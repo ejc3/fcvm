@@ -568,7 +568,7 @@ fn intent_effect(
             state.fleet.director.vote(c.client, target, c.id)?;
             Ok(format!("nudge {target}"))
         }
-        Intent::Word { text } => {
+        Intent::Word { text, text_style } => {
             word_rate(state, c.client, at)?;
             match check {
                 None => return Err("the text check did not run".into()),
@@ -592,6 +592,7 @@ fn intent_effect(
             f.scene.words.push(Word {
                 text: text.clone(),
                 t,
+                text_style: *text_style,
             });
             while f.scene.words.len() > MAX_WORDS {
                 f.scene.words.remove(0);

@@ -17,11 +17,36 @@ pub struct Keyframe {
     pub intent: Option<String>,
 }
 
-/// A viewer's word, placed at scene time `t`.
+/// How the renderer draws a viewer's message (the renderer's PROTOCOL.md, #1178).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextStyle {
+    #[default]
+    Lockup,
+    Skywriting,
+    Landmark,
+}
+
+impl TextStyle {
+    pub const NAMES: &'static str = "lockup, skywriting, landmark";
+
+    pub fn parse(s: &str) -> Option<TextStyle> {
+        match s {
+            "lockup" => Some(TextStyle::Lockup),
+            "skywriting" => Some(TextStyle::Skywriting),
+            "landmark" => Some(TextStyle::Landmark),
+            _ => None,
+        }
+    }
+}
+
+/// A viewer's word, placed at scene time `t`, drawn in `text_style`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Word {
     pub text: String,
     pub t: f64,
+    #[serde(default)]
+    pub text_style: TextStyle,
 }
 
 /// A light a viewer dropped: world position, linear RGB in [0, 1], scene time placed.

@@ -158,7 +158,8 @@
         "/view/scene/words": [
           {
             "t": 2.0,
-            "text": "hello"
+            "text": "hello",
+            "text_style": "lockup"
           }
         ]
       }
@@ -405,11 +406,13 @@
       "words": [
         {
           "t": 2.0,
-          "text": "hello"
+          "text": "hello",
+          "text_style": "lockup"
         },
         {
           "t": 9.2,
-          "text": "two words"
+          "text": "two words",
+          "text_style": "lockup"
         }
       ]
     },

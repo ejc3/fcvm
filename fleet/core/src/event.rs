@@ -130,6 +130,7 @@ pub enum Intent {
     },
     Word {
         text: String,
+        text_style: crate::scene::TextStyle,
     },
     Light {
         pos: [f64; 3],
@@ -235,8 +236,21 @@ impl Intent {
                     .get("text")
                     .and_then(|v| v.as_str())
                     .ok_or("args.text must be a string")?;
+                let text_style = match args.get("text_style") {
+                    None | Some(serde_json::Value::Null) => crate::scene::TextStyle::default(),
+                    Some(v) => v
+                        .as_str()
+                        .and_then(crate::scene::TextStyle::parse)
+                        .ok_or_else(|| {
+                            format!(
+                                "args.text_style must be one of {}",
+                                crate::scene::TextStyle::NAMES
+                            )
+                        })?,
+                };
                 Ok(Intent::Word {
                     text: normalise_word(text)?,
+                    text_style,
                 })
             }
             "light" => {

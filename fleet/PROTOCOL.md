@@ -125,7 +125,7 @@ Intents:
 | `restart_now` | `{}` | starts a race now (below); refused while the global cooldown runs (`race.cooldown_until`) |
 | `relaunch` | `{"tile": "fcvm:3"}` (a tile id) or `{"tile": "slot-3"}` / `{"tile": "ec2-2"}` (a slot id) | bumps that slot's generation; refused for a dark tile, a draining host, a borrowed GPU, or a second relaunch from the client within 2 s |
 | `nudge` | `{"target": "<viewpoint>"}` | a vote for the next camera hold, among `nudges.targets`; one vote per client, the latest counts; refused once the vote has closed |
-| `word` | `{"text": "hello"}` | 1 to 28 characters (the renderer's limit) after collapsing whitespace, no control characters, one per client per 5 s; checked together with every word in the sky first (below) |
+| `word` | `{"text": "hello", "text_style": "skywriting"}` | 1 to 28 characters (the renderer's limit) after collapsing whitespace, no control characters, one per client per 5 s; checked together with every word in the sky first (below). `text_style` is how the renderer draws it (#1178): `lockup` (when absent or null), `skywriting` or `landmark`; anything else is refused before the text check |
 | `light` | `{"pos": [x, y, z], "color": [r, g, b]}` | one per client per second; each client keeps its latest 3 (its oldest goes); `color` components are clamped to [0, 1], then scaled so they add up to at most 2; the scene keeps the latest 32 |
 | `claim_gpu` | `{}` | a GPU of your own for 60 s (below) |
 | `release_gpu` | `{"claim": "claim-3"}` (or `{}`) | ends your claim early; a `claim` that is not yours is refused |
@@ -235,7 +235,7 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
                                             {"phase": "agent_connected", "at": 1761134492000}]}],
                       "last_wake": {"started_at": ..., "awake_at": ..., "gpus": 16, "ms": 98000},
                       "wakes": [...]}},
-  "scene": {"epoch_unix_ms": ..., "camera": [...], "time_of_day": 0.3, "words": [{"text", "t"}], "lights": [{"pos", "color", "t"}]},
+  "scene": {"epoch_unix_ms": ..., "camera": [...], "time_of_day": 0.3, "words": [{"text", "t", "text_style"}], "lights": [{"pos", "color", "t"}]},
   "image_aspect": 1.7777777777777777,
   "next_race_at": 1761134700000,
   "cooldown_until": 1761134460000,
@@ -615,7 +615,7 @@ none is placed). For each slot the agent reconciles:
 ```json
 {"type": "scene", "epoch_unix_ms": 1761134400000, "image_aspect": 3.5555555555555554,
  "camera": [{"t": 0, "pos": [-32, 1.9, -55], "look": [-60, 1.9, -100], "fov_deg": 62}], "time_of_day": 0.3,
- "words": [{"text": "hello", "t": 12.5}], "lights": [{"pos": [1, 2, 3], "color": [1, 0.5, 0], "t": 14.0}]}
+ "words": [{"text": "hello", "t": 12.5, "text_style": "lockup"}], "lights": [{"pos": [1, 2, 3], "color": [1, 0.5, 0], "t": 14.0}]}
 ```
 
 The scene shared by every renderer, sent after the hello and whenever it changes. The
