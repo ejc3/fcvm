@@ -49,6 +49,9 @@ class TlsFront {
   // Checks the file every period_ms and loads it again when it changed (a new
   // inode, size or modification time). Runs on its own thread.
   void watch(const std::string& path, int period_ms);
+  // Tests: the watcher thread waits this long before its first look (as a
+  // thread scheduled late on a busy host would).
+  int test_watch_delay_ms = 0;
   // TLS handshake on an accepted socket, within timeout_ms.
   std::unique_ptr<Conn> accept(int fd, int timeout_ms, std::string* err);
   // For /health: whether a pair is loaded, how many loads succeeded, and the
