@@ -2439,12 +2439,16 @@ carry it, and a driver bump does not rebuild the rootfs.
      `/dev/nvidiactl`, `/dev/nvidia<minor>`, `/dev/nvidia-uvm{,-tools}`;
    - starts `nvidia-persistenced` from the image, which initialises the GPU and
      keeps it open, so later processes do not initialise it again;
+   - zeroes every byte of each GPU's memory it can allocate with the image's
+     `fcvm-gpu-scrub` (see GPU memory between tenants) and fails if any GPU
+     was not zeroed;
    - runs `nvidia-smi -L` from the image and requires one line per GPU;
    - runs `nvidia-ctk cdi generate --driver-root=/run/fcvm-gpu/driver`
      into `/var/run/cdi/nvidia.yaml`.
 4. **Container start.** The container starts after the restore is
    acknowledged, as for any warm start, with `--device nvidia.com/gpu=all`.
-   The ACK's phase record carries `gpu_ms` and `gpus`.
+   The ACK's phase record carries `gpu_ms`, `gpus` and
+   `gpu_steps.scrub_ms`.
 
 Any failure is fatal to the clone before the ACK: fc-agent prints
 `FATAL: clone restore failed closed ... restore phase gpu-attach: <cause>` and
@@ -2452,6 +2456,109 @@ shuts the VM down with status 1. Each cause names what was expected and what
 the guest saw: the PCI functions present after a rescan, the kernel release
 the image was built for, the kernel log's NVRM lines after a failed `insmod`
 or `nvidia-smi`.
+
+### GPU memory between tenants
+
+A GPU goes from one VM to the next (a wall GPU lent to a visitor and given
+back, any pool of GPUs). NVIDIA documents that newly allocated memory is not
+cleared, and documents a scrub on reset only for H100 confidential computing.
+Two layers keep one VM's GPU memory from the next, each failing closed:
+
+**In the guest, on every restore.** After `nvidia-persistenced` has
+initialised the GPUs and before `nvidia-smi -L`, the CDI spec and the
+container, fc-agent runs `/run/fcvm-gpu/driver/usr/bin/fcvm-gpu-scrub`
+(`src/setup/nvidia_gpu_scrub.c`, compiled into the driver image by the image
+stage). Per GPU it creates a CUDA context, allocates until the device refuses
+2 MiB, memsets every allocation to zero, synchronises and frees. It loads the
+image's `libcuda.so.1` with `dlopen`, so the stage needs only gcc, and the
+stage refuses a binary that needs a glibc newer than 2.34. A context costs
+guest memory, so fc-agent passes `--parallel N` from `MemAvailable` (256 MiB
+for the first context, 64 MiB for each further one), and the tool sets
+`CUDA_DEVICE_MAX_CONNECTIONS=1` and `CUDA_MODULE_LOADING=LAZY`, which cut a
+context from about 230 to about 185 MiB. A failed scrub, a missing tool, or
+fewer GPUs zeroed than the host attached fails the attach, so the clone is
+never acknowledged. This layer holds even when the previous VM was killed and
+nothing ran on the host in between.
+
+**On the host, between VMs.** `sudo fcvm gpu scrub <sbdf>...`
+(`src/gpu/scrub.rs`), for the fleet agent to run after a VM's Firecracker has
+exited and before the GPU goes to another VM. On Turing, Ampere and Ada a GPU
+clears its own memory after a secondary bus reset and reports when it has
+finished; the scrub follows NVIDIA's gpu-admin-tools `--reset-with-sbr
+--clear-memory` for that:
+
+1. Refuse unless the GPU is NVIDIA, on vfio-pci, and its `reset_method` is
+   `bus`.
+2. Open the GPU's VFIO group and hold it for the whole scrub. A group has one
+   opener, so no VM can open the GPU mid-scrub, and a GPU a VM still holds is
+   reported `busy` and left alone.
+3. Set `power/control` to `on` (vfio-pci lets an idle GPU suspend to D3, where
+   BAR0 reads all ones) and enable memory decoding; both are restored after.
+4. Check `PMC_BOOT_0` names Turing, Ampere or Ada; set VBIOS scratch 22
+   (`0x1458`) to 1.
+5. Reset through sysfs `reset`, then require the scratch to read 0: the reset
+   happened, so the clear-finished bit below is from this reset.
+6. Wait up to 5 s each for boot (`0x118234 & 0x3ff == 0x3ff`) and for the clear
+   (`0x100b20 & 1`). A read of all ones or 0xbadfxxxx never counts as done.
+
+Each GPU's record is `/var/lib/fcvm/gpu/<sbdf>.json` (`FCVM_GPU_STATE_DIR`):
+`scrubs`, `failures`, `quarantined`, the last error and the last timings. A
+failed scrub quarantines the GPU, and `check_host_device` refuses a
+quarantined GPU, so `podman run --gpu` and `snapshot run --gpu` do not hand it
+out until a later scrub of it succeeds. An unreadable record also refuses.
+`fcvm gpu scrub` prints one JSON line per GPU with `outcome` `scrubbed`,
+`failed` or `busy` and exits 1 unless every GPU was scrubbed; `fcvm gpu
+status` prints every record. Only root runs the scrub.
+
+**Measuring it.** `make gpu-residue-test GPU=<sbdf>` (`scripts/gpu-residue/`):
+VM A fills all the memory it can allocate with 16-byte records (a 64-bit
+marker and the offset) and then its container exits, or its fcvm is
+SIGKILLed; VM B, restored on the same GPU, allocates as much with `cudaMalloc`,
+`cuMemAlloc` or `cudaMallocManaged`, writes nothing, and counts the marker and
+the non-zero words in a GPU kernel. A's fill reads its records back before it
+reports, and each B scan then writes one marker into its own memory and fails
+unless a second scan counts exactly one more. A `same-vm` case runs fill and
+scan as two processes in one VM. `HOST_CLEAR="sudo fcvm gpu scrub <sbdf>"`
+runs the host scrub between A and B.
+
+**Measured** on 2026-10-23, g4dn.metal (T4, 15,636,037,632 bytes, `reset_method`
+`bus`), driver 580.196.07 with the open modules, the default 1 GiB guest. B
+allocated 15,521,021,952 bytes (`cudaMalloc`, `cuMemAlloc`) and 15,456,010,240
+(`cudaMallocManaged`). Each layer ran the nine cases (same-vm, exit and kill,
+each with the three allocators):
+
+| layers | marker words in B | non-zero words in B | scrub time |
+|---|---|---|---|
+| none (main) | 0 in all 9 | 0 in all 9 | none |
+| host only | 0 in all 9 | 0 in all 9 | host 1.21 to 1.24 s per scrub, wall |
+| in-guest only | 0 in all 9 | 0 in all 9 | `scrub_ms` 413 to 459 |
+| both | 0 in all 9 | 0 in all 9 | `scrub_ms` 401 to 450, host as above |
+
+Nothing was found even without either layer: on this driver a later process
+of the same VM also gets zeroed memory, and the GPU runs its own clear after
+the bus reset VFIO gives it when a VM opens or releases it. Neither is a
+documented guarantee, and neither holds for a GPU or a host that resets
+another way, which is why both layers stay.
+
+Costs:
+
+- In the guest, one T4: `scrub_ms` 410 to 447 over six restores, and `gpu_ms`
+  1,693 to 1,846 against 1,277 to 1,647 on main. Inside the tool (347 to 401
+  ms): `cuInit` 47 to 68, context 75 to 87, alloc 3 to 99, zeroing 15.5 GB 64
+  to 73, free 31 to 37, context destroy about 90.
+- Two T4s in one VM: 632 to 646 ms. Eight in the 1 GiB guest (two at a time):
+  2,609 to 2,674 ms, `gpu_ms` 11,798 to 11,834 against 9,249 on main. Before
+  the contexts were bounded, eight at once OOM-killed the scrub and the guest.
+- On the host: 1,178 to 1,212 ms per T4 over 17 scrubs (reset 179 to 188, boot
+  95 to 103, clear 872 to 904); all eight GPUs at once, 1.23 s wall.
+  gpu-admin-tools took 1.46 s for the same on one T4.
+
+Which layer: the in-guest scrub is on every restore's critical path (about
+0.4 s per GPU, and guest memory for a context) and holds whatever happened
+before the VM started. The host scrub is off the critical path (between
+tenants), confirms through the GPU's own registers that its memory was
+cleared, and quarantines a GPU that does not, but it runs only when the fleet
+agent runs it and only on Turing to Ada with a bus reset.
 
 ### Verified on hardware
 
