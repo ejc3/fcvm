@@ -127,18 +127,22 @@ def main():
                 hs.append(None)
         fits = [x.get("budget_fit") for x in hs if x and x.get("ready")]
         over = any((x.get("frames_2s") or {}).get("render_ms_max", 0) > 0.9 * 1000 / 30 for x in hs if x)
-        # every tile must report: a budget chosen without the slowest one
-        # could be one it cannot draw
-        b = c.decide(fits, over) if len(fits) == len(tiles) else None
+        # every tile must report a fit: a budget chosen without the slowest one
+        # could be one it cannot draw. A tile whose fit is not known yet (0:
+        # its window is younger than 60 s, as after it rejoins) holds the
+        # budget in force, as fleet-control's port does.
+        known = len(fits) == len(tiles) and all(f and f > 0 for f in fits)
+        b = c.decide(fits, over) if known else None
         tnow = max((x["t"] for x in hs if x), default=0)
         line = {"round": n, "fits": fits, "budget_in_use": [x.get("budget") for x in hs if x],
                 "render_ms": [x.get("render_ms") for x in hs if x]}
         # the current budget goes out every round (a new scene clears a tile's
         # schedule); a changed one takes effect at the same slot everywhere
-        if c.current is not None and len(fits) == len(tiles):
+        if c.current is not None:
             t0 = math.ceil((tnow + lead) * 30) / 30
-            for h, p in tiles:
-                post_budget(h, p, c.current, t0)
+            for (h, p), x in zip(tiles, hs):
+                if x:  # a tile not answering gets it when it does
+                    post_budget(h, p, c.current, t0)
             line.update(posted=c.current, changed=b is not None, from_t=t0)
         print(json.dumps(line), flush=True)
         time.sleep(period)

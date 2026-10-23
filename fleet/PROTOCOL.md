@@ -353,8 +353,13 @@ samples) and `frames_2s` (over the last 2 s: `n`, `frame_ms_p50`,
 sending, `render_ms_max`, `encode_ms_max`). `budget_fit` comes from a cost
 model of the frames the renderer drew: the fixed part of a frame
 (`render_ms - trace_ms`) and the cost per sample of each path (`trace_ms` /
-samples drawn), smoothed over about five frames, started again when the drawn
-size changes. It is the largest budget whose predicted frame takes 70% of a
+samples drawn), each the 95th percentile over the frames of the last 180 s,
+so the fit holds over what the camera has shown in that time instead of
+following the latest frames (round 10: on the coordinator's directed camera
+the latest frames' fit swung 2x and the grid budget changed 9 times in 2
+minutes). It is 0 until the window spans 60 s (a controller leaves it out);
+the model starts again when the drawn size changes. `budget_fit_now` is the
+same fit from the latest frames (smoothed over about five), for diagnosis. It is the largest budget whose predicted frame takes 70% of a
 slot, on the fast path below `HQ_SPP` samples per drawn pixel or on the
 high-quality path from it; until a renderer has drawn a high-quality frame it
 assumes that path costs `HQ_COST_PRIOR` (1.0) times the fast one per sample.
