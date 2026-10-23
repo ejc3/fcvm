@@ -317,6 +317,22 @@ pub fn race_running(f: &Fleet) -> bool {
     })
 }
 
+/// Whether the image shows what it will keep showing: no race is running and no placed
+/// tile (claimed GPUs aside, they are black on the wall) is starting or relaunching. A tile
+/// that failed or waits for capacity is dark for a while and does not hold this back.
+pub fn image_settled(f: &Fleet) -> bool {
+    let starting = |s: &Slot| {
+        s.position.is_some()
+            && s.claim.is_none()
+            && (s.observed.generation < s.generation
+                || matches!(
+                    s.observed.phase.as_str(),
+                    "pending" | "launching" | "stopping" | "restoring" | "starting"
+                ))
+    };
+    !race_running(f) && !f.slots.values().chain(f.ec2.values()).any(starting)
+}
+
 /// Every placed tile of both halves runs its current generation.
 fn image_complete(f: &Fleet) -> bool {
     let done = |s: &Slot| {

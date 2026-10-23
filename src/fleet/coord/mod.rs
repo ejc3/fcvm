@@ -295,8 +295,8 @@ impl Actor {
             }
             Cmd::PosterPlan { reply } => {
                 let f = &self.state.fleet;
-                // A race relaunches the tiles: their regions are black until it is done.
-                if fleet_core::apply::race_running(f) {
+                // Starting tiles (a race, a first launch) are black until they run.
+                if !fleet_core::apply::image_settled(f) {
                     let _ = reply.send(None);
                     return;
                 }

@@ -361,7 +361,8 @@ paint. Once per camera hold, 5.5 s into it, the coordinator subscribes to every 
 places each region in the whole image and encodes one JPEG (through the `ffmpeg` CLI).
 Served with `Cache-Control: public, max-age=10` and `Access-Control-Allow-Origin: *` (the
 page reads it from its own origin); `404` with `no-store` until the first poster exists. A hold whose capture does not finish before the flight keeps the previous
-poster, and so does a hold during a race (the relaunching tiles would be black). Borrowed tiles are black in it, as on the wall.
+poster, and so does a hold while a race runs or any placed tile is starting or
+relaunching (its region would be black; claimed GPUs and dark tiles do not count). Borrowed tiles are black in it, as on the wall.
 
 ### Running it
 

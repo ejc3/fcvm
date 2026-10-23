@@ -890,6 +890,7 @@ async fn the_poster_is_the_whole_image_at_a_hold() {
             frame_url: host_agg,
         })
         .unwrap();
+    agent.report("slot-1", "running", 1);
 
     let http = reqwest::Client::new();
     let r = http.get(format!("{base}/poster.jpg")).send().await.unwrap();
@@ -1257,10 +1258,11 @@ async fn no_active_viewer_scales_the_gpus_to_zero_and_one_wakes_them() {
     assert_eq!(calls()[2], ("fleet-hosts".to_string(), 2));
 }
 
-/// No poster is taken while a race relaunches the tiles: their regions would be black.
-/// (On a GPU host the first posters of a run were black frames taken mid-race.)
+/// No poster is taken while tiles are starting or a race relaunches them: their regions
+/// would be black. (On a GPU host the first posters of two runs were black frames, taken
+/// mid-race and while the first VMs started.)
 #[tokio::test]
-async fn no_poster_is_planned_while_a_race_runs() {
+async fn no_poster_is_planned_while_tiles_start_or_race() {
     let config = Config {
         restart_cooldown_secs: 0,
         ..Config::default()
@@ -1268,13 +1270,20 @@ async fn no_poster_is_planned_while_a_race_runs() {
     let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None);
     let mut agent = FakeAgent::connect(&handle, "gpu-a", 1);
     agent.assign().await;
-    agent.report("slot-1", "running", 1);
     agent
         .to_coord
         .send(AgentMsg::Aggregate {
             frame_url: "ws://gpu-host.example:20200/frames".into(),
         })
         .unwrap();
+    // Nor while the tiles are still starting (the first poster of a GPU run was black).
+    agent.report("slot-1", "restoring", 1);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        handle.poster_plan().await.is_none(),
+        "a poster planned while a tile starts"
+    );
+    agent.report("slot-1", "running", 1);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while handle
         .poster_plan()
