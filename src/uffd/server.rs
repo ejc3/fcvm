@@ -91,7 +91,20 @@ const PARKED_RETRY_BURST: Duration = Duration::from_millis(2);
 /// has run out. Retries are also attempted after every drain and between prefetch chunks.
 const PARKED_RETRY_DELAY: Duration = Duration::from_millis(2);
 
-/// How long a parked fault may stay unresolved before the handler fails closed.
+/// How long a parked fault may stay refused with no REMOVE event read before the handler fails
+/// closed. The wait counts from when the fault was parked or from the last REMOVE event read,
+/// whichever is later ([`ParkedFaults::refused_without_progress`]).
+///
+/// The bound is there for a flag that stays up: a fault whose refusal nothing will clear
+/// would hang its vCPU for good. Every REMOVE that is read lowers the flag as soon as the
+/// thread inside `madvise` runs again, so a balloon whose events keep arriving is not that
+/// case, even when no retry gets through. When that thread and the handler share a CPU none
+/// can: the thread runs only while the handler is off the CPU, and between lowering the flag
+/// and raising it for its next `madvise` it does not stop. Measured on a 32-core arm64 host
+/// with both pinned to one CPU, against back-to-back single-page `madvise` calls: in 2 s the
+/// handler made 3,428,087 retries and read 2,656 REMOVE events, none of the retries got
+/// through, and the bound, counted from the park, then killed the clone. Such a fault
+/// resolves when the balloon pauses or the scheduler moves one of the two threads.
 const MAX_PARKED_WAIT: Duration = Duration::from_secs(2);
 
 /// `sockaddr_un.sun_path` is a fixed 108-byte array on Linux; bind(2) fails with a bare
@@ -2080,6 +2093,8 @@ struct ParkedFaults {
     by_page: std::collections::BTreeMap<usize, ParkedFault>,
     /// Until when the pause between retries is a yield; see [`PARKED_RETRY_BURST`].
     retry_without_sleeping_until: Option<std::time::Instant>,
+    /// When a REMOVE event was last read; see [`MAX_PARKED_WAIT`].
+    last_remove_read: Option<std::time::Instant>,
 }
 
 impl ParkedFaults {
@@ -2091,9 +2106,10 @@ impl ParkedFaults {
     ///
     /// A fault already parked keeps its original start: the vCPU has been blocked
     /// since that first attempt, and that is the cost the trace is measuring. It is also
-    /// what [`MAX_PARKED_WAIT`] counts from, so a second fault on the page cannot extend
-    /// the wait. A second fault that is a write makes the parked fault a write, so the retry
-    /// fills the page writable for every faulter waiting on it.
+    /// where [`MAX_PARKED_WAIT`] starts counting, so a second fault on the page cannot extend
+    /// the wait; only a REMOVE event read can. A second fault that is a write makes the
+    /// parked fault a write, so the retry fills the page writable for every faulter waiting
+    /// on it.
     fn park(&mut self, page: usize, file_offset: usize, write: bool, trace_t0: Option<u64>) {
         let now = std::time::Instant::now();
         let parked = self.by_page.entry(page).or_insert(ParkedFault {
@@ -2111,7 +2127,20 @@ impl ParkedFaults {
     /// A REMOVE event was read just now, so the thread inside `madvise` can run again and
     /// `mmap_changing` is about to drop.
     fn a_remove_was_read(&mut self) {
-        self.retry_without_sleeping_from(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        self.last_remove_read = Some(now);
+        self.retry_without_sleeping_from(now);
+    }
+
+    /// How long `parked` has been refused since anything was read that lowers the flag: since
+    /// it was parked, or since the last REMOVE event read if that came later. This, not the
+    /// time since the park, is what [`MAX_PARKED_WAIT`] bounds.
+    fn refused_without_progress(&self, parked: &ParkedFault, now: std::time::Instant) -> Duration {
+        let since = match self.last_remove_read {
+            Some(read) if read > parked.parked_at => read,
+            _ => parked.parked_at,
+        };
+        now.saturating_duration_since(since)
     }
 
     fn retry_without_sleeping_from(&mut self, now: std::time::Instant) {
@@ -4167,9 +4196,9 @@ fn granule_segments(
 
 /// Retry every parked fault once. `Ok(false)` means the clone is gone.
 ///
-/// A fault still refused [`MAX_PARKED_WAIT`] after it was parked fails the handler, and
-/// the fail-closed path kills the VMM. The alternative is dropping the fault, which leaves
-/// its vCPU asleep for good.
+/// A fault still refused [`MAX_PARKED_WAIT`] after it was parked, with no REMOVE event read
+/// in that time, fails the handler, and the fail-closed path kills the VMM. The alternative
+/// is dropping the fault, which leaves its vCPU asleep for good.
 fn retry_parked_faults(ctx: &VmContext<'_>, uffd: &Uffd, state: &mut VmState) -> Result<bool> {
     let mut resolved = Vec::new();
     for (&page, parked) in &state.parked_faults.by_page {
@@ -4190,19 +4219,25 @@ fn retry_parked_faults(ctx: &VmContext<'_>, uffd: &Uffd, state: &mut VmState) ->
                 resolved.push((page, zero, matches!(outcome, FaultOutcome::Resolved)))
             }
             FaultOutcome::VmGone => return Ok(false),
-            FaultOutcome::Retry if parked.parked_at.elapsed() >= MAX_PARKED_WAIT => {
+            FaultOutcome::Retry => {
+                let stalled = state
+                    .parked_faults
+                    .refused_without_progress(parked, std::time::Instant::now());
+                if stalled < MAX_PARKED_WAIT {
+                    continue;
+                }
                 // Named after the attempt: a zero page refused with EINVAL in it was answered
                 // with a copy of zeros, and the copy is what is still refused.
                 let retried = zero.map(|_| ctx.zero_fill(parked.write, state.zero_page_refused));
                 return Err(anyhow!(
-                    "{} at 0x{page:x} still EAGAIN after {:?}; refusing to drop \
-                     a fault that would permanently hang a vCPU for vm {}",
+                    "{} at 0x{page:x} still EAGAIN after {:?}, with no REMOVE event read for \
+                     {stalled:?}; refusing to drop a fault that would permanently hang a vCPU \
+                     for vm {}",
                     ctx.resolution(retried).ioctl(),
                     parked.parked_at.elapsed(),
                     ctx.vm_id
                 ));
             }
-            FaultOutcome::Retry => {}
         }
     }
     for (page, zero, filled) in resolved {
@@ -7553,16 +7588,24 @@ mod tests {
         }
 
         /// A balloon that keeps inflating: back-to-back single-page `madvise` calls over the
-        /// first `pages` pages, until stopped. Each call sleeps until the handler reads its
-        /// REMOVE event.
-        fn inflate_until_stopped(&self, pages: usize) -> BalloonStream {
+        /// first `pages` pages, from a thread pinned to `cpu`, until stopped or until `until`.
+        /// Each call sleeps until the handler reads its REMOVE event.
+        fn inflate_until_stopped(
+            &self,
+            pages: usize,
+            cpu: usize,
+            until: Option<std::time::Instant>,
+        ) -> BalloonStream {
             let base = self.base;
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let thread = std::thread::spawn({
                 let stop = Arc::clone(&stop);
                 move || {
+                    let _pinned = PinnedThread::to(cpu);
                     let mut calls = 0u64;
-                    while !stop.load(Ordering::Relaxed) {
+                    while !stop.load(Ordering::Relaxed)
+                        && until.is_none_or(|until| std::time::Instant::now() < until)
+                    {
                         let page = base + (calls as usize % pages) * Self::PAGE;
                         // SAFETY: advising this test's own live mapping.
                         let rc = unsafe {
@@ -7709,6 +7752,75 @@ mod tests {
         clone.unmap();
     }
 
+    /// The CPUs this process may run on.
+    fn allowed_cpus() -> Vec<usize> {
+        // SAFETY: a zeroed cpu_set_t is a valid empty set, filled in by the kernel.
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: the size passed is the size of `set`.
+        let rc =
+            unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+        assert_eq!(
+            rc,
+            0,
+            "sched_getaffinity: {}",
+            std::io::Error::last_os_error()
+        );
+        (0..libc::CPU_SETSIZE as usize)
+            // SAFETY: `cpu` is below CPU_SETSIZE.
+            .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+            .collect()
+    }
+
+    /// Two different CPUs this process may run on, for a test whose claim holds only while
+    /// the balloon and the handler run at the same time.
+    fn two_cpus() -> (usize, usize) {
+        let cpus = allowed_cpus();
+        assert!(
+            cpus.len() >= 2,
+            "this test needs two CPUs to put the handler and the balloon on; allowed: {cpus:?}"
+        );
+        (cpus[0], cpus[1])
+    }
+
+    /// The calling thread pinned to one CPU until dropped, when its old affinity comes back.
+    struct PinnedThread {
+        old: libc::cpu_set_t,
+    }
+
+    impl PinnedThread {
+        fn to(cpu: usize) -> Self {
+            let size = std::mem::size_of::<libc::cpu_set_t>();
+            // SAFETY: zeroed cpu_set_t values are valid empty sets; `cpu` is one this process
+            // may run on, so below CPU_SETSIZE; the sizes passed are the sets' own.
+            unsafe {
+                let mut old: libc::cpu_set_t = std::mem::zeroed();
+                assert_eq!(
+                    libc::sched_getaffinity(0, size, &mut old),
+                    0,
+                    "sched_getaffinity"
+                );
+                let mut one: libc::cpu_set_t = std::mem::zeroed();
+                libc::CPU_SET(cpu, &mut one);
+                assert_eq!(
+                    libc::sched_setaffinity(0, size, &one),
+                    0,
+                    "pinning to CPU {cpu}: {}",
+                    std::io::Error::last_os_error()
+                );
+                Self { old }
+            }
+        }
+    }
+
+    impl Drop for PinnedThread {
+        fn drop(&mut self) {
+            // SAFETY: restoring the mask this thread had, with its own size.
+            unsafe {
+                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &self.old)
+            };
+        }
+    }
+
     /// See [`BalloonedCopyClone::inflate_until_stopped`].
     struct BalloonStream {
         stop: Arc<std::sync::atomic::AtomicBool>,
@@ -7804,10 +7916,19 @@ mod tests {
     /// bound, and replay must not fail. Five rounds, because one proves little: with the
     /// sleeping cadence a single parked fault waited 0.8 to 1.8 s in five of eight runs on a
     /// 6.16 host, and got through at once in two.
+    ///
+    /// The handler and the balloon are pinned to two different CPUs. A retry gets through
+    /// only while it runs at the same time as the balloon's thread, between that thread
+    /// lowering the flag and raising it again, so the bound below holds only when the two
+    /// can run at once. Left to the scheduler, they sometimes shared a CPU and the fault
+    /// waited out MAX_PARKED_WAIT; that case is
+    /// `a_fault_parked_behind_a_balloon_on_its_own_cpu_waits_for_the_balloon_without_failing`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fault_parked_during_replay_resolves_while_the_balloon_keeps_inflating() {
         const PAGE: usize = BalloonedCopyClone::PAGE;
         const ROUNDS: usize = 5;
+        let (handler_cpu, balloon_cpu) = two_cpus();
+        let _pinned = PinnedThread::to(handler_cpu);
         let (clone, uffd) = BalloonedCopyClone::new(64);
         let ctx = clone.ctx();
         let mut state = BalloonedCopyClone::state();
@@ -7816,7 +7937,7 @@ mod tests {
         let mut recorded = PageSet::empty(clone.mem_size as u64);
         recorded.insert_range((48 * PAGE) as u64, (8 * PAGE) as u64);
 
-        let balloon = clone.inflate_until_stopped(16);
+        let balloon = clone.inflate_until_stopped(16, balloon_cpu, None);
         let mut rounds = Vec::new();
         for round in 0..ROUNDS {
             // Nothing reads events between two replays, so by now the balloon is asleep
@@ -7880,10 +8001,14 @@ mod tests {
     /// inflating. The flag is up whenever one of them is read, so each is refused at first.
     /// None may wait anywhere near the bound, and the loop must not fail. Two hundred,
     /// because the damage was in the tail: with the old cadence the slowest of thirty such
-    /// faults waited 210 to 551 ms across seven runs, against a median of 1 to 25 ms.
+    /// faults waited 210 to 551 ms across seven runs, against a median of 1 to 25 ms. The
+    /// handler and the balloon are pinned to two different CPUs, for the reason given on
+    /// `a_fault_parked_during_replay_resolves_while_the_balloon_keeps_inflating`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn faults_served_while_the_balloon_keeps_inflating_resolve_far_inside_the_bound() {
         const FAULTS: usize = 200;
+        let (handler_cpu, balloon_cpu) = two_cpus();
+        let _pinned = PinnedThread::to(handler_cpu);
         let (clone, uffd) = BalloonedCopyClone::new(256);
         let ctx = clone.ctx();
         let mut state = BalloonedCopyClone::state();
@@ -7893,7 +8018,7 @@ mod tests {
         let async_peer_pidfd =
             AsyncFd::new(PidfdRef(&peer.pidfd)).expect("registering the peer pidfd");
 
-        let balloon = clone.inflate_until_stopped(16);
+        let balloon = clone.inflate_until_stopped(16, balloon_cpu, None);
         wait_for_uffd_event(async_uffd.get_ref(), "the balloon's first REMOVE event");
         let pages: Vec<usize> = (32..32 + FAULTS).map(|index| clone.page(index)).collect();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -7944,6 +8069,75 @@ mod tests {
             "a fault was blocked for {longest:?} (median {median:?}) across {madvise_calls} \
              madvise calls; every fault has to resolve far inside the {MAX_PARKED_WAIT:?} bound"
         );
+        clone.unmap();
+    }
+
+    /// A balloon whose thread shares the handler's CPU. Reading a REMOVE wakes the thread
+    /// inside `madvise`, and on one CPU it runs only while the handler is off it: it lowers
+    /// the flag, returns, and raises the flag again for its next call before the handler runs
+    /// again, so no retry can get through until the balloon pauses. Each REMOVE read still
+    /// lowers the flag, so the fault is waiting on a balloon that is making progress, not on
+    /// a flag that stays up, and MAX_PARKED_WAIT must not kill the clone for it. The handler
+    /// counted that bound from the park and failed `serve_faults` at 2 s, every run.
+    ///
+    /// The balloon inflates for longer than the bound and then stops. The fault must then be
+    /// served, and `serve_faults` must still be running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fault_parked_behind_a_balloon_on_its_own_cpu_waits_for_the_balloon_without_failing()
+    {
+        let cpu = allowed_cpus()[0];
+        let _pinned = PinnedThread::to(cpu);
+        let (clone, uffd) = BalloonedCopyClone::new(64);
+        let ctx = clone.ctx();
+        let mut state = BalloonedCopyClone::state();
+        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        // serve_faults ends when its peer does. Pin this process, which outlives the test.
+        let peer = PeerVmm::from_pid(std::process::id()).expect("pinning this process");
+        let async_peer_pidfd =
+            AsyncFd::new(PidfdRef(&peer.pidfd)).expect("registering the peer pidfd");
+
+        let inflating = MAX_PARKED_WAIT + Duration::from_millis(500);
+        let balloon =
+            clone.inflate_until_stopped(16, cpu, Some(std::time::Instant::now() + inflating));
+        // The balloon is asleep inside a `madvise` with its REMOVE queued and the flag up, so
+        // the fault below is read ahead of the REMOVE and refused.
+        wait_for_uffd_event(async_uffd.get_ref(), "the balloon's first REMOVE event");
+        let addr = clone.page(40);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let vcpu = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            // SAFETY: `addr` is inside a mapping that outlives this thread.
+            let got = unsafe { std::ptr::read_volatile(addr as *const u8) };
+            let blocked = started.elapsed();
+            done_tx.send(()).ok();
+            (got, blocked)
+        });
+
+        // serve_faults returns only when its peer exits or serving fails, and the peer is
+        // this process, so any return before the vCPU is through is a failure.
+        let ended_early = tokio::select! {
+            ended = serve_faults(&ctx, &async_uffd, &async_peer_pidfd, peer.pid, &mut state) => {
+                Some(ended)
+            }
+            _ = done_rx => None,
+        };
+
+        let madvise_calls = balloon.stop(async_uffd.get_ref(), &ctx, &mut state);
+        serve_until(async_uffd.get_ref(), &ctx, &mut state, || {
+            vcpu.is_finished()
+        });
+        let (got, blocked) = vcpu.join().expect("vCPU thread");
+        println!(
+            "a balloon on the handler's CPU, {madvise_calls} madvise calls over {inflating:?}; \
+             the parked fault was blocked for {blocked:?}; ended early: {ended_early:?}"
+        );
+
+        assert!(
+            ended_early.is_none(),
+            "serve_faults must not fail a fault parked behind a balloon whose REMOVE events \
+             keep being read, because its failure kills the clone's VMM: {ended_early:?}"
+        );
+        assert_eq!(got, 41, "the fault must be served its own snapshot page");
         clone.unmap();
     }
 
