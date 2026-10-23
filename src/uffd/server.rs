@@ -8109,11 +8109,11 @@ mod tests {
         let (clone, uffd) = BalloonedCopyClone::new(64);
         let ctx = clone.ctx();
         let mut state = BalloonedCopyClone::state();
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         // serve_faults ends when its peer does. Pin this process, which outlives the test.
         let peer = PeerVmm::from_pid(std::process::id()).expect("pinning this process");
         let async_peer_pidfd =
-            AsyncFd::new(PidfdRef(&peer.pidfd)).expect("registering the peer pidfd");
+            register_peer_pidfd(&peer.pidfd).expect("registering the peer pidfd");
 
         let inflating = MAX_PARKED_WAIT + Duration::from_millis(500);
         let balloon =
