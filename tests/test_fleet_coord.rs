@@ -32,6 +32,8 @@ struct Opts {
     /// The EC2 aggregator as the coordinator reaches it.
     ec2_local: Option<String>,
     site_key: Option<String>,
+    /// A DNS writer: tiles' and claims' frame URLs are then the published names.
+    dns: Option<fcvm::fleet::coord::dns::Cloudflare>,
 }
 
 impl Default for Opts {
@@ -45,6 +47,7 @@ impl Default for Opts {
             verifier: Arc::new(turnstile::Off),
             trust_cf: true,
             ec2_local: None,
+            dns: None,
             site_key: None,
         }
     }
@@ -62,7 +65,7 @@ async fn coordinator_with(o: Opts) -> Coord {
         None,
         o.ec2_local,
         None,
-        None,
+        o.dns,
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -721,6 +724,84 @@ async fn browser_intents_reach_the_agent_as_assignments() {
         }
         v.recv().await;
     }
+}
+
+/// With published names, a claim's frame URLs are its launch's published names, like a
+/// tile's: the agent's own URL names a host that has no record.
+#[tokio::test]
+async fn a_claims_frame_urls_are_its_launchs_published_names() {
+    use fcvm::fleet::coord::dns::Cloudflare;
+    let cf = FakeCf::default();
+    let base = fake_cloudflare(cf.clone()).await;
+    let gate = GateConfirm {
+        open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        cf: cf.clone(),
+        asked_before_written: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let writer = Cloudflare::with_endpoint(
+        "dns-token-for-tests".into(),
+        "fcvm.example".into(),
+        Some("zone-for-tests".into()),
+        &base,
+    )
+    .unwrap()
+    .with_confirm(Arc::new(gate));
+    let c = coordinator_with(Opts {
+        dns: Some(writer),
+        ..Opts::default()
+    })
+    .await;
+    let mut agent = FakeAgent::connect(&c.handle, "gpu-a", 1);
+    agent.assign().await;
+    let report = |generation: u64, v6: &str| {
+        AgentMsg::Slot(SlotReport {
+            id: "slot-1".into(),
+            phase: "running".into(),
+            generation,
+            frame_url: Some("wss://slot-1.fcvm.example/frames".into()),
+            ipv6: Some(v6.into()),
+            ipv4: Some("192.0.2.10".into()),
+            v4_port: Some(20200),
+            ..Default::default()
+        })
+    };
+    agent.to_coord.send(report(1, "2001:db8::1")).unwrap();
+    let mut a = Viewer::connect_from(&c.url, Some("198.51.100.1")).await;
+    a.until(|s| !s["tiles"][0]["frame_url"].is_null()).await;
+    a.intent("c1", "claim_gpu", json!({})).await;
+    assert_eq!(a.receipt("c1").await["outcome"], "committed");
+    agent.assign().await;
+    agent.to_coord.send(report(2, "2001:db8::1")).unwrap();
+    let claim = a
+        .message_where("claim", |m| {
+            m["claim"]["phase"] == "running" && !m["claim"]["frame_url"].is_null()
+        })
+        .await["claim"]
+        .clone();
+    let url = claim["frame_url"].as_str().unwrap();
+    let host = url
+        .strip_prefix("wss://")
+        .and_then(|u| u.strip_suffix("/frames"))
+        .unwrap();
+    assert!(
+        host.starts_with("slot-1-") && host.ends_with(".fcvm.example"),
+        "{claim}"
+    );
+    assert!(
+        cf.records
+            .lock()
+            .unwrap()
+            .values()
+            .any(|r| r["name"] == host),
+        "the claim's URL names no record: {claim}"
+    );
+    assert_eq!(
+        claim["frame_url_v4"],
+        format!(
+            "wss://{}-v4.fcvm.example:20200/frames",
+            host.strip_suffix(".fcvm.example").unwrap()
+        )
+    );
 }
 
 /// With every GPU drawing the wall, `claim_gpu` borrows a running tile's GPU. Only the

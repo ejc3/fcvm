@@ -434,6 +434,7 @@ async fn tell_claim(handle: Handle, viewer: String, direct: mpsc::Sender<ServerM
                 );
                 c.phase = "ended".into();
                 c.frame_url = None;
+                c.frame_url_v4 = None;
                 let _ = direct.send(ServerMsg::Claim { claim: c }).await;
                 return;
             }

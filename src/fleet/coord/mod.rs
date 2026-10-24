@@ -388,7 +388,12 @@ impl Actor {
                         tile: c.borrowed.clone(),
                         phase: if ready { "running" } else { "restoring" }.into(),
                         frame_url: if ready {
-                            s.observed.frame_url.clone()
+                            fleet_core::view::frame_urls(&self.state, s).0
+                        } else {
+                            None
+                        },
+                        frame_url_v4: if ready {
+                            fleet_core::view::frame_urls(&self.state, s).1
                         } else {
                             None
                         },
