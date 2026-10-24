@@ -17,7 +17,7 @@ import {
   posterUrl,
   readingOrder,
   screenToImage,
-  tileAt,
+  pointerTile,
   lightPosition,
   sceneT,
   serverNow,
@@ -327,8 +327,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   };
   const tileUnder = (x: number, y: number) => {
     const p = imagePoint(x, y);
-    const tiles = client.getState().accepted?.tiles ?? [];
-    return p ? tileAt(tiles, p.u, p.v) : null;
+    return p ? pointerTile(client.getState(), canDecode, p.u, p.v) : null;
   };
 
   const onPointerDown = (e: React.PointerEvent) => {

@@ -81,6 +81,12 @@ export class WallClient {
     const watches = cameraTargets(next);
     if (watches.length !== hadWatches.length || watches.some((w, i) => w.tEff !== hadWatches[i]?.tEff)) this.postWatch();
     for (const l of this.listeners) l();
+    // A claim came for a request the viewer dismissed: give the GPU back.
+    const release = next.own.release;
+    if (release !== null && before.own.release !== release) {
+      this.send("release_gpu", { claim: release });
+      this.dispatch({ type: "own-released", claim: release });
+    }
   }
 
   // ---- coordinator socket -----------------------------------------------------

@@ -144,6 +144,10 @@ export interface OwnGpu {
   claim: Claim | null;
   /** Why the coordinator refused the claim. */
   refused: string | null;
+  /** A claim_gpu the viewer dismissed before its claim arrived: a claim that comes for it is released. */
+  abandoned: string | null;
+  /** A claim to release: it arrived for the abandoned request. The client sends release_gpu, then "own-released". */
+  release: string | null;
 }
 
 /**
@@ -200,6 +204,8 @@ export type ClientEvent =
   | { type: "turnstile-error"; error: string }
   /** The viewer closed its own-GPU view, or dismissed a refusal. */
   | { type: "own-closed" }
+  /** The client sent release_gpu for own.release. */
+  | { type: "own-released"; claim: string }
   /** The frame drawer now draws this layout generation. */
   | { type: "gen-shown"; gen: number };
 
@@ -208,6 +214,8 @@ const NOTICES_KEPT = 6;
 const WATCHES_KEPT = 32;
 /** GPU readings kept per tile: two minutes at the coordinator's two-second cadence. */
 export const GPU_HISTORY = 60;
+
+const NO_OWN: OwnGpu = { requestId: null, requestedAt: null, claim: null, refused: null, abandoned: null, release: null };
 
 export function initialState(): ClientState {
   return {
@@ -226,7 +234,7 @@ export function initialState(): ClientState {
     serverError: null,
     you: null,
     turnstile: { sitekey: null, verified: false, verifying: false, error: null, queued: [] },
-    own: { requestId: null, requestedAt: null, claim: null, refused: null },
+    own: NO_OWN,
     gpuHistory: {},
     shownLayout: null,
     ui: {
@@ -312,7 +320,7 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
             ].slice(-WATCHES_KEPT)
           : s.cameraWatches;
       const own =
-        e.intent.name === "claim_gpu" ? { requestId: e.intent.id, requestedAt: e.at, claim: null, refused: null } : s.own;
+        e.intent.name === "claim_gpu" ? { ...NO_OWN, requestId: e.intent.id, requestedAt: e.at } : s.own;
       return { ...s, pending, cameraWatches, own };
     }
     case "frame-stats":
@@ -344,7 +352,10 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
       return { ...s, shownLayout: { gen: st.layout.generation, tiles: st.tiles, aggregates: st.aggregates } };
     }
     case "own-closed":
-      return { ...s, own: { requestId: null, requestedAt: null, claim: null, refused: null } };
+      // Dismissed while the request is still out: the claim it may yet bring is released when it comes.
+      return { ...s, own: { ...NO_OWN, abandoned: s.own.requestId !== null && s.own.claim === null ? s.own.requestId : null } };
+    case "own-released":
+      return s.own.release === e.claim ? { ...s, own: { ...s.own, release: null, abandoned: null } } : s;
     case "message": {
       let msg;
       try {
@@ -384,7 +395,11 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
           };
         case "claim": {
           // Only the claim this page asked for, or the one it holds.
-          if (s.own.requestId === null && s.own.claim === null) return s;
+          if (s.own.requestId === null && s.own.claim === null) {
+            // The answer to a request the viewer dismissed: give the GPU back.
+            if (s.own.abandoned !== null && s.own.release === null && msg.claim.phase !== "ended") return { ...s, own: { ...s.own, release: msg.claim.id } };
+            return s;
+          }
           if (s.own.claim !== null && s.own.claim.id !== msg.claim.id) return s;
           const own = { ...s.own, requestId: null, claim: msg.claim };
           const cameraWatches = s.cameraWatches.map((w) => resolveWatch(w, msg.claim.camera, s.version));
@@ -447,6 +462,8 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
           if (s.own.requestId === msg.id) {
             // Applied: the claim message (which can come before or after this) ends the request.
             if (!applied) own = { ...s.own, requestId: null, requestedAt: null, refused: msg.reason ?? "refused" };
+          } else if (s.own.abandoned === msg.id && !applied) {
+            own = { ...s.own, abandoned: null };
           }
           return { ...s, handled, pending, notices, cameraWatches, own };
         }

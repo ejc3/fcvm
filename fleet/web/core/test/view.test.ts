@@ -11,12 +11,14 @@ import {
   needsVerify,
   nativePlacement,
   placeLabel,
+  pointerTile,
   relaunchParts,
   sourceIdFor,
   wallView,
   type WallInput,
 } from "../view.ts";
 import { suggestMode } from "../mode.ts";
+import { tileAt as tileAtPoint } from "../layout.ts";
 import { parseReelMeta, reelView } from "../reel.ts";
 import type { Claim, FleetState, Power, RelaunchAll } from "../protocol.ts";
 import { EPOCH, fleet, fleetSplit, snapshotText } from "./fixtures.ts";
@@ -716,6 +718,19 @@ describe("re-tiling: each side as wide as the GPUs it has", () => {
       expect(v.seams.segments.length).toBeGreaterThan(0);
     });
   }
+
+  it("the pointer targets the tile drawn there, not the one of a tiling still waiting for its streams", () => {
+    const drawn = fleetSplit(8, 7, 1);
+    let s = snap(stateWith(drawn), 2, fleetSplit(4, 7, 2));
+    // (0.45, 0.5) is fcvm:7 in the drawn tiling and an EC2 tile in the waiting one.
+    expect(tileAtPoint(drawn.tiles, 0.45, 0.5)!.id).toBe("fcvm:7");
+    expect(tileAtPoint(fleetSplit(4, 7, 2).tiles, 0.45, 0.5)!.half).toBe("ec2");
+    expect(pointerTile(s, true, 0.45, 0.5)!.id).toBe("fcvm:7");
+    s = reduce(s, { type: "gen-shown", gen: 2 });
+    expect(pointerTile(s, true, 0.45, 0.5)!.half).toBe("ec2");
+    // A browser that cannot decode draws no frames, so its overlays and pointer follow the newest snapshot.
+    expect(pointerTile(snap(stateWith(drawn), 2, fleetSplit(4, 7, 2)), false, 0.45, 0.5)!.half).toBe("ec2");
+  });
 
   it("keeps the latest state of a tile that stays, on its drawn rectangle", () => {
     let s = stateWith(fleetSplit(4, 4, 1));

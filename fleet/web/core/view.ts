@@ -12,6 +12,7 @@ import {
   splitOf,
   streamHeightFor,
   seamSegments,
+  tileAt,
   type Box,
   type MosaicLayout,
   type PlacedTile,
@@ -1182,6 +1183,19 @@ export interface WallView {
 }
 
 /**
+ * The tiles the overlays follow: the drawn generation while a newer one waits for its
+ * streams. A browser that cannot decode draws no frames, so it follows the newest.
+ */
+export function shownTilesOf(s: ClientState, canDecode: boolean): Tile[] {
+  return canDecode ? drawnTiles(s) : s.accepted?.tiles ?? [];
+}
+
+/** The tile under an image point, as the pointer targets it: the one drawn there. */
+export function pointerTile(s: ClientState, canDecode: boolean, u: number, v: number): Tile | null {
+  return tileAt(shownTilesOf(s, canDecode), u, v);
+}
+
+/**
  * The tiles the canvas draws now: the shown generation's places and rectangles,
  * each with its latest state when the newest snapshot still has it.
  */
@@ -1306,7 +1320,7 @@ export function wallView(input: WallInput): WallView {
   const sleep = sleepView(st, srvNow);
   // Two tilings while a re-tile settles: the plan is the newest generation (its
   // streams open now), and the overlays follow the one the canvas still draws.
-  const shownTiles = input.canDecode ? drawnTiles(s) : st.tiles;
+  const shownTiles = shownTilesOf(s, input.canDecode);
   const planLayout = area ? layoutMosaic(area, st.tiles, input.dpr, st.image_aspect) : null;
   const layout = shownTiles === st.tiles ? planLayout : area ? layoutMosaic(area, shownTiles, input.dpr, st.image_aspect) : null;
   const placedById = new Map<string, PlacedTile>(layout?.tiles.map((p) => [p.id, p]) ?? []);

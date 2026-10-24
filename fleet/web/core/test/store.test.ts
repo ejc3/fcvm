@@ -126,6 +126,35 @@ describe("input to pixels", () => {
   });
 });
 
+describe("a GPU request dismissed before its claim arrives", () => {
+  const claimMsg = (phase: string) => JSON.stringify({ type: "claim", claim: { id: "claim-1", tile: "fcvm:4", phase, frame_url: null, clicked_at: EPOCH, first_frame_at: null, expires_at: null, gpu: "Tesla T4", phases: {}, camera: [], ended: phase === "ended" ? "released" : null } });
+
+  it("releases the claim that arrives afterwards, once, and keeps the panel closed", () => {
+    let s = feed(initialState(), snapshotText(1, fleet()));
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("own", "claim_gpu"), at: EPOCH });
+    s = reduce(s, { type: "own-closed" });
+    expect(s.own.requestId).toBeNull();
+    s = feed(s, claimMsg("restoring"), EPOCH + 500);
+    expect(s.own.release).toBe("claim-1");
+    expect(s.own.claim).toBeNull();
+    s = reduce(s, { type: "own-released", claim: "claim-1" });
+    expect(s.own.release).toBeNull();
+    // The coordinator's last claim message for it changes nothing.
+    s = feed(s, claimMsg("ended"), EPOCH + 900);
+    expect(s.own.release).toBeNull();
+    expect(s.own.claim).toBeNull();
+  });
+
+  it("has nothing to release when the request was refused", () => {
+    let s = feed(initialState(), snapshotText(1, fleet()));
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("own", "claim_gpu"), at: EPOCH });
+    s = reduce(s, { type: "own-closed" });
+    s = feed(s, JSON.stringify({ type: "receipt", id: "own", outcome: "refused", reason: "no GPU free", version: 2 }));
+    s = feed(s, claimMsg("restoring"), EPOCH + 500);
+    expect(s.own.release).toBeNull();
+  });
+});
+
 describe("a viewer's own GPU across a reconnect", () => {
   const running = JSON.stringify({ type: "claim", claim: { id: "claim-1", tile: "fcvm:4", phase: "running", frame_url: "ws://example-host:2/frames/claim-1", clicked_at: EPOCH, first_frame_at: EPOCH + 2900, expires_at: EPOCH + 62_900, gpu: "Tesla T4", phases: {}, camera: [], ended: null } });
 
