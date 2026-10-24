@@ -249,6 +249,10 @@ fn unique_env(tag: &str) -> Result<String> {
 /// Run `podman run` with `flags` until it is healthy, return the snapshot it records
 /// (what it restored from, or its startup snapshot once that is taken) and, with
 /// `started_at`, its container's StartedAt; then stop it.
+///
+/// The subject is the snapshot lifecycle, which the CI SnapshotDisabled lane switches off
+/// with an inherited FCVM_NO_SNAPSHOT=1; the run drops it so the tests mean the same in
+/// every lane.
 async fn run_once(
     name: &str,
     env: &str,
@@ -258,9 +262,10 @@ async fn run_once(
     let mut args = vec!["podman", "run", "--name", name, "--env", env];
     args.extend_from_slice(flags);
     args.push(TEST_IMAGE);
-    let (mut child, pid) = common::spawn_fcvm(&args)
-        .await
-        .with_context(|| format!("spawning {name}"))?;
+    let (mut child, pid, _log) =
+        common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(&args, &[])
+            .await
+            .with_context(|| format!("spawning {name}"))?;
     let result = async {
         common::poll_health_by_pid(pid, 300).await?;
         // Healthy is published after a startup snapshot is taken.
