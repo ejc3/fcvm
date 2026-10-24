@@ -252,6 +252,11 @@ jobs:
         run: pnpm build
       - name: Browser tests
         run: pnpm test:e2e
+      # The staging deploy ships this Worker; it must serve the page, not only build.
+      - name: Build the Worker
+        run: pnpm cf:build
+      - name: Serve the built Worker
+        run: scripts/worker-smoke.sh 24110
 
   # Lints every workflow file. Lives here, not in claude-lint.yml, so `Summary`
   # gates it: a PR that changes only `.github/workflows/claude*.yml` skips the

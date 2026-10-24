@@ -51,6 +51,10 @@ jobs:
         run: pnpm lint && pnpm typecheck
       - name: Build the Worker
         run: pnpm cf:build
+      # The Access check after the deploy cannot see past Access: a Worker that throws on
+      # every request answers the unauthenticated request with the same 302.
+      - name: Serve the built Worker before shipping it
+        run: scripts/worker-smoke.sh 24110
       - name: Deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
