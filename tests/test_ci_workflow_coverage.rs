@@ -2563,3 +2563,44 @@ fn the_built_worker_must_serve_the_page_in_ci_and_before_each_deploy() {
         "the deploy must build, then serve, then ship the Worker"
     );
 }
+
+/// The x64 runner's root volume is restored lazily from its AMI snapshot, and the AMI
+/// holds root-store image layers that the localhost image tests build on. Read cold,
+/// inside the suite, they cost every export about 100 s (a 4.7 MB/s volume at 10 ms per
+/// read) and tests with a 120 s budget failed their first try in most cold x64 runs.
+/// The host-root job reads them before it builds and waits for that read before the
+/// suite. Both steps must stay, in that order.
+#[test]
+fn host_root_reads_the_root_container_store_before_the_suite() {
+    let ci = parse_workflow("ci.yml");
+    let steps = workflow_job(&ci, "host-root")["steps"]
+        .as_sequence()
+        .expect("host-root has steps");
+    let runs = |needle: &str| {
+        steps.iter().position(|s| {
+            s.get("run")
+                .and_then(Value::as_str)
+                .is_some_and(|r| r.lines().any(|l| l.trim() == needle))
+        })
+    };
+    let named = |name: &str| {
+        steps
+            .iter()
+            .position(|s| s.get("name").and_then(Value::as_str) == Some(name))
+            .unwrap_or_else(|| panic!("host-root has no `{name}` step"))
+    };
+    let start = runs("./scripts/ci-warm-root-container-store.sh start")
+        .expect("host-root never starts the container store warm-up");
+    let wait = runs("./scripts/ci-warm-root-container-store.sh wait")
+        .expect("host-root never waits for the container store warm-up");
+    let build = named("setup-fcvm");
+    let suite = named("test-root");
+    assert!(
+        start < build,
+        "the warm-up must start before the build it overlaps (start {start}, setup-fcvm {build})"
+    );
+    assert!(
+        build < wait && wait < suite,
+        "the suite must not start before the warm-up is waited for (wait {wait}, test-root {suite})"
+    );
+}

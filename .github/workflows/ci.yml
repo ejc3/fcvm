@@ -902,6 +902,14 @@ jobs:
       - name: Stray microVM guard (pre)
         working-directory: fcvm
         run: ./scripts/ci-stray-vm-guard.sh pre
+      # The root volume is restored lazily from the AMI's snapshot, and the x64 AMI holds
+      # root-store image layers the localhost image tests build on. Read them now, while
+      # the job builds. Read first in the suite, the pjdfstest export held the layer store
+      # lock for ~107 s and every root podman call queued behind it
+      # (scripts/ci-warm-root-container-store.sh).
+      - name: Warm root container store
+        working-directory: fcvm
+        run: ./scripts/ci-warm-root-container-store.sh start
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
         run: |
@@ -1033,6 +1041,9 @@ jobs:
         run: |
           echo 512 | sudo tee /proc/sys/vm/nr_hugepages
           echo "Allocated $(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages) hugepages"
+      - name: Wait for root container store warm-up
+        working-directory: fcvm
+        run: ./scripts/ci-warm-root-container-store.sh wait
       - name: test-root
         working-directory: fcvm
         run: |
