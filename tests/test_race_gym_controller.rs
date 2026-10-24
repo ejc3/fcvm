@@ -88,7 +88,7 @@ fn ctx(root: &std::path::Path, tag: &str) -> RunCtx {
 
 #[tokio::test]
 async fn race_gym_pair_search_finds_the_toy_race_and_replay_reproduces_it() -> Result<()> {
-    let root = std::env::temp_dir().join(format!("race-gym-toy-{}", std::process::id()));
+    let root = scripts_root("toy");
     let toy = Toy { root: root.clone() };
     let limits = Limits {
         step_deadline: Duration::from_secs(20),
@@ -253,7 +253,7 @@ async fn race_gym_a_silent_actor_fails_as_an_unmodeled_wait() -> Result<()> {
             Box::pin(async { Vec::new() })
         }
     }
-    let root = std::env::temp_dir().join(format!("race-gym-silent-{}", std::process::id()));
+    let root = scripts_root("silent");
     let limits = Limits {
         step_deadline: Duration::from_millis(500),
     };
@@ -322,7 +322,7 @@ kill $bg
             Box::pin(async { Vec::new() })
         }
     }
-    let root = std::env::temp_dir().join(format!("race-gym-two-{}", std::process::id()));
+    let root = scripts_root("two");
     let limits = Limits {
         step_deadline: Duration::from_secs(5),
     };
@@ -386,8 +386,20 @@ impl Scenario for Scripts {
     }
 }
 
+/// A test's own directory, `race-gym-<name>-<pid>` under the temp dir, emptied first. A test
+/// removes it when it passes and leaves it for diagnosis when it fails, so a later run with
+/// the same pid would otherwise find the failed run's files.
 fn scripts_root(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("race-gym-{name}-{}", std::process::id()))
+    let root = std::env::temp_dir().join(format!("race-gym-{name}-{}", std::process::id()));
+    if let Err(error) = std::fs::remove_dir_all(&root) {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clearing {}: {error}",
+            root.display()
+        );
+    }
+    root
 }
 
 /// Actor 0 waits on a lock actor 1 holds and exits a moment after actor 1's last release,
@@ -588,4 +600,74 @@ async fn race_gym_a_failed_discovery_fails_the_gym() -> Result<()> {
     assert_eq!(race_gym::discovery_findings(&whole)?, whole.failed);
     std::fs::remove_dir_all(&root)?;
     Ok(())
+}
+
+/// A test starts from an empty directory even when a failed run with the same pid left its
+/// files behind (the toy skips its create step when the shared file already exists).
+#[test]
+fn race_gym_a_test_root_starts_empty() {
+    let stale = std::env::temp_dir().join(format!("race-gym-stale-{}", std::process::id()));
+    std::fs::create_dir_all(stale.join("shared")).unwrap();
+    std::fs::write(stale.join("shared/f"), "left by a failed run").unwrap();
+    let root = scripts_root("stale");
+    assert_eq!(root, stale);
+    let left = std::fs::read_dir(&root).map(|d| d.count()).unwrap_or(0);
+    let _ = std::fs::remove_dir_all(&stale);
+    assert_eq!(
+        left,
+        0,
+        "{} still holds a previous run's files",
+        root.display()
+    );
+}
+
+/// `make race-gym EMIT=` writes the recorded failure into a `///` comment. A failure detail
+/// that spans lines (a control failure's error chain) must stay inside the comment, or the
+/// emitted case does not compile.
+#[test]
+fn race_gym_emit_keeps_a_multiline_failure_in_its_comment() {
+    let tree = std::env::temp_dir().join(format!("race-gym-emit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tree);
+    std::fs::create_dir_all(tree.join("scripts")).unwrap();
+    // rustfmt, which the script runs last, reads the module the case section declares.
+    std::fs::create_dir_all(tree.join("tests/race_gym")).unwrap();
+    std::fs::write(tree.join("tests/race_gym/mod.rs"), "").unwrap();
+    let script = tree.join("scripts/race-gym-emit.sh");
+    std::fs::copy(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/race-gym-emit.sh"),
+        &script,
+    )
+    .unwrap();
+    let tests = tree.join("tests/test_lifecycle_interleave.rs");
+    std::fs::write(&tests, "use anyhow::Result;\n").unwrap();
+    let replay = tree.join("replay.json");
+    let body = serde_json::json!({
+        "format": 1,
+        "scenario": "toy",
+        "fcvm_rev": "test",
+        "params": {},
+        "schedule": "lockstep",
+        "steps": [{"actor": 0, "release": "a.one#1", "event": {"exited": 0}}],
+        "failed": [{"oracle": "control", "actor": null, "detail": "first line\nsecond line"}],
+        "pin_oracles": [],
+    });
+    std::fs::write(&replay, body.to_string()).unwrap();
+    let out = std::process::Command::new("bash")
+        .arg(&script)
+        .arg(&replay)
+        .arg("multiline")
+        .output()
+        .expect("running race-gym-emit.sh");
+    let emitted = std::fs::read_to_string(&tests).unwrap();
+    assert!(
+        out.status.success(),
+        "race-gym-emit.sh failed ({}): {}\n{emitted}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        emitted.contains("/// Recorded failure: control: first line second line\n"),
+        "{emitted}"
+    );
+    std::fs::remove_dir_all(&tree).unwrap();
 }

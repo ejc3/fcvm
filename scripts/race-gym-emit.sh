@@ -45,7 +45,7 @@ if ! grep -q '^mod race_gym;' "$tests"; then
 mod race_gym;
 RS
 fi
-summary=$(jq -r '(.pin_oracles // []) as $p | [.failed[] | select(($p | length) == 0 or (.oracle as $o | $p | index($o))) | .oracle + ": " + .detail] | first // "no failure recorded"' "$case_file" | cut -c1-120 | tr -d '"')
+summary=$(jq -r '(.pin_oracles // []) as $p | [.failed[] | select(($p | length) == 0 or (.oracle as $o | $p | index($o))) | .oracle + ": " + (.detail | gsub("[\\r\\n]+"; " "))] | first // "no failure recorded"' "$case_file" | cut -c1-120 | tr -d '"')
 cat >> "$tests" <<RS
 
 /// Race gym replay \`$name\` ($(jq -r '.scenario' "$replay"), $(jq -c '.schedule' "$replay")).
