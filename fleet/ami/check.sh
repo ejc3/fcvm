@@ -35,5 +35,12 @@ image=$(sed -n '/^image)/,/;;/p' fleet/ami/tile/build.sh)
 grep -qF "| jq -e '$ready' >/dev/null || { echo \"renderer not ready after 300 s\"" <<<"$image" ||
   no "tile image phase does not fail when the renderer is not ready after the wait"
 
+# gpubox passes its lease script to `aws ec2 run-instances --user-data` as the script
+# itself: the CLI base64-encodes user data, so a pre-encoded script reaches cloud-init as
+# base64 text and the lease timer is never installed (seen 2026-10-24: describing a
+# test instance's userData and decoding it once gave base64 text back).
+grep -qE 'ud=\$\(lease_userdata "\$lease"\)$' fleet/tools/gpubox.sh ||
+  no "gpubox.sh must pass the lease script to --user-data unencoded"
+
 [ "$fail" = 0 ] && echo "fleet/ami checks: ok"
 exit "$fail"

@@ -150,7 +150,7 @@ up)
   lease=$(date -u -d "+$hours hours" '+%Y-%m-%d %H:%M:%S')
   ami=$(host_ami); [ "$ami" != None ] || die "no fleet host AMI in $REGION"
   sg=$(A ec2 describe-security-groups --filters Name=group-name,Values=fcvm-fleet --query 'SecurityGroups[0].GroupId' --output text)
-  ud=$(lease_userdata "$lease" | base64 -w0)
+  ud=$(lease_userdata "$lease")
   t0=$(now); id=""
   for market in spot on-demand; do
     for az in $AZS; do
