@@ -271,6 +271,11 @@ pub fn shared_cache_verdict(initial: CacheVerdict) -> SharedCacheVerdict {
 pub enum SnapshotOutcome {
     /// Snapshot created successfully
     Created,
+    /// Another process installed this content-addressed snapshot first. This VM was not
+    /// paused and its memory is not the snapshot's, so the snapshot must not become its
+    /// diff parent: a later diff snapshot of this VM would merge its dirty pages onto
+    /// another guest's memory (#1231).
+    Existing,
     /// Snapshot creation failed
     Failed(anyhow::Error),
     /// Signal received during creation (caller should break and shutdown)

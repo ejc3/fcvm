@@ -2749,10 +2749,11 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                             *ctx.cache_verdict.lock().unwrap() = CacheVerdict::Doomed;
                             return Ok(None);
                         }
-                        SnapshotOutcome::Created => {
+                        outcome @ (SnapshotOutcome::Created | SnapshotOutcome::Existing) => {
                             // NV2 (vEL2) guests: do NOT ack fc-agent and do NOT resume
                             // into this VM — tear it down and restore the snapshot we just
-                            // produced, so the miss path runs the exact same restore flow
+                            // produced (or that another process installed under this key
+                            // first), so the miss path runs the exact same restore flow
                             // as a hit. Resuming the paused VM is the lifecycle that
                             // intermittently starves Firecracker's device event loop under
                             // NV2 timer/vsock churn (#630: NETDEV watchdog, stalled FUSE,
@@ -2784,16 +2785,27 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                                 ctx.restore_from_cache = Some(key.clone());
                                 return Ok(None);
                             }
-                            info!(snapshot_key = %key, "Pre-start snapshot created successfully");
-                            ctx.vm_state.config.snapshot_name = Some(key.clone());
-                            // Locked read-modify-write: only update snapshot_name so the
-                            // health monitor's concurrent writes are not clobbered.
-                            let _ = ctx
-                                .state_manager
-                                .update_state(&ctx.vm_state.vm_id, |state| {
-                                    state.config.snapshot_name = Some(key.clone());
-                                })
-                                .await;
+                            if matches!(outcome, SnapshotOutcome::Existing) {
+                                // Another process's snapshot holds another guest's memory.
+                                // This cold-booted VM records no parent, so its next
+                                // snapshot is a full one (#1231).
+                                info!(
+                                    snapshot_key = %key,
+                                    "Pre-start snapshot installed by another process; not \
+                                     recorded as this VM's diff parent"
+                                );
+                            } else {
+                                info!(snapshot_key = %key, "Pre-start snapshot created successfully");
+                                ctx.vm_state.config.snapshot_name = Some(key.clone());
+                                // Locked read-modify-write: only update snapshot_name so the
+                                // health monitor's concurrent writes are not clobbered.
+                                let _ = ctx
+                                    .state_manager
+                                    .update_state(&ctx.vm_state.vm_id, |state| {
+                                        state.config.snapshot_name = Some(key.clone());
+                                    })
+                                    .await;
+                            }
                         }
                         SnapshotOutcome::Failed(e) if !ctx.args.gpu.is_empty() => {
                             // Continuing cold would run the container without its GPU.
@@ -2856,6 +2868,10 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         info!(snapshot_key = %startup_key, "Startup snapshot already exists, skipping");
                     } else {
                         info!(snapshot_key = %startup_key, "Creating startup snapshot (VM healthy)");
+                        // failpoint: hold between the existence check above and the
+                        // create's generation lock, where another process can install
+                        // the same content-addressed snapshot first.
+                        failpoint::hit_async("snapshot.startup.pre_create").await;
 
                         // Use select! so SIGTERM can abort startup snapshot immediately.
                         // This is safe: startup snapshots are optional (just caching), so
@@ -2887,6 +2903,16 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                                 match outcome {
                                     SnapshotOutcome::Interrupted => {
                                         return Ok(None);
+                                    }
+                                    SnapshotOutcome::Existing => {
+                                        // Another process's snapshot holds another guest's
+                                        // memory. The VM keeps its pre-start snapshot as its
+                                        // diff parent (#1231).
+                                        info!(
+                                            snapshot_key = %startup_key,
+                                            "Startup snapshot installed by another process; not \
+                                             recorded as this VM's diff parent"
+                                        );
                                     }
                                     SnapshotOutcome::Created => {
                                         info!(snapshot_key = %startup_key, "Startup snapshot created successfully");

@@ -7029,6 +7029,156 @@ async fn the_restore_hook_reaches_the_network() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A VM whose startup snapshot another process installed first keeps its own
+/// pre-start snapshot as its diff parent, and a snapshot of it restores (#1231).
+///
+/// Two cold runs with one cache key: B creates the pre-start snapshot, and between
+/// B's check for the startup snapshot and its create's lock, A (restored from B's
+/// pre-start snapshot) installs the startup snapshot. B used to record A's startup
+/// snapshot as its own parent, so `fcvm snapshot create` of B merged B's dirty pages
+/// onto A's memory, and the clone's kernel panicked in its first interrupt after
+/// resume ("Fatal exception in interrupt"). The failpoint holds B in that window
+/// while A runs, so the interleaving is fixed, not raced.
+///
+/// RED BEFORE THE FIX: B's state named `<key>-startup` as its snapshot.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn a_startup_snapshot_another_vm_installed_is_not_the_sources_diff_parent() -> Result<()> {
+    let (b_name, a_name, snap_tag, _) = common::unique_names("lineage");
+    let clone_name = format!("{b_name}-clone");
+    // An env var in the cache key, so no other test shares these snapshots.
+    let env_unique = format!("FCVM_LINEAGE_TEST={b_name}");
+    let run_args = |name: &str| -> Vec<String> {
+        [
+            "podman",
+            "run",
+            "--name",
+            name,
+            "--network",
+            "rootless",
+            "--env",
+            env_unique.as_str(),
+            "--health-check",
+            "http://localhost/",
+            common::TEST_IMAGE,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    };
+    let gate = std::env::temp_dir().join(format!("{b_name}-startup-go"));
+    let _ = std::fs::remove_file(&gate);
+    let spec = format!(
+        "snapshot.startup.pre_create:block_until_file:{}",
+        gate.display()
+    );
+
+    let b_args = run_args(&b_name);
+    let b_refs: Vec<&str> = b_args.iter().map(String::as_str).collect();
+    let (mut b, b_pid, b_log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+        &b_refs,
+        &[("FCVM_FAILPOINT", spec.as_str())],
+    )
+    .await?;
+    let mut key: Option<String> = None;
+
+    let outcome = async {
+        // B: cold boot, its own pre-start snapshot, then held before the startup create.
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            let text = std::fs::read_to_string(&b_log).unwrap_or_default();
+            if text.contains("FAILPOINT snapshot.startup.pre_create reached") {
+                break;
+            }
+            anyhow::ensure!(
+                b.try_wait()?.is_none(),
+                "B exited before its startup snapshot; log at {}",
+                b_log.display()
+            );
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "B did not reach its startup snapshot within 300 s; log at {}",
+                b_log.display()
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let (how, pre_start) =
+            common::cache_choice(&b_log).context("B's log does not say how it started")?;
+        key = Some(pre_start.clone());
+        anyhow::ensure!(how == "cold boot", "control: B started from a {how}");
+        let startup = format!("{pre_start}-startup");
+
+        // A: restores B's pre-start snapshot and installs the startup snapshot.
+        let a_args = run_args(&a_name);
+        let a_refs: Vec<&str> = a_args.iter().map(String::as_str).collect();
+        let (mut a, a_pid, a_log) =
+            common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(&a_refs, &[]).await?;
+        let a_healthy = common::poll_health(&mut a, 300).await;
+        common::kill_process(a_pid).await;
+        let _ = a.wait().await;
+        a_healthy?;
+        let a_choice = common::cache_choice(&a_log);
+        anyhow::ensure!(
+            a_choice == Some(("pre-start snapshot", pre_start.clone())),
+            "control: A started from {a_choice:?}, not B's pre-start snapshot {pre_start}"
+        );
+        anyhow::ensure!(
+            common::snapshot_exists(&startup),
+            "control: A did not install the startup snapshot {startup}"
+        );
+
+        // B: finds the startup snapshot installed when it takes the lock.
+        std::fs::write(&gate, b"go").context("releasing B")?;
+        common::poll_health(&mut b, 300).await?;
+        let b_text = std::fs::read_to_string(&b_log)?;
+        anyhow::ensure!(
+            b_text.contains(&format!(
+                "Snapshot already exists (created by another process) snapshot_key={startup}"
+            )),
+            "control: B did not find the startup snapshot installed; log at {}",
+            b_log.display()
+        );
+        let recorded = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+            .load_state_by_pid(b_pid)
+            .await?
+            .config
+            .snapshot_name;
+        anyhow::ensure!(
+            recorded.as_deref() == Some(pre_start.as_str()),
+            "B's state names {recorded:?} as its diff parent, not its own pre-start \
+             snapshot {pre_start}"
+        );
+
+        // A snapshot of B restores and serves.
+        common::create_snapshot_by_pid(b_pid, &snap_tag).await?;
+        let (mut serve, serve_pid) = common::start_memory_server(&snap_tag).await?;
+        let cloned = async {
+            common::poll_serve_ready(&snap_tag, serve_pid, 60).await?;
+            let (mut clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
+            let healthy = common::poll_health(&mut clone, 300).await;
+            common::kill_process(clone_pid).await;
+            let _ = clone.wait().await;
+            healthy
+        }
+        .await;
+        common::kill_process(serve_pid).await;
+        let _ = serve.wait().await;
+        cloned.context("the clone of B did not become healthy")
+    }
+    .await;
+
+    let _ = std::fs::write(&gate, b"go");
+    common::kill_process(b_pid).await;
+    let _ = b.wait().await;
+    let _ = std::fs::remove_file(&gate);
+    let _ = common::delete_snapshot(&snap_tag).await;
+    if let Some(key) = key {
+        let _ = common::delete_snapshot(&format!("{key}-startup")).await;
+        let _ = common::delete_snapshot(&key).await;
+    }
+    outcome
+}
+
 /// A run that gives no hook and restores a startup snapshot made by a run that did
 /// runs no hook. The hook is not in the snapshot cache key, so the two runs share
 /// the snapshot, and the recorded hook is the other run's.
