@@ -1,0 +1,109 @@
+name: Fleet coordinator staging deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/fleet/**'
+      - 'src/cli.rs'
+      - 'fleet/core/**'
+      - 'fleet/coord/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'rootfs-config.toml'
+      - '.github/workflows/fleet-coordinator-deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-coordinator-stage
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@48b64ba94bc1a6fe819fd9afc0799a7647efdc65 # 1.93.0
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: fleet-coordinator-arm64
+      - name: Build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev libclang-dev clang ffmpeg
+      - name: Release and staging probe tests
+        run: python3 -B fleet/coord/test_release.py
+      - name: Coordinator contract tests
+        run: make test-fleet-coordinator
+      - name: Build the coordinator binary
+        run: make build-fleet-coordinator
+      - name: Build and serve the ARM64 image without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C fleet/coord image ENGINE=docker TAG="$GITHUB_SHA" IMAGE="fcvm-fleet-coordinator:$GITHUB_SHA"
+          id=$(docker run -d --read-only --cap-drop ALL --security-opt no-new-privileges \
+            -p 127.0.0.1:24120:8080 "fcvm-fleet-coordinator:$GITHUB_SHA")
+          trap 'docker rm -f "$id" >/dev/null' EXIT
+          ready=false
+          for _ in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:24120/healthz; then ready=true; break; fi
+            sleep 1
+          done
+          test "$ready" = true
+          docker save -o "$RUNNER_TEMP/coordinator-image.tar" "fcvm-fleet-coordinator:$GITHUB_SHA"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: fleet-coordinator-arm64
+          path: ${{ runner.temp }}/coordinator-image.tar
+          compression-level: 0
+          retention-days: 1
+
+  deploy:
+    needs: build
+    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    environment: fleet-stage-deploy
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: fleet-coordinator-arm64
+          path: ${{ runner.temp }}/coordinator-image
+      - name: Load the tested image
+        run: docker load -i "$RUNNER_TEMP/coordinator-image/coordinator-image.tar"
+      # OIDC admits only this main-only environment. The role can publish this
+      # image and invoke one image-only releaser; it cannot read state or call ECS.
+      - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+          role-session-name: fcvm-stage-${{ github.run_id }}
+      - name: Publish and release the staging coordinator
+        env:
+          COORDINATOR_REPO: ${{ vars.COORDINATOR_REPO }}
+          COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
+        run: python3 -B fleet/coord/publish.py
+      # This is a real viewer: it may wake the fleet and relaunches one tile
+      # in each half. A capacity drought fails this check; it never counts as a pass.
+      - name: Access, fresh launch names and renderer frames over IPv4
+        env:
+          STAGING_API_URL: ${{ vars.STAGING_API_URL }}
+          STAGING_ORIGIN: ${{ vars.STAGING_ORIGIN }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: python3 -B fleet/coord/stage-smoke.py
