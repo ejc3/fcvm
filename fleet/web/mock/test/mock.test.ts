@@ -1,0 +1,746 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import WebSocket from "ws";
+import { innerRect, parseFrame, parseStreamHeader, splitNals, nalType, NAL_SPS, NAL_IDR } from "../../core/frame.ts";
+import { MockCoordinator } from "../coordinator.ts";
+import { gridIn, mockLayout } from "../layout.ts";
+import { MockRenderers } from "../renderer.ts";
+import { FFMPEG } from "../encoder.ts";
+import { tileGeometry } from "../../core/layout.ts";
+import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { expectedRgb, frameCtx, renderI420 } from "../pattern.ts";
+import { ensureReel } from "../media.ts";
+
+const MEDIA = "node_modules/.cache/fleet-mock-media-test";
+let coord: MockCoordinator;
+let renderers: MockRenderers;
+const FPS = 20;
+
+beforeAll(async () => {
+  const epochUnixMs = Math.floor(Date.now() / 1000) * 1000;
+  ensureReel(MEDIA, epochUnixMs, "320x180");
+  renderers = new MockRenderers({ port: 0, publicHost: "localhost", fps: FPS, threads: 2, maxHeight: 360, epochUnixMs, scene: () => coord.patternScene() });
+  await renderers.listen();
+  coord = new MockCoordinator({
+    port: 0, fcvmGpus: 2, ec2Gpus: 1, gpusPerHost: 1, fcvmRelaunchMs: 400, ec2RelaunchMs: 900,
+    raceEverySecs: 0, firstRaceSecs: 0, cooldownSecs: 1, capacityWaitProb: 0, capacityWaitMs: [0, 0],
+    borrowCap: 1, claimSecs: 1, holdSecs: 600, travelSecs: 0.5, turnstileSitekey: null,
+    sleepAfterSecs: 0, wakeMs: 800, mediaDir: MEDIA,
+    refusedWords: ["forbidden"], checkMs: 20, epochUnixMs, renderers,
+  });
+  await coord.listen();
+});
+
+afterAll(async () => {
+  await coord.close();
+  await renderers.close();
+});
+
+async function admin(path: string, body: unknown): Promise<unknown> {
+  const r = await fetch(`http://localhost:${coord.port}${path}`, { method: "POST", body: JSON.stringify(body) });
+  expect(r.status, path).toBe(200);
+  return r.json();
+}
+
+/** Every snapshot state any socket of this suite received: the last test holds them to the coordinator's shapes. */
+const seenStates: unknown[] = [];
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Wait for a condition on the mock's state, polling. */
+async function until(pred: () => boolean, ms = 5000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!pred()) {
+    if (Date.now() > end) throw new Error("condition not met in time");
+    await sleep(20);
+  }
+}
+
+function live(): Promise<{ ws: WebSocket; msgs: Record<string, unknown>[]; next: (pred: (m: Record<string, unknown>) => boolean) => Promise<Record<string, unknown>> }> {
+  return new Promise((resolve) => {
+    const ws = new WebSocket(`ws://localhost:${coord.port}/live`);
+    const msgs: Record<string, unknown>[] = [];
+    const waiters: { pred: (m: Record<string, unknown>) => boolean; res: (m: Record<string, unknown>) => void }[] = [];
+    ws.on("message", (d) => {
+      const m = JSON.parse(d.toString()) as Record<string, unknown>;
+      msgs.push(m);
+      if (m["type"] === "snapshot") seenStates.push(m["state"]);
+      for (const w of [...waiters]) if (w.pred(m)) { waiters.splice(waiters.indexOf(w), 1); w.res(m); }
+    });
+    const next = (pred: (m: Record<string, unknown>) => boolean) =>
+      new Promise<Record<string, unknown>>((res) => {
+        const hit = msgs.find(pred);
+        if (hit) res(hit);
+        else waiters.push({ pred, res });
+      });
+    ws.on("open", () => resolve({ ws, msgs, next }));
+  });
+}
+
+describe("mock coordinator", () => {
+  it("lays out a half on a grid close to 16:9 tiles", () => {
+    // Eight in a half of a 16:9 image: 2 x 4. Seven: rows of 2, the last one stretched.
+    const half = { x: 0, y: 0, w: 0.5, h: 1 };
+    expect(gridIn(half, 8, 16 / 9).map((r) => [r.w, r.h])).toEqual(Array(8).fill([0.25, 0.25]));
+    const seven = gridIn(half, 7, 16 / 9);
+    expect(seven).toHaveLength(7);
+    expect(seven.at(-1)).toMatchObject({ w: 0.5, h: 0.25 });
+    expect(seven.reduce((a, r) => a + r.w * r.h, 0)).toBeCloseTo(0.5, 9);
+    // Every count, in a narrow and a wide region, gives exactly that many tiles covering it.
+    for (const region of [{ x: 0, y: 0, w: 7 / 17, h: 1 }, { x: 0, y: 0, w: 1, h: 0.25 }]) {
+      for (let n = 1; n <= 40; n++) {
+        const g = gridIn(region, n, 16 / 9);
+        expect(g, `${n} in ${region.w}x${region.h}`).toHaveLength(n);
+        expect(g.reduce((a, r) => a + r.w * r.h, 0)).toBeCloseTo(region.w * region.h, 9);
+      }
+    }
+    // Sides as wide as their GPUs: 100 fcvm against 12 EC2.
+    const lay = mockLayout([{ host: "a", gpus: 50 }, { host: "b", gpus: 50 }], 12, 16 / 9);
+    expect(lay.split).toBeCloseTo(100 / 112, 9);
+    expect(lay.hosts.map((h) => [h.band.y, h.band.h])).toEqual([[0, 0.5], [0.5, 0.5]]);
+    expect(lay.hosts[0]!.band.w).toBeCloseTo(100 / 112, 9);
+    expect(lay.ec2Region!.x).toBeCloseTo(100 / 112, 9);
+    expect(lay.ec2Region!.w).toBeCloseTo(12 / 112, 9);
+    expect(mockLayout([{ host: "a", gpus: 4 }], 0, 16 / 9)).toMatchObject({ split: 1, ec2Region: null, ec2: [] });
+  });
+
+  it("applies a repeated intent id once and answers both with the same receipt", async () => {
+    const c = await live();
+    const intent = JSON.stringify({ type: "intent", id: "dup-1", name: "word", args: { text: "orbit" } });
+    c.ws.send(intent);
+    c.ws.send(intent);
+    await c.next(() => c.msgs.filter((m) => m["type"] === "receipt").length === 2);
+    const receipts = c.msgs.filter((m) => m["type"] === "receipt");
+    expect(receipts[0]).toEqual(receipts[1]);
+    expect(receipts[0]).toMatchObject({ id: "dup-1", outcome: "committed" });
+    expect(coord.appliedCount("dup-1")).toBe(1);
+    expect(coord.fleetState().scene.words.filter((w) => w.text === "orbit")).toHaveLength(1);
+    c.ws.close();
+  });
+
+  it("keeps each word's style, Lockup when none is sent, and refuses a style it does not know", async () => {
+    const c = await live();
+    c.ws.send(JSON.stringify({ type: "intent", id: "ws-1", name: "word", args: { text: "smoke", text_style: "skywriting" } }));
+    c.ws.send(JSON.stringify({ type: "intent", id: "ws-2", name: "word", args: { text: "plain" } }));
+    c.ws.send(JSON.stringify({ type: "intent", id: "ws-3", name: "word", args: { text: "odd", text_style: "neon" } }));
+    await c.next(() => c.msgs.filter((m) => m["type"] === "receipt").length === 3);
+    const words = coord.fleetState().scene.words;
+    expect(words.find((w) => w.text === "smoke")).toMatchObject({ text_style: "skywriting" });
+    expect(words.find((w) => w.text === "plain")).toMatchObject({ text_style: "lockup" });
+    expect(c.msgs.find((m) => m["id"] === "ws-3")).toMatchObject({ outcome: "refused", reason: "text_style is lockup, skywriting or landmark" });
+    c.ws.close();
+  });
+
+  it("refuses the test word", async () => {
+    const c = await live();
+    c.ws.send(JSON.stringify({ type: "intent", id: "w-bad", name: "word", args: { text: "forbidden" } }));
+    const r = await c.next((m) => m["type"] === "receipt" && m["id"] === "w-bad");
+    expect(r).toMatchObject({ outcome: "refused", reason: "the text check refused it" });
+    expect(coord.appliedCount("w-bad")).toBe(0);
+    c.ws.close();
+  });
+
+  it("answers a ping with its clock", async () => {
+    const c = await live();
+    c.ws.send(JSON.stringify({ type: "ping", client_unix_ms: 123 }));
+    const m = await c.next((x) => x["type"] === "clock");
+    expect(typeof m["server_unix_ms"]).toBe("number");
+    c.ws.close();
+  });
+
+  it("relaunches a tile: dark and refusing frames, then running with timings", async () => {
+    const c = await live();
+    c.ws.send(JSON.stringify({ type: "intent", id: "r-1", name: "relaunch", args: { tile: "fcvm:1" } }));
+    await c.next((m) => m["type"] === "receipt" && m["id"] === "r-1");
+    const tile = () => coord.fleetState().tiles.find((t) => t.id === "fcvm:1")!;
+    expect(tile().phase).not.toBe("running");
+    const refused = await new Promise<boolean>((res) => {
+      const ws = new WebSocket(`${tile().frame_url}?h=144`);
+      ws.on("unexpected-response", () => res(true));
+      ws.on("open", () => { ws.close(); res(false); });
+    });
+    expect(refused).toBe(true);
+    await new Promise((r) => setTimeout(r, 900));
+    expect(tile().phase).toBe("running");
+    const lr = tile().last_relaunch!;
+    expect(lr.first_frame_at! - lr.clicked_at).toBeGreaterThan(250);
+    expect(Object.keys(lr.phases).sort()).toEqual(["ack_ms", "container_ms", "first_frame_ms", "gpu_ms", "restore_ms", "teardown_ms", "total_ms"]);
+    c.ws.close();
+  });
+
+  it("races relaunch all and stamps each half", async () => {
+    const c = await live();
+    c.ws.send(JSON.stringify({ type: "intent", id: "ra-1", name: "restart_now", args: {} }));
+    await c.next((m) => m["type"] === "receipt" && m["id"] === "ra-1");
+    c.ws.send(JSON.stringify({ type: "intent", id: "ra-2", name: "restart_now", args: {} }));
+    expect(await c.next((m) => m["type"] === "receipt" && m["id"] === "ra-2")).toMatchObject({ outcome: "refused" });
+    await new Promise((r) => setTimeout(r, 1300));
+    const ra = coord.fleetState().relaunch_all!;
+    expect(ra.fcvm_done_at).not.toBeNull();
+    expect(ra.ec2_done_at).not.toBeNull();
+    expect(ra.fcvm_done_at!).toBeLessThan(ra.ec2_done_at!);
+    c.ws.close();
+    await sleep(1000); // the cooldown
+  });
+});
+
+describe("mock renderer", () => {
+  it("speaks the frame protocol: a header, then FCVF frames on the shared clock, keyframe first", async () => {
+    const tile = coord.fleetState().tiles.find((t) => t.slot === "slot-2")!;
+    const url = `${tile.frame_url}?h=90`;
+    const ws = new WebSocket(url);
+    const texts: string[] = [];
+    const frames: ReturnType<typeof parseFrame>[] = [];
+    await new Promise<void>((res) => {
+      ws.on("message", (d, bin) => {
+        if (!bin) texts.push(d.toString());
+        else frames.push(parseFrame(new Uint8Array(d as Buffer)));
+        if (frames.length === 6) res();
+      });
+    });
+    ws.close();
+    const header = parseStreamHeader(texts[0]!);
+    expect(header).not.toBeNull();
+    // The tile is the renderer's geometry for its rectangle at 90 high (214 x 90: two
+    // thirds of the width, a host band half the height), sent with a margin on its
+    // inner sides and a crop that says so.
+    const g = tileGeometry(tile.rect, 16 / 9, 90);
+    expect(innerRect(header!)).toMatchObject({ sw: g.width, sh: 90 });
+    expect(g.width).toBe(214);
+    expect(header!.crop.left + header!.crop.right + header!.crop.top + header!.crop.bottom).toBeGreaterThan(0);
+    const ok = frames.map((f) => { if (!f.ok) throw new Error(f.error); return f.frame; });
+    expect(ok[0]!.keyframe).toBe(true);
+    const types = splitNals(ok[0]!.data).map(nalType);
+    expect(types).toContain(NAL_SPS);
+    expect(types).toContain(NAL_IDR);
+    for (let i = 1; i < ok.length; i++) {
+      expect(ok[i]!.frame).toBeGreaterThan(ok[i - 1]!.frame);
+      expect(ok[i]!.t).toBeCloseTo(ok[i]!.frame / FPS, 9);
+    }
+    expect([ok[0]!.width, ok[0]!.height]).toEqual([header!.width, header!.height]);
+  });
+});
+
+describe("mock renderer, height change", () => {
+  it("sends only frames drawn at the new height after a height change", async () => {
+    // Each drawn frame is held 150 ms before it is encoded, so one drawn at the
+    // old height is always in flight when the height changes. It must not reach
+    // the new encoder: a raw frame of the wrong size shifts every frame after it.
+    const scene = coord.patternScene();
+    const r = new MockRenderers({ port: 0, publicHost: "localhost", fps: FPS, threads: 1, maxHeight: 360, epochUnixMs: scene.epoch_unix_ms, scene: () => scene, holdMs: 150 });
+    await r.listen();
+    const rect = { x: 0.25, y: 0, w: 0.25, h: 0.25 };
+    r.setTile("t1", rect);
+    const ws = new WebSocket(`${r.frameUrl("t1")}?h=90`);
+    const after: { t: number; data: Uint8Array }[] = [];
+    let headers = 0;
+    let last: ReturnType<typeof parseStreamHeader> = null;
+    let sentResize = false;
+    await new Promise<void>((res) => {
+      ws.on("message", (d, bin) => {
+        if (!bin) {
+          headers++;
+          last = parseStreamHeader(d.toString());
+          return;
+        }
+        const p = parseFrame(new Uint8Array(d as Buffer));
+        if (!p.ok) throw new Error(p.error);
+        if (!sentResize) {
+          sentResize = true;
+          ws.send(JSON.stringify({ h: 180 }));
+          return;
+        }
+        if (headers < 2 || p.frame.height !== last!.height) return;
+        after.push({ t: p.frame.t, data: p.frame.data });
+        if (after.length === 6) res();
+      });
+    });
+    ws.close();
+    await r.close();
+    expect(headers).toBe(2);
+    // Decode them and compare each frame with the picture at its t.
+    const stream = Buffer.concat(after.map((f) => Buffer.from(f.data)));
+    const out = spawnSync(FFMPEG, ["-hide_banner", "-loglevel", "error", "-f", "h264", "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"], { input: stream, maxBuffer: 1 << 26 });
+    expect(out.status).toBe(0);
+    // The delivered frame holds the 320 x 180 tile inside its margin.
+    const hdr = last!;
+    const W = hdr.width;
+    const H = hdr.height;
+    expect(innerRect(hdr)).toMatchObject({ sw: 320, sh: 180 });
+    const frames = Math.floor(out.stdout.length / (W * H * 3));
+    expect(frames).toBe(6);
+    for (let k = 0; k < frames; k++) {
+      const f = frameCtx(after[k]!.t, scene);
+      let err = 0;
+      let n = 0;
+      for (let j = 5; j < H; j += 10) {
+        for (let i = 5; i < W; i += 10) {
+          const ii = i - hdr.crop.left;
+          const jj = j - hdr.crop.top;
+          const e = expectedRgb(rect.x + ((ii + 0.5) / 320) * rect.w, rect.y + ((jj + 0.5) / 180) * rect.h, f);
+          const o = (k * W * H + j * W + i) * 3;
+          err += (Math.abs(out.stdout[o]! - e[0]) + Math.abs(out.stdout[o + 1]! - e[1]) + Math.abs(out.stdout[o + 2]! - e[2])) / 3;
+          n++;
+        }
+      }
+      expect(err / n, `frame ${k}`).toBeLessThan(8);
+    }
+  });
+});
+
+describe("pattern", () => {
+  it("is a pure function of image position: two halves drawn apart equal the whole", () => {
+    const scene = { epoch_unix_ms: 0, image_aspect: 16 / 9, camera: [{ t: 0, x: 0.1, y: 0, zoom: 1.3 }], time_of_day: 0.3, words: [{ text: "hi", pos: { x: 0, y: 0 } }], lights: [] };
+    const f = frameCtx(12.35, scene);
+    const grid = { fullWidth: 128, fullHeight: 64, x0: 32, y0: 16, height: 16 };
+    const whole = renderI420({ ...grid, width: 64 }, f);
+    const left = renderI420({ ...grid, width: 32 }, f);
+    for (let j = 0; j < 16; j++) for (let i = 0; i < 32; i++) expect(left[j * 32 + i]).toBe(whole[j * 64 + i]);
+  });
+
+  it("changes with t, so a tile drawn at another t shows a seam", () => {
+    const scene = { epoch_unix_ms: 0, image_aspect: 16 / 9, camera: [], time_of_day: 0.3, words: [], lights: [] };
+    const g = { width: 16, height: 16, fullWidth: 160, fullHeight: 160, x0: 0, y0: 0 };
+    const a = renderI420(g, frameCtx(10, scene));
+    const b = renderI420(g, frameCtx(10.5, scene));
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) diff += Math.abs(a[i]! - b[i]!);
+    expect(diff / a.length).toBeGreaterThan(3);
+  });
+});
+
+describe("mock coordinator, review findings", () => {
+  it("never shows two viewers different state under one version", async () => {
+    const a = await live();
+    await a.next((m) => m["type"] === "snapshot");
+    const id = `tod-${Date.now()}`;
+    a.ws.send(JSON.stringify({ type: "intent", id, name: "light", args: { pos: [0, 1, -2], color: [1, 1, 1] } }));
+    // B connects while that change waits for its flush.
+    await new Promise((r) => setTimeout(r, 2));
+    const b = await live();
+    await a.next((m) => m["type"] === "receipt" && m["id"] === id);
+    await new Promise((r) => setTimeout(r, 100));
+    const byVersion = (msgs: Record<string, unknown>[]) => {
+      const out = new Map<number, string>();
+      for (const m of msgs) {
+        if (m["type"] !== "snapshot") continue;
+        const st = structuredClone(m["state"]) as { viewers: unknown };
+        st.viewers = null; // the viewer count is part of the state too; compare the rest
+        out.set(m["version"] as number, JSON.stringify(st));
+      }
+      return out;
+    };
+    const va = byVersion(a.msgs);
+    const vb = byVersion(b.msgs);
+    let shared = 0;
+    for (const [v, s] of vb) {
+      if (!va.has(v)) continue;
+      shared++;
+      expect(s, `version ${v}`).toBe(va.get(v));
+    }
+    expect(shared).toBeGreaterThan(0);
+    a.ws.close();
+    b.ws.close();
+  });
+
+  it("answers a JSON null with an error and keeps serving", async () => {
+    const c = await live();
+    c.ws.send("null");
+    c.ws.send(JSON.stringify({ type: "ping", client_unix_ms: 1 }));
+    expect(await c.next((m) => m["type"] === "error")).toMatchObject({ type: "error" });
+    expect(await c.next((m) => m["type"] === "clock")).toMatchObject({ type: "clock" });
+    c.ws.close();
+  });
+});
+
+describe("mock aggregates", () => {
+  it("lists one aggregate per fcvm host and one for EC2, covering the image, each serving the frame protocol", async () => {
+    const st = coord.fleetState();
+    expect(st.aggregates.map((a) => a.id)).toEqual(["agg:mock-host-1", "agg:mock-host-2", "agg:ec2"]);
+    expect(st.layout).toEqual({ generation: 1, from_frame: 0, from_t: 0 });
+    // Two fcvm GPUs and one EC2: the fcvm side is two thirds of the image.
+    expect(st.aggregates[2]!.rect.x).toBeCloseTo(2 / 3, 9);
+    expect(st.aggregates[0]!.tiles).toEqual(["fcvm:1"]);
+    const area = st.aggregates.reduce((s, a) => s + a.rect.w * a.rect.h, 0);
+    expect(area).toBeCloseTo(1, 9);
+    const ec2 = st.aggregates.find((a) => a.id === "agg:ec2")!;
+    const ws = new WebSocket(`${ec2.frame_url}?h=90`);
+    const msgs: (string | Uint8Array)[] = [];
+    await new Promise<void>((res) => {
+      ws.on("message", (d, bin) => {
+        msgs.push(bin ? new Uint8Array(d as Buffer) : d.toString());
+        if (msgs.length === 3) res();
+      });
+    });
+    ws.close();
+    const header = parseStreamHeader(msgs[0] as string)!;
+    // The EC2 half asked at 90 is under the encoder's minimum width, so it comes taller.
+    const g = tileGeometry(ec2.rect, 16 / 9, 90);
+    expect(g.height).toBeGreaterThan(90);
+    expect(header.grid).toEqual({ fullWidth: g.fullWidth, fullHeight: g.fullHeight, x0: g.x0, y0: g.y0 });
+    const f = parseFrame(msgs[1] as Uint8Array);
+    expect(f.ok && f.frame.keyframe).toBe(true);
+  });
+
+  it("says hello with the viewer id and records actions with the viewer and intent id", async () => {
+    const c = await live();
+    const hello = await c.next((m) => m["type"] === "hello");
+    expect(hello["viewer"]).toMatch(/^v-\d+$/);
+    expect(hello["turnstile"]).toBeUndefined();
+    const id = `lit-${Date.now()}`;
+    c.ws.send(JSON.stringify({ type: "intent", id, name: "light", args: { pos: [0, 1, -2], color: [1, 1, 1] } }));
+    await c.next((m) => m["type"] === "receipt");
+    const a = coord.fleetState().actions.at(-1)!;
+    expect(a).toMatchObject({ name: "light", viewer: hello["viewer"], id, outcome: "committed" });
+    // As the coordinator: no time_of_day intent (the director sets it per hold).
+    c.ws.send(JSON.stringify({ type: "intent", id: `tod-${Date.now()}`, name: "time_of_day", args: { v: 0.75 } }));
+    expect(await c.next((m) => m["type"] === "receipt" && String(m["id"]).startsWith("tod-"))).toMatchObject({ outcome: "refused", reason: 'unknown intent "time_of_day"' });
+    c.ws.close();
+  });
+});
+
+describe("mock race, second design review", () => {
+  it("runs the owner's cadence as the race's `by` (not an action), and holds viewers to the cooldown", async () => {
+    const c = await live();
+    await admin("/mock/schedule", { next_in_ms: 0, cooldown_s: 30 });
+    await until(() => coord.fleetState().relaunch_all?.by === "schedule" && coord.fleetState().relaunch_all!.ec2_done_at === null);
+    const st = coord.fleetState();
+    expect(st.actions.some((x) => x.viewer === "schedule")).toBe(false);
+    expect(st.cooldown_until! - st.relaunch_all!.started_at).toBe(30_000);
+    await until(() => coord.fleetState().relaunch_all!.ec2_done_at !== null);
+    c.ws.send(JSON.stringify({ type: "intent", id: `cool-${Date.now()}`, name: "restart_now", args: {} }));
+    const r = await c.next((m) => m["type"] === "receipt");
+    expect(r).toMatchObject({ outcome: "refused" });
+    expect(String(r["reason"])).toMatch(/^the next restart is allowed in \d+ s$/);
+    await admin("/mock/schedule", { next_in_ms: null, cooldown_s: 1, clear_cooldown: true });
+    c.ws.close();
+  });
+
+  it("keeps a capacity wait out of EC2's time and says how long it was", async () => {
+    const c = await live();
+    await admin("/mock/schedule", { capacity_wait_ms: 600 });
+    c.ws.send(JSON.stringify({ type: "intent", id: `cap-${Date.now()}`, name: "restart_now", args: {} }));
+    await c.next((m) => m["type"] === "receipt");
+    await until(() => coord.fleetState().relaunch_all!.ec2_waiting_since !== null);
+    await until(() => coord.fleetState().tiles.find((t) => t.id === "ec2:1")!.phase === "waiting_capacity");
+    expect(coord.fleetState().relaunch_all!.ec2_waiting_since).not.toBeNull();
+    await until(() => coord.fleetState().relaunch_all!.ec2_done_at !== null);
+    const st = coord.fleetState();
+    const ra = st.relaunch_all!;
+    expect(ra.ec2_capacity_wait_ms).toBe(600);
+    expect(ra.ec2_waiting_since).toBeNull();
+    const sb = st.scoreboard.ec2!;
+    expect(sb.last_ms).toBe(ra.ec2_done_at! - ra.started_at - 600);
+    expect(sb.last_capacity_wait_ms).toBe(600);
+    expect(sb.measured_on).toBe(1);
+    expect(st.scoreboard.fcvm!.last_ms).toBe(ra.fcvm_done_at! - ra.started_at);
+    expect(st.scoreboard.fcvm!.measured_on).toBe(2);
+    expect(st.tiles.find((t) => t.id === "ec2:1")!.last_relaunch!.phases["capacity_wait_ms"]).toBe(600);
+    c.ws.close();
+    await sleep(1000);
+  });
+
+  it("counts every GPU VM restored, and the scrubs agents report", async () => {
+    const before = coord.fleetState().counters;
+    const c = await live();
+    c.ws.send(JSON.stringify({ type: "intent", id: `cnt-${Date.now()}`, name: "relaunch", args: { tile: "fcvm:1" } }));
+    await c.next((m) => m["type"] === "receipt");
+    await until(() => coord.fleetState().counters.restores === before.restores + 1);
+    expect(coord.fleetState().counters.scrubs).toBe(before.scrubs);
+    expect(coord.fleetState().counters.restores_last_hour).toBe(before.restores_last_hour + 1);
+    await admin("/mock/schedule", { gpu_scrub: true });
+    c.ws.send(JSON.stringify({ type: "intent", id: `cnt2-${Date.now()}`, name: "relaunch", args: { tile: "fcvm:1" } }));
+    await c.next((m) => m["type"] === "receipt" && String(m["id"]).startsWith("cnt2"));
+    await until(() => coord.fleetState().counters.restores === before.restores + 2);
+    expect(coord.fleetState().counters.scrubs).toBe(before.scrubs + 1);
+    await admin("/mock/schedule", { gpu_scrub: false });
+    c.ws.close();
+  });
+
+  it("chooses the next camera stop by the viewers' votes", async () => {
+    const c = await live();
+    c.ws.send(JSON.stringify({ type: "intent", id: `n-${Date.now()}`, name: "nudge", args: { target: "stars" } }));
+    await c.next((m) => m["type"] === "receipt");
+    expect(coord.fleetState().nudges.targets.find((t) => t.id === "stars")!.votes).toBe(1);
+    await admin("/mock/schedule", { hold_in_ms: 0 });
+    await until(() => coord.fleetState().nudges.holding === "stars");
+    const keys = coord.patternScene().camera as unknown as { x: number; zoom: number }[];
+    expect(keys.at(-1)).toMatchObject({ x: 1.2, zoom: 0.7 });
+    expect(coord.fleetState().nudges.targets.every((t) => t.votes === 0)).toBe(true);
+    await admin("/mock/schedule", { hold_in_ms: 600_000 });
+    c.ws.close();
+  });
+
+  it("lends a wall GPU: the tile is borrowed and sits out races, the claim streams, then the tile restores", async () => {
+    const c = await live();
+    const other = await live();
+    c.ws.send(JSON.stringify({ type: "intent", id: `claim-${Date.now()}`, name: "claim_gpu", args: {} }));
+    expect(await c.next((m) => m["type"] === "receipt")).toMatchObject({ outcome: "committed" });
+    const first = await c.next((m) => m["type"] === "claim");
+    const claim = first["claim"] as Record<string, unknown>;
+    expect(claim).toMatchObject({ phase: "restoring", frame_url: null, tile: "fcvm:2" });
+    const tile = () => coord.fleetState().tiles.find((t) => t.id === "fcvm:2")!;
+    expect(tile().phase).toBe("borrowed");
+    expect(coord.fleetState().borrow).toMatchObject({ cap: 1, lent: 1 });
+    // The cap: a second viewer is told when to try again.
+    other.ws.send(JSON.stringify({ type: "intent", id: `claim2-${Date.now()}`, name: "claim_gpu", args: {} }));
+    const refused = await other.next((m) => m["type"] === "receipt");
+    expect(String(refused["reason"])).toMatch(/^all 1 GPUs we lend are out; the next comes back in \d+ s$/);
+    const running = await c.next((m) => m["type"] === "claim" && (m["claim"] as { phase: string }).phase === "running");
+    const rc = running["claim"] as { frame_url: string; first_frame_at: number; expires_at: number; clicked_at: number };
+    expect(rc.expires_at - rc.first_frame_at).toBe(1000);
+    expect(tile().borrowed!.until).toBe(rc.expires_at);
+    // A race now leaves the borrowed tile out.
+    await admin("/mock/schedule", { next_in_ms: 0 });
+    await until(() => coord.fleetState().relaunch_all?.by === "schedule" && coord.fleetState().relaunch_all!.started_at > rc.first_frame_at);
+    expect(coord.fleetState().relaunch_all!.fcvm_gpus).toBe(1);
+    expect(tile().phase).toBe("borrowed");
+    await admin("/mock/schedule", { next_in_ms: null });
+    // The claim's own camera.
+    const camId = `cc-${Date.now()}`;
+    c.ws.send(JSON.stringify({ type: "intent", id: camId, name: "claim_camera", args: { drag: { yaw_deg: 9, pitch_deg: 0, dive: 0 } } }));
+    const moved = await c.next((m) => m["type"] === "claim" && ((m["claim"] as { camera: { intent?: string }[] }).camera.some((k) => k.intent === camId)));
+    expect(moved).toBeTruthy();
+    const ended = await c.next((m) => m["type"] === "claim" && (m["claim"] as { phase: string }).phase === "ended");
+    expect((ended["claim"] as { ended: string }).ended).toBe("Your minute is up. The GPU went back to the pool.");
+    expect(tile().borrowed).toBeNull();
+    expect(["relaunching", "stopping", "restoring", "starting"]).toContain(tile().phase);
+    await until(() => tile().phase === "running");
+    expect(tile().last_relaunch!.by).toBe("return");
+    c.ws.close();
+    other.ws.close();
+    await until(() => coord.fleetState().relaunch_all!.ec2_done_at !== null);
+    await admin("/mock/schedule", { clear_cooldown: true });
+  });
+
+  it("asks for Turnstile when it has a site key, refusing intents until verified", async () => {
+    await admin("/mock/turnstile", { sitekey: "example-sitekey" });
+    const c = await live();
+    expect(await c.next((m) => m["type"] === "hello")).toMatchObject({ turnstile: "example-sitekey" });
+    c.ws.send(JSON.stringify({ type: "intent", id: `ts-1-${Date.now()}`, name: "light", args: { pos: [0, 1, -2], color: [1, 1, 1] } }));
+    expect(await c.next((m) => m["type"] === "receipt")).toMatchObject({ outcome: "refused", reason: "verify first" });
+    c.ws.send(JSON.stringify({ type: "verify", token: "wrong" }));
+    expect(await c.next((m) => m["type"] === "verified")).toMatchObject({ ok: false });
+    c.ws.send(JSON.stringify({ type: "verify", token: "mock-pass" }));
+    expect(await c.next((m) => m["type"] === "verified" && m["ok"] === true)).toMatchObject({ ok: true });
+    const id = `ts-2-${Date.now()}`;
+    c.ws.send(JSON.stringify({ type: "intent", id, name: "light", args: { pos: [0, 1, -2], color: [1, 1, 1] } }));
+    expect(await c.next((m) => m["type"] === "receipt" && m["id"] === id)).toMatchObject({ outcome: "committed" });
+    await admin("/mock/turnstile", { sitekey: null });
+    c.ws.close();
+  });
+
+  it("serves the poster as a JPEG any origin can read", async () => {
+    const r = await fetch(`http://localhost:${coord.port}/poster.jpg`);
+    expect(r.status).toBe(200);
+    expect(r.headers.get("content-type")).toBe("image/jpeg");
+    expect(r.headers.get("access-control-allow-origin")).toBe("*");
+    const b = new Uint8Array(await r.arrayBuffer());
+    expect([b[0], b[1]]).toEqual([0xff, 0xd8]);
+  });
+
+  it("goes offline: drops /live and refuses it, then takes viewers again", async () => {
+    const c = await live();
+    const closed = new Promise<void>((res) => c.ws.on("close", () => res()));
+    await admin("/mock/offline", { ms: 400 });
+    await closed;
+    const refused = await new Promise<number>((res) => {
+      const ws = new WebSocket(`ws://localhost:${coord.port}/live`);
+      ws.on("unexpected-response", (_req, resp) => res(resp.statusCode ?? 0));
+      ws.on("open", () => {
+        ws.close();
+        res(101);
+      });
+    });
+    expect(refused).toBe(503);
+    await sleep(450);
+    const back = await live();
+    expect(await back.next((m) => m["type"] === "hello")).toBeTruthy();
+    back.ws.close();
+  });
+
+  it("counts every connection, and only visible tabs as active viewers", async () => {
+    const c = await live();
+    await c.next((m) => m["type"] === "snapshot");
+    const v = () => coord.fleetState().viewers;
+    const before = v();
+    c.ws.send(JSON.stringify({ type: "visibility", visible: false }));
+    await until(() => v().active === before.active - 1);
+    expect(v().count).toBe(before.count);
+    c.ws.send(JSON.stringify({ type: "visibility", visible: true }));
+    await until(() => v().active === before.active);
+    c.ws.close();
+  });
+
+  it("sleeps with nobody watching (nothing placed) and wakes host by host when a viewer comes, measuring the wake", async () => {
+    const awake = coord.fleetState().tiles.length;
+    await admin("/mock/power", { sleep: true, hold: true });
+    let st = coord.fleetState();
+    expect(st.fleet.power).toMatchObject({ state: "asleep", woke_at: null });
+    // As the coordinator: asleep, nothing is placed.
+    expect(st.tiles).toEqual([]);
+    expect(st.aggregates).toEqual([]);
+    const restored = st.counters.restores;
+    await admin("/mock/power", { wake: true });
+    st = coord.fleetState();
+    expect(st.fleet.power.state).toBe("waking");
+    // The GPU hosts; the EC2 half launches at once and is not a host here.
+    expect(st.fleet.power.hosts.map((h) => h.host)).toEqual(["mock-host-1", "mock-host-2"]);
+    expect(st.tiles.every((t) => t.half === "ec2")).toBe(true);
+    await until(() => coord.fleetState().fleet.power.state === "awake", 5000);
+    st = coord.fleetState();
+    for (const h of st.fleet.power.hosts) {
+      expect(h.phases.map((p) => p.phase)).toEqual(["instance_pending", "booted", "store_ready", "agent_connected", "tiles_rendering"]);
+      for (let i = 1; i < h.phases.length; i++) expect(h.phases[i]!.at).toBeGreaterThanOrEqual(h.phases[i - 1]!.at);
+    }
+    const lw = st.fleet.power.last_wake!;
+    expect(lw.started_at).toBe(st.fleet.power.woke_at);
+    expect(lw.awake_at).toBeGreaterThanOrEqual(Math.max(...st.fleet.power.hosts.map((h) => h.phases.at(-1)!.at)));
+    expect(lw.ms).toBe(lw.awake_at - lw.started_at);
+    expect(st.tiles).toHaveLength(awake);
+    expect(lw.gpus).toBe(st.tiles.filter((t) => t.slot).length);
+    expect(st.tiles.filter((t) => t.slot).every((t) => t.phase === "running" && t.frame_url !== null)).toBe(true);
+    expect(st.counters.restores).toBe(restored + st.tiles.filter((t) => t.slot && t.half === "fcvm").length);
+  });
+
+  it("serves the recording with byte ranges, and answers 404 when it is missing", async () => {
+    const base = `http://localhost:${coord.port}/media`;
+    const meta = (await (await fetch(`${base}/wall-reel.json`)).json()) as Record<string, unknown>;
+    expect(meta).toMatchObject({ duration_s: 4, measured: null });
+    const full = await fetch(`${base}/wall-reel.mp4`);
+    expect(full.headers.get("content-type")).toBe("video/mp4");
+    const size = Number(full.headers.get("content-length"));
+    await full.arrayBuffer();
+    expect(size).toBeGreaterThan(1000);
+    // A 4 s 720p clip, far under Workers' 25 MiB static asset limit.
+    expect(size).toBeLessThan(25 * 2 ** 20);
+    const part = await fetch(`${base}/wall-reel.mp4`, { headers: { range: "bytes=100-199" } });
+    expect(part.status).toBe(206);
+    expect(part.headers.get("content-range")).toBe(`bytes 100-199/${size}`);
+    expect((await part.arrayBuffer()).byteLength).toBe(100);
+    expect((await fetch(`${base}/wall-reel.vtt`)).headers.get("content-type")).toBe("text/vtt");
+    expect((await fetch(`${base}/../package.json`)).status).toBe(404);
+    await admin("/mock/media", { missing: true });
+    expect((await fetch(`${base}/wall-reel.mp4`)).status).toBe(404);
+    await admin("/mock/media", { missing: false });
+  });
+
+  it("re-tiles when GPUs join or leave: a new generation whose rectangles start at a frame, and streams switch there", async () => {
+    const st0 = coord.fleetState();
+    const tile0 = st0.tiles.find((t) => t.id === "fcvm:1")!;
+    const ws = new WebSocket(`${tile0.frame_url}?h=90`);
+    const headers: { at: number; grid: unknown }[] = [];
+    const frames: { t: number; afterHeaders: number }[] = [];
+    ws.on("message", (d, bin) => {
+      if (!bin) headers.push({ at: frames.length, grid: parseStreamHeader(d.toString())!.grid });
+      else {
+        const f = parseFrame(new Uint8Array(d as Buffer));
+        if (f.ok) frames.push({ t: f.frame.t, afterHeaders: headers.length });
+      }
+    });
+    await until(() => frames.length > 3);
+    await admin("/mock/fault", { fcvm_gpus: 2, ec2_gpus: 3 });
+    const st = coord.fleetState();
+    expect(st.layout.generation).toBe(st0.layout.generation + 1);
+    const atT = st.layout.from_frame / 30;
+    // Ahead of now, on the renderers' t = k/30 grid.
+    expect(atT * 1000).toBeGreaterThan(Date.now() - coord.patternScene().epoch_unix_ms);
+    // Two fcvm against three EC2: the fcvm side is two fifths of the image.
+    const r1 = st.tiles.find((t) => t.id === "fcvm:1")!.rect;
+    expect(r1.w).toBeCloseTo(2 / 5, 9);
+    expect(st.tiles.filter((t) => t.half === "ec2").map((t) => t.id)).toEqual(["ec2:1", "ec2:2", "ec2:3"]);
+    await until(() => frames.some((f) => f.t >= atT + 0.2));
+    ws.close();
+    // A new header for the new rectangle, and every frame after it at or after the re-tile's frame.
+    const g = tileGeometry(r1, 16 / 9, 90);
+    const h = headers.findIndex((x) => JSON.stringify(x.grid) === JSON.stringify({ fullWidth: g.fullWidth, fullHeight: g.fullHeight, x0: g.x0, y0: g.y0 }));
+    expect(h).toBeGreaterThan(0);
+    for (const f of frames) {
+      if (f.afterHeaders > h) expect(f.t).toBeGreaterThanOrEqual(atT - 1e-9);
+      else expect(f.t).toBeLessThan(atT - 1e-9);
+    }
+    // A GPU that leaves and comes back before its stream is retired keeps serving.
+    await admin("/mock/fault", { fcvm_gpus: 2, ec2_gpus: 1 });
+    await admin("/mock/fault", { fcvm_gpus: 2, ec2_gpus: 3 });
+    await sleep(6500);
+    const back = coord.fleetState().tiles.find((t) => t.id === "ec2:3")!;
+    await until(() => coord.fleetState().tiles.find((t) => t.id === "ec2:3")!.phase === "running", 25_000);
+    const status = await new Promise<number>((res) => {
+      const w = new WebSocket(`${back.frame_url}?h=90`);
+      w.on("open", () => {
+        w.close();
+        res(101);
+      });
+      w.on("unexpected-response", (_q, resp) => res(resp.statusCode ?? 0));
+    });
+    expect(status).toBe(101);
+    await admin("/mock/fault", { fcvm_gpus: 2, ec2_gpus: 1 });
+  }, 60_000);
+
+  it("fails a tile with a retry time, and reclaims a host as the coordinator does: its tiles leave at once, `failures` says why", async () => {
+    await admin("/mock/fault", { fail: "fcvm:1", message: "GPU did not come back", retry_ms: 300 });
+    const t = coord.fleetState().tiles.find((x) => x.id === "fcvm:1")!;
+    expect(t.phase).toBe("failed");
+    expect(t.failure).toMatchObject({ kind: "relaunch_failed", message: "GPU did not come back" });
+    expect(t.error).toBe("GPU did not come back");
+    await until(() => coord.fleetState().tiles.find((x) => x.id === "fcvm:1")!.phase === "running");
+    expect(coord.fleetState().tiles.find((x) => x.id === "fcvm:1")!.failure).toBeNull();
+    const gen = coord.fleetState().layout.generation;
+    await admin("/mock/fault", { reclaim: "mock-host-2" });
+    // The same event: the host's tile is gone and the GPUs left are re-tiled; no tile carries the reclaim.
+    let st = coord.fleetState();
+    expect(st.tiles.map((x) => x.id)).not.toContain("fcvm:2");
+    expect(st.tiles.every((x) => x.failure === null || x.failure.kind === "relaunch_failed")).toBe(true);
+    expect(st.layout.generation).toBe(gen + 1);
+    expect(st.tiles.find((x) => x.id === "fcvm:1")!.rect).toMatchObject({ x: 0, w: 0.5, h: 1 });
+    expect(st.failures).toEqual([{ kind: "host_reclaimed", host: "mock-host-2", since: expect.any(Number), retiling: true }]);
+    expect(st.fleet.hosts.find((h) => h.name === "mock-host-2")!.draining).toBe(true);
+    await admin("/mock/fault", { replace_host: "mock-host-2" });
+    st = coord.fleetState();
+    expect(st.layout.generation).toBe(gen + 2);
+    expect(st.failures).toEqual([]);
+    expect(st.fleet.hosts.find((h) => h.name === "mock-host-2")!.draining).toBe(false);
+    await until(() => coord.fleetState().tiles.find((x) => x.id === "fcvm:2")?.phase === "running");
+  });
+});
+
+describe("the mock speaks the coordinator's snapshot shapes", () => {
+  // The coordinator's own states (#1146, core/test/fixtures/coordinator.json): every
+  // field the mock sends must be one the coordinator sends, at the same path.
+  const fixture = JSON.parse(readFileSync(new URL("../../core/test/fixtures/coordinator.json", import.meta.url), "utf8")) as { views: Record<string, unknown> };
+  /**
+   * In PROTOCOL.md's "Snapshot state" but in no vector's final view (none ends mid-loan
+   * or with GPU readings), so listed by hand with the line that documents it.
+   */
+  const DOCUMENTED: Record<string, string> = {
+    "tiles[].borrowed.until": '"borrowed": {"session", "viewer", "since", "until"}',
+    "tiles[].gpu_stats": '"gpu_stats": { ... }, the agent\'s readings',
+    "fleet.power.hosts[]": '"hosts": [{"host": "i-...", "phases": [{"phase", "at"}]}]',
+    "tiles[].last_relaunch.phases.ack_ms": "Agent, `timings`: fcvm's own restore clock",
+    "tiles[].last_relaunch.phases.total_ms": "Agent, `timings`: the relaunch start to the first frame",
+  };
+  /** The mock's own, read by nothing the real coordinator feeds. */
+  const MOCK_ONLY: Record<string, string> = {
+    "scene.camera[].x": "the mock renderer's flat test pattern pans by x, y and zoom, not pos and look",
+    "scene.camera[].y": "the same",
+    "scene.camera[].zoom": "the same",
+  };
+  const shapes = (v: unknown, at = "", out = new Set<string>()): Set<string> => {
+    if (v !== null && typeof v === "object") {
+      const arr = Array.isArray(v);
+      for (const [k, x] of arr ? v.map((y, i) => [i, y] as const) : Object.entries(v)) shapes(x, arr ? `${at}[]` : at ? `${at}.${k}` : String(k), out);
+      if (!arr) out.add(at);
+    } else out.add(at);
+    return out;
+  };
+  it("sends nothing the coordinator does not", () => {
+    expect(seenStates.length).toBeGreaterThan(20);
+    const coordinator = new Set<string>();
+    for (const v of Object.values(fixture.views)) shapes(v, "", coordinator);
+    const allowed = (p: string) =>
+      coordinator.has(p) || [...Object.keys(DOCUMENTED), ...Object.keys(MOCK_ONLY)].some((d) => p === d || p.startsWith(`${d}.`) || p.startsWith(`${d}[]`));
+    const mock = new Set<string>();
+    for (const st of seenStates) shapes(st, "", mock);
+    expect([...mock].filter((p) => p !== "" && !allowed(p)).sort()).toEqual([]);
+  });
+});

@@ -62,6 +62,7 @@ jobs:
       code: ${{ steps.detect.outputs.code }}
       bench: ${{ steps.detect.outputs.bench }}
       fleet: ${{ steps.detect.outputs.fleet }}
+      web: ${{ steps.detect.outputs.web }}
     steps:
       - name: Detect whether any non-doc path changed
         id: detect
@@ -85,6 +86,7 @@ jobs:
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "bench=true" >> "$GITHUB_OUTPUT"
             echo "fleet=true" >> "$GITHUB_OUTPUT"
+            echo "web=true" >> "$GITHUB_OUTPUT"
             echo "event $EVENT: running the full matrix"
             exit 0
           fi
@@ -101,6 +103,7 @@ jobs:
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "bench=true" >> "$GITHUB_OUTPUT"
             echo "fleet=true" >> "$GITHUB_OUTPUT"
+            echo "web=true" >> "$GITHUB_OUTPUT"
             echo "no changed files reported: running the full matrix"
             exit 0
           fi
@@ -114,6 +117,7 @@ jobs:
           code=false
           bench=false
           fleet=false
+          web=false
           while IFS= read -r f; do
             # `bench/*` MUST precede the docs arm. A shell `case` glob matches
             # `/`, so `*.md` swallows bench/chromium/README.md and that PR
@@ -149,12 +153,15 @@ jobs:
               # The rest of fleet/ (renderer, media, shots, tools, PROTOCOL.md)
               # is not built, read or run by anything the VM matrix executes, so
               # the matrix can say nothing about it. It runs fleet-renderer, the
-              # renderer's host tests (fleet/web has its own job on the fleet-web
-              # branch).
+              # renderer's host tests; fleet/web runs fleet-web instead.
               fleet/core/*) code=true; echo "code path: $f" ;;
+              # The fleet web page is TypeScript with its own suite (fleet-web);
+              # the VM matrix does not build or run it. Like bench/, it precedes
+              # the docs arm so its README still routes to its check.
+              fleet/web/*) web=true; echo "fleet web path: $f" ;;
               fleet/*) fleet=true; echo "fleet path, no matrix: $f" ;;
-              # This file holds the fleet-renderer job, so a change here runs it too.
-              .github/workflows/ci.yml) code=true; fleet=true; echo "ci workflow: $f" ;;
+              # This file holds the fleet-renderer and fleet-web jobs, so a change here runs them too.
+              .github/workflows/ci.yml) code=true; web=true; fleet=true; echo "ci workflow: $f" ;;
               docs/*|*.md) ;;
               *) code=true; echo "code path: $f" ;;
             esac
@@ -162,7 +169,8 @@ jobs:
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "bench=$bench" >> "$GITHUB_OUTPUT"
           echo "fleet=$fleet" >> "$GITHUB_OUTPUT"
-          echo "code_changed=$code bench_changed=$bench fleet_changed=$fleet"
+          echo "web=$web" >> "$GITHUB_OUTPUT"
+          echo "code_changed=$code bench_changed=$bench fleet_changed=$fleet web_changed=$web"
 
   # The benchmark harness has four test files and, until now, CI ran none of
   # them: `grep -c bench/ ci.yml` was 0 while bench/chromium/test_reqbench.py,
@@ -179,6 +187,67 @@ jobs:
       - name: Run the bench harness test suite
         run: |
           python3 -m unittest discover -s bench/chromium -p 'test_*.py' -v
+
+  # The fleet web page (fleet/web): lint, the core's purity rules, unit tests, the
+  # Next.js build, and Playwright (Chromium and WebKit) against the mock fleet,
+  # which needs ffmpeg for its H.264 encoder.
+  fleet-web:
+    name: Fleet Web
+    needs: [changes]
+    if: ${{ needs.changes.outputs.web == 'true' }}
+    runs-on: ubuntu-latest
+    # Playwright's own image carries Chromium, WebKit and their libraries, so
+    # the job installs nothing with apt: the Azure mirror stalled apt for 13 to
+    # 30 minutes in four runs on 2026-10-22. Tag and digest of 1.64.0, the
+    # @playwright/test version in fleet/web/package.json.
+    container:
+      image: mcr.microsoft.com/playwright:v1.64.0-noble@sha256:06a9939e57531807f8d5fd76ce44b53165ffb7d7501d87ab10e285c20b1e971f
+    # The suite takes about 5 minutes; anything that hangs fails instead of waiting.
+    timeout-minutes: 30
+    defaults:
+      run:
+        # A container job's default shell is sh, which has no pipefail.
+        shell: bash
+        working-directory: fleet/web
+    env:
+      # Ports for the mock fleet and the page under test: this runner runs nothing else.
+      FLEET_TEST_BASE_PORT: "24100"
+      # The mock renders every pixel in JavaScript. On a 4-vCPU runner it keeps up
+      # with 16 tiles at 10 frames per second on a 1280x800 screen, where the stage
+      # letterboxes the image to about 700x390 (smaller screens leave tiles too few
+      # pixels for the seam checks' colour fit).
+      FLEET_E2E_VIEW: "1280x800"
+      FLEET_MOCK_FPS: "10"
+      FLEET_MOCK_THREADS: "3"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 10.34.7
+      # ffmpeg from the ffmpeg-static package (a static build with libx264,
+      # downloaded from GitHub), not apt (see the container above).
+      - name: Install ffmpeg
+        working-directory: /tmp
+        run: |
+          set -euo pipefail
+          mkdir ffmpeg && cd ffmpeg
+          npm install --no-audit --no-fund --no-save ffmpeg-static@5.3.0
+          bin="$PWD/node_modules/ffmpeg-static/ffmpeg"
+          "$bin" -hide_banner -encoders | grep libx264 > /dev/null
+          echo "FLEET_FFMPEG=$bin" >> "$GITHUB_ENV"
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Lint and typecheck
+        run: pnpm lint && pnpm typecheck
+      - name: Unit tests
+        run: pnpm test
+      - name: Build
+        run: pnpm build
+      - name: Browser tests
+        run: pnpm test:e2e
 
   # Lints every workflow file. Lives here, not in claude-lint.yml, so `Summary`
   # gates it: a PR that changes only `.github/workflows/claude*.yml` skips the
@@ -1211,7 +1280,7 @@ jobs:
   # Final summary job - runs after all test jobs
   summary:
     name: Summary
-    needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, bench-tests, fleet-renderer, host, host-root, container]
+    needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, bench-tests, fleet-renderer, fleet-web, host, host-root, container]
     if: always()
     runs-on: ubuntu-latest
     steps:
