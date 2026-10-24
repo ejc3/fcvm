@@ -1015,6 +1015,19 @@ test("asleep: the recording plays over the poster with its badge, the scores are
 
   // Waking: a live clock since the wake began and each phase as the hosts report it.
   await page.evaluate(() => window.__fleet!.client.traceStart());
+  // Every change of the recording's leaving state, sampled each animation frame until it goes.
+  await page.evaluate(() => {
+    const w = window as unknown as { __leaving: boolean[] };
+    w.__leaving = [];
+    const tick = () => {
+      const el = document.querySelector(".reel");
+      if (!el) return;
+      const on = el.classList.contains("leaving");
+      if (w.__leaving.at(-1) !== on) w.__leaving.push(on);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
   await admin("/mock/power", { wake: true });
   await expect(page.getByTestId("sleep-card")).toContainText("Waking up the GPUs");
   await expect(page.getByTestId("reel-badge")).toHaveText(`Recorded ${await reelDate()}. The live wall is waking up.`);
@@ -1029,6 +1042,8 @@ test("asleep: the recording plays over the poster with its badge, the scores are
   const shot = await page.evaluate((p) => window.__fleet!.client.capture(p), pts);
   for (const px of shot.pixels) expect(px.slice(0, 3)).not.toEqual([6, 8, 11]);
   await expect(page.getByTestId("reel")).toHaveCount(0, { timeout: 5000 });
+  // Once the recording starts to leave, the live image under it stays whole: it never comes back.
+  expect(await page.evaluate(() => (window as unknown as { __leaving: boolean[] }).__leaving)).toEqual([false, true]);
   const trace = await page.evaluate(() => window.__fleet!.client.traceStop());
   expect(trace.filter((e) => e.T !== null && e.missing > 0 && !e.poster)).toEqual([]);
   // The wake, measured once.

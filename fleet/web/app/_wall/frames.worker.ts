@@ -910,6 +910,13 @@ function allLive(): boolean {
   return drawn.length > 0 && drawn.every((src) => streamOf(src)?.appearedAt != null);
 }
 
+/** The drawn sources whose stream has shown a frame, by stream key. */
+function liveKeys(): string[] {
+  return sourcesOf(shownMode)
+    .filter((src) => src.box !== null && src.url !== null && streamOf(src)?.appearedAt != null)
+    .map(keyOf);
+}
+
 function pct(xs: readonly number[], p: number): number {
   if (xs.length === 0) return 0;
   const s = [...xs].sort((a, b) => a - b);
@@ -948,6 +955,8 @@ function report(): void {
     rafMsP50: pct(rafMs, 0.5),
     rafMsP95: pct(rafMs, 0.95),
     allLive: allLive(),
+    live: liveKeys(),
+    mode: shownMode,
   };
   const kinds = [...lastChoice.show.values()];
   const bench: BenchStats = {

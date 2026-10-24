@@ -67,6 +67,14 @@ export interface FrameStats {
   rafMsP95: number;
   /** Every region the image draws has shown a frame (the live image is whole). */
   allLive: boolean;
+  /**
+   * The regions behind allLive: `<source id> <base URL>` of every drawn source whose stream
+   * has shown a frame. The drawer reports every 500 ms, so a snapshot can open a region
+   * this list does not have yet (imageWhole in view.ts).
+   */
+  live: string[];
+  /** The mode the drawer drew when it reported: `live` holds that mode's sources. */
+  mode: StreamMode;
 }
 
 export type StreamMode = "direct" | "aggregated";

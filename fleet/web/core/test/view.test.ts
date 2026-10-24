@@ -28,7 +28,7 @@ function stateWith(st: FleetState, version = 1): ClientState {
   s = reduce(s, { type: "message", text: snapshotText(version, st), at: EPOCH });
   const tiles: FrameStats["tiles"] = {};
   for (const t of st.tiles) tiles[`d:${t.id}`] = { connected: true, fps: 24, newestT: 100, width: 320, height: 180, behind: false, decodeMs: 2 };
-  return reduce(s, { type: "frame-stats", stats: { T: 100, tiles, drawMsP50: 1, drawMsP95: 2, rafMsP50: 16.7, rafMsP95: 17, allLive: true } });
+  return reduce(s, { type: "frame-stats", stats: { T: 100, tiles, drawMsP50: 1, drawMsP95: 2, rafMsP50: 16.7, rafMsP95: 17, allLive: true, live: [], mode: "direct" } });
 }
 
 function msg(s: ClientState, m: unknown, at = EPOCH): ClientState {
@@ -672,6 +672,22 @@ describe("the recording", () => {
     expect(reelView({ ...base, meta: null })).toMatchObject({ badge: "", caption: "" });
     expect(parseReelMeta({ duration_s: 4 })).toBeNull();
     expect(parseReelMeta("x")).toBeNull();
+  });
+
+  it("does not leave on a drawer report that predates a region the newest snapshot opened", () => {
+    // The wake's last snapshot both says "awake" and gives the last region its frame URL;
+    // the drawer's report, every 500 ms, still describes the image without it.
+    const st = fleet();
+    let s = stateWith(st);
+    s = reduce(s, { type: "ui", patch: { reelOn: true, mode: "direct" } });
+    const media = { media: { base: "/media", meta: null } };
+    const v0 = view(s, EPOCH, media);
+    const keys = v0.plan.direct.filter((x) => x.box !== null && x.url !== null).map((x) => `${x.id} ${x.baseUrl ?? ""}`);
+    expect(keys.length).toBeGreaterThan(1);
+    // The drawer's own mode decides which tiling its report describes (ui.shownMode can lag it).
+    const report = (live: string[]) => reduce(s, { type: "frame-stats", stats: { ...s.frames!, allLive: true, live, mode: "direct" } });
+    expect(view(report(keys.slice(1)), EPOCH, media).reel!.leaving).toBe(false);
+    expect(view(report(keys), EPOCH, media).reel!.leaving).toBe(true);
   });
 
   it("leaves only once the fleet is awake and every region of the live image has a frame", () => {
