@@ -321,7 +321,10 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
           : s.cameraWatches;
       const own =
         e.intent.name === "claim_gpu" ? { ...NO_OWN, requestId: e.intent.id, requestedAt: e.at } : s.own;
-      return { ...s, pending, cameraWatches, own };
+      // Asking for a GPU resumes the picture: the private view's stream has no place in a
+      // paused wall's frame choice, and the view hides the Resume button.
+      const ui = e.intent.name === "claim_gpu" && s.ui.paused ? { ...s.ui, paused: false } : s.ui;
+      return { ...s, pending, cameraWatches, own, ui };
     }
     case "frame-stats":
       return { ...s, frames: e.stats };

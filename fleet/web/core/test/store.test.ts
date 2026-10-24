@@ -126,6 +126,15 @@ describe("input to pixels", () => {
   });
 });
 
+describe("asking for a GPU while the wall is paused", () => {
+  it("resumes: the private view's stream is not in the paused wall's frame choice, and its Resume button is hidden", () => {
+    let s = feed(initialState(), snapshotText(1, fleet()));
+    s = reduce(s, { type: "ui", patch: { paused: true } });
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("own", "claim_gpu"), at: EPOCH });
+    expect(s.ui.paused).toBe(false);
+  });
+});
+
 describe("a GPU request dismissed before its claim arrives", () => {
   const claimMsg = (phase: string) => JSON.stringify({ type: "claim", claim: { id: "claim-1", tile: "fcvm:4", phase, frame_url: null, clicked_at: EPOCH, first_frame_at: null, expires_at: null, gpu: "Tesla T4", phases: {}, camera: [], ended: phase === "ended" ? "released" : null } });
 
