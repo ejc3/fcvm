@@ -170,6 +170,9 @@ export function PlayDrawer({ client, view, onClose, section }: { client: WallCli
           <span className="switch" aria-hidden="true" />
           {p.stats.label}
         </button>
+        <p className="note" data-testid="family">
+          {p.stats.family}
+        </p>
       </section>
       <section className="isolation" aria-labelledby="isolation-title" data-testid="isolation">
         <h3 id="isolation-title" tabIndex={-1}>

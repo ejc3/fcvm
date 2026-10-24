@@ -18,10 +18,10 @@ import {
   type PlacedTile,
   type Segment,
 } from "./layout.ts";
-import { frameSocketUrl } from "./net.ts";
+import { FAMILY_PROBE_MS, frameSocketUrl, streamUrl, type Family } from "./net.ts";
 import { fitBandwidth, type StreamAsk } from "./bandwidth.ts";
 import { suggestMode } from "./mode.ts";
-import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type FleetState, type Half, type IntentMsg, type Rect, type Tile } from "./protocol.ts";
+import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type Aggregate, type FleetState, type Half, type IntentMsg, type Rect, type Tile } from "./protocol.ts";
 import { KIND_TAG, NOT_AWAKE_NOTE, scoreView, type ScoreView } from "./race.ts";
 import { sceneUnixMs } from "./scene.ts";
 import { reelView, type ReelMeta, type ReelView } from "./reel.ts";
@@ -208,8 +208,9 @@ function pendingRelaunch(pending: readonly IntentMsg[], t: Tile): boolean {
   return pending.some((i) => (i.name === "relaunch" && i.args["tile"] === t.id) || i.name === "restart_now");
 }
 
+/** Running with a renderer to connect to, over either family (the overlays follow this). */
 function isLive(t: Tile): boolean {
-  return t.phase === "running" && t.frame_url !== null;
+  return t.phase === "running" && (t.frame_url !== null || t.frame_url_v4 !== null);
 }
 
 function glyphFor(t: Tile, phase: string): Glyph {
@@ -476,7 +477,8 @@ export interface PlayView {
   };
   light: { label: string; on: boolean };
   streams: { label: string; on: boolean; note: string; disabled: boolean };
-  stats: { label: string; on: boolean };
+  /** `family`: the stats drawer's line on the address family every tile streams over. */
+  stats: { label: string; on: boolean; family: string };
   verify: { needed: boolean; title: string; text: string; error: string };
   disabled: boolean;
 }
@@ -522,7 +524,7 @@ function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMs
     };
   }
 
-  const hasAgg = st.aggregates.some((a) => a.frame_url !== null);
+  const hasAgg = aggregatedAvailable(st.aggregates, s.net.family);
   const sug = suggestMode({
     aggregators: st.aggregates.length,
     downlinkMbps: input.downlinkMbps ?? null,
@@ -552,7 +554,7 @@ function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMs
     },
     light: { label: s.ui.lightMode ? "Click the picture to drop it" : "Drop a light", on: s.ui.lightMode },
     streams: { label: "See every VM's own stream", on: direct, note: streamsNote, disabled: !hasAgg },
-    stats: { label: "Show stream stats", on: s.ui.stats },
+    stats: { label: "Show stream stats", on: s.ui.stats, family: familyLine(s.net) },
     verify: {
       needed: ts.sitekey !== null && !ts.verified,
       title: "One check first",
@@ -1358,35 +1360,42 @@ export function wallView(input: WallInput): WallView {
     return { id: t.id, rect: t.rect, height, keep: focused };
   });
   const fitted = fitBandwidth(asks, st.image_aspect, input.budgetBps);
-  const direct: DrawSource[] = st.tiles.filter(isLive).map((t) => {
+  // Every tile streams over the one family the IPv6 probe chose; until it answers, none does.
+  const family = s.net.family;
+  const direct: DrawSource[] = st.tiles.filter((t) => isLive(t) && streamUrl(t, family) !== null).map((t) => {
     const height = fitted.heights.get(t.id) ?? 144;
     const q = fitted.quality.get(t.id) ?? "std";
+    const base = streamUrl(t, family)!;
     return {
       id: `d:${t.id}`,
-      url: frameSocketUrl(t.frame_url!, height, q),
-      baseUrl: t.frame_url,
+      url: frameSocketUrl(base, height, q),
+      baseUrl: base,
       height,
       box: covered ? (opened?.id === t.id ? focus!.placed!.box : null) : placedPlan.get(t.id)?.box ?? null,
     };
   });
-  // Aggregated: each region is one big tile; it asks for the height it covers.
+  // Aggregated: each region is one big tile; it asks for the height it covers. Only the
+  // aggregates with a URL in this viewer's family stream.
   const aggregated: DrawSource[] = st.aggregates
-    .filter((g) => g.frame_url !== null)
+    .filter((g) => streamUrl(g, family) !== null)
     .map((g) => {
       const box = planLayout ? rectOnScreen(planLayout.image, g.rect, input.dpr) : null;
       const height = covered || !box ? STREAM_HEIGHTS[0] : streamHeightFor(box.h * input.dpr);
-      return { id: `a:${g.id}`, url: frameSocketUrl(g.frame_url!, height), baseUrl: g.frame_url, height, box: covered ? null : box };
+      const base = streamUrl(g, family)!;
+      return { id: `a:${g.id}`, url: frameSocketUrl(base, height), baseUrl: base, height, box: covered ? null : box };
     });
   let focusSource: DrawSource | null = null;
-  if (own && own.placed && s.own.claim?.frame_url) {
+  const claimUrl = s.own.claim ? streamUrl(s.own.claim, family) : null;
+  if (own && own.placed && s.own.claim && claimUrl) {
     const c = s.own.claim;
-    focusSource = { id: `o:${c.id}`, url: frameSocketUrl(c.frame_url!, own.placed.streamHeight), baseUrl: c.frame_url, height: own.placed.streamHeight, box: own.placed.box };
+    focusSource = { id: `o:${c.id}`, url: frameSocketUrl(claimUrl, own.placed.streamHeight), baseUrl: claimUrl, height: own.placed.streamHeight, box: own.placed.box };
   } else if (opened) {
     focusSource = direct.find((d) => d.id === `d:${opened.id}`) ?? null;
   }
   const plan: DrawPlan = {
     ...emptyPlan,
-    mode: st.aggregates.some((a) => a.frame_url !== null) ? s.ui.mode : "direct",
+    // Aggregated only where the serving aggregates serve this viewer's family; otherwise direct.
+    mode: aggregatedAvailable(st.aggregates, family) ? s.ui.mode : "direct",
     direct,
     aggregated,
     focus: focusSource,
@@ -1465,3 +1474,23 @@ export function needsVerify(s: ClientState): boolean {
   return s.turnstile.sitekey !== null && !s.turnstile.verified;
 }
 
+
+/**
+ * Aggregated mode is available to a viewer when an aggregate serves its family and every
+ * aggregate that is serving at all (a URL in either family) serves its family: otherwise a
+ * half drawn only by an aggregate the viewer cannot open would stay dark. An aggregate not
+ * serving yet (no URL, as during a wake) does not count against it.
+ */
+export function aggregatedAvailable(aggregates: readonly Aggregate[], family: Family | null): boolean {
+  const serving = aggregates.filter((a) => a.frame_url !== null || a.frame_url_v4 !== null);
+  return serving.length > 0 && serving.every((a) => streamUrl(a, family) !== null);
+}
+
+/** The stats drawer's line on the address family the tiles stream over. */
+export function familyLine(net: ClientState["net"]): string {
+  if (net.family === null) return "Address family: checking IPv6";
+  if (net.family === "v6") return `Address family: IPv6 for every tile${net.probeMs === null ? "" : ` (connected in ${Math.round(net.probeMs)} ms)`}`;
+  return net.probeMs === null
+    ? "Address family: IPv4 for every tile (the tiles have no IPv6 address)"
+    : `Address family: IPv4 for every tile (IPv6 did not connect within ${(FAMILY_PROBE_MS / 1000).toFixed(1)} s)`;
+}

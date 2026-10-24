@@ -4,6 +4,10 @@
 
 import {
   cameraTargets,
+  FAMILY_PROBE_MS,
+  familyProbeTargets,
+  frameSocketUrl,
+  STREAM_HEIGHTS,
   initialState,
   intentsToResend,
   makeIntent,
@@ -49,6 +53,8 @@ export class WallClient {
   /** The canvas has painted the poster or a frame. */
   painted = false;
   private paintedListeners = new Set<() => void>();
+  /** The IPv6 probe's sockets while it runs; it runs once per page load. */
+  private probe: WebSocket[] | null = null;
   readonly url: string;
 
   constructor(url: string) {
@@ -81,6 +87,7 @@ export class WallClient {
     const watches = cameraTargets(next);
     if (watches.length !== hadWatches.length || watches.some((w, i) => w.tEff !== hadWatches[i]?.tEff)) this.postWatch();
     for (const l of this.listeners) l();
+    if (next.net.family === null && this.probe === null && next.accepted) this.probeFamily(next);
     // A claim came for a request the viewer dismissed: give the GPU back.
     const release = next.own.release;
     if (release !== null && before.own.release !== release) {
@@ -95,6 +102,59 @@ export class WallClient {
     this.stopped = false;
     this.connect();
     this.noticeTimer = setInterval(() => this.dispatch({ type: "notice-expired", before: now() - NOTICE_MS }), 1000);
+  }
+
+  /**
+   * Once per page load: open the IPv6 frame sockets of up to three tiles at once. The first
+   * to open within FAMILY_PROBE_MS makes IPv6 the family for every tile; none opening makes
+   * it IPv4. One tile can be down without IPv6 being down, hence several.
+   */
+  private probeFamily(s: ClientState): void {
+    const { urls, v4Only } = familyProbeTargets(s.accepted!.tiles);
+    if (v4Only) {
+      this.probe = [];
+      this.dispatch({ type: "family", family: "v4", probeMs: null });
+      return;
+    }
+    if (urls.length === 0) return; // no tile has an address yet: probe on a later snapshot
+    const started = performance.now();
+    let open = 0;
+    let failed = 0;
+    let done = false;
+    const sockets: WebSocket[] = [];
+    this.probe = sockets;
+    const finish = (family: "v6" | "v4", ms: number | null) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      for (const ws of sockets) {
+        ws.onopen = ws.onerror = ws.onclose = null;
+        try {
+          ws.close();
+        } catch {
+          // Already closed.
+        }
+      }
+      if (!this.stopped) this.dispatch({ type: "family", family, probeMs: ms });
+    };
+    const timer = setTimeout(() => finish("v4", FAMILY_PROBE_MS), FAMILY_PROBE_MS);
+    for (const url of urls) {
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(frameSocketUrl(url, STREAM_HEIGHTS[0]!));
+      } catch {
+        if (++failed === urls.length) finish("v4", performance.now() - started);
+        continue;
+      }
+      sockets.push(ws);
+      ws.onopen = () => {
+        open++;
+        finish("v6", performance.now() - started);
+      };
+      ws.onerror = () => {
+        if (++failed === urls.length && open === 0) finish("v4", performance.now() - started);
+      };
+    }
   }
 
   stop(): void {

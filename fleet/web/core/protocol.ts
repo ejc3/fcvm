@@ -52,8 +52,13 @@ export interface Tile {
   fps: number | null;
   error: string | null;
   failure: Failure | null;
-  /** Null while the tile has no renderer to connect to (waiting for capacity). */
+  /**
+   * The renderer's frame socket over IPv6 (`wss://<label>.<zone>/frames`). Null while the
+   * tile has no renderer to connect to, and until the coordinator has published its DNS.
+   */
   frame_url: string | null;
+  /** The same renderer over IPv4 (`wss://<label>-v4.<zone>[:port]/frames`), null alike. */
+  frame_url_v4: string | null;
   gpu: GpuInfo | null;
   host: string | null;
   last_relaunch: LastRelaunch | null;
@@ -240,7 +245,9 @@ export interface Aggregate {
   half: Half;
   host: string | null;
   rect: Rect;
+  /** The host's aggregator over IPv6, and over IPv4: null while it is not serving browsers. */
   frame_url: string | null;
+  frame_url_v4: string | null;
   tiles: string[];
 }
 
@@ -308,7 +315,9 @@ export interface Claim {
   tile: string | null;
   /** `restoring`, `running`, or `ended`. */
   phase: string;
+  /** The private VM's frames over IPv6, and over IPv4. */
   frame_url: string | null;
+  frame_url_v4: string | null;
   clicked_at: number;
   first_frame_at: number | null;
   /** When the GPU goes back to the pool. */
@@ -489,6 +498,7 @@ function parseTile(v: unknown, i: number): Tile {
     error: strOrNull(v, "error", where),
     failure: parseFailure(v["failure"], `${where}.failure`),
     frame_url: strOrNull(v, "frame_url", where),
+    frame_url_v4: strOrNull(v, "frame_url_v4", where),
     gpu: parseGpu(v["gpu"], v["gpu_stats"], `${where}.gpu`),
     host: strOrNull(v, "host", where),
     last_relaunch: parseLastRelaunch(v["last_relaunch"], `${where}.last_relaunch`),
@@ -676,6 +686,7 @@ function parseState(o: Obj): FleetState {
         host: strOrNull(a, "host", where),
         rect: parseRect(obj(a, "rect", where), `${where}.rect`),
         frame_url: strOrNull(a, "frame_url", where),
+        frame_url_v4: strOrNull(a, "frame_url_v4", where),
         tiles: arr(a, "tiles", where).filter((x): x is string => typeof x === "string"),
       };
     }),
@@ -691,6 +702,7 @@ function parseClaim(v: Obj): Claim {
     tile: strOrNull(v, "tile", w),
     phase: str(v, "phase", w),
     frame_url: strOrNull(v, "frame_url", w),
+    frame_url_v4: strOrNull(v, "frame_url_v4", w),
     clicked_at: num(v, "clicked_at", w),
     first_frame_at: numOrNull(v, "first_frame_at", w),
     expires_at: numOrNull(v, "expires_at", w),

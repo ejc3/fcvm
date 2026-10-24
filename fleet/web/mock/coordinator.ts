@@ -374,6 +374,7 @@ export class MockCoordinator {
         phase: t.phase,
         slot: t.slot,
         frame_url: t.slot ? this.opts.renderers.frameUrl(t.slot) : null,
+        frame_url_v4: t.slot ? this.opts.renderers.frameUrlV4(t.slot) : null,
         gpu: t.gpu,
         host: t.host,
         vm: t.slot ? `fleet-${t.slot}` : null,
@@ -430,7 +431,11 @@ export class MockCoordinator {
       },
       viewers: { count: this.clients.size, active: [...this.clients].filter((c) => c.visible).length },
       actions: this.actions,
-      aggregates: this.aggregates.map((a) => ({ ...a, frame_url: this.aggregateUp(a) ? this.opts.renderers.frameUrl(this.streamId(a.id)) : null })),
+      aggregates: this.aggregates.map((a) => ({
+        ...a,
+        frame_url: this.aggregateUp(a) ? this.opts.renderers.frameUrl(this.streamId(a.id)) : null,
+        frame_url_v4: this.aggregateUp(a) ? this.opts.renderers.frameUrlV4(this.streamId(a.id)) : null,
+      })),
     };
   }
 
@@ -1128,6 +1133,7 @@ export class MockCoordinator {
         tile: cl.tile.id,
         phase: cl.phase,
         frame_url: cl.phase === "running" ? this.opts.renderers.frameUrl(cl.id) : null,
+        frame_url_v4: cl.phase === "running" ? this.opts.renderers.frameUrlV4(cl.id) : null,
         clicked_at: cl.clicked_at,
         first_frame_at: cl.first_frame_at,
         expires_at: cl.expires_at,
@@ -1331,6 +1337,7 @@ export class MockCoordinator {
             this.setGpus(typeof b["fcvm_gpus"] === "number" ? b["fcvm_gpus"] : this.fcvmSlots.length, typeof b["ec2_gpus"] === "number" ? b["ec2_gpus"] : this.ec2Count);
           }
           if (typeof b["renderers_silent"] === "boolean") this.opts.renderers.setSilent(b["renderers_silent"]);
+          if (typeof b["ipv6_down"] === "boolean") this.opts.renderers.setV6Down(b["ipv6_down"]);
           return { ok: true };
         });
         return;

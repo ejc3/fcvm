@@ -23,8 +23,13 @@ const MAX_INFLIGHT = 4;
 
 export interface RendererOptions {
   port: number;
-  /** Host name the browser uses to reach this server, for frame_url. */
+  /** Host name the browser uses to reach this server, for frame_url (the IPv6 address). */
   publicHost: string;
+  /**
+   * Host name for frame_url_v4. The mock stands in for the two families with two names for
+   * one server: a socket is IPv4 when its Host is this name, IPv6 otherwise.
+   */
+  publicHostV4?: string;
   /** The port the browser reaches it on, when that is not its own (a proxy in front). */
   publicPort?: number;
   fps: number;
@@ -54,6 +59,7 @@ const CRF: Record<string, number> = { hi: 14, std: 18, lo: 26 };
 
 interface Sub {
   q: string;
+  family: "v6" | "v4";
   ws: WebSocket;
   tile: string;
   width: number;
@@ -73,6 +79,8 @@ export interface RendererStats {
   subscribers: number;
   /** Open frame sockets by the quality they were opened with (q is read from the URL at connection time only). */
   subscribersByQuality: Record<string, number>;
+  /** Open frame sockets by the address family they came over (v6 or v4). */
+  subscribersByFamily: Record<string, number>;
   framesSent: number;
   framesSkipped: number;
   renderBacklog: number;
@@ -89,7 +97,7 @@ export class MockRenderers {
   private wss: WebSocketServer;
   private timer: NodeJS.Timeout | null = null;
   private lastFrame = -1;
-  readonly stats: RendererStats = { subscribers: 0, subscribersByQuality: {}, framesSent: 0, framesSkipped: 0, renderBacklog: 0 };
+  readonly stats: RendererStats = { subscribers: 0, subscribersByQuality: {}, subscribersByFamily: {}, framesSent: 0, framesSkipped: 0, renderBacklog: 0 };
 
   constructor(opts: RendererOptions) {
     this.opts = opts;
@@ -110,13 +118,19 @@ export class MockRenderers {
         socket.end("HTTP/1.1 503 Service Unavailable\r\n\r\n");
         return;
       }
+      const family = (req.headers.host ?? "").replace(/:\d+$/, "") === this.v4Host ? "v4" : "v6";
+      // A viewer with no IPv6: its IPv6 connects fail.
+      if (family === "v6" && this.v6Down) {
+        socket.destroy();
+        return;
+      }
       const h = Number(url.searchParams.get("h") ?? "144");
       const q = url.searchParams.get("q") ?? "std";
       if (!(q in CRF)) {
         socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
         return;
       }
-      this.wss.handleUpgrade(req, socket, head, (ws) => this.subscribe(ws, m[1]!, h, q));
+      this.wss.handleUpgrade(req, socket, head, (ws) => this.subscribe(ws, m[1]!, h, q, family));
     });
   }
 
@@ -137,6 +151,21 @@ export class MockRenderers {
 
   frameUrl(id: string): string {
     return `ws://${this.opts.publicHost}:${this.opts.publicPort ?? this.port}/frames/${id}`;
+  }
+
+  private get v4Host(): string {
+    return this.opts.publicHostV4 ?? "127.0.0.1";
+  }
+
+  /** The same stream as frameUrl over the IPv4 name. */
+  frameUrlV4(id: string): string {
+    return `ws://${this.v4Host}:${this.opts.publicPort ?? this.port}/frames/${id}`;
+  }
+
+  private v6Down = false;
+  /** Tests: refuse every IPv6 frame socket, as for a viewer with no IPv6. */
+  setV6Down(down: boolean): void {
+    this.v6Down = down;
   }
 
   setTile(id: string, rect: Rect, black: () => Rect[] = () => [], scene: (() => PatternScene) | null = null): void {
@@ -201,8 +230,8 @@ export class MockRenderers {
     return Math.min(this.opts.maxHeight, Number.isFinite(h) ? h : 144);
   }
 
-  private subscribe(ws: WebSocket, tile: string, h: number, q: string): void {
-    const sub: Sub = { q, ws, tile, width: 0, height: 0, geometry: null, reqH: h, geomKey: "", encoder: null, stamps: [], sentKey: false };
+  private subscribe(ws: WebSocket, tile: string, h: number, q: string, family: "v6" | "v4"): void {
+    const sub: Sub = { q, family, ws, tile, width: 0, height: 0, geometry: null, reqH: h, geomKey: "", encoder: null, stamps: [], sentKey: false };
     this.subs.add(sub);
     this.countSubs();
     this.resize(sub, h);
@@ -229,8 +258,13 @@ export class MockRenderers {
   private countSubs(): void {
     this.stats.subscribers = this.subs.size;
     const by: Record<string, number> = {};
-    for (const s of this.subs) by[s.q] = (by[s.q] ?? 0) + 1;
+    const fam: Record<string, number> = {};
+    for (const s of this.subs) {
+      by[s.q] = (by[s.q] ?? 0) + 1;
+      fam[s.family] = (fam[s.family] ?? 0) + 1;
+    }
     this.stats.subscribersByQuality = by;
+    this.stats.subscribersByFamily = fam;
   }
 
   private resize(sub: Sub, h: number): void {
