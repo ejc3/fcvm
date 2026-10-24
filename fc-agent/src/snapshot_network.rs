@@ -1803,6 +1803,14 @@ pub async fn resume_source_network() -> Result<()> {
         "[fc-agent] source VM snapshot network reopened: gate=open \
          (link never taken down)"
     );
+    // The snapshot reset the vsock transport under the running agent's output writer,
+    // which reconnects only when asked; nothing else asks a resumed source.
+    if let Err(error) = crate::output::request_reconnect() {
+        eprintln!(
+            "[fc-agent] WARNING: {error:#}; the container's output after this snapshot \
+             will not reach the host"
+        );
+    }
     Ok(())
 }
 

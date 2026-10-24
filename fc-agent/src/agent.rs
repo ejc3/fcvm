@@ -130,11 +130,15 @@ pub async fn run() -> Result<()> {
     // reset = snapshot restore) to the restore-epoch watcher.
     let (output, output_writer, vsock_reset_rx) = output::create();
     tokio::spawn(output_writer);
+    // How the host's resume of a snapshotted source asks for the output to reconnect.
+    output::spawn_reconnect_listener(output.clone())
+        .context("starting the output reconnect listener")?;
 
     // Pending until the cache handshake proves this is a cold start or the
     // restore watcher completes every restore phase. The state owns the only
-    // explicit output reconnect edge, so a failed restore cannot race an
-    // independent WarmStart reconnect below.
+    // explicit output reconnect edge of a restore, so a failed restore cannot race an
+    // independent WarmStart reconnect below. (The reconnect listener above serves a
+    // resumed snapshot source, which restores nothing.)
     let restore_status = crate::restore::RestoreStatus::new(output.clone());
 
     // Shared flag: set by restore-epoch watcher, checked by notify_cache_ready_and_wait.

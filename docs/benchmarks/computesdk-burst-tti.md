@@ -42,13 +42,16 @@ here. The benchmark has no GPU variant.
    the published providers use. The task, the schedule, the timer and the statistics are the
    harness's, unchanged.
 2. Starts `fcvm serve` on the same host. Each sandbox is an `fcvm podman run` of
-   `node:22-slim` with 2 vCPUs, 2048 MiB and rootless networking, which restores the image's
-   pre-start snapshot (memory from the snapshot file, disk as a btrfs snapshot). A create
+   `node:22-slim` with 2 vCPUs, 2048 MiB and rootless networking, which restores a snapshot
+   of the image (memory from the snapshot file, disk as a btrfs snapshot). Serve now passes
+   `--startup-snapshot`, so that is the startup snapshot, with the container already running;
+   the results before "With the startup snapshot taken at the container's start" were
+   measured before that change and restored the pre-start snapshot. A create
    (`POST /v1/sandboxes`) returns once fcvm's health monitor reports the container running.
    `runCommand` (`POST /s/{id}/run/command`) runs `sh -c 'node -v'` in the container over
    vsock.
-3. Creates and destroys one sandbox, untimed. That creates the pre-start snapshot, as a
-   provider's template exists before its published runs.
+3. Creates and destroys one sandbox, untimed. That creates the snapshot the timed creates
+   restore, as a provider's template exists before its published runs.
 4. Runs `bench run benchmarks/sandbox/tti.bench.ts --provider fcvm --iterations N --concurrency C --no-ingest`
    once per burst.
 
@@ -155,6 +158,37 @@ check waited as long as the last one took. In the before run, where fc-agent sti
 notification when it spawned `podman run`, podman took a median of 588 ms (p95 963) from
 that spawn to the container running. This change does not touch that time, and it is now
 the largest part of a create after the restore.
+
+### With the startup snapshot taken at the container's start
+
+`fcvm serve` gives no `--health-check`, so until then it only restored the pre-start
+snapshot and every create started its container with `podman run` in the guest. Since then
+serve passes `--startup-snapshot`: a run takes the startup snapshot at its first Healthy
+(here the container's start), and an identical later create restores the container already
+running. A plain `podman run` takes none unless it passes the flag (README, "Startup
+Snapshots"). Same host type, same quiet-box gate
+(1-minute load 0.17 to 0.95 at the eight starts), arms alternating, with all system snapshots
+removed before each measurement so neither arm reuses the other's: before at `e8ecb178`, after
+at `f0449371`. Every timed create of the after arm restored the startup snapshot. TTI in ms,
+harness statistics, then untrimmed p99 and max.
+
+| concurrency | sandboxes | before median | before p95 | before p99 | after median | after p95 | after p99 | before / after untrimmed p99 | before / after max |
+|---|---|---|---|---|---|---|---|---|---|
+| 100 | 5 bursts x 100 | 2228 | 2467 | 2505 | 1678 | 2151 | 2256 | 2561 / 2392 | 2678 / 2417 |
+| 10 | 5 bursts x 10 | 586 | 635 | 661 | 437 | 596 | 602 | 667 / 607 | 667 / 607 |
+| 1 | 50 in sequence | 525 | 569 | 578 | 400 | 465 | 514 | 598 / 629 | 598 / 629 |
+
+One burst of 100 creates each way, without the command, p50 / p95 ms:
+
+| interval | before | after |
+|---|---|---|
+| create request to return | 1884 / 2095 | 1080 / 1649 |
+| restore start to guest ACK | 682 / 823 | 747 / 920 |
+| create request to the container-running notification at the host | 1871 / 2084 | 1063 / 1643 |
+| notification to the create's return | 11 / 28 | 13 / 27 |
+
+The restore of a running container takes a median 65 ms longer (more memory to page in), and
+podman's start of the container (about 600 ms under the burst) is gone.
 
 ### Published results, for reference
 

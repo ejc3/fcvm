@@ -215,13 +215,29 @@ After the first run with a given image, fcvm snapshots the VM state post-image-p
 
 ### Startup Snapshots
 
-Use `--health-check` to snapshot the fully initialized application, not just the pulled image:
+A run can snapshot its running container the first time it is healthy, so the next
+identical run (same image, command, environment and volumes; the name and labels may differ)
+restores the container already running instead of starting it with `podman run`. A run asks
+for this with `--startup-snapshot`, or with `--health-check`, which also decides when it is
+healthy. Otherwise healthy is podman's healthcheck for an image that defines one, and the
+container's start for one that does not:
 
 ```bash
+./fcvm podman run --name web1 --startup-snapshot nginx:alpine
+# First run: starts the container, then snapshots it running
+./fcvm podman run --name web2 --startup-snapshot nginx:alpine
+# Second run: restores with the container already running
+
 ./fcvm podman run --name web --health-check http://localhost/ nginx:alpine
-# First run: waits for health check, then snapshots the warm app
-# Second run: restores with app already running
+# Snapshots once the app answers, not just once the container started
 ```
+
+It is off for a plain `podman run` because every run restored from the snapshot continues
+the same container: whatever the app made when it started (keys, IDs, random seeds, a
+registration with a server) is shared by all of them, and output written before the snapshot
+is not repeated. A run that does not ask also does not restore a startup snapshot that another
+run left under the same key. `fcvm serve` passes `--startup-snapshot`, since its sandboxes of
+one image are identical by design.
 
 With `--balloon`, the startup snapshot is kept per target, because the app initialized under that target. Runs that differ only in the target still share the pre-start snapshot. A run whose target `fcvm balloon` changed before the app turned healthy saves no startup snapshot, and `podman prepare` fails.
 
@@ -469,6 +485,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 -i / -t / -it         Interactive / TTY / both
 --setup               Auto-setup if assets missing (rootless only)
 --health-check <URL>  Create startup snapshot after health passes
+--startup-snapshot    Snapshot the running container at its first Healthy (off by default)
 --cpu <N> --mem <MB>  CPU count and memory
 --hugepages           Use 2MB hugepages (pre-allocate pool first)
 --balloon <MIB>       Balloon device target; runs that differ only in the target share the pre-start snapshot

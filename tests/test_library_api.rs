@@ -36,6 +36,7 @@ fn test_run_args(name: &str) -> RunArgs {
         network: NetworkMode::Rootless,
         hypervisor: fcvm::cli::args::Hypervisor::Firecracker,
         health_check: None,
+        startup_snapshot: false,
         privileged: false,
         interactive: false,
         tty: false,
