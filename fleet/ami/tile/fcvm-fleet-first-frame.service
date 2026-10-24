@@ -1,0 +1,10 @@
+[Unit]
+Description=fcvm fleet tile: record the renderer's first frame after boot
+After=fcvm-fleet-renderer.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/fcvm-fleet/first-frame.sh
+
+[Install]
+WantedBy=multi-user.target
