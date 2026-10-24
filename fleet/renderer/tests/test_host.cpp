@@ -590,6 +590,17 @@ int main() {
     CHECK(s.q.size() == 2 && *s.q[0] == "hdr-720" && *s.q[1] == "key",
           "after a dropped queue the header is sent again before the keyframe (queue: %s)", order.c_str());
   }
+  {
+    // A camera that sees no land: find_ridge_cached answers false and still
+    // writes at and dist, since its cache stores them with the miss.
+    const double pos[3] = {0.0, 2.0, 0.0}, look[3] = {0.0, 50.0, 0.001};
+    GCam sky = make_cam(pos, look, 60.0, 16.0 / 9.0);
+    V3 at = v3(NAN, NAN, NAN);
+    float dist = NAN;
+    bool ok = find_ridge_cached(sky, 16.0f / 9.0f, 4.0f, 0.1f, &at, &dist);
+    CHECK(!ok && dist == 0.0f && at.x == sky.pos.x && at.y == sky.pos.y && at.z == sky.pos.z,
+          "a ridge search that finds no land still writes its outputs (ok %d, dist %g, at.y %g)", ok, dist, at.y);
+  }
   tlscheck::run();
   DONE();
 }
