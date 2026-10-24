@@ -208,9 +208,9 @@ every renderer gets its new rectangle through `POST /scene` without a relaunch, 
 picture changes from coarser to finer tiles at one frame `t`. When a host is reclaimed (a
 two-minute spot notice) the coordinator re-tiles onto the remaining GPUs at once, before
 the host disappears, so the image never shows a hole for a lost host. Slot names are
-reused lowest-first, so a stable fleet keeps stable names. The EC2 half is re-tiled in the
-same event (N is recomputed from both counts) and launches or terminates instances to
-match the fcvm count.
+reused lowest-first, so a stable fleet keeps stable names. Both sides are re-tiled in the
+same event (each side's width follows its live GPU count), as a new layout generation that
+takes effect at a stated frame; the EC2 side keeps its configured number of tiles.
 
 Within a host's life a slot keeps its address across relaunches, so a browser reconnects
 to the same address. Two fcvm changes make that possible:
@@ -220,7 +220,8 @@ to the same address. Two fcvm changes make that possible:
   in the prefix; a collision with a live VM is refused, as the hash path refuses one today.
 - VM names unique among live VMs, so `--name slot-3` identifies one VM.
 
-The slot's address is `<host prefix>::<gpu index + 1>`. The host prefix is a public IPv6
+The slot's address is `<host prefix>::<gpu index + 2>` (fcvm refuses the prefix's
+addresses 0 and 1). The host prefix is a public IPv6
 /80 that AWS delegates to the host's network interface at launch (`Ipv6PrefixCount = 1` in
 the launch template). The browser connects straight to the VM: `slot-<n>.<zone>` is an
 unproxied AAAA record pointing at the slot's address, which the coordinator writes through
@@ -310,13 +311,18 @@ detail view for 1080p.
 **The image is fixed; its tiling follows the fleet.** The picture is always the same
 frame of the same scene. The coordinator splits each half into as many rectangles as that
 half has GPUs, so more hosts make each GPU's rectangle smaller and the whole image finer
-(more pixels and more ray-marching steps per pixel in total). **DECIDED (2026-10-22): the halves are symmetrical.** Both halves are cut into the same
-grid of N rectangles, N = max(fcvm GPUs, EC2 instances running). One GPU renders one
-rectangle, never more. The coordinator asks EC2 for as many instances as the fcvm side
-has GPUs; whichever side ends up with fewer GPUs (spot capacity decides) shows its missing
-rectangles dark, labelled "waiting for capacity", until a GPU arrives. An EC2 side short
-of spot capacity therefore shows as dark tiles, which is part of the comparison. Every viewer sees the same tiling, because the tiling
-is part of the shared state.
+(more pixels and more ray-marching steps per pixel in total). **DECIDED (2026-10-23, replacing "the halves are symmetrical"): each side shows the GPUs it
+has live.** The fcvm and EC2 sides no longer mirror each other: each is as wide as its
+share of the live GPUs (fcvm 100 and EC2 12 give the fcvm side 100/112 of the width), one
+rectangle per GPU, never more, and no dark "waiting for capacity" tiles. An EC2 tile still
+waiting for spot capacity is not on the wall; its wait is shown in its own panel and kept
+out of the EC2 side's race time. A side with no GPU has no width, and with none on either
+side (asleep) there is no tile. A change of capacity re-tiles without a hitch: the
+coordinator publishes a new layout generation with the frame it takes effect at, each
+renderer switches to its new rectangle at that frame, and the page keeps the old tiles on
+screen until every new tile's first frame has arrived, then swaps them all at once. A GPU
+keeps its slot and addresses; only its rectangle changes. Every viewer sees the same
+tiling, because the tiling is part of the shared state (fleet/PROTOCOL.md, `layout`).
 
 ### Web
 
@@ -462,7 +468,7 @@ tiles is capped by what a browser can decode and draw: `max_tiles` in the coordi
 100 until the browser measurement below sets it. A browser holds 200 to 255 WebSockets
 (Chrome's socket pool caps WebSockets at 255, Firefox defaults to 200), so connections are
 not the limit at 100; the open question is 100 concurrent decoders, which the measurement
-answers. N = min(max_tiles, max(fcvm GPUs, EC2 instances)); GPUs beyond that are standby.
+answers. Each side shows at most `max_tiles` tiles; fcvm GPUs beyond that are standby.
 
 ## Measurements to take
 
