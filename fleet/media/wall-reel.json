@@ -1,0 +1,43 @@
+{
+ "recorded_at": 1792756499967,
+ "duration_s": 59,
+ "measured": {
+  "gpus": 8,
+  "fcvm_ms": 3489,
+  "ec2_ms": null
+ },
+ "wake": {
+  "gpus": 8,
+  "ms": 2829
+ },
+ "single_restart_ms": 2967,
+ "edited": true,
+ "session": {
+  "started_at": 1792752095967,
+  "duration_s": 4471
+ },
+ "clips": [
+  {
+   "reel_from_s": 0,
+   "reel_to_s": 24,
+   "session_from_s": 4404,
+   "recorded_at": 1792756499967,
+   "shows": "asleep, a viewer arrives, the wake"
+  },
+  {
+   "reel_from_s": 24,
+   "reel_to_s": 44,
+   "session_from_s": 1193,
+   "recorded_at": 1792753288967,
+   "shows": "restart all eight GPUs"
+  },
+  {
+   "reel_from_s": 44,
+   "reel_to_s": 59,
+   "session_from_s": 301,
+   "recorded_at": 1792752396967,
+   "shows": "one VM opened and restarted"
+  }
+ ],
+ "host": "g4dn.metal, 8 x Tesla T4"
+}

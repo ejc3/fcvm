@@ -80,6 +80,7 @@ async fn test_state_persistence() {
             balloon_mib: None,
             balloon_free_page_reporting: false,
             gpus: Vec::new(),
+            container_start_version: None,
         },
     };
 
@@ -175,6 +176,7 @@ async fn test_list_vms() {
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
                 gpus: Vec::new(),
+                container_start_version: None,
             },
         };
         manager.save_state(&state).await.unwrap();
@@ -254,6 +256,7 @@ async fn test_load_state_by_name_duplicate_detection() {
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
                 gpus: Vec::new(),
+                container_start_version: None,
             },
         };
         manager.save_state(&state).await.unwrap();
@@ -327,6 +330,7 @@ async fn test_load_state_by_name_duplicate_detection() {
             balloon_mib: None,
             balloon_free_page_reporting: false,
             gpus: Vec::new(),
+            container_start_version: None,
         },
     };
     manager.save_state(&state).await.unwrap();
@@ -449,6 +453,7 @@ fn make_vm_state(vm_id: &str, name: &str, pid: u32) -> VmState {
             balloon_mib: None,
             balloon_free_page_reporting: false,
             gpus: Vec::new(),
+            container_start_version: None,
         },
     }
 }

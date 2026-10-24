@@ -6,11 +6,17 @@
 //!
 //! Gateway endpoints: `/v1/sandboxes/*`
 //! Sandbox daemon endpoints: `/s/{id}/*`
+//!
+//! Each sandbox is one `fcvm podman run` child process, so a sandbox starts the way the
+//! CLI starts a VM: it restores from the snapshot cache when the snapshot exists, and
+//! boots cold and creates it otherwise. `--no-snapshot` passes `--no-snapshot` to every
+//! child. A create returns once the child's state file says Healthy (the container is
+//! running), which one shared poller of the state directory observes for every
+//! pending create (`ReadyWatch`).
 
 use crate::cli::ServeArgs;
 use crate::commands::exec::{run_exec_in_vm_captured, ExecOutput};
-use crate::commands::podman::{start_vm, VmHandle};
-use crate::state::HealthStatus;
+use crate::state::{owner_is_live, HealthStatus, StateManager, VmState};
 use anyhow::{Context, Result};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -20,8 +26,10 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Duration;
+use tokio::sync::{oneshot, Notify, RwLock};
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 
@@ -29,8 +37,18 @@ use tracing::{error, info, warn};
 // Server state
 // ============================================================================
 
+/// How long a create waits for its sandbox to become healthy.
+const CREATE_READY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How often `ReadyWatch` reads the state directory while a create is pending.
+const READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How long a destroy waits for the child to finish its teardown after SIGTERM before
+/// it sends SIGKILL.
+const STOP_GRACE: Duration = Duration::from_secs(30);
+
 struct SandboxEntry {
-    handle: VmHandle,
+    sandbox: SandboxProcess,
     runtime: Option<String>,
     created_at: DateTime<Utc>,
     timeout_ms: Option<u64>,
@@ -39,9 +57,219 @@ struct SandboxEntry {
 struct AppState {
     sandboxes: RwLock<HashMap<String, SandboxEntry>>,
     port: u16,
+    /// The fcvm binary every sandbox runs, resolved once at startup.
+    fcvm_bin: PathBuf,
+    no_snapshot: bool,
+    ready: Arc<ReadyWatch>,
 }
 
 type SharedState = Arc<AppState>;
+
+/// An `fcvm podman run` child process. Dropping it while the child is unreaped stops it
+/// (SIGTERM, then SIGKILL after `STOP_GRACE`) on a task of its own, so a create abandoned by
+/// its client, or a sandbox the server never stopped, does not leave a VM behind. If this
+/// process dies, the kernel SIGKILLs the child (`die_with_parent`).
+struct ChildGuard {
+    child: Option<tokio::process::Child>,
+}
+
+impl ChildGuard {
+    fn new(child: tokio::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn pid(&self) -> Option<u32> {
+        // `id` is None once tokio has reaped the child, so the PID cannot be recycled
+        // while this returns Some.
+        self.child.as_ref().and_then(|c| c.id())
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self.child.as_mut() {
+            Some(child) => child.wait().await,
+            None => Err(std::io::Error::other("sandbox child already stopped")),
+        }
+    }
+
+    /// Whether the child has exited; reaps it if so.
+    fn exited(&mut self) -> bool {
+        match self.child.as_mut() {
+            Some(child) => !matches!(child.try_wait(), Ok(None)),
+            None => true,
+        }
+    }
+
+    /// SIGTERM, then SIGKILL after `STOP_GRACE`, and reap.
+    async fn stop(&mut self) -> Result<std::process::ExitStatus> {
+        match self.child.as_mut() {
+            Some(child) => stop_child(child).await,
+            None => anyhow::bail!("sandbox child already stopped"),
+        }
+    }
+}
+
+/// SIGTERM, then SIGKILL after `STOP_GRACE`, and reap. The SIGKILL matters: a SIGTERM that
+/// reaches `fcvm podman run` before a cache hit's restore has installed its own handlers is
+/// not acted on.
+async fn stop_child(child: &mut tokio::process::Child) -> Result<std::process::ExitStatus> {
+    if let Some(pid) = child.id() {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+    }
+    match tokio::time::timeout(STOP_GRACE, child.wait()).await {
+        Ok(status) => Ok(status?),
+        Err(_) => {
+            warn!(pid = ?child.id(), "sandbox did not exit after SIGTERM; sending SIGKILL");
+            child.start_kill()?;
+            Ok(child.wait().await?)
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if child.id().is_none() {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    let _ = stop_child(&mut child).await;
+                });
+            }
+            Err(_) => {
+                let _ = child.start_kill();
+            }
+        }
+    }
+}
+
+/// A healthy sandbox: its child and what its state file recorded.
+struct SandboxProcess {
+    child: ChildGuard,
+    vm_id: String,
+    name: String,
+    vsock_socket_path: PathBuf,
+}
+
+impl SandboxProcess {
+    async fn state(&self) -> Result<VmState> {
+        StateManager::new(crate::paths::state_dir())
+            .load_state(&self.vm_id)
+            .await
+    }
+
+    async fn stop(&mut self) -> Result<std::process::ExitStatus> {
+        self.child.stop().await
+    }
+}
+
+/// Arm `command` so the kernel SIGKILLs the child when this process dies. SIGKILL, because
+/// nothing is left to escalate after this process is gone, and a SIGTERM that lands before a
+/// cache hit's restore installs its own handlers is not acted on. The child's own children
+/// (VMM, namespace holder, pasta) carry their own parent-death signals, so the VM goes with
+/// it. tokio spawns from a runtime worker thread, which lives as long as the runtime, so the
+/// signal is not sent early by a thread exiting.
+fn die_with_parent(command: &mut tokio::process::Command) {
+    let parent = std::process::id() as libc::pid_t;
+    // SAFETY: the hook runs in the forked child before exec and makes two
+    // async-signal-safe calls; `parent` was captured before the fork.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The parent died between the fork and the prctl: no signal is coming.
+            if libc::getppid() != parent {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Waits for sandbox children to become healthy. One task reads the state directory every
+/// `READY_POLL_INTERVAL` while any create is pending, and hands each pending create the
+/// first state its child wrote that is Healthy or Stopped. A poller per create would read
+/// every state file once per create per interval.
+struct ReadyWatch {
+    state_dir: PathBuf,
+    waiters: std::sync::Mutex<HashMap<u32, oneshot::Sender<VmState>>>,
+    wake: Notify,
+}
+
+/// Removes its waiter when the create that registered it finishes or is dropped.
+struct ReadyRegistration<'a> {
+    watch: &'a ReadyWatch,
+    pid: u32,
+}
+
+impl Drop for ReadyRegistration<'_> {
+    fn drop(&mut self) {
+        self.watch.waiters.lock().unwrap().remove(&self.pid);
+    }
+}
+
+impl ReadyWatch {
+    fn new(state_dir: PathBuf) -> Self {
+        Self {
+            state_dir,
+            waiters: std::sync::Mutex::new(HashMap::new()),
+            wake: Notify::new(),
+        }
+    }
+
+    fn register(&self, pid: u32) -> (ReadyRegistration<'_>, oneshot::Receiver<VmState>) {
+        let (tx, rx) = oneshot::channel();
+        self.waiters.lock().unwrap().insert(pid, tx);
+        // notify_one stores a permit when the poller is not waiting, so a registration
+        // that lands between its emptiness check and its wait is not missed.
+        self.wake.notify_one();
+        (ReadyRegistration { watch: self, pid }, rx)
+    }
+
+    /// Deliver every waiter whose child has written a Healthy or Stopped state.
+    fn deliver(&self, states: Vec<VmState>) {
+        let mut waiters = self.waiters.lock().unwrap();
+        for vm in states {
+            let Some(pid) = vm.pid else { continue };
+            if !matches!(
+                vm.health_status,
+                HealthStatus::Healthy | HealthStatus::Stopped
+            ) {
+                continue;
+            }
+            // A stale state file can carry a recycled PID; only the process that wrote
+            // it counts.
+            if !waiters.contains_key(&pid) || !owner_is_live(&vm) {
+                continue;
+            }
+            if let Some(tx) = waiters.remove(&pid) {
+                let _ = tx.send(vm);
+            }
+        }
+    }
+
+    async fn run(self: Arc<Self>) {
+        let manager = StateManager::new(self.state_dir.clone());
+        loop {
+            if self.waiters.lock().unwrap().is_empty() {
+                self.wake.notified().await;
+                continue;
+            }
+            match manager.list_vms().await {
+                Ok(states) => self.deliver(states),
+                Err(e) => warn!(error = %e, "reading the state directory for pending sandboxes"),
+            }
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
+        }
+    }
+}
 
 // ============================================================================
 // Request/Response types
@@ -247,7 +475,10 @@ async fn get_exec_target(
     let entry = sandboxes
         .get(id)
         .ok_or_else(|| gateway_error(StatusCode::NOT_FOUND, format!("Sandbox {} not found", id)))?;
-    Ok((entry.handle.vsock_socket_path(), entry.handle.vm_id.clone()))
+    Ok((
+        entry.sandbox.vsock_socket_path.clone(),
+        entry.sandbox.vm_id.clone(),
+    ))
 }
 
 fn sandbox_url(port: u16, id: &str) -> String {
@@ -257,6 +488,57 @@ fn sandbox_url(port: u16, id: &str) -> String {
 // ============================================================================
 // Gateway handlers
 // ============================================================================
+
+/// `KEY=VALUE` strings sorted by key. The environment is part of the snapshot key, in the
+/// order given, and a HashMap iterates in a different order for every request: unsorted,
+/// two identical requests could miss each other's snapshot.
+fn key_value_flags(map: HashMap<String, String>) -> Vec<String> {
+    let mut pairs: Vec<(String, String)> = map.into_iter().collect();
+    pairs.sort();
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect()
+}
+
+/// The `fcvm podman run` arguments for one sandbox.
+fn podman_run_args(
+    name: &str,
+    image: &str,
+    cpu: u8,
+    mem_mib: u32,
+    env: &[String],
+    labels: &[String],
+    no_snapshot: bool,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "podman".into(),
+        "run".into(),
+        "--name".into(),
+        name.into(),
+        "--cpu".into(),
+        cpu.to_string(),
+        "--mem".into(),
+        mem_mib.to_string(),
+        "--network".into(),
+        "rootless".into(),
+    ];
+    if no_snapshot {
+        args.push("--no-snapshot".into());
+    }
+    for e in env {
+        args.push("--env".into());
+        args.push(e.clone());
+    }
+    for l in labels {
+        args.push("--label".into());
+        args.push(l.clone());
+    }
+    args.push("--cmd".into());
+    args.push("sh -c 'while :; do sleep 3600; done'".into());
+    args.push(image.into());
+    args
+}
 
 async fn create_sandbox(
     State(state): State<SharedState>,
@@ -273,104 +555,111 @@ async fn create_sandbox(
         .name
         .unwrap_or_else(|| format!("csdk-{}", &uuid::Uuid::new_v4().to_string()[..8]));
 
-    // Build RunArgs for start_vm
-    let args = crate::cli::RunArgs {
-        dns: None,
-        name: name.clone(),
-        cpu: req.cpu.unwrap_or(2),
-        mem: req.memory_mib.unwrap_or(2048),
-        rootfs_size: "10G".to_string(),
-        map: vec![],
-        disk: vec![],
-        disk_dir: vec![],
-        pmem: vec![],
-        gpu: vec![],
-        nfs: vec![],
-        env: {
-            let env_map = req.env.unwrap_or_default();
-            for k in env_map.keys() {
-                if !is_valid_env_key(k) {
-                    return gateway_error(
-                        StatusCode::BAD_REQUEST,
-                        format!(
-                            "Invalid environment variable name: '{}'. \
-                             Keys must match [a-zA-Z_][a-zA-Z0-9_]*.",
-                            k
-                        ),
-                    );
-                }
-            }
-            env_map
-                .into_iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect()
-        },
-        label: req
-            .labels
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect(),
-        cmd: Some("sh -c 'while :; do sleep 3600; done'".to_string()),
-        publish: vec![],
-        balloon: None,
-        free_page_reporting: false,
-        network: crate::cli::NetworkMode::Rootless,
-        hypervisor: crate::cli::args::Hypervisor::Firecracker,
-        ipv6_prefix: None,
-        ipv6_address: None,
-        health_check: None,
-        on_restore: None,
-        health_check_timeout: 5,
-        privileged: false,
-        interactive: false,
-        tty: false,
-        strace_agent: false,
-        setup: false,
-        kernel: None,
-        kernel_profile: None,
-        vsock_dir: None,
-        no_snapshot: true,
-        image_mode: None,
-        rootfs_type: None,
-        non_blocking_output: false,
-        forward_localhost: vec![],
-        user: None,
-        hugepages: false,
-        portable_volumes: false,
-        image,
-        command_args: vec![],
-        rootfs_override: None,
-        image_disk_override: None,
-        pmem_devices: vec![],
-    };
+    let env_map = req.env.unwrap_or_default();
+    for k in env_map.keys() {
+        if !is_valid_env_key(k) {
+            return gateway_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Invalid environment variable name: '{}'. \
+                     Keys must match [a-zA-Z_][a-zA-Z0-9_]*.",
+                    k
+                ),
+            );
+        }
+    }
+    let env = key_value_flags(env_map);
+    let labels = key_value_flags(req.labels.unwrap_or_default());
+    let args = podman_run_args(
+        &name,
+        &image,
+        req.cpu.unwrap_or(2),
+        req.memory_mib.unwrap_or(2048),
+        &env,
+        &labels,
+        state.no_snapshot,
+    );
 
-    info!(name = %name, "Creating sandbox");
+    info!(name = %name, no_snapshot = state.no_snapshot, "Creating sandbox");
 
-    let handle = match start_vm(args).await {
-        Ok(h) => h,
+    let mut command = tokio::process::Command::new(&state.fcvm_bin);
+    command
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    die_with_parent(&mut command);
+    let mut child = match command.spawn() {
+        Ok(child) => ChildGuard::new(child),
         Err(e) => {
-            error!(error = %e, "Failed to start VM");
+            error!(error = %e, "Failed to start fcvm podman run");
             return gateway_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to create sandbox: {}", e),
             );
         }
     };
+    let Some(pid) = child.pid() else {
+        return gateway_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to create sandbox: the child exited before it could be watched",
+        );
+    };
 
-    let sandbox_id = handle.vm_id.clone();
-
-    // Wait for healthy status (max 120s)
-    let healthy = wait_for_healthy(&handle, std::time::Duration::from_secs(120)).await;
-    if !healthy {
-        warn!(sandbox_id = %sandbox_id, "Sandbox did not become healthy within timeout");
-        // Don't fail — the SDK will poll /health itself
+    // If this future is dropped (the client went away), the registration and the
+    // child guard drop with it: the waiter is removed and the child gets SIGTERM.
+    let (_registration, ready_rx) = state.ready.register(pid);
+    let vm = tokio::select! {
+        vm = ready_rx => vm.ok(),
+        status = child.wait() => {
+            let detail = match status {
+                Ok(status) => format!("fcvm podman run exited before the sandbox was ready: {}", status),
+                Err(e) => format!("waiting for fcvm podman run: {}", e),
+            };
+            error!(name = %name, "{}", detail);
+            return gateway_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create sandbox: {}", detail));
+        }
+        _ = tokio::time::sleep(CREATE_READY_TIMEOUT) => None,
+    };
+    let Some(vm) = vm else {
+        warn!(name = %name, "Sandbox did not become healthy within {:?}", CREATE_READY_TIMEOUT);
+        let _ = child.stop().await;
+        return gateway_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Failed to create sandbox: not healthy within {}s",
+                CREATE_READY_TIMEOUT.as_secs()
+            ),
+        );
+    };
+    if vm.health_status != HealthStatus::Healthy {
+        let _ = child.stop().await;
+        return gateway_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Failed to create sandbox: the container stopped (exit code {:?})",
+                vm.exit_code
+            ),
+        );
     }
+    let Some(vsock_socket_path) = vm.config.vsock_socket_path.clone() else {
+        let _ = child.stop().await;
+        return gateway_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to create sandbox: its state records no vsock socket",
+        );
+    };
 
+    let sandbox_id = vm.vm_id.clone();
     let url = sandbox_url(state.port, &sandbox_id);
 
     let entry = SandboxEntry {
-        handle,
+        sandbox: SandboxProcess {
+            child,
+            vm_id: sandbox_id.clone(),
+            name: name.clone(),
+            vsock_socket_path,
+        },
         runtime,
         created_at: Utc::now(),
         timeout_ms: req.timeout_ms,
@@ -382,7 +671,11 @@ async fn create_sandbox(
         .await
         .insert(sandbox_id.clone(), entry);
 
-    info!(sandbox_id = %sandbox_id, "Sandbox created");
+    info!(
+        sandbox_id = %sandbox_id,
+        snapshot = ?vm.config.snapshot_name,
+        "Sandbox created"
+    );
 
     let info = SandboxInfo {
         sandbox_id,
@@ -396,22 +689,6 @@ async fn create_sandbox(
     GatewayResponse::ok(info).into_response()
 }
 
-async fn wait_for_healthy(handle: &VmHandle, timeout: std::time::Duration) -> bool {
-    let start = std::time::Instant::now();
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-    loop {
-        interval.tick().await;
-        if start.elapsed() > timeout {
-            return false;
-        }
-        match handle.state().await {
-            Ok(s) if s.health_status == HealthStatus::Healthy => return true,
-            Ok(s) if s.health_status == HealthStatus::Stopped => return false,
-            _ => {}
-        }
-    }
-}
-
 async fn list_sandboxes(State(state): State<SharedState>) -> Response {
     let sandboxes = state.sandboxes.read().await;
     let list: Vec<SandboxInfo> = sandboxes
@@ -422,7 +699,7 @@ async fn list_sandboxes(State(state): State<SharedState>) -> Response {
             token: "local".to_string(),
             provider: "fcvm".to_string(),
             status: None,
-            name: Some(entry.handle.name.clone()),
+            name: Some(entry.sandbox.name.clone()),
         })
         .collect();
     GatewayResponse::ok(list).into_response()
@@ -435,7 +712,7 @@ async fn get_sandbox(State(state): State<SharedState>, Path(id): Path<String>) -
         None => return gateway_error(StatusCode::NOT_FOUND, format!("Sandbox {} not found", id)),
     };
 
-    let status = match entry.handle.state().await {
+    let status = match entry.sandbox.state().await {
         Ok(s) => format!("{:?}", s.health_status).to_lowercase(),
         Err(_) => "unknown".to_string(),
     };
@@ -446,7 +723,7 @@ async fn get_sandbox(State(state): State<SharedState>, Path(id): Path<String>) -
         token: "local".to_string(),
         provider: "fcvm".to_string(),
         status: Some(status),
-        name: Some(entry.handle.name.clone()),
+        name: Some(entry.sandbox.name.clone()),
     };
 
     GatewayResponse::ok(info).into_response()
@@ -460,7 +737,7 @@ async fn destroy_sandbox(State(state): State<SharedState>, Path(id): Path<String
 
     info!(sandbox_id = %id, "Destroying sandbox");
 
-    if let Err(e) = entry.handle.stop().await {
+    if let Err(e) = entry.sandbox.stop().await {
         warn!(sandbox_id = %id, error = %e, "Error stopping sandbox");
     }
 
@@ -492,7 +769,7 @@ async fn ready(State(state): State<SharedState>, Path(id): Path<String>) -> Resp
         None => return gateway_error(StatusCode::NOT_FOUND, format!("Sandbox {} not found", id)),
     };
 
-    let healthy = match entry.handle.state().await {
+    let healthy = match entry.sandbox.state().await {
         Ok(s) => s.health_status == HealthStatus::Healthy,
         Err(_) => false,
     };
@@ -528,8 +805,8 @@ async fn run_code(
                 .to_string()
         });
         (
-            entry.handle.vsock_socket_path(),
-            entry.handle.vm_id.clone(),
+            entry.sandbox.vsock_socket_path.clone(),
+            entry.sandbox.vm_id.clone(),
             lang,
         )
     };
@@ -938,7 +1215,10 @@ async fn ws_terminal(
     let (vsock_path, vm_id) = {
         let sandboxes = state.sandboxes.read().await;
         match sandboxes.get(&id) {
-            Some(entry) => (entry.handle.vsock_socket_path(), entry.handle.vm_id.clone()),
+            Some(entry) => (
+                entry.sandbox.vsock_socket_path.clone(),
+                entry.sandbox.vm_id.clone(),
+            ),
             None => {
                 return gateway_error(StatusCode::NOT_FOUND, format!("Sandbox {} not found", id));
             }
@@ -1263,6 +1543,19 @@ mod terminal_input_tests {
 // Cleanup
 // ============================================================================
 
+/// Stop every sandbox at once and wait for all of them: each stop can take up to
+/// `STOP_GRACE`, so one after another would take that long per sandbox.
+async fn stop_all(entries: Vec<(String, SandboxEntry)>, message: &'static str) {
+    let mut stops = tokio::task::JoinSet::new();
+    for (id, mut entry) in entries {
+        stops.spawn(async move {
+            info!(sandbox_id = %id, "{}", message);
+            let _ = entry.sandbox.stop().await;
+        });
+    }
+    while stops.join_next().await.is_some() {}
+}
+
 async fn reaper_task(state: SharedState) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
     loop {
@@ -1293,10 +1586,18 @@ async fn reaper_task(state: SharedState) {
         } else {
             Vec::new()
         };
-        for (id, mut entry) in expired_entries {
-            info!(sandbox_id = %id, "Sandbox expired, destroying");
-            let _ = entry.handle.stop().await;
-        }
+        stop_all(expired_entries, "Sandbox expired, destroying").await;
+
+        // A sandbox whose `fcvm podman run` exited on its own (its container stopped, its
+        // VM died) is reaped here, so it does not stay a zombie, and dropped from the map.
+        let mut sandboxes = state.sandboxes.write().await;
+        sandboxes.retain(|id, entry| {
+            let exited = entry.sandbox.child.exited();
+            if exited {
+                info!(sandbox_id = %id, "Sandbox process exited, removing it");
+            }
+            !exited
+        });
     }
 }
 
@@ -1305,11 +1606,31 @@ async fn reaper_task(state: SharedState) {
 // ============================================================================
 
 pub async fn cmd_serve(args: ServeArgs) -> Result<()> {
-    info!(port = args.port, "Starting fcvm serve");
+    info!(
+        port = args.port,
+        no_snapshot = args.no_snapshot,
+        "Starting fcvm serve"
+    );
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.port));
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .context("Failed to bind to port")?;
+    // The bound address, so `--port 0` (a port the kernel picks) can be read back.
+    let bound = listener.local_addr().context("reading the bound address")?;
+    info!(addr = %bound, "Listening");
+
+    // Every sandbox is a child running this same binary.
+    let fcvm_bin = std::env::current_exe().context("resolving the fcvm binary")?;
+    let ready_watch = Arc::new(ReadyWatch::new(crate::paths::state_dir()));
+    tokio::spawn(ready_watch.clone().run());
 
     let state = Arc::new(AppState {
         sandboxes: RwLock::new(HashMap::new()),
-        port: args.port,
+        port: bound.port(),
+        fcvm_bin,
+        no_snapshot: args.no_snapshot,
+        ready: ready_watch,
     });
 
     // Spawn idle timeout reaper
@@ -1337,13 +1658,6 @@ pub async fn cmd_serve(args: ServeArgs) -> Result<()> {
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.port));
-    info!(addr = %addr, "Listening");
-
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .context("Failed to bind to port")?;
-
     // Graceful shutdown on SIGTERM/SIGINT
     let shutdown_state = state.clone();
     axum::serve(listener, app)
@@ -1362,11 +1676,7 @@ pub async fn cmd_serve(args: ServeArgs) -> Result<()> {
             // Drain the map first to release the write lock, then stop handles
             // outside the lock so in-flight API requests aren't blocked.
             let entries: Vec<_> = shutdown_state.sandboxes.write().await.drain().collect();
-            for (id, entry) in entries {
-                info!(sandbox_id = %id, "Stopping sandbox");
-                let mut handle = entry.handle;
-                let _ = handle.stop().await;
-            }
+            stop_all(entries, "Stopping sandbox").await;
         })
         .await
         .context("Server error")?;
@@ -1378,6 +1688,18 @@ pub async fn cmd_serve(args: ServeArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_value_flags_are_sorted_whatever_the_map_order() {
+        let keys: Vec<String> = (0..16).map(|i| format!("K{i:02}")).collect();
+        let map: HashMap<String, String> = keys
+            .iter()
+            .rev()
+            .map(|k| (k.clone(), format!("v-{k}")))
+            .collect();
+        let expected: Vec<String> = keys.iter().map(|k| format!("{k}=v-{k}")).collect();
+        assert_eq!(key_value_flags(map), expected);
+    }
 
     #[test]
     fn test_language_to_run_command_go_uses_go_toolchain() {

@@ -38,6 +38,402 @@ pub enum Commands {
     Serve(ServeArgs),
     /// Generate shell completions
     Completions(CompletionsArgs),
+    /// The GPU wall's control plane: coordinator and host agent (docs/fleet/ARCHITECTURE.md)
+    Fleet(FleetArgs),
+}
+
+// ============================================================================
+// Fleet Command
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct FleetArgs {
+    #[command(subcommand)]
+    pub cmd: FleetCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FleetCommand {
+    /// Run the coordinator: the fleet state, the browser WebSocket and the agents
+    Coord(Box<FleetCoordArgs>),
+    /// Run the agent on a GPU host: one fcvm GPU VM per assigned slot
+    Agent(Box<FleetAgentArgs>),
+    /// Join a region's tile streams into one stream (POST /layout, GET /frames)
+    Aggregate(FleetAggregateArgs),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum FleetAggregateCodec {
+    /// H.264 through the ffmpeg CLI (decode; libx264 encode)
+    Ffmpeg,
+    /// Uncompressed pictures (tests)
+    Raw,
+}
+
+#[derive(Args, Debug)]
+pub struct FleetAggregateArgs {
+    /// Address to serve /frames, /layout, /stats and /healthz on
+    #[arg(long)]
+    pub listen: String,
+
+    /// Height of the whole image in pixels; the region is encoded at its share of it
+    #[arg(long, default_value_t = 1080)]
+    pub image_height: u32,
+
+    #[arg(long, value_enum, default_value_t = FleetAggregateCodec::Ffmpeg, hide = true)]
+    pub codec: FleetAggregateCodec,
+
+    /// ffmpeg binary
+    #[arg(long, default_value = "ffmpeg")]
+    pub ffmpeg: String,
+
+    /// libx264 constant rate factor of the region stream
+    #[arg(long, default_value_t = 20)]
+    pub crf: u32,
+
+    /// libx264 preset
+    #[arg(long, default_value = "veryfast")]
+    pub preset: String,
+
+    /// Bitrate cap of the region stream, kbit/s
+    #[arg(long, default_value_t = 20000)]
+    pub maxrate_kbps: u32,
+
+    /// Query added to every tile subscription
+    #[arg(long, default_value = "q=hi")]
+    pub tile_query: String,
+
+    /// How long past a slot's time the region waits for late tiles, ms
+    #[arg(long, default_value_t = 150)]
+    pub late_ms: u64,
+
+    /// Initial layout (JSON), instead of waiting for POST /layout
+    #[arg(long)]
+    pub layout: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum FleetTextCheck {
+    /// Claude Haiku on Amazon Bedrock (needs --text-check-model and --text-check-region)
+    Bedrock,
+    /// No text check: every viewer word is refused
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum FleetEc2 {
+    /// No EC2 tiles: the EC2 half stays dark
+    None,
+    /// Fake EC2 instances that come up after a delay and render nothing (dark tiles)
+    Fake,
+    /// Real EC2 instances from the tile launch template (--ec2-template)
+    Aws,
+}
+
+#[derive(Args, Debug)]
+pub struct FleetCoordArgs {
+    /// Address to serve the browser WebSocket (/live) and /healthz on, e.g. 127.0.0.1:20000
+    #[arg(long, env = "FLEET_COORD_LISTEN")]
+    pub listen: String,
+
+    /// Command that starts an agent speaking the agent protocol on its stdin and stdout,
+    /// e.g. "fcvm fleet agent --stdio ..." or "ssh gpu-host fcvm fleet agent --stdio ...".
+    /// Split like a shell would. Repeatable.
+    #[arg(long = "agent-cmd")]
+    pub agent_cmds: Vec<String>,
+
+    /// Keep the state in this JSON file (rewritten atomically) and resume from it
+    #[arg(long, conflicts_with = "state_bucket")]
+    pub state_file: Option<std::path::PathBuf>,
+
+    /// Keep the state as an S3 object in this bucket instead (read at start, rewritten
+    /// whole after changes and at shutdown)
+    #[arg(long, env = "FLEET_STATE_BUCKET")]
+    pub state_bucket: Option<String>,
+
+    /// The state object's key
+    #[arg(long, env = "FLEET_STATE_KEY", default_value = "state.json")]
+    pub state_key: String,
+
+    /// The state bucket's region (default: AWS_REGION)
+    #[arg(long, env = "FLEET_STATE_REGION")]
+    pub state_region: Option<String>,
+
+    /// How viewer text is checked before it enters the scene
+    #[arg(long, value_enum, default_value_t = FleetTextCheck::None)]
+    pub text_check: FleetTextCheck,
+
+    /// Bedrock model id (or inference profile id) for the text check
+    #[arg(long, env = "FLEET_TEXT_CHECK_MODEL")]
+    pub text_check_model: Option<String>,
+
+    /// AWS region of the text check's Bedrock endpoint
+    #[arg(long, env = "FLEET_TEXT_CHECK_REGION")]
+    pub text_check_region: Option<String>,
+
+    /// The most tiles per half
+    #[arg(long, default_value_t = 100)]
+    pub max_tiles: usize,
+
+    /// Where EC2 tiles come from
+    #[arg(long, value_enum, default_value_t = FleetEc2::None)]
+    pub ec2: FleetEc2,
+
+    /// A browser origin (scheme://host[:port]) allowed to open /live besides the
+    /// coordinator's own. Repeatable. Other cross-origin WebSockets are refused with 403.
+    #[arg(long = "allowed-origin")]
+    pub allowed_origins: Vec<String>,
+
+    /// Run the EC2 half's aggregator on this address
+    #[arg(long, requires = "ec2_aggregate_url")]
+    pub ec2_aggregate_listen: Option<String>,
+
+    /// The EC2 half's aggregator frame WebSocket as browsers reach it
+    #[arg(long, requires = "ec2_aggregate_listen")]
+    pub ec2_aggregate_url: Option<String>,
+
+    /// Extra argument for the EC2 half's aggregator. Repeatable.
+    #[arg(long = "aggregate-arg", allow_hyphen_values = true)]
+    pub aggregate_args: Vec<String>,
+
+    /// The owner's race cadence: relaunch every tile this many seconds after the last race.
+    /// Viewers cannot change it.
+    #[arg(long, env = "FLEET_RACE_EVERY")]
+    pub race_every: Option<u64>,
+
+    /// After any race, `restart_now` is refused for everyone for this many seconds
+    #[arg(long, default_value_t = 60)]
+    pub restart_cooldown: u64,
+
+    /// Seed of the directed camera's path
+    #[arg(long, default_value_t = 1)]
+    pub camera_seed: u64,
+
+    /// Key per-client limits by the CF-Connecting-IP header (set by Cloudflare in front of
+    /// the coordinator); without this flag, by the connection's peer address
+    #[arg(long)]
+    pub trust_cf_connecting_ip: bool,
+
+    /// Cloudflare Turnstile secret: a connection must pass `verify` before its first
+    /// intent. Without it no verification is asked for (local runs).
+    #[arg(
+        long,
+        env = "FLEET_TURNSTILE_SECRET",
+        hide_env_values = true,
+        requires = "turnstile_site_key"
+    )]
+    pub turnstile_secret: Option<String>,
+
+    /// The Turnstile site key the page's widget uses, sent in each connection's hello
+    #[arg(long, env = "FLEET_TURNSTILE_SITE_KEY", requires = "turnstile_secret")]
+    pub turnstile_site_key: Option<String>,
+
+    /// Decoder for the poster frame (`raw` for tests)
+    #[arg(long, value_enum, default_value_t = FleetAggregateCodec::Ffmpeg, hide = true)]
+    pub poster_codec: FleetAggregateCodec,
+
+    /// Wall tiles that may be lent to visitors at once (default: 2 or a tenth of the
+    /// tiles, rounded up, whichever is smaller)
+    #[arg(long)]
+    pub max_borrowed: Option<usize>,
+
+    /// A GPU host auto scaling group the coordinator owns (`<region>:<name>`, repeatable).
+    /// With any, the fleet scales them to 0 after --idle-scale-down seconds with no active
+    /// viewer and back to --awake-capacity when one arrives.
+    #[arg(long = "scale-group")]
+    pub scale_groups: Vec<crate::fleet::coord::scale::Group>,
+
+    /// Sleep with no active viewer (no tiles, every VM stopped) and wake for the next one,
+    /// on hosts the coordinator does not scale (a fixed host, a test box). Implied by any
+    /// --scale-group.
+    #[arg(long)]
+    pub sleep_when_idle: bool,
+
+    /// Desired capacity of each scale group while the fleet is awake
+    #[arg(long, default_value_t = 1)]
+    pub awake_capacity: u32,
+
+    /// Seconds with no active viewer before the fleet scales down
+    #[arg(long, default_value_t = 600)]
+    pub idle_scale_down: u64,
+
+    /// Operator endpoint (POST /quarantine/release) on this address; keep it on loopback
+    /// or a private network. Off without it.
+    #[arg(long)]
+    pub admin_listen: Option<String>,
+
+    /// EC2 tiles the EC2 side runs (each side shows the GPUs it has live)
+    #[arg(long, default_value_t = 8)]
+    pub ec2_tiles: usize,
+
+    /// Regions to launch EC2 tiles in, tried in order (comma separated)
+    #[arg(long, env = "FLEET_REGIONS", value_delimiter = ',')]
+    pub ec2_regions: Vec<String>,
+
+    /// The EC2 tile launch template (one-time spot)
+    #[arg(long, default_value = "fcvm-fleet-tile-x86_64")]
+    pub ec2_template: String,
+
+    /// An on-demand tile launch template, tried when every region refuses spot capacity
+    #[arg(long)]
+    pub ec2_on_demand_template: Option<String>,
+    /// This fleet's name, tagged on its EC2 tiles at launch (`Fleet=<name>`). At start and
+    /// shutdown the coordinator terminates the tiles tagged with it, so two fleets in one
+    /// account (staging and production) need different names.
+    #[arg(long, env = "FLEET_NAME", default_value = "stage")]
+    pub fleet_name: String,
+
+    /// The DNS zone tiles and slots are named in (`ec2-<n>.<zone>`, `slot-<n>.<zone>`)
+    #[arg(long, default_value = "fcvm.dev")]
+    pub dns_zone: String,
+
+    /// Write the slots' DNS records with the Cloudflare token in this Secrets Manager secret
+    #[arg(long)]
+    pub dns_token_secret: Option<String>,
+
+    /// The zone's Cloudflare id (default: looked up by name)
+    #[arg(long)]
+    pub dns_zone_id: Option<String>,
+
+    /// Keep the wildcard certificate in this secret renewed (30 days before expiry, ACME
+    /// DNS-01 through the DNS token)
+    #[arg(long, requires = "dns_token_secret")]
+    pub tls_secret: Option<String>,
+
+    /// The ACME directory (default: Let's Encrypt production)
+    #[arg(long)]
+    pub acme_directory: Option<String>,
+
+    /// Region of the fleet's secrets (default: AWS_REGION)
+    #[arg(long)]
+    pub secrets_region: Option<String>,
+
+    /// ffmpeg binary for the poster frame (decode, then JPEG)
+    #[arg(long, default_value = "ffmpeg")]
+    pub ffmpeg: String,
+}
+
+#[derive(Args, Debug)]
+#[command(group(clap::ArgGroup::new("transport").required(true).args(["stdio", "dial"])))]
+pub struct FleetAgentArgs {
+    /// Speak the agent protocol on stdin and stdout (the coordinator runs this agent)
+    #[arg(long)]
+    pub stdio: bool,
+
+    /// Dial the coordinator's agent WebSocket (e.g. wss://<api host>/agent) and keep
+    /// reconnecting; the VMs keep running while it is away
+    #[arg(long)]
+    pub dial: Option<String>,
+
+    /// Secrets Manager secret holding the Cloudflare Access service token for --dial
+    /// (JSON with client_id and client_secret), read with the instance role
+    #[arg(long, requires = "dial")]
+    pub access_secret: Option<String>,
+
+    /// Region of --access-secret (default: the instance's region)
+    #[arg(long)]
+    pub secret_region: Option<String>,
+
+    /// The fleet's wildcard certificate secret, handed to every renderer (written into
+    /// --tls-dir and mapped into each VM)
+    #[arg(long)]
+    pub tls_secret: Option<String>,
+
+    /// Where the renderers' certificate files are kept on the host
+    #[arg(long, default_value = "/run/fcvm-fleet/tls")]
+    pub tls_dir: std::path::PathBuf,
+
+    /// Name the host by its EC2 instance id (from the instance metadata service)
+    #[arg(long, conflicts_with = "host")]
+    pub host_from_imds: bool,
+
+    /// Host name reported to the coordinator (default: the system host name)
+    #[arg(long)]
+    pub host: Option<String>,
+
+    /// Renderer container image every slot runs
+    #[arg(long)]
+    pub image: String,
+
+    /// First host port; the slot on GPU index i publishes the renderer on base + i
+    #[arg(long, env = "FLEET_AGENT_BASE_PORT")]
+    pub base_port: u16,
+
+    /// Host address the renderer ports are published on
+    #[arg(long, default_value = "127.0.0.1")]
+    pub publish_ip: String,
+
+    /// Host name or address browsers use to reach the published ports (default: --publish-ip)
+    #[arg(long)]
+    pub frame_host: Option<String>,
+
+    /// Run each slot's VM in fcvm's routed mode at `<prefix>::<GPU index + 2>` and report
+    /// that address (the coordinator writes it to `slot-<n>.<zone>`).
+    #[arg(long, conflicts_with = "ipv6_prefix_from_imds")]
+    pub ipv6_prefix: Option<String>,
+
+    /// Take the IPv6 prefix delegated to the instance's primary interface from IMDS.
+    #[arg(long)]
+    pub ipv6_prefix_from_imds: bool,
+
+    /// Report frame URLs as `wss://<slot id>.<zone>/frames` (the slot's DNS name and the
+    /// renderer's TLS port) instead of the publish address.
+    #[arg(long)]
+    pub frame_zone: Option<String>,
+
+    /// Publish each slot's renderer TLS port (443 in the VM) on --publish-ip at this base
+    /// plus the GPU index (hosts whose VMs are not routed); with --frame-zone the frame URL
+    /// names the port.
+    #[arg(long)]
+    pub tls_publish_base: Option<u16>,
+
+    /// GPUs to use instead of the vfio-pci inventory: <sbdf>=<name>,...
+    #[arg(long)]
+    pub gpus: Option<String>,
+
+    /// VMs this host runs at once (default: one per GPU)
+    #[arg(long)]
+    pub capacity: Option<usize>,
+
+    /// fcvm binary that runs the VMs (default: this executable)
+    #[arg(long)]
+    pub fcvm: Option<std::path::PathBuf>,
+
+    /// Extra argument for every `fcvm podman run`, before the image. Repeatable.
+    #[arg(long = "fcvm-arg", allow_hyphen_values = true)]
+    pub fcvm_args: Vec<String>,
+
+    /// EC2 metadata base URL to poll for spot interruption notices (IMDSv2), e.g.
+    /// http://169.254.169.254
+    #[arg(long)]
+    pub spot_notice_url: Option<String>,
+
+    /// Seconds a relaunch may take from fcvm start to the renderer's first frame
+    #[arg(long, default_value_t = 300)]
+    pub start_timeout_secs: u64,
+
+    /// Run this host's aggregator on this port (published on --publish-ip): it joins the
+    /// host's tiles into one stream
+    #[arg(long)]
+    pub aggregate_port: Option<u16>,
+
+    /// Extra argument for the aggregator (`fcvm fleet aggregate`). Repeatable.
+    #[arg(long = "aggregate-arg", allow_hyphen_values = true)]
+    pub aggregate_args: Vec<String>,
+
+    /// A file the host's boot writes once its store is mounted; its modification time is
+    /// reported in the hello (the wake's `store_ready` phase)
+    #[arg(long)]
+    pub store_ready_file: Option<std::path::PathBuf>,
+
+    /// Scrub each standby GPU with `<fcvm> gpu scrub <sbdf>` before reporting it ready; a
+    /// failed scrub quarantines the GPU
+    #[arg(long)]
+    pub scrub: bool,
+
+    /// sysfs root for the GPU inventory and VFIO group lookup (tests)
+    #[arg(long, default_value = "/sys", hide = true)]
+    pub sysfs_root: std::path::PathBuf,
 }
 
 // ============================================================================
@@ -101,6 +497,12 @@ pub struct ServeArgs {
     /// Port to listen on
     #[arg(long, default_value_t = 8090)]
     pub port: u16,
+
+    /// Start every sandbox with `--no-snapshot`: a cold boot that neither restores from
+    /// nor creates the snapshot cache. By default each sandbox is an
+    /// `fcvm podman run` that restores from the cache when its snapshot exists.
+    #[arg(long)]
+    pub no_snapshot: bool,
 }
 
 // ============================================================================
@@ -725,6 +1127,12 @@ pub struct SnapshotRunArgs {
     /// Passed from podman run's --cpu when restoring from a snapshot.
     #[arg(skip)]
     pub cpu: Option<u8>,
+
+    /// KEY=VALUE labels for the clone's state (internal use only).
+    /// Passed from podman run's --label when restoring from a snapshot; labels are not in
+    /// the snapshot key, so a cache hit takes the run's own.
+    #[arg(skip)]
+    pub label: Vec<String>,
 
     /// Memory in MiB (internal use only).
     /// Passed from podman run's --mem when restoring from a snapshot.

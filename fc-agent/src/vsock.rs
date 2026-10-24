@@ -645,13 +645,44 @@ pub fn notify_reboot() -> bool {
     false
 }
 
-/// Notify host that the container has started.
-pub fn notify_container_started() {
-    if send_status(b"ready\n") {
-        eprintln!("[fc-agent] container started, notified host via vsock");
+/// The status message that tells the host the container is running, saying whether
+/// the image defines a HEALTHCHECK whose result the host still has to ask podman for.
+pub fn container_started_message(healthcheck: bool) -> String {
+    let word = if healthcheck {
+        exec_proto::CONTAINER_STARTED_WITH_HEALTHCHECK
     } else {
-        eprintln!("[fc-agent] WARNING: failed to send ready status to host");
+        exec_proto::CONTAINER_STARTED
+    };
+    format!("{word}\n")
+}
+
+/// Notify the host that the container is running.
+///
+/// It is the host's only signal that the container started: its health monitor runs no
+/// check of its own until this arrives. Retried like the exit notification, each attempt
+/// on a fresh connection.
+pub fn notify_container_started(healthcheck: bool) {
+    const MAX_ATTEMPTS: u32 = 5;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+    let msg = container_started_message(healthcheck);
+    for attempt in 1..=MAX_ATTEMPTS {
+        if send_status(msg.as_bytes()) {
+            eprintln!("[fc-agent] container started, notified host via vsock");
+            return;
+        }
+        if attempt < MAX_ATTEMPTS {
+            eprintln!(
+                "[fc-agent] WARNING: failed to send ready status to host (attempt {}/{}), retrying",
+                attempt, MAX_ATTEMPTS
+            );
+            std::thread::sleep(RETRY_DELAY);
+        }
     }
+    eprintln!(
+        "[fc-agent] WARNING: failed to send ready status to host after {} attempts",
+        MAX_ATTEMPTS
+    );
 }
 
 #[cfg(test)]

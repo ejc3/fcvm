@@ -290,6 +290,12 @@ pub struct VmConfig {
     /// were attached when the VM was restored; a VM with them can not be snapshotted.
     #[serde(default)]
     pub gpus: Vec<String>,
+    /// The container start notification version this VM's fc-agent speaks
+    /// (`storage::snapshot::SNAPSHOT_CONTAINER_START_VERSION`). Every VM this fcvm starts
+    /// has it; None is a VM started by an fcvm from before the notification, which
+    /// `snapshot create` refuses to snapshot.
+    #[serde(default)]
+    pub container_start_version: Option<u32>,
 }
 
 impl VmConfig {
@@ -367,6 +373,9 @@ impl VmState {
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
                 gpus: Vec::new(),
+                container_start_version: Some(
+                    crate::storage::snapshot::SNAPSHOT_CONTAINER_START_VERSION,
+                ),
             },
         }
     }
