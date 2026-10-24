@@ -68,9 +68,50 @@ grants. The body is at most 1 MiB.
 | `words` | viewer text | optional; may be empty |
 | `lights` | viewer lights | optional; may be empty; `color` components 0 to 64 |
 | `budget` | pixel-samples per frame for every tile (see "Budget") | optional; 10,000 to 50,000,000; absent means the renderer's `BUDGET` |
+| `layout_generation` | the coordinator's layout this rect belongs to (see "Layout generations") | optional; a non-negative integer or null |
+| `rect_from_frame` | the first frame (scene time x 30) drawn with `rect` | optional; a non-negative integer or null |
+| `previous_rect` | the rect drawn for frames before `rect_from_frame` | optional; null, or a rect as above; needs `rect_from_frame` |
 
 Answers `200 {"ok":true}`, or `400 {"error":"<what is wrong>"}` naming the
 field. A scene replaces the previous one whole.
+
+### Layout generations (addition, round 10)
+
+The coordinator re-tiles a running wall by posting every renderer a scene with
+a new `layout_generation`, its new `rect`, its old one as `previous_rect` and
+one `rect_from_frame` K shared by all of them, far enough ahead that every post
+arrives first. Each renderer then:
+
+- draws frames before K with `previous_rect` and frames from K with `rect`, so
+  the frames before K stitch under the old layout and the frames from K under
+  the new one;
+- starts its history again at K (every renderer, whether its rect moved or not:
+  a moving frame reads the 8 frames before it, and those were drawn under
+  another layout on some neighbours), so frame K and the 7 after it draw like
+  the first frames of a stream;
+- sends every subscriber a new text header at frame K, with the new tile's
+  size and position and `layout_generation`, followed by a keyframe. A
+  subscriber keeps the whole image's height: its height is converted so that
+  `full_height` stays what it was under `previous_rect` (asked at `h=270` for a
+  1/2-high cell of a 540-high image, it gets `height` 540 after a move to a
+  full-height column).
+
+A scene whose `layout_generation` is the one in force, or already pending,
+changes nothing about the switch (the coordinator re-posts the same body).
+Without `layout_generation` a scene takes effect at once, as before. With it
+and no `previous_rect`, the new rect applies from K and frames before K use it
+too. A re-tile keeps the clock, so it keeps the budget schedule (see "Budget"),
+and the budget the coordinator re-posts after the scene, with a `t` at or
+before the current frame, changes nothing: every frame drawn between the two
+posts already has the grid's budget.
+
+A switch must skip no slot: a tile that skips one lacks that frame in its
+history, and its moving frames stop matching its neighbours' for 8 frames. So
+the renderer opens the new layout's encoders ahead of K, on a separate thread,
+as soon as the scene arrives, and tears the old ones down on that thread after
+K (opening took 10 to 25 ms per encoder and tearing down 29 to 245 ms on a T4;
+done on the render thread they skipped 1 to 8 slots at K). K must leave time
+for that: at least 0.5 s after the last post arrives.
 
 ### Camera interpolation and holds
 
@@ -127,13 +168,16 @@ field. A scene replaces the previous one whole.
 ```json
 {"codec":"avc1.64001f","width":512,"height":556,
  "full_width":1920,"full_height":1080,"x0":480,"y0":0,"fps":30,
- "crop":{"left":16,"top":0,"right":16,"bottom":16},"q":"std","bitrate":6830899}
+ "crop":{"left":16,"top":0,"right":16,"bottom":16},"q":"std","bitrate":6830899,
+ "layout_generation":2}
 ```
 
 `codec`, `width`, `height` are the contract: the size of the delivered
 (decoded) pictures. The renderer adds `full_width`, `full_height` (the whole
 image's pixel grid at this height), `x0`, `y0` (the tile's top-left pixel in
-that grid) and `fps`.
+that grid), `fps` and `layout_generation` (the layout the tile belongs to,
+null without one; a new header arrives at the frame a new layout takes
+effect).
 
 **`crop` (addition, round 3).** Each picture is the tile plus an overlap of up
 to 16 pixels (`MARGIN`) on every side that lies inside the image (none past the image's
@@ -169,6 +213,35 @@ Then binary messages, each one access unit:
   BT.709 limited range (signalled in the VUI), CBR at the quality's rate (the
   header's `bitrate`, bits per second).
 - The first binary message is a keyframe. Keyframes follow at least every 2 s.
+- **A stream's first frames (round 10).** A moving frame averages the 7
+  frames before it, so a tile whose stream starts must have those 7 or its
+  first frames differ from a neighbour whose stream started at another slot.
+  When a tile starts drawing at a new size (a stream starts or changes
+  height; not at a layout switch, where every tile starts its history at the
+  same frame, and not for a whole-image renderer), it draws the current slot
+  and the following ones back to back, unsent, until it has drawn 7 and is at least a
+  slot ahead of the clock (at most 90 slots), then continues on the
+  clock. A tile that took more than 90% of a slot for its last frame stops
+  after 7 unless its frames are still getting faster (a GPU leaving its idle
+  clocks: 585 MHz on a T4 against 1590, about 1.5 s to full speed): it cannot
+  get ahead, and skips slots on the clock as before. Its first frame sent has
+  all 7 behind it.
+- **Warming (round 10).** A posted scene keeps the renderer drawing every
+  slot for 10 s at the height it last streamed (540 before any stream), as
+  it would for a subscriber. A tile that joins or rejoins the wall gets its
+  scene before its stream, so its GPU has left the idle clocks and, when the
+  stream asks for the height being drawn, the 7 slots before its first frame
+  are already drawn and it starts at once. A stream at another height primes
+  as above. The encoder opens on a
+  second thread meanwhile, and NVENC's minimum frame size is asked once at
+  start on that thread (opening a session to ask took about 250 ms on the
+  render thread). Measured on a 2 x 2 grid at 270 px: priming took 111 to
+  392 ms (7 to 13 slots; a GPU clocking up from idle draws its first frames
+  slower than later ones) at 353,553 pixel-samples, so a stream's first frame
+  arrived 0.1 to 0.4 s after it subscribed. At 500,000, where one cell drew a
+  frame in about a slot, priming took up to 1.9 s (57 slots) and that cell
+  still skipped a slot right after it, as any tile that slow does at any
+  time; the controller's 70% target keeps tiles clear of that.
 - The client may send text `{"h": <height>}`. The renderer then sends a new
   text header and continues from a keyframe at the new size.
 - A subscriber that falls more than 90 messages or 16 MiB behind has its queue
@@ -228,6 +301,9 @@ encoded), `spp` (samples per pixel drawn in it), `checkerboard` (see below),
 subscriber was connected, since start), and `startup_ms`, milliseconds from the
 process start (read from `/proc/self/stat`) to CUDA being ready, the first
 frame drawn and the first frame sent to a subscriber (`-1` until it happens).
+`layout_generation` is the layout in force (null without one), and
+`layout_pending` (`{"generation", "from_frame"}`, present only while one is
+waiting) the next.
 `Access-Control-Allow-Origin: *` is set on this route only.
 
 ## Sampling, accumulation and determinism
@@ -237,19 +313,81 @@ Every pixel is a path-traced estimate. Its random numbers are seeded by
 value is reduced across pixels, so a pixel's samples are the same wherever it
 is drawn.
 
-**Budget.** Each frame spends a fixed number of pixel-samples (the scene's
-`budget`, else `BUDGET`, default 250,000) over the pixels it draws: its rect
-plus the stream overlap plus a guard band (below), counted before clipping to
-the image. The samples per pixel are
-`round(BUDGET / drawn pixels)`, clamped to 1..64, so every tile of a grid draws
-the same number: a 180 px wall tile of a 16 x 9 grid draws 3, a whole 1080p
-image 1. Moving frames match across tiles only if every renderer draws every
-slot, so the budget must leave the slowest tile inside its 33 ms; `/health`
-counts `slots_missed`, and the coordinator can lower `budget` for all tiles at
-once when any tile reports misses. `ADAPT=1`
-instead adjusts the budget so a frame's GPU time stays near 70% of its slot,
-which keeps the frame rate on a slow view but gives tiles different sample
-counts, so moving frames no longer match across tile edges.
+**Budget.** Each frame spends a fixed number of pixel-samples (its budget)
+over the pixels it draws: its rect plus the stream overlap plus a guard band
+(below), counted before clipping to the image. The samples per pixel are
+`round(budget / drawn pixels)`, clamped to 1..64, so every tile of a grid
+given the same budget draws the same number. Moving frames match across tile
+edges only if every tile uses the same budget at the same slot and draws
+every slot.
+
+The budget for a slot is, in this order (round 8):
+
+1. **A posted schedule.** `POST /budget` with `{"budget": B, "t": T}`
+   (`Content-Type: application/json`; B in 10,000..500,000,000) sets budget B
+   from the first slot at or after scene time T, until a later entry takes
+   effect. A later entry for the same slot replaces it. A T at or before the
+   current frame applies from the next frame drawn. A new scene with the same
+   `epoch_unix_ms` (a re-tile) keeps the schedule; one with a new
+   `epoch_unix_ms` keeps only the budget in force at the last frame drawn, from
+   slot 0, since the old entries' times are on the old clock; one with its own
+   `budget` clears it (round 10; until then every scene cleared it, so a frame
+   drawn between a scene post and the controller's next budget post fell back
+   to `BUDGET` on some tiles and not others). `200 {"ok":true}` or `400`
+   naming the field.
+2. The scene's `budget`.
+3. For a renderer drawing the whole image (`rect` is the unit square, so it
+   has no edges to match) with `ADAPT=1` (the default): its own fit, rounded
+   down to the ladder below.
+4. `BUDGET` (250,000).
+
+A hold keeps the budget it started with (its samples per frame and its
+quality stay fixed while it accumulates); a new budget reaches a hold at the
+next hold.
+
+**Adapting a grid.** Each renderer reports in `/health`: `budget` (the last
+frame's), `budget_source` (`schedule`, `scene`, `local` or `default`),
+`budget_fit`, `hq` (below), `trace_ms` (the part of `render_ms` spent drawing
+samples) and `frames_2s` (over the last 2 s: `n`, `frame_ms_p50`,
+`frame_ms_p99`, `frame_ms_max` for a whole frame including encoding and
+sending, `render_ms_max`, `encode_ms_max`). `budget_fit` comes from a cost
+model of the frames the renderer drew: the fixed part of a frame
+(`render_ms - trace_ms`) and the cost per sample of each path (`trace_ms` /
+samples drawn), each the 95th percentile over the frames of the last 180 s,
+so the fit holds over what the camera has shown in that time instead of
+following the latest frames (round 10: on the coordinator's directed camera
+the latest frames' fit swung 2x and the grid budget changed 9 times in 2
+minutes). It is 0 until the window spans 60 s (a controller leaves it out);
+the model starts again when the drawn size changes. `budget_fit_now` is the
+same fit from the latest frames (smoothed over about five), for diagnosis. It is the largest budget whose predicted frame takes 70% of a
+slot, on the fast path below `HQ_SPP` samples per drawn pixel or on the
+high-quality path from it; until a renderer has drawn a high-quality frame it
+assumes that path costs `HQ_COST_PRIOR` (1.0) times the fast one per sample.
+So a tile that cannot afford the high-quality path reports a fit just under
+`HQ_SPP` samples per pixel.
+
+One controller sets one budget for all tiles of a grid. Every 2 s it reads
+every tile's `budget_fit`, takes the smallest (the slowest tile governs) and
+smooths it over rounds (half the way each round), and posts the budget in
+force to every tile with one `t`, at least a second past the newest frame any
+tile has drawn, so every tile switches at the same slot. The budget moves on
+the ladder `250,000 x 2^(n/4)` (n from -8 to 40) with hysteresis: down, to the
+rung under the fit, when the budget exceeds the smoothed fit by more than 5%,
+and by at least a rung at once when any tile's `render_ms_max` is over 90% of
+a slot; up, to the rung under fit / 1.15, after three rounds in a row that
+allow it. It posts only when every tile has reported. Tiles never adapt on
+their own. `tools/budgetctl.py` is the reference controller; the fleet
+coordinator is to run the same rule.
+
+**The high-quality path.** From `HQ_SPP` (8) samples per drawn pixel, with
+every pixel drawing, a frame takes the high-quality path: the full cloud march
+(fine steps of 1.5% of the distance, the light march every second step with
+four samples, until transmittance falls under 0.01), a second diffuse bounce
+with the first bounce's sunlight shadowed, a sun shadow march of up to 56
+steps over 60 km, and 12 aerial-perspective steps. Below it a frame takes the
+fast path of round 7. The choice follows from the budget and the tile size, so
+every tile of a grid makes the same one at the same slot. `/health` and the
+`/raw` tile header report `hq`.
 
 **Checkerboard (round 4).** Where the budget gives under 0.5 samples per
 drawn pixel, a frame draws one sample on half its pixels (stride 2: those
@@ -393,7 +531,9 @@ itself.
 Waits for the frame at `t` (a future slot, at most 15 s ahead) and returns this
 renderer's tile of it unencoded, as a binary PPM at the height being drawn,
 with a header `X-Fleet-Tile: {"t":..,"x0":..,"y0":..,"width":..,"height":..,
-"full_width":..,"full_height":..,"spp":..}`; `404` if the renderer skipped that
+"full_width":..,"full_height":..,"spp":..,"layout_generation":..}` (and
+`hq`, `budget`, `budget_source`); the tile is the one drawn for that frame,
+under `previous_rect` before `rect_from_frame`; `404` if the renderer skipped that
 slot. `tools/rawmosaic.py` uses it to stitch an unencoded mosaic that can be
 compared pixel for pixel with the same frame drawn whole
 (`fleet-renderer still --seq 12`). Not for browsers.
@@ -406,5 +546,6 @@ compared pixel for pixel with the same frame drawn whole
   stays current; a new subscriber wakes it at once.
 - Kernels are SASS for `sm_75` only (no PTX), so CUDA compiles nothing at
   start. Other GPU generations need a build with their `GENCODE`.
-- Environment: `PORT` (8080), `FPS` (30), `BUDGET` (250000), `ADAPT` (0), `MARGIN` (16), `ENC_BPP` (0.8),
-  `ACCUMULATE` (1), `TLS_CERT_FILE` (unset: no TLS listener), `TLS_PORT` (443).
+- Environment: `PORT` (8080), `FPS` (30), `BUDGET` (250000), `ADAPT` (1), `MARGIN` (16), `ENC_BPP` (0.8),
+  `ACCUMULATE` (1), `TLS_CERT_FILE` (unset: no TLS listener), `TLS_PORT` (443). `FIT_SCALE`
+  (1) scales the reported `budget_fit`, to test a grid of unequal GPUs; never set it in production.

@@ -6,6 +6,8 @@
 #define MAX_TEXTS 17   // the clock plus the 16 newest words
 #define MAX_CHARS 28
 #define MAX_LIGHTS 32
+#define HQ_COST_PRIOR 1.0  // cost per sample of the high-quality path over the fast path, until one is measured
+#define HQ_SPP 8  // samples per drawn pixel from which a frame takes the high-quality path
 #define HOLD_MAX_SAMPLES 1024  // a hold stops adding samples here
 #define HOLD_BLEND_OUT 256     // motion history fades out of a hold by this sample count
 #define TAA_MAX_HISTORY 16     // the last moving output weighs at most this many samples in a hold's blend-in
@@ -49,6 +51,7 @@ struct FrameParams {
   int guard;             // largest reprojection displacement accepted, whole-image pixels
   GCam hist_cam[TEMPORAL_WINDOW];  // cameras of frames k-1, k-2, ... (moving reprojection)
   int spp;             // samples per pixel this frame
+  int hq;              // 1: the high-quality path (budget >= HQ_SPP samples per drawn pixel; see PROTOCOL.md)
   int half;            // checkerboard stride: 1 every pixel draws, 2 half, 4 a quarter (see draws_here)
   int parity;          // the frame slot k & 3
   int hold;            // 1: camera held, exact accumulation; 0: moving, reprojection

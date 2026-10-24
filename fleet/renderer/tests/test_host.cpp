@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "../src/budget.h"
 #include "../src/jpeg.h"
 #include "../src/json.h"
 #include "../src/nvenc.h"
@@ -221,6 +222,126 @@ int main() {
       std::string got = pacific_clock(k.t);
       CHECK(got == k.want, "pacific_clock(%lld) = %s, want %s", (long long)k.t, got.c_str(), k.want);
     }
+  }
+  {
+    // The grid-wide budget: a schedule gives every slot one budget, the same
+    // for every tile that was given the same entries; the fit and the ladder.
+    BudgetSchedule a, b;
+    double x, y;
+    CHECK(!a.at(10, &x), "an empty schedule names no budget");
+    a.add(100, 4e5);
+    a.add(160, 8e5);
+    b.add(160, 8e5);  // posted in another order
+    b.add(100, 4e5);
+    bool same = true;
+    for (long long k = 90; k < 200; k++) {
+      bool ha = a.at(k, &x), hb = b.at(k, &y);
+      same = same && ha == hb && (!ha || x == y);
+    }
+    CHECK(same, "two tiles with the same entries use the same budget at every slot");
+    BudgetSchedule c;
+    c.add(100, 4e5);
+    c.add(160, 8e5);
+    CHECK(c.at(159, &x) && x == 4e5 && c.at(160, &x) && x == 8e5, "a budget takes effect exactly at its slot");
+    c.add(200, 9e5);
+    c.add(200, 5e5);
+    CHECK(c.at(210, &x) && x == 5e5, "a later entry for the same slot replaces it");
+    CHECK(std::fabs(budget_fit(1e6, 20.0, 1000.0 / 30) - 1e6 * 0.7 * (1000.0 / 30) / 20.0) < 1, "fit at 70%% of a slot");
+    CHECK(ladder_floor(250000) == 250000 && ladder_floor(297302) == 297302 && ladder_floor(297300) == 250000 &&
+              ladder_floor(1e6) == 1000000 && ladder_floor(10) == 62500,
+          "ladder: %.0f %.0f %.0f %.0f", ladder_floor(250000), ladder_floor(297300), ladder_floor(1e6), ladder_floor(10));
+    // A renderer alone at 1280x720 (about 1.08 M drawn pixels) whose fit is
+    // 406 k samples: a stride-2 budget would draw 540 k, so it stays on
+    // stride 4 (the 720p row of round 8's first run sat on stride 2 at 31 ms).
+    double px720 = 1.08e6;
+    CHECK(samples_for(local_budget(406000, px720), px720) <= 406000 && stride_for(local_budget(406000, px720) / px720) == 4,
+          "a stride's share is not chosen over the fit (budget %.0f)", local_budget(406000, px720));
+    CHECK(local_budget(5e6, 50000) == ladder_floor(5e6), "at many samples per pixel the ladder rung stands");
+    // The cost model: 50,000 drawn pixels, a fixed 4 ms, the fast path 40 ns
+    // per sample. Slot 33.3 ms, target 23.3 ms: 19.3 ms of samples.
+    CostModel m;
+    m.hq_prior = 2.0;
+    m.observe(false, 250000, 10.0, 14.0);  // 250 k samples in 10 ms
+    double fslot = 1000.0 / 30;
+    // the high-quality path at 80 ns per sample (the prior) needs 400 k = 8 spp
+    // for 32 ms: unaffordable, so the fit stays just under 8 spp on the fast path
+    double f1 = m.fit_now(50000, 8, fslot);
+    CHECK(f1 < 8 * 50000 && f1 > 7.9 * 50000, "fast path capped under the high-quality threshold (%.0f)", f1);
+    // measured: the high-quality path costs 30 ns per sample here, so 19.3 ms buys 644 k
+    m.observe(true, 500000, 15.0, 19.0);
+    double f2 = m.fit_now(50000, 8, fslot);
+    CHECK(std::fabs(f2 - (0.7 * fslot - 4.0) / 3e-5) < 1000, "high-quality fit from its own cost (%.0f)", f2);
+    // and the frame it predicts lands at 70% of the slot
+    CHECK(std::fabs(4.0 + f2 * 3e-5 - 0.7 * fslot) < 0.05, "predicted frame at the target");
+  }
+  {
+    // The windowed fit: a camera path whose cost per sample swings 2x every
+    // 20 s (40 ns on easy views, 80 ns on hard ones) at 30 fps. The latest
+    // frames' fit swings 2x with it; the window's holds at the hard views.
+    CostModel w;
+    const double fslot = 1000.0 / 30, px = 50000;
+    double lo_now = 1e18, hi_now = 0, lo_w = 1e18, hi_w = 0, first_w = -1, early = 0;
+    for (int f = 0; f < 30 * 300; f++) {
+      double t = f / 30.0;
+      double c = (int(t / 20) % 2) ? 8e-5 : 4e-5;
+      w.observe(false, 200000, 200000 * c, 200000 * c + 4.0, t);
+      double fn = w.fit_now(px, 8, fslot), fw = w.fit(px, 8, fslot, t);
+      if (t < 59.9) early = std::max(early, fw);
+      if (fw > 0 && first_w < 0) first_w = t;
+      if (t >= 120) {
+        lo_now = std::min(lo_now, fn); hi_now = std::max(hi_now, fn);
+        lo_w = std::min(lo_w, fw); hi_w = std::max(hi_w, fw);
+      }
+    }
+    CHECK(early == 0 && first_w >= 59.9 && first_w < 62, "the windowed fit is known from 60 s (%.1f)", first_w);
+    CHECK(hi_now / lo_now > 1.8, "the latest frames' fit swings with the path (%.0f to %.0f)", lo_now, hi_now);
+    CHECK(hi_w / lo_w < 1.01, "the window's fit holds (%.0f to %.0f)", lo_w, hi_w);
+    CHECK(std::fabs(lo_w - (0.7 * fslot - 4.0) / 8e-5) < 2000, "at the hard views' cost (%.0f)", lo_w);
+  }
+  {
+    // Layout generations: the coordinator's scene body (fleet/PROTOCOL.md on
+    // fleet-control: "layout_generation", "rect_from_frame", "previous_rect").
+    std::string b = R"({"epoch_unix_ms": 1, "rect": {"x": 0.25, "y": 0, "w": 0.25, "h": 1}, "image_aspect": 1.7778,
+        "camera": [{"t": 0, "pos": [0,1,0], "look": [0,1,10], "fov_deg": 60}], "time_of_day": 0.3,
+        "layout_generation": 2, "rect_from_frame": 900, "previous_rect": {"x": 0.5, "y": 0, "w": 0.5, "h": 0.5}})";
+    Scene sc = parse_scene(b);
+    CHECK(sc.layout_generation == 2 && sc.rect_from_frame == 900 && sc.has_previous_rect && sc.previous_rect.x == 0.5 &&
+              sc.previous_rect.h == 0.5 && sc.rect.x == 0.25,
+          "layout fields parsed");
+    std::string n = R"({"epoch_unix_ms": 1, "rect": {"x": 0, "y": 0, "w": 1, "h": 1}, "image_aspect": 1.7778,
+        "camera": [{"t": 0, "pos": [0,1,0], "look": [0,1,10], "fov_deg": 60}], "time_of_day": 0.3,
+        "layout_generation": 3, "rect_from_frame": null, "previous_rect": null})";
+    Scene sn = parse_scene(n);
+    CHECK(sn.layout_generation == 3 && sn.rect_from_frame == -1 && !sn.has_previous_rect, "null layout fields");
+    bool threw = false;
+    try {
+      parse_scene(R"({"epoch_unix_ms": 1, "rect": {"x": 0, "y": 0, "w": 1, "h": 1}, "image_aspect": 1.7778,
+        "camera": [{"t": 0, "pos": [0,1,0], "look": [0,1,10], "fov_deg": 60}], "time_of_day": 0.3,
+        "previous_rect": {"x": 0, "y": 0, "w": 1, "h": 1}})");
+    } catch (const std::exception&) { threw = true; }
+    CHECK(threw, "previous_rect without rect_from_frame is refused");
+    // a stream keeps its whole image's height across a re-tile: 2x2 -> 4x1
+    Rect a{0, 0, 0.5, 0.5}, c{0, 0, 0.25, 1};
+    int full = tile_geometry(a, 16.0 / 9, 270).full_h;
+    int h2 = tile_h_for(c, 16.0 / 9, full);
+    CHECK(full == 540 && h2 == 540 && tile_geometry(c, 16.0 / 9, h2).full_h == 540, "540 -> tile height %d", h2);
+    // a budget posted with a t in the past applies from the next slot
+    BudgetSchedule bs;
+    double bb;
+    bs.add((long long)std::ceil(0.0 * 30), 707107);
+    CHECK(bs.at(26000, &bb) && bb == 707107, "a past t applies at once");
+    // a scene on the same clock keeps the schedule; on a new clock the budget
+    // in force carries over from slot 0; a scene with its own budget clears it
+    BudgetSchedule s2;
+    s2.add(100, 500000);
+    s2.add(400, 353553);
+    BudgetSchedule same = schedule_after_scene(s2, true, false, 200);
+    CHECK(same.at(200, &bb) && bb == 500000 && same.at(400, &bb) && bb == 353553, "same clock keeps the entries");
+    BudgetSchedule fresh = schedule_after_scene(s2, false, false, 200);
+    CHECK(fresh.at(0, &bb) && bb == 500000 && fresh.at(400, &bb) && bb == 500000, "new clock carries the budget in force");
+    BudgetSchedule none = schedule_after_scene(s2, false, false, 50);
+    CHECK(none.size() == 0, "nothing in force, nothing carried");
+    CHECK(schedule_after_scene(s2, true, true, 200).size() == 0, "a scene budget clears the schedule");
   }
   tlscheck::run();
   DONE();

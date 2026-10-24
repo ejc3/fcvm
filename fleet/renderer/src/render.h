@@ -10,11 +10,13 @@
 
 struct RenderStats {
   float render_ms = 0;  // last frame: trace + accumulate + tone map
+  float trace_ms = 0;   // of which the samples themselves (the part that scales with the budget)
   int spp = 0;          // samples drawn per pixel in the last frame
   int hold_samples = 0; // samples accumulated in the current hold (0 while moving)
   bool hold = false;
   unsigned int bad_samples = 0;  // non-finite samples dropped in the last frame (should be 0)
   int half = 1;          // checkerboard stride: 1 every pixel drew, 2 half, 4 a quarter
+  bool hq = false;       // the frame took the high-quality path
 };
 
 class Renderer {
@@ -36,6 +38,9 @@ class Renderer {
   // Checkerboard frames: -1 by the budget (the default: stride 2 under 0.5
   // samples per drawn pixel, 4 under 0.3), 0 never, 2 or 4 always.
   void set_checkerboard(int mode) { checker_ = mode; }
+  // The high-quality path: -1 by the budget (on from HQ_SPP samples per drawn
+  // pixel, every pixel drawing; the default), 0 never, 1 always.
+  void set_quality(int mode) { quality_ = mode; }
   // Draw frame t into the tile's RGBA8 buffer on the device. accumulate=false draws
   // every frame independently (seeded by t only), which is what the seam test uses.
   // spp > 0 overrides the budget.
@@ -54,6 +59,16 @@ class Renderer {
   void* alloc_nv12(int w, int h, size_t* pitch);
   void free_dev(void* p);
   void* cu_context() const { return ctx_; }
+  // Makes the renderer's device current on the calling thread (for a thread
+  // that allocates or frees its buffers).
+  static void bind_thread();
+  // Whether frame slot k is in the history (the 8 most recent slots drawn).
+  bool drew(long long k) const { return have_tile_ && ring_slot_[((k % TEMPORAL_WINDOW) + TEMPORAL_WINDOW) % TEMPORAL_WINDOW] == k; }
+  // Whether the next frame at tile t continues the history drawn so far.
+  bool same_tile(const Tile& t) const {
+    return have_tile_ && t.w == tile_.w && t.h == tile_.h && t.full_w == tile_.full_w && t.full_h == tile_.full_h &&
+           t.x0 == tile_.x0 && t.y0 == tile_.y0;
+  }
   int width() const { return tile_.w; }
   int height() const { return tile_.h; }
   const RenderStats& stats() const { return stats_; }
@@ -94,10 +109,14 @@ class Renderer {
   int hold_n_ = 0;
   long long hold_frames_ = 0;
   int checker_ = -1;  // -1 by budget, 0 never, 2 or 4 always
+  int quality_ = -1;  // -1 by budget, 0 never, 1 always
+  double hold_budget_ = 0;  // the budget the current hold started with
   void* fill_c_ = nullptr;  // checkerboard fill output, swapped into the ring
   void* fill_a_ = nullptr;
   void* stream_ = nullptr;
   void* ev0_ = nullptr;
   void* ev1_ = nullptr;
+  void* evt0_ = nullptr;  // around the trace kernel
+  void* evt1_ = nullptr;
   RenderStats stats_;
 };

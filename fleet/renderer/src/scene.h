@@ -38,6 +38,11 @@ struct Scene {
   std::vector<SceneLight> lights;  // sorted by t
   double loop_s = 0;  // > 0 only for the built-in demo scene: t wraps
   double budget = 0;  // pixel-samples per frame for every tile; 0: the renderer's BUDGET
+  // Layout generations: draw previous_rect for frames before rect_from_frame
+  // (when has_previous_rect), rect from it; -1: absent.
+  long long layout_generation = -1, rect_from_frame = -1;
+  bool has_previous_rect = false;
+  Rect previous_rect;
 };
 
 // Throws std::runtime_error with a message naming the bad field.
@@ -64,6 +69,9 @@ CamPose camera_at(const std::vector<Keyframe>& kf, double t);
 
 // Scene time that drives the camera and animation (wraps for the demo loop).
 double scene_time(const Scene& s, double t);
+// The tile height that gives a whole image full_h pixels tall for rect r (the
+// stream height to keep when a layout generation changes a tile's rect).
+int tile_h_for(const Rect& r, double image_aspect, int full_h);
 
 // Host copy of the 2D noise table (the GPU gets the same values), used to keep
 // the eye above ground and to place words.

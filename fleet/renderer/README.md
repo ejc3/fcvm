@@ -144,8 +144,9 @@ python3 tools/seam_metric.py out.png 4 2              # seam ratio at every tile
 
 ## Measured (2026-10-23, g4dn.metal from the fleet host AMI, one T4 per fcvm VM)
 
-The fps table, seams and shots are from round 7; the TLS numbers from round
-6; the stream-quality and subscriber numbers from round 4.
+The fps table, seams and shots are from round 7 (round 10's fps runs and
+seam hashes match round 9's); the TLS numbers from round 6; the
+stream-quality and subscriber numbers from round 4.
 
 Moving camera, `tools/measure.py`, 8 s per row after 2 s to settle, default
 budget (250,000 pixel-samples per frame over the drawn region), `q=std`; wall
@@ -173,6 +174,130 @@ inside clouds, and shortens the sun shadow march (32 steps), the bounce ray
 (14 steps over 6 km) and the aerial perspective over a hit (8 steps). On the
 measure scene's 720p frame the trace went from 29.6 to 27.2 ms, and on the
 1080 detail tile from 95.2 to 82.8 ms (`still --seq 12`, per-kernel events).
+
+### Grid-wide budget (round 8)
+
+Eight VMs, one T4 each; `tools/budgetctl.py` (period 1 s) driving all eight;
+the shots' JSON records `/health` read while streaming.
+
+| tiles | camera | budget before -> after | samples/pixel | high quality | render ms (slowest tile) | fps (slowest tile) |
+|---|---|---|---|---|---|---|
+| 192 x 108 (100-GPU wall), sky block | moving, 20 s | 250,000 -> 840,896 | 5 -> 17 | off -> on | 5.5 -> 13.9 | 30.0 -> 29.3 |
+| 192 x 108 (100-GPU wall), terrain block | moving, 40 s | 250,000 -> 500,000 | 5 -> 10 | off -> on | 13.9 -> 24.2 | 30.0 -> 30.0 |
+| 480 x 540 (8-GPU wall) | moving, 40 s | 250,000 -> 707,107 | 1 -> 2 | off | 13.5 -> 19.4 | 30.0 -> 30.0 |
+
+The slowest tile governs, and tiles differ a lot: on the 100-GPU wall a sky
+tile's fit was 2 to 4 M pixel-samples and a terrain tile's 0.4 to 0.5 M. At
+8-GPU size there is room for one more sample per pixel, not for the
+high-quality path.
+
+Unequal GPUs: four of eight VMs reported half their fit (`FIT_SCALE=0.5`);
+the controller followed those four (fits 0.48 to 0.78 M against 0.82 to
+1.15 M) and every tile drew the same budget at every slot. A moving frame of a
+4 x 2 block of the 100-GPU wall, at 420,448 pixel-samples (9 samples per
+pixel, high quality), stitched unencoded from the eight VMs equals the same
+block drawn as one rect in another VM in all 165,888 pixels
+(`shots/scale100-raw-tiles-vs-whole.png`). The seam test passes on three
+GPUs with 21 checks, the new ones covering the high-quality path while the
+samples per frame change mid-sequence and a high-quality hold in different
+batches.
+
+Round 9:
+
+- **The flat near cloud.** Two-arm renders of the fast-move frame at 1080
+  (12 frames of history; high quality at 16 spp and the fast path at 1 spp,
+  stride 4), measuring the cloud crop's detail energy (the standard deviation
+  of luminance minus a 3 px blur): base 5.76. Light march shortened near the
+  eye 5.94; a finer erosion octave near the eye 5.86; fine steps of 10 or 30 m
+  near the eye made the cloud disappear (the crop shows sky): with steps that
+  fine the march spent its 64 to 96 fine steps without becoming opaque. The
+  cloud is a deep region of thin density: where coverage is high the density
+  remap rises slowly, so it takes kilometres to become opaque and reads as a
+  uniform fog bank from inside or near the layer. Density now saturates at a
+  third of it (`sat(3 d)`): 6.66, with shaded undersides
+  (`shots/nearcloud-density-before-after.png`; the 8-VM fast shot's crop
+  5.48 -> 6.67, `shots/fast-8gpu-r7-r9.jpg`). Clouds are denser and darker
+  underneath everywhere, and a thin lens cloud at mid distance is grainier at
+  1 spp.
+- **Controller hysteresis.** Four of eight tiles slowed (`FIT_SCALE=0.5`), the
+  long moving path on the 100-GPU terrain block, 2 minutes each: the round 8
+  rule changed the budget 2 times (1.0 per minute, between 125,000 and
+  148,651), the new rule 0 times (125,000 throughout).
+- **Cost per path.** The fit now models a frame as a fixed part plus a cost per
+  sample per path. On the 100-GPU terrain block, no slowed tiles, 60 s: every
+  tile at 353,553 (7 samples per pixel, fast path; the slowest tile cannot
+  afford the high-quality path at 8), render 12.8 to 15.0 ms against the
+  23.3 ms target, 30.0 fps on every tile.
+- **The detail view's 26.1 fps run (round 8).** Not reproduced in 11 runs:
+  five with round 8's image in the order of `tools/measure.py`'s full table
+  (three with eight VMs up, two with one), its batch order once more, and five
+  with round 9's image, all 30.0. `measure.py` now records per row the slots
+  the renderer skipped, the slots missing from the stream and the frame-time
+  tail; round 9's detail rows: 1 skipped slot (the stream switch), no gaps,
+  frames at most 27.6 to 29.6 ms. The 26.1 row has none of these, so whether it
+  was the renderer skipping slots, the stream dropping frames for a slow
+  client, or the client is not known.
+
+Round 10, layout generations (`tools/retile.py`, four VMs):
+
+- **A re-tile mid-stream.** Four tiles stream a moving camera as a 2 x 2 grid
+  (layout 1, 270 px streams), then get layout 2, four columns, with
+  `previous_rect` and `rect_from_frame` K 2.5 s ahead. Every tile's unencoded
+  frame at K-1, stitched under the 2 x 2 layout, and at K+6, stitched under the
+  four columns, equals the same frame drawn whole in another VM (12 frames of
+  history for K-1, 7 for K+6) in all 518,400 pixels, in three runs
+  (`shots/retile-old-new.jpg`, old layout left, new right). Each stream's last
+  layout-1 frame is K-1 and its new header (`layout_generation` 2, 540 px
+  tall, whole image still 540) comes with frame K, a keyframe, and no frame
+  from K on is missing. The frame at K took 21.5 to 26.8 ms.
+- **What the switch cost before.** Opening each new encoder on the render
+  thread took 10 to 25 ms and tearing each old one down 29 to 245 ms, so the
+  frame at K took 61 to 281 ms and tiles skipped 1 to 8 slots; frame K+6
+  stitched under the new layout then differed from the whole frame in 222,469
+  of 518,400 pixels. Encoders for a pending layout are now opened, and old
+  ones torn down, on a second thread.
+- **Scene then budget.** On a tile streaming at 500,000 pixel-samples per
+  frame, a scene post followed 1 s later by the budget, `/health` read every
+  30 ms: every frame it reported in between drew 500,000 from the schedule (31
+  or 32 frames per check, same clock and new clock, two runs). With every scene
+  clearing the schedule, as through round 9, the same check reports 30 of 32
+  frames at the default 250,000.
+
+- **A stream's first frames** (`tools/streamstart.py`, four VMs, a 2 x 2
+  grid with the camera moving at 353,553 pixel-samples, four streams at
+  270 px subscribing 70 ms apart): frames F to F+7, F the first frame every
+  stream delivered, stitched unencoded, equal the same frames drawn whole
+  (12 frames of history) in all 518,400 pixels, 8 of 8 frames in each of 4
+  runs, with no frame missing from any stream. Round 10's renderer (`41c46e09`)
+  skipped 9 to 12 slots after each stream started, so no tile drew F to F+7
+  all; with the encoder opened off the render thread but no priming, the
+  first frame all four drew differed in 162,911 pixels and the next four in
+  99,194 to 131,044, and the slowest cell skipped every other slot.
+
+Round 10, from the end-to-end run on eight T4s:
+
+- **A renderer rejoining the wall** (`tools/rejoin.py`, four VMs, a moving
+  2 x 2 grid, 270 px streams; one VM is killed and a fresh one started, sent
+  the scene and the budget, then streamed). A fresh VM's GPU sits at its idle
+  clock (585 MHz on a T4, against 1590; it takes about 1.5 s under load to
+  reach full speed), so its first frames were slow: priming stopped after 7
+  slots, the next slots were skipped, and frames F to F+6 of its stream
+  differed from the frame drawn whole in about 55,000 of 129,600 pixels.
+  Now a posted scene keeps the renderer drawing every slot (warming it), and
+  priming goes on while its frames are still getting faster. At 707,107
+  pixel-samples: first frame 0.28 s after subscribing, frames F to F+7 equal
+  the whole frame's region in all pixels, in 3 runs; 2 runs skipped no slot
+  in 5 s and 1 skipped one slot 1.6 s after the first frame (that budget is
+  75% of a slot at full clock, above the controller's 70%). At 353,553: 2
+  runs, 0 pixels different, no slot skipped.
+- **The grid budget** (`tools/pathrun.py`: eight VMs as a 4 x 2 wall at 540 px
+  tiles, fleet-control's directed camera with seed 1, `budgetctl.py` every
+  2 s, 7 minutes). With the fit from the latest frames the slowest tile's
+  fit swung 444 k to 716 k and the budget changed 7 times (420,448 and
+  500,000 in turn). With the fit from a 180 s window's 95th percentile it
+  stayed within 448 k to 489 k and the budget changed once (353,553 to
+  420,448 at 225 s), 0 times in the last 3 minutes; the latest frames' fit on
+  the same run still swung 447 k to 711 k. No frame took over 27.0 ms.
 
 Stream quality at 180 px tiles (4 x 2 grid, 160 x 180 inner, 192 x 212
 delivered; one moving frame unencoded and as the eight streams decode it,
