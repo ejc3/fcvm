@@ -4,7 +4,8 @@
 #   FCVM=./target/release/fcvm scripts/gpu-routed/run.sh <gpu pci address> [image]
 # Needs root (routed mode), a GPU on vfio-pci, the gpu profile set up (make setup-gpu),
 # and a routable IPv6 prefix: FCVM_IPV6_PREFIX, or the one AWS delegates to the instance.
-# scripts/gpu-routed/test-cleanup.sh checks that an early exit stops the VM it started.
+# scripts/gpu-routed/test-cleanup.sh checks that an early exit stops the VM it started;
+# scripts/gpu-routed/test-restore.sh that the second VM must report a snapshot restore.
 set -euo pipefail
 GPU=${1:?usage: run.sh <gpu pci address> [image]}
 IMAGE=${2:-docker.io/library/nginx:alpine}
@@ -31,13 +32,13 @@ stop_runner() {
 }
 trap stop_runner EXIT
 trap 'exit 130' INT TERM
-check() { # name, address suffix
-  local name=$1 want; want=$(addr "$2")
+check() { # name, address suffix, [restored: the VM must report a snapshot restore]
+  local name=$1 want restored=${3:-}; want=$(addr "$2")
   "$F" podman run --name "$name" --kernel-profile gpu --gpu "$GPU" --network routed \
     --ipv6-prefix "$FCVM_IPV6_PREFIX" --ipv6-address "$want" "$IMAGE" > "$LOGS/$name.log" 2>&1 < /dev/null &
   runner=$!
-  local pid="" i
-  for i in $(seq 1 300); do
+  local pid=""
+  for _ in $(seq 1 300); do
     pid=$("$F" ls --json 2>/dev/null | jq -r --arg n "$name" '.[] | select(.name == $n and .health_status == "healthy") | .pid' | head -1)
     [ -n "$pid" ] && break
     kill -0 "$runner" 2>/dev/null || break
@@ -55,9 +56,16 @@ check() { # name, address suffix
     echo "FAIL $name: no IPv6 reply from $TARGET: $(grep 'packet loss' "$LOGS/$name.ping") (guest routes in $LOGS/$name.net)"; fail=1
   fi
   stop_runner
+  # A run with the snapshot cache off (FCVM_NO_SNAPSHOT passes through sudo -E) boots
+  # cold and would pass the checks above without restoring anything.
+  if [ -n "$restored" ] && ! jq -nRe '[inputs | fromjson? | objects | select(.status == "restored")] | length > 0' \
+      "$LOGS/$name.log" > /dev/null; then
+    echo "FAIL $name: did not report a snapshot restore (log $LOGS/$name.log)"; fail=1
+  fi
 }
 # The first run creates the pre-start snapshot (or restores one); the second restores it
 # at another address.
 check "gpu-routed-a-$$" "$((0x20 + RANDOM % 0x60))"
-check "gpu-routed-b-$$" "$((0x80 + RANDOM % 0x60))"
-[ "$fail" = 0 ] && echo "gpu-routed: PASS" || { echo "gpu-routed: FAIL (logs in $LOGS)"; exit 1; }
+check "gpu-routed-b-$$" "$((0x80 + RANDOM % 0x60))" restored
+if [ "$fail" != 0 ]; then echo "gpu-routed: FAIL (logs in $LOGS)"; exit 1; fi
+echo "gpu-routed: PASS"

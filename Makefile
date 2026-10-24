@@ -827,7 +827,7 @@ setup-gpu: build setup-btrfs
 # --ipv6-address they were given on eth0 and reach the internet over IPv6
 # (scripts/gpu-routed/run.sh). Needs root, a GPU on vfio-pci and a routable prefix.
 gpu-routed-test: private SHELL := $(TARGET_LEASE_SHELL)
-gpu-routed-test: setup-gpu
+gpu-routed-test: $(if $(strip $(GPU)),setup-gpu)
 	@test -n "$(GPU)" || { echo "usage: make gpu-routed-test GPU=<pci address>" >&2; exit 2; }
 	sudo -E FCVM=./target/release/fcvm ./scripts/gpu-routed/run.sh "$(GPU)"
 

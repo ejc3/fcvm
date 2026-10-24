@@ -424,7 +424,13 @@ sudo sysctl -w vm.unprivileged_userfaultfd=1
 echo "user_allow_other" | sudo tee -a /etc/fuse.conf
 sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0  # Ubuntu 24.04+
 sudo sysctl -w net.ipv4.conf.all.forwarding=1
-sudo sysctl -w net.ipv6.conf.all.forwarding=1  # routed networking
+# Routed networking. If the kernel itself takes the uplink's IPv6 default route from
+# router advertisements (accept_ra=1), turning forwarding on makes it ignore them and
+# the route expires, so set accept_ra=2 on the uplink first:
+#   sudo sysctl -w net.ipv6.conf.<uplink>.accept_ra=2
+# systemd-networkd handles advertisements itself (the kernel's accept_ra is 0) and keeps
+# its route either way.
+sudo sysctl -w net.ipv6.conf.all.forwarding=1
 
 # For bridged networking only:
 sudo mkdir -p /var/run/netns
