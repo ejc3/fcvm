@@ -305,6 +305,10 @@ pub struct FleetCoordArgs {
     /// The zone's Cloudflare id (default: looked up by name)
     #[arg(long)]
     pub dns_zone_id: Option<String>,
+    /// The zone's authoritative nameservers (comma separated). A launch's names are
+    /// published to viewers only once every one of them answers with the new records.
+    #[arg(long, value_delimiter = ',')]
+    pub dns_nameservers: Vec<String>,
 
     /// Keep the wildcard certificate in this secret renewed (30 days before expiry, ACME
     /// DNS-01 through the DNS token)
@@ -397,6 +401,13 @@ pub struct FleetAgentArgs {
     /// names the port.
     #[arg(long)]
     pub tls_publish_base: Option<u16>,
+
+    /// The host's public IPv4 address, reported for every slot whose TLS port is published
+    /// (--tls-publish-base) so the coordinator names it `<label>-v4.<zone>` with the slot's
+    /// port: one address per host, each slot on its own port. Read from IMDS (`public-ipv4`,
+    /// the address EC2 assigns at launch).
+    #[arg(long, requires = "tls_publish_base")]
+    pub public_ipv4_from_imds: bool,
 
     /// GPUs to use instead of the vfio-pci inventory: <sbdf>=<name>,...
     #[arg(long)]

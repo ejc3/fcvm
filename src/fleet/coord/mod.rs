@@ -117,7 +117,7 @@ pub struct Outputs {
     /// The grid budget, for the EC2 tiles' renderers.
     pub budget: watch::Sender<Option<BudgetBody>>,
     /// The slots' DNS records, when the coordinator writes them (zone, wanted records).
-    pub dns: Option<(String, watch::Sender<dns::Wanted>)>,
+    pub dns: Option<watch::Sender<Vec<dns::Fact>>>,
     pub store: Option<store::StoreTx>,
 }
 
@@ -233,7 +233,8 @@ impl Actor {
                     Some(TileSpec {
                         id: s.id.clone(),
                         rect: s.rect?,
-                        url: s.observed.frame_url.clone(),
+                        // The tile's published IPv6 name, as viewers get it.
+                        url: fleet_core::view::frame_urls(&self.state, s).0,
                     })
                 })
                 .collect(),
@@ -251,11 +252,11 @@ impl Actor {
             *cur = power.clone();
             changed
         });
-        if let Some((zone, tx)) = &self.out.dns {
-            let want = dns::wanted(&self.state, zone);
+        if let Some(tx) = &self.out.dns {
+            let facts = dns::facts(&self.state);
             tx.send_if_modified(|cur| {
-                let changed = *cur != want;
-                *cur = want;
+                let changed = *cur != facts;
+                *cur = facts;
                 changed
             });
         }
@@ -387,7 +388,12 @@ impl Actor {
                         tile: c.borrowed.clone(),
                         phase: if ready { "running" } else { "restoring" }.into(),
                         frame_url: if ready {
-                            s.observed.frame_url.clone()
+                            fleet_core::view::frame_urls(&self.state, s).0
+                        } else {
+                            None
+                        },
+                        frame_url_v4: if ready {
+                            fleet_core::view::frame_urls(&self.state, s).1
                         } else {
                             None
                         },
@@ -517,7 +523,8 @@ fn set_at(event: &mut Event, t: u64) {
         | Event::ReleaseQuarantine { at, .. }
         | Event::Visibility { at, .. }
         | Event::ScaleInstances { at, .. }
-        | Event::Ec2Health { at, .. } => *at = t,
+        | Event::Ec2Health { at, .. }
+        | Event::Published { at, .. } => *at = t,
     }
 }
 
@@ -626,8 +633,11 @@ pub fn start(
     let (power_tx, power_rx) = watch::channel(state.fleet.power.state.clone());
     let (scene_tx, scene_rx) = watch::channel(None);
     let (budget_tx, budget_rx) = watch::channel(state.fleet.budget.body());
+    let mut state = state;
+    // With a DNS writer, tiles' frame URLs are the launches' published names.
+    state.config.names_published = dns_writer.is_some();
     let dns_out = dns_writer.map(|cf| {
-        let (tx, rx) = watch::channel(dns::wanted(&state, &cf.zone));
+        let (tx, rx) = watch::channel(dns::facts(&state));
         (cf, tx, rx)
     });
     let actor = Actor::new(
@@ -639,9 +649,7 @@ pub fn start(
             power: power_tx,
             scene: scene_tx,
             budget: budget_tx,
-            dns: dns_out
-                .as_ref()
-                .map(|(cf, tx, _)| (cf.zone.clone(), tx.clone())),
+            dns: dns_out.as_ref().map(|(_, tx, _)| tx.clone()),
             store,
         },
         Box::new(now_ms),
@@ -687,7 +695,7 @@ pub fn start(
         tokio::spawn(scale::run(cfg, power_rx, handle.clone()));
     }
     if let Some((cf, _, rx)) = dns_out {
-        tokio::spawn(dns::run(cf, rx));
+        tokio::spawn(dns::run(cf, rx, handle.clone()));
     }
     (handle, task)
 }
@@ -847,8 +855,15 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             args.dns_zone_id.clone(),
         )
     };
+    if dns_token.is_some() && args.dns_nameservers.is_empty() {
+        tracing::warn!(
+            "--dns-nameservers is empty: launches' names are published without confirming them at the zone's authoritative servers"
+        );
+    }
     let dns_writer = match &dns_token {
-        Some(t) => Some(cloudflare(t)?),
+        Some(t) => Some(cloudflare(t)?.with_confirm(Arc::new(dns::Authoritative {
+            servers: args.dns_nameservers.clone(),
+        }))),
         None => None,
     };
     if let Some(secret) = &args.tls_secret {

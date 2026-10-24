@@ -37,6 +37,9 @@ pub struct AgentCfg {
     /// base plus the GPU index, for hosts whose VMs are not routed (a test box, a local run);
     /// the zone frame URL then names that port.
     pub tls_publish_base: Option<u16>,
+    /// The host's public IPv4 address: a slot whose TLS port is published reports it with
+    /// that port, its IPv4 path (one address per host, a port per slot).
+    pub public_ipv4: Option<String>,
     pub sysfs_root: PathBuf,
     pub start_timeout: Duration,
     pub stop_grace: Duration,
@@ -158,14 +161,17 @@ impl SlotCtx {
             error,
             retry_in_ms: retry_in.map(ms),
             ipv6: self.ipv6.map(|a| a.to_string()),
-            ipv4: None,
+            ipv4: self.tls_port.and(self.cfg.public_ipv4.clone()),
+            v4_port: self.cfg.public_ipv4.as_ref().and(self.tls_port),
         }));
     }
 
     /// The renderer's frame WebSocket as a browser opens it.
     fn frame_url(&self) -> String {
         match &self.cfg.frame_zone {
-            Some(zone) => match self.tls_port {
+            // A routed slot is reached at its own address on 443; its published port is
+            // the IPv4 path, which the coordinator names separately.
+            Some(zone) => match self.tls_port.filter(|_| self.ipv6.is_none()) {
                 Some(p) => format!("wss://{}.{zone}:{p}/frames", self.id),
                 None => format!("wss://{}.{zone}/frames", self.id),
             },

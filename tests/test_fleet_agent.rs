@@ -71,6 +71,7 @@ fn cfg(fcvm: &Path) -> AgentCfg {
         ipv6_prefix: None,
         frame_zone: None,
         tls_publish_base: None,
+        public_ipv4: None,
         sysfs_root: PathBuf::from("/nonexistent-sysfs"),
         start_timeout: Duration::from_secs(20),
         stop_grace: Duration::from_secs(10),
@@ -1516,6 +1517,37 @@ async fn a_slot_publishes_its_tls_port_when_not_routed() {
     );
     let args = std::fs::read_to_string(f.dir.path().join("args-fleet-slot-2")).unwrap();
     assert!(args.contains("--publish\n127.0.0.1:40101:443\n"), "{args}");
+    c.close().await;
+}
+
+/// A routed slot's IPv4 path: the host's one public IPv4 address with a port per slot. The
+/// slot forwards its TLS port on the host (base + GPU index, into the routed VM) and reports
+/// the host's address and its port; its frame URL stays its own IPv6 name on 443.
+#[tokio::test]
+async fn a_routed_slot_reports_the_hosts_ipv4_and_its_port() {
+    let f = fake(2, &[]);
+    let mut cfg = cfg(&f.fcvm);
+    cfg.ipv6_prefix = Some(fcvm::fleet::agent::addr::Prefix::parse("2001:db8:1:2:3::/80").unwrap());
+    cfg.frame_zone = Some("fleet.example".into());
+    cfg.tls_publish_base = Some(20200);
+    cfg.publish_ip = "0.0.0.0".into();
+    cfg.public_ipv4 = Some("192.0.2.44".into());
+    let mut c = Coord::start(&f, 2, cfg);
+    c.next().await;
+    c.send(scene());
+    c.assign(&[("slot-1", 0, 1, rect(0.0)), ("slot-2", 1, 1, rect(0.25))]);
+    let got = c.until(&["slot-1", "slot-2"], "running", 1).await;
+    for (id, port) in [("slot-1", 20200), ("slot-2", 20201)] {
+        assert_eq!(got[id].ipv4.as_deref(), Some("192.0.2.44"), "{id}");
+        assert_eq!(got[id].v4_port, Some(port), "{id}");
+        assert_eq!(
+            got[id].frame_url.as_deref(),
+            Some(format!("wss://{id}.fleet.example/frames").as_str())
+        );
+    }
+    let args = std::fs::read_to_string(f.dir.path().join("args-fleet-slot-2")).unwrap();
+    assert!(args.contains("--publish\n0.0.0.0:20201:443\n"), "{args}");
+    assert!(args.contains("--network\nrouted\n"), "{args}");
     c.close().await;
 }
 

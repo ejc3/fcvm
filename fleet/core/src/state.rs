@@ -49,6 +49,10 @@ pub struct Config {
     pub power_managed: bool,
     #[serde(default = "ten_minutes")]
     pub idle_scale_down_secs: u64,
+    /// The coordinator writes each launch's DNS names and a tile's frame URLs are its
+    /// published names (`Slot::published`), not the URL its agent reported.
+    #[serde(default)]
+    pub names_published: bool,
 }
 
 fn ten_minutes() -> u64 {
@@ -136,6 +140,7 @@ impl Default for Config {
             max_borrowed: None,
             power_managed: false,
             idle_scale_down_secs: 600,
+            names_published: false,
         }
     }
 }
@@ -186,11 +191,37 @@ pub struct Observed {
     /// When the agent will try a failed slot again.
     #[serde(default)]
     pub retry_at: Option<u64>,
-    /// The slot's public addresses, as last reported.
+    /// The slot's public addresses, as last reported, and the port its TLS is reached on at
+    /// the IPv4 address (443 when absent).
     #[serde(default)]
     pub ipv6: Option<String>,
     #[serde(default)]
     pub ipv4: Option<String>,
+    #[serde(default)]
+    pub v4_port: Option<u16>,
+}
+
+/// One launch's DNS names, written and confirmed at the zone's authoritative servers before
+/// they were published: `<label>.<zone>` (AAAA) and `<label>-v4.<zone>` (A). A label is
+/// made for one launch and never used again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Published {
+    /// The launch (the slot's observed generation) the names belong to.
+    pub generation: u64,
+    pub label: String,
+    #[serde(default)]
+    pub ipv6: Option<String>,
+    #[serde(default)]
+    pub ipv4: Option<String>,
+    /// The port of the IPv4 path (443 when absent), as the slot reported it.
+    #[serde(default)]
+    pub v4_port: Option<u16>,
+    /// `wss://<label>.<zone>/frames`, with an IPv6 address.
+    #[serde(default)]
+    pub frame_url: Option<String>,
+    /// `wss://<label>-v4.<zone>[:<port>]/frames`, with an IPv4 address.
+    #[serde(default)]
+    pub frame_url_v4: Option<String>,
 }
 
 /// One relaunch of one slot, from the click to its first frame.
@@ -225,6 +256,9 @@ pub struct Slot {
     #[serde(default)]
     pub rect_generation: u64,
     pub observed: Observed,
+    /// The newest launch whose DNS names were published (with `Config::names_published`).
+    #[serde(default)]
+    pub published: Option<Published>,
     pub last_relaunch: Option<Relaunch>,
     /// A viewer's private session on this (standby) GPU.
     #[serde(default)]

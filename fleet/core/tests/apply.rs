@@ -183,6 +183,7 @@ fn version_moves_exactly_when_the_view_or_a_receipt_changes() {
                 retry_in_ms: None,
                 ipv6: None,
                 ipv4: None,
+                v4_port: None,
             }),
         });
     }

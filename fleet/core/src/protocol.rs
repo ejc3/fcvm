@@ -78,8 +78,11 @@ pub struct ClaimMsg {
     pub tile: Option<String>,
     /// `restoring` until the private VM's first frame, `running`, then `ended`.
     pub phase: String,
-    /// The private renderer's frame WebSocket, once it runs.
+    /// The private renderer's frame WebSocket over IPv6 and over IPv4, once it runs (with
+    /// published names, once the launch's names answer, as for a tile).
     pub frame_url: Option<String>,
+    #[serde(default)]
+    pub frame_url_v4: Option<String>,
     /// The session token for this viewer alone.
     pub token: String,
     pub clicked_at: u64,
@@ -133,6 +136,10 @@ pub struct SlotReport {
     pub ipv6: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipv4: Option<String>,
+    /// The TCP port the renderer's TLS port is reached on at `ipv4` (a GPU host's public
+    /// IPv4 address is shared by its slots, each forwarded on its own port); 443 when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v4_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

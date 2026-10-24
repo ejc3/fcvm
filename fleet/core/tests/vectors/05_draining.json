@@ -194,6 +194,7 @@
     "aggregates": [
       {
         "frame_url": null,
+        "frame_url_v4": null,
         "half": "fcvm",
         "host": "h2",
         "id": "agg:h2",
@@ -452,6 +453,7 @@
         "failure": null,
         "fps": null,
         "frame_url": "ws://h2:20003/frames",
+        "frame_url_v4": null,
         "generation": 3,
         "gpu": {
           "name": "Tesla T4",
