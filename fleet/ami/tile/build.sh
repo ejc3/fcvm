@@ -115,6 +115,8 @@ image)
     sleep 1
   done
   curl -fsS -m 2 http://127.0.0.1:8080/health | jq -c '{ready, frame, gpu}'
+  # /health answers 200 whatever the renderer's state: the body decides.
+  curl -fsS -m 2 http://127.0.0.1:8080/health | jq -e '.ready == true and .frame > 0' >/dev/null || { echo "renderer not ready after 300 s"; exit 1; }
   systemctl stop fcvm-fleet-renderer.service
   ;;
 bake)

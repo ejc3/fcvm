@@ -89,7 +89,9 @@ XEOF
 cut -d= -f1 /var/lib/fleet-ami/env"
   ;;
 start)
-  ssm_sh "$2" "cd /opt/fleet-ami && nohup setsid bash $3 $4 > /dev/null 2>&1 < /dev/null & echo started $4"
+  # The phase clears its own markers too, but only once it runs; until then `wait` would
+  # read the previous run's (a repeated phase, or a builder from a BASE_AMI).
+  ssm_sh "$2" "rm -f /var/lib/fleet-ami/$4.done /var/lib/fleet-ami/$4.failed; cd /opt/fleet-ami && nohup setsid bash $3 $4 > /dev/null 2>&1 < /dev/null & echo started $4"
   ;;
 wait)
   id=$2; ph=$3

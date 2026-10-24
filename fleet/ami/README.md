@@ -61,5 +61,9 @@ Measured from the launch request (`measure-boot.sh`, on demand): a tile serves i
 frame over HTTPS at 67.7 s and 83.0 s; a host is ready for the agent at 117.9 s, of which
 47.5 s is the store fetched from S3 (from the AMI's own volume it took 419 s).
 
+`bash fleet/ami/check.sh` runs the offline checks of these recipes (shellcheck, `bash -n`,
+the phase-marker and tile-readiness contracts); CI does not run it, so run it before
+changing a recipe.
+
 The wildcard certificate in `fcvm-fleet/tls-wildcard` is issued by
 `fleet/tools/issue-cert.sh`, whose header documents the secret's format.
