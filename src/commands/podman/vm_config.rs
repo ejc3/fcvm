@@ -23,6 +23,10 @@ fn get_host_subuid_range() -> Option<(u64, u64)> {
     parse_subid_file("/etc/subuid")
 }
 
+fn get_host_subgid_range() -> Option<(u64, u64)> {
+    parse_subid_file("/etc/subgid")
+}
+
 /// Parse /etc/subuid or /etc/subgid for the current user.
 /// Format: username:start:count
 fn parse_subid_file(path: &str) -> Option<(u64, u64)> {
@@ -803,10 +807,10 @@ pub(super) fn build_boot_plan_json(
         .or_else(|_| std::env::var("NO_PROXY"))
         .ok();
 
-    let subuid_range = if launch_config.user.is_some() {
-        get_host_subuid_range()
+    let (subuid_range, subgid_range) = if launch_config.user.is_some() {
+        (get_host_subuid_range(), get_host_subgid_range())
     } else {
-        None
+        (None, None)
     };
 
     let runtime = crate::firecracker::MmdsRuntime {
@@ -822,6 +826,8 @@ pub(super) fn build_boot_plan_json(
         no_proxy,
         subuid_start: subuid_range.map(|(start, _)| start),
         subuid_count: subuid_range.map(|(_, count)| count),
+        subgid_start: subgid_range.map(|(start, _)| start),
+        subgid_count: subgid_range.map(|(_, count)| count),
         host_time: chrono::Utc::now().timestamp().to_string(),
         ntp_servers: host_ntp_servers(),
     };
