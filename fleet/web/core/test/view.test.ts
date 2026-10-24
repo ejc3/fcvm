@@ -274,6 +274,7 @@ describe("your own GPU", () => {
     tile: "fcvm:4",
     phase: "restoring",
     frame_url: null,
+    frame_url_v4: null,
     clicked_at: EPOCH + 1000,
     first_frame_at: null,
     expires_at: null,
@@ -524,8 +525,8 @@ describe("hover label placement", () => {
 
 describe("streaming modes", () => {
   const aggs = [
-    { id: "agg:example-host", half: "fcvm" as const, host: "example-host", frame_url: "ws://example-host:2/frames/agg-a", rect: { x: 0, y: 0, w: 0.5, h: 1 }, tiles: ["fcvm:1", "fcvm:2", "fcvm:3", "fcvm:4"] },
-    { id: "agg:ec2", half: "ec2" as const, host: null, frame_url: "ws://example-host:2/frames/agg-ec2", rect: { x: 0.5, y: 0, w: 0.5, h: 1 }, tiles: ["ec2:1", "ec2:2", "ec2:3", "ec2:4"] },
+    { id: "agg:example-host", half: "fcvm" as const, host: "example-host", frame_url: "ws://example-host:2/frames/agg-a", frame_url_v4: null, rect: { x: 0, y: 0, w: 0.5, h: 1 }, tiles: ["fcvm:1", "fcvm:2", "fcvm:3", "fcvm:4"] },
+    { id: "agg:ec2", half: "ec2" as const, host: null, frame_url: "ws://example-host:2/frames/agg-ec2", frame_url_v4: null, rect: { x: 0.5, y: 0, w: 0.5, h: 1 }, tiles: ["ec2:1", "ec2:2", "ec2:3", "ec2:4"] },
   ];
   it("starts aggregated, plans both modes, and offers direct as every VM's own stream", () => {
     const s = stateWith(fleet(2, 2, { aggregates: aggs }));
@@ -812,7 +813,7 @@ describe("re-tiling: each side as wide as the GPUs it has", () => {
 
   it("Aggregated mode takes the new regions with the new generation", () => {
     const agg = (st: FleetState) => [
-      { id: "agg:example-host", half: "fcvm" as const, host: "example-host", rect: { x: 0, y: 0, w: st.tiles.filter((t) => t.half === "fcvm").reduce((a, t) => Math.max(a, t.rect.x + t.rect.w), 0), h: 1 }, frame_url: "ws://example-host:2/frames/agg-a", tiles: st.tiles.filter((t) => t.half === "fcvm").map((t) => t.id) },
+      { id: "agg:example-host", half: "fcvm" as const, host: "example-host", rect: { x: 0, y: 0, w: st.tiles.filter((t) => t.half === "fcvm").reduce((a, t) => Math.max(a, t.rect.x + t.rect.w), 0), h: 1 }, frame_url: "ws://example-host:2/frames/agg-a", frame_url_v4: null, tiles: st.tiles.filter((t) => t.half === "fcvm").map((t) => t.id) },
     ];
     const g1 = fleetSplit(4, 4, 1);
     g1.aggregates = agg(g1);
@@ -912,5 +913,43 @@ describe("the IPv6 probe's targets", () => {
     let s = initialState();
     s = reduce(s, { type: "family", family: "v6", probeMs: 180 });
     expect(reduce(s, { type: "family", family: "v4", probeMs: 1500 }).net).toEqual({ family: "v6", probeMs: 180 });
+  });
+});
+
+describe("the family choice covers every stream the page opens", () => {
+  const agg = (v6: string | null, v4: string | null) => ({ id: "agg:example-host", half: "fcvm" as const, host: "example-host", rect: { x: 0, y: 0, w: 0.5, h: 1 }, frame_url: v6, frame_url_v4: v4, tiles: ["fcvm:1", "fcvm:2", "fcvm:3", "fcvm:4"] });
+  const at = (aggregates: ReturnType<typeof agg>[], family: "v6" | "v4") => {
+    const s = stateWith(fleet(2, 2, { aggregates }));
+    return reduce({ ...s, net: { family, probeMs: family === "v6" ? 180 : 1500 } }, { type: "ui", patch: { mode: "aggregated" } });
+  };
+
+  it("keeps an IPv4 viewer direct when the aggregates serve only IPv6", () => {
+    const v = view(at([agg("ws://example-host:2/frames/agg-a", null)], "v4"), EPOCH);
+    expect(v.plan.aggregated).toEqual([]);
+    expect(v.plan.mode).toBe("direct");
+    expect(v.plan.direct.length).toBe(8);
+    expect(new Set(v.plan.direct.map((d) => new URL(d.url!).hostname))).toEqual(new Set(["example-host-v4"]));
+  });
+
+  it("streams an aggregate over the viewer's family when it has a URL in it", () => {
+    const v4 = view(at([agg("ws://example-host:2/frames/agg-a", "ws://example-host-v4:2/frames/agg-a")], "v4"), EPOCH);
+    expect(v4.plan.mode).toBe("aggregated");
+    expect(v4.plan.aggregated.map((a) => new URL(a.url!).hostname)).toEqual(["example-host-v4"]);
+    const v6 = view(at([agg("ws://example-host:2/frames/agg-a", "ws://example-host-v4:2/frames/agg-a")], "v6"), EPOCH);
+    expect(v6.plan.aggregated.map((a) => new URL(a.url!).hostname)).toEqual(["example-host"]);
+  });
+
+  it("opens a borrowed GPU's stream over the viewer's family, and none when it has no URL in it", () => {
+    const claimMsg = (v4: string | null) => ({ type: "claim", claim: { id: "claim-1", tile: "fcvm:4", phase: "running", frame_url: "ws://example-host:2/frames/claim-1", frame_url_v4: v4, clicked_at: EPOCH, first_frame_at: EPOCH + 2900, expires_at: EPOCH + 62_900, gpu: "Tesla T4", phases: {}, camera: [], ended: null } });
+    const own = (family: "v6" | "v4", v4: string | null) => {
+      let s = stateWith(fleet(2, 2));
+      s = { ...s, net: { family, probeMs: 180 } };
+      s = reduce(s, { type: "intent-sent", intent: makeIntent("own", "claim_gpu"), at: EPOCH });
+      s = msg(s, claimMsg(v4));
+      return view(s, EPOCH, { ownArea: { x: 0, y: 0, w: 1600, h: 900 } }).plan.focus;
+    };
+    expect(new URL(own("v4", "ws://example-host-v4:2/frames/claim-1")!.url!).hostname).toBe("example-host-v4");
+    expect(new URL(own("v6", "ws://example-host-v4:2/frames/claim-1")!.url!).hostname).toBe("example-host");
+    expect(own("v4", null)).toBeNull();
   });
 });

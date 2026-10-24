@@ -18,7 +18,7 @@ import {
   type PlacedTile,
   type Segment,
 } from "./layout.ts";
-import { FAMILY_PROBE_MS, frameSocketUrl, tileStreamUrl } from "./net.ts";
+import { FAMILY_PROBE_MS, frameSocketUrl, streamUrl } from "./net.ts";
 import { fitBandwidth, type StreamAsk } from "./bandwidth.ts";
 import { suggestMode } from "./mode.ts";
 import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type FleetState, type Half, type IntentMsg, type Rect, type Tile } from "./protocol.ts";
@@ -524,7 +524,7 @@ function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMs
     };
   }
 
-  const hasAgg = st.aggregates.some((a) => a.frame_url !== null);
+  const hasAgg = st.aggregates.some((a) => streamUrl(a, s.net.family) !== null);
   const sug = suggestMode({
     aggregators: st.aggregates.length,
     downlinkMbps: input.downlinkMbps ?? null,
@@ -1362,10 +1362,10 @@ export function wallView(input: WallInput): WallView {
   const fitted = fitBandwidth(asks, st.image_aspect, input.budgetBps);
   // Every tile streams over the one family the IPv6 probe chose; until it answers, none does.
   const family = s.net.family;
-  const direct: DrawSource[] = st.tiles.filter((t) => isLive(t) && tileStreamUrl(t, family) !== null).map((t) => {
+  const direct: DrawSource[] = st.tiles.filter((t) => isLive(t) && streamUrl(t, family) !== null).map((t) => {
     const height = fitted.heights.get(t.id) ?? 144;
     const q = fitted.quality.get(t.id) ?? "std";
-    const base = tileStreamUrl(t, family)!;
+    const base = streamUrl(t, family)!;
     return {
       id: `d:${t.id}`,
       url: frameSocketUrl(base, height, q),
@@ -1374,24 +1374,28 @@ export function wallView(input: WallInput): WallView {
       box: covered ? (opened?.id === t.id ? focus!.placed!.box : null) : placedPlan.get(t.id)?.box ?? null,
     };
   });
-  // Aggregated: each region is one big tile; it asks for the height it covers.
+  // Aggregated: each region is one big tile; it asks for the height it covers. Only the
+  // aggregates with a URL in this viewer's family stream.
   const aggregated: DrawSource[] = st.aggregates
-    .filter((g) => g.frame_url !== null)
+    .filter((g) => streamUrl(g, family) !== null)
     .map((g) => {
       const box = planLayout ? rectOnScreen(planLayout.image, g.rect, input.dpr) : null;
       const height = covered || !box ? STREAM_HEIGHTS[0] : streamHeightFor(box.h * input.dpr);
-      return { id: `a:${g.id}`, url: frameSocketUrl(g.frame_url!, height), baseUrl: g.frame_url, height, box: covered ? null : box };
+      const base = streamUrl(g, family)!;
+      return { id: `a:${g.id}`, url: frameSocketUrl(base, height), baseUrl: base, height, box: covered ? null : box };
     });
   let focusSource: DrawSource | null = null;
-  if (own && own.placed && s.own.claim?.frame_url) {
+  const claimUrl = s.own.claim ? streamUrl(s.own.claim, family) : null;
+  if (own && own.placed && s.own.claim && claimUrl) {
     const c = s.own.claim;
-    focusSource = { id: `o:${c.id}`, url: frameSocketUrl(c.frame_url!, own.placed.streamHeight), baseUrl: c.frame_url, height: own.placed.streamHeight, box: own.placed.box };
+    focusSource = { id: `o:${c.id}`, url: frameSocketUrl(claimUrl, own.placed.streamHeight), baseUrl: claimUrl, height: own.placed.streamHeight, box: own.placed.box };
   } else if (opened) {
     focusSource = direct.find((d) => d.id === `d:${opened.id}`) ?? null;
   }
   const plan: DrawPlan = {
     ...emptyPlan,
-    mode: st.aggregates.some((a) => a.frame_url !== null) ? s.ui.mode : "direct",
+    // Aggregated only where an aggregate serves this viewer's family; otherwise direct.
+    mode: aggregated.length > 0 ? s.ui.mode : "direct",
     direct,
     aggregated,
     focus: focusSource,

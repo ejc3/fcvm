@@ -63,10 +63,13 @@ export const FAMILY_PROBE_MS = 1500;
 /** How many tiles the probe tries at once: one tile can be down without IPv6 being down. */
 export const FAMILY_PROBE_TILES = 3;
 
-/** A tile's frame socket base URL in a family: null while the family is unknown or the URL is. */
-export function tileStreamUrl(t: { frame_url: string | null; frame_url_v4: string | null }, family: Family | null): string | null {
+/**
+ * A stream's base URL in a family (a tile's, an aggregate's or a borrowed GPU's: every
+ * `frame_url` has a `frame_url_v4` sibling): null while the family is unknown or the URL is.
+ */
+export function streamUrl(x: { frame_url: string | null; frame_url_v4: string | null }, family: Family | null): string | null {
   if (family === null) return null;
-  return family === "v6" ? t.frame_url : t.frame_url_v4;
+  return family === "v6" ? x.frame_url : x.frame_url_v4;
 }
 
 /**
