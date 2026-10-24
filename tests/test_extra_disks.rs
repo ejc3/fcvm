@@ -439,3 +439,107 @@ async fn test_nfs_clone_restore() -> Result<()> {
     );
     Ok(())
 }
+
+/// Runs `podman run --disk-dir DIR:/data:ro` with the snapshot cache on, reads
+/// /data/marker.txt in the container, and stops the VM. Returns the content, the
+/// cache decision the run logged, its snapshot key, and whether it copied the directory.
+async fn run_disk_dir_ro_cached(
+    name: &str,
+    dir: &Path,
+) -> Result<(String, &'static str, String, bool)> {
+    let spec = format!("{}:/data:ro", dir.display());
+    let (mut child, pid, log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            name,
+            "--network",
+            "rootless",
+            "--disk-dir",
+            &spec,
+            common::TEST_IMAGE,
+        ],
+        &[],
+    )
+    .await
+    .context("spawn")?;
+    common::poll_health_by_pid(pid, 180).await?;
+    let content = common::exec_in_container(pid, &["cat", "/data/marker.txt"]).await?;
+    let (choice, key) = common::cache_choice(&log).with_context(|| {
+        format!(
+            "{name} logged no snapshot cache decision in {}",
+            log.display()
+        )
+    })?;
+
+    // A cold boot installs its pre-start snapshot before the container starts; wait for
+    // it so the next run can hit it.
+    if choice == "cold boot" {
+        let data_dir = std::env::var("FCVM_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/mnt/fcvm-btrfs/root"));
+        let config = data_dir.join("snapshots").join(&key).join("config.json");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !config.exists() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "{name}'s pre-start snapshot {} never appeared",
+                config.display()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+    common::kill_process(pid).await;
+    let _ = child.wait().await;
+    let copied = std::fs::read_to_string(&log)?.contains("staged read-only --disk-dir");
+    Ok((content.trim().to_string(), choice, key, copied))
+}
+
+/// A read-only --disk-dir whose content changes between two runs must not restore the
+/// first run's image from the snapshot cache, and the same content recreated with new
+/// timestamps must still hit the cache.
+#[tokio::test]
+async fn test_disk_dir_ro_snapshot_cache_follows_content() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("diskdir-key");
+    let source_dir = TempDir::new()?;
+    let marker = source_dir.path().join("marker.txt");
+    // The key names the directory's content, so the content is unique to this run:
+    // another run's directory with the same bytes would share its snapshot.
+    let first = format!("first {vm_name}");
+    let second = format!("second {vm_name}");
+
+    tokio::fs::write(&marker, format!("{first}\n")).await?;
+    let (content, choice, first_key, cold_boot_copied) =
+        run_disk_dir_ro_cached(&format!("{vm_name}-a"), source_dir.path()).await?;
+    assert_eq!(content, first);
+    assert_eq!(choice, "cold boot", "new content hit an existing snapshot");
+
+    tokio::fs::write(&marker, format!("{second}\n")).await?;
+    let (content, choice, second_key, _) =
+        run_disk_dir_ro_cached(&format!("{vm_name}-b"), source_dir.path()).await?;
+    assert_eq!(
+        content, second,
+        "the second run read the first run's disk-dir image ({choice}, key {second_key})"
+    );
+    assert_eq!(choice, "cold boot");
+    assert_ne!(first_key, second_key);
+
+    // Same content, file recreated: new inode, mtime and ctime. The cache must hit.
+    tokio::fs::remove_file(&marker).await?;
+    tokio::fs::write(&marker, format!("{second}\n")).await?;
+    let (content, choice, third_key, hit_copied) =
+        run_disk_dir_ro_cached(&format!("{vm_name}-c"), source_dir.path()).await?;
+    assert_eq!(content, second);
+    assert_eq!(
+        choice, "pre-start snapshot",
+        "recreated identical content missed the cache"
+    );
+    assert_eq!(third_key, second_key);
+    assert!(
+        cold_boot_copied,
+        "the cold boot built its image without a private copy"
+    );
+    assert!(!hit_copied, "the cache hit copied the directory");
+    Ok(())
+}
