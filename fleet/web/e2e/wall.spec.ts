@@ -554,7 +554,15 @@ test("a resize that moves tiles to q=lo reopens their streams at q=lo", async ({
   console.log(`bps ${before.estimatedBps} -> ${after.estimatedBps}; ${lo} of ${after.direct.length} tiles asked for q=lo`);
   // The renderer reads q only when a socket opens, so these tiles are served at lo only if their sockets were reopened.
   await expect.poll(async () => (await stats()).subscribersByQuality.lo ?? 0, { timeout: 15_000 }).toBe(lo);
-  await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBeGreaterThanOrEqual(15);
+  // Every tile moved to lo decodes frames from its reopened stream. Not "all 15 in sync":
+  // at 1920x1080 that measures whether the mock renderer keeps up, and on one core it
+  // does not (6 of 15 in sync after 33 s, 3757 frames skipped against 2024 sent).
+  const loIds = after.direct.filter((d) => d.url!.includes("q=lo")).map((d) => d.id);
+  const newest = () => page.evaluate((ids) => ids.map((id) => window.__fleet!.client.getState().frames?.tiles[id]?.newestT ?? null), loIds);
+  const reopened = await newest();
+  await expect
+    .poll(async () => (await newest()).filter((t, i) => t !== null && (reopened[i] === null || t > reopened[i]!)).length, { timeout: 15_000 })
+    .toBe(lo);
 });
 
 test("first load paints the coordinator's poster at once, before any stream arrives", async ({ page }) => {
