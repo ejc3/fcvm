@@ -1960,7 +1960,7 @@ async fn the_aws_tile_driver_sees_a_reclaimed_instance() {
     std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
     std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
     let api = FakeEc2Api {
-        gone: vec!["i-0bbbbbbbbbbbbbbb1".to_string()],
+        gone: vec!["i-reclaimed-1".to_string()],
         ..Default::default()
     };
     let base = fake_ec2_api(api.clone()).await;
@@ -1979,7 +1979,7 @@ async fn the_aws_tile_driver_sees_a_reclaimed_instance() {
         ipv4: None,
     };
     assert!(d.alive(&launched("i-0123456789abcdef0")).await.unwrap());
-    assert!(!d.alive(&launched("i-0bbbbbbbbbbbbbbb1")).await.unwrap());
+    assert!(!d.alive(&launched("i-reclaimed-1")).await.unwrap());
 }
 
 /// A restarted coordinator does not know the tile instances an earlier one launched:
@@ -1994,10 +1994,7 @@ async fn the_aws_tile_driver_sweeps_every_tagged_tile_instance() {
     let api = FakeEc2Api {
         tagged: BTreeMap::from([(
             "us-east-1".to_string(),
-            vec![
-                "i-0aaaaaaaaaaaaaaa1".to_string(),
-                "i-0aaaaaaaaaaaaaaa2".to_string(),
-            ],
+            vec!["i-swept-1".to_string(), "i-swept-2".to_string()],
         )]),
         ..Default::default()
     };
@@ -2031,8 +2028,8 @@ async fn the_aws_tile_driver_sweeps_every_tagged_tile_instance() {
         .collect();
     assert_eq!(terminates.len(), 1, "nothing to terminate in us-west-2");
     assert_eq!(terminates[0].0, "us-east-1");
-    assert_eq!(terminates[0].1["InstanceId.1"], "i-0aaaaaaaaaaaaaaa1");
-    assert_eq!(terminates[0].1["InstanceId.2"], "i-0aaaaaaaaaaaaaaa2");
+    assert_eq!(terminates[0].1["InstanceId.1"], "i-swept-1");
+    assert_eq!(terminates[0].1["InstanceId.2"], "i-swept-2");
 }
 
 /// The AWS tile driver: a spot launch from the template, tagged, in the first region with

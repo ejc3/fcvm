@@ -274,7 +274,7 @@ mod tests {
     <AutoScalingGroupName>fleet-hosts</AutoScalingGroupName>
     <Instances>
       <member><InstanceId>i-0123456789abcdef0</InstanceId><LifecycleState>Pending</LifecycleState><HealthStatus>Healthy</HealthStatus></member>
-      <member><InstanceId>i-0fedcba9876543210</InstanceId><LifecycleState>InService</LifecycleState></member>
+      <member><InstanceId>i-1234567890abcdef0</InstanceId><LifecycleState>InService</LifecycleState></member>
     </Instances>
     <DesiredCapacity>2</DesiredCapacity>
   </member></AutoScalingGroups></DescribeAutoScalingGroupsResult>
@@ -288,7 +288,7 @@ mod tests {
                     lifecycle: "Pending".into()
                 },
                 ScaleInstance {
-                    id: "i-0fedcba9876543210".into(),
+                    id: "i-1234567890abcdef0".into(),
                     lifecycle: "InService".into()
                 },
             ]
