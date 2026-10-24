@@ -559,8 +559,10 @@ static bool find_ridge(const GCam& wc, float asp, float len_em, float em_per_km,
 }
 
 // find_ridge is a few hundred thousand terrain queries; its answer depends
-// only on the camera when the word came, so it is cached by that.
-static bool find_ridge_cached(const GCam& wc, float asp, float len_em, float em_per_km, V3* at, float* dist) {
+// only on the camera when the word came, so it is cached by that. `at` and
+// `dist` are written whatever the answer (the camera's position and 0 when no
+// ridge is found), since a miss is cached too.
+bool find_ridge_cached(const GCam& wc, float asp, float len_em, float em_per_km, V3* at, float* dist) {
   static std::mutex mu;
   static std::map<std::vector<float>, std::tuple<bool, V3, float>> cache;
   std::vector<float> key = {wc.pos.x, wc.pos.y, wc.pos.z, wc.fwd.x, wc.fwd.y, wc.fwd.z, wc.tan_half, asp, len_em, em_per_km};
@@ -573,6 +575,8 @@ static bool find_ridge_cached(const GCam& wc, float asp, float len_em, float em_
       return std::get<0>(it->second);
     }
   }
+  *at = wc.pos;
+  *dist = 0.0f;
   bool ok = find_ridge(wc, asp, len_em, em_per_km, at, dist);
   std::lock_guard<std::mutex> l(mu);
   if (cache.size() > 64) cache.clear();

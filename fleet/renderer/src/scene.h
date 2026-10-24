@@ -103,3 +103,6 @@ void fill_noise_table(V4* tab);  // deterministic
 std::string pacific_clock(int64_t unix_s);
 FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* hold_key, bool* held);
 GCam make_cam(const double pos[3], const double look[3], double fov_deg, double aspect);
+// The flattest high ridge in view for a landmark of len_em em (scene.cpp).
+// False when no ray meets land; `at` and `dist` are written either way.
+bool find_ridge_cached(const GCam& wc, float asp, float len_em, float em_per_km, V3* at, float* dist);
