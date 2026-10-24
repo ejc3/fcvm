@@ -18,10 +18,10 @@ import {
   type PlacedTile,
   type Segment,
 } from "./layout.ts";
-import { FAMILY_PROBE_MS, frameSocketUrl, streamUrl } from "./net.ts";
+import { FAMILY_PROBE_MS, frameSocketUrl, streamUrl, type Family } from "./net.ts";
 import { fitBandwidth, type StreamAsk } from "./bandwidth.ts";
 import { suggestMode } from "./mode.ts";
-import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type FleetState, type Half, type IntentMsg, type Rect, type Tile } from "./protocol.ts";
+import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type Aggregate, type FleetState, type Half, type IntentMsg, type Rect, type Tile } from "./protocol.ts";
 import { KIND_TAG, NOT_AWAKE_NOTE, scoreView, type ScoreView } from "./race.ts";
 import { sceneUnixMs } from "./scene.ts";
 import { reelView, type ReelMeta, type ReelView } from "./reel.ts";
@@ -524,7 +524,7 @@ function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMs
     };
   }
 
-  const hasAgg = st.aggregates.some((a) => streamUrl(a, s.net.family) !== null);
+  const hasAgg = aggregatedAvailable(st.aggregates, s.net.family);
   const sug = suggestMode({
     aggregators: st.aggregates.length,
     downlinkMbps: input.downlinkMbps ?? null,
@@ -1394,8 +1394,8 @@ export function wallView(input: WallInput): WallView {
   }
   const plan: DrawPlan = {
     ...emptyPlan,
-    // Aggregated only where an aggregate serves this viewer's family; otherwise direct.
-    mode: aggregated.length > 0 ? s.ui.mode : "direct",
+    // Aggregated only where the serving aggregates serve this viewer's family; otherwise direct.
+    mode: aggregatedAvailable(st.aggregates, family) ? s.ui.mode : "direct",
     direct,
     aggregated,
     focus: focusSource,
@@ -1474,6 +1474,17 @@ export function needsVerify(s: ClientState): boolean {
   return s.turnstile.sitekey !== null && !s.turnstile.verified;
 }
 
+
+/**
+ * Aggregated mode is available to a viewer when an aggregate serves its family and every
+ * aggregate that is serving at all (a URL in either family) serves its family: otherwise a
+ * half drawn only by an aggregate the viewer cannot open would stay dark. An aggregate not
+ * serving yet (no URL, as during a wake) does not count against it.
+ */
+export function aggregatedAvailable(aggregates: readonly Aggregate[], family: Family | null): boolean {
+  const serving = aggregates.filter((a) => a.frame_url !== null || a.frame_url_v4 !== null);
+  return serving.length > 0 && serving.every((a) => streamUrl(a, family) !== null);
+}
 
 /** The stats drawer's line on the address family the tiles stream over. */
 export function familyLine(net: ClientState["net"]): string {

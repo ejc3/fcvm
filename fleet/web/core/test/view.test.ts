@@ -22,7 +22,7 @@ import { suggestMode } from "../mode.ts";
 import { tileAt as tileAtPoint } from "../layout.ts";
 import { familyProbeTargets } from "../net.ts";
 import { parseReelMeta, reelView } from "../reel.ts";
-import type { Claim, FleetState, Power, RelaunchAll } from "../protocol.ts";
+import type { Aggregate, Claim, FleetState, Power, RelaunchAll } from "../protocol.ts";
 import { EPOCH, fleet, fleetSplit, snapshotText } from "./fixtures.ts";
 
 function stateWith(st: FleetState, version = 1): ClientState {
@@ -917,8 +917,8 @@ describe("the IPv6 probe's targets", () => {
 });
 
 describe("the family choice covers every stream the page opens", () => {
-  const agg = (v6: string | null, v4: string | null) => ({ id: "agg:example-host", half: "fcvm" as const, host: "example-host", rect: { x: 0, y: 0, w: 0.5, h: 1 }, frame_url: v6, frame_url_v4: v4, tiles: ["fcvm:1", "fcvm:2", "fcvm:3", "fcvm:4"] });
-  const at = (aggregates: ReturnType<typeof agg>[], family: "v6" | "v4") => {
+  const agg = (v6: string | null, v4: string | null): Aggregate => ({ id: "agg:example-host", half: "fcvm", host: "example-host", rect: { x: 0, y: 0, w: 0.5, h: 1 }, frame_url: v6, frame_url_v4: v4, tiles: ["fcvm:1", "fcvm:2", "fcvm:3", "fcvm:4"] });
+  const at = (aggregates: Aggregate[], family: "v6" | "v4") => {
     const s = stateWith(fleet(2, 2, { aggregates }));
     return reduce({ ...s, net: { family, probeMs: family === "v6" ? 180 : 1500 } }, { type: "ui", patch: { mode: "aggregated" } });
   };
@@ -929,6 +929,15 @@ describe("the family choice covers every stream the page opens", () => {
     expect(v.plan.mode).toBe("direct");
     expect(v.plan.direct.length).toBe(8);
     expect(new Set(v.plan.direct.map((d) => new URL(d.url!).hostname))).toEqual(new Set(["example-host-v4"]));
+  });
+
+  it("stays direct when one serving aggregate has no URL in the viewer's family, so no half goes undrawn", () => {
+    const other: Aggregate = { ...agg("ws://example-host:2/frames/agg-ec2", null), id: "agg:ec2", half: "ec2", host: null, rect: { x: 0.5, y: 0, w: 0.5, h: 1 }, tiles: ["ec2:1", "ec2:2", "ec2:3", "ec2:4"] };
+    const v = view(at([agg("ws://example-host:2/frames/agg-a", "ws://example-host-v4:2/frames/agg-a"), other], "v4"), EPOCH);
+    expect(v.plan.mode).toBe("direct");
+    // An aggregate that is not serving yet (no URL in either family, as during a wake) does not count against it.
+    const waking: Aggregate = { ...other, frame_url: null, frame_url_v4: null };
+    expect(view(at([agg("ws://example-host:2/frames/agg-a", "ws://example-host-v4:2/frames/agg-a"), waking], "v4"), EPOCH).plan.mode).toBe("aggregated");
   });
 
   it("streams an aggregate over the viewer's family when it has a URL in it", () => {
