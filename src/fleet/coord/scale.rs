@@ -188,6 +188,9 @@ pub async fn run(cfg: PowerConfig, mut power: watch::Receiver<String>, handle: H
         };
         let mut newly_set = false;
         if set != Some(want) {
+            // A transition that does not finish leaves no target behind, so a wake that
+            // comes before a half-done sleep is retried writes every group again.
+            set = None;
             let mut ok = true;
             if want == 0 {
                 fallbacks.iter_mut().for_each(|f| *f = Fallback::default());

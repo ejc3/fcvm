@@ -1979,6 +1979,71 @@ async fn a_failed_fallback_write_is_retried_and_clears_the_degraded_scale() {
     assert!(!scale_degraded(&s));
 }
 
+/// A sleep whose on-demand write fails after the spot group went to 0, followed by a wake
+/// before the retry, still raises the spot group: a half-done transition is not taken
+/// for the target it was heading to.
+#[tokio::test]
+async fn a_wake_after_a_half_done_sleep_raises_the_spot_group_again() {
+    use fcvm::fleet::coord::scale::FakeScale;
+    let config = Config {
+        power_managed: true,
+        idle_scale_down_secs: 1,
+        ..Config::default()
+    };
+    let fake = Arc::new(FakeScale::default());
+    fake.fail_sets
+        .lock()
+        .unwrap()
+        .push(("fleet-hosts-on-demand".to_string(), 0));
+    let mut power = fallback_power(&fake, Duration::from_secs(120));
+    // No retry before the wake below.
+    power.poll = Duration::from_secs(30);
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        None,
+        None,
+        Some(power),
+        None,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/live", listener.local_addr().unwrap());
+    let cfg = live::LiveConfig {
+        checker: allow_all(),
+        allowed_origins: vec![],
+        verifier: Arc::new(turnstile::Off),
+        trust_cf_connecting_ip: false,
+        turnstile_site_key: None,
+        poster: Arc::new(poster::Poster::default()),
+    };
+    let h = handle.clone();
+    tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
+    let mut v = Viewer::connect(&url).await;
+    v.until(|s| s["viewers"]["active"] == 1).await;
+    v.send(json!({"type": "visibility", "visible": false}))
+        .await;
+    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !fake.fail_sets.lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sleep never tried the on-demand group"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(fake.desired.lock().unwrap()["fleet-hosts"], 0);
+    v.send(json!({"type": "visibility", "visible": true})).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while fake.desired.lock().unwrap()["fleet-hosts"] != 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "spot left at 0 after the wake: {:?}",
+            fake.calls.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// No poster is taken while tiles are starting or a race relaunches them: their regions
 /// would be black. (On a GPU host the first posters of two runs were black frames, taken
 /// mid-race and while the first VMs started.)
