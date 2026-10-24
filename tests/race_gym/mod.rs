@@ -317,7 +317,6 @@ impl<'a> Run<'a> {
             .stdout(log.try_clone()?)
             .stderr(log)
             .kill_on_drop(true);
-            set_pdeathsig(&mut cmd);
             let child =
                 spawn_recorded(&mut cmd).with_context(|| format!("spawning actor {idx}"))?;
             actors.push(Actor {
@@ -793,12 +792,20 @@ pub fn run_owned_lock(lock: &str) -> bool {
         || (lock.starts_with("state/vm-") && lock.ends_with(".json.lock"))
 }
 
+/// Arm `cmd` to be SIGKILLed when the thread that spawns it exits. A gym killed mid-run
+/// runs no destructor, so `kill_on_drop` cannot end its actors or their VMs; this can.
 fn set_pdeathsig(cmd: &mut tokio::process::Command) {
-    // SAFETY: prctl is async-signal-safe; runs in the child between fork and exec.
+    let parent = std::process::id() as i32;
+    // SAFETY: prctl and getppid are async-signal-safe and allocate nothing; this runs in
+    // the child between fork and exec.
     unsafe {
-        cmd.pre_exec(|| {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            // The parent died between fork and prctl: do not start an unsupervised process.
+            if libc::getppid() != parent {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
             }
             Ok(())
         });
@@ -824,8 +831,9 @@ static SPAWNED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
 /// Spawn a process the gym starts itself and record it, under one hold of the registry
 /// lock, so [`orphans`] (which holds the lock for its scan) never sees the process
-/// unrecorded.
+/// unrecorded. The process is armed to die with the gym ([`set_pdeathsig`]).
 pub fn spawn_recorded(cmd: &mut tokio::process::Command) -> std::io::Result<tokio::process::Child> {
+    set_pdeathsig(cmd);
     let mut spawned = SPAWNED.lock().unwrap();
     let child = cmd.spawn()?;
     if let Some(pid) = child.id() {
@@ -923,6 +931,29 @@ pub async fn run(
         feasible,
         elapsed: started.elapsed(),
     })
+}
+
+/// The lock-step discovery run the pair search derives its schedules from. Its traces are
+/// unusable when an actor recorded no hit, or when a control or outcome failure cut an
+/// actor's run short: that is an error. Any other failure (an end-of-run oracle such as a
+/// leak) leaves the traces whole and is returned, to be reported with the schedules'.
+pub fn discovery_findings(discovery: &RunResult) -> Result<Vec<Failure>> {
+    let cut_short: Vec<String> = discovery
+        .failed
+        .iter()
+        .filter(|f| f.oracle == "control" || f.oracle == "outcome")
+        .map(|f| format!("{}: {}", f.oracle, f.detail))
+        .collect();
+    if !cut_short.is_empty() {
+        bail!(
+            "the lock-step discovery run failed before its traces were complete: {}",
+            cut_short.join("; ")
+        );
+    }
+    if discovery.traces.iter().any(|t| t.is_empty()) {
+        bail!("discovery recorded an actor with no hits: the park spec did not reach fcvm");
+    }
+    Ok(discovery.failed.clone())
 }
 
 /// Every pair schedule over two actors' traces, both release orders.

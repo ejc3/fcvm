@@ -107,6 +107,9 @@ An unarmed hit stays one static lookup.
 **Discovery.** One run of the scenario in lock-step (release each actor one step in turn)
 records every actor's trace: the ordered hits it passes. For the cold-run scenario with
 `--gpu` the winner of the generation lock passes 22 hits and the loser 15.
+A discovery failure is reported with the schedules' failures and has its own replay
+(`<scenario>-discovery.json`). A control or outcome failure there, which cuts an actor's
+trace short, ends the gym before any schedule is derived from it.
 
 **Phase 1: every pair of points (depth 2).** A pair schedule is `(a@i, b@j, first)`: run
 lock-step until actor `a` is parked at its `i`-th hit and actor `b` at its `j`-th (an actor

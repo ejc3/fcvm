@@ -10,6 +10,7 @@ pub const HOST_POINTS: &[&str] = &[
     "cache.miss",
     "cache.pre_ack",
     "exec.post_connect_pre_send",
+    "fleet.agent.slot_running",
     "health.pre_persist_healthy",
     "lifecycle.before_ready_claim",
     "restore.locked",

@@ -187,9 +187,16 @@ async fn race_gym() -> Result<()> {
     for (i, t) in discovery.traces.iter().enumerate() {
         println!("RACE-GYM trace a{i} ({} hits): {}", t.len(), t.join(" "));
     }
-    if discovery.traces.iter().any(|t| t.is_empty()) {
-        bail!("discovery recorded an actor with no hits: the park spec did not reach fcvm");
+    // A discovery failure is a finding like a schedule's, with a replay of its own.
+    let discovery_replay = out.join(format!("{}-discovery.json", pair_scenario.name()));
+    if !discovery.failed.is_empty() {
+        write_json(
+            &discovery_replay,
+            &record(pair_scenario.as_ref(), &Schedule::Lockstep, &discovery),
+        )?;
+        println!("RACE-GYM discovery replay: {}", discovery_replay.display());
     }
+    let discovery_failed = race_gym::discovery_findings(&discovery)?;
 
     let first: usize = env_num("RACE_GYM_FIRST", 0)?;
     let (scenario, schedules): (Arc<ColdRun>, Vec<(usize, Schedule)>) = match phase.as_str() {
@@ -339,16 +346,19 @@ async fn race_gym() -> Result<()> {
             "signature": sig, "count": ns.len(), "schedules": ns, "replay": files.get(sig) }))
             .collect::<Vec<_>>(),
         "not_reproduced_alone": unconfirmed,
+        "discovery_failures": discovery_failed.iter().map(Failure::signature).collect::<Vec<_>>(),
+        "discovery_replay": (!discovery_failed.is_empty()).then_some(&discovery_replay),
     });
     write_json(&out.join("summary.json"), &summary)?;
     println!(
         "RACE-GYM summary: {}",
         serde_json::to_string_pretty(&summary)?
     );
-    if !files.is_empty() {
+    if !files.is_empty() || !discovery_failed.is_empty() {
         bail!(
-            "{} distinct failures, each with a replay in {}",
+            "{} distinct failures from the schedules and {} from discovery, each with a replay in {}",
             files.len(),
+            discovery_failed.len(),
             out.display()
         );
     }

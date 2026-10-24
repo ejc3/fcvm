@@ -513,3 +513,79 @@ fn race_gym_only_run_owned_locks_make_a_pair_infeasible() {
         assert!(!race_gym::run_owned_lock(shared), "{shared}");
     }
 }
+
+/// Every process the gym starts is armed to die with the thread that started it, so a gym
+/// that is SIGKILLed mid-run leaves no fcvm (and no VM) behind. `spawn_recorded` arms it for
+/// every caller: the actors and a scenario's own commands, such as cold-run's fresh restore.
+#[test]
+fn race_gym_a_spawned_process_dies_with_its_spawner() {
+    let pid = std::thread::spawn(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut cmd = tokio::process::Command::new("sleep");
+            cmd.arg("1000");
+            let child = race_gym::spawn_recorded(&mut cmd).unwrap();
+            child.id().unwrap()
+        })
+    })
+    .join()
+    .unwrap();
+    // The spawning thread has exited. The kernel's SIGKILL leaves a zombie nobody reaps,
+    // so the pid cannot be reused while this polls.
+    let state = || {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| s.rsplit_once(") ").map(|(_, r)| r.chars().next().unwrap()))
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while matches!(state(), Some(s) if s != 'Z') && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let last = state();
+    if matches!(last, Some(s) if s != 'Z') {
+        // SAFETY: plain kill of the sleep this test started.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        panic!("sleep {pid} outlived the thread that spawned it (state {last:?})");
+    }
+}
+
+/// A discovery run that fails is part of the gym's verdict, not a printed line, and traces
+/// cut short by a failure are not used for the search.
+#[tokio::test]
+async fn race_gym_a_failed_discovery_fails_the_gym() -> Result<()> {
+    let root = scripts_root("discovery");
+    let actors = Scripts(vec![
+        r#"park a.one 0; park a.two 1; exit 3"#,
+        r#"park b.one 0; park b.two 1"#,
+    ]);
+    let limits = Limits {
+        step_deadline: Duration::from_secs(5),
+    };
+    let discovery = race_gym::run(
+        &actors,
+        &ctx(&root, "d"),
+        &limits,
+        Plan::Schedule(&Schedule::Lockstep),
+    )
+    .await?;
+    assert!(
+        discovery.traces.iter().all(|t| !t.is_empty()) && !discovery.failed.is_empty(),
+        "the fixture must fail with every actor traced: traces {:?}, failed {:?}",
+        discovery.traces,
+        discovery.failed
+    );
+    let error = race_gym::discovery_findings(&discovery)
+        .expect_err("a discovery run cut short by a failure was accepted");
+    assert!(format!("{error:#}").contains("exit 3"), "{error:#}");
+
+    // An end-of-run oracle leaves the traces whole: the search goes on, and the failure is
+    // returned to be reported, not dropped.
+    let mut whole = discovery;
+    whole.failed = vec![Failure::new("leak", None, "vm-disks/vm-1 left behind")];
+    assert_eq!(race_gym::discovery_findings(&whole)?, whole.failed);
+    std::fs::remove_dir_all(&root)?;
+    Ok(())
+}
