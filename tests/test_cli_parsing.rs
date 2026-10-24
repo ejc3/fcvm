@@ -216,6 +216,10 @@ fn a_broken_stderr_does_not_change_the_exit_status() {
     let (reader, writer) = std::io::pipe().expect("pipe");
     drop(reader);
     let broken = run(writer.into());
+    assert!(
+        control.success(),
+        "fcvm ls failed with stderr discarded ({control}), so the comparison proves nothing"
+    );
     assert_eq!(
         broken.code(),
         control.code(),
