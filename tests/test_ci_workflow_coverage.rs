@@ -104,6 +104,35 @@ fn main_runs_are_not_cancelled_by_the_next_merge() {
     );
 }
 
+/// Marking a draft ready must start a CI run.
+///
+/// With the default `pull_request` types a ready flip fires no event, so a PR whose
+/// draft runs were cancelled, superseded or never started reached review with no
+/// checks for its head. Listing `ready_for_review` replaces the default set, so the
+/// defaults must be listed alongside it or pushes and reopens would run nothing.
+#[test]
+fn marking_a_draft_ready_starts_ci() {
+    let ci = parse_workflow("ci.yml");
+    let types: Vec<String> = triggers(&ci)
+        .get("pull_request")
+        .and_then(|p| p.get("types"))
+        .and_then(Value::as_sequence)
+        .map(|l| {
+            l.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    for needed in ["opened", "synchronize", "reopened", "ready_for_review"] {
+        assert!(
+            types.iter().any(|t| t == needed),
+            "ci.yml `pull_request` types are {types:?}; `{needed}` is missing, so that \
+             event starts no CI run"
+        );
+    }
+}
+
 #[test]
 fn ci_runs_on_pull_requests_regardless_of_base_branch() {
     let ci = parse_workflow("ci.yml");
