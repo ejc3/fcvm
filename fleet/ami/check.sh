@@ -56,9 +56,22 @@ elif (
 ); then
   no "measure-boot.sh ssm() returns success for an invocation that ended Failed"
 fi
-measure=$(sed -n '/^  ssm ".*G0=/p' fleet/ami/measure-boot.sh)
-grep -q 'set -o pipefail' <<<"$measure" && grep -q '" ||$' <<<"$measure" && grep -qF '{ echo "host: the first GPU VM failed"; exit 1; }' fleet/ami/measure-boot.sh ||
-  no "measure-boot.sh host does not fail when the warm-up fails"
+# The host warm-up command runs on the instance under `sh` (AWS-RunShellScript; dash on
+# Ubuntu, which has no pipefail) and must end with warm.sh's status. Run the command as the
+# instance receives it, under dash, with a stub prlimit standing in for the warm-up.
+raw=$(sed -n 's/^  ssm "\(.*G0=.*\)" ||$/\1/p' fleet/ami/measure-boot.sh)
+stub=$(mktemp -d)
+printf '#!/bin/sh\necho "warm: ok=$WARM_OK"\n[ "$WARM_OK" = 1 ]\n' > "$stub/prlimit"; chmod +x "$stub/prlimit"
+if [ -z "$raw" ] || ! command -v dash >/dev/null; then
+  no "measure-boot.sh host warm-up command not found, or no dash to run it"
+else
+  remote=""; eval "remote=\"$raw\""
+  WARM_OK=1 PATH="$stub:$PATH" dash -c "$remote" >/dev/null 2>&1 || no "measure-boot warm-up command fails under dash for a good warm-up"
+  WARM_OK=0 PATH="$stub:$PATH" dash -c "$remote" >/dev/null 2>&1 && no "measure-boot warm-up command succeeds under dash for a failed warm-up"
+fi
+rm -rf "$stub"
+grep -qF '{ echo "host: the first GPU VM failed"; exit 1; }' fleet/ami/measure-boot.sh ||
+  no "measure-boot.sh host does not stop when the warm-up fails"
 
 [ "$fail" = 0 ] && echo "fleet/ami checks: ok"
 exit "$fail"

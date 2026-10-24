@@ -89,7 +89,9 @@ if [ "$KIND" = host ]; then
   ssm "for u in fcvm-fleet-vfio fcvm-fleet-store; do echo \$u \$(date -d \"\$(systemctl show -p ActiveEnterTimestamp --value \$u.service)\" +%s%3N); done; journalctl -u fcvm-fleet-store -o cat --no-pager | grep 'fcvm-fleet-store:'" | while read -r u t rest; do
     case "$u" in fcvm-fleet-store:) echo "on-instance: $u $t $rest" ;; *) [ -z "$t" ] || echo "$u active $(( t - t0 )) ms after the request" ;; esac
   done
-  ssm "set -o pipefail; G0=\$(ls /sys/bus/pci/drivers/vfio-pci | grep -E '^[0-9a-f]{4}:' | head -1); prlimit --memlock=unlimited:unlimited sudo -u ubuntu -H XDG_RUNTIME_DIR=/run/user/1000 bash -c \"cd /tmp && bash /usr/local/lib/fcvm-fleet/warm.sh \$G0 /tmp/warm.log\" 2>&1 | tail -3 || exit 1; grep -o '\"status\":\"restored\"[^}]*' /tmp/warm.log | head -1 || true" ||
+  # AWS-RunShellScript runs `sh` (dash on Ubuntu: no pipefail), so keep warm.sh's status
+  # by hand and end with it.
+  ssm "G0=\$(ls /sys/bus/pci/drivers/vfio-pci | grep -E '^[0-9a-f]{4}:' | head -1); prlimit --memlock=unlimited:unlimited sudo -u ubuntu -H XDG_RUNTIME_DIR=/run/user/1000 bash -c \"cd /tmp && bash /usr/local/lib/fcvm-fleet/warm.sh \$G0 /tmp/warm.log\" > /tmp/warm.out 2>&1; rc=\$?; tail -3 /tmp/warm.out; grep -o '\"status\":\"restored\"[^}]*' /tmp/warm.log | head -1; exit \$rc" ||
     { echo "host: the first GPU VM failed"; exit 1; }
   t_vm=$(now)
   echo "host: first GPU VM done $((t_vm - t0)) ms after the request (includes SSM round trips)"
