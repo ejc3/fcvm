@@ -2496,3 +2496,70 @@ fn the_staging_access_check_passes_access_and_an_unresolved_host_and_fails_anyth
     let (code, out) = run_access_check("000 curl: (28) Operation timed out", 28);
     assert_eq!(code, 1, "any other curl failure must fail: {out}");
 }
+
+/// The `run:` scripts of a job's steps, in order, with each step's name.
+fn job_steps(workflow: &str, job: &str) -> Vec<(String, String)> {
+    let wf = parse_workflow(workflow);
+    workflow_job(&wf, job)
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .unwrap_or_else(|| panic!("{workflow}: `{job}` has no `steps:`"))
+        .iter()
+        .map(|s| {
+            (
+                s.get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                s.get("run")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The built Worker serves the page before it is trusted: Fleet Web CI and the deploy
+/// both run `scripts/worker-smoke.sh`, which serves `.open-next` with `wrangler dev
+/// --local` and requires GET / to return 200 with the page's title, and the deploy runs
+/// it before `wrangler deploy`.
+///
+/// On 2026-10-24 every request to stage.fcvm.dev failed with error 1101 (OpenNext
+/// 1.20.9 did not inline Next 16.4's preview-props.json). `pnpm cf:build` succeeded and
+/// the deploy's only check, the unauthenticated Access 302, passed in front of a Worker
+/// that threw on every request.
+#[test]
+fn the_built_worker_must_serve_the_page_in_ci_and_before_each_deploy() {
+    let ci = job_steps("ci.yml", "fleet-web");
+    let build = ci
+        .iter()
+        .position(|(_, run)| run.contains("pnpm cf:build"))
+        .expect("Fleet Web does not build the Worker (`pnpm cf:build`)");
+    let smoke = ci
+        .iter()
+        .position(|(_, run)| run.contains("scripts/worker-smoke.sh"))
+        .expect("Fleet Web does not serve the built Worker (`scripts/worker-smoke.sh`)");
+    assert!(
+        build < smoke,
+        "Fleet Web serves the Worker before building it"
+    );
+
+    let deploy = job_steps("fleet-web-deploy.yml", "deploy");
+    let build = deploy
+        .iter()
+        .position(|(_, run)| run.contains("pnpm cf:build"))
+        .expect("the deploy does not build the Worker");
+    let smoke = deploy
+        .iter()
+        .position(|(_, run)| run.contains("scripts/worker-smoke.sh"))
+        .expect("the deploy does not serve the built Worker before shipping it");
+    let ship = deploy
+        .iter()
+        .position(|(_, run)| run.contains("wrangler deploy"))
+        .expect("the deploy job no longer runs `wrangler deploy`");
+    assert!(
+        build < smoke && smoke < ship,
+        "the deploy must build, then serve, then ship the Worker"
+    );
+}
