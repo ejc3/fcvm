@@ -18,7 +18,7 @@ import {
   type PlacedTile,
   type Segment,
 } from "./layout.ts";
-import { frameSocketUrl } from "./net.ts";
+import { FAMILY_PROBE_MS, frameSocketUrl, tileStreamUrl } from "./net.ts";
 import { fitBandwidth, type StreamAsk } from "./bandwidth.ts";
 import { suggestMode } from "./mode.ts";
 import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type FleetState, type Half, type IntentMsg, type Rect, type Tile } from "./protocol.ts";
@@ -208,8 +208,9 @@ function pendingRelaunch(pending: readonly IntentMsg[], t: Tile): boolean {
   return pending.some((i) => (i.name === "relaunch" && i.args["tile"] === t.id) || i.name === "restart_now");
 }
 
+/** Running with a renderer to connect to, over either family (the overlays follow this). */
 function isLive(t: Tile): boolean {
-  return t.phase === "running" && t.frame_url !== null;
+  return t.phase === "running" && (t.frame_url !== null || t.frame_url_v4 !== null);
 }
 
 function glyphFor(t: Tile, phase: string): Glyph {
@@ -476,7 +477,8 @@ export interface PlayView {
   };
   light: { label: string; on: boolean };
   streams: { label: string; on: boolean; note: string; disabled: boolean };
-  stats: { label: string; on: boolean };
+  /** `family`: the stats drawer's line on the address family every tile streams over. */
+  stats: { label: string; on: boolean; family: string };
   verify: { needed: boolean; title: string; text: string; error: string };
   disabled: boolean;
 }
@@ -552,7 +554,7 @@ function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMs
     },
     light: { label: s.ui.lightMode ? "Click the picture to drop it" : "Drop a light", on: s.ui.lightMode },
     streams: { label: "See every VM's own stream", on: direct, note: streamsNote, disabled: !hasAgg },
-    stats: { label: "Show stream stats", on: s.ui.stats },
+    stats: { label: "Show stream stats", on: s.ui.stats, family: familyLine(s.net) },
     verify: {
       needed: ts.sitekey !== null && !ts.verified,
       title: "One check first",
@@ -1358,13 +1360,16 @@ export function wallView(input: WallInput): WallView {
     return { id: t.id, rect: t.rect, height, keep: focused };
   });
   const fitted = fitBandwidth(asks, st.image_aspect, input.budgetBps);
-  const direct: DrawSource[] = st.tiles.filter(isLive).map((t) => {
+  // Every tile streams over the one family the IPv6 probe chose; until it answers, none does.
+  const family = s.net.family;
+  const direct: DrawSource[] = st.tiles.filter((t) => isLive(t) && tileStreamUrl(t, family) !== null).map((t) => {
     const height = fitted.heights.get(t.id) ?? 144;
     const q = fitted.quality.get(t.id) ?? "std";
+    const base = tileStreamUrl(t, family)!;
     return {
       id: `d:${t.id}`,
-      url: frameSocketUrl(t.frame_url!, height, q),
-      baseUrl: t.frame_url,
+      url: frameSocketUrl(base, height, q),
+      baseUrl: base,
       height,
       box: covered ? (opened?.id === t.id ? focus!.placed!.box : null) : placedPlan.get(t.id)?.box ?? null,
     };
@@ -1465,3 +1470,12 @@ export function needsVerify(s: ClientState): boolean {
   return s.turnstile.sitekey !== null && !s.turnstile.verified;
 }
 
+
+/** The stats drawer's line on the address family the tiles stream over. */
+export function familyLine(net: ClientState["net"]): string {
+  if (net.family === null) return "Address family: checking IPv6";
+  if (net.family === "v6") return `Address family: IPv6 for every tile${net.probeMs === null ? "" : ` (connected in ${Math.round(net.probeMs)} ms)`}`;
+  return net.probeMs === null
+    ? "Address family: IPv4 for every tile (the tiles have no IPv6 address)"
+    : `Address family: IPv4 for every tile (IPv6 did not connect within ${(FAMILY_PROBE_MS / 1000).toFixed(1)} s)`;
+}

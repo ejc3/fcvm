@@ -46,3 +46,39 @@ export function posterUrl(liveUrl: string): string | null {
   if (!m) return null;
   return `${m[1]!.toLowerCase() === "wss" ? "https" : "http"}://${m[2]}/poster.jpg`;
 }
+
+/**
+ * The address family a viewer streams every tile over. One family for both halves of the
+ * race, so the fcvm and EC2 tiles are measured over the same kind of path.
+ */
+export type Family = "v6" | "v4";
+
+/**
+ * How long the IPv6 probe waits for a frame socket to open. A working IPv6 connect to a
+ * staging tile measured 177 to 188 ms from a browser (10 of 10, 2026-10-24); a refused
+ * or unreachable one fails sooner or never answers. 1.5 s is about 8x the working time.
+ */
+export const FAMILY_PROBE_MS = 1500;
+
+/** How many tiles the probe tries at once: one tile can be down without IPv6 being down. */
+export const FAMILY_PROBE_TILES = 3;
+
+/** A tile's frame socket base URL in a family: null while the family is unknown or the URL is. */
+export function tileStreamUrl(t: { frame_url: string | null; frame_url_v4: string | null }, family: Family | null): string | null {
+  if (family === null) return null;
+  return family === "v6" ? t.frame_url : t.frame_url_v4;
+}
+
+/**
+ * What the probe opens: the IPv6 URLs of up to FAMILY_PROBE_TILES running tiles. Empty when
+ * no tile has one yet; `v4Only` when tiles have IPv4 URLs and none an IPv6 one, so there is
+ * nothing to probe and IPv4 is the only family.
+ */
+export function familyProbeTargets(tiles: readonly { phase: string; frame_url: string | null; frame_url_v4: string | null }[]): {
+  urls: string[];
+  v4Only: boolean;
+} {
+  const running = tiles.filter((t) => t.phase === "running");
+  const urls = running.flatMap((t) => (t.frame_url === null ? [] : [t.frame_url])).slice(0, FAMILY_PROBE_TILES);
+  return { urls, v4Only: urls.length === 0 && running.some((t) => t.frame_url_v4 !== null) };
+}

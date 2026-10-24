@@ -1151,3 +1151,48 @@ test("phone: the image full width, the two bars, one button, and a hint to turn 
   expect(overflow).toBeLessThanOrEqual(0);
   await ctx.close();
 });
+
+test("one address family for both halves: a viewer with no IPv6 gets IPv4 for every tile; with IPv6, IPv6 for every tile", async ({ page }) => {
+  const byFamily = async () => ((await (await fetch(`${COORD}/mock/render-stats`)).json()) as { subscribersByFamily: Record<string, number> }).subscribersByFamily;
+  const net = () => page.evaluate(() => window.__fleet!.client.getState().net);
+  const hosts = () =>
+    page.evaluate(() => {
+      const byHalf: Record<string, string[]> = {};
+      for (const d of window.__fleet!.view().plan.direct) (byHalf[d.id.split(":")[1]!] ??= []).push(new URL(d.url!).hostname);
+      return byHalf;
+    });
+  await page.addInitScript(() => window.localStorage.setItem("fleet-wall.mode", "direct"));
+
+  await admin("/mock/fault", { ipv6_down: true });
+  try {
+    await page.goto("/?debug=1");
+    await page.waitForFunction(() => window.__fleet?.client.getState().net.family != null, undefined, { timeout: 10_000 });
+    expect((await net()).family).toBe("v4");
+    const v4 = await hosts();
+    expect(Object.keys(v4).sort()).toEqual(["ec2", "fcvm"]);
+    for (const [half, h] of Object.entries(v4)) expect(new Set(h), half).toEqual(new Set(["127.0.0.1"]));
+    await page.evaluate(() => window.__fleet!.client.ui({ drawer: true }));
+    await expect(page.getByTestId("family")).toHaveText("Address family: IPv4 for every tile (IPv6 did not connect within 1.5 s)");
+    const n = v4["fcvm"]!.length + v4["ec2"]!.length;
+    await expect.poll(async () => (await byFamily()).v4 ?? 0, { timeout: 15_000 }).toBe(n);
+    expect((await byFamily()).v6 ?? 0).toBe(0);
+    await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBeGreaterThanOrEqual(n);
+  } finally {
+    await admin("/mock/fault", { ipv6_down: false });
+  }
+
+  // A new page load probes again: IPv6 works now, so every tile goes over it.
+  await page.reload();
+  await page.waitForFunction(() => window.__fleet?.client.getState().net.family != null, undefined, { timeout: 10_000 });
+  const n6 = await net();
+  expect(n6.family).toBe("v6");
+  expect(n6.probeMs).toBeLessThan(1500);
+  const v6 = await hosts();
+  expect(Object.keys(v6).sort()).toEqual(["ec2", "fcvm"]);
+  for (const [half, h] of Object.entries(v6)) expect(new Set(h), half).toEqual(new Set(["localhost"]));
+  await page.evaluate(() => window.__fleet!.client.ui({ drawer: true }));
+  await expect(page.getByTestId("family")).toHaveText(/^Address family: IPv6 for every tile \(connected in \d+ ms\)$/);
+  const m = v6["fcvm"]!.length + v6["ec2"]!.length;
+  await expect.poll(async () => (await byFamily()).v6 ?? 0, { timeout: 15_000 }).toBe(m);
+  await expect.poll(async () => (await byFamily()).v4 ?? 0, { timeout: 15_000 }).toBe(0);
+});

@@ -68,6 +68,7 @@ export async function startMock() {
   const renderers = new MockRenderers({
     port: int("FLEET_MOCK_RENDER_PORT"),
     publicHost: env("FLEET_MOCK_HOST", "localhost"),
+    publicHostV4: env("FLEET_MOCK_HOST_V4", "127.0.0.1"),
     ...(process.env["FLEET_MOCK_PUBLIC_RENDER_PORT"] ? { publicPort: int("FLEET_MOCK_PUBLIC_RENDER_PORT") } : {}),
     fps: fps(),
     threads: int("FLEET_MOCK_THREADS", 12),

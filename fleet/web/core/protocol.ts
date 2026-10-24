@@ -52,8 +52,13 @@ export interface Tile {
   fps: number | null;
   error: string | null;
   failure: Failure | null;
-  /** Null while the tile has no renderer to connect to (waiting for capacity). */
+  /**
+   * The renderer's frame socket over IPv6 (`wss://<label>.<zone>/frames`). Null while the
+   * tile has no renderer to connect to, and until the coordinator has published its DNS.
+   */
   frame_url: string | null;
+  /** The same renderer over IPv4 (`wss://<label>-v4.<zone>[:port]/frames`), null alike. */
+  frame_url_v4: string | null;
   gpu: GpuInfo | null;
   host: string | null;
   last_relaunch: LastRelaunch | null;
@@ -489,6 +494,7 @@ function parseTile(v: unknown, i: number): Tile {
     error: strOrNull(v, "error", where),
     failure: parseFailure(v["failure"], `${where}.failure`),
     frame_url: strOrNull(v, "frame_url", where),
+    frame_url_v4: strOrNull(v, "frame_url_v4", where),
     gpu: parseGpu(v["gpu"], v["gpu_stats"], `${where}.gpu`),
     host: strOrNull(v, "host", where),
     last_relaunch: parseLastRelaunch(v["last_relaunch"], `${where}.last_relaunch`),

@@ -22,6 +22,7 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
           failure: null,
           borrowed: null,
           frame_url: `ws://example-host:1/frames/${half}-${n}`,
+          frame_url_v4: `ws://example-host-v4:1/frames/${half}-${n}`,
           gpu: { name: "NVIDIA T4", temp_c: 61, power_w: 70.4, util_pct: 98 },
           host: half === "fcvm" ? "g4dn.metal · example-region" : "g4dn.xlarge · example-region",
           last_relaunch: {
@@ -85,6 +86,7 @@ export function fleetSplit(nf: number, ne: number, gen: number, over: Partial<Fl
         slot: half === "fcvm" ? `slot-${i + 1}` : `ec2-${i + 1}`,
         rect: { x: x0 + (i * w) / n, y: 0, w: w / n, h: 1 },
         frame_url: `ws://example-host:1/frames/${half}-${i + 1}`,
+        frame_url_v4: `ws://example-host-v4:1/frames/${half}-${i + 1}`,
       });
     }
   }

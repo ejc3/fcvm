@@ -374,6 +374,7 @@ export class MockCoordinator {
         phase: t.phase,
         slot: t.slot,
         frame_url: t.slot ? this.opts.renderers.frameUrl(t.slot) : null,
+        frame_url_v4: t.slot ? this.opts.renderers.frameUrlV4(t.slot) : null,
         gpu: t.gpu,
         host: t.host,
         vm: t.slot ? `fleet-${t.slot}` : null,
@@ -1331,6 +1332,7 @@ export class MockCoordinator {
             this.setGpus(typeof b["fcvm_gpus"] === "number" ? b["fcvm_gpus"] : this.fcvmSlots.length, typeof b["ec2_gpus"] === "number" ? b["ec2_gpus"] : this.ec2Count);
           }
           if (typeof b["renderers_silent"] === "boolean") this.opts.renderers.setSilent(b["renderers_silent"]);
+          if (typeof b["ipv6_down"] === "boolean") this.opts.renderers.setV6Down(b["ipv6_down"]);
           return { ok: true };
         });
         return;
