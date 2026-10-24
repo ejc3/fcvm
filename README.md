@@ -400,7 +400,7 @@ brackets, quoted for the shell. `config.port_mappings[].host_ip` records the add
 - Cloud Hypervisor (only if using `--hypervisor cloud-hypervisor`): build the pinned fork with `fcvm setup --cloud-hypervisor`, or set `FCVM_CLOUD_HYPERVISOR_BIN`, or put `cloud-hypervisor` in PATH (resolved in that order)
 - For rootless: `passt` package (provides `pasta`)
 - For bridged: sudo, iptables, iproute2
-- For routed: sudo, iproute2, host with global IPv6 /64 (ip6tables also needed unless `--ipv6-prefix` is set)
+- For routed: sudo, iproute2, host with global IPv6 /64 (ip6tables also needed unless `--ipv6-prefix` is set), and `net.ipv6.conf.all.forwarding=1` (fcvm refuses routed mode without it)
 - For rootfs build: qemu-utils, e2fsprogs
 
 **Storage:** btrfs at `/mnt/fcvm-btrfs` (auto-created as loopback on non-btrfs hosts)
@@ -424,6 +424,13 @@ sudo sysctl -w vm.unprivileged_userfaultfd=1
 echo "user_allow_other" | sudo tee -a /etc/fuse.conf
 sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0  # Ubuntu 24.04+
 sudo sysctl -w net.ipv4.conf.all.forwarding=1
+# Routed networking. If the kernel itself takes the uplink's IPv6 default route from
+# router advertisements (accept_ra=1), turning forwarding on makes it ignore them and
+# the route expires, so set accept_ra=2 on the uplink first:
+#   sudo sysctl -w net.ipv6.conf.<uplink>.accept_ra=2
+# systemd-networkd handles advertisements itself (the kernel's accept_ra is 0) and keeps
+# its route either way.
+sudo sysctl -w net.ipv6.conf.all.forwarding=1
 
 # For bridged networking only:
 sudo mkdir -p /var/run/netns
