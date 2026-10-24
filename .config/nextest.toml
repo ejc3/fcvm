@@ -52,9 +52,13 @@ max-threads = 1
 [test-groups.hugepage-tests]
 max-threads = 1
 
-# Snapshot tests limited to 3 concurrent (each snapshot is ~5.6GB on disk)
+# Snapshot tests limited to 8 concurrent. Each snapshot takes up to ~5.6GB on disk,
+# so 8 fit in the 60G loopback `fcvm setup` makes on a host without btrfs
+# (paths.btrfs_size). The cap was 3 when that loopback was 20G; at 3 this group was
+# most of a CI suite run (122 tests, 2,112 s of test time, 704 s minimum at 3 wide,
+# in an 860 s run on Host-Root-x64-SnapshotEnabled).
 [test-groups.snapshot-tests]
-max-threads = 3
+max-threads = 8
 
 # Nested (NV2) tests are the heaviest in the suite: each chain is an L1 (4GB) plus an L2 VM,
 # and the L2 boots a 10GB disk copy INSIDE the L1 where there is no reflink. They run only on
@@ -149,7 +153,7 @@ filter = "package(fcvm) & test(/hugepage/)"
 test-group = "hugepage-tests"
 slow-timeout = { period = "600s", terminate-after = 1 }
 
-# Snapshot tests: limited to 3 concurrent (each creates ~5.6GB snapshot on disk)
+# Snapshot tests: limited to 8 concurrent (see test-groups.snapshot-tests)
 [[profile.default.overrides]]
 filter = "package(fcvm) & (test(/snapshot/) | test(/clone/))"
 test-group = "snapshot-tests"

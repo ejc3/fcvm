@@ -639,6 +639,8 @@ pub struct RunArgs {
     /// Create disk image from directory: HOST_DIR:GUEST_MOUNT[:ro]
     /// Creates an ext4 image from HOST_DIR contents and mounts at GUEST_MOUNT.
     /// Image is stored in VM's data directory and cleaned up on exit.
+    /// The snapshot cache is keyed on a read-only HOST_DIR's content, so a changed
+    /// directory never restores an older image.
     /// Example: --disk-dir ./mydata:/data:ro
     #[arg(long, action = clap::ArgAction::Append)]
     pub disk_dir: Vec<String>,
@@ -894,6 +896,12 @@ pub struct RunArgs {
     /// snapshot metadata; `pmem` then holds exactly these devices' specs.
     #[arg(skip)]
     pub pmem_devices: Vec<crate::state::types::PmemDevice>,
+
+    /// Internal (not a CLI flag): what `disk` and `disk_dir` resolved to for the
+    /// snapshot key, set once by podman run before it computes the key. A read-only
+    /// `--disk-dir` is built from the private copy named here, not from HOST_DIR.
+    #[arg(skip)]
+    pub resolved_extra_disks: Option<crate::storage::disk_dir::ResolvedExtraDisks>,
 }
 
 // ============================================================================

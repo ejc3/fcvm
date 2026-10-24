@@ -193,3 +193,36 @@ fn an_unknown_firecracker_log_level_stops_the_command_before_it_starts() {
         "{stderr}"
     );
 }
+
+/// fcvm logs to stderr. When whoever reads it has gone (a fleet agent that died, a pipe
+/// whose reader exited) the write fails, and tracing-subscriber reported that with
+/// `eprintln!`, which panics on the same broken stderr: fcvm exited 101 from the first log
+/// line after the reader went. A VM's teardown logs, so a SIGTERMed `podman run` died
+/// halfway and left a routed VM's namespace, veth and host route behind. A broken stderr
+/// must change nothing about what fcvm does.
+#[test]
+fn a_broken_stderr_does_not_change_the_exit_status() {
+    let fcvm_path = common::find_fcvm_binary().expect("fcvm binary not found");
+    let run = |stderr: std::process::Stdio| {
+        Command::new(&fcvm_path)
+            .arg("ls")
+            .env("RUST_LOG", "debug")
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr)
+            .status()
+            .expect("failed to run fcvm")
+    };
+    let control = run(std::process::Stdio::null());
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let broken = run(writer.into());
+    assert!(
+        control.success(),
+        "fcvm ls failed with stderr discarded ({control}), so the comparison proves nothing"
+    );
+    assert_eq!(
+        broken.code(),
+        control.code(),
+        "fcvm ls exited {broken} with a broken stderr and {control} with stderr discarded"
+    );
+}

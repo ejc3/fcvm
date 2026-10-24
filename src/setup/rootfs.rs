@@ -2689,6 +2689,36 @@ branch = "agent/nv2"
         assert!(error.to_string().contains("commit"), "{error}");
     }
 
+    /// A profile on the PCI transport keeps the guest's NIC named eth0: virtio-net is a
+    /// PCI device there and udev would rename it, and fc-agent and fcvm configure eth0
+    /// (a routed guest restored on the gpu profile came up with no global IPv6 at all).
+    #[test]
+    fn every_pci_transport_profile_keeps_the_guest_nic_eth0() {
+        let plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        let mut pci = 0;
+        for (name, arches) in &plan.kernel_profiles {
+            for (arch, profile) in arches {
+                let on_pci = profile
+                    .firecracker_args
+                    .as_deref()
+                    .is_some_and(|a| a.split_whitespace().any(|w| w == "--enable-pci"));
+                if !on_pci {
+                    continue;
+                }
+                pci += 1;
+                let args = profile.boot_args.as_deref().unwrap_or("");
+                assert!(
+                    args.split_whitespace().any(|w| w == "net.ifnames=0"),
+                    "kernel_profiles.{name}.{arch} is on the PCI transport without net.ifnames=0 in boot_args ({args:?})"
+                );
+            }
+        }
+        assert!(
+            pci > 0,
+            "no profile on the PCI transport: the check saw nothing"
+        );
+    }
+
     /// Every Firecracker the embedded config builds is pinned, so setup keeps a
     /// built binary without the network and launch resolves it offline.
     #[test]

@@ -202,6 +202,9 @@ so nothing is built or booted twice when it doesn't have to be.
   Fragmenting the key silently kills sharing between behaviorally identical artifacts.
 - Before adding an opt-out or a key ingredient, ask: can the restore path absorb this
   difference? If yes, that is the fix.
+- **A key names content, not a path, where the snapshot keeps its own copy.** A read-only
+  `--disk-dir` is keyed on its tree's hash, taken in place so a hit copies nothing; a cold
+  boot builds the image from a private copy with that hash (`src/storage/disk_dir.rs`).
 
 ## VERIFY PLAN AND RUN NEW TESTS LOCALLY
 
@@ -2914,8 +2917,9 @@ with the granule.
   paging. It never fails a clone. A vCPU that faults inside the granule meanwhile is woken by
   the populate itself, because `UFFDIO_COPY` wakes every sleeper in the range it installs.
   It stands down in three cases. While any fault is parked it serves demanded pages only: a
-  parked fault is retried between batches and fails the clone if it is still refused after
-  2 s, so nothing optional may lengthen a batch. After a demand copy that found its page
+  parked fault is retried between batches and fails the clone if it is still refused 2 s
+  after it was parked or after the last REMOVE event read, so nothing optional may lengthen a
+  batch. After a demand copy that found its page
   already present it populates nothing, because another populator owns that range. After a
   fault on a page the clone's balloon gave back, which is answered with zeros, it
   populates nothing either. A fault on a hole in the memory file is answered with zeros

@@ -50,6 +50,12 @@ pub struct Plan {
     pub subuid_start: Option<u64>,
     #[serde(default)]
     pub subuid_count: Option<u64>,
+    /// Host user's subordinate GID range (from /etc/subgid), which rootless podman on
+    /// the host wrote a store's group ids with. It can differ from the UID range.
+    #[serde(default)]
+    pub subgid_start: Option<u64>,
+    #[serde(default)]
+    pub subgid_count: Option<u64>,
     /// Use non-blocking output: drop container stdout/stderr when the output
     /// channel is full instead of blocking. Prevents backpressure from
     /// deadlocking FUSE-based services in the container.

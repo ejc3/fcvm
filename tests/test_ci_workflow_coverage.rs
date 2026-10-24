@@ -223,6 +223,62 @@ fn a_path_excluded_from_the_matrix_still_gets_a_check() {
     );
 }
 
+/// fleet/web changes run the fleet web suite, and it gates `Summary`.
+///
+/// fleet/web is TypeScript the VM matrix never builds. Without its own arm in
+/// `changes` a page-only PR either ran the whole matrix and nothing that reads
+/// the page, or (had it been classified as docs) nothing at all.
+#[test]
+fn fleet_web_changes_run_the_fleet_web_job() {
+    let ci = parse_workflow("ci.yml");
+    let text = std::fs::read_to_string(workflow_path("ci.yml")).expect("ci.yml must be readable");
+    let web_arm = text
+        .find("fleet/web/*) web=true")
+        .expect("`changes` does not route fleet/web/* to `web`");
+    let docs_arm = text
+        .find("docs/*|*.md) ;;")
+        .expect("`changes` lost its docs arm");
+    assert!(
+        web_arm < docs_arm,
+        "the fleet/web arm must come before the docs arm, or fleet/web/README.md is a doc"
+    );
+
+    let jobs = ci.get("jobs").expect("ci.yml has no jobs");
+    let job = jobs
+        .get("fleet-web")
+        .expect("ci.yml routes fleet/web to `web` but has no `fleet-web` job");
+    let condition = job
+        .get("if")
+        .and_then(Value::as_str)
+        .expect("`fleet-web` has no `if:`");
+    assert!(
+        condition.contains("needs.changes.outputs.web == 'true'"),
+        "`fleet-web` does not gate on `changes.outputs.web` ({condition:?})"
+    );
+    let summary_needs = jobs
+        .get("summary")
+        .and_then(|s| s.get("needs"))
+        .and_then(Value::as_sequence)
+        .map(|l| l.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    assert!(
+        summary_needs.contains(&"fleet-web"),
+        "`summary` does not depend on `fleet-web`, so a failing page suite would not fail it"
+    );
+    // A change to ci.yml can break the fleet-web job itself, so it runs it.
+    assert!(
+        text.contains(".github/workflows/ci.yml) code=true; web=true"),
+        "a ci.yml-only change does not run `fleet-web`, so a broken fleet-web job merges green"
+    );
+    // Every fail-open branch opens the web gate too.
+    assert_eq!(
+        text.matches("echo \"web=true\" >> \"$GITHUB_OUTPUT\"")
+            .count(),
+        2,
+        "a fail-open branch of `changes` leaves `web` unset"
+    );
+}
+
 #[test]
 fn gating_jobs_live_in_the_pull_request_workflow() {
     let ci = parse_workflow("ci.yml");

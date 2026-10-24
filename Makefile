@@ -266,7 +266,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	_test-unit _test-agent-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
-	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu gpu-residue-test setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
+	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu gpu-residue-test gpu-routed-test setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-computesdk bench-gpu-restore bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
 	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-chromium-corpus-extra bench-stop \
@@ -317,6 +317,7 @@ help:
 	@echo "  setup-fcvm         Download kernel and create rootfs"
 	@echo "  setup-gpu          Build the gpu profile kernel and NVIDIA driver image"
 	@echo "  gpu-residue-test   GPU memory residue between VMs (GPU=<pci address>)"
+	@echo "  gpu-routed-test    A routed GPU VM and its restore hold their IPv6 address (GPU=<pci address>)"
 	@echo "  setup-passt        Build and install the pinned upstream pasta/passt"
 	@echo "  setup-pjdfstest    Build pjdfstest"
 	@echo "  setup-lint-tools   Install cargo-audit and cargo-deny"
@@ -859,6 +860,14 @@ setup-fcvm: setup-default
 setup-gpu: private SHELL := $(TARGET_LEASE_SHELL)
 setup-gpu: build setup-btrfs
 	./target/release/fcvm setup --kernel-profile gpu --build-kernels --config "$(CURDIR)/rootfs-config.toml"
+
+# A routed GPU VM, and one restored from its snapshot at another address, hold the
+# --ipv6-address they were given on eth0 and reach the internet over IPv6
+# (scripts/gpu-routed/run.sh). Needs root, a GPU on vfio-pci and a routable prefix.
+gpu-routed-test: private SHELL := $(TARGET_LEASE_SHELL)
+gpu-routed-test: $(if $(strip $(GPU)),setup-gpu)
+	@test -n "$(GPU)" || { echo "usage: make gpu-routed-test GPU=<pci address>" >&2; exit 2; }
+	sudo -E FCVM=./target/release/fcvm ./scripts/gpu-routed/run.sh "$(GPU)"
 
 # Cross-tenant GPU memory residue (scripts/gpu-residue/run.sh): one VM fills a
 # GPU's memory with a marker and ends, the next VM on that GPU counts the marker

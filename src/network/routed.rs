@@ -27,6 +27,10 @@ const HOST_LOOPBACK_ALIAS: &str = "10.0.2.2";
 /// Bridge device name
 const BRIDGE_DEVICE: &str = "br0";
 
+/// The host's IPv6 forwarding switch, which routed mode requires (see
+/// `RoutedNetwork::require_ipv6_forwarding`).
+const ALL_IPV6_FORWARDING: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
+
 /// Where routed VMs hold their IPv6 addresses ([`AddressLease`]). Under /run, so the
 /// scope matches the host route table the addresses are routed in: one per kernel,
 /// shared by every fcvm data directory on it, and empty after a reboot.
@@ -510,6 +514,8 @@ impl RoutedNetwork {
             );
         }
 
+        Self::require_ipv6_forwarding(std::path::Path::new(ALL_IPV6_FORWARDING))?;
+
         if let Some(ref prefix) = self.ipv6_prefix {
             Self::parse_ipv6_prefix(prefix)?;
             return Ok(()); // Explicit prefix — no auto-detect or ip6tables needed
@@ -537,6 +543,27 @@ impl RoutedNetwork {
             );
         }
 
+        Ok(())
+    }
+
+    /// Refuse a host whose kernel does not forward IPv6. Every packet between a routed
+    /// VM and the outside is forwarded by the host (veth to uplink and back), and the
+    /// kernel forwards IPv6 only with `net.ipv6.conf.all.forwarding=1`: the per-device
+    /// switch fcvm sets on its veth does not do it. Without it the guest holds its
+    /// address and reaches nothing, with no error anywhere.
+    fn require_ipv6_forwarding(path: &std::path::Path) -> Result<()> {
+        let value =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        if value.trim() != "1" {
+            anyhow::bail!(
+                "routed networking needs the host to forward IPv6, and {} is {}.\n\
+                 Set net.ipv6.conf.all.forwarding=1 (in /etc/sysctl.d/ to keep it), and \
+                 accept_ra=2 on the uplink if its default route comes from router \
+                 advertisements the kernel processes.",
+                path.display(),
+                value.trim()
+            );
+        }
         Ok(())
     }
 
@@ -927,17 +954,8 @@ impl NetworkManager for RoutedNetwork {
         // Verify host routing is set up correctly. These sysctls are the user's
         // responsibility (host sysctl configuration), not fcvm's — but warn
         // loudly if they're wrong because IPv6 egress silently fails without them.
+        // Forwarding itself is refused in preflight_check.
         if self.ipv6_prefix.is_none() {
-            if let Ok(val) =
-                tokio::fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding").await
-            {
-                if val.trim() != "1" {
-                    warn!(
-                        "net.ipv6.conf.all.forwarding={} (need 1) — fix host sysctls",
-                        val.trim()
-                    );
-                }
-            }
             if let Ok(val) = tokio::fs::read_to_string(format!(
                 "/proc/sys/net/ipv6/conf/{}/accept_ra",
                 default_iface
@@ -1562,6 +1580,34 @@ mod tests {
 
     const NET_2600: u128 = 0x2600_1f1c_0494_0201 << 64;
     const NET_2803: u128 = 0x2803_6084_7058_46f6 << 64;
+
+    #[test]
+    fn routed_networking_refuses_a_host_that_does_not_forward_ipv6() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forwarding");
+        std::fs::write(&path, "0\n").unwrap();
+        let err = RoutedNetwork::require_ipv6_forwarding(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("net.ipv6.conf.all.forwarding=1"),
+            "the refusal names the sysctl to set: {err:#}"
+        );
+        std::fs::write(&path, "1\n").unwrap();
+        RoutedNetwork::require_ipv6_forwarding(&path).unwrap();
+        assert!(RoutedNetwork::require_ipv6_forwarding(&dir.path().join("absent")).is_err());
+
+        // The check runs with --ipv6-prefix too: the prefix path returns early, and
+        // the host forwards a prefix VM's packets exactly as it forwards any other's.
+        let source = include_str!("routed.rs");
+        let body = &source[source.find("pub fn preflight_check").unwrap()..];
+        let check = body.find("Self::require_ipv6_forwarding(").unwrap();
+        let prefix_return = body
+            .find("if let Some(ref prefix) = self.ipv6_prefix")
+            .unwrap();
+        assert!(
+            check < prefix_return,
+            "preflight checks forwarding before the --ipv6-prefix return"
+        );
+    }
 
     #[test]
     fn a_loopback_address_is_needed_only_by_a_mapping_without_a_host_address() {

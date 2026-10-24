@@ -339,9 +339,34 @@ pub async fn run() -> Result<()> {
                 .subuid_start
                 .zip(plan.subuid_count)
                 .or_else(|| plan.subuid_start.map(|s| (s, 65536)));
-            let (username, _uid, runtime_dir) =
-                container::create_vm_user(user_spec, desired_name, subuid_range, provisioned);
-            Some((username, runtime_dir))
+            let subgid_range = plan
+                .subgid_start
+                .zip(plan.subgid_count)
+                .or_else(|| plan.subgid_start.map(|s| (s, 65536)));
+            let (username, _uid, runtime_dir) = container::create_vm_user(
+                user_spec,
+                desired_name,
+                subuid_range,
+                subgid_range,
+                provisioned,
+            );
+            let gid: u32 = user_spec
+                .split(':')
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100);
+            let (sub_start, sub_count) = container::resolve_subuid_range(subuid_range);
+            let (sub_gid_start, sub_gid_count) =
+                container::resolve_subgid_range(subgid_range, subuid_range);
+            let store_user = container::StoreUser {
+                uid,
+                gid,
+                sub_start,
+                sub_count,
+                sub_gid_start,
+                sub_gid_count,
+            };
+            Some((username, runtime_dir, store_user))
         }
     } else {
         None
@@ -349,7 +374,7 @@ pub async fn run() -> Result<()> {
 
     // Build the command prefix for running commands as the target user
     let cmd_prefix: Vec<String> = match &user_info {
-        Some((username, runtime_dir)) => container::run_as_user_prefix(username, runtime_dir),
+        Some((username, runtime_dir, _)) => container::run_as_user_prefix(username, runtime_dir),
         None => vec![],
     };
 
@@ -394,8 +419,15 @@ pub async fn run() -> Result<()> {
     let image_ref = if provisioned {
         if let (Some("overlay"), Some(device)) = (plan.image_mode.as_deref(), &plan.image_device) {
             eprintln!("[fc-agent] re-mounting overlay image store (provisioned re-boot)");
-            let username = user_info.as_ref().map(|(name, _)| name.as_str());
-            container::mount_overlay_image(device, &plan.image, username, &mut mount_record)?
+            let username = user_info.as_ref().map(|(name, _, _)| name.as_str());
+            let store_user = user_info.as_ref().map(|(_, _, store_user)| *store_user);
+            container::mount_overlay_image(
+                device,
+                &plan.image,
+                username,
+                store_user,
+                &mut mount_record,
+            )?
         } else {
             eprintln!("[fc-agent] skipping image import (clone — image already in storage)");
             plan.image.clone()
@@ -403,8 +435,15 @@ pub async fn run() -> Result<()> {
     } else {
         let image_ref = match (plan.image_mode.as_deref(), &plan.image_device) {
             (Some("overlay"), Some(device)) => {
-                let username = user_info.as_ref().map(|(name, _)| name.as_str());
-                container::mount_overlay_image(device, &plan.image, username, &mut mount_record)?
+                let username = user_info.as_ref().map(|(name, _, _)| name.as_str());
+                let store_user = user_info.as_ref().map(|(_, _, store_user)| *store_user);
+                container::mount_overlay_image(
+                    device,
+                    &plan.image,
+                    username,
+                    store_user,
+                    &mut mount_record,
+                )?
             }
             (Some("btrfs"), Some(device)) => {
                 // Btrfs loopback was created in Phase 1 (setup_btrfs_storage_if_available).
@@ -609,7 +648,7 @@ pub async fn run() -> Result<()> {
     // captured writable layer) instead of `podman run`-ing a fresh one.
     let user_ref = user_info
         .as_ref()
-        .map(|(username, runtime_dir)| (username.as_str(), runtime_dir.as_str()));
+        .map(|(username, runtime_dir, _)| (username.as_str(), runtime_dir.as_str()));
     // Taken before the args: an attach still loading the driver finishes first, and
     // from here a GPU attached by a later restore cannot reach this container.
     let gpu_devices = crate::gpu::launch_devices().await;
@@ -659,7 +698,12 @@ pub async fn run() -> Result<()> {
     mounts::unmount_paths(&mounted_pmem_paths, "pmem device");
     mounts::unmount_disks(&mounted_disk_paths);
     if let Some("overlay") = plan.image_mode.as_deref() {
-        mounts::unmount_paths(&["/mnt/image-store".to_string()], "image store");
+        // A run with a user binds the store over its device, and the bind comes off first.
+        let mut store_paths = vec![container::IMAGE_STORE_PATH.to_string()];
+        if user_info.is_some() {
+            store_paths.push(container::IMAGE_STORE_RAW_PATH.to_string());
+        }
+        mounts::unmount_paths(&store_paths, "image store");
     }
 
     // Let chronyd setup finish before the VM goes away, so it cannot be killed

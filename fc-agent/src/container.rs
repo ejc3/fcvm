@@ -11,40 +11,148 @@ use crate::output::OutputHandle;
 use crate::types::Plan;
 use crate::vsock;
 
+/// Where podman finds the overlay image store.
+pub const IMAGE_STORE_PATH: &str = "/mnt/image-store";
+/// Where the store's device is mounted for a run with a user, under the bind mount at
+/// [`IMAGE_STORE_PATH`]. It is in /run, a tmpfs, so no map of the guest's /mnt can make
+/// its mount point impossible to create.
+pub const IMAGE_STORE_RAW_PATH: &str = "/run/fcvm-image-store-raw";
+
+/// The container user's ids, which the overlay store is shown with. Rootless podman
+/// keeps its storage with container uid and gid 0 as the user's own ids, and container
+/// ids 1 to `sub_count` as the user's subordinate ids from `sub_start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreUser {
+    pub uid: u32,
+    pub gid: u32,
+    pub sub_start: u64,
+    pub sub_count: u64,
+    pub sub_gid_start: u64,
+    pub sub_gid_count: u64,
+}
+
+/// Who a store's files belong to on disk: the ids container uid and gid 0 were written
+/// as, and where container uids and gids 1 and up begin. Root podman on the host writes
+/// the container ids themselves (0, 0, 1, 1). Rootless podman on the host writes its
+/// builder's uid and gid, and its subordinate ids from the subuid and subgid starts the
+/// host passes in the plan, which are also the container user's ranges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StoreOwner {
+    uid: u32,
+    gid: u32,
+    sub_start: u64,
+    sub_gid_start: u64,
+}
+
+impl StoreOwner {
+    /// The owner a store has, from who owns its `overlay-images` directory.
+    fn of(meta: &std::fs::Metadata, user: &StoreUser) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        let root_built = meta.uid() == 0;
+        Self {
+            uid: meta.uid(),
+            gid: meta.gid(),
+            sub_start: if root_built { 1 } else { user.sub_start },
+            sub_gid_start: if root_built { 1 } else { user.sub_gid_start },
+        }
+    }
+}
+
+impl StoreUser {
+    /// The `X-mount.idmap` option (util-linux 2.39) that shows a store `owner` wrote as
+    /// this user's, or None when the store already holds this user's ids.
+    fn idmap_option(&self, owner: StoreOwner) -> Option<String> {
+        if owner.uid == self.uid
+            && owner.gid == self.gid
+            && owner.sub_start == self.sub_start
+            && owner.sub_gid_start == self.sub_gid_start
+        {
+            return None;
+        }
+        Some(format!(
+            "X-mount.idmap=u:{ou}:{uid}:1 u:{os}:{sub}:{n} g:{og}:{gid}:1 g:{ogs}:{subg}:{ng}",
+            ou = owner.uid,
+            og = owner.gid,
+            os = owner.sub_start,
+            ogs = owner.sub_gid_start,
+            uid = self.uid,
+            gid = self.gid,
+            sub = self.sub_start,
+            n = self.sub_count,
+            subg = self.sub_gid_start,
+            ng = self.sub_gid_count
+        ))
+    }
+}
+
 /// Mount a pre-built overlay storage image and configure as additionalImageStore.
 ///
 /// The storage image is an ext4 filesystem containing a podman overlay storage tree
 /// (overlay/, overlay-images/, overlay-layers/). It is mounted read-only and podman
-/// finds the image there without needing `podman load`. The mount goes into `record`.
+/// finds the image there without needing `podman load`. The mounts go into `record`.
+///
+/// With a user, the device is mounted at [`IMAGE_STORE_RAW_PATH`] and bound at
+/// [`IMAGE_STORE_PATH`] through an id-mapped mount that shows the store's files as
+/// `store_user`'s, the ownership rootless podman's own `podman load` would have given
+/// them. That covers a store root podman built and one rootless podman built as another
+/// uid; a store that already holds the user's ids is bound as it is.
 pub fn mount_overlay_image(
     device: &str,
     image_name: &str,
     username: Option<&str>,
+    store_user: Option<StoreUser>,
     record: &mut crate::mounts::MountRecord,
 ) -> Result<String> {
     eprintln!("[fc-agent] mounting overlay storage image: {}", device);
 
-    let mount_path = "/mnt/image-store";
+    let mount_path = IMAGE_STORE_PATH;
     std::fs::create_dir_all(mount_path).context("creating image store mount point")?;
 
     wait_for_device(device)?;
 
-    // Mount read-only
+    let device_path = if store_user.is_some() {
+        std::fs::create_dir_all(IMAGE_STORE_RAW_PATH)
+            .context("creating the raw image store mount point")?;
+        IMAGE_STORE_RAW_PATH
+    } else {
+        mount_path
+    };
     let output = std::process::Command::new("mount")
-        .args(["-o", "ro", device, mount_path])
+        .args(["-o", "ro", device, device_path])
         .output()
-        .context("mounting storage image")?;
+        .context("running mount for the overlay storage image")?;
+    mount_succeeded(&output)
+        .with_context(|| format!("mounting overlay storage image {device} at {device_path}"))?;
+    record.record(format!("image store {device}"), device_path)?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "Failed to mount overlay storage image {} at {}: {}",
-            device,
-            mount_path,
-            stderr
+    if let Some(user) = store_user {
+        let meta = std::fs::metadata(format!("{IMAGE_STORE_RAW_PATH}/overlay-images"))
+            .context("reading who owns the overlay storage image")?;
+        let owner = StoreOwner::of(&meta, &user);
+        let idmap = user.idmap_option(owner);
+        let options = match &idmap {
+            Some(idmap) => format!("ro,{idmap}"),
+            None => "ro".to_string(),
+        };
+        let output = std::process::Command::new("mount")
+            .args(["--bind", "-o", &options, IMAGE_STORE_RAW_PATH, mount_path])
+            .output()
+            .context("running mount for the image store bind")?;
+        mount_succeeded(&output).with_context(|| {
+            format!("binding the image store at {mount_path} with options {options}")
+        })?;
+        record.record(format!("image store bind of {device}"), mount_path)?;
+        eprintln!(
+            "[fc-agent] image store owned by uid {} on disk, {} for uid {}",
+            owner.uid,
+            if idmap.is_some() {
+                "shown through an id-mapped mount"
+            } else {
+                "bound as it is"
+            },
+            user.uid
         );
     }
-    record.record(format!("image store {device}"), mount_path)?;
 
     // Configure podman to use this as an additional image store.
     let (conf_path, runroot, graphroot) = storage_paths(username);
@@ -119,6 +227,14 @@ pub fn mount_overlay_image(
 
     // Fallback: return expected name (downstream will fail with clear error if wrong)
     Ok(image_name.to_string())
+}
+
+/// Whether a mount(8) run succeeded; a failure carries its stderr.
+fn mount_succeeded(output: &std::process::Output) -> Result<()> {
+    if !output.status.success() {
+        anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(())
 }
 
 /// Wait for a block device to appear (up to 5 seconds).
@@ -1479,6 +1595,22 @@ pub fn build_podman_args(
     args
 }
 
+/// The VM user's subordinate id range: the host's from /etc/subuid when the plan
+/// carries it (a store built by rootless podman on the host holds those ids),
+/// otherwise a default range.
+pub fn resolve_subuid_range(subuid_range: Option<(u64, u64)>) -> (u64, u64) {
+    subuid_range.unwrap_or((100000, 65536))
+}
+
+/// The VM user's subordinate gid range: the host's from /etc/subgid when the plan
+/// carries it, which can differ from its uid range, otherwise the uid range.
+pub fn resolve_subgid_range(
+    subgid_range: Option<(u64, u64)>,
+    subuid_range: Option<(u64, u64)>,
+) -> (u64, u64) {
+    subgid_range.unwrap_or_else(|| resolve_subuid_range(subuid_range))
+}
+
 /// Create the VM user and set up rootless podman prerequisites.
 /// Call this BEFORE importing images so podman load runs as the target user.
 /// Returns (username, uid, runtime_dir) for use by run_as_user_prefix().
@@ -1492,6 +1624,7 @@ pub fn create_vm_user(
     user_spec: &str,
     desired_name: &str,
     subuid_range: Option<(u64, u64)>,
+    subgid_range: Option<(u64, u64)>,
     provisioned: bool,
 ) -> (String, String, String) {
     let parts: Vec<&str> = user_spec.split(':').collect();
@@ -1511,16 +1644,20 @@ pub fn create_vm_user(
         .args(["-u", &uid, "-g", &gid, "-m", "-s", "/bin/sh", &username])
         .output();
 
-    // Use host's subuid range if provided (matches storage image UIDs),
-    // otherwise fall back to a default range.
-    let (subuid_start, subuid_count) = subuid_range.unwrap_or((100000, 65536));
-    let subuid_entry = format!("{}:{}:{}\n", username, subuid_start, subuid_count);
+    let (subuid_start, subuid_count) = resolve_subuid_range(subuid_range);
+    let (subgid_start, subgid_count) = resolve_subgid_range(subgid_range, subuid_range);
     eprintln!(
-        "[fc-agent] subuid/subgid: {}:{}",
-        subuid_start, subuid_count
+        "[fc-agent] subuid {}:{}, subgid {}:{}",
+        subuid_start, subuid_count, subgid_start, subgid_count
     );
-    let _ = std::fs::write("/etc/subuid", &subuid_entry);
-    let _ = std::fs::write("/etc/subgid", &subuid_entry);
+    let _ = std::fs::write(
+        "/etc/subuid",
+        format!("{username}:{subuid_start}:{subuid_count}\n"),
+    );
+    let _ = std::fs::write(
+        "/etc/subgid",
+        format!("{username}:{subgid_start}:{subgid_count}\n"),
+    );
 
     let runtime_dir = format!("/run/user/{}", uid);
     let _ = std::fs::create_dir_all(&runtime_dir);
@@ -1937,6 +2074,69 @@ pub async fn run_async(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A store's owner shows as the user and its subordinate ids as the user's,
+    /// the mapping rootless podman stores with: root podman wrote container ids
+    /// (0, and 1 up), rootless podman on the host wrote its builder's uid and the
+    /// host's subuid range, and a store holding the user's ids needs no mapping.
+    #[test]
+    fn store_user_maps_the_store_owner_to_the_user_and_its_range_to_the_users() {
+        let user = StoreUser {
+            uid: 1001,
+            gid: 100,
+            sub_start: 100000,
+            sub_count: 65536,
+            sub_gid_start: 200000,
+            sub_gid_count: 65536,
+        };
+        let root_built = StoreOwner {
+            uid: 0,
+            gid: 0,
+            sub_start: 1,
+            sub_gid_start: 1,
+        };
+        assert_eq!(
+            user.idmap_option(root_built).as_deref(),
+            Some("X-mount.idmap=u:0:1001:1 u:1:100000:65536 g:0:100:1 g:1:200000:65536")
+        );
+        // Rootless podman as another uid wrote the host's ranges, which are also the
+        // user's, so only the owner moves; the gid range stays the gid range.
+        let built_by_another_uid = StoreOwner {
+            uid: 2000,
+            gid: 100,
+            sub_start: 100000,
+            sub_gid_start: 200000,
+        };
+        assert_eq!(
+            user.idmap_option(built_by_another_uid).as_deref(),
+            Some("X-mount.idmap=u:2000:1001:1 u:100000:100000:65536 g:100:100:1 g:200000:200000:65536")
+        );
+        let built_by_the_user = StoreOwner {
+            uid: 1001,
+            gid: 100,
+            sub_start: 100000,
+            sub_gid_start: 200000,
+        };
+        assert_eq!(user.idmap_option(built_by_the_user), None);
+    }
+
+    /// The guest's /etc/subgid takes the host's gid range when the plan carries one,
+    /// so a rootless-built store's group ids are the user's; without one it is the uid
+    /// range, as before.
+    #[test]
+    fn the_subgid_range_is_the_hosts_and_falls_back_to_the_subuid_range() {
+        assert_eq!(
+            resolve_subgid_range(Some((200000, 65536)), Some((100000, 65536))),
+            (200000, 65536)
+        );
+        assert_eq!(
+            resolve_subgid_range(None, Some((100000, 65536))),
+            (100000, 65536)
+        );
+        assert_eq!(resolve_subgid_range(None, None), (100000, 65536));
+    }
+
     use super::{consume_cache_wait_lines, run_cache_handshake, CacheResult, StatusConnector};
 
     /// An attached GPU reaches the container as a CDI device, before the image

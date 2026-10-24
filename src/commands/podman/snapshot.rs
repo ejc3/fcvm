@@ -399,12 +399,7 @@ pub(super) fn build_firecracker_config(
 
     let port_mappings = crate::network::PortMapping::parse_all_lenient(&args.publish);
 
-    // Collect extra disk specifications for cache key.
-    // These are block devices that must match between cache create and restore.
-    let mut extra_disks: Vec<String> = Vec::new();
-    extra_disks.extend(args.disk.iter().cloned());
-    extra_disks.extend(args.disk_dir.iter().cloned());
-    extra_disks.extend(args.nfs.iter().cloned());
+    let extra_disks = super::vm_config::snapshot_key_extra_disks(args);
 
     FirecrackerConfig {
         boot_source: BootSource {
