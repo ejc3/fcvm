@@ -1688,6 +1688,8 @@ async fn no_active_viewer_scales_the_gpus_to_zero_and_one_wakes_them() {
         }],
         awake_capacity: 2,
         poll: Duration::from_millis(100),
+        on_demand: vec![],
+        spot_wait: Duration::from_secs(120),
     };
     let (handle, _actor) = start(
         State::new(config, now_ms()),
@@ -1741,6 +1743,305 @@ async fn no_active_viewer_scales_the_gpus_to_zero_and_one_wakes_them() {
     );
     assert!(s["fleet"]["power"]["woke_at"].is_u64());
     assert_eq!(calls()[2], ("fleet-hosts".to_string(), 2));
+}
+
+/// A wake that leaves the spot group with no instance for the spot wait moves the
+/// shortfall to the on-demand group and holds the spot group at what it has; sleeping sets
+/// both to zero, and the next wake asks spot first again.
+#[tokio::test]
+async fn a_spot_group_short_after_the_wait_falls_back_to_on_demand_and_sleeps_to_zero() {
+    use fcvm::fleet::coord::scale::{FakeScale, Group, PowerConfig};
+    let config = Config {
+        power_managed: true,
+        idle_scale_down_secs: 1,
+        ..Config::default()
+    };
+    let fake = Arc::new(FakeScale::default());
+    let spot = Group {
+        region: "us-east-1".into(),
+        name: "fleet-hosts".into(),
+    };
+    let od = Group {
+        region: "us-east-1".into(),
+        name: "fleet-hosts-on-demand".into(),
+    };
+    let power = PowerConfig {
+        driver: fake.clone(),
+        groups: vec![spot],
+        awake_capacity: 1,
+        poll: Duration::from_millis(50),
+        on_demand: vec![Some(od)],
+        spot_wait: Duration::from_millis(300),
+    };
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        None,
+        None,
+        Some(power),
+        None,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/live", listener.local_addr().unwrap());
+    let cfg = live::LiveConfig {
+        checker: allow_all(),
+        allowed_origins: vec![],
+        verifier: Arc::new(turnstile::Off),
+        trust_cf_connecting_ip: false,
+        turnstile_site_key: None,
+        poster: Arc::new(poster::Poster::default()),
+    };
+    let h = handle.clone();
+    tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
+    let calls = || fake.calls.lock().unwrap().clone();
+    let wait_for = |n: usize| {
+        let fake = fake.clone();
+        async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while fake.calls.lock().unwrap().len() < n {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{:?}",
+                    fake.calls.lock().unwrap()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
+    let c = |g: &str, d: u32| (g.to_string(), d);
+    let mut v = Viewer::connect(&url).await;
+    v.until(|s| s["viewers"]["active"] == 1).await;
+    // Awake at start: the spot group only; the on-demand group is not raised.
+    assert_eq!(calls(), vec![c("fleet-hosts", 1)]);
+    v.send(json!({"type": "visibility", "visible": false}))
+        .await;
+    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    wait_for(3).await;
+    assert_eq!(
+        calls()[1..3],
+        [c("fleet-hosts", 0), c("fleet-hosts-on-demand", 0)]
+    );
+    // Wake with no spot capacity: after the wait, on-demand takes the one host.
+    v.send(json!({"type": "visibility", "visible": true})).await;
+    wait_for(6).await;
+    assert_eq!(
+        calls()[3..6],
+        [
+            c("fleet-hosts", 1),
+            c("fleet-hosts-on-demand", 1),
+            c("fleet-hosts", 0)
+        ]
+    );
+    // The on-demand host shows on the page and nothing more is launched.
+    fake.by_group.lock().unwrap().insert(
+        "fleet-hosts-on-demand".into(),
+        vec![fleet_core::event::ScaleInstance {
+            id: "i-0123456789abcdef0".into(),
+            lifecycle: "Pending".into(),
+        }],
+    );
+    v.until(|s| s["fleet"]["power"]["hosts"][0]["host"] == "i-0123456789abcdef0")
+        .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(calls().len(), 6, "{:?}", calls());
+    // Sleep: both groups to zero.
+    v.send(json!({"type": "visibility", "visible": false}))
+        .await;
+    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    wait_for(8).await;
+    assert_eq!(
+        calls()[6..8],
+        [c("fleet-hosts", 0), c("fleet-hosts-on-demand", 0)]
+    );
+}
+
+fn fallback_power(
+    fake: &Arc<fcvm::fleet::coord::scale::FakeScale>,
+    spot_wait: Duration,
+) -> fcvm::fleet::coord::scale::PowerConfig {
+    use fcvm::fleet::coord::scale::{Group, PowerConfig};
+    PowerConfig {
+        driver: fake.clone(),
+        groups: vec![Group {
+            region: "us-east-1".into(),
+            name: "fleet-hosts".into(),
+        }],
+        awake_capacity: 1,
+        poll: Duration::from_millis(50),
+        on_demand: vec![Some(Group {
+            region: "us-east-1".into(),
+            name: "fleet-hosts-on-demand".into(),
+        })],
+        spot_wait,
+    }
+}
+
+/// A coordinator that restarts while a fallback is in force (the on-demand group holds a
+/// host) keeps that split: it reads the groups' desired capacity first and never raises
+/// the spot group beside the on-demand host.
+#[tokio::test]
+async fn a_restart_keeps_an_on_demand_fallback_instead_of_raising_spot_beside_it() {
+    use fcvm::fleet::coord::scale::FakeScale;
+    let fake = Arc::new(FakeScale::default());
+    fake.desired.lock().unwrap().extend([
+        ("fleet-hosts".to_string(), 0),
+        ("fleet-hosts-on-demand".to_string(), 1),
+    ]);
+    // The fleet resumes awake (a viewer is watching the on-demand host's tiles).
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(fallback_power(&fake, Duration::from_secs(120))),
+        None,
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while fake.calls.lock().unwrap().len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{:?}",
+            fake.calls.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let calls = fake.calls.lock().unwrap().clone();
+    assert!(
+        !calls.contains(&("fleet-hosts".to_string(), 1)),
+        "spot raised beside the on-demand host: {calls:?}"
+    );
+    let desired = fake.desired.lock().unwrap().clone();
+    assert_eq!(desired["fleet-hosts"], 0, "{calls:?}");
+    assert_eq!(desired["fleet-hosts-on-demand"], 1, "{calls:?}");
+}
+
+/// A fallback whose spot write fails is retried until both groups hold their split, and
+/// the coordinator stops reporting `scale` degraded once it is.
+#[tokio::test]
+async fn a_failed_fallback_write_is_retried_and_clears_the_degraded_scale() {
+    use fcvm::fleet::coord::scale::FakeScale;
+    let fake = Arc::new(FakeScale::default());
+    fake.fail_sets.lock().unwrap().extend([
+        ("fleet-hosts".to_string(), 0),
+        ("fleet-hosts".to_string(), 0),
+    ]);
+    let mut state = State::new(Config::default(), now_ms());
+    state.fleet.power.state = "waking".into();
+    let (handle, _actor) = start(
+        state,
+        None,
+        None,
+        None,
+        Some(fallback_power(&fake, Duration::from_millis(200))),
+        None,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/live", listener.local_addr().unwrap());
+    let cfg = live::LiveConfig {
+        checker: allow_all(),
+        allowed_origins: vec![],
+        verifier: Arc::new(turnstile::Off),
+        trust_cf_connecting_ip: false,
+        turnstile_site_key: None,
+        poster: Arc::new(poster::Poster::default()),
+    };
+    let h = handle.clone();
+    tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let d = fake.desired.lock().unwrap().clone();
+        if d.get("fleet-hosts") == Some(&0) && d.get("fleet-hosts-on-demand") == Some(&1) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{:?}",
+            fake.calls.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        fake.fail_sets.lock().unwrap().is_empty(),
+        "both failures injected"
+    );
+    let scale_degraded = |s: &serde_json::Value| {
+        s["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["kind"] == "coordinator_degraded" && f["component"] == "scale")
+    };
+    let mut v = Viewer::connect(&url).await;
+    let s = tokio::time::timeout(Duration::from_secs(5), v.until(|s| !scale_degraded(s)))
+        .await
+        .expect("scale still degraded 5 s after the fallback was applied");
+    assert!(!scale_degraded(&s));
+}
+
+/// A sleep whose on-demand write fails after the spot group went to 0, followed by a wake
+/// before the retry, still raises the spot group: a half-done transition is not taken
+/// for the target it was heading to.
+#[tokio::test]
+async fn a_wake_after_a_half_done_sleep_raises_the_spot_group_again() {
+    use fcvm::fleet::coord::scale::FakeScale;
+    let config = Config {
+        power_managed: true,
+        idle_scale_down_secs: 1,
+        ..Config::default()
+    };
+    let fake = Arc::new(FakeScale::default());
+    fake.fail_sets
+        .lock()
+        .unwrap()
+        .push(("fleet-hosts-on-demand".to_string(), 0));
+    let mut power = fallback_power(&fake, Duration::from_secs(120));
+    // No retry before the wake below.
+    power.poll = Duration::from_secs(30);
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        None,
+        None,
+        Some(power),
+        None,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/live", listener.local_addr().unwrap());
+    let cfg = live::LiveConfig {
+        checker: allow_all(),
+        allowed_origins: vec![],
+        verifier: Arc::new(turnstile::Off),
+        trust_cf_connecting_ip: false,
+        turnstile_site_key: None,
+        poster: Arc::new(poster::Poster::default()),
+    };
+    let h = handle.clone();
+    tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
+    let mut v = Viewer::connect(&url).await;
+    v.until(|s| s["viewers"]["active"] == 1).await;
+    v.send(json!({"type": "visibility", "visible": false}))
+        .await;
+    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !fake.fail_sets.lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sleep never tried the on-demand group"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(fake.desired.lock().unwrap()["fleet-hosts"], 0);
+    v.send(json!({"type": "visibility", "visible": true})).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while fake.desired.lock().unwrap()["fleet-hosts"] != 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "spot left at 0 after the wake: {:?}",
+            fake.calls.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// No poster is taken while tiles are starting or a race relaunches them: their regions
