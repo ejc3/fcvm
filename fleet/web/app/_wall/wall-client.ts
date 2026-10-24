@@ -4,7 +4,9 @@
 
 import {
   cameraTargets,
+  FAMILY_PROBE_ATTEMPTS,
   FAMILY_PROBE_MS,
+  FAMILY_PROBE_RETRY_MS,
   familyProbeTargets,
   frameSocketUrl,
   STREAM_HEIGHTS,
@@ -53,8 +55,11 @@ export class WallClient {
   /** The canvas has painted the poster or a frame. */
   painted = false;
   private paintedListeners = new Set<() => void>();
-  /** The IPv6 probe's sockets while it runs; it runs once per page load. */
+  /** The IPv6 probe's sockets while it runs; it settles once per page load. */
   private probe: WebSocket[] | null = null;
+  /** Failed probes so far, and the timer for the next one. */
+  private probeFailures = 0;
+  private probeRetry: ReturnType<typeof setTimeout> | null = null;
   readonly url: string;
 
   constructor(url: string) {
@@ -110,10 +115,10 @@ export class WallClient {
    * it IPv4. One tile can be down without IPv6 being down, hence several.
    */
   private probeFamily(s: ClientState): void {
-    const { urls, v4Only } = familyProbeTargets(s.accepted!.tiles);
-    if (v4Only) {
+    const { urls, v4Only, v6Only } = familyProbeTargets(s.accepted!.tiles);
+    if (v4Only || v6Only) {
       this.probe = [];
-      this.dispatch({ type: "family", family: "v4", probeMs: null });
+      this.dispatch({ type: "family", family: v4Only ? "v4" : "v6", probeMs: null });
       return;
     }
     if (urls.length === 0) return; // no tile has an address yet: probe on a later snapshot
@@ -135,7 +140,17 @@ export class WallClient {
           // Already closed.
         }
       }
-      if (!this.stopped) this.dispatch({ type: "family", family, probeMs: ms });
+      if (this.stopped) return;
+      if (family === "v4" && ++this.probeFailures < FAMILY_PROBE_ATTEMPTS) {
+        // Not settled yet: probe again on the snapshot current then.
+        this.probeRetry = setTimeout(() => {
+          this.probeRetry = null;
+          this.probe = null;
+          if (!this.stopped && this.state.net.family === null && this.state.accepted) this.probeFamily(this.state);
+        }, FAMILY_PROBE_RETRY_MS);
+        return;
+      }
+      this.dispatch({ type: "family", family, probeMs: ms });
     };
     const timer = setTimeout(() => finish("v4", FAMILY_PROBE_MS), FAMILY_PROBE_MS);
     for (const url of urls) {
@@ -159,6 +174,7 @@ export class WallClient {
 
   stop(): void {
     this.stopped = true;
+    if (this.probeRetry) clearTimeout(this.probeRetry);
     if (this.pingTimer) clearTimeout(this.pingTimer);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.noticeTimer) clearInterval(this.noticeTimer);

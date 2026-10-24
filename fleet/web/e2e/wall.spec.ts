@@ -1172,7 +1172,7 @@ test("one address family for both halves: a viewer with no IPv6 gets IPv4 for ev
     expect(Object.keys(v4).sort()).toEqual(["ec2", "fcvm"]);
     for (const [half, h] of Object.entries(v4)) expect(new Set(h), half).toEqual(new Set(["127.0.0.1"]));
     await page.evaluate(() => window.__fleet!.client.ui({ drawer: true }));
-    await expect(page.getByTestId("family")).toHaveText("Address family: IPv4 for every tile (IPv6 did not connect within 1.5 s)");
+    await expect(page.getByTestId("family")).toHaveText("Address family: IPv4 for every tile (IPv6 did not connect in 3 tries of 1.5 s)");
     const n = v4["fcvm"]!.length + v4["ec2"]!.length;
     await expect.poll(async () => (await byFamily()).v4 ?? 0, { timeout: 15_000 }).toBe(n);
     expect((await byFamily()).v6 ?? 0).toBe(0);
@@ -1195,4 +1195,20 @@ test("one address family for both halves: a viewer with no IPv6 gets IPv4 for ev
   const m = v6["fcvm"]!.length + v6["ec2"]!.length;
   await expect.poll(async () => (await byFamily()).v6 ?? 0, { timeout: 15_000 }).toBe(m);
   await expect.poll(async () => (await byFamily()).v4 ?? 0, { timeout: 15_000 }).toBe(0);
+});
+
+test("a probe that lands while the renderers are not accepting yet tries again: the page gets IPv6, not IPv4 with every tile", async ({ page }) => {
+  await page.addInitScript(() => window.localStorage.setItem("fleet-wall.mode", "direct"));
+  // As at the end of a wake: the tiles say running, and their renderers refuse every socket for a moment.
+  await admin("/mock/fault", { renderers_silent: true });
+  try {
+    await page.goto("/?debug=1");
+    await page.waitForFunction(() => window.__fleet?.client.getState().accepted != null);
+    await page.waitForTimeout(600);
+  } finally {
+    await admin("/mock/fault", { renderers_silent: false });
+  }
+  await page.waitForFunction(() => window.__fleet?.client.getState().net.family != null, undefined, { timeout: 10_000 });
+  expect((await page.evaluate(() => window.__fleet!.client.getState().net)).family).toBe("v6");
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBeGreaterThanOrEqual(15);
 });

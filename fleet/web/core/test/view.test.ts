@@ -891,7 +891,8 @@ describe("one address family for every tile", () => {
   it("says in the stats drawer which family is in use", () => {
     expect(familyLine({ family: null, probeMs: null })).toBe("Address family: checking IPv6");
     expect(familyLine({ family: "v6", probeMs: 183.4 })).toBe("Address family: IPv6 for every tile (connected in 183 ms)");
-    expect(familyLine({ family: "v4", probeMs: 1500 })).toBe("Address family: IPv4 for every tile (IPv6 did not connect within 1.5 s)");
+    expect(familyLine({ family: "v6", probeMs: null })).toBe("Address family: IPv6 for every tile (the tiles have no IPv4 address)");
+    expect(familyLine({ family: "v4", probeMs: 1500 })).toBe("Address family: IPv4 for every tile (IPv6 did not connect in 3 tries of 1.5 s)");
     expect(familyLine({ family: "v4", probeMs: null })).toBe("Address family: IPv4 for every tile (the tiles have no IPv6 address)");
   });
 });
@@ -901,12 +902,14 @@ describe("the IPv6 probe's targets", () => {
 
   it("tries up to three running tiles' IPv6 URLs, skipping tiles without one", () => {
     const tiles = [tile("running", "wss://a/frames", "wss://a4/frames"), tile("restoring", "wss://b/frames", null), tile("running", null, null), tile("running", "wss://c/frames", "wss://c4/frames"), tile("running", "wss://d/frames", null), tile("running", "wss://e/frames", null)];
-    expect(familyProbeTargets(tiles)).toEqual({ urls: ["wss://a/frames", "wss://c/frames", "wss://d/frames"], v4Only: false });
+    expect(familyProbeTargets(tiles)).toEqual({ urls: ["wss://a/frames", "wss://c/frames", "wss://d/frames"], v4Only: false, v6Only: false });
   });
 
-  it("waits while no tile has an address, and is IPv4 outright when tiles have only IPv4 ones", () => {
-    expect(familyProbeTargets([tile("running", null, null)])).toEqual({ urls: [], v4Only: false });
-    expect(familyProbeTargets([tile("running", null, "wss://a4/frames")])).toEqual({ urls: [], v4Only: true });
+  it("waits while no tile has an address, and settles without a probe when only one family has URLs", () => {
+    expect(familyProbeTargets([tile("running", null, null)])).toEqual({ urls: [], v4Only: false, v6Only: false });
+    expect(familyProbeTargets([tile("running", null, "wss://a4/frames")])).toEqual({ urls: [], v4Only: true, v6Only: false });
+    // A coordinator that publishes no IPv4 names (staging before #1229's DNS): IPv6 is the only family.
+    expect(familyProbeTargets([tile("running", "wss://a/frames", null), tile("running", "wss://b/frames", null)])).toEqual({ urls: ["wss://a/frames", "wss://b/frames"], v4Only: false, v6Only: true });
   });
 
   it("is chosen once per page load", () => {

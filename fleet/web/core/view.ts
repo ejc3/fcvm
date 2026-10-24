@@ -18,7 +18,7 @@ import {
   type PlacedTile,
   type Segment,
 } from "./layout.ts";
-import { FAMILY_PROBE_MS, frameSocketUrl, streamUrl, type Family } from "./net.ts";
+import { FAMILY_PROBE_ATTEMPTS, FAMILY_PROBE_MS, frameSocketUrl, streamUrl, type Family } from "./net.ts";
 import { fitBandwidth, type StreamAsk } from "./bandwidth.ts";
 import { suggestMode } from "./mode.ts";
 import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type Aggregate, type FleetState, type Half, type IntentMsg, type Rect, type Tile } from "./protocol.ts";
@@ -1489,8 +1489,11 @@ export function aggregatedAvailable(aggregates: readonly Aggregate[], family: Fa
 /** The stats drawer's line on the address family the tiles stream over. */
 export function familyLine(net: ClientState["net"]): string {
   if (net.family === null) return "Address family: checking IPv6";
-  if (net.family === "v6") return `Address family: IPv6 for every tile${net.probeMs === null ? "" : ` (connected in ${Math.round(net.probeMs)} ms)`}`;
+  if (net.family === "v6")
+    return net.probeMs === null
+      ? "Address family: IPv6 for every tile (the tiles have no IPv4 address)"
+      : `Address family: IPv6 for every tile (connected in ${Math.round(net.probeMs)} ms)`;
   return net.probeMs === null
     ? "Address family: IPv4 for every tile (the tiles have no IPv6 address)"
-    : `Address family: IPv4 for every tile (IPv6 did not connect within ${(FAMILY_PROBE_MS / 1000).toFixed(1)} s)`;
+    : `Address family: IPv4 for every tile (IPv6 did not connect in ${FAMILY_PROBE_ATTEMPTS} tries of ${(FAMILY_PROBE_MS / 1000).toFixed(1)} s)`;
 }
