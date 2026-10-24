@@ -63,6 +63,8 @@ ssm() {
   while :; do st=$(A ssm get-command-invocation --command-id "$cid" --instance-id "$id" --query Status --output text 2>/dev/null || echo Pending)
     case "$st" in Pending|InProgress|Delayed) sleep 2 ;; *) break ;; esac; done
   A ssm get-command-invocation --command-id "$cid" --instance-id "$id" --query StandardOutputContent --output text
+  # A command that failed on the instance must not be reported as a measurement.
+  [ "$st" = Success ] || { echo "measure-boot: command ended $st on the instance" >&2; return 1; }
 }
 until [ "$(A ssm describe-instance-information --filters Key=InstanceIds,Values="$id" --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null)" = Online ]; do sleep 5; done
 t_ssm=$(now)
@@ -87,7 +89,8 @@ if [ "$KIND" = host ]; then
   ssm "for u in fcvm-fleet-vfio fcvm-fleet-store; do echo \$u \$(date -d \"\$(systemctl show -p ActiveEnterTimestamp --value \$u.service)\" +%s%3N); done; journalctl -u fcvm-fleet-store -o cat --no-pager | grep 'fcvm-fleet-store:'" | while read -r u t rest; do
     case "$u" in fcvm-fleet-store:) echo "on-instance: $u $t $rest" ;; *) [ -z "$t" ] || echo "$u active $(( t - t0 )) ms after the request" ;; esac
   done
-  ssm "G0=\$(ls /sys/bus/pci/drivers/vfio-pci | grep -E '^[0-9a-f]{4}:' | head -1); prlimit --memlock=unlimited:unlimited sudo -u ubuntu -H XDG_RUNTIME_DIR=/run/user/1000 bash -c \"cd /tmp && bash /usr/local/lib/fcvm-fleet/warm.sh \$G0 /tmp/warm.log\" 2>&1 | tail -3; grep -o '\"status\":\"restored\"[^}]*' /tmp/warm.log | head -1"
+  ssm "set -o pipefail; G0=\$(ls /sys/bus/pci/drivers/vfio-pci | grep -E '^[0-9a-f]{4}:' | head -1); prlimit --memlock=unlimited:unlimited sudo -u ubuntu -H XDG_RUNTIME_DIR=/run/user/1000 bash -c \"cd /tmp && bash /usr/local/lib/fcvm-fleet/warm.sh \$G0 /tmp/warm.log\" 2>&1 | tail -3 || exit 1; grep -o '\"status\":\"restored\"[^}]*' /tmp/warm.log | head -1 || true" ||
+    { echo "host: the first GPU VM failed"; exit 1; }
   t_vm=$(now)
   echo "host: first GPU VM done $((t_vm - t0)) ms after the request (includes SSM round trips)"
 fi

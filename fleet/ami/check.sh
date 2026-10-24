@@ -42,5 +42,23 @@ grep -qF "| jq -e '$ready' >/dev/null || { echo \"renderer not ready after 300 s
 grep -qE 'ud=\$\(lease_userdata "\$lease"\)$' fleet/tools/gpubox.sh ||
   no "gpubox.sh must pass the lease script to --user-data unencoded"
 
+# measure-boot.sh must not report a timing for a command that failed on the instance: its
+# ssm() fails unless the invocation ended Success. Run its ssm() against a stub `A` whose
+# invocation ended Failed.
+ssm_def=$(sed -n '/^ssm() {/,/^}/p' fleet/ami/measure-boot.sh)
+if [ -z "$ssm_def" ]; then
+  no "measure-boot.sh has no ssm() to test"
+elif (
+  A() { case "$*" in *send-command*) echo cmd-1 ;; *"--query Status"*) echo Failed ;; *) echo "warm: ok=0" ;; esac; }
+  export id=i-1234567890abcdef0  # read by the eval'd ssm()
+  eval "$ssm_def"
+  ssm "true" >/dev/null 2>&1
+); then
+  no "measure-boot.sh ssm() returns success for an invocation that ended Failed"
+fi
+measure=$(sed -n '/^  ssm ".*G0=/p' fleet/ami/measure-boot.sh)
+grep -q 'set -o pipefail' <<<"$measure" && grep -q '" ||$' <<<"$measure" && grep -qF '{ echo "host: the first GPU VM failed"; exit 1; }' fleet/ami/measure-boot.sh ||
+  no "measure-boot.sh host does not fail when the warm-up fails"
+
 [ "$fail" = 0 ] && echo "fleet/ami checks: ok"
 exit "$fail"
