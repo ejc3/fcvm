@@ -1,14 +1,17 @@
 #include "scene.h"
 
 #include <algorithm>
+#include <map>
+#include <mutex>
+#include <tuple>
 #include <cmath>
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
 
-#include "font.h"
 #include "json.h"
 #include "world.h"
+#include "font_sdf.h"
 
 namespace {
 void vec3(const Json& j, double out[3], const std::string& what) {
@@ -20,9 +23,8 @@ void vec3(const Json& j, double out[3], const std::string& what) {
 std::string clean_text(const std::string& in) {
   std::string out;
   for (unsigned char c : in) {
-    if (c >= 'a' && c <= 'z') c = (unsigned char)(c - 'a' + 'A');
-    if (c >= 0x80) continue;  // the font is ASCII
-    if (!font_has(c)) c = '?';
+    if (c >= 0x80) continue;  // the fonts are ASCII
+    if (c < 0x20 || c > 0x7E) c = '?';
     if (out.size() < MAX_CHARS) out += (char)c;
   }
   // trim spaces
@@ -111,6 +113,13 @@ Scene parse_scene(const std::string& body) {
       SceneWord sw;
       sw.text = clean_text(w.at("text").string("words[].text"));
       sw.t = w.at("t").number("words[].t");
+      if (w.has("text_style") && w.at("text_style").type != Json::Null) {
+        std::string ts = w.at("text_style").string("words[].text_style");
+        if (ts == "lockup") sw.style = TEXT_STYLE_LOCKUP;
+        else if (ts == "skywriting") sw.style = TEXT_STYLE_SKYWRITING;
+        else if (ts == "landmark") sw.style = TEXT_STYLE_LANDMARK;
+        else throw std::runtime_error("'words[].text_style' must be lockup, skywriting or landmark");
+      }
       if (!sw.text.empty()) s.words.push_back(sw);
     }
   }
@@ -159,28 +168,56 @@ Scene default_scene() {
 }
 
 Tile tile_geometry(const Rect& r, double image_aspect, int requested_h) {
-  int h = std::clamp(requested_h, 16, 2160);
-  h &= ~1;
-  Tile t;
-  t.h = h;
-  t.full_h = std::max(16, (int)std::lround(h / r.h));
-  t.full_w = std::max(16, (int)std::lround(t.full_h * image_aspect));
-  t.y0 = (int)std::lround(r.y * t.full_h);
-  t.x0 = (int)std::lround(r.x * t.full_w);
-  int w = (int)std::lround(r.w * t.full_w);
-  w = std::clamp(w, 16, 4096);
-  t.w = (w + 1) & ~1;
-  return t;
+  int h = std::clamp(requested_h, 16, 2160) & ~1;
+  for (;;) {
+    Tile t;
+    t.h = h;
+    t.full_h = std::max(16, (int)std::lround(h / r.h));
+    t.full_w = std::max(16, (int)std::lround(t.full_h * image_aspect));
+    t.y0 = (int)std::lround(r.y * t.full_h);
+    t.x0 = (int)std::lround(r.x * t.full_w);
+    int w = (int)std::lround(r.w * t.full_w);
+    if (w > 4096 && h > 16) {
+      // too wide to encode: a lower height, the same rect
+      h = std::max(16, (int)(h * 4096.0 / w)) & ~1;
+      continue;
+    }
+    w = std::clamp(w, 16, 4096);
+    t.w = (w + 1) & ~1;
+    return t;
+  }
 }
 
 int tile_h_for(const Rect& r, double image_aspect, int full_h) {
   int best = 16, bd = 1 << 30;
-  int c = (int)std::lround(full_h * r.h);
+  // a full_h beyond what a tile can be gets the nearest height there is
+  int c = std::clamp((int)std::lround(full_h * r.h), 16, 2160);
   for (int h = std::max(16, (c - 8) & ~1); h <= std::min(2160, c + 8); h += 2) {
     int d = std::abs(tile_geometry(r, image_aspect, h).full_h - full_h);
     if (d < bd) { bd = d; best = h; }
   }
   return best;
+}
+
+void LayoutSwitch::on_scene(const Scene& sc) {
+  if (sc.layout_generation < 0) {
+    pending = false;
+    cur = next = -1;
+    return;
+  }
+  if (sc.layout_generation == cur || (pending && next == sc.layout_generation)) return;
+  pending = true;
+  next = sc.layout_generation;
+  k = sc.rect_from_frame >= 0 ? sc.rect_from_frame : 0;
+  from = sc.has_previous_rect ? sc.previous_rect : sc.rect;
+  to = sc.rect;
+}
+
+bool LayoutSwitch::take(long long frame) {
+  if (!pending || frame < k) return false;
+  pending = false;
+  cur = next;
+  return true;
 }
 
 double scene_time(const Scene& s, double t) {
@@ -321,13 +358,6 @@ V3 sun_direction(double tod) {
   double up = std::sin(dec) * std::sin(lat) + std::cos(dec) * std::cos(H) * std::cos(lat);
   return normalize(v3((float)east, (float)up, (float)north));
 }
-
-
-void set_text(GText& g, const std::string& s) {
-  g.len = (int)std::min<size_t>(s.size(), MAX_CHARS);
-  memset(g.ch, 0, sizeof g.ch);
-  for (int i = 0; i < g.len; i++) g.ch[i] = (unsigned char)s[i];
-}
 }  // namespace
 
 namespace {
@@ -369,6 +399,314 @@ std::string pacific_clock(int64_t unix_s) {
   return buf;
 }
 
+namespace {
+// ------------------------------------------------------------ SDF text layout
+
+int sdf_index(unsigned char c) { return c >= 32 && c <= 126 ? c - 32 : '?' - 32; }
+
+float sdf_kern(unsigned char a, unsigned char b) {
+  int lo = 0, hi = kSdfKernN - 1;
+  while (lo <= hi) {
+    int m = (lo + hi) / 2;
+    int c = kSdfKern[m].a != a ? (int)kSdfKern[m].a - a : (int)kSdfKern[m].b - b;
+    if (c == 0) return kSdfKern[m].d;
+    if (c < 0) lo = m + 1; else hi = m - 1;
+  }
+  return 0.0f;
+}
+
+// Glyph origins of s along the baseline, in em, kerned; with `tabular`, digits
+// sit centred on one fixed advance so a clock does not shift as it counts.
+void sdf_layout(GText& g, const std::string& str, bool tabular) {
+  float dig = 0;
+  for (char c = '0'; c <= '9'; c++) dig = std::max(dig, kSdfGlyphs[c - 32].advance);
+  g.len = (int)std::min<size_t>(str.size(), MAX_CHARS);
+  memset(g.ch, 0, sizeof g.ch);
+  float x = 0;
+  for (int i = 0; i < g.len; i++) {
+    unsigned char c = (unsigned char)str[i];
+    if (c < 32 || c > 126) c = '?';
+    g.ch[i] = c;
+    bool fixed = tabular && c >= '0' && c <= '9';
+    if (i > 0) {
+      unsigned char a = g.ch[i - 1];
+      bool afixed = tabular && a >= '0' && a <= '9';
+      if (!fixed && !afixed) x += sdf_kern(a, c);
+    }
+    float adv = kSdfGlyphs[sdf_index(c)].advance;
+    g.gx[i] = fixed ? x + 0.5f * (dig - adv) : x;
+    x += fixed ? dig : adv;
+  }
+  g.width = x;
+  for (int i = 0; i < g.len; i++) g.gy[i] = 0.0f;
+  g.ylo = -0.3f;
+  g.yhi = 1.0f;
+}
+
+// A message too wide for the safe area splits at the space nearest its middle.
+std::vector<std::string> wrap2(const std::string& m, float em_u, float max_u) {
+  GText g;
+  sdf_layout(g, m, false);
+  if (g.width * em_u <= max_u) return {m};
+  size_t best = std::string::npos;
+  for (size_t i = 0; i < m.size(); i++)
+    if (m[i] == ' ' && (best == std::string::npos ||
+                        std::abs((double)i - m.size() / 2.0) < std::abs((double)best - m.size() / 2.0)))
+      best = i;
+  if (best == std::string::npos) return {m};
+  return {m.substr(0, best), m.substr(best + 1)};
+}
+
+double age_alpha(double age) { return std::min(1.0, age / 1.5) * std::min(1.0, (90 - age) / 3.0); }
+
+// The newest word on screen (age 0..90 s), or null.
+const SceneWord* newest_word(const Scene& s, double st) {
+  for (int i = (int)s.words.size() - 1; i >= 0; i--) {
+    double age = st - s.words[i].t;
+    if (age >= 0 && age <= 90) return &s.words[i];
+  }
+  return nullptr;
+}
+
+const V3 kWarmWhite = v3(1.0f, 0.92f, 0.80f);
+
+// Type facing the camera with the left end of its baseline at screen position
+// (u, v) (-1..1 across the image), em_frac of the image's height to the em, at
+// dist km.
+void place_type(GText& g, const GCam& cam, float asp, float u, float v, float dist, float em_frac) {
+  V3 dir = normalize(cam.fwd + cam.right * (u * cam.tan_half * asp) + cam.up * (v * cam.tan_half));
+  g.center = cam.pos + dir * dist;
+  g.right = cam.right;
+  g.up = cam.up;
+  g.height = em_frac * 2.0f * cam.tan_half * dist;
+}
+}  // namespace
+
+// Where the landmark letters stand: candidates are the first ground each of
+// a fan of rays meets just below the horizon (the middle 70% of the view, 2.5
+// to 14 km out, above the sea). Among those at least 60% as high as the
+// highest, the one whose ground is flattest along a row of `len_em` em
+// (em km, across the view) wins: a ridge line rather than a peak. False when
+// no ray meets land.
+static bool find_ridge(const GCam& wc, float asp, float len_em, float em_per_km, V3* at, float* dist) {
+  const V4* tab = host_noise().tab.data();
+  struct Cand { V3 q; float d, alt; };
+  std::vector<Cand> cands;
+  float best_alt = 0.0f;
+  // the row spans len_em * em_per_km * d km at d km, the same share of the
+  // view at any distance: keep its middle where the whole row is in view
+  float half_u = 0.5f * len_em * em_per_km / (wc.tan_half * asp);
+  float umax = std::max(0.0f, 0.92f - half_u);
+  for (int vi = 0; vi < 3; vi++) {
+    float v = -0.03f - 0.04f * vi;
+    for (float u = -umax; u <= umax + 1e-4f; u += std::max(0.05f, umax / 10.0f)) {
+      V3 dir = normalize(wc.fwd + wc.right * (u * wc.tan_half * asp) + wc.up * (v * wc.tan_half));
+      for (float d = 0.5f; d < 14.0f; d += 0.02f) {
+        V3 q = wc.pos + dir * d;
+        double qp[3] = {q.x, q.y, q.z};
+        double alt = q.y + curvature(qp);
+        double ground = surface_h(v2(q.x, q.z), 9, tab);
+        if (alt > std::max(0.0, ground)) continue;
+        if (d >= 2.5f && ground > 0.05) {
+          cands.push_back({q, d, (float)ground});
+          best_alt = std::max(best_alt, (float)ground);
+        }
+        break;
+      }
+    }
+  }
+  if (cands.empty()) return false;
+  float best = 1e9f;
+  bool found = false;
+  for (const Cand& c : cands) {
+    if (c.alt < 0.6f * best_alt) continue;
+    V3 n = normalize(v3(wc.pos.x - c.q.x, 0.0f, wc.pos.z - c.q.z));
+    V3 right = normalize(cross(v3(0, 1, 0), n));
+    float em = em_per_km * c.d;  // the em at this distance
+    float lo = 1e9f, hi = -1e9f;
+    for (int k = 0; k <= 8; k++) {
+      V3 q = c.q + right * ((k / 8.0f - 0.5f) * len_em * em);
+      float h = std::max(0.0f, surface_h(v2(q.x, q.z), 9, tab));
+      lo = std::min(lo, h);
+      hi = std::max(hi, h);
+    }
+    float rough = (hi - lo) / em;  // how far the ground under the row rises and falls, em
+    // the whole row must be in sight: no ground between the camera and
+    // points along it 0.15, 0.4 and 0.7 em above the ground
+    int hidden = 0;
+    for (int k = 0; k < 36 && !hidden; k++) {
+      V3 q = c.q + right * (((k % 12) / 11.0f - 0.5f) * len_em * em);
+      q.y = std::max(0.0f, surface_h(v2(q.x, q.z), 9, tab)) + (k < 12 ? 0.15f : k < 24 ? 0.4f : 0.7f) * em;
+      double qp[3] = {q.x, 0.0, q.z};
+      q.y -= (float)curvature(qp);
+      V3 dv = q - wc.pos;
+      float L = length(dv);
+      for (float t = 0.2f; t < L - 0.01f; t += (L - t > 0.5f ? 0.04f : 0.01f)) {
+        V3 r = wc.pos + dv * (t / L);
+        double rp[3] = {r.x, r.y, r.z};
+        if (r.y + curvature(rp) < surface_h(v2(r.x, r.z), 9, tab)) { hidden++; break; }
+      }
+    }
+    if (hidden) continue;
+    if (rough < best) {
+      best = rough;
+      *at = c.q;
+      *dist = c.d;
+      found = true;
+    }
+  }
+  return found;
+}
+
+// find_ridge is a few hundred thousand terrain queries; its answer depends
+// only on the camera when the word came, so it is cached by that.
+static bool find_ridge_cached(const GCam& wc, float asp, float len_em, float em_per_km, V3* at, float* dist) {
+  static std::mutex mu;
+  static std::map<std::vector<float>, std::tuple<bool, V3, float>> cache;
+  std::vector<float> key = {wc.pos.x, wc.pos.y, wc.pos.z, wc.fwd.x, wc.fwd.y, wc.fwd.z, wc.tan_half, asp, len_em, em_per_km};
+  {
+    std::lock_guard<std::mutex> l(mu);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+      *at = std::get<1>(it->second);
+      *dist = std::get<2>(it->second);
+      return std::get<0>(it->second);
+    }
+  }
+  bool ok = find_ridge(wc, asp, len_em, em_per_km, at, dist);
+  std::lock_guard<std::mutex> l(mu);
+  if (cache.size() > 64) cache.clear();
+  cache[key] = std::make_tuple(ok, *at, *dist);
+  return ok;
+}
+
+// The clock (always lockup type, upper left, never occluded) and the newest
+// word in its own style: lockup type above the clock, smoke written across the
+// sky, or letters standing on a ridge. Skywriting and the landmark stay where
+// the camera was looking when the word arrived.
+static void text_layout(const Scene& s, FrameParams& p, double st, double t, double aspect) {
+  const float asp = (float)aspect;
+  const GCam& cam = p.cam;
+  const float U0 = -0.90f;        // left edge of the safe area
+  const float MSG_EM = 0.068f;    // the message's em, of the image height (cap height 4.9%)
+  const float CLOCK_EM = 0.040f;  // the clock's (cap height 2.9%)
+  const float TYPE_KM = 6.0f;     // the message: far enough that the haze touches it
+  const float CLOCK_KM = 1.2f;    // the clock: in front of the cloud layer's base from anywhere near the ground
+  const float msg_cap_v = SDF_CAP_HEIGHT * MSG_EM * 2.0f, clock_cap_v = SDF_CAP_HEIGHT * CLOCK_EM * 2.0f;
+  const float msg_base = 0.84f - msg_cap_v;                // the message's (last) baseline
+  const float clock_top = msg_base - 0.9f * msg_cap_v;     // the clock keeps its place whatever the word's style
+  {
+    GText& g = p.text[p.n_text++];
+    sdf_layout(g, pacific_clock((int64_t)std::floor(s.epoch_unix_ms / 1000.0 + t)), true);
+    place_type(g, cam, asp, U0, clock_top - clock_cap_v, CLOCK_KM, CLOCK_EM);
+    g.color = kWarmWhite * 2.8f;  // after exposure
+    g.style = GTEXT_TYPE;
+    g.occlude = 0;  // nothing hides the clock
+    g.shade = 1.0f;
+    g.alpha = 1.0f;
+  }
+  const SceneWord* w = newest_word(s, st);
+  if (!w) return;
+  double age = st - w->t;
+  float alpha = (float)age_alpha(age);
+  if (w->style == TEXT_STYLE_LOCKUP) {
+    auto lines = wrap2(w->text, MSG_EM * 2.0f / asp, 1.15f);
+    // The last line keeps the one-line baseline, above the clock; the lines
+    // above it go up. Every line must stay inside the image, projected: the
+    // first line's cap top below MSG_TOP, and each line's right end left of
+    // MSG_RIGHT (a message with no space to wrap at, or wrapped into a line
+    // still too wide). A message that would cross either gets a smaller em.
+    const float MSG_TOP = 0.96f, MSG_RIGHT = 0.96f;
+    auto base_of = [&](size_t li, float em) { return msg_base + (float)(lines.size() - 1 - li) * 1.2f * em * 2.0f; };
+    std::vector<GText> laid(lines.size());
+    for (size_t li = 0; li < lines.size(); li++) sdf_layout(laid[li], lines[li], false);
+    auto fits = [&](float em) {
+      for (size_t li = 0; li < lines.size(); li++) {
+        GText g = laid[li];
+        place_type(g, cam, asp, U0, base_of(li, em), TYPE_KM, em);
+        V3 top = g.center + g.up * (SDF_CAP_HEIGHT * g.height) - cam.pos;
+        V3 end = g.center + g.right * (g.width * g.height) - cam.pos;
+        if (dot(top, cam.up) / (dot(top, cam.fwd) * cam.tan_half) > MSG_TOP) return false;
+        if (dot(end, cam.right) / (dot(end, cam.fwd) * cam.tan_half * asp) > MSG_RIGHT) return false;
+      }
+      return true;
+    };
+    float em = MSG_EM;
+    if (!fits(em)) {
+      float lo = 0.1f * MSG_EM, hi = MSG_EM;
+      for (int i = 0; i < 24; i++) {
+        float mid = 0.5f * (lo + hi);
+        if (fits(mid)) lo = mid; else hi = mid;
+      }
+      em = lo;
+    }
+    for (size_t li = 0; li < lines.size(); li++) {
+      GText& g = p.text[p.n_text++];
+      sdf_layout(g, lines[li], false);
+      place_type(g, cam, asp, U0, base_of(li, em), TYPE_KM, em);
+      g.color = kWarmWhite * 2.4f;  // after exposure
+      g.style = GTEXT_TYPE;
+      g.occlude = 1;
+      g.shade = 0.8f;
+      g.alpha = alpha;
+    }
+    return;
+  }
+  CamPose wp = camera_at(s.camera, w->t);
+  clamp_above_ground(wp.pos);
+  to_world(wp.look);
+  GCam wc = make_cam(wp.pos, wp.look, wp.fov_deg, aspect);
+  GText& g = p.text[p.n_text++];
+  sdf_layout(g, w->text, false);
+  g.age = (float)age;
+  g.occlude = 1;
+  if (w->style == TEXT_STYLE_SKYWRITING) {
+    // written at SMOKE_WRITE (2.2) em/s; it stays readable about 25 s after
+    // the last letter, then fades out over 8 s
+    double written = g.width / 2.2;
+    g.alpha = (float)std::clamp((written + 33.0 - age) / 8.0, 0.0, 1.0) * (float)std::min(1.0, age / 0.3);
+    const float dist = 9.0f, em_frac = 0.085f;
+    float em_u = em_frac * 2.0f / asp;
+    place_type(g, wc, asp, -0.5f * g.width * em_u, 0.36f, dist, em_frac);
+    g.ylo = -0.3f;
+    g.yhi = 1.0f;
+    g.style = GTEXT_SMOKE;
+    return;
+  }
+  // landmark: letters standing on the highest ground in view, facing where
+  // the camera was, each on the ground under its own middle
+  g.alpha = alpha;
+  const V4* tab = host_noise().tab.data();
+  V3 at;
+  float dist;
+  const float LM_EM = 0.09f;  // the em, of the image height from where it was placed (cap height 6.5%)
+  if (!find_ridge_cached(wc, asp, g.width, LM_EM * 2.0f * wc.tan_half, &at, &dist)) {
+    dist = 6.0f;
+    at = wc.pos + normalize(v3(wc.fwd.x, 0.0f, wc.fwd.z)) * dist;
+  }
+  auto ground_at = [&](V3 q) {
+    double qp[3] = {q.x, q.y, q.z};
+    return (float)(std::max(0.0, (double)surface_h(v2(q.x, q.z), 9, tab)) - curvature(qp));
+  };
+  V3 n = normalize(v3(wc.pos.x - at.x, 0.0f, wc.pos.z - at.z));
+  g.right = normalize(cross(v3(0, 1, 0), n));
+  g.up = v3(0, 1, 0);
+  g.height = LM_EM * 2.0f * wc.tan_half * dist;
+  float y0 = ground_at(at);
+  g.center = v3(at.x, y0, at.z) - g.right * (0.5f * g.width * g.height);
+  g.ylo = 1e9f;
+  g.yhi = -1e9f;
+  // each letter on the ground under its middle, a little sunk so none floats
+  for (int i = 0; i < g.len; i++) {
+    float mid = g.gx[i] + 0.5f * kSdfGlyphs[sdf_index(g.ch[i])].advance;
+    g.gy[i] = (ground_at(g.center + g.right * (mid * g.height)) - y0) / g.height - 0.08f;
+    g.ylo = std::min(g.ylo, g.gy[i] - 0.3f);
+    g.yhi = std::max(g.yhi, g.gy[i] + 1.0f);
+  }
+  g.color = v3(1.0f, 0.62f, 0.32f) * 2.2f;  // the dusk edge light
+  g.style = GTEXT_LANDMARK;
+}
+
 FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* hold_key, bool* held) {
   FrameParams p;
   memset(&p, 0, sizeof p);
@@ -407,58 +745,7 @@ FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* ho
     g.alpha = (float)std::min(1.0, (st - l.t) / 0.5);
     for (int i = 0; i < 3; i++) { key = mix64(key, dbits(l.pos[i])); key = mix64(key, dbits(l.color[i])); }
   }
-  // Text: the clock first, then the newest words. Both are placed in screen
-  // terms (direction from the eye) inside a safe area, so none is cut off at
-  // the image's edge and the clock is always in view; they sit in the world at
-  // a fixed distance and face the camera.
-  const float tanh_ = p.cam.tan_half, asp = (float)aspect;
-  auto place = [&](GText& g, float u, float v, float dist, float hfrac) {
-    V3 dir = normalize(p.cam.fwd + p.cam.right * (u * tanh_ * asp) + p.cam.up * (v * tanh_));
-    g.center = p.cam.pos + dir * dist;
-    g.right = p.cam.right;
-    g.up = p.cam.up;
-    g.height = hfrac * 2.0f * tanh_ * dist;  // hfrac of the image's height
-  };
-  auto text_halfwidth_u = [&](int len, float hfrac) {  // half the text's width in u (-1..1 across the image)
-    float wh = (len * GLYPH_ADVANCE - (GLYPH_ADVANCE - GLYPH_W)) / GLYPH_H;  // width / height
-    return hfrac * wh / asp;
-  };
-  {
-    GText& g = p.text[p.n_text++];
-    set_text(g, pacific_clock((int64_t)std::floor(s.epoch_unix_ms / 1000.0 + t)));
-    place(g, 0.0f, 0.66f, 2.0f, 0.075f);
-    g.color = v3(1.0f, 0.86f, 0.62f) * 3.2f;  // the rim's light
-    g.style = 1;
-    g.occlude = 0;  // always readable
-    g.alpha = 1.0f;
-  }
-  int first = std::max(0, (int)s.words.size() - (MAX_TEXTS - 1));
-  int slot = 0;
-  for (int i = (int)s.words.size() - 1; i >= first; i--) {  // newest first gets the top row
-    const SceneWord& w = s.words[i];
-    double age = st - w.t;
-    if (age < 0 || age > 90) continue;
-    GText& g = p.text[p.n_text++];
-    set_text(g, w.text);
-    uint32_t h = hash_u32((uint32_t)i * 2654435761u ^ (uint32_t)std::lround(w.t * 1000));
-    const float hf = 0.05f;
-    // six rows below the clock, three columns; the safe area is 85% of the
-    // width and from 0.45 down to -0.75 of the height
-    int row = slot % 6, col = (slot / 6) % 3;
-    slot++;
-    float v = 0.38f - row * 0.2f;
-    float half = text_halfwidth_u(g.len, hf);
-    float lim = std::max(0.0f, 0.85f - half);
-    float u = std::clamp((col - 1) * 0.55f + (u01(h) - 0.5f) * 0.3f, -lim, lim);
-    place(g, u, v, 2.5f, hf);
-    float hue = u01(hash_u32(h ^ 0xABCDu));
-    V3 col3 = v3(0.5f + 0.5f * cosf(6.2832f * hue), 0.5f + 0.5f * cosf(6.2832f * (hue + 0.33f)),
-                 0.5f + 0.5f * cosf(6.2832f * (hue + 0.67f)));
-    g.color = (col3 * 0.85f + v3(0.15f)) * 2.6f;
-    g.style = 0;
-    g.occlude = 1;
-    g.alpha = (float)(std::min(1.0, age / 1.5) * std::min(1.0, (90 - age) / 3.0));
-  }
+  text_layout(s, p, st, t, aspect);
 
   *held = pose.held;
   if (pose.held) {
@@ -468,6 +755,15 @@ FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* ho
     key = mix64(key, dbits(s.time_of_day));
     key = mix64(key, (uint64_t)tile.full_w << 32 | (uint32_t)tile.full_h);
     key = mix64(key, (uint64_t)p.n_lights);
+    // landmark letters shade the terrain in the accumulated samples: a new
+    // landmark word starts a new hold
+    for (int i = 0; i < p.n_text; i++)
+      if (casts_landmark_shadow(p.text[i])) {
+        key = mix64(key, 0x1A2D);
+        for (int c = 0; c < p.text[i].len; c++) key = mix64(key, p.text[i].ch[c]);
+        key = mix64(key, dbits(p.text[i].center.x));
+        key = mix64(key, dbits(p.text[i].center.z));
+      }
     if (key == 0) key = 1;
     p.seed = (uint32_t)(key ^ (key >> 32));
   } else {

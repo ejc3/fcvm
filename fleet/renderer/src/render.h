@@ -41,6 +41,9 @@ class Renderer {
   // The high-quality path: -1 by the budget (on from HQ_SPP samples per drawn
   // pixel, every pixel drawing; the default), 0 never, 1 always.
   void set_quality(int mode) { quality_ = mode; }
+  // Tests: draw the image without the clock and words drawn over it (the
+  // landmark letters still shade the terrain).
+  void set_text_overlay(bool on) { text_overlay_ = on; }
   // Draw frame t into the tile's RGBA8 buffer on the device. accumulate=false draws
   // every frame independently (seeded by t only), which is what the seam test uses.
   // spp > 0 overrides the budget.
@@ -110,6 +113,7 @@ class Renderer {
   long long hold_frames_ = 0;
   int checker_ = -1;  // -1 by budget, 0 never, 2 or 4 always
   int quality_ = -1;  // -1 by budget, 0 never, 1 always
+  bool text_overlay_ = true;
   double hold_budget_ = 0;  // the budget the current hold started with
   void* fill_c_ = nullptr;  // checkerboard fill output, swapped into the ring
   void* fill_a_ = nullptr;

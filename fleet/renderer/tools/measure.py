@@ -18,7 +18,7 @@ secs = float(sys.argv[3]) if len(sys.argv) > 3 else 10
 heights = [int(h) for h in sys.argv[4:]] or [136, 180, 240, 360, 1080]
 # rows: (height, rect); a wall tile is 1/16 x 1/9 of a 16:9 image, the detail
 # view opens one tile at 1080, and 720 and 1080 are also drawn as the whole image
-tile_rect = {"x": 0.5, "y": 0.333, "w": 0.0625, "h": 1 / 9}
+tile_rect = {"x": float(os.environ.get("TILE_X", 0.5)), "y": float(os.environ.get("TILE_Y", 0.333)), "w": 0.0625, "h": 1 / 9}
 whole_rect = {"x": 0, "y": 0, "w": 1, "h": 1}
 rows = [(h, tile_rect, "tile") for h in heights if h <= 400]
 rows += [(h, whole_rect, "whole") for h in heights if h > 400]
@@ -31,6 +31,9 @@ print("inner_height,inner_width,stream,rect,frames,client_fps,spp,checkerboard,r
 for h, rect, kind in rows:
     scene = {"epoch_unix_ms": now, "rect": rect, "image_aspect": 16 / 9, "camera": cam,
              "time_of_day": 0.3, "words": [], "lights": []}
+    if os.environ.get("WORD"):  # a word on screen for the whole row, in TEXT_STYLE
+        scene["words"] = [{"text": os.environ["WORD"], "t": (time.time() * 1000 - now) / 1000 - 10,
+                           "text_style": os.environ.get("TEXT_STYLE", "lockup")}]
     if os.environ.get("BUDGET"):  # the scene's per-frame budget (pixel-samples) instead of the renderer's
         scene["budget"] = int(os.environ["BUDGET"])
     fc.post_scene(host, port, scene)

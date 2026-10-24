@@ -16,8 +16,9 @@ struct Keyframe {
   double fov_deg;
 };
 struct SceneWord {
-  std::string text;  // uppercased, filtered to the font, at most MAX_CHARS
+  std::string text;  // printable ASCII, at most MAX_CHARS
   double t;
+  int style = 0;     // TEXT_STYLE_*: how this word is drawn (lockup by default)
 };
 struct SceneLight {
   double pos[3];
@@ -56,7 +57,9 @@ struct Tile {
 // The tile's pixels for a requested height: the whole image is a pixel grid of
 // full_w x full_h, and this tile is [x0, x0+w) x [y0, y0+h) of it. w and h are
 // even (4:2:0 video), so a tile may overlap its neighbour by one pixel column or
-// row; overlapping pixels are the same whole-image pixels and so match.
+// row; overlapping pixels are the same whole-image pixels and so match. A tile
+// is at most 4096 wide (NVENC H.264): a rect too wide for that at the requested
+// height gets a lower height, so the tile still covers the whole rect.
 Tile tile_geometry(const Rect& r, double image_aspect, int requested_h);
 
 struct CamPose {
@@ -72,6 +75,19 @@ double scene_time(const Scene& s, double t);
 // The tile height that gives a whole image full_h pixels tall for rect r (the
 // stream height to keep when a layout generation changes a tile's rect).
 int tile_h_for(const Rect& r, double image_aspect, int full_h);
+
+// The layout generation in force and a pending switch (PROTOCOL.md, "Layout
+// generations"). on_scene takes each accepted scene: a new generation becomes
+// pending; a scene without one takes effect at once, so it cancels a pending
+// switch and leaves no generation in force. take(k) puts a pending switch into
+// force at its first frame; true when it did.
+struct LayoutSwitch {
+  long long cur = -1, next = -1, k = 0;
+  bool pending = false;
+  Rect from, to;
+  void on_scene(const Scene& sc);
+  bool take(long long frame);
+};
 
 // Host copy of the 2D noise table (the GPU gets the same values), used to keep
 // the eye above ground and to place words.

@@ -25,23 +25,7 @@
 #include "nvenc.h"
 #include "render.h"
 #include "scene.h"
-
-struct Subscriber {
-  int id = 0;
-  std::atomic<int> want_h{0};
-  std::atomic<int> want_q{1};  // 0 lo, 1 std, 2 hi
-  // filled by the render thread, drained by the connection's writer
-  std::mutex mu;
-  std::condition_variable cv;
-  std::deque<std::shared_ptr<const std::string>> q;  // complete WebSocket frames
-  size_t queued = 0;
-  bool closed = false;
-  // render-thread state
-  int cur_h = 0;  // encoder key the header was sent for (0: header pending)
-  bool need_key = true;
-  void push(std::shared_ptr<const std::string> m);
-  void close();
-};
+#include "subscriber.h"
 
 struct Options {
   int port = 8080;
@@ -116,6 +100,7 @@ class Pipeline {
   bool had_streams_ = false;  // render thread: the last frame drawn had a stream
   int warm_h_ = 540;  // render thread: the stream height to warm at (the last one streamed)
   void frame_once(double t, uint32_t frame_no);
+  void set_fatal(const std::string& m);
   // overlap and encoded size of an encoder for tile g
   void enc_layout(Enc& e, const Tile& g) const;
   // Work kept off the render thread: tearing an encoder down (40 to 250 ms
@@ -138,7 +123,7 @@ class Pipeline {
   void prepare_layout(const std::shared_ptr<const Scene>& sc, const std::vector<std::pair<int, int>>& hq, long long gen);
   Tile encode_geometry(const Scene& sc, int h);
   int min_w_ = 0, min_h_ = 0;  // under aux_mu_ until min_known_
-  std::string header_json(const Enc& e, int q);
+  std::string header_json(const Enc& e, int q, long long gen);
   struct RawReq {
     long long k;  // the frame slot wanted; LLONG_MIN: the next frame drawn
     int want_h = 0;  // with no stream, only a frame drawn for this tile height (0: any)
@@ -163,9 +148,7 @@ class Pipeline {
   // layout generations: the scene with previous_rect, drawn before
   // rect_from_frame; the generation in effect and a pending switch (under mu_)
   std::shared_ptr<const Scene> scene_prev_;
-  long long gen_cur_ = -1, gen_next_ = -1, switch_k_ = 0;
-  bool switch_pending_ = false;
-  Rect switch_from_, switch_to_;
+  LayoutSwitch lay_;  // under mu_ (post_scene writes it)
   uint64_t scene_version_ = 0;
   std::vector<std::shared_ptr<Subscriber>> subs_;
   int next_id_ = 1;
@@ -187,7 +170,7 @@ class Pipeline {
   std::deque<FrameLog> frame_log_;  // under hmu_
   const char* budget_source_ = "default";
   // health
-  std::mutex hmu_;
+  mutable std::mutex hmu_;
   double last_t_ = 0;
   uint32_t frame_ = 0;
   double fps_ = 0;
@@ -198,6 +181,8 @@ class Pipeline {
   uint64_t slots_missed_ = 0;  // frame slots skipped while someone was subscribed
   double startup_ready_ms_ = -1, first_frame_ms_ = -1, first_sent_ms_ = -1;
   std::string gpu_name_;
+  // fatal_, gpu_name_ and the startup_ms fields are written by the render
+  // thread and read by health_json and fatal() on server threads: all under hmu_
 };
 
 double now_unix_ms();

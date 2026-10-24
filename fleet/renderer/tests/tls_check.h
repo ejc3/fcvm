@@ -236,6 +236,20 @@ static void run() {
   std::this_thread::sleep_for(std::chrono::milliseconds(400));
   Client bad(port, 0);
   CHECK(front.generation() == 2 && bad.ok && bad.cn == "second", "a broken file leaves the loaded pair in use");
+  // a file replaced between the load and watch() is read again: the watcher
+  // starts from the version that was loaded, not the one on disk when it starts
+  {
+    std::string path2 = std::string(dir) + "/tls2.json";
+    write_secret(path2, c1, k1);
+    TlsFront late;
+    CHECK(late.load(path2, &err) && late.generation() == 1, "the second front loads (%s)", err.c_str());
+    write_secret(path2, c2, k2);
+    late.watch(path2, 100);
+    for (int i = 0; i < 100 && late.generation() < 2; i++) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(late.generation() == 2, "a file replaced before watch() is loaded again (loads %llu)",
+          (unsigned long long)late.generation());
+    unlink(path2.c_str());
+  }
   shutdown(lfd, SHUT_RDWR);
   close(lfd);
   srv.join();

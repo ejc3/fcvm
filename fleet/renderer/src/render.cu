@@ -13,7 +13,8 @@
 #include <cstring>
 #include <stdexcept>
 
-#include "font.h"
+#define SDF_WITH_ATLAS
+#include "font_sdf.h"
 #include "budget.h"
 #include "render.h"
 #include "world.h"
@@ -46,15 +47,17 @@ struct Globals {
   cudaTextureObject_t cloud;
   cudaTextureObject_t macro;
   const float4* macro_arr;  // the same fields, for C1-smooth sampling in shading
+  cudaTextureObject_t sdf;  // Inter's signed distance atlas (font_sdf.h)
+  const short* puffs;       // smoke puffs along the glyphs' centrelines (x, y, half-width; 1/4096 em)
 };
 
 __constant__ FrameParams cP;
 __device__ float g_sunvis;      // fraction of the sun the camera sees this frame (glare)
 __device__ unsigned int g_bad;  // samples that came out non-finite (counted, then dropped)
 __constant__ Globals cG;
-__constant__ V4 cSeg[FONT_MAX_SEGMENTS];
-__constant__ short cGStart[128];
-__constant__ short cGCount[128];
+__constant__ SdfGlyph cSdf[95];
+__constant__ short cPuffStart[95];
+__constant__ unsigned char cPuffCount[95];
 
 // ---------------------------------------------------------------- atmosphere
 
@@ -372,6 +375,19 @@ struct CloudOut {
 };
 
 // March the cloud layer along o + d*s, s in [0, tmax].
+// Several orders of scattering of sunlight that crossed optical depth od to
+// reach a point, each softer and less directional (c: cosine between the view
+// ray and the sun). Clouds and the skywriting smoke share it.
+__device__ __forceinline__ float cloud_scatter(float c, float od) {
+  float S = 0.0f, a = 1.0f, b = 1.0f, g = 1.0f;
+  for (int o2 = 0; o2 < 3; o2++) {
+    float ph = mixf(phase_hg(c, 0.85f * g), phase_hg(c, -0.2f * g), 0.4f);
+    S += a * __expf(-od * b) * ph;
+    a *= 0.55f; b *= 0.3f; g *= 0.5f;
+  }
+  return S;
+}
+
 __device__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bool cheap) {
   CloudOut out{v3(0.0f), 1.0f, 0.0f};
   float ho = alt_flat(o);
@@ -436,12 +452,7 @@ __device__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bo
     // slowly, so take it on every fourth fine step
     if (lit_age++ % (cP.hq ? 2 : 4) == 0) od = cloud_light_od(p, cP.hq ? 4 : 3);
     // several orders of scattering, each softer and less directional
-    float S = 0.0f, a = 1.0f, b = 1.0f, g = 1.0f;
-    for (int o2 = 0; o2 < 3; o2++) {
-      float ph = mixf(phase_hg(c, 0.85f * g), phase_hg(c, -0.2f * g), 0.4f);
-      S += a * __expf(-od * b) * ph;
-      a *= 0.55f; b *= 0.3f; g *= 0.5f;
-    }
+    float S = cloud_scatter(c, od);
     float h01 = sat((alt_flat(p) - CLOUD_BASE) / (CLOUD_TOP - CLOUD_BASE));
     // light reaching the inside is softer near the edges: "powder"
     float powder = 1.0f - 0.6f * __expf(-sig * 0.25f);
@@ -673,6 +684,88 @@ __device__ V3 point_lights(V3 p, V3 n) {
   return L;
 }
 
+// ---------------------------------------------------------------- text geometry
+
+// Signed distance (em, positive outside) from (x, y) on a text's baseline
+// frame to the nearest glyph of the text, from the atlas; SDF_SPREAD where no
+// glyph cell reaches. Glyph i sits gx[i] along and, for landmark letters,
+// gy[i] up.
+__device__ float sdf_dist(const GText& g, float x, float y) {
+  float best = SDF_SPREAD;
+  for (int i = 0; i < g.len; i++) {
+    unsigned char c = g.ch[i];
+    if (c < 33 || c > 126) continue;
+    const SdfGlyph& gl = cSdf[c - 32];
+    float cx = (x - g.gx[i]) * SDF_PX_PER_EM - gl.ox;  // texels from the cell's left edge
+    float cy = -(y - g.gy[i]) * SDF_PX_PER_EM - gl.oy;
+    if (cx < 0.0f || cy < 0.0f || cx > gl.w || cy > gl.h) continue;
+    float v = tex2D<float>(cG.sdf, gl.ax + cx, gl.ay + cy);
+    best = fminf(best, (v * 255.0f - 128.0f) * (SDF_SPREAD / 127.0f));
+  }
+  return best;
+}
+
+#define LANDMARK_DEPTH 0.22f  // em: how thick the letters are
+
+// Landmark letters: the glyphs extruded LANDMARK_DEPTH em, distance in em in
+// the letters' frame (x along the row, y up, z toward where the camera was).
+__device__ float landmark_sdf(const GText& g, V3 q) {
+  float d2 = sdf_dist(g, q.x, q.y);
+  float dz = fabsf(q.z) - 0.5f * LANDMARK_DEPTH;
+  float ox = fmaxf(d2, 0.0f), oz = fmaxf(dz, 0.0f);
+  return sqrtf(ox * ox + oz * oz) + fminf(fmaxf(d2, dz), 0.0f);
+}
+
+// A ray (km) in a landmark's frame (em): origin and direction per km.
+__device__ __forceinline__ void landmark_ray(const GText& g, V3 o, V3 d, V3* ol, V3* dl) {
+  V3 n = cross(g.right, g.up);
+  V3 oc = o - g.center;
+  *ol = v3(dot(oc, g.right), dot(oc, g.up), dot(oc, n)) / g.height;
+  *dl = v3(dot(d, g.right), dot(d, g.up), dot(d, n)) / g.height;
+}
+
+// The span (km) of a ray inside a landmark's bounds; false when it misses.
+__device__ bool landmark_box(const GText& g, V3 ol, V3 dl, float* ta, float* tb) {
+  V3 lo = v3(-0.3f, g.ylo - 0.3f, -0.5f * LANDMARK_DEPTH - 0.3f);
+  V3 hi = v3(g.width + 0.3f, g.yhi + 0.3f, 0.5f * LANDMARK_DEPTH + 0.3f);
+  float t0 = 0.0f, t1 = 1e9f;
+  float oa[3] = {ol.x, ol.y, ol.z}, da[3] = {dl.x, dl.y, dl.z}, la[3] = {lo.x, lo.y, lo.z}, ha[3] = {hi.x, hi.y, hi.z};
+  for (int k = 0; k < 3; k++) {
+    if (fabsf(da[k]) < 1e-9f) {
+      if (oa[k] < la[k] || oa[k] > ha[k]) return false;
+      continue;
+    }
+    float a = (la[k] - oa[k]) / da[k], b = (ha[k] - oa[k]) / da[k];
+    if (a > b) { float tt = a; a = b; b = tt; }
+    t0 = fmaxf(t0, a);
+    t1 = fminf(t1, b);
+  }
+  *ta = t0;
+  *tb = t1;
+  return t1 > t0;
+}
+
+// Sunlight reaching p past the landmark letters (1: none in the way, 0: a
+// letter in the way). The letters cast their shadows on the terrain through
+// this.
+__device__ float landmark_vis(V3 p, V3 l) {
+  for (int i = 0; i < cP.n_text; i++) {
+    const GText& g = cP.text[i];
+    if (!casts_landmark_shadow(g)) continue;
+    V3 ol, dl;
+    landmark_ray(g, p, l, &ol, &dl);
+    float ta, tb;
+    if (!landmark_box(g, ol, dl, &ta, &tb)) continue;
+    float t = ta;
+    for (int it = 0; it < 40 && t < tb; it++) {
+      float dist = landmark_sdf(g, ol + dl * t);
+      if (dist < 0.01f) return 0.0f;  // whole while the word is up (a hold keys on it)
+      t += dist * g.height;
+    }
+  }
+  return 1.0f;
+}
+
 // Radiance leaving a terrain point toward the eye, with one bounce of sky and ground light.
 __device__ V3 shade_terrain(V3 p, V3 rd, float t, float pix, Rng& rng, bool full) {
   float h = terrain_s(v2(p.x, p.z), 8);
@@ -705,6 +798,7 @@ __device__ V3 shade_terrain(V3 p, V3 rd, float t, float pix, Rng& rng, bool full
   if (nl > 0.0f && Es.x + Es.y + Es.z > 1e-4f) {
     float vis = full ? terrain_shadow(p + n * 0.003f, l) : 1.0f;
     if (vis > 0.0f) vis *= cloud_shadow(p, l) * (1.0f - ring_cover(p, l));
+    if (vis > 0.0f && full) vis *= landmark_vis(p + n * 0.003f, l);
     float spec = ggx_spec(n, v, l, m.rough, 0.03f);
     L += Es * (vis * (nl / PI_F)) * m.albedo + Es * (vis * spec);
   }
@@ -934,6 +1028,7 @@ __device__ V3 shade_water(V3 p, V3 rd, float t, float level, Rng& rng, bool full
   // glitter of the sun
   V3 l = sun_sample(rng.next(), rng.next());
   float vis = (full && l.y > 0.0f) ? terrain_shadow(p + v3(0, 0.002f, 0), l) * cloud_shadow(p, l) * (1.0f - ring_cover(p, l)) : 1.0f;
+  if (full && vis > 0.0f) vis *= landmark_vis(p + v3(0, 0.002f, 0), l);
   V3 spec = sun_at(p) * (ggx_spec(n, v, l, fminf(0.07f + 0.004f * t, 0.3f), 0.02f) * vis);
   // body of the water: seabed seen through absorbing water
   float depth_m = fmaxf(level - terrain(v2(p.x, p.z), 7), 0.0f) * 1000.0f;
@@ -1013,123 +1108,213 @@ __device__ Hit trace(V3 o, V3 d, float pix, Rng& rng) {
   return hres;
 }
 
-// ---------------------------------------------------------------- overlays
+// ---------------------------------------------------------------- text
 
-__device__ float seg_dist(V2 p, V4 s) {
-  V2 a = v2(s.x, s.y), b = v2(s.z, s.w);
-  V2 pa = p - a, ba = b - a;
-  float h = sat(dot(pa, ba) / fmaxf(dot(ba, ba), 1e-6f));
-  return length(pa - ba * h);
+// Per text, once per frame (k_textlight): the haze between the eye and the
+// text's middle (transmittance and in-scattered light) and the sun reaching
+// it. A text is small and at one depth, so one value serves all its pixels,
+// and every tile computes the same.
+__device__ V3 g_ttr[MAX_TEXTS], g_tins[MAX_TEXTS], g_tsun[MAX_TEXTS];
+
+__device__ __forceinline__ V3 text_mid(const GText& g) {
+  return g.center + g.right * (0.5f * g.width * g.height) + g.up * ((0.5f * (g.ylo + g.yhi)) * g.height);
 }
 
-// Distance from p (glyph units, z out of the text plane) to the strokes of
-// glyphs gi-1..gi+1 of a text, as round tubes along each segment. Also returns
-// the nearest point on the stroke centre lines (for the normal).
-__device__ float text_sdf(const GText& g, V3 p, V3* nearest) {
-  int gi = (int)floorf(p.x / GLYPH_ADVANCE);
-  float best = 1e9f;
-  V3 bc = v3(0.0f);
-  for (int k = gi - 1; k <= gi + 1; k++) {
-    if (k < 0 || k >= g.len) continue;
-    unsigned char ch = g.ch[k];
-    if (ch >= 128) continue;
-    int s0 = cGStart[ch], n = cGCount[ch];
-    V2 q = v2(p.x - k * GLYPH_ADVANCE, p.y);
-    for (int m = 0; m < n; m++) {
-      V4 sg = cSeg[s0 + m];
-      V2 a = v2(sg.x, sg.y), b = v2(sg.z, sg.w);
-      V2 pa = q - a, ba = b - a;
-      float h = sat(dot(pa, ba) / fmaxf(dot(ba, ba), 1e-6f));
-      V2 c = a + ba * h;
-      V2 dd = q - c;
-      float d2 = dot(dd, dd) + p.z * p.z;
-      if (d2 < best) { best = d2; bc = v3(c.x + k * GLYPH_ADVANCE, c.y, 0.0f); }
+// A ray against a text's plane: the distance along the ray and the point in
+// em on the baseline frame. False when the ray runs along it or away.
+__device__ bool text_plane(const GText& g, V3 o, V3 d, float* tp, float* x, float* y) {
+  V3 n = cross(g.right, g.up);
+  float den = dot(d, n);
+  if (fabsf(den) < 1e-7f) return false;
+  float t = dot(g.center - o, n) / den;
+  if (t <= 0.0f) return false;
+  V3 q = o + d * t - g.center;
+  *tp = t;
+  *x = dot(q, g.right) / g.height;
+  *y = dot(q, g.up) / g.height;
+  return true;
+}
+
+// Type (the clock in every style, and the lockup message): warm light in a
+// plane facing the camera, attenuated and scattered by the haze in front of
+// it, over a soft wide shade that keeps it readable over bright cloud. The
+// clock is not occluded: it is drawn over whatever the pixel shows.
+__device__ V3 draw_type(const GText& g, int gi, V3 o, V3 d, V3 base, float pix, float depth) {
+  float tp, x, y;
+  if (!text_plane(g, o, d, &tp, &x, &y)) return base;
+  if (x < -0.6f || x > g.width + 0.6f || y < -0.6f || y > 1.4f) return base;
+  if (g.occlude && depth < tp) return base;
+  float dist = sdf_dist(g, x, y);
+  if (dist >= SDF_SPREAD - 1e-3f) return base;
+  float fw = fmaxf(pix * tp / g.height, 1e-5f);  // a pixel in em
+  float cov = sat(0.5f - dist / fw);
+  V3 tr = g_ttr[gi], ins = g_tins[gi];
+  float haze = 1.0f - (tr.x + tr.y + tr.z) * (1.0f / 3.0f);
+  float out = fmaxf(dist, 0.0f);
+  // The shade: near the letters, what lies behind is held below 0.22 of the
+  // exposed range (bright cloud is darkened, dark sky and ground are left
+  // alone), fading out over about 0.14 em.
+  float sh = g.shade * g.alpha * __expf(-out * (1.0f / 0.14f));
+  float lb = lum(base) * cP.exposure;
+  if (lb > 0.22f) base = base * (1.0f - sh * (1.0f - 0.22f / lb));
+  // the type's light is set against the frame's exposure, so it reads as
+  // near white at any time of day
+  V3 Le = g.color * (1.0f / cP.exposure);
+  // its light scattered by the haze around the letters (none for the clock:
+  // it is near, and a glow would cost it contrast)
+  float glow = g.occlude ? __expf(-out * (1.0f / 0.05f)) * (0.03f + 0.6f * haze) : 0.0f;
+  V3 L = ins + Le * tr;
+  base = mix(base, L, cov * g.alpha);
+  return base + Le * tr * (glow * g.alpha * (1.0f - cov));
+}
+
+#define SMOKE_WRITE 2.2f   // em written per second
+#define SMOKE_GROW 0.002f  // em a puff's radius grows per second
+#define SMOKE_WIND_X 0.008f
+#define SMOKE_WIND_Y 0.003f
+
+__device__ __forceinline__ float hash01(uint32_t h) {
+  h ^= h >> 16; h *= 0x7feb352dU; h ^= h >> 15; h *= 0x846ca68bU; h ^= h >> 16;
+  return (h & 0xFFFFFF) * (1.0f / 16777216.0f);
+}
+
+// Skywriting: smoke puffs laid along each glyph's centreline, left to right
+// at SMOKE_WRITE em/s. At the head a puff is the stroke's own width and dense;
+// behind it each grows by SMOKE_GROW em/s (thinning, keeping its smoke),
+// drifts with the wind and wanders on its own. A puff is a Gaussian blob, so
+// its optical depth along the ray is closed form; it is lit by the sun with
+// the clouds' scattering (several orders, through its own depth toward the
+// sun) and by the sky.
+__device__ V3 draw_smoke(const GText& g, int gi, V3 o, V3 d, V3 base, float depth) {
+  V3 n = cross(g.right, g.up);
+  float em = g.height;
+  V3 oc = o - g.center;
+  V3 ol = v3(dot(oc, g.right), dot(oc, g.up), dot(oc, n)) / em;
+  V3 dl = v3(dot(d, g.right), dot(d, g.up), dot(d, n)) / em;
+  if (fabsf(dl.z) < 1e-7f) return base;
+  float t0 = -ol.z / dl.z;  // km to the plane
+  if (t0 <= 0.0f) return base;
+  float px = ol.x + dl.x * t0, py = ol.y + dl.y * t0;
+  float wx = SMOKE_WIND_X * g.age + 0.6f, wy = SMOKE_WIND_Y * g.age + 0.6f;
+  if (px < -0.6f || px > g.width + wx || py < -0.6f || py > 1.2f + wy) return base;
+  if (g.occlude && depth < t0) return base;
+  V3 dn = normalize(dl);
+  float c = dot(d, cP.sun_dir);
+  V3 Esun = g_tsun[gi];
+  V3 amb = sky_lookup(v3(0, 1, 0)) * 0.8f;
+  float tau = 0.0f;
+  V3 Lw = v3(0.0f);
+  for (int i = 0; i < g.len; i++) {
+    unsigned char ch = g.ch[i];
+    if (ch < 33 || ch > 126) continue;
+    float adv = cSdf[ch - 32].advance;
+    if (px < g.gx[i] - 0.5f || px > g.gx[i] + adv + wx || py > 1.2f + wy) continue;
+    int k0 = cPuffStart[ch - 32], kn = cPuffCount[ch - 32];
+    for (int k = 0; k < kn; k++) {
+      const short* pf = cG.puffs + 3 * (k0 + k);
+      float xs = g.gx[i] + pf[0] * (1.0f / 4096.0f), ys = pf[1] * (1.0f / 4096.0f);
+      float a = g.age - xs / SMOKE_WRITE;  // seconds since the plane laid this puff
+      if (a < 0.0f) continue;
+      uint32_t hk = (uint32_t)(i * 977 + k * 131 + ch);
+      float h1 = hash01(hk), h2 = hash01(hk ^ 0x9E37u), h3 = hash01(hk ^ 0x85EBu), h4 = hash01(hk ^ 0xC2B2u);
+      float r0 = (0.6f * pf[2] * (1.0f / 4096.0f) + 0.01f) * (0.85f + 0.3f * h1);
+      float r = r0 + SMOKE_GROW * a;
+      float wander = 0.004f + 0.004f * a;
+      V3 P = v3(xs + SMOKE_WIND_X * a + (h2 - 0.5f) * 2.0f * wander, ys + SMOKE_WIND_Y * a + (h3 - 0.5f) * 2.0f * wander,
+                (h4 - 0.5f) * 0.6f * r);
+      V3 w = P - ol;
+      float tt = dot(w, dn);
+      V3 cl = ol + dn * tt - P;
+      float d2 = dot(cl, cl);
+      if (d2 > 9.0f * r * r) continue;
+      float A = 22.0f * powf(r0 / r, 2.2f) * (0.75f + 0.5f * hash01(hk ^ 0x27D4u));  // density at the centre, per em
+      // billows: noise at the ray's closest point to the puff, moving with it
+      V3 nq = (cl + P) * 6.0f + v3(h1, h2, h3) * 3.0f;
+      float bil = cloud_tex(v3(nq.x * 0.13f, nq.y * 0.13f, nq.z * 0.13f + 0.01f * a));
+      float ti = A * r * 1.7724539f * __expf(-d2 / (r * r)) * (0.35f + 1.3f * bil);
+      float od_sun = 0.5f * A * r * 1.7724539f;
+      float powder = 1.0f - 0.6f * __expf(-ti * 2.0f);
+      V3 Lin = Esun * (cloud_scatter(c, od_sun) * 4.0f * PI_F * 0.55f * powder) + amb;
+      Lw += Lin * ti;
+      tau += ti;
     }
   }
-  *nearest = bc;
-  return sqrtf(best);
+  if (tau < 1e-4f) return base;
+  float T = __expf(-tau * g.alpha);
+  V3 Ls = Lw * ((1.0f - T) / tau);
+  V3 tr = g_ttr[gi], ins = g_tins[gi];
+  return base * T + ins * (1.0f - T) + Ls * tr;
 }
 
-#define TEXT_TUBE 0.46f  // stroke radius, glyph units (words)
-#define CLOCK_TUBE 0.72f  // the clock's heavier strokes
+// Landmark: the word as big solid letters standing on a ridge, extruded,
+// lit by the sun (shadowed by terrain and clouds) and the sky, hidden by
+// nearer terrain, behind the haze; at dusk a soft warm light along the edges
+// of the faces. They cast their shadows on the terrain (landmark_vis).
+__device__ V3 draw_landmark(const GText& g, int gi, V3 o, V3 d, V3 base, float pix, float depth) {
+  V3 ol, dl;
+  landmark_ray(g, o, d, &ol, &dl);
+  float ta, tb;
+  if (!landmark_box(g, ol, dl, &ta, &tb)) return base;
+  if (g.occlude && depth < ta) return base;
+  float t = ta, mind = 1e9f, tmin = ta;
+  bool hit = false;
+  for (int it = 0; it < 64 && t < tb; it++) {
+    float fw = fmaxf(pix * t / g.height, 1e-5f);
+    float dist = landmark_sdf(g, ol + dl * t);
+    if (dist < mind) { mind = dist; tmin = t; }
+    if (dist < 0.25f * fw) { hit = true; tmin = t; break; }
+    t += fmaxf(dist, 0.1f * fw) * g.height;
+  }
+  float fw = fmaxf(pix * tmin / g.height, 1e-5f);
+  float cov = hit ? 1.0f : sat(1.0f - mind / fw);
+  if (cov <= 0.0f) return base;
+  if (g.occlude && depth < tmin) return base;
+  V3 q = ol + dl * tmin;
+  const float h = 0.01f;
+  V3 gl = v3(landmark_sdf(g, q + v3(h, 0, 0)) - landmark_sdf(g, q - v3(h, 0, 0)),
+             landmark_sdf(g, q + v3(0, h, 0)) - landmark_sdf(g, q - v3(0, h, 0)),
+             landmark_sdf(g, q + v3(0, 0, h)) - landmark_sdf(g, q - v3(0, 0, h)));
+  V3 nl = normalize(gl + v3(0, 0, 1e-6f));
+  V3 nz = cross(g.right, g.up);
+  V3 nw = normalize(g.right * nl.x + g.up * nl.y + nz * nl.z);
+  if (dot(nw, d) > 0.0f) nw = -nw;
+  float ndl = fmaxf(dot(nw, cP.sun_dir), 0.0f);
+  V3 amb = sky_lookup(v3(0, 1, 0)) * (0.35f + 0.35f * nw.y) + v3(0.02f, 0.025f, 0.02f) * (0.5f - 0.5f * nw.y);
+  V3 L = v3(0.78f, 0.76f, 0.72f) * (g_tsun[gi] * (ndl / PI_F) + amb);  // painted white
+  // dusk: a soft warm light along the edges of the faces
+  float dusk = 1.0f - smoothstepf(0.03f, 0.3f, cP.sun_dir.y);
+  float d2 = sdf_dist(g, q.x, q.y);
+  if (fabsf(q.z) > 0.5f * LANDMARK_DEPTH - 0.02f) L = L + g.color * (dusk * __expf(fminf(d2, 0.0f) * (1.0f / 0.035f)));
+  return mix(base, g_tins[gi] + L * g_ttr[gi], cov * g.alpha);
+}
 
-// Emissive text and light spheres, drawn per frame at the current t on top of
-// the accumulated image. Exact (no sampling), so the same on every GPU. They
-// are hidden where the pixel's first hit (`depth`, from the frame's or the
-// hold's first sample) is nearer than they are. Letters are glowing glass
-// tubes: lit by the sun and the sky, with an emissive core, a bright rim and a
-// soft halo.
+__global__ void k_textlight() {
+  int i = threadIdx.x;
+  if (i >= cP.n_text) return;
+  const GText& g = cP.text[i];
+  V3 o = cP.cam.pos, m = text_mid(g);
+  float dist = length(m - o);
+  V3 tr;
+  g_tins[i] = scatter(o, (m - o) / fmaxf(dist, 1e-6f), dist, 8, &tr);
+  g_ttr[i] = tr;
+  float vis = cP.sun_dir.y > -0.1f ? terrain_shadow(m, cP.sun_dir) * fmaxf(cloud_shadow(m, cP.sun_dir), 0.4f) : 0.0f;
+  g_tsun[i] = sun_at(m) * vis;
+}
+
+// The clock, the newest word and light spheres, drawn per frame at the
+// current t on top of the accumulated image. Exact (no sampling), so the same
+// on every GPU. A word is hidden where the pixel's first hit (`depth`, from
+// the frame's or the hold's first sample) is nearer than it is; the clock
+// never is.
 __device__ V3 overlay(V3 o, V3 d, V3 base, float pix, float depth) {
-  for (int i = 0; i < cP.n_text; i++) {
+  // the words first, the clock (text 0) last, over everything
+  for (int k = 1; cP.text_overlay && k <= cP.n_text; k++) {
+    int i = k % cP.n_text;
     const GText& g = cP.text[i];
     if (g.alpha <= 0.0f || g.len == 0) continue;
-    V3 nrm = cross(g.right, g.up);  // toward the camera that the text faces
-    float sc = GLYPH_H / g.height;  // glyph units per km
-    float width = g.len * GLYPH_ADVANCE - (GLYPH_ADVANCE - GLYPH_W);
-    V3 oc = o - g.center;
-    // ray in glyph space; t stays in km
-    V3 ol = v3(dot(oc, g.right) * sc + 0.5f * width, dot(oc, g.up) * sc + 0.5f * GLYPH_H, dot(oc, nrm) * sc);
-    V3 dl = v3(dot(d, g.right) * sc, dot(d, g.up) * sc, dot(d, nrm) * sc);
-    if (fabsf(dl.z) < 1e-6f) continue;
-    // slab |z| <= margin around the text plane
-    const float margin = 3.0f;
-    float t0 = (-margin - ol.z) / dl.z, t1 = (margin - ol.z) / dl.z;
-    if (t0 > t1) { float tt = t0; t0 = t1; t1 = tt; }
-    t0 = fmaxf(t0, 0.0f);
-    if (t1 <= t0) continue;
-    V3 pm = ol + dl * (0.5f * (t0 + t1));
-    if (pm.x < -margin - 2.0f || pm.x > width + margin + 2.0f || pm.y < -margin - 2.0f || pm.y > GLYPH_H + margin + 2.0f)
-      continue;
-    float fw = fmaxf(pix * t0 * sc, 1e-4f);  // a pixel in glyph units at the slab
-    float t = t0, mind = 1e9f, tmin = t0;
-    bool hit = false;
-    V3 nearest = v3(0.0f), ph = v3(0.0f), nmin = v3(0.0f);
-    for (int it = 0; it < 40 && t < t1; it++) {
-      V3 pl = ol + dl * t;
-      V3 nr;
-      float dist = text_sdf(g, pl, &nr) - (g.style == 1 ? CLOCK_TUBE : TEXT_TUBE);
-      if (dist < mind) { mind = dist; ph = pl; nmin = nr; tmin = t; }
-      if (dist < 0.25f * fw) { hit = true; break; }
-      t += fmaxf(dist, 0.05f) / sc;
-    }
-    nearest = nmin;
-    t = tmin;
-    // full cover on a hit, partial for a ray passing within a pixel of the tube
-    float cov = hit ? 1.0f : sat(1.0f - mind / fw);
-    if (cov > 0.0f) hit = true;
-    float glow = __expf(-fmaxf(mind, 0.0f) * 1.2f) * 0.18f;
-    float tw = hit ? t : 0.5f * (t0 + t1);
-    if (g.occlude && depth < tw) continue;  // behind terrain: the pixel's first hit is nearer
-    float Ta = __expf(-tw * 0.018f);
-    if (hit) {
-      V3 nl = normalize(ph - nearest);
-      V3 n = normalize(g.right * nl.x + g.up * nl.y + nrm * nl.z);
-      V3 v = -d;
-      V3 wp = o + d * t;
-      V3 Es = sun_at(wp);
-      float ndl = fmaxf(dot(n, cP.sun_dir), 0.0f);
-      V3 amb = sky_lookup(n.y > -0.2f ? n : v3(0, 1, 0)) * 0.9f;
-      float nv = sat(dot(n, v));
-      float rim = powf(1.0f - nv, 2.5f);
-      V3 L;
-      if (g.style == 1) {
-        // dark lacquered core, lit by the scene, with a bright rim: reads over
-        // bright cloud (the core) and over dark ground (the rim)
-        V3 lit = v3(0.03f) * (Es * (ndl / PI_F) + amb) + Es * ggx_spec(n, v, cP.sun_dir, 0.25f, 0.05f);
-        L = lit + g.color * (0.03f + 2.4f * powf(1.0f - nv, 1.1f));
-      } else {
-        V3 col = g.color * (1.0f / 2.6f);  // albedo-scaled hue
-        V3 lit = col * (Es * (ndl * 0.7f / PI_F) + amb) + Es * ggx_spec(n, v, cP.sun_dir, 0.22f, 0.04f);
-        L = lit + g.color * (0.45f + 1.4f * rim);
-      }
-      base = mix(base, L * Ta, g.alpha * cov);
-    }
-    if (g.style == 1) {
-      // a soft dark halo instead of a glow, so the outline holds over cloud
-      if (!hit || cov < 1.0f) base = base * (1.0f - 0.6f * __expf(-fmaxf(mind, 0.0f) * 0.7f) * g.alpha);
-    } else {
-      base = base + g.color * (glow * g.alpha * Ta);
-    }
+    if (g.style == GTEXT_TYPE) base = draw_type(g, i, o, d, base, pix, depth);
+    else if (g.style == GTEXT_SMOKE) base = draw_smoke(g, i, o, d, base, depth);
+    else if (g.style == GTEXT_LANDMARK) base = draw_landmark(g, i, o, d, base, pix, depth);
   }
   for (int i = 0; i < cP.n_lights; i++) {
     const GLight& l = cP.lights[i];
@@ -1570,6 +1755,31 @@ __global__ void k_cloud_volume(float* out) {
 
 // ---------------------------------------------------------------- host
 
+static std::vector<uint8_t> b64_decode(const char* in) {
+  auto val = [](char c) -> int {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+  };
+  std::vector<uint8_t> out;
+  uint32_t acc = 0;
+  int bits = 0;
+  for (const char* p = in; *p; p++) {
+    int v = val(*p);
+    if (v < 0) continue;  // padding
+    acc = (acc << 6) | (uint32_t)v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push_back((uint8_t)((acc >> bits) & 0xFF));
+    }
+  }
+  return out;
+}
+
 Renderer::Renderer() {}
 Renderer::~Renderer() {}
 
@@ -1604,10 +1814,31 @@ bool Renderer::init(std::string* err) {
     CK(cudaMalloc(&noise_, sizeof(V4) * NOISE_N * NOISE_N));
     CK(cudaMemcpyAsync(noise_, hn.tab.data(), sizeof(V4) * NOISE_N * NOISE_N, cudaMemcpyHostToDevice, st));
     // font
-    const FontTable& f = font_table();
-    CK(cudaMemcpyToSymbolAsync(cSeg, f.seg, sizeof f.seg, 0, cudaMemcpyHostToDevice, st));
-    CK(cudaMemcpyToSymbolAsync(cGStart, f.start, sizeof f.start, 0, cudaMemcpyHostToDevice, st));
-    CK(cudaMemcpyToSymbolAsync(cGCount, f.count, sizeof f.count, 0, cudaMemcpyHostToDevice, st));
+    // Inter's signed distance atlas -> a 2D texture, bilinear, read as 0..1
+    cudaTextureObject_t sdf_tex_ = 0;
+    void* puffs_dev = nullptr;
+    {
+      std::vector<uint8_t> atlas = b64_decode(kSdfAtlasB64);
+      if (atlas.size() != (size_t)SDF_ATLAS_W * SDF_ATLAS_H) throw std::runtime_error("font atlas has the wrong size");
+      cudaChannelFormatDesc ad = cudaCreateChannelDesc<unsigned char>();
+      cudaArray_t aarr;
+      CK(cudaMallocArray(&aarr, &ad, SDF_ATLAS_W, SDF_ATLAS_H));
+      CK(cudaMemcpy2DToArray(aarr, 0, 0, atlas.data(), SDF_ATLAS_W, SDF_ATLAS_W, SDF_ATLAS_H, cudaMemcpyHostToDevice));
+      cudaResourceDesc ard = {};
+      ard.resType = cudaResourceTypeArray;
+      ard.res.array.array = aarr;
+      cudaTextureDesc atd = {};
+      atd.addressMode[0] = atd.addressMode[1] = cudaAddressModeClamp;
+      atd.filterMode = cudaFilterModeLinear;
+      atd.readMode = cudaReadModeNormalizedFloat;
+      atd.normalizedCoords = 0;
+      CK(cudaCreateTextureObject(&sdf_tex_, &ard, &atd, nullptr));
+      CK(cudaMemcpyToSymbolAsync(cSdf, kSdfGlyphs, sizeof kSdfGlyphs, 0, cudaMemcpyHostToDevice, st));
+      CK(cudaMemcpyToSymbolAsync(cPuffStart, kSdfPuffStart, sizeof kSdfPuffStart, 0, cudaMemcpyHostToDevice, st));
+      CK(cudaMemcpyToSymbolAsync(cPuffCount, kSdfPuffCount, sizeof kSdfPuffCount, 0, cudaMemcpyHostToDevice, st));
+      CK(cudaMalloc(&puffs_dev, sizeof kSdfPuffs));
+      CK(cudaMemcpyAsync(puffs_dev, kSdfPuffs, sizeof kSdfPuffs, cudaMemcpyHostToDevice, st));
+    }
     // transmittance
     CK(cudaMalloc(&trans_, sizeof(V4) * TRANS_W * TRANS_H));
     CK(cudaMalloc(&sky_, sizeof(V4) * SKY_W * SKY_H));
@@ -1663,6 +1894,8 @@ bool Renderer::init(std::string* err) {
     CK(cudaCreateTextureObject(&mtex, &mrd, &mtd, nullptr));
     g.macro = mtex;
     g.macro_arr = mac;
+    g.sdf = sdf_tex_;
+    g.puffs = (const short*)puffs_dev;
     CK(cudaMemcpyToSymbolAsync(cG, &g, sizeof g, 0, cudaMemcpyHostToDevice, st));
     CK(cudaStreamSynchronize(st));
     CK(cudaFree(vol));
@@ -1765,6 +1998,7 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
   }
   spp = spp < 1 ? 1 : spp > 64 ? 64 : spp;
   p.hq = hq;
+  p.text_overlay = text_overlay_ ? 1 : 0;
   stats_.hq = hq != 0;
   bool half = stride > 1;
   p.spp = spp;
@@ -1814,6 +2048,7 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
   CK(cudaEventRecord((cudaEvent_t)ev0_, st));
   k_sky<<<dim3(SKY_W / 64, SKY_H), 64, 0, st>>>((V4*)sky_);
   k_sunvis<<<1, 1, 0, st>>>();
+  k_textlight<<<1, MAX_TEXTS, 0, st>>>();
   unsigned int zero = 0;
   CK(cudaMemcpyToSymbolAsync(g_bad, &zero, sizeof zero, 0, cudaMemcpyHostToDevice, st));
   dim3 bs(8, 8);

@@ -4,6 +4,7 @@
 // changes. New connections use the new pair; open ones keep theirs.
 #pragma once
 #include <stdint.h>
+#include <sys/stat.h>
 
 #include <atomic>
 #include <memory>
@@ -64,6 +65,8 @@ class TlsFront {
   mutable std::mutex mu_;
   std::shared_ptr<SSL_CTX> ctx_;
   std::string not_after_;
+  struct stat loaded_st_ {};  // the version (inode, size, mtime) of the file last loaded
+  bool have_loaded_st_ = false;
   std::atomic<uint64_t> gen_{0};
   std::atomic<bool> stop_{false};
   std::thread watcher_;

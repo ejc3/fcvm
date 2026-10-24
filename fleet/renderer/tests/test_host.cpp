@@ -2,15 +2,19 @@
 // and holds, tile geometry, wire formats.
 #include <cmath>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include "../src/budget.h"
+#include "../src/font_sdf.h"
 #include "../src/jpeg.h"
 #include "../src/json.h"
 #include "../src/nvenc.h"
 #include "../src/proto.h"
 #include "../src/scene.h"
+#include "../src/subscriber.h"
 #include "../src/world.h"
 #include "check.h"
 #include "tls_check.h"
@@ -22,6 +26,36 @@ static const char* kContractExample =
                    {"t": 10.0, "pos": [5,1,0], "look": [5,1,10], "fov_deg": 60.0}],
         "time_of_day": 0.35, "words": [{"text":"HELLO","t":12.0}],
         "lights": [{"pos":[1,1,1],"color":[1,0.5,0.2],"t":30.0}]})";
+
+
+// Source-level checks for pipeline.cpp, which needs CUDA and so is not built
+// here. Reads the file next to this one; an unreadable file fails the check.
+static std::vector<std::string> source_lines(const std::string& rel) {
+  std::string me = __FILE__;
+  std::string dir = me.substr(0, me.find_last_of('/') + 1);
+  std::ifstream f(dir + rel);
+  std::vector<std::string> out;
+  for (std::string l; std::getline(f, l);) out.push_back(l);
+  return out;
+}
+// True when the line at i runs with hmu_ held: a lock_guard on hmu_ earlier in
+// the same block or an enclosing one (not inside a block already closed, like a
+// try before its catch), inside the same function. Walks back character by
+// character: a '{' leaves for the enclosing block, a '}' enters a closed one.
+static bool under_hmu(const std::vector<std::string>& src, size_t i) {
+  int depth = 0, low = 0;
+  for (size_t j = i; j-- > 0;) {
+    const std::string& l = src[j];
+    if (l.find("lock_guard<std::mutex>") != std::string::npos && l.find("(hmu_)") != std::string::npos && depth == low)
+      return true;
+    for (size_t c = l.size(); c-- > 0;) {
+      if (l[c] == '}') depth++;
+      if (l[c] == '{') low = std::min(low, --depth);
+    }
+    if (!l.empty() && l[0] != ' ' && l[0] != '}' && l[0] != '/' && l[0] != '#') return false;  // a function starts here
+  }
+  return false;
+}
 
 static Scene two_holds() {
   Scene s;
@@ -87,7 +121,7 @@ int main() {
     CHECK(e.words.empty() && e.lights.empty(), "empty words and lights parse");
     Scene lc = parse_scene(R"({"epoch_unix_ms":0,"rect":{"x":0,"y":0,"w":1,"h":1},"image_aspect":1.7778,
         "camera":[{"t":0,"pos":[0,1,0],"look":[0,1,1],"fov_deg":60}],"time_of_day":0.5,"words":[{"text":"hi é!","t":1}]})");
-    CHECK(lc.words.size() == 1 && lc.words[0].text == "HI !", "text uppercased and filtered: '%s'", lc.words[0].text.c_str());
+    CHECK(lc.words.size() == 1 && lc.words[0].text == "hi !", "text filtered to ASCII: '%s'", lc.words[0].text.c_str());
     auto bad = [](const char* j) {
       try { parse_scene(j); } catch (const std::exception&) { return true; }
       return false;
@@ -342,6 +376,219 @@ int main() {
     BudgetSchedule none = schedule_after_scene(s2, false, false, 50);
     CHECK(none.size() == 0, "nothing in force, nothing carried");
     CHECK(schedule_after_scene(s2, true, true, 200).size() == 0, "a scene budget clears the schedule");
+  }
+  // --- text styles (words[].text_style)
+  {
+    auto scene_with = [](const std::string& word) {
+      return parse_scene(R"({"epoch_unix_ms":0,"rect":{"x":0,"y":0,"w":1,"h":1},"image_aspect":1.7778,
+        "camera":[{"t":0,"pos":[-15,2.2,-100],"look":[-70,1.4,-70],"fov_deg":62}],"time_of_day":0.245,"words":[)" + word +
+                         "]}");
+    };
+    CHECK(scene_with(R"({"text":"AVA hi","t":1})").words[0].style == TEXT_STYLE_LOCKUP, "text_style absent: lockup");
+    CHECK(scene_with(R"({"text":"a","t":1,"text_style":"skywriting"})").words[0].style == TEXT_STYLE_SKYWRITING &&
+              scene_with(R"({"text":"a","t":1,"text_style":"landmark"})").words[0].style == TEXT_STYLE_LANDMARK &&
+              scene_with(R"({"text":"a","t":1,"text_style":"lockup"})").words[0].style == TEXT_STYLE_LOCKUP &&
+              scene_with(R"({"text":"a","t":1,"text_style":null})").words[0].style == TEXT_STYLE_LOCKUP,
+          "text_style names");
+    bool threw = false;
+    try { scene_with(R"({"text":"a","t":1,"text_style":"classic"})"); } catch (const std::exception&) { threw = true; }
+    CHECK(threw, "an unknown text_style (classic is gone) is refused");
+    Tile tl = tile_geometry(Rect{0, 0, 1, 1}, 16.0 / 9, 540);
+    uint64_t key;
+    bool held;
+    FrameParams pl = build_frame(scene_with(R"({"text":"AVA hi","t":1})"), tl, 2.0, &key, &held);
+    CHECK(pl.n_text == 2 && pl.text[0].style == GTEXT_TYPE && pl.text[1].style == GTEXT_TYPE &&
+              memcmp(pl.text[1].ch, "AVA hi", 6) == 0,
+          "lockup: the clock and the word as type, case kept");
+    CHECK(pl.text[0].occlude == 0 && pl.text[1].occlude == 1, "nothing hides the clock; terrain hides the word");
+    // kerning: V tucks under A, so V starts before A's advance ends
+    CHECK(pl.text[1].gx[1] < pl.text[1].gx[0] + 0.69f - 0.02f, "A V kerned (V at %.3f em)", pl.text[1].gx[1]);
+    // the clock's digits sit on one advance: its width does not change as it counts
+    FrameParams p2 = build_frame(scene_with(R"({"text":"AVA hi","t":1})"), tl, 3.0, &key, &held);
+    CHECK(fabsf(pl.text[0].width - p2.text[0].width) < 1e-6f && pl.text[0].width > 3.0f,
+          "the clock's width does not change as it counts (%.4f, %.4f)", pl.text[0].width, p2.text[0].width);
+    // the message sits above the clock, both from one left edge
+    auto screen = [](const FrameParams& f, const GText& g, float* u, float* v) {
+      V3 d = g.center - f.cam.pos;
+      *u = dot(d, f.cam.right) / dot(d, f.cam.fwd);
+      *v = dot(d, f.cam.up) / dot(d, f.cam.fwd);
+    };
+    float um, vm, uc, vc;
+    screen(pl, pl.text[1], &um, &vm);
+    screen(pl, pl.text[0], &uc, &vc);
+    CHECK(fabsf(um - uc) < 1e-4f && vm > vc && um < 0, "left-aligned lockup, message above the clock (u %.4f %.4f, v %.4f %.4f)",
+          um, uc, vm, vc);
+    // the clock keeps its place whatever the word's style, or with no word
+    FrameParams ps = build_frame(scene_with(R"({"text":"Hello","t":1,"text_style":"skywriting"})"), tl, 2.0, &key, &held);
+    FrameParams pk = build_frame(scene_with(R"({"text":"Hello","t":1,"text_style":"landmark"})"), tl, 2.0, &key, &held);
+    FrameParams pn = build_frame(scene_with(R"({"text":"Hello","t":100})"), tl, 2.0, &key, &held);
+    float u2, v2_, u3, v3_, u4, v4_;
+    screen(ps, ps.text[0], &u2, &v2_);
+    screen(pk, pk.text[0], &u3, &v3_);
+    screen(pn, pn.text[0], &u4, &v4_);
+    CHECK(pn.n_text == 1 && fabsf(u2 - uc) < 1e-5f && fabsf(u3 - uc) < 1e-5f && fabsf(u4 - uc) < 1e-5f &&
+              fabsf(v2_ - vc) < 1e-5f && fabsf(v3_ - vc) < 1e-5f && fabsf(v4_ - vc) < 1e-5f,
+          "the clock does not move with the word's style");
+    CHECK(ps.text[1].style == GTEXT_SMOKE && pk.text[1].style == GTEXT_LANDMARK, "each word in its own style");
+    // skywriting stays up about 25 s after the last letter, then fades
+    FrameParams ps1 = build_frame(scene_with(R"({"text":"Hello","t":1,"text_style":"skywriting"})"), tl, 26.0, &key, &held);
+    FrameParams ps2 = build_frame(scene_with(R"({"text":"Hello","t":1,"text_style":"skywriting"})"), tl, 50.0, &key, &held);
+    CHECK(ps1.text[1].alpha == 1.0f && ps2.text[1].alpha == 0.0f, "skywriting: up at 25 s, gone at 49 s (%.2f, %.2f)",
+          ps1.text[1].alpha, ps2.text[1].alpha);
+    // landmark letters stand on the ground under their middles, facing where the camera was
+    const GText& lg = pk.text[1];
+    V3 nz = cross(lg.right, lg.up);
+    float dcam = length(lg.center - pk.cam.pos);
+    CHECK(dot(nz, pk.cam.pos - lg.center) > 0 && dcam > 2.0f && dcam < 15.0f, "landmark faces the camera, %.2f km out", dcam);
+    int on = 0;
+    for (int k = 0; k < lg.len; k++) {
+      if (lg.ch[k] == ' ') continue;
+      V3 base = lg.center + lg.right * ((lg.gx[k] + 0.25f) * lg.height) + lg.up * (lg.gy[k] * lg.height);
+      double bp[3] = {base.x, base.y, base.z};
+      double ground = std::max(0.0, (double)surface_h(v2(base.x, base.z), 9, host_noise().tab.data())) -
+                      (bp[0] * bp[0] + bp[2] * bp[2]) / (2.0 * PLANET_R);
+      on += fabs(base.y - ground) < 0.25 * lg.height;
+    }
+    CHECK(on >= lg.len - 1, "landmark letters stand on the ground (%d of %d)", on, lg.len);
+    // a landmark word starts a new hold (its letters shade the terrain)
+    uint64_t k1, k2;
+    build_frame(scene_with(R"({"text":"Hello","t":100,"text_style":"landmark"})"), tl, 50.0, &k1, &held);
+    build_frame(scene_with(R"({"text":"Hello","t":1,"text_style":"landmark"})"), tl, 50.0, &k2, &held);
+    CHECK(held && k1 != k2, "a landmark word changes the hold key");
+    // a landmark that appears on a frame slot inside a hold shades the terrain
+    // the same way on every frame of that hold: tiles that start rendering at
+    // the appearance frame and one frame later must accumulate the same samples
+    {
+      Scene sw = scene_with(R"({"text":"Hello","t":50,"text_style":"landmark"})");
+      uint64_t ka, kb;
+      bool ha, hb;
+      FrameParams fa = build_frame(sw, tl, 50.0, &ka, &ha);
+      FrameParams fb = build_frame(sw, tl, 50.0 + 1.0 / 30.0, &kb, &hb);
+      int sa = 0, sb = 0;
+      for (int i = 0; i < fa.n_text; i++) sa += casts_landmark_shadow(fa.text[i]);
+      for (int i = 0; i < fb.n_text; i++) sb += casts_landmark_shadow(fb.text[i]);
+      CHECK(ha && hb && ka == kb && sa == 1 && sb == 1,
+            "a landmark appearing inside a hold casts its shadow from the hold's first frame (held %d %d, same key %d, shadows %d %d)",
+            ha, hb, ka == kb, sa, sb);
+    }
+  }
+  // --- review round: tile width, re-tile height, layout switch, words, wrapped lockup, pipeline locking
+  {
+    // a rect too wide to encode at the requested height keeps the whole rect
+    Rect half_high{0, 0, 1, 0.5};
+    Tile t = tile_geometry(half_high, 16.0 / 9, 2160);
+    CHECK(t.w <= 4096 && std::abs(t.w - half_high.w * t.full_w) <= 1 && t.h == (int)std::lround(half_high.h * t.full_h),
+          "a wide tile covers its rect (w %d of full %d, h %d of full %d)", t.w, t.full_w, t.h, t.full_h);
+    Tile two = tile_geometry(Rect{0.5, 0, 0.5, 0.5}, 16.0 / 9, 2160);
+    CHECK(two.x0 <= t.w && two.x0 + two.w >= two.full_w - 1, "two wide tiles meet and reach the right edge (%d+%d of %d)",
+          two.x0, two.w, two.full_w);
+    // a whole image taller than any tile gets the tallest tile, not the shortest
+    int hh = tile_h_for(Rect{0, 0, 0.25, 1}, 16.0 / 9, 2880);
+    CHECK(hh == 2160, "re-tile to a full-height column from a 2880-high image: tile height %d", hh);
+    // a scene without layout_generation replaces a pending switch and ends the generation
+    Scene g2;
+    g2.layout_generation = 2;
+    g2.rect_from_frame = 300;
+    g2.has_previous_rect = true;
+    g2.previous_rect = Rect{0, 0, 0.5, 0.5};
+    g2.rect = Rect{0, 0, 0.5, 1};
+    LayoutSwitch ls;
+    ls.on_scene(g2);
+    CHECK(ls.pending && ls.next == 2 && ls.k == 300, "a new generation is pending");
+    ls.on_scene(g2);
+    CHECK(ls.pending && ls.k == 300, "the same generation re-posted changes nothing");
+    Scene plain;
+    ls.on_scene(plain);
+    CHECK(!ls.pending && !ls.take(300) && ls.cur == -1, "a generationless scene cancels the pending switch");
+    ls.on_scene(g2);
+    CHECK(ls.take(300) && ls.cur == 2 && !ls.pending, "the switch takes effect at its frame");
+    ls.on_scene(plain);
+    CHECK(ls.cur == -1 && !ls.pending, "a generationless scene leaves no generation in force (header null)");
+    // a word on screen is found behind words scheduled later
+    std::string words = R"({"text":"early","t":1})";
+    for (int i = 0; i < 16; i++) words += R"(,{"text":"later","t":)" + std::to_string(100 + i) + "}";
+    Scene ws = parse_scene(R"({"epoch_unix_ms":0,"rect":{"x":0,"y":0,"w":1,"h":1},"image_aspect":1.7778,
+        "camera":[{"t":0,"pos":[-15,2.2,-100],"look":[-70,1.4,-70],"fov_deg":60}],"time_of_day":0.245,"words":[)" + words + "]}");
+    uint64_t key;
+    bool held;
+    Tile whole = tile_geometry(Rect{0, 0, 1, 1}, 16.0 / 9, 1080);
+    FrameParams pw = build_frame(ws, whole, 10.0, &key, &held);
+    CHECK(pw.n_text == 2 && memcmp(pw.text[1].ch, "early", 5) == 0, "the word at t=1 shows at t=10 behind 16 later ones");
+    // a wrapped lockup message stays inside the image, its lines apart, above the clock
+    Scene wl = parse_scene(R"({"epoch_unix_ms":0,"rect":{"x":0,"y":0,"w":1,"h":1},"image_aspect":1.7778,
+        "camera":[{"t":0,"pos":[-15,2.2,-100],"look":[-70,1.4,-70],"fov_deg":60}],"time_of_day":0.245,
+        "words":[{"text":"WELCOME TO THE AMAZING WORLD","t":1}]})");
+    FrameParams pl = build_frame(wl, whole, 3.0, &key, &held);
+    auto v_of = [&](const GText& g, float em_up) {
+      V3 d = g.center + g.up * (em_up * g.height) - pl.cam.pos;
+      return dot(d, pl.cam.up) / (dot(d, pl.cam.fwd) * pl.cam.tan_half);
+    };
+    CHECK(pl.n_text == 3, "clock and two lines (%d texts)", pl.n_text);
+    if (pl.n_text == 3) {
+      float top1 = v_of(pl.text[1], SDF_CAP_HEIGHT), base1 = v_of(pl.text[1], 0);
+      float top2 = v_of(pl.text[2], SDF_CAP_HEIGHT), base2 = v_of(pl.text[2], 0);
+      float clock_top = v_of(pl.text[0], SDF_CAP_HEIGHT);
+      CHECK(top1 < 1.0f && top2 < 1.0f, "wrapped lockup inside the image (cap tops at v %.3f, %.3f)", top1, top2);
+      CHECK(top2 < base1 && clock_top < base2, "lines apart and above the clock (%.3f < %.3f, %.3f < %.3f)", top2, base1,
+            clock_top, base2);
+    }
+    // a lockup message wider than the image, with no space to wrap at or wrapped
+    // into lines still too wide, ends inside the image
+    auto right_u = [](const FrameParams& f, const GText& g) {
+      V3 d = g.center + g.right * (g.width * g.height) - f.cam.pos;
+      return dot(d, f.cam.right) / (dot(d, f.cam.fwd) * f.cam.tan_half * (16.0f / 9));
+    };
+    for (const char* text : {"WWWWWWWWWWWWWWWWWWWWWWWWWWWW",
+                             "W WWWWWWWWWWWWWWWWWWWWWWWWWW"}) {
+      Scene ww = parse_scene(std::string(R"({"epoch_unix_ms":0,"rect":{"x":0,"y":0,"w":1,"h":1},"image_aspect":1.7778,
+          "camera":[{"t":0,"pos":[-15,2.2,-100],"look":[-70,1.4,-70],"fov_deg":60}],"time_of_day":0.245,
+          "words":[{"text":")") + text + R"(","t":1}]})");
+      FrameParams pw2 = build_frame(ww, whole, 3.0, &key, &held);
+      float worst = -1e9f;
+      for (int i = 1; i < pw2.n_text; i++) worst = std::max(worst, right_u(pw2, pw2.text[i]));
+      CHECK(pw2.n_text >= 2 && worst < 1.0f, "a long lockup message ends inside the image (%zu chars, right edge u %.3f)",
+            strlen(text), worst);
+    }
+    // pipeline.cpp: the fields health_json and fatal() read on server threads are
+    // written under hmu_, and a failed encoder open gives its buffer back
+    std::vector<std::string> src = source_lines("../src/pipeline.cpp");
+    CHECK(src.size() > 100, "read src/pipeline.cpp (%zu lines)", src.size());
+    int writes = 0, unguarded = 0;
+    for (size_t i = 0; i < src.size(); i++) {
+      for (const char* f : {"fatal_ =", "gpu_name_ =", "startup_ready_ms_ =", "first_frame_ms_ =", "first_sent_ms_ ="}) {
+        if (src[i].find(f) == std::string::npos) continue;
+        writes++;
+        if (!under_hmu(src, i)) { unguarded++; fprintf(stderr, "  unguarded: pipeline.cpp:%zu: %s\n", i + 1, src[i].c_str()); }
+      }
+    }
+    CHECK(writes >= 5 && unguarded == 0, "health fields written under hmu_ (%d writes, %d not)", writes, unguarded);
+    bool fatal_read_locked = false, failed_retired = false;
+    for (size_t i = 0; i < src.size(); i++) {
+      if (src[i].find("return fatal_;") != std::string::npos) fatal_read_locked = under_hmu(src, i);
+      if (src[i].find("if (ready.failed) {") != std::string::npos)
+        for (size_t j = i + 1; j < src.size() && src[j].find("continue;") == std::string::npos; j++)
+          failed_retired = failed_retired || src[j].find("retire(ready)") != std::string::npos;
+    }
+    CHECK(fatal_read_locked, "fatal() reads fatal_ under hmu_");
+    CHECK(failed_retired, "a failed encoder open is retired (its NV12 buffer freed) before the stream is closed");
+  }
+  // --- a slow subscriber whose queue is cleared still gets the stream header
+  {
+    auto msg = [](const char* m) { return std::make_shared<const std::string>(m); };
+    Subscriber s;
+    s.offer_header(1080, msg("hdr-1080"));
+    CHECK(s.offer_frame(msg("key"), true) == Subscriber::SENT, "the first keyframe goes out");
+    for (int i = 0; i <= SUB_MAX_QUEUED_MSGS; i++) s.push(msg("frame"));  // the reader stalls
+    s.offer_header(720, msg("hdr-720"));  // its height changes: a new header is queued
+    CHECK(s.offer_frame(msg("key"), true) == Subscriber::DROPPED, "an overflowing queue is dropped");
+    // the next frame: the header for the current key, then the recovery keyframe
+    s.offer_header(720, msg("hdr-720"));
+    CHECK(s.offer_frame(msg("key"), false) == Subscriber::SKIPPED, "a delta frame waits for the keyframe");
+    CHECK(s.offer_frame(msg("key"), true) == Subscriber::SENT, "the recovery keyframe goes out");
+    std::string order;
+    for (auto& m : s.q) order += *m + " ";
+    CHECK(s.q.size() == 2 && *s.q[0] == "hdr-720" && *s.q[1] == "key",
+          "after a dropped queue the header is sent again before the keyframe (queue: %s)", order.c_str());
   }
   tlscheck::run();
   DONE();

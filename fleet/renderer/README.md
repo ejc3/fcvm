@@ -60,13 +60,14 @@ scene is at golden hour (sun about 7 degrees up):
   sun's disc), cloud shadow (from the first 8 km of the sun ray's crossing of
   the cloud layer, letting 14% through as diffuse light), and one bounce of
   sky or ground light; viewers' lights add point lighting.
-- **Words and the clock**: tubes along a stroke font, ray marched as 3D
-  distance fields and laid out on the screen (the clock, in Pacific time
-  with PDT or PST, centred near the top,
-  words in a grid below it, inside a safe area). Words are glowing glass; the
-  clock is solid dark metal with a bright rim and a dark halo, readable over
-  cloud and sky. Viewers' lights are glowing spheres. All drawn exactly (no
-  sampling) every frame.
+- **The clock and the newest word**: Inter from a signed distance atlas.
+  The clock (Pacific time, PDT or PST) is warm white type in the upper left,
+  never occluded, over a soft shade that holds bright cloud behind it down.
+  The word is drawn in its own `text_style`: lockup type above the clock,
+  smoke puffs written across the sky, or solid letters standing on a ridge
+  that cast shadows on the terrain. Viewers' lights are glowing spheres. All
+  drawn exactly (no sampling) every frame; the landmark's shadows are in the
+  path-traced samples.
 - The sun's glare: three exponential lobes around the sun's direction, scaled
   by how much of the sun the camera sees (a terrain and cloud shadow ray from
   the camera, one per frame).
@@ -95,6 +96,7 @@ src/render.cu      kernels: tables, path tracer, accumulation, tone map, NV12
 src/world.h        terrain and noise, shared by GPU and host (host keeps the eye above ground)
 src/scene.cpp      scene JSON, camera splines and holds, tile geometry, per-frame parameters
 src/pipeline.cpp   frame clock, subscribers, per-height encoders, sample budget, /health
+src/subscriber.cpp a subscriber's queue: header and keyframe rules, a slow reader dropped to the next keyframe
 src/server.cpp     HTTP/1.1 and WebSocket
 src/nvenc.cpp      NVENC (libnvidia-encode loaded at run time; header from nv-codec-headers, MIT)
 src/gpustats.cpp   NVML (libnvidia-ml loaded at run time)
@@ -298,6 +300,33 @@ Round 10, from the end-to-end run on eight T4s:
   stayed within 448 k to 489 k and the budget changed once (353,553 to
   420,448 at 225 s), 0 times in the last 3 minutes; the latest frames' fit on
   the same run still swung 447 k to 711 k. No frame took over 27.0 ms.
+
+Round 12, text (PROTOCOL.md "Words, the clock and lights"):
+
+- `shots/text-styles.jpg`: each message style (`words[].text_style`), a
+  hold (128 samples) and a moving frame at 1080, and the 8-GPU wall's whole
+  image at 360 (180 px tiles), the message "Hello from 8 GPUs".
+  `shots/text-clock-cloud.jpg`: the clock and a lockup message on a path
+  climbing through the cloud layer, at 1080 and at 360.
+- Seam test on three GPUs: 33/33 each, the same hashes on all three. Each
+  style stitches with 0 pixels different, moving and as a hold accumulated
+  in different batches, and draws its word; the landmark letters darken the
+  terrain in the path-traced samples (the overlay off); and over the cloud
+  that passes behind the clock on the shots' moving path, its letters are
+  brighter than the pixels around them by at least 0.3 (8-bit luminance /
+  255). Without the clock's shade, 6 km out, that check reads 0.28; with
+  round 11's clock, 0.17.
+- fps with the camera moving, each style against no word (the clock only)
+  on the same wall tile, the one its word falls in, two runs each, render ms:
+
+  | style | 180 px tile | 720p whole | 1080 detail of that tile | 1080 whole |
+  |---|---|---|---|---|
+  | lockup | 4.5 (4.4) | 25.6 (25.5 to 25.6), 30.0 fps | 13.7 to 13.8 (13.6), 30.0 fps | 56.8 (56.5 to 56.8), 15.0 fps |
+  | skywriting | 5.6 (5.4) | 25.9 (25.6), 30.0 fps | 14.2 (13.9 to 14.0), 30.0 fps | 57.0 to 57.2 (56.7 to 56.9), 15.0 fps |
+  | landmark | 14.4 to 14.5 (14.1) | 26.8 to 26.9 (25.7), 30.0 fps | 58.4 to 58.5 (57.9), 15.0 fps | 58.3 to 58.6 (56.8 to 56.9), 14.9 fps |
+
+  The landmark's tile is terrain the default budget draws at 15 fps in the
+  detail view with or without the letters.
 
 Stream quality at 180 px tiles (4 x 2 grid, 160 x 180 inner, 192 x 212
 delivered; one moving frame unencoded and as the eight streams decode it,
