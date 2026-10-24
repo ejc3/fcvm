@@ -1,7 +1,7 @@
 [workspace]
-members = [".", "fuse-pipe", "fc-agent", "exec-proto", "fc-mock", "failpoint"]
+members = [".", "fuse-pipe", "fc-agent", "exec-proto", "fc-mock", "failpoint", "fleet/core"]
 # Build all members by default (not just the root package)
-default-members = [".", "fuse-pipe", "fc-agent", "exec-proto", "fc-mock", "failpoint"]
+default-members = [".", "fuse-pipe", "fc-agent", "exec-proto", "fc-mock", "failpoint", "fleet/core"]
 # Exclude sync-test (used only for Makefile sync verification)
 exclude = ["sync-test"]
 # Resolver v2 makes --no-default-features work across all workspace members
@@ -68,6 +68,12 @@ vmm-sys-util = "0.15"
 shell-words = "1"
 fuse-pipe = { path = "fuse-pipe", default-features = false }
 exec-proto = { path = "exec-proto" }
+fleet-core = { path = "fleet/core" }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
+x509-parser = "0.18"
 failpoint = { path = "failpoint" }
 url = "2"
 axum = { version = "0.8", features = ["ws"] }
@@ -95,6 +101,9 @@ privileged-tests = []
 
 # libfuse remap_file_range container test (requires pre-built container)
 libfuse-test = []
+
+# Fleet aggregator tests through the ffmpeg CLI (requires ffmpeg with libx264)
+ffmpeg-tests = []
 
 [dev-dependencies]
 serial_test = "3"

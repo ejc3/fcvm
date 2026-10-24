@@ -1946,6 +1946,186 @@ gsum_failed() { jq -n --arg t "$G_SUMMARY_TEMPLATE" --arg f "$G_FAILED_BLOCK" --
 run_case "a greptile summary naming the head with comments outside the diff is claimable" \
   "$(wrapc "$(gsuites "$G_RUN_CLEAN")" "$(cmt "$GREPTILE" Bot 2026-01-02T00:51:00Z "$(gsum_failed "$HEAD40")")")" 1 "carry no disposition"
 
+echo "== finding 49: Codex's receipt-marked verdict, with the sign-offs it actually posts =="
+# Since 2026-10-15 Codex opens its no-findings comment with "<!-- codex-review-receipt:v1 -->".
+# The marker is a hidden HTML comment and was already dropped; what blocked #1190 was its
+# sign-off, "Delightful!", one of seven Codex had posted here that codex_line_re did not
+# list. receipt_body is the #1190 body: every receipt-marked comment on this repo is
+# codex_body with that marker line in front, byte for byte apart from sign-off and sha.
+receipt_body() { jq -n --argjson b "$(codex_body "$1" "$2")" '"<!-- codex-review-receipt:v1 -->\n\n" + $b'; }
+run_case "the #1190 receipt-marked verdict covers the head it names" \
+  "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(receipt_body ' Delightful!' deadbeef)")]")" \
+  0 "HEAD COVERED"
+run_case "the #1190 receipt-marked verdict needs no disposition" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(receipt_body ' Delightful!' deadbeef)")")" \
+  0 "CLEAR"
+for signoff in ' What shall we delve into next?' ' More of your lovely PRs please.' " Can't wait for the next one!" \
+               " Chef's kiss." ' Already looking forward to the next diff.' ' Another round soon, please!'; do
+  run_case "the codex sign-off '$signoff' is a verdict" \
+    "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(receipt_body "$signoff" deadbeef)")]")" \
+    0 "HEAD COVERED"
+done
+# Guards, blocked before and after: the same words with a finding after the sign-off, on its
+# line or below it, are a finding; a receipt-marked verdict for an older commit covers nothing;
+# and the receipt words from anyone but the Codex bot are an ordinary comment.
+run_case "the receipt verdict with a finding on the sign-off line is claimable, not coverage" \
+  "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(receipt_body ' Delightful! P1: the lease is dropped before the rename' deadbeef)")]")" \
+  1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "the receipt verdict with a finding appended below is claimable, not coverage" \
+  "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(receipt_body $' Delightful!\n\nP1: the lease is dropped before the rename, which races the pruner.' deadbeef)")]")" \
+  1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "a receipt verdict naming an older commit is not coverage" \
+  "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(receipt_body ' Delightful!' abc123def4)")]")" \
+  1 "UNREVIEWED HEAD"
+run_case "a human posting the receipt verdict is claimable, not coverage" \
+  "$(wrap6 "[$(cmt helpful-human User 2026-01-02T01:00:00Z "$(receipt_body ' Delightful!' deadbeef)")]")" \
+  1 "carry no disposition" "UNREVIEWED HEAD"
+
+echo "== finding 50: CodeRabbit's review-limit notice in its 2026-10 layout is a notice =="
+# From 2026-10-01 CodeRabbit's summary notice wraps its folded parts in <dl><dd>, bolds their
+# summaries, lists the run configuration as "- **Key**: value", links the limits docs at a
+# new path, and carries an Autofix checkbox between the notice and the tips. None of that
+# was a listed shape, so on #1199 the "Review limit reached" notice read as an unanswered
+# finding. CR_1199 is that body with its org, run and checkbox ids replaced and the range
+# moved onto this harness's base and head.
+IFS= read -r -d '' CR_1199_RAW <<'CR1199_EOF'
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->
+
+> [!WARNING]
+> ## Review limit reached
+> 
+> You've used all free OSS reviews for now. Wait for the free limit to reset to keep reviewing this public repository.
+> 
+> **Next included review available in 46 minutes.**
+> 
+> [Check out review usage here](https://app.coderabbit.ai/dashboard/review-capacity?orgId=00000000-0000-4000-8000-000000000001).
+> 
+> <details>
+> <summary><strong>View limit details</strong></summary>
+> <dl>
+> <dd>
+> 
+> **Limit details:** You’ve used the included review currently available.
+> 
+> [Learn how review limits work](https://docs.coderabbit.ai/management/rate-limits).
+> 
+> **Review configuration:**
+> 
+> <details>
+> <summary><strong>⚙️ Run configuration</strong></summary>
+> <dl>
+> <dd>
+> 
+> - **Source mode**: Auto
+> - **Repository**: Unavailable
+> - **Branch**: Unavailable
+> - **File**: No configuration file from this repository applied
+> - **Commit**: Unavailable
+> - **Layers**: defaults
+> - **Review profile**: CHILL
+> - **Plan**: Advanced
+> - **Run ID**: `00000000-0000-4000-8000-000000000002`
+> 
+> </dd>
+> </dl>
+> </details>
+> 
+> <details>
+> <summary><strong>📥 Commits</strong></summary>
+> <dl>
+> <dd>
+> 
+> Reviewing files that changed from the base of the PR and between @BASE@ and @HEAD@.
+> 
+> </dd>
+> </dl>
+> </details>
+> 
+> <details>
+> <summary><strong>⛔ Files ignored due to path filters: 1</strong></summary>
+> <dl>
+> <dd>
+> 
+> * `Cargo.lock` is excluded by `!**/*.lock`
+> 
+> </dd>
+> </dl>
+> </details>
+> 
+> <details>
+> <summary><strong>📒 Files selected for processing: 11</strong></summary>
+> <dl>
+> <dd>
+> 
+> * `Cargo.toml`
+> * `exec-proto/Cargo.toml`
+> * `failpoint/Cargo.toml`
+> * `fc-agent/Cargo.toml`
+> * `fc-agent/src/agent.rs`
+> * `fc-agent/src/vsock.rs`
+> * `fc-mock/Cargo.toml`
+> * `fuse-pipe/Cargo.toml`
+> * `src/uffd/server.rs`
+> * `src/utils.rs`
+> * `tests/test_snapshot_clone.rs`
+> 
+> </dd>
+> </dl>
+> </details>
+> 
+> </dd>
+> </dl>
+> </details>
+
+<!-- end of auto-generated comment: rate limited by coderabbit.ai -->
+
+<!-- autopilot:start -->
+- [ ] <!-- {"checkboxId":"00000000-0000-4000-8000-000000000003"} --> <strong title="Keep fixing CodeRabbit findings and required CI, and resolving merge conflicts">Autofix</strong> · Keep fixing CodeRabbit findings and required CI, and resolving merge conflicts
+<!-- autopilot:end -->
+<!-- tips_start -->
+
+
+
+Thanks for using [CodeRabbit](https://coderabbit.ai?utm_source=oss&utm_medium=github&utm_campaign=ejc3/fcvm&utm_content=1199)! It's free for OSS, and your support helps us grow. If you like it, consider giving us a shout-out.
+
+<details>
+<summary><strong>❤️ Share</strong></summary>
+<dl>
+<dd>
+
+- [X](https://twitter.com/intent/tweet?text=I%20just%20used%20%40coderabbitai%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20the%20proprietary%20code.%20Check%20it%20out%3A&url=https%3A//coderabbit.ai)
+- [Mastodon](https://mastodon.social/share?text=I%20just%20used%20%40coderabbitai%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20the%20proprietary%20code.%20Check%20it%20out%3A%20https%3A%2F%2Fcoderabbit.ai)
+- [Reddit](https://www.reddit.com/submit?title=Great%20tool%20for%20code%20review%20-%20CodeRabbit&text=I%20just%20used%20CodeRabbit%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20proprietary%20code.%20Check%20it%20out%3A%20https%3A//coderabbit.ai)
+- [LinkedIn](https://www.linkedin.com/sharing/share-offsite/?url=https%3A%2F%2Fcoderabbit.ai&mini=true&title=Great%20tool%20for%20code%20review%20-%20CodeRabbit&summary=I%20just%20used%20CodeRabbit%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20proprietary%20code)
+
+</dd>
+</dl>
+</details>
+
+
+<sub>Comment `@coderabbitai help` to get the list of available commands.</sub>
+
+<!-- tips_end -->
+CR1199_EOF
+CR_1199=${CR_1199_RAW//@BASE@/$BASE40}; CR_1199=${CR_1199//@HEAD@/$HEAD40}
+cr1199() { jq -n --arg b "$CR_1199" --arg x "${1:-}" '$b + $x'; }
+run_case "the #1199 review-limit notice needs no disposition" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr1199)" 2026-01-02T01:00:00Z)")" 0 "CLEAR"
+# Guards: a notice covers no head, and the same body with anything added is a claim.
+run_case "the #1199 review-limit notice quoting the head's range covers no head" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr1199)" 2026-01-02T01:00:00Z)]")" 1 "UNREVIEWED HEAD"
+run_case "the #1199 notice with a finding appended is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr1199 $'\n\nP1: this drops the last row')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+run_case "the #1199 notice with a walkthrough appended is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr1199 $'\n<!-- walkthrough_start -->\n\n## Walkthrough\n\nThe pruner now drops the last row before the rename.\n\n<!-- walkthrough_end -->')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+run_case "a finding inside the Autofix block is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(jq -n --arg b "$CR_1199" '$b | sub("<!-- autopilot:end -->"; "P1: this drops the last row\n<!-- autopilot:end -->")')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+run_case "a finding written as a run-configuration item is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(jq -n --arg b "$CR_1199" '$b | sub("> - \\*\\*Commit\\*\\*: Unavailable"; "> - **Commit**: P1 this drops the last row")')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+
 echo
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]

@@ -2417,8 +2417,10 @@ The times are `nvidia-persistenced`'s start in a gpu VM with the driver
 unloaded and the GPU removed and rescanned, two rounds per variant, twice; the
 proprietary modules with the GSP firmware left on took 1,111 to 1,223 ms. The
 stage writes the parameters to `nvidia.params` beside the modules and fc-agent
-passes them to `insmod`. The gpu profile uses `proprietary` on amd64 and
-`open` on arm64, which no g5g.metal run has measured yet. With the GSP firmware
+passes them to `insmod`. The gpu profile uses `proprietary` on amd64 and on
+arm64. On a g5g.metal (T4G) the proprietary modules took `nvidia-persistenced`'s
+start from 1,285 to 609 ms and `gpu_ms` from 1,823 to 1,026, medians of eight
+restores each (see "arm64: g5g.metal" under Verified on hardware). With the GSP firmware
 off the proprietary modules are allowed on Turing and Ampere GPUs only:
 `fcvm podman run --gpu` refuses any other NVIDIA GPU before launch when the
 profile builds them, and names `module_type = "open"` as the setting that runs
@@ -2655,6 +2657,63 @@ A second run on another g4dn.metal the same day:
   `nvidia-smi -L` in the container took 1.490, 1.436 and 1.447 s; with the daemon
   running, 0.031, 0.026 and 0.023 s. fc-agent now starts the daemon during the attach.
 
+#### arm64: g5g.metal (#1139)
+
+On 2026-10-23, on a g5g.metal (arm64, two NVIDIA T4G, each bound to vfio-pci), at
+59f84996 with the gpu profile built by `make setup-gpu`, rootless fcvm and the default
+1 GiB guest. Every step ran twice: with the profile's `open` modules, and with
+`module_type = "proprietary"` added to `[kernel_profiles.gpu.arm64.nvidia]` (GSP
+firmware off). Every step passed with both.
+
+- `fcvm podman run --kernel-profile gpu --gpu <sbdf> ubuntu:24.04 nvidia-smi -L`, on a
+  snapshot miss and then on cache hits: the container lists `NVIDIA T4G` with its UUID.
+  `gpu_ms` on the miss was 1,611 (open) and 1,025 (proprietary); hits are in the table
+  below.
+- The same with `--user 1000:1000`, miss and hit: lists the T4G.
+- `nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0`, as root and with
+  `--user 1000:1000`, miss and hit: `Test PASSED`.
+- Two cache hits at once from one snapshot, one per T4G: each listed its own T4G
+  (different UUIDs); 6.93 and 7.00 s (open), 6.17 and 6.37 s (proprietary), process
+  start to exit.
+- In the guest the T4G is `0000:00:06.0`, `[10de:1eb4]`, class 0x030200, behind the
+  host bridge the FDT describes (`pci-host-generic 70000000.pci`, ECAM, no
+  `/sys/firmware/acpi`), with BAR0 16 MiB, BAR1 256 MiB and BAR3 32 MiB assigned, as on
+  the x86 T4.
+- MSI-X goes through the GIC ITS: the driver holds six vectors
+  (`ITS-PCI-MSIX-0000:00:06.0`, `msi_irqs` 28 to 33) while `nvidia-persistenced` keeps
+  the GPU open, and they deliver. With the proprietary modules one vector counted 76
+  after the attach. Stopping the daemon released the vectors, so the counts started
+  again when it was restarted: that vector read 10 after the restart and 39 after
+  `fcvm-gpu-scrub` ran its CUDA work. With the open modules it counted 3 to 5.
+- `dmesg` shows the aarch64 module loading ("NVIDIA UNIX Open Kernel Module for
+  aarch64 580.196.07", or "NVIDIA UNIX aarch64 Kernel Module" with
+  `EnableGpuFirmware: 0`) and three warnings, none of them a failure:
+  `of_irq_parse_pci: failed with rc=-22` (the FDT's PCI node has no `interrupt-map`;
+  Firecracker's PCI transport has no INTx and the driver uses MSI-X),
+  `NVRM: Chipset not recognized (vendor ID 0x8086, device ID 0x0d57)` with "has not been
+  qualified on this platform" (the ID of Firecracker's emulated host bridge), and, with
+  the open modules, `objClInitPcieChipset: *** Unable to get PCI port handles` once per
+  GPU initialisation.
+- `nvidia-smi -L` in the container, three runs each: with the daemon 0.013 to 0.016 s
+  (open) and 0.012 to 0.014 s (proprietary); with the daemon stopped 1.42 to 1.49 s
+  (open) and 0.420 s (proprietary). Starting the daemon again took 1.12 s (open) and
+  0.35 s (proprietary).
+- `sudo fcvm gpu scrub` on both T4Gs (`reset_method` `bus`): `scrubbed`, 1.22 and
+  1.23 s (reset 192 to 214 ms, boot 77 to 98, clear 898 to 903).
+
+Eight cache-hit relaunches of `nvidia-smi -L` on one T4G per module type, after one
+warm-up, on a quiet box (`mpstat` 99.99 to 100 percent idle over 5 s before and after,
+no other Firecracker). Columns as in the table under Attach time, medians with the
+range in parentheses:
+
+| modules | runs | relaunch (s) | ACK (ms) | gpu_ms | rescan | persistenced | scrub | smi / cdi |
+|---|---|---|---|---|---|---|---|---|
+| open | 8 | 5.50 (5.48-5.52) | 2,783 (2,782-2,804) | 1,823 (1,809-1,854) | 56 | 1,285 | 428 | 21 / 54 |
+| proprietary, GSP off | 8 | 4.77 (4.74-4.82) | 2,063 (2,014-2,112) | 1,026 (1,008-1,045) | 55 | 609 | 306 | 19 / 54 |
+
+Both load the driver at boot, so `insmod` at restore is 0 ms. After these runs the
+arm64 gpu profile switched to the proprietary modules, as amd64 had.
+
 ### Attach time
 
 Measured on a g4dn.metal (T4) on 2026-10-22: a cache-hit `fcvm podman run --gpu <sbdf>
@@ -2681,8 +2740,7 @@ the load attached the PCI segment.
 
 Not yet checked:
 
-- arm64 (g5g.metal, T4G): #1139.
-- MSI-X in use: the idle guest had no MSI vectors allocated, since the driver
+- MSI-X in use on x86_64: the idle guest had no MSI vectors allocated, since the driver
   allocates them only while a process holds the GPU open. A CUDA kernel completing
   implies interrupts work (Firecracker's PCI transport has no INTx), but no
   `/proc/interrupts` reading was taken under load.

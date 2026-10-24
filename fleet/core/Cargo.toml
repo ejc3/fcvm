@@ -1,0 +1,12 @@
+[package]
+name = "fleet-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+description = "fcvm fleet: shared state, events and the pure apply function"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

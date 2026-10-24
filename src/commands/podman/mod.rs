@@ -847,6 +847,15 @@ async fn settle_balloon_check(ctx: &mut VmContext) -> Result<()> {
 /// `publish` is this run's own `--publish`, so the clone listens where this run asked,
 /// and a spec the cache key's lenient parse skipped is refused here as it is on a cache
 /// miss. The key hashes the mappings, so today they equal the snapshot's.
+/// `--label KEY=VALUE` flags as the state's label map. A flag without `=` is dropped.
+pub(crate) fn parse_labels(labels: &[String]) -> std::collections::HashMap<String, String> {
+    labels
+        .iter()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
 fn snapshot_restore_args(
     args: &RunArgs,
     snapshot_key: &str,
@@ -869,6 +878,7 @@ fn snapshot_restore_args(
         // no startup snapshot.
         startup_snapshot_base_key: startup_snapshot_base_key.filter(|_| args.gpu.is_empty()),
         cpu: Some(args.cpu),
+        label: args.label.clone(),
         mem: Some(args.mem),
         balloon: args.balloon,
         firecracker_bin,
@@ -1695,12 +1705,7 @@ async fn prepare_vm_for_lifecycle(
             .find_map(|s| s.strip_prefix("USER="))
             .map(|s| s.to_string());
     }
-    vm_state.config.labels = args
-        .label
-        .iter()
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
+    vm_state.config.labels = parse_labels(&args.label);
 
     // Initialize state manager
     let state_manager = StateManager::new(paths::state_dir());
@@ -1969,7 +1974,8 @@ async fn prepare_vm_for_lifecycle(
     };
 
     // Start status channel listener for fc-agent notifications
-    // - "ready" on port 4999 -> creates container-ready file for health check
+    // - "ready" / "ready:healthcheck" on port 4999 -> podman reports the container
+    //   running: creates the container-ready file the health monitor reads
     // - "exit:{code}" on port 4999 -> creates container-exit file with exit code
     // - "cache-ready:{digest}" on port 4999 -> trigger cache creation
     let status_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_STATUS_PORT);
@@ -1977,12 +1983,16 @@ async fn prepare_vm_for_lifecycle(
     // exit; consumed by run_vm_loop to decide relaunch-in-place vs terminate.
     let reboot_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let container_exit_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Fired by the status listener when the container starts; wakes the health
+    // monitor so it checks at once instead of at its next poll.
+    let container_started = Arc::new(tokio::sync::Notify::new());
     let status_handle = {
         let runtime_dir = data_dir.clone();
         let socket_path = status_socket_path.clone();
         let vm_id_clone = vm_id.clone();
         let reboot_flag = reboot_requested.clone();
         let exit_flag = container_exit_seen.clone();
+        let container_started = container_started.clone();
         let verdict = cache_verdict.clone();
         tokio::spawn(async move {
             if let Err(e) = run_status_listener(
@@ -1993,6 +2003,7 @@ async fn prepare_vm_for_lifecycle(
                 verdict,
                 reboot_flag,
                 exit_flag,
+                container_started,
             )
             .await
             {
@@ -2159,6 +2170,7 @@ async fn prepare_vm_for_lifecycle(
         vm_state.pid,
         paths::state_dir(),
         Some(health_cancel_token.clone()),
+        Some(container_started.clone()),
         startup_tx,
     );
 

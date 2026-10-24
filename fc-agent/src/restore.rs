@@ -180,6 +180,18 @@ pub struct RestorePhases {
     pub tcp_destroyed: usize,
     pub tcp_already_gone: usize,
     pub tcp_destroy_datagrams: usize,
+    /// Per-operation gate timings from the same report: each family's
+    /// verification read and UDP rule (one `iptables` spawn each), and for
+    /// each half of the gate the nf_tables read of its rules and the one
+    /// commit that removes it in both families.
+    pub tcp_gate_verify_ipv4_ms: f64,
+    pub tcp_gate_verify_ipv6_ms: f64,
+    pub tcp_gate_udp_ipv4_ms: f64,
+    pub tcp_gate_udp_ipv6_ms: f64,
+    pub tcp_gate_egress_read_ms: f64,
+    pub tcp_gate_egress_commit_ms: f64,
+    pub tcp_gate_ingress_read_ms: f64,
+    pub tcp_gate_ingress_commit_ms: f64,
     pub neighbor_ms: f64,
     pub nfs_ms: f64,
     pub exec_wait_ms: f64,
@@ -214,11 +226,42 @@ impl RestorePhases {
         self.tcp_destroyed = boundary.tally.destroyed;
         self.tcp_already_gone = boundary.tally.already_gone;
         self.tcp_destroy_datagrams = boundary.tally.datagrams;
+        let gate = boundary.gate;
+        self.tcp_gate_verify_ipv4_ms = gate.verify_ipv4_ms;
+        self.tcp_gate_verify_ipv6_ms = gate.verify_ipv6_ms;
+        self.tcp_gate_udp_ipv4_ms = gate.udp_ipv4_ms;
+        self.tcp_gate_udp_ipv6_ms = gate.udp_ipv6_ms;
+        self.tcp_gate_egress_read_ms = gate.egress_read_ms;
+        self.tcp_gate_egress_commit_ms = gate.egress_commit_ms;
+        self.tcp_gate_ingress_read_ms = gate.ingress_read_ms;
+        self.tcp_gate_ingress_commit_ms = gate.ingress_commit_ms;
     }
 
-    /// Compact single-line JSON for the ACK frame.
+    /// Compact single-line JSON for the ACK frame, every timing rounded to
+    /// the microsecond. Unrounded, `as_secs_f64() * 1000.0` prints up to 17
+    /// significant digits, and a record of such values passed the frame's
+    /// 1024 bytes, which drops the whole record.
     pub fn to_frame_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+        let Ok(mut value) = serde_json::to_value(self) else {
+            return "{}".to_string();
+        };
+        round_timings(&mut value);
+        serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
+/// Rounds every floating-point timing to the microsecond, in nested objects too
+/// (`gpu_steps`), so a 17-significant-digit `as_secs_f64() * 1000.0` cannot push
+/// the ACK past its frame budget.
+fn round_timings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(round_timings),
+        field if field.is_f64() => {
+            if let Some(ms) = field.as_f64() {
+                *field = serde_json::json!((ms * 1000.0).round() / 1000.0);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -319,15 +362,6 @@ pub async fn handle_clone_restore(
     // path can settle it rather than race it.
     spawn_restore_side_job(restart_journald());
 
-    // Reconfigure IPv6 — before any network traffic can use the old address.
-    // The link is UP throughout (the boundary no longer takes it down), so the
-    // gate is what holds inbound traffic off until the cleanup below finishes.
-    let ipv6_started = std::time::Instant::now();
-    if let Some(new_ipv6) = clone_ipv6 {
-        network::reconfigure_ipv6(new_ipv6).await;
-    }
-    phases.ipv6_ms = elapsed_ms(ipv6_started);
-
     // Pin the neighbour entry BEFORE the boundary reopens the gate. The clone
     // inherits the source's neighbour table, and restore_snapshot_network ends
     // by publishing; anything answered between publication and a later pin
@@ -336,8 +370,32 @@ pub async fn handle_clone_restore(
     // purges the neighbour table any more.
     // Order matters: drop the inherited entries first, then pin the one the
     // host's health checks depend on. Flushing after the pin would delete it.
+    //
+    // The flush also runs before the IPv6 swap below. The swap announces the
+    // new address, which lets in the traffic that was waiting for it, and the
+    // guest resolves its senders' addresses to answer; a flush running then
+    // deletes those entries mid-resolution and left one INCOMPLETE for a
+    // second (2 of 1700 routed restores with an early client). Pinned by
+    // `inherited_neighbours_are_flushed_before_the_new_ipv6_is_announced`.
     network::flush_stale_neighbours().await;
     network::pin_namespace_neighbour().await;
+    // A routed clone's IPv6 gateway is pinned too, before the swap below: a
+    // resolution of it in flight across the swap lost its answer to the
+    // deleted snapshot-time address and held every reply for a second
+    // (#1160). Pinned by `the_routed_gateway_is_pinned_before_the_ipv6_swap`.
+    if clone_ipv6.is_some() {
+        network::pin_routed_gateway_neighbour().await;
+    }
+
+    // Reconfigure IPv6, then announce it: before any network traffic can use
+    // the old address. The link is UP throughout (the boundary no longer takes
+    // it down), so the gate is what holds inbound traffic off until the
+    // cleanup below finishes.
+    let ipv6_started = std::time::Instant::now();
+    if let Some(new_ipv6) = clone_ipv6 {
+        network::reconfigure_ipv6(new_ipv6).await;
+    }
+    phases.ipv6_ms = elapsed_ms(ipv6_started);
     // ANNOUNCE, as early as possible. The host cannot forward a packet to this
     // clone until its namespace has learned the guest's MAC, and it only learns
     // that when the guest transmits. The old boundary got this for free: taking
@@ -690,6 +748,14 @@ mod tests {
         phases.tcp_destroyed = 999_999;
         phases.tcp_already_gone = 999_999;
         phases.tcp_destroy_datagrams = 999_999;
+        phases.tcp_gate_verify_ipv4_ms = 99_999.999;
+        phases.tcp_gate_verify_ipv6_ms = 99_999.999;
+        phases.tcp_gate_udp_ipv4_ms = 99_999.999;
+        phases.tcp_gate_udp_ipv6_ms = 99_999.999;
+        phases.tcp_gate_egress_read_ms = 99_999.999;
+        phases.tcp_gate_egress_commit_ms = 99_999.999;
+        phases.tcp_gate_ingress_read_ms = 99_999.999;
+        phases.tcp_gate_ingress_commit_ms = 99_999.999;
         phases.neighbor_ms = 99_999.999;
         phases.nfs_ms = 99_999.999;
         phases.exec_wait_ms = 99_999.999;
@@ -713,6 +779,55 @@ mod tests {
         );
     }
 
+    /// The timings are `as_secs_f64() * 1000.0`, which prints with up to 17
+    /// significant digits (`0.000032999999999999996` was seen in a real ACK).
+    /// With every field that long the record passed 1024 bytes and the frame
+    /// dropped all of it for `{}`.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn long_decimal_timings_still_fit_the_frame_budget() {
+        let long = 10_000.000_001_999_999_f64;
+        let mut phases = RestorePhases::default();
+        phases.clock_ms = long;
+        phases.ipv6_ms = long;
+        phases.tcp_cleanup_ms = long;
+        phases.tcp_verified = true;
+        phases.tcp_verify_ms = long;
+        phases.tcp_reassert_ms = long;
+        phases.tcp_destroy_ms = long;
+        phases.tcp_reopen_ms = long;
+        phases.tcp_egress_open_ms = long;
+        phases.tcp_hook_ms = long;
+        phases.tcp_destroyed = 999_999;
+        phases.tcp_already_gone = 999_999;
+        phases.tcp_destroy_datagrams = 999_999;
+        phases.tcp_gate_verify_ipv4_ms = long;
+        phases.tcp_gate_verify_ipv6_ms = long;
+        phases.tcp_gate_udp_ipv4_ms = long;
+        phases.tcp_gate_udp_ipv6_ms = long;
+        phases.tcp_gate_egress_read_ms = long;
+        phases.tcp_gate_egress_commit_ms = long;
+        phases.tcp_gate_ingress_read_ms = long;
+        phases.tcp_gate_ingress_commit_ms = long;
+        phases.neighbor_ms = long;
+        phases.nfs_ms = long;
+        phases.exec_wait_ms = long;
+        phases.egress_wait_ms = long;
+        phases.total_ms = long;
+        phases.ack_connect_ms = long;
+        phases.gpu_ms = long;
+        phases.gpus = 999_999;
+        let frame = exec_proto::restore_complete_frame(
+            "8f4b2c1e-6d3a-4f5b-9c7e-0a1b2c3d4e5f",
+            &phases.to_frame_json(),
+        );
+        assert!(
+            frame.contains("\"ack_connect_ms\":10000.0"),
+            "the ACK telemetry was dropped from the frame ({} bytes): {frame}",
+            frame.len()
+        );
+    }
+
     /// The ACK names the GPU memory scrub's duration, and says nothing about
     /// GPU steps without GPUs.
     #[test]
@@ -728,39 +843,46 @@ mod tests {
         assert_eq!(frame["gpu_steps"]["scrub_ms"], 61.5, "{frame}");
     }
 
-    /// A GPU restore's ACK, with every phase and every GPU attach step at a value whose
-    /// shortest round-trip rendering is 17 significant digits (as measured timings
-    /// often are, e.g. `79.74971599999999`), still fits the frame budget beside a UUID
-    /// epoch, so the host keeps the GPU step timings rather than an empty `{}`.
+    /// A GPU restore's ACK with every phase (the firewall gate's included) and every
+    /// GPU attach step (the scrub's included) at a 17-significant-digit timing, as
+    /// measured timings often are (`79.74971599999999`), still fits the frame budget
+    /// beside a UUID epoch, so the host gets the gate and GPU step timings rather than
+    /// an empty `{}`. The nested step timings are rounded like the top-level ones.
     #[test]
-    fn a_gpu_restore_ack_keeps_its_step_timings_within_the_frame_budget() {
+    #[allow(clippy::field_reassign_with_default)]
+    fn a_gpu_restore_ack_keeps_every_gate_and_gpu_step_timing_within_the_frame_budget() {
         let long = 12_345.678_901_234_567_f64;
         assert_eq!(format!("{long}").len(), 18, "{long}");
-        let phases = RestorePhases {
-            clock_ms: long,
-            ipv6_ms: long,
-            tcp_cleanup_ms: long,
-            tcp_verified: true,
-            tcp_verify_ms: long,
-            tcp_reassert_ms: long,
-            tcp_destroy_ms: long,
-            tcp_reopen_ms: long,
-            tcp_egress_open_ms: long,
-            tcp_hook_ms: long,
-            tcp_destroyed: 999_999,
-            tcp_already_gone: 999_999,
-            tcp_destroy_datagrams: 999_999,
-            neighbor_ms: long,
-            nfs_ms: long,
-            exec_wait_ms: long,
-            egress_wait_ms: long,
-            total_ms: long,
-            ack_connect_ms: long,
-            gpu_ms: long,
-            gpus: 8,
-            gpu_steps: None,
-        };
-        let mut phases = phases;
+        let mut phases = RestorePhases::default();
+        phases.clock_ms = long;
+        phases.ipv6_ms = long;
+        phases.tcp_cleanup_ms = long;
+        phases.tcp_verified = true;
+        phases.tcp_verify_ms = long;
+        phases.tcp_reassert_ms = long;
+        phases.tcp_destroy_ms = long;
+        phases.tcp_reopen_ms = long;
+        phases.tcp_egress_open_ms = long;
+        phases.tcp_hook_ms = long;
+        phases.tcp_destroyed = 999_999;
+        phases.tcp_already_gone = 999_999;
+        phases.tcp_destroy_datagrams = 999_999;
+        phases.tcp_gate_verify_ipv4_ms = long;
+        phases.tcp_gate_verify_ipv6_ms = long;
+        phases.tcp_gate_udp_ipv4_ms = long;
+        phases.tcp_gate_udp_ipv6_ms = long;
+        phases.tcp_gate_egress_read_ms = long;
+        phases.tcp_gate_egress_commit_ms = long;
+        phases.tcp_gate_ingress_read_ms = long;
+        phases.tcp_gate_ingress_commit_ms = long;
+        phases.neighbor_ms = long;
+        phases.nfs_ms = long;
+        phases.exec_wait_ms = long;
+        phases.egress_wait_ms = long;
+        phases.total_ms = long;
+        phases.ack_connect_ms = long;
+        phases.gpu_ms = long;
+        phases.gpus = 8;
         phases.gpu_steps = Some(crate::gpu::AttachSteps {
             check_ms: long,
             rescan_ms: long,
@@ -768,70 +890,18 @@ mod tests {
             uvm_ms: long,
             nodes_ms: long,
             persistenced_ms: long,
+            scrub_ms: long,
             smi_ms: long,
             cdi_ms: long,
-            ..Default::default()
         });
-        let frame = exec_proto::restore_complete_frame(
-            "8f4b2c1e-6d3a-4f5b-9c7e-0a1b2c3d4e5f",
-            &phases.to_frame_json(),
-        );
-        assert!(
-            frame.contains("\"gpu_steps\":{") && frame.contains("\"persistenced_ms\""),
-            "the GPU step timings were dropped from the ACK ({} bytes of telemetry): {frame}",
-            phases.to_frame_json().len()
-        );
-    }
-
-    /// The scrub's time rides in `gpu_steps` with every other attach step: a GPU
-    /// restore's ACK with all of them, and every phase, at 17 significant digits
-    /// still fits the frame budget beside a UUID epoch, so the host gets the scrub
-    /// time and the step timings rather than an empty `{}`.
-    #[test]
-    fn a_gpu_restore_ack_keeps_the_scrub_time_with_its_step_timings_within_the_frame_budget() {
-        let long = 12_345.678_901_234_567_f64;
-        assert_eq!(format!("{long}").len(), 18, "{long}");
-        let phases = RestorePhases {
-            clock_ms: long,
-            ipv6_ms: long,
-            tcp_cleanup_ms: long,
-            tcp_verified: true,
-            tcp_verify_ms: long,
-            tcp_reassert_ms: long,
-            tcp_destroy_ms: long,
-            tcp_reopen_ms: long,
-            tcp_egress_open_ms: long,
-            tcp_hook_ms: long,
-            tcp_destroyed: 999_999,
-            tcp_already_gone: 999_999,
-            tcp_destroy_datagrams: 999_999,
-            neighbor_ms: long,
-            nfs_ms: long,
-            exec_wait_ms: long,
-            egress_wait_ms: long,
-            total_ms: long,
-            ack_connect_ms: long,
-            gpu_ms: long,
-            gpus: 8,
-            gpu_steps: Some(crate::gpu::AttachSteps {
-                check_ms: long,
-                rescan_ms: long,
-                nvidia_ms: long,
-                uvm_ms: long,
-                nodes_ms: long,
-                persistenced_ms: long,
-                scrub_ms: long,
-                smi_ms: long,
-                cdi_ms: long,
-            }),
-        };
         let telemetry = phases.to_frame_json();
         let frame =
             exec_proto::restore_complete_frame("8f4b2c1e-6d3a-4f5b-9c7e-0a1b2c3d4e5f", &telemetry);
         assert!(
-            frame.contains("\"scrub_ms\":12345.678901234567")
-                && frame.contains("\"persistenced_ms\""),
-            "the scrub time was dropped from the ACK ({} bytes of telemetry): {frame}",
+            frame.contains("\"tcp_gate_ingress_commit_ms\":12345.679")
+                && frame.contains("\"scrub_ms\":12345.679")
+                && frame.contains("\"persistenced_ms\":12345.679"),
+            "the gate or GPU step timings were dropped from the ACK ({} bytes of telemetry): {frame}",
             telemetry.len()
         );
     }

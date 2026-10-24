@@ -29,6 +29,30 @@ pub(crate) fn open_raw_socket(
     Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(raw) })
 }
 
+/// The one AF_PACKET socket fc-agent sends frames through (the gateway ARP
+/// probe, the IPv6 announcement), opened on first use and never closed.
+///
+/// Releasing an AF_PACKET socket waits one RCU grace period
+/// (`packet_release()` calls `synchronize_net()`): 26, 46 and 79 ms at 2, 4
+/// and 8 vCPUs in restored clones. Released inline it sat on the restore's
+/// path; released on another thread it raced with process spawns, because a
+/// child forked before the release holds a reference until its exec closes
+/// the CLOEXEC descriptor, and the child then made the final release and
+/// waited inside its own exec (the `iptables -S` verification after the ARP
+/// probe went from 2-3 ms to 27-75 ms). A socket that is never released costs
+/// neither. Protocol 0 registers no receive hook, so it sees no traffic; each
+/// send names its protocol in the address. The receive barrier opens and
+/// closes its own socket: its grace period is the barrier.
+fn packet_sender() -> std::io::Result<std::os::fd::BorrowedFd<'static>> {
+    use std::os::fd::AsFd;
+    static SENDER: std::sync::OnceLock<OwnedFd> = std::sync::OnceLock::new();
+    if let Some(socket) = SENDER.get() {
+        return Ok(socket.as_fd());
+    }
+    let socket = open_raw_socket(libc::AF_PACKET, libc::SOCK_RAW, 0)?;
+    Ok(SENDER.get_or_init(|| socket).as_fd())
+}
+
 /// One row of the kernel's IPv4 route table that names a default gateway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DefaultRoute {
@@ -118,21 +142,26 @@ fn interface_ipv4(interface: &str) -> Option<Ipv4Addr> {
     None
 }
 
-/// Send the broadcast frame on `interface` through an AF_PACKET socket.
-fn send_ethernet_broadcast(interface: &str, frame: &[u8]) -> std::io::Result<()> {
+/// Send `frame` on `interface` through `packet_sender`, as `protocol`,
+/// addressed to `destination`.
+fn send_ethernet_frame(
+    interface: &str,
+    frame: &[u8],
+    protocol: u16,
+    destination: [u8; 6],
+) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
 
-    const ETH_P_ARP: u16 = 0x0806;
     let index = nix::net::if_::if_nametoindex(interface)
         .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-    let fd = open_raw_socket(libc::AF_PACKET, libc::SOCK_RAW, ETH_P_ARP.to_be() as i32)?;
+    let fd = packet_sender()?;
     // SAFETY: sockaddr_ll is fully zero-initialized before the fields we set.
     let mut address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
     address.sll_family = libc::AF_PACKET as u16;
-    address.sll_protocol = ETH_P_ARP.to_be();
+    address.sll_protocol = protocol.to_be();
     address.sll_ifindex = index as i32;
     address.sll_halen = 6;
-    address.sll_addr[..6].copy_from_slice(&[0xff; 6]);
+    address.sll_addr[..6].copy_from_slice(&destination);
     // SAFETY: the frame buffer and address are valid for the duration of the call.
     let sent = unsafe {
         libc::sendto(
@@ -149,7 +178,7 @@ fn send_ethernet_broadcast(interface: &str, frame: &[u8]) -> std::io::Result<()>
     }
     if sent as usize != frame.len() {
         return Err(std::io::Error::other(format!(
-            "short ARP send: {sent} of {} bytes",
+            "short send: {sent} of {} bytes",
             frame.len()
         )));
     }
@@ -397,7 +426,7 @@ fn delete_request(record: &[u8], sequence: u32) -> Vec<u8> {
 fn replace_neighbour<C: NetlinkChannel>(
     channel: &mut C,
     index: u32,
-    address: Ipv4Addr,
+    address: std::net::IpAddr,
     lladdr: [u8; 6],
 ) -> anyhow::Result<()> {
     let sequence = NEXT_NETLINK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -415,7 +444,10 @@ fn replace_neighbour<C: NetlinkChannel>(
     append_neighbour_message(
         &mut request,
         NeighbourMessage {
-            family: libc::AF_INET as u8,
+            family: match address {
+                std::net::IpAddr::V4(_) => libc::AF_INET as u8,
+                std::net::IpAddr::V6(_) => libc::AF_INET6 as u8,
+            },
             pad1: 0,
             pad2: 0,
             index: i32::try_from(index).context("interface index out of range")?,
@@ -424,7 +456,10 @@ fn replace_neighbour<C: NetlinkChannel>(
             kind: 0,
         },
     );
-    append_attribute(&mut request, NDA_DST, &address.octets());
+    match address {
+        std::net::IpAddr::V4(v4) => append_attribute(&mut request, NDA_DST, &v4.octets()),
+        std::net::IpAddr::V6(v6) => append_attribute(&mut request, NDA_DST, &v6.octets()),
+    }
     append_attribute(&mut request, NDA_LLADDR, &lladdr);
     request_acknowledged(channel, &with_length(request), sequence, RTM_NEWNEIGH)
 }
@@ -486,12 +521,54 @@ where
             .parse()
             .context("NAMESPACE_IP is not an IPv4 address")?;
         let lladdr = parse_mac(NAMESPACE_MAC).context("NAMESPACE_MAC is not a MAC address")?;
-        replace_neighbour(&mut channel, index, address, lladdr)
+        replace_neighbour(&mut channel, index, address.into(), lladdr)
     })
     .await;
     match pinned {
         Ok(()) => eprintln!("[fc-agent] pinned {NAMESPACE_IP} to {NAMESPACE_MAC} (permanent)"),
         Err(error) => eprintln!("[fc-agent] WARNING: could not pin {NAMESPACE_IP}: {error:#}"),
+    }
+}
+
+/// The routed namespace bridge's IPv6 address, the guest's IPv6 default
+/// gateway in routed mode, on the bridge whose MAC is `NAMESPACE_MAC`. Kept in
+/// sync with `ROUTED_GATEWAY_IPV6` in src/network/routed.rs by
+/// `routed_gateway_matches_the_guests_pinned_neighbour` there.
+pub(crate) const ROUTED_GATEWAY_IPV6: &str = "fd00::1";
+
+/// Pin the routed IPv6 gateway's neighbour entry to the bridge MAC. RESTORE
+/// ONLY, routed clones only (the ones that take a new IPv6).
+///
+/// A restored clone inherits a correct entry for `fd00::1` (the bridge MAC is
+/// pinned on the host side), and `flush_stale_neighbours` deletes it with the
+/// rest. The next packet then solicits the gateway sourced from the
+/// snapshot-time address, and the address swap that follows deletes that
+/// address; when the bridge's advertisement arrives after the deletion it is
+/// not delivered, the entry stays INCOMPLETE, and every reply waits for the
+/// retransmit a second later. Captured in a routed clone's namespace: the
+/// solicitation from the old address at +56.5 ms, the bridge's answer to it at
+/// +56.5 ms, the swap's announcement at +57.3 ms, and the clone's SYN-ACKs
+/// only after the next solicitation, about one second on. A permanent entry
+/// is never resolved, so no solicitation can straddle the swap. Runs after the
+/// flush, which would otherwise delete nothing permanent anyway, and before
+/// the swap.
+pub async fn pin_routed_gateway_neighbour() {
+    let pinned = off_the_runtime("the IPv6 gateway pin", move || {
+        let (mut channel, index) = eth0_route_channel()?;
+        let address: Ipv6Addr = ROUTED_GATEWAY_IPV6
+            .parse()
+            .context("ROUTED_GATEWAY_IPV6 is not an IPv6 address")?;
+        let lladdr = parse_mac(NAMESPACE_MAC).context("NAMESPACE_MAC is not a MAC address")?;
+        replace_neighbour(&mut channel, index, address.into(), lladdr)
+    })
+    .await;
+    match pinned {
+        Ok(()) => {
+            eprintln!("[fc-agent] pinned {ROUTED_GATEWAY_IPV6} to {NAMESPACE_MAC} (permanent)")
+        }
+        Err(error) => {
+            eprintln!("[fc-agent] WARNING: could not pin {ROUTED_GATEWAY_IPV6}: {error:#}")
+        }
     }
 }
 
@@ -522,7 +599,8 @@ pub fn refresh_gateway_arp() {
         return;
     };
     let frame = build_arp_request(mac, source_ip, route.gateway);
-    match send_ethernet_broadcast(&route.interface, &frame) {
+    const ETH_P_ARP: u16 = 0x0806;
+    match send_ethernet_frame(&route.interface, &frame, ETH_P_ARP, [0xff; 6]) {
         Ok(()) => eprintln!(
             "[fc-agent] gateway {} ARP probe sent from {} ({})",
             route.gateway, source_ip, route.interface
@@ -788,6 +866,96 @@ impl std::fmt::Display for Ipv6Prefix {
 /// `off_the_runtime`).
 pub async fn reconfigure_ipv6(new_ipv6: &str) {
     reconfigure_ipv6_over(eth0_route_channel, new_ipv6).await;
+    announce_ipv6("eth0", new_ipv6);
+}
+
+/// The Ethernet multicast address of ff02::1, all nodes.
+const ALL_NODES_MAC: [u8; 6] = [0x33, 0x33, 0x00, 0x00, 0x00, 0x01];
+const ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+
+/// Build an unsolicited Neighbor Advertisement for `address` (RFC 4861 7.2.6):
+/// Ethernet to 33:33:00:00:00:01, IPv6 from `address` to ff02::1 with hop
+/// limit 255, ICMPv6 type 136 with only the Override flag set, the target
+/// `address`, and a Target Link-Layer Address option carrying `mac`.
+fn build_unsolicited_na(mac: [u8; 6], address: Ipv6Addr) -> [u8; 86] {
+    const ICMPV6_LENGTH: usize = 32;
+    let mut frame = [0u8; 86];
+    frame[0..6].copy_from_slice(&ALL_NODES_MAC);
+    frame[6..12].copy_from_slice(&mac);
+    frame[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+    let ip = &mut frame[14..54];
+    ip[0] = 0x60; // version 6, traffic class and flow label zero
+    ip[4..6].copy_from_slice(&(ICMPV6_LENGTH as u16).to_be_bytes());
+    ip[6] = 58; // next header: ICMPv6
+    ip[7] = 255; // hop limit: receivers drop ND messages with any other
+    ip[8..24].copy_from_slice(&address.octets());
+    ip[24..40].copy_from_slice(&ALL_NODES.octets());
+    let icmp = &mut frame[54..86];
+    icmp[0] = 136; // Neighbor Advertisement
+    icmp[4] = 0x20; // Override; not Router, not Solicited
+    icmp[8..24].copy_from_slice(&address.octets());
+    icmp[24] = 2; // option: Target Link-Layer Address
+    icmp[25] = 1; // length in units of 8 bytes
+    icmp[26..32].copy_from_slice(&mac);
+    let checksum = icmpv6_checksum(address, ALL_NODES, &frame[54..86]);
+    frame[56..58].copy_from_slice(&checksum.to_be_bytes());
+    frame
+}
+
+/// The ICMPv6 checksum over the IPv6 pseudo-header and `message` (whose own
+/// checksum field must be zero).
+fn icmpv6_checksum(source: Ipv6Addr, destination: Ipv6Addr, message: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut add = |bytes: &[u8]| {
+        for pair in bytes.chunks(2) {
+            let word = u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]);
+            sum += u32::from(word);
+        }
+    };
+    add(&source.octets());
+    add(&destination.octets());
+    add(&(message.len() as u32).to_be_bytes());
+    add(&[0, 0, 0, 58]);
+    add(message);
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Announce a clone's new IPv6 on `interface` with one unsolicited Neighbor
+/// Advertisement, natively and without waiting.
+///
+/// A client that dials the clone's address before the guest holds it (one
+/// retrying while the clone restores) leaves the host's neighbour entry for
+/// that address INCOMPLETE: its Neighbor Solicitation reached a guest that
+/// did not have the address yet, and the next one goes out only after the
+/// retransmit timer, one second later. Every connection to the address waits
+/// in that entry's queue until then. Measured on routed clones: with a client
+/// dialling from the clone's start, the host's entry was still INCOMPLETE at
+/// the restore ACK and the first connection after the ACK took 787 to 893 ms;
+/// with no client before the ACK it took 1 to 4 ms. An unsolicited
+/// advertisement updates an INCOMPLETE entry and sends its queue at once
+/// (`ndisc_recv_na`); with no entry it changes nothing.
+pub fn announce_ipv6(interface: &str, address: &str) {
+    let Ok(address) = address.parse::<Ipv6Addr>() else {
+        eprintln!("[fc-agent] WARNING: {address:?} is not an IPv6 address; not announcing it");
+        return;
+    };
+    let Some(mac) = interface_mac(interface) else {
+        eprintln!("[fc-agent] WARNING: no MAC for {interface}; not announcing {address}");
+        return;
+    };
+    const ETH_P_IPV6: u16 = 0x86dd;
+    let frame = build_unsolicited_na(mac, address);
+    match send_ethernet_frame(interface, &frame, ETH_P_IPV6, ALL_NODES_MAC) {
+        Ok(()) => eprintln!("[fc-agent] announced IPv6 {address} on {interface}"),
+        Err(error) => {
+            eprintln!(
+                "[fc-agent] WARNING: announcing IPv6 {address} on {interface} failed: {error}"
+            )
+        }
+    }
 }
 
 /// `reconfigure_ipv6` over the socket `open` returns.
@@ -1504,6 +1672,60 @@ mod gateway_arp_tests {
 }
 
 #[cfg(test)]
+mod ipv6_announce_tests {
+    use super::*;
+
+    /// Frames go out through the one socket `packet_sender` keeps open. A
+    /// socket opened per send has to be released, and the release waits a
+    /// grace period: on the restore's path when inline, and inside the exec
+    /// of whatever process was forked meanwhile when on another thread.
+    /// Source-pinned: which process pays depends on a fork interleaving no
+    /// runtime test can hold.
+    #[test]
+    fn frames_are_sent_through_the_socket_that_is_never_released() {
+        let source = include_str!("network.rs");
+        let start = source
+            .find("fn send_ethernet_frame(")
+            .expect("send_ethernet_frame is in network.rs");
+        let end = start + source[start..].find("\n}\n").expect("its body ends");
+        let body = &source[start..end];
+        assert!(body.contains("packet_sender()"), "{body}");
+        assert!(
+            !body.contains("open_raw_socket"),
+            "send_ethernet_frame opens a socket per send:\n{body}"
+        );
+    }
+
+    #[test]
+    fn the_unsolicited_na_overrides_with_our_link_layer_address() {
+        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let address: Ipv6Addr = "fd00:db8::5".parse().unwrap();
+        let frame = build_unsolicited_na(mac, address);
+        assert_eq!(&frame[0..6], &ALL_NODES_MAC);
+        assert_eq!(&frame[6..12], &mac);
+        assert_eq!(&frame[12..14], &[0x86, 0xdd]);
+        assert_eq!(frame[14] >> 4, 6);
+        assert_eq!(u16::from_be_bytes([frame[18], frame[19]]), 32);
+        assert_eq!(frame[20], 58, "next header ICMPv6");
+        assert_eq!(frame[21], 255, "receivers drop ND with any other hop limit");
+        assert_eq!(&frame[22..38], &address.octets());
+        assert_eq!(&frame[38..54], &ALL_NODES.octets());
+        assert_eq!(frame[54], 136, "Neighbor Advertisement");
+        assert_eq!(frame[55], 0);
+        assert_eq!(
+            &frame[58..62],
+            &[0x20, 0, 0, 0],
+            "Override only: an unsolicited advertisement must not claim Solicited"
+        );
+        assert_eq!(&frame[62..78], &address.octets());
+        assert_eq!(&frame[78..80], &[2, 1], "Target Link-Layer Address option");
+        assert_eq!(&frame[80..86], &mac);
+        // Computed independently over the pseudo-header and message.
+        assert_eq!(u16::from_be_bytes([frame[56], frame[57]]), 0x3f23);
+    }
+}
+
+#[cfg(test)]
 mod loopback_publish_tests {
     use super::*;
 
@@ -2058,6 +2280,16 @@ mod neighbour_tests {
         0x01, 0x00, 0x00,
     ];
 
+    /// `ip -6 neigh replace fd00::1 lladdr 02:fc:00:00:02:01 dev eth0 nud
+    /// permanent` (iproute2 6.1, eth0 index 2), captured with
+    /// `strace -e trace=sendmsg -e write=3`.
+    const IP6_NEIGH_REPLACE: [u8; 60] = [
+        0x3c, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x05, 0x05, 0xea, 0xd3, 0xda, 0x6a, 0x00, 0x00, 0x00,
+        0x00, 0x0a, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x14, 0x00,
+        0x01, 0x00, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x0a, 0x00, 0x02, 0x00, 0x02, 0xfc, 0x00, 0x00, 0x02, 0x01, 0x00, 0x00,
+    ];
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct Neighbour {
         family: u8,
@@ -2590,7 +2822,13 @@ mod neighbour_tests {
             ..Default::default()
         };
         let address: Ipv4Addr = NAMESPACE_IP.parse().unwrap();
-        replace_neighbour(&mut model, 2, address, parse_mac(NAMESPACE_MAC).unwrap()).unwrap();
+        replace_neighbour(
+            &mut model,
+            2,
+            address.into(),
+            parse_mac(NAMESPACE_MAC).unwrap(),
+        )
+        .unwrap();
         assert_eq!(model.sent.len(), 1);
         assert_eq!(
             sequences_zeroed(&model.sent[0]),
@@ -2599,6 +2837,24 @@ mod neighbour_tests {
         assert_eq!(model.table.len(), 1);
         assert_eq!(model.table[0].state, NUD_PERMANENT);
         assert_eq!(Some(model.table[0].lladdr), parse_mac(NAMESPACE_MAC));
+    }
+
+    #[test]
+    fn the_routed_gateway_pin_sends_the_request_ip_sent() {
+        let mut model = ModelNeighbours::default();
+        let address: Ipv6Addr = ROUTED_GATEWAY_IPV6.parse().unwrap();
+        replace_neighbour(
+            &mut model,
+            2,
+            address.into(),
+            parse_mac(NAMESPACE_MAC).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(model.sent.len(), 1);
+        assert_eq!(
+            sequences_zeroed(&model.sent[0]),
+            sequences_zeroed(&IP6_NEIGH_REPLACE)
+        );
     }
 }
 

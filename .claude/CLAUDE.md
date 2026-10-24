@@ -116,6 +116,16 @@ touches the link, so there are no routes and no neighbours to reinstate.
    clone inheriting the source's neighbour table holds entries that are correct
    in its own namespace. fc-agent hardcodes the same constant; the pair is
    asserted by `namespace_neighbour_matches_host_constants`.
+4. **A restored clone resolves none of its gateways.** fc-agent pins 10.0.2.1
+   and, in routed mode, the IPv6 gateway `fd00::1` to that MAC (permanent)
+   right after flushing the inherited neighbours and before the IPv6 swap. A
+   resolution of `fd00::1` in flight across the swap was sourced from the
+   address the swap deletes, its answer was not delivered, and every reply
+   waited a second for the retransmit (#1160, about 6 restores in 1000 with a
+   client dialling during the restore).
+   `test_routed_clone_answers_without_resolving_its_ipv6_gateway` holds that
+   interleaving; `the_routed_gateway_is_pinned_before_the_ipv6_swap` pins the
+   order.
 
 **Enforcement:** `snapshot_leaves_the_source_network_untouched`
 (`tests/test_snapshot_clone.rs`) diffs the guest's routes, neighbours and
@@ -142,6 +152,29 @@ retired with egress closed, `ModelHook` if the hook runs with egress closed or
 after ingress opened;
 `the_restore_hook_runs_after_the_nfs_remount_and_the_proxy_waits` pins the
 source order of `handle_clone_restore`.
+
+### Opening the gate costs no grace period on the restore path
+
+Each half of the gate opens with one nf_tables commit covering both families,
+sent by fc-agent over nfnetlink (`fc-agent/src/nftables.rs`), not with an
+`iptables-restore` per family. Releasing a NETLINK_NETFILTER socket after a
+commit that deleted rules waits one RCU grace period (`nft_rcv_nl_event`
+flushes the pending destruction, which starts with `synchronize_rcu()`) while
+holding the namespace's commit mutex; so does releasing any AF_PACKET socket
+(`packet_release()` calls `synchronize_net()`). Measured in restored clones,
+that wait was 26, 46 and 79 ms at 2, 4 and 8 vCPUs, and it was the whole
+110-260 ms the gate used to cost (#1151).
+
+So fc-agent never releases those sockets: it keeps one nfnetlink socket and one
+send-only AF_PACKET socket for its whole life. Releasing them on another thread
+is not a fix: a process forked before the release holds a reference until its
+exec closes the CLOEXEC descriptor, so that process makes the final release and
+waits the grace period inside its own exec (the `iptables -S` after the ARP
+probe went from 2-3 ms to 27-75 ms). The receive barrier is the one release
+that must stay: its grace period is the barrier.
+`the_gate_socket_is_kept_and_never_released`,
+`frames_are_sent_through_the_socket_that_is_never_released` and
+`opening_each_half_is_one_transaction_for_both_families` pin it.
 
 ## MAXIMUM REUSE / CACHEABILITY
 

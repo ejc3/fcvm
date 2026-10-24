@@ -357,9 +357,10 @@ pub async fn run() -> Result<()> {
     container::set_podman_cmd_prefix(cmd_prefix.clone());
 
     // Open exec only now, with the rebind signal for vsock transport reset
-    // recovery. The host's health monitor runs `podman inspect` over exec as soon
-    // as the server accepts connections, so no podman command can start before
-    // storage setup, the container user and the command prefix are done. Overlay
+    // recovery. A host exec (a user's, or the health monitor's `podman inspect`
+    // for an image with a HEALTHCHECK) can arrive as soon as the server accepts
+    // connections, so no podman command can start before storage setup, the
+    // container user and the command prefix are done. Overlay
     // image mode rewrites storage.conf after this point, in mount_overlay_image(),
     // with the driver write_early_storage_conf() already named. The host's exec
     // client retries until the server listens.
@@ -452,9 +453,14 @@ pub async fn run() -> Result<()> {
     // If the console cannot be proven quiet it returns Failed WITHOUT sending
     // cache-ready — the host never pauses us and the VM continues cold.
     let mut restored = false;
-    match container::get_image_digest(&image_ref, &cmd_prefix).await {
-        Ok(digest) => {
-            let cache_result = container::notify_cache_ready_and_wait(&digest, &restore_flag);
+    // Whether the image defines a HEALTHCHECK, sent to the host with the container's
+    // start. Unknown counts as yes: the host then asks podman, which is what it did for
+    // every container before the start notification carried this.
+    let mut image_healthcheck = true;
+    match container::get_image_facts(&image_ref, &cmd_prefix).await {
+        Ok(facts) => {
+            image_healthcheck = facts.healthcheck;
+            let cache_result = container::notify_cache_ready_and_wait(&facts.digest, &restore_flag);
             match cache_result {
                 container::CacheResult::ColdStart => {
                     eprintln!("[fc-agent] cache ready: cold start (cache-ack received)");
@@ -516,7 +522,7 @@ pub async fn run() -> Result<()> {
             }
         }
         Err(e) => {
-            eprintln!("[fc-agent] WARNING: failed to get image digest: {:?}", e);
+            eprintln!("[fc-agent] WARNING: failed to inspect the image: {:?}", e);
         }
     }
     crate::gpu::check_gpu_restore(plan.await_gpu_restore, restored)?;
@@ -614,14 +620,32 @@ pub async fn run() -> Result<()> {
         container::build_podman_args(&plan, &image_ref, user_ref, &gpu_devices)
     };
 
+    // Bound before podman starts, so its READY=1 always has somewhere to go.
+    let start_notify =
+        container::StartNotify::bind(container::podman_user_ids(plan.user.as_deref()))?;
+
     // TTY mode: never returns
     if plan.tty {
         eprintln!("[fc-agent] TTY mode enabled, using PTY");
-        container::run_tty(&podman_args, &plan, &mounted_fuse_paths).await;
+        container::run_tty(
+            &podman_args,
+            &plan,
+            &mounted_fuse_paths,
+            start_notify,
+            image_healthcheck,
+        )
+        .await;
     }
 
     // Non-TTY mode: async
-    let exit_code = container::run_async(&podman_args, &output, plan.non_blocking_output).await?;
+    let exit_code = container::run_async(
+        &podman_args,
+        &output,
+        plan.non_blocking_output,
+        start_notify,
+        image_healthcheck,
+    )
+    .await?;
 
     // Notify host of exit
     crate::vsock::notify_container_exit(exit_code);

@@ -1,0 +1,5 @@
+{"rect": {"x": 0, "y": 0, "w": 1, "h": 1}, "image_aspect": 1.7777778,
+ "camera": [{"t": 0.0, "pos": [-30, 80, -40], "look": [700, 0, -300], "fov_deg": 60.0}],
+ "time_of_day": 0.245,
+ "words": [{"text": "80 KM UP", "t": 0.0}],
+ "lights": []}

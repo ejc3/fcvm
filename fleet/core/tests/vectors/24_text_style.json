@@ -1,0 +1,451 @@
+{
+  "description": "A message carries a text_style for the renderer: lockup when it is missing (or null), otherwise one of lockup, skywriting and landmark; anything else is refused before the text check counts it, and the per-client message rate is unchanged.",
+  "events": [
+    {
+      "at": 1000,
+      "client": "198.51.100.21",
+      "type": "viewer_joined",
+      "viewer": "v1"
+    },
+    {
+      "at": 1000,
+      "client": "198.51.100.22",
+      "type": "viewer_joined",
+      "viewer": "v2"
+    },
+    {
+      "at": 1000,
+      "client": "198.51.100.23",
+      "type": "viewer_joined",
+      "viewer": "v3"
+    },
+    {
+      "at": 1000,
+      "client": "198.51.100.24",
+      "type": "viewer_joined",
+      "viewer": "v4"
+    },
+    {
+      "at": 1000,
+      "client": "198.51.100.25",
+      "type": "viewer_joined",
+      "viewer": "v5"
+    },
+    {
+      "args": {
+        "text": "one"
+      },
+      "at": 2000,
+      "check": {
+        "reason": "ok",
+        "sky": [],
+        "verdict": "allow"
+      },
+      "client": "198.51.100.21",
+      "id": "s1",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "text": "two",
+        "text_style": "skywriting"
+      },
+      "at": 2100,
+      "check": {
+        "reason": "ok",
+        "sky": [
+          "one"
+        ],
+        "verdict": "allow"
+      },
+      "client": "198.51.100.22",
+      "id": "s2",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "text": "three",
+        "text_style": "landmark"
+      },
+      "at": 2200,
+      "check": {
+        "reason": "ok",
+        "sky": [
+          "one",
+          "two"
+        ],
+        "verdict": "allow"
+      },
+      "client": "198.51.100.23",
+      "id": "s3",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "args": {
+        "text": "four",
+        "text_style": "lockup"
+      },
+      "at": 2300,
+      "check": {
+        "reason": "ok",
+        "sky": [
+          "one",
+          "two",
+          "three"
+        ],
+        "verdict": "allow"
+      },
+      "client": "198.51.100.24",
+      "id": "s4",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v4"
+    },
+    {
+      "args": {
+        "text": "five",
+        "text_style": "neon"
+      },
+      "at": 2400,
+      "check": {
+        "reason": "ok",
+        "sky": [
+          "one",
+          "two",
+          "three",
+          "four"
+        ],
+        "verdict": "allow"
+      },
+      "client": "198.51.100.25",
+      "id": "s5",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v5"
+    },
+    {
+      "args": {
+        "text": "five",
+        "text_style": 3
+      },
+      "at": 2500,
+      "check": {
+        "reason": "ok",
+        "sky": [
+          "one",
+          "two",
+          "three",
+          "four"
+        ],
+        "verdict": "allow"
+      },
+      "client": "198.51.100.25",
+      "id": "s6",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v5"
+    },
+    {
+      "args": {
+        "text": "again",
+        "text_style": "landmark"
+      },
+      "at": 2600,
+      "check": {
+        "reason": "ok",
+        "sky": [
+          "one",
+          "two",
+          "three",
+          "four"
+        ],
+        "verdict": "allow"
+      },
+      "client": "198.51.100.21",
+      "id": "s7",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v1"
+    }
+  ],
+  "expect": [
+    {
+      "after": 5,
+      "checks": {
+        "/receipts/s1/outcome": "committed",
+        "/view/scene/words/0": {
+          "t": 2.0,
+          "text": "one",
+          "text_style": "lockup"
+        }
+      },
+      "note": "no text_style: lockup"
+    },
+    {
+      "after": 6,
+      "checks": {
+        "/view/scene/words/1/text_style": "skywriting"
+      }
+    },
+    {
+      "after": 7,
+      "checks": {
+        "/view/scene/words/2/text_style": "landmark"
+      }
+    },
+    {
+      "after": 8,
+      "checks": {
+        "/view/scene/words/3/text_style": "lockup"
+      }
+    },
+    {
+      "after": 9,
+      "checks": {
+        "/receipts/s5/outcome": "refused",
+        "/receipts/s5/reason": "args.text_style must be one of lockup, skywriting, landmark",
+        "/view/scene/words/4": null
+      },
+      "note": "not one of the styles"
+    },
+    {
+      "after": 10,
+      "checks": {
+        "/receipts/s6/outcome": "refused",
+        "/receipts/s6/reason": "args.text_style must be one of lockup, skywriting, landmark"
+      }
+    },
+    {
+      "after": 11,
+      "checks": {
+        "/receipts/s7/outcome": "refused",
+        "/receipts/s7/reason": "one word per 5 s per client"
+      },
+      "note": "the per-client rate still applies"
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "args": {
+          "text": "one"
+        },
+        "at": 2000,
+        "id": "s1",
+        "name": "word",
+        "outcome": "committed",
+        "summary": "word \"one\"",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "text": "two",
+          "text_style": "skywriting"
+        },
+        "at": 2100,
+        "id": "s2",
+        "name": "word",
+        "outcome": "committed",
+        "summary": "word \"two\"",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "text": "three",
+          "text_style": "landmark"
+        },
+        "at": 2200,
+        "id": "s3",
+        "name": "word",
+        "outcome": "committed",
+        "summary": "word \"three\"",
+        "viewer": "v3"
+      },
+      {
+        "args": {
+          "text": "four",
+          "text_style": "lockup"
+        },
+        "at": 2300,
+        "id": "s4",
+        "name": "word",
+        "outcome": "committed",
+        "summary": "word \"four\"",
+        "viewer": "v4"
+      },
+      {
+        "args": {},
+        "at": 2400,
+        "id": "s5",
+        "name": "word",
+        "outcome": "refused",
+        "summary": "args.text_style must be one of lockup, skywriting, landmark",
+        "viewer": "v5"
+      },
+      {
+        "args": {},
+        "at": 2500,
+        "id": "s6",
+        "name": "word",
+        "outcome": "refused",
+        "summary": "args.text_style must be one of lockup, skywriting, landmark",
+        "viewer": "v5"
+      },
+      {
+        "args": {},
+        "at": 2600,
+        "id": "s7",
+        "name": "word",
+        "outcome": "refused",
+        "summary": "one word per 5 s per client",
+        "viewer": "v1"
+      }
+    ],
+    "aggregates": [],
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "budget": null,
+    "budget_from_t": null,
+    "claims": [],
+    "cooldown_until": null,
+    "counters": {
+      "restores": 0,
+      "restores_last_hour": 0,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
+    "failures": [],
+    "fleet": {
+      "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
+      "fcvm_gpus": 0,
+      "gpus": 0,
+      "hosts": [],
+      "max_tiles": 100,
+      "n": 0,
+      "power": {
+        "asleep_since": null,
+        "hosts": [],
+        "idle_since": null,
+        "last_wake": null,
+        "state": "awake",
+        "wakes": [],
+        "woke_at": null
+      },
+      "standby": [],
+      "standby_ready": 0,
+      "warming": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": null,
+      "from_frame": 0,
+      "from_t": 0.0,
+      "generation": 0
+    },
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": null,
+      "holding": "coast",
+      "next": null,
+      "next_hold_at": 7000,
+      "targets": [
+        {
+          "id": "horizon",
+          "label": "High above: the curve of the horizon",
+          "votes": 0
+        },
+        {
+          "id": "dawn-valley",
+          "label": "Dawn in the valley",
+          "votes": 0
+        },
+        {
+          "id": "peak-seam-low-sun",
+          "label": "The peak at a low sun",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [],
+    "relaunch_all": null,
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -63.5,
+            2.2,
+            -87.0
+          ],
+          "pos": [
+            -100.0,
+            0.35,
+            -90.0
+          ],
+          "t": 0.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -63.5,
+            2.2,
+            -87.0
+          ],
+          "pos": [
+            -100.0,
+            0.35,
+            -90.0
+          ],
+          "t": 7.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.33,
+      "words": [
+        {
+          "t": 2.0,
+          "text": "one",
+          "text_style": "lockup"
+        },
+        {
+          "t": 2.1,
+          "text": "two",
+          "text_style": "skywriting"
+        },
+        {
+          "t": 2.2,
+          "text": "three",
+          "text_style": "landmark"
+        },
+        {
+          "t": 2.3,
+          "text": "four",
+          "text_style": "lockup"
+        }
+      ]
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": null
+    },
+    "tiles": [],
+    "viewers": {
+      "active": 5,
+      "count": 5
+    }
+  },
+  "start_ms": 0
+}

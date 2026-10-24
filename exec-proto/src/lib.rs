@@ -428,6 +428,19 @@ pub fn parse_rejection(line: &[u8]) -> Option<String> {
     (rejection.kind == "error").then_some(rejection.data)
 }
 
+// ---- Container start notification ----
+//
+// fc-agent sends one of these on the status port once podman reports the container
+// running; fcvm's status listener records it for the health monitor. Shared so the two
+// binaries cannot disagree on the words.
+
+/// The container is running and its image defines no HEALTHCHECK.
+pub const CONTAINER_STARTED: &str = "ready";
+
+/// The container is running and its image defines a HEALTHCHECK, whose result the host
+/// asks podman for.
+pub const CONTAINER_STARTED_WITH_HEALTHCHECK: &str = "ready:healthcheck";
+
 // ---- Restore-completion ACK framing ----
 //
 // Shared by fc-agent (producer) and fcvm's restore listener (consumer) so the
@@ -440,9 +453,10 @@ pub fn parse_rejection(line: &[u8]) -> Option<String> {
 pub const RESTORE_COMPLETE_PREFIX: &str = "restore-complete:";
 
 /// Whole-frame cap, prefix through newline. Sized for a UUID epoch plus the
-/// guest's phase-timing telemetry JSON with generous headroom (a dozen
-/// float-valued phases render near 450 bytes).
-pub const RESTORE_COMPLETE_MAX_FRAME_BYTES: usize = 1024;
+/// guest's phase-timing telemetry JSON: about 30 restore phases (the firewall
+/// gate's among them) and nine GPU attach steps, each rounded to the microsecond,
+/// render near 1,000 bytes at five integer digits, so 1024 left none to spare.
+pub const RESTORE_COMPLETE_MAX_FRAME_BYTES: usize = 2048;
 
 /// How long fc-agent waits for the host to answer the connection it sends the ACK on. A
 /// blocking vsock connect otherwise waits only Linux's default of 2 s, which a guest busy

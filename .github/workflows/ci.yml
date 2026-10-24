@@ -61,6 +61,7 @@ jobs:
     outputs:
       code: ${{ steps.detect.outputs.code }}
       bench: ${{ steps.detect.outputs.bench }}
+      fleet: ${{ steps.detect.outputs.fleet }}
     steps:
       - name: Detect whether any non-doc path changed
         id: detect
@@ -83,6 +84,7 @@ jobs:
           if [ "$EVENT" != "pull_request" ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "bench=true" >> "$GITHUB_OUTPUT"
+            echo "fleet=true" >> "$GITHUB_OUTPUT"
             echo "event $EVENT: running the full matrix"
             exit 0
           fi
@@ -98,6 +100,7 @@ jobs:
             # An empty file list is unexpected, so fail toward running everything.
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "bench=true" >> "$GITHUB_OUTPUT"
+            echo "fleet=true" >> "$GITHUB_OUTPUT"
             echo "no changed files reported: running the full matrix"
             exit 0
           fi
@@ -110,6 +113,7 @@ jobs:
           # documents twice.
           code=false
           bench=false
+          fleet=false
           while IFS= read -r f; do
             # `bench/*` MUST precede the docs arm. A shell `case` glob matches
             # `/`, so `*.md` swallows bench/chromium/README.md and that PR
@@ -141,13 +145,24 @@ jobs:
               # is exactly the class that can break it.
               Makefile) code=true; bench=true; echo "makefile: $f" ;;
               bench/*) bench=true; echo "bench path: $f" ;;
+              # fleet/core is a workspace member that fcvm builds, so it is code.
+              # The rest of fleet/ (renderer, media, shots, tools, PROTOCOL.md)
+              # is not built, read or run by anything the VM matrix executes, so
+              # the matrix can say nothing about it. It runs fleet-renderer, the
+              # renderer's host tests (fleet/web has its own job on the fleet-web
+              # branch).
+              fleet/core/*) code=true; echo "code path: $f" ;;
+              fleet/*) fleet=true; echo "fleet path, no matrix: $f" ;;
+              # This file holds the fleet-renderer job, so a change here runs it too.
+              .github/workflows/ci.yml) code=true; fleet=true; echo "ci workflow: $f" ;;
               docs/*|*.md) ;;
               *) code=true; echo "code path: $f" ;;
             esac
           done <<< "$files"
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "bench=$bench" >> "$GITHUB_OUTPUT"
-          echo "code_changed=$code bench_changed=$bench"
+          echo "fleet=$fleet" >> "$GITHUB_OUTPUT"
+          echo "code_changed=$code bench_changed=$bench fleet_changed=$fleet"
 
   # The benchmark harness has four test files and, until now, CI ran none of
   # them: `grep -c bench/ ci.yml` was 0 while bench/chromium/test_reqbench.py,
@@ -187,6 +202,35 @@ jobs:
         run: /tmp/actionlint -shellcheck=
       - name: Test runner acceptance contract without AWS credentials
         run: make test-runner-acceptance
+
+  # The fleet renderer's host tests (fleet/renderer/tests/test_host.cpp: scene
+  # parsing, tile geometry, wire formats, TLS). They need g++, OpenSSL and the
+  # NVENC API header, no GPU. The GPU seam test (test_gpu.cpp) needs a GPU and
+  # does not run here.
+  fleet-renderer:
+    name: Fleet Renderer
+    needs: [changes]
+    if: ${{ needs.changes.outputs.fleet == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Renderer host tests
+        run: |
+          set -euo pipefail
+          # fleet/renderer arrives with #1144; until a tree has it there is nothing to test.
+          if [ ! -d fleet/renderer ]; then
+            echo "fleet/renderer does not exist in this tree: nothing to test"
+            exit 0
+          fi
+          # The NVENC API header at the commit fleet/renderer/Containerfile pins
+          # (n12.2.72.0). Ubuntu's libffmpeg-nvenc-dev is 12.1.14.
+          hdr="$RUNNER_TEMP/nv-codec-headers"
+          git init -q "$hdr"
+          git -C "$hdr" fetch -q --depth 1 https://github.com/FFmpeg/nv-codec-headers.git \
+            c69278340ab1d5559c7d7bf0edf615dc33ddbba7
+          git -C "$hdr" checkout -q FETCH_HEAD
+          make -C fleet/renderer test-host NVCH="$hdr/include"
 
   # Plans which self-hosted jobs this run needs.
   #
@@ -351,7 +395,7 @@ jobs:
           which cargo-deny || cargo install cargo-deny@0.18.9 --locked
       - name: Check formatting
         working-directory: fcvm
-        run: cargo fmt -p fcvm -p fuse-pipe -p fc-agent --check
+        run: cargo fmt -p fcvm -p fuse-pipe -p fc-agent -p failpoint -p fleet-core --check
       - name: Clippy
         working-directory: fcvm
         run: cargo clippy --all-targets -- -D warnings
@@ -1167,7 +1211,7 @@ jobs:
   # Final summary job - runs after all test jobs
   summary:
     name: Summary
-    needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, bench-tests, host, host-root, container]
+    needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, bench-tests, fleet-renderer, host, host-root, container]
     if: always()
     runs-on: ubuntu-latest
     steps:

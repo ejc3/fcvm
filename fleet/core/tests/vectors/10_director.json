@@ -1,0 +1,282 @@
+{
+  "description": "The directed camera holds at the seed's first viewpoint, closes the vote 2 s before the hold ends, flies to the default next hold when nobody voted, and arrives on whole seconds; free camera and time-of-day intents are gone.",
+  "events": [
+    {
+      "at": 1000,
+      "type": "viewer_joined",
+      "viewer": "v1"
+    },
+    {
+      "at": 4999,
+      "type": "tick"
+    },
+    {
+      "at": 5000,
+      "type": "tick"
+    },
+    {
+      "at": 7000,
+      "type": "tick"
+    },
+    {
+      "at": 29999,
+      "type": "tick"
+    },
+    {
+      "at": 30000,
+      "type": "tick"
+    },
+    {
+      "args": {
+        "drag": {
+          "pitch_deg": 0,
+          "yaw_deg": 5
+        }
+      },
+      "at": 30010,
+      "id": "c1",
+      "name": "camera",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "v": 0.5
+      },
+      "at": 30020,
+      "id": "t1",
+      "name": "time_of_day",
+      "type": "intent",
+      "viewer": "v1"
+    }
+  ],
+  "expect": [
+    {
+      "after": 0,
+      "checks": {
+        "/view/nudges/arrive_next_at": null,
+        "/view/nudges/holding": "coast",
+        "/view/nudges/next": null,
+        "/view/nudges/next_hold_at": 7000,
+        "/view/nudges/targets": [
+          {
+            "id": "horizon",
+            "label": "High above: the curve of the horizon",
+            "votes": 0
+          },
+          {
+            "id": "dawn-valley",
+            "label": "Dawn in the valley",
+            "votes": 0
+          },
+          {
+            "id": "peak-seam-low-sun",
+            "label": "The peak at a low sun",
+            "votes": 0
+          }
+        ],
+        "/view/scene/camera/0/t": 0.0,
+        "/view/scene/camera/1/t": 7.0,
+        "/view/scene/camera/2": null
+      }
+    },
+    {
+      "after": 1,
+      "checks": {
+        "/view/nudges/next": null
+      }
+    },
+    {
+      "after": 2,
+      "checks": {
+        "/view/nudges/arrive_next_at": 30000,
+        "/view/nudges/next": "horizon",
+        "/view/scene/camera/1/t": 7.0,
+        "/view/scene/camera/2/t": 18.5
+      }
+    },
+    {
+      "after": 3,
+      "checks": {
+        "/view/nudges/holding": null,
+        "/view/nudges/next_hold_at": null
+      },
+      "note": "flying: no hold"
+    },
+    {
+      "after": 4,
+      "checks": {
+        "/view/nudges/holding": null
+      }
+    },
+    {
+      "after": 5,
+      "checks": {
+        "/view/nudges/holding": "horizon",
+        "/view/nudges/next": null,
+        "/view/nudges/next_hold_at": 37000,
+        "/view/nudges/targets/0/id": "dawn-valley"
+      }
+    },
+    {
+      "after": 6,
+      "checks": {
+        "/receipts/c1/reason": "unknown intent \"camera\""
+      }
+    },
+    {
+      "after": 7,
+      "checks": {
+        "/receipts/t1/reason": "unknown intent \"time_of_day\""
+      }
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "args": {
+          "drag": {
+            "pitch_deg": 0,
+            "yaw_deg": 5
+          }
+        },
+        "at": 30010,
+        "id": "c1",
+        "name": "camera",
+        "outcome": "refused",
+        "summary": "unknown intent \"camera\"",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "v": 0.5
+        },
+        "at": 30020,
+        "id": "t1",
+        "name": "time_of_day",
+        "outcome": "refused",
+        "summary": "unknown intent \"time_of_day\"",
+        "viewer": "v1"
+      }
+    ],
+    "aggregates": [],
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "budget": null,
+    "budget_from_t": null,
+    "claims": [],
+    "cooldown_until": null,
+    "counters": {
+      "restores": 0,
+      "restores_last_hour": 0,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
+    "failures": [],
+    "fleet": {
+      "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
+      "fcvm_gpus": 0,
+      "gpus": 0,
+      "hosts": [],
+      "max_tiles": 100,
+      "n": 0,
+      "power": {
+        "asleep_since": null,
+        "hosts": [],
+        "idle_since": null,
+        "last_wake": null,
+        "state": "awake",
+        "wakes": [],
+        "woke_at": null
+      },
+      "standby": [],
+      "standby_ready": 0,
+      "warming": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": null,
+      "from_frame": 0,
+      "from_t": 0.0,
+      "generation": 0
+    },
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": null,
+      "holding": "horizon",
+      "next": null,
+      "next_hold_at": 37000,
+      "targets": [
+        {
+          "id": "dawn-valley",
+          "label": "Dawn in the valley",
+          "votes": 0
+        },
+        {
+          "id": "peak-seam-low-sun",
+          "label": "The peak at a low sun",
+          "votes": 0
+        },
+        {
+          "id": "peak-close",
+          "label": "Close to the peak",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [],
+    "relaunch_all": null,
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 70.0,
+          "look": [
+            -75.0,
+            28.0,
+            -170.0
+          ],
+          "pos": [
+            -30.0,
+            38.0,
+            -60.0
+          ],
+          "t": 30.0
+        },
+        {
+          "fov_deg": 70.0,
+          "look": [
+            -75.0,
+            28.0,
+            -170.0
+          ],
+          "pos": [
+            -30.0,
+            38.0,
+            -60.0
+          ],
+          "t": 37.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.45,
+      "words": []
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": null
+    },
+    "tiles": [],
+    "viewers": {
+      "active": 1,
+      "count": 1
+    }
+  },
+  "start_ms": 0
+}
