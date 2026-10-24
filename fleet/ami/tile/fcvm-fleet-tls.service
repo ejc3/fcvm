@@ -1,0 +1,14 @@
+[Unit]
+Description=fcvm fleet tile: fetch the wildcard TLS certificate with the instance role
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/fcvm-fleet/fetch-cert.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

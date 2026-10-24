@@ -1,0 +1,14 @@
+// The staging Worker for the wall page (stage.fcvm.dev, behind Cloudflare Access).
+// Terraform in ejc3/aws owns the envelope (the Access application, the custom domain);
+// wrangler owns the code. No workers.dev or preview URL: both would be outside Access.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "fcvm-fleet-stage",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "assets": { "directory": ".open-next/assets", "binding": "ASSETS" },
+  "vars": { "FLEET_COORD_URL": "wss://fleet-api-stage.fcvm.dev/live" }
+}

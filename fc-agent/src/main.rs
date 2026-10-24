@@ -10,6 +10,7 @@ mod mmds;
 mod mounts;
 mod netlink;
 mod network;
+mod nftables;
 mod output;
 mod proxy;
 mod restore;

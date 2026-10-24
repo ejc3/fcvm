@@ -52,9 +52,13 @@ max-threads = 1
 [test-groups.hugepage-tests]
 max-threads = 1
 
-# Snapshot tests limited to 3 concurrent (each snapshot is ~5.6GB on disk)
+# Snapshot tests limited to 8 concurrent. Each snapshot takes up to ~5.6GB on disk,
+# so 8 fit in the 60G loopback `fcvm setup` makes on a host without btrfs
+# (paths.btrfs_size). The cap was 3 when that loopback was 20G; at 3 this group was
+# most of a CI suite run (122 tests, 2,112 s of test time, 704 s minimum at 3 wide,
+# in an 860 s run on Host-Root-x64-SnapshotEnabled).
 [test-groups.snapshot-tests]
-max-threads = 3
+max-threads = 8
 
 # Nested (NV2) tests are the heaviest in the suite: each chain is an L1 (4GB) plus an L2 VM,
 # and the L2 boots a 10GB disk copy INSIDE the L1 where there is no reflink. They run only on
@@ -97,6 +101,14 @@ max-threads = "num-cpus"
 # stress_100 variant, each burning 100-150s before a clean retry). Give the
 # bench the entire runner: ~160s of exclusivity is cheaper in wall time than
 # the try-1 burns plus retries it causes.
+# Race gym (make race-gym, tests/test_race_gym.rs, docs/race-gym.md): one test runs every
+# schedule of a phase, each a set of real VM launches; the replays it emits as cases run the
+# same way. A retry would rerun a different schedule set and hide the failing one, so none.
+[[profile.default.overrides]]
+filter = "package(fcvm) & (binary(test_race_gym) | test(/lifecycle_interleave_gym_/))"
+slow-timeout = { period = "14400s", terminate-after = 1 }
+retries = 0
+
 # Seeded lifecycle chaos fuzz (make fuzz, tests/test_fuzz_chaos.rs): ONE test
 # loops over every requested seed, each booting a VM and running a full op
 # schedule (~2-4 min/seed). The weekly CI run uses 20 seeds x 25 ops, so the
@@ -141,7 +153,7 @@ filter = "package(fcvm) & test(/hugepage/)"
 test-group = "hugepage-tests"
 slow-timeout = { period = "600s", terminate-after = 1 }
 
-# Snapshot tests: limited to 3 concurrent (each creates ~5.6GB snapshot on disk)
+# Snapshot tests: limited to 8 concurrent (see test-groups.snapshot-tests)
 [[profile.default.overrides]]
 filter = "package(fcvm) & (test(/snapshot/) | test(/clone/))"
 test-group = "snapshot-tests"

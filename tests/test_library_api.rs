@@ -64,6 +64,7 @@ fn test_run_args(name: &str) -> RunArgs {
         rootfs_override: None,
         image_disk_override: None,
         pmem_devices: vec![],
+        resolved_extra_disks: None,
     }
 }
 

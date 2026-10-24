@@ -1,0 +1,13 @@
+[Unit]
+Description=fcvm fleet: fcvm store on the local NVMe, restored from the AMI's copy
+After=local-fs.target
+ConditionPathExists=/var/lib/fcvm-fleet/store.tar.zst
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/fcvm-fleet/store.sh
+TimeoutStartSec=30min
+
+[Install]
+WantedBy=multi-user.target

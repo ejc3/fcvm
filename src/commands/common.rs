@@ -1876,6 +1876,7 @@ async fn cleanup_vm_inner(
             .and_then(|pid| crate::utils::process_start_time(pid).map(|start| (pid, start)))
     });
 
+    failpoint::hit_async("teardown.pre_kill").await;
     let kill_start = std::time::Instant::now();
     failures.record("signalling VM process", vm_manager.start_kill());
     if let Some(ref mut holder) = holder_child {
@@ -1994,16 +1995,13 @@ async fn cleanup_vm_inner(
         // The logs are copied out BEFORE removing the directory they live in.
         let saved = save_vm_logs(&data_dir, &vm_id, std::path::Path::new("/tmp")).await;
 
+        failpoint::hit_async("teardown.pre_remove_data_dir").await;
         // Includes disks, sockets, everything under the VM's runtime directory.
-        let removed = match tokio::fs::remove_dir_all(&data_dir).await {
-            Ok(()) => {
-                info!(vm_id = %vm_id, "cleaned up VM data directory");
-                Ok(())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error)
-                .with_context(|| format!("removing VM data directory {}", data_dir.display())),
-        };
+        // A clone of this VM's snapshot that is still loading it reads its disks through
+        // a bind over this directory, so the removal waits for it.
+        let removed = crate::storage::runtime_dir::remove_runtime_dir(&data_dir)
+            .await
+            .map(|()| info!(vm_id = %vm_id, "cleaned up VM data directory"));
         (saved, removed)
     };
     let (exports_removed, state_deleted, (logs_saved, data_dir_removed)) =
@@ -2738,6 +2736,10 @@ pub struct CloneSubstrate {
     /// set to `(baseline_dirs, clone_dir)` so the VMM opens the clone's CoW disk where the
     /// snapshot embedded the baseline's path.
     pub namespace: crate::utils::NamespaceParams,
+    /// Shared leases on the source VM directories `mount_redirects` binds over. The
+    /// caller holds them until the VMM has opened the disks the snapshot names, so the
+    /// source VM's teardown cannot remove a directory, and with it the bind mount, first.
+    pub mount_target_lease: crate::storage::runtime_dir::MountTargetLease,
 }
 
 /// Stop and reap a rootless namespace holder retained by a failed restore.
@@ -2960,6 +2962,20 @@ async fn prepare_clone_substrate(
     );
     namespace.mount_redirects = Some(redirects);
 
+    // The VMM opens the snapshot's disks through the binds over these directories. Their
+    // own VMs' teardowns remove them, which detaches the binds in this clone's namespace
+    // too, so hold them until the disks are open (storage::runtime_dir).
+    let mount_target_lease = match crate::storage::runtime_dir::lease_mount_targets(&disk_dirs)
+        .await
+        .context("leasing the source VM directories the clone's disks are bound over")
+    {
+        Ok(lease) => lease,
+        Err(error) => {
+            cleanup_failed_clone_holder(&mut holder_child, "leasing source VM directories").await;
+            return Err(error);
+        }
+    };
+
     // Extra disk images (disk-dir) in the clone's disk directory, so the redirected baseline
     // paths resolve to real files. A disk directory made as a subvolume snapshot of the
     // snapshot's disk directory already holds them; the reflink copy is for one that was not.
@@ -3002,6 +3018,7 @@ async fn prepare_clone_substrate(
         holder_child,
         holder_pid_for_post_start,
         namespace,
+        mount_target_lease,
     })
 }
 
@@ -3090,8 +3107,10 @@ pub async fn restore_from_snapshot(
         vsock_override.is_some(),
     )
     .await?;
+    failpoint::hit_async("restore.post_clone_disk").await;
     let rootfs_path = substrate.rootfs_path;
     let holder_pid_for_post_start = substrate.holder_pid_for_post_start;
+    let mut mount_target_lease = Some(substrate.mount_target_lease);
 
     let fc_log_path = data_dir.join("firecracker.log");
     let mut vm_manager = VmManager::new(
@@ -3116,6 +3135,9 @@ pub async fn restore_from_snapshot(
         vm_manager.set_mount_redirects(redirects.clone());
     }
 
+    // failpoint: before the VMM is spawned, which is when the host creates any missing
+    // mountpoint of the mount redirect and the child binds over it.
+    failpoint::hit_async("restore.pre_spawn_vmm").await;
     if let Err(error) = vm_manager
         .start(&firecracker_bin, None, firecracker_args.as_deref())
         .await
@@ -3187,6 +3209,11 @@ pub async fn restore_from_snapshot(
             }
         };
 
+        // Failpoint: the VMM runs in its mount namespace, its own directory bound over
+        // the source VM's, and has not opened the disks the snapshot names. A harness
+        // tears the source VM down in this window.
+        failpoint::hit_async("restore.pre_load").await;
+
         // Timing instrumentation: measure snapshot load operation
         let load_start = std::time::Instant::now();
         client
@@ -3211,6 +3238,8 @@ pub async fn restore_from_snapshot(
                 }
             })?;
         let load_duration = load_start.elapsed();
+        // The load opened every disk at its source path, so the source VMs may go.
+        drop(mount_target_lease.take());
         info!(
             duration_ms = load_duration.as_millis(),
             track_dirty_pages, "snapshot load completed"
@@ -3610,6 +3639,7 @@ pub async fn restore_from_snapshot_ch(
     }
 
     let mut holder_child = substrate.holder_child.take();
+    let mut mount_target_lease = Some(substrate.mount_target_lease);
     // Everything after spawn runs in a fallible block so a failure kills the CH process
     // (callers may fall back to a fresh boot, so a half-restored process must not leak).
     let post_start = async {
@@ -3629,6 +3659,8 @@ pub async fn restore_from_snapshot_ch(
             .resume()
             .await
             .context("resuming Cloud Hypervisor after restore")?;
+        // The restore opened every disk at its source path, so the source VMs may go.
+        drop(mount_target_lease.take());
 
         vm_state.pid = Some(std::process::id());
         // Future snapshots of this clone must redirect using the original vsock vm_id.
@@ -3743,6 +3775,15 @@ async fn reflink_disks_to_snapshot(
 /// temp dir into place, then remove the old. Shared by the snapshot-create paths so a
 /// finalized snapshot directory always appears atomically.
 async fn atomic_replace_dir(temp_dir: &Path, final_dir: &Path) -> Result<()> {
+    failpoint::hit_async("snapshot.install.pre_rename").await;
+    let result = replace_dir(temp_dir, final_dir).await;
+    if result.is_ok() {
+        failpoint::hit_async("snapshot.install.post_rename").await;
+    }
+    result
+}
+
+async fn replace_dir(temp_dir: &Path, final_dir: &Path) -> Result<()> {
     if final_dir.exists() {
         let old = snapshot_sibling(final_dir, "old");
         let _ = tokio::fs::remove_dir_all(&old).await;
@@ -4040,12 +4081,17 @@ async fn lock_vm_snapshots(
     let lock_file = std::fs::File::create(&lock_path)
         .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
     use fs2::FileExt;
+    let mut noted_wait = false;
     loop {
         match lock_file.try_lock_exclusive() {
             Ok(()) => break,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if give_up_at.is_some_and(|at| std::time::Instant::now() >= at) {
                     return Ok(None);
+                }
+                if !noted_wait {
+                    failpoint::note("lock.wait", lock_path.display());
+                    noted_wait = true;
                 }
                 debug!("waiting for per-VM snapshot lock");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -4087,6 +4133,7 @@ pub async fn acquire_snapshot_dir_lock(
         .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
     let wait_started = std::time::Instant::now();
     let mut next_info_log = std::time::Duration::from_secs(5);
+    let mut noted_wait = false;
     loop {
         // Fully-qualified fs2 calls: std::fs::File now has inherent try_lock_*
         // methods with a different error type, and inherent methods win over
@@ -4099,6 +4146,10 @@ pub async fn acquire_snapshot_dir_lock(
         match result {
             Ok(()) => break,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if !noted_wait {
+                    failpoint::note("lock.wait", lock_path.display());
+                    noted_wait = true;
+                }
                 debug!(lock = %lock_path.display(), "waiting for per-snapshot lock");
                 let elapsed = wait_started.elapsed();
                 if elapsed >= next_info_log {

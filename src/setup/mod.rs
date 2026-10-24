@@ -196,9 +196,16 @@ pub(crate) async fn lock_store_dir(lock_path: &Path, what: &str) -> Result<Flock
         .with_context(|| format!("opening {what} lock file"))?;
     give_store_entry_to_invoker(lock_path);
 
-    Flock::lock(lock_fd, FlockArg::LockExclusive)
-        .map_err(|(_, err)| err)
-        .with_context(|| format!("acquiring exclusive lock for {what}"))
+    match Flock::lock(lock_fd, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => Ok(lock),
+        Err((lock_fd, nix::errno::Errno::EWOULDBLOCK)) => {
+            failpoint::note("lock.wait", lock_path.display());
+            Flock::lock(lock_fd, FlockArg::LockExclusive)
+                .map_err(|(_, err)| err)
+                .with_context(|| format!("acquiring exclusive lock for {what}"))
+        }
+        Err((_, err)) => Err(err).with_context(|| format!("acquiring exclusive lock for {what}")),
+    }
 }
 
 pub use kernel::{

@@ -1,0 +1,14 @@
+[Unit]
+Description=fcvm fleet tile: the renderer on the instance's one GPU (HTTP on 127.0.0.1:8080, TLS by nginx on 443)
+After=nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+
+[Service]
+ExecStartPre=-/usr/bin/podman rm -f renderer
+ExecStart=/usr/bin/podman run --rm --name renderer --network host --device nvidia.com/gpu=all -e PORT=8080 localhost/fcvm-renderer:fleet
+ExecStop=/usr/bin/podman stop -t 5 renderer
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

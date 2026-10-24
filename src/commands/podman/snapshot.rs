@@ -190,6 +190,7 @@ pub async fn create_podman_snapshot(
             expected_parent_dir.as_deref(),
         )
         .await?;
+        failpoint::hit_async("snapshot.create.locked").await;
 
         // Another VM process may have finished this content-addressed snapshot while we
         // waited for its generation lock.
@@ -398,12 +399,7 @@ pub(super) fn build_firecracker_config(
 
     let port_mappings = crate::network::PortMapping::parse_all_lenient(&args.publish);
 
-    // Collect extra disk specifications for cache key.
-    // These are block devices that must match between cache create and restore.
-    let mut extra_disks: Vec<String> = Vec::new();
-    extra_disks.extend(args.disk.iter().cloned());
-    extra_disks.extend(args.disk_dir.iter().cloned());
-    extra_disks.extend(args.nfs.iter().cloned());
+    let extra_disks = super::vm_config::snapshot_key_extra_disks(args);
 
     FirecrackerConfig {
         boot_source: BootSource {
