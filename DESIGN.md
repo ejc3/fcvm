@@ -2417,10 +2417,10 @@ The times are `nvidia-persistenced`'s start in a gpu VM with the driver
 unloaded and the GPU removed and rescanned, two rounds per variant, twice; the
 proprietary modules with the GSP firmware left on took 1,111 to 1,223 ms. The
 stage writes the parameters to `nvidia.params` beside the modules and fc-agent
-passes them to `insmod`. The gpu profile uses `proprietary` on amd64 and
-`open` on arm64. On a g5g.metal (T4G) the proprietary modules took
-`nvidia-persistenced`'s start from 1,285 to 609 ms, median of eight restores each
-(see "arm64: g5g.metal" under Verified on hardware). With the GSP firmware
+passes them to `insmod`. The gpu profile uses `proprietary` on amd64 and on
+arm64. On a g5g.metal (T4G) the proprietary modules took `nvidia-persistenced`'s
+start from 1,285 to 609 ms and `gpu_ms` from 1,823 to 1,026, medians of eight
+restores each (see "arm64: g5g.metal" under Verified on hardware). With the GSP firmware
 off the proprietary modules are allowed on Turing and Ampere GPUs only:
 `fcvm podman run --gpu` refuses any other NVIDIA GPU before launch when the
 profile builds them, and names `module_type = "open"` as the setting that runs
@@ -2711,7 +2711,8 @@ range in parentheses:
 | open | 8 | 5.50 (5.48-5.52) | 2,783 (2,782-2,804) | 1,823 (1,809-1,854) | 56 | 1,285 | 428 | 21 / 54 |
 | proprietary, GSP off | 8 | 4.77 (4.74-4.82) | 2,063 (2,014-2,112) | 1,026 (1,008-1,045) | 55 | 609 | 306 | 19 / 54 |
 
-Both load the driver at boot, so `insmod` at restore is 0 ms.
+Both load the driver at boot, so `insmod` at restore is 0 ms. After these runs the
+arm64 gpu profile switched to the proprietary modules, as amd64 had.
 
 ### Attach time
 
