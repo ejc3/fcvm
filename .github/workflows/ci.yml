@@ -36,10 +36,14 @@ on:
     types: [completed]
     branches: [main]
 
-# Cancel in-progress runs when a new revision is pushed
+# A new push to a pull request cancels its superseded run. On main a run in progress
+# finishes, and only the newest waiting run is kept: cancelling there meant merges that
+# land faster than the matrix (about 40 minutes) left main with no completed host or
+# container run at all (2026-10-24: runs on 8e2fb2b2 and e121e7f0 both cancelled with
+# every self-hosted job still queued).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always

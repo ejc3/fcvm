@@ -81,6 +81,29 @@ fn daily_benchmarks_require_results_from_the_container_target_mount() {
 }
 
 /// A base-branch filter on `pull_request` silently excludes stacked PRs.
+/// A run on main must be allowed to finish.
+///
+/// With `cancel-in-progress: true` for every event, each merge to main cancelled the run
+/// still testing the previous one. Merges landed faster than the self-hosted matrix runs,
+/// so main went hours with no completed host or container job, and a broken merge could
+/// only be found on someone's next pull request.
+#[test]
+fn main_runs_are_not_cancelled_by_the_next_merge() {
+    let ci = parse_workflow("ci.yml");
+    let cancel = ci
+        .get("concurrency")
+        .and_then(|c| c.get("cancel-in-progress"))
+        .expect("ci.yml has no `concurrency.cancel-in-progress`");
+    let expr = cancel.as_str().unwrap_or_else(|| {
+        panic!("`cancel-in-progress` is {cancel:?}: a constant cancels or keeps every event alike")
+    });
+    let compact: String = expr.chars().filter(|c| !c.is_whitespace()).collect();
+    assert_eq!(
+        compact, "${{github.event_name=='pull_request'}}",
+        "`cancel-in-progress` must cancel superseded pull request runs only, never a run on main"
+    );
+}
+
 #[test]
 fn ci_runs_on_pull_requests_regardless_of_base_branch() {
     let ci = parse_workflow("ci.yml");
