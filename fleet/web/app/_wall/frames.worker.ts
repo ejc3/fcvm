@@ -689,8 +689,15 @@ function draw(): void {
     answerCaptures(null);
     return;
   }
-  // Paused: the picture holds what it shows; only a new plan or size redraws it.
-  if (plan.paused && !dirty && captures.length === 0) return;
+  // Paused, the picture holds the frozen choice. A source shown since it was taken (an
+  // opened tile) is not in it, so once that source has a frame the choice is taken again
+  // over what is shown now, and held from then on.
+  const unfrozen = plan.paused && (plan.focus ? [plan.focus] : sourcesOf(shownMode)).some((src) => {
+    const st = src.box !== null ? streamOf(src) : undefined;
+    return st !== undefined && !lastChoice.show.has(src.id) && st.frames.some((h) => fitsPlan(h, src, plan));
+  });
+  // Paused: the picture holds what it shows; only a new plan, a size or a newly shown source redraws it.
+  if (plan.paused && !unfrozen && !dirty && captures.length === 0) return;
   if (!plan.paused) trySwitch();
   if (nextPlan && !plan.paused) tryRetile();
   const shown = plan.focus ? [plan.focus] : sourcesOf(shownMode);
@@ -700,7 +707,7 @@ function draw(): void {
   if (!nextPlan) pinT = drawable.some((src) => streamOf(src)!.frames.some((h) => !fitsPlan(h, src, plan))) ? prevT : null;
   // While a re-tile waits, the old tiles show only frames from before its first frame.
   const cap = nextPlan ? Math.min(switchCap(), nextPlan.atT - SAME_T_EPS) : switchCap();
-  const choice = plan.paused ? lastChoice : chooseCommonT(buffers, prevT, undefined, cap);
+  const choice = plan.paused && !unfrozen ? lastChoice : chooseCommonT(buffers, prevT, undefined, cap);
   if (resuming) {
     // Back from hidden: the picture holds until every region has a frame at one
     // t (the mode switch's rule), then the live image fades in over it.

@@ -605,6 +605,24 @@ test("pause holds the picture; resume moves it again", async ({ page }) => {
   await expect.poll(() => drawnT(page)).toBeGreaterThan(t0!);
 });
 
+test("a tile opened from a paused aggregated wall shows its own stream's frame and holds it", async ({ page }) => {
+  await openWall(page, 3, "aggregated");
+  await page.getByTestId("pause").click();
+  await expect(page.getByTestId("pause")).toHaveAttribute("aria-pressed", "true");
+  const t = await tileBox(page, "fcvm:3");
+  await page.mouse.click(t.x + t.w / 2, t.y + t.h / 2);
+  await expect(page.getByTestId("focus")).toBeVisible();
+  // The opened tile is a direct stream the paused wall's frame choice never held.
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().frames?.tiles["d:fcvm:3"]?.newestT ?? null), { timeout: 15_000 }).not.toBeNull();
+  await expect.poll(async () => (await focusError(page, "fcvm:3")).shown, { timeout: 5_000 }).toMatch(/^(sync|behind)@/);
+  const first = await focusError(page, "fcvm:3");
+  // Still paused: the opened view holds that frame.
+  await page.waitForTimeout(1200);
+  const later = await focusError(page, "fcvm:3");
+  expect(later.shown).toBe(first.shown);
+  expect(later.err).toBeLessThan(TILE_ERR_MAX);
+});
+
 test("a paused picture survives frames arriving and a redraw: no tile goes dark", async ({ page }) => {
   await openWall(page, 15);
   await page.getByTestId("pause").click();
