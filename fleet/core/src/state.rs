@@ -536,7 +536,9 @@ impl State {
         f.n = 0;
         f.layout = LayoutGen::default();
         f.ec2_n = 0;
+        // Viewer ids restart with the process, so which were hidden means nothing now.
         f.viewers.clear();
+        f.hidden.clear();
         f.degraded.clear();
         // A race interrupted by the restart cannot finish (its slots come back at
         // generation 1), on either half.
@@ -654,5 +656,21 @@ mod tests {
         let kept: Vec<u64> = resumed.fleet.races.iter().map(|r| r.id).collect();
         assert_eq!(kept, vec![1]);
         assert!(!crate::apply::race_running(&resumed.fleet));
+    }
+
+    #[test]
+    fn a_resumed_coordinator_forgets_which_viewers_were_hidden() {
+        // Viewer ids restart at v-1 with the process, so a hidden id kept across a
+        // restart would mark a new viewer that gets the same id as inactive.
+        let mut s = State::new(Config::default(), 1000);
+        s.fleet.viewers.insert("v-1".into(), "198.51.100.1".into());
+        s.fleet.hidden.insert("v-1".into());
+        let resumed = s.resumed(Config::default(), 2000);
+        assert!(resumed.fleet.viewers.is_empty());
+        assert!(
+            resumed.fleet.hidden.is_empty(),
+            "{:?}",
+            resumed.fleet.hidden
+        );
     }
 }

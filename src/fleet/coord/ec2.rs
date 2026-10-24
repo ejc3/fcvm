@@ -68,7 +68,7 @@ pub trait Ec2Driver: Send + Sync {
     fn capacity_retry(&self) -> Duration {
         CAPACITY_RETRY
     }
-    /// Terminate every tile instance that exists, whoever launched it, and return how many
+    /// Terminate every tile instance of this fleet, whoever launched it, and return how many
     /// there were. The coordinator is the only owner of tiles and keeps no instance ids
     /// across a restart, so it runs this before its first launch and again at shutdown:
     /// an instance an earlier coordinator left running is billed and nothing manages it.
@@ -134,7 +134,25 @@ impl Ec2Driver for FakeEc2 {
 }
 
 /// The running instance of each tile, for the scene poster.
-type Running = Arc<std::sync::Mutex<HashMap<String, Launched>>>;
+/// The running instance of each tile, with the token of the tile task that put it there.
+/// A tile that leaves the assignment and rejoins gets a new task while the old one can
+/// still be waiting in `launch` or `ready`; the token keeps the old task from overwriting
+/// or removing the new one's entry.
+type Running = Arc<std::sync::Mutex<HashMap<String, (u64, Launched)>>>;
+
+/// A distinct token for every tile task.
+fn task_token() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Remove `id`'s entry if this task (`token`) put it there.
+fn remove_own(running: &Running, id: &str, token: u64) {
+    let mut r = running.lock().unwrap();
+    if r.get(id).is_some_and(|(t, _)| *t == token) {
+        r.remove(id);
+    }
+}
 
 /// Post every running tile its renderer body whenever its rectangle, the layout or the
 /// scene changes, and the grid budget after every scene and whenever it changes (retrying
@@ -159,7 +177,7 @@ async fn post_scenes(
         let now: Vec<(AssignSlot, Launched)> = {
             let r = running.lock().unwrap();
             list.into_iter()
-                .filter_map(|a| r.get(&a.id).cloned().map(|l| (a, l)))
+                .filter_map(|a| r.get(&a.id).map(|(_, l)| (a, l.clone())))
                 .collect()
         };
         if let Some(shared) = &shared {
@@ -322,6 +340,7 @@ async fn tile(
     handle: Handle,
     running: Running,
 ) {
+    let token = task_token();
     let mut current: Option<(Launched, u64)> = None;
     let mut retry = Duration::from_secs(1);
     // The generation that is waiting for capacity, and since when.
@@ -329,7 +348,7 @@ async fn tile(
     loop {
         let generation = *want.borrow_and_update();
         if current.as_ref().is_none_or(|(_, g)| *g < generation) {
-            running.lock().unwrap().remove(&id);
+            remove_own(&running, &id, token);
             let t0 = Instant::now();
             let mut timings = BTreeMap::new();
             if waiting.is_some_and(|(g, _)| g != generation) {
@@ -375,8 +394,15 @@ async fn tile(
                     .await;
                     let accepted = Instant::now();
                     let l = match driver.ready(&id, &l).await {
+                        // The tile left the assignment while its instance started (its
+                        // sender is gone), and a task for its return may already own the
+                        // entry: this instance is only terminated, below.
+                        Ok(l) if want.has_changed().is_err() => l,
                         Ok(l) => {
-                            running.lock().unwrap().insert(id.clone(), l.clone());
+                            running
+                                .lock()
+                                .unwrap()
+                                .insert(id.clone(), (token, l.clone()));
                             timings
                                 .insert("ready_ms".into(), accepted.elapsed().as_millis() as u64);
                             timings.insert("total_ms".into(), t0.elapsed().as_millis() as u64);
@@ -486,7 +512,7 @@ async fn tile(
                 // The instance went away under a running tile (a spot reclaim): report it,
                 // and launch the same generation again after the backoff.
                 let (l, generation) = current.take().expect("checked a current instance");
-                running.lock().unwrap().remove(&id);
+                remove_own(&running, &id, token);
                 let wait = retry;
                 retry = (retry * 2).min(Duration::from_secs(30));
                 report(
@@ -508,7 +534,7 @@ async fn tile(
             }
         }
     }
-    running.lock().unwrap().remove(&id);
+    remove_own(&running, &id, token);
     if let Some((l, _)) = current {
         if let Err(e) = driver.terminate(&l.instance).await {
             tracing::warn!(instance = %l.instance, error = %e, "terminate failed");

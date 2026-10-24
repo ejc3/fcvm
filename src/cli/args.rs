@@ -277,6 +277,11 @@ pub struct FleetCoordArgs {
     /// An on-demand tile launch template, tried when every region refuses spot capacity
     #[arg(long)]
     pub ec2_on_demand_template: Option<String>,
+    /// This fleet's name, tagged on its EC2 tiles at launch (`Fleet=<name>`). At start and
+    /// shutdown the coordinator terminates the tiles tagged with it, so two fleets in one
+    /// account (staging and production) need different names.
+    #[arg(long, env = "FLEET_NAME", default_value = "stage")]
+    pub fleet_name: String,
 
     /// The DNS zone tiles and slots are named in (`ec2-<n>.<zone>`, `slot-<n>.<zone>`)
     #[arg(long, default_value = "fcvm.dev")]

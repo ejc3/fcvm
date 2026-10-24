@@ -42,7 +42,7 @@ where
         .ok()
         .context("the coordinator stopped")?;
     if !accepted.await.unwrap_or(false) {
-        bail!("the coordinator refused the agent's hello (its host is already connected)");
+        bail!("the coordinator refused the agent's hello (it names another host than this connection)");
     }
     let result = loop {
         match reader.next::<AgentMsg>().await {

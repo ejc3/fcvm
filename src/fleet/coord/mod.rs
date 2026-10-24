@@ -417,15 +417,26 @@ impl Actor {
                     let _ = reply.send(false);
                     return;
                 };
-                let taken = self
-                    .agents
-                    .iter()
-                    .any(|(c, a)| *c != conn && &a.host == host);
                 let renamed = self.agents.get(&conn).is_some_and(|a| &a.host != host);
-                if taken || renamed {
-                    tracing::warn!(%host, conn, taken, renamed, "refusing an agent hello");
+                if renamed {
+                    tracing::warn!(%host, conn, "refusing a hello that renames its connection");
                     let _ = reply.send(false);
                     return;
+                }
+                // A host that dials again (`--dial` after a network drop) can find its old
+                // connection still held here: nothing is written to an agent between
+                // assignments, so a half-open one is not noticed. The new connection
+                // replaces it. The host's slots stay (no AgentGone), and the old
+                // connection's later messages and close are ignored, as its id is gone.
+                let stale: Vec<u64> = self
+                    .agents
+                    .iter()
+                    .filter(|(c, a)| **c != conn && &a.host == host)
+                    .map(|(c, _)| *c)
+                    .collect();
+                for c in stale {
+                    tracing::warn!(%host, old = c, new = conn, "a new connection replaces the host's old one");
+                    self.agents.remove(&c);
                 }
                 let host = host.clone();
                 self.agents.insert(
@@ -783,12 +794,16 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             Duration::from_secs(2),
             Duration::from_secs(20),
         ))),
-        FleetEc2::Aws => Some(Arc::new(ec2_aws::AwsEc2::new(
-            args.ec2_regions.clone(),
-            args.ec2_template.clone(),
-            args.ec2_on_demand_template.clone(),
-            args.dns_zone.clone(),
-        )?)),
+        FleetEc2::Aws => {
+            let mut d = ec2_aws::AwsEc2::new(
+                args.ec2_regions.clone(),
+                args.ec2_template.clone(),
+                args.ec2_on_demand_template.clone(),
+                args.dns_zone.clone(),
+            )?;
+            d.fleet = args.fleet_name.clone();
+            Some(Arc::new(d))
+        }
     };
     let ec2_local = args.ec2_aggregate_listen.as_ref().map(|l| {
         format!(

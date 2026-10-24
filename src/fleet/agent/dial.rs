@@ -54,6 +54,38 @@ impl Replay {
         self.keyed.insert(key, line.to_string());
     }
 
+    /// A coordinator frame: an `assign` names every slot the host still runs. A slot that
+    /// left it is torn down here, so its last report and its quarantine are no longer
+    /// true: a quarantined GPU leaves the assignment, and comes back to it only when an
+    /// operator releases it. Replaying either would undo that (a released GPU quarantined
+    /// again, a removed slot reported running).
+    fn assigned(&mut self, frame: &str) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(frame) else {
+            return;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("assign") {
+            return;
+        }
+        let ids: std::collections::BTreeSet<&str> = v["slots"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.get("id").and_then(|i| i.as_str()))
+            .collect();
+        self.keyed.retain(|key, line| {
+            if let Some(id) = key.strip_prefix("slot/") {
+                return ids.contains(id);
+            }
+            if key.starts_with("quarantine/") {
+                let slot = serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|q| q.get("slot").and_then(|s| s.as_str()).map(str::to_string));
+                return slot.is_some_and(|s| ids.contains(s.as_str()));
+            }
+            true
+        });
+    }
+
     fn lines(&self) -> Vec<String> {
         self.hello
             .iter()
@@ -145,6 +177,7 @@ pub async fn run(agent: Agent, cfg: DialCfg) -> Result<()> {
             tokio::select! {
                 m = stream.next() => match m {
                     Some(Ok(Message::Text(t))) => {
+                        replay.assigned(t.as_str());
                         let mut line = t.as_bytes().to_vec();
                         line.push(b'\n');
                         if to_agent.write_all(&line).await.is_err() {
@@ -170,5 +203,38 @@ pub async fn run(agent: Agent, cfg: DialCfg) -> Result<()> {
         if connected.elapsed() >= Duration::from_secs(60) {
             backoff = cfg.backoff_min;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Replay;
+
+    #[test]
+    fn the_replay_forgets_slots_and_quarantines_that_left_the_assignment() {
+        let mut r = Replay::default();
+        r.note(r#"{"type":"hello","host":"h","arch":"x86_64","gpus":[],"capacity":2}"#);
+        r.note(r#"{"type":"slot","id":"slot-1","phase":"running","generation":1}"#);
+        r.note(r#"{"type":"slot","id":"slot-2","phase":"failed","generation":1}"#);
+        r.note(
+            r#"{"type":"quarantine","slot":"slot-2","sbdf":"0000:19:00.0","error":"reset failed"}"#,
+        );
+        // The coordinator still lists both: everything is replayed.
+        r.assigned(r#"{"type":"assign","slots":[{"id":"slot-1"},{"id":"slot-2"}]}"#);
+        assert_eq!(r.lines().len(), 4);
+        // The quarantined GPU's slot leaves the assignment.
+        r.assigned(r#"{"type":"assign","slots":[{"id":"slot-1"}],"region":null}"#);
+        let lines = r.lines().join("\n");
+        assert!(lines.contains("slot-1"), "{lines}");
+        assert!(!lines.contains("quarantine"), "{lines}");
+        assert!(!lines.contains("\"slot-2\""), "{lines}");
+        // An operator releases it and it runs again: nothing replays the old quarantine.
+        r.assigned(r#"{"type":"assign","slots":[{"id":"slot-1"},{"id":"slot-2"}]}"#);
+        r.note(r#"{"type":"slot","id":"slot-2","phase":"running","generation":2}"#);
+        let lines = r.lines().join("\n");
+        assert!(!lines.contains("quarantine"), "{lines}");
+        // Scenes and budgets change nothing.
+        r.assigned(r#"{"type":"scene","epoch_unix_ms":1}"#);
+        assert_eq!(r.lines().len(), 3);
     }
 }

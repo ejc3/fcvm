@@ -692,17 +692,26 @@ async fn browser_intents_reach_the_agent_as_assignments() {
         }
     }
 
-    // A second connection naming the same host is refused.
-    let dup = FakeAgent::connect(&handle, "gpu-a", 1);
-    let err = tokio::time::timeout(Duration::from_secs(10), dup.conn)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(err.is_err(), "a second agent for one host must be refused");
-
-    // The agent going away takes its slots out of the tiling.
+    // A second connection naming the same host (an agent that dialed again while the old
+    // connection is still held) replaces the first: the host keeps its slots at their
+    // generations, so no VM is relaunched.
+    let mut again = FakeAgent::connect(&handle, "gpu-a", 2);
+    let slots = again.assign().await;
+    assert_eq!((slots[0].generation, slots[1].generation), (3, 2));
+    // The old connection closing afterwards takes nothing away.
     drop(agent.to_coord);
     agent.conn.await.unwrap().unwrap();
+    v.intent("l2", "light", light(6.0)).await;
+    let r = v.receipt("l2").await;
+    let s = v.at_least(r["version"].as_u64().unwrap()).await;
+    assert_eq!(
+        s["fleet"]["n"], 2,
+        "the replaced connection's close left the host"
+    );
+
+    // The agent going away takes its slots out of the tiling.
+    drop(again.to_coord);
+    again.conn.await.unwrap().unwrap();
     loop {
         let (_, s) = v.latest();
         if s["fleet"]["n"] == 0 {
@@ -1135,6 +1144,163 @@ async fn an_ec2_tile_whose_instance_is_reclaimed_is_launched_again() {
     .await
     .expect("the tile runs on a new instance after its first was reclaimed");
     assert_eq!(terminated.lock().unwrap()[0], "i-test-0");
+}
+
+/// A tile that leaves the assignment and comes back gets a new task while the old one can
+/// still be waiting for its instance to be ready. The old task must neither overwrite nor
+/// remove the new task's running instance: without that the new instance gets no scene,
+/// and the tile stays black until its next relaunch.
+struct RetiredEc2 {
+    launches: std::sync::atomic::AtomicU64,
+    // Opened to let the first instance become ready, and told when its wait began.
+    gate: Arc<tokio::sync::Notify>,
+    waiting: Arc<tokio::sync::Notify>,
+    scenes: Arc<std::sync::Mutex<Vec<(String, i64)>>>,
+    terminated: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ec2::Ec2Driver for RetiredEc2 {
+    async fn launch(&self, _tile: &str) -> Result<ec2::Launched, ec2::LaunchError> {
+        let n = self
+            .launches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ec2::Launched {
+            instance: format!("i-test-{n}"),
+            frame_url: None,
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        if l.instance == "i-test-0" {
+            self.waiting.notify_one();
+            self.gate.notified().await;
+        }
+        Ok(l.clone())
+    }
+    async fn terminate(&self, instance: &str) -> anyhow::Result<()> {
+        self.terminated.lock().unwrap().push(instance.to_string());
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _tile: &str,
+        l: &ec2::Launched,
+        body: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
+        let epoch = serde_json::to_value(body).unwrap()["epoch_unix_ms"]
+            .as_i64()
+            .unwrap_or(-1);
+        self.scenes
+            .lock()
+            .unwrap()
+            .push((l.instance.clone(), epoch));
+        Ok(())
+    }
+    async fn post_budget(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn health(&self, _tile: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("no renderer")
+    }
+}
+
+#[tokio::test]
+async fn a_retired_tile_task_leaves_its_replacement_running() {
+    let (handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let waiting = Arc::new(tokio::sync::Notify::new());
+    let scenes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let terminated = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let driver: Arc<dyn ec2::Ec2Driver> = Arc::new(RetiredEc2 {
+        launches: Default::default(),
+        gate: gate.clone(),
+        waiting: waiting.clone(),
+        scenes: scenes.clone(),
+        terminated: terminated.clone(),
+    });
+    let slot: fleet_core::protocol::AssignSlot = serde_json::from_value(json!({
+        "id": "ec2-1", "sbdf": "", "generation": 1,
+        "rect": {"x": 0.5, "y": 0.0, "w": 0.5, "h": 1.0}
+    }))
+    .unwrap();
+    let scene = |epoch: u64| {
+        Some(fleet_core::protocol::SharedScene::new(
+            &fleet_core::scene::Scene::new(epoch),
+            16.0 / 9.0,
+        ))
+    };
+    let (assign_tx, assign_rx) = tokio::sync::watch::channel(vec![slot.clone()]);
+    let (scene_tx, scene_rx) = tokio::sync::watch::channel(scene(1_000));
+    let (_budget_tx, budget_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(ec2::run(
+        driver,
+        assign_rx,
+        scene_rx,
+        budget_rx,
+        handle.clone(),
+    ));
+    // The first task waits for its instance (i-test-0); the tile leaves and comes back.
+    tokio::time::timeout(Duration::from_secs(5), waiting.notified())
+        .await
+        .expect("the first instance is waited for");
+    assign_tx.send(Vec::new()).unwrap();
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assign_tx.send(vec![slot]).unwrap();
+    let posted = |instance: &str, epoch: i64| {
+        let scenes = scenes.clone();
+        let instance = instance.to_string();
+        async move {
+            loop {
+                if scenes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(i, e)| *i == instance && *e == epoch)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), posted("i-test-1", 1_000))
+        .await
+        .expect("the returning tile's instance gets the scene");
+    // Now the first instance becomes ready, after its task was retired.
+    gate.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !terminated.lock().unwrap().contains(&"i-test-0".to_string()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the retired task terminates its instance");
+    // A new scene still reaches the running instance, and never the retired one.
+    scene_tx.send(scene(2_000)).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), posted("i-test-1", 2_000))
+        .await
+        .expect("the replacement is still the tile's running instance");
+    assert!(
+        !scenes.lock().unwrap().iter().any(|(i, _)| i == "i-test-0"),
+        "{:?}",
+        scenes.lock().unwrap()
+    );
 }
 
 /// The periodic store has queued the newest state and its write is still running when
@@ -2010,6 +2176,7 @@ async fn the_aws_tile_driver_sweeps_every_tagged_tile_instance() {
     for r in &regions {
         d.endpoints.insert(r.clone(), base.clone());
     }
+    d.fleet = "stage-test".into();
     assert_eq!(d.sweep().await.unwrap(), 2);
     let calls = api.calls.lock().unwrap();
     let describes: Vec<&Ec2Call> = calls
@@ -2021,6 +2188,9 @@ async fn the_aws_tile_driver_sweeps_every_tagged_tile_instance() {
         assert_eq!(p["Filter.1.Name"], "tag:Purpose");
         assert_eq!(p["Filter.1.Value.1"], "fcvm-fleet-tile");
         assert_eq!(p["Filter.2.Name"], "instance-state-name");
+        // Only this fleet's tiles: another coordinator's in the account are left alone.
+        assert_eq!(p["Filter.3.Name"], "tag:Fleet");
+        assert_eq!(p["Filter.3.Value.1"], "stage-test");
     }
     let terminates: Vec<&Ec2Call> = calls
         .iter()
@@ -2030,6 +2200,72 @@ async fn the_aws_tile_driver_sweeps_every_tagged_tile_instance() {
     assert_eq!(terminates[0].0, "us-east-1");
     assert_eq!(terminates[0].1["InstanceId.1"], "i-swept-1");
     assert_eq!(terminates[0].1["InstanceId.2"], "i-swept-2");
+}
+
+/// The renderer answers `/health` with 200 while CUDA starts and after it fails, so a tile
+/// is ready only when the body says `ready`, and a body with an `error` fails the launch
+/// (the tile is then terminated and launched again) instead of being accepted.
+#[tokio::test]
+async fn the_aws_tile_driver_waits_for_a_ready_renderer_and_refuses_a_failed_one() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    use fcvm::fleet::coord::ec2_aws::AwsEc2;
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    // Serves `bodies` in turn, the last one from then on; counts the requests.
+    async fn renderer(bodies: Vec<Value>) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n2 = n.clone();
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(move || {
+                let n2 = n2.clone();
+                let bodies = bodies.clone();
+                async move {
+                    let i = n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(bodies[i.min(bodies.len() - 1)].clone())
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (port, n)
+    }
+    let base = fake_ec2_api(FakeEc2Api::default()).await;
+    let driver = |port: u16| {
+        let mut d = AwsEc2::new(
+            vec!["us-east-1".to_string()],
+            "fcvm-fleet-tile-x86_64".into(),
+            None,
+            "fcvm.example".into(),
+        )
+        .unwrap();
+        d.endpoints.insert("us-east-1".into(), base.clone());
+        d.health_scheme = "http".into();
+        d.health_port = port;
+        d.poll = Duration::from_millis(20);
+        d.ready_timeout = Duration::from_secs(5);
+        d
+    };
+    let launched = ec2::Launched {
+        instance: "us-east-1/i-0123456789abcdef0".into(),
+        frame_url: None,
+        ipv6: None,
+        ipv4: None,
+    };
+    let (port, n) = renderer(vec![json!({"ready": false}), json!({"ready": true})]).await;
+    driver(port).ready("ec2-1", &launched).await.unwrap();
+    assert_eq!(
+        n.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a renderer that is not ready yet is asked again"
+    );
+    let (port, _) = renderer(vec![json!({"ready": false, "error": "CUDA init failed"})]).await;
+    let e = driver(port)
+        .ready("ec2-1", &launched)
+        .await
+        .expect_err("a failed renderer is not a ready tile");
+    assert!(format!("{e:#}").contains("CUDA init failed"), "{e:#}");
 }
 
 /// The AWS tile driver: a spot launch from the template, tagged, in the first region with
@@ -2056,7 +2292,7 @@ async fn the_aws_tile_driver_launches_waits_and_terminates() {
                     h2.lock()
                         .unwrap()
                         .push(headers["host"].to_str().unwrap().to_string());
-                    "ok"
+                    axum::Json(json!({"ready": true}))
                 }
             }),
         )
@@ -2114,6 +2350,8 @@ async fn the_aws_tile_driver_launches_waits_and_terminates() {
         assert_eq!(p["TagSpecification.1.Tag.1.Key"], "Purpose");
         assert_eq!(p["TagSpecification.1.Tag.1.Value"], "fcvm-fleet-tile");
         assert_eq!(p["TagSpecification.1.Tag.2.Value"], "ec2-1");
+        assert_eq!(p["TagSpecification.1.Tag.3.Key"], "Fleet");
+        assert_eq!(p["TagSpecification.1.Tag.3.Value"], "stage");
     }
     let up = d.ready("ec2-1", &l).await.unwrap();
     assert_eq!(up.ipv4.as_deref(), Some("127.0.0.1"));

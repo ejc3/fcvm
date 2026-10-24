@@ -412,7 +412,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--scale-group <region>:<group name>]... [--awake-capacity 1] [--idle-scale-down 600]
                  [--state-bucket <bucket> [--state-key state.json] [--state-region <region>]]
                  [--ec2 aws --ec2-tiles 8 --ec2-regions <r1,r2,...> [--ec2-template fcvm-fleet-tile-x86_64]
-                  [--ec2-on-demand-template <name>]] [--dns-zone fcvm.dev]
+                  [--ec2-on-demand-template <name>] [--fleet-name stage]] [--dns-zone fcvm.dev]
                  [--dns-token-secret <secret> [--dns-zone-id <id>]] [--tls-secret <secret>] [--secrets-region <region>]
 ```
 
@@ -422,19 +422,23 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   is no state; a refused read (403, which S3 also answers for a missing object to a caller
   without `s3:ListBucket`) stops the coordinator rather than start it empty.
 - `--ec2 aws` runs `--ec2-tiles` EC2 tiles, whatever the fcvm side has. Each is one
-  instance from the tile launch template (one-time spot), tagged `Purpose=fcvm-fleet-tile`
-  and `FleetTile=<tile>` at launch, in the first of `--ec2-regions` (`FLEET_REGIONS`) with
+  instance from the tile launch template (one-time spot), tagged `Purpose=fcvm-fleet-tile`,
+  `FleetTile=<tile>` and `Fleet=<--fleet-name>` (`FLEET_NAME`, default `stage`) at launch,
+  in the first of `--ec2-regions` (`FLEET_REGIONS`) with
   capacity; when every region refuses for capacity it tries `--ec2-on-demand-template`,
   and without one the tile waits for capacity (recorded on its own) and asks again every
   10 s. A tile is ready once its instance runs and its renderer answers
-  `https://ec2-<n>.<zone>/health` (the name resolved to the instance); it is terminated by
+  `https://ec2-<n>.<zone>/health` (the name resolved to the instance) with `ready` true; a
+  reply carrying `error` fails the launch like no answer at all. It is terminated by
   id. A relaunch launches the replacement first and terminates the old instance once the
   new launch is accepted. A tile whose instance never serves `/health` has that instance
   terminated and is launched again after a backoff (1 s doubling to 30 s), and so does a
   running tile whose instance is found shutting down, stopped or terminated (a spot
   reclaim; checked every 15 s). The coordinator
   keeps no instance ids across a restart, so before its first launch, and again when it
-  stops, it terminates every instance tagged `Purpose=fcvm-fleet-tile` in `--ec2-regions`.
+  stops, it terminates every instance tagged `Purpose=fcvm-fleet-tile` and
+  `Fleet=<--fleet-name>` in `--ec2-regions`; another fleet's tiles in the same account (a
+  different `--fleet-name`) are left alone.
 - `--dns-token-secret` writes the slots' names in `--dns-zone` with the zone's Cloudflare
   token: for every fcvm slot and EC2 tile that reported a public address,
   `slot-<n>.<zone>` / `ec2-<n>.<zone>` AAAA (unproxied, TTL 60) and `slot-<n>-v4.<zone>` /
@@ -522,9 +526,10 @@ modification time of `--store-ready-file`, which the host's boot writes once the
 mounted. `gpus` are the NVIDIA display functions bound to `vfio-pci`, in address
 order; `capacity` is how many VMs the host runs at once (default: one per GPU). The
 coordinator makes one slot per GPU and ignores a repeated address. The first hello binds the
-connection to `host`; a hello naming a host another live connection holds is refused (the
-coordinator closes the new connection), and a later hello on the same connection must name
-the same host.
+connection to `host`, and a later hello on the same connection must name the same host. A
+hello naming a host another connection holds replaces that connection: a dialing agent that
+lost its network reconnects while the coordinator may still hold the old, half-open one. The
+host's slots stay, and the old connection's later messages are ignored.
 
 ```json
 {"type": "slot", "id": "slot-3", "phase": "running", "generation": 4, "vm": "fleet-slot-3",
@@ -547,15 +552,15 @@ reports `standby` once its GPU is free (and scrubbed, with `--scrub`) and no VM 
 |-----|------|----|
 | `teardown_ms` | the agent starts stopping the old VM | its fcvm process has exited and the GPU is free |
 | `restore_ms` | the agent starts fcvm | fcvm prints its `restored` record |
-| `ack_ms` | fcvm's own restore clock (the record's `ack_ms`): restore call to the guest's ACK |
-| `gpu_ms` | the guest's GPU attach (the record's `guest_phases.gpu_ms`) |
+| `ack_ms` | fcvm's restore call (fcvm's own clock, the record's `ack_ms`) | the guest's ACK |
+| `gpu_ms` | the guest starts its GPU attach (the record's `guest_phases.gpu_ms`) | the attach is done |
 | `container_ms` | the `restored` record | the renderer's `GET /health` first answers |
 | `first_frame_ms` | `/health` first answers (the scene is posted then) | `/health` reports a frame drawn after the scene was posted: `ready` is not false and `frame` is above its value in the reply read just before the post (for a renderer without `frame`, a numeric `t`) |
 | `renderer_gpu_ready_ms` | the renderer process starts | CUDA is ready (`/health` `startup_ms.gpu_ready`) |
 | `renderer_first_frame_ms` | the renderer process starts | its first frame is drawn (`startup_ms.first_frame_drawn`) |
+| `total_ms` | the agent starts the relaunch | the first frame |
 
 A `/health` reply carrying `error` (the renderer failed) fails the relaunch at once.
-| `total_ms` | the agent starts the relaunch | the first frame |
 
 ```json
 {"type": "health", "id": "slot-3", "fps": 29.8, "gpu": { ... }, "budget_fit": 1210000, "t": 861.9, "render_ms_max": 14.2}

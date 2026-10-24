@@ -30,6 +30,9 @@ pub struct AwsEc2 {
     pub health_port: u16,
     pub ready_timeout: Duration,
     pub poll: Duration,
+    /// This fleet's name, tagged on every tile at launch (`Fleet=<name>`): the sweep
+    /// terminates only this fleet's tiles, not another coordinator's in the same account.
+    pub fleet: String,
     chain: CredentialChain,
     http: reqwest::Client,
 }
@@ -90,6 +93,7 @@ impl AwsEc2 {
             health_port: 443,
             ready_timeout: Duration::from_secs(600),
             poll: Duration::from_secs(3),
+            fleet: "stage".into(),
             chain: CredentialChain::new()?,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
@@ -160,6 +164,8 @@ impl AwsEc2 {
                     ("TagSpecification.1.Tag.1.Value", "fcvm-fleet-tile".into()),
                     ("TagSpecification.1.Tag.2.Key", "FleetTile".into()),
                     ("TagSpecification.1.Tag.2.Value", tile.into()),
+                    ("TagSpecification.1.Tag.3.Key", "Fleet".into()),
+                    ("TagSpecification.1.Tag.3.Value", self.fleet.clone()),
                 ],
             )
             .await?;
@@ -264,9 +270,19 @@ impl Ec2Driver for AwsEc2 {
                         "{}://{name}:{}/health",
                         self.health_scheme, self.health_port
                     );
+                    // The renderer answers /health with 200 while CUDA starts and after it
+                    // has failed: ready means `ready` is true, and an `error` is a renderer
+                    // that will not render, so the launch fails and the tile is retried.
                     if let Ok(r) = client.get(&url).send().await {
                         if r.status().is_success() {
-                            return Ok(up);
+                            if let Ok(h) = r.json::<serde_json::Value>().await {
+                                if let Some(e) = h.get("error").filter(|e| !e.is_null()) {
+                                    bail!("{id}'s renderer failed: {e}");
+                                }
+                                if h["ready"] == serde_json::Value::Bool(true) {
+                                    return Ok(up);
+                                }
+                            }
                         }
                     }
                 }
@@ -332,8 +348,8 @@ impl Ec2Driver for AwsEc2 {
         ))
     }
 
-    /// Every instance tagged `Purpose=fcvm-fleet-tile` that is not terminated or shutting
-    /// down, in every fleet region, terminated by id.
+    /// Every instance of this fleet (tagged `Purpose=fcvm-fleet-tile` and `Fleet=<name>`)
+    /// that is not terminated or shutting down, in every fleet region, terminated by id.
     async fn sweep(&self) -> Result<usize> {
         let mut total = 0;
         for region in &self.regions {
@@ -349,6 +365,8 @@ impl Ec2Driver for AwsEc2 {
                     ("Filter.2.Value.2", "running".into()),
                     ("Filter.2.Value.3", "stopping".into()),
                     ("Filter.2.Value.4", "stopped".into()),
+                    ("Filter.3.Name", "tag:Fleet".into()),
+                    ("Filter.3.Value.1", self.fleet.clone()),
                 ];
                 if let Some(t) = &next {
                     params.push(("NextToken", t.clone()));
