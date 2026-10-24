@@ -348,15 +348,20 @@ impl Actor {
                     return;
                 }
                 let d = &f.director;
+                // Only aggregators with a region: one without (a host whose GPUs are all
+                // on standby, the EC2 side with no tile) never sends a frame, and the
+                // capture waits for every source.
                 let mut sources: Vec<String> = f
                     .hosts
                     .values()
+                    .filter(|h| h.region.is_some())
                     .filter_map(|h| h.aggregate_url.clone())
                     .collect();
                 if let Some(u) = self
                     .ec2_aggregate_local
                     .clone()
                     .or_else(|| self.state.config.ec2_aggregate_url.clone())
+                    .filter(|_| f.layout.ec2.is_some())
                 {
                     sources.push(u);
                 }

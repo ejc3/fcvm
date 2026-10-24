@@ -538,9 +538,10 @@ impl State {
         f.ec2_n = 0;
         f.viewers.clear();
         f.degraded.clear();
-        // A race interrupted by the restart cannot finish.
-        f.races
-            .retain(|r| r.fcvm.done_at.is_some() || r.fcvm.tiles.is_empty());
+        // A race interrupted by the restart cannot finish (its slots come back at
+        // generation 1), on either half.
+        let finished = |h: &HalfRace| h.done_at.is_some() || h.tiles.is_empty();
+        f.races.retain(|r| finished(&r.fcvm) && finished(&r.ec2));
         f.next_race_at = config.race_interval_secs.map(|s| now_ms + s * 1000);
         self.config = config;
         self.version += 1;
@@ -617,5 +618,41 @@ mod tests {
             );
         }
         assert_eq!(layout_from_frame(10.0), 345);
+    }
+
+    /// A race the restart interrupted cannot finish (its slots come back at generation 1),
+    /// so it is dropped whichever half was unfinished; a finished race is kept.
+    #[test]
+    fn a_resumed_coordinator_drops_a_race_with_either_half_unfinished() {
+        let tile = |tile: &str| RaceTile {
+            tile: tile.into(),
+            generation: 2,
+            first_frame_at: None,
+            phases: BTreeMap::new(),
+            capacity_wait_ms: 0,
+            waiting_since: None,
+        };
+        let half = |slot: &str, done: Option<u64>| HalfRace {
+            tiles: BTreeMap::from([(slot.to_string(), tile(slot))]),
+            done_at: done,
+            ..Default::default()
+        };
+        let race = |id, fcvm, ec2| Race {
+            id,
+            started_at: 100,
+            by: "schedule".into(),
+            fcvm,
+            ec2,
+        };
+        let mut s = State::new(Config::default(), 1000);
+        s.fleet.races.extend([
+            race(1, half("slot-1", Some(200)), half("ec2-1", Some(300))),
+            race(2, half("slot-1", Some(200)), half("ec2-1", None)),
+            race(3, half("slot-1", None), half("ec2-1", Some(300))),
+        ]);
+        let resumed = s.resumed(Config::default(), 2000);
+        let kept: Vec<u64> = resumed.fleet.races.iter().map(|r| r.id).collect();
+        assert_eq!(kept, vec![1]);
+        assert!(!crate::apply::race_running(&resumed.fleet));
     }
 }

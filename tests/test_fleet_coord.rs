@@ -864,10 +864,19 @@ async fn the_poster_is_the_whole_image_at_a_hold() {
     let blue = [32, 240, 118];
     let host_agg = fake_aggregate(epoch, 0, red).await;
     let ec2_agg = fake_aggregate(epoch, 4, blue).await;
+    // One EC2 tile, so the EC2 side has its half of the image and its aggregator a region.
+    let config = Config {
+        ec2_max: 1,
+        ..Config::default()
+    };
+    let ec2: Arc<dyn ec2::Ec2Driver> = Arc::new(ec2::FakeEc2::new(
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+    ));
     let (handle, _actor) = start(
-        State::new(Config::default(), epoch),
+        State::new(config, epoch),
         None,
-        None,
+        Some(ec2),
         Some(ec2_agg),
         None,
         None,
@@ -1031,6 +1040,101 @@ async fn shutdown_writes_the_last_state_to_the_state_file() {
         .await
         .unwrap()
         .unwrap();
+}
+
+/// A tile's instance that goes away after it was ready (a spot reclaim) is reported
+/// failed and launched again; without that the tile stays "running" on a dead instance
+/// until someone relaunches it.
+struct ReclaimedEc2 {
+    launches: std::sync::atomic::AtomicU64,
+    terminated: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ec2::Ec2Driver for ReclaimedEc2 {
+    async fn launch(&self, _tile: &str) -> Result<ec2::Launched, ec2::LaunchError> {
+        let n = self
+            .launches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ec2::Launched {
+            instance: format!("i-test-{n}"),
+            frame_url: None,
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        Ok(l.clone())
+    }
+    async fn terminate(&self, instance: &str) -> anyhow::Result<()> {
+        self.terminated.lock().unwrap().push(instance.to_string());
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_budget(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn health(&self, _tile: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("no renderer")
+    }
+    async fn alive(&self, l: &ec2::Launched) -> anyhow::Result<bool> {
+        // The first instance is reclaimed once it has run.
+        Ok(l.instance != "i-test-0")
+    }
+    fn liveness_every(&self) -> Duration {
+        Duration::from_millis(100)
+    }
+}
+
+#[tokio::test]
+async fn an_ec2_tile_whose_instance_is_reclaimed_is_launched_again() {
+    let config = Config {
+        ec2_max: 1,
+        max_tiles: 1,
+        ..Config::default()
+    };
+    let terminated = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let driver: Arc<dyn ec2::Ec2Driver> = Arc::new(ReclaimedEc2 {
+        launches: Default::default(),
+        terminated: terminated.clone(),
+    });
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        Some(driver),
+        None,
+        None,
+        None,
+    );
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 1);
+    agent.assign().await;
+    agent.report("slot-1", "running", 1);
+    let mut snaps = handle.snapshot.clone();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let v: Value = serde_json::from_str(&snaps.borrow_and_update().text).unwrap();
+            let t = &v["state"]["tiles"][1];
+            if t["phase"] == "running" && t["vm"] == "i-test-1" {
+                return;
+            }
+            snaps.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the tile runs on a new instance after its first was reclaimed");
+    assert_eq!(terminated.lock().unwrap()[0], "i-test-0");
 }
 
 /// The periodic store has queued the newest state and its write is still running when
@@ -1540,6 +1644,78 @@ async fn no_poster_is_planned_while_tiles_start_or_race() {
     }
 }
 
+/// A poster capture waits for a frame from every source, so an aggregator with no region
+/// (a host whose GPUs are all on standby, or the EC2 side with no tile) must not be one:
+/// it never streams, and the whole capture would be discarded.
+#[tokio::test]
+async fn a_poster_plan_names_only_placed_aggregators() {
+    let config = Config {
+        max_tiles: 1,
+        ..Config::default()
+    };
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        None,
+        Some("ws://127.0.0.1:9/frames".into()),
+        None,
+        None,
+    );
+    let mut a = FakeAgent::connect(&handle, "gpu-a", 1);
+    let slots = a.assign().await;
+    assert!(slots[0].rect.is_some());
+    a.report("slot-1", "running", 1);
+    a.to_coord
+        .send(AgentMsg::Aggregate {
+            frame_url: "ws://gpu-a.example:20200/frames".into(),
+        })
+        .unwrap();
+    // gpu-b's only GPU is on standby: max_tiles is taken by gpu-a.
+    let b = FakeAgent::connect(&handle, "gpu-b", 1);
+    b.to_coord
+        .send(AgentMsg::Aggregate {
+            frame_url: "ws://gpu-b.example:20200/frames".into(),
+        })
+        .unwrap();
+    // A scrub after it on the same connection shows when gpu-b's aggregate is applied.
+    b.to_coord
+        .send(AgentMsg::Scrub {
+            slot: "slot-2".into(),
+            sbdf: "0000:01:00.0".into(),
+            ok: true,
+            error: None,
+        })
+        .unwrap();
+    let mut snaps = handle.snapshot.clone();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let v: Value = serde_json::from_str(&snaps.borrow_and_update().text).unwrap();
+            if v["state"]["counters"]["scrubs"] == 1 {
+                return;
+            }
+            snaps.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("gpu-b's messages applied");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let plan = loop {
+        if let Some(p) = handle
+            .poster_plan()
+            .await
+            .filter(|p| p.sources.iter().any(|u| u.contains("gpu-a")))
+        {
+            break p;
+        }
+        assert!(std::time::Instant::now() < deadline, "no plan");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        plan.sources,
+        vec!["ws://gpu-a.example:20200/frames".to_string()]
+    );
+}
+
 /// An agent that dials in over `/agent` speaks the same messages, one per text frame: its
 /// hello brings the scene and the assignment, and closing the socket takes the host out.
 #[tokio::test]
@@ -1699,6 +1875,8 @@ struct FakeEc2Api {
     spot_capacity: Vec<String>,
     /// Per region, the instances a tag-filtered DescribeInstances finds.
     tagged: BTreeMap<String, Vec<String>>,
+    /// Instances DescribeInstances reports terminated.
+    gone: Vec<String>,
     calls: Arc<std::sync::Mutex<Vec<Ec2Call>>>,
 }
 
@@ -1759,6 +1937,7 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
                             .collect();
                         (StatusCode::OK, format!("<DescribeInstancesResponse><reservationSet>{items}</reservationSet></DescribeInstancesResponse>"))
                     }
+                    "DescribeInstances" if api.gone.contains(&params["InstanceId.1"]) => (StatusCode::OK, format!("<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>{}</instanceId><instanceState><code>48</code><name>terminated</name></instanceState></item></instancesSet></item></reservationSet></DescribeInstancesResponse>", params["InstanceId.1"])),
                     "DescribeInstances" => (StatusCode::OK, "<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>i-0123456789abcdef0</instanceId><instanceState><code>16</code><name>running</name></instanceState><ipAddress>127.0.0.1</ipAddress><ipv6Address>2001:db8::5</ipv6Address></item></instancesSet></item></reservationSet></DescribeInstancesResponse>".into()),
                     "TerminateInstances" => (StatusCode::OK, "<TerminateInstancesResponse/>".into()),
                     _ => error("InvalidAction"),
@@ -1770,6 +1949,37 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
     let base = format!("http://{}", l.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
     base
+}
+
+/// `alive` reads the instance's state: a running tile is alive, a terminated one (a spot
+/// reclaim) is not.
+#[tokio::test]
+async fn the_aws_tile_driver_sees_a_reclaimed_instance() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    use fcvm::fleet::coord::ec2_aws::AwsEc2;
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let api = FakeEc2Api {
+        gone: vec!["i-0bbbbbbbbbbbbbbb1".to_string()],
+        ..Default::default()
+    };
+    let base = fake_ec2_api(api.clone()).await;
+    let mut d = AwsEc2::new(
+        vec!["us-east-1".to_string()],
+        "fcvm-fleet-tile-x86_64".into(),
+        None,
+        "fcvm.example".into(),
+    )
+    .unwrap();
+    d.endpoints.insert("us-east-1".into(), base);
+    let launched = |id: &str| ec2::Launched {
+        instance: format!("us-east-1/{id}"),
+        frame_url: None,
+        ipv6: None,
+        ipv4: None,
+    };
+    assert!(d.alive(&launched("i-0123456789abcdef0")).await.unwrap());
+    assert!(!d.alive(&launched("i-0bbbbbbbbbbbbbbb1")).await.unwrap());
 }
 
 /// A restarted coordinator does not know the tile instances an earlier one launched:

@@ -26,6 +26,9 @@ use tokio::sync::watch;
 /// How long a tile waits before asking EC2 again after a capacity refusal.
 const CAPACITY_RETRY: Duration = Duration::from_secs(10);
 
+/// How often a running tile's instance is checked.
+const LIVENESS_EVERY: Duration = Duration::from_secs(15);
+
 /// How long the EC2 side waits before trying a failed sweep again.
 const SWEEP_RETRY: Duration = Duration::from_secs(10);
 
@@ -71,6 +74,15 @@ pub trait Ec2Driver: Send + Sync {
     /// an instance an earlier coordinator left running is billed and nothing manages it.
     async fn sweep(&self) -> Result<usize> {
         Ok(0)
+    }
+    /// Whether the instance still exists (not shutting down, terminated, stopping or
+    /// stopped). A running tile is checked every [`Ec2Driver::liveness_every`]; one that is
+    /// gone (a spot reclaim) is launched again. An error is taken as unknown.
+    async fn alive(&self, _launched: &Launched) -> Result<bool> {
+        Ok(true)
+    }
+    fn liveness_every(&self) -> Duration {
+        LIVENESS_EVERY
     }
 }
 
@@ -448,8 +460,52 @@ async fn tile(
                 }
             }
         }
-        if want.changed().await.is_err() {
-            break;
+        let gone = loop {
+            let check = tokio::time::sleep(driver.liveness_every());
+            tokio::select! {
+                r = want.changed() => {
+                    if r.is_err() {
+                        break None;
+                    }
+                    break Some(false);
+                }
+                _ = check => {
+                    let Some((l, _)) = &current else { continue };
+                    match driver.alive(l).await {
+                        Ok(false) => break Some(true),
+                        Ok(true) => {}
+                        Err(e) => tracing::debug!(tile = %id, error = %format!("{e:#}"), "tile liveness unknown"),
+                    }
+                }
+            }
+        };
+        match gone {
+            None => break,
+            Some(false) => {}
+            Some(true) => {
+                // The instance went away under a running tile (a spot reclaim): report it,
+                // and launch the same generation again after the backoff.
+                let (l, generation) = current.take().expect("checked a current instance");
+                running.lock().unwrap().remove(&id);
+                let wait = retry;
+                retry = (retry * 2).min(Duration::from_secs(30));
+                report(
+                    &handle,
+                    &id,
+                    "failed",
+                    generation,
+                    Some(&l),
+                    &BTreeMap::new(),
+                    Some((format!("instance {} is gone", l.instance), Some(wait))),
+                )
+                .await;
+                if let Err(e) = driver.terminate(&l.instance).await {
+                    tracing::warn!(instance = %l.instance, error = %e, "terminate failed");
+                }
+                if wait_or_removed(&mut want, wait).await {
+                    break;
+                }
+            }
         }
     }
     running.lock().unwrap().remove(&id);

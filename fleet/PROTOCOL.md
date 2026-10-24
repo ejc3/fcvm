@@ -430,7 +430,9 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   `https://ec2-<n>.<zone>/health` (the name resolved to the instance); it is terminated by
   id. A relaunch launches the replacement first and terminates the old instance once the
   new launch is accepted. A tile whose instance never serves `/health` has that instance
-  terminated and is launched again after a backoff (1 s doubling to 30 s). The coordinator
+  terminated and is launched again after a backoff (1 s doubling to 30 s), and so does a
+  running tile whose instance is found shutting down, stopped or terminated (a spot
+  reclaim; checked every 15 s). The coordinator
   keeps no instance ids across a restart, so before its first launch, and again when it
   stops, it terminates every instance tagged `Purpose=fcvm-fleet-tile` in `--ec2-regions`.
 - `--dns-token-secret` writes the slots' names in `--dns-zone` with the zone's Cloudflare

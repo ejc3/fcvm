@@ -307,6 +307,31 @@ impl Ec2Driver for AwsEc2 {
         Ok(r.json().await?)
     }
 
+    async fn alive(&self, launched: &Launched) -> Result<bool> {
+        let (region, id) = split(&launched.instance)?;
+        let xml = match self
+            .call(
+                region,
+                &[
+                    ("Action", "DescribeInstances".into()),
+                    ("InstanceId.1", id.into()),
+                ],
+            )
+            .await
+        {
+            Ok(x) => x,
+            Err(CallError::Capacity(e)) => bail!("{e}"),
+            Err(CallError::Other(e)) => return Err(e),
+        };
+        let state = xml_tag(&xml, "instanceState")
+            .and_then(|s| xml_tag(&s, "name"))
+            .context("DescribeInstances named no state")?;
+        Ok(!matches!(
+            state.as_str(),
+            "shutting-down" | "terminated" | "stopping" | "stopped"
+        ))
+    }
+
     /// Every instance tagged `Purpose=fcvm-fleet-tile` that is not terminated or shutting
     /// down, in every fleet region, terminated by id.
     async fn sweep(&self) -> Result<usize> {
