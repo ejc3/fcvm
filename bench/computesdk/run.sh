@@ -17,9 +17,11 @@
 #                        (default /mnt/fcvm-btrfs/computesdk-bench)
 #   OUT=<dir>            where results go (default $WORK/results/<UTC time>)
 #
-# Each sandbox restores the pre-start snapshot of its image. Before the first run one sandbox
-# is created and destroyed, untimed, which creates that snapshot. The published runs measure
-# providers whose images or templates already exist, so a run here starts from the same place.
+# fcvm serve passes --startup-snapshot, so each sandbox restores its image's startup snapshot,
+# with the container already running. Before the first run one sandbox is created and
+# destroyed, untimed, which creates the pre-start and startup snapshots. The published runs
+# measure providers whose images or templates already exist, so a run here starts from the
+# same place.
 set -euo pipefail
 
 HARNESS_REPO=https://github.com/computesdk/benchmarks.git

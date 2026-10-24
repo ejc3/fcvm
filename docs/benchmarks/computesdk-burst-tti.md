@@ -42,13 +42,16 @@ here. The benchmark has no GPU variant.
    the published providers use. The task, the schedule, the timer and the statistics are the
    harness's, unchanged.
 2. Starts `fcvm serve` on the same host. Each sandbox is an `fcvm podman run` of
-   `node:22-slim` with 2 vCPUs, 2048 MiB and rootless networking, which restores the image's
-   pre-start snapshot (memory from the snapshot file, disk as a btrfs snapshot). A create
+   `node:22-slim` with 2 vCPUs, 2048 MiB and rootless networking, which restores a snapshot
+   of the image (memory from the snapshot file, disk as a btrfs snapshot). Serve now passes
+   `--startup-snapshot`, so that is the startup snapshot, with the container already running;
+   the results before "With the startup snapshot taken at the container's start" were
+   measured before that change and restored the pre-start snapshot. A create
    (`POST /v1/sandboxes`) returns once fcvm's health monitor reports the container running.
    `runCommand` (`POST /s/{id}/run/command`) runs `sh -c 'node -v'` in the container over
    vsock.
-3. Creates and destroys one sandbox, untimed. That creates the pre-start snapshot, as a
-   provider's template exists before its published runs.
+3. Creates and destroys one sandbox, untimed. That creates the snapshot the timed creates
+   restore, as a provider's template exists before its published runs.
 4. Runs `bench run benchmarks/sandbox/tti.bench.ts --provider fcvm --iterations N --concurrency C --no-ingest`
    once per burst.
 
