@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline checks for publishing and the live IPv4/name-regression probe."""
 import importlib.util
+import fnmatch
 import os
 import socket
 import unittest
@@ -87,6 +88,15 @@ class PublishTests(unittest.TestCase):
         with patch.dict(os.environ, env), patch.object(publish, "command") as command:
             with self.assertRaises(ValueError): publish.main()
             command.assert_not_called()
+
+
+class WorkflowTests(unittest.TestCase):
+    def test_changes_to_the_actual_cli_files_trigger_a_release(self):
+        workflow = (HERE.parent.parent / ".github/workflows/fleet-coordinator-deploy.yml").read_text()
+        import re
+        patterns = re.findall(r"^      - '([^']+)'", workflow, re.M)
+        for path in ("src/cli/mod.rs", "src/cli/args.rs"):
+            self.assertTrue(any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns), path)
 
 
 if __name__ == "__main__":

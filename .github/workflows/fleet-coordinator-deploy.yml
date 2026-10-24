@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths:
       - 'src/fleet/**'
-      - 'src/cli.rs'
+      - 'src/cli/**'
       - 'fleet/core/**'
       - 'fleet/coord/**'
       - 'Cargo.toml'
