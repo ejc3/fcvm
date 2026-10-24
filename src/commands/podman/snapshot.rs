@@ -354,10 +354,12 @@ pub async fn create_snapshot_interruptible(
             if cancel.is_cancelled() {
                 // Snapshot succeeded but we're shutting down
                 SnapshotOutcome::Interrupted
-            } else if matches!(install, SnapshotInstall::BalloonTargetChanged { .. }) {
-                SnapshotOutcome::NotTaken
             } else {
-                SnapshotOutcome::Created
+                match install {
+                    SnapshotInstall::Created => SnapshotOutcome::Created,
+                    SnapshotInstall::Existing => SnapshotOutcome::Existing,
+                    SnapshotInstall::BalloonTargetChanged { .. } => SnapshotOutcome::NotTaken,
+                }
             }
         }
         Err(e) => {

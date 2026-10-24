@@ -3631,6 +3631,16 @@ async fn cmd_snapshot_run_inner(
                                             container_exit_code = None;
                                             break;
                                         }
+                                        SnapshotOutcome::Existing => {
+                                            // Another process's snapshot holds another guest's
+                                            // memory. The clone keeps the snapshot it was
+                                            // restored from as its diff parent (#1231).
+                                            info!(
+                                                snapshot_key = %startup_key,
+                                                "Startup snapshot installed by another process; \
+                                                 not recorded as this VM's diff parent"
+                                            );
+                                        }
                                         SnapshotOutcome::Created => {
                                             info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
                                             vm_state.config.snapshot_name = Some(startup_key.clone());
