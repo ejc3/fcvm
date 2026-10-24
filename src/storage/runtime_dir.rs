@@ -136,6 +136,9 @@ async fn lock(file: &std::fs::File, dir: &Path, exclusive: bool) -> Result<()> {
         match result {
             Ok(()) => return Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if next_log == Duration::ZERO {
+                    failpoint::note("lock.wait", dir.display());
+                }
                 let waited = started.elapsed();
                 if waited >= next_log {
                     if exclusive {

@@ -2193,6 +2193,32 @@ async fn test_lifecycle_interleave_resumed_source_survives_late_ack() -> Result<
 }
 
 // ---------------------------------------------------------------------------
+// Race gym cases (docs/race-gym.md): each replays a recorded schedule of concurrent
+// actors and fails while the race it caught exists. `make race-gym-cases` runs them.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "race-gym")]
+#[path = "race_gym/mod.rs"]
+mod race_gym;
+
+/// Race gym replay `cold_run_restore_after_source_teardown` (cold-run, pair schedule 348:
+/// actor 0 held at `teardown.pre_remove_data_dir#1`, actor 1 at `restore.pre_load#1`, actor 0
+/// released first). On main, actor 0 removes the source VM's directory, which detaches the
+/// bind that actor 1's VMM reads its disks through, and actor 1's LoadSnapshot fails with
+/// `rootfs.raw` missing (replayed 10 of 10). The file is the schedule re-recorded with #1188,
+/// where actor 0's removal waits for actor 1's load: on main that step diverges and the case
+/// fails; with the fix it passes. Pinned to the outcome oracle; the source directory the
+/// restore leaves behind is #1181.
+#[cfg(feature = "race-gym")]
+#[tokio::test]
+async fn test_lifecycle_interleave_gym_cold_run_restore_after_source_teardown() -> Result<()> {
+    race_gym::replay_case(include_str!(
+        "race_gym/cases/cold_run_restore_after_source_teardown.json"
+    ))
+    .await
+}
+
+// ---------------------------------------------------------------------------
 // CASE: source_teardown_waits_for_clone_disk_open
 // ---------------------------------------------------------------------------
 

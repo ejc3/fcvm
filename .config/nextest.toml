@@ -101,6 +101,14 @@ max-threads = "num-cpus"
 # stress_100 variant, each burning 100-150s before a clean retry). Give the
 # bench the entire runner: ~160s of exclusivity is cheaper in wall time than
 # the try-1 burns plus retries it causes.
+# Race gym (make race-gym, tests/test_race_gym.rs, docs/race-gym.md): one test runs every
+# schedule of a phase, each a set of real VM launches; the replays it emits as cases run the
+# same way. A retry would rerun a different schedule set and hide the failing one, so none.
+[[profile.default.overrides]]
+filter = "package(fcvm) & (binary(test_race_gym) | test(/lifecycle_interleave_gym_/))"
+slow-timeout = { period = "14400s", terminate-after = 1 }
+retries = 0
+
 # Seeded lifecycle chaos fuzz (make fuzz, tests/test_fuzz_chaos.rs): ONE test
 # loops over every requested seed, each booting a VM and running a full op
 # schedule (~2-4 min/seed). The weekly CI run uses 20 seeds x 25 ops, so the

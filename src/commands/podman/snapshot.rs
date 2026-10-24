@@ -190,6 +190,7 @@ pub async fn create_podman_snapshot(
             expected_parent_dir.as_deref(),
         )
         .await?;
+        failpoint::hit_async("snapshot.create.locked").await;
 
         // Another VM process may have finished this content-addressed snapshot while we
         // waited for its generation lock.

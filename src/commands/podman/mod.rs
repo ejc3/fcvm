@@ -1042,9 +1042,12 @@ async fn export_localhost_image_disk(
     // Lock per-digest to prevent concurrent exports of the same image
     let lock_path = image_cache_dir.join(format!("{}.lock", &digest));
     let lock_file = std::fs::File::create(&lock_path).context("creating image cache lock file")?;
-    lock_file
-        .lock_exclusive()
-        .context("acquiring image cache lock")?;
+    if fs2::FileExt::try_lock_exclusive(&lock_file).is_err() {
+        failpoint::note("lock.wait", lock_path.display());
+        lock_file
+            .lock_exclusive()
+            .context("acquiring image cache lock")?;
+    }
 
     // Check if already cached (inside lock to prevent race)
     // Use Docker archive format (preserves HEALTHCHECK, single tar file) for FUSE transfer
@@ -1652,6 +1655,7 @@ async fn prepare_vm_for_lifecycle(
             image = %args.image,
             "Snapshot miss, will create snapshot after image load"
         );
+        failpoint::hit_async("cache.miss").await;
         // The cold boot builds each read-only --disk-dir image from a private copy, and
         // refuses one whose content is no longer what the key names.
         on_disk_dir_staging(&mut disk_dir_staging, |s| s.stage()).await?;

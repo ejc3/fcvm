@@ -262,7 +262,7 @@ CONTAINER_RUN_BASE := "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" \
 CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=65536
 
 .PHONY: all help build clean clean-test-data check-disk \
-	test test-unit test-agent-unit test-fast test-all test-root test-packaging test-ci-infrastructure test-clone-floor-overlap fuzz \
+	test test-unit test-agent-unit test-fast test-all test-root test-packaging test-ci-infrastructure test-clone-floor-overlap fuzz race-gym _race-gym race-gym-cases \
 	_test-unit _test-agent-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
@@ -298,6 +298,8 @@ help:
 	@echo "  test-clone-floor-overlap  Reproduce the clone/CH/hugepage lifecycle overlap"
 	@echo "  test-ci-infrastructure  Deterministic runner-failure classifier fixtures"
 	@echo "  fuzz               Seeded lifecycle chaos fuzz (SEEDS=N|list OPS=M, defaults 1/10)"
+	@echo "  race-gym           Race gym: enumerate interleavings of concurrent actors (SCENARIO= PHASE=pairs|walk SCHEDULES= PARALLEL=; REPLAY=<file> [EMIT=<name>])"
+	@echo "  race-gym-cases     Run the race gym replays emitted into test_lifecycle_interleave.rs"
 	@echo ""
 	@echo "Test (container):"
 	@echo "  container-test-unit    Unit tests in container"
@@ -630,6 +632,42 @@ SEEDS ?= 1
 OPS ?= 10
 fuzz: show-notes check-disk setup-fcvm
 	FCVM_FUZZ_SEEDS=$(SEEDS) FCVM_FUZZ_OPS=$(OPS) $(MAKE) _test-root FILTER=fuzz_lifecycle_chaos
+
+# Race gym (docs/race-gym.md): concurrent fcvm actors parked at named failpoints and
+# released in enumerated orders. Rootless, so it runs as the invoking user.
+#   make race-gym SCENARIO=cold-run PHASE=pairs SCHEDULES=N PARALLEL=P
+#   make race-gym PHASE=walk SCHEDULES=200 SEED=1
+#   make race-gym REPLAY=<file>                 rerun one recorded schedule
+#   make race-gym REPLAY=<file> EMIT=<name> [PIN=outcome]   add it as a case to test_lifecycle_interleave.rs
+#                                                failing while a PIN oracle fails (default: any)
+#   make race-gym-cases                         run the emitted cases
+# Host inputs come from the environment: RACE_GYM_GPUS (one --gpu per actor),
+# RACE_GYM_ARGS (extra podman run arguments), RACE_GYM_IMAGE, RACE_GYM_OUT.
+SCENARIO ?= cold-run
+PHASE ?= pairs
+SCHEDULES ?=
+PARALLEL ?= 1
+SEED ?= 1
+FIRST ?= 0
+REPLAY ?=
+EMIT ?=
+RERECORD ?=
+PIN ?=
+race-gym: show-notes check-disk
+ifneq ($(EMIT),)
+	./scripts/race-gym-emit.sh "$(REPLAY)" "$(EMIT)" "$(PIN)"
+else
+	$(MAKE) setup-fcvm _race-gym
+endif
+
+_race-gym: cargo-target-link
+	RACE_GYM_SCENARIO="$(SCENARIO)" RACE_GYM_PHASE="$(PHASE)" RACE_GYM_SCHEDULES="$(SCHEDULES)" \
+	RACE_GYM_PARALLEL="$(PARALLEL)" RACE_GYM_SEED="$(SEED)" RACE_GYM_FIRST="$(FIRST)" RACE_GYM_REPLAY="$(REPLAY)" RACE_GYM_RERECORD="$(RERECORD)" \
+	$(TEST_CONFIG_WRAPPER) $(NEXTEST) $(NEXTEST_CAPTURE) --no-default-features --features race-gym -E 'binary(test_race_gym)'
+
+race-gym-cases: show-notes check-disk setup-fcvm cargo-target-link
+	$(TEST_CONFIG_WRAPPER) $(NEXTEST) $(NEXTEST_CAPTURE) --no-default-features --features integration-fast,race-gym \
+		-E 'binary(test_lifecycle_interleave) & test(/lifecycle_interleave_gym_/)'
 
 # fc-mock: container-mode tests (no KVM required)
 # Uses fc-mock binary instead of Firecracker.
