@@ -107,6 +107,7 @@ pub fn names(
         label: label.into(),
         ipv6: ipv6.map(canonical),
         ipv4: ipv4.map(canonical),
+        v4_port,
         frame_url: ipv6.map(|_| format!("wss://{label}.{zone}/frames")),
         frame_url_v4: ipv4.map(|_| format!("wss://{label}-v4.{zone}{port}/frames")),
     }
@@ -541,6 +542,20 @@ pub async fn run(
         let mut live = BTreeMap::new();
         for f in &facts {
             if f.ipv6.is_none() && f.ipv4.is_none() {
+                continue;
+            }
+            // An address that is not one would only make the zone refuse the write.
+            let bad = [(&f.ipv6, true), (&f.ipv4, false)]
+                .into_iter()
+                .find(|(a, v6)| {
+                    a.as_ref()
+                        .is_some_and(|a| match a.parse::<std::net::IpAddr>() {
+                            Ok(ip) => ip.is_ipv6() != *v6,
+                            Err(_) => true,
+                        })
+                });
+            if let Some((a, _)) = bad {
+                tracing::warn!(slot = %f.id, address = ?a, "not naming a slot whose reported address is not one");
                 continue;
             }
             if f.published

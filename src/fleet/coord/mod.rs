@@ -855,6 +855,11 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             args.dns_zone_id.clone(),
         )
     };
+    if dns_token.is_some() && args.dns_nameservers.is_empty() {
+        tracing::warn!(
+            "--dns-nameservers is empty: launches' names are published without confirming them at the zone's authoritative servers"
+        );
+    }
     let dns_writer = match &dns_token {
         Some(t) => Some(cloudflare(t)?.with_confirm(Arc::new(dns::Authoritative {
             servers: args.dns_nameservers.clone(),

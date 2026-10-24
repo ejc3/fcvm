@@ -213,6 +213,9 @@ pub struct Published {
     pub ipv6: Option<String>,
     #[serde(default)]
     pub ipv4: Option<String>,
+    /// The port of the IPv4 path (443 when absent), as the slot reported it.
+    #[serde(default)]
+    pub v4_port: Option<u16>,
     /// `wss://<label>.<zone>/frames`, with an IPv6 address.
     #[serde(default)]
     pub frame_url: Option<String>,

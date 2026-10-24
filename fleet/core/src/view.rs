@@ -841,8 +841,23 @@ pub fn frame_urls(state: &State, s: &Slot) -> (Option<String>, Option<String>) {
     if !state.config.names_published {
         return (s.observed.frame_url.clone(), None);
     }
+    let canonical = |a: &Option<String>| {
+        a.as_ref().map(|a| {
+            a.parse::<std::net::IpAddr>()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|_| a.clone())
+        })
+    };
+    let o = &s.observed;
     match &s.published {
-        Some(p) if p.generation == s.observed.generation => {
+        // The names of exactly what the slot runs now: a new address or port at the same
+        // generation waits for its own names.
+        Some(p)
+            if p.generation == o.generation
+                && p.ipv6 == canonical(&o.ipv6)
+                && p.ipv4 == canonical(&o.ipv4)
+                && p.v4_port == o.v4_port =>
+        {
             (p.frame_url.clone(), p.frame_url_v4.clone())
         }
         _ => (None, None),

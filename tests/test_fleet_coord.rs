@@ -3097,6 +3097,33 @@ async fn a_launch_is_published_only_after_its_names_answer() {
     }
 }
 
+/// A slot that reports another address at the same generation shows no URL until that
+/// address has its own published names: its old names point at an address it left.
+#[tokio::test]
+async fn a_new_address_at_the_same_generation_hides_the_old_urls() {
+    let fx = dns_fixture(&[]).await;
+    fx.open(true);
+    fx.report("running", 1, Some("2001:db8::1"), Some("192.0.2.10"));
+    let first = fx.label_for("2001:db8::1").await;
+    fx.wait_until("published", |fx| !fx.tile()["frame_url"].is_null())
+        .await;
+    fx.open(false);
+    fx.report("running", 1, Some("2001:db8::5"), Some("192.0.2.10"));
+    let second = fx.label_for("2001:db8::5").await;
+    assert_ne!(first, second);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        fx.tile()["frame_url"].is_null() && fx.tile()["frame_url_v4"].is_null(),
+        "the old names were shown for a new address: {}",
+        fx.tile()
+    );
+    fx.open(true);
+    fx.wait_until("the new address published", |fx| {
+        fx.tile()["frame_url"] == format!("wss://{second}.fcvm.example/frames")
+    })
+    .await;
+}
+
 /// Every launch gets new names. A relaunch keeps the earlier launch's records while the new
 /// launch is written and confirmed (the page shows no URL for the new launch until then),
 /// and removes them only once the new names are published and nothing references the old.
