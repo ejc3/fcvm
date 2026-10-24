@@ -133,6 +133,10 @@ pub struct SlotReport {
     pub ipv6: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipv4: Option<String>,
+    /// The TCP port the renderer's TLS port is reached on at `ipv4` (a GPU host's public
+    /// IPv4 address is shared by its slots, each forwarded on its own port); 443 when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v4_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

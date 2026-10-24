@@ -195,6 +195,26 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             }
             None
         }
+        Event::Published { slot, names, .. } => {
+            let f = &mut state.fleet;
+            if let Some(s) = f
+                .slots
+                .values_mut()
+                .chain(f.ec2.values_mut())
+                .find(|s| s.id == *slot)
+            {
+                // Only for the launch the slot is on: a slower write for an earlier launch
+                // must not replace a newer one's names.
+                if s.observed.generation == names.generation
+                    && s.published
+                        .as_ref()
+                        .is_none_or(|p| p.generation <= names.generation)
+                {
+                    s.published = Some(names.clone());
+                }
+            }
+            None
+        }
         Event::ScaleInstances { instances, .. } => {
             let p = &mut state.fleet.power;
             if p.state == "waking" {
@@ -1014,6 +1034,7 @@ fn new_slot(id: String, half: Half, host: Option<String>, gpu: Option<Gpu>, at: 
             phase: "pending".into(),
             ..Default::default()
         },
+        published: None,
         last_relaunch: None,
         claim: None,
     }
@@ -1051,6 +1072,7 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
     slot.observed.retry_at = r.retry_in_ms.map(|ms| at + ms);
     slot.observed.ipv6 = r.ipv6.clone();
     slot.observed.ipv4 = r.ipv4.clone();
+    slot.observed.v4_port = r.v4_port;
     if r.phase == "waiting_capacity" {
         let id = slot.id.clone();
         let since = at.saturating_sub(r.timings.get("capacity_wait_ms").copied().unwrap_or(0));

@@ -84,6 +84,15 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
         (None, false) => None,
     };
     addr::check_routed_user(ipv6_prefix.is_some(), nix::unistd::geteuid().is_root())?;
+    let public_ipv4 = if args.public_ipv4_from_imds {
+        Some(
+            crate::fleet::coord::aws::imds("public-ipv4")
+                .await
+                .context("reading the host's public IPv4 address")?,
+        )
+    } else {
+        None
+    };
     let fcvm = match args.fcvm {
         Some(p) => p,
         None => std::env::current_exe().context("locating this fcvm binary")?,
@@ -101,6 +110,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             ipv6_prefix,
             frame_zone: args.frame_zone,
             tls_publish_base: args.tls_publish_base,
+            public_ipv4,
             publish_ip: args.publish_ip,
             sysfs_root: args.sysfs_root,
             start_timeout: Duration::from_secs(args.start_timeout_secs),
@@ -433,6 +443,7 @@ fn assign(
                 retry_in_ms: None,
                 ipv6: None,
                 ipv4: None,
+                v4_port: None,
             }));
             continue;
         };

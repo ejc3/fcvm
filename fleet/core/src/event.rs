@@ -87,6 +87,13 @@ pub enum Event {
         at: u64,
         instances: Vec<ScaleInstance>,
     },
+    /// A launch's DNS names were written and answer at the zone's authoritative servers.
+    Published {
+        at: u64,
+        /// The slot or tile id (`slot-<n>`, `ec2-<n>`).
+        slot: String,
+        names: crate::state::Published,
+    },
 }
 
 /// One instance in a GPU host auto scaling group.
@@ -111,7 +118,8 @@ impl Event {
             | Event::ReleaseQuarantine { at, .. }
             | Event::Visibility { at, .. }
             | Event::Ec2Health { at, .. }
-            | Event::ScaleInstances { at, .. } => *at,
+            | Event::ScaleInstances { at, .. }
+            | Event::Published { at, .. } => *at,
         }
     }
 }

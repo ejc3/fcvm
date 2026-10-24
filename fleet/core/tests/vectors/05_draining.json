@@ -452,6 +452,7 @@
         "failure": null,
         "fps": null,
         "frame_url": "ws://h2:20003/frames",
+        "frame_url_v4": null,
         "generation": 3,
         "gpu": {
           "name": "Tesla T4",

@@ -636,6 +636,7 @@ impl FakeAgent {
                 retry_in_ms: None,
                 ipv6: None,
                 ipv4: None,
+                v4_port: None,
             }))
             .unwrap();
     }
@@ -2783,30 +2784,63 @@ async fn fake_cloudflare(cf: FakeCf) -> String {
     base
 }
 
-/// A slot that reports its addresses gets `slot-<n>` AAAA (unproxied, TTL 60) and
-/// `slot-<n>-v4` A (proxied); a stale record of that shape is deleted, other names are
-/// left alone, and nothing is written while the wanted records stay the same.
-#[tokio::test]
-async fn slot_dns_records_follow_the_reported_addresses() {
+/// A confirmation the test opens: until it does, every launch's names count as not yet
+/// answering at the authoritative servers. It also checks, when asked, that the records it
+/// is asked about are already in the zone: confirmation comes after the write.
+#[derive(Clone)]
+struct GateConfirm {
+    open: Arc<std::sync::atomic::AtomicBool>,
+    cf: FakeCf,
+    asked_before_written: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl fcvm::fleet::coord::dns::Confirm for GateConfirm {
+    async fn confirmed(&self, records: &[fcvm::fleet::coord::dns::Record]) -> bool {
+        let zone = self.cf.records.lock().unwrap().clone();
+        for r in records {
+            if !zone
+                .values()
+                .any(|z| z["name"] == r.name.as_str() && z["content"] == r.content.as_str())
+            {
+                self.asked_before_written
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        self.open.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+struct DnsFixture {
+    cf: FakeCf,
+    gate: GateConfirm,
+    handle: Handle,
+    agent: FakeAgent,
+}
+
+async fn dns_fixture(pre: &[(&str, &str, &str)]) -> DnsFixture {
     use fcvm::fleet::coord::dns::Cloudflare;
     let cf = FakeCf::default();
-    for (id, name) in [
-        ("keep", "stage.fcvm.example"),
-        ("stale", "slot-9.fcvm.example"),
-    ] {
+    for (i, (kind, name, content)) in pre.iter().enumerate() {
         cf.records.lock().unwrap().insert(
-            id.into(),
-            json!({"id": id, "type": "AAAA", "name": name, "content": "2001:db8::99", "proxied": false}),
+            format!("pre{i}"),
+            json!({"id": format!("pre{i}"), "type": kind, "name": name, "content": content, "proxied": false}),
         );
     }
     let base = fake_cloudflare(cf.clone()).await;
+    let gate = GateConfirm {
+        open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cf: cf.clone(),
+        asked_before_written: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
     let writer = Cloudflare::with_endpoint(
         "dns-token-for-tests".into(),
         "fcvm.example".into(),
         Some("zone-for-tests".into()),
         &base,
     )
-    .unwrap();
+    .unwrap()
+    .with_confirm(Arc::new(gate.clone()));
     let (handle, _actor) = start(
         State::new(Config::default(), now_ms()),
         None,
@@ -2817,67 +2851,218 @@ async fn slot_dns_records_follow_the_reported_addresses() {
     );
     let mut agent = FakeAgent::connect(&handle, "gpu-a", 1);
     agent.assign().await;
-    let report = |v6: &str| {
-        AgentMsg::Slot(SlotReport {
-            id: "slot-1".into(),
-            phase: "running".into(),
-            generation: 1,
-            ipv6: Some(v6.into()),
-            ipv4: Some("192.0.2.10".into()),
-            ..Default::default()
-        })
-    };
-    agent.to_coord.send(report("2001:db8::1")).unwrap();
-    let wait_writes = |n: usize| {
-        let cf = cf.clone();
-        async move {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while cf.writes.lock().unwrap().len() < n {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "{:?}",
-                    cf.writes.lock().unwrap()
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
+    DnsFixture {
+        cf,
+        gate,
+        handle,
+        agent,
+    }
+}
+
+impl DnsFixture {
+    fn report(&self, phase: &str, generation: u64, v6: Option<&str>, v4: Option<&str>) {
+        self.agent
+            .to_coord
+            .send(AgentMsg::Slot(SlotReport {
+                id: "slot-1".into(),
+                phase: phase.into(),
+                generation,
+                ipv6: v6.map(str::to_string),
+                ipv4: v4.map(str::to_string),
+                v4_port: v4.map(|_| 20200),
+                ..Default::default()
+            }))
+            .unwrap();
+    }
+
+    fn tile(&self) -> Value {
+        serde_json::from_str::<Value>(&self.handle.snapshot.borrow().text).unwrap()["state"]
+            ["tiles"][0]
+            .clone()
+    }
+
+    /// The zone's records as (type, name, content), sorted.
+    fn zone(&self) -> Vec<(String, String, String)> {
+        let mut v: Vec<_> = self
+            .cf
+            .records
+            .lock()
+            .unwrap()
+            .values()
+            .map(|r| {
+                (
+                    r["type"].as_str().unwrap().to_string(),
+                    r["name"].as_str().unwrap().to_string(),
+                    r["content"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The label of the zone's AAAA record for `v6`, once there is one.
+    async fn label_for(&self, v6: &str) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some((_, name, _)) = self
+                .zone()
+                .into_iter()
+                .find(|(k, _, c)| k == "AAAA" && c == v6)
+            {
+                return name.strip_suffix(".fcvm.example").unwrap().to_string();
             }
-            cf.writes.lock().unwrap().clone()
+            assert!(std::time::Instant::now() < deadline, "{:?}", self.zone());
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    };
-    let w = wait_writes(3).await;
+    }
+
+    async fn wait_until(&self, what: &str, f: impl Fn(&Self) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !f(self) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: zone {:?}, tile {}",
+                self.zone(),
+                self.tile()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn open(&self, open: bool) {
+        self.gate
+            .open
+            .store(open, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A launch gets a label never used before; its records are written (AAAA for the slot's own
+/// address, A for the host's IPv4, both unproxied with TTL 60), confirmed at the zone's
+/// authoritative servers, and only then do its frame URLs reach the page. The start-up sweep
+/// removes names of the fleet's shape that nothing references and leaves every other name.
+#[tokio::test]
+async fn a_launch_is_published_only_after_its_names_answer() {
+    let fx = dns_fixture(&[
+        ("CNAME", "stage.fcvm.example", "worker.example"),
+        ("AAAA", "fleet-api-stage.fcvm.example", "2001:db8::99"),
+        ("AAAA", "dnstest-1.fcvm.example", "2001:db8::98"),
+        ("AAAA", "slot-9.fcvm.example", "2001:db8::97"),
+        ("A", "slot-9-v4.fcvm.example", "192.0.2.97"),
+        ("AAAA", "slot-7-abcdefgh.fcvm.example", "2001:db8::96"),
+    ])
+    .await;
+    fx.report("running", 1, Some("2001:db8::1"), Some("192.0.2.10"));
+    let label = fx.label_for("2001:db8::1").await;
     assert!(
-        w.contains(&"delete \"slot-9.fcvm.example\"".to_string()),
-        "{w:?}"
+        label.starts_with("slot-1-") && label.len() == "slot-1-".len() + 8,
+        "{label}"
     );
-    assert!(
-        w.contains(&"create \"AAAA\" \"slot-1.fcvm.example\" \"2001:db8::1\"".to_string()),
-        "{w:?}"
-    );
-    assert!(
-        w.contains(&"create \"A\" \"slot-1-v4.fcvm.example\" \"192.0.2.10\"".to_string()),
-        "{w:?}"
-    );
-    let recs = cf.records.lock().unwrap().clone();
-    let aaaa = recs
-        .values()
-        .find(|r| r["name"] == "slot-1.fcvm.example")
-        .unwrap();
-    assert_eq!(
-        (aaaa["proxied"].clone(), aaaa["ttl"].clone()),
-        (json!(false), json!(60))
-    );
-    let a = recs
-        .values()
-        .find(|r| r["name"] == "slot-1-v4.fcvm.example")
-        .unwrap();
-    assert_eq!(a["proxied"], json!(true));
-    assert!(recs.values().any(|r| r["name"] == "stage.fcvm.example"));
-    // The same report again changes nothing; a new address is one update.
-    agent.to_coord.send(report("2001:db8::1")).unwrap();
+    fx.wait_until("the A record", |fx| {
+        fx.zone().contains(&(
+            "A".into(),
+            format!("{label}-v4.fcvm.example"),
+            "192.0.2.10".into(),
+        ))
+    })
+    .await;
+    // Written, not yet answering: the page gets nothing.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(cf.writes.lock().unwrap().len(), 3);
-    agent.to_coord.send(report("2001:db8::2")).unwrap();
-    let w = wait_writes(4).await;
-    assert_eq!(w[3], "update \"slot-1.fcvm.example\" \"2001:db8::2\"");
+    assert_eq!(fx.tile()["phase"], "running");
+    assert!(fx.tile()["frame_url"].is_null(), "{}", fx.tile());
+    assert!(fx.tile()["frame_url_v4"].is_null(), "{}", fx.tile());
+    fx.open(true);
+    fx.wait_until("the published URLs", |fx| !fx.tile()["frame_url"].is_null())
+        .await;
+    assert_eq!(
+        fx.tile()["frame_url"],
+        format!("wss://{label}.fcvm.example/frames")
+    );
+    assert_eq!(
+        fx.tile()["frame_url_v4"],
+        format!("wss://{label}-v4.fcvm.example:20200/frames")
+    );
+    assert!(
+        !fx.gate
+            .asked_before_written
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "a launch was confirmed before its records were written"
+    );
+    // No fleet record is proxied, and each has TTL 60.
+    for r in fx.cf.records.lock().unwrap().values() {
+        if r["name"].as_str().unwrap().starts_with("slot-") {
+            assert_eq!(
+                (r["proxied"].clone(), r["ttl"].clone()),
+                (json!(false), json!(60)),
+                "{r}"
+            );
+        }
+    }
+    // The sweep: the fleet's unreferenced names are gone, every other name stays.
+    let names: Vec<String> = fx.zone().into_iter().map(|(_, n, _)| n).collect();
+    for keep in [
+        "stage.fcvm.example",
+        "fleet-api-stage.fcvm.example",
+        "dnstest-1.fcvm.example",
+    ] {
+        assert!(names.contains(&keep.to_string()), "{keep}: {names:?}");
+    }
+    for gone in [
+        "slot-9.fcvm.example",
+        "slot-9-v4.fcvm.example",
+        "slot-7-abcdefgh.fcvm.example",
+    ] {
+        assert!(!names.contains(&gone.to_string()), "{gone}: {names:?}");
+    }
+}
+
+/// Every launch gets new names. A relaunch keeps the earlier launch's records while the new
+/// launch is written and confirmed (the page shows no URL for the new launch until then),
+/// and removes them only once the new names are published and nothing references the old.
+#[tokio::test]
+async fn each_launch_gets_new_names_and_old_ones_go_once_unreferenced() {
+    let fx = dns_fixture(&[]).await;
+    fx.open(true);
+    fx.report("running", 1, Some("2001:db8::1"), Some("192.0.2.10"));
+    let first = fx.label_for("2001:db8::1").await;
+    fx.wait_until("the first launch published", |fx| {
+        !fx.tile()["frame_url"].is_null()
+    })
+    .await;
+    // The relaunch: no address yet, then the new launch's addresses, confirmation held.
+    fx.open(false);
+    fx.report("starting", 2, None, None);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        fx.zone().iter().any(|(_, n, _)| n.starts_with(&first)),
+        "{:?}",
+        fx.zone()
+    );
+    assert!(fx.tile()["frame_url"].is_null(), "{}", fx.tile());
+    fx.report("running", 2, Some("2001:db8::2"), Some("192.0.2.11"));
+    let second = fx.label_for("2001:db8::2").await;
+    assert_ne!(first, second);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        fx.zone().iter().any(|(_, n, _)| n.starts_with(&first)),
+        "the first launch's names went before the second's were published: {:?}",
+        fx.zone()
+    );
+    assert!(fx.tile()["frame_url"].is_null(), "{}", fx.tile());
+    fx.open(true);
+    fx.wait_until("the second launch published", |fx| {
+        fx.tile()["frame_url"] == format!("wss://{second}.fcvm.example/frames")
+    })
+    .await;
+    fx.wait_until("the first launch's names removed", |fx| {
+        !fx.zone().iter().any(|(_, n, _)| n.starts_with(&first))
+    })
+    .await;
+    let w = fx.cf.writes.lock().unwrap().clone();
+    assert!(
+        !w.iter().any(|x| x.starts_with("update")),
+        "a name changed address in place: {w:?}"
+    );
 }
 
 /// An EC2 tile whose renderer reports a fit; it records the budgets posted to it.

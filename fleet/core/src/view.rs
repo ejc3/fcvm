@@ -23,7 +23,11 @@ pub struct TileView {
     pub phase: String,
     /// The slot behind the tile (`slot-3`, `ec2-2`); null when dark.
     pub slot: Option<String>,
+    /// The frame WebSocket over IPv6 and over IPv4. With published names (the fleet's
+    /// coordinator) both are null until the launch's DNS names answer at the zone's
+    /// authoritative servers; a viewer uses one family for every tile.
     pub frame_url: Option<String>,
+    pub frame_url_v4: Option<String>,
     pub gpu: Option<Gpu>,
     pub host: Option<String>,
     pub vm: Option<String>,
@@ -348,7 +352,7 @@ fn tile_phase(s: &Slot) -> String {
     }
 }
 
-fn tile(id: String, half: Half, rect: Rect, slot: Option<&Slot>) -> TileView {
+fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) -> TileView {
     let lent = slot.and_then(|s| {
         let c = s.claim.as_ref().filter(|c| c.borrowed.is_some())?;
         Some(BorrowedView {
@@ -367,6 +371,7 @@ fn tile(id: String, half: Half, rect: Rect, slot: Option<&Slot>) -> TileView {
             phase: "waiting_capacity".into(),
             slot: None,
             frame_url: None,
+            frame_url_v4: None,
             gpu: None,
             host: None,
             vm: None,
@@ -393,7 +398,12 @@ fn tile(id: String, half: Half, rect: Rect, slot: Option<&Slot>) -> TileView {
             frame_url: if lent.is_some() {
                 None
             } else {
-                s.observed.frame_url.clone()
+                frame_urls(state, s).0
+            },
+            frame_url_v4: if lent.is_some() {
+                None
+            } else {
+                frame_urls(state, s).1
             },
             gpu: s.gpu.clone(),
             host: s.host.clone(),
@@ -430,6 +440,7 @@ pub fn view(state: &State) -> View {
         placed.sort_by_key(|s| s.position);
         for s in placed {
             let mut t = tile(
+                state,
                 format!("{}:{}", half.as_str(), s.position.unwrap() + 1),
                 half,
                 s.rect.expect("a placed slot has a rectangle"),
@@ -817,4 +828,18 @@ pub fn ec2_assignment(state: &State) -> Vec<AssignSlot> {
 
 pub fn shared_scene(state: &State) -> SharedScene {
     SharedScene::new(&state.fleet.scene, state.config.image_aspect)
+}
+
+/// A tile's frame URLs (IPv6, IPv4). With published names, those of the launch the slot is
+/// on, once published; otherwise the URL its agent reported, with no IPv4 one.
+pub fn frame_urls(state: &State, s: &Slot) -> (Option<String>, Option<String>) {
+    if !state.config.names_published {
+        return (s.observed.frame_url.clone(), None);
+    }
+    match &s.published {
+        Some(p) if p.generation == s.observed.generation => {
+            (p.frame_url.clone(), p.frame_url_v4.clone())
+        }
+        _ => (None, None),
+    }
 }

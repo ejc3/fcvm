@@ -200,7 +200,8 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
       "previous_rect": {"x": 0, "y": 0, "w": 0.0909, "h": 0.1},
       "phase": "running",
       "slot": "slot-1",
-      "frame_url": "ws://<host>:<port>/frames",
+      "frame_url": "wss://slot-1-k3x7q2ab.<zone>/frames",
+      "frame_url_v4": "wss://slot-1-k3x7q2ab-v4.<zone>:20200/frames",
       "gpu": {"sbdf": "0000:01:00.0", "name": "Tesla T4"},
       "host": "<host name>",
       "vm": "fleet-slot-1",
@@ -306,8 +307,12 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   `relaunching` (a newer generation is wanted than the agent has reported), or what the
   agent reported: `stopping`, `restoring`, `starting`, `running`, `failed`.
 - `frame_url` is the renderer's frame WebSocket as the browser should open it (append
-  `?h=<height>`); null while borrowed. After a relaunch the tile reconnects when `phase` is
-  `running` again.
+  `?h=<height>`), over IPv6; `frame_url_v4` the same renderer over IPv4. Both are null while
+  borrowed. With `--dns-token-secret` both are the launch's own names (see "Running it"),
+  null until those names answer at the zone's authoritative servers, and a relaunch gives
+  new ones; without it `frame_url` is what the agent reported and `frame_url_v4` is null.
+  A viewer uses one family for every tile of both halves. After a relaunch the tile
+  reconnects when `phase` is `running` again and its URLs are set.
 - `last_relaunch.first_frame_at - clicked_at` is the tile's relaunch time; `phases` are
   the agent's timings for that relaunch (see Agent).
 - `next_race_at` is when the owner's cadence races next (null without one);
@@ -414,7 +419,8 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--state-bucket <bucket> [--state-key state.json] [--state-region <region>]]
                  [--ec2 aws --ec2-tiles 8 --ec2-regions <r1,r2,...> [--ec2-template fcvm-fleet-tile-x86_64]
                   [--ec2-on-demand-template <name>] [--fleet-name stage]] [--dns-zone fcvm.dev]
-                 [--dns-token-secret <secret> [--dns-zone-id <id>]] [--tls-secret <secret>] [--secrets-region <region>]
+                 [--dns-token-secret <secret> [--dns-zone-id <id>] [--dns-nameservers <ns>,...]]
+                 [--tls-secret <secret>] [--secrets-region <region>]
 ```
 
 - `--state-bucket` (also `FLEET_STATE_BUCKET`, `FLEET_STATE_KEY`) keeps the state as one S3
@@ -440,12 +446,18 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   stops, it terminates every instance tagged `Purpose=fcvm-fleet-tile` and
   `Fleet=<--fleet-name>` in `--ec2-regions`; another fleet's tiles in the same account (a
   different `--fleet-name`) are left alone.
-- `--dns-token-secret` writes the slots' names in `--dns-zone` with the zone's Cloudflare
-  token: for every fcvm slot and EC2 tile that reported a public address,
-  `slot-<n>.<zone>` / `ec2-<n>.<zone>` AAAA (unproxied, TTL 60) and `slot-<n>-v4.<zone>` /
-  `ec2-<n>-v4.<zone>` A (proxied). Records are written only when the wanted set changes,
-  and records of that shape nobody wants are deleted; other names in the zone are left
-  alone.
+- `--dns-token-secret` names each launch in `--dns-zone` with the zone's Cloudflare token.
+  Every launch of an fcvm slot or EC2 tile that reports an address gets a label never used
+  before, `slot-<n>-<token>` / `ec2-<n>-<token>` (8 random base32 characters), and under it
+  `<label>.<zone>` AAAA (the slot's own IPv6 address) and `<label>-v4.<zone>` A (the host's
+  or the tile's public IPv4 address), both unproxied with TTL 60. The coordinator writes the
+  records, confirms them at every server in `--dns-nameservers` (asked directly, without
+  recursion), and only then sets the tile's `frame_url` and `frame_url_v4`. A name is never
+  asked for before it exists and never changes address, so no resolver holds a negative or
+  stale answer for it. A launch's records stay until its slot has a newer published launch
+  or leaves the fleet; names of the fleet's shape (`slot-<n>`, `ec2-<n>`, with or without a
+  token, with or without `-v4`) that nothing references are deleted, at start too; every
+  other name in the zone is left alone.
 - `--tls-secret` keeps the wildcard certificate renewed (see "Certificate").
 
 ### Certificate
@@ -549,7 +561,7 @@ host's slots stay, and the old connection's later messages are ignored.
 
 ```json
 {"type": "slot", "id": "slot-3", "phase": "running", "generation": 4, "vm": "fleet-slot-3",
- "frame_url": "ws://<host>:<port>/frames", "ipv6": "2001:db8::3", "ipv4": null,
+ "frame_url": "ws://<host>:<port>/frames", "ipv6": "2001:db8::3", "ipv4": "192.0.2.10", "v4_port": 20202,
  "timings": {"teardown_ms": 310, "restore_ms": 4300, "ack_ms": 4300, "gpu_ms": 3100, "container_ms": 600, "first_frame_ms": 250, "total_ms": 5200},
  "error": null, "retry_in_ms": null}
 ```
@@ -757,6 +769,7 @@ fcvm fleet agent (--stdio | --dial <wss url> [--access-secret <secret>]) --image
                  [--scrub] [--store-ready-file <path>] [--host-from-imds] [--secret-region <region>]
                  [--tls-secret <secret> [--tls-dir /run/fcvm-fleet/tls]]
                  [--ipv6-prefix <prefix/len> | --ipv6-prefix-from-imds] [--frame-zone <zone>]
+                 [--tls-publish-base <port> [--public-ipv4-from-imds]]
 ```
 
 `--host-from-imds` names the host by its EC2 instance id. `--tls-secret` hands the fleet's
@@ -774,15 +787,21 @@ restart.
 primary interface, `Ipv6PrefixCount = 1`) runs each slot's VM in fcvm's routed mode at
 `<prefix>::<GPU index + 2>` (`--network routed --ipv6-prefix <prefix> --ipv6-address
 <addr>`; fcvm refuses the prefix's addresses 0 and 1). The slot keeps the address across
-relaunches and reports it as `ipv6` in every slot message; the coordinator writes it to
-`slot-<n>.<zone>` (AAAA, unproxied, TTL 60). The renderer's container shares the VM's
+relaunches and reports it as `ipv6` in every slot message; the coordinator names it in DNS
+(see the coordinator's `--dns-token-secret`). The renderer's container shares the VM's
 network, so a browser reaches its TLS port at that address. `--frame-zone` reports the frame
-URL as `wss://<slot id>.<zone>/frames`. The host
+URL as `wss://<slot id>.<zone>/frames`.
+
+The IPv4 path: a GPU host has one public IPv4 address, shared by its slots.
+`--tls-publish-base <port>` forwards each slot's TLS port on the host (`--publish-ip`, port
+`<port> + GPU index`, fcvm's `--publish`, which relays into a routed VM and goes away with its
+fcvm), and `--public-ipv4-from-imds` reports the host's address (IMDS `public-ipv4`, assigned
+by EC2 at launch) as `ipv4`, with the slot's port as `v4_port`. The host
 AMI's unit (`fcvm-fleet-agent.service`, `ExecStart=/usr/local/bin/fcvm fleet agent
 $FLEET_AGENT_ARGS`) takes, in `/etc/fcvm-fleet/agent.env`:
 
 ```
-FLEET_AGENT_ARGS=--dial wss://fleet-api-stage.fcvm.dev/agent --access-secret fcvm-fleet/agent-access-token --host-from-imds --image localhost/fcvm-renderer:fleet --base-port 20100 --publish-ip 0.0.0.0 --tls-secret fcvm-fleet/tls-wildcard --ipv6-prefix-from-imds --frame-zone fcvm.dev --store-ready-file /var/lib/fcvm-fleet/store-ready
+FLEET_AGENT_ARGS=--dial wss://fleet-api-stage.fcvm.dev/agent --access-secret fcvm-fleet/agent-access-token --host-from-imds --image localhost/fcvm-renderer:fleet --base-port 20100 --publish-ip 0.0.0.0 --tls-secret fcvm-fleet/tls-wildcard --ipv6-prefix-from-imds --frame-zone fcvm.dev --tls-publish-base 20200 --public-ipv4-from-imds --store-ready-file /var/lib/fcvm-fleet/store-ready
 ```
 
 Each slot's VM is `fcvm podman run --name fleet-<slot> --kernel-profile gpu --gpu <sbdf>

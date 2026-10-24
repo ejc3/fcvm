@@ -480,6 +480,7 @@
         "failure": null,
         "fps": null,
         "frame_url": "ws://hC:20001/frames",
+        "frame_url_v4": null,
         "generation": 1,
         "gpu": {
           "name": "Tesla T4",
@@ -512,6 +513,7 @@
         "failure": null,
         "fps": null,
         "frame_url": "ws://hB:20003/frames",
+        "frame_url_v4": null,
         "generation": 1,
         "gpu": {
           "name": "Tesla T4",
@@ -544,6 +546,7 @@
         "failure": null,
         "fps": null,
         "frame_url": "ws://hB:20004/frames",
+        "frame_url_v4": null,
         "generation": 1,
         "gpu": {
           "name": "Tesla T4",
@@ -576,6 +579,7 @@
         "failure": null,
         "fps": null,
         "frame_url": "ws://hB:20005/frames",
+        "frame_url_v4": null,
         "generation": 1,
         "gpu": {
           "name": "Tesla T4",

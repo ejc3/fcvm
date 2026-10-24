@@ -328,6 +328,8 @@ async fn report(
                 retry_in_ms: retry_in.map(|d| d.as_millis() as u64),
                 ipv6: l.and_then(|l| l.ipv6.clone()),
                 ipv4: l.and_then(|l| l.ipv4.clone()),
+                // A tile serves TLS on 443 at its own IPv4 address.
+                v4_port: None,
             },
         })
         .await;
