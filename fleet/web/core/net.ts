@@ -64,6 +64,14 @@ export const FAMILY_PROBE_MS = 1500;
 export const FAMILY_PROBE_TILES = 3;
 
 /**
+ * How many probes fail before the page settles on IPv4, and the wait between them. A fast
+ * failure does not tell "no IPv6" (no route) from "not accepting yet" (a renderer that has
+ * just reported running, as at the end of a wake), so one failed probe is not enough.
+ */
+export const FAMILY_PROBE_ATTEMPTS = 3;
+export const FAMILY_PROBE_RETRY_MS = 1000;
+
+/**
  * A stream's base URL in a family (a tile's, an aggregate's or a borrowed GPU's: every
  * `frame_url` has a `frame_url_v4` sibling): null while the family is unknown or the URL is.
  */
@@ -74,14 +82,17 @@ export function streamUrl(x: { frame_url: string | null; frame_url_v4: string | 
 
 /**
  * What the probe opens: the IPv6 URLs of up to FAMILY_PROBE_TILES running tiles. Empty when
- * no tile has one yet; `v4Only` when tiles have IPv4 URLs and none an IPv6 one, so there is
- * nothing to probe and IPv4 is the only family.
+ * no tile has one yet. When only one family has URLs there is nothing to choose: `v4Only`
+ * (tiles have IPv4 URLs and none an IPv6 one) and `v6Only` (the other way round, as with a
+ * coordinator that publishes no IPv4 names) settle the family without a probe.
  */
 export function familyProbeTargets(tiles: readonly { phase: string; frame_url: string | null; frame_url_v4: string | null }[]): {
   urls: string[];
   v4Only: boolean;
+  v6Only: boolean;
 } {
   const running = tiles.filter((t) => t.phase === "running");
   const urls = running.flatMap((t) => (t.frame_url === null ? [] : [t.frame_url])).slice(0, FAMILY_PROBE_TILES);
-  return { urls, v4Only: urls.length === 0 && running.some((t) => t.frame_url_v4 !== null) };
+  const anyV4 = running.some((t) => t.frame_url_v4 !== null);
+  return { urls, v4Only: urls.length === 0 && anyV4, v6Only: urls.length > 0 && !anyV4 };
 }
