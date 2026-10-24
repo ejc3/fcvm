@@ -73,5 +73,31 @@ rm -rf "$stub"
 grep -qF '{ echo "host: the first GPU VM failed"; exit 1; }' fleet/ami/measure-boot.sh ||
   no "measure-boot.sh host does not stop when the warm-up fails"
 
+# host/build.sh must check out $FCVM_COMMIT even when the builder's source tree (from a
+# BASE_AMI) holds untracked files that commit tracks: on 2026-10-24 an untracked
+# fleet/ami/ stopped the build with "untracked working tree files would be overwritten".
+# Run build.sh's own checkout command in a scratch clone in that state.
+checkout=$(sed -n 's/^  as_user "\(cd \$SRC && git fetch .*git checkout.*\)"$/\1/p' fleet/ami/host/build.sh)
+gt=$(mktemp -d)
+if [ -z "$checkout" ]; then
+  no "host/build.sh has no source checkout command to test"
+else
+  (
+    set -e
+    g() { git -c user.email=check@example.invalid -c user.name=check -c init.defaultBranch=main "$@"; }
+    g init -q "$gt/origin"; cd "$gt/origin"
+    echo a > a; g add a; g commit -qm a; old=$(git rev-parse HEAD)
+    mkdir -p fleet/ami; echo tracked > fleet/ami/warm.sh; g add fleet; g commit -qm b
+    new=$(git rev-parse HEAD)
+    g clone -q "$gt/origin" "$gt/src"; cd "$gt/src"; git checkout -q --detach "$old"
+    mkdir -p fleet/ami; echo stray > fleet/ami/warm.sh; echo stray > leftover
+    export SRC="$gt/src" FCVM_COMMIT="$new"  # read by the eval'd command
+    c=""; eval "c=\"$checkout\""
+    bash -c "$c" 2>&1 >/dev/null | sed "s/^/  checkout: /" >&2
+    [ "$(git -C "$gt/src" rev-parse HEAD)" = "$new" ] && [ "$(cat "$gt/src/fleet/ami/warm.sh")" = tracked ] && [ ! -e "$gt/src/leftover" ]
+  ) || no "host/build.sh's checkout does not reach FCVM_COMMIT cleanly over untracked files"
+fi
+rm -rf "$gt"
+
 [ "$fail" = 0 ] && echo "fleet/ami checks: ok"
 exit "$fail"

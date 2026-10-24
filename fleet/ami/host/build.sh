@@ -83,7 +83,10 @@ build)
   prlimit --pid $$ --memlock=unlimited:unlimited
   [ -x "$UH/.cargo/bin/cargo" ] || as_user 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal'
   [ -d "$SRC/.git" ] || as_user "git clone -q https://github.com/ejc3/fcvm.git $SRC"
-  as_user "cd $SRC && git fetch -q origin && git checkout -q --detach $FCVM_COMMIT && git log --oneline -1"
+  # The tree must be exactly $FCVM_COMMIT. A builder from a BASE_AMI keeps the previous
+  # build's checkout, whose untracked files can block the checkout or be built: force the
+  # checkout over them and remove untracked files (ignored ones, the cargo target, stay).
+  as_user "cd $SRC && git fetch -q origin && git checkout -q -f --detach $FCVM_COMMIT && git clean -q -fd && git log --oneline -1"
   as_user "cd $SRC && make build"
   as_user "cd $SRC && make setup-gpu"
   as_user "cd $SRC && make -C fleet/renderer image TAG=fleet"
