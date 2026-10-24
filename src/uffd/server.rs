@@ -7771,6 +7771,66 @@ mod tests {
         clone.unmap();
     }
 
+    /// The bound counts from the later of the park and the last REMOVE event read, decided
+    /// on the clock rather than on a schedule. The REMOVE stays unread, so every retry is
+    /// refused. A fault parked longer than MAX_PARKED_WAIT ago, with a REMOVE read since,
+    /// must stay parked; once MAX_PARKED_WAIT passes with no REMOVE read, it fails the
+    /// handler. Counted from the park alone, the first retry fails.
+    #[test]
+    fn a_parked_copy_refused_past_the_deadline_stays_parked_while_remove_events_are_read() {
+        let (clone, uffd) = BalloonedCopyClone::new(3);
+        let ctx = clone.ctx();
+        let mut state = BalloonedCopyClone::state();
+        // Queued and deliberately left unread until the end of the test.
+        let balloon = clone.inflate_page_zero(&uffd);
+
+        let page = clone.page(2);
+        state
+            .parked_faults
+            .park(page, 2 * BalloonedCopyClone::PAGE, false, None);
+        state
+            .parked_faults
+            .by_page
+            .get_mut(&page)
+            .expect("the fault is parked")
+            .parked_at = std::time::Instant::now()
+            .checked_sub(MAX_PARKED_WAIT * 2)
+            .expect("the monotonic clock is older than twice the wait");
+        state.parked_faults.a_remove_was_read();
+        assert!(
+            retry_parked_faults(&ctx, &uffd, &mut state).expect(
+                "a fault refused past the deadline from its park, with a REMOVE read since, \
+                 must not fail the handler"
+            ),
+            "the clone is alive; a retry must not report it gone"
+        );
+        assert_eq!(
+            state.parked_faults.by_page.len(),
+            1,
+            "still refused: the fault stays parked"
+        );
+
+        // The same refusal once MAX_PARKED_WAIT has passed since that REMOVE was read.
+        state.parked_faults.last_remove_read =
+            std::time::Instant::now().checked_sub(MAX_PARKED_WAIT);
+        let error = retry_parked_faults(&ctx, &uffd, &mut state)
+            .expect_err("a COPY refused for the wait with no REMOVE read must fail the handler");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("with no REMOVE event read for"),
+            "the error must give the time without a REMOVE read: {message}"
+        );
+
+        // Let madvise return.
+        let event = uffd.read_event().expect("reading the REMOVE event");
+        assert!(
+            matches!(event, Some(Event::Remove { .. })),
+            "expected the queued REMOVE, got {event:?}"
+        );
+        assert_eq!(balloon.join().expect("balloon thread"), 0, "madvise");
+        clone.unmap();
+    }
+
     /// The CPUs this process may run on.
     fn allowed_cpus() -> Vec<usize> {
         // SAFETY: a zeroed cpu_set_t is a valid empty set, filled in by the kernel.
@@ -8100,7 +8160,10 @@ mod tests {
     /// counted that bound from the park and failed `serve_faults` at 2 s, every run.
     ///
     /// The balloon inflates for longer than the bound and then stops. The fault must then be
-    /// served, and `serve_faults` must still be running.
+    /// served, and `serve_faults` must still be running. Whether the fault is still refused
+    /// when the bound passes is up to the scheduler, so this test can pass with the bound
+    /// counted from the park; the decision itself is pinned on the clock by
+    /// `a_parked_copy_refused_past_the_deadline_stays_parked_while_remove_events_are_read`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fault_parked_behind_a_balloon_on_its_own_cpu_waits_for_the_balloon_without_failing()
     {
