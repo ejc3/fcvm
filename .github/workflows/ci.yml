@@ -21,7 +21,12 @@ on:
   # reported it CLEAN (PR #785 was mechanically mergeable that way). The
   # expensive matrix is skipped per-job via the `changes` job below instead, so
   # every PR still gets exactly one `Summary` check and it can be required.
+  # `ready_for_review` is listed so marking a draft ready starts a run: the draft's own
+  # runs may have been cancelled, superseded or never started, and the flip is the
+  # point at which the PR is offered for review. Listing types replaces the default
+  # set, so the defaults (opened, synchronize, reopened) are listed too.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
     paths-ignore:
