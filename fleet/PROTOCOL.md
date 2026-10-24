@@ -410,6 +410,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--trust-cf-connecting-ip] [--turnstile-secret <secret> --turnstile-site-key <key>]
                  [--admin-listen <addr:port>] [--ffmpeg ffmpeg]
                  [--scale-group <region>:<group name>]... [--awake-capacity 1] [--idle-scale-down 600]
+                 [--on-demand-group <region>:<group name>]... [--spot-wait 120]
                  [--state-bucket <bucket> [--state-key state.json] [--state-region <region>]]
                  [--ec2 aws --ec2-tiles 8 --ec2-regions <r1,r2,...> [--ec2-template fcvm-fleet-tile-x86_64]
                   [--ec2-on-demand-template <name>] [--fleet-name stage]] [--dns-zone fcvm.dev]
@@ -465,6 +466,17 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
   while waking, reads their instances (`DescribeAutoScalingGroups`) every 5 s, with the
   credentials of its task or instance role. A call that fails marks the coordinator
   degraded (`scale`) and is retried.
+- `--on-demand-group` names an on-demand group as the fallback of the `--scale-group` in its
+  region (at most one per region, and that region must have exactly one scale group). Auto
+  Scaling does not move a spot group's capacity to on demand by itself, so the coordinator
+  does: while waking, when the spot group and its on-demand group together have had fewer
+  live instances (any lifecycle state but `Terminating*`, `Terminated` and `Detach*`) than
+  `--awake-capacity` for `--spot-wait` seconds (default 120), it sets the on-demand group to
+  the shortfall and the spot group to the live instances it has, so a spot launch that
+  succeeds later cannot add a host. A group it cannot describe is not taken to be short. It
+  never raises the on-demand group otherwise, sets it to 0 with the spot group when the
+  fleet sleeps, and the next wake asks spot first. The on-demand group's own `max_size` caps
+  what it can be given. The on-demand instances are listed with the spot ones in `hosts`.
 - `--admin-listen` serves the operator's endpoint, `POST /quarantine/release` with
   `{"host": "<host>", "sbdf": "0000:05:00.0"}`, which returns a quarantined GPU to
   rotation. It has no authentication: keep it on loopback or a private network.

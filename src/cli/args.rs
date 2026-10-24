@@ -253,6 +253,17 @@ pub struct FleetCoordArgs {
     #[arg(long, default_value_t = 1)]
     pub awake_capacity: u32,
 
+    /// An on-demand GPU host auto scaling group (`<region>:<name>`, repeatable), the
+    /// fallback of the --scale-group in its region. It is 0 unless a wake leaves that spot
+    /// group short of --awake-capacity for --spot-wait seconds; then it takes the shortfall
+    /// and the spot group is held at what it has. Both go to 0 when the fleet sleeps.
+    #[arg(long = "on-demand-group")]
+    pub on_demand_groups: Vec<crate::fleet::coord::scale::Group>,
+
+    /// Seconds a waking spot group may stay short before its on-demand group takes over
+    #[arg(long, default_value_t = 120)]
+    pub spot_wait: u64,
+
     /// Seconds with no active viewer before the fleet scales down
     #[arg(long, default_value_t = 600)]
     pub idle_scale_down: u64,

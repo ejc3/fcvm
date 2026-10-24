@@ -1688,6 +1688,8 @@ async fn no_active_viewer_scales_the_gpus_to_zero_and_one_wakes_them() {
         }],
         awake_capacity: 2,
         poll: Duration::from_millis(100),
+        on_demand: vec![],
+        spot_wait: Duration::from_secs(120),
     };
     let (handle, _actor) = start(
         State::new(config, now_ms()),
@@ -1741,6 +1743,116 @@ async fn no_active_viewer_scales_the_gpus_to_zero_and_one_wakes_them() {
     );
     assert!(s["fleet"]["power"]["woke_at"].is_u64());
     assert_eq!(calls()[2], ("fleet-hosts".to_string(), 2));
+}
+
+/// A wake that leaves the spot group with no instance for the spot wait moves the
+/// shortfall to the on-demand group and holds the spot group at what it has; sleeping sets
+/// both to zero, and the next wake asks spot first again.
+#[tokio::test]
+async fn a_spot_group_short_after_the_wait_falls_back_to_on_demand_and_sleeps_to_zero() {
+    use fcvm::fleet::coord::scale::{FakeScale, Group, PowerConfig};
+    let config = Config {
+        power_managed: true,
+        idle_scale_down_secs: 1,
+        ..Config::default()
+    };
+    let fake = Arc::new(FakeScale::default());
+    let spot = Group {
+        region: "us-east-1".into(),
+        name: "fleet-hosts".into(),
+    };
+    let od = Group {
+        region: "us-east-1".into(),
+        name: "fleet-hosts-on-demand".into(),
+    };
+    let power = PowerConfig {
+        driver: fake.clone(),
+        groups: vec![spot],
+        awake_capacity: 1,
+        poll: Duration::from_millis(50),
+        on_demand: vec![Some(od)],
+        spot_wait: Duration::from_millis(300),
+    };
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        None,
+        None,
+        Some(power),
+        None,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/live", listener.local_addr().unwrap());
+    let cfg = live::LiveConfig {
+        checker: allow_all(),
+        allowed_origins: vec![],
+        verifier: Arc::new(turnstile::Off),
+        trust_cf_connecting_ip: false,
+        turnstile_site_key: None,
+        poster: Arc::new(poster::Poster::default()),
+    };
+    let h = handle.clone();
+    tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
+    let calls = || fake.calls.lock().unwrap().clone();
+    let wait_for = |n: usize| {
+        let fake = fake.clone();
+        async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while fake.calls.lock().unwrap().len() < n {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{:?}",
+                    fake.calls.lock().unwrap()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
+    let c = |g: &str, d: u32| (g.to_string(), d);
+    let mut v = Viewer::connect(&url).await;
+    v.until(|s| s["viewers"]["active"] == 1).await;
+    // Awake at start: the spot group only; the on-demand group is not raised.
+    assert_eq!(calls(), vec![c("fleet-hosts", 1)]);
+    v.send(json!({"type": "visibility", "visible": false}))
+        .await;
+    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    wait_for(3).await;
+    assert_eq!(
+        calls()[1..3],
+        [c("fleet-hosts", 0), c("fleet-hosts-on-demand", 0)]
+    );
+    // Wake with no spot capacity: after the wait, on-demand takes the one host.
+    v.send(json!({"type": "visibility", "visible": true})).await;
+    wait_for(6).await;
+    assert_eq!(
+        calls()[3..6],
+        [
+            c("fleet-hosts", 1),
+            c("fleet-hosts-on-demand", 1),
+            c("fleet-hosts", 0)
+        ]
+    );
+    // The on-demand host shows on the page and nothing more is launched.
+    fake.by_group.lock().unwrap().insert(
+        "fleet-hosts-on-demand".into(),
+        vec![fleet_core::event::ScaleInstance {
+            id: "i-0123456789abcdef0".into(),
+            lifecycle: "Pending".into(),
+        }],
+    );
+    v.until(|s| s["fleet"]["power"]["hosts"][0]["host"] == "i-0123456789abcdef0")
+        .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(calls().len(), 6, "{:?}", calls());
+    // Sleep: both groups to zero.
+    v.send(json!({"type": "visibility", "visible": false}))
+        .await;
+    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    wait_for(8).await;
+    assert_eq!(
+        calls()[6..8],
+        [c("fleet-hosts", 0), c("fleet-hosts-on-demand", 0)]
+    );
 }
 
 /// No poster is taken while tiles are starting or a race relaunches them: their regions

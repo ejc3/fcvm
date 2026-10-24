@@ -811,6 +811,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             crate::fleet::aggregate::child::connect_addr(l)
         )
     });
+    let on_demand = scale::pair_on_demand(&args.scale_groups, &args.on_demand_groups)?;
     let power = if args.scale_groups.is_empty() {
         None
     } else {
@@ -819,6 +820,8 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             groups: args.scale_groups.clone(),
             awake_capacity: args.awake_capacity,
             poll: Duration::from_secs(5),
+            on_demand,
+            spot_wait: Duration::from_secs(args.spot_wait),
         })
     };
     let secrets_region = || {
