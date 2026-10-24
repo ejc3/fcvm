@@ -26,6 +26,9 @@ use tokio::sync::watch;
 /// How long a tile waits before asking EC2 again after a capacity refusal.
 const CAPACITY_RETRY: Duration = Duration::from_secs(10);
 
+/// How long the EC2 side waits before trying a failed sweep again.
+const SWEEP_RETRY: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone)]
 pub struct Launched {
     pub instance: String,
@@ -61,6 +64,13 @@ pub trait Ec2Driver: Send + Sync {
     /// How long a tile waits before asking again after a capacity refusal.
     fn capacity_retry(&self) -> Duration {
         CAPACITY_RETRY
+    }
+    /// Terminate every tile instance that exists, whoever launched it, and return how many
+    /// there were. The coordinator is the only owner of tiles and keeps no instance ids
+    /// across a restart, so it runs this before its first launch and again at shutdown:
+    /// an instance an earlier coordinator left running is billed and nothing manages it.
+    async fn sweep(&self) -> Result<usize> {
+        Ok(0)
     }
 }
 
@@ -201,6 +211,23 @@ pub async fn run(
     budget: watch::Receiver<Option<BudgetBody>>,
     handle: Handle,
 ) {
+    // No tile launches before the instances an earlier coordinator left are gone.
+    loop {
+        match driver.sweep().await {
+            Ok(0) => break,
+            Ok(n) => {
+                tracing::info!(
+                    instances = n,
+                    "terminated tile instances left by an earlier coordinator"
+                );
+                break;
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "cannot sweep earlier tile instances; retrying");
+                tokio::time::sleep(SWEEP_RETRY).await;
+            }
+        }
+    }
     let running: Running = Arc::default();
     tokio::spawn(post_scenes(
         driver.clone(),
@@ -355,6 +382,10 @@ async fn tile(
                             l
                         }
                         Err(e) => {
+                            // The instance never served: terminate it and launch the
+                            // generation again after the backoff.
+                            let wait = retry;
+                            retry = (retry * 2).min(Duration::from_secs(30));
                             report(
                                 &handle,
                                 &id,
@@ -362,10 +393,16 @@ async fn tile(
                                 generation,
                                 Some(&l),
                                 &timings,
-                                Some((format!("{e:#}"), None)),
+                                Some((format!("{e:#}"), Some(wait))),
                             )
                             .await;
-                            l
+                            if let Err(e) = driver.terminate(&l.instance).await {
+                                tracing::warn!(instance = %l.instance, error = %e, "terminate failed");
+                            }
+                            if wait_or_removed(&mut want, wait).await {
+                                break;
+                            }
+                            continue;
                         }
                     };
                     current = Some((l, generation));

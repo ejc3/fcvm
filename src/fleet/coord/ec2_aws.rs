@@ -168,6 +168,21 @@ impl AwsEc2 {
     }
 }
 
+/// The text of every `<tag>` element in `xml`, in order.
+fn all_tags(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find(&open) {
+        rest = &rest[i + open.len()..];
+        let Some(j) = rest.find(&close) else { break };
+        out.push(rest[..j].to_string());
+        rest = &rest[j + close.len()..];
+    }
+    out
+}
+
 /// `<region>/<instance id>`, how a launched tile's instance is named.
 fn split(instance: &str) -> Result<(&str, &str)> {
     instance
@@ -290,6 +305,59 @@ impl Ec2Driver for AwsEc2 {
             bail!("GET {url} answered {}", r.status());
         }
         Ok(r.json().await?)
+    }
+
+    /// Every instance tagged `Purpose=fcvm-fleet-tile` that is not terminated or shutting
+    /// down, in every fleet region, terminated by id.
+    async fn sweep(&self) -> Result<usize> {
+        let mut total = 0;
+        for region in &self.regions {
+            let mut ids = Vec::new();
+            let mut next: Option<String> = None;
+            loop {
+                let mut params = vec![
+                    ("Action", "DescribeInstances".to_string()),
+                    ("Filter.1.Name", "tag:Purpose".into()),
+                    ("Filter.1.Value.1", "fcvm-fleet-tile".into()),
+                    ("Filter.2.Name", "instance-state-name".into()),
+                    ("Filter.2.Value.1", "pending".into()),
+                    ("Filter.2.Value.2", "running".into()),
+                    ("Filter.2.Value.3", "stopping".into()),
+                    ("Filter.2.Value.4", "stopped".into()),
+                ];
+                if let Some(t) = &next {
+                    params.push(("NextToken", t.clone()));
+                }
+                let xml = match self.call(region, &params).await {
+                    Ok(x) => x,
+                    Err(CallError::Capacity(e)) => bail!("{e}"),
+                    Err(CallError::Other(e)) => return Err(e),
+                };
+                ids.extend(all_tags(&xml, "instanceId"));
+                next = xml_tag(&xml, "nextToken").filter(|t| !t.is_empty());
+                if next.is_none() {
+                    break;
+                }
+            }
+            ids.sort();
+            ids.dedup();
+            if ids.is_empty() {
+                continue;
+            }
+            let mut params = vec![("Action", "TerminateInstances".to_string())];
+            let keys: Vec<String> = (1..=ids.len()).map(|i| format!("InstanceId.{i}")).collect();
+            for (k, id) in keys.iter().zip(&ids) {
+                params.push((k.as_str(), id.clone()));
+            }
+            match self.call(region, &params).await {
+                Ok(_) => {}
+                Err(CallError::Capacity(e)) => bail!("{e}"),
+                Err(CallError::Other(e)) => return Err(e),
+            }
+            tracing::info!(%region, instances = ?ids, "terminated tile instances");
+            total += ids.len();
+        }
+        Ok(total)
     }
 
     async fn terminate(&self, instance: &str) -> Result<()> {

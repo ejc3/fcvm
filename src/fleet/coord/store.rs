@@ -35,8 +35,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// One state to write; `ack` is answered once that write (and every earlier one) is done.
+/// Without `bytes` it writes nothing and only waits for the writes queued before it.
 pub struct StoreCmd {
-    pub bytes: Arc<Vec<u8>>,
+    pub bytes: Option<Arc<Vec<u8>>>,
     pub ack: Option<oneshot::Sender<()>>,
 }
 
@@ -52,16 +53,20 @@ pub fn spawn_writer(path: PathBuf) -> StoreTx {
             let mut bytes = first.bytes;
             let mut acks: Vec<oneshot::Sender<()>> = first.ack.into_iter().collect();
             while let Ok(more) = rx.try_recv() {
-                bytes = more.bytes;
+                if more.bytes.is_some() {
+                    bytes = more.bytes;
+                }
                 acks.extend(more.ack);
             }
-            let p = path.clone();
-            match tokio::task::spawn_blocking(move || write_atomic(&p, &bytes)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::error!(path = %path.display(), error = %format!("{e:#}"), "state file not written")
+            if let Some(bytes) = bytes {
+                let p = path.clone();
+                match tokio::task::spawn_blocking(move || write_atomic(&p, &bytes)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::error!(path = %path.display(), error = %format!("{e:#}"), "state file not written")
+                    }
+                    Err(e) => tracing::error!(error = %e, "state writer panicked"),
                 }
-                Err(e) => tracing::error!(error = %e, "state writer panicked"),
             }
             for a in acks {
                 let _ = a.send(());
@@ -188,11 +193,15 @@ pub fn spawn_s3_writer(obj: S3Object) -> StoreTx {
             let mut bytes = first.bytes;
             let mut acks: Vec<oneshot::Sender<()>> = first.ack.into_iter().collect();
             while let Ok(more) = rx.try_recv() {
-                bytes = more.bytes;
+                if more.bytes.is_some() {
+                    bytes = more.bytes;
+                }
                 acks.extend(more.ack);
             }
-            if let Err(e) = obj.put(&bytes).await {
-                tracing::error!(bucket = %obj.bucket, key = %obj.key, error = %format!("{e:#}"), "state not written");
+            if let Some(bytes) = bytes {
+                if let Err(e) = obj.put(&bytes).await {
+                    tracing::error!(bucket = %obj.bucket, key = %obj.key, error = %format!("{e:#}"), "state not written");
+                }
             }
             for a in acks {
                 let _ = a.send(());

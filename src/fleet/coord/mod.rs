@@ -278,21 +278,30 @@ impl Actor {
     }
 
     /// Queue the state for the writer if it changed; the returned receiver resolves once it
-    /// is on disk (at once when nothing needed writing).
-    fn store(&mut self) -> oneshot::Receiver<()> {
+    /// is written (at once when nothing needed writing). With `barrier`, an unchanged state
+    /// still waits for the writes already queued, so shutdown does not end while the
+    /// periodic store's last write is in flight.
+    fn store(&mut self, barrier: bool) -> oneshot::Receiver<()> {
         let (ack, done) = oneshot::channel();
         let Some(tx) = &self.out.store else {
             let _ = ack.send(());
             return done;
         };
         if self.state.version == self.stored {
-            let _ = ack.send(());
+            if barrier {
+                let _ = tx.send(store::StoreCmd {
+                    bytes: None,
+                    ack: Some(ack),
+                });
+            } else {
+                let _ = ack.send(());
+            }
             return done;
         }
         match serde_json::to_vec(&self.state) {
             Ok(bytes) => {
                 let _ = tx.send(store::StoreCmd {
-                    bytes: Arc::new(bytes),
+                    bytes: Some(Arc::new(bytes)),
                     ack: Some(ack),
                 });
                 self.stored = self.state.version;
@@ -466,12 +475,12 @@ impl Actor {
                 },
                 _ = snap_tick.tick() => self.publish(),
                 _ = store_tick.tick() => {
-                    drop(self.store());
+                    drop(self.store(false));
                 }
             }
         };
         self.publish();
-        let written = self.store();
+        let written = self.store(true);
         let _ = written.await;
         if let Some(ack) = ack {
             let _ = ack.send(());
@@ -833,6 +842,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             cloudflare(token)?,
         ));
     }
+    let ec2_sweep = ec2.clone();
     let (handle, _actor) = start(state, store_tx, ec2, ec2_local, power, dns_writer);
     if let Some(listen) = &args.ec2_aggregate_listen {
         let mut argv = vec![
@@ -917,6 +927,15 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     // are killed when their handles drop, and their VMs follow them (PR_SET_PDEATHSIG).
     handle.shutdown().await;
     tracing::info!("coordinator stopped; state written");
+    // The next coordinator does not know these instances; terminate them now (it also
+    // sweeps at its start, for a coordinator that was killed).
+    if let Some(d) = ec2_sweep {
+        match tokio::time::timeout(Duration::from_secs(20), d.sweep()).await {
+            Ok(Ok(n)) => tracing::info!(instances = n, "EC2 tiles terminated"),
+            Ok(Err(e)) => tracing::warn!(error = %format!("{e:#}"), "EC2 tiles not terminated"),
+            Err(_) => tracing::warn!("EC2 tiles not terminated within 20 s"),
+        }
+    }
     Ok(())
 }
 

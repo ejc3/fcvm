@@ -139,6 +139,8 @@ struct Stats {
     recent: VecDeque<(Instant, FrameTiming)>,
     frames: u64,
     tiles: Vec<serde_json::Value>,
+    /// Rounds of the compositor's loop (tests: a loop that never sleeps shows here).
+    rounds: u64,
 }
 
 pub struct Shared {
@@ -466,10 +468,13 @@ async fn pipeline(
     let swap_by = (now_ms() as f64).max(wall_of(layout.epoch_unix_ms, layout.from_frame, opts.fps))
         + opts.swap_wait.as_secs_f64() * 1000.0;
     let streams: Vec<usize> = (0..n).filter(|i| layout.tiles[*i].url.is_some()).collect();
+    // With no tile streaming no reader holds a sender, and a closed channel is always
+    // ready: stop polling it, and let the timers pace the black region.
+    let mut events_open = true;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
-            ev = ev_rx.recv() => match ev {
+            ev = ev_rx.recv(), if events_open => match ev {
                 Some(TileEvent::Up { tile, header }) => {
                     live[tile] = true;
                     tracing::info!(tile = %tile_ids[tile], w = header.width, h = header.height, "tile streaming");
@@ -484,7 +489,7 @@ async fn pipeline(
                         frames[tile].insert(k, Held { pic, header, arrived, arrived_unix_ms, decoded: Instant::now() });
                     }
                 }
-                None => {}
+                None => events_open = false,
             },
             e = enc_rx.recv() => {
                 let Some(e) = e else { anyhow::bail!("the encoder stopped") };
@@ -656,7 +661,9 @@ async fn pipeline(
         let tiles: Vec<serde_json::Value> = (0..n)
             .map(|i| serde_json::json!({"id": tile_ids[i], "streaming": live[i], "newest": frames[i].keys().next_back()}))
             .collect();
-        shared.stats.lock().unwrap().tiles = tiles;
+        let mut st = shared.stats.lock().unwrap();
+        st.tiles = tiles;
+        st.rounds += 1;
     }
 }
 
@@ -757,4 +764,66 @@ pub async fn cmd(args: FleetAggregateArgs) -> Result<()> {
     axum::serve(listener, router(shared)).await?;
     cancel.cancel();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A layout with nothing to stream (every tile black) drops the tile-event channel's
+    /// last sender before the loop starts; the loop must still sleep on its timers.
+    #[tokio::test]
+    async fn a_region_with_no_streaming_tile_does_not_spin() {
+        let shared = Shared::new();
+        let layout = Layout {
+            epoch_unix_ms: now_ms(),
+            image_aspect: 16.0 / 9.0,
+            region: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 1.0,
+                h: 1.0,
+            },
+            tiles: vec![TileSpec {
+                id: "t0".into(),
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 1.0,
+                    h: 1.0,
+                },
+                url: None,
+            }],
+            generation: 1,
+            from_frame: 0,
+        };
+        let opts = Options {
+            image_height: 36,
+            ..Options::default()
+        };
+        let (_publish_tx, publish) = watch::channel(true);
+        let (_until_tx, until) = watch::channel(i64::MAX);
+        let gate = Gate {
+            publish,
+            until,
+            ready: None,
+        };
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(pipeline(
+            shared.clone(),
+            Arc::new(codec::Raw),
+            opts,
+            layout,
+            gate,
+            cancel.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        cancel.cancel();
+        task.await.unwrap().unwrap();
+        let s = shared.stats.lock().unwrap();
+        // The 5 ms tick, 30 encoded frames a second and the encoder's outputs wake it about
+        // 160 times in 500 ms; a loop that does not wait runs many thousands of rounds.
+        assert!(s.rounds < 1000, "{} compositor rounds in 500 ms", s.rounds);
+        assert!(s.frames > 0, "the black region was not encoded");
+    }
 }

@@ -1033,6 +1033,177 @@ async fn shutdown_writes_the_last_state_to_the_state_file() {
         .unwrap();
 }
 
+/// The periodic store has queued the newest state and its write is still running when
+/// the coordinator is stopped: shutdown must wait for that write, not report the state
+/// written while it is not.
+#[tokio::test]
+async fn shutdown_waits_for_a_state_write_already_in_flight() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<store::StoreCmd>();
+    let written = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+    let w2 = written.clone();
+    // A slow writer: each write takes 2 s, then it is recorded and acknowledged.
+    tokio::spawn(async move {
+        while let Some(cmd) = rx.recv().await {
+            if let Some(b) = &cmd.bytes {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                w2.lock().unwrap().push(b.len());
+            }
+            if let Some(a) = cmd.ack {
+                let _ = a.send(());
+            }
+        }
+    });
+    let (handle, actor) = start(
+        State::new(
+            Config {
+                light_interval_ms: 0,
+                ..Config::default()
+            },
+            1_000,
+        ),
+        Some(tx),
+        None,
+        None,
+        None,
+        None,
+    );
+    // Let the first store tick (at start, an unchanged state) pass, then change the state.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    handle
+        .apply(Event::Intent {
+            at: 0,
+            viewer: "v-1".into(),
+            client: Some("198.51.100.9".into()),
+            id: "l-0".into(),
+            name: "light".into(),
+            args: light(0.0),
+            check: None,
+            secret: None,
+        })
+        .await
+        .unwrap();
+    // The next store tick (1 s) queues the write; stop while it is running.
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    assert!(
+        written.lock().unwrap().is_empty(),
+        "the write is still running"
+    );
+    handle.shutdown().await;
+    assert_eq!(
+        written.lock().unwrap().len(),
+        1,
+        "shutdown returned before the queued write finished"
+    );
+    tokio::time::timeout(Duration::from_secs(5), actor)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// A tile whose instance never serves its renderer is terminated and launched again,
+/// instead of staying failed until someone relaunches it.
+struct NotReadyOnceEc2 {
+    launches: std::sync::atomic::AtomicU64,
+    terminated: Arc<std::sync::Mutex<Vec<String>>>,
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ec2::Ec2Driver for NotReadyOnceEc2 {
+    async fn launch(&self, _tile: &str) -> Result<ec2::Launched, ec2::LaunchError> {
+        let n = self
+            .launches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.calls.lock().unwrap().push("launch".into());
+        Ok(ec2::Launched {
+            instance: format!("i-test-{n}"),
+            frame_url: None,
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        if l.instance == "i-test-0" {
+            anyhow::bail!("i-test-0 did not serve /health");
+        }
+        Ok(l.clone())
+    }
+    async fn terminate(&self, instance: &str) -> anyhow::Result<()> {
+        self.terminated.lock().unwrap().push(instance.to_string());
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_budget(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn health(&self, _tile: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("no renderer")
+    }
+    async fn sweep(&self) -> anyhow::Result<usize> {
+        self.calls.lock().unwrap().push("sweep".into());
+        Ok(0)
+    }
+}
+
+#[tokio::test]
+async fn an_ec2_tile_that_never_gets_ready_is_terminated_and_launched_again() {
+    let config = Config {
+        ec2_max: 1,
+        max_tiles: 1,
+        ..Config::default()
+    };
+    let terminated = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let driver: Arc<dyn ec2::Ec2Driver> = Arc::new(NotReadyOnceEc2 {
+        launches: Default::default(),
+        terminated: terminated.clone(),
+        calls: calls.clone(),
+    });
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        Some(driver),
+        None,
+        None,
+        None,
+    );
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 1);
+    agent.assign().await;
+    agent.report("slot-1", "running", 1);
+    let mut snaps = handle.snapshot.clone();
+    let s = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let v: Value = serde_json::from_str(&snaps.borrow_and_update().text).unwrap();
+            let s = v["state"].clone();
+            if s["tiles"][1]["phase"] == "running" {
+                return s;
+            }
+            snaps.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the tile runs after its first instance failed readiness");
+    assert_eq!(s["tiles"][1]["vm"], "i-test-1");
+    assert_eq!(*terminated.lock().unwrap(), vec!["i-test-0".to_string()]);
+    // The EC2 side swept for instances an earlier coordinator left before it launched any.
+    assert_eq!(
+        calls.lock().unwrap()[..2],
+        ["sweep".to_string(), "launch".to_string()]
+    );
+}
+
 /// EC2 refuses capacity for the race's first three launches; the tile records how long it
 /// waited, and the EC2 half's race time leaves that wait out.
 struct ScarceEc2 {
@@ -1526,6 +1697,8 @@ type Ec2Call = (String, BTreeMap<String, String>);
 #[derive(Clone, Default)]
 struct FakeEc2Api {
     spot_capacity: Vec<String>,
+    /// Per region, the instances a tag-filtered DescribeInstances finds.
+    tagged: BTreeMap<String, Vec<String>>,
     calls: Arc<std::sync::Mutex<Vec<Ec2Call>>>,
 }
 
@@ -1576,6 +1749,16 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
                         }
                         (StatusCode::OK, "<RunInstancesResponse><instancesSet><item><instanceId>i-0123456789abcdef0</instanceId></item></instancesSet></RunInstancesResponse>".into())
                     }
+                    "DescribeInstances" if params.contains_key("Filter.1.Name") => {
+                        let items: String = api
+                            .tagged
+                            .get(&region)
+                            .into_iter()
+                            .flatten()
+                            .map(|id| format!("<item><instancesSet><item><instanceId>{id}</instanceId><instanceState><code>16</code><name>running</name></instanceState></item></instancesSet></item>"))
+                            .collect();
+                        (StatusCode::OK, format!("<DescribeInstancesResponse><reservationSet>{items}</reservationSet></DescribeInstancesResponse>"))
+                    }
                     "DescribeInstances" => (StatusCode::OK, "<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>i-0123456789abcdef0</instanceId><instanceState><code>16</code><name>running</name></instanceState><ipAddress>127.0.0.1</ipAddress><ipv6Address>2001:db8::5</ipv6Address></item></instancesSet></item></reservationSet></DescribeInstancesResponse>".into()),
                     "TerminateInstances" => (StatusCode::OK, "<TerminateInstancesResponse/>".into()),
                     _ => error("InvalidAction"),
@@ -1587,6 +1770,59 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
     let base = format!("http://{}", l.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
     base
+}
+
+/// A restarted coordinator does not know the tile instances an earlier one launched:
+/// `sweep` finds every instance tagged `Purpose=fcvm-fleet-tile` that is not terminated, in
+/// every fleet region, and terminates them.
+#[tokio::test]
+async fn the_aws_tile_driver_sweeps_every_tagged_tile_instance() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    use fcvm::fleet::coord::ec2_aws::AwsEc2;
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let api = FakeEc2Api {
+        tagged: BTreeMap::from([(
+            "us-east-1".to_string(),
+            vec![
+                "i-0aaaaaaaaaaaaaaa1".to_string(),
+                "i-0aaaaaaaaaaaaaaa2".to_string(),
+            ],
+        )]),
+        ..Default::default()
+    };
+    let base = fake_ec2_api(api.clone()).await;
+    let regions = vec!["us-east-1".to_string(), "us-west-2".to_string()];
+    let mut d = AwsEc2::new(
+        regions.clone(),
+        "fcvm-fleet-tile-x86_64".into(),
+        None,
+        "fcvm.example".into(),
+    )
+    .unwrap();
+    for r in &regions {
+        d.endpoints.insert(r.clone(), base.clone());
+    }
+    assert_eq!(d.sweep().await.unwrap(), 2);
+    let calls = api.calls.lock().unwrap();
+    let describes: Vec<&Ec2Call> = calls
+        .iter()
+        .filter(|(_, p)| p["Action"] == "DescribeInstances")
+        .collect();
+    assert_eq!(describes.len(), 2, "one tag-filtered describe per region");
+    for (_, p) in &describes {
+        assert_eq!(p["Filter.1.Name"], "tag:Purpose");
+        assert_eq!(p["Filter.1.Value.1"], "fcvm-fleet-tile");
+        assert_eq!(p["Filter.2.Name"], "instance-state-name");
+    }
+    let terminates: Vec<&Ec2Call> = calls
+        .iter()
+        .filter(|(_, p)| p["Action"] == "TerminateInstances")
+        .collect();
+    assert_eq!(terminates.len(), 1, "nothing to terminate in us-west-2");
+    assert_eq!(terminates[0].0, "us-east-1");
+    assert_eq!(terminates[0].1["InstanceId.1"], "i-0aaaaaaaaaaaaaaa1");
+    assert_eq!(terminates[0].1["InstanceId.2"], "i-0aaaaaaaaaaaaaaa2");
 }
 
 /// The AWS tile driver: a spot launch from the template, tagged, in the first region with
