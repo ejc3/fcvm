@@ -26,6 +26,7 @@ pub const HOST_POINTS: &[&str] = &[
     "snapshot.post_balloon_read_pre_save",
     "snapshot.post_save_pre_resume",
     "snapshot.pre_pause",
+    "snapshot.startup.pre_create",
     "teardown.pre_kill",
     "teardown.pre_remove_data_dir",
 ];

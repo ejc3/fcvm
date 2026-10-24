@@ -2856,6 +2856,10 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         info!(snapshot_key = %startup_key, "Startup snapshot already exists, skipping");
                     } else {
                         info!(snapshot_key = %startup_key, "Creating startup snapshot (VM healthy)");
+                        // failpoint: hold between the existence check above and the
+                        // create's generation lock, where another process can install
+                        // the same content-addressed snapshot first.
+                        failpoint::hit_async("snapshot.startup.pre_create").await;
 
                         // Use select! so SIGTERM can abort startup snapshot immediately.
                         // This is safe: startup snapshots are optional (just caching), so
