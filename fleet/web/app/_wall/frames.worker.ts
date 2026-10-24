@@ -689,12 +689,16 @@ function draw(): void {
     answerCaptures(null);
     return;
   }
-  // Paused, the picture holds the frozen choice. A source shown since it was taken (an
-  // opened tile) is not in it, so once that source has a frame the choice is taken again
-  // over what is shown now, and held from then on.
+  // Paused, the picture holds the frozen choice while every frame it names still exists.
+  // It is taken again over what is shown now when a shown source is not in it (an opened
+  // tile, once its stream has a frame) or the frame it names is gone (suspension closed
+  // the streams and dropped their frames), and held from then on.
   const unfrozen = plan.paused && (plan.focus ? [plan.focus] : sourcesOf(shownMode)).some((src) => {
     const st = src.box !== null ? streamOf(src) : undefined;
-    return st !== undefined && !lastChoice.show.has(src.id) && st.frames.some((h) => fitsPlan(h, src, plan));
+    if (st === undefined) return false;
+    if (!lastChoice.show.has(src.id)) return st.frames.some((h) => fitsPlan(h, src, plan));
+    const t = shownT(lastChoice.show.get(src.id));
+    return t !== null && st.frameAt(t) === null;
   });
   // Paused: the picture holds what it shows; only a new plan, a size or a newly shown source redraws it.
   if (plan.paused && !unfrozen && !dirty && captures.length === 0) return;

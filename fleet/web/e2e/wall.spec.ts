@@ -926,6 +926,45 @@ test("coming back to the tab holds the last picture, then fades the live image i
   expect(trace.at(-1)!.held).toBe(false);
 });
 
+test("a paused wall hidden past the limit comes back with a picture, and holds it", async ({ page }) => {
+  await visibility.install(page);
+  await page.addInitScript(() => window.localStorage.setItem("fleet-wall.mode", "direct"));
+  await page.goto("/?debug=1&hidden_ms=800");
+  await page.waitForFunction(() => window.__fleet !== undefined);
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBe(15);
+  await page.getByTestId("pause").click();
+  await expect(page.getByTestId("pause")).toHaveAttribute("aria-pressed", "true");
+  await visibility.set(page, "hidden");
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().ui.suspended)).toBe(true);
+  // Suspension closed every stream and dropped its frames; the frozen choice still names them.
+  await expect.poll(subscribers, { timeout: 5000 }).toBe(0);
+  await page.evaluate(() => window.__fleet!.client.traceStart());
+  await visibility.set(page, "visible");
+  await expect.poll(subscribers, { timeout: 15_000 }).toBe(15);
+  // Past the hold and its fade.
+  await page.waitForTimeout(4000);
+  const trace = await page.evaluate(() => window.__fleet!.client.traceStop());
+  // No region drawn without a frame: the frozen choice named frames suspension had dropped.
+  expect(trace.filter((e) => e.missing > 0)).toEqual([]);
+  // The picture is the reopened streams' frames, held while still paused: no tile is the flat empty fill (6,8,11).
+  const T = await page.evaluate(() => window.__fleet!.client.getState().frames!.T);
+  await page.waitForTimeout(1200);
+  const pts = await page.evaluate(() =>
+    window.__fleet!.view().tiles.filter((t) => !t.dark && t.box).flatMap((t) =>
+      Array.from({ length: 25 }, (_, k) => ({ id: t.id, x: t.box!.x + (t.box!.w * (1 + (k % 5))) / 6, y: t.box!.y + (t.box!.h * (1 + Math.floor(k / 5))) / 6 })),
+    ),
+  );
+  const res = await page.evaluate((p) => window.__fleet!.client.capture(p), pts.map(({ x, y }) => ({ x, y })));
+  expect(res.T).toBe(T);
+  const flat = new Map<string, number>();
+  pts.forEach((pt, i) => {
+    const px = res.pixels[i]!;
+    if (px[0] === 6 && px[1] === 8 && px[2] === 11) flat.set(pt.id, (flat.get(pt.id) ?? 0) + 1);
+  });
+  for (const id of new Set(pts.map((pt) => pt.id))) expect(flat.get(id) ?? 0, `tile ${id}: points drawn as the empty fill, of 25`).toBeLessThan(13);
+  await expect(page.getByTestId("pause")).toHaveAttribute("aria-pressed", "true");
+});
+
 const reelDate = async () => utcDate(((await (await fetch(`${COORD}/media/wall-reel.json`)).json()) as { recorded_at: number }).recorded_at);
 const power = async () => ((await mockState()).state as unknown as { fleet: { power: { state: string } } }).fleet.power.state;
 const sleepNow = () => admin("/mock/power", { sleep: true, hold: true });
