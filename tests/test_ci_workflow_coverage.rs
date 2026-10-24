@@ -1346,6 +1346,13 @@ fn path_classification_holds_on_both_sides_of_the_bench_arm() {
 /// `gh` is never reached on the fail-open paths (they exit before the API
 /// call), which is exactly what makes those paths testable here.
 fn run_changes_step(event: &str) -> String {
+    run_changes_step_with_files(event, None)
+}
+
+/// As `run_changes_step`, with a stand-in `gh` on PATH that reports `files` as the
+/// pull request's changed files (`Some(&[])` reports none), so the pull_request
+/// path runs end to end through its `$GITHUB_OUTPUT` writes.
+fn run_changes_step_with_files(event: &str, files: Option<&[&str]>) -> String {
     let ci = parse_workflow("ci.yml");
     let run = workflow_job(&ci, "changes")
         .get("steps")
@@ -1357,12 +1364,31 @@ fn run_changes_step(event: &str) -> String {
         .expect("`changes` job no longer classifies paths — update this test")
         .to_string();
 
-    let dir = std::env::temp_dir().join(format!("fcvm-changes-{}-{event}", std::process::id()));
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "fcvm-changes-{}-{event}-{}",
+        std::process::id(),
+        CALLS.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let out_file = dir.join("github_output");
     std::fs::write(&out_file, "").expect("seed GITHUB_OUTPUT");
 
-    let status = std::process::Command::new("bash")
+    let mut command = std::process::Command::new("bash");
+    if let Some(files) = files {
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).expect("stub bin dir");
+        let gh = bin.join("gh");
+        let mut script = String::from("#!/bin/sh\n");
+        for f in files {
+            script.push_str(&format!("printf '%s\\n' '{f}'\n"));
+        }
+        std::fs::write(&gh, script).expect("write stub gh");
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).expect("chmod gh");
+        let path = std::env::var("PATH").unwrap_or_default();
+        command.env("PATH", format!("{}:{path}", bin.display()));
+    }
+    let status = command
         .arg("-c")
         .arg(&run)
         .env("EVENT", event)
@@ -1406,7 +1432,100 @@ fn a_fail_open_opens_the_bench_gate_too() {
             "event {event}: fail-open set code but left bench unset, so bench-tests \
              is skipped and its lints never run: {outputs:?}"
         );
+        assert!(
+            outputs.contains("fleet=true"),
+            "event {event}: fail-open left fleet unset, so fleet-renderer is skipped: {outputs:?}"
+        );
     }
+    // A pull request whose file list comes back empty fails open the same way.
+    let outputs = run_changes_step_with_files("pull_request", Some(&[]));
+    for gate in ["code", "bench", "fleet"] {
+        assert!(
+            outputs.lines().any(|l| l == format!("{gate}=true")),
+            "an empty changed-file list left `{gate}` closed: {outputs:?}"
+        );
+    }
+}
+
+/// A renderer-only pull request runs the renderer's host tests and not the VM matrix.
+///
+/// fleet/renderer is C++ and CUDA that fcvm never builds. Before the `fleet` output
+/// its changes set no gate at all, so a renderer PR ran nothing that could fail for
+/// it, and before #1206 it ran the five self-hosted VM jobs, none of which read it.
+#[test]
+fn a_renderer_change_runs_the_fleet_renderer_job_and_not_the_matrix() {
+    for files in [
+        &[
+            "fleet/renderer/src/render.cu",
+            "fleet/renderer/tests/test_host.cpp",
+        ][..],
+        &["fleet/renderer/README.md"][..],
+        &["fleet/tools/gpubox.sh", "fleet/PROTOCOL.md"][..],
+    ] {
+        let outputs = run_changes_step_with_files("pull_request", Some(files));
+        let lines: Vec<&str> = outputs.lines().collect();
+        for (gate, want) in [("code", false), ("bench", false), ("fleet", true)] {
+            assert!(
+                lines.contains(&format!("{gate}={want}").as_str()),
+                "{files:?}: expected {gate}={want}, got {outputs:?}"
+            );
+        }
+    }
+    // fleet/core is built by fcvm, so it runs the matrix; mixed with a renderer path, both.
+    let outputs = run_changes_step_with_files(
+        "pull_request",
+        Some(&["fleet/core/src/protocol.rs", "fleet/renderer/src/scene.cpp"]),
+    );
+    assert!(
+        outputs.lines().any(|l| l == "code=true") && outputs.lines().any(|l| l == "fleet=true"),
+        "a PR touching fleet/core and fleet/renderer must run the matrix and fleet-renderer: \
+         {outputs:?}"
+    );
+    let outputs = run_changes_step_with_files("pull_request", Some(&["fleet/core/Cargo.toml"]));
+    assert!(
+        outputs.lines().any(|l| l == "fleet=false"),
+        "fleet/core alone does not touch the renderer: {outputs:?}"
+    );
+    // This file holds the job, so a change to it runs the job.
+    let outputs = run_changes_step_with_files("pull_request", Some(&[".github/workflows/ci.yml"]));
+    assert!(
+        outputs.lines().any(|l| l == "fleet=true"),
+        "a ci.yml-only change does not run fleet-renderer, so a broken job merges green: \
+         {outputs:?}"
+    );
+
+    let ci = parse_workflow("ci.yml");
+    let job = workflow_job(&ci, "fleet-renderer");
+    let condition = job
+        .get("if")
+        .and_then(Value::as_str)
+        .expect("`fleet-renderer` has no `if:`");
+    assert!(
+        condition.contains("needs.changes.outputs.fleet == 'true'"),
+        "`fleet-renderer` does not gate on `changes.outputs.fleet` ({condition:?})"
+    );
+    assert_eq!(
+        job.get("runs-on").and_then(Value::as_str),
+        Some("ubuntu-latest"),
+        "`fleet-renderer` needs no KVM and must not take a self-hosted runner"
+    );
+    let script = format!("{:?}", job.get("steps"));
+    assert!(
+        script.contains("make -C fleet/renderer test-host"),
+        "`fleet-renderer` no longer runs the renderer's host tests"
+    );
+    let summary_needs: Vec<&str> = workflow_job(&ci, "summary")
+        .get("needs")
+        .and_then(Value::as_sequence)
+        .expect("`summary` has no needs")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        summary_needs.contains(&"fleet-renderer"),
+        "`summary` does not depend on `fleet-renderer`, so a failing renderer test would not \
+         fail the run's required check"
+    );
 }
 
 /// A rename must be classified by where it came FROM as well as where it went.
