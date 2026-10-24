@@ -60,8 +60,11 @@ jobs:
       - name: Staging stays behind Access
         run: |
           set -uo pipefail
-          out=$(curl -sS -o /dev/null --max-time 20 -w '%{http_code} %{redirect_url}' https://stage.fcvm.dev/ 2>&1)
-          echo "stage.fcvm.dev: $out"
+          # The step runs under -e: a curl failure (6 when the host does not resolve) must
+          # reach the case below, not end the step.
+          rc=0
+          out=$(curl -sS -o /dev/null --max-time 20 -w '%{http_code} %{redirect_url}' https://stage.fcvm.dev/ 2>&1) || rc=$?
+          echo "stage.fcvm.dev: $out (curl exit $rc)"
           case "$out" in
             "302 https://"*".cloudflareaccess.com/"*) echo "behind Access" ;;
             *"Could not resolve host"*) echo "no custom domain yet (ejc3/aws#627): not reachable" ;;

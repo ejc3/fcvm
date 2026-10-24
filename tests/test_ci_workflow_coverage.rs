@@ -2374,3 +2374,73 @@ fn cleaning_test_data_keeps_the_test_logs() {
         "clean-test-data deletes the test logs, which CI uploads after running it: {deletes_logs:?}"
     );
 }
+
+/// Run the fleet-web-deploy job's Access check with a stub `curl`, under the
+/// flags GitHub gives a `shell: bash` step (`bash --noprofile --norc -e -o
+/// pipefail`), and return its exit status and stdout.
+fn run_access_check(curl_stdout: &str, curl_exit: i32) -> (i32, String) {
+    let deploy = parse_workflow("fleet-web-deploy.yml");
+    let run = workflow_job(&deploy, "deploy")
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("`deploy` job has no `steps:`")
+        .iter()
+        .find(|s| s.get("name").and_then(Value::as_str) == Some("Staging stays behind Access"))
+        .and_then(|s| s.get("run").and_then(Value::as_str))
+        .expect("`deploy` job has no `Staging stays behind Access` step — update this test")
+        .to_string();
+
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "fcvm-access-check-{}-{}",
+        std::process::id(),
+        CALLS.fetch_add(1, Ordering::Relaxed)
+    ));
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("stub bin dir");
+    let curl = bin.join("curl");
+    std::fs::write(
+        &curl,
+        format!("#!/bin/sh\nprintf '%s' '{curl_stdout}'\nexit {curl_exit}\n"),
+    )
+    .expect("write stub curl");
+    std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).expect("chmod curl");
+    let path = std::env::var("PATH").unwrap_or_default();
+    let out = std::process::Command::new("bash")
+        .args(["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", &run])
+        .env("PATH", format!("{}:{path}", bin.display()))
+        .output()
+        .expect("run the Access check");
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// The deploy's last step passes only when stage.fcvm.dev answers an
+/// unauthenticated request with the Access login redirect, or does not resolve
+/// (before the custom domain exists), and fails on anything else.
+///
+/// The first deploy (run 40065715105) failed with exit code 6 and printed
+/// nothing: GitHub runs the step with `-e`, so `out=$(curl ...)` aborted the step
+/// on curl's own exit status before the "does not resolve" case was reached.
+#[test]
+fn the_staging_access_check_passes_access_and_an_unresolved_host_and_fails_anything_else() {
+    let (code, out) = run_access_check(
+        "302 https://example-team.cloudflareaccess.com/cdn-cgi/access/login",
+        0,
+    );
+    assert_eq!(code, 0, "the Access redirect must pass: {out}");
+    assert!(out.contains("behind Access"), "{out}");
+
+    let (code, out) = run_access_check("000 curl: (6) Could not resolve host: stage.fcvm.dev", 6);
+    assert_eq!(code, 0, "a host that does not resolve must pass: {out}");
+    assert!(out.contains("no custom domain yet"), "{out}");
+
+    let (code, out) = run_access_check("200 ", 0);
+    assert_eq!(code, 1, "a page served without Access must fail: {out}");
+
+    let (code, out) = run_access_check("000 curl: (28) Operation timed out", 28);
+    assert_eq!(code, 1, "any other curl failure must fail: {out}");
+}
