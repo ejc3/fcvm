@@ -25,7 +25,7 @@ import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type FleetState, type
 import { KIND_TAG, NOT_AWAKE_NOTE, scoreView, type ScoreView } from "./race.ts";
 import { sceneUnixMs } from "./scene.ts";
 import { reelView, type ReelMeta, type ReelView } from "./reel.ts";
-import type { ClientState, GpuSample, Notice, StreamMode } from "./store.ts";
+import type { ClientState, FrameStats, GpuSample, Notice, StreamMode } from "./store.ts";
 
 export const SITE = "fcvm.dev";
 export const TITLE = "Every GPU, live";
@@ -1190,6 +1190,19 @@ export function shownTilesOf(s: ClientState, canDecode: boolean): Tile[] {
   return canDecode ? drawnTiles(s) : s.accepted?.tiles ?? [];
 }
 
+/**
+ * The live image is whole: the drawer says every region it draws has shown a frame, and
+ * its report covers every region of the newest plan. The drawer reports every 500 ms, and
+ * a wake's last snapshot both says "awake" and opens the last region's stream, so the
+ * report alone would let the recording leave over a region with no frame yet.
+ */
+export function imageWhole(plan: DrawPlan, frames: FrameStats | null): boolean {
+  if (!frames?.allLive) return false;
+  const live = new Set(frames.live);
+  const drawn = (frames.mode === "direct" ? plan.direct : plan.aggregated).filter((x) => x.box !== null && x.url !== null);
+  return drawn.length > 0 && drawn.every((x) => live.has(`${x.id} ${x.baseUrl ?? ""}`));
+}
+
 /** The tile under an image point, as the pointer targets it: the one drawn there. */
 export function pointerTile(s: ClientState, canDecode: boolean, u: number, v: number): Tile | null {
   return tileAt(shownTilesOf(s, canDecode), u, v);
@@ -1408,7 +1421,7 @@ export function wallView(input: WallInput): WallView {
           meta: input.media.meta,
           power: st.fleet.power.state,
           reelOn: s.ui.reelOn,
-          allLive: s.frames?.allLive ?? false,
+          allLive: imageWhole(plan, s.frames),
           reducedMotion: input.reducedMotion ?? false,
           saveData: input.saveData ?? false,
         })
