@@ -49,6 +49,8 @@ impl std::str::FromStr for Group {
 pub trait ScaleDriver: Send + Sync {
     async fn set_desired(&self, group: &Group, desired: u32) -> Result<()>;
     async fn instances(&self, group: &Group) -> Result<Vec<ScaleInstance>>;
+    /// The group's desired capacity now.
+    async fn desired(&self, group: &Group) -> Result<u32>;
 }
 
 /// The groups, their awake capacity, and how often to poll while waking.
@@ -100,19 +102,24 @@ pub fn is_live(i: &ScaleInstance) -> bool {
     !i.lifecycle.starts_with("Terminat") && !i.lifecycle.starts_with("Detach")
 }
 
-/// One spot group's fallback to its on-demand group during a wake.
+/// One spot group's fallback to its on-demand group.
 #[derive(Debug, Default)]
 pub struct Fallback {
     short_since: Option<Instant>,
-    applied: Option<(u32, u32)>,
+    /// The (spot, on-demand) split in force: decided by a fallback, or found at a wake.
+    target: Option<(u32, u32)>,
+    /// Whether both capacities of `target` were set.
+    applied: bool,
 }
 
 impl Fallback {
-    /// After a poll of a waking fleet: the desired capacities (spot, on-demand) to set, once
-    /// the two groups' live instances have stayed below `want` for `wait`. The spot group
-    /// is held at what it has and the on-demand group takes the rest, so the two never ask
-    /// for more than `want` together. `None` while they are not short, before `wait` has
-    /// passed, or when the same capacities were already set.
+    /// After a poll of a waking fleet: the desired capacities (spot, on-demand) to set.
+    /// A split not yet fully set is asked for again whatever the instances are, so a write
+    /// that failed half way is retried until both groups hold it. Otherwise, once the two
+    /// groups' live instances have stayed below `want` for `wait`, the spot group is held
+    /// at what it has and the on-demand group takes the rest, so the two never ask for
+    /// more than `want` together. `None` while they are not short, before `wait` has
+    /// passed, or when that split is already in force.
     pub fn observe(
         &mut self,
         now: Instant,
@@ -121,6 +128,9 @@ impl Fallback {
         on_demand_live: u32,
         wait: Duration,
     ) -> Option<(u32, u32)> {
+        if let Some(t) = self.pending() {
+            return Some(t);
+        }
         if spot_live.saturating_add(on_demand_live) >= want {
             self.short_since = None;
             return None;
@@ -130,12 +140,32 @@ impl Fallback {
             return None;
         }
         let target = (spot_live, want - spot_live);
-        (self.applied != Some(target)).then_some(target)
+        if self.target == Some(target) {
+            return None;
+        }
+        self.target = Some(target);
+        self.applied = false;
+        Some(target)
+    }
+
+    /// The split to set, while it is not fully set.
+    pub fn pending(&self) -> Option<(u32, u32)> {
+        self.target.filter(|_| !self.applied)
     }
 
     /// Both capacities of `target` were set.
     pub fn applied(&mut self, target: (u32, u32)) {
-        self.applied = Some(target);
+        if self.target == Some(target) {
+            self.applied = true;
+        }
+    }
+
+    /// At a wake, the on-demand group already holds `on_demand` (a fallback made before a
+    /// restart): keep it, up to `want`, and hold the spot group at the rest.
+    pub fn adopt(&mut self, want: u32, on_demand: u32) {
+        let od = on_demand.min(want);
+        self.target = Some((want - od, od));
+        self.applied = false;
     }
 }
 
@@ -147,7 +177,8 @@ pub async fn run(cfg: PowerConfig, mut power: watch::Receiver<String>, handle: H
     let on_demand = |i: usize| cfg.on_demand.get(i).cloned().flatten();
     let mut set: Option<u32> = None;
     let mut fallbacks: Vec<Fallback> = cfg.groups.iter().map(|_| Fallback::default()).collect();
-    let mut fallback_ok = true;
+    // A degraded `scale` was reported and not cleared yet.
+    let mut reported = false;
     loop {
         let state = power.borrow_and_update().clone();
         let want = if state == "asleep" {
@@ -155,74 +186,114 @@ pub async fn run(cfg: PowerConfig, mut power: watch::Receiver<String>, handle: H
         } else {
             cfg.awake_capacity
         };
+        let mut newly_set = false;
         if set != Some(want) {
             let mut ok = true;
-            for (i, g) in cfg.groups.iter().enumerate() {
-                // Asleep, the on-demand group goes to 0 with its spot group; awake, only a
-                // fallback raises it.
-                let od = on_demand(i).filter(|_| want == 0);
-                for g in std::iter::once(g).chain(od.as_ref()) {
-                    if let Err(e) = cfg.driver.set_desired(g, want).await {
-                        ok = false;
-                        degraded(&handle, g, &e).await;
-                    } else {
-                        tracing::info!(group = %g.name, region = %g.region, desired = want, "desired capacity set");
-                    }
-                }
-            }
             if want == 0 {
                 fallbacks.iter_mut().for_each(|f| *f = Fallback::default());
             }
+            for (i, g) in cfg.groups.iter().enumerate() {
+                let od = on_demand(i);
+                let result = match (&od, want) {
+                    // Asleep, the on-demand group goes to 0 with its spot group.
+                    (Some(od), 0) => async {
+                        cfg.driver.set_desired(g, 0).await?;
+                        cfg.driver.set_desired(od, 0).await
+                    }
+                    .await,
+                    // Awake, read both groups first: an on-demand group that already holds
+                    // hosts (a fallback made before a restart) keeps them, and the spot group
+                    // is held at the rest by the fallback write below.
+                    (Some(od), _) => async {
+                        let od_now = cfg.driver.desired(od).await?;
+                        let spot_now = cfg.driver.desired(g).await?;
+                        if od_now > 0 {
+                            fallbacks[i].adopt(want, od_now);
+                            tracing::warn!(spot_group = %g.name, on_demand_group = %od.name, on_demand = od_now, "the on-demand group holds hosts; keeping that fallback");
+                            Ok(())
+                        } else if spot_now != want {
+                            cfg.driver.set_desired(g, want).await
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    .await,
+                    (None, _) => cfg.driver.set_desired(g, want).await,
+                };
+                match result {
+                    Ok(()) => {
+                        tracing::info!(group = %g.name, region = %g.region, power_target = want, "group set for the power state")
+                    }
+                    Err(e) => {
+                        ok = false;
+                        reported = true;
+                        degraded(&handle, g, &e).await;
+                    }
+                }
+            }
             if ok {
                 set = Some(want);
-                healthy(&handle).await;
+                newly_set = true;
             }
         }
-        if state == "waking" {
+        if state != "asleep" {
+            let waking = state == "waking";
             let mut all = Vec::new();
-            fallback_ok = true;
             for (i, g) in cfg.groups.iter().enumerate() {
-                let spot = match cfg.driver.instances(g).await {
-                    Ok(i) => i,
-                    Err(e) => {
-                        tracing::warn!(group = %g.name, error = %format!("{e:#}"), "describing the group failed");
-                        continue;
+                let od = on_demand(i);
+                let mut target = fallbacks[i].pending();
+                if waking {
+                    let spot_live = match cfg.driver.instances(g).await {
+                        Ok(i) => {
+                            let n = i.iter().filter(|i| is_live(i)).count() as u32;
+                            all.extend(i);
+                            Some(n)
+                        }
+                        Err(e) => {
+                            tracing::warn!(group = %g.name, error = %format!("{e:#}"), "describing the group failed");
+                            None
+                        }
+                    };
+                    // A group that cannot be described is not known to be short: no new
+                    // fallback (a split already decided is still written).
+                    let od_live = match &od {
+                        Some(od) => match cfg.driver.instances(od).await {
+                            Ok(i) => {
+                                let n = i.iter().filter(|i| is_live(i)).count() as u32;
+                                all.extend(i);
+                                Some(n)
+                            }
+                            Err(e) => {
+                                tracing::warn!(group = %od.name, error = %format!("{e:#}"), "describing the group failed");
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    if let (Some(s), Some(o)) = (spot_live, od_live) {
+                        target = fallbacks[i].observe(
+                            Instant::now(),
+                            cfg.awake_capacity,
+                            s,
+                            o,
+                            cfg.spot_wait,
+                        );
                     }
-                };
-                let spot_live = spot.iter().filter(|i| is_live(i)).count() as u32;
-                all.extend(spot);
-                let Some(od) = on_demand(i) else { continue };
-                // A group that cannot be described is not known to be short: no fallback.
-                let od_instances = match cfg.driver.instances(&od).await {
-                    Ok(i) => i,
-                    Err(e) => {
-                        tracing::warn!(group = %od.name, error = %format!("{e:#}"), "describing the group failed");
-                        continue;
-                    }
-                };
-                let od_live = od_instances.iter().filter(|i| is_live(i)).count() as u32;
-                all.extend(od_instances);
-                let Some((spot_to, od_to)) = fallbacks[i].observe(
-                    Instant::now(),
-                    cfg.awake_capacity,
-                    spot_live,
-                    od_live,
-                    cfg.spot_wait,
-                ) else {
+                }
+                let (Some(od), Some((spot_to, od_to))) = (od, target) else {
                     continue;
                 };
                 tracing::warn!(
                     spot_group = %g.name, on_demand_group = %od.name, region = %g.region,
-                    spot_live, on_demand_live = od_live, want = cfg.awake_capacity,
-                    wait_s = cfg.spot_wait.as_secs(),
-                    "spot group short after the wait; the on-demand group takes the shortfall"
+                    spot = spot_to, on_demand = od_to, want = cfg.awake_capacity,
+                    "setting the on-demand fallback split"
                 );
-                // The on-demand group first: if holding the spot group then fails, the
-                // next poll sets both again.
+                // The on-demand group first; the split stays pending until both are set.
                 let mut ok = true;
                 for (grp, to) in [(&od, od_to), (g, spot_to)] {
                     if let Err(e) = cfg.driver.set_desired(grp, to).await {
                         ok = false;
+                        reported = true;
                         degraded(&handle, grp, &e).await;
                         break;
                     }
@@ -230,19 +301,25 @@ pub async fn run(cfg: PowerConfig, mut power: watch::Receiver<String>, handle: H
                 }
                 if ok {
                     fallbacks[i].applied((spot_to, od_to));
-                } else {
-                    fallback_ok = false;
                 }
             }
-            handle
-                .send(Event::ScaleInstances {
-                    at: 0,
-                    instances: all,
-                })
-                .await;
+            if waking {
+                handle
+                    .send(Event::ScaleInstances {
+                        at: 0,
+                        instances: all,
+                    })
+                    .await;
+            }
+        }
+        let pending = fallbacks.iter().any(|f| f.pending().is_some());
+        // Clear `scale` once every write it reported has gone through.
+        if set == Some(want) && !pending && (newly_set || reported) {
+            reported = false;
+            healthy(&handle).await;
         }
         // A failed set is retried on the next poll.
-        let wait = if state == "waking" || set != Some(want) || !fallback_ok {
+        let wait = if state == "waking" || set != Some(want) || pending {
             cfg.poll
         } else {
             Duration::from_secs(3600)
@@ -378,6 +455,25 @@ impl ScaleDriver for AwsAutoScaling {
             .await?;
         Ok(parse_instances(&xml))
     }
+
+    async fn desired(&self, group: &Group) -> Result<u32> {
+        let xml = self
+            .call(
+                &group.region,
+                &[
+                    ("Action", "DescribeAutoScalingGroups".into()),
+                    ("AutoScalingGroupNames.member.1", group.name.clone()),
+                ],
+            )
+            .await?;
+        parse_desired(&xml).with_context(|| format!("no desired capacity for group {}", group.name))
+    }
+}
+
+/// The desired capacity of a DescribeAutoScalingGroups answer naming one group.
+pub fn parse_desired(xml: &str) -> Option<u32> {
+    tag(xml, "AutoScalingGroupName")?;
+    tag(xml, "DesiredCapacity")?.parse().ok()
 }
 
 /// The instances of a DescribeAutoScalingGroups answer: each `<member>` of `<Instances>`
@@ -401,21 +497,39 @@ pub fn parse_instances(xml: &str) -> Vec<ScaleInstance> {
 }
 
 /// Records every call; its instances are set by the test: `by_group` for a group named
-/// there, `instances` for every other group.
+/// there, `instances` for every other group. `desired` holds each group's desired capacity
+/// (0 for one never set) and follows every successful set. A set matching an entry of
+/// `fail_sets` (group, desired) fails once and removes that entry.
 #[derive(Default)]
 pub struct FakeScale {
     pub calls: Mutex<Vec<(String, u32)>>,
     pub instances: Mutex<Vec<ScaleInstance>>,
     pub by_group: Mutex<HashMap<String, Vec<ScaleInstance>>>,
+    pub desired: Mutex<HashMap<String, u32>>,
+    pub fail_sets: Mutex<Vec<(String, u32)>>,
 }
 
 #[async_trait]
 impl ScaleDriver for FakeScale {
     async fn set_desired(&self, group: &Group, desired: u32) -> Result<()> {
+        {
+            let mut fail = self.fail_sets.lock().unwrap();
+            if let Some(p) = fail
+                .iter()
+                .position(|(n, d)| *n == group.name && *d == desired)
+            {
+                fail.remove(p);
+                bail!("injected failure setting {} to {desired}", group.name);
+            }
+        }
         self.calls
             .lock()
             .unwrap()
             .push((group.name.clone(), desired));
+        self.desired
+            .lock()
+            .unwrap()
+            .insert(group.name.clone(), desired);
         Ok(())
     }
     async fn instances(&self, group: &Group) -> Result<Vec<ScaleInstance>> {
@@ -423,6 +537,15 @@ impl ScaleDriver for FakeScale {
             return Ok(i.clone());
         }
         Ok(self.instances.lock().unwrap().clone())
+    }
+    async fn desired(&self, group: &Group) -> Result<u32> {
+        Ok(self
+            .desired
+            .lock()
+            .unwrap()
+            .get(&group.name)
+            .copied()
+            .unwrap_or(0))
     }
 }
 
@@ -543,6 +666,37 @@ mod tests {
         assert_eq!(
             f.observe(t0 + Duration::from_secs(200) + wait, 2, 1, 0, wait),
             Some((1, 1))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fallback_not_fully_written_is_retried_after_capacity_appears() {
+        let wait = Duration::from_secs(120);
+        let mut f = Fallback::default();
+        let t0 = Instant::now();
+        assert_eq!(f.observe(t0, 1, 0, 0, wait), None);
+        assert_eq!(f.observe(t0 + wait, 1, 0, 0, wait), Some((0, 1)));
+        // The on-demand write landed and its instance is pending, but holding the spot
+        // group failed: the two groups together are not short any more, and the spot
+        // group would still launch. The split is asked for again until it is applied.
+        assert_eq!(f.observe(t0 + wait, 1, 0, 1, wait), Some((0, 1)));
+        assert_eq!(f.pending(), Some((0, 1)));
+        f.applied((0, 1));
+        assert_eq!(f.pending(), None);
+        assert_eq!(f.observe(t0 + 2 * wait, 1, 0, 1, wait), None);
+    }
+
+    #[test]
+    fn describe_answers_parse_to_a_desired_capacity() {
+        let xml = r#"<DescribeAutoScalingGroupsResponse><DescribeAutoScalingGroupsResult><AutoScalingGroups><member>
+    <AutoScalingGroupName>fleet-hosts-on-demand</AutoScalingGroupName><MinSize>0</MinSize><MaxSize>8</MaxSize>
+    <DesiredCapacity>1</DesiredCapacity><Instances/></member></AutoScalingGroups></DescribeAutoScalingGroupsResult>
+</DescribeAutoScalingGroupsResponse>"#;
+        assert_eq!(parse_desired(xml), Some(1));
+        // A name that matches no group answers an empty list.
+        assert_eq!(
+            parse_desired("<DescribeAutoScalingGroupsResult><AutoScalingGroups/></DescribeAutoScalingGroupsResult>"),
+            None
         );
     }
 }

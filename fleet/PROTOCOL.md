@@ -473,9 +473,13 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
   live instances (any lifecycle state but `Terminating*`, `Terminated` and `Detach*`) than
   `--awake-capacity` for `--spot-wait` seconds (default 120), it sets the on-demand group to
   the shortfall and the spot group to the live instances it has, so a spot launch that
-  succeeds later cannot add a host. A group it cannot describe is not taken to be short. It
-  never raises the on-demand group otherwise, sets it to 0 with the spot group when the
-  fleet sleeps, and the next wake asks spot first. The on-demand group's own `max_size` caps
+  succeeds later cannot add a host. A split written only half way (one call failed) is
+  written again on every poll until both groups hold it, and `scale` stays degraded until
+  then. A group it cannot describe is not taken to be short. It never raises the on-demand
+  group otherwise, sets it to 0 with the spot group when the fleet sleeps, and the next
+  wake asks spot first. Before raising a spot group for a wake (also the first one after
+  the coordinator starts) it reads both groups' desired capacity: an on-demand group that
+  already holds hosts keeps them, and the spot group is held at the rest. The on-demand group's own `max_size` caps
   what it can be given. The on-demand instances are listed with the spot ones in `hosts`.
 - `--admin-listen` serves the operator's endpoint, `POST /quarantine/release` with
   `{"host": "<host>", "sbdf": "0000:05:00.0"}`, which returns a quarantined GPU to

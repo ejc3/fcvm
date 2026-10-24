@@ -1855,6 +1855,130 @@ async fn a_spot_group_short_after_the_wait_falls_back_to_on_demand_and_sleeps_to
     );
 }
 
+fn fallback_power(
+    fake: &Arc<fcvm::fleet::coord::scale::FakeScale>,
+    spot_wait: Duration,
+) -> fcvm::fleet::coord::scale::PowerConfig {
+    use fcvm::fleet::coord::scale::{Group, PowerConfig};
+    PowerConfig {
+        driver: fake.clone(),
+        groups: vec![Group {
+            region: "us-east-1".into(),
+            name: "fleet-hosts".into(),
+        }],
+        awake_capacity: 1,
+        poll: Duration::from_millis(50),
+        on_demand: vec![Some(Group {
+            region: "us-east-1".into(),
+            name: "fleet-hosts-on-demand".into(),
+        })],
+        spot_wait,
+    }
+}
+
+/// A coordinator that restarts while a fallback is in force (the on-demand group holds a
+/// host) keeps that split: it reads the groups' desired capacity first and never raises
+/// the spot group beside the on-demand host.
+#[tokio::test]
+async fn a_restart_keeps_an_on_demand_fallback_instead_of_raising_spot_beside_it() {
+    use fcvm::fleet::coord::scale::FakeScale;
+    let fake = Arc::new(FakeScale::default());
+    fake.desired.lock().unwrap().extend([
+        ("fleet-hosts".to_string(), 0),
+        ("fleet-hosts-on-demand".to_string(), 1),
+    ]);
+    // The fleet resumes awake (a viewer is watching the on-demand host's tiles).
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(fallback_power(&fake, Duration::from_secs(120))),
+        None,
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while fake.calls.lock().unwrap().len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{:?}",
+            fake.calls.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let calls = fake.calls.lock().unwrap().clone();
+    assert!(
+        !calls.contains(&("fleet-hosts".to_string(), 1)),
+        "spot raised beside the on-demand host: {calls:?}"
+    );
+    let desired = fake.desired.lock().unwrap().clone();
+    assert_eq!(desired["fleet-hosts"], 0, "{calls:?}");
+    assert_eq!(desired["fleet-hosts-on-demand"], 1, "{calls:?}");
+}
+
+/// A fallback whose spot write fails is retried until both groups hold their split, and
+/// the coordinator stops reporting `scale` degraded once it is.
+#[tokio::test]
+async fn a_failed_fallback_write_is_retried_and_clears_the_degraded_scale() {
+    use fcvm::fleet::coord::scale::FakeScale;
+    let fake = Arc::new(FakeScale::default());
+    fake.fail_sets.lock().unwrap().extend([
+        ("fleet-hosts".to_string(), 0),
+        ("fleet-hosts".to_string(), 0),
+    ]);
+    let mut state = State::new(Config::default(), now_ms());
+    state.fleet.power.state = "waking".into();
+    let (handle, _actor) = start(
+        state,
+        None,
+        None,
+        None,
+        Some(fallback_power(&fake, Duration::from_millis(200))),
+        None,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/live", listener.local_addr().unwrap());
+    let cfg = live::LiveConfig {
+        checker: allow_all(),
+        allowed_origins: vec![],
+        verifier: Arc::new(turnstile::Off),
+        trust_cf_connecting_ip: false,
+        turnstile_site_key: None,
+        poster: Arc::new(poster::Poster::default()),
+    };
+    let h = handle.clone();
+    tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let d = fake.desired.lock().unwrap().clone();
+        if d.get("fleet-hosts") == Some(&0) && d.get("fleet-hosts-on-demand") == Some(&1) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{:?}",
+            fake.calls.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        fake.fail_sets.lock().unwrap().is_empty(),
+        "both failures injected"
+    );
+    let scale_degraded = |s: &serde_json::Value| {
+        s["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["kind"] == "coordinator_degraded" && f["component"] == "scale")
+    };
+    let mut v = Viewer::connect(&url).await;
+    let s = tokio::time::timeout(Duration::from_secs(5), v.until(|s| !scale_degraded(s)))
+        .await
+        .expect("scale still degraded 5 s after the fallback was applied");
+    assert!(!scale_degraded(&s));
+}
+
 /// No poster is taken while tiles are starting or a race relaunches them: their regions
 /// would be black. (On a GPU host the first posters of two runs were black frames, taken
 /// mid-race and while the first VMs started.)
