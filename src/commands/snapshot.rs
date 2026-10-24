@@ -1044,7 +1044,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     }
 
     // --inherit-working-set reads the parent's set while this create still pins the
-    // parent's generation, so the set describes the image the diff was merged onto. A parent
+    // parent's generation, so the set describes the image the diff was written over. A parent
     // that is the target itself is held exclusive by this create, and its set described the
     // image just replaced.
     let inherit_from = if !args.inherit_working_set {

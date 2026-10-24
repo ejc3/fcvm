@@ -856,6 +856,198 @@ fn punch_hole(file: &std::fs::File, offset: u64, len: u64) -> nix::Result<()> {
     )
 }
 
+/// The bytes a diff snapshot wrote, for the dirty-tracking check: what was measured, or 0
+/// when it could not be, so a diff of unknown size is retried as a Full snapshot.
+fn diff_bytes_written(snapshot: &str, measured: std::io::Result<u64>) -> u64 {
+    match measured {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!(snapshot = %snapshot, error = %e,
+                "could not measure what the diff wrote; it counts as nothing written");
+            0
+        }
+    }
+}
+
+/// Clone the parent's memory file to `dst` for an in-place diff snapshot, with FICLONE.
+///
+/// Returns false, leaving no `dst`, when the snapshot has to be written as a sparse diff and
+/// merged instead: the parent's file is not `memory_bytes` long (Firecracker truncates a
+/// memory file of another length and writes only the dirty pages into it), the store cannot
+/// clone it, or its filesystem does not report which extents a file shares, which is how the
+/// snapshot finds the pages Firecracker wrote. A clone costs one reference per extent of the
+/// parent's file, which is why it is made before the VM is paused.
+async fn clone_base_for_in_place_diff(
+    base: &Path,
+    dst: &Path,
+    memory_bytes: u64,
+    snapshot: &str,
+) -> Result<bool> {
+    let (base, dst) = (base.to_path_buf(), dst.to_path_buf());
+    let started = std::time::Instant::now();
+    let outcome =
+        tokio::task::spawn_blocking(move || -> Result<std::result::Result<(), String>> {
+            let base_file = std::fs::File::open(&base)
+                .with_context(|| format!("opening {}", base.display()))?;
+            let base_len = base_file
+                .metadata()
+                .context("reading the base's length")?
+                .len();
+            if base_len != memory_bytes {
+                return Ok(Err(format!(
+                    "the parent's memory file is {base_len} bytes, the VM's memory {memory_bytes}"
+                )));
+            }
+            let dst_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&dst)
+                .with_context(|| format!("creating {}", dst.display()))?;
+            let refused = match crate::storage::pmem_store::ficlone(&base_file, &dst_file) {
+                Ok(()) => match crate::storage::extents::reports_shared_extents(&dst_file) {
+                    Ok(true) => None,
+                    Ok(false) => Some("the filesystem does not report shared extents".to_string()),
+                    Err(e) => Some(format!("the filesystem cannot report extents: {e}")),
+                },
+                Err(e) => match e.raw_os_error() {
+                    Some(libc::EXDEV | libc::EOPNOTSUPP | libc::EINVAL | libc::ENOTTY) => Some(
+                        format!("the store cannot clone the parent's memory file: {e}"),
+                    ),
+                    _ => {
+                        return Err(
+                            anyhow::Error::new(e).context("cloning the parent's memory file")
+                        )
+                    }
+                },
+            };
+            match refused {
+                None => Ok(Ok(())),
+                Some(reason) => {
+                    drop(dst_file);
+                    std::fs::remove_file(&dst)
+                        .with_context(|| format!("removing {}", dst.display()))?;
+                    Ok(Err(reason))
+                }
+            }
+        })
+        .await
+        .context("base clone task panicked")??;
+    match outcome {
+        Ok(()) => {
+            info!(snapshot = %snapshot, clone_ms = started.elapsed().as_millis() as u64,
+                "cloned the parent's memory file, the diff is written into it");
+            Ok(true)
+        }
+        Err(reason) => {
+            info!(snapshot = %snapshot, reason = %reason,
+                "writing the diff to memory.diff and merging it");
+            Ok(false)
+        }
+    }
+}
+
+/// What giving an in-place diff's long zero runs back as holes did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct InPlaceStats {
+    /// Bytes in the extents the snapshot wrote, the memory file's unshared ones.
+    pub written_bytes: u64,
+    /// Those extents, with touching ones joined.
+    pub ranges: u64,
+    /// Bytes read to find zero runs: the ranges long enough to hold one.
+    pub read_bytes: u64,
+    /// Holes punched, one fallocate call each.
+    pub punches: u64,
+    /// Bytes the punches covered (see `MergeStats::zero_bytes`).
+    pub zero_bytes: u64,
+    /// Bytes of zero runs long enough to punch that stay written, because the filesystem
+    /// refused the punch: those of the range it refused in. Later ranges are not read.
+    pub unpunched_zero_bytes: u64,
+}
+
+/// Punch the long zero runs of an in-place diff as holes, as a merge does for the zero runs
+/// of a sparse diff (`MergeWrite::apply_with`), so memory the guest gave back costs the
+/// snapshot nothing. Only the extents the snapshot wrote are considered: the memory file's
+/// unshared extents, with touching ones joined. A range shorter than `min_punch` cannot hold
+/// a run to punch and is not read, which skips most of a diff of scattered pages. A longer
+/// one is read in pieces cut at multiples of `MERGE_WINDOW`, and in each piece every run of
+/// all-zero granules at least `min_punch` long is punched (`piece_runs`). The data is left
+/// where Firecracker wrote it. Where the filesystem refuses a punch with EOPNOTSUPP, the zeros
+/// stay written and nothing more is read or punched: the zero runs of the rest of that range
+/// are counted apart, and later ranges are not read. The file is flushed before this
+/// returns, as a merged file is.
+fn punch_in_place_diff(path: &Path, min_punch: u64) -> Result<InPlaceStats> {
+    punch_in_place_diff_with(path, min_punch, &punch_hole)
+}
+
+/// `punch_in_place_diff` with the punch it makes passed in, for the tests.
+fn punch_in_place_diff_with(
+    path: &Path,
+    min_punch: u64,
+    punch: MergePuncher<'_>,
+) -> Result<InPlaceStats> {
+    use std::os::unix::fs::FileExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let ranges = crate::storage::extents::unshared_ranges(&file)
+        .context("reading the in-place diff's extents")?;
+    let mut stats = InPlaceStats {
+        ranges: ranges.len() as u64,
+        ..Default::default()
+    };
+    stats.written_bytes = ranges.iter().map(|range| range.end - range.start).sum();
+    let mut cannot_punch = false;
+    let mut buffer = Vec::new();
+    for range in ranges {
+        if cannot_punch {
+            break;
+        }
+        if range.end - range.start < min_punch {
+            continue;
+        }
+        stats.read_bytes += range.end - range.start;
+        let mut start = range.start;
+        while start < range.end {
+            let end = range.end.min((start / MERGE_WINDOW + 1) * MERGE_WINDOW);
+            buffer.resize((end - start) as usize, 0);
+            file.read_exact_at(&mut buffer, start)
+                .with_context(|| format!("reading the in-place diff at offset {start}"))?;
+            for (run, hole) in piece_runs(start, &buffer, min_punch) {
+                if !hole {
+                    continue;
+                }
+                let (offset, len) = (start + run.start as u64, run.len() as u64);
+                if cannot_punch {
+                    stats.unpunched_zero_bytes += len;
+                    continue;
+                }
+                match punch(&file, offset, len) {
+                    Ok(()) => {
+                        stats.punches += 1;
+                        stats.zero_bytes += len;
+                    }
+                    Err(nix::errno::Errno::EOPNOTSUPP) => {
+                        cannot_punch = true;
+                        stats.unpunched_zero_bytes += len;
+                    }
+                    Err(e) => bail!(
+                        "punching a hole of {} bytes at offset {} of the in-place diff: {}",
+                        len,
+                        offset,
+                        e
+                    ),
+                }
+            }
+            start = end;
+        }
+    }
+    file.sync_all().context("flushing the in-place diff")?;
+    Ok(stats)
+}
+
 /// Whether the byte at `offset` of the diff is data.
 fn diff_has_data_at(diff_file: &std::fs::File, offset: u64) -> Result<bool> {
     match lseek(diff_file, offset as i64, Whence::SeekData) {
@@ -4175,8 +4367,8 @@ pub async fn acquire_snapshot_dir_lock(
 /// Locks that pin every snapshot generation read or replaced by one snapshot create.
 ///
 /// The files stay locked until this value is dropped.  Callers acquire this before the
-/// per-VM snapshot lock and keep it through the parent-memory copy/merge and the target's
-/// atomic replacement.
+/// per-VM snapshot lock and keep it through the parent's memory file being cloned (for an
+/// in-place diff, before the pause) or copied and merged, and the target's atomic replacement.
 pub struct SnapshotCreateGenerationLocks {
     _files: Vec<std::fs::File>,
 }
@@ -4640,17 +4832,18 @@ impl PublishedMemoryFile {
         }
     }
 
-    /// Log the memory file's length and how many of its bytes are data. Its data runs
-    /// are the guest memory the snapshot stores: the default Firecracker build leaves a
-    /// Full snapshot's all-zero pages as holes, and a Diff keeps its base's, because on
-    /// btrfs the base copy (copy_file_range) clones, and gains one for each run of its
-    /// diff's all-zero pages at least `MERGE_MIN_PUNCH` long, which the merge punches. A
+    /// Log the memory file's length and how many of its bytes are data. Its data runs are the
+    /// guest memory the snapshot stores: the default Firecracker build leaves a Full
+    /// snapshot's all-zero pages as holes, and a Diff keeps its base's, because its memory
+    /// file starts as a clone of the parent's (FICLONE for an in-place diff, copy_file_range
+    /// for a merge, which clones on btrfs), and gains one for each run of its all-zero pages
+    /// at least `MERGE_MIN_PUNCH` long, which `punch_in_place_diff` or the merge punches. A
     /// failed measurement is logged and does not fail the snapshot.
     ///
     /// The walk runs on a blocking thread. It is quick only because the file is synced:
-    /// Firecracker syncs the memory file it writes, and merge_diff_snapshot syncs a merged
-    /// one. On a btrfs file with dirty pages the same walk measured about 1,000 times
-    /// slower (13 to 70 s for 8k to 32k runs).
+    /// Firecracker syncs the memory file it writes, and `punch_in_place_diff` and
+    /// merge_diff_snapshot sync the file they finish. On a btrfs file with dirty pages the
+    /// same walk measured about 1,000 times slower (13 to 70 s for 8k to 32k runs).
     pub async fn log_data_runs(self) {
         let Self { snapshot, file } = self;
         let measured = match file {
@@ -4753,6 +4946,7 @@ pub async fn create_snapshot_core(
         let _ = tokio::fs::remove_dir_all(snapshot_dir).await;
     }
 
+    let memory_bytes = (snapshot_config.metadata.memory_mib as u64) * 1024 * 1024;
     let snapshot_type = if has_base { "Diff" } else { "Full" };
 
     // Check available disk space before attempting snapshot.
@@ -4761,7 +4955,6 @@ pub async fn create_snapshot_core(
     // refusing. A diff snapshot is smaller but still needs space.
     // Failing ENOSPC mid-snapshot corrupts the VM (Firecracker can't resume properly).
     {
-        let memory_bytes = (snapshot_config.metadata.memory_mib as u64) * 1024 * 1024;
         // For full snapshots, need at most memory_mib. For diff, need ~10% as buffer.
         let required_bytes = if has_base {
             memory_bytes / 10
@@ -4803,9 +4996,31 @@ pub async fn create_snapshot_core(
         .await
         .context("creating temp snapshot directory")?;
 
-    // For diff snapshots, write to memory.diff so we can merge onto memory.bin
-    // For full snapshots, write directly to memory.bin
-    let temp_memory_path = if has_base {
+    // A diff snapshot is written in place when the store can clone the parent's memory file:
+    // Firecracker writes the dirty pages into the clone, so there is no diff file to merge
+    // afterwards. The clone is made here, before the pause. Otherwise Firecracker writes the
+    // dirty pages to a sparse memory.diff, merged onto a copy of the parent's memory.bin after
+    // the resume. A full snapshot writes memory.bin.
+    let diff_in_place = match base_memory_source.as_ref() {
+        Some(base) if has_base => {
+            clone_base_for_in_place_diff(
+                base,
+                &temp_snapshot_dir.join("memory.bin"),
+                memory_bytes,
+                &snapshot_config.name,
+            )
+            .await
+        }
+        _ => Ok(false),
+    };
+    let diff_in_place = match diff_in_place {
+        Ok(in_place) => in_place,
+        Err(e) => {
+            let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+            return Err(e);
+        }
+    };
+    let temp_memory_path = if has_base && !diff_in_place {
         temp_snapshot_dir.join("memory.diff")
     } else {
         temp_snapshot_dir.join("memory.bin")
@@ -4934,40 +5149,61 @@ pub async fn create_snapshot_core(
     //   "stack-protector: Kernel stack is corrupted in: do_idle"
     // because the vmstate has startup-time registers but memory has pre-start content.
     //
-    // Detection: check the diff file's actual disk usage. A VM that ran from pre-start
+    // Detection: check how much the diff wrote. A VM that ran from pre-start
     // to healthy MUST have dirtied at least 0.1% of memory (~1 MB for a 1 GB VM).
-    // If the diff is smaller, retry as Full while the VM is still paused.
+    // If the diff is smaller, retry as Full while the VM is still paused. A sparse diff
+    // wrote its allocated blocks; an in-place diff wrote the clone's extents that are no
+    // longer shared with the parent, counted only until they reach the minimum. A diff whose
+    // size cannot be measured counts as nothing written (`diff_bytes_written`): the dump has
+    // consumed the dirty bitmap, so failing here would leave the VM's next diff without the
+    // pages dirtied so far, and a Full snapshot holds them all.
     if snapshot_result.is_ok() && has_base {
         use std::os::unix::fs::MetadataExt;
-        if let Ok(meta) = std::fs::metadata(&temp_memory_path) {
-            let diff_allocated = meta.blocks() * 512;
-            let memory_bytes = (snapshot_config.metadata.memory_mib as u64) * 1024 * 1024;
+        {
             // 0.1% of VM memory — a VM that started a container must dirty at least this much.
             // Empirically, pre-start → startup diffs are 36-43 MB for a 1 GB VM (3.5-4.1%).
             let min_diff_bytes = memory_bytes / 1024;
+            let measured = if diff_in_place {
+                std::fs::File::open(&temp_memory_path).and_then(|file| {
+                    crate::storage::extents::unshared_bytes_up_to(&file, min_diff_bytes)
+                })
+            } else {
+                std::fs::metadata(&temp_memory_path).map(|meta| meta.blocks() * 512)
+            };
+            let diff_allocated = diff_bytes_written(&snapshot_config.name, measured);
 
             if diff_allocated < min_diff_bytes {
                 error!(
                     snapshot = %snapshot_config.name,
                     diff_allocated_bytes = diff_allocated,
-                    diff_file_size = meta.len(),
                     min_expected_bytes = min_diff_bytes,
                     memory_mib = snapshot_config.metadata.memory_mib,
-                    "diff snapshot too small — KVM dirty page tracking lost guest writes. \
-                     Retrying as Full snapshot (VM still paused)."
+                    "diff snapshot too small — KVM dirty page tracking lost guest writes, or the \
+                     diff could not be measured. Retrying as Full snapshot (VM still paused)."
                 );
 
-                // Remove bad diff file and retry as Full
-                let _ = std::fs::remove_file(&temp_memory_path);
+                // Remove the diff and retry as Full; the removal must succeed. An in-place diff
+                // is memory.bin itself, and a Full snapshot leaves all-zero pages as holes, so a
+                // clone left in place would keep the parent's bytes there. A sparse memory.diff
+                // left behind would be published beside the Full memory.bin.
+                let removed = std::fs::remove_file(&temp_memory_path);
                 let full_memory_path = temp_snapshot_dir.join("memory.bin");
-                match snapshot_client
-                    .create_snapshot(SnapshotCreate {
-                        snapshot_type: Some("Full".to_string()),
-                        snapshot_path: temp_vmstate_path.display().to_string(),
-                        mem_file_path: full_memory_path.display().to_string(),
-                    })
-                    .await
-                {
+                let retry = match removed {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        Err(anyhow::Error::new(e)
+                            .context("removing the diff before the Full retry"))
+                    }
+                    _ => {
+                        snapshot_client
+                            .create_snapshot(SnapshotCreate {
+                                snapshot_type: Some("Full".to_string()),
+                                snapshot_path: temp_vmstate_path.display().to_string(),
+                                mem_file_path: full_memory_path.display().to_string(),
+                            })
+                            .await
+                    }
+                };
+                match retry {
                     Ok(()) => {
                         use_diff = false;
                         info!(
@@ -5089,7 +5325,35 @@ pub async fn create_snapshot_core(
     // in flight across the pause were silently lost (the CI-observed orphan mode),
     // so their blocked reads abort instead of hanging.
 
-    if use_diff {
+    if use_diff && diff_in_place {
+        // The dirty pages are already in memory.bin. Its long zero runs become holes, as a
+        // merge makes them, and the file is flushed.
+        let memory_path = temp_memory_path.clone();
+        let started = std::time::Instant::now();
+        let punched =
+            tokio::task::spawn_blocking(move || punch_in_place_diff(&memory_path, MERGE_MIN_PUNCH))
+                .await
+                .context("in-place diff task panicked")
+                .and_then(|punched| punched.context("punching the in-place diff's zero runs"));
+        let punched = match punched {
+            Ok(punched) => punched,
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+                return Err(e);
+            }
+        };
+        info!(
+            snapshot = %snapshot_config.name,
+            written_bytes = punched.written_bytes,
+            ranges = punched.ranges,
+            read_bytes = punched.read_bytes,
+            punches = punched.punches,
+            zero_bytes = punched.zero_bytes,
+            unpunched_zero_bytes = punched.unpunched_zero_bytes,
+            punch_ms = started.elapsed().as_millis() as u64,
+            "diff written in place, building atomic update"
+        );
+    } else if use_diff {
         // Diff snapshot: copy base to temp, merge diff onto it, then atomic rename
         // At this point:
         //   - temp_memory_path = memory.diff (Firecracker wrote the sparse diff here)
@@ -5178,7 +5442,7 @@ pub async fn create_snapshot_core(
 
     // Record parent snapshot for the diff chain.
     // Full snapshots: parent = None (self-contained).
-    // Diff snapshots: parent = name of snapshot whose memory.bin was the merge base.
+    // Diff snapshots: parent = name of snapshot whose memory.bin the diff was written over.
     snapshot_config.parent_snapshot = if use_diff { diff_parent_name } else { None };
 
     // Write config.json to temp directory
@@ -7471,6 +7735,223 @@ mod tests {
             (6, 8 * GRANULE, 0),
             "the eight zero pages, in six runs, should be punched and counted in zero_bytes"
         );
+    }
+
+    /// Write the diff's data runs into `dst` at the same offsets, as Firecracker writes the dirty
+    /// pages of an in-place diff into the clone.
+    fn write_diff_in_place(diff: &Path, dst: &Path) {
+        use std::os::unix::fs::FileExt;
+
+        let diff = std::fs::File::open(diff).unwrap();
+        let dst = std::fs::OpenOptions::new().write(true).open(dst).unwrap();
+        let len = diff.metadata().unwrap().len();
+        crate::uffd::for_each_data_run(&diff, len, |start, end| {
+            let mut bytes = vec![0u8; (end - start) as usize];
+            diff.read_exact_at(&mut bytes, start).unwrap();
+            dst.write_all_at(&bytes, start).unwrap();
+        })
+        .unwrap();
+        dst.sync_all().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_in_place_diff_ends_as_the_merge_of_the_same_diff_does() {
+        let (base, diff, expected, holes) = zero_page_fixture();
+        let dir = tempfile::tempdir_in(snapshot_fs_dir()).unwrap();
+        let dst = dir.path().join("memory.bin");
+        let len = base.as_file().metadata().unwrap().len();
+        assert!(
+            clone_base_for_in_place_diff(base.path(), &dst, len, "t")
+                .await
+                .unwrap(),
+            "control: the btrfs store clones the parent's memory file"
+        );
+        write_diff_in_place(diff.path(), &dst);
+        let stats = punch_in_place_diff(&dst, EVERY_ZERO_RUN.min_punch).unwrap();
+        assert_eq!(
+            hole_pages(&dst),
+            holes,
+            "hole layout: the in-place diff's holes, page by page, are not the diff's all-zero pages"
+        );
+        assert!(
+            std::fs::read(&dst).unwrap() == expected,
+            "the in-place diff differs from the bytes a merge gives"
+        );
+        assert!(
+            std::fs::read(base.path()).unwrap() == vec![0xAAu8; len as usize],
+            "writing the diff in place changed the parent's memory file"
+        );
+        assert_eq!(
+            (stats.written_bytes, stats.punches, stats.zero_bytes, stats.unpunched_zero_bytes),
+            (14 * GRANULE, 6, 8 * GRANULE, 0),
+            "the fourteen written pages are the unshared extents, and their eight zero pages, in six runs, are punched"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_place_diff_counts_exactly_the_pages_written_into_the_clone() {
+        use std::os::unix::fs::FileExt;
+
+        let (base, _diff, _expected) = merge_fixture_in(snapshot_fs_dir(), 32 * GRANULE, &[]);
+        let dir = tempfile::tempdir_in(snapshot_fs_dir()).unwrap();
+        let dst = dir.path().join("memory.bin");
+        assert!(
+            clone_base_for_in_place_diff(base.path(), &dst, 32 * GRANULE, "t")
+                .await
+                .unwrap()
+        );
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&dst)
+            .unwrap();
+        assert_eq!(
+            crate::storage::extents::unshared_bytes_up_to(&file, u64::MAX).unwrap(),
+            0,
+            "a clone nothing has written shares every extent with the parent"
+        );
+        file.write_all_at(&[0xBB; 4096], 4 * GRANULE).unwrap();
+        file.write_all_at(&[0xCC; 8192], 7 * GRANULE).unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(
+            crate::storage::extents::unshared_bytes_up_to(&file, u64::MAX).unwrap(),
+            3 * GRANULE,
+            "the unshared extents are the three pages written"
+        );
+        assert!(
+            crate::storage::extents::unshared_bytes_up_to(&file, GRANULE).unwrap() >= GRANULE,
+            "a count that reaches its minimum reports at least the minimum"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_place_diff_reads_only_ranges_long_enough_to_hold_a_hole() {
+        use std::os::unix::fs::FileExt;
+
+        let (base, _diff, _expected) = merge_fixture_in(snapshot_fs_dir(), 64 * GRANULE, &[]);
+        let dir = tempfile::tempdir_in(snapshot_fs_dir()).unwrap();
+        let dst = dir.path().join("memory.bin");
+        assert!(
+            clone_base_for_in_place_diff(base.path(), &dst, 64 * GRANULE, "t")
+                .await
+                .unwrap(),
+            "control: the btrfs store clones the parent's memory file"
+        );
+        let file = std::fs::OpenOptions::new().write(true).open(&dst).unwrap();
+        // Three single zero pages, a zero run of exactly MERGE_MIN_PUNCH, and a page of data.
+        for page in [2, 5, 9] {
+            file.write_all_at(&[0u8; 4096], page * GRANULE).unwrap();
+        }
+        file.write_all_at(&vec![0u8; MERGE_MIN_PUNCH as usize], 16 * GRANULE)
+            .unwrap();
+        file.write_all_at(&[0xBB; 4096], 50 * GRANULE).unwrap();
+        file.sync_all().unwrap();
+        let stats = punch_in_place_diff(&dst, MERGE_MIN_PUNCH).unwrap();
+        let run_pages = MERGE_MIN_PUNCH / GRANULE;
+        assert_eq!(
+            (stats.written_bytes, stats.read_bytes),
+            ((4 + run_pages) * GRANULE, MERGE_MIN_PUNCH),
+            "only the range long enough to hold a hole is read"
+        );
+        assert_eq!((stats.punches, stats.zero_bytes), (1, MERGE_MIN_PUNCH));
+        let mut holes = vec![false; 64];
+        holes[16..16 + run_pages as usize].fill(true);
+        assert_eq!(
+            hole_pages(&dst),
+            holes,
+            "the long zero run is a hole and the single zero pages stay written"
+        );
+        let mut expected = vec![0xAAu8; 64 * 4096];
+        for page in [2usize, 5, 9] {
+            expected[page * 4096..(page + 1) * 4096].fill(0);
+        }
+        expected[16 * 4096..16 * 4096 + MERGE_MIN_PUNCH as usize].fill(0);
+        expected[50 * 4096..51 * 4096].fill(0xBB);
+        assert!(
+            std::fs::read(&dst).unwrap() == expected,
+            "the in-place diff's bytes changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_place_diff_keeps_its_zeros_where_the_filesystem_refuses_to_punch() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let (base, diff, expected, _holes) = zero_page_fixture();
+        let dir = tempfile::tempdir_in(snapshot_fs_dir()).unwrap();
+        let dst = dir.path().join("memory.bin");
+        let len = base.as_file().metadata().unwrap().len();
+        assert!(
+            clone_base_for_in_place_diff(base.path(), &dst, len, "t")
+                .await
+                .unwrap(),
+            "control: the btrfs store clones the parent's memory file"
+        );
+        write_diff_in_place(diff.path(), &dst);
+        let asked = AtomicU64::new(0);
+        let refuse = |_: &std::fs::File, _: u64, _: u64| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            Err(nix::errno::Errno::EOPNOTSUPP)
+        };
+        let stats = punch_in_place_diff_with(&dst, EVERY_ZERO_RUN.min_punch, &refuse).unwrap();
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "a refused punch is not asked again"
+        );
+        // The first range written, pages 1 and 2, is all zeros: its punch is refused, its two
+        // pages are counted apart, and no later range is read.
+        assert_eq!(
+            (
+                stats.punches,
+                stats.zero_bytes,
+                stats.unpunched_zero_bytes,
+                stats.read_bytes
+            ),
+            (0, 0, 2 * GRANULE, 2 * GRANULE),
+            "after a refused punch nothing more is read or punched"
+        );
+        assert!(
+            std::fs::read(&dst).unwrap() == expected,
+            "the in-place diff differs from the bytes a merge gives"
+        );
+    }
+
+    #[test]
+    fn a_diff_whose_size_cannot_be_measured_counts_as_nothing_written() {
+        assert_eq!(diff_bytes_written("t", Ok(5 * GRANULE)), 5 * GRANULE);
+        assert_eq!(
+            diff_bytes_written("t", Err(std::io::Error::other("FIEMAP refused"))),
+            0,
+            "a diff of unknown size must fall under the minimum so it is retried as Full: \
+             the dump consumed the dirty bitmap, and the VM's next diff would miss its pages"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parent_of_another_length_is_merged_instead() {
+        let (base, _diff, _expected) = merge_fixture_in(snapshot_fs_dir(), 32 * GRANULE, &[]);
+        let dir = tempfile::tempdir_in(snapshot_fs_dir()).unwrap();
+        let dst = dir.path().join("memory.bin");
+        assert!(
+            !clone_base_for_in_place_diff(base.path(), &dst, 64 * GRANULE, "t").await.unwrap(),
+            "Firecracker truncates a memory file of another length, so it cannot take the diff in place"
+        );
+        assert!(!dst.exists(), "a refused clone leaves no file");
+    }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_clone_merges_instead() {
+        let (base, _diff, _expected) = merge_fixture_in(Path::new("/dev/shm"), 32 * GRANULE, &[]);
+        let dir = tempfile::tempdir_in("/dev/shm").unwrap();
+        let dst = dir.path().join("memory.bin");
+        assert!(
+            !clone_base_for_in_place_diff(base.path(), &dst, 32 * GRANULE, "t")
+                .await
+                .unwrap(),
+            "tmpfs cannot clone, so the diff is written to memory.diff and merged"
+        );
+        assert!(!dst.exists(), "a refused clone leaves no file");
     }
 
     #[test]
