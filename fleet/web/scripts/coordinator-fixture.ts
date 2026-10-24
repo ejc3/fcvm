@@ -10,9 +10,9 @@
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-const [dir, commit] = process.argv.slice(2);
+const [dir, commit, pr = "1146"] = process.argv.slice(2);
 if (!dir || !commit) {
-  console.error("usage: node scripts/coordinator-fixture.ts <fleet/core/tests/vectors> <commit>");
+  console.error("usage: node scripts/coordinator-fixture.ts <fleet/core/tests/vectors> <commit> [pr]");
   process.exit(2);
 }
 
@@ -36,7 +36,7 @@ for (const file of readdirSync(dir).filter((f) => f.endsWith(".json")).sort()) {
 if (Object.keys(views).length === 0) throw new Error(`no vectors in ${dir}`);
 
 const out = {
-  source: { pr: 1146, commit, dir: "fleet/core/tests/vectors" },
+  source: { pr: Number(pr), commit, dir: "fleet/core/tests/vectors" },
   intents: { known: [...sent].filter((n) => !unknown.has(n)).sort(), unknown: [...unknown].sort() },
   views,
 };

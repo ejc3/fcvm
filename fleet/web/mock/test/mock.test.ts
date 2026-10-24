@@ -718,10 +718,6 @@ describe("the mock speaks the coordinator's snapshot shapes", () => {
     "fleet.power.hosts[]": '"hosts": [{"host": "i-...", "phases": [{"phase", "at"}]}]',
     "tiles[].last_relaunch.phases.ack_ms": "Agent, `timings`: fcvm's own restore clock",
     "tiles[].last_relaunch.phases.total_ms": "Agent, `timings`: the relaunch start to the first frame",
-    // Until the coordinator's vectors carry it (the fleet agent's change that adds it); then
-    // regenerate core/test/fixtures/coordinator.json and drop this line.
-    "tiles[].frame_url_v4": '"frame_url_v4": "wss://<label>-v4.<zone>[:port]/frames", null until its DNS is published',
-    "aggregates[].frame_url_v4": "every frame_url has a frame_url_v4 sibling (#1229)",
   };
   /** The mock's own, read by nothing the real coordinator feeds. */
   const MOCK_ONLY: Record<string, string> = {
