@@ -272,8 +272,11 @@ pub struct AggregateView {
     pub half: Half,
     pub host: Option<String>,
     pub rect: Rect,
-    /// The aggregator's frame WebSocket; null until it is serving.
+    /// The aggregator's frame WebSocket; null until it is serving. `frame_url_v4` is its
+    /// IPv4 sibling (every `*_url` has one): null for now, since an aggregator serves plain
+    /// WebSocket on the GPU host or in the coordinator, not under a published name.
     pub frame_url: Option<String>,
+    pub frame_url_v4: Option<String>,
     /// The tiles inside the region, by tile id.
     pub tiles: Vec<String>,
 }
@@ -487,6 +490,7 @@ pub fn view(state: &State) -> View {
                 host: Some(h.name.clone()),
                 rect,
                 frame_url: h.aggregate_url.clone(),
+                frame_url_v4: None,
                 tiles: placed.into_iter().map(|(_, id)| id).collect(),
             })
         })
@@ -499,6 +503,7 @@ pub fn view(state: &State) -> View {
             host: None,
             rect,
             frame_url: Some(url.clone()),
+            frame_url_v4: None,
             tiles: (1..=f.ec2_n).map(|k| format!("ec2:{k}")).collect(),
         });
     }

@@ -287,6 +287,7 @@
     "aggregates": [
       {
         "frame_url": null,
+        "frame_url_v4": null,
         "half": "fcvm",
         "host": "hC",
         "id": "agg:hC",
@@ -302,6 +303,7 @@
       },
       {
         "frame_url": null,
+        "frame_url_v4": null,
         "half": "fcvm",
         "host": "hB",
         "id": "agg:hB",

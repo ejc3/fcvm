@@ -67,6 +67,28 @@ pub fn facts(state: &State) -> Vec<Fact> {
         .collect()
 }
 
+/// An address in its canonical text (`2001:db8::2` for `2001:0db8::2`), so the record, the
+/// published names and an authoritative answer compare as the same address; text that is
+/// not an address is kept as it is.
+fn canonical(a: &str) -> String {
+    a.parse::<std::net::IpAddr>()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|_| a.to_string())
+}
+
+/// Whether `p` names exactly the launch `f` is on: its generation, its addresses and the
+/// IPv4 port in its URL. Anything else is a new launch, with a new label.
+pub fn is_current(zone: &str, p: &Published, f: &Fact) -> bool {
+    *p == names(
+        zone,
+        &p.label,
+        f.generation,
+        f.ipv6.as_deref(),
+        f.ipv4.as_deref(),
+        f.v4_port,
+    )
+}
+
 /// A launch's names: the label, its addresses and the frame URLs they give.
 pub fn names(
     zone: &str,
@@ -83,8 +105,8 @@ pub fn names(
     Published {
         generation,
         label: label.into(),
-        ipv6: ipv6.map(str::to_string),
-        ipv4: ipv4.map(str::to_string),
+        ipv6: ipv6.map(canonical),
+        ipv4: ipv4.map(canonical),
         frame_url: ipv6.map(|_| format!("wss://{label}.{zone}/frames")),
         frame_url_v4: ipv4.map(|_| format!("wss://{label}-v4.{zone}{port}/frames")),
     }
@@ -169,7 +191,7 @@ impl Confirm for Authoritative {
         for server in &self.servers {
             for r in records {
                 match query(server, &r.name, &r.kind).await {
-                    Ok(addrs) if addrs.contains(&r.content) => {}
+                    Ok(addrs) if addrs.iter().any(|a| canonical(a) == canonical(&r.content)) => {}
                     Ok(addrs) => {
                         tracing::debug!(server, name = %r.name, ?addrs, "not yet at the authoritative server");
                         return false;
@@ -521,17 +543,15 @@ pub async fn run(
             if f.ipv6.is_none() && f.ipv4.is_none() {
                 continue;
             }
-            let current = f.published.as_ref().is_some_and(|p| {
-                p.generation == f.generation && p.ipv6 == f.ipv6 && p.ipv4 == f.ipv4
-            });
-            if current {
+            if f.published
+                .as_ref()
+                .is_some_and(|p| is_current(&cf.zone, p, f))
+            {
                 continue;
             }
-            let p = pending.remove(&f.id).filter(|p| {
-                p.names.generation == f.generation
-                    && p.names.ipv6 == f.ipv6
-                    && p.names.ipv4 == f.ipv4
-            });
+            let p = pending
+                .remove(&f.id)
+                .filter(|p| is_current(&cf.zone, &p.names, f));
             let p = p.unwrap_or_else(|| Pending {
                 names: names(
                     &cf.zone,
@@ -686,6 +706,37 @@ mod tests {
             t.frame_url_v4.as_deref(),
             Some("wss://ec2-2-abcdefgh-v4.fcvm.dev/frames")
         );
+    }
+
+    #[test]
+    fn addresses_are_canonical_and_a_new_port_is_a_new_launch() {
+        use super::{is_current, Fact};
+        let p = names(
+            "fcvm.dev",
+            "ec2-1-abcdefgh",
+            2,
+            Some("2001:0db8:0::2"),
+            Some("192.0.2.1"),
+            None,
+        );
+        assert_eq!(p.ipv6.as_deref(), Some("2001:db8::2"));
+        let mut f = Fact {
+            id: "ec2-1".into(),
+            generation: 2,
+            ipv6: Some("2001:db8::0:2".into()),
+            ipv4: Some("192.0.2.1".into()),
+            v4_port: None,
+            published: None,
+        };
+        assert!(is_current("fcvm.dev", &p, &f));
+        f.v4_port = Some(20201);
+        assert!(
+            !is_current("fcvm.dev", &p, &f),
+            "a new IPv4 port must be a new launch"
+        );
+        f.v4_port = None;
+        f.generation = 3;
+        assert!(!is_current("fcvm.dev", &p, &f));
     }
 
     #[test]

@@ -194,6 +194,7 @@
     "aggregates": [
       {
         "frame_url": null,
+        "frame_url_v4": null,
         "half": "fcvm",
         "host": "h2",
         "id": "agg:h2",
