@@ -2563,3 +2563,148 @@ fn the_built_worker_must_serve_the_page_in_ci_and_before_each_deploy() {
         "the deploy must build, then serve, then ship the Worker"
     );
 }
+
+/// The x64 runner's root volume is restored lazily from its AMI snapshot, and the AMI
+/// holds root-store image layers that the localhost image tests build on. Read cold,
+/// inside the suite, they cost every export about 100 s (a 4.7 MB/s volume at 10 ms per
+/// read) and tests with a 120 s budget failed their first try in most cold x64 runs.
+/// The host-root job reads them before it builds and waits for that read before the
+/// suite. Both steps must stay, in that order.
+#[test]
+fn host_root_reads_the_root_container_store_before_the_suite() {
+    let ci = parse_workflow("ci.yml");
+    let steps = workflow_job(&ci, "host-root")["steps"]
+        .as_sequence()
+        .expect("host-root has steps");
+    let runs = |needle: &str| {
+        steps.iter().position(|s| {
+            s.get("run")
+                .and_then(Value::as_str)
+                .is_some_and(|r| r.lines().any(|l| l.trim() == needle))
+        })
+    };
+    let named = |name: &str| {
+        steps
+            .iter()
+            .position(|s| s.get("name").and_then(Value::as_str) == Some(name))
+            .unwrap_or_else(|| panic!("host-root has no `{name}` step"))
+    };
+    let start = runs("./scripts/ci-warm-root-container-store.sh start")
+        .expect("host-root never starts the container store warm-up");
+    let wait = runs("./scripts/ci-warm-root-container-store.sh wait")
+        .expect("host-root never waits for the container store warm-up");
+    let build = named("setup-fcvm");
+    let suite = named("test-root");
+    assert!(
+        start < build,
+        "the warm-up must start before the build it overlaps (start {start}, setup-fcvm {build})"
+    );
+    assert!(
+        build < wait && wait < suite,
+        "the suite must not start before the warm-up is waited for (wait {wait}, test-root {suite})"
+    );
+}
+
+/// Run `scripts/ci-warm-root-container-store.sh` with `args` and its state in `state`,
+/// with `stubs` first on PATH when given, and return its stdout.
+fn run_store_warm(
+    state: &std::path::Path,
+    stubs: Option<&std::path::Path>,
+    args: &[&str],
+) -> String {
+    let mut command = std::process::Command::new("bash");
+    command
+        .arg(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ci-warm-root-container-store.sh"),
+        )
+        .args(args)
+        .env("RUNNER_TEMP", state);
+    if let Some(stubs) = stubs {
+        let path = std::env::var("PATH").unwrap_or_default();
+        command.env("PATH", format!("{}:{path}", stubs.display()));
+    }
+    let out = command
+        .output()
+        .expect("run ci-warm-root-container-store.sh");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the warm-up never fails the job: {out:?}"
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The warm-up's `wait` reports how the detached reader ended, not only whether it is
+/// still running: a reader that exits nonzero, or that dies before reporting a status,
+/// raises a warning annotation, and one whose reads all succeeded raises none. Before this, a failing read showed only as `(exit N)`
+/// inside the log text, and a reader killed before its summary left `wait` printing
+/// nothing but the seconds it waited.
+#[test]
+fn store_warm_up_wait_reports_how_the_reader_ended() {
+    let tmp = tempfile::tempdir().expect("fixture dir");
+    let stubs = tmp.path().join("bin");
+    let layers = tmp.path().join("layers");
+    std::fs::create_dir_all(&stubs).expect("stub dir");
+    std::fs::create_dir_all(&layers).expect("layers dir");
+    std::fs::write(layers.join("layer"), b"data").expect("layer file");
+    for (name, body) in [
+        ("sudo", "#!/bin/sh\nexec \"$@\"\n"),
+        // Only the reader's `run` sees these stubs: its reads fail.
+        ("cat", "#!/bin/sh\necho 'cat: read error' >&2\nexit 1\n"),
+    ] {
+        let p = stubs.join(name);
+        std::fs::write(&p, body).expect("write stub");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod stub");
+    }
+    // A reader pid that has already exited.
+    let mut exited = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn true");
+    exited.wait().expect("reap true");
+    let pid = exited.id().to_string();
+
+    // The reader ran to the end, and its reads failed.
+    let state = tmp.path().join("failed");
+    std::fs::create_dir_all(&state).expect("state dir");
+    std::fs::write(state.join("fcvm-store-warm.pid"), &pid).expect("pid file");
+    let layers_arg = layers.to_str().expect("utf-8 path");
+    let log = run_store_warm(&state, Some(&stubs), &["run", layers_arg]);
+    std::fs::write(state.join("fcvm-store-warm.log"), log).expect("reader log");
+    let out = run_store_warm(&state, None, &["wait"]);
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("::warning::") && l.contains("exit")),
+        "a reader whose reads failed must raise a warning: {out}"
+    );
+
+    // The reader ran to the end and every read succeeded: no warning.
+    let ok_stubs = tmp.path().join("ok-bin");
+    std::fs::create_dir_all(&ok_stubs).expect("stub dir");
+    std::fs::copy(stubs.join("sudo"), ok_stubs.join("sudo")).expect("copy sudo stub");
+    let state = tmp.path().join("succeeded");
+    std::fs::create_dir_all(&state).expect("state dir");
+    std::fs::write(state.join("fcvm-store-warm.pid"), &pid).expect("pid file");
+    let log = run_store_warm(&state, Some(&ok_stubs), &["run", layers_arg]);
+    assert!(
+        log.contains("(exit 0)"),
+        "a clean read must report exit 0: {log}"
+    );
+    std::fs::write(state.join("fcvm-store-warm.log"), log).expect("reader log");
+    let out = run_store_warm(&state, None, &["wait"]);
+    assert!(
+        !out.contains("::warning::"),
+        "a reader whose reads all succeeded must raise no warning: {out}"
+    );
+
+    // The reader died before it reported anything.
+    let state = tmp.path().join("killed");
+    std::fs::create_dir_all(&state).expect("state dir");
+    std::fs::write(state.join("fcvm-store-warm.pid"), &pid).expect("pid file");
+    std::fs::write(state.join("fcvm-store-warm.log"), b"").expect("empty log");
+    let out = run_store_warm(&state, None, &["wait"]);
+    assert!(
+        out.lines().any(|l| l.starts_with("::warning::")),
+        "a reader that ended without reporting must raise a warning: {out}"
+    );
+}
