@@ -2809,10 +2809,11 @@ separately.
   through Firecracker's File backend starts no server, releases nothing and holds no mark, so
   a pass can drop the cached pages of its snapshot that its VMM has not touched yet.
 - **Invalidation**: keyed by the exact `config.json` digest plus the memory image's
-  (`len, mtime, ino, dev`) identity, not a memory-image content hash — SHA-256 of a 2 GiB
+  (`len`, nanosecond `mtime`) identity, not a memory-image content hash — SHA-256 of a 2 GiB
   image measures 1.4 s at 1.5 GB/s here, which costs more than the mis-prefetch it would
-  prevent. The config digest makes atomically installed generations distinct even under inode
-  reuse. Safe because a working set only says WHICH offsets to copy; the BYTES always come
+  prevent. The config digest makes atomically installed generations distinct even under
+  timestamp granularity. The inode and device are not in the key, so a store restored from a
+  tar archive (`--format=posix`, which keeps nanosecond mtimes) keeps its sets. Safe because a working set only says WHICH offsets to copy; the BYTES always come
   from the file being served, so a stale set wastes a copy and can never corrupt a guest.
 - **Inheritance (`snapshot create --inherit-working-set`)**: a new snapshot starts with no set,
   so its first restore faults in on demand every page the guest touches, and a recording pass
