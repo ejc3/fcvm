@@ -25,6 +25,17 @@ behind by a killed process is complete up to its last answered request:
   --access-log PATH  {ts, peer, method, host, path, status, bytes, duration_ms}
                      per HTTP and HTTPS request; host is the Host header as sent
 
+A third, optional log is not evidence the campaign hashes; it measures the
+listeners themselves:
+  --listen-log PATH  one line a second per listener that did anything, and one
+                     "kernel" line a second: connections accepted and the
+                     time the accept thread spent in accept() (for the TLS
+                     listener that is the whole handshake, because it runs
+                     there unless --tls-handshake-in-handler), handler thread
+                     start delay, requests answered and their handler time,
+                     and the host's TcpExt ListenOverflows / ListenDrops
+                     deltas with the listeners' accept-queue depth
+
 Either log is evidence the campaign hashes once this process has exited, so
 the log has to be complete when it exits. SIGTERM and SIGINT run the shutdown
 sequence (stop_listeners): every listener stops accepting, the DNS responder
@@ -95,6 +106,192 @@ class JsonlLog:
             self._fh.close()
 
 
+class ListenStats:
+    """Counters of one listener, drained once a second into --listen-log.
+
+    The access log's duration_ms starts when a handler thread parses the
+    request line. Everything before that is outside it: the kernel accept
+    queue, the accept thread (which for the TLS listener also runs the
+    handshake), and the handler thread's start. These counters cover that part.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        self._lock = threading.Lock()
+        self.active = 0
+        self._reset()
+
+    def _reset(self):
+        self.accepts = self.accept_errors = 0
+        self.accept_ms_sum = self.accept_ms_max = 0.0
+        self.handshakes = self.handshake_errors = 0
+        self.handshake_ms_sum = self.handshake_ms_max = 0.0
+        self.thread_starts = 0
+        self.thread_start_ms_sum = self.thread_start_ms_max = 0.0
+        self.requests = 0
+        self.request_ms_sum = self.request_ms_max = 0.0
+        self.active_peak = self.active
+
+    def accepted(self, ms: float, ok: bool = True):
+        with self._lock:
+            if ok:
+                self.accepts += 1
+            else:
+                self.accept_errors += 1
+            self.accept_ms_sum += ms
+            self.accept_ms_max = max(self.accept_ms_max, ms)
+
+    def handshake(self, ms: float, ok: bool = True):
+        with self._lock:
+            if ok:
+                self.handshakes += 1
+            else:
+                self.handshake_errors += 1
+            self.handshake_ms_sum += ms
+            self.handshake_ms_max = max(self.handshake_ms_max, ms)
+
+    def thread_started(self, ms: float):
+        with self._lock:
+            self.active += 1
+            self.active_peak = max(self.active_peak, self.active)
+            self.thread_starts += 1
+            self.thread_start_ms_sum += ms
+            self.thread_start_ms_max = max(self.thread_start_ms_max, ms)
+
+    def thread_finished(self):
+        with self._lock:
+            self.active -= 1
+
+    def request(self, ms: float):
+        with self._lock:
+            self.requests += 1
+            self.request_ms_sum += ms
+            self.request_ms_max = max(self.request_ms_max, ms)
+
+    def drain(self, interval_s: float):
+        """The row for the interval just ended, or None when nothing happened."""
+        with self._lock:
+            busy = self.accepts + self.accept_errors + self.handshakes + self.handshake_errors \
+                + self.thread_starts + self.requests
+            row = None
+            if busy:
+                row = {
+                    "listener": self.name,
+                    "interval_s": round(interval_s, 4),
+                    "accepts": self.accepts,
+                    "accept_errors": self.accept_errors,
+                    "accept_ms_sum": round(self.accept_ms_sum, 3),
+                    "accept_ms_max": round(self.accept_ms_max, 3),
+                    # the share of the interval the accept thread was inside accept()
+                    "accept_busy": round(self.accept_ms_sum / (interval_s * 1000.0), 4),
+                    "handshakes": self.handshakes,
+                    "handshake_errors": self.handshake_errors,
+                    "handshake_ms_sum": round(self.handshake_ms_sum, 3),
+                    "handshake_ms_max": round(self.handshake_ms_max, 3),
+                    "thread_starts": self.thread_starts,
+                    "thread_start_ms_sum": round(self.thread_start_ms_sum, 3),
+                    "thread_start_ms_max": round(self.thread_start_ms_max, 3),
+                    "requests": self.requests,
+                    "request_ms_sum": round(self.request_ms_sum, 3),
+                    "request_ms_max": round(self.request_ms_max, 3),
+                    "active_peak": self.active_peak,
+                }
+            self._reset()
+            return row
+
+
+def read_listen_counters(path: str = "/proc/net/netstat"):
+    """(ListenOverflows, ListenDrops) from the host's TcpExt counters, or None.
+
+    Both are host-wide and cumulative. ListenOverflows counts connections the
+    kernel dropped because a listener's accept queue was full, ListenDrops
+    every SYN a listener dropped for that or another reason.
+    """
+    try:
+        with open(path) as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return None
+    for head, vals in zip(lines, lines[1:]):
+        if head.startswith("TcpExt:") and vals.startswith("TcpExt:"):
+            table = dict(zip(head.split()[1:], vals.split()[1:]))
+            try:
+                return int(table["ListenOverflows"]), int(table["ListenDrops"])
+            except (KeyError, ValueError):
+                return None
+    return None
+
+
+def accept_queues(ports, ss: str = "ss"):
+    """{port: [Recv-Q, Send-Q]} of the listening sockets on `ports`.
+
+    For a listener Recv-Q is the number of connections the kernel has
+    completed and the server has not yet accepted, and Send-Q the queue's
+    limit. None when ss cannot be run.
+    """
+    try:
+        out = subprocess.run([ss, "-H", "-ltn"], capture_output=True, text=True,
+                             timeout=2, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    queues = {}
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        try:
+            port = int(fields[3].rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if port in ports:
+            try:
+                queues[port] = [int(fields[1]), int(fields[2])]
+            except ValueError:
+                pass
+    return queues
+
+
+class ListenSampler(threading.Thread):
+    """Writes one row a second per busy listener, and one kernel row, to `log`."""
+
+    def __init__(self, servers, log: "JsonlLog", interval: float = 1.0):
+        super().__init__(name="listen-sampler", daemon=True)
+        self.servers = list(servers)
+        self.log = log
+        self.interval = interval
+        self._stop_event = threading.Event()
+        self._counters = read_listen_counters()
+        self._last = time.monotonic()
+
+    def run(self):
+        while not self._stop_event.wait(self.interval):
+            self.sample()
+
+    def sample(self):
+        now = time.monotonic()
+        elapsed, self._last = now - self._last, now
+        ts = time.time()
+        for server in self.servers:
+            row = server.stats.drain(elapsed)
+            if row is not None:
+                row["ts"] = ts
+                self.log.write(row)
+        counters = read_listen_counters()
+        kernel = {"ts": ts, "listener": "kernel", "interval_s": round(elapsed, 4)}
+        if counters is not None and self._counters is not None:
+            kernel["listen_overflows"] = counters[0] - self._counters[0]
+            kernel["listen_drops"] = counters[1] - self._counters[1]
+        self._counters = counters
+        kernel["accept_queue"] = accept_queues({s.server_port for s in self.servers})
+        self.log.write(kernel)
+
+    def stop(self):
+        """End the thread and write the last partial interval."""
+        self._stop_event.set()
+        self.join()
+        self.sample()
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     exact = {}
     noquery = {}
@@ -123,6 +320,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             super().handle_one_request()
         finally:
+            stats = getattr(self.server, "stats", None)
+            if stats is not None and self._log_status is not None:
+                stats.request((time.monotonic() - t0) * 1000)
             if self.access_log is not None and self._log_status is not None:
                 headers = getattr(self, "headers", None)
                 try:
@@ -397,12 +597,64 @@ class ReplayServer(http.server.ThreadingHTTPServer):
     daemon_threads = False
     block_on_close = True
 
-    def __init__(self, address, handler, peers=None):
+    # How long a handler thread waits for a client's hello when the handshake
+    # runs there (--tls-handshake-in-handler). The default placement has no
+    # limit: the accept thread waits for as long as the client does.
+    HANDSHAKE_TIMEOUT_S = 10.0
+
+    def __init__(self, address, handler, peers=None, name="http", backlog=None,
+                 handshake_in_handler=False):
+        # socketserver listens with request_queue_size, 5 unless a caller says
+        # otherwise; it is read by server_activate, inside the base __init__.
+        if backlog is not None:
+            self.request_queue_size = backlog
+        self.name = name
+        self.stats = ListenStats(name)
+        self.handshake_in_handler = handshake_in_handler
+        self._submitted = {}
         super().__init__(address, handler)
         self.log_failure = None
         self.failed_log = None
         self.peers = peers if peers is not None else []
         self.peers.append(self)
+
+    def get_request(self):
+        # accept() on the TLS listener runs the handshake in the thread that
+        # runs serve_forever, so no other connection is accepted meanwhile.
+        t0 = time.monotonic()
+        try:
+            conn = super().get_request()
+        except OSError:
+            self.stats.accepted((time.monotonic() - t0) * 1000, ok=False)
+            raise
+        self.stats.accepted((time.monotonic() - t0) * 1000)
+        return conn
+
+    def process_request(self, request, client_address):
+        self._submitted[id(request)] = time.monotonic()
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        submitted = self._submitted.pop(id(request), None)
+        if submitted is not None:
+            self.stats.thread_started((time.monotonic() - submitted) * 1000)
+        else:
+            self.stats.thread_started(0.0)
+        try:
+            if self.handshake_in_handler:
+                h0 = time.monotonic()
+                try:
+                    request.settimeout(self.HANDSHAKE_TIMEOUT_S)
+                    request.do_handshake()
+                    request.settimeout(None)
+                except OSError:
+                    self.stats.handshake((time.monotonic() - h0) * 1000, ok=False)
+                    self.shutdown_request(request)
+                    return
+                self.stats.handshake((time.monotonic() - h0) * 1000)
+            super().process_request_thread(request, client_address)
+        finally:
+            self.stats.thread_finished()
 
     def fail_closed(self, exc: BaseException, log_name: str) -> None:
         with _FAIL_CLOSED:
@@ -487,7 +739,8 @@ def install_signal_handlers(server: ReplayServer):
     return on_signal
 
 
-def serve_http(plain: ReplayServer, tls: ReplayServer, err=None, logs=(), dns=None) -> int:
+def serve_http(plain: ReplayServer, tls: ReplayServer, err=None, logs=(), dns=None,
+               sampler: "ListenSampler | None" = None) -> int:
     """Serve both listeners until a signal or a failed log write stops them.
 
     serve_forever() returns only through ReplayServer.request_stop (the
@@ -505,6 +758,9 @@ def serve_http(plain: ReplayServer, tls: ReplayServer, err=None, logs=(), dns=No
     if dns is not None:
         stop_dns(*dns)
     stop_listeners((tls, plain), logs)
+    if sampler is not None:
+        sampler.stop()
+        sampler.log.close()
     failure = tls.log_failure or plain.log_failure
     if failure is None:
         return 0
@@ -633,6 +889,16 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--access-log", default=None, metavar="PATH",
                     help="append one JSON line per HTTP/HTTPS request: "
                          "ts, peer, method, host, path, status, bytes, duration_ms")
+    ap.add_argument("--listen-log", default=None, metavar="PATH",
+                    help="append one JSON line a second per busy listener and one "
+                         "kernel line (accept-queue overflows and drops): see the "
+                         "module docstring")
+    ap.add_argument("--backlog", type=int, default=None, metavar="N",
+                    help="listen() backlog of both listeners; socketserver's default "
+                         "is 5. The kernel caps it at net.core.somaxconn")
+    ap.add_argument("--tls-handshake-in-handler", action="store_true",
+                    help="run the TLS handshake in the connection's handler thread "
+                         "instead of in the accept thread")
     return ap
 
 
@@ -658,23 +924,40 @@ def main():
     # Both listeners exist before either serves: a failure on one must find
     # the other in `peers`, and neither answers a request before that.
     peers = []
-    plain = ReplayServer(("127.0.0.1", args.port), Handler, peers)
-    tls = ReplayServer(("127.0.0.1", args.tls_port), Handler, peers)
+    if args.backlog is not None and args.backlog < 1:
+        ap.error(f"--backlog must be at least 1: {args.backlog}")
+    plain = ReplayServer(("127.0.0.1", args.port), Handler, peers, name="http",
+                         backlog=args.backlog)
+    tls = ReplayServer(("127.0.0.1", args.tls_port), Handler, peers, name="tls",
+                       backlog=args.backlog,
+                       handshake_in_handler=args.tls_handshake_in_handler)
     # The key pair lives only until it is loaded: a fixed path under /tmp was
     # shared by every server on the box, whatever user each ran as.
     with tempfile.TemporaryDirectory(prefix="corpus-replay-cert-") as tmp:
         crt, key = selfsigned(Path(tmp))
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(str(crt), str(key))
-    tls.socket = ctx.wrap_socket(tls.socket, server_side=True)
+    tls.socket = ctx.wrap_socket(tls.socket, server_side=True,
+                                 do_handshake_on_connect=not args.tls_handshake_in_handler)
 
     dns_thread = threading.Thread(target=serve_dns,
                                   args=(dns_sock, args.answer_ip, dns_log, plain), daemon=True)
     dns_thread.start()
     print(f"wildcard DNS on {args.dns_addr}:{args.dns_port} -> {args.answer_ip}", flush=True)
     install_signal_handlers(plain)
+    sampler = None
+    if args.listen_log:
+        listen_log = JsonlLog(args.listen_log)
+        listen_log.write({
+            "ts": time.time(), "listener": "start",
+            "tls_handshake": "handler" if args.tls_handshake_in_handler else "accept",
+            "backlog": plain.request_queue_size,
+            "tls_port": tls.server_port, "http_port": plain.server_port,
+        })
+        sampler = ListenSampler((plain, tls), listen_log)
+        sampler.start()
     print(f"replaying on http://127.0.0.1:{args.port} and https://127.0.0.1:{args.tls_port}", flush=True)
-    return serve_http(plain, tls,
+    return serve_http(plain, tls, sampler=sampler,
                       logs=[log for log in (Handler.access_log, dns_log) if log is not None],
                       dns=(dns_sock, dns_thread))
 
