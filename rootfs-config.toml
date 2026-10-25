@@ -39,8 +39,9 @@ commit = "4e8aa70379a35ec9deb11d76513e7f6c4123b667"
 # 2026-09-04): vsock muxer capacity + the bounded UFFD-minor memory backend,
 # and a Full snapshot written to a new memory file leaves all-zero 4 KiB pages
 # as holes, and with dirty tracking on a diff holds the pages a discard emptied
-# (balloon, free page reporting) as zeros. nested.arm64 builds nv2-on-main,
-# which has neither change.
+# (balloon, free page reporting) as zeros. nested.arm64 builds its own NV2
+# fork, which has neither change; its Full snapshot leaves only never-written
+# guest memory as holes.
 # v1.17.0 writes snapshot format 12 and refuses format 11, and the previous
 # build cannot restore format 12. A restore uses the binary the snapshot
 # recorded (SnapshotMetadata::firecracker_bin) while that file exists. A
@@ -359,9 +360,12 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 
 # Firecracker fork: diff snapshot fix + NV2 nested virt (ARM64)
 # PR: https://github.com/firecracker-microvm/firecracker/pull/5696
+# nv2-on-main plus a Full snapshot that leaves never-written guest memory as
+# holes instead of reading it, which would map it to the zero page and make
+# the resumed guest's first write to each page a copy-on-write (#1264).
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "nv2-on-main"
-firecracker_commit = "865fcab0d237cea9bcb3faf79f0e6d654d5a33eb"
+firecracker_branch = "fix/nv2-dump-skip-absent"
+firecracker_commit = "ad2ff71e8bdc79734849e9a71c0310af26b101c4"
 firecracker_args = "--enable-nv2"
 
 # Boot args for nested KVM

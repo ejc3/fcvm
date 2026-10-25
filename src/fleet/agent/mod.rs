@@ -290,6 +290,8 @@ where
             CoordMsg::Budget(b) => {
                 budget_tx.send_replace(Some(b));
             }
+            // The dialing connection keeps the replay (dial.rs); nothing to do here.
+            CoordMsg::QuarantineStored { .. } => {}
             CoordMsg::Assign {
                 slots: list,
                 region: r,

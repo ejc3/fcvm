@@ -824,7 +824,7 @@ std::string Pipeline::health_json() {
   if (!g.ok && !g.error.empty()) o << ",\"error\":\"" << json_escape(g.error) << "\"";
   o << "},";
   o.precision(15);
-  o << "\"t\":" << last_t_ << ",\"frame\":" << frame_;
+  o << "\"t\":" << last_t_ << ",\"frame\":" << frame_ << ",\"boot_id\":\"" << boot_id_ << "\"";
   o.precision(6);
   o << ",\"ready\":" << (ready_ ? "true" : "false");
   if (!fatal_.empty()) o << ",\"error\":\"" << json_escape(fatal_) << "\"";

@@ -1541,6 +1541,120 @@ async fn a_retired_tile_task_whose_instance_fails_reports_nothing_on_the_replace
     assert!(!reports.iter().any(|r| r.phase == "failed"), "{reports:#?}");
 }
 
+/// A tile whose renderer restarts on the same instance (its service has `Restart=always`)
+/// comes back answering `/health` without its scene. Its `boot_id` changes, and the
+/// coordinator posts the scene and the budget to it again.
+struct RestartingRendererEc2 {
+    boot: Arc<std::sync::Mutex<String>>,
+    scenes: Arc<std::sync::Mutex<Vec<String>>>,
+    budgets: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ec2::Ec2Driver for RestartingRendererEc2 {
+    async fn launch(&self, _tile: &str) -> Result<ec2::Launched, ec2::LaunchError> {
+        Ok(ec2::Launched {
+            instance: "i-test-0".into(),
+            frame_url: None,
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        Ok(l.clone())
+    }
+    async fn terminate(&self, _instance: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _tile: &str,
+        l: &ec2::Launched,
+        _body: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
+        self.scenes.lock().unwrap().push(l.instance.clone());
+        Ok(())
+    }
+    async fn post_budget(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        self.budgets
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    async fn health(&self, _tile: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        Ok(json!({"ready": true, "fps": 30.0, "boot_id": *self.boot.lock().unwrap()}))
+    }
+}
+
+#[tokio::test]
+async fn an_ec2_renderer_restarted_on_its_instance_gets_its_scene_again() {
+    use fleet_core::protocol::{AssignSlot, BudgetBody, SharedScene};
+    let boot = Arc::new(std::sync::Mutex::new("boot-1".to_string()));
+    let scenes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let budgets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let driver: Arc<dyn ec2::Ec2Driver> = Arc::new(RestartingRendererEc2 {
+        boot: boot.clone(),
+        scenes: scenes.clone(),
+        budgets: budgets.clone(),
+    });
+    let (handle, _reports) = recording_handle();
+    let tile = AssignSlot {
+        id: "ec2-1".into(),
+        sbdf: String::new(),
+        generation: 1,
+        rect: Some(fleet_core::tiling::Rect {
+            x: 0.5,
+            y: 0.0,
+            w: 0.25,
+            h: 1.0,
+        }),
+        private_camera: None,
+        layout_generation: 0,
+        rect_from_frame: 0,
+        previous_rect: None,
+        standby: false,
+        warm: false,
+    };
+    let (_assign, assign) = tokio::sync::watch::channel(vec![tile]);
+    let (_scene, scene) = tokio::sync::watch::channel(Some(SharedScene::new(
+        &fleet_core::scene::Scene::new(1_000),
+        32.0 / 9.0,
+    )));
+    let (_budget, budget) = tokio::sync::watch::channel(Some(BudgetBody {
+        budget: 500_000,
+        t: 1.0,
+    }));
+    tokio::spawn(ec2::run(driver, assign, scene, budget, handle));
+    let count = |s: &Arc<std::sync::Mutex<Vec<String>>>| s.lock().unwrap().len();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while count(&scenes) < 1 || budgets.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the running tile gets its scene and budget");
+    // Health is read once a second; the same boot id posts nothing again.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        count(&scenes),
+        1,
+        "an unchanged renderer gets no second scene"
+    );
+    *boot.lock().unwrap() = "boot-2".into();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while count(&scenes) < 2 || budgets.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a renderer with a new boot id gets the scene and the budget again");
+    assert_eq!(scenes.lock().unwrap()[1], "i-test-0", "the same instance");
+}
+
 /// A running tile whose renderer stops answering on an instance that keeps running is
 /// launched again after three silent checks in a row; a check it answers starts the count
 /// again. Before, only the instance's state was checked and the tile stayed `running`.
@@ -2156,6 +2270,84 @@ async fn an_ec2_capacity_wait_is_kept_out_of_the_race_time() {
     assert_eq!(s["scoreboard"]["ec2"]["last_capacity_wait_ms"], wait_ms);
 }
 
+/// An agent's quarantine report is acknowledged (`quarantine_stored`) only once a state write
+/// that holds the quarantine is stored: while writes fail the agent hears nothing and keeps
+/// replaying it, so a coordinator that crashes before its write cannot forget the GPU.
+#[tokio::test]
+async fn a_quarantine_is_acknowledged_once_a_stored_state_holds_it() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<store::StoreCmd>();
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let stored = Arc::new(std::sync::Mutex::new(None::<Arc<Vec<u8>>>));
+    let (f2, s2) = (failing.clone(), stored.clone());
+    // A store that keeps an unwritten state, as the real writers do, and fails while told to.
+    tokio::spawn(async move {
+        let mut pending: Option<Arc<Vec<u8>>> = None;
+        while let Some(cmd) = rx.recv().await {
+            if cmd.bytes.is_some() {
+                pending = cmd.bytes;
+            }
+            if pending.is_some() && !f2.load(std::sync::atomic::Ordering::SeqCst) {
+                *s2.lock().unwrap() = pending.take();
+            }
+            if let Some(a) = cmd.ack {
+                let _ = a.send(pending.is_none());
+            }
+        }
+    });
+    let (handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        Some(tx),
+        None,
+        None,
+        None,
+        None,
+    );
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 2);
+    agent.assign().await;
+    agent
+        .to_coord
+        .send(AgentMsg::Quarantine {
+            slot: "slot-1".into(),
+            sbdf: "0000:01:00.0".into(),
+            error: "GPU 0000:01:00.0 did not reset".into(),
+            report: Some("report-1".into()),
+        })
+        .unwrap();
+    // The next acknowledgement within `secs`, if any.
+    async fn ack(agent: &mut FakeAgent, secs: u64) -> Option<(String, Option<String>)> {
+        tokio::time::timeout(Duration::from_secs(secs), async {
+            loop {
+                if let CoordMsg::QuarantineStored { sbdf, report } = agent.next().await {
+                    return (sbdf, report);
+                }
+            }
+        })
+        .await
+        .ok()
+    }
+    // The store ticks once a second: three ticks pass with every write failing.
+    assert_eq!(
+        ack(&mut agent, 3).await,
+        None,
+        "a quarantine no stored state holds was acknowledged"
+    );
+    failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        ack(&mut agent, 5).await,
+        Some(("0000:01:00.0".to_string(), Some("report-1".to_string()))),
+        "the quarantine is acknowledged once a write holding it is stored"
+    );
+    let bytes = stored.lock().unwrap().clone().expect("a stored state");
+    let state: State = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        state
+            .fleet
+            .quarantined
+            .contains_key(&fleet_core::state::gpu_key("gpu-a", "0000:01:00.0")),
+        "the stored state holds the quarantine"
+    );
+}
+
 /// A GPU the agent quarantines leaves the wall (a standby GPU takes its place) and comes
 /// back only when an operator releases it through the admin endpoint. Restores count in
 /// the snapshot.
@@ -2185,6 +2377,7 @@ async fn a_quarantined_gpu_returns_only_by_the_operator() {
             slot: "slot-1".into(),
             sbdf: "0000:01:00.0".into(),
             error: "GPU 0000:01:00.0 did not reset".into(),
+            report: Some("report-1".into()),
         })
         .unwrap();
     let slots = loop {
@@ -2219,6 +2412,73 @@ async fn a_quarantined_gpu_returns_only_by_the_operator() {
     };
     assert_eq!(slots[0].id, "slot-1");
     assert!(slots[0].rect.is_some() && slots[1].standby, "{slots:?}");
+}
+
+/// An agent that did not hear its quarantine was stored replays it on its next connection.
+/// When an operator released the GPU meanwhile, the replay of that same report is
+/// acknowledged and changes nothing: the release stands. A new report for the GPU (it failed
+/// again) quarantines it.
+#[tokio::test]
+async fn a_replayed_quarantine_does_not_undo_an_operators_release() {
+    let config = Config {
+        max_tiles: 1,
+        ..Config::default()
+    };
+    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None, None);
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 2);
+    agent.assign().await;
+    let quarantine = |report: &str| AgentMsg::Quarantine {
+        slot: "slot-1".into(),
+        sbdf: "0000:01:00.0".into(),
+        error: "GPU 0000:01:00.0 did not reset".into(),
+        report: Some(report.into()),
+    };
+    // Read until the acknowledgement of `report`, returning the last assignment seen.
+    async fn acked(agent: &mut FakeAgent, report: &str, mut slots: usize) -> usize {
+        loop {
+            match agent.next().await {
+                CoordMsg::Assign { slots: s, .. } => slots = s.len(),
+                CoordMsg::QuarantineStored {
+                    report: Some(r), ..
+                } if r == report => return slots,
+                _ => {}
+            }
+        }
+    }
+    agent.to_coord.send(quarantine("report-1")).unwrap();
+    assert_eq!(acked(&mut agent, "report-1", 2).await, 1, "quarantined");
+    handle
+        .send(Event::ReleaseQuarantine {
+            at: 0,
+            host: "gpu-a".into(),
+            sbdf: "0000:01:00.0".into(),
+        })
+        .await;
+    loop {
+        if agent.assign().await.len() == 2 {
+            break;
+        }
+    }
+    let quarantined = |h: &Handle| -> bool {
+        let v: Value = serde_json::from_str(&h.snapshot.borrow().text).unwrap();
+        v["state"]["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["kind"] == "gpu_quarantined")
+    };
+    // The replay of the released report.
+    agent.to_coord.send(quarantine("report-1")).unwrap();
+    assert_eq!(
+        acked(&mut agent, "report-1", 2).await,
+        2,
+        "the replay of a released report took the GPU out again"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!quarantined(&handle), "the release stands");
+    // The GPU fails again: a new report quarantines it.
+    agent.to_coord.send(quarantine("report-2")).unwrap();
+    assert_eq!(acked(&mut agent, "report-2", 2).await, 1, "a new failure");
 }
 
 /// The coordinator's host launcher over `fake` in `regions`, polling every 50 ms.
@@ -3015,6 +3275,10 @@ struct FakeEc2Api {
     tagged: BTreeMap<String, Vec<String>>,
     /// Instances DescribeInstances reports terminated.
     gone: Vec<String>,
+    /// For a spot launch that names a subnet: the subnets with capacity, and those whose AZ
+    /// does not offer the type (`Unsupported`).
+    spot_subnets: Vec<String>,
+    unsupported_subnets: Vec<String>,
     calls: Arc<std::sync::Mutex<Vec<Ec2Call>>>,
 }
 
@@ -3060,8 +3324,16 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
                 match action {
                     "RunInstances" => {
                         let spot = params["LaunchTemplate.LaunchTemplateName"] == "fcvm-fleet-tile-x86_64";
-                        if spot && !api.spot_capacity.contains(&region) {
-                            return error("InsufficientInstanceCapacity");
+                        match params.get("NetworkInterface.1.SubnetId") {
+                            Some(s) if api.unsupported_subnets.contains(s) => return error("Unsupported"),
+                            Some(s) if spot && !api.spot_subnets.contains(s) => {
+                                return error("InsufficientInstanceCapacity")
+                            }
+                            Some(_) => {}
+                            None if spot && !api.spot_capacity.contains(&region) => {
+                                return error("InsufficientInstanceCapacity")
+                            }
+                            None => {}
                         }
                         (StatusCode::OK, "<RunInstancesResponse><instancesSet><item><instanceId>i-0123456789abcdef0</instanceId></item></instancesSet></RunInstancesResponse>".into())
                     }
@@ -3357,6 +3629,120 @@ async fn the_aws_tile_driver_waits_for_a_ready_renderer_and_refuses_a_failed_one
         .await
         .expect_err("a failed renderer is not a ready tile");
     assert!(format!("{e:#}").contains("CUDA init failed"), "{e:#}");
+}
+
+/// With subnets configured for a region, a launch tries each of them (one per AZ) in order,
+/// naming the whole interface (subnet, the region's group, a public IPv4 and an IPv6
+/// address), and moves to the next AZ on a capacity refusal or an `Unsupported` type, before
+/// the next region. Before, a launch named no subnet, so the template's one AZ decided.
+#[tokio::test]
+async fn the_aws_tile_driver_tries_every_az_of_a_region_before_the_next() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    use fcvm::fleet::coord::ec2_aws::{networks, AwsEc2};
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let api = FakeEc2Api {
+        // us-west-2 has capacity for a launch that names no subnet: a launch must not get
+        // there while an AZ of us-east-1 has some.
+        spot_capacity: vec!["us-west-2".into()],
+        spot_subnets: vec!["subnet-c".into()],
+        unsupported_subnets: vec!["subnet-a".into()],
+        ..Default::default()
+    };
+    let base = fake_ec2_api(api.clone()).await;
+    let regions = vec!["us-east-1".to_string(), "us-west-2".to_string()];
+    let mut d = AwsEc2::new(
+        regions.clone(),
+        "fcvm-fleet-tile-x86_64".into(),
+        None,
+        "fcvm.example".into(),
+    )
+    .unwrap();
+    for r in &regions {
+        d.endpoints.insert(r.clone(), base.clone());
+    }
+    d.networks = networks(
+        &["us-east-1:subnet-a,subnet-b,subnet-c".to_string()],
+        &["us-east-1:sg-0fleet".to_string()],
+    )
+    .unwrap();
+    let l = d.launch("ec2-1").await.unwrap();
+    assert_eq!(l.instance, "us-east-1/i-0123456789abcdef0");
+    let calls = api.calls.lock().unwrap();
+    let runs: Vec<&Ec2Call> = calls
+        .iter()
+        .filter(|(_, p)| p["Action"] == "RunInstances")
+        .collect();
+    let tried: Vec<(&str, Option<&str>)> = runs
+        .iter()
+        .map(|(r, p)| {
+            (
+                r.as_str(),
+                p.get("NetworkInterface.1.SubnetId").map(String::as_str),
+            )
+        })
+        .collect();
+    assert_eq!(
+        tried,
+        vec![
+            ("us-east-1", Some("subnet-a")),
+            ("us-east-1", Some("subnet-b")),
+            ("us-east-1", Some("subnet-c")),
+        ],
+        "every AZ of the first region, in order, and no other region"
+    );
+    for (_, p) in &runs {
+        assert_eq!(
+            p["LaunchTemplate.LaunchTemplateName"],
+            "fcvm-fleet-tile-x86_64"
+        );
+        assert_eq!(p["NetworkInterface.1.DeviceIndex"], "0");
+        assert_eq!(p["NetworkInterface.1.SecurityGroupId.1"], "sg-0fleet");
+        assert_eq!(p["NetworkInterface.1.AssociatePublicIpAddress"], "true");
+        assert_eq!(p["NetworkInterface.1.Ipv6AddressCount"], "1");
+        assert_eq!(p["NetworkInterface.1.DeleteOnTermination"], "true");
+    }
+}
+
+/// `--ec2-subnets` and `--ec2-security-group` (or their environment variables) parse into
+/// one network per region; a region with subnets and no group is refused at start.
+#[test]
+fn tile_networks_need_a_group_for_every_region_with_subnets() {
+    use fcvm::fleet::coord::ec2_aws::networks;
+    let n = networks(
+        &[
+            "us-east-1:subnet-a,subnet-b".to_string(),
+            String::new(),
+            "us-west-2:subnet-z".to_string(),
+        ],
+        &[
+            "us-east-1:sg-1".to_string(),
+            "us-west-2:sg-2".to_string(),
+            "us-east-2:sg-3".to_string(),
+        ],
+    )
+    .unwrap();
+    assert_eq!(n["us-east-1"].subnets, vec!["subnet-a", "subnet-b"]);
+    assert_eq!(n["us-east-1"].security_group, "sg-1");
+    assert_eq!(n["us-west-2"].subnets, vec!["subnet-z"]);
+    assert!(
+        !n.contains_key("us-east-2"),
+        "a group alone names no subnet"
+    );
+    let e = networks(&["us-east-1:subnet-a".to_string()], &[]).unwrap_err();
+    assert!(
+        format!("{e:#}").contains("no --ec2-security-group"),
+        "{e:#}"
+    );
+    assert!(networks(&["subnet-a".to_string()], &[]).is_err());
+    assert!(networks(
+        &[
+            "us-east-1:subnet-a".to_string(),
+            "us-east-1:subnet-b".to_string()
+        ],
+        &["us-east-1:sg-1".to_string()]
+    )
+    .is_err());
 }
 
 /// The AWS tile driver: a spot launch from the template, tagged, in the first region with

@@ -29,11 +29,19 @@
 //! The key exists to stop a set recorded against one memory image from being replayed against
 //! a different one. Because a mismatch can only waste work (see above), the key is sized to
 //! that harm: SHA-256 over the exact snapshot `config.json` digest plus the memory file's
-//! `(len, mtime, ino, dev)`, which is one small read and one `stat`.
+//! `(len, mtime)` with nanosecond mtime, which is one small read and one `stat`.
 //! Hashing the image itself was measured at 1.5 GB/s on this host — 1.4 s for a 2 GiB snapshot,
 //! paid on every `snapshot serve` startup — which is a far bigger cost than the mis-prefetch it
 //! would prevent. Rewriting a snapshot (`snapshot create --tag` over an existing tag) always
-//! writes a new file: new inode, new mtime, new key, and the stale set is dropped.
+//! writes a new file with a new mtime and a new config, so the stale set is dropped.
+//!
+//! The inode and device number are not part of the key. A store restored from a tar archive
+//! (or copied with `cp -p`, `rsync -t`) holds the same bytes under a new inode and possibly a
+//! new device, and keying on them made the first restore on every such host skip replay. Length
+//! and nanosecond mtime survive that copy and still change on a rewrite. A copy that loses the
+//! nanoseconds (tar's default format keeps whole seconds) misses, which is safe: the set is a
+//! hint. A false match is also safe: it can only copy pages nobody asked for, since the bytes
+//! always come from the served file.
 
 use anyhow::{Context, Result};
 use nix::fcntl::{Flock, FlockArg};
@@ -80,8 +88,6 @@ impl ImageKey {
         hasher.update(meta.len().to_le_bytes());
         hasher.update(meta.mtime().to_le_bytes());
         hasher.update(meta.mtime_nsec().to_le_bytes());
-        hasher.update(meta.ino().to_le_bytes());
-        hasher.update(meta.dev().to_le_bytes());
         Ok(Self(hasher.finalize().into()))
     }
 
@@ -1051,6 +1057,15 @@ mod tests {
         let mem_len = 64 * GRANULE;
         let image = fake_image("key-a", mem_len);
         let other = fake_image("key-b", mem_len);
+        // Same length and, on a coarse clock, possibly the same tick: the key tells images apart
+        // by mtime, not by inode, so make the difference explicit.
+        let mtime = std::fs::metadata(&image).unwrap().modified().unwrap();
+        File::options()
+            .write(true)
+            .open(&other)
+            .unwrap()
+            .set_modified(mtime + std::time::Duration::from_nanos(1))
+            .unwrap();
         let key = image_key(&image);
         let other_key = image_key(&other);
         assert_ne!(
@@ -1210,7 +1225,7 @@ mod tests {
         store.merge_and_persist(&observed).unwrap();
         assert_eq!(open_store(&image, mem_len).to_prefetch().len(), 4);
 
-        // Rewriting the snapshot replaces the memory image: new inode, new mtime, new key.
+        // Rewriting the snapshot replaces the memory image: new mtime, new config, new key.
         std::fs::remove_file(&image).unwrap();
         let f = File::create(&image).unwrap();
         f.set_len(mem_len).unwrap();
@@ -1221,6 +1236,84 @@ mod tests {
         assert!(
             after.to_prefetch().is_empty(),
             "a working set from the previous snapshot must not be replayed"
+        );
+    }
+
+    /// Copy a snapshot directory the way an extracted tar archive lands: every file is a new
+    /// inode with the same bytes, length and nanosecond mtime.
+    fn copy_dir_like_tar(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let dest = to.join(entry.file_name());
+            std::fs::copy(entry.path(), &dest).unwrap();
+            let mtime = std::fs::metadata(entry.path()).unwrap().modified().unwrap();
+            File::options()
+                .write(true)
+                .open(&dest)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn store_survives_a_copy_that_keeps_content_length_and_mtime() {
+        let mem_len = 64 * GRANULE;
+        let image = fake_image("tar-src", mem_len);
+        let store = open_store(&image, mem_len);
+        let mut observed = store.recorder();
+        observed.insert_range(0, 4 * GRANULE);
+        assert!(store.merge_and_persist(&observed).unwrap().persisted);
+
+        let dest = tempfile::Builder::new()
+            .prefix("fcvm-ws-test-tar-dst-")
+            .tempdir()
+            .unwrap();
+        copy_dir_like_tar(image.parent().unwrap(), dest.path());
+        let copied = dest.path().join("memory.bin");
+        let (a, b) = (
+            std::fs::metadata(&image).unwrap(),
+            std::fs::metadata(&copied).unwrap(),
+        );
+        assert_ne!(a.ino(), b.ino(), "the copy must be a new inode");
+        assert_eq!(a.mtime_nsec(), b.mtime_nsec());
+
+        assert_eq!(
+            open_store(&copied, mem_len).to_prefetch().len(),
+            4,
+            "a tar-restored snapshot must keep its recorded working set"
+        );
+    }
+
+    #[test]
+    fn store_drops_a_set_when_the_image_length_or_mtime_changed() {
+        let mem_len = 64 * GRANULE;
+        let image = fake_image("rewrite-in-place", mem_len);
+        let store = open_store(&image, mem_len);
+        let mut observed = store.recorder();
+        observed.insert_range(0, 4 * GRANULE);
+        assert!(store.merge_and_persist(&observed).unwrap().persisted);
+        assert_eq!(open_store(&image, mem_len).to_prefetch().len(), 4);
+
+        // Same config, same path: only the image's own stat differs.
+        let original = std::fs::metadata(&image).unwrap().modified().unwrap();
+        let f = File::options().write(true).open(&image).unwrap();
+        f.set_modified(original + std::time::Duration::from_nanos(1))
+            .unwrap();
+        assert!(
+            open_store(&image, mem_len).to_prefetch().is_empty(),
+            "a changed mtime means a rewritten image"
+        );
+        f.set_modified(original).unwrap();
+        assert_eq!(open_store(&image, mem_len).to_prefetch().len(), 4);
+
+        let longer = mem_len + GRANULE;
+        f.set_len(longer).unwrap();
+        f.set_modified(original).unwrap();
+        assert!(
+            open_store(&image, longer).to_prefetch().is_empty(),
+            "a changed length means a rewritten image"
         );
     }
 
