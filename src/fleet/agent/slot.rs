@@ -189,6 +189,7 @@ impl SlotCtx {
             slot: self.id.clone(),
             sbdf: self.sbdf.clone(),
             error: error.to_string(),
+            report: Some(uuid::Uuid::new_v4().simple().to_string()),
         });
     }
 

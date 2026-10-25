@@ -312,8 +312,18 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                         c.scrub_failures += 1;
                     }
                 }
-                AgentMsg::Quarantine { sbdf, error, .. } => {
-                    quarantine(&mut state.fleet, host, sbdf, error, at);
+                AgentMsg::Quarantine {
+                    sbdf,
+                    error,
+                    report,
+                    ..
+                } => {
+                    let key = gpu_key(host, sbdf);
+                    let released = report.is_some()
+                        && state.fleet.released_reports.get(&key) == report.as_ref();
+                    if !released {
+                        quarantine(&mut state.fleet, host, sbdf, error, report.clone(), at);
+                    }
                 }
             }
             None
@@ -351,7 +361,10 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             None
         }
         Event::ReleaseQuarantine { host, sbdf, .. } => {
-            state.fleet.quarantined.remove(&gpu_key(host, sbdf));
+            let key = gpu_key(host, sbdf);
+            if let Some(report) = state.fleet.quarantined.remove(&key).and_then(|q| q.report) {
+                state.fleet.released_reports.insert(key, report);
+            }
             None
         }
     }
@@ -480,7 +493,7 @@ pub fn is_quarantined(f: &Fleet, s: &Slot) -> bool {
 
 /// Take a GPU out of rotation: its slot leaves the tiling (and any race and claim), and
 /// stays out until an operator releases it.
-fn quarantine(f: &mut Fleet, host: &str, sbdf: &str, error: &str, at: u64) {
+fn quarantine(f: &mut Fleet, host: &str, sbdf: &str, error: &str, report: Option<String>, at: u64) {
     let key = gpu_key(host, sbdf);
     if f.quarantined.contains_key(&key) {
         return;
@@ -492,6 +505,7 @@ fn quarantine(f: &mut Fleet, host: &str, sbdf: &str, error: &str, at: u64) {
             sbdf: sbdf.to_string(),
             error: error.to_string(),
             since: at,
+            report,
         },
     );
     let on_gpu = |s: &Slot| {

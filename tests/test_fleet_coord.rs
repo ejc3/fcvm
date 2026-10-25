@@ -2310,14 +2310,15 @@ async fn a_quarantine_is_acknowledged_once_a_stored_state_holds_it() {
             slot: "slot-1".into(),
             sbdf: "0000:01:00.0".into(),
             error: "GPU 0000:01:00.0 did not reset".into(),
+            report: Some("report-1".into()),
         })
         .unwrap();
     // The next acknowledgement within `secs`, if any.
-    async fn ack(agent: &mut FakeAgent, secs: u64) -> Option<String> {
+    async fn ack(agent: &mut FakeAgent, secs: u64) -> Option<(String, Option<String>)> {
         tokio::time::timeout(Duration::from_secs(secs), async {
             loop {
-                if let CoordMsg::QuarantineStored { sbdf } = agent.next().await {
-                    return sbdf;
+                if let CoordMsg::QuarantineStored { sbdf, report } = agent.next().await {
+                    return (sbdf, report);
                 }
             }
         })
@@ -2332,8 +2333,8 @@ async fn a_quarantine_is_acknowledged_once_a_stored_state_holds_it() {
     );
     failing.store(false, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
-        ack(&mut agent, 5).await.as_deref(),
-        Some("0000:01:00.0"),
+        ack(&mut agent, 5).await,
+        Some(("0000:01:00.0".to_string(), Some("report-1".to_string()))),
         "the quarantine is acknowledged once a write holding it is stored"
     );
     let bytes = stored.lock().unwrap().clone().expect("a stored state");
@@ -2376,6 +2377,7 @@ async fn a_quarantined_gpu_returns_only_by_the_operator() {
             slot: "slot-1".into(),
             sbdf: "0000:01:00.0".into(),
             error: "GPU 0000:01:00.0 did not reset".into(),
+            report: Some("report-1".into()),
         })
         .unwrap();
     let slots = loop {
@@ -2410,6 +2412,73 @@ async fn a_quarantined_gpu_returns_only_by_the_operator() {
     };
     assert_eq!(slots[0].id, "slot-1");
     assert!(slots[0].rect.is_some() && slots[1].standby, "{slots:?}");
+}
+
+/// An agent that did not hear its quarantine was stored replays it on its next connection.
+/// When an operator released the GPU meanwhile, the replay of that same report is
+/// acknowledged and changes nothing: the release stands. A new report for the GPU (it failed
+/// again) quarantines it.
+#[tokio::test]
+async fn a_replayed_quarantine_does_not_undo_an_operators_release() {
+    let config = Config {
+        max_tiles: 1,
+        ..Config::default()
+    };
+    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None, None);
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 2);
+    agent.assign().await;
+    let quarantine = |report: &str| AgentMsg::Quarantine {
+        slot: "slot-1".into(),
+        sbdf: "0000:01:00.0".into(),
+        error: "GPU 0000:01:00.0 did not reset".into(),
+        report: Some(report.into()),
+    };
+    // Read until the acknowledgement of `report`, returning the last assignment seen.
+    async fn acked(agent: &mut FakeAgent, report: &str, mut slots: usize) -> usize {
+        loop {
+            match agent.next().await {
+                CoordMsg::Assign { slots: s, .. } => slots = s.len(),
+                CoordMsg::QuarantineStored {
+                    report: Some(r), ..
+                } if r == report => return slots,
+                _ => {}
+            }
+        }
+    }
+    agent.to_coord.send(quarantine("report-1")).unwrap();
+    assert_eq!(acked(&mut agent, "report-1", 2).await, 1, "quarantined");
+    handle
+        .send(Event::ReleaseQuarantine {
+            at: 0,
+            host: "gpu-a".into(),
+            sbdf: "0000:01:00.0".into(),
+        })
+        .await;
+    loop {
+        if agent.assign().await.len() == 2 {
+            break;
+        }
+    }
+    let quarantined = |h: &Handle| -> bool {
+        let v: Value = serde_json::from_str(&h.snapshot.borrow().text).unwrap();
+        v["state"]["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["kind"] == "gpu_quarantined")
+    };
+    // The replay of the released report.
+    agent.to_coord.send(quarantine("report-1")).unwrap();
+    assert_eq!(
+        acked(&mut agent, "report-1", 2).await,
+        2,
+        "the replay of a released report took the GPU out again"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!quarantined(&handle), "the release stands");
+    // The GPU fails again: a new report quarantines it.
+    agent.to_coord.send(quarantine("report-2")).unwrap();
+    assert_eq!(acked(&mut agent, "report-2", 2).await, 1, "a new failure");
 }
 
 /// With scale groups, the fleet scales them to zero after the idle time with no active

@@ -140,8 +140,8 @@ pub struct Actor {
     published: u64,
     stored: u64,
     /// Quarantines agents reported and have not been told are stored: host, GPU address,
-    /// and the state version that holds the report.
-    unacked: Vec<(String, String, u64)>,
+    /// the report's id, and the state version that holds the report.
+    unacked: Vec<(String, String, Option<String>, u64)>,
     clock: Box<dyn Fn() -> u64 + Send>,
 }
 
@@ -480,7 +480,9 @@ impl Actor {
                     return;
                 };
                 let quarantined = match &msg {
-                    AgentMsg::Quarantine { sbdf, .. } => Some(sbdf.clone()),
+                    AgentMsg::Quarantine { sbdf, report, .. } => {
+                        Some((sbdf.clone(), report.clone()))
+                    }
                     _ => None,
                 };
                 self.apply(Event::Agent {
@@ -488,8 +490,8 @@ impl Actor {
                     host: host.clone(),
                     msg,
                 });
-                if let Some(sbdf) = quarantined {
-                    self.unacked.push((host, sbdf, self.state.version));
+                if let Some((sbdf, report)) = quarantined {
+                    self.unacked.push((host, sbdf, report, self.state.version));
                 }
             }
             Cmd::Shutdown { ack } => {
@@ -513,12 +515,15 @@ impl Actor {
     /// next connection, which is acknowledged in turn.
     fn quarantines_stored(&mut self, version: u64) {
         let agents = &self.agents;
-        self.unacked.retain(|(host, sbdf, v)| {
+        self.unacked.retain(|(host, sbdf, report, v)| {
             if *v > version {
                 return true;
             }
             if let Some(a) = agents.values().find(|a| &a.host == host) {
-                let _ = a.tx.send(CoordMsg::QuarantineStored { sbdf: sbdf.clone() });
+                let _ = a.tx.send(CoordMsg::QuarantineStored {
+                    sbdf: sbdf.clone(),
+                    report: report.clone(),
+                });
             }
             false
         });

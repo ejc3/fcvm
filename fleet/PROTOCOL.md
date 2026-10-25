@@ -630,15 +630,18 @@ until the host stops.
 A GPU scrub finished (with `--scrub`: `<fcvm> gpu scrub <sbdf>`, exit status 0 is ok).
 
 ```json
-{"type": "quarantine", "slot": "slot-5", "sbdf": "0000:05:00.0", "error": "..."}
+{"type": "quarantine", "slot": "slot-5", "sbdf": "0000:05:00.0", "error": "...", "report": "<32 hex>"}
 ```
 
 The agent took a GPU out of rotation and runs nothing on it again: its scrub failed, a
 relaunch failed with an error naming the GPU's address, or three relaunches in a row
 failed before fcvm's `restored` record (the GPU reset and attach) or while the GPU was
 still held. Failures after the restore (the container or the renderer) do not count.
-The agent sends it again at the start of every connection until the coordinator answers
-with `quarantine_stored` for the GPU.
+`report` names this report (random per quarantine). The agent sends it again at the start
+of every connection until the coordinator answers with `quarantine_stored` for that report.
+A replay of a report whose quarantine an operator released (the coordinator keeps the last
+released report per GPU in its state) is acknowledged and changes nothing; a new report for
+the same GPU quarantines it again.
 
 ### Coordinator to agent
 
@@ -740,14 +743,15 @@ drawing the whole image for a claim gets no budget (it chooses its own). The coo
 body to each EC2 tile's renderer.
 
 ```json
-{"type": "quarantine_stored", "sbdf": "0000:05:00.0"}
+{"type": "quarantine_stored", "sbdf": "0000:05:00.0", "report": "<32 hex>"}
 ```
 
-A stored state holds the agent's `quarantine` report for this GPU: the coordinator's
+A stored state holds the agent's `quarantine` report `report` for this GPU: the coordinator's
 state write (`--state-file` or `--state-bucket`) that came after the report succeeded.
 Without it a coordinator that stopped before its next write would come back with no record
 of the quarantine and assign the GPU again, so the agent keeps the report in its replay
-until this arrives. The coordinator sends it on the store tick (1 s) after the write, to the
+until this arrives for that report (a newer report for the same GPU stays). The
+coordinator sends it on the store tick (1 s) after the write, to the
 host's connection at the time; a host that reconnected first replays the report and is
 answered on the new connection. With no store configured it is sent on the next tick. A
 release by the operator before the write still gets it: the stored state then holds the

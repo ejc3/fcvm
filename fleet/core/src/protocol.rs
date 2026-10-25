@@ -217,11 +217,15 @@ pub enum AgentMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
-    /// The agent took a GPU out of rotation: its reset, scrub or attach failed.
+    /// The agent took a GPU out of rotation: its reset, scrub or attach failed. `report`
+    /// names this report (random per quarantine), so a replay of it is told apart from a
+    /// new failure of the same GPU.
     Quarantine {
         slot: String,
         sbdf: String,
         error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report: Option<String>,
     },
 }
 
@@ -309,10 +313,13 @@ pub enum CoordMsg {
     /// The grid's budget: every renderer draws `budget` pixel-samples per frame from the
     /// first frame at or after scene time `t` (`POST /budget`, again after every scene).
     Budget(BudgetBody),
-    /// A state that holds the agent's `quarantine` report for this GPU (or an operator's
-    /// release that came after it) is stored: the agent stops replaying the report.
+    /// A state that holds the agent's `quarantine` report `report` for this GPU (or an
+    /// operator's release that came after it) is stored: the agent stops replaying that
+    /// report.
     QuarantineStored {
         sbdf: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report: Option<String>,
     },
 }
 

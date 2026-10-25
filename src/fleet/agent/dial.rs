@@ -80,9 +80,20 @@ impl Replay {
                     None => true,
                 });
             }
+            // Only the report it names: a newer failure of the same GPU (after an operator
+            // released it) replaced the line and is not stored yet.
             Some("quarantine_stored") => {
-                if let Some(sbdf) = v.get("sbdf").and_then(|s| s.as_str()) {
-                    self.keyed.remove(&format!("quarantine/{sbdf}"));
+                let Some(sbdf) = v.get("sbdf").and_then(|s| s.as_str()) else {
+                    return;
+                };
+                let key = format!("quarantine/{sbdf}");
+                let report = |v: &serde_json::Value| v.get("report").cloned();
+                let named = self.keyed.get(&key).is_some_and(|line| {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .is_ok_and(|q| report(&q) == report(&v))
+                });
+                if named {
+                    self.keyed.remove(&key);
                 }
             }
             _ => {}
@@ -213,6 +224,22 @@ pub async fn run(agent: Agent, cfg: DialCfg) -> Result<()> {
 mod tests {
     use super::Replay;
 
+    /// An operator releases a GPU while its first quarantine waits for its acknowledgement,
+    /// and the GPU fails again: the second report replaces the first in the replay, and the
+    /// first one's acknowledgement must not drop it.
+    #[test]
+    fn an_acknowledgement_drops_only_the_report_it_names() {
+        let mut r = Replay::default();
+        r.note(r#"{"type":"hello","host":"h","arch":"x86_64","gpus":[],"capacity":1}"#);
+        r.note(r#"{"type":"quarantine","slot":"slot-1","sbdf":"0000:19:00.0","error":"a","report":"r1"}"#);
+        r.note(r#"{"type":"quarantine","slot":"slot-1","sbdf":"0000:19:00.0","error":"b","report":"r2"}"#);
+        r.coordinator_frame(r#"{"type":"quarantine_stored","sbdf":"0000:19:00.0","report":"r1"}"#);
+        let lines = r.lines().join("\n");
+        assert!(lines.contains("\"report\":\"r2\""), "{lines}");
+        r.coordinator_frame(r#"{"type":"quarantine_stored","sbdf":"0000:19:00.0","report":"r2"}"#);
+        assert!(!r.lines().join("\n").contains("quarantine"));
+    }
+
     #[test]
     fn the_replay_forgets_slots_that_left_and_keeps_a_quarantine_until_it_is_stored() {
         let mut r = Replay::default();
@@ -220,7 +247,7 @@ mod tests {
         r.note(r#"{"type":"slot","id":"slot-1","phase":"running","generation":1}"#);
         r.note(r#"{"type":"slot","id":"slot-2","phase":"failed","generation":1}"#);
         r.note(
-            r#"{"type":"quarantine","slot":"slot-2","sbdf":"0000:19:00.0","error":"reset failed"}"#,
+            r#"{"type":"quarantine","slot":"slot-2","sbdf":"0000:19:00.0","error":"reset failed","report":"r1"}"#,
         );
         // The coordinator still lists both: everything is replayed.
         r.coordinator_frame(r#"{"type":"assign","slots":[{"id":"slot-1"},{"id":"slot-2"}]}"#);
@@ -232,11 +259,12 @@ mod tests {
         assert!(lines.contains("slot-1"), "{lines}");
         assert!(!lines.contains("\"id\":\"slot-2\""), "{lines}");
         assert!(lines.contains("\"quarantine\""), "{lines}");
-        // Another GPU's acknowledgement changes nothing.
-        r.coordinator_frame(r#"{"type":"quarantine_stored","sbdf":"0000:01:00.0"}"#);
+        // Another GPU's acknowledgement, or another report's, changes nothing.
+        r.coordinator_frame(r#"{"type":"quarantine_stored","sbdf":"0000:01:00.0","report":"r1"}"#);
+        r.coordinator_frame(r#"{"type":"quarantine_stored","sbdf":"0000:19:00.0","report":"r0"}"#);
         assert!(r.lines().join("\n").contains("\"quarantine\""));
         // Stored: no longer replayed.
-        r.coordinator_frame(r#"{"type":"quarantine_stored","sbdf":"0000:19:00.0"}"#);
+        r.coordinator_frame(r#"{"type":"quarantine_stored","sbdf":"0000:19:00.0","report":"r1"}"#);
         assert!(!r.lines().join("\n").contains("quarantine"));
         // An operator releases it and it runs again: nothing replays the old quarantine.
         r.coordinator_frame(r#"{"type":"assign","slots":[{"id":"slot-1"},{"id":"slot-2"}]}"#);
