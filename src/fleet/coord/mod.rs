@@ -351,12 +351,17 @@ impl Actor {
                 let d = &f.director;
                 // Only aggregators with a region: one without (a host whose GPUs are all
                 // on standby, the EC2 side with no tile) never sends a frame, and the
-                // capture waits for every source.
+                // capture waits for every source. A host aggregator is read at its
+                // published name when it has one (IPv4 first): the URL its agent reported
+                // can be an address only that host reaches.
                 let mut sources: Vec<String> = f
                     .hosts
                     .values()
                     .filter(|h| h.region.is_some())
-                    .filter_map(|h| h.aggregate_url.clone())
+                    .filter_map(|h| {
+                        let (v6, v4) = fleet_core::view::host_aggregate_urls(&self.state, h);
+                        v4.or(v6).or_else(|| h.aggregate_url.clone())
+                    })
                     .collect();
                 if let Some(u) = self
                     .ec2_aggregate_local

@@ -453,6 +453,14 @@ pub struct FleetAgentArgs {
     #[arg(long = "aggregate-arg", allow_hyphen_values = true)]
     pub aggregate_args: Vec<String>,
 
+    /// Serve the aggregator's stream to browsers with TLS (the --tls-secret certificate):
+    /// on this port of --publish-ip, reported with the host's public IPv4 address
+    /// (--public-ipv4-from-imds), and with an IPv6 prefix on port 443 of `<prefix>::1`,
+    /// which the agent adds to the host's default IPv6 interface. The coordinator names
+    /// both (`agg-<host>-<token>`).
+    #[arg(long, requires_all = ["aggregate_port", "tls_secret"])]
+    pub aggregate_tls_port: Option<u16>,
+
     /// A file the host's boot writes once its store is mounted; its modification time is
     /// reported in the hello (the wake's `store_ready` phase)
     #[arg(long)]

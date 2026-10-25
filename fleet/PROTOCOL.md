@@ -388,7 +388,11 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   and `failures` carry it.
 - `aggregates` lists the regions an aggregator serves (see Aggregator): one per GPU host
   that has placed tiles, with the tiles inside it, and the EC2 half when the coordinator
-  runs its aggregator. `frame_url` is null until the host's aggregator is serving.
+  runs its aggregator. `frame_url` is null until the host's aggregator is serving. With
+  the coordinator's DNS (`--dns-token-secret`) a host aggregator's `frame_url` and
+  `frame_url_v4` are its published names (`wss://agg-<host>-<token>.<zone>/frames`,
+  `wss://agg-<host>-<token>-v4.<zone>:<port>/frames`), and both stay null for an aggregator
+  that serves no browser (no `--aggregate-tls-port`).
 - `actions` holds the latest 50 intents, committed and refused, oldest first: the
   `viewer` that sent it, the intent `id`, its `args` (a refused word's are `{}`, so its
   text appears nowhere), and the outcome.
@@ -456,8 +460,12 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   asked for before it exists and never changes address, so no resolver holds a negative or
   stale answer for it. A launch's records stay until its slot has a newer published launch
   or leaves the fleet; names of the fleet's shape (`slot-<n>`, `ec2-<n>`, with or without a
-  token, with or without `-v4`) that nothing references are deleted, at start too; every
-  other name in the zone is left alone.
+  token, `agg-<host>-<token>`, each with or without `-v4`) that nothing references are
+  deleted, at start too; every other name in the zone is left alone. A host aggregator
+  that reports public addresses is named the same way under `agg-<host>-<token>` (a host
+  name of lowercase letters, digits and inner hyphens, at most 40 characters): AAAA its own
+  IPv6 address, A the host's IPv4 address, with its port in `frame_url_v4`. Its names last
+  while it reports the same addresses.
 - `--tls-secret` keeps the wildcard certificate renewed (see "Certificate").
 
 ### Certificate
@@ -765,7 +773,8 @@ round that counts it.
 fcvm fleet agent (--stdio | --dial <wss url> [--access-secret <secret>]) --image <renderer image> --base-port <port>
                  [--host <name>] [--publish-ip <ip>] [--frame-host <name or ip>]
                  [--gpus <sbdf>=<name>,...] [--fcvm <path>] [--fcvm-arg <arg>]...
-                 [--spot-notice-url <url>] [--aggregate-port <port> [--aggregate-arg <arg>]...]
+                 [--spot-notice-url <url>] [--aggregate-port <port> [--aggregate-arg <arg>]...
+                  [--aggregate-tls-port <port>]]
                  [--scrub] [--store-ready-file <path>] [--host-from-imds] [--secret-region <region>]
                  [--tls-secret <secret> [--tls-dir /run/fcvm-fleet/tls]]
                  [--ipv6-prefix <prefix/len> | --ipv6-prefix-from-imds] [--frame-zone <zone>]
@@ -819,6 +828,16 @@ every assignment or scene change, and reports it once it answers:
 ```json
 {"type": "aggregate", "frame_url": "ws://<frame host>:<port>/frames"}
 ```
+
+`--aggregate-tls-port <port>` (with `--tls-secret`) also serves the stream to browsers with
+TLS (the aggregator's `--tls-listen`, the renderers' certificate file): on `<publish ip>:<port>`,
+and with an IPv6 prefix on port 443 of `<prefix>::1`, the host's side of the prefix (fcvm
+never gives it to a VM), which the agent puts on the host's default IPv6 interface
+(`ip -6 addr replace <addr>/128 dev <iface> nodad`) before it starts. The message then
+carries what the coordinator names (`agg-<host>-<token>`, see `--dns-token-secret`):
+`ipv6` (port 443), and with `--public-ipv4-from-imds` the host's `ipv4` and the port as
+`v4_port`. The aggregator's `--listen` stays on `<publish ip>:<aggregate port>`, which the
+host's security group does not admit.
 
 ## Aggregator
 

@@ -195,9 +195,17 @@ pub enum AgentMsg {
     Draining {
         reason: String,
     },
-    /// The host's aggregator is serving the host's region at this frame WebSocket.
+    /// The host's aggregator is serving the host's region at this frame WebSocket, and,
+    /// when it serves browsers with TLS, at these public addresses: its own IPv6 address
+    /// (port 443) and the host's IPv4 address on `v4_port`. The coordinator names them.
     Aggregate {
         frame_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ipv6: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ipv4: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        v4_port: Option<u16>,
     },
     /// A GPU scrub finished (`ok`), or failed with `error`.
     Scrub {
