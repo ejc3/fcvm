@@ -525,7 +525,19 @@ pub struct ServeArgs {
     /// `fcvm podman run` that restores from the cache when its snapshot exists.
     #[arg(long)]
     pub no_snapshot: bool,
+
+    /// Seconds a sandbox create waits for the sandbox to become healthy. A create that is not
+    /// healthy by then stops the sandbox and returns 500.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_CREATE_TIMEOUT_SECS,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub create_timeout: u64,
 }
+
+/// Default for `fcvm serve --create-timeout`.
+pub const DEFAULT_CREATE_TIMEOUT_SECS: u64 = 120;
 
 // ============================================================================
 // Completions Command
