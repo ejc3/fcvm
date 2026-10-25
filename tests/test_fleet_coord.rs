@@ -3615,6 +3615,64 @@ async fn the_aws_tile_driver_waits_for_a_ready_renderer_and_refuses_a_failed_one
     assert!(format!("{e:#}").contains("CUDA init failed"), "{e:#}");
 }
 
+/// A starting tile's renderer is asked for `/health` every 250 ms, not every describe
+/// (3 s): the coordinator saw tiles ready up to 3 s late. EC2 is described once per `poll`
+/// all the same, so an instance reclaimed while it boots is still noticed.
+#[tokio::test]
+async fn a_starting_tile_is_seen_ready_within_the_health_poll_not_the_describe_poll() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    use fcvm::fleet::coord::ec2_aws::{AwsEc2, HEALTH_POLL};
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let n2 = n.clone();
+    let app = axum::Router::new().route(
+        "/health",
+        axum::routing::get(move || {
+            let i = n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { axum::Json(json!({"ready": i >= 2})) }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let api = FakeEc2Api::default();
+    let base = fake_ec2_api(api.clone()).await;
+    let mut d = AwsEc2::new(
+        vec!["us-east-1".to_string()],
+        "fcvm-fleet-tile-x86_64".into(),
+        None,
+        "fcvm.example".into(),
+    )
+    .unwrap();
+    assert!(d.health_poll == HEALTH_POLL && HEALTH_POLL <= Duration::from_millis(250));
+    d.endpoints.insert("us-east-1".into(), base);
+    d.health_scheme = "http".into();
+    d.health_port = port;
+    d.poll = Duration::from_secs(3);
+    d.ready_timeout = Duration::from_secs(20);
+    let launched = ec2::Launched {
+        instance: "us-east-1/i-0123456789abcdef0".into(),
+        frame_url: None,
+        ipv6: None,
+        ipv4: None,
+    };
+    let t = std::time::Instant::now();
+    d.ready("ec2-1", &launched).await.unwrap();
+    let took = t.elapsed();
+    assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 3);
+    // Two not-ready answers, then ready: two health polls, far less than one describe poll.
+    assert!(took < Duration::from_millis(1500), "ready after {took:?}");
+    let describes = api
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, p)| p["Action"] == "DescribeInstances")
+        .count();
+    assert_eq!(describes, 1, "one describe within the first poll");
+}
+
 /// With subnets configured for a region, a launch tries each of them (one per AZ) in order,
 /// naming the whole interface (subnet, the region's group, a public IPv4 and an IPv6
 /// address), and moves to the next AZ on a capacity refusal or an `Unsupported` type, before

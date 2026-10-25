@@ -362,7 +362,8 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   `wake: tile running` with each tile's timings, `wake: fleet awake`), each with
   `since_wake_ms`, and each EC2 tile's readiness (`tile ready`: since its launch was
   accepted, when the instance was first seen running, when its renderer first answered
-  `/health`, and when it was ready).
+  `/health`, and when it was ready). A starting tile is described every 3 s and, once it
+  runs with an address, its renderer's `/health` is asked every 250 ms in between.
 - `counters` are totals since the fleet first started, kept in the state file across
   coordinator restarts: `restores` counts fcvm GPU VMs that reached their first frame
   (the wall's, races', claims' and returns'), `restores_last_hour` those in the current
