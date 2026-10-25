@@ -1088,6 +1088,52 @@ mod tests {
         drop(lease_gpu_as(&state, sbdf, false).expect("a rootless run uses the file root created"));
     }
 
+    /// The fleet host's boot creates each GPU's lock file without replacing one that
+    /// exists: a launch may already hold its lease on that inode, and a new inode under
+    /// the same name would let a scrub lock it while the launch's lease is held.
+    #[test]
+    fn the_host_boot_creates_lock_files_without_replacing_a_leased_one() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let script = include_str!("../../fleet/ami/host/bind-vfio.sh");
+        let function = script
+            .lines()
+            .find(|line| line.starts_with("make_lock_file() {"))
+            .expect("bind-vfio.sh has no make_lock_file");
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("gpu");
+        let sbdf = "0000:18:00.0";
+        let path = lock_path(&state, sbdf);
+        let run = || {
+            let status = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!("set -eu\n{function}\nmake_lock_file \"$1\""))
+                .arg("bash")
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success(), "make_lock_file failed: {status}");
+        };
+        std::fs::create_dir_all(&state).unwrap();
+        run();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        let lease = lease_gpu_as(&state, sbdf, false).unwrap();
+        let leased_inode = std::fs::metadata(&path).unwrap().ino();
+        run();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            leased_inode,
+            "the boot replaced a lock file a VM holds its lease on"
+        );
+        let fake = Fake::new();
+        let (report, reset) = scrub_recorded(&fake, &state, &|| {});
+        assert_eq!(report.outcome, "busy", "{:?}", report.error);
+        assert!(!reset);
+        drop(lease);
+    }
+
     /// Root writes the records and rootless launches read them, so a record
     /// and its directory are readable by everyone whatever root's umask.
     #[test]

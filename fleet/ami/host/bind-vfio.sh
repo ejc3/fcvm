@@ -32,11 +32,13 @@ done
 mv "$out.tmp" "$out"; cat "$out"
 # Each GPU's lock file, readable by every user. A VM's shared lease on it keeps
 # `fcvm gpu scrub` off a GPU the VM holds, and a rootless run cannot create it here.
+# Opened for append, never replaced: a launch may already hold its lease on the file's
+# inode, and a new inode under the same name would let a scrub lock it.
+make_lock_file() { : >> "$1" && chmod 0644 "$1"; }
 install -d -m 0755 /var/lib/fcvm/gpu || bad=1
 for d in /sys/bus/pci/devices/*; do
   [ "$(cat "$d/vendor")" = 0x10de ] || continue
-  f=/var/lib/fcvm/gpu/${d##*/}.lock
-  [ -e "$f" ] || install -m 0644 /dev/null "$f" || bad=1
+  make_lock_file "/var/lib/fcvm/gpu/${d##*/}.lock" || bad=1
 done
 grep -qw intel_iommu=on /proc/cmdline || { [ "$(uname -m)" != x86_64 ] || { echo "kernel booted without intel_iommu=on"; bad=1; }; }
 [ "$n" -gt 0 ] || { echo "no NVIDIA function found"; bad=1; }
