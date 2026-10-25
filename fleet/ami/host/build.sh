@@ -7,7 +7,7 @@
 #   build.sh build   fcvm at $FCVM_COMMIT (make build, make setup-gpu), the renderer image,
 #                    one GPU VM to first frame (warms the image export and snapshot cache),
 #                    and the renderer image's export at /mnt/fcvm-btrfs/renderer.oci.tar.zst
-#   build.sh bake    copies the store into /var/lib/fcvm-fleet/store.tar.zst and cleans up
+#   build.sh bake    packs the store into /var/lib/fcvm-fleet/store/ (store-pack.py) and cleans up
 #                    for imaging
 #
 # Every phase logs to /var/log/fleet-ami/<phase>.log and leaves <phase>.done or
@@ -114,27 +114,30 @@ build)
 bake)
   pkill -TERM -x fcvm || true; sleep 2
   install -m 0755 "$HERE/warm.sh" "$HERE/store.sh" "$HERE/s3-cat.py" /usr/local/lib/fcvm-fleet/
-  # Where the store archive is fetched at boot; build-ami.sh uploads it there after bake.
-  if [ -n "${STORE_S3_KEY:-}" ]; then
-    printf 'STORE_S3_REGION=%s\nSTORE_S3_BUCKET=%s\nSTORE_S3_KEY=%s\n' "$STORE_S3_REGION" "$STORE_S3_BUCKET" "$STORE_S3_KEY" > /etc/fcvm-fleet/store.env
+  # Where the store's parts are fetched at boot (<prefix><part>.tar.zst); they are uploaded
+  # there after bake (fleet/ami/README.md).
+  if [ -n "${STORE_S3_PREFIX:-}" ]; then
+    printf 'STORE_S3_REGION=%s\nSTORE_S3_BUCKET=%s\nSTORE_S3_PREFIX=%s\n' "$STORE_S3_REGION" "$STORE_S3_BUCKET" "$STORE_S3_PREFIX" > /etc/fcvm-fleet/store.env
   fi
   # What a host needs to run GPU VMs without building: everything in the store except
   # per-VM and per-run state, build caches and downloads that only setup reads.
   cd /mnt/fcvm-btrfs
   du -sh --apparent-size ./* 2>/dev/null | sort -h | tee "$S/store-du.txt"
-  # --format=posix keeps modification times to the nanosecond. fcvm keys the snapshot
+  # STORE_PARTS parts, extracted at once at boot (store.sh). store-pack.py writes them with
+  # --format=posix, which keeps modification times to the nanosecond. fcvm keys the snapshot
   # cache by each driver and overlay image's SHA-256 and caches that digest in
-  # version-cache/ under the image's path, mtime and length, so with whole-second
-  # mtimes a host would hash the images again on its first GPU VM (#1219).
-  tar -c --sparse --numeric-owner --format=posix \
+  # version-cache/ under the image's path, mtime and length, so with whole-second mtimes a
+  # host would hash the images again on its first GPU VM (#1219).
+  rm -rf /var/lib/fcvm-fleet/store
+  python3 "$HERE/store-pack.py" /mnt/fcvm-btrfs /var/lib/fcvm-fleet/store "${STORE_PARTS:-16}" \
       --exclude=./vm-disks --exclude=./state --exclude=./cache --exclude='./cargo-target*' \
-      --exclude=./renderer.oci.tar --exclude=./renderer.oci.tar.zst --exclude='./*.lock' \
-      . | zstd -q -T0 -6 -o /var/lib/fcvm-fleet/store.tar.zst -f
-  ls -la /var/lib/fcvm-fleet/store.tar.zst
-  # The archive goes to S3 in one presigned PUT, which S3 refuses above 5 GiB; a host whose
+      --exclude=./renderer.oci.tar --exclude=./renderer.oci.tar.zst --exclude='./*.lock'
+  ls -la /var/lib/fcvm-fleet/store
+  # Each part goes to S3 in one presigned PUT, which S3 refuses above 5 GiB; a host whose
   # S3 restore fails falls back to the AMI's copy, which took 1006 s against 78 s (2026-10-24).
-  [ "$(stat -c %s /var/lib/fcvm-fleet/store.tar.zst)" -lt $((5 * 1024 * 1024 * 1024)) ] || {
-    echo "store.tar.zst is 5 GiB or more: one PUT cannot upload it"; exit 1; }
+  for f in /var/lib/fcvm-fleet/store/*.tar.zst; do
+    [ "$(stat -c %s "$f")" -lt $((5 * 1024 * 1024 * 1024)) ] || { echo "$f is 5 GiB or more: one PUT cannot upload it"; exit 1; }
+  done
   # The user's rootless podman storage keeps the renderer image (the store holds its export).
   rm -rf "$UH/.cargo/registry" "$UH/.cargo/git" "$UH/.rustup/toolchains"/*/share/doc
   rm -f "$SRC/target"
