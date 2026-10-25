@@ -965,7 +965,9 @@ A scene whose `layout_generation` is the one in force, or already pending,
 changes nothing about the switch (the coordinator re-posts the same body).
 Without `layout_generation` a scene takes effect at once, as before: it
 cancels a pending switch, and headers sent after it carry `layout_generation`
-null. With it
+null. If a generation was in force, every open stream gets a new header (and a
+keyframe) with `layout_generation` null at the next frame, even when the geometry
+is unchanged. With it
 and no `previous_rect`, the new rect applies from K and frames before K use it
 too. A re-tile keeps the clock, so it keeps the budget schedule (see "Budget"),
 and the budget the coordinator re-posts after the scene, with a `t` at or

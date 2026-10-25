@@ -201,6 +201,7 @@ int tile_h_for(const Rect& r, double image_aspect, int full_h) {
 
 void LayoutSwitch::on_scene(const Scene& sc) {
   if (sc.layout_generation < 0) {
+    if (cur >= 0) cleared = true;
     pending = false;
     cur = next = -1;
     return;
@@ -211,6 +212,12 @@ void LayoutSwitch::on_scene(const Scene& sc) {
   k = sc.rect_from_frame >= 0 ? sc.rect_from_frame : 0;
   from = sc.has_previous_rect ? sc.previous_rect : sc.rect;
   to = sc.rect;
+}
+
+bool LayoutSwitch::take_cleared() {
+  bool c = cleared;
+  cleared = false;
+  return c;
 }
 
 bool LayoutSwitch::take(long long frame) {
