@@ -63,123 +63,38 @@ jobs:
   # (docs, the assistant tooling, the claude workflows) still runs `actionlint`
   # and still publishes `Summary`; it just skips the VM matrix, which cannot say
   # anything about those files. Gating per-job rather than per-workflow is what
-  # keeps `Summary` present on every PR.
+  # keeps `Summary` present on every PR. A draft, or a PR with another stacked
+  # on it, runs none of them (not even `actionlint`) and reports `Summary (deferred)`.
   changes:
     name: Changes
     runs-on: ubuntu-latest
     outputs:
+      run: ${{ steps.detect.outputs.run }}
+      reason: ${{ steps.detect.outputs.reason }}
       code: ${{ steps.detect.outputs.code }}
       bench: ${{ steps.detect.outputs.bench }}
       fleet: ${{ steps.detect.outputs.fleet }}
       web: ${{ steps.detect.outputs.web }}
     steps:
-      - name: Detect whether any non-doc path changed
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # A draft, and a PR with another open PR stacked on it, run nothing; the top
+      # of a stack classifies the whole stack's diff. See scripts/ci-pr-scope.sh.
+      - name: Detect what this event needs to run
         id: detect
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           PR: ${{ github.event.number }}
           REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          # Only a pull_request has a well-defined changed-file set here; every
-          # other trigger runs the full matrix rather than guess.
-          # A fail-open must open EVERY gate. Writing `code=true` alone left
-          # `bench` unset, and bench-tests is gated on it, so the bench lints
-          # were skipped on push-to-main, workflow_dispatch and the Build
-          # Kernels workflow_run — i.e. never ran on main at all, which matters
-          # because the documented stacked-PR routine force-merges with --admin
-          # after cancelling the PR-side run. Summary counts skipped as
-          # non-failure, so that read as green.
-          if [ "$EVENT" != "pull_request" ]; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            echo "bench=true" >> "$GITHUB_OUTPUT"
-            echo "fleet=true" >> "$GITHUB_OUTPUT"
-            echo "web=true" >> "$GITHUB_OUTPUT"
-            echo "event $EVENT: running the full matrix"
-            exit 0
-          fi
-          # `.filename` is the POST-rename path only. `git mv src/foo.rs
-          # bench/chromium/foo.rs` would report one bench/ entry, leave code
-          # false, skip the whole VM matrix, and make a non-compiling tree
-          # mergeable behind a green Summary. `previous_filename` is present on
-          # exactly the renamed entries, so classifying both paths means a
-          # rename is judged by where it came from as well as where it went.
-          files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate \
-            --jq '.[] | .filename, (.previous_filename // empty)')
-          if [ -z "$files" ]; then
-            # An empty file list is unexpected, so fail toward running everything.
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            echo "bench=true" >> "$GITHUB_OUTPUT"
-            echo "fleet=true" >> "$GITHUB_OUTPUT"
-            echo "web=true" >> "$GITHUB_OUTPUT"
-            echo "no changed files reported: running the full matrix"
-            exit 0
-          fi
-          # bench/** is classified SEPARATELY, not lumped into code. The
-          # self-hosted matrix does not exercise the benchmark harness at all,
-          # so a bench-only PR was paying for the full matrix and getting no
-          # check of the thing it changed. It now runs bench-tests instead,
-          # which is the check that can actually fail for it. Skipping without
-          # routing would be the green-by-absence hole this file already
-          # documents twice.
-          code=false
-          bench=false
-          fleet=false
-          web=false
-          while IFS= read -r f; do
-            # `bench/*` MUST precede the docs arm. A shell `case` glob matches
-            # `/`, so `*.md` swallows bench/chromium/README.md and that PR
-            # reports code=false bench=false: zero gating jobs, clean Summary.
-            # Meanwhile bench/chromium/test_reqbench.py carries lints that read
-            # exactly those files (the Clopper-Pearson bound lint on REVIEW.md,
-            # the JPEG figure and cited-path lints on AGENTS.md, the healthcheck
-            # lint on README.md), so the one class of change those lints exist
-            # to catch would be the one class that runs nothing.
-            #
-            # The `*.md` in `paths-ignore:` at the top of this file is NOT the
-            # same pattern: GitHub's filter globs stop at a slash, so there it
-            # means root-level markdown only. Identical spelling, different
-            # matcher — which is why this was easy to miss.
-            case "$f" in
-              scripts/claude-assistant/*|.github/workflows/claude*.yml|.claude/*) ;;
-              # Docs that TESTS READ are code, whatever their extension.
-              # tests/test_documented_make_targets.rs reads README.md and
-              # PERFORMANCE.md and fails when they name make targets that do not
-              # exist; it runs ungated under `make test-unit` in the host job. A
-              # PR editing only those files was getting zero gating jobs while
-              # the very lints that check them sat unrun -- the same hole this
-              # file fixes for bench/, one directory up.
-              README.md|PERFORMANCE.md) code=true; echo "linted doc: $f" ;;
-              # The Makefile is BOTH: ordinary code, and the subject of
-              # bench/chromium/test_reqbench.py::MakefileBenchGraph, the
-              # structural pin AGENTS.md cites for the bench dependency graph.
-              # It runs `make -pq` against this file, so a Makefile-only change
-              # is exactly the class that can break it.
-              Makefile) code=true; bench=true; echo "makefile: $f" ;;
-              bench/*) bench=true; echo "bench path: $f" ;;
-              # fleet/core is a workspace member that fcvm builds, so it is code.
-              # The rest of fleet/ (renderer, media, shots, tools, PROTOCOL.md)
-              # is not built, read or run by anything the VM matrix executes, so
-              # the matrix can say nothing about it. It runs fleet-renderer, the
-              # renderer's host tests; fleet/web runs fleet-web instead.
-              fleet/core/*) code=true; echo "code path: $f" ;;
-              # The fleet web page is TypeScript with its own suite (fleet-web);
-              # the VM matrix does not build or run it. Like bench/, it precedes
-              # the docs arm so its README still routes to its check.
-              fleet/web/*) web=true; echo "fleet web path: $f" ;;
-              fleet/*|.github/workflows/fleet-coordinator-deploy.yml) fleet=true; echo "fleet path, no matrix: $f" ;;
-              # This file holds the fleet-renderer and fleet-web jobs, so a change here runs them too.
-              .github/workflows/ci.yml) code=true; web=true; fleet=true; echo "ci workflow: $f" ;;
-              docs/*|*.md) ;;
-              *) code=true; echo "code path: $f" ;;
-            esac
-          done <<< "$files"
-          echo "code=$code" >> "$GITHUB_OUTPUT"
-          echo "bench=$bench" >> "$GITHUB_OUTPUT"
-          echo "fleet=$fleet" >> "$GITHUB_OUTPUT"
-          echo "web=$web" >> "$GITHUB_OUTPUT"
-          echo "code_changed=$code bench_changed=$bench fleet_changed=$fleet web_changed=$web"
+          DRAFT: ${{ github.event.pull_request.draft }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: bash scripts/ci-pr-scope.sh
 
   # The benchmark harness has four test files and, until now, CI ran none of
   # them: `grep -c bench/ ci.yml` was 0 while bench/chromium/test_reqbench.py,
@@ -269,6 +184,8 @@ jobs:
   # matrix, and this is then the check that can actually fail for it.
   actionlint:
     name: actionlint
+    needs: [changes]
+    if: ${{ needs.changes.outputs.run == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -286,6 +203,8 @@ jobs:
         run: /tmp/actionlint -shellcheck=
       - name: Test runner acceptance contract without AWS credentials
         run: make test-runner-acceptance
+      - name: Test the pull request scope and stack coverage
+        run: make test-ci-scope
 
   # The fleet renderer's host tests (fleet/renderer/tests/test_host.cpp: scene
   # parsing, tile geometry, wire formats, TLS). They need g++, OpenSSL and the
@@ -378,6 +297,13 @@ jobs:
               if ! NAMES=$(gh api "repos/$REPO/actions/runs/$run/jobs" --paginate \
                   --jq '.jobs[] | select(.conclusion == "success" or .conclusion == "skipped") | .name'); then
                 echo "Could not list the jobs of run $run, ignoring it"
+                continue
+              fi
+              # Only a run that tested something counts. A draft's or a lower stack
+              # PR's run skips every job and still succeeds, under a Summary named
+              # "Summary (deferred)"; reusing it would skip the whole matrix here.
+              if ! grep -qxF Summary <<< "$NAMES"; then
+                echo "Run $run tested nothing (no passing Summary), ignoring it"
                 continue
               fi
               echo "Tree SHA $TREE_SHA already passed CI on PR commit $sha (run $run)"
@@ -1306,8 +1232,11 @@ jobs:
           retention-days: 14
 
   # Final summary job - runs after all test jobs
+  # A run that tested nothing (a draft, or a PR with another stacked on it) is
+  # named "Summary (deferred)", so a reader or a tool looking for a passing
+  # Summary on that commit finds none.
   summary:
-    name: Summary
+    name: ${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || 'Summary' }}
     needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, bench-tests, fleet-renderer, fleet-web, host, host-root, container]
     if: always()
     runs-on: ubuntu-latest
@@ -1376,6 +1305,11 @@ jobs:
           echo "::error::A gating job did not succeed — needs results: $RESULTS"
           exit 1
 
+      - name: Report deferred
+        if: needs.changes.outputs.run == 'false'
+        env:
+          REASON: ${{ needs.changes.outputs.reason }}
+        run: echo "::notice::Nothing tested on this commit. $REASON"
       - name: Report skipped
         if: needs.skip-check.outputs.skip == 'true'
         run: echo "::notice::Skipped self-hosted tests — every self-hosted job already passed for this tree on a PR branch"
@@ -1396,3 +1330,35 @@ jobs:
       - name: Analyze CI run
         if: needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true'
         run: python3 scripts/analyze_ci_vms.py /tmp/ci-artifacts
+
+  # The top of a stack tests every lower PR's commits. When its run passes, each
+  # lower PR whose head is an ancestor of this head gets a "Stack CI" success
+  # status naming this run, which is what says that PR was tested.
+  stack-coverage:
+    name: Stack coverage
+    needs: [changes, summary]
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.changes.outputs.run == 'true' &&
+      needs.summary.result == 'success' &&
+      github.event.pull_request.base.ref != github.event.repository.default_branch &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Mark the lower PRs of this stack as tested
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash scripts/ci-stack-coverage.sh

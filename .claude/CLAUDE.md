@@ -692,6 +692,27 @@ means the reviewer never started.
 Enforcement: `tests/test_ci_workflow_coverage.rs` fails if `ci.yml` reintroduces a
 `branches:`/`branches-ignore:` filter on `pull_request`, or if a gating job leaves that file.
 
+### CI runs on the top of a stack, not on every layer
+
+A draft PR runs no tests, and neither does a PR that another open PR from this repository is
+stacked on (`scripts/ci-pr-scope.sh`). Their run ends in a check named **`Summary (deferred)`**,
+never `Summary`, so it can never be read as a pass. Push the stack as drafts, mark it ready, and
+the top PR's run tests every layer: its `changes` job classifies the whole stack's diff against
+`main`, not only the top PR's files, so a docs-only top cannot skip the matrix for code changed
+lower down.
+
+When the top's `Summary` passes, the `Stack coverage` job posts a **`Stack CI`** success status
+on each lower PR's head, naming the run, but only on heads that are ancestors of the tested
+head (`scripts/ci-stack-coverage.sh`). A lower PR is tested when it carries `Summary` success or
+`Stack CI` success on its current head; `Summary (deferred)` alone means nothing ran for it.
+
+To bisect a failure on the top, run one layer on its own:
+`gh workflow run ci.yml --ref <layer-branch>` (a dispatch run tests the full matrix). Also run it
+when the top PR is closed and a lower PR becomes the top, since nothing re-triggers its CI.
+
+Enforcement: `scripts/test-ci-stack-scope.py` (`make test-ci-scope`, run by the `actionlint`
+job) drives both scripts against a fake `gh` and evaluates every job's `if:` for a deferred run.
+
 ## Fresh Bare-Metal Box Quickstart
 
 Bring up a new ARM (or x86) KVM-capable box to building-and-benching in ~20 minutes.
