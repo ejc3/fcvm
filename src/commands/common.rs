@@ -44,10 +44,11 @@ pub struct RuntimeConfig {
     pub gpu_driver_image: Option<GpuDriverImage>,
 }
 
-/// A profile's NVIDIA driver image and the build identity (`utils::file_identity`)
+/// A profile's NVIDIA driver image and the build identity (`utils::image_disk_digest`)
 /// it had when resolved. The identity keys the snapshot cache: a rebuild at the same
 /// path is a different filesystem, which a snapshot holding the guest's mount of the
-/// old one must not be restored against.
+/// old one must not be restored against, while a copy of the same bytes (a store
+/// restored from an archive) keeps its snapshots.
 #[derive(Clone, Debug)]
 pub struct GpuDriverImage {
     pub path: PathBuf,
@@ -56,8 +57,8 @@ pub struct GpuDriverImage {
 
 impl GpuDriverImage {
     pub fn at(path: PathBuf) -> anyhow::Result<Self> {
-        let identity = crate::utils::file_identity(&path)
-            .with_context(|| format!("stat NVIDIA driver image {}", path.display()))?;
+        let identity = crate::utils::image_disk_digest(&path)
+            .with_context(|| format!("hash NVIDIA driver image {}", path.display()))?;
         Ok(Self { path, identity })
     }
 }

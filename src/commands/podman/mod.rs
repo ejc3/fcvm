@@ -1473,8 +1473,8 @@ async fn prepare_vm_for_lifecycle(
         args.image_disk_override.clone()
     };
 
-    // Build identity (inode/size/mtime) of the exact file that will be
-    // attached; a rebuild at the same path is a different identity. Overlay
+    // Build identity (SHA-256, `utils::image_disk_digest`) of the exact file that
+    // will be attached; a rebuild at the same path is a different identity. Overlay
     // storage images ONLY: btrfs/archive modes import the archive into the
     // guest before the pre-start snapshot, so a restored VM never re-reads the
     // archive — keying those on identity would force a needless cold boot on
@@ -1483,8 +1483,8 @@ async fn prepare_vm_for_lifecycle(
         .as_deref()
         .filter(|p| crate::utils::is_overlay_storage_image(p))
         .map(|p| {
-            crate::utils::file_identity(p)
-                .with_context(|| format!("stat image disk {} for snapshot key", p.display()))
+            crate::utils::image_disk_digest(p)
+                .with_context(|| format!("hash image disk {} for snapshot key", p.display()))
         })
         .transpose()?;
 

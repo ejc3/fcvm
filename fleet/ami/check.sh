@@ -66,8 +66,25 @@ if [ -z "$raw" ] || ! command -v dash >/dev/null; then
   no "measure-boot.sh host warm-up command not found, or no dash to run it"
 else
   remote=""; eval "remote=\"$raw\""
+  # fcvm logs its snapshot-cache line at info and only warnings by default.
+  grep -qF 'RUST_LOG=fcvm=info bash -c' <<<"$remote" || no "measure-boot warm-up does not log fcvm's info lines"
+  # Its files go to the scratch directory, not the instance's /tmp.
+  remote=${remote//\/tmp\//$stub/}
   WARM_OK=1 PATH="$stub:$PATH" dash -c "$remote" >/dev/null 2>&1 || no "measure-boot warm-up command fails under dash for a good warm-up"
   WARM_OK=0 PATH="$stub:$PATH" dash -c "$remote" >/dev/null 2>&1 && no "measure-boot warm-up command succeeds under dash for a failed warm-up"
+  # It prints fcvm's restored record whole, and hit or miss from fcvm's last
+  # snapshot-cache line (a hit whose load fails logs a miss after it and boots cold).
+  record='{"status":"restored","name":"warm","snapshot":"0123456789ab","vm_id":"vm-0","backend":"uffd","hypervisor":"firecracker","ack_ms":4157,"guest_phases":{"gpu_ms":3337.4,"total_ms":4100}}'
+  hit='2026-10-24T00:00:00.000000Z  INFO fcvm: Pre-start snapshot hit! Restoring from cached snapshot snapshot_key=0123456789ab image=localhost/fcvm-renderer:fleet'
+  miss='2026-10-24T00:00:01.000000Z  INFO fcvm: Snapshot miss, will create snapshot after image load snapshot_key=0123456789ab image=localhost/fcvm-renderer:fleet'
+  report() { printf '%s\n' "$@" > "$stub/warm.log"; WARM_OK=1 PATH="$stub:$PATH" dash -c "$remote" 2>/dev/null; }
+  out=$(report "$hit" '{"status":"starting"}' 'not json {' "$record")
+  grep -qxF "$record" <<<"$out" || no "measure-boot host does not print the whole restored record"
+  grep -qx 'snapshot: hit' <<<"$out" || no "measure-boot host does not report a snapshot hit"
+  out=$(report "$hit" "$miss" "$record")
+  grep -qx 'snapshot: miss' <<<"$out" || no "measure-boot host reports a hit whose restore fell back to a cold boot"
+  out=$(report "$miss" "$record")
+  grep -qx 'snapshot: miss' <<<"$out" || no "measure-boot host does not report a snapshot miss"
 fi
 rm -rf "$stub"
 grep -qF '{ echo "host: the first GPU VM failed"; exit 1; }' fleet/ami/measure-boot.sh ||
@@ -98,6 +115,23 @@ else
   ) || no "host/build.sh's checkout does not reach FCVM_COMMIT cleanly over untracked files"
 fi
 rm -rf "$gt"
+
+# The store archive must keep nanosecond modification times through host/build.sh's bake
+# and host/store.sh's restore: fcvm's cached image digests (version-cache/) are valid for
+# the image's exact mtime, so a whole-second mtime makes a host hash its images again.
+create=$(sed -n 's/^  tar -c \(.*\) \\$/\1/p' fleet/ami/host/build.sh)
+extract=$(sed -n 's/^  zstd -q -d -T0 -c "\$ARCHIVE" | tar -x \(.*\) -C "\$M"$/\1/p' fleet/ami/host/store.sh)
+tt=$(mktemp -d)
+if [ -z "$create" ] || [ -z "$extract" ]; then
+  no "host/build.sh's store tar or host/store.sh's restore tar not found"
+else
+  mkdir "$tt/in" "$tt/out"; echo image > "$tt/in/img"; touch -d '2026-10-24 00:00:00.123456789' "$tt/in/img"
+  # shellcheck disable=SC2086 # the recipes' own flags, split as the recipes split them
+  tar -c $create -C "$tt/in" . | tar -x $extract -C "$tt/out"
+  [ "$(stat -c %y "$tt/out/img")" = "$(stat -c %y "$tt/in/img")" ] ||
+    no "the store archive drops the fraction of a modification time ($(stat -c %y "$tt/out/img"))"
+fi
+rm -rf "$tt"
 
 [ "$fail" = 0 ] && echo "fleet/ami checks: ok"
 exit "$fail"

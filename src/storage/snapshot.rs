@@ -274,7 +274,7 @@ pub struct SnapshotMetadata {
     /// stay reachable.
     #[serde(default)]
     pub image_disk_path: Option<PathBuf>,
-    /// Build identity (inode:size:mtime) of that disk when the source VM
+    /// Build identity (SHA-256, `utils::image_disk_digest`) of that disk when the source VM
     /// booted. `podman load` randomizes overlay layer link IDs per build, so a
     /// restore against a REBUILT disk at the same path pairs the captured
     /// container with links that no longer exist ("readlink .../overlay/l/…").
