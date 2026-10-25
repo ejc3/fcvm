@@ -621,7 +621,11 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 # sign-offs, then "**Reviewed commit:** `<sha>`", then a folded "About Codex in GitHub"
 # block. Since 2026-10-15 the comment opens with "<!-- codex-review-receipt:v1 -->", an
 # HTML comment on its own line, which verdict_lines drops like any hidden comment
-# (strip_hidden_comments below). A CodeRabbit review that produces no comments replies
+# (strip_hidden_comments below). That receipt can also name no commit: on #1282
+# (2026-10-25) it was the phrase and sign-off alone, and the summary comment's row read "—"
+# where the commit goes. A receipt in that shape is a verdict that covers nothing, like
+# CodeRabbit's reply below; the marker must be its first line, because the bare phrase
+# without it is not a shape Codex posts (finding 21). A CodeRabbit review that produces no comments replies
 # "Full review finished." (or "Review finished." for an incremental one) folded under
 # "Action performed". Those are verdicts, not findings: they need no disposition. Codex's
 # also covers the commit it names; CodeRabbit's names nothing, and its coverage comes
@@ -860,11 +864,14 @@ def verdict_lines:
              | map(select(length > 0 and . != cr_note))) end;
 def codex_line_re: "^Codex Review: Didn.t find any major issues\\.?( Bravo\\.| Keep it up!| Keep them coming!| Hooray!| Swish!| You.re on a roll\\.| :\\+1:| :rocket:| :tada:| Nice work[.!]| Great job[.!]| Breezy!| 👍| Delightful!| What shall we delve into next\\?| More of your lovely PRs please\\.| Can.t wait for the next one!| Chef.s kiss\\.| Already looking forward to the next diff\\.| Another round soon, please!)?$";
 def reviewed_re: "^\\*\\*Reviewed commit:\\*\\* `(?<sha>[0-9a-f]{7,40})`$";
+def codex_receipt_re: "\\A<!-- codex-review-receipt:v1 -->\n";
 def is_verdict:
-  verdict_lines as $l
+  (. // "") as $b
+  | verdict_lines as $l
   | ($l == ["<details>", "<summary>✅ Action performed</summary>", "Full review finished.", "</details>"])
     or ($l == ["<details>", "<summary>✅ Action performed</summary>", "Review finished.", "</details>"])
-    or (($l | length) == 2 and ($l[0] | test(codex_line_re)) and ($l[1] | test(reviewed_re)));
+    or (($l | length) == 2 and ($l[0] | test(codex_line_re)) and ($l[1] | test(reviewed_re)))
+    or (($l | length) == 1 and ($l[0] | test(codex_line_re)) and ($b | test(codex_receipt_re)));
 def verdict_sha:
   verdict_lines as $l
   | if ($l | length) == 2 and ($l[1] | test(reviewed_re)) then ($l[1] | capture(reviewed_re) | .sha) else "" end;
@@ -939,15 +946,25 @@ def cr_notice_heading_re: "^## (Review limit reached|Review skipped|Reviews paus
 # configuration as "- **Key**: value" (each key with the values it has shown, so a list
 # item holding other text is not a run setting) and links the limits docs at a new path (#1199);
 # every "Review limit reached" notice on ejc3/fcvm PRs on 2026-10-23 matched, except #811,
-# which also carries a Finishing Touches block. A line outside it makes the comment claimable, which is what it was before the
-# exemption existed: the cost of an unlisted shape is one disposition, and the cost of
-# accepting one is a finding nobody has to answer.
+# which also carries a Finishing Touches block. From 2026-10-23 each folded summary opens
+# with an icon, a <picture> of two SVGs from the CodeRabbit icon set (cr_icon_summary_re, one
+# shape per icon and the name it labels). Of the 56 notices without a walkthrough on ejc3/fcvm
+# PRs updated from 2026-10-01 to 2026-10-25, the 31 with icons read as findings until these
+# shapes were listed. A line outside this list makes the comment claimable, which is what it
+# was before the exemption existed: the cost of an unlisted shape is one disposition, and
+# the cost of accepting one is a finding nobody has to answer.
+def cr_icon_summary_re($icon; $name):
+  "^<summary><strong><picture><source media=\"\\(prefers-color-scheme: dark\\)\" srcset=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-comment-icons-v1/\($icon)-dark\\.svg\"><img src=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-comment-icons-v1/\($icon)\\.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> \($name)</strong></summary>$";
 def cr_notice_payload_res:
   [ "^$"
   , "^</?details>$"
   , "^</?(dl|dd)>$"
   , "^<summary><strong>(⚙️ Run configuration|📥 Commits|📒 Files selected for processing: [0-9]+|⛔ Files ignored due to path filters: [0-9]+|View limit details)</strong></summary>$"
   , "^<summary>(⚙️ Run configuration|📥 Commits|📒 Files selected for processing \\([0-9]+\\)|⛔ Files ignored due to path filters \\([0-9]+\\)|How can I continue\\?|How do review limits work\\?|Review details|View limit details)</summary>$"
+  , cr_icon_summary_re("cog"; "Run configuration")
+  , cr_icon_summary_re("git-commit-horizontal"; "Commits")
+  , cr_icon_summary_re("file-plus-corner"; "Files selected for processing: [0-9]+")
+  , cr_icon_summary_re("file-minus-corner"; "Files ignored due to path filters: [0-9]+")
   , "^\\* `[^`]+`( is excluded by `[^`]+`)?$"
   , "^- \\[ \\] <!-- \\{\"checkboxId\": ?\"[0-9a-f-]+\"\\} --> 🔍 Trigger review$"
   , "^\\*\\*(Configuration used|Review profile|Plan)\\*\\*: [A-Za-z0-9 +]+$"
