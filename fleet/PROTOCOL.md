@@ -441,7 +441,8 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   new launch is accepted. A tile whose instance never serves `/health` has that instance
   terminated and is launched again after a backoff (1 s doubling to 30 s), and so does a
   running tile whose instance is found shutting down, stopped or terminated (a spot
-  reclaim; checked every 15 s). The coordinator
+  reclaim), whose renderer's `/health` carries an `error`, or whose renderer leaves
+  `/health` unanswered three checks in a row (checked every 15 s). The coordinator
   keeps no instance ids across a restart, so before its first launch, and again when it
   stops, it terminates every instance tagged `Purpose=fcvm-fleet-tile` and
   `Fleet=<--fleet-name>` in `--ec2-regions`; another fleet's tiles in the same account (a
@@ -851,13 +852,22 @@ processes; the host needs the `ffmpeg` CLI with libx264.
   that has delivered nothing is then drawn black), the new layout takes over at once, from
   the first frame every tile still holds, with a new header and a keyframe. Until then
   viewers hold the old composite's last frame. No frame mixes the two generations. A layout
-  of the same generation (a tile's URL changed) replaces the old one at once.
+  of the same generation (a tile's URL changed) replaces the old one at once. If the new
+  layout's pipeline stops before it takes over (its encoder failed), the old layout keeps
+  composing past `from_frame`; a publishing pipeline that stops is started again after 1 s,
+  doubling to 30 s. A viewer that falls behind the stream starts again from the newest
+  keyframe.
 - The region's size is its share of a whole image `--image-height` tall (default 1080):
   the fcvm half of a 1920 x 1080 image is 960 x 1080. `?h=` is accepted and ignored.
 - `POST /layout`: `{"epoch_unix_ms","image_aspect","region":{x,y,w,h},
   "tiles":[{"id","rect","url"}],"generation","from_frame"}` (`generation` and `from_frame`
   default to 0: the layout generation of the tiles' rects and its frame; the agent sends
   its placed slots' newest, the coordinator the EC2 side's); `GET /layout` returns it.
+  The listener also serves viewers, so a `POST /layout` needs
+  `Authorization: Bearer <token>` when the aggregator was started with
+  `FCVM_FLEET_AGGREGATE_TOKEN` in its environment (the agent and the coordinator make one
+  for the aggregator they run), and otherwise comes only from this host (a loopback
+  address); anything else is refused with 403.
 - `GET /stats`: frames out, the output bitrate over the last 10 s, and percentiles of
   `after_last_tile_ms` (last tile frame used to the region frame out of the encoder),
   `after_first_tile_ms`, `encode_ms`, `tile_lateness_ms` and `out_lateness_ms` (wall

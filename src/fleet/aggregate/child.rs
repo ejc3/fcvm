@@ -1,6 +1,8 @@
 //! Running an aggregator as a child process: the agent runs one for its host's band, the
 //! coordinator one for the EC2 half. The child dies with its parent (PR_SET_PDEATHSIG); if
-//! it exits it is restarted after 1 s, doubling to 30 s, and given the layout again.
+//! it exits it is restarted after 1 s, doubling to 30 s, and given the layout again. Its
+//! listener also serves viewers, so it accepts layouts only with a token this process makes
+//! and hands it through the environment.
 
 use super::Layout;
 use std::process::Stdio;
@@ -21,12 +23,14 @@ pub async fn supervise(
         .build()
         .expect("an HTTP client");
     let base = format!("http://{}", connect_addr(&listen));
+    let token = uuid::Uuid::new_v4().simple().to_string();
     let mut backoff = Duration::from_secs(1);
     loop {
         let started = Instant::now();
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..])
             .args(["--listen", &listen])
+            .env(super::LAYOUT_TOKEN_ENV, &token)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -74,7 +78,7 @@ pub async fn supervise(
                         }
                         let layout = layouts.borrow_and_update().clone();
                         if let Some(l) = layout {
-                            if let Err(e) = http.post(format!("{base}/layout")).json(&l).send().await {
+                            if let Err(e) = http.post(format!("{base}/layout")).bearer_auth(&token).json(&l).send().await.and_then(|r| r.error_for_status()) {
                                 tracing::warn!(error = %e, "layout not posted to the aggregator");
                             }
                         }

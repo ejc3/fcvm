@@ -90,9 +90,10 @@ pub enum Cmd {
     AgentClosed {
         conn: u64,
     },
-    /// Stop: publish the last snapshot, write the state file, then answer.
+    /// Stop: publish the last snapshot, write the state file, then answer whether the last
+    /// state is stored.
     Shutdown {
-        ack: oneshot::Sender<()>,
+        ack: oneshot::Sender<bool>,
     },
 }
 
@@ -125,6 +126,9 @@ pub struct Outputs {
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(50);
 /// Minimum time between two state file writes.
 const STORE_INTERVAL: Duration = Duration::from_secs(1);
+/// How many times shutdown asks for the last state to be written, and the pause between.
+const SHUTDOWN_WRITE_ATTEMPTS: u32 = 3;
+const SHUTDOWN_WRITE_PAUSE: Duration = Duration::from_secs(1);
 
 pub struct Actor {
     state: State,
@@ -279,23 +283,30 @@ impl Actor {
     }
 
     /// Queue the state for the writer if it changed; the returned receiver resolves once it
-    /// is written (at once when nothing needed writing). With `barrier`, an unchanged state
-    /// still waits for the writes already queued, so shutdown does not end while the
-    /// periodic store's last write is in flight.
-    fn store(&mut self, barrier: bool) -> oneshot::Receiver<()> {
+    /// is written (at once when nothing needed writing), with whether the newest state is
+    /// stored. With `barrier`, an unchanged state still waits for the writes already
+    /// queued, and retries one that failed, so shutdown does not end while the periodic
+    /// store's last write is in flight or lost.
+    fn store(&mut self, barrier: bool) -> oneshot::Receiver<bool> {
         let (ack, done) = oneshot::channel();
         let Some(tx) = &self.out.store else {
-            let _ = ack.send(());
+            let _ = ack.send(true);
             return done;
         };
         if self.state.version == self.stored {
+            // Nothing new to write; the writer retries a state whose write failed, so an
+            // unchanged state that is not stored yet is tried again every tick.
             if barrier {
                 let _ = tx.send(store::StoreCmd {
                     bytes: None,
                     ack: Some(ack),
                 });
             } else {
-                let _ = ack.send(());
+                let _ = tx.send(store::StoreCmd {
+                    bytes: None,
+                    ack: None,
+                });
+                let _ = ack.send(true);
             }
             return done;
         }
@@ -309,7 +320,7 @@ impl Actor {
             }
             Err(e) => {
                 tracing::error!(error = %e, "cannot serialize the state");
-                let _ = ack.send(());
+                let _ = ack.send(false);
             }
         }
         done
@@ -468,7 +479,7 @@ impl Actor {
             }
             Cmd::Shutdown { ack } => {
                 // `run` handles shutdown; a direct call only acknowledges.
-                let _ = ack.send(());
+                let _ = ack.send(true);
             }
             Cmd::AgentClosed { conn } => {
                 if let Some(a) = self.agents.remove(&conn) {
@@ -502,10 +513,26 @@ impl Actor {
             }
         };
         self.publish();
-        let written = self.store(true);
-        let _ = written.await;
+        let mut stored = false;
+        for attempt in 1..=SHUTDOWN_WRITE_ATTEMPTS {
+            // A writer that is gone cannot store anything.
+            stored = self.store(true).await.unwrap_or(false);
+            if stored {
+                break;
+            }
+            tracing::warn!(attempt, "the last state is not stored yet");
+            if attempt < SHUTDOWN_WRITE_ATTEMPTS {
+                tokio::time::sleep(SHUTDOWN_WRITE_PAUSE).await;
+            }
+        }
+        if !stored {
+            tracing::error!(
+                attempts = SHUTDOWN_WRITE_ATTEMPTS,
+                "the last state was not stored"
+            );
+        }
         if let Some(ack) = ack {
-            let _ = ack.send(());
+            let _ = ack.send(stored);
         }
     }
 }
@@ -549,12 +576,14 @@ impl Handle {
         rx.await.ok().flatten()
     }
 
-    /// Stop the actor; returns once the last state is on disk.
-    pub async fn shutdown(&self) {
+    /// Stop the actor; returns once the last state is stored, or its writes have failed,
+    /// with whether it is stored.
+    pub async fn shutdown(&self) -> bool {
         let (ack, done) = oneshot::channel();
-        if self.cmds.send(Cmd::Shutdown { ack }).await.is_ok() {
-            let _ = done.await;
+        if self.cmds.send(Cmd::Shutdown { ack }).await.is_err() {
+            return false;
         }
+        done.await.unwrap_or(false)
     }
 
     pub async fn send(&self, event: Event) {
@@ -963,8 +992,10 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     }
     // The state file holds the last state before the process exits; the agents' commands
     // are killed when their handles drop, and their VMs follow them (PR_SET_PDEATHSIG).
-    handle.shutdown().await;
-    tracing::info!("coordinator stopped; state written");
+    let stored = handle.shutdown().await;
+    if stored {
+        tracing::info!("coordinator stopped; state written");
+    }
     // The next coordinator does not know these instances; terminate them now (it also
     // sweeps at its start, for a coordinator that was killed).
     if let Some(d) = ec2_sweep {
@@ -974,6 +1005,10 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             Err(_) => tracing::warn!("EC2 tiles not terminated within 20 s"),
         }
     }
+    anyhow::ensure!(
+        stored,
+        "the coordinator stopped without storing its last state"
+    );
     Ok(())
 }
 
