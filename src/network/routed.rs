@@ -155,6 +155,64 @@ pub(crate) fn lease_address(
     anyhow::bail!("the lease of IPv6 address {address} kept being replaced while taking it")
 }
 
+/// Remove the proxy NDP entry and, with `masquerade`, the MASQUERADE rule a routed VM that
+/// exited without teardown left for `address` (`crate::reclaim`). Both are keyed by the
+/// address alone, so they are touched only while this holds the address's lease: a VM
+/// that holds it now owns the entry and the rule.
+pub(crate) async fn release_address(
+    address: std::net::Ipv6Addr,
+    iface: &str,
+    masquerade: bool,
+) -> crate::reclaim::Undo {
+    use crate::reclaim::Undo;
+    let lease = match lease_address(std::path::Path::new(ADDRESS_LEASE_DIR), address, "reclaim") {
+        Ok(LeaseAttempt::Leased(lease)) => lease,
+        Ok(LeaseAttempt::Held { .. }) => return Undo::Done,
+        Err(error) => return Undo::Kept(format!("{error:#}")),
+    };
+    let source = format!("{address}/128");
+    if masquerade {
+        let rule = [
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-o",
+            iface,
+            "-s",
+            &source,
+            "-j",
+            "MASQUERADE",
+        ];
+        match tokio::process::Command::new("ip6tables")
+            .args(rule)
+            .output()
+            .await
+        {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.contains("Bad rule") && !stderr.contains("does a matching rule exist") {
+                    return Undo::Kept(stderr.trim().to_string());
+                }
+            }
+            Err(error) => return Undo::Kept(error.to_string()),
+        }
+    }
+    let address = address.to_string();
+    match tokio::process::Command::new("ip")
+        .args(["-6", "neigh", "del", "proxy", &address, "dev", iface])
+        .output()
+        .await
+    {
+        // A missing entry fails with an error, and is gone either way.
+        Ok(_) => {}
+        Err(error) => return Undo::Kept(error.to_string()),
+    }
+    drop(lease);
+    Undo::Done
+}
+
 /// Refuse `--ipv6-address` for a VM that does not use routed networking: only routed
 /// gives a VM an address of its own on the host's network. `network` is the VM's mode,
 /// the run's `--network` or, for a restore, the one its snapshot was created with.
@@ -779,6 +837,14 @@ impl NetworkManager for RoutedNetwork {
             .context("reserving per-VM network names")?;
         let ns_name = vm_names.namespace.clone();
         self.namespace_id = Some(ns_name.clone());
+        // Recorded once the namespace exists, and every name built on its base before
+        // the object exists (crate::reclaim).
+        crate::reclaim::record(
+            &self.vm_id,
+            crate::reclaim::Resource::Netns {
+                name: ns_name.clone(),
+            },
+        )?;
         let host_veth = vm_names.link("veth-");
         let guest_veth = vm_names.link("vns-");
         // The TAP is created inside the reserved namespace, so its name is
@@ -822,6 +888,12 @@ impl NetworkManager for RoutedNetwork {
         .context("disabling IPv6 DAD in the VM namespace")?;
 
         // 2. Create veth pair and move guest side to namespace
+        crate::reclaim::record(
+            &self.vm_id,
+            crate::reclaim::Resource::Link {
+                name: host_veth.clone(),
+            },
+        )?;
         veth::create_veth_pair(&host_veth, &guest_veth, &ns_name).await?;
         self.host_veth = Some(host_veth.clone());
 
@@ -1040,7 +1112,16 @@ impl NetworkManager for RoutedNetwork {
         .await;
 
         // 12. Add proxy NDP so the network fabric routes VM's IPv6 to this host
-        // (default_iface already detected above)
+        // (default_iface already detected above). Recorded first, with step 13's rule:
+        // the lease makes both this VM's until it is released.
+        crate::reclaim::record(
+            &self.vm_id,
+            crate::reclaim::Resource::RoutedAddress {
+                address: vm_ipv6.parse().context("parsing the VM's IPv6 address")?,
+                iface: default_iface.clone(),
+                masquerade: self.ipv6_prefix.is_none(),
+            },
+        )?;
         // Enable proxy NDP on the interface so the kernel actually responds
         // to neighbor solicitations for our proxy entries.
         run_host_command(
@@ -1290,7 +1371,14 @@ impl NetworkManager for RoutedNetwork {
                 }
             }
         }
-        // Delete veth pair (auto-deletes peer, and with it any route through it)
+        // Delete veth pair (auto-deletes peer, and with it any route through it). Its
+        // name, and the address once the lease goes, can be another VM's from here on,
+        // so the records go first (crate::reclaim).
+        if let Err(e) = crate::reclaim::forget(&self.vm_id, |r| {
+            r.is_network() && !matches!(r, crate::reclaim::Resource::Netns { .. })
+        }) {
+            warn!(error = %format!("{e:#}"), "dropping the records of the routed network");
+        }
         if let Some(ref host_veth) = self.host_veth {
             if let Err(e) = veth::delete_veth_pair(host_veth).await {
                 warn!(error = %e, host_veth = %host_veth, "veth pair cleanup failed");
@@ -1300,6 +1388,11 @@ impl NetworkManager for RoutedNetwork {
         self.address_lease.take();
 
         // Delete namespace
+        if let Err(e) = crate::reclaim::forget(&self.vm_id, |r| {
+            matches!(r, crate::reclaim::Resource::Netns { .. })
+        }) {
+            warn!(error = %format!("{e:#}"), "dropping the record of the routed namespace");
+        }
         if let Some(ref ns_name) = self.namespace_id {
             if let Err(e) = namespace::delete_namespace(ns_name).await {
                 warn!(error = %e, namespace = %ns_name, "namespace cleanup failed");
