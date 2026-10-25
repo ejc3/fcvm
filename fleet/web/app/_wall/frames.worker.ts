@@ -14,6 +14,10 @@ import {
   heightSent,
   heightToSend,
   innerRect,
+  frameFitsBox,
+  gridBox,
+  deviceBox,
+  type DeviceBox,
   NO_CROP,
   nalType,
   newStream,
@@ -37,6 +41,7 @@ import {
   type StreamMode,
   type FrameStats,
   type SyncChoice,
+  acquireFrozen,
   type TileFrameStats,
 } from "../../core/index.ts";
 import type { BenchStats, CaptureResult, DrawSettings, FromWorker, ToWorker, TraceEntry } from "./worker-msgs.ts";
@@ -332,6 +337,8 @@ let retileStarted = 0;
 let pinT: number | null = null;
 /** The mode being drawn. It becomes plan.mode only once that mode can be drawn whole. */
 let shownMode: StreamMode = "direct";
+/** The page has been told the mode drawn (its own copy starts out unknown, whatever this worker started with). */
+let modeAnnounced = false;
 /** When each tile last stopped being dark, for its fade back in. */
 const litAt = new Map<string, number>();
 const wasDark = new Set<string>();
@@ -527,9 +534,11 @@ function applyPlan(p: DrawPlan): void {
   loadPoster(p.poster);
   dirty = true;
   needsClear = true;
-  // Before anything is on screen there is nothing to keep: start in the wanted mode.
-  if (prevT === null && plan.mode !== shownMode) {
+  // Before anything is on screen there is nothing to keep: start in the wanted mode, and say so
+  // even when it is the one this worker starts in: the page's record of it starts unset.
+  if (prevT === null && (plan.mode !== shownMode || !modeAnnounced)) {
     shownMode = plan.mode;
+    modeAnnounced = true;
     post({ type: "mode-shown", mode: shownMode });
   }
   syncStreams();
@@ -576,6 +585,7 @@ function trySwitch(): void {
   switchStarted = null;
   dirty = true;
   needsClear = true;
+  modeAnnounced = true;
   post({ type: "mode-shown", mode: shownMode });
 }
 
@@ -621,13 +631,10 @@ function resize(w: number, h: number, d: number): void {
 
 // ---- drawing -----------------------------------------------------------------
 
-function devBox(b: Box): [number, number, number, number] {
-  const x = Math.round(b.x * dpr);
-  const y = Math.round(b.y * dpr);
-  return [x, y, Math.round((b.x + b.w) * dpr) - x, Math.round((b.y + b.h) * dpr) - y];
+function devBox(b: Box): DeviceBox {
+  return deviceBox(b, dpr);
 }
 
-/** Device-pixel box of a stream's inner rectangle placed in the image by its grid position. */
 /**
  * Whether a frame was rendered for the place a plan draws its source in. After a
  * re-tile's frame the renderers draw the new rectangles, so until the page has the
@@ -637,18 +644,7 @@ function devBox(b: Box): [number, number, number, number] {
 function fitsPlan(h: Held, src: DrawSource, p: DrawPlan): boolean {
   if (!p.image || !h.grid || !src.box || p.focus) return true;
   const inner = innerRect({ width: h.frame.displayWidth, height: h.frame.displayHeight, crop: h.crop });
-  const [x, y, w, hh] = gridBox(p.image, h.grid, inner.sw, inner.sh);
-  const [bx, by, bw, bh] = devBox(src.box);
-  const tol = Math.max(2, Math.round(dpr * 2));
-  return Math.abs(x - bx) <= tol && Math.abs(y - by) <= tol && Math.abs(w - bw) <= tol && Math.abs(hh - bh) <= tol;
-}
-
-function gridBox(image: Box, g: Grid, w: number, h: number): [number, number, number, number] {
-  const x0 = Math.round((image.x + (g.x0 / g.fullWidth) * image.w) * dpr);
-  const y0 = Math.round((image.y + (g.y0 / g.fullHeight) * image.h) * dpr);
-  const x1 = Math.round((image.x + ((g.x0 + w) / g.fullWidth) * image.w) * dpr);
-  const y1 = Math.round((image.y + ((g.y0 + h) / g.fullHeight) * image.h) * dpr);
-  return [x0, y0, x1 - x0, y1 - y0];
+  return frameFitsBox(p.image, h.grid, inner, src.box, dpr);
 }
 
 /** A region with no frame to show. */
@@ -675,6 +671,13 @@ function drawDark(t: DrawTile, alpha: number): void {
   ctx.globalAlpha = 1;
 }
 
+/** The frames each shown source's stream holds for the place the plan draws it. */
+function buffersOf(shown: DrawSource[]): { id: string; ts: number[] }[] {
+  return shown
+    .filter((src) => src.box !== null && streams.has(keyOf(src)))
+    .map((src) => ({ id: src.id, ts: streamOf(src)!.frames.filter((h) => fitsPlan(h, src, plan)).map((h) => h.t) }));
+}
+
 function draw(): void {
   if (!ctx || !canvas) return;
   const t0 = performance.now();
@@ -689,29 +692,55 @@ function draw(): void {
     answerCaptures(null);
     return;
   }
-  // Paused, the picture holds the frozen choice while every frame it names still exists.
-  // It is taken again over what is shown now when a shown source is not in it (an opened
-  // tile, once its stream has a frame) or the frame it names is gone (suspension closed
-  // the streams and dropped their frames), and held from then on.
-  const unfrozen = plan.paused && (plan.focus ? [plan.focus] : sourcesOf(shownMode)).some((src) => {
-    const st = src.box !== null ? streamOf(src) : undefined;
-    if (st === undefined) return false;
-    if (!lastChoice.show.has(src.id)) return st.frames.some((h) => fitsPlan(h, src, plan));
-    const t = shownT(lastChoice.show.get(src.id));
-    return t !== null && st.frameAt(t) === null;
-  });
+  // Paused, the picture holds the frozen choice. It is taken again over what is shown now when
+  // a shown source is not in it (an opened tile, once its stream has a frame), or when the frame
+  // every shown source's entry names is gone (suspension closed the streams and dropped their frames).
+  // A source that lost its frame while others kept theirs (its stream closed and reopened) is not
+  // a reason to move the picture: it takes a frame of its own and the rest stay as they were.
+  let unfrozen = false;
+  let acquired: SyncChoice | null = null;
+  if (plan.paused) {
+    const shown = plan.focus ? [plan.focus] : sourcesOf(shownMode);
+    const lost = new Set<string>();
+    let kept = 0;
+    for (const src of shown) {
+      const st = src.box !== null ? streamOf(src) : undefined;
+      if (st === undefined) continue;
+      const entry = lastChoice.show.get(src.id);
+      if (entry === undefined) {
+        if (st.frames.some((h) => fitsPlan(h, src, plan))) unfrozen = true;
+        continue;
+      }
+      const t = shownT(entry);
+      if (t === null) continue;
+      if (st.frameAt(t) === null) lost.add(src.id);
+      else kept++;
+    }
+    if (lost.size > 0 && kept === 0) unfrozen = true;
+    if (!unfrozen) {
+      let base = lastChoice;
+      if (lost.size > 0) {
+        base = { T: lastChoice.T, show: new Map(lastChoice.show) };
+        for (const id of lost) base.show.set(id, { kind: "empty" });
+      }
+      acquired = acquireFrozen(base, buffersOf(shown));
+    }
+    // A frozen picture stops drawing, which is when the held bitmap would be let go.
+    if (heldFadeFrom !== null) dirty = true;
+  }
   // Paused: the picture holds what it shows; only a new plan, a size or a newly shown source redraws it.
-  if (plan.paused && !unfrozen && !dirty && captures.length === 0) return;
+  if (plan.paused && !unfrozen && acquired === null && !dirty && captures.length === 0) return;
   if (!plan.paused) trySwitch();
   if (nextPlan && !plan.paused) tryRetile();
+  // The mode drawn can have changed in the switch above.
   const shown = plan.focus ? [plan.focus] : sourcesOf(shownMode);
   const drawable = shown.filter((src) => src.box !== null && streams.has(keyOf(src)));
-  const buffers = drawable.map((src) => ({ id: src.id, ts: streamOf(src)!.frames.filter((h) => fitsPlan(h, src, plan)).map((h) => h.t) }));
+  const buffers = buffersOf(shown);
   // Frames that do not fit (a re-tile the page has not heard of yet): keep the one on screen.
   if (!nextPlan) pinT = drawable.some((src) => streamOf(src)!.frames.some((h) => !fitsPlan(h, src, plan))) ? prevT : null;
   // While a re-tile waits, the old tiles show only frames from before its first frame.
   const cap = nextPlan ? Math.min(switchCap(), nextPlan.atT - SAME_T_EPS) : switchCap();
-  const choice = plan.paused && !unfrozen ? lastChoice : chooseCommonT(buffers, prevT, undefined, cap);
+  const choice = plan.paused && !unfrozen ? (acquired ?? lastChoice) : chooseCommonT(buffers, prevT, undefined, cap);
   if (resuming) {
     // Back from hidden: the picture holds until every region has a frame at one
     // t (the mode switch's rule), then the live image fades in over it.
@@ -772,7 +801,7 @@ function draw(): void {
     const inner = innerRect({ width: frame.frame.displayWidth, height: frame.frame.displayHeight, crop: frame.crop });
     // In the mosaic the inner rectangle goes where the stream says it sits in
     // the whole image (x0, y0 of full_width x full_height); opened, it fills its box.
-    const [x, y, w, h] = plan.image && frame.grid && !plan.focus ? gridBox(plan.image, frame.grid, inner.sw, inner.sh) : devBox(src.box);
+    const [x, y, w, h] = plan.image && frame.grid && !plan.focus ? gridBox(plan.image, frame.grid, inner.sw, inner.sh, dpr) : devBox(src.box);
     if (st.appearedAt === null) st.appearedAt = at;
     const fade = Math.min(1, (at - st.appearedAt) / settings.fadeInMs);
     if (fade < 1) {
@@ -846,15 +875,15 @@ function draw(): void {
     const keep = releaseBefore(choice, src.id);
     if (keep !== null) st.releaseOlder(keep);
   }
-  if (trace) {
-    trace.push({ T: choice.T, mode: shownMode, missing, darkIn, poster: posterOn(), held: heldFadeFrom !== null, gen: plan.gen });
-    if (trace.length > 20_000) trace.shift();
-  }
   // The held picture goes once the live one has faded in over it.
   if (heldFadeFrom !== null && at - heldFadeFrom > settings.fadeInMs + 50) {
     heldFadeFrom = null;
     held?.close();
     held = null;
+  }
+  if (trace) {
+    trace.push({ T: choice.T, mode: shownMode, missing, darkIn, poster: posterOn(), held: heldFadeFrom !== null, gen: plan.gen });
+    if (trace.length > 20_000) trace.shift();
   }
   // The poster goes once every stream drawn has shown a frame.
   if (!posterRetired && !plan.posterFull && poster && shown.length > 0 && shown.every((src) => src.box === null || src.url === null || streamOf(src)?.appearedAt != null)) {

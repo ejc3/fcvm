@@ -441,7 +441,8 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   new launch is accepted. A tile whose instance never serves `/health` has that instance
   terminated and is launched again after a backoff (1 s doubling to 30 s), and so does a
   running tile whose instance is found shutting down, stopped or terminated (a spot
-  reclaim; checked every 15 s). The coordinator
+  reclaim), whose renderer's `/health` carries an `error`, or whose renderer leaves
+  `/health` unanswered three checks in a row (checked every 15 s). The coordinator
   keeps no instance ids across a restart, so before its first launch, and again when it
   stops, it terminates every instance tagged `Purpose=fcvm-fleet-tile` and
   `Fleet=<--fleet-name>` in `--ec2-regions`; another fleet's tiles in the same account (a
@@ -475,17 +476,26 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
 
 - `--scale-group` hands the coordinator the GPU hosts' auto scaling groups (repeatable,
   one per region); it sets their desired capacity (Auto Scaling `SetDesiredCapacity`) and,
-  while waking, reads their instances (`DescribeAutoScalingGroups`) every 5 s, with the
+  while they come up, reads their instances (`DescribeAutoScalingGroups`) every 2 s, with the
   credentials of its task or instance role. A call that fails marks the coordinator
   degraded (`scale`) and is retried.
 - `--on-demand-group` names an on-demand group as the fallback of the `--scale-group` in its
   region (at most one per region, and that region must have exactly one scale group). Auto
   Scaling does not move a spot group's capacity to on demand by itself, so the coordinator
-  does: while waking, when the spot group and its on-demand group together have had fewer
-  live instances (any lifecycle state but `Terminating*`, `Terminated` and `Detach*`) than
-  `--awake-capacity` for `--spot-wait` seconds (default 120), it sets the on-demand group to
-  the shortfall and the spot group to the live instances it has, so a spot launch that
-  succeeds later cannot add a host. A split written only half way (one call failed) is
+  does: while the groups come up, when the spot group and its on-demand group together
+  have fewer live instances (any lifecycle state but `Terminating*`, `Terminated` and
+  `Detach*`) than `--awake-capacity`, and either Auto Scaling has recorded a failed launch
+  of the spot group since the wake raised it (`DescribeScalingActivities`, a `Failed`
+  activity, e.g. `UnfulfillableCapacity` or `MaxSpotInstanceCountExceeded`, about 10 s after
+  the raise) or they have stayed short for `--spot-wait` seconds (default 120; the only rule
+  when the activities cannot be read), it sets the on-demand group to the shortfall and the
+  spot group to the live instances it has, so a spot launch that succeeds later cannot add
+  a host. It logs which rule fell back (`spot launch failed; falling back to on-demand now`
+  with the activity's message, or `spot group still short after the spot wait`). The groups
+  come up from the wake (or the coordinator's start) until they hold `--awake-capacity`
+  instances in service, also after the fleet is `awake` (the EC2 half can complete the
+  image first); the coordinator then logs `wake: host capacity in service` with `path`
+  (`spot`, `on-demand`, or `spot and on-demand`). A split written only half way (one call failed) is
   written again on every poll until both groups hold it, and `scale` stays degraded until
   then. A group it cannot describe is not taken to be short. It never raises the on-demand
   group otherwise, sets it to 0 with the spot group when the fleet sleeps, and the next
@@ -851,13 +861,22 @@ processes; the host needs the `ffmpeg` CLI with libx264.
   that has delivered nothing is then drawn black), the new layout takes over at once, from
   the first frame every tile still holds, with a new header and a keyframe. Until then
   viewers hold the old composite's last frame. No frame mixes the two generations. A layout
-  of the same generation (a tile's URL changed) replaces the old one at once.
+  of the same generation (a tile's URL changed) replaces the old one at once. If the new
+  layout's pipeline stops before it takes over (its encoder failed), the old layout keeps
+  composing past `from_frame`; a publishing pipeline that stops is started again after 1 s,
+  doubling to 30 s. A viewer that falls behind the stream starts again from the newest
+  keyframe.
 - The region's size is its share of a whole image `--image-height` tall (default 1080):
   the fcvm half of a 1920 x 1080 image is 960 x 1080. `?h=` is accepted and ignored.
 - `POST /layout`: `{"epoch_unix_ms","image_aspect","region":{x,y,w,h},
   "tiles":[{"id","rect","url"}],"generation","from_frame"}` (`generation` and `from_frame`
   default to 0: the layout generation of the tiles' rects and its frame; the agent sends
   its placed slots' newest, the coordinator the EC2 side's); `GET /layout` returns it.
+  The listener also serves viewers, so a `POST /layout` needs
+  `Authorization: Bearer <token>` when the aggregator was started with
+  `FCVM_FLEET_AGGREGATE_TOKEN` in its environment (the agent and the coordinator make one
+  for the aggregator they run), and otherwise comes only from this host (a loopback
+  address); anything else is refused with 403.
 - `GET /stats`: frames out, the output bitrate over the last 10 s, and percentiles of
   `after_last_tile_ms` (last tile frame used to the region frame out of the encoder),
   `after_first_tile_ms`, `encode_ms`, `tile_lateness_ms` and `out_lateness_ms` (wall
