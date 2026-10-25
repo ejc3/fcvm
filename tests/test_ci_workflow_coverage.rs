@@ -2637,7 +2637,7 @@ fn run_store_warm(
 
 /// The warm-up's `wait` reports how the detached reader ended, not only whether it is
 /// still running: a reader that exits nonzero, or that dies before reporting a status,
-/// raises a warning annotation. Before this, a failing read showed only as `(exit N)`
+/// raises a warning annotation, and one whose reads all succeeded raises none. Before this, a failing read showed only as `(exit N)`
 /// inside the log text, and a reader killed before its summary left `wait` printing
 /// nothing but the seconds it waited.
 #[test]
@@ -2676,6 +2676,25 @@ fn store_warm_up_wait_reports_how_the_reader_ended() {
         out.lines()
             .any(|l| l.starts_with("::warning::") && l.contains("exit")),
         "a reader whose reads failed must raise a warning: {out}"
+    );
+
+    // The reader ran to the end and every read succeeded: no warning.
+    let ok_stubs = tmp.path().join("ok-bin");
+    std::fs::create_dir_all(&ok_stubs).expect("stub dir");
+    std::fs::copy(stubs.join("sudo"), ok_stubs.join("sudo")).expect("copy sudo stub");
+    let state = tmp.path().join("succeeded");
+    std::fs::create_dir_all(&state).expect("state dir");
+    std::fs::write(state.join("fcvm-store-warm.pid"), &pid).expect("pid file");
+    let log = run_store_warm(&state, Some(&ok_stubs), &["run", layers_arg]);
+    assert!(
+        log.contains("(exit 0)"),
+        "a clean read must report exit 0: {log}"
+    );
+    std::fs::write(state.join("fcvm-store-warm.log"), log).expect("reader log");
+    let out = run_store_warm(&state, None, &["wait"]);
+    assert!(
+        !out.contains("::warning::"),
+        "a reader whose reads all succeeded must raise no warning: {out}"
     );
 
     // The reader died before it reported anything.

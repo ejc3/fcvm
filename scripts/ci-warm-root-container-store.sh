@@ -46,13 +46,14 @@ store_dirs() {
 }
 
 run() {
-	local began sizes rc elapsed
+	local began sizes rc read_rc elapsed
 	began=$(date +%s.%N)
 	sizes=$(sudo find "$@" -xdev -type f -printf '%s\n')
 	rc=$?
 	# The status is reported, not acted on: a failed read only leaves latency in the suite.
 	sudo find "$@" -xdev -type f -print0 | sudo xargs -0 -r -P "$PARALLEL" -n 64 cat >/dev/null
-	[ "$rc" -ne 0 ] || rc=$?
+	read_rc=$?
+	[ "$rc" -ne 0 ] || rc=$read_rc
 	elapsed=$(awk -v a="$began" -v b="$(date +%s.%N)" 'BEGIN {printf "%.1f", b - a}')
 	echo "$sizes" | awk -v dirs="$*" -v s="$elapsed" -v rc="$rc" \
 		'NF {n++; b += $1} END {printf "read %d files, %d MiB under %s in %s s (exit %s)\n", n, b / 1048576, dirs, s, rc}'
