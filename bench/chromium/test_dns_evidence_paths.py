@@ -147,10 +147,30 @@ class SealedRecordsIndexFromThisCheckout(unittest.TestCase):
             "no sealed record in the legacy absolute form is left under results/, "
             "so only the fixture above covers that form")
         for run_dir in runs:
+            scale = glob.glob(os.path.join(run_dir, "scale-*", "analysis.json"))
+            if not os.path.exists(os.path.join(run_dir, "analysis.json")) and scale:
+                # A corpus scale record: its analysis is the scale run's own,
+                # which reqscale_analyze publishes only against this evidence
+                # (corpus_dns_gate). campaign_summary indexes serial runs, so
+                # hold the scale record to that binding instead.
+                with self.subTest(run=os.path.basename(run_dir)):
+                    self.assertEqual(len(scale), 1, scale)
+                    with open(scale[0]) as handle:
+                        analysis = json.load(handle)
+                    self.assertIs(analysis.get("publishable"), True, scale[0])
+                    self.assertEqual(analysis.get("run_id"), runs[run_dir].get("run_id"), scale[0])
+                continue
+            external = os.path.exists(os.path.join(run_dir, campaign_summary.EXTERNAL_LOGS))
             with self.subTest(run=os.path.basename(run_dir)), \
                     tempfile.TemporaryDirectory() as d:
                 out = os.path.join(d, "campaign-x-summary.json")
                 rc, text = summarize(out, run_dir)
+                if external and not os.environ.get(campaign_summary.RECORDS_ENV):
+                    # Its replay logs live in ejc3/fcvm-bench-records, which this
+                    # checkout does not have: the index must refuse, not pass.
+                    self.assertNotEqual(rc, 0, text)
+                    self.assertIn("NOT VERIFIED", text)
+                    continue
                 self.assertEqual(rc, 0, text)
                 with open(out) as handle:
                     index = json.load(handle)

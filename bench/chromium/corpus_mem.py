@@ -640,6 +640,11 @@ def clone_gone(state_dir, name):
         try:
             with open(path) as f:
                 state = json.load(f)
+        except FileNotFoundError:
+            # Deleted between the listing and the read: an exiting clone's
+            # fcvm removes its own state file, and a file that no longer
+            # exists holds no clone.
+            continue
         except (OSError, ValueError) as exc:
             raise CloneStateReadError(
                 f"cannot read clone state {path} while proving {name} is gone: {exc}"
@@ -653,8 +658,9 @@ def clone_gone(state_dir, name):
     return True
 
 
-def render(endpoint, url, timeout=120):
-    r = sh([sys.executable, CDPDRIVE, endpoint, url, "--format", "jpeg"], timeout=timeout)
+def render(endpoint, url, timeout=120, op="screenshot"):
+    r = sh([sys.executable, CDPDRIVE, endpoint, url, "--format", "jpeg", "--op", op],
+           timeout=timeout)
     return r.returncode == 0, (r.stdout or r.stderr)[-400:]
 
 
@@ -735,7 +741,7 @@ class FcvmSide:
                 time.sleep(0.05)
         for c in live:
             url = self.args.urls[url_indices[c["i"]]]
-            ok, out = render(c["endpoint"], url)
+            ok, out = render(c["endpoint"], url, op=self.args.op)
             if not ok:
                 die(f"clone {c['name']} failed to render {url}: {out}")
             c["url"] = url
@@ -871,6 +877,7 @@ def memory_argument_parser():
     parser.add_argument("--data-root", default="/mnt/fcvm-btrfs")
     parser.add_argument("--cdp-port", type=int, default=9222)
     parser.add_argument("--container-create-ops-dir", default="")
+    parser.add_argument("--op", choices=("screenshot", "html"), default="screenshot")
     parser.add_argument("--uffd-mode", default="minor")
     parser.add_argument("--uffd-prefetch", default="on")
     parser.add_argument("--settle", type=float, default=5.0)
@@ -1173,7 +1180,10 @@ def remove_owned_container(name, owner_token, expected_id=None):
     if expected_id is not None and container_id != exact_container_id(expected_id):
         raise RuntimeError(
             f"owned container {name} changed identity from {expected_id} to {container_id}")
-    removed = sh_bounded(["podman", "rm", "-f", "--", container_id], 30)
+    # --time=0: Chromium in the pool container ignores SIGTERM, so the default
+    # stop timeout spent 10 s per container, serially, before the SIGKILL that
+    # ends it anyway; nothing reads the container after it is sampled.
+    removed = sh_bounded(["podman", "rm", "-f", "--time=0", "--", container_id], 30)
     if removed.returncode != 0:
         raise RuntimeError(
             f"cannot remove owned container {name} ({container_id}): "
@@ -1207,7 +1217,13 @@ class ContainerSide:
         for i in range(n):
             name = f"{self.prefix(cell_tag)}{i}"
             self.owned.add(name)
-            command = ["podman", "create", "--name", name,
+            # --no-healthcheck: the image's HEALTHCHECK is the golden's capture
+            # trigger and has no job in the pool, whose readiness is
+            # /run/bench-ready. Run per container from systemd timers, it put
+            # transient processes in the measured cgroups and held podman's
+            # locks: with 48 containers `podman ps` took 7.7 to 23.6 s and
+            # report.py's sample timed out at 20 s; without it, 0.04 s.
+            command = ["podman", "create", "--no-healthcheck", "--name", name,
                        "--label", f"{CONTAINER_OWNER_LABEL}={self.args.container_owner_token}",
                        "--network", CONTAINER_NET,
                        "-e", f"BENCH_RESOLVE_ALL_TO={CONTAINER_RESOLVE_TO}",
@@ -1902,6 +1918,8 @@ def main_with_resources(resources):
                           "urls": [args.urls[index] for index in url_indices]}
                          for side, n, rep, url_indices in schedule],
             "uffd_mode": args.uffd_mode, "uffd_prefetch": args.uffd_prefetch,
+            "render_op": args.op,
+            "container_render": "render.py in the image: a JPEG screenshot and the DOM",
             "basis": "cgroup memory.current and PSS summed over EXACTLY that cgroup's "
                      "process set, on both sides: an fcvm clone's leaf cgroup holds fcvm, "
                      "firecracker, the namespace holder and pasta; a container's cgroup is "

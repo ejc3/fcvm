@@ -6,16 +6,26 @@ https://ejc3.github.io/fcvm/shared-nothing-renders.html
 The HTML is the maintained report source. `../REVIEW.md` records withdrawals
 and the status of historical evidence.
 
-## Closeout status (2026-09-07)
+## Status (2026-10-22)
 
-- The source retains the verified 549.4 ms corpus headline and 2/4/8 vCPU ladder.
-- Unsupported network, memory, CPU-demand and WebKit conclusions are removed.
-- Fixture measurements remain explicitly labelled optimisation evidence.
-- Useful August 30 records are retained under `evidence/20260830/`, with their
-  limitations and reproduction inputs. They are not publication-qualified results.
+- The page quotes the 2026-10-22 corpus campaign, listed under "The 2026-10-22
+  campaign" below: request latency at 2, 4 and 8 guest vCPUs with repeat runs
+  on fresh goldens, host CPU per request for the screenshot, the HTML
+  extraction and a restore alone, memory with many clones held at once,
+  open-loop throughput, working-set prefetch on and off, the poll interval,
+  copy against minor mode, and a warm host Chromium without a VM. The WebKit
+  run and a 2 MiB-page A/B/A were dropped for host time (the page's Limits).
+  Every serial run records the host's instance type, the Chromium version,
+  the Firecracker commit and binary, and the memory server's prefetch
+  setting; the memory, host-control and throughput records hold less, as the
+  page's Setup says.
+- The 2026-09-02 ladder and the 2026-08-30 run remain verified records. The
+  page lists them under "Earlier runs" and no longer quotes them; the sections
+  below on them are kept as their history.
+- The synthetic-page (fixture) runs are listed the same way. The publication
+  rule below is unchanged: they never carried a published figure.
 - **External publication (2026-09-26):** GitHub Pages publishes this file at the
-  URL above on every merge to main that changes it (see Publishing). The Claude
-  artifact route is retired.
+  URL above on every merge to main that changes it (see Publishing).
 
 ## Publishing
 
@@ -51,22 +61,44 @@ The 348.7 ms direct-CDP figure and the fixture latency/decomposition tables
 remain optimisation evidence only. They do not appear as corpus headlines or
 support CPU, memory or network-mode comparisons against Cloudflare.
 
-That leaves the corpus mix as the publishable headline: 549.4 ms [467.9, 632.4],
-n=202, 14 URLs cycled uniformly, 4 guest vCPUs, from
-`results/reqbench-20260902-025115-corpus-c4` (DNS-verified: `dns-evidence.json`
-verdict clean, first_mismatch null, diag violations none). Four corpus cells now
-have a shipped record, a real workload and a verified resolver: the 2026-09-02
-ladder at 2, 4 and 8 vCPU, and `results/reqbench-20260830-171007-corpus` at
-712.6 ms [610.5, 808.5] on 2 vCPU. The headline is the 4 vCPU cell, the lowest
-request median of the ladder's three single runs; the runs do not show that 4 is
-faster than 8 (see "Corpus latency by guest vCPU count" below). The 2 vCPU
-figures are quoted beside it wherever it appears, because most of the rest of
-this report is 2 vCPU work.
-The 695.7 ms at 4 vCPU that stood here before came from
-`results/reqbench-20260816-123529-corpus`, which is withdrawn.
+That leaves the corpus mix as the publishable headline. Since 2026-10-22 it is the range of the 7 default-configuration 4 vCPU runs' request medians, 683.4 to 715.5 ms, each over 202 requests on the 14 URLs cycled uniformly, on 5 goldens, every run DNS-verified (`dns-evidence.json` verdict clean). The runs are listed under "The 2026-10-22 campaign" below and indexed by `results/campaign-20261022-summary.json`. The 2026-09-02 ladder's 549.4 ms at 4 vCPU and the 2026-08-30 run's 712.6 ms at 2 vCPU remain verified records of earlier builds; the page lists them under Earlier runs.
 
 Regeneration follows the same rule: anything intended for publication is a
 corpus run, not a fixture run.
+
+## The 2026-10-22 campaign
+
+Every run below is a corpus run of `make bench-chromium-corpus` (or, for the memory, host-control and throughput records, `make bench-chromium-corpus-extra` and `MEASURE=scale`) on an AWS c8g.metal-48xl, with the knobs its meta line records (the serial runs' meta lines name the instance type; the other records do not all do so). Goldens are named G1, G2, ... in the order they appear; runs that share one are A/B or A/B/A comparisons. `restore-ack.jsonl` beside each run's `reqbench.jsonl` was read out of the run's clone logs by `restore_ack.py`; `logs/serve.log` is the memory server's log of the measured run. The replay server's two logs, `corpus-access.log` and `corpus-dns.log`, are kept in the separate repository `ejc3/fcvm-bench-records` at the same paths; each run's `external-logs.json` names the commit there, and `campaign_summary.py` verifies them only with `FCVM_BENCH_RECORDS` set to a checkout of it.
+
+| run | configuration | golden | fcvm source | record |
+|---|---|---|---|---|
+| c2a | 2 vCPU, minor, 4 KiB pages, prefetch on, 50 ms polling | G1 | `ff9aef9e` | `results/reqbench-20261022-corpus-c2a` |
+| c2b | 2 vCPU, minor, 4 KiB pages, prefetch on, 50 ms polling | G2 | `ff9aef9e` | `results/reqbench-20261022-corpus-c2b` |
+| c4a | 4 vCPU, minor, 4 KiB pages, prefetch on, 50 ms polling | G3 | `ec5def10` | `results/reqbench-20261022-corpus-c4a` |
+| c4b | 4 vCPU, minor, 4 KiB pages, prefetch on, 50 ms polling | G4 | `ff9aef9e` | `results/reqbench-20261022-corpus-c4b` |
+| c4c | 4 vCPU, minor, 4 KiB pages, prefetch on, 50 ms polling | G5 | `ff9aef9e` | `results/reqbench-20261022-corpus-c4c` |
+| c4e | 4 vCPU, minor, 4 KiB pages, prefetch on, 50 ms polling | G6 | `ff9aef9e` | `results/reqbench-20261022-corpus-c4e` |
+| c4e-p50b | 4 vCPU, minor, 4 KiB pages, prefetch on, 50 ms polling | G6 | `ff9aef9e` | `results/reqbench-20261022-corpus-c4e-p50b` |
+| c4f | 4 vCPU, minor, 4 KiB pages, prefetch on, 50 ms polling | G7 | `fcbeec9e` | `results/reqbench-20261022-corpus-c4f` |
+| c4f-minorb | 4 vCPU, minor, 4 KiB pages, prefetch on, 50 ms polling | G7 | `fcbeec9e` | `results/reqbench-20261022-corpus-c4f-minorb` |
+| c8a | 8 vCPU, minor, 4 KiB pages, prefetch on, 50 ms polling | G8 | `ff9aef9e` | `results/reqbench-20261022-corpus-c8a` |
+| c8b | 8 vCPU, minor, 4 KiB pages, prefetch on, 50 ms polling | G9 | `ff9aef9e` | `results/reqbench-20261022-corpus-c8b` |
+| c4b-off | 4 vCPU, minor, 4 KiB pages, prefetch off, 50 ms polling | G4 | `ff9aef9e` | `results/reqbench-20261022-corpus-c4b-off` |
+| c4c-off3 | 4 vCPU, minor, 4 KiB pages, prefetch off, 50 ms polling | G5 | `ff9aef9e` | `results/reqbench-20261022-corpus-c4c-off3` |
+| c4e-p5 | 4 vCPU, minor, 4 KiB pages, prefetch on, 5 ms polling | G6 | `ff9aef9e` | `results/reqbench-20261022-corpus-c4e-p5` |
+| c4f-copy | 4 vCPU, copy, 4 KiB pages, prefetch on, 50 ms polling | G7 | `fcbeec9e` | `results/reqbench-20261022-corpus-c4f-copy` |
+
+Records that are not serial corpus runs:
+
+| record | what it measures | fcvm source | path |
+|---|---|---|---|
+| memory, html | clones and warm host containers held at once, N = 2 to 48, 4 vCPU, prefetch on | `fcbeec9e` | `results/corpusextra-20261023-011703-814a3ab38d5e4229948f274f6b10606c/memory` |
+| memory, screenshot | clones and warm host containers held at once, N = 2 to 48, 4 vCPU, prefetch on | `ffab8ecd` | `results/corpusextra-20261022-165733-a749c4da790c42d79da23db5f64e9ca2/memory` |
+| host control, cpu2 | host Chromium without a VM, 2 CPUs, in-process driver | `fcbeec9e` | `results/corpusextra-20261023-004330-fbc7a26f27be46b2964f738ed09156ed/hostcdp-cpu2` |
+| host control, cpu4 | host Chromium without a VM, 4 CPUs, in-process driver | `fcbeec9e` | `results/corpusextra-20261023-005104-46646123fe6d4d92a4b4a883ee754fb7/hostcdp-cpu4` |
+| host control, cpu8 | host Chromium without a VM, 8 CPUs, in-process driver | `fcbeec9e` | `results/corpusextra-20261023-005833-4c9bbd35513c4a92ad1a50d02ff48c00/hostcdp-cpu8` |
+| host control, free | host Chromium without a VM, no CPU limit, in-process driver | `fcbeec9e` | `results/corpusextra-20261023-003603-f0e8696f6ae14e259a4a71463f892836/hostcdp-free` |
+| throughput | open loop, 0.93, 1.40, 1.87 req/s per restore path, FILE and UFFD interleaved, 4 vCPU | `fcbeec9e` | `results/reqbench-20261022-corpus-s13/scale-20261023-000033-1468478` |
 
 ## Corrections closed in the source
 
@@ -92,7 +124,7 @@ changing URL mixes, unreconciled memory bases and missing provenance prevent
 publication comparisons from those records. No new campaign is needed for the
 current latency report; those measurements are follow-up research.
 
-## Corpus latency by guest vCPU count
+## The 2026-09-02 ladder and the 2026-08-16 withdrawal (history)
 
 A DNS-verified 2/4/8 vCPU ladder exists, measured 2026-09-02; it is below,
 under "The verified ladder". The 2026-08-16 ladder that used to stand here is

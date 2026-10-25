@@ -153,19 +153,28 @@ Chromium from the host with no exec, the request path a service would actually r
   (`upgrade_ms`), and `Page.enable` (`enable_ms`), rolled up as
   `connect_total_ms`. These stages run serially within a request, and no
   connection is reused across requests, so every request proves the whole path.
-- **Teardown differs per arm, deliberately**: `cdp-fast` uses the one-SIGKILL
-  teardown (the kernel fans it out to Firecracker and the namespace holder via
-  `PR_SET_PDEATHSIG`); the `cdp`, `noop`, and `exec` control arms keep the
-  normal SIGTERM-and-wait path so the A/B isolates exactly that change.
+- **Teardown differs per arm, deliberately**: `cdp-fast`, `html-fast` and
+  `noop-fast` use the one-SIGKILL teardown (the kernel fans it out to
+  Firecracker, the namespace holder and pasta via `PR_SET_PDEATHSIG`), which
+  reads each clone child's CPU and gives the arm a `request_cpu_ms`; the `cdp`,
+  `html`, `noop`, and `exec` arms keep the normal SIGTERM-and-wait path so the
+  A/B isolates exactly that change. `noop-fast` renders nothing, so its CPU is
+  that of a restore.
 - **Sealed provenance.** Each run records content hashes of the harness, of `fcvm`
   and of the runtime bundle holding `fcvm` and `fc-agent`, the snapshot
   generation UUID, the exact config digest, the container image id and the fcvm
-  source revision. These bind a number to those inputs, not to every binary
-  under it: no record stores the Firecracker commit a run used (setup builds or
-  reuses a binary for the fork branch `rootfs-config.toml` names, and keeps a
-  cached binary when it cannot reach the remote), only the 2026-09-02 ladder's
-  `hostinfo.json` files record the Firecracker binary's content hash, and no
-  record keeps the Chromium version.
+  source revision. Runs from `5b94b566` on also record the host (EC2 instance
+  type, CPU model, vCPUs, memory, OS), the memory server's prefetch setting,
+  hugepage backing, the browser build the golden's image reports
+  (`browser_version`) and the Firecracker binary with its sha256 and the commit
+  `rootfs-config.toml` pins, set only when the binary's name is the one `fcvm
+  setup` gives a build of that commit (`firecracker`). Runs from `19b9c21c`
+  on record fcvm's restored record per request (`restore_ack`: the ACK time and
+  fc-agent's restore phases); `restore_ack.py` reads it out of an earlier run's
+  clone logs. Earlier records carry
+  none of these: only the 2026-09-02 ladder's hand-written `hostinfo.json`
+  files record a Firecracker binary hash, and no earlier record keeps the
+  Chromium version or the Firecracker commit.
 
 Prerequisites: `make build && make setup-fcvm` from the repo root first — the
 script stages the `fcvm`/`fc-agent` binaries and `golden` needs the
@@ -179,7 +188,9 @@ measured run when the 1-minute load is above 2.0 or a firecracker, fcvm or
 cloud-hypervisor process is running. It checks only at start: the three
 2026-09-02 ladder runs passed it and then reached a 1-minute load of 2.62, 18.3
 and 16.97 (`load_max_1min` in
-`results/campaign-20260902-box2-ladder-summary.json`). `ALLOW_BUSY=1` overrides
+`results/campaign-20260902-box2-ladder-summary.json`). Every request record
+carries the 1-minute load at its start (`loadavg1`), so a run's load can be set
+against its requests. `ALLOW_BUSY=1` overrides
 the refusal and is recorded in the run. An overridden run is contaminated and
 must be excluded from comparisons or rerun before publication.
 

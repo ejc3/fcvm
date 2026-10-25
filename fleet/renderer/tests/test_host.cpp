@@ -504,6 +504,28 @@ int main() {
     CHECK(ls.take(300) && ls.cur == 2 && !ls.pending, "the switch takes effect at its frame");
     ls.on_scene(plain);
     CHECK(ls.cur == -1 && !ls.pending, "a generationless scene leaves no generation in force (header null)");
+    // leaving a numbered layout must reach open streams: the header names the
+    // generation, and with the geometry unchanged nothing else would resend it
+    CHECK(ls.take_cleared(), "leaving a numbered layout is reported once");
+    CHECK(!ls.take_cleared(), "the report is consumed");
+    ls.on_scene(plain);
+    CHECK(!ls.take_cleared(), "a generationless scene after a generationless one reports nothing");
+    ls.on_scene(g2);
+    ls.on_scene(plain);
+    CHECK(!ls.take_cleared(), "cancelling a pending switch while no generation was in force reports nothing");
+    {
+      auto hdr_a = std::make_shared<const std::string>("generation 2");
+      auto hdr_b = std::make_shared<const std::string>("generation null");
+      Subscriber open;
+      open.offer_header(8, hdr_a);
+      open.need_key = false;
+      open.offer_header(8, hdr_b);
+      CHECK(open.q.size() == 1, "an open stream does not get the same encoder's header twice");
+      open.restart_header();
+      open.offer_header(8, hdr_b);
+      CHECK(open.q.size() == 2 && *open.q.back() == "generation null" && open.need_key,
+            "a restarted stream gets the new header and waits for a keyframe");
+    }
     // a word on screen is found behind words scheduled later
     std::string words = R"({"text":"early","t":1})";
     for (int i = 0; i < 16; i++) words += R"(,{"text":"later","t":)" + std::to_string(100 + i) + "}";
@@ -571,6 +593,17 @@ int main() {
     }
     CHECK(fatal_read_locked, "fatal() reads fatal_ under hmu_");
     CHECK(failed_retired, "a failed encoder open is retired (its NV12 buffer freed) before the stream is closed");
+    // frame_once restarts every stream's header, under mu_, when a scene ended the numbered layout
+    bool restarts = false, restart_locked = false, idr_forced = false;
+    for (size_t i = 0; i < src.size(); i++) {
+      if (src[i].find("lay_.take_cleared()") != std::string::npos) {
+        restart_locked = src[i].find("if (") != std::string::npos;
+        for (size_t j = i + 1; j < i + 4 && j < src.size(); j++) restarts = restarts || src[j].find("restart_header()") != std::string::npos;
+      }
+      if (src[i].find("generation_cleared) e.want_idr = true") != std::string::npos) idr_forced = true;
+    }
+    CHECK(restarts && restart_locked, "frame_once restarts the headers of open streams when the numbered layout ended");
+    CHECK(idr_forced, "the encoders force a keyframe for the restarted headers");
   }
   // --- a slow subscriber whose queue is cleared still gets the stream header
   {

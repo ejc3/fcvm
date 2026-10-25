@@ -236,12 +236,10 @@ class DnsLog(unittest.TestCase):
         self.assertFalse(thread.is_alive(), "serve_dns kept serving after a failed log write")
         self.assertEqual(sock.fileno(), -1, "the responder left its socket open")
         self.assertTrue(seen and isinstance(seen[0], OSError), seen)
-        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.addCleanup(client.close)
-        client.settimeout(1)
-        client.sendto(dns_query("second.test", QTYPE_A), ("127.0.0.1", port))
-        with self.assertRaises(OSError):
-            client.recvfrom(512)
+        # No probe of the freed port: once serve_dns has closed its socket,
+        # any other socket can bind port 0 and take that number, and a reply
+        # from it says nothing about the responder (issue #1212). The closed
+        # descriptor and the dead thread above are the closure evidence.
 
     def test_closing_the_socket_ends_the_responder_thread(self):
         """A closed socket must end serve_dns, not spin it on EBADF forever.

@@ -88,14 +88,17 @@ jobs:
         run: docker load -i "$RUNNER_TEMP/coordinator-image/coordinator-image.tar"
       # OIDC admits only this main-only environment. The role can publish this
       # image and invoke one image-only releaser; it cannot read state or call ECS.
+      # The role ARN and the repository carry account ids, so they are secrets:
+      # a step header prints vars.* values unmasked.
       - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-west-1
           role-session-name: fcvm-stage-${{ github.run_id }}
+          mask-aws-account-id: true
       - name: Publish and release the staging coordinator
         env:
-          COORDINATOR_REPO: ${{ vars.COORDINATOR_REPO }}
+          COORDINATOR_REPO: ${{ secrets.COORDINATOR_REPO }}
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
         run: python3 -B fleet/coord/publish.py
       # This is a real viewer: it may wake the fleet and relaunches one tile

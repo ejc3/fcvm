@@ -13,6 +13,11 @@ void Subscriber::close() {
   cv.notify_all();
 }
 
+void Subscriber::restart_header() {
+  cur_h = 0;
+  need_key = true;
+}
+
 void Subscriber::offer_header(int ekey, const std::shared_ptr<const std::string>& hdr) {
   if (cur_h == ekey) return;
   push(hdr);

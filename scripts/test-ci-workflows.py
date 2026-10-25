@@ -81,9 +81,19 @@ class WorkflowSecurityTest(unittest.TestCase):
     def builder(self, context):
         return evaluate(job_field('build-runner-ami.yml', 'build-ami', 'if'), context)
 
+    def test_account_bearing_values_come_from_secrets(self):
+        # A step header prints its env, with: and run: values, and Actions masks
+        # only secrets, so a value read from vars.* lands in the public log as
+        # typed. Each of these names carries an AWS account id. An if: expression
+        # is evaluated without being printed, so it may read one.
+        for workflow in sorted((ROOT / '.github/workflows').glob('*.y*ml')):
+            for line in workflow.read_text().splitlines():
+                if re.search(r'vars\.(AWS_ACCOUNT_ID|AWS_ROLE_ARN|COORDINATOR_REPO)\b', line):
+                    self.assertRegex(line, r'^\s+if: ', f'{workflow.name}: {line.strip()}')
+
     def test_no_workflow_hard_codes_an_aws_account_id(self):
-        # The account id comes from the AWS_ACCOUNT_ID repository variable; a public
-        # workflow must not carry it (an ARN account field or a 12-digit literal).
+        # The account id comes from the AWS_ACCOUNT_ID secret; a public workflow
+        # must not carry it (an ARN account field or a 12-digit literal).
         for workflow in sorted((ROOT / '.github/workflows').glob('*.y*ml')):
             text = workflow.read_text()
             self.assertNotRegex(text, r'arn:aws:[a-z0-9-]*:[a-z0-9-]*:\d{12}:', workflow.name)

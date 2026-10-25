@@ -1,0 +1,30 @@
+{
+  "run_id": null,
+  "serve_pid": 3016163,
+  "dnsmasq_was_active_before": false,
+  "dnsmasq_active_after_restore": false,
+  "dnsmasq_state_after_restore": "inactive",
+  "sampler_alive_at_stop": true,
+  "samples": 140,
+  "sample_interval_s": 10,
+  "owner_log": "dns-owner.log",
+  "load_max_1min": 21.77,
+  "load_samples": 140,
+  "first_mismatch": null,
+  "verify_files": [
+    "verify-dns-pre.json",
+    "verify-dns-before-run.json",
+    "verify-dns-after-run.json"
+  ],
+  "verify_file_sha256": {
+    "verify-dns-pre.json": "1ebb263ecee5ef7beddfeb5e0a758be1c79f96ca3ac39918386c3acbe374cbd8",
+    "verify-dns-before-run.json": "8eec4a2e6713384cf1c663f7d7715388f8c50d309592a7d9c363d0d8adb99f52",
+    "verify-dns-after-run.json": "49760118e65c8d66ff34611f882295eff5c5e9e8d7338447699ec6a7c05aed1e"
+  },
+  "corpus_dns_log_sha256": "df94fcd8b137e760681327ffa701d2bfc228f051aa63a0ddab65c4e2d7fe97db",
+  "replay_queries_log_sha256": "e269b534604cd6b8263733926a81f32e58e6721ed10b95b5fab9604d6d613608",
+  "corpus_access_log_sha256": "7cef1046744b3e4a51afb216574a958146e7a4f957a3d39e082f4c0e5ac82da6",
+  "corpus_serve_exit_status": 0,
+  "reason": "/mnt/work/src/fcvm-c1022/bench/chromium/results/corpus-20261022-s12-r2/reqbench/scale-20261022-231953-3016136/analysis-pre-evidence.json names no run_id, so this evidence is bound to no measured run",
+  "verdict": "unclean"
+}

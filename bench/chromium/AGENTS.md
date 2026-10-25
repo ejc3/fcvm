@@ -51,6 +51,10 @@ of a restore. The drift control stays `noop`.
 runs the host control once with the whole box and once capped at each
 ladder rung's vCPU count (`cpuN`, `CPU_BUDGET=vm-matched`); the default is
 `free,cpu2`.
+`PHASES=memory MEM_OP=html` renders each fcvm clone with HTML extraction in
+place of the screenshot before it is sampled (default `screenshot`). The host
+containers always render with the image's `render.py`, a screenshot and the
+DOM; `summary.json`'s meta records both as `render_op` and `container_render`.
 `RESOLVE_POLL_MS=` (run only, default 50) is the sleep between the CDP arms'
 `/json/list` polls for the page target; the run's meta records it as
 `resolve_poll_ms`, and runs with different values are separate cells.
@@ -66,11 +70,16 @@ source revision, with `commit` set only when the binary's name is the one
 `fcvm setup` gives a build of that commit). The analyzer copies them into the
 cell. Each CDP and noop record carries `restore_marks`, when fcvm's
 `snapshot load completed`, `disk patch completed`, `VM resume completed` and
-`VM lifecycle ready` lines reached the clone's log, in ms from the launch; each
-render carries `resolve_polls` (each poll's time and outcome) and `nav` gains
+`VM lifecycle ready` lines reached the clone's log, in ms from the launch, and
+`restore_ack`, the `ack_ms` and fc-agent `guest_phases` of the one-line
+restored record fcvm prints when the guest acknowledges the restore. For runs
+recorded before that field, `restore_ack.py <run dir>` reads the same record out
+of the per-request clone logs into `restore-ack.jsonl`, bound to
+`reqbench.jsonl` by sha256. Each render carries `resolve_polls` (each poll's time and outcome) and `nav` gains
 `response_end_ms`, `dom_interactive_ms`, `dom_content_loaded_end_ms` and
 `load_event_start_ms`. `analysis.json` summarises them per arm under
-`timeline`. `test_run_facts.py` pins every one of these.
+`timeline` (`restore_ack_ms` and `guest_phases_ms` among them). `test_run_facts.py` pins
+every one of these.
 
 `GUEST_ENV=` (golden only) bakes extra container environment into the
 snapshot: comma-separated `KEY=VALUE` entries, one `fcvm podman prepare
@@ -155,7 +164,11 @@ diagnosed, and `runtime_bundle_sha256`, the sealed runtime it rendered from
 (the hash the measured run records; `null` when the phase ran outside a
 staged bundle). The phase exits non-zero, and `passed` is false, on any remote IP
 outside `DIAG_EXPECT_IPS=` (comma-separated, when set), a trace naming no
-remote address at all while it is set, any `net::ERR_NAME_NOT_RESOLVED` in a
+remote address at all while it is set, any HTTP(S) row naming no address
+while it is set, unless it was a cache or service-worker hit or the replay's
+`corpus-access.log` shows the replay answered that host and request target
+inside the render's wall-clock window (`<stem>-<rep>.window`; counted per
+URL as `answered_by_replay`), any `net::ERR_NAME_NOT_RESOLVED` in a
 trace, any load event over `DIAG_MAX_LOAD_MS=` (when set), any failed render
 (a record for another URL, one not saying ok, one written under a non-zero
 driver exit status, or one without a load event timing), any clone whose
@@ -250,6 +263,16 @@ per HTTP request the server answered, from the campaign's startup probes
 through the three verify brackets and every rep of every arm of the measured
 run, so it is the biggest record in the directory and a short one means the
 server was not serving the whole run.
+
+From the 2026-10-22 campaign on, those two logs are kept in the separate
+repository `ejc3/fcvm-bench-records`, at the same path under
+`bench/chromium/results/`, and the run directory keeps `external-logs.json`:
+the repository, the path and the commit there that holds each file, with its
+sha256. `campaign_summary.py` reads a pointed-to log from that commit in the
+checkout `FCVM_BENCH_RECORDS` names, and refuses the run, saying NOT VERIFIED,
+when the variable is unset or the checkout lacks the commit. So does the
+scale analyzer's DNS gate, which uses the same check. CI has no checkout, so
+there the committed 2026-10-22 runs are expected to refuse.
 
 The evidence is only as good as the checks behind it, and six of them are
 easy to get wrong:

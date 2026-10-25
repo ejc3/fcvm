@@ -763,6 +763,68 @@ def pidfd_open(pid: int):
     return fd
 
 
+PR_SET_CHILD_SUBREAPER = 36
+
+
+def become_child_subreaper() -> bool:
+    """Make this process the reaper of its descendants' orphans.
+
+    fcvm's children (Firecracker, the namespace holder, pasta) outlive a
+    SIGKILLed fcvm by a moment, and without a subreaper init adopts and reaps
+    them, often before teardown_fast's 200 us sampler reads their final CPU
+    from the zombie. Those readings were lower bounds: in the first fast-arm
+    corpus run on 2026-10-22, most requests had at least one. As the
+    subreaper, the harness adopts them instead, each stays a zombie until
+    reap_pinned_children() collects it, and every final reading is complete.
+    """
+    return _libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
+
+
+def reap_pinned_children(fds: dict) -> dict:
+    """Collect each pinned, exited child this process adopted; never fcvm.
+
+    {name: "reaped" | "running" | "not-ours"}. "not-ours" means the process is
+    not this process's child (no subreaper, or another reaper got it first).
+    """
+    outcome = {}
+    for name, fd in fds.items():
+        if fd is None:
+            continue
+        try:
+            result = os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG)
+        except ChildProcessError:
+            outcome[name] = "not-ours"
+            continue
+        outcome[name] = "running" if result is None else "reaped"
+    return outcome
+
+
+def reap_adopted_zombies(exclude=()) -> int:
+    """Collect zombies this process adopted outside a fast teardown.
+
+    Only a zombie (state Z) whose parent is this process and whose PID is not
+    in exclude, so no live Popen's status is taken. Returns how many.
+    """
+    me = os.getpid()
+    reaped = 0
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) in exclude:
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        if fields[0] != "Z" or int(fields[1]) != me:
+            continue
+        try:
+            if os.waitpid(int(entry), os.WNOHANG)[0]:
+                reaped += 1
+        except ChildProcessError:
+            pass
+    return reaped
+
+
 def pidfd_send_signal(fd: int, sig: int) -> None:
     """Signal the exact process pinned by ``fd``; a recycled PID is irrelevant."""
     result = _libc.syscall(
@@ -842,6 +904,40 @@ def freeze_and_capture_children(pid: int) -> tuple[list[int], list[int | None]]:
                 os.kill(pid, signal.SIGCONT)
             except ProcessLookupError:
                 pass
+
+
+def child_start_times(pids: list[int]) -> dict[int, int | None]:
+    """Start time of each pid, read while its frozen parent still holds it.
+
+    A frozen parent cannot reap a child, so a listed child is still a process
+    (possibly a zombie) and its start time names that process alone.
+    """
+    out: dict[int, int | None] = {}
+    for pid in pids:
+        fields = proc_stat_fields(pid)
+        out[pid] = None if fields is None else fields[3]
+    return out
+
+
+def unpinned_children(
+    initial_starts: dict[int, int | None], timeout_kids: list[int]
+) -> list[int]:
+    """Children in a later capture that the first capture did not pin.
+
+    Both captures read one process's direct children, so the comparison covers
+    only that process's own forks. A child the first capture pinned may have
+    exited since, and is then absent or a zombie: that is not a new child. A
+    pid is the same child only when its start time matches the one recorded at
+    the first capture, so a recycled number counts as new. A child whose start
+    time cannot be read now or was not read then is not proven pinned.
+    """
+    unpinned = []
+    for pid in timeout_kids:
+        fields = proc_stat_fields(pid)
+        recorded = initial_starts.get(pid)
+        if fields is None or recorded is None or fields[3] != recorded:
+            unpinned.append(pid)
+    return unpinned
 
 
 def close_pidfds(fds) -> None:
@@ -2133,10 +2229,15 @@ def reap_disk(
                 fcntl.flock(state_lock, fcntl.LOCK_UN)
                 os.close(state_lock)
             return reaped
+    # A removal that finds the file already gone has nothing left to do: under
+    # concurrent clones another fcvm's stale-state cleanup can delete this
+    # clone's state or lock between the check and the remove.
     if state_path and os.path.lexists(state_path):
         try:
             os.remove(state_path)
             reaped.append(state_path)
+        except FileNotFoundError:
+            pass
         except OSError as e:
             out.setdefault("disk_errors", []).append(f"{state_path}: {e}")
     # cleanup_stale_state removes `<vm_id>.json.lock` alongside the state file;
@@ -2151,6 +2252,8 @@ def reap_disk(
         try:
             os.remove(lock)
             reaped.append(lock)
+        except FileNotFoundError:
+            pass
         except OSError as e:
             out.setdefault("disk_errors", []).append(f"{lock}: {e}")
     elif state_lock is not None:
@@ -2284,6 +2387,7 @@ def measure_fast_reap(
         # the exact owner set terminal, retain its durable disk pointer, and let
         # the caller emit a structured abort instead of stranding a stopped VM.
         abort_frozen_owner(fcvm_pid, parent_fd, list(fds.values()))
+        reap_pinned_children(fds)
         close_pidfds(all_fds)
         raise
 
@@ -2324,6 +2428,7 @@ def teardown_fast(
             )
     except (RuntimeError, OSError) as error:
         terminal = abort_frozen_owner(fcvm_pid, parent_fd, captured_fds)
+        reap_pinned_children(dict(enumerate(captured_fds)))
         close_pidfds([parent_fd, *captured_fds])
         out["child_attribution_established"] = False
         out["all_gone"] = terminal
@@ -2348,6 +2453,7 @@ def teardown_fast(
         sampled["fcvm"] = fcvm_pid
     except BaseException as error:
         abort_frozen_owner(fcvm_pid, parent_fd, captured_fds)
+        reap_pinned_children(dict(enumerate(captured_fds)))
         close_pidfds([parent_fd, *captured_fds])
         out["child_attribution_established"] = False
         out["disk_reap_skipped"] = True
@@ -2518,6 +2624,7 @@ def teardown_fast(
             except (ProcessLookupError, PermissionError, OSError):
                 pass
         wait_pidfds([parent_fd, *fds.values()], 10.0)
+        out["children_reaped"] = reap_pinned_children(fds)
         close_pidfds([parent_fd, *fds.values()])
         out["teardown_total_ms"] = (time.monotonic() - t_kill) * 1000
         raise SurvivedTeardown(
@@ -2525,6 +2632,7 @@ def teardown_fast(
             f"{timeout_s:.1f}s; state {state_path} and data {data_dir} NOT reaped",
             out,
         )
+    out["children_reaped"] = reap_pinned_children(fds)
     close_pidfds([parent_fd, *fds.values()])
 
     t_disk = time.monotonic()
@@ -2920,6 +3028,34 @@ def restore_marks(log_path: str, launch_wall: float) -> dict:
     except OSError as error:
         return {"error": f"{type(error).__name__}: {error}", **marks}
     return marks
+
+
+def restore_ack(log_path: str) -> dict:
+    """fcvm's restored record from a clone's log: the ACK time and the guest's phases.
+
+    fcvm prints one JSON line on stdout when fc-agent acknowledges the exact
+    restore generation (restored_record in src/commands/snapshot.rs):
+    ack_ms, the host-observed time from the start of the restore call to
+    the ACK, and guest_phases, fc-agent's per-phase milliseconds for its
+    side of the restore (socket cleanup, reopening the network gate, ...).
+    Read after the request's answer, so nothing here is timed. A log
+    without the record says so rather than reading as zero.
+    """
+    try:
+        with open(log_path, errors="replace") as handle:
+            for line in handle:
+                if not line.startswith("{"):
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(record, dict) and record.get("status") == "restored":
+                    return {"ack_ms": record.get("ack_ms"),
+                            "guest_phases": record.get("guest_phases")}
+    except OSError as error:
+        return {"error": f"{type(error).__name__}: {error}"}
+    return {"error": "no restored record in the clone's log"}
 
 
 def probe_batch_script(sections) -> str:
@@ -3686,6 +3822,62 @@ def discover_wd_session(args, fcvm_pid: int, deadline: float) -> str:
     return session
 
 
+def _drive_clone(args, rep, op, endpoint, deadline, fcvm_pid, rec):
+    """Render one page on a ready clone: WebDriver for WebKit, CDP otherwise."""
+    import cdpdrive
+
+    if getattr(args, "engine", "chromium") == "webkit":
+        # Classic WebDriver has NO session discovery: the warm session
+        # id is written by entry-webkit.sh to /run/bench-session-id
+        # BEFORE the golden snapshot, so it is snapshot state --
+        # identical across clones for exactly the reason cdpdrive's
+        # target id is. Captured ONCE via fcvm exec on the first clone
+        # and pinned for every later rep (discovery-once, same pattern
+        # as --prewire; warmups run first, so the exec cost lands on a
+        # discarded rep).
+        if not getattr(args, "wd_session_id", ""):
+            args.wd_session_id = discover_wd_session(args, fcvm_pid, deadline)
+        rec["session_prewired"] = True
+        import wddrive
+
+        result = wddrive.drive(argparse.Namespace(
+            cdp_host=endpoint,
+            url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
+            timeout=max(1.0, deadline - time.monotonic()),
+            session_id=args.wd_session_id,
+            out_prefix="",
+        ))
+    else:
+        ws_url = clone_ws_url(args.ws_url, endpoint) if args.ws_url else ""
+        rec["ws_url_prewired"] = bool(ws_url)
+        drive_args = argparse.Namespace(
+            cdp_host=endpoint,
+            url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
+            format=args.format,
+            quality=args.quality,
+            timeout=max(1.0, deadline - time.monotonic()),
+            idle_wait_ms=0.0,
+            out_prefix="",
+            ws_url=ws_url,
+            connect_retries=200,
+            nav_timing=True,
+            print_target=False,
+            # This Namespace is an explicit, CLOSED field list, so every flag
+            # cdpdrive grows has to be added here too or `drive()` raises
+            # AttributeError — which is not in its except tuple, escapes it,
+            # and is swallowed by the `except Exception` below, failing every
+            # cdp rep. cdpdrive also reads it with getattr; both halves.
+            host_header="",
+            op=op,
+            # getattr: failure-path fixtures drive this function with
+            # bare Namespaces that predate the knob.
+            resolve_poll_ms=getattr(args, "resolve_poll_ms", 50.0),
+            render_module=os.path.join(HERE, "render.py"),
+        )
+        result = cdpdrive.drive(drive_args)
+    return result
+
+
 def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screenshot") -> dict:
     import cdpdrive
 
@@ -3700,7 +3892,12 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
     log = os.path.join(args.out_dir, f"{name}.log")
     rec: dict = {"arm": arm_name, "rep": rep, "name": name}
 
-    cmd = [args.fcvm, "snapshot", "run"] + clone_backend_args(args) + [
+    # reqscale places each clone in its backend's cgroup through a guard that
+    # execs fcvm (same pid), so the FILE and UFFD cgroups account their own
+    # clones. Without the prefix every clone ran in the driver's cgroup.
+    cmd = list(getattr(args, "spawn_prefix", ())) + [
+        args.fcvm, "snapshot", "run",
+    ] + clone_backend_args(args) + [
         "--name", name, "--no-dirty-tracking", "--no-swap",
     ]
     env = dict(os.environ, RUST_LOG=args.rust_log)
@@ -3709,6 +3906,9 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
     watch = DirWatch(args.state_dir)
     t_spawn = time.monotonic()
     t_spawn_wall = time.time()
+    # reqscale times each request of an open-loop run from these monotonic
+    # stamps (the same clock as its time.monotonic_ns schedule).
+    rec["started_monotonic_ns"] = int(t_spawn * 1e9)
     interrupted = None
     fcvm_start_time = None
     try:
@@ -3745,55 +3945,20 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
             rec["state_to_port_ms"] = wait_port(endpoint, deadline, proc, log)
             rec["spawn_to_port_ms"] = (time.monotonic() - t_spawn) * 1000
 
-            if getattr(args, "engine", "chromium") == "webkit":
-                # Classic WebDriver has NO session discovery: the warm session
-                # id is written by entry-webkit.sh to /run/bench-session-id
-                # BEFORE the golden snapshot, so it is snapshot state --
-                # identical across clones for exactly the reason cdpdrive's
-                # target id is. Captured ONCE via fcvm exec on the first clone
-                # and pinned for every later rep (discovery-once, same pattern
-                # as --prewire; warmups run first, so the exec cost lands on a
-                # discarded rep).
-                if not getattr(args, "wd_session_id", ""):
-                    args.wd_session_id = discover_wd_session(args, fcvm_pid, deadline)
-                rec["session_prewired"] = True
-                import wddrive
-
-                result = wddrive.drive(argparse.Namespace(
-                    cdp_host=endpoint,
-                    url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
-                    timeout=max(1.0, deadline - time.monotonic()),
-                    session_id=args.wd_session_id,
-                    out_prefix="",
-                ))
-            else:
-                ws_url = clone_ws_url(args.ws_url, endpoint) if args.ws_url else ""
-                rec["ws_url_prewired"] = bool(ws_url)
-                drive_args = argparse.Namespace(
-                    cdp_host=endpoint,
-                    url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
-                    format=args.format,
-                    quality=args.quality,
-                    timeout=max(1.0, deadline - time.monotonic()),
-                    idle_wait_ms=0.0,
-                    out_prefix="",
-                    ws_url=ws_url,
-                    connect_retries=200,
-                    nav_timing=True,
-                    print_target=False,
-                    # This Namespace is an explicit, CLOSED field list, so every flag
-                    # cdpdrive grows has to be added here too or `drive()` raises
-                    # AttributeError — which is not in its except tuple, escapes it,
-                    # and is swallowed by the `except Exception` below, failing every
-                    # cdp rep. cdpdrive also reads it with getattr; both halves.
-                    host_header="",
-                    op=op,
-                    # getattr: failure-path fixtures drive this function with
-                    # bare Namespaces that predate the knob.
-                    resolve_poll_ms=getattr(args, "resolve_poll_ms", 50.0),
-                    render_module=os.path.join(HERE, "render.py"),
-                )
-                result = cdpdrive.drive(drive_args)
+            # reqscale hands each request a private probe that pins this clone's
+            # Firecracker child and reads its fault counters from endpoint-ready
+            # to the answer. A probe failure is a request failure and still goes
+            # through the teardown below.
+            fault_probe = getattr(args, "firecracker_fault_probe", None)
+            fault_probe_started = False
+            if fault_probe is not None:
+                fault_probe.begin(fcvm_pid)
+                fault_probe_started = True
+            try:
+                result = _drive_clone(args, rep, op, endpoint, deadline, fcvm_pid, rec)
+            finally:
+                if fault_probe_started:
+                    rec["firecracker_process_faults_ready_to_artifact"] = fault_probe.finish()
             raise_if_harness_interrupted()
             rec["render"] = result
             rec["ok"] = bool(result.get("ok"))
@@ -3828,7 +3993,10 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
                 rec["failure_stage"] = result.get("stage", "")
             # THE CALLER'S ANSWER IS IN HAND HERE. Everything after this line is
             # teardown, and none of it is latency the caller pays.
-            rec["blocking_ms"] = (time.monotonic() - t_spawn) * 1000
+            t_answer = time.monotonic()
+            rec["blocking_ms"] = (t_answer - t_spawn) * 1000
+            if rec.get("ok"):
+                rec["artifact_monotonic_ns"] = int(t_answer * 1e9)
             t_owned = time.monotonic()
             state = wait_state_owned(
                 state_path,
@@ -3941,9 +4109,12 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
             rec["log"] = log
             e.record = rec
             raise e from interrupted
-    rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
+    t_finished = time.monotonic()
+    rec["wall_ms"] = (t_finished - t_spawn) * 1000
+    rec["finished_monotonic_ns"] = int(t_finished * 1e9)
     rec["log"] = log
     rec["restore_marks"] = restore_marks(log, t_spawn_wall)
+    rec["restore_ack"] = restore_ack(log)
     if interrupted is not None:
         raise interrupted
     raise_if_harness_interrupted()
@@ -4114,6 +4285,7 @@ def run_noop_request(args, rep: int, fast: bool = False) -> dict:
     rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
     rec["log"] = log
     rec["restore_marks"] = restore_marks(log, t_spawn_wall)
+    rec["restore_ack"] = restore_ack(log)
     if interrupted is not None:
         raise interrupted
     raise_if_harness_interrupted()
@@ -4189,6 +4361,7 @@ def run_exec_request(args, rep: int) -> dict:
             raise RuntimeError(
                 f"exec clone owner {proc.pid} has no completely pinned child set"
             )
+        kid_starts = child_start_times(kids)
         os.kill(proc.pid, signal.SIGCONT)
     except BaseException as request_error:
         if (
@@ -4318,9 +4491,11 @@ def run_exec_request(args, rep: int) -> dict:
             error.record = rec
             raise error from capture_error
         # No production child is allowed to appear after the state ownership
-        # barrier. A mismatch means the original attribution was incomplete;
-        # kill every exact handle, retain disk evidence, and fail closed.
-        if timeout_kids != kids or any(fd is None for fd in timeout_fds):
+        # barrier. A child outside the pinned set means the original attribution
+        # was incomplete; kill every exact handle, retain disk evidence, and
+        # fail closed. A pinned child that has since exited is not that: the
+        # first read can hold a child the frozen owner had not yet reaped.
+        if unpinned_children(kid_starts, timeout_kids):
             abort_frozen_owner(proc.pid, parent_fd, [*fds, *timeout_fds])
             close_pidfds([parent_fd, *fds, *timeout_fds])
             teardown = {
@@ -4602,6 +4777,9 @@ def main_with_resources(resources: ExitStack) -> int:
     args = p.parse_args()
     signal.signal(signal.SIGINT, record_harness_interrupt)
     signal.signal(signal.SIGTERM, record_harness_interrupt)
+    # Adopt fcvm's orphans so a fast teardown reads each one's final CPU
+    # from its zombie (become_child_subreaper).
+    child_subreaper = become_child_subreaper()
     # The harness owns these handlers.  Do not inherit a caller's blocked mask:
     # every clone and the harness itself must be able to observe shutdown.
     signal.pthread_sigmask(signal.SIG_UNBLOCK, TERMINATION_SIGNALS)
@@ -4824,6 +5002,7 @@ def main_with_resources(resources: ExitStack) -> int:
             "quiet_loadavg1_limit": quiet_loadavg1_limit,
             **host_identity(),
             "host": host_facts(),
+            "child_subreaper": child_subreaper,
             # The memory server's own ready record says whether it records
             # and replays the working set; null for a file-backed restore.
             "uffd_prefetch": (
@@ -4876,6 +5055,10 @@ def main_with_resources(resources: ExitStack) -> int:
                 }
                 fatal = e
             rec["warmup"] = is_warmup  # discarded explicitly at analysis, never silently
+            # Anything else the harness adopted during this request (an fcvm
+            # child that outlived a normal teardown) is collected here, after
+            # the request's own processes have been waited.
+            rec["adopted_zombies_reaped"] = reap_adopted_zombies()
             rec["url"] = url_for_rep(getattr(args, "urls", None) or [args.url], rep)
             rec["run_id"] = run_id
             rec["record_id"] = f"{run_id}:{arm}:{rep}:{int(is_warmup)}"

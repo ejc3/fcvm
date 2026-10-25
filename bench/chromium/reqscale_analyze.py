@@ -1184,6 +1184,20 @@ def _require_hex(value, length: int, name: str) -> str:
     return value
 
 
+def _valid_port_mapping(value) -> bool:
+    """One entry of fcvm's snapshot `metadata.port_mappings`, as fcvm writes it:
+    {"host_ip": null | str, "host_port": int, "guest_port": int, "proto": str}."""
+    def port(v):
+        return isinstance(v, int) and not isinstance(v, bool) and 0 < v < 65536
+    return (
+        isinstance(value, dict)
+        and set(value) == {"host_ip", "host_port", "guest_port", "proto"}
+        and (value["host_ip"] is None or (isinstance(value["host_ip"], str) and value["host_ip"]))
+        and port(value["host_port"]) and port(value["guest_port"])
+        and value["proto"] in ("tcp", "udp")
+    )
+
+
 def _validate_snapshot_provenance(snapshot: dict) -> tuple[str, str]:
     required = {
         "tag", "generation_id", "created_at", "vm_id", "config_sha256",
@@ -1216,7 +1230,7 @@ def _validate_snapshot_provenance(snapshot: dict) -> tuple[str, str]:
         or isinstance(shape["memory_mib"], bool)
         or shape["memory_mib"] <= 0
         or not isinstance(shape["port_mappings"], list)
-        or any(not isinstance(value, str) or not value for value in shape["port_mappings"])
+        or any(not _valid_port_mapping(value) for value in shape["port_mappings"])
     ):
         raise AnalysisInvalid("provenance snapshot shape contains invalid values")
     files = snapshot.get("files")
@@ -1312,12 +1326,18 @@ def _validate_provenance(provenance: dict, schedule: dict) -> tuple[str, str]:
         raise AnalysisInvalid("snapshot generation lease provenance is incomplete")
     host = provenance.get("host")
     if not isinstance(host, dict) or set(host) != {
-        "kernel", "machine", "python", "cpu_count", "quiet_gate",
+        "instance_type", "cpu_model", "kernel", "machine", "python", "cpu_count",
+        "quiet_gate",
     }:
         raise AnalysisInvalid("host provenance is incomplete")
     for field in ("kernel", "machine", "python"):
         if not isinstance(host.get(field), str) or not host[field]:
             raise AnalysisInvalid(f"host provenance lacks {field}")
+    for field in ("instance_type", "cpu_model"):
+        if host.get(field) is not None and (
+            not isinstance(host[field], str) or not host[field]
+        ):
+            raise AnalysisInvalid(f"host provenance has an invalid {field}")
     if (
         not isinstance(host.get("cpu_count"), int)
         or isinstance(host["cpu_count"], bool)
@@ -1681,16 +1701,22 @@ def _validate_uffd_serve(
 
 def _validate_fault_cgroup_membership(requests: list[dict], status: dict) -> None:
     final = status["final_cgroups"]
+    # The audit's role is the process's comm, and fcvm runs a content-addressed
+    # binary, so Firecracker appears as "firecracker-def" (comm is cut to 15
+    # bytes); the probe selects it by the same prefix.
     observed = {
         backend: {
-            (item.get("pid"), item.get("pid_start_time_ticks"), item.get("role"))
-            for item in final[backend].get("observed", []) if isinstance(item, dict)
+            (item.get("pid"), item.get("pid_start_time_ticks"))
+            for item in final[backend].get("observed", [])
+            if isinstance(item, dict)
+            and isinstance(item.get("role"), str)
+            and item["role"].startswith("firecracker")
         }
         for backend in ("file", "uffd")
     }
     for row in requests:
         faults = row["firecracker_process_faults_ready_to_artifact"]
-        identity = (faults["pid"], faults["pid_start_time_ticks"], "firecracker")
+        identity = (faults["pid"], faults["pid_start_time_ticks"])
         if identity not in observed[row["backend"]]:
             raise AnalysisInvalid(
                 f"request {row['request_id']} Firecracker identity is absent from its "
@@ -2010,6 +2036,8 @@ def analyze(run_dir: str) -> dict:
             "seed": config.seed,
         },
         "provenance": {
+            "instance_type": provenance["host"]["instance_type"],
+            "cpu_model": provenance["host"]["cpu_model"],
             "kernel": provenance["host"]["kernel"],
             "machine": provenance["host"]["machine"],
             "cpu_count": provenance["host"]["cpu_count"],
@@ -2060,7 +2088,8 @@ def markdown_report(analysis: dict) -> str:
         f"`{analysis['snapshot_generation_id']}`. The run passed its provenance, "
         "continuous-accounting, and host drift-control checks.",
         "",
-        f"Measured on a {prov['machine']} host ({prov['cpu_count']} CPUs, "
+        f"Measured on `{prov['instance_type'] or 'an unrecorded instance type'}` "
+        f"({prov['cpu_model'] or prov['machine']}, {prov['cpu_count']} CPUs, "
         f"kernel `{prov['kernel']}`) with fcvm `{prov['fcvm_version']}` "
         f"(`{prov['fcvm_sha256'][:12]}`) at source revision "
         f"`{prov['source_revision'][:12]}`"

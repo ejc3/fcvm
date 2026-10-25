@@ -22,6 +22,7 @@ import os
 import random
 import re
 import signal
+import statistics
 import shlex
 import shutil
 import subprocess
@@ -43,6 +44,21 @@ REPO_ROOT = os.path.dirname(os.path.dirname(HERE))
 import campaign_summary  # noqa: E402
 import reqanalyze  # noqa: E402
 import reqbench  # noqa: E402
+from unittest import mock as _subreaper_mock  # noqa: E402
+
+# main() makes the harness the subreaper of its descendants' orphans. The test
+# runner must not adopt every orphan of every test, so this module's tests run
+# main() without it; test_run_facts.Subreaper checks the real call in a child.
+_NO_SUBREAPER = _subreaper_mock.patch.object(reqbench, "become_child_subreaper",
+                                             lambda: False)
+
+
+def setUpModule():
+    _NO_SUBREAPER.start()
+
+
+def tearDownModule():
+    _NO_SUBREAPER.stop()
 
 
 def self_cpu_ms() -> float:
@@ -683,6 +699,31 @@ class ReapDiskPathGuard(unittest.TestCase):
             self.assertTrue(any("vm-disks" in e for e in out.get("disk_errors", [])),
                             f"the refusal must be recorded: {out}")
 
+    def test_a_lock_already_removed_by_someone_else_is_not_an_error(self):
+        """Under concurrent clones another fcvm's stale-state cleanup can delete
+        this clone's lock between reap_disk's lexists and its remove.
+
+        RED BEFORE THE FIX: the ENOENT was recorded as a disk error, the fast
+        teardown raised SurvivedTeardown with left=[], and the scale harness
+        refused a 2,015-request run over that one request (2026-10-22, s12).
+        """
+        with tempfile.TemporaryDirectory() as root:
+            vm_id = "vm-66666666666666666666666666666666"
+            state = os.path.join(root, f"{vm_id}.json")
+            with open(state, "w") as f:
+                json.dump({"vm_id": vm_id}, f)
+            lock = f"{state}.lock"
+            real_lexists = os.path.lexists
+            # The lock is there when checked and gone by the remove.
+            from unittest import mock
+            with mock.patch.object(reqbench.os.path, "lexists",
+                                   lambda p: True if p == lock else real_lexists(p)):
+                out: dict = {}
+                reaped = reqbench.reap_disk(out, root, state, "")
+            self.assertNotIn("disk_errors", out)
+            self.assertEqual(reaped, [state])
+            self.assertFalse(os.path.lexists(state))
+
     def test_a_real_per_vm_dir_is_still_reaped(self):
         """The guard must not disarm the ordinary reap."""
         with tempfile.TemporaryDirectory() as root:
@@ -1013,12 +1054,116 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
                 server.close()
 
             self.assertTrue(rec["ok"])
+            # reqscale's request function (_make_request_fn) times each corpus
+            # scale request from these three monotonic stamps, and refuses a
+            # successful record without artifact_ns; run_cdp_request set none
+            # of them, so every request of a corpus scale run was refused
+            # (2026-10-22: "successful request record is missing artifact_ns").
+            self.assertLess(rec["started_monotonic_ns"], rec["artifact_monotonic_ns"])
+            self.assertLessEqual(rec["artifact_monotonic_ns"], rec["finished_monotonic_ns"])
+            self.assertAlmostEqual(
+                (rec["artifact_monotonic_ns"] - rec["started_monotonic_ns"]) / 1e6,
+                rec["blocking_ms"], delta=1.0)
             self.assertEqual(owner_wait_calls, [True])
             self.assertTrue(os.path.exists(owner_wait_entered))
             self.assertGreaterEqual(rec["state_owner_wait_ms"], 150.0, rec)
             self.assertTrue(rec["teardown"]["all_gone"])
             self.assertFalse(os.path.lexists(state_path))
             self.assertFalse(os.path.lexists(data_dir))
+
+    def test_scale_request_hooks_place_the_clone_and_sample_its_faults(self):
+        """reqscale passes spawn_prefix (its cgroup guard) and a per-request
+        firecracker_fault_probe; run_cdp_request must use both.
+
+        RED BEFORE THE FIX: it ignored both. Every clone of a scale run ran in
+        the driver's cgroup (2026-10-22: the FILE cgroup's cpu.stat stayed at 0
+        while the driver's held 739 s), and no request carried
+        firecracker_process_faults_ready_to_artifact, which reqscale_analyze
+        requires of every row, so no scale run could be analyzed.
+        """
+        import cdpdrive
+        import socket
+
+        with tempfile.TemporaryDirectory() as d:
+            state_dir = os.path.join(d, "state")
+            vm_id = "vm-33333333333333333333333333333333"
+            state_path = os.path.join(state_dir, f"{vm_id}.json")
+            os.makedirs(state_dir)
+            os.makedirs(os.path.join(d, "vm-disks", vm_id))
+            child_ready = os.path.join(d, "child-ready")
+            guard_ran = os.path.join(d, "guard-ran")
+            stub = os.path.join(d, "fcvm-stub")
+            guard = os.path.join(d, "guard")
+
+            server = socket.socket()
+            server.bind(("127.0.0.1", 0))
+            server.listen(8)
+            port = server.getsockname()[1]
+            name = "rb-test-run-0-fast"
+            ready = json.dumps({
+                "vm_id": vm_id,
+                "name": name,
+                "pid": "PID",
+                "pid_start_time": "START",
+                "lifecycle_ready": True,
+                "config": {"network": {"loopback_ip": "127.0.0.1"}},
+            })
+            with open(guard, "w") as f:
+                f.write(f"#!/bin/bash\necho $$ > {guard_ran}\nexec \"$@\"\n")
+            os.chmod(guard, 0o755)
+            with open(stub, "w") as f:
+                f.write(
+                    "#!/bin/bash\n"
+                    f"python3 -c 'import ctypes,signal,time; ctypes.CDLL(\"libc.so.6\").prctl(1, signal.SIGKILL); open(\"{child_ready}\", \"w\").close(); time.sleep(600)' &\n"
+                    f"while [ ! -e {child_ready} ]; do sleep 0.01; done\n"
+                    "read -r proc_stat < /proc/$$/stat; proc_stat=${proc_stat##*) }; "
+                    "read -ra proc_fields <<< \"$proc_stat\"; start=${proc_fields[19]}\n"
+                    f"printf '%s\\n' '{ready}' | sed -e \"s/\\\"PID\\\"/$$/\" -e \"s/\\\"START\\\"/$start/\" > {state_path}\n"
+                    f": > {state_path}.lock\n"
+                    "wait\n"
+                )
+            os.chmod(stub, 0o755)
+
+            calls = []
+
+            class Probe:
+                def begin(self, pid):
+                    calls.append(("begin", pid))
+
+                def finish(self):
+                    calls.append(("finish",))
+                    return {"pid": 7, "minor_faults": 3, "major_faults": 0}
+
+            def drive(_args):
+                calls.append(("drive",))
+                return {"ok": True, "stages": {}}
+
+            real_drive = cdpdrive.drive
+            cdpdrive.drive = drive
+            args = argparse.Namespace(
+                fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
+                snapshot_tag="", serve_pid=1, rust_log="off",
+                timeout=5.0, teardown_timeout=5.0, cdp_port=port,
+                state_dir=state_dir, data_root=d, ws_url="", run_id="test-run",
+                spawn_prefix=[guard], firecracker_fault_probe=Probe(),
+            )
+            try:
+                rec = reqbench.run_cdp_request(args, 0, fast=True)
+            finally:
+                cdpdrive.drive = real_drive
+                server.close()
+
+            self.assertTrue(rec["ok"], rec)
+            # The guard execs fcvm, so it ran as the very process whose pid
+            # the state file names and the probe pins.
+            self.assertTrue(os.path.exists(guard_ran), "spawn_prefix was not run")
+            with open(guard_ran) as f:
+                guard_pid = int(f.read())
+            self.assertEqual(rec["state_owner_pid"], guard_pid)
+            self.assertEqual(calls, [("begin", guard_pid), ("drive",), ("finish",)])
+            self.assertEqual(
+                rec["firecracker_process_faults_ready_to_artifact"],
+                {"pid": 7, "minor_faults": 3, "major_faults": 0})
 
 
 class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):
@@ -2099,6 +2244,99 @@ class ExecArmTimeout(unittest.TestCase):
                 if pid not in before and process_running(pid)
             ]
             self.assertEqual(leaked, [], f"stub survived the timeout: {leaked}")
+
+    def _args_for_stub_with_cont_trap(self, trap_body, extra_setup=""):
+        """Exec-arm args for a stub whose SIGCONT trap changes its child set.
+
+        The harness sends SIGCONT only after it has pinned the stub's direct
+        children, so whatever the trap does happens strictly between the two
+        reads of that set. `trap_body` runs in the stub on that SIGCONT.
+        """
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        stub = os.path.join(d, "fcvm-stub")
+        child_ready = os.path.join(d, "exec-child-ready")
+        state = os.path.join(d, "vm-44444444444444444444444444444444.json")
+        os.makedirs(os.path.join(d, "vm-disks", "vm-44444444444444444444444444444444"))
+        fifo = os.path.join(d, "release")
+        os.mkfifo(fifo)
+        with open(stub, "w") as f:
+            f.write(
+                "#!/bin/bash\n"
+                f"{extra_setup.format(fifo=fifo)}"
+                f"python3 -c 'import ctypes,signal,time; ctypes.CDLL(\"libc.so.6\").prctl(1, signal.SIGKILL); open(\"{child_ready}\", \"w\").close(); time.sleep(600)' &\n"
+                "main_child=$!\n"
+                f"while [ ! -e {child_ready} ]; do sleep 0.01; done\n"
+                f"trap '{trap_body.format(fifo=fifo)}' CONT\n"
+                "read -r proc_stat < /proc/$$/stat; proc_stat=${proc_stat##*) }; "
+                "read -ra proc_fields <<< \"$proc_stat\"; start=${proc_fields[19]}\n"
+                f"cat > {state} <<EOF\n"
+                '{"vm_id": "vm-44444444444444444444444444444444", "name": "rb-test-run-0-exec", "pid": $$, "pid_start_time": $start, "lifecycle_ready": true}\n'
+                "EOF\n"
+                f": > {state}.lock\n"
+                "while kill -0 $main_child 2>/dev/null; do wait $main_child; done\n"
+            )
+        os.chmod(stub, 0o755)
+        return argparse.Namespace(
+            fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
+            snapshot_tag="", serve_pid=1, rust_log="off",
+            timeout=1.5, teardown_timeout=1.0,
+            state_dir=d, data_root=d, run_id="test-run",
+        )
+
+    def test_a_child_that_exits_between_the_two_reads_is_not_a_changed_set(self):
+        """A pinned child leaving the set after SIGCONT is not an unpinned child.
+
+        RED BEFORE THE FIX: `timeout_kids != kids` treated any difference as a
+        failure. The set is the stub's own direct children (/proc/<pid>/children),
+        so an unrelated process cannot enter it; what differed in the issue-1251
+        flake was the stub's own transient child (the `cat` that publishes the
+        state), captured while the frozen stub had not yet reaped it and gone by
+        the second read. The transient child here blocks until the stub gets
+        SIGCONT, so it is always in the first read and never in the second:
+            SurvivedTeardown: exec clone child set changed after ownership
+            publication: [T, P] -> [P]
+        """
+        args = self._args_for_stub_with_cont_trap(
+            "echo go > {fifo}",
+            extra_setup='bash -c "read -r _ < {fifo}" &\n',
+        )
+        rec = reqbench.run_exec_request(args, 0)  # must NOT raise
+        self.assertIs(rec["ok"], False)
+        self.assertIs(rec["timed_out"], True)
+        self.assertIs(rec["teardown"]["child_attribution_established"], True)
+        self.assertIs(rec["teardown"]["all_gone"], True)
+
+    def test_a_child_that_appears_between_the_two_reads_is_still_refused(self):
+        """A child forked after the barrier is unpinned and must fail closed."""
+        args = self._args_for_stub_with_cont_trap("sleep 300 &")
+        with self.assertRaises(reqbench.SurvivedTeardown) as cm:
+            reqbench.run_exec_request(args, 0)
+        self.assertIn("child set changed", str(cm.exception))
+        teardown = cm.exception.teardown
+        added = [
+            pid for pid in teardown["timeout_children"]
+            if pid not in teardown["initial_children"]
+        ]
+        self.assertEqual(len(added), 1, teardown)
+        self.assertFalse(process_running(added[0]), "the unpinned child was not killed")
+
+    def test_an_exited_unreaped_child_is_the_same_child_but_a_recycled_pid_is_not(self):
+        child = subprocess.Popen(["true"])
+        self.addCleanup(child.wait)
+        deadline = time.monotonic() + 5
+        while process_running(child.pid):
+            self.assertLess(time.monotonic(), deadline, "child did not exit")
+            time.sleep(0.01)
+        starts = reqbench.child_start_times([child.pid])
+        self.assertIsNotNone(starts[child.pid], "a zombie's start time is readable")
+        # Exited and still listed by its frozen parent: the child pinned earlier.
+        self.assertEqual(reqbench.unpinned_children(starts, [child.pid]), [])
+        # Same number, different start time: a new process holds the pid.
+        recycled = {child.pid: starts[child.pid] + 1}
+        self.assertEqual(reqbench.unpinned_children(recycled, [child.pid]), [child.pid])
+        # Not in the first capture at all.
+        self.assertEqual(reqbench.unpinned_children({}, [child.pid]), [child.pid])
 
 
 class _JsonListServer:
@@ -6347,9 +6585,23 @@ if error:
 # names no address for it. STUB_CACHED=1: one the cache answered and one a
 # service worker answered, which carry no address either and say why.
 if os.environ.get("STUB_UNADDRESSED") == "1":
-    rows.append({"request_id": "r5", "url": url + "late.js", "remote_ip": "",
+    rows.append({"request_id": "r5", "url": os.environ.get("STUB_BEACON_URL") or (url + "late.js"), "remote_ip": "",
                  "status": None, "failed": False, "pending_at_load": True,
                  "error_text": "", "from_cache": False, "from_service_worker": False})
+    # STUB_ACCESS_LOG=<path>: the replay's access log, with a line saying it
+    # answered that request now (or, with STUB_ACCESS_TS, at that time).
+    if os.environ.get("STUB_ACCESS_LOG"):
+        import time, urllib.parse
+        # The path as the replay logs it: the raw request target, so a URL
+        # ending in a bare "?" keeps it (STUB_BEACON_URL, a beacon's shape).
+        beacon = os.environ.get("STUB_BEACON_URL") or (url + "late.js")
+        parts = urllib.parse.urlsplit(beacon)
+        raw = beacon.split(parts.netloc, 1)[1].split("#", 1)[0] or "/"
+        line = {"ts": float(os.environ.get("STUB_ACCESS_TS") or time.time()),
+                "peer": "127.0.0.1:1", "method": "POST", "host": parts.netloc,
+                "path": raw, "status": 404, "bytes": 0, "duration_ms": 0.2}
+        with open(os.environ["STUB_ACCESS_LOG"], "a") as log:
+            log.write(json.dumps(line) + "\n")
 if os.environ.get("STUB_CACHED") == "1":
     rows.append({"request_id": "r6", "url": url + "logo.png", "remote_ip": "",
                  "status": 200, "failed": False, "pending_at_load": False,
@@ -6584,6 +6836,38 @@ exec __PYTHON__ "$@"
             for data in summary["urls"].values():
                 self.assertEqual(data["errors"], {"net::ERR_NAME_NOT_RESOLVED": 2})
                 self.assertEqual(data["max_pending_at_load"], 3)
+
+    def test_an_unaddressed_request_the_replay_logged_answering_is_not_a_violation(self):
+        """#1137: the replay answers an uncaptured beacon POST with a 404 and
+        then closes with the body unread, which the kernel turns into a RST,
+        so Chromium's trace row names no remote address. The replay's own
+        access log names where that request went: it logs every request it
+        answers, after answering. A row with no address whose URL the access
+        log shows answered during that rep's render is the replay's; one the
+        log does not show, or shows outside the rep, is still a violation.
+        On 2026-10-22 these resets failed most diags on one host.
+
+        RED BEFORE THE FIX: the logged request still failed the diag."""
+        # The second beacon is the shape that failed on 2026-10-22 after the
+        # first fix: https://blog.cloudflare.com/cdn-cgi/rum? with an empty
+        # query, which the replay logs as "/cdn-cgi/rum?".
+        for when, passes, beacon in (("", True, ""), ("1.0", False, ""),
+                                     ("", True, "https://blog.cloudflare.com/cdn-cgi/rum?")):
+            with tempfile.TemporaryDirectory() as d:
+                env, _state_dir = self._diag_fixture(d, reps="1", STUB_UNADDRESSED="1",
+                                                     STUB_BEACON_URL=beacon)
+                os.makedirs(env["RESULTS"], exist_ok=True)
+                env["STUB_ACCESS_LOG"] = os.path.join(env["RESULTS"], "corpus-access.log")
+                env["STUB_ACCESS_TS"] = when
+                result = self._diag(env)
+                summary = self._diag_summary(env)
+                if passes:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr[-2000:])
+                    self.assertIs(summary["passed"], True, summary["violations"])
+                    self.assertEqual(sum(u["answered_by_replay"] for u in summary["urls"].values()), 2)
+                else:
+                    self.assertIs(summary["passed"], False)
+                    self.assertEqual({v["kind"] for v in summary["violations"]}, {"no_remote_ip"})
 
     def test_a_traced_request_with_no_allowed_address_is_a_violation(self):
         """DIAG_EXPECT_IPS passed on `addressed > 0`: one request with an
@@ -7541,12 +7825,28 @@ class DocLint(unittest.TestCase):
             os.path.join(self._results(), run, campaign_summary.WITHDRAWN_MARKER))
 
     def _verified_cell(self, run):
-        """load_cell's cell for a committed run, or the RunError text."""
+        """load_cell's cell for a committed run, or the RunError text.
+
+        A run whose replay logs are kept in ejc3/fcvm-bench-records
+        (external-logs.json) is fully verified when FCVM_BENCH_RECORDS names a
+        checkout. Without one (CI), campaign_summary refuses it as NOT
+        VERIFIED, and the lint reads every other record of it with
+        replay_logs=False: the figures it checks are in analysis.json, and the
+        logs' sha256 stays the index's to check where the logs are."""
+        run_dir = os.path.join(self._results(), run)
         try:
-            cell, _sources = campaign_summary.load_cell(
-                os.path.join(self._results(), run))
+            cell, _sources = campaign_summary.load_cell(run_dir)
         except campaign_summary.RunError as error:
-            return None, str(error)
+            if not (
+                "NOT VERIFIED" in str(error)
+                and not os.environ.get(campaign_summary.RECORDS_ENV)
+                and os.path.isfile(os.path.join(run_dir, campaign_summary.EXTERNAL_LOGS))
+            ):
+                return None, str(error)
+            try:
+                cell, _sources = campaign_summary.load_cell(run_dir, replay_logs=False)
+            except campaign_summary.RunError as second:
+                return None, str(second)
         return cell, None
 
     def _resolve_cite(self, token, ellipsis, names):
@@ -7741,6 +8041,23 @@ class DocLint(unittest.TestCase):
             run = parts[anchors[-1]] if anchors else ""
             rel = "/".join(parts[anchors[-1] + 1:]) if anchors else ""
             committed = os.path.join(self._results(), run, rel)
+            path = str(entry.get("path") or "")
+            if re.match(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}:", path):
+                # A log kept in the records repository: the run's pointer must
+                # name this commit, path and sha256 (campaign_summary read it there).
+                pointer_path = os.path.join(self._results(), run, campaign_summary.EXTERNAL_LOGS)
+                pointed = None
+                if os.path.isfile(pointer_path):
+                    with open(pointer_path) as f:
+                        pointer = json.load(f)
+                    for entry_name, ext in pointer.get("files", {}).items():
+                        if path == f"{pointer.get('repository')}@{ext.get('commit')}:{ext.get('path')}":
+                            pointed = ext
+                if pointed is None or pointed.get("sha256") != entry.get("sha256"):
+                    bad.append(f"{name}: results/{token} generated_from names {path}, "
+                               f"which results/{run}/{campaign_summary.EXTERNAL_LOGS} does not point at "
+                               "with that sha256")
+                continue
             if run not in files or rel not in files[run]:
                 bad.append(f"{name}: results/{token} generated_from names "
                            f"results/{run}/{rel}, not committed")
@@ -7778,15 +8095,16 @@ class DocLint(unittest.TestCase):
         return values, runs
 
     def _record_values(self, run):
-        """Every median, lo and hi under arms and per_url of a committed
-        run's analysis.json."""
+        """Every median, mean, lo and hi under arms and per_url of a committed
+        run's analysis.json. The means are the CPU figures (request_cpu_ms),
+        which the analyzer publishes as a mean with its interval."""
         values = set()
         with open(os.path.join(self._results(), run, "analysis.json")) as f:
             analysis = json.load(f)
 
         def walk(node):
             if isinstance(node, dict):
-                for key in ("median", "lo", "hi"):
+                for key in ("median", "mean", "lo", "hi"):
                     v = node.get(key)
                     if isinstance(v, (int, float)) and not isinstance(v, bool):
                         values.add(float(v))
@@ -7797,7 +8115,31 @@ class DocLint(unittest.TestCase):
                     walk(v)
         walk(analysis.get("arms"))
         walk(analysis.get("per_url"))
-        return values
+        return values | self._ack_values(run)
+
+    def _ack_values(self, run):
+        """The per-arm medians of fc-agent's restore phases and of the ACK time
+        over a run's measured requests, from restore-ack.jsonl (restore_ack.py,
+        which reads them out of the clone logs) joined to reqbench.jsonl by
+        record_id. A run without the file contributes nothing."""
+        path = os.path.join(self._results(), run, "restore-ack.jsonl")
+        if not os.path.isfile(path):
+            return set()
+        with open(path) as f:
+            acks = [json.loads(line) for line in f if line.strip()][1:]
+        by_id = {a["record_id"]: a["restore_ack"] for a in acks}
+        with open(os.path.join(self._results(), run, "reqbench.jsonl")) as f:
+            records = [json.loads(line) for line in f if line.strip()][1:]
+        samples = {}
+        for r in records:
+            if r.get("warmup") is not False or not r.get("ok"):
+                continue
+            ack = by_id.get(r.get("record_id")) or {}
+            phases = ack.get("guest_phases") if isinstance(ack.get("guest_phases"), dict) else {}
+            for key, v in list(phases.items()) + [("ack_ms", ack.get("ack_ms"))]:
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    samples.setdefault((r.get("arm"), key), []).append(float(v))
+        return {statistics.median(v) for v in samples.values()}
 
     def _blocking_values(self, run):
         """(headline, everything) for one committed run: blocking_ms
@@ -7919,12 +8261,14 @@ class DocLint(unittest.TestCase):
         text = self._read(name)
         tables = []
         if name.endswith(".html"):
-            for body in re.findall(r"<table>(.*?)</table>", text, re.S):
+            for body in re.findall(r"<table\b[^>]*>(.*?)</table>", text, re.S):
                 rows = [re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", r, re.S)
                         for r in re.findall(r"<tr>(.*?)</tr>", body, re.S)]
                 if rows:
                     tables.append((" | ".join(rows[0]), rows[1:]))
-            card = re.search(r'<div class="verdict">(.*?)</div>\s*\n', text, re.S)
+            # The card's own closing tag is the first `</div>` alone on its
+            # line; each tile's closes on the tile's line.
+            card = re.search(r'<div class="verdict">(.*?)\n</div>', text, re.S)
             if card:
                 nums = re.findall(r'<span class="num">(.*?)</span>', card.group(1))
                 tables.append(("verdict card", [["verdict"] + nums]))
@@ -7948,9 +8292,25 @@ class DocLint(unittest.TestCase):
         ladder ("direct CDP p50" over run ids) is optimisation evidence
         under this document's own publication rule and is not one."""
         head = header.lower()
-        if head == "verdict card" or "vcpu" in head or "cdp median" in head:
+        if (head == "verdict card" or "vcpu" in head or "cdp median" in head
+                or "screenshot median" in head):
             return True
         return "cdp p50" in head and any("vcpu" in row[0].lower() for row in rows if row)
+
+    def test_the_verdict_card_check_reads_every_tile(self):
+        """RED BEFORE THE FIX: _figure_tables cut the verdict card at the first
+        `</div>` followed by a newline, which is the end of the FIRST tile, so
+        only that tile's figure was checked and the CPU, prefetch and failure
+        tiles were never compared with a record (found by a review of the
+        2026-10-22 page: one of five tiles read)."""
+        page = self._read("report/shared-nothing-renders.html")
+        region = page[page.index('<div class="verdict">'):page.index('<nav class="toc"')]
+        tiles = re.findall(r'<span class="num">(.*?)</span>', region)
+        self.assertGreater(len(tiles), 1, "the verdict card has one tile; the check is vacuous")
+        cards = [rows for header, rows in self._figure_tables("report/shared-nothing-renders.html")
+                 if header == "verdict card"]
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0][0][1:], tiles)
 
     def test_every_corpus_figure_in_the_ladder_is_a_verified_headline(self):
         """RED BEFORE THE FIX: report/README.md's ladder quoted 982.9, 695.7
@@ -8238,17 +8598,19 @@ class DocLint(unittest.TestCase):
         HTML-extraction rows' fcvm cells reading "included in the same single
         op as the screenshot" and "same single-op value".
 
-        No record holds a DOM extraction. Across the DNS-verified corpus runs
-        every ok cdp render carries image_sha256 and stages.screenshot_ms, and
-        none carries html_bytes, html_sha256 or stages.extract_ms; cdpdrive.py's
-        html branch is reachable only through an `op` attribute no caller sets.
+        No cdp render holds a DOM extraction. Across the DNS-verified corpus
+        runs every ok cdp render carries image_sha256 and stages.screenshot_ms,
+        and none carries html_bytes, html_sha256 or stages.extract_ms. At the
+        time cdpdrive.py's html branch was reachable only through an `op`
+        attribute no caller set; the html-fast arm now runs it as an arm of its
+        own, whose records are not cdp renders.
 
         Cloudflare publishes "Wall time: screenshot" and "Wall time: HTML
         extraction" as separate rows. So the row label was right and the prose
-        was wrong: what we measured is their screenshot operation, and the
-        HTML-extraction operation is unmeasured on our side. A claim that we do
-        both in one op turns a like-for-like row into a combined operation set
-        against a single-operation number.
+        was wrong: the cdp arm measures their screenshot operation, and the
+        HTML-extraction operation is a separate arm. A claim that we do both in
+        one op turns a like-for-like row into a combined operation set against
+        a single-operation number.
 
         Observed on that tree: AssertionError: Lists differ:
         ["report/shared-nothing-renders.html: credits the measured render with
@@ -8282,15 +8644,46 @@ class DocLint(unittest.TestCase):
                                f"extraction no record holds ({m.group(0)!r})")
         self.assertEqual(bad, [], "\n".join(bad))
 
-        # And the rows for the operation we do not run say so where the reader
-        # looks for our number, not only in a footnote.
-        rows = [line for line in self._read("report/shared-nothing-renders.html").splitlines()
-                if line.lstrip().startswith("<tr") and "HTML extraction" in line]
-        self.assertEqual(len(rows), 3, "the comparator lost its HTML-extraction rows")
-        for row in rows:
-            self.assertIn("not measured", self._plain(row),
-                          f"an HTML-extraction row does not say the operation is "
-                          f"unmeasured on our side: {self._plain(row).strip()[:160]!r}")
+        # Since 2026-10-22 the html-fast arm runs Cloudflare's other operation
+        # (outerHTML in place of the screenshot, with the CPU-reading teardown),
+        # so the comparator's HTML-extraction rows carry its figures. Each figure
+        # in the fcvm cell of the wall row must be an html-fast blocking_ms
+        # median, and each in the CPU row an html-fast request_cpu_ms total
+        # mean, of a DNS-verified run, at the printed precision. RED on the
+        # page before that campaign, whose three rows read "not measured".
+        page = self._read("report/shared-nothing-renders.html")
+        start = page.index("Cloudflare&#8217;s published table, with fcvm&#8217;s figures")
+        table = page[start:page.index("</table>", start)]
+        rows = {}
+        for tr in re.findall(r"<tr>(.*?)</tr>", table, re.S):
+            cells = dict(re.findall(r'<td data-label="([^"]+)">(.*?)</td>', tr, re.S))
+            metric = self._plain(cells.get("Metric", "")).strip()
+            if "HTML extraction" in metric:
+                rows[metric] = cells.get("fcvm", "")
+        self.assertEqual(sorted(rows), ["CPU, HTML extraction", "Memory, HTML extraction",
+                                        "Wall, HTML extraction"],
+                         "the comparator lost its HTML-extraction rows")
+        wall, cpu = set(), set()
+        for run in self._verified_runs():
+            with open(os.path.join(self._results(), run, "analysis.json")) as f:
+                arm = json.load(f)["arms"].get("html-fast")
+            if not arm:
+                continue
+            wall.add(arm["blocking_ms"]["median"])
+            total = (arm.get("request_cpu_ms") or {}).get("total_mean_ms") or {}
+            if isinstance(total.get("mean"), (int, float)):
+                cpu.add(total["mean"])
+        self.assertTrue(wall and cpu, "no verified run carries the html-fast arm")
+        for metric, pool in (("Wall, HTML extraction", wall), ("CPU, HTML extraction", cpu)):
+            cell = rows[metric]
+            self.assertNotIn("not measured", self._plain(cell), metric)
+            figures = [(raw, value, decimals) for raw, value, _scale, decimals
+                       in self._figures_in(cell) if value >= 100]
+            self.assertTrue(figures, f"{metric}: the fcvm cell quotes no figure")
+            for raw, value, decimals in figures:
+                self.assertTrue(any(abs(round(v, decimals) - value) < 1e-9 for v in pool),
+                                f"{metric}: {raw} is no html-fast figure of a verified run")
+        self.assertNotIn("not measured", self._plain(rows["Memory, HTML extraction"]))
 
     def test_no_comparison_with_a_published_median_quotes_a_within_run_interval(self):
         """RED BEFORE THE FIX: three sentences derived a verdict against
