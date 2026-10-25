@@ -2270,6 +2270,83 @@ async fn an_ec2_capacity_wait_is_kept_out_of_the_race_time() {
     assert_eq!(s["scoreboard"]["ec2"]["last_capacity_wait_ms"], wait_ms);
 }
 
+/// An agent's quarantine report is acknowledged (`quarantine_stored`) only once a state write
+/// that holds the quarantine is stored: while writes fail the agent hears nothing and keeps
+/// replaying it, so a coordinator that crashes before its write cannot forget the GPU.
+#[tokio::test]
+async fn a_quarantine_is_acknowledged_once_a_stored_state_holds_it() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<store::StoreCmd>();
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let stored = Arc::new(std::sync::Mutex::new(None::<Arc<Vec<u8>>>));
+    let (f2, s2) = (failing.clone(), stored.clone());
+    // A store that keeps an unwritten state, as the real writers do, and fails while told to.
+    tokio::spawn(async move {
+        let mut pending: Option<Arc<Vec<u8>>> = None;
+        while let Some(cmd) = rx.recv().await {
+            if cmd.bytes.is_some() {
+                pending = cmd.bytes;
+            }
+            if pending.is_some() && !f2.load(std::sync::atomic::Ordering::SeqCst) {
+                *s2.lock().unwrap() = pending.take();
+            }
+            if let Some(a) = cmd.ack {
+                let _ = a.send(pending.is_none());
+            }
+        }
+    });
+    let (handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        Some(tx),
+        None,
+        None,
+        None,
+        None,
+    );
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 2);
+    agent.assign().await;
+    agent
+        .to_coord
+        .send(AgentMsg::Quarantine {
+            slot: "slot-1".into(),
+            sbdf: "0000:01:00.0".into(),
+            error: "GPU 0000:01:00.0 did not reset".into(),
+        })
+        .unwrap();
+    // The next acknowledgement within `secs`, if any.
+    async fn ack(agent: &mut FakeAgent, secs: u64) -> Option<String> {
+        tokio::time::timeout(Duration::from_secs(secs), async {
+            loop {
+                if let CoordMsg::QuarantineStored { sbdf } = agent.next().await {
+                    return sbdf;
+                }
+            }
+        })
+        .await
+        .ok()
+    }
+    // The store ticks once a second: three ticks pass with every write failing.
+    assert_eq!(
+        ack(&mut agent, 3).await,
+        None,
+        "a quarantine no stored state holds was acknowledged"
+    );
+    failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        ack(&mut agent, 5).await.as_deref(),
+        Some("0000:01:00.0"),
+        "the quarantine is acknowledged once a write holding it is stored"
+    );
+    let bytes = stored.lock().unwrap().clone().expect("a stored state");
+    let state: State = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        state
+            .fleet
+            .quarantined
+            .contains_key(&fleet_core::state::gpu_key("gpu-a", "0000:01:00.0")),
+        "the stored state holds the quarantine"
+    );
+}
+
 /// A GPU the agent quarantines leaves the wall (a standby GPU takes its place) and comes
 /// back only when an operator releases it through the admin endpoint. Restores count in
 /// the snapshot.

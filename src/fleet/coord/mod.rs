@@ -139,6 +139,9 @@ pub struct Actor {
     last_at: u64,
     published: u64,
     stored: u64,
+    /// Quarantines agents reported and have not been told are stored: host, GPU address,
+    /// and the state version that holds the report.
+    unacked: Vec<(String, String, u64)>,
     clock: Box<dyn Fn() -> u64 + Send>,
 }
 
@@ -163,6 +166,7 @@ impl Actor {
             state,
             out,
             agents: HashMap::new(),
+            unacked: Vec::new(),
             last_at: 0,
             published,
             clock,
@@ -475,7 +479,18 @@ impl Actor {
                 let Some(host) = self.agents.get(&conn).map(|a| a.host.clone()) else {
                     return;
                 };
-                self.apply(Event::Agent { at: 0, host, msg });
+                let quarantined = match &msg {
+                    AgentMsg::Quarantine { sbdf, .. } => Some(sbdf.clone()),
+                    _ => None,
+                };
+                self.apply(Event::Agent {
+                    at: 0,
+                    host: host.clone(),
+                    msg,
+                });
+                if let Some(sbdf) = quarantined {
+                    self.unacked.push((host, sbdf, self.state.version));
+                }
             }
             Cmd::Shutdown { ack } => {
                 // `run` handles shutdown; a direct call only acknowledges.
@@ -493,12 +508,31 @@ impl Actor {
         }
     }
 
+    /// Tell each agent whose quarantine report a stored state of `version` holds that it
+    /// is stored. A host whose connection is gone is not told: it replays the report on its
+    /// next connection, which is acknowledged in turn.
+    fn quarantines_stored(&mut self, version: u64) {
+        let agents = &self.agents;
+        self.unacked.retain(|(host, sbdf, v)| {
+            if *v > version {
+                return true;
+            }
+            if let Some(a) = agents.values().find(|a| &a.host == host) {
+                let _ = a.tx.send(CoordMsg::QuarantineStored { sbdf: sbdf.clone() });
+            }
+            false
+        });
+    }
+
     /// Run until every command sender is dropped.
     pub async fn run(mut self, mut rx: mpsc::Receiver<Cmd>) {
         let mut snap_tick = tokio::time::interval(SNAPSHOT_INTERVAL);
         snap_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut store_tick = tokio::time::interval(STORE_INTERVAL);
         store_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // A write whose outcome acknowledges quarantines: the state version it holds, and
+        // whether it was stored.
+        let mut quarantine_write: Option<(u64, oneshot::Receiver<bool>)> = None;
         let ack = loop {
             tokio::select! {
                 cmd = rx.recv() => match cmd {
@@ -508,7 +542,20 @@ impl Actor {
                 },
                 _ = snap_tick.tick() => self.publish(),
                 _ = store_tick.tick() => {
-                    drop(self.store(false));
+                    if quarantine_write.is_none() && !self.unacked.is_empty() {
+                        // The barrier's answer says whether the newest state, which holds
+                        // every report so far, is stored (also when it was written before).
+                        let version = self.state.version;
+                        quarantine_write = Some((version, self.store(true)));
+                    } else {
+                        drop(self.store(false));
+                    }
+                }
+                (version, stored) = written(&mut quarantine_write) => {
+                    quarantine_write = None;
+                    if stored {
+                        self.quarantines_stored(version);
+                    }
                 }
             }
         };
@@ -534,6 +581,14 @@ impl Actor {
         if let Some(ack) = ack {
             let _ = ack.send(stored);
         }
+    }
+}
+
+/// The outcome of the write in `w` (pending forever without one).
+async fn written(w: &mut Option<(u64, oneshot::Receiver<bool>)>) -> (u64, bool) {
+    match w {
+        Some((version, rx)) => (*version, rx.await.unwrap_or(false)),
+        None => std::future::pending().await,
     }
 }
 

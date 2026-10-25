@@ -309,6 +309,11 @@ pub enum CoordMsg {
     /// The grid's budget: every renderer draws `budget` pixel-samples per frame from the
     /// first frame at or after scene time `t` (`POST /budget`, again after every scene).
     Budget(BudgetBody),
+    /// A state that holds the agent's `quarantine` report for this GPU (or an operator's
+    /// release that came after it) is stored: the agent stops replaying the report.
+    QuarantineStored {
+        sbdf: String,
+    },
 }
 
 /// The body of a renderer's `POST /budget`.

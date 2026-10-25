@@ -539,8 +539,9 @@ with the instance role). The VMs keep running while the connection is down; the 
 reconnects (1 s doubling to 30 s) and starts each new connection with its hello and the
 latest of every state message (each slot's report, the aggregator, a draining notice,
 quarantines), so a coordinator that lost the host learns where each slot is without a
-restart. A reported generation above the coordinator's is adopted, so the next relaunch
-goes past it. The coordinator serves `/agent` on its `/live` listener; Cloudflare Access
+restart. A slot's report is replayed while the slot is assigned; a quarantine until the
+coordinator answers it with `quarantine_stored` (below). A reported generation above the
+coordinator's is adopted, so the next relaunch goes past it. The coordinator serves `/agent` on its `/live` listener; Cloudflare Access
 admits only the agents' service token there.
 
 When its input closes (`--stdio`), the agent tears down every VM it started and exits. If the agent
@@ -628,6 +629,8 @@ The agent took a GPU out of rotation and runs nothing on it again: its scrub fai
 relaunch failed with an error naming the GPU's address, or three relaunches in a row
 failed before fcvm's `restored` record (the GPU reset and attach) or while the GPU was
 still held. Failures after the restore (the container or the renderer) do not count.
+The agent sends it again at the start of every connection until the coordinator answers
+with `quarantine_stored` for the GPU.
 
 ### Coordinator to agent
 
@@ -727,6 +730,20 @@ avoid the renderer's default; it is kept because it costs one small request per 
 change and keeps a renderer that missed the original post on the grid's budget. A renderer
 drawing the whole image for a claim gets no budget (it chooses its own). The coordinator posts the same
 body to each EC2 tile's renderer.
+
+```json
+{"type": "quarantine_stored", "sbdf": "0000:05:00.0"}
+```
+
+A stored state holds the agent's `quarantine` report for this GPU: the coordinator's
+state write (`--state-file` or `--state-bucket`) that came after the report succeeded.
+Without it a coordinator that stopped before its next write would come back with no record
+of the quarantine and assign the GPU again, so the agent keeps the report in its replay
+until this arrives. The coordinator sends it on the store tick (1 s) after the write, to the
+host's connection at the time; a host that reconnected first replays the report and is
+answered on the new connection. With no store configured it is sent on the next tick. A
+release by the operator before the write still gets it: the stored state then holds the
+release, and the report must no longer be replayed.
 
 ### Grid budget
 
