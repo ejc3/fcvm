@@ -2550,9 +2550,11 @@ finished; the scrub follows NVIDIA's gpu-admin-tools `--reset-with-sbr
 
 1. Refuse unless the GPU is NVIDIA, on vfio-pci, and its `reset_method` is
    `bus`.
-2. Take the GPU's record lock and open its VFIO group, and hold both until the
-   outcome is written. A group has one opener, so no VM can open the GPU
-   mid-scrub, and a GPU a VM still holds is reported `busy` and left alone.
+2. Take the GPU's lock (`<sbdf>.lock`, exclusively and without waiting) and
+   open its VFIO group, and hold both until the outcome is written. A group
+   has one opener, so no VM can open the GPU mid-scrub, and a GPU a VM still
+   holds (its lease on the lock, or its VFIO group) is reported `busy` and
+   left alone.
    Before touching the GPU, mark its record quarantined ("a scrub started and
    has not recorded its outcome"); a scrub that cannot write that mark stops
    there, and one that dies leaves the GPU refused.
@@ -2573,10 +2575,20 @@ out until a later scrub of it succeeds. An unreadable record also refuses.
 `fcvm gpu scrub` prints one JSON line per GPU with `outcome` `scrubbed`,
 `failed` or `busy` and exits 1 unless every GPU was scrubbed; `fcvm gpu
 status` prints every record. Only root runs the scrub. Records are written to a
-synced temporary file, renamed, and the directory synced. One window is left
-(#1164): a launch whose quarantine check ran before a scrub started, and whose
-VMM opens the GPU after that scrub failed, gets the GPU; the in-guest scrub
-still zeroes it.
+synced temporary file, renamed, and the directory synced.
+
+**The lease.** `podman run --gpu` and `snapshot run --gpu` take a shared
+`flock` on `/var/lib/fcvm/gpu/<sbdf>.lock` before the quarantine check, without
+waiting, so a launch during a scrub is refused. `snapshot run`, the restore
+that attaches the GPU, holds it until its VM has been torn down (the kernel
+drops it if fcvm is killed), so a scrub cannot start between the check and
+the VMM opening the GPU, nor while the VM runs. `podman run` releases its
+lease after the check: its cold-booted VM has no GPU, and the restore that
+attaches one takes its own. Each lease is its own open file, so one process
+running several VMs holds one per VM. A rootless run cannot create the lock
+file in the root-owned directory and is refused when it is missing; root
+runs, the scrub and the fleet host's boot (`fleet/ami/host/bind-vfio.sh`)
+create it, mode 0644.
 
 **Measuring it.** `make gpu-residue-test GPU=<sbdf>` (`scripts/gpu-residue/`):
 VM A fills all the memory it can allocate with 16-byte records (a 64-bit

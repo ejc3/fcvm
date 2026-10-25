@@ -20,6 +20,13 @@
 //! opener at a time, so no VM can open the GPU in the middle of a scrub, and a
 //! GPU some VM still holds is refused as busy rather than reset under it.
 //!
+//! The group alone leaves a window: a launch checks the quarantine before its
+//! VMM opens the group, so a scrub could start and fail in between. Every
+//! `--gpu` launch therefore takes a shared lease on the GPU's lock file before
+//! its check and holds it until the VM is gone ([`lease_gpu`]), and a scrub
+//! takes that lock exclusively without waiting, reporting `busy` when a VM
+//! holds it.
+//!
 //! Every outcome is recorded per GPU under [`state_dir`]: scrubs done,
 //! failures, and whether the GPU is quarantined. A failed scrub quarantines
 //! the GPU, and `--gpu` refuses a quarantined GPU, until a later scrub of it
@@ -76,7 +83,8 @@ fn unreadable(value: u32) -> bool {
     value == 0xffff_ffff || value >> 16 == 0xbadf
 }
 
-/// The scrub found the GPU's VFIO group open: a VM still holds the GPU.
+/// A VM holds the GPU: the scrub found its lease on the GPU's lock file, or
+/// its VFIO group open.
 #[derive(Debug)]
 pub struct GpuBusy(pub String);
 
@@ -441,10 +449,18 @@ pub fn read_records(state_dir: &Path) -> Result<Vec<GpuRecord>> {
     Ok(records)
 }
 
-/// Take the GPU's record lock, `<state_dir>/<sbdf>.lock`. A scrub holds it
-/// from before it touches the GPU until its outcome is written.
-fn lock_gpu(state_dir: &Path, sbdf: &str) -> Result<std::fs::File> {
-    use fs2::FileExt as _;
+/// The GPU's lock file, `<state_dir>/<sbdf>.lock`. A scrub holds it
+/// exclusively (`LOCK_EX`) and every VM given the GPU holds it shared
+/// (`LOCK_SH`, [`lease_gpu`]), so a scrub never runs while a VM holds the GPU,
+/// and a VM never gets a GPU between a scrub's start and its recorded outcome.
+fn lock_path(state_dir: &Path, sbdf: &str) -> PathBuf {
+    state_dir.join(format!("{sbdf}.lock"))
+}
+
+/// Create the state directory and the GPU's lock file if missing, readable by
+/// every user: a rootless run cannot create a file in the root-owned directory,
+/// and needs only to open it for reading to take a shared `flock`.
+fn create_lock_file(state_dir: &Path, sbdf: &str) -> Result<std::fs::File> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("creating {}", state_dir.display()))?;
@@ -452,16 +468,86 @@ fn lock_gpu(state_dir: &Path, sbdf: &str) -> Result<std::fs::File> {
     // root's umask.
     std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o755))
         .with_context(|| format!("making {} readable", state_dir.display()))?;
-    let path = state_dir.join(format!("{sbdf}.lock"));
-    let lock = std::fs::OpenOptions::new()
+    let path = lock_path(state_dir, sbdf);
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
-    lock.lock_exclusive()
-        .with_context(|| format!("locking {}", path.display()))?;
-    Ok(lock)
+    file.set_permissions(std::fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("making {} readable", path.display()))?;
+    Ok(file)
+}
+
+/// Take the GPU's lock for a scrub, without waiting. A scrub holds it from
+/// before it touches the GPU until its outcome is written. While a VM holds
+/// the GPU's lease this fails with [`GpuBusy`].
+fn lock_gpu(state_dir: &Path, sbdf: &str) -> Result<std::fs::File> {
+    let lock = create_lock_file(state_dir, sbdf)?;
+    let path = lock_path(state_dir, sbdf);
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(std::fs::TryLockError::WouldBlock) => Err(GpuBusy(format!(
+            "GPU {sbdf} is held by a VM, or another scrub of it is running ({} is locked); \
+             nothing was done",
+            path.display()
+        ))
+        .into()),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(error).with_context(|| format!("locking {}", path.display()))
+        }
+    }
+}
+
+/// A VM's hold on a GPU: a shared `flock` on the GPU's lock file, taken before
+/// the quarantine check and kept until the VM is gone. While it is held no scrub
+/// can start, so the GPU the check passed is the GPU the VM gets. Each lease is
+/// its own open file, so one process running several VMs holds one lease per
+/// VM, and dropping one VM's lease leaves the others in place. The kernel
+/// drops it when the process exits, SIGKILL included.
+#[must_use = "the lease protects the GPU only while it is held"]
+#[derive(Debug)]
+pub struct GpuLease {
+    _file: std::fs::File,
+}
+
+/// Take a VM's lease on a GPU, without waiting: a GPU being scrubbed is
+/// refused. A run as root creates the lock file if it is missing; any other
+/// run cannot create it in the root-owned state directory and is refused,
+/// rather than run without the lease.
+pub fn lease_gpu(state_dir: &Path, sbdf: &str) -> Result<GpuLease> {
+    lease_gpu_as(state_dir, sbdf, nix::unistd::geteuid().is_root())
+}
+
+/// [`lease_gpu`] with whether the caller may create the lock file supplied.
+pub fn lease_gpu_as(state_dir: &Path, sbdf: &str, may_create: bool) -> Result<GpuLease> {
+    let path = lock_path(state_dir, sbdf);
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && may_create => {
+            create_lock_file(state_dir, sbdf)?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+            "GPU {sbdf} has no lock file {}, and this run cannot create it in {}. \
+             `sudo fcvm gpu scrub {sbdf}` creates it",
+            path.display(),
+            state_dir.display()
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| format!("opening {}", path.display()));
+        }
+    };
+    match file.try_lock_shared() {
+        Ok(()) => Ok(GpuLease { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => bail!(
+            "GPU {sbdf} is being scrubbed ({} is locked); try again when the scrub has finished",
+            path.display()
+        ),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(error).with_context(|| format!("locking {} shared", path.display()))
+        }
+    }
 }
 
 /// Publish `record` atomically and durably: a synced temporary file renamed
@@ -530,8 +616,8 @@ pub fn record_outcome(
 #[derive(Debug, Serialize)]
 pub struct ScrubReport {
     pub sbdf: String,
-    /// `scrubbed`, `failed` (now quarantined) or `busy` (a VM holds the GPU;
-    /// nothing was done and nothing recorded).
+    /// `scrubbed`, `failed` (now quarantined) or `busy` (a VM holds the GPU,
+    /// or another scrub of it is running; nothing was done and nothing recorded).
     pub outcome: &'static str,
     pub error: Option<String>,
     pub timings: Option<ScrubTimings>,
@@ -574,9 +660,19 @@ pub fn scrub_and_record_with(
         timings: None,
         record: None,
     };
+    let busy = |busy: &GpuBusy| ScrubReport {
+        sbdf: sbdf.to_string(),
+        outcome: "busy",
+        error: Some(busy.to_string()),
+        timings: None,
+        record: None,
+    };
     let _lock = match lock_gpu(state_dir, sbdf) {
         Ok(lock) => lock,
-        Err(error) => return failed(format!("{error:#}; the GPU was not touched")),
+        Err(error) => match error.downcast_ref::<GpuBusy>() {
+            Some(held) => return busy(held),
+            None => return failed(format!("{error:#}; the GPU was not touched")),
+        },
     };
     let mark = || {
         update_record(state_dir, sbdf, |record| {
@@ -591,14 +687,8 @@ pub fn scrub_and_record_with(
     };
     let result = scrub_device_marked(sysfs, dev, sbdf, timeout, reset, &mark);
     if let Err(error) = &result {
-        if let Some(busy) = error.downcast_ref::<GpuBusy>() {
-            return ScrubReport {
-                sbdf: sbdf.to_string(),
-                outcome: "busy",
-                error: Some(busy.to_string()),
-                timings: None,
-                record: None,
-            };
+        if let Some(held) = error.downcast_ref::<GpuBusy>() {
+            return busy(held);
         }
     }
     let outcome = result.map_err(|error| format!("{error:#}"));
@@ -895,6 +985,109 @@ mod tests {
         );
     }
 
+    /// Scrub the fake GPU, recording the outcome, and say whether the reset ran.
+    fn scrub_recorded(fake: &Fake, state: &Path, during: &dyn Fn()) -> (ScrubReport, bool) {
+        let reset = std::cell::Cell::new(false);
+        let report = scrub_and_record_with(
+            &fake.root.path().join("sys"),
+            &fake.root.path().join("dev"),
+            state,
+            "0000:18:00.0",
+            Duration::from_millis(50),
+            &|device: &Path| {
+                reset.set(true);
+                during();
+                std::fs::write(device.join("reset"), "1")?;
+                fake.set(RESET_SCRATCH, 0);
+                Ok(())
+            },
+        );
+        (report, reset.get())
+    }
+
+    /// A VM that passed its quarantine check holds the GPU's lease until it is
+    /// gone, so a scrub that starts meanwhile is busy and touches nothing, and
+    /// cannot leave a failed outcome behind for the VM's VMM to open the GPU on.
+    #[test]
+    fn a_scrub_is_busy_while_a_vm_holds_the_gpus_lease() {
+        let fake = Fake::new();
+        let state = fake.root.path().join("gpu-state");
+        let sbdf = "0000:18:00.0";
+        record_outcome(&state, sbdf, &Ok(ScrubTimings::default())).unwrap();
+        let lease = lease_gpu_as(&state, sbdf, false).unwrap();
+        let (report, reset) = scrub_recorded(&fake, &state, &|| {});
+        assert_eq!(report.outcome, "busy", "{:?}", report.error);
+        assert!(!reset, "the GPU was reset under a VM's lease");
+        let record = read_record(&state, sbdf).unwrap().unwrap();
+        assert!(!record.quarantined, "a busy scrub changed the record");
+        assert_eq!((record.scrubs, record.failures), (1, 0));
+        drop(lease);
+        let (report, reset) = scrub_recorded(&fake, &state, &|| {});
+        assert_eq!(report.outcome, "scrubbed", "{:?}", report.error);
+        assert!(reset);
+    }
+
+    /// The lease belongs to the VM, not the process: one process running two
+    /// VMs on the GPU (`fcvm serve`) keeps it held until the last one is gone.
+    #[test]
+    fn each_vm_holds_its_own_lease() {
+        let fake = Fake::new();
+        let state = fake.root.path().join("gpu-state");
+        let sbdf = "0000:18:00.0";
+        record_outcome(&state, sbdf, &Ok(ScrubTimings::default())).unwrap();
+        let first = lease_gpu_as(&state, sbdf, false).unwrap();
+        let second = lease_gpu_as(&state, sbdf, false).unwrap();
+        drop(first);
+        let (report, reset) = scrub_recorded(&fake, &state, &|| {});
+        assert_eq!(report.outcome, "busy", "{:?}", report.error);
+        assert!(!reset);
+        drop(second);
+        let (report, _) = scrub_recorded(&fake, &state, &|| {});
+        assert_eq!(report.outcome, "scrubbed", "{:?}", report.error);
+    }
+
+    /// A launch that checks while a scrub runs is refused at once.
+    #[test]
+    fn a_launch_during_a_scrub_is_refused() {
+        let fake = Fake::new();
+        let state = fake.root.path().join("gpu-state");
+        let sbdf = "0000:18:00.0";
+        let leased = std::cell::RefCell::new(None);
+        let (report, _) = scrub_recorded(&fake, &state, &|| {
+            *leased.borrow_mut() =
+                Some(lease_gpu_as(&state, sbdf, true).map_err(|e| format!("{e:#}")));
+        });
+        assert_eq!(report.outcome, "scrubbed", "{:?}", report.error);
+        let leased = leased.into_inner().expect("the reset did not run");
+        let error = leased.expect_err("a VM got the GPU's lease during a scrub");
+        assert!(error.contains("is being scrubbed"), "{error}");
+    }
+
+    /// A run that cannot create the GPU's lock file (rootless, in the root-owned
+    /// state directory) is refused rather than run without the lease; root
+    /// creates it, readable by every user.
+    #[test]
+    fn a_run_that_cannot_create_the_lock_file_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("gpu");
+        let sbdf = "0000:18:00.0";
+        let error = format!("{:#}", lease_gpu_as(&state, sbdf, false).unwrap_err());
+        assert!(
+            error.contains("no lock file") && error.contains("sudo fcvm gpu scrub 0000:18:00.0"),
+            "{error}"
+        );
+        // nextest runs each test in its own process, so the umask is ours.
+        let old = unsafe { libc::umask(0o077) };
+        let leased = lease_gpu_as(&state, sbdf, true);
+        unsafe { libc::umask(old) };
+        let lease = leased.unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&state.join(format!("{sbdf}.lock"))), 0o644);
+        drop(lease);
+        drop(lease_gpu_as(&state, sbdf, false).expect("a rootless run uses the file root created"));
+    }
+
     /// Root writes the records and rootless launches read them, so a record
     /// and its directory are readable by everyone whatever root's umask.
     #[test]
@@ -910,6 +1103,7 @@ mod tests {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&state), 0o755, "state directory");
         assert_eq!(mode(&state.join("0000:18:00.0.json")), 0o644, "record");
+        assert_eq!(mode(&state.join("0000:18:00.0.lock")), 0o644, "lock file");
     }
 
     /// A record is published by rename, and the directory is synced after
