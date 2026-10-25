@@ -284,6 +284,15 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                     .count() as u32
             })
         });
+        // An on-demand launch whose answer was lost may have launched: its count stays
+        // reserved until a retry with its token answers.
+        if let Some(n) = on_demand.as_mut() {
+            *n += tokens
+                .iter()
+                .filter(|((_, m), _)| *m == Market::OnDemand)
+                .map(|(_, (_, c))| *c)
+                .sum::<u32>();
+        }
         let mut report = Vec::new();
         let mut busy = false;
         for (i, region) in cfg.regions.iter().enumerate() {
@@ -430,7 +439,13 @@ async fn launch_shortfall(
                 failed = true;
                 break;
             };
-            let room = cfg.on_demand_max.saturating_sub(n);
+            // A retry of a lost launch is already counted in `n` and asks for its own count.
+            let retry = tokens.contains_key(&(region.to_string(), Market::OnDemand));
+            let room = if retry {
+                ask
+            } else {
+                cfg.on_demand_max.saturating_sub(n)
+            };
             if room == 0 {
                 tracing::warn!(%region, on_demand = n, cap = cfg.on_demand_max, reason = %refused.join("; "),
                     "spot refused and the on-demand cap is reached; waiting for capacity");
@@ -446,6 +461,7 @@ async fn launch_shortfall(
         // count, so EC2 answers with what it launched then rather than launching again. Its
         // count was within the on-demand cap when it was decided.
         let key = (region.to_string(), market);
+        let was_pending = tokens.contains_key(&key);
         let (token, ask) = match tokens.get(&key) {
             Some((t, n)) => (t.clone(), *n),
             None => (uuid::Uuid::new_v4().to_string(), ask),
@@ -458,6 +474,12 @@ async fn launch_shortfall(
             }
             Err(e) => {
                 tokens.insert(key, (token, ask));
+                // It may have launched: count it against the cap for the rest of the pass.
+                if market == Market::OnDemand && !was_pending {
+                    if let Some(n) = on_demand.as_mut() {
+                        *n += ask;
+                    }
+                }
                 tracing::warn!(%region, market = market.name(), error = %format!("{e:#}"), "launching GPU hosts failed");
                 errors.push(format!("{region} {}: {e:#}", market.name()));
                 return (launched, false);
@@ -477,6 +499,10 @@ async fn launch_shortfall(
         }
         if market == Market::OnDemand {
             if let Some(n) = on_demand.as_mut() {
+                // A retry's reservation gives way to what it launched.
+                if was_pending {
+                    *n = n.saturating_sub(ask);
+                }
                 *n += got.ids.len() as u32;
             }
         }
@@ -868,8 +894,8 @@ impl HostDriver for AwsHosts {
 /// hosts start in `launch_state` (default `pending`); `set_state` moves them. Every call is
 /// recorded in `calls`, in order: `list <region>`, `launch <region> <market> <count>`,
 /// `terminate <region> <ids>`. `fail_lists` makes that many next lists of a region fail.
-/// A launch is idempotent by its token. `ambiguous` makes that many next launches launch and
-/// then fail, as a request whose answer is lost. `hide_new` (show, hide): each launched
+/// A launch is idempotent by its token. `ambiguous` makes that many next launches that launch
+/// something fail after launching, as a request whose answer is lost. `hide_new` (show, hide): each launched
 /// instance is named by its region's next `show` lists, left out of the `hide` after them,
 /// then named again, as an eventually consistent DescribeInstances.
 #[derive(Default)]
@@ -1008,7 +1034,7 @@ impl HostDriver for FakeHosts {
             .unwrap()
             .insert(token.to_string(), out.clone());
         let mut amb = self.ambiguous.lock().unwrap();
-        if *amb > 0 {
+        if *amb > 0 && n > 0 {
             *amb -= 1;
             bail!("injected: the launch's answer was lost");
         }

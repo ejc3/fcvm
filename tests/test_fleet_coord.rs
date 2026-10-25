@@ -2531,6 +2531,48 @@ async fn a_launch_whose_answer_is_lost_is_asked_again_with_its_token() {
     );
 }
 
+/// An on-demand launch whose answer is lost counts against the fleet-wide cap until its
+/// retry answers: with a cap of 1 and spot refused in two regions, the second region does
+/// not launch on demand beside a host the first may have.
+#[tokio::test]
+async fn a_lost_on_demand_launch_holds_its_place_under_the_cap() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Market};
+    let fake = Arc::new(FakeHosts::default());
+    for r in ["us-east-1", "us-east-2"] {
+        fake.capacity
+            .lock()
+            .unwrap()
+            .insert((r.into(), Market::Spot), 0);
+    }
+    *fake.ambiguous.lock().unwrap() = 1;
+    *fake.hide_new.lock().unwrap() = Some((0, 4));
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1", "us-east-2"], 1, 1)),
+        None,
+    );
+    until_hosts(&fake, "an on-demand launch", |f| {
+        launches(f).iter().any(|c| c.contains("on-demand"))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let hosts = fake.hosts.lock().unwrap().clone();
+    let od = hosts
+        .values()
+        .flatten()
+        .filter(|h| h.market == Market::OnDemand)
+        .count();
+    assert_eq!(
+        od,
+        1,
+        "on-demand instances over the cap: {:?}",
+        fake.calls()
+    );
+}
+
 /// A list can name a new host and the next one leave it out (DescribeInstances is eventually
 /// consistent): the host still counts, and no second one is launched.
 #[tokio::test]
