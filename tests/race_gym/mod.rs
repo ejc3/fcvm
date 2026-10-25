@@ -32,11 +32,27 @@ pub const FORMAT: u32 = 1;
 /// The scenario a replay names, rebuilt from its recorded parameters.
 pub fn scenario_from(name: &str, params: &serde_json::Value) -> Result<Box<dyn Scenario>> {
     match name {
-        cold_run::NAME => Ok(Box::new(cold_run::ColdRun::new(serde_json::from_value(
-            params.clone(),
-        )?)?)),
+        cold_run::NAME => {
+            let image = std::env::var("RACE_GYM_IMAGE")
+                .ok()
+                .filter(|v| !v.is_empty());
+            Ok(Box::new(cold_run::ColdRun::new(cold_run::params_on_host(
+                params,
+                image.as_deref(),
+            )?)?))
+        }
         other => bail!("unknown race gym scenario {other:?}"),
     }
+}
+
+/// Whether a serial replay of a failing schedule confirms `signature`. A replay that ends
+/// in a control failure (divergence, unmodeled wait, park timeout) did not run as recorded,
+/// so it cannot show that the failure goes away: it counts as confirmed and is reported with
+/// its own failures.
+pub fn confirmation_holds(signature: &str, confirm_failed: &[Failure]) -> bool {
+    confirm_failed
+        .iter()
+        .any(|f| f.oracle == "control" || f.signature() == signature)
 }
 
 /// Run a recorded replay; Err when it diverges or an oracle fails. The body of every case

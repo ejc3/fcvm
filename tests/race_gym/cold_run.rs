@@ -9,7 +9,8 @@
 //!
 //! Host-specific inputs come from the environment, not from a replay: `RACE_GYM_GPUS`
 //! (comma list of vfio-pci SBDFs, handed out per run slot and actor) and
-//! `RACE_GYM_FCVM` (the fcvm binary, default `./target/release/fcvm`).
+//! `RACE_GYM_FCVM` (the fcvm binary, default `./target/release/fcvm`), and `RACE_GYM_IMAGE`,
+//! which replaces the image a replay recorded.
 
 use super::{error_lines, Failure, RunCtx, Scenario};
 use anyhow::{bail, Context, Result};
@@ -27,6 +28,16 @@ pub struct Params {
     pub args: Vec<String>,
     /// Give each actor its own `--gpu` from `RACE_GYM_GPUS`.
     pub gpu_per_actor: bool,
+}
+
+/// The recorded parameters of a replay, on this host: the image is a host input like
+/// `RACE_GYM_GPUS`, so `RACE_GYM_IMAGE` replaces the recorded one when set.
+pub fn params_on_host(recorded: &serde_json::Value, image: Option<&str>) -> Result<Params> {
+    let mut params: Params = serde_json::from_value(recorded.clone())?;
+    if let Some(image) = image {
+        params.image = image.to_string();
+    }
+    Ok(params)
 }
 
 pub struct ColdRun {
