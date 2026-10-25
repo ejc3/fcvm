@@ -155,6 +155,48 @@ export function tileGeometry(rect: Rect, imageAspect: number, requested: number)
   return g;
 }
 
+/** A box in device pixels: x, y, width, height. */
+export type DeviceBox = [number, number, number, number];
+
+export function deviceBox(b: Box, dpr: number): DeviceBox {
+  const x = Math.round(b.x * dpr);
+  const y = Math.round(b.y * dpr);
+  return [x, y, Math.round((b.x + b.w) * dpr) - x, Math.round((b.y + b.h) * dpr) - y];
+}
+
+/** A stream's place in the whole image's pixel grid, from its header. */
+export interface StreamGrid {
+  fullWidth: number;
+  fullHeight: number;
+  x0: number;
+  y0: number;
+}
+
+/** The stream's inner rectangle (w x h pixels of the whole-image grid) placed in the image, in device pixels. */
+export function gridBox(image: Box, g: StreamGrid, w: number, h: number, dpr: number): DeviceBox {
+  const x0 = Math.round((image.x + (g.x0 / g.fullWidth) * image.w) * dpr);
+  const y0 = Math.round((image.y + (g.y0 / g.fullHeight) * image.h) * dpr);
+  const x1 = Math.round((image.x + ((g.x0 + w) / g.fullWidth) * image.w) * dpr);
+  const y1 = Math.round((image.y + ((g.y0 + h) / g.fullHeight) * image.h) * dpr);
+  return [x0, y0, x1 - x0, y1 - y0];
+}
+
+/**
+ * Whether a frame whose inner rectangle is `inner` (pixels of the whole-image grid
+ * `g`) was rendered for the place `box` has in `image`: the rectangle it draws at
+ * is the planned one, give or take the renderer's rounding.
+ */
+export function frameFitsBox(image: Box, g: StreamGrid, inner: { sw: number; sh: number }, box: Box, dpr: number): boolean {
+  const [x, y, w, h] = gridBox(image, g, inner.sw, inner.sh, dpr);
+  const [bx, by, bw, bh] = deviceBox(box, dpr);
+  // The renderer's rounding (an even width, a minimum size) moves an edge by up to a pixel of its
+  // own grid, and a width or height compares two edges: two grid pixels, which are
+  // image.w * dpr / fullWidth device pixels wide. Never under the screen-space floor.
+  const tolX = Math.max(2, Math.round(dpr * 2), Math.ceil((2 * image.w * dpr) / g.fullWidth));
+  const tolY = Math.max(2, Math.round(dpr * 2), Math.ceil((2 * image.h * dpr) / g.fullHeight));
+  return Math.abs(x - bx) <= tolX && Math.abs(y - by) <= tolY && Math.abs(w - bw) <= tolX && Math.abs(h - bh) <= tolY;
+}
+
 /** A point on screen in image fractions, or null when it is outside the image. */
 export function screenToImage(image: Box, px: number, py: number): { u: number; v: number } | null {
   if (image.w <= 0 || image.h <= 0) return null;

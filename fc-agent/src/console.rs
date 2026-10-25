@@ -64,9 +64,10 @@ use nix::unistd::{read, write};
 /// Upper bound on bytes buffered while the console is gated or stalled.
 /// Beyond this, new bytes are dropped (and counted; one summary line is
 /// emitted when the console recovers). Sized for the WORST-CASE gate hold:
-/// the quiesce gate is held for the entire cache-ready→ack handshake, which
-/// host `cache-wait` keepalives can extend to the absolute 600s cap
-/// (`notify_cache_ready_and_wait` in container.rs) — not just a short
+/// the quiesce gate is held from cache-ready until the snapshot boundary
+/// severs the handshake session or the handshake returns, and host
+/// `cache-wait` keepalives can extend that to the absolute 600s cap
+/// (`run_cache_handshake` in container.rs) — not just a short
 /// pre-pause window. 1 MiB absorbs ~1.7 KiB/s of gated log traffic for that
 /// full window, well above fc-agent's log rate while idling in the handshake
 /// (a few short lines per poll cycle). Dropping on overflow stays deliberate:
@@ -445,7 +446,8 @@ impl ConsoleShared {
 /// reaches the UART: the snapshot cannot capture the 8250 mid-transmit, so
 /// its restores keep a working serial console. `eprintln!` stays usable
 /// throughout — lines are held in the writer's pending buffer and flushed
-/// when the guard drops (ack received, restore detected, or failure).
+/// when the guard drops (the first severed handshake session after the pause,
+/// or the handshake's return: ack received, restore detected, or failure).
 ///
 /// `Err` means the UART could not be proven idle: the gate is NOT held, and
 /// the caller must NOT send `cache-ready` — the only safe outcome is to

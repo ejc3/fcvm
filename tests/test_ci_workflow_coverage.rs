@@ -2495,6 +2495,23 @@ fn the_staging_access_check_passes_access_and_an_unresolved_host_and_fails_anyth
 
     let (code, out) = run_access_check("000 curl: (28) Operation timed out", 28);
     assert_eq!(code, 1, "any other curl failure must fail: {out}");
+
+    // The status is part of the verdict: a redirect that arrived with a transfer error, and the
+    // resolver's words under any other exit status, are not the two answers that pass.
+    let (code, out) = run_access_check(
+        "302 https://example-team.cloudflareaccess.com/cdn-cgi/access/login",
+        18,
+    );
+    assert_eq!(
+        code, 1,
+        "the Access redirect after a curl error must fail: {out}"
+    );
+
+    let (code, out) = run_access_check("000 curl: (28) Could not resolve host: stage.fcvm.dev", 28);
+    assert_eq!(
+        code, 1,
+        "the resolver's message under another exit status must fail: {out}"
+    );
 }
 
 /// The `run:` scripts of a job's steps, in order, with each step's name.
