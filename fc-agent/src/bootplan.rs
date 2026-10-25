@@ -104,13 +104,44 @@ pub async fn sync_clock_from_host(transport: Transport) -> Result<()> {
             let doc = read_vsock_doc().await?;
             let meta: LatestMetadata =
                 serde_json::from_value(doc).context("parsing host-time from vsock boot plan")?;
-            set_system_clock(&meta.host_time, std::time::Duration::ZERO);
+            set_system_clock(meta.host_clock(), std::time::Duration::ZERO);
             Ok(())
         }
     }
 }
 
-/// Set the system clock to `host_time` (UTC epoch seconds). Shared by both transports.
+/// The host's clock as a boot plan or restore document carries it.
+///
+/// "host-time" is whole epoch seconds: the agent frozen in an older snapshot
+/// parses it as a decimal integer and rejects anything else, so it keeps that
+/// form. "host-time-ns" is the same instant in nanoseconds, from hosts that send
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostClock<'a> {
+    pub seconds: &'a str,
+    pub nanos: Option<&'a str>,
+}
+
+impl HostClock<'_> {
+    /// The host's instant as time since the epoch: "host-time-ns" when it parses,
+    /// else "host-time".
+    fn instant(&self) -> Result<std::time::Duration> {
+        if let Some(nanos) = self.nanos {
+            match nanos.trim().parse::<u64>() {
+                Ok(nanos) => return Ok(std::time::Duration::from_nanos(nanos)),
+                Err(error) => eprintln!(
+                    "[fc-agent] WARNING: host-time-ns {nanos:?} is not decimal nanoseconds \
+                     ({error}); using whole seconds"
+                ),
+            }
+        }
+        Ok(std::time::Duration::from_secs(
+            parse_epoch_seconds(self.seconds)? as u64,
+        ))
+    }
+}
+
+/// Set the system clock to the host's clock. Shared by both transports.
 ///
 /// Steps the clock with `clock_settime(2)` directly: fc-agent holds
 /// CAP_SYS_TIME, and this runs on the restore critical path where a process
@@ -121,11 +152,15 @@ pub async fn sync_clock_from_host(transport: Transport) -> Result<()> {
 /// `since_read` is how long ago the host's value was read: a caller that steps
 /// the clock some time after it fetched the value passes that time, so the
 /// clock lands on the host's present rather than on the moment of the read.
-pub(crate) fn set_system_clock(host_time: &str, since_read: std::time::Duration) {
-    eprintln!("[fc-agent] received host time: {host_time} (read {since_read:?} ago)");
-    match parse_epoch_seconds(host_time) {
-        Ok(seconds) => {
-            let spec = clock_target(seconds, since_read);
+pub(crate) fn set_system_clock(host_time: HostClock<'_>, since_read: std::time::Duration) {
+    eprintln!(
+        "[fc-agent] received host time: {} ns={} (read {since_read:?} ago)",
+        host_time.seconds,
+        host_time.nanos.unwrap_or("-")
+    );
+    match host_time.instant() {
+        Ok(instant) => {
+            let spec = clock_target(instant, since_read);
             // SAFETY: `spec` is fully initialized and outlives the call.
             let rc = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &spec) };
             if rc != 0 {
@@ -145,20 +180,20 @@ pub(crate) fn set_system_clock(host_time: &str, since_read: std::time::Duration)
     }
 }
 
-/// Parse the host's clock value: non-negative decimal epoch seconds.
-///
-/// Returns i64 rather than `libc::time_t`, which is deprecated because musl
-/// widened it; the cast at the one call site adapts to whatever the target's
-/// `timespec` field actually is.
-/// The time to set: the host's epoch seconds plus the time since they were read.
-fn clock_target(seconds: i64, since_read: std::time::Duration) -> libc::timespec {
-    let total = std::time::Duration::from_secs(seconds as u64) + since_read;
+/// The time to set: the host's instant plus the time since it was read.
+fn clock_target(instant: std::time::Duration, since_read: std::time::Duration) -> libc::timespec {
+    let total = instant + since_read;
     libc::timespec {
         tv_sec: total.as_secs() as _,
         tv_nsec: total.subsec_nanos() as _,
     }
 }
 
+/// Parse the host's clock value: non-negative decimal epoch seconds.
+///
+/// Returns i64 rather than `libc::time_t`, which is deprecated because musl
+/// widened it; the cast at the one call site adapts to whatever the target's
+/// `timespec` field actually is.
 fn parse_epoch_seconds(host_time: &str) -> Result<i64> {
     let seconds: i64 = host_time
         .trim()
@@ -174,14 +209,55 @@ mod clock_tests {
 
     #[test]
     fn the_clock_target_adds_the_time_since_the_host_value_was_read() {
-        let spec = clock_target(1_700_000_000, std::time::Duration::from_millis(31_250));
+        let host = std::time::Duration::from_secs(1_700_000_000);
+        let spec = clock_target(host, std::time::Duration::from_millis(31_250));
         assert_eq!(spec.tv_sec as i64, 1_700_000_031);
         assert_eq!(spec.tv_nsec as i64, 250_000_000);
-        let spec = clock_target(1_700_000_000, std::time::Duration::ZERO);
+        let spec = clock_target(host, std::time::Duration::ZERO);
         assert_eq!(
             (spec.tv_sec as i64, spec.tv_nsec as i64),
             (1_700_000_000, 0)
         );
+    }
+
+    /// The host stamps its clock to the nanosecond in "host-time-ns", and the
+    /// guest steps to that instant. Whole seconds alone left a restored guest
+    /// behind the host by the fraction of the second at which the host read
+    /// its clock: up to a second, half a second on average (issue 1194).
+    ///
+    /// RED BEFORE THE FIX: the guest stepped to the whole second, 750 ms
+    /// behind here.
+    #[test]
+    fn the_clock_lands_on_the_hosts_instant_to_the_nanosecond() {
+        let meta: crate::types::LatestMetadata = serde_json::from_str(
+            r#"{"host-time": "1700000000", "host-time-ns": "1700000000750000123"}"#,
+        )
+        .unwrap();
+        let spec = clock_target(
+            meta.host_clock().instant().unwrap(),
+            std::time::Duration::from_millis(20),
+        );
+        assert_eq!(
+            (spec.tv_sec as i64, spec.tv_nsec as i64),
+            (1_700_000_000, 770_000_123)
+        );
+    }
+
+    /// A host that sends whole seconds only, and a value that does not parse,
+    /// still set the clock from "host-time".
+    #[test]
+    fn whole_seconds_remain_the_fallback() {
+        for nanos in [None, Some("garbage"), Some("-5")] {
+            let host = HostClock {
+                seconds: "1700000000",
+                nanos,
+            };
+            assert_eq!(
+                host.instant().unwrap(),
+                std::time::Duration::from_secs(1_700_000_000),
+                "{nanos:?}"
+            );
+        }
     }
 
     #[test]

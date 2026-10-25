@@ -124,6 +124,10 @@ pub struct NfsMount {
 pub struct LatestMetadata {
     #[serde(rename = "host-time")]
     pub host_time: String,
+    /// The same instant as `host_time`, in nanoseconds since the epoch, from
+    /// hosts that send it (`bootplan::HostClock`).
+    #[serde(rename = "host-time-ns", default)]
+    pub host_time_ns: Option<String>,
     #[serde(rename = "restore-epoch")]
     pub restore_epoch: Option<String>,
     /// For routed mode clones: unique IPv6 to replace the snapshot's shared guest IPv6.
@@ -138,6 +142,15 @@ pub struct LatestMetadata {
     /// spec before this restore is acknowledged (`gpu::attach`).
     #[serde(default)]
     pub gpus: Vec<String>,
+}
+
+impl LatestMetadata {
+    pub(crate) fn host_clock(&self) -> crate::bootplan::HostClock<'_> {
+        crate::bootplan::HostClock {
+            seconds: &self.host_time,
+            nanos: self.host_time_ns.as_deref(),
+        }
+    }
 }
 
 #[cfg(test)]
