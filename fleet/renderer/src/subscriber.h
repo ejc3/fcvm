@@ -28,6 +28,9 @@ struct Subscriber {
   bool need_key = true;
   void push(std::shared_ptr<const std::string> m);
   void close();
+  // Render thread: forget the header sent, so the next offer_header queues
+  // it again, ahead of a keyframe.
+  void restart_header();
 
   // Render thread: queue the stream header unless this subscriber already has
   // the one for encoder key `ekey`; a new header waits for a keyframe.

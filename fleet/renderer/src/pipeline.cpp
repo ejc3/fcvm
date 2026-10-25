@@ -416,6 +416,7 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   std::vector<std::shared_ptr<Subscriber>> subs;
   std::shared_ptr<const Scene> sc;
   bool new_layout = false;
+  bool generation_cleared = false;  // a scene ended the numbered layout: streams need a header without it
   std::vector<std::pair<int, int>> prep;  // a pending layout's streams: (height, quality)
   std::shared_ptr<const Scene> prep_scene;
   long long prep_gen = -1;
@@ -441,6 +442,10 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
         s->cur_h = 0;  // a new header (layout_generation) at this frame
         s->need_key = true;
       }
+    }
+    if (lay_.take_cleared()) {
+      generation_cleared = true;
+      for (auto& s : subs) s->restart_header();
     }
     gen_cur = lay_.cur;
     if (lay_.pending) pend_k = lay_.k;
@@ -634,7 +639,7 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     if (heights.empty() || heights.back() != h) heights.push_back(h);
     streams.push_back({h, q});
     Tile g = encode_geometry(*sc, h);
-    if (new_layout) e.want_idr = true;  // the first frame of a layout generation is a keyframe
+    if (new_layout || generation_cleared) e.want_idr = true;  // the first frame of a layout generation, or of the header without one, is a keyframe
     bool same = e.enc && geo_eq(g, e.geo);
     bool continue_encode = false;
     if (!same) {

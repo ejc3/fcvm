@@ -79,11 +79,16 @@ int tile_h_for(const Rect& r, double image_aspect, int full_h);
 // The layout generation in force and a pending switch (PROTOCOL.md, "Layout
 // generations"). on_scene takes each accepted scene: a new generation becomes
 // pending; a scene without one takes effect at once, so it cancels a pending
-// switch and leaves no generation in force. take(k) puts a pending switch into
+// switch and leaves no generation in force (take_cleared reports that). take(k) puts a pending switch into
 // force at its first frame; true when it did.
 struct LayoutSwitch {
   long long cur = -1, next = -1, k = 0;
   bool pending = false;
+  bool cleared = false;  // a numbered layout ended without a successor; see take_cleared
+  // True once after a generationless scene ended a generation that was in
+  // force: open streams hold a header naming it, and with the geometry
+  // unchanged nothing else would make the renderer send them a new one.
+  bool take_cleared();
   Rect from, to;
   void on_scene(const Scene& sc);
   bool take(long long frame);
