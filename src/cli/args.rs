@@ -255,12 +255,14 @@ pub struct FleetCoordArgs {
 
     /// An on-demand GPU host auto scaling group (`<region>:<name>`, repeatable), the
     /// fallback of the --scale-group in its region. It is 0 unless a wake leaves that spot
-    /// group short of --awake-capacity for --spot-wait seconds; then it takes the shortfall
-    /// and the spot group is held at what it has. Both go to 0 when the fleet sleeps.
+    /// group short of --awake-capacity and Auto Scaling reports a failed launch of it, or
+    /// short for --spot-wait seconds; then it takes the shortfall and the spot group is
+    /// held at what it has. Both go to 0 when the fleet sleeps.
     #[arg(long = "on-demand-group")]
     pub on_demand_groups: Vec<crate::fleet::coord::scale::Group>,
 
-    /// Seconds a waking spot group may stay short before its on-demand group takes over
+    /// Seconds a waking spot group may stay short before its on-demand group takes over,
+    /// when Auto Scaling has reported no failed launch of it
     #[arg(long, default_value_t = 120)]
     pub spot_wait: u64,
 
@@ -525,7 +527,19 @@ pub struct ServeArgs {
     /// `fcvm podman run` that restores from the cache when its snapshot exists.
     #[arg(long)]
     pub no_snapshot: bool,
+
+    /// Seconds a sandbox create waits for the sandbox to become healthy. A create that is not
+    /// healthy by then stops the sandbox and returns 500.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_CREATE_TIMEOUT_SECS,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub create_timeout: u64,
 }
+
+/// Default for `fcvm serve --create-timeout`.
+pub const DEFAULT_CREATE_TIMEOUT_SECS: u64 = 120;
 
 // ============================================================================
 // Completions Command

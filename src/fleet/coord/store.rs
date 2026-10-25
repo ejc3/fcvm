@@ -34,42 +34,65 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// One state to write; `ack` is answered once that write (and every earlier one) is done.
-/// Without `bytes` it writes nothing and only waits for the writes queued before it.
+/// One state to write; `ack` is answered once that write (and every earlier one) is done,
+/// with whether the newest state the writer was given is stored. Without `bytes` it writes
+/// nothing new: it retries a state whose write failed, and waits for the writes queued
+/// before it.
 pub struct StoreCmd {
     pub bytes: Option<Arc<Vec<u8>>>,
-    pub ack: Option<oneshot::Sender<()>>,
+    pub ack: Option<oneshot::Sender<bool>>,
 }
 
 pub type StoreTx = mpsc::UnboundedSender<StoreCmd>;
 
 /// Start the one task that writes `path`. States are written in the order sent; when
 /// several are queued only the newest is written, and every ack among them is answered
-/// after that write.
+/// after that write. A state whose write failed is kept and written again with the next
+/// command, unless a newer state replaces it.
 pub fn spawn_writer(path: PathBuf) -> StoreTx {
+    spawn_store(move |bytes| {
+        let p = path.clone();
+        async move {
+            let shown = p.display().to_string();
+            tokio::task::spawn_blocking(move || write_atomic(&p, &bytes))
+                .await
+                .context("the state writer panicked")?
+                .with_context(|| format!("writing {shown}"))
+        }
+    })
+}
+
+/// The writer task both stores share: `write` stores one state.
+fn spawn_store<F, Fut>(mut write: F) -> StoreTx
+where
+    F: FnMut(Arc<Vec<u8>>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send,
+{
     let (tx, mut rx) = mpsc::unbounded_channel::<StoreCmd>();
     tokio::spawn(async move {
+        // The newest state not stored yet: a write that failed is kept for the next try.
+        let mut unwritten: Option<Arc<Vec<u8>>> = None;
         while let Some(first) = rx.recv().await {
-            let mut bytes = first.bytes;
-            let mut acks: Vec<oneshot::Sender<()>> = first.ack.into_iter().collect();
+            let mut acks: Vec<oneshot::Sender<bool>> = first.ack.into_iter().collect();
+            if first.bytes.is_some() {
+                unwritten = first.bytes;
+            }
             while let Ok(more) = rx.try_recv() {
                 if more.bytes.is_some() {
-                    bytes = more.bytes;
+                    unwritten = more.bytes;
                 }
                 acks.extend(more.ack);
             }
-            if let Some(bytes) = bytes {
-                let p = path.clone();
-                match tokio::task::spawn_blocking(move || write_atomic(&p, &bytes)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::error!(path = %path.display(), error = %format!("{e:#}"), "state file not written")
+            if let Some(bytes) = unwritten.clone() {
+                match write(bytes).await {
+                    Ok(()) => unwritten = None,
+                    Err(e) => {
+                        tracing::error!(error = %format!("{e:#}"), "state not written; kept for the next write")
                     }
-                    Err(e) => tracing::error!(error = %e, "state writer panicked"),
                 }
             }
             for a in acks {
-                let _ = a.send(());
+                let _ = a.send(unwritten.is_none());
             }
         }
     });
@@ -184,31 +207,14 @@ impl S3Object {
     }
 }
 
-/// Start the one task that writes the S3 object, with the file writer's ordering and acks.
-/// A failed write is logged and the next state is written in full.
+/// Start the one task that writes the S3 object, with the file writer's ordering, acks and
+/// retries.
 pub fn spawn_s3_writer(obj: S3Object) -> StoreTx {
-    let (tx, mut rx) = mpsc::unbounded_channel::<StoreCmd>();
-    tokio::spawn(async move {
-        while let Some(first) = rx.recv().await {
-            let mut bytes = first.bytes;
-            let mut acks: Vec<oneshot::Sender<()>> = first.ack.into_iter().collect();
-            while let Ok(more) = rx.try_recv() {
-                if more.bytes.is_some() {
-                    bytes = more.bytes;
-                }
-                acks.extend(more.ack);
-            }
-            if let Some(bytes) = bytes {
-                if let Err(e) = obj.put(&bytes).await {
-                    tracing::error!(bucket = %obj.bucket, key = %obj.key, error = %format!("{e:#}"), "state not written");
-                }
-            }
-            for a in acks {
-                let _ = a.send(());
-            }
-        }
-    });
-    tx
+    let obj = Arc::new(obj);
+    spawn_store(move |bytes| {
+        let obj = obj.clone();
+        async move { obj.put(&bytes).await }
+    })
 }
 
 #[cfg(test)]

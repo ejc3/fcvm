@@ -7,10 +7,11 @@
 //! The tile serves its renderer over TLS on 443 with the fleet's wildcard certificate, as
 //! `<tile>.<zone>` (the coordinator's DNS writes that name). `ready` waits for the instance to
 //! run, then for `/health` there, resolving the name to the instance's address itself so
-//! readiness does not wait for DNS.
+//! readiness does not wait for DNS. `alive` reads the instance's state and asks the same
+//! `/health` again, so a renderer that crashed on a running instance is noticed.
 
 use super::aws::{signed, xml_tag, CredentialChain};
-use super::ec2::{Ec2Driver, LaunchError, Launched};
+use super::ec2::{Ec2Driver, LaunchError, Launched, Liveness};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use fleet_core::protocol::{BudgetBody, RendererScene};
@@ -53,6 +54,16 @@ enum CallError {
     Other(anyhow::Error),
 }
 
+/// What the renderer's `/health` said. It answers 200 while CUDA starts and after it has
+/// failed: ready means `ready` is true, and an `error` is a renderer that will not render.
+enum Health {
+    Ready,
+    NotReady,
+    Failed(String),
+    /// No answer, or not one this code can read.
+    Silent(String),
+}
+
 impl AwsEc2 {
     /// A client that reaches the tile's renderer by its address under its DNS name (the
     /// name its certificate is for), and the URL of `path` on it.
@@ -66,6 +77,38 @@ impl AwsEc2 {
             .ipv4
             .as_deref()
             .context("the tile has no address yet")?;
+        self.renderer_at(tile, ip, path)
+    }
+
+    /// Ask the tile's renderer at `ip` for its `/health`.
+    async fn probe(&self, tile: &str, ip: &str) -> Health {
+        let silent = |e: &dyn std::fmt::Display| Health::Silent(format!("{e:#}"));
+        let (client, url) = match self.renderer_at(tile, ip, "/health") {
+            Ok(c) => c,
+            Err(e) => return silent(&e),
+        };
+        let r = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => return silent(&e),
+        };
+        if !r.status().is_success() {
+            return Health::Silent(format!("GET {url} answered {}", r.status()));
+        }
+        let h = match r.json::<serde_json::Value>().await {
+            Ok(h) => h,
+            Err(e) => return silent(&e),
+        };
+        if let Some(e) = h.get("error").filter(|e| !e.is_null()) {
+            return Health::Failed(e.to_string());
+        }
+        if h["ready"] == serde_json::Value::Bool(true) {
+            Health::Ready
+        } else {
+            Health::NotReady
+        }
+    }
+
+    fn renderer_at(&self, tile: &str, ip: &str, path: &str) -> Result<(reqwest::Client, String)> {
         let addr: std::net::IpAddr = ip.parse().context("the tile's address")?;
         let name = format!("{tile}.{}", self.zone);
         let client = reqwest::Client::builder()
@@ -74,6 +117,31 @@ impl AwsEc2 {
             .build()?;
         let url = format!("{}://{name}:{}{path}", self.health_scheme, self.health_port);
         Ok((client, url))
+    }
+
+    /// The instance's state and public IPv4 address, from DescribeInstances.
+    async fn describe(
+        &self,
+        region: &str,
+        id: &str,
+    ) -> Result<(String, Option<String>, Option<String>), CallError> {
+        let xml = self
+            .call(
+                region,
+                &[
+                    ("Action", "DescribeInstances".into()),
+                    ("InstanceId.1", id.into()),
+                ],
+            )
+            .await?;
+        let state = xml_tag(&xml, "instanceState")
+            .and_then(|s| xml_tag(&s, "name"))
+            .unwrap_or_default();
+        Ok((
+            state,
+            xml_tag(&xml, "ipAddress"),
+            xml_tag(&xml, "ipv6Address"),
+        ))
     }
 
     pub fn new(
@@ -224,7 +292,6 @@ impl Ec2Driver for AwsEc2 {
     async fn ready(&self, tile: &str, launched: &Launched) -> Result<Launched> {
         let (region, id) = split(&launched.instance)?;
         let deadline = Instant::now() + self.ready_timeout;
-        let name = format!("{tile}.{}", self.zone);
         let mut up = launched.clone();
         // For the log: since this call, when the instance was first seen running with an
         // address, and when its renderer first answered /health.
@@ -235,17 +302,8 @@ impl Ec2Driver for AwsEc2 {
             if Instant::now() >= deadline {
                 bail!("{id} did not serve /health within {:?}", self.ready_timeout);
             }
-            let xml = match self
-                .call(
-                    region,
-                    &[
-                        ("Action", "DescribeInstances".into()),
-                        ("InstanceId.1", id.into()),
-                    ],
-                )
-                .await
-            {
-                Ok(x) => x,
+            let (state, ipv4, ipv6) = match self.describe(region, id).await {
+                Ok(d) => d,
                 Err(CallError::Capacity(e)) => bail!("{e}"),
                 Err(CallError::Other(e)) => {
                     tracing::debug!(error = %format!("{e:#}"), "describing a tile");
@@ -253,51 +311,36 @@ impl Ec2Driver for AwsEc2 {
                     continue;
                 }
             };
-            let state = xml_tag(&xml, "instanceState")
-                .and_then(|s| xml_tag(&s, "name"))
-                .unwrap_or_default();
             if matches!(
                 state.as_str(),
                 "shutting-down" | "terminated" | "stopping" | "stopped"
             ) {
                 bail!("{id} is {state}");
             }
-            up.ipv4 = xml_tag(&xml, "ipAddress");
-            up.ipv6 = xml_tag(&xml, "ipv6Address");
+            up.ipv4 = ipv4;
+            up.ipv6 = ipv6;
             if state == "running" {
                 if let Some(ip) = up.ipv4.clone() {
                     running_ms.get_or_insert(t0.elapsed().as_millis());
-                    let addr: std::net::IpAddr = ip.parse().context("the instance's address")?;
-                    let client = reqwest::Client::builder()
-                        .resolve(&name, std::net::SocketAddr::new(addr, self.health_port))
-                        .timeout(Duration::from_secs(5))
-                        .build()?;
-                    let url = format!(
-                        "{}://{name}:{}/health",
-                        self.health_scheme, self.health_port
-                    );
-                    // The renderer answers /health with 200 while CUDA starts and after it
-                    // has failed: ready means `ready` is true, and an `error` is a renderer
-                    // that will not render, so the launch fails and the tile is retried.
-                    if let Ok(r) = client.get(&url).send().await {
-                        if r.status().is_success() {
+                    // A renderer that reports an error will not render: the launch fails
+                    // and the tile is retried.
+                    match self.probe(tile, &ip).await {
+                        Health::Ready => {
                             health_ms.get_or_insert(t0.elapsed().as_millis());
-                            if let Ok(h) = r.json::<serde_json::Value>().await {
-                                if let Some(e) = h.get("error").filter(|e| !e.is_null()) {
-                                    bail!("{id}'s renderer failed: {e}");
-                                }
-                                if h["ready"] == serde_json::Value::Bool(true) {
-                                    tracing::info!(
-                                        %tile, instance = %id,
-                                        running_ms = running_ms.unwrap_or_default() as u64,
-                                        health_answered_ms = health_ms.unwrap_or_default() as u64,
-                                        ready_ms = t0.elapsed().as_millis() as u64,
-                                        "tile ready (ms since the launch was accepted)"
-                                    );
-                                    return Ok(up);
-                                }
-                            }
+                            tracing::info!(
+                                %tile, instance = %id,
+                                running_ms = running_ms.unwrap_or_default() as u64,
+                                health_answered_ms = health_ms.unwrap_or_default() as u64,
+                                ready_ms = t0.elapsed().as_millis() as u64,
+                                "tile ready (ms since the launch was accepted)"
+                            );
+                            return Ok(up);
                         }
+                        Health::Failed(e) => bail!("{id}'s renderer failed: {e}"),
+                        Health::NotReady => {
+                            health_ms.get_or_insert(t0.elapsed().as_millis());
+                        }
+                        Health::Silent(_) => {}
                     }
                 }
             }
@@ -337,29 +380,32 @@ impl Ec2Driver for AwsEc2 {
         Ok(r.json().await?)
     }
 
-    async fn alive(&self, launched: &Launched) -> Result<bool> {
+    async fn alive(&self, tile: &str, launched: &Launched) -> Result<Liveness> {
         let (region, id) = split(&launched.instance)?;
-        let xml = match self
-            .call(
-                region,
-                &[
-                    ("Action", "DescribeInstances".into()),
-                    ("InstanceId.1", id.into()),
-                ],
-            )
-            .await
-        {
-            Ok(x) => x,
+        let (state, ipv4, _) = match self.describe(region, id).await {
+            Ok(d) => d,
             Err(CallError::Capacity(e)) => bail!("{e}"),
             Err(CallError::Other(e)) => return Err(e),
         };
-        let state = xml_tag(&xml, "instanceState")
-            .and_then(|s| xml_tag(&s, "name"))
-            .context("DescribeInstances named no state")?;
-        Ok(!matches!(
+        anyhow::ensure!(!state.is_empty(), "DescribeInstances named no state");
+        if matches!(
             state.as_str(),
             "shutting-down" | "terminated" | "stopping" | "stopped"
-        ))
+        ) {
+            return Ok(Liveness::Dead(format!("instance {id} is {state}")));
+        }
+        if state != "running" {
+            return Ok(Liveness::Alive);
+        }
+        let Some(ip) = ipv4.or_else(|| launched.ipv4.clone()) else {
+            return Ok(Liveness::Silent(format!("{id} has no address")));
+        };
+        Ok(match self.probe(tile, &ip).await {
+            // A renderer that answers and is not ready is starting again: it is there.
+            Health::Ready | Health::NotReady => Liveness::Alive,
+            Health::Failed(e) => Liveness::Dead(format!("{id}'s renderer failed: {e}")),
+            Health::Silent(e) => Liveness::Silent(e),
+        })
     }
 
     /// Every instance of this fleet (tagged `Purpose=fcvm-fleet-tile` and `Fleet=<name>`)
