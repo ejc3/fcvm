@@ -575,6 +575,30 @@ static void scenario_tlbi_removal(void)
 	check_teardown("tlbi_removal");
 }
 
+/* A guest TLBI of part of a shadow block removes the whole block but keeps
+ * its record. The guest refaulting the block, again and again, must not add
+ * a record each time. */
+static void scenario_tlbi_refault(void)
+{
+	struct kvm *kvm = make_vm(1);
+	struct kvm_s2_mmu *mmu1 = &kvm->arch.nested_mmus[1];
+
+	record(kvm, 1, B_CIPA, B_NIPA, SZ_2M);
+	for (int i = 0; i < 100; i++) {
+		write_lock(&kvm->mmu_lock);
+		kvm_stage2_unmap_range(mmu1, B_NIPA, 2 * SZ_4K, true);
+		write_unlock(&kvm->mmu_lock);
+		record(kvm, 1, B_CIPA, B_NIPA, SZ_2M);
+	}
+	CHECK(tree_count(&mmu1->guest_s2_mappings) == 1 &&
+	      tree_count(&kvm->arch.mmu.guest_s2_mappings) == 1,
+	      "100 partial unmaps and refaults of one 2M block left %d records in nested MMU 1's "
+	      "tree and %d in the canonical tree, want 1 and 1",
+	      tree_count(&mmu1->guest_s2_mappings), tree_count(&kvm->arch.mmu.guest_s2_mappings));
+	destroy_vm(kvm, 1);
+	check_teardown("tlbi_refault");
+}
+
 /* kvm_vcpu_init_nested() moves nested_mmus when a vcpu is added. A record
  * made before the move still names its MMU afterwards. */
 static void scenario_grow(void)
@@ -643,6 +667,8 @@ int main(int argc, char **argv)
 #ifdef HAVE_GUEST_S2_TRACKING
 	else if (!strcmp(name, "tlbi_removal"))
 		scenario_tlbi_removal();
+	else if (!strcmp(name, "tlbi_refault"))
+		scenario_tlbi_refault();
 	else if (!strcmp(name, "grow"))
 		scenario_grow();
 	else if (!strcmp(name, "teardown_race"))

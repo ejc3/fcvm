@@ -481,7 +481,7 @@ fn nv2_invalidation_unmaps_only_the_shadow_mappings_of_the_invalidated_range() {
 
     let mut scenarios = vec!["targeted", "memslot"];
     if patched {
-        scenarios.extend(["tlbi_removal", "grow", "teardown_race"]);
+        scenarios.extend(["tlbi_removal", "tlbi_refault", "grow", "teardown_race"]);
     }
     let mut failures = Vec::new();
     for scenario in scenarios {

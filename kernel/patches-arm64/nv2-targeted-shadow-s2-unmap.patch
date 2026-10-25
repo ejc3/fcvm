@@ -1,6 +1,6 @@
-From cbdd7bba9e485ffc2a7028ed90edf278b6f75c38 Mon Sep 17 00:00:00 2001
+From d479daef94dba4a6adeaa6ab0db4394fddf43c01 Mon Sep 17 00:00:00 2001
 From: ejc3 <ejc3@users.noreply.github.com>
-Date: Sun, 25 Oct 2026 16:46:33 +0000
+Date: Sun, 25 Oct 2026 17:23:48 +0000
 Subject: [PATCH] KVM: arm64: nv: Unmap only the affected shadow stage-2 ranges
  on invalidation
 
@@ -44,13 +44,18 @@ refactor that 6.18 does not have:
   It now drops every record under the mmu_lock first, so that a
   kvm_nested_unmap_cipa_range() that dropped the lock to reschedule finds
   no record naming the freed array when it resumes.
+- kvm_record_guest_s2_mapping() does not insert a record identical to one
+  already in the nested MMU's tree. An unmap that covers part of a shadow
+  block (a guest TLBI of a subrange) removes the whole block but keeps its
+  record, so upstream adds one more record each time the guest refaults
+  that block, without bound until an unmap covers all of it.
 - kmalloc() instead of kmalloc_obj().
 ---
- arch/arm64/include/asm/kvm_host.h   |  20 ++++
+ arch/arm64/include/asm/kvm_host.h   |  20 +++
  arch/arm64/include/asm/kvm_nested.h |   8 ++
- arch/arm64/kvm/mmu.c                |  90 ++++++++++++--
- arch/arm64/kvm/nested.c             | 174 ++++++++++++++++++++++++++++
- 4 files changed, 285 insertions(+), 7 deletions(-)
+ arch/arm64/kvm/mmu.c                |  90 ++++++++++++-
+ arch/arm64/kvm/nested.c             | 198 ++++++++++++++++++++++++++++
+ 4 files changed, 309 insertions(+), 7 deletions(-)
 
 diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
 index 7bee8a3..21a8ad4 100644
@@ -352,7 +357,7 @@ index b423769..7da6d61 100644
  }
  
 diff --git a/arch/arm64/kvm/nested.c b/arch/arm64/kvm/nested.c
-index 44bb2c9..85170fd 100644
+index 44bb2c9..dacf40b 100644
 --- a/arch/arm64/kvm/nested.c
 +++ b/arch/arm64/kvm/nested.c
 @@ -5,6 +5,7 @@
@@ -371,7 +376,7 @@ index 44bb2c9..85170fd 100644
  }
  
  static int init_nested_s2_mmu(struct kvm *kvm, struct kvm_s2_mmu *mmu)
-@@ -727,6 +729,108 @@ static struct kvm_s2_mmu *get_s2_mmu_nested(struct kvm_vcpu *vcpu)
+@@ -727,6 +729,132 @@ static struct kvm_s2_mmu *get_s2_mmu_nested(struct kvm_vcpu *vcpu)
  	return s2_mmu;
  }
  
@@ -408,6 +413,8 @@ index 44bb2c9..85170fd 100644
 +				 struct kvm_guest_s2_mapping *mapping)
 +{
 +	struct kvm *kvm = kvm_s2_mmu_to_kvm(mmu);
++	struct kvm_guest_s2_mapping *old;
++	struct interval_tree_node *node;
 +
 +	lockdep_assert_held_read(&kvm->mmu_lock);
 +
@@ -423,6 +430,28 @@ index 44bb2c9..85170fd 100644
 +	tag_s2_mapping_mmu(kvm, mapping, mmu);
 +
 +	guard(spinlock)(&kvm->arch.guest_s2_tracking_lock);
++
++	/*
++	 * An unmap that covers part of a shadow block (a guest TLBI of a
++	 * subrange) removes the whole block but keeps its record, which
++	 * only an unmap covering all of it drops. Refaulting the block
++	 * would then add an identical record each time, without bound.
++	 * Keep one.
++	 */
++	for (node = interval_tree_iter_first(&mmu->guest_s2_mappings, nested_ipa,
++					     mapping->nested.last);
++	     node;
++	     node = interval_tree_iter_next(node, nested_ipa, mapping->nested.last)) {
++		old = container_of(node, struct kvm_guest_s2_mapping, nested);
++		if (s2_mapping_to_nested_start(old) == nested_ipa &&
++		    old->nested.last == mapping->nested.last &&
++		    old->canonical.start == mapping->canonical.start &&
++		    old->canonical.last == mapping->canonical.last) {
++			kfree(mapping);
++			return;
++		}
++	}
++
 +	interval_tree_insert(&mapping->nested, &mmu->guest_s2_mappings);
 +	interval_tree_insert(&mapping->canonical, &kvm->arch.mmu.guest_s2_mappings);
 +}
@@ -480,7 +509,7 @@ index 44bb2c9..85170fd 100644
  void kvm_init_nested_s2_mmu(struct kvm_s2_mmu *mmu)
  {
  	/* CnP being set denotes an invalid entry */
-@@ -1102,6 +1206,60 @@ void kvm_nested_s2_wp(struct kvm *kvm)
+@@ -1102,6 +1230,60 @@ void kvm_nested_s2_wp(struct kvm *kvm)
  	kvm_invalidate_vncr_ipa(kvm, 0, BIT(kvm->arch.mmu.pgt->ia_bits));
  }
  
@@ -541,7 +570,7 @@ index 44bb2c9..85170fd 100644
  void kvm_nested_s2_unmap(struct kvm *kvm, bool may_block)
  {
  	int i;
-@@ -1134,8 +1292,24 @@ void kvm_nested_s2_flush(struct kvm *kvm)
+@@ -1134,8 +1316,24 @@ void kvm_nested_s2_flush(struct kvm *kvm)
  
  void kvm_arch_flush_shadow_all(struct kvm *kvm)
  {
