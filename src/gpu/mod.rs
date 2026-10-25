@@ -211,17 +211,28 @@ pub trait WarmGpuSteps {
     async fn unpark(&mut self) -> Result<()>;
 }
 
+/// A warm GPU snapshot that was taken, and whether the source got its GPUs back.
+#[derive(Debug)]
+pub struct WarmSnapshot<T> {
+    pub snapshot: T,
+    /// Why the source VM did not get its GPUs back, if it did not. The snapshot is
+    /// published either way, so the caller records it (the VM's diff parent) before
+    /// it reports this.
+    pub recovery: Option<anyhow::Error>,
+}
+
 /// Take a snapshot whose memory holds the guest's GPU state.
 ///
 /// A passthrough device cannot be saved, so the GPUs leave the VM first: the guest
 /// parks them, the VMM detaches them, the snapshot is taken, and the source gets
 /// them back (attach, then unpark) whatever the snapshot did. Once the park has
-/// succeeded the source is always given its GPUs back; a failure there is reported
-/// with the snapshot's own result rather than replacing it.
+/// succeeded the source is always given its GPUs back. A failure there does not
+/// replace the snapshot's own result: a snapshot that was taken is returned with
+/// the recovery failure beside it, and one that was not carries it as context.
 pub async fn warm_gpu_snapshot<S: WarmGpuSteps>(
     steps: &mut S,
     devices: &[crate::firecracker::api::DevicePassthrough],
-) -> Result<S::Snapshot> {
+) -> Result<WarmSnapshot<S::Snapshot>> {
     anyhow::ensure!(
         !devices.is_empty(),
         "a warm GPU snapshot needs a GPU to park"
@@ -269,11 +280,18 @@ pub async fn warm_gpu_snapshot<S: WarmGpuSteps>(
         );
     }
     match (result, recovery.is_empty()) {
-        (result, true) => result,
-        (Ok(_), false) => Err(anyhow::anyhow!(
-            "the snapshot was taken, but the source VM did not get its GPUs back: {}",
-            recovery.join("; ")
-        )),
+        (Ok(snapshot), true) => Ok(WarmSnapshot {
+            snapshot,
+            recovery: None,
+        }),
+        (Err(error), true) => Err(error),
+        (Ok(snapshot), false) => Ok(WarmSnapshot {
+            snapshot,
+            recovery: Some(anyhow::anyhow!(
+                "the snapshot was taken, but the source VM did not get its GPUs back: {}",
+                recovery.join("; ")
+            )),
+        }),
         (Err(error), false) => Err(error.context(format!(
             "and the source VM did not get its GPUs back: {}",
             recovery.join("; ")
@@ -517,10 +535,9 @@ mod warm_tests {
     #[tokio::test]
     async fn the_gpus_leave_before_the_snapshot_and_come_back_after() {
         let mut steps = Recorder::default();
-        assert_eq!(
-            warm_gpu_snapshot(&mut steps, &two_gpus()).await.unwrap(),
-            "snap"
-        );
+        let taken = warm_gpu_snapshot(&mut steps, &two_gpus()).await.unwrap();
+        assert_eq!(taken.snapshot, "snap");
+        assert!(taken.recovery.is_none());
         assert_eq!(
             steps.log,
             [
@@ -597,15 +614,20 @@ mod warm_tests {
         );
     }
 
+    /// The snapshot is published before the source gets its GPUs back, so a failed
+    /// recovery must not hide it: the caller records it as the VM's diff parent (the
+    /// VMM has already reset its dirty pages against it) and then reports the failure.
     #[tokio::test]
     async fn a_failed_reattach_is_reported_and_leaves_the_processes_parked() {
         let mut steps = Recorder {
             fail: vec!["attach gpu0"],
             ..Default::default()
         };
-        let error = warm_gpu_snapshot(&mut steps, &two_gpus())
+        let taken = warm_gpu_snapshot(&mut steps, &two_gpus())
             .await
-            .unwrap_err();
+            .expect("a snapshot that was taken is returned when the recovery fails");
+        assert_eq!(taken.snapshot, "snap");
+        let error = taken.recovery.expect("the failed recovery is reported");
         let text = format!("{error:#}");
         assert!(
             text.contains("snapshot was taken") && text.contains("stay checkpointed"),
