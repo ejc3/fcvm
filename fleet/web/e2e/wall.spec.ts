@@ -1205,7 +1205,7 @@ test("one address family for both halves: a viewer with no IPv6 gets IPv4 for ev
     expect(Object.keys(v4).sort()).toEqual(["ec2", "fcvm"]);
     for (const [half, h] of Object.entries(v4)) expect(new Set(h), half).toEqual(new Set(["127.0.0.1"]));
     await page.evaluate(() => window.__fleet!.client.ui({ drawer: true }));
-    await expect(page.getByTestId("family")).toHaveText("Address family: IPv4 for every tile (IPv6 did not connect in 3 tries of 1.5 s)");
+    await expect(page.getByTestId("family")).toHaveText(/^Address family: IPv4 for every tile \(connected first, in \d+ ms\)$/);
     const n = v4["fcvm"]!.length + v4["ec2"]!.length;
     await expect.poll(async () => (await byFamily()).v4 ?? 0, { timeout: 15_000 }).toBe(n);
     expect((await byFamily()).v6 ?? 0).toBe(0);
@@ -1224,7 +1224,7 @@ test("one address family for both halves: a viewer with no IPv6 gets IPv4 for ev
   expect(Object.keys(v6).sort()).toEqual(["ec2", "fcvm"]);
   for (const [half, h] of Object.entries(v6)) expect(new Set(h), half).toEqual(new Set(["localhost"]));
   await page.evaluate(() => window.__fleet!.client.ui({ drawer: true }));
-  await expect(page.getByTestId("family")).toHaveText(/^Address family: IPv6 for every tile \(connected in \d+ ms\)$/);
+  await expect(page.getByTestId("family")).toHaveText(/^Address family: IPv6 for every tile \(connected first, in \d+ ms\)$/);
   const m = v6["fcvm"]!.length + v6["ec2"]!.length;
   await expect.poll(async () => (await byFamily()).v6 ?? 0, { timeout: 15_000 }).toBe(m);
   await expect.poll(async () => (await byFamily()).v4 ?? 0, { timeout: 15_000 }).toBe(0);

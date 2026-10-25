@@ -5,7 +5,10 @@
 //! running: the agent itself never stops. Each new connection starts with the hello and
 //! then the latest of every message that describes current state (each slot's report, the
 //! aggregator, a draining notice, quarantines), so a coordinator that lost the host learns
-//! where every slot is without restarting a VM. Reconnects back off from 1 s to 30 s.
+//! where every slot is without restarting a VM. A quarantine is replayed until the
+//! coordinator says a stored state holds it (`quarantine_stored`): a coordinator that
+//! crashed before writing it would otherwise assign the GPU again. Reconnects back off from
+//! 1 s to 30 s.
 
 use super::{serve, Agent};
 use anyhow::{Context, Result};
@@ -54,36 +57,47 @@ impl Replay {
         self.keyed.insert(key, line.to_string());
     }
 
-    /// A coordinator frame: an `assign` names every slot the host still runs. A slot that
-    /// left it is torn down here, so its last report and its quarantine are no longer
-    /// true: a quarantined GPU leaves the assignment, and comes back to it only when an
-    /// operator releases it. Replaying either would undo that (a released GPU quarantined
-    /// again, a removed slot reported running).
-    fn assigned(&mut self, frame: &str) {
+    /// A coordinator frame. An `assign` names every slot the host still runs: a slot that
+    /// left it is torn down here, so its last report is no longer true, and replaying it
+    /// would report a removed slot running. A quarantine stays until `quarantine_stored`
+    /// names its GPU: the coordinator sends that once a stored state holds the quarantine,
+    /// or an operator's release that followed it, so neither a coordinator restart can lose
+    /// it nor a later replay quarantine a released GPU again.
+    fn coordinator_frame(&mut self, frame: &str) {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(frame) else {
             return;
         };
-        if v.get("type").and_then(|t| t.as_str()) != Some("assign") {
-            return;
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("assign") => {
+                let ids: std::collections::BTreeSet<&str> = v["slots"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|s| s.get("id").and_then(|i| i.as_str()))
+                    .collect();
+                self.keyed.retain(|key, _| match key.strip_prefix("slot/") {
+                    Some(id) => ids.contains(id),
+                    None => true,
+                });
+            }
+            // Only the report it names: a newer failure of the same GPU (after an operator
+            // released it) replaced the line and is not stored yet.
+            Some("quarantine_stored") => {
+                let Some(sbdf) = v.get("sbdf").and_then(|s| s.as_str()) else {
+                    return;
+                };
+                let key = format!("quarantine/{sbdf}");
+                let report = |v: &serde_json::Value| v.get("report").cloned();
+                let named = self.keyed.get(&key).is_some_and(|line| {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .is_ok_and(|q| report(&q) == report(&v))
+                });
+                if named {
+                    self.keyed.remove(&key);
+                }
+            }
+            _ => {}
         }
-        let ids: std::collections::BTreeSet<&str> = v["slots"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|s| s.get("id").and_then(|i| i.as_str()))
-            .collect();
-        self.keyed.retain(|key, line| {
-            if let Some(id) = key.strip_prefix("slot/") {
-                return ids.contains(id);
-            }
-            if key.starts_with("quarantine/") {
-                let slot = serde_json::from_str::<serde_json::Value>(line)
-                    .ok()
-                    .and_then(|q| q.get("slot").and_then(|s| s.as_str()).map(str::to_string));
-                return slot.is_some_and(|s| ids.contains(s.as_str()));
-            }
-            true
-        });
     }
 
     fn lines(&self) -> Vec<String> {
@@ -177,7 +191,7 @@ pub async fn run(agent: Agent, cfg: DialCfg) -> Result<()> {
             tokio::select! {
                 m = stream.next() => match m {
                     Some(Ok(Message::Text(t))) => {
-                        replay.assigned(t.as_str());
+                        replay.coordinator_frame(t.as_str());
                         let mut line = t.as_bytes().to_vec();
                         line.push(b'\n');
                         if to_agent.write_all(&line).await.is_err() {
@@ -210,31 +224,55 @@ pub async fn run(agent: Agent, cfg: DialCfg) -> Result<()> {
 mod tests {
     use super::Replay;
 
+    /// An operator releases a GPU while its first quarantine waits for its acknowledgement,
+    /// and the GPU fails again: the second report replaces the first in the replay, and the
+    /// first one's acknowledgement must not drop it.
     #[test]
-    fn the_replay_forgets_slots_and_quarantines_that_left_the_assignment() {
+    fn an_acknowledgement_drops_only_the_report_it_names() {
+        let mut r = Replay::default();
+        r.note(r#"{"type":"hello","host":"h","arch":"x86_64","gpus":[],"capacity":1}"#);
+        r.note(r#"{"type":"quarantine","slot":"slot-1","sbdf":"0000:19:00.0","error":"a","report":"r1"}"#);
+        r.note(r#"{"type":"quarantine","slot":"slot-1","sbdf":"0000:19:00.0","error":"b","report":"r2"}"#);
+        r.coordinator_frame(r#"{"type":"quarantine_stored","sbdf":"0000:19:00.0","report":"r1"}"#);
+        let lines = r.lines().join("\n");
+        assert!(lines.contains("\"report\":\"r2\""), "{lines}");
+        r.coordinator_frame(r#"{"type":"quarantine_stored","sbdf":"0000:19:00.0","report":"r2"}"#);
+        assert!(!r.lines().join("\n").contains("quarantine"));
+    }
+
+    #[test]
+    fn the_replay_forgets_slots_that_left_and_keeps_a_quarantine_until_it_is_stored() {
         let mut r = Replay::default();
         r.note(r#"{"type":"hello","host":"h","arch":"x86_64","gpus":[],"capacity":2}"#);
         r.note(r#"{"type":"slot","id":"slot-1","phase":"running","generation":1}"#);
         r.note(r#"{"type":"slot","id":"slot-2","phase":"failed","generation":1}"#);
         r.note(
-            r#"{"type":"quarantine","slot":"slot-2","sbdf":"0000:19:00.0","error":"reset failed"}"#,
+            r#"{"type":"quarantine","slot":"slot-2","sbdf":"0000:19:00.0","error":"reset failed","report":"r1"}"#,
         );
         // The coordinator still lists both: everything is replayed.
-        r.assigned(r#"{"type":"assign","slots":[{"id":"slot-1"},{"id":"slot-2"}]}"#);
+        r.coordinator_frame(r#"{"type":"assign","slots":[{"id":"slot-1"},{"id":"slot-2"}]}"#);
         assert_eq!(r.lines().len(), 4);
-        // The quarantined GPU's slot leaves the assignment.
-        r.assigned(r#"{"type":"assign","slots":[{"id":"slot-1"}],"region":null}"#);
+        // The quarantined GPU's slot leaves the assignment: its report goes, its quarantine
+        // stays, since the coordinator may not have stored it yet.
+        r.coordinator_frame(r#"{"type":"assign","slots":[{"id":"slot-1"}],"region":null}"#);
         let lines = r.lines().join("\n");
         assert!(lines.contains("slot-1"), "{lines}");
-        assert!(!lines.contains("quarantine"), "{lines}");
-        assert!(!lines.contains("\"slot-2\""), "{lines}");
+        assert!(!lines.contains("\"id\":\"slot-2\""), "{lines}");
+        assert!(lines.contains("\"quarantine\""), "{lines}");
+        // Another GPU's acknowledgement, or another report's, changes nothing.
+        r.coordinator_frame(r#"{"type":"quarantine_stored","sbdf":"0000:01:00.0","report":"r1"}"#);
+        r.coordinator_frame(r#"{"type":"quarantine_stored","sbdf":"0000:19:00.0","report":"r0"}"#);
+        assert!(r.lines().join("\n").contains("\"quarantine\""));
+        // Stored: no longer replayed.
+        r.coordinator_frame(r#"{"type":"quarantine_stored","sbdf":"0000:19:00.0","report":"r1"}"#);
+        assert!(!r.lines().join("\n").contains("quarantine"));
         // An operator releases it and it runs again: nothing replays the old quarantine.
-        r.assigned(r#"{"type":"assign","slots":[{"id":"slot-1"},{"id":"slot-2"}]}"#);
+        r.coordinator_frame(r#"{"type":"assign","slots":[{"id":"slot-1"},{"id":"slot-2"}]}"#);
         r.note(r#"{"type":"slot","id":"slot-2","phase":"running","generation":2}"#);
         let lines = r.lines().join("\n");
         assert!(!lines.contains("quarantine"), "{lines}");
         // Scenes and budgets change nothing.
-        r.assigned(r#"{"type":"scene","epoch_unix_ms":1}"#);
+        r.coordinator_frame(r#"{"type":"scene","epoch_unix_ms":1}"#);
         assert_eq!(r.lines().len(), 3);
     }
 }

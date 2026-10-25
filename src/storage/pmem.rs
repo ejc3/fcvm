@@ -444,7 +444,7 @@ mod tests {
             "the restore check stats an image more than once"
         );
         assert!(
-            !body.contains("file_identity("),
+            !body.contains("image_disk_digest("),
             "the restore check stats the image again for its identity"
         );
     }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove Access, fresh launch names and real renderer frames over IPv4 on staging."""
+"""Prove Access, fresh launch names that resolve at once, and renderer frames over IPv4 on staging."""
 import base64
 import hashlib
 import ipaddress
@@ -160,6 +160,102 @@ def fresh(old, new):
             raise AssertionError("a launch reused its predecessor's DNS name")
 
 
+# A fresh launch name must answer at each of these on its first query, within RESOLVE_WITHIN
+# seconds including the resolver's walk of the delegation: the coordinator serves the names
+# itself and publishes one only once it answers.
+PUBLIC_RESOLVERS = ("1.1.1.1", "8.8.8.8", "9.9.9.9")
+RESOLVE_WITHIN = 2.0
+DNS_PORT = 53
+
+
+def dns_query(name, qtype):
+    """A recursive query for name (RD set, EDNS0 with a 1232-byte payload); returns (id, packet)."""
+    ident = os.urandom(2)
+    packet = ident + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x01"
+    for label in name.rstrip(".").split("."):
+        if not 0 < len(label) < 64:
+            raise ValueError("invalid DNS name")
+        packet += bytes([len(label)]) + label.encode("ascii")
+    packet += b"\x00" + struct.pack(">HH", qtype, 1)
+    packet += b"\x00" + struct.pack(">HHIH", 41, 1232, 0, 0)
+    return ident, packet
+
+
+def skip_name(m, i):
+    for _ in range(128):
+        if i >= len(m):
+            raise ValueError("short DNS reply")
+        n = m[i]
+        if n & 0xC0 == 0xC0:
+            return i + 2
+        if n == 0:
+            return i + 1
+        if n > 63:
+            raise ValueError("invalid DNS name")
+        i += 1 + n
+    raise ValueError("invalid DNS name")
+
+
+def addresses(reply, ident, query, qtype):
+    """The qtype addresses of a resolver's reply to query; a failed, truncated or foreign reply raises."""
+    if len(reply) < 12 or reply[:2] != ident:
+        raise ValueError("not the reply to this query")
+    flags, qd, an = struct.unpack(">HHH", reply[2:8])
+    if not flags & 0x8000 or flags & 0x0200 or flags & 0xF:
+        raise AssertionError("the resolver did not answer the name")
+    question = query[12:len(query) - 11]
+    if qd != 1 or reply[12:12 + len(question)].lower() != question.lower():
+        raise ValueError("the reply is for another question")
+    i, found = 12 + len(question), []
+    for _ in range(an):
+        i = skip_name(reply, i)
+        if i + 10 > len(reply):
+            raise ValueError("short DNS reply")
+        kind, _, _, n = struct.unpack(">HHIH", reply[i:i + 10])
+        rdata = reply[i + 10:i + 10 + n]
+        if len(rdata) != n:
+            raise ValueError("short DNS reply")
+        if kind == qtype and n in (4, 16):
+            found.append(ipaddress.ip_address(rdata))
+        i += 10 + n
+    return found
+
+
+def resolve(resolver, name, qtype, timeout):
+    """One query to a public resolver; the addresses it answers within timeout seconds."""
+    ident, query = dns_query(name, qtype)
+    deadline = time.monotonic() + timeout
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect((resolver, DNS_PORT))
+        s.send(query)
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("a public resolver did not answer in time")
+            s.settimeout(left)
+            try:
+                reply = s.recv(4096)
+            except socket.timeout:
+                continue
+            if reply[:2] == ident:
+                return addresses(reply, ident, query, qtype)
+
+
+def prove_resolves(tile):
+    """Both of a fresh launch's names answer at every public resolver on the first query; the slowest, in s."""
+    slowest = 0.0
+    for key, qtype in (("frame_url", 28), ("frame_url_v4", 1)):
+        host = frame_host(tile[key])
+        for resolver in PUBLIC_RESOLVERS:
+            start = time.monotonic()
+            found = resolve(resolver, host, qtype, RESOLVE_WITHIN)
+            took = time.monotonic() - start
+            if not found or took > RESOLVE_WITHIN:
+                raise AssertionError("a fresh launch name did not resolve on its first query")
+            slowest = max(slowest, took)
+    return slowest
+
+
 def relaunch_interval_seconds():
     # The image and this probe come from the same commit. Read its server default
     # instead of copying a rate limit that could drift when the core changes.
@@ -245,8 +341,11 @@ def main():
             until(lambda s: ready(s, half, slot=old["slot"], after=old["generation"]))
             new = ready(state, half, slot=old["slot"], after=old["generation"])
             fresh(old, new)
+            # Before anything else looks the names up: each resolver's first query.
+            slowest = prove_resolves(new)
             prove_frame(new)
-            print(json.dumps({"half": half, "freshLaunchNames": True, "ipv4RendererFrames": True}), flush=True)
+            print(json.dumps({"half": half, "freshLaunchNames": True, "freshNamesResolved": True,
+                              "resolveMsMax": round(slowest * 1000), "ipv4RendererFrames": True}), flush=True)
     finally:
         connection.close()
 

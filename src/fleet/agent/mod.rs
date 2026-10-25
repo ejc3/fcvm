@@ -32,14 +32,78 @@ pub struct Agent {
     pub spot_notice_url: Option<String>,
     /// How often the spot notice URL is polled.
     pub spot_poll: Duration,
-    /// Run an aggregator for this host's band on this port, with this command
-    /// (`fcvm fleet aggregate ...`; `--listen` is added).
-    pub aggregate: Option<(u16, Vec<String>)>,
+    /// Run an aggregator for this host's band.
+    pub aggregate: Option<AggregateCfg>,
     /// A file the host's boot writes once its store is mounted; its modification time is
     /// reported in the hello.
     pub store_ready_file: Option<std::path::PathBuf>,
     /// The host's boot times, sent in every hello ([`boot_times`]).
     pub boot: BTreeMap<String, u64>,
+}
+
+/// The host's aggregator.
+#[derive(Debug, Clone)]
+pub struct AggregateCfg {
+    /// Its private listener (`--listen <publish ip>:<port>`): the layout, the stats, and the
+    /// stream for host-local readers.
+    pub port: u16,
+    /// The command (`fcvm fleet aggregate ...`; `--listen` and the TLS arguments are added).
+    pub argv: Vec<String>,
+    /// Serving browsers with TLS.
+    pub public: Option<AggregatePublic>,
+}
+
+/// Where the aggregator serves browsers, and what the agent reports of it.
+#[derive(Debug, Clone)]
+pub struct AggregatePublic {
+    /// The certificate file (the renderers' `tls.json`).
+    pub tls_file: std::path::PathBuf,
+    /// The IPv4 port, on the publish address.
+    pub v4_port: u16,
+    /// The host's public IPv4 address, reported with `v4_port`.
+    pub ipv4: Option<String>,
+    /// Its own IPv6 address, served on 443 (the host must hold it).
+    pub ipv6: Option<std::net::Ipv6Addr>,
+}
+
+impl AggregateCfg {
+    /// The aggregator's command with its listeners.
+    pub fn command(&self, publish_ip: &str) -> (Vec<String>, String) {
+        let listen = format!("{}:{}", bracket(publish_ip), self.port);
+        let mut argv = self.argv.clone();
+        if let Some(p) = &self.public {
+            argv.push("--tls-file".into());
+            argv.push(p.tls_file.to_string_lossy().into_owned());
+            argv.push("--tls-listen".into());
+            argv.push(format!("{}:{}", bracket(publish_ip), p.v4_port));
+            if let Some(a) = p.ipv6 {
+                argv.push("--tls-listen".into());
+                argv.push(format!("[{a}]:{}", tls::PORT));
+            }
+        }
+        (argv, listen)
+    }
+
+    /// The message that reports it serving.
+    pub fn report(&self, frame_url: String) -> AgentMsg {
+        let p = self.public.as_ref();
+        let ipv4 = p.and_then(|p| p.ipv4.clone());
+        AgentMsg::Aggregate {
+            frame_url,
+            ipv6: p.and_then(|p| p.ipv6).map(|a| a.to_string()),
+            v4_port: ipv4.as_ref().and(p.map(|p| p.v4_port)),
+            ipv4,
+        }
+    }
+}
+
+/// An IPv6 literal in brackets, for `<address>:<port>`.
+fn bracket(ip: &str) -> String {
+    if ip.contains(':') && !ip.starts_with('[') {
+        format!("[{ip}]")
+    } else {
+        ip.to_string()
+    }
 }
 
 /// The modification time of `path` in Unix milliseconds, if it exists.
@@ -152,10 +216,10 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             image: args.image,
             extra_args: fcvm_args,
             frame_host: args.frame_host.unwrap_or_else(|| args.publish_ip.clone()),
-            ipv6_prefix,
+            ipv6_prefix: ipv6_prefix.clone(),
             frame_zone: args.frame_zone,
             tls_publish_base: args.tls_publish_base,
-            public_ipv4,
+            public_ipv4: public_ipv4.clone(),
             publish_ip: args.publish_ip,
             sysfs_root: args.sysfs_root,
             start_timeout: Duration::from_secs(args.start_timeout_secs),
@@ -181,7 +245,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .as_deref(),
         ),
-        aggregate: args.aggregate_port.map(|p| {
+        aggregate: args.aggregate_port.map(|port| {
             let mut argv = vec![
                 std::env::current_exe()
                     .map(|e| e.to_string_lossy().into_owned())
@@ -190,9 +254,27 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
                 "aggregate".into(),
             ];
             argv.extend(args.aggregate_args.iter().cloned());
-            (p, argv)
+            AggregateCfg {
+                port,
+                argv,
+                public: args.aggregate_tls_port.map(|v4_port| AggregatePublic {
+                    tls_file: args.tls_dir.join(tls::FILE),
+                    v4_port,
+                    ipv4: public_ipv4.clone(),
+                    ipv6: ipv6_prefix.as_ref().map(addr::Prefix::aggregator_address),
+                }),
+            }
         }),
     };
+    // The aggregator listens on its own IPv6 address, so the host must hold it first.
+    if let Some(a) = agent
+        .aggregate
+        .as_ref()
+        .and_then(|a| a.public.as_ref())
+        .and_then(|p| p.ipv6)
+    {
+        addr::add_host_address(a).await?;
+    }
     let Some(url) = args.dial else {
         return serve(agent, tokio::io::stdin(), tokio::io::stdout()).await;
     };
@@ -303,18 +385,16 @@ where
     let (budget_tx, budget_rx) = watch::channel::<Option<BudgetBody>>(None);
     // The aggregator's layout follows the assignment and the scene.
     let (layout_tx, layout_rx) = watch::channel::<Option<Layout>>(None);
-    let aggregator = agent.aggregate.clone().map(|(port, argv)| {
-        let listen = format!("{}:{port}", cfg.publish_ip);
-        let url = slot::frame_url(&cfg.frame_host, port);
+    let aggregator = agent.aggregate.clone().map(|a| {
+        let (argv, listen) = a.command(&cfg.publish_ip);
+        let report = a.report(slot::frame_url(&cfg.frame_host, a.port));
         let out = out.clone();
         tokio::spawn(crate::fleet::aggregate::child::supervise(
             argv,
             listen,
             layout_rx,
             move || {
-                let _ = out.send(AgentMsg::Aggregate {
-                    frame_url: url.clone(),
-                });
+                let _ = out.send(report.clone());
             },
         ))
     });
@@ -345,6 +425,8 @@ where
             CoordMsg::Budget(b) => {
                 budget_tx.send_replace(Some(b));
             }
+            // The dialing connection keeps the replay (dial.rs); nothing to do here.
+            CoordMsg::QuarantineStored { .. } => {}
             CoordMsg::Assign {
                 slots: list,
                 region: r,
