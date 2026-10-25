@@ -336,19 +336,19 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   (`id`), with a label and this hold's votes; `holding` is the viewpoint held now (null
   while flying) and `next_hold_at` when the camera leaves it; `next` is the next hold once
   the vote has closed, `arrive_next_at` when the camera gets there.
-- `fleet.power` is whether the GPU capacity is up, when the coordinator owns the GPU hosts'
-  auto scaling groups (`--scale-group`), or with `--sleep-when-idle` on hosts it does not
-  scale (a fixed host, a test box); without either it stays `awake`. After
+- `fleet.power` is whether the GPU capacity is up, when the coordinator launches the GPU
+  hosts (`--host-template`), or with `--sleep-when-idle` on hosts it does not launch (a
+  fixed host, a test box); without either it stays `awake`. After
   `--idle-scale-down` seconds (default 600) with no active viewer (`viewers.active`), and
   never while a claim is active or a race is running, the fleet goes `asleep`
-  (`asleep_since`): every group is set to desired capacity 0, nothing is placed (every fcvm
+  (`asleep_since`): every GPU host is terminated, nothing is placed (every fcvm
   GPU still connected goes to standby, so its VM stops; the EC2 half's instances are
   terminated), no race is scheduled (`next_race_at` null) and
   `restart_now` is refused. Hosts that leave then are not reclaimed. When an active viewer
-  arrives it is `waking` from `woke_at`, the moment the wake began: every group goes back
-  to `--awake-capacity` (default 1) and the EC2 half launches as many tiles as the fcvm
+  arrives it is `waking` from `woke_at`, the moment the wake began: every host region gets
+  `--awake-capacity` hosts again (default 1) and the EC2 half launches as many tiles as the fcvm
   half had. `hosts` lists each GPU host by EC2 instance id with the phases it has reached,
-  in order: `instance_pending` and `booted` from the group (Pending, then InService),
+  in order: `instance_pending` and `booted` from EC2 (pending, then running),
   `store_ready` when the host marked its store mounted (the agent's hello reports it; the
   phase is absent when the host does not mark it), `agent_connected` when its agent says
   hello (the agent names itself by its instance id), `tiles_rendering` when all its placed
@@ -414,8 +414,8 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--race-every <secs>] [--restart-cooldown 60] [--camera-seed 1] [--max-borrowed <n>]
                  [--trust-cf-connecting-ip] [--turnstile-secret <secret> --turnstile-site-key <key>]
                  [--admin-listen <addr:port>] [--ffmpeg ffmpeg]
-                 [--scale-group <region>:<group name>]... [--awake-capacity 1] [--idle-scale-down 600]
-                 [--on-demand-group <region>:<group name>]... [--spot-wait 120]
+                 [--host-template <region>:<template>... --host-subnet <region>:<subnet id>...]
+                 [--awake-capacity 1] [--host-on-demand-max 8] [--idle-scale-down 600]
                  [--state-bucket <bucket> [--state-key state.json] [--state-region <region>]]
                  [--ec2 aws --ec2-tiles 8 --ec2-regions <r1,r2,...> [--ec2-template fcvm-fleet-tile-x86_64]
                   [--ec2-on-demand-template <name>] [--fleet-name stage]] [--dns-zone fcvm.dev]
@@ -474,35 +474,33 @@ removes the records. Its key is PKCS#8 (`PRIVATE KEY`), where issue-cert.sh wrot
 both are PEM that nginx and rustls read. Renderers get it from their agent
 (`--tls-secret`), tiles from their own instance role.
 
-- `--scale-group` hands the coordinator the GPU hosts' auto scaling groups (repeatable,
-  one per region); it sets their desired capacity (Auto Scaling `SetDesiredCapacity`) and,
-  while they come up, reads their instances (`DescribeAutoScalingGroups`) every 2 s, with the
-  credentials of its task or instance role. A call that fails marks the coordinator
-  degraded (`scale`) and is retried.
-- `--on-demand-group` names an on-demand group as the fallback of the `--scale-group` in its
-  region (at most one per region, and that region must have exactly one scale group). Auto
-  Scaling does not move a spot group's capacity to on demand by itself, so the coordinator
-  does: while the groups come up, when the spot group and its on-demand group together
-  have fewer live instances (any lifecycle state but `Terminating*`, `Terminated` and
-  `Detach*`) than `--awake-capacity`, and either Auto Scaling has recorded a failed launch
-  of the spot group since the wake raised it (`DescribeScalingActivities`, a `Failed`
-  activity, e.g. `UnfulfillableCapacity` or `MaxSpotInstanceCountExceeded`, about 10 s after
-  the raise) or they have stayed short for `--spot-wait` seconds (default 120; the only rule
-  when the activities cannot be read), it sets the on-demand group to the shortfall and the
-  spot group to the live instances it has, so a spot launch that succeeds later cannot add
-  a host. It logs which rule fell back (`spot launch failed; falling back to on-demand now`
-  with the activity's message, or `spot group still short after the spot wait`). The groups
-  come up from the wake (or the coordinator's start) until they hold `--awake-capacity`
-  instances in service, also after the fleet is `awake` (the EC2 half can complete the
-  image first); the coordinator then logs `wake: host capacity in service` with `path`
-  (`spot`, `on-demand`, or `spot and on-demand`). A split written only half way (one call failed) is
-  written again on every poll until both groups hold it, and `scale` stays degraded until
-  then. A group it cannot describe is not taken to be short. It never raises the on-demand
-  group otherwise, sets it to 0 with the spot group when the fleet sleeps, and the next
-  wake asks spot first. Before raising a spot group for a wake (also the first one after
-  the coordinator starts) it reads both groups' desired capacity: an on-demand group that
-  already holds hosts keeps them, and the spot group is held at the rest. The on-demand group's own `max_size` caps
-  what it can be given. The on-demand instances are listed with the spot ones in `hosts`.
+- `--host-template` names a GPU host launch template (`<region>:<template>`, repeatable;
+  the templates of a region are one request's pools, e.g. one per architecture), and
+  `--host-subnet` the subnets hosts may launch in (`<region>:<subnet id>`, repeatable, at
+  least one per region with a template). Both also come comma separated from
+  `FLEET_HOST_TEMPLATES` and `FLEET_HOST_SUBNETS`, and `--host-on-demand-max` from
+  `FLEET_HOST_ON_DEMAND_MAX`. The coordinator launches the hosts itself, with
+  the credentials of its task or instance role: a region with fewer pending or running
+  hosts than `--awake-capacity` asks EC2 for the shortfall on spot (`CreateFleet` of type
+  `instant` over every template and subnet of the region, `price-capacity-optimized`), and
+  when the answer refuses spot for capacity (`InsufficientInstanceCapacity`,
+  `MaxSpotInstanceCountExceeded`, `UnfulfillableCapacity`, `VcpuLimitExceeded`, ...) asks
+  for the rest on demand in the same pass (`spot launch refused; launching on demand now`
+  with the refusal), while the fleet runs fewer than `--host-on-demand-max` on-demand hosts
+  (default 8, at most 8) in all regions together. The on-demand hosts are counted only when
+  every region could be listed; otherwise no region falls back until it can. A region still
+  short asks again 10 s later, spot first. Each host is tagged `Purpose=fcvm-fleet-host`,
+  `Fleet=<--fleet-name>` and `Market=spot|on-demand`, and is found by those tags, so a
+  restarted coordinator keeps the hosts it finds. Asleep, every host of the fleet is
+  terminated; awake, a stopped host and a host over the awake capacity (on-demand first)
+  are terminated, and a host that is reclaimed or terminated is replaced. The regions are
+  listed (`DescribeInstances`) every 2 s while hosts come up or go away and every 15 s while
+  they run; an instance a launch named counts as pending until a list names it (60 s at
+  most). The coordinator logs `wake: host launch accepted` (`market`, `request_ms`, the
+  `CreateFleet` round trip), `wake: host running` (`request_to_running_ms`) and, once a
+  region runs its awake capacity, `wake: host capacity in service` with `path` (`spot`,
+  `on-demand`, or `spot and on-demand`) and `since_wake_ms`. A call that fails marks the
+  coordinator degraded (`scale`) and is retried at the next poll.
 - `--admin-listen` serves the operator's endpoint, `POST /quarantine/release` with
   `{"host": "<host>", "sbdf": "0000:05:00.0"}`, which returns a quarantined GPU to
   rotation. It has no authentication: keep it on loopback or a private network.

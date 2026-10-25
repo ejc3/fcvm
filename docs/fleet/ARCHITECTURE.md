@@ -77,7 +77,7 @@ coordinator (Rust, `fcvm fleet coord`)     v
    ^  wss, agents dial out                 |
    |                                       v
 agent (Rust, `fcvm fleet agent`)         renderer in the slot's VM (container, GPU)
-  one per GPU host: spot g4dn.metal / g5g.metal in auto scaling groups, several regions
+  one per GPU host: spot g4dn.metal / g5g.metal the coordinator launches, several regions
    |  spawns, supervises, tears down
    v
 fcvm snapshot run --snapshot <gold> --gpu <sbdf> --network routed --ipv6-address <slot addr>
@@ -125,12 +125,15 @@ stdio and ssh transports, so the three transports share one protocol and one tes
 
 ### Hosts and capacity
 
-The GPU hosts are spot instances in EC2 auto scaling groups, one group per region, each
-with a mixed instances policy over both bare-metal GPU types (g4dn.metal: x86, eight T4;
-g5g.metal: arm64, two T4G; fcvm needs `/dev/kvm`, so nothing smaller qualifies), every AZ
-the region offers, and the `price-capacity-optimized` allocation strategy. The groups run
-in us-east-2, us-west-2 and us-east-1, so one region losing spot capacity leaves the
-others. Each group's desired capacity is 1, so up to three hosts render at once; one host is
+The GPU hosts are spot instances the coordinator launches itself with EC2 Fleet
+(`CreateFleet`, type `instant`), one request per region over both bare-metal GPU types'
+launch templates (g4dn.metal: x86, eight T4; g5g.metal: arm64, two T4G; fcvm needs
+`/dev/kvm`, so nothing smaller qualifies), every AZ the region offers a host type in, and
+the `price-capacity-optimized` allocation strategy. When spot is refused for capacity the
+same pass launches on demand, at most 8 on-demand hosts across the fleet
+(fleet/PROTOCOL.md, `--host-template`). The regions are us-east-2, us-west-2 and us-east-1,
+so one region losing spot capacity leaves the others. Each region runs 1 host while the
+fleet is awake, so up to three hosts render at once; one host is
 enough to show the whole image, at coarser tiles. The account's G spot quota is 96 vCPUs per
 region (64 in us-east-1), which is one g4dn.metal or one g5g.metal, so three regions give
 up to three hosts; a quota increase raises it.
@@ -362,8 +365,8 @@ All of it is Terraform in ejc3/aws, applied by the jumpbox:
   security group allowing TCP 443 from `::/0` and nothing else inbound (no SSH; SSM for
   access).
 - **Hosts:** a launch template per region and architecture (the AMI, IOMMU kernel
-  arguments, `Ipv6PrefixCount = 1`, the instance role), and one spot auto scaling group per
-  region with the mixed instances policy above.
+  arguments, `Ipv6PrefixCount = 1`, the instance role), which the coordinator launches
+  from as above.
 - **AMI:** built by a pipeline from the fcvm release (fcvm, the gpu kernel and Firecracker,
   the driver image), one per architecture, copied to each region.
 - **Coordinator:** a dedicated ECS cluster, one Fargate service with the coordinator and a

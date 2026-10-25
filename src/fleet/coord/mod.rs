@@ -13,9 +13,9 @@ pub mod cert;
 pub mod dns;
 pub mod ec2;
 pub mod ec2_aws;
+pub mod hosts;
 pub mod live;
 pub mod poster;
-pub mod scale;
 pub mod secrets;
 pub mod sigv4;
 pub mod store;
@@ -649,7 +649,7 @@ pub fn start(
     store: Option<store::StoreTx>,
     ec2: Option<Arc<dyn ec2::Ec2Driver>>,
     ec2_aggregate_local: Option<String>,
-    power: Option<scale::PowerConfig>,
+    power: Option<hosts::HostConfig>,
     dns_writer: Option<dns::Cloudflare>,
 ) -> (Handle, tokio::task::JoinHandle<()>) {
     let (cmds, rx) = mpsc::channel(4096);
@@ -721,7 +721,7 @@ pub fn start(
         ));
     }
     if let Some(cfg) = power {
-        tokio::spawn(scale::run(cfg, power_rx, handle.clone()));
+        tokio::spawn(hosts::run(cfg, power_rx, handle.clone()));
     }
     if let Some((cf, _, rx)) = dns_out {
         tokio::spawn(dns::run(cf, rx, handle.clone()));
@@ -757,10 +757,10 @@ pub fn admin_router(handle: Handle) -> axum::Router {
         .with_state(handle)
 }
 
-/// Whether the fleet sleeps with no active viewer: it scales its host groups, or it was told
+/// Whether the fleet sleeps with no active viewer: it launches its GPU hosts, or it was told
 /// to sleep on fixed hosts.
 pub fn power_managed(args: &FleetCoordArgs) -> bool {
-    !args.scale_groups.is_empty() || args.sleep_when_idle
+    !args.host_templates.is_empty() || args.sleep_when_idle
 }
 
 pub async fn run(args: FleetCoordArgs) -> Result<()> {
@@ -848,19 +848,28 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             crate::fleet::aggregate::child::connect_addr(l)
         )
     });
-    let on_demand = scale::pair_on_demand(&args.scale_groups, &args.on_demand_groups)?;
-    let power = if args.scale_groups.is_empty() {
+    let power = if args.host_templates.is_empty() {
+        anyhow::ensure!(
+            args.host_subnets.is_empty(),
+            "--host-subnet needs a --host-template"
+        );
         None
     } else {
-        Some(scale::PowerConfig {
-            driver: Arc::new(scale::AwsAutoScaling::new()?),
-            groups: args.scale_groups.clone(),
+        let driver = hosts::AwsHosts::new(
+            &args.host_templates,
+            &args.host_subnets,
+            args.fleet_name.clone(),
+        )?;
+        Some(hosts::HostConfig {
+            regions: driver.regions(),
+            driver: Arc::new(driver),
             awake_capacity: args.awake_capacity,
-            // While the groups come up: a failed spot launch is seen at most 2 s after Auto
-            // Scaling records it. Two or three describe calls per poll, only then.
+            on_demand_max: args.host_on_demand_max,
+            // While hosts come up or go away: one DescribeInstances per region.
             poll: Duration::from_secs(2),
-            on_demand,
-            spot_wait: Duration::from_secs(args.spot_wait),
+            // While they run: a reclaimed spot host is replaced within this.
+            liveness: Duration::from_secs(15),
+            capacity_retry: Duration::from_secs(10),
         })
     };
     let secrets_region = || {
@@ -1032,12 +1041,30 @@ mod power_tests {
     }
 
     #[test]
-    fn the_fleet_sleeps_with_scale_groups_or_when_told_to() {
+    fn the_fleet_sleeps_with_host_templates_or_when_told_to() {
         assert!(!super::power_managed(&coord(&[])));
         assert!(super::power_managed(&coord(&["--sleep-when-idle"])));
         assert!(super::power_managed(&coord(&[
-            "--scale-group",
-            "us-east-1:fcvm-fleet-hosts"
+            "--host-template",
+            "us-east-1:fcvm-fleet-host-x86_64",
+            "--host-subnet",
+            "us-east-1:subnet-0123456789abcdef0"
         ])));
+    }
+
+    #[test]
+    fn the_on_demand_host_cap_is_at_most_eight() {
+        assert_eq!(coord(&[]).host_on_demand_max, 8);
+        assert_eq!(coord(&["--host-on-demand-max", "2"]).host_on_demand_max, 2);
+        let argv = [
+            "fcvm",
+            "fleet",
+            "coord",
+            "--listen",
+            "127.0.0.1:0",
+            "--host-on-demand-max",
+            "9",
+        ];
+        assert!(Cli::try_parse_from(argv).is_err());
     }
 }
