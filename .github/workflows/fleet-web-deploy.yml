@@ -69,8 +69,10 @@ jobs:
           rc=0
           out=$(curl -sS -o /dev/null --max-time 20 -w '%{http_code} %{redirect_url}' https://stage.fcvm.dev/ 2>&1) || rc=$?
           echo "stage.fcvm.dev: $out (curl exit $rc)"
-          case "$out" in
-            "302 https://"*".cloudflareaccess.com/"*) echo "behind Access" ;;
-            *"Could not resolve host"*) echo "no custom domain yet (ejc3/aws#627): not reachable" ;;
+          # Classified on the exit status too: the redirect passes only after a clean transfer
+          # (0), an unresolved host only as curl's own resolver error (6).
+          case "$rc:$out" in
+            "0:302 https://"*".cloudflareaccess.com/"*) echo "behind Access" ;;
+            "6:"*"Could not resolve host"*) echo "no custom domain yet (ejc3/aws#627): not reachable" ;;
             *) echo "::error::stage.fcvm.dev answered an unauthenticated request without Access: $out"; exit 1 ;;
           esac

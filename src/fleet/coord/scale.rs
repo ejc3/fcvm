@@ -10,6 +10,17 @@
 //! held at the instances it has, so a spot launch that succeeds later cannot double the
 //! hosts. The on-demand group is never raised otherwise, and goes to 0 with the spot group
 //! when the fleet sleeps; the next wake tries spot first again.
+//!
+//! The wait is a backstop. Auto Scaling records a refused spot launch as a failed scaling
+//! activity (`UnfulfillableCapacity`, `MaxSpotInstanceCountExceeded`) about 10 s after the
+//! desired capacity is raised, and keeps retrying spot without telling anyone, so a short
+//! spot group with a failed launch since the wake began falls back at the next poll.
+//!
+//! The groups are watched (polled, their instances reported, the fallback decided) while
+//! the fleet wakes and after, until they hold the awake capacity in service: the EC2 half
+//! can make the fleet awake before the GPU hosts are up (53 s into the staging wake of
+//! 2026-10-25), and a fallback decided only while waking then never came. Once in service
+//! the coordinator logs which path the wake's hosts took (spot, on demand or both).
 
 use super::aws::{xml_tag as tag, CredentialChain};
 use super::sigv4::{authorization, uri_encode};
@@ -51,6 +62,9 @@ pub trait ScaleDriver: Send + Sync {
     async fn instances(&self, group: &Group) -> Result<Vec<ScaleInstance>>;
     /// The group's desired capacity now.
     async fn desired(&self, group: &Group) -> Result<u32>;
+    /// The status messages of the group's failed scaling activities that started at or
+    /// after `since` (Unix milliseconds), newest first.
+    async fn failed_launches(&self, group: &Group, since: u64) -> Result<Vec<String>>;
 }
 
 /// The groups, their awake capacity, and how often to poll while waking.
@@ -62,7 +76,8 @@ pub struct PowerConfig {
     /// The on-demand fallback of each of `groups`, by index (`pair_on_demand`); a missing
     /// or `None` entry has none.
     pub on_demand: Vec<Option<Group>>,
-    /// How long a waking spot group may stay short before its on-demand group takes over.
+    /// How long a waking spot group may stay short before its on-demand group takes over,
+    /// when Auto Scaling has not reported a failed spot launch.
     pub spot_wait: Duration,
 }
 
@@ -116,10 +131,11 @@ impl Fallback {
     /// After a poll of a waking fleet: the desired capacities (spot, on-demand) to set.
     /// A split not yet fully set is asked for again whatever the instances are, so a write
     /// that failed half way is retried until both groups hold it. Otherwise, once the two
-    /// groups' live instances have stayed below `want` for `wait`, the spot group is held
-    /// at what it has and the on-demand group takes the rest, so the two never ask for
-    /// more than `want` together. `None` while they are not short, before `wait` has
-    /// passed, or when that split is already in force.
+    /// groups' live instances have stayed below `want` for `wait`, or at once when the spot
+    /// group reported a failed launch (`spot_failed`), the spot group is held at what it
+    /// has and the on-demand group takes the rest, so the two never ask for more than
+    /// `want` together. `None` while they are not short, before `wait` has passed without
+    /// a failed spot launch, or when that split is already in force.
     pub fn observe(
         &mut self,
         now: Instant,
@@ -127,6 +143,7 @@ impl Fallback {
         spot_live: u32,
         on_demand_live: u32,
         wait: Duration,
+        spot_failed: bool,
     ) -> Option<(u32, u32)> {
         if let Some(t) = self.pending() {
             return Some(t);
@@ -136,7 +153,7 @@ impl Fallback {
             return None;
         }
         let since = *self.short_since.get_or_insert(now);
-        if now.duration_since(since) < wait {
+        if now.duration_since(since) < wait && !spot_failed {
             return None;
         }
         let target = (spot_live, want - spot_live);
@@ -171,12 +188,16 @@ impl Fallback {
 
 /// Follow the fleet's power state: set every group's desired capacity on each change
 /// (0 asleep, `awake_capacity` otherwise; on-demand groups 0 asleep and untouched
-/// otherwise), report the groups' instances while waking, and fall back to on-demand
-/// groups as the module says.
+/// otherwise), watch the groups while they come up, report their instances, and fall back
+/// to on-demand groups as the module says.
 pub async fn run(cfg: PowerConfig, mut power: watch::Receiver<String>, handle: Handle) {
     let on_demand = |i: usize| cfg.on_demand.get(i).cloned().flatten();
     let mut set: Option<u32> = None;
     let mut fallbacks: Vec<Fallback> = cfg.groups.iter().map(|_| Fallback::default()).collect();
+    // Per group: whether it is still coming up (watched until its live instances, with its
+    // on-demand group's, hold the awake capacity in service), and since when (Unix ms) a
+    // failed launch counts toward its fallback.
+    let mut watch: Vec<Watch> = cfg.groups.iter().map(|_| Watch::default()).collect();
     // A degraded `scale` was reported and not cleared yet.
     let mut reported = false;
     loop {
@@ -194,6 +215,15 @@ pub async fn run(cfg: PowerConfig, mut power: watch::Receiver<String>, handle: H
             let mut ok = true;
             if want == 0 {
                 fallbacks.iter_mut().for_each(|f| *f = Fallback::default());
+                watch.iter_mut().for_each(|w| *w = Watch::default());
+            } else {
+                let since = unix_ms().saturating_sub(CLOCK_SLACK_MS);
+                watch.iter_mut().for_each(|w| {
+                    if !w.up {
+                        w.coming_up = true;
+                        w.since.get_or_insert(since);
+                    }
+                });
             }
             for (i, g) in cfg.groups.iter().enumerate() {
                 let od = on_demand(i);
@@ -239,50 +269,97 @@ pub async fn run(cfg: PowerConfig, mut power: watch::Receiver<String>, handle: H
                 newly_set = true;
             }
         }
+        let mut watching = false;
         if state != "asleep" {
-            let waking = state == "waking";
             let mut all = Vec::new();
+            let mut polled = false;
             for (i, g) in cfg.groups.iter().enumerate() {
                 let od = on_demand(i);
                 let mut target = fallbacks[i].pending();
-                if waking {
-                    let spot_live = match cfg.driver.instances(g).await {
-                        Ok(i) => {
-                            let n = i.iter().filter(|i| is_live(i)).count() as u32;
-                            all.extend(i);
-                            Some(n)
-                        }
+                if state == "waking" || watch[i].coming_up {
+                    polled = true;
+                    let spot = match cfg.driver.instances(g).await {
+                        Ok(i) => Some(i),
                         Err(e) => {
                             tracing::warn!(group = %g.name, error = %format!("{e:#}"), "describing the group failed");
                             None
                         }
                     };
-                    // A group that cannot be described is not known to be short: no new
-                    // fallback (a split already decided is still written).
-                    let od_live = match &od {
+                    let od_instances = match &od {
                         Some(od) => match cfg.driver.instances(od).await {
-                            Ok(i) => {
-                                let n = i.iter().filter(|i| is_live(i)).count() as u32;
-                                all.extend(i);
-                                Some(n)
-                            }
+                            Ok(i) => Some(i),
                             Err(e) => {
                                 tracing::warn!(group = %od.name, error = %format!("{e:#}"), "describing the group failed");
                                 None
                             }
                         },
-                        None => None,
+                        None => Some(Vec::new()),
                     };
-                    if let (Some(s), Some(o)) = (spot_live, od_live) {
-                        target = fallbacks[i].observe(
-                            Instant::now(),
-                            cfg.awake_capacity,
-                            s,
-                            o,
-                            cfg.spot_wait,
-                        );
+                    // A group that cannot be described is not known to be short: no new
+                    // fallback (a split already decided is still written).
+                    if let (Some(s), Some(o)) = (&spot, &od_instances) {
+                        let live =
+                            |v: &[ScaleInstance]| v.iter().filter(|i| is_live(i)).count() as u32;
+                        let serving = |v: &[ScaleInstance]| {
+                            v.iter().filter(|i| i.lifecycle == "InService").count() as u32
+                        };
+                        let (s_live, o_live) = (live(s), live(o));
+                        let (s_in, o_in) = (serving(s), serving(o));
+                        if s_in + o_in >= cfg.awake_capacity {
+                            if watch[i].coming_up {
+                                tracing::info!(
+                                    spot_group = %g.name, region = %g.region,
+                                    path = path_name(s_in, o_in),
+                                    spot = s_in, on_demand = o_in,
+                                    since_wake_ms = watch[i].since.map(|t| unix_ms().saturating_sub(t + CLOCK_SLACK_MS)),
+                                    "wake: host capacity in service"
+                                );
+                            }
+                            watch[i].coming_up = false;
+                            watch[i].up = true;
+                        } else {
+                            watch[i].up = false;
+                        }
+                        if let Some(od) = &od {
+                            let short = s_live + o_live < cfg.awake_capacity;
+                            let spot_failed = if short && fallbacks[i].target.is_none() {
+                                watch[i].spot_failure(&*cfg.driver, g).await
+                            } else {
+                                None
+                            };
+                            let failed = spot_failed.is_some();
+                            let decided = fallbacks[i].target;
+                            target = fallbacks[i].observe(
+                                Instant::now(),
+                                cfg.awake_capacity,
+                                s_live,
+                                o_live,
+                                cfg.spot_wait,
+                                failed,
+                            );
+                            if let Some((spot_to, od_to)) = target {
+                                if fallbacks[i].target != decided {
+                                    match &spot_failed {
+                                        Some(why) => tracing::warn!(
+                                            spot_group = %g.name, on_demand_group = %od.name,
+                                            spot = spot_to, on_demand = od_to, reason = %why,
+                                            "spot launch failed; falling back to on-demand now"
+                                        ),
+                                        None => tracing::warn!(
+                                            spot_group = %g.name, on_demand_group = %od.name,
+                                            spot = spot_to, on_demand = od_to,
+                                            spot_wait_s = cfg.spot_wait.as_secs(),
+                                            "spot group still short after the spot wait; falling back to on-demand"
+                                        ),
+                                    }
+                                }
+                            }
+                        }
                     }
+                    all.extend(spot.unwrap_or_default());
+                    all.extend(od_instances.unwrap_or_default());
                 }
+                watching |= watch[i].coming_up;
                 let (Some(od), Some((spot_to, od_to))) = (od, target) else {
                     continue;
                 };
@@ -306,7 +383,7 @@ pub async fn run(cfg: PowerConfig, mut power: watch::Receiver<String>, handle: H
                     fallbacks[i].applied((spot_to, od_to));
                 }
             }
-            if waking {
+            if polled {
                 handle
                     .send(Event::ScaleInstances {
                         at: 0,
@@ -322,7 +399,7 @@ pub async fn run(cfg: PowerConfig, mut power: watch::Receiver<String>, handle: H
             healthy(&handle).await;
         }
         // A failed set is retried on the next poll.
-        let wait = if state == "waking" || set != Some(want) || pending {
+        let wait = if state == "waking" || watching || set != Some(want) || pending {
             cfg.poll
         } else {
             Duration::from_secs(3600)
@@ -330,6 +407,59 @@ pub async fn run(cfg: PowerConfig, mut power: watch::Receiver<String>, handle: H
         tokio::select! {
             r = power.changed() => if r.is_err() { return },
             _ = tokio::time::sleep(wait) => {}
+        }
+    }
+}
+
+/// How far before the coordinator's own clock a failed activity still counts as this
+/// wake's: Auto Scaling stamps it after the desired capacity was raised, so this only
+/// absorbs the difference between the two clocks.
+const CLOCK_SLACK_MS: u64 = 2000;
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Which groups a wake's in-service hosts came from.
+pub fn path_name(spot: u32, on_demand: u32) -> &'static str {
+    match (spot > 0, on_demand > 0) {
+        (true, false) => "spot",
+        (false, true) => "on-demand",
+        (true, true) => "spot and on-demand",
+        (false, false) => "none",
+    }
+}
+
+/// One spot group's progress through a wake.
+#[derive(Debug, Default)]
+struct Watch {
+    /// Raised for the wake and not yet holding the awake capacity in service.
+    coming_up: bool,
+    /// Held the awake capacity in service at the last poll.
+    up: bool,
+    /// Failed activities from this time on (Unix ms) count toward the fallback.
+    since: Option<u64>,
+    /// Reading the activities failed once and was logged (a role without
+    /// DescribeScalingActivities); the spot wait still applies.
+    warned: bool,
+}
+
+impl Watch {
+    /// The newest failed launch of the spot group since the wake began, if any.
+    async fn spot_failure(&mut self, driver: &dyn ScaleDriver, g: &Group) -> Option<String> {
+        let since = self.since?;
+        match driver.failed_launches(g, since).await {
+            Ok(f) => f.into_iter().next(),
+            Err(e) => {
+                if !self.warned {
+                    self.warned = true;
+                    tracing::warn!(group = %g.name, error = %format!("{e:#}"), "reading the group's scaling activities failed; falling back only after the spot wait");
+                }
+                None
+            }
         }
     }
 }
@@ -471,6 +601,42 @@ impl ScaleDriver for AwsAutoScaling {
             .await?;
         parse_desired(&xml).with_context(|| format!("no desired capacity for group {}", group.name))
     }
+
+    async fn failed_launches(&self, group: &Group, since: u64) -> Result<Vec<String>> {
+        let xml = self
+            .call(
+                &group.region,
+                &[
+                    ("Action", "DescribeScalingActivities".into()),
+                    ("AutoScalingGroupName", group.name.clone()),
+                    ("MaxRecords", "20".into()),
+                ],
+            )
+            .await?;
+        Ok(parse_failed_activities(&xml, since))
+    }
+}
+
+/// The failed activities of a DescribeScalingActivities answer that started at or after
+/// `since` (Unix ms): each one's `StatusMessage` (its `Description` when it has none), in
+/// the answer's order (newest first). An activity whose `StartTime` does not parse is left
+/// out: it cannot be placed in this wake.
+pub fn parse_failed_activities(xml: &str, since: u64) -> Vec<String> {
+    let Some(start) = xml.find("<Activities>") else {
+        return Vec::new();
+    };
+    let body = &xml[start..];
+    let body = &body[..body.find("</Activities>").unwrap_or(body.len())];
+    body.split("<member>")
+        .skip(1)
+        .filter(|m| tag(m, "StatusCode").as_deref() == Some("Failed"))
+        .filter(|m| {
+            tag(m, "StartTime")
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+                .is_some_and(|t| t.timestamp_millis() >= since as i64)
+        })
+        .filter_map(|m| tag(m, "StatusMessage").or_else(|| tag(m, "Description")))
+        .collect()
 }
 
 /// The desired capacity of a DescribeAutoScalingGroups answer naming one group.
@@ -510,6 +676,8 @@ pub struct FakeScale {
     pub by_group: Mutex<HashMap<String, Vec<ScaleInstance>>>,
     pub desired: Mutex<HashMap<String, u32>>,
     pub fail_sets: Mutex<Vec<(String, u32)>>,
+    /// Each group's failed launches: (start time in Unix ms, status message).
+    pub failed: Mutex<HashMap<String, Vec<(u64, String)>>>,
 }
 
 #[async_trait]
@@ -549,6 +717,20 @@ impl ScaleDriver for FakeScale {
             .get(&group.name)
             .copied()
             .unwrap_or(0))
+    }
+    async fn failed_launches(&self, group: &Group, since: u64) -> Result<Vec<String>> {
+        Ok(self
+            .failed
+            .lock()
+            .unwrap()
+            .get(&group.name)
+            .map(|v| {
+                v.iter()
+                    .filter(|(t, _)| *t >= since)
+                    .map(|(_, m)| m.clone())
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 }
 
@@ -638,20 +820,20 @@ mod tests {
         let mut f = Fallback::default();
         let t0 = Instant::now();
         // Short, but not for the whole wait yet.
-        assert_eq!(f.observe(t0, 1, 0, 0, wait), None);
+        assert_eq!(f.observe(t0, 1, 0, 0, wait, false), None);
         assert_eq!(
-            f.observe(t0 + Duration::from_secs(119), 1, 0, 0, wait),
+            f.observe(t0 + Duration::from_secs(119), 1, 0, 0, wait, false),
             None
         );
         // Short for the wait: hold spot at what it has, on-demand takes the rest.
-        assert_eq!(f.observe(t0 + wait, 1, 0, 0, wait), Some((0, 1)));
+        assert_eq!(f.observe(t0 + wait, 1, 0, 0, wait, false), Some((0, 1)));
         // Not applied (the call failed): asked again.
-        assert_eq!(f.observe(t0 + wait, 1, 0, 0, wait), Some((0, 1)));
+        assert_eq!(f.observe(t0 + wait, 1, 0, 0, wait, false), Some((0, 1)));
         f.applied((0, 1));
         // Applied, and the on-demand launch fails too: never more than the shortfall.
-        assert_eq!(f.observe(t0 + 10 * wait, 1, 0, 0, wait), None);
+        assert_eq!(f.observe(t0 + 10 * wait, 1, 0, 0, wait, false), None);
         // The on-demand host arrives: not short.
-        assert_eq!(f.observe(t0 + 11 * wait, 1, 0, 1, wait), None);
+        assert_eq!(f.observe(t0 + 11 * wait, 1, 0, 1, wait, false), None);
     }
 
     #[tokio::test(start_paused = true)]
@@ -659,15 +841,18 @@ mod tests {
         let wait = Duration::from_secs(120);
         let mut f = Fallback::default();
         let t0 = Instant::now();
-        assert_eq!(f.observe(t0, 2, 0, 0, wait), None);
-        assert_eq!(f.observe(t0 + Duration::from_secs(60), 2, 2, 0, wait), None);
+        assert_eq!(f.observe(t0, 2, 0, 0, wait, false), None);
+        assert_eq!(
+            f.observe(t0 + Duration::from_secs(60), 2, 2, 0, wait, false),
+            None
+        );
         // Short again later: the wait starts over.
         assert_eq!(
-            f.observe(t0 + Duration::from_secs(200), 2, 1, 0, wait),
+            f.observe(t0 + Duration::from_secs(200), 2, 1, 0, wait, false),
             None
         );
         assert_eq!(
-            f.observe(t0 + Duration::from_secs(200) + wait, 2, 1, 0, wait),
+            f.observe(t0 + Duration::from_secs(200) + wait, 2, 1, 0, wait, false),
             Some((1, 1))
         );
     }
@@ -677,16 +862,67 @@ mod tests {
         let wait = Duration::from_secs(120);
         let mut f = Fallback::default();
         let t0 = Instant::now();
-        assert_eq!(f.observe(t0, 1, 0, 0, wait), None);
-        assert_eq!(f.observe(t0 + wait, 1, 0, 0, wait), Some((0, 1)));
+        assert_eq!(f.observe(t0, 1, 0, 0, wait, false), None);
+        assert_eq!(f.observe(t0 + wait, 1, 0, 0, wait, false), Some((0, 1)));
         // The on-demand write landed and its instance is pending, but holding the spot
         // group failed: the two groups together are not short any more, and the spot
         // group would still launch. The split is asked for again until it is applied.
-        assert_eq!(f.observe(t0 + wait, 1, 0, 1, wait), Some((0, 1)));
+        assert_eq!(f.observe(t0 + wait, 1, 0, 1, wait, false), Some((0, 1)));
         assert_eq!(f.pending(), Some((0, 1)));
         f.applied((0, 1));
         assert_eq!(f.pending(), None);
-        assert_eq!(f.observe(t0 + 2 * wait, 1, 0, 1, wait), None);
+        assert_eq!(f.observe(t0 + 2 * wait, 1, 0, 1, wait, false), None);
+    }
+
+    /// A DescribeScalingActivities answer as Auto Scaling gave it for the staging spot group
+    /// (2026-10-25, instance ids replaced): failed launches since the wake began, newest
+    /// first, and nothing older or successful.
+    #[test]
+    fn failed_spot_launches_parse_from_the_scaling_activities() {
+        let xml = r#"<DescribeScalingActivitiesResponse xmlns="http://autoscaling.amazonaws.com/doc/2011-01-01/">
+  <DescribeScalingActivitiesResult><Activities>
+    <member><ActivityId>a3</ActivityId><AutoScalingGroupName>fleet-hosts</AutoScalingGroupName>
+      <Description>Launching a new EC2 instance.  Status Reason: Could not launch Spot Instances. MaxSpotInstanceCountExceeded - Max spot instance count exceeded. Launching EC2 instance failed.</Description>
+      <StatusCode>Failed</StatusCode><StatusMessage>Could not launch Spot Instances. MaxSpotInstanceCountExceeded - Max spot instance count exceeded. Launching EC2 instance failed.</StatusMessage>
+      <StartTime>2026-10-25T05:40:11.080Z</StartTime><Progress>100</Progress></member>
+    <member><ActivityId>a2</ActivityId><Description>Launching a new EC2 instance: i-0123456789abcdef0</Description>
+      <StatusCode>Successful</StatusCode><StartTime>2026-10-25T05:23:37.888Z</StartTime></member>
+    <member><ActivityId>a1</ActivityId><Description>Launching a new EC2 instance.  Status Reason: Could not launch Spot Instances. UnfulfillableCapacity - Unable to fulfill capacity due to your request configuration. Please adjust your request and try again. Launching EC2 instance failed.</Description>
+      <StatusCode>Failed</StatusCode><StartTime>2026-10-25T05:23:26.582Z</StartTime></member>
+    <member><ActivityId>a0</ActivityId><StatusCode>Failed</StatusCode><StatusMessage>before the wake</StatusMessage>
+      <StartTime>2026-10-24T21:57:06.649Z</StartTime></member>
+  </Activities></DescribeScalingActivitiesResult></DescribeScalingActivitiesResponse>"#;
+        let since = chrono::DateTime::parse_from_rfc3339("2026-10-25T05:23:19Z")
+            .unwrap()
+            .timestamp_millis() as u64;
+        let got = parse_failed_activities(xml, since);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got[0].starts_with("Could not launch Spot Instances. MaxSpot"));
+        // No StatusMessage: the description stands in.
+        assert!(got[1].contains("UnfulfillableCapacity"));
+        assert!(parse_failed_activities("<Activities/>", 0).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_spot_launch_falls_back_without_the_wait() {
+        let wait = Duration::from_secs(120);
+        let mut f = Fallback::default();
+        let t0 = Instant::now();
+        assert_eq!(f.observe(t0, 1, 0, 0, wait, false), None);
+        assert_eq!(
+            f.observe(t0 + Duration::from_secs(12), 1, 0, 0, wait, true),
+            Some((0, 1))
+        );
+        // Not short: a failure (a rebalance launch while the host runs) changes nothing.
+        let mut g = Fallback::default();
+        assert_eq!(g.observe(t0, 1, 1, 0, wait, true), None);
+    }
+
+    #[test]
+    fn the_path_names_the_groups_the_hosts_came_from() {
+        assert_eq!(path_name(1, 0), "spot");
+        assert_eq!(path_name(0, 1), "on-demand");
+        assert_eq!(path_name(1, 1), "spot and on-demand");
     }
 
     #[test]

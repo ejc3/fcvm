@@ -196,6 +196,7 @@ jobs:
       - name: Run the bench harness test suite
         run: |
           python3 -m unittest discover -s bench/chromium -p 'test_*.py' -v
+          python3 -m unittest discover -s bench/gpu-restore -p 'test_*.py' -v
 
   # The fleet web page (fleet/web): lint, the core's purity rules, unit tests, the
   # Next.js build, and Playwright (Chromium and WebKit) against the mock fleet,
