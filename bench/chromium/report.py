@@ -163,15 +163,57 @@ def read_meminfo():
     return mi
 
 
+def process_state(pid):
+    """The state letter in /proc/<pid>/stat, or None when the process is gone."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return None
+
+
 def pss_kb_of_pid(pid):
+    """PSS of one process, from its smaps_rollup.
+
+    pasta makes itself non-dumpable, so its /proc files belong to root and
+    the invoking user is refused even though it owns the process: the memory
+    phase's first 48-clone cell stopped on "cannot read
+    /proc/<pasta>/smaps_rollup: [Errno 13] Permission denied". The phase
+    already requires passwordless sudo, so a refused read is retried as
+    `sudo -n cat` of the same file.
+    """
     path = f"/proc/{pid}/smaps_rollup"
     try:
         with open(path) as f:
-            for line in f:
-                if line.startswith("Pss:"):
-                    return int(line.split()[1])
-    except (OSError, ValueError) as exc:
+            text = f.read()
+    except PermissionError as exc:
+        try:
+            result = subprocess.run(["sudo", "-n", "cat", path], capture_output=True,
+                                    text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as sudo_exc:
+            raise CgroupReadError(f"cannot read {path}: {exc}; sudo: {sudo_exc}") from exc
+        if result.returncode != 0:
+            raise CgroupReadError(
+                f"cannot read {path}: {exc}; sudo cat exited {result.returncode}: "
+                f"{result.stderr.strip()}") from exc
+        text = result.stdout
+    except (ProcessLookupError, FileNotFoundError) as exc:
+        # A zombie has released its address space, so it holds no pages and
+        # its PSS is zero: smaps_rollup answers ESRCH while it waits to be
+        # reaped, which can outlast every re-read (2026-10-22: one zombie in
+        # a clone's cgroup failed 20 reads over a second). Any other exit
+        # means the set is changing, and the caller reads the cgroup again.
+        if process_state(pid) in ("Z", "X"):
+            return 0
+        raise ProcessGone(f"cannot read {path}: {exc}") from exc
+    except OSError as exc:
         raise CgroupReadError(f"cannot read {path}: {exc}") from exc
+    for line in text.splitlines():
+        if line.startswith("Pss:"):
+            try:
+                return int(line.split()[1])
+            except (IndexError, ValueError) as exc:
+                raise CgroupReadError(f"cannot read {path}: {exc}") from exc
     raise CgroupReadError(f"cannot read {path}: no Pss field")
 
 
@@ -187,6 +229,14 @@ def pss_kb_of_pid(pid):
 
 class CgroupReadError(RuntimeError):
     """A cgroup basis could not be read completely."""
+
+
+class CgroupMoved(CgroupReadError):
+    """The process set changed while it was read."""
+
+
+class ProcessGone(CgroupReadError):
+    """A process exited while its memory was read."""
 
 
 def cgroup_bytes(cg_path):
@@ -258,24 +308,54 @@ def cgroup_stat(cg_path):
     return out
 
 
+# A clone's process set is not static: fcvm's health monitor runs `fcvm exec
+# ... podman inspect` in each clone's cgroup every 10 s. With 96 clones a sample
+# overlapped one on 2026-10-22 and the memory phase stopped on "process set
+# changed in .../req-fcvm96r4-23 while it was sampled: [... 4 pids] -> [... 5]".
+# A read whose set moved is taken again, a bounded number of times.
+STABLE_READ_ATTEMPTS = 20
+STABLE_READ_PAUSE_S = 0.05
+
+
 def measure_complete_cgroup(cg_path, with_stat=True):
-    """Read both bases over one process set that stayed unchanged."""
+    """Read both bases over one process set that stayed unchanged.
+
+    A read during which the set changed, or one of its processes exited, is
+    repeated up to STABLE_READ_ATTEMPTS times; a set still moving after that
+    refuses the sample.
+    """
+    for attempt in range(STABLE_READ_ATTEMPTS):
+        try:
+            return _measure_complete_cgroup_once(cg_path, with_stat)
+        except CgroupMoved:
+            if attempt == STABLE_READ_ATTEMPTS - 1:
+                raise
+            time.sleep(STABLE_READ_PAUSE_S)
+
+
+def _measure_complete_cgroup_once(cg_path, with_stat):
     if not os.path.isdir(cg_path):
         raise CgroupReadError(f"cgroup disappeared before it was sampled: {cg_path}")
     before = cgroup_procs(cg_path)
     if not before:
         after = cgroup_procs(cg_path)
         if after:
-            raise CgroupReadError(
+            raise CgroupMoved(
                 f"process set changed in {cg_path} while it was sampled: [] -> {after}")
         raise CgroupReadError(
             f"owned cgroup {cg_path} has no processes; zero is not a complete sample")
     current = cgroup_bytes(cg_path)
-    pss = sum(pss_kb_of_pid(pid) for pid in before)
+    try:
+        pss = sum(pss_kb_of_pid(pid) for pid in before)
+    except CgroupReadError as exc:
+        if isinstance(exc, ProcessGone) or sorted(cgroup_procs(cg_path)) != sorted(before):
+            raise CgroupMoved(
+                f"process set changed in {cg_path} while it was sampled: {exc}") from exc
+        raise
     stat = cgroup_stat(cg_path) if with_stat else {}
     after = cgroup_procs(cg_path)
     if sorted(before) != sorted(after):
-        raise CgroupReadError(
+        raise CgroupMoved(
             f"process set changed in {cg_path} while it was sampled: "
             f"{sorted(before)} -> {sorted(after)}")
     return before, current, pss, stat

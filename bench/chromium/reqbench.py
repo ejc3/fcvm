@@ -763,6 +763,68 @@ def pidfd_open(pid: int):
     return fd
 
 
+PR_SET_CHILD_SUBREAPER = 36
+
+
+def become_child_subreaper() -> bool:
+    """Make this process the reaper of its descendants' orphans.
+
+    fcvm's children (Firecracker, the namespace holder, pasta) outlive a
+    SIGKILLed fcvm by a moment, and without a subreaper init adopts and reaps
+    them, often before teardown_fast's 200 us sampler reads their final CPU
+    from the zombie. Those readings were lower bounds: in the first fast-arm
+    corpus run on 2026-10-22, most requests had at least one. As the
+    subreaper, the harness adopts them instead, each stays a zombie until
+    reap_pinned_children() collects it, and every final reading is complete.
+    """
+    return _libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
+
+
+def reap_pinned_children(fds: dict) -> dict:
+    """Collect each pinned, exited child this process adopted; never fcvm.
+
+    {name: "reaped" | "running" | "not-ours"}. "not-ours" means the process is
+    not this process's child (no subreaper, or another reaper got it first).
+    """
+    outcome = {}
+    for name, fd in fds.items():
+        if fd is None:
+            continue
+        try:
+            result = os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG)
+        except ChildProcessError:
+            outcome[name] = "not-ours"
+            continue
+        outcome[name] = "running" if result is None else "reaped"
+    return outcome
+
+
+def reap_adopted_zombies(exclude=()) -> int:
+    """Collect zombies this process adopted outside a fast teardown.
+
+    Only a zombie (state Z) whose parent is this process and whose PID is not
+    in exclude, so no live Popen's status is taken. Returns how many.
+    """
+    me = os.getpid()
+    reaped = 0
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) in exclude:
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        if fields[0] != "Z" or int(fields[1]) != me:
+            continue
+        try:
+            if os.waitpid(int(entry), os.WNOHANG)[0]:
+                reaped += 1
+        except ChildProcessError:
+            pass
+    return reaped
+
+
 def pidfd_send_signal(fd: int, sig: int) -> None:
     """Signal the exact process pinned by ``fd``; a recycled PID is irrelevant."""
     result = _libc.syscall(
@@ -2284,6 +2346,7 @@ def measure_fast_reap(
         # the exact owner set terminal, retain its durable disk pointer, and let
         # the caller emit a structured abort instead of stranding a stopped VM.
         abort_frozen_owner(fcvm_pid, parent_fd, list(fds.values()))
+        reap_pinned_children(fds)
         close_pidfds(all_fds)
         raise
 
@@ -2324,6 +2387,7 @@ def teardown_fast(
             )
     except (RuntimeError, OSError) as error:
         terminal = abort_frozen_owner(fcvm_pid, parent_fd, captured_fds)
+        reap_pinned_children(dict(enumerate(captured_fds)))
         close_pidfds([parent_fd, *captured_fds])
         out["child_attribution_established"] = False
         out["all_gone"] = terminal
@@ -2348,6 +2412,7 @@ def teardown_fast(
         sampled["fcvm"] = fcvm_pid
     except BaseException as error:
         abort_frozen_owner(fcvm_pid, parent_fd, captured_fds)
+        reap_pinned_children(dict(enumerate(captured_fds)))
         close_pidfds([parent_fd, *captured_fds])
         out["child_attribution_established"] = False
         out["disk_reap_skipped"] = True
@@ -2518,6 +2583,7 @@ def teardown_fast(
             except (ProcessLookupError, PermissionError, OSError):
                 pass
         wait_pidfds([parent_fd, *fds.values()], 10.0)
+        out["children_reaped"] = reap_pinned_children(fds)
         close_pidfds([parent_fd, *fds.values()])
         out["teardown_total_ms"] = (time.monotonic() - t_kill) * 1000
         raise SurvivedTeardown(
@@ -2525,6 +2591,7 @@ def teardown_fast(
             f"{timeout_s:.1f}s; state {state_path} and data {data_dir} NOT reaped",
             out,
         )
+    out["children_reaped"] = reap_pinned_children(fds)
     close_pidfds([parent_fd, *fds.values()])
 
     t_disk = time.monotonic()
@@ -4602,6 +4669,9 @@ def main_with_resources(resources: ExitStack) -> int:
     args = p.parse_args()
     signal.signal(signal.SIGINT, record_harness_interrupt)
     signal.signal(signal.SIGTERM, record_harness_interrupt)
+    # Adopt fcvm's orphans so a fast teardown reads each one's final CPU
+    # from its zombie (become_child_subreaper).
+    child_subreaper = become_child_subreaper()
     # The harness owns these handlers.  Do not inherit a caller's blocked mask:
     # every clone and the harness itself must be able to observe shutdown.
     signal.pthread_sigmask(signal.SIG_UNBLOCK, TERMINATION_SIGNALS)
@@ -4824,6 +4894,7 @@ def main_with_resources(resources: ExitStack) -> int:
             "quiet_loadavg1_limit": quiet_loadavg1_limit,
             **host_identity(),
             "host": host_facts(),
+            "child_subreaper": child_subreaper,
             # The memory server's own ready record says whether it records
             # and replays the working set; null for a file-backed restore.
             "uffd_prefetch": (
@@ -4876,6 +4947,10 @@ def main_with_resources(resources: ExitStack) -> int:
                 }
                 fatal = e
             rec["warmup"] = is_warmup  # discarded explicitly at analysis, never silently
+            # Anything else the harness adopted during this request (an fcvm
+            # child that outlived a normal teardown) is collected here, after
+            # the request's own processes have been waited.
+            rec["adopted_zombies_reaped"] = reap_adopted_zombies()
             rec["url"] = url_for_rep(getattr(args, "urls", None) or [args.url], rep)
             rec["run_id"] = run_id
             rec["record_id"] = f"{run_id}:{arm}:{rep}:{int(is_warmup)}"

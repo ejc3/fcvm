@@ -930,18 +930,22 @@ fi
 #   REFUSING: box is busy (load=2.41, 0 firecracker/fcvm)
 # Wait for the average to decay instead. 1.5 leaves margin under the gate, and
 # the wait is bounded so a genuinely busy box still fails rather than hanging.
-settle_deadline=$(( $(date +%s) + 900 ))
-while :; do
-    load1=$(awk '{print $1}' "$LOADAVG_FILE")
-    if awk -v l="$load1" 'BEGIN{exit !(l < 1.5)}'; then break; fi
-    if [ "$(date +%s)" -ge "$settle_deadline" ]; then
-        echo "BLOCKED: load stayed at $load1 for 15 min; refusing to measure on a busy box" >&2
-        exit 4
-    fi
-    say "waiting for the box to go quiet (1-min load $load1, need < 1.5)"
-    sleep 20
-done
-say "box quiet (1-min load $load1)"
+settle_quiet() {
+    local settle_deadline load1
+    settle_deadline=$(( $(date +%s) + 900 ))
+    while :; do
+        load1=$(awk '{print $1}' "$LOADAVG_FILE")
+        if awk -v l="$load1" 'BEGIN{exit !(l < 1.5)}'; then break; fi
+        if [ "$(date +%s)" -ge "$settle_deadline" ]; then
+            echo "BLOCKED: load stayed at $load1 for 15 min; refusing to measure on a busy box" >&2
+            exit 4
+        fi
+        say "waiting for the box to go quiet (1-min load $load1, need < 1.5)"
+        sleep 20
+    done
+    say "box quiet (1-min load $load1)"
+}
+settle_quiet
 
 # The settle wait is time in which the box can change under us; prove the
 # resolver again immediately before measuring.
@@ -952,6 +956,12 @@ run_rc=0
 if [ "$MEASURE" = scale ]; then
     say "measured run: open-loop scale over the corpus, rates ${SCALE_RATES:-unset}, $UFFD_MODE prefetch=$UFFD_PREFETCH"
     start_dns_sampler
+    # The before-run verify boots two clones, and their load can put the run
+    # over its own quiet gate, which refuses rather than waits (observed
+    # 2026-10-22: "REFUSING: box is busy (load=2.61, 0 firecracker/fcvm)" right
+    # after a verify that started under 1.5). Settle again, under the sampler,
+    # so the resolver evidence covers the wait too.
+    settle_quiet
     SCALE_URL="$URLS" SCALE_TAG="$TAG" SCALE_OUT="$SCALE_DIR" \
         SCALE_UFFD_MODE="$UFFD_MODE" SCALE_UFFD_PREFETCH="$UFFD_PREFETCH" \
         SCALE_CONTROL_URL="${SCALE_CONTROL_URL:-${URLS%%,*}}" \
@@ -969,6 +979,7 @@ if [ "$MEASURE" = scale ]; then
 else
     say "measured run: $REPS reps/arm, warmup $WARMUP, arms $ARMS, $BACKEND/$UFFD_MODE prefetch=$UFFD_PREFETCH"
     start_dns_sampler
+    settle_quiet  # after the verify's clones, as above
     TAG="$TAG" URL="$URLS" BACKEND="$BACKEND" UFFD_MODE="$UFFD_MODE" \
         UFFD_PREFETCH="$UFFD_PREFETCH" ARMS="$ARMS" REPS="$REPS" WARMUP="$WARMUP" \
         STALL_MAX_MS="$STALL_MAX_MS" RESULTS="$RESULTS" ENGINE="$ENGINE" \

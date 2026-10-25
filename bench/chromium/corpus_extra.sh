@@ -153,6 +153,7 @@ stage_runtime_bundle() {
         corpus_serve.py report.py reqbench.py reqbench.sh reqanalyze.py wddrive.py
         owned_process.py phase_supervisor.py host_resource_finalizer.py
         serve_guardian.py corpus_campaign.sh
+        reqscale.py reqscale_analyze.py faulttrace.bt guardexec.py guardsupervise.py
     )
     [ "${SOURCE_REVISION+x}" = x ] && [ "${SOURCE_GIT_DIRTY+x}" = x ] \
         || { echo "BLOCKED: runtime staging requires a complete source identity" >&2; return 2; }
@@ -371,8 +372,12 @@ PY
     reqbench_manifest_temp=$(mktemp "$RESULTS/runtime/.reqbench-manifest.XXXXXX")
     (
         cd "$stage"
+        # Exactly reqbench.sh's sealed bundle (its runtime_sources, in order),
+        # so a golden that bundle made is one this phase accepts.
+        # RequestBundleManifestPin holds the two lists to each other.
         sha256sum fcvm fc-agent reqbench.sh reqbench.py reqanalyze.py \
-            cdpdrive.py render.py wddrive.py
+            cdpdrive.py render.py wddrive.py \
+            reqscale.py reqscale_analyze.py faulttrace.bt guardexec.py guardsupervise.py
     ) > "$reqbench_manifest_temp"
     mv --no-target-directory \
         "$reqbench_manifest_temp" "$stage/REQBENCH_MANIFEST.sha256"

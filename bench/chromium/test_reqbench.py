@@ -43,6 +43,21 @@ REPO_ROOT = os.path.dirname(os.path.dirname(HERE))
 import campaign_summary  # noqa: E402
 import reqanalyze  # noqa: E402
 import reqbench  # noqa: E402
+from unittest import mock as _subreaper_mock  # noqa: E402
+
+# main() makes the harness the subreaper of its descendants' orphans. The test
+# runner must not adopt every orphan of every test, so this module's tests run
+# main() without it; test_run_facts.Subreaper checks the real call in a child.
+_NO_SUBREAPER = _subreaper_mock.patch.object(reqbench, "become_child_subreaper",
+                                             lambda: False)
+
+
+def setUpModule():
+    _NO_SUBREAPER.start()
+
+
+def tearDownModule():
+    _NO_SUBREAPER.stop()
 
 
 def self_cpu_ms() -> float:
