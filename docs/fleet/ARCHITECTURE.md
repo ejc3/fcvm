@@ -369,6 +369,15 @@ All of it is Terraform in ejc3/aws, applied by the jumpbox:
 - **Coordinator:** a dedicated ECS cluster, one Fargate service with the coordinator and a
   `cloudflared` container, its S3 state object, and the Secrets Manager entries (the
   certificate, the Cloudflare DNS token, the Access service token for agents).
+- **Coordinator releases:** `.github/workflows/fleet-coordinator-deploy.yml` builds and tests
+  the ARM64 image after relevant changes reach main. Its main-only `fleet-stage-deploy`
+  environment admits OIDC credentials that can publish that image and invoke one image-only
+  release function. The function takes Terraform's backend lock, preserves the task's
+  infrastructure settings, rolls out the digest and records it in the release parameter.
+  A failed ECS rollout restores the old task. CI then checks Access, relaunches one tile in
+  each half, requires new names, and receives actual renderer frames over IPv4/TLS. It can
+  wake the fleet; lack of capacity fails the check. Terraform provisions the environment's
+  variables and staging-only Access token. CI cannot read Terraform state or call ECS.
 - **Cloudflare:** the tunnel to `fleet-api.<zone>`, the Access application for staging, the
   Worker for the site.
 - **Testing before the fleet exists:** `pbox up N kvm-gpu-96 --open` gives one host with a

@@ -561,6 +561,22 @@ build-host-tools: cargo-target-link dep-provenance
 		exit 1; \
 	fi
 
+# The coordinator needs the host binary, not a guest agent or VM assets. Keep
+# these entry points under the same worktree target lease as the other builds.
+.PHONY: build-fleet-coordinator test-fleet-coordinator
+build-fleet-coordinator: private SHELL := $(TARGET_LEASE_SHELL)
+build-fleet-coordinator: cargo-target-link dep-provenance
+	@set -e; \
+	before="$$($(MAKE) --no-print-directory dep-provenance)"; \
+	CARGO_TARGET_DIR=target $(CARGO) build --locked --release -p fcvm; \
+	after="$$($(MAKE) --no-print-directory dep-provenance)"; \
+	test "$$before" = "$$after"; \
+	test -x target/release/fcvm
+
+test-fleet-coordinator: private SHELL := $(TARGET_LEASE_SHELL)
+test-fleet-coordinator: cargo-target-link dep-provenance
+	CARGO_TARGET_DIR=target $(CARGO) test --locked --release --no-default-features -p fcvm --test test_fleet_coord
+
 build-fc-mock: private SHELL := $(TARGET_LEASE_SHELL)
 build-fc-mock: cargo-target-link
 	@echo "==> Building fc-mock..."

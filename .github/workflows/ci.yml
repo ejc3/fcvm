@@ -168,7 +168,7 @@ jobs:
               # the VM matrix does not build or run it. Like bench/, it precedes
               # the docs arm so its README still routes to its check.
               fleet/web/*) web=true; echo "fleet web path: $f" ;;
-              fleet/*) fleet=true; echo "fleet path, no matrix: $f" ;;
+              fleet/*|.github/workflows/fleet-coordinator-deploy.yml) fleet=true; echo "fleet path, no matrix: $f" ;;
               # This file holds the fleet-renderer and fleet-web jobs, so a change here runs them too.
               .github/workflows/ci.yml) code=true; web=true; fleet=true; echo "ci workflow: $f" ;;
               docs/*|*.md) ;;
@@ -298,6 +298,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Coordinator release and IPv4 staging probe tests
+        run: python3 -B fleet/coord/test_release.py
       - name: Renderer host tests
         run: |
           set -euo pipefail
