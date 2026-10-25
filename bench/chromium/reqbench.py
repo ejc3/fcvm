@@ -906,6 +906,40 @@ def freeze_and_capture_children(pid: int) -> tuple[list[int], list[int | None]]:
                 pass
 
 
+def child_start_times(pids: list[int]) -> dict[int, int | None]:
+    """Start time of each pid, read while its frozen parent still holds it.
+
+    A frozen parent cannot reap a child, so a listed child is still a process
+    (possibly a zombie) and its start time names that process alone.
+    """
+    out: dict[int, int | None] = {}
+    for pid in pids:
+        fields = proc_stat_fields(pid)
+        out[pid] = None if fields is None else fields[3]
+    return out
+
+
+def unpinned_children(
+    initial_starts: dict[int, int | None], timeout_kids: list[int]
+) -> list[int]:
+    """Children in a later capture that the first capture did not pin.
+
+    Both captures read one process's direct children, so the comparison covers
+    only that process's own forks. A child the first capture pinned may have
+    exited since, and is then absent or a zombie: that is not a new child. A
+    pid is the same child only when its start time matches the one recorded at
+    the first capture, so a recycled number counts as new. A child whose start
+    time cannot be read now or was not read then is not proven pinned.
+    """
+    unpinned = []
+    for pid in timeout_kids:
+        fields = proc_stat_fields(pid)
+        recorded = initial_starts.get(pid)
+        if fields is None or recorded is None or fields[3] != recorded:
+            unpinned.append(pid)
+    return unpinned
+
+
 def close_pidfds(fds) -> None:
     """Close every live pidfd exactly once."""
     for fd in fds:
@@ -4327,6 +4361,7 @@ def run_exec_request(args, rep: int) -> dict:
             raise RuntimeError(
                 f"exec clone owner {proc.pid} has no completely pinned child set"
             )
+        kid_starts = child_start_times(kids)
         os.kill(proc.pid, signal.SIGCONT)
     except BaseException as request_error:
         if (
@@ -4456,9 +4491,11 @@ def run_exec_request(args, rep: int) -> dict:
             error.record = rec
             raise error from capture_error
         # No production child is allowed to appear after the state ownership
-        # barrier. A mismatch means the original attribution was incomplete;
-        # kill every exact handle, retain disk evidence, and fail closed.
-        if timeout_kids != kids or any(fd is None for fd in timeout_fds):
+        # barrier. A child outside the pinned set means the original attribution
+        # was incomplete; kill every exact handle, retain disk evidence, and
+        # fail closed. A pinned child that has since exited is not that: the
+        # first read can hold a child the frozen owner had not yet reaped.
+        if unpinned_children(kid_starts, timeout_kids):
             abort_frozen_owner(proc.pid, parent_fd, [*fds, *timeout_fds])
             close_pidfds([parent_fd, *fds, *timeout_fds])
             teardown = {
