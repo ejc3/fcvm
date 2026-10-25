@@ -2410,9 +2410,10 @@ async fn test_lifecycle_interleave_source_teardown_waits_for_clone_disk_open() -
 
 /// A restore of a snapshot whose source VM is gone recreates the source's runtime
 /// directory as a mountpoint for its disk redirect (issue 1187). Once the clone's VMM
-/// has opened its disks through it, and its Firecracker takes the vsock override, nothing
-/// needs it, so the restore removes it instead of leaving an empty `vm-disks/<source>`
-/// behind for good.
+/// has opened its disks through it, and its Firecracker takes the vsock override
+/// (1.16.0 and later), nothing needs it, so the restore removes it. An older
+/// Firecracker resolves its vsock socket through the redirect for its whole life, so
+/// the directory stays until the clone exits. Either way none is left behind.
 ///
 /// RED BEFORE THE FIX: the recreated directory outlived the clone.
 #[tokio::test]
@@ -2483,11 +2484,45 @@ async fn test_lifecycle_interleave_restore_removes_a_recreated_source_dir() -> R
                     log_tail(&clone_log, 60)
                 )
             })?;
+        let firecracker = ls_vm_by_pid(clone_pid)
+            .await?
+            .and_then(|state| state.config.firecracker_bin)
+            .context("the clone recorded no Firecracker binary")?;
+        let version = std::process::Command::new(&firecracker)
+            .arg("--version")
+            .output()
+            .with_context(|| format!("running {} --version", firecracker.display()))?;
+        let version = String::from_utf8_lossy(&version.stdout).to_string();
+        let numbers: Vec<u32> = version
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix('v'))
+            .with_context(|| format!("no version in {version:?}"))?
+            .split(['.', '-'])
+            .take(3)
+            .map(|part| part.parse().context("parsing the Firecracker version"))
+            .collect::<Result<_>>()?;
+        let overrides_vsock = numbers.as_slice() >= [1u32, 16, 0].as_slice();
+        anyhow::ensure!(
+            baseline_dir.exists() != overrides_vsock,
+            "Firecracker {} (vsock override: {overrides_vsock}): the source directory the \
+             restore recreated is {} while the clone runs; log tail:\n{}",
+            version.trim(),
+            if baseline_dir.exists() {
+                "present"
+            } else {
+                "gone"
+            },
+            log_tail(&clone_log, 40)
+        );
+        let (clone_child, clone_process) = clone.as_mut().context("clone fixture disappeared")?;
+        stop_test_child(clone_child, clone_process)
+            .await
+            .context("stopping the clone")?;
+        clone = None;
         anyhow::ensure!(
             !baseline_dir.exists(),
-            "the restore left the source directory it recreated: {}; log tail:\n{}",
-            baseline_dir.display(),
-            log_tail(&clone_log, 40)
+            "the restore left the source directory it recreated: {}",
+            baseline_dir.display()
         );
         Ok(())
     }
