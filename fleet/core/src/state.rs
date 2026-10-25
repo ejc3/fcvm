@@ -27,6 +27,12 @@ pub struct Config {
     /// The EC2 half's aggregator frame WebSocket, when the coordinator runs one.
     #[serde(default)]
     pub ec2_aggregate_url: Option<String>,
+    /// The EC2 half's aggregator's public addresses when it serves browsers with TLS (on
+    /// 443 in both families): the coordinator task's own. Named `agg-ec2-<token>`.
+    #[serde(default)]
+    pub ec2_aggregate_ipv6: Option<String>,
+    #[serde(default)]
+    pub ec2_aggregate_ipv4: Option<String>,
     /// The owner's race cadence: a relaunch of every tile this often. `None`: no schedule.
     pub race_interval_secs: Option<u64>,
     /// After any race, `restart_now` is refused for this long, for everyone.
@@ -131,6 +137,8 @@ impl Default for Config {
             light_interval_ms: 1_000,
             relaunch_interval_ms: 2_000,
             ec2_aggregate_url: None,
+            ec2_aggregate_ipv6: None,
+            ec2_aggregate_ipv4: None,
             race_interval_secs: None,
             restart_cooldown_secs: 60,
             camera_seed: 1,
@@ -515,6 +523,9 @@ pub struct Fleet {
     pub budget: crate::budget::Budget,
     /// Coordinator components that are degraded: reason and since when.
     pub degraded: BTreeMap<String, (String, u64)>,
+    /// The EC2 half's aggregator's published DNS names (`EC2_AGGREGATE_ID`).
+    #[serde(default)]
+    pub ec2_aggregate_published: Option<Published>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -563,6 +574,7 @@ impl State {
                 warming: Default::default(),
                 power: Power::default(),
                 budget: Default::default(),
+                ec2_aggregate_published: None,
             },
             config,
             receipts: BTreeMap::new(),
@@ -586,6 +598,8 @@ impl State {
         f.viewers.clear();
         f.hidden.clear();
         f.degraded.clear();
+        // The EC2 aggregator's names were for the previous coordinator's addresses.
+        f.ec2_aggregate_published = None;
         // A race interrupted by the restart cannot finish (its slots come back at
         // generation 1), on either half.
         let finished = |h: &HalfRace| h.done_at.is_some() || h.tiles.is_empty();
@@ -653,6 +667,9 @@ pub fn aggregate_id(host: &str) -> Option<String> {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
     ok.then(|| format!("agg-{host}"))
 }
+
+/// The id the EC2 half's aggregator is named under in DNS.
+pub const EC2_AGGREGATE_ID: &str = "agg-ec2";
 
 /// An address in its canonical text (`2001:db8::2` for `2001:0db8::2`); text that is not an
 /// address is kept as it is.

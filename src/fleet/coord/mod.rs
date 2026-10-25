@@ -13,6 +13,7 @@ pub mod cert;
 pub mod dns;
 pub mod ec2;
 pub mod ec2_aws;
+pub mod ecs;
 pub mod live;
 pub mod poster;
 pub mod scale;
@@ -740,6 +741,28 @@ pub fn power_managed(args: &FleetCoordArgs) -> bool {
 }
 
 pub async fn run(args: FleetCoordArgs) -> Result<()> {
+    if args.ec2_aggregate_listen.is_some()
+        && args.ec2_aggregate_url.is_none()
+        && !args.ec2_aggregate_tls
+    {
+        bail!("--ec2-aggregate-listen needs --ec2-aggregate-url or --ec2-aggregate-tls (how browsers reach it)");
+    }
+    let secrets_region = || {
+        args.secrets_region
+            .clone()
+            .or_else(|| std::env::var("AWS_REGION").ok())
+            .context("reading a secret needs --secrets-region or AWS_REGION")
+    };
+    // The EC2 aggregator serving browsers: the task's own addresses, fixed for its life.
+    let ec2_public = if args.ec2_aggregate_tls {
+        let region = std::env::var("AWS_REGION")
+            .context("--ec2-aggregate-tls reads the task's addresses in AWS_REGION")?;
+        let a = ecs::task_addresses(&region).await?;
+        tracing::info!(ipv6 = ?a.ipv6, ipv4 = ?a.ipv4, "the EC2 aggregator's public addresses");
+        Some(a)
+    } else {
+        None
+    };
     let config = Config {
         max_tiles: args.max_tiles,
         ec2_max: match args.ec2 {
@@ -747,6 +770,8 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             FleetEc2::Fake | FleetEc2::Aws => args.ec2_tiles.min(args.max_tiles),
         },
         ec2_aggregate_url: args.ec2_aggregate_url.clone(),
+        ec2_aggregate_ipv6: ec2_public.as_ref().and_then(|a| a.ipv6.clone()),
+        ec2_aggregate_ipv4: ec2_public.as_ref().and_then(|a| a.ipv4.clone()),
         race_interval_secs: args.race_every,
         restart_cooldown_secs: args.restart_cooldown,
         camera_seed: args.camera_seed,
@@ -837,12 +862,6 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             spot_wait: Duration::from_secs(args.spot_wait),
         })
     };
-    let secrets_region = || {
-        args.secrets_region
-            .clone()
-            .or_else(|| std::env::var("AWS_REGION").ok())
-            .context("reading a secret needs --secrets-region or AWS_REGION")
-    };
     let dns_token = match &args.dns_token_secret {
         Some(name) => Some(
             secrets::Secrets::new(&secrets_region()?)?
@@ -897,6 +916,24 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             "aggregate".into(),
         ];
         argv.extend(args.aggregate_args.iter().cloned());
+        if let (Some(a), Some(secret)) = (&ec2_public, &args.tls_secret) {
+            // The certificate file, written before the aggregator starts and kept current.
+            use crate::fleet::agent::tls;
+            let dir = args.ec2_aggregate_tls_dir.clone();
+            let secrets = secrets::Secrets::new(&secrets_region()?)?;
+            tls::refresh(&secrets, secret, &dir).await?;
+            tokio::spawn(tls::run(secrets, secret.clone(), dir.clone()));
+            argv.extend([
+                "--tls-file".into(),
+                dir.join(tls::FILE).to_string_lossy().into_owned(),
+            ]);
+            if a.ipv4.is_some() {
+                argv.extend(["--tls-listen".into(), format!("0.0.0.0:{}", tls::PORT)]);
+            }
+            if let Some(v6) = &a.ipv6 {
+                argv.extend(["--tls-listen".into(), format!("[{v6}]:{}", tls::PORT)]);
+            }
+        }
         tokio::spawn(crate::fleet::aggregate::child::supervise(
             argv,
             listen.clone(),

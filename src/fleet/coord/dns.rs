@@ -10,6 +10,8 @@
 //! A host's aggregator is named the same way under `agg-<host>-<token>`
 //! (`fleet_core::state::aggregate_id`): its own IPv6 address (port 443) and the host's IPv4
 //! address on the aggregator's port. Its label lasts while it reports the same addresses.
+//! The EC2 half's aggregator, which runs beside the coordinator, is `agg-ec2-<token>`: the
+//! coordinator task's own addresses, both on 443.
 //!
 //! The order is: write the records, confirm them at the zone's authoritative servers, and
 //! only then tell the coordinator (`Event::Published`), which puts the frame URLs in the
@@ -54,8 +56,8 @@ pub struct Fact {
     pub published: Option<Published>,
 }
 
-/// The facts of every slot, tile and host aggregator in the fleet. An aggregator has one
-/// launch (generation 0) for as long as it reports the same addresses.
+/// The facts of every slot, tile and aggregator in the fleet. An aggregator has one launch
+/// (generation 0) for as long as it has the same addresses.
 pub fn facts(state: &State) -> Vec<Fact> {
     let f = &state.fleet;
     let units = f.slots.values().chain(f.ec2.values()).map(|s| Fact {
@@ -76,7 +78,19 @@ pub fn facts(state: &State) -> Vec<Fact> {
             published: h.aggregate_published.clone(),
         })
     });
-    units.chain(aggregators).collect()
+    let c = &state.config;
+    let ec2_aggregator = Fact {
+        id: fleet_core::state::EC2_AGGREGATE_ID.into(),
+        generation: 0,
+        ipv6: c.ec2_aggregate_ipv6.clone(),
+        ipv4: c.ec2_aggregate_ipv4.clone(),
+        v4_port: None,
+        published: f.ec2_aggregate_published.clone(),
+    };
+    units
+        .chain(aggregators)
+        .chain(std::iter::once(ec2_aggregator))
+        .collect()
 }
 
 // Addresses compare in their canonical text, so the record, the published names and an
@@ -162,7 +176,7 @@ fn is_token(t: &str) -> bool {
 }
 
 /// Whether a name in the zone is one this module owns: `slot-<n>` or `ec2-<n>`, optionally
-/// with a launch token, or `agg-<host>-<token>` (an aggregator), each optionally with
+/// with a launch token, or `agg-<host>-<token>` / `agg-ec2-<token>` (an aggregator), each optionally with
 /// `-v4`. Anything else in the zone is never touched.
 fn owned(name: &str, zone: &str) -> bool {
     let Some(label) = name.strip_suffix(&format!(".{zone}")) else {
@@ -171,7 +185,10 @@ fn owned(name: &str, zone: &str) -> bool {
     let label = label.strip_suffix("-v4").unwrap_or(label);
     if let Some(rest) = label.strip_prefix("agg-") {
         return rest.rsplit_once('-').is_some_and(|(host, token)| {
-            fleet_core::state::aggregate_id(host).is_some() && is_token(token)
+            let id = format!("agg-{host}");
+            (fleet_core::state::aggregate_id(host).as_ref() == Some(&id)
+                || id == fleet_core::state::EC2_AGGREGATE_ID)
+                && is_token(token)
         });
     }
     let Some(rest) = label
@@ -676,6 +693,8 @@ mod tests {
             "agg-i-0123456789abcdef0-abcdefgh.fcvm.dev",
             "agg-i-0123456789abcdef0-abcdefgh-v4.fcvm.dev",
             "agg-gpu-a-zzzz2345.fcvm.dev",
+            "agg-ec2-abcdefgh.fcvm.dev",
+            "agg-ec2-abcdefgh-v4.fcvm.dev",
         ] {
             assert!(owned(name, z), "{name}");
         }

@@ -414,7 +414,8 @@ relaunching (its region would be black; claimed GPUs and dark tiles do not count
 fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file <path>]
                  [--text-check bedrock --text-check-model <id> --text-check-region <region> | --text-check none]
                  [--max-tiles 100] [--ec2 none|fake] [--allowed-origin <scheme://host[:port]>]...
-                 [--ec2-aggregate-listen <addr:port> --ec2-aggregate-url <ws url>] [--aggregate-arg <arg>]...
+                 [--ec2-aggregate-listen <addr:port> (--ec2-aggregate-url <ws url> | --ec2-aggregate-tls
+                  [--ec2-aggregate-tls-dir /tmp/fcvm-fleet/tls])] [--aggregate-arg <arg>]...
                  [--race-every <secs>] [--restart-cooldown 60] [--camera-seed 1] [--max-borrowed <n>]
                  [--trust-cf-connecting-ip] [--turnstile-secret <secret> --turnstile-site-key <key>]
                  [--admin-listen <addr:port>] [--ffmpeg ffmpeg]
@@ -467,6 +468,18 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   IPv6 address, A the host's IPv4 address, with its port in `frame_url_v4`. Its names last
   while it reports the same addresses.
 - `--tls-secret` keeps the wildcard certificate renewed (see "Certificate").
+- `--ec2-aggregate-tls` (with `--ec2-aggregate-listen`, `--tls-secret` and
+  `--dns-token-secret`) serves the EC2 half's aggregator to browsers with TLS on port 443
+  of the coordinator task's own addresses, read at start on ECS: the global IPv6 address
+  from the task metadata (`ECS_CONTAINER_METADATA_URI_V4`) and the public IPv4 address of
+  the task's network interface (EC2 `DescribeNetworkInterfaces` by its private address, in
+  `AWS_REGION`, with the task role). It writes the certificate (from `--tls-secret`) as
+  `tls.json` into `--ec2-aggregate-tls-dir` for the aggregator and reads the secret again
+  hourly, and names the addresses `agg-ec2-<token>` (AAAA and `-v4` A, both on 443) like a
+  host aggregator. A non-root process binds 443 only where the task lowers
+  `net.ipv4.ip_unprivileged_port_start` (it covers IPv6 too). With published names the
+  EC2 aggregate's `frame_url`/`frame_url_v4` are those names, else null;
+  `--ec2-aggregate-url` is used only without the DNS writer.
 
 ### Certificate
 
