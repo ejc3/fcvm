@@ -1371,27 +1371,25 @@ pub async fn ensure_rootfs(allow_create: bool, rootfs_type: Option<&str>) -> Res
     // Log the generated script for debugging
     debug!("generated setup script:\n{}", setup_script);
 
-    let temp_rootfs_path = rootfs_path.with_extension("raw.tmp");
-    let _ = tokio::fs::remove_file(&temp_rootfs_path).await;
-
-    let result = create_layer2_rootless(
+    let temp_rootfs = super::StoreTemp::new(&rootfs_path);
+    let result = match create_layer2_rootless(
         &plan,
         script_sha_short,
         &setup_script,
-        &temp_rootfs_path,
+        temp_rootfs.path(),
         rootfs_type,
     )
-    .await;
-
+    .await
+    {
+        Ok(()) => temp_rootfs.publish(&rootfs_path, "rootfs").await,
+        Err(err) => Err(err),
+    };
     if result.is_ok() {
-        super::publish_store_entry(&temp_rootfs_path, &rootfs_path, "rootfs").await?;
         info!(
             path = %rootfs_path.display(),
             script_sha = %script_sha_short,
             "Layer 2 rootfs creation complete"
         );
-    } else {
-        let _ = tokio::fs::remove_file(&temp_rootfs_path).await;
     }
 
     // Release lock. Deliberately leave the lock file in place (matching the kernel
@@ -1736,18 +1734,15 @@ pub async fn ensure_fc_agent_initrd(allow_create: bool) -> Result<PathBuf> {
         "creating fc-agent initrd"
     );
 
-    // Create temporary directory for initrd contents
-    // Use PID in temp dir name to avoid conflicts even with same sha
-    let temp_dir = initrd_dir.join(format!(
-        ".initrd-build-{}-{}",
-        initrd_sha_short,
-        std::process::id()
-    ));
-    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-    tokio::fs::create_dir_all(&temp_dir).await?;
-    // A killed root run would otherwise leave a directory whose contents a
-    // rootless run's remove_dir_all cannot unlink.
-    super::give_store_entry_to_invoker(&temp_dir);
+    // Directory for the initrd contents, unique to this builder and removed when
+    // `build_dir` drops.
+    let build_dir =
+        super::StoreTemp::new(&initrd_dir.join(format!(".initrd-build-{}", initrd_sha_short)));
+    let temp_dir = build_dir.path();
+    tokio::fs::create_dir_all(temp_dir).await?;
+    // A killed root run leaves this directory behind; hand it to the invoker so a
+    // rootless operator can remove it.
+    super::give_store_entry_to_invoker(temp_dir);
 
     // Create directory structure
     for dir in &["bin", "sbin", "dev", "proc", "sys", "newroot"] {
@@ -1790,14 +1785,14 @@ pub async fn ensure_fc_agent_initrd(allow_create: bool) -> Result<PathBuf> {
 
     // Create cpio archive (initrd format)
     // Use bash with pipefail so cpio errors aren't masked by gzip success (v3)
-    let temp_initrd = initrd_path.with_extension("initrd.tmp");
+    let temp_initrd = super::StoreTemp::new(&initrd_path);
     let output = Command::new("bash")
         .args([
             "-c",
             &format!(
                 "set -o pipefail && cd {} && find . | cpio -o -H newc | gzip > {}",
                 temp_dir.display(),
-                temp_initrd.display()
+                temp_initrd.path().display()
             ),
         ])
         .output()
@@ -1815,10 +1810,8 @@ pub async fn ensure_fc_agent_initrd(allow_create: bool) -> Result<PathBuf> {
     }
 
     // Rename to final path (atomic)
-    super::publish_store_entry(&temp_initrd, &initrd_path, "initrd").await?;
-
-    // Cleanup temp directory
-    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    temp_initrd.publish(&initrd_path, "initrd").await?;
+    drop(build_dir);
 
     info!(
         path = %initrd_path.display(),
@@ -1922,7 +1915,10 @@ async fn create_layer2_rootless(
 
     // Step 2: Convert qcow2 to raw (no root required!)
     info!("converting qcow2 to raw format (no root required)");
-    let full_disk_path = output_path.with_extension("full");
+    // Intermediates beside the output, unique to this builder like it and removed
+    // when they drop.
+    let full_disk = super::StoreTemp::new(output_path);
+    let full_disk_path = full_disk.path();
     let output = Command::new("qemu-img")
         .args([
             "convert",
@@ -1931,7 +1927,7 @@ async fn create_layer2_rootless(
             "-O",
             "raw",
             path_to_str(&cloud_image)?,
-            path_to_str(&full_disk_path)?,
+            path_to_str(full_disk_path)?,
         ])
         .output()
         .await
@@ -1947,11 +1943,12 @@ async fn create_layer2_rootless(
     // Step 3: Extract partition 1 (root filesystem) using fdisk and dd
     // This avoids GPT partition table issues with Firecracker
     info!("extracting root partition from GPT disk (no root required)");
-    let partition_path = output_path.with_extension("converting");
+    let partition = super::StoreTemp::new(output_path);
+    let partition_path = partition.path();
 
     // Get partition info using sfdisk
     let output = Command::new("sfdisk")
-        .args(["-J", path_to_str(&full_disk_path)?])
+        .args(["-J", path_to_str(full_disk_path)?])
         .output()
         .await
         .context("getting partition info")?;
@@ -1999,8 +1996,8 @@ async fn create_layer2_rootless(
     // Extract partition using dd (sector size is 512 bytes)
     let output = Command::new("dd")
         .args([
-            &format!("if={}", path_to_str(&full_disk_path)?),
-            &format!("of={}", path_to_str(&partition_path)?),
+            &format!("if={}", path_to_str(full_disk_path)?),
+            &format!("of={}", path_to_str(partition_path)?),
             "bs=512",
             &format!("skip={}", root_part.start),
             &format!("count={}", root_part.size),
@@ -2015,12 +2012,12 @@ async fn create_layer2_rootless(
     }
 
     // Remove full disk image (no longer needed)
-    let _ = tokio::fs::remove_file(&full_disk_path).await;
+    drop(full_disk);
 
     // Step 4: Expand the extracted partition to 10GB
     info!("expanding partition to {}", LAYER2_SIZE);
     let output = Command::new("truncate")
-        .args(["-s", LAYER2_SIZE, path_to_str(&partition_path)?])
+        .args(["-s", LAYER2_SIZE, path_to_str(partition_path)?])
         .output()
         .await
         .context("expanding partition")?;
@@ -2035,14 +2032,14 @@ async fn create_layer2_rootless(
     // Resize the ext4 filesystem to fill the partition
     info!("resizing ext4 filesystem");
     let _output = Command::new("e2fsck")
-        .args(["-f", "-y", path_to_str(&partition_path)?])
+        .args(["-f", "-y", path_to_str(partition_path)?])
         .output()
         .await
         .context("running e2fsck")?;
     // e2fsck may return non-zero even on success (exit code 1 = errors corrected)
 
     let output = Command::new("resize2fs")
-        .args([path_to_str(&partition_path)?])
+        .args([path_to_str(partition_path)?])
         .output()
         .await
         .context("running resize2fs")?;
@@ -2057,7 +2054,7 @@ async fn create_layer2_rootless(
     // Step 4b: Convert ext4 to btrfs if requested (before setup VM boot)
     if rootfs_type == Some("btrfs") {
         info!("converting rootfs from ext4 to btrfs");
-        convert_to_btrfs(&partition_path).await?;
+        convert_to_btrfs(partition_path).await?;
     }
 
     // Step 5: Download packages on host (host has network!)
@@ -2083,12 +2080,10 @@ async fn create_layer2_rootless(
         "booting VM with setup initrd (packages embedded)"
     );
 
-    boot_vm_for_setup(&partition_path, &setup_initrd, rootfs_type).await?;
+    boot_vm_for_setup(partition_path, &setup_initrd, rootfs_type).await?;
 
-    // Step 8: Rename to final path
-    tokio::fs::rename(&partition_path, output_path)
-        .await
-        .context("renaming partition to output path")?;
+    // Step 8: Rename to the output path
+    partition.publish(output_path, "rootfs partition").await?;
 
     info!("Layer 2 creation complete (packages embedded in initrd)");
     Ok(())
@@ -2224,8 +2219,8 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
     // The directory is populated under a temp name and renamed into place only
     // after the download succeeds, so its existence implies a complete set.
     if packages_dir.exists() {
+        let mut has_debs = false;
         if let Ok(mut entries) = tokio::fs::read_dir(&packages_dir).await {
-            let mut has_debs = false;
             while let Ok(Some(entry)) = entries.next_entry().await {
                 if entry
                     .path()
@@ -2237,20 +2232,23 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
                     break;
                 }
             }
-            if has_debs {
-                info!(path = %packages_dir.display(), "using cached packages directory");
-                return Ok(packages_dir);
-            }
         }
+        if has_debs {
+            info!(path = %packages_dir.display(), "using cached packages directory");
+            return Ok(packages_dir);
+        }
+        // The publish below never produces a directory without packages, and a
+        // rename cannot replace a directory that holds entries.
+        let _ = tokio::fs::remove_dir_all(&packages_dir).await;
     }
 
-    // Download into a temp directory, then atomically rename to the final cache
-    // path on success. An interrupted or failed download must never leave a
-    // partial package set at the content-addressed path.
-    let download_dir = cache_dir.join(format!("packages-{}.tmp", script_sha_short));
-    let _ = tokio::fs::remove_dir_all(&packages_dir).await;
-    let _ = tokio::fs::remove_dir_all(&download_dir).await;
-    tokio::fs::create_dir_all(&download_dir).await?;
+    // Download into a temp directory of this builder's own, then atomically
+    // rename it to the final cache path on success. An interrupted or failed
+    // download must never leave a partial package set at the content-addressed
+    // path, and the temp is removed when `download` drops unpublished.
+    let download = super::StoreTemp::new(&packages_dir);
+    let download_dir = download.path();
+    tokio::fs::create_dir_all(download_dir).await?;
     super::give_store_entry_to_invoker(&cache_dir);
 
     let codename = &plan.base.codename;
@@ -2308,7 +2306,6 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = tokio::fs::remove_dir_all(&download_dir).await;
         bail!(
             "Package download failed (podman exited with {:?}). stdout={}, stderr={}",
             output.status.code(),
@@ -2319,7 +2316,7 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
 
     // Count downloaded packages
     let mut count = 0;
-    if let Ok(mut entries) = tokio::fs::read_dir(&download_dir).await {
+    if let Ok(mut entries) = tokio::fs::read_dir(download_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             if entry
                 .path()
@@ -2335,7 +2332,6 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
     if count == 0 {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = tokio::fs::remove_dir_all(&download_dir).await;
         bail!(
             "No packages downloaded. stdout={}, stderr={}",
             stdout.trim(),
@@ -2343,11 +2339,14 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
         );
     }
 
-    // Atomically publish the completed download as the cache directory.
-    // The .deb files inside may stay root-owned after a sudo run; that is
-    // fine — the handed-back parent directory is what governs a rootless
-    // run's ability to read, replace, or unlink them.
-    super::publish_store_entry(&download_dir, &packages_dir, "downloaded packages").await?;
+    // Atomically publish the completed download as the cache directory. When
+    // another VM sharing the store published the same set first, its directory
+    // is kept and this one removed. The .deb files inside may stay root-owned
+    // after a sudo run; that is fine, because the handed-back parent directory is what
+    // governs a rootless run's ability to read, replace, or unlink them.
+    download
+        .publish(&packages_dir, "downloaded packages")
+        .await?;
 
     info!(path = %packages_dir.display(), count = count, "packages downloaded");
     Ok(packages_dir)
@@ -2393,9 +2392,7 @@ async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
         "downloading Ubuntu cloud image (this may take several minutes)"
     );
 
-    let temp_path = image_path.with_extension("img.download");
-    // Clean up any leftover temp file from a previous failed attempt
-    let _ = tokio::fs::remove_file(&temp_path).await;
+    let temp = super::StoreTemp::new(&image_path);
 
     // -f makes curl fail on HTTP errors instead of saving the error page as the
     // image; -S still prints the error despite --progress-bar.
@@ -2403,7 +2400,7 @@ async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
         .args([
             "-fSL",
             "-o",
-            path_to_str(&temp_path)?,
+            path_to_str(temp.path())?,
             "--progress-bar",
             &arch_config.url,
         ])
@@ -2412,7 +2409,6 @@ async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
         .context("downloading cloud image")?;
 
     if !output.success() {
-        let _ = tokio::fs::remove_file(&temp_path).await;
         bail!(
             "curl failed to download cloud image from {}",
             arch_config.url
@@ -2420,7 +2416,7 @@ async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
     }
 
     // Rename to final path
-    super::publish_store_entry(&temp_path, &image_path, "downloaded cloud image").await?;
+    temp.publish(&image_path, "downloaded cloud image").await?;
 
     info!(
         path = %image_path.display(),

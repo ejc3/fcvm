@@ -3,27 +3,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use tracing::{info, warn};
 
-/// Build a unique sibling temp path for atomically publishing a content-addressed cache file.
-///
-/// The image-cache dir is content-addressed and SHARED across VMs: nested tests `--map` the
-/// host `/mnt/fcvm-btrfs` into multiple L1 VMs, so two VMs preparing the same image write to
-/// the same directory on the host backing store. The per-digest `flock` guarding image prep
-/// does NOT coordinate this: it is `flock()` over a fuse-pipe mount that negotiates no
-/// `FUSE_FLOCK_LOCKS`, so each guest kernel grants it locally and never forwards it to the
-/// host. A shared `"<final>.tmp"` therefore lets two builders mkfs/resize the same file
-/// (corruption) and one's rename ENOENT the other's in-flight temp.
-///
-/// Keyed by a fresh UUID — NOT the pid, which is not unique across VMs (separate PID
-/// namespaces reuse the same numbers). The caller atomically renames to `final_path`; because
-/// the bytes are content-addressed, a rename race between builders is idempotent (same result).
-pub(super) fn unique_cache_tmp(final_path: &Path) -> PathBuf {
-    PathBuf::from(format!(
-        "{}.{}.tmp",
-        final_path.display(),
-        uuid::Uuid::new_v4()
-    ))
-}
-
 /// Remove podman state files from a storage root, keeping only image/layer data.
 ///
 /// `podman load` creates state files (db.sql, storage.lock, libpod/, etc.) that
@@ -490,7 +469,7 @@ pub async fn build_storage_image(
         .ok_or_else(|| anyhow::anyhow!("output_path has no parent directory"))?;
 
     // Temp paths are UUID-keyed because the image-cache dir is shared across VMs and the
-    // per-digest flock does not coordinate cross-VM (see `unique_cache_tmp`). A shared
+    // per-digest flock does not coordinate cross-VM (see `crate::setup::store_temp_path`). A shared
     // "tmp-storage-{pid}" would collide too — separate PID namespaces reuse pid numbers.
     let tmp_dir = cache_dir.join(format!("tmp-storage-{}", uuid::Uuid::new_v4()));
 
@@ -520,9 +499,9 @@ pub async fn build_storage_image(
     clean_podman_state(&tmp_dir, &["overlay", "overlay-images", "overlay-layers"]).await;
 
     // Package the storage tree as an ext4 image, building into a UUID-keyed temp and
-    // atomically renaming (see `unique_cache_tmp` — a shared "<digest>.tmp" lets two VMs
+    // atomically renaming (see `crate::setup::store_temp_path`: a shared "<digest>.tmp" lets two VMs
     // mkfs/resize2fs the same file and one's rename ENOENTs the other's in-flight temp).
-    let tmp_img = unique_cache_tmp(output_path);
+    let tmp_img = crate::setup::store_temp_path(output_path);
     let result = create_disk_from_dir(&tmp_dir, &tmp_img, true).await;
 
     // Clean up temp storage dir regardless of result
@@ -764,25 +743,5 @@ mod tests {
             fc_mock.contains("cmd.env(\"XDG_RUNTIME_DIR\""),
             "fc-mock no longer gives podman a runtime directory of its own, so its graphroot needs a runroot"
         );
-    }
-
-    #[test]
-    fn cache_tmp_is_unique_per_call() {
-        // Regression for the cross-VM image-cache race (PR #677): two builders preparing the
-        // same content-addressed file must NOT share a temp name. A fixed "<final>.tmp" let
-        // concurrent VMs (sharing the host image-cache via --map, where flock does not
-        // coordinate) corrupt each other's image and ENOENT each other's rename. The temp
-        // MUST be unique per call.
-        let final_path = Path::new("/mnt/fcvm-btrfs/image-cache/abc123.storage-v2.img");
-        let a = unique_cache_tmp(final_path);
-        let b = unique_cache_tmp(final_path);
-        assert_ne!(a, b, "concurrent builders must get distinct temp paths");
-
-        // It must remain a sibling of the final file (same dir → rename is an atomic
-        // intra-filesystem replace, not a cross-device copy) and carry the final name.
-        assert_eq!(a.parent(), final_path.parent());
-        let a_str = a.to_str().unwrap();
-        assert!(a_str.contains("abc123.storage-v2.img"), "got {a_str}");
-        assert!(a_str.ends_with(".tmp"), "got {a_str}");
     }
 }

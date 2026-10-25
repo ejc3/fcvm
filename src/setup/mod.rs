@@ -129,6 +129,99 @@ pub(crate) async fn publish_store_entry(temp: &Path, dest: &Path, what: &str) ->
     Ok(())
 }
 
+/// A sibling of `final_path` that is unique to this builder, to stage a store entry
+/// in before renaming it onto `final_path`.
+///
+/// The stores are shared across VMs: nested runs `--map` the host store into every
+/// L1. The store lock ([`lock_store_dir`]) is a `flock`, and a fuse-pipe mount
+/// negotiates no `FUSE_FLOCK_LOCKS`, so each guest kernel grants it locally and two
+/// VMs building the same entry both hold it. A temp name shared by builders lets
+/// one VM write, remove or rename the other's in-flight file. The name carries a
+/// uuid, not a pid, because separate PID namespaces reuse pids. It sits in the
+/// final path's directory, so the rename stays on one filesystem and is atomic, and
+/// two builders of one content-addressed entry renaming in turn leave a complete
+/// entry either way.
+pub(crate) fn store_temp_path(final_path: &Path) -> std::path::PathBuf {
+    let mut name = final_path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    final_path.with_file_name(name)
+}
+
+/// A store temp ([`store_temp_path`]), file or directory, that is removed when
+/// dropped unless it was published.
+///
+/// A fixed temp name was overwritten by the next build, so a failed build left at
+/// most one behind. A unique name is never reused, so every failure path (including
+/// a `?` return and a cancelled future) has to remove its own, and dropping the
+/// guard does that.
+pub(crate) struct StoreTemp {
+    path: std::path::PathBuf,
+    published: bool,
+}
+
+impl StoreTemp {
+    /// Name a unique temp beside `final_path`. Nothing is created.
+    pub(crate) fn new(final_path: &Path) -> Self {
+        Self {
+            path: store_temp_path(final_path),
+            published: false,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Rename the temp onto `dest` and hand it back to the sudo invoker.
+    ///
+    /// A rename replaces a file or an empty directory atomically, but fails on a
+    /// directory that holds entries (ENOTEMPTY or EEXIST). For a content-addressed
+    /// directory that means another builder published the same entry first: theirs
+    /// is kept, this temp is removed, and the publish succeeds.
+    pub(crate) async fn publish(mut self, dest: &Path, what: &str) -> Result<()> {
+        match tokio::fs::rename(&self.path, dest).await {
+            Ok(()) => {
+                self.published = true;
+                give_store_entry_to_invoker(dest);
+                Ok(())
+            }
+            Err(err)
+                if matches!(err.raw_os_error(), Some(libc::ENOTEMPTY | libc::EEXIST))
+                    && dest.is_dir() =>
+            {
+                tracing::info!(
+                    path = %dest.display(),
+                    "{what} was published by another builder; keeping it"
+                );
+                Ok(())
+            }
+            Err(err) => {
+                Err(err).with_context(|| format!("renaming {what} into {}", dest.display()))
+            }
+        }
+    }
+}
+
+impl Drop for StoreTemp {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        let removed = match std::fs::symlink_metadata(&self.path) {
+            Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&self.path),
+            Ok(_) => std::fs::remove_file(&self.path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        };
+        if let Err(err) = removed {
+            warn!(path = %self.path.display(), %err, "removing an unpublished store temp");
+        }
+    }
+}
+
 /// Run a build child as the user who invoked sudo instead of as root.
 ///
 /// The store builders clone repos and run the operator's toolchains. As root
@@ -269,6 +362,82 @@ mod store_ownership_tests {
         assert!(dir.is_dir());
         assert!(dir.join("x.lock").is_file());
         flock.unlock().map_err(|(_, e)| e).unwrap();
+    }
+
+    #[test]
+    fn store_temps_are_unique_uuid_keyed_siblings() {
+        let final_path = Path::new("/store/rootfs/layer2-abc.raw");
+        let a = store_temp_path(final_path);
+        let b = store_temp_path(final_path);
+        assert_ne!(a, b, "two builders of one entry must not share a temp");
+        for temp in [&a, &b] {
+            assert_eq!(temp.parent(), final_path.parent(), "{}", temp.display());
+            let name = temp.file_name().unwrap().to_str().unwrap();
+            let key = name
+                .strip_prefix("layer2-abc.raw.")
+                .and_then(|rest| rest.strip_suffix(".tmp"))
+                .unwrap_or_else(|| panic!("unexpected temp name {name}"));
+            uuid::Uuid::parse_str(key)
+                .unwrap_or_else(|e| panic!("temp key {key} is not a uuid: {e}"));
+            assert!(
+                !key.contains(&std::process::id().to_string()),
+                "temp key {key} carries the pid"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unpublished_store_temp_is_removed_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = StoreTemp::new(&tmp.path().join("kernel.bin"));
+        std::fs::write(file.path(), b"partial").unwrap();
+        let dir = StoreTemp::new(&tmp.path().join("packages-abc"));
+        std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested/a.deb"), b"x").unwrap();
+        let never_created = StoreTemp::new(&tmp.path().join("missing"));
+        let paths = [file.path().to_path_buf(), dir.path().to_path_buf()];
+        drop((file, dir, never_created));
+        for path in paths {
+            assert!(!path.exists(), "{} was left behind", path.display());
+        }
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn store_temp_publish_renames_into_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("artifact.bin");
+        std::fs::write(&dest, b"old").unwrap();
+        let temp = StoreTemp::new(&dest);
+        let staged = temp.path().to_path_buf();
+        std::fs::write(&staged, b"new").unwrap();
+        temp.publish(&dest, "test artifact").await.unwrap();
+        assert!(!staged.exists());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+    }
+
+    /// Two builders in different kernels download the same package set into their
+    /// own temps and publish them in turn: the second finds the first's directory
+    /// in place, keeps it, and removes its own temp.
+    #[tokio::test]
+    async fn two_builders_publish_one_directory_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("packages-abc");
+        let first = StoreTemp::new(&dest);
+        let second = StoreTemp::new(&dest);
+        for (temp, body) in [(&first, b"first"), (&second, b"other")] {
+            std::fs::create_dir_all(temp.path()).unwrap();
+            std::fs::write(temp.path().join("a.deb"), body).unwrap();
+        }
+        let second_path = second.path().to_path_buf();
+        first.publish(&dest, "packages").await.unwrap();
+        second.publish(&dest, "packages").await.unwrap();
+        assert_eq!(std::fs::read(dest.join("a.deb")).unwrap(), b"first");
+        assert!(
+            !second_path.exists(),
+            "the losing builder's temp was left behind"
+        );
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
     }
 
     #[tokio::test]
