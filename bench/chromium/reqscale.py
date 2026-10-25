@@ -65,12 +65,15 @@ import reqbench  # noqa: E402
 
 SCHEDULE_SCHEMA = "fcvm.chromium.reqscale.schedule.v2"
 RECORD_SCHEMA = "fcvm.chromium.reqscale.record.v2"
+# v3: failed_rates, the rates whose requests failed while the run went on.
+STATUS_SCHEMA = "fcvm.chromium.reqscale.status.v3"
 RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 CGROUP_NAME_RE = re.compile(r"^fcvm-reqscale-[0-9a-f]{32}$")
 SNAPSHOT_TAG_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 RAMP_SECONDS = 15.0
 SCORE_SECONDS = 60.0
 WARMUP_BURSTS = 1
+MIN_SCORED_REQUESTS = 200  # per backend and rate, across the scored bursts
 CONTROL_INTERVAL_SECONDS = 10.0
 SAMPLE_INTERVAL_SECONDS = 5.0
 GUARDEXEC = os.path.join(HERE, "guardexec.py")
@@ -384,10 +387,10 @@ def _validate_schedule_config(config: ScheduleConfig) -> None:
             raise ValueError(f"target rate must be finite and positive: {rate}")
         _planned_count(rate, config.ramp_seconds)
         _planned_count(rate, config.score_seconds)
-        if config.scored_bursts * _planned_count(rate, config.score_seconds) < 200:
+        if config.scored_bursts * _planned_count(rate, config.score_seconds) < MIN_SCORED_REQUESTS:
             raise ValueError(
-                f"rate {rate:g} supplies fewer than 200 scored requests per backend "
-                f"across {config.scored_bursts} bursts"
+                f"rate {rate:g} supplies fewer than {MIN_SCORED_REQUESTS} scored requests "
+                f"per backend across {config.scored_bursts} bursts"
             )
         # A corpus is only the same workload at every rate when each scored
         # window renders every page equally often: whole cycles of the list.
@@ -901,6 +904,36 @@ def _max_backlog(records: list[dict], backend: str, start_ns: int, end_ns: int) 
         if backlog < 0:
             raise MeasurementInvalid("artifact completion drove burst backlog below zero")
     return maximum
+
+
+FAILURE_COUNTS = ("failed", "artifact_missing", "undrained", "cleanup_unconfirmed")
+
+
+def burst_request_failures(summary: dict) -> Optional[dict]:
+    """What a burst's requests left undone, or None when every one finished clean.
+
+    A scale run records a burst with any of these as a failure of its rate and
+    keeps measuring the other rates; reqscale_analyze reports that rate as
+    failed and publishes no latency for it.
+    """
+    planned = summary["total_planned"]
+    failure = {
+        "burst_id": summary["burst_id"],
+        "population": summary["population"],
+        "failed": summary["failed"],
+        "artifact_missing": planned - summary["total_artifact_completed"],
+        "undrained": planned - summary["total_drained"],
+        "cleanup_unconfirmed": planned - summary["total_cleanup_confirmed"],
+    }
+    return failure if any(failure[name] for name in FAILURE_COUNTS) else None
+
+
+def failed_rate_records(failed: dict[float, list[dict]]) -> list[dict]:
+    """The status record of every failed rate, in rate order."""
+    return [
+        {"target_rps": rate, "bursts": list(failed[rate])}
+        for rate in sorted(failed)
+    ]
 
 
 def _burst_metadata(spec: BurstSpec) -> dict:
@@ -3635,6 +3668,7 @@ def execute(args, schedule: dict, provenance: dict) -> int:
     sampler_summary = None
     final_snapshot_identity = None
     failures = []
+    failed_rates: dict[float, list[dict]] = {}
     phase = RunPhase()
     try:
         scope = RunCgroups(args.run_id, args.cgroup_root)
@@ -3745,14 +3779,23 @@ def execute(args, schedule: dict, provenance: dict) -> int:
                 f"drain={summary['drain_span_ms']:.1f}ms",
                 flush=True,
             )
-            if (
-                summary["failed"]
-                or summary["total_artifact_completed"] != summary["total_planned"]
-                or summary["total_drained"] != summary["total_planned"]
-                or summary["total_cleanup_confirmed"] != summary["total_planned"]
-            ):
-                raise MeasurementInvalid(
-                    f"burst {spec.burst_id} has failed or unconfirmed-clean requests", summary
+            # A failed request fails its rate, not the run: a rate above the
+            # host's ceiling would otherwise void every rate measured with it.
+            # The burst has drained and _interburst_membership found no process
+            # left in the clone cgroups, so the next burst starts clean. The
+            # trace-perturbation pairs compare like with like and stay strict.
+            failure = burst_request_failures(summary)
+            if failure is not None:
+                if spec.population == "trace-perturbation":
+                    raise MeasurementInvalid(
+                        f"trace burst {spec.burst_id} has failed or unconfirmed-clean requests",
+                        summary,
+                    )
+                failed_rates.setdefault(spec.target_rps, []).append(failure)
+                print(
+                    f"{spec.burst_id} rate {spec.target_rps:g}rps/backend FAILED: "
+                    + ", ".join(f"{name}={failure[name]}" for name in FAILURE_COUNTS),
+                    flush=True,
                 )
             sampler.check()
             control_scheduler.check()
@@ -3830,11 +3873,12 @@ def execute(args, schedule: dict, provenance: dict) -> int:
 
     primary = failures[0] if failures else None
     status = {
-        "schema": "fcvm.chromium.reqscale.status.v2",
+        "schema": STATUS_SCHEMA,
         "run_id": args.run_id,
         "valid": not failures,
         "bursts_completed": len(summaries),
         "bursts_planned": len(schedule["bursts"]),
+        "failed_rates": failed_rate_records(failed_rates),
         "control": control_summary,
         "sampler": sampler_summary,
         "snapshot_identity_after": final_snapshot_identity,
@@ -3915,6 +3959,11 @@ def main() -> int:
         "--plan-only", action="store_true",
         help="write only a schedule.json; no cgroup, serve, clone, or benchmark",
     )
+    parser.add_argument(
+        "--check-schedule", action="store_true",
+        help="validate the arguments and the schedule they make, write nothing, and "
+             "exit; make bench-chromium-corpus MEASURE=scale runs it before the golden",
+    )
     args = parser.parse_args()
 
     args.run_id = args.run_id or uuid.uuid4().hex
@@ -3973,6 +4022,13 @@ def main() -> int:
         schedule = build_schedule(config, args.run_id)
     except ValueError as error:
         parser.error(str(error))
+    if args.check_schedule:
+        print(
+            f"schedule ok: {len(schedule['bursts'])} bursts at "
+            f"{','.join(format(rate, '.12g') for rate in config.rates)} req/s per path "
+            f"over {len(config.urls)} page(s)"
+        )
+        return 0
     if args.plan_only:
         os.mkdir(args.out_dir)
         _fsync_directory(os.path.dirname(args.out_dir))

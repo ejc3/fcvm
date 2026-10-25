@@ -23,7 +23,8 @@ import reqanalyze  # noqa: E402
 import reqscale  # noqa: E402
 
 
-ANALYSIS_SCHEMA = "fcvm.chromium.reqscale.analysis.v1"
+# v2: failed_rates, and cells whose rate failed carry null figures.
+ANALYSIS_SCHEMA = "fcvm.chromium.reqscale.analysis.v2"
 BOOTSTRAP_DRAWS = 10_000
 
 
@@ -329,17 +330,20 @@ def _recompute_backend_metrics(spec: reqscale.BurstSpec, records: list[dict], ba
             f"burst {spec.burst_id} has {len(rows)} raw scored {backend} requests, "
             f"expected {planned}"
         )
+    # A failed request has no artifact milestone; it is counted, and kept out
+    # of every latency distribution, as the harness does.
+    completed = [row for row in rows if "artifact_ns" in row]
     launched_by_end = sum(row["actual_launch_ns"] <= score_end_ns for row in rows)
-    artifact_by_end = sum(row["artifact_ns"] <= score_end_ns for row in rows)
+    artifact_by_end = sum(row["artifact_ns"] <= score_end_ns for row in completed)
     return {
         "cell_id": f"{backend}:r{format(spec.target_rps, '.12g')}",
         "planned": planned,
         "launched": len(rows),
         "launched_by_score_end": launched_by_end,
-        "artifact_completed": len(rows),
+        "artifact_completed": len(completed),
         "artifact_completed_by_score_end": artifact_by_end,
         "drained": len(rows),
-        "cleanup_confirmed": sum(row["teardown"]["all_gone"] is True for row in rows),
+        "cleanup_confirmed": sum(_cleanup_confirmed(row) for row in rows),
         "ok": sum(row["ok"] is True for row in rows),
         "failed": sum(row["ok"] is not True for row in rows),
         "offered_rps": launched_by_end / spec.score_seconds,
@@ -356,20 +360,24 @@ def _recompute_backend_metrics(spec: reqscale.BurstSpec, records: list[dict], ba
         ]),
         "artifact_latency_ms": reqscale.distribution([
             (row["artifact_ns"] - row["actual_launch_ns"]) / 1_000_000
-            for row in rows
+            for row in completed
         ]),
         "drain_latency_ms": reqscale.distribution([
             (row["finished_ns"] - row["artifact_ns"]) / 1_000_000
-            for row in rows
+            for row in completed
         ]),
         "wall_latency_ms": reqscale.distribution([
             (row["finished_ns"] - row["actual_launch_ns"]) / 1_000_000
             for row in rows
         ]),
         "blocking_latency_ms": reqscale.distribution([
-            float(row["blocking_ms"]) for row in rows
+            float(row["blocking_ms"]) for row in rows if row["ok"] is True
         ]),
     }
+
+
+def _cleanup_confirmed(row: dict) -> bool:
+    return isinstance(row.get("teardown"), dict) and row["teardown"].get("all_gone") is True
 
 
 def _validate_burst_accounting(summary: dict) -> None:
@@ -590,16 +598,23 @@ def _validate_requests(
                 reqscale._validate_request_record(row)
             except reqscale.MeasurementInvalid as error:
                 raise AnalysisInvalid(f"request {key} is invalid: {error}") from error
-            if row.get("ok") is not True:
-                raise AnalysisInvalid(f"request {key} failed")
-            if not isinstance(row.get("teardown"), dict) or row["teardown"].get("all_gone") is not True:
+            # A failed request fails its rate (reqscale.burst_request_failures,
+            # checked against the status in analyze()); the trace pairs compare
+            # like with like, and the harness refuses the run on a failure there.
+            if row.get("ok") is not True and (
+                spec.traced or spec.population == "trace-perturbation"
+            ):
+                raise AnalysisInvalid(f"trace-perturbation request {key} failed")
+            if row.get("ok") is True and not _cleanup_confirmed(row):
                 raise AnalysisInvalid(f"request {key} lacks confirmed teardown")
-            _validate_fault_metric(row, spec.traced)
-            faults = row["firecracker_process_faults_ready_to_artifact"]
-            identity = (faults["pid"], faults["pid_start_time_ticks"])
-            if identity in firecracker_identities:
-                raise AnalysisInvalid(f"Firecracker identity {identity} served multiple requests")
-            firecracker_identities.add(identity)
+            # A request that failed before its clone was ready has no counters.
+            if row.get("ok") is True or "firecracker_process_faults_ready_to_artifact" in row:
+                _validate_fault_metric(row, spec.traced)
+                faults = row["firecracker_process_faults_ready_to_artifact"]
+                identity = (faults["pid"], faults["pid_start_time_ticks"])
+                if identity in firecracker_identities:
+                    raise AnalysisInvalid(f"Firecracker identity {identity} served multiple requests")
+                firecracker_identities.add(identity)
             burst_rows.append(row)
 
         expected_start_ns = start_ns + round(spec.ramp_seconds * 1_000_000_000)
@@ -618,15 +633,15 @@ def _validate_requests(
         expected_totals = {
             "planned": len(scored),
             "launched": len(scored),
-            "artifact_completed": len(scored),
+            "artifact_completed": sum("artifact_ns" in row for row in scored),
             "drained": len(scored),
-            "cleanup_confirmed": len(scored),
-            "ok": len(scored),
-            "failed": 0,
+            "cleanup_confirmed": sum(_cleanup_confirmed(row) for row in scored),
+            "ok": sum(row["ok"] is True for row in scored),
+            "failed": sum(row["ok"] is not True for row in burst_rows),
             "total_planned": len(burst_rows),
-            "total_artifact_completed": len(burst_rows),
+            "total_artifact_completed": sum("artifact_ns" in row for row in burst_rows),
             "total_drained": len(burst_rows),
-            "total_cleanup_confirmed": len(burst_rows),
+            "total_cleanup_confirmed": sum(_cleanup_confirmed(row) for row in burst_rows),
         }
         mismatch = {
             name: {"expected": value, "actual": summary.get(name)}
@@ -641,8 +656,10 @@ def _validate_requests(
                 max(row["actual_launch_ns"] for row in burst_rows) - start_ns
             ) / 1_000_000,
             "completion_span_ms": (
-                max(row["artifact_ns"] for row in burst_rows) - start_ns
-            ) / 1_000_000,
+                (max(row["artifact_ns"] for row in burst_rows if "artifact_ns" in row)
+                 - start_ns) / 1_000_000
+                if any("artifact_ns" in row for row in burst_rows) else None
+            ),
             "drain_span_ms": (
                 max(row["finished_ns"] for row in burst_rows) - start_ns
             ) / 1_000_000,
@@ -651,7 +668,7 @@ def _validate_requests(
                 for row in scored
             ]),
             "latency_ms": reqscale.distribution([
-                float(row["blocking_ms"]) for row in scored
+                float(row["blocking_ms"]) for row in scored if row["ok"] is True
             ]),
         }
         mismatch = {
@@ -1407,13 +1424,15 @@ def _validate_provenance(provenance: dict, schedule: dict) -> tuple[str, str]:
 def _validate_status(status: dict, schedule: dict, provenance: dict) -> None:
     required_status = {
         "schema", "run_id", "valid", "bursts_completed", "bursts_planned",
-        "control", "sampler", "snapshot_identity_after", "run_before",
+        "failed_rates", "control", "sampler", "snapshot_identity_after", "run_before",
         "run_after", "final_cgroups", "error", "error_details", "errors",
     }
     if not isinstance(status, dict) or set(status) != required_status:
         raise AnalysisInvalid("terminal status fields are incomplete or unknown")
-    if status.get("schema") != "fcvm.chromium.reqscale.status.v2":
+    if status.get("schema") != reqscale.STATUS_SCHEMA:
         raise AnalysisInvalid("unsupported terminal status schema")
+    if not isinstance(status.get("failed_rates"), list):
+        raise AnalysisInvalid("terminal status failed_rates is not a list")
     if status.get("valid") is not True or status.get("errors") != []:
         raise AnalysisInvalid("run status is not valid and error-free")
     if status.get("error") is not None or status.get("error_details") is not None:
@@ -1715,7 +1734,10 @@ def _validate_fault_cgroup_membership(requests: list[dict], status: dict) -> Non
         for backend in ("file", "uffd")
     }
     for row in requests:
-        faults = row["firecracker_process_faults_ready_to_artifact"]
+        faults = row.get("firecracker_process_faults_ready_to_artifact")
+        if faults is None:
+            # Only a failed request lacks counters (_validate_requests).
+            continue
         identity = (faults["pid"], faults["pid_start_time_ticks"])
         if identity not in observed[row["backend"]]:
             raise AnalysisInvalid(
@@ -1836,6 +1858,15 @@ def _validate_fault_trace_artifacts(
                 )
 
 
+# A cell's published figures, each withheld (None) for a rate that failed.
+CELL_MEASUREMENTS = (
+    "offered_rps", "departure_rps", "artifact_latency_p95_ms", "drain_latency_p95_ms",
+    "score_end_backlog",
+    "firecracker_process_minor_faults_per_request_ready_to_artifact",
+    "firecracker_process_major_faults_per_request_ready_to_artifact",
+)
+
+
 def analyze(run_dir: str) -> dict:
     schedule = _load_json(os.path.join(run_dir, "schedule.json"))
     provenance = _load_json(os.path.join(run_dir, "provenance.json"))
@@ -1858,6 +1889,19 @@ def analyze(run_dir: str) -> dict:
     _validate_fault_trace_artifacts(
         run_dir, schedule, summaries, requests_by_burst
     )
+    # The burst totals now match the raw records, so the failures they imply
+    # are the raw records' own; the harness's account of them must agree.
+    derived_failures = {}
+    for summary in summaries:
+        failure = reqscale.burst_request_failures(summary)
+        if failure is not None:
+            derived_failures.setdefault(summary["target_rps"], []).append(failure)
+    if status["failed_rates"] != reqscale.failed_rate_records(derived_failures):
+        raise AnalysisInvalid(
+            "status failed_rates differ from the failures in the raw request records: "
+            f"status={status['failed_rates']} raw={reqscale.failed_rate_records(derived_failures)}"
+        )
+    failed_rates = set(derived_failures)
     run_id = schedule["run_id"]
     measurement_start_ns = min(summary["burst_start_ns"] for summary in summaries)
     measurement_end_ns = max(row["finished_ns"] for row in requests)
@@ -1916,6 +1960,26 @@ def analyze(run_dir: str) -> dict:
                 "repeat": burst["repeat"],
                 **verdict,
             })
+        if declared["target_rps"] in failed_rates:
+            # Strict per rate: a rate with any failed request publishes no
+            # latency, rate or fault figure, only that it failed and how.
+            scored = [burst["backends"][declared["backend"]] for burst in bursts]
+            cells.append({
+                **declared,
+                "passed": False,
+                "rate_failed": True,
+                "rate_failure": {
+                    "scored_failed": sum(row["failed"] for row in scored),
+                    "scored_artifact_missing": sum(
+                        row["planned"] - row["artifact_completed"] for row in scored),
+                    "scored_cleanup_unconfirmed": sum(
+                        row["planned"] - row["cleanup_confirmed"] for row in scored),
+                    "bursts": derived_failures[declared["target_rps"]],
+                },
+                "burst_verdicts": cell_rows,
+                **{name: None for name in CELL_MEASUREMENTS},
+            })
+            continue
         metric_seed = analysis_seed + cell_index * 100
         departure = [burst["backends"][declared["backend"]]["departure_rps"] for burst in bursts]
         offered = [burst["backends"][declared["backend"]]["offered_rps"] for burst in bursts]
@@ -1949,6 +2013,8 @@ def analyze(run_dir: str) -> dict:
         cells.append({
             **declared,
             "passed": all(row["passed"] for row in cell_rows),
+            "rate_failed": False,
+            "rate_failure": None,
             "burst_verdicts": cell_rows,
             "offered_rps": bootstrap_mean_ci(offered, metric_seed),
             "departure_rps": bootstrap_mean_ci(departure, metric_seed + 1),
@@ -2058,6 +2124,7 @@ def analyze(run_dir: str) -> dict:
         "trace_perturbation_gate": trace_gate,
         "fault_metric_scope": schedule["fault_metric_scope"],
         "cells": cells,
+        "failed_rates": sorted(failed_rates),
         "capacity": {
             "by_backend": capacities,
             "joint_highest_contiguous_passing_rate_per_second": joint,
@@ -2068,6 +2135,14 @@ def analyze(run_dir: str) -> dict:
 def _format_seconds(value):
     """`15 second` / `2.5 second`, without a trailing `.0` on whole numbers."""
     return f"{int(value)} second" if float(value).is_integer() else f"{value} second"
+
+
+def _failure_text(failure: dict) -> str:
+    return (
+        f"{failure['scored_failed']} scored requests failed, "
+        f"{failure['scored_cleanup_unconfirmed']} cleanups unconfirmed, "
+        f"{len(failure['bursts'])} bursts affected"
+    )
 
 
 def markdown_report(analysis: dict) -> str:
@@ -2124,6 +2199,12 @@ def markdown_report(analysis: dict) -> str:
         "|---|---:|:---:|---:|---:|---:|---:|---:|",
     ]
     for cell in sorted(analysis["cells"], key=lambda row: (row["target_rps"], row["backend"])):
+        if cell["rate_failed"]:
+            lines.append(
+                f"| {cell['backend'].upper()} | {cell['target_rps']:g} | "
+                f"no, rate failed ({_failure_text(cell['rate_failure'])}) | – | – | – | – | – |"
+            )
+            continue
         departure = cell["departure_rps"]
         offered = cell["offered_rps"]
         latency = cell["artifact_latency_p95_ms"]
@@ -2144,6 +2225,13 @@ def markdown_report(analysis: dict) -> str:
         "every lower rate also passed. This avoids selecting an isolated high-rate "
         "pass after a lower-rate failure.",
         "",
+        *([
+            "A rate fails as a whole when any of its requests, in any burst, failed "
+            "or left its clone's cleanup unconfirmed; its figures are withheld. "
+            "Failed rates per backend: "
+            + ", ".join(f"{rate:g}" for rate in analysis["failed_rates"]) + ".",
+            "",
+        ] if analysis["failed_rates"] else []),
         f"- FILE: {analysis['capacity']['by_backend']['file']['highest_contiguous_passing_rate_per_second']} requests/s",
         f"- UFFD: {analysis['capacity']['by_backend']['uffd']['highest_contiguous_passing_rate_per_second']} requests/s",
         f"- Joint: {analysis['capacity']['joint_highest_contiguous_passing_rate_per_second']} requests/s per backend",
@@ -2158,6 +2246,9 @@ def markdown_report(analysis: dict) -> str:
         "|---|---:|---:|---:|",
     ])
     for cell in sorted(analysis["cells"], key=lambda row: (row["target_rps"], row["backend"])):
+        if cell["rate_failed"]:
+            lines.append(f"| {cell['backend'].upper()} | {cell['target_rps']:g} | – | – |")
+            continue
         minor = cell["firecracker_process_minor_faults_per_request_ready_to_artifact"]
         major = cell["firecracker_process_major_faults_per_request_ready_to_artifact"]
         lines.append(
