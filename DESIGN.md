@@ -1496,20 +1496,38 @@ fcvm snapshot create my-vm --tag warm-nginx
 ```
 
 **Zero pages are holes**: with the default Firecracker build (`[firecracker]` in `rootfs-config.toml`, used by every
-kernel profile that does not set its own `firecracker_repo`), a Full snapshot written to a new memory file leaves every
-all-zero 4 KiB page as a hole. The fork tests each page as it dumps, so `memory.bin` stores only the non-zero pages and
-a hole reads back as zeros. With dirty tracking on, a diff from that build also holds the pages a discard emptied
-(balloon inflation, free page reporting) as zeros: a discard is not a guest write, so KVM's dirty log never records it,
-and the fork marks each discarded range itself. A diff writes every page the VM touched or a discard emptied, zeros
-included, and its merge punches each run of its all-zero pages at least `MERGE_MIN_PUNCH` long, measured within its 8
-MiB merge window, as a hole, so memory a restored guest gave back in runs that long is a hole in its snapshot. The
-`nested` arm64 profile builds its own fork (`nv2-on-main`), which writes every page of a Full snapshot and leaves
-discarded pages out of a diff. A diff's merge base is a copy of the parent's `memory.bin` made with `copy_file_range`,
-which on btrfs clones the parent's extents, so a child keeps its parent's holes.
+kernel profile that does not set its own `firecracker_repo`), a Full snapshot written to a new memory file leaves
+every all-zero 4 KiB page as a hole. The fork tests each page as it dumps, so `memory.bin` stores only the non-zero
+pages and a hole reads back as zeros. With dirty tracking on, a diff from that build also holds the pages a discard
+emptied (balloon inflation, free page reporting) as zeros: a discard is not a guest write, so KVM's dirty log never
+records it, and the fork marks each discarded range itself. A diff writes every page the VM touched or a discard
+emptied, zeros included, and its merge punches each run of its all-zero pages at least `MERGE_MIN_PUNCH` long,
+measured within its 8 MiB merge window, as a hole, so memory a restored guest gave back in runs that long is a hole in
+its snapshot. The `nested` arm64 profile builds its own fork (`nv2-on-main`), which writes every page of a Full
+snapshot and leaves discarded pages out of a diff. A diff starts from a clone or copy of the parent's `memory.bin`,
+which on btrfs shares the parent's extents, so a child keeps its parent's holes.
 
-**A snapshot of a restored VM**: a VM that was itself restored from a snapshot is saved as a diff. Firecracker
-writes the pages the VM touched to a sparse `memory.diff`, fcvm reflinks the base snapshot's `memory.bin`, and
-`merge_diff_snapshot` (`src/commands/common.rs`) copies each data run of the diff to the same offset of that copy:
+**A snapshot of a restored VM**: a VM that was itself restored from a snapshot is saved as a diff, written in
+place when the store allows it:
+
+- **In place.** Before the pause, fcvm clones the parent's `memory.bin` into the new snapshot with FICLONE
+  (`clone_base_for_in_place_diff`, `src/commands/common.rs`), and Firecracker writes the dirty pages into that clone:
+  every fork fcvm builds writes a diff into an existing memory file of the guest's size instead of truncating it. The
+  extents the snapshot wrote are then the clone's only extents no other file shares, which FIEMAP reports
+  (`src/storage/extents.rs`); Firecracker syncs the file before its create returns, so they are on disk when counted.
+  The dirty-tracking check below counts them, stopping at its minimum, and a diff whose extents cannot be read counts
+  as nothing written, so it is retried as Full. After the resume `punch_in_place_diff` reads those of them long enough
+  to hold a run to punch (most of a diff of scattered pages is not), punches their long zero runs as a merge does, and
+  flushes the file. A clone costs one reference per extent of the parent: 31.3 s for a 128 GiB guest's memory file of
+  4.34 million extents. The check found its minimum in 0.17 s on that clone after a million scattered page writes, and
+  a full walk of its extents took 7.1 s.
+- **Merged.** When the parent's `memory.bin` is not the guest's size (Firecracker would truncate it), the store
+  cannot clone it (another filesystem, tmpfs), or its filesystem does not report shared extents, Firecracker
+  writes the pages to a sparse `memory.diff`, fcvm copies the base snapshot's `memory.bin` after the resume, and
+  `merge_diff_snapshot` copies each data run of the diff to the same offset of that copy. On a 128 GiB guest that
+  had dirtied 6.4 GB in 1,008,048 runs, the merge took 236 s, against 66 s for Firecracker's write of the diff.
+
+The merge:
 
 - **Workers.** One for each 256 MiB or 4,096 writes (`MERGE_BYTES_PER_WORKER`, `MERGE_WRITES_PER_WORKER`), up to 16
   (`MERGE_WORKERS`), because one reader waits for one read at a time: on a 128 GiB guest with 38.1 GiB touched in
@@ -1538,6 +1556,10 @@ writes the pages the VM touched to a sparse `memory.diff`, fcvm reflinks the bas
 - `create_snapshot_core` logs `diff merge complete` with the diff's bytes and runs, the pieces written (`writes`), the
   holes punched (`punches`), the bytes they covered (`zero_bytes`), the bytes of zero runs written after a refusal
   (`unpunched_zero_bytes`), the workers and the duration.
+- An in-place diff logs `cloned the parent's memory file` with the clone's duration before the pause, or why it is
+  merged instead, and `diff written in place` after the resume with the bytes written (`written_bytes`), the
+  extents they lie in (`ranges`), the bytes read to find zero runs (`read_bytes`), the punches, `zero_bytes`,
+  `unpunched_zero_bytes` and the duration.
 
 
 #### `fcvm snapshot serve`
@@ -3049,7 +3071,7 @@ Kernel panic - not syncing: stack-protector: Kernel stack is corrupted in: do_id
 1. Load pre-start snapshot with `track_dirty_pages: true`
 2. Resume VM — VM boots, container initializes until healthy
 3. Pause VM — Create diff snapshot
-4. Merge diff into pre-start base → startup snapshot
+4. Write the diff into a clone of the pre-start base, in place or by a merge onto a copy → startup snapshot
 
 ### Root Cause
 
@@ -3098,10 +3120,13 @@ Investigated the Firecracker source (`ejc3/firecracker`, branch `bump-vsock-max-
 
 In `create_snapshot_core()`, after creating the diff snapshot but before resuming the VM:
 
-1. Check diff file's actual disk usage (`meta.blocks() * 512`)
-2. If `diff_allocated < memory_bytes / 1024` (0.1% of VM memory), the diff is corrupt
-3. Retry as Full snapshot while VM is still paused
-4. Skip the merge step and use the full snapshot directly
+1. Count what the diff wrote: the allocated blocks of a sparse `memory.diff` (`meta.blocks() * 512`), or the
+   unshared extents of an in-place diff's clone (`unshared_bytes_up_to`), read only as far as the minimum.
+   Extents that cannot be read count as nothing written
+2. If that is under `memory_bytes / 1024` (0.1% of VM memory), the diff is corrupt
+3. Remove the diff and retry as Full snapshot while VM is still paused. An in-place diff is `memory.bin` itself,
+   and a Full snapshot leaves all-zero pages as holes, so its removal must succeed or the retry fails
+4. Use the full snapshot directly, with no merge or punch pass
 
 This is a detection + recovery approach because the bug is in KVM kernel code we don't control.
 
