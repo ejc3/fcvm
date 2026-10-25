@@ -420,6 +420,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--ec2 aws --ec2-tiles 8 --ec2-regions <r1,r2,...> [--ec2-template fcvm-fleet-tile-x86_64]
                   [--ec2-on-demand-template <name>] [--fleet-name stage]] [--dns-zone fcvm.dev]
                  [--dns-token-secret <secret> [--dns-zone-id <id>] [--dns-nameservers <ns>,...]]
+                 [--dns-subzone <subzone> --dns-subzone-ns <ns>,... --dns-listen <addr:port> [--dns-rate-limit 200]]
                  [--tls-secret <secret>] [--secrets-region <region>]
 ```
 
@@ -458,18 +459,34 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   or leaves the fleet; names of the fleet's shape (`slot-<n>`, `ec2-<n>`, with or without a
   token, with or without `-v4`) that nothing references are deleted, at start too; every
   other name in the zone is left alone.
+- `--dns-subzone` makes the coordinator the authoritative DNS server of a subzone of
+  `--dns-zone` (the parent delegates it with NS records naming `--dns-subzone-ns`, and no DS
+  record) and names launches there instead: `<label>.<subzone>` AAAA and
+  `<label>-v4.<subzone>` A, TTL 60. Minting a launch's label and publishing its names are
+  one step of the coordinator's state, and the server answers from that state, so a name
+  answers from the moment a viewer can learn it, with no wait. It listens on
+  `--dns-listen`, UDP and TCP (a high port; a load balancer maps 53), and answers only for
+  the subzone: SOA (negative TTL 5 s), NS, the published names, and
+  `_acme-challenge.<subzone>` as a CNAME to `_acme-challenge.<zone>`; NXDOMAIN or NODATA
+  with the SOA; REFUSED for any other name; AA set, no recursion, EDNS(0), TC over UDP when
+  the client's buffer is too small. Over UDP, past `--dns-rate-limit` responses a second
+  per source /24 or /56, every second response goes out truncated and the rest are
+  dropped. With `--dns-token-secret` it deletes, once at start, the launch names earlier
+  written to the parent zone.
 - `--tls-secret` keeps the wildcard certificate renewed (see "Certificate").
 
 ### Certificate
 
-The wildcard certificate (`*.<zone>` and `<zone>`) lives in one Secrets Manager secret,
+The wildcard certificate (`*.<zone>`, `<zone>` and, with `--dns-subzone`, `*.<subzone>`)
+lives in one Secrets Manager secret,
 a JSON object: `cert` (PEM full chain), `key` (PEM private key), `domains`, `not_after` and
 `issued_at` (RFC 3339 UTC) and `issuer` (fleet/tools/issue-cert.sh writes the first one).
 Twice a day the coordinator reads it; within 30 days of `not_after` (or when it is missing
-or does not cover the zone) it orders a new certificate from Let's Encrypt
-(`--acme-directory` for another CA), answers DNS-01 with `_acme-challenge` TXT records
-through the DNS token, waits until public DNS shows them, stores the new version and
-removes the records. Its key is PKCS#8 (`PRIVATE KEY`), where issue-cert.sh wrote SEC 1;
+or does not cover every one of those names) it orders a new certificate from Let's Encrypt
+(`--acme-directory` for another CA), answers DNS-01 with TXT records at
+`_acme-challenge.<zone>` through the DNS token (the subzone's challenge name is a CNAME to
+it), waits until public DNS shows them, stores the new version and removes the records. A
+renewal that fails is tried again 15 minutes later. Its key is PKCS#8 (`PRIVATE KEY`), where issue-cert.sh wrote SEC 1;
 both are PEM that nginx and rustls read. Renderers get it from their agent
 (`--tls-secret`), tiles from their own instance role.
 

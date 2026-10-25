@@ -310,6 +310,27 @@ pub struct FleetCoordArgs {
     #[arg(long, value_delimiter = ',')]
     pub dns_nameservers: Vec<String>,
 
+    /// Serve the launch names from this subzone of --dns-zone as its authoritative DNS
+    /// server (`<label>.<subzone>`) instead of writing them through the Cloudflare API: a
+    /// name answers from the moment it is published. The parent zone delegates the subzone
+    /// with NS records and no DS record.
+    #[arg(long, requires_all = ["dns_subzone_ns", "dns_listen"])]
+    pub dns_subzone: Option<String>,
+
+    /// The subzone's nameserver names (comma separated), as the parent's NS records name them
+    #[arg(long, value_delimiter = ',')]
+    pub dns_subzone_ns: Vec<String>,
+
+    /// Where the subzone's DNS server listens, UDP and TCP (a high port: the load balancer
+    /// in front maps port 53 to it)
+    #[arg(long)]
+    pub dns_listen: Option<std::net::SocketAddr>,
+
+    /// UDP responses per second per source prefix (/24, /56); past it, every second one is
+    /// sent truncated and the rest are dropped
+    #[arg(long, default_value_t = 200)]
+    pub dns_rate_limit: u32,
+
     /// Keep the wildcard certificate in this secret renewed (30 days before expiry, ACME
     /// DNS-01 through the DNS token)
     #[arg(long, requires = "dns_token_secret")]
