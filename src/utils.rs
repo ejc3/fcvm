@@ -1390,21 +1390,85 @@ pub fn ensure_sbin_on_path() {
     }
 }
 
-/// Build identity of a cached image-delivery artifact: inode, size, and mtime.
+/// Build identity of a cached image-delivery artifact (an overlay storage image or the
+/// NVIDIA driver image): the SHA-256 of its bytes, as `sha256:<hex>`.
 ///
 /// The content-addressed cache path names the IMAGE the artifact was built
-/// from, not the build itself — and `podman load` randomizes overlay layer
+/// from, not the build itself, and `podman load` randomizes overlay layer
 /// link IDs on every build, so two builds of the same digest are NOT
 /// interchangeable once a snapshot has provisioned a container against one of
-/// them. Atomic-rename installation means a rebuild always produces a new
-/// inode, so this triple distinguishes builds cheaply (one stat) without
-/// hashing multi-hundred-MB files.
-pub fn file_identity(path: &std::path::Path) -> anyhow::Result<String> {
-    Ok(metadata_identity(&std::fs::metadata(path)?))
+/// them. Their bytes differ, so the digest tells them apart. It is the bytes and not
+/// the inode and mtime because a copy of the same build must keep its snapshots: the
+/// fleet's GPU hosts restore their store from a tar archive, which gives every file a
+/// new inode and, in GNU tar's default format, a whole-second mtime (#1219).
+///
+/// Hashing reads the whole file, so the digest is memoised by `version_cache` under the
+/// file's path, modification time and length: it is computed once per build of a file
+/// (and once more on a host whose copy did not keep the mtime to the nanosecond), and a
+/// launch after that costs one stat and a read of a small cache entry. Hashing reads
+/// 210 MB/s on a g4dn.metal (Xeon 8259CL, no SHA instructions): 6.6 s for the fleet's
+/// 1.38 GB driver image and 0.58 s for its 122 MB renderer storage image, page cache
+/// warm. An unwritable cache directory degrades to hashing on every launch. The cache is valid for one
+/// mtime and length, so a different build written at the same path with the same
+/// length within one timestamp tick of the cached one would be read as that build;
+/// builds of these images write gigabytes and take seconds.
+pub fn image_disk_digest(path: &std::path::Path) -> anyhow::Result<String> {
+    crate::version_cache::derived_from_file(path, IMAGE_DISK_DIGEST_NAMESPACE, |stamp| {
+        sha256_of_unchanged_file(path, stamp)
+    })
 }
 
-/// `file_identity` of metadata already read, for a caller that checks other fields
-/// of the same stat.
+/// `version_cache` namespace of `image_disk_digest`; a change to the digest's format
+/// changes it.
+const IMAGE_DISK_DIGEST_NAMESPACE: &str = "image-disk-sha256-v1";
+
+/// SHA-256 of the file at `path`. Refused unless the open file has `stamp`, the stamp
+/// the digest is cached under, before and after it is read, so a rebuild racing the read
+/// is never cached as the digest of either build. The refusal carries the "image disk
+/// build changed" marker, so a restore that meets it falls back to a cold boot.
+fn sha256_of_unchanged_file(
+    path: &std::path::Path,
+    stamp: Option<crate::version_cache::FileStamp>,
+) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("open image disk {}", path.display()))?;
+    let stamp_of = |file: &std::fs::File| -> anyhow::Result<_> {
+        let md = file
+            .metadata()
+            .with_context(|| format!("stat image disk {}", path.display()))?;
+        Ok(crate::version_cache::FileStamp::of(&md))
+    };
+    let changed = || {
+        anyhow::anyhow!(
+            "image disk build changed while it was hashed: {}",
+            path.display()
+        )
+    };
+    let before = stamp_of(&file)?;
+    if before.is_none() || before != stamp {
+        return Err(changed());
+    }
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("read image disk {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    if stamp_of(&file)? != before {
+        return Err(changed());
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+}
+
+/// Identity of a file from metadata already read: inode, size and mtime. Callers that
+/// need a change to the file in place to show also compare its ctime.
 pub fn metadata_identity(md: &std::fs::Metadata) -> String {
     use std::os::unix::fs::MetadataExt;
     format!(
@@ -1438,11 +1502,12 @@ pub fn is_overlay_storage_image(path: &std::path::Path) -> bool {
 /// error text is matched by `is_snapshot_load_failure` so a restore-time
 /// mismatch invalidates the snapshot and falls back to a fresh boot.
 pub fn verify_image_disk_identity(path: &std::path::Path, expected: &str) -> anyhow::Result<()> {
-    let current =
-        file_identity(path).with_context(|| format!("re-stat image disk {}", path.display()))?;
+    let current = image_disk_digest(path)
+        .with_context(|| format!("re-read image disk {}", path.display()))?;
     anyhow::ensure!(
         current == expected,
-        "image disk build changed during launch: {} is now {current}, snapshot/key was          computed against {expected}",
+        "image disk build changed during launch: {} is now {current}, snapshot/key was \
+         computed against {expected}",
         path.display()
     );
     Ok(())
@@ -1465,17 +1530,54 @@ mod image_disk_identity_tests {
         assert!(!is_overlay_storage_image(std::path::Path::new("/tmp/img")));
     }
 
+    /// The digest is cached under the stamp `version_cache` read before the hash. A file
+    /// that is not at that stamp when it is read (a rebuild renamed in between) is
+    /// refused with the marker that turns a restore into a cold boot, so it is never
+    /// cached as the digest of the other build.
+    #[test]
+    fn a_digest_is_refused_for_a_file_not_at_the_cached_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.storage-v2.img");
+        std::fs::write(&path, b"build one").unwrap();
+        let stamp =
+            crate::version_cache::FileStamp::of(&std::fs::metadata(&path).unwrap()).unwrap();
+        assert!(sha256_of_unchanged_file(&path, Some(stamp)).is_ok());
+        for other in [
+            None,
+            Some(crate::version_cache::FileStamp {
+                mtime_ns: stamp.mtime_ns + 1,
+                ..stamp
+            }),
+        ] {
+            let err = sha256_of_unchanged_file(&path, other).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("image disk build changed"),
+                "{err:#}"
+            );
+        }
+    }
+
     #[test]
     fn verify_image_disk_identity_detects_a_rebuild() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x.storage-v2.img");
         std::fs::write(&path, b"build one").unwrap();
-        let recorded = file_identity(&path).unwrap();
+        let recorded = image_disk_digest(&path).unwrap();
         // Same build: passes.
         verify_image_disk_identity(&path, &recorded).expect("unchanged file must verify");
-        // Rebuild at the same path (unique temp + atomic rename => new inode).
+        // Rebuild at the same path (unique temp + atomic rename => new inode), written
+        // after the first build. The digest is cached under the path, mtime and length,
+        // so the rebuild's mtime is set apart from the first build's: two writes in this
+        // test can share one timestamp tick, two real builds of an image cannot.
         let tmp = dir.path().join("x.tmp");
         std::fs::write(&tmp, b"build two").unwrap();
+        let first = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&tmp)
+            .unwrap()
+            .set_modified(first + std::time::Duration::from_secs(1))
+            .unwrap();
         std::fs::rename(&tmp, &path).unwrap();
         let err = verify_image_disk_identity(&path, &recorded)
             .expect_err("a rebuilt file must fail verification");
