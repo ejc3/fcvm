@@ -44,6 +44,10 @@ test-runner-acceptance:
 	python3 scripts/test-runner-acceptance.py
 
 # Offline CI trust and AWS argument regressions. No credentials or builds.
+.PHONY: test-ci-scope
+test-ci-scope:
+	python3 scripts/test-ci-stack-scope.py
+
 .PHONY: test-ci-security test-ci-workflow-security test-ami-security
 test-ci-security: test-ci-workflow-security test-ami-security
 test-ci-workflow-security:
