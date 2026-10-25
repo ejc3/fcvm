@@ -4776,6 +4776,8 @@ struct PoolEc2 {
     /// Instances a filtered DescribeInstances lists as stopped and pooled whatever they are
     /// (a list read before a resume and a release changed them).
     listed_stopped: Vec<String>,
+    /// TerminateInstances calls that fail before one succeeds.
+    terminate_fails: u32,
     actions: Vec<String>,
 }
 
@@ -4906,6 +4908,10 @@ async fn pool_ec2_api(api: Arc<std::sync::Mutex<PoolEc2>>) -> String {
                     ok("<CancelSpotInstanceRequestsResponse/>".into())
                 }
                 "TerminateInstances" => {
+                    if a.terminate_fails > 0 {
+                        a.terminate_fails -= 1;
+                        return (StatusCode::SERVICE_UNAVAILABLE, "<Response><Errors><Error><Code>RequestLimitExceeded</Code><Message>slow down</Message></Error></Errors></Response>".into());
+                    }
                     for id in ids(&p, "InstanceId") {
                         let sir = a.instances[&id].3.clone();
                         if sir.is_some_and(|r| !r.starts_with("sir-once-") && !a.cancelled.contains(&r)) {
@@ -4960,6 +4966,87 @@ fn state_of(
     let a = api.lock().unwrap();
     let (st, tags, _, _) = &a.instances[id];
     (st.clone(), tags.clone())
+}
+
+/// A stale pooled instance (an older image) whose termination fails is tried again at the
+/// next resume: its claim is released with the failure, not kept for the coordinator's
+/// lifetime, where every later resume would step over it and it would stay counted in the pool.
+#[tokio::test]
+async fn a_stale_pooled_tile_whose_termination_fails_is_terminated_at_the_next_resume() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, api) = pool_driver(2).await;
+    {
+        let mut a = api.lock().unwrap();
+        let tags: BTreeMap<String, String> = [
+            ("Purpose", "fcvm-fleet-tile"),
+            ("Fleet", "stage-test"),
+            ("FleetPool", "stage-test"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        a.instances.insert(
+            "i-stale000000001".into(),
+            (
+                "stopped".into(),
+                tags,
+                "ami-0older0000000000".into(),
+                Some("sir-7".into()),
+            ),
+        );
+        a.terminate_fails = 1;
+    }
+    assert!(d.resume("ec2-1").await.is_none());
+    assert_eq!(
+        api.lock().unwrap().instances["i-stale000000001"].0,
+        "stopped"
+    );
+    assert!(d.resume("ec2-1").await.is_none());
+    let (state, actions) = {
+        let a = api.lock().unwrap();
+        (a.instances["i-stale000000001"].0.clone(), a.actions.clone())
+    };
+    assert_eq!(
+        state, "terminated",
+        "the second resume did not try the stale instance again: {actions:?}"
+    );
+}
+
+/// DescribeInstances and DescribeSpotInstanceRequests are read item by item: EC2 does not
+/// promise the order of an item's elements, so a field before `<instanceId>` (or a request
+/// type before its id) belongs to its own item, not to the one before it.
+#[test]
+fn ec2_answers_parse_by_item_whatever_the_field_order() {
+    use fcvm::fleet::coord::ec2_aws::{parse_instances, persistent_requests};
+    let xml = "<DescribeInstancesResponse><reservationSet><item><instancesSet>\
+        <item><imageId>ami-a</imageId><instanceState><name>stopped</name></instanceState>\
+        <tagSet><item><key>FleetPool</key><value>stage</value></item></tagSet>\
+        <spotInstanceRequestId>sir-a</spotInstanceRequestId><instanceId>i-a</instanceId></item>\
+        <item><instanceId>i-b</instanceId><imageId>ami-b</imageId>\
+        <instanceState><name>running</name></instanceState></item>\
+        </instancesSet></item></reservationSet></DescribeInstancesResponse>";
+    let got = parse_instances(xml);
+    assert_eq!(got.len(), 2, "{got:?}");
+    let a = got.iter().find(|i| i.id == "i-a").unwrap();
+    let b = got.iter().find(|i| i.id == "i-b").unwrap();
+    assert_eq!(
+        (a.image.as_deref(), a.state.as_str()),
+        (Some("ami-a"), "stopped")
+    );
+    assert!(
+        a.pooled && a.spot_request.as_deref() == Some("sir-a"),
+        "{a:?}"
+    );
+    assert_eq!(
+        (b.image.as_deref(), b.state.as_str()),
+        (Some("ami-b"), "running")
+    );
+    assert!(!b.pooled && b.spot_request.is_none(), "{b:?}");
+    let sirs = "<DescribeSpotInstanceRequestsResponse><spotInstanceRequestSet>\
+        <item><type>persistent</type><spotInstanceRequestId>sir-p</spotInstanceRequestId></item>\
+        <item><spotInstanceRequestId>sir-o</spotInstanceRequestId><type>one-time</type></item>\
+        </spotInstanceRequestSet></DescribeSpotInstanceRequestsResponse>";
+    assert_eq!(persistent_requests(sirs), vec!["sir-p".to_string()]);
 }
 
 /// A tile released when the fleet sleeps is stopped into the pool, and the next wake starts

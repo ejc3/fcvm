@@ -23,7 +23,7 @@
 //! readiness does not wait for DNS. `alive` reads the instance's state and asks the same
 //! `/health` again, so a renderer that crashed on a running instance is noticed.
 
-use super::aws::{signed, xml_tag, CredentialChain};
+use super::aws::{set_items, signed, xml_tag, CredentialChain};
 use super::ec2::{Ec2Driver, LaunchError, Launched, Liveness};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -83,34 +83,22 @@ pub struct Instance {
 /// stopped instance cannot be started after that.
 pub const POOL_MAX_AGE: Duration = Duration::from_secs(6 * 24 * 3600);
 
-/// The persistent requests of a DescribeSpotInstanceRequests answer.
+/// The persistent requests of a DescribeSpotInstanceRequests answer, one per item of its
+/// `spotInstanceRequestSet`.
 pub fn persistent_requests(xml: &str) -> Vec<String> {
-    let marks: Vec<usize> = xml
-        .match_indices("<spotInstanceRequestId>")
-        .map(|(i, _)| i)
-        .collect();
-    marks
-        .iter()
-        .enumerate()
-        .filter_map(|(n, &start)| {
-            let seg = &xml[start..marks.get(n + 1).copied().unwrap_or(xml.len())];
-            (xml_tag(seg, "type").as_deref() == Some("persistent"))
-                .then(|| xml_tag(seg, "spotInstanceRequestId"))
-                .flatten()
-        })
+    set_items(xml, "spotInstanceRequestSet")
+        .into_iter()
+        .filter(|item| xml_tag(item, "type").as_deref() == Some("persistent"))
+        .filter_map(|item| xml_tag(item, "spotInstanceRequestId"))
         .collect()
 }
 
-/// The instances of a DescribeInstances answer. Each `<instanceId>` at instance level opens
-/// one (tag sets and network interfaces carry none).
+/// The instances of a DescribeInstances answer, one per item of its `instancesSet` lists:
+/// an instance's fields can come in any order, so the item bounds it.
 pub fn parse_instances(xml: &str) -> Vec<Instance> {
-    let marks: Vec<usize> = xml.match_indices("<instanceId>").map(|(i, _)| i).collect();
-    marks
-        .iter()
-        .enumerate()
-        .filter_map(|(n, &start)| {
-            let end = marks.get(n + 1).copied().unwrap_or(xml.len());
-            let seg = &xml[start..end];
+    set_items(xml, "instancesSet")
+        .into_iter()
+        .filter_map(|seg| {
             Some(Instance {
                 id: xml_tag(seg, "instanceId")?,
                 state: xml_tag(seg, "instanceState")
@@ -558,7 +546,16 @@ impl AwsEc2 {
             };
             let ids: Vec<&str> = stale.iter().map(|i| i.id.as_str()).collect();
             tracing::info!(%region, instances = ?ids, %image, "terminating pooled tiles of an older image or past the pool's age");
-            self.terminate_all(&region, &stale).await?;
+            let done = self.terminate_all(&region, &stale).await;
+            // Released either way: a terminated instance is not listed as stopped again, and
+            // one whose termination failed is tried again at the next resume.
+            {
+                let mut c = self.claimed.lock().unwrap();
+                for i in &stale {
+                    c.remove(&i.id);
+                }
+            }
+            done?;
         }
         for cand in fresh {
             if !self.claimed.lock().unwrap().insert(cand.id.clone()) {
