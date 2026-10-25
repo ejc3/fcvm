@@ -29,14 +29,28 @@ pub struct CertDoc {
 /// Renew this long before expiry.
 pub const RENEW_BEFORE: chrono::Duration = chrono::Duration::days(30);
 
+/// The names the certificate covers: the zone, its wildcard and `extra`.
+pub fn domains(zone: &str, extra: &[String]) -> Vec<String> {
+    let mut d = vec![format!("*.{zone}"), zone.to_string()];
+    d.extend(extra.iter().cloned());
+    d
+}
+
 /// Whether the stored secret needs a new certificate now: missing, unreadable, not
-/// covering the zone, or expiring within `RENEW_BEFORE`.
-pub fn needs_renewal(secret: Option<&str>, zone: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+/// covering every name of [`domains`], or expiring within `RENEW_BEFORE`.
+pub fn needs_renewal(
+    secret: Option<&str>,
+    zone: &str,
+    extra: &[String],
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
     let Some(doc) = secret.and_then(|s| serde_json::from_str::<CertDoc>(s).ok()) else {
         return true;
     };
-    let covers = |d: &str| doc.domains.iter().any(|x| x == d);
-    if !covers(&format!("*.{zone}")) || !covers(zone) {
+    if !domains(zone, extra)
+        .iter()
+        .all(|d| doc.domains.iter().any(|x| x == d))
+    {
         return true;
     }
     match chrono::DateTime::parse_from_rfc3339(&doc.not_after) {
@@ -77,8 +91,16 @@ pub fn doc_from_pem(chain: &str, key: &str, now: chrono::DateTime<chrono::Utc>) 
 pub struct Renewal {
     pub secret: String,
     pub zone: String,
+    /// Names beyond the zone and its wildcard: the launch subzone's wildcard, whose
+    /// `_acme-challenge` the subzone's server answers with a CNAME to the zone's own, so
+    /// every challenge record is written at `_acme-challenge.<zone>`.
+    pub extra: Vec<String>,
     pub directory: String,
     pub check_every: Duration,
+    /// How soon a renewal that failed is tried again (a certificate that does not cover a
+    /// new name is due at once, and waiting `check_every` would leave it uncovered for half
+    /// a day). Let's Encrypt allows 5 failed validations per name per hour.
+    pub retry_after: Duration,
     /// Where DNS-01 answers are checked before telling the CA (a DNS-over-HTTPS JSON API).
     pub doh: String,
 }
@@ -88,8 +110,10 @@ impl Renewal {
         Renewal {
             secret,
             zone,
+            extra: Vec::new(),
             directory: instant_acme::LetsEncrypt::Production.url().to_string(),
             check_every: Duration::from_secs(12 * 3600),
+            retry_after: Duration::from_secs(15 * 60),
             doh: "https://cloudflare-dns.com/dns-query".into(),
         }
     }
@@ -144,10 +168,10 @@ pub async fn issue(r: &Renewal, cf: &mut Cloudflare) -> Result<CertDoc> {
         )
         .await
         .context("creating the ACME account")?;
-    let ids = [
-        Identifier::Dns(format!("*.{}", r.zone)),
-        Identifier::Dns(r.zone.clone()),
-    ];
+    let ids: Vec<Identifier> = domains(&r.zone, &r.extra)
+        .into_iter()
+        .map(Identifier::Dns)
+        .collect();
     let mut order = account
         .new_order(&NewOrder::new(&ids))
         .await
@@ -210,14 +234,16 @@ pub async fn run(r: Renewal, secrets: Secrets, mut cf: Cloudflare) {
     loop {
         let current = secrets.get(&r.secret).await;
         let due = match &current {
-            Ok(s) => needs_renewal(Some(s), &r.zone, chrono::Utc::now()),
+            Ok(s) => needs_renewal(Some(s), &r.zone, &r.extra, chrono::Utc::now()),
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "the certificate secret could not be read");
                 false
             }
         };
+        let mut wait = r.check_every;
         if due {
-            tracing::info!(zone = %r.zone, "renewing the wildcard certificate");
+            tracing::info!(zone = %r.zone, extra = ?r.extra, "renewing the wildcard certificate");
+            wait = r.retry_after;
             match issue(&r, &mut cf).await {
                 Ok(doc) => match secrets
                     .put(
@@ -226,7 +252,10 @@ pub async fn run(r: Renewal, secrets: Secrets, mut cf: Cloudflare) {
                     )
                     .await
                 {
-                    Ok(()) => tracing::info!(not_after = %doc.not_after, "certificate renewed"),
+                    Ok(()) => {
+                        tracing::info!(not_after = %doc.not_after, "certificate renewed");
+                        wait = r.check_every;
+                    }
                     Err(e) => {
                         tracing::error!(error = %format!("{e:#}"), "the renewed certificate was not stored")
                     }
@@ -234,7 +263,7 @@ pub async fn run(r: Renewal, secrets: Secrets, mut cf: Cloudflare) {
                 Err(e) => tracing::error!(error = %format!("{e:#}"), "certificate renewal failed"),
             }
         }
-        tokio::time::sleep(r.check_every).await;
+        tokio::time::sleep(wait).await;
     }
 }
 
@@ -257,21 +286,46 @@ mod tests {
         assert!(!needs_renewal(
             Some(&doc("2026-11-22T00:00:01Z", &both)),
             "fcvm.dev",
+            &[],
             now
         ));
         assert!(needs_renewal(
             Some(&doc("2026-11-22T00:00:00Z", &both)),
             "fcvm.dev",
+            &[],
             now
         ));
         assert!(needs_renewal(
             Some(&doc("2027-01-01T00:00:00Z", &["*.fcvm.dev"])),
             "fcvm.dev",
+            &[],
             now
         ));
-        assert!(needs_renewal(Some("not json"), "fcvm.dev", now));
-        assert!(needs_renewal(None, "fcvm.dev", now));
-        assert!(needs_renewal(Some(&doc("soon", &both)), "fcvm.dev", now));
+        assert!(needs_renewal(Some("not json"), "fcvm.dev", &[], now));
+        assert!(needs_renewal(None, "fcvm.dev", &[], now));
+        // A subzone's wildcard the certificate does not cover yet.
+        let sub = ["*.tiles.fcvm.dev".to_string()];
+        assert!(needs_renewal(
+            Some(&doc("2027-01-01T00:00:00Z", &both)),
+            "fcvm.dev",
+            &sub,
+            now
+        ));
+        assert!(!needs_renewal(
+            Some(&doc(
+                "2027-01-01T00:00:00Z",
+                &["*.fcvm.dev", "fcvm.dev", "*.tiles.fcvm.dev"]
+            )),
+            "fcvm.dev",
+            &sub,
+            now
+        ));
+        assert!(needs_renewal(
+            Some(&doc("soon", &both)),
+            "fcvm.dev",
+            &[],
+            now
+        ));
     }
 
     #[test]
@@ -296,6 +350,7 @@ mod tests {
         assert!(!needs_renewal(
             Some(&serde_json::to_string(&d).unwrap()),
             "fcvm.example",
+            &[],
             now
         ));
     }

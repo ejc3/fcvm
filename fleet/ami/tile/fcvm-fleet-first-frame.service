@@ -1,6 +1,10 @@
 [Unit]
 Description=fcvm fleet tile: record the renderer's first frame after boot
-After=fcvm-fleet-renderer.service
+# Not after cloud-init, like the renderer it watches (fcvm-fleet-renderer.service).
+DefaultDependencies=no
+After=local-fs.target fcvm-fleet-renderer.service
+Conflicts=shutdown.target
+Before=shutdown.target
 
 [Service]
 Type=oneshot

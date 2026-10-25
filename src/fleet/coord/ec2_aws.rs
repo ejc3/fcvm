@@ -1,8 +1,9 @@
 //! The EC2 half on AWS: one instance per tile from the tile launch template (one-time spot),
 //! tagged at launch (`Purpose=fcvm-fleet-tile`, `FleetTile=<tile>`), terminated by id. A
-//! launch tries each fleet region in order; when every region refuses for capacity it tries
-//! the on-demand template, if one is configured, and otherwise reports no capacity, which the
-//! tile records as a capacity wait.
+//! launch tries each fleet region in order, and in a region with configured subnets each
+//! subnet (one per AZ) in order, before the next region; when every one refuses for capacity
+//! it tries the on-demand template the same way, if one is configured, and otherwise reports
+//! no capacity, which the tile records as a capacity wait.
 //!
 //! The pool (`pool_max` above 0, with `pool_template`): a tile that leaves the assignment
 //! (the fleet sleeps) has its instance stopped and tagged `FleetPool=<fleet>` instead of
@@ -57,6 +58,9 @@ pub struct AwsEc2 {
     claimed: std::sync::Mutex<HashSet<String>>,
     /// Held while a release counts the pool and tags an instance into it.
     pool_lock: tokio::sync::Mutex<()>,
+    /// Per region, the subnets (one per AZ) a launch tries in order, and the security group
+    /// the tile's interface gets there. A region without subnets launches in the template's.
+    pub networks: BTreeMap<String, Network>,
     chain: CredentialChain,
     http: reqwest::Client,
 }
@@ -121,6 +125,60 @@ pub fn parse_instances(xml: &str) -> Vec<Instance> {
             })
         })
         .collect()
+}
+
+/// A region's tile network: its subnets, tried in order, and the security group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Network {
+    pub subnets: Vec<String>,
+    pub security_group: String,
+}
+
+/// The tile networks from `--ec2-subnets` (`<region>:<subnet>[,<subnet>...]`) and
+/// `--ec2-security-group` (`<region>:<group>`). Every region with subnets needs a group;
+/// empty entries (an empty environment variable) are skipped.
+pub fn networks(subnets: &[String], groups: &[String]) -> Result<BTreeMap<String, Network>> {
+    let split = |flag: &str, entry: &str| -> Result<(String, String)> {
+        let (region, rest) = entry
+            .split_once(':')
+            .filter(|(r, v)| !r.is_empty() && !v.is_empty())
+            .with_context(|| format!("{flag} {entry:?} is not <region>:<value>"))?;
+        Ok((region.to_string(), rest.to_string()))
+    };
+    let mut sgs = BTreeMap::new();
+    for g in groups.iter().map(|g| g.trim()).filter(|g| !g.is_empty()) {
+        let (region, sg) = split("--ec2-security-group", g)?;
+        anyhow::ensure!(
+            sgs.insert(region.clone(), sg).is_none(),
+            "--ec2-security-group names {region} twice"
+        );
+    }
+    let mut out = BTreeMap::new();
+    for e in subnets.iter().map(|e| e.trim()).filter(|e| !e.is_empty()) {
+        let (region, list) = split("--ec2-subnets", e)?;
+        let subnets: Vec<String> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        anyhow::ensure!(!subnets.is_empty(), "--ec2-subnets {e:?} names no subnet");
+        let security_group = sgs.get(&region).cloned().with_context(|| {
+            format!("--ec2-subnets names {region}, which has no --ec2-security-group")
+        })?;
+        anyhow::ensure!(
+            out.insert(
+                region.clone(),
+                Network {
+                    subnets,
+                    security_group
+                }
+            )
+            .is_none(),
+            "--ec2-subnets names {region} twice"
+        );
+    }
+    Ok(out)
 }
 
 /// Errors EC2 gives when it has no capacity for the request (as opposed to a broken one).
@@ -257,6 +315,7 @@ impl AwsEc2 {
             claimed: std::sync::Mutex::new(HashSet::new()),
             pool_lock: tokio::sync::Mutex::new(()),
             fleet: "stage".into(),
+            networks: BTreeMap::new(),
             chain: CredentialChain::new()?,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
@@ -618,27 +677,42 @@ impl AwsEc2 {
         self.terminate_all(region, &[inst]).await
     }
 
-    async fn run(&self, region: &str, template: &str, tile: &str) -> Result<String, CallError> {
-        let xml = self
-            .call(
-                region,
-                &[
-                    ("Action", "RunInstances".into()),
-                    ("LaunchTemplate.LaunchTemplateName", template.into()),
-                    ("LaunchTemplate.Version", "$Latest".into()),
-                    ("MinCount", "1".into()),
-                    ("MaxCount", "1".into()),
-                    ("ClientToken", uuid::Uuid::new_v4().to_string()),
-                    ("TagSpecification.1.ResourceType", "instance".into()),
-                    ("TagSpecification.1.Tag.1.Key", "Purpose".into()),
-                    ("TagSpecification.1.Tag.1.Value", "fcvm-fleet-tile".into()),
-                    ("TagSpecification.1.Tag.2.Key", "FleetTile".into()),
-                    ("TagSpecification.1.Tag.2.Value", tile.into()),
-                    ("TagSpecification.1.Tag.3.Key", "Fleet".into()),
-                    ("TagSpecification.1.Tag.3.Value", self.fleet.clone()),
-                ],
-            )
-            .await?;
+    /// One RunInstances from `template`, in `subnet` when given. Naming a subnet means naming
+    /// the whole interface the template describes (its group, a public IPv4 and one IPv6
+    /// address), since a request's interface replaces the template's.
+    async fn run(
+        &self,
+        region: &str,
+        template: &str,
+        tile: &str,
+        subnet: Option<(&str, &str)>,
+    ) -> Result<String, CallError> {
+        let mut params: Vec<(&str, String)> = vec![
+            ("Action", "RunInstances".into()),
+            ("LaunchTemplate.LaunchTemplateName", template.into()),
+            ("LaunchTemplate.Version", "$Latest".into()),
+            ("MinCount", "1".into()),
+            ("MaxCount", "1".into()),
+            ("ClientToken", uuid::Uuid::new_v4().to_string()),
+            ("TagSpecification.1.ResourceType", "instance".into()),
+            ("TagSpecification.1.Tag.1.Key", "Purpose".into()),
+            ("TagSpecification.1.Tag.1.Value", "fcvm-fleet-tile".into()),
+            ("TagSpecification.1.Tag.2.Key", "FleetTile".into()),
+            ("TagSpecification.1.Tag.2.Value", tile.into()),
+            ("TagSpecification.1.Tag.3.Key", "Fleet".into()),
+            ("TagSpecification.1.Tag.3.Value", self.fleet.clone()),
+        ];
+        if let Some((subnet, group)) = subnet {
+            params.extend([
+                ("NetworkInterface.1.DeviceIndex", "0".to_string()),
+                ("NetworkInterface.1.SubnetId", subnet.to_string()),
+                ("NetworkInterface.1.SecurityGroupId.1", group.to_string()),
+                ("NetworkInterface.1.AssociatePublicIpAddress", "true".into()),
+                ("NetworkInterface.1.Ipv6AddressCount", "1".into()),
+                ("NetworkInterface.1.DeleteOnTermination", "true".into()),
+            ]);
+        }
+        let xml = self.call(region, &params).await?;
         xml_tag(&xml, "instanceId")
             .ok_or_else(|| CallError::Other(anyhow::anyhow!("RunInstances named no instance")))
     }
@@ -664,18 +738,33 @@ impl Ec2Driver for AwsEc2 {
         let templates = std::iter::once(first).chain(self.on_demand_template.iter());
         for template in templates {
             for region in &self.regions {
-                match self.run(region, template, tile).await {
-                    Ok(id) => {
-                        tracing::info!(%tile, %region, %template, instance = %id, "tile launched");
-                        return Ok(Launched {
-                            instance: format!("{region}/{id}"),
-                            frame_url: Some(format!("wss://{tile}.{}/frames", self.zone)),
-                            ipv6: None,
-                            ipv4: None,
-                        });
+                // The region's subnets, one AZ each, or the template's own.
+                let nets: Vec<Option<(&str, &str)>> = match self.networks.get(region) {
+                    Some(n) => n
+                        .subnets
+                        .iter()
+                        .map(|s| Some((s.as_str(), n.security_group.as_str())))
+                        .collect(),
+                    None => vec![None],
+                };
+                for net in nets {
+                    let subnet = net.map(|(s, _)| s);
+                    match self.run(region, template, tile, net).await {
+                        Ok(id) => {
+                            tracing::info!(%tile, %region, %template, ?subnet, instance = %id, "tile launched");
+                            return Ok(Launched {
+                                instance: format!("{region}/{id}"),
+                                frame_url: Some(format!("wss://{tile}.{}/frames", self.zone)),
+                                ipv6: None,
+                                ipv4: None,
+                            });
+                        }
+                        Err(CallError::Capacity(why)) => refusals.push(match subnet {
+                            Some(s) => format!("{template} in {s} of {why}"),
+                            None => format!("{template} in {why}"),
+                        }),
+                        Err(CallError::Other(e)) => return Err(LaunchError::Failed(e)),
                     }
-                    Err(CallError::Capacity(why)) => refusals.push(format!("{template} in {why}")),
-                    Err(CallError::Other(e)) => return Err(LaunchError::Failed(e)),
                 }
             }
         }

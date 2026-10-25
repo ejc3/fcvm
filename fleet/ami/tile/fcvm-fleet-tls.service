@@ -1,11 +1,19 @@
 [Unit]
 Description=fcvm fleet tile: fetch the wildcard TLS certificate with the instance role
-After=network-online.target
-Wants=network-online.target
+# Started as soon as the interface is configured, not after cloud-init's network stage
+# (network-online.target and sysinit.target both wait for it): see fcvm-fleet-renderer.service.
+# The fetch needs an IPv4 route (the instance role from IMDS, then Secrets Manager) and DNS.
+# netplan leaves systemd-networkd-wait-online.service conditioned out on a tile, so an
+# ordering on it waits for nothing; ExecStartPre waits for a routable IPv4 link itself.
+DefaultDependencies=no
+After=local-fs.target systemd-tmpfiles-setup.service systemd-networkd.service systemd-resolved.service
+Conflicts=shutdown.target
+Before=shutdown.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+ExecStartPre=/usr/lib/systemd/systemd-networkd-wait-online --any --ipv4 --timeout=120
 ExecStart=/usr/local/lib/fcvm-fleet/fetch-cert.py
 Restart=on-failure
 RestartSec=5

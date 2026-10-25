@@ -86,12 +86,18 @@ async fn health(State(r): State<Renderer>) -> Result<Json<serde_json::Value>, St
     }
     // Like the fleet renderer: a frame counter that moves while it is up.
     let frame = r.frames.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    Ok(Json(serde_json::json!({
+    let mut h = serde_json::json!({
         "fps": 30.0, "t": 1.5, "frame": frame, "ready": true, "budget_fit": 1.0e6,
         "frames_2s": {"render_ms_max": 12.5},
         "gpu": {"name": "fake", "temp_c": 40},
         "startup_ms": {"gpu_ready": 1500, "first_frame_drawn": 1600, "first_frame_sent": -1}
-    })))
+    });
+    // The renderer's process id, from `port-<port>.boot` beside the marker when a test
+    // writes one (a test restarts the renderer by writing a new one).
+    if let Ok(boot) = std::fs::read_to_string(r.marker.with_extension("boot")) {
+        h["boot_id"] = boot.trim().into();
+    }
+    Ok(Json(h))
 }
 
 async fn scene(State(r): State<Renderer>, Json(body): Json<serde_json::Value>) -> StatusCode {

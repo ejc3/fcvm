@@ -16,7 +16,7 @@ use super::Handle;
 use anyhow::Result;
 use async_trait::async_trait;
 use fleet_core::protocol::{
-    AssignSlot, BudgetBody, HealthReport, RendererScene, SharedScene, SlotReport,
+    boot_id, AssignSlot, BudgetBody, HealthReport, RendererScene, SharedScene, SlotReport,
 };
 use fleet_core::Event;
 use std::collections::{BTreeMap, HashMap};
@@ -187,7 +187,11 @@ fn remove_own(running: &Running, id: &str, token: u64) {
 /// Post every running tile its renderer body whenever its rectangle, the layout or the
 /// scene changes, and the grid budget after every scene and whenever it changes (retrying
 /// a failed post once a second). Once a second it also reads each tile's health for the
-/// budget (`Event::Ec2Health`).
+/// budget (`Event::Ec2Health`). A `/health` whose `boot_id` differs from the one read
+/// before means the renderer restarted on the same instance (its service restarts it) and
+/// has lost its scene: the scene and the budget are posted again. The first scene post on
+/// an instance reads `/health` first, so a restart between that read and any later one is
+/// seen.
 async fn post_scenes(
     driver: Arc<dyn Ec2Driver>,
     mut assign: watch::Receiver<Vec<AssignSlot>>,
@@ -198,6 +202,8 @@ async fn post_scenes(
 ) {
     let mut posted: HashMap<String, (String, RendererScene)> = HashMap::new();
     let mut budget_posted: HashMap<String, (String, BudgetBody)> = HashMap::new();
+    // Per tile: the instance and the renderer's boot id last read from its `/health`.
+    let mut boots: HashMap<String, (String, Option<String>)> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut read_health = false;
     loop {
@@ -213,6 +219,30 @@ async fn post_scenes(
         if let Some(shared) = &shared {
             for (a, l) in now {
                 let Some(rect) = a.rect else { continue };
+                let known = boots.get(&a.id).is_some_and(|(i, _)| *i == l.instance);
+                if read_health || !known {
+                    match driver.health(&a.id, &l).await {
+                        Ok(h) => {
+                            let boot = boot_id(&h);
+                            if known && boots[&a.id].1 != boot {
+                                tracing::info!(tile = %a.id, instance = %l.instance, boot = ?boot, "the tile's renderer restarted; posting its scene again");
+                                posted.remove(&a.id);
+                                budget_posted.remove(&a.id);
+                            }
+                            boots.insert(a.id.clone(), (l.instance.clone(), boot));
+                            if read_health {
+                                let report = HealthReport::from_renderer(&a.id, &h);
+                                handle.send(Event::Ec2Health { at: 0, report }).await;
+                            }
+                        }
+                        // Unknown until a read succeeds: that read then counts as a
+                        // restart, and the scene is posted again.
+                        Err(_) if !known => {
+                            boots.insert(a.id.clone(), (l.instance.clone(), None));
+                        }
+                        Err(_) => {}
+                    }
+                }
                 let body = RendererScene {
                     layout_generation: a.layout_generation,
                     rect_from_frame: a.rect_from_frame,
@@ -242,12 +272,6 @@ async fn post_scenes(
                                 tracing::debug!(tile = %a.id, error = %format!("{e:#}"), "budget not posted yet")
                             }
                         }
-                    }
-                }
-                if read_health {
-                    if let Ok(h) = driver.health(&a.id, &l).await {
-                        let report = HealthReport::from_renderer(&a.id, &h);
-                        handle.send(Event::Ec2Health { at: 0, report }).await;
                     }
                 }
             }
