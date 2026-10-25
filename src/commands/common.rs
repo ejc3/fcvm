@@ -4475,11 +4475,48 @@ pub(crate) fn validate_snapshot_vm_identity(
 
 /// Extra files to write into the snapshot directory before it is atomically finalized.
 ///
-/// Returns (filename, contents) pairs. Invoked after the Firecracker snapshot is taken
-/// (and the VM resumed) so contents reflect host-side state at snapshot time — e.g.
-/// portable-volume inode tables.
+/// Returns (filename, contents) pairs. [`publish_snapshot_dir`] invokes it after the VM's
+/// memory and disks are captured and the VM resumed, on every backend, so contents reflect
+/// host-side state at snapshot time, e.g. portable-volume inode tables.
 pub type SnapshotExtraFiles<'a> =
     Option<&'a (dyn Fn() -> Result<Vec<(String, Vec<u8>)>> + Send + Sync)>;
+
+/// Publish a snapshot built in `temp_snapshot_dir` as `snapshot_dir`: write the caller's
+/// extra files (the portable volumes' inode tables) and fcvm's `config.json` into it, then
+/// atomically replace `snapshot_dir` with it.
+///
+/// Every backend's creator publishes through this, so no backend can finalize a snapshot
+/// (config.json present) without its extra files: a clone restored without a portable
+/// volume's inode table answers EIO for every file the guest held open through it. A
+/// failure removes the temp directory and fails the snapshot.
+async fn publish_snapshot_dir(
+    temp_snapshot_dir: &Path,
+    snapshot_dir: &Path,
+    snapshot_config: &crate::storage::snapshot::SnapshotConfig,
+    extra_files: SnapshotExtraFiles<'_>,
+) -> Result<()> {
+    let written: Result<()> = async {
+        if let Some(extra_files) = extra_files {
+            let files = extra_files().context("gathering snapshot extra files")?;
+            for (filename, contents) in files {
+                tokio::fs::write(temp_snapshot_dir.join(&filename), &contents)
+                    .await
+                    .with_context(|| format!("writing snapshot extra file {}", filename))?;
+            }
+        }
+        let config_json =
+            serde_json::to_string_pretty(snapshot_config).context("serializing snapshot config")?;
+        tokio::fs::write(temp_snapshot_dir.join("config.json"), &config_json)
+            .await
+            .context("writing snapshot config")
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_dir_all(temp_snapshot_dir).await;
+        return Err(e);
+    }
+    atomic_replace_dir(temp_snapshot_dir, snapshot_dir).await
+}
 
 /// What to do with the source VM after capturing its memory and disks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5420,41 +5457,18 @@ pub async fn create_snapshot_core(
         );
     }
 
-    // Write caller-provided extra files (e.g. portable-volume inode tables) into the
-    // temp directory BEFORE the atomic rename. A finalized snapshot (config.json present)
-    // must never be missing these files — clones would silently restore without them —
-    // so a write failure here fails the snapshot instead of being logged and ignored.
-    if let Some(extra_files) = extra_files {
-        let files = match extra_files() {
-            Ok(files) => files,
-            Err(e) => {
-                let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-                return Err(e).context("gathering snapshot extra files");
-            }
-        };
-        for (filename, contents) in files {
-            let path = temp_snapshot_dir.join(&filename);
-            if let Err(e) = tokio::fs::write(&path, &contents).await {
-                let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-                return Err(e).with_context(|| format!("writing snapshot extra file {}", filename));
-            }
-        }
-    }
-
     // Record parent snapshot for the diff chain.
     // Full snapshots: parent = None (self-contained).
     // Diff snapshots: parent = name of snapshot whose memory.bin the diff was written over.
     snapshot_config.parent_snapshot = if use_diff { diff_parent_name } else { None };
 
-    // Write config.json to temp directory
-    let temp_config_path = temp_snapshot_dir.join("config.json");
-    let config_json =
-        serde_json::to_string_pretty(&snapshot_config).context("serializing snapshot config")?;
-    tokio::fs::write(&temp_config_path, &config_json)
-        .await
-        .context("writing snapshot config")?;
-
-    atomic_replace_dir(&temp_snapshot_dir, snapshot_dir).await?;
+    publish_snapshot_dir(
+        &temp_snapshot_dir,
+        snapshot_dir,
+        &snapshot_config,
+        extra_files,
+    )
+    .await?;
 
     let actual_type = if use_diff { "Diff" } else { "Full" };
     info!(
@@ -5490,6 +5504,7 @@ pub async fn create_snapshot_ch(
     mut snapshot_config: crate::storage::snapshot::SnapshotConfig,
     disk_path: &Path,
     vsock_socket_path: &Path,
+    extra_files: SnapshotExtraFiles<'_>,
 ) -> Result<()> {
     // CH snapshots are always self-contained (no diff base / parent chain).
     snapshot_config.parent_snapshot = None;
@@ -5670,15 +5685,13 @@ pub async fn create_snapshot_ch(
 
     info!(snapshot = %snapshot_config.name, "CH VM and guest network resumed, finalizing snapshot");
 
-    // Write fcvm's metadata config.json, then atomically swap the dir into place.
-    let temp_config_path = temp_snapshot_dir.join("config.json");
-    let config_json =
-        serde_json::to_string_pretty(&snapshot_config).context("serializing snapshot config")?;
-    tokio::fs::write(&temp_config_path, &config_json)
-        .await
-        .context("writing snapshot config")?;
-
-    atomic_replace_dir(&temp_snapshot_dir, snapshot_dir).await?;
+    publish_snapshot_dir(
+        &temp_snapshot_dir,
+        snapshot_dir,
+        &snapshot_config,
+        extra_files,
+    )
+    .await?;
 
     info!(
         snapshot = %snapshot_config.name,
@@ -6818,7 +6831,7 @@ mod tests {
             core,
             &[
                 "let _permit = snapshot_semaphore()",
-                "atomic_replace_dir(&temp_snapshot_dir, snapshot_dir)",
+                "publish_snapshot_dir(",
                 "PublishedMemoryFile::open(",
             ],
         );
@@ -6861,6 +6874,60 @@ mod tests {
                 "inherit_working_set(&parent",
                 "drop(_generation_locks)",
             ],
+        );
+    }
+
+    /// A memory snapshot of a VM with portable volumes carries their inode tables on every
+    /// backend (#1200): a clone restored without them answers EIO for every file the guest
+    /// held open through a portable volume. `cmd_snapshot_create` hands each backend's
+    /// creator the hook that fetches the tables from the VM's fcvm process, and each creator
+    /// publishes its directory only through `publish_snapshot_dir`, with that hook, which
+    /// writes the tables before the rename that makes the snapshot visible. No fake VMM can
+    /// drive these functions, so the wiring is pinned by their source.
+    #[test]
+    fn every_memory_snapshot_backend_saves_the_portable_volume_inode_tables() {
+        /// The text of the first call to `callee` in `body`, through its `.await`.
+        fn call<'a>(name: &str, body: &'a str, callee: &str) -> &'a str {
+            let start = body
+                .find(callee)
+                .unwrap_or_else(|| panic!("{name} does not call `{callee}`"));
+            let end = body[start..]
+                .find(".await")
+                .unwrap_or_else(|| panic!("{name}'s call to `{callee}` is not awaited"));
+            &body[start..start + end]
+        }
+
+        let create = body_of(include_str!("snapshot.rs"), "async fn cmd_snapshot_create(");
+        let without_tables: Vec<&str> = ["create_snapshot_core(", "create_snapshot_ch("]
+            .into_iter()
+            .filter(|creator| {
+                !call("cmd_snapshot_create", create, creator).contains("inode_tables")
+            })
+            .collect();
+        assert!(
+            without_tables.is_empty(),
+            "cmd_snapshot_create does not hand the portable volumes' inode tables to {without_tables:?}"
+        );
+
+        let source = include_str!("common.rs");
+        for signature in [
+            "pub async fn create_snapshot_core(",
+            "pub async fn create_snapshot_ch(",
+        ] {
+            let body = body_of(source, signature);
+            assert!(
+                !body.contains("atomic_replace_dir("),
+                "{signature} publishes its directory without `publish_snapshot_dir`"
+            );
+            assert!(
+                call(signature, body, "publish_snapshot_dir(").contains("extra_files"),
+                "{signature} does not hand its extra files to `publish_snapshot_dir`"
+            );
+        }
+        assert_in_order(
+            "publish_snapshot_dir",
+            body_of(source, "async fn publish_snapshot_dir("),
+            &["extra_files()", "\"config.json\"", "atomic_replace_dir("],
         );
     }
 

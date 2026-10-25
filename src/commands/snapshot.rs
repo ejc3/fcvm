@@ -973,17 +973,23 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         .await?;
         None
     } else {
+        // The VM's own fcvm process holds the portable volumes' inode tables; without them
+        // every inode the guest held at the snapshot answers EIO in a clone. Every backend's
+        // creator takes the same hook.
+        let has_portable = snapshot_config.metadata.volumes.iter().any(|v| v.portable);
+        let table_vsock = vsock_socket_path.clone();
+        let fetch_tables = move || crate::volume::fetch_inode_tables(&table_vsock);
+        let inode_tables: super::common::SnapshotExtraFiles<'_> = if has_portable {
+            Some(&fetch_tables)
+        } else {
+            None
+        };
         // Memory snapshot: drive the VM's actual control plane. Both backends listen on
         // the same `firecracker.sock` path; the client type + snapshot mechanism differ.
         match vm_state.config.hypervisor {
             crate::hypervisor::Backend::Firecracker => {
                 use crate::firecracker::FirecrackerClient;
                 let client = FirecrackerClient::new(socket_path.clone())?;
-                // The VM's own fcvm process holds the portable volumes' inode tables; without
-                // them every inode the guest held at the snapshot answers EIO in a clone.
-                let has_portable = snapshot_config.metadata.volumes.iter().any(|v| v.portable);
-                let table_vsock = vsock_socket_path.clone();
-                let fetch_tables = move || crate::volume::fetch_inode_tables(&table_vsock);
                 Some(
                     super::common::create_snapshot_core(
                         &client,
@@ -991,11 +997,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                         &vm_disk_path,
                         &vsock_socket_path,
                         parent_dir.as_deref(),
-                        if has_portable {
-                            Some(&fetch_tables)
-                        } else {
-                            None
-                        },
+                        inode_tables,
                         super::common::SnapshotSourceDisposition::Resume,
                     )
                     .await?,
@@ -1009,6 +1011,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                     snapshot_config.clone(),
                     &vm_disk_path,
                     &vsock_socket_path,
+                    inode_tables,
                 )
                 .await?;
                 None
