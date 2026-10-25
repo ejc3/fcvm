@@ -63,6 +63,17 @@ async fn start_portable_vm(
     guest_path: &str,
     read_only: bool,
 ) -> Result<(tokio::process::Child, u32)> {
+    start_portable_vm_on("firecracker", vm_name, host_dir, guest_path, read_only).await
+}
+
+/// Start a VM with --portable-volumes and a FUSE mount on `hypervisor`.
+async fn start_portable_vm_on(
+    hypervisor: &str,
+    vm_name: &str,
+    host_dir: &str,
+    guest_path: &str,
+    read_only: bool,
+) -> Result<(tokio::process::Child, u32)> {
     let map_arg = if read_only {
         format!("{}:{}:ro", host_dir, guest_path)
     } else {
@@ -75,6 +86,8 @@ async fn start_portable_vm(
             "run",
             "--name",
             vm_name,
+            "--hypervisor",
+            hypervisor,
             "--network",
             "rootless",
             "--portable-volumes",
@@ -713,9 +726,15 @@ async fn reader_log(pid: u32) -> Result<Vec<(u32, String)>> {
         .collect())
 }
 
-/// Snapshot a VM whose container holds a file open, restore a clone, optionally open `holders` new
-/// handles on another file in the clone, and require the held-open reader to keep reading its own file.
-async fn held_open_file_across_snapshot(prefix: &str, holders: usize) -> Result<()> {
+/// Snapshot a VM on `hypervisor` whose container holds a file open, restore a clone, optionally open
+/// `holders` new handles on another file in the clone, and require the held-open reader to keep reading
+/// its own file. A Firecracker clone pages from a memory server; a Cloud Hypervisor clone restores from
+/// the snapshot directly, as `snapshot run --snapshot` does for it.
+async fn held_open_file_across_snapshot(
+    prefix: &str,
+    holders: usize,
+    hypervisor: &str,
+) -> Result<()> {
     // Handle numbers are never reused, so opening and closing files first gives the reader a handle
     // number the clone's server will hand out again once it has opened that many files.
     let (vm_name, clone_name, snap_name, _) = common::unique_names(prefix);
@@ -731,7 +750,8 @@ async fn held_open_file_across_snapshot(prefix: &str, holders: usize) -> Result<
     // Every fcvm process started below, killed after the body whether or not it succeeded.
     let mut started: Vec<u32> = Vec::new();
     let result = async {
-        let (_child, pid) = start_portable_vm(&vm_name, &host_dir, "/mnt/test", true).await?;
+        let (_child, pid) =
+            start_portable_vm_on(hypervisor, &vm_name, &host_dir, "/mnt/test", true).await?;
         started.push(pid);
         common::poll_health_by_pid(pid, 180).await?;
         if holders > 0 {
@@ -759,9 +779,19 @@ async fn held_open_file_across_snapshot(prefix: &str, holders: usize) -> Result<
         common::kill_process(pid).await;
         started.retain(|p| *p != pid);
 
-        let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
-        started.push(serve_pid);
-        let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
+        let mut _serve = None;
+        let (_clone, clone_pid) = if hypervisor == "cloud-hypervisor" {
+            common::spawn_fcvm_with_logs(
+                &["snapshot", "run", "--snapshot", &snap_name, "--name", &clone_name],
+                &clone_name,
+            )
+            .await?
+        } else {
+            let (serve, serve_pid) = common::start_memory_server(&snap_name).await?;
+            _serve = Some(serve);
+            started.push(serve_pid);
+            common::spawn_clone(serve_pid, &clone_name).await?
+        };
         started.push(clone_pid);
         common::poll_health_by_pid(clone_pid, 180).await?;
 
@@ -834,7 +864,21 @@ async fn held_open_file_across_snapshot(prefix: &str, holders: usize) -> Result<
 /// A handle opened before `fcvm snapshot create` keeps reading its file in the clone.
 #[tokio::test]
 async fn test_file_open_across_snapshot_keeps_reading() -> Result<()> {
-    held_open_file_across_snapshot("pv-heldopen", 0).await
+    held_open_file_across_snapshot("pv-heldopen", 0, "firecracker").await
+}
+
+/// A handle opened before a Cloud Hypervisor `fcvm snapshot create` keeps reading its file in the
+/// clone, which needs the snapshot to carry the portable volume's inode table (#1200).
+#[tokio::test]
+async fn test_file_open_across_cloud_hypervisor_snapshot_keeps_reading() -> Result<()> {
+    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
+        eprintln!(
+            "SKIP: cloud-hypervisor not found (build it with `fcvm setup --cloud-hypervisor`, set \
+             FCVM_CLOUD_HYPERVISOR_BIN, or install on PATH)"
+        );
+        return Ok(());
+    }
+    held_open_file_across_snapshot("pv-ch-heldopen", 0, "cloud-hypervisor").await
 }
 
 /// A handle opened before the snapshot still reads its own file after the clone opens new handles.
@@ -843,5 +887,5 @@ async fn test_file_open_across_snapshot_keeps_reading() -> Result<()> {
 /// its first new handles reuse the numbers the guest still holds from before the snapshot.
 #[tokio::test]
 async fn test_restored_handle_does_not_read_a_new_handles_file() -> Result<()> {
-    held_open_file_across_snapshot("pv-collide", 6).await
+    held_open_file_across_snapshot("pv-collide", 6, "firecracker").await
 }
