@@ -7,6 +7,7 @@ import {
   FAMILY_PROBE_ATTEMPTS,
   FAMILY_PROBE_MS,
   FAMILY_PROBE_RETRY_MS,
+  FAMILY_V6_HEAD_START_MS,
   familyProbeTargets,
   frameSocketUrl,
   STREAM_HEIGHTS,
@@ -22,6 +23,7 @@ import {
   type ClientEvent,
   type ClientState,
   type DrawPlan,
+  type Family,
   type IntentName,
   type UiState,
 } from "../../core/index.ts";
@@ -55,7 +57,7 @@ export class WallClient {
   /** The canvas has painted the poster or a frame. */
   painted = false;
   private paintedListeners = new Set<() => void>();
-  /** The IPv6 probe's sockets while it runs; it settles once per page load. */
+  /** The family probe's sockets while it runs; it settles once per page load. */
   private probe: WebSocket[] | null = null;
   /** Failed probes so far, and the timer for the next one. */
   private probeFailures = 0;
@@ -110,28 +112,33 @@ export class WallClient {
   }
 
   /**
-   * Once per page load: open the IPv6 frame sockets of up to three tiles at once. The first
-   * to open within FAMILY_PROBE_MS makes IPv6 the family for every tile; none opening makes
-   * it IPv4. One tile can be down without IPv6 being down, hence several.
+   * Once per page load, happy-eyeballs style: open the IPv6 frame sockets of up to three
+   * tiles at once, and their IPv4 ones FAMILY_V6_HEAD_START_MS later (at once when every
+   * IPv6 socket has failed). The first socket to open sets the family for every tile. One
+   * tile can be down without its family being down, hence several. A probe in which nothing
+   * opens within FAMILY_PROBE_MS, or everything fails, is tried again, and after
+   * FAMILY_PROBE_ATTEMPTS of them the page settles on IPv4.
    */
   private probeFamily(s: ClientState): void {
-    const { urls, v4Only, v6Only } = familyProbeTargets(s.accepted!.tiles);
+    const { urls, v4Urls, v4Only, v6Only } = familyProbeTargets(s.accepted!.tiles);
     if (v4Only || v6Only) {
       this.probe = [];
-      this.dispatch({ type: "family", family: v4Only ? "v4" : "v6", probeMs: null });
+      this.dispatch({ type: "family", family: v4Only ? "v4" : "v6", probeMs: null, via: "one-family" });
       return;
     }
     if (urls.length === 0) return; // no tile has an address yet: probe on a later snapshot
     const started = performance.now();
-    let open = 0;
-    let failed = 0;
+    const tried = { v6: 0, v4: 0 };
+    const failed = { v6: 0, v4: 0 };
+    let v4Started = false;
     let done = false;
     const sockets: WebSocket[] = [];
     this.probe = sockets;
-    const finish = (family: "v6" | "v4", ms: number | null) => {
+    const finish = (family: Family | null) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      clearTimeout(headStart);
       for (const ws of sockets) {
         ws.onopen = ws.onerror = ws.onclose = null;
         try {
@@ -141,7 +148,11 @@ export class WallClient {
         }
       }
       if (this.stopped) return;
-      if (family === "v4" && ++this.probeFailures < FAMILY_PROBE_ATTEMPTS) {
+      if (family !== null) {
+        this.dispatch({ type: "family", family, probeMs: performance.now() - started, via: "race" });
+        return;
+      }
+      if (++this.probeFailures < FAMILY_PROBE_ATTEMPTS) {
         // Not settled yet: probe again on the snapshot current then.
         this.probeRetry = setTimeout(() => {
           this.probeRetry = null;
@@ -150,26 +161,47 @@ export class WallClient {
         }, FAMILY_PROBE_RETRY_MS);
         return;
       }
-      this.dispatch({ type: "family", family, probeMs: ms });
+      this.dispatch({ type: "family", family: "v4", probeMs: null, via: "no-answer" });
     };
-    const timer = setTimeout(() => finish("v4", FAMILY_PROBE_MS), FAMILY_PROBE_MS);
-    for (const url of urls) {
-      let ws: WebSocket;
-      try {
-        ws = new WebSocket(frameSocketUrl(url, STREAM_HEIGHTS[0]!));
-      } catch {
-        if (++failed === urls.length) finish("v4", performance.now() - started);
-        continue;
+    // After every failure: IPv4 starts once IPv6 has nothing left, and the probe fails once
+    // neither has.
+    const check = () => {
+      if (done) return;
+      if (!v4Started && failed.v6 === tried.v6) startV4();
+      else if (v4Started && failed.v6 === tried.v6 && failed.v4 === tried.v4) finish(null);
+    };
+    const open = (family: Family, list: string[]) => {
+      for (const url of list) {
+        tried[family]++;
+        let ws: WebSocket;
+        try {
+          ws = new WebSocket(frameSocketUrl(url, STREAM_HEIGHTS[0]!));
+        } catch {
+          failed[family]++;
+          continue;
+        }
+        sockets.push(ws);
+        let gone = false;
+        ws.onopen = () => finish(family);
+        ws.onerror = ws.onclose = () => {
+          if (gone) return;
+          gone = true;
+          failed[family]++;
+          check();
+        };
       }
-      sockets.push(ws);
-      ws.onopen = () => {
-        open++;
-        finish("v6", performance.now() - started);
-      };
-      ws.onerror = () => {
-        if (++failed === urls.length && open === 0) finish("v4", performance.now() - started);
-      };
-    }
+    };
+    const startV4 = () => {
+      if (v4Started || done) return;
+      v4Started = true;
+      clearTimeout(headStart);
+      open("v4", v4Urls);
+      check();
+    };
+    const timer = setTimeout(() => finish(null), FAMILY_PROBE_MS);
+    const headStart = setTimeout(startV4, FAMILY_V6_HEAD_START_MS);
+    open("v6", urls);
+    check();
   }
 
   stop(): void {

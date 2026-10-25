@@ -19,7 +19,7 @@ import {
   type IntentName,
   type ReceiptMsg,
 } from "./protocol.ts";
-import type { Family } from "./net.ts";
+import type { Family, FamilyVia } from "./net.ts";
 
 export interface PendingIntent {
   intent: IntentMsg;
@@ -190,8 +190,11 @@ export interface ClientState {
   you: string | null;
   turnstile: TurnstileState;
   own: OwnGpu;
-  /** The address family the tiles stream over: null until the IPv6 probe has answered. */
-  net: { family: Family | null; probeMs: number | null };
+  /**
+   * The address family the tiles stream over: null until the probe has answered. `probeMs`
+   * is how long the winning socket took to open, when `via` is "race".
+   */
+  net: { family: Family | null; probeMs: number | null; via: FamilyVia | null };
   /** Recent GPU readings per tile, oldest first. */
   gpuHistory: Record<string, GpuSample[]>;
   shownLayout: ShownLayout | null;
@@ -217,8 +220,8 @@ export type ClientEvent =
   | { type: "own-closed" }
   /** The client sent release_gpu for own.release. */
   | { type: "own-released"; claim: string }
-  /** The IPv6 probe's answer: the family every tile streams over for this page load. */
-  | { type: "family"; family: Family; probeMs: number | null }
+  /** The probe's answer: the family every tile streams over for this page load. */
+  | { type: "family"; family: Family; probeMs: number | null; via: FamilyVia }
   /** The frame drawer now draws this layout generation. */
   | { type: "gen-shown"; gen: number };
 
@@ -248,7 +251,7 @@ export function initialState(): ClientState {
     you: null,
     turnstile: { sitekey: null, verified: false, verifying: false, error: null, queued: [] },
     own: NO_OWN,
-    net: { family: null, probeMs: null },
+    net: { family: null, probeMs: null, via: null },
     gpuHistory: {},
     shownLayout: null,
     ui: {
@@ -373,7 +376,7 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
       return { ...s, own: { ...NO_OWN, abandoned: s.own.requestId !== null && s.own.claim === null ? s.own.requestId : null } };
     case "family":
       // Once per page load: the first answer stands.
-      return s.net.family !== null ? s : { ...s, net: { family: e.family, probeMs: e.probeMs } };
+      return s.net.family !== null ? s : { ...s, net: { family: e.family, probeMs: e.probeMs, via: e.via } };
     case "own-released":
       return s.own.release === e.claim ? { ...s, own: { ...s.own, release: null, abandoned: null } } : s;
     case "message": {

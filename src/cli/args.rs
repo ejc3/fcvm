@@ -110,6 +110,16 @@ pub struct FleetAggregateArgs {
     /// Initial layout (JSON), instead of waiting for POST /layout
     #[arg(long)]
     pub layout: Option<std::path::PathBuf>,
+
+    /// Also serve /frames and /healthz with TLS on this address, for browsers (repeatable).
+    /// /layout and /stats are served on --listen only.
+    #[arg(long = "tls-listen", requires = "tls_file")]
+    pub tls_listen: Vec<String>,
+
+    /// The certificate of --tls-listen: a JSON object {"cert", "key"} (PEM), the file the
+    /// agent writes for its renderers; read again every 2 s
+    #[arg(long, requires = "tls_listen")]
+    pub tls_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -323,6 +333,27 @@ pub struct FleetCoordArgs {
     /// published to viewers only once every one of them answers with the new records.
     #[arg(long, value_delimiter = ',')]
     pub dns_nameservers: Vec<String>,
+
+    /// Serve the launch names from this subzone of --dns-zone as its authoritative DNS
+    /// server (`<label>.<subzone>`) instead of writing them through the Cloudflare API: a
+    /// name answers from the moment it is published. The parent zone delegates the subzone
+    /// with NS records and no DS record.
+    #[arg(long, requires_all = ["dns_subzone_ns", "dns_listen"])]
+    pub dns_subzone: Option<String>,
+
+    /// The subzone's nameserver names (comma separated), as the parent's NS records name them
+    #[arg(long, value_delimiter = ',')]
+    pub dns_subzone_ns: Vec<String>,
+
+    /// Where the subzone's DNS server listens, UDP and TCP (a high port: the load balancer
+    /// in front maps port 53 to it)
+    #[arg(long)]
+    pub dns_listen: Option<std::net::SocketAddr>,
+
+    /// UDP responses per second per source prefix (/24, /56); past it, every second one is
+    /// sent truncated and the rest are dropped
+    #[arg(long, default_value_t = 200)]
+    pub dns_rate_limit: u32,
 
     /// Keep the wildcard certificate in this secret renewed (30 days before expiry, ACME
     /// DNS-01 through the DNS token)
