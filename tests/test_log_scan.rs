@@ -1172,6 +1172,126 @@ fn review_gate_treats_the_coderabbit_1199_notice_with_additions_as_a_claim() {
     }
 }
 
+/// CodeRabbit's "Review limit reached" summary notice as posted on #1285 (2026-10-25), with
+/// its org, run and checkbox ids replaced. JSON string literal.
+const CR_1285_NOTICE: &str = r#""<!-- coderabbit-ai-generated:v1 -->\n\n<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\n\n> [!WARNING]\n> ## Review limit reached\n> \n> You've used all free OSS reviews for now. Wait for the free limit to reset to keep reviewing this public repository.\n> \n> **Next included review available in 54 minutes.**\n> \n> [Check out review usage here](https://app.coderabbit.ai/dashboard/review-capacity?orgId=00000000-0000-4000-8000-000000000001).\n> \n> <details>\n> <summary><strong>View limit details</strong></summary>\n> <dl>\n> <dd>\n> \n> **Limit details:** You’ve used the included review currently available.\n> \n> [Learn how review limits work](https://docs.coderabbit.ai/management/rate-limits).\n> \n> **Review configuration:**\n> \n> <details>\n> <summary><strong><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/cog-dark.svg\"><img src=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/cog.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> Run configuration</strong></summary>\n> <dl>\n> <dd>\n> \n> - **Source mode**: Auto\n> - **Repository**: Unavailable\n> - **Branch**: Unavailable\n> - **File**: No configuration file from this repository applied\n> - **Commit**: Unavailable\n> - **Layers**: defaults\n> - **Review profile**: CHILL\n> - **Plan**: Advanced\n> - **Run ID**: `00000000-0000-4000-8000-000000000002`\n> \n> </dd>\n> </dl>\n> </details>\n> \n> <details>\n> <summary><strong><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/git-commit-horizontal-dark.svg\"><img src=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/git-commit-horizontal.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> Commits</strong></summary>\n> <dl>\n> <dd>\n> \n> Reviewing files that changed from the base of the PR and between c89d4fa27958c7650314e7ba9f2c212656ecc142 and 2c2089a9ffe884eed3d19ef62272121c07ada5e6.\n> \n> </dd>\n> </dl>\n> </details>\n> \n> <details>\n> <summary><strong><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/file-plus-corner-dark.svg\"><img src=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/file-plus-corner.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> Files selected for processing: 2</strong></summary>\n> <dl>\n> <dd>\n> \n> * `.claude/CLAUDE.md`\n> * `src/uffd/working_set.rs`\n> \n> </dd>\n> </dl>\n> </details>\n> \n> </dd>\n> </dl>\n> </details>\n\n<!-- end of auto-generated comment: rate limited by coderabbit.ai -->\n\n<!-- autopilot:start -->\n- [ ] <!-- {\"checkboxId\":\"00000000-0000-4000-8000-000000000003\"} --> <strong title=\"Keep fixing CodeRabbit findings and required CI, and resolving merge conflicts\">Autofix</strong> · Keep fixing CodeRabbit findings and required CI, and resolving merge conflicts\n<!-- autopilot:end -->\n<!-- tips_start -->\n\n\n\nThanks for using [CodeRabbit](https://coderabbit.ai?utm_source=oss&utm_medium=github&utm_campaign=ejc3/fcvm&utm_content=1285)! It's free for OSS, and your support helps us grow. If you like it, consider giving us a shout-out.\n\n<details>\n<summary><strong>❤️ Share</strong></summary>\n<dl>\n<dd>\n\n- [X](https://twitter.com/intent/tweet?text=I%20just%20used%20%40coderabbitai%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20the%20proprietary%20code.%20Check%20it%20out%3A&url=https%3A//coderabbit.ai)\n- [Mastodon](https://mastodon.social/share?text=I%20just%20used%20%40coderabbitai%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20the%20proprietary%20code.%20Check%20it%20out%3A%20https%3A%2F%2Fcoderabbit.ai)\n- [Reddit](https://www.reddit.com/submit?title=Great%20tool%20for%20code%20review%20-%20CodeRabbit&text=I%20just%20used%20CodeRabbit%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20proprietary%20code.%20Check%20it%20out%3A%20https%3A//coderabbit.ai)\n- [LinkedIn](https://www.linkedin.com/sharing/share-offsite/?url=https%3A%2F%2Fcoderabbit.ai&mini=true&title=Great%20tool%20for%20code%20review%20-%20CodeRabbit&summary=I%20just%20used%20CodeRabbit%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20proprietary%20code)\n\n</dd>\n</dl>\n</details>\n\n\n<sub>Comment `@coderabbitai help` to get the list of available commands.</sub>\n\n<!-- tips_end -->""#;
+
+/// CodeRabbit's review-limit notice with icons in its folded summaries needs no disposition
+/// and covers no head.
+///
+/// From 2026-10-23 the notice puts a <picture> of two SVG icons in front of each folded
+/// summary (Run configuration, Commits, Files selected for processing, Files ignored due to
+/// path filters). No such line was a listed shape, so every "Review limit reached" notice
+/// posted on ejc3/fcvm from then on read as an unanswered finding.
+#[test]
+fn review_gate_treats_the_coderabbit_1285_icon_notice_as_a_notice() {
+    require_jq();
+    let (code, out) = run_gate_on_bot_comment("cr1285", "coderabbitai", CR_1285_NOTICE);
+    assert!(
+        !out.contains("carry no disposition") && !out.contains("UNANSWERED"),
+        "the #1285 review-limit notice is not a finding.\n{out}"
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("UNREVIEWED HEAD") && !out.contains("HEAD COVERED"),
+        "a notice covers no head.\n{out}"
+    );
+}
+
+/// The #1285 notice with anything added, or with a finding written where an icon summary's
+/// name goes, is a claim.
+///
+/// Green on the gate before and after the icon shapes were listed; the second case goes red
+/// if an icon summary accepts any name.
+#[test]
+fn review_gate_treats_the_coderabbit_1285_notice_with_additions_as_a_claim() {
+    require_jq();
+    let appended = format!(
+        "{}\\n\\nP1: this drops the last row\"",
+        &CR_1285_NOTICE[..CR_1285_NOTICE.len() - 1]
+    );
+    let as_icon_name = CR_1285_NOTICE.replace(
+        "</picture> Commits</strong>",
+        "</picture> P1: this drops the last row</strong>",
+    );
+    for (case, body) in [
+        ("a finding appended", &appended),
+        ("a finding as an icon summary's name", &as_icon_name),
+    ] {
+        assert_ne!(
+            body.as_str(),
+            CR_1285_NOTICE,
+            "{case}: the fixture edit did not apply"
+        );
+        let (code, out) = run_gate_on_bot_comment("cr1285-claim", "coderabbitai", body);
+        assert_eq!(code, Some(1), "{case}\n{out}");
+        assert!(
+            out.contains("carry no disposition"),
+            "the #1285 notice with {case} is a claim.\n{out}"
+        );
+    }
+}
+
+/// Codex's receipt as posted on #1282 (2026-10-25): the marker, the phrase and its sign-off,
+/// no reviewed-commit line, and the About Codex block. JSON string literal.
+const CODEX_1282_RECEIPT: &str = r#""<!-- codex-review-receipt:v1 -->\n\nCodex Review: Didn't find any major issues. Can't wait for the next one!\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>""#;
+
+/// A Codex receipt that names no commit reports no findings and covers nothing.
+///
+/// On #1282 Codex posted its receipt without a reviewed-commit line, and its summary
+/// comment's row read "—" where the commit goes. The gate counted the receipt as an
+/// unanswered finding.
+#[test]
+fn review_gate_treats_a_codex_receipt_naming_no_commit_as_a_verdict_without_coverage() {
+    require_jq();
+    let (code, out) = run_gate_on_bot_comment(
+        "receipt-nocommit",
+        "chatgpt-codex-connector",
+        CODEX_1282_RECEIPT,
+    );
+    assert!(
+        !out.contains("carry no disposition") && !out.contains("UNANSWERED"),
+        "Codex's receipt naming no commit is not a finding.\n{out}"
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("UNREVIEWED HEAD") && !out.contains("HEAD COVERED"),
+        "a receipt naming no commit covers no head.\n{out}"
+    );
+}
+
+/// The #1282 receipt without its marker, or with a finding after the sign-off, is a claim.
+///
+/// The marker is what separates the receipt from the bare phrase, which stays claimable.
+/// Green on the gate before and after; the first case goes red if the marker is not
+/// required.
+#[test]
+fn review_gate_treats_a_codex_receipt_naming_no_commit_with_changes_as_a_claim() {
+    require_jq();
+    let unmarked = CODEX_1282_RECEIPT.replace(r"<!-- codex-review-receipt:v1 -->\n\n", "");
+    let appended = CODEX_1282_RECEIPT.replace(
+        "Can't wait for the next one!",
+        r"Can't wait for the next one!\n\nP1: the lease is dropped before the rename",
+    );
+    for (case, body) in [
+        ("without its marker", &unmarked),
+        ("with a finding appended", &appended),
+    ] {
+        assert_ne!(
+            body.as_str(),
+            CODEX_1282_RECEIPT,
+            "{case}: the fixture edit did not apply"
+        );
+        let (code, out) =
+            run_gate_on_bot_comment("receipt-nocommit-claim", "chatgpt-codex-connector", body);
+        assert_eq!(code, Some(1), "{case}\n{out}");
+        assert!(
+            out.contains("carry no disposition"),
+            "the #1282 receipt {case} is a claim.\n{out}"
+        );
+    }
+}
+
 /// A bot saying that its review did NOT run is not a finding, and covers no head.
 ///
 /// Codex out of quota posts "You have reached your Codex usage limits for code reviews" as
