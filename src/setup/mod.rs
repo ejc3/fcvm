@@ -377,12 +377,9 @@ mod store_ownership_tests {
                 .strip_prefix("layer2-abc.raw.")
                 .and_then(|rest| rest.strip_suffix(".tmp"))
                 .unwrap_or_else(|| panic!("unexpected temp name {name}"));
+            // A uuid, not the pid: separate PID namespaces reuse pids.
             uuid::Uuid::parse_str(key)
                 .unwrap_or_else(|e| panic!("temp key {key} is not a uuid: {e}"));
-            assert!(
-                !key.contains(&std::process::id().to_string()),
-                "temp key {key} carries the pid"
-            );
         }
     }
 
