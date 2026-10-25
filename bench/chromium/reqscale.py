@@ -3513,7 +3513,20 @@ def _make_request_fn(args, spec, serve_pid, log_dir, audits, tracer, global_base
         # No request reads the memory server's counters: they would bracket
         # overlapping requests, and reqscale_analyze has its own whole-run
         # cgroup accounting.
-        record = reqbench.run_cdp_request(request_args, rep, fast=True)
+        try:
+            record = reqbench.run_cdp_request(request_args, rep, fast=True)
+        except Exception as error:
+            # A request that raised (a spawn refused with EAGAIN at an
+            # overloaded rate, a teardown that left survivors) fails its rate.
+            # Its record still carries the metadata below, which the analyzer
+            # checks every record for. BaseException (a signal) unwinds.
+            supplied = getattr(error, "record", None)
+            record = dict(supplied) if isinstance(supplied, dict) else {}
+            record["ok"] = False
+            record.setdefault("error", f"{type(error).__name__}: {error}")
+            elapsed_ms = (time.monotonic_ns() - context.actual_launch_ns) / 1_000_000
+            record.setdefault("blocking_ms", elapsed_ms)
+            record.setdefault("wall_ms", elapsed_ms)
         record.update(
             url=request_url(args, context),
             schema=RECORD_SCHEMA,

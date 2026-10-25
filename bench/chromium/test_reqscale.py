@@ -2223,6 +2223,9 @@ class HarnessOutputFeedsTheAnalyzer(unittest.TestCase):
     """
 
     RATE = 1 / 15  # one ramp request and 4 scored ones per path and burst
+    # Every spawn at this rate raises EAGAIN, as fork does at an overloaded
+    # rate: the failed rate must not cost the analysis of the healthy one.
+    FAILING_RATE = 2 / 15
 
     def _stub(self, path, body):
         with open(path, "w") as stream:
@@ -2315,20 +2318,10 @@ exec sleep 600
 
         def drain(self, _handles):
             threads = reqscale.ThreadLauncher()
-            records = []
-            for context, request_fn in self.pending:
-                def timed(owned, context=context, request_fn=request_fn):
-                    try:
-                        record = request_fn(owned)
-                    except Exception as error:
-                        # A request that raises carries its record to the
-                        # launcher, which keeps it as a failed request.
-                        self.on_schedule(getattr(error, "record", {}), context)
-                        raise
-                    return self.on_schedule(record, context)
-
-                records.extend(threads.drain([threads.launch(context, timed)]))
-            return records
+            return [
+                self.on_schedule(threads.drain([threads.launch(context, request_fn)])[0], context)
+                for context, request_fn in self.pending
+            ]
 
     def test_a_run_of_the_harness_on_a_fake_fcvm_is_analyzable(self):
         import cdpdrive
@@ -2362,8 +2355,18 @@ exec sleep 600
                 max_score_end_backlog=2, max_p95_launch_lag_ms=20.0,
                 max_control_median_drift_pct=10.0)
             schedule = reqscale.build_schedule(reqscale.ScheduleConfig(
-                rates=(self.RATE,), scored_bursts=5, seed=776, criteria=criteria,
-                urls=(url,)), RUN_ID)
+                rates=(self.RATE, self.FAILING_RATE), scored_bursts=5, seed=776,
+                criteria=criteria, urls=(url,)), RUN_ID)
+            overloaded = threading.Event()
+            spawn = reqscale.reqbench.spawn_clone_process
+
+            def spawn_or_refuse(*spawn_args, **spawn_kwargs):
+                if overloaded.is_set():
+                    raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+                return spawn(*spawn_args, **spawn_kwargs)
+
+            stack.enter_context(mock.patch.object(
+                reqscale.reqbench, "spawn_clone_process", spawn_or_refuse))
             lease = stack.enter_context(reqscale.SnapshotGenerationLease(data_root, "golden"))
             args = SimpleNamespace(
                 run_id=RUN_ID, snapshot_tag="golden", snapshot_identity=dict(lease.identity),
@@ -2401,10 +2404,12 @@ exec sleep 600
                     cpu_before = reqscale._cpu_snapshots(audits)
                     request_fn = reqscale._make_request_fn(
                         args, spec, serve_pid, log_dir, audits, None, global_base)
+                    failing = spec.target_rps == self.FAILING_RATE
+                    (overloaded.set if failing else overloaded.clear)()
                     records, summary = reqscale.run_open_loop_burst(
                         RUN_ID, spec, request_fn, clock, self.SerialLauncher())
                     for record in records:
-                        self.assertTrue(record["ok"], record.get("error"))
+                        self.assertEqual(record["ok"], not failing, record.get("error"))
                     drain = max(record["finished_ns"] for record in records)
                     reqscale._augment_burst_accounting(
                         summary, proc_before,
@@ -2481,16 +2486,20 @@ exec sleep 600
             with mock.patch.object(reqscale_analyze, "BOOTSTRAP_DRAWS", 1000):
                 analysis = reqscale_analyze.analyze(run_dir)
             self.assertTrue(analysis["publishable"], analysis["publication_blocked_by"])
-            self.assertEqual(analysis["failed_rates"], [])
-            self.assertEqual(len(analysis["cells"]), 2)
+            self.assertEqual(analysis["failed_rates"], [self.FAILING_RATE])
+            cells = {(cell["backend"], cell["target_rps"]): cell for cell in analysis["cells"]}
+            for backend in ("file", "uffd"):
+                self.assertTrue(cells[(backend, self.RATE)]["passed"])
+                self.assertTrue(cells[(backend, self.FAILING_RATE)]["rate_failed"])
             # The real probe found one Firecracker per request, in its path's cgroup.
             roles = {name: {item["role"] for item in final_cgroups[name]["observed"]}
                      for name in ("file", "uffd")}
             self.assertIn("firecracker-012", roles["file"])
             self.assertIn("uffd-serve", roles["uffd"])
-            self.assertEqual(len({(row["firecracker_process_faults_ready_to_artifact"]["pid"],
-                                   row["firecracker_process_faults_ready_to_artifact"]["pid_start_time_ticks"])
-                                  for row in requests}), len(requests))
+            served = [row["firecracker_process_faults_ready_to_artifact"]
+                      for row in requests if row["ok"]]
+            self.assertEqual(len({(faults["pid"], faults["pid_start_time_ticks"])
+                                  for faults in served}), len(served))
 
 
 class TracePerturbationIsAGate(unittest.TestCase):
@@ -3295,11 +3304,13 @@ class ConcurrentRequestRecords(unittest.TestCase):
                 args, spec, 1234, state_dir,
                 {"uffd": mock.Mock(), "file": mock.Mock()}, None, 0)
             # The clone launch is stopped right after the point where the
-            # request would have sampled the server before it.
+            # request would have sampled the server before it; the request
+            # function records that as a failed request.
             with mock.patch.object(reqscale.reqbench, "serve_cpu_sample", side_effect=sample), \
                     mock.patch.object(reqscale.reqbench, "state_path_baseline", side_effect=Stop):
-                with self.assertRaises(Stop):
-                    request(context)
+                record = request(context)
+        self.assertFalse(record["ok"])
+        self.assertIn("Stop", record["error"])
         self.assertEqual(reads, [], "a concurrent UFFD request read the memory server")
 
     def test_a_corpus_request_renders_its_pairs_url_and_says_so(self):
