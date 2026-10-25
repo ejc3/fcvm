@@ -2501,6 +2501,58 @@ async fn a_reclaimed_host_is_replaced() {
     assert_eq!(launches(&fake).len(), 2, "{:?}", fake.calls());
 }
 
+/// A launch whose answer is lost (EC2 launched, the reply never came) is asked again with
+/// the same token, so EC2 answers with the instance it launched and no second host starts,
+/// although no list names the first one yet.
+#[tokio::test]
+async fn a_launch_whose_answer_is_lost_is_asked_again_with_its_token() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let fake = Arc::new(FakeHosts::default());
+    *fake.ambiguous.lock().unwrap() = 1;
+    *fake.hide_new.lock().unwrap() = Some((0, 4));
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    until_hosts(&fake, "asked again", |f| launches(f).len() >= 2).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Every instance ever launched, terminated ones included: a second one would be
+    // terminated as excess once both are listed, so the present count cannot tell.
+    let launched = fake.hosts.lock().unwrap()["us-east-1"].len();
+    assert_eq!(
+        launched,
+        1,
+        "a second host for one shortfall: {:?}",
+        fake.calls()
+    );
+}
+
+/// A list can name a new host and the next one leave it out (DescribeInstances is eventually
+/// consistent): the host still counts, and no second one is launched.
+#[tokio::test]
+async fn a_host_a_later_list_leaves_out_is_not_launched_again() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let fake = Arc::new(FakeHosts::default());
+    *fake.hide_new.lock().unwrap() = Some((1, 4));
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    until_hosts(&fake, "launched", |f| !launches(f).is_empty()).await;
+    // Past the one list that names it, the four that leave it out, and more.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(launches(&fake).len(), 1, "{:?}", fake.calls());
+    assert_eq!(fake.present("us-east-1").len(), 1);
+}
+
 /// A coordinator that restarts keeps the hosts it finds (an on-demand fallback from before
 /// the restart included): nothing is launched beside them.
 #[tokio::test]
@@ -2963,16 +3015,23 @@ async fn the_aws_host_driver_launches_through_an_instant_fleet() {
     )
     .unwrap();
     d.endpoints.insert("us-east-1".into(), base);
-    let spot = d.launch("us-east-1", Market::Spot, 1).await.unwrap();
+    let spot = d
+        .launch("us-east-1", Market::Spot, 1, "token-spot")
+        .await
+        .unwrap();
     assert!(spot.ids.is_empty(), "{spot:?}");
     assert_eq!(spot.refused.len(), 1, "{spot:?}");
     assert!(spot.refused[0].starts_with("UnfulfillableCapacity: "));
-    let od = d.launch("us-east-1", Market::OnDemand, 1).await.unwrap();
+    let od = d
+        .launch("us-east-1", Market::OnDemand, 1, "token-od")
+        .await
+        .unwrap();
     assert_eq!(od.ids, vec!["i-0fedcba9876543210".to_string()]);
     let calls = api.calls.lock().unwrap().clone();
     let (region, p) = &calls[0];
     assert_eq!(region, "us-east-1");
     assert_eq!(p["Action"], "CreateFleet");
+    assert_eq!(p["ClientToken"], "token-spot");
     assert_eq!(p["Type"], "instant");
     assert_eq!(
         p["LaunchTemplateConfigs.1.LaunchTemplateSpecification.LaunchTemplateName"],

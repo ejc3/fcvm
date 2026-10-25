@@ -20,8 +20,10 @@
 //! Hosts are found by their tags (`Purpose=fcvm-fleet-host`, `Fleet=<fleet>`), so a restarted
 //! coordinator keeps the hosts an earlier one launched. A host that is reclaimed (spot) or
 //! stops is replaced: the regions are listed every `poll` while a wake's hosts come up and
-//! every `liveness` while they run. An instance just launched counts as pending until a list
-//! names it, so DescribeInstances lagging behind CreateFleet does not launch it twice.
+//! every `liveness` while they run. An instance just launched counts as pending while lists
+//! leave it out, for up to a minute, so DescribeInstances lagging behind CreateFleet does not
+//! launch it twice; a launch whose answer is lost is asked again with the same idempotency
+//! token, so EC2 answers with what it launched instead of launching more.
 
 use super::aws::{signed, xml_tag, CredentialChain};
 use super::sigv4::uri_encode;
@@ -107,10 +109,13 @@ pub struct Launch {
 pub trait HostDriver: Send + Sync {
     /// This fleet's GPU hosts in `region`, in any state EC2 still lists.
     async fn hosts(&self, region: &str) -> Result<Vec<Host>>;
-    /// Launch `count` hosts in `region` in `market`. An error is a request that did not
-    /// reach a decision (no answer, refused credentials); EC2's per-instance refusals come
-    /// back in [`Launch`].
-    async fn launch(&self, region: &str, market: Market, count: u32) -> Result<Launch>;
+    /// Launch `count` hosts in `region` in `market`. `token` is the request's idempotency
+    /// token: the same token with the same count answers what the first request launched
+    /// instead of launching again. An error is a request that did not reach a decision (no
+    /// answer, refused credentials), which may still have launched; EC2's per-instance
+    /// refusals come back in [`Launch`].
+    async fn launch(&self, region: &str, market: Market, count: u32, token: &str)
+        -> Result<Launch>;
     async fn terminate(&self, region: &str, ids: &[String]) -> Result<()>;
 }
 
@@ -143,8 +148,6 @@ struct Recent {
     market: Market,
     /// When the launch was asked for.
     asked: Instant,
-    /// Whether a list has named it.
-    listed: bool,
 }
 
 /// One region's progress through a wake.
@@ -158,8 +161,10 @@ struct Watch {
     next_launch: Option<Instant>,
 }
 
-/// The hosts of `listed` plus the instances `recent` launched in `region` that no list has
-/// named yet and that are younger than [`LIST_GRACE`] (as pending).
+/// The hosts of `listed` plus the instances `recent` launched in `region` that this list
+/// does not name and that are younger than [`LIST_GRACE`] (as pending). A list that named an
+/// instance once can omit it the next time (EC2's describe calls are eventually consistent),
+/// so the grace holds whether or not an earlier list named it.
 fn with_recent(
     region: &str,
     listed: Vec<Host>,
@@ -167,13 +172,9 @@ fn with_recent(
     now: Instant,
 ) -> Vec<Host> {
     let mut out = listed;
-    for h in &out {
-        if let Some(r) = recent.get_mut(&h.id) {
-            r.listed = true;
-        }
-    }
+    let named: std::collections::HashSet<String> = out.iter().map(|h| h.id.clone()).collect();
     recent.retain(|id, r| {
-        if r.region != region || r.listed {
+        if r.region != region || named.contains(id) {
             return true;
         }
         if now.duration_since(r.asked) >= LIST_GRACE {
@@ -218,6 +219,9 @@ fn lifecycle(state: &str) -> &'static str {
     }
 }
 
+/// Per region and market: the token and count of a launch whose outcome is unknown.
+type Tokens = HashMap<(String, Market), (String, u32)>;
+
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -231,6 +235,8 @@ fn unix_ms() -> u64 {
 pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Handle) {
     let mut watch: Vec<Watch> = cfg.regions.iter().map(|_| Watch::default()).collect();
     let mut recent: HashMap<String, Recent> = HashMap::new();
+    // Per region and market, a launch whose outcome is unknown: its token and count.
+    let mut tokens: Tokens = HashMap::new();
     let mut last_want: Option<u32> = None;
     // A degraded `scale` was reported and not cleared yet.
     let mut reported = false;
@@ -252,6 +258,7 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                 };
             }
             last_want = Some(want);
+            tokens.clear();
             tracing::info!(power = %state, hosts_per_region = want, "hosts set for the power state");
         }
         let now = Instant::now();
@@ -335,6 +342,7 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                     short,
                     &mut on_demand,
                     &mut recent,
+                    &mut tokens,
                     &mut errors,
                 )
                 .await;
@@ -400,6 +408,7 @@ async fn launch_shortfall(
     short: u32,
     on_demand: &mut Option<u32>,
     recent: &mut HashMap<String, Recent>,
+    tokens: &mut Tokens,
     errors: &mut Vec<String>,
 ) -> (u32, bool) {
     let mut launched = 0;
@@ -433,10 +442,22 @@ async fn launch_shortfall(
         } else {
             ask
         };
+        // A request whose outcome is unknown (no answer) is asked again with its token and
+        // count, so EC2 answers with what it launched then rather than launching again. Its
+        // count was within the on-demand cap when it was decided.
+        let key = (region.to_string(), market);
+        let (token, ask) = match tokens.get(&key) {
+            Some((t, n)) => (t.clone(), *n),
+            None => (uuid::Uuid::new_v4().to_string(), ask),
+        };
         let asked = Instant::now();
-        let got = match cfg.driver.launch(region, market, ask).await {
-            Ok(g) => g,
+        let got = match cfg.driver.launch(region, market, ask, &token).await {
+            Ok(g) => {
+                tokens.remove(&key);
+                g
+            }
             Err(e) => {
+                tokens.insert(key, (token, ask));
                 tracing::warn!(%region, market = market.name(), error = %format!("{e:#}"), "launching GPU hosts failed");
                 errors.push(format!("{region} {}: {e:#}", market.name()));
                 return (launched, false);
@@ -451,7 +472,6 @@ async fn launch_shortfall(
                     region: region.to_string(),
                     market,
                     asked,
-                    listed: false,
                 },
             );
         }
@@ -807,7 +827,13 @@ impl HostDriver for AwsHosts {
         Ok(out)
     }
 
-    async fn launch(&self, region: &str, market: Market, count: u32) -> Result<Launch> {
+    async fn launch(
+        &self,
+        region: &str,
+        market: Market,
+        count: u32,
+        token: &str,
+    ) -> Result<Launch> {
         let templates = self
             .templates
             .get(region)
@@ -816,14 +842,7 @@ impl HostDriver for AwsHosts {
             .subnets
             .get(region)
             .with_context(|| format!("no host subnet in {region}"))?;
-        let params = create_fleet_params(
-            templates,
-            subnets,
-            market,
-            count,
-            &self.fleet,
-            &uuid::Uuid::new_v4().to_string(),
-        );
+        let params = create_fleet_params(templates, subnets, market, count, &self.fleet, token);
         match self.call(region, &params).await {
             Ok(xml) => Ok(parse_create_fleet(&xml)),
             // A request refused as a whole for capacity is a refusal like a per-pool one.
@@ -849,6 +868,10 @@ impl HostDriver for AwsHosts {
 /// hosts start in `launch_state` (default `pending`); `set_state` moves them. Every call is
 /// recorded in `calls`, in order: `list <region>`, `launch <region> <market> <count>`,
 /// `terminate <region> <ids>`. `fail_lists` makes that many next lists of a region fail.
+/// A launch is idempotent by its token. `ambiguous` makes that many next launches launch and
+/// then fail, as a request whose answer is lost. `hide_new` (show, hide): each launched
+/// instance is named by its region's next `show` lists, left out of the `hide` after them,
+/// then named again, as an eventually consistent DescribeInstances.
 #[derive(Default)]
 pub struct FakeHosts {
     pub hosts: Mutex<BTreeMap<String, Vec<Host>>>,
@@ -856,6 +879,10 @@ pub struct FakeHosts {
     pub launch_state: Mutex<Option<String>>,
     pub calls: Mutex<Vec<String>>,
     pub fail_lists: Mutex<HashMap<String, u32>>,
+    pub ambiguous: Mutex<u32>,
+    pub hide_new: Mutex<Option<(u32, u32)>>,
+    by_token: Mutex<HashMap<String, Launch>>,
+    visibility: Mutex<HashMap<String, (u32, u32)>>,
     next: std::sync::atomic::AtomicU64,
 }
 
@@ -894,20 +921,44 @@ impl HostDriver for FakeHosts {
                 bail!("injected list failure in {region}");
             }
         }
-        Ok(self
+        let all = self
             .hosts
             .lock()
             .unwrap()
             .get(region)
             .cloned()
-            .unwrap_or_default())
+            .unwrap_or_default();
+        let mut vis = self.visibility.lock().unwrap();
+        Ok(all
+            .into_iter()
+            .filter(|h| match vis.get_mut(&h.id) {
+                Some((show, _)) if *show > 0 => {
+                    *show -= 1;
+                    true
+                }
+                Some((_, hide)) if *hide > 0 => {
+                    *hide -= 1;
+                    false
+                }
+                _ => true,
+            })
+            .collect())
     }
 
-    async fn launch(&self, region: &str, market: Market, count: u32) -> Result<Launch> {
+    async fn launch(
+        &self,
+        region: &str,
+        market: Market,
+        count: u32,
+        token: &str,
+    ) -> Result<Launch> {
         self.calls
             .lock()
             .unwrap()
             .push(format!("launch {region} {} {count}", market.name()));
+        if let Some(l) = self.by_token.lock().unwrap().get(token) {
+            return Ok(l.clone());
+        }
         let n = {
             let mut cap = self.capacity.lock().unwrap();
             match cap.get_mut(&(region.to_string(), market)) {
@@ -941,6 +992,9 @@ impl HostDriver for FakeHosts {
                     state: state.clone(),
                     market,
                 });
+            if let Some(v) = *self.hide_new.lock().unwrap() {
+                self.visibility.lock().unwrap().insert(id.clone(), v);
+            }
             out.ids.push(id);
         }
         if n < count {
@@ -948,6 +1002,15 @@ impl HostDriver for FakeHosts {
                 "InsufficientInstanceCapacity: no {} capacity",
                 market.name()
             ));
+        }
+        self.by_token
+            .lock()
+            .unwrap()
+            .insert(token.to_string(), out.clone());
+        let mut amb = self.ambiguous.lock().unwrap();
+        if *amb > 0 {
+            *amb -= 1;
+            bail!("injected: the launch's answer was lost");
         }
         Ok(out)
     }
@@ -1116,7 +1179,6 @@ mod tests {
                 region: "us-east-1".into(),
                 market: Market::Spot,
                 asked: now,
-                listed: false,
             },
         );
         let got = with_recent("us-east-1", vec![], &mut recent, now);
@@ -1131,6 +1193,9 @@ mod tests {
             now,
         );
         assert_eq!(got, vec![host("i-new", "running", Market::Spot)]);
+        // Named once, then left out of a list within the grace: still pending.
+        let got = with_recent("us-east-1", vec![], &mut recent, now);
+        assert_eq!(got, vec![host("i-new", "pending", Market::Spot)]);
         // Never listed and past the grace: dropped.
         let mut stale = HashMap::new();
         stale.insert(
@@ -1139,7 +1204,6 @@ mod tests {
                 region: "us-east-1".into(),
                 market: Market::Spot,
                 asked: now,
-                listed: false,
             },
         );
         assert!(with_recent("us-east-1", vec![], &mut stale, now + LIST_GRACE).is_empty());

@@ -495,8 +495,8 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
   terminated; awake, a stopped host and a host over the awake capacity (on-demand first)
   are terminated, and a host that is reclaimed or terminated is replaced. The regions are
   listed (`DescribeInstances`) every 2 s while hosts come up or go away and every 15 s while
-  they run; an instance a launch named counts as pending until a list names it (60 s at
-  most). The coordinator logs `wake: host launch accepted` (`market`, `request_ms`, the
+  they run; an instance a launch named counts as pending while lists leave it out (60 s at
+  most), and a launch whose answer is lost is asked again with the same idempotency token. The coordinator logs `wake: host launch accepted` (`market`, `request_ms`, the
   `CreateFleet` round trip), `wake: host running` (`request_to_running_ms`) and, once a
   region runs its awake capacity, `wake: host capacity in service` with `path` (`spot`,
   `on-demand`, or `spot and on-demand`) and `since_wake_ms`. A call that fails marks the
