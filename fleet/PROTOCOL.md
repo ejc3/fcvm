@@ -441,7 +441,8 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   new launch is accepted. A tile whose instance never serves `/health` has that instance
   terminated and is launched again after a backoff (1 s doubling to 30 s), and so does a
   running tile whose instance is found shutting down, stopped or terminated (a spot
-  reclaim; checked every 15 s). The coordinator
+  reclaim), whose renderer's `/health` carries an `error`, or whose renderer leaves
+  `/health` unanswered three checks in a row (checked every 15 s). The coordinator
   keeps no instance ids across a restart, so before its first launch, and again when it
   stops, it terminates every instance tagged `Purpose=fcvm-fleet-tile` and
   `Fleet=<--fleet-name>` in `--ec2-regions`; another fleet's tiles in the same account (a

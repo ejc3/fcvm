@@ -1180,9 +1180,13 @@ impl ec2::Ec2Driver for ReclaimedEc2 {
     async fn health(&self, _tile: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
         anyhow::bail!("no renderer")
     }
-    async fn alive(&self, l: &ec2::Launched) -> anyhow::Result<bool> {
+    async fn alive(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Liveness> {
         // The first instance is reclaimed once it has run.
-        Ok(l.instance != "i-test-0")
+        Ok(if l.instance == "i-test-0" {
+            ec2::Liveness::Dead("instance i-test-0 is terminated".into())
+        } else {
+            ec2::Liveness::Alive
+        })
     }
     fn liveness_every(&self) -> Duration {
         Duration::from_millis(100)
@@ -1382,6 +1386,292 @@ async fn a_retired_tile_task_leaves_its_replacement_running() {
         !scenes.lock().unwrap().iter().any(|(i, _)| i == "i-test-0"),
         "{:?}",
         scenes.lock().unwrap()
+    );
+}
+
+/// A handle whose actor only records the EC2 tiles' reports, in order.
+fn recording_handle() -> (Handle, Arc<std::sync::Mutex<Vec<SlotReport>>>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<fcvm::fleet::coord::Cmd>(256);
+    let reports = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let r2 = reports.clone();
+    tokio::spawn(async move {
+        while let Some(cmd) = rx.recv().await {
+            if let fcvm::fleet::coord::Cmd::Apply { event, reply } = cmd {
+                if let Event::Ec2 { report, .. } = event {
+                    r2.lock().unwrap().push(report);
+                }
+                if let Some(reply) = reply {
+                    let _ = reply.send(None);
+                }
+            }
+        }
+    });
+    let snapshot = tokio::sync::watch::channel(Arc::new(fcvm::fleet::coord::Snapshot {
+        version: 0,
+        text: String::new(),
+    }))
+    .1;
+    let ec2_layout = tokio::sync::watch::channel(None).1;
+    (
+        Handle {
+            cmds: tx,
+            snapshot,
+            ec2_layout,
+        },
+        reports,
+    )
+}
+
+/// The first instance of a tile that left and came back fails its readiness check after
+/// the replacement runs. The retired task terminates it and reports nothing: a `failed`
+/// report on the slot would replace the replacement's `running` and clear its addresses
+/// until the next relaunch.
+struct RetiredFailsEc2 {
+    launches: std::sync::atomic::AtomicU64,
+    gate: Arc<tokio::sync::Notify>,
+    waiting: Arc<tokio::sync::Notify>,
+    terminated: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ec2::Ec2Driver for RetiredFailsEc2 {
+    async fn launch(&self, _tile: &str) -> Result<ec2::Launched, ec2::LaunchError> {
+        let n = self
+            .launches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ec2::Launched {
+            instance: format!("i-test-{n}"),
+            frame_url: None,
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        if l.instance == "i-test-0" {
+            self.waiting.notify_one();
+            self.gate.notified().await;
+            anyhow::bail!("i-test-0 did not serve /health");
+        }
+        Ok(ec2::Launched {
+            ipv4: Some("192.0.2.10".into()),
+            ..l.clone()
+        })
+    }
+    async fn terminate(&self, instance: &str) -> anyhow::Result<()> {
+        self.terminated.lock().unwrap().push(instance.to_string());
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_budget(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn health(&self, _tile: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("no renderer")
+    }
+}
+
+#[tokio::test]
+async fn a_retired_tile_task_whose_instance_fails_reports_nothing_on_the_replacement() {
+    let (handle, reports) = recording_handle();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let waiting = Arc::new(tokio::sync::Notify::new());
+    let terminated = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let driver: Arc<dyn ec2::Ec2Driver> = Arc::new(RetiredFailsEc2 {
+        launches: Default::default(),
+        gate: gate.clone(),
+        waiting: waiting.clone(),
+        terminated: terminated.clone(),
+    });
+    let slot: fleet_core::protocol::AssignSlot = serde_json::from_value(json!({
+        "id": "ec2-1", "sbdf": "", "generation": 1,
+        "rect": {"x": 0.5, "y": 0.0, "w": 0.5, "h": 1.0}
+    }))
+    .unwrap();
+    let (assign_tx, assign_rx) = tokio::sync::watch::channel(vec![slot.clone()]);
+    let (_scene_tx, scene_rx) = tokio::sync::watch::channel(None);
+    let (_budget_tx, budget_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(ec2::run(driver, assign_rx, scene_rx, budget_rx, handle));
+    tokio::time::timeout(Duration::from_secs(5), waiting.notified())
+        .await
+        .expect("the first instance is waited for");
+    assign_tx.send(Vec::new()).unwrap();
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assign_tx.send(vec![slot]).unwrap();
+    let running = |reports: &[SlotReport]| {
+        reports
+            .iter()
+            .any(|r| r.phase == "running" && r.vm.as_deref() == Some("i-test-1"))
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !running(&reports.lock().unwrap()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the replacement runs");
+    gate.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !terminated.lock().unwrap().contains(&"i-test-0".to_string()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the retired task terminates its instance");
+    // The retired task reports before it terminates, so its report is in by now.
+    let reports = reports.lock().unwrap();
+    let last = reports.last().unwrap();
+    assert!(
+        last.phase == "running" && last.vm.as_deref() == Some("i-test-1"),
+        "the slot's last report is not the replacement's: {reports:#?}"
+    );
+    assert!(!reports.iter().any(|r| r.phase == "failed"), "{reports:#?}");
+}
+
+/// A running tile whose renderer stops answering on an instance that keeps running is
+/// launched again after three silent checks in a row; a check it answers starts the count
+/// again. Before, only the instance's state was checked and the tile stayed `running`.
+struct SilentRendererEc2 {
+    launches: std::sync::atomic::AtomicU64,
+    /// The first instance's renderer: what each check finds, then silence from then on.
+    first: std::sync::Mutex<std::collections::VecDeque<ec2::Liveness>>,
+    checks: Arc<std::sync::atomic::AtomicUsize>,
+    terminated: Arc<std::sync::Mutex<Vec<(String, usize)>>>,
+}
+
+#[async_trait::async_trait]
+impl ec2::Ec2Driver for SilentRendererEc2 {
+    async fn launch(&self, _tile: &str) -> Result<ec2::Launched, ec2::LaunchError> {
+        let n = self
+            .launches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ec2::Launched {
+            instance: format!("i-test-{n}"),
+            frame_url: None,
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        Ok(l.clone())
+    }
+    async fn terminate(&self, instance: &str) -> anyhow::Result<()> {
+        let checks = self.checks.load(std::sync::atomic::Ordering::SeqCst);
+        self.terminated
+            .lock()
+            .unwrap()
+            .push((instance.to_string(), checks));
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_budget(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn health(&self, _tile: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("no renderer")
+    }
+    async fn alive(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Liveness> {
+        if l.instance != "i-test-0" {
+            return Ok(ec2::Liveness::Alive);
+        }
+        self.checks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self
+            .first
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| ec2::Liveness::Silent("connection refused".into())))
+    }
+    fn liveness_every(&self) -> Duration {
+        Duration::from_millis(50)
+    }
+}
+
+#[tokio::test]
+async fn an_ec2_tile_whose_renderer_stops_answering_is_launched_again() {
+    use ec2::Liveness::{Alive, Silent};
+    let (handle, reports) = recording_handle();
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let terminated = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let silent = || Silent("connection refused".into());
+    let driver: Arc<dyn ec2::Ec2Driver> = Arc::new(SilentRendererEc2 {
+        launches: Default::default(),
+        // Silent, answered, silent twice, answered, then silent from the sixth check on:
+        // the third silent check in a row is the eighth.
+        first: std::sync::Mutex::new(
+            [silent(), Alive, silent(), silent(), Alive]
+                .into_iter()
+                .collect(),
+        ),
+        checks: checks.clone(),
+        terminated: terminated.clone(),
+    });
+    let slot: fleet_core::protocol::AssignSlot = serde_json::from_value(json!({
+        "id": "ec2-1", "sbdf": "", "generation": 1,
+        "rect": {"x": 0.5, "y": 0.0, "w": 0.5, "h": 1.0}
+    }))
+    .unwrap();
+    let (_assign_tx, assign_rx) = tokio::sync::watch::channel(vec![slot]);
+    let (_scene_tx, scene_rx) = tokio::sync::watch::channel(None);
+    let (_budget_tx, budget_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(ec2::run(driver, assign_rx, scene_rx, budget_rx, handle));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if reports
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.phase == "running" && r.vm.as_deref() == Some("i-test-1"))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the tile runs on a new instance after its renderer stopped answering");
+    assert_eq!(
+        terminated.lock().unwrap()[0],
+        ("i-test-0".to_string(), 8),
+        "relaunched after the third silent check in a row"
+    );
+    let reports = reports.lock().unwrap();
+    let failed = reports
+        .iter()
+        .find(|r| r.phase == "failed")
+        .expect("a failed report");
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("did not answer 3 checks") && e.contains("i-test-0")),
+        "{failed:?}"
     );
 }
 
@@ -2616,11 +2906,12 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
     base
 }
 
-/// `alive` reads the instance's state: a running tile is alive, a terminated one (a spot
-/// reclaim) is not.
+/// `alive` reads the instance's state and asks its renderer: a running tile whose renderer
+/// answers is alive, a terminated one (a spot reclaim) or one whose renderer reports an
+/// error is dead, and one whose renderer does not answer is silent.
 #[tokio::test]
-async fn the_aws_tile_driver_sees_a_reclaimed_instance() {
-    use fcvm::fleet::coord::ec2::Ec2Driver;
+async fn the_aws_tile_driver_sees_a_reclaimed_instance_and_a_stopped_renderer() {
+    use fcvm::fleet::coord::ec2::{Ec2Driver, Liveness};
     use fcvm::fleet::coord::ec2_aws::AwsEc2;
     std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
     std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
@@ -2629,22 +2920,67 @@ async fn the_aws_tile_driver_sees_a_reclaimed_instance() {
         ..Default::default()
     };
     let base = fake_ec2_api(api.clone()).await;
-    let mut d = AwsEc2::new(
-        vec!["us-east-1".to_string()],
-        "fcvm-fleet-tile-x86_64".into(),
-        None,
-        "fcvm.example".into(),
-    )
-    .unwrap();
-    d.endpoints.insert("us-east-1".into(), base);
+    // A renderer answering `body` at /health, on a port of its own.
+    async fn renderer(body: Value) -> u16 {
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move { axum::Json(body) }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        port
+    }
+    let driver = |port: u16| {
+        let mut d = AwsEc2::new(
+            vec!["us-east-1".to_string()],
+            "fcvm-fleet-tile-x86_64".into(),
+            None,
+            "fcvm.example".into(),
+        )
+        .unwrap();
+        d.endpoints.insert("us-east-1".into(), base.clone());
+        d.health_scheme = "http".into();
+        d.health_port = port;
+        d
+    };
     let launched = |id: &str| ec2::Launched {
         instance: format!("us-east-1/{id}"),
         frame_url: None,
         ipv6: None,
         ipv4: None,
     };
-    assert!(d.alive(&launched("i-0123456789abcdef0")).await.unwrap());
-    assert!(!d.alive(&launched("i-reclaimed-1")).await.unwrap());
+    let running = launched("i-0123456789abcdef0");
+    let ready = driver(renderer(json!({"ready": true})).await);
+    assert_eq!(
+        ready.alive("ec2-1", &running).await.unwrap(),
+        Liveness::Alive
+    );
+    match ready
+        .alive("ec2-1", &launched("i-reclaimed-1"))
+        .await
+        .unwrap()
+    {
+        Liveness::Dead(why) => assert!(why.contains("terminated"), "{why}"),
+        other => panic!("a reclaimed instance is {other:?}"),
+    }
+    let failed = driver(renderer(json!({"ready": true, "error": "CUDA error 999"})).await);
+    match failed.alive("ec2-1", &running).await.unwrap() {
+        Liveness::Dead(why) => assert!(why.contains("CUDA error 999"), "{why}"),
+        other => panic!("a failed renderer is {other:?}"),
+    }
+    // Nothing listens on a port that was bound and released.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    match driver(closed).alive("ec2-1", &running).await.unwrap() {
+        Liveness::Silent(_) => {}
+        other => panic!("a renderer that does not answer is {other:?}"),
+    }
 }
 
 /// A restarted coordinator does not know the tile instances an earlier one launched:
