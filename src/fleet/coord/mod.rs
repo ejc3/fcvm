@@ -249,8 +249,8 @@ impl Actor {
         let marks = wake_log::Marks::of(&self.state);
         let state = std::mem::replace(&mut self.state, State::new(Config::default(), 0));
         self.state = apply(state, &event);
-        wake_log::log(&wake_log::notes(&marks, &self.state, at));
         self.name_launches();
+        wake_log::log(&wake_log::notes(&marks, &self.state, at));
         if self.state.version != before {
             self.dispatch_agents();
         }
