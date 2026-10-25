@@ -33,7 +33,7 @@ jobs:
       - name: Verify ephemeral host, smoke test, and hold for independent observation
         env:
           ACCEPTANCE_RUNNER_NAME: ${{ runner.name }}
-          EXPECTED_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          EXPECTED_AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
         shell: bash
         run: |
           set -euo pipefail
