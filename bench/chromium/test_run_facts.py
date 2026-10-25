@@ -854,9 +854,9 @@ class ScaleProvenanceNamesNoHost(unittest.TestCase):
                                   lambda: {"loadavg1": 0.1, "loadavg1_limit": 2.0,
                                            "vm_process_count": 0, "vm_processes": []}), \
                 mock.patch.object(reqscale.reqbench, "host_facts", lambda: facts), \
-                mock.patch.object(reqscale.platform, "node", lambda: "ip-10-0-0-1"):
+                mock.patch.object(reqscale.platform, "node", lambda: "ip-192-0-2-10"):
             prov = reqscale.collect_provenance(args, {"run_id": "1" * 32}, {"tag": "t"})
-        self.assertNotIn("ip-10-0-0-1", json.dumps(prov))
+        self.assertNotIn("ip-192-0-2-10", json.dumps(prov))
         self.assertEqual(prov["host"]["instance_type"], "c8g.metal-48xl")
         self.assertNotIn("hostname", prov["host"])
 
