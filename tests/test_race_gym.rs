@@ -7,7 +7,8 @@
 //!   200 walks), `RACE_GYM_FIRST` (skip the first this many pair schedules, so
 //!   `FIRST=348 SCHEDULES=1` runs schedule 348 alone), `RACE_GYM_SEED` (first walk seed, default 1), `RACE_GYM_DEPTH` (walk depth,
 //!   default 3), `RACE_GYM_PARALLEL` (runs at once, default 1).
-//! - `RACE_GYM_IMAGE` (default `alpine:latest`), `RACE_GYM_ARGS` (extra `podman run`
+//! - `RACE_GYM_IMAGE` (default `alpine:latest`; it also replaces the image a replay
+//!   recorded), `RACE_GYM_ARGS` (extra `podman run`
 //!   arguments), `RACE_GYM_GPUS` (one `--gpu` per actor when set).
 //! - `RACE_GYM_REPLAY=<file>`: rerun that replay instead; with `RACE_GYM_RERECORD=1`, run
 //!   its schedule again and write the new replay.
@@ -299,6 +300,8 @@ async fn race_gym() -> Result<()> {
                 &results[results.iter().position(|(m, _, _)| *m == n).unwrap()];
             let mut replay = record(scenario.as_ref(), schedule, result);
             if parallel > 1 && !control {
+                // A serial replay that ends in a control failure did not run as recorded;
+                // `confirmation_holds` counts it as confirmed and its failures go in the replay.
                 let confirm = race_gym::run(
                     scenario.as_ref(),
                     &ctx(&out, format!("{run_id}-{n}-confirm{k}"), 0),
@@ -307,7 +310,7 @@ async fn race_gym() -> Result<()> {
                 )
                 .await?;
                 print_result(&format!("schedule {n} serial replay"), &confirm);
-                if !confirm.failed.iter().any(|f| f.signature() == *signature) {
+                if !race_gym::confirmation_holds(signature, &confirm.failed) {
                     println!("RACE-GYM schedule {n}: {signature:?} not reproduced alone");
                     continue;
                 }

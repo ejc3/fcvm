@@ -2377,6 +2377,17 @@ async fn the_state_lives_in_s3_and_a_refused_read_is_an_error() {
             .unwrap()
             .version;
     }
+    // The coordinator's 1 s ticker moves the version without a receipt whenever a tick
+    // changes the fleet, so the stored version can pass the last receipt's. A viewer
+    // joining does the same on demand, which makes that happen on every run.
+    let after = handle
+        .apply(Event::ViewerJoined {
+            at: 0,
+            viewer: "v-2".into(),
+            client: None,
+        })
+        .await;
+    assert!(after.is_none(), "a join carries no receipt");
     handle.shutdown().await;
     tokio::time::timeout(Duration::from_secs(5), actor)
         .await
@@ -2388,8 +2399,19 @@ async fn the_state_lives_in_s3_and_a_refused_read_is_an_error() {
         .unwrap()
         .contains_key("/fleet-state/state.json"));
     let back = obj().load().await.unwrap().expect("the state object");
-    assert_eq!(back.version, last);
-    assert!(back.receipts.contains_key("l-2"));
+    // The stored state is the state the actor ended with, which the shutdown publishes.
+    let final_version = handle.snapshot.borrow().version;
+    assert_eq!(back.version, final_version);
+    assert!(
+        back.version > last,
+        "the join moved the version past the last receipt"
+    );
+    for i in 0..3 {
+        assert!(
+            back.receipts.contains_key(&format!("l-{i}")),
+            "receipt l-{i}"
+        );
+    }
     s3.deny.store(true, std::sync::atomic::Ordering::SeqCst);
     let e = obj().load().await.unwrap_err();
     assert!(format!("{e:#}").contains("403"), "{e:#}");
