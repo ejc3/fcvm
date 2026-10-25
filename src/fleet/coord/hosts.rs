@@ -341,22 +341,44 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
             if want == 0 {
                 continue;
             }
-            let live = hosts.iter().filter(|h| h.live()).count() as u32;
-            if live < want && watch[i].next_launch.is_none_or(|t| now >= t) {
+            let mut live = hosts.iter().filter(|h| h.live()).count() as u32;
+            if live >= want {
+                // A lost launch here either launched nothing or its hosts are listed (any
+                // over the capacity are terminated above): its token goes, and its on-demand
+                // count stops being reserved.
+                drop_tokens(region, &mut tokens, &mut on_demand);
+            } else if watch[i].next_launch.is_none_or(|t| now >= t) {
                 busy = true;
-                let short = want - live;
-                let (launched, retry) = launch_shortfall(
+                // Lost launches first, each asked again with its own token and count, so EC2
+                // answers with what it launched; only the shortfall left after them is new.
+                if let Some(found) = reconcile(
                     &cfg,
                     region,
-                    short,
+                    hosts,
+                    &mut tokens,
                     &mut on_demand,
                     &mut recent,
-                    &mut tokens,
                     &mut errors,
                 )
-                .await;
-                watch[i].next_launch =
-                    (launched < short && retry).then(|| now + cfg.capacity_retry);
+                .await
+                {
+                    live += found;
+                    if live < want {
+                        let short = want - live;
+                        let (launched, retry) = launch_shortfall(
+                            &cfg,
+                            region,
+                            short,
+                            &mut on_demand,
+                            &mut recent,
+                            &mut tokens,
+                            &mut errors,
+                        )
+                        .await;
+                        watch[i].next_launch =
+                            (launched < short && retry).then(|| now + cfg.capacity_retry);
+                    }
+                }
             }
             let running = |m: Market| {
                 hosts
@@ -407,6 +429,77 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
     }
 }
 
+/// Drop `region`'s lost launches, and their on-demand reservation.
+fn drop_tokens(region: &str, tokens: &mut Tokens, on_demand: &mut Option<u32>) {
+    tokens.retain(|(r, m), (_, c)| {
+        if r != region {
+            return true;
+        }
+        if *m == Market::OnDemand {
+            if let Some(n) = on_demand.as_mut() {
+                *n = n.saturating_sub(*c);
+            }
+        }
+        false
+    });
+}
+
+/// Ask `region`'s lost launches again with their tokens. Returns how many instances they
+/// launched that `hosts` does not list yet (now followed as pending), or `None` when one
+/// still has no answer (asked again at the next poll, and nothing new is launched).
+async fn reconcile(
+    cfg: &HostConfig,
+    region: &str,
+    hosts: &[Host],
+    tokens: &mut Tokens,
+    on_demand: &mut Option<u32>,
+    recent: &mut HashMap<String, Recent>,
+    errors: &mut Vec<String>,
+) -> Option<u32> {
+    let mut found = 0;
+    for market in [Market::Spot, Market::OnDemand] {
+        let key = (region.to_string(), market);
+        let Some((token, count)) = tokens.get(&key).cloned() else {
+            continue;
+        };
+        let asked = Instant::now();
+        match cfg.driver.launch(region, market, count, &token).await {
+            Ok(got) => {
+                tokens.remove(&key);
+                let new: Vec<&String> = got
+                    .ids
+                    .iter()
+                    .filter(|id| !hosts.iter().any(|h| h.id == **id))
+                    .collect();
+                for id in &new {
+                    tracing::info!(%region, instance = %id, market = market.name(), "wake: host launch accepted (answer of a lost request)");
+                    recent.insert(
+                        (*id).clone(),
+                        Recent {
+                            region: region.to_string(),
+                            market,
+                            asked,
+                        },
+                    );
+                }
+                if market == Market::OnDemand {
+                    // The reservation gives way to the hosts the list does not count yet.
+                    if let Some(n) = on_demand.as_mut() {
+                        *n = n.saturating_sub(count) + new.len() as u32;
+                    }
+                }
+                found += new.len() as u32;
+            }
+            Err(e) => {
+                tracing::warn!(%region, market = market.name(), error = %format!("{e:#}"), "asking a lost GPU host launch again failed");
+                errors.push(format!("{region} {}: {e:#}", market.name()));
+                return None;
+            }
+        }
+    }
+    Some(found)
+}
+
 /// Launch `short` hosts in `region`: spot, then what spot refused for capacity on demand
 /// within the fleet's on-demand cap (`on_demand` counts the fleet's on-demand hosts, `None`
 /// when a region could not be listed). Returns how many were launched and whether the rest
@@ -439,13 +532,7 @@ async fn launch_shortfall(
                 failed = true;
                 break;
             };
-            // A retry of a lost launch is already counted in `n` and asks for its own count.
-            let retry = tokens.contains_key(&(region.to_string(), Market::OnDemand));
-            let room = if retry {
-                ask
-            } else {
-                cfg.on_demand_max.saturating_sub(n)
-            };
+            let room = cfg.on_demand_max.saturating_sub(n);
             if room == 0 {
                 tracing::warn!(%region, on_demand = n, cap = cfg.on_demand_max, reason = %refused.join("; "),
                     "spot refused and the on-demand cap is reached; waiting for capacity");
@@ -457,25 +544,15 @@ async fn launch_shortfall(
         } else {
             ask
         };
-        // A request whose outcome is unknown (no answer) is asked again with its token and
-        // count, so EC2 answers with what it launched then rather than launching again. Its
-        // count was within the on-demand cap when it was decided.
-        let key = (region.to_string(), market);
-        let was_pending = tokens.contains_key(&key);
-        let (token, ask) = match tokens.get(&key) {
-            Some((t, n)) => (t.clone(), *n),
-            None => (uuid::Uuid::new_v4().to_string(), ask),
-        };
+        let token = uuid::Uuid::new_v4().to_string();
         let asked = Instant::now();
         let got = match cfg.driver.launch(region, market, ask, &token).await {
-            Ok(g) => {
-                tokens.remove(&key);
-                g
-            }
+            Ok(g) => g,
             Err(e) => {
-                tokens.insert(key, (token, ask));
-                // It may have launched: count it against the cap for the rest of the pass.
-                if market == Market::OnDemand && !was_pending {
+                // It may have launched: [`reconcile`] asks again with this token, and an
+                // on-demand count is reserved against the cap until then.
+                tokens.insert((region.to_string(), market), (token, ask));
+                if market == Market::OnDemand {
                     if let Some(n) = on_demand.as_mut() {
                         *n += ask;
                     }
@@ -499,10 +576,6 @@ async fn launch_shortfall(
         }
         if market == Market::OnDemand {
             if let Some(n) = on_demand.as_mut() {
-                // A retry's reservation gives way to what it launched.
-                if was_pending {
-                    *n = n.saturating_sub(ask);
-                }
                 *n += got.ids.len() as u32;
             }
         }
