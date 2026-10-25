@@ -196,7 +196,95 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Vary", "Origin")
         super().end_headers()
 
+    # A request body larger than this is not read through; the connection
+    # closes with the rest unread, as before. Beacons are a few KiB.
+    MAX_DRAIN = 64 * 1024 * 1024
+    # How long the drain waits for a body that has stopped arriving. A client
+    # that sends part of its body and stops still gets its answer after this.
+    DRAIN_TIMEOUT_S = 5.0
+
+    def _drain_body(self):
+        """Read and discard the request body, so the close after the answer is
+        a FIN. Left unread, the body sits in the socket's receive queue when the
+        HTTP/1.0 connection closes, the kernel sends a RST, and Chromium reports
+        the request as net::ERR_CONNECTION_RESET (#1137). A body that stops
+        arriving, or a malformed one, ends the drain and the answer goes out."""
+        headers = getattr(self, "headers", None)
+        if headers is None:
+            return
+        previous = self.connection.gettimeout()
+        self._drain_deadline = time.monotonic() + self.DRAIN_TIMEOUT_S
+        try:
+            self._read_body(headers)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self.connection.settimeout(previous)
+
+    def _take(self, n):
+        """Up to n bytes of the body: what the handler's buffer already holds,
+        or one read from the socket with its timeout set to what is left of
+        the drain's one deadline, so bytes trickled in one at a time cannot
+        extend it. b"" at the end of the stream."""
+        left = self._drain_deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("request body drain deadline passed")
+        self.connection.settimeout(left)
+        return self.rfile.read1(n)
+
+    def _read_body(self, headers):
+        if "chunked" in (headers.get("Transfer-Encoding") or "").lower():
+            pending = b""
+
+            def line():
+                nonlocal pending
+                while b"\n" not in pending and len(pending) < 1024:
+                    data = self._take(4096)
+                    if not data:
+                        break
+                    pending += data
+                head, sep, pending = pending.partition(b"\n")
+                return head + sep
+
+            def skip(count):
+                nonlocal pending
+                used = min(count, len(pending))
+                pending, count = pending[used:], count - used
+                while count > 0:
+                    data = self._take(min(count, 1 << 16))
+                    if not data:
+                        return
+                    count -= len(data)
+
+            left = self.MAX_DRAIN
+            while left > 0:
+                try:
+                    size = int(line().split(b";")[0].strip() or b"0", 16)
+                except ValueError:
+                    return
+                if size == 0:
+                    while line() not in (b"\r\n", b"\n", b""):
+                        pass
+                    return
+                if size < 0 or size > left:
+                    return
+                skip(size + 2)
+                left -= size
+            return
+        try:
+            length = int(headers.get("Content-Length") or 0)
+        except ValueError:
+            return
+        if length <= 0 or length > self.MAX_DRAIN:
+            return
+        while length > 0:
+            chunk = self._take(min(length, 1 << 16))
+            if not chunk:
+                return
+            length -= len(chunk)
+
     def _serve(self, body=True):
+        self._drain_body()
         host = (self.headers.get("Host") or "").split(":")[0]
         u = urllib.parse.urlparse(self.path)
         entry = self.exact.get((host, u.path, u.query)) or \
