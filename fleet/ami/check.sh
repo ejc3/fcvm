@@ -99,5 +99,25 @@ else
 fi
 rm -rf "$gt"
 
+# The tile's boot path (certificate, TLS, renderer, first-frame log) must not wait for
+# cloud-init's network stage: cloud-init.service is ordered before sysinit.target and
+# network-online.target, so a unit with default dependencies (after sysinit.target), or one
+# ordered after network-online.target or any cloud-init unit, starts only once that stage is
+# done (about 8 s into a tile's first boot, issue #1257). The distribution's nginx.service is
+# ordered after network-online.target, so the tile must run fcvm-fleet-nginx.service instead.
+late='network-online.target|sysinit.target|basic.target|multi-user.target|cloud-[a-z-]*\.(service|target)|nginx\.service'
+for u in fcvm-fleet-tls fcvm-fleet-renderer fcvm-fleet-nginx fcvm-fleet-first-frame; do
+  f=fleet/ami/tile/$u.service
+  [ -f "$f" ] || { no "$f is missing"; continue; }
+  unit=$(sed -n '/^\[Unit\]/,/^\[/p' "$f")
+  grep -qx 'DefaultDependencies=no' <<<"$unit" ||
+    no "$u.service has default dependencies, so it starts after sysinit.target and cloud-init's network stage"
+  bad=$(grep -E '^(After|Requires|Wants|BindsTo|Requisite)=' <<<"$unit" | grep -oE "(^|[= ])($late)" | tr -d '= ' | sort -u | paste -sd' ')
+  [ -z "$bad" ] || no "$u.service waits for $bad, which waits for cloud-init's network stage"
+done
+enable=$(grep -E '^ *systemctl enable ' fleet/ami/tile/build.sh)
+grep -qw 'fcvm-fleet-nginx.service' <<<"$enable" || no "tile/build.sh does not enable fcvm-fleet-nginx.service"
+grep -qE '(^| )nginx\.service' <<<"$enable" && no "tile/build.sh enables the distribution's nginx.service, which waits for network-online.target"
+
 [ "$fail" = 0 ] && echo "fleet/ami checks: ok"
 exit "$fail"
