@@ -262,6 +262,11 @@ gh pr checks <N>
 
 ## Stacked PRs (Branch of Branch)
 
+CI runs only on the top of a stack (see AGENTS.md "CI runs on the top of a stack"). Drafts and
+lower PRs get `Summary (deferred)`. A lower PR is tested when its head carries `Summary` success
+or the `Stack CI` status that the top's passing run posts; bisect a failing top with
+`gh workflow run ci.yml --ref <layer-branch>`.
+
 ```bash
 git checkout pr1-branch
 git checkout -b pr2-branch

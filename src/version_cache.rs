@@ -1,5 +1,7 @@
 //! Cached per-binary derivations: `<binary> --version` probes and other strings
-//! that are a pure function of a binary's bytes (e.g. the fc-agent initrd SHA).
+//! that are a pure function of a binary's bytes (e.g. the fc-agent initrd SHA, and
+//! the SHA-256 of an image disk that keys the snapshot cache,
+//! `utils::image_content_identity`).
 //!
 //! `firecracker --version` runs on the VM-launch / snapshot-clone hot path —
 //! `find_firecracker()` probes it and is called more than once per launch — and
@@ -62,9 +64,17 @@ struct BinaryIdentity {
     len: u64,
 }
 
-impl BinaryIdentity {
-    fn of(bin: &Path) -> Option<Self> {
-        let meta = std::fs::metadata(bin).ok()?;
+/// The part of a file's metadata a cache entry is valid for: its modification time and
+/// length. A `compute` that reads the file compares this with an `fstat` of what it
+/// read, so a value is never stored under a stamp it was not derived from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStamp {
+    pub mtime_ns: i128,
+    pub len: u64,
+}
+
+impl FileStamp {
+    pub fn of(meta: &std::fs::Metadata) -> Option<Self> {
         let mtime = meta.modified().ok()?;
         let mtime_ns = match mtime.duration_since(std::time::UNIX_EPOCH) {
             Ok(d) => d.as_nanos() as i128,
@@ -72,10 +82,27 @@ impl BinaryIdentity {
             Err(e) => -(e.duration().as_nanos() as i128),
         };
         Some(Self {
-            path: bin.to_path_buf(),
             mtime_ns,
             len: meta.len(),
         })
+    }
+}
+
+impl BinaryIdentity {
+    fn of(bin: &Path) -> Option<Self> {
+        let stamp = FileStamp::of(&std::fs::metadata(bin).ok()?)?;
+        Some(Self {
+            path: bin.to_path_buf(),
+            mtime_ns: stamp.mtime_ns,
+            len: stamp.len,
+        })
+    }
+
+    fn stamp(&self) -> FileStamp {
+        FileStamp {
+            mtime_ns: self.mtime_ns,
+            len: self.len,
+        }
     }
 
     /// Stable file name for this identity's on-disk cache entry. The namespace
@@ -148,11 +175,31 @@ pub fn derived(
     derived_in(bin, namespace, disk_cache_dir().as_deref(), compute)
 }
 
+/// [`derived`] for a `compute` that reads the file itself: it is handed the stamp its
+/// value will be cached under (`None` when the file could not be stat'ed, and then
+/// nothing is cached), so it can refuse to return a value read from other bytes.
+pub fn derived_from_file(
+    file: &Path,
+    namespace: &str,
+    compute: impl FnOnce(Option<FileStamp>) -> Result<String>,
+) -> Result<String> {
+    derived_stamped_in(file, namespace, disk_cache_dir().as_deref(), compute)
+}
+
 fn derived_in(
     bin: &Path,
     namespace: &str,
     cache_dir: Option<&Path>,
     compute: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    derived_stamped_in(bin, namespace, cache_dir, |_| compute())
+}
+
+fn derived_stamped_in(
+    bin: &Path,
+    namespace: &str,
+    cache_dir: Option<&Path>,
+    compute: impl FnOnce(Option<FileStamp>) -> Result<String>,
 ) -> Result<String> {
     let identity = BinaryIdentity::of(bin);
 
@@ -174,7 +221,7 @@ fn derived_in(
         }
     }
 
-    let value = compute()?;
+    let value = compute(identity.as_ref().map(BinaryIdentity::stamp))?;
 
     if let Some(id) = &identity {
         let key = id.key(namespace);
