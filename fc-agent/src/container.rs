@@ -1172,6 +1172,7 @@ fn run_cache_handshake<G>(
     let absolute_deadline = started + std::time::Duration::from_secs(600);
     let mut asked_before = false;
     let mut went_silent = false;
+    let mut failed_reconnects: u64 = 0;
 
     loop {
         if restore_flag.load(std::sync::atomic::Ordering::Acquire) {
@@ -1208,10 +1209,16 @@ fn run_cache_handshake<G>(
                 // binding its listener (a restore binds before resume, but a
                 // teardown-in-progress can also present this way). Retry; the
                 // restore_flag/absolute-deadline checks above bound the loop.
-                eprintln!(
-                    "[fc-agent] cache handshake: reconnect failed ({}), retrying",
-                    e
-                );
+                // Once the console gate is released these lines reach the
+                // serial console, and the loop retries ten times a second for
+                // up to the 10-minute cap: log the first few and every 100th.
+                failed_reconnects += 1;
+                if failed_reconnects <= 5 || failed_reconnects.is_multiple_of(100) {
+                    eprintln!(
+                        "[fc-agent] cache handshake: reconnect failed ({}, attempt {}), retrying",
+                        e, failed_reconnects
+                    );
+                }
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }
