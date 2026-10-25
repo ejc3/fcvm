@@ -87,7 +87,7 @@ class Harness(unittest.TestCase):
 
 class PrScope(Harness):
     def scope(self, fixture, **env):
-        base = dict(EVENT='pull_request', PR='12', DRAFT='false', HEAD_REF='feature-b',
+        base = dict(EVENT='pull_request', PR='12', DRAFT='false', HEAD_REPO=REPO, HEAD_REF='feature-b',
                     HEAD_SHA='b' * 40, BASE_REF='main')
         base.update(env)
         return self.run_script('ci-pr-scope.sh', fixture, **base)
@@ -118,6 +118,14 @@ class PrScope(Harness):
                    [pr(13, 'feature-c', 'feature-b', repo='someone/fork')],
                    f'repos/{REPO}/pulls/12/files': files('src/lib.rs')}
         outputs, _, _ = self.scope(fixture)
+        self.assertEqual(outputs['run'], 'true')
+        self.assertEqual(outputs['code'], 'true')
+
+    def test_a_fork_pr_whose_branch_shares_a_stack_branch_name_runs(self):
+        # Upstream has a PR stacked on feature-b; this PR's feature-b is a fork's branch.
+        fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100': [pr(13, 'feature-c', 'feature-b')],
+                   f'repos/{REPO}/pulls/12/files': files('src/lib.rs')}
+        outputs, _, _ = self.scope(fixture, HEAD_REPO='someone/fork')
         self.assertEqual(outputs['run'], 'true')
         self.assertEqual(outputs['code'], 'true')
 
@@ -286,6 +294,7 @@ class Workflow(unittest.TestCase):
     def test_the_scope_sees_draft_state_and_the_stack(self):
         block = jobs(CI.read_text())['changes']
         for env in ('DRAFT: ${{ github.event.pull_request.draft }}', 'HEAD_REF: ${{ github.event.pull_request.head.ref }}',
+                    'HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}',
                     'BASE_REF: ${{ github.event.pull_request.base.ref }}', 'run: bash scripts/ci-pr-scope.sh'):
             self.assertIn(env, block)
 

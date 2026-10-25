@@ -13,7 +13,7 @@
 # Every lookup that fails runs the full matrix: a scope that cannot be computed
 # must not skip anything.
 #
-# Environment: EVENT, REPO, PR, DRAFT, HEAD_REF, HEAD_SHA, BASE_REF,
+# Environment: EVENT, REPO, PR, DRAFT, HEAD_REPO, HEAD_REF, HEAD_SHA, BASE_REF,
 # DEFAULT_BRANCH, GITHUB_OUTPUT; GH overrides the gh command (tests).
 set -euo pipefail
 GH=${GH:-gh}
@@ -45,6 +45,11 @@ if [ "$EVENT" != "pull_request" ]; then
   exit 0
 fi
 
+# Only a PR whose branch is in this repository can be a layer of one of its
+# stacks. A fork's branch can share a name with one of ours.
+stackable=true
+[ "$HEAD_REPO" = "$REPO" ] || stackable=false
+
 if [ "$DRAFT" = "true" ]; then
   emit false "draft: CI runs when the PR is marked ready" false false false false
   exit 0
@@ -52,7 +57,9 @@ fi
 
 # Open PRs from this repository based on this PR's branch. A query that fails
 # counts as none, so this PR runs.
-if children=$("$GH" api --paginate "repos/$REPO/pulls?state=open&base=$HEAD_REF&per_page=100" \
+if [ "$stackable" = false ]; then
+  echo "head branch is in $HEAD_REPO, not $REPO: not part of a stack here"
+elif children=$("$GH" api --paginate "repos/$REPO/pulls?state=open&base=$HEAD_REF&per_page=100" \
     --jq ".[] | select(.head.repo.full_name == \"$REPO\") | .number"); then
   children=$(echo "$children" | grep -E '^[0-9]+$' | sort -n | tr '\n' ' ' | sed 's/ $//' || true)
   if [ -n "$children" ]; then

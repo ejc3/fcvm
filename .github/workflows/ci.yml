@@ -89,6 +89,7 @@ jobs:
           PR: ${{ github.event.number }}
           REPO: ${{ github.repository }}
           DRAFT: ${{ github.event.pull_request.draft }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
@@ -295,6 +296,13 @@ jobs:
               if ! NAMES=$(gh api "repos/$REPO/actions/runs/$run/jobs" --paginate \
                   --jq '.jobs[] | select(.conclusion == "success" or .conclusion == "skipped") | .name'); then
                 echo "Could not list the jobs of run $run, ignoring it"
+                continue
+              fi
+              # Only a run that tested something counts. A draft's or a lower stack
+              # PR's run skips every job and still succeeds, under a Summary named
+              # "Summary (deferred)"; reusing it would skip the whole matrix here.
+              if ! grep -qxF Summary <<< "$NAMES"; then
+                echo "Run $run tested nothing (no passing Summary), ignoring it"
                 continue
               fi
               echo "Tree SHA $TREE_SHA already passed CI on PR commit $sha (run $run)"

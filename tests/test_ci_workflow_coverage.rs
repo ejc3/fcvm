@@ -354,7 +354,11 @@ fn fleet_web_changes_run_the_fleet_web_job() {
     );
     // Every fail-open branch opens the web gate too: each `emit true` that is not
     // the classifier's own verdict opens all four gates.
-    for line in text.lines().map(str::trim).filter(|l| l.starts_with("emit true ")) {
+    for line in text
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("emit true "))
+    {
         assert!(
             line == "emit true \"$scope\" \"$code\" \"$bench\" \"$fleet\" \"$web\""
                 || line.ends_with(" true true true true"),
@@ -1539,6 +1543,7 @@ fn run_changes_step_with_files(event: &str, files: Option<&[&str]>) -> String {
         .env("REPO", "o/r")
         .env("PR", "1")
         .env("DRAFT", "false")
+        .env("HEAD_REPO", "o/r")
         .env("HEAD_REF", "example-branch")
         .env("HEAD_SHA", "0000000000000000000000000000000000000000")
         .env("BASE_REF", "main")
@@ -2319,6 +2324,7 @@ fn main_runs_the_x64_jobs_its_pull_request_left_out() {
     let pr = planned_jobs(&run_matrix_plan("pull_request", false, &[]));
     let mut reported: Vec<&str> = pr.iter().map(String::as_str).collect();
     reported.push("Lint");
+    reported.push("Summary");
     let main = planned_jobs(&run_matrix_plan("push", true, &reported));
     assert!(
         pr.is_disjoint(&main),
@@ -2356,8 +2362,10 @@ fn runs_without_a_passing_pull_request_tree_get_the_full_matrix() {
 /// reports under the unexpanded matrix names.
 #[test]
 fn main_skips_the_matrix_when_its_pull_request_needed_nothing_more() {
+    let mut passed: Vec<&str> = SELF_HOSTED_JOBS.to_vec();
+    passed.push("Summary");
     assert!(
-        planned_jobs(&run_matrix_plan("push", true, &SELF_HOSTED_JOBS)).is_empty(),
+        planned_jobs(&run_matrix_plan("push", true, &passed)).is_empty(),
         "every self-hosted job already passed for this tree, so main must run none"
     );
     let skipped = [
@@ -2365,10 +2373,34 @@ fn main_skips_the_matrix_when_its_pull_request_needed_nothing_more() {
         "Host-Root-${{ matrix.arch }}-${{ matrix.mode }}",
         "Container-${{ matrix.arch }}",
         "Lint",
+        "Summary",
     ];
     assert!(
         planned_jobs(&run_matrix_plan("push", true, &skipped)).is_empty(),
         "the PR run skipped the matrix for this tree, so main must skip it too"
+    );
+}
+
+/// A PR run that tested nothing is not evidence for main. A draft's or a lower stack PR's
+/// run skips every job (so the jobs API reports the unexpanded matrix names, the same as
+/// a run whose `changes` job skipped the matrix) and succeeds under a Summary named
+/// "Summary (deferred)". Reusing it would skip every self-hosted job on main.
+#[test]
+fn main_ignores_a_pull_request_run_that_tested_nothing() {
+    let deferred = [
+        "Changes",
+        "Skip Check",
+        "Host-${{ matrix.arch }}",
+        "Host-Root-${{ matrix.arch }}-${{ matrix.mode }}",
+        "Container-${{ matrix.arch }}",
+        "Lint",
+        "actionlint",
+        "Summary (deferred)",
+    ];
+    assert_eq!(
+        planned_jobs(&run_matrix_plan("push", true, &deferred)),
+        job_set(&SELF_HOSTED_JOBS),
+        "main reused a deferred PR run and skipped self-hosted jobs nothing tested"
     );
 }
 
