@@ -482,12 +482,13 @@ impl SnapshotManager {
         Ok(())
     }
 
-    /// Delete `name` only if it is still the generation a failed restore used.
+    /// Delete `name` only if it is still the generation `expected`: the one a
+    /// failed restore used, or the one `snapshots prune` selected.
     ///
     /// The comparison happens while holding the generation lock exclusively.
-    /// This closes the release-shared/acquire-exclusive gap in cache
-    /// invalidation: if another creator installs a replacement in that gap, the
-    /// replacement is retained rather than being mistaken for the failed one.
+    /// This closes the gap between the caller's read and the delete: if another
+    /// creator installs a replacement in that gap, the replacement is retained
+    /// rather than being mistaken for the generation the caller read.
     pub async fn delete_snapshot_if_generation(
         &self,
         name: &str,
@@ -498,7 +499,7 @@ impl SnapshotManager {
         let _generation_lock =
             crate::commands::common::acquire_snapshot_dir_lock(&snapshot_dir, true)
                 .await
-                .with_context(|| format!("locking snapshot '{}' for invalidation", name))?;
+                .with_context(|| format!("locking snapshot '{}' for deletion", name))?;
 
         if !snapshot_dir.exists() {
             return Ok(false);
@@ -507,11 +508,11 @@ impl SnapshotManager {
         let (_, current) = self
             .load_snapshot_with_generation(name)
             .await
-            .with_context(|| format!("revalidating snapshot '{}' before invalidation", name))?;
+            .with_context(|| format!("revalidating snapshot '{}' before deletion", name))?;
         if &current != expected {
             info!(
                 snapshot = name,
-                "snapshot generation changed before invalidation; retaining replacement"
+                "snapshot generation changed before deletion; retaining replacement"
             );
             return Ok(false);
         }
@@ -519,7 +520,7 @@ impl SnapshotManager {
         fs::remove_dir_all(&snapshot_dir)
             .await
             .context("removing invalid snapshot generation")?;
-        info!(snapshot = name, "invalid snapshot generation deleted");
+        info!(snapshot = name, "snapshot generation deleted");
         Ok(true)
     }
 }
