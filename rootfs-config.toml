@@ -365,7 +365,7 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # the resumed guest's first write to each page a copy-on-write (#1264).
 firecracker_repo = "ejc3/firecracker"
 firecracker_branch = "fix/nv2-dump-skip-absent"
-firecracker_commit = "8f1f2d2011f188ff6a05f89954a19c0d21971f61"
+firecracker_commit = "ad2ff71e8bdc79734849e9a71c0310af26b101c4"
 firecracker_args = "--enable-nv2"
 
 # Boot args for nested KVM
