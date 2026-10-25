@@ -1,6 +1,7 @@
-# The host agent. Installed disabled: a host's boot (the launch template's user data in
-# ejc3/aws, fcvm-fleet.tf `fcvm_fleet_host_agent_args`) writes its arguments to
-# /etc/fcvm-fleet/agent.env and starts it, so the agent dials the coordinator
+# The host agent. Enabled, and started only where a host's boot (the launch template's user
+# data in ejc3/aws, fcvm-fleet.tf `fcvm_fleet_host_agent_args`) wrote its arguments to
+# /etc/fcvm-fleet/agent.env: at the store's end when the file was there by then, otherwise
+# by the user data's own `systemctl start`. The agent dials the coordinator
 # (wss://fleet-api-stage.fcvm.dev/agent with the Access service token from
 # fcvm-fleet/agent-access-token). The arguments are fleet/PROTOCOL.md, "Agent", "Running it".
 [Unit]

@@ -172,5 +172,20 @@ fx=$(mktemp -d)
 ) 2>/dev/null || no "store.sh does not restore store-pack.py's parts at once into the tree one tar gives"
 rm -rf "$fx"
 
+# The store waits for the network and nothing else of the boot: with default dependencies
+# it waited for sysinit.target and basic.target, so for cloud-init's network stage (2.1 s of
+# a cold g4dn.metal boot), and multi-user.target, so cloud-final, waited for the store.
+su=fleet/ami/host/fcvm-fleet-store.service
+after=$(sed -n 's/^After=//p' "$su" | tr ' ' '\n')
+grep -qx 'DefaultDependencies=no' "$su" &&
+  grep -qx 'systemd-networkd-wait-online.service' <<<"$after" && grep -qx 'nss-lookup.target' <<<"$after" &&
+  grep -qx 'local-fs.target' <<<"$after" && ! grep -qE '^(cloud-init|sysinit|basic|network-online)' <<<"$after" &&
+  grep -qx 'Conflicts=shutdown.target' "$su" && grep -qx 'Before=shutdown.target' "$su" ||
+  no "fcvm-fleet-store.service must order itself after the network only (DefaultDependencies=no)"
+# The agent is enabled in the image, so a host whose boot wrote agent.env starts it as soon
+# as the store is restored, without waiting for the user data's `systemctl start`.
+sed -n '/^prep)/,/;;/p' fleet/ami/host/build.sh | grep -qE '^  systemctl enable .*fcvm-fleet-agent\.service' ||
+  no "host/build.sh prep does not enable fcvm-fleet-agent.service"
+
 [ "$fail" = 0 ] && echo "fleet/ami checks: ok"
 exit "$fail"

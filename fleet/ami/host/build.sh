@@ -71,7 +71,23 @@ X
   install -m 0755 "$HERE/bind-vfio.sh" "$HERE/store.sh" "$HERE/s3-cat.py" /usr/local/lib/fcvm-fleet/
   install -m 0644 "$HERE/fcvm-fleet-vfio.service" "$HERE/fcvm-fleet-store.service" "$HERE/fcvm-fleet-agent.service" /etc/systemd/system/
   systemctl daemon-reload
-  systemctl enable fcvm-fleet-vfio.service fcvm-fleet-store.service
+  # The agent starts once the store is restored, on a host whose boot wrote agent.env.
+  systemctl enable fcvm-fleet-vfio.service fcvm-fleet-store.service fcvm-fleet-agent.service
+  # Units a GPU host does not use. At the first boot each reads its files from the lazily
+  # loaded root volume while the store is restored (podman's own units, apport, fwupd,
+  # ModemManager, udisks2 and the rest started within 1 s of the store on a cold boot).
+  # podman runs inside the guests; the host only exports and loads images.
+  unused=(podman.service podman.socket podman-auto-update.timer podman-auto-update.service \
+    podman-restart.service podman-clean-transient.service udisks2.service ModemManager.service \
+    apport.service apport-autoreport.path apport-autoreport.timer apport-forward.socket fwupd-refresh.timer \
+    multipathd.service multipathd.socket open-iscsi.service iscsid.socket lxd-installer.socket \
+    open-vm-tools.service vgauth.service pollinate.service ubuntu-advantage.service ua-reboot-cmds.service \
+    ua-timer.timer motd-news.timer update-notifier-download.timer update-notifier-motd.timer man-db.timer \
+    hibinit-agent.service lvm2-monitor.service dm-event.socket lvm2-lvmpolld.socket mdcheck_continue.timer \
+    mdcheck_start.timer mdmonitor-oneshot.timer snapd.autoimport.service e2scrub_all.timer e2scrub_reap.service \
+    dpkg-db-backup.timer)
+  mapfile -t unused < <(systemctl list-unit-files --no-legend --plain "${unused[@]}" | awk '{print $1}')
+  [ "${#unused[@]}" = 0 ] || systemctl disable "${unused[@]}"
   ;;
 build)
   loginctl enable-linger "$U"
