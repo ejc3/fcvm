@@ -2835,33 +2835,32 @@ async fn cmd_snapshot_run_inner(
     // Host-observed end-to-end restore clock: from the start of the restore
     // call through the guest's ACK. Published as ack_ms in the restored record.
     let restore_started = std::time::Instant::now();
-    let setup_result: Result<(
-        Box<dyn crate::hypervisor::Hypervisor>,
-        Option<tokio::process::Child>,
-    )> = if is_ch {
-        super::common::restore_from_snapshot_ch(
-            restore_params,
-            setup.network_mut(),
-            &state_manager,
-            &mut vm_state,
-        )
-        .await
-        .map(|(backend, holder)| {
-            (
-                Box::new(backend) as Box<dyn crate::hypervisor::Hypervisor>,
-                holder,
+    let setup_result: Result<super::common::RestoredVmm<Box<dyn crate::hypervisor::Hypervisor>>> =
+        if is_ch {
+            super::common::restore_from_snapshot_ch(
+                restore_params,
+                setup.network_mut(),
+                &state_manager,
+                &mut vm_state,
             )
-        })
-    } else {
-        super::common::restore_from_snapshot(
-            restore_params,
-            setup.network_mut(),
-            &state_manager,
-            &mut vm_state,
-        )
-        .await
-        .map(|(b, h)| (Box::new(b) as Box<dyn crate::hypervisor::Hypervisor>, h))
-    };
+            .await
+            .map(|(backend, holder, lease)| {
+                (
+                    Box::new(backend) as Box<dyn crate::hypervisor::Hypervisor>,
+                    holder,
+                    lease,
+                )
+            })
+        } else {
+            super::common::restore_from_snapshot(
+                restore_params,
+                setup.network_mut(),
+                &state_manager,
+                &mut vm_state,
+            )
+            .await
+            .map(|(b, h, l)| (Box::new(b) as Box<dyn crate::hypervisor::Hypervisor>, h, l))
+        };
 
     // The restore has opened/reflinked everything it needs from the snapshot directory;
     // release the shared per-snapshot lock so creators are not blocked for the lifetime
@@ -2869,7 +2868,10 @@ async fn cmd_snapshot_run_inner(
     drop(snapshot_shared_lock);
     failpoint::hit_async("restore.unlocked").await;
 
-    let (mut vm_manager, mut holder_child) = setup_try!(setup_result);
+    // `_vsock_redirect_lease` is held until this function returns, after the clone's
+    // teardown: its VMM resolves its vsock socket through the mount redirect for its
+    // whole life (storage::runtime_dir).
+    let (mut vm_manager, mut holder_child, _vsock_redirect_lease) = setup_try!(setup_result);
 
     // The VMM is now owned by the normal lifecycle. Move every companion out of
     // the setup transaction exactly once; failed setup never reaches this point.
