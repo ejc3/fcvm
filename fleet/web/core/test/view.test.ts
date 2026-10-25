@@ -688,7 +688,7 @@ describe("the recording", () => {
     const v0 = view(s, EPOCH, media);
     const keys = v0.plan.direct.filter((x) => x.box !== null && x.url !== null).map((x) => `${x.id} ${x.baseUrl ?? ""}`);
     expect(keys.length).toBeGreaterThan(1);
-    // The drawer's own mode decides which tiling its report describes (ui.shownMode can lag it).
+    // The report carries the mode it describes, so the reader needs no other record of it.
     const report = (live: string[]) => reduce(s, { type: "frame-stats", stats: { ...s.frames!, allLive: true, live, mode: "direct" } });
     expect(view(report(keys.slice(1)), EPOCH, media).reel!.leaving).toBe(false);
     expect(view(report(keys), EPOCH, media).reel!.leaving).toBe(true);

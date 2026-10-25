@@ -106,3 +106,27 @@ export function releaseBefore(choice: SyncChoice, id: string): number | null {
   if (s.kind === "sync" || s.kind === "behind") return s.t - SAME_T_EPS;
   return null;
 }
+
+/**
+ * A frozen choice, given a frame for each tile whose entry names none (empty or
+ * waiting) and whose stream now holds one: a stream that closed and reopened under a
+ * paused picture. The tile takes its newest frame at or before T, dimmed unless it
+ * is at T. A reopened stream seldom holds one that old, so otherwise it takes its
+ * oldest frame after T, dimmed. T and every other entry stay as they were: choosing
+ * the whole wall again would move a picture the viewer paused. Null when nothing
+ * changes. A tile the choice does not name is not added.
+ */
+export function acquireFrozen(choice: SyncChoice, buffers: readonly TileBuffer[]): SyncChoice | null {
+  if (choice.T === null) return null;
+  let show: Map<string, TileShow> | null = null;
+  for (const b of buffers) {
+    const was = choice.show.get(b.id);
+    if (!was || (was.kind !== "empty" && was.kind !== "waiting") || b.ts.length === 0) continue;
+    let at: number | null = null;
+    for (const t of b.ts) if (t <= choice.T + SAME_T_EPS) at = t;
+    show ??= new Map(choice.show);
+    if (at !== null) show.set(b.id, Math.abs(at - choice.T) <= SAME_T_EPS ? { kind: "sync", t: choice.T } : { kind: "behind", t: at });
+    else show.set(b.id, { kind: "behind", t: b.ts[0]! });
+  }
+  return show === null ? null : { T: choice.T, show };
+}
