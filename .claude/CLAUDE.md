@@ -1275,6 +1275,20 @@ implicit UFFD copy server (`direct_restore_memory` in `src/commands/snapshot.rs`
 anonymous memory that later writes do not copy. The chain is from reading
 arch/arm64/kvm/mmu.c and nested.c; it has not been traced on hardware.
 
+**Copy-on-write after a Full snapshot of the source (#1264).** The same invalidation reaches a
+cold-booted NV2 source through `snapshot create`. A Full snapshot that reads every guest page
+maps each page the guest never wrote to the shared zero page (a 1 GiB L1: 0 such pages before
+the dump, 144,696 after), so after the resume each first write to one is a copy-on-write that
+unmaps every shadow stage-2: ~600k exits/s on one IPA, guest soft lockups of 74 s, and
+`--resume-snapshot-network` unacknowledged for 40 s or more, in 12 of 337 pre-start snapshots
+on a pbox. The NV2 fork's Full dump leaves those pages as holes without reading them (pagemap
+and mincore say they have no page table entry), so the source keeps them unmapped and its
+first write is an ordinary anonymous fault. It still reads every page of a restore through a
+userfaultfd, of file-backed memory, and of a memory file it overwrites in place.
+`test_snapshot_create_leaves_nv2_source_pages_unmapped` (tests/test_kvm.rs) counts the
+zero-page pages across one snapshot. Linux removed the full unmap upstream (e6084aecaeef and
+its series); the 6.18 host kernel still has it, so other invalidation sources still reach it.
+
 **Debugging these**: guest `dd if=/dev/zero of=/dev/null` per-CPU (healthy ≈ 19 GB/s on
 Graviton3; storms read 0.07-0.3 GB/s), host `ftrace` on `kvm:kvm_timer_emulate`, per-thread
 CPU of the firecracker process (`/proc/<fc>/task/*/stat` field 14+15), and the fork's
