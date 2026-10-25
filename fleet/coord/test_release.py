@@ -6,6 +6,8 @@ import copy
 import json
 import os
 import socket
+import base64
+import hashlib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -77,7 +79,38 @@ class ProbeTests(unittest.TestCase):
             def close(self): pass
         with patch.object(smoke, "Socket", Renderer):
             smoke.prove_frame(self.tile())
-        self.assertEqual(calls, [((self.tile()["frame_url_v4"],), {})])
+        self.assertEqual(calls, [((self.tile()["frame_url_v4"] + "?h=180",), {})])
+
+    def test_renderer_handshake_requests_a_valid_frame_height(self):
+        class Transport:
+            closed = False
+            request = b""
+            pending = b""
+            def sendall(self, request):
+                self.request = request
+                lines = request.decode().split("\r\n")
+                headers = dict(line.split(": ", 1) for line in lines[1:] if ": " in line)
+                if lines[0] != "GET /frames?h=180 HTTP/1.1":
+                    self.pending = b"HTTP/1.1 400 Bad Request\r\n\r\n"
+                    return
+                accept = base64.b64encode(hashlib.sha1((headers["Sec-WebSocket-Key"] +
+                    "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
+                self.pending = (b"HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: " +
+                                accept + b"\r\n\r\n\x82\x01x")
+            def recv(self, count):
+                result, self.pending = self.pending[:count], self.pending[count:]
+                return result
+            def settimeout(self, timeout): pass
+            def close(self): self.closed = True
+        transport, error = Transport(), None
+        with patch.object(smoke, "ipv4", return_value=transport):
+            try:
+                smoke.prove_frame(self.tile())
+            except RuntimeError as caught:
+                error = caught
+        self.assertEqual(transport.request.split(b"\r\n", 1)[0], b"GET /frames?h=180 HTTP/1.1")
+        self.assertIsNone(error)
+        self.assertTrue(transport.closed)
 
     def test_a_fast_fcvm_restore_does_not_trip_the_shared_relaunch_limit(self):
         clock = [100.0]

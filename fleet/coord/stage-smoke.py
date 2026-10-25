@@ -44,7 +44,8 @@ class Socket:
             if any(c in name + value for c in "\r\n"):
                 raise ValueError("invalid header")
             extra += name + ": " + value + "\r\n"
-        self.s.sendall((f"GET {parsed.path or '/'} HTTP/1.1\r\nHost: {authority}\r\nUpgrade: websocket\r\n"
+        target = (parsed.path or "/") + ("?" + parsed.query if parsed.query else "")
+        self.s.sendall((f"GET {target} HTTP/1.1\r\nHost: {authority}\r\nUpgrade: websocket\r\n"
             f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n{extra}\r\n").encode())
         head = b""
         while not head.endswith(b"\r\n\r\n"):
@@ -129,7 +130,7 @@ def prove_frame(tile):
     """A DNS record alone is insufficient: require a binary renderer packet over IPv4/TLS."""
     url = tile["frame_url_v4"]
     frame_host(url)
-    connection = Socket(url)  # No Access credentials are ever sent to a renderer.
+    connection = Socket(url + "?h=180")  # No Access credentials are ever sent to a renderer.
     try:
         deadline = time.monotonic() + 40
         while time.monotonic() < deadline:
