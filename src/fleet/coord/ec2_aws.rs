@@ -437,6 +437,17 @@ impl AwsEc2 {
             if !self.claimed.lock().unwrap().insert(cand.id.clone()) {
                 continue;
             }
+            // The list can be older than the claim: the instance may have been started for
+            // another tile and released since (a release holds its claim until its stop is
+            // sent, and tags the instance FleetPool while it still runs). Start it only if
+            // it is stopped and pooled now.
+            match self.one_instance(&region, &cand.id).await {
+                Ok(now) if now.state == "stopped" && now.pooled => {}
+                Ok(_) | Err(_) => {
+                    self.claimed.lock().unwrap().remove(&cand.id);
+                    continue;
+                }
+            }
             match self
                 .call(
                     &region,
@@ -502,7 +513,19 @@ impl AwsEc2 {
             }
             keep
         };
+        let done = self.stop_or_terminate(region, id, inst, keep).await;
+        // Held until the stop or terminate is sent, so a resume cannot claim it before.
         self.claimed.lock().unwrap().remove(id);
+        done
+    }
+
+    async fn stop_or_terminate(
+        &self,
+        region: &str,
+        id: &str,
+        inst: Instance,
+        keep: bool,
+    ) -> Result<()> {
         if keep {
             match self
                 .call_ok(
@@ -804,7 +827,8 @@ impl Ec2Driver for AwsEc2 {
     async fn terminate(&self, instance: &str) -> Result<()> {
         let (region, id) = split(instance)?;
         let inst = self.one_instance(region, id).await?;
+        let done = self.terminate_all(region, &[inst]).await;
         self.claimed.lock().unwrap().remove(id);
-        self.terminate_all(region, &[inst]).await
+        done
     }
 }

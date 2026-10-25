@@ -3351,6 +3351,9 @@ struct PoolEc2 {
     start_fails: Vec<String>,
     /// Instances launched more than a week ago.
     old: Vec<String>,
+    /// Instances a filtered DescribeInstances lists as stopped and pooled whatever they are
+    /// (a list read before a resume and a release changed them).
+    listed_stopped: Vec<String>,
     actions: Vec<String>,
 }
 
@@ -3416,6 +3419,14 @@ async fn pool_ec2_api(api: Arc<std::sync::Mutex<PoolEc2>>) -> String {
                     let items: String = a
                         .instances
                         .iter()
+                        .map(|(id, i)| {
+                            let mut i = i.clone();
+                            if wanted.is_empty() && a.listed_stopped.contains(id) {
+                                i.0 = "stopped".into();
+                                i.1.insert("FleetPool".into(), "stage-test".into());
+                            }
+                            (id, i)
+                        })
                         .filter(|(id, (st, tags, _, _))| {
                             if !wanted.is_empty() {
                                 return wanted.contains(id);
@@ -3424,7 +3435,7 @@ async fn pool_ec2_api(api: Arc<std::sync::Mutex<PoolEc2>>) -> String {
                                 && tags.get("Purpose").map(String::as_str) == Some("fcvm-fleet-tile")
                                 && tags.get("Fleet") == fleet.as_ref()
                         })
-                        .map(|(id, i)| item(id, i))
+                        .map(|(id, i)| item(id, &i))
                         .collect();
                     ok(format!("<DescribeInstancesResponse><reservationSet>{items}</reservationSet></DescribeInstancesResponse>"))
                 }
@@ -3784,4 +3795,26 @@ async fn a_one_time_spot_tile_is_terminated_without_a_cancel() {
     assert!(!a
         .actions
         .contains(&"CancelSpotInstanceRequests".to_string()));
+}
+
+/// A resume works from a list that can be older than its claim: an instance listed stopped
+/// and pooled may since have been started for another tile. It is started only if it is
+/// stopped and pooled when claimed, so a resume never takes a running tile's instance.
+#[tokio::test]
+async fn a_resume_does_not_take_an_instance_the_pool_list_shows_stale() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, api) = pool_driver(2).await;
+    let l = d.launch("ec2-1").await.unwrap();
+    let id = l.instance.split_once('/').unwrap().1.to_string();
+    // ec2-1 runs on it; the list still says stopped and pooled.
+    api.lock().unwrap().listed_stopped.push(id);
+    assert!(d.resume("ec2-2").await.is_none());
+    let (st, tags) = state_of(&api, &l.instance);
+    assert_eq!(st, "running");
+    assert_eq!(tags.get("FleetTile").map(String::as_str), Some("ec2-1"));
+    assert!(!api
+        .lock()
+        .unwrap()
+        .actions
+        .contains(&"StartInstances".to_string()));
 }
