@@ -1931,23 +1931,27 @@ async fn cmd_snapshot_run_inner(
     // Construct signal streams synchronously before either restore path can
     // allocate clone state.  Installing them inside a spawned task leaves the
     // process's default SIGTERM disposition live until that task first polls.
+    //
+    // The gate is created cancelled when this process was already asked to shut
+    // down: `podman run` takes a cache hit through here, and a signal its own
+    // handler received before this point would otherwise reach no gate this
+    // restore checks (`common::ShutdownRegistry`, issue 1162).
     let lifecycle_gate = super::common::LifecycleReadyGate::new();
     let cancel = lifecycle_gate.cancellation_token();
-    let signal_gate = lifecycle_gate.clone();
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
     tokio::spawn(async move {
-        tokio::select! {
-            _ = sigterm.recv() => {
-                signal_gate.cancel();
-                info!("received SIGTERM, shutting down VM");
-            }
-            _ = sigint.recv() => {
-                signal_gate.cancel();
-                info!("received SIGINT, shutting down VM");
-            }
-        }
+        let signal_name = tokio::select! {
+            _ = sigterm.recv() => "SIGTERM",
+            _ = sigint.recv() => "SIGINT",
+        };
+        super::common::request_process_shutdown();
+        info!("received {signal_name}, shutting down VM");
     });
+    if cancel.is_cancelled() {
+        info!(snapshot = %snapshot_name, "shutdown requested before the restore began");
+        bail!("interrupted by signal before snapshot restore");
+    }
     // The --pid (UFFD) and --snapshot (direct memory restore) paths both resume
     // from a memory image; a disk-only tag has none — it cold-boots a fresh VM
     // from the captured disk instead. Dispatch to that path before any

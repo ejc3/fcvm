@@ -1218,6 +1218,135 @@ async fn test_lifecycle_interleave_quiesce_survives_long_prepause() -> Result<()
 }
 
 // ---------------------------------------------------------------------------
+// CASE: sigterm_before_cache_hit_restore_gate
+// ---------------------------------------------------------------------------
+
+/// Pins issue 1162: a SIGTERM that reaches `podman run` during a snapshot cache
+/// hit, after `podman run` installed its signal handler and before the restore
+/// created its own lifecycle gate and signal streams, stops the run.
+///
+/// Run 1 cold-boots a unique command and creates its pre-start snapshot. Run 2
+/// repeats the command, so it restores, and is held at `restore.locked`: the
+/// restore holds the snapshot's shared generation lock and has not yet created
+/// its gate. SIGTERM is sent there, and `podman run`'s own handler records it
+/// before the hold is released.
+///
+/// RED BEFORE THE FIX: the signal cancelled only `podman run`'s gate, which
+/// nothing on the cache-hit path checks. The restore created a fresh gate, the
+/// clone published lifecycle readiness and ran until the test killed it.
+#[tokio::test]
+async fn test_lifecycle_interleave_sigterm_before_cache_hit_restore_gate() -> Result<()> {
+    let (run1_name, run2_name, _, _) = common::unique_names("ilv-hit-sigterm");
+    // Unique command, unique snapshot key: run 1 is always cold, run 2 a hit.
+    let script = format!("echo {run1_name}; sleep 3600");
+    let go_file = PathBuf::from(format!("/tmp/{run2_name}-restore-locked-go"));
+    remove_file_if_exists(&go_file).context("removing stale restore.locked go-file")?;
+
+    let (mut child1, pid1, log1) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &run1_name,
+            common::ALPINE_IMAGE,
+            "sh",
+            "-c",
+            &script,
+        ],
+        &[],
+    )
+    .await?;
+    let seeded: Result<Option<String>> = async {
+        common::poll_health_by_pid(pid1, 300).await?;
+        wait_for_marker(
+            &log1,
+            "Pre-start snapshot created successfully",
+            0,
+            Duration::from_secs(60),
+        )
+        .await?;
+        Ok(ls_vm_by_pid(pid1)
+            .await?
+            .and_then(|state| state.config.snapshot_name))
+    }
+    .await;
+    common::kill_process(pid1).await;
+    let _ = child1.wait().await;
+    let base_key = seeded.context("run 1 must create the pre-start snapshot")?;
+    anyhow::ensure!(base_key.is_some(), "run 1 recorded no snapshot key");
+
+    let failpoint_spec = format!("restore.locked:block_until_file:{}", go_file.display());
+    let (mut child2, pid2, log2) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &run2_name,
+            common::ALPINE_IMAGE,
+            "sh",
+            "-c",
+            &script,
+        ],
+        &[("FCVM_FAILPOINT", &failpoint_spec)],
+    )
+    .await?;
+    let exercise: Result<std::process::ExitStatus> = async {
+        let held_at = wait_for_marker(
+            &log2,
+            "FAILPOINT restore.locked reached",
+            0,
+            Duration::from_secs(120),
+        )
+        .await
+        .context("run 2 must restore the cached snapshot")?;
+        sigterm(pid2).await;
+        wait_for_marker(
+            &log2,
+            "received SIGTERM, shutting down VM",
+            held_at,
+            Duration::from_secs(30),
+        )
+        .await
+        .context("podman run's handler must record the signal while the restore is held")?;
+        anyhow::ensure!(
+            search_log_from(&log2, "FAILPOINT restore.locked released", held_at).is_none(),
+            "the restore left restore.locked before the signal was recorded"
+        );
+        std::fs::write(&go_file, b"go").context("releasing restore.locked")?;
+        wait_exit(&mut child2, Duration::from_secs(60))
+            .await
+            .with_context(|| {
+                format!(
+                    "run 2 kept running after SIGTERM; log tail:\n{}",
+                    log_tail(&log2, 40)
+                )
+            })
+    }
+    .await;
+
+    let _ = std::fs::write(&go_file, b"cleanup");
+    if exercise.is_err() {
+        common::kill_process(pid2).await;
+        let _ = child2.wait().await;
+    }
+    cleanup_snapshot_keys(&[base_key]).await;
+    let _ = remove_file_if_exists(&go_file);
+
+    let status = exercise?;
+    anyhow::ensure!(
+        !status.success(),
+        "run 2 reported success after SIGTERM; log tail:\n{}",
+        log_tail(&log2, 40)
+    );
+    anyhow::ensure!(
+        !log_contains(&log2, "VM lifecycle ready"),
+        "the clone published lifecycle readiness after SIGTERM; log tail:\n{}",
+        log_tail(&log2, 40)
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // CASE: no_leaks_after_interleaved_teardown
 // ---------------------------------------------------------------------------
 
