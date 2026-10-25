@@ -333,35 +333,6 @@ pub async fn handle_clone_restore(
     signals.exec_rebind_needed.store(true, Ordering::Release);
     signals.exec_rebind.notify_one();
 
-    // Sync clock — snapshot restore leaves the VM clock frozen at snapshot time.
-    // Services that validate timestamps (auth, TLS, sessions) will fail with
-    // stale time. The step is soft-fail by construction (chronyd converges
-    // eventually), so nothing here branches on it.
-    let clock_started = std::time::Instant::now();
-    crate::bootplan::set_system_clock(host_time);
-    // Reset chrony after the clock jump so it doesn't lose its sources:
-    // `makestep` forces it to accept the stepped time. Its convergence is
-    // not part of the readiness contract (the clock is already stepped),
-    // so it must not hold the host's ACK.
-    spawn_restore_side_job(async {
-        let _ = tokio::process::Command::new("chronyc")
-            .args(["makestep"])
-            .output()
-            .await;
-    });
-    phases.clock_ms = elapsed_ms(clock_started);
-
-    // Restart journald in the background, started this early so it usually
-    // finishes before the ACK without ever holding it. The journal file was
-    // mid-write when the snapshot was taken, so the restored journald finds a
-    // corrupted file and gets stuck; systemd's watchdog would kill it after
-    // 3 min. Nothing in the readiness contract reads journald (container
-    // output travels over vsock), so a synchronous restart, which is a full
-    // systemd job, would only add latency. After the clock step so the fresh
-    // journal opens with correct timestamps, and registered so the shutdown
-    // path can settle it rather than race it.
-    spawn_restore_side_job(restart_journald());
-
     // Pin the neighbour entry BEFORE the boundary reopens the gate. The clone
     // inherits the source's neighbour table, and restore_snapshot_network ends
     // by publishing; anything answered between publication and a later pin
@@ -406,8 +377,12 @@ pub async fn handle_clone_restore(
     // verification could time out first ("guest 10.0.2.100 never appeared at L2"
     // while the namespace's own table showed it REACHABLE moments later).
     //
-    // One broadcast ARP costs nothing and teaches the whole segment.
+    // One broadcast ARP costs nothing and teaches the whole segment. It refreshes
+    // the gateway without flushing the neighbour table, whose entries a client
+    // can already be using while the cleanup runs.
+    let neighbor_started = std::time::Instant::now();
     network::refresh_gateway_arp();
+    phases.neighbor_ms = elapsed_ms(neighbor_started);
 
     let tcp_cleanup_started = std::time::Instant::now();
     eprintln!(
@@ -430,14 +405,40 @@ pub async fn handle_clone_restore(
         restored.report().tally.already_gone
     );
 
-    // Do not flush the neighbor table. A client can already be using an entry
-    // while restore cleanup runs, and `ip neigh flush all` has no generation
-    // boundary. One broadcast ARP request refreshes the gateway and teaches the
-    // new bridge/pasta path without deleting unrelated/current neighbors.
-    let neighbor_started = std::time::Instant::now();
-    // Already announced above, before the boundary work, so the host learns
-    // this clone's MAC as early as possible rather than at the end.
-    phases.neighbor_ms = elapsed_ms(neighbor_started);
+    // Sync clock — snapshot restore leaves the VM clock frozen at snapshot time.
+    // Services that validate timestamps (auth, TLS, sessions) will fail with
+    // stale time. The step is soft-fail by construction (chronyd converges
+    // eventually), so nothing here branches on it.
+    //
+    // Stepped here, after the boundary has opened the gate's egress half: the
+    // jump makes every daemon whose lease ran out in it reconnect at once, and a
+    // connect the gated egress answers with a reset is a definitive refusal to
+    // ServiceRouter (.claude/CLAUDE.md, "SUSPENDING A VM DOES NOT DISTURB IT").
+    // The NFS remount and the hook run after it. The host's value was read just
+    // before this function started, so the step adds the time since then.
+    let clock_started = std::time::Instant::now();
+    crate::bootplan::set_system_clock(host_time, restore_started.elapsed());
+    // Reset chrony after the clock jump so it doesn't lose its sources:
+    // `makestep` forces it to accept the stepped time. Its convergence is
+    // not part of the readiness contract (the clock is already stepped),
+    // so it must not hold the host's ACK.
+    spawn_restore_side_job(async {
+        let _ = tokio::process::Command::new("chronyc")
+            .args(["makestep"])
+            .output()
+            .await;
+    });
+    phases.clock_ms = elapsed_ms(clock_started);
+
+    // Restart journald in the background without ever holding the ACK. The
+    // journal file was mid-write when the snapshot was taken, so the restored
+    // journald finds a corrupted file and gets stuck; systemd's watchdog would
+    // kill it after 3 min. Nothing in the readiness contract reads journald
+    // (container output travels over vsock), so a synchronous restart, which is
+    // a full systemd job, would only add latency. After the clock step so the
+    // fresh journal opens with correct timestamps, and registered so the
+    // shutdown path can settle it rather than race it.
+    spawn_restore_side_job(restart_journald());
 
     // Remount NFS shares: their kernel TCP connections to the host's NFS
     // server died with the snapshot transport reset, and a hard NFS mount
@@ -643,6 +644,22 @@ async fn restart_journald() {
             eprintln!("[fc-agent] WARNING: failed to restart journald: {}", e);
         }
     }
+}
+
+/// The source of `handle_clone_restore` alone, for the tests that pin the order
+/// of its steps. Bounded at the function's closing brace, so a needle that also
+/// appears in a test's own string literals cannot match there.
+#[cfg(test)]
+pub(crate) fn handle_clone_restore_source() -> &'static str {
+    let source = include_str!("restore.rs");
+    let start = source
+        .find("pub async fn handle_clone_restore(")
+        .expect("handle_clone_restore is in restore.rs");
+    let len = source[start..]
+        .find("\n}\n")
+        .expect("handle_clone_restore has a closing brace")
+        + 2;
+    &source[start..start + len]
 }
 
 #[cfg(test)]
@@ -1043,11 +1060,36 @@ mod tests {
     }
 
     #[test]
+    fn the_clock_steps_after_the_egress_gate_opens_and_before_publication() {
+        let body = handle_clone_restore_source();
+        let boundary = body
+            .find("crate::snapshot_network::restore_snapshot_network(")
+            .expect("the restore path no longer runs the snapshot boundary");
+        let clock = body
+            .find("crate::bootplan::set_system_clock(host_time")
+            .expect("the restore path no longer steps the clock");
+        let nfs = body
+            .find("mount_nfs_shares(")
+            .expect("the restore path no longer remounts NFS");
+        let publish = body
+            .find(".publish(restore_hook)")
+            .expect("the restore path no longer publishes");
+        assert!(
+            clock < nfs,
+            "the NFS remount must see the stepped clock: clock={clock} nfs={nfs}"
+        );
+        assert!(
+            boundary < clock && clock < publish,
+            "the restore must step the clock after the boundary has opened the gate's egress \
+             half and before it publishes: a step taken while egress is gated makes every daemon \
+             whose lease ran out in the jump reconnect into the gate, whose reset ServiceRouter \
+             takes as a definitive refusal. boundary={boundary} clock={clock} publish={publish}"
+        );
+    }
+
+    #[test]
     fn gpu_attach_completes_before_the_clone_is_published() {
-        let source = include_str!("restore.rs");
-        let body = &source[source
-            .find("pub async fn handle_clone_restore(")
-            .expect("handle_clone_restore is gone")..];
+        let body = handle_clone_restore_source();
         let start = body
             .find("crate::gpu::attach(&gpus)")
             .expect("the restore path no longer attaches GPUs");
@@ -1066,7 +1108,7 @@ mod tests {
 
     #[test]
     fn the_clone_announces_itself_before_the_boundary_publishes() {
-        let source = include_str!("restore.rs");
+        let source = handle_clone_restore_source();
         let announce = source
             .find("network::refresh_gateway_arp()")
             .expect("the restore path no longer announces the clone at all");

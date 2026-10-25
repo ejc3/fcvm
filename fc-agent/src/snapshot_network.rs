@@ -2038,9 +2038,9 @@ impl RestoreHook for ContainerRestoreHook {
 /// A restored clone's network between the two phases of its boundary: the
 /// snapshot-time sockets are retired and egress is open, ingress is still
 /// gated, and the guest-wide boundary lock is held until `publish` opens it.
-/// The restore sequence does its other work (the NFS remount, the exec and
-/// egress-proxy waits) in between, so the hook runs with everything a
-/// workload may need already restored.
+/// The restore sequence does its other work (the clock step, the journald
+/// restart, the NFS remount, the exec and egress-proxy waits) in between, so
+/// the hook runs with everything a workload may need already restored.
 pub struct RestoredNetwork {
     _transaction_lock: std::fs::File,
     gate: IptablesGate<SystemCommandRunner>,
@@ -3802,11 +3802,7 @@ mod tests {
     /// RED BEFORE THE FIX: `hook_for_this_restore(` came before `mount_nfs_shares(`.
     #[test]
     fn the_restore_hook_runs_after_the_nfs_remount_and_the_proxy_waits() {
-        let source = include_str!("restore.rs");
-        let start = source
-            .find("pub async fn handle_clone_restore(")
-            .expect("handle_clone_restore is in restore.rs");
-        let body = &source[start..];
+        let body = crate::restore::handle_clone_restore_source();
         let at = |needle: &str| {
             body.find(needle)
                 .unwrap_or_else(|| panic!("{needle} is not in handle_clone_restore"))
@@ -3838,11 +3834,7 @@ mod tests {
     /// kernel interleaving no runtime test can hold open.
     #[test]
     fn inherited_neighbours_are_flushed_before_the_new_ipv6_is_announced() {
-        let source = include_str!("restore.rs");
-        let start = source
-            .find("pub async fn handle_clone_restore(")
-            .expect("handle_clone_restore is in restore.rs");
-        let body = &source[start..];
+        let body = crate::restore::handle_clone_restore_source();
         let at = |needle: &str| {
             body.find(needle)
                 .unwrap_or_else(|| panic!("{needle} is not in handle_clone_restore"))
@@ -3864,11 +3856,7 @@ mod tests {
     /// open.
     #[test]
     fn the_routed_gateway_is_pinned_before_the_ipv6_swap() {
-        let source = include_str!("restore.rs");
-        let start = source
-            .find("pub async fn handle_clone_restore(")
-            .expect("handle_clone_restore is in restore.rs");
-        let body = &source[start..];
+        let body = crate::restore::handle_clone_restore_source();
         let at = |needle: &str| {
             body.find(needle)
                 .unwrap_or_else(|| panic!("{needle} is not in handle_clone_restore"))
@@ -3894,11 +3882,7 @@ mod tests {
     /// went on to publish.
     #[test]
     fn a_failed_nfs_remount_keeps_the_clone_unpublished() {
-        let source = include_str!("restore.rs");
-        let start = source
-            .find("pub async fn handle_clone_restore(")
-            .expect("handle_clone_restore is in restore.rs");
-        let body = &source[start..];
+        let body = crate::restore::handle_clone_restore_source();
         let call = body
             .find("mount_nfs_shares(")
             .expect("the restore remounts the NFS shares");
