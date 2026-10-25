@@ -2026,6 +2026,26 @@ class AnalyzerReportsAFailedRate(unittest.TestCase):
             self.assertIn("no, rate failed", report)
             self.assertIn("Failed rates per backend: 1.6.", report)
 
+    def test_a_rate_whose_every_request_failed_is_reported_failed(self):
+        """Codex review of #1293: with no artifact at 1.6 req/s, the ramp's
+        requests count in the score-end backlog, which then exceeds the scored
+        plan, and the per-burst capacity check refused the whole run ("score-end
+        backlog is not a valid request count") before the failed rate was set
+        aside."""
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(
+            reqscale_analyze, "BOOTSTRAP_DRAWS", 1000
+        ):
+            CompleteAnalyzerFixture.build_run(
+                d, rates=(0.8, 1.6),
+                fail=lambda context: "spawn" if context.target_rps == 1.6 else None)
+            analysis = reqscale_analyze.analyze(d)
+            self.assertEqual(analysis["failed_rates"], [1.6])
+            cells = {(cell["backend"], cell["target_rps"]): cell for cell in analysis["cells"]}
+            for backend in ("file", "uffd"):
+                self.assertTrue(cells[(backend, 0.8)]["passed"])
+                self.assertTrue(cells[(backend, 1.6)]["rate_failed"])
+                self.assertEqual(cells[(backend, 1.6)]["rate_failure"]["scored_failed"], 5 * 96)
+
     def test_the_status_must_name_exactly_the_failed_rates_the_records_show(self):
         for label, edit in (
             ("omits the failed rate", lambda rates: []),

@@ -1945,24 +1945,17 @@ def analyze(run_dir: str) -> dict:
         bursts = sorted(grouped.get(key, []), key=lambda row: row["repeat"])
         if len(bursts) != declared["independent_bursts"] or len(bursts) < 5:
             raise AnalysisInvalid(f"cell {declared['cell_id']} lacks independent bursts")
-        cell_rows = []
         for burst in bursts:
-            metrics = burst.get("backends", {}).get(declared["backend"])
-            if not isinstance(metrics, dict):
+            if not isinstance(burst.get("backends", {}).get(declared["backend"]), dict):
                 raise AnalysisInvalid(
                     f"burst {burst.get('burst_id')} lacks {declared['backend']} metrics"
                 )
-            verdict = evaluate_cell_burst(
-                {**metrics, "target_rps": declared["target_rps"]}, criteria
-            )
-            cell_rows.append({
-                "burst_id": burst["burst_id"],
-                "repeat": burst["repeat"],
-                **verdict,
-            })
         if declared["target_rps"] in failed_rates:
             # Strict per rate: a rate with any failed request publishes no
-            # latency, rate or fault figure, only that it failed and how.
+            # latency, rate or fault figure, only that it failed and how. Its
+            # bursts get no capacity verdict either: requests that never
+            # finished leave a score-end backlog that counts the ramp's too,
+            # beyond what evaluate_cell_burst accepts for a scored plan.
             scored = [burst["backends"][declared["backend"]] for burst in bursts]
             cells.append({
                 **declared,
@@ -1976,10 +1969,21 @@ def analyze(run_dir: str) -> dict:
                         row["planned"] - row["cleanup_confirmed"] for row in scored),
                     "bursts": derived_failures[declared["target_rps"]],
                 },
-                "burst_verdicts": cell_rows,
+                "burst_verdicts": None,
                 **{name: None for name in CELL_MEASUREMENTS},
             })
             continue
+        cell_rows = []
+        for burst in bursts:
+            verdict = evaluate_cell_burst(
+                {**burst["backends"][declared["backend"]], "target_rps": declared["target_rps"]},
+                criteria,
+            )
+            cell_rows.append({
+                "burst_id": burst["burst_id"],
+                "repeat": burst["repeat"],
+                **verdict,
+            })
         metric_seed = analysis_seed + cell_index * 100
         departure = [burst["backends"][declared["backend"]]["departure_rps"] for burst in bursts]
         offered = [burst["backends"][declared["backend"]]["offered_rps"] for burst in bursts]
