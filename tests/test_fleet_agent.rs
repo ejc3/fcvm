@@ -5,7 +5,7 @@
 mod fleet_support;
 
 use fcvm::fleet::agent::slot::AgentCfg;
-use fcvm::fleet::agent::{serve, Agent};
+use fcvm::fleet::agent::{serve, Agent, AggregateCfg, AggregatePublic};
 use fcvm::fleet::lines::{spawn_writer, LineReader};
 use fleet_core::protocol::{AgentMsg, AssignSlot, CoordMsg, SharedScene, SlotReport};
 use fleet_core::scene::Scene;
@@ -940,14 +940,27 @@ async fn a_spot_notice_is_reported_as_draining() {
 
 /// With an aggregator port the agent runs `fcvm fleet aggregate` for its band, reports its
 /// frame URL, and gives it the layout: the assigned region and every placed slot's renderer.
+/// Serving browsers, the aggregator listens with TLS on its IPv4 port (with the renderers'
+/// certificate file) and the agent reports the host's public IPv4 address with that port.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_agent_runs_and_feeds_its_aggregator() {
     let f = fake(2, &[]);
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let free_port = || {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    };
+    let (port, tls_port) = (free_port(), free_port());
+    let tls_dir = tempfile::tempdir().unwrap();
+    let ck = rcgen::generate_simple_self_signed(vec!["agg.fleet.test".to_string()]).unwrap();
+    std::fs::write(
+        tls_dir.path().join("tls.json"),
+        serde_json::json!({"cert": ck.cert.pem(), "key": ck.signing_key.serialize_pem()})
+            .to_string(),
+    )
+    .unwrap();
     let (coord_side, agent_side) = tokio::io::duplex(1 << 20);
     let (agent_in, agent_out) = tokio::io::split(agent_side);
     let (coord_in, coord_out) = tokio::io::split(coord_side);
@@ -960,16 +973,22 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
         spot_notice_url: None,
         spot_poll: Duration::from_millis(50),
         store_ready_file: None,
-        aggregate: Some((
+        aggregate: Some(AggregateCfg {
             port,
-            vec![
+            argv: vec![
                 env!("CARGO_BIN_EXE_fcvm").to_string(),
                 "fleet".into(),
                 "aggregate".into(),
                 "--codec".into(),
                 "raw".into(),
             ],
-        )),
+            public: Some(AggregatePublic {
+                tls_file: tls_dir.path().join("tls.json"),
+                v4_port: tls_port,
+                ipv4: Some("192.0.2.7".into()),
+                ipv6: None,
+            }),
+        }),
     };
     let task = tokio::spawn(serve(agent, agent_in, agent_out));
     let (to_agent, _w) = spawn_writer::<CoordMsg, _>(coord_out, "agent");
@@ -1023,11 +1042,45 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
             .expect("an agent message")
             .unwrap()
             .unwrap();
-        if let AgentMsg::Aggregate { frame_url } = m {
+        if let AgentMsg::Aggregate {
+            frame_url,
+            ipv6,
+            ipv4,
+            v4_port,
+        } = m
+        {
             assert_eq!(frame_url, format!("ws://gpu-host.example:{port}/frames"));
+            assert_eq!(
+                (ipv6, ipv4.as_deref(), v4_port),
+                (None, Some("192.0.2.7"), Some(tls_port))
+            );
             break;
         }
     }
+    // Browsers: TLS on the IPv4 port, the stream and the health check only.
+    let https = reqwest::Client::builder()
+        .use_rustls_tls()
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(reqwest::Certificate::from_pem(ck.cert.pem().as_bytes()).unwrap())
+        .resolve(
+            "agg.fleet.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], tls_port)),
+        )
+        .no_proxy()
+        .build()
+        .unwrap();
+    let r = https
+        .get(format!("https://agg.fleet.test:{tls_port}/healthz"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = https
+        .get(format!("https://agg.fleet.test:{tls_port}/layout"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404, "the layout is not served to browsers");
     let layout_url = format!("http://127.0.0.1:{port}/layout");
     let deadline = Instant::now() + Duration::from_secs(10);
     let layout = loop {

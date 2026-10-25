@@ -33,6 +33,12 @@ impl Prefix {
         })
     }
 
+    /// The host aggregator's address, `<prefix>::1`: the host's side of the prefix, which
+    /// fcvm never gives a VM.
+    pub fn aggregator_address(&self) -> Ipv6Addr {
+        Ipv6Addr::from(self.base | 1)
+    }
+
     /// The address of the slot on the GPU at `index` in the host's inventory.
     pub fn slot_address(&self, index: usize) -> Result<Ipv6Addr> {
         let host_bits = 128 - u32::from(self.len);
@@ -61,6 +67,36 @@ pub async fn from_imds() -> Result<Prefix> {
     .context("the primary interface has no delegated IPv6 prefix (Ipv6PrefixCount)")?;
     let first = list.lines().next().context("an empty IPv6 prefix list")?;
     Prefix::parse(first)
+}
+
+/// Put `addr` on the host's default IPv6 interface (the one fcvm's routed mode answers for
+/// its VMs on), so the aggregator can listen there. Idempotent: an agent that restarts finds
+/// it in place.
+pub async fn add_host_address(addr: Ipv6Addr) -> Result<()> {
+    let iface = crate::network::routed::detect_default_ipv6_interface()
+        .await
+        .context("the host has no default IPv6 route, so no interface to put the aggregator's address on")?;
+    let out = tokio::process::Command::new("ip")
+        .args([
+            "-6",
+            "addr",
+            "replace",
+            &format!("{addr}/128"),
+            "dev",
+            &iface,
+            "nodad",
+        ])
+        .output()
+        .await
+        .context("running ip")?;
+    if !out.status.success() {
+        bail!(
+            "ip -6 addr replace {addr}/128 dev {iface}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    tracing::info!(%addr, %iface, "aggregator address on the host");
+    Ok(())
 }
 
 /// fcvm's routed mode needs root, so an agent given a prefix must run as root; refusing at
@@ -104,6 +140,7 @@ mod tests {
         assert_eq!(p.to_string(), "2001:db8:1:2:3::/80");
         assert_eq!(p.slot_address(0).unwrap().to_string(), "2001:db8:1:2:3::2");
         assert_eq!(p.slot_address(7).unwrap().to_string(), "2001:db8:1:2:3::9");
+        assert_eq!(p.aggregator_address().to_string(), "2001:db8:1:2:3::1");
         let small = Prefix::parse("2001:db8::/124").unwrap();
         assert_eq!(small.slot_address(13).unwrap().to_string(), "2001:db8::f");
         assert!(small.slot_address(14).is_err(), "past the prefix");

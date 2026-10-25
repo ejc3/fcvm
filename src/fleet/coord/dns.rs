@@ -7,6 +7,10 @@
 //! - `<label>-v4.<zone>` A: an IPv4 address: a GPU host's public address, shared by its
 //!   slots, each forwarded on its own port (`SlotReport::v4_port`), or a tile's own.
 //!
+//! A host's aggregator is named the same way under `agg-<host>-<token>`
+//! (`fleet_core::state::aggregate_id`): its own IPv6 address (port 443) and the host's IPv4
+//! address on the aggregator's port. Its label lasts while it reports the same addresses.
+//!
 //! The order is: write the records, confirm them at the zone's authoritative servers, and
 //! only then tell the coordinator (`Event::Published`), which puts the frame URLs in the
 //! state the page reads. A name is never asked for before it exists, so no resolver holds a
@@ -50,31 +54,34 @@ pub struct Fact {
     pub published: Option<Published>,
 }
 
-/// The facts of every slot and tile in the fleet.
+/// The facts of every slot, tile and host aggregator in the fleet. An aggregator has one
+/// launch (generation 0) for as long as it reports the same addresses.
 pub fn facts(state: &State) -> Vec<Fact> {
     let f = &state.fleet;
-    f.slots
-        .values()
-        .chain(f.ec2.values())
-        .map(|s| Fact {
-            id: s.id.clone(),
-            generation: s.observed.generation,
-            ipv6: s.observed.ipv6.clone(),
-            ipv4: s.observed.ipv4.clone(),
-            v4_port: s.observed.v4_port,
-            published: s.published.clone(),
+    let units = f.slots.values().chain(f.ec2.values()).map(|s| Fact {
+        id: s.id.clone(),
+        generation: s.observed.generation,
+        ipv6: s.observed.ipv6.clone(),
+        ipv4: s.observed.ipv4.clone(),
+        v4_port: s.observed.v4_port,
+        published: s.published.clone(),
+    });
+    let aggregators = f.hosts.values().filter_map(|h| {
+        Some(Fact {
+            id: fleet_core::state::aggregate_id(&h.name)?,
+            generation: 0,
+            ipv6: h.aggregate_ipv6.clone(),
+            ipv4: h.aggregate_ipv4.clone(),
+            v4_port: h.aggregate_v4_port,
+            published: h.aggregate_published.clone(),
         })
-        .collect()
+    });
+    units.chain(aggregators).collect()
 }
 
-/// An address in its canonical text (`2001:db8::2` for `2001:0db8::2`), so the record, the
-/// published names and an authoritative answer compare as the same address; text that is
-/// not an address is kept as it is.
-fn canonical(a: &str) -> String {
-    a.parse::<std::net::IpAddr>()
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|_| a.to_string())
-}
+// Addresses compare in their canonical text, so the record, the published names and an
+// authoritative answer agree on one address however it was written.
+use fleet_core::state::canonical_ip as canonical;
 
 /// Whether `p` names exactly the launch `f` is on: its generation, its addresses and the
 /// IPv4 port in its URL. Anything else is a new launch, with a new label.
@@ -170,13 +177,26 @@ pub fn mint(id: &str) -> String {
     format!("{id}-{token}")
 }
 
+/// A launch token: 8 characters of the base32 alphabet.
+fn is_token(t: &str) -> bool {
+    t.len() == 8
+        && t.bytes()
+            .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
+}
+
 /// Whether a name in the zone is one this module owns: `slot-<n>` or `ec2-<n>`, optionally
-/// with a launch token, optionally with `-v4`. Anything else in the zone is never touched.
+/// with a launch token, or `agg-<host>-<token>` (an aggregator), each optionally with
+/// `-v4`. Anything else in the zone is never touched.
 fn owned(name: &str, zone: &str) -> bool {
     let Some(label) = name.strip_suffix(&format!(".{zone}")) else {
         return false;
     };
     let label = label.strip_suffix("-v4").unwrap_or(label);
+    if let Some(rest) = label.strip_prefix("agg-") {
+        return rest.rsplit_once('-').is_some_and(|(host, token)| {
+            fleet_core::state::aggregate_id(host).is_some() && is_token(token)
+        });
+    }
     let Some(rest) = label
         .strip_prefix("slot-")
         .or_else(|| label.strip_prefix("ec2-"))
@@ -188,12 +208,7 @@ fn owned(name: &str, zone: &str) -> bool {
         None => (rest, None),
     };
     let digits = !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit());
-    let token_ok = token.is_none_or(|t| {
-        t.len() == 8
-            && t.bytes()
-                .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
-    });
-    digits && token_ok
+    digits && token.is_none_or(is_token)
 }
 
 /// Whether the names of a launch answer at the zone's authoritative servers.
@@ -684,6 +699,9 @@ mod tests {
             "slot-3-abcdefgh.fcvm.dev",
             "slot-3-abcd2345-v4.fcvm.dev",
             "ec2-8-zzzzzzzz.fcvm.dev",
+            "agg-i-0123456789abcdef0-abcdefgh.fcvm.dev",
+            "agg-i-0123456789abcdef0-abcdefgh-v4.fcvm.dev",
+            "agg-gpu-a-zzzz2345.fcvm.dev",
         ] {
             assert!(owned(name, z), "{name}");
         }
@@ -700,6 +718,14 @@ mod tests {
             "slot-3-ABCDEFGH.fcvm.dev",
             "slot-3-abcdefgh-x.fcvm.dev",
             "slot-3.other.dev",
+            "agg-gpu-a.fcvm.dev",
+            "agg-gpu-a-v4.fcvm.dev",
+            "agg-abcdefgh.fcvm.dev",
+            "agg--abcdefgh.fcvm.dev",
+            "agg-gpu_a-abcdefgh.fcvm.dev",
+            "agg-GPU-abcdefgh.fcvm.dev",
+            "agg-gpu-a-abcdefg1.fcvm.dev",
+            "dnstest-agg-gpu-a-abcdefgh.fcvm.dev",
         ] {
             assert!(!owned(name, z), "{name}");
         }
@@ -708,6 +734,11 @@ mod tests {
     #[test]
     fn labels_are_owned_and_not_reused() {
         let mut seen = std::collections::BTreeSet::new();
+        for id in ["slot-3", "agg-i-0123456789abcdef0"] {
+            let l = mint(id);
+            assert!(owned(&format!("{l}.fcvm.dev"), "fcvm.dev"), "{l}");
+            assert!(owned(&format!("{l}-v4.fcvm.dev"), "fcvm.dev"), "{l}");
+        }
         for _ in 0..1000 {
             let l = mint("slot-3");
             assert!(owned(&format!("{l}.fcvm.dev"), "fcvm.dev"), "{l}");

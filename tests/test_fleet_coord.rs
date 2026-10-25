@@ -996,6 +996,9 @@ async fn the_poster_is_the_whole_image_at_a_hold() {
         .to_coord
         .send(AgentMsg::Aggregate {
             frame_url: host_agg,
+            ipv6: None,
+            ipv4: None,
+            v4_port: None,
         })
         .unwrap();
     agent.report("slot-1", "running", 1);
@@ -3013,6 +3016,9 @@ async fn no_poster_is_planned_while_tiles_start_or_race() {
         .to_coord
         .send(AgentMsg::Aggregate {
             frame_url: "ws://gpu-host.example:20200/frames".into(),
+            ipv6: None,
+            ipv4: None,
+            v4_port: None,
         })
         .unwrap();
     // Nor while the tiles are still starting (the first poster of a GPU run was black).
@@ -3088,6 +3094,9 @@ async fn a_poster_plan_names_only_placed_aggregators() {
     a.to_coord
         .send(AgentMsg::Aggregate {
             frame_url: "ws://gpu-a.example:20200/frames".into(),
+            ipv6: None,
+            ipv4: None,
+            v4_port: None,
         })
         .unwrap();
     // gpu-b's only GPU is on standby: max_tiles is taken by gpu-a.
@@ -3095,6 +3104,9 @@ async fn a_poster_plan_names_only_placed_aggregators() {
     b.to_coord
         .send(AgentMsg::Aggregate {
             frame_url: "ws://gpu-b.example:20200/frames".into(),
+            ipv6: None,
+            ipv4: None,
+            v4_port: None,
         })
         .unwrap();
     // A scrub after it on the same connection shows when gpu-b's aggregate is applied.
@@ -4236,6 +4248,106 @@ async fn each_launch_gets_new_names_and_old_ones_go_once_unreferenced() {
         !w.iter().any(|x| x.starts_with("update")),
         "a name changed address in place: {w:?}"
     );
+}
+
+impl DnsFixture {
+    fn aggregate_report(&self, v6: Option<&str>, v4: Option<&str>) {
+        self.agent
+            .to_coord
+            .send(AgentMsg::Aggregate {
+                frame_url: "ws://gpu-a.internal:20300/frames".into(),
+                ipv6: v6.map(str::to_string),
+                ipv4: v4.map(str::to_string),
+                v4_port: v4.map(|_| 20208),
+            })
+            .unwrap();
+    }
+
+    fn aggregate(&self) -> Value {
+        let state =
+            &serde_json::from_str::<Value>(&self.handle.snapshot.borrow().text).unwrap()["state"];
+        state["aggregates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "agg:gpu-a")
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+}
+
+/// A host aggregator that serves browsers is named like a launch, under
+/// `agg-<host>-<token>`: its own IPv6 address and the host's IPv4 address on the
+/// aggregator's port, written, confirmed, and only then given to the page. Before that,
+/// and for an aggregator that reports no public address, the page gets no URL (it is https
+/// and cannot open the aggregator's plain one). A new address is a new label, and the old
+/// names go once unreferenced.
+#[tokio::test]
+async fn a_host_aggregator_is_published_under_its_own_names() {
+    let fx = dns_fixture(&[]).await;
+    fx.report("running", 1, Some("2001:db8::2"), Some("192.0.2.10"));
+    fx.wait_until("the host's band", |fx| !fx.aggregate().is_null())
+        .await;
+    fx.aggregate_report(None, None);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        fx.aggregate()["frame_url"].is_null() && fx.aggregate()["frame_url_v4"].is_null(),
+        "the plain URL reached an https page: {}",
+        fx.aggregate()
+    );
+    assert!(
+        !fx.zone().iter().any(|(_, n, _)| n.starts_with("agg-")),
+        "{:?}",
+        fx.zone()
+    );
+
+    fx.aggregate_report(Some("2001:db8::1"), Some("192.0.2.10"));
+    let label = fx.label_for("2001:db8::1").await;
+    assert!(
+        label.starts_with("agg-gpu-a-") && label.len() == "agg-gpu-a-".len() + 8,
+        "{label}"
+    );
+    fx.wait_until("the A record", |fx| {
+        fx.zone().contains(&(
+            "A".into(),
+            format!("{label}-v4.fcvm.example"),
+            "192.0.2.10".into(),
+        ))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(fx.aggregate()["frame_url"].is_null(), "{}", fx.aggregate());
+    fx.open(true);
+    fx.wait_until("the aggregator published", |fx| {
+        !fx.aggregate()["frame_url"].is_null()
+    })
+    .await;
+    assert_eq!(
+        fx.aggregate()["frame_url"],
+        format!("wss://{label}.fcvm.example/frames")
+    );
+    assert_eq!(
+        fx.aggregate()["frame_url_v4"],
+        format!("wss://{label}-v4.fcvm.example:20208/frames")
+    );
+
+    // Another address (a new host prefix): the old names are hidden at once, the new ones
+    // shown once confirmed, and the old records removed.
+    fx.open(false);
+    fx.aggregate_report(Some("2001:db8:5::1"), Some("192.0.2.10"));
+    let second = fx.label_for("2001:db8:5::1").await;
+    assert_ne!(label, second);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(fx.aggregate()["frame_url"].is_null(), "{}", fx.aggregate());
+    fx.open(true);
+    fx.wait_until("the new address published", |fx| {
+        fx.aggregate()["frame_url"] == format!("wss://{second}.fcvm.example/frames")
+    })
+    .await;
+    fx.wait_until("the old names removed", |fx| {
+        !fx.zone().iter().any(|(_, n, _)| n.starts_with(&label))
+    })
+    .await;
 }
 
 /// A DNS query for `name` and `qtype` to `server` over UDP (or TCP): the rcode, whether AA

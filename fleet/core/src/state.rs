@@ -165,6 +165,18 @@ pub struct Host {
     /// The host aggregator's frame WebSocket, once the agent reports it.
     #[serde(default)]
     pub aggregate_url: Option<String>,
+    /// The aggregator's public addresses, as last reported (`AgentMsg::Aggregate`), and the
+    /// port of its IPv4 path.
+    #[serde(default)]
+    pub aggregate_ipv6: Option<String>,
+    #[serde(default)]
+    pub aggregate_ipv4: Option<String>,
+    #[serde(default)]
+    pub aggregate_v4_port: Option<u16>,
+    /// The aggregator's published DNS names (with `Config::names_published`), under the
+    /// label `agg-<host>-<token>` (see [`aggregate_id`]).
+    #[serde(default)]
+    pub aggregate_published: Option<Published>,
 }
 
 /// What an agent (or the EC2 driver) last said about one slot.
@@ -636,6 +648,38 @@ pub fn ec2_name(n: u32) -> String {
     format!("ec2-{n}")
 }
 
+/// The id a host's aggregator is named under in DNS, `agg-<host>`, when the host's name can
+/// be part of a DNS label: lowercase letters, digits and inner hyphens, at most 40
+/// characters (an EC2 instance id is 19), and not `ec2`, kept for the EC2 half's aggregator.
+pub fn aggregate_id(host: &str) -> Option<String> {
+    let ok = !host.is_empty()
+        && host.len() <= 40
+        && host != "ec2"
+        && !host.starts_with('-')
+        && !host.ends_with('-')
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    ok.then(|| format!("agg-{host}"))
+}
+
+/// An address in its canonical text (`2001:db8::2` for `2001:0db8::2`); text that is not an
+/// address is kept as it is.
+pub fn canonical_ip(a: &str) -> String {
+    a.parse::<std::net::IpAddr>()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|_| a.to_string())
+}
+
+impl Published {
+    /// Whether these names are for exactly these addresses and IPv4 port.
+    pub fn names(&self, ipv6: Option<&str>, ipv4: Option<&str>, v4_port: Option<u16>) -> bool {
+        self.ipv6 == ipv6.map(canonical_ip)
+            && self.ipv4 == ipv4.map(canonical_ip)
+            && self.v4_port == v4_port
+    }
+}
+
 /// Parse `slot-<n>` back to its number.
 pub fn slot_number(id: &str) -> Option<u32> {
     id.strip_prefix("slot-")?.parse().ok()
@@ -648,6 +692,27 @@ pub fn ec2_number(id: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_host_aggregator_is_named_only_when_its_host_name_fits_a_label() {
+        assert_eq!(
+            aggregate_id("i-0123456789abcdef0").as_deref(),
+            Some("agg-i-0123456789abcdef0")
+        );
+        assert_eq!(aggregate_id("gpu-a").as_deref(), Some("agg-gpu-a"));
+        for bad in [
+            "",
+            "ec2",
+            "-gpu",
+            "gpu-",
+            "GPU-A",
+            "gpu.example.com",
+            "gpu_a",
+            &"a".repeat(41),
+        ] {
+            assert_eq!(aggregate_id(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn a_layout_leaves_every_renderer_half_a_second_after_its_post() {
