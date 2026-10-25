@@ -112,6 +112,29 @@ class ProbeTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertTrue(transport.closed)
 
+    def test_http_checks_identify_the_probe_and_preserve_access_headers(self):
+        requests = []
+        class Reply:
+            headers = {}
+            def __init__(self, status): self.status = status
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self, count): return b""
+        class Gateway:
+            def open(self, request, timeout):
+                requests.append(request)
+                if request.get_header("User-agent") != "fcvm-stage-smoke/1":
+                    return Reply(403)
+                return Reply(200 if request.get_header("Cf-access-client-secret") else 302)
+        headers = {"CF-Access-Client-Id": "synthetic-id", "CF-Access-Client-Secret": "synthetic-secret"}
+        with patch.object(smoke.urllib.request, "build_opener", return_value=Gateway()):
+            public, _, _ = smoke.get("https://stage.example.test/")
+            authenticated, _, _ = smoke.get("https://stage.example.test/", headers)
+        self.assertEqual((public, authenticated), (302, 200))
+        self.assertIsNone(requests[0].get_header("Cf-access-client-secret"))
+        self.assertEqual(requests[1].get_header("Cf-access-client-id"), "synthetic-id")
+        self.assertEqual(requests[1].get_header("Cf-access-client-secret"), "synthetic-secret")
+
     def test_a_fast_fcvm_restore_does_not_trip_the_shared_relaunch_limit(self):
         clock = [100.0]
         sent = []

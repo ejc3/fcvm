@@ -178,8 +178,9 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def get(url, headers=None):
     opener = urllib.request.build_opener(NoRedirect)
+    request_headers = {"User-Agent": "fcvm-stage-smoke/1", **(headers or {})}
     try:
-        with opener.open(urllib.request.Request(url, headers=headers or {}), timeout=30) as response:
+        with opener.open(urllib.request.Request(url, headers=request_headers), timeout=30) as response:
             return response.status, response.headers, response.read(65536)
     except urllib.error.HTTPError as error:
         return error.code, error.headers, b""
