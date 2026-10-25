@@ -16,7 +16,6 @@ import os
 import re
 import select
 import shlex
-import shutil
 import signal
 import socket
 import subprocess
@@ -2212,12 +2211,17 @@ class HarnessOutputFeedsTheAnalyzer(unittest.TestCase):
         return path
 
     def _fakes(self, d, state_dir):
-        firecracker = os.path.join(d, "bin", "firecracker-0123456789abcdef")
-        os.makedirs(os.path.dirname(firecracker))
-        os.symlink(shutil.which("sleep"), firecracker)
-        pdeathsig = ("import ctypes,os,signal,sys; "
-                     "ctypes.CDLL(None).prctl(1, signal.SIGKILL); "
-                     "os.execv(sys.argv[1], sys.argv[1:])")
+        os.makedirs(os.path.join(d, "bin"))
+        # A script, not a renamed `sleep`: a multicall coreutils (uutils on
+        # Ubuntu 26.04) dispatches on argv[0] and exits at once under another
+        # name. The kernel names a script's process after the script file.
+        firecracker = self._stub(os.path.join(d, "bin", "firecracker-0123456789abcdef"), (
+            f"#!{sys.executable}\n"
+            "import ctypes, signal, sys, time\n"
+            "ctypes.CDLL(None).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG, as fcvm arms it\n"
+            "open(sys.argv[1], 'w').close()\n"
+            "time.sleep(600)\n"
+        ))
         serve = (
             "import json,os,signal,sys,time\n"
             "state = sys.argv[1]\n"
@@ -2245,9 +2249,8 @@ if [ "$2" = serve ]; then
 fi
 name=""
 while [ $# -gt 0 ]; do [ "$1" = --name ] && name=$2; shift; done
-python3 -c {shlex.quote(pdeathsig)} {firecracker} 600 &
-fc=$!
-until [ "$(cat /proc/$fc/comm 2>/dev/null)" = firecracker-012 ]; do sleep 0.002; done
+{firecracker} {d}/firecracker-$$.armed &
+until [ -e {d}/firecracker-$$.armed ]; do sleep 0.002; done
 true &
 read -r stat < /proc/$$/stat; stat=${{stat##*) }}; read -ra fields <<< "$stat"
 vm=vm-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \\n')
