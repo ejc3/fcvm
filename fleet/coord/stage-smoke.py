@@ -5,6 +5,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
 import socket
 import ssl
 import struct
@@ -13,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from pathlib import Path
 
 
 def ipv4(host, port):
@@ -157,6 +159,17 @@ def fresh(old, new):
             raise AssertionError("a launch reused its predecessor's DNS name")
 
 
+def relaunch_interval_seconds():
+    # The image and this probe come from the same commit. Read its server default
+    # instead of copying a rate limit that could drift when the core changes.
+    source = (Path(__file__).resolve().parent.parent / "core/src/state.rs").read_text()
+    defaults = source.split("impl Default for Config", 1)[1]
+    value = re.search(r"relaunch_interval_ms:\s*([0-9_]+)", defaults)
+    if value is None:
+        raise ValueError("coordinator relaunch interval unavailable")
+    return int(value[1].replace("_", "")) / 1000
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
@@ -189,6 +202,7 @@ def main():
     connection = Socket(api.replace("https://", "wss://", 1) + "/live", headers)
     try:
         deadline = time.monotonic() + 720
+        interval, next_relaunch = relaunch_interval_seconds(), 0.0
         state = {}
         def until(predicate):
             nonlocal state
@@ -206,6 +220,9 @@ def main():
             until(lambda s: ready(s, half))
             old = dict(ready(state, half))
             prove_frame(old)
+            delay = next_relaunch - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
             intent = str(uuid.uuid4())
             connection.send({"type": "intent", "id": intent, "name": "relaunch", "args": {"tile": old["id"]}})
             # A refused intent must fail explicitly, rather than wait for an unrelated scheduled race.
@@ -219,6 +236,9 @@ def main():
                 if message.get("type") == "receipt" and message.get("id") == intent:
                     if message.get("outcome") != "committed":
                         raise AssertionError("staging refused the relaunch")
+                    # Start the interval at the receipt, after the server accepted
+                    # the intent, so varying network latency cannot shorten it.
+                    next_relaunch = time.monotonic() + interval
                     break
             until(lambda s: ready(s, half, slot=old["slot"], after=old["generation"]))
             new = ready(state, half, slot=old["slot"], after=old["generation"])

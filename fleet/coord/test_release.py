@@ -2,6 +2,8 @@
 """Offline checks for publishing and the live IPv4/name-regression probe."""
 import importlib.util
 import fnmatch
+import copy
+import json
 import os
 import socket
 import unittest
@@ -76,6 +78,48 @@ class ProbeTests(unittest.TestCase):
         with patch.object(smoke, "Socket", Renderer):
             smoke.prove_frame(self.tile())
         self.assertEqual(calls, [((self.tile()["frame_url_v4"],), {})])
+
+    def test_a_fast_fcvm_restore_does_not_trip_the_shared_relaunch_limit(self):
+        clock = [100.0]
+        sent = []
+        def tile(half, generation):
+            label = half + ("-old" if generation == 1 else "-new")
+            return {"id": half + ":1", "slot": half + "-1", "half": half, "phase": "running",
+                    "generation": generation, "frame_url": f"wss://{label}.fcvm.dev/frames",
+                    "frame_url_v4": f"wss://{label}-v4.fcvm.dev/frames"}
+        class Viewer:
+            def __init__(self, *args):
+                self.state = {"tiles": [tile("fcvm", 1), tile("ec2", 1)]}
+                self.queue = [{"type": "snapshot", "state": copy.deepcopy(self.state)}]
+                self.last = None
+            def send(self, message):
+                sent.append(clock[0])
+                allowed = self.last is None or clock[0] - self.last >= 2.0
+                self.queue.append({"type": "receipt", "id": message["id"],
+                                   "outcome": "committed" if allowed else "refused"})
+                if allowed:
+                    self.last = clock[0]
+                    half = message["args"]["tile"].split(":")[0]
+                    self.state["tiles"] = [tile(t["half"], 2 if t["half"] == half else t["generation"])
+                                           for t in self.state["tiles"]]
+                    self.queue.append({"type": "snapshot", "state": copy.deepcopy(self.state)})
+            def message(self, deadline):
+                message = self.queue.pop(0)
+                clock[0] += 0.4 if message["type"] == "snapshot" else 0.1
+                return 1, json.dumps(message).encode()
+            def close(self): pass
+        def get(url, headers=None):
+            if not headers:
+                return 302, {"Location": "https://login.cloudflareaccess.com/login"}, b""
+            return (403 if url.endswith("/agent") else 200), {}, b""
+        env = {"STAGING_API_URL": "https://api.example.test", "STAGING_ORIGIN": "https://stage.example.test",
+               "CF_ACCESS_CLIENT_ID": "synthetic-id", "CF_ACCESS_CLIENT_SECRET": "synthetic-secret"}
+        with patch.dict(os.environ, env), patch.object(smoke, "Socket", Viewer), patch.object(smoke, "get", get), \
+                patch.object(smoke, "prove_frame"), patch.object(smoke.time, "monotonic", lambda: clock[0]), \
+                patch.object(smoke.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay)):
+            smoke.main()
+        self.assertEqual(len(sent), 2)
+        self.assertGreaterEqual(sent[1] - sent[0], 2.0)
 
 
 class PublishTests(unittest.TestCase):
