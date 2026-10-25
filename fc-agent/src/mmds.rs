@@ -559,7 +559,7 @@ pub async fn sync_clock_from_host() -> Result<()> {
     let metadata: LatestMetadata =
         serde_json::from_str(&body).context("parsing host-time from MMDS")?;
 
-    crate::bootplan::set_system_clock(&metadata.host_time);
+    crate::bootplan::set_system_clock(&metadata.host_time, Duration::ZERO);
     Ok(())
 }
 

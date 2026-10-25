@@ -133,7 +133,7 @@ addresses across one snapshot and fails on any difference. The `ModelBarrier`
 and `ModelDiag` invariants in `fc-agent/src/snapshot_network.rs` fail if any
 boundary step takes the link down, on the source or the clone path.
 
-### On restore, the gate's egress half opens as soon as the stale sockets are gone
+### On restore, the gate's egress half opens before the stale sockets are retired
 
 The restored clone inherits the gate closed in both directions. Every daemon
 whose connection the cleanup retires reconnects at once, and a connection the
@@ -152,6 +152,14 @@ retired with egress closed, `ModelHook` if the hook runs with egress closed or
 after ingress opened;
 `the_restore_hook_runs_after_the_nfs_remount_and_the_proxy_waits` pins the
 source order of `handle_clone_restore`.
+
+The guest's clock step belongs on the same side of that line. The restore sets the guest's wall
+clock to the host's time, a jump of the snapshot's age, and every daemon whose lease or ticket ran
+out in the jump reconnects at once. Stepped before egress opened, those connects met the gate's
+reset: a www clone of a 9.5-hour-old snapshot was not healthy 10m38s in, when the restore script stopped waiting (falcon_proxy timed out on its
+SMC tiers, configerator fell back), and the same snapshot restored with its clock held back was
+healthy in 2m05s and 2m15s (2026-10-25). So the clock steps after the boundary opens egress and
+before publication; `the_clock_steps_after_the_egress_gate_opens_and_before_publication` pins it.
 
 ### Opening the gate costs no grace period on the restore path
 

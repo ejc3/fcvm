@@ -104,7 +104,7 @@ pub async fn sync_clock_from_host(transport: Transport) -> Result<()> {
             let doc = read_vsock_doc().await?;
             let meta: LatestMetadata =
                 serde_json::from_value(doc).context("parsing host-time from vsock boot plan")?;
-            set_system_clock(&meta.host_time);
+            set_system_clock(&meta.host_time, std::time::Duration::ZERO);
             Ok(())
         }
     }
@@ -117,14 +117,15 @@ pub async fn sync_clock_from_host(transport: Transport) -> Result<()> {
 /// spawn is pure latency. Failure is soft by construction (this returns
 /// nothing): chronyd converges the clock eventually, and refusing restore
 /// over a clock step would trade a one-second skew for a dead clone.
-pub(crate) fn set_system_clock(host_time: &str) {
-    eprintln!("[fc-agent] received host time: {host_time}");
+///
+/// `since_read` is how long ago the host's value was read: a caller that steps
+/// the clock some time after it fetched the value passes that time, so the
+/// clock lands on the host's present rather than on the moment of the read.
+pub(crate) fn set_system_clock(host_time: &str, since_read: std::time::Duration) {
+    eprintln!("[fc-agent] received host time: {host_time} (read {since_read:?} ago)");
     match parse_epoch_seconds(host_time) {
         Ok(seconds) => {
-            let spec = libc::timespec {
-                tv_sec: seconds as _,
-                tv_nsec: 0,
-            };
+            let spec = clock_target(seconds, since_read);
             // SAFETY: `spec` is fully initialized and outlives the call.
             let rc = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &spec) };
             if rc != 0 {
@@ -149,6 +150,15 @@ pub(crate) fn set_system_clock(host_time: &str) {
 /// Returns i64 rather than `libc::time_t`, which is deprecated because musl
 /// widened it; the cast at the one call site adapts to whatever the target's
 /// `timespec` field actually is.
+/// The time to set: the host's epoch seconds plus the time since they were read.
+fn clock_target(seconds: i64, since_read: std::time::Duration) -> libc::timespec {
+    let total = std::time::Duration::from_secs(seconds as u64) + since_read;
+    libc::timespec {
+        tv_sec: total.as_secs() as _,
+        tv_nsec: total.subsec_nanos() as _,
+    }
+}
+
 fn parse_epoch_seconds(host_time: &str) -> Result<i64> {
     let seconds: i64 = host_time
         .trim()
@@ -161,6 +171,18 @@ fn parse_epoch_seconds(host_time: &str) -> Result<i64> {
 #[cfg(test)]
 mod clock_tests {
     use super::*;
+
+    #[test]
+    fn the_clock_target_adds_the_time_since_the_host_value_was_read() {
+        let spec = clock_target(1_700_000_000, std::time::Duration::from_millis(31_250));
+        assert_eq!(spec.tv_sec as i64, 1_700_000_031);
+        assert_eq!(spec.tv_nsec as i64, 250_000_000);
+        let spec = clock_target(1_700_000_000, std::time::Duration::ZERO);
+        assert_eq!(
+            (spec.tv_sec as i64, spec.tv_nsec as i64),
+            (1_700_000_000, 0)
+        );
+    }
 
     #[test]
     fn epoch_seconds_parse_rejects_garbage_and_pre_epoch_values() {
