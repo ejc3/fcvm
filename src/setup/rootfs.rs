@@ -435,21 +435,33 @@ if [ -n "${{http_proxy:-}}" ]; then
 fi
 # Configure apt to retry on transient failures (e.g. 403 from mirrors)
 echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/80retries
-apt-get update -qq
-# Retry apt-get download up to 3 times with delay for transient mirror errors
-for attempt in 1 2 3; do
-    if apt-get install --download-only --yes --no-install-recommends {packages}; then
-        break
-    fi
-    if [ "$attempt" -lt 3 ]; then
-        echo "apt-get download failed (attempt $attempt/3), retrying in $((attempt * 10))s..."
-        sleep $((attempt * 10))
-        apt-get update -qq
-    else
-        echo "apt-get download failed after 3 attempts"
-        exit 1
-    fi
-done
+# Run a command up to 3 times. Between attempts: wait attempt*10 s (the delay is
+# FCVM_APT_RETRY_DELAY, default 10), run `apt-get update`, and call the function
+# named by APT_RETRY_CLEAN, if any, to undo what the failed attempt left behind.
+# A mirror error that outlasts Acquire::Retries fails only after the third attempt.
+apt_retry() {{
+    local attempt delay="${{FCVM_APT_RETRY_DELAY:-10}}"
+    for attempt in 1 2 3; do
+        if "$@"; then
+            return 0
+        fi
+        if [ "$attempt" -lt 3 ]; then
+            echo "apt step failed (attempt $attempt/3): $*; retrying in $((attempt * delay))s..." >&2
+            sleep $((attempt * delay))
+            apt-get update -qq || true
+            "${{APT_RETRY_CLEAN:-:}}"
+        fi
+    done
+    echo "apt step failed after 3 attempts: $*" >&2
+    exit 1
+}}
+# apt-get source leaves a partly unpacked conmon-*/ tree and fetched source files
+# when it fails; the later `cd conmon-*/` needs exactly one tree.
+conmon_source_clean() {{
+    rm -rf -- "$conmon_build_dir"/conmon-*/ "$conmon_build_dir"/conmon_*
+}}
+apt_retry apt-get update -qq
+apt_retry apt-get install --download-only --yes --no-install-recommends {packages}
 cp /var/cache/apt/archives/*.deb /packages/ 2>/dev/null || true
 
 # Rebuild conmon from the same archive's source with fcvm's fix for its
@@ -466,17 +478,18 @@ if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
 else
     sed -i 's/^# *deb-src /deb-src /' /etc/apt/sources.list
 fi
-apt-get update -qq
-apt-get install --yes --no-install-recommends -qq dpkg-dev patch >/dev/null
-mkdir -p /tmp/conmon-build
-cd /tmp/conmon-build
-apt-get source conmon="$(dpkg-deb -f "${{stock[0]}}" Version)"
-apt-get build-dep --yes -qq conmon >/dev/null
+apt_retry apt-get update -qq
+apt_retry apt-get install --yes --no-install-recommends -qq dpkg-dev patch >/dev/null
+conmon_build_dir=/tmp/conmon-build
+mkdir -p "$conmon_build_dir"
+cd "$conmon_build_dir"
+APT_RETRY_CLEAN=conmon_source_clean apt_retry apt-get source conmon="$(dpkg-deb -f "${{stock[0]}}" Version)"
+apt_retry apt-get build-dep --yes -qq conmon >/dev/null
 cat > console-race.patch <<'FCVM_CONMON_PATCH'
 {conmon_patch}FCVM_CONMON_PATCH
 (cd conmon-*/ && patch -p1 --forward < ../console-race.patch && dpkg-buildpackage -b -uc -us >../build.log 2>&1) \
     || {{ tail -50 build.log 2>/dev/null; echo "conmon rebuild failed"; exit 1; }}
-built=(/tmp/conmon-build/conmon_*.deb)
+built=("$conmon_build_dir"/conmon_*.deb)
 if [ "${{#built[@]}}" -ne 1 ] || [ "$(dpkg-deb -f "${{built[0]}}" Version)" != "$(dpkg-deb -f "${{stock[0]}}" Version)" ]; then
     echo "conmon rebuild produced ${{built[*]}}, not one package at the archive's version"
     exit 1
@@ -2676,6 +2689,198 @@ fn path_to_str(path: &Path) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bash functions of the generated download script, by name: from the
+    /// `name() {` line to the next line that is a bare `}`.
+    fn download_script_function(script: &str, name: &str) -> String {
+        let head = format!("{name}() {{");
+        let mut out = Vec::new();
+        let mut inside = false;
+        for line in script.lines() {
+            if line == head {
+                inside = true;
+            }
+            if inside {
+                out.push(line);
+                if line == "}" {
+                    return out.join("\n") + "\n";
+                }
+            }
+        }
+        panic!("download script has no function {name}");
+    }
+
+    fn embedded_download_script() -> String {
+        let plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        generate_download_script(&plan)
+    }
+
+    /// Every apt-get call in the download script outside the helper's own body goes
+    /// through `apt_retry`, so a mirror error that outlasts apt's own retries re-runs
+    /// the step (issue #1202).
+    #[test]
+    fn every_apt_get_call_in_the_download_script_goes_through_apt_retry() {
+        let script = embedded_download_script();
+        let mut in_helper = false;
+        let mut calls = 0;
+        let mut bare = Vec::new();
+        for line in script.lines() {
+            if line == "apt_retry() {" {
+                in_helper = true;
+            }
+            if in_helper {
+                if line == "}" {
+                    in_helper = false;
+                }
+                continue;
+            }
+            let code = line.trim_start();
+            if code.starts_with('#') || code.starts_with("echo") || !code.contains("apt-get") {
+                continue;
+            }
+            calls += 1;
+            if !code.contains("apt_retry apt-get") {
+                bare.push(line.to_string());
+            }
+        }
+        assert!(
+            bare.is_empty(),
+            "apt-get calls outside apt_retry:\n{}",
+            bare.join("\n")
+        );
+        assert_eq!(
+            calls, 6,
+            "expected update, install, update, install dpkg-dev, source, build-dep:\n{script}"
+        );
+        let source = script
+            .lines()
+            .find(|l| l.contains("apt_retry apt-get source"))
+            .expect("apt-get source goes through apt_retry");
+        assert!(
+            source.starts_with("APT_RETRY_CLEAN=conmon_source_clean "),
+            "a retried apt-get source must clear the partial tree first: {source}"
+        );
+    }
+
+    /// Runs `body` under bash with `apt_retry` and `conmon_source_clean` from the
+    /// generated script and a stub `apt-get` that logs its arguments to `calls`.
+    /// Returns (exit status, calls log, stderr).
+    fn run_apt_retry(
+        dir: &std::path::Path,
+        stub_apt_get: &str,
+        body: &str,
+    ) -> (bool, String, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = embedded_download_script();
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("apt-get");
+        std::fs::write(&stub, format!("#!/bin/bash\n{stub_apt_get}")).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = format!(
+            "set -euo pipefail\n{}{}conmon_build_dir={}\n{body}\n",
+            download_script_function(&script, "apt_retry"),
+            download_script_function(&script, "conmon_source_clean"),
+            dir.join("build").display(),
+        );
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(program)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("FCVM_APT_RETRY_DELAY", "0")
+            .env("STUB_DIR", dir)
+            .output()
+            .unwrap();
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap_or_default();
+        (
+            out.status.success(),
+            calls,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// A stub whose `install` fails until it has been called more than twice.
+    const STUB_FLAKY_INSTALL: &str = r#"echo "$*" >> "$STUB_DIR/calls"
+if [ "$1" = update ]; then exit 0; fi
+n=$(grep -c '^install' "$STUB_DIR/calls")
+[ "$n" -gt 2 ]
+"#;
+
+    #[test]
+    fn apt_retry_reruns_a_failing_step_after_an_apt_get_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ok, calls, err) = run_apt_retry(
+            dir.path(),
+            STUB_FLAKY_INSTALL,
+            "apt_retry apt-get install --yes foo",
+        );
+        assert!(ok, "two failures then a success must pass: {err}");
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            [
+                "install --yes foo",
+                "update -qq",
+                "install --yes foo",
+                "update -qq",
+                "install --yes foo"
+            ]
+        );
+    }
+
+    #[test]
+    fn apt_retry_gives_up_after_three_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ok, calls, err) = run_apt_retry(
+            dir.path(),
+            "echo \"$*\" >> \"$STUB_DIR/calls\"\n[ \"$1\" = update ]\n",
+            "apt_retry apt-get install --yes foo\necho reached-after-failure",
+        );
+        assert!(!ok, "three failures must fail the script");
+        assert!(err.contains("after 3 attempts"), "{err}");
+        assert_eq!(calls.matches("install --yes foo").count(), 3, "{calls}");
+        assert_eq!(calls.matches("update -qq").count(), 2, "{calls}");
+    }
+
+    #[test]
+    fn apt_retry_clears_a_partial_conmon_tree_before_retrying_the_source_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let build = dir.path().join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        // First `source` leaves a half-unpacked tree and a fetched tarball, then fails.
+        let stub = r#"echo "$*" >> "$STUB_DIR/calls"
+if [ "$1" = update ]; then exit 0; fi
+if [ ! -e "$STUB_DIR/second" ]; then
+    touch "$STUB_DIR/second"
+    mkdir conmon-2.1.0-partial
+    touch conmon_2.1.0.orig.tar.xz
+    exit 1
+fi
+mkdir conmon-2.1.0
+"#;
+        let (ok, calls, err) = run_apt_retry(
+            dir.path(),
+            stub,
+            "cd \"$conmon_build_dir\"\n\
+             APT_RETRY_CLEAN=conmon_source_clean apt_retry apt-get source conmon=2.1.0\n\
+             ls -d conmon-*/ > \"$STUB_DIR/trees\"\n\
+             ls conmon_* > \"$STUB_DIR/files\" 2>/dev/null || true",
+        );
+        assert!(ok, "second attempt must succeed: {err}");
+        assert_eq!(calls.matches("source conmon=2.1.0").count(), 2, "{calls}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("trees")).unwrap(),
+            "conmon-2.1.0/\n",
+            "the glob `cd conmon-*/` must see exactly one tree"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("files")).unwrap(),
+            "",
+            "files from the failed attempt must be gone"
+        );
+    }
 
     #[test]
     fn global_firecracker_config_without_a_commit_is_refused() {
