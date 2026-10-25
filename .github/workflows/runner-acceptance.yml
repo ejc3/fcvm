@@ -30,10 +30,27 @@ jobs:
     runs-on: [self-hosted, Linux, ARM64]
     timeout-minutes: 5
     steps:
+      # The account is compared in an if: expression, which the runner evaluates without
+      # printing it; an env: or run: value appears in the public log as typed, and this
+      # self-hosted job is given no secret at all.
+      - name: Read this host's AWS account
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          token=$(curl -sf --noproxy '*' -m 5 -X PUT http://169.254.169.254/latest/api/token \
+            -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+          curl -sf --noproxy '*' -m 5 -H "X-aws-ec2-metadata-token: $token" \
+            http://169.254.169.254/latest/dynamic/instance-identity/document \
+            | python3 -c 'import json, sys; print("account=" + json.load(sys.stdin)["accountId"])' >> "$GITHUB_OUTPUT"
+      - name: Reject a host from another AWS account
+        if: steps.identity.outputs.account != vars.AWS_ACCOUNT_ID
+        run: |
+          echo '::error::This host is not in the expected AWS account.'
+          exit 1
       - name: Verify ephemeral host, smoke test, and hold for independent observation
         env:
           ACCEPTANCE_RUNNER_NAME: ${{ runner.name }}
-          EXPECTED_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
         shell: bash
         run: |
           set -euo pipefail
@@ -52,7 +69,7 @@ jobs:
           def validate(data):
               identity = data['identity']
               instance = identity['instanceId']
-              if (identity['accountId'] != data['expected_account'] or identity['region'] != 'us-west-1'
+              if (identity['region'] != 'us-west-1'
                       or identity['architecture'] != 'arm64' or data['machine'] != 'aarch64'
                       or not re.fullmatch(r'i-[0-9a-f]{17}', instance)):
                   raise ValueError('Unexpected instance identity or architecture')
@@ -107,8 +124,7 @@ jobs:
               properties[key] = subprocess.check_output(
                   ['systemctl', 'show', service, '--property=' + key, '--value'],
                   text=True, timeout=5).strip()
-          validate({'identity': identity, 'expected_account': os.environ['EXPECTED_AWS_ACCOUNT_ID'],
-                    'runner_name': os.environ['ACCEPTANCE_RUNNER_NAME'],
+          validate({'identity': identity, 'runner_name': os.environ['ACCEPTANCE_RUNNER_NAME'],
               'machine': os.uname().machine, 'settings': json.loads((directory / '.runner').read_bytes()),
               'service': service, 'cgroup': Path('/proc/self/cgroup').read_text(),
               'dropin': dropin.read_text(), 'dropin_uid': info.st_uid,

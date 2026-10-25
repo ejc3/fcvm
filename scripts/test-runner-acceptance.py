@@ -29,7 +29,6 @@ class RunnerAcceptanceTests(unittest.TestCase):
         instance = 'i-0123456789abcdef0'
         service = f'actions.runner.ejc3-fcvm.runner-{instance}.service'
         return {
-            'expected_account': '123456789012',
             'identity': {'accountId': '123456789012', 'region': 'us-west-1',
                          'instanceId': instance, 'architecture': 'arm64'},
             'runner_name': f'runner-{instance}', 'machine': 'aarch64',
@@ -75,12 +74,26 @@ class RunnerAcceptanceTests(unittest.TestCase):
                 self.validate(data)
 
     def test_wrong_identity_is_rejected(self):
-        for key, value in [('accountId', '111111111111'), ('region', 'us-east-1'),
+        for key, value in [('region', 'us-east-1'),
                            ('instanceId', 'not-an-instance'), ('architecture', 'x86_64')]:
             data = self.valid()
             data['identity'][key] = value
             with self.assertRaises(ValueError):
                 self.validate(data)
+
+    def test_a_host_from_another_account_fails_before_verification(self):
+        steps = self.workflow.split('  accept:\n', 1)[1]
+        reject = steps.index('      - name: Reject a host from another AWS account\n')
+        self.assertLess(steps.index('        id: identity\n'), reject)
+        self.assertLess(reject, steps.index('      - name: Verify ephemeral host'))
+        step = steps[reject:].split('\n      - name:', 2)[0]
+        self.assertIn('        if: steps.identity.outputs.account != vars.AWS_ACCOUNT_ID\n', step)
+        self.assertIn('exit 1', step)
+        self.assertIn('print("account=" + json.load(sys.stdin)["accountId"])\' >> "$GITHUB_OUTPUT"', steps)
+        # Only an if: expression reads the account: an env: or run: value is printed as typed.
+        for line in self.workflow.splitlines():
+            if 'vars.' in line:
+                self.assertRegex(line, r'^\s+if: ', line)
 
     def test_runner_name_and_settings_are_bound_to_instance(self):
         for key in ('runner_name', 'settings'):
