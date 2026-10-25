@@ -1186,12 +1186,25 @@ async fn run_exec_with_pty_interrupt(
 /// conmon): conmon bytes ""` for an exec whose process already ran. In CI the gap
 /// opened only when a starved vCPU preempted conmon there.
 ///
-/// This test holds the gap open: a wrapper runs conmon under strace with every
-/// `wait4()` delayed by two seconds, and detaches from crun at its `execve` so crun
-/// itself runs at full speed and finishes inside the delay. The
-/// rootfs carries a rebuilt conmon (`scripts/conmon-exec-console-race.patch`) that
-/// accepts a console still queued when the loop exits; with the archive's conmon
-/// this test fails with no token and the journal line below.
+/// The same gap can leave podman's attach connection queued too. podman connects
+/// to conmon's attach socket before it lets the runtime start, but when conmon's
+/// first poll ran before that connect, the loop quits with both connections
+/// queued. If the exec'd process has also exited, conmon skips its second loop,
+/// drains the terminal to no accepted connection and exits, and podman reads a
+/// reset connection as end of output: exit 0, no output. Before this test forced
+/// that order, it failed that way in 13 of 113 attempts on arm64 CI and 2 of 26
+/// on x64.
+///
+/// This test holds both gaps open: a wrapper runs conmon under strace with every
+/// `wait4()` delayed by three seconds, and detaches from crun at its `execve` so
+/// crun itself runs at full speed and finishes inside the delay; podman runs under
+/// strace with every `connect()` delayed by one second, so conmon's first poll
+/// always precedes the attach connection. The rootfs carries a rebuilt conmon
+/// (`scripts/conmon-exec-console-race.patch`) that accepts a console and attach
+/// connections still queued when the loop exits. With the archive's conmon this
+/// test fails with no token and "Runtime did not set up terminal" in the journal;
+/// with a conmon that accepts only the late console it fails with rc=0 and no
+/// token.
 #[tokio::test]
 async fn test_exec_tty_when_conmon_reaps_the_runtime_before_the_console() -> Result<()> {
     let (vm_name, _, _, _) = common::unique_names("exec-conmon-race");
@@ -1218,7 +1231,7 @@ async fn test_exec_tty_when_conmon_reaps_the_runtime_before_the_console() -> Res
         let install = "cat > /tmp/slow-conmon <<'EOF'\n\
             #!/bin/sh\n\
             exec strace -DDD -f --detach-on=execve -qq --seccomp-bpf -o /dev/null \
-            -e trace=wait4 -e inject=wait4:delay_enter=2000000 /usr/bin/conmon \"$@\"\n\
+            -e trace=wait4 -e inject=wait4:delay_enter=3000000 /usr/bin/conmon \"$@\"\n\
             EOF\n\
             chmod +x /tmp/slow-conmon";
         common::exec_in_vm(fcvm_pid, &[install])
@@ -1228,14 +1241,20 @@ async fn test_exec_tty_when_conmon_reaps_the_runtime_before_the_console() -> Res
         // podman's -t needs a terminal; script gives it one. `tty` prints the
         // terminal the container process got, a line podman's own debug output
         // never starts with. --log-level=debug is passed on to conmon, which then
-        // logs that it took the late console. The timeout bounds the archive's
-        // conmon, where the strace tracer holds podman's sync pipe open and podman
-        // waits for it.
+        // logs that it took the late console and attach connection. The timeout
+        // bounds the archive's conmon, where the strace tracer holds podman's sync
+        // pipe open and podman waits for it. The tracer on podman detaches from
+        // podman's children at their execve, so conmon and crun are not delayed.
+        // The output and conmon's journal follow, for a failure to show.
         let run = "timeout 60 script -qec \
-            'podman --log-level=debug --conmon /tmp/slow-conmon exec -t --latest tty' \
+            'strace -f --detach-on=execve -qq -o /dev/null \
+            -e trace=connect -e inject=connect:delay_enter=1000000 \
+            podman --log-level=debug --conmon /tmp/slow-conmon exec -t --latest tty' \
             /dev/null </dev/null >/tmp/conmon-race.out 2>&1; echo \"rc=$?\"; \
             tr -d '\\r' </tmp/conmon-race.out | grep -c '^/dev/pts/[0-9]'; \
-            journalctl -q -t conmon --no-pager -o cat | grep -E 'did not set up terminal|accepting the console' || true";
+            journalctl -q -t conmon --no-pager -o cat | grep -E 'did not set up terminal|after the runtime exited' || true; \
+            echo '--- exec output'; tr -d '\\r' </tmp/conmon-race.out; \
+            echo '--- conmon journal'; journalctl -q -t conmon --no-pager -o short-precise";
         let out = common::exec_in_vm(fcvm_pid, &[run])
             .await
             .context("running the TTY exec under the delayed conmon")?;
@@ -1261,6 +1280,11 @@ async fn test_exec_tty_when_conmon_reaps_the_runtime_before_the_console() -> Res
         anyhow::ensure!(
             out.contains("accepting the console after the runtime exited"),
             "conmon never took the late-console path, so the race was not exercised:\n{}",
+            out
+        );
+        anyhow::ensure!(
+            out.contains("accepted 1 attach connection after the runtime exited"),
+            "conmon never took the late-attach path, so the race was not exercised:\n{}",
             out
         );
         Ok(())
