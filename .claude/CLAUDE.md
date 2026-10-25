@@ -706,6 +706,11 @@ on each lower PR's head, naming the run, but only on heads that are ancestors of
 head (`scripts/ci-stack-coverage.sh`). A lower PR is tested when it carries `Summary` success or
 `Stack CI` success on its current head; `Summary (deferred)` alone means nothing ran for it.
 
+A lower PR defers only to a child whose head already contains its new head. Push every
+updated layer of a stack in one command (`git push origin layer-1 layer-2 layer-3`): a lower
+layer pushed on its own starts its run before its child holds the new commit, and that run
+tests in full.
+
 To bisect a failure on the top, run one layer on its own:
 `gh workflow run ci.yml --ref <layer-branch>` (a dispatch run tests the full matrix). Also run it
 when the top PR is closed and a lower PR becomes the top, since nothing re-triggers its CI.
