@@ -72,8 +72,15 @@ MIN_CDP_ATTEMPTS_PER_BACKEND = 200
 SUPPORTED_ENGINES = ("chromium", "webkit")
 
 
+# The DOM-extraction arms, and the arms whose teardown is the one SIGKILL
+# (reqbench.py teardown_fast) that reads each clone child's CPU.
+HTML_ARMS = frozenset({"html", "html-fast"})
+FAST_ARMS = frozenset({"cdp-fast", "html-fast", "noop-fast"})
+NOOP_ARMS = frozenset({"noop", "noop-fast"})
+
+
 def is_cdp_class(arm):
-    """Arms that pay the per-request CDP handshake: cdp, cdp-fast, and html.
+    """Arms that pay the per-request CDP handshake: cdp, cdp-fast, html, html-fast.
 
     Both the sample-size gate and the stage decomposition key off this
     predicate. A name test scattered as startswith("cdp") let the html arm
@@ -81,7 +88,7 @@ def is_cdp_class(arm):
     than 200 measured attempts, and analysis.json dropped every
     connection/extraction stage for it.
     """
-    return isinstance(arm, str) and (arm.startswith("cdp") or arm == "html")
+    return isinstance(arm, str) and (arm.startswith("cdp") or arm in HTML_ARMS)
 MIN_NOOP_ATTEMPTS = 6
 DRIFT_EQUIVALENCE_MARGIN_MS = 10.0
 QUIET_LOADAVG1_LIMIT = 2.0
@@ -162,6 +169,13 @@ def mean_ci(xs, iters=20000, conf=0.95, seed=12345):
     boots = sorted(statistics.fmean(xs[rng.randrange(n)] for _ in range(n))
                    for _ in range(iters))
     return mean, boots[int((1 - conf) / 2 * iters)], boots[int((1 + conf) / 2 * iters) - 1], n
+
+
+def finite_or_none(value):
+    """value as a float when it is a finite number (not a boolean), else None."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return float(value)
+    return None
 
 
 def cpu_reading(value) -> bool:
@@ -495,6 +509,28 @@ def _cell_from_meta(meta, source):
                 else value.strip() if isinstance(value, str)
                 else value
             )
+    # Facts the harness began recording later (reqbench.py meta): the memory
+    # server's prefetch setting, the host, the browser build, the Firecracker
+    # build and hugepage backing. A record from before has no key and its cell
+    # stays as it was; a present value must have its shape, and it is part of
+    # the cell, so runs that differ in any of them are not pooled.
+    optional_shapes = {
+        "uffd_prefetch": lambda v: v is None or v in ("on", "off"),
+        "browser_version": lambda v: v is None or (isinstance(v, str) and bool(v.strip())),
+        "firecracker": lambda v: v is None or isinstance(v, dict),
+        "hugepages": lambda v: isinstance(v, bool),
+        "host": lambda v: isinstance(v, dict),
+        "resolve_poll_ms": lambda v: finite_or_none(v) is not None and v > 0,
+    }
+    for field, shape in optional_shapes.items():
+        if field not in meta:
+            continue
+        if shape(meta[field]):
+            cell[field] = meta[field]
+        else:
+            errors.append(f"{source} metadata has no valid {field}")
+    if "uffd_prefetch" in cell and cell.get("backend") == "uffd" and cell["uffd_prefetch"] is None:
+        errors.append(f"{source} metadata records no uffd_prefetch for a UFFD run")
     if "url" in cell:
         declared = meta.get("urls")
         if declared is not None:
@@ -672,7 +708,8 @@ def _validate_arms(arms, label, errors):
         or len(arms) != len(set(arms))
     ):
         errors.append(f"{label} metadata has no valid duplicate-free arms list")
-    elif any(arm not in {"exec", "cdp", "cdp-fast", "html", "noop"} for arm in arms):
+    elif any(arm not in {"exec", "cdp", "cdp-fast", "html", "html-fast", "noop", "noop-fast"}
+                 for arm in arms):
         errors.append(f"{label} metadata declares an unsupported arm")
     elif "noop" not in arms or not any(is_cdp_class(arm) for arm in arms):
         errors.append(
@@ -787,6 +824,220 @@ def _validate_schedule(dataset):
     def finite_positive(value):
         return finite_number(value) and value > 0
 
+    def _validate_fast_teardown(teardown, rlabel, errors):
+        """The fast teardown's accounting fields, for every fast-teardown arm."""
+        if teardown.get("accounting_version") != "post-terminal-ambient-v2":
+            errors.append(f"{rlabel} fast teardown has stale accounting semantics")
+        for metric in (
+            "reap_wall_ms", "teardown_total_ms", "machine_cpu_ms",
+            "harness_cpu_ms", "machine_cpu_window_ms",
+            "machine_cpu_ms_net", "machine_cpu_ms_net_lo",
+            "machine_cpu_ms_net_hi", "control_machine_cpu_ms",
+            "control_harness_cpu_ms", "control_wall_ms", "control_target_ms",
+            "control_cpu_ms_net", "control_cpu_ms_net_lo",
+            "control_cpu_ms_net_hi", "control_busy_cores",
+            "control_busy_cores_lo", "control_busy_cores_hi",
+            "cpu_residual_uncertainty_ms", "machine_cpu_resolution_ms",
+            "harness_cpu_resolution_ms", "sample_period_s", "tick_ms",
+        ):
+            if not finite_nonnegative(teardown.get(metric)):
+                errors.append(
+                    f"{rlabel} fast teardown has no valid {metric}"
+                )
+        for metric in (
+            "machine_cpu_window_ms", "control_wall_ms", "control_target_ms",
+            "cpu_residual_uncertainty_ms", "machine_cpu_resolution_ms",
+            "harness_cpu_resolution_ms", "sample_period_s", "tick_ms",
+        ):
+            if not finite_positive(teardown.get(metric)):
+                errors.append(
+                    f"{rlabel} fast teardown has no positive {metric}"
+                )
+        for metric in (
+            "machine_cpu_ms_raw", "control_cpu_ms_raw",
+            "machine_cpu_ms_excess", "machine_cpu_ms_excess_lo",
+            "machine_cpu_ms_excess_hi",
+        ):
+            if not finite_number(teardown.get(metric)):
+                errors.append(
+                    f"{rlabel} fast teardown has no finite {metric}"
+                )
+        if teardown.get("machine_cpu_source") != (
+            "/proc/stat:busy(user,nice,system,irq,softirq,steal)"
+        ):
+            errors.append(f"{rlabel} fast teardown has wrong machine CPU source")
+        if teardown.get("harness_cpu_source") != (
+            "/proc/self/stat:utime+stime"
+        ):
+            errors.append(f"{rlabel} fast teardown has wrong harness CPU source")
+        for field in (
+            "machine_cpu_ms_subtraction_clamped",
+            "control_cpu_ms_subtraction_clamped",
+        ):
+            if not isinstance(teardown.get(field), bool):
+                errors.append(f"{rlabel} fast teardown has no valid {field}")
+
+        def close_enough(field, expected):
+            actual = teardown.get(field)
+            if not finite_number(actual) or not math.isclose(
+                actual, expected, rel_tol=1e-9, abs_tol=1e-6
+            ):
+                errors.append(
+                    f"{rlabel} fast teardown {field}={actual!r} "
+                    f"does not match derived {expected!r}"
+                )
+
+        machine_resolution = teardown.get("machine_cpu_resolution_ms")
+        harness_resolution = teardown.get("harness_cpu_resolution_ms")
+        if finite_positive(machine_resolution) and finite_positive(
+            harness_resolution
+        ):
+            tick_ms = teardown.get("tick_ms")
+            if finite_positive(tick_ms):
+                close_enough("machine_cpu_resolution_ms", tick_ms)
+                close_enough("harness_cpu_resolution_ms", tick_ms)
+            uncertainty = (
+                6 * machine_resolution + 2 * harness_resolution
+            )
+            close_enough("cpu_residual_uncertainty_ms", uncertainty)
+
+            def validate_residual(prefix, machine_field, harness_field):
+                machine = teardown.get(machine_field)
+                harness = teardown.get(harness_field)
+                if not (
+                    finite_nonnegative(machine)
+                    and finite_nonnegative(harness)
+                ):
+                    return
+                raw = machine - harness
+                close_enough(f"{prefix}_raw", raw)
+                close_enough(f"{prefix}_net", max(0.0, raw))
+                close_enough(
+                    f"{prefix}_net_lo", max(0.0, raw - uncertainty)
+                )
+                close_enough(
+                    f"{prefix}_net_hi", max(0.0, raw + uncertainty)
+                )
+                clamped = teardown.get(f"{prefix}_subtraction_clamped")
+                if clamped is not (raw < 0.0):
+                    errors.append(
+                        f"{rlabel} fast teardown {prefix} clamp "
+                        "classification contradicts its raw residual"
+                    )
+                if raw < -uncertainty - 1e-6:
+                    errors.append(
+                        f"{rlabel} fast teardown {prefix} raw residual "
+                        "exceeds its negative counter-resolution bound"
+                    )
+
+            validate_residual(
+                "machine_cpu_ms", "machine_cpu_ms", "harness_cpu_ms"
+            )
+            validate_residual(
+                "control_cpu_ms",
+                "control_machine_cpu_ms",
+                "control_harness_cpu_ms",
+            )
+
+            control_wall = teardown.get("control_wall_ms")
+            control_target = teardown.get("control_target_ms")
+            if finite_positive(control_target):
+                close_enough("control_target_ms", 50.0)
+            if (
+                finite_positive(control_wall)
+                and finite_positive(control_target)
+                and control_wall + 1e-6 < control_target
+            ):
+                errors.append(
+                    f"{rlabel} fast teardown control window ended "
+                    "before its declared target"
+                )
+            machine_window = teardown.get("machine_cpu_window_ms")
+            reap_wall = teardown.get("reap_wall_ms")
+            if (
+                finite_positive(machine_window)
+                and finite_nonnegative(reap_wall)
+                and machine_window + 1e-6 < reap_wall
+            ):
+                errors.append(
+                    f"{rlabel} fast teardown machine CPU window does "
+                    "not enclose reap_wall_ms"
+                )
+            control_net = teardown.get("control_cpu_ms_net")
+            control_lo = teardown.get("control_cpu_ms_net_lo")
+            control_hi = teardown.get("control_cpu_ms_net_hi")
+            machine_net = teardown.get("machine_cpu_ms_net")
+            machine_lo = teardown.get("machine_cpu_ms_net_lo")
+            machine_hi = teardown.get("machine_cpu_ms_net_hi")
+            if (
+                finite_positive(control_wall)
+                and all(
+                    finite_nonnegative(value)
+                    for value in (control_net, control_lo, control_hi)
+                )
+            ):
+                control_rate = control_net / control_wall
+                control_rate_lo = control_lo / control_wall
+                control_rate_hi = control_hi / control_wall
+                close_enough("control_busy_cores", control_rate)
+                close_enough("control_busy_cores_lo", control_rate_lo)
+                close_enough("control_busy_cores_hi", control_rate_hi)
+                if (
+                    finite_positive(machine_window)
+                    and all(
+                        finite_nonnegative(value)
+                        for value in (machine_net, machine_lo, machine_hi)
+                    )
+                ):
+                    close_enough(
+                        "machine_cpu_ms_excess",
+                        machine_net - control_rate * machine_window,
+                    )
+                    close_enough(
+                        "machine_cpu_ms_excess_lo",
+                        machine_lo - control_rate_hi * machine_window,
+                    )
+                    close_enough(
+                        "machine_cpu_ms_excess_hi",
+                        machine_hi - control_rate_lo * machine_window,
+                    )
+                    excess = teardown.get("machine_cpu_ms_excess")
+                    excess_lo = teardown.get("machine_cpu_ms_excess_lo")
+                    excess_hi = teardown.get("machine_cpu_ms_excess_hi")
+                    if (
+                        finite_number(excess)
+                        and finite_number(excess_lo)
+                        and finite_number(excess_hi)
+                        and not excess_lo <= excess <= excess_hi
+                    ):
+                        errors.append(
+                            f"{rlabel} fast teardown excess point lies "
+                            "outside its quantization interval"
+                        )
+        processes = teardown.get("per_child_cpu")
+        if not isinstance(processes, dict) or not processes:
+            errors.append(f"{rlabel} fast teardown has no per-process CPU data")
+        else:
+            if "fcvm" not in processes:
+                errors.append(f"{rlabel} fast teardown omits fcvm CPU data")
+            for process_name, process in processes.items():
+                if not isinstance(process, dict):
+                    errors.append(
+                        f"{rlabel} fast teardown process {process_name} is invalid"
+                    )
+                    continue
+                if not isinstance(process.get("complete"), bool):
+                    errors.append(
+                        f"{rlabel} fast teardown process {process_name} "
+                        "has no completion classification"
+                    )
+                reclaim = process.get("reclaim_cpu_ms")
+                if reclaim is not None and not finite_nonnegative(reclaim):
+                    errors.append(
+                        f"{rlabel} fast teardown process {process_name} "
+                        "has invalid reclaim CPU"
+                    )
+
     if not isinstance(run_id, str) or not run_id:
         errors.append(f"{label} metadata has no run_id")
     if (
@@ -894,7 +1145,7 @@ def _validate_schedule(dataset):
         teardown = record.get("teardown")
         expected_mode = (
             "exec" if arm == "exec"
-            else "fast" if arm == "cdp-fast"
+            else "fast" if arm in FAST_ARMS
             else "normal"
         )
         if not isinstance(teardown, dict):
@@ -1027,7 +1278,7 @@ def _validate_schedule(dataset):
                     errors.append(f"{rlabel} successful exec did not exit cleanly")
                 if not finite_nonnegative(record.get("render_total_ms")):
                     errors.append(f"{rlabel} successful exec has no render_total_ms")
-            elif arm in ("cdp", "cdp-fast", "html"):
+            elif is_cdp_class(arm):
                 for metric in ("state_to_port_ms", "spawn_to_port_ms"):
                     if not finite_nonnegative(record.get(metric)):
                         errors.append(f"{rlabel} successful CDP record has no {metric}")
@@ -1112,7 +1363,7 @@ def _validate_schedule(dataset):
                         # (tcp/upgrade/enable), no idle policy, no separate
                         # decode, and no navigation-timing extraction. The html
                         # arm is refused upfront for this engine.
-                        if arm == "html":
+                        if arm in HTML_ARMS:
                             errors.append(
                                 f"{rlabel} html arm is not valid for webkit records"
                             )
@@ -1120,7 +1371,7 @@ def _validate_schedule(dataset):
                             "resolve_ms", "connect_total_ms", "navigate_ms",
                             "screenshot_ms", "total_ms",
                         )
-                    elif arm == "html":
+                    elif arm in HTML_ARMS:
                         # The html op swaps the terminal screenshot+decode stages
                         # for a single DOM-extraction stage.
                         required_stages = (
@@ -1142,7 +1393,7 @@ def _validate_schedule(dataset):
                                 errors.append(
                                     f"{rlabel} successful CDP render has invalid {stage}"
                                 )
-                    if arm == "html":
+                    if arm in HTML_ARMS:
                         html_bytes = render.get("html_bytes")
                         html_sha256 = render.get("html_sha256")
                         if (
@@ -1159,13 +1410,13 @@ def _validate_schedule(dataset):
                             errors.append(f"{rlabel} html render has invalid html_sha256")
                     image_bytes = render.get("image_bytes")
                     image_sha256 = render.get("image_sha256")
-                    if arm != "html" and (
+                    if arm not in HTML_ARMS and (
                         not isinstance(image_bytes, int)
                         or isinstance(image_bytes, bool)
                         or image_bytes <= 0
                     ):
                         errors.append(f"{rlabel} CDP render has no positive image_bytes")
-                    if arm != "html" and (
+                    if arm not in HTML_ARMS and (
                         not isinstance(image_sha256, str)
                         or len(image_sha256) != 64
                         or any(
@@ -1175,7 +1426,7 @@ def _validate_schedule(dataset):
                     ):
                         errors.append(f"{rlabel} CDP render has invalid image_sha256")
                     for dimension in (
-                        () if (arm == "html" or engine == "webkit") else ("width", "height")
+                        () if (arm in HTML_ARMS or engine == "webkit") else ("width", "height")
                     ):
                         value = render.get(dimension)
                         if (
@@ -1185,7 +1436,7 @@ def _validate_schedule(dataset):
                         ):
                             errors.append(f"{rlabel} CDP render has invalid {dimension}")
                     if (
-                        arm != "html"
+                        arm not in HTML_ARMS
                         and engine != "webkit"
                         and render.get("quality") != expected_quality
                     ):
@@ -1205,220 +1456,13 @@ def _validate_schedule(dataset):
                                     errors.append(
                                         f"{rlabel} CDP render has invalid nav.{field}"
                                     )
-                if arm == "cdp-fast" and isinstance(teardown, dict):
-                    if teardown.get("accounting_version") != "post-terminal-ambient-v2":
-                        errors.append(f"{rlabel} fast teardown has stale accounting semantics")
-                    for metric in (
-                        "reap_wall_ms", "teardown_total_ms", "machine_cpu_ms",
-                        "harness_cpu_ms", "machine_cpu_window_ms",
-                        "machine_cpu_ms_net", "machine_cpu_ms_net_lo",
-                        "machine_cpu_ms_net_hi", "control_machine_cpu_ms",
-                        "control_harness_cpu_ms", "control_wall_ms", "control_target_ms",
-                        "control_cpu_ms_net", "control_cpu_ms_net_lo",
-                        "control_cpu_ms_net_hi", "control_busy_cores",
-                        "control_busy_cores_lo", "control_busy_cores_hi",
-                        "cpu_residual_uncertainty_ms", "machine_cpu_resolution_ms",
-                        "harness_cpu_resolution_ms", "sample_period_s", "tick_ms",
-                    ):
-                        if not finite_nonnegative(teardown.get(metric)):
-                            errors.append(
-                                f"{rlabel} fast teardown has no valid {metric}"
-                            )
-                    for metric in (
-                        "machine_cpu_window_ms", "control_wall_ms", "control_target_ms",
-                        "cpu_residual_uncertainty_ms", "machine_cpu_resolution_ms",
-                        "harness_cpu_resolution_ms", "sample_period_s", "tick_ms",
-                    ):
-                        if not finite_positive(teardown.get(metric)):
-                            errors.append(
-                                f"{rlabel} fast teardown has no positive {metric}"
-                            )
-                    for metric in (
-                        "machine_cpu_ms_raw", "control_cpu_ms_raw",
-                        "machine_cpu_ms_excess", "machine_cpu_ms_excess_lo",
-                        "machine_cpu_ms_excess_hi",
-                    ):
-                        if not finite_number(teardown.get(metric)):
-                            errors.append(
-                                f"{rlabel} fast teardown has no finite {metric}"
-                            )
-                    if teardown.get("machine_cpu_source") != (
-                        "/proc/stat:busy(user,nice,system,irq,softirq,steal)"
-                    ):
-                        errors.append(f"{rlabel} fast teardown has wrong machine CPU source")
-                    if teardown.get("harness_cpu_source") != (
-                        "/proc/self/stat:utime+stime"
-                    ):
-                        errors.append(f"{rlabel} fast teardown has wrong harness CPU source")
-                    for field in (
-                        "machine_cpu_ms_subtraction_clamped",
-                        "control_cpu_ms_subtraction_clamped",
-                    ):
-                        if not isinstance(teardown.get(field), bool):
-                            errors.append(f"{rlabel} fast teardown has no valid {field}")
-
-                    def close_enough(field, expected):
-                        actual = teardown.get(field)
-                        if not finite_number(actual) or not math.isclose(
-                            actual, expected, rel_tol=1e-9, abs_tol=1e-6
-                        ):
-                            errors.append(
-                                f"{rlabel} fast teardown {field}={actual!r} "
-                                f"does not match derived {expected!r}"
-                            )
-
-                    machine_resolution = teardown.get("machine_cpu_resolution_ms")
-                    harness_resolution = teardown.get("harness_cpu_resolution_ms")
-                    if finite_positive(machine_resolution) and finite_positive(
-                        harness_resolution
-                    ):
-                        tick_ms = teardown.get("tick_ms")
-                        if finite_positive(tick_ms):
-                            close_enough("machine_cpu_resolution_ms", tick_ms)
-                            close_enough("harness_cpu_resolution_ms", tick_ms)
-                        uncertainty = (
-                            6 * machine_resolution + 2 * harness_resolution
-                        )
-                        close_enough("cpu_residual_uncertainty_ms", uncertainty)
-
-                        def validate_residual(prefix, machine_field, harness_field):
-                            machine = teardown.get(machine_field)
-                            harness = teardown.get(harness_field)
-                            if not (
-                                finite_nonnegative(machine)
-                                and finite_nonnegative(harness)
-                            ):
-                                return
-                            raw = machine - harness
-                            close_enough(f"{prefix}_raw", raw)
-                            close_enough(f"{prefix}_net", max(0.0, raw))
-                            close_enough(
-                                f"{prefix}_net_lo", max(0.0, raw - uncertainty)
-                            )
-                            close_enough(
-                                f"{prefix}_net_hi", max(0.0, raw + uncertainty)
-                            )
-                            clamped = teardown.get(f"{prefix}_subtraction_clamped")
-                            if clamped is not (raw < 0.0):
-                                errors.append(
-                                    f"{rlabel} fast teardown {prefix} clamp "
-                                    "classification contradicts its raw residual"
-                                )
-                            if raw < -uncertainty - 1e-6:
-                                errors.append(
-                                    f"{rlabel} fast teardown {prefix} raw residual "
-                                    "exceeds its negative counter-resolution bound"
-                                )
-
-                        validate_residual(
-                            "machine_cpu_ms", "machine_cpu_ms", "harness_cpu_ms"
-                        )
-                        validate_residual(
-                            "control_cpu_ms",
-                            "control_machine_cpu_ms",
-                            "control_harness_cpu_ms",
-                        )
-
-                        control_wall = teardown.get("control_wall_ms")
-                        control_target = teardown.get("control_target_ms")
-                        if finite_positive(control_target):
-                            close_enough("control_target_ms", 50.0)
-                        if (
-                            finite_positive(control_wall)
-                            and finite_positive(control_target)
-                            and control_wall + 1e-6 < control_target
-                        ):
-                            errors.append(
-                                f"{rlabel} fast teardown control window ended "
-                                "before its declared target"
-                            )
-                        machine_window = teardown.get("machine_cpu_window_ms")
-                        reap_wall = teardown.get("reap_wall_ms")
-                        if (
-                            finite_positive(machine_window)
-                            and finite_nonnegative(reap_wall)
-                            and machine_window + 1e-6 < reap_wall
-                        ):
-                            errors.append(
-                                f"{rlabel} fast teardown machine CPU window does "
-                                "not enclose reap_wall_ms"
-                            )
-                        control_net = teardown.get("control_cpu_ms_net")
-                        control_lo = teardown.get("control_cpu_ms_net_lo")
-                        control_hi = teardown.get("control_cpu_ms_net_hi")
-                        machine_net = teardown.get("machine_cpu_ms_net")
-                        machine_lo = teardown.get("machine_cpu_ms_net_lo")
-                        machine_hi = teardown.get("machine_cpu_ms_net_hi")
-                        if (
-                            finite_positive(control_wall)
-                            and all(
-                                finite_nonnegative(value)
-                                for value in (control_net, control_lo, control_hi)
-                            )
-                        ):
-                            control_rate = control_net / control_wall
-                            control_rate_lo = control_lo / control_wall
-                            control_rate_hi = control_hi / control_wall
-                            close_enough("control_busy_cores", control_rate)
-                            close_enough("control_busy_cores_lo", control_rate_lo)
-                            close_enough("control_busy_cores_hi", control_rate_hi)
-                            if (
-                                finite_positive(machine_window)
-                                and all(
-                                    finite_nonnegative(value)
-                                    for value in (machine_net, machine_lo, machine_hi)
-                                )
-                            ):
-                                close_enough(
-                                    "machine_cpu_ms_excess",
-                                    machine_net - control_rate * machine_window,
-                                )
-                                close_enough(
-                                    "machine_cpu_ms_excess_lo",
-                                    machine_lo - control_rate_hi * machine_window,
-                                )
-                                close_enough(
-                                    "machine_cpu_ms_excess_hi",
-                                    machine_hi - control_rate_lo * machine_window,
-                                )
-                                excess = teardown.get("machine_cpu_ms_excess")
-                                excess_lo = teardown.get("machine_cpu_ms_excess_lo")
-                                excess_hi = teardown.get("machine_cpu_ms_excess_hi")
-                                if (
-                                    finite_number(excess)
-                                    and finite_number(excess_lo)
-                                    and finite_number(excess_hi)
-                                    and not excess_lo <= excess <= excess_hi
-                                ):
-                                    errors.append(
-                                        f"{rlabel} fast teardown excess point lies "
-                                        "outside its quantization interval"
-                                    )
-                    processes = teardown.get("per_child_cpu")
-                    if not isinstance(processes, dict) or not processes:
-                        errors.append(f"{rlabel} fast teardown has no per-process CPU data")
-                    else:
-                        if "fcvm" not in processes:
-                            errors.append(f"{rlabel} fast teardown omits fcvm CPU data")
-                        for process_name, process in processes.items():
-                            if not isinstance(process, dict):
-                                errors.append(
-                                    f"{rlabel} fast teardown process {process_name} is invalid"
-                                )
-                                continue
-                            if not isinstance(process.get("complete"), bool):
-                                errors.append(
-                                    f"{rlabel} fast teardown process {process_name} "
-                                    "has no completion classification"
-                                )
-                            reclaim = process.get("reclaim_cpu_ms")
-                            if reclaim is not None and not finite_nonnegative(reclaim):
-                                errors.append(
-                                    f"{rlabel} fast teardown process {process_name} "
-                                    "has invalid reclaim CPU"
-                                )
-            elif arm == "noop" and not finite_nonnegative(record.get("spawn_to_port_ms")):
-                errors.append(f"{rlabel} successful noop has no spawn_to_port_ms")
+                if arm in FAST_ARMS and isinstance(teardown, dict):
+                    _validate_fast_teardown(teardown, rlabel, errors)
+            elif arm in NOOP_ARMS:
+                if not finite_nonnegative(record.get("spawn_to_port_ms")):
+                    errors.append(f"{rlabel} successful noop has no spawn_to_port_ms")
+                if arm in FAST_ARMS and isinstance(teardown, dict):
+                    _validate_fast_teardown(teardown, rlabel, errors)
         elif ok is False and not isinstance(record.get("error"), str):
             errors.append(f"{rlabel} failed record has no string error")
         loadavg = record.get("loadavg1")
@@ -1854,7 +1898,8 @@ def analyze_backend(
     for r in recs:
         if r.get("arm") and r["arm"] not in arms:
             arms.append(r["arm"])
-    arms.sort(key=lambda a: {"exec": 0, "cdp": 1, "cdp-fast": 2, "noop": 9}.get(a, 5))
+    arms.sort(key=lambda a: {"exec": 0, "cdp": 1, "cdp-fast": 2, "html": 3, "html-fast": 4, "noop": 9,
+                                    "noop-fast": 10}.get(a, 5))
     by = {a: [r for r in ok if r.get("arm") == a] for a in arms}
     # EVERY attempt, not just the successes. The teardown/leak section reads this
     # one: a request that failed is precisely the one whose teardown is most
@@ -2076,7 +2121,7 @@ def analyze_backend(
         # html swaps the terminal screenshot stage for extract (no image);
         # every other stage is the same CDP handshake all cdp-class arms pay.
         arm_stage_keys = [
-            ("extract_ms" if (k == "screenshot_ms" and a == "html") else k)
+            ("extract_ms" if (k == "screenshot_ms" and a in HTML_ARMS) else k)
             for k in stage_keys
         ]
         print(f"  [{a}]")
@@ -2120,6 +2165,61 @@ def analyze_backend(
                         else r.get("render", {}).get(key)
                     ),
                 )
+    # ---- 4a'. The request's timeline beyond its stages, from fields the
+    # harness began recording later: when fcvm's restore milestones reached
+    # the clone's log (restore_marks, ms from launch), what each poll for the
+    # page target found (render.resolve_polls) and the navigation timing
+    # marks that split navigate (render.nav). Arms whose records carry none
+    # of them publish nothing here.
+    for a in [x for x in arms if is_cdp_class(x) or x in NOOP_ARMS]:
+        timeline = {}
+        marks = sorted({key for r in by[a] for key in (r.get("restore_marks") or {})
+                        if key != "error"})
+        if marks:
+            timeline["restore_marks_ms"] = {
+                key: metric_summary(by[a], lambda r, k=key: finite_or_none(
+                    (r.get("restore_marks") or {}).get(k)))
+                for key in marks
+            }
+        polled = [r for r in by[a]
+                  if isinstance((r.get("render") or {}).get("resolve_polls"), list)]
+        if polled:
+            def polls(r):
+                return [p for p in r["render"]["resolve_polls"] if isinstance(p, dict)]
+
+            def first_page(r):
+                return next((finite_or_none(p.get("t_ms")) for p in polls(r)
+                             if p.get("outcome") == "page"), None)
+
+            def last_miss(r):
+                misses = [finite_or_none(p.get("t_ms")) for p in polls(r)
+                          if p.get("outcome") != "page"]
+                misses = [m for m in misses if m is not None]
+                return misses[-1] if misses else None
+
+            outcomes = {}
+            for r in polled:
+                for p in polls(r):
+                    outcome = str(p.get("outcome"))
+                    outcomes[outcome] = outcomes.get(outcome, 0) + 1
+            timeline["resolve_polls"] = {
+                "n": len(polled),
+                "polls_per_request": metric_summary(polled, lambda r: len(polls(r))),
+                "first_page_poll_ms": metric_summary(polled, first_page),
+                "last_miss_poll_ms": metric_summary(polled, last_miss),
+                "outcomes": dict(sorted(outcomes.items())),
+            }
+        nav_keys = ("response_end_ms", "dom_interactive_ms",
+                    "dom_content_loaded_end_ms", "load_event_start_ms")
+        if any(isinstance((r.get("render") or {}).get("nav"), dict)
+               and key in r["render"]["nav"] for r in by[a] for key in nav_keys):
+            timeline["nav_marks_ms"] = {
+                key: metric_summary(by[a], lambda r, k=key: finite_or_none(
+                    ((r.get("render") or {}).get("nav") or {}).get(k)))
+                for key in nav_keys
+            }
+        if timeline:
+            out["arms"][a]["timeline"] = timeline
     if "exec" in by:
         v = [r.get("render_total_ms") for r in by["exec"] if r.get("render_total_ms")]
         if v:

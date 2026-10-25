@@ -14,6 +14,12 @@ of being reported as one lump:
   cdp-fast  same request path, fast teardown: the response is delivered the
             instant the image is in hand, THEN one SIGKILL to fcvm.
             (cdp -> cdp-fast isolates PART 2.)
+  html      the cdp arm's path with document.documentElement.outerHTML
+            extracted in place of the screenshot.
+  html-fast html with cdp-fast's teardown, which reads each clone child's CPU.
+  noop      the drift control: a restored clone, no page, normal teardown.
+  noop-fast noop held until fcvm publishes the clone ready, then the fast
+            teardown: the CPU of a restore without a render.
 
 WHY ONE SIGNAL IS THE CONCURRENT KILL
 -------------------------------------
@@ -101,6 +107,7 @@ import fcntl
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import platform
 import random
@@ -1666,7 +1673,30 @@ def snapshot_generation(data_root: str, snapshot_name: str) -> dict:
                 f"snapshot provenance {provenance_path} has invalid {field}"
             )
 
+    # The browser build and the Firecracker the golden ran on (reqbench.sh
+    # golden). Goldens made before the golden recorded them carry neither,
+    # and their runs record null; a present value must have its shape.
+    browser_version = provenance.get("browser_version")
+    if browser_version is not None and (
+        not isinstance(browser_version, str) or not browser_version
+    ):
+        raise RuntimeError(
+            f"snapshot provenance {provenance_path} has invalid browser_version "
+            f"{browser_version!r}"
+        )
+    firecracker = provenance.get("firecracker")
+    if firecracker is not None and not isinstance(firecracker, dict):
+        raise RuntimeError(
+            f"snapshot provenance {provenance_path} has invalid firecracker {firecracker!r}"
+        )
+    hugepages = metadata.get("hugepages", False)
+    if not isinstance(hugepages, bool):
+        raise RuntimeError(f"snapshot config {path} has non-boolean hugepages")
+
     return {
+        "browser_version": browser_version,
+        "firecracker": firecracker,
+        "hugepages": hugepages,
         "generation_id": generation_id,
         "config_sha256": config_sha256,
         "created_at": created_at,
@@ -1685,6 +1715,120 @@ def snapshot_generation(data_root: str, snapshot_name: str) -> dict:
         "dns_server": dns_server,
         "guest_dns": guest_dns,
         "guest_env": list(guest_env),
+    }
+
+
+def libc_version_tag() -> str:
+    """The tag fcvm folds into a Firecracker binary's name (src/setup/kernel.rs).
+
+    Same probe as probe_libc_version_tag: the last whitespace-separated word
+    containing a dot on any line of `ldd --version`, stdout first, stderr when
+    stdout is empty.
+    """
+    try:
+        result = subprocess.run(["ldd", "--version"], capture_output=True, text=True,
+                                timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return "libc-unknown"
+    text = result.stdout or result.stderr
+    for line in text.splitlines():
+        words = line.split()
+        if words and "." in words[-1]:
+            return f"libc-{words[-1]}"
+    return "libc-unknown"
+
+
+def firecracker_build_name(profile: str, repo: str, branch: str, commit: str,
+                           arch: str, libc_tag: str) -> str:
+    """The file name fcvm setup gives a Firecracker build of these fields.
+
+    compute_firecracker_sha_for_fields in src/setup/kernel.rs: SHA-256 over a
+    domain tag and each field length-prefixed as a little-endian u64, first
+    six bytes in hex. FirecrackerBuildNamePin holds the two to the same bytes.
+    """
+    digest = hashlib.sha256(b"fcvm-firecracker-cache-v2\0")
+    for field in (repo, branch, commit, arch, libc_tag):
+        encoded = field.encode()
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    return f"firecracker-{profile}-{digest.digest()[:6].hex()}.bin"
+
+
+def firecracker_identity(binary, config_text: str, arch: str = None,
+                         libc_tag: str = None) -> dict:
+    """Which Firecracker a golden ran on, for its provenance.
+
+    binary is the snapshot's metadata.firecracker_bin, the build restores run
+    on. config_text is rootfs-config.toml at the run's source revision; its
+    [firecracker] table pins repo, branch and commit, and fcvm setup names the
+    binary it builds from exactly those fields, so a matching name ties the
+    binary to that commit. commit_matches_binary says whether it did; a
+    binary built from anything else keeps its path and hash and no commit.
+    """
+    import tomllib
+
+    record = {"binary": binary, "sha256": None, "repo": None, "branch": None,
+              "commit": None, "commit_matches_binary": False}
+    if isinstance(binary, str) and binary:
+        try:
+            record["sha256"] = sha256_file(binary)
+        except OSError:
+            pass
+    if not config_text:
+        return record
+    pin = tomllib.loads(config_text).get("firecracker") or {}
+    repo, branch, commit = pin.get("repo"), pin.get("branch"), pin.get("commit")
+    if not all(isinstance(value, str) and value for value in (repo, branch, commit)):
+        return record
+    record.update(repo=repo, branch=branch)
+    expected = firecracker_build_name(
+        "default", repo, branch, commit,
+        arch or platform.machine(), libc_tag or libc_version_tag(),
+    )
+    if isinstance(binary, str) and os.path.basename(binary) == expected:
+        record.update(commit=commit, commit_matches_binary=True)
+    return record
+
+
+def host_facts(root: str = "/", run=subprocess.run, cpu_count=os.cpu_count) -> dict:
+    """The machine a run measured on, without its name, address or account.
+
+    instance_type is the DMI product name, which an EC2 instance reports as
+    its instance type; null on any other vendor. cpu_model is lscpu's model
+    name (arm64 /proc/cpuinfo carries only part numbers).
+    """
+    def read(path):
+        try:
+            with open(os.path.join(root, path.lstrip("/"))) as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    vendor = read("/sys/class/dmi/id/sys_vendor") or ""
+    product = read("/sys/class/dmi/id/product_name")
+    mem_total_kb = None
+    for line in (read("/proc/meminfo") or "").splitlines():
+        if line.startswith("MemTotal:"):
+            mem_total_kb = int(line.split()[1])
+    os_name = None
+    for line in (read("/etc/os-release") or "").splitlines():
+        if line.startswith("PRETTY_NAME="):
+            os_name = line.split("=", 1)[1].strip('"')
+    cpu_model = None
+    try:
+        lscpu = run(["lscpu"], capture_output=True, text=True, timeout=10)
+        for line in lscpu.stdout.splitlines():
+            if line.startswith("Model name:"):
+                cpu_model = line.split(":", 1)[1].strip()
+                break
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return {
+        "instance_type": product if vendor.startswith("Amazon EC2") else None,
+        "cpu_model": cpu_model,
+        "nproc": cpu_count(),
+        "mem_total_kb": mem_total_kb,
+        "os": os_name,
     }
 
 
@@ -2732,6 +2876,51 @@ PROBE_LOG_MARKERS = (
 
 PROBE_LOG_MAX_LINES = 200
 
+# fcvm's restore milestones in a clone's own log, each an info! line in
+# src/commands/common.rs. restore_marks() times them from the launch;
+# RestoreMarkSourcePin fails if a message or its level changes.
+RESTORE_MARKS = (
+    ("snapshot_loaded_ms", "snapshot load completed"),
+    ("disk_patched_ms", "disk patch completed"),
+    ("resumed_ms", "VM resume completed"),
+    ("lifecycle_ready_ms", "VM lifecycle ready"),
+)
+LOG_TIMESTAMP = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z)\s")
+
+
+def restore_marks(log_path: str, launch_wall: float) -> dict:
+    """When each restore milestone reached this clone's log, in ms from launch.
+
+    launch_wall is time.time() taken beside the monotonic launch stamp. Each
+    value is the first matching line's timestamp, which fcvm's formatter takes
+    when the line is written, minus the launch; null when the line is absent.
+    The log is read after the request's answer, so nothing here is timed.
+    Wall-clock time can be stepped by NTP between the two readings; the
+    figures carry that error, which on a host with a settled clock is far
+    below their 1 us resolution's significance.
+    """
+    import datetime
+
+    marks = {key: None for key, _message in RESTORE_MARKS}
+    try:
+        with open(log_path, errors="replace") as handle:
+            for line in handle:
+                pending = [(key, message) for key, message in RESTORE_MARKS
+                           if marks[key] is None and message in line]
+                if not pending:
+                    continue
+                stamp = LOG_TIMESTAMP.match(line)
+                if stamp is None:
+                    continue
+                at = datetime.datetime.fromisoformat(stamp.group(1)).timestamp()
+                for key, _message in pending:
+                    marks[key] = (at - launch_wall) * 1000.0
+                if all(value is not None for value in marks.values()):
+                    break
+    except OSError as error:
+        return {"error": f"{type(error).__name__}: {error}", **marks}
+    return marks
+
 
 def probe_batch_script(sections) -> str:
     """One shell script that runs every section and frames its output and status.
@@ -3500,10 +3689,14 @@ def discover_wd_session(args, fcvm_pid: int, deadline: float) -> str:
 def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screenshot") -> dict:
     import cdpdrive
 
-    arm_name = "html" if op == "html" else ("cdp-fast" if fast else "cdp")
-    # The clone name carries the arm: cdp and html arms share rep indices, and a
+    if op == "html":
+        arm_name = "html-fast" if fast else "html"
+    else:
+        arm_name = "cdp-fast" if fast else "cdp"
+    # The clone name carries the arm: the CDP arms share rep indices, and a
     # shared name would collide two live clones.
-    name = f"rb-{args.run_id}-{rep}-{'html' if op == 'html' else ('fast' if fast else 'norm')}"
+    suffix = {"cdp": "norm", "cdp-fast": "fast", "html": "html", "html-fast": "htmlfast"}
+    name = f"rb-{args.run_id}-{rep}-{suffix[arm_name]}"
     log = os.path.join(args.out_dir, f"{name}.log")
     rec: dict = {"arm": arm_name, "rep": rep, "name": name}
 
@@ -3515,6 +3708,7 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
     # state file's creation and then block waiting for an event already past.
     watch = DirWatch(args.state_dir)
     t_spawn = time.monotonic()
+    t_spawn_wall = time.time()
     interrupted = None
     fcvm_start_time = None
     try:
@@ -3594,6 +3788,9 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
                     # cdp rep. cdpdrive also reads it with getattr; both halves.
                     host_header="",
                     op=op,
+                    # getattr: failure-path fixtures drive this function with
+                    # bare Namespaces that predate the knob.
+                    resolve_poll_ms=getattr(args, "resolve_poll_ms", 50.0),
                     render_module=os.path.join(HERE, "render.py"),
                 )
                 result = cdpdrive.drive(drive_args)
@@ -3746,6 +3943,7 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
             raise e from interrupted
     rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
     rec["log"] = log
+    rec["restore_marks"] = restore_marks(log, t_spawn_wall)
     if interrupted is not None:
         raise interrupted
     raise_if_harness_interrupted()
@@ -3772,8 +3970,14 @@ def clone_backend_args(args) -> list:
     return ["--pid", str(args.serve_pid)]
 
 
-def run_noop_request(args, rep: int) -> dict:
+def run_noop_request(args, rep: int, fast: bool = False) -> dict:
     """DRIFT CONTROL. Clone spawn -> CDP port answers -> normal teardown. No page.
+
+    fast=True is the noop-fast arm: the same clone, held until fcvm has
+    published it ready (the restore is complete), then cdp-fast's one-SIGKILL
+    teardown, which reads each clone child's CPU. Its request_cpu_ms is what a
+    restore costs without a render. It is not the drift control; that stays
+    the noop arm.
 
     AGENTS.md defect 2 requires a probe that exercises NONE of the varied
     dimension, so wall-clock drift is measurable and removable rather than being
@@ -3786,15 +3990,16 @@ def run_noop_request(args, rep: int) -> dict:
     spawn, snapshot restore, and fcvm's own teardown — so a machine that slows
     down over the run shows up here, in a series with no arm effect in it.
     """
-    name = f"rb-{args.run_id}-{rep}-noop"
+    name = f"rb-{args.run_id}-{rep}-{'noopfast' if fast else 'noop'}"
     log = os.path.join(args.out_dir, f"{name}.log")
-    rec: dict = {"arm": "noop", "rep": rep, "name": name}
+    rec: dict = {"arm": "noop-fast" if fast else "noop", "rep": rep, "name": name}
     cmd = [args.fcvm, "snapshot", "run"] + clone_backend_args(args) + [
         "--name", name, "--no-dirty-tracking", "--no-swap",
     ]
     env = dict(os.environ, RUST_LOG=args.rust_log)
     watch = DirWatch(args.state_dir)
     t_spawn = time.monotonic()
+    t_spawn_wall = time.time()
     state_path = data_dir = None
     interrupted = None
     fcvm_start_time = None
@@ -3869,16 +4074,31 @@ def run_noop_request(args, rep: int) -> dict:
         watch.close()
     rec.setdefault("blocking_ms", (time.monotonic() - t_spawn) * 1000)
     try:
-        rec["teardown"] = teardown_normal(
-            proc,
-            fcvm_pid,
-            args.teardown_timeout,
-            args.data_root,
-            state_path,
-            data_dir,
-            verify_disk_cleanup=True,
-            expected_pid_start_time=fcvm_start_time,
-        )
+        if fast:
+            rec["teardown"] = teardown_fast(
+                fcvm_pid,
+                args.data_root,
+                state_path,
+                data_dir,
+                args.teardown_timeout,
+                verify_disk_cleanup=True,
+                expected_pid_start_time=fcvm_start_time,
+            )
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            rec["teardown"] = teardown_normal(
+                proc,
+                fcvm_pid,
+                args.teardown_timeout,
+                args.data_root,
+                state_path,
+                data_dir,
+                verify_disk_cleanup=True,
+                expected_pid_start_time=fcvm_start_time,
+            )
     except SurvivedTeardown as e:
         rec["teardown"] = e.teardown
         rec["ok"] = False
@@ -3893,6 +4113,7 @@ def run_noop_request(args, rep: int) -> dict:
         raise e from interrupted
     rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
     rec["log"] = log
+    rec["restore_marks"] = restore_marks(log, t_spawn_wall)
     if interrupted is not None:
         raise interrupted
     raise_if_harness_interrupted()
@@ -4272,8 +4493,10 @@ def dispatch_request(args, rep: int, arm: str, is_warmup: bool, probe=None) -> d
         return run_exec_request(args, rep)
     if arm == "noop":
         return run_noop_request(args, rep)
-    if arm == "html":
-        return run_cdp_request(args, rep, fast=False, probe=probe, op="html")
+    if arm == "noop-fast":
+        return run_noop_request(args, rep, fast=True)
+    if arm in ("html", "html-fast"):
+        return run_cdp_request(args, rep, fast=(arm == "html-fast"), probe=probe, op="html")
     return run_cdp_request(args, rep, fast=(arm == "cdp-fast"), probe=probe)
 
 
@@ -4285,7 +4508,7 @@ def dispatch_request(args, rep: int, arm: str, is_warmup: bool, probe=None) -> d
 # while the analyzer already classified html as CDP-class, so a legitimate
 # `--arms noop,html` publication run was refused with "requires at least one
 # CDP arm" (observed 2026-08-15, corpus campaign).
-CDP_CLASS_ARMS = frozenset({"cdp", "cdp-fast", "html"})
+CDP_CLASS_ARMS = frozenset({"cdp", "cdp-fast", "html", "html-fast"})
 
 
 def allowed_arms_for_engine(engine: str) -> frozenset:
@@ -4297,8 +4520,8 @@ def allowed_arms_for_engine(engine: str) -> frozenset:
     DOM-extraction op; the request would silently return screenshot records the
     analyzer then rejects for missing extract_ms/html_bytes/html_sha256)."""
     if engine == "webkit":
-        return frozenset({"cdp", "cdp-fast", "noop"})
-    return frozenset({"exec", "cdp", "cdp-fast", "html", "noop"})
+        return frozenset({"cdp", "cdp-fast", "noop", "noop-fast"})
+    return frozenset({"exec", "cdp", "cdp-fast", "html", "html-fast", "noop", "noop-fast"})
 
 
 def publication_arms_ok(arms) -> bool:
@@ -4371,6 +4594,9 @@ def main_with_resources(resources: ExitStack) -> int:
     p.add_argument("--timeout", type=float, default=120.0)
     p.add_argument("--teardown-timeout", type=float, default=60.0)
     p.add_argument("--rust-log", default="fcvm=debug")
+    p.add_argument("--resolve-poll-ms", type=float, default=50.0,
+                   help="sleep between the CDP arms' /json/list polls for the page "
+                        "target (cdpdrive's 50 ms by default); recorded in meta")
     p.add_argument("--run-id", default="",
                    help="32-hex invocation identity (generated when omitted)")
     args = p.parse_args()
@@ -4492,7 +4718,7 @@ def main_with_resources(resources: ExitStack) -> int:
     if not publication_arms_ok(arms):
         p.error(
             "publication runs require noop and at least one CDP arm "
-            "(cdp, cdp-fast, or html)"
+            "(cdp, cdp-fast, html, or html-fast)"
         )
 
     urls = parse_urls(args.url)
@@ -4510,6 +4736,8 @@ def main_with_resources(resources: ExitStack) -> int:
         )
     if args.serve_pid and not args.serve_log:
         p.error("--serve-log is required with --serve-pid")
+    if not (math.isfinite(args.resolve_poll_ms) and 1.0 <= args.resolve_poll_ms <= 1000.0):
+        p.error("--resolve-poll-ms must be between 1 and 1000")
     args.urls = urls
 
     args.run_id = args.run_id or uuid.uuid4().hex
@@ -4595,6 +4823,16 @@ def main_with_resources(resources: ExitStack) -> int:
             "quiet_vm_processes": quiet_guard_vm_processes,
             "quiet_loadavg1_limit": quiet_loadavg1_limit,
             **host_identity(),
+            "host": host_facts(),
+            # The memory server's own ready record says whether it records
+            # and replays the working set; null for a file-backed restore.
+            "uffd_prefetch": (
+                ("on" if serve.prefetch else "off") if serve is not None else None
+            ),
+            "resolve_poll_ms": args.resolve_poll_ms,
+            "browser_version": snapshot["browser_version"],
+            "firecracker": snapshot["firecracker"],
+            "hugepages": snapshot["hugepages"],
             "loadavg": read_trimmed("/proc/loadavg").split()[:3],
             "started": time.time(),
         }

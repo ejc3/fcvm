@@ -33,12 +33,44 @@ make bench-chromium-request-run BACKEND=file REPS=200 RESULTS=/mnt/fcvm-btrfs/re
 
 Knobs pass as make command-line variables (make exports them to the recipe
 environment): `TAG=`, `HUGEPAGES=1`, `NETMODE=`, `UFFD_MODE=`,
-`UFFD_PREFETCH=`, `REPS=`, `WARMUP=`, `ARMS=`, `RESULTS=`, and for the diag
+`UFFD_PREFETCH=`, `REPS=`, `WARMUP=`, `ARMS=`, `RESOLVE_POLL_MS=`, `RESULTS=`, and for the diag
 `DIAG_URLS=`, `DIAG_REPS=`, `DIAG_EXPECT_IPS=`, `DIAG_MAX_LOAD_MS=`. Hugepage goldens
 are part of the snapshot identity — give them their own tag
 (`make bench-chromium-request-golden TAG=cb-req-golden-huge HUGEPAGES=1`;
 the same `TAG=` must then be passed to `-verify` and `-run`, or they select
 the default snapshot).
+
+`ARMS=` takes `cdp`, `cdp-fast`, `html`, `html-fast`, `noop`, `noop-fast`
+and `exec`. `html` is the `cdp` path with `document.documentElement.outerHTML`
+extracted in place of the screenshot; `html-fast` is `html` with `cdp-fast`'s
+teardown, so `analysis.json` carries `request_cpu_ms` for it as it does for
+`cdp-fast`. `noop-fast` restores a clone, holds it until fcvm publishes it
+ready, renders nothing and tears it down fast: its `request_cpu_ms` is the CPU
+of a restore. The drift control stays `noop`.
+`make bench-chromium-corpus-extra PHASES=hostcdp HOSTCDP_ARMS=free,cpu2,cpu4,cpu8`
+runs the host control once with the whole box and once capped at each
+ladder rung's vCPU count (`cpuN`, `CPU_BUDGET=vm-matched`); the default is
+`free,cpu2`.
+`RESOLVE_POLL_MS=` (run only, default 50) is the sleep between the CDP arms'
+`/json/list` polls for the page target; the run's meta records it as
+`resolve_poll_ms`, and runs with different values are separate cells.
+
+Each run's meta line records what the page once had to say no record held:
+`host` (DMI instance type on EC2, lscpu model name, vCPU count, memory, OS;
+no host name, address or account), `uffd_prefetch` (from the memory server's
+own ready record; null for a file-backed restore), `hugepages`, and from the
+golden's provenance `browser_version` (the image's own `chromium --version`,
+or `WebKitWebDriver --version`) and `firecracker` (the snapshot's binary, its
+sha256, and the repo, branch and commit pinned in `rootfs-config.toml` at the
+source revision, with `commit` set only when the binary's name is the one
+`fcvm setup` gives a build of that commit). The analyzer copies them into the
+cell. Each CDP and noop record carries `restore_marks`, when fcvm's
+`snapshot load completed`, `disk patch completed`, `VM resume completed` and
+`VM lifecycle ready` lines reached the clone's log, in ms from the launch; each
+render carries `resolve_polls` (each poll's time and outcome) and `nav` gains
+`response_end_ms`, `dom_interactive_ms`, `dom_content_loaded_end_ms` and
+`load_event_start_ms`. `analysis.json` summarises them per arm under
+`timeline`. `test_run_facts.py` pins every one of these.
 
 `GUEST_ENV=` (golden only) bakes extra container environment into the
 snapshot: comma-separated `KEY=VALUE` entries, one `fcvm podman prepare
