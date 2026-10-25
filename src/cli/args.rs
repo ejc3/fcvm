@@ -294,26 +294,23 @@ pub struct FleetCoordArgs {
     #[arg(long, env = "FLEET_NAME", default_value = "stage")]
     pub fleet_name: String,
 
-    /// The DNS zone tiles and slots are named in (`ec2-<n>.<zone>`, `slot-<n>.<zone>`)
+    /// The fleet's DNS zone: the certificate's (`*.<zone>`), the EC2 tiles' health name
+    /// (`ec2-<n>.<zone>`), and the parent of --dns-subzone
     #[arg(long, default_value = "fcvm.dev")]
     pub dns_zone: String,
 
-    /// Write the slots' DNS records with the Cloudflare token in this Secrets Manager secret
+    /// The Cloudflare token for --dns-zone, in this Secrets Manager secret: the certificate
+    /// renewal writes its DNS-01 records with it
     #[arg(long)]
     pub dns_token_secret: Option<String>,
 
     /// The zone's Cloudflare id (default: looked up by name)
     #[arg(long)]
     pub dns_zone_id: Option<String>,
-    /// The zone's authoritative nameservers (comma separated). A launch's names are
-    /// published to viewers only once every one of them answers with the new records.
-    #[arg(long, value_delimiter = ',')]
-    pub dns_nameservers: Vec<String>,
-
-    /// Serve the launch names from this subzone of --dns-zone as its authoritative DNS
-    /// server (`<label>.<subzone>`) instead of writing them through the Cloudflare API: a
-    /// name answers from the moment it is published. The parent zone delegates the subzone
-    /// with NS records and no DS record.
+    /// Name launches in this subzone of --dns-zone (`<label>.<subzone>`) and serve it as
+    /// its authoritative DNS server: a name answers from the moment it is published. The
+    /// parent zone delegates the subzone with NS records and no DS record. Without it,
+    /// launches are not named and tiles show the URLs their agents report.
     #[arg(long, requires_all = ["dns_subzone_ns", "dns_listen"])]
     pub dns_subzone: Option<String>,
 

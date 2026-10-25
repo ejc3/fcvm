@@ -308,9 +308,9 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   agent reported: `stopping`, `restoring`, `starting`, `running`, `failed`.
 - `frame_url` is the renderer's frame WebSocket as the browser should open it (append
   `?h=<height>`), over IPv6; `frame_url_v4` the same renderer over IPv4. Both are null while
-  borrowed. With `--dns-token-secret` both are the launch's own names (see "Running it"),
-  null until those names answer at the zone's authoritative servers, and a relaunch gives
-  new ones; without it `frame_url` is what the agent reported and `frame_url_v4` is null.
+  borrowed. With `--dns-subzone` both are the launch's own names (see "Running it"),
+  published with the launch's address, and a relaunch gives new ones; without it
+  `frame_url` is what the agent reported and `frame_url_v4` is null.
   A viewer uses one family for every tile of both halves. After a relaunch the tile
   reconnects when `phase` is `running` again and its URLs are set.
 - `last_relaunch.first_frame_at - clicked_at` is the tile's relaunch time; `phases` are
@@ -419,7 +419,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--state-bucket <bucket> [--state-key state.json] [--state-region <region>]]
                  [--ec2 aws --ec2-tiles 8 --ec2-regions <r1,r2,...> [--ec2-template fcvm-fleet-tile-x86_64]
                   [--ec2-on-demand-template <name>] [--fleet-name stage]] [--dns-zone fcvm.dev]
-                 [--dns-token-secret <secret> [--dns-zone-id <id>] [--dns-nameservers <ns>,...]]
+                 [--dns-token-secret <secret> [--dns-zone-id <id>]]
                  [--dns-subzone <subzone> --dns-subzone-ns <ns>,... --dns-listen <addr:port> [--dns-rate-limit 200]]
                  [--tls-secret <secret>] [--secrets-region <region>]
 ```
@@ -447,22 +447,15 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   stops, it terminates every instance tagged `Purpose=fcvm-fleet-tile` and
   `Fleet=<--fleet-name>` in `--ec2-regions`; another fleet's tiles in the same account (a
   different `--fleet-name`) are left alone.
-- `--dns-token-secret` names each launch in `--dns-zone` with the zone's Cloudflare token.
-  Every launch of an fcvm slot or EC2 tile that reports an address gets a label never used
-  before, `slot-<n>-<token>` / `ec2-<n>-<token>` (8 random base32 characters), and under it
-  `<label>.<zone>` AAAA (the slot's own IPv6 address) and `<label>-v4.<zone>` A (the host's
-  or the tile's public IPv4 address), both unproxied with TTL 60. The coordinator writes the
-  records, confirms them at every server in `--dns-nameservers` (asked directly, without
-  recursion), and only then sets the tile's `frame_url` and `frame_url_v4`. A name is never
-  asked for before it exists and never changes address, so no resolver holds a negative or
-  stale answer for it. A launch's records stay until its slot has a newer published launch
-  or leaves the fleet; names of the fleet's shape (`slot-<n>`, `ec2-<n>`, with or without a
-  token, with or without `-v4`) that nothing references are deleted, at start too; every
-  other name in the zone is left alone.
+- `--dns-token-secret` is the zone's Cloudflare token, which the certificate renewal writes
+  its DNS-01 records with (see "Certificate").
 - `--dns-subzone` makes the coordinator the authoritative DNS server of a subzone of
   `--dns-zone` (the parent delegates it with NS records naming `--dns-subzone-ns`, and no DS
-  record) and names launches there instead: `<label>.<subzone>` AAAA and
-  `<label>-v4.<subzone>` A, TTL 60. Minting a launch's label and publishing its names are
+  record) and names launches there. Every launch of an fcvm slot or EC2 tile that reports
+  an address gets a label never used before, `slot-<n>-<token>` / `ec2-<n>-<token>` (8
+  random base32 characters), and under it `<label>.<subzone>` AAAA (the slot's own IPv6
+  address) and `<label>-v4.<subzone>` A (the host's or the tile's public IPv4 address), TTL
+  60. A launch's names answer until its slot has a newer launch or leaves the fleet. Minting a launch's label and publishing its names are
   one step of the coordinator's state, and the server answers from that state, so a name
   answers from the moment a viewer can learn it, with no wait. It listens on
   `--dns-listen`, UDP and TCP (a high port; a load balancer maps 53), and answers only for
@@ -471,8 +464,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   with the SOA; REFUSED for any other name; AA set, no recursion, EDNS(0), TC over UDP when
   the client's buffer is too small. Over UDP, past `--dns-rate-limit` responses a second
   per source /24 or /56, every second response goes out truncated and the rest are
-  dropped. With `--dns-token-secret` it deletes, once at start, the launch names earlier
-  written to the parent zone.
+  dropped.
 - `--tls-secret` keeps the wildcard certificate renewed (see "Certificate").
 
 ### Certificate
@@ -805,7 +797,7 @@ primary interface, `Ipv6PrefixCount = 1`) runs each slot's VM in fcvm's routed m
 `<prefix>::<GPU index + 2>` (`--network routed --ipv6-prefix <prefix> --ipv6-address
 <addr>`; fcvm refuses the prefix's addresses 0 and 1). The slot keeps the address across
 relaunches and reports it as `ipv6` in every slot message; the coordinator names it in DNS
-(see the coordinator's `--dns-token-secret`). The renderer's container shares the VM's
+(see the coordinator's `--dns-subzone`). The renderer's container shares the VM's
 network, so a browser reaches its TLS port at that address. `--frame-zone` reports the frame
 URL as `wss://<slot id>.<zone>/frames`.
 

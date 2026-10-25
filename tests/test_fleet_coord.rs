@@ -32,7 +32,7 @@ struct Opts {
     /// The EC2 aggregator as the coordinator reaches it.
     ec2_local: Option<String>,
     site_key: Option<String>,
-    /// How launches are named: tiles' and claims' frame URLs are then the published names.
+    /// The launch names' subzone: tiles' and claims' frame URLs are then the published names.
     dns: Option<fcvm::fleet::coord::Names>,
 }
 
@@ -730,24 +730,9 @@ async fn browser_intents_reach_the_agent_as_assignments() {
 /// tile's: the agent's own URL names a host that has no record.
 #[tokio::test]
 async fn a_claims_frame_urls_are_its_launchs_published_names() {
-    use fcvm::fleet::coord::dns::Cloudflare;
-    let cf = FakeCf::default();
-    let base = fake_cloudflare(cf.clone()).await;
-    let gate = GateConfirm {
-        open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        cf: cf.clone(),
-        asked_before_written: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    };
-    let writer = Cloudflare::with_endpoint(
-        "dns-token-for-tests".into(),
-        "fcvm.example".into(),
-        Some("zone-for-tests".into()),
-        &base,
-    )
-    .unwrap()
-    .with_confirm(Arc::new(gate));
+    let (names, zone) = subzone_names();
     let c = coordinator_with(Opts {
-        dns: Some(fcvm::fleet::coord::Names::Cloudflare(writer)),
+        dns: Some(names),
         ..Opts::default()
     })
     .await;
@@ -784,22 +769,18 @@ async fn a_claims_frame_urls_are_its_launchs_published_names() {
         .and_then(|u| u.strip_suffix("/frames"))
         .unwrap();
     assert!(
-        host.starts_with("slot-1-") && host.ends_with(".fcvm.example"),
+        host.starts_with("slot-1-") && host.ends_with(".tiles.fcvm.example"),
         "{claim}"
     );
     assert!(
-        cf.records
-            .lock()
-            .unwrap()
-            .values()
-            .any(|r| r["name"] == host),
+        zone.borrow().aaaa.contains_key(host),
         "the claim's URL names no record: {claim}"
     );
     assert_eq!(
         claim["frame_url_v4"],
         format!(
-            "wss://{}-v4.fcvm.example:20200/frames",
-            host.strip_suffix(".fcvm.example").unwrap()
+            "wss://{}-v4.tiles.fcvm.example:20200/frames",
+            host.strip_suffix(".tiles.fcvm.example").unwrap()
         )
     );
 }
@@ -2793,386 +2774,6 @@ async fn the_aws_tile_driver_launches_waits_and_terminates() {
     }
 }
 
-/// A fake Cloudflare DNS API for one zone: records by id, and every write recorded.
-#[derive(Clone, Default)]
-struct FakeCf {
-    records: Arc<std::sync::Mutex<BTreeMap<String, Value>>>,
-    writes: Arc<std::sync::Mutex<Vec<String>>>,
-    next: Arc<std::sync::atomic::AtomicU64>,
-}
-
-async fn fake_cloudflare(cf: FakeCf) -> String {
-    use axum::extract::{Path, State as St};
-    use axum::routing::{get, put};
-    let app = axum::Router::new()
-        .route(
-            "/zones/{zid}/dns_records",
-            get(
-                |St(cf): St<FakeCf>, headers: axum::http::HeaderMap| async move {
-                    assert_eq!(headers["authorization"], "Bearer dns-token-for-tests");
-                    let all: Vec<Value> = cf.records.lock().unwrap().values().cloned().collect();
-                    axum::Json(
-                        json!({"success": true, "result": all, "result_info": {"total_pages": 1}}),
-                    )
-                },
-            )
-            .post(
-                |St(cf): St<FakeCf>, axum::Json(mut r): axum::Json<Value>| async move {
-                    let id = format!(
-                        "r{}",
-                        cf.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                    );
-                    r["id"] = json!(id);
-                    cf.writes.lock().unwrap().push(format!(
-                        "create {} {} {}",
-                        r["type"], r["name"], r["content"]
-                    ));
-                    cf.records.lock().unwrap().insert(id.clone(), r.clone());
-                    axum::Json(json!({"success": true, "result": r}))
-                },
-            ),
-        )
-        .route(
-            "/zones/{zid}/dns_records/{id}",
-            put(
-                |St(cf): St<FakeCf>,
-                 Path((_z, id)): Path<(String, String)>,
-                 axum::Json(mut r): axum::Json<Value>| async move {
-                    r["id"] = json!(id);
-                    cf.writes
-                        .lock()
-                        .unwrap()
-                        .push(format!("update {} {}", r["name"], r["content"]));
-                    cf.records.lock().unwrap().insert(id, r.clone());
-                    axum::Json(json!({"success": true, "result": r}))
-                },
-            )
-            .delete(
-                |St(cf): St<FakeCf>, Path((_z, id)): Path<(String, String)>| async move {
-                    let r = cf.records.lock().unwrap().remove(&id).unwrap();
-                    cf.writes
-                        .lock()
-                        .unwrap()
-                        .push(format!("delete {}", r["name"]));
-                    axum::Json(json!({"success": true, "result": {"id": id}}))
-                },
-            ),
-        )
-        .with_state(cf);
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", l.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
-    base
-}
-
-/// A confirmation the test opens: until it does, every launch's names count as not yet
-/// answering at the authoritative servers. It also checks, when asked, that the records it
-/// is asked about are already in the zone: confirmation comes after the write.
-#[derive(Clone)]
-struct GateConfirm {
-    open: Arc<std::sync::atomic::AtomicBool>,
-    cf: FakeCf,
-    asked_before_written: Arc<std::sync::atomic::AtomicBool>,
-}
-
-#[async_trait::async_trait]
-impl fcvm::fleet::coord::dns::Confirm for GateConfirm {
-    async fn confirmed(&self, records: &[fcvm::fleet::coord::dns::Record]) -> bool {
-        let zone = self.cf.records.lock().unwrap().clone();
-        for r in records {
-            if !zone
-                .values()
-                .any(|z| z["name"] == r.name.as_str() && z["content"] == r.content.as_str())
-            {
-                self.asked_before_written
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        self.open.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-struct DnsFixture {
-    cf: FakeCf,
-    gate: GateConfirm,
-    handle: Handle,
-    agent: FakeAgent,
-}
-
-async fn dns_fixture(pre: &[(&str, &str, &str)]) -> DnsFixture {
-    use fcvm::fleet::coord::dns::Cloudflare;
-    let cf = FakeCf::default();
-    for (i, (kind, name, content)) in pre.iter().enumerate() {
-        cf.records.lock().unwrap().insert(
-            format!("pre{i}"),
-            json!({"id": format!("pre{i}"), "type": kind, "name": name, "content": content, "proxied": false}),
-        );
-    }
-    let base = fake_cloudflare(cf.clone()).await;
-    let gate = GateConfirm {
-        open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        cf: cf.clone(),
-        asked_before_written: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    };
-    let writer = Cloudflare::with_endpoint(
-        "dns-token-for-tests".into(),
-        "fcvm.example".into(),
-        Some("zone-for-tests".into()),
-        &base,
-    )
-    .unwrap()
-    .with_confirm(Arc::new(gate.clone()));
-    let (handle, _actor) = start(
-        State::new(Config::default(), now_ms()),
-        None,
-        None,
-        None,
-        None,
-        Some(fcvm::fleet::coord::Names::Cloudflare(writer)),
-    );
-    let mut agent = FakeAgent::connect(&handle, "gpu-a", 1);
-    agent.assign().await;
-    DnsFixture {
-        cf,
-        gate,
-        handle,
-        agent,
-    }
-}
-
-impl DnsFixture {
-    fn report(&self, phase: &str, generation: u64, v6: Option<&str>, v4: Option<&str>) {
-        self.agent
-            .to_coord
-            .send(AgentMsg::Slot(SlotReport {
-                id: "slot-1".into(),
-                phase: phase.into(),
-                generation,
-                ipv6: v6.map(str::to_string),
-                ipv4: v4.map(str::to_string),
-                v4_port: v4.map(|_| 20200),
-                ..Default::default()
-            }))
-            .unwrap();
-    }
-
-    fn tile(&self) -> Value {
-        serde_json::from_str::<Value>(&self.handle.snapshot.borrow().text).unwrap()["state"]
-            ["tiles"][0]
-            .clone()
-    }
-
-    /// The zone's records as (type, name, content), sorted.
-    fn zone(&self) -> Vec<(String, String, String)> {
-        let mut v: Vec<_> = self
-            .cf
-            .records
-            .lock()
-            .unwrap()
-            .values()
-            .map(|r| {
-                (
-                    r["type"].as_str().unwrap().to_string(),
-                    r["name"].as_str().unwrap().to_string(),
-                    r["content"].as_str().unwrap().to_string(),
-                )
-            })
-            .collect();
-        v.sort();
-        v
-    }
-
-    /// The label of the zone's AAAA record for `v6`, once there is one.
-    async fn label_for(&self, v6: &str) -> String {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some((_, name, _)) = self
-                .zone()
-                .into_iter()
-                .find(|(k, _, c)| k == "AAAA" && c == v6)
-            {
-                return name.strip_suffix(".fcvm.example").unwrap().to_string();
-            }
-            assert!(std::time::Instant::now() < deadline, "{:?}", self.zone());
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
-    async fn wait_until(&self, what: &str, f: impl Fn(&Self) -> bool) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !f(self) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{what}: zone {:?}, tile {}",
-                self.zone(),
-                self.tile()
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
-    fn open(&self, open: bool) {
-        self.gate
-            .open
-            .store(open, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-/// A launch gets a label never used before; its records are written (AAAA for the slot's own
-/// address, A for the host's IPv4, both unproxied with TTL 60), confirmed at the zone's
-/// authoritative servers, and only then do its frame URLs reach the page. The start-up sweep
-/// removes names of the fleet's shape that nothing references and leaves every other name.
-#[tokio::test]
-async fn a_launch_is_published_only_after_its_names_answer() {
-    let fx = dns_fixture(&[
-        ("CNAME", "stage.fcvm.example", "worker.example"),
-        ("AAAA", "fleet-api-stage.fcvm.example", "2001:db8::99"),
-        ("AAAA", "dnstest-1.fcvm.example", "2001:db8::98"),
-        ("AAAA", "slot-9.fcvm.example", "2001:db8::97"),
-        ("A", "slot-9-v4.fcvm.example", "192.0.2.97"),
-        ("AAAA", "slot-7-abcdefgh.fcvm.example", "2001:db8::96"),
-    ])
-    .await;
-    fx.report("running", 1, Some("2001:db8::1"), Some("192.0.2.10"));
-    let label = fx.label_for("2001:db8::1").await;
-    assert!(
-        label.starts_with("slot-1-") && label.len() == "slot-1-".len() + 8,
-        "{label}"
-    );
-    fx.wait_until("the A record", |fx| {
-        fx.zone().contains(&(
-            "A".into(),
-            format!("{label}-v4.fcvm.example"),
-            "192.0.2.10".into(),
-        ))
-    })
-    .await;
-    // Written, not yet answering: the page gets nothing.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(fx.tile()["phase"], "running");
-    assert!(fx.tile()["frame_url"].is_null(), "{}", fx.tile());
-    assert!(fx.tile()["frame_url_v4"].is_null(), "{}", fx.tile());
-    fx.open(true);
-    fx.wait_until("the published URLs", |fx| !fx.tile()["frame_url"].is_null())
-        .await;
-    assert_eq!(
-        fx.tile()["frame_url"],
-        format!("wss://{label}.fcvm.example/frames")
-    );
-    assert_eq!(
-        fx.tile()["frame_url_v4"],
-        format!("wss://{label}-v4.fcvm.example:20200/frames")
-    );
-    assert!(
-        !fx.gate
-            .asked_before_written
-            .load(std::sync::atomic::Ordering::SeqCst),
-        "a launch was confirmed before its records were written"
-    );
-    // No fleet record is proxied, and each has TTL 60.
-    for r in fx.cf.records.lock().unwrap().values() {
-        if r["name"].as_str().unwrap().starts_with("slot-") {
-            assert_eq!(
-                (r["proxied"].clone(), r["ttl"].clone()),
-                (json!(false), json!(60)),
-                "{r}"
-            );
-        }
-    }
-    // The sweep: the fleet's unreferenced names are gone, every other name stays.
-    let names: Vec<String> = fx.zone().into_iter().map(|(_, n, _)| n).collect();
-    for keep in [
-        "stage.fcvm.example",
-        "fleet-api-stage.fcvm.example",
-        "dnstest-1.fcvm.example",
-    ] {
-        assert!(names.contains(&keep.to_string()), "{keep}: {names:?}");
-    }
-    for gone in [
-        "slot-9.fcvm.example",
-        "slot-9-v4.fcvm.example",
-        "slot-7-abcdefgh.fcvm.example",
-    ] {
-        assert!(!names.contains(&gone.to_string()), "{gone}: {names:?}");
-    }
-}
-
-/// A slot that reports another address at the same generation shows no URL until that
-/// address has its own published names: its old names point at an address it left.
-#[tokio::test]
-async fn a_new_address_at_the_same_generation_hides_the_old_urls() {
-    let fx = dns_fixture(&[]).await;
-    fx.open(true);
-    fx.report("running", 1, Some("2001:db8::1"), Some("192.0.2.10"));
-    let first = fx.label_for("2001:db8::1").await;
-    fx.wait_until("published", |fx| !fx.tile()["frame_url"].is_null())
-        .await;
-    fx.open(false);
-    fx.report("running", 1, Some("2001:db8::5"), Some("192.0.2.10"));
-    let second = fx.label_for("2001:db8::5").await;
-    assert_ne!(first, second);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        fx.tile()["frame_url"].is_null() && fx.tile()["frame_url_v4"].is_null(),
-        "the old names were shown for a new address: {}",
-        fx.tile()
-    );
-    fx.open(true);
-    fx.wait_until("the new address published", |fx| {
-        fx.tile()["frame_url"] == format!("wss://{second}.fcvm.example/frames")
-    })
-    .await;
-}
-
-/// Every launch gets new names. A relaunch keeps the earlier launch's records while the new
-/// launch is written and confirmed (the page shows no URL for the new launch until then),
-/// and removes them only once the new names are published and nothing references the old.
-#[tokio::test]
-async fn each_launch_gets_new_names_and_old_ones_go_once_unreferenced() {
-    let fx = dns_fixture(&[]).await;
-    fx.open(true);
-    fx.report("running", 1, Some("2001:db8::1"), Some("192.0.2.10"));
-    let first = fx.label_for("2001:db8::1").await;
-    fx.wait_until("the first launch published", |fx| {
-        !fx.tile()["frame_url"].is_null()
-    })
-    .await;
-    // The relaunch: no address yet, then the new launch's addresses, confirmation held.
-    fx.open(false);
-    fx.report("starting", 2, None, None);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        fx.zone().iter().any(|(_, n, _)| n.starts_with(&first)),
-        "{:?}",
-        fx.zone()
-    );
-    assert!(fx.tile()["frame_url"].is_null(), "{}", fx.tile());
-    fx.report("running", 2, Some("2001:db8::2"), Some("192.0.2.11"));
-    let second = fx.label_for("2001:db8::2").await;
-    assert_ne!(first, second);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        fx.zone().iter().any(|(_, n, _)| n.starts_with(&first)),
-        "the first launch's names went before the second's were published: {:?}",
-        fx.zone()
-    );
-    assert!(fx.tile()["frame_url"].is_null(), "{}", fx.tile());
-    fx.open(true);
-    fx.wait_until("the second launch published", |fx| {
-        fx.tile()["frame_url"] == format!("wss://{second}.fcvm.example/frames")
-    })
-    .await;
-    fx.wait_until("the first launch's names removed", |fx| {
-        !fx.zone().iter().any(|(_, n, _)| n.starts_with(&first))
-    })
-    .await;
-    let w = fx.cf.writes.lock().unwrap().clone();
-    assert!(
-        !w.iter().any(|x| x.starts_with("update")),
-        "a name changed address in place: {w:?}"
-    );
-}
-
 /// A DNS query for `name` and `qtype` to `server` over UDP (or TCP): the rcode, whether AA
 /// is set, and the addresses of the answer.
 async fn ask_dns(
@@ -3229,15 +2830,12 @@ async fn ask_dns(
     (m[3] & 0xF, m[2] & 0x04 != 0, out)
 }
 
-/// A coordinator serving the launch names' subzone, its DNS server's address, the zone it
-/// answers from, and an agent with one slot.
-async fn subzone_fixture() -> (
-    Handle,
-    std::net::SocketAddr,
+/// Launch names in `tiles.fcvm.example`, and the zone the actor will publish.
+fn subzone_names() -> (
+    fcvm::fleet::coord::Names,
     tokio::sync::watch::Receiver<Arc<fcvm::fleet::coord::authority::Zone>>,
-    FakeAgent,
 ) {
-    use fcvm::fleet::coord::authority::{Authority, Zone, ZoneConfig};
+    use fcvm::fleet::coord::authority::{Zone, ZoneConfig};
     let cfg = Arc::new(
         ZoneConfig::new(
             "tiles.fcvm.example",
@@ -3246,9 +2844,22 @@ async fn subzone_fixture() -> (
         )
         .unwrap(),
     );
-    let (tx, rx) = tokio::sync::watch::channel(Arc::new(Zone::default()));
+    let (zone, rx) = tokio::sync::watch::channel(Arc::new(Zone::default()));
+    (fcvm::fleet::coord::Names { cfg, zone }, rx)
+}
+
+/// A coordinator serving the launch names' subzone, its DNS server's address, the zone it
+/// answers from, and an agent with one slot.
+async fn subzone_fixture() -> (
+    Handle,
+    std::net::SocketAddr,
+    tokio::sync::watch::Receiver<Arc<fcvm::fleet::coord::authority::Zone>>,
+    FakeAgent,
+) {
+    use fcvm::fleet::coord::authority::Authority;
+    let (names, rx) = subzone_names();
     let server = Authority {
-        cfg: cfg.clone(),
+        cfg: names.cfg.clone(),
         zone: rx.clone(),
     }
     .serve("127.0.0.1:0".parse().unwrap(), 1000)
@@ -3260,7 +2871,7 @@ async fn subzone_fixture() -> (
         None,
         None,
         None,
-        Some(fcvm::fleet::coord::Names::Subzone(cfg, tx)),
+        Some(names),
     );
     let mut agent = FakeAgent::connect(&handle, "gpu-a", 1);
     agent.assign().await;
@@ -3351,6 +2962,26 @@ async fn a_minted_name_answers_at_once_and_a_replaced_one_does_not() {
     assert_eq!(
         ask_dns(server, "slot-1.fcvm.example", 28, false).await,
         (5, false, vec![])
+    );
+}
+
+/// A slot that reports another address at the same generation gets new names at once; its
+/// old names pointed at an address it left, and stop answering.
+#[tokio::test]
+async fn a_new_address_at_the_same_generation_gets_new_names() {
+    let (handle, server, zone, agent) = subzone_fixture().await;
+    report_slot(&agent, 1, Some("2001:db8::1"), Some("192.0.2.10"));
+    let (first, _, _) = published_urls(&handle, &zone, None).await;
+    report_slot(&agent, 1, Some("2001:db8::5"), Some("192.0.2.10"));
+    let (second, _, _) = published_urls(&handle, &zone, Some(&first)).await;
+    assert_ne!(host_of(&first), host_of(&second));
+    assert_eq!(
+        ask_dns(server, &host_of(&second), 28, false).await,
+        (0, true, vec!["2001:db8::5".to_string()])
+    );
+    assert_eq!(
+        ask_dns(server, &host_of(&first), 28, false).await,
+        (3, true, vec![])
     );
 }
 
