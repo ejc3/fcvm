@@ -1541,6 +1541,120 @@ async fn a_retired_tile_task_whose_instance_fails_reports_nothing_on_the_replace
     assert!(!reports.iter().any(|r| r.phase == "failed"), "{reports:#?}");
 }
 
+/// A tile whose renderer restarts on the same instance (its service has `Restart=always`)
+/// comes back answering `/health` without its scene. Its `boot_id` changes, and the
+/// coordinator posts the scene and the budget to it again.
+struct RestartingRendererEc2 {
+    boot: Arc<std::sync::Mutex<String>>,
+    scenes: Arc<std::sync::Mutex<Vec<String>>>,
+    budgets: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ec2::Ec2Driver for RestartingRendererEc2 {
+    async fn launch(&self, _tile: &str) -> Result<ec2::Launched, ec2::LaunchError> {
+        Ok(ec2::Launched {
+            instance: "i-test-0".into(),
+            frame_url: None,
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        Ok(l.clone())
+    }
+    async fn terminate(&self, _instance: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _tile: &str,
+        l: &ec2::Launched,
+        _body: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
+        self.scenes.lock().unwrap().push(l.instance.clone());
+        Ok(())
+    }
+    async fn post_budget(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        self.budgets
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    async fn health(&self, _tile: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        Ok(json!({"ready": true, "fps": 30.0, "boot_id": *self.boot.lock().unwrap()}))
+    }
+}
+
+#[tokio::test]
+async fn an_ec2_renderer_restarted_on_its_instance_gets_its_scene_again() {
+    use fleet_core::protocol::{AssignSlot, BudgetBody, SharedScene};
+    let boot = Arc::new(std::sync::Mutex::new("boot-1".to_string()));
+    let scenes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let budgets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let driver: Arc<dyn ec2::Ec2Driver> = Arc::new(RestartingRendererEc2 {
+        boot: boot.clone(),
+        scenes: scenes.clone(),
+        budgets: budgets.clone(),
+    });
+    let (handle, _reports) = recording_handle();
+    let tile = AssignSlot {
+        id: "ec2-1".into(),
+        sbdf: String::new(),
+        generation: 1,
+        rect: Some(fleet_core::tiling::Rect {
+            x: 0.5,
+            y: 0.0,
+            w: 0.25,
+            h: 1.0,
+        }),
+        private_camera: None,
+        layout_generation: 0,
+        rect_from_frame: 0,
+        previous_rect: None,
+        standby: false,
+        warm: false,
+    };
+    let (_assign, assign) = tokio::sync::watch::channel(vec![tile]);
+    let (_scene, scene) = tokio::sync::watch::channel(Some(SharedScene::new(
+        &fleet_core::scene::Scene::new(1_000),
+        32.0 / 9.0,
+    )));
+    let (_budget, budget) = tokio::sync::watch::channel(Some(BudgetBody {
+        budget: 500_000,
+        t: 1.0,
+    }));
+    tokio::spawn(ec2::run(driver, assign, scene, budget, handle));
+    let count = |s: &Arc<std::sync::Mutex<Vec<String>>>| s.lock().unwrap().len();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while count(&scenes) < 1 || budgets.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the running tile gets its scene and budget");
+    // Health is read once a second; the same boot id posts nothing again.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        count(&scenes),
+        1,
+        "an unchanged renderer gets no second scene"
+    );
+    *boot.lock().unwrap() = "boot-2".into();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while count(&scenes) < 2 || budgets.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a renderer with a new boot id gets the scene and the budget again");
+    assert_eq!(scenes.lock().unwrap()[1], "i-test-0", "the same instance");
+}
+
 /// A running tile whose renderer stops answering on an instance that keeps running is
 /// launched again after three silent checks in a row; a check it answers starts the count
 /// again. Before, only the instance's state was checked and the tile stayed `running`.

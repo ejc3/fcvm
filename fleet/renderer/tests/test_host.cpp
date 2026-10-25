@@ -571,6 +571,20 @@ int main() {
       CHECK(pw2.n_text >= 2 && worst < 1.0f, "a long lockup message ends inside the image (%zu chars, right edge u %.3f)",
             strlen(text), worst);
     }
+    // the boot id: 32 hex digits, a new one per process, reported by /health
+    {
+      std::string a = new_boot_id(), b = new_boot_id();
+      bool hex = a.size() == 32;
+      for (char c : a) hex = hex && ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
+      CHECK(hex, "a boot id is 32 lowercase hex digits: %s", a.c_str());
+      CHECK(a != b, "two boot ids differ: %s %s", a.c_str(), b.c_str());
+      bool reported = false, kept = false;
+      for (auto& l : source_lines("../src/pipeline.cpp"))
+        reported = reported || (l.find("\\\"boot_id\\\":") != std::string::npos && l.find("boot_id_") != std::string::npos);
+      for (auto& l : source_lines("../src/pipeline.h"))
+        kept = kept || l.find("const std::string boot_id_ = new_boot_id();") != std::string::npos;
+      CHECK(kept && reported, "the pipeline makes one boot id at start (%d) and health_json reports it (%d)", kept, reported);
+    }
     // pipeline.cpp: the fields health_json and fatal() read on server threads are
     // written under hmu_, and a failed encoder open gives its buffer back
     std::vector<std::string> src = source_lines("../src/pipeline.cpp");

@@ -442,7 +442,11 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   terminated and is launched again after a backoff (1 s doubling to 30 s), and so does a
   running tile whose instance is found shutting down, stopped or terminated (a spot
   reclaim), whose renderer's `/health` carries an `error`, or whose renderer leaves
-  `/health` unanswered three checks in a row (checked every 15 s). The coordinator
+  `/health` unanswered three checks in a row (checked every 15 s). A renderer that
+  restarts on its instance (`fcvm-fleet-renderer.service` restarts it) answers with a new
+  `boot_id`: the coordinator reads each tile's `/health` once a second (and once before the
+  first scene post on an instance) and posts the scene and the budget again when the
+  `boot_id` differs from the last one read. The coordinator
   keeps no instance ids across a restart, so before its first launch, and again when it
   stops, it terminates every instance tagged `Purpose=fcvm-fleet-tile` and
   `Fleet=<--fleet-name>` in `--ec2-regions`; another fleet's tiles in the same account (a
@@ -648,6 +652,9 @@ none is placed). For each slot the agent reconciles:
   once.
 - `rect` changed, generation not: post the new scene to the running renderer, no
   relaunch. `rect: null` (the host drains): keep the VM, post nothing.
+- the renderer's `/health` names a different `boot_id` than the last read (the renderer
+  restarted inside its VM and lost its scene): post the scene and the budget again, no
+  relaunch.
 - `standby: true` (the standby pool): stop any VM, wait until the GPU is free, scrub it
   with `--scrub`, report `standby`, and run nothing until the slot is placed again.
 - `warm: true` (with `rect: null`): the GPU is joining. Run its VM as for a placed slot and
@@ -1186,7 +1193,7 @@ pixel in both, drawn identically.
 ```json
 {"fps":30.0,"heights":[240],"streams":[{"h":240,"q":"std"}],
  "gpu":{"name":"Tesla T4","temp_c":38,"power_w":64.2,"util_pct":70,"mem_used_mb":648.3},
- "t":1234.5,"frame":5678,
+ "t":1234.5,"frame":5678,"boot_id":"9f0c2a6e41d84b7c8e2f5a1b3c4d6e7f",
  "ready":true,"render_ms":13.0,"encode_ms":0.5,"spp":3,"checkerboard":1,"hold":false,"hold_samples":0,"slots_missed":0,
  "startup_ms":{"gpu_ready":1515,"first_frame_drawn":1845,"first_frame_sent":1899}}
 ```
@@ -1200,6 +1207,9 @@ encoded), `spp` (samples per pixel drawn in it), `checkerboard` (see below),
 subscriber was connected, since start), and `startup_ms`, milliseconds from the
 process start (read from `/proc/self/stat`) to CUDA being ready, the first
 frame drawn and the first frame sent to a subscriber (`-1` until it happens).
+`boot_id` is 32 hex digits drawn at random when the process starts: a client
+that reads a different one than before is talking to a restarted renderer,
+which has no scene and no budget until they are posted again.
 `layout_generation` is the layout in force (null without one), and
 `layout_pending` (`{"generation", "from_frame"}`, present only while one is
 waiting) the next.

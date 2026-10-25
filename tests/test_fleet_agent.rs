@@ -398,6 +398,56 @@ async fn wait_len(
     }
 }
 
+/// A renderer that restarts inside its VM (the VM keeps running) answers `/health` with a
+/// new `boot_id`, without the scene it was posted: the agent posts the scene and the budget
+/// to it again, without a relaunch.
+#[tokio::test]
+async fn a_renderer_restarted_in_its_vm_gets_its_scene_again() {
+    let f = fake(1, &[]);
+    let boot = f.dir.path().join(format!("port-{}.boot", f.base));
+    let set_boot = |id: &str| {
+        let tmp = boot.with_extension("boot.tmp");
+        std::fs::write(&tmp, id).unwrap();
+        std::fs::rename(&tmp, &boot).unwrap();
+    };
+    set_boot("boot-1");
+    let mut c = Coord::start(&f, 1, cfg(&f.fcvm));
+    c.next().await;
+    c.send(scene());
+    c.send(CoordMsg::Budget(fleet_core::protocol::BudgetBody {
+        budget: 500_000,
+        t: 11.2,
+    }));
+    c.assign(&[("slot-1", 0, 1, rect(0.0))]);
+    c.until(&["slot-1"], "running", 1).await;
+    wait_len(&f.budgets[0], 1, "the budget was not posted").await;
+    // Health is read every 200 ms; an unchanged boot id posts nothing again.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(f.scenes[0].lock().unwrap().len(), 1, "one scene post");
+    assert_eq!(f.budgets[0].lock().unwrap().len(), 1, "one budget post");
+    set_boot("boot-2");
+    wait_len(
+        &f.scenes[0],
+        2,
+        "the scene was not posted again after the renderer restarted",
+    )
+    .await;
+    wait_len(
+        &f.budgets[0],
+        2,
+        "the budget was not posted again after the renderer restarted",
+    )
+    .await;
+    let scenes = f.scenes[0].lock().unwrap().clone();
+    assert_eq!(scenes[1], scenes[0], "the same scene");
+    let starts = events(f.dir.path())
+        .iter()
+        .filter(|e| e.kind == "start")
+        .count();
+    assert_eq!(starts, 1, "a renderer restart is not a relaunch");
+    c.close().await;
+}
+
 /// The grid budget reaches a wall tile's renderer, again after every scene post (a new
 /// scene clears the renderer's schedule), never a renderer drawing the whole image for a
 /// claim; the agent forwards the renderer's `budget_fit` and `t`.

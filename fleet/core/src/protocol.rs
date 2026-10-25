@@ -176,6 +176,16 @@ impl HealthReport {
     }
 }
 
+/// The renderer's process id in a `/health` reply (`boot_id`, random per process), when it
+/// reports one. A different one than the last read means the renderer restarted and has
+/// lost its scene.
+pub fn boot_id(health: &serde_json::Value) -> Option<String> {
+    health
+        .get("boot_id")
+        .and_then(|b| b.as_str())
+        .map(str::to_string)
+}
+
 /// Agent -> coordinator.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
