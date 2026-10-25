@@ -601,6 +601,7 @@ impl FakeAgent {
                     .collect(),
                 capacity: gpus,
                 store_ready_at: None,
+                boot: Default::default(),
             })
             .unwrap();
         FakeAgent {

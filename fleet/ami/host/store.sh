@@ -4,9 +4,14 @@
 # carries (/var/lib/fcvm-fleet/store.tar.zst: kernels, rootfs, initrd, Firecracker, the
 # NVIDIA driver image, the renderer image's export and the warmed snapshot cache). Never
 # formats the disk that holds /.
+#
+# Once the store is restored it writes READY (the agent's --store-ready-file): a JSON object
+# of the boot's times in Unix milliseconds, which the agent reports in its hello
+# (fleet/PROTOCOL.md, "Agent to coordinator") and the coordinator logs for each wake.
 set -euo pipefail
 M=/mnt/fcvm-btrfs
 ARCHIVE=/var/lib/fcvm-fleet/store.tar.zst
+READY=${STORE_READY_FILE:-/var/lib/fcvm-fleet/store-ready}
 t0=$(date +%s%N)
 if mountpoint -q "$M"; then echo "$M already mounted"; exit 0; fi
 root_disk=$(lsblk -no PKNAME "$(findmnt -no SOURCE /)")
@@ -40,3 +45,7 @@ fi
 chown ubuntu:ubuntu "$M"
 t2=$(date +%s%N)
 echo "fcvm-fleet-store: mkfs+mount $(( (t1 - t0) / 1000000 )) ms, restore from $src $(( (t2 - t1) / 1000000 )) ms, $(du -sh --apparent-size "$M" | cut -f1) apparent"
+mkdir -p "$(dirname "$READY")"
+printf '{"store_started_at": %d, "store_mounted_at": %d, "store_source": "%s"}\n' \
+  $((t0 / 1000000)) $((t1 / 1000000)) "$src" > "$READY.tmp"
+mv -f "$READY.tmp" "$READY"

@@ -38,6 +38,8 @@ pub struct Agent {
     /// A file the host's boot writes once its store is mounted; its modification time is
     /// reported in the hello.
     pub store_ready_file: Option<std::path::PathBuf>,
+    /// The host's boot times, sent in every hello ([`boot_times`]).
+    pub boot: BTreeMap<String, u64>,
 }
 
 /// The modification time of `path` in Unix milliseconds, if it exists.
@@ -46,7 +48,50 @@ fn mtime_ms(path: &std::path::Path) -> Option<u64> {
     Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64)
 }
 
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The host's boot times for the hello (`AgentMsg::Hello::boot`), Unix milliseconds:
+/// `kernel_started_at` from `uptime` (the first field of `/proc/uptime`) read at `now`,
+/// `agent_started_at`, and every `*_at` number in the store-ready file, a JSON object the
+/// host's store unit writes (`fleet/ami/host/store.sh`: `store_started_at`,
+/// `store_mounted_at`). A file that is not such an object adds nothing.
+pub fn boot_times(
+    uptime: Option<&str>,
+    now: u64,
+    agent_started_at: u64,
+    store_ready: Option<&str>,
+) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    if let Some(up) = uptime
+        .and_then(|u| u.split_whitespace().next())
+        .and_then(|u| u.parse::<f64>().ok())
+        .filter(|u| u.is_finite() && *u >= 0.0)
+    {
+        out.insert(
+            "kernel_started_at".into(),
+            now.saturating_sub((up * 1000.0) as u64),
+        );
+    }
+    out.insert("agent_started_at".into(), agent_started_at);
+    if let Some(serde_json::Value::Object(o)) =
+        store_ready.and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+    {
+        for (k, v) in o {
+            if let (true, Some(t)) = (k.ends_with("_at"), v.as_u64()) {
+                out.insert(k, t);
+            }
+        }
+    }
+    out
+}
+
 pub async fn run(args: FleetAgentArgs) -> Result<()> {
+    let started_at = unix_ms();
     let host = match args.host {
         Some(h) => h,
         None if args.host_from_imds => crate::fleet::coord::aws::imds("instance-id")
@@ -127,6 +172,15 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
         spot_notice_url: args.spot_notice_url,
         spot_poll: Duration::from_secs(5),
         store_ready_file: args.store_ready_file.clone(),
+        boot: boot_times(
+            std::fs::read_to_string("/proc/uptime").ok().as_deref(),
+            unix_ms(),
+            started_at,
+            args.store_ready_file
+                .as_deref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .as_deref(),
+        ),
         aggregate: args.aggregate_port.map(|p| {
             let mut argv = vec![
                 std::env::current_exe()
@@ -224,6 +278,7 @@ where
         gpus: agent.gpus.clone(),
         capacity: agent.capacity,
         store_ready_at: agent.store_ready_file.as_deref().and_then(mtime_ms),
+        boot: agent.boot.clone(),
     })
     .ok();
     let http = reqwest::Client::builder()

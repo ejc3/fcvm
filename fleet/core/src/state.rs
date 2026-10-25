@@ -72,6 +72,10 @@ pub struct HostWake {
     pub agent_at: Option<u64>,
     /// Every one of its slots reported running.
     pub rendering_at: Option<u64>,
+    /// The host's own boot times, from the agent's hello (`AgentMsg::Hello::boot`): Unix
+    /// milliseconds on the host's clock, each kept only when it falls inside this wake.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub boot: BTreeMap<String, u64>,
 }
 
 /// One wake, measured from the first active viewer to the complete image.

@@ -188,6 +188,10 @@ pub enum AgentMsg {
         /// When the host's store was ready (Unix ms), if the host marks it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         store_ready_at: Option<u64>,
+        /// When the host's boot reached each of its steps (Unix ms, the host's clock):
+        /// `kernel_started_at`, `store_started_at`, `store_mounted_at`, `agent_started_at`.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        boot: BTreeMap<String, u64>,
     },
     Slot(SlotReport),
     Health(HealthReport),

@@ -226,6 +226,11 @@ impl Ec2Driver for AwsEc2 {
         let deadline = Instant::now() + self.ready_timeout;
         let name = format!("{tile}.{}", self.zone);
         let mut up = launched.clone();
+        // For the log: since this call, when the instance was first seen running with an
+        // address, and when its renderer first answered /health.
+        let t0 = Instant::now();
+        let mut running_ms: Option<u128> = None;
+        let mut health_ms: Option<u128> = None;
         loop {
             if Instant::now() >= deadline {
                 bail!("{id} did not serve /health within {:?}", self.ready_timeout);
@@ -261,6 +266,7 @@ impl Ec2Driver for AwsEc2 {
             up.ipv6 = xml_tag(&xml, "ipv6Address");
             if state == "running" {
                 if let Some(ip) = up.ipv4.clone() {
+                    running_ms.get_or_insert(t0.elapsed().as_millis());
                     let addr: std::net::IpAddr = ip.parse().context("the instance's address")?;
                     let client = reqwest::Client::builder()
                         .resolve(&name, std::net::SocketAddr::new(addr, self.health_port))
@@ -275,11 +281,19 @@ impl Ec2Driver for AwsEc2 {
                     // that will not render, so the launch fails and the tile is retried.
                     if let Ok(r) = client.get(&url).send().await {
                         if r.status().is_success() {
+                            health_ms.get_or_insert(t0.elapsed().as_millis());
                             if let Ok(h) = r.json::<serde_json::Value>().await {
                                 if let Some(e) = h.get("error").filter(|e| !e.is_null()) {
                                     bail!("{id}'s renderer failed: {e}");
                                 }
                                 if h["ready"] == serde_json::Value::Bool(true) {
+                                    tracing::info!(
+                                        %tile, instance = %id,
+                                        running_ms = running_ms.unwrap_or_default() as u64,
+                                        health_answered_ms = health_ms.unwrap_or_default() as u64,
+                                        ready_ms = t0.elapsed().as_millis() as u64,
+                                        "tile ready (ms since the launch was accepted)"
+                                    );
                                     return Ok(up);
                                 }
                             }

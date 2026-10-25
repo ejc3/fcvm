@@ -99,5 +99,20 @@ else
 fi
 rm -rf "$gt"
 
+# The store unit writes the file the agent reads as --store-ready-file (the host's agent
+# arguments, fleet/PROTOCOL.md "Running it"), with the boot times the agent reports. Nothing
+# wrote it before, so every hello carried no store time.
+agent_file=$(grep '^FLEET_AGENT_ARGS=' fleet/PROTOCOL.md | grep -o -- '--store-ready-file [^ ]*' | head -1 | cut -d' ' -f2)
+store_file=$(sed -n 's/^READY=\${STORE_READY_FILE:-\([^}]*\)}$/\1/p' fleet/ami/host/store.sh)
+[ -n "$agent_file" ] && [ "$agent_file" = "$store_file" ] ||
+  no "store.sh writes '${store_file}', the agent reads --store-ready-file '${agent_file}'"
+grep -q 'mv -f "$READY.tmp" "$READY"' fleet/ami/host/store.sh || no "store.sh does not replace the ready file by rename"
+st=$(mktemp -d)
+sed -n '/^printf .{"store_started_at"/,/> "\$READY.tmp"/p' fleet/ami/host/store.sh |
+  sed "s|\$READY|$st/ready|; s|\$((t0 / 1000000))|1|; s|\$((t1 / 1000000))|2|; s|\"\$src\"|s3|" > "$st/w.sh"
+bash "$st/w.sh" 2>/dev/null && jq -e '.store_started_at == 1 and .store_mounted_at == 2' "$st/ready.tmp" >/dev/null 2>&1 ||
+  no "store.sh's ready file is not a JSON object of the store's times"
+rm -rf "$st"
+
 [ "$fail" = 0 ] && echo "fleet/ami checks: ok"
 exit "$fail"
