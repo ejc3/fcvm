@@ -3,6 +3,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use tracing::{info, warn};
 
+/// An owner for the temporaries of one image-cache operation, so a SIGKILLed one leaves
+/// them to the next launch to reclaim (`crate::reclaim`). The temporaries sit in the
+/// shared assets directory, but the record is in this nesting level's data directory,
+/// where its flock is authoritative.
+pub(super) fn temp_owner() -> Result<crate::reclaim::Owner> {
+    crate::reclaim::Owner::begin(&format!("image-temp-{}", uuid::Uuid::new_v4().simple()))
+}
+
 /// Remove podman state files from a storage root, keeping only image/layer data.
 ///
 /// `podman load` creates state files (db.sql, storage.lock, libpod/, etc.) that
@@ -434,8 +442,17 @@ impl TempStore {
 /// Load `archive` into a new temporary store at `graphroot` and return what podman
 /// printed. The store's runroot exists only inside this function, so it is removed on
 /// every way out of it.
-async fn load_into_temp_store(graphroot: &Path, archive: &Path) -> Result<String> {
+async fn load_into_temp_store(
+    graphroot: &Path,
+    archive: &Path,
+    temps: &crate::reclaim::Owner,
+) -> Result<String> {
     let store = TempStore::new(graphroot)?;
+    // Recorded after it exists: its name is random, so another process's runroot can
+    // never be mistaken for it, and a kill between the two leaves a few kilobytes in /tmp.
+    temps.record(crate::reclaim::Resource::Temp {
+        path: store.runroot.path().to_path_buf(),
+    })?;
     let output = store
         .podman()
         .arg("load")
@@ -472,8 +489,37 @@ pub async fn build_storage_image(
     // per-digest flock does not coordinate cross-VM (see `crate::setup::store_temp_path`). A shared
     // "tmp-storage-{pid}" would collide too — separate PID namespaces reuse pid numbers.
     let tmp_dir = cache_dir.join(format!("tmp-storage-{}", uuid::Uuid::new_v4()));
+    let tmp_img = crate::setup::store_temp_path(output_path);
 
-    tokio::fs::create_dir_all(&tmp_dir)
+    // Both temporaries are recorded before they exist, so a SIGKILLed build leaves them
+    // to the next launch to reclaim (crate::reclaim). Completing the owner removes
+    // whatever the build did not remove or rename into place.
+    let temps = temp_owner()?;
+    for path in [&tmp_dir, &tmp_img] {
+        temps.record(crate::reclaim::Resource::Temp { path: path.clone() })?;
+    }
+    let built = build_storage_image_in(archive_path, output_path, &tmp_dir, &tmp_img, &temps).await;
+    complete_temps(temps).await;
+    built
+}
+
+/// Complete an owner of image-cache temporaries. A temporary that cannot be removed does
+/// not fail the operation, as it did not before it was recorded: it stays recorded, and
+/// the next launch tries again.
+pub(super) async fn complete_temps(temps: crate::reclaim::Owner) {
+    if let Err(error) = temps.complete().await {
+        warn!(error = %format!("{error:#}"), "image-cache temporaries remain");
+    }
+}
+
+async fn build_storage_image_in(
+    archive_path: &Path,
+    output_path: &Path,
+    tmp_dir: &Path,
+    tmp_img: &Path,
+    temps: &crate::reclaim::Owner,
+) -> Result<()> {
+    tokio::fs::create_dir_all(tmp_dir)
         .await
         .context("creating temp storage dir")?;
 
@@ -484,10 +530,10 @@ pub async fn build_storage_image(
         tmp_dir.display()
     );
 
-    let loaded_msg = match load_into_temp_store(&tmp_dir, archive_path).await {
+    let loaded_msg = match load_into_temp_store(tmp_dir, archive_path, temps).await {
         Ok(message) => message,
         Err(e) => {
-            tokio::fs::remove_dir_all(&tmp_dir).await.ok();
+            tokio::fs::remove_dir_all(tmp_dir).await.ok();
             return Err(e);
         }
     };
@@ -496,27 +542,26 @@ pub async fn build_storage_image(
     // Remove podman state files that contain hardcoded paths from the temp dir.
     // Keep only image/layer data directories. When the guest mounts this read-only
     // at a different path, stale state files cause "database graph driver does not match".
-    clean_podman_state(&tmp_dir, &["overlay", "overlay-images", "overlay-layers"]).await;
+    clean_podman_state(tmp_dir, &["overlay", "overlay-images", "overlay-layers"]).await;
 
     // Package the storage tree as an ext4 image, building into a UUID-keyed temp and
     // atomically renaming (see `crate::setup::store_temp_path`: a shared "<digest>.tmp" lets two VMs
     // mkfs/resize2fs the same file and one's rename ENOENTs the other's in-flight temp).
-    let tmp_img = crate::setup::store_temp_path(output_path);
-    let result = create_disk_from_dir(&tmp_dir, &tmp_img, true).await;
+    let result = create_disk_from_dir(tmp_dir, tmp_img, true).await;
 
     // Clean up temp storage dir regardless of result
-    tokio::fs::remove_dir_all(&tmp_dir).await.ok();
+    tokio::fs::remove_dir_all(tmp_dir).await.ok();
 
     if let Err(e) = result {
         // Clean up partial .tmp image file on failure
-        tokio::fs::remove_file(&tmp_img).await.ok();
+        tokio::fs::remove_file(tmp_img).await.ok();
         return Err(e).context("creating ext4 image from storage dir");
     }
 
     // Atomic rename to final path
-    if let Err(e) = tokio::fs::rename(&tmp_img, output_path).await {
+    if let Err(e) = tokio::fs::rename(tmp_img, output_path).await {
         // Clean up .tmp image file if rename fails
-        tokio::fs::remove_file(&tmp_img).await.ok();
+        tokio::fs::remove_file(tmp_img).await.ok();
         return Err(e).context("renaming storage image to final path");
     }
 

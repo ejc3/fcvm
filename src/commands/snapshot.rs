@@ -219,6 +219,12 @@ impl CloneSetupResources {
                 ));
             }
         }
+        // The mount targets the restore made, and the owner record.
+        if let Err(error) = crate::reclaim::complete(&self.vm_id).await {
+            errors.push(format!(
+                "reclaiming the clone's resources after failed setup: {error:#}"
+            ));
+        }
         if errors.is_empty() {
             info!(vm_id = %self.vm_id, "clone setup cleanup complete");
             Ok(())
@@ -2132,7 +2138,16 @@ async fn cmd_snapshot_run_inner(
     // snapshot-miss path, which tears its throwaway VM down (deleting its
     // state) and relaunches through here. No pre-restore exec session can
     // reference this state file, so restore needs no vsock-epoch bump.
+    //
+    // What VMs of processes killed without teardown left on the host goes first. The
+    // clone's data directory is recorded before anything creates it, so a SIGKILLed
+    // clone leaves it to the next launch to reclaim (crate::reclaim).
+    crate::reclaim::reclaim_abandoned().await;
     let vm_id = generate_vm_id();
+    let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
+    reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
+        path: paths::vm_runtime_dir(&vm_id),
+    })?;
     let (mut runtime_config, firecracker_choice) = snapshot_restore_runtime_config(
         &args,
         snapshot_config.metadata.kernel_profile.as_deref(),
