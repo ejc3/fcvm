@@ -232,7 +232,17 @@ discovery and the serial replay that confirms one schedule per failure signature
 must not pull its image from a registry: a first run with `alpine:latest` hit Docker Hub's
 unauthenticated rate limit after about 100 cold boots and failed every later schedule.
 `RACE_GYM_IMAGE` should name a `localhost/` image, which fcvm exports once into the image
-cache.
+cache. Build one with the invoking user's podman (one registry pull, then none):
+
+```bash
+printf 'FROM docker.io/library/alpine:latest\n' | podman build -t localhost/race-gym-alpine:1 -
+```
+
+`RACE_GYM_IMAGE` also replaces the image a replay recorded, so
+`RACE_GYM_IMAGE=localhost/race-gym-alpine:1 make race-gym REPLAY=<file>` and the emitted
+cases (`make race-gym-cases`) run on a host that builds the image under any name. The emitted
+cold-run case records `localhost/race-gym-alpine:1`, so without the variable the host needs
+that tag.
 
 Not measured: the arm64 nested tier and fc-mock. A pbox kvm-96 (c8g.metal-24xl) boots a
 stock kernel without `kvm-arm.mode=nested`, so `--kernel-profile nested` needs the fcvm host

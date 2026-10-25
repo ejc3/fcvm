@@ -8,8 +8,9 @@ import {
   tileGeometry,
   deliveredGeometry,
   tileAt,
+  frameFitsBox,
 } from "../layout.ts";
-import { chooseCommonT } from "../sync.ts";
+import { acquireFrozen, chooseCommonT, type SyncChoice } from "../sync.ts";
 import { fitBandwidth, MIN_STREAM_BPS, streamBitrate } from "../bandwidth.ts";
 import { addDrag, cameraAt, emptyDrag, lightPosition, poseAt, projectPoint, takeDrag } from "../scene.ts";
 import { fleet } from "./fixtures.ts";
@@ -260,5 +261,71 @@ describe("holding the image for a mode switch", () => {
     expect(c.show.get("a")).toEqual({ kind: "sync", t: 1.1 });
     const held = chooseCommonT([b("a", [1.1, 1.2])], 1.2, 0.35, 1.0);
     expect(held.T).toBe(1.2);
+  });
+});
+
+describe("whether a frame was rendered for the place a plan draws it", () => {
+  const image = { x: 0, y: 0, w: 1920, h: 1080 };
+  // A 3 x 2 tiling of one half, as fractions of the image.
+  const tile = (c: number, r: number) => ({ x: c / 6, y: r / 2, w: 1 / 6, h: 1 / 2 });
+  const boxOf = (r: { x: number; y: number; w: number; h: number }) => ({ x: r.x * image.w, y: r.y * image.h, w: r.w * image.w, h: r.h * image.h });
+
+  it("accepts the renderer's frame at the smallest stream height, however it rounds", () => {
+    // Asked for height 72, the renderer raises it to its minimum width: 146 x 244 on an 868 x 488 grid,
+    // which draws 3 screen pixels wider than the planned 320.
+    for (const dpr of [1, 2]) {
+      for (let c = 0; c < 3; c++) {
+        for (let r = 0; r < 2; r++) {
+          const g = tileGeometry(tile(c, r), 16 / 9, 72);
+          expect(g).toMatchObject({ width: 146, height: 244, fullWidth: 868, fullHeight: 488 });
+          expect(frameFitsBox(image, g, { sw: g.width, sh: g.height }, boxOf(tile(c, r)), dpr), `dpr ${dpr} tile ${c},${r}`).toBe(true);
+        }
+      }
+    }
+  });
+
+  it("still refuses a frame rendered for another tiling", () => {
+    const g = tileGeometry(tile(1, 0), 16 / 9, 72);
+    // The same stream against the neighbouring column's place, and against a tile half the height.
+    expect(frameFitsBox(image, g, { sw: g.width, sh: g.height }, boxOf(tile(2, 0)), 1)).toBe(false);
+    expect(frameFitsBox(image, g, { sw: g.width, sh: g.height }, { ...boxOf(tile(1, 0)), h: 270 }, 1)).toBe(false);
+  });
+});
+
+describe("a frozen picture takes a frame for a tile that had none", () => {
+  const b = (id: string, ts: number[]) => ({ id, ts });
+  const frozen: SyncChoice = {
+    T: 2,
+    show: new Map([
+      ["a", { kind: "sync", t: 2 }],
+      ["b", { kind: "empty" }],
+      ["c", { kind: "waiting" }],
+    ]),
+  };
+
+  it("takes the newest frame at or before T for a tile that shows none, and leaves the others alone", () => {
+    const got = acquireFrozen(frozen, [b("a", [2, 2.1, 2.2]), b("b", [1.8, 1.9, 2.5]), b("c", [])]);
+    expect(got).not.toBeNull();
+    expect(got!.T).toBe(2);
+    expect(got!.show.get("a")).toEqual({ kind: "sync", t: 2 });
+    expect(got!.show.get("b")).toEqual({ kind: "behind", t: 1.9 });
+    expect(got!.show.get("c")).toEqual({ kind: "waiting" });
+  });
+
+  it("shows a frame at T as in sync", () => {
+    expect(acquireFrozen(frozen, [b("b", [1.9, 2])])!.show.get("b")).toEqual({ kind: "sync", t: 2 });
+  });
+
+  it("takes the oldest frame after T, dimmed, when a reopened stream has nothing older", () => {
+    expect(acquireFrozen(frozen, [b("b", [3.1, 3.2])])!.show.get("b")).toEqual({ kind: "behind", t: 3.1 });
+  });
+
+  it("changes nothing when no tile that shows none has a frame, or every tile shows one", () => {
+    expect(acquireFrozen(frozen, [b("a", [2, 2.1]), b("b", []), b("c", [])])).toBeNull();
+    expect(acquireFrozen({ T: 2, show: new Map([["a", { kind: "behind", t: 1.9 }]]) }, [b("a", [2.5])])).toBeNull();
+  });
+
+  it("does not add a tile the choice never named", () => {
+    expect(acquireFrozen(frozen, [b("d", [2])])).toBeNull();
   });
 });

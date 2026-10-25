@@ -692,6 +692,27 @@ means the reviewer never started.
 Enforcement: `tests/test_ci_workflow_coverage.rs` fails if `ci.yml` reintroduces a
 `branches:`/`branches-ignore:` filter on `pull_request`, or if a gating job leaves that file.
 
+### CI runs on the top of a stack, not on every layer
+
+A draft PR runs no tests, and neither does a PR that another open PR from this repository is
+stacked on (`scripts/ci-pr-scope.sh`). Their run ends in a check named **`Summary (deferred)`**,
+never `Summary`, so it can never be read as a pass. Push the stack as drafts, mark it ready, and
+the top PR's run tests every layer: its `changes` job classifies the whole stack's diff against
+`main`, not only the top PR's files, so a docs-only top cannot skip the matrix for code changed
+lower down.
+
+When the top's `Summary` passes, the `Stack coverage` job posts a **`Stack CI`** success status
+on each lower PR's head, naming the run, but only on heads that are ancestors of the tested
+head (`scripts/ci-stack-coverage.sh`). A lower PR is tested when it carries `Summary` success or
+`Stack CI` success on its current head; `Summary (deferred)` alone means nothing ran for it.
+
+To bisect a failure on the top, run one layer on its own:
+`gh workflow run ci.yml --ref <layer-branch>` (a dispatch run tests the full matrix). Also run it
+when the top PR is closed and a lower PR becomes the top, since nothing re-triggers its CI.
+
+Enforcement: `scripts/test-ci-stack-scope.py` (`make test-ci-scope`, run by the `actionlint`
+job) drives both scripts against a fake `gh` and evaluates every job's `if:` for a deferred run.
+
 ## Fresh Bare-Metal Box Quickstart
 
 Bring up a new ARM (or x86) KVM-capable box to building-and-benching in ~20 minutes.
@@ -1274,6 +1295,20 @@ write by L1 discards all of L2's translations. NV2 restores therefore page in th
 implicit UFFD copy server (`direct_restore_memory` in `src/commands/snapshot.rs`), which fills
 anonymous memory that later writes do not copy. The chain is from reading
 arch/arm64/kvm/mmu.c and nested.c; it has not been traced on hardware.
+
+**Copy-on-write after a Full snapshot of the source (#1264).** The same invalidation reaches a
+cold-booted NV2 source through `snapshot create`. A Full snapshot that reads every guest page
+maps each page the guest never wrote to the shared zero page (a 1 GiB L1: 0 such pages before
+the dump, 144,696 after), so after the resume each first write to one is a copy-on-write that
+unmaps every shadow stage-2: ~600k exits/s on one IPA, guest soft lockups of 74 s, and
+`--resume-snapshot-network` unacknowledged for 40 s or more, in 12 of 337 pre-start snapshots
+on a pbox. The NV2 fork's Full dump leaves those pages as holes without reading them (pagemap
+and mincore say they have no page table entry), so the source keeps them unmapped and its
+first write is an ordinary anonymous fault. It still reads every page of a restore through a
+userfaultfd, of file-backed memory, and of a memory file it overwrites in place.
+`test_snapshot_create_leaves_nv2_source_pages_unmapped` (tests/test_kvm.rs) counts the
+zero-page pages across one snapshot. Linux removed the full unmap upstream (e6084aecaeef and
+its series); the 6.18 host kernel still has it, so other invalidation sources still reach it.
 
 **Debugging these**: guest `dd if=/dev/zero of=/dev/null` per-CPU (healthy ≈ 19 GB/s on
 Graviton3; storms read 0.07-0.3 GB/s), host `ftrace` on `kvm:kvm_timer_emulate`, per-thread

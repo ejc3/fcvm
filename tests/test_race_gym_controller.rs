@@ -671,3 +671,46 @@ fn race_gym_emit_keeps_a_multiline_failure_in_its_comment() {
     );
     std::fs::remove_dir_all(&tree).unwrap();
 }
+
+/// A serial replay that ends in a control failure did not run as recorded. It must count as
+/// confirming the failure (and be reported with its replay), not as "not reproduced alone",
+/// which dropped the failure and let the gym exit 0.
+#[test]
+fn race_gym_a_diverged_confirmation_counts_as_confirmed() {
+    let signature = "outcome: exit #: lock vanished";
+    let diverged = [Failure::new(
+        "control",
+        None,
+        "step 3 diverged: wanted parked",
+    )];
+    assert!(race_gym::confirmation_holds(signature, &diverged));
+    let same = [Failure::new("outcome", Some(1), "exit 3: lock vanished")];
+    assert!(race_gym::confirmation_holds(signature, &same));
+    let other = [Failure::new("leak", None, "a VM directory is left")];
+    assert!(!race_gym::confirmation_holds(signature, &other));
+    assert!(!race_gym::confirmation_holds(signature, &[]));
+}
+
+/// `RACE_GYM_IMAGE` replaces the image a replay recorded, so a case that names a
+/// `localhost/` image runs on a host that builds it under another name.
+#[test]
+fn race_gym_the_image_env_overrides_the_recorded_image() {
+    let case: serde_json::Value = serde_json::from_str(include_str!(
+        "race_gym/cases/cold_run_restore_after_source_teardown.json"
+    ))
+    .unwrap();
+    let recorded = &case["params"];
+    let kept = race_gym::cold_run::params_on_host(recorded, None).unwrap();
+    assert_eq!(kept.image, recorded["image"].as_str().unwrap());
+    let replaced = race_gym::cold_run::params_on_host(recorded, Some("example/image:1")).unwrap();
+    assert_eq!(replaced.image, "example/image:1");
+    assert_eq!(replaced.actors, kept.actors);
+    assert_eq!(replaced.args, kept.args);
+
+    // scenario_from reads the variable itself. Nothing else in this binary reads these.
+    std::env::set_var("RACE_GYM_IMAGE", "example/image:2");
+    std::env::set_var("RACE_GYM_FCVM", "/bin/sh");
+    std::env::set_var("RACE_GYM_GPUS", "0000:00:00.0,0000:00:01.0");
+    let scenario = race_gym::scenario_from(race_gym::cold_run::NAME, recorded).unwrap();
+    assert_eq!(scenario.params()["image"], "example/image:2");
+}
