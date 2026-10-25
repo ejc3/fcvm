@@ -1,6 +1,16 @@
+# The store needs the instance-store NVMe, the network (the parts come from S3 with the
+# instance role) and name resolution, and nothing else of the boot. Without default
+# dependencies it is not ordered after sysinit.target and basic.target, which wait for
+# cloud-init's network stage (2.1 s of a cold g4dn.metal boot, 2026-10-25), and
+# multi-user.target does not wait for it, so cloud-final and the units after it run while
+# the store is restored. The agent orders itself after the store.
 [Unit]
-Description=fcvm fleet: fcvm store on the local NVMe, restored from the AMI's copy
-After=local-fs.target
+Description=fcvm fleet: fcvm store on the local NVMe, restored from S3 or the AMI's copy
+DefaultDependencies=no
+Wants=systemd-networkd-wait-online.service
+After=local-fs.target systemd-networkd-wait-online.service nss-lookup.target
+Before=shutdown.target
+Conflicts=shutdown.target
 ConditionPathExists=/var/lib/fcvm-fleet/store/parts
 
 [Service]
