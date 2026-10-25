@@ -465,10 +465,12 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   carry `resumed: 1`. The relaunch of a running tile (a race) always launches. Cold
   launches use the pool template, which must give instances that can be stopped
   (persistent spot that stops on interruption, or on demand). Every terminate cancels the
-  instance's spot request first, since a persistent request replaces a terminated
-  instance, and leaves the instance running when the cancel fails. The start and stop
-  sweeps keep up to `n` pooled instances that are stopped or stopping. A pooled instance of
-  an older image is terminated at the next wake. Measured on g4dn.xlarge (2026-10-25): a
+  instance's spot request first when it is persistent, since a persistent request replaces
+  a terminated instance, and leaves the instance running when the request cannot be read
+  or cancelled. The start and stop sweeps keep up to `n` pooled instances that are stopped
+  or stopping. A pooled instance of an older image, or launched more than 6 days ago (a
+  persistent request without `ValidUntil` expires after 7), is terminated at the next wake
+  instead of started. Measured on g4dn.xlarge (2026-10-25): a
   stopped tile started to its first frame in 15.5 s (persistent spot) and 17.2 to 17.5 s
   (on demand), against 81 to 84 s for a launch; a stopped persistent spot instance can be
   started again only once its request is `disabled`, 42 to 54 s after it stopped.

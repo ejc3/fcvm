@@ -69,6 +69,31 @@ pub struct Instance {
     pub spot_request: Option<String>,
     /// Tagged `FleetPool`.
     pub pooled: bool,
+    /// When it was launched (Unix seconds), if the answer says.
+    pub launched_at: Option<i64>,
+}
+
+/// A pooled instance launched longer ago than this is terminated, not started: a
+/// persistent spot request launched without `ValidUntil` expires after 7 days, and its
+/// stopped instance cannot be started after that.
+pub const POOL_MAX_AGE: Duration = Duration::from_secs(6 * 24 * 3600);
+
+/// The persistent requests of a DescribeSpotInstanceRequests answer.
+pub fn persistent_requests(xml: &str) -> Vec<String> {
+    let marks: Vec<usize> = xml
+        .match_indices("<spotInstanceRequestId>")
+        .map(|(i, _)| i)
+        .collect();
+    marks
+        .iter()
+        .enumerate()
+        .filter_map(|(n, &start)| {
+            let seg = &xml[start..marks.get(n + 1).copied().unwrap_or(xml.len())];
+            (xml_tag(seg, "type").as_deref() == Some("persistent"))
+                .then(|| xml_tag(seg, "spotInstanceRequestId"))
+                .flatten()
+        })
+        .collect()
 }
 
 /// The instances of a DescribeInstances answer. Each `<instanceId>` at instance level opens
@@ -89,6 +114,9 @@ pub fn parse_instances(xml: &str) -> Vec<Instance> {
                 image: xml_tag(seg, "imageId"),
                 spot_request: xml_tag(seg, "spotInstanceRequestId").filter(|r| !r.is_empty()),
                 pooled: seg.contains("<key>FleetPool</key>"),
+                launched_at: xml_tag(seg, "launchTime")
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+                    .map(|t| t.timestamp()),
             })
         })
         .collect()
@@ -283,8 +311,10 @@ impl AwsEc2 {
             .with_context(|| format!("DescribeInstances did not name {id}"))
     }
 
-    /// Terminate `insts`, cancelling their spot requests first: a persistent request whose
-    /// instance is terminated launches a replacement.
+    /// Terminate `insts`, cancelling their persistent spot requests first: a persistent
+    /// request whose instance is terminated launches a replacement. A one-time request
+    /// closes when it is fulfilled and is left alone. When the requests cannot be read or
+    /// cancelled nothing is terminated: the instances stay tagged for the next sweep.
     async fn terminate_all(&self, region: &str, insts: &[Instance]) -> Result<()> {
         if insts.is_empty() {
             return Ok(());
@@ -294,16 +324,30 @@ impl AwsEc2 {
             .filter_map(|i| i.spot_request.as_ref())
             .collect();
         if !requests.is_empty() {
-            let mut params = vec![("Action", "CancelSpotInstanceRequests".to_string())];
+            let mut params = vec![("Action", "DescribeSpotInstanceRequests".to_string())];
             let keys: Vec<String> = (1..=requests.len())
                 .map(|i| format!("SpotInstanceRequestId.{i}"))
                 .collect();
             for (k, r) in keys.iter().zip(&requests) {
                 params.push((k.as_str(), (*r).clone()));
             }
-            self.call_ok(region, &params)
+            let xml = self
+                .call_ok(region, &params)
                 .await
-                .context("cancelling the tiles' spot requests")?;
+                .context("reading the tiles' spot requests")?;
+            let persistent = persistent_requests(&xml);
+            if !persistent.is_empty() {
+                let mut params = vec![("Action", "CancelSpotInstanceRequests".to_string())];
+                let keys: Vec<String> = (1..=persistent.len())
+                    .map(|i| format!("SpotInstanceRequestId.{i}"))
+                    .collect();
+                for (k, r) in keys.iter().zip(&persistent) {
+                    params.push((k.as_str(), r.clone()));
+                }
+                self.call_ok(region, &params)
+                    .await
+                    .context("cancelling the tiles' persistent spot requests")?;
+            }
         }
         let mut params = vec![("Action", "TerminateInstances".to_string())];
         let keys: Vec<String> = (1..=insts.len())
@@ -373,9 +417,10 @@ impl AwsEc2 {
             return Ok(None);
         }
         let image = self.pool_image().await?;
-        let (fresh, stale): (Vec<Instance>, Vec<Instance>) = pooled
-            .into_iter()
-            .partition(|i| i.image.as_deref() == Some(image.as_str()));
+        let oldest = chrono::Utc::now().timestamp() - POOL_MAX_AGE.as_secs() as i64;
+        let (fresh, stale): (Vec<Instance>, Vec<Instance>) = pooled.into_iter().partition(|i| {
+            i.image.as_deref() == Some(image.as_str()) && i.launched_at.is_some_and(|t| t >= oldest)
+        });
         if !stale.is_empty() {
             let stale: Vec<Instance> = {
                 let mut c = self.claimed.lock().unwrap();
@@ -385,7 +430,7 @@ impl AwsEc2 {
                     .collect()
             };
             let ids: Vec<&str> = stale.iter().map(|i| i.id.as_str()).collect();
-            tracing::info!(%region, instances = ?ids, %image, "terminating pooled tiles of an older image");
+            tracing::info!(%region, instances = ?ids, %image, "terminating pooled tiles of an older image or past the pool's age");
             self.terminate_all(&region, &stale).await?;
         }
         for cand in fresh {
@@ -446,8 +491,12 @@ impl AwsEc2 {
                 .await
                 .map(|v| v.iter().filter(|i| i.pooled && i.id != id).count() < self.pool_max)
                 .unwrap_or(false);
-            let keep =
-                region == self.pool_region() && room && image.is_some() && inst.image == image;
+            let oldest = chrono::Utc::now().timestamp() - POOL_MAX_AGE.as_secs() as i64;
+            let keep = region == self.pool_region()
+                && room
+                && image.is_some()
+                && inst.image == image
+                && inst.launched_at.is_some_and(|t| t >= oldest);
             if keep {
                 self.tag(region, id, "FleetPool", &self.fleet).await?;
             }

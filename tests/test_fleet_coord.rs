@@ -3349,6 +3349,8 @@ struct PoolEc2 {
     uncancelled_terminates: Vec<String>,
     /// Instances whose StartInstances fails (a spot request not yet disabled).
     start_fails: Vec<String>,
+    /// Instances launched more than a week ago.
+    old: Vec<String>,
     actions: Vec<String>,
 }
 
@@ -3373,13 +3375,19 @@ async fn pool_ec2_api(api: Arc<std::sync::Mutex<PoolEc2>>) -> String {
                     .map_while(|i| p.get(&format!("{key}.{i}")).cloned())
                     .collect()
             };
+            let old = a.old.clone();
             let item = |id: &str, (st, tags, img, sir): &PoolInstance| {
+                let at = if old.contains(&id.to_string()) {
+                    "2020-01-01T00:00:00.000Z".to_string()
+                } else {
+                    chrono::Utc::now().to_rfc3339()
+                };
                 let tags: String = tags
                     .iter()
                     .map(|(k, v)| format!("<item><key>{k}</key><value>{v}</value></item>"))
                     .collect();
                 let sir = sir.as_ref().map(|r| format!("<spotInstanceRequestId>{r}</spotInstanceRequestId>")).unwrap_or_default();
-                format!("<item><instancesSet><item><instanceId>{id}</instanceId><imageId>{img}</imageId><instanceState><name>{st}</name></instanceState><ipAddress>127.0.0.1</ipAddress>{sir}<tagSet>{tags}</tagSet></item></instancesSet></item>")
+                format!("<item><instancesSet><item><instanceId>{id}</instanceId><imageId>{img}</imageId><instanceState><name>{st}</name></instanceState><launchTime>{at}</launchTime><ipAddress>127.0.0.1</ipAddress>{sir}<tagSet>{tags}</tagSet></item></instancesSet></item>")
             };
             let ok = |s: String| (StatusCode::OK, s);
             match action.as_str() {
@@ -3391,7 +3399,12 @@ async fn pool_ec2_api(api: Arc<std::sync::Mutex<PoolEc2>>) -> String {
                         let Some(k) = p.get(&format!("TagSpecification.1.Tag.{i}.Key")) else { break };
                         tags.insert(k.clone(), p[&format!("TagSpecification.1.Tag.{i}.Value")].clone());
                     }
-                    let sir = (p["LaunchTemplate.LaunchTemplateName"] == "tile-pool").then(|| format!("sir-{}", a.next));
+                    // The pool template's requests are persistent; the spot template's one-time.
+                    let sir = match p["LaunchTemplate.LaunchTemplateName"].as_str() {
+                        "tile-pool" => Some(format!("sir-{}", a.next)),
+                        "tile-spot" => Some(format!("sir-once-{}", a.next)),
+                        _ => None,
+                    };
                     let img = a.image.clone();
                     a.instances.insert(id.clone(), ("running".into(), tags, img, sir));
                     ok(format!("<RunInstancesResponse><instancesSet><item><instanceId>{id}</instanceId></item></instancesSet></RunInstancesResponse>"))
@@ -3444,6 +3457,16 @@ async fn pool_ec2_api(api: Arc<std::sync::Mutex<PoolEc2>>) -> String {
                     a.instances.get_mut(&id).unwrap().1.remove(&k);
                     ok("<DeleteTagsResponse/>".into())
                 }
+                "DescribeSpotInstanceRequests" => {
+                    let items: String = ids(&p, "SpotInstanceRequestId")
+                        .iter()
+                        .map(|r| {
+                            let t = if r.starts_with("sir-once-") { "one-time" } else { "persistent" };
+                            format!("<item><spotInstanceRequestId>{r}</spotInstanceRequestId><type>{t}</type></item>")
+                        })
+                        .collect();
+                    ok(format!("<DescribeSpotInstanceRequestsResponse><spotInstanceRequestSet>{items}</spotInstanceRequestSet></DescribeSpotInstanceRequestsResponse>"))
+                }
                 "CancelSpotInstanceRequests" => {
                     let r = ids(&p, "SpotInstanceRequestId");
                     a.cancelled.extend(r);
@@ -3452,7 +3475,7 @@ async fn pool_ec2_api(api: Arc<std::sync::Mutex<PoolEc2>>) -> String {
                 "TerminateInstances" => {
                     for id in ids(&p, "InstanceId") {
                         let sir = a.instances[&id].3.clone();
-                        if sir.is_some_and(|r| !a.cancelled.contains(&r)) {
+                        if sir.is_some_and(|r| !r.starts_with("sir-once-") && !a.cancelled.contains(&r)) {
                             a.uncancelled_terminates.push(id.clone());
                         }
                         a.instances.get_mut(&id).unwrap().0 = "terminated".into();
@@ -3580,6 +3603,17 @@ async fn the_pool_keeps_at_most_its_size_and_cancels_spot_requests_before_termin
     api.lock().unwrap().image = "ami-1123456789abcdef0".into();
     assert!(d.resume("ec2-3").await.is_none());
     assert_eq!(state_of(&api, &a1.instance).0, "terminated");
+    // A pooled tile launched more than POOL_MAX_AGE ago (its persistent request would have
+    // expired) is terminated, not started.
+    let c1 = d.launch("ec2-1").await.unwrap();
+    d.release(&c1.instance).await.unwrap();
+    assert_eq!(state_of(&api, &c1.instance).0, "stopped");
+    api.lock()
+        .unwrap()
+        .old
+        .push(c1.instance.split_once('/').unwrap().1.to_string());
+    assert!(d.resume("ec2-1").await.is_none());
+    assert_eq!(state_of(&api, &c1.instance).0, "terminated");
     // The sweep keeps a pooled stopped tile and terminates a running one.
     let b1 = d.launch("ec2-1").await.unwrap();
     let b2 = d.launch("ec2-2").await.unwrap();
@@ -3733,4 +3767,21 @@ async fn a_wake_resumes_tiles_a_race_launches_them_and_a_sleep_releases_them() {
     let mut rest = c[2..].to_vec();
     rest.sort();
     assert_eq!(rest, ["release i-cold-2", "terminate i-pooled"], "{c:?}");
+}
+
+/// Without the pool, tiles launch one-time spot; terminating one cancels nothing (a one-time
+/// request closes when fulfilled, and the role may not be allowed to cancel it).
+#[tokio::test]
+async fn a_one_time_spot_tile_is_terminated_without_a_cancel() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (mut d, api) = pool_driver(0).await;
+    d.pool_template = None;
+    let l = d.launch("ec2-1").await.unwrap();
+    d.release(&l.instance).await.unwrap();
+    assert_eq!(state_of(&api, &l.instance).0, "terminated");
+    let a = api.lock().unwrap();
+    assert!(a.cancelled.is_empty(), "{:?}", a.cancelled);
+    assert!(!a
+        .actions
+        .contains(&"CancelSpotInstanceRequests".to_string()));
 }
