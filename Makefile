@@ -271,7 +271,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
 	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu gpu-residue-test gpu-routed-test setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
-	bench-container-import bench-computesdk bench-gpu-restore test-gpu-restore bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
+	bench-container-import bench-computesdk bench-gpu-restore test-gpu-restore test-computesdk bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
 	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-chromium-corpus-extra bench-stop \
 	bench-chromium-request-run bench-chromium-request-all bench-chromium-hostcdp bench-chromium-fault \
@@ -361,6 +361,7 @@ help:
 	@echo "  analyze-chromium-campaign  Index retained CAMPAIGN_RUNS='run1 run2' into CAMPAIGN_OUT=path"
 	@echo "  test-chromium          Run ALL bench unit tests (what CI runs)"
 	@echo "  test-gpu-restore       Run bench/gpu-restore/summarize.py's unit tests"
+	@echo "  test-computesdk        Run bench/computesdk/run.sh's output-directory checks"
 	@echo "  test-chromium-request  Run the request benchmark's deterministic unit tests"
 	@echo "  bench-chromium-scale  Open-loop FILE/UFFD Chromium request scalability run"
 	@echo "  analyze-chromium-scale  Validate a scale run and write deterministic JSON"
@@ -1264,6 +1265,10 @@ test-chromium:
 
 test-gpu-restore:
 	@python3 -m unittest discover -s bench/gpu-restore -p 'test_*.py' \
+		$(if $(FILTER),-k '$(FILTER)',)
+
+test-computesdk:
+	@python3 -m unittest discover -s bench/computesdk -p 'test_*.py' \
 		$(if $(FILTER),-k '$(FILTER)',)
 
 test-chromium-request:
