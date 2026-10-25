@@ -934,6 +934,13 @@ processes; the host needs the `ffmpeg` CLI with libx264.
   `after_last_tile_ms` (last tile frame used to the region frame out of the encoder),
   `after_first_tile_ms`, `encode_ms`, `tile_lateness_ms` and `out_lateness_ms` (wall
   clock minus the slot's scene time), and per tile whether it is streaming.
+- `--tls-listen <addr:port>` (repeatable, with `--tls-file <path>`) also serves `GET
+  /frames` and `GET /healthz` with TLS on that address, for browsers on an https page.
+  `/layout` and `/stats` are served on `--listen` only, which the agent and the
+  coordinator keep on an address of their own. `--tls-file` is the file the agent writes
+  for its renderers (`tls.json`, `{"cert", "key"}`, PEM; see the agent's `--tls-secret`):
+  it is read again every 2 s and a new version is used for the connections that follow;
+  a version that does not load is logged and the previous one kept.
 
 ## Renderer
 

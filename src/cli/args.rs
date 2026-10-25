@@ -110,6 +110,16 @@ pub struct FleetAggregateArgs {
     /// Initial layout (JSON), instead of waiting for POST /layout
     #[arg(long)]
     pub layout: Option<std::path::PathBuf>,
+
+    /// Also serve /frames and /healthz with TLS on this address, for browsers (repeatable).
+    /// /layout and /stats are served on --listen only.
+    #[arg(long = "tls-listen", requires = "tls_file")]
+    pub tls_listen: Vec<String>,
+
+    /// The certificate of --tls-listen: a JSON object {"cert", "key"} (PEM), the file the
+    /// agent writes for its renderers; read again every 2 s
+    #[arg(long, requires = "tls_listen")]
+    pub tls_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
