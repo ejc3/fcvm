@@ -150,19 +150,29 @@ enable=$(grep -E '^ *systemctl enable ' fleet/ami/tile/build.sh)
 grep -qw 'fcvm-fleet-nginx.service' <<<"$enable" || no "tile/build.sh does not enable fcvm-fleet-nginx.service"
 grep -qE '(^| )nginx\.service' <<<"$enable" && no "tile/build.sh enables the distribution's nginx.service, which waits for network-online.target"
 # The store archive must keep nanosecond modification times through host/build.sh's bake
-# and host/store.sh's restore: fcvm's cached image digests (version-cache/) are valid for
-# the image's exact mtime, so a whole-second mtime makes a host hash its images again.
+# and host/store.sh's restore, staged through tmpfs or not: fcvm's cached image digests
+# (version-cache/) are valid for the image's exact mtime, so a whole-second mtime makes a
+# host hash its images again.
 create=$(sed -n 's/^  tar -c \(.*\) \\$/\1/p' fleet/ami/host/build.sh)
-extract=$(sed -n 's/^  zstd -q -d -T0 -c "\$ARCHIVE" | tar -x \(.*\) -C "\$M"$/\1/p' fleet/ami/host/store.sh)
+fns=$(sed -n '/^# --- restore functions/,/^# --- end of restore functions/p' fleet/ami/host/store.sh)
 tt=$(mktemp -d)
-if [ -z "$create" ] || [ -z "$extract" ]; then
-  no "host/build.sh's store tar or host/store.sh's restore tar not found"
+if [ -z "$create" ] || [ -z "$fns" ]; then
+  no "host/build.sh's store tar or host/store.sh's restore functions not found"
 else
-  mkdir "$tt/in" "$tt/out"; echo image > "$tt/in/img"; touch -d '2026-10-24 00:00:00.123456789' "$tt/in/img"
-  # shellcheck disable=SC2086 # the recipes' own flags, split as the recipes split them
-  tar -c $create -C "$tt/in" . | tar -x $extract -C "$tt/out"
-  [ "$(stat -c %y "$tt/out/img")" = "$(stat -c %y "$tt/in/img")" ] ||
-    no "the store archive drops the fraction of a modification time ($(stat -c %y "$tt/out/img"))"
+  mkdir "$tt/in"; echo image > "$tt/in/img"; touch -d '2026-10-24 00:00:00.123456789' "$tt/in/img"
+  for mode in direct staged; do
+    got=$(
+      M="$tt/$mode"; mkdir "$M"; stage=""
+      if [ "$mode" = staged ]; then stage=$(mktemp -d); fi
+      eval "$fns"
+      # shellcheck disable=SC2086 # the recipe's own flags, split as the recipe splits them
+      tar -c $create -C "$tt/in" . | extract
+      if [ -n "$stage" ]; then rm -rf "$stage"; fi
+      stat -c %y "$M/img"
+    )
+    [ "$got" = "$(stat -c %y "$tt/in/img")" ] ||
+      no "the store archive drops the fraction of a modification time ($mode restore: $got)"
+  done
 fi
 rm -rf "$tt"
 
