@@ -1405,63 +1405,109 @@ pub fn ensure_sbin_on_path() {
 /// Hashing reads the whole file, so the digest is memoised by `version_cache` under the
 /// file's path, modification time and length: it is computed once per build of a file
 /// (and once more on a host whose copy did not keep the mtime to the nanosecond), and a
-/// launch after that costs one stat and a read of a small cache entry. Hashing reads
-/// 210 MB/s on a g4dn.metal (Xeon 8259CL, no SHA instructions): 6.6 s for the fleet's
-/// 1.38 GB driver image and 0.58 s for its 122 MB renderer storage image, page cache
-/// warm. An unwritable cache directory degrades to hashing on every launch. The cache is valid for one
-/// mtime and length, so a different build written at the same path with the same
-/// length within one timestamp tick of the cached one would be read as that build;
-/// builds of these images write gigabytes and take seconds.
+/// launch after that costs one stat, a `sampled_fingerprint` and a read of a small cache
+/// entry. The fingerprint is part of the lookup, so a different image given the same
+/// length and mtime (a fixed-size image, a build that pins mtimes) is hashed again
+/// rather than served the old digest. Hashing reads 210 MB/s on a g4dn.metal (Xeon
+/// 8259CL, no SHA instructions): 6.6 s for the fleet's 1.38 GB driver image and 0.58 s
+/// for its 122 MB renderer storage image, page cache warm. An unwritable cache
+/// directory degrades to hashing on every launch.
 pub fn image_disk_digest(path: &std::path::Path) -> anyhow::Result<String> {
-    crate::version_cache::derived_from_file(path, IMAGE_DISK_DIGEST_NAMESPACE, |stamp| {
-        sha256_of_unchanged_file(path, stamp)
+    let file =
+        std::fs::File::open(path).with_context(|| format!("open image disk {}", path.display()))?;
+    let md = file
+        .metadata()
+        .with_context(|| format!("stat image disk {}", path.display()))?;
+    let opened = crate::version_cache::FileStamp::of(&md);
+    let fingerprint = sampled_fingerprint(&file, md.len()).with_context(|| {
+        format!(
+            "image disk build changed while it was read: {}",
+            path.display()
+        )
+    })?;
+    let namespace = format!("{IMAGE_DISK_DIGEST_NAMESPACE}:{fingerprint}");
+    crate::version_cache::derived_from_file(path, &namespace, |cached_under| {
+        sha256_of_open_file(&file, path, opened, cached_under)
     })
 }
 
 /// `version_cache` namespace of `image_disk_digest`; a change to the digest's format
-/// changes it.
+/// changes it. The image's `sampled_fingerprint` is appended to it.
 const IMAGE_DISK_DIGEST_NAMESPACE: &str = "image-disk-sha256-v1";
 
-/// SHA-256 of the file at `path`. Refused unless the open file has `stamp`, the stamp
-/// the digest is cached under, before and after it is read, so a rebuild racing the read
-/// is never cached as the digest of either build. The refusal carries the "image disk
-/// build changed" marker, so a restore that meets it falls back to a cold boot.
-fn sha256_of_unchanged_file(
+/// What `sampled_fingerprint` reads: the first and last `FINGERPRINT_EDGE` bytes and
+/// `FINGERPRINT_BLOCKS` blocks of `FINGERPRINT_BLOCK` bytes spread evenly between.
+const FINGERPRINT_EDGE: u64 = 1 << 20;
+const FINGERPRINT_BLOCK: u64 = 4096;
+const FINGERPRINT_BLOCKS: u64 = 64;
+
+/// SHA-256 (first 16 bytes, hex) over the image's length, its first and last 1 MiB and
+/// 64 4 KiB blocks at evenly spaced offsets: 2.25 MiB read in 66 calls, about 11 ms of
+/// hashing at the 210 MB/s measured on a g4dn.metal. `image_disk_digest` adds it to the
+/// cache lookup, so a different image with the same length and mtime is hashed again
+/// unless it differs only outside the sampled bytes. An ext4 image's first 1 MiB holds
+/// its superblock, with the UUID and times a new filesystem gets.
+fn sampled_fingerprint(file: &std::fs::File, len: u64) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::FileExt;
+    let mut ranges = vec![
+        (0, FINGERPRINT_EDGE.min(len)),
+        (len.saturating_sub(FINGERPRINT_EDGE), len),
+    ];
+    for i in 0..FINGERPRINT_BLOCKS {
+        let at = len / FINGERPRINT_BLOCKS * i / FINGERPRINT_BLOCK * FINGERPRINT_BLOCK;
+        ranges.push((at, (at + FINGERPRINT_BLOCK).min(len)));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(len.to_le_bytes());
+    let mut buf = vec![0u8; FINGERPRINT_EDGE as usize];
+    for (start, end) in ranges {
+        let part = &mut buf[..(end - start) as usize];
+        file.read_exact_at(part, start)?;
+        hasher.update(&part[..]);
+    }
+    Ok(hex::encode(&hasher.finalize()[..16]))
+}
+
+/// SHA-256 of the open image. Refused unless the file had `cached_under`, the stamp
+/// `version_cache` read by path and caches the digest under, when it was opened
+/// (`opened`), and still has it after the read, so a rebuild racing the read is never
+/// cached as the digest of either build. The refusal carries the "image disk build
+/// changed" marker, so a restore that meets it falls back to a cold boot.
+fn sha256_of_open_file(
+    file: &std::fs::File,
     path: &std::path::Path,
-    stamp: Option<crate::version_cache::FileStamp>,
+    opened: Option<crate::version_cache::FileStamp>,
+    cached_under: Option<crate::version_cache::FileStamp>,
 ) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("open image disk {}", path.display()))?;
-    let stamp_of = |file: &std::fs::File| -> anyhow::Result<_> {
-        let md = file
-            .metadata()
-            .with_context(|| format!("stat image disk {}", path.display()))?;
-        Ok(crate::version_cache::FileStamp::of(&md))
-    };
+    use std::os::unix::fs::FileExt;
     let changed = || {
         anyhow::anyhow!(
             "image disk build changed while it was hashed: {}",
             path.display()
         )
     };
-    let before = stamp_of(&file)?;
-    if before.is_none() || before != stamp {
+    if opened.is_none() || opened != cached_under {
         return Err(changed());
     }
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
+    let mut at = 0;
     loop {
         let n = file
-            .read(&mut buf)
+            .read_at(&mut buf, at)
             .with_context(|| format!("read image disk {}", path.display()))?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
+        at += n as u64;
     }
-    if stamp_of(&file)? != before {
+    let md = file
+        .metadata()
+        .with_context(|| format!("stat image disk {}", path.display()))?;
+    if crate::version_cache::FileStamp::of(&md) != opened {
         return Err(changed());
     }
     Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
@@ -1502,6 +1548,14 @@ pub fn is_overlay_storage_image(path: &std::path::Path) -> bool {
 /// error text is matched by `is_snapshot_load_failure` so a restore-time
 /// mismatch invalidates the snapshot and falls back to a fresh boot.
 pub fn verify_image_disk_identity(path: &std::path::Path, expected: &str) -> anyhow::Result<()> {
+    // Recorded before image identities were digests (#1219). Not the rebuild marker: the
+    // image may be the same build, and nothing here can tell.
+    anyhow::ensure!(
+        expected.starts_with("sha256:"),
+        "the snapshot predates content-keyed image identity: it records image disk {} as \
+         {expected} (inode:size:mtime), which this fcvm cannot verify; recreate the snapshot",
+        path.display()
+    );
     let current = image_disk_digest(path)
         .with_context(|| format!("re-read image disk {}", path.display()))?;
     anyhow::ensure!(
@@ -1530,31 +1584,93 @@ mod image_disk_identity_tests {
         assert!(!is_overlay_storage_image(std::path::Path::new("/tmp/img")));
     }
 
-    /// The digest is cached under the stamp `version_cache` read before the hash. A file
-    /// that is not at that stamp when it is read (a rebuild renamed in between) is
-    /// refused with the marker that turns a restore into a cold boot, so it is never
-    /// cached as the digest of the other build.
+    /// The digest is cached under the stamp `version_cache` reads by path. An open file
+    /// that did not have that stamp (a rebuild renamed in between) is refused with the
+    /// marker that turns a restore into a cold boot, so its digest is never cached as
+    /// the digest of the other build.
     #[test]
     fn a_digest_is_refused_for_a_file_not_at_the_cached_stamp() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x.storage-v2.img");
         std::fs::write(&path, b"build one").unwrap();
-        let stamp =
-            crate::version_cache::FileStamp::of(&std::fs::metadata(&path).unwrap()).unwrap();
-        assert!(sha256_of_unchanged_file(&path, Some(stamp)).is_ok());
-        for other in [
-            None,
-            Some(crate::version_cache::FileStamp {
-                mtime_ns: stamp.mtime_ns + 1,
-                ..stamp
-            }),
-        ] {
-            let err = sha256_of_unchanged_file(&path, other).unwrap_err();
+        let file = std::fs::File::open(&path).unwrap();
+        let stamp = crate::version_cache::FileStamp::of(&file.metadata().unwrap()).unwrap();
+        assert!(sha256_of_open_file(&file, &path, Some(stamp), Some(stamp)).is_ok());
+        let later = crate::version_cache::FileStamp {
+            mtime_ns: stamp.mtime_ns + 1,
+            ..stamp
+        };
+        for cached_under in [None, Some(later)] {
+            let err = sha256_of_open_file(&file, &path, Some(stamp), cached_under).unwrap_err();
             assert!(
                 format!("{err:#}").contains("image disk build changed"),
                 "{err:#}"
             );
         }
+    }
+
+    /// The cached digest is looked up by path, mtime and length. A different image of
+    /// the same length given the same mtime (fixed-size images, a build that pins
+    /// mtimes) must be hashed again, not served the old image's digest, or a restore
+    /// would accept it.
+    #[test]
+    fn a_replacement_with_the_same_length_and_mtime_is_hashed_again() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.storage-v2.img");
+        std::fs::write(&path, vec![b'a'; 3 << 20]).unwrap();
+        let old = image_disk_digest(&path).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+
+        let tmp = dir.path().join("x.tmp");
+        let mut bytes = vec![b'a'; 3 << 20];
+        bytes[0] = b'b';
+        std::fs::write(&tmp, &bytes).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&tmp)
+            .unwrap()
+            .set_modified(before.modified().unwrap())
+            .unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            (after.len(), after.modified().unwrap()),
+            (before.len(), before.modified().unwrap())
+        );
+
+        let new = image_disk_digest(&path).unwrap();
+        assert_ne!(
+            new, old,
+            "the replacement was served the old image's digest"
+        );
+        assert_eq!(
+            new,
+            format!("sha256:{}", hex::encode(Sha256::digest(&bytes)))
+        );
+        let err = verify_image_disk_identity(&path, &old).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("image disk build changed"),
+            "{err:#}"
+        );
+    }
+
+    /// A snapshot taken before image identities were digests records
+    /// `inode:size:mtime`. Its restore is refused with a message that says so, not as a
+    /// rebuilt image.
+    #[test]
+    fn a_legacy_identity_is_refused_as_predating_content_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.storage-v2.img");
+        std::fs::write(&path, b"build one").unwrap();
+        let err = verify_image_disk_identity(&path, "1841:9:1765574672.000000000").unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("predates content-keyed image identity"),
+            "{text}"
+        );
+        assert!(text.contains("recreate"), "{text}");
+        assert!(!text.contains("image disk build changed"), "{text}");
     }
 
     #[test]
