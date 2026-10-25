@@ -3114,6 +3114,10 @@ struct FakeEc2Api {
     tagged: BTreeMap<String, Vec<String>>,
     /// Instances DescribeInstances reports terminated.
     gone: Vec<String>,
+    /// For a spot launch that names a subnet: the subnets with capacity, and those whose AZ
+    /// does not offer the type (`Unsupported`).
+    spot_subnets: Vec<String>,
+    unsupported_subnets: Vec<String>,
     calls: Arc<std::sync::Mutex<Vec<Ec2Call>>>,
 }
 
@@ -3159,8 +3163,16 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
                 match action {
                     "RunInstances" => {
                         let spot = params["LaunchTemplate.LaunchTemplateName"] == "fcvm-fleet-tile-x86_64";
-                        if spot && !api.spot_capacity.contains(&region) {
-                            return error("InsufficientInstanceCapacity");
+                        match params.get("NetworkInterface.1.SubnetId") {
+                            Some(s) if api.unsupported_subnets.contains(s) => return error("Unsupported"),
+                            Some(s) if spot && !api.spot_subnets.contains(s) => {
+                                return error("InsufficientInstanceCapacity")
+                            }
+                            Some(_) => {}
+                            None if spot && !api.spot_capacity.contains(&region) => {
+                                return error("InsufficientInstanceCapacity")
+                            }
+                            None => {}
                         }
                         (StatusCode::OK, "<RunInstancesResponse><instancesSet><item><instanceId>i-0123456789abcdef0</instanceId></item></instancesSet></RunInstancesResponse>".into())
                     }
@@ -3383,6 +3395,120 @@ async fn the_aws_tile_driver_waits_for_a_ready_renderer_and_refuses_a_failed_one
         .await
         .expect_err("a failed renderer is not a ready tile");
     assert!(format!("{e:#}").contains("CUDA init failed"), "{e:#}");
+}
+
+/// With subnets configured for a region, a launch tries each of them (one per AZ) in order,
+/// naming the whole interface (subnet, the region's group, a public IPv4 and an IPv6
+/// address), and moves to the next AZ on a capacity refusal or an `Unsupported` type, before
+/// the next region. Before, a launch named no subnet, so the template's one AZ decided.
+#[tokio::test]
+async fn the_aws_tile_driver_tries_every_az_of_a_region_before_the_next() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    use fcvm::fleet::coord::ec2_aws::{networks, AwsEc2};
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let api = FakeEc2Api {
+        // us-west-2 has capacity for a launch that names no subnet: a launch must not get
+        // there while an AZ of us-east-1 has some.
+        spot_capacity: vec!["us-west-2".into()],
+        spot_subnets: vec!["subnet-c".into()],
+        unsupported_subnets: vec!["subnet-a".into()],
+        ..Default::default()
+    };
+    let base = fake_ec2_api(api.clone()).await;
+    let regions = vec!["us-east-1".to_string(), "us-west-2".to_string()];
+    let mut d = AwsEc2::new(
+        regions.clone(),
+        "fcvm-fleet-tile-x86_64".into(),
+        None,
+        "fcvm.example".into(),
+    )
+    .unwrap();
+    for r in &regions {
+        d.endpoints.insert(r.clone(), base.clone());
+    }
+    d.networks = networks(
+        &["us-east-1:subnet-a,subnet-b,subnet-c".to_string()],
+        &["us-east-1:sg-0fleet".to_string()],
+    )
+    .unwrap();
+    let l = d.launch("ec2-1").await.unwrap();
+    assert_eq!(l.instance, "us-east-1/i-0123456789abcdef0");
+    let calls = api.calls.lock().unwrap();
+    let runs: Vec<&Ec2Call> = calls
+        .iter()
+        .filter(|(_, p)| p["Action"] == "RunInstances")
+        .collect();
+    let tried: Vec<(&str, Option<&str>)> = runs
+        .iter()
+        .map(|(r, p)| {
+            (
+                r.as_str(),
+                p.get("NetworkInterface.1.SubnetId").map(String::as_str),
+            )
+        })
+        .collect();
+    assert_eq!(
+        tried,
+        vec![
+            ("us-east-1", Some("subnet-a")),
+            ("us-east-1", Some("subnet-b")),
+            ("us-east-1", Some("subnet-c")),
+        ],
+        "every AZ of the first region, in order, and no other region"
+    );
+    for (_, p) in &runs {
+        assert_eq!(
+            p["LaunchTemplate.LaunchTemplateName"],
+            "fcvm-fleet-tile-x86_64"
+        );
+        assert_eq!(p["NetworkInterface.1.DeviceIndex"], "0");
+        assert_eq!(p["NetworkInterface.1.SecurityGroupId.1"], "sg-0fleet");
+        assert_eq!(p["NetworkInterface.1.AssociatePublicIpAddress"], "true");
+        assert_eq!(p["NetworkInterface.1.Ipv6AddressCount"], "1");
+        assert_eq!(p["NetworkInterface.1.DeleteOnTermination"], "true");
+    }
+}
+
+/// `--ec2-subnets` and `--ec2-security-group` (or their environment variables) parse into
+/// one network per region; a region with subnets and no group is refused at start.
+#[test]
+fn tile_networks_need_a_group_for_every_region_with_subnets() {
+    use fcvm::fleet::coord::ec2_aws::networks;
+    let n = networks(
+        &[
+            "us-east-1:subnet-a,subnet-b".to_string(),
+            String::new(),
+            "us-west-2:subnet-z".to_string(),
+        ],
+        &[
+            "us-east-1:sg-1".to_string(),
+            "us-west-2:sg-2".to_string(),
+            "us-east-2:sg-3".to_string(),
+        ],
+    )
+    .unwrap();
+    assert_eq!(n["us-east-1"].subnets, vec!["subnet-a", "subnet-b"]);
+    assert_eq!(n["us-east-1"].security_group, "sg-1");
+    assert_eq!(n["us-west-2"].subnets, vec!["subnet-z"]);
+    assert!(
+        !n.contains_key("us-east-2"),
+        "a group alone names no subnet"
+    );
+    let e = networks(&["us-east-1:subnet-a".to_string()], &[]).unwrap_err();
+    assert!(
+        format!("{e:#}").contains("no --ec2-security-group"),
+        "{e:#}"
+    );
+    assert!(networks(&["subnet-a".to_string()], &[]).is_err());
+    assert!(networks(
+        &[
+            "us-east-1:subnet-a".to_string(),
+            "us-east-1:subnet-b".to_string()
+        ],
+        &["us-east-1:sg-1".to_string()]
+    )
+    .is_err());
 }
 
 /// The AWS tile driver: a spot launch from the template, tagged, in the first region with

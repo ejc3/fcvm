@@ -418,7 +418,9 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--on-demand-group <region>:<group name>]... [--spot-wait 120]
                  [--state-bucket <bucket> [--state-key state.json] [--state-region <region>]]
                  [--ec2 aws --ec2-tiles 8 --ec2-regions <r1,r2,...> [--ec2-template fcvm-fleet-tile-x86_64]
-                  [--ec2-on-demand-template <name>] [--fleet-name stage]] [--dns-zone fcvm.dev]
+                  [--ec2-on-demand-template <name>] [--fleet-name stage]
+                  [--ec2-subnets <region>:<subnet>,... --ec2-security-group <region>:<group>]...]
+                 [--dns-zone fcvm.dev]
                  [--dns-token-secret <secret> [--dns-zone-id <id>] [--dns-nameservers <ns>,...]]
                  [--tls-secret <secret>] [--secrets-region <region>]
 ```
@@ -432,7 +434,13 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   instance from the tile launch template (one-time spot), tagged `Purpose=fcvm-fleet-tile`,
   `FleetTile=<tile>` and `Fleet=<--fleet-name>` (`FLEET_NAME`, default `stage`) at launch,
   in the first of `--ec2-regions` (`FLEET_REGIONS`) with
-  capacity; when every region refuses for capacity it tries `--ec2-on-demand-template`,
+  capacity. In a region given `--ec2-subnets` (`FLEET_EC2_SUBNETS`, entries separated by
+  spaces; one subnet per AZ) a launch tries each subnet in order before the next region,
+  naming the interface itself: that subnet, the region's `--ec2-security-group`
+  (`FLEET_EC2_SECURITY_GROUPS`), a public IPv4 address and one IPv6 address. A refusal for
+  capacity, or `Unsupported` (the AZ does not offer the type), moves to the next subnet. A
+  region without subnets launches in the template's. When every region refuses for capacity
+  it tries `--ec2-on-demand-template` the same way,
   and without one the tile waits for capacity (recorded on its own) and asks again every
   10 s. A tile is ready once its instance runs and its renderer answers
   `https://ec2-<n>.<zone>/health` (the name resolved to the instance) with `ready` true; a

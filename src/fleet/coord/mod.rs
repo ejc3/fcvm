@@ -894,6 +894,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
                 args.dns_zone.clone(),
             )?;
             d.fleet = args.fleet_name.clone();
+            d.networks = ec2_aws::networks(&args.ec2_subnets, &args.ec2_security_group)?;
             Some(Arc::new(d))
         }
     };
