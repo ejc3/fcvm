@@ -24,3 +24,6 @@ std::string base64(const std::string& data);
 std::string ws_accept(const std::string& client_key);
 // One unmasked server frame (FIN set) with opcode 1 text, 2 binary, 8 close, 10 pong.
 std::string ws_frame(int opcode, const void* data, size_t n);
+// 32 lowercase hex digits from /dev/urandom: the process's boot id, which
+// /health reports so a client notices a restarted renderer (it has lost its scene).
+std::string new_boot_id();

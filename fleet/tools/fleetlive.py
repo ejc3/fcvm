@@ -23,7 +23,11 @@ class Live:
                         f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n{extra}\r\n").encode())
         head = b""
         while b"\r\n\r\n" not in head:
-            head += self.s.recv(1)
+            c = self.s.recv(1)
+            if not c:
+                self.s.close()
+                raise ConnectionError("the coordinator closed /live during the handshake")
+            head += c
         assert b" 101 " in head.split(b"\r\n")[0], head
         self.snap, self.receipts, self.cv, self.closed = None, {}, threading.Condition(), False
         self.others = []  # hello, claim, verified, clock, error
@@ -104,6 +108,8 @@ class Live:
         self.send({"type": "intent", "id": iid, "name": name, "args": args})
         with self.cv:
             while iid not in self.receipts:
+                if self.closed:
+                    raise ConnectionError(f"/live closed before the receipt for {name}")
                 self.cv.wait(30)
             return self.receipts[iid]
 
