@@ -1360,7 +1360,7 @@ export function wallView(input: WallInput): WallView {
     return { id: t.id, rect: t.rect, height, keep: focused };
   });
   const fitted = fitBandwidth(asks, st.image_aspect, input.budgetBps);
-  // Every tile streams over the one family the IPv6 probe chose; until it answers, none does.
+  // Every tile streams over the one family the probe chose; until it answers, none does.
   const family = s.net.family;
   const direct: DrawSource[] = st.tiles.filter((t) => isLive(t) && streamUrl(t, family) !== null).map((t) => {
     const height = fitted.heights.get(t.id) ?? 144;
@@ -1488,12 +1488,11 @@ export function aggregatedAvailable(aggregates: readonly Aggregate[], family: Fa
 
 /** The stats drawer's line on the address family the tiles stream over. */
 export function familyLine(net: ClientState["net"]): string {
-  if (net.family === null) return "Address family: checking IPv6";
-  if (net.family === "v6")
-    return net.probeMs === null
-      ? "Address family: IPv6 for every tile (the tiles have no IPv4 address)"
-      : `Address family: IPv6 for every tile (connected in ${Math.round(net.probeMs)} ms)`;
-  return net.probeMs === null
-    ? "Address family: IPv4 for every tile (the tiles have no IPv6 address)"
-    : `Address family: IPv4 for every tile (IPv6 did not connect in ${FAMILY_PROBE_ATTEMPTS} tries of ${(FAMILY_PROBE_MS / 1000).toFixed(1)} s)`;
+  if (net.family === null) return "Address family: checking";
+  const name = net.family === "v6" ? "IPv6" : "IPv4";
+  if (net.via === "race" && net.probeMs !== null)
+    return `Address family: ${name} for every tile (connected first, in ${Math.round(net.probeMs)} ms)`;
+  if (net.via === "no-answer")
+    return `Address family: IPv4 for every tile (neither family connected in ${FAMILY_PROBE_ATTEMPTS} tries of ${(FAMILY_PROBE_MS / 1000).toFixed(1)} s)`;
+  return `Address family: ${name} for every tile (the tiles have no ${net.family === "v6" ? "IPv4" : "IPv6"} address)`;
 }
