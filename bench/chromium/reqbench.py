@@ -2195,10 +2195,15 @@ def reap_disk(
                 fcntl.flock(state_lock, fcntl.LOCK_UN)
                 os.close(state_lock)
             return reaped
+    # A removal that finds the file already gone has nothing left to do: under
+    # concurrent clones another fcvm's stale-state cleanup can delete this
+    # clone's state or lock between the check and the remove.
     if state_path and os.path.lexists(state_path):
         try:
             os.remove(state_path)
             reaped.append(state_path)
+        except FileNotFoundError:
+            pass
         except OSError as e:
             out.setdefault("disk_errors", []).append(f"{state_path}: {e}")
     # cleanup_stale_state removes `<vm_id>.json.lock` alongside the state file;
@@ -2213,6 +2218,8 @@ def reap_disk(
         try:
             os.remove(lock)
             reaped.append(lock)
+        except FileNotFoundError:
+            pass
         except OSError as e:
             out.setdefault("disk_errors", []).append(f"{lock}: {e}")
     elif state_lock is not None:
@@ -2989,6 +2996,34 @@ def restore_marks(log_path: str, launch_wall: float) -> dict:
     return marks
 
 
+def restore_ack(log_path: str) -> dict:
+    """fcvm's restored record from a clone's log: the ACK time and the guest's phases.
+
+    fcvm prints one JSON line on stdout when fc-agent acknowledges the exact
+    restore generation (restored_record in src/commands/snapshot.rs):
+    ack_ms, the host-observed time from the start of the restore call to
+    the ACK, and guest_phases, fc-agent's per-phase milliseconds for its
+    side of the restore (socket cleanup, reopening the network gate, ...).
+    Read after the request's answer, so nothing here is timed. A log
+    without the record says so rather than reading as zero.
+    """
+    try:
+        with open(log_path, errors="replace") as handle:
+            for line in handle:
+                if not line.startswith("{"):
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(record, dict) and record.get("status") == "restored":
+                    return {"ack_ms": record.get("ack_ms"),
+                            "guest_phases": record.get("guest_phases")}
+    except OSError as error:
+        return {"error": f"{type(error).__name__}: {error}"}
+    return {"error": "no restored record in the clone's log"}
+
+
 def probe_batch_script(sections) -> str:
     """One shell script that runs every section and frames its output and status.
 
@@ -3753,6 +3788,62 @@ def discover_wd_session(args, fcvm_pid: int, deadline: float) -> str:
     return session
 
 
+def _drive_clone(args, rep, op, endpoint, deadline, fcvm_pid, rec):
+    """Render one page on a ready clone: WebDriver for WebKit, CDP otherwise."""
+    import cdpdrive
+
+    if getattr(args, "engine", "chromium") == "webkit":
+        # Classic WebDriver has NO session discovery: the warm session
+        # id is written by entry-webkit.sh to /run/bench-session-id
+        # BEFORE the golden snapshot, so it is snapshot state --
+        # identical across clones for exactly the reason cdpdrive's
+        # target id is. Captured ONCE via fcvm exec on the first clone
+        # and pinned for every later rep (discovery-once, same pattern
+        # as --prewire; warmups run first, so the exec cost lands on a
+        # discarded rep).
+        if not getattr(args, "wd_session_id", ""):
+            args.wd_session_id = discover_wd_session(args, fcvm_pid, deadline)
+        rec["session_prewired"] = True
+        import wddrive
+
+        result = wddrive.drive(argparse.Namespace(
+            cdp_host=endpoint,
+            url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
+            timeout=max(1.0, deadline - time.monotonic()),
+            session_id=args.wd_session_id,
+            out_prefix="",
+        ))
+    else:
+        ws_url = clone_ws_url(args.ws_url, endpoint) if args.ws_url else ""
+        rec["ws_url_prewired"] = bool(ws_url)
+        drive_args = argparse.Namespace(
+            cdp_host=endpoint,
+            url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
+            format=args.format,
+            quality=args.quality,
+            timeout=max(1.0, deadline - time.monotonic()),
+            idle_wait_ms=0.0,
+            out_prefix="",
+            ws_url=ws_url,
+            connect_retries=200,
+            nav_timing=True,
+            print_target=False,
+            # This Namespace is an explicit, CLOSED field list, so every flag
+            # cdpdrive grows has to be added here too or `drive()` raises
+            # AttributeError — which is not in its except tuple, escapes it,
+            # and is swallowed by the `except Exception` below, failing every
+            # cdp rep. cdpdrive also reads it with getattr; both halves.
+            host_header="",
+            op=op,
+            # getattr: failure-path fixtures drive this function with
+            # bare Namespaces that predate the knob.
+            resolve_poll_ms=getattr(args, "resolve_poll_ms", 50.0),
+            render_module=os.path.join(HERE, "render.py"),
+        )
+        result = cdpdrive.drive(drive_args)
+    return result
+
+
 def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screenshot") -> dict:
     import cdpdrive
 
@@ -3767,7 +3858,12 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
     log = os.path.join(args.out_dir, f"{name}.log")
     rec: dict = {"arm": arm_name, "rep": rep, "name": name}
 
-    cmd = [args.fcvm, "snapshot", "run"] + clone_backend_args(args) + [
+    # reqscale places each clone in its backend's cgroup through a guard that
+    # execs fcvm (same pid), so the FILE and UFFD cgroups account their own
+    # clones. Without the prefix every clone ran in the driver's cgroup.
+    cmd = list(getattr(args, "spawn_prefix", ())) + [
+        args.fcvm, "snapshot", "run",
+    ] + clone_backend_args(args) + [
         "--name", name, "--no-dirty-tracking", "--no-swap",
     ]
     env = dict(os.environ, RUST_LOG=args.rust_log)
@@ -3776,6 +3872,9 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
     watch = DirWatch(args.state_dir)
     t_spawn = time.monotonic()
     t_spawn_wall = time.time()
+    # reqscale times each request of an open-loop run from these monotonic
+    # stamps (the same clock as its time.monotonic_ns schedule).
+    rec["started_monotonic_ns"] = int(t_spawn * 1e9)
     interrupted = None
     fcvm_start_time = None
     try:
@@ -3812,55 +3911,20 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
             rec["state_to_port_ms"] = wait_port(endpoint, deadline, proc, log)
             rec["spawn_to_port_ms"] = (time.monotonic() - t_spawn) * 1000
 
-            if getattr(args, "engine", "chromium") == "webkit":
-                # Classic WebDriver has NO session discovery: the warm session
-                # id is written by entry-webkit.sh to /run/bench-session-id
-                # BEFORE the golden snapshot, so it is snapshot state --
-                # identical across clones for exactly the reason cdpdrive's
-                # target id is. Captured ONCE via fcvm exec on the first clone
-                # and pinned for every later rep (discovery-once, same pattern
-                # as --prewire; warmups run first, so the exec cost lands on a
-                # discarded rep).
-                if not getattr(args, "wd_session_id", ""):
-                    args.wd_session_id = discover_wd_session(args, fcvm_pid, deadline)
-                rec["session_prewired"] = True
-                import wddrive
-
-                result = wddrive.drive(argparse.Namespace(
-                    cdp_host=endpoint,
-                    url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
-                    timeout=max(1.0, deadline - time.monotonic()),
-                    session_id=args.wd_session_id,
-                    out_prefix="",
-                ))
-            else:
-                ws_url = clone_ws_url(args.ws_url, endpoint) if args.ws_url else ""
-                rec["ws_url_prewired"] = bool(ws_url)
-                drive_args = argparse.Namespace(
-                    cdp_host=endpoint,
-                    url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
-                    format=args.format,
-                    quality=args.quality,
-                    timeout=max(1.0, deadline - time.monotonic()),
-                    idle_wait_ms=0.0,
-                    out_prefix="",
-                    ws_url=ws_url,
-                    connect_retries=200,
-                    nav_timing=True,
-                    print_target=False,
-                    # This Namespace is an explicit, CLOSED field list, so every flag
-                    # cdpdrive grows has to be added here too or `drive()` raises
-                    # AttributeError — which is not in its except tuple, escapes it,
-                    # and is swallowed by the `except Exception` below, failing every
-                    # cdp rep. cdpdrive also reads it with getattr; both halves.
-                    host_header="",
-                    op=op,
-                    # getattr: failure-path fixtures drive this function with
-                    # bare Namespaces that predate the knob.
-                    resolve_poll_ms=getattr(args, "resolve_poll_ms", 50.0),
-                    render_module=os.path.join(HERE, "render.py"),
-                )
-                result = cdpdrive.drive(drive_args)
+            # reqscale hands each request a private probe that pins this clone's
+            # Firecracker child and reads its fault counters from endpoint-ready
+            # to the answer. A probe failure is a request failure and still goes
+            # through the teardown below.
+            fault_probe = getattr(args, "firecracker_fault_probe", None)
+            fault_probe_started = False
+            if fault_probe is not None:
+                fault_probe.begin(fcvm_pid)
+                fault_probe_started = True
+            try:
+                result = _drive_clone(args, rep, op, endpoint, deadline, fcvm_pid, rec)
+            finally:
+                if fault_probe_started:
+                    rec["firecracker_process_faults_ready_to_artifact"] = fault_probe.finish()
             raise_if_harness_interrupted()
             rec["render"] = result
             rec["ok"] = bool(result.get("ok"))
@@ -3895,7 +3959,10 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
                 rec["failure_stage"] = result.get("stage", "")
             # THE CALLER'S ANSWER IS IN HAND HERE. Everything after this line is
             # teardown, and none of it is latency the caller pays.
-            rec["blocking_ms"] = (time.monotonic() - t_spawn) * 1000
+            t_answer = time.monotonic()
+            rec["blocking_ms"] = (t_answer - t_spawn) * 1000
+            if rec.get("ok"):
+                rec["artifact_monotonic_ns"] = int(t_answer * 1e9)
             t_owned = time.monotonic()
             state = wait_state_owned(
                 state_path,
@@ -4008,9 +4075,12 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
             rec["log"] = log
             e.record = rec
             raise e from interrupted
-    rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
+    t_finished = time.monotonic()
+    rec["wall_ms"] = (t_finished - t_spawn) * 1000
+    rec["finished_monotonic_ns"] = int(t_finished * 1e9)
     rec["log"] = log
     rec["restore_marks"] = restore_marks(log, t_spawn_wall)
+    rec["restore_ack"] = restore_ack(log)
     if interrupted is not None:
         raise interrupted
     raise_if_harness_interrupted()
@@ -4181,6 +4251,7 @@ def run_noop_request(args, rep: int, fast: bool = False) -> dict:
     rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
     rec["log"] = log
     rec["restore_marks"] = restore_marks(log, t_spawn_wall)
+    rec["restore_ack"] = restore_ack(log)
     if interrupted is not None:
         raise interrupted
     raise_if_harness_interrupted()

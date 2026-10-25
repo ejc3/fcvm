@@ -78,6 +78,7 @@ import os
 import re
 import secrets
 import statistics
+import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -130,7 +131,16 @@ REPLAY_LOGS = {
     "corpus_access_log_sha256": "corpus-access.log",
     "replay_queries_log_sha256": "replay-queries.log",
 }
+# A replay log too large for this repository is kept in a separate records
+# repository, and the run carries a pointer to it: the repository, the path
+# there and the commit that holds the file, beside the sha256 its
+# dns-evidence.json already recorded. FCVM_BENCH_RECORDS names a local
+# checkout of that repository. Without one a pointed-to log is not read, and
+# the run is refused: nothing is reported as verified that was not read.
+EXTERNAL_LOGS = "external-logs.json"
+RECORDS_ENV = "FCVM_BENCH_RECORDS"
 RUN_INPUT_RELATIVE_PATHS = (
+    EXTERNAL_LOGS,
     "analysis.json",
     "reqbench.jsonl",
     "dns-evidence.json",
@@ -945,7 +955,8 @@ def check_replay_queries(run_dir, name, data, dns_data, stage_hosts, answers):
             )
 
 
-def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls, run_id):
+def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls, run_id,
+                   replay_logs=True):
     """Hold a clean verdict to the files it cites; raise RunError otherwise.
 
     measured_urls is the cell's own URL list, what every bracket has to have
@@ -1090,15 +1101,18 @@ def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls, run_id)
         answers |= bracket_answers(run_dir, name, verify)
         stage_hosts[stage] = set(verify.get("hosts") or {})
     # The replay server's own logs, pinned by hash at the verdict.
+    if not replay_logs:
+        return answers, owner_load_evidence
     bodies = {}
     for field, name in REPLAY_LOGS.items():
         want = evidence.get(field)
         if not is_sha256(want):
             raise RunError(f"{run_dir}: dns-evidence.json has no sha256 for {name} ({field})")
         path = os.path.join(run_dir, name)
-        if not os.path.isfile(path):
-            raise RunError(f"{run_dir}: {name} cited by dns-evidence.json is missing")
-        data, digest = sources.read_hashed(path)
+        if os.path.isfile(path):
+            data, digest = sources.read_hashed(path)
+        else:
+            data, digest = read_external_log(run_dir, name, want, sources)
         if digest != want:
             raise RunError(
                 f"{run_dir}: {name} sha256 {digest} does not match the "
@@ -1114,6 +1128,63 @@ def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls, run_id)
         answers,
     )
     return answers, owner_load_evidence
+
+
+def read_external_log(run_dir, name, want, sources):
+    """A replay log the run keeps in the records repository: its bytes and sha256.
+
+    Read from the commit the run's external-logs.json names, through git, so a
+    checkout whose working tree has moved still answers for that commit. Every
+    way of not reading the file (no pointer, a pointer that names another file,
+    no checkout, a checkout without that commit) is a RunError that says the log
+    was not verified.
+    """
+    pointer_path = os.path.join(run_dir, EXTERNAL_LOGS)
+    if not os.path.isfile(pointer_path):
+        raise RunError(f"{run_dir}: {name} cited by dns-evidence.json is missing")
+    pointer = sources.read_json(pointer_path)
+    files = pointer.get("files") if isinstance(pointer, dict) else None
+    entry = files.get(name) if isinstance(files, dict) else None
+    repository = pointer.get("repository") if isinstance(pointer, dict) else None
+    if (
+        not isinstance(entry, dict)
+        or not isinstance(repository, str) or not repository
+        or not isinstance(entry.get("path"), str) or not entry["path"]
+        or not isinstance(entry.get("commit"), str)
+        or not re.fullmatch(r"[0-9a-f]{40}", entry["commit"])
+    ):
+        raise RunError(
+            f"{run_dir}: {name} is missing and {EXTERNAL_LOGS} names no repository, "
+            "path and commit for it"
+        )
+    if entry.get("sha256") != want:
+        raise RunError(
+            f"{run_dir}: {EXTERNAL_LOGS} points {name} at sha256 {entry.get('sha256')}, "
+            f"not the {want} dns-evidence.json recorded"
+        )
+    where = f"{repository}@{entry['commit']}:{entry['path']}"
+    checkout = os.environ.get(RECORDS_ENV)
+    if not checkout:
+        raise RunError(
+            f"{run_dir}: NOT VERIFIED: {name} is not in this checkout; it is kept in "
+            f"{where}. Set {RECORDS_ENV} to a checkout of {repository} to verify it"
+        )
+    try:
+        shown = subprocess.run(
+            ["git", "-C", checkout, "cat-file", "blob", f"{entry['commit']}:{entry['path']}"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+    except OSError as error:
+        raise RunError(f"{run_dir}: NOT VERIFIED: cannot run git for {where}: {error}")
+    if shown.returncode != 0:
+        raise RunError(
+            f"{run_dir}: NOT VERIFIED: {RECORDS_ENV}={checkout} does not hold {where} "
+            f"({shown.stderr.decode(errors='replace').strip()})"
+        )
+    data = shown.stdout
+    digest = hashlib.sha256(data).hexdigest()
+    sources.entries.append({"path": where, "sha256": digest})
+    return data, digest
 
 
 def recorded_addresses(run_dir, measured_urls, guest_env, answers):
@@ -1362,8 +1433,15 @@ def check_diag_limits(run_dir, diag, measured_urls, addresses, stall_max_ms):
             )
 
 
-def load_cell(run_dir, sources=None):
-    """Read one run directory into an index cell. Returns (cell, source entries)."""
+def load_cell(run_dir, sources=None, replay_logs=True):
+    """Read one run directory into an index cell. Returns (cell, source entries).
+
+    replay_logs=False reads every record except the replay server's two logs
+    and the bracket check that needs them, and marks the cell
+    replay_logs_verified false. The index (main) never uses it: it is for a
+    reader that only needs the cell's figures, such as the report lint in CI,
+    where the logs kept in the records repository are not checked out.
+    """
     if sources is None:
         sources = Sources(run_dir)
     marker = os.path.join(run_dir, WITHDRAWN_MARKER)
@@ -1477,7 +1555,7 @@ def load_cell(run_dir, sources=None):
         evidence = sources.read_json(evidence_path)
         answers, owner_load_evidence = check_evidence(
             run_dir, evidence, sources, cell["guest_dns"], measured,
-            run_id,
+            run_id, replay_logs=replay_logs,
         )
         dns_verdict = evidence["verdict"]
         # Reported, not gated: the run driver refused a busy box at the
@@ -1575,7 +1653,9 @@ def load_cell(run_dir, sources=None):
         }
     request_loads = request_load_evidence(run_dir, analysis, arms, sources)
 
+    unread = {} if replay_logs else {"replay_logs_verified": False}
     return {
+        **unread,
         "run_dir": str(run_dir),
         "run_id": run_id,
         "engine": cell["engine"],

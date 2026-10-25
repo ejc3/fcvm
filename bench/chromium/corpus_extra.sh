@@ -45,6 +45,7 @@ WARMUP="${WARMUP:-28}"       # two full 14-URL cycles, the campaign's warmup
 MEM_NS="${MEM_NS:-1,2,4,8}"
 MEM_REPS="${MEM_REPS:-14}"
 MEM_SEED="${MEM_SEED:-20260830}"
+MEM_OP="${MEM_OP:-screenshot}"
 UFFD_MODE="${UFFD_MODE:-minor}"
 UFFD_PREFETCH="${UFFD_PREFETCH:-on}"
 
@@ -550,7 +551,7 @@ if [ "$CORPUS_EXTRA_STAGED" = 0 ]; then
         STAMP="$STAMP" RUN_ID="$RUN_ID" CONTAINER_OWNER_TOKEN="$CONTAINER_OWNER_TOKEN" \
         RESULTS="$RESULTS" LOGDIR="$LOGDIR" TAG="$TAG" IMAGE="$IMAGE" PHASES="$PHASES" \
         REPS="$REPS" WARMUP="$WARMUP" MEM_NS="$MEM_NS" MEM_REPS="$MEM_REPS" \
-        MEM_SEED="$MEM_SEED" \
+        MEM_SEED="$MEM_SEED" MEM_OP="$MEM_OP" \
         UFFD_MODE="$UFFD_MODE" UFFD_PREFETCH="$UFFD_PREFETCH" \
         bash "$bundle_dir/corpus_extra.sh"
 fi
@@ -1294,13 +1295,13 @@ if [[ ",$PHASES," == *",hostcdp,"* ]]; then
 fi
 
 if [[ ",$PHASES," == *",memory,"* ]]; then
-    say "matched-basis memory: N in $MEM_NS, $MEM_REPS reps, interleaved seed $MEM_SEED"
+    say "matched-basis memory: N in $MEM_NS, $MEM_REPS reps, interleaved seed $MEM_SEED, clones render with $MEM_OP"
     ACTIVE_PHASE_FINALIZER=memory-containers \
     run_logged "$LOGDIR/memory.log" python3 "$BENCH/corpus_mem.py" \
         --results "$RESULTS/memory" --tag "$TAG" \
         --image "$IMAGE" --image-id "$RUNTIME_IMAGE" \
         --urls "$URLS" --ns "$MEM_NS" --reps "$MEM_REPS" \
-        --seed "$MEM_SEED" \
+        --seed "$MEM_SEED" --op "$MEM_OP" \
         --uffd-mode "$UFFD_MODE" --uffd-prefetch "$UFFD_PREFETCH" \
         --run-id "$RUN_ID" \
         --container-owner-token "$CONTAINER_OWNER_TOKEN" \

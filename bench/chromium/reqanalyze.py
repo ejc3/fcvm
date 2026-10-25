@@ -2207,6 +2207,22 @@ def analyze_backend(
                     (r.get("restore_marks") or {}).get(k)))
                 for key in marks
             }
+        acks = [r.get("restore_ack") for r in by[a]]
+        acks = [x for x in acks if isinstance(x, dict) and "error" not in x]
+        if acks:
+            timeline["restore_ack_ms"] = metric_summary(by[a], lambda r: finite_or_none(
+                (r.get("restore_ack") or {}).get("ack_ms")))
+            phase_keys = sorted({k for x in acks if isinstance(x.get("guest_phases"), dict)
+                                 for k, v in x["guest_phases"].items()
+                                 if k.endswith("_ms") and finite_or_none(v) is not None})
+            if phase_keys:
+                timeline["guest_phases_ms"] = {
+                    key: metric_summary(by[a], lambda r, k=key: finite_or_none(
+                        ((r.get("restore_ack") or {}).get("guest_phases") or {}).get(k)
+                        if isinstance((r.get("restore_ack") or {}).get("guest_phases"), dict)
+                        else None))
+                    for key in phase_keys
+                }
         polled = [r for r in by[a]
                   if isinstance((r.get("render") or {}).get("resolve_polls"), list)]
         if polled:

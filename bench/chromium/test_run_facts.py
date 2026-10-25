@@ -17,8 +17,10 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import types
 import unittest
@@ -177,6 +179,255 @@ class RestoreMarks(unittest.TestCase):
             missing = reqbench.restore_marks(os.path.join(d, "absent.log"), self.launch())
         self.assertIsNone(marks["resumed_ms"])
         self.assertIn("FileNotFoundError", missing["error"])
+
+
+class RestoreAck(unittest.TestCase):
+    """restore_ack: fcvm's restored record, with fc-agent's per-phase timing.
+
+    fcvm prints one JSON line on stdout once the guest acknowledges the
+    restore (restored_record in src/commands/snapshot.rs). Its guest_phases
+    split the guest's restore work, which is where a clone spends the time
+    between the VM resuming and its DevTools port answering."""
+
+    RECORD = {"status": "restored", "name": "rb-1", "snapshot": "cb", "vm_id": "vm-1",
+              "backend": "uffd", "hypervisor": "firecracker", "ack_ms": 367,
+              "guest_phases": {"tcp_cleanup_ms": 130.3, "tcp_reopen_ms": 109.9,
+                               "tcp_verified": True, "tcp_destroyed": 1, "total_ms": 303.6}}
+
+    def test_the_restored_record_is_read_from_the_log(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = write(d, "clone.log", RestoreMarks.LOG + json.dumps(self.RECORD) + "\n"
+                        + "{not json\n")
+            ack = reqbench.restore_ack(log)
+        self.assertEqual(ack, {"ack_ms": 367, "guest_phases": self.RECORD["guest_phases"]})
+
+    def test_a_log_without_the_record_says_so(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = write(d, "clone.log", RestoreMarks.LOG + json.dumps({"status": "serving"}) + "\n")
+            ack = reqbench.restore_ack(log)
+            missing = reqbench.restore_ack(os.path.join(d, "absent.log"))
+        self.assertEqual(set(ack), {"error"})
+        self.assertIn("FileNotFoundError", missing["error"])
+
+    def test_both_request_paths_record_it(self):
+        """The cdp and noop request functions each set restore_ack beside restore_marks."""
+        with open(os.path.join(HERE, "reqbench.py")) as f:
+            source = f.read()
+        self.assertEqual(source.count('rec["restore_ack"] = restore_ack(log)'),
+                         source.count('rec["restore_marks"] = restore_marks(log, t_spawn_wall)'))
+        self.assertGreaterEqual(source.count('rec["restore_ack"] = restore_ack(log)'), 2)
+
+    def test_the_restored_record_is_a_println_in_fcvm(self):
+        with open(os.path.join(REPO, "src", "commands", "snapshot.rs")) as f:
+            source = f.read()
+        self.assertIn('"status": "restored"', source)
+        self.assertIn('"guest_phases": phases', source)
+        self.assertIn('"ack_ms": ack_ms', source)
+
+
+class RestoreAckExtraction(unittest.TestCase):
+    """restore_ack.py: the same reading for runs whose records predate it."""
+
+    def run_dir(self, d, logs):
+        rows = [{"kind": "meta", "run_id": "r1"}]
+        for i, text in enumerate(logs):
+            name = f"rb-r1-{i}-norm.log"
+            if text is not None:
+                write(d, name, text)
+            rows.append({"record_id": f"r1:cdp:{i}:0", "arm": "cdp", "rep": i, "warmup": False,
+                         "log": f"/elsewhere/{name}"})
+        write(d, "reqbench.jsonl", "".join(json.dumps(r) + "\n" for r in rows))
+
+    def test_every_record_gets_its_log_hash_and_reading(self):
+        import restore_ack
+        good = RestoreMarks.LOG + json.dumps(RestoreAck.RECORD) + "\n"
+        with tempfile.TemporaryDirectory() as d:
+            self.run_dir(d, [good, RestoreMarks.LOG])
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(restore_ack.main(["restore_ack.py", d]), 0)
+            with open(os.path.join(d, "restore-ack.jsonl")) as f:
+                lines = [json.loads(line) for line in f]
+            with open(os.path.join(d, "reqbench.jsonl"), "rb") as f:
+                source = hashlib.sha256(f.read()).hexdigest()
+        self.assertEqual(lines[0]["source_sha256"], source)
+        self.assertEqual([x["record_id"] for x in lines[1:]], ["r1:cdp:0:0", "r1:cdp:1:0"])
+        self.assertEqual(lines[1]["restore_ack"]["guest_phases"]["tcp_cleanup_ms"], 130.3)
+        self.assertEqual(lines[1]["log_sha256"], hashlib.sha256(good.encode()).hexdigest())
+        self.assertIn("error", lines[2]["restore_ack"])
+
+    def test_two_extractions_into_one_run_do_not_share_a_temporary_file(self):
+        """RED BEFORE THE FIX: both wrote `restore-ack.jsonl.tmp`. A second
+        extraction that ran between the first's write and its rename renamed
+        the shared file away, and the first's rename then failed with
+        FileNotFoundError (Codex review of #1172)."""
+        import restore_ack
+        good = RestoreMarks.LOG + json.dumps(RestoreAck.RECORD) + "\n"
+        with tempfile.TemporaryDirectory() as d:
+            self.run_dir(d, [good, good])
+            real_replace = os.replace
+            nested = []
+
+            def replace(src, dst):
+                if not nested:
+                    nested.append(1)
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(restore_ack.main(["restore_ack.py", d]), 0)
+                return real_replace(src, dst)
+
+            with mock.patch.object(restore_ack.os, "replace", replace), redirect_stdout(io.StringIO()):
+                self.assertEqual(restore_ack.main(["restore_ack.py", d]), 0)
+            with open(os.path.join(d, "restore-ack.jsonl")) as f:
+                lines = [json.loads(line) for line in f]
+            self.assertEqual([x.get("record_id") for x in lines[1:]], ["r1:cdp:0:0", "r1:cdp:1:0"])
+            self.assertEqual([n for n in os.listdir(d) if n.endswith(".tmp")], [])
+
+    def test_a_missing_log_writes_nothing(self):
+        import restore_ack
+        with tempfile.TemporaryDirectory() as d:
+            self.run_dir(d, [RestoreMarks.LOG, None])
+            with redirect_stdout(io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                self.assertEqual(restore_ack.main(["restore_ack.py", d]), 2)
+            self.assertFalse(os.path.exists(os.path.join(d, "restore-ack.jsonl")))
+
+
+class MemoryRenderOperation(unittest.TestCase):
+    """The memory phase renders each fcvm clone with a chosen operation.
+
+    Cloudflare publishes memory for a screenshot and for HTML extraction; the
+    memory phase rendered every clone with a screenshot, with no way to ask for
+    the other. Its host containers render with the image's render.py, which
+    takes the screenshot and the DOM both, and the record says so."""
+
+    def test_the_driver_cli_takes_the_operation(self):
+        seen = {}
+
+        def drive(args):
+            seen["op"] = args.op
+            return {"ok": True}
+
+        argv = ["cdpdrive.py", "127.0.0.1:9222", "https://example.com/", "--op", "html"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(cdpdrive, "drive", drive), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(cdpdrive.main(), 0)
+        self.assertEqual(seen["op"], "html")
+
+    def test_the_memory_render_passes_it_to_the_driver(self):
+        import corpus_mem
+        calls = []
+
+        def sh(cmd, **_kw):
+            calls.append(cmd)
+            return types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        with mock.patch.object(corpus_mem, "sh", sh):
+            corpus_mem.render("127.0.0.1:9222", "https://example.com/", op="html")
+            corpus_mem.render("127.0.0.1:9222", "https://example.com/")
+        self.assertEqual(calls[0][-2:], ["--op", "html"])
+        self.assertEqual(calls[1][-2:], ["--op", "screenshot"])
+
+    def test_the_phase_records_and_forwards_it(self):
+        with open(os.path.join(HERE, "corpus_mem.py")) as f:
+            mem = f.read()
+        with open(os.path.join(HERE, "corpus_extra.sh")) as f:
+            extra = f.read()
+        self.assertIn('parser.add_argument("--op", choices=("screenshot", "html"), default="screenshot")', mem)
+        self.assertIn('"render_op": args.op', mem)
+        self.assertIn('render(c["endpoint"], url, op=self.args.op)', mem)
+        self.assertIn('"container_render": ', mem)
+        self.assertIn('MEM_OP="${MEM_OP:-screenshot}"', extra)
+        self.assertIn('--op "$MEM_OP"', extra)
+
+
+class MemoryContainerRemoval(unittest.TestCase):
+    """A pool container is removed without podman's SIGTERM grace.
+
+    Chromium in the pool container does not exit on SIGTERM, so `podman rm -f`
+    waited its default 10 s stop timeout for every container, one after another
+    (480 s to clear a 48-container cell), and on 2026-10-22 one removal on a
+    loaded host took 72 s from the rm to the remove event, past the 30 s bound,
+    which failed the memory phase after 110 of its 140 cells. The container's
+    state is never read after it is sampled, so it is killed at once."""
+
+    def test_rm_does_not_wait_for_sigterm(self):
+        import corpus_mem
+        calls = []
+
+        def bounded(cmd, timeout):
+            calls.append((cmd, timeout))
+            rc = 1 if cmd[:3] == ["podman", "container", "exists"] else 0
+            return types.SimpleNamespace(returncode=rc, stdout="", stderr="")
+
+        with mock.patch.object(corpus_mem, "inspected_container_identity", lambda name: ("a" * 64, "tok")), \
+                mock.patch.object(corpus_mem, "sh_bounded", bounded):
+            corpus_mem.remove_owned_container("c", "tok")
+        rm = [cmd for cmd, _t in calls if cmd[:2] == ["podman", "rm"]]
+        self.assertEqual(len(rm), 1)
+        self.assertIn("--time=0", rm[0])
+
+
+class MemoryCloneGone(unittest.TestCase):
+    """clone_gone lists the state directory, then reads each file. Another
+    clone's fcvm deletes its own state file as it exits, so a file can vanish
+    between the listing and the read; on 2026-10-22 that raised
+    CloneStateReadError and failed the memory phase after 101 of its 140
+    cells. A file that no longer exists holds no clone, so it is skipped; any
+    other unreadable file still fails closed."""
+
+    def test_a_state_file_deleted_after_the_listing_is_not_a_clone(self):
+        import corpus_mem
+        with tempfile.TemporaryDirectory() as d:
+            gone = os.path.join(d, "vm-gone.json")
+            other = write(d, "vm-other.json", json.dumps({"name": "someone-else"}))
+            with mock.patch.object(corpus_mem, "state_files", lambda _d: [gone, other]):
+                self.assertTrue(corpus_mem.clone_gone(d, "mine"))
+
+    def test_an_unreadable_state_file_still_fails_closed(self):
+        import corpus_mem
+        with tempfile.TemporaryDirectory() as d:
+            bad = write(d, "vm-bad.json", "{not json")
+            with mock.patch.object(corpus_mem, "state_files", lambda _d: [bad]):
+                with self.assertRaises(corpus_mem.CloneStateReadError):
+                    corpus_mem.clone_gone(d, "mine")
+
+
+class ScaleCleanTree(unittest.TestCase):
+    """The scale run refuses a dirty source tree, so that what it measured is
+    committed. It counted the run's own outputs as dirt: the corpus campaign
+    writes the run's results under bench/chromium/results/ before the scale
+    phase starts, so `make bench-chromium-corpus MEASURE=scale` refused every
+    time ("benchmark source tree is dirty", 2026-10-22). Untracked files under
+    bench/chromium/results/ are outputs, not harness; anything else still
+    refuses."""
+
+    def repo(self, d):
+        import subprocess
+        for args in (["init", "-q"], ["config", "user.email", "t@example.test"],
+                     ["config", "user.name", "t"]):
+            subprocess.run(["git", "-C", d] + args, check=True)
+        write(d, "bench/chromium/reqbench.py", "x = 1\n")
+        subprocess.run(["git", "-C", d, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", d, "commit", "-q", "-m", "c"], check=True)
+
+    def test_results_outputs_are_not_dirt(self):
+        import reqscale
+        with tempfile.TemporaryDirectory() as d:
+            self.repo(d)
+            write(d, "bench/chromium/results/corpus-x/reqbench/analysis.json", "{}")
+            self.assertEqual(reqscale.source_tree_dirt(d), "")
+
+    def test_an_untracked_harness_file_is_dirt(self):
+        import reqscale
+        with tempfile.TemporaryDirectory() as d:
+            self.repo(d)
+            write(d, "bench/chromium/new_driver.py", "y = 2\n")
+            self.assertIn("new_driver.py", reqscale.source_tree_dirt(d))
+
+    def test_a_modified_harness_file_is_dirt(self):
+        import reqscale
+        with tempfile.TemporaryDirectory() as d:
+            self.repo(d)
+            write(d, "bench/chromium/reqbench.py", "x = 3\n")
+            self.assertIn("reqbench.py", reqscale.source_tree_dirt(d))
 
 
 class RestoreMarkSourcePin(unittest.TestCase):
@@ -413,6 +664,23 @@ class AnalysisCarriesTheFacts(unittest.TestCase):
         self.assertEqual(analysis["arms"]["noop"]["timeline"]["restore_marks_ms"]
                          ["snapshot_loaded_ms"]["median"], 10.0)
 
+    def test_the_timeline_summarises_the_guest_restore_phases(self):
+        def stamp(rows):
+            for row in rows:
+                if row.get("kind") == "meta":
+                    continue
+                row["restore_ack"] = {"ack_ms": 300, "guest_phases": {
+                    "tcp_cleanup_ms": 150.0, "tcp_reopen_ms": 90.0, "tcp_verified": True,
+                    "tcp_destroyed": 1, "total_ms": 290.0}}
+        with tempfile.TemporaryDirectory() as d:
+            _rc, analysis = self.analyze(d, stamp, **self.FACTS)
+        for armname in ("cdp", "noop"):
+            timeline = analysis["arms"][armname]["timeline"]
+            self.assertEqual(timeline["restore_ack_ms"]["median"], 300.0)
+            phases = timeline["guest_phases_ms"]
+            self.assertEqual(set(phases), {"tcp_cleanup_ms", "tcp_reopen_ms", "total_ms"})
+            self.assertEqual(phases["tcp_cleanup_ms"]["median"], 150.0)
+
     def test_html_fast_publishes_cpu_like_cdp_fast(self):
         """html-fast: the html op with the fast teardown, so its CPU is read."""
         def to_html_fast(rows):
@@ -545,6 +813,18 @@ class HtmlFastArm(unittest.TestCase):
         self.assertTrue(reqbench.publication_arms_ok({"noop", "html-fast"}))
 
 
+
+def reap_leftover_children():
+    """Reap every exited child of the test process, so a test that counts
+    reaped zombies counts only its own."""
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+
 class Subreaper(unittest.TestCase):
     """A fast teardown reads every child's final CPU, then collects it.
 
@@ -618,6 +898,19 @@ print(json.dumps({
                 self.assertEqual(got["zombies"], [], got)
 
     def test_main_becomes_the_subreaper_and_says_so(self):
+        # main reaps every zombie child of its process and charges it to the
+        # first request. The test process can hold zombies left by earlier
+        # tests (2026-10-23 CI: 3, after tests whose stub fcvm's children were
+        # reparented to it), which are not this run's. Leave one on purpose so
+        # the drain below is exercised every run, then reap them all.
+        leftover = subprocess.Popen(["true"])
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with open(f"/proc/{leftover.pid}/stat") as stat:
+                if stat.read().rsplit(") ", 1)[1].startswith("Z"):
+                    break
+            time.sleep(0.01)
+        reap_leftover_children()
         calls = []
         with tempfile.TemporaryDirectory() as d:
             server = test_reqbench.ServeAcknowledgement.FakeServer(os.path.join(d, "serve.log"))

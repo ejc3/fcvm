@@ -169,12 +169,14 @@ class EngineDispatch(unittest.TestCase):
         self.assertIn("webkit", text)
 
     def test_the_webkit_branch_exists_and_is_reached_by_engine(self):
-        """Structural pin on the dispatch itself: run_cdp_request must consult
-        args.engine and route webkit to wddrive. The behavioural half (a full
-        fake clone) needs a VM; the routing decision does not.
+        """Structural pin on the dispatch itself: run_cdp_request renders
+        through _drive_clone, which must consult args.engine and route webkit
+        to wddrive. The behavioural half (a full fake clone) needs a VM; the
+        routing decision does not.
         """
         import inspect
-        src = inspect.getsource(reqbench.run_cdp_request)
+        self.assertIn("_drive_clone(", inspect.getsource(reqbench.run_cdp_request))
+        src = inspect.getsource(reqbench._drive_clone)
         self.assertIn('== "webkit"', src)
         self.assertIn("wddrive.drive", src)
         self.assertIn("discover_wd_session", src)
@@ -365,3 +367,35 @@ class WebkitAnalyzerSchema(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WebKitBrowserVersion(unittest.TestCase):
+    """The golden records the browser build from the image it snapshots.
+
+    RED BEFORE THE FIX: for ENGINE=webkit it ran `WebKitWebDriver --version`,
+    and WebKitWebDriver has no such flag: it prints its usage to stderr and
+    exits 1, so the golden refused itself with "'WebKitWebDriver --version'
+    printed nothing" and no WebKit run could start (2026-10-22, c4w). The
+    version now comes from the package that ships the driver.
+    """
+
+    def engine_case(self, engine):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "reqbench.sh")) as f:
+            src = f.read()
+        start = src.index(f"\n{engine})\n")
+        return src[start:src.index(";;", start)]
+
+    def test_webkit_reads_its_version_from_the_driver_package(self):
+        case = self.engine_case("webkit")
+        self.assertNotIn("WebKitWebDriver --version", case)
+        self.assertNotRegex(case, r'BROWSER_BIN="WebKitWebDriver"')
+        self.assertIn("BROWSER_VERSION_CMD=(dpkg-query -W -f 'WebKitGTK ${Version}\\n' webkit2gtk-driver)", case)
+
+    def test_chromium_still_asks_chromium(self):
+        self.assertIn("BROWSER_VERSION_CMD=(chromium --version)", self.engine_case("chromium"))
+
+    def test_the_golden_runs_the_engine_command(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "reqbench.sh")) as f:
+            src = f.read()
+        self.assertIn('--entrypoint "${BROWSER_VERSION_CMD[0]}"', src)
+        self.assertIn('"${BROWSER_VERSION_CMD[@]:1}"', src)
