@@ -1086,6 +1086,8 @@ Patches from `kernel/patches/` are applied automatically during the build.
 **Current patches** (all apply to both host and guest kernels):
 - `nv2-vsock-cache-sync.patch`: DSB SY in `kvm_nested_sync_hwstate()`
 - `nv2-vsock-rx-barrier.patch`: DSB SY in `virtio_transport_rx_work()`
+- `nv2-targeted-shadow-s2-unmap.patch`: backport of upstream e6084aecaeef and its series, so an
+  MMU notifier invalidation unmaps only the shadow stage-2 mappings of the invalidated range (#1274)
 - `mmfr4-override.vm.patch`: ID register override for recursive nesting (guest only)
 
 **VM Graceful Shutdown (PSCI)**:
@@ -1286,8 +1288,18 @@ and mincore say they have no page table entry), so the source keeps them unmappe
 first write is an ordinary anonymous fault. It still reads every page of a restore through a
 userfaultfd, of file-backed memory, and of a memory file it overwrites in place.
 `test_snapshot_create_leaves_nv2_source_pages_unmapped` (tests/test_kvm.rs) counts the
-zero-page pages across one snapshot. Linux removed the full unmap upstream (e6084aecaeef and
-its series); the 6.18 host kernel still has it, so other invalidation sources still reach it.
+zero-page pages across one snapshot.
+
+**Targeted shadow stage-2 unmap (#1274).** `kernel/patches-arm64/nv2-targeted-shadow-s2-unmap.patch`
+backports upstream e6084aecaeef and its series to the 6.18 host and nested kernels: KVM records
+each shadow mapping's canonical and nested IPA ranges, and an MMU-notifier invalidation unmaps
+only the shadow mappings that overlap the invalidated canonical range. With the host compacting
+memory every second, `test_nested_l2_with_large_files` passed in 32 s on the patched host
+(206,243 invalidations, none through `kvm_nested_s2_unmap`); on the unpatched host its first try
+failed after 849 s. The hand port's differences from upstream are in the patch description;
+`nv2_invalidation_unmaps_only_the_shadow_mappings_of_the_invalidated_range`
+(tests/test_kernel_patch_invariants.rs) runs the patched 6.18 functions in a C harness. CI
+runners get the patched host kernel only from a runner AMI built after the patch reaches main.
 
 **Debugging these**: guest `dd if=/dev/zero of=/dev/null` per-CPU (healthy ≈ 19 GB/s on
 Graviton3; storms read 0.07-0.3 GB/s), host `ftrace` on `kvm:kvm_timer_emulate`, per-thread
