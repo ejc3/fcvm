@@ -25,7 +25,7 @@
 //! launch it twice; a launch whose answer is lost is asked again with the same idempotency
 //! token, so EC2 answers with what it launched instead of launching more.
 
-use super::aws::{signed, xml_tag, CredentialChain};
+use super::aws::{set_items, signed, xml_tag, CredentialChain};
 use super::sigv4::uri_encode;
 use super::Handle;
 use anyhow::{bail, Context, Result};
@@ -852,37 +852,32 @@ pub fn parse_create_fleet(xml: &str) -> Launch {
         ids: items_of(xml, "instanceIds"),
         ..Launch::default()
     };
-    if let Some(start) = xml.find("<errorSet>") {
-        let body = &xml[start..];
-        let body = &body[..body.find("</errorSet>").unwrap_or(body.len())];
-        for item in body.split("<item>").skip(1) {
-            let Some(code) = xml_tag(item, "errorCode") else {
-                continue;
-            };
-            let msg = xml_tag(item, "errorMessage").unwrap_or_default();
-            let line = format!("{code}: {msg}");
-            let list = if CAPACITY_CODES.contains(&code.as_str()) {
-                &mut out.refused
-            } else {
-                &mut out.failed
-            };
-            if !list.contains(&line) {
-                list.push(line);
-            }
+    for item in set_items(xml, "errorSet") {
+        let Some(code) = xml_tag(item, "errorCode") else {
+            continue;
+        };
+        let msg = xml_tag(item, "errorMessage").unwrap_or_default();
+        let line = format!("{code}: {msg}");
+        let list = if CAPACITY_CODES.contains(&code.as_str()) {
+            &mut out.refused
+        } else {
+            &mut out.failed
+        };
+        if !list.contains(&line) {
+            list.push(line);
         }
     }
     out
 }
 
-/// The instances of a DescribeInstances answer, with their state and market (an instance
-/// with `<instanceLifecycle>spot` is spot; one without is on demand).
+/// The instances of a DescribeInstances answer, one per item of its `instancesSet` lists
+/// (EC2 does not promise the order of an item's elements, so the item bounds an instance),
+/// with their state and market (an instance with `<instanceLifecycle>spot` is spot; one
+/// without is on demand).
 pub fn parse_hosts(xml: &str) -> Vec<Host> {
-    let marks: Vec<usize> = xml.match_indices("<instanceId>").map(|(i, _)| i).collect();
-    marks
-        .iter()
-        .enumerate()
-        .filter_map(|(n, &start)| {
-            let seg = &xml[start..marks.get(n + 1).copied().unwrap_or(xml.len())];
+    set_items(xml, "instancesSet")
+        .into_iter()
+        .filter_map(|seg| {
             Some(Host {
                 id: xml_tag(seg, "instanceId")?,
                 state: xml_tag(seg, "instanceState")
@@ -1242,6 +1237,24 @@ mod tests {
         let xml = r#"<DescribeInstancesResponse><reservationSet><item><instancesSet>
   <item><instanceId>i-0000000000000000a</instanceId><instanceState><code>16</code><name>running</name></instanceState>
     <instanceLifecycle>spot</instanceLifecycle><tagSet><item><key>Purpose</key><value>fcvm-fleet-host</value></item></tagSet></item>
+  <item><instanceId>i-0000000000000000b</instanceId><instanceState><code>0</code><name>pending</name></instanceState></item>
+</instancesSet></item></reservationSet></DescribeInstancesResponse>"#;
+        assert_eq!(
+            parse_hosts(xml),
+            vec![
+                host("i-0000000000000000a", "running", Market::Spot),
+                host("i-0000000000000000b", "pending", Market::OnDemand),
+            ]
+        );
+    }
+
+    /// EC2 does not promise the order of an instance's elements: a state or market before
+    /// `<instanceId>` belongs to that instance, not to the one listed before it.
+    #[test]
+    fn describe_answers_parse_by_item_whatever_the_field_order() {
+        let xml = r#"<DescribeInstancesResponse><reservationSet><item><instancesSet>
+  <item><instanceState><code>16</code><name>running</name></instanceState><instanceLifecycle>spot</instanceLifecycle>
+    <tagSet><item><key>Purpose</key><value>fcvm-fleet-host</value></item></tagSet><instanceId>i-0000000000000000a</instanceId></item>
   <item><instanceId>i-0000000000000000b</instanceId><instanceState><code>0</code><name>pending</name></instanceState></item>
 </instancesSet></item></reservationSet></DescribeInstancesResponse>"#;
         assert_eq!(
