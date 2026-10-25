@@ -1,7 +1,7 @@
 [Unit]
 Description=fcvm fleet: fcvm store on the local NVMe, restored from the AMI's copy
 After=local-fs.target
-ConditionPathExists=/var/lib/fcvm-fleet/store.tar.zst
+ConditionPathExists=/var/lib/fcvm-fleet/store/parts
 
 [Service]
 Type=oneshot

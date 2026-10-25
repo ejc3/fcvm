@@ -13,7 +13,7 @@ if command -v shellcheck >/dev/null; then
 else
   no "shellcheck is not installed"
 fi
-python3 -m py_compile fleet/ami/host/s3-cat.py fleet/ami/tile/fetch-cert.py || no "py_compile"
+python3 -m py_compile fleet/ami/host/s3-cat.py fleet/ami/host/store-pack.py fleet/ami/tile/fetch-cert.py || no "py_compile"
 
 # `build-ami.sh start` must clear the phase's markers before it launches the phase:
 # `wait` reads <phase>.done / <phase>.failed, and a builder from a BASE_AMI (or a
@@ -114,32 +114,62 @@ bash "$st/w.sh" 2>/dev/null && jq -e '.store_started_at == 1 and .store_mounted_
   no "store.sh's ready file is not a JSON object of the store's times"
 rm -rf "$st"
 
-# store.sh's staged restore (tar into tmpfs, then cp -a into the store) must give the tree a
-# direct extraction gives: names, types, modes, owners, mtimes, hard links, holes, bytes.
+# store-pack.py packs the store into parts and store.sh restores them all at once, each
+# part decompressed and extracted while the others are (one zstd stream decompresses on one
+# core), then the directories, then the staging copy. Both ways (staged and direct) the
+# restore must give the tree one tar of the store gives: names, types, modes, owners,
+# mtimes (directories' too), hard links, holes, bytes. The fetch below holds every part
+# until all of them have been asked for, so a restore that takes the parts one by one fails.
 fx=$(mktemp -d)
 # Each step ends in `|| exit 1`: `set -e` does nothing in a subshell that is part of `||`.
 (
-  mkdir -p "$fx/src/d/e" || exit 1
+  mkdir -p "$fx/src/d/e" "$fx/src/vm-disks/x" "$fx/src/f" || exit 1
   printf 'one' > "$fx/src/d/a" && ln "$fx/src/d/a" "$fx/src/d/e/a-link" && ln -s ../a "$fx/src/d/e/sym" || exit 1
+  ln -s d/e "$fx/src/dir-link" && printf 'x' > "$fx/src/vm-disks/x/disk" && printf 'l' > "$fx/src/f/k.lock" || exit 1
+  for i in 1 2 3 4 5 6; do head -c $((i * 4096)) /dev/urandom > "$fx/src/f/file$i" || exit 1; done
+  # Hard links of equal size: split across parts, a name's link would become a copy.
+  for i in 1 2 3 4; do printf 'h%s' "$i" > "$fx/src/f/h$i" && ln "$fx/src/f/h$i" "$fx/src/f/h$i-link" || exit 1; done
   truncate -s 64M "$fx/src/d/sparse" || exit 1
   printf 'tail' | dd of="$fx/src/d/sparse" bs=1 seek=$((32 << 20)) conv=notrunc status=none || exit 1
   chmod 0750 "$fx/src/d/e" && touch -d '2026-01-02 03:04:05' "$fx/src/d/a" || exit 1
-  tar -c --sparse -C "$fx/src" . > "$fx/a.tar" || exit 1
+  # A directory that holds a file (so a part creates it) and an empty directory (which only
+  # the directory pass creates): its mtime must survive the empty one being made in it.
+  mkdir -p "$fx/src/g/empty" && printf 'g' > "$fx/src/g/file" || exit 1
+  touch -d '2026-01-03 00:00:00' "$fx/src/d" "$fx/src/d/e" "$fx/src/f" "$fx/src/g/empty" "$fx/src/g" "$fx/src" || exit 1
+  ex=(--exclude=./vm-disks --exclude='./*.lock')
+  tar -c --sparse --numeric-owner "${ex[@]}" -C "$fx/src" . > "$fx/one.tar" || exit 1
+  mkdir "$fx/one" && tar -x --sparse --same-owner --numeric-owner -C "$fx/one" < "$fx/one.tar" || exit 1
+  python3 fleet/ami/host/store-pack.py "$fx/src" "$fx/pack" 3 "${ex[@]}" > /dev/null || exit 1
+  mapfile -t parts < "$fx/pack/parts"
+  [ "${#parts[@]}" = 3 ] || exit 1
   fns=$(sed -n '/^# --- restore functions/,/^# --- end of restore functions/p' fleet/ami/host/store.sh)
   [ -n "$fns" ] || exit 1
   for mode in direct staged; do
-    M="$fx/$mode"; mkdir "$M" || exit 1; stage=""
+    M="$fx/$mode"; mkdir "$M" "$fx/seen-$mode" || exit 1; stage=""
     if [ "$mode" = staged ]; then stage=$(mktemp -d) || exit 1; fi
+    fetch() {
+      if [ "$1" != dirs ]; then
+        touch "$fx/seen-$mode/$1"
+        for _ in $(seq 100); do
+          [ "$(find "$fx/seen-$mode" -type f | wc -l)" -ge "${#parts[@]}" ] && break
+          sleep 0.1
+        done
+        [ "$(find "$fx/seen-$mode" -type f | wc -l)" -ge "${#parts[@]}" ] || return 1
+      fi
+      cat "$fx/pack/$1.tar.zst"
+    }
     eval "$fns"
-    extract < "$fx/a.tar" || exit 1
+    restore fetch "${parts[@]}" || exit 1
     if [ -n "$stage" ]; then rm -rf "$stage"; fi
   done
   tree() { (cd "$1" && find . -printf '%p %y %m %U %G %T@ %n %s %l\n' | sort && find . -type f -exec sha256sum {} + | sort -k2); }
-  diff <(tree "$fx/direct") <(tree "$fx/staged") >&2 || exit 1
-  [ "$(stat -c %h "$fx/staged/d/a")" = 2 ] || exit 1
-  # The hole stays a hole: far fewer blocks than the 64 MiB the file spans.
-  [ "$(stat -c %b "$fx/staged/d/sparse")" -lt 1024 ] || exit 1
-) 2>/dev/null || no "store.sh's staged restore does not give the tree a direct extraction gives"
+  for mode in direct staged; do
+    diff <(tree "$fx/one") <(tree "$fx/$mode") >&2 || exit 1
+    [ "$(stat -c %h "$fx/$mode/d/a")" = 2 ] || exit 1
+    # The hole stays a hole: far fewer blocks than the 64 MiB the file spans.
+    [ "$(stat -c %b "$fx/$mode/d/sparse")" -lt 1024 ] || exit 1
+  done
+) 2>/dev/null || no "store.sh does not restore store-pack.py's parts at once into the tree one tar gives"
 rm -rf "$fx"
 
 [ "$fail" = 0 ] && echo "fleet/ami checks: ok"
