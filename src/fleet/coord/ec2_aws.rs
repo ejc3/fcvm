@@ -29,7 +29,10 @@ pub struct AwsEc2 {
     pub health_scheme: String,
     pub health_port: u16,
     pub ready_timeout: Duration,
+    /// How often a starting instance is described (its state and addresses).
     pub poll: Duration,
+    /// How often its renderer's `/health` is asked once the instance runs with an address.
+    pub health_poll: Duration,
     /// This fleet's name, tagged on every tile at launch (`Fleet=<name>`): the sweep
     /// terminates only this fleet's tiles, not another coordinator's in the same account.
     pub fleet: String,
@@ -47,6 +50,9 @@ const CAPACITY_CODES: &[&str] = &[
     "MaxSpotInstanceCountExceeded",
     "Unsupported",
 ];
+
+/// How often a starting tile's renderer is asked for `/health`.
+pub const HEALTH_POLL: Duration = Duration::from_millis(250);
 
 enum CallError {
     Capacity(String),
@@ -93,6 +99,9 @@ impl AwsEc2 {
             health_port: 443,
             ready_timeout: Duration::from_secs(600),
             poll: Duration::from_secs(3),
+            // A local HTTP request to the instance, not an EC2 API call: a ready renderer
+            // is seen within 250 ms instead of up to `poll` (3 s) later.
+            health_poll: HEALTH_POLL,
             fleet: "stage".into(),
             chain: CredentialChain::new()?,
             http: reqwest::Client::builder()
@@ -231,77 +240,91 @@ impl Ec2Driver for AwsEc2 {
         let t0 = Instant::now();
         let mut running_ms: Option<u128> = None;
         let mut health_ms: Option<u128> = None;
+        // What the last describe said, and when the next one is due. Between describes
+        // only `/health` is asked, every `health_poll`; a describe every `poll` still
+        // notices an instance that is reclaimed while it boots.
+        let mut running_at: Option<std::net::IpAddr> = None;
+        let mut next_describe = Instant::now();
         loop {
             if Instant::now() >= deadline {
                 bail!("{id} did not serve /health within {:?}", self.ready_timeout);
             }
-            let xml = match self
-                .call(
-                    region,
-                    &[
-                        ("Action", "DescribeInstances".into()),
-                        ("InstanceId.1", id.into()),
-                    ],
-                )
-                .await
-            {
-                Ok(x) => x,
-                Err(CallError::Capacity(e)) => bail!("{e}"),
-                Err(CallError::Other(e)) => {
-                    tracing::debug!(error = %format!("{e:#}"), "describing a tile");
-                    tokio::time::sleep(self.poll).await;
-                    continue;
+            if Instant::now() >= next_describe {
+                next_describe = Instant::now() + self.poll;
+                match self
+                    .call(
+                        region,
+                        &[
+                            ("Action", "DescribeInstances".into()),
+                            ("InstanceId.1", id.into()),
+                        ],
+                    )
+                    .await
+                {
+                    Ok(xml) => {
+                        let state = xml_tag(&xml, "instanceState")
+                            .and_then(|s| xml_tag(&s, "name"))
+                            .unwrap_or_default();
+                        if matches!(
+                            state.as_str(),
+                            "shutting-down" | "terminated" | "stopping" | "stopped"
+                        ) {
+                            bail!("{id} is {state}");
+                        }
+                        up.ipv4 = xml_tag(&xml, "ipAddress");
+                        up.ipv6 = xml_tag(&xml, "ipv6Address");
+                        running_at = match (&*state, &up.ipv4) {
+                            ("running", Some(ip)) => {
+                                Some(ip.parse().context("the instance's address")?)
+                            }
+                            _ => None,
+                        };
+                        if running_at.is_some() {
+                            running_ms.get_or_insert(t0.elapsed().as_millis());
+                        }
+                    }
+                    Err(CallError::Capacity(e)) => bail!("{e}"),
+                    Err(CallError::Other(e)) => {
+                        tracing::debug!(error = %format!("{e:#}"), "describing a tile");
+                    }
                 }
-            };
-            let state = xml_tag(&xml, "instanceState")
-                .and_then(|s| xml_tag(&s, "name"))
-                .unwrap_or_default();
-            if matches!(
-                state.as_str(),
-                "shutting-down" | "terminated" | "stopping" | "stopped"
-            ) {
-                bail!("{id} is {state}");
             }
-            up.ipv4 = xml_tag(&xml, "ipAddress");
-            up.ipv6 = xml_tag(&xml, "ipv6Address");
-            if state == "running" {
-                if let Some(ip) = up.ipv4.clone() {
-                    running_ms.get_or_insert(t0.elapsed().as_millis());
-                    let addr: std::net::IpAddr = ip.parse().context("the instance's address")?;
-                    let client = reqwest::Client::builder()
-                        .resolve(&name, std::net::SocketAddr::new(addr, self.health_port))
-                        .timeout(Duration::from_secs(5))
-                        .build()?;
-                    let url = format!(
-                        "{}://{name}:{}/health",
-                        self.health_scheme, self.health_port
-                    );
-                    // The renderer answers /health with 200 while CUDA starts and after it
-                    // has failed: ready means `ready` is true, and an `error` is a renderer
-                    // that will not render, so the launch fails and the tile is retried.
-                    if let Ok(r) = client.get(&url).send().await {
-                        if r.status().is_success() {
-                            health_ms.get_or_insert(t0.elapsed().as_millis());
-                            if let Ok(h) = r.json::<serde_json::Value>().await {
-                                if let Some(e) = h.get("error").filter(|e| !e.is_null()) {
-                                    bail!("{id}'s renderer failed: {e}");
-                                }
-                                if h["ready"] == serde_json::Value::Bool(true) {
-                                    tracing::info!(
-                                        %tile, instance = %id,
-                                        running_ms = running_ms.unwrap_or_default() as u64,
-                                        health_answered_ms = health_ms.unwrap_or_default() as u64,
-                                        ready_ms = t0.elapsed().as_millis() as u64,
-                                        "tile ready (ms since the launch was accepted)"
-                                    );
-                                    return Ok(up);
-                                }
+            if let Some(addr) = running_at {
+                let client = reqwest::Client::builder()
+                    .resolve(&name, std::net::SocketAddr::new(addr, self.health_port))
+                    .timeout(Duration::from_secs(5))
+                    .build()?;
+                let url = format!(
+                    "{}://{name}:{}/health",
+                    self.health_scheme, self.health_port
+                );
+                // The renderer answers /health with 200 while CUDA starts and after it
+                // has failed: ready means `ready` is true, and an `error` is a renderer
+                // that will not render, so the launch fails and the tile is retried.
+                if let Ok(r) = client.get(&url).send().await {
+                    if r.status().is_success() {
+                        health_ms.get_or_insert(t0.elapsed().as_millis());
+                        if let Ok(h) = r.json::<serde_json::Value>().await {
+                            if let Some(e) = h.get("error").filter(|e| !e.is_null()) {
+                                bail!("{id}'s renderer failed: {e}");
+                            }
+                            if h["ready"] == serde_json::Value::Bool(true) {
+                                tracing::info!(
+                                    %tile, instance = %id,
+                                    running_ms = running_ms.unwrap_or_default() as u64,
+                                    health_answered_ms = health_ms.unwrap_or_default() as u64,
+                                    ready_ms = t0.elapsed().as_millis() as u64,
+                                    "tile ready (ms since the launch was accepted)"
+                                );
+                                return Ok(up);
                             }
                         }
                     }
                 }
+                tokio::time::sleep(self.health_poll.min(self.poll)).await;
+            } else {
+                tokio::time::sleep(next_describe.saturating_duration_since(Instant::now())).await;
             }
-            tokio::time::sleep(self.poll).await;
         }
     }
 
