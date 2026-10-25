@@ -441,6 +441,9 @@ async fn apply_restore_epoch(
         );
         crate::system::shutdown_vm(1).await;
     }
+    // 6. A container that was running when the snapshot was taken is running in the
+    //    clone, and the clone's host process has not been told.
+    crate::container::resend_container_started_after_restore().await;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -556,7 +559,7 @@ pub async fn sync_clock_from_host() -> Result<()> {
     let metadata: LatestMetadata =
         serde_json::from_str(&body).context("parsing host-time from MMDS")?;
 
-    crate::bootplan::set_system_clock(&metadata.host_time);
+    crate::bootplan::set_system_clock(&metadata.host_time, Duration::ZERO);
     Ok(())
 }
 

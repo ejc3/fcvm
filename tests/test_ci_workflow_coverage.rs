@@ -81,6 +81,58 @@ fn daily_benchmarks_require_results_from_the_container_target_mount() {
 }
 
 /// A base-branch filter on `pull_request` silently excludes stacked PRs.
+/// A run on main must be allowed to finish.
+///
+/// With `cancel-in-progress: true` for every event, each merge to main cancelled the run
+/// still testing the previous one. Merges landed faster than the self-hosted matrix runs,
+/// so main went hours with no completed host or container job, and a broken merge could
+/// only be found on someone's next pull request.
+#[test]
+fn main_runs_are_not_cancelled_by_the_next_merge() {
+    let ci = parse_workflow("ci.yml");
+    let cancel = ci
+        .get("concurrency")
+        .and_then(|c| c.get("cancel-in-progress"))
+        .expect("ci.yml has no `concurrency.cancel-in-progress`");
+    let expr = cancel.as_str().unwrap_or_else(|| {
+        panic!("`cancel-in-progress` is {cancel:?}: a constant cancels or keeps every event alike")
+    });
+    let compact: String = expr.chars().filter(|c| !c.is_whitespace()).collect();
+    assert_eq!(
+        compact, "${{github.event_name=='pull_request'}}",
+        "`cancel-in-progress` must cancel superseded pull request runs only, never a run on main"
+    );
+}
+
+/// Marking a draft ready must start a CI run.
+///
+/// With the default `pull_request` types a ready flip fires no event, so a PR whose
+/// draft runs were cancelled, superseded or never started reached review with no
+/// checks for its head. Listing `ready_for_review` replaces the default set, so the
+/// defaults must be listed alongside it or pushes and reopens would run nothing.
+#[test]
+fn marking_a_draft_ready_starts_ci() {
+    let ci = parse_workflow("ci.yml");
+    let types: Vec<String> = triggers(&ci)
+        .get("pull_request")
+        .and_then(|p| p.get("types"))
+        .and_then(Value::as_sequence)
+        .map(|l| {
+            l.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    for needed in ["opened", "synchronize", "reopened", "ready_for_review"] {
+        assert!(
+            types.iter().any(|t| t == needed),
+            "ci.yml `pull_request` types are {types:?}; `{needed}` is missing, so that \
+             event starts no CI run"
+        );
+    }
+}
+
 #[test]
 fn ci_runs_on_pull_requests_regardless_of_base_branch() {
     let ci = parse_workflow("ci.yml");
@@ -220,6 +272,62 @@ fn a_path_excluded_from_the_matrix_still_gets_a_check() {
         summary_needs.contains(&"bench-tests"),
         "`summary` does not depend on `bench-tests` (needs = {summary_needs:?}), so a failing \
          bench suite would not fail the run's required check and would be advisory only"
+    );
+}
+
+/// fleet/web changes run the fleet web suite, and it gates `Summary`.
+///
+/// fleet/web is TypeScript the VM matrix never builds. Without its own arm in
+/// `changes` a page-only PR either ran the whole matrix and nothing that reads
+/// the page, or (had it been classified as docs) nothing at all.
+#[test]
+fn fleet_web_changes_run_the_fleet_web_job() {
+    let ci = parse_workflow("ci.yml");
+    let text = std::fs::read_to_string(workflow_path("ci.yml")).expect("ci.yml must be readable");
+    let web_arm = text
+        .find("fleet/web/*) web=true")
+        .expect("`changes` does not route fleet/web/* to `web`");
+    let docs_arm = text
+        .find("docs/*|*.md) ;;")
+        .expect("`changes` lost its docs arm");
+    assert!(
+        web_arm < docs_arm,
+        "the fleet/web arm must come before the docs arm, or fleet/web/README.md is a doc"
+    );
+
+    let jobs = ci.get("jobs").expect("ci.yml has no jobs");
+    let job = jobs
+        .get("fleet-web")
+        .expect("ci.yml routes fleet/web to `web` but has no `fleet-web` job");
+    let condition = job
+        .get("if")
+        .and_then(Value::as_str)
+        .expect("`fleet-web` has no `if:`");
+    assert!(
+        condition.contains("needs.changes.outputs.web == 'true'"),
+        "`fleet-web` does not gate on `changes.outputs.web` ({condition:?})"
+    );
+    let summary_needs = jobs
+        .get("summary")
+        .and_then(|s| s.get("needs"))
+        .and_then(Value::as_sequence)
+        .map(|l| l.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    assert!(
+        summary_needs.contains(&"fleet-web"),
+        "`summary` does not depend on `fleet-web`, so a failing page suite would not fail it"
+    );
+    // A change to ci.yml can break the fleet-web job itself, so it runs it.
+    assert!(
+        text.contains(".github/workflows/ci.yml) code=true; web=true"),
+        "a ci.yml-only change does not run `fleet-web`, so a broken fleet-web job merges green"
+    );
+    // Every fail-open branch opens the web gate too.
+    assert_eq!(
+        text.matches("echo \"web=true\" >> \"$GITHUB_OUTPUT\"")
+            .count(),
+        2,
+        "a fail-open branch of `changes` leaves `web` unset"
     );
 }
 
@@ -1322,6 +1430,14 @@ fn path_classification_holds_on_both_sides_of_the_bench_arm() {
         ("src/main.rs", true, false),
         ("scripts/scan-test-log.sh", true, false),
         (".github/workflows/ci.yml", true, false),
+        // fcvm builds fleet/core; the rest of fleet/ is outside the matrix.
+        ("fleet/core/src/protocol.rs", true, false),
+        ("fleet/core/Cargo.toml", true, false),
+        ("fleet/renderer/src/render.cu", false, false),
+        ("fleet/renderer/Makefile", false, false),
+        ("fleet/tools/gpubox.sh", false, false),
+        ("fleet/PROTOCOL.md", false, false),
+        ("src/fleet/mod.rs", true, false),
     ] {
         let (code, bench) = classify_changed_path(path);
         assert_eq!(
@@ -1338,6 +1454,13 @@ fn path_classification_holds_on_both_sides_of_the_bench_arm() {
 /// `gh` is never reached on the fail-open paths (they exit before the API
 /// call), which is exactly what makes those paths testable here.
 fn run_changes_step(event: &str) -> String {
+    run_changes_step_with_files(event, None)
+}
+
+/// As `run_changes_step`, with a stand-in `gh` on PATH that reports `files` as the
+/// pull request's changed files (`Some(&[])` reports none), so the pull_request
+/// path runs end to end through its `$GITHUB_OUTPUT` writes.
+fn run_changes_step_with_files(event: &str, files: Option<&[&str]>) -> String {
     let ci = parse_workflow("ci.yml");
     let run = workflow_job(&ci, "changes")
         .get("steps")
@@ -1349,12 +1472,31 @@ fn run_changes_step(event: &str) -> String {
         .expect("`changes` job no longer classifies paths — update this test")
         .to_string();
 
-    let dir = std::env::temp_dir().join(format!("fcvm-changes-{}-{event}", std::process::id()));
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "fcvm-changes-{}-{event}-{}",
+        std::process::id(),
+        CALLS.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let out_file = dir.join("github_output");
     std::fs::write(&out_file, "").expect("seed GITHUB_OUTPUT");
 
-    let status = std::process::Command::new("bash")
+    let mut command = std::process::Command::new("bash");
+    if let Some(files) = files {
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).expect("stub bin dir");
+        let gh = bin.join("gh");
+        let mut script = String::from("#!/bin/sh\n");
+        for f in files {
+            script.push_str(&format!("printf '%s\\n' '{f}'\n"));
+        }
+        std::fs::write(&gh, script).expect("write stub gh");
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).expect("chmod gh");
+        let path = std::env::var("PATH").unwrap_or_default();
+        command.env("PATH", format!("{}:{path}", bin.display()));
+    }
+    let status = command
         .arg("-c")
         .arg(&run)
         .env("EVENT", event)
@@ -1398,7 +1540,100 @@ fn a_fail_open_opens_the_bench_gate_too() {
             "event {event}: fail-open set code but left bench unset, so bench-tests \
              is skipped and its lints never run: {outputs:?}"
         );
+        assert!(
+            outputs.contains("fleet=true"),
+            "event {event}: fail-open left fleet unset, so fleet-renderer is skipped: {outputs:?}"
+        );
     }
+    // A pull request whose file list comes back empty fails open the same way.
+    let outputs = run_changes_step_with_files("pull_request", Some(&[]));
+    for gate in ["code", "bench", "fleet"] {
+        assert!(
+            outputs.lines().any(|l| l == format!("{gate}=true")),
+            "an empty changed-file list left `{gate}` closed: {outputs:?}"
+        );
+    }
+}
+
+/// A renderer-only pull request runs the renderer's host tests and not the VM matrix.
+///
+/// fleet/renderer is C++ and CUDA that fcvm never builds. Before the `fleet` output
+/// its changes set no gate at all, so a renderer PR ran nothing that could fail for
+/// it, and before #1206 it ran the five self-hosted VM jobs, none of which read it.
+#[test]
+fn a_renderer_change_runs_the_fleet_renderer_job_and_not_the_matrix() {
+    for files in [
+        &[
+            "fleet/renderer/src/render.cu",
+            "fleet/renderer/tests/test_host.cpp",
+        ][..],
+        &["fleet/renderer/README.md"][..],
+        &["fleet/tools/gpubox.sh", "fleet/PROTOCOL.md"][..],
+    ] {
+        let outputs = run_changes_step_with_files("pull_request", Some(files));
+        let lines: Vec<&str> = outputs.lines().collect();
+        for (gate, want) in [("code", false), ("bench", false), ("fleet", true)] {
+            assert!(
+                lines.contains(&format!("{gate}={want}").as_str()),
+                "{files:?}: expected {gate}={want}, got {outputs:?}"
+            );
+        }
+    }
+    // fleet/core is built by fcvm, so it runs the matrix; mixed with a renderer path, both.
+    let outputs = run_changes_step_with_files(
+        "pull_request",
+        Some(&["fleet/core/src/protocol.rs", "fleet/renderer/src/scene.cpp"]),
+    );
+    assert!(
+        outputs.lines().any(|l| l == "code=true") && outputs.lines().any(|l| l == "fleet=true"),
+        "a PR touching fleet/core and fleet/renderer must run the matrix and fleet-renderer: \
+         {outputs:?}"
+    );
+    let outputs = run_changes_step_with_files("pull_request", Some(&["fleet/core/Cargo.toml"]));
+    assert!(
+        outputs.lines().any(|l| l == "fleet=false"),
+        "fleet/core alone does not touch the renderer: {outputs:?}"
+    );
+    // This file holds the job, so a change to it runs the job.
+    let outputs = run_changes_step_with_files("pull_request", Some(&[".github/workflows/ci.yml"]));
+    assert!(
+        outputs.lines().any(|l| l == "fleet=true"),
+        "a ci.yml-only change does not run fleet-renderer, so a broken job merges green: \
+         {outputs:?}"
+    );
+
+    let ci = parse_workflow("ci.yml");
+    let job = workflow_job(&ci, "fleet-renderer");
+    let condition = job
+        .get("if")
+        .and_then(Value::as_str)
+        .expect("`fleet-renderer` has no `if:`");
+    assert!(
+        condition.contains("needs.changes.outputs.fleet == 'true'"),
+        "`fleet-renderer` does not gate on `changes.outputs.fleet` ({condition:?})"
+    );
+    assert_eq!(
+        job.get("runs-on").and_then(Value::as_str),
+        Some("ubuntu-latest"),
+        "`fleet-renderer` needs no KVM and must not take a self-hosted runner"
+    );
+    let script = format!("{:?}", job.get("steps"));
+    assert!(
+        script.contains("make -C fleet/renderer test-host"),
+        "`fleet-renderer` no longer runs the renderer's host tests"
+    );
+    let summary_needs: Vec<&str> = workflow_job(&ci, "summary")
+        .get("needs")
+        .and_then(Value::as_sequence)
+        .expect("`summary` has no needs")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        summary_needs.contains(&"fleet-renderer"),
+        "`summary` does not depend on `fleet-renderer`, so a failing renderer test would not \
+         fail the run's required check"
+    );
 }
 
 /// A rename must be classified by where it came FROM as well as where it went.
@@ -2189,5 +2424,287 @@ fn cleaning_test_data_keeps_the_test_logs() {
     assert!(
         deletes_logs.is_empty(),
         "clean-test-data deletes the test logs, which CI uploads after running it: {deletes_logs:?}"
+    );
+}
+
+/// Run the fleet-web-deploy job's Access check with a stub `curl`, under the
+/// flags GitHub gives a `shell: bash` step (`bash --noprofile --norc -e -o
+/// pipefail`), and return its exit status and stdout.
+fn run_access_check(curl_stdout: &str, curl_exit: i32) -> (i32, String) {
+    let deploy = parse_workflow("fleet-web-deploy.yml");
+    let run = workflow_job(&deploy, "deploy")
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("`deploy` job has no `steps:`")
+        .iter()
+        .find(|s| s.get("name").and_then(Value::as_str) == Some("Staging stays behind Access"))
+        .and_then(|s| s.get("run").and_then(Value::as_str))
+        .expect("`deploy` job has no `Staging stays behind Access` step — update this test")
+        .to_string();
+
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "fcvm-access-check-{}-{}",
+        std::process::id(),
+        CALLS.fetch_add(1, Ordering::Relaxed)
+    ));
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("stub bin dir");
+    let curl = bin.join("curl");
+    std::fs::write(
+        &curl,
+        format!("#!/bin/sh\nprintf '%s' '{curl_stdout}'\nexit {curl_exit}\n"),
+    )
+    .expect("write stub curl");
+    std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).expect("chmod curl");
+    let path = std::env::var("PATH").unwrap_or_default();
+    let out = std::process::Command::new("bash")
+        .args(["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", &run])
+        .env("PATH", format!("{}:{path}", bin.display()))
+        .output()
+        .expect("run the Access check");
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// The deploy's last step passes only when stage.fcvm.dev answers an
+/// unauthenticated request with the Access login redirect, or does not resolve
+/// (before the custom domain exists), and fails on anything else.
+///
+/// The first deploy (run 40065715105) failed with exit code 6 and printed
+/// nothing: GitHub runs the step with `-e`, so `out=$(curl ...)` aborted the step
+/// on curl's own exit status before the "does not resolve" case was reached.
+#[test]
+fn the_staging_access_check_passes_access_and_an_unresolved_host_and_fails_anything_else() {
+    let (code, out) = run_access_check(
+        "302 https://example-team.cloudflareaccess.com/cdn-cgi/access/login",
+        0,
+    );
+    assert_eq!(code, 0, "the Access redirect must pass: {out}");
+    assert!(out.contains("behind Access"), "{out}");
+
+    let (code, out) = run_access_check("000 curl: (6) Could not resolve host: stage.fcvm.dev", 6);
+    assert_eq!(code, 0, "a host that does not resolve must pass: {out}");
+    assert!(out.contains("no custom domain yet"), "{out}");
+
+    let (code, out) = run_access_check("200 ", 0);
+    assert_eq!(code, 1, "a page served without Access must fail: {out}");
+
+    let (code, out) = run_access_check("000 curl: (28) Operation timed out", 28);
+    assert_eq!(code, 1, "any other curl failure must fail: {out}");
+}
+
+/// The `run:` scripts of a job's steps, in order, with each step's name.
+fn job_steps(workflow: &str, job: &str) -> Vec<(String, String)> {
+    let wf = parse_workflow(workflow);
+    workflow_job(&wf, job)
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .unwrap_or_else(|| panic!("{workflow}: `{job}` has no `steps:`"))
+        .iter()
+        .map(|s| {
+            (
+                s.get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                s.get("run")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The built Worker serves the page before it is trusted: Fleet Web CI and the deploy
+/// both run `scripts/worker-smoke.sh`, which serves `.open-next` with `wrangler dev
+/// --local` and requires GET / to return 200 with the page's title, and the deploy runs
+/// it before `wrangler deploy`.
+///
+/// On 2026-10-24 every request to stage.fcvm.dev failed with error 1101 (OpenNext
+/// 1.20.9 did not inline Next 16.4's preview-props.json). `pnpm cf:build` succeeded and
+/// the deploy's only check, the unauthenticated Access 302, passed in front of a Worker
+/// that threw on every request.
+#[test]
+fn the_built_worker_must_serve_the_page_in_ci_and_before_each_deploy() {
+    let ci = job_steps("ci.yml", "fleet-web");
+    let build = ci
+        .iter()
+        .position(|(_, run)| run.contains("pnpm cf:build"))
+        .expect("Fleet Web does not build the Worker (`pnpm cf:build`)");
+    let smoke = ci
+        .iter()
+        .position(|(_, run)| run.contains("scripts/worker-smoke.sh"))
+        .expect("Fleet Web does not serve the built Worker (`scripts/worker-smoke.sh`)");
+    assert!(
+        build < smoke,
+        "Fleet Web serves the Worker before building it"
+    );
+
+    let deploy = job_steps("fleet-web-deploy.yml", "deploy");
+    let build = deploy
+        .iter()
+        .position(|(_, run)| run.contains("pnpm cf:build"))
+        .expect("the deploy does not build the Worker");
+    let smoke = deploy
+        .iter()
+        .position(|(_, run)| run.contains("scripts/worker-smoke.sh"))
+        .expect("the deploy does not serve the built Worker before shipping it");
+    let ship = deploy
+        .iter()
+        .position(|(_, run)| run.contains("wrangler deploy"))
+        .expect("the deploy job no longer runs `wrangler deploy`");
+    assert!(
+        build < smoke && smoke < ship,
+        "the deploy must build, then serve, then ship the Worker"
+    );
+}
+
+/// The x64 runner's root volume is restored lazily from its AMI snapshot, and the AMI
+/// holds root-store image layers that the localhost image tests build on. Read cold,
+/// inside the suite, they cost every export about 100 s (a 4.7 MB/s volume at 10 ms per
+/// read) and tests with a 120 s budget failed their first try in most cold x64 runs.
+/// The host-root job reads them before it builds and waits for that read before the
+/// suite. Both steps must stay, in that order.
+#[test]
+fn host_root_reads_the_root_container_store_before_the_suite() {
+    let ci = parse_workflow("ci.yml");
+    let steps = workflow_job(&ci, "host-root")["steps"]
+        .as_sequence()
+        .expect("host-root has steps");
+    let runs = |needle: &str| {
+        steps.iter().position(|s| {
+            s.get("run")
+                .and_then(Value::as_str)
+                .is_some_and(|r| r.lines().any(|l| l.trim() == needle))
+        })
+    };
+    let named = |name: &str| {
+        steps
+            .iter()
+            .position(|s| s.get("name").and_then(Value::as_str) == Some(name))
+            .unwrap_or_else(|| panic!("host-root has no `{name}` step"))
+    };
+    let start = runs("./scripts/ci-warm-root-container-store.sh start")
+        .expect("host-root never starts the container store warm-up");
+    let wait = runs("./scripts/ci-warm-root-container-store.sh wait")
+        .expect("host-root never waits for the container store warm-up");
+    let build = named("setup-fcvm");
+    let suite = named("test-root");
+    assert!(
+        start < build,
+        "the warm-up must start before the build it overlaps (start {start}, setup-fcvm {build})"
+    );
+    assert!(
+        build < wait && wait < suite,
+        "the suite must not start before the warm-up is waited for (wait {wait}, test-root {suite})"
+    );
+}
+
+/// Run `scripts/ci-warm-root-container-store.sh` with `args` and its state in `state`,
+/// with `stubs` first on PATH when given, and return its stdout.
+fn run_store_warm(
+    state: &std::path::Path,
+    stubs: Option<&std::path::Path>,
+    args: &[&str],
+) -> String {
+    let mut command = std::process::Command::new("bash");
+    command
+        .arg(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ci-warm-root-container-store.sh"),
+        )
+        .args(args)
+        .env("RUNNER_TEMP", state);
+    if let Some(stubs) = stubs {
+        let path = std::env::var("PATH").unwrap_or_default();
+        command.env("PATH", format!("{}:{path}", stubs.display()));
+    }
+    let out = command
+        .output()
+        .expect("run ci-warm-root-container-store.sh");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the warm-up never fails the job: {out:?}"
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The warm-up's `wait` reports how the detached reader ended, not only whether it is
+/// still running: a reader that exits nonzero, or that dies before reporting a status,
+/// raises a warning annotation, and one whose reads all succeeded raises none. Before this, a failing read showed only as `(exit N)`
+/// inside the log text, and a reader killed before its summary left `wait` printing
+/// nothing but the seconds it waited.
+#[test]
+fn store_warm_up_wait_reports_how_the_reader_ended() {
+    let tmp = tempfile::tempdir().expect("fixture dir");
+    let stubs = tmp.path().join("bin");
+    let layers = tmp.path().join("layers");
+    std::fs::create_dir_all(&stubs).expect("stub dir");
+    std::fs::create_dir_all(&layers).expect("layers dir");
+    std::fs::write(layers.join("layer"), b"data").expect("layer file");
+    for (name, body) in [
+        ("sudo", "#!/bin/sh\nexec \"$@\"\n"),
+        // Only the reader's `run` sees these stubs: its reads fail.
+        ("cat", "#!/bin/sh\necho 'cat: read error' >&2\nexit 1\n"),
+    ] {
+        let p = stubs.join(name);
+        std::fs::write(&p, body).expect("write stub");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod stub");
+    }
+    // A reader pid that has already exited.
+    let mut exited = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn true");
+    exited.wait().expect("reap true");
+    let pid = exited.id().to_string();
+
+    // The reader ran to the end, and its reads failed.
+    let state = tmp.path().join("failed");
+    std::fs::create_dir_all(&state).expect("state dir");
+    std::fs::write(state.join("fcvm-store-warm.pid"), &pid).expect("pid file");
+    let layers_arg = layers.to_str().expect("utf-8 path");
+    let log = run_store_warm(&state, Some(&stubs), &["run", layers_arg]);
+    std::fs::write(state.join("fcvm-store-warm.log"), log).expect("reader log");
+    let out = run_store_warm(&state, None, &["wait"]);
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("::warning::") && l.contains("exit")),
+        "a reader whose reads failed must raise a warning: {out}"
+    );
+
+    // The reader ran to the end and every read succeeded: no warning.
+    let ok_stubs = tmp.path().join("ok-bin");
+    std::fs::create_dir_all(&ok_stubs).expect("stub dir");
+    std::fs::copy(stubs.join("sudo"), ok_stubs.join("sudo")).expect("copy sudo stub");
+    let state = tmp.path().join("succeeded");
+    std::fs::create_dir_all(&state).expect("state dir");
+    std::fs::write(state.join("fcvm-store-warm.pid"), &pid).expect("pid file");
+    let log = run_store_warm(&state, Some(&ok_stubs), &["run", layers_arg]);
+    assert!(
+        log.contains("(exit 0)"),
+        "a clean read must report exit 0: {log}"
+    );
+    std::fs::write(state.join("fcvm-store-warm.log"), log).expect("reader log");
+    let out = run_store_warm(&state, None, &["wait"]);
+    assert!(
+        !out.contains("::warning::"),
+        "a reader whose reads all succeeded must raise no warning: {out}"
+    );
+
+    // The reader died before it reported anything.
+    let state = tmp.path().join("killed");
+    std::fs::create_dir_all(&state).expect("state dir");
+    std::fs::write(state.join("fcvm-store-warm.pid"), &pid).expect("pid file");
+    std::fs::write(state.join("fcvm-store-warm.log"), b"").expect("empty log");
+    let out = run_store_warm(&state, None, &["wait"]);
+    assert!(
+        out.lines().any(|l| l.starts_with("::warning::")),
+        "a reader that ended without reporting must raise a warning: {out}"
     );
 }

@@ -397,7 +397,8 @@ Uses veth pairs + IPv6 routing for kernel line-rate networking without userspace
 **Features**:
 - Requires root and a host with a global IPv6 /64 subnet (or `--ipv6-prefix` to specify one explicitly)
 - Native IPv6 routing through the kernel stack (no userspace L4 translation)
-- Each VM gets a unique IPv6 derived from the host's /64 prefix
+- Each VM gets a unique IPv6 derived from the host's /64 prefix, or the address `--ipv6-address` names inside the prefix in use (not its address 0 or 1)
+- A VM leases its address before using it: an exclusive `flock` on `/run/fcvm/routed-ipv6/<address>.lock`, held until its network is torn down and released by the kernel if the process dies. Of two VMs that ask for one address together, exactly one gets it. If the lease is free but the host already has a /128 route for the address, in any routing table, the route belongs to something other than a live fcvm VM (the host itself, a VM that died without cleanup, another program), so a given address is refused and a derived one is re-derived
 - Port forwarding via built-in TCP proxy (`setns` + tokio relay): a mapping listens on its HOSTIP, or on the VM's loopback IP (same allocation as rootless) when it names none
 - Parallel-safe: per-VM routes, proxy NDP, ip6tables rules
 
@@ -412,15 +413,18 @@ struct RoutedNetwork {
     namespace_id: Option<String>,
     host_veth: Option<String>,
     vm_ipv6: Option<String>,
+    address_lease: Option<AddressLease>, // held until cleanup has removed everything naming vm_ipv6
     default_iface: Option<String>,
     proxy_handles: Vec<Relay>,
     ipv6_prefix: Option<String>,       // explicit /64 prefix (skips auto-detect + MASQUERADE)
+    ipv6_address: Option<Ipv6Addr>,    // --ipv6-address, instead of a derived address
 }
 
 async fn setup() -> Result<NetworkConfig> {
     self.preflight_check()             // root, IPv6, ip6tables (skipped if --ipv6-prefix); rejects /udp publishes
     detect_host_ipv6()                 // find /64 subnet (or /128 with on-link /64); skipped if --ipv6-prefix
-    generate_vm_ipv6(prefix, vm_id)    // deterministic IPv6 from hash
+    generate_vm_ipv6(prefix, vm_id)    // deterministic IPv6 from hash, or the --ipv6-address given
+    lease_address(vm_ipv6)             // flock held for the VM's life; refused if held or routed
     create_namespace(ns_name)
     // Disable DAD inside namespace (accept_dad=0 on all + default)
     create_veth_pair(host_veth, guest_veth)
@@ -855,7 +859,7 @@ curl http://172.30.x.1:8080
 **Setup Sequence** (16 steps):
 1. Preflight: verify root, global IPv6, ip6tables
 2. Detect host IPv6 /64 subnet (supports direct /64 or AWS-style /128 with on-link /64 route)
-3. Generate deterministic VM IPv6 from host prefix + hash of vm_id (with collision detection)
+3. Generate deterministic VM IPv6 from host prefix + hash of vm_id, or take `--ipv6-address`; lease it (collision detection: the lease, then the host's /128 routes)
 4. Create network namespace (`ip netns add fcvm-XXXX`)
 5. Disable IPv6 DAD inside namespace (`accept_dad=0` on all + default, before any interface exists)
 6. Create veth pair, move guest side to namespace
@@ -1453,6 +1457,11 @@ One async session per connection:
    fcvm exec --name my-vm -- hostname    # By name
    fcvm exec --pid 12345 -- hostname     # By PID
    ```
+   Names are unique among live VMs. A launch writes its first state through
+   `StateManager::claim_name`, which holds `names.lock` in the state directory while it
+   checks every state with that name and writes its own, so of two launches with one name
+   exactly one proceeds. A state is live while its process runs (PID, start time, not a
+   zombie); a state with the name whose process is gone is deleted by the claim.
 
 3. **Interactive flags** (`-i`, `-t`): Match docker/podman semantics:
    - `-i`: Keep stdin open
@@ -1487,20 +1496,38 @@ fcvm snapshot create my-vm --tag warm-nginx
 ```
 
 **Zero pages are holes**: with the default Firecracker build (`[firecracker]` in `rootfs-config.toml`, used by every
-kernel profile that does not set its own `firecracker_repo`), a Full snapshot written to a new memory file leaves every
-all-zero 4 KiB page as a hole. The fork tests each page as it dumps, so `memory.bin` stores only the non-zero pages and
-a hole reads back as zeros. With dirty tracking on, a diff from that build also holds the pages a discard emptied
-(balloon inflation, free page reporting) as zeros: a discard is not a guest write, so KVM's dirty log never records it,
-and the fork marks each discarded range itself. A diff writes every page the VM touched or a discard emptied, zeros
-included, and its merge punches each run of its all-zero pages at least `MERGE_MIN_PUNCH` long, measured within its 8
-MiB merge window, as a hole, so memory a restored guest gave back in runs that long is a hole in its snapshot. The
-`nested` arm64 profile builds its own fork (`nv2-on-main`), which writes every page of a Full snapshot and leaves
-discarded pages out of a diff. A diff's merge base is a copy of the parent's `memory.bin` made with `copy_file_range`,
-which on btrfs clones the parent's extents, so a child keeps its parent's holes.
+kernel profile that does not set its own `firecracker_repo`), a Full snapshot written to a new memory file leaves
+every all-zero 4 KiB page as a hole. The fork tests each page as it dumps, so `memory.bin` stores only the non-zero
+pages and a hole reads back as zeros. With dirty tracking on, a diff from that build also holds the pages a discard
+emptied (balloon inflation, free page reporting) as zeros: a discard is not a guest write, so KVM's dirty log never
+records it, and the fork marks each discarded range itself. A diff writes every page the VM touched or a discard
+emptied, zeros included, and its merge punches each run of its all-zero pages at least `MERGE_MIN_PUNCH` long,
+measured within its 8 MiB merge window, as a hole, so memory a restored guest gave back in runs that long is a hole in
+its snapshot. The `nested` arm64 profile builds its own fork (`nv2-on-main`), which writes every page of a Full
+snapshot and leaves discarded pages out of a diff. A diff starts from a clone or copy of the parent's `memory.bin`,
+which on btrfs shares the parent's extents, so a child keeps its parent's holes.
 
-**A snapshot of a restored VM**: a VM that was itself restored from a snapshot is saved as a diff. Firecracker
-writes the pages the VM touched to a sparse `memory.diff`, fcvm reflinks the base snapshot's `memory.bin`, and
-`merge_diff_snapshot` (`src/commands/common.rs`) copies each data run of the diff to the same offset of that copy:
+**A snapshot of a restored VM**: a VM that was itself restored from a snapshot is saved as a diff, written in
+place when the store allows it:
+
+- **In place.** Before the pause, fcvm clones the parent's `memory.bin` into the new snapshot with FICLONE
+  (`clone_base_for_in_place_diff`, `src/commands/common.rs`), and Firecracker writes the dirty pages into that clone:
+  every fork fcvm builds writes a diff into an existing memory file of the guest's size instead of truncating it. The
+  extents the snapshot wrote are then the clone's only extents no other file shares, which FIEMAP reports
+  (`src/storage/extents.rs`); Firecracker syncs the file before its create returns, so they are on disk when counted.
+  The dirty-tracking check below counts them, stopping at its minimum, and a diff whose extents cannot be read counts
+  as nothing written, so it is retried as Full. After the resume `punch_in_place_diff` reads those of them long enough
+  to hold a run to punch (most of a diff of scattered pages is not), punches their long zero runs as a merge does, and
+  flushes the file. A clone costs one reference per extent of the parent: 31.3 s for a 128 GiB guest's memory file of
+  4.34 million extents. The check found its minimum in 0.17 s on that clone after a million scattered page writes, and
+  a full walk of its extents took 7.1 s.
+- **Merged.** When the parent's `memory.bin` is not the guest's size (Firecracker would truncate it), the store
+  cannot clone it (another filesystem, tmpfs), or its filesystem does not report shared extents, Firecracker
+  writes the pages to a sparse `memory.diff`, fcvm copies the base snapshot's `memory.bin` after the resume, and
+  `merge_diff_snapshot` copies each data run of the diff to the same offset of that copy. On a 128 GiB guest that
+  had dirtied 6.4 GB in 1,008,048 runs, the merge took 236 s, against 66 s for Firecracker's write of the diff.
+
+The merge:
 
 - **Workers.** One for each 256 MiB or 4,096 writes (`MERGE_BYTES_PER_WORKER`, `MERGE_WRITES_PER_WORKER`), up to 16
   (`MERGE_WORKERS`), because one reader waits for one read at a time: on a 128 GiB guest with 38.1 GiB touched in
@@ -1529,6 +1556,10 @@ writes the pages the VM touched to a sparse `memory.diff`, fcvm reflinks the bas
 - `create_snapshot_core` logs `diff merge complete` with the diff's bytes and runs, the pieces written (`writes`), the
   holes punched (`punches`), the bytes they covered (`zero_bytes`), the bytes of zero runs written after a refusal
   (`unpunched_zero_bytes`), the workers and the duration.
+- An in-place diff logs `cloned the parent's memory file` with the clone's duration before the pause, or why it is
+  merged instead, and `diff written in place` after the resume with the bytes written (`written_bytes`), the
+  extents they lie in (`ranges`), the bytes read to find zero runs (`read_bytes`), the punches, `zero_bytes`,
+  `unpunched_zero_bytes` and the duration.
 
 
 #### `fcvm snapshot serve`
@@ -1591,7 +1622,8 @@ fcvm snapshot run --snapshot <NAME> [OPTIONS]
 --pid <SERVE_PID>         Memory server PID (UFFD lazy-restore mode)
 --snapshot <NAME>         Snapshot name (no serve process needed)
                           (Either --pid or --snapshot is required; mutually exclusive)
---name <NAME>             Clone VM name (auto-generated if not provided)
+--name <NAME>             Clone VM name (auto-generated if not provided; unique among running VMs)
+--ipv6-address <ADDR>     Routed snapshots only: the clone's address, swapped in on restore
 --exec <CMD>              Execute command in container after clone is healthy
 --publish <SPEC>          [HOSTIP:]HOSTPORT:GUESTPORT[/PROTO], comma-separated or repeated.
                           The clone publishes these mappings instead of the snapshot's
@@ -2382,7 +2414,7 @@ one nvidia-container-toolkit version (1.20.1), each by URL and SHA-256.
 (`src/setup/nvidia.rs`) holding:
 
 ```
-lib/modules/<release>/extra/{nvidia,nvidia-uvm}.ko
+lib/modules/<release>/extra/{nvidia,nvidia-uvm}.ko, nvidia.params
 lib/firmware/nvidia/<version>/gsp_{tu10x,ga10x}.bin
 usr/lib/<triplet>/lib*.so.<version> and their soname links
 usr/bin/{nvidia-smi,nvidia-persistenced,nvidia-debugdump,nvidia-cuda-mps-*}
@@ -2391,10 +2423,38 @@ usr/bin/{nvidia-ctk,nvidia-cdi-hook}
 
 The build configures and builds the profile's kernel tree from the same
 inputs as the kernel artifact (`make <image> modules`, so `Module.symvers`
-exists and modpost checks every symbol), then builds `kernel-open/` from the
+exists and modpost checks every symbol), then builds the modules from the
 driver's `.run` against it. Modules, libraries and firmware come from that one
 `.run`, and the build refuses a module whose `modinfo` version is not the
-pinned version or whose vermagic is not this kernel. The image is named
+pinned version or whose vermagic is not this kernel.
+
+The table's `module_type` picks the modules:
+
+| `module_type` | Sources | nvidia.ko parameters | GPU initialisation on a T4 |
+|---|---|---|---|
+| `open` (default) | `kernel-open/` | none | boots the GSP firmware: 1,113 to 1,156 ms |
+| `proprietary` | `kernel/` | `NVreg_EnableGpuFirmware=0` | resource manager on the CPU: 576 to 623 ms |
+
+The times are `nvidia-persistenced`'s start in a gpu VM with the driver
+unloaded and the GPU removed and rescanned, two rounds per variant, twice; the
+proprietary modules with the GSP firmware left on took 1,111 to 1,223 ms. The
+stage writes the parameters to `nvidia.params` beside the modules and fc-agent
+passes them to `insmod`. The gpu profile uses `proprietary` on amd64 and on
+arm64. On a g5g.metal (T4G) the proprietary modules took `nvidia-persistenced`'s
+start from 1,285 to 609 ms and `gpu_ms` from 1,823 to 1,026, medians of eight
+restores each (see "arm64: g5g.metal" under Verified on hardware). With the GSP firmware
+off the proprietary modules are allowed on Turing and Ampere GPUs only:
+`fcvm podman run --gpu` refuses any other NVIDIA GPU before launch when the
+profile builds them, and names `module_type = "open"` as the setting that runs
+it. `fcvm snapshot run --gpu` restores the driver image the snapshot recorded,
+which the current profile does not name, so it does not check; the guest's
+attach fails closed for a GPU that driver cannot run.
+
+The stage also lets nvidia.ko load with no GPU on the bus. `nvidia_init_module`
+refuses an empty bus unless an NVSwitch is present, and all three refusals
+test one local, `is_nvswitch_present`; the stage sets it to `NV_TRUE` in the
+chosen sources' `nv.c` and fails the build if the declaration is not there
+exactly once. The image is named
 `nvidia-<version>-<profile>-<kernel version>-<arch>-<key>.ext4` under
 `<assets_dir>/nvidia/`, where the key hashes the kernel's identity, the pinned
 table and the build stage. It is not in the rootfs: VMs without a GPU do not
@@ -2407,7 +2467,11 @@ carry it, and a driver bump does not rebuild the rootfs.
    read-only virtio-blk drive and names it in the container plan:
    `"gpu_driver": {"device": "/dev/vdX"}`. fc-agent mounts it read-only at
    `/run/fcvm-gpu/driver` with the extra disks, before the pre-start snapshot,
-   so every clone has it. It is not mounted into the container. The image path
+   so every clone has it. It is not mounted into the container. Right after
+   the mount, fc-agent points `firmware_class.path` at the image's firmware
+   and loads `nvidia.ko` and `nvidia-uvm.ko` with no GPU present, so the
+   snapshot carries the loaded driver. A failure there is logged and not
+   fatal: the attach loads what is not loaded. The image path
    belongs in the snapshot cache key (it is content-addressed). It cannot be a
    pmem device: a restore with device passthrough refuses pmem.
 2. **Restore.** The restore metadata document (the vsock `latest` document and
@@ -2424,15 +2488,26 @@ carry it, and a driver bump does not rebuild the rootfs.
    - writes `/sys/bus/pci/rescan` and waits up to 10s for that many NVIDIA
      display functions (vendor 0x10de, class 0x03xxxx);
    - points `firmware_class.path` at the image's firmware and `insmod`s
-     `nvidia.ko` and `nvidia-uvm.ko`;
+     `nvidia.ko` and `nvidia-uvm.ko` if the boot did not load them (when it
+     did, the rescan's synchronous probe binds the GPU to the loaded driver);
    - checks `/proc/driver/nvidia/gpus` lists every GPU and creates
      `/dev/nvidiactl`, `/dev/nvidia<minor>`, `/dev/nvidia-uvm{,-tools}`;
-   - runs `nvidia-smi -L` from the image and requires one line per GPU;
-   - runs `nvidia-ctk cdi generate --driver-root=/run/fcvm-gpu/driver`
-     into `/var/run/cdi/nvidia.yaml`.
+   - starts `nvidia-persistenced` from the image, which initialises the GPU and
+     keeps it open, so later processes do not initialise it again;
+   - zeroes every byte of each GPU's memory it can allocate with the image's
+     `fcvm-gpu-scrub` (see GPU memory between tenants) and fails if any GPU
+     was not zeroed;
+   - runs, together, `nvidia-smi -L` from the image, requiring one line per
+     GPU, and `nvidia-ctk cdi generate --driver-root=/run/fcvm-gpu/driver`
+     into `/var/run/cdi/nvidia.yaml`. The spec cannot be generated before
+     the GPU is there: it names each GPU by index and by UUID.
 4. **Container start.** The container starts after the restore is
    acknowledged, as for any warm start, with `--device nvidia.com/gpu=all`.
-   The ACK's phase record carries `gpu_ms` and `gpus`.
+   The ACK's phase record carries `gpu_ms`, `gpus` and `gpu_steps`, the
+   milliseconds of each attach step (`check_ms`, `rescan_ms`, `nvidia_ms`,
+   `uvm_ms`, `nodes_ms`, `persistenced_ms`, `scrub_ms`, `smi_ms`, `cdi_ms`;
+   the last two overlap). fc-agent also logs each as
+   `gpu: step=<name> elapsed_ms=<ms>`.
 
 Any failure is fatal to the clone before the ACK: fc-agent prints
 `FATAL: clone restore failed closed ... restore phase gpu-attach: <cause>` and
@@ -2440,6 +2515,139 @@ shuts the VM down with status 1. Each cause names what was expected and what
 the guest saw: the PCI functions present after a rescan, the kernel release
 the image was built for, the kernel log's NVRM lines after a failed `insmod`
 or `nvidia-smi`.
+
+### GPU memory between tenants
+
+A GPU goes from one VM to the next (a wall GPU lent to a visitor and given
+back, any pool of GPUs). NVIDIA documents that newly allocated memory is not
+cleared, and documents a scrub on reset only for H100 confidential computing.
+Two layers keep one VM's GPU memory from the next, each failing closed:
+
+**In the guest, on every restore.** After `nvidia-persistenced` has
+initialised the GPUs and before `nvidia-smi -L`, the CDI spec and the
+container, fc-agent runs `/run/fcvm-gpu/driver/usr/bin/fcvm-gpu-scrub`
+(`src/setup/nvidia_gpu_scrub.c`, compiled into the driver image by the image
+stage). Per GPU it creates a CUDA context, allocates until the device refuses
+2 MiB, memsets every allocation to zero, synchronises and frees. It loads the
+image's `libcuda.so.1` with `dlopen`, so the stage needs only gcc, and the
+stage refuses a binary that needs a glibc newer than 2.34. A context costs
+guest memory, so fc-agent passes `--parallel N` from `MemAvailable` (256 MiB
+for the first context, 64 MiB for each further one), and the tool sets
+`CUDA_DEVICE_MAX_CONNECTIONS=1` and `CUDA_MODULE_LOADING=LAZY`, which cut a
+context from about 230 to about 185 MiB. A failed scrub, a missing tool, or
+fewer GPUs zeroed than the host attached fails the attach, so the clone is
+never acknowledged. This layer holds even when the previous VM was killed and
+nothing ran on the host in between.
+
+**On the host, between VMs.** `sudo fcvm gpu scrub <sbdf>...`
+(`src/gpu/scrub.rs`), for the fleet agent to run after a VM's Firecracker has
+exited and before the GPU goes to another VM. On Turing, Ampere and Ada a GPU
+clears its own memory after a secondary bus reset and reports when it has
+finished; the scrub follows NVIDIA's gpu-admin-tools `--reset-with-sbr
+--clear-memory` for that:
+
+1. Refuse unless the GPU is NVIDIA, on vfio-pci, and its `reset_method` is
+   `bus`.
+2. Take the GPU's record lock and open its VFIO group, and hold both until the
+   outcome is written. A group has one opener, so no VM can open the GPU
+   mid-scrub, and a GPU a VM still holds is reported `busy` and left alone.
+   Before touching the GPU, mark its record quarantined ("a scrub started and
+   has not recorded its outcome"); a scrub that cannot write that mark stops
+   there, and one that dies leaves the GPU refused.
+3. Set `power/control` to `on` (vfio-pci lets an idle GPU suspend to D3, where
+   BAR0 reads all ones) and enable memory decoding; both are restored after.
+4. Check `PMC_BOOT_0` names Turing, Ampere or Ada; set VBIOS scratch 22
+   (`0x1458`) to 1.
+5. Reset through sysfs `reset`, then require the scratch to read 0: the reset
+   happened, so the clear-finished bit below is from this reset.
+6. Wait up to 5 s each for boot (`0x118234 & 0x3ff == 0x3ff`) and for the clear
+   (`0x100b20 & 1`). A read of all ones or 0xbadfxxxx never counts as done.
+
+Each GPU's record is `/var/lib/fcvm/gpu/<sbdf>.json` (`FCVM_GPU_STATE_DIR`):
+`scrubs`, `failures`, `quarantined`, the last error and the last timings. A
+failed scrub quarantines the GPU, and `check_host_device` refuses a
+quarantined GPU, so `podman run --gpu` and `snapshot run --gpu` do not hand it
+out until a later scrub of it succeeds. An unreadable record also refuses.
+`fcvm gpu scrub` prints one JSON line per GPU with `outcome` `scrubbed`,
+`failed` or `busy` and exits 1 unless every GPU was scrubbed; `fcvm gpu
+status` prints every record. Only root runs the scrub. Records are written to a
+synced temporary file, renamed, and the directory synced. One window is left
+(#1164): a launch whose quarantine check ran before a scrub started, and whose
+VMM opens the GPU after that scrub failed, gets the GPU; the in-guest scrub
+still zeroes it.
+
+**Measuring it.** `make gpu-residue-test GPU=<sbdf>` (`scripts/gpu-residue/`):
+VM A fills all the memory it can allocate with 16-byte records (a 64-bit
+marker and the offset) and then its container exits, or its fcvm is
+SIGKILLed; VM B, restored on the same GPU, allocates as much with `cudaMalloc`,
+`cuMemAlloc` or `cudaMallocManaged`, writes nothing, and counts the marker and
+the non-zero words in a GPU kernel. A's fill reads its records back before it
+reports, and each B scan then writes one marker into its own memory and fails
+unless a second scan counts exactly one more. A `same-vm` case runs fill and
+scan as two processes in one VM. `HOST_CLEAR="sudo fcvm gpu scrub <sbdf>"`
+runs the host scrub between A and B.
+
+**Measured** on 2026-10-23, g4dn.metal (T4, `reset_method` `bus`), driver
+580.196.07, the default 1 GiB guest, with both module types:
+
+- open modules (`kernel-open/`, GSP firmware booted): `cudaMemGetInfo` total
+  15,636,037,632 bytes; B allocated 15,521,021,952 bytes (`cudaMalloc`,
+  `cuMemAlloc`) and 15,456,010,240 (`cudaMallocManaged`);
+- proprietary modules with `NVreg_EnableGpuFirmware=0`, the amd64 default since
+  #1149 (in the guest, `/proc/driver/nvidia/version` reads "NVIDIA UNIX x86_64
+  Kernel Module" and `/proc/driver/nvidia/params` `EnableGpuFirmware: 0`):
+  `cudaMemGetInfo` total 15,828,320,256 bytes; B allocated 15,713,959,936 and
+  15,648,948,224 bytes, 184 MiB more, since no GSP firmware is resident. No scrub and host only ran 2cb12514 (#1149 merged, before
+  the scrub); in-guest only, both, and the host scrub ran 65122f8c (#1158 merged).
+  The box was a fresh one for this run alone, checked before and after each
+  matrix: CPU 98.97 to 100 percent idle over 5 s, no process holding a VFIO
+  group, no fcvm or Firecracker left between runs; the 1-minute load average
+  read 6.33 before the first matrix (a build had finished 2 minutes earlier)
+  and 1.04 to 2.45 after it.
+
+Each layer ran the nine cases (same-vm, exit and kill, each with the three
+allocators). The host scrub runs between two VMs, so it acted on the six exit
+and kill cases; same-vm is one VM and has no host step:
+
+| modules | layers | marker words in B | non-zero words in B | scrub time |
+|---|---|---|---|---|
+| open | none | 0 in all 9 | 0 in all 9 | none |
+| open | host only | 0 in all 9 | 0 in all 9 | host 1.21 to 1.24 s per scrub, wall |
+| open | in-guest only | 0 in all 9 | 0 in all 9 | `scrub_ms` 413 to 459 |
+| open | both | 0 in all 9 | 0 in all 9 | `scrub_ms` 401 to 450, host as above |
+| proprietary | none | 0 in all 9 | 0 in all 9 | none |
+| proprietary | host only | 0 in all 9 | 0 in all 9 | host 1.22 to 1.24 s per scrub, wall |
+| proprietary | in-guest only | 0 in all 9 | 0 in all 9 | `scrub_ms` 280 to 328 |
+| proprietary | both | 0 in all 9 | 0 in all 9 | `scrub_ms` 282 to 322, host 1.21 to 1.24 s |
+
+Nothing was found even without either layer: on this driver a later process
+of the same VM also gets zeroed memory, and the GPU runs its own clear after
+the bus reset VFIO gives it when a VM opens or releases it. Neither is a
+documented guarantee, and neither holds for a GPU or a host that resets
+another way, which is why both layers stay.
+
+Costs:
+
+- In the guest, one T4, open modules: `scrub_ms` 410 to 447 over six restores,
+  and `gpu_ms` 1,693 to 1,846 against 1,277 to 1,647 without the scrub. Inside
+  the tool (347 to 401 ms): `cuInit` 47 to 68, context 75 to 87, alloc 3 to 99,
+  zeroing 15.5 GB 64 to 73, free 31 to 37, context destroy about 90.
+- In the guest, one T4, proprietary modules: `scrub_ms` 283 to 291 over six
+  restores, and `gpu_ms` 970 to 1,012 against 681 to 804 without the scrub (15
+  restores of 2cb12514).
+- Open modules, two T4s in one VM: 632 to 646 ms. Eight in the 1 GiB guest (two at a time):
+  2,609 to 2,674 ms, `gpu_ms` 11,798 to 11,834 against 9,249 on main. Before
+  the contexts were bounded, eight at once OOM-killed the scrub and the guest.
+- On the host, open modules: 1,178 to 1,212 ms per T4 over 17 scrubs (reset 179 to 188, boot
+  95 to 103, clear 872 to 904); all eight GPUs at once, 1.23 s wall.
+  gpu-admin-tools took 1.46 s for the same on one T4.
+
+Which layer: the in-guest scrub is on every restore's critical path (0.3 to
+0.4 s per GPU, and guest memory for a context) and holds whatever happened
+before the VM started. The host scrub is off the critical path (between
+tenants), confirms through the GPU's own registers that its memory was
+cleared, and quarantines a GPU that does not, but it runs only when the fleet
+agent runs it and only on Turing to Ada with a bus reset.
 
 ### Verified on hardware
 
@@ -2460,14 +2668,104 @@ the gpu profile built by `make setup-gpu`:
   passes in a gpu VM with the default guest memory, so `nvidia-uvm`, its device nodes
   and the CDI injection work for a CUDA process.
 
+A second run on another g4dn.metal the same day:
+
+- Rootless podman in the guest (`--user 1000:1000`): `nvidia-smi -L` lists the T4 and
+  the CUDA vector-add sample passes, as it does with root podman.
+- In the guest the T4 is `0000:00:06.0`, class 0x030200, with BAR0 16 MiB, BAR1
+  256 MiB and BAR3 32 MiB assigned. `dmesg` shows the open kernel module 580.196.07
+  loading.
+- Without `nvidia-persistenced` every process that opens the GPU initialises it:
+  `nvidia-smi -L` in the container took 1.490, 1.436 and 1.447 s; with the daemon
+  running, 0.031, 0.026 and 0.023 s. fc-agent now starts the daemon during the attach.
+
+#### arm64: g5g.metal (#1139)
+
+On 2026-10-23, on a g5g.metal (arm64, two NVIDIA T4G, each bound to vfio-pci), at
+59f84996 with the gpu profile built by `make setup-gpu`, rootless fcvm and the default
+1 GiB guest. Every step ran twice: with the profile's `open` modules, and with
+`module_type = "proprietary"` added to `[kernel_profiles.gpu.arm64.nvidia]` (GSP
+firmware off). Every step passed with both.
+
+- `fcvm podman run --kernel-profile gpu --gpu <sbdf> ubuntu:24.04 nvidia-smi -L`, on a
+  snapshot miss and then on cache hits: the container lists `NVIDIA T4G` with its UUID.
+  `gpu_ms` on the miss was 1,611 (open) and 1,025 (proprietary); hits are in the table
+  below.
+- The same with `--user 1000:1000`, miss and hit: lists the T4G.
+- `nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0`, as root and with
+  `--user 1000:1000`, miss and hit: `Test PASSED`.
+- Two cache hits at once from one snapshot, one per T4G: each listed its own T4G
+  (different UUIDs); 6.93 and 7.00 s (open), 6.17 and 6.37 s (proprietary), process
+  start to exit.
+- In the guest the T4G is `0000:00:06.0`, `[10de:1eb4]`, class 0x030200, behind the
+  host bridge the FDT describes (`pci-host-generic 70000000.pci`, ECAM, no
+  `/sys/firmware/acpi`), with BAR0 16 MiB, BAR1 256 MiB and BAR3 32 MiB assigned, as on
+  the x86 T4.
+- MSI-X goes through the GIC ITS: the driver holds six vectors
+  (`ITS-PCI-MSIX-0000:00:06.0`, `msi_irqs` 28 to 33) while `nvidia-persistenced` keeps
+  the GPU open, and they deliver. With the proprietary modules one vector counted 76
+  after the attach. Stopping the daemon released the vectors, so the counts started
+  again when it was restarted: that vector read 10 after the restart and 39 after
+  `fcvm-gpu-scrub` ran its CUDA work. With the open modules it counted 3 to 5.
+- `dmesg` shows the aarch64 module loading ("NVIDIA UNIX Open Kernel Module for
+  aarch64 580.196.07", or "NVIDIA UNIX aarch64 Kernel Module" with
+  `EnableGpuFirmware: 0`) and three warnings, none of them a failure:
+  `of_irq_parse_pci: failed with rc=-22` (the FDT's PCI node has no `interrupt-map`;
+  Firecracker's PCI transport has no INTx and the driver uses MSI-X),
+  `NVRM: Chipset not recognized (vendor ID 0x8086, device ID 0x0d57)` with "has not been
+  qualified on this platform" (the ID of Firecracker's emulated host bridge), and, with
+  the open modules, `objClInitPcieChipset: *** Unable to get PCI port handles` once per
+  GPU initialisation.
+- `nvidia-smi -L` in the container, three runs each: with the daemon 0.013 to 0.016 s
+  (open) and 0.012 to 0.014 s (proprietary); with the daemon stopped 1.42 to 1.49 s
+  (open) and 0.420 s (proprietary). Starting the daemon again took 1.12 s (open) and
+  0.35 s (proprietary).
+- `sudo fcvm gpu scrub` on both T4Gs (`reset_method` `bus`): `scrubbed`, 1.22 and
+  1.23 s (reset 192 to 214 ms, boot 77 to 98, clear 898 to 903).
+
+Eight cache-hit relaunches of `nvidia-smi -L` on one T4G per module type, after one
+warm-up, on a quiet box (`mpstat` 99.99 to 100 percent idle over 5 s before and after,
+no other Firecracker). Columns as in the table under Attach time, medians with the
+range in parentheses:
+
+| modules | runs | relaunch (s) | ACK (ms) | gpu_ms | rescan | persistenced | scrub | smi / cdi |
+|---|---|---|---|---|---|---|---|---|
+| open | 8 | 5.50 (5.48-5.52) | 2,783 (2,782-2,804) | 1,823 (1,809-1,854) | 56 | 1,285 | 428 | 21 / 54 |
+| proprietary, GSP off | 8 | 4.77 (4.74-4.82) | 2,063 (2,014-2,112) | 1,026 (1,008-1,045) | 55 | 609 | 306 | 19 / 54 |
+
+Both load the driver at boot, so `insmod` at restore is 0 ms. After these runs the
+arm64 gpu profile switched to the proprietary modules, as amd64 had.
+
+### Attach time
+
+Measured on a g4dn.metal (T4) on 2026-10-22: a cache-hit `fcvm podman run --gpu <sbdf>
+ubuntu:24.04 nvidia-smi -L`, relaunched in sequence on one GPU. "Relaunch" is process
+start to exit; "ACK" is the host's `ack_ms`; the rest are the guest's `gpu_ms` and
+`gpu_steps`. Medians, with the range in parentheses.
+
+| | runs | relaunch (s) | ACK (ms) | gpu_ms | insmod nvidia + uvm | rescan | persistenced | smi / cdi |
+|---|---|---|---|---|---|---|---|---|
+| #1141 (daemon), open modules | 12 | 3.41 (3.33-3.48) | 2,370 | 1,362 (1,308-1,475) | 126 + 12 | 8 | 1,073 | 41 / 73, in sequence |
+| + nvidia-smi and CDI together | 6 | 3.39 (3.30-3.41) | 2,356 | 1,318 (1,315-1,467) | 116 + 11 | 13 | 1,091 | 50 / 87, together |
+| + driver loaded at boot | 12 | 3.38 (3.31-3.43) | 2,341 | 1,289 (1,233-1,405) | 0 | 65 | 1,140 | 48 / 85 |
+| + proprietary modules, GSP off | 24 | 2.83 (2.75-2.93) | 1,791 | 724 (701-776) | 0 | 64 | 576 | 46 / 82 |
+| the same without the boot load | 12 | 3.03 (2.90-3.16) | 1,987 | 951 (918-1,017) | 310 + 11 | 10 | 537 | 46 / 80 |
+
+With the driver loaded at boot the rescan carries the PCI probe. The proprietary
+nvidia.ko takes 280 to 340 ms to load at restore, so the boot load matters most with
+it. Before #1141, `nvidia-smi -L` and `nvidia-ctk cdi generate` each initialised the
+GPU, and `gpu_ms` was the 3,028 to 3,337 ms above.
+
+The rest of the ACK is the host: Firecracker's `/snapshot/load` with the GPU in
+`device_passthrough` took 955 ms in a debug-logged relaunch, almost all of it after
+the load attached the PCI segment.
+
 Not yet checked:
 
-- The same on arm64 (g5g.metal, T4G).
-- `lspci -vv` in the guest (MSI-X, BAR sizes) and the GSP firmware lines in `dmesg`;
-  the driver and a CUDA kernel run, which needs both, but the output was not kept.
-- Root versus rootless podman in the guest: only the default was run.
-- Whether the GPU re-initialises on every container process start without
-  `nvidia-persistenced`.
+- MSI-X in use on x86_64: the idle guest had no MSI vectors allocated, since the driver
+  allocates them only while a process holds the GPU open. A CUDA kernel completing
+  implies interrupts work (Firecracker's PCI transport has no INTx), but no
+  `/proc/interrupts` reading was taken under load.
 
 ## Known Limitations
 
@@ -2628,7 +2926,10 @@ still load):
   and restores the device as it was saved.
   `test_balloon_target_honored_on_snapshot_cache_hit` covers it with one hit
   above the snapshot's target and one below.
-  The startup snapshot (`--health-check`) is not shared between targets. It
+  The startup snapshot (taken by a run with `--startup-snapshot` or `--health-check`,
+  which `fcvm serve` passes; a plain run takes and restores none, because every run
+  restored from it shares the startup state the app made, such as keys, IDs and seeds)
+  is not shared between targets. It
   holds a workload that initialised under the target of the run that made it
   (the memory the guest had, which a workload sizes itself by), and a restore
   can set a target but cannot replay that. So its name carries the target:
@@ -2770,7 +3071,7 @@ Kernel panic - not syncing: stack-protector: Kernel stack is corrupted in: do_id
 1. Load pre-start snapshot with `track_dirty_pages: true`
 2. Resume VM — VM boots, container initializes until healthy
 3. Pause VM — Create diff snapshot
-4. Merge diff into pre-start base → startup snapshot
+4. Write the diff into a clone of the pre-start base, in place or by a merge onto a copy → startup snapshot
 
 ### Root Cause
 
@@ -2819,10 +3120,13 @@ Investigated the Firecracker source (`ejc3/firecracker`, branch `bump-vsock-max-
 
 In `create_snapshot_core()`, after creating the diff snapshot but before resuming the VM:
 
-1. Check diff file's actual disk usage (`meta.blocks() * 512`)
-2. If `diff_allocated < memory_bytes / 1024` (0.1% of VM memory), the diff is corrupt
-3. Retry as Full snapshot while VM is still paused
-4. Skip the merge step and use the full snapshot directly
+1. Count what the diff wrote: the allocated blocks of a sparse `memory.diff` (`meta.blocks() * 512`), or the
+   unshared extents of an in-place diff's clone (`unshared_bytes_up_to`), read only as far as the minimum.
+   Extents that cannot be read count as nothing written
+2. If that is under `memory_bytes / 1024` (0.1% of VM memory), the diff is corrupt
+3. Remove the diff and retry as Full snapshot while VM is still paused. An in-place diff is `memory.bin` itself,
+   and a Full snapshot leaves all-zero pages as holes, so its removal must succeed or the retry fails
+4. Use the full snapshot directly, with no merge or punch pass
 
 This is a detection + recovery approach because the bug is in KVM kernel code we don't control.
 

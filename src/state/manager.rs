@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use nix::fcntl::{Flock, FlockArg};
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -33,9 +33,16 @@ fn lock_opened_state_file(
     use std::os::unix::fs::MetadataExt;
 
     loop {
-        let guard = Flock::lock(file, arg)
-            .map_err(|(_, error)| error)
-            .context("acquiring state lock")?;
+        let guard = match Flock::lock(file, nonblocking(arg)) {
+            Ok(guard) => guard,
+            Err((file, nix::errno::Errno::EWOULDBLOCK)) if nonblocking(arg) != arg => {
+                failpoint::note("lock.wait", path.display());
+                Flock::lock(file, arg)
+                    .map_err(|(_, error)| error)
+                    .context("acquiring state lock")?
+            }
+            Err((_, error)) => return Err(error).context("acquiring state lock"),
+        };
         let held = guard
             .metadata()
             .context("reading held state lock identity")?;
@@ -55,7 +62,16 @@ fn lock_opened_state_file(
     }
 }
 
-fn remove_if_exists(path: &Path) -> std::io::Result<()> {
+/// The non-blocking form of a blocking lock request, so a wait can be recorded first.
+fn nonblocking(arg: FlockArg) -> FlockArg {
+    match arg {
+        FlockArg::LockShared => FlockArg::LockSharedNonblock,
+        FlockArg::LockExclusive => FlockArg::LockExclusiveNonblock,
+        other => other,
+    }
+}
+
+pub(crate) fn remove_if_exists(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         result => result,
@@ -73,6 +89,31 @@ fn pid_identity_matches(state: &VmState) -> bool {
     match (state.pid, state.pid_start_time) {
         (Some(pid), Some(recorded)) => process_start_time(pid) == Some(recorded),
         _ => true,
+    }
+}
+
+/// Whether the process a state file names is still running and is still the process
+/// that wrote it: its PID exists, has not exited (a zombie has), and has the recorded
+/// start time. A state without a PID names no process, and every state this fcvm
+/// writes has one from its first save (`StateManager::claim_name`).
+pub fn owner_is_live(state: &VmState) -> bool {
+    let Some(pid) = state.pid else {
+        return false;
+    };
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // Fields after the last ')' start at field 3 (state); starttime is field 22.
+    let Some((_, after_comm)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    let mut fields = after_comm.split_whitespace();
+    if matches!(fields.next(), None | Some("Z") | Some("X")) {
+        return false;
+    }
+    match state.pid_start_time {
+        Some(recorded) => fields.nth(18).and_then(|t| t.parse::<u64>().ok()) == Some(recorded),
+        None => true,
     }
 }
 
@@ -140,11 +181,16 @@ impl StateManager {
         );
 
         // Clean up any stale state files that claim our PID
-        // This happens when a VM crashes and its PID is later reused
+        // This happens when a VM crashes and its PID is later reused. A state with our PID
+        // whose owner is live is another VM of this same process (`fcvm serve`, the
+        // library API), not a stale one.
         if let Some(pid) = state.pid {
             if let Ok(existing_vms) = self.list_vms().await {
                 for existing in existing_vms {
-                    if existing.pid == Some(pid) && existing.vm_id != state.vm_id {
+                    if existing.pid == Some(pid)
+                        && existing.vm_id != state.vm_id
+                        && !owner_is_live(&existing)
+                    {
                         tracing::warn!(
                             stale_vm_id = %existing.vm_id,
                             pid = pid,
@@ -219,6 +265,81 @@ impl StateManager {
             .context("releasing lock on state file")?;
 
         result
+    }
+
+    /// Write a new VM's first state, under its name, while no other live VM has that name.
+    ///
+    /// The check and the write happen under one host-wide lock (`names.lock` in the state
+    /// directory), and every launch writes its first state here, so of two launches with
+    /// one name exactly one gets it. The state is written with this process's PID and
+    /// start time, which is what makes it live to the next claim; it stops being live when
+    /// the VM's state is deleted or its process exits, so a SIGKILLed VM frees its name
+    /// without any cleanup. A state with this name whose owner is not live is deleted
+    /// here, so lookups by name never see it beside the new VM.
+    pub async fn claim_name(&self, vm_state: &mut VmState) -> Result<()> {
+        self.claim_name_after_check(vm_state, || {}).await
+    }
+
+    /// `claim_name` with a seam for tests: `after_check` runs once the name is known to be
+    /// free and before the state is written, with the name lock held.
+    #[doc(hidden)]
+    pub async fn claim_name_after_check(
+        &self,
+        vm_state: &mut VmState,
+        after_check: impl FnOnce(),
+    ) -> Result<()> {
+        let name = vm_state
+            .name
+            .clone()
+            .context("a VM must have a name before it claims one")?;
+        let lock_path = self.state_dir.join("names.lock");
+        let lock = tokio::task::spawn_blocking(move || -> Result<Flock<std::fs::File>> {
+            let file = open_lock_file(&lock_path).context("opening the VM name lock")?;
+            Flock::lock(file, FlockArg::LockExclusive)
+                .map_err(|(_, error)| error)
+                .context("acquiring the VM name lock")
+        })
+        .await
+        .context("waiting for the VM name lock")??;
+
+        self.cleanup_stale_state().await;
+        let vms = self
+            .list_vms()
+            .await
+            .context("listing VMs to check that the name is free")?;
+        for vm in vms
+            .iter()
+            .filter(|vm| vm.vm_id != vm_state.vm_id && vm.name.as_deref() == Some(name.as_str()))
+        {
+            if owner_is_live(vm) {
+                bail!(
+                    "a live VM is already named '{}' (pid {}, vm_id {}); VM names are unique \
+                     among running VMs, so stop that VM or choose another --name",
+                    name,
+                    vm.pid
+                        .map_or_else(|| "none".to_string(), |pid| pid.to_string()),
+                    vm.vm_id
+                );
+            }
+            self.delete_state(&vm.vm_id).await.with_context(|| {
+                format!(
+                    "deleting the state of exited VM {} that was named '{}'",
+                    vm.vm_id, name
+                )
+            })?;
+        }
+        after_check();
+
+        let pid = std::process::id();
+        vm_state.pid = Some(pid);
+        vm_state.pid_start_time = process_start_time(pid);
+        self.save_state(vm_state).await?;
+
+        // Released only after the state is on disk: the next claim must see it.
+        lock.unlock()
+            .map_err(|(_, error)| error)
+            .context("releasing the VM name lock")?;
+        Ok(())
     }
 
     /// Load VM state
@@ -923,5 +1044,181 @@ mod tests {
             current.metadata().unwrap().ino(),
             std::fs::metadata(path).unwrap().ino()
         );
+    }
+
+    fn named_state(vm_id: &str, name: &str) -> VmState {
+        let mut state = VmState::new(vm_id.to_string(), "alpine:latest".to_string(), 1, 512);
+        state.name = Some(name.to_string());
+        state
+    }
+
+    /// Write a state file as it is, bypassing `save_state`, which records the start time
+    /// of whatever process is at the PID now.
+    fn write_state_file(dir: &Path, state: &VmState) {
+        std::fs::write(
+            dir.join(format!("{}.json", state.vm_id)),
+            serde_json::to_string(state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_live_vm_keeps_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = StateManager::new(dir.path().to_path_buf());
+        let mut first = named_state("vm-first", "slot-3");
+        manager.claim_name(&mut first).await.unwrap();
+        assert_eq!(first.pid, Some(std::process::id()));
+
+        let mut second = named_state("vm-second", "slot-3");
+        let error = format!("{:#}", manager.claim_name(&mut second).await.unwrap_err());
+        assert!(
+            error.contains("'slot-3'")
+                && error.contains(&format!("pid {}", std::process::id()))
+                && error.contains("vm-first"),
+            "the refusal must name the live VM and its pid: {error}"
+        );
+        assert!(
+            !dir.path().join("vm-second.json").exists(),
+            "a refused claim must write no state"
+        );
+        let mut other = named_state("vm-other", "slot-4");
+        manager.claim_name(&mut other).await.unwrap();
+    }
+
+    /// Several VMs of one process (`fcvm serve`, the library API) share a PID. Claiming
+    /// one must not delete another's state, which holds its name and its loopback IP.
+    #[tokio::test]
+    async fn vms_of_one_process_keep_their_names_and_loopback_ips() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = StateManager::new(dir.path().to_path_buf());
+        let mut first = named_state("vm-first", "slot-1");
+        manager.claim_name(&mut first).await.unwrap();
+        let first_ip = manager.allocate_loopback_ip(&mut first).await.unwrap();
+        let mut second = named_state("vm-second", "slot-2");
+        manager.claim_name(&mut second).await.unwrap();
+        let second_ip = manager.allocate_loopback_ip(&mut second).await.unwrap();
+
+        assert_ne!(first_ip, second_ip);
+        assert_eq!(
+            manager
+                .load_state("vm-first")
+                .await
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("slot-1"),
+            "claiming slot-2 deleted slot-1's state"
+        );
+        let mut again = named_state("vm-again", "slot-1");
+        assert!(manager.claim_name(&mut again).await.is_err());
+    }
+
+    /// A VM whose process exited, or whose PID now belongs to another process, does not
+    /// hold its name, and its state is removed so a lookup by name finds one VM.
+    #[tokio::test]
+    async fn an_exited_vm_frees_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = StateManager::new(dir.path().to_path_buf());
+        // Above the kernel's PID_MAX_LIMIT (4194304), so no process has it.
+        let mut exited = named_state("vm-exited", "slot-3");
+        exited.pid = Some(4_000_000_000);
+        write_state_file(dir.path(), &exited);
+        let mut replaced = named_state("vm-replaced", "slot-3");
+        replaced.pid = Some(std::process::id());
+        replaced.pid_start_time =
+            crate::utils::process_start_time(std::process::id()).map(|start| start + 1);
+        write_state_file(dir.path(), &replaced);
+        let mut unowned = named_state("vm-unowned", "slot-3");
+        unowned.pid = None;
+        write_state_file(dir.path(), &unowned);
+
+        let mut new = named_state("vm-new", "slot-3");
+        manager.claim_name(&mut new).await.unwrap();
+        let named: Vec<String> = manager
+            .list_vms()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|vm| vm.name.as_deref() == Some("slot-3"))
+            .map(|vm| vm.vm_id)
+            .collect();
+        assert_eq!(named, vec!["vm-new".to_string()]);
+        assert_eq!(
+            manager.load_state_by_name("slot-3").await.unwrap().vm_id,
+            "vm-new"
+        );
+    }
+
+    /// Two claims of one name at once: the second runs entirely inside the first's
+    /// window between its check and its write. Exactly one may succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn of_two_concurrent_claims_of_one_name_exactly_one_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().to_path_buf();
+        let manager = StateManager::new(state_dir.clone());
+        let mut first = named_state("vm-first", "slot-3");
+        let mut second_thread = None;
+        let mut second_finished_inside_window = false;
+        manager
+            .claim_name_after_check(&mut first, || {
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                second_thread = Some(std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    let result = runtime.block_on(async {
+                        let mut second = named_state("vm-second", "slot-3");
+                        StateManager::new(state_dir).claim_name(&mut second).await
+                    });
+                    let _ = done_tx.send(());
+                    result
+                }));
+                // Correct: the second claim waits on the name lock and cannot finish
+                // here. Without the lock it finishes within milliseconds.
+                second_finished_inside_window = done_rx
+                    .recv_timeout(std::time::Duration::from_millis(500))
+                    .is_ok();
+            })
+            .await
+            .unwrap();
+        let second = second_thread.unwrap().join().unwrap();
+        assert!(
+            !second_finished_inside_window,
+            "the second claim finished while the first held the name between check and write"
+        );
+        let error = format!("{:#}", second.unwrap_err());
+        assert!(error.contains("vm-first"), "{error}");
+    }
+
+    #[test]
+    fn a_zombie_is_not_a_live_owner() {
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let start = crate::utils::process_start_time(pid);
+        let mut state = named_state("vm-zombie", "slot-3");
+        state.pid = Some(pid);
+        state.pid_start_time = start;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            let state_field = stat.rsplit_once(')').unwrap().1.split_whitespace().next();
+            if state_field == Some("Z") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "`true` did not exit");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !owner_is_live(&state),
+            "an exited, unreaped process is not live"
+        );
+        let mut child = child;
+        child.wait().unwrap();
+
+        state.pid = Some(std::process::id());
+        state.pid_start_time = crate::utils::process_start_time(std::process::id());
+        assert!(owner_is_live(&state), "this test process is live");
     }
 }

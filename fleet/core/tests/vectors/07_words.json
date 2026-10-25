@@ -1,0 +1,431 @@
+{
+  "description": "A word reaches the scene only when the text check allowed it together with every word already in the sky; refused, failed or missing checks, long text, a second word from one client within the interval, and a word checked against a sky that has since changed are refused, and a refused word's text is not shown.",
+  "events": [
+    {
+      "at": 1000,
+      "client": "198.51.100.7",
+      "type": "viewer_joined",
+      "viewer": "v1"
+    },
+    {
+      "at": 1000,
+      "client": "198.51.100.8",
+      "type": "viewer_joined",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "text": "hello"
+      },
+      "at": 2000,
+      "check": {
+        "reason": "ok",
+        "sky": [],
+        "verdict": "allow"
+      },
+      "client": "198.51.100.7",
+      "id": "w1",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "text": "again"
+      },
+      "at": 3000,
+      "check": {
+        "reason": "ok",
+        "sky": [
+          "hello"
+        ],
+        "verdict": "allow"
+      },
+      "client": "198.51.100.7",
+      "id": "w2",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "text": "nasty"
+      },
+      "at": 3000,
+      "check": {
+        "reason": "not suitable",
+        "sky": [
+          "hello"
+        ],
+        "verdict": "refuse"
+      },
+      "client": "198.51.100.8",
+      "id": "w3",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "text": "x"
+      },
+      "at": 9000,
+      "check": {
+        "reason": "text check unavailable",
+        "sky": [
+          "hello"
+        ],
+        "verdict": "error"
+      },
+      "client": "198.51.100.8",
+      "id": "w4",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "text": "y"
+      },
+      "at": 9100,
+      "client": "198.51.100.8",
+      "id": "w5",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "at": 9150,
+      "check": {
+        "reason": "ok",
+        "sky": [
+          "hello"
+        ],
+        "verdict": "allow"
+      },
+      "client": "198.51.100.8",
+      "id": "w6",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "text": "  two   words "
+      },
+      "at": 9200,
+      "check": {
+        "reason": "ok",
+        "sky": [
+          "hello"
+        ],
+        "verdict": "allow"
+      },
+      "client": "198.51.100.8",
+      "id": "w7",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "text": "third"
+      },
+      "at": 9300,
+      "check": {
+        "reason": "ok",
+        "sky": [
+          "hello"
+        ],
+        "verdict": "allow"
+      },
+      "client": "198.51.100.9",
+      "id": "w8",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v3"
+    }
+  ],
+  "expect": [
+    {
+      "after": 2,
+      "checks": {
+        "/receipts/w1/check/verdict": "allow",
+        "/receipts/w1/outcome": "committed",
+        "/view/scene/words": [
+          {
+            "t": 2.0,
+            "text": "hello",
+            "text_style": "lockup"
+          }
+        ]
+      }
+    },
+    {
+      "after": 3,
+      "checks": {
+        "/receipts/w2/outcome": "refused",
+        "/receipts/w2/reason": "one word per 5 s per client"
+      }
+    },
+    {
+      "after": 4,
+      "checks": {
+        "/receipts/w3/check/verdict": "refuse",
+        "/receipts/w3/outcome": "refused",
+        "/receipts/w3/reason": "the text check refused it: not suitable",
+        "/view/actions/2/args": {},
+        "/view/actions/2/summary": "the text check refused it: not suitable",
+        "/view/scene/words/1": null
+      }
+    },
+    {
+      "after": 5,
+      "checks": {
+        "/receipts/w4/reason": "the text check failed: text check unavailable"
+      }
+    },
+    {
+      "after": 6,
+      "checks": {
+        "/receipts/w5/reason": "the text check did not run"
+      }
+    },
+    {
+      "after": 7,
+      "checks": {
+        "/receipts/w6/reason": "text is 29 characters; the limit is 28"
+      }
+    },
+    {
+      "after": 8,
+      "checks": {
+        "/receipts/w7/outcome": "committed",
+        "/view/scene/words/1/text": "two words",
+        "/view/viewers/count": 2
+      }
+    },
+    {
+      "after": 9,
+      "checks": {
+        "/receipts/w8/outcome": "refused",
+        "/receipts/w8/reason": "the words in the sky changed while this one was checked; send it again",
+        "/view/scene/words/2": null
+      },
+      "note": "checked with [hello] but the sky is now [hello, two words]"
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "args": {
+          "text": "hello"
+        },
+        "at": 2000,
+        "id": "w1",
+        "name": "word",
+        "outcome": "committed",
+        "summary": "word \"hello\"",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 3000,
+        "id": "w2",
+        "name": "word",
+        "outcome": "refused",
+        "summary": "one word per 5 s per client",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 3000,
+        "id": "w3",
+        "name": "word",
+        "outcome": "refused",
+        "summary": "the text check refused it: not suitable",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 9000,
+        "id": "w4",
+        "name": "word",
+        "outcome": "refused",
+        "summary": "the text check failed: text check unavailable",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 9100,
+        "id": "w5",
+        "name": "word",
+        "outcome": "refused",
+        "summary": "the text check did not run",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 9150,
+        "id": "w6",
+        "name": "word",
+        "outcome": "refused",
+        "summary": "text is 29 characters; the limit is 28",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "text": "  two   words "
+        },
+        "at": 9200,
+        "id": "w7",
+        "name": "word",
+        "outcome": "committed",
+        "summary": "word \"two words\"",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 9300,
+        "id": "w8",
+        "name": "word",
+        "outcome": "refused",
+        "summary": "the words in the sky changed while this one was checked; send it again",
+        "viewer": "v3"
+      }
+    ],
+    "aggregates": [],
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "budget": null,
+    "budget_from_t": null,
+    "claims": [],
+    "cooldown_until": null,
+    "counters": {
+      "restores": 0,
+      "restores_last_hour": 0,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
+    "failures": [],
+    "fleet": {
+      "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
+      "fcvm_gpus": 0,
+      "gpus": 0,
+      "hosts": [],
+      "max_tiles": 100,
+      "n": 0,
+      "power": {
+        "asleep_since": null,
+        "hosts": [],
+        "idle_since": null,
+        "last_wake": null,
+        "state": "awake",
+        "wakes": [],
+        "woke_at": null
+      },
+      "standby": [],
+      "standby_ready": 0,
+      "warming": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": null,
+      "from_frame": 0,
+      "from_t": 0.0,
+      "generation": 0
+    },
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": null,
+      "holding": "coast",
+      "next": null,
+      "next_hold_at": 7000,
+      "targets": [
+        {
+          "id": "horizon",
+          "label": "High above: the curve of the horizon",
+          "votes": 0
+        },
+        {
+          "id": "dawn-valley",
+          "label": "Dawn in the valley",
+          "votes": 0
+        },
+        {
+          "id": "peak-seam-low-sun",
+          "label": "The peak at a low sun",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [],
+    "relaunch_all": null,
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -63.5,
+            2.2,
+            -87.0
+          ],
+          "pos": [
+            -100.0,
+            0.35,
+            -90.0
+          ],
+          "t": 0.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -63.5,
+            2.2,
+            -87.0
+          ],
+          "pos": [
+            -100.0,
+            0.35,
+            -90.0
+          ],
+          "t": 7.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.33,
+      "words": [
+        {
+          "t": 2.0,
+          "text": "hello",
+          "text_style": "lockup"
+        },
+        {
+          "t": 9.2,
+          "text": "two words",
+          "text_style": "lockup"
+        }
+      ]
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": null
+    },
+    "tiles": [],
+    "viewers": {
+      "active": 2,
+      "count": 2
+    }
+  },
+  "start_ms": 0
+}

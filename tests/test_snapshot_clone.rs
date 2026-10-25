@@ -3542,6 +3542,126 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
     }
 }
 
+/// `snapshot run --map HOST:GUEST` serves a directory the snapshot mapped from another host
+/// directory. The baseline maps one directory at /data; its clone, given another at the same
+/// guest path, reads the other directory's file through the mount the guest made at boot.
+#[tokio::test]
+async fn test_snapshot_run_map_serves_a_mapped_directory_from_another_host_directory() -> Result<()>
+{
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("mapover");
+    let fcvm_path = common::find_fcvm_binary()?;
+    let recorded = tempfile::tempdir()?;
+    let replacement = tempfile::tempdir()?;
+    std::fs::write(recorded.path().join("marker"), "from-A\n")?;
+    // A different length: the guest revalidates a cached file by its size and mtime, and
+    // two files written this close together can share an mtime.
+    std::fs::write(
+        replacement.path().join("marker"),
+        "from-B, the replacement\n",
+    )?;
+    let recorded_map = format!("{}:/data:ro", recorded.path().display());
+    let replacement_map = format!("{}:/data:ro", replacement.path().display());
+
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "rootless",
+            "--portable-volumes",
+            "--map",
+            &recorded_map,
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+    let seen = common::exec_in_container(baseline_pid, &["cat", "/data/marker"]).await?;
+    assert_eq!(
+        seen.trim(),
+        "from-A",
+        "the baseline reads the recorded directory"
+    );
+
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "snapshot create failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    common::kill_process(baseline_pid).await;
+
+    // The listing names the directory, so a caller can tell which --map the snapshot takes.
+    let listing = tokio::process::Command::new(&fcvm_path)
+        .args(["snapshots", "ls", "--json"])
+        .output()
+        .await
+        .context("running snapshots ls")?;
+    anyhow::ensure!(
+        listing.status.success(),
+        "snapshots ls failed: {}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&listing.stdout)?;
+    let maps = listed
+        .iter()
+        .find(|s| s["name"] == snapshot_name.as_str())
+        .map(|s| s["maps"].clone());
+    assert_eq!(
+        maps,
+        Some(serde_json::json!([{"guest_path": "/data", "read_only": true, "portable": true}])),
+        "snapshots ls names the snapshot's map"
+    );
+
+    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &snapshot_name,
+            "--name",
+            &clone_name,
+            "--map",
+            &replacement_map,
+        ],
+        &clone_name,
+    )
+    .await
+    .context("spawning clone with --map")?;
+    let healthy = common::poll_health_by_pid(clone_pid, 120).await;
+    // The guest takes a cached file's size and mtime from the host only once the attribute
+    // timeout (1 s) has passed since it last asked, counted in guest time, which stood still
+    // while the snapshot sat. Read after that, as for a host file that changes under a VM.
+    let seen = if healthy.is_ok() {
+        common::exec_in_container(clone_pid, &["sleep 2; cat /data/marker"]).await
+    } else {
+        Err(anyhow::anyhow!("clone never turned healthy"))
+    };
+    common::kill_process(clone_pid).await;
+    healthy?;
+    assert_eq!(
+        seen?.trim(),
+        "from-B, the replacement",
+        "the clone reads the directory --map named"
+    );
+    Ok(())
+}
+
 /// The guest-armed burn every test VM boots with in `a_slow_ack_connect_still_completes_the_restore`.
 const SLOW_ACK_BURN: &str = "restore.pre_ack_connect:burn:4000";
 
@@ -6031,7 +6151,10 @@ async fn an_exited_clone_returns_its_server_slot() -> Result<()> {
                 .with_context(|| format!("watching test log {}", log_path.display()));
         }
 
-        let async_inotify = tokio::io::unix::AsyncFd::new(inotify)
+        // SAFETY: the `AsyncFd` owns the inotify fd, which closes only on drop, and this
+        // function never replaces it.
+        let async_inotify = unsafe { tokio::io::unix::AsyncFd::register(inotify) }
+            .map_err(std::io::Error::from)
             .context("registering test-log inotify fd with the reactor")?;
         let wait = async {
             loop {
@@ -6906,6 +7029,156 @@ async fn the_restore_hook_reaches_the_network() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A VM whose startup snapshot another process installed first keeps its own
+/// pre-start snapshot as its diff parent, and a snapshot of it restores (#1231).
+///
+/// Two cold runs with one cache key: B creates the pre-start snapshot, and between
+/// B's check for the startup snapshot and its create's lock, A (restored from B's
+/// pre-start snapshot) installs the startup snapshot. B used to record A's startup
+/// snapshot as its own parent, so `fcvm snapshot create` of B merged B's dirty pages
+/// onto A's memory, and the clone's kernel panicked in its first interrupt after
+/// resume ("Fatal exception in interrupt"). The failpoint holds B in that window
+/// while A runs, so the interleaving is fixed, not raced.
+///
+/// RED BEFORE THE FIX: B's state named `<key>-startup` as its snapshot.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn a_startup_snapshot_another_vm_installed_is_not_the_sources_diff_parent() -> Result<()> {
+    let (b_name, a_name, snap_tag, _) = common::unique_names("lineage");
+    let clone_name = format!("{b_name}-clone");
+    // An env var in the cache key, so no other test shares these snapshots.
+    let env_unique = format!("FCVM_LINEAGE_TEST={b_name}");
+    let run_args = |name: &str| -> Vec<String> {
+        [
+            "podman",
+            "run",
+            "--name",
+            name,
+            "--network",
+            "rootless",
+            "--env",
+            env_unique.as_str(),
+            "--health-check",
+            "http://localhost/",
+            common::TEST_IMAGE,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    };
+    let gate = std::env::temp_dir().join(format!("{b_name}-startup-go"));
+    let _ = std::fs::remove_file(&gate);
+    let spec = format!(
+        "snapshot.startup.pre_create:block_until_file:{}",
+        gate.display()
+    );
+
+    let b_args = run_args(&b_name);
+    let b_refs: Vec<&str> = b_args.iter().map(String::as_str).collect();
+    let (mut b, b_pid, b_log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+        &b_refs,
+        &[("FCVM_FAILPOINT", spec.as_str())],
+    )
+    .await?;
+    let mut key: Option<String> = None;
+
+    let outcome = async {
+        // B: cold boot, its own pre-start snapshot, then held before the startup create.
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            let text = std::fs::read_to_string(&b_log).unwrap_or_default();
+            if text.contains("FAILPOINT snapshot.startup.pre_create reached") {
+                break;
+            }
+            anyhow::ensure!(
+                b.try_wait()?.is_none(),
+                "B exited before its startup snapshot; log at {}",
+                b_log.display()
+            );
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "B did not reach its startup snapshot within 300 s; log at {}",
+                b_log.display()
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let (how, pre_start) =
+            common::cache_choice(&b_log).context("B's log does not say how it started")?;
+        key = Some(pre_start.clone());
+        anyhow::ensure!(how == "cold boot", "control: B started from a {how}");
+        let startup = format!("{pre_start}-startup");
+
+        // A: restores B's pre-start snapshot and installs the startup snapshot.
+        let a_args = run_args(&a_name);
+        let a_refs: Vec<&str> = a_args.iter().map(String::as_str).collect();
+        let (mut a, a_pid, a_log) =
+            common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(&a_refs, &[]).await?;
+        let a_healthy = common::poll_health(&mut a, 300).await;
+        common::kill_process(a_pid).await;
+        let _ = a.wait().await;
+        a_healthy?;
+        let a_choice = common::cache_choice(&a_log);
+        anyhow::ensure!(
+            a_choice == Some(("pre-start snapshot", pre_start.clone())),
+            "control: A started from {a_choice:?}, not B's pre-start snapshot {pre_start}"
+        );
+        anyhow::ensure!(
+            common::snapshot_exists(&startup),
+            "control: A did not install the startup snapshot {startup}"
+        );
+
+        // B: finds the startup snapshot installed when it takes the lock.
+        std::fs::write(&gate, b"go").context("releasing B")?;
+        common::poll_health(&mut b, 300).await?;
+        let b_text = std::fs::read_to_string(&b_log)?;
+        anyhow::ensure!(
+            b_text.contains(&format!(
+                "Snapshot already exists (created by another process) snapshot_key={startup}"
+            )),
+            "control: B did not find the startup snapshot installed; log at {}",
+            b_log.display()
+        );
+        let recorded = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+            .load_state_by_pid(b_pid)
+            .await?
+            .config
+            .snapshot_name;
+        anyhow::ensure!(
+            recorded.as_deref() == Some(pre_start.as_str()),
+            "B's state names {recorded:?} as its diff parent, not its own pre-start \
+             snapshot {pre_start}"
+        );
+
+        // A snapshot of B restores and serves.
+        common::create_snapshot_by_pid(b_pid, &snap_tag).await?;
+        let (mut serve, serve_pid) = common::start_memory_server(&snap_tag).await?;
+        let cloned = async {
+            common::poll_serve_ready(&snap_tag, serve_pid, 60).await?;
+            let (mut clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
+            let healthy = common::poll_health(&mut clone, 300).await;
+            common::kill_process(clone_pid).await;
+            let _ = clone.wait().await;
+            healthy
+        }
+        .await;
+        common::kill_process(serve_pid).await;
+        let _ = serve.wait().await;
+        cloned.context("the clone of B did not become healthy")
+    }
+    .await;
+
+    let _ = std::fs::write(&gate, b"go");
+    common::kill_process(b_pid).await;
+    let _ = b.wait().await;
+    let _ = std::fs::remove_file(&gate);
+    let _ = common::delete_snapshot(&snap_tag).await;
+    if let Some(key) = key {
+        let _ = common::delete_snapshot(&format!("{key}-startup")).await;
+        let _ = common::delete_snapshot(&key).await;
+    }
+    outcome
+}
+
 /// A run that gives no hook and restores a startup snapshot made by a run that did
 /// runs no hook. The hook is not in the snapshot cache key, so the two runs share
 /// the snapshot, and the recorded hook is the other run's.
@@ -7093,5 +7366,360 @@ async fn clone_disks_are_subvolume_snapshots_of_the_snapshot_directory() -> anyh
         served.contains("hello"),
         "the clone cannot read the extra disk: {served}"
     );
+    Ok(())
+}
+
+/// Wait, up to two minutes, until the log at `path` contains `marker`.
+#[cfg(feature = "privileged-tests")]
+async fn wait_for_log(path: &std::path::Path, marker: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .contains(marker)
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "{path:?} never logged {marker:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// One HTTP request to `address`:80 that must answer; returns how long it took.
+#[cfg(feature = "privileged-tests")]
+async fn http_get_v6(address: std::net::Ipv6Addr, limit: Duration) -> Result<Duration> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let started = Instant::now();
+    let mut stream = tokio::time::timeout(
+        limit,
+        tokio::net::TcpStream::connect((std::net::IpAddr::V6(address), 80)),
+    )
+    .await
+    .with_context(|| format!("connecting to [{address}]:80 timed out after {limit:?}"))?
+    .with_context(|| format!("connecting to [{address}]:80"))?;
+    stream.write_all(b"GET / HTTP/1.0\r\n\r\n").await?;
+    let mut head = [0u8; 8];
+    tokio::time::timeout(limit, stream.read_exact(&mut head))
+        .await
+        .context("reading the response timed out")??;
+    anyhow::ensure!(head.starts_with(b"HTTP/"), "not an HTTP answer: {head:?}");
+    Ok(started.elapsed())
+}
+
+/// A routed clone's own IPv6 address is open to a new inbound connection the
+/// moment the clone acknowledges its restore, even when a client was already
+/// dialling it while the clone restored (as a browser retrying its page does).
+///
+/// That client's Neighbor Solicitations reach the guest before it holds its
+/// new address, which leaves the host's neighbour entry INCOMPLETE until the
+/// next solicitation, a second later; measured, the first connection after
+/// the ACK then took 684 to 893 ms. The guest announces the address with an
+/// unsolicited Neighbor Advertisement right after taking it.
+///
+/// The clone is held before its VMM resumes (`restore.post_network_pre_resume`)
+/// until the early client has made the host's entry INCOMPLETE, so the test
+/// always reaches that state instead of depending on when the client starts.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_routed_clone_ipv6_ingress_is_clear_at_the_ack() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("v6-ingress");
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "routed",
+            "--health-check",
+            "http://localhost:80",
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "snapshot create failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    common::kill_process(baseline_pid).await;
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server")
+            .await
+            .context("spawning memory server")?;
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+
+    let go_file = std::path::PathBuf::from(format!("/tmp/fcvm-{clone_name}.go"));
+    let _ = std::fs::remove_file(&go_file);
+    let failpoint = format!(
+        "restore.post_network_pre_resume:block_until_file:{}",
+        go_file.display()
+    );
+    let serve_pid_str = serve_pid.to_string();
+    let (_clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid_str,
+            "--name",
+            &clone_name,
+        ],
+        &[("FCVM_FAILPOINT", &failpoint)],
+    )
+    .await
+    .context("spawning clone held before VMM resume")?;
+    wait_for_log(
+        &clone_log,
+        "FAILPOINT restore.post_network_pre_resume reached",
+    )
+    .await?;
+    // Routed setup logs the clone's address before the hold.
+    let log = std::fs::read_to_string(&clone_log).context("reading the clone log")?;
+    let address: std::net::Ipv6Addr = log
+        .split("vm_ipv6=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .context("the clone did not log its vm_ipv6")?
+        .parse()
+        .context("vm_ipv6 is not an IPv6 address")?;
+
+    // The early client dials the held clone, whose guest is not running.
+    let acked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let early = {
+        let acked = acked.clone();
+        tokio::spawn(async move {
+            let mut attempts = 0u32;
+            while !acked.load(std::sync::atomic::Ordering::Acquire) {
+                attempts += 1;
+                let _ = http_get_v6(address, Duration::from_millis(300)).await;
+            }
+            attempts
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let neigh = tokio::process::Command::new("ip")
+            .args(["-6", "neigh", "show", "to", &address.to_string()])
+            .output()
+            .await
+            .context("running ip -6 neigh")?;
+        if String::from_utf8_lossy(&neigh.stdout).contains("INCOMPLETE") {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the early client never left the host's neighbour entry for {address} INCOMPLETE"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    std::fs::write(&go_file, b"go").context("releasing the held clone")?;
+    wait_for_log(&clone_log, "acknowledged exact restore generation").await?;
+    acked.store(true, std::sync::atomic::Ordering::Release);
+    let first = http_get_v6(address, Duration::from_secs(5)).await;
+    let attempts = early.await?;
+    let _ = std::fs::remove_file(&go_file);
+    println!("early client made {attempts} attempts; first connection after the ACK: {first:?}");
+    let first = first.context("the first connection after the ACK failed")?;
+    // A healthy connection takes about a millisecond; the stall this pins was
+    // a neighbour retransmit, about one second.
+    anyhow::ensure!(
+        first < Duration::from_millis(300),
+        "the first IPv6 connection after the ACK took {first:?}"
+    );
+    let rules = common::exec_in_vm(
+        clone_pid,
+        &[
+            "sh",
+            "-c",
+            "/usr/sbin/iptables -w -S; /usr/sbin/ip6tables -w -S",
+        ],
+    )
+    .await?;
+    anyhow::ensure!(
+        !rules.contains("FCVM_SNAPSHOT"),
+        "the gate is still installed after the ACK:\n{rules}"
+    );
+
+    common::kill_process(clone_pid).await;
+    common::kill_process(serve_pid).await;
+    Ok(())
+}
+
+/// A restored routed clone answers a new IPv6 connection without resolving its
+/// IPv6 gateway (#1160).
+///
+/// The clone inherits a correct neighbour entry for `fd00::1` and flushes it;
+/// re-resolving it raced the IPv6 swap. A solicitation sourced from the
+/// snapshot-time address got its answer after the swap had deleted that
+/// address, the answer was not delivered, and every reply, the SYN-ACK
+/// included, waited for the retransmit a second later: about 6 restores in
+/// 1000 with a client dialling during the restore. The guest now pins the
+/// gateway's entry before the swap.
+///
+/// The losing interleaving is held, not hoped for: from before the clone
+/// resumes until 100 ms after the first request is sent, the VM namespace
+/// drops its Neighbor Advertisements, so a guest that resolves its gateway in
+/// that time gets no answer, as the guest in the race did. A guest that
+/// solicited waits for its retransmit, about a second; one that never needs
+/// to answers at once.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_routed_clone_answers_without_resolving_its_ipv6_gateway() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("v6-gateway");
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "routed",
+            "--health-check",
+            "http://localhost:80",
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "snapshot create failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    common::kill_process(baseline_pid).await;
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server")
+            .await
+            .context("spawning memory server")?;
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+
+    let go_file = std::path::PathBuf::from(format!("/tmp/fcvm-{clone_name}.go"));
+    let _ = std::fs::remove_file(&go_file);
+    let failpoint = format!(
+        "restore.post_network_pre_resume:block_until_file:{}",
+        go_file.display()
+    );
+    let serve_pid_str = serve_pid.to_string();
+    let (_clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid_str,
+            "--name",
+            &clone_name,
+        ],
+        &[("FCVM_FAILPOINT", &failpoint)],
+    )
+    .await
+    .context("spawning clone held before VMM resume")?;
+    wait_for_log(
+        &clone_log,
+        "FAILPOINT restore.post_network_pre_resume reached",
+    )
+    .await?;
+    let log = std::fs::read_to_string(&clone_log).context("reading the clone log")?;
+    let field = |key: &str| {
+        log.split(key)
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(str::to_string)
+            .with_context(|| format!("the clone did not log {key}"))
+    };
+    let address: std::net::Ipv6Addr = field("vm_ipv6=")?
+        .parse()
+        .context("vm_ipv6 is not an IPv6 address")?;
+    let namespace = field("namespace=")?;
+    let advertisements = [
+        "-w",
+        "OUTPUT",
+        "-p",
+        "icmpv6",
+        "--icmpv6-type",
+        "neighbour-advertisement",
+        "-j",
+        "DROP",
+    ];
+    let in_namespace = |action: &'static str| {
+        let namespace = namespace.clone();
+        async move {
+            let mut args = vec!["netns", "exec", namespace.as_str(), "ip6tables"];
+            args.push(advertisements[0]);
+            args.push(action);
+            args.extend(&advertisements[1..]);
+            let output = tokio::process::Command::new("ip")
+                .args(&args)
+                .output()
+                .await
+                .context("running ip6tables in the VM namespace")?;
+            anyhow::ensure!(
+                output.status.success(),
+                "ip6tables {action} in {namespace}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok::<(), anyhow::Error>(())
+        }
+    };
+
+    // From before the guest runs until the first request is in flight, nothing
+    // the guest solicits from the bridge is answered.
+    in_namespace("-I").await?;
+    std::fs::write(&go_file, b"go").context("releasing the held clone")?;
+    wait_for_log(&clone_log, "acknowledged exact restore generation").await?;
+    let _ = std::fs::remove_file(&go_file);
+    let request = tokio::spawn(http_get_v6(address, Duration::from_secs(5)));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    in_namespace("-D").await?;
+    let answered = request.await?;
+    println!(
+        "first connection after the ACK, gateway unanswered for its first 100 ms: {answered:?}"
+    );
+    let answered = answered.context("the first connection after the ACK failed")?;
+    // Answered at once it takes milliseconds; a guest waiting for its
+    // gateway's retransmit takes about a second.
+    anyhow::ensure!(
+        answered < Duration::from_millis(300),
+        "the first connection after the ACK took {answered:?}: the clone resolved its IPv6 gateway"
+    );
+
+    common::kill_process(clone_pid).await;
+    common::kill_process(serve_pid).await;
     Ok(())
 }

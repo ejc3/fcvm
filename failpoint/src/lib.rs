@@ -52,6 +52,12 @@
 //!   (failpoint/src/burn.rs).
 //! * `<name>:block_until_file:<path>` — poll every 10ms until `<path>` exists,
 //!   hard-capped at 300 s. Host-only (see below). `<path>` may contain `:`.
+//! * `<name>:park:<dir>`: the race gym's controller protocol (`docs/race-gym.md`). The hit
+//!   writes `<dir>/<actor>-<pid>/<seq>.reached`, naming the point and its per-process hit
+//!   count, and waits for `<seq>.go`, capped at 300 s like `block_until_file`. `<actor>` is
+//!   `FCVM_RACE_ACTOR` (default `actor`). `<name>` may be `*`, which parks every point and
+//!   turns on [`note`]. Host-only. With `FCVM_RACE_PARENT` set, only a process whose parent
+//!   has that pid parks, so the fcvm processes an actor spawns do not.
 //!
 //! # Arming
 //!
@@ -81,6 +87,10 @@
 //! snapshot with failpoints armed.
 
 mod burn;
+mod park;
+mod points;
+
+pub use points::{GUEST_POINTS, HOST_POINTS};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -114,6 +124,8 @@ enum Action {
     /// Keep every SCHED_OTHER task off every CPU for the given duration. Guest-only and
     /// root-only (see the crate docs and the `burn` module).
     Burn(Duration),
+    /// Announce the hit in the directory and wait for the controller's go file. Host-only.
+    Park(PathBuf),
 }
 
 impl fmt::Display for Action {
@@ -122,6 +134,7 @@ impl fmt::Display for Action {
             Action::Sleep(d) => write!(f, "sleep:{}ms", d.as_millis()),
             Action::BlockUntilFile(p) => write!(f, "block_until_file:{}", p.display()),
             Action::Burn(d) => write!(f, "burn:{}ms", d.as_millis()),
+            Action::Park(dir) => write!(f, "park:{}", dir.display()),
         }
     }
 }
@@ -130,9 +143,23 @@ impl fmt::Display for Action {
 /// (env var unset). Either way [`hit`] is one static lookup on the fast path.
 static ARMED: OnceLock<Option<HashMap<String, Action>>> = OnceLock::new();
 
+/// The name that arms every point. Only `park` may use it.
+const EVERY_POINT: &str = "*";
+
 fn armed_action(name: &str) -> Option<&'static Action> {
     match ARMED.get() {
-        Some(Some(map)) => map.get(name),
+        Some(Some(map)) => map.get(name).or_else(|| map.get(EVERY_POINT)),
+        _ => None,
+    }
+}
+
+/// The directory of a `*:park:<dir>` spec, which is also where [`note`] writes.
+fn park_everything_dir() -> Option<&'static Path> {
+    match ARMED.get() {
+        Some(Some(map)) => match map.get(EVERY_POINT) {
+            Some(Action::Park(dir)) => Some(dir.as_path()),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -183,15 +210,24 @@ fn parse_spec(spec: &str) -> Result<HashMap<String, Action>, String> {
             (Some("block_until_file"), _) => {
                 return Err(format!("entry {entry:?}: block_until_file needs a path"));
             }
+            (Some("park"), Some(dir)) if !dir.is_empty() => Action::Park(PathBuf::from(dir)),
+            (Some("park"), _) => {
+                return Err(format!("entry {entry:?}: park needs a directory"));
+            }
             (Some(other), _) => {
                 return Err(format!(
-                    "entry {entry:?}: unknown action {other:?} (expected sleep, burn, or block_until_file)"
+                    "entry {entry:?}: unknown action {other:?} (expected sleep, burn, block_until_file, or park)"
                 ));
             }
             (None, _) => {
                 return Err(format!("entry {entry:?}: expected <name>:<action>:<arg>"));
             }
         };
+        if name == EVERY_POINT && !matches!(action, Action::Park(_)) {
+            return Err(format!(
+                "entry {entry:?}: only park may arm every point ({EVERY_POINT:?})"
+            ));
+        }
         if map.insert(name.to_string(), action).is_some() {
             return Err(format!("failpoint {name:?} specified twice"));
         }
@@ -212,10 +248,28 @@ pub fn arm_from_env() {
     }
 }
 
+/// A park belongs to the actor the race gym started, not to the fcvm processes that actor
+/// spawns (a health check's `fcvm exec` inherits the environment and would otherwise park
+/// on its own, on a timer). The controller sets `FCVM_RACE_PARENT` to its pid; a process
+/// whose parent is another one keeps every other action and drops its parks.
+fn drop_inherited_parks(map: HashMap<String, Action>) -> HashMap<String, Action> {
+    let Ok(parent) = std::env::var("FCVM_RACE_PARENT") else {
+        return map;
+    };
+    // SAFETY: getppid has no preconditions.
+    let ppid = unsafe { libc::getppid() }.to_string();
+    if parent == ppid {
+        return map;
+    }
+    map.into_iter()
+        .filter(|(_, action)| !matches!(action, Action::Park(_)))
+        .collect()
+}
+
 /// [`arm_from_str`] for the host: a `burn` entry is refused like a malformed one, because
 /// a burn armed in fcvm would starve every CPU of the host.
 fn arm_host(spec: &str) {
-    let map = parse_spec(spec).and_then(|map| {
+    let map = parse_spec(spec).map(drop_inherited_parks).and_then(|map| {
         let burn = map
             .iter()
             .find_map(|(name, action)| matches!(action, Action::Burn(_)).then_some(name));
@@ -256,9 +310,10 @@ pub fn validate_guest_spec(spec: &str) -> Result<(), String> {
         );
     }
     for (name, action) in parse_spec(spec)? {
-        if matches!(action, Action::BlockUntilFile(_)) {
+        if matches!(action, Action::BlockUntilFile(_) | Action::Park(_)) {
             return Err(format!(
-                "failpoint {name:?}: block_until_file is host-only; guest failpoints support sleep and burn only"
+                "failpoint {name:?}: block_until_file and park are host-only; guest failpoints \
+                 support sleep and burn only"
             ));
         }
     }
@@ -352,6 +407,18 @@ fn begin_sync(name: &str, action: &Action, cap: Duration) -> Hold {
             }
         }
         Action::Burn(d) => burn = burn::start(name, *d),
+        Action::Park(dir) => {
+            let go = park::announce(dir, name);
+            let deadline = Instant::now() + cap;
+            while !go.exists() {
+                if Instant::now() >= deadline {
+                    release_by_timeout(name, &go, cap);
+                    park::timed_out(dir, name);
+                    break;
+                }
+                std::thread::sleep(park::POLL);
+            }
+        }
     }
     let hold = Hold {
         name: Some(name.to_string()),
@@ -389,8 +456,30 @@ async fn perform_async(name: &str, action: &Action, cap: Duration) {
             "FAILPOINT {name} BURN ABORTED: a burn raises the thread that hits it, so it needs \
              failpoint::hit or failpoint::hit_scoped on a blocking thread, not hit_async"
         ),
+        Action::Park(dir) => {
+            let go = park::announce(dir, name);
+            let deadline = Instant::now() + cap;
+            while !go.exists() {
+                if Instant::now() >= deadline {
+                    release_by_timeout(name, &go, cap);
+                    park::timed_out(dir, name);
+                    break;
+                }
+                tokio::time::sleep(park::POLL).await;
+            }
+        }
     }
     eprintln!("FAILPOINT {name} released");
+}
+
+/// Record an event the race gym's controller needs and that is not a point: an actor that
+/// starts waiting on a lock another actor holds (`note("lock.wait", path)`). Writes only when
+/// every point is parked (`*:park:<dir>`); otherwise it is one static lookup and `detail` is
+/// never formatted. Never waits.
+pub fn note(kind: &str, detail: impl fmt::Display) {
+    if let Some(dir) = park_everything_dir() {
+        park::note(dir, kind, &detail.to_string());
+    }
 }
 
 fn release_by_timeout(name: &str, path: &Path, cap: Duration) {
@@ -472,6 +561,112 @@ mod tests {
     #[should_panic(expected = "burn is guest-only")]
     fn test_host_arming_refuses_burn() {
         arm_host("exec.post_connect_pre_send:burn:3000");
+    }
+
+    #[test]
+    fn test_parse_park_and_every_point() {
+        let map = parse_spec("restore.pre_load:park:/tmp/gym,*:park:/tmp/all").unwrap();
+        assert_eq!(
+            map["restore.pre_load"],
+            Action::Park(PathBuf::from("/tmp/gym"))
+        );
+        assert_eq!(map["*"], Action::Park(PathBuf::from("/tmp/all")));
+        assert!(parse_spec("x:park:").is_err()); // no directory
+        assert!(parse_spec("*:sleep:5").is_err()); // only park arms every point
+        assert!(parse_spec("*:block_until_file:/tmp/x").is_err());
+        // park is host-only: the guest cannot see the controller's files.
+        assert!(validate_guest_spec("x:park:/tmp/gym").is_err());
+    }
+
+    /// Unarmed, every registered point and a note are one static lookup each: nothing
+    /// parks, nothing is written, and 1000 rounds over every point take well under the
+    /// time one park poll would.
+    #[test]
+    fn test_unarmed_park_points_do_nothing() {
+        // No test in this crate arms `*`, and no registered point is armed by name.
+        assert!(park_everything_dir().is_none());
+        assert!(HOST_POINTS.iter().all(|p| armed_action(p).is_none()));
+        let start = Instant::now();
+        for _ in 0..1000 {
+            for point in HOST_POINTS {
+                hit(point);
+            }
+            note("lock.wait", "never formatted");
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "unarmed points must be effectively free (took {:?})",
+            start.elapsed()
+        );
+        // Arming anything but `*:park` turns no note on.
+        let map = parse_spec("restore.pre_load:park:/tmp/gym").unwrap();
+        assert!(!map.contains_key(EVERY_POINT));
+    }
+
+    /// Each park root gets its own directory (a spec may name several), and a park that
+    /// reaches its cap records that it ran on unreleased.
+    #[test]
+    fn test_park_roots_are_separate_and_a_timeout_is_recorded() {
+        let one = unique_path("root-one");
+        let two = unique_path("root-two");
+        perform_sync(
+            "unit.one",
+            &Action::Park(one.clone()),
+            Duration::from_millis(30),
+        );
+        perform_sync(
+            "unit.two",
+            &Action::Park(two.clone()),
+            Duration::from_millis(30),
+        );
+        for (root, point) in [(&one, "unit.one"), (&two, "unit.two")] {
+            let actor = root.join(format!("actor-{}", std::process::id()));
+            let reached = std::fs::read_to_string(actor.join("000000.reached")).unwrap();
+            assert!(reached.contains(&format!("point={point}\n")), "{reached}");
+            let note = std::fs::read_to_string(actor.join("000001.note")).unwrap();
+            assert!(
+                note.contains("note=park.timeout\n") && note.contains(point),
+                "{note}"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// A parked hit announces itself, waits for its go file, and numbers repeat hits of a
+    /// name. The one test that parks (the actor directory is fixed once per process).
+    #[test]
+    fn test_park_announces_and_waits_for_go() {
+        let dir = unique_path("park");
+        let action = Action::Park(dir.clone());
+        let parked = {
+            let action = action.clone();
+            std::thread::spawn(move || {
+                perform_sync("unit.park", &action, Duration::from_secs(10));
+                perform_sync("unit.park", &action, Duration::from_secs(10));
+            })
+        };
+        let actor = dir.join(format!("actor-{}", std::process::id()));
+        let wait_for = |file: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !actor.join(file).exists() {
+                assert!(Instant::now() < deadline, "{file} never appeared");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::fs::read_to_string(actor.join(file)).unwrap()
+        };
+        let first = wait_for("000000.reached");
+        assert!(first.contains("point=unit.park\nhit=1\n"), "{first}");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !actor.join("000001.reached").exists(),
+            "the hit did not wait for its go"
+        );
+        std::fs::write(actor.join("000000.go"), b"").unwrap();
+        let second = wait_for("000001.reached");
+        assert!(second.contains("hit=2"), "{second}");
+        std::fs::write(actor.join("000001.go"), b"").unwrap();
+        parked.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

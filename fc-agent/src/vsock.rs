@@ -6,6 +6,13 @@ use std::task::{ready, Poll};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 
+/// Register an owned fd with tokio's reactor.
+fn register(fd: OwnedFd) -> std::io::Result<AsyncFd<OwnedFd>> {
+    // SAFETY: the `AsyncFd` owns `fd`, which closes only when the `AsyncFd` drops or
+    // `into_inner` hands it back, and nothing in this module replaces it through `get_mut`.
+    Ok(unsafe { AsyncFd::register(fd) }?)
+}
+
 pub const HOST_CID: u32 = 2;
 pub const STATUS_PORT: u32 = 4999;
 pub const EXEC_PORT: u32 = 4998;
@@ -234,7 +241,7 @@ impl VsockStream {
         )
         .context("setting O_NONBLOCK on vsock")?;
 
-        let inner = Arc::new(AsyncFd::new(fd).context("wrapping vsock in AsyncFd")?);
+        let inner = Arc::new(register(fd).context("wrapping vsock in AsyncFd")?);
         Ok(Self { inner })
     }
 
@@ -330,7 +337,7 @@ impl AsyncFdStream {
         let flags = nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK;
         nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_SETFL(flags))?;
         Ok(Self {
-            inner: Arc::new(AsyncFd::new(fd)?),
+            inner: Arc::new(register(fd)?),
         })
     }
 
@@ -379,7 +386,7 @@ impl VsockListener {
         )
         .context("listening on vsock")?;
 
-        let inner = AsyncFd::new(fd).context("wrapping listener in AsyncFd")?;
+        let inner = register(fd).context("wrapping listener in AsyncFd")?;
         Ok(Self { inner })
     }
 
@@ -394,7 +401,7 @@ impl VsockListener {
     /// snapshot keep the port bound, causing bind() to fail with EADDRINUSE.
     pub fn re_register(self) -> Result<Self> {
         let fd = self.inner.into_inner();
-        let inner = AsyncFd::new(fd).context("re-registering listener with AsyncFd")?;
+        let inner = register(fd).context("re-registering listener with AsyncFd")?;
         Ok(Self { inner })
     }
 
@@ -638,13 +645,44 @@ pub fn notify_reboot() -> bool {
     false
 }
 
-/// Notify host that the container has started.
-pub fn notify_container_started() {
-    if send_status(b"ready\n") {
-        eprintln!("[fc-agent] container started, notified host via vsock");
+/// The status message that tells the host the container is running, saying whether
+/// the image defines a HEALTHCHECK whose result the host still has to ask podman for.
+pub fn container_started_message(healthcheck: bool) -> String {
+    let word = if healthcheck {
+        exec_proto::CONTAINER_STARTED_WITH_HEALTHCHECK
     } else {
-        eprintln!("[fc-agent] WARNING: failed to send ready status to host");
+        exec_proto::CONTAINER_STARTED
+    };
+    format!("{word}\n")
+}
+
+/// Notify the host that the container is running.
+///
+/// It is the host's only signal that the container started: its health monitor runs no
+/// check of its own until this arrives. Retried like the exit notification, each attempt
+/// on a fresh connection.
+pub fn notify_container_started(healthcheck: bool) {
+    const MAX_ATTEMPTS: u32 = 5;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+    let msg = container_started_message(healthcheck);
+    for attempt in 1..=MAX_ATTEMPTS {
+        if send_status(msg.as_bytes()) {
+            eprintln!("[fc-agent] container started, notified host via vsock");
+            return;
+        }
+        if attempt < MAX_ATTEMPTS {
+            eprintln!(
+                "[fc-agent] WARNING: failed to send ready status to host (attempt {}/{}), retrying",
+                attempt, MAX_ATTEMPTS
+            );
+            std::thread::sleep(RETRY_DELAY);
+        }
     }
+    eprintln!(
+        "[fc-agent] WARNING: failed to send ready status to host after {} attempts",
+        MAX_ATTEMPTS
+    );
 }
 
 #[cfg(test)]

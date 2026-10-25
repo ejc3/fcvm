@@ -262,12 +262,12 @@ CONTAINER_RUN_BASE := "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" \
 CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=65536
 
 .PHONY: all help build clean clean-test-data check-disk \
-	test test-unit test-agent-unit test-fast test-all test-root test-packaging test-ci-infrastructure test-clone-floor-overlap fuzz \
+	test test-unit test-agent-unit test-fast test-all test-root test-packaging test-ci-infrastructure test-clone-floor-overlap fuzz race-gym _race-gym race-gym-cases \
 	_test-unit _test-agent-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
-	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
-	bench-container-import bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
+	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu gpu-residue-test gpu-routed-test setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
+	bench-container-import bench-computesdk bench-gpu-restore bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
 	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-chromium-corpus-extra bench-stop \
 	bench-chromium-request-run bench-chromium-request-all bench-chromium-hostcdp bench-chromium-fault \
@@ -298,6 +298,8 @@ help:
 	@echo "  test-clone-floor-overlap  Reproduce the clone/CH/hugepage lifecycle overlap"
 	@echo "  test-ci-infrastructure  Deterministic runner-failure classifier fixtures"
 	@echo "  fuzz               Seeded lifecycle chaos fuzz (SEEDS=N|list OPS=M, defaults 1/10)"
+	@echo "  race-gym           Race gym: enumerate interleavings of concurrent actors (SCENARIO= PHASE=pairs|walk SCHEDULES= PARALLEL=; REPLAY=<file> [EMIT=<name>])"
+	@echo "  race-gym-cases     Run the race gym replays emitted into test_lifecycle_interleave.rs"
 	@echo ""
 	@echo "Test (container):"
 	@echo "  container-test-unit    Unit tests in container"
@@ -314,6 +316,8 @@ help:
 	@echo "  setup-btrfs        Create btrfs loopback at /mnt/fcvm-btrfs"
 	@echo "  setup-fcvm         Download kernel and create rootfs"
 	@echo "  setup-gpu          Build the gpu profile kernel and NVIDIA driver image"
+	@echo "  gpu-residue-test   GPU memory residue between VMs (GPU=<pci address>)"
+	@echo "  gpu-routed-test    A routed GPU VM and its restore hold their IPv6 address (GPU=<pci address>)"
 	@echo "  setup-passt        Build and install the pinned upstream pasta/passt"
 	@echo "  setup-pjdfstest    Build pjdfstest"
 	@echo "  setup-lint-tools   Install cargo-audit and cargo-deny"
@@ -333,6 +337,8 @@ help:
 	@echo "  bench-hugepages    Run hugepages benchmark (32GB VM, 16GB dirty)"
 	@echo "  bench-hugepages-test  Run hugepages benchmark (2GB VM, 256MB dirty)"
 	@echo "  bench-container-import  Compare podman load vs direct image mount"
+	@echo "  bench-computesdk   ComputeSDK Burst TTI against fcvm serve (CONCURRENCY=, ITERATIONS=, BURSTS=)"
+	@echo "  bench-gpu-restore  Cache-hit GPU VM restore latency, N runs (needs vfio-pci bound GPUs)"
 	@echo "  bench-chromium     Chromium shared-nothing clone bench (egress x memory matrix)"
 	@echo "  bench-chromium-request-build   Build the request-bench container image"
 	@echo "  bench-webkit-request-build     Build the WebKit request-bench container image"
@@ -555,6 +561,22 @@ build-host-tools: cargo-target-link dep-provenance
 		exit 1; \
 	fi
 
+# The coordinator needs the host binary, not a guest agent or VM assets. Keep
+# these entry points under the same worktree target lease as the other builds.
+.PHONY: build-fleet-coordinator test-fleet-coordinator
+build-fleet-coordinator: private SHELL := $(TARGET_LEASE_SHELL)
+build-fleet-coordinator: cargo-target-link dep-provenance
+	@set -e; \
+	before="$$($(MAKE) --no-print-directory dep-provenance)"; \
+	CARGO_TARGET_DIR=target $(CARGO) build --locked --release -p fcvm; \
+	after="$$($(MAKE) --no-print-directory dep-provenance)"; \
+	test "$$before" = "$$after"; \
+	test -x target/release/fcvm
+
+test-fleet-coordinator: private SHELL := $(TARGET_LEASE_SHELL)
+test-fleet-coordinator: cargo-target-link dep-provenance
+	CARGO_TARGET_DIR=target $(CARGO) test --locked --release --no-default-features -p fcvm --test test_fleet_coord
+
 build-fc-mock: private SHELL := $(TARGET_LEASE_SHELL)
 build-fc-mock: cargo-target-link
 	@echo "==> Building fc-mock..."
@@ -626,6 +648,42 @@ SEEDS ?= 1
 OPS ?= 10
 fuzz: show-notes check-disk setup-fcvm
 	FCVM_FUZZ_SEEDS=$(SEEDS) FCVM_FUZZ_OPS=$(OPS) $(MAKE) _test-root FILTER=fuzz_lifecycle_chaos
+
+# Race gym (docs/race-gym.md): concurrent fcvm actors parked at named failpoints and
+# released in enumerated orders. Rootless, so it runs as the invoking user.
+#   make race-gym SCENARIO=cold-run PHASE=pairs SCHEDULES=N PARALLEL=P
+#   make race-gym PHASE=walk SCHEDULES=200 SEED=1
+#   make race-gym REPLAY=<file>                 rerun one recorded schedule
+#   make race-gym REPLAY=<file> EMIT=<name> [PIN=outcome]   add it as a case to test_lifecycle_interleave.rs
+#                                                failing while a PIN oracle fails (default: any)
+#   make race-gym-cases                         run the emitted cases
+# Host inputs come from the environment: RACE_GYM_GPUS (one --gpu per actor),
+# RACE_GYM_ARGS (extra podman run arguments), RACE_GYM_IMAGE, RACE_GYM_OUT.
+SCENARIO ?= cold-run
+PHASE ?= pairs
+SCHEDULES ?=
+PARALLEL ?= 1
+SEED ?= 1
+FIRST ?= 0
+REPLAY ?=
+EMIT ?=
+RERECORD ?=
+PIN ?=
+race-gym: show-notes check-disk
+ifneq ($(EMIT),)
+	./scripts/race-gym-emit.sh "$(REPLAY)" "$(EMIT)" "$(PIN)"
+else
+	$(MAKE) setup-fcvm _race-gym
+endif
+
+_race-gym: cargo-target-link
+	RACE_GYM_SCENARIO="$(SCENARIO)" RACE_GYM_PHASE="$(PHASE)" RACE_GYM_SCHEDULES="$(SCHEDULES)" \
+	RACE_GYM_PARALLEL="$(PARALLEL)" RACE_GYM_SEED="$(SEED)" RACE_GYM_FIRST="$(FIRST)" RACE_GYM_REPLAY="$(REPLAY)" RACE_GYM_RERECORD="$(RERECORD)" \
+	$(TEST_CONFIG_WRAPPER) $(NEXTEST) $(NEXTEST_CAPTURE) --no-default-features --features race-gym -E 'binary(test_race_gym)'
+
+race-gym-cases: show-notes check-disk setup-fcvm cargo-target-link
+	$(TEST_CONFIG_WRAPPER) $(NEXTEST) $(NEXTEST_CAPTURE) --no-default-features --features integration-fast,race-gym \
+		-E 'binary(test_lifecycle_interleave) & test(/lifecycle_interleave_gym_/)'
 
 # fc-mock: container-mode tests (no KVM required)
 # Uses fc-mock binary instead of Firecracker.
@@ -819,6 +877,22 @@ setup-gpu: private SHELL := $(TARGET_LEASE_SHELL)
 setup-gpu: build setup-btrfs
 	./target/release/fcvm setup --kernel-profile gpu --build-kernels --config "$(CURDIR)/rootfs-config.toml"
 
+# A routed GPU VM, and one restored from its snapshot at another address, hold the
+# --ipv6-address they were given on eth0 and reach the internet over IPv6
+# (scripts/gpu-routed/run.sh). Needs root, a GPU on vfio-pci and a routable prefix.
+gpu-routed-test: private SHELL := $(TARGET_LEASE_SHELL)
+gpu-routed-test: $(if $(strip $(GPU)),setup-gpu)
+	@test -n "$(GPU)" || { echo "usage: make gpu-routed-test GPU=<pci address>" >&2; exit 2; }
+	sudo -E FCVM=./target/release/fcvm ./scripts/gpu-routed/run.sh "$(GPU)"
+
+# Cross-tenant GPU memory residue (scripts/gpu-residue/run.sh): one VM fills a
+# GPU's memory with a marker and ends, the next VM on that GPU counts the marker
+# in fresh allocations. Needs a host with the GPU on vfio-pci.
+gpu-residue-test: private SHELL := $(TARGET_LEASE_SHELL)
+gpu-residue-test: setup-gpu
+	@test -n "$(GPU)" || { echo "usage: make gpu-residue-test GPU=<pci address> [RESIDUE_OUT=<dir>]" >&2; exit 2; }
+	FCVM=./target/release/fcvm ./scripts/gpu-residue/run.sh "$(GPU)" $(RESIDUE_OUT)
+
 # Build and install host kernel with all patches from kernel/patches/
 # Requires reboot to activate the new kernel
 install-host-kernel: private SHELL := $(TARGET_LEASE_SHELL)
@@ -855,6 +929,17 @@ test-serve-sdk: build
 	fi
 	cd tests && npm install --silent
 	npx tsx tests/test_serve_sdk.ts
+
+# ComputeSDK Burst TTI (computesdk/benchmarks' sandbox TTI task at a pinned commit) against
+# `fcvm serve` on this host. Method and results: docs/benchmarks/computesdk-burst-tti.md.
+# Knobs: CONCURRENCY, ITERATIONS, BURSTS, WORK, OUT (see bench/computesdk/run.sh).
+bench-computesdk: setup-default
+	@bash bench/computesdk/run.sh
+
+# Cache-hit GPU VM restore latency: N `fcvm podman run --gpu` runs, rotating over the host's
+# vfio-pci bound NVIDIA GPUs. Knobs: N (default 104), IMAGE, OUT.
+bench-gpu-restore: setup-gpu
+	@bash bench/gpu-restore/run.sh
 
 # Chromium shared-nothing benchmark: per-request clone latency + memory density
 # across every egress path, vs host-native baselines. Results land in
@@ -1435,7 +1520,7 @@ setup-lint-tools: cargo-target-link
 	@which cargo-deny > /dev/null || (echo "Installing cargo-deny..." && $(CARGO) install cargo-deny@$(CARGO_DENY_VERSION) --locked)
 
 lint: setup-lint-tools
-	$(CARGO) fmt -p fcvm -p fuse-pipe -p fc-agent -p failpoint --check
+	$(CARGO) fmt -p fcvm -p fuse-pipe -p fc-agent -p failpoint -p fleet-core --check
 	$(MAKE) clippy
 	$(CARGO) audit
 	$(CARGO) deny check
@@ -1486,8 +1571,9 @@ fmt: cargo-target-link
 	$(CARGO) fmt
 
 # SSH to jumpbox (IP from terraform: cd ~/src/aws && terraform output jumpbox_ssh_command)
-JUMPBOX_IP := 54.193.62.221
+JUMPBOX_IP ?=
 ssh:
+	@test -n "$(JUMPBOX_IP)" || { echo "set JUMPBOX_IP (terraform output jumpbox_ssh_command)" >&2; exit 2; }
 	ssh -i ~/.ssh/fcvm-ec2 ubuntu@$(JUMPBOX_IP)
 
 # Kernel patch helpers - generates properly formatted patches

@@ -67,8 +67,8 @@ async fn run() -> Result<()> {
             // Setup handles its own path initialization after loading config
             // Don't pre-initialize here since setup may create storage first
         }
-        Commands::Completions(_) => {
-            // Shell completions don't need config
+        Commands::Completions(_) | Commands::Fleet(_) | Commands::Gpu(_) => {
+            // Shell completions, the fleet control plane and the GPU pool commands don't need config
             paths::init_with_defaults();
         }
         _ => {
@@ -81,6 +81,9 @@ async fn run() -> Result<()> {
     // Use RUST_LOG if set, otherwise default to WARN (quiet by default, use RUST_LOG=info for verbose)
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
 
+    // `log_internal_errors(false)` on both: when stderr's reader is gone, tracing-subscriber
+    // would report the failed write with eprintln!, which panics on the same broken stderr
+    // and kills fcvm mid-command (a VM's teardown included). Logs are lost; nothing else is.
     // If --sub-process flag is set, disable timestamps AND level (subprocess mode)
     // Parent process already shows timestamp and level, so subprocess just shows the message
     // But KEEP target tags to show the nesting hierarchy!
@@ -94,6 +97,7 @@ async fn run() -> Result<()> {
             .without_time()
             .with_level(false) // Disable level prefix too (INFO, DEBUG, etc.)
             .with_ansi(false) // NEVER use ANSI in subprocesses
+            .log_internal_errors(false)
             .try_init()
             .ok();
     } else {
@@ -105,6 +109,7 @@ async fn run() -> Result<()> {
             .with_writer(std::io::stderr) // Logs to stderr, keep stdout clean for command output
             .with_target(true) // Show targets for all processes
             .with_ansi(use_color) // Only use ANSI when outputting to TTY
+            .log_internal_errors(false)
             .try_init()
             .ok();
     }
@@ -121,12 +126,14 @@ async fn run() -> Result<()> {
         Commands::Snapshots(args) => commands::cmd_snapshots(args).await,
         Commands::Exec(args) => commands::cmd_exec(args).await,
         Commands::Balloon(args) => commands::cmd_balloon(args).await,
+        Commands::Gpu(args) => commands::cmd_gpu(args).await,
         Commands::Serve(args) => commands::cmd_serve(args).await,
         Commands::Setup(args) => commands::cmd_setup(args).await,
         Commands::Completions(args) => {
             commands::cmd_completions(args);
             Ok(())
         }
+        Commands::Fleet(args) => fcvm::fleet::cmd_fleet(args).await,
     };
 
     // Handle errors

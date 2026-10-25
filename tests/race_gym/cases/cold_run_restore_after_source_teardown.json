@@ -1,0 +1,293 @@
+{
+  "format": 1,
+  "scenario": "cold-run",
+  "fcvm_rev": "race-gym with #1188 at 66d9b3c8 merged",
+  "params": {
+    "actors": 2,
+    "args": [
+      "--kernel-profile",
+      "gpu"
+    ],
+    "gpu_per_actor": true,
+    "image": "localhost/race-gym-alpine:1"
+  },
+  "schedule": {
+    "kind": "pair",
+    "a": 0,
+    "i": "teardown.pre_remove_data_dir#1",
+    "b": 1,
+    "j": "restore.pre_load#1",
+    "first": 0
+  },
+  "steps": [
+    {
+      "actor": 0,
+      "release": "cache.miss#1",
+      "event": {
+        "parked": "lifecycle.before_ready_claim#1"
+      }
+    },
+    {
+      "actor": 1,
+      "release": "cache.miss#1",
+      "event": {
+        "parked": "lifecycle.before_ready_claim#1"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "lifecycle.before_ready_claim#1",
+      "event": {
+        "parked": "snapshot.create.locked#1"
+      }
+    },
+    {
+      "actor": 1,
+      "release": "lifecycle.before_ready_claim#1",
+      "event": {
+        "waiting": "snapshots/#.lock"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "snapshot.create.locked#1",
+      "event": {
+        "parked": "snapshot.pre_pause#1"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "snapshot.pre_pause#1",
+      "event": {
+        "parked": "exec.post_connect_pre_send#1"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "exec.post_connect_pre_send#1",
+      "event": {
+        "parked": "snapshot.post_balloon_read_pre_save#1"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "snapshot.post_balloon_read_pre_save#1",
+      "event": {
+        "parked": "snapshot.post_save_pre_resume#1"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "snapshot.post_save_pre_resume#1",
+      "event": {
+        "parked": "exec.post_connect_pre_send#2"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "exec.post_connect_pre_send#2",
+      "event": {
+        "parked": "snapshot.install.pre_rename#1"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "snapshot.install.pre_rename#1",
+      "event": {
+        "parked": "snapshot.install.post_rename#1"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "snapshot.install.post_rename#1",
+      "event": {
+        "parked": "teardown.pre_kill#1"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "teardown.pre_kill#1",
+      "event": {
+        "parked": "teardown.pre_remove_data_dir#1"
+      }
+    },
+    {
+      "actor": 1,
+      "release": "snapshot.create.locked#1",
+      "event": {
+        "parked": "teardown.pre_kill#1"
+      }
+    },
+    {
+      "actor": 1,
+      "release": "teardown.pre_kill#1",
+      "event": {
+        "parked": "teardown.pre_remove_data_dir#1"
+      }
+    },
+    {
+      "actor": 1,
+      "release": "teardown.pre_remove_data_dir#1",
+      "event": {
+        "parked": "restore.locked#1"
+      }
+    },
+    {
+      "actor": 1,
+      "release": "restore.locked#1",
+      "event": {
+        "parked": "restore.pre_resume#1"
+      }
+    },
+    {
+      "actor": 1,
+      "release": "restore.pre_resume#1",
+      "event": {
+        "parked": "restore.post_clone_disk#1"
+      }
+    },
+    {
+      "actor": 1,
+      "release": "restore.post_clone_disk#1",
+      "event": {
+        "parked": "restore.pre_spawn_vmm#1"
+      }
+    },
+    {
+      "actor": 1,
+      "release": "restore.pre_spawn_vmm#1",
+      "event": {
+        "parked": "restore.pre_load#1"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "teardown.pre_remove_data_dir#1",
+      "event": {
+        "waiting": "vm-disks/vm-#"
+      }
+    },
+    {
+      "actor": 1,
+      "release": "restore.pre_load#1",
+      "event": {
+        "parked": "restore.post_network_pre_resume#1"
+      }
+    },
+    {
+      "actor": 1,
+      "release": "restore.post_network_pre_resume#1",
+      "event": {
+        "parked": "restore.unlocked#1"
+      }
+    },
+    {
+      "actor": 1,
+      "release": "restore.unlocked#1",
+      "event": {
+        "parked": "lifecycle.before_ready_claim#2"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "restore.locked#1",
+      "event": {
+        "parked": "restore.pre_resume#1"
+      }
+    },
+    {
+      "actor": 1,
+      "release": "lifecycle.before_ready_claim#2",
+      "event": {
+        "parked": "teardown.pre_kill#2"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "restore.pre_resume#1",
+      "event": {
+        "parked": "restore.post_clone_disk#1"
+      }
+    },
+    {
+      "actor": 1,
+      "release": "teardown.pre_kill#2",
+      "event": {
+        "parked": "teardown.pre_remove_data_dir#2"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "restore.post_clone_disk#1",
+      "event": {
+        "parked": "restore.pre_spawn_vmm#1"
+      }
+    },
+    {
+      "actor": 1,
+      "release": "teardown.pre_remove_data_dir#2",
+      "event": {
+        "exited": 0
+      }
+    },
+    {
+      "actor": 0,
+      "release": "restore.pre_spawn_vmm#1",
+      "event": {
+        "parked": "restore.pre_load#1"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "restore.pre_load#1",
+      "event": {
+        "parked": "restore.post_network_pre_resume#1"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "restore.post_network_pre_resume#1",
+      "event": {
+        "parked": "restore.unlocked#1"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "restore.unlocked#1",
+      "event": {
+        "parked": "lifecycle.before_ready_claim#2"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "lifecycle.before_ready_claim#2",
+      "event": {
+        "parked": "teardown.pre_kill#2"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "teardown.pre_kill#2",
+      "event": {
+        "parked": "teardown.pre_remove_data_dir#2"
+      }
+    },
+    {
+      "actor": 0,
+      "release": "teardown.pre_remove_data_dir#2",
+      "event": {
+        "exited": 0
+      }
+    }
+  ],
+  "failed": [
+    {
+      "oracle": "leak",
+      "actor": null,
+      "detail": "VM directory vm-disks/vm-adc42d26030046e2a98c47c2ad298c45 outlived its VM"
+    }
+  ],
+  "pin_oracles": [
+    "outcome"
+  ]
+}

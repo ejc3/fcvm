@@ -91,7 +91,20 @@ const PARKED_RETRY_BURST: Duration = Duration::from_millis(2);
 /// has run out. Retries are also attempted after every drain and between prefetch chunks.
 const PARKED_RETRY_DELAY: Duration = Duration::from_millis(2);
 
-/// How long a parked fault may stay unresolved before the handler fails closed.
+/// How long a parked fault may stay refused with no REMOVE event read before the handler fails
+/// closed. The wait counts from when the fault was parked or from the last REMOVE event read,
+/// whichever is later ([`ParkedFaults::refused_without_progress`]).
+///
+/// The bound is there for a flag that stays up: a fault whose refusal nothing will clear
+/// would hang its vCPU for good. Every REMOVE that is read lowers the flag as soon as the
+/// thread inside `madvise` runs again, so a balloon whose events keep arriving is not that
+/// case, even when no retry gets through. When that thread and the handler share a CPU none
+/// can: the thread runs only while the handler is off the CPU, and between lowering the flag
+/// and raising it for its next `madvise` it does not stop. Measured on a 32-core arm64 host
+/// with both pinned to one CPU, against back-to-back single-page `madvise` calls: in 2 s the
+/// handler made 3,428,087 retries and read 2,656 REMOVE events, none of the retries got
+/// through, and the bound, counted from the park, then killed the clone. Such a fault
+/// resolves when the balloon pauses or the scheduler moves one of the two threads.
 const MAX_PARKED_WAIT: Duration = Duration::from_secs(2);
 
 /// `sockaddr_un.sun_path` is a fixed 108-byte array on Linux; bind(2) fails with a bare
@@ -259,6 +272,20 @@ impl AsRawFd for PidfdRef<'_> {
     fn as_raw_fd(&self) -> RawFd {
         self.0.as_raw_fd()
     }
+}
+
+/// Register an owned userfaultfd with tokio's reactor.
+fn register_uffd(uffd: Uffd) -> std::io::Result<AsyncFd<Uffd>> {
+    // SAFETY: `Uffd` owns its descriptor, closes it only on drop, and returns the same one
+    // from every `as_raw_fd`. Nothing replaces it through `AsyncFd::get_mut`.
+    Ok(unsafe { AsyncFd::register(uffd) }?)
+}
+
+/// Register the peer VMM's pidfd with tokio's reactor without duplicating it.
+fn register_peer_pidfd(pidfd: &OwnedFd) -> std::io::Result<AsyncFd<PidfdRef<'_>>> {
+    // SAFETY: `PidfdRef` borrows `pidfd`, so the descriptor stays open and unchanged for the
+    // lifetime of the returned `AsyncFd`.
+    Ok(unsafe { AsyncFd::register(PidfdRef(pidfd)) }?)
 }
 
 impl PeerVmm {
@@ -2080,6 +2107,8 @@ struct ParkedFaults {
     by_page: std::collections::BTreeMap<usize, ParkedFault>,
     /// Until when the pause between retries is a yield; see [`PARKED_RETRY_BURST`].
     retry_without_sleeping_until: Option<std::time::Instant>,
+    /// When a REMOVE event was last read; see [`MAX_PARKED_WAIT`].
+    last_remove_read: Option<std::time::Instant>,
 }
 
 impl ParkedFaults {
@@ -2091,9 +2120,10 @@ impl ParkedFaults {
     ///
     /// A fault already parked keeps its original start: the vCPU has been blocked
     /// since that first attempt, and that is the cost the trace is measuring. It is also
-    /// what [`MAX_PARKED_WAIT`] counts from, so a second fault on the page cannot extend
-    /// the wait. A second fault that is a write makes the parked fault a write, so the retry
-    /// fills the page writable for every faulter waiting on it.
+    /// where [`MAX_PARKED_WAIT`] starts counting, so a second fault on the page cannot extend
+    /// the wait; only a REMOVE event read can. A second fault that is a write makes the
+    /// parked fault a write, so the retry fills the page writable for every faulter waiting
+    /// on it.
     fn park(&mut self, page: usize, file_offset: usize, write: bool, trace_t0: Option<u64>) {
         let now = std::time::Instant::now();
         let parked = self.by_page.entry(page).or_insert(ParkedFault {
@@ -2111,7 +2141,20 @@ impl ParkedFaults {
     /// A REMOVE event was read just now, so the thread inside `madvise` can run again and
     /// `mmap_changing` is about to drop.
     fn a_remove_was_read(&mut self) {
-        self.retry_without_sleeping_from(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        self.last_remove_read = Some(now);
+        self.retry_without_sleeping_from(now);
+    }
+
+    /// How long `parked` has been refused since anything was read that lowers the flag: since
+    /// it was parked, or since the last REMOVE event read if that came later. This, not the
+    /// time since the park, is what [`MAX_PARKED_WAIT`] bounds.
+    fn refused_without_progress(&self, parked: &ParkedFault, now: std::time::Instant) -> Duration {
+        let since = match self.last_remove_read {
+            Some(read) if read > parked.parked_at => read,
+            _ => parked.parked_at,
+        };
+        now.saturating_duration_since(since)
     }
 
     fn retry_without_sleeping_from(&mut self, now: std::time::Instant) {
@@ -2526,12 +2569,12 @@ async fn handle_vm_page_faults(
         libc::fcntl(uffd_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
 
-    let async_uffd = AsyncFd::new(uffd).context("creating AsyncFd for UFFD")?;
+    let async_uffd = register_uffd(uffd).context("creating AsyncFd for UFFD")?;
     // Firecracker keeps its own UFFD reference for the VMM's lifetime, and this handler
     // owns another one. Consequently, a normal VMM exit does not make OUR UFFD readable
     // or close it: the pidfd is the only authoritative lifetime signal.
-    let async_peer_pidfd = AsyncFd::new(PidfdRef(&peer.pidfd))
-        .context("registering peer VMM pidfd with the reactor")?;
+    let async_peer_pidfd =
+        register_peer_pidfd(&peer.pidfd).context("registering peer VMM pidfd with the reactor")?;
 
     let gate = Arc::new(ReplayGate::default());
     let ctx = VmContext {
@@ -4167,9 +4210,9 @@ fn granule_segments(
 
 /// Retry every parked fault once. `Ok(false)` means the clone is gone.
 ///
-/// A fault still refused [`MAX_PARKED_WAIT`] after it was parked fails the handler, and
-/// the fail-closed path kills the VMM. The alternative is dropping the fault, which leaves
-/// its vCPU asleep for good.
+/// A fault still refused [`MAX_PARKED_WAIT`] after it was parked, with no REMOVE event read
+/// in that time, fails the handler, and the fail-closed path kills the VMM. The alternative
+/// is dropping the fault, which leaves its vCPU asleep for good.
 fn retry_parked_faults(ctx: &VmContext<'_>, uffd: &Uffd, state: &mut VmState) -> Result<bool> {
     let mut resolved = Vec::new();
     for (&page, parked) in &state.parked_faults.by_page {
@@ -4190,19 +4233,25 @@ fn retry_parked_faults(ctx: &VmContext<'_>, uffd: &Uffd, state: &mut VmState) ->
                 resolved.push((page, zero, matches!(outcome, FaultOutcome::Resolved)))
             }
             FaultOutcome::VmGone => return Ok(false),
-            FaultOutcome::Retry if parked.parked_at.elapsed() >= MAX_PARKED_WAIT => {
+            FaultOutcome::Retry => {
+                let stalled = state
+                    .parked_faults
+                    .refused_without_progress(parked, std::time::Instant::now());
+                if stalled < MAX_PARKED_WAIT {
+                    continue;
+                }
                 // Named after the attempt: a zero page refused with EINVAL in it was answered
                 // with a copy of zeros, and the copy is what is still refused.
                 let retried = zero.map(|_| ctx.zero_fill(parked.write, state.zero_page_refused));
                 return Err(anyhow!(
-                    "{} at 0x{page:x} still EAGAIN after {:?}; refusing to drop \
-                     a fault that would permanently hang a vCPU for vm {}",
+                    "{} at 0x{page:x} still EAGAIN after {:?}, with no REMOVE event read for \
+                     {stalled:?}; refusing to drop a fault that would permanently hang a vCPU \
+                     for vm {}",
                     ctx.resolution(retried).ioctl(),
                     parked.parked_at.elapsed(),
                     ctx.vm_id
                 ));
             }
-            FaultOutcome::Retry => {}
         }
     }
     for (page, zero, filled) in resolved {
@@ -4664,7 +4713,11 @@ async fn handshake(
 ) -> Result<(Uffd, Vec<GuestRegionUffdMapping>)> {
     let std_stream = stream.into_std().context("converting to std stream")?;
     // Keep non-blocking — AsyncFd handles readiness
-    let async_stream = AsyncFd::new(std_stream).context("creating AsyncFd for handshake socket")?;
+    // SAFETY: the `AsyncFd` owns the stream, which closes only on drop, and the handshake
+    // never replaces it through `get_mut`.
+    let async_stream = unsafe { AsyncFd::register(std_stream) }
+        .map_err(std::io::Error::from)
+        .context("creating AsyncFd for handshake socket")?;
 
     if let PageSource::Minor { backing, .. } = source {
         send_backing_fd(&async_stream, backing).await?;
@@ -6154,7 +6207,8 @@ mod tests {
         // --- receive the fd exactly the way a clone's Firecracker does ---
         let (tx, rx) = std::os::unix::net::UnixStream::pair().unwrap();
         tx.set_nonblocking(true).unwrap();
-        let tx = AsyncFd::new(tx).unwrap();
+        // SAFETY: the `AsyncFd` owns `tx` and the test never replaces it.
+        let tx = unsafe { AsyncFd::register(tx) }.unwrap();
         send_backing_fd(&tx, &backing).await.unwrap();
         let mut hello = [0u8; 64];
         let (_, received) = rx.recv_with_fd(&mut hello).unwrap();
@@ -6484,7 +6538,7 @@ mod tests {
         const PAGE: usize = MinorClone::PAGE;
         // Page 1 is all zeros, so the backing memfd leaves it unwritten.
         let (clone, uffd) = MinorClone::new(&[0xA1, 0, 0xA3, 0xA4]);
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx();
         let mut state = clone.state();
         // An earlier clone recorded all four pages, the zero page among them.
@@ -6524,7 +6578,7 @@ mod tests {
         let (clone, uffd) = MinorClone::new(&[0xA1, 0, 0, 0xA4]);
         // An earlier clone touched page 1 and not page 2.
         clone.touch_as_another_clone(&[1]);
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx();
         let mut state = clone.state();
         let mut recorded = PageSet::empty(clone.mem_size as u64);
@@ -6593,7 +6647,7 @@ mod tests {
         let (clone, uffd) = MinorClone::new(&[0xC0, 0, 0, 0xC3, 0, 0xC5, 0, 0]);
         // Earlier clones filled pages 2 and 6.
         clone.touch_as_another_clone(&[2, 6]);
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx();
         let mut state = clone.state();
         // Pages 1 to 3 are given back: a hole, a filled hole and a data page.
@@ -7553,16 +7607,24 @@ mod tests {
         }
 
         /// A balloon that keeps inflating: back-to-back single-page `madvise` calls over the
-        /// first `pages` pages, until stopped. Each call sleeps until the handler reads its
-        /// REMOVE event.
-        fn inflate_until_stopped(&self, pages: usize) -> BalloonStream {
+        /// first `pages` pages, from a thread pinned to `cpu`, until stopped or until `until`.
+        /// Each call sleeps until the handler reads its REMOVE event.
+        fn inflate_until_stopped(
+            &self,
+            pages: usize,
+            cpu: usize,
+            until: Option<std::time::Instant>,
+        ) -> BalloonStream {
             let base = self.base;
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let thread = std::thread::spawn({
                 let stop = Arc::clone(&stop);
                 move || {
+                    let _pinned = PinnedThread::to(cpu);
                     let mut calls = 0u64;
-                    while !stop.load(Ordering::Relaxed) {
+                    while !stop.load(Ordering::Relaxed)
+                        && until.is_none_or(|until| std::time::Instant::now() < until)
+                    {
                         let page = base + (calls as usize % pages) * Self::PAGE;
                         // SAFETY: advising this test's own live mapping.
                         let rc = unsafe {
@@ -7709,6 +7771,135 @@ mod tests {
         clone.unmap();
     }
 
+    /// The bound counts from the later of the park and the last REMOVE event read, decided
+    /// on the clock rather than on a schedule. The REMOVE stays unread, so every retry is
+    /// refused. A fault parked longer than MAX_PARKED_WAIT ago, with a REMOVE read since,
+    /// must stay parked; once MAX_PARKED_WAIT passes with no REMOVE read, it fails the
+    /// handler. Counted from the park alone, the first retry fails.
+    #[test]
+    fn a_parked_copy_refused_past_the_deadline_stays_parked_while_remove_events_are_read() {
+        let (clone, uffd) = BalloonedCopyClone::new(3);
+        let ctx = clone.ctx();
+        let mut state = BalloonedCopyClone::state();
+        // Queued and deliberately left unread until the end of the test.
+        let balloon = clone.inflate_page_zero(&uffd);
+
+        let page = clone.page(2);
+        state
+            .parked_faults
+            .park(page, 2 * BalloonedCopyClone::PAGE, false, None);
+        state
+            .parked_faults
+            .by_page
+            .get_mut(&page)
+            .expect("the fault is parked")
+            .parked_at = std::time::Instant::now()
+            .checked_sub(MAX_PARKED_WAIT * 2)
+            .expect("the monotonic clock is older than twice the wait");
+        state.parked_faults.a_remove_was_read();
+        assert!(
+            retry_parked_faults(&ctx, &uffd, &mut state).expect(
+                "a fault refused past the deadline from its park, with a REMOVE read since, \
+                 must not fail the handler"
+            ),
+            "the clone is alive; a retry must not report it gone"
+        );
+        assert_eq!(
+            state.parked_faults.by_page.len(),
+            1,
+            "still refused: the fault stays parked"
+        );
+
+        // The same refusal once MAX_PARKED_WAIT has passed since that REMOVE was read.
+        state.parked_faults.last_remove_read =
+            std::time::Instant::now().checked_sub(MAX_PARKED_WAIT);
+        let error = retry_parked_faults(&ctx, &uffd, &mut state)
+            .expect_err("a COPY refused for the wait with no REMOVE read must fail the handler");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("with no REMOVE event read for"),
+            "the error must give the time without a REMOVE read: {message}"
+        );
+
+        // Let madvise return.
+        let event = uffd.read_event().expect("reading the REMOVE event");
+        assert!(
+            matches!(event, Some(Event::Remove { .. })),
+            "expected the queued REMOVE, got {event:?}"
+        );
+        assert_eq!(balloon.join().expect("balloon thread"), 0, "madvise");
+        clone.unmap();
+    }
+
+    /// The CPUs this process may run on.
+    fn allowed_cpus() -> Vec<usize> {
+        // SAFETY: a zeroed cpu_set_t is a valid empty set, filled in by the kernel.
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: the size passed is the size of `set`.
+        let rc =
+            unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+        assert_eq!(
+            rc,
+            0,
+            "sched_getaffinity: {}",
+            std::io::Error::last_os_error()
+        );
+        (0..libc::CPU_SETSIZE as usize)
+            // SAFETY: `cpu` is below CPU_SETSIZE.
+            .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+            .collect()
+    }
+
+    /// Two different CPUs this process may run on, for a test whose claim holds only while
+    /// the balloon and the handler run at the same time.
+    fn two_cpus() -> (usize, usize) {
+        let cpus = allowed_cpus();
+        assert!(
+            cpus.len() >= 2,
+            "this test needs two CPUs to put the handler and the balloon on; allowed: {cpus:?}"
+        );
+        (cpus[0], cpus[1])
+    }
+
+    /// The calling thread pinned to one CPU until dropped, when its old affinity comes back.
+    struct PinnedThread {
+        old: libc::cpu_set_t,
+    }
+
+    impl PinnedThread {
+        fn to(cpu: usize) -> Self {
+            let size = std::mem::size_of::<libc::cpu_set_t>();
+            // SAFETY: zeroed cpu_set_t values are valid empty sets; `cpu` is one this process
+            // may run on, so below CPU_SETSIZE; the sizes passed are the sets' own.
+            unsafe {
+                let mut old: libc::cpu_set_t = std::mem::zeroed();
+                assert_eq!(
+                    libc::sched_getaffinity(0, size, &mut old),
+                    0,
+                    "sched_getaffinity"
+                );
+                let mut one: libc::cpu_set_t = std::mem::zeroed();
+                libc::CPU_SET(cpu, &mut one);
+                assert_eq!(
+                    libc::sched_setaffinity(0, size, &one),
+                    0,
+                    "pinning to CPU {cpu}: {}",
+                    std::io::Error::last_os_error()
+                );
+                Self { old }
+            }
+        }
+    }
+
+    impl Drop for PinnedThread {
+        fn drop(&mut self) {
+            // SAFETY: restoring the mask this thread had, with its own size.
+            unsafe {
+                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &self.old)
+            };
+        }
+    }
+
     /// See [`BalloonedCopyClone::inflate_until_stopped`].
     struct BalloonStream {
         stop: Arc<std::sync::atomic::AtomicBool>,
@@ -7804,19 +7995,28 @@ mod tests {
     /// bound, and replay must not fail. Five rounds, because one proves little: with the
     /// sleeping cadence a single parked fault waited 0.8 to 1.8 s in five of eight runs on a
     /// 6.16 host, and got through at once in two.
+    ///
+    /// The handler and the balloon are pinned to two different CPUs. A retry gets through
+    /// only while it runs at the same time as the balloon's thread, between that thread
+    /// lowering the flag and raising it again, so the bound below holds only when the two
+    /// can run at once. Left to the scheduler, they sometimes shared a CPU and the fault
+    /// waited out MAX_PARKED_WAIT; that case is
+    /// `a_fault_parked_behind_a_balloon_on_its_own_cpu_waits_for_the_balloon_without_failing`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fault_parked_during_replay_resolves_while_the_balloon_keeps_inflating() {
         const PAGE: usize = BalloonedCopyClone::PAGE;
         const ROUNDS: usize = 5;
+        let (handler_cpu, balloon_cpu) = two_cpus();
+        let _pinned = PinnedThread::to(handler_cpu);
         let (clone, uffd) = BalloonedCopyClone::new(64);
         let ctx = clone.ctx();
         let mut state = BalloonedCopyClone::state();
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         // Something for replay to populate once the parked fault is out of its way.
         let mut recorded = PageSet::empty(clone.mem_size as u64);
         recorded.insert_range((48 * PAGE) as u64, (8 * PAGE) as u64);
 
-        let balloon = clone.inflate_until_stopped(16);
+        let balloon = clone.inflate_until_stopped(16, balloon_cpu, None);
         let mut rounds = Vec::new();
         for round in 0..ROUNDS {
             // Nothing reads events between two replays, so by now the balloon is asleep
@@ -7880,20 +8080,24 @@ mod tests {
     /// inflating. The flag is up whenever one of them is read, so each is refused at first.
     /// None may wait anywhere near the bound, and the loop must not fail. Two hundred,
     /// because the damage was in the tail: with the old cadence the slowest of thirty such
-    /// faults waited 210 to 551 ms across seven runs, against a median of 1 to 25 ms.
+    /// faults waited 210 to 551 ms across seven runs, against a median of 1 to 25 ms. The
+    /// handler and the balloon are pinned to two different CPUs, for the reason given on
+    /// `a_fault_parked_during_replay_resolves_while_the_balloon_keeps_inflating`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn faults_served_while_the_balloon_keeps_inflating_resolve_far_inside_the_bound() {
         const FAULTS: usize = 200;
+        let (handler_cpu, balloon_cpu) = two_cpus();
+        let _pinned = PinnedThread::to(handler_cpu);
         let (clone, uffd) = BalloonedCopyClone::new(256);
         let ctx = clone.ctx();
         let mut state = BalloonedCopyClone::state();
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         // serve_faults ends when its peer does. Pin this process, which outlives the test.
         let peer = PeerVmm::from_pid(std::process::id()).expect("pinning this process");
         let async_peer_pidfd =
-            AsyncFd::new(PidfdRef(&peer.pidfd)).expect("registering the peer pidfd");
+            register_peer_pidfd(&peer.pidfd).expect("registering the peer pidfd");
 
-        let balloon = clone.inflate_until_stopped(16);
+        let balloon = clone.inflate_until_stopped(16, balloon_cpu, None);
         wait_for_uffd_event(async_uffd.get_ref(), "the balloon's first REMOVE event");
         let pages: Vec<usize> = (32..32 + FAULTS).map(|index| clone.page(index)).collect();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -7944,6 +8148,78 @@ mod tests {
             "a fault was blocked for {longest:?} (median {median:?}) across {madvise_calls} \
              madvise calls; every fault has to resolve far inside the {MAX_PARKED_WAIT:?} bound"
         );
+        clone.unmap();
+    }
+
+    /// A balloon whose thread shares the handler's CPU. Reading a REMOVE wakes the thread
+    /// inside `madvise`, and on one CPU it runs only while the handler is off it: it lowers
+    /// the flag, returns, and raises the flag again for its next call before the handler runs
+    /// again, so no retry can get through until the balloon pauses. Each REMOVE read still
+    /// lowers the flag, so the fault is waiting on a balloon that is making progress, not on
+    /// a flag that stays up, and MAX_PARKED_WAIT must not kill the clone for it. The handler
+    /// counted that bound from the park and failed `serve_faults` at 2 s, every run.
+    ///
+    /// The balloon inflates for longer than the bound and then stops. The fault must then be
+    /// served, and `serve_faults` must still be running. Whether the fault is still refused
+    /// when the bound passes is up to the scheduler, so this test can pass with the bound
+    /// counted from the park; the decision itself is pinned on the clock by
+    /// `a_parked_copy_refused_past_the_deadline_stays_parked_while_remove_events_are_read`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fault_parked_behind_a_balloon_on_its_own_cpu_waits_for_the_balloon_without_failing()
+    {
+        let cpu = allowed_cpus()[0];
+        let _pinned = PinnedThread::to(cpu);
+        let (clone, uffd) = BalloonedCopyClone::new(64);
+        let ctx = clone.ctx();
+        let mut state = BalloonedCopyClone::state();
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
+        // serve_faults ends when its peer does. Pin this process, which outlives the test.
+        let peer = PeerVmm::from_pid(std::process::id()).expect("pinning this process");
+        let async_peer_pidfd =
+            register_peer_pidfd(&peer.pidfd).expect("registering the peer pidfd");
+
+        let inflating = MAX_PARKED_WAIT + Duration::from_millis(500);
+        let balloon =
+            clone.inflate_until_stopped(16, cpu, Some(std::time::Instant::now() + inflating));
+        // The balloon is asleep inside a `madvise` with its REMOVE queued and the flag up, so
+        // the fault below is read ahead of the REMOVE and refused.
+        wait_for_uffd_event(async_uffd.get_ref(), "the balloon's first REMOVE event");
+        let addr = clone.page(40);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let vcpu = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            // SAFETY: `addr` is inside a mapping that outlives this thread.
+            let got = unsafe { std::ptr::read_volatile(addr as *const u8) };
+            let blocked = started.elapsed();
+            done_tx.send(()).ok();
+            (got, blocked)
+        });
+
+        // serve_faults returns only when its peer exits or serving fails, and the peer is
+        // this process, so any return before the vCPU is through is a failure.
+        let ended_early = tokio::select! {
+            ended = serve_faults(&ctx, &async_uffd, &async_peer_pidfd, peer.pid, &mut state) => {
+                Some(ended)
+            }
+            _ = done_rx => None,
+        };
+
+        let madvise_calls = balloon.stop(async_uffd.get_ref(), &ctx, &mut state);
+        serve_until(async_uffd.get_ref(), &ctx, &mut state, || {
+            vcpu.is_finished()
+        });
+        let (got, blocked) = vcpu.join().expect("vCPU thread");
+        println!(
+            "a balloon on the handler's CPU, {madvise_calls} madvise calls over {inflating:?}; \
+             the parked fault was blocked for {blocked:?}; ended early: {ended_early:?}"
+        );
+
+        assert!(
+            ended_early.is_none(),
+            "serve_faults must not fail a fault parked behind a balloon whose REMOVE events \
+             keep being read, because its failure kills the clone's VMM: {ended_early:?}"
+        );
+        assert_eq!(got, 41, "the fault must be served its own snapshot page");
         clone.unmap();
     }
 
@@ -8681,7 +8957,7 @@ mod tests {
         const PAGE: usize = FaultAroundClone::PAGE;
         // The region maps file pages 2..10 and granules are 4 pages.
         let (clone, uffd) = FaultAroundClone::new(4, 2, 8);
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         {
             let ctx = clone.ctx();
             assert!(
@@ -8726,7 +9002,7 @@ mod tests {
             PageSource::Copy { mmap, .. } => &mmap[..],
             PageSource::Minor { .. } => unreachable!(),
         };
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx();
         let mut state = clone.state();
         let mut workers =
@@ -8779,7 +9055,7 @@ mod tests {
             PageSource::Copy { mmap, .. } => &mmap[..],
             PageSource::Minor { .. } => unreachable!(),
         };
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx_with_gate(&gate);
         let mut state = clone.state();
         let mut workers =
@@ -8889,7 +9165,7 @@ mod tests {
             PageSource::Copy { mmap, .. } => &mmap[..],
             PageSource::Minor { .. } => unreachable!(),
         };
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx_with_gate(&gate);
         let mut state = clone.state();
         let mut workers =
@@ -9001,7 +9277,7 @@ mod tests {
             PageSource::Copy { mmap, .. } => &mmap[..],
             PageSource::Minor { .. } => unreachable!(),
         };
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx_with_gate(&gate);
         let mut state = clone.state();
         let mut workers =
@@ -9093,7 +9369,7 @@ mod tests {
             PageSource::Copy { mmap, .. } => &mmap[..],
             PageSource::Minor { .. } => unreachable!(),
         };
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx_with_gate(&gate);
         let mut state = clone.state();
         let mut workers =
@@ -9192,7 +9468,7 @@ mod tests {
         let (clone, uffd) =
             FaultAroundClone::with_features(0, 0, 16, userfaultfd::FeatureFlags::EVENT_REMOVE);
         let gate = Arc::new(ReplayGate::default());
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx_with_gate(&gate);
         let mut state = clone.state();
         for gone in [true, false] {
@@ -9268,7 +9544,7 @@ mod tests {
             PageSource::Copy { mmap, .. } => &mmap[..],
             PageSource::Minor { .. } => unreachable!(),
         };
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx_with_gate(&gate);
         let mut state = clone.state();
         let mut workers =
@@ -9575,7 +9851,7 @@ mod tests {
         if let PageSource::Copy { replay_threads, .. } = &mut clone.source {
             *replay_threads = 4;
         }
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         let gate = Arc::new(ReplayGate::default());
         {
             let ctx = clone.ctx_with_gate(&gate);
@@ -10026,7 +10302,7 @@ mod tests {
         // second recorded run, pages 10 and 11.
         remember_removed(&ctx, &mut state.removed, clone.page(5), clone.page(7));
         remember_removed(&ctx, &mut state.removed, clone.page(10), clone.page(12));
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         let mut recorded = PageSet::empty(clone.mem_size as u64);
         recorded.insert_range((4 * PAGE) as u64, (4 * PAGE) as u64);
         recorded.insert_range((10 * PAGE) as u64, (2 * PAGE) as u64);
@@ -10707,7 +10983,7 @@ mod tests {
             let ctx = clone.ctx();
             let mut state = BalloonedCopyClone::state();
             remember_removed(&ctx, &mut state.removed, clone.page(5), clone.page(6));
-            let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+            let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
             let mut recorded = PageSet::empty(clone.mem_size as u64);
             recorded.insert_range((4 * PAGE) as u64, (5 * PAGE) as u64);
             recorded.insert_range((10 * PAGE) as u64, (2 * PAGE) as u64);

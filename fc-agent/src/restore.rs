@@ -180,6 +180,18 @@ pub struct RestorePhases {
     pub tcp_destroyed: usize,
     pub tcp_already_gone: usize,
     pub tcp_destroy_datagrams: usize,
+    /// Per-operation gate timings from the same report: each family's
+    /// verification read and UDP rule (one `iptables` spawn each), and for
+    /// each half of the gate the nf_tables read of its rules and the one
+    /// commit that removes it in both families.
+    pub tcp_gate_verify_ipv4_ms: f64,
+    pub tcp_gate_verify_ipv6_ms: f64,
+    pub tcp_gate_udp_ipv4_ms: f64,
+    pub tcp_gate_udp_ipv6_ms: f64,
+    pub tcp_gate_egress_read_ms: f64,
+    pub tcp_gate_egress_commit_ms: f64,
+    pub tcp_gate_ingress_read_ms: f64,
+    pub tcp_gate_ingress_commit_ms: f64,
     pub neighbor_ms: f64,
     pub nfs_ms: f64,
     pub exec_wait_ms: f64,
@@ -193,6 +205,9 @@ pub struct RestorePhases {
     pub gpu_ms: f64,
     /// GPUs the driver initialised.
     pub gpus: usize,
+    /// Each attach step's milliseconds; absent without GPUs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_steps: Option<crate::gpu::AttachSteps>,
 }
 
 impl RestorePhases {
@@ -211,11 +226,42 @@ impl RestorePhases {
         self.tcp_destroyed = boundary.tally.destroyed;
         self.tcp_already_gone = boundary.tally.already_gone;
         self.tcp_destroy_datagrams = boundary.tally.datagrams;
+        let gate = boundary.gate;
+        self.tcp_gate_verify_ipv4_ms = gate.verify_ipv4_ms;
+        self.tcp_gate_verify_ipv6_ms = gate.verify_ipv6_ms;
+        self.tcp_gate_udp_ipv4_ms = gate.udp_ipv4_ms;
+        self.tcp_gate_udp_ipv6_ms = gate.udp_ipv6_ms;
+        self.tcp_gate_egress_read_ms = gate.egress_read_ms;
+        self.tcp_gate_egress_commit_ms = gate.egress_commit_ms;
+        self.tcp_gate_ingress_read_ms = gate.ingress_read_ms;
+        self.tcp_gate_ingress_commit_ms = gate.ingress_commit_ms;
     }
 
-    /// Compact single-line JSON for the ACK frame.
+    /// Compact single-line JSON for the ACK frame, every timing rounded to
+    /// the microsecond. Unrounded, `as_secs_f64() * 1000.0` prints up to 17
+    /// significant digits, and a record of such values passed the frame's
+    /// 1024 bytes, which drops the whole record.
     pub fn to_frame_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+        let Ok(mut value) = serde_json::to_value(self) else {
+            return "{}".to_string();
+        };
+        round_timings(&mut value);
+        serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
+/// Rounds every floating-point timing to the microsecond, in nested objects too
+/// (`gpu_steps`), so a 17-significant-digit `as_secs_f64() * 1000.0` cannot push
+/// the ACK past its frame budget.
+fn round_timings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(round_timings),
+        field if field.is_f64() => {
+            if let Some(ms) = field.as_f64() {
+                *field = serde_json::json!((ms * 1000.0).round() / 1000.0);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -274,8 +320,8 @@ pub async fn handle_clone_restore(
         let gpus = gpus.to_vec();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
-            let ready = crate::gpu::attach(&gpus).await?;
-            Ok::<_, anyhow::Error>((elapsed_ms(started), ready))
+            let report = crate::gpu::attach(&gpus).await?;
+            Ok::<_, anyhow::Error>((elapsed_ms(started), report))
         })
     });
 
@@ -287,44 +333,6 @@ pub async fn handle_clone_restore(
     signals.exec_rebind_needed.store(true, Ordering::Release);
     signals.exec_rebind.notify_one();
 
-    // Sync clock — snapshot restore leaves the VM clock frozen at snapshot time.
-    // Services that validate timestamps (auth, TLS, sessions) will fail with
-    // stale time. The step is soft-fail by construction (chronyd converges
-    // eventually), so nothing here branches on it.
-    let clock_started = std::time::Instant::now();
-    crate::bootplan::set_system_clock(host_time);
-    // Reset chrony after the clock jump so it doesn't lose its sources:
-    // `makestep` forces it to accept the stepped time. Its convergence is
-    // not part of the readiness contract (the clock is already stepped),
-    // so it must not hold the host's ACK.
-    spawn_restore_side_job(async {
-        let _ = tokio::process::Command::new("chronyc")
-            .args(["makestep"])
-            .output()
-            .await;
-    });
-    phases.clock_ms = elapsed_ms(clock_started);
-
-    // Restart journald in the background, started this early so it usually
-    // finishes before the ACK without ever holding it. The journal file was
-    // mid-write when the snapshot was taken, so the restored journald finds a
-    // corrupted file and gets stuck; systemd's watchdog would kill it after
-    // 3 min. Nothing in the readiness contract reads journald (container
-    // output travels over vsock), so a synchronous restart, which is a full
-    // systemd job, would only add latency. After the clock step so the fresh
-    // journal opens with correct timestamps, and registered so the shutdown
-    // path can settle it rather than race it.
-    spawn_restore_side_job(restart_journald());
-
-    // Reconfigure IPv6 — before any network traffic can use the old address.
-    // The link is UP throughout (the boundary no longer takes it down), so the
-    // gate is what holds inbound traffic off until the cleanup below finishes.
-    let ipv6_started = std::time::Instant::now();
-    if let Some(new_ipv6) = clone_ipv6 {
-        network::reconfigure_ipv6(new_ipv6).await;
-    }
-    phases.ipv6_ms = elapsed_ms(ipv6_started);
-
     // Pin the neighbour entry BEFORE the boundary reopens the gate. The clone
     // inherits the source's neighbour table, and restore_snapshot_network ends
     // by publishing; anything answered between publication and a later pin
@@ -333,8 +341,32 @@ pub async fn handle_clone_restore(
     // purges the neighbour table any more.
     // Order matters: drop the inherited entries first, then pin the one the
     // host's health checks depend on. Flushing after the pin would delete it.
+    //
+    // The flush also runs before the IPv6 swap below. The swap announces the
+    // new address, which lets in the traffic that was waiting for it, and the
+    // guest resolves its senders' addresses to answer; a flush running then
+    // deletes those entries mid-resolution and left one INCOMPLETE for a
+    // second (2 of 1700 routed restores with an early client). Pinned by
+    // `inherited_neighbours_are_flushed_before_the_new_ipv6_is_announced`.
     network::flush_stale_neighbours().await;
     network::pin_namespace_neighbour().await;
+    // A routed clone's IPv6 gateway is pinned too, before the swap below: a
+    // resolution of it in flight across the swap lost its answer to the
+    // deleted snapshot-time address and held every reply for a second
+    // (#1160). Pinned by `the_routed_gateway_is_pinned_before_the_ipv6_swap`.
+    if clone_ipv6.is_some() {
+        network::pin_routed_gateway_neighbour().await;
+    }
+
+    // Reconfigure IPv6, then announce it: before any network traffic can use
+    // the old address. The link is UP throughout (the boundary no longer takes
+    // it down), so the gate is what holds inbound traffic off until the
+    // cleanup below finishes.
+    let ipv6_started = std::time::Instant::now();
+    if let Some(new_ipv6) = clone_ipv6 {
+        network::reconfigure_ipv6(new_ipv6).await;
+    }
+    phases.ipv6_ms = elapsed_ms(ipv6_started);
     // ANNOUNCE, as early as possible. The host cannot forward a packet to this
     // clone until its namespace has learned the guest's MAC, and it only learns
     // that when the guest transmits. The old boundary got this for free: taking
@@ -345,8 +377,12 @@ pub async fn handle_clone_restore(
     // verification could time out first ("guest 10.0.2.100 never appeared at L2"
     // while the namespace's own table showed it REACHABLE moments later).
     //
-    // One broadcast ARP costs nothing and teaches the whole segment.
+    // One broadcast ARP costs nothing and teaches the whole segment. It refreshes
+    // the gateway without flushing the neighbour table, whose entries a client
+    // can already be using while the cleanup runs.
+    let neighbor_started = std::time::Instant::now();
     network::refresh_gateway_arp();
+    phases.neighbor_ms = elapsed_ms(neighbor_started);
 
     let tcp_cleanup_started = std::time::Instant::now();
     eprintln!(
@@ -369,14 +405,43 @@ pub async fn handle_clone_restore(
         restored.report().tally.already_gone
     );
 
-    // Do not flush the neighbor table. A client can already be using an entry
-    // while restore cleanup runs, and `ip neigh flush all` has no generation
-    // boundary. One broadcast ARP request refreshes the gateway and teaches the
-    // new bridge/pasta path without deleting unrelated/current neighbors.
-    let neighbor_started = std::time::Instant::now();
-    // Already announced above, before the boundary work, so the host learns
-    // this clone's MAC as early as possible rather than at the end.
-    phases.neighbor_ms = elapsed_ms(neighbor_started);
+    // Sync clock — snapshot restore leaves the VM clock frozen at snapshot time.
+    // Services that validate timestamps (auth, TLS, sessions) will fail with
+    // stale time. The step is soft-fail by construction (chronyd converges
+    // eventually), so nothing here branches on it.
+    //
+    // Stepped here, after the boundary has opened the gate's egress half: the
+    // jump makes every daemon whose lease ran out in it reconnect at once, and a
+    // connect the gated egress answers with a reset is a definitive refusal to
+    // ServiceRouter (.claude/CLAUDE.md, "SUSPENDING A VM DOES NOT DISTURB IT").
+    // The NFS remount and the hook run after it. The host's value was read just
+    // before this function started, so the step adds the time since then.
+    let clock_started = std::time::Instant::now();
+    crate::bootplan::set_system_clock(host_time, restore_started.elapsed());
+    // Reset chrony after the clock jump so it doesn't lose its sources:
+    // `makestep` forces it to accept the stepped time. Its convergence is
+    // not part of the readiness contract (the clock is already stepped),
+    // so it must not hold the host's ACK.
+    // Then a burst, since the snapshot gate rejected any poll chronyd made
+    // before egress opened; it matters most when the step above failed.
+    spawn_restore_side_job(async {
+        let _ = tokio::process::Command::new("chronyc")
+            .args(["makestep"])
+            .output()
+            .await;
+        crate::snapshot_network::chrony_burst().await;
+    });
+    phases.clock_ms = elapsed_ms(clock_started);
+
+    // Restart journald in the background without ever holding the ACK. The
+    // journal file was mid-write when the snapshot was taken, so the restored
+    // journald finds a corrupted file and gets stuck; systemd's watchdog would
+    // kill it after 3 min. Nothing in the readiness contract reads journald
+    // (container output travels over vsock), so a synchronous restart, which is
+    // a full systemd job, would only add latency. After the clock step so the
+    // fresh journal opens with correct timestamps, and registered so the
+    // shutdown path can settle it rather than race it.
+    spawn_restore_side_job(restart_journald());
 
     // Remount NFS shares: their kernel TCP connections to the host's NFS
     // server died with the snapshot transport reset, and a hard NFS mount
@@ -455,13 +520,17 @@ pub async fn handle_clone_restore(
     eprintln!("[fc-agent] exec re-registered after restore");
 
     if let Some(job) = gpu_attach {
-        let (gpu_ms, ready) = job
+        let (gpu_ms, report) = job
             .await
             .context("joining the GPU attach")?
             .context("restore phase gpu-attach")?;
         phases.gpu_ms = gpu_ms;
-        phases.gpus = ready;
-        eprintln!("[fc-agent] restore phase=gpu-attach epoch={restore_epoch} gpus={ready} elapsed_ms={gpu_ms:.3}");
+        phases.gpus = report.gpus;
+        phases.gpu_steps = Some(report.steps);
+        eprintln!(
+            "[fc-agent] restore phase=gpu-attach epoch={restore_epoch} gpus={} elapsed_ms={gpu_ms:.3}",
+            phases.gpus
+        );
     }
 
     // Publication, last: the plan's restore hook runs now, with egress open,
@@ -580,6 +649,22 @@ async fn restart_journald() {
     }
 }
 
+/// The source of `handle_clone_restore` alone, for the tests that pin the order
+/// of its steps. Bounded at the function's closing brace, so a needle that also
+/// appears in a test's own string literals cannot match there.
+#[cfg(test)]
+pub(crate) fn handle_clone_restore_source() -> &'static str {
+    let source = include_str!("restore.rs");
+    let start = source
+        .find("pub async fn handle_clone_restore(")
+        .expect("handle_clone_restore is in restore.rs");
+    let len = source[start..]
+        .find("\n}\n")
+        .expect("handle_clone_restore has a closing brace")
+        + 2;
+    &source[start..start + len]
+}
+
 #[cfg(test)]
 mod restore_side_job_tests {
     use super::*;
@@ -683,19 +768,161 @@ mod tests {
         phases.tcp_destroyed = 999_999;
         phases.tcp_already_gone = 999_999;
         phases.tcp_destroy_datagrams = 999_999;
+        phases.tcp_gate_verify_ipv4_ms = 99_999.999;
+        phases.tcp_gate_verify_ipv6_ms = 99_999.999;
+        phases.tcp_gate_udp_ipv4_ms = 99_999.999;
+        phases.tcp_gate_udp_ipv6_ms = 99_999.999;
+        phases.tcp_gate_egress_read_ms = 99_999.999;
+        phases.tcp_gate_egress_commit_ms = 99_999.999;
+        phases.tcp_gate_ingress_read_ms = 99_999.999;
+        phases.tcp_gate_ingress_commit_ms = 99_999.999;
         phases.neighbor_ms = 99_999.999;
         phases.nfs_ms = 99_999.999;
         phases.exec_wait_ms = 99_999.999;
         phases.egress_wait_ms = 99_999.999;
         phases.total_ms = 99_999.999;
         phases.ack_connect_ms = 99_999.999;
+        phases.gpu_ms = 99_999.999;
+        phases.gpus = 8;
+        phases.gpu_steps = Some(crate::gpu::AttachSteps {
+            scrub_ms: 99_999.999,
+            ..Default::default()
+        });
         let frame = exec_proto::restore_complete_frame(
             "8f4b2c1e-6d3a-4f5b-9c7e-0a1b2c3d4e5f",
             &phases.to_frame_json(),
         );
         assert!(
-            frame.contains("\"ack_connect_ms\":99999.999"),
+            frame.contains("\"ack_connect_ms\":99999.999")
+                && frame.contains("\"scrub_ms\":99999.999"),
             "the ACK telemetry was dropped from the frame: {frame}"
+        );
+    }
+
+    /// The timings are `as_secs_f64() * 1000.0`, which prints with up to 17
+    /// significant digits (`0.000032999999999999996` was seen in a real ACK).
+    /// With every field that long the record passed 1024 bytes and the frame
+    /// dropped all of it for `{}`.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn long_decimal_timings_still_fit_the_frame_budget() {
+        let long = 10_000.000_001_999_999_f64;
+        let mut phases = RestorePhases::default();
+        phases.clock_ms = long;
+        phases.ipv6_ms = long;
+        phases.tcp_cleanup_ms = long;
+        phases.tcp_verified = true;
+        phases.tcp_verify_ms = long;
+        phases.tcp_reassert_ms = long;
+        phases.tcp_destroy_ms = long;
+        phases.tcp_reopen_ms = long;
+        phases.tcp_egress_open_ms = long;
+        phases.tcp_hook_ms = long;
+        phases.tcp_destroyed = 999_999;
+        phases.tcp_already_gone = 999_999;
+        phases.tcp_destroy_datagrams = 999_999;
+        phases.tcp_gate_verify_ipv4_ms = long;
+        phases.tcp_gate_verify_ipv6_ms = long;
+        phases.tcp_gate_udp_ipv4_ms = long;
+        phases.tcp_gate_udp_ipv6_ms = long;
+        phases.tcp_gate_egress_read_ms = long;
+        phases.tcp_gate_egress_commit_ms = long;
+        phases.tcp_gate_ingress_read_ms = long;
+        phases.tcp_gate_ingress_commit_ms = long;
+        phases.neighbor_ms = long;
+        phases.nfs_ms = long;
+        phases.exec_wait_ms = long;
+        phases.egress_wait_ms = long;
+        phases.total_ms = long;
+        phases.ack_connect_ms = long;
+        phases.gpu_ms = long;
+        phases.gpus = 999_999;
+        let frame = exec_proto::restore_complete_frame(
+            "8f4b2c1e-6d3a-4f5b-9c7e-0a1b2c3d4e5f",
+            &phases.to_frame_json(),
+        );
+        assert!(
+            frame.contains("\"ack_connect_ms\":10000.0"),
+            "the ACK telemetry was dropped from the frame ({} bytes): {frame}",
+            frame.len()
+        );
+    }
+
+    /// The ACK names the GPU memory scrub's duration, and says nothing about
+    /// GPU steps without GPUs.
+    #[test]
+    fn the_ack_carries_the_gpu_scrub_time() {
+        let mut phases = RestorePhases::default();
+        let bare: serde_json::Value = serde_json::from_str(&phases.to_frame_json()).unwrap();
+        assert!(bare.get("gpu_steps").is_none(), "{bare}");
+        phases.gpu_steps = Some(crate::gpu::AttachSteps {
+            scrub_ms: 61.5,
+            ..Default::default()
+        });
+        let frame: serde_json::Value = serde_json::from_str(&phases.to_frame_json()).unwrap();
+        assert_eq!(frame["gpu_steps"]["scrub_ms"], 61.5, "{frame}");
+    }
+
+    /// A GPU restore's ACK with every phase (the firewall gate's included) and every
+    /// GPU attach step (the scrub's included) at a 17-significant-digit timing, as
+    /// measured timings often are (`79.74971599999999`), still fits the frame budget
+    /// beside a UUID epoch, so the host gets the gate and GPU step timings rather than
+    /// an empty `{}`. The nested step timings are rounded like the top-level ones.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn a_gpu_restore_ack_keeps_every_gate_and_gpu_step_timing_within_the_frame_budget() {
+        let long = 12_345.678_901_234_567_f64;
+        assert_eq!(format!("{long}").len(), 18, "{long}");
+        let mut phases = RestorePhases::default();
+        phases.clock_ms = long;
+        phases.ipv6_ms = long;
+        phases.tcp_cleanup_ms = long;
+        phases.tcp_verified = true;
+        phases.tcp_verify_ms = long;
+        phases.tcp_reassert_ms = long;
+        phases.tcp_destroy_ms = long;
+        phases.tcp_reopen_ms = long;
+        phases.tcp_egress_open_ms = long;
+        phases.tcp_hook_ms = long;
+        phases.tcp_destroyed = 999_999;
+        phases.tcp_already_gone = 999_999;
+        phases.tcp_destroy_datagrams = 999_999;
+        phases.tcp_gate_verify_ipv4_ms = long;
+        phases.tcp_gate_verify_ipv6_ms = long;
+        phases.tcp_gate_udp_ipv4_ms = long;
+        phases.tcp_gate_udp_ipv6_ms = long;
+        phases.tcp_gate_egress_read_ms = long;
+        phases.tcp_gate_egress_commit_ms = long;
+        phases.tcp_gate_ingress_read_ms = long;
+        phases.tcp_gate_ingress_commit_ms = long;
+        phases.neighbor_ms = long;
+        phases.nfs_ms = long;
+        phases.exec_wait_ms = long;
+        phases.egress_wait_ms = long;
+        phases.total_ms = long;
+        phases.ack_connect_ms = long;
+        phases.gpu_ms = long;
+        phases.gpus = 8;
+        phases.gpu_steps = Some(crate::gpu::AttachSteps {
+            check_ms: long,
+            rescan_ms: long,
+            nvidia_ms: long,
+            uvm_ms: long,
+            nodes_ms: long,
+            persistenced_ms: long,
+            scrub_ms: long,
+            smi_ms: long,
+            cdi_ms: long,
+        });
+        let telemetry = phases.to_frame_json();
+        let frame =
+            exec_proto::restore_complete_frame("8f4b2c1e-6d3a-4f5b-9c7e-0a1b2c3d4e5f", &telemetry);
+        assert!(
+            frame.contains("\"tcp_gate_ingress_commit_ms\":12345.679")
+                && frame.contains("\"scrub_ms\":12345.679")
+                && frame.contains("\"persistenced_ms\":12345.679"),
+            "the gate or GPU step timings were dropped from the ACK ({} bytes of telemetry): {frame}",
+            telemetry.len()
         );
     }
 
@@ -806,12 +1033,73 @@ mod tests {
     /// publishes the clone then, so the GPU must be usable before either. The
     /// attach is joined, with its error propagated, before the boundary
     /// publishes and therefore before `apply_restore_epoch` sends the ACK.
+    /// The ACK's phase record names each GPU attach step, so a slow attach is
+    /// attributed to its step in the host's log; without GPUs it says nothing.
+    #[test]
+    fn the_ack_carries_each_gpu_attach_step() {
+        let mut phases = RestorePhases::default();
+        let bare: serde_json::Value = serde_json::from_str(&phases.to_frame_json()).unwrap();
+        assert!(bare.get("gpu_steps").is_none(), "{bare}");
+
+        phases.gpu_steps = Some(crate::gpu::AttachSteps {
+            rescan_ms: 1.5,
+            persistenced_ms: 900.0,
+            ..Default::default()
+        });
+        let frame: serde_json::Value = serde_json::from_str(&phases.to_frame_json()).unwrap();
+        let steps = &frame["gpu_steps"];
+        assert_eq!(steps["rescan_ms"], 1.5, "{frame}");
+        assert_eq!(steps["persistenced_ms"], 900.0, "{frame}");
+        for step in [
+            "check_ms",
+            "nvidia_ms",
+            "uvm_ms",
+            "nodes_ms",
+            "smi_ms",
+            "cdi_ms",
+        ] {
+            assert!(steps.get(step).is_some(), "{step} missing from {frame}");
+        }
+    }
+
+    #[test]
+    fn the_clock_steps_after_the_egress_gate_opens_and_before_publication() {
+        let body = handle_clone_restore_source();
+        let boundary = body
+            .find("crate::snapshot_network::restore_snapshot_network(")
+            .expect("the restore path no longer runs the snapshot boundary");
+        let clock = body
+            .find("crate::bootplan::set_system_clock(host_time")
+            .expect("the restore path no longer steps the clock");
+        let nfs = body
+            .find("mount_nfs_shares(")
+            .expect("the restore path no longer remounts NFS");
+        let publish = body
+            .find(".publish(restore_hook)")
+            .expect("the restore path no longer publishes");
+        assert!(
+            clock < nfs,
+            "the NFS remount must see the stepped clock: clock={clock} nfs={nfs}"
+        );
+        let burst = body.find("crate::snapshot_network::chrony_burst()").expect(
+            "the restore no longer asks chronyd to measure after the gate rejected its polls",
+        );
+        assert!(
+            clock < burst,
+            "the burst must follow the step: clock={clock} burst={burst}"
+        );
+        assert!(
+            boundary < clock && clock < publish,
+            "the restore must step the clock after the boundary has opened the gate's egress \
+             half and before it publishes: a step taken while egress is gated makes every daemon \
+             whose lease ran out in the jump reconnect into the gate, whose reset ServiceRouter \
+             takes as a definitive refusal. boundary={boundary} clock={clock} publish={publish}"
+        );
+    }
+
     #[test]
     fn gpu_attach_completes_before_the_clone_is_published() {
-        let source = include_str!("restore.rs");
-        let body = &source[source
-            .find("pub async fn handle_clone_restore(")
-            .expect("handle_clone_restore is gone")..];
+        let body = handle_clone_restore_source();
         let start = body
             .find("crate::gpu::attach(&gpus)")
             .expect("the restore path no longer attaches GPUs");
@@ -830,7 +1118,7 @@ mod tests {
 
     #[test]
     fn the_clone_announces_itself_before_the_boundary_publishes() {
-        let source = include_str!("restore.rs");
+        let source = handle_clone_restore_source();
         let announce = source
             .find("network::refresh_gateway_arp()")
             .expect("the restore path no longer announces the clone at all");

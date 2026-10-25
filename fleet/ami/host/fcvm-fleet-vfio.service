@@ -1,0 +1,11 @@
+[Unit]
+Description=fcvm fleet: bind every NVIDIA GPU to vfio-pci and check it is passable
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/fcvm-fleet/bind-vfio.sh
+
+[Install]
+WantedBy=multi-user.target

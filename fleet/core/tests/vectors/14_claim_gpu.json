@@ -1,0 +1,606 @@
+{
+  "config": {
+    "claim_cooldown_secs": 120,
+    "claim_secs": 30,
+    "max_tiles": 2
+  },
+  "description": "claim_gpu takes a standby GPU (one not drawing a tile) when there is one, for one viewer: it relaunches with the private camera, is timed from the click to its first frame, refuses a second claim from the same address and a claim with no standby GPU, and returns to standby after claim_secs or when its viewer leaves, after which the address waits claim_cooldown_secs.",
+  "events": [
+    {
+      "at": 1000,
+      "host": "h1",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 8,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:02:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:03:00.0"
+          }
+        ],
+        "host": "h1",
+        "type": "hello"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20003/frames",
+        "generation": 1,
+        "id": "slot-3",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-3"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2500,
+      "client": "198.51.100.20",
+      "type": "viewer_joined",
+      "viewer": "v1"
+    },
+    {
+      "at": 2500,
+      "client": "198.51.100.21",
+      "type": "viewer_joined",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 3000,
+      "client": "198.51.100.20",
+      "id": "c1",
+      "name": "claim_gpu",
+      "secret": "token-a",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "at": 3100,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20003/frames",
+        "generation": 2,
+        "id": "slot-3",
+        "phase": "stopping",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-3"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 9000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20003/frames",
+        "generation": 2,
+        "id": "slot-3",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-3"
+      },
+      "type": "agent"
+    },
+    {
+      "args": {},
+      "at": 9500,
+      "client": "198.51.100.20",
+      "id": "c2",
+      "name": "claim_gpu",
+      "secret": "token-b",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {},
+      "at": 9600,
+      "client": "198.51.100.21",
+      "id": "c3",
+      "name": "claim_gpu",
+      "secret": "token-c",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "drag": {
+          "dive": 1,
+          "pitch_deg": 0,
+          "yaw_deg": 20
+        }
+      },
+      "at": 10000,
+      "client": "198.51.100.20",
+      "id": "s1",
+      "name": "claim_camera",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "drag": {
+          "pitch_deg": 0,
+          "yaw_deg": 20
+        }
+      },
+      "at": 10100,
+      "client": "198.51.100.21",
+      "id": "s2",
+      "name": "claim_camera",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "at": 32999,
+      "type": "tick"
+    },
+    {
+      "at": 33000,
+      "type": "tick"
+    },
+    {
+      "args": {},
+      "at": 40000,
+      "client": "198.51.100.20",
+      "id": "c4",
+      "name": "claim_gpu",
+      "secret": "token-d",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {},
+      "at": 40100,
+      "client": "198.51.100.21",
+      "id": "c5",
+      "name": "claim_gpu",
+      "secret": "token-e",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "claim": "claim-9"
+      },
+      "at": 40500,
+      "client": "198.51.100.21",
+      "id": "rel",
+      "name": "release_gpu",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "at": 41000,
+      "type": "viewer_left",
+      "viewer": "v2"
+    }
+  ],
+  "expect": [
+    {
+      "after": 1,
+      "checks": {
+        "/view/claims": [],
+        "/view/fleet/standby": [
+          "slot-3"
+        ]
+      }
+    },
+    {
+      "after": 4,
+      "checks": {
+        "/assign/h1/2/generation": 2,
+        "/assign/h1/2/private_camera/0/intent": "c1",
+        "/assign/h1/2/rect": null,
+        "/receipts/c1/outcome": "committed",
+        "/view/claims/0/expires_at": 33000,
+        "/view/claims/0/first_frame_at": null,
+        "/view/claims/0/session": "claim-1",
+        "/view/claims/0/slot": "slot-3",
+        "/view/claims/0/token": null,
+        "/view/claims/0/viewer": "v1",
+        "/view/fleet/standby": []
+      }
+    },
+    {
+      "after": 6,
+      "checks": {
+        "/view/claims/0/click_to_first_frame_ms": 6000,
+        "/view/claims/0/first_frame_at": 9000
+      }
+    },
+    {
+      "after": 7,
+      "checks": {
+        "/receipts/c2/reason": "one GPU per client at a time"
+      }
+    },
+    {
+      "after": 8,
+      "checks": {
+        "/receipts/c3/reason": "no wall tile can be lent now: every tile is relaunching or racing"
+      },
+      "note": "no standby GPU, and neither wall tile has reported running at its generation"
+    },
+    {
+      "after": 9,
+      "checks": {
+        "/assign/h1/2/private_camera/2/intent": "s1",
+        "/receipts/s1/outcome": "committed"
+      }
+    },
+    {
+      "after": 10,
+      "checks": {
+        "/receipts/s2/reason": "claim_camera needs a GPU of your own (claim_gpu)"
+      }
+    },
+    {
+      "after": 11,
+      "checks": {
+        "/view/claims/0/slot": "slot-3"
+      }
+    },
+    {
+      "after": 12,
+      "checks": {
+        "/assign/h1/2/generation": 3,
+        "/assign/h1/2/private_camera": null,
+        "/view/claims": [],
+        "/view/fleet/standby": [
+          "slot-3"
+        ]
+      }
+    },
+    {
+      "after": 13,
+      "checks": {
+        "/receipts/c4/reason": "your last GPU was returned 7 s ago; claim again in 113 s"
+      }
+    },
+    {
+      "after": 14,
+      "checks": {
+        "/receipts/c5/outcome": "committed",
+        "/view/claims/0/viewer": "v2"
+      }
+    },
+    {
+      "after": 15,
+      "checks": {
+        "/receipts/rel/reason": "\"claim-9\" is not this viewer's claim",
+        "/view/claims/0/session": "claim-2"
+      }
+    },
+    {
+      "after": 16,
+      "checks": {
+        "/assign/h1/2/generation": 5,
+        "/view/claims": []
+      }
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "args": {},
+        "at": 3000,
+        "id": "c1",
+        "name": "claim_gpu",
+        "outcome": "committed",
+        "summary": "claim-1 on slot-3",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 9500,
+        "id": "c2",
+        "name": "claim_gpu",
+        "outcome": "refused",
+        "summary": "one GPU per client at a time",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 9600,
+        "id": "c3",
+        "name": "claim_gpu",
+        "outcome": "refused",
+        "summary": "no wall tile can be lent now: every tile is relaunching or racing",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "drag": {
+            "dive": 1,
+            "pitch_deg": 0,
+            "yaw_deg": 20
+          }
+        },
+        "at": 10000,
+        "id": "s1",
+        "name": "claim_camera",
+        "outcome": "committed",
+        "summary": "claim camera",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "drag": {
+            "pitch_deg": 0,
+            "yaw_deg": 20
+          }
+        },
+        "at": 10100,
+        "id": "s2",
+        "name": "claim_camera",
+        "outcome": "refused",
+        "summary": "claim_camera needs a GPU of your own (claim_gpu)",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 40000,
+        "id": "c4",
+        "name": "claim_gpu",
+        "outcome": "refused",
+        "summary": "your last GPU was returned 7 s ago; claim again in 113 s",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 40100,
+        "id": "c5",
+        "name": "claim_gpu",
+        "outcome": "committed",
+        "summary": "claim-2 on slot-3",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "claim": "claim-9"
+        },
+        "at": 40500,
+        "id": "rel",
+        "name": "release_gpu",
+        "outcome": "refused",
+        "summary": "\"claim-9\" is not this viewer's claim",
+        "viewer": "v2"
+      }
+    ],
+    "aggregates": [
+      {
+        "frame_url": null,
+        "frame_url_v4": null,
+        "half": "fcvm",
+        "host": "h1",
+        "id": "agg:h1",
+        "rect": {
+          "h": 1.0,
+          "w": 1.0,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "tiles": [
+          "fcvm:1",
+          "fcvm:2"
+        ]
+      }
+    ],
+    "borrow": {
+      "cap": 1,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "budget": null,
+    "budget_from_t": null,
+    "claims": [],
+    "cooldown_until": null,
+    "counters": {
+      "restores": 2,
+      "restores_last_hour": 2,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
+    "failures": [],
+    "fleet": {
+      "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
+      "fcvm_gpus": 3,
+      "gpus": 3,
+      "hosts": [
+        {
+          "arch": "x86_64",
+          "draining": false,
+          "gpus": [
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:01:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:02:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:03:00.0"
+            }
+          ],
+          "name": "h1"
+        }
+      ],
+      "max_tiles": 2,
+      "n": 2,
+      "power": {
+        "asleep_since": null,
+        "hosts": [],
+        "idle_since": null,
+        "last_wake": null,
+        "state": "awake",
+        "wakes": [],
+        "woke_at": null
+      },
+      "standby": [
+        "slot-3"
+      ],
+      "standby_ready": 0,
+      "warming": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": {
+        "h": 1.0,
+        "w": 1.0,
+        "x": 0.0,
+        "y": 0.0
+      },
+      "from_frame": 75,
+      "from_t": 2.5,
+      "generation": 1
+    },
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": null,
+      "holding": "horizon",
+      "next": null,
+      "next_hold_at": 37000,
+      "targets": [
+        {
+          "id": "dawn-valley",
+          "label": "Dawn in the valley",
+          "votes": 0
+        },
+        {
+          "id": "peak-seam-low-sun",
+          "label": "The peak at a low sun",
+          "votes": 0
+        },
+        {
+          "id": "peak-close",
+          "label": "Close to the peak",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [],
+    "relaunch_all": null,
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 70.0,
+          "look": [
+            -75.0,
+            28.0,
+            -170.0
+          ],
+          "pos": [
+            -30.0,
+            38.0,
+            -60.0
+          ],
+          "t": 30.0
+        },
+        {
+          "fov_deg": 70.0,
+          "look": [
+            -75.0,
+            28.0,
+            -170.0
+          ],
+          "pos": [
+            -30.0,
+            38.0,
+            -60.0
+          ],
+          "t": 37.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.45,
+      "words": []
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": null
+    },
+    "tiles": [
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": null,
+        "frame_url_v4": null,
+        "generation": 1,
+        "gpu": {
+          "name": "Tesla T4",
+          "sbdf": "0000:01:00.0"
+        },
+        "gpu_stats": null,
+        "half": "fcvm",
+        "host": "h1",
+        "id": "fcvm:1",
+        "last_relaunch": null,
+        "phase": "pending",
+        "previous_rect": null,
+        "rect": {
+          "h": 1.0,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "slot": "slot-1",
+        "vm": null
+      },
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": null,
+        "frame_url_v4": null,
+        "generation": 1,
+        "gpu": {
+          "name": "Tesla T4",
+          "sbdf": "0000:02:00.0"
+        },
+        "gpu_stats": null,
+        "half": "fcvm",
+        "host": "h1",
+        "id": "fcvm:2",
+        "last_relaunch": null,
+        "phase": "pending",
+        "previous_rect": null,
+        "rect": {
+          "h": 1.0,
+          "w": 0.5,
+          "x": 0.5,
+          "y": 0.0
+        },
+        "slot": "slot-2",
+        "vm": null
+      }
+    ],
+    "viewers": {
+      "active": 1,
+      "count": 1
+    }
+  },
+  "start_ms": 0
+}

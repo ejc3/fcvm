@@ -259,9 +259,9 @@ The two verified 2 vCPU cells are 57.7 ms apart: this ladder's 770.3 and the
 2026-08-30 run's 712.6, measured on different goldens, fcvm binaries, container
 images (`cell.image_id` 5b870d814e5d and 334fc21f7c8c) and host boots
 (`cell.host_boot_sha256` prefixes cba28e78 and 34dd09df). Both ran on kernel
-6.17.0-1019-aws on aarch64. The ladder's `hostinfo.json` names its machine
-(box parallel-box-2, instance i-0b8def825d4e9bcc2) and the 2026-08-30 run has
-no `hostinfo.json`, so whether that is one box rebooted or two is not
+6.17.0-1019-aws on aarch64. The ladder's `hostinfo.json` records the instance type and
+`instance_sha256` (prefix bb28b8ba), and the 2026-08-30 run has no
+`hostinfo.json`, so whether that is one box rebooted or two is not
 established. Their within-run intervals overlap, which says nothing about
 run-to-run variation: no configuration here was measured twice under the same
 conditions, so nothing in this report prices that term. The pair gives one
