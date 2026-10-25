@@ -275,12 +275,18 @@ fn parse_answers(m: &[u8], id: u16, qtype: u16) -> Result<Vec<String>> {
     if u16_at(0)? != id {
         bail!("answer for another query");
     }
-    let rcode = u16_at(2)? & 0xF;
+    let flags = u16_at(2)?;
+    let rcode = flags & 0xF;
     if rcode == 3 {
         return Ok(Vec::new()); // NXDOMAIN
     }
     if rcode != 0 {
         bail!("rcode {rcode}");
+    }
+    // Only the zone's own server may confirm a launch name; a cache or forwarder answers
+    // NOERROR with AA clear.
+    if flags & 0x0400 == 0 {
+        bail!("answer is not authoritative (AA bit clear)");
     }
     let (qd, an) = (u16_at(4)?, u16_at(6)?);
     let skip_name = |mut i: usize| -> Result<usize> {
@@ -800,5 +806,32 @@ mod tests {
         nx[3] = 3;
         nx[7] = 0;
         assert!(parse_answers(&nx, 0x1234, 28).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_answer_without_the_aa_bit_is_refused() {
+        // Same response as above with AA clear (flags QR only): a resolver's or cache's
+        // answer, not the zone's own server.
+        let mut m = vec![0x12, 0x34, 0x80, 0x00, 0, 1, 0, 1, 0, 0, 0, 0];
+        for part in ["slot-1", "fcvm", "dev"] {
+            m.push(part.len() as u8);
+            m.extend_from_slice(part.as_bytes());
+        }
+        m.extend_from_slice(&[0, 0, 28, 0, 1]);
+        m.extend_from_slice(&[0xC0, 12, 0, 28, 0, 1, 0, 0, 0, 60, 0, 16]);
+        m.extend_from_slice(
+            &"2001:db8::2"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        let err = parse_answers(&m, 0x1234, 28).unwrap_err();
+        assert!(format!("{err:#}").contains("not authoritative"), "{err:#}");
+        // The same bytes with AA set are read.
+        m[2] = 0x84;
+        assert_eq!(
+            parse_answers(&m, 0x1234, 28).unwrap(),
+            vec!["2001:db8::2".to_string()]
+        );
     }
 }

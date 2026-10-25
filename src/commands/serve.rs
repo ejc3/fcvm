@@ -37,9 +37,6 @@ use tracing::{error, info, warn};
 // Server state
 // ============================================================================
 
-/// How long a create waits for its sandbox to become healthy.
-const CREATE_READY_TIMEOUT: Duration = Duration::from_secs(120);
-
 /// How often `ReadyWatch` reads the state directory while a create is pending.
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -60,6 +57,8 @@ struct AppState {
     /// The fcvm binary every sandbox runs, resolved once at startup.
     fcvm_bin: PathBuf,
     no_snapshot: bool,
+    /// How long a create waits for its sandbox to become healthy (`--create-timeout`).
+    create_timeout: Duration,
     ready: Arc<ReadyWatch>,
 }
 
@@ -622,16 +621,16 @@ async fn create_sandbox(
             error!(name = %name, "{}", detail);
             return gateway_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create sandbox: {}", detail));
         }
-        _ = tokio::time::sleep(CREATE_READY_TIMEOUT) => None,
+        _ = tokio::time::sleep(state.create_timeout) => None,
     };
     let Some(vm) = vm else {
-        warn!(name = %name, "Sandbox did not become healthy within {:?}", CREATE_READY_TIMEOUT);
+        warn!(name = %name, "Sandbox did not become healthy within {:?}", state.create_timeout);
         let _ = child.stop().await;
         return gateway_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
                 "Failed to create sandbox: not healthy within {}s",
-                CREATE_READY_TIMEOUT.as_secs()
+                state.create_timeout.as_secs()
             ),
         );
     };
@@ -1608,10 +1607,15 @@ async fn reaper_task(state: SharedState) {
 // Main entry point
 // ============================================================================
 
+fn create_timeout(args: &ServeArgs) -> Duration {
+    Duration::from_secs(args.create_timeout)
+}
+
 pub async fn cmd_serve(args: ServeArgs) -> Result<()> {
     info!(
         port = args.port,
         no_snapshot = args.no_snapshot,
+        create_timeout_secs = args.create_timeout,
         "Starting fcvm serve"
     );
 
@@ -1633,6 +1637,7 @@ pub async fn cmd_serve(args: ServeArgs) -> Result<()> {
         port: bound.port(),
         fcvm_bin,
         no_snapshot: args.no_snapshot,
+        create_timeout: create_timeout(&args),
         ready: ready_watch,
     });
 
@@ -1691,6 +1696,38 @@ pub async fn cmd_serve(args: ServeArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_serve(extra: &[&str]) -> Result<ServeArgs, clap::Error> {
+        use clap::Parser;
+        let mut argv = vec!["fcvm", "serve"];
+        argv.extend_from_slice(extra);
+        match crate::cli::Cli::try_parse_from(argv)?.cmd {
+            crate::cli::Commands::Serve(args) => Ok(args),
+            _ => panic!("expected `serve` command"),
+        }
+    }
+
+    /// `--create-timeout` reaches the duration a create waits; without it the wait stays 120 s.
+    #[test]
+    fn create_timeout_flag_sets_the_ready_wait() {
+        let default = parse_serve(&[]).unwrap();
+        assert_eq!(create_timeout(&default), Duration::from_secs(120));
+
+        let custom = parse_serve(&["--create-timeout", "300"]).unwrap();
+        assert_eq!(create_timeout(&custom), Duration::from_secs(300));
+
+        assert!(parse_serve(&["--create-timeout", "0"]).is_err());
+        assert!(parse_serve(&["--create-timeout", "soon"]).is_err());
+    }
+
+    /// The create handler waits on the state's timeout, not a constant.
+    #[test]
+    fn create_handler_waits_on_the_configured_timeout() {
+        let src = include_str!("serve.rs");
+        let handler = src.split("mod tests {").next().unwrap();
+        assert!(handler.contains("tokio::time::sleep(state.create_timeout)"));
+        assert!(!handler.contains("CREATE_READY_TIMEOUT"));
+    }
 
     /// A sandbox create asks for the startup snapshot: sandboxes of one image are identical
     /// by design, while a plain `podman run` takes none unless asked.
