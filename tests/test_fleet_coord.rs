@@ -1401,7 +1401,7 @@ async fn shutdown_waits_for_a_state_write_already_in_flight() {
                 w2.lock().unwrap().push(b.len());
             }
             if let Some(a) = cmd.ack {
-                let _ = a.send(());
+                let _ = a.send(true);
             }
         }
     });
@@ -1450,6 +1450,100 @@ async fn shutdown_waits_for_a_state_write_already_in_flight() {
         .await
         .unwrap()
         .unwrap();
+}
+
+/// A state write that fails (here: its directory does not exist yet) is kept, and the next
+/// command to the writer, a shutdown barrier that carries no state of its own, writes it.
+/// Before, the writer dropped it and acknowledged the barrier with nothing written.
+#[tokio::test]
+async fn a_failed_state_write_is_kept_and_written_by_the_next_barrier() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("later").join("fleet.json");
+    let tx = store::spawn_writer(path.clone());
+    let mut s = State::new(Config::default(), 1_000);
+    s.version = 7;
+    let (ack, done) = tokio::sync::oneshot::channel();
+    tx.send(store::StoreCmd {
+        bytes: Some(Arc::new(serde_json::to_vec(&s).unwrap())),
+        ack: Some(ack),
+    })
+    .unwrap();
+    let first = done.await.unwrap();
+    assert!(!first, "a failed write is acknowledged as not stored");
+    assert!(store::load(&path).unwrap().is_none());
+    std::fs::create_dir(dir.path().join("later")).unwrap();
+    let (ack, done) = tokio::sync::oneshot::channel();
+    tx.send(store::StoreCmd {
+        bytes: None,
+        ack: Some(ack),
+    })
+    .unwrap();
+    let second = done.await.unwrap();
+    let saved = store::load(&path)
+        .unwrap()
+        .expect("the barrier wrote the state that failed before");
+    assert_eq!(saved.version, 7);
+    assert!(second, "the retried write is acknowledged as stored");
+}
+
+/// A writer whose writes fail: shutdown asks again, and reports that the last state is not
+/// stored rather than counting it stored. A write that succeeds on a later attempt is
+/// reported stored.
+#[tokio::test]
+async fn shutdown_reports_a_last_state_that_was_not_stored() {
+    async fn run(fail_first: usize) -> (bool, usize) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<store::StoreCmd>();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a2 = attempts.clone();
+        tokio::spawn(async move {
+            let mut pending = false;
+            while let Some(cmd) = rx.recv().await {
+                pending |= cmd.bytes.is_some();
+                if pending {
+                    let n = a2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    pending = n < fail_first;
+                }
+                if let Some(a) = cmd.ack {
+                    let _ = a.send(!pending);
+                }
+            }
+        });
+        let (handle, actor) = start(
+            State::new(
+                Config {
+                    light_interval_ms: 0,
+                    ..Config::default()
+                },
+                1_000,
+            ),
+            Some(tx),
+            None,
+            None,
+            None,
+            None,
+        );
+        handle
+            .apply(Event::Intent {
+                at: 0,
+                viewer: "v-1".into(),
+                client: Some("198.51.100.9".into()),
+                id: "l-0".into(),
+                name: "light".into(),
+                args: light(0.0),
+                check: None,
+                secret: None,
+            })
+            .await
+            .unwrap();
+        let stored = handle.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(10), actor)
+            .await
+            .unwrap()
+            .unwrap();
+        (stored, attempts.load(std::sync::atomic::Ordering::SeqCst))
+    }
+    assert_eq!(run(usize::MAX).await, (false, 3));
+    assert_eq!(run(1).await, (true, 2));
 }
 
 /// A tile whose instance never serves its renderer is terminated and launched again,
