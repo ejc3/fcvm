@@ -196,7 +196,33 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             None
         }
         Event::Published { slot, names, .. } => {
+            let c = &state.config;
+            if slot == crate::state::EC2_AGGREGATE_ID {
+                if names.names(
+                    c.ec2_aggregate_ipv6.as_deref(),
+                    c.ec2_aggregate_ipv4.as_deref(),
+                    None,
+                ) {
+                    state.fleet.ec2_aggregate_published = Some(names.clone());
+                }
+                return None;
+            }
             let f = &mut state.fleet;
+            // A host aggregator's names, for the addresses it reports now.
+            if let Some(h) = f
+                .hosts
+                .values_mut()
+                .find(|h| crate::state::aggregate_id(&h.name).as_deref() == Some(slot.as_str()))
+            {
+                if names.names(
+                    h.aggregate_ipv6.as_deref(),
+                    h.aggregate_ipv4.as_deref(),
+                    h.aggregate_v4_port,
+                ) {
+                    h.aggregate_published = Some(names.clone());
+                }
+                return None;
+            }
             if let Some(s) = f
                 .slots
                 .values_mut()
@@ -307,9 +333,17 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                         at,
                     );
                 }
-                AgentMsg::Aggregate { frame_url } => {
+                AgentMsg::Aggregate {
+                    frame_url,
+                    ipv6,
+                    ipv4,
+                    v4_port,
+                } => {
                     if let Some(h) = state.fleet.hosts.get_mut(host) {
                         h.aggregate_url = Some(frame_url.clone());
+                        h.aggregate_ipv6 = ipv6.clone();
+                        h.aggregate_ipv4 = ipv4.clone();
+                        h.aggregate_v4_port = *v4_port;
                     }
                 }
                 AgentMsg::Scrub { ok, .. } => {
@@ -320,8 +354,18 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                         c.scrub_failures += 1;
                     }
                 }
-                AgentMsg::Quarantine { sbdf, error, .. } => {
-                    quarantine(&mut state.fleet, host, sbdf, error, at);
+                AgentMsg::Quarantine {
+                    sbdf,
+                    error,
+                    report,
+                    ..
+                } => {
+                    let key = gpu_key(host, sbdf);
+                    let released = report.is_some()
+                        && state.fleet.released_reports.get(&key) == report.as_ref();
+                    if !released {
+                        quarantine(&mut state.fleet, host, sbdf, error, report.clone(), at);
+                    }
                 }
             }
             None
@@ -359,7 +403,10 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             None
         }
         Event::ReleaseQuarantine { host, sbdf, .. } => {
-            state.fleet.quarantined.remove(&gpu_key(host, sbdf));
+            let key = gpu_key(host, sbdf);
+            if let Some(report) = state.fleet.quarantined.remove(&key).and_then(|q| q.report) {
+                state.fleet.released_reports.insert(key, report);
+            }
             None
         }
     }
@@ -501,7 +548,7 @@ pub fn is_quarantined(f: &Fleet, s: &Slot) -> bool {
 
 /// Take a GPU out of rotation: its slot leaves the tiling (and any race and claim), and
 /// stays out until an operator releases it.
-fn quarantine(f: &mut Fleet, host: &str, sbdf: &str, error: &str, at: u64) {
+fn quarantine(f: &mut Fleet, host: &str, sbdf: &str, error: &str, report: Option<String>, at: u64) {
     let key = gpu_key(host, sbdf);
     if f.quarantined.contains_key(&key) {
         return;
@@ -513,6 +560,7 @@ fn quarantine(f: &mut Fleet, host: &str, sbdf: &str, error: &str, at: u64) {
             sbdf: sbdf.to_string(),
             error: error.to_string(),
             since: at,
+            report,
         },
     );
     let on_gpu = |s: &Slot| {
@@ -1033,6 +1081,10 @@ fn hello(f: &mut Fleet, host: &str, arch: &str, gpus: &[Gpu], capacity: usize, a
             joined_at: at,
             region: None,
             aggregate_url: None,
+            aggregate_ipv6: None,
+            aggregate_ipv4: None,
+            aggregate_v4_port: None,
+            aggregate_published: None,
         },
     );
     f.reclaimed.remove(host);

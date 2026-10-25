@@ -40,7 +40,7 @@ fleet/tools/gpubox.sh list              # every gpubox, owner, lease end
 | | built by | boots to |
 |---|---|---|
 | `fcvm-fleet-host-x86_64-<commit>-<date>` (g4dn.metal) | `host/build.sh` prep, build, bake | `fcvm-fleet-vfio.service` binds every NVIDIA function to vfio-pci and fails unless each is passable; `fcvm-fleet-store.service` formats the instance-store NVMe as btrfs at `/mnt/fcvm-btrfs` and restores the store from the asset bucket (`/etc/fcvm-fleet/store.env`), falling back to the AMI's copy; `fcvm-fleet-agent.service` is installed disabled; the host's boot writes `/etc/fcvm-fleet/agent.env` and starts it (ejc3/aws `fcvm_fleet_host_agent_args`), and the agent dials the coordinator |
-| `fcvm-fleet-tile-x86_64-<commit>-<date>` (g4dn.xlarge) | `tile/build.sh` prep, image, bake | nvidia-persistenced, the certificate from `fcvm-fleet/tls-wildcard`, the renderer on 127.0.0.1:8080 behind nginx on 443 |
+| `fcvm-fleet-tile-x86_64-<commit>-<date>` (g4dn.xlarge) | `tile/build.sh` prep, image, bake (`units` and bake revise one launched with `BASE_AMI`) | nvidia-persistenced, the certificate from `fcvm-fleet/tls-wildcard`, the renderer on 127.0.0.1:8080 behind nginx on 443 (`fcvm-fleet-nginx.service`); none of them waits for cloud-init's network stage |
 
 ```bash
 H=$(fleet/ami/build-ami.sh launch host)                  # BASE_AMI=<ami> revises an earlier image
