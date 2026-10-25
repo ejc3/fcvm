@@ -32,8 +32,8 @@ struct Opts {
     /// The EC2 aggregator as the coordinator reaches it.
     ec2_local: Option<String>,
     site_key: Option<String>,
-    /// A DNS writer: tiles' and claims' frame URLs are then the published names.
-    dns: Option<fcvm::fleet::coord::dns::Cloudflare>,
+    /// How launches are named: tiles' and claims' frame URLs are then the published names.
+    dns: Option<fcvm::fleet::coord::Names>,
 }
 
 impl Default for Opts {
@@ -747,7 +747,7 @@ async fn a_claims_frame_urls_are_its_launchs_published_names() {
     .unwrap()
     .with_confirm(Arc::new(gate));
     let c = coordinator_with(Opts {
-        dns: Some(writer),
+        dns: Some(fcvm::fleet::coord::Names::Cloudflare(writer)),
         ..Opts::default()
     })
     .await;
@@ -996,6 +996,9 @@ async fn the_poster_is_the_whole_image_at_a_hold() {
         .to_coord
         .send(AgentMsg::Aggregate {
             frame_url: host_agg,
+            ipv6: None,
+            ipv4: None,
+            v4_port: None,
         })
         .unwrap();
     agent.report("slot-1", "running", 1);
@@ -1995,6 +1998,7 @@ async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
         scene: tokio::sync::watch::channel(None).0,
         budget: tokio::sync::watch::channel(None).0,
         dns: None,
+        zone: None,
         store: Some(tx),
     };
     let (cmds, cmds_rx) = tokio::sync::mpsc::channel(64);
@@ -2969,6 +2973,9 @@ async fn no_poster_is_planned_while_tiles_start_or_race() {
         .to_coord
         .send(AgentMsg::Aggregate {
             frame_url: "ws://gpu-host.example:20200/frames".into(),
+            ipv6: None,
+            ipv4: None,
+            v4_port: None,
         })
         .unwrap();
     // Nor while the tiles are still starting (the first poster of a GPU run was black).
@@ -3044,6 +3051,9 @@ async fn a_poster_plan_names_only_placed_aggregators() {
     a.to_coord
         .send(AgentMsg::Aggregate {
             frame_url: "ws://gpu-a.example:20200/frames".into(),
+            ipv6: None,
+            ipv4: None,
+            v4_port: None,
         })
         .unwrap();
     // gpu-b's only GPU is on standby: max_tiles is taken by gpu-a.
@@ -3051,6 +3061,9 @@ async fn a_poster_plan_names_only_placed_aggregators() {
     b.to_coord
         .send(AgentMsg::Aggregate {
             frame_url: "ws://gpu-b.example:20200/frames".into(),
+            ipv6: None,
+            ipv4: None,
+            v4_port: None,
         })
         .unwrap();
     // A scrub after it on the same connection shows when gpu-b's aggregate is applied.
@@ -3994,6 +4007,14 @@ struct DnsFixture {
 }
 
 async fn dns_fixture(pre: &[(&str, &str, &str)]) -> DnsFixture {
+    dns_fixture_with(pre, Config::default(), None).await
+}
+
+async fn dns_fixture_with(
+    pre: &[(&str, &str, &str)],
+    config: Config,
+    ec2: Option<Arc<dyn ec2::Ec2Driver>>,
+) -> DnsFixture {
     use fcvm::fleet::coord::dns::Cloudflare;
     let cf = FakeCf::default();
     for (i, (kind, name, content)) in pre.iter().enumerate() {
@@ -4017,12 +4038,12 @@ async fn dns_fixture(pre: &[(&str, &str, &str)]) -> DnsFixture {
     .unwrap()
     .with_confirm(Arc::new(gate.clone()));
     let (handle, _actor) = start(
-        State::new(Config::default(), now_ms()),
+        State::new(config, now_ms()),
+        None,
+        ec2,
         None,
         None,
-        None,
-        None,
-        Some(writer),
+        Some(fcvm::fleet::coord::Names::Cloudflare(writer)),
     );
     let mut agent = FakeAgent::connect(&handle, "gpu-a", 1);
     agent.assign().await;
@@ -4264,6 +4285,343 @@ async fn each_launch_gets_new_names_and_old_ones_go_once_unreferenced() {
     assert!(
         !w.iter().any(|x| x.starts_with("update")),
         "a name changed address in place: {w:?}"
+    );
+}
+
+impl DnsFixture {
+    fn aggregate_report(&self, v6: Option<&str>, v4: Option<&str>) {
+        self.agent
+            .to_coord
+            .send(AgentMsg::Aggregate {
+                frame_url: "ws://gpu-a.internal:20300/frames".into(),
+                ipv6: v6.map(str::to_string),
+                ipv4: v4.map(str::to_string),
+                v4_port: v4.map(|_| 20208),
+            })
+            .unwrap();
+    }
+
+    fn aggregate(&self) -> Value {
+        self.aggregate_of("agg:gpu-a")
+    }
+
+    fn aggregate_of(&self, id: &str) -> Value {
+        let state =
+            &serde_json::from_str::<Value>(&self.handle.snapshot.borrow().text).unwrap()["state"];
+        state["aggregates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == id)
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+}
+
+/// The EC2 half's aggregator serving browsers with TLS is named `agg-ec2-<token>` at the
+/// coordinator's own addresses, both on 443, and its URLs reach the page only once the
+/// names answer.
+#[tokio::test]
+async fn the_ec2_aggregator_is_published_at_the_coordinators_addresses() {
+    let config = Config {
+        ec2_max: 1,
+        ec2_aggregate_ipv6: Some("2001:db8:20::5".into()),
+        ec2_aggregate_ipv4: Some("192.0.2.44".into()),
+        ..Config::default()
+    };
+    let ec2: Arc<dyn ec2::Ec2Driver> = Arc::new(ec2::FakeEc2::new(
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+    ));
+    let fx = dns_fixture_with(&[], config, Some(ec2)).await;
+    fx.wait_until("the EC2 half's region", |fx| {
+        !fx.aggregate_of("agg:ec2").is_null()
+    })
+    .await;
+    let label = fx.label_for("2001:db8:20::5").await;
+    assert!(
+        label.starts_with("agg-ec2-") && label.len() == "agg-ec2-".len() + 8,
+        "{label}"
+    );
+    fx.wait_until("the A record", |fx| {
+        fx.zone().contains(&(
+            "A".into(),
+            format!("{label}-v4.fcvm.example"),
+            "192.0.2.44".into(),
+        ))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        fx.aggregate_of("agg:ec2")["frame_url"].is_null(),
+        "{}",
+        fx.aggregate_of("agg:ec2")
+    );
+    fx.open(true);
+    fx.wait_until("the EC2 aggregator published", |fx| {
+        !fx.aggregate_of("agg:ec2")["frame_url"].is_null()
+    })
+    .await;
+    let a = fx.aggregate_of("agg:ec2");
+    assert_eq!(a["frame_url"], format!("wss://{label}.fcvm.example/frames"));
+    assert_eq!(
+        a["frame_url_v4"],
+        format!("wss://{label}-v4.fcvm.example/frames")
+    );
+}
+
+/// A host aggregator that serves browsers is named like a launch, under
+/// `agg-<host>-<token>`: its own IPv6 address and the host's IPv4 address on the
+/// aggregator's port, written, confirmed, and only then given to the page. Before that,
+/// and for an aggregator that reports no public address, the page gets no URL (it is https
+/// and cannot open the aggregator's plain one). A new address is a new label, and the old
+/// names go once unreferenced.
+#[tokio::test]
+async fn a_host_aggregator_is_published_under_its_own_names() {
+    let fx = dns_fixture(&[]).await;
+    fx.report("running", 1, Some("2001:db8::2"), Some("192.0.2.10"));
+    fx.wait_until("the host's band", |fx| !fx.aggregate().is_null())
+        .await;
+    fx.aggregate_report(None, None);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        fx.aggregate()["frame_url"].is_null() && fx.aggregate()["frame_url_v4"].is_null(),
+        "the plain URL reached an https page: {}",
+        fx.aggregate()
+    );
+    assert!(
+        !fx.zone().iter().any(|(_, n, _)| n.starts_with("agg-")),
+        "{:?}",
+        fx.zone()
+    );
+
+    fx.aggregate_report(Some("2001:db8::1"), Some("192.0.2.10"));
+    let label = fx.label_for("2001:db8::1").await;
+    assert!(
+        label.starts_with("agg-gpu-a-") && label.len() == "agg-gpu-a-".len() + 8,
+        "{label}"
+    );
+    fx.wait_until("the A record", |fx| {
+        fx.zone().contains(&(
+            "A".into(),
+            format!("{label}-v4.fcvm.example"),
+            "192.0.2.10".into(),
+        ))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(fx.aggregate()["frame_url"].is_null(), "{}", fx.aggregate());
+    fx.open(true);
+    fx.wait_until("the aggregator published", |fx| {
+        !fx.aggregate()["frame_url"].is_null()
+    })
+    .await;
+    assert_eq!(
+        fx.aggregate()["frame_url"],
+        format!("wss://{label}.fcvm.example/frames")
+    );
+    assert_eq!(
+        fx.aggregate()["frame_url_v4"],
+        format!("wss://{label}-v4.fcvm.example:20208/frames")
+    );
+
+    // Another address (a new host prefix): the old names are hidden at once, the new ones
+    // shown once confirmed, and the old records removed.
+    fx.open(false);
+    fx.aggregate_report(Some("2001:db8:5::1"), Some("192.0.2.10"));
+    let second = fx.label_for("2001:db8:5::1").await;
+    assert_ne!(label, second);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(fx.aggregate()["frame_url"].is_null(), "{}", fx.aggregate());
+    fx.open(true);
+    fx.wait_until("the new address published", |fx| {
+        fx.aggregate()["frame_url"] == format!("wss://{second}.fcvm.example/frames")
+    })
+    .await;
+    fx.wait_until("the old names removed", |fx| {
+        !fx.zone().iter().any(|(_, n, _)| n.starts_with(&label))
+    })
+    .await;
+}
+
+/// A DNS query for `name` and `qtype` to `server` over UDP (or TCP): the rcode, whether AA
+/// is set, and the addresses of the answer.
+async fn ask_dns(
+    server: std::net::SocketAddr,
+    name: &str,
+    qtype: u16,
+    tcp: bool,
+) -> (u8, bool, Vec<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut q = vec![0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    for l in name.split('.') {
+        q.push(l.len() as u8);
+        q.extend_from_slice(l.as_bytes());
+    }
+    q.push(0);
+    q.extend_from_slice(&qtype.to_be_bytes());
+    q.extend_from_slice(&[0, 1]);
+    let m = if tcp {
+        let mut s = tokio::net::TcpStream::connect(server).await.unwrap();
+        s.write_all(&(q.len() as u16).to_be_bytes()).await.unwrap();
+        s.write_all(&q).await.unwrap();
+        let len = s.read_u16().await.unwrap() as usize;
+        let mut m = vec![0; len];
+        s.read_exact(&mut m).await.unwrap();
+        m
+    } else {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.send_to(&q, server).await.unwrap();
+        let mut buf = [0u8; 1500];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+            .await
+            .expect("an answer within 2 s")
+            .unwrap();
+        buf[..n].to_vec()
+    };
+    assert_eq!(&m[..2], &[0x12, 0x34]);
+    let an = u16::from_be_bytes([m[6], m[7]]);
+    let mut i = q.len();
+    let mut out = Vec::new();
+    for _ in 0..an {
+        assert_eq!(m[i] & 0xC0, 0xC0, "an answer owned by the question's name");
+        let t = u16::from_be_bytes([m[i + 2], m[i + 3]]);
+        let len = u16::from_be_bytes([m[i + 10], m[i + 11]]) as usize;
+        let rd = &m[i + 12..i + 12 + len];
+        match (t, len) {
+            (1, 4) => out.push(std::net::Ipv4Addr::new(rd[0], rd[1], rd[2], rd[3]).to_string()),
+            (28, 16) => {
+                out.push(std::net::Ipv6Addr::from(<[u8; 16]>::try_from(rd).unwrap()).to_string())
+            }
+            _ => {}
+        }
+        i += 12 + len;
+    }
+    (m[3] & 0xF, m[2] & 0x04 != 0, out)
+}
+
+/// A coordinator serving the launch names' subzone, its DNS server's address, the zone it
+/// answers from, and an agent with one slot.
+async fn subzone_fixture() -> (
+    Handle,
+    std::net::SocketAddr,
+    tokio::sync::watch::Receiver<Arc<fcvm::fleet::coord::authority::Zone>>,
+    FakeAgent,
+) {
+    use fcvm::fleet::coord::authority::{Authority, Zone, ZoneConfig};
+    let cfg = Arc::new(
+        ZoneConfig::new(
+            "tiles.fcvm.example",
+            &["ns1-tiles.fcvm.example".into()],
+            Some("_acme-challenge.fcvm.example"),
+        )
+        .unwrap(),
+    );
+    let (tx, rx) = tokio::sync::watch::channel(Arc::new(Zone::default()));
+    let server = Authority {
+        cfg: cfg.clone(),
+        zone: rx.clone(),
+    }
+    .serve("127.0.0.1:0".parse().unwrap(), 1000)
+    .await
+    .unwrap();
+    let (handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        None,
+        Some(fcvm::fleet::coord::Names::Subzone(cfg, tx)),
+    );
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 1);
+    agent.assign().await;
+    (handle, server, rx, agent)
+}
+
+fn report_slot(agent: &FakeAgent, generation: u64, v6: Option<&str>, v4: Option<&str>) {
+    agent
+        .to_coord
+        .send(AgentMsg::Slot(SlotReport {
+            id: "slot-1".into(),
+            phase: if v6.is_some() { "running" } else { "starting" }.into(),
+            generation,
+            ipv6: v6.map(str::to_string),
+            ipv4: v4.map(str::to_string),
+            v4_port: v4.map(|_| 20200),
+            ..Default::default()
+        }))
+        .unwrap();
+}
+
+/// The first snapshot whose tile shows both frame URLs other than `not`; the zone the DNS
+/// server answers from is read right after it.
+async fn published_urls(
+    handle: &Handle,
+    zone: &tokio::sync::watch::Receiver<Arc<fcvm::fleet::coord::authority::Zone>>,
+    not: Option<&str>,
+) -> (String, String, Arc<fcvm::fleet::coord::authority::Zone>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let tile = serde_json::from_str::<Value>(&handle.snapshot.borrow().text).unwrap()["state"]
+            ["tiles"][0]
+            .clone();
+        let z = zone.borrow().clone();
+        if let (Some(v6), Some(v4)) = (tile["frame_url"].as_str(), tile["frame_url_v4"].as_str()) {
+            if Some(v6) != not {
+                return (v6.to_string(), v4.to_string(), z);
+            }
+        }
+        assert!(Instant::now() < deadline, "no published URLs: {tile}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn host_of(url: &str) -> String {
+    let rest = url.strip_prefix("wss://").unwrap();
+    rest.split(['/', ':']).next().unwrap().to_string()
+}
+
+/// With the subzone served by the coordinator, a launch's names are published as they are
+/// minted, with no wait: the zone already holds them when a snapshot first shows them, and
+/// the server answers them (AA) over UDP and TCP. A relaunch's new names replace them, and
+/// the old ones stop answering.
+#[tokio::test]
+async fn a_minted_name_answers_at_once_and_a_replaced_one_does_not() {
+    let (handle, server, zone, agent) = subzone_fixture().await;
+    report_slot(&agent, 1, Some("2001:db8::1"), Some("192.0.2.10"));
+    let (v6_url, v4_url, z) = published_urls(&handle, &zone, None).await;
+    let (v6, v4) = (host_of(&v6_url), host_of(&v4_url));
+    assert!(
+        v6.starts_with("slot-1-") && v6.ends_with(".tiles.fcvm.example"),
+        "{v6_url}"
+    );
+    assert_eq!(v4_url, format!("wss://{v4}:20200/frames"));
+    // In the zone before the snapshot named it.
+    assert!(z.aaaa.contains_key(&v6) && z.a.contains_key(&v4), "{z:?}");
+    assert_eq!(
+        ask_dns(server, &v6, 28, false).await,
+        (0, true, vec!["2001:db8::1".to_string()])
+    );
+    assert_eq!(
+        ask_dns(server, &v4, 1, true).await,
+        (0, true, vec!["192.0.2.10".to_string()])
+    );
+    // The relaunch: the old names answer until the new launch's replace them.
+    report_slot(&agent, 2, None, None);
+    report_slot(&agent, 2, Some("2001:db8::2"), Some("192.0.2.11"));
+    let (new_url, _, _) = published_urls(&handle, &zone, Some(&v6_url)).await;
+    let new = host_of(&new_url);
+    assert_ne!(new, v6);
+    assert_eq!(
+        ask_dns(server, &new, 28, false).await,
+        (0, true, vec!["2001:db8::2".to_string()])
+    );
+    assert_eq!(ask_dns(server, &v6, 28, false).await, (3, true, vec![]));
+    assert_eq!(ask_dns(server, &v4, 1, false).await, (3, true, vec![]));
+    // Outside the subzone: refused.
+    assert_eq!(
+        ask_dns(server, "slot-1.fcvm.example", 28, false).await,
+        (5, false, vec![])
     );
 }
 

@@ -8,11 +8,13 @@
 //! nothing to lock and no order to race on.
 
 pub mod agents;
+pub mod authority;
 pub mod aws;
 pub mod cert;
 pub mod dns;
 pub mod ec2;
 pub mod ec2_aws;
+pub mod ecs;
 pub mod hosts;
 pub mod live;
 pub mod poster;
@@ -119,6 +121,12 @@ pub struct Outputs {
     pub budget: watch::Sender<Option<BudgetBody>>,
     /// The slots' DNS records, when the coordinator writes them (zone, wanted records).
     pub dns: Option<watch::Sender<Vec<dns::Fact>>>,
+    /// The launch names' subzone, when this coordinator serves it: its records follow the
+    /// published names.
+    pub zone: Option<(
+        Arc<authority::ZoneConfig>,
+        watch::Sender<Arc<authority::Zone>>,
+    )>,
     pub store: Option<store::StoreTx>,
 }
 
@@ -158,18 +166,71 @@ pub fn snapshot_of(state: &State) -> Arc<Snapshot> {
 
 impl Actor {
     pub fn new(state: State, out: Outputs, clock: Box<dyn Fn() -> u64 + Send>) -> Self {
-        let published = state.version;
-        out.snapshot.send_replace(snapshot_of(&state));
-        Actor {
+        let mut actor = Actor {
             ec2_aggregate_local: None,
             stored: state.version,
+            published: state.version,
             state,
             out,
             agents: HashMap::new(),
             unacked: Vec::new(),
             last_at: 0,
-            published,
             clock,
+        };
+        // A resumed state's launches are named, and the subzone holds them, before the first
+        // snapshot.
+        actor.name_launches();
+        actor.update_zone();
+        actor.published = actor.state.version;
+        actor.out.snapshot.send_replace(snapshot_of(&actor.state));
+        actor
+    }
+
+    /// With the subzone served here, give every launch that needs names new ones and publish
+    /// them in the same step: the zone the server answers from is updated from this state
+    /// before any snapshot or claim names them.
+    fn name_launches(&mut self) {
+        let Some(apex) = self.out.zone.as_ref().map(|(c, _)| c.apex.clone()) else {
+            return;
+        };
+        for f in dns::facts(&self.state) {
+            if !dns::needs_names(&apex, &f) {
+                continue;
+            }
+            let names = dns::names(
+                &apex,
+                &dns::mint(&f.id),
+                f.generation,
+                f.ipv6.as_deref(),
+                f.ipv4.as_deref(),
+                f.v4_port,
+            );
+            tracing::info!(slot = %f.id, label = %names.label, "names published");
+            let at = self.stamp();
+            let state = std::mem::replace(&mut self.state, State::new(Config::default(), 0));
+            self.state = apply(
+                state,
+                &Event::Published {
+                    at,
+                    slot: f.id.clone(),
+                    names,
+                },
+            );
+        }
+    }
+
+    /// The subzone's records, from the published names.
+    fn update_zone(&mut self) {
+        if let Some((cfg, tx)) = &self.out.zone {
+            let z = authority::zone_of(&self.state, &cfg.apex);
+            tx.send_if_modified(|cur| {
+                if cur.same_records(&z) {
+                    false
+                } else {
+                    *cur = Arc::new(z);
+                    true
+                }
+            });
         }
     }
 
@@ -186,6 +247,7 @@ impl Actor {
         let before = self.state.version;
         let state = std::mem::replace(&mut self.state, State::new(Config::default(), 0));
         self.state = apply(state, &event);
+        self.name_launches();
         if self.state.version != before {
             self.dispatch_agents();
         }
@@ -193,6 +255,8 @@ impl Actor {
 
     /// Send each agent its assignment and the scene when they differ from what it last got.
     fn dispatch_agents(&mut self) {
+        // First: every output below can name a launch, and its reader may look it up at once.
+        self.update_zone();
         let assignments = host_assignments(&self.state);
         let regions = host_regions(&self.state);
         let scene = shared_scene(&self.state);
@@ -366,12 +430,17 @@ impl Actor {
                 let d = &f.director;
                 // Only aggregators with a region: one without (a host whose GPUs are all
                 // on standby, the EC2 side with no tile) never sends a frame, and the
-                // capture waits for every source.
+                // capture waits for every source. A host aggregator is read at its
+                // published name when it has one (IPv4 first): the URL its agent reported
+                // can be an address only that host reaches.
                 let mut sources: Vec<String> = f
                     .hosts
                     .values()
                     .filter(|h| h.region.is_some())
-                    .filter_map(|h| h.aggregate_url.clone())
+                    .filter_map(|h| {
+                        let (v6, v4) = fleet_core::view::host_aggregate_urls(&self.state, h);
+                        v4.or(v6).or_else(|| h.aggregate_url.clone())
+                    })
                     .collect();
                 if let Some(u) = self
                     .ec2_aggregate_local
@@ -702,6 +771,18 @@ impl Handle {
     }
 }
 
+/// How launches' DNS names are made.
+pub enum Names {
+    /// Written through the Cloudflare API and published once the zone's servers answer them.
+    Cloudflare(dns::Cloudflare),
+    /// Served by this coordinator as the subzone's authoritative server ([`authority`]):
+    /// published as they are minted, with the zone sent on the channel.
+    Subzone(
+        Arc<authority::ZoneConfig>,
+        watch::Sender<Arc<authority::Zone>>,
+    ),
+}
+
 /// Start the actor, the tick timer and the EC2 driver; returns the handle the transports
 /// use and the actor task.
 pub fn start(
@@ -710,7 +791,7 @@ pub fn start(
     ec2: Option<Arc<dyn ec2::Ec2Driver>>,
     ec2_aggregate_local: Option<String>,
     power: Option<hosts::HostConfig>,
-    dns_writer: Option<dns::Cloudflare>,
+    names: Option<Names>,
 ) -> (Handle, tokio::task::JoinHandle<()>) {
     let (cmds, rx) = mpsc::channel(4096);
     let (snap_tx, snap_rx) = watch::channel(Arc::new(Snapshot {
@@ -723,8 +804,13 @@ pub fn start(
     let (scene_tx, scene_rx) = watch::channel(None);
     let (budget_tx, budget_rx) = watch::channel(state.fleet.budget.body());
     let mut state = state;
-    // With a DNS writer, tiles' frame URLs are the launches' published names.
-    state.config.names_published = dns_writer.is_some();
+    // With named launches, tiles' frame URLs are the launches' published names.
+    state.config.names_published = names.is_some();
+    let (dns_writer, zone) = match names {
+        Some(Names::Cloudflare(cf)) => (Some(cf), None),
+        Some(Names::Subzone(cfg, tx)) => (None, Some((cfg, tx))),
+        None => (None, None),
+    };
     let dns_out = dns_writer.map(|cf| {
         let (tx, rx) = watch::channel(dns::facts(&state));
         (cf, tx, rx)
@@ -739,6 +825,7 @@ pub fn start(
             scene: scene_tx,
             budget: budget_tx,
             dns: dns_out.as_ref().map(|(_, tx, _)| tx.clone()),
+            zone,
             store,
         },
         Box::new(now_ms),
@@ -824,6 +911,28 @@ pub fn power_managed(args: &FleetCoordArgs) -> bool {
 }
 
 pub async fn run(args: FleetCoordArgs) -> Result<()> {
+    if args.ec2_aggregate_listen.is_some()
+        && args.ec2_aggregate_url.is_none()
+        && !args.ec2_aggregate_tls
+    {
+        bail!("--ec2-aggregate-listen needs --ec2-aggregate-url or --ec2-aggregate-tls (how browsers reach it)");
+    }
+    let secrets_region = || {
+        args.secrets_region
+            .clone()
+            .or_else(|| std::env::var("AWS_REGION").ok())
+            .context("reading a secret needs --secrets-region or AWS_REGION")
+    };
+    // The EC2 aggregator serving browsers: the task's own addresses, fixed for its life.
+    let ec2_public = if args.ec2_aggregate_tls {
+        let region = std::env::var("AWS_REGION")
+            .context("--ec2-aggregate-tls reads the task's addresses in AWS_REGION")?;
+        let a = ecs::task_addresses(&region).await?;
+        tracing::info!(ipv6 = ?a.ipv6, ipv4 = ?a.ipv4, "the EC2 aggregator's public addresses");
+        Some(a)
+    } else {
+        None
+    };
     let config = Config {
         max_tiles: args.max_tiles,
         ec2_max: match args.ec2 {
@@ -831,6 +940,8 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             FleetEc2::Fake | FleetEc2::Aws => args.ec2_tiles.min(args.max_tiles),
         },
         ec2_aggregate_url: args.ec2_aggregate_url.clone(),
+        ec2_aggregate_ipv6: ec2_public.as_ref().and_then(|a| a.ipv6.clone()),
+        ec2_aggregate_ipv4: ec2_public.as_ref().and_then(|a| a.ipv4.clone()),
         race_interval_secs: args.race_every,
         restart_cooldown_secs: args.restart_cooldown,
         camera_seed: args.camera_seed,
@@ -933,12 +1044,6 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             capacity_retry: Duration::from_secs(10),
         })
     };
-    let secrets_region = || {
-        args.secrets_region
-            .clone()
-            .or_else(|| std::env::var("AWS_REGION").ok())
-            .context("reading a secret needs --secrets-region or AWS_REGION")
-    };
     let dns_token = match &args.dns_token_secret {
         Some(name) => Some(
             secrets::Secrets::new(&secrets_region()?)?
@@ -956,22 +1061,68 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             args.dns_zone_id.clone(),
         )
     };
-    if dns_token.is_some() && args.dns_nameservers.is_empty() {
-        tracing::warn!(
-            "--dns-nameservers is empty: launches' names are published without confirming them at the zone's authoritative servers"
-        );
-    }
-    let dns_writer = match &dns_token {
-        Some(t) => Some(cloudflare(t)?.with_confirm(Arc::new(dns::Authoritative {
-            servers: args.dns_nameservers.clone(),
-        }))),
-        None => None,
+    let names = match &args.dns_subzone {
+        Some(sub) => {
+            let parent = args.dns_zone.trim_end_matches('.').to_ascii_lowercase();
+            if !sub
+                .trim_end_matches('.')
+                .to_ascii_lowercase()
+                .ends_with(&format!(".{parent}"))
+            {
+                bail!("--dns-subzone {sub} is not below --dns-zone {parent}");
+            }
+            // The certificate's DNS-01 records for the subzone's wildcard live in the parent
+            // zone, at the name the parent's own challenge uses.
+            let cfg = Arc::new(authority::ZoneConfig::new(
+                sub,
+                &args.dns_subzone_ns,
+                Some(&format!("_acme-challenge.{parent}")),
+            )?);
+            let (tx, rx) = watch::channel(Arc::new(authority::Zone::default()));
+            let listen = args
+                .dns_listen
+                .context("--dns-subzone needs --dns-listen")?;
+            let bound = authority::Authority {
+                cfg: cfg.clone(),
+                zone: rx,
+            }
+            .serve(listen, args.dns_rate_limit)
+            .await?;
+            tracing::info!(zone = %cfg.apex, listen = %bound, "serving the launch names' subzone");
+            // Launch names written to the parent zone before the switch are referenced by
+            // nothing now.
+            if let Some(t) = &dns_token {
+                tokio::spawn(dns::sweep(cloudflare(t)?));
+            }
+            Some(Names::Subzone(cfg, tx))
+        }
+        None => match &dns_token {
+            Some(t) => {
+                if args.dns_nameservers.is_empty() {
+                    tracing::warn!(
+                        "--dns-nameservers is empty: launches' names are published without confirming them at the zone's authoritative servers"
+                    );
+                }
+                Some(Names::Cloudflare(cloudflare(t)?.with_confirm(Arc::new(
+                    dns::Authoritative {
+                        servers: args.dns_nameservers.clone(),
+                    },
+                ))))
+            }
+            None => None,
+        },
     };
     if let Some(secret) = &args.tls_secret {
         let token = dns_token
             .as_deref()
             .context("--tls-secret needs --dns-token-secret (DNS-01 challenges)")?;
         let mut renewal = cert::Renewal::new(secret.clone(), args.dns_zone.clone());
+        if let Some(sub) = &args.dns_subzone {
+            renewal.extra.push(format!(
+                "*.{}",
+                sub.trim_end_matches('.').to_ascii_lowercase()
+            ));
+        }
         if let Some(d) = &args.acme_directory {
             renewal.directory = d.clone();
         }
@@ -982,7 +1133,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         ));
     }
     let ec2_sweep = ec2.clone();
-    let (handle, _actor) = start(state, store_tx, ec2, ec2_local, power, dns_writer);
+    let (handle, _actor) = start(state, store_tx, ec2, ec2_local, power, names);
     if let Some(listen) = &args.ec2_aggregate_listen {
         let mut argv = vec![
             std::env::current_exe()
@@ -993,6 +1144,24 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             "aggregate".into(),
         ];
         argv.extend(args.aggregate_args.iter().cloned());
+        if let (Some(a), Some(secret)) = (&ec2_public, &args.tls_secret) {
+            // The certificate file, written before the aggregator starts and kept current.
+            use crate::fleet::agent::tls;
+            let dir = args.ec2_aggregate_tls_dir.clone();
+            let secrets = secrets::Secrets::new(&secrets_region()?)?;
+            tls::refresh(&secrets, secret, &dir).await?;
+            tokio::spawn(tls::run(secrets, secret.clone(), dir.clone()));
+            argv.extend([
+                "--tls-file".into(),
+                dir.join(tls::FILE).to_string_lossy().into_owned(),
+            ]);
+            if a.ipv4.is_some() {
+                argv.extend(["--tls-listen".into(), format!("0.0.0.0:{}", tls::PORT)]);
+            }
+            if let Some(v6) = &a.ipv6 {
+                argv.extend(["--tls-listen".into(), format!("[{v6}]:{}", tls::PORT)]);
+            }
+        }
         tokio::spawn(crate::fleet::aggregate::child::supervise(
             argv,
             listen.clone(),
@@ -1127,5 +1296,34 @@ mod power_tests {
             "9",
         ];
         assert!(Cli::try_parse_from(argv).is_err());
+    }
+}
+
+#[cfg(test)]
+mod zone_order_tests {
+    /// Every output `dispatch_agents` sends can name a launch (the EC2 aggregator's layout
+    /// carries the tiles' published URLs), and its reader may dial the name at once, so the
+    /// served zone is updated before the first of them: a lookup that ran ahead of the zone
+    /// would get an NXDOMAIN its resolver keeps for the negative TTL.
+    #[test]
+    fn the_zone_is_updated_before_any_output_that_can_name_a_launch() {
+        let src = include_str!("mod.rs");
+        let body = src
+            .split("    fn dispatch_agents(&mut self) {")
+            .nth(1)
+            .expect("dispatch_agents")
+            .split("\n    }\n")
+            .next()
+            .unwrap();
+        let zone = body
+            .find("self.update_zone();")
+            .expect("dispatch_agents updates the zone");
+        let first_send = body
+            .find(".send")
+            .expect("dispatch_agents sends its outputs");
+        assert!(
+            zone < first_send,
+            "dispatch_agents sends an output before it updates the zone"
+        );
     }
 }

@@ -196,7 +196,33 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             None
         }
         Event::Published { slot, names, .. } => {
+            let c = &state.config;
+            if slot == crate::state::EC2_AGGREGATE_ID {
+                if names.names(
+                    c.ec2_aggregate_ipv6.as_deref(),
+                    c.ec2_aggregate_ipv4.as_deref(),
+                    None,
+                ) {
+                    state.fleet.ec2_aggregate_published = Some(names.clone());
+                }
+                return None;
+            }
             let f = &mut state.fleet;
+            // A host aggregator's names, for the addresses it reports now.
+            if let Some(h) = f
+                .hosts
+                .values_mut()
+                .find(|h| crate::state::aggregate_id(&h.name).as_deref() == Some(slot.as_str()))
+            {
+                if names.names(
+                    h.aggregate_ipv6.as_deref(),
+                    h.aggregate_ipv4.as_deref(),
+                    h.aggregate_v4_port,
+                ) {
+                    h.aggregate_published = Some(names.clone());
+                }
+                return None;
+            }
             if let Some(s) = f
                 .slots
                 .values_mut()
@@ -299,9 +325,17 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                         at,
                     );
                 }
-                AgentMsg::Aggregate { frame_url } => {
+                AgentMsg::Aggregate {
+                    frame_url,
+                    ipv6,
+                    ipv4,
+                    v4_port,
+                } => {
                     if let Some(h) = state.fleet.hosts.get_mut(host) {
                         h.aggregate_url = Some(frame_url.clone());
+                        h.aggregate_ipv6 = ipv6.clone();
+                        h.aggregate_ipv4 = ipv4.clone();
+                        h.aggregate_v4_port = *v4_port;
                     }
                 }
                 AgentMsg::Scrub { ok, .. } => {
@@ -1026,6 +1060,10 @@ fn hello(f: &mut Fleet, host: &str, arch: &str, gpus: &[Gpu], capacity: usize, a
             joined_at: at,
             region: None,
             aggregate_url: None,
+            aggregate_ipv6: None,
+            aggregate_ipv4: None,
+            aggregate_v4_port: None,
+            aggregate_published: None,
         },
     );
     f.reclaimed.remove(host);

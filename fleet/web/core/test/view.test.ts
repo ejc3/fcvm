@@ -27,7 +27,7 @@ import { EPOCH, fleet, fleetSplit, snapshotText } from "./fixtures.ts";
 
 function stateWith(st: FleetState, version = 1): ClientState {
   let s = reduce(initialState(), { type: "socket", status: "open", at: EPOCH });
-  s = reduce(s, { type: "family", family: "v6", probeMs: 180 });
+  s = reduce(s, { type: "family", family: "v6", probeMs: 180, via: "race" });
   s = reduce(s, { type: "message", text: snapshotText(version, st), at: EPOCH });
   const tiles: FrameStats["tiles"] = {};
   for (const t of st.tiles) tiles[`d:${t.id}`] = { connected: true, fps: 24, newestT: 100, width: 320, height: 180, behind: false, decodeMs: 2 };
@@ -854,8 +854,8 @@ describe("one address family for every tile", () => {
   const hostOf = (u: string) => new URL(u).hostname;
   const withFamily = (st: FleetState, family: "v6" | "v4" | null) => {
     let s = stateWith(st);
-    if (family === null) s = { ...s, net: { family: null, probeMs: null } };
-    else s = { ...s, net: { family, probeMs: family === "v6" ? 180 : 1500 } };
+    if (family === null) s = { ...s, net: { family: null, probeMs: null, via: null } };
+    else s = { ...s, net: { family, probeMs: 180, via: "race" } };
     return reduce(s, { type: "ui", patch: { mode: "direct" } });
   };
 
@@ -889,33 +889,34 @@ describe("one address family for every tile", () => {
   });
 
   it("says in the stats drawer which family is in use", () => {
-    expect(familyLine({ family: null, probeMs: null })).toBe("Address family: checking IPv6");
-    expect(familyLine({ family: "v6", probeMs: 183.4 })).toBe("Address family: IPv6 for every tile (connected in 183 ms)");
-    expect(familyLine({ family: "v6", probeMs: null })).toBe("Address family: IPv6 for every tile (the tiles have no IPv4 address)");
-    expect(familyLine({ family: "v4", probeMs: 1500 })).toBe("Address family: IPv4 for every tile (IPv6 did not connect in 3 tries of 1.5 s)");
-    expect(familyLine({ family: "v4", probeMs: null })).toBe("Address family: IPv4 for every tile (the tiles have no IPv6 address)");
+    expect(familyLine({ family: null, probeMs: null, via: null })).toBe("Address family: checking");
+    expect(familyLine({ family: "v6", probeMs: 183.4, via: "race" })).toBe("Address family: IPv6 for every tile (connected first, in 183 ms)");
+    expect(familyLine({ family: "v4", probeMs: 431.2, via: "race" })).toBe("Address family: IPv4 for every tile (connected first, in 431 ms)");
+    expect(familyLine({ family: "v6", probeMs: null, via: "one-family" })).toBe("Address family: IPv6 for every tile (the tiles have no IPv4 address)");
+    expect(familyLine({ family: "v4", probeMs: null, via: "one-family" })).toBe("Address family: IPv4 for every tile (the tiles have no IPv6 address)");
+    expect(familyLine({ family: "v4", probeMs: null, via: "no-answer" })).toBe("Address family: IPv4 for every tile (neither family connected in 3 tries of 1.5 s)");
   });
 });
 
-describe("the IPv6 probe's targets", () => {
+describe("the family probe's targets", () => {
   const tile = (phase: string, v6: string | null, v4: string | null) => ({ phase, frame_url: v6, frame_url_v4: v4 });
 
-  it("tries up to three running tiles' IPv6 URLs, skipping tiles without one", () => {
+  it("tries up to three running tiles' URLs in each family, skipping tiles without one", () => {
     const tiles = [tile("running", "wss://a/frames", "wss://a4/frames"), tile("restoring", "wss://b/frames", null), tile("running", null, null), tile("running", "wss://c/frames", "wss://c4/frames"), tile("running", "wss://d/frames", null), tile("running", "wss://e/frames", null)];
-    expect(familyProbeTargets(tiles)).toEqual({ urls: ["wss://a/frames", "wss://c/frames", "wss://d/frames"], v4Only: false, v6Only: false });
+    expect(familyProbeTargets(tiles)).toEqual({ urls: ["wss://a/frames", "wss://c/frames", "wss://d/frames"], v4Urls: ["wss://a4/frames", "wss://c4/frames"], v4Only: false, v6Only: false });
   });
 
   it("waits while no tile has an address, and settles without a probe when only one family has URLs", () => {
-    expect(familyProbeTargets([tile("running", null, null)])).toEqual({ urls: [], v4Only: false, v6Only: false });
-    expect(familyProbeTargets([tile("running", null, "wss://a4/frames")])).toEqual({ urls: [], v4Only: true, v6Only: false });
+    expect(familyProbeTargets([tile("running", null, null)])).toEqual({ urls: [], v4Urls: [], v4Only: false, v6Only: false });
+    expect(familyProbeTargets([tile("running", null, "wss://a4/frames")])).toEqual({ urls: [], v4Urls: ["wss://a4/frames"], v4Only: true, v6Only: false });
     // A coordinator that publishes no IPv4 names (staging before #1229's DNS): IPv6 is the only family.
-    expect(familyProbeTargets([tile("running", "wss://a/frames", null), tile("running", "wss://b/frames", null)])).toEqual({ urls: ["wss://a/frames", "wss://b/frames"], v4Only: false, v6Only: true });
+    expect(familyProbeTargets([tile("running", "wss://a/frames", null), tile("running", "wss://b/frames", null)])).toEqual({ urls: ["wss://a/frames", "wss://b/frames"], v4Urls: [], v4Only: false, v6Only: true });
   });
 
   it("is chosen once per page load", () => {
     let s = initialState();
-    s = reduce(s, { type: "family", family: "v6", probeMs: 180 });
-    expect(reduce(s, { type: "family", family: "v4", probeMs: 1500 }).net).toEqual({ family: "v6", probeMs: 180 });
+    s = reduce(s, { type: "family", family: "v6", probeMs: 180, via: "race" });
+    expect(reduce(s, { type: "family", family: "v4", probeMs: null, via: "no-answer" }).net).toEqual({ family: "v6", probeMs: 180, via: "race" });
   });
 });
 
@@ -923,7 +924,7 @@ describe("the family choice covers every stream the page opens", () => {
   const agg = (v6: string | null, v4: string | null): Aggregate => ({ id: "agg:example-host", half: "fcvm", host: "example-host", rect: { x: 0, y: 0, w: 0.5, h: 1 }, frame_url: v6, frame_url_v4: v4, tiles: ["fcvm:1", "fcvm:2", "fcvm:3", "fcvm:4"] });
   const at = (aggregates: Aggregate[], family: "v6" | "v4") => {
     const s = stateWith(fleet(2, 2, { aggregates }));
-    return reduce({ ...s, net: { family, probeMs: family === "v6" ? 180 : 1500 } }, { type: "ui", patch: { mode: "aggregated" } });
+    return reduce({ ...s, net: { family, probeMs: 180, via: "race" } }, { type: "ui", patch: { mode: "aggregated" } });
   };
 
   it("keeps an IPv4 viewer direct when the aggregates serve only IPv6", () => {
@@ -955,7 +956,7 @@ describe("the family choice covers every stream the page opens", () => {
     const claimMsg = (v4: string | null) => ({ type: "claim", claim: { id: "claim-1", tile: "fcvm:4", phase: "running", frame_url: "ws://example-host:2/frames/claim-1", frame_url_v4: v4, clicked_at: EPOCH, first_frame_at: EPOCH + 2900, expires_at: EPOCH + 62_900, gpu: "Tesla T4", phases: {}, camera: [], ended: null } });
     const own = (family: "v6" | "v4", v4: string | null) => {
       let s = stateWith(fleet(2, 2));
-      s = { ...s, net: { family, probeMs: 180 } };
+      s = { ...s, net: { family, probeMs: 180, via: "race" } };
       s = reduce(s, { type: "intent-sent", intent: makeIntent("own", "claim_gpu"), at: EPOCH });
       s = msg(s, claimMsg(v4));
       return view(s, EPOCH, { ownArea: { x: 0, y: 0, w: 1600, h: 900 } }).plan.focus;

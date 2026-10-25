@@ -110,6 +110,16 @@ pub struct FleetAggregateArgs {
     /// Initial layout (JSON), instead of waiting for POST /layout
     #[arg(long)]
     pub layout: Option<std::path::PathBuf>,
+
+    /// Also serve /frames and /healthz with TLS on this address, for browsers (repeatable).
+    /// /layout and /stats are served on --listen only.
+    #[arg(long = "tls-listen", requires = "tls_file")]
+    pub tls_listen: Vec<String>,
+
+    /// The certificate of --tls-listen: a JSON object {"cert", "key"} (PEM), the file the
+    /// agent writes for its renderers; read again every 2 s
+    #[arg(long, requires = "tls_listen")]
+    pub tls_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -184,13 +194,26 @@ pub struct FleetCoordArgs {
     #[arg(long = "allowed-origin")]
     pub allowed_origins: Vec<String>,
 
-    /// Run the EC2 half's aggregator on this address
-    #[arg(long, requires = "ec2_aggregate_url")]
+    /// Run the EC2 half's aggregator on this address (its layout, stats and a stream for
+    /// the coordinator); browsers reach it at --ec2-aggregate-url, or with
+    /// --ec2-aggregate-tls at its published names
+    #[arg(long)]
     pub ec2_aggregate_listen: Option<String>,
 
     /// The EC2 half's aggregator frame WebSocket as browsers reach it
     #[arg(long, requires = "ec2_aggregate_listen")]
     pub ec2_aggregate_url: Option<String>,
+
+    /// Serve the EC2 half's aggregator to browsers with TLS (the --tls-secret certificate)
+    /// on port 443 of the coordinator task's own addresses, read on ECS (the task metadata
+    /// for IPv6, EC2 DescribeNetworkInterfaces for the public IPv4 address), and name them
+    /// `agg-ec2-<token>` (needs --dns-token-secret)
+    #[arg(long, requires_all = ["ec2_aggregate_listen", "tls_secret", "dns_token_secret"])]
+    pub ec2_aggregate_tls: bool,
+
+    /// Where the coordinator keeps the certificate file of --ec2-aggregate-tls
+    #[arg(long, default_value = "/run/fcvm-fleet/tls")]
+    pub ec2_aggregate_tls_dir: std::path::PathBuf,
 
     /// Extra argument for the EC2 half's aggregator. Repeatable.
     #[arg(long = "aggregate-arg", allow_hyphen_values = true)]
@@ -334,6 +357,27 @@ pub struct FleetCoordArgs {
     #[arg(long, value_delimiter = ',')]
     pub dns_nameservers: Vec<String>,
 
+    /// Serve the launch names from this subzone of --dns-zone as its authoritative DNS
+    /// server (`<label>.<subzone>`) instead of writing them through the Cloudflare API: a
+    /// name answers from the moment it is published. The parent zone delegates the subzone
+    /// with NS records and no DS record.
+    #[arg(long, requires_all = ["dns_subzone_ns", "dns_listen"])]
+    pub dns_subzone: Option<String>,
+
+    /// The subzone's nameserver names (comma separated), as the parent's NS records name them
+    #[arg(long, value_delimiter = ',')]
+    pub dns_subzone_ns: Vec<String>,
+
+    /// Where the subzone's DNS server listens, UDP and TCP (a high port: the load balancer
+    /// in front maps port 53 to it)
+    #[arg(long)]
+    pub dns_listen: Option<std::net::SocketAddr>,
+
+    /// UDP responses per second per source prefix (/24, /56); past it, every second one is
+    /// sent truncated and the rest are dropped
+    #[arg(long, default_value_t = 200)]
+    pub dns_rate_limit: u32,
+
     /// Keep the wildcard certificate in this secret renewed (30 days before expiry, ACME
     /// DNS-01 through the DNS token)
     #[arg(long, requires = "dns_token_secret")]
@@ -466,6 +510,14 @@ pub struct FleetAgentArgs {
     /// Extra argument for the aggregator (`fcvm fleet aggregate`). Repeatable.
     #[arg(long = "aggregate-arg", allow_hyphen_values = true)]
     pub aggregate_args: Vec<String>,
+
+    /// Serve the aggregator's stream to browsers with TLS (the --tls-secret certificate):
+    /// on this port of --publish-ip, reported with the host's public IPv4 address
+    /// (--public-ipv4-from-imds), and with an IPv6 prefix on port 443 of `<prefix>::1`,
+    /// which the agent adds to the host's default IPv6 interface. The coordinator names
+    /// both (`agg-<host>-<token>`).
+    #[arg(long, requires_all = ["aggregate_port", "tls_secret"])]
+    pub aggregate_tls_port: Option<u16>,
 
     /// A file the host's boot writes once its store is mounted; its modification time is
     /// reported in the hello (the wake's `store_ready` phase)

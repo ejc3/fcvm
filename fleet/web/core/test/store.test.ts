@@ -261,7 +261,7 @@ describe("a hidden tab", () => {
   });
 
   it("tells the frame drawer to close the streams while suspended, and to reopen them when shown", () => {
-    let s = reduce(feed(initialState(), snapshotText(1, fleet())), { type: "family", family: "v6", probeMs: 180 });
+    let s = reduce(feed(initialState(), snapshotText(1, fleet())), { type: "family", family: "v6", probeMs: 180, via: "race" });
     const plan = (x: ClientState) => wallView({ state: x, now: EPOCH, dpr: 1, mosaicArea: { x: 0, y: 0, w: 1600, h: 900 }, focusArea: null, canDecode: true, phone: false }).plan;
     expect(plan(s).suspended).toBe(false);
     s = reduce(s, { type: "ui", patch: { hiddenSince: EPOCH, suspended: true } });
