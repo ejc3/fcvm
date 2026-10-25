@@ -107,11 +107,29 @@ class PrScope(Harness):
         self.assertEqual(calls, [])
 
     def test_a_pr_with_another_stacked_on_it_runs_nothing(self):
-        fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100': [pr(13, 'feature-c', 'feature-b')]}
+        fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100': [pr(13, 'feature-c', 'feature-b', 'c' * 40)],
+                   f'repos/{REPO}/compare/{"b" * 40}...{"c" * 40}': {'status': 'ahead'}}
         outputs, _, _ = self.scope(fixture)
         self.assertEqual(outputs['run'], 'false')
         self.assertEqual(outputs['code'], 'false')
         self.assertIn('#13', outputs['reason'])
+
+    def test_a_child_that_does_not_contain_this_head_defers_nothing(self):
+        # A fix pushed here before the child was rebased: the child's runs do not
+        # test this commit, so this PR runs.
+        fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100': [pr(13, 'feature-c', 'feature-b', 'c' * 40)],
+                   f'repos/{REPO}/compare/{"b" * 40}...{"c" * 40}': {'status': 'diverged'},
+                   f'repos/{REPO}/pulls/12/files': files('src/lib.rs')}
+        outputs, _, _ = self.scope(fixture)
+        self.assertEqual(outputs['run'], 'true')
+        self.assertEqual(outputs['code'], 'true')
+
+    def test_a_failed_ancestry_lookup_defers_nothing(self):
+        fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100': [pr(13, 'feature-c', 'feature-b', 'c' * 40)],
+                   f'repos/{REPO}/compare/{"b" * 40}...{"c" * 40}': 'FAIL',
+                   f'repos/{REPO}/pulls/12/files': files('src/lib.rs')}
+        outputs, _, _ = self.scope(fixture)
+        self.assertEqual(outputs['run'], 'true')
 
     def test_a_fork_pr_on_this_branch_does_not_defer_it(self):
         fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100':

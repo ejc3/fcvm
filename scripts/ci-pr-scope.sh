@@ -55,15 +55,26 @@ if [ "$DRAFT" = "true" ]; then
   exit 0
 fi
 
-# Open PRs from this repository based on this PR's branch. A query that fails
-# counts as none, so this PR runs.
+# Open PRs from this repository based on this PR's branch whose head contains this
+# PR's head: their runs test this commit. A child that does not contain it yet (a fix
+# pushed here before the child was rebased) defers nothing, or the commit would go
+# untested. A failed lookup counts as no child, so this PR runs.
 if [ "$stackable" = false ]; then
   echo "head branch is in $HEAD_REPO, not $REPO: not part of a stack here"
 elif children=$("$GH" api --paginate "repos/$REPO/pulls?state=open&base=$HEAD_REF&per_page=100" \
-    --jq ".[] | select(.head.repo.full_name == \"$REPO\") | .number"); then
-  children=$(echo "$children" | grep -E '^[0-9]+$' | sort -n | tr '\n' ' ' | sed 's/ $//' || true)
-  if [ -n "$children" ]; then
-    emit false "stacked under #${children// /, #}: CI runs on the top of the stack" false false false false
+    --jq ".[] | select(.head.repo.full_name == \"$REPO\") | \"\(.number) \(.head.sha)\""); then
+  covering=""
+  while read -r number sha; do
+    [[ "$number" =~ ^[0-9]+$ && "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
+    status=$("$GH" api "repos/$REPO/compare/$HEAD_SHA...$sha" --jq '.status' 2>/dev/null) || status=""
+    if [ "$status" = "ahead" ] || [ "$status" = "identical" ]; then
+      covering="$covering${covering:+ }$number"
+    else
+      echo "#$number is stacked here but its head does not contain ${HEAD_SHA:0:12} (${status:-lookup failed})"
+    fi
+  done <<< "$children"
+  if [ -n "$covering" ]; then
+    emit false "stacked under #${covering// /, #}: CI runs on the top of the stack" false false false false
     exit 0
   fi
 else
