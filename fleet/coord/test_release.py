@@ -6,6 +6,7 @@ import copy
 import json
 import os
 import socket
+import struct
 import base64
 import hashlib
 import unittest
@@ -171,11 +172,95 @@ class ProbeTests(unittest.TestCase):
         env = {"STAGING_API_URL": "https://api.example.test", "STAGING_ORIGIN": "https://stage.example.test",
                "CF_ACCESS_CLIENT_ID": "synthetic-id", "CF_ACCESS_CLIENT_SECRET": "synthetic-secret"}
         with patch.dict(os.environ, env), patch.object(smoke, "Socket", Viewer), patch.object(smoke, "get", get), \
-                patch.object(smoke, "prove_frame"), patch.object(smoke.time, "monotonic", lambda: clock[0]), \
+                patch.object(smoke, "prove_frame"), patch.object(smoke, "prove_resolves", return_value=0.05), \
+                patch.object(smoke.time, "monotonic", lambda: clock[0]), \
                 patch.object(smoke.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay)):
             smoke.main()
         self.assertEqual(len(sent), 2)
         self.assertGreaterEqual(sent[1] - sent[0], 2.0)
+
+
+class ResolveTests(unittest.TestCase):
+    """The public-resolver check against a resolver on loopback that answers as it is told."""
+
+    def resolver(self, answer):
+        import threading
+        server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        server.bind(("127.0.0.1", 0))
+        self.addCleanup(server.close)
+        def serve():
+            try:
+                query, peer = server.recvfrom(4096)
+            except OSError:
+                return
+            for reply in answer(query):
+                server.sendto(reply, peer)
+        threading.Thread(target=serve, daemon=True).start()
+        return server.getsockname()[1]
+
+    @staticmethod
+    def reply(query, rcode=0, tc=False, records=()):
+        """The reply to query: its question, then (type, rdata) answers owned by a pointer to it."""
+        question = query[12:len(query) - 11]
+        flags = 0x8180 | rcode | (0x0200 if tc else 0)
+        out = query[:2] + struct.pack(">HHHHH", flags, 1, len(records), 0, 0) + question
+        for kind, rdata in records:
+            out += b"\xc0\x0c" + struct.pack(">HHIH", kind, 1, 60, len(rdata)) + rdata
+        return out
+
+    def ask(self, answer, qtype=28):
+        port = self.resolver(answer)
+        with patch.object(smoke, "DNS_PORT", port):
+            return smoke.resolve("127.0.0.1", "slot-1-abcdefgh.tiles.fcvm.dev", qtype, 0.5)
+
+    def test_an_answer_is_read(self):
+        v6 = socket.inet_pton(socket.AF_INET6, "2001:db8::1")
+        got = self.ask(lambda q: [self.reply(q, records=[(5, b"\x00"), (28, v6)])])
+        self.assertEqual([str(a) for a in got], ["2001:db8::1"])
+
+    def test_a_reply_to_another_query_is_ignored(self):
+        v4 = socket.inet_aton("192.0.2.1")
+        got = self.ask(lambda q: [b"\x00\x00" + self.reply(q)[2:], self.reply(q, records=[(1, v4)])], qtype=1)
+        self.assertEqual([str(a) for a in got], ["192.0.2.1"])
+
+    def test_nxdomain_servfail_and_truncation_fail(self):
+        for answer in (lambda q: [self.reply(q, rcode=3)], lambda q: [self.reply(q, rcode=2)],
+                       lambda q: [self.reply(q, tc=True)]):
+            with self.subTest(), self.assertRaises(AssertionError):
+                self.ask(answer)
+
+    def test_no_answer_in_time_fails(self):
+        with self.assertRaises(TimeoutError):
+            self.ask(lambda q: [])
+
+    def test_a_cut_reply_or_a_bad_label_raises(self):
+        _, q = smoke.dns_query("x.fcvm.dev", 1)
+        cut = self.reply(q, records=[(1, b"\x01\x02\x03\x04")])[:-2]
+        with self.assertRaises(ValueError):
+            smoke.addresses(cut, q[:2], q, 1)
+        bad = self.reply(q)[:6] + b"\x00\x01" + self.reply(q)[8:] + b"\x40" + b"a" * 64
+        with self.assertRaises(ValueError):
+            smoke.addresses(bad, q[:2], q, 1)
+
+    def test_a_fresh_name_must_answer_everywhere_within_the_bound(self):
+        tile = {"frame_url": "wss://slot-1-abcdefgh.tiles.fcvm.dev/frames",
+                "frame_url_v4": "wss://slot-1-abcdefgh-v4.tiles.fcvm.dev:20200/frames"}
+        asked = []
+        def resolve(resolver, name, qtype, timeout):
+            asked.append((resolver, name, qtype))
+            return [] if resolver == "9.9.9.9" and qtype == 1 else ["x"]
+        with patch.object(smoke, "resolve", resolve), self.assertRaises(AssertionError):
+            smoke.prove_resolves(tile)
+        self.assertEqual(len(asked), 6)
+        clock = [0.0]
+        def slow(resolver, name, qtype, timeout):
+            clock[0] += 2.5
+            return ["x"]
+        with patch.object(smoke, "resolve", slow), patch.object(smoke.time, "monotonic", lambda: clock[0]), \
+                self.assertRaises(AssertionError):
+            smoke.prove_resolves(tile)
+        with patch.object(smoke, "resolve", lambda *a: ["x"]):
+            self.assertLess(smoke.prove_resolves(tile), 2.0)
 
 
 class PublishTests(unittest.TestCase):

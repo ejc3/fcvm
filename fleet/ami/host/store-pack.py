@@ -89,7 +89,7 @@ def main():
             f.write(b"".join(n.encode() + b"\0" for n in names))
         out = open(os.path.join(a.outdir, f"{name}.tar.zst"), "wb")
         tar = subprocess.Popen(
-            ["tar", "-c", "--sparse", "--numeric-owner", "--no-recursion", "--null",
+            ["tar", "-c", "--sparse", "--numeric-owner", "--format=posix", "--no-recursion", "--null",
              "-C", root, "-T", lst],
             stdout=subprocess.PIPE)
         zst = subprocess.Popen(["zstd", "-q", "-6", "-T0", "-c"], stdin=tar.stdout, stdout=out)

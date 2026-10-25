@@ -123,7 +123,11 @@ bake)
   # per-VM and per-run state, build caches and downloads that only setup reads.
   cd /mnt/fcvm-btrfs
   du -sh --apparent-size ./* 2>/dev/null | sort -h | tee "$S/store-du.txt"
-  # STORE_PARTS parts, extracted at once at boot (store.sh).
+  # STORE_PARTS parts, extracted at once at boot (store.sh). store-pack.py writes them with
+  # --format=posix, which keeps modification times to the nanosecond. fcvm keys the snapshot
+  # cache by each driver and overlay image's SHA-256 and caches that digest in
+  # version-cache/ under the image's path, mtime and length, so with whole-second mtimes a
+  # host would hash the images again on its first GPU VM (#1219).
   rm -rf /var/lib/fcvm-fleet/store
   python3 "$HERE/store-pack.py" /mnt/fcvm-btrfs /var/lib/fcvm-fleet/store "${STORE_PARTS:-16}" \
       --exclude=./vm-disks --exclude=./state --exclude=./cache --exclude='./cargo-target*' \
