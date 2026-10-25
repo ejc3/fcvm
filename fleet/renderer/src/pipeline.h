@@ -23,6 +23,7 @@
 // how long one GET /still keeps the renderer drawing every slot at its height
 #define STILL_HOLD_S 30
 #include "nvenc.h"
+#include "proto.h"
 #include "render.h"
 #include "scene.h"
 #include "subscriber.h"
@@ -181,6 +182,8 @@ class Pipeline {
   uint64_t slots_missed_ = 0;  // frame slots skipped while someone was subscribed
   double startup_ready_ms_ = -1, first_frame_ms_ = -1, first_sent_ms_ = -1;
   std::string gpu_name_;
+  // Random per process, set once before any thread starts: /health's boot_id.
+  const std::string boot_id_ = new_boot_id();
   // fatal_, gpu_name_ and the startup_ms fields are written by the render
   // thread and read by health_json and fatal() on server threads: all under hmu_
 };

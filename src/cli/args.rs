@@ -313,6 +313,18 @@ pub struct FleetCoordArgs {
     /// An on-demand tile launch template, tried when every region refuses spot capacity
     #[arg(long)]
     pub ec2_on_demand_template: Option<String>,
+
+    /// The subnets (one per AZ) to launch EC2 tiles in, per region, tried in order before
+    /// the next region: `<region>:<subnet>[,<subnet>...]`, repeatable (FLEET_EC2_SUBNETS:
+    /// entries separated by spaces). A region without any launches in the template's subnet.
+    #[arg(long, env = "FLEET_EC2_SUBNETS", value_delimiter = ' ')]
+    pub ec2_subnets: Vec<String>,
+
+    /// The security group of a tile's interface in each region with --ec2-subnets:
+    /// `<region>:<group id>`, repeatable (FLEET_EC2_SECURITY_GROUPS: entries separated by
+    /// spaces)
+    #[arg(long, env = "FLEET_EC2_SECURITY_GROUPS", value_delimiter = ' ')]
+    pub ec2_security_group: Vec<String>,
     /// This fleet's name, tagged on its EC2 tiles at launch (`Fleet=<name>`). At start and
     /// shutdown the coordinator terminates the tiles tagged with it, so two fleets in one
     /// account (staging and production) need different names.
@@ -334,6 +346,27 @@ pub struct FleetCoordArgs {
     /// published to viewers only once every one of them answers with the new records.
     #[arg(long, value_delimiter = ',')]
     pub dns_nameservers: Vec<String>,
+
+    /// Serve the launch names from this subzone of --dns-zone as its authoritative DNS
+    /// server (`<label>.<subzone>`) instead of writing them through the Cloudflare API: a
+    /// name answers from the moment it is published. The parent zone delegates the subzone
+    /// with NS records and no DS record.
+    #[arg(long, requires_all = ["dns_subzone_ns", "dns_listen"])]
+    pub dns_subzone: Option<String>,
+
+    /// The subzone's nameserver names (comma separated), as the parent's NS records name them
+    #[arg(long, value_delimiter = ',')]
+    pub dns_subzone_ns: Vec<String>,
+
+    /// Where the subzone's DNS server listens, UDP and TCP (a high port: the load balancer
+    /// in front maps port 53 to it)
+    #[arg(long)]
+    pub dns_listen: Option<std::net::SocketAddr>,
+
+    /// UDP responses per second per source prefix (/24, /56); past it, every second one is
+    /// sent truncated and the rest are dropped
+    #[arg(long, default_value_t = 200)]
+    pub dns_rate_limit: u32,
 
     /// Keep the wildcard certificate in this secret renewed (30 days before expiry, ACME
     /// DNS-01 through the DNS token)

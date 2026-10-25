@@ -41,9 +41,5 @@
     "wrangler": "4.148.0",
     "ws": "8.22.0"
   },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "sharp"
-    ]
-  }
+  "packageManager": "pnpm@12.15.0"
 }

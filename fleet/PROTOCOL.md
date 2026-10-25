@@ -423,8 +423,11 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--on-demand-group <region>:<group name>]... [--spot-wait 120]
                  [--state-bucket <bucket> [--state-key state.json] [--state-region <region>]]
                  [--ec2 aws --ec2-tiles 8 --ec2-regions <r1,r2,...> [--ec2-template fcvm-fleet-tile-x86_64]
-                  [--ec2-on-demand-template <name>] [--fleet-name stage]] [--dns-zone fcvm.dev]
+                  [--ec2-on-demand-template <name>] [--fleet-name stage]
+                  [--ec2-subnets <region>:<subnet>,... --ec2-security-group <region>:<group>]...]
+                 [--dns-zone fcvm.dev]
                  [--dns-token-secret <secret> [--dns-zone-id <id>] [--dns-nameservers <ns>,...]]
+                 [--dns-subzone <subzone> --dns-subzone-ns <ns>,... --dns-listen <addr:port> [--dns-rate-limit 200]]
                  [--tls-secret <secret>] [--secrets-region <region>]
 ```
 
@@ -437,7 +440,13 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   instance from the tile launch template (one-time spot), tagged `Purpose=fcvm-fleet-tile`,
   `FleetTile=<tile>` and `Fleet=<--fleet-name>` (`FLEET_NAME`, default `stage`) at launch,
   in the first of `--ec2-regions` (`FLEET_REGIONS`) with
-  capacity; when every region refuses for capacity it tries `--ec2-on-demand-template`,
+  capacity. In a region given `--ec2-subnets` (`FLEET_EC2_SUBNETS`, entries separated by
+  spaces; one subnet per AZ) a launch tries each subnet in order before the next region,
+  naming the interface itself: that subnet, the region's `--ec2-security-group`
+  (`FLEET_EC2_SECURITY_GROUPS`), a public IPv4 address and one IPv6 address. A refusal for
+  capacity, or `Unsupported` (the AZ does not offer the type), moves to the next subnet. A
+  region without subnets launches in the template's. When every region refuses for capacity
+  it tries `--ec2-on-demand-template` the same way,
   and without one the tile waits for capacity (recorded on its own) and asks again every
   10 s. A tile is ready once its instance runs and its renderer answers
   `https://ec2-<n>.<zone>/health` (the name resolved to the instance) with `ready` true; a
@@ -447,7 +456,11 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   terminated and is launched again after a backoff (1 s doubling to 30 s), and so does a
   running tile whose instance is found shutting down, stopped or terminated (a spot
   reclaim), whose renderer's `/health` carries an `error`, or whose renderer leaves
-  `/health` unanswered three checks in a row (checked every 15 s). The coordinator
+  `/health` unanswered three checks in a row (checked every 15 s). A renderer that
+  restarts on its instance (`fcvm-fleet-renderer.service` restarts it) answers with a new
+  `boot_id`: the coordinator reads each tile's `/health` once a second (and once before the
+  first scene post on an instance) and posts the scene and the budget again when the
+  `boot_id` differs from the last one read. The coordinator
   keeps no instance ids across a restart, so before its first launch, and again when it
   stops, it terminates every instance tagged `Purpose=fcvm-fleet-tile` and
   `Fleet=<--fleet-name>` in `--ec2-regions`; another fleet's tiles in the same account (a
@@ -468,6 +481,20 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   name of lowercase letters, digits and inner hyphens, at most 40 characters): AAAA its own
   IPv6 address, A the host's IPv4 address, with its port in `frame_url_v4`. Its names last
   while it reports the same addresses.
+- `--dns-subzone` makes the coordinator the authoritative DNS server of a subzone of
+  `--dns-zone` (the parent delegates it with NS records naming `--dns-subzone-ns`, and no DS
+  record) and names launches there instead: `<label>.<subzone>` AAAA and
+  `<label>-v4.<subzone>` A, TTL 60. Minting a launch's label and publishing its names are
+  one step of the coordinator's state, and the server answers from that state, so a name
+  answers from the moment a viewer can learn it, with no wait. It listens on
+  `--dns-listen`, UDP and TCP (a high port; a load balancer maps 53), and answers only for
+  the subzone: SOA (negative TTL 5 s), NS, the published names, and
+  `_acme-challenge.<subzone>` as a CNAME to `_acme-challenge.<zone>`; NXDOMAIN or NODATA
+  with the SOA; REFUSED for any other name; AA set, no recursion, EDNS(0), TC over UDP when
+  the client's buffer is too small. Over UDP, past `--dns-rate-limit` responses a second
+  per source /24 or /56, every second response goes out truncated and the rest are
+  dropped. With `--dns-token-secret` it deletes, once at start, the launch names earlier
+  written to the parent zone.
 - `--tls-secret` keeps the wildcard certificate renewed (see "Certificate").
 - `--ec2-aggregate-tls` (with `--ec2-aggregate-listen`, `--tls-secret` and
   `--dns-token-secret`) serves the EC2 half's aggregator to browsers with TLS on port 443
@@ -484,14 +511,16 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
 
 ### Certificate
 
-The wildcard certificate (`*.<zone>` and `<zone>`) lives in one Secrets Manager secret,
+The wildcard certificate (`*.<zone>`, `<zone>` and, with `--dns-subzone`, `*.<subzone>`)
+lives in one Secrets Manager secret,
 a JSON object: `cert` (PEM full chain), `key` (PEM private key), `domains`, `not_after` and
 `issued_at` (RFC 3339 UTC) and `issuer` (fleet/tools/issue-cert.sh writes the first one).
 Twice a day the coordinator reads it; within 30 days of `not_after` (or when it is missing
-or does not cover the zone) it orders a new certificate from Let's Encrypt
-(`--acme-directory` for another CA), answers DNS-01 with `_acme-challenge` TXT records
-through the DNS token, waits until public DNS shows them, stores the new version and
-removes the records. Its key is PKCS#8 (`PRIVATE KEY`), where issue-cert.sh wrote SEC 1;
+or does not cover every one of those names) it orders a new certificate from Let's Encrypt
+(`--acme-directory` for another CA), answers DNS-01 with TXT records at
+`_acme-challenge.<zone>` through the DNS token (the subzone's challenge name is a CNAME to
+it), waits until public DNS shows them, stores the new version and removes the records. A
+renewal that fails is tried again 15 minutes later. Its key is PKCS#8 (`PRIVATE KEY`), where issue-cert.sh wrote SEC 1;
 both are PEM that nginx and rustls read. Renderers get it from their agent
 (`--tls-secret`), tiles from their own instance role.
 
@@ -565,8 +594,9 @@ with the instance role). The VMs keep running while the connection is down; the 
 reconnects (1 s doubling to 30 s) and starts each new connection with its hello and the
 latest of every state message (each slot's report, the aggregator, a draining notice,
 quarantines), so a coordinator that lost the host learns where each slot is without a
-restart. A reported generation above the coordinator's is adopted, so the next relaunch
-goes past it. The coordinator serves `/agent` on its `/live` listener; Cloudflare Access
+restart. A slot's report is replayed while the slot is assigned; a quarantine until the
+coordinator answers it with `quarantine_stored` (below). A reported generation above the
+coordinator's is adopted, so the next relaunch goes past it. The coordinator serves `/agent` on its `/live` listener; Cloudflare Access
 admits only the agents' service token there.
 
 When its input closes (`--stdio`), the agent tears down every VM it started and exits. If the agent
@@ -647,13 +677,18 @@ until the host stops.
 A GPU scrub finished (with `--scrub`: `<fcvm> gpu scrub <sbdf>`, exit status 0 is ok).
 
 ```json
-{"type": "quarantine", "slot": "slot-5", "sbdf": "0000:05:00.0", "error": "..."}
+{"type": "quarantine", "slot": "slot-5", "sbdf": "0000:05:00.0", "error": "...", "report": "<32 hex>"}
 ```
 
 The agent took a GPU out of rotation and runs nothing on it again: its scrub failed, a
 relaunch failed with an error naming the GPU's address, or three relaunches in a row
 failed before fcvm's `restored` record (the GPU reset and attach) or while the GPU was
 still held. Failures after the restore (the container or the renderer) do not count.
+`report` names this report (random per quarantine). The agent sends it again at the start
+of every connection until the coordinator answers with `quarantine_stored` for that report.
+A replay of a report whose quarantine an operator released (the coordinator keeps the last
+released report per GPU in its state) is acknowledged and changes nothing; a new report for
+the same GPU quarantines it again.
 
 ### Coordinator to agent
 
@@ -678,6 +713,9 @@ none is placed). For each slot the agent reconciles:
   once.
 - `rect` changed, generation not: post the new scene to the running renderer, no
   relaunch. `rect: null` (the host drains): keep the VM, post nothing.
+- the renderer's `/health` names a different `boot_id` than the last read (the renderer
+  restarted inside its VM and lost its scene): post the scene and the budget again, no
+  relaunch.
 - `standby: true` (the standby pool): stop any VM, wait until the GPU is free, scrub it
   with `--scrub`, report `standby`, and run nothing until the slot is placed again.
 - `warm: true` (with `rect: null`): the GPU is joining. Run its VM as for a placed slot and
@@ -750,6 +788,21 @@ avoid the renderer's default; it is kept because it costs one small request per 
 change and keeps a renderer that missed the original post on the grid's budget. A renderer
 drawing the whole image for a claim gets no budget (it chooses its own). The coordinator posts the same
 body to each EC2 tile's renderer.
+
+```json
+{"type": "quarantine_stored", "sbdf": "0000:05:00.0", "report": "<32 hex>"}
+```
+
+A stored state holds the agent's `quarantine` report `report` for this GPU: the coordinator's
+state write (`--state-file` or `--state-bucket`) that came after the report succeeded.
+Without it a coordinator that stopped before its next write would come back with no record
+of the quarantine and assign the GPU again, so the agent keeps the report in its replay
+until this arrives for that report (a newer report for the same GPU stays). The
+coordinator sends it on the store tick (1 s) after the write, to the
+host's connection at the time; a host that reconnected first replays the report and is
+answered on the new connection. With no store configured it is sent on the next tick. A
+release by the operator before the write still gets it: the stored state then holds the
+release, and the report must no longer be replayed.
 
 ### Grid budget
 
@@ -1234,7 +1287,7 @@ pixel in both, drawn identically.
 ```json
 {"fps":30.0,"heights":[240],"streams":[{"h":240,"q":"std"}],
  "gpu":{"name":"Tesla T4","temp_c":38,"power_w":64.2,"util_pct":70,"mem_used_mb":648.3},
- "t":1234.5,"frame":5678,
+ "t":1234.5,"frame":5678,"boot_id":"9f0c2a6e41d84b7c8e2f5a1b3c4d6e7f",
  "ready":true,"render_ms":13.0,"encode_ms":0.5,"spp":3,"checkerboard":1,"hold":false,"hold_samples":0,"slots_missed":0,
  "startup_ms":{"gpu_ready":1515,"first_frame_drawn":1845,"first_frame_sent":1899}}
 ```
@@ -1248,6 +1301,9 @@ encoded), `spp` (samples per pixel drawn in it), `checkerboard` (see below),
 subscriber was connected, since start), and `startup_ms`, milliseconds from the
 process start (read from `/proc/self/stat`) to CUDA being ready, the first
 frame drawn and the first frame sent to a subscriber (`-1` until it happens).
+`boot_id` is 32 hex digits drawn at random when the process starts: a client
+that reads a different one than before is talking to a restarted renderer,
+which has no scene and no budget until they are posted again.
 `layout_generation` is the layout in force (null without one), and
 `layout_pending` (`{"generation", "from_frame"}`, present only while one is
 waiting) the next.
