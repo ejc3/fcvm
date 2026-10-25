@@ -246,6 +246,8 @@ impl Actor {
 
     /// Send each agent its assignment and the scene when they differ from what it last got.
     fn dispatch_agents(&mut self) {
+        // First: every output below can name a launch, and its reader may look it up at once.
+        self.update_zone();
         let assignments = host_assignments(&self.state);
         let regions = host_regions(&self.state);
         let scene = shared_scene(&self.state);
@@ -313,7 +315,6 @@ impl Actor {
             *cur = power.clone();
             changed
         });
-        self.update_zone();
         if let Some(tx) = &self.out.dns {
             let facts = dns::facts(&self.state);
             tx.send_if_modified(|cur| {
@@ -1128,5 +1129,34 @@ mod power_tests {
             "--scale-group",
             "us-east-1:fcvm-fleet-hosts"
         ])));
+    }
+}
+
+#[cfg(test)]
+mod zone_order_tests {
+    /// Every output `dispatch_agents` sends can name a launch (the EC2 aggregator's layout
+    /// carries the tiles' published URLs), and its reader may dial the name at once, so the
+    /// served zone is updated before the first of them: a lookup that ran ahead of the zone
+    /// would get an NXDOMAIN its resolver keeps for the negative TTL.
+    #[test]
+    fn the_zone_is_updated_before_any_output_that_can_name_a_launch() {
+        let src = include_str!("mod.rs");
+        let body = src
+            .split("    fn dispatch_agents(&mut self) {")
+            .nth(1)
+            .expect("dispatch_agents")
+            .split("\n    }\n")
+            .next()
+            .unwrap();
+        let zone = body
+            .find("self.update_zone();")
+            .expect("dispatch_agents updates the zone");
+        let first_send = body
+            .find(".send")
+            .expect("dispatch_agents sends its outputs");
+        assert!(
+            zone < first_send,
+            "dispatch_agents sends an output before it updates the zone"
+        );
     }
 }
