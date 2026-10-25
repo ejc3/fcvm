@@ -813,6 +813,8 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
                 args.dns_zone.clone(),
             )?;
             d.fleet = args.fleet_name.clone();
+            d.pool_max = args.ec2_pool;
+            d.pool_template = args.ec2_pool_template.clone();
             Some(Arc::new(d))
         }
     };

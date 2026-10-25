@@ -288,6 +288,16 @@ pub struct FleetCoordArgs {
     /// An on-demand tile launch template, tried when every region refuses spot capacity
     #[arg(long)]
     pub ec2_on_demand_template: Option<String>,
+
+    /// Keep up to this many EC2 tile instances stopped when the fleet sleeps, and start
+    /// them at the next wake instead of launching (needs --ec2-pool-template)
+    #[arg(long, default_value_t = 0, requires = "ec2_pool_template")]
+    pub ec2_pool: usize,
+
+    /// The tile launch template cold launches use while --ec2-pool is above 0: one whose
+    /// instances can be stopped (persistent spot that stops on interruption, or on demand)
+    #[arg(long)]
+    pub ec2_pool_template: Option<String>,
     /// This fleet's name, tagged on its EC2 tiles at launch (`Fleet=<name>`). At start and
     /// shutdown the coordinator terminates the tiles tagged with it, so two fleets in one
     /// account (staging and production) need different names.

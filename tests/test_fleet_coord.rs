@@ -3333,3 +3333,404 @@ async fn the_slowest_tile_sets_one_budget_for_every_tile() {
     }
     assert_eq!(driver.posted.lock().unwrap()[0], got);
 }
+
+/// One instance of [`PoolEc2`]: state, tags, image, spot request.
+type PoolInstance = (String, BTreeMap<String, String>, String, Option<String>);
+
+/// A stateful EC2 for the tile pool: instances with states, tags, images and spot requests.
+#[derive(Default)]
+struct PoolEc2 {
+    instances: BTreeMap<String, PoolInstance>,
+    next: u32,
+    /// The pool template's current image.
+    image: String,
+    cancelled: Vec<String>,
+    /// Instances terminated while their spot request was not cancelled.
+    uncancelled_terminates: Vec<String>,
+    /// Instances whose StartInstances fails (a spot request not yet disabled).
+    start_fails: Vec<String>,
+    actions: Vec<String>,
+}
+
+async fn pool_ec2_api(api: Arc<std::sync::Mutex<PoolEc2>>) -> String {
+    use axum::http::StatusCode;
+    let app = axum::Router::new().fallback(move |body: String| {
+        let api = api.clone();
+        async move {
+            let p: BTreeMap<String, String> = body
+                .split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .map(|(k, v)| {
+                    let v = v.replace("%24", "$").replace("%3A", ":").replace("%2F", "/");
+                    (k.replace("%2E", "."), v)
+                })
+                .collect();
+            let mut a = api.lock().unwrap();
+            let action = p["Action"].clone();
+            a.actions.push(action.clone());
+            let ids = |p: &BTreeMap<String, String>, key: &str| -> Vec<String> {
+                (1..)
+                    .map_while(|i| p.get(&format!("{key}.{i}")).cloned())
+                    .collect()
+            };
+            let item = |id: &str, (st, tags, img, sir): &PoolInstance| {
+                let tags: String = tags
+                    .iter()
+                    .map(|(k, v)| format!("<item><key>{k}</key><value>{v}</value></item>"))
+                    .collect();
+                let sir = sir.as_ref().map(|r| format!("<spotInstanceRequestId>{r}</spotInstanceRequestId>")).unwrap_or_default();
+                format!("<item><instancesSet><item><instanceId>{id}</instanceId><imageId>{img}</imageId><instanceState><name>{st}</name></instanceState><ipAddress>127.0.0.1</ipAddress>{sir}<tagSet>{tags}</tagSet></item></instancesSet></item>")
+            };
+            let ok = |s: String| (StatusCode::OK, s);
+            match action.as_str() {
+                "RunInstances" => {
+                    a.next += 1;
+                    let id = format!("i-pool{:012}", a.next);
+                    let mut tags = BTreeMap::new();
+                    for i in 1.. {
+                        let Some(k) = p.get(&format!("TagSpecification.1.Tag.{i}.Key")) else { break };
+                        tags.insert(k.clone(), p[&format!("TagSpecification.1.Tag.{i}.Value")].clone());
+                    }
+                    let sir = (p["LaunchTemplate.LaunchTemplateName"] == "tile-pool").then(|| format!("sir-{}", a.next));
+                    let img = a.image.clone();
+                    a.instances.insert(id.clone(), ("running".into(), tags, img, sir));
+                    ok(format!("<RunInstancesResponse><instancesSet><item><instanceId>{id}</instanceId></item></instancesSet></RunInstancesResponse>"))
+                }
+                "DescribeInstances" => {
+                    let wanted = ids(&p, "InstanceId");
+                    let states = ids(&p, "Filter.2.Value");
+                    let fleet = p.get("Filter.3.Value.1").cloned();
+                    let items: String = a
+                        .instances
+                        .iter()
+                        .filter(|(id, (st, tags, _, _))| {
+                            if !wanted.is_empty() {
+                                return wanted.contains(id);
+                            }
+                            states.contains(st)
+                                && tags.get("Purpose").map(String::as_str) == Some("fcvm-fleet-tile")
+                                && tags.get("Fleet") == fleet.as_ref()
+                        })
+                        .map(|(id, i)| item(id, i))
+                        .collect();
+                    ok(format!("<DescribeInstancesResponse><reservationSet>{items}</reservationSet></DescribeInstancesResponse>"))
+                }
+                "DescribeLaunchTemplateVersions" => ok(format!(
+                    "<DescribeLaunchTemplateVersionsResponse><launchTemplateVersionSet><item><launchTemplateData><imageId>{}</imageId></launchTemplateData></item></launchTemplateVersionSet></DescribeLaunchTemplateVersionsResponse>",
+                    a.image
+                )),
+                "StartInstances" => {
+                    let id = p["InstanceId.1"].clone();
+                    if a.start_fails.contains(&id) {
+                        return (StatusCode::BAD_REQUEST, "<Response><Errors><Error><Code>IncorrectSpotRequestState</Code><Message>not yet</Message></Error></Errors></Response>".into());
+                    }
+                    a.instances.get_mut(&id).unwrap().0 = "running".into();
+                    ok("<StartInstancesResponse/>".into())
+                }
+                "StopInstances" => {
+                    let id = p["InstanceId.1"].clone();
+                    a.instances.get_mut(&id).unwrap().0 = "stopped".into();
+                    ok("<StopInstancesResponse/>".into())
+                }
+                "CreateTags" => {
+                    let id = p["ResourceId.1"].clone();
+                    let (k, v) = (p["Tag.1.Key"].clone(), p["Tag.1.Value"].clone());
+                    a.instances.get_mut(&id).unwrap().1.insert(k, v);
+                    ok("<CreateTagsResponse/>".into())
+                }
+                "DeleteTags" => {
+                    let id = p["ResourceId.1"].clone();
+                    let k = p["Tag.1.Key"].clone();
+                    a.instances.get_mut(&id).unwrap().1.remove(&k);
+                    ok("<DeleteTagsResponse/>".into())
+                }
+                "CancelSpotInstanceRequests" => {
+                    let r = ids(&p, "SpotInstanceRequestId");
+                    a.cancelled.extend(r);
+                    ok("<CancelSpotInstanceRequestsResponse/>".into())
+                }
+                "TerminateInstances" => {
+                    for id in ids(&p, "InstanceId") {
+                        let sir = a.instances[&id].3.clone();
+                        if sir.is_some_and(|r| !a.cancelled.contains(&r)) {
+                            a.uncancelled_terminates.push(id.clone());
+                        }
+                        a.instances.get_mut(&id).unwrap().0 = "terminated".into();
+                    }
+                    ok("<TerminateInstancesResponse/>".into())
+                }
+                _ => (StatusCode::BAD_REQUEST, "<Response><Errors><Error><Code>InvalidAction</Code><Message>no</Message></Error></Errors></Response>".into()),
+            }
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    base
+}
+
+async fn pool_driver(
+    max: usize,
+) -> (
+    fcvm::fleet::coord::ec2_aws::AwsEc2,
+    Arc<std::sync::Mutex<PoolEc2>>,
+) {
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let api = Arc::new(std::sync::Mutex::new(PoolEc2 {
+        image: "ami-0123456789abcdef0".into(),
+        ..Default::default()
+    }));
+    let base = pool_ec2_api(api.clone()).await;
+    let mut d = fcvm::fleet::coord::ec2_aws::AwsEc2::new(
+        vec!["us-east-1".to_string()],
+        "tile-spot".into(),
+        Some("tile-on-demand".into()),
+        "fcvm.example".into(),
+    )
+    .unwrap();
+    d.endpoints.insert("us-east-1".into(), base);
+    d.fleet = "stage-test".into();
+    d.pool_max = max;
+    d.pool_template = Some("tile-pool".into());
+    (d, api)
+}
+
+fn state_of(
+    api: &Arc<std::sync::Mutex<PoolEc2>>,
+    instance: &str,
+) -> (String, BTreeMap<String, String>) {
+    let id = instance.split_once('/').unwrap().1;
+    let a = api.lock().unwrap();
+    let (st, tags, _, _) = &a.instances[id];
+    (st.clone(), tags.clone())
+}
+
+/// A tile released when the fleet sleeps is stopped into the pool, and the next wake starts
+/// it (15.5 s to a first frame on staging, against 81 to 84 s for a launch) instead of
+/// launching; cold launches use the pool template, whose instances can be stopped.
+#[tokio::test]
+async fn a_tile_released_into_the_pool_is_started_at_the_next_wake() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, api) = pool_driver(2).await;
+    assert!(
+        d.resume("ec2-1").await.is_none(),
+        "an empty pool resumes nothing"
+    );
+    let l = d.launch("ec2-1").await.unwrap();
+    assert_eq!(
+        api.lock()
+            .unwrap()
+            .instances
+            .values()
+            .next()
+            .unwrap()
+            .3
+            .as_deref(),
+        Some("sir-1"),
+        "launched from the pool template"
+    );
+    d.release(&l.instance).await.unwrap();
+    let (st, tags) = state_of(&api, &l.instance);
+    assert_eq!(st, "stopped");
+    assert_eq!(
+        tags.get("FleetPool").map(String::as_str),
+        Some("stage-test")
+    );
+    let r = d.resume("ec2-2").await.expect("the pooled tile starts");
+    assert_eq!(r.instance, l.instance);
+    assert_eq!(
+        r.frame_url.as_deref(),
+        Some("wss://ec2-2.fcvm.example/frames")
+    );
+    let (st, tags) = state_of(&api, &r.instance);
+    assert_eq!(st, "running");
+    assert_eq!(tags.get("FleetTile").map(String::as_str), Some("ec2-2"));
+    assert!(!tags.contains_key("FleetPool"));
+    let a = api.lock().unwrap();
+    assert_eq!(a.actions.iter().filter(|x| *x == "RunInstances").count(), 1);
+    assert!(a.uncancelled_terminates.is_empty());
+}
+
+/// A full pool, a tile of an older image, and the sweep terminate; every terminate cancels
+/// the instance's spot request first (a persistent request would launch a replacement),
+/// and a pooled tile that does not start yet stays in the pool for a later wake.
+#[tokio::test]
+async fn the_pool_keeps_at_most_its_size_and_cancels_spot_requests_before_terminating() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, api) = pool_driver(1).await;
+    let a1 = d.launch("ec2-1").await.unwrap();
+    let a2 = d.launch("ec2-2").await.unwrap();
+    d.release(&a1.instance).await.unwrap();
+    d.release(&a2.instance).await.unwrap();
+    assert_eq!(state_of(&api, &a1.instance).0, "stopped");
+    assert_eq!(
+        state_of(&api, &a2.instance).0,
+        "terminated",
+        "the pool holds one"
+    );
+    assert_eq!(api.lock().unwrap().cancelled, vec!["sir-2".to_string()]);
+    // Not startable yet: left pooled, and the tile launches.
+    let id1 = a1.instance.split_once('/').unwrap().1.to_string();
+    api.lock().unwrap().start_fails.push(id1.clone());
+    assert!(d.resume("ec2-3").await.is_none());
+    assert_eq!(state_of(&api, &a1.instance).0, "stopped");
+    api.lock().unwrap().start_fails.clear();
+    // A new image: the pooled tile is stale and is terminated, not started.
+    api.lock().unwrap().image = "ami-1123456789abcdef0".into();
+    assert!(d.resume("ec2-3").await.is_none());
+    assert_eq!(state_of(&api, &a1.instance).0, "terminated");
+    // The sweep keeps a pooled stopped tile and terminates a running one.
+    let b1 = d.launch("ec2-1").await.unwrap();
+    let b2 = d.launch("ec2-2").await.unwrap();
+    d.release(&b1.instance).await.unwrap();
+    assert_eq!(d.sweep().await.unwrap(), 1);
+    assert_eq!(state_of(&api, &b1.instance).0, "stopped");
+    assert_eq!(state_of(&api, &b2.instance).0, "terminated");
+    let a = api.lock().unwrap();
+    assert!(
+        a.uncancelled_terminates.is_empty(),
+        "{:?}",
+        a.uncancelled_terminates
+    );
+}
+
+/// The tiles of one wake resume at once: each starts a different pooled instance.
+#[tokio::test]
+async fn tiles_resuming_at_once_start_distinct_pooled_instances() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, _api) = pool_driver(2).await;
+    let d = Arc::new(d);
+    for t in ["ec2-1", "ec2-2"] {
+        let l = d.launch(t).await.unwrap();
+        d.release(&l.instance).await.unwrap();
+    }
+    let (a, b, c) = tokio::join!(d.resume("ec2-1"), d.resume("ec2-2"), d.resume("ec2-3"));
+    let got = [a, b, c];
+    let mut ids: Vec<String> = got.iter().flatten().map(|l| l.instance.clone()).collect();
+    assert_eq!(ids.len(), 2, "{got:?}");
+    ids.dedup();
+    assert_eq!(ids.len(), 2, "two tiles started one instance: {got:?}");
+}
+
+/// The tile task: a tile with no instance asks the pool first; the relaunch of a running
+/// tile (a race) launches cold; a tile that leaves the assignment releases its instance.
+struct PoolTask {
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ec2::Ec2Driver for PoolTask {
+    async fn launch(&self, tile: &str) -> Result<ec2::Launched, ec2::LaunchError> {
+        let mut c = self.calls.lock().unwrap();
+        c.push(format!("launch {tile}"));
+        Ok(ec2::Launched {
+            instance: format!("i-cold-{}", c.len()),
+            frame_url: None,
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn resume(&self, tile: &str) -> Option<ec2::Launched> {
+        self.calls.lock().unwrap().push(format!("resume {tile}"));
+        Some(ec2::Launched {
+            instance: "i-pooled".into(),
+            frame_url: None,
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn release(&self, instance: &str) -> anyhow::Result<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("release {instance}"));
+        Ok(())
+    }
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        Ok(l.clone())
+    }
+    async fn terminate(&self, instance: &str) -> anyhow::Result<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("terminate {instance}"));
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _t: &str,
+        _l: &ec2::Launched,
+        _b: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_budget(
+        &self,
+        _t: &str,
+        _l: &ec2::Launched,
+        _b: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn health(&self, _t: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("no renderer")
+    }
+}
+
+#[tokio::test]
+async fn a_wake_resumes_tiles_a_race_launches_them_and_a_sleep_releases_them() {
+    use fleet_core::protocol::AssignSlot;
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let driver: Arc<dyn ec2::Ec2Driver> = Arc::new(PoolTask {
+        calls: calls.clone(),
+    });
+    let (handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let slot = |g: u64| AssignSlot {
+        id: "ec2-1".into(),
+        sbdf: String::new(),
+        generation: g,
+        rect: None,
+        private_camera: None,
+        layout_generation: 0,
+        rect_from_frame: 0,
+        previous_rect: None,
+        standby: false,
+        warm: false,
+    };
+    let (assign, assign_rx) = tokio::sync::watch::channel(vec![slot(1)]);
+    let (_scene, scene_rx) = tokio::sync::watch::channel(None);
+    let (_budget, budget_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(ec2::run(driver, assign_rx, scene_rx, budget_rx, handle));
+    let until = |n: usize| {
+        let calls = calls.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while calls.lock().unwrap().len() < n {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{:?}", calls.lock().unwrap()));
+        }
+    };
+    until(1).await;
+    assign.send(vec![slot(2)]).unwrap();
+    until(3).await;
+    assign.send(vec![]).unwrap();
+    until(4).await;
+    let c = calls.lock().unwrap().clone();
+    assert_eq!(c[..2], ["resume ec2-1", "launch ec2-1"], "{c:?}");
+    // The race's old instance is terminated once its replacement is accepted (on a task of
+    // its own), and the sleep releases the replacement.
+    let mut rest = c[2..].to_vec();
+    rest.sort();
+    assert_eq!(rest, ["release i-cold-2", "terminate i-pooled"], "{c:?}");
+}
