@@ -194,13 +194,26 @@ pub struct FleetCoordArgs {
     #[arg(long = "allowed-origin")]
     pub allowed_origins: Vec<String>,
 
-    /// Run the EC2 half's aggregator on this address
-    #[arg(long, requires = "ec2_aggregate_url")]
+    /// Run the EC2 half's aggregator on this address (its layout, stats and a stream for
+    /// the coordinator); browsers reach it at --ec2-aggregate-url, or with
+    /// --ec2-aggregate-tls at its published names
+    #[arg(long)]
     pub ec2_aggregate_listen: Option<String>,
 
     /// The EC2 half's aggregator frame WebSocket as browsers reach it
     #[arg(long, requires = "ec2_aggregate_listen")]
     pub ec2_aggregate_url: Option<String>,
+
+    /// Serve the EC2 half's aggregator to browsers with TLS (the --tls-secret certificate)
+    /// on port 443 of the coordinator task's own addresses, read on ECS (the task metadata
+    /// for IPv6, EC2 DescribeNetworkInterfaces for the public IPv4 address), and name them
+    /// `agg-ec2-<token>` (needs --dns-token-secret)
+    #[arg(long, requires_all = ["ec2_aggregate_listen", "tls_secret", "dns_token_secret"])]
+    pub ec2_aggregate_tls: bool,
+
+    /// Where the coordinator keeps the certificate file of --ec2-aggregate-tls
+    #[arg(long, default_value = "/run/fcvm-fleet/tls")]
+    pub ec2_aggregate_tls_dir: std::path::PathBuf,
 
     /// Extra argument for the EC2 half's aggregator. Repeatable.
     #[arg(long = "aggregate-arg", allow_hyphen_values = true)]

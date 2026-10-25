@@ -3977,6 +3977,14 @@ struct DnsFixture {
 }
 
 async fn dns_fixture(pre: &[(&str, &str, &str)]) -> DnsFixture {
+    dns_fixture_with(pre, Config::default(), None).await
+}
+
+async fn dns_fixture_with(
+    pre: &[(&str, &str, &str)],
+    config: Config,
+    ec2: Option<Arc<dyn ec2::Ec2Driver>>,
+) -> DnsFixture {
     use fcvm::fleet::coord::dns::Cloudflare;
     let cf = FakeCf::default();
     for (i, (kind, name, content)) in pre.iter().enumerate() {
@@ -4000,9 +4008,9 @@ async fn dns_fixture(pre: &[(&str, &str, &str)]) -> DnsFixture {
     .unwrap()
     .with_confirm(Arc::new(gate.clone()));
     let (handle, _actor) = start(
-        State::new(Config::default(), now_ms()),
+        State::new(config, now_ms()),
         None,
-        None,
+        ec2,
         None,
         None,
         Some(fcvm::fleet::coord::Names::Cloudflare(writer)),
@@ -4264,16 +4272,72 @@ impl DnsFixture {
     }
 
     fn aggregate(&self) -> Value {
+        self.aggregate_of("agg:gpu-a")
+    }
+
+    fn aggregate_of(&self, id: &str) -> Value {
         let state =
             &serde_json::from_str::<Value>(&self.handle.snapshot.borrow().text).unwrap()["state"];
         state["aggregates"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|a| a["id"] == "agg:gpu-a")
+            .find(|a| a["id"] == id)
             .cloned()
             .unwrap_or(Value::Null)
     }
+}
+
+/// The EC2 half's aggregator serving browsers with TLS is named `agg-ec2-<token>` at the
+/// coordinator's own addresses, both on 443, and its URLs reach the page only once the
+/// names answer.
+#[tokio::test]
+async fn the_ec2_aggregator_is_published_at_the_coordinators_addresses() {
+    let config = Config {
+        ec2_max: 1,
+        ec2_aggregate_ipv6: Some("2001:db8:20::5".into()),
+        ec2_aggregate_ipv4: Some("192.0.2.44".into()),
+        ..Config::default()
+    };
+    let ec2: Arc<dyn ec2::Ec2Driver> = Arc::new(ec2::FakeEc2::new(
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+    ));
+    let fx = dns_fixture_with(&[], config, Some(ec2)).await;
+    fx.wait_until("the EC2 half's region", |fx| {
+        !fx.aggregate_of("agg:ec2").is_null()
+    })
+    .await;
+    let label = fx.label_for("2001:db8:20::5").await;
+    assert!(
+        label.starts_with("agg-ec2-") && label.len() == "agg-ec2-".len() + 8,
+        "{label}"
+    );
+    fx.wait_until("the A record", |fx| {
+        fx.zone().contains(&(
+            "A".into(),
+            format!("{label}-v4.fcvm.example"),
+            "192.0.2.44".into(),
+        ))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        fx.aggregate_of("agg:ec2")["frame_url"].is_null(),
+        "{}",
+        fx.aggregate_of("agg:ec2")
+    );
+    fx.open(true);
+    fx.wait_until("the EC2 aggregator published", |fx| {
+        !fx.aggregate_of("agg:ec2")["frame_url"].is_null()
+    })
+    .await;
+    let a = fx.aggregate_of("agg:ec2");
+    assert_eq!(a["frame_url"], format!("wss://{label}.fcvm.example/frames"));
+    assert_eq!(
+        a["frame_url_v4"],
+        format!("wss://{label}-v4.fcvm.example/frames")
+    );
 }
 
 /// A host aggregator that serves browsers is named like a launch, under

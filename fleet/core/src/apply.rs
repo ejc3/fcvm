@@ -196,6 +196,17 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             None
         }
         Event::Published { slot, names, .. } => {
+            let c = &state.config;
+            if slot == crate::state::EC2_AGGREGATE_ID {
+                if names.names(
+                    c.ec2_aggregate_ipv6.as_deref(),
+                    c.ec2_aggregate_ipv4.as_deref(),
+                    None,
+                ) {
+                    state.fleet.ec2_aggregate_published = Some(names.clone());
+                }
+                return None;
+            }
             let f = &mut state.fleet;
             // A host aggregator's names, for the addresses it reports now.
             if let Some(h) = f
