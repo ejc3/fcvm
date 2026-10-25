@@ -136,6 +136,29 @@ fn records(zone: &str, p: &Published) -> Vec<((String, String), Record)> {
     out
 }
 
+/// An address a slot reported that is not one of its family (`ipv6` must be IPv6, `ipv4`
+/// IPv4): naming it would only publish a record nobody can use.
+pub fn bad_address(f: &Fact) -> Option<&str> {
+    [(&f.ipv6, true), (&f.ipv4, false)]
+        .into_iter()
+        .find(|(a, v6)| {
+            a.as_ref()
+                .is_some_and(|a| match a.parse::<std::net::IpAddr>() {
+                    Ok(ip) => ip.is_ipv6() != *v6,
+                    Err(_) => true,
+                })
+        })
+        .and_then(|(a, _)| a.as_deref())
+}
+
+/// Whether a slot needs names for the launch it is on: it has an address, every address it
+/// reported is one, and it has no published names for exactly this launch.
+pub fn needs_names(zone: &str, f: &Fact) -> bool {
+    (f.ipv6.is_some() || f.ipv4.is_some())
+        && bad_address(f).is_none()
+        && !f.published.as_ref().is_some_and(|p| is_current(zone, p, f))
+}
+
 /// A label for one launch of `id`, never made before (8 random base32 characters).
 pub fn mint(id: &str) -> String {
     use rand::Rng;
@@ -507,6 +530,19 @@ fn body(r: &Record) -> serde_json::Value {
     })
 }
 
+/// Delete every launch name of the zone (`slot-<n>-<token>`, `ec2-<n>-<token>` and their
+/// `-v4`), once: with the launch names served from a subzone, none of them is referenced.
+pub async fn sweep(mut cf: Cloudflare) {
+    match cf.reconcile(&Wanted::new()).await {
+        Ok(n) => {
+            tracing::info!(deleted = n, zone = %cf.zone, "launch names swept from the parent zone")
+        }
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "launch names in the parent zone not swept")
+        }
+    }
+}
+
 /// One launch whose names are being written or confirmed.
 struct Pending {
     names: Published,
@@ -547,27 +583,11 @@ pub async fn run(
         // whose names it has published, is dropped.
         let mut live = BTreeMap::new();
         for f in &facts {
-            if f.ipv6.is_none() && f.ipv4.is_none() {
+            if let Some(a) = bad_address(f) {
+                tracing::warn!(slot = %f.id, address = %a, "not naming a slot whose reported address is not one");
                 continue;
             }
-            // An address that is not one would only make the zone refuse the write.
-            let bad = [(&f.ipv6, true), (&f.ipv4, false)]
-                .into_iter()
-                .find(|(a, v6)| {
-                    a.as_ref()
-                        .is_some_and(|a| match a.parse::<std::net::IpAddr>() {
-                            Ok(ip) => ip.is_ipv6() != *v6,
-                            Err(_) => true,
-                        })
-                });
-            if let Some((a, _)) = bad {
-                tracing::warn!(slot = %f.id, address = ?a, "not naming a slot whose reported address is not one");
-                continue;
-            }
-            if f.published
-                .as_ref()
-                .is_some_and(|p| is_current(&cf.zone, p, f))
-            {
+            if !needs_names(&cf.zone, f) {
                 continue;
             }
             let p = pending
