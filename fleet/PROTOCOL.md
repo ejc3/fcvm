@@ -475,17 +475,26 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
 
 - `--scale-group` hands the coordinator the GPU hosts' auto scaling groups (repeatable,
   one per region); it sets their desired capacity (Auto Scaling `SetDesiredCapacity`) and,
-  while waking, reads their instances (`DescribeAutoScalingGroups`) every 5 s, with the
+  while they come up, reads their instances (`DescribeAutoScalingGroups`) every 2 s, with the
   credentials of its task or instance role. A call that fails marks the coordinator
   degraded (`scale`) and is retried.
 - `--on-demand-group` names an on-demand group as the fallback of the `--scale-group` in its
   region (at most one per region, and that region must have exactly one scale group). Auto
   Scaling does not move a spot group's capacity to on demand by itself, so the coordinator
-  does: while waking, when the spot group and its on-demand group together have had fewer
-  live instances (any lifecycle state but `Terminating*`, `Terminated` and `Detach*`) than
-  `--awake-capacity` for `--spot-wait` seconds (default 120), it sets the on-demand group to
-  the shortfall and the spot group to the live instances it has, so a spot launch that
-  succeeds later cannot add a host. A split written only half way (one call failed) is
+  does: while the groups come up, when the spot group and its on-demand group together
+  have fewer live instances (any lifecycle state but `Terminating*`, `Terminated` and
+  `Detach*`) than `--awake-capacity`, and either Auto Scaling has recorded a failed launch
+  of the spot group since the wake raised it (`DescribeScalingActivities`, a `Failed`
+  activity, e.g. `UnfulfillableCapacity` or `MaxSpotInstanceCountExceeded`, about 10 s after
+  the raise) or they have stayed short for `--spot-wait` seconds (default 120; the only rule
+  when the activities cannot be read), it sets the on-demand group to the shortfall and the
+  spot group to the live instances it has, so a spot launch that succeeds later cannot add
+  a host. It logs which rule fell back (`spot launch failed; falling back to on-demand now`
+  with the activity's message, or `spot group still short after the spot wait`). The groups
+  come up from the wake (or the coordinator's start) until they hold `--awake-capacity`
+  instances in service, also after the fleet is `awake` (the EC2 half can complete the
+  image first); the coordinator then logs `wake: host capacity in service` with `path`
+  (`spot`, `on-demand`, or `spot and on-demand`). A split written only half way (one call failed) is
   written again on every poll until both groups hold it, and `scale` stays degraded until
   then. A group it cannot describe is not taken to be short. It never raises the on-demand
   group otherwise, sets it to 0 with the spot group when the fleet sleeps, and the next

@@ -1855,6 +1855,13 @@ async fn a_spot_group_short_after_the_wait_falls_back_to_on_demand_and_sleeps_to
         on_demand: vec![Some(od)],
         spot_wait: Duration::from_millis(300),
     };
+    fake.by_group.lock().unwrap().insert(
+        "fleet-hosts".into(),
+        vec![fleet_core::event::ScaleInstance {
+            id: "i-1234567890abcdef0".into(),
+            lifecycle: "InService".into(),
+        }],
+    );
     let (handle, _actor) = start(
         State::new(config, now_ms()),
         None,
@@ -1893,7 +1900,8 @@ async fn a_spot_group_short_after_the_wait_falls_back_to_on_demand_and_sleeps_to
     let c = |g: &str, d: u32| (g.to_string(), d);
     let mut v = Viewer::connect(&url).await;
     v.until(|s| s["viewers"]["active"] == 1).await;
-    // Awake at start: the spot group only; the on-demand group is not raised.
+    // Awake at start with the spot host in service: the spot group only; the on-demand
+    // group is not raised.
     assert_eq!(calls(), vec![c("fleet-hosts", 1)]);
     v.send(json!({"type": "visibility", "visible": false}))
         .await;
@@ -1903,6 +1911,8 @@ async fn a_spot_group_short_after_the_wait_falls_back_to_on_demand_and_sleeps_to
         calls()[1..3],
         [c("fleet-hosts", 0), c("fleet-hosts-on-demand", 0)]
     );
+    // Asleep, the spot host is gone, and spot has no capacity for the next wake.
+    fake.by_group.lock().unwrap().remove("fleet-hosts");
     // Wake with no spot capacity: after the wait, on-demand takes the one host.
     v.send(json!({"type": "visibility", "visible": true})).await;
     wait_for(6).await;
@@ -1956,6 +1966,131 @@ fn fallback_power(
         })],
         spot_wait,
     }
+}
+
+/// Waits until `fake`'s desired capacities hold `want` for every group named there.
+async fn until_desired(
+    fake: &Arc<fcvm::fleet::coord::scale::FakeScale>,
+    want: &[(&str, u32)],
+    within: Duration,
+) {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let d = fake.desired.lock().unwrap().clone();
+        if want.iter().all(|(g, n)| d.get(*g) == Some(n)) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "desired {d:?} after {within:?}, calls {:?}",
+            fake.calls.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Auto Scaling reports a refused spot launch as a failed activity about 10 s after the
+/// desired capacity is raised, and then keeps retrying spot on its own. The coordinator
+/// falls back on that report at its next poll instead of waiting out --spot-wait (120 s on
+/// staging), and an activity from before the wake does not count.
+#[tokio::test]
+async fn a_failed_spot_launch_falls_back_to_on_demand_without_waiting() {
+    use fcvm::fleet::coord::scale::FakeScale;
+    let fake = Arc::new(FakeScale::default());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    // An old failure (a previous wake's) changes nothing.
+    fake.failed.lock().unwrap().insert(
+        "fleet-hosts".into(),
+        vec![(
+            now - 3_600_000,
+            "Could not launch Spot Instances. UnfulfillableCapacity".into(),
+        )],
+    );
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(fallback_power(&fake, Duration::from_secs(60))),
+        None,
+    );
+    until_desired(&fake, &[("fleet-hosts", 1)], Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        fake.desired
+            .lock()
+            .unwrap()
+            .get("fleet-hosts-on-demand")
+            .copied()
+            .unwrap_or(0),
+        0,
+        "fell back on a failure from before the wake: {:?}",
+        fake.calls.lock().unwrap()
+    );
+    // This wake's spot launch fails.
+    fake.failed
+        .lock()
+        .unwrap()
+        .get_mut("fleet-hosts")
+        .unwrap()
+        .insert(
+            0,
+            (
+                now + 1,
+                "Could not launch Spot Instances. MaxSpotInstanceCountExceeded".into(),
+            ),
+        );
+    until_desired(
+        &fake,
+        &[("fleet-hosts", 0), ("fleet-hosts-on-demand", 1)],
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+/// The EC2 half can make the fleet awake before the GPU hosts are up (53 s into the
+/// staging wake of 2026-10-25). A spot group still short then falls back after the spot
+/// wait all the same; the groups are watched until they hold the awake capacity in service,
+/// not only while the fleet is waking.
+#[tokio::test]
+async fn a_spot_group_still_short_once_the_fleet_is_awake_falls_back() {
+    use fcvm::fleet::coord::scale::FakeScale;
+    let fake = Arc::new(FakeScale::default());
+    // State::new starts awake: the EC2 half is up, the spot group has nothing.
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(fallback_power(&fake, Duration::from_millis(300))),
+        None,
+    );
+    until_desired(
+        &fake,
+        &[("fleet-hosts", 0), ("fleet-hosts-on-demand", 1)],
+        Duration::from_secs(5),
+    )
+    .await;
+    // The on-demand host comes up: the groups are no longer watched, and nothing more is set.
+    fake.by_group.lock().unwrap().insert(
+        "fleet-hosts-on-demand".into(),
+        vec![fleet_core::event::ScaleInstance {
+            id: "i-0123456789abcdef0".into(),
+            lifecycle: "InService".into(),
+        }],
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let n = fake.calls.lock().unwrap().len();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        fake.calls.lock().unwrap().len(),
+        n,
+        "{:?}",
+        fake.calls.lock().unwrap()
+    );
 }
 
 /// A coordinator that restarts while a fallback is in force (the on-demand group holds a

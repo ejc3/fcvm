@@ -827,7 +827,9 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             driver: Arc::new(scale::AwsAutoScaling::new()?),
             groups: args.scale_groups.clone(),
             awake_capacity: args.awake_capacity,
-            poll: Duration::from_secs(5),
+            // While the groups come up: a failed spot launch is seen at most 2 s after Auto
+            // Scaling records it. Two or three describe calls per poll, only then.
+            poll: Duration::from_secs(2),
             on_demand,
             spot_wait: Duration::from_secs(args.spot_wait),
         })
