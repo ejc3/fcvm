@@ -1995,6 +1995,7 @@ async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
         scene: tokio::sync::watch::channel(None).0,
         budget: tokio::sync::watch::channel(None).0,
         dns: None,
+        zone: None,
         store: Some(tx),
     };
     let (cmds, cmds_rx) = tokio::sync::mpsc::channel(64);
