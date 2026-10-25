@@ -451,6 +451,9 @@ pub struct Quarantined {
     pub sbdf: String,
     pub error: String,
     pub since: u64,
+    /// The agent's report that quarantined it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
 }
 
 /// The key of a GPU across hosts.
@@ -502,6 +505,11 @@ pub struct Fleet {
     /// Quarantined GPUs by `gpu_key`.
     #[serde(default)]
     pub quarantined: BTreeMap<String, Quarantined>,
+    /// Per `gpu_key`, the report of the quarantine an operator released last: an agent
+    /// that replays that report (it was not told the release was stored) must not
+    /// quarantine the GPU again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub released_reports: BTreeMap<String, String>,
     /// Viewers whose page reported it is hidden; they do not count as active.
     #[serde(default)]
     pub hidden: std::collections::BTreeSet<String>,
@@ -559,6 +567,7 @@ impl State {
                 degraded: BTreeMap::new(),
                 counters: Counters::default(),
                 quarantined: BTreeMap::new(),
+                released_reports: BTreeMap::new(),
                 hidden: Default::default(),
                 warming: Default::default(),
                 power: Power::default(),

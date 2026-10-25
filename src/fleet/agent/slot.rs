@@ -10,7 +10,7 @@
 use super::inventory::{holders, vfio_node};
 use super::vm::{wait_restored, Vm, VmSpec};
 use fleet_core::protocol::{
-    AgentMsg, BudgetBody, HealthReport, RendererScene, SharedScene, SlotReport,
+    boot_id, AgentMsg, BudgetBody, HealthReport, RendererScene, SharedScene, SlotReport,
 };
 use fleet_core::scene::Keyframe;
 use fleet_core::tiling::Rect;
@@ -128,6 +128,9 @@ struct Running {
     posted: Option<RendererScene>,
     /// The budget posted since the last scene post (a scene post clears the renderer's).
     budget_posted: Option<BudgetBody>,
+    /// The renderer's `boot_id` in the last `/health` read. A different one means the
+    /// renderer restarted inside the VM and lost its scene.
+    boot: Option<String>,
 }
 
 enum Failure {
@@ -186,6 +189,7 @@ impl SlotCtx {
             slot: self.id.clone(),
             sbdf: self.sbdf.clone(),
             error: error.to_string(),
+            report: Some(uuid::Uuid::new_v4().simple().to_string()),
         });
     }
 
@@ -506,6 +510,14 @@ pub async fn supervise(
             }
             _ = health_tick.tick() => {
                 if let Some(h) = ctx.health().await {
+                    let boot = boot_id(&h);
+                    if boot != r.boot {
+                        tracing::info!(slot = %ctx.id, ?boot, "the renderer restarted; posting its scene again");
+                        r.boot = boot;
+                        r.posted = None;
+                        r.budget_posted = None;
+                        post_if_changed(&ctx, r, &desired, &mut scene, &mut budget).await;
+                    }
                     let _ = ctx.out.send(AgentMsg::Health(HealthReport::from_renderer(&ctx.id, &h)));
                 }
             }
@@ -633,6 +645,7 @@ async fn relaunch(
     let mut health_at: Option<Instant> = None;
     let mut baseline: Option<u64> = None;
     let mut posted: Option<RendererScene> = None;
+    let mut boot: Option<String> = None;
     let fail = |vm: &Vm, why: String, attach: bool| Failure::Failed {
         error: format!("{why}; fcvm said: {}", vm.tail()),
         attach,
@@ -653,6 +666,14 @@ async fn relaunch(
             }
             _ = poll.tick() => {
                 let Some(h) = ctx.health().await else { continue };
+                // A renderer that restarted after the scene was posted lost it: post it
+                // again and count frames from there.
+                let b = boot_id(&h);
+                if posted.is_some() && b != boot {
+                    posted = None;
+                    baseline = None;
+                }
+                boot = b;
                 if let Some(e) = h.get("error").and_then(|e| e.as_str()) {
                     let e = fail(&vm, format!("the renderer failed: {e}"), false);
                     vm.stop(ctx.cfg.stop_grace).await;
@@ -719,6 +740,7 @@ async fn relaunch(
         started: spawned,
         posted,
         budget_posted: None,
+        boot,
     });
     Ok(())
 }

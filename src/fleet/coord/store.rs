@@ -238,6 +238,7 @@ mod tests {
                 sbdf: "0000:05:00.0".into(),
                 error: "did not reset".into(),
                 since: 900,
+                report: None,
             },
         );
         write_atomic(&path, &serde_json::to_vec(&s).unwrap()).unwrap();

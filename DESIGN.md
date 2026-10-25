@@ -1503,8 +1503,10 @@ emptied (balloon inflation, free page reporting) as zeros: a discard is not a gu
 records it, and the fork marks each discarded range itself. A diff writes every page the VM touched or a discard
 emptied, zeros included, and its merge punches each run of its all-zero pages at least `MERGE_MIN_PUNCH` long,
 measured within its 8 MiB merge window, as a hole, so memory a restored guest gave back in runs that long is a hole in
-its snapshot. The `nested` arm64 profile builds its own fork (`nv2-on-main`), which writes every page of a Full
-snapshot and leaves discarded pages out of a diff. A diff starts from a clone or copy of the parent's `memory.bin`,
+its snapshot. The `nested` arm64 profile builds its own NV2 fork, which writes every page of a Full snapshot that
+holds data, leaves the pages the guest never wrote as holes without reading them (reading one would map it to the
+zero page, and the guest's first write after the resume would then be a copy-on-write, #1264), and leaves discarded
+pages out of a diff. A diff starts from a clone or copy of the parent's `memory.bin`,
 which on btrfs shares the parent's extents, so a child keeps its parent's holes.
 
 **A snapshot of a restored VM**: a VM that was itself restored from a snapshot is saved as a diff, written in
