@@ -9,7 +9,6 @@ import shutil
 import stat
 import subprocess
 import tempfile
-import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -52,16 +51,16 @@ class RunShChecks(unittest.TestCase):
     def test_a_second_run_with_another_work_and_the_same_out_is_refused(self):
         out = os.path.join(self.tmp, "o")
         os.makedirs(out)
-        # The first run holds OUT's lock; it is running under a different WORK.
+        # The first run holds OUT's lock under a different WORK. The holder prints a line
+        # once it owns the lock, and the test waits for that line, not for the file to exist.
         holder = subprocess.Popen(
-            ["flock", os.path.join(out, ".lock"), "sleep", "60"]
+            ["flock", os.path.join(out, ".lock"), "sh", "-c", "echo held; sleep 60"],
+            stdout=subprocess.PIPE,
+            text=True,
         )
         self.addCleanup(holder.wait)
         self.addCleanup(holder.kill)
-        for _ in range(100):
-            if os.path.exists(os.path.join(out, ".lock")):
-                break
-            time.sleep(0.05)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
         r = self.run_script(os.path.join(self.tmp, "w2"), out)
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertIn(f"holds {out}/.lock", r.stderr)
