@@ -6,7 +6,8 @@
 #                                frame (EC2's best case in the race: launch request to first frame)
 #   measure-boot.sh host <ami>   g4dn.metal; times until the GPUs are on vfio-pci and the store is
 #                                restored (the host is ready for the agent), then starts one GPU VM
-#                                and times it to first frame (fleet/ami/host/warm.sh)
+#                                and times it to first frame (fleet/ami/host/warm.sh), printing
+#                                fcvm's restored record and whether it hit the build's snapshot
 #
 # The instance is terminated at the end. Fleet-account credentials in the environment.
 set -euo pipefail
@@ -70,13 +71,16 @@ until [ "$(A ssm describe-instance-information --filters Key=InstanceIds,Values=
 t_ssm=$(now)
 launch=$(A ec2 describe-instances --instance-ids "$id" --query 'Reservations[0].Instances[0].LaunchTime' --output text)
 echo "ssm online after $((t_ssm - t0)) ms; EC2 LaunchTime $launch"
-units="fcvm-fleet-vfio fcvm-fleet-store"; [ "$KIND" = tile ] && units="nvidia-persistenced fcvm-fleet-tls fcvm-fleet-renderer nginx"
-ssm "echo kernel_start=\$(( \$(date +%s%3N) - \$(awk '{printf \"%d\", \$1*1000}' /proc/uptime) )); for u in $units; do echo \$u \$(systemctl show -p ActiveEnterTimestamp --value \$u.service | xargs -I{} date -d '{}' +%s%3N 2>/dev/null) \$(systemctl show -p ActiveState --value \$u.service); done; cat /var/log/fcvm-fleet-first-frame.log 2>/dev/null; journalctl -u fcvm-fleet-store -o cat --no-pager 2>/dev/null | grep -E 'fcvm-fleet-store:' ; cat /run/fcvm-fleet/gpus 2>/dev/null | wc -l" | while read -r a b c; do
+units="fcvm-fleet-vfio fcvm-fleet-store"; [ "$KIND" = tile ] && units="nvidia-persistenced cloud-init fcvm-fleet-tls fcvm-fleet-renderer fcvm-fleet-nginx"
+# Per unit: when its start job began (InactiveExit) and when it became active, from the
+# monotonic stamps (microseconds since the kernel started) added to the kernel's start, so
+# the times are not rounded to the second; 0 for a unit that never started.
+ssm "k=\$(( \$(date +%s%3N) - \$(awk '{printf \"%d\", \$1*1000}' /proc/uptime) )); echo kernel_start=\$k; for u in $units; do a=\$(systemctl show -p ActiveEnterTimestampMonotonic --value \$u.service); i=\$(systemctl show -p InactiveExitTimestampMonotonic --value \$u.service); echo \$u \$(( \${a:-0} > 0 ? k + \${a:-0} / 1000 : 0 )) \$(systemctl show -p ActiveState --value \$u.service) \$(( \${i:-0} > 0 ? k + \${i:-0} / 1000 : 0 )); done; cat /var/log/fcvm-fleet-first-frame.log 2>/dev/null; journalctl -u fcvm-fleet-store -o cat --no-pager 2>/dev/null | grep -E 'fcvm-fleet-store:' ; cat /run/fcvm-fleet/gpus 2>/dev/null | wc -l" | while read -r a b c d; do
   case "$a" in
     kernel_start=*) echo "kernel started $(( ${a#kernel_start=} - t0 )) ms after the request" ;;
     first_frame) echo "on-instance: $a $b $c" ;;
     fcvm-fleet-store:*) echo "on-instance: $a $b $c" ;;
-    *) [ -n "$b" ] && [ "$b" -gt 0 ] 2>/dev/null && echo "$a active ($c) $(( b - t0 )) ms after the request" || echo "$a $b $c" ;;
+    *) [ -n "$b" ] && [ "$b" -gt 0 ] 2>/dev/null && echo "$a started $(( ${d:-0} - t0 )) ms, active ($c) $(( b - t0 )) ms after the request" || echo "$a $b $c" ;;
   esac
 done
 if [ "$KIND" = host ]; then
@@ -90,8 +94,12 @@ if [ "$KIND" = host ]; then
     case "$u" in fcvm-fleet-store:) echo "on-instance: $u $t $rest" ;; *) [ -z "$t" ] || echo "$u active $(( t - t0 )) ms after the request" ;; esac
   done
   # AWS-RunShellScript runs `sh` (dash on Ubuntu: no pipefail), so keep warm.sh's status
-  # by hand and end with it.
-  ssm "G0=\$(ls /sys/bus/pci/drivers/vfio-pci | grep -E '^[0-9a-f]{4}:' | head -1); prlimit --memlock=unlimited:unlimited sudo -u ubuntu -H XDG_RUNTIME_DIR=/run/user/1000 bash -c \"cd /tmp && bash /usr/local/lib/fcvm-fleet/warm.sh \$G0 /tmp/warm.log\" > /tmp/warm.out 2>&1; rc=\$?; tail -3 /tmp/warm.out; grep -o '\"status\":\"restored\"[^}]*' /tmp/warm.log | head -1; exit \$rc" ||
+  # by hand and end with it. warm.log is fcvm's output: log lines and JSON records. The
+  # restored record is printed whole (ack_ms, guest_phases). A snapshot miss also ends in
+  # a restore, so hit or miss is read from fcvm's last snapshot-cache line: a hit whose
+  # load fails falls back to a cold boot and logs "Snapshot miss" after the hit. Those
+  # lines are info, and fcvm logs warnings and up unless RUST_LOG says otherwise.
+  ssm "G0=\$(ls /sys/bus/pci/drivers/vfio-pci | grep -E '^[0-9a-f]{4}:' | head -1); prlimit --memlock=unlimited:unlimited sudo -u ubuntu -H XDG_RUNTIME_DIR=/run/user/1000 RUST_LOG=fcvm=info bash -c \"cd /tmp && bash /usr/local/lib/fcvm-fleet/warm.sh \$G0 /tmp/warm.log\" > /tmp/warm.out 2>&1; rc=\$?; tail -3 /tmp/warm.out; jq -cR 'fromjson? | objects | select(.status == \"restored\")' /tmp/warm.log | head -1; l=\$(grep -E 'snapshot hit|Snapshot miss' /tmp/warm.log | tail -1); case \"\$l\" in *'snapshot hit'*) echo 'snapshot: hit' ;; *'Snapshot miss'*) echo 'snapshot: miss' ;; *) echo 'snapshot: warm.log has no snapshot-cache line' ;; esac; echo \"\$l\"; exit \$rc" ||
     { echo "host: the first GPU VM failed"; exit 1; }
   t_vm=$(now)
   echo "host: first GPU VM done $((t_vm - t0)) ms after the request (includes SSM round trips)"

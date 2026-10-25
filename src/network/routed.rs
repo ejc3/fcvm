@@ -1531,7 +1531,7 @@ async fn detect_ipv6_dns(selected: Option<String>) -> Option<String> {
 }
 
 /// Detect the default IPv6 outgoing interface
-async fn detect_default_ipv6_interface() -> Option<String> {
+pub(crate) async fn detect_default_ipv6_interface() -> Option<String> {
     let output = tokio::process::Command::new("ip")
         .args(["-6", "route", "show", "default"])
         .output()

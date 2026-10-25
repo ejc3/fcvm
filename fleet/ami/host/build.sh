@@ -122,7 +122,11 @@ bake)
   # per-VM and per-run state, build caches and downloads that only setup reads.
   cd /mnt/fcvm-btrfs
   du -sh --apparent-size ./* 2>/dev/null | sort -h | tee "$S/store-du.txt"
-  tar -c --sparse --numeric-owner \
+  # --format=posix keeps modification times to the nanosecond. fcvm keys the snapshot
+  # cache by each driver and overlay image's SHA-256 and caches that digest in
+  # version-cache/ under the image's path, mtime and length, so with whole-second
+  # mtimes a host would hash the images again on its first GPU VM (#1219).
+  tar -c --sparse --numeric-owner --format=posix \
       --exclude=./vm-disks --exclude=./state --exclude=./cache --exclude='./cargo-target*' \
       --exclude=./renderer.oci.tar --exclude=./renderer.oci.tar.zst --exclude='./*.lock' \
       . | zstd -q -T0 -6 -o /var/lib/fcvm-fleet/store.tar.zst -f

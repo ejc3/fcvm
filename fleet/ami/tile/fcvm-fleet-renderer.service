@@ -1,12 +1,22 @@
 [Unit]
 Description=fcvm fleet tile: the renderer on the instance's one GPU (HTTP on 127.0.0.1:8080, TLS by nginx on 443)
-After=nvidia-persistenced.service
+# Started without waiting for cloud-init. A unit with default dependencies is ordered after
+# sysinit.target, and cloud-init's network stage (cloud-init.service) is ordered before
+# sysinit.target, so it would start only once that stage is done (about 8 s into a tile's
+# first boot). The renderer listens on 127.0.0.1 with host networking: it needs the local
+# filesystems and the GPU, not an address. It also starts before D-Bus (dbus.socket is
+# ordered after sysinit.target), so podman manages the container's cgroup itself
+# (--cgroup-manager=cgroupfs): crun's systemd manager fails with "cannot open sd-bus".
+DefaultDependencies=no
+After=local-fs.target systemd-tmpfiles-setup.service nvidia-persistenced.service
 Wants=nvidia-persistenced.service
+Conflicts=shutdown.target
+Before=shutdown.target
 
 [Service]
-ExecStartPre=-/usr/bin/podman rm -f renderer
-ExecStart=/usr/bin/podman run --rm --name renderer --network host --device nvidia.com/gpu=all -e PORT=8080 localhost/fcvm-renderer:fleet
-ExecStop=/usr/bin/podman stop -t 5 renderer
+ExecStartPre=-/usr/bin/podman --cgroup-manager=cgroupfs rm -f renderer
+ExecStart=/usr/bin/podman --cgroup-manager=cgroupfs run --rm --name renderer --network host --device nvidia.com/gpu=all -e PORT=8080 localhost/fcvm-renderer:fleet
+ExecStop=/usr/bin/podman --cgroup-manager=cgroupfs stop -t 5 renderer
 Restart=always
 RestartSec=2
 

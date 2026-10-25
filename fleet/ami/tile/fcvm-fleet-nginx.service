@@ -1,0 +1,24 @@
+[Unit]
+Description=fcvm fleet tile: nginx, TLS on 443 in front of the renderer
+# The distribution's nginx.service is ordered after network-online.target, which waits for
+# cloud-init's network stage, and a drop-in cannot remove an ordering; this unit replaces it
+# (build.sh disables nginx.service). It needs the certificate and nothing else: it listens on
+# the wildcard address.
+DefaultDependencies=no
+Requires=fcvm-fleet-tls.service
+After=fcvm-fleet-tls.service local-fs.target systemd-tmpfiles-setup.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=forking
+PIDFile=/run/nginx.pid
+ExecStartPre=/usr/sbin/nginx -t -q -g 'daemon on; master_process on;'
+ExecStart=/usr/sbin/nginx -g 'daemon on; master_process on;'
+ExecReload=/usr/sbin/nginx -g 'daemon on; master_process on;' -s reload
+ExecStop=-/sbin/start-stop-daemon --quiet --stop --retry QUIT/5 --pidfile /run/nginx.pid
+TimeoutStopSec=5
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

@@ -23,6 +23,7 @@ pub mod codec;
 pub mod compose;
 pub mod frame;
 mod tile;
+pub mod tls;
 
 use crate::cli::{FleetAggregateArgs, FleetAggregateCodec};
 use crate::fleet::now_ms;
@@ -930,6 +931,15 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .with_state(shared)
 }
 
+/// What a public listener (`--tls-listen`) serves: the region stream and the health check,
+/// never the layout or the stats.
+pub fn public_router(shared: Arc<Shared>) -> Router {
+    Router::new()
+        .route("/frames", get(frames_route))
+        .route("/healthz", get(|| async { "ok" }))
+        .with_state(shared)
+}
+
 pub async fn cmd(args: FleetAggregateArgs) -> Result<()> {
     let codec: Arc<dyn Codec> = match args.codec {
         FleetAggregateCodec::Ffmpeg => Arc::new(codec::Ffmpeg { bin: args.ffmpeg }),
@@ -959,19 +969,46 @@ pub async fn cmd(args: FleetAggregateArgs) -> Result<()> {
             .with_context(|| format!("reading {}", path.display()))?;
         shared.set_layout(l);
     }
+    // The public listeners are bound before the private one, so a started aggregator
+    // (the private `/healthz` answers) is serving every address it was given.
+    let mut public = tokio::task::JoinSet::new();
+    if !args.tls_listen.is_empty() {
+        let file = args
+            .tls_file
+            .as_deref()
+            .context("--tls-listen needs --tls-file")?;
+        let certs = tls::CertFile::load(file)?;
+        tokio::spawn(certs.clone().watch(tls::RELOAD));
+        for addr in &args.tls_listen {
+            let l = tls::TlsListener::bind(addr, certs.clone()).await?;
+            eprintln!(
+                "fleet aggregator serving /frames with TLS on {}",
+                l.address()
+            );
+            let app = public_router(shared.clone());
+            let addr = addr.clone();
+            public.spawn(async move { (addr, axum::serve(l, app).await) });
+        }
+    }
     let cancel = CancellationToken::new();
     tokio::spawn(run(shared.clone(), codec, opts, cancel.clone()));
     let listener = tokio::net::TcpListener::bind(&args.listen)
         .await
         .with_context(|| format!("listening on {}", args.listen))?;
     eprintln!("fleet aggregator listening on {}", listener.local_addr()?);
-    axum::serve(
-        listener,
-        router(shared).into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await?;
+    let result = tokio::select! {
+        r = axum::serve(
+            listener,
+            router(shared).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        ) => r.map_err(anyhow::Error::from),
+        Some(r) = public.join_next() => match r {
+            Ok((addr, Ok(()))) => Err(anyhow::anyhow!("the listener on {addr} stopped")),
+            Ok((addr, Err(e))) => Err(anyhow::Error::from(e).context(format!("serving on {addr}"))),
+            Err(e) => Err(anyhow::Error::from(e)),
+        },
+    };
     cancel.cancel();
-    Ok(())
+    result
 }
 
 #[cfg(test)]
