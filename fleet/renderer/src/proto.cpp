@@ -1,6 +1,8 @@
 #include "proto.h"
 
+#include <cstdio>
 #include <cstring>
+#include <random>
 
 void fcvf_header(uint8_t o[FCVF_HEADER_BYTES], bool keyframe, int w, int h, double t, uint32_t frame) {
   o[0] = 'F'; o[1] = 'C'; o[2] = 'V'; o[3] = 'F';
@@ -96,4 +98,24 @@ std::string ws_frame(int opcode, const void* data, size_t n) {
   }
   f.append((const char*)data, n);
   return f;
+}
+
+std::string new_boot_id() {
+  unsigned char b[16];
+  size_t got = 0;
+  if (FILE* f = fopen("/dev/urandom", "rb")) {
+    got = fread(b, 1, sizeof b, f);
+    fclose(f);
+  }
+  if (got != sizeof b) {
+    std::random_device rd;
+    for (auto& c : b) c = (unsigned char)rd();
+  }
+  static const char hex[] = "0123456789abcdef";
+  std::string out;
+  for (unsigned char c : b) {
+    out += hex[c >> 4];
+    out += hex[c & 15];
+  }
+  return out;
 }

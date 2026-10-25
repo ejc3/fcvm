@@ -220,6 +220,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Coordinator release and IPv4 staging probe tests
         run: python3 -B fleet/coord/test_release.py
+      - name: Operator script tests (fleet/tools)
+        run: make -C fleet/tools test
       - name: Renderer host tests
         run: |
           set -euo pipefail

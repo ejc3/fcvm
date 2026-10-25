@@ -290,6 +290,18 @@ pub struct FleetCoordArgs {
     /// An on-demand tile launch template, tried when every region refuses spot capacity
     #[arg(long)]
     pub ec2_on_demand_template: Option<String>,
+
+    /// The subnets (one per AZ) to launch EC2 tiles in, per region, tried in order before
+    /// the next region: `<region>:<subnet>[,<subnet>...]`, repeatable (FLEET_EC2_SUBNETS:
+    /// entries separated by spaces). A region without any launches in the template's subnet.
+    #[arg(long, env = "FLEET_EC2_SUBNETS", value_delimiter = ' ')]
+    pub ec2_subnets: Vec<String>,
+
+    /// The security group of a tile's interface in each region with --ec2-subnets:
+    /// `<region>:<group id>`, repeatable (FLEET_EC2_SECURITY_GROUPS: entries separated by
+    /// spaces)
+    #[arg(long, env = "FLEET_EC2_SECURITY_GROUPS", value_delimiter = ' ')]
+    pub ec2_security_group: Vec<String>,
     /// This fleet's name, tagged on its EC2 tiles at launch (`Fleet=<name>`). At start and
     /// shutdown the coordinator terminates the tiles tagged with it, so two fleets in one
     /// account (staging and production) need different names.
