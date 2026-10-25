@@ -7,12 +7,13 @@ output bitrate, and whether the joined region is seamless.
 Needs the renderer's tools (fleet/renderer/tools) for its frame client, Pillow and the
 ffmpeg CLI. Writes OUT/aggregate.json and the images it compares.
 """
-import json, os, struct, subprocess, sys, threading, time, urllib.request
+import json, os, subprocess, sys, threading, time, urllib.request
 sys.path.insert(0, os.environ.get("FLEETCLIENT_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "renderer", "tools")))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fleetclient as fc  # noqa: E402
 import fleetlive  # noqa: E402
 from fleetlive import Live, all_running, fcvm_tiles  # noqa: E402
+from aggstream import Recorder, hostport, proc_cpu, require_listening_pid, wait_for_t  # noqa: E402
 from PIL import Image  # noqa: E402
 
 URL, OUT = sys.argv[1], sys.argv[2]
@@ -27,66 +28,6 @@ def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
-def hostport(url):
-    hp = url[len("ws://"):].split("/")[0]
-    h, p = hp.rsplit(":", 1)
-    return h, int(p)
-
-
-def proc_cpu(pid):
-    """utime+stime in seconds of pid and its children (the ffmpeg processes, which any of
-    its threads may have started)."""
-    tck = os.sysconf("SC_CLK_TCK")
-    kids = []
-    for task in os.listdir(f"/proc/{pid}/task"):
-        try:
-            kids += [int(c) for c in open(f"/proc/{pid}/task/{task}/children").read().split()]
-        except OSError:
-            pass
-    total = 0.0
-    for p in [pid] + kids:
-        try:
-            f = open(f"/proc/{p}/stat").read().rsplit(")", 1)[1].split()
-            total += (int(f[11]) + int(f[12])) / tck
-        except OSError:
-            pass
-    return total, 1 + len(kids)
-
-
-def pid_listening(port):
-    out = subprocess.run(["ss", "-ltnpH", f"sport = :{port}"], capture_output=True, text=True).stdout
-    for part in out.split("pid=")[1:]:
-        return int(part.split(",")[0])
-    return None
-
-
-class Recorder:
-    """A frame stream: receive time per t, bytes, header, (optionally) frames kept."""
-
-    def __init__(self, host, port, h, keep_until=None):
-        self.host, self.port, self.h, self.keep_until = host, port, h, keep_until
-        self.recv, self.bytes, self.header, self.frames, self.stop = {}, 0, None, [], False
-        self.t = threading.Thread(target=self.run, daemon=True)
-        self.t.start()
-
-    def run(self):
-        s = fc.Stream(self.host, self.port, self.h)
-        try:
-            while not self.stop:
-                op, pl = s.recv()
-                now = time.time()
-                if op == 1:
-                    self.header = json.loads(pl)
-                elif op == 2:
-                    m, au = fc.parse_fcvf(pl)
-                    self.recv.setdefault(m["t"], now)
-                    self.bytes += len(pl)
-                    if self.keep_until is not None and (not self.frames or self.frames[-1][0]["t"] < self.keep_until):
-                        self.frames.append((m, au))
-        finally:
-            s.close()
-
-
 v = Live()
 st = v.until(lambda s: all_running(s) and any(a["frame_url"] for a in s["aggregates"] if a["half"] == "fcvm"), 1800)
 agg = [a for a in st["aggregates"] if a["half"] == "fcvm" and a["frame_url"]][0]
@@ -94,7 +35,7 @@ tiles = {t["id"]: t for t in fcvm_tiles(st)}
 ah, ap = hostport(agg["frame_url"])
 ah = "127.0.0.1"
 log("aggregate", agg["id"], "rect", agg["rect"], "tiles", agg["tiles"])
-agg_pid = pid_listening(ap)
+agg_pid = require_listening_pid(ap)
 image_aspect = st["image_aspect"]
 layout = json.loads(urllib.request.urlopen(f"http://{ah}:{ap}/layout", timeout=5).read())
 # Reach each tile the way the aggregator does (its host-local plain URL): the snapshot's
@@ -195,8 +136,8 @@ def raw(tid):
 ths = [threading.Thread(target=raw, args=(tid,)) for tid in agg["tiles"]]
 [t.start() for t in ths]
 [t.join() for t in ths]
-while not rec.frames or rec.frames[-1][0]["t"] < T:
-    time.sleep(0.05)
+# T is 5 s ahead, and the stream can end (the aggregator stopped): bounded either way.
+wait_for_t(rec, T, 60)
 rec.stop = True
 hdr = rec.header
 fr = rec.frames
