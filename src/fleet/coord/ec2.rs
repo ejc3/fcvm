@@ -31,6 +31,10 @@ const CAPACITY_RETRY: Duration = Duration::from_secs(10);
 /// How often a running tile's instance is checked.
 const LIVENESS_EVERY: Duration = Duration::from_secs(15);
 
+/// How many checks in a row a running tile's renderer may leave unanswered before the tile
+/// is launched again (45 s at [`LIVENESS_EVERY`]): one lost probe is not a crash.
+const RENDERER_SILENT_LIMIT: u32 = 3;
+
 /// How long the EC2 side waits before trying a failed sweep again.
 const SWEEP_RETRY: Duration = Duration::from_secs(10);
 
@@ -42,6 +46,18 @@ pub struct Launched {
     /// Its public addresses, once known (for its DNS names).
     pub ipv6: Option<String>,
     pub ipv4: Option<String>,
+}
+
+/// What a liveness check found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Liveness {
+    Alive,
+    /// The instance is gone (a spot reclaim), or its renderer reports that it failed: the
+    /// tile is launched again.
+    Dead(String),
+    /// The instance runs and its renderer did not answer: after
+    /// [`RENDERER_SILENT_LIMIT`] such checks in a row the tile is launched again.
+    Silent(String),
 }
 
 #[derive(Debug)]
@@ -89,10 +105,11 @@ pub trait Ec2Driver: Send + Sync {
         Ok(0)
     }
     /// Whether the instance still exists (not shutting down, terminated, stopping or
-    /// stopped). A running tile is checked every [`Ec2Driver::liveness_every`]; one that is
-    /// gone (a spot reclaim) is launched again. An error is taken as unknown.
-    async fn alive(&self, _launched: &Launched) -> Result<bool> {
-        Ok(true)
+    /// stopped) and its renderer still serves. A running tile is checked every
+    /// [`Ec2Driver::liveness_every`]; one that is gone (a spot reclaim) or whose renderer
+    /// stopped is launched again. An error is taken as unknown.
+    async fn alive(&self, _tile: &str, _launched: &Launched) -> Result<Liveness> {
+        Ok(Liveness::Alive)
     }
     fn liveness_every(&self) -> Duration {
         LIVENESS_EVERY
@@ -313,8 +330,13 @@ pub async fn run(
     }
 }
 
+/// Report the tile's phase, unless its task is retired: once the tile has left the
+/// assignment (its sender is gone) a task for its return may already report on the same
+/// slot, and this task's report would overwrite it.
+#[allow(clippy::too_many_arguments)]
 async fn report(
     handle: &Handle,
+    want: &watch::Receiver<u64>,
     id: &str,
     phase: &str,
     generation: u64,
@@ -323,6 +345,9 @@ async fn report(
     // What went wrong, and when the tile tries again.
     problem: Option<(String, Option<Duration>)>,
 ) {
+    if want.has_changed().is_err() {
+        return;
+    }
     let (error, retry_in) = match problem {
         Some((e, r)) => (Some(e), r),
         None => (None, None),
@@ -377,6 +402,7 @@ async fn tile(
             }
             report(
                 &handle,
+                &want,
                 &id,
                 "launching",
                 generation,
@@ -414,6 +440,7 @@ async fn tile(
                     }
                     report(
                         &handle,
+                        &want,
                         &id,
                         "starting",
                         generation,
@@ -438,6 +465,7 @@ async fn tile(
                             timings.insert("total_ms".into(), t0.elapsed().as_millis() as u64);
                             report(
                                 &handle,
+                                &want,
                                 &id,
                                 "running",
                                 generation,
@@ -449,6 +477,14 @@ async fn tile(
                             retry = Duration::from_secs(1);
                             l
                         }
+                        // The tile left while its instance started: only terminate it. A
+                        // task for the tile's return may already run on the same slot.
+                        Err(_) if want.has_changed().is_err() => {
+                            if let Err(e) = driver.terminate(&l.instance).await {
+                                tracing::warn!(instance = %l.instance, error = %e, "terminate failed");
+                            }
+                            break;
+                        }
                         Err(e) => {
                             // The instance never served: terminate it and launch the
                             // generation again after the backoff.
@@ -456,6 +492,7 @@ async fn tile(
                             retry = (retry * 2).min(Duration::from_secs(30));
                             report(
                                 &handle,
+                                &want,
                                 &id,
                                 "failed",
                                 generation,
@@ -483,6 +520,7 @@ async fn tile(
                     );
                     report(
                         &handle,
+                        &want,
                         &id,
                         "waiting_capacity",
                         generation,
@@ -501,6 +539,7 @@ async fn tile(
                     retry = (retry * 2).min(Duration::from_secs(30));
                     report(
                         &handle,
+                        &want,
                         &id,
                         "failed",
                         generation,
@@ -516,6 +555,8 @@ async fn tile(
                 }
             }
         }
+        // Renderer checks left unanswered in a row.
+        let mut silent = 0;
         let gone = loop {
             let check = tokio::time::sleep(driver.liveness_every());
             tokio::select! {
@@ -523,13 +564,23 @@ async fn tile(
                     if r.is_err() {
                         break None;
                     }
-                    break Some(false);
+                    break Some(None);
                 }
                 _ = check => {
                     let Some((l, _)) = &current else { continue };
-                    match driver.alive(l).await {
-                        Ok(false) => break Some(true),
-                        Ok(true) => {}
+                    match driver.alive(&id, l).await {
+                        Ok(Liveness::Alive) => silent = 0,
+                        Ok(Liveness::Dead(why)) => break Some(Some(why)),
+                        Ok(Liveness::Silent(why)) => {
+                            silent += 1;
+                            tracing::debug!(tile = %id, silent, error = %why, "tile renderer did not answer");
+                            if silent >= RENDERER_SILENT_LIMIT {
+                                break Some(Some(format!(
+                                    "the renderer on {} did not answer {silent} checks in a row: {why}",
+                                    l.instance
+                                )));
+                            }
+                        }
                         Err(e) => tracing::debug!(tile = %id, error = %format!("{e:#}"), "tile liveness unknown"),
                     }
                 }
@@ -537,22 +588,24 @@ async fn tile(
         };
         match gone {
             None => break,
-            Some(false) => {}
-            Some(true) => {
-                // The instance went away under a running tile (a spot reclaim): report it,
-                // and launch the same generation again after the backoff.
+            Some(None) => {}
+            Some(Some(why)) => {
+                // The instance went away under a running tile (a spot reclaim), or its
+                // renderer stopped: report it, terminate the instance, and launch the same
+                // generation again after the backoff.
                 let (l, generation) = current.take().expect("checked a current instance");
                 remove_own(&running, &id, token);
                 let wait = retry;
                 retry = (retry * 2).min(Duration::from_secs(30));
                 report(
                     &handle,
+                    &want,
                     &id,
                     "failed",
                     generation,
                     Some(&l),
                     &BTreeMap::new(),
-                    Some((format!("instance {} is gone", l.instance), Some(wait))),
+                    Some((why, Some(wait))),
                 )
                 .await;
                 if let Err(e) = driver.terminate(&l.instance).await {

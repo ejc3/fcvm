@@ -224,6 +224,36 @@ fn skipping_drafts_requires_ready_for_review() {
     }
 }
 
+/// The scope logic the `changes` job runs: its `run:` steps, plus every repository
+/// script a step invokes as `bash scripts/<name>`. The path classifier lives in
+/// `scripts/ci-pr-scope.sh`.
+fn changes_scripts() -> String {
+    let ci = parse_workflow("ci.yml");
+    let steps = ci
+        .get("jobs")
+        .and_then(|j| j.get("changes"))
+        .and_then(|c| c.get("steps"))
+        .and_then(Value::as_sequence)
+        .expect("the `changes` job has no steps");
+    let mut out = Vec::new();
+    for run in steps
+        .iter()
+        .filter_map(|s| s.get("run").and_then(Value::as_str))
+    {
+        out.push(run.to_string());
+        for word in run.split_whitespace() {
+            if word.starts_with("scripts/") && word.ends_with(".sh") {
+                let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(word);
+                out.push(
+                    std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("`changes` runs {word}, unreadable: {e}")),
+                );
+            }
+        }
+    }
+    out.join("\n")
+}
+
 /// Excluding a path from the expensive matrix must ROUTE it, not silence it.
 ///
 /// bench/** no longer sets `code`, because the self-hosted matrix does not
@@ -239,7 +269,7 @@ fn skipping_drafts_requires_ready_for_review() {
 #[test]
 fn a_path_excluded_from_the_matrix_still_gets_a_check() {
     let ci = parse_workflow("ci.yml");
-    let text = std::fs::read_to_string(workflow_path("ci.yml")).expect("ci.yml must be readable");
+    let text = changes_scripts();
 
     // Only binding once bench is classified separately from code.
     if !text.contains("bench=true") {
@@ -283,7 +313,7 @@ fn a_path_excluded_from_the_matrix_still_gets_a_check() {
 #[test]
 fn fleet_web_changes_run_the_fleet_web_job() {
     let ci = parse_workflow("ci.yml");
-    let text = std::fs::read_to_string(workflow_path("ci.yml")).expect("ci.yml must be readable");
+    let text = changes_scripts();
     let web_arm = text
         .find("fleet/web/*) web=true")
         .expect("`changes` does not route fleet/web/* to `web`");
@@ -322,13 +352,19 @@ fn fleet_web_changes_run_the_fleet_web_job() {
         text.contains(".github/workflows/ci.yml) code=true; web=true"),
         "a ci.yml-only change does not run `fleet-web`, so a broken fleet-web job merges green"
     );
-    // Every fail-open branch opens the web gate too.
-    assert_eq!(
-        text.matches("echo \"web=true\" >> \"$GITHUB_OUTPUT\"")
-            .count(),
-        2,
-        "a fail-open branch of `changes` leaves `web` unset"
-    );
+    // Every fail-open branch opens the web gate too: each `emit true` that is not
+    // the classifier's own verdict opens all four gates.
+    for line in text
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("emit true "))
+    {
+        assert!(
+            line == "emit true \"$scope\" \"$code\" \"$bench\" \"$fleet\" \"$web\""
+                || line.ends_with(" true true true true"),
+            "a fail-open branch of `changes` leaves a gate closed: {line}"
+        );
+    }
 }
 
 #[test]
@@ -1031,7 +1067,7 @@ fn expensive_jobs_are_gated_on_the_changes_job() {
     let changes = jobs
         .get(Value::from("changes"))
         .expect("ci.yml has no `changes` job to decide whether the matrix is meaningful");
-    let detect = format!("{changes:?}");
+    let detect = format!("{changes:?}\n{}", changes_scripts());
     for ignored in [
         "scripts/claude-assistant/",
         ".github/workflows/claude",
@@ -1098,10 +1134,13 @@ fn workflow_changes_get_a_relevant_gated_check() {
         "ci.yml no longer defines an `actionlint` job, so a workflow-only PR skips the \
                  matrix and nothing else can fail for it",
     );
-    assert!(
-        actionlint.get("if").is_none(),
-        "the `actionlint` job must not be gated on `changes`: workflow-only PRs are exactly \
-         the case it exists to cover"
+    // Gated only on whether this run tests anything (a draft or a lower stack PR
+    // does not), never on which paths changed: workflow-only PRs are exactly the
+    // case it exists to cover.
+    assert_eq!(
+        actionlint.get("if").and_then(Value::as_str),
+        Some("${{ needs.changes.outputs.run == 'true' }}"),
+        "the `actionlint` job must be gated on `changes.outputs.run` alone"
     );
 
     let needs: Vec<String> = jobs
@@ -1331,16 +1370,11 @@ fn hygiene_script_refuses_a_home_that_is_not_the_users() {
 /// individually correct. A restatement would have the same ordering as whatever
 /// the test author believed, and would pass.
 fn classify_changed_path(path: &str) -> (bool, bool) {
-    let ci = parse_workflow("ci.yml");
-    let run = workflow_job(&ci, "changes")
-        .get("steps")
-        .and_then(Value::as_sequence)
-        .expect("`changes` job has no `steps:`")
-        .iter()
-        .filter_map(|s| s.get("run").and_then(Value::as_str))
-        .find(|r| r.contains("case \"$f\" in"))
-        .expect("`changes` job no longer classifies paths with a `case` — update this test")
-        .to_string();
+    let run = changes_scripts();
+    assert!(
+        run.contains("case \"$f\" in"),
+        "`changes` no longer classifies paths with a `case` — update this test"
+    );
 
     let start = run.find("case \"$f\" in").expect("case start");
     let end = run[start..].find("esac").expect("unterminated case") + start + "esac".len();
@@ -1461,6 +1495,7 @@ fn run_changes_step(event: &str) -> String {
 /// pull request's changed files (`Some(&[])` reports none), so the pull_request
 /// path runs end to end through its `$GITHUB_OUTPUT` writes.
 fn run_changes_step_with_files(event: &str, files: Option<&[&str]>) -> String {
+    // The `changes` job's `run:` step itself, which invokes scripts/ci-pr-scope.sh.
     let ci = parse_workflow("ci.yml");
     let run = workflow_job(&ci, "changes")
         .get("steps")
@@ -1468,8 +1503,8 @@ fn run_changes_step_with_files(event: &str, files: Option<&[&str]>) -> String {
         .expect("`changes` job has no `steps:`")
         .iter()
         .filter_map(|s| s.get("run").and_then(Value::as_str))
-        .find(|r| r.contains("case \"$f\" in"))
-        .expect("`changes` job no longer classifies paths — update this test")
+        .find(|r| r.contains("scripts/ci-pr-scope.sh"))
+        .expect("`changes` job no longer runs scripts/ci-pr-scope.sh — update this test")
         .to_string();
 
     static CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -1496,13 +1531,23 @@ fn run_changes_step_with_files(event: &str, files: Option<&[&str]>) -> String {
         let path = std::env::var("PATH").unwrap_or_default();
         command.env("PATH", format!("{}:{path}", bin.display()));
     }
+    // The stub answers every `gh api` call with the file list, so the query for PRs
+    // stacked on this one finds no PR numbers and this PR is classified as a top PR
+    // based on the default branch.
     let status = command
         .arg("-c")
         .arg(&run)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("EVENT", event)
         .env("GITHUB_OUTPUT", &out_file)
         .env("REPO", "o/r")
         .env("PR", "1")
+        .env("DRAFT", "false")
+        .env("HEAD_REPO", "o/r")
+        .env("HEAD_REF", "example-branch")
+        .env("HEAD_SHA", "0000000000000000000000000000000000000000")
+        .env("BASE_REF", "main")
+        .env("DEFAULT_BRANCH", "main")
         .output()
         .expect("run the changes step");
     assert!(
@@ -1645,15 +1690,11 @@ fn a_renderer_change_runs_the_fleet_renderer_job_and_not_the_matrix() {
 /// on exactly the renamed entries and is what closes it.
 #[test]
 fn renames_are_classified_by_their_source_path_too() {
-    let ci = parse_workflow("ci.yml");
-    let run = workflow_job(&ci, "changes")
-        .get("steps")
-        .and_then(Value::as_sequence)
-        .expect("`changes` job has no `steps:`")
-        .iter()
-        .filter_map(|s| s.get("run").and_then(Value::as_str))
-        .find(|r| r.contains("gh api"))
-        .expect("`changes` job no longer lists changed files");
+    let script = changes_scripts();
+    let at = script
+        .find("pulls/$PR/files")
+        .expect("`changes` no longer lists the pull request's changed files");
+    let run = &script[at..];
     // Assert on the --jq ARGUMENT, not on the whole `run:` block. The block now
     // explains previous_filename in prose, so `run.contains("previous_filename")`
     // stayed true even with the query reverted to `.[].filename` -- a test that
@@ -1708,17 +1749,9 @@ fn the_changes_job_emits_every_output_the_matrix_gates_on() {
         .and_then(Value::as_mapping)
         .expect("ci.yml has no `changes` job");
 
-    // Every step's `run:` in the changes job, concatenated: this is where the
+    // The changes job's steps and the scope script they run: this is where the
     // GITHUB_OUTPUT writes live.
-    let scripts: String = changes
-        .get(Value::from("steps"))
-        .and_then(Value::as_sequence)
-        .expect("the `changes` job has no steps")
-        .iter()
-        .filter_map(Value::as_mapping)
-        .filter_map(|s| s.get(Value::from("run")).and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let scripts = changes_scripts();
 
     let declared = changes
         .get(Value::from("outputs"))
@@ -1738,27 +1771,28 @@ fn the_changes_job_emits_every_output_the_matrix_gates_on() {
              `outputs.{name}`. Every consumer of `needs.changes.outputs.{name}` will see the \
              empty string, so its gated jobs skip and `summary` goes green having run nothing."
         );
-        // And the script must write that key from the COMPUTED variable, not
-        // merely somewhere. There are three writes of `code=` in this file: two
-        // fail-open branches emit the literal `code=true`, and the main path
-        // emits `code=$code`. An earlier version of this assertion accepted any
-        // `echo "code="`, so deleting the MAIN write still passed -- the
-        // fail-opens covered for it. That is the same disease this test exists
-        // to cure, one level up, and mutation testing is what exposed it.
+        // `emit` writes each output from its positional argument. A declared
+        // output the function does not write is the empty string to every consumer.
+        let position = ["run", "reason", "code", "bench", "fleet", "web"]
+            .iter()
+            .position(|k| *k == name)
+            .unwrap_or_else(|| panic!("`changes` declares `{name}`, which `emit` does not write"))
+            + 1;
         assert!(
-            scripts.contains(&format!("echo \"{name}=${name}\"")),
-            "`changes` declares output `{name}` but no step writes `{name}=${name}` to \
-             $GITHUB_OUTPUT, so the classifier's verdict never reaches the matrix and every \
-             job gated on it skips while `summary` goes green"
-        );
-        // The fail-open branches must ALSO open this gate. A fail-open that
-        // opens only some gates is the hole this file already documents.
-        assert!(
-            scripts.contains(&format!("echo \"{name}=true\"")),
-            "no fail-open branch writes `{name}=true`, so a path the classifier cannot \
-             evaluate leaves `{name}` closed and its jobs never run"
+            scripts.contains(&format!("echo \"{name}=${position}\"")),
+            "`emit` does not write `{name}` from argument {position}, so its consumers read \
+             the empty string and every job gated on it skips while `summary` goes green"
         );
     }
+    // The classifier's verdict reaches the gates from the COMPUTED variables. An
+    // earlier version accepted any write of `code=`, so deleting the main write
+    // still passed because the fail-open branches covered for it; mutation testing
+    // exposed that. The fail-open branches are pinned in
+    // fleet_web_changes_run_the_fleet_web_job.
+    assert!(
+        scripts.contains("emit true \"$scope\" \"$code\" \"$bench\" \"$fleet\" \"$web\""),
+        "the classifier's own verdict is not emitted from $code, $bench, $fleet and $web"
+    );
 
     // And the reverse: nothing may gate on an output `changes` does not declare.
     let whole = std::fs::read_to_string(workflow_path("ci.yml")).expect("ci.yml is unreadable");
@@ -2290,6 +2324,7 @@ fn main_runs_the_x64_jobs_its_pull_request_left_out() {
     let pr = planned_jobs(&run_matrix_plan("pull_request", false, &[]));
     let mut reported: Vec<&str> = pr.iter().map(String::as_str).collect();
     reported.push("Lint");
+    reported.push("Summary");
     let main = planned_jobs(&run_matrix_plan("push", true, &reported));
     assert!(
         pr.is_disjoint(&main),
@@ -2327,8 +2362,10 @@ fn runs_without_a_passing_pull_request_tree_get_the_full_matrix() {
 /// reports under the unexpanded matrix names.
 #[test]
 fn main_skips_the_matrix_when_its_pull_request_needed_nothing_more() {
+    let mut passed: Vec<&str> = SELF_HOSTED_JOBS.to_vec();
+    passed.push("Summary");
     assert!(
-        planned_jobs(&run_matrix_plan("push", true, &SELF_HOSTED_JOBS)).is_empty(),
+        planned_jobs(&run_matrix_plan("push", true, &passed)).is_empty(),
         "every self-hosted job already passed for this tree, so main must run none"
     );
     let skipped = [
@@ -2336,10 +2373,34 @@ fn main_skips_the_matrix_when_its_pull_request_needed_nothing_more() {
         "Host-Root-${{ matrix.arch }}-${{ matrix.mode }}",
         "Container-${{ matrix.arch }}",
         "Lint",
+        "Summary",
     ];
     assert!(
         planned_jobs(&run_matrix_plan("push", true, &skipped)).is_empty(),
         "the PR run skipped the matrix for this tree, so main must skip it too"
+    );
+}
+
+/// A PR run that tested nothing is not evidence for main. A draft's or a lower stack PR's
+/// run skips every job (so the jobs API reports the unexpanded matrix names, the same as
+/// a run whose `changes` job skipped the matrix) and succeeds under a Summary named
+/// "Summary (deferred)". Reusing it would skip every self-hosted job on main.
+#[test]
+fn main_ignores_a_pull_request_run_that_tested_nothing() {
+    let deferred = [
+        "Changes",
+        "Skip Check",
+        "Host-${{ matrix.arch }}",
+        "Host-Root-${{ matrix.arch }}-${{ matrix.mode }}",
+        "Container-${{ matrix.arch }}",
+        "Lint",
+        "actionlint",
+        "Summary (deferred)",
+    ];
+    assert_eq!(
+        planned_jobs(&run_matrix_plan("push", true, &deferred)),
+        job_set(&SELF_HOSTED_JOBS),
+        "main reused a deferred PR run and skipped self-hosted jobs nothing tested"
     );
 }
 
@@ -2495,6 +2556,23 @@ fn the_staging_access_check_passes_access_and_an_unresolved_host_and_fails_anyth
 
     let (code, out) = run_access_check("000 curl: (28) Operation timed out", 28);
     assert_eq!(code, 1, "any other curl failure must fail: {out}");
+
+    // The status is part of the verdict: a redirect that arrived with a transfer error, and the
+    // resolver's words under any other exit status, are not the two answers that pass.
+    let (code, out) = run_access_check(
+        "302 https://example-team.cloudflareaccess.com/cdn-cgi/access/login",
+        18,
+    );
+    assert_eq!(
+        code, 1,
+        "the Access redirect after a curl error must fail: {out}"
+    );
+
+    let (code, out) = run_access_check("000 curl: (28) Could not resolve host: stage.fcvm.dev", 28);
+    assert_eq!(
+        code, 1,
+        "the resolver's message under another exit status must fail: {out}"
+    );
 }
 
 /// The `run:` scripts of a job's steps, in order, with each step's name.

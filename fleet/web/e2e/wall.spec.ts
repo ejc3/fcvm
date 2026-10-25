@@ -507,6 +507,16 @@ test("switching streams never shows a region without a frame, nor a t going back
   expect(await page.evaluate(() => window.localStorage.getItem("fleet-wall.mode"))).toBe("direct");
 });
 
+test("a page that starts direct says it draws direct from its first plan", async ({ page }) => {
+  await openWall(page, 15, "direct");
+  // The worker's first plan names the mode it already draws, and the page still hears it.
+  expect(await page.evaluate(() => window.__fleet!.client.getState().ui.shownMode)).toBe("direct");
+  expect(await page.evaluate(() => Object.keys(window.__fleet!.client.getState().frames?.tiles ?? {}).every((k) => k.startsWith("d:")))).toBe(true);
+  // So it does not call itself switching.
+  await page.getByTestId("play").click();
+  await expect(page.getByTestId("streams-note")).not.toContainText("switching");
+});
+
 test("aggregated is the default: no seam, and tile state drawn exactly as in direct mode", { tag: "@engines" }, async ({ page }) => {
   await page.goto("/?debug=1");
   await page.waitForFunction(() => window.__fleet !== undefined);
@@ -663,6 +673,27 @@ test("a paused picture survives frames arriving and a redraw: no tile goes dark"
     if (px[0] === 6 && px[1] === 8 && px[2] === 11) flat.set(pt.id, (flat.get(pt.id) ?? 0) + 1);
   });
   for (const id of new Set(pts.map((pt) => pt.id))) expect(flat.get(id) ?? 0, `tile ${id}: points drawn as the empty fill, of 25`).toBeLessThan(13);
+});
+
+test("a paused tile whose stream reopens gets a frame again, and the rest of the picture stays where it was", async ({ page }) => {
+  await openWall(page, 15, "direct");
+  await page.getByTestId("pause").click();
+  await expect(page.getByTestId("pause")).toHaveAttribute("aria-pressed", "true");
+  const T = await drawnT(page);
+  // The VM fails and comes back (another viewer restarting it): its stream closes, dropping the frozen frame, and reopens.
+  await admin("/mock/fault", { fail: "fcvm:2", message: "the VM did not come back", retry_ms: 2000 });
+  await expect(page.getByTestId("dark-fcvm:2")).toHaveAttribute("data-kind", "failed");
+  await expect(page.getByTestId("dark-fcvm:2")).toHaveCount(0, { timeout: 30_000 });
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().frames?.tiles["d:fcvm:2"]?.newestT ?? null), { timeout: 30_000 }).not.toBeNull();
+  await page.waitForTimeout(1500);
+  const box = await tileBox(page, "fcvm:2");
+  const pts = Array.from({ length: 25 }, (_, k) => ({ x: box.x + (box.w * (1 + (k % 5))) / 6, y: box.y + (box.h * (1 + Math.floor(k / 5))) / 6 }));
+  const res = await page.evaluate((p) => window.__fleet!.client.capture(p), pts);
+  // Still the picture paused at T, with a frame of its own in the reopened tile: not the flat empty fill (6,8,11).
+  expect(res.T).toBe(T);
+  const flat = res.pixels.filter((px) => px[0] === 6 && px[1] === 8 && px[2] === 11).length;
+  expect(flat, "points of the reopened tile drawn as the empty fill, of 25").toBeLessThan(13);
+  await expect(page.getByTestId("pause")).toHaveAttribute("aria-pressed", "true");
 });
 
 test("with less motion asked for, a tile going dark fades instead of flashing", async ({ page }) => {
@@ -976,6 +1007,8 @@ test("a paused wall hidden past the limit comes back with a picture, and holds i
   });
   for (const id of new Set(pts.map((pt) => pt.id))) expect(flat.get(id) ?? 0, `tile ${id}: points drawn as the empty fill, of 25`).toBeLessThan(13);
   await expect(page.getByTestId("pause")).toHaveAttribute("aria-pressed", "true");
+  // The held picture was let go once the live one had faded in, though the frozen picture stopped drawing.
+  expect(trace.at(-1)!.held).toBe(false);
 });
 
 const reelDate = async () => utcDate(((await (await fetch(`${COORD}/media/wall-reel.json`)).json()) as { recorded_at: number }).recorded_at);
