@@ -27,21 +27,51 @@ t1=$(date +%s%N)
 # snapshot reads its blocks lazily from S3, which measured 4.6 MB/s (1.9 GB in 419 s),
 # while the instance role reads the object at network speed. The AMI's own copy is the
 # fallback.
+#
+# The archive is extracted into a tmpfs staging directory and then copied into the btrfs
+# with one `cp -a` (which keeps hard links and holes). GNU tar writing the store's sparse
+# images straight into the btrfs ran at about 270 MB/s: on a g4dn.metal (2026-10-25, the
+# bdaa0003 store, 12.7 GB of tar stream) the one stream took 51.8 s at boot, while the same
+# stream into tmpfs took 21.6 s and the copy into the btrfs 7.8 s (30.5 s in all, the
+# copy identical file for file). The staging needs the uncompressed store in memory; with
+# less than STAGE_MIN_KB free in /dev/shm the archive is extracted into the btrfs directly.
+STAGE_MIN_KB=$((48 * 1024 * 1024))
+stage=""
+if [ "$(df --output=avail -k /dev/shm 2>/dev/null | tail -1)" -ge "$STAGE_MIN_KB" ] 2>/dev/null; then
+  stage=$(mktemp -d /dev/shm/fcvm-fleet-store.XXXXXX)
+  trap 'rm -rf "$stage"' EXIT
+fi
+# --- restore functions (fleet/ami/check.sh runs these on a fixture) ---
+# extract: a tar stream on stdin into the store, through the staging directory if any.
+extract() {
+  if [ -n "$stage" ]; then
+    tar -x --sparse --same-owner --numeric-owner -C "$stage" && cp -a --sparse=always "$stage/." "$M/"
+  else
+    tar -x --sparse --same-owner --numeric-owner -C "$M"
+  fi
+}
+# empty: what a failed extraction left, before the fallback.
+empty() {
+  find "$M" -mindepth 1 -delete
+  if [ -n "$stage" ]; then find "$stage" -mindepth 1 -delete; fi
+}
+# --- end of restore functions ---
 src=none
 if [ -r /etc/fcvm-fleet/store.env ]; then
   . /etc/fcvm-fleet/store.env
   if /usr/local/lib/fcvm-fleet/s3-cat.py "$STORE_S3_REGION" "$STORE_S3_BUCKET" "$STORE_S3_KEY" \
-      | zstd -q -d -T0 | tar -x --sparse --same-owner --numeric-owner -C "$M"; then
+      | zstd -q -d -T0 | extract; then
     src=s3
   else
     echo "fetching s3://$STORE_S3_BUCKET/$STORE_S3_KEY failed; restoring from the AMI's copy"
-    find "$M" -mindepth 1 -delete
+    empty
   fi
 fi
 if [ "$src" = none ] && [ -s "$ARCHIVE" ]; then
-  zstd -q -d -T0 -c "$ARCHIVE" | tar -x --sparse --same-owner --numeric-owner -C "$M"
+  zstd -q -d -T0 -c "$ARCHIVE" | extract
   src=ami
 fi
+if [ -n "$stage" ]; then rm -rf "$stage"; src="$src via tmpfs"; fi
 chown ubuntu:ubuntu "$M"
 t2=$(date +%s%N)
 echo "fcvm-fleet-store: mkfs+mount $(( (t1 - t0) / 1000000 )) ms, restore from $src $(( (t2 - t1) / 1000000 )) ms, $(du -sh --apparent-size "$M" | cut -f1) apparent"

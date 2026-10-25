@@ -150,21 +150,59 @@ enable=$(grep -E '^ *systemctl enable ' fleet/ami/tile/build.sh)
 grep -qw 'fcvm-fleet-nginx.service' <<<"$enable" || no "tile/build.sh does not enable fcvm-fleet-nginx.service"
 grep -qE '(^| )nginx\.service' <<<"$enable" && no "tile/build.sh enables the distribution's nginx.service, which waits for network-online.target"
 # The store archive must keep nanosecond modification times through host/build.sh's bake
-# and host/store.sh's restore: fcvm's cached image digests (version-cache/) are valid for
-# the image's exact mtime, so a whole-second mtime makes a host hash its images again.
+# and host/store.sh's restore, staged through tmpfs or not: fcvm's cached image digests
+# (version-cache/) are valid for the image's exact mtime, so a whole-second mtime makes a
+# host hash its images again.
 create=$(sed -n 's/^  tar -c \(.*\) \\$/\1/p' fleet/ami/host/build.sh)
-extract=$(sed -n 's/^  zstd -q -d -T0 -c "\$ARCHIVE" | tar -x \(.*\) -C "\$M"$/\1/p' fleet/ami/host/store.sh)
+fns=$(sed -n '/^# --- restore functions/,/^# --- end of restore functions/p' fleet/ami/host/store.sh)
 tt=$(mktemp -d)
-if [ -z "$create" ] || [ -z "$extract" ]; then
-  no "host/build.sh's store tar or host/store.sh's restore tar not found"
+if [ -z "$create" ] || [ -z "$fns" ]; then
+  no "host/build.sh's store tar or host/store.sh's restore functions not found"
 else
-  mkdir "$tt/in" "$tt/out"; echo image > "$tt/in/img"; touch -d '2026-10-24 00:00:00.123456789' "$tt/in/img"
-  # shellcheck disable=SC2086 # the recipes' own flags, split as the recipes split them
-  tar -c $create -C "$tt/in" . | tar -x $extract -C "$tt/out"
-  [ "$(stat -c %y "$tt/out/img")" = "$(stat -c %y "$tt/in/img")" ] ||
-    no "the store archive drops the fraction of a modification time ($(stat -c %y "$tt/out/img"))"
+  mkdir "$tt/in"; echo image > "$tt/in/img"; touch -d '2026-10-24 00:00:00.123456789' "$tt/in/img"
+  for mode in direct staged; do
+    got=$(
+      M="$tt/$mode"; mkdir "$M"; stage=""
+      if [ "$mode" = staged ]; then stage=$(mktemp -d); fi
+      eval "$fns"
+      # shellcheck disable=SC2086 # the recipe's own flags, split as the recipe splits them
+      tar -c $create -C "$tt/in" . | extract
+      if [ -n "$stage" ]; then rm -rf "$stage"; fi
+      stat -c %y "$M/img"
+    )
+    [ "$got" = "$(stat -c %y "$tt/in/img")" ] ||
+      no "the store archive drops the fraction of a modification time ($mode restore: $got)"
+  done
 fi
 rm -rf "$tt"
+
+# store.sh's staged restore (tar into tmpfs, then cp -a into the store) must give the tree a
+# direct extraction gives: names, types, modes, owners, mtimes, hard links, holes, bytes.
+fx=$(mktemp -d)
+# Each step ends in `|| exit 1`: `set -e` does nothing in a subshell that is part of `||`.
+(
+  mkdir -p "$fx/src/d/e" || exit 1
+  printf 'one' > "$fx/src/d/a" && ln "$fx/src/d/a" "$fx/src/d/e/a-link" && ln -s ../a "$fx/src/d/e/sym" || exit 1
+  truncate -s 64M "$fx/src/d/sparse" || exit 1
+  printf 'tail' | dd of="$fx/src/d/sparse" bs=1 seek=$((32 << 20)) conv=notrunc status=none || exit 1
+  chmod 0750 "$fx/src/d/e" && touch -d '2026-01-02 03:04:05' "$fx/src/d/a" || exit 1
+  tar -c --sparse -C "$fx/src" . > "$fx/a.tar" || exit 1
+  fns=$(sed -n '/^# --- restore functions/,/^# --- end of restore functions/p' fleet/ami/host/store.sh)
+  [ -n "$fns" ] || exit 1
+  for mode in direct staged; do
+    M="$fx/$mode"; mkdir "$M" || exit 1; stage=""
+    if [ "$mode" = staged ]; then stage=$(mktemp -d) || exit 1; fi
+    eval "$fns"
+    extract < "$fx/a.tar" || exit 1
+    if [ -n "$stage" ]; then rm -rf "$stage"; fi
+  done
+  tree() { (cd "$1" && find . -printf '%p %y %m %U %G %T@ %n %s %l\n' | sort && find . -type f -exec sha256sum {} + | sort -k2); }
+  diff <(tree "$fx/direct") <(tree "$fx/staged") >&2 || exit 1
+  [ "$(stat -c %h "$fx/staged/d/a")" = 2 ] || exit 1
+  # The hole stays a hole: far fewer blocks than the 64 MiB the file spans.
+  [ "$(stat -c %b "$fx/staged/d/sparse")" -lt 1024 ] || exit 1
+) 2>/dev/null || no "store.sh's staged restore does not give the tree a direct extraction gives"
+rm -rf "$fx"
 
 [ "$fail" = 0 ] && echo "fleet/ami checks: ok"
 exit "$fail"
