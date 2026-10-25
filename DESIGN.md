@@ -2660,6 +2660,13 @@ device, so the GPU state leaves the GPU first, through NVIDIA's cuda-checkpoint
 (`cuCheckpointProcess*`, R550 and later; `--device-map` from R580), which the driver
 image carries at `usr/bin/cuda-checkpoint`.
 
+x86_64 only for now: cuda-checkpoint supports ARM CPUs from NVIDIA driver 595
+(its README, "595 Features"), and the arm64 gpu profile pins 580, so `--gpu-warm`
+is refused on arm64 before the guest parks anything. If the source does not get
+its GPUs back after a snapshot that was taken, the snapshot is still recorded as
+the VM's diff parent before the failure is reported: the VMM has reset its dirty
+pages against it.
+
 The sequence (`crate::gpu::warm_gpu_snapshot`, fc-agent/src/gpu_park.rs):
 
 1. **Park** (`fc-agent --gpu-park` over the exec channel). fc-agent finds every

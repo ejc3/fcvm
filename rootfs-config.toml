@@ -292,7 +292,8 @@ boot_args = "net.ifnames=0"
 # publishes beside the same files under download.nvidia.com/XFree86/; the
 # toolkit's match its release's checksums.txt. cuda-checkpoint is the binary
 # at a fixed commit of NVIDIA/cuda-checkpoint (warm GPU snapshots, R580 for
-# --device-map); its SHA-256 is of that file.
+# --device-map); its SHA-256 is of that file. Its ARM support needs driver 595,
+# so `snapshot create --gpu-warm` is refused on arm64 while this pins 580.
 #
 # The proprietary modules with the GSP firmware off, as on amd64: on a
 # g5g.metal (T4G) nvidia-persistenced's start at restore took 609 ms against

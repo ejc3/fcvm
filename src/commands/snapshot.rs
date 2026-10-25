@@ -785,6 +785,9 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
 
     ensure_gpu_snapshot_mode(&vm_state.config.gpus, args.disk_only, args.gpu_warm)?;
     if args.gpu_warm {
+        ensure_warm_gpu_arch(std::env::consts::ARCH)?;
+    }
+    if args.gpu_warm {
         anyhow::ensure!(
             matches!(
                 vm_state.config.hypervisor,
@@ -948,6 +951,11 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         );
     };
 
+    // A warm GPU snapshot that was published although the source did not get its GPUs
+    // back. Returned only after the snapshot is recorded as the VM's diff parent: the VMM
+    // reset its dirty pages against this snapshot, so a later diff on the older parent
+    // would miss every page written in between.
+    let mut gpu_recovery_failure: Option<anyhow::Error> = None;
     let published_memory = if args.disk_only {
         // Disk-only: no vCPU pause, no memory dump — fsfreeze the guest over the
         // exec vsock, reflink the disk, unfreeze. Cold-boot clones run from it.
@@ -1022,15 +1030,18 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                         core: Some(core),
                         timings: Vec::new(),
                     };
-                    let published = crate::gpu::warm_gpu_snapshot(&mut steps, &devices).await;
+                    let warm = crate::gpu::warm_gpu_snapshot(&mut steps, &devices).await;
                     info!(
                         snapshot = %snapshot_name,
                         gpus = devices.len(),
                         steps = %steps.timings.join(" "),
-                        ok = published.is_ok(),
+                        ok = matches!(&warm, Ok(w) if w.recovery.is_none()),
                         "warm GPU snapshot"
                     );
-                    Some(published?)
+                    let warm = warm?;
+                    // Published: record it as the VM's diff parent below, then report.
+                    gpu_recovery_failure = warm.recovery;
+                    Some(warm.snapshot)
                 } else {
                     Some(core().await?)
                 }
@@ -1190,7 +1201,10 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         published_memory.log_data_runs().await;
     }
 
-    Ok(())
+    match gpu_recovery_failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// How long serve shutdown waits for clones to exit after SIGTERM before escalating to SIGKILL.
@@ -1275,6 +1289,19 @@ fn ensure_gpu_snapshot_mode(gpus: &[String], disk_only: bool, gpu_warm: bool) ->
              snapshot it with its GPU state, snapshot the VM it was restored from (fcvm \
              attaches GPUs to a restore of a snapshot taken without them), or use --disk-only",
             gpus.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Refuse `--gpu-warm` where the gpu profile's driver cannot checkpoint, before the
+/// guest parks anything. cuda-checkpoint's ARM support needs NVIDIA driver 595 or later
+/// (NVIDIA/cuda-checkpoint README, "595 Features"), and the arm64 gpu profile pins 580.
+fn ensure_warm_gpu_arch(arch: &str) -> Result<()> {
+    if arch == "aarch64" {
+        bail!(
+            "--gpu-warm is not supported on arm64: cuda-checkpoint supports ARM CPUs from \
+             NVIDIA driver 595, and the gpu profile's arm64 driver is 580"
         );
     }
     Ok(())
@@ -5168,6 +5195,54 @@ mod tests {
             .expect_err("must be refused")
             .to_string();
         assert!(error.contains("published no ports"), "{error}");
+    }
+
+    /// A warm GPU snapshot that was published while the source did not get its GPUs
+    /// back is still recorded as the VM's diff parent before the failure is returned:
+    /// the VMM reset its dirty pages against it, so a later diff over the older parent
+    /// would miss every page written in between.
+    #[test]
+    fn a_warm_snapshot_whose_source_recovery_failed_is_recorded_before_the_error() {
+        let code = include_str!("snapshot.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let body = &code[code.find("async fn cmd_snapshot_create(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("cmd_snapshot_create has no `{needle}`"))
+        };
+        assert!(
+            !body.contains("Some(published?)"),
+            "a failed source recovery returns before the snapshot is recorded"
+        );
+        let kept = at("gpu_recovery_failure = warm.recovery;");
+        let recorded = at("state.config.snapshot_name = Some(recorded_snapshot_name);");
+        let returned = at("Some(error) => Err(error),");
+        assert!(kept < recorded && recorded < returned);
+    }
+
+    /// cuda-checkpoint cannot park CUDA processes on ARM with the arm64 profile's 580
+    /// driver, so `--gpu-warm` is refused there before the guest parks anything.
+    #[test]
+    fn a_warm_gpu_snapshot_is_refused_on_arm64() {
+        let err = format!("{:#}", ensure_warm_gpu_arch("aarch64").unwrap_err());
+        assert!(err.contains("driver 595"), "{err}");
+        ensure_warm_gpu_arch("x86_64").unwrap();
+        let code = include_str!("snapshot.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let body = &code[code.find("async fn cmd_snapshot_create(").unwrap()..];
+        let check = body
+            .find("ensure_warm_gpu_arch(std::env::consts::ARCH)")
+            .expect("cmd_snapshot_create does not check the host architecture");
+        let core = body.find("create_snapshot_core(").unwrap();
+        assert!(
+            check < core,
+            "the architecture is checked after the snapshot starts"
+        );
     }
 
     #[test]
