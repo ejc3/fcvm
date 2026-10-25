@@ -51,6 +51,13 @@ const INSMOD_TIMEOUT: Duration = Duration::from_secs(120);
 /// nvidia-smi initialises the GPU on first open when nothing holds it open.
 const SMI_TIMEOUT: Duration = Duration::from_secs(120);
 const CDI_TIMEOUT: Duration = Duration::from_secs(60);
+/// nvidia-persistenced initialises the GPU and then detaches; its parent exits.
+const PERSISTENCED_TIMEOUT: Duration = Duration::from_secs(120);
+/// The memory scrub zeroes 16 GB on a T4 in a fraction of a second.
+const SCRUB_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The scrub tool in the driver image (src/setup/nvidia_gpu_scrub.c).
+pub const SCRUB_TOOL: &str = "usr/bin/fcvm-gpu-scrub";
 
 /// Orders GPU attachment against the container launch. An attach holds the gate
 /// from its check that no container is running until it has published the CDI
@@ -79,10 +86,10 @@ impl LaunchGate {
 
     /// Run `work`, which makes `count` GPUs usable, unless the container already
     /// launched, and publish the CDI devices when it succeeds.
-    pub async fn attach<F, Fut>(&self, count: usize, work: F) -> Result<usize>
+    pub async fn attach<F, Fut>(&self, count: usize, work: F) -> Result<AttachReport>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<usize>>,
+        Fut: std::future::Future<Output = Result<AttachReport>>,
     {
         let mut state = self.state.lock().await;
         if state.launched {
@@ -414,35 +421,51 @@ async fn run_checked(
     Ok(text)
 }
 
-async fn load_modules(module_dir: &Path, firmware_dir: &Path) -> Result<()> {
-    // The firmware loader looks in this directory first. Set it before
-    // nvidia.ko loads: the GSP firmware is requested from its probe.
+/// Point the firmware loader at the image's firmware. It looks in this
+/// directory first. Set before nvidia.ko probes a GPU: the GSP firmware is
+/// requested from the probe.
+fn set_firmware_path(firmware_dir: &Path) -> Result<()> {
     let firmware_param = "/sys/module/firmware_class/parameters/path";
     std::fs::write(firmware_param, firmware_dir.as_os_str().as_encoded_bytes())
-        .with_context(|| format!("setting {firmware_param} to {}", firmware_dir.display()))?;
+        .with_context(|| format!("setting {firmware_param} to {}", firmware_dir.display()))
+}
 
-    for module in MODULES {
-        if Path::new("/sys/module")
-            .join(module.replace('-', "_"))
-            .exists()
-        {
-            eprintln!("[fc-agent] gpu: {module} already loaded");
-            continue;
-        }
-        let path = module_dir.join(format!("{module}.ko"));
-        let mut insmod = tokio::process::Command::new("insmod");
-        insmod.arg(&path);
-        if let Err(error) = run_checked(
-            &format!("insmod {}", path.display()),
-            insmod,
-            INSMOD_TIMEOUT,
-        )
-        .await
-        {
-            bail!("{error:#}\nkernel log:\n{}", nvrm_log_tail().await);
-        }
-        eprintln!("[fc-agent] gpu: loaded {module}");
+/// The parameters `module` is loaded with: the words of `<module>.params`
+/// beside it in the image (the driver image records them for its module
+/// type, e.g. `NVreg_EnableGpuFirmware=0` for the proprietary modules), or
+/// none when the file is absent.
+pub fn module_params(module_dir: &Path, module: &str) -> Result<Vec<String>> {
+    let file = module_dir.join(format!("{module}.params"));
+    match std::fs::read_to_string(&file) {
+        Ok(text) => Ok(text.split_whitespace().map(str::to_string).collect()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error).with_context(|| format!("reading {}", file.display())),
     }
+}
+
+/// `insmod` one of [`MODULES`] from the image, unless it is already loaded.
+async fn load_module(module_dir: &Path, module: &str) -> Result<()> {
+    debug_assert!(MODULES.contains(&module));
+    if Path::new("/sys/module")
+        .join(module.replace('-', "_"))
+        .exists()
+    {
+        eprintln!("[fc-agent] gpu: {module} already loaded");
+        return Ok(());
+    }
+    let path = module_dir.join(format!("{module}.ko"));
+    let mut insmod = tokio::process::Command::new("insmod");
+    insmod.arg(&path).args(module_params(module_dir, module)?);
+    if let Err(error) = run_checked(
+        &format!("insmod {}", path.display()),
+        insmod,
+        INSMOD_TIMEOUT,
+    )
+    .await
+    {
+        bail!("{error:#}\nkernel log:\n{}", nvrm_log_tail().await);
+    }
+    eprintln!("[fc-agent] gpu: loaded {module}");
     Ok(())
 }
 
@@ -488,35 +511,112 @@ fn create_device_nodes(nodes: &[DeviceNode]) -> Result<()> {
     Ok(())
 }
 
+/// Load the NVIDIA modules at boot, with no GPU on the bus, so the pre-start
+/// snapshot carries them: a restore that attaches a GPU then only probes it
+/// (the PCI rescan binds it to the loaded driver). The driver image's
+/// nvidia.ko is built to load without a GPU (src/setup/nvidia.rs). The
+/// firmware path is set here too, because the probe of a hot-added GPU
+/// requests the GSP firmware.
+///
+/// A failure here is not fatal: [`attach`] loads whatever is not loaded, and
+/// fails closed if that fails, so this only moves work out of the restore.
+pub async fn preload(driver_root: &Path) -> Result<()> {
+    let release = kernel_release()?;
+    let modules = check_module_dir(driver_root, &release)?;
+    set_firmware_path(&driver_root.join("lib/firmware"))?;
+    for module in MODULES {
+        load_module(&modules, module).await?;
+    }
+    Ok(())
+}
+
 /// Make the GPUs the host attached usable by the container.
 ///
 /// `announced` is the host's list of attached devices (host PCI addresses);
 /// only its length is compared with what the guest sees, because the guest
 /// address of a passed-through device is assigned by the VMM.
-/// Returns the number of GPUs the driver initialised.
-pub async fn attach(announced: &[String]) -> Result<usize> {
+/// Returns the number of GPUs the driver initialised and each step's duration.
+pub async fn attach(announced: &[String]) -> Result<AttachReport> {
     anyhow::ensure!(!announced.is_empty(), "attach called with no GPUs");
     GATE.attach(announced.len(), || attach_devices(announced))
         .await
 }
 
-async fn attach_devices(announced: &[String]) -> Result<usize> {
+/// What a successful attach reports: the GPUs the driver initialised and the
+/// duration of each step, carried in the restore ACK's phase record.
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+pub struct AttachReport {
+    pub gpus: usize,
+    pub steps: AttachSteps,
+}
+
+/// Milliseconds spent in each step of [`attach_devices`].
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+pub struct AttachSteps {
+    /// The driver image check for this kernel.
+    pub check_ms: f64,
+    /// PCI rescan until the announced GPUs are on the bus.
+    pub rescan_ms: f64,
+    /// `firmware_class.path` and `insmod nvidia.ko` (the PCI probe runs here).
+    pub nvidia_ms: f64,
+    /// `insmod nvidia-uvm.ko`.
+    pub uvm_ms: f64,
+    /// Reading the probed minors and creating the device nodes.
+    pub nodes_ms: f64,
+    /// `nvidia-persistenced`, which initialises the GPU and keeps it open.
+    pub persistenced_ms: f64,
+    /// Zeroing the GPUs' memory ([`scrub_gpus`]).
+    pub scrub_ms: f64,
+    /// `nvidia-smi -L`.
+    pub smi_ms: f64,
+    /// `nvidia-ctk cdi generate`.
+    pub cdi_ms: f64,
+}
+
+/// Times one attach step and logs it, so a slow attach names the slow step in
+/// the guest log as well as in the ACK.
+struct StepClock(std::time::Instant);
+
+impl StepClock {
+    fn start() -> Self {
+        Self(std::time::Instant::now())
+    }
+
+    /// Milliseconds since the last lap (or the start), logged under `step`.
+    fn lap(&mut self, step: &str) -> f64 {
+        let now = std::time::Instant::now();
+        let ms = now.duration_since(self.0).as_secs_f64() * 1000.0;
+        self.0 = now;
+        eprintln!("[fc-agent] gpu: step={step} elapsed_ms={ms:.3}");
+        ms
+    }
+}
+
+async fn attach_devices(announced: &[String]) -> Result<AttachReport> {
     eprintln!(
         "[fc-agent] gpu: host attached {} device(s): {}",
         announced.len(),
         announced.join(", ")
     );
+    let mut steps = AttachSteps::default();
+    let mut clock = StepClock::start();
 
     let driver_root = Path::new(DRIVER_ROOT);
     let release = kernel_release()?;
     let modules = check_module_dir(driver_root, &release)?;
+    steps.check_ms = clock.lap("check");
 
     let gpus = rescan_for_gpus(Path::new("/sys"), announced).await?;
     for gpu in &gpus {
         eprintln!("[fc-agent] gpu: found {gpu}");
     }
+    steps.rescan_ms = clock.lap("rescan");
 
-    load_modules(&modules, &driver_root.join("lib/firmware")).await?;
+    set_firmware_path(&driver_root.join("lib/firmware"))?;
+    load_module(&modules, "nvidia").await?;
+    steps.nvidia_ms = clock.lap("insmod-nvidia");
+    load_module(&modules, "nvidia-uvm").await?;
+    steps.uvm_ms = clock.lap("insmod-nvidia-uvm");
 
     let minors = probed_gpu_minors()?;
     if minors.len() < announced.len() {
@@ -529,14 +629,27 @@ async fn attach_devices(announced: &[String]) -> Result<usize> {
     }
     let proc_devices = std::fs::read_to_string("/proc/devices").context("reading /proc/devices")?;
     create_device_nodes(&device_nodes(&parse_char_majors(&proc_devices), &minors)?)?;
+    steps.nodes_ms = clock.lap("device-nodes");
 
-    let libraries = library_dir(driver_root);
-    let mut smi = tokio::process::Command::new(driver_root.join("usr/bin/nvidia-smi"));
-    smi.arg("-L").env("LD_LIBRARY_PATH", &libraries);
-    let listed = match run_checked("nvidia-smi -L", smi, SMI_TIMEOUT).await {
-        Ok(text) => text,
-        Err(error) => bail!("{error:#}\nkernel log:\n{}", nvrm_log_tail().await),
-    };
+    start_persistenced(driver_root).await?;
+    steps.persistenced_ms = clock.lap("persistenced");
+
+    // Zero the memory the previous VM on these GPUs left, before anything can
+    // hand them to the container.
+    let parallel = scrub_parallelism(mem_available_kib()?, announced.len());
+    steps.scrub_ms = scrub_gpus(scrub_command(driver_root, parallel), announced.len()).await?;
+
+    // Both only read the GPUs the daemon has initialised, so they run together.
+    // The spec is generated after the daemon starts so it mounts its socket.
+    let ((smi_ms, listed), (cdi_ms, spec)) = tokio::join!(
+        timed(list_gpus(driver_root)),
+        timed(generate_cdi_spec(driver_root)),
+    );
+    steps.smi_ms = smi_ms;
+    steps.cdi_ms = cdi_ms;
+    eprintln!("[fc-agent] gpu: step=nvidia-smi elapsed_ms={smi_ms:.3}");
+    eprintln!("[fc-agent] gpu: step=cdi elapsed_ms={cdi_ms:.3}");
+    let listed = listed?;
     let initialised = listed.lines().filter(|l| l.starts_with("GPU ")).count();
     if initialised < announced.len() {
         bail!(
@@ -546,15 +659,156 @@ async fn attach_devices(announced: &[String]) -> Result<usize> {
         );
     }
     eprintln!("[fc-agent] gpu: {}", listed.trim().replace('\n', "; "));
+    spec?;
+    eprintln!("[fc-agent] gpu: wrote CDI spec {CDI_SPEC}");
+    Ok(AttachReport {
+        gpus: initialised,
+        steps,
+    })
+}
 
+/// Run `future` and return its milliseconds with its output.
+async fn timed<T>(future: impl std::future::Future<Output = T>) -> (f64, T) {
+    let started = std::time::Instant::now();
+    let output = future.await;
+    (started.elapsed().as_secs_f64() * 1000.0, output)
+}
+
+/// `nvidia-smi -L` from the image: one `GPU <n>:` line per GPU the driver
+/// initialised. A failure carries the kernel log's NVRM lines.
+async fn list_gpus(driver_root: &Path) -> Result<String> {
+    let mut smi = tokio::process::Command::new(driver_root.join("usr/bin/nvidia-smi"));
+    smi.arg("-L")
+        .env("LD_LIBRARY_PATH", library_dir(driver_root));
+    match run_checked("nvidia-smi -L", smi, SMI_TIMEOUT).await {
+        Ok(text) => Ok(text),
+        Err(error) => bail!("{error:#}\nkernel log:\n{}", nvrm_log_tail().await),
+    }
+}
+
+/// Write the CDI spec with `nvidia-ctk cdi generate` from the image.
+async fn generate_cdi_spec(driver_root: &Path) -> Result<()> {
     std::fs::create_dir_all(Path::new(CDI_SPEC).parent().unwrap())
         .context("creating the CDI spec directory")?;
     let mut ctk = tokio::process::Command::new(driver_root.join("usr/bin/nvidia-ctk"));
     ctk.args(cdi_generate_args(driver_root))
-        .env("LD_LIBRARY_PATH", &libraries);
+        .env("LD_LIBRARY_PATH", library_dir(driver_root));
     run_checked("nvidia-ctk cdi generate", ctk, CDI_TIMEOUT).await?;
-    eprintln!("[fc-agent] gpu: wrote CDI spec {CDI_SPEC}");
-    Ok(initialised)
+    Ok(())
+}
+
+/// The scrub tool command: the image's binary with the image's libraries,
+/// scrubbing at most `parallel` GPUs at a time.
+pub fn scrub_command(driver_root: &Path, parallel: usize) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(driver_root.join(SCRUB_TOOL));
+    command
+        .args(["--parallel", &parallel.to_string()])
+        .env("LD_LIBRARY_PATH", library_dir(driver_root));
+    command
+}
+
+/// How many GPUs the scrub may hold a CUDA context on at once, given the
+/// guest's `MemAvailable` in KiB. Measured on a T4 in a 1 GiB guest with eight
+/// GPUs (MemAvailable 345 to 364 MiB): the first context took about 185 MiB
+/// and each further one about 35 MiB; four at once left 54 MiB, eight were
+/// OOM-killed. So 256 MiB for the first and 64 MiB for each further one. At
+/// least 1: a guest too small for even that fails the scrub, and the attach.
+pub fn scrub_parallelism(mem_available_kib: u64, gpus: usize) -> usize {
+    let mib = mem_available_kib / 1024;
+    let extra = mib.saturating_sub(256) / 64;
+    (1 + extra as usize).clamp(1, gpus.max(1))
+}
+
+/// `MemAvailable` from `/proc/meminfo`, in KiB.
+fn mem_available_kib() -> Result<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").context("reading /proc/meminfo")?;
+    meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+        .context("/proc/meminfo has no MemAvailable")
+}
+
+/// Zero the memory of every GPU before the container can use them, and
+/// return the scrub's milliseconds.
+///
+/// A GPU moves between VMs. NVIDIA documents that newly allocated memory is
+/// not cleared, so a new VM's first allocations can return what the previous
+/// VM left there; scripts/gpu-residue measures it. The tool allocates all free memory on each GPU, zeroes it and frees
+/// it. It must report at least `expected` GPUs; anything else fails the
+/// attach, so the clone is not published.
+pub async fn scrub_gpus(command: tokio::process::Command, expected: usize) -> Result<f64> {
+    let started = std::time::Instant::now();
+    // Named by path: an image built before the scrub existed does not have it.
+    let program = command
+        .as_std()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
+    let output = match run_checked(&program, command, SCRUB_TIMEOUT).await {
+        Ok(output) => output,
+        Err(error) => bail!(
+            "zeroing the GPUs' memory failed, so the previous tenant's data may still be \
+             on them: {error:#}\nkernel log:\n{}",
+            nvrm_log_tail().await
+        ),
+    };
+    let Some((devices, bytes)) = parse_scrub_summary(&output) else {
+        bail!(
+            "fcvm-gpu-scrub exited 0 with no summary line: {}",
+            output.trim()
+        );
+    };
+    if devices < expected {
+        bail!(
+            "fcvm-gpu-scrub zeroed {devices} of {expected} GPU(s): {}",
+            output.trim()
+        );
+    }
+    // Rounded to microseconds: the ACK frame has a byte budget.
+    let ms = (started.elapsed().as_secs_f64() * 1e6).round() / 1e3;
+    eprintln!("[fc-agent] gpu: zeroed {bytes} bytes on {devices} GPU(s) in {ms:.3} ms");
+    for line in output.lines().filter(|l| l.starts_with("scrubbed device=")) {
+        eprintln!("[fc-agent] gpu: {line}");
+    }
+    Ok(ms)
+}
+
+/// The GPU count and byte total of the scrub tool's summary line,
+/// `scrubbed devices=<n> bytes=<b> ms=<ms>`.
+pub fn parse_scrub_summary(output: &str) -> Option<(usize, u64)> {
+    output.lines().rev().find_map(|line| {
+        let rest = line.trim().strip_prefix("scrubbed devices=")?;
+        let mut fields = rest.split_whitespace();
+        let devices = fields.next()?.parse().ok()?;
+        let bytes = fields.next()?.strip_prefix("bytes=")?.parse().ok()?;
+        Some((devices, bytes))
+    })
+}
+
+/// Start nvidia-persistenced from the driver image. Without it nothing holds the
+/// GPU open between processes, and every process that opens it initialises it
+/// again: `nvidia-smi -L` took 1.44 to 1.49 s each on a T4 in a gpu VM, and
+/// 0.023 to 0.031 s with the daemon running. It starts before `nvidia-smi -L`,
+/// so that check opens a GPU the daemon has initialised, and before the CDI spec
+/// is generated, which then mounts the daemon's socket into the container.
+async fn start_persistenced(driver_root: &Path) -> Result<()> {
+    run_checked(
+        "nvidia-persistenced",
+        persistenced_command(driver_root),
+        PERSISTENCED_TIMEOUT,
+    )
+    .await?;
+    eprintln!("[fc-agent] gpu: nvidia-persistenced started");
+    Ok(())
+}
+
+/// The nvidia-persistenced command: the image's binary, as root (its default),
+/// with the image's libraries. It forks the daemon and exits.
+pub fn persistenced_command(driver_root: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(driver_root.join("usr/bin/nvidia-persistenced"));
+    command.env("LD_LIBRARY_PATH", library_dir(driver_root));
+    command
 }
 
 /// Arguments for `nvidia-ctk cdi generate` against the mounted driver image.
@@ -579,6 +833,196 @@ pub fn cdi_generate_args(driver_root: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The daemon is the image's binary, run with the image's libraries.
+    #[test]
+    fn persistenced_runs_the_images_binary_with_its_libraries() {
+        let root = std::path::Path::new("/run/fcvm-gpu/driver");
+        let command = super::persistenced_command(root);
+        let command = command.as_std();
+        assert_eq!(
+            command.get_program(),
+            root.join("usr/bin/nvidia-persistenced").as_os_str()
+        );
+        let libraries = command
+            .get_envs()
+            .find(|(key, _)| *key == "LD_LIBRARY_PATH")
+            .and_then(|(_, value)| value);
+        assert_eq!(libraries, Some(super::library_dir(root).as_os_str()));
+    }
+
+    /// The body of `attach_devices`, for the source-order tests below.
+    fn attach_devices_body() -> &'static str {
+        let source = include_str!("gpu.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let body = &code[code
+            .find("async fn attach_devices(")
+            .expect("no attach_devices")..];
+        &body[..body.find("\n}\n").expect("attach_devices does not end")]
+    }
+
+    /// The daemon must start once the device nodes exist, and before the checks
+    /// and the CDI spec: `nvidia-smi -L` then opens a GPU the daemon already
+    /// initialised, and the spec mounts the daemon's socket into the container.
+    #[test]
+    fn persistenced_starts_after_the_device_nodes_and_before_the_cdi_spec() {
+        let body = attach_devices_body();
+        let nodes = body.find("create_device_nodes(").expect("no device nodes");
+        let daemon = body
+            .find("start_persistenced(driver_root)")
+            .expect("attach_devices does not start nvidia-persistenced");
+        let smi = body
+            .find("list_gpus(driver_root)")
+            .expect("no nvidia-smi -L");
+        let cdi = body
+            .find("generate_cdi_spec(driver_root)")
+            .expect("no CDI generation");
+        assert!(
+            nodes < daemon && daemon < smi && daemon < cdi,
+            "nvidia-persistenced must start after the device nodes ({nodes}) and before \
+             nvidia-smi -L ({smi}) and the CDI spec ({cdi}); it starts at {daemon}"
+        );
+    }
+
+    /// The scrub runs once the daemon has initialised the GPUs, and before the
+    /// GPU check and the CDI spec: the spec is what hands the GPUs to the
+    /// container, and the container starts only after the attach returns. Its
+    /// error must end the attach.
+    #[test]
+    fn the_scrub_runs_before_the_cdi_spec_and_the_container() {
+        let body = attach_devices_body();
+        let daemon = body
+            .find("start_persistenced(driver_root)")
+            .expect("no nvidia-persistenced");
+        let scrub = body
+            .find("scrub_gpus(scrub_command(driver_root, parallel), announced.len())")
+            .expect("attach_devices does not scrub the GPUs' memory");
+        let smi = body
+            .find("list_gpus(driver_root)")
+            .expect("no nvidia-smi -L");
+        let cdi = body
+            .find("generate_cdi_spec(driver_root)")
+            .expect("no CDI generation");
+        assert!(
+            daemon < scrub && scrub < smi && scrub < cdi,
+            "the scrub ({scrub}) must run after nvidia-persistenced ({daemon}) and before \
+             nvidia-smi -L ({smi}) and the CDI spec ({cdi})"
+        );
+        assert!(
+            body[scrub..].starts_with(
+                "scrub_gpus(scrub_command(driver_root, parallel), announced.len()).await?"
+            ),
+            "a failed scrub must fail the attach"
+        );
+    }
+
+    /// A tool standing in for fcvm-gpu-scrub: a shell script printing `output`
+    /// and exiting with `status`.
+    fn fake_scrub(dir: &Path, output: &str, status: i32) -> tokio::process::Command {
+        let tool = dir.join(format!("scrub-{status}-{}", output.len()));
+        std::fs::write(
+            &tool,
+            format!("#!/bin/sh\nprintf '%s' '{output}'\nexit {status}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        tokio::process::Command::new(tool)
+    }
+
+    /// The scrub fails closed: a tool that fails, reports fewer GPUs than the
+    /// host attached, says nothing, or is not in the image ends the attach.
+    #[tokio::test]
+    async fn a_scrub_that_does_not_cover_every_gpu_fails_the_attach() {
+        let dir = tempfile::tempdir().unwrap();
+        let two = "scrubbed device=0 bytes=1 free=1 total=2 ms=1\n\
+                   scrubbed device=1 bytes=1 free=1 total=2 ms=1\n\
+                   scrubbed devices=2 bytes=2 ms=3.5\n";
+        assert!(scrub_gpus(fake_scrub(dir.path(), two, 0), 2).await.is_ok());
+
+        let failed = scrub_gpus(
+            fake_scrub(
+                dir.path(),
+                "fcvm-gpu-scrub: GPU 1: cuMemAlloc: out of memory",
+                1,
+            ),
+            2,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{failed:#}").contains("cuMemAlloc"), "{failed:#}");
+
+        let short = scrub_gpus(
+            fake_scrub(dir.path(), "scrubbed devices=1 bytes=2 ms=3.5\n", 0),
+            2,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{short:#}").contains("1 of 2"), "{short:#}");
+
+        let silent = scrub_gpus(fake_scrub(dir.path(), "", 0), 1)
+            .await
+            .unwrap_err();
+        assert!(format!("{silent:#}").contains("no summary"), "{silent:#}");
+
+        let missing = scrub_gpus(
+            tokio::process::Command::new(dir.path().join("no-such-tool")),
+            1,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{missing:#}").contains("no-such-tool"),
+            "{missing:#}"
+        );
+    }
+
+    /// Eight GPUs in a 1 GiB guest (about 350 MiB available) were OOM-killed
+    /// at four contexts at once; the scrub must take them two at a time there,
+    /// all at once only with room for every context, and never zero at a time.
+    #[test]
+    fn the_scrub_holds_only_as_many_contexts_as_the_guest_has_memory_for() {
+        assert_eq!(scrub_parallelism(353 * 1024, 8), 2);
+        assert_eq!(scrub_parallelism(100 * 1024, 8), 1);
+        assert_eq!(scrub_parallelism(0, 1), 1);
+        assert_eq!(scrub_parallelism(4096 * 1024, 8), 8);
+        assert_eq!(scrub_parallelism(4096 * 1024, 1), 1);
+        let command = scrub_command(Path::new(DRIVER_ROOT), 2);
+        let args: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(args, ["--parallel", "2"]);
+    }
+
+    #[test]
+    fn the_scrub_summary_is_its_last_line() {
+        assert_eq!(
+            parse_scrub_summary("scrubbed device=0 bytes=5 free=1 total=2 ms=1\nscrubbed devices=1 bytes=5 ms=2.0\n"),
+            Some((1, 5))
+        );
+        assert_eq!(
+            parse_scrub_summary("scrubbed device=0 bytes=5 free=1 total=2 ms=1\n"),
+            None
+        );
+        assert_eq!(
+            parse_scrub_summary("scrubbed devices=x bytes=5 ms=2.0"),
+            None
+        );
+    }
+
+    /// With the daemon up, `nvidia-smi -L` and the CDI generation only read the
+    /// initialised GPUs, so they run together rather than one after the other.
+    #[test]
+    fn the_gpu_check_and_the_cdi_spec_run_together() {
+        let body = attach_devices_body();
+        let join = body
+            .find("tokio::join!(")
+            .expect("attach_devices no longer joins the GPU check and the CDI spec");
+        let joined = &body[join..join + body[join..].find(");").unwrap()];
+        assert!(
+            joined.contains("list_gpus(driver_root)")
+                && joined.contains("generate_cdi_spec(driver_root)"),
+            "nvidia-smi -L and the CDI generation must be joined: {joined}"
+        );
+    }
+
     /// A launch that starts while an attach is loading the driver waits for the
     /// attach and gets its devices; one that comes first makes a later attach fail.
     #[tokio::test]
@@ -591,16 +1035,22 @@ mod tests {
                 gate.attach(1, || async move {
                     started_tx.send(()).unwrap();
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    Ok(1)
+                    Ok(AttachReport {
+                        gpus: 1,
+                        ..Default::default()
+                    })
                 })
                 .await
             })
         };
         started_rx.await.unwrap();
         assert_eq!(gate.launch().await, vec![CDI_ALL_GPUS.to_string()]);
-        assert_eq!(attaching.await.unwrap().unwrap(), 1);
+        assert_eq!(attaching.await.unwrap().unwrap().gpus, 1);
 
-        let late = gate.attach(1, || async { Ok(1) }).await.unwrap_err();
+        let late = gate
+            .attach(1, || async { Ok(AttachReport::default()) })
+            .await
+            .unwrap_err();
         assert!(format!("{late:#}").contains("already running"), "{late:#}");
     }
 
@@ -729,6 +1179,32 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("nvidia-uvm"), "{error}");
+    }
+
+    /// nvidia.ko is loaded with the parameters its image records (the
+    /// proprietary modules need the GSP firmware switched off); a module
+    /// without a params file, or an image from before them, gets none.
+    #[test]
+    fn modules_load_with_the_parameters_the_image_records() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(module_params(dir.path(), "nvidia").unwrap().is_empty());
+        std::fs::write(dir.path().join("nvidia.params"), "\n").unwrap();
+        assert!(module_params(dir.path(), "nvidia").unwrap().is_empty());
+        std::fs::write(
+            dir.path().join("nvidia.params"),
+            "NVreg_EnableGpuFirmware=0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            module_params(dir.path(), "nvidia").unwrap(),
+            vec!["NVreg_EnableGpuFirmware=0".to_string()]
+        );
+        assert!(module_params(dir.path(), "nvidia-uvm").unwrap().is_empty());
+        let code = include_str!("gpu.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(
+            code.contains(".args(module_params(module_dir, module)?)"),
+            "load_module must pass the recorded parameters to insmod"
+        );
     }
 
     #[test]

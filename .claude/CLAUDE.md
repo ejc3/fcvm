@@ -65,7 +65,7 @@ What the boundary needs is narrow, and both halves are non-destructive:
 
 | need | mechanism | reversible? |
 |------|-----------|-------------|
-| no NEW socket may appear while the cookie dump runs | directional NEW-flow REJECT gate (iptables/ip6tables) | yes: one rule added, then removed |
+| no NEW socket may appear while the cookie dump runs | directional NEW-flow REJECT gate (iptables/ip6tables) | yes: its chains and hooks added, then removed |
 | packets already in receive processing must drain | AF_PACKET open/close, whose release runs `synchronize_net()` | nothing to reverse |
 | restore must destroy exactly the snapshot-time sockets | dump kernel socket **cookies** into a manifest | read-only |
 
@@ -116,6 +116,16 @@ touches the link, so there are no routes and no neighbours to reinstate.
    clone inheriting the source's neighbour table holds entries that are correct
    in its own namespace. fc-agent hardcodes the same constant; the pair is
    asserted by `namespace_neighbour_matches_host_constants`.
+4. **A restored clone resolves none of its gateways.** fc-agent pins 10.0.2.1
+   and, in routed mode, the IPv6 gateway `fd00::1` to that MAC (permanent)
+   right after flushing the inherited neighbours and before the IPv6 swap. A
+   resolution of `fd00::1` in flight across the swap was sourced from the
+   address the swap deletes, its answer was not delivered, and every reply
+   waited a second for the retransmit (#1160, about 6 restores in 1000 with a
+   client dialling during the restore).
+   `test_routed_clone_answers_without_resolving_its_ipv6_gateway` holds that
+   interleaving; `the_routed_gateway_is_pinned_before_the_ipv6_swap` pins the
+   order.
 
 **Enforcement:** `snapshot_leaves_the_source_network_untouched`
 (`tests/test_snapshot_clone.rs`) diffs the guest's routes, neighbours and
@@ -123,7 +133,7 @@ addresses across one snapshot and fails on any difference. The `ModelBarrier`
 and `ModelDiag` invariants in `fc-agent/src/snapshot_network.rs` fail if any
 boundary step takes the link down, on the source or the clone path.
 
-### On restore, the gate's egress half opens as soon as the stale sockets are gone
+### On restore, the gate's egress half opens before the stale sockets are retired
 
 The restored clone inherits the gate closed in both directions. Every daemon
 whose connection the cleanup retires reconnects at once, and a connection the
@@ -142,6 +152,42 @@ retired with egress closed, `ModelHook` if the hook runs with egress closed or
 after ingress opened;
 `the_restore_hook_runs_after_the_nfs_remount_and_the_proxy_waits` pins the
 source order of `handle_clone_restore`.
+
+The guest's clock step belongs on the same side of that line. The restore sets the guest's wall
+clock to the host's time, a jump of the snapshot's age, and every daemon whose lease or ticket ran
+out in the jump reconnects at once. Stepped before egress opened, those connects met the gate's
+reset: a www clone of a 9.5-hour-old snapshot was not healthy 10m38s in, when the restore script stopped waiting (falcon_proxy timed out on its
+SMC tiers, configerator fell back), and the same snapshot restored with its clock held back was
+healthy in 2m05s and 2m15s (2026-10-25). So the clock steps after the boundary opens egress and
+before publication; `the_clock_steps_after_the_egress_gate_opens_and_before_publication` pins it.
+chronyd can step the clock too (fc-agent configures `makestep 1 -1`), so the gate's OUTPUT chain
+also rejects the guest's NTP requests (UDP to port 123, and no other UDP), from the snapshot until
+egress opens; `the_egress_gate_rejects_ntp_and_no_other_udp` pins it. The rejected send fails with EPERM,
+so a source VM's chronyd logs at most one failed poll per snapshot, and both the source and a
+restored clone ask chronyd for a burst (`chrony_burst`) once egress is open again.
+
+### Opening the gate costs no grace period on the restore path
+
+Each half of the gate opens with one nf_tables commit covering both families,
+sent by fc-agent over nfnetlink (`fc-agent/src/nftables.rs`), not with an
+`iptables-restore` per family. Releasing a NETLINK_NETFILTER socket after a
+commit that deleted rules waits one RCU grace period (`nft_rcv_nl_event`
+flushes the pending destruction, which starts with `synchronize_rcu()`) while
+holding the namespace's commit mutex; so does releasing any AF_PACKET socket
+(`packet_release()` calls `synchronize_net()`). Measured in restored clones,
+that wait was 26, 46 and 79 ms at 2, 4 and 8 vCPUs, and it was the whole
+110-260 ms the gate used to cost (#1151).
+
+So fc-agent never releases those sockets: it keeps one nfnetlink socket and one
+send-only AF_PACKET socket for its whole life. Releasing them on another thread
+is not a fix: a process forked before the release holds a reference until its
+exec closes the CLOEXEC descriptor, so that process makes the final release and
+waits the grace period inside its own exec (the `iptables -S` after the ARP
+probe went from 2-3 ms to 27-75 ms). The receive barrier is the one release
+that must stay: its grace period is the barrier.
+`the_gate_socket_is_kept_and_never_released`,
+`frames_are_sent_through_the_socket_that_is_never_released` and
+`opening_each_half_is_one_transaction_for_both_families` pin it.
 
 ## MAXIMUM REUSE / CACHEABILITY
 
@@ -169,6 +215,9 @@ so nothing is built or booted twice when it doesn't have to be.
   Fragmenting the key silently kills sharing between behaviorally identical artifacts.
 - Before adding an opt-out or a key ingredient, ask: can the restore path absorb this
   difference? If yes, that is the fix.
+- **A key names content, not a path, where the snapshot keeps its own copy.** A read-only
+  `--disk-dir` is keyed on its tree's hash, taken in place so a hit copies nothing; a cold
+  boot builds the image from a private copy with that hash (`src/storage/disk_dir.rs`).
 
 ## VERIFY PLAN AND RUN NEW TESTS LOCALLY
 
@@ -2881,8 +2930,9 @@ with the granule.
   paging. It never fails a clone. A vCPU that faults inside the granule meanwhile is woken by
   the populate itself, because `UFFDIO_COPY` wakes every sleeper in the range it installs.
   It stands down in three cases. While any fault is parked it serves demanded pages only: a
-  parked fault is retried between batches and fails the clone if it is still refused after
-  2 s, so nothing optional may lengthen a batch. After a demand copy that found its page
+  parked fault is retried between batches and fails the clone if it is still refused 2 s
+  after it was parked or after the last REMOVE event read, so nothing optional may lengthen a
+  batch. After a demand copy that found its page
   already present it populates nothing, because another populator owns that range. After a
   fault on a page the clone's balloon gave back, which is answered with zeros, it
   populates nothing either. A fault on a hole in the memory file is answered with zeros

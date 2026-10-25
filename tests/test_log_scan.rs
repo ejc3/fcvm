@@ -991,6 +991,187 @@ fn review_gate_accepts_the_codex_breezy_signoff() {
     assert!(!combined.contains("UNANSWERED"), "{combined}");
 }
 
+/// Runs the gate on one bot comment by `login` with `body` (a JSON string literal), posted
+/// after the head `deadbeef` arrived on a PR with no review object, and returns (exit code,
+/// combined output).
+fn run_gate_on_bot_comment(name: &str, login: &str, body: &str) -> (Option<i32>, String) {
+    let comments = format!(
+        r#"[{{"author":{{"login":"{login}","__typename":"Bot"}},"createdAt":"2026-01-02T01:00:00Z","updatedAt":"2026-01-02T01:00:00Z","body":{body}}}]"#
+    );
+    let payload = format!(
+        r#"{{"data":{{"repository":{{"pullRequest":{{"author":{{"login":"me"}},"headRefOid":"deadbeef","commits":{{"nodes":[{{"commit":{{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{{"nodes":[{{"createdAt":"2026-01-02T00:30:00Z"}}]}}}}}}]}},"reviewThreads":{{"nodes":[]}},"reviews":{{"nodes":[]}},"comments":{{"nodes":{comments}}},"recheck":{{"comments":{{"nodes":{comments}}}}}}}}}}}}}"#
+    );
+    let dir = std::env::temp_dir().join(format!("fcvm-gate-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("payload.json");
+    std::fs::write(&f, payload).unwrap();
+    let out = Command::new("bash")
+        .arg(repo_root().join("scripts/check-review-threads.sh"))
+        .arg("--from-file")
+        .arg(&f)
+        .output()
+        .expect("check-review-threads.sh must be runnable");
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        out.status.code(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+/// Codex's receipt-marked no-findings comment, as posted on #1190, with `signoff` after the
+/// phrase (JSON-escaped). Every receipt-marked Codex comment on this repo is this body,
+/// byte for byte apart from the sign-off and the commit.
+fn codex_receipt_body(signoff: &str) -> String {
+    format!(
+        r#""<!-- codex-review-receipt:v1 -->\n\nCodex Review: Didn't find any major issues.{signoff}\n\n**Reviewed commit:** `deadbeef`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>""#
+    )
+}
+
+/// Codex's receipt-marked no-findings comment is a verdict with every sign-off it posts.
+///
+/// Since 2026-10-15 Codex opens its no-findings comment with
+/// "<!-- codex-review-receipt:v1 -->". On 2026-10-23 #1190's head was signed off with
+/// "Didn't find any major issues. Delightful!", and the gate reported the comment
+/// UNANSWERED and the head UNREVIEWED. The marker is a hidden HTML comment the gate already
+/// drops; the sign-off was missing from codex_line_re, as were six others Codex had posted
+/// on this repo since 2026-08-30. Each is checked here in the receipt-marked shape.
+#[test]
+fn review_gate_accepts_the_codex_receipt_verdict_and_its_signoffs() {
+    require_jq();
+    for signoff in [
+        " Delightful!",
+        " What shall we delve into next?",
+        " More of your lovely PRs please.",
+        " Can't wait for the next one!",
+        " Chef's kiss.",
+        " Already looking forward to the next diff.",
+        " Another round soon, please!",
+    ] {
+        let (code, out) = run_gate_on_bot_comment(
+            "receipt",
+            "chatgpt-codex-connector",
+            &codex_receipt_body(signoff),
+        );
+        assert_eq!(
+            code,
+            Some(0),
+            "Codex's receipt-marked comment signed off with {signoff:?} is a verdict, not a claim.\n{out}"
+        );
+        assert!(out.contains("HEAD COVERED"), "{signoff:?}\n{out}");
+        assert!(!out.contains("UNANSWERED"), "{signoff:?}\n{out}");
+    }
+}
+
+/// The verdict words with a finding after them are a finding, not a verdict.
+///
+/// The sign-off list is enumerated so that the phrase cannot carry text after it. Green on
+/// the gate before and after the receipt fix; it goes red against a sign-off pattern with an
+/// open tail, which is the loosening this guards against.
+#[test]
+fn review_gate_treats_a_codex_receipt_verdict_with_a_finding_as_a_claim() {
+    require_jq();
+    for (case, signoff) in [
+        (
+            "the sign-off line",
+            r#" Delightful! P1: the lease is dropped before the rename"#,
+        ),
+        (
+            "a line below",
+            r#" Delightful!\n\nP1: the lease is dropped before the rename, which races the pruner."#,
+        ),
+    ] {
+        let (code, out) = run_gate_on_bot_comment(
+            "receipt-claim",
+            "chatgpt-codex-connector",
+            &codex_receipt_body(signoff),
+        );
+        assert_eq!(
+            code,
+            Some(1),
+            "a finding on {case} after Codex's verdict words is a claim.\n{out}"
+        );
+        assert!(out.contains("carry no disposition"), "{case}\n{out}");
+        assert!(out.contains("UNREVIEWED HEAD"), "{case}\n{out}");
+        assert!(!out.contains("HEAD COVERED"), "{case}\n{out}");
+    }
+}
+
+/// CodeRabbit's "Review limit reached" summary notice as posted on #1199, with its org, run
+/// and checkbox ids replaced. JSON string literal.
+const CR_1199_NOTICE: &str = r#""<!-- coderabbit-ai-generated:v1 -->\n\n<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\n\n> [!WARNING]\n> ## Review limit reached\n> \n> You've used all free OSS reviews for now. Wait for the free limit to reset to keep reviewing this public repository.\n> \n> **Next included review available in 46 minutes.**\n> \n> [Check out review usage here](https://app.coderabbit.ai/dashboard/review-capacity?orgId=00000000-0000-4000-8000-000000000001).\n> \n> <details>\n> <summary><strong>View limit details</strong></summary>\n> <dl>\n> <dd>\n> \n> **Limit details:** You’ve used the included review currently available.\n> \n> [Learn how review limits work](https://docs.coderabbit.ai/management/rate-limits).\n> \n> **Review configuration:**\n> \n> <details>\n> <summary><strong>⚙️ Run configuration</strong></summary>\n> <dl>\n> <dd>\n> \n> - **Source mode**: Auto\n> - **Repository**: Unavailable\n> - **Branch**: Unavailable\n> - **File**: No configuration file from this repository applied\n> - **Commit**: Unavailable\n> - **Layers**: defaults\n> - **Review profile**: CHILL\n> - **Plan**: Advanced\n> - **Run ID**: `00000000-0000-4000-8000-000000000002`\n> \n> </dd>\n> </dl>\n> </details>\n> \n> <details>\n> <summary><strong>📥 Commits</strong></summary>\n> <dl>\n> <dd>\n> \n> Reviewing files that changed from the base of the PR and between 1aa0e96276e5500e60fc93f56d3c74298b4a2ba3 and 5f8a63e13cd9fdc777d23165ecd5f149fb93f848.\n> \n> </dd>\n> </dl>\n> </details>\n> \n> <details>\n> <summary><strong>⛔ Files ignored due to path filters: 1</strong></summary>\n> <dl>\n> <dd>\n> \n> * `Cargo.lock` is excluded by `!**/*.lock`\n> \n> </dd>\n> </dl>\n> </details>\n> \n> <details>\n> <summary><strong>📒 Files selected for processing: 11</strong></summary>\n> <dl>\n> <dd>\n> \n> * `Cargo.toml`\n> * `exec-proto/Cargo.toml`\n> * `failpoint/Cargo.toml`\n> * `fc-agent/Cargo.toml`\n> * `fc-agent/src/agent.rs`\n> * `fc-agent/src/vsock.rs`\n> * `fc-mock/Cargo.toml`\n> * `fuse-pipe/Cargo.toml`\n> * `src/uffd/server.rs`\n> * `src/utils.rs`\n> * `tests/test_snapshot_clone.rs`\n> \n> </dd>\n> </dl>\n> </details>\n> \n> </dd>\n> </dl>\n> </details>\n\n<!-- end of auto-generated comment: rate limited by coderabbit.ai -->\n\n<!-- autopilot:start -->\n- [ ] <!-- {\"checkboxId\":\"00000000-0000-4000-8000-000000000003\"} --> <strong title=\"Keep fixing CodeRabbit findings and required CI, and resolving merge conflicts\">Autofix</strong> · Keep fixing CodeRabbit findings and required CI, and resolving merge conflicts\n<!-- autopilot:end -->\n<!-- tips_start -->\n\n\n\nThanks for using [CodeRabbit](https://coderabbit.ai?utm_source=oss&utm_medium=github&utm_campaign=ejc3/fcvm&utm_content=1199)! It's free for OSS, and your support helps us grow. If you like it, consider giving us a shout-out.\n\n<details>\n<summary><strong>❤️ Share</strong></summary>\n<dl>\n<dd>\n\n- [X](https://twitter.com/intent/tweet?text=I%20just%20used%20%40coderabbitai%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20the%20proprietary%20code.%20Check%20it%20out%3A&url=https%3A//coderabbit.ai)\n- [Mastodon](https://mastodon.social/share?text=I%20just%20used%20%40coderabbitai%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20the%20proprietary%20code.%20Check%20it%20out%3A%20https%3A%2F%2Fcoderabbit.ai)\n- [Reddit](https://www.reddit.com/submit?title=Great%20tool%20for%20code%20review%20-%20CodeRabbit&text=I%20just%20used%20CodeRabbit%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20proprietary%20code.%20Check%20it%20out%3A%20https%3A//coderabbit.ai)\n- [LinkedIn](https://www.linkedin.com/sharing/share-offsite/?url=https%3A%2F%2Fcoderabbit.ai&mini=true&title=Great%20tool%20for%20code%20review%20-%20CodeRabbit&summary=I%20just%20used%20CodeRabbit%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20proprietary%20code)\n\n</dd>\n</dl>\n</details>\n\n\n<sub>Comment `@coderabbitai help` to get the list of available commands.</sub>\n\n<!-- tips_end -->\n""#;
+
+/// Appends `extra` (JSON-escaped) to the end of the #1199 notice.
+fn cr_1199_with(extra: &str) -> String {
+    format!("{}{extra}\"", &CR_1199_NOTICE[..CR_1199_NOTICE.len() - 1])
+}
+
+/// CodeRabbit's review-limit notice in its 2026-10 layout needs no disposition and covers
+/// no head.
+///
+/// From 2026-10-01 the notice wraps its folded parts in <dl><dd>, bolds their summaries,
+/// lists the run configuration as "- **Key**: value", links the limits docs at a new path,
+/// and carries an Autofix checkbox block between the notice and the tips. None of those
+/// lines was a listed shape, so on 2026-10-23 #1199's notice read as an unanswered finding.
+#[test]
+fn review_gate_treats_the_coderabbit_1199_limit_notice_as_a_notice() {
+    require_jq();
+    let (code, out) = run_gate_on_bot_comment("cr1199", "coderabbitai", CR_1199_NOTICE);
+    assert!(
+        !out.contains("carry no disposition") && !out.contains("UNANSWERED"),
+        "the #1199 review-limit notice is not a finding.\n{out}"
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("UNREVIEWED HEAD") && !out.contains("HEAD COVERED"),
+        "a notice covers no head, whatever range it quotes.\n{out}"
+    );
+}
+
+/// The #1199 notice with anything added is a claim: text after it, a walkthrough, a line in
+/// its Autofix block, or a finding shaped like a run-configuration item.
+///
+/// Green on the gate before and after the notice fix. The third case goes red if the
+/// Autofix block is stripped without checking its lines, the fourth if run-configuration
+/// items accept any value.
+#[test]
+fn review_gate_treats_the_coderabbit_1199_notice_with_additions_as_a_claim() {
+    require_jq();
+    let appended = cr_1199_with(r"\n\nP1: this drops the last row");
+    let walkthrough = cr_1199_with(
+        r"\n<!-- walkthrough_start -->\n\n## Walkthrough\n\nThe pruner now drops the last row before the rename.\n\n<!-- walkthrough_end -->",
+    );
+    let in_autofix = CR_1199_NOTICE.replace(
+        "<!-- autopilot:end -->",
+        r"P1: this drops the last row\n<!-- autopilot:end -->",
+    );
+    let as_config = CR_1199_NOTICE.replace(
+        r"> - **Commit**: Unavailable",
+        r"> - **Commit**: P1 this drops the last row",
+    );
+    for (case, body) in [
+        ("a finding appended", &appended),
+        ("a walkthrough appended", &walkthrough),
+        ("a finding inside the Autofix block", &in_autofix),
+        ("a finding as a run-configuration item", &as_config),
+    ] {
+        assert_ne!(
+            body.as_str(),
+            CR_1199_NOTICE,
+            "{case}: the fixture edit did not apply"
+        );
+        let (code, out) = run_gate_on_bot_comment("cr1199-claim", "coderabbitai", body);
+        assert_eq!(code, Some(1), "{case}\n{out}");
+        assert!(
+            out.contains("carry no disposition"),
+            "the #1199 notice with {case} is a claim.\n{out}"
+        );
+    }
+}
+
 /// A bot saying that its review did NOT run is not a finding, and covers no head.
 ///
 /// Codex out of quota posts "You have reached your Codex usage limits for code reviews" as

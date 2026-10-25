@@ -47,7 +47,21 @@ sudo ./fcvm podman run --name web --network bridged nginx:alpine
 
 # Routed — IPv6 native at kernel line rate, requires sudo + IPv6 host
 sudo ./fcvm podman run --name web --network routed nginx:alpine
+
+# Routed at a chosen address in the prefix in use, instead of one derived from the VM id
+sudo ./fcvm podman run --name slot-3 --network routed --ipv6-address 2001:db8:0:1::3 nginx:alpine
 ```
+
+A routed VM's address is derived from its random VM id unless `--ipv6-address` names one.
+That address must lie inside the prefix in use (`--ipv6-prefix`, `FCVM_IPV6_PREFIX`, or the
+detected /64) and must not be its address 0 or 1. An address another live VM holds is
+refused, naming that VM, and so is one the host already routes when no live VM holds it
+(a VM that exited without cleanup leaves its route). The flag is refused with any other
+network mode.
+
+VM names are unique among running VMs: `podman run --name X` and `snapshot run --name X`
+are refused, naming the VM's pid, while a live VM is named X. A VM whose process exited
+frees its name, SIGKILL included, so `exec --name X` always finds at most one VM.
 
 | Mode | Flag | Root | How It Works |
 |------|------|------|-------------|
@@ -138,6 +152,9 @@ from `snapshot run --ipv6-prefix` (also read from `FCVM_IPV6_PREFIX`), in the fo
 snapshot was created under is never used, so a clone on another host, or on a host whose
 routed prefix changed, gets an address the network routes to it. On a host with no
 routable /64 of its own, set the variable. Other network modes ignore it.
+`snapshot run --ipv6-address` gives a routed clone that address instead of a derived one,
+under the rules `podman run --ipv6-address` follows; fc-agent swaps it in for the
+snapshot's address on restore. The address is in no snapshot key.
 
 ### Building a Snapshot Without Leaving a VM Behind
 
@@ -198,13 +215,29 @@ After the first run with a given image, fcvm snapshots the VM state post-image-p
 
 ### Startup Snapshots
 
-Use `--health-check` to snapshot the fully initialized application, not just the pulled image:
+A run can snapshot its running container the first time it is healthy, so the next
+identical run (same image, command, environment and volumes; the name and labels may differ)
+restores the container already running instead of starting it with `podman run`. A run asks
+for this with `--startup-snapshot`, or with `--health-check`, which also decides when it is
+healthy. Otherwise healthy is podman's healthcheck for an image that defines one, and the
+container's start for one that does not:
 
 ```bash
+./fcvm podman run --name web1 --startup-snapshot nginx:alpine
+# First run: starts the container, then snapshots it running
+./fcvm podman run --name web2 --startup-snapshot nginx:alpine
+# Second run: restores with the container already running
+
 ./fcvm podman run --name web --health-check http://localhost/ nginx:alpine
-# First run: waits for health check, then snapshots the warm app
-# Second run: restores with app already running
+# Snapshots once the app answers, not just once the container started
 ```
+
+It is off for a plain `podman run` because every run restored from the snapshot continues
+the same container: whatever the app made when it started (keys, IDs, random seeds, a
+registration with a server) is shared by all of them, and output written before the snapshot
+is not repeated. A run that does not ask also does not restore a startup snapshot that another
+run left under the same key. `fcvm serve` passes `--startup-snapshot`, since its sandboxes of
+one image are identical by design.
 
 With `--balloon`, the startup snapshot is kept per target, because the app initialized under that target. Runs that differ only in the target still share the pre-start snapshot. A run whose target `fcvm balloon` changed before the app turned healthy saves no startup snapshot, and `podman prepare` fails.
 
@@ -383,7 +416,7 @@ brackets, quoted for the shell. `config.port_mappings[].host_ip` records the add
 - Cloud Hypervisor (only if using `--hypervisor cloud-hypervisor`): build the pinned fork with `fcvm setup --cloud-hypervisor`, or set `FCVM_CLOUD_HYPERVISOR_BIN`, or put `cloud-hypervisor` in PATH (resolved in that order)
 - For rootless: `passt` package (provides `pasta`)
 - For bridged: sudo, iptables, iproute2
-- For routed: sudo, iproute2, host with global IPv6 /64 (ip6tables also needed unless `--ipv6-prefix` is set)
+- For routed: sudo, iproute2, host with global IPv6 /64 (ip6tables also needed unless `--ipv6-prefix` is set), and `net.ipv6.conf.all.forwarding=1` (fcvm refuses routed mode without it)
 - For rootfs build: qemu-utils, e2fsprogs
 
 **Storage:** btrfs at `/mnt/fcvm-btrfs` (auto-created as loopback on non-btrfs hosts)
@@ -407,6 +440,13 @@ sudo sysctl -w vm.unprivileged_userfaultfd=1
 echo "user_allow_other" | sudo tee -a /etc/fuse.conf
 sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0  # Ubuntu 24.04+
 sudo sysctl -w net.ipv4.conf.all.forwarding=1
+# Routed networking. If the kernel itself takes the uplink's IPv6 default route from
+# router advertisements (accept_ra=1), turning forwarding on makes it ignore them and
+# the route expires, so set accept_ra=2 on the uplink first:
+#   sudo sysctl -w net.ipv6.conf.<uplink>.accept_ra=2
+# systemd-networkd handles advertisements itself (the kernel's accept_ra is 0) and keeps
+# its route either way.
+sudo sysctl -w net.ipv6.conf.all.forwarding=1
 
 # For bridged networking only:
 sudo mkdir -p /var/run/netns
@@ -437,7 +477,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 
 **Key `podman run` flags:**
 ```
---name <NAME>         VM name (required)
+--name <NAME>         VM name (required; unique among running VMs)
 --network <MODE>      rootless (default), bridged, or routed
 --publish <[IP:]H:G>  Port forward (e.g., 8080:80, '[::]:80:80')
 --map <H:G[:ro]>      Volume mount (e.g., /data:/data:ro); :ro is read-only in the guest and follows the host
@@ -445,6 +485,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 -i / -t / -it         Interactive / TTY / both
 --setup               Auto-setup if assets missing (rootless only)
 --health-check <URL>  Create startup snapshot after health passes
+--startup-snapshot    Snapshot the running container at its first Healthy (off by default)
 --cpu <N> --mem <MB>  CPU count and memory
 --hugepages           Use 2MB hugepages (pre-allocate pool first)
 --balloon <MIB>       Balloon device target; runs that differ only in the target share the pre-start snapshot
@@ -456,6 +497,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 --no-snapshot         Disable automatic snapshot creation
 --hypervisor <VMM>    firecracker (default) or cloud-hypervisor (#632)
 --ipv6-prefix <PREFIX>  Use explicit /64 prefix for routed mode (skips auto-detect and MASQUERADE; also read from FCVM_IPV6_PREFIX)
+--ipv6-address <ADDR>   Routed mode only: the VM's address, inside the prefix in use, instead of a derived one
 ```
 
 Run `fcvm --help` or `fcvm <command> --help` for full options.

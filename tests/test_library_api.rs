@@ -36,6 +36,7 @@ fn test_run_args(name: &str) -> RunArgs {
         network: NetworkMode::Rootless,
         hypervisor: fcvm::cli::args::Hypervisor::Firecracker,
         health_check: None,
+        startup_snapshot: false,
         privileged: false,
         interactive: false,
         tty: false,
@@ -56,12 +57,14 @@ fn test_run_args(name: &str) -> RunArgs {
         health_check_timeout: 5,
         on_restore: None,
         ipv6_prefix: None,
+        ipv6_address: None,
         dns: None,
         image: common::TEST_IMAGE.to_string(),
         command_args: vec![],
         rootfs_override: None,
         image_disk_override: None,
         pmem_devices: vec![],
+        resolved_extra_disks: None,
     }
 }
 

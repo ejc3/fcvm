@@ -1,0 +1,1006 @@
+//! `fcvm fleet coord`: the multiplayer authority.
+//!
+//! One task, the [`Actor`], owns the fleet state. Browsers, agents, the EC2 driver and the
+//! tick timer only send it commands; it stamps each event with the time, runs
+//! `fleet_core::apply`, and fans the result out: a snapshot for browsers (a watch channel,
+//! so a slow socket skips to the latest), an `assign`/`scene` diff for each agent, the EC2
+//! assignment, and the state file. No other task reads or writes the state, so there is
+//! nothing to lock and no order to race on.
+
+pub mod agents;
+pub mod aws;
+pub mod cert;
+pub mod dns;
+pub mod ec2;
+pub mod ec2_aws;
+pub mod live;
+pub mod poster;
+pub mod scale;
+pub mod secrets;
+pub mod sigv4;
+pub mod store;
+pub mod text_check;
+pub mod turnstile;
+
+use crate::cli::{FleetAggregateCodec, FleetCoordArgs, FleetEc2, FleetTextCheck};
+use crate::fleet::aggregate::codec::{Codec, Ffmpeg, Raw};
+use crate::fleet::aggregate::{Layout, TileSpec};
+use crate::fleet::now_ms;
+use anyhow::{bail, Context, Result};
+use fleet_core::protocol::{
+    AgentMsg, AssignSlot, BudgetBody, ClaimMsg, CoordMsg, ServerMsg, SharedScene,
+};
+use fleet_core::tiling::Rect;
+use fleet_core::view::{ec2_assignment, host_assignments, host_regions, shared_scene};
+use fleet_core::{apply, view, Config, Event, Receipt, State};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot, watch};
+
+/// The latest browser snapshot, serialized once for every socket.
+#[derive(Debug)]
+pub struct Snapshot {
+    pub version: u64,
+    pub text: String,
+}
+
+pub enum Cmd {
+    /// Apply an event; its `at` is replaced with the actor's clock. Replies with the
+    /// receipt for an intent.
+    Apply {
+        event: Event,
+        reply: Option<oneshot::Sender<Option<Receipt>>>,
+    },
+    /// The receipt already held for an intent id.
+    Receipt {
+        id: String,
+        reply: oneshot::Sender<Option<Receipt>>,
+    },
+    /// Would a `word` be refused before its text check? (`fleet_core::precheck_word`)
+    PrecheckWord {
+        client: String,
+        args: serde_json::Value,
+        reply: oneshot::Sender<Option<String>>,
+    },
+    /// The words in the sky now (a new word is checked together with them).
+    Sky {
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    /// The claim a viewer holds and, once its renderer runs, its frame URL.
+    ClaimFor {
+        viewer: String,
+        reply: oneshot::Sender<Option<ClaimMsg>>,
+    },
+    /// The current camera hold and the aggregators to take its poster from.
+    PosterPlan {
+        reply: oneshot::Sender<Option<poster::Plan>>,
+    },
+    /// An agent connection's hello. Replies whether the connection may name that host.
+    AgentHello {
+        conn: u64,
+        msg: AgentMsg,
+        tx: mpsc::UnboundedSender<CoordMsg>,
+        reply: oneshot::Sender<bool>,
+    },
+    AgentMsg {
+        conn: u64,
+        msg: AgentMsg,
+    },
+    AgentClosed {
+        conn: u64,
+    },
+    /// Stop: publish the last snapshot, write the state file, then answer.
+    Shutdown {
+        ack: oneshot::Sender<()>,
+    },
+}
+
+struct AgentConn {
+    host: String,
+    tx: mpsc::UnboundedSender<CoordMsg>,
+    last_assign: Option<(Vec<AssignSlot>, Option<Rect>)>,
+    last_scene: Option<SharedScene>,
+    last_budget: Option<BudgetBody>,
+}
+
+/// The channels the actor publishes on.
+pub struct Outputs {
+    pub snapshot: watch::Sender<Arc<Snapshot>>,
+    pub ec2: watch::Sender<Vec<AssignSlot>>,
+    /// The EC2 half's aggregator layout.
+    pub ec2_layout: watch::Sender<Option<Layout>>,
+    /// The fleet's power state (`awake`, `asleep`, `waking`).
+    pub power: watch::Sender<String>,
+    /// The shared scene, for the EC2 tiles' renderers.
+    pub scene: watch::Sender<Option<SharedScene>>,
+    /// The grid budget, for the EC2 tiles' renderers.
+    pub budget: watch::Sender<Option<BudgetBody>>,
+    /// The slots' DNS records, when the coordinator writes them (zone, wanted records).
+    pub dns: Option<watch::Sender<Vec<dns::Fact>>>,
+    pub store: Option<store::StoreTx>,
+}
+
+/// Minimum time between two browser snapshots; versions in between are skipped.
+const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(50);
+/// Minimum time between two state file writes.
+const STORE_INTERVAL: Duration = Duration::from_secs(1);
+
+pub struct Actor {
+    state: State,
+    /// The EC2 aggregator as the coordinator reaches it (it runs as our child).
+    ec2_aggregate_local: Option<String>,
+    out: Outputs,
+    agents: HashMap<u64, AgentConn>,
+    last_at: u64,
+    published: u64,
+    stored: u64,
+    clock: Box<dyn Fn() -> u64 + Send>,
+}
+
+pub fn snapshot_of(state: &State) -> Arc<Snapshot> {
+    let msg = ServerMsg::Snapshot {
+        version: state.version,
+        state: serde_json::to_value(view(state)).expect("the view serializes"),
+    };
+    Arc::new(Snapshot {
+        version: state.version,
+        text: serde_json::to_string(&msg).expect("a snapshot serializes"),
+    })
+}
+
+impl Actor {
+    pub fn new(state: State, out: Outputs, clock: Box<dyn Fn() -> u64 + Send>) -> Self {
+        let published = state.version;
+        out.snapshot.send_replace(snapshot_of(&state));
+        Actor {
+            ec2_aggregate_local: None,
+            stored: state.version,
+            state,
+            out,
+            agents: HashMap::new(),
+            last_at: 0,
+            published,
+            clock,
+        }
+    }
+
+    /// Event time: the clock, never earlier than the previous event, so `apply` sees time
+    /// move forward in the order it applies events.
+    fn stamp(&mut self) -> u64 {
+        self.last_at = (self.clock)().max(self.last_at);
+        self.last_at
+    }
+
+    fn apply(&mut self, mut event: Event) {
+        let at = self.stamp();
+        set_at(&mut event, at);
+        let before = self.state.version;
+        let state = std::mem::replace(&mut self.state, State::new(Config::default(), 0));
+        self.state = apply(state, &event);
+        if self.state.version != before {
+            self.dispatch_agents();
+        }
+    }
+
+    /// Send each agent its assignment and the scene when they differ from what it last got.
+    fn dispatch_agents(&mut self) {
+        let assignments = host_assignments(&self.state);
+        let regions = host_regions(&self.state);
+        let scene = shared_scene(&self.state);
+        self.out.scene.send_if_modified(|cur| {
+            let changed = cur.as_ref() != Some(&scene);
+            *cur = Some(scene.clone());
+            changed
+        });
+        let budget = self.state.fleet.budget.body();
+        self.out.budget.send_if_modified(|cur| {
+            let changed = *cur != budget;
+            *cur = budget;
+            changed
+        });
+        for conn in self.agents.values_mut() {
+            let mine = (
+                assignments.get(&conn.host).cloned().unwrap_or_default(),
+                regions.get(&conn.host).copied().flatten(),
+            );
+            // The scene goes first, so a slot's first scene post has it.
+            if conn.last_scene.as_ref() != Some(&scene) {
+                let _ = conn.tx.send(CoordMsg::Scene(scene.clone()));
+                conn.last_scene = Some(scene.clone());
+            }
+            if conn.last_assign.as_ref() != Some(&mine) {
+                let _ = conn.tx.send(CoordMsg::Assign {
+                    slots: mine.0.clone(),
+                    region: mine.1,
+                });
+                conn.last_assign = Some(mine);
+            }
+            if let Some(b) = budget.filter(|b| conn.last_budget != Some(*b)) {
+                let _ = conn.tx.send(CoordMsg::Budget(b));
+                conn.last_budget = Some(b);
+            }
+        }
+        let f = &self.state.fleet;
+        let ec2_layout = f.layout.ec2.map(|region| Layout {
+            epoch_unix_ms: f.scene.epoch_unix_ms,
+            image_aspect: self.state.config.image_aspect,
+            region,
+            tiles: f
+                .ec2
+                .values()
+                .filter_map(|s| {
+                    Some(TileSpec {
+                        id: s.id.clone(),
+                        rect: s.rect?,
+                        // The tile's published IPv6 name, as viewers get it.
+                        url: fleet_core::view::frame_urls(&self.state, s).0,
+                    })
+                })
+                .collect(),
+            generation: f.layout.generation,
+            from_frame: f.layout.from_frame,
+        });
+        self.out.ec2_layout.send_if_modified(|cur| {
+            let changed = *cur != ec2_layout;
+            *cur = ec2_layout.clone();
+            changed
+        });
+        let power = self.state.fleet.power.state.clone();
+        self.out.power.send_if_modified(|cur| {
+            let changed = *cur != power;
+            *cur = power.clone();
+            changed
+        });
+        if let Some(tx) = &self.out.dns {
+            let facts = dns::facts(&self.state);
+            tx.send_if_modified(|cur| {
+                let changed = *cur != facts;
+                *cur = facts;
+                changed
+            });
+        }
+        let ec2 = ec2_assignment(&self.state);
+        self.out.ec2.send_if_modified(|cur| {
+            if *cur == ec2 {
+                false
+            } else {
+                *cur = ec2;
+                true
+            }
+        });
+    }
+
+    fn publish(&mut self) {
+        if self.state.version != self.published {
+            self.published = self.state.version;
+            self.out.snapshot.send_replace(snapshot_of(&self.state));
+        }
+    }
+
+    /// Queue the state for the writer if it changed; the returned receiver resolves once it
+    /// is written (at once when nothing needed writing). With `barrier`, an unchanged state
+    /// still waits for the writes already queued, so shutdown does not end while the
+    /// periodic store's last write is in flight.
+    fn store(&mut self, barrier: bool) -> oneshot::Receiver<()> {
+        let (ack, done) = oneshot::channel();
+        let Some(tx) = &self.out.store else {
+            let _ = ack.send(());
+            return done;
+        };
+        if self.state.version == self.stored {
+            if barrier {
+                let _ = tx.send(store::StoreCmd {
+                    bytes: None,
+                    ack: Some(ack),
+                });
+            } else {
+                let _ = ack.send(());
+            }
+            return done;
+        }
+        match serde_json::to_vec(&self.state) {
+            Ok(bytes) => {
+                let _ = tx.send(store::StoreCmd {
+                    bytes: Some(Arc::new(bytes)),
+                    ack: Some(ack),
+                });
+                self.stored = self.state.version;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "cannot serialize the state");
+                let _ = ack.send(());
+            }
+        }
+        done
+    }
+
+    pub fn handle(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Apply { event, reply } => {
+                let id = match &event {
+                    Event::Intent { id, .. } => Some(id.clone()),
+                    _ => None,
+                };
+                self.apply(event);
+                if let Some(reply) = reply {
+                    let _ = reply.send(id.and_then(|id| self.state.receipt(&id).cloned()));
+                }
+            }
+            Cmd::Receipt { id, reply } => {
+                let _ = reply.send(self.state.receipt(&id).cloned());
+            }
+            Cmd::PrecheckWord {
+                client,
+                args,
+                reply,
+            } => {
+                let at = self.stamp();
+                let _ = reply.send(fleet_core::precheck_word(&self.state, &client, &args, at));
+            }
+            Cmd::Sky { reply } => {
+                let _ = reply.send(fleet_core::apply::sky(&self.state));
+            }
+            Cmd::PosterPlan { reply } => {
+                let f = &self.state.fleet;
+                // Starting tiles (a race, a first launch) are black until they run.
+                if !fleet_core::apply::image_settled(f) {
+                    let _ = reply.send(None);
+                    return;
+                }
+                let d = &f.director;
+                // Only aggregators with a region: one without (a host whose GPUs are all
+                // on standby, the EC2 side with no tile) never sends a frame, and the
+                // capture waits for every source.
+                let mut sources: Vec<String> = f
+                    .hosts
+                    .values()
+                    .filter(|h| h.region.is_some())
+                    .filter_map(|h| h.aggregate_url.clone())
+                    .collect();
+                if let Some(u) = self
+                    .ec2_aggregate_local
+                    .clone()
+                    .or_else(|| self.state.config.ec2_aggregate_url.clone())
+                    .filter(|_| f.layout.ec2.is_some())
+                {
+                    sources.push(u);
+                }
+                let plan = poster::Plan {
+                    step: d.step,
+                    arrive_t: d.arrive_t,
+                    hold_until_t: d.hold_until(),
+                    viewpoint: fleet_core::director::viewpoints()[d.current]
+                        .name
+                        .to_string(),
+                    epoch_unix_ms: f.scene.epoch_unix_ms,
+                    sources,
+                };
+                let _ = reply.send(Some(plan));
+            }
+            Cmd::ClaimFor { viewer, reply } => {
+                let info = self.state.fleet.slots.values().find_map(|s| {
+                    let c = s.claim.as_ref().filter(|c| c.viewer == viewer)?;
+                    let ready =
+                        s.observed.phase == "running" && s.observed.generation >= c.generation;
+                    Some(ClaimMsg {
+                        id: c.session.clone(),
+                        tile: c.borrowed.clone(),
+                        phase: if ready { "running" } else { "restoring" }.into(),
+                        frame_url: if ready {
+                            fleet_core::view::frame_urls(&self.state, s).0
+                        } else {
+                            None
+                        },
+                        frame_url_v4: if ready {
+                            fleet_core::view::frame_urls(&self.state, s).1
+                        } else {
+                            None
+                        },
+                        token: c.token.clone(),
+                        clicked_at: c.claimed_at,
+                        first_frame_at: c.first_frame_at,
+                        expires_at: c.expires_at,
+                        gpu: s.gpu.as_ref().map(|g| g.name.clone()),
+                        phases: if ready {
+                            s.observed.timings.clone()
+                        } else {
+                            Default::default()
+                        },
+                        camera: c.camera.clone(),
+                        ended: None,
+                    })
+                });
+                let _ = reply.send(info);
+            }
+            Cmd::AgentHello {
+                conn,
+                msg,
+                tx,
+                reply,
+            } => {
+                let AgentMsg::Hello { host, .. } = &msg else {
+                    let _ = reply.send(false);
+                    return;
+                };
+                let renamed = self.agents.get(&conn).is_some_and(|a| &a.host != host);
+                if renamed {
+                    tracing::warn!(%host, conn, "refusing a hello that renames its connection");
+                    let _ = reply.send(false);
+                    return;
+                }
+                // A host that dials again (`--dial` after a network drop) can find its old
+                // connection still held here: nothing is written to an agent between
+                // assignments, so a half-open one is not noticed. The new connection
+                // replaces it. The host's slots stay (no AgentGone), and the old
+                // connection's later messages and close are ignored, as its id is gone.
+                let stale: Vec<u64> = self
+                    .agents
+                    .iter()
+                    .filter(|(c, a)| **c != conn && &a.host == host)
+                    .map(|(c, _)| *c)
+                    .collect();
+                for c in stale {
+                    tracing::warn!(%host, old = c, new = conn, "a new connection replaces the host's old one");
+                    self.agents.remove(&c);
+                }
+                let host = host.clone();
+                self.agents.insert(
+                    conn,
+                    AgentConn {
+                        host: host.clone(),
+                        tx,
+                        last_assign: None,
+                        last_scene: None,
+                        last_budget: None,
+                    },
+                );
+                let _ = reply.send(true);
+                self.apply(Event::Agent { at: 0, host, msg });
+                // A host whose hello changed nothing still needs its first assignment.
+                self.dispatch_agents();
+            }
+            Cmd::AgentMsg { conn, msg } => {
+                let Some(host) = self.agents.get(&conn).map(|a| a.host.clone()) else {
+                    return;
+                };
+                self.apply(Event::Agent { at: 0, host, msg });
+            }
+            Cmd::Shutdown { ack } => {
+                // `run` handles shutdown; a direct call only acknowledges.
+                let _ = ack.send(());
+            }
+            Cmd::AgentClosed { conn } => {
+                if let Some(a) = self.agents.remove(&conn) {
+                    tracing::info!(host = %a.host, "agent gone");
+                    self.apply(Event::AgentGone {
+                        at: 0,
+                        host: a.host,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Run until every command sender is dropped.
+    pub async fn run(mut self, mut rx: mpsc::Receiver<Cmd>) {
+        let mut snap_tick = tokio::time::interval(SNAPSHOT_INTERVAL);
+        snap_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut store_tick = tokio::time::interval(STORE_INTERVAL);
+        store_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let ack = loop {
+            tokio::select! {
+                cmd = rx.recv() => match cmd {
+                    Some(Cmd::Shutdown { ack }) => break Some(ack),
+                    Some(c) => self.handle(c),
+                    None => break None,
+                },
+                _ = snap_tick.tick() => self.publish(),
+                _ = store_tick.tick() => {
+                    drop(self.store(false));
+                }
+            }
+        };
+        self.publish();
+        let written = self.store(true);
+        let _ = written.await;
+        if let Some(ack) = ack {
+            let _ = ack.send(());
+        }
+    }
+}
+
+fn set_at(event: &mut Event, t: u64) {
+    match event {
+        Event::Intent { at, .. }
+        | Event::ViewerJoined { at, .. }
+        | Event::ViewerLeft { at, .. }
+        | Event::Tick { at }
+        | Event::Agent { at, .. }
+        | Event::AgentGone { at, .. }
+        | Event::Ec2 { at, .. }
+        | Event::Degraded { at, .. }
+        | Event::ReleaseQuarantine { at, .. }
+        | Event::Visibility { at, .. }
+        | Event::ScaleInstances { at, .. }
+        | Event::Ec2Health { at, .. }
+        | Event::Published { at, .. } => *at = t,
+    }
+}
+
+/// Everything the coordinator's tasks share.
+#[derive(Clone)]
+pub struct Handle {
+    pub cmds: mpsc::Sender<Cmd>,
+    pub snapshot: watch::Receiver<Arc<Snapshot>>,
+    pub ec2_layout: watch::Receiver<Option<Layout>>,
+}
+
+impl Handle {
+    pub async fn apply(&self, event: Event) -> Option<Receipt> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Cmd::Apply {
+                event,
+                reply: Some(tx),
+            })
+            .await
+            .ok()?;
+        rx.await.ok().flatten()
+    }
+
+    /// Stop the actor; returns once the last state is on disk.
+    pub async fn shutdown(&self) {
+        let (ack, done) = oneshot::channel();
+        if self.cmds.send(Cmd::Shutdown { ack }).await.is_ok() {
+            let _ = done.await;
+        }
+    }
+
+    pub async fn send(&self, event: Event) {
+        let _ = self.cmds.send(Cmd::Apply { event, reply: None }).await;
+    }
+
+    pub async fn receipt(&self, id: &str) -> Option<Receipt> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Cmd::Receipt {
+                id: id.to_string(),
+                reply: tx,
+            })
+            .await
+            .ok()?;
+        rx.await.ok().flatten()
+    }
+
+    pub async fn sky(&self) -> Vec<String> {
+        let (tx, rx) = oneshot::channel();
+        if self.cmds.send(Cmd::Sky { reply: tx }).await.is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    pub async fn poster_plan(&self) -> Option<poster::Plan> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds.send(Cmd::PosterPlan { reply: tx }).await.ok()?;
+        rx.await.ok().flatten()
+    }
+
+    pub async fn claim_for(&self, viewer: &str) -> Option<ClaimMsg> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Cmd::ClaimFor {
+                viewer: viewer.to_string(),
+                reply: tx,
+            })
+            .await
+            .ok()?;
+        rx.await.ok().flatten()
+    }
+
+    pub async fn precheck_word(&self, client: &str, args: &serde_json::Value) -> Option<String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Cmd::PrecheckWord {
+                client: client.to_string(),
+                args: args.clone(),
+                reply: tx,
+            })
+            .await
+            .ok()?;
+        rx.await.ok().flatten()
+    }
+}
+
+/// Start the actor, the tick timer and the EC2 driver; returns the handle the transports
+/// use and the actor task.
+pub fn start(
+    state: State,
+    store: Option<store::StoreTx>,
+    ec2: Option<Arc<dyn ec2::Ec2Driver>>,
+    ec2_aggregate_local: Option<String>,
+    power: Option<scale::PowerConfig>,
+    dns_writer: Option<dns::Cloudflare>,
+) -> (Handle, tokio::task::JoinHandle<()>) {
+    let (cmds, rx) = mpsc::channel(4096);
+    let (snap_tx, snap_rx) = watch::channel(Arc::new(Snapshot {
+        version: 0,
+        text: String::new(),
+    }));
+    let (ec2_tx, ec2_rx) = watch::channel(Vec::new());
+    let (ec2_layout_tx, ec2_layout_rx) = watch::channel(None);
+    let (power_tx, power_rx) = watch::channel(state.fleet.power.state.clone());
+    let (scene_tx, scene_rx) = watch::channel(None);
+    let (budget_tx, budget_rx) = watch::channel(state.fleet.budget.body());
+    let mut state = state;
+    // With a DNS writer, tiles' frame URLs are the launches' published names.
+    state.config.names_published = dns_writer.is_some();
+    let dns_out = dns_writer.map(|cf| {
+        let (tx, rx) = watch::channel(dns::facts(&state));
+        (cf, tx, rx)
+    });
+    let actor = Actor::new(
+        state,
+        Outputs {
+            snapshot: snap_tx,
+            ec2: ec2_tx,
+            ec2_layout: ec2_layout_tx,
+            power: power_tx,
+            scene: scene_tx,
+            budget: budget_tx,
+            dns: dns_out.as_ref().map(|(_, tx, _)| tx.clone()),
+            store,
+        },
+        Box::new(now_ms),
+    );
+    let actor = Actor {
+        ec2_aggregate_local,
+        ..actor
+    };
+    let task = tokio::spawn(actor.run(rx));
+    let handle = Handle {
+        cmds,
+        snapshot: snap_rx,
+        ec2_layout: ec2_layout_rx,
+    };
+    let tick = handle.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            every.tick().await;
+            if tick
+                .cmds
+                .send(Cmd::Apply {
+                    event: Event::Tick { at: 0 },
+                    reply: None,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+    if let Some(driver) = ec2 {
+        tokio::spawn(ec2::run(
+            driver,
+            ec2_rx,
+            scene_rx,
+            budget_rx,
+            handle.clone(),
+        ));
+    }
+    if let Some(cfg) = power {
+        tokio::spawn(scale::run(cfg, power_rx, handle.clone()));
+    }
+    if let Some((cf, _, rx)) = dns_out {
+        tokio::spawn(dns::run(cf, rx, handle.clone()));
+    }
+    (handle, task)
+}
+
+/// The operator's endpoint: `POST /quarantine/release {"host", "sbdf"}` returns a
+/// quarantined GPU to rotation.
+pub fn admin_router(handle: Handle) -> axum::Router {
+    #[derive(serde::Deserialize)]
+    struct Release {
+        host: String,
+        sbdf: String,
+    }
+    axum::Router::new()
+        .route(
+            "/quarantine/release",
+            axum::routing::post(
+                |axum::extract::State(h): axum::extract::State<Handle>,
+                 axum::Json(r): axum::Json<Release>| async move {
+                    tracing::info!(host = %r.host, sbdf = %r.sbdf, "operator released a quarantined GPU");
+                    h.send(Event::ReleaseQuarantine {
+                        at: 0,
+                        host: r.host,
+                        sbdf: r.sbdf,
+                    })
+                    .await;
+                    axum::Json(serde_json::json!({"ok": true}))
+                },
+            ),
+        )
+        .with_state(handle)
+}
+
+/// Whether the fleet sleeps with no active viewer: it scales its host groups, or it was told
+/// to sleep on fixed hosts.
+pub fn power_managed(args: &FleetCoordArgs) -> bool {
+    !args.scale_groups.is_empty() || args.sleep_when_idle
+}
+
+pub async fn run(args: FleetCoordArgs) -> Result<()> {
+    let config = Config {
+        max_tiles: args.max_tiles,
+        ec2_max: match args.ec2 {
+            FleetEc2::None => 0,
+            FleetEc2::Fake | FleetEc2::Aws => args.ec2_tiles.min(args.max_tiles),
+        },
+        ec2_aggregate_url: args.ec2_aggregate_url.clone(),
+        race_interval_secs: args.race_every,
+        restart_cooldown_secs: args.restart_cooldown,
+        camera_seed: args.camera_seed,
+        max_borrowed: args.max_borrowed,
+        power_managed: power_managed(&args),
+        idle_scale_down_secs: args.idle_scale_down,
+        ..Config::default()
+    };
+    if config.max_tiles == 0 {
+        bail!("--max-tiles must be at least 1");
+    }
+    let checker: Arc<dyn text_check::TextChecker> = match args.text_check {
+        FleetTextCheck::None => Arc::new(text_check::NoCheck),
+        FleetTextCheck::Bedrock => {
+            let model = args
+                .text_check_model
+                .context("--text-check bedrock needs --text-check-model")?;
+            let region = args
+                .text_check_region
+                .context("--text-check bedrock needs --text-check-region")?;
+            Arc::new(text_check::Bedrock::new(region, model)?)
+        }
+    };
+    let (state, store_tx) = match &args.state_file {
+        Some(path) => {
+            let state = match store::load(path)? {
+                Some(s) => {
+                    tracing::info!(path = %path.display(), version = s.version, "resuming from the state file");
+                    s.resumed(config, now_ms())
+                }
+                None => State::new(config, now_ms()),
+            };
+            (state, Some(store::spawn_writer(path.clone())))
+        }
+        None => match &args.state_bucket {
+            Some(bucket) => {
+                let region = args
+                    .state_region
+                    .clone()
+                    .or_else(|| std::env::var("AWS_REGION").ok())
+                    .context("--state-bucket needs --state-region or AWS_REGION")?;
+                let obj = store::S3Object::new(bucket, &args.state_key, &region)?;
+                let state = match obj.load().await? {
+                    Some(s) => {
+                        tracing::info!(bucket = %bucket, key = %args.state_key, version = s.version, "resuming from the state object");
+                        s.resumed(config, now_ms())
+                    }
+                    None => State::new(config, now_ms()),
+                };
+                (state, Some(store::spawn_s3_writer(obj)))
+            }
+            None => (State::new(config, now_ms()), None),
+        },
+    };
+    let ec2: Option<Arc<dyn ec2::Ec2Driver>> = match args.ec2 {
+        FleetEc2::None => None,
+        FleetEc2::Fake => Some(Arc::new(ec2::FakeEc2::new(
+            Duration::from_secs(2),
+            Duration::from_secs(20),
+        ))),
+        FleetEc2::Aws => {
+            let mut d = ec2_aws::AwsEc2::new(
+                args.ec2_regions.clone(),
+                args.ec2_template.clone(),
+                args.ec2_on_demand_template.clone(),
+                args.dns_zone.clone(),
+            )?;
+            d.fleet = args.fleet_name.clone();
+            Some(Arc::new(d))
+        }
+    };
+    let ec2_local = args.ec2_aggregate_listen.as_ref().map(|l| {
+        format!(
+            "ws://{}/frames",
+            crate::fleet::aggregate::child::connect_addr(l)
+        )
+    });
+    let on_demand = scale::pair_on_demand(&args.scale_groups, &args.on_demand_groups)?;
+    let power = if args.scale_groups.is_empty() {
+        None
+    } else {
+        Some(scale::PowerConfig {
+            driver: Arc::new(scale::AwsAutoScaling::new()?),
+            groups: args.scale_groups.clone(),
+            awake_capacity: args.awake_capacity,
+            poll: Duration::from_secs(5),
+            on_demand,
+            spot_wait: Duration::from_secs(args.spot_wait),
+        })
+    };
+    let secrets_region = || {
+        args.secrets_region
+            .clone()
+            .or_else(|| std::env::var("AWS_REGION").ok())
+            .context("reading a secret needs --secrets-region or AWS_REGION")
+    };
+    let dns_token = match &args.dns_token_secret {
+        Some(name) => Some(
+            secrets::Secrets::new(&secrets_region()?)?
+                .get(name)
+                .await?
+                .trim()
+                .to_string(),
+        ),
+        None => None,
+    };
+    let cloudflare = |token: &str| {
+        dns::Cloudflare::new(
+            token.to_string(),
+            args.dns_zone.clone(),
+            args.dns_zone_id.clone(),
+        )
+    };
+    if dns_token.is_some() && args.dns_nameservers.is_empty() {
+        tracing::warn!(
+            "--dns-nameservers is empty: launches' names are published without confirming them at the zone's authoritative servers"
+        );
+    }
+    let dns_writer = match &dns_token {
+        Some(t) => Some(cloudflare(t)?.with_confirm(Arc::new(dns::Authoritative {
+            servers: args.dns_nameservers.clone(),
+        }))),
+        None => None,
+    };
+    if let Some(secret) = &args.tls_secret {
+        let token = dns_token
+            .as_deref()
+            .context("--tls-secret needs --dns-token-secret (DNS-01 challenges)")?;
+        let mut renewal = cert::Renewal::new(secret.clone(), args.dns_zone.clone());
+        if let Some(d) = &args.acme_directory {
+            renewal.directory = d.clone();
+        }
+        tokio::spawn(cert::run(
+            renewal,
+            secrets::Secrets::new(&secrets_region()?)?,
+            cloudflare(token)?,
+        ));
+    }
+    let ec2_sweep = ec2.clone();
+    let (handle, _actor) = start(state, store_tx, ec2, ec2_local, power, dns_writer);
+    if let Some(listen) = &args.ec2_aggregate_listen {
+        let mut argv = vec![
+            std::env::current_exe()
+                .context("locating this fcvm binary")?
+                .to_string_lossy()
+                .into_owned(),
+            "fleet".into(),
+            "aggregate".into(),
+        ];
+        argv.extend(args.aggregate_args.iter().cloned());
+        tokio::spawn(crate::fleet::aggregate::child::supervise(
+            argv,
+            listen.clone(),
+            handle.ec2_layout.clone(),
+            || {},
+        ));
+    }
+    for cmd in args.agent_cmds {
+        let argv =
+            shell_words::split(&cmd).with_context(|| format!("splitting --agent-cmd {cmd:?}"))?;
+        if argv.is_empty() {
+            bail!("--agent-cmd is empty");
+        }
+        tokio::spawn(agents::run_command(argv, handle.clone()));
+    }
+    let listener = tokio::net::TcpListener::bind(&args.listen)
+        .await
+        .with_context(|| format!("listening on {}", args.listen))?;
+    tracing::info!(listen = %args.listen, "coordinator serving /live");
+    eprintln!("fleet coordinator listening on {}", listener.local_addr()?);
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    if let Some(addr) = &args.admin_listen {
+        let admin = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("listening on {addr}"))?;
+        eprintln!("fleet coordinator admin on {}", admin.local_addr()?);
+        let h = handle.clone();
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(admin, admin_router(h)).await {
+                tracing::error!(error = %e, "admin endpoint stopped");
+            }
+        });
+    }
+    let verifier: Arc<dyn turnstile::Verifier> = match args.turnstile_secret {
+        Some(secret) => Arc::new(turnstile::Siteverify::new(secret, None)?),
+        None => Arc::new(turnstile::Off),
+    };
+    let poster = Arc::new(poster::Poster::default());
+    let (decoder, encoder): (Arc<dyn Codec>, poster::StillEncoder) = match args.poster_codec {
+        FleetAggregateCodec::Ffmpeg => (
+            Arc::new(Ffmpeg {
+                bin: args.ffmpeg.clone(),
+            }),
+            poster::StillEncoder::Jpeg {
+                ffmpeg: args.ffmpeg.clone(),
+            },
+        ),
+        FleetAggregateCodec::Raw => (Arc::new(Raw), poster::StillEncoder::Ppm),
+    };
+    tokio::spawn(poster::run(
+        handle.clone(),
+        poster.clone(),
+        decoder,
+        encoder,
+    ));
+    let cfg = live::LiveConfig {
+        checker,
+        allowed_origins: args.allowed_origins,
+        verifier,
+        trust_cf_connecting_ip: args.trust_cf_connecting_ip,
+        turnstile_site_key: args.turnstile_site_key,
+        poster,
+    };
+    tokio::select! {
+        r = live::serve(listener, handle.clone(), cfg) => r?,
+        _ = term.recv() => tracing::info!("SIGTERM"),
+        _ = int.recv() => tracing::info!("SIGINT"),
+    }
+    // The state file holds the last state before the process exits; the agents' commands
+    // are killed when their handles drop, and their VMs follow them (PR_SET_PDEATHSIG).
+    handle.shutdown().await;
+    tracing::info!("coordinator stopped; state written");
+    // The next coordinator does not know these instances; terminate them now (it also
+    // sweeps at its start, for a coordinator that was killed).
+    if let Some(d) = ec2_sweep {
+        match tokio::time::timeout(Duration::from_secs(20), d.sweep()).await {
+            Ok(Ok(n)) => tracing::info!(instances = n, "EC2 tiles terminated"),
+            Ok(Err(e)) => tracing::warn!(error = %format!("{e:#}"), "EC2 tiles not terminated"),
+            Err(_) => tracing::warn!("EC2 tiles not terminated within 20 s"),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod power_tests {
+    use crate::cli::{Cli, Commands, FleetCommand};
+    use clap::Parser;
+
+    fn coord(extra: &[&str]) -> crate::cli::FleetCoordArgs {
+        let mut argv = vec!["fcvm", "fleet", "coord", "--listen", "127.0.0.1:0"];
+        argv.extend_from_slice(extra);
+        match Cli::try_parse_from(argv).expect("parses").cmd {
+            Commands::Fleet(f) => match f.cmd {
+                FleetCommand::Coord(a) => *a,
+                _ => panic!("coord"),
+            },
+            _ => panic!("fleet"),
+        }
+    }
+
+    #[test]
+    fn the_fleet_sleeps_with_scale_groups_or_when_told_to() {
+        assert!(!super::power_managed(&coord(&[])));
+        assert!(super::power_managed(&coord(&["--sleep-when-idle"])));
+        assert!(super::power_managed(&coord(&[
+            "--scale-group",
+            "us-east-1:fcvm-fleet-hosts"
+        ])));
+    }
+}

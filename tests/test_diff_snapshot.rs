@@ -3,10 +3,10 @@
 //! Tests the diff snapshot optimization:
 //! 1. First snapshot (pre-start) = Full snapshot
 //! 2. Subsequent snapshots (startup, user from clone) = Diff snapshot
-//! 3. Diff is merged onto base immediately after creation
+//! 3. The diff is written over a clone of the base's memory.bin: in place, or merged onto a copy
 //!
-//! Only one Full snapshot is ever created. All subsequent snapshots use reflink copy
-//! of base memory.bin, then create and merge a diff.
+//! Only one Full snapshot is ever created. All subsequent snapshots start from a clone
+//! of the base's memory.bin.
 
 #![cfg(feature = "integration-fast")]
 
@@ -39,8 +39,10 @@ async fn check_log_for_diff_snapshot(log_path: &str) -> (bool, bool, bool) {
         || log_content.contains("snapshot_type=\"Full\"");
     let has_diff = log_content.contains("creating diff snapshot")
         || log_content.contains("snapshot_type=\"Diff\"");
+    // A diff is merged onto a copy of its base, or written in place into a clone of it.
     let has_merge = log_content.contains("merging diff snapshot onto base")
-        || log_content.contains("diff merge complete");
+        || log_content.contains("diff merge complete")
+        || log_content.contains("diff written in place");
 
     (has_full, has_diff, has_merge)
 }
@@ -49,9 +51,9 @@ async fn check_log_for_diff_snapshot(log_path: &str) -> (bool, bool, bool) {
 ///
 /// This test verifies the core diff snapshot optimization:
 /// 1. Pre-start snapshot is Full (no base exists yet)
-/// 2. Startup snapshot uses reflink copy of pre-start's memory.bin as base
+/// 2. Startup snapshot starts from a clone of pre-start's memory.bin
 /// 3. Startup creates a Diff snapshot
-/// 4. Diff is merged onto base
+/// 4. The diff is written into that clone, in place or by a merge
 #[tokio::test]
 async fn test_diff_snapshot_prestart_full_startup_diff() -> Result<()> {
     // This test verifies diff snapshot types (Full vs Diff), which requires
@@ -405,7 +407,7 @@ async fn test_user_snapshot_from_clone_uses_parent() -> Result<()> {
     // What the merge did, for the log of this run.
     if let Some(line) = stderr
         .lines()
-        .find(|line| line.contains("diff merge complete"))
+        .find(|line| line.contains("diff merge complete") || line.contains("diff written in place"))
     {
         println!("  {}", line.trim());
     }
@@ -599,7 +601,7 @@ async fn test_tracked_diff_of_a_served_clone_keeps_its_writes_and_the_parents_pa
     );
     if let Some(line) = stderr
         .lines()
-        .find(|line| line.contains("diff merge complete"))
+        .find(|line| line.contains("diff merge complete") || line.contains("diff written in place"))
     {
         println!("  {}", line.trim());
     }
@@ -692,12 +694,11 @@ impl Drop for RemoveSnapshotOnDrop {
 /// read just before the snapshot. A Firecracker that writes zero pages as data
 /// leaves no holes at all.
 ///
-/// A snapshot of a clone restored from it is a Diff whose merge base is a copy of
-/// this memory.bin, made with copy_file_range. On btrfs that clones the extents,
-/// so the child keeps the parent's holes. When btrfs refuses the clone (the two
-/// files' NODATACOW flags differ, or the data dir is not btrfs) the kernel falls
-/// back to a byte copy and every hole becomes data, so the test also bounds the
-/// child's holes.
+/// A snapshot of a clone restored from it is a Diff written over a clone of this
+/// memory.bin: FICLONE for an in-place diff, copy_file_range for a merge, which
+/// clones on btrfs. Either way the child keeps the parent's holes. A byte copy
+/// (copy_file_range on a store that cannot clone) writes every hole out as data,
+/// so the test also bounds the child's holes.
 ///
 /// The data is counted from SEEK_DATA and SEEK_HOLE runs, which is what the
 /// snapshot wrote. That is not disk use: on btrfs with compression neither the
@@ -840,13 +841,13 @@ async fn test_full_snapshot_stores_zero_pages_as_holes() -> Result<()> {
     // The clone's diff writes every page it touched since the restore, zeros
     // included, so the child gains some data: 1.1 MiB on this 1 GiB guest, and
     // 4 to 8 MiB for the startup diffs of the other tests in this binary. A
-    // merge base that writes the parent's holes out (about 630 MiB) leaves the
+    // base copy that writes the parent's holes out (about 630 MiB) leaves the
     // child none. Half the parent's holes allows about 40 times the largest
     // gain measured and still fails that copy.
     assert!(
         child_holes >= holes / 2,
         "the child's memory.bin has {child_holes} bytes of holes against its parent's {holes}: \
-         the merge base copy wrote the parent's holes out as data"
+         the copy of the parent wrote its holes out as data"
     );
     Ok(())
 }
@@ -1198,11 +1199,11 @@ async fn test_snapshot_of_a_clone_stores_the_memory_its_guest_gave_back_as_holes
     );
     let merge_line = stderr
         .lines()
-        .find(|line| line.contains("diff merge complete"))
-        .with_context(|| format!("snapshot create on the clone logged no merge: {stderr}"))?;
+        .find(|line| line.contains("diff merge complete") || line.contains("diff written in place"))
+        .with_context(|| format!("snapshot create on the clone logged neither a merge nor an in-place diff: {stderr}"))?;
     println!("  {}", merge_line.trim());
     let zero_bytes = log_number(merge_line, " zero_bytes=")
-        .with_context(|| format!("the merge line has no zero_bytes: {merge_line}"))?;
+        .with_context(|| format!("the diff line has no zero_bytes: {merge_line}"))?;
 
     let child_memory = std::fs::File::open(child_snapshot.join("memory.bin"))
         .context("opening the child's memory.bin")?;

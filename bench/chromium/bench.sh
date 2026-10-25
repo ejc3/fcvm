@@ -105,9 +105,9 @@ HOST6=$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[0-9a-f:]+'
 [ -n "$HOST4" ] || die "no host IPv4 (route to 1.1.1.1)"
 
 write_hostinfo() {
-    python3 - "$RESULTS" "$HOST4" "${HOST6:-}" "$R" "$CPU" "$MEM" "$FCVM" <<'EOF'
+    python3 - "$RESULTS" "$R" "$CPU" "$MEM" "$FCVM" <<'EOF'
 import hashlib, json, os, platform, subprocess, sys
-d, h4, h6, r, cpu, mem, fcvm = sys.argv[1:8]
+d, r, cpu, mem, fcvm = sys.argv[1:6]
 meminfo = {l.split(":")[0]: l.split()[1] for l in open("/proc/meminfo") if ":" in l}
 
 
@@ -134,12 +134,13 @@ def sh(*a):
 # cell was measured on a quiet machine without taking the write-up's word for it.
 load1, load5, load15 = open("/proc/loadavg").read().split()[:3]
 info = {
-    "uname": " ".join(platform.uname()),
+    # Published records keep the instance type and facts about the kernel and
+    # CPU, never the host name or an address: uname() minus its node field.
+    "uname": " ".join((platform.system(), platform.release(), platform.version(), platform.machine())),
     "nproc": os.cpu_count(),
     "mem_total_kb": int(meminfo["MemTotal"]),
     "cpu_model": next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo")
                        if l.lower().startswith(("model name", "hardware", "cpu part"))), "unknown-arm64"),
-    "host_ipv4": h4, "host_ipv6": h6 or None,
     "reps": int(r), "vm_cpu": int(cpu), "vm_mem_mib": int(mem),
     "started_utc": subprocess.run(["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"],
                                   capture_output=True, text=True).stdout.strip(),

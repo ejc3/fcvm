@@ -11,40 +11,148 @@ use crate::output::OutputHandle;
 use crate::types::Plan;
 use crate::vsock;
 
+/// Where podman finds the overlay image store.
+pub const IMAGE_STORE_PATH: &str = "/mnt/image-store";
+/// Where the store's device is mounted for a run with a user, under the bind mount at
+/// [`IMAGE_STORE_PATH`]. It is in /run, a tmpfs, so no map of the guest's /mnt can make
+/// its mount point impossible to create.
+pub const IMAGE_STORE_RAW_PATH: &str = "/run/fcvm-image-store-raw";
+
+/// The container user's ids, which the overlay store is shown with. Rootless podman
+/// keeps its storage with container uid and gid 0 as the user's own ids, and container
+/// ids 1 to `sub_count` as the user's subordinate ids from `sub_start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreUser {
+    pub uid: u32,
+    pub gid: u32,
+    pub sub_start: u64,
+    pub sub_count: u64,
+    pub sub_gid_start: u64,
+    pub sub_gid_count: u64,
+}
+
+/// Who a store's files belong to on disk: the ids container uid and gid 0 were written
+/// as, and where container uids and gids 1 and up begin. Root podman on the host writes
+/// the container ids themselves (0, 0, 1, 1). Rootless podman on the host writes its
+/// builder's uid and gid, and its subordinate ids from the subuid and subgid starts the
+/// host passes in the plan, which are also the container user's ranges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StoreOwner {
+    uid: u32,
+    gid: u32,
+    sub_start: u64,
+    sub_gid_start: u64,
+}
+
+impl StoreOwner {
+    /// The owner a store has, from who owns its `overlay-images` directory.
+    fn of(meta: &std::fs::Metadata, user: &StoreUser) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        let root_built = meta.uid() == 0;
+        Self {
+            uid: meta.uid(),
+            gid: meta.gid(),
+            sub_start: if root_built { 1 } else { user.sub_start },
+            sub_gid_start: if root_built { 1 } else { user.sub_gid_start },
+        }
+    }
+}
+
+impl StoreUser {
+    /// The `X-mount.idmap` option (util-linux 2.39) that shows a store `owner` wrote as
+    /// this user's, or None when the store already holds this user's ids.
+    fn idmap_option(&self, owner: StoreOwner) -> Option<String> {
+        if owner.uid == self.uid
+            && owner.gid == self.gid
+            && owner.sub_start == self.sub_start
+            && owner.sub_gid_start == self.sub_gid_start
+        {
+            return None;
+        }
+        Some(format!(
+            "X-mount.idmap=u:{ou}:{uid}:1 u:{os}:{sub}:{n} g:{og}:{gid}:1 g:{ogs}:{subg}:{ng}",
+            ou = owner.uid,
+            og = owner.gid,
+            os = owner.sub_start,
+            ogs = owner.sub_gid_start,
+            uid = self.uid,
+            gid = self.gid,
+            sub = self.sub_start,
+            n = self.sub_count,
+            subg = self.sub_gid_start,
+            ng = self.sub_gid_count
+        ))
+    }
+}
+
 /// Mount a pre-built overlay storage image and configure as additionalImageStore.
 ///
 /// The storage image is an ext4 filesystem containing a podman overlay storage tree
 /// (overlay/, overlay-images/, overlay-layers/). It is mounted read-only and podman
-/// finds the image there without needing `podman load`. The mount goes into `record`.
+/// finds the image there without needing `podman load`. The mounts go into `record`.
+///
+/// With a user, the device is mounted at [`IMAGE_STORE_RAW_PATH`] and bound at
+/// [`IMAGE_STORE_PATH`] through an id-mapped mount that shows the store's files as
+/// `store_user`'s, the ownership rootless podman's own `podman load` would have given
+/// them. That covers a store root podman built and one rootless podman built as another
+/// uid; a store that already holds the user's ids is bound as it is.
 pub fn mount_overlay_image(
     device: &str,
     image_name: &str,
     username: Option<&str>,
+    store_user: Option<StoreUser>,
     record: &mut crate::mounts::MountRecord,
 ) -> Result<String> {
     eprintln!("[fc-agent] mounting overlay storage image: {}", device);
 
-    let mount_path = "/mnt/image-store";
+    let mount_path = IMAGE_STORE_PATH;
     std::fs::create_dir_all(mount_path).context("creating image store mount point")?;
 
     wait_for_device(device)?;
 
-    // Mount read-only
+    let device_path = if store_user.is_some() {
+        std::fs::create_dir_all(IMAGE_STORE_RAW_PATH)
+            .context("creating the raw image store mount point")?;
+        IMAGE_STORE_RAW_PATH
+    } else {
+        mount_path
+    };
     let output = std::process::Command::new("mount")
-        .args(["-o", "ro", device, mount_path])
+        .args(["-o", "ro", device, device_path])
         .output()
-        .context("mounting storage image")?;
+        .context("running mount for the overlay storage image")?;
+    mount_succeeded(&output)
+        .with_context(|| format!("mounting overlay storage image {device} at {device_path}"))?;
+    record.record(format!("image store {device}"), device_path)?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "Failed to mount overlay storage image {} at {}: {}",
-            device,
-            mount_path,
-            stderr
+    if let Some(user) = store_user {
+        let meta = std::fs::metadata(format!("{IMAGE_STORE_RAW_PATH}/overlay-images"))
+            .context("reading who owns the overlay storage image")?;
+        let owner = StoreOwner::of(&meta, &user);
+        let idmap = user.idmap_option(owner);
+        let options = match &idmap {
+            Some(idmap) => format!("ro,{idmap}"),
+            None => "ro".to_string(),
+        };
+        let output = std::process::Command::new("mount")
+            .args(["--bind", "-o", &options, IMAGE_STORE_RAW_PATH, mount_path])
+            .output()
+            .context("running mount for the image store bind")?;
+        mount_succeeded(&output).with_context(|| {
+            format!("binding the image store at {mount_path} with options {options}")
+        })?;
+        record.record(format!("image store bind of {device}"), mount_path)?;
+        eprintln!(
+            "[fc-agent] image store owned by uid {} on disk, {} for uid {}",
+            owner.uid,
+            if idmap.is_some() {
+                "shown through an id-mapped mount"
+            } else {
+                "bound as it is"
+            },
+            user.uid
         );
     }
-    record.record(format!("image store {device}"), mount_path)?;
 
     // Configure podman to use this as an additional image store.
     let (conf_path, runroot, graphroot) = storage_paths(username);
@@ -119,6 +227,14 @@ pub fn mount_overlay_image(
 
     // Fallback: return expected name (downstream will fail with clear error if wrong)
     Ok(image_name.to_string())
+}
+
+/// Whether a mount(8) run succeeded; a failure carries its stderr.
+fn mount_succeeded(output: &std::process::Output) -> Result<()> {
+    if !output.status.success() {
+        anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(())
 }
 
 /// Wait for a block device to appear (up to 5 seconds).
@@ -787,8 +903,19 @@ pub async fn pull_image(plan: &Plan) -> Result<String> {
     )
 }
 
-/// Get the digest of a pulled image.
-pub async fn get_image_digest(image: &str, cmd_prefix: &[String]) -> Result<String> {
+/// What fc-agent reads from the image before the container starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageFacts {
+    /// The image digest, the snapshot cache key the host is told about.
+    pub digest: String,
+    /// Whether the image defines a HEALTHCHECK. Sent with the start notification, so
+    /// the host runs `podman healthcheck` only for images that have one.
+    pub healthcheck: bool,
+}
+
+/// Get the digest of a pulled image and whether it defines a HEALTHCHECK, in one
+/// `podman image inspect`.
+pub async fn get_image_facts(image: &str, cmd_prefix: &[String]) -> Result<ImageFacts> {
     let (cmd, mut args) = if cmd_prefix.is_empty() {
         ("podman".to_string(), vec![])
     } else {
@@ -800,7 +927,7 @@ pub async fn get_image_digest(image: &str, cmd_prefix: &[String]) -> Result<Stri
         "image".to_string(),
         "inspect".to_string(),
         "--format".to_string(),
-        "{{.Digest}}".to_string(),
+        "{{.Digest}}\n{{json .HealthCheck}}".to_string(),
         image.to_string(),
     ]);
 
@@ -815,7 +942,33 @@ pub async fn get_image_digest(image: &str, cmd_prefix: &[String]) -> Result<Stri
         anyhow::bail!("podman image inspect failed: {}", stderr);
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    parse_image_facts(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse the output of `podman image inspect --format '{{.Digest}}\n{{json .HealthCheck}}'`.
+///
+/// `HEALTHCHECK NONE` is stored as a test of `["NONE"]`, and podman runs no check for it.
+fn parse_image_facts(stdout: &str) -> Result<ImageFacts> {
+    let mut lines = stdout.trim().splitn(2, '\n');
+    let digest = lines.next().unwrap_or_default().trim().to_string();
+    if digest.is_empty() {
+        anyhow::bail!("podman image inspect printed no digest: {stdout:?}");
+    }
+    let health: serde_json::Value = match lines.next().map(str::trim) {
+        Some(json) if !json.is_empty() => serde_json::from_str(json)
+            .with_context(|| format!("parsing the image's HealthCheck: {json:?}"))?,
+        _ => anyhow::bail!("podman image inspect printed no HealthCheck: {stdout:?}"),
+    };
+    let healthcheck = health
+        .get("Test")
+        .and_then(|test| test.as_array())
+        .and_then(|test| test.first())
+        .and_then(|first| first.as_str())
+        .is_some_and(|first| first != "NONE");
+    Ok(ImageFacts {
+        digest,
+        healthcheck,
+    })
 }
 
 /// Result of notify_cache_ready_and_wait: what this VM is, per the host.
@@ -1345,6 +1498,9 @@ pub fn build_podman_args(
         // with rootless podman (--user mode), causing the container to deadlock
         // on stdout/stderr pipe write.
         "--log-driver=none".to_string(),
+        // podman sends READY=1 to $NOTIFY_SOCKET (START_NOTIFY_SOCKET) once the
+        // container is running; that is the host's signal that it started.
+        "--sdnotify=conmon".to_string(),
     ]);
 
     if let Some((username, runtime_dir)) = user_info {
@@ -1439,6 +1595,22 @@ pub fn build_podman_args(
     args
 }
 
+/// The VM user's subordinate id range: the host's from /etc/subuid when the plan
+/// carries it (a store built by rootless podman on the host holds those ids),
+/// otherwise a default range.
+pub fn resolve_subuid_range(subuid_range: Option<(u64, u64)>) -> (u64, u64) {
+    subuid_range.unwrap_or((100000, 65536))
+}
+
+/// The VM user's subordinate gid range: the host's from /etc/subgid when the plan
+/// carries it, which can differ from its uid range, otherwise the uid range.
+pub fn resolve_subgid_range(
+    subgid_range: Option<(u64, u64)>,
+    subuid_range: Option<(u64, u64)>,
+) -> (u64, u64) {
+    subgid_range.unwrap_or_else(|| resolve_subuid_range(subuid_range))
+}
+
 /// Create the VM user and set up rootless podman prerequisites.
 /// Call this BEFORE importing images so podman load runs as the target user.
 /// Returns (username, uid, runtime_dir) for use by run_as_user_prefix().
@@ -1452,6 +1624,7 @@ pub fn create_vm_user(
     user_spec: &str,
     desired_name: &str,
     subuid_range: Option<(u64, u64)>,
+    subgid_range: Option<(u64, u64)>,
     provisioned: bool,
 ) -> (String, String, String) {
     let parts: Vec<&str> = user_spec.split(':').collect();
@@ -1471,16 +1644,20 @@ pub fn create_vm_user(
         .args(["-u", &uid, "-g", &gid, "-m", "-s", "/bin/sh", &username])
         .output();
 
-    // Use host's subuid range if provided (matches storage image UIDs),
-    // otherwise fall back to a default range.
-    let (subuid_start, subuid_count) = subuid_range.unwrap_or((100000, 65536));
-    let subuid_entry = format!("{}:{}:{}\n", username, subuid_start, subuid_count);
+    let (subuid_start, subuid_count) = resolve_subuid_range(subuid_range);
+    let (subgid_start, subgid_count) = resolve_subgid_range(subgid_range, subuid_range);
     eprintln!(
-        "[fc-agent] subuid/subgid: {}:{}",
-        subuid_start, subuid_count
+        "[fc-agent] subuid {}:{}, subgid {}:{}",
+        subuid_start, subuid_count, subgid_start, subgid_count
     );
-    let _ = std::fs::write("/etc/subuid", &subuid_entry);
-    let _ = std::fs::write("/etc/subgid", &subuid_entry);
+    let _ = std::fs::write(
+        "/etc/subuid",
+        format!("{username}:{subuid_start}:{subuid_count}\n"),
+    );
+    let _ = std::fs::write(
+        "/etc/subgid",
+        format!("{username}:{subgid_start}:{subgid_count}\n"),
+    );
 
     let runtime_dir = format!("/run/user/{}", uid);
     let _ = std::fs::create_dir_all(&runtime_dir);
@@ -1640,11 +1817,144 @@ fn setup_user_mapping(args: &mut Vec<String>, username: &str, runtime_dir: &str)
     }
 }
 
-/// Run container in TTY mode. Never returns: powers the VM off when the container exits.
-pub async fn run_tty(podman_args: &[String], plan: &Plan, mounted_fuse_paths: &[String]) -> ! {
-    vsock::notify_container_started();
+/// The uid and gid podman runs the container as, or None when it runs as root. Matches
+/// how `agent::run` decides on a container user: a uid that is 0 or does not parse means
+/// root, and a spec without a gid takes group 100, as [`create_vm_user`] does.
+pub fn podman_user_ids(user_spec: Option<&str>) -> Option<(u32, u32)> {
+    let mut parts = user_spec?.split(':');
+    let uid: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    if uid == 0 {
+        return None;
+    }
+    let gid = parts.next().and_then(|s| s.parse().ok()).unwrap_or(100);
+    Some((uid, gid))
+}
 
-    let exit_code = crate::tty::run_with_pty(podman_args, plan.tty, plan.interactive).await;
+/// Where podman reports that the container is running.
+///
+/// fc-agent runs podman with `--sdnotify=conmon` and this path in `NOTIFY_SOCKET`, and
+/// podman sends `READY=1` here once the OCI runtime has started the container. The
+/// container itself is not given the socket. podman records the path when it creates the
+/// container, so a `podman start` of a captured container reports here too.
+pub const START_NOTIFY_SOCKET: &str = "/run/fcvm-container-start.sock";
+
+/// Whether the container has started in this boot: [`NOT_STARTED`], or what the start
+/// notification said ([`STARTED`] or [`STARTED_WITH_HEALTHCHECK`]). A restore re-sends it
+/// to the clone's host process, whose status listener has never heard it.
+static CONTAINER_START: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+const NOT_STARTED: u8 = 0;
+const STARTED: u8 = 1;
+const STARTED_WITH_HEALTHCHECK: u8 = 2;
+
+/// Whether one sd_notify datagram says the service is ready.
+fn notify_says_ready(datagram: &[u8]) -> bool {
+    datagram
+        .split(|b| *b == b'\n')
+        .any(|line| line == b"READY=1")
+}
+
+/// The socket podman reports the container's start to, bound before podman runs.
+pub struct StartNotify {
+    socket: tokio::net::UnixDatagram,
+}
+
+impl StartNotify {
+    /// Bind [`START_NOTIFY_SOCKET`]. `owner` is the uid and gid rootless podman runs as;
+    /// podman sends from that user, and a datagram socket takes writes only from users
+    /// with write permission on it.
+    pub fn bind(owner: Option<(u32, u32)>) -> Result<Self> {
+        Self::bind_at(std::path::Path::new(START_NOTIFY_SOCKET), owner)
+    }
+
+    fn bind_at(path: &std::path::Path, owner: Option<(u32, u32)>) -> Result<Self> {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("removing a stale {path:?}")),
+        }
+        let socket = tokio::net::UnixDatagram::bind(path)
+            .with_context(|| format!("binding the container start socket {path:?}"))?;
+        if let Some((uid, gid)) = owner {
+            std::os::unix::fs::chown(path, Some(uid), Some(gid))
+                .with_context(|| format!("giving {path:?} to uid {uid}"))?;
+        }
+        Ok(Self { socket })
+    }
+
+    /// Wait for podman's `READY=1`, then tell the host the container is running. Other
+    /// datagrams (podman sends `MAINPID=` and, while it pulls, `EXTEND_TIMEOUT_USEC=`)
+    /// are read and ignored.
+    pub fn spawn(self, healthcheck: bool) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            if let Err(e) = self.wait_ready().await {
+                eprintln!(
+                    "[fc-agent] WARNING: reading the container start socket failed: {e}; \
+                     the host will not learn that the container started"
+                );
+                return;
+            }
+            let started = if healthcheck {
+                STARTED_WITH_HEALTHCHECK
+            } else {
+                STARTED
+            };
+            CONTAINER_START.store(started, std::sync::atomic::Ordering::Release);
+            eprintln!("[fc-agent] container running (podman READY=1)");
+            send_container_started(healthcheck).await;
+        })
+    }
+
+    /// Return once a datagram says `READY=1`.
+    async fn wait_ready(&self) -> std::io::Result<()> {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = self.socket.recv(&mut buf).await?;
+            if notify_says_ready(&buf[..n]) {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Tell the host the container is running, off the runtime's worker threads: the send
+/// is a blocking vsock connect, retried.
+async fn send_container_started(healthcheck: bool) {
+    if let Err(e) =
+        tokio::task::spawn_blocking(move || vsock::notify_container_started(healthcheck)).await
+    {
+        eprintln!("[fc-agent] WARNING: the container start notification task failed: {e}");
+    }
+}
+
+/// After a restore, tell the clone's host process that the container is running, if it
+/// was when the snapshot was taken. The host process that took the snapshot heard it;
+/// the clone's never did. Before the container starts this sends nothing: the start
+/// notification goes to the clone's host when it happens.
+pub async fn resend_container_started_after_restore() {
+    match CONTAINER_START.load(std::sync::atomic::Ordering::Acquire) {
+        NOT_STARTED => {}
+        started => send_container_started(started == STARTED_WITH_HEALTHCHECK).await,
+    }
+}
+
+/// Run container in TTY mode. Never returns: powers the VM off when the container exits.
+pub async fn run_tty(
+    podman_args: &[String],
+    plan: &Plan,
+    mounted_fuse_paths: &[String],
+    start_notify: StartNotify,
+    healthcheck: bool,
+) -> ! {
+    let start_watch = start_notify.spawn(healthcheck);
+
+    let exit_code = crate::tty::run_with_pty(
+        podman_args,
+        vec![("NOTIFY_SOCKET".to_string(), START_NOTIFY_SOCKET.to_string())],
+        plan.tty,
+        plan.interactive,
+    )
+    .await;
+    start_watch.abort();
 
     vsock::notify_container_exit(exit_code);
 
@@ -1661,15 +1971,19 @@ pub async fn run_async(
     podman_args: &[String],
     output: &OutputHandle,
     non_blocking_output: bool,
+    start_notify: StartNotify,
+    healthcheck: bool,
 ) -> Result<i32> {
     let mut cmd = Command::new(&podman_args[0]);
     cmd.args(&podman_args[1..]);
+    cmd.env("NOTIFY_SOCKET", START_NOTIFY_SOCKET);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
     let mut child = cmd.spawn().context("spawning Podman container")?;
-
-    vsock::notify_container_started();
+    // The socket is already bound, so a READY=1 sent before this task first reads it
+    // waits in the socket's queue.
+    let start_watch = start_notify.spawn(healthcheck);
 
     // Stream stdout via OutputHandle.
     // In non-blocking mode, use try_send_line (drops on full) to prevent
@@ -1708,6 +2022,7 @@ pub async fn run_async(
     });
 
     let status = child.wait().await?;
+    start_watch.abort();
     let exit_code = status.code().unwrap_or(1);
 
     if let Some(task) = stdout_task {
@@ -1759,6 +2074,69 @@ pub async fn run_async(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A store's owner shows as the user and its subordinate ids as the user's,
+    /// the mapping rootless podman stores with: root podman wrote container ids
+    /// (0, and 1 up), rootless podman on the host wrote its builder's uid and the
+    /// host's subuid range, and a store holding the user's ids needs no mapping.
+    #[test]
+    fn store_user_maps_the_store_owner_to_the_user_and_its_range_to_the_users() {
+        let user = StoreUser {
+            uid: 1001,
+            gid: 100,
+            sub_start: 100000,
+            sub_count: 65536,
+            sub_gid_start: 200000,
+            sub_gid_count: 65536,
+        };
+        let root_built = StoreOwner {
+            uid: 0,
+            gid: 0,
+            sub_start: 1,
+            sub_gid_start: 1,
+        };
+        assert_eq!(
+            user.idmap_option(root_built).as_deref(),
+            Some("X-mount.idmap=u:0:1001:1 u:1:100000:65536 g:0:100:1 g:1:200000:65536")
+        );
+        // Rootless podman as another uid wrote the host's ranges, which are also the
+        // user's, so only the owner moves; the gid range stays the gid range.
+        let built_by_another_uid = StoreOwner {
+            uid: 2000,
+            gid: 100,
+            sub_start: 100000,
+            sub_gid_start: 200000,
+        };
+        assert_eq!(
+            user.idmap_option(built_by_another_uid).as_deref(),
+            Some("X-mount.idmap=u:2000:1001:1 u:100000:100000:65536 g:100:100:1 g:200000:200000:65536")
+        );
+        let built_by_the_user = StoreOwner {
+            uid: 1001,
+            gid: 100,
+            sub_start: 100000,
+            sub_gid_start: 200000,
+        };
+        assert_eq!(user.idmap_option(built_by_the_user), None);
+    }
+
+    /// The guest's /etc/subgid takes the host's gid range when the plan carries one,
+    /// so a rootless-built store's group ids are the user's; without one it is the uid
+    /// range, as before.
+    #[test]
+    fn the_subgid_range_is_the_hosts_and_falls_back_to_the_subuid_range() {
+        assert_eq!(
+            resolve_subgid_range(Some((200000, 65536)), Some((100000, 65536))),
+            (200000, 65536)
+        );
+        assert_eq!(
+            resolve_subgid_range(None, Some((100000, 65536))),
+            (100000, 65536)
+        );
+        assert_eq!(resolve_subgid_range(None, None), (100000, 65536));
+    }
+
     use super::{consume_cache_wait_lines, run_cache_handshake, CacheResult, StatusConnector};
 
     /// An attached GPU reaches the container as a CDI device, before the image
@@ -1780,6 +2158,83 @@ mod tests {
 
         let args = super::build_podman_args(&plan, "alpine", None, &[]);
         assert!(!args.iter().any(|a| a == "--device"), "{args:?}");
+    }
+
+    /// podman is asked to report the container's start, the host's only signal that it
+    /// is running.
+    #[test]
+    fn podman_run_reports_the_start_over_sd_notify() {
+        let plan: crate::types::Plan = serde_json::from_str(r#"{"image": "alpine"}"#).unwrap();
+        for user in [None, Some(("fcvm-user", "/run/user/1000"))] {
+            let args = super::build_podman_args(&plan, "alpine", user, &[]);
+            let sdnotify = args.iter().position(|a| a == "--sdnotify=conmon");
+            let image = args.iter().position(|a| a == "alpine").unwrap();
+            assert!(sdnotify.is_some_and(|i| i < image), "{args:?}");
+        }
+    }
+
+    /// The image's HEALTHCHECK is read from the same inspect as its digest; a missing
+    /// one, and `HEALTHCHECK NONE`, are no healthcheck.
+    #[test]
+    fn image_facts_carry_the_digest_and_whether_there_is_a_healthcheck() {
+        let digest = "sha256:4b9a4e0196b9ec48c209f98d6e7cea3241bfc402262bf1b0500ea4dbb1002c45";
+        for (health, expected) in [
+            (
+                r#"{"Test":["CMD-SHELL","true"],"Interval":5000000000}"#,
+                true,
+            ),
+            (r#"{"Test":["CMD","/bin/check"]}"#, true),
+            ("null", false),
+            (r#"{"Test":["NONE"]}"#, false),
+            (r#"{"Test":[]}"#, false),
+        ] {
+            let facts = super::parse_image_facts(&format!("{digest}\n{health}\n")).unwrap();
+            assert_eq!(facts.digest, digest);
+            assert_eq!(facts.healthcheck, expected, "{health}");
+        }
+        assert!(super::parse_image_facts("\n").is_err());
+        assert!(super::parse_image_facts(&format!("{digest}\n")).is_err());
+        assert!(super::parse_image_facts(&format!("{digest}\nnot json")).is_err());
+    }
+
+    #[test]
+    fn container_user_ids_follow_the_plans_user() {
+        assert_eq!(super::podman_user_ids(None), None);
+        assert_eq!(super::podman_user_ids(Some("0")), None);
+        assert_eq!(super::podman_user_ids(Some("0:0")), None);
+        assert_eq!(
+            super::podman_user_ids(Some("1000:1000")),
+            Some((1000, 1000))
+        );
+        assert_eq!(super::podman_user_ids(Some("1000")), Some((1000, 100)));
+    }
+
+    /// The start watch returns on podman's READY=1 and not before: podman sends
+    /// MAINPID= and, while it pulls, EXTEND_TIMEOUT_USEC= on the same socket.
+    #[tokio::test]
+    async fn the_start_watch_waits_for_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("start.sock");
+        let watch = super::StartNotify::bind_at(&path, None).unwrap();
+        let podman = std::os::unix::net::UnixDatagram::unbound().unwrap();
+
+        podman
+            .send_to(b"EXTEND_TIMEOUT_USEC=30000000", &path)
+            .unwrap();
+        podman.send_to(b"MAINPID=42", &path).unwrap();
+        let early =
+            tokio::time::timeout(std::time::Duration::from_millis(200), watch.wait_ready()).await;
+        assert!(early.is_err(), "returned before READY=1");
+
+        podman.send_to(b"MAINPID=42\nREADY=1", &path).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), watch.wait_ready())
+            .await
+            .expect("READY=1 was not seen")
+            .unwrap();
+
+        // A stale socket from an earlier boot is replaced, not an error.
+        drop(watch);
+        super::StartNotify::bind_at(&path, None).unwrap();
     }
 
     /// A pmem mount reaches the container read-only at the same path, as a

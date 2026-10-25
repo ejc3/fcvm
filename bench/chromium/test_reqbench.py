@@ -9282,6 +9282,89 @@ class HostBootDigest(unittest.TestCase):
         )
 
 
+class NoHostIdentifiersInTree(unittest.TestCase):
+    """Tracked files carry no EC2 instance id, volume id or AWS-internal host name.
+
+    Published records keep the instance type and never a box's host name, IP
+    address, boot id or instance id. #1153 removed the raw boot id; this pins the
+    rest of the class. Watched FAIL before the rewrite: 3 ladder hostinfo.json
+    files named an instance id and a host name, report/README.md quoted the
+    instance id, and runner ids sat in CI comments and a fixture.
+    """
+
+    INSTANCE = re.compile(r"(?<![0-9A-Za-z])i-(?:[0-9a-f]{17}|[0-9a-f]{8})(?![0-9A-Za-z])")
+    VOLUME = re.compile(r"(?<![0-9A-Za-z])vol-[0-9a-f]{8,17}(?![0-9A-Za-z])")
+    HOSTNAME = re.compile(
+        r"(?<![0-9A-Za-z])(?:ip|ec2)-[0-9]{1,3}-[0-9]{1,3}-[0-9]{1,3}-[0-9]{1,3}(?![0-9A-Za-z])"
+    )
+    # RFC 5737 documentation addresses spelled as AWS host names are examples.
+    HOSTNAME_EXAMPLE = re.compile(r"(?:ip|ec2)-192-0-2-[0-9]{1,3}(?![0-9A-Za-z])")
+    # Placeholders the AWS CLI documentation uses; not any real resource.
+    PLACEHOLDERS = {
+        "i-" + "1234567890abcdef0",
+        "i-" + "0123456789abcdef0",
+        "vol-" + "1234567890abcdef0",
+    }
+    # Spelled in pieces so this file does not contain the forbidden keys.
+    FIELDS = ("instance" + "_id", "host_" + "ipv4", "host_" + "ipv6")
+    # Captured third-party pages and dependency locks are not our records.
+    SKIP_PREFIXES = ("bench/chromium/corpus-live/", "tests/package-lock.json")
+
+    def offenders(self, pathspec, with_fields):
+        root = os.path.dirname(os.path.dirname(HERE))
+        listing = subprocess.run(
+            ["git", "-C", root, "ls-files", "-z", "--", pathspec],
+            check=True, capture_output=True,
+        ).stdout.decode().split("\0")
+        paths = [p for p in listing if p and not p.startswith(self.SKIP_PREFIXES)]
+        self.assertGreater(len(paths), 100, "git ls-files returned too little")
+        found = []
+        for path in paths:
+            full = os.path.join(root, path)
+            if not os.path.isfile(full):
+                continue
+            with open(full, "rb") as handle:
+                text = handle.read().decode("utf-8", "replace")
+            hits = [m.group(0) for m in self.INSTANCE.finditer(text)]
+            hits += [m.group(0) for m in self.VOLUME.finditer(text)]
+            hits = [h for h in hits if h not in self.PLACEHOLDERS]
+            for match in self.HOSTNAME.finditer(text):
+                if not self.HOSTNAME_EXAMPLE.match(text, match.start()):
+                    hits.append("hostname")
+            if with_fields:
+                hits += [f for f in self.FIELDS if f'"{f}"' in text]
+            if hits:
+                found.append((path, len(hits)))
+        return found
+
+    def test_no_tracked_file_under_bench_names_a_box(self):
+        found = self.offenders("bench", with_fields=True)
+        self.assertEqual(
+            found, [],
+            f"{len(found)} tracked files under bench/ name an instance id, volume "
+            "id, AWS host name or a host address/instance field (path, hits); "
+            "record the instance type and, where equality is needed, a salted "
+            "SHA-256",
+        )
+
+    def test_no_tracked_file_anywhere_names_an_instance_volume_or_host(self):
+        found = self.offenders(".", with_fields=False)
+        self.assertEqual(
+            found, [],
+            f"{len(found)} tracked files name an instance id, volume id or AWS "
+            "host name (path, hits)",
+        )
+
+    def test_hostinfo_writer_records_no_name_or_address(self):
+        root = os.path.dirname(os.path.dirname(HERE))
+        with open(os.path.join(root, "bench/chromium/bench.sh")) as handle:
+            source = handle.read()
+        body = source.split("write_hostinfo() {", 1)[1].split("\n}\n", 1)[0]
+        for field in self.FIELDS:
+            self.assertNotIn(f'"{field}"', body)
+        self.assertNotIn("platform.uname()", body, "uname() carries the node name")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
@@ -9548,7 +9631,7 @@ class MakefileBenchGraph(unittest.TestCase):
         recipe whose script runs `make` reaches the link script through the
         sub-make and waits on its own ancestor forever.
 
-        Observed 2026-09-02 on parallel-box 2: `make bench-chromium-corpus`
+        Observed 2026-09-02 on a parallel box: `make bench-chromium-corpus`
         -> corpus_campaign.sh -> `make -C $REPO bench-chromium-request-golden`
         -> cargo-target-link.sh, `flock -x` parked in locks_lock_inode_wait
         with the box at load 0.00, until killed.

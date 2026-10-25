@@ -1,0 +1,76 @@
+name: Fleet web staging deploy
+
+# Deploys fleet/web to the fcvm-fleet-stage Worker (stage.fcvm.dev, behind Cloudflare
+# Access) from main. The token is the cloudflare-deploy environment's CLOUDFLARE_API_TOKEN
+# (ejc3/aws workers-deploy.tf), and that environment admits main only: a run from any
+# other ref waits on it and never receives the secret. wrangler.jsonc keeps workers.dev and
+# preview URLs off; the stage.fcvm.dev custom domain is Terraform's (ejc3/aws fcvm-dev.tf),
+# so the Worker is reachable only through the Access application on that host.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'fleet/web/**'
+      - '.github/workflows/fleet-web-deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-web-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy fcvm-fleet-stage
+    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: cloudflare-deploy
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+        working-directory: fleet/web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 10.34.7
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      # The pull request's Fleet Web job ran the unit and browser tests on this code; the
+      # deploy checks only what it builds.
+      - name: Lint and typecheck
+        run: pnpm lint && pnpm typecheck
+      - name: Build the Worker
+        run: pnpm cf:build
+      # The Access check after the deploy cannot see past Access: a Worker that throws on
+      # every request answers the unauthenticated request with the same 302.
+      - name: Serve the built Worker before shipping it
+        run: scripts/worker-smoke.sh 24110
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: pnpm exec wrangler deploy
+      # Staging must answer an unauthenticated request with Access's login redirect. Before
+      # the custom domain exists the host does not resolve, which is also closed.
+      - name: Staging stays behind Access
+        run: |
+          set -uo pipefail
+          # The step runs under -e: a curl failure (6 when the host does not resolve) must
+          # reach the case below, not end the step.
+          rc=0
+          out=$(curl -sS -o /dev/null --max-time 20 -w '%{http_code} %{redirect_url}' https://stage.fcvm.dev/ 2>&1) || rc=$?
+          echo "stage.fcvm.dev: $out (curl exit $rc)"
+          case "$out" in
+            "302 https://"*".cloudflareaccess.com/"*) echo "behind Access" ;;
+            *"Could not resolve host"*) echo "no custom domain yet (ejc3/aws#627): not reachable" ;;
+            *) echo "::error::stage.fcvm.dev answered an unauthenticated request without Access: $out"; exit 1 ;;
+          esac

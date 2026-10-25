@@ -70,6 +70,67 @@ impl OutputHandle {
 /// of finishing a frozen 50ms sleep first. It is an ACCELERATOR only — every
 /// consumer must keep working (just slower) if it never fires (e.g. TTY-mode
 /// VMs, where no output connection exists).
+/// Where `fc-agent --resume-snapshot-network` asks the running agent to reconnect its
+/// output after a snapshot of this VM.
+///
+/// A snapshot resets the vsock transport, and the writer reconnects only when asked (see
+/// [`output_writer`]). A restored clone is asked by its restore handler, and a cold start
+/// by the cache handshake. The VM that was snapshotted is resumed by the host and restores
+/// nothing, so before this nothing asked it, and every line its container wrote after a
+/// snapshot taken while it ran (a startup snapshot, `fcvm snapshot create`) was lost. The
+/// host runs the resume one-shot only on the VM it just snapshotted and resumed, which is
+/// never in the middle of a restore of its own.
+pub const RECONNECT_SOCKET: &str = "/run/fc-agent-output-reconnect.sock";
+const RECONNECT_REQUEST: &[u8] = b"reconnect";
+
+/// Listen on [`RECONNECT_SOCKET`] and reconnect the output on each request.
+pub fn spawn_reconnect_listener(output: OutputHandle) -> anyhow::Result<()> {
+    spawn_reconnect_listener_at(std::path::Path::new(RECONNECT_SOCKET), output)
+}
+
+fn spawn_reconnect_listener_at(path: &std::path::Path, output: OutputHandle) -> anyhow::Result<()> {
+    use anyhow::Context;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("removing a stale {path:?}")),
+    }
+    let socket = tokio::net::UnixDatagram::bind(path)
+        .with_context(|| format!("binding the output reconnect socket {path:?}"))?;
+    tokio::spawn(async move {
+        let mut buf = [0u8; 64];
+        loop {
+            match socket.recv(&mut buf).await {
+                Ok(n) if &buf[..n] == RECONNECT_REQUEST => {
+                    eprintln!("[fc-agent] output reconnect requested after the source resumed");
+                    output.reconnect();
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("[fc-agent] WARNING: output reconnect socket failed: {e}");
+                    return;
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Ask the running agent to reconnect its output (see [`RECONNECT_SOCKET`]).
+pub fn request_reconnect() -> anyhow::Result<()> {
+    request_reconnect_at(std::path::Path::new(RECONNECT_SOCKET))
+}
+
+fn request_reconnect_at(path: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let socket = std::os::unix::net::UnixDatagram::unbound()
+        .context("creating the output reconnect request socket")?;
+    socket
+        .send_to(RECONNECT_REQUEST, path)
+        .with_context(|| format!("asking the agent to reconnect its output via {path:?}"))?;
+    Ok(())
+}
+
 pub fn create() -> (
     OutputHandle,
     impl Future<Output = ()>,
@@ -295,6 +356,36 @@ async fn output_writer(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    /// The resume one-shot's request reaches the running agent's output writer as a
+    /// reconnect, and other datagrams do not.
+    #[tokio::test]
+    async fn a_reconnect_request_reaches_the_output_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reconnect.sock");
+        let (output, _writer, _reset) = create();
+        spawn_reconnect_listener_at(&path, output.clone()).unwrap();
+
+        std::os::unix::net::UnixDatagram::unbound()
+            .unwrap()
+            .send_to(b"something else", &path)
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !output.reconnect_requested(),
+            "a stray datagram reconnected the output"
+        );
+
+        request_reconnect_at(&path).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !output.reconnect_requested() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no reconnect was requested"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
 
     #[tokio::test]
     async fn test_output_handle_try_send() {

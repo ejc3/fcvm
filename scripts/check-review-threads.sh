@@ -619,12 +619,14 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 # A reviewer with nothing to say posts no review object. Codex answers with a plain
 # comment: "Codex Review: Didn't find any major issues." plus one of a few short
 # sign-offs, then "**Reviewed commit:** `<sha>`", then a folded "About Codex in GitHub"
-# block. A CodeRabbit review that produces no comments replies "Full review finished."
-# (or "Review finished." for an incremental one) folded under "Action performed". Those
-# are verdicts, not findings: they need no disposition. Codex's also covers the commit it
-# names; CodeRabbit's names nothing, and its coverage comes from the walkthrough comment
-# instead (walkthrough_sha below, and the coverage check for how a result is bound to
-# the head).
+# block. Since 2026-10-15 the comment opens with "<!-- codex-review-receipt:v1 -->", an
+# HTML comment on its own line, which verdict_lines drops like any hidden comment
+# (strip_hidden_comments below). A CodeRabbit review that produces no comments replies
+# "Full review finished." (or "Review finished." for an incremental one) folded under
+# "Action performed". Those are verdicts, not findings: they need no disposition. Codex's
+# also covers the commit it names; CodeRabbit's names nothing, and its coverage comes
+# from the walkthrough comment instead (walkthrough_sha below, and the coverage check for
+# how a result is bound to the head).
 #
 # walkthrough_sha is the last commit of a review that RAN CLEAN, or "". CodeRabbit edits
 # one walkthrough comment in place, and its recent-review block names the range it
@@ -640,7 +642,7 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 # beside a clean block at the head (#869) also declines: the comment is in a mixed state
 # from two runs, and which run wrote which block is not something this gate can read.
 #
-# Codex's SECOND no-findings shape, and since 2026-08-28 the only one it has posted here:
+# Codex's SECOND no-findings shape, posted here since 2026-08-28 alongside the first:
 # one comment per PR carrying "<!-- codex-pull-request-review-summary -->", opened when a
 # review STARTS and edited in place as reviews finish. Its table holds one row per review:
 #   | Code Review | Completed <relative-time datetime="..."> | `9ebed54` | Manual request |
@@ -666,8 +668,10 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 # an open-ended tail would accept "Didn't find any major issues. P1: drops data" as a
 # verdict. An unlisted sign-off is not a verdict, so the gate blocks until someone reads
 # the comment, which is the right direction; extend the list when Codex says something
-# new. Only the About Codex block is stripped, and only under that exact summary text:
-# a details block with any other summary is where a bot folds its findings.
+# new. On 2026-10-23 the 129 Codex comments on ejc3/fcvm PRs carrying the phrase used 18
+# distinct sign-offs, all listed (#1190 was blocked on "Delightful!", one of seven then
+# missing). Only the About Codex block is stripped, and only under that exact summary
+# text: a details block with any other summary is where a bot folds its findings.
 # NOTICES: a listed reviewer saying that its review did NOT run. Neither a finding nor
 # coverage. Both bots post one, and because both are in VERDICT_BOTS none of it fell under
 # the notification-bot exemption below: every notice was a PR-level claim needing a
@@ -695,8 +699,8 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 #   - CodeRabbit's summary comment before any review has run: the summarize marker, ONE
 #     notice between its "rate limited", "skip review" or "review paused" markers, its
 #     payload blockquoted under a "Review limit reached", "Review skipped" or "Reviews
-#     paused" heading, the tips block, and nothing else (#874, #843, #789, #832). The
-#     payload is parsed line by line against the shapes CodeRabbit posts
+#     paused" heading, the tips block, the Autofix checkbox block (cr_autopilot, since
+#     2026-10-01), and nothing else (#874, #843, #789, #832, #1036, #1199). The payload is parsed line by line against the shapes CodeRabbit posts
 #     (cr_notice_payload_res), not skimmed for a leading ">": accepting any quoted line
 #     made "> P1: this drops the last row" part of the notice, and a notice needs no
 #     disposition. The range
@@ -724,6 +728,8 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 # body is claimable the same way. The regions:
 #
 #   cr_tips       <!-- tips_start --> .. <!-- tips_end -->        rendered, shape-checked
+#   cr_autopilot  <!-- autopilot:start --> .. <!-- autopilot:end -->
+#                                                                 rendered, shape-checked
 #   codex_about   <details> <summary>ℹ️ About Codex ..</details>  rendered, shape-checked
 #   html_comment  <!-- .. -->                                     removed only where
 #                                                                 CommonMark hides it
@@ -732,7 +738,9 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 # About blocks, 17 tips blocks) and match all of it with nothing left over. Every shape is
 # anchored, because an unanchored one matches the head of a line and lets the rest ride
 # along. An unlisted line costs one disposition; accepting one costs a finding nobody has
-# to answer.
+# to answer. On 2026-10-23 CodeRabbit's tips block had gained <dl>/<dd> wrappers and a
+# <strong> summary, and the cr_autopilot shapes (an Autofix or Autopilot checkbox, and a
+# preview line under the older one) were read off the 19 notices from 2026-10-01 on.
 #
 # html_comment carries no shapes because it is justified by INVISIBILITY instead, and that
 # justification is checked per occurrence by strip_hidden_comments. "GitHub renders none of
@@ -763,7 +771,8 @@ VERDICT_JQ='def cr_note: "> Note: CodeRabbit is an incremental review system and
 def cr_tips_res:
   [ "^---$"
   , "^</?details>$"
-  , "^<summary>❤️ Share</summary>$"
+  , "^</?(dl|dd)>$"
+  , "^<summary>(❤️ Share|<strong>❤️ Share</strong>)</summary>$"
   , "^- \\[(X|Mastodon|Reddit|LinkedIn)\\]\\(https://[^)]*\\)$"
   , "^Thanks for using \\[CodeRabbit\\]\\(https://coderabbit\\.ai\\?utm_source=oss&utm_medium=github&utm_campaign=[^)]+\\)! It.s free for OSS, and your support helps us grow\\. If you like it, consider giving us a shout-out\\.$"
   , "^<sub>Comment `@coderabbitai help` to get the list of available commands\\.</sub>$"
@@ -778,9 +787,15 @@ def codex_about_res:
   , "^Codex reacts with 👀 while any review is running, comments if it has suggestions, and reacts with 👍 once all reviews finish with no findings\\.$"
   , "^Codex can also answer questions or update the PR\\. Try commenting \"@codex address that feedback\"\\.$"
   ];
+def cr_autopilot_res:
+  [ "^- \\[ \\] <!-- \\{\"checkboxId\": ?\"[0-9a-f-]+\"\\} --> <strong title=\"Keep fixing CodeRabbit findings and required CI, and resolving merge conflicts\">(Autofix|Autopilot)</strong> · Keep fixing CodeRabbit findings and required CI, and resolving merge conflicts$"
+  , "^> Autopilot is currently an internal CodeRabbit preview\\.$"
+  ];
 def accounted_regions:
   [ { name: "cr_tips", rendered: true, lines: cr_tips_res,
       re: "<!-- tips_start -->(?<inner>(.|\n)*?)<!-- tips_end -->" }
+  , { name: "cr_autopilot", rendered: true, lines: cr_autopilot_res,
+      re: "<!-- autopilot:start -->(?<inner>(.|\n)*?)<!-- autopilot:end -->" }
   , { name: "codex_about", rendered: true, lines: codex_about_res,
       re: "<details> <summary>ℹ️ About Codex in GitHub</summary>(?<inner>(.|\n)*?)</details>" }
   , { name: "html_comment", rendered: false, lines: null, re: null }
@@ -843,7 +858,7 @@ def verdict_lines:
   | if $s == null then null
     else ($s | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
              | map(select(length > 0 and . != cr_note))) end;
-def codex_line_re: "^Codex Review: Didn.t find any major issues\\.?( Bravo\\.| Keep it up!| Keep them coming!| Hooray!| Swish!| You.re on a roll\\.| :\\+1:| :rocket:| :tada:| Nice work[.!]| Great job[.!]| Breezy!| 👍)?$";
+def codex_line_re: "^Codex Review: Didn.t find any major issues\\.?( Bravo\\.| Keep it up!| Keep them coming!| Hooray!| Swish!| You.re on a roll\\.| :\\+1:| :rocket:| :tada:| Nice work[.!]| Great job[.!]| Breezy!| 👍| Delightful!| What shall we delve into next\\?| More of your lovely PRs please\\.| Can.t wait for the next one!| Chef.s kiss\\.| Already looking forward to the next diff\\.| Another round soon, please!)?$";
 def reviewed_re: "^\\*\\*Reviewed commit:\\*\\* `(?<sha>[0-9a-f]{7,40})`$";
 def is_verdict:
   verdict_lines as $l
@@ -919,17 +934,26 @@ def cr_notice_heading_re: "^## (Review limit reached|Review skipped|Reviews paus
 # handle the rate-limit line addresses. An apostrophe is written "." so this list can live
 # inside VERDICT_JQ. Every shape was read off a notice CodeRabbit posted in ejc3/fcvm or
 # ejc3/aws; the 46 such bodies fetched on 2026-09-02 are matched by this list with nothing
-# left over. A line outside it makes the comment claimable, which is what it was before the
+# left over. From 2026-10-01 CodeRabbit wraps the folded parts in <dl><dd>, bolds their
+# summaries ("Files selected for processing: 11" rather than "(11)"), lists the run
+# configuration as "- **Key**: value" (each key with the values it has shown, so a list
+# item holding other text is not a run setting) and links the limits docs at a new path (#1199);
+# every "Review limit reached" notice on ejc3/fcvm PRs on 2026-10-23 matched, except #811,
+# which also carries a Finishing Touches block. A line outside it makes the comment claimable, which is what it was before the
 # exemption existed: the cost of an unlisted shape is one disposition, and the cost of
 # accepting one is a finding nobody has to answer.
 def cr_notice_payload_res:
   [ "^$"
   , "^</?details>$"
+  , "^</?(dl|dd)>$"
+  , "^<summary><strong>(⚙️ Run configuration|📥 Commits|📒 Files selected for processing: [0-9]+|⛔ Files ignored due to path filters: [0-9]+|View limit details)</strong></summary>$"
   , "^<summary>(⚙️ Run configuration|📥 Commits|📒 Files selected for processing \\([0-9]+\\)|⛔ Files ignored due to path filters \\([0-9]+\\)|How can I continue\\?|How do review limits work\\?|Review details|View limit details)</summary>$"
   , "^\\* `[^`]+`( is excluded by `[^`]+`)?$"
   , "^- \\[ \\] <!-- \\{\"checkboxId\": ?\"[0-9a-f-]+\"\\} --> 🔍 Trigger review$"
   , "^\\*\\*(Configuration used|Review profile|Plan)\\*\\*: [A-Za-z0-9 +]+$"
   , "^\\*\\*Run ID\\*\\*: `[0-9a-f-]+`$"
+  , "^- \\*\\*(Source mode\\*\\*: Auto|(Repository|Branch|Commit)\\*\\*: Unavailable|File\\*\\*: No configuration file from this repository applied|(Layers|Configuration used)\\*\\*: defaults|Review profile\\*\\*: CHILL|Plan\\*\\*: (Advanced|Pro Plus|Team))$"
+  , "^- \\*\\*Run ID\\*\\*: `[0-9a-f-]+`$"
   , "^\\*\\*Review configuration:\\*\\*$"
   , "^\\*\\*Next review available in:\\*\\* \\*\\*[0-9]+ (minutes?|seconds?|hours?)\\*\\*$"
   , "^\\*\\*Next included review available in [0-9]+ (minutes?|seconds?|hours?)\\.\\*\\*$"
@@ -949,7 +973,7 @@ def cr_notice_payload_res:
   , "^Draft detected\\.$"
   , "^Enable \\*\\*\\[usage-based reviews\\]\\(https://app\\.coderabbit\\.ai/settings/billing\\?tab=usage&orgId=[0-9a-f-]+\\)\\*\\* in Billing to review now\\. Otherwise, wait until the next included review is available\\.$"
   , "^You.re only billed for reviews past your plan.s rate limits \\(\\$[0-9]+\\.[0-9]+/file\\)\\.$"
-  , "^\\[Learn how review limits work\\]\\(https://docs\\.coderabbit\\.ai/management/plans#rate-limits\\)\\.$"
+  , "^\\[Learn how review limits work\\]\\(https://docs\\.coderabbit\\.ai/management/(plans#rate-limits|rate-limits)\\)\\.$"
   , "^Too many files!$"
   , "^This PR contains [0-9]+ files, which is [0-9]+ over the limit of [0-9]+\\.$"
   , "^To get a review, reduce the PR to [0-9]+ files or fewer by splitting it into smaller PRs or changing its base branch\\.$"
@@ -978,7 +1002,7 @@ def is_cr_summary_notice:
                 | ($q | length) == 2
                   and (($q[0] | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0)))
                        | cr_notice_payload_ok)
-                  and ((($p[0] + $q[1]) | strip_accounted(["cr_tips", "html_comment"])) as $rest
+                  and ((($p[0] + $q[1]) | strip_accounted(["cr_tips", "cr_autopilot", "html_comment"])) as $rest
                        | $rest != null and ($rest | test("[^[:space:]]") | not))));
 def is_cr_notice: is_cr_reply_notice or is_cr_summary_notice;
 def greptile_status_marker: "<!-- greptile-status -->";

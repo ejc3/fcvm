@@ -324,8 +324,8 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
 /// and runtime-data paths from the deserialized VM ID. State files are keyed by
 /// VM ID, not name or PID; in particular, a rootless clone parked at either
 /// restore failpoint (`restore.pre_resume`, `restore.post_network_pre_resume`)
-/// intentionally still has `pid = null`, because the PID is published only
-/// after the VMM resumes.
+/// is still `Starting`: the restore publishes `Running` only after the VMM
+/// resumes.
 fn artifacts_for_name(vm_name: &str) -> Result<Option<VmArtifacts>> {
     let state_dir = fcvm::paths::state_dir();
     let mut found = None;
@@ -1622,10 +1622,17 @@ async fn test_lifecycle_interleave_early_connection_cannot_poison_restored_ingre
         let artifacts = wait_for_artifacts(&clone_name, clone_child, Duration::from_secs(10))
             .await
             .context("waiting for held clone network state")?;
+        // The name claim writes the clone's first state with its own PID; the restore
+        // publishes `Running` with its network once the VMM exists.
         anyhow::ensure!(
-            artifacts.state.pid.is_none() && !artifacts.state.lifecycle_ready,
-            "restore hold must precede VMM/lifecycle publication: pid={:?} ready={}",
+            artifacts.state.pid == Some(clone_pid)
+                && matches!(artifacts.state.status, fcvm::state::VmStatus::Starting)
+                && !artifacts.state.lifecycle_ready,
+            "restore hold must precede VMM/lifecycle publication: pid={:?} (clone {}) \
+             status={:?} ready={}",
             artifacts.state.pid,
+            clone_pid,
+            artifacts.state.status,
             artifacts.state.lifecycle_ready
         );
         let loopback_ip = artifacts
@@ -1769,15 +1776,15 @@ async fn test_lifecycle_interleave_early_connection_cannot_poison_restored_ingre
 /// Pins the signal-registration boundary of `fcvm snapshot run`. A rootless
 /// clone is held at `restore.pre_resume:block_until_file` after clone setup has
 /// published its state, lock, and runtime-data directory, but before the restore
-/// function starts. No restored VMM exists at this boundary and state still has
-/// `pid = null`. SIGTERM must already be owned by fcvm in this window; otherwise
+/// function starts. No restored VMM exists at this boundary: the state carries the
+/// PID the name claim wrote and is still `Starting`. SIGTERM must already be owned by fcvm in this window; otherwise
 /// the kernel's default action exits without cleanup and strands those setup
 /// artifacts.
 ///
 /// The marker and go-file make the interleaving deterministic:
 ///
 /// 1. wait for `restore.pre_resume reached` and all three exact clone artifacts;
-/// 2. prove the state still has no PID, deliver SIGTERM, and require fcvm's
+/// 2. prove the state is still `Starting`, deliver SIGTERM, and require fcvm's
 ///    signal-handler log while the failpoint remains held;
 /// 3. release the failpoint, require a bounded non-success exit, and require the
 ///    exact `state/<vm_id>.json`, `.json.lock`, and `vm-disks/<vm_id>` paths to
@@ -1879,11 +1886,17 @@ async fn test_lifecycle_interleave_snapshot_run_sigterm_before_resume_cleans_exa
                     log_tail(&clone_log, 40)
                 )
             })?;
+        // The name claim writes the clone's first state with its own PID; the restore
+        // publishes `Running` with its network once the VMM exists.
         anyhow::ensure!(
-            artifacts.state.pid.is_none(),
-            "restore.pre_resume must precede PID publication, but clone {} recorded PID {:?}",
+            artifacts.state.pid == Some(clone_pid)
+                && matches!(artifacts.state.status, fcvm::state::VmStatus::Starting),
+            "restore.pre_resume must precede the restore's state publication, but clone {} \
+             recorded PID {:?} (clone {}) and status {:?}",
             artifacts.vm_id,
-            artifacts.state.pid
+            artifacts.state.pid,
+            clone_pid,
+            artifacts.state.status
         );
         anyhow::ensure!(
             !artifacts.state.lifecycle_ready,
@@ -2175,6 +2188,222 @@ async fn test_lifecycle_interleave_resumed_source_survives_late_ack() -> Result<
         ask_count,
         reask_after_boundary,
         log_tail(&vm_log, 40)
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Race gym cases (docs/race-gym.md): each replays a recorded schedule of concurrent
+// actors and fails while the race it caught exists. `make race-gym-cases` runs them.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "race-gym")]
+#[path = "race_gym/mod.rs"]
+mod race_gym;
+
+/// Race gym replay `cold_run_restore_after_source_teardown` (cold-run, pair schedule 348:
+/// actor 0 held at `teardown.pre_remove_data_dir#1`, actor 1 at `restore.pre_load#1`, actor 0
+/// released first). On main, actor 0 removes the source VM's directory, which detaches the
+/// bind that actor 1's VMM reads its disks through, and actor 1's LoadSnapshot fails with
+/// `rootfs.raw` missing (replayed 10 of 10). The file is the schedule re-recorded with #1188,
+/// where actor 0's removal waits for actor 1's load: on main that step diverges and the case
+/// fails; with the fix it passes. Pinned to the outcome oracle; the source directory the
+/// restore leaves behind is #1181.
+#[cfg(feature = "race-gym")]
+#[tokio::test]
+async fn test_lifecycle_interleave_gym_cold_run_restore_after_source_teardown() -> Result<()> {
+    race_gym::replay_case(include_str!(
+        "race_gym/cases/cold_run_restore_after_source_teardown.json"
+    ))
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// CASE: source_teardown_waits_for_clone_disk_open
+// ---------------------------------------------------------------------------
+
+/// A clone's VMM opens the disks its snapshot names at the SOURCE VM's paths
+/// (`vm-disks/<source>/disks/rootfs.raw`), which resolve to the clone's own disks
+/// only through a bind mount over `vm-disks/<source>` in the VMM's mount namespace.
+/// When the source VM's teardown removes that directory, the kernel detaches the
+/// mount in every other namespace, so a clone whose VMM is between its spawn and
+/// its snapshot load then finds no disk. Four `podman run --gpu` launches of a new
+/// image hit this: each relaunches by restoring the first one's pre-start snapshot
+/// while the first one tears its source VM down.
+///
+/// The interleaving, made deterministic with `restore.pre_load`:
+///
+/// 1. snapshot a rootless baseline, hold a clone of it at `restore.pre_load`
+///    (VMM spawned with its redirect, disks not yet opened);
+/// 2. SIGTERM the baseline, and wait until its teardown has either removed its
+///    runtime directory or logged that it waits for the clone;
+/// 3. release the clone. It must become healthy, and the baseline must then
+///    finish its teardown and remove its directory.
+#[tokio::test]
+async fn test_lifecycle_interleave_source_teardown_waits_for_clone_disk_open() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("ilv-src-teardown");
+    let go_file = PathBuf::from(format!("/tmp/{clone_name}-pre-load-go"));
+    remove_file_if_exists(&go_file).context("removing stale pre-load go-file")?;
+
+    let mut baseline: Option<(tokio::process::Child, PinnedProcess)> = None;
+    let mut clone: Option<(tokio::process::Child, PinnedProcess, PathBuf)> = None;
+    let mut snapshot_created = false;
+
+    let exercise: Result<()> = async {
+        let (baseline_child, baseline_pid, baseline_log) =
+            common::spawn_fcvm_with_env_and_log_path(
+                &[
+                    "podman",
+                    "run",
+                    "--name",
+                    &baseline_name,
+                    "--network",
+                    "rootless",
+                    "--no-snapshot",
+                    common::TEST_IMAGE,
+                ],
+                &[],
+            )
+            .await
+            .context("spawning rootless baseline")?;
+        let baseline_process =
+            PinnedProcess::capture(baseline_pid).context("pinning rootless baseline")?;
+        baseline = Some((baseline_child, baseline_process));
+        common::poll_health_by_pid(baseline_pid, 180)
+            .await
+            .context("waiting for baseline health")?;
+        let baseline_dir = artifacts_for_name(&baseline_name)?
+            .context("baseline published no state")?
+            .data_dir;
+        common::create_snapshot_by_pid(baseline_pid, &snapshot_name)
+            .await
+            .context("creating the snapshot the clone restores")?;
+        snapshot_created = true;
+
+        let failpoint_spec = format!("restore.pre_load:block_until_file:{}", go_file.display());
+        let (clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snapshot_name,
+                "--name",
+                &clone_name,
+            ],
+            &[("FCVM_FAILPOINT", &failpoint_spec)],
+        )
+        .await
+        .context("spawning clone held before its snapshot load")?;
+        let clone_process = PinnedProcess::capture(clone_pid).context("pinning held clone")?;
+        clone = Some((clone_child, clone_process, clone_log.clone()));
+        let reached_at = wait_for_marker(
+            &clone_log,
+            "FAILPOINT restore.pre_load reached",
+            0,
+            Duration::from_secs(120),
+        )
+        .await?;
+
+        // The source goes away while the clone's VMM still has to open its disks.
+        let (_, baseline_process) = baseline.as_ref().context("baseline fixture disappeared")?;
+        baseline_process.signal(libc::SIGTERM)?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if !baseline_dir.exists()
+                || log_contains(
+                    &baseline_log,
+                    "VM teardown waiting for clone restores that bind over its runtime directory",
+                )
+            {
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "baseline teardown neither removed {} nor waited for the clone within 60 s; \
+                 log tail:\n{}",
+                baseline_dir.display(),
+                log_tail(&baseline_log, 40)
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        anyhow::ensure!(
+            search_log_from(
+                &clone_log,
+                "FAILPOINT restore.pre_load released",
+                reached_at
+            )
+            .is_none(),
+            "the clone loaded its snapshot before the baseline teardown reached its directory"
+        );
+
+        std::fs::write(&go_file, b"go").context("releasing restore.pre_load")?;
+        let (clone_child, _, _) = clone.as_mut().context("clone fixture disappeared")?;
+        common::poll_health(clone_child, 180)
+            .await
+            .with_context(|| {
+                format!(
+                    "clone did not become healthy after its source was torn down; log tail:\n{}",
+                    log_tail(&clone_log, 60)
+                )
+            })?;
+
+        let (baseline_child, _) = baseline.as_mut().context("baseline fixture disappeared")?;
+        let baseline_status = wait_exit(baseline_child, Duration::from_secs(60))
+            .await
+            .context("baseline teardown did not finish after the clone loaded")?;
+        baseline = None;
+        anyhow::ensure!(
+            baseline_status.success(),
+            "baseline exited unsuccessfully: {baseline_status:?}"
+        );
+        anyhow::ensure!(
+            !baseline_dir.exists(),
+            "baseline teardown left its runtime directory {}",
+            baseline_dir.display()
+        );
+        Ok(())
+    }
+    .await;
+
+    let mut cleanup_errors = Vec::new();
+    if let Err(error) = std::fs::write(&go_file, b"cleanup") {
+        cleanup_errors.push(format!("releasing pre-load failpoint: {error}"));
+    }
+    let mut all_children_stopped = true;
+    if let Some((child, process, _)) = clone.as_mut() {
+        if let Err(error) = stop_test_child(child, process).await {
+            all_children_stopped = false;
+            cleanup_errors.push(format!("stopping clone: {error:#}"));
+        }
+    }
+    if let Some((child, process)) = baseline.as_mut() {
+        if let Err(error) = stop_test_child(child, process).await {
+            all_children_stopped = false;
+            cleanup_errors.push(format!("stopping baseline: {error:#}"));
+        }
+    }
+    if snapshot_created && all_children_stopped {
+        if let Err(error) = common::delete_snapshot(&snapshot_name).await {
+            cleanup_errors.push(format!("deleting snapshot {snapshot_name}: {error:#}"));
+        }
+    }
+    if let Err(error) = remove_file_if_exists(&go_file) {
+        cleanup_errors.push(format!("removing pre-load go-file: {error:#}"));
+    }
+
+    if let Err(error) = exercise {
+        if cleanup_errors.is_empty() {
+            return Err(error);
+        }
+        return Err(error.context(format!(
+            "fixture cleanup also failed:\n- {}",
+            cleanup_errors.join("\n- ")
+        )));
+    }
+    anyhow::ensure!(
+        cleanup_errors.is_empty(),
+        "fixture cleanup failed:\n- {}",
+        cleanup_errors.join("\n- ")
     );
     Ok(())
 }

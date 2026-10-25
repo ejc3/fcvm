@@ -1196,7 +1196,7 @@ fn copy_image(src: &File, dst: &File, len: u64) -> Result<CopyMethod> {
 }
 
 /// FICLONE `src` into `dst`.
-fn ficlone(src: &File, dst: &File) -> std::io::Result<()> {
+pub(crate) fn ficlone(src: &File, dst: &File) -> std::io::Result<()> {
     // SAFETY: both descriptors are open for the duration of the call.
     let rc = unsafe { libc::ioctl(dst.as_raw_fd(), libc::FICLONE as _, src.as_raw_fd()) };
     if rc == 0 {

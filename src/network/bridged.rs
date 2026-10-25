@@ -819,7 +819,7 @@ mod tests {
     /// host route to the VPC resolver beats the /30. The probe must reject.
     #[test]
     fn dhcp_claimed_peer_resolves_off_veth_and_fails_probe() {
-        let out = "10.0.0.2 via 10.0.1.1 dev enP1s33 src 10.0.1.49 uid 0 \n    cache \n";
+        let out = "10.0.0.2 via 10.0.1.1 dev enP1s33 src 192.0.2.10 uid 0 \n    cache \n";
         assert!(!route_get_names_dev(out, "veth0-vm-7f55a"));
     }
 

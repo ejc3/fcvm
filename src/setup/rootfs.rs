@@ -451,11 +451,50 @@ for attempt in 1 2 3; do
     fi
 done
 cp /var/cache/apt/archives/*.deb /packages/ 2>/dev/null || true
+
+# Rebuild conmon from the same archive's source with fcvm's fix for its
+# `exec -t` console race (issue #841, scripts/conmon-exec-console-race.patch),
+# and ship it in place of the archive's conmon. Built after the copy above, so
+# none of the build dependencies land in /packages.
+stock=(/packages/conmon_*.deb)
+if [ "${{#stock[@]}}" -ne 1 ] || [ ! -f "${{stock[0]}}" ]; then
+    echo "expected exactly one conmon .deb in /packages, found: ${{stock[*]}}"
+    exit 1
+fi
+if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+    sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+else
+    sed -i 's/^# *deb-src /deb-src /' /etc/apt/sources.list
+fi
+apt-get update -qq
+apt-get install --yes --no-install-recommends -qq dpkg-dev patch >/dev/null
+mkdir -p /tmp/conmon-build
+cd /tmp/conmon-build
+apt-get source conmon="$(dpkg-deb -f "${{stock[0]}}" Version)"
+apt-get build-dep --yes -qq conmon >/dev/null
+cat > console-race.patch <<'FCVM_CONMON_PATCH'
+{conmon_patch}FCVM_CONMON_PATCH
+(cd conmon-*/ && patch -p1 --forward < ../console-race.patch && dpkg-buildpackage -b -uc -us >../build.log 2>&1) \
+    || {{ tail -50 build.log 2>/dev/null; echo "conmon rebuild failed"; exit 1; }}
+built=(/tmp/conmon-build/conmon_*.deb)
+if [ "${{#built[@]}}" -ne 1 ] || [ "$(dpkg-deb -f "${{built[0]}}" Version)" != "$(dpkg-deb -f "${{stock[0]}}" Version)" ]; then
+    echo "conmon rebuild produced ${{built[*]}}, not one package at the archive's version"
+    exit 1
+fi
+rm "${{stock[0]}}"
+cp "${{built[0]}}" /packages/
 "#,
         codename = codename,
-        packages = packages_str
+        packages = packages_str,
+        conmon_patch = CONMON_EXEC_CONSOLE_PATCH,
     )
 }
+
+/// fcvm's fix for conmon's `exec -t` console race (issue #841), applied when the
+/// download step rebuilds the archive's conmon. Embedded, so the download script
+/// carries it and the rootfs hash changes with it.
+const CONMON_EXEC_CONSOLE_PATCH: &str =
+    include_str!("../../scripts/conmon-exec-console-race.patch");
 
 /// Generate the init script that runs in the initrd during Layer 2 setup.
 /// This script mounts filesystems, runs install + setup scripts, then powers off.
@@ -2648,6 +2687,36 @@ branch = "agent/nv2"
         )
         .expect_err("a [firecracker] section must pin the commit it builds");
         assert!(error.to_string().contains("commit"), "{error}");
+    }
+
+    /// A profile on the PCI transport keeps the guest's NIC named eth0: virtio-net is a
+    /// PCI device there and udev would rename it, and fc-agent and fcvm configure eth0
+    /// (a routed guest restored on the gpu profile came up with no global IPv6 at all).
+    #[test]
+    fn every_pci_transport_profile_keeps_the_guest_nic_eth0() {
+        let plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        let mut pci = 0;
+        for (name, arches) in &plan.kernel_profiles {
+            for (arch, profile) in arches {
+                let on_pci = profile
+                    .firecracker_args
+                    .as_deref()
+                    .is_some_and(|a| a.split_whitespace().any(|w| w == "--enable-pci"));
+                if !on_pci {
+                    continue;
+                }
+                pci += 1;
+                let args = profile.boot_args.as_deref().unwrap_or("");
+                assert!(
+                    args.split_whitespace().any(|w| w == "net.ifnames=0"),
+                    "kernel_profiles.{name}.{arch} is on the PCI transport without net.ifnames=0 in boot_args ({args:?})"
+                );
+            }
+        }
+        assert!(
+            pci > 0,
+            "no profile on the PCI transport: the check saw nothing"
+        );
     }
 
     /// Every Firecracker the embedded config builds is pinned, so setup keeps a

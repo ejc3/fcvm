@@ -1,7 +1,7 @@
 [workspace]
-members = [".", "fuse-pipe", "fc-agent", "exec-proto", "fc-mock", "failpoint"]
+members = [".", "fuse-pipe", "fc-agent", "exec-proto", "fc-mock", "failpoint", "fleet/core"]
 # Build all members by default (not just the root package)
-default-members = [".", "fuse-pipe", "fc-agent", "exec-proto", "fc-mock", "failpoint"]
+default-members = [".", "fuse-pipe", "fc-agent", "exec-proto", "fc-mock", "failpoint", "fleet/core"]
 # Exclude sync-test (used only for Makefile sync verification)
 exclude = ["sync-test"]
 # Resolver v2 makes --no-default-features work across all workspace members
@@ -44,7 +44,7 @@ serde_json = "1"
 sha2 = "0.10"
 hex = "0.4"
 toml = { version = "0.9", default-features = false, features = ["std", "serde", "parse"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "signal", "io-util", "io-std", "sync", "time"] }
+tokio = { version = "1.51.6", features = ["rt-multi-thread", "macros", "process", "fs", "signal", "io-util", "io-std", "sync", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 which = "6"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -68,6 +68,12 @@ vmm-sys-util = "0.15"
 shell-words = "1"
 fuse-pipe = { path = "fuse-pipe", default-features = false }
 exec-proto = { path = "exec-proto" }
+fleet-core = { path = "fleet/core" }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
+x509-parser = "0.18"
 failpoint = { path = "failpoint" }
 url = "2"
 axum = { version = "0.8", features = ["ws"] }
@@ -87,6 +93,8 @@ default = ["integration-fast", "integration-slow"]
 # Test speed tiers (unit tests always run, no feature flag needed)
 integration-fast = []        # Quick VM tests, < 30s each (sanity, signal, exec, port forward)
 integration-slow = []        # Slow VM tests, > 30s each (clone, snapshot, fuse posix, egress)
+# Race gym (make race-gym, docs/race-gym.md): runs only when asked for, never in a suite
+race-gym = []
 
 # Privileged tests require sudo (bridged networking, pjdfstest, iptables)
 privileged-tests = []
@@ -94,10 +102,13 @@ privileged-tests = []
 # libfuse remap_file_range container test (requires pre-built container)
 libfuse-test = []
 
+# Fleet aggregator tests through the ffmpeg CLI (requires ffmpeg with libx264)
+ffmpeg-tests = []
+
 [dev-dependencies]
 serial_test = "3"
 criterion = "0.5"
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1.51.6", features = ["test-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # small_rng: SmallRng for the seeded chaos harness (tests/test_fuzz_chaos.rs)
