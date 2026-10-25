@@ -422,11 +422,14 @@ pub async fn handle_clone_restore(
     // `makestep` forces it to accept the stepped time. Its convergence is
     // not part of the readiness contract (the clock is already stepped),
     // so it must not hold the host's ACK.
+    // Then a burst, since the snapshot gate rejected any poll chronyd made
+    // before egress opened; it matters most when the step above failed.
     spawn_restore_side_job(async {
         let _ = tokio::process::Command::new("chronyc")
             .args(["makestep"])
             .output()
             .await;
+        crate::snapshot_network::chrony_burst().await;
     });
     phases.clock_ms = elapsed_ms(clock_started);
 
@@ -1077,6 +1080,13 @@ mod tests {
         assert!(
             clock < nfs,
             "the NFS remount must see the stepped clock: clock={clock} nfs={nfs}"
+        );
+        let burst = body.find("crate::snapshot_network::chrony_burst()").expect(
+            "the restore no longer asks chronyd to measure after the gate rejected its polls",
+        );
+        assert!(
+            clock < burst,
+            "the burst must follow the step: clock={clock} burst={burst}"
         );
         assert!(
             boundary < clock && clock < publish,

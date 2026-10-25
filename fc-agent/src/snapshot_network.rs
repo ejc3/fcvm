@@ -538,10 +538,24 @@ const IPV6_LOOPBACK: &str = "::1/128";
 /// arrives on eth0, and must still be rejected while the gate is closed.
 ///
 /// These are the rules both the snapshot side and the restore side carry, and
-/// what verification expects. UDP is not among them: a restored clone adds its
-/// own UDP rejection to INPUT with `gate_udp_ingress` (see there), which the
-/// snapshot side must not install, because it would answer a live client's
+/// what verification expects. UDP ingress is not among them: a restored clone
+/// adds its own UDP rejection to INPUT with `gate_udp_ingress` (see there), which
+/// the snapshot side must not install, because it would answer a live client's
 /// datagram on the source VM with an ICMP unreachable during the cookie dump.
+///
+/// OUTPUT also rejects the guest's own NTP requests (UDP to port 123). chronyd
+/// steps the clock at any update (`makestep 1 -1`), and a restored clone is
+/// behind by the snapshot's age, so a poll answered while egress is gated would
+/// jump the clock while every daemon whose session ran out in the jump is
+/// refused a connection: the window the restore keeps its own clock step out
+/// of. The rule has to be in the snapshot, not added by the restore, so that no
+/// poll can leave between the resume and the restore's first step while the
+/// inherited gate verifies. (A reinstall over a gate that fails verification
+/// flushes each chain before refilling it, a window issue 1244 tracks.) A REJECT
+/// in OUTPUT fails the send itself (`sendto` returns EPERM), so on the source
+/// VM a poll whose timer fires during the cookie dump fails and chronyd logs
+/// "Could not send". Both the source and a clone ask chronyd for a burst once
+/// egress is open again (`chrony_burst`), so neither waits a poll interval.
 fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<String>> {
     let owned = |tokens: &[&str]| tokens.iter().map(|token| token.to_string()).collect();
     let mut rules = vec![owned(&[
@@ -555,6 +569,22 @@ fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<Stri
     let ingress = loopback_flag == "-s";
     if ingress {
         rules.push(owned(&["-i", "lo", "-j", "RETURN"]));
+    } else {
+        // `-m udp` is what `iptables -S` renders for `--dport`, and spelling it
+        // here keeps the rule equal to its rendering for verification.
+        let unreachable = port_unreachable(loopback_network);
+        rules.push(owned(&[
+            "-p",
+            "udp",
+            "-m",
+            "udp",
+            "--dport",
+            "123",
+            "-j",
+            "REJECT",
+            "--reject-with",
+            unreachable,
+        ]));
     }
     rules.extend([owned(&[
         "-p",
@@ -572,6 +602,25 @@ fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<Stri
     rules
 }
 
+/// Ask chronyd to measure now: four polls, four answers needed. Run once the
+/// gate's egress half is open, because a poll the gate rejected leaves chronyd
+/// waiting its whole poll interval (up to 1024 s) to measure again.
+pub async fn chrony_burst() {
+    let _ = tokio::process::Command::new("chronyc")
+        .args(["burst", "4/4"])
+        .output()
+        .await;
+}
+
+/// The ICMP reply a UDP REJECT sends, by the family of `loopback_network`.
+fn port_unreachable(loopback_network: &str) -> &'static str {
+    if loopback_network.contains(':') {
+        "icmp6-port-unreachable"
+    } else {
+        "icmp-port-unreachable"
+    }
+}
+
 /// The restored clone's UDP rejection, inserted into the INPUT gate chain below
 /// the two loopback exemptions: a published UDP port reaches the workload
 /// through the port forwarders like a TCP one, and a client's datagram while
@@ -579,14 +628,11 @@ fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<Stri
 /// repair. The match is the flow's direction, not the conntrack state, because
 /// a client that exchanged traffic before the snapshot inherits an ESTABLISHED
 /// entry in the restored guest and a NEW-only rule would pass it. Replies to
-/// the guest's own outbound UDP are reply-direction and pass; OUTPUT never
-/// gates UDP (DNS, NTP). Removed with the chain when ingress opens.
+/// the guest's own outbound UDP are reply-direction and pass; OUTPUT gates no
+/// UDP but NTP (`gate_chain_rules`), so DNS works throughout. Removed with the
+/// chain when ingress opens.
 fn udp_ingress_rule_args(loopback_network: &str) -> [&'static str; 10] {
-    let unreachable = if loopback_network.contains(':') {
-        "icmp6-port-unreachable"
-    } else {
-        "icmp-port-unreachable"
-    };
+    let unreachable = port_unreachable(loopback_network);
     [
         "-p",
         "udp",
@@ -1459,7 +1505,7 @@ async fn reopen_with<G: FirewallGate>(gate: &G) -> Result<()> {
     // the caller reports it and the clone stays unpublished.
     gate.open()
         .await
-        .context("opening the snapshot TCP NEW-flow gate")
+        .context("opening the snapshot NEW-flow gate")
 }
 
 async fn rollback_preparation<G: FirewallGate>(error: anyhow::Error, gate: &G) -> anyhow::Error {
@@ -1489,7 +1535,7 @@ async fn prepare_with<
     // cookie dump runs, and packets already in receive processing must drain
     // first. The gate delivers the first (a directional NEW-flow REJECT) and the
     // AF_PACKET barrier the second. Both are reversible and destroy no kernel
-    // state: the gate is one iptables rule added then removed, the barrier an
+    // state: the gate is two iptables chains added then removed, the barrier an
     // open/close whose release runs synchronize_net().
     //
     // `link.down()` used to sit between them. It prevented sockets the gate
@@ -1504,7 +1550,7 @@ async fn prepare_with<
     if let Err(error) = gate
         .close()
         .await
-        .context("closing snapshot TCP NEW-flow gate")
+        .context("closing the snapshot NEW-flow gate")
     {
         return Err(rollback_preparation(error, gate).await);
     }
@@ -1627,7 +1673,7 @@ async fn restore_boundary_with<
     if !verified_armed {
         gate.close()
             .await
-            .context("ensuring restored snapshot TCP NEW-flow gate is closed")?;
+            .context("ensuring the restored snapshot NEW-flow gate is closed")?;
     }
     // The clone's own addition to the inherited gate: client-direction UDP is
     // refused until publication. Never part of the snapshot-side gate.
@@ -1660,7 +1706,7 @@ async fn restore_boundary_with<
     let egress_started = std::time::Instant::now();
     gate.open_egress()
         .await
-        .context("opening the egress half of the snapshot TCP NEW-flow gate")?;
+        .context("opening the egress half of the snapshot NEW-flow gate")?;
     let egress_open_ms = egress_started.elapsed().as_secs_f64() * 1000.0;
     let destroy_started = std::time::Instant::now();
     let manifest = store.load()?;
@@ -1803,6 +1849,8 @@ pub async fn resume_source_network() -> Result<()> {
         "[fc-agent] source VM snapshot network reopened: gate=open \
          (link never taken down)"
     );
+    // A poll the gate rejected would leave chronyd waiting its whole interval.
+    tokio::spawn(chrony_burst());
     // The snapshot reset the vsock transport under the running agent's output writer,
     // which reconnects only when asked; nothing else asks a resumed source.
     if let Err(error) = crate::output::request_reconnect() {
@@ -2653,6 +2701,70 @@ mod tests {
         }
     }
 
+    /// A restored clone is behind by the snapshot's age and chronyd steps at any
+    /// update, so an NTP reply while egress is gated jumps the clock into the
+    /// window the restore keeps its own step out of (issue 1242). The gate the
+    /// snapshot carries rejects the guest's NTP requests in both families, and
+    /// no other outbound UDP, so DNS keeps working.
+    #[tokio::test]
+    async fn the_egress_gate_rejects_ntp_and_no_other_udp() {
+        let runner = RecordingRunner::default();
+        let calls = runner.0.clone();
+        IptablesGate::new(runner).close().await.unwrap();
+        let calls = calls.lock().unwrap().join("\n");
+        // The whole OUTPUT chain, so a rule that gates UDP without naming it (a
+        // protocol-less REJECT) fails here too.
+        for (program, loopback, unreachable) in [
+            ("iptables", "127.0.0.0/8", "icmp-port-unreachable"),
+            ("ip6tables", "::1/128", "icmp6-port-unreachable"),
+        ] {
+            let prefix = format!("{program} -w -A FCVM_SNAPSHOT_OUT ");
+            let appended: Vec<&str> = calls
+                .lines()
+                .filter_map(|call| call.strip_prefix(prefix.as_str()))
+                .collect();
+            let ntp = format!("-p udp -m udp --dport 123 -j REJECT --reject-with {unreachable}");
+            let local = format!("-p tcp -d {loopback} -j RETURN");
+            assert_eq!(
+                appended,
+                [
+                    local.as_str(),
+                    ntp.as_str(),
+                    "-p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset",
+                    "-j RETURN",
+                ],
+                "{program}'s OUTPUT gate chain:\n{calls}"
+            );
+        }
+        assert!(
+            !calls
+                .lines()
+                .any(|call| call.contains("FCVM_SNAPSHOT_IN") && call.contains("-p udp")),
+            "the snapshot side gates UDP ingress:\n{calls}"
+        );
+    }
+
+    /// The source's gate rejected any poll chronyd made during the cookie dump,
+    /// so the source asks chronyd to measure once its gate has reopened.
+    #[test]
+    fn the_source_asks_chronyd_to_measure_after_its_gate_reopens() {
+        let source = include_str!("snapshot_network.rs");
+        let start = source
+            .find("pub async fn resume_source_network(")
+            .expect("resume_source_network is in snapshot_network.rs");
+        let len = source[start..]
+            .find("\n}\n")
+            .expect("resume_source_network has a closing brace");
+        let body = &source[start..start + len];
+        let reopened = body
+            .find("source VM snapshot network reopened")
+            .expect("the source no longer reports its reopened gate");
+        let burst = body
+            .find("tokio::spawn(chrony_burst())")
+            .expect("the source no longer asks chronyd to measure after its gate reopens");
+        assert!(reopened < burst, "reopened={reopened} burst={burst}");
+    }
+
     #[tokio::test]
     async fn gateway_address_cannot_bypass_directional_new_flow_gate() {
         let runner = RecordingRunner::default();
@@ -2687,14 +2799,17 @@ mod tests {
                 && calls.contains("ip6tables -w -A FCVM_SNAPSHOT_IN -i lo -j RETURN"),
             "the egress proxy's redirected flows (entering on lo) must pass INPUT:\n{calls}"
         );
-        // The UDP rejection belongs to the restored clone only (see
+        // The UDP ingress rejection belongs to the restored clone only (see
         // the_udp_rejection_is_installed_on_restore_only): installed by close(), it
         // would answer a live client's datagram on the VM being snapshotted with an
         // ICMP unreachable during the cookie dump, and a snapshot must not disturb
-        // its source.
+        // its source. The NTP egress rule is the source's own poll, which chronyd
+        // retries (the_egress_gate_rejects_ntp_and_no_other_udp).
         assert!(
-            !calls.contains("-p udp"),
-            "close() gates UDP on the source VM during the cookie dump:\n{calls}"
+            !calls
+                .lines()
+                .any(|call| call.contains("FCVM_SNAPSHOT_IN") && call.contains("-p udp")),
+            "close() gates UDP ingress on the source VM during the cookie dump:\n{calls}"
         );
     }
 
@@ -2770,10 +2885,14 @@ mod tests {
         -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
         -A FCVM_SNAPSHOT_IN -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -d 127.0.0.0/8 -p tcp -j RETURN\n\
+        -A FCVM_SNAPSHOT_OUT -p udp -m udp --dport 123 -j REJECT --reject-with icmp-port-unreachable\n\
         -A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
         -A FCVM_SNAPSHOT_OUT -j RETURN\n";
 
     /// Same capture for the IPv6 family (`-d ::1/128 -p tcp -j RETURN` etc.).
+    /// The NTP lines of both dumps are iptables 1.8.10's rendering, legacy and
+    /// nf_tables alike, of the rule as `gate_chain_rules` appends it (with
+    /// `-m udp`); the rest of each dump is the capture described above.
     const ARMED_V6_DUMP: &str = "-P INPUT ACCEPT\n\
         -P FORWARD ACCEPT\n\
         -P OUTPUT ACCEPT\n\
@@ -2786,6 +2905,7 @@ mod tests {
         -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
         -A FCVM_SNAPSHOT_IN -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -d ::1/128 -p tcp -j RETURN\n\
+        -A FCVM_SNAPSHOT_OUT -p udp -m udp --dport 123 -j REJECT --reject-with icmp6-port-unreachable\n\
         -A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
         -A FCVM_SNAPSHOT_OUT -j RETURN\n";
 

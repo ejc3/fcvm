@@ -65,7 +65,7 @@ What the boundary needs is narrow, and both halves are non-destructive:
 
 | need | mechanism | reversible? |
 |------|-----------|-------------|
-| no NEW socket may appear while the cookie dump runs | directional NEW-flow REJECT gate (iptables/ip6tables) | yes: one rule added, then removed |
+| no NEW socket may appear while the cookie dump runs | directional NEW-flow REJECT gate (iptables/ip6tables) | yes: its chains and hooks added, then removed |
 | packets already in receive processing must drain | AF_PACKET open/close, whose release runs `synchronize_net()` | nothing to reverse |
 | restore must destroy exactly the snapshot-time sockets | dump kernel socket **cookies** into a manifest | read-only |
 
@@ -160,6 +160,11 @@ reset: a www clone of a 9.5-hour-old snapshot was not healthy 10m38s in, when th
 SMC tiers, configerator fell back), and the same snapshot restored with its clock held back was
 healthy in 2m05s and 2m15s (2026-10-25). So the clock steps after the boundary opens egress and
 before publication; `the_clock_steps_after_the_egress_gate_opens_and_before_publication` pins it.
+chronyd can step the clock too (fc-agent configures `makestep 1 -1`), so the gate's OUTPUT chain
+also rejects the guest's NTP requests (UDP to port 123, and no other UDP), from the snapshot until
+egress opens; `the_egress_gate_rejects_ntp_and_no_other_udp` pins it. The rejected send fails with EPERM,
+so a source VM's chronyd logs at most one failed poll per snapshot, and both the source and a
+restored clone ask chronyd for a burst (`chrony_burst`) once egress is open again.
 
 ### Opening the gate costs no grace period on the restore path
 
