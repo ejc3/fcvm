@@ -2604,3 +2604,88 @@ fn host_root_reads_the_root_container_store_before_the_suite() {
         "the suite must not start before the warm-up is waited for (wait {wait}, test-root {suite})"
     );
 }
+
+/// Run `scripts/ci-warm-root-container-store.sh` with `args` and its state in `state`,
+/// with `stubs` first on PATH when given, and return its stdout.
+fn run_store_warm(
+    state: &std::path::Path,
+    stubs: Option<&std::path::Path>,
+    args: &[&str],
+) -> String {
+    let mut command = std::process::Command::new("bash");
+    command
+        .arg(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ci-warm-root-container-store.sh"),
+        )
+        .args(args)
+        .env("RUNNER_TEMP", state);
+    if let Some(stubs) = stubs {
+        let path = std::env::var("PATH").unwrap_or_default();
+        command.env("PATH", format!("{}:{path}", stubs.display()));
+    }
+    let out = command
+        .output()
+        .expect("run ci-warm-root-container-store.sh");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the warm-up never fails the job: {out:?}"
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The warm-up's `wait` reports how the detached reader ended, not only whether it is
+/// still running: a reader that exits nonzero, or that dies before reporting a status,
+/// raises a warning annotation. Before this, a failing read showed only as `(exit N)`
+/// inside the log text, and a reader killed before its summary left `wait` printing
+/// nothing but the seconds it waited.
+#[test]
+fn store_warm_up_wait_reports_how_the_reader_ended() {
+    let tmp = tempfile::tempdir().expect("fixture dir");
+    let stubs = tmp.path().join("bin");
+    let layers = tmp.path().join("layers");
+    std::fs::create_dir_all(&stubs).expect("stub dir");
+    std::fs::create_dir_all(&layers).expect("layers dir");
+    std::fs::write(layers.join("layer"), b"data").expect("layer file");
+    for (name, body) in [
+        ("sudo", "#!/bin/sh\nexec \"$@\"\n"),
+        // Only the reader's `run` sees these stubs: its reads fail.
+        ("cat", "#!/bin/sh\necho 'cat: read error' >&2\nexit 1\n"),
+    ] {
+        let p = stubs.join(name);
+        std::fs::write(&p, body).expect("write stub");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod stub");
+    }
+    // A reader pid that has already exited.
+    let mut exited = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn true");
+    exited.wait().expect("reap true");
+    let pid = exited.id().to_string();
+
+    // The reader ran to the end, and its reads failed.
+    let state = tmp.path().join("failed");
+    std::fs::create_dir_all(&state).expect("state dir");
+    std::fs::write(state.join("fcvm-store-warm.pid"), &pid).expect("pid file");
+    let layers_arg = layers.to_str().expect("utf-8 path");
+    let log = run_store_warm(&state, Some(&stubs), &["run", layers_arg]);
+    std::fs::write(state.join("fcvm-store-warm.log"), log).expect("reader log");
+    let out = run_store_warm(&state, None, &["wait"]);
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("::warning::") && l.contains("exit")),
+        "a reader whose reads failed must raise a warning: {out}"
+    );
+
+    // The reader died before it reported anything.
+    let state = tmp.path().join("killed");
+    std::fs::create_dir_all(&state).expect("state dir");
+    std::fs::write(state.join("fcvm-store-warm.pid"), &pid).expect("pid file");
+    std::fs::write(state.join("fcvm-store-warm.log"), b"").expect("empty log");
+    let out = run_store_warm(&state, None, &["wait"]);
+    assert!(
+        out.lines().any(|l| l.starts_with("::warning::")),
+        "a reader that ended without reporting must raise a warning: {out}"
+    );
+}
