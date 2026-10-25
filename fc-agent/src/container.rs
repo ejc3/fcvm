@@ -1090,17 +1090,19 @@ pub fn notify_cache_ready_and_wait(
     // delivers). So: announce FIRST, then make the console provably quiet
     // (flush + gate + TIOCOUTQ drain — structural, not probabilistic), and
     // only THEN let the host know we are ready to be paused. On success the
-    // gate holds until this function returns (every path: verdict, restore,
-    // failure), so no concurrent task can put a byte in UART TX while the
-    // pause can happen — lines logged meanwhile are buffered and flushed when
-    // the guard drops. If the console CANNOT be proven quiet, the handshake
-    // is aborted BEFORE cache-ready is sent: the host never pauses us, no
-    // poisoned snapshot artifact can be created, and the VM continues cold.
+    // gate holds until the pause is behind us: the first severed session
+    // (the snapshot boundary reset the transport) or the handshake's return,
+    // whichever comes first. No concurrent task can put a byte in UART TX
+    // while the pause can happen — lines logged meanwhile are buffered and
+    // flushed when the guard drops. If the console CANNOT be proven quiet,
+    // the handshake is aborted BEFORE cache-ready is sent: the host never
+    // pauses us, no poisoned snapshot artifact can be created, and the VM
+    // continues cold.
     eprintln!(
         "[fc-agent] image digest {} loaded; quiescing console before cache-ready notification",
         digest
     );
-    let _console_quiesce = match crate::console::quiesce_for_snapshot() {
+    let console_quiesce = match crate::console::quiesce_for_snapshot() {
         Ok(guard) => guard,
         Err(e) => {
             eprintln!(
@@ -1112,7 +1114,12 @@ pub fn notify_cache_ready_and_wait(
         }
     };
 
-    run_cache_handshake(&mut VsockStatusConnector, digest, restore_flag)
+    run_cache_handshake(
+        &mut VsockStatusConnector,
+        digest,
+        restore_flag,
+        Some(console_quiesce),
+    )
 }
 
 /// The cache handshake protocol: ask the host what this VM is, and keep
@@ -1138,12 +1145,28 @@ pub fn notify_cache_ready_and_wait(
 /// the FIRST connect/send failing (the host never saw the ask, so it will
 /// never pause us), the host going silent for 30s AND then refusing the
 /// reconnect (host process gone), or the 10-minute absolute cap.
-fn run_cache_handshake(
+///
+/// `console_gate` is the console quiesce guard taken before the first ask. It
+/// keeps the UART idle across the snapshot pause, so it is released at the
+/// first severed session: the host pauses the VM with the session open and
+/// closes one only after a verdict, so a session that dies without a verdict
+/// means the pause is behind us or none is coming. Held to the handshake's
+/// return, it also hid every line logged while a restored clone kept failing
+/// to reach the host, for up to the 10-minute cap (#1207: a clone that never
+/// ACKed printed nothing from fc-agent for two minutes).
+fn run_cache_handshake<G>(
     connector: &mut dyn StatusConnector,
     digest: &str,
     restore_flag: &std::sync::atomic::AtomicBool,
+    mut console_gate: Option<G>,
 ) -> CacheResult {
     use nix::unistd::write;
+
+    let mut release_console = |why: &str| {
+        if console_gate.take().is_some() {
+            eprintln!("[fc-agent] cache handshake: {why}; console released");
+        }
+    };
 
     let started = std::time::Instant::now();
     let absolute_deadline = started + std::time::Duration::from_secs(600);
@@ -1221,6 +1244,7 @@ fn run_cache_handshake(
                 // Treat like a severed session and go around. Delay like the
                 // refused-connect path so a host that accepts and immediately
                 // resets cannot drive this loop hot for the whole absolute cap.
+                release_console("re-ask send failed after the snapshot boundary");
                 eprintln!(
                     "[fc-agent] cache handshake: re-ask send failed ({:?}), reconnecting",
                     other
@@ -1268,6 +1292,7 @@ fn run_cache_handshake(
                 return CacheResult::Doomed;
             }
             SessionOutcome::Severed => {
+                release_console("session severed by the snapshot boundary");
                 // A snapshot boundary passed over this connection. Ask again —
                 // the owner (resumed-source run loop, restored clone's host, or
                 // a teardown that will kill us) answers from what it knows.
@@ -2469,7 +2494,7 @@ mod tests {
 
     fn handshake(scripts: Vec<HostScript>, flag: &AtomicBool) -> (CacheResult, Vec<String>) {
         let mut connector = ScriptedConnector::new(scripts);
-        let result = run_cache_handshake(&mut connector, "sha256:test", flag);
+        let result = run_cache_handshake(&mut connector, "sha256:test", flag, None::<()>);
         (result, connector.asks())
     }
 
@@ -2577,9 +2602,74 @@ mod tests {
             }
         }
         let mut connector = One(Some(OwnedFd::from(guest)));
-        let result = run_cache_handshake(&mut connector, "sha256:test", &flag);
+        let result = run_cache_handshake(&mut connector, "sha256:test", &flag, None::<()>);
         handle.join().unwrap();
         assert_eq!(result, CacheResult::WarmStart);
+    }
+
+    /// The console quiesce guard covers the snapshot pause and nothing after
+    /// it. A restored clone whose reconnects keep failing loops in this
+    /// handshake until the restore flag or the 10-minute cap; with the guard
+    /// held for the whole loop, every line fc-agent logged meanwhile stayed in
+    /// the gated buffer, and #1207's clone showed nothing for two minutes.
+    /// The guard must be gone by the first reconnect after the severed session.
+    #[test]
+    fn the_console_gate_is_released_at_the_first_severed_session() {
+        struct Gate(Arc<AtomicBool>);
+        impl Drop for Gate {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        /// One scripted session that the host severs, then refused reconnects.
+        /// Each reconnect records whether the gate was already released; the
+        /// third one publishes the restore flag so the handshake returns.
+        struct SeverThenRefuse {
+            first: Option<OwnedFd>,
+            released: Arc<AtomicBool>,
+            restore_flag: Arc<AtomicBool>,
+            reconnects_seen_released: Vec<bool>,
+        }
+        impl StatusConnector for SeverThenRefuse {
+            fn connect(&mut self) -> Result<OwnedFd, nix::errno::Errno> {
+                if let Some(first) = self.first.take() {
+                    return Ok(first);
+                }
+                self.reconnects_seen_released
+                    .push(self.released.load(Ordering::SeqCst));
+                if self.reconnects_seen_released.len() == 3 {
+                    self.restore_flag.store(true, Ordering::Release);
+                }
+                Err(nix::errno::Errno::ECONNREFUSED)
+            }
+        }
+
+        let (guest, host) = UnixStream::pair().expect("socketpair");
+        let host = spawn_host(host, HostScript::Sever);
+        let released = Arc::new(AtomicBool::new(false));
+        let restore_flag = Arc::new(AtomicBool::new(false));
+        let mut connector = SeverThenRefuse {
+            first: Some(OwnedFd::from(guest)),
+            released: released.clone(),
+            restore_flag: restore_flag.clone(),
+            reconnects_seen_released: Vec::new(),
+        };
+
+        let result = run_cache_handshake(
+            &mut connector,
+            "sha256:test",
+            &restore_flag,
+            Some(Gate(released.clone())),
+        );
+        host.join().expect("host thread");
+
+        assert_eq!(result, CacheResult::WarmStart);
+        assert_eq!(
+            connector.reconnects_seen_released,
+            vec![true, true, true],
+            "the console gate was still held after the snapshot boundary severed the session"
+        );
     }
 
     #[test]
