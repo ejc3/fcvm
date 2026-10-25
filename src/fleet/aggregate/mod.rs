@@ -450,6 +450,8 @@ pub async fn run(
             }
             () = exited => {
                 let c = current.take().expect("a publishing pipeline");
+                // Its tile readers hold clones of the token and outlive the pipeline's task.
+                c.token.cancel();
                 if c.started.elapsed() >= RESTART_RESET {
                     backoff = RESTART_MIN;
                 }
@@ -1094,6 +1096,58 @@ mod tests {
             shared.stats.lock().unwrap().frames > 0
         })
         .await;
+        cancel.cancel();
+    }
+
+    /// A publishing pipeline whose encoder stops while a tile is connected and sends
+    /// nothing: the pipeline started again must not leave the old one's tile reader
+    /// connected. Each restart would otherwise keep one more connection and decoder.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pipeline_started_again_leaves_no_tile_reader_behind() {
+        use axum::extract::ws::WebSocketUpgrade;
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        // Connections made, and connections open.
+        let made = Arc::new(AtomicUsize::new(0));
+        let open = Arc::new(AtomicUsize::new(0));
+        let (m2, o2) = (made.clone(), open.clone());
+        let app = Router::new().route(
+            "/frames",
+            get(move |ws: WebSocketUpgrade| {
+                let (made, open) = (m2.clone(), o2.clone());
+                async move {
+                    ws.on_upgrade(move |mut s| async move {
+                        made.fetch_add(1, SeqCst);
+                        open.fetch_add(1, SeqCst);
+                        // A tile that is up and sends nothing; read until the reader leaves.
+                        while let Some(Ok(_)) = s.recv().await {}
+                        open.fetch_sub(1, SeqCst);
+                    })
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/frames", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let mut layout = black(1, now_ms(), 0);
+        layout.tiles[0].url = Some(url);
+        let shared = Shared::new();
+        shared.set_layout(layout);
+        let codec = codec::Narrow {
+            stop: vec![0],
+            ..codec::Narrow::new(vec![])
+        };
+        let cancel = CancellationToken::new();
+        tokio::spawn(run(
+            shared.clone(),
+            Arc::new(codec),
+            small(),
+            cancel.clone(),
+        ));
+        until("the pipeline started again to connect", || {
+            made.load(SeqCst) == 2
+        })
+        .await;
+        until("one tile connection left open", || open.load(SeqCst) == 1).await;
         cancel.cancel();
     }
 

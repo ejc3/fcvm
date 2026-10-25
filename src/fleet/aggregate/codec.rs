@@ -121,11 +121,13 @@ fn raw_encoder(width: u32, height: u32, keyint: u32, cap: usize) -> EncoderIo {
 }
 
 /// [`Raw`] with channels of one message (the least room a real codec's pipes can leave),
-/// whose `encoder` calls numbered in `refuse` (from 0) fail to start.
+/// whose `encoder` calls numbered in `refuse` (from 0) fail to start, and those in `stop`
+/// stop after their first output.
 #[cfg(test)]
 pub(crate) struct Narrow {
     pub calls: std::sync::atomic::AtomicUsize,
     pub refuse: Vec<usize>,
+    pub stop: Vec<usize>,
 }
 
 #[cfg(test)]
@@ -134,6 +136,7 @@ impl Narrow {
         Narrow {
             calls: Default::default(),
             refuse,
+            stop: Vec::new(),
         }
     }
 }
@@ -149,7 +152,17 @@ impl Codec for Narrow {
         if self.refuse.contains(&n) {
             bail!("encoder {n} refused to start");
         }
-        Ok(raw_encoder(width, height, p.keyint, 1))
+        let (tx, mut rx) = raw_encoder(width, height, p.keyint, 1);
+        if !self.stop.contains(&n) {
+            return Ok((tx, rx));
+        }
+        let (out_tx, out_rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            if let Some(e) = rx.recv().await {
+                let _ = out_tx.send(e).await;
+            }
+        });
+        Ok((tx, out_rx))
     }
 
     fn name(&self) -> &'static str {

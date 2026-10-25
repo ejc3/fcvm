@@ -294,12 +294,18 @@ impl Actor {
             return done;
         };
         if self.state.version == self.stored {
+            // Nothing new to write; the writer retries a state whose write failed, so an
+            // unchanged state that is not stored yet is tried again every tick.
             if barrier {
                 let _ = tx.send(store::StoreCmd {
                     bytes: None,
                     ack: Some(ack),
                 });
             } else {
+                let _ = tx.send(store::StoreCmd {
+                    bytes: None,
+                    ack: None,
+                });
                 let _ = ack.send(true);
             }
             return done;

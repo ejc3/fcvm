@@ -1836,6 +1836,97 @@ async fn shutdown_reports_a_last_state_that_was_not_stored() {
     assert_eq!(run(1).await, (true, 2));
 }
 
+/// A state write fails and the state then stays unchanged: the periodic store asks the
+/// writer again on its next tick instead of leaving the state unwritten until the next
+/// change or shutdown.
+#[tokio::test]
+async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<store::StoreCmd>();
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let a2 = attempts.clone();
+    // Fails its first write and stores every later one.
+    tokio::spawn(async move {
+        let mut pending = false;
+        while let Some(cmd) = rx.recv().await {
+            pending |= cmd.bytes.is_some();
+            if pending {
+                let n = a2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                pending = n == 0;
+            }
+            if let Some(a) = cmd.ack {
+                let _ = a.send(!pending);
+            }
+        }
+    });
+    // The actor alone, on a clock that stands still and with no tick task, so nothing
+    // changes the state after the intent below.
+    let (snapshot, snapshot_rx) =
+        tokio::sync::watch::channel(Arc::new(fcvm::fleet::coord::Snapshot {
+            version: 0,
+            text: String::new(),
+        }));
+    let (ec2_layout, ec2_layout_rx) = tokio::sync::watch::channel(None);
+    let state = State::new(
+        Config {
+            light_interval_ms: 0,
+            ..Config::default()
+        },
+        1_000,
+    );
+    let outputs = fcvm::fleet::coord::Outputs {
+        snapshot,
+        ec2: tokio::sync::watch::channel(Vec::new()).0,
+        ec2_layout,
+        power: tokio::sync::watch::channel(String::new()).0,
+        scene: tokio::sync::watch::channel(None).0,
+        budget: tokio::sync::watch::channel(None).0,
+        dns: None,
+        store: Some(tx),
+    };
+    let (cmds, cmds_rx) = tokio::sync::mpsc::channel(64);
+    let actor = tokio::spawn(
+        fcvm::fleet::coord::Actor::new(state, outputs, Box::new(|| 2_000)).run(cmds_rx),
+    );
+    let handle = Handle {
+        cmds,
+        snapshot: snapshot_rx,
+        ec2_layout: ec2_layout_rx,
+    };
+    let before = handle.snapshot.borrow().version;
+    handle
+        .apply(Event::Intent {
+            at: 0,
+            viewer: "v-1".into(),
+            client: Some("198.51.100.9".into()),
+            id: "l-0".into(),
+            name: "light".into(),
+            args: light(0.0),
+            check: None,
+            secret: None,
+        })
+        .await
+        .unwrap();
+    // The store ticks once a second: the first queues the state (and fails), a later one
+    // retries it while the state stays as it is.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while attempts.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the failed write is retried before any change or shutdown");
+    assert_eq!(
+        handle.snapshot.borrow().version,
+        before + 1,
+        "only the intent changed the state"
+    );
+    assert!(handle.shutdown().await);
+    tokio::time::timeout(Duration::from_secs(10), actor)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 /// A tile whose instance never serves its renderer is terminated and launched again,
 /// instead of staying failed until someone relaunches it.
 struct NotReadyOnceEc2 {
