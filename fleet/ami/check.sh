@@ -114,5 +114,33 @@ bash "$st/w.sh" 2>/dev/null && jq -e '.store_started_at == 1 and .store_mounted_
   no "store.sh's ready file is not a JSON object of the store's times"
 rm -rf "$st"
 
+# store.sh's staged restore (tar into tmpfs, then cp -a into the store) must give the tree a
+# direct extraction gives: names, types, modes, owners, mtimes, hard links, holes, bytes.
+fx=$(mktemp -d)
+# Each step ends in `|| exit 1`: `set -e` does nothing in a subshell that is part of `||`.
+(
+  mkdir -p "$fx/src/d/e" || exit 1
+  printf 'one' > "$fx/src/d/a" && ln "$fx/src/d/a" "$fx/src/d/e/a-link" && ln -s ../a "$fx/src/d/e/sym" || exit 1
+  truncate -s 64M "$fx/src/d/sparse" || exit 1
+  printf 'tail' | dd of="$fx/src/d/sparse" bs=1 seek=$((32 << 20)) conv=notrunc status=none || exit 1
+  chmod 0750 "$fx/src/d/e" && touch -d '2026-01-02 03:04:05' "$fx/src/d/a" || exit 1
+  tar -c --sparse -C "$fx/src" . > "$fx/a.tar" || exit 1
+  fns=$(sed -n '/^# --- restore functions/,/^# --- end of restore functions/p' fleet/ami/host/store.sh)
+  [ -n "$fns" ] || exit 1
+  for mode in direct staged; do
+    M="$fx/$mode"; mkdir "$M" || exit 1; stage=""
+    if [ "$mode" = staged ]; then stage=$(mktemp -d) || exit 1; fi
+    eval "$fns"
+    extract < "$fx/a.tar" || exit 1
+    if [ -n "$stage" ]; then rm -rf "$stage"; fi
+  done
+  tree() { (cd "$1" && find . -printf '%p %y %m %U %G %T@ %n %s %l\n' | sort && find . -type f -exec sha256sum {} + | sort -k2); }
+  diff <(tree "$fx/direct") <(tree "$fx/staged") >&2 || exit 1
+  [ "$(stat -c %h "$fx/staged/d/a")" = 2 ] || exit 1
+  # The hole stays a hole: far fewer blocks than the 64 MiB the file spans.
+  [ "$(stat -c %b "$fx/staged/d/sparse")" -lt 1024 ] || exit 1
+) 2>/dev/null || no "store.sh's staged restore does not give the tree a direct extraction gives"
+rm -rf "$fx"
+
 [ "$fail" = 0 ] && echo "fleet/ami checks: ok"
 exit "$fail"
