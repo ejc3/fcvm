@@ -60,49 +60,96 @@ pub struct Raw;
 
 impl Codec for Raw {
     fn decoder(&self, width: u32, height: u32) -> Result<DecoderIo> {
-        let (in_tx, mut in_rx) = mpsc::channel::<(f64, Vec<u8>)>(64);
-        let (out_tx, out_rx) = mpsc::channel(64);
-        tokio::spawn(async move {
-            while let Some((t, au)) = in_rx.recv().await {
-                if au.len() != Picture::size(width, height) {
-                    tracing::warn!(len = au.len(), "raw tile picture of the wrong size");
-                    continue;
-                }
-                let pic = Picture {
-                    width,
-                    height,
-                    data: au,
-                };
-                if out_tx.send((t, pic)).await.is_err() {
-                    return;
-                }
-            }
-        });
-        Ok((in_tx, out_rx))
+        Ok(raw_decoder(width, height, 64))
     }
 
     fn encoder(&self, width: u32, height: u32, _fps: u32, p: &EncodeParams) -> Result<EncoderIo> {
-        let (in_tx, mut in_rx) = mpsc::channel::<(f64, Picture)>(64);
-        let (out_tx, out_rx) = mpsc::channel(64);
-        let keyint = p.keyint.max(1) as u64;
-        tokio::spawn(async move {
-            let mut n = 0u64;
-            while let Some((t, pic)) = in_rx.recv().await {
-                if pic.width != width || pic.height != height {
-                    continue;
-                }
-                let e = Encoded {
-                    t,
-                    key: n.is_multiple_of(keyint),
-                    au: pic.data,
-                };
-                n += 1;
-                if out_tx.send(e).await.is_err() {
-                    return;
-                }
+        Ok(raw_encoder(width, height, p.keyint, 64))
+    }
+
+    fn name(&self) -> &'static str {
+        "raw"
+    }
+}
+
+/// [`Raw`]'s decoder, with channels of `cap` messages.
+fn raw_decoder(width: u32, height: u32, cap: usize) -> DecoderIo {
+    let (in_tx, mut in_rx) = mpsc::channel::<(f64, Vec<u8>)>(cap);
+    let (out_tx, out_rx) = mpsc::channel(cap);
+    tokio::spawn(async move {
+        while let Some((t, au)) = in_rx.recv().await {
+            if au.len() != Picture::size(width, height) {
+                tracing::warn!(len = au.len(), "raw tile picture of the wrong size");
+                continue;
             }
-        });
-        Ok((in_tx, out_rx))
+            let pic = Picture {
+                width,
+                height,
+                data: au,
+            };
+            if out_tx.send((t, pic)).await.is_err() {
+                return;
+            }
+        }
+    });
+    (in_tx, out_rx)
+}
+
+/// [`Raw`]'s encoder, with channels of `cap` messages.
+fn raw_encoder(width: u32, height: u32, keyint: u32, cap: usize) -> EncoderIo {
+    let (in_tx, mut in_rx) = mpsc::channel::<(f64, Picture)>(cap);
+    let (out_tx, out_rx) = mpsc::channel(cap);
+    let keyint = keyint.max(1) as u64;
+    tokio::spawn(async move {
+        let mut n = 0u64;
+        while let Some((t, pic)) = in_rx.recv().await {
+            if pic.width != width || pic.height != height {
+                continue;
+            }
+            let e = Encoded {
+                t,
+                key: n.is_multiple_of(keyint),
+                au: pic.data,
+            };
+            n += 1;
+            if out_tx.send(e).await.is_err() {
+                return;
+            }
+        }
+    });
+    (in_tx, out_rx)
+}
+
+/// [`Raw`] with channels of one message (the least room a real codec's pipes can leave),
+/// whose `encoder` calls numbered in `refuse` (from 0) fail to start.
+#[cfg(test)]
+pub(crate) struct Narrow {
+    pub calls: std::sync::atomic::AtomicUsize,
+    pub refuse: Vec<usize>,
+}
+
+#[cfg(test)]
+impl Narrow {
+    pub fn new(refuse: Vec<usize>) -> Self {
+        Narrow {
+            calls: Default::default(),
+            refuse,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Codec for Narrow {
+    fn decoder(&self, width: u32, height: u32) -> Result<DecoderIo> {
+        Ok(raw_decoder(width, height, 1))
+    }
+
+    fn encoder(&self, width: u32, height: u32, _fps: u32, p: &EncodeParams) -> Result<EncoderIo> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.refuse.contains(&n) {
+            bail!("encoder {n} refused to start");
+        }
+        Ok(raw_encoder(width, height, p.keyint, 1))
     }
 
     fn name(&self) -> &'static str {
