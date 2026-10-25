@@ -23,6 +23,7 @@ pub mod sigv4;
 pub mod store;
 pub mod text_check;
 pub mod turnstile;
+pub mod wake_log;
 
 use crate::cli::{FleetAggregateCodec, FleetCoordArgs, FleetEc2, FleetTextCheck};
 use crate::fleet::aggregate::codec::{Codec, Ffmpeg, Raw};
@@ -245,9 +246,11 @@ impl Actor {
         let at = self.stamp();
         set_at(&mut event, at);
         let before = self.state.version;
+        let marks = wake_log::Marks::of(&self.state);
         let state = std::mem::replace(&mut self.state, State::new(Config::default(), 0));
         self.state = apply(state, &event);
         self.name_launches();
+        wake_log::log(&wake_log::notes(&marks, &self.state, at));
         if self.state.version != before {
             self.dispatch_agents();
         }

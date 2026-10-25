@@ -243,7 +243,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
         }
         Event::ScaleInstances { instances, .. } => {
             let p = &mut state.fleet.power;
-            if p.state == "waking" {
+            if wake_open(p) {
                 for i in instances {
                     let w = p.hosts.entry(i.id.clone()).or_default();
                     w.pending_at.get_or_insert(at);
@@ -287,19 +287,27 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     gpus,
                     capacity,
                     store_ready_at,
+                    boot,
                 } => {
                     // The connection names the host; a hello naming another is ignored.
                     if named == host {
                         hello(&mut state.fleet, host, arch, gpus, *capacity, at);
                         let p = &mut state.fleet.power;
-                        if p.state == "waking" {
+                        if wake_open(p) {
+                            let woke = p.woke_at;
                             let w = p.hosts.entry(host.clone()).or_default();
-                            w.agent_at.get_or_insert(at);
                             // The host's own clock: kept only when it falls inside this wake.
-                            if let Some(t) = store_ready_at
-                                .filter(|t| p.woke_at.is_some_and(|w| *t >= w) && *t <= at)
-                            {
-                                w.store_ready_at.get_or_insert(t);
+                            let inside = |t: &u64| woke.is_some_and(|w| *t >= w) && *t <= at;
+                            if w.agent_at.is_none() {
+                                w.agent_at = Some(at);
+                                if let Some(t) = store_ready_at.filter(inside) {
+                                    w.store_ready_at.get_or_insert(t);
+                                }
+                                w.boot = boot
+                                    .iter()
+                                    .filter(|(_, t)| inside(t))
+                                    .map(|(k, t)| (k.clone(), *t))
+                                    .collect();
                             }
                         }
                     }
@@ -474,7 +482,7 @@ fn power_step(state: &mut State, at: u64) {
         f.next_race_at = None;
         return;
     }
-    if f.power.state == "waking" {
+    if wake_open(&f.power) {
         let hosts = f.hosts.clone();
         for (id, w) in f.power.hosts.iter_mut() {
             if w.rendering_at.is_some() || !hosts.contains_key(id) {
@@ -494,27 +502,40 @@ fn power_step(state: &mut State, at: u64) {
                 w.rendering_at = Some(at);
             }
         }
-        if image_complete(f) {
-            let started = f.power.woke_at.unwrap_or(at);
-            let gpus = f
-                .slots
-                .values()
-                .chain(f.ec2.values())
-                .filter(|s| s.position.is_some())
-                .count();
-            f.power.wakes.push_back(Wake {
-                started_at: started,
-                awake_at: at,
-                gpus,
-                ms: at - started,
-            });
-            while f.power.wakes.len() > MAX_WAKES {
-                f.power.wakes.pop_front();
-            }
-            f.power.state = "awake".into();
-            f.next_race_at = interval.map(|s| at + s * 1000);
-        }
     }
+    if f.power.state == "waking" && image_complete(f) {
+        let started = f.power.woke_at.unwrap_or(at);
+        let gpus = f
+            .slots
+            .values()
+            .chain(f.ec2.values())
+            .filter(|s| s.position.is_some())
+            .count();
+        f.power.wakes.push_back(Wake {
+            started_at: started,
+            awake_at: at,
+            gpus,
+            ms: at - started,
+        });
+        while f.power.wakes.len() > MAX_WAKES {
+            f.power.wakes.pop_front();
+        }
+        f.power.state = "awake".into();
+        f.next_race_at = interval.map(|s| at + s * 1000);
+    }
+}
+
+/// Whether the hosts' progress still belongs to the current wake: while it wakes, and after
+/// it is awake until every host recorded for it renders. The fleet is awake once the image
+/// is complete, which the EC2 half can make before any GPU host's agent has said hello
+/// (staging, 2026-10-25: awake 53 s into a wake whose host rendered at 150 s), so the
+/// host's later phases are recorded too. A host that never renders keeps the record open
+/// until the fleet sleeps.
+pub fn wake_open(p: &crate::state::Power) -> bool {
+    p.woke_at.is_some()
+        && (p.state == "waking"
+            || p.hosts.is_empty()
+            || p.hosts.values().any(|w| w.rendering_at.is_none()))
 }
 
 /// Whether the GPU behind a slot is quarantined.

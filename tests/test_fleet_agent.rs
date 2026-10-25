@@ -114,6 +114,7 @@ impl Coord {
             spot_poll: Duration::from_millis(50),
             aggregate: None,
             store_ready_file: None,
+            boot: Default::default(),
         };
         let task = tokio::spawn(serve(agent, agent_in, agent_out));
         let (to_agent, _w) = spawn_writer::<CoordMsg, _>(coord_out, "agent");
@@ -973,6 +974,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
         spot_notice_url: None,
         spot_poll: Duration::from_millis(50),
         store_ready_file: None,
+        boot: Default::default(),
         aggregate: Some(AggregateCfg {
             port,
             argv: vec![
@@ -1329,6 +1331,7 @@ async fn the_hello_reports_when_the_store_was_ready() {
         spot_poll: Duration::from_millis(50),
         aggregate: None,
         store_ready_file: Some(marker),
+        boot: Default::default(),
     };
     let task = tokio::spawn(serve(agent, agent_in, agent_out));
     let mut from_agent = LineReader::new(coord_in, "agent");
@@ -1403,6 +1406,7 @@ async fn a_dialing_agent_reconnects_and_replays_its_state_without_restarting_vms
         spot_poll: Duration::from_millis(50),
         aggregate: None,
         store_ready_file: None,
+        boot: Default::default(),
     };
     let task = tokio::spawn(dial(
         agent,
@@ -1697,4 +1701,35 @@ async fn a_warming_slot_draws_the_whole_image_then_takes_its_place() {
         .count();
     assert_eq!(starts, 1, "joining the wall must not relaunch");
     c.close().await;
+}
+
+/// The hello's boot times: the kernel's start from `/proc/uptime`, the agent's start, and
+/// every `*_at` number in the store unit's ready file; anything else in that file is left
+/// out, and a file that is not a JSON object adds nothing.
+#[test]
+fn boot_times_come_from_uptime_the_agent_and_the_store_ready_file() {
+    use fcvm::fleet::agent::boot_times;
+    let b = boot_times(
+        Some("86.25 1201.50\n"),
+        1_000_000,
+        999_000,
+        Some(
+            r#"{"store_started_at": 920000, "store_mounted_at": 921000, "store_source": "s3", "bytes": 5}"#,
+        ),
+    );
+    assert_eq!(
+        b,
+        [
+            ("kernel_started_at".to_string(), 1_000_000 - 86_250),
+            ("agent_started_at".to_string(), 999_000),
+            ("store_started_at".to_string(), 920_000),
+            ("store_mounted_at".to_string(), 921_000),
+        ]
+        .into()
+    );
+    // The store unit of an older image wrote nothing (or an empty marker).
+    assert_eq!(
+        boot_times(None, 1_000_000, 999_000, Some("")),
+        [("agent_started_at".to_string(), 999_000)].into()
+    );
 }

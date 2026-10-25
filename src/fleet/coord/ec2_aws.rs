@@ -382,6 +382,11 @@ impl Ec2Driver for AwsEc2 {
         let (region, id) = split(&launched.instance)?;
         let deadline = Instant::now() + self.ready_timeout;
         let mut up = launched.clone();
+        // For the log: since this call, when the instance was first seen running with an
+        // address, and when its renderer first answered /health.
+        let t0 = Instant::now();
+        let mut running_ms: Option<u128> = None;
+        let mut health_ms: Option<u128> = None;
         loop {
             if Instant::now() >= deadline {
                 bail!("{id} did not serve /health within {:?}", self.ready_timeout);
@@ -405,12 +410,26 @@ impl Ec2Driver for AwsEc2 {
             up.ipv6 = ipv6;
             if state == "running" {
                 if let Some(ip) = up.ipv4.clone() {
+                    running_ms.get_or_insert(t0.elapsed().as_millis());
                     // A renderer that reports an error will not render: the launch fails
                     // and the tile is retried.
                     match self.probe(tile, &ip).await {
-                        Health::Ready => return Ok(up),
+                        Health::Ready => {
+                            health_ms.get_or_insert(t0.elapsed().as_millis());
+                            tracing::info!(
+                                %tile, instance = %id,
+                                running_ms = running_ms.unwrap_or_default() as u64,
+                                health_answered_ms = health_ms.unwrap_or_default() as u64,
+                                ready_ms = t0.elapsed().as_millis() as u64,
+                                "tile ready (ms since the launch was accepted)"
+                            );
+                            return Ok(up);
+                        }
                         Health::Failed(e) => bail!("{id}'s renderer failed: {e}"),
-                        Health::NotReady | Health::Silent(_) => {}
+                        Health::NotReady => {
+                            health_ms.get_or_insert(t0.elapsed().as_millis());
+                        }
+                        Health::Silent(_) => {}
                     }
                 }
             }
