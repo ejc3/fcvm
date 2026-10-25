@@ -106,6 +106,41 @@ fn light(x: f64) -> Value {
     json!({"pos": [x, 2.0, -90.0], "color": [1.0, 0.5, 0.0]})
 }
 
+/// Stops a coordinator started with `start` and returns the version its last publish
+/// carries, which is the version of the state it stored.
+///
+/// `start` runs a 1 s ticker, and a tick that changes the fleet moves the version without
+/// a receipt. A stored or published version therefore cannot be compared to the last
+/// receipt's: it equals it when no tick landed and is larger when one did. This applies a
+/// viewer join first, which moves the version the same way on every run, so a test that
+/// compares against the last receipt fails every time instead of one run in a while. The
+/// join also makes the returned version greater than `last_receipt`, which is asserted.
+async fn shutdown_at_final_version(
+    handle: &Handle,
+    actor: tokio::task::JoinHandle<()>,
+    last_receipt: u64,
+) -> u64 {
+    let join = handle
+        .apply(Event::ViewerJoined {
+            at: 0,
+            viewer: "v-final".into(),
+            client: None,
+        })
+        .await;
+    assert!(join.is_none(), "a join carries no receipt");
+    handle.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(5), actor)
+        .await
+        .unwrap()
+        .unwrap();
+    let published = handle.snapshot.borrow().version;
+    assert!(
+        published > last_receipt,
+        "the join moved the version past the last receipt: {published} after {last_receipt}"
+    );
+    published
+}
+
 /// A browser: every message it receives, snapshots kept by version.
 struct Viewer {
     ws: Ws,
@@ -322,10 +357,9 @@ async fn a_repeated_intent_id_returns_its_first_receipt_and_applies_once() {
         repeats[0], repeats[1],
         "a repeated id must get the first receipt"
     );
-    assert_eq!(
-        first["version"].as_u64().unwrap() + 1,
-        marker["version"].as_u64().unwrap()
-    );
+    // The ticker can move the version between the two receipts, so only the order is
+    // fixed; that the repeat applied nothing is the action count below.
+    assert!(first["version"].as_u64().unwrap() < marker["version"].as_u64().unwrap());
     let s = a.at_least(marker["version"].as_u64().unwrap()).await;
     let named: Vec<&Value> = s["actions"]
         .as_array()
@@ -1124,17 +1158,13 @@ async fn shutdown_writes_the_last_state_to_the_state_file() {
             .unwrap();
         last = r.version;
     }
-    handle.shutdown().await;
+    let final_version = shutdown_at_final_version(&handle, actor, last).await;
     let saved = store::load(&path).unwrap().expect("a state file");
     assert_eq!(
-        saved.version, last,
+        saved.version, final_version,
         "the state file misses the last changes"
     );
     assert!(saved.receipts.contains_key("l-4"));
-    tokio::time::timeout(Duration::from_secs(5), actor)
-        .await
-        .unwrap()
-        .unwrap();
 }
 
 /// A tile's instance that goes away after it was ready (a spot reclaim) is reported
@@ -3280,35 +3310,14 @@ async fn the_state_lives_in_s3_and_a_refused_read_is_an_error() {
             .unwrap()
             .version;
     }
-    // The coordinator's 1 s ticker moves the version without a receipt whenever a tick
-    // changes the fleet, so the stored version can pass the last receipt's. A viewer
-    // joining does the same on demand, which makes that happen on every run.
-    let after = handle
-        .apply(Event::ViewerJoined {
-            at: 0,
-            viewer: "v-2".into(),
-            client: None,
-        })
-        .await;
-    assert!(after.is_none(), "a join carries no receipt");
-    handle.shutdown().await;
-    tokio::time::timeout(Duration::from_secs(5), actor)
-        .await
-        .unwrap()
-        .unwrap();
+    let final_version = shutdown_at_final_version(&handle, actor, last).await;
     assert!(s3
         .objects
         .lock()
         .unwrap()
         .contains_key("/fleet-state/state.json"));
     let back = obj().load().await.unwrap().expect("the state object");
-    // The stored state is the state the actor ended with, which the shutdown publishes.
-    let final_version = handle.snapshot.borrow().version;
     assert_eq!(back.version, final_version);
-    assert!(
-        back.version > last,
-        "the join moved the version past the last receipt"
-    );
     for i in 0..3 {
         assert!(
             back.receipts.contains_key(&format!("l-{i}")),
