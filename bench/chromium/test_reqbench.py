@@ -2245,6 +2245,99 @@ class ExecArmTimeout(unittest.TestCase):
             ]
             self.assertEqual(leaked, [], f"stub survived the timeout: {leaked}")
 
+    def _args_for_stub_with_cont_trap(self, trap_body, extra_setup=""):
+        """Exec-arm args for a stub whose SIGCONT trap changes its child set.
+
+        The harness sends SIGCONT only after it has pinned the stub's direct
+        children, so whatever the trap does happens strictly between the two
+        reads of that set. `trap_body` runs in the stub on that SIGCONT.
+        """
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        stub = os.path.join(d, "fcvm-stub")
+        child_ready = os.path.join(d, "exec-child-ready")
+        state = os.path.join(d, "vm-44444444444444444444444444444444.json")
+        os.makedirs(os.path.join(d, "vm-disks", "vm-44444444444444444444444444444444"))
+        fifo = os.path.join(d, "release")
+        os.mkfifo(fifo)
+        with open(stub, "w") as f:
+            f.write(
+                "#!/bin/bash\n"
+                f"{extra_setup.format(fifo=fifo)}"
+                f"python3 -c 'import ctypes,signal,time; ctypes.CDLL(\"libc.so.6\").prctl(1, signal.SIGKILL); open(\"{child_ready}\", \"w\").close(); time.sleep(600)' &\n"
+                "main_child=$!\n"
+                f"while [ ! -e {child_ready} ]; do sleep 0.01; done\n"
+                f"trap '{trap_body.format(fifo=fifo)}' CONT\n"
+                "read -r proc_stat < /proc/$$/stat; proc_stat=${proc_stat##*) }; "
+                "read -ra proc_fields <<< \"$proc_stat\"; start=${proc_fields[19]}\n"
+                f"cat > {state} <<EOF\n"
+                '{"vm_id": "vm-44444444444444444444444444444444", "name": "rb-test-run-0-exec", "pid": $$, "pid_start_time": $start, "lifecycle_ready": true}\n'
+                "EOF\n"
+                f": > {state}.lock\n"
+                "while kill -0 $main_child 2>/dev/null; do wait $main_child; done\n"
+            )
+        os.chmod(stub, 0o755)
+        return argparse.Namespace(
+            fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
+            snapshot_tag="", serve_pid=1, rust_log="off",
+            timeout=1.5, teardown_timeout=1.0,
+            state_dir=d, data_root=d, run_id="test-run",
+        )
+
+    def test_a_child_that_exits_between_the_two_reads_is_not_a_changed_set(self):
+        """A pinned child leaving the set after SIGCONT is not an unpinned child.
+
+        RED BEFORE THE FIX: `timeout_kids != kids` treated any difference as a
+        failure. The set is the stub's own direct children (/proc/<pid>/children),
+        so an unrelated process cannot enter it; what differed in the issue-1251
+        flake was the stub's own transient child (the `cat` that publishes the
+        state), captured while the frozen stub had not yet reaped it and gone by
+        the second read. The transient child here blocks until the stub gets
+        SIGCONT, so it is always in the first read and never in the second:
+            SurvivedTeardown: exec clone child set changed after ownership
+            publication: [T, P] -> [P]
+        """
+        args = self._args_for_stub_with_cont_trap(
+            "echo go > {fifo}",
+            extra_setup='bash -c "read -r _ < {fifo}" &\n',
+        )
+        rec = reqbench.run_exec_request(args, 0)  # must NOT raise
+        self.assertIs(rec["ok"], False)
+        self.assertIs(rec["timed_out"], True)
+        self.assertIs(rec["teardown"]["child_attribution_established"], True)
+        self.assertIs(rec["teardown"]["all_gone"], True)
+
+    def test_a_child_that_appears_between_the_two_reads_is_still_refused(self):
+        """A child forked after the barrier is unpinned and must fail closed."""
+        args = self._args_for_stub_with_cont_trap("sleep 300 &")
+        with self.assertRaises(reqbench.SurvivedTeardown) as cm:
+            reqbench.run_exec_request(args, 0)
+        self.assertIn("child set changed", str(cm.exception))
+        teardown = cm.exception.teardown
+        added = [
+            pid for pid in teardown["timeout_children"]
+            if pid not in teardown["initial_children"]
+        ]
+        self.assertEqual(len(added), 1, teardown)
+        self.assertFalse(process_running(added[0]), "the unpinned child was not killed")
+
+    def test_an_exited_unreaped_child_is_the_same_child_but_a_recycled_pid_is_not(self):
+        child = subprocess.Popen(["true"])
+        self.addCleanup(child.wait)
+        deadline = time.monotonic() + 5
+        while process_running(child.pid):
+            self.assertLess(time.monotonic(), deadline, "child did not exit")
+            time.sleep(0.01)
+        starts = reqbench.child_start_times([child.pid])
+        self.assertIsNotNone(starts[child.pid], "a zombie's start time is readable")
+        # Exited and still listed by its frozen parent: the child pinned earlier.
+        self.assertEqual(reqbench.unpinned_children(starts, [child.pid]), [])
+        # Same number, different start time: a new process holds the pid.
+        recycled = {child.pid: starts[child.pid] + 1}
+        self.assertEqual(reqbench.unpinned_children(recycled, [child.pid]), [child.pid])
+        # Not in the first capture at all.
+        self.assertEqual(reqbench.unpinned_children({}, [child.pid]), [child.pid])
+
 
 class _JsonListServer:
     """A stdlib HTTP server that speaks just enough `/json/list` to drive cdpdrive.

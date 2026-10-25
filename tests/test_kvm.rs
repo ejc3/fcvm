@@ -2220,3 +2220,143 @@ async fn test_nv2_kernel_writeback_cache_vsock_corruption() -> Result<()> {
     assert!(out.contains("OK"), "Write failed: {}", out);
     Ok(())
 }
+
+/// The VMM process under an fcvm process: the first descendant whose command
+/// name starts with `firecracker` (the NV2 build's name is longer, and `comm`
+/// is cut at 15 bytes).
+#[cfg(target_arch = "aarch64")]
+fn firecracker_under(fcvm_pid: u32) -> Result<u32> {
+    let mut parents = vec![fcvm_pid];
+    while let Some(parent) = parents.pop() {
+        for entry in std::fs::read_dir("/proc")? {
+            let Ok(pid) = entry?.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                continue;
+            };
+            // The name sits in parentheses and may hold spaces; ppid is the
+            // second field after it.
+            let Some((name, rest)) = stat
+                .split_once(" (")
+                .and_then(|(_, rest)| rest.rsplit_once(") "))
+            else {
+                continue;
+            };
+            if rest.split_whitespace().nth(1) != Some(&parent.to_string()) {
+                continue;
+            }
+            if name.starts_with("firecracker") {
+                return Ok(pid);
+            }
+            parents.push(pid);
+        }
+    }
+    bail!("no firecracker process under fcvm {fcvm_pid}")
+}
+
+/// Pages of a process's guest memory (its largest private anonymous mapping)
+/// that are mapped to a page the process does not own exclusively. A private
+/// anonymous page that is present and not exclusive is the kernel's shared
+/// zero page (or huge zero page): a write to it is a copy-on-write.
+#[cfg(target_arch = "aarch64")]
+fn shared_guest_pages(vmm_pid: u32) -> Result<u64> {
+    use std::os::unix::fs::FileExt;
+    const PRESENT: u64 = 1 << 63;
+    const EXCLUSIVE: u64 = 1 << 56;
+    // SAFETY: sysconf has no preconditions.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+
+    let maps = std::fs::read_to_string(format!("/proc/{vmm_pid}/maps"))?;
+    let (start, end) = maps
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // An anonymous mapping has no sixth field (path).
+            if fields.len() != 5 || fields[1] != "rw-p" {
+                return None;
+            }
+            let (start, end) = fields[0].split_once('-')?;
+            Some((
+                u64::from_str_radix(start, 16).ok()?,
+                u64::from_str_radix(end, 16).ok()?,
+            ))
+        })
+        .max_by_key(|(start, end)| end - start)
+        .context("no private anonymous mapping in the VMM")?;
+
+    let pagemap = std::fs::File::open(format!("/proc/{vmm_pid}/pagemap"))?;
+    let mut shared = 0;
+    let mut entries = vec![0u8; 8 * 4096];
+    let mut addr = start;
+    while addr < end {
+        let count = ((end - addr) / page_size).min(4096) as usize;
+        let bytes = &mut entries[..count * 8];
+        pagemap.read_exact_at(bytes, addr / page_size * 8)?;
+        shared += bytes
+            .chunks_exact(8)
+            .map(|e| u64::from_ne_bytes(e.try_into().unwrap()))
+            .filter(|e| e & PRESENT != 0 && e & EXCLUSIVE == 0)
+            .count() as u64;
+        addr += count as u64 * page_size;
+    }
+    Ok(shared)
+}
+
+/// `snapshot create` must not map the source's never-written guest pages to
+/// the zero page (fcvm#1264). A Full snapshot's memory dump that reads them
+/// does exactly that, and on an arm64 host each later first write by the
+/// resumed guest is then a copy-on-write whose MMU notifier invalidation
+/// unmaps every shadow stage-2 of an NV2 guest in full: ~600k exits/s, guest
+/// soft lockups, the resumed source unresponsive for 40 s or more. Measured
+/// on a 1 GiB NV2 guest: 0 zero-page pages before the snapshot, 144,696
+/// after. The NV2 Firecracker build leaves those pages as holes in the memory
+/// file instead.
+#[cfg(target_arch = "aarch64")]
+#[tokio::test]
+async fn test_snapshot_create_leaves_nv2_source_pages_unmapped() -> Result<()> {
+    let (vm_name, _, snap_tag, _) = common::unique_names("nv2zero");
+    let (mut child, pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "--kernel-profile",
+        "nested",
+        // A cold boot: guest memory is plain anonymous memory, not a restore
+        // whose missing pages a page server fills.
+        "--no-snapshot",
+        common::TEST_IMAGE,
+    ])
+    .await
+    .context("spawning an NV2 VM")?;
+
+    // Captured, never `?`-propagated, so the VM and its snapshot are always
+    // torn down.
+    let outcome = async {
+        common::poll_health(&mut child, 180).await?;
+        let vmm = firecracker_under(pid)?;
+        let before = shared_guest_pages(vmm)?;
+        common::create_snapshot_by_pid(pid, &snap_tag).await?;
+        let after = shared_guest_pages(vmm)?;
+        anyhow::Ok((before, after))
+    }
+    .await;
+
+    common::kill_process(pid).await;
+    let _ = child.wait().await;
+    let _ = common::delete_snapshot(&snap_tag).await;
+
+    let (before, after) = outcome?;
+    println!("zero-page guest pages: {before} before the snapshot, {after} after");
+    assert!(
+        after <= before,
+        "snapshot create mapped {} never-written guest pages of the source to the \
+         zero page ({before} before, {after} after); the resumed guest's first write \
+         to each is a copy-on-write that unmaps every shadow stage-2 (fcvm#1264)",
+        after - before
+    );
+    Ok(())
+}
