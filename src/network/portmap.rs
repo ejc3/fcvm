@@ -339,44 +339,39 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
 /// The list-then-delete sequence runs under the host-level `bridged-nat.lock`,
 /// serializing it against `ensure_global_nat()` in concurrently starting fcvm
 /// processes so this never deletes a MASQUERADE rule another VM just confirmed.
-pub async fn cleanup_global_nat_if_unused() {
+pub async fn cleanup_global_nat_if_unused() -> Result<()> {
     // Serialize against ensure_global_nat() in other fcvm processes.
-    let _nat_lock = match super::acquire_host_network_lock("bridged-nat.lock").await {
-        Ok(lock) => lock,
-        Err(e) => {
-            warn!(error = %e, "failed to acquire bridged NAT lock, leaving global NAT rules in place");
-            return;
-        }
-    };
+    let _nat_lock = super::acquire_host_network_lock("bridged-nat.lock")
+        .await
+        .context("acquiring the bridged NAT lock; global NAT rules left in place")?;
 
     // Check if any veth0- interfaces exist (active bridged VMs)
-    let output = match Command::new("ip")
+    let output = Command::new("ip")
         .args(["-o", "link", "show"])
         .output()
         .await
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return, // Can't check — leave rules in place
-    };
+        .context("listing interfaces to see whether bridged VMs remain")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "`ip -o link show` failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     if stdout.lines().any(|line| line.contains("veth0-")) {
         debug!("other bridged VMs still running, keeping global NAT rules");
-        return;
+        return Ok(());
     }
 
     info!("no bridged VMs running, cleaning up global NAT rules");
 
     // Detect outbound interface for MASQUERADE rule deletion
-    let outbound_iface = match detect_default_interface().await {
-        Ok(iface) => iface,
-        Err(e) => {
-            warn!(error = %e, "failed to detect default interface for NAT cleanup");
-            return;
-        }
-    };
+    let outbound_iface = detect_default_interface()
+        .await
+        .context("detecting the default interface for NAT cleanup")?;
 
     // Remove the fcvm-tagged MASQUERADE rules for both subnets
+    let mut failures = Vec::new();
     for subnet in &["172.30.0.0/16", "10.0.0.0/8"] {
         let output = Command::new("iptables")
             .args([
@@ -409,12 +404,10 @@ pub async fn cleanup_global_nat_if_unused() {
                     && !stderr.contains("No chain")
                     && !stderr.contains("Bad rule")
                 {
-                    warn!(subnet = %subnet, error = %stderr, "failed to remove MASQUERADE rule");
+                    failures.push(format!("{subnet}: {}", stderr.trim()));
                 }
             }
-            Err(e) => {
-                warn!(subnet = %subnet, error = %e, "failed to run iptables for NAT cleanup");
-            }
+            Err(e) => failures.push(format!("{subnet}: {e}")),
         }
     }
 
@@ -423,7 +416,13 @@ pub async fn cleanup_global_nat_if_unused() {
     // IP forwarding being enabled. Since we can't know whether fcvm was the one
     // that enabled it, the safe default is to leave it on.
 
+    anyhow::ensure!(
+        failures.is_empty(),
+        "removing the shared MASQUERADE rules failed: {}",
+        failures.join("; ")
+    );
     debug!("global NAT cleanup complete");
+    Ok(())
 }
 
 /// Detects the default network interface for outbound traffic

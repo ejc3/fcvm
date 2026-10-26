@@ -439,7 +439,9 @@ impl Inner {
                 self.id
             );
         }
-        if state.resources.contains(&resource) {
+        // Two published ports can append one rule twice (the same guest port), and each
+        // copy needs its own delete.
+        if !matches!(resource, Resource::Rule { .. }) && state.resources.contains(&resource) {
             return Ok(());
         }
         state.resources.push(resource);
@@ -458,7 +460,10 @@ impl Inner {
             }
             std::mem::take(&mut state.resources)
         };
-        let remaining = undo_all(&self.id, resources, true).await;
+        let remaining = undo_all(&self.id, resources, true, |list| {
+            write_record(&self.dir, &self.id, list)
+        })
+        .await;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.completed = true;
         let lock = state
@@ -507,12 +512,23 @@ pub fn forget(id: &str, matches: impl Fn(&Resource) -> bool) -> Result<()> {
         return Ok(());
     };
     let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
-    let before = state.resources.len();
-    state.resources.retain(|resource| !matches(resource));
-    if state.resources.len() == before || state.completed {
+    if state.completed {
         return Ok(());
     }
-    write_record(&inner.dir, &inner.id, &state.resources)
+    let kept: Vec<Resource> = state
+        .resources
+        .iter()
+        .filter(|resource| !matches(resource))
+        .cloned()
+        .collect();
+    if kept.len() == state.resources.len() {
+        return Ok(());
+    }
+    // On disk first: until the write lands the objects are still recorded there, and
+    // the caller must not delete them.
+    write_record(&inner.dir, &inner.id, &kept)?;
+    state.resources = kept;
+    Ok(())
 }
 
 /// End the owner registered under `id`: undo every resource still
@@ -533,16 +549,60 @@ pub(crate) enum Undo {
 
 /// Undo `resources` newest first, returning the ones that stay. `same_boot` is false for
 /// a record written before the last reboot, whose kernel objects are gone.
-async fn undo_all(id: &str, resources: Vec<Resource>, same_boot: bool) -> Vec<(Resource, String)> {
-    let mut remaining = Vec::new();
-    for resource in resources.into_iter().rev() {
-        if resource.is_kernel_object() && !same_boot {
+///
+/// A kernel object's name can be another VM's once the object is deleted, so its record
+/// is rewritten without it (`persist`) before it is deleted: a kill in between leaks the
+/// object instead of leaving a record that would delete a namesake. When one cannot be
+/// deleted, the older kernel objects stay as well, because they are what keeps its names
+/// and addresses this owner's (the namespace and the veth outlive the rules that name
+/// them).
+async fn undo_all(
+    id: &str,
+    resources: Vec<Resource>,
+    same_boot: bool,
+    persist: impl Fn(&[Resource]) -> Result<()>,
+) -> Vec<(Resource, String)> {
+    let mut pending = resources;
+    // Newest first.
+    let mut remaining: Vec<(Resource, String)> = Vec::new();
+    let mut hold_kernel: Option<String> = None;
+    let record = |pending: &[Resource], remaining: &[(Resource, String)]| -> Vec<Resource> {
+        pending
+            .iter()
+            .cloned()
+            .chain(remaining.iter().rev().map(|(r, _)| r.clone()))
+            .collect()
+    };
+    while let Some(resource) = pending.pop() {
+        if !resource.is_kernel_object() {
+            match undo(&resource).await {
+                Undo::Done => debug!(owner = %id, %resource, "undone"),
+                Undo::Kept(why) => remaining.push((resource, why)),
+            }
+            continue;
+        }
+        if !same_boot {
             debug!(owner = %id, %resource, "recorded before the last boot; gone with it");
+            continue;
+        }
+        if let Some(why) = &hold_kernel {
+            remaining.push((resource, why.clone()));
+            continue;
+        }
+        if let Err(error) = persist(&record(&pending, &remaining)) {
+            let why = format!("its record could not be retired first: {error:#}");
+            hold_kernel = Some(why.clone());
+            remaining.push((resource, why));
             continue;
         }
         match undo(&resource).await {
             Undo::Done => debug!(owner = %id, %resource, "undone"),
-            Undo::Kept(why) => remaining.push((resource, why)),
+            Undo::Kept(why) => {
+                hold_kernel = Some(format!("{resource} could not be removed"));
+                remaining.push((resource, why));
+                // Still this owner's: record it again.
+                let _ = persist(&record(&pending, &remaining));
+            }
         }
     }
     remaining.reverse();
@@ -563,8 +623,7 @@ async fn undo(resource: &Resource) -> Undo {
             undo_result(crate::network::veth::delete_host_route_to_guest(guest_ip, via).await)
         }
         Resource::GlobalNat => {
-            crate::network::portmap::cleanup_global_nat_if_unused().await;
-            Undo::Done
+            undo_result(crate::network::portmap::cleanup_global_nat_if_unused().await)
         }
         Resource::RoutedAddress {
             address,
@@ -789,7 +848,10 @@ pub async fn reclaim_abandoned_in(dir: &Path) -> Reclaimed {
         };
         let total = record.resources.len();
         let same_boot = record.boot_id == boot_id();
-        let remaining = undo_all(&id, record.resources, same_boot).await;
+        let remaining = undo_all(&id, record.resources, same_boot, |list| {
+            write_record(dir, &id, list)
+        })
+        .await;
         done.resources += total - remaining.len();
         if remaining.is_empty() {
             match delete_owner_files(dir, &id, lock) {
@@ -1169,8 +1231,10 @@ mod tests {
             pid: 1,
             boot_id: "a-boot-before-this-one".into(),
             resources: vec![
-                Resource::Netns {
-                    name: "fcvm-vm-before-reboot".into(),
+                // Its undo cannot run, so a pass that acted on it would keep it.
+                Resource::Rule {
+                    program: "/nonexistent/iptables".into(),
+                    args: vec!["-A".into(), "FORWARD".into()],
                 },
                 Resource::Temp { path: temp.clone() },
             ],
@@ -1190,5 +1254,89 @@ mod tests {
         );
         assert!(!temp.exists());
         assert!(files_in(&dir).is_empty());
+    }
+
+    fn rule(program: &str, chain: &str) -> Resource {
+        Resource::Rule {
+            program: program.into(),
+            args: vec!["-A".into(), chain.into()],
+        }
+    }
+
+    /// A kernel object's record is rewritten without it before it is deleted, so a pass
+    /// killed in between leaks it instead of later deleting a namesake.
+    #[tokio::test]
+    async fn a_kernel_object_is_retired_from_the_record_before_it_is_deleted() {
+        let temp = PathBuf::from("/nonexistent/reclaim-test.tmp");
+        let persisted = std::sync::Mutex::new(Vec::new());
+        let remaining = undo_all(
+            "vm-retire",
+            vec![
+                Resource::Temp { path: temp.clone() },
+                rule("true", "FORWARD"),
+            ],
+            true,
+            |list| {
+                persisted.lock().unwrap().push(list.to_vec());
+                Ok(())
+            },
+        )
+        .await;
+        assert!(remaining.is_empty());
+        assert_eq!(
+            persisted.into_inner().unwrap(),
+            [vec![Resource::Temp { path: temp }]],
+            "the rule was not retired before its delete"
+        );
+    }
+
+    /// A kernel object that cannot be removed keeps the older ones that hold its names.
+    #[tokio::test]
+    async fn an_object_that_cannot_be_removed_keeps_the_ones_recorded_before_it() {
+        let veth = Resource::Link {
+            name: "veth0-vm-reclm0".into(),
+        };
+        let stuck = rule("/nonexistent/iptables", "FORWARD");
+        let remaining = undo_all("vm-stuck", vec![veth.clone(), stuck.clone()], true, |_| {
+            Ok(())
+        })
+        .await;
+        let remaining: Vec<Resource> = remaining.into_iter().map(|(r, _)| r).collect();
+        assert_eq!(remaining, [veth, stuck]);
+    }
+
+    /// Two published ports with one guest port append the same rule twice; each copy is
+    /// recorded, so each gets a delete.
+    #[tokio::test]
+    async fn a_rule_recorded_twice_is_kept_twice() {
+        let (_root, dir) = test_dir();
+        let owner = Owner::begin_in(&dir, "vm-twice").unwrap();
+        let twice = rule("iptables", "FORWARD");
+        owner.record(twice.clone()).unwrap();
+        owner.record(twice.clone()).unwrap();
+        let record: Record =
+            serde_json::from_slice(&std::fs::read(dir.join("vm-twice.json")).unwrap()).unwrap();
+        assert_eq!(record.resources, [twice.clone(), twice]);
+        drop(owner);
+    }
+
+    /// A forget whose write fails changes nothing, so the caller keeps the objects.
+    #[tokio::test]
+    async fn a_failed_forget_keeps_the_records() {
+        let (_root, dir) = test_dir();
+        let owner = Owner::begin_in(&dir, "vm-forget-fails").unwrap();
+        let netns = Resource::Netns {
+            name: "fcvm-vm-ffails".into(),
+        };
+        owner.record(netns.clone()).unwrap();
+        // A directory in the record's place makes the rename onto it fail, as root too.
+        let record = dir.join("vm-forget-fails.json");
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir_all(record.join("blocker")).unwrap();
+        assert!(forget("vm-forget-fails", Resource::is_network).is_err());
+        let state = owner.inner.state.lock().unwrap();
+        assert_eq!(state.resources, [netns]);
+        drop(state);
+        drop(owner);
     }
 }

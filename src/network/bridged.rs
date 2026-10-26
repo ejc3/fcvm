@@ -713,46 +713,61 @@ impl NetworkManager for BridgedNetwork {
 
         // Step 3: Delete FORWARD rule and veth pair. With the veth gone its address, and
         // the rules and routes that name it, can be another VM's, so this VM's records of
-        // them go first (crate::reclaim). A kill from here on leaks what is left.
-        if let Err(e) = crate::reclaim::forget(&self.vm_id, |r| {
+        // them go first (crate::reclaim). If they cannot be dropped, the objects stay,
+        // still recorded, and the next launch removes them. A kill from here on leaks
+        // what is left.
+        let forgotten = crate::reclaim::forget(&self.vm_id, |r| {
             r.is_network()
                 && !matches!(
                     r,
                     crate::reclaim::Resource::Netns { .. } | crate::reclaim::Resource::GlobalNat
                 )
-        }) {
-            errors.push(format!("dropping network records: {e:#}"));
-        }
-        if let Some(ref host_veth) = self.host_veth {
-            if let Err(e) = veth::delete_veth_forward_rule(host_veth).await {
-                warn!(vm_id = %self.vm_id, error = %e, "failed to delete forward rule");
-                errors.push(format!("forward rule: {}", e));
+        });
+        if let Err(e) = forgotten {
+            errors.push(format!(
+                "dropping network records, so the veth and namespace stay for the next launch: {e:#}"
+            ));
+        } else {
+            if let Some(ref host_veth) = self.host_veth {
+                if let Err(e) = veth::delete_veth_forward_rule(host_veth).await {
+                    warn!(vm_id = %self.vm_id, error = %e, "failed to delete forward rule");
+                    errors.push(format!("forward rule: {}", e));
+                }
+                if let Err(e) = veth::delete_veth_pair(host_veth).await {
+                    warn!(vm_id = %self.vm_id, error = %e, "failed to delete veth pair");
+                    errors.push(format!("veth pair: {}", e));
+                }
             }
-            if let Err(e) = veth::delete_veth_pair(host_veth).await {
-                warn!(vm_id = %self.vm_id, error = %e, "failed to delete veth pair");
-                errors.push(format!("veth pair: {}", e));
+
+            // Step 4: Delete network namespace
+            match crate::reclaim::forget(&self.vm_id, |r| {
+                matches!(r, crate::reclaim::Resource::Netns { .. })
+            }) {
+                Err(e) => errors.push(format!(
+                    "dropping the namespace record, so it stays for the next launch: {e:#}"
+                )),
+                Ok(()) => {
+                    if let Some(ref namespace_id) = self.namespace_id {
+                        if let Err(e) = namespace::delete_namespace(namespace_id).await {
+                            warn!(vm_id = %self.vm_id, error = %e, "failed to delete namespace");
+                            errors.push(format!("namespace: {}", e));
+                        }
+                    }
+                }
             }
         }
 
-        // Step 4: Delete network namespace
-        if let Err(e) = crate::reclaim::forget(&self.vm_id, |r| {
-            matches!(r, crate::reclaim::Resource::Netns { .. })
-        }) {
-            errors.push(format!("dropping the namespace record: {e:#}"));
-        }
-        if let Some(ref namespace_id) = self.namespace_id {
-            if let Err(e) = namespace::delete_namespace(namespace_id).await {
-                warn!(vm_id = %self.vm_id, error = %e, "failed to delete namespace");
-                errors.push(format!("namespace: {}", e));
+        // Step 5: Remove global NAT rules if no other bridged VMs are running. A failure
+        // leaves the record, so the next launch tries again.
+        match portmap::cleanup_global_nat_if_unused().await {
+            Ok(()) => {
+                if let Err(e) = crate::reclaim::forget(&self.vm_id, |r| {
+                    matches!(r, crate::reclaim::Resource::GlobalNat)
+                }) {
+                    errors.push(format!("dropping the shared NAT record: {e:#}"));
+                }
             }
-        }
-
-        // Step 5: Remove global NAT rules if no other bridged VMs are running
-        portmap::cleanup_global_nat_if_unused().await;
-        if let Err(e) = crate::reclaim::forget(&self.vm_id, |r| {
-            matches!(r, crate::reclaim::Resource::GlobalNat)
-        }) {
-            errors.push(format!("dropping the shared NAT record: {e:#}"));
+            Err(e) => warn!(vm_id = %self.vm_id, error = %format!("{e:#}"), "global NAT cleanup"),
         }
 
         if errors.is_empty() {

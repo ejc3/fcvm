@@ -1373,11 +1373,16 @@ impl NetworkManager for RoutedNetwork {
         }
         // Delete veth pair (auto-deletes peer, and with it any route through it). Its
         // name, and the address once the lease goes, can be another VM's from here on,
-        // so the records go first (crate::reclaim).
+        // so the records go first (crate::reclaim). If they cannot be dropped, the veth
+        // and the namespace stay, still recorded, and the next launch removes them.
         if let Err(e) = crate::reclaim::forget(&self.vm_id, |r| {
             r.is_network() && !matches!(r, crate::reclaim::Resource::Netns { .. })
         }) {
-            warn!(error = %format!("{e:#}"), "dropping the records of the routed network");
+            self.address_lease.take();
+            anyhow::bail!(
+                "dropping the records of the routed network, so its veth and namespace stay \
+                 for the next launch: {e:#}"
+            );
         }
         if let Some(ref host_veth) = self.host_veth {
             if let Err(e) = veth::delete_veth_pair(host_veth).await {
@@ -1391,7 +1396,10 @@ impl NetworkManager for RoutedNetwork {
         if let Err(e) = crate::reclaim::forget(&self.vm_id, |r| {
             matches!(r, crate::reclaim::Resource::Netns { .. })
         }) {
-            warn!(error = %format!("{e:#}"), "dropping the record of the routed namespace");
+            anyhow::bail!(
+                "dropping the record of the routed namespace, so it stays for the next launch: \
+                 {e:#}"
+            );
         }
         if let Some(ref ns_name) = self.namespace_id {
             if let Err(e) = namespace::delete_namespace(ns_name).await {

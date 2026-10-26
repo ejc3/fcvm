@@ -459,6 +459,16 @@ fn command_output(program: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// The /30 peer of a bridged veth's host-end address (`.1` to `.2`).
+#[cfg(feature = "privileged-tests")]
+fn peer_of(host_ip: &str) -> String {
+    let (prefix, last) = host_ip.rsplit_once('.').expect("an IPv4 address");
+    format!(
+        "{prefix}.{}",
+        last.parse::<u8>().expect("an IPv4 address") + 1
+    )
+}
+
 #[cfg(feature = "privileged-tests")]
 /// The host objects of one bridged VM, read from its state.
 #[derive(Debug)]
@@ -488,9 +498,7 @@ impl BridgedObjects {
             .with_context(|| format!("unexpected host veth {host_veth}"))?;
         let route = if clone {
             // The namespace end of a clone's veth is the host end's /30 peer.
-            let (prefix, last) = host_ip.rsplit_once('.').context("host_ip")?;
-            let via = format!("{prefix}.{}", last.parse::<u8>()? + 1);
-            Some((field("guest_ip")?, via))
+            Some((field("guest_ip")?, peer_of(&host_ip)))
         } else {
             None
         };
@@ -514,10 +522,16 @@ impl BridgedObjects {
         let rules = command_output("iptables-save", &[])?;
         for rule in rules.lines() {
             // Token-exact, so that 172.30.0.1 does not match 172.30.0.13.
+            // The host end's address and its /30 peer: the guest of a baseline and the
+            // namespace end of a clone's veth, which the published ports target.
+            let peer = peer_of(&self.host_ip);
             let named = rule.split_whitespace().any(|token| {
                 token == self.host_veth
-                    || token == self.host_ip
-                    || token == format!("{}/32", self.host_ip)
+                    || [&self.host_ip, &peer].into_iter().any(|ip| {
+                        token == ip.as_str()
+                            || token == format!("{ip}/32")
+                            || token.starts_with(&format!("{ip}:"))
+                    })
             });
             if named {
                 present.push(format!("rule {rule}"));
@@ -539,8 +553,12 @@ impl BridgedObjects {
 #[tokio::test]
 async fn a_sigkilled_bridged_vm_leaves_its_network_to_the_next_launch() -> Result<()> {
     let (name, clone_name, snapshot, _) = common::unique_names("reclaim-bridged");
+    // Two host ports on one guest port: their MASQUERADE and FORWARD rules are the
+    // same rule twice.
     let port = common::find_available_high_port()?;
     let publish = format!("{port}:80");
+    let second_port = common::find_available_port(port + 1, 1000)?;
+    let second_publish = format!("{second_port}:80");
     let (mut baseline, baseline_pid) = common::spawn_fcvm(&[
         "podman",
         "run",
@@ -551,6 +569,8 @@ async fn a_sigkilled_bridged_vm_leaves_its_network_to_the_next_launch() -> Resul
         "--no-snapshot",
         "--publish",
         &publish,
+        "--publish",
+        &second_publish,
         common::TEST_IMAGE,
     ])
     .await?;
