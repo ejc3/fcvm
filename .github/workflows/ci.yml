@@ -21,12 +21,14 @@ on:
   # reported it CLEAN (PR #785 was mechanically mergeable that way). The
   # expensive matrix is skipped per-job via the `changes` job below instead, so
   # every PR still gets exactly one `Summary` check and it can be required.
+  # `closed` starts a run that tests nothing: it joins the PR's concurrency group, which
+  # cancels the PR's queued and running jobs, so a merged or closed PR stops using runners.
   # `ready_for_review` is listed so marking a draft ready starts a run: the draft's own
   # runs may have been cancelled, superseded or never started, and the flip is the
   # point at which the PR is offered for review. Listing types replaces the default
   # set, so the defaults (opened, synchronize, reopened) are listed too.
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, closed]
   push:
     branches: [main]
     paths-ignore:
@@ -88,6 +90,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR: ${{ github.event.number }}
           REPO: ${{ github.repository }}
+          ACTION: ${{ github.event.action }}
           DRAFT: ${{ github.event.pull_request.draft }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}

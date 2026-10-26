@@ -100,6 +100,12 @@ class PrScope(Harness):
         self.assertEqual(self.flags(outputs), dict(run='true', code='true', bench='true', fleet='true', web='true'))
         self.assertEqual(calls, [])
 
+    def test_a_closed_pr_runs_nothing_and_asks_nothing(self):
+        outputs, calls, _ = self.scope({}, ACTION='closed')
+        self.assertEqual(self.flags(outputs), dict(run='false', code='false', bench='false', fleet='false', web='false'))
+        self.assertIn('closed', outputs['reason'])
+        self.assertEqual(calls, [])
+
     def test_a_draft_runs_nothing_and_asks_nothing(self):
         outputs, calls, _ = self.scope({}, DRAFT='true')
         self.assertEqual(self.flags(outputs), dict(run='false', code='false', bench='false', fleet='false', web='false'))
