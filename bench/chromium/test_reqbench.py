@@ -6602,6 +6602,15 @@ if os.environ.get("STUB_UNADDRESSED") == "1":
                 "path": raw, "status": 404, "bytes": 0, "duration_ms": 0.2}
         with open(os.environ["STUB_ACCESS_LOG"], "a") as log:
             log.write(json.dumps(line) + "\n")
+# STUB_CANCELED=1: the page cancelled a request before the browser gave it
+# network timing (ERR_ABORTED, no address, no timing). STUB_CANCELED=timed:
+# the same, but the request had already started connecting.
+if os.environ.get("STUB_CANCELED"):
+    rows.append({"request_id": "r8", "url": url + "frame.html", "remote_ip": "",
+                 "status": None, "failed": True, "canceled": True, "pending_at_load": False,
+                 "error_text": "net::ERR_ABORTED", "from_cache": False,
+                 "from_service_worker": False,
+                 "timing": ({"connect_start": 1.0} if os.environ["STUB_CANCELED"] == "timed" else None)})
 if os.environ.get("STUB_CACHED") == "1":
     rows.append({"request_id": "r6", "url": url + "logo.png", "remote_ip": "",
                  "status": 200, "failed": False, "pending_at_load": False,
@@ -6915,6 +6924,28 @@ exec __PYTHON__ "$@"
             result = self._diag(env)
             self.assertEqual(result.returncode, 0, result.stdout)
             self.assertIs(self._diag_summary(env)["passed"], True)
+
+    def test_a_request_the_page_cancelled_before_any_network_timing_is_not_an_escape(self):
+        """Chromium 156 renders www.elmundo.es with an iframe document request
+        that the page cancels 3 ms after it starts (net::ERR_ABORTED, no
+        address, timing null). It failed 3 of 5 corpus diags on 2026-10-26 as
+        'no_remote_ip' although it never left the browser.
+
+        RED BEFORE THE CHANGE: the untimed cancelled row failed the diag with
+        one no_remote_ip violation. A cancelled request that had started
+        connecting still fails it (the second half).
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", STUB_CANCELED="1")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr[-2000:])
+            self.assertIs(self._diag_summary(env)["passed"], True)
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", STUB_CANCELED="timed")
+            result = self._diag(env)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            summary = self._diag_summary(env)
+            self.assertEqual({v["kind"] for v in summary["violations"]}, {"no_remote_ip"})
 
     def test_a_load_event_over_the_limit_is_a_stall_and_no_limit_is_no_gate(self):
         with tempfile.TemporaryDirectory() as d:
