@@ -1519,12 +1519,14 @@ async fn prepare_vm_for_lifecycle(
         let profile_name = args.kernel_profile.as_deref().unwrap_or("default");
         let module_type = crate::setup::profile_module_type(profile_name)?;
         for sbdf in &args.gpu {
-            crate::gpu::check_host_device(
+            // The lease is released at once: this VM cold-boots without the GPU,
+            // and the restore that attaches it takes its own lease and checks again.
+            drop(crate::gpu::check_host_device(
                 Path::new("/sys"),
                 Path::new("/dev"),
                 &crate::gpu::scrub::state_dir(),
                 sbdf,
-            )?;
+            )?);
             crate::gpu::check_driver_supports_device(
                 Path::new("/sys"),
                 sbdf,

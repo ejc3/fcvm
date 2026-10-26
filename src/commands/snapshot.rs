@@ -2217,6 +2217,10 @@ async fn cmd_snapshot_run_inner(
     // --gpu devices are attached by the snapshot load. The host side is checked before
     // any side effects, so a host that is not ready fails with what to fix.
     let gpus = crate::gpu::canonical_sbdfs(&args.gpu)?;
+    // The VM's lease on each GPU, taken before its quarantine check and held to the
+    // end of this function, after the clone's VMM is gone: no scrub can start
+    // between the check and the load opening the GPU, or while the clone runs.
+    let mut _gpu_leases = Vec::with_capacity(gpus.len());
     if !gpus.is_empty() {
         anyhow::ensure!(
             snapshot_config.metadata.hypervisor == crate::hypervisor::Backend::Firecracker,
@@ -2228,12 +2232,15 @@ async fn cmd_snapshot_run_inner(
         // clone restores the image recorded in the snapshot, whose module type the
         // current profile does not determine. The guest's attach fails closed instead.
         for sbdf in &gpus {
-            crate::gpu::check_host_device(
-                Path::new("/sys"),
-                Path::new("/dev"),
-                &crate::gpu::scrub::state_dir(),
-                sbdf,
-            )?;
+            _gpu_leases.push(
+                crate::gpu::check_host_device(
+                    Path::new("/sys"),
+                    Path::new("/dev"),
+                    &crate::gpu::scrub::state_dir(),
+                    sbdf,
+                )?
+                .lease,
+            );
         }
     }
     check_parked_gpus(snapshot_config.metadata.parked_gpus, &gpus)?;

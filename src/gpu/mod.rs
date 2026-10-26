@@ -69,13 +69,18 @@ pub fn canonical_sbdfs(addresses: &[String]) -> Result<Vec<String>> {
 /// (normally `/sys` and `/dev`): the device exists, it is bound to vfio-pci (not
 /// to a host driver), it is not quarantined by a failed host scrub (records in
 /// `gpu_state`, normally [`scrub::state_dir`]), and this process can open its
-/// IOMMU group and the VFIO container. Returns the group's device node.
+/// IOMMU group and the VFIO container.
+///
+/// The VM's lease on the GPU ([`scrub::lease_gpu`]) is taken before the
+/// quarantine is read and returned with the group's device node: the caller
+/// holds it until the VM is gone, so no scrub can start between this check and
+/// the VMM opening the group.
 pub fn check_host_device(
     sysfs: &Path,
     dev: &Path,
     gpu_state: &Path,
     sbdf: &str,
-) -> Result<PathBuf> {
+) -> Result<CheckedGpu> {
     let device = sysfs.join("bus/pci/devices").join(sbdf);
     if !device.exists() {
         bail!(
@@ -102,6 +107,7 @@ pub fn check_host_device(
             device.display()
         ),
     }
+    let lease = scrub::lease_gpu(gpu_state, sbdf)?;
     scrub::check_not_quarantined(gpu_state, sbdf)?;
     let group = std::fs::read_link(device.join("iommu_group"))
         .with_context(|| {
@@ -128,7 +134,15 @@ pub fn check_host_device(
                 )
             })?;
     }
-    Ok(group_node)
+    Ok(CheckedGpu { group_node, lease })
+}
+
+/// A GPU that [`check_host_device`] found ready, with the VM's lease on it.
+#[must_use = "the lease protects the GPU only while it is held"]
+#[derive(Debug)]
+pub struct CheckedGpu {
+    pub group_node: PathBuf,
+    pub lease: scrub::GpuLease,
 }
 
 /// Whether these Firecracker arguments turn on the PCI transport.
@@ -341,10 +355,13 @@ mod tests {
             std::fs::write(root.path().join("dev/vfio/vfio"), b"").unwrap();
             std::fs::write(root.path().join("dev/vfio").join(group), b"").unwrap();
         }
+        // The GPU's lock file, as `fcvm gpu scrub` (or the host's boot) leaves it.
+        std::fs::create_dir_all(root.path().join("gpu-state")).unwrap();
+        std::fs::write(root.path().join("gpu-state/0000:01:00.0.lock"), b"").unwrap();
         root
     }
 
-    fn check(root: &tempfile::TempDir) -> Result<PathBuf> {
+    fn check(root: &tempfile::TempDir) -> Result<CheckedGpu> {
         check_host_device(
             &root.path().join("sys"),
             &root.path().join("dev"),
@@ -369,10 +386,67 @@ mod tests {
         assert!(check(&root).is_ok());
     }
 
+    /// The check takes the VM's lease before it reads the quarantine and hands
+    /// it to the caller: while the caller holds it, a scrub cannot lock the GPU.
+    #[test]
+    fn the_check_returns_the_vms_lease_on_the_gpu() {
+        use fs2::FileExt as _;
+        let root = fixture(Some("vfio-pci"), Some("7"));
+        let lock_file = root.path().join("gpu-state/0000:01:00.0.lock");
+        let scrub_lock = || {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&lock_file)
+                .unwrap();
+            file.try_lock_exclusive().map(|()| file)
+        };
+        let checked = check(&root).unwrap();
+        assert!(
+            scrub_lock().is_err(),
+            "a scrub could lock the GPU while a checked VM held it"
+        );
+        drop(checked);
+        scrub_lock().expect("the lease outlived the check's result");
+        let code = include_str!("mod.rs").split("#[cfg(test)]").next().unwrap();
+        let body = &code[code.find("pub fn check_host_device(").unwrap()..];
+        let lease = body
+            .find("scrub::lease_gpu(")
+            .expect("the check takes no lease");
+        let quarantine = body.find("scrub::check_not_quarantined(").unwrap();
+        assert!(
+            lease < quarantine,
+            "the lease is taken after the quarantine check"
+        );
+    }
+
+    /// `snapshot run --gpu`, the restore that attaches the GPU, keeps every
+    /// lease to the end of the run, after the clone's VMM has been torn down.
+    #[test]
+    fn snapshot_run_holds_the_leases_until_the_vm_is_gone() {
+        let code = include_str!("../commands/snapshot.rs");
+        let body = &code[code.find("async fn cmd_snapshot_run_inner(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let bound = body
+            .find("let mut _gpu_leases = Vec::with_capacity(gpus.len());")
+            .expect("the leases are not bound in cmd_snapshot_run_inner's own scope");
+        let pushed = body.find("_gpu_leases.push(").expect("leases are not kept");
+        let cleanup = body
+            .find("super::common::cleanup_vm(")
+            .expect("no VM cleanup in cmd_snapshot_run_inner");
+        assert!(bound < pushed && pushed < cleanup);
+        assert!(
+            !body.contains("drop(_gpu_leases)"),
+            "the leases are dropped before the function ends"
+        );
+    }
+
     #[test]
     fn a_device_bound_to_vfio_pci_is_ready() {
         let root = fixture(Some("vfio-pci"), Some("7"));
-        assert_eq!(check(&root).unwrap(), root.path().join("dev/vfio/7"));
+        assert_eq!(
+            check(&root).unwrap().group_node,
+            root.path().join("dev/vfio/7")
+        );
     }
 
     #[test]
