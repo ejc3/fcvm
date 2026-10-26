@@ -32,12 +32,78 @@ pub struct Agent {
     pub spot_notice_url: Option<String>,
     /// How often the spot notice URL is polled.
     pub spot_poll: Duration,
-    /// Run an aggregator for this host's band on this port, with this command
-    /// (`fcvm fleet aggregate ...`; `--listen` is added).
-    pub aggregate: Option<(u16, Vec<String>)>,
+    /// Run an aggregator for this host's band.
+    pub aggregate: Option<AggregateCfg>,
     /// A file the host's boot writes once its store is mounted; its modification time is
     /// reported in the hello.
     pub store_ready_file: Option<std::path::PathBuf>,
+    /// The host's boot times, sent in every hello ([`boot_times`]).
+    pub boot: BTreeMap<String, u64>,
+}
+
+/// The host's aggregator.
+#[derive(Debug, Clone)]
+pub struct AggregateCfg {
+    /// Its private listener (`--listen <publish ip>:<port>`): the layout, the stats, and the
+    /// stream for host-local readers.
+    pub port: u16,
+    /// The command (`fcvm fleet aggregate ...`; `--listen` and the TLS arguments are added).
+    pub argv: Vec<String>,
+    /// Serving browsers with TLS.
+    pub public: Option<AggregatePublic>,
+}
+
+/// Where the aggregator serves browsers, and what the agent reports of it.
+#[derive(Debug, Clone)]
+pub struct AggregatePublic {
+    /// The certificate file (the renderers' `tls.json`).
+    pub tls_file: std::path::PathBuf,
+    /// The IPv4 port, on the publish address.
+    pub v4_port: u16,
+    /// The host's public IPv4 address, reported with `v4_port`.
+    pub ipv4: Option<String>,
+    /// Its own IPv6 address, served on 443 (the host must hold it).
+    pub ipv6: Option<std::net::Ipv6Addr>,
+}
+
+impl AggregateCfg {
+    /// The aggregator's command with its listeners.
+    pub fn command(&self, publish_ip: &str) -> (Vec<String>, String) {
+        let listen = format!("{}:{}", bracket(publish_ip), self.port);
+        let mut argv = self.argv.clone();
+        if let Some(p) = &self.public {
+            argv.push("--tls-file".into());
+            argv.push(p.tls_file.to_string_lossy().into_owned());
+            argv.push("--tls-listen".into());
+            argv.push(format!("{}:{}", bracket(publish_ip), p.v4_port));
+            if let Some(a) = p.ipv6 {
+                argv.push("--tls-listen".into());
+                argv.push(format!("[{a}]:{}", tls::PORT));
+            }
+        }
+        (argv, listen)
+    }
+
+    /// The message that reports it serving.
+    pub fn report(&self, frame_url: String) -> AgentMsg {
+        let p = self.public.as_ref();
+        let ipv4 = p.and_then(|p| p.ipv4.clone());
+        AgentMsg::Aggregate {
+            frame_url,
+            ipv6: p.and_then(|p| p.ipv6).map(|a| a.to_string()),
+            v4_port: ipv4.as_ref().and(p.map(|p| p.v4_port)),
+            ipv4,
+        }
+    }
+}
+
+/// An IPv6 literal in brackets, for `<address>:<port>`.
+fn bracket(ip: &str) -> String {
+    if ip.contains(':') && !ip.starts_with('[') {
+        format!("[{ip}]")
+    } else {
+        ip.to_string()
+    }
 }
 
 /// The modification time of `path` in Unix milliseconds, if it exists.
@@ -46,7 +112,50 @@ fn mtime_ms(path: &std::path::Path) -> Option<u64> {
     Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64)
 }
 
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The host's boot times for the hello (`AgentMsg::Hello::boot`), Unix milliseconds:
+/// `kernel_started_at` from `uptime` (the first field of `/proc/uptime`) read at `now`,
+/// `agent_started_at`, and every `*_at` number in the store-ready file, a JSON object the
+/// host's store unit writes (`fleet/ami/host/store.sh`: `store_started_at`,
+/// `store_mounted_at`). A file that is not such an object adds nothing.
+pub fn boot_times(
+    uptime: Option<&str>,
+    now: u64,
+    agent_started_at: u64,
+    store_ready: Option<&str>,
+) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    if let Some(up) = uptime
+        .and_then(|u| u.split_whitespace().next())
+        .and_then(|u| u.parse::<f64>().ok())
+        .filter(|u| u.is_finite() && *u >= 0.0)
+    {
+        out.insert(
+            "kernel_started_at".into(),
+            now.saturating_sub((up * 1000.0) as u64),
+        );
+    }
+    out.insert("agent_started_at".into(), agent_started_at);
+    if let Some(serde_json::Value::Object(o)) =
+        store_ready.and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+    {
+        for (k, v) in o {
+            if let (true, Some(t)) = (k.ends_with("_at"), v.as_u64()) {
+                out.insert(k, t);
+            }
+        }
+    }
+    out
+}
+
 pub async fn run(args: FleetAgentArgs) -> Result<()> {
+    let started_at = unix_ms();
     let host = match args.host {
         Some(h) => h,
         None if args.host_from_imds => crate::fleet::coord::aws::imds("instance-id")
@@ -107,10 +216,10 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             image: args.image,
             extra_args: fcvm_args,
             frame_host: args.frame_host.unwrap_or_else(|| args.publish_ip.clone()),
-            ipv6_prefix,
+            ipv6_prefix: ipv6_prefix.clone(),
             frame_zone: args.frame_zone,
             tls_publish_base: args.tls_publish_base,
-            public_ipv4,
+            public_ipv4: public_ipv4.clone(),
             publish_ip: args.publish_ip,
             sysfs_root: args.sysfs_root,
             start_timeout: Duration::from_secs(args.start_timeout_secs),
@@ -127,7 +236,16 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
         spot_notice_url: args.spot_notice_url,
         spot_poll: Duration::from_secs(5),
         store_ready_file: args.store_ready_file.clone(),
-        aggregate: args.aggregate_port.map(|p| {
+        boot: boot_times(
+            std::fs::read_to_string("/proc/uptime").ok().as_deref(),
+            unix_ms(),
+            started_at,
+            args.store_ready_file
+                .as_deref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .as_deref(),
+        ),
+        aggregate: args.aggregate_port.map(|port| {
             let mut argv = vec![
                 std::env::current_exe()
                     .map(|e| e.to_string_lossy().into_owned())
@@ -136,9 +254,27 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
                 "aggregate".into(),
             ];
             argv.extend(args.aggregate_args.iter().cloned());
-            (p, argv)
+            AggregateCfg {
+                port,
+                argv,
+                public: args.aggregate_tls_port.map(|v4_port| AggregatePublic {
+                    tls_file: args.tls_dir.join(tls::FILE),
+                    v4_port,
+                    ipv4: public_ipv4.clone(),
+                    ipv6: ipv6_prefix.as_ref().map(addr::Prefix::aggregator_address),
+                }),
+            }
         }),
     };
+    // The aggregator listens on its own IPv6 address, so the host must hold it first.
+    if let Some(a) = agent
+        .aggregate
+        .as_ref()
+        .and_then(|a| a.public.as_ref())
+        .and_then(|p| p.ipv6)
+    {
+        addr::add_host_address(a).await?;
+    }
     let Some(url) = args.dial else {
         return serve(agent, tokio::io::stdin(), tokio::io::stdout()).await;
     };
@@ -224,6 +360,7 @@ where
         gpus: agent.gpus.clone(),
         capacity: agent.capacity,
         store_ready_at: agent.store_ready_file.as_deref().and_then(mtime_ms),
+        boot: agent.boot.clone(),
     })
     .ok();
     let http = reqwest::Client::builder()
@@ -248,18 +385,16 @@ where
     let (budget_tx, budget_rx) = watch::channel::<Option<BudgetBody>>(None);
     // The aggregator's layout follows the assignment and the scene.
     let (layout_tx, layout_rx) = watch::channel::<Option<Layout>>(None);
-    let aggregator = agent.aggregate.clone().map(|(port, argv)| {
-        let listen = format!("{}:{port}", cfg.publish_ip);
-        let url = slot::frame_url(&cfg.frame_host, port);
+    let aggregator = agent.aggregate.clone().map(|a| {
+        let (argv, listen) = a.command(&cfg.publish_ip);
+        let report = a.report(slot::frame_url(&cfg.frame_host, a.port));
         let out = out.clone();
         tokio::spawn(crate::fleet::aggregate::child::supervise(
             argv,
             listen,
             layout_rx,
             move || {
-                let _ = out.send(AgentMsg::Aggregate {
-                    frame_url: url.clone(),
-                });
+                let _ = out.send(report.clone());
             },
         ))
     });
@@ -290,6 +425,8 @@ where
             CoordMsg::Budget(b) => {
                 budget_tx.send_replace(Some(b));
             }
+            // The dialing connection keeps the replay (dial.rs); nothing to do here.
+            CoordMsg::QuarantineStored { .. } => {}
             CoordMsg::Assign {
                 slots: list,
                 region: r,

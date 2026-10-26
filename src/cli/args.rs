@@ -110,6 +110,16 @@ pub struct FleetAggregateArgs {
     /// Initial layout (JSON), instead of waiting for POST /layout
     #[arg(long)]
     pub layout: Option<std::path::PathBuf>,
+
+    /// Also serve /frames and /healthz with TLS on this address, for browsers (repeatable).
+    /// /layout and /stats are served on --listen only.
+    #[arg(long = "tls-listen", requires = "tls_file")]
+    pub tls_listen: Vec<String>,
+
+    /// The certificate of --tls-listen: a JSON object {"cert", "key"} (PEM), the file the
+    /// agent writes for its renderers; read again every 2 s
+    #[arg(long, requires = "tls_listen")]
+    pub tls_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -184,13 +194,26 @@ pub struct FleetCoordArgs {
     #[arg(long = "allowed-origin")]
     pub allowed_origins: Vec<String>,
 
-    /// Run the EC2 half's aggregator on this address
-    #[arg(long, requires = "ec2_aggregate_url")]
+    /// Run the EC2 half's aggregator on this address (its layout, stats and a stream for
+    /// the coordinator); browsers reach it at --ec2-aggregate-url, or with
+    /// --ec2-aggregate-tls at its published names
+    #[arg(long)]
     pub ec2_aggregate_listen: Option<String>,
 
     /// The EC2 half's aggregator frame WebSocket as browsers reach it
     #[arg(long, requires = "ec2_aggregate_listen")]
     pub ec2_aggregate_url: Option<String>,
+
+    /// Serve the EC2 half's aggregator to browsers with TLS (the --tls-secret certificate)
+    /// on port 443 of the coordinator task's own addresses, read on ECS (the task metadata
+    /// for IPv6, EC2 DescribeNetworkInterfaces for the public IPv4 address), and name them
+    /// `agg-ec2-<token>` in --dns-subzone
+    #[arg(long, requires_all = ["ec2_aggregate_listen", "tls_secret", "dns_subzone"])]
+    pub ec2_aggregate_tls: bool,
+
+    /// Where the coordinator keeps the certificate file of --ec2-aggregate-tls
+    #[arg(long, default_value = "/run/fcvm-fleet/tls")]
+    pub ec2_aggregate_tls_dir: std::path::PathBuf,
 
     /// Extra argument for the EC2 half's aggregator. Repeatable.
     #[arg(long = "aggregate-arg", allow_hyphen_values = true)]
@@ -237,32 +260,44 @@ pub struct FleetCoordArgs {
     #[arg(long)]
     pub max_borrowed: Option<usize>,
 
-    /// A GPU host auto scaling group the coordinator owns (`<region>:<name>`, repeatable).
-    /// With any, the fleet scales them to 0 after --idle-scale-down seconds with no active
-    /// viewer and back to --awake-capacity when one arrives.
-    #[arg(long = "scale-group")]
-    pub scale_groups: Vec<crate::fleet::coord::scale::Group>,
+    /// A GPU host launch template (`<region>:<name>`, repeatable; several in a region are
+    /// one request's pools). With any, the coordinator launches the GPU hosts itself: spot
+    /// first, on demand at once when spot is refused for capacity, and terminates them after
+    /// --idle-scale-down seconds with no active viewer.
+    #[arg(
+        long = "host-template",
+        env = "FLEET_HOST_TEMPLATES",
+        value_delimiter = ','
+    )]
+    pub host_templates: Vec<crate::fleet::coord::hosts::Regional>,
+
+    /// A subnet GPU hosts may launch in (`<region>:<subnet id>`, repeatable); every region
+    /// with a --host-template needs at least one
+    #[arg(
+        long = "host-subnet",
+        env = "FLEET_HOST_SUBNETS",
+        value_delimiter = ','
+    )]
+    pub host_subnets: Vec<crate::fleet::coord::hosts::Regional>,
 
     /// Sleep with no active viewer (no tiles, every VM stopped) and wake for the next one,
-    /// on hosts the coordinator does not scale (a fixed host, a test box). Implied by any
-    /// --scale-group.
+    /// on hosts the coordinator does not launch (a fixed host, a test box). Implied by any
+    /// --host-template.
     #[arg(long)]
     pub sleep_when_idle: bool,
 
-    /// Desired capacity of each scale group while the fleet is awake
+    /// GPU hosts per region while the fleet is awake
     #[arg(long, default_value_t = 1)]
     pub awake_capacity: u32,
 
-    /// An on-demand GPU host auto scaling group (`<region>:<name>`, repeatable), the
-    /// fallback of the --scale-group in its region. It is 0 unless a wake leaves that spot
-    /// group short of --awake-capacity for --spot-wait seconds; then it takes the shortfall
-    /// and the spot group is held at what it has. Both go to 0 when the fleet sleeps.
-    #[arg(long = "on-demand-group")]
-    pub on_demand_groups: Vec<crate::fleet::coord::scale::Group>,
-
-    /// Seconds a waking spot group may stay short before its on-demand group takes over
-    #[arg(long, default_value_t = 120)]
-    pub spot_wait: u64,
+    /// Most on-demand GPU hosts the fleet runs, all regions together (spot's fallback)
+    #[arg(
+        long,
+        env = "FLEET_HOST_ON_DEMAND_MAX",
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u32).range(0..=8)
+    )]
+    pub host_on_demand_max: u32,
 
     /// Seconds with no active viewer before the fleet scales down
     #[arg(long, default_value_t = 600)]
@@ -288,6 +323,28 @@ pub struct FleetCoordArgs {
     /// An on-demand tile launch template, tried when every region refuses spot capacity
     #[arg(long)]
     pub ec2_on_demand_template: Option<String>,
+
+    /// Keep up to this many EC2 tile instances stopped when the fleet sleeps, and start
+    /// them at the next wake instead of launching (needs --ec2-pool-template)
+    #[arg(long, default_value_t = 0, requires = "ec2_pool_template")]
+    pub ec2_pool: usize,
+
+    /// The tile launch template cold launches use while --ec2-pool is above 0: one whose
+    /// instances can be stopped (persistent spot that stops on interruption, or on demand)
+    #[arg(long)]
+    pub ec2_pool_template: Option<String>,
+
+    /// The subnets (one per AZ) to launch EC2 tiles in, per region, tried in order before
+    /// the next region: `<region>:<subnet>[,<subnet>...]`, repeatable (FLEET_EC2_SUBNETS:
+    /// entries separated by spaces). A region without any launches in the template's subnet.
+    #[arg(long, env = "FLEET_EC2_SUBNETS", value_delimiter = ' ')]
+    pub ec2_subnets: Vec<String>,
+
+    /// The security group of a tile's interface in each region with --ec2-subnets:
+    /// `<region>:<group id>`, repeatable (FLEET_EC2_SECURITY_GROUPS: entries separated by
+    /// spaces)
+    #[arg(long, env = "FLEET_EC2_SECURITY_GROUPS", value_delimiter = ' ')]
+    pub ec2_security_group: Vec<String>,
     /// This fleet's name, tagged on its EC2 tiles at launch (`Fleet=<name>`). At start and
     /// shutdown the coordinator terminates the tiles tagged with it, so two fleets in one
     /// account (staging and production) need different names.
@@ -460,6 +517,14 @@ pub struct FleetAgentArgs {
     /// Extra argument for the aggregator (`fcvm fleet aggregate`). Repeatable.
     #[arg(long = "aggregate-arg", allow_hyphen_values = true)]
     pub aggregate_args: Vec<String>,
+
+    /// Serve the aggregator's stream to browsers with TLS (the --tls-secret certificate):
+    /// on this port of --publish-ip, reported with the host's public IPv4 address
+    /// (--public-ipv4-from-imds), and with an IPv6 prefix on port 443 of `<prefix>::1`,
+    /// which the agent adds to the host's default IPv6 interface. The coordinator names
+    /// both (`agg-<host>-<token>`).
+    #[arg(long, requires_all = ["aggregate_port", "tls_secret"])]
+    pub aggregate_tls_port: Option<u16>,
 
     /// A file the host's boot writes once its store is mounted; its modification time is
     /// reported in the hello (the wake's `store_ready` phase)
@@ -1018,6 +1083,20 @@ pub struct SnapshotCreateArgs {
     /// snapshot without a set.
     #[arg(long, conflicts_with = "disk_only")]
     pub inherit_working_set: bool,
+
+    /// Snapshot a VM that has GPUs attached, with its CUDA processes' GPU memory in the
+    /// snapshot (a "warm GPU snapshot").
+    ///
+    /// fc-agent checkpoints every process holding a GPU with NVIDIA's cuda-checkpoint, which
+    /// copies its device memory into the process's memory and releases the GPU, stops
+    /// nvidia-persistenced and removes the GPUs from the guest's PCI bus. fcvm then detaches
+    /// them from Firecracker, takes the snapshot, attaches them again and has fc-agent
+    /// restore the processes onto them, so the source VM keeps its GPUs; its CUDA processes
+    /// are stopped for the duration. A clone must be restored with as many `--gpu`s as the
+    /// source had, and its processes continue on them. The guest needs memory for the GPU
+    /// state it holds.
+    #[arg(long, conflicts_with = "disk_only")]
+    pub gpu_warm: bool,
 }
 
 #[derive(Args, Debug)]

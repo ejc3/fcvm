@@ -225,7 +225,7 @@ pub struct VmConfig {
     /// additionalImageStore or docker archive). Content-addressed cache file.
     #[serde(default)]
     pub image_disk_path: Option<std::path::PathBuf>,
-    /// Build identity (inode:size:mtime) of that disk at BOOT time — the build
+    /// Build identity (SHA-256, `utils::image_disk_digest`) of that disk at BOOT time — the build
     /// the container was provisioned against. Copied into snapshot metadata so
     /// restore can refuse a snapshot whose disk was rebuilt underneath it.
     #[serde(default)]

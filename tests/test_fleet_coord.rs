@@ -106,6 +106,41 @@ fn light(x: f64) -> Value {
     json!({"pos": [x, 2.0, -90.0], "color": [1.0, 0.5, 0.0]})
 }
 
+/// Stops a coordinator started with `start` and returns the version its last publish
+/// carries, which is the version of the state it stored.
+///
+/// `start` runs a 1 s ticker, and a tick that changes the fleet moves the version without
+/// a receipt. A stored or published version therefore cannot be compared to the last
+/// receipt's: it equals it when no tick landed and is larger when one did. This applies a
+/// viewer join first, which moves the version the same way on every run, so a test that
+/// compares against the last receipt fails every time instead of one run in a while. The
+/// join also makes the returned version greater than `last_receipt`, which is asserted.
+async fn shutdown_at_final_version(
+    handle: &Handle,
+    actor: tokio::task::JoinHandle<()>,
+    last_receipt: u64,
+) -> u64 {
+    let join = handle
+        .apply(Event::ViewerJoined {
+            at: 0,
+            viewer: "v-final".into(),
+            client: None,
+        })
+        .await;
+    assert!(join.is_none(), "a join carries no receipt");
+    handle.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(5), actor)
+        .await
+        .unwrap()
+        .unwrap();
+    let published = handle.snapshot.borrow().version;
+    assert!(
+        published > last_receipt,
+        "the join moved the version past the last receipt: {published} after {last_receipt}"
+    );
+    published
+}
+
 /// A browser: every message it receives, snapshots kept by version.
 struct Viewer {
     ws: Ws,
@@ -322,10 +357,9 @@ async fn a_repeated_intent_id_returns_its_first_receipt_and_applies_once() {
         repeats[0], repeats[1],
         "a repeated id must get the first receipt"
     );
-    assert_eq!(
-        first["version"].as_u64().unwrap() + 1,
-        marker["version"].as_u64().unwrap()
-    );
+    // The ticker can move the version between the two receipts, so only the order is
+    // fixed; that the repeat applied nothing is the action count below.
+    assert!(first["version"].as_u64().unwrap() < marker["version"].as_u64().unwrap());
     let s = a.at_least(marker["version"].as_u64().unwrap()).await;
     let named: Vec<&Value> = s["actions"]
         .as_array()
@@ -601,6 +635,7 @@ impl FakeAgent {
                     .collect(),
                 capacity: gpus,
                 store_ready_at: None,
+                boot: Default::default(),
             })
             .unwrap();
         FakeAgent {
@@ -977,6 +1012,9 @@ async fn the_poster_is_the_whole_image_at_a_hold() {
         .to_coord
         .send(AgentMsg::Aggregate {
             frame_url: host_agg,
+            ipv6: None,
+            ipv4: None,
+            v4_port: None,
         })
         .unwrap();
     agent.report("slot-1", "running", 1);
@@ -1101,17 +1139,13 @@ async fn shutdown_writes_the_last_state_to_the_state_file() {
             .unwrap();
         last = r.version;
     }
-    handle.shutdown().await;
+    let final_version = shutdown_at_final_version(&handle, actor, last).await;
     let saved = store::load(&path).unwrap().expect("a state file");
     assert_eq!(
-        saved.version, last,
+        saved.version, final_version,
         "the state file misses the last changes"
     );
     assert!(saved.receipts.contains_key("l-4"));
-    tokio::time::timeout(Duration::from_secs(5), actor)
-        .await
-        .unwrap()
-        .unwrap();
 }
 
 /// A tile's instance that goes away after it was ready (a spot reclaim) is reported
@@ -1161,9 +1195,13 @@ impl ec2::Ec2Driver for ReclaimedEc2 {
     async fn health(&self, _tile: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
         anyhow::bail!("no renderer")
     }
-    async fn alive(&self, l: &ec2::Launched) -> anyhow::Result<bool> {
+    async fn alive(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Liveness> {
         // The first instance is reclaimed once it has run.
-        Ok(l.instance != "i-test-0")
+        Ok(if l.instance == "i-test-0" {
+            ec2::Liveness::Dead("instance i-test-0 is terminated".into())
+        } else {
+            ec2::Liveness::Alive
+        })
     }
     fn liveness_every(&self) -> Duration {
         Duration::from_millis(100)
@@ -1366,6 +1404,406 @@ async fn a_retired_tile_task_leaves_its_replacement_running() {
     );
 }
 
+/// A handle whose actor only records the EC2 tiles' reports, in order.
+fn recording_handle() -> (Handle, Arc<std::sync::Mutex<Vec<SlotReport>>>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<fcvm::fleet::coord::Cmd>(256);
+    let reports = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let r2 = reports.clone();
+    tokio::spawn(async move {
+        while let Some(cmd) = rx.recv().await {
+            if let fcvm::fleet::coord::Cmd::Apply { event, reply } = cmd {
+                if let Event::Ec2 { report, .. } = event {
+                    r2.lock().unwrap().push(report);
+                }
+                if let Some(reply) = reply {
+                    let _ = reply.send(None);
+                }
+            }
+        }
+    });
+    let snapshot = tokio::sync::watch::channel(Arc::new(fcvm::fleet::coord::Snapshot {
+        version: 0,
+        text: String::new(),
+    }))
+    .1;
+    let ec2_layout = tokio::sync::watch::channel(None).1;
+    (
+        Handle {
+            cmds: tx,
+            snapshot,
+            ec2_layout,
+        },
+        reports,
+    )
+}
+
+/// The first instance of a tile that left and came back fails its readiness check after
+/// the replacement runs. The retired task terminates it and reports nothing: a `failed`
+/// report on the slot would replace the replacement's `running` and clear its addresses
+/// until the next relaunch.
+struct RetiredFailsEc2 {
+    launches: std::sync::atomic::AtomicU64,
+    gate: Arc<tokio::sync::Notify>,
+    waiting: Arc<tokio::sync::Notify>,
+    terminated: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ec2::Ec2Driver for RetiredFailsEc2 {
+    async fn launch(&self, _tile: &str) -> Result<ec2::Launched, ec2::LaunchError> {
+        let n = self
+            .launches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ec2::Launched {
+            instance: format!("i-test-{n}"),
+            frame_url: None,
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        if l.instance == "i-test-0" {
+            self.waiting.notify_one();
+            self.gate.notified().await;
+            anyhow::bail!("i-test-0 did not serve /health");
+        }
+        Ok(ec2::Launched {
+            ipv4: Some("192.0.2.10".into()),
+            ..l.clone()
+        })
+    }
+    async fn terminate(&self, instance: &str) -> anyhow::Result<()> {
+        self.terminated.lock().unwrap().push(instance.to_string());
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_budget(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn health(&self, _tile: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("no renderer")
+    }
+}
+
+#[tokio::test]
+async fn a_retired_tile_task_whose_instance_fails_reports_nothing_on_the_replacement() {
+    let (handle, reports) = recording_handle();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let waiting = Arc::new(tokio::sync::Notify::new());
+    let terminated = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let driver: Arc<dyn ec2::Ec2Driver> = Arc::new(RetiredFailsEc2 {
+        launches: Default::default(),
+        gate: gate.clone(),
+        waiting: waiting.clone(),
+        terminated: terminated.clone(),
+    });
+    let slot: fleet_core::protocol::AssignSlot = serde_json::from_value(json!({
+        "id": "ec2-1", "sbdf": "", "generation": 1,
+        "rect": {"x": 0.5, "y": 0.0, "w": 0.5, "h": 1.0}
+    }))
+    .unwrap();
+    let (assign_tx, assign_rx) = tokio::sync::watch::channel(vec![slot.clone()]);
+    let (_scene_tx, scene_rx) = tokio::sync::watch::channel(None);
+    let (_budget_tx, budget_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(ec2::run(driver, assign_rx, scene_rx, budget_rx, handle));
+    tokio::time::timeout(Duration::from_secs(5), waiting.notified())
+        .await
+        .expect("the first instance is waited for");
+    assign_tx.send(Vec::new()).unwrap();
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assign_tx.send(vec![slot]).unwrap();
+    let running = |reports: &[SlotReport]| {
+        reports
+            .iter()
+            .any(|r| r.phase == "running" && r.vm.as_deref() == Some("i-test-1"))
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !running(&reports.lock().unwrap()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the replacement runs");
+    gate.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !terminated.lock().unwrap().contains(&"i-test-0".to_string()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the retired task terminates its instance");
+    // The retired task reports before it terminates, so its report is in by now.
+    let reports = reports.lock().unwrap();
+    let last = reports.last().unwrap();
+    assert!(
+        last.phase == "running" && last.vm.as_deref() == Some("i-test-1"),
+        "the slot's last report is not the replacement's: {reports:#?}"
+    );
+    assert!(!reports.iter().any(|r| r.phase == "failed"), "{reports:#?}");
+}
+
+/// A tile whose renderer restarts on the same instance (its service has `Restart=always`)
+/// comes back answering `/health` without its scene. Its `boot_id` changes, and the
+/// coordinator posts the scene and the budget to it again.
+struct RestartingRendererEc2 {
+    boot: Arc<std::sync::Mutex<String>>,
+    scenes: Arc<std::sync::Mutex<Vec<String>>>,
+    budgets: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ec2::Ec2Driver for RestartingRendererEc2 {
+    async fn launch(&self, _tile: &str) -> Result<ec2::Launched, ec2::LaunchError> {
+        Ok(ec2::Launched {
+            instance: "i-test-0".into(),
+            frame_url: None,
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        Ok(l.clone())
+    }
+    async fn terminate(&self, _instance: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _tile: &str,
+        l: &ec2::Launched,
+        _body: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
+        self.scenes.lock().unwrap().push(l.instance.clone());
+        Ok(())
+    }
+    async fn post_budget(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        self.budgets
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    async fn health(&self, _tile: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        Ok(json!({"ready": true, "fps": 30.0, "boot_id": *self.boot.lock().unwrap()}))
+    }
+}
+
+#[tokio::test]
+async fn an_ec2_renderer_restarted_on_its_instance_gets_its_scene_again() {
+    use fleet_core::protocol::{AssignSlot, BudgetBody, SharedScene};
+    let boot = Arc::new(std::sync::Mutex::new("boot-1".to_string()));
+    let scenes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let budgets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let driver: Arc<dyn ec2::Ec2Driver> = Arc::new(RestartingRendererEc2 {
+        boot: boot.clone(),
+        scenes: scenes.clone(),
+        budgets: budgets.clone(),
+    });
+    let (handle, _reports) = recording_handle();
+    let tile = AssignSlot {
+        id: "ec2-1".into(),
+        sbdf: String::new(),
+        generation: 1,
+        rect: Some(fleet_core::tiling::Rect {
+            x: 0.5,
+            y: 0.0,
+            w: 0.25,
+            h: 1.0,
+        }),
+        private_camera: None,
+        layout_generation: 0,
+        rect_from_frame: 0,
+        previous_rect: None,
+        standby: false,
+        warm: false,
+    };
+    let (_assign, assign) = tokio::sync::watch::channel(vec![tile]);
+    let (_scene, scene) = tokio::sync::watch::channel(Some(SharedScene::new(
+        &fleet_core::scene::Scene::new(1_000),
+        32.0 / 9.0,
+    )));
+    let (_budget, budget) = tokio::sync::watch::channel(Some(BudgetBody {
+        budget: 500_000,
+        t: 1.0,
+    }));
+    tokio::spawn(ec2::run(driver, assign, scene, budget, handle));
+    let count = |s: &Arc<std::sync::Mutex<Vec<String>>>| s.lock().unwrap().len();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while count(&scenes) < 1 || budgets.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the running tile gets its scene and budget");
+    // Health is read once a second; the same boot id posts nothing again.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        count(&scenes),
+        1,
+        "an unchanged renderer gets no second scene"
+    );
+    *boot.lock().unwrap() = "boot-2".into();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while count(&scenes) < 2 || budgets.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a renderer with a new boot id gets the scene and the budget again");
+    assert_eq!(scenes.lock().unwrap()[1], "i-test-0", "the same instance");
+}
+
+/// A running tile whose renderer stops answering on an instance that keeps running is
+/// launched again after three silent checks in a row; a check it answers starts the count
+/// again. Before, only the instance's state was checked and the tile stayed `running`.
+struct SilentRendererEc2 {
+    launches: std::sync::atomic::AtomicU64,
+    /// The first instance's renderer: what each check finds, then silence from then on.
+    first: std::sync::Mutex<std::collections::VecDeque<ec2::Liveness>>,
+    checks: Arc<std::sync::atomic::AtomicUsize>,
+    terminated: Arc<std::sync::Mutex<Vec<(String, usize)>>>,
+}
+
+#[async_trait::async_trait]
+impl ec2::Ec2Driver for SilentRendererEc2 {
+    async fn launch(&self, _tile: &str) -> Result<ec2::Launched, ec2::LaunchError> {
+        let n = self
+            .launches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ec2::Launched {
+            instance: format!("i-test-{n}"),
+            frame_url: None,
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        Ok(l.clone())
+    }
+    async fn terminate(&self, instance: &str) -> anyhow::Result<()> {
+        let checks = self.checks.load(std::sync::atomic::Ordering::SeqCst);
+        self.terminated
+            .lock()
+            .unwrap()
+            .push((instance.to_string(), checks));
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_budget(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn health(&self, _tile: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("no renderer")
+    }
+    async fn alive(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Liveness> {
+        if l.instance != "i-test-0" {
+            return Ok(ec2::Liveness::Alive);
+        }
+        self.checks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self
+            .first
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| ec2::Liveness::Silent("connection refused".into())))
+    }
+    fn liveness_every(&self) -> Duration {
+        Duration::from_millis(50)
+    }
+}
+
+#[tokio::test]
+async fn an_ec2_tile_whose_renderer_stops_answering_is_launched_again() {
+    use ec2::Liveness::{Alive, Silent};
+    let (handle, reports) = recording_handle();
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let terminated = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let silent = || Silent("connection refused".into());
+    let driver: Arc<dyn ec2::Ec2Driver> = Arc::new(SilentRendererEc2 {
+        launches: Default::default(),
+        // Silent, answered, silent twice, answered, then silent from the sixth check on:
+        // the third silent check in a row is the eighth.
+        first: std::sync::Mutex::new(
+            [silent(), Alive, silent(), silent(), Alive]
+                .into_iter()
+                .collect(),
+        ),
+        checks: checks.clone(),
+        terminated: terminated.clone(),
+    });
+    let slot: fleet_core::protocol::AssignSlot = serde_json::from_value(json!({
+        "id": "ec2-1", "sbdf": "", "generation": 1,
+        "rect": {"x": 0.5, "y": 0.0, "w": 0.5, "h": 1.0}
+    }))
+    .unwrap();
+    let (_assign_tx, assign_rx) = tokio::sync::watch::channel(vec![slot]);
+    let (_scene_tx, scene_rx) = tokio::sync::watch::channel(None);
+    let (_budget_tx, budget_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(ec2::run(driver, assign_rx, scene_rx, budget_rx, handle));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if reports
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.phase == "running" && r.vm.as_deref() == Some("i-test-1"))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the tile runs on a new instance after its renderer stopped answering");
+    assert_eq!(
+        terminated.lock().unwrap()[0],
+        ("i-test-0".to_string(), 8),
+        "relaunched after the third silent check in a row"
+    );
+    let reports = reports.lock().unwrap();
+    let failed = reports
+        .iter()
+        .find(|r| r.phase == "failed")
+        .expect("a failed report");
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("did not answer 3 checks") && e.contains("i-test-0")),
+        "{failed:?}"
+    );
+}
+
 /// The periodic store has queued the newest state and its write is still running when
 /// the coordinator is stopped: shutdown must wait for that write, not report the state
 /// written while it is not.
@@ -1382,7 +1820,7 @@ async fn shutdown_waits_for_a_state_write_already_in_flight() {
                 w2.lock().unwrap().push(b.len());
             }
             if let Some(a) = cmd.ack {
-                let _ = a.send(());
+                let _ = a.send(true);
             }
         }
     });
@@ -1428,6 +1866,191 @@ async fn shutdown_waits_for_a_state_write_already_in_flight() {
         "shutdown returned before the queued write finished"
     );
     tokio::time::timeout(Duration::from_secs(5), actor)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// A state write that fails (here: its directory does not exist yet) is kept, and the next
+/// command to the writer, a shutdown barrier that carries no state of its own, writes it.
+/// Before, the writer dropped it and acknowledged the barrier with nothing written.
+#[tokio::test]
+async fn a_failed_state_write_is_kept_and_written_by_the_next_barrier() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("later").join("fleet.json");
+    let tx = store::spawn_writer(path.clone());
+    let mut s = State::new(Config::default(), 1_000);
+    s.version = 7;
+    let (ack, done) = tokio::sync::oneshot::channel();
+    tx.send(store::StoreCmd {
+        bytes: Some(Arc::new(serde_json::to_vec(&s).unwrap())),
+        ack: Some(ack),
+    })
+    .unwrap();
+    let first = done.await.unwrap();
+    assert!(!first, "a failed write is acknowledged as not stored");
+    assert!(store::load(&path).unwrap().is_none());
+    std::fs::create_dir(dir.path().join("later")).unwrap();
+    let (ack, done) = tokio::sync::oneshot::channel();
+    tx.send(store::StoreCmd {
+        bytes: None,
+        ack: Some(ack),
+    })
+    .unwrap();
+    let second = done.await.unwrap();
+    let saved = store::load(&path)
+        .unwrap()
+        .expect("the barrier wrote the state that failed before");
+    assert_eq!(saved.version, 7);
+    assert!(second, "the retried write is acknowledged as stored");
+}
+
+/// A writer whose writes fail: shutdown asks again, and reports that the last state is not
+/// stored rather than counting it stored. A write that succeeds on a later attempt is
+/// reported stored.
+#[tokio::test]
+async fn shutdown_reports_a_last_state_that_was_not_stored() {
+    async fn run(fail_first: usize) -> (bool, usize) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<store::StoreCmd>();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a2 = attempts.clone();
+        tokio::spawn(async move {
+            let mut pending = false;
+            while let Some(cmd) = rx.recv().await {
+                pending |= cmd.bytes.is_some();
+                if pending {
+                    let n = a2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    pending = n < fail_first;
+                }
+                if let Some(a) = cmd.ack {
+                    let _ = a.send(!pending);
+                }
+            }
+        });
+        let (handle, actor) = start(
+            State::new(
+                Config {
+                    light_interval_ms: 0,
+                    ..Config::default()
+                },
+                1_000,
+            ),
+            Some(tx),
+            None,
+            None,
+            None,
+            None,
+        );
+        handle
+            .apply(Event::Intent {
+                at: 0,
+                viewer: "v-1".into(),
+                client: Some("198.51.100.9".into()),
+                id: "l-0".into(),
+                name: "light".into(),
+                args: light(0.0),
+                check: None,
+                secret: None,
+            })
+            .await
+            .unwrap();
+        let stored = handle.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(10), actor)
+            .await
+            .unwrap()
+            .unwrap();
+        (stored, attempts.load(std::sync::atomic::Ordering::SeqCst))
+    }
+    assert_eq!(run(usize::MAX).await, (false, 3));
+    assert_eq!(run(1).await, (true, 2));
+}
+
+/// A state write fails and the state then stays unchanged: the periodic store asks the
+/// writer again on its next tick instead of leaving the state unwritten until the next
+/// change or shutdown.
+#[tokio::test]
+async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<store::StoreCmd>();
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let a2 = attempts.clone();
+    // Fails its first write and stores every later one.
+    tokio::spawn(async move {
+        let mut pending = false;
+        while let Some(cmd) = rx.recv().await {
+            pending |= cmd.bytes.is_some();
+            if pending {
+                let n = a2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                pending = n == 0;
+            }
+            if let Some(a) = cmd.ack {
+                let _ = a.send(!pending);
+            }
+        }
+    });
+    // The actor alone, on a clock that stands still and with no tick task, so nothing
+    // changes the state after the intent below.
+    let (snapshot, snapshot_rx) =
+        tokio::sync::watch::channel(Arc::new(fcvm::fleet::coord::Snapshot {
+            version: 0,
+            text: String::new(),
+        }));
+    let (ec2_layout, ec2_layout_rx) = tokio::sync::watch::channel(None);
+    let state = State::new(
+        Config {
+            light_interval_ms: 0,
+            ..Config::default()
+        },
+        1_000,
+    );
+    let outputs = fcvm::fleet::coord::Outputs {
+        snapshot,
+        ec2: tokio::sync::watch::channel(Vec::new()).0,
+        ec2_layout,
+        power: tokio::sync::watch::channel(String::new()).0,
+        scene: tokio::sync::watch::channel(None).0,
+        budget: tokio::sync::watch::channel(None).0,
+        zone: None,
+        store: Some(tx),
+    };
+    let (cmds, cmds_rx) = tokio::sync::mpsc::channel(64);
+    let actor = tokio::spawn(
+        fcvm::fleet::coord::Actor::new(state, outputs, Box::new(|| 2_000)).run(cmds_rx),
+    );
+    let handle = Handle {
+        cmds,
+        snapshot: snapshot_rx,
+        ec2_layout: ec2_layout_rx,
+    };
+    let before = handle.snapshot.borrow().version;
+    handle
+        .apply(Event::Intent {
+            at: 0,
+            viewer: "v-1".into(),
+            client: Some("198.51.100.9".into()),
+            id: "l-0".into(),
+            name: "light".into(),
+            args: light(0.0),
+            check: None,
+            secret: None,
+        })
+        .await
+        .unwrap();
+    // The store ticks once a second: the first queues the state (and fails), a later one
+    // retries it while the state stays as it is.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while attempts.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the failed write is retried before any change or shutdown");
+    assert_eq!(
+        handle.snapshot.borrow().version,
+        before + 1,
+        "only the intent changed the state"
+    );
+    assert!(handle.shutdown().await);
+    tokio::time::timeout(Duration::from_secs(10), actor)
         .await
         .unwrap()
         .unwrap();
@@ -1662,6 +2285,84 @@ async fn an_ec2_capacity_wait_is_kept_out_of_the_race_time() {
     assert_eq!(s["scoreboard"]["ec2"]["last_capacity_wait_ms"], wait_ms);
 }
 
+/// An agent's quarantine report is acknowledged (`quarantine_stored`) only once a state write
+/// that holds the quarantine is stored: while writes fail the agent hears nothing and keeps
+/// replaying it, so a coordinator that crashes before its write cannot forget the GPU.
+#[tokio::test]
+async fn a_quarantine_is_acknowledged_once_a_stored_state_holds_it() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<store::StoreCmd>();
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let stored = Arc::new(std::sync::Mutex::new(None::<Arc<Vec<u8>>>));
+    let (f2, s2) = (failing.clone(), stored.clone());
+    // A store that keeps an unwritten state, as the real writers do, and fails while told to.
+    tokio::spawn(async move {
+        let mut pending: Option<Arc<Vec<u8>>> = None;
+        while let Some(cmd) = rx.recv().await {
+            if cmd.bytes.is_some() {
+                pending = cmd.bytes;
+            }
+            if pending.is_some() && !f2.load(std::sync::atomic::Ordering::SeqCst) {
+                *s2.lock().unwrap() = pending.take();
+            }
+            if let Some(a) = cmd.ack {
+                let _ = a.send(pending.is_none());
+            }
+        }
+    });
+    let (handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        Some(tx),
+        None,
+        None,
+        None,
+        None,
+    );
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 2);
+    agent.assign().await;
+    agent
+        .to_coord
+        .send(AgentMsg::Quarantine {
+            slot: "slot-1".into(),
+            sbdf: "0000:01:00.0".into(),
+            error: "GPU 0000:01:00.0 did not reset".into(),
+            report: Some("report-1".into()),
+        })
+        .unwrap();
+    // The next acknowledgement within `secs`, if any.
+    async fn ack(agent: &mut FakeAgent, secs: u64) -> Option<(String, Option<String>)> {
+        tokio::time::timeout(Duration::from_secs(secs), async {
+            loop {
+                if let CoordMsg::QuarantineStored { sbdf, report } = agent.next().await {
+                    return (sbdf, report);
+                }
+            }
+        })
+        .await
+        .ok()
+    }
+    // The store ticks once a second: three ticks pass with every write failing.
+    assert_eq!(
+        ack(&mut agent, 3).await,
+        None,
+        "a quarantine no stored state holds was acknowledged"
+    );
+    failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        ack(&mut agent, 5).await,
+        Some(("0000:01:00.0".to_string(), Some("report-1".to_string()))),
+        "the quarantine is acknowledged once a write holding it is stored"
+    );
+    let bytes = stored.lock().unwrap().clone().expect("a stored state");
+    let state: State = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        state
+            .fleet
+            .quarantined
+            .contains_key(&fleet_core::state::gpu_key("gpu-a", "0000:01:00.0")),
+        "the stored state holds the quarantine"
+    );
+}
+
 /// A GPU the agent quarantines leaves the wall (a standby GPU takes its place) and comes
 /// back only when an operator releases it through the admin endpoint. Restores count in
 /// the snapshot.
@@ -1691,6 +2392,7 @@ async fn a_quarantined_gpu_returns_only_by_the_operator() {
             slot: "slot-1".into(),
             sbdf: "0000:01:00.0".into(),
             error: "GPU 0000:01:00.0 did not reset".into(),
+            report: Some("report-1".into()),
         })
         .unwrap();
     let slots = loop {
@@ -1727,41 +2429,93 @@ async fn a_quarantined_gpu_returns_only_by_the_operator() {
     assert!(slots[0].rect.is_some() && slots[1].standby, "{slots:?}");
 }
 
-/// With scale groups, the fleet scales them to zero after the idle time with no active
-/// viewer (a hidden page does not count), and back up when a viewer's page is visible
-/// again; while it wakes, the groups' instances show in the snapshot.
+/// An agent that did not hear its quarantine was stored replays it on its next connection.
+/// When an operator released the GPU meanwhile, the replay of that same report is
+/// acknowledged and changes nothing: the release stands. A new report for the GPU (it failed
+/// again) quarantines it.
 #[tokio::test]
-async fn no_active_viewer_scales_the_gpus_to_zero_and_one_wakes_them() {
-    use fcvm::fleet::coord::scale::{FakeScale, Group, PowerConfig};
+async fn a_replayed_quarantine_does_not_undo_an_operators_release() {
     let config = Config {
-        power_managed: true,
-        idle_scale_down_secs: 1,
+        max_tiles: 1,
         ..Config::default()
     };
-    let fake = Arc::new(FakeScale::default());
-    *fake.instances.lock().unwrap() = vec![fleet_core::event::ScaleInstance {
-        id: "i-0123456789abcdef0".into(),
-        lifecycle: "Pending".into(),
-    }];
-    let power = PowerConfig {
-        driver: fake.clone(),
-        groups: vec![Group {
-            region: "us-east-1".into(),
-            name: "fleet-hosts".into(),
-        }],
-        awake_capacity: 2,
-        poll: Duration::from_millis(100),
-        on_demand: vec![],
-        spot_wait: Duration::from_secs(120),
+    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None, None);
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 2);
+    agent.assign().await;
+    let quarantine = |report: &str| AgentMsg::Quarantine {
+        slot: "slot-1".into(),
+        sbdf: "0000:01:00.0".into(),
+        error: "GPU 0000:01:00.0 did not reset".into(),
+        report: Some(report.into()),
     };
-    let (handle, _actor) = start(
-        State::new(config, now_ms()),
-        None,
-        None,
-        None,
-        Some(power),
-        None,
+    // Read until the acknowledgement of `report`, returning the last assignment seen.
+    async fn acked(agent: &mut FakeAgent, report: &str, mut slots: usize) -> usize {
+        loop {
+            match agent.next().await {
+                CoordMsg::Assign { slots: s, .. } => slots = s.len(),
+                CoordMsg::QuarantineStored {
+                    report: Some(r), ..
+                } if r == report => return slots,
+                _ => {}
+            }
+        }
+    }
+    agent.to_coord.send(quarantine("report-1")).unwrap();
+    assert_eq!(acked(&mut agent, "report-1", 2).await, 1, "quarantined");
+    handle
+        .send(Event::ReleaseQuarantine {
+            at: 0,
+            host: "gpu-a".into(),
+            sbdf: "0000:01:00.0".into(),
+        })
+        .await;
+    loop {
+        if agent.assign().await.len() == 2 {
+            break;
+        }
+    }
+    let quarantined = |h: &Handle| -> bool {
+        let v: Value = serde_json::from_str(&h.snapshot.borrow().text).unwrap();
+        v["state"]["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["kind"] == "gpu_quarantined")
+    };
+    // The replay of the released report.
+    agent.to_coord.send(quarantine("report-1")).unwrap();
+    assert_eq!(
+        acked(&mut agent, "report-1", 2).await,
+        2,
+        "the replay of a released report took the GPU out again"
     );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!quarantined(&handle), "the release stands");
+    // The GPU fails again: a new report quarantines it.
+    agent.to_coord.send(quarantine("report-2")).unwrap();
+    assert_eq!(acked(&mut agent, "report-2", 2).await, 1, "a new failure");
+}
+
+/// The coordinator's host launcher over `fake` in `regions`, polling every 50 ms.
+fn host_config(
+    fake: &Arc<fcvm::fleet::coord::hosts::FakeHosts>,
+    regions: &[&str],
+    awake_capacity: u32,
+    on_demand_max: u32,
+) -> fcvm::fleet::coord::hosts::HostConfig {
+    fcvm::fleet::coord::hosts::HostConfig {
+        driver: fake.clone(),
+        regions: regions.iter().map(|r| r.to_string()).collect(),
+        awake_capacity,
+        on_demand_max,
+        poll: Duration::from_millis(50),
+        liveness: Duration::from_millis(100),
+        capacity_retry: Duration::from_millis(300),
+    }
+}
+
+/// Serves the page for `handle` and connects one viewer to it.
+async fn page_viewer(handle: &Handle) -> Viewer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/live", listener.local_addr().unwrap());
     let cfg = live::LiveConfig {
@@ -1774,337 +2528,494 @@ async fn no_active_viewer_scales_the_gpus_to_zero_and_one_wakes_them() {
     };
     let h = handle.clone();
     tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
-    let calls = || fake.calls.lock().unwrap().clone();
-    let mut v = Viewer::connect(&url).await;
-    v.until(|s| s["viewers"]["active"] == 1).await;
-    assert_eq!(
-        calls(),
-        vec![("fleet-hosts".to_string(), 2)],
-        "awake at start"
+    Viewer::connect(&url).await
+}
+
+/// Waits until `cond` holds for `fake`, or fails with its calls.
+async fn until_hosts(
+    fake: &Arc<fcvm::fleet::coord::hosts::FakeHosts>,
+    what: &str,
+    cond: impl Fn(&fcvm::fleet::coord::hosts::FakeHosts) -> bool,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !cond(fake) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: calls {:?}",
+            fake.calls()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The launch calls `fake` received, in order.
+fn launches(fake: &fcvm::fleet::coord::hosts::FakeHosts) -> Vec<String> {
+    fake.calls()
+        .into_iter()
+        .filter(|c| c.starts_with("launch "))
+        .collect()
+}
+
+/// The coordinator launches the GPU hosts itself, spot first: awake at start it launches
+/// the awake capacity, with no active viewer it terminates every host, and a viewer's
+/// visible page launches them again. While it wakes, the hosts show in the snapshot.
+#[tokio::test]
+async fn no_active_viewer_terminates_the_gpu_hosts_and_one_launches_them() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let config = Config {
+        power_managed: true,
+        idle_scale_down_secs: 1,
+        ..Config::default()
+    };
+    let fake = Arc::new(FakeHosts::default());
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 2, 8)),
+        None,
     );
+    let mut v = page_viewer(&handle).await;
+    v.until(|s| s["viewers"]["active"] == 1).await;
+    until_hosts(&fake, "awake at start", |f| {
+        f.present("us-east-1").len() == 2
+    })
+    .await;
+    assert_eq!(launches(&fake), vec!["launch us-east-1 spot 2"]);
     v.send(json!({"type": "visibility", "visible": false}))
         .await;
-    let s = v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
-    assert_eq!(s["viewers"]["active"], 0);
-    assert_eq!(s["viewers"]["count"], 1);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while calls().len() < 2 {
-        assert!(std::time::Instant::now() < deadline, "{:?}", calls());
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(calls()[1], ("fleet-hosts".to_string(), 0));
+    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    until_hosts(&fake, "asleep", |f| f.present("us-east-1").is_empty()).await;
     v.send(json!({"type": "visibility", "visible": true})).await;
     let s = v
         .until(|s| {
             s["fleet"]["power"]["state"] == "waking"
-                && s["fleet"]["power"]["hosts"][0]["phases"][0]["phase"] == "instance_pending"
+                && s["fleet"]["power"]["hosts"]
+                    .as_array()
+                    .is_some_and(|h| h.len() == 2)
         })
         .await;
+    for h in s["fleet"]["power"]["hosts"].as_array().unwrap() {
+        assert!(h["host"].as_str().unwrap().starts_with("i-"), "{s}");
+        assert_eq!(h["phases"][0]["phase"], "instance_pending", "{s}");
+    }
     assert_eq!(
-        s["fleet"]["power"]["hosts"][0]["host"],
-        "i-0123456789abcdef0"
+        launches(&fake),
+        vec!["launch us-east-1 spot 2", "launch us-east-1 spot 2"]
     );
-    assert!(s["fleet"]["power"]["woke_at"].is_u64());
-    assert_eq!(calls()[2], ("fleet-hosts".to_string(), 2));
 }
 
-/// A wake that leaves the spot group with no instance for the spot wait moves the
-/// shortfall to the on-demand group and holds the spot group at what it has; sleeping sets
-/// both to zero, and the next wake asks spot first again.
+/// A spot request EC2 refuses for capacity is followed by the on-demand request in the
+/// same pass: no list or wait comes between them (the Auto Scaling path waited for a failed
+/// activity, then for the next poll). The next wake asks spot first again.
 #[tokio::test]
-async fn a_spot_group_short_after_the_wait_falls_back_to_on_demand_and_sleeps_to_zero() {
-    use fcvm::fleet::coord::scale::{FakeScale, Group, PowerConfig};
+async fn a_refused_spot_launch_launches_on_demand_in_the_same_pass() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Market};
     let config = Config {
         power_managed: true,
         idle_scale_down_secs: 1,
         ..Config::default()
     };
-    let fake = Arc::new(FakeScale::default());
-    let spot = Group {
-        region: "us-east-1".into(),
-        name: "fleet-hosts".into(),
-    };
-    let od = Group {
-        region: "us-east-1".into(),
-        name: "fleet-hosts-on-demand".into(),
-    };
-    let power = PowerConfig {
-        driver: fake.clone(),
-        groups: vec![spot],
-        awake_capacity: 1,
-        poll: Duration::from_millis(50),
-        on_demand: vec![Some(od)],
-        spot_wait: Duration::from_millis(300),
-    };
+    let fake = Arc::new(FakeHosts::default());
+    fake.capacity
+        .lock()
+        .unwrap()
+        .insert(("us-east-1".into(), Market::Spot), 0);
     let (handle, _actor) = start(
         State::new(config, now_ms()),
         None,
         None,
         None,
-        Some(power),
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
         None,
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/live", listener.local_addr().unwrap());
-    let cfg = live::LiveConfig {
-        checker: allow_all(),
-        allowed_origins: vec![],
-        verifier: Arc::new(turnstile::Off),
-        trust_cf_connecting_ip: false,
-        turnstile_site_key: None,
-        poster: Arc::new(poster::Poster::default()),
-    };
-    let h = handle.clone();
-    tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
-    let calls = || fake.calls.lock().unwrap().clone();
-    let wait_for = |n: usize| {
-        let fake = fake.clone();
-        async move {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while fake.calls.lock().unwrap().len() < n {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "{:?}",
-                    fake.calls.lock().unwrap()
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }
-    };
-    let c = |g: &str, d: u32| (g.to_string(), d);
-    let mut v = Viewer::connect(&url).await;
+    let mut v = page_viewer(&handle).await;
     v.until(|s| s["viewers"]["active"] == 1).await;
-    // Awake at start: the spot group only; the on-demand group is not raised.
-    assert_eq!(calls(), vec![c("fleet-hosts", 1)]);
+    until_hosts(&fake, "on-demand host", |f| {
+        f.present("us-east-1").len() == 1
+    })
+    .await;
+    let calls = fake.calls();
+    let spot = calls
+        .iter()
+        .position(|c| c == "launch us-east-1 spot 1")
+        .expect("spot asked first");
+    assert_eq!(
+        calls[spot + 1],
+        "launch us-east-1 on-demand 1",
+        "the on-demand launch did not follow the refusal at once: {calls:?}"
+    );
+    assert_eq!(fake.present("us-east-1")[0].market, Market::OnDemand);
+    // Running: nothing more is launched.
+    fake.set_state("us-east-1", "pending", "running");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(launches(&fake).len(), 2, "{:?}", fake.calls());
+    // Sleep, then wake with spot capacity: spot first again, no on-demand.
     v.send(json!({"type": "visibility", "visible": false}))
         .await;
     v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
-    wait_for(3).await;
-    assert_eq!(
-        calls()[1..3],
-        [c("fleet-hosts", 0), c("fleet-hosts-on-demand", 0)]
-    );
-    // Wake with no spot capacity: after the wait, on-demand takes the one host.
+    until_hosts(&fake, "asleep", |f| f.present("us-east-1").is_empty()).await;
+    fake.capacity.lock().unwrap().clear();
     v.send(json!({"type": "visibility", "visible": true})).await;
-    wait_for(6).await;
+    until_hosts(&fake, "spot host", |f| f.present("us-east-1").len() == 1).await;
     assert_eq!(
-        calls()[3..6],
-        [
-            c("fleet-hosts", 1),
-            c("fleet-hosts-on-demand", 1),
-            c("fleet-hosts", 0)
-        ]
-    );
-    // The on-demand host shows on the page and nothing more is launched.
-    fake.by_group.lock().unwrap().insert(
-        "fleet-hosts-on-demand".into(),
-        vec![fleet_core::event::ScaleInstance {
-            id: "i-0123456789abcdef0".into(),
-            lifecycle: "Pending".into(),
-        }],
-    );
-    v.until(|s| s["fleet"]["power"]["hosts"][0]["host"] == "i-0123456789abcdef0")
-        .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(calls().len(), 6, "{:?}", calls());
-    // Sleep: both groups to zero.
-    v.send(json!({"type": "visibility", "visible": false}))
-        .await;
-    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
-    wait_for(8).await;
-    assert_eq!(
-        calls()[6..8],
-        [c("fleet-hosts", 0), c("fleet-hosts-on-demand", 0)]
+        launches(&fake)[2..],
+        ["launch us-east-1 spot 1".to_string()]
     );
 }
 
-fn fallback_power(
-    fake: &Arc<fcvm::fleet::coord::scale::FakeScale>,
-    spot_wait: Duration,
-) -> fcvm::fleet::coord::scale::PowerConfig {
-    use fcvm::fleet::coord::scale::{Group, PowerConfig};
-    PowerConfig {
-        driver: fake.clone(),
-        groups: vec![Group {
-            region: "us-east-1".into(),
-            name: "fleet-hosts".into(),
-        }],
-        awake_capacity: 1,
-        poll: Duration::from_millis(50),
-        on_demand: vec![Some(Group {
-            region: "us-east-1".into(),
-            name: "fleet-hosts-on-demand".into(),
-        })],
-        spot_wait,
-    }
-}
-
-/// A coordinator that restarts while a fallback is in force (the on-demand group holds a
-/// host) keeps that split: it reads the groups' desired capacity first and never raises
-/// the spot group beside the on-demand host.
+/// The fleet never runs more on-demand hosts than the cap, all regions together: with
+/// spot refused in two regions and a cap of 1, one region gets an on-demand host and the
+/// other waits for capacity (asking spot again, never on demand).
 #[tokio::test]
-async fn a_restart_keeps_an_on_demand_fallback_instead_of_raising_spot_beside_it() {
-    use fcvm::fleet::coord::scale::FakeScale;
-    let fake = Arc::new(FakeScale::default());
-    fake.desired.lock().unwrap().extend([
-        ("fleet-hosts".to_string(), 0),
-        ("fleet-hosts-on-demand".to_string(), 1),
-    ]);
-    // The fleet resumes awake (a viewer is watching the on-demand host's tiles).
+async fn on_demand_hosts_stay_within_the_cap_across_regions() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Market};
+    let fake = Arc::new(FakeHosts::default());
+    for r in ["us-east-1", "us-east-2"] {
+        fake.capacity
+            .lock()
+            .unwrap()
+            .insert((r.into(), Market::Spot), 0);
+    }
     let (_handle, _actor) = start(
         State::new(Config::default(), now_ms()),
         None,
         None,
         None,
-        Some(fallback_power(&fake, Duration::from_secs(120))),
+        Some(host_config(&fake, &["us-east-1", "us-east-2"], 1, 1)),
         None,
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while fake.calls.lock().unwrap().len() < 2 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{:?}",
-            fake.calls.lock().unwrap()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let calls = fake.calls.lock().unwrap().clone();
+    until_hosts(&fake, "one on-demand host", |f| {
+        f.present("us-east-1").len() + f.present("us-east-2").len() == 1
+    })
+    .await;
+    // Past several capacity retries.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let od: Vec<String> = launches(&fake)
+        .into_iter()
+        .filter(|c| c.contains("on-demand"))
+        .collect();
+    assert_eq!(od.len(), 1, "{:?}", fake.calls());
+    assert_eq!(
+        fake.present("us-east-1").len() + fake.present("us-east-2").len(),
+        1
+    );
     assert!(
-        !calls.contains(&("fleet-hosts".to_string(), 1)),
-        "spot raised beside the on-demand host: {calls:?}"
-    );
-    let desired = fake.desired.lock().unwrap().clone();
-    assert_eq!(desired["fleet-hosts"], 0, "{calls:?}");
-    assert_eq!(desired["fleet-hosts-on-demand"], 1, "{calls:?}");
-}
-
-/// A fallback whose spot write fails is retried until both groups hold their split, and
-/// the coordinator stops reporting `scale` degraded once it is.
-#[tokio::test]
-async fn a_failed_fallback_write_is_retried_and_clears_the_degraded_scale() {
-    use fcvm::fleet::coord::scale::FakeScale;
-    let fake = Arc::new(FakeScale::default());
-    fake.fail_sets.lock().unwrap().extend([
-        ("fleet-hosts".to_string(), 0),
-        ("fleet-hosts".to_string(), 0),
-    ]);
-    let mut state = State::new(Config::default(), now_ms());
-    state.fleet.power.state = "waking".into();
-    let (handle, _actor) = start(
-        state,
-        None,
-        None,
-        None,
-        Some(fallback_power(&fake, Duration::from_millis(200))),
-        None,
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/live", listener.local_addr().unwrap());
-    let cfg = live::LiveConfig {
-        checker: allow_all(),
-        allowed_origins: vec![],
-        verifier: Arc::new(turnstile::Off),
-        trust_cf_connecting_ip: false,
-        turnstile_site_key: None,
-        poster: Arc::new(poster::Poster::default()),
-    };
-    let h = handle.clone();
-    tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let d = fake.desired.lock().unwrap().clone();
-        if d.get("fleet-hosts") == Some(&0) && d.get("fleet-hosts-on-demand") == Some(&1) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{:?}",
-            fake.calls.lock().unwrap()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(
-        fake.fail_sets.lock().unwrap().is_empty(),
-        "both failures injected"
-    );
-    let scale_degraded = |s: &serde_json::Value| {
-        s["failures"]
-            .as_array()
-            .unwrap()
+        launches(&fake)
             .iter()
-            .any(|f| f["kind"] == "coordinator_degraded" && f["component"] == "scale")
-    };
-    let mut v = Viewer::connect(&url).await;
-    let s = tokio::time::timeout(Duration::from_secs(5), v.until(|s| !scale_degraded(s)))
-        .await
-        .expect("scale still degraded 5 s after the fallback was applied");
-    assert!(!scale_degraded(&s));
+            .filter(|c| c.starts_with("launch us-east-2 spot"))
+            .count()
+            >= 2,
+        "the short region did not ask spot again: {:?}",
+        fake.calls()
+    );
 }
 
-/// A sleep whose on-demand write fails after the spot group went to 0, followed by a wake
-/// before the retry, still raises the spot group: a half-done transition is not taken
-/// for the target it was heading to.
+/// A region that cannot be listed leaves the fleet's on-demand hosts uncounted, so no region
+/// falls back to on demand until it can be: the cap fails closed.
 #[tokio::test]
-async fn a_wake_after_a_half_done_sleep_raises_the_spot_group_again() {
-    use fcvm::fleet::coord::scale::FakeScale;
-    let config = Config {
-        power_managed: true,
-        idle_scale_down_secs: 1,
-        ..Config::default()
-    };
-    let fake = Arc::new(FakeScale::default());
-    fake.fail_sets
+async fn an_uncounted_region_holds_back_the_on_demand_fallback() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Market};
+    let fake = Arc::new(FakeHosts::default());
+    fake.capacity
         .lock()
         .unwrap()
-        .push(("fleet-hosts-on-demand".to_string(), 0));
-    let mut power = fallback_power(&fake, Duration::from_secs(120));
-    // No retry before the wake below.
-    power.poll = Duration::from_secs(30);
-    let (handle, _actor) = start(
-        State::new(config, now_ms()),
+        .insert(("us-east-1".into(), Market::Spot), 0);
+    fake.fail_lists
+        .lock()
+        .unwrap()
+        .insert("us-east-2".into(), 3);
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
         None,
         None,
         None,
-        Some(power),
+        Some(host_config(&fake, &["us-east-1", "us-east-2"], 1, 8)),
         None,
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/live", listener.local_addr().unwrap());
-    let cfg = live::LiveConfig {
-        checker: allow_all(),
-        allowed_origins: vec![],
-        verifier: Arc::new(turnstile::Off),
-        trust_cf_connecting_ip: false,
-        turnstile_site_key: None,
-        poster: Arc::new(poster::Poster::default()),
-    };
-    let h = handle.clone();
-    tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
-    let mut v = Viewer::connect(&url).await;
-    v.until(|s| s["viewers"]["active"] == 1).await;
-    v.send(json!({"type": "visibility", "visible": false}))
-        .await;
-    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !fake.fail_sets.lock().unwrap().is_empty() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the sleep never tried the on-demand group"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    until_hosts(&fake, "us-east-2 listed", |f| {
+        f.fail_lists.lock().unwrap()["us-east-2"] == 0 && !f.present("us-east-2").is_empty()
+    })
+    .await;
+    let calls = fake.calls();
+    let first_od = calls
+        .iter()
+        .position(|c| c == "launch us-east-1 on-demand 1")
+        .expect("on demand once both regions are counted");
+    let listed_ok = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| *c == "list us-east-2")
+        .map(|(i, _)| i)
+        .nth(3)
+        .expect("a fourth list of us-east-2");
+    assert!(
+        first_od > listed_ok,
+        "on demand launched while us-east-2 was uncounted: {calls:?}"
+    );
+}
+
+/// A host that is reclaimed (spot) or terminated while the fleet is awake is replaced.
+#[tokio::test]
+async fn a_reclaimed_host_is_replaced() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let fake = Arc::new(FakeHosts::default());
+    *fake.launch_state.lock().unwrap() = Some("running".into());
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    until_hosts(&fake, "first host", |f| f.present("us-east-1").len() == 1).await;
+    fake.set_state("us-east-1", "running", "terminated");
+    until_hosts(&fake, "replacement", |f| f.present("us-east-1").len() == 1).await;
+    assert_eq!(launches(&fake).len(), 2, "{:?}", fake.calls());
+}
+
+/// A launch whose answer is lost (EC2 launched, the reply never came) is asked again with
+/// the same token, so EC2 answers with the instance it launched and no second host starts,
+/// although no list names the first one yet.
+#[tokio::test]
+async fn a_launch_whose_answer_is_lost_is_asked_again_with_its_token() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let fake = Arc::new(FakeHosts::default());
+    *fake.ambiguous.lock().unwrap() = 1;
+    *fake.hide_new.lock().unwrap() = Some((0, 4));
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    until_hosts(&fake, "asked again", |f| launches(f).len() >= 2).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Every instance ever launched, terminated ones included: a second one would be
+    // terminated as excess once both are listed, so the present count cannot tell.
+    let launched = fake.hosts.lock().unwrap()["us-east-1"].len();
+    assert_eq!(
+        launched,
+        1,
+        "a second host for one shortfall: {:?}",
+        fake.calls()
+    );
+}
+
+/// An on-demand launch whose answer is lost counts against the fleet-wide cap until its
+/// retry answers: with a cap of 1 and spot refused in two regions, the second region does
+/// not launch on demand beside a host the first may have.
+#[tokio::test]
+async fn a_lost_on_demand_launch_holds_its_place_under_the_cap() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Market};
+    let fake = Arc::new(FakeHosts::default());
+    for r in ["us-east-1", "us-east-2"] {
+        fake.capacity
+            .lock()
+            .unwrap()
+            .insert((r.into(), Market::Spot), 0);
     }
-    assert_eq!(fake.desired.lock().unwrap()["fleet-hosts"], 0);
-    v.send(json!({"type": "visibility", "visible": true})).await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while fake.desired.lock().unwrap()["fleet-hosts"] != 1 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "spot left at 0 after the wake: {:?}",
-            fake.calls.lock().unwrap()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    *fake.ambiguous.lock().unwrap() = 1;
+    *fake.hide_new.lock().unwrap() = Some((0, 4));
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1", "us-east-2"], 1, 1)),
+        None,
+    );
+    until_hosts(&fake, "an on-demand launch", |f| {
+        launches(f).iter().any(|c| c.contains("on-demand"))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let hosts = fake.hosts.lock().unwrap().clone();
+    let od = hosts
+        .values()
+        .flatten()
+        .filter(|h| h.market == Market::OnDemand)
+        .count();
+    assert_eq!(
+        od,
+        1,
+        "on-demand instances over the cap: {:?}",
+        fake.calls()
+    );
+}
+
+/// A lost launch's host can fill its region before a later list omits it. The recovered
+/// host still has visibility protection, so this never creates a second instance.
+#[tokio::test]
+async fn a_lost_launch_whose_host_is_listed_stays_protected_from_later_omissions() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let fake = Arc::new(FakeHosts::default());
+    *fake.ambiguous.lock().unwrap() = 1;
+    *fake.launch_state.lock().unwrap() = Some("running".into());
+    *fake.hide_new.lock().unwrap() = Some((1, 4));
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    until_hosts(&fake, "past the omitted recovered-host lists", |f| {
+        f.calls().iter().filter(|c| c.starts_with("list ")).count() >= 8
+    })
+    .await;
+    // Include terminated instances: a duplicate may already have been removed as excess.
+    let launched = fake.hosts.lock().unwrap()["us-east-1"].len();
+    assert_eq!(launched, 1, "{:?}", fake.calls());
+}
+
+/// A lost on-demand launch whose host the next list shows releases its reservation: the
+/// region is full, its token is dropped, and the host is counted once. With a cap of 2, the
+/// other region still gets an on-demand host when its spot host is reclaimed and spot is
+/// refused.
+#[tokio::test]
+async fn a_lost_launch_whose_host_is_listed_releases_its_reservation() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Market};
+    let fake = Arc::new(FakeHosts::default());
+    fake.capacity.lock().unwrap().extend([
+        (("us-east-1".to_string(), Market::Spot), 0),
+        (("us-east-2".to_string(), Market::Spot), 1),
+    ]);
+    *fake.ambiguous.lock().unwrap() = 1;
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1", "us-east-2"], 1, 2)),
+        None,
+    );
+    until_hosts(&fake, "a host in each region", |f| {
+        f.present("us-east-1").len() == 1 && f.present("us-east-2").len() == 1
+    })
+    .await;
+    // Past the pass that lists the lost launch's host.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    fake.set_state("us-east-2", "pending", "terminated");
+    until_hosts(&fake, "an on-demand host in us-east-2", |f| {
+        f.present("us-east-2")
+            .iter()
+            .any(|h| h.market == Market::OnDemand)
+    })
+    .await;
+}
+
+/// A lost launch that launched part of its count is asked again with its token, and the
+/// instances its answer names that the list already shows are not counted twice: only the
+/// one host still missing falls back to on demand.
+#[tokio::test]
+async fn a_lost_partial_launch_counts_its_listed_hosts_once() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Market};
+    let fake = Arc::new(FakeHosts::default());
+    fake.capacity
+        .lock()
+        .unwrap()
+        .insert(("us-east-1".into(), Market::Spot), 2);
+    *fake.ambiguous.lock().unwrap() = 1;
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 3, 8)),
+        None,
+    );
+    until_hosts(&fake, "three hosts", |f| f.present("us-east-1").len() == 3).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let hosts = fake.hosts.lock().unwrap()["us-east-1"].clone();
+    let count = |m: Market| hosts.iter().filter(|h| h.market == m).count();
+    assert_eq!(
+        (count(Market::Spot), count(Market::OnDemand)),
+        (2, 1),
+        "{:?}",
+        fake.calls()
+    );
+}
+
+/// A list can name a new host and the next one leave it out (DescribeInstances is eventually
+/// consistent): the host still counts, and no second one is launched.
+#[tokio::test]
+async fn a_host_a_later_list_leaves_out_is_not_launched_again() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let fake = Arc::new(FakeHosts::default());
+    *fake.hide_new.lock().unwrap() = Some((1, 4));
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    until_hosts(&fake, "launched", |f| !launches(f).is_empty()).await;
+    // Past the one list that names it, the four that leave it out, and more.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(launches(&fake).len(), 1, "{:?}", fake.calls());
+    assert_eq!(fake.present("us-east-1").len(), 1);
+}
+
+/// A running host remains protected when a later list omits it during the launch grace.
+#[tokio::test]
+async fn a_running_host_a_later_list_leaves_out_is_not_launched_again() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let fake = Arc::new(FakeHosts::default());
+    *fake.launch_state.lock().unwrap() = Some("running".into());
+    *fake.hide_new.lock().unwrap() = Some((1, 4));
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    // One visible list, four omitted lists, and subsequent visible lists have all run.
+    until_hosts(&fake, "past the omitted running-host lists", |f| {
+        f.calls().iter().filter(|c| c.starts_with("list ")).count() >= 8
+    })
+    .await;
+    assert_eq!(launches(&fake).len(), 1, "{:?}", fake.calls());
+    assert_eq!(fake.present("us-east-1").len(), 1);
+}
+
+/// A coordinator that restarts keeps the hosts it finds (an on-demand fallback from before
+/// the restart included): nothing is launched beside them.
+#[tokio::test]
+async fn a_restart_keeps_the_hosts_it_finds() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Host, Market};
+    let fake = Arc::new(FakeHosts::default());
+    fake.hosts.lock().unwrap().insert(
+        "us-east-1".into(),
+        vec![Host {
+            id: "i-0123456789abcdef0".into(),
+            state: "running".into(),
+            market: Market::OnDemand,
+        }],
+    );
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    until_hosts(&fake, "listed", |f| {
+        f.calls().iter().filter(|c| c.starts_with("list")).count() >= 3
+    })
+    .await;
+    assert!(launches(&fake).is_empty(), "{:?}", fake.calls());
+    assert_eq!(fake.present("us-east-1").len(), 1);
 }
 
 /// No poster is taken while tiles are starting or a race relaunches them: their regions
@@ -2123,6 +3034,9 @@ async fn no_poster_is_planned_while_tiles_start_or_race() {
         .to_coord
         .send(AgentMsg::Aggregate {
             frame_url: "ws://gpu-host.example:20200/frames".into(),
+            ipv6: None,
+            ipv4: None,
+            v4_port: None,
         })
         .unwrap();
     // Nor while the tiles are still starting (the first poster of a GPU run was black).
@@ -2198,6 +3112,9 @@ async fn a_poster_plan_names_only_placed_aggregators() {
     a.to_coord
         .send(AgentMsg::Aggregate {
             frame_url: "ws://gpu-a.example:20200/frames".into(),
+            ipv6: None,
+            ipv4: None,
+            v4_port: None,
         })
         .unwrap();
     // gpu-b's only GPU is on standby: max_tiles is taken by gpu-a.
@@ -2205,6 +3122,9 @@ async fn a_poster_plan_names_only_placed_aggregators() {
     b.to_coord
         .send(AgentMsg::Aggregate {
             frame_url: "ws://gpu-b.example:20200/frames".into(),
+            ipv6: None,
+            ipv4: None,
+            v4_port: None,
         })
         .unwrap();
     // A scrub after it on the same connection shows when gpu-b's aggregate is applied.
@@ -2377,35 +3297,14 @@ async fn the_state_lives_in_s3_and_a_refused_read_is_an_error() {
             .unwrap()
             .version;
     }
-    // The coordinator's 1 s ticker moves the version without a receipt whenever a tick
-    // changes the fleet, so the stored version can pass the last receipt's. A viewer
-    // joining does the same on demand, which makes that happen on every run.
-    let after = handle
-        .apply(Event::ViewerJoined {
-            at: 0,
-            viewer: "v-2".into(),
-            client: None,
-        })
-        .await;
-    assert!(after.is_none(), "a join carries no receipt");
-    handle.shutdown().await;
-    tokio::time::timeout(Duration::from_secs(5), actor)
-        .await
-        .unwrap()
-        .unwrap();
+    let final_version = shutdown_at_final_version(&handle, actor, last).await;
     assert!(s3
         .objects
         .lock()
         .unwrap()
         .contains_key("/fleet-state/state.json"));
     let back = obj().load().await.unwrap().expect("the state object");
-    // The stored state is the state the actor ended with, which the shutdown publishes.
-    let final_version = handle.snapshot.borrow().version;
     assert_eq!(back.version, final_version);
-    assert!(
-        back.version > last,
-        "the join moved the version past the last receipt"
-    );
     for i in 0..3 {
         assert!(
             back.receipts.contains_key(&format!("l-{i}")),
@@ -2429,6 +3328,10 @@ struct FakeEc2Api {
     tagged: BTreeMap<String, Vec<String>>,
     /// Instances DescribeInstances reports terminated.
     gone: Vec<String>,
+    /// For a spot launch that names a subnet: the subnets with capacity, and those whose AZ
+    /// does not offer the type (`Unsupported`).
+    spot_subnets: Vec<String>,
+    unsupported_subnets: Vec<String>,
     calls: Arc<std::sync::Mutex<Vec<Ec2Call>>>,
 }
 
@@ -2474,8 +3377,16 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
                 match action {
                     "RunInstances" => {
                         let spot = params["LaunchTemplate.LaunchTemplateName"] == "fcvm-fleet-tile-x86_64";
-                        if spot && !api.spot_capacity.contains(&region) {
-                            return error("InsufficientInstanceCapacity");
+                        match params.get("NetworkInterface.1.SubnetId") {
+                            Some(s) if api.unsupported_subnets.contains(s) => return error("Unsupported"),
+                            Some(s) if spot && !api.spot_subnets.contains(s) => {
+                                return error("InsufficientInstanceCapacity")
+                            }
+                            Some(_) => {}
+                            None if spot && !api.spot_capacity.contains(&region) => {
+                                return error("InsufficientInstanceCapacity")
+                            }
+                            None => {}
                         }
                         (StatusCode::OK, "<RunInstancesResponse><instancesSet><item><instanceId>i-0123456789abcdef0</instanceId></item></instancesSet></RunInstancesResponse>".into())
                     }
@@ -2492,6 +3403,29 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
                     "DescribeInstances" if api.gone.contains(&params["InstanceId.1"]) => (StatusCode::OK, format!("<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>{}</instanceId><instanceState><code>48</code><name>terminated</name></instanceState></item></instancesSet></item></reservationSet></DescribeInstancesResponse>", params["InstanceId.1"])),
                     "DescribeInstances" => (StatusCode::OK, "<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>i-0123456789abcdef0</instanceId><instanceState><code>16</code><name>running</name></instanceState><ipAddress>127.0.0.1</ipAddress><ipv6Address>2001:db8::5</ipv6Address></item></instancesSet></item></reservationSet></DescribeInstancesResponse>".into()),
                     "TerminateInstances" => (StatusCode::OK, "<TerminateInstancesResponse/>".into()),
+                    // An instant EC2 Fleet: spot is refused per pool where the region has no spot
+                    // capacity (a 200 with an errorSet, as EC2 answers it); on demand launches.
+                    "DescribeLaunchTemplateVersions" => (StatusCode::OK, "<DescribeLaunchTemplateVersionsResponse><launchTemplateVersionSet><item><launchTemplateData><instanceType>g4dn.metal</instanceType></launchTemplateData></item></launchTemplateVersionSet></DescribeLaunchTemplateVersionsResponse>".into()),
+                    // IAM's FleetTypesOnly checks ec2:InstanceType on the fleet's instances, and
+                    // CreateFleet supplies that key only from the request's overrides: an override
+                    // that names no host type is refused as a whole, as EC2 answers it.
+                    "CreateFleet" if params.iter().any(|(k, _)| {
+                        k.ends_with(".SubnetId")
+                            && !matches!(
+                                params.get(&k.replace(".SubnetId", ".InstanceType")).map(String::as_str),
+                                Some("g4dn.metal" | "g5g.metal")
+                            )
+                    }) => (
+                        StatusCode::FORBIDDEN,
+                        "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>You are not authorized to perform this operation.</Message></Error></Errors></Response>".into(),
+                    ),
+                    "CreateFleet" => {
+                        let spot = params["TargetCapacitySpecification.DefaultTargetCapacityType"] == "spot";
+                        if spot && !api.spot_capacity.contains(&region) {
+                            return (StatusCode::OK, "<CreateFleetResponse><fleetId>fleet-0</fleetId><errorSet><item><lifecycle>spot</lifecycle><errorCode>UnfulfillableCapacity</errorCode><errorMessage>Unable to fulfill capacity due to your request configuration.</errorMessage></item></errorSet><fleetInstanceSet/></CreateFleetResponse>".into());
+                        }
+                        (StatusCode::OK, "<CreateFleetResponse><fleetId>fleet-1</fleetId><fleetInstanceSet><item><instanceIds><item>i-0fedcba9876543210</item></instanceIds></item></fleetInstanceSet></CreateFleetResponse>".into())
+                    }
                     _ => error("InvalidAction"),
                 }
             },
@@ -2503,11 +3437,97 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
     base
 }
 
-/// `alive` reads the instance's state: a running tile is alive, a terminated one (a spot
-/// reclaim) is not.
+/// The host driver asks EC2 Fleet for every template and subnet of the region at once, reads a
+/// spot refusal for capacity out of the answer's errorSet (EC2 answers 200), and an on-demand
+/// request launches; the fleet's hosts are listed by their tags.
 #[tokio::test]
-async fn the_aws_tile_driver_sees_a_reclaimed_instance() {
-    use fcvm::fleet::coord::ec2::Ec2Driver;
+async fn the_aws_host_driver_launches_through_an_instant_fleet() {
+    use fcvm::fleet::coord::hosts::{AwsHosts, HostDriver, Market};
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let api = FakeEc2Api {
+        tagged: [(
+            "us-east-1".to_string(),
+            vec!["i-0123456789abcdef0".to_string()],
+        )]
+        .into(),
+        ..Default::default()
+    };
+    let base = fake_ec2_api(api.clone()).await;
+    let mut d = AwsHosts::new(
+        &["us-east-1:fcvm-fleet-host-x86_64".parse().unwrap()],
+        &[
+            "us-east-1:subnet-0000000000000000a".parse().unwrap(),
+            "us-east-1:subnet-0000000000000000b".parse().unwrap(),
+        ],
+        "stage".into(),
+    )
+    .unwrap();
+    d.endpoints.insert("us-east-1".into(), base);
+    let spot = d
+        .launch("us-east-1", Market::Spot, 1, "token-spot")
+        .await
+        .unwrap();
+    assert!(spot.ids.is_empty(), "{spot:?}");
+    assert_eq!(spot.refused.len(), 1, "{spot:?}");
+    assert!(spot.refused[0].starts_with("UnfulfillableCapacity: "));
+    let od = d
+        .launch("us-east-1", Market::OnDemand, 1, "token-od")
+        .await
+        .unwrap();
+    assert_eq!(od.ids, vec!["i-0fedcba9876543210".to_string()]);
+    let calls = api.calls.lock().unwrap().clone();
+    // The template's type is read once and reused for the second launch.
+    let reads: Vec<_> = calls
+        .iter()
+        .filter(|(_, p)| p["Action"] == "DescribeLaunchTemplateVersions")
+        .collect();
+    assert_eq!(reads.len(), 1, "{calls:?}");
+    assert_eq!(reads[0].1["LaunchTemplateName"], "fcvm-fleet-host-x86_64");
+    let (region, p) = calls
+        .iter()
+        .find(|(_, p)| p["Action"] == "CreateFleet")
+        .unwrap();
+    assert_eq!(region, "us-east-1");
+    assert_eq!(
+        p["LaunchTemplateConfigs.1.Overrides.1.InstanceType"],
+        "g4dn.metal"
+    );
+    assert_eq!(p["ClientToken"], "token-spot");
+    assert_eq!(p["Type"], "instant");
+    assert_eq!(
+        p["LaunchTemplateConfigs.1.LaunchTemplateSpecification.LaunchTemplateName"],
+        "fcvm-fleet-host-x86_64"
+    );
+    assert_eq!(
+        p["LaunchTemplateConfigs.1.Overrides.2.SubnetId"],
+        "subnet-0000000000000000b"
+    );
+    assert_eq!(p["TagSpecification.1.Tag.2.Value"], "fcvm-fleet-host");
+    let hosts = d.hosts("us-east-1").await.unwrap();
+    assert_eq!(hosts.len(), 1);
+    assert_eq!(hosts[0].id, "i-0123456789abcdef0");
+    let list = &api
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, p)| p["Action"] == "DescribeInstances")
+        .unwrap()
+        .1
+        .clone();
+    assert_eq!(list["Filter.1.Value.1"], "fcvm-fleet-host");
+    assert_eq!(list["Filter.2.Value.1"], "stage");
+    // A template with no subnet in its region is refused at start.
+    assert!(AwsHosts::new(&["us-east-1:t".parse().unwrap()], &[], "stage".into()).is_err());
+}
+
+/// `alive` reads the instance's state and asks its renderer: a running tile whose renderer
+/// answers is alive, a terminated one (a spot reclaim) or one whose renderer reports an
+/// error is dead, and one whose renderer does not answer is silent.
+#[tokio::test]
+async fn the_aws_tile_driver_sees_a_reclaimed_instance_and_a_stopped_renderer() {
+    use fcvm::fleet::coord::ec2::{Ec2Driver, Liveness};
     use fcvm::fleet::coord::ec2_aws::AwsEc2;
     std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
     std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
@@ -2516,22 +3536,67 @@ async fn the_aws_tile_driver_sees_a_reclaimed_instance() {
         ..Default::default()
     };
     let base = fake_ec2_api(api.clone()).await;
-    let mut d = AwsEc2::new(
-        vec!["us-east-1".to_string()],
-        "fcvm-fleet-tile-x86_64".into(),
-        None,
-        "fcvm.example".into(),
-    )
-    .unwrap();
-    d.endpoints.insert("us-east-1".into(), base);
+    // A renderer answering `body` at /health, on a port of its own.
+    async fn renderer(body: Value) -> u16 {
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move { axum::Json(body) }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        port
+    }
+    let driver = |port: u16| {
+        let mut d = AwsEc2::new(
+            vec!["us-east-1".to_string()],
+            "fcvm-fleet-tile-x86_64".into(),
+            None,
+            "fcvm.example".into(),
+        )
+        .unwrap();
+        d.endpoints.insert("us-east-1".into(), base.clone());
+        d.health_scheme = "http".into();
+        d.health_port = port;
+        d
+    };
     let launched = |id: &str| ec2::Launched {
         instance: format!("us-east-1/{id}"),
         frame_url: None,
         ipv6: None,
         ipv4: None,
     };
-    assert!(d.alive(&launched("i-0123456789abcdef0")).await.unwrap());
-    assert!(!d.alive(&launched("i-reclaimed-1")).await.unwrap());
+    let running = launched("i-0123456789abcdef0");
+    let ready = driver(renderer(json!({"ready": true})).await);
+    assert_eq!(
+        ready.alive("ec2-1", &running).await.unwrap(),
+        Liveness::Alive
+    );
+    match ready
+        .alive("ec2-1", &launched("i-reclaimed-1"))
+        .await
+        .unwrap()
+    {
+        Liveness::Dead(why) => assert!(why.contains("terminated"), "{why}"),
+        other => panic!("a reclaimed instance is {other:?}"),
+    }
+    let failed = driver(renderer(json!({"ready": true, "error": "CUDA error 999"})).await);
+    match failed.alive("ec2-1", &running).await.unwrap() {
+        Liveness::Dead(why) => assert!(why.contains("CUDA error 999"), "{why}"),
+        other => panic!("a failed renderer is {other:?}"),
+    }
+    // Nothing listens on a port that was bound and released.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    match driver(closed).alive("ec2-1", &running).await.unwrap() {
+        Liveness::Silent(_) => {}
+        other => panic!("a renderer that does not answer is {other:?}"),
+    }
 }
 
 /// A restarted coordinator does not know the tile instances an earlier one launched:
@@ -2652,6 +3717,178 @@ async fn the_aws_tile_driver_waits_for_a_ready_renderer_and_refuses_a_failed_one
         .await
         .expect_err("a failed renderer is not a ready tile");
     assert!(format!("{e:#}").contains("CUDA init failed"), "{e:#}");
+}
+
+/// A starting tile's renderer is asked for `/health` every 250 ms, not every describe
+/// (3 s): the coordinator saw tiles ready up to 3 s late. EC2 is described once per `poll`
+/// all the same, so an instance reclaimed while it boots is still noticed.
+#[tokio::test]
+async fn a_starting_tile_is_seen_ready_within_the_health_poll_not_the_describe_poll() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    use fcvm::fleet::coord::ec2_aws::{AwsEc2, HEALTH_POLL};
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let n2 = n.clone();
+    let app = axum::Router::new().route(
+        "/health",
+        axum::routing::get(move || {
+            let i = n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { axum::Json(json!({"ready": i >= 2})) }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let api = FakeEc2Api::default();
+    let base = fake_ec2_api(api.clone()).await;
+    let mut d = AwsEc2::new(
+        vec!["us-east-1".to_string()],
+        "fcvm-fleet-tile-x86_64".into(),
+        None,
+        "fcvm.example".into(),
+    )
+    .unwrap();
+    assert!(d.health_poll == HEALTH_POLL && HEALTH_POLL <= Duration::from_millis(250));
+    d.endpoints.insert("us-east-1".into(), base);
+    d.health_scheme = "http".into();
+    d.health_port = port;
+    d.poll = Duration::from_secs(3);
+    d.ready_timeout = Duration::from_secs(20);
+    let launched = ec2::Launched {
+        instance: "us-east-1/i-0123456789abcdef0".into(),
+        frame_url: None,
+        ipv6: None,
+        ipv4: None,
+    };
+    let t = std::time::Instant::now();
+    d.ready("ec2-1", &launched).await.unwrap();
+    let took = t.elapsed();
+    assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 3);
+    // Two not-ready answers, then ready: two health polls, far less than one describe poll.
+    assert!(took < Duration::from_millis(1500), "ready after {took:?}");
+    let describes = api
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, p)| p["Action"] == "DescribeInstances")
+        .count();
+    assert_eq!(describes, 1, "one describe within the first poll");
+}
+
+/// With subnets configured for a region, a launch tries each of them (one per AZ) in order,
+/// naming the whole interface (subnet, the region's group, a public IPv4 and an IPv6
+/// address), and moves to the next AZ on a capacity refusal or an `Unsupported` type, before
+/// the next region. Before, a launch named no subnet, so the template's one AZ decided.
+#[tokio::test]
+async fn the_aws_tile_driver_tries_every_az_of_a_region_before_the_next() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    use fcvm::fleet::coord::ec2_aws::{networks, AwsEc2};
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let api = FakeEc2Api {
+        // us-west-2 has capacity for a launch that names no subnet: a launch must not get
+        // there while an AZ of us-east-1 has some.
+        spot_capacity: vec!["us-west-2".into()],
+        spot_subnets: vec!["subnet-c".into()],
+        unsupported_subnets: vec!["subnet-a".into()],
+        ..Default::default()
+    };
+    let base = fake_ec2_api(api.clone()).await;
+    let regions = vec!["us-east-1".to_string(), "us-west-2".to_string()];
+    let mut d = AwsEc2::new(
+        regions.clone(),
+        "fcvm-fleet-tile-x86_64".into(),
+        None,
+        "fcvm.example".into(),
+    )
+    .unwrap();
+    for r in &regions {
+        d.endpoints.insert(r.clone(), base.clone());
+    }
+    d.networks = networks(
+        &["us-east-1:subnet-a,subnet-b,subnet-c".to_string()],
+        &["us-east-1:sg-0fleet".to_string()],
+    )
+    .unwrap();
+    let l = d.launch("ec2-1").await.unwrap();
+    assert_eq!(l.instance, "us-east-1/i-0123456789abcdef0");
+    let calls = api.calls.lock().unwrap();
+    let runs: Vec<&Ec2Call> = calls
+        .iter()
+        .filter(|(_, p)| p["Action"] == "RunInstances")
+        .collect();
+    let tried: Vec<(&str, Option<&str>)> = runs
+        .iter()
+        .map(|(r, p)| {
+            (
+                r.as_str(),
+                p.get("NetworkInterface.1.SubnetId").map(String::as_str),
+            )
+        })
+        .collect();
+    assert_eq!(
+        tried,
+        vec![
+            ("us-east-1", Some("subnet-a")),
+            ("us-east-1", Some("subnet-b")),
+            ("us-east-1", Some("subnet-c")),
+        ],
+        "every AZ of the first region, in order, and no other region"
+    );
+    for (_, p) in &runs {
+        assert_eq!(
+            p["LaunchTemplate.LaunchTemplateName"],
+            "fcvm-fleet-tile-x86_64"
+        );
+        assert_eq!(p["NetworkInterface.1.DeviceIndex"], "0");
+        assert_eq!(p["NetworkInterface.1.SecurityGroupId.1"], "sg-0fleet");
+        assert_eq!(p["NetworkInterface.1.AssociatePublicIpAddress"], "true");
+        assert_eq!(p["NetworkInterface.1.Ipv6AddressCount"], "1");
+        assert_eq!(p["NetworkInterface.1.DeleteOnTermination"], "true");
+    }
+}
+
+/// `--ec2-subnets` and `--ec2-security-group` (or their environment variables) parse into
+/// one network per region; a region with subnets and no group is refused at start.
+#[test]
+fn tile_networks_need_a_group_for_every_region_with_subnets() {
+    use fcvm::fleet::coord::ec2_aws::networks;
+    let n = networks(
+        &[
+            "us-east-1:subnet-a,subnet-b".to_string(),
+            String::new(),
+            "us-west-2:subnet-z".to_string(),
+        ],
+        &[
+            "us-east-1:sg-1".to_string(),
+            "us-west-2:sg-2".to_string(),
+            "us-east-2:sg-3".to_string(),
+        ],
+    )
+    .unwrap();
+    assert_eq!(n["us-east-1"].subnets, vec!["subnet-a", "subnet-b"]);
+    assert_eq!(n["us-east-1"].security_group, "sg-1");
+    assert_eq!(n["us-west-2"].subnets, vec!["subnet-z"]);
+    assert!(
+        !n.contains_key("us-east-2"),
+        "a group alone names no subnet"
+    );
+    let e = networks(&["us-east-1:subnet-a".to_string()], &[]).unwrap_err();
+    assert!(
+        format!("{e:#}").contains("no --ec2-security-group"),
+        "{e:#}"
+    );
+    assert!(networks(&["subnet-a".to_string()], &[]).is_err());
+    assert!(networks(
+        &[
+            "us-east-1:subnet-a".to_string(),
+            "us-east-1:subnet-b".to_string()
+        ],
+        &["us-east-1:sg-1".to_string()]
+    )
+    .is_err());
 }
 
 /// The AWS tile driver: a spot launch from the template, tagged, in the first region with
@@ -2878,6 +4115,18 @@ async fn subzone_fixture() -> (
     tokio::sync::watch::Receiver<Arc<fcvm::fleet::coord::authority::Zone>>,
     FakeAgent,
 ) {
+    subzone_fixture_with(Config::default(), None).await
+}
+
+async fn subzone_fixture_with(
+    config: Config,
+    ec2: Option<Arc<dyn ec2::Ec2Driver>>,
+) -> (
+    Handle,
+    std::net::SocketAddr,
+    tokio::sync::watch::Receiver<Arc<fcvm::fleet::coord::authority::Zone>>,
+    FakeAgent,
+) {
     use fcvm::fleet::coord::authority::Authority;
     let (names, rx) = subzone_names();
     let server = Authority {
@@ -2888,9 +4137,9 @@ async fn subzone_fixture() -> (
     .await
     .unwrap();
     let (handle, _actor) = start(
-        State::new(Config::default(), now_ms()),
+        State::new(config, now_ms()),
         None,
-        None,
+        ec2,
         None,
         None,
         Some(names),
@@ -3007,6 +4256,146 @@ async fn a_new_address_at_the_same_generation_gets_new_names() {
     );
 }
 
+/// The aggregate `id` in the latest snapshot (`agg:gpu-a`, `agg:ec2`), or null.
+fn aggregate_of(handle: &Handle, id: &str) -> Value {
+    let state = &serde_json::from_str::<Value>(&handle.snapshot.borrow().text).unwrap()["state"];
+    state["aggregates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == id)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// The first snapshot in which aggregate `id` shows a `frame_url` other than `not`: its two
+/// frame URLs.
+async fn aggregate_urls(handle: &Handle, id: &str, not: Option<&str>) -> (String, String) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let a = aggregate_of(handle, id);
+        if let (Some(v6), Some(v4)) = (a["frame_url"].as_str(), a["frame_url_v4"].as_str()) {
+            if Some(v6) != not {
+                return (v6.to_string(), v4.to_string());
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no published aggregator URLs: {a}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn report_aggregate(agent: &FakeAgent, v6: Option<&str>, v4: Option<&str>) {
+    agent
+        .to_coord
+        .send(AgentMsg::Aggregate {
+            frame_url: "ws://gpu-a.internal:20300/frames".into(),
+            ipv6: v6.map(str::to_string),
+            ipv4: v4.map(str::to_string),
+            v4_port: v4.map(|_| 20208),
+        })
+        .unwrap();
+}
+
+/// A host aggregator that serves browsers is named like a launch, under
+/// `agg-<host>-<token>` in the subzone: AAAA its own IPv6 address, the `-v4` A the host's
+/// IPv4 address with the aggregator's port in `frame_url_v4`, and the coordinator's server
+/// answers both from the moment the page can read them. An aggregator that reports no
+/// public address gets no URL (the page is https and cannot open its plain one) and no
+/// names. A new address is a new label, and the old names stop answering.
+#[tokio::test]
+async fn a_host_aggregator_is_named_in_the_subzone_and_answers() {
+    let (handle, server, _zone, agent) = subzone_fixture().await;
+    report_slot(&agent, 1, Some("2001:db8::2"), Some("192.0.2.10"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while aggregate_of(&handle, "agg:gpu-a").is_null() {
+        assert!(Instant::now() < deadline, "the host's band never appeared");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    report_aggregate(&agent, None, None);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let a = aggregate_of(&handle, "agg:gpu-a");
+    assert!(
+        a["frame_url"].is_null() && a["frame_url_v4"].is_null(),
+        "the plain URL reached an https page: {a}"
+    );
+
+    report_aggregate(&agent, Some("2001:db8::1"), Some("192.0.2.10"));
+    let (v6_url, v4_url) = aggregate_urls(&handle, "agg:gpu-a", None).await;
+    let (v6, v4) = (host_of(&v6_url), host_of(&v4_url));
+    let label = v6
+        .strip_suffix(".tiles.fcvm.example")
+        .expect("in the subzone");
+    assert!(
+        label.starts_with("agg-gpu-a-") && label.len() == "agg-gpu-a-".len() + 8,
+        "{v6_url}"
+    );
+    assert_eq!(v6_url, format!("wss://{label}.tiles.fcvm.example/frames"));
+    assert_eq!(
+        v4_url,
+        format!("wss://{label}-v4.tiles.fcvm.example:20208/frames")
+    );
+    assert_eq!(
+        ask_dns(server, &v6, 28, false).await,
+        (0, true, vec!["2001:db8::1".to_string()])
+    );
+    assert_eq!(
+        ask_dns(server, &v4, 1, false).await,
+        (0, true, vec!["192.0.2.10".to_string()])
+    );
+
+    // Another address (a new host prefix): new names, and the old ones stop answering.
+    report_aggregate(&agent, Some("2001:db8:5::1"), Some("192.0.2.10"));
+    let (second, _) = aggregate_urls(&handle, "agg:gpu-a", Some(&v6_url)).await;
+    assert_ne!(host_of(&second), v6);
+    assert_eq!(
+        ask_dns(server, &host_of(&second), 28, false).await,
+        (0, true, vec!["2001:db8:5::1".to_string()])
+    );
+    assert_eq!(ask_dns(server, &v6, 28, false).await, (3, true, vec![]));
+    assert_eq!(ask_dns(server, &v4, 1, false).await, (3, true, vec![]));
+}
+
+/// The EC2 half's aggregator serving browsers with TLS is named `agg-ec2-<token>` in the
+/// subzone at the coordinator's own addresses, both on 443, and the server answers both.
+#[tokio::test]
+async fn the_ec2_aggregator_is_named_in_the_subzone_and_answers() {
+    let config = Config {
+        ec2_max: 1,
+        ec2_aggregate_ipv6: Some("2001:db8:20::5".into()),
+        ec2_aggregate_ipv4: Some("192.0.2.44".into()),
+        ..Config::default()
+    };
+    let ec2: Arc<dyn ec2::Ec2Driver> = Arc::new(ec2::FakeEc2::new(
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+    ));
+    let (handle, server, _zone, _agent) = subzone_fixture_with(config, Some(ec2)).await;
+    let (v6_url, v4_url) = aggregate_urls(&handle, "agg:ec2", None).await;
+    let (v6, v4) = (host_of(&v6_url), host_of(&v4_url));
+    let label = v6
+        .strip_suffix(".tiles.fcvm.example")
+        .expect("in the subzone");
+    assert!(
+        label.starts_with("agg-ec2-") && label.len() == "agg-ec2-".len() + 8,
+        "{v6_url}"
+    );
+    assert_eq!(
+        v4_url,
+        format!("wss://{label}-v4.tiles.fcvm.example/frames")
+    );
+    assert_eq!(
+        ask_dns(server, &v6, 28, false).await,
+        (0, true, vec!["2001:db8:20::5".to_string()])
+    );
+    assert_eq!(
+        ask_dns(server, &v4, 1, true).await,
+        (0, true, vec!["192.0.2.44".to_string()])
+    );
+}
+
 /// An EC2 tile whose renderer reports a fit; it records the budgets posted to it.
 struct BudgetEc2 {
     posted: std::sync::Mutex<Vec<fleet_core::protocol::BudgetBody>>,
@@ -3107,4 +4496,596 @@ async fn the_slowest_tile_sets_one_budget_for_every_tile() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(driver.posted.lock().unwrap()[0], got);
+}
+
+/// One instance of [`PoolEc2`]: state, tags, image, spot request.
+type PoolInstance = (String, BTreeMap<String, String>, String, Option<String>);
+
+/// A stateful EC2 for the tile pool: instances with states, tags, images and spot requests.
+#[derive(Default)]
+struct PoolEc2 {
+    instances: BTreeMap<String, PoolInstance>,
+    next: u32,
+    /// The pool template's current image.
+    image: String,
+    cancelled: Vec<String>,
+    /// Instances terminated while their spot request was not cancelled.
+    uncancelled_terminates: Vec<String>,
+    /// Instances whose StartInstances fails (a spot request not yet disabled).
+    start_fails: Vec<String>,
+    /// Instances launched more than a week ago.
+    old: Vec<String>,
+    /// Instances a filtered DescribeInstances lists as stopped and pooled whatever they are
+    /// (a list read before a resume and a release changed them).
+    listed_stopped: Vec<String>,
+    /// TerminateInstances calls that fail before one succeeds.
+    terminate_fails: u32,
+    /// CreateTags calls for FleetPool that fail before one succeeds.
+    pool_tag_fails: u32,
+    actions: Vec<String>,
+}
+
+async fn pool_ec2_api(api: Arc<std::sync::Mutex<PoolEc2>>) -> String {
+    use axum::http::StatusCode;
+    let app = axum::Router::new().fallback(move |body: String| {
+        let api = api.clone();
+        async move {
+            let p: BTreeMap<String, String> = body
+                .split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .map(|(k, v)| {
+                    let v = v.replace("%24", "$").replace("%3A", ":").replace("%2F", "/");
+                    (k.replace("%2E", "."), v)
+                })
+                .collect();
+            let mut a = api.lock().unwrap();
+            let action = p["Action"].clone();
+            a.actions.push(action.clone());
+            let ids = |p: &BTreeMap<String, String>, key: &str| -> Vec<String> {
+                (1..)
+                    .map_while(|i| p.get(&format!("{key}.{i}")).cloned())
+                    .collect()
+            };
+            let old = a.old.clone();
+            let item = |id: &str, (st, tags, img, sir): &PoolInstance| {
+                let at = if old.contains(&id.to_string()) {
+                    "2020-01-01T00:00:00.000Z".to_string()
+                } else {
+                    chrono::Utc::now().to_rfc3339()
+                };
+                let tags: String = tags
+                    .iter()
+                    .map(|(k, v)| format!("<item><key>{k}</key><value>{v}</value></item>"))
+                    .collect();
+                let sir = sir.as_ref().map(|r| format!("<spotInstanceRequestId>{r}</spotInstanceRequestId>")).unwrap_or_default();
+                format!("<item><instancesSet><item><instanceId>{id}</instanceId><imageId>{img}</imageId><instanceState><name>{st}</name></instanceState><launchTime>{at}</launchTime><ipAddress>127.0.0.1</ipAddress>{sir}<tagSet>{tags}</tagSet></item></instancesSet></item>")
+            };
+            let ok = |s: String| (StatusCode::OK, s);
+            match action.as_str() {
+                "RunInstances" => {
+                    a.next += 1;
+                    let id = format!("i-pool{:012}", a.next);
+                    let mut tags = BTreeMap::new();
+                    for i in 1.. {
+                        let Some(k) = p.get(&format!("TagSpecification.1.Tag.{i}.Key")) else { break };
+                        tags.insert(k.clone(), p[&format!("TagSpecification.1.Tag.{i}.Value")].clone());
+                    }
+                    // The pool template's requests are persistent; the spot template's one-time.
+                    let sir = match p["LaunchTemplate.LaunchTemplateName"].as_str() {
+                        "tile-pool" => Some(format!("sir-{}", a.next)),
+                        "tile-spot" => Some(format!("sir-once-{}", a.next)),
+                        _ => None,
+                    };
+                    let img = a.image.clone();
+                    a.instances.insert(id.clone(), ("running".into(), tags, img, sir));
+                    ok(format!("<RunInstancesResponse><instancesSet><item><instanceId>{id}</instanceId></item></instancesSet></RunInstancesResponse>"))
+                }
+                "DescribeInstances" => {
+                    let wanted = ids(&p, "InstanceId");
+                    let states = ids(&p, "Filter.2.Value");
+                    let fleet = p.get("Filter.3.Value.1").cloned();
+                    let items: String = a
+                        .instances
+                        .iter()
+                        .map(|(id, i)| {
+                            let mut i = i.clone();
+                            if wanted.is_empty() && a.listed_stopped.contains(id) {
+                                i.0 = "stopped".into();
+                                i.1.insert("FleetPool".into(), "stage-test".into());
+                            }
+                            (id, i)
+                        })
+                        .filter(|(id, (st, tags, _, _))| {
+                            if !wanted.is_empty() {
+                                return wanted.contains(id);
+                            }
+                            states.contains(st)
+                                && tags.get("Purpose").map(String::as_str) == Some("fcvm-fleet-tile")
+                                && tags.get("Fleet") == fleet.as_ref()
+                        })
+                        .map(|(id, i)| item(id, &i))
+                        .collect();
+                    ok(format!("<DescribeInstancesResponse><reservationSet>{items}</reservationSet></DescribeInstancesResponse>"))
+                }
+                "DescribeLaunchTemplateVersions" => ok(format!(
+                    "<DescribeLaunchTemplateVersionsResponse><launchTemplateVersionSet><item><launchTemplateData><imageId>{}</imageId></launchTemplateData></item></launchTemplateVersionSet></DescribeLaunchTemplateVersionsResponse>",
+                    a.image
+                )),
+                "StartInstances" => {
+                    let id = p["InstanceId.1"].clone();
+                    if a.start_fails.contains(&id) {
+                        return (StatusCode::BAD_REQUEST, "<Response><Errors><Error><Code>IncorrectSpotRequestState</Code><Message>not yet</Message></Error></Errors></Response>".into());
+                    }
+                    a.instances.get_mut(&id).unwrap().0 = "running".into();
+                    ok("<StartInstancesResponse/>".into())
+                }
+                "StopInstances" => {
+                    let id = p["InstanceId.1"].clone();
+                    a.instances.get_mut(&id).unwrap().0 = "stopped".into();
+                    ok("<StopInstancesResponse/>".into())
+                }
+                "CreateTags" => {
+                    let id = p["ResourceId.1"].clone();
+                    let (k, v) = (p["Tag.1.Key"].clone(), p["Tag.1.Value"].clone());
+                    if k == "FleetPool" && a.pool_tag_fails > 0 {
+                        a.pool_tag_fails -= 1;
+                        return (StatusCode::SERVICE_UNAVAILABLE, "<Response><Errors><Error><Code>RequestLimitExceeded</Code><Message>slow down</Message></Error></Errors></Response>".into());
+                    }
+                    a.instances.get_mut(&id).unwrap().1.insert(k, v);
+                    ok("<CreateTagsResponse/>".into())
+                }
+                "DeleteTags" => {
+                    let id = p["ResourceId.1"].clone();
+                    let k = p["Tag.1.Key"].clone();
+                    a.instances.get_mut(&id).unwrap().1.remove(&k);
+                    ok("<DeleteTagsResponse/>".into())
+                }
+                "DescribeSpotInstanceRequests" => {
+                    let items: String = ids(&p, "SpotInstanceRequestId")
+                        .iter()
+                        .map(|r| {
+                            let t = if r.starts_with("sir-once-") { "one-time" } else { "persistent" };
+                            format!("<item><spotInstanceRequestId>{r}</spotInstanceRequestId><type>{t}</type></item>")
+                        })
+                        .collect();
+                    ok(format!("<DescribeSpotInstanceRequestsResponse><spotInstanceRequestSet>{items}</spotInstanceRequestSet></DescribeSpotInstanceRequestsResponse>"))
+                }
+                "CancelSpotInstanceRequests" => {
+                    let r = ids(&p, "SpotInstanceRequestId");
+                    a.cancelled.extend(r);
+                    ok("<CancelSpotInstanceRequestsResponse/>".into())
+                }
+                "TerminateInstances" => {
+                    if a.terminate_fails > 0 {
+                        a.terminate_fails -= 1;
+                        return (StatusCode::SERVICE_UNAVAILABLE, "<Response><Errors><Error><Code>RequestLimitExceeded</Code><Message>slow down</Message></Error></Errors></Response>".into());
+                    }
+                    for id in ids(&p, "InstanceId") {
+                        let sir = a.instances[&id].3.clone();
+                        if sir.is_some_and(|r| !r.starts_with("sir-once-") && !a.cancelled.contains(&r)) {
+                            a.uncancelled_terminates.push(id.clone());
+                        }
+                        a.instances.get_mut(&id).unwrap().0 = "terminated".into();
+                    }
+                    ok("<TerminateInstancesResponse/>".into())
+                }
+                _ => (StatusCode::BAD_REQUEST, "<Response><Errors><Error><Code>InvalidAction</Code><Message>no</Message></Error></Errors></Response>".into()),
+            }
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    base
+}
+
+async fn pool_driver(
+    max: usize,
+) -> (
+    fcvm::fleet::coord::ec2_aws::AwsEc2,
+    Arc<std::sync::Mutex<PoolEc2>>,
+) {
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let api = Arc::new(std::sync::Mutex::new(PoolEc2 {
+        image: "ami-0123456789abcdef0".into(),
+        ..Default::default()
+    }));
+    let base = pool_ec2_api(api.clone()).await;
+    let mut d = fcvm::fleet::coord::ec2_aws::AwsEc2::new(
+        vec!["us-east-1".to_string()],
+        "tile-spot".into(),
+        Some("tile-on-demand".into()),
+        "fcvm.example".into(),
+    )
+    .unwrap();
+    d.endpoints.insert("us-east-1".into(), base);
+    d.fleet = "stage-test".into();
+    d.pool_max = max;
+    d.pool_template = Some("tile-pool".into());
+    (d, api)
+}
+
+fn state_of(
+    api: &Arc<std::sync::Mutex<PoolEc2>>,
+    instance: &str,
+) -> (String, BTreeMap<String, String>) {
+    let id = instance.split_once('/').unwrap().1;
+    let a = api.lock().unwrap();
+    let (st, tags, _, _) = &a.instances[id];
+    (st.clone(), tags.clone())
+}
+
+/// A tile whose FleetPool tag fails while the fleet sleeps is terminated, not left running
+/// with no owner: nothing would stop it until the coordinator's next start sweeps.
+#[tokio::test]
+async fn a_tile_that_cannot_be_tagged_into_the_pool_is_terminated() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, api) = pool_driver(2).await;
+    let l = d.launch("ec2-1").await.unwrap();
+    api.lock().unwrap().pool_tag_fails = 1;
+    d.release(&l.instance).await.unwrap();
+    let (st, tags) = state_of(&api, &l.instance);
+    assert_eq!(st, "terminated", "tags {tags:?}");
+    assert!(api.lock().unwrap().uncancelled_terminates.is_empty());
+}
+
+/// A stale pooled instance (an older image) whose termination fails is tried again at the
+/// next resume: its claim is released with the failure, not kept for the coordinator's
+/// lifetime, where every later resume would step over it and it would stay counted in the pool.
+#[tokio::test]
+async fn a_stale_pooled_tile_whose_termination_fails_is_terminated_at_the_next_resume() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, api) = pool_driver(2).await;
+    {
+        let mut a = api.lock().unwrap();
+        let tags: BTreeMap<String, String> = [
+            ("Purpose", "fcvm-fleet-tile"),
+            ("Fleet", "stage-test"),
+            ("FleetPool", "stage-test"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        a.instances.insert(
+            "i-stale000000001".into(),
+            (
+                "stopped".into(),
+                tags,
+                "ami-0older0000000000".into(),
+                Some("sir-7".into()),
+            ),
+        );
+        a.terminate_fails = 1;
+    }
+    assert!(d.resume("ec2-1").await.is_none());
+    assert_eq!(
+        api.lock().unwrap().instances["i-stale000000001"].0,
+        "stopped"
+    );
+    assert!(d.resume("ec2-1").await.is_none());
+    let (state, actions) = {
+        let a = api.lock().unwrap();
+        (a.instances["i-stale000000001"].0.clone(), a.actions.clone())
+    };
+    assert_eq!(
+        state, "terminated",
+        "the second resume did not try the stale instance again: {actions:?}"
+    );
+}
+
+/// DescribeInstances and DescribeSpotInstanceRequests are read item by item: EC2 does not
+/// promise the order of an item's elements, so a field before `<instanceId>` (or a request
+/// type before its id) belongs to its own item, not to the one before it.
+#[test]
+fn ec2_answers_parse_by_item_whatever_the_field_order() {
+    use fcvm::fleet::coord::ec2_aws::{parse_instances, persistent_requests};
+    let xml = "<DescribeInstancesResponse><reservationSet><item><instancesSet>\
+        <item><imageId>ami-a</imageId><instanceState><name>stopped</name></instanceState>\
+        <tagSet><item><key>FleetPool</key><value>stage</value></item></tagSet>\
+        <spotInstanceRequestId>sir-a</spotInstanceRequestId><instanceId>i-a</instanceId></item>\
+        <item><instanceId>i-b</instanceId><imageId>ami-b</imageId>\
+        <instanceState><name>running</name></instanceState></item>\
+        </instancesSet></item></reservationSet></DescribeInstancesResponse>";
+    let got = parse_instances(xml);
+    assert_eq!(got.len(), 2, "{got:?}");
+    let a = got.iter().find(|i| i.id == "i-a").unwrap();
+    let b = got.iter().find(|i| i.id == "i-b").unwrap();
+    assert_eq!(
+        (a.image.as_deref(), a.state.as_str()),
+        (Some("ami-a"), "stopped")
+    );
+    assert!(
+        a.pooled && a.spot_request.as_deref() == Some("sir-a"),
+        "{a:?}"
+    );
+    assert_eq!(
+        (b.image.as_deref(), b.state.as_str()),
+        (Some("ami-b"), "running")
+    );
+    assert!(!b.pooled && b.spot_request.is_none(), "{b:?}");
+    let sirs = "<DescribeSpotInstanceRequestsResponse><spotInstanceRequestSet>\
+        <item><type>persistent</type><spotInstanceRequestId>sir-p</spotInstanceRequestId></item>\
+        <item><spotInstanceRequestId>sir-o</spotInstanceRequestId><type>one-time</type></item>\
+        </spotInstanceRequestSet></DescribeSpotInstanceRequestsResponse>";
+    assert_eq!(persistent_requests(sirs), vec!["sir-p".to_string()]);
+}
+
+/// A tile released when the fleet sleeps is stopped into the pool, and the next wake starts
+/// it (15.5 s to a first frame on staging, against 81 to 84 s for a launch) instead of
+/// launching; cold launches use the pool template, whose instances can be stopped.
+#[tokio::test]
+async fn a_tile_released_into_the_pool_is_started_at_the_next_wake() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, api) = pool_driver(2).await;
+    assert!(
+        d.resume("ec2-1").await.is_none(),
+        "an empty pool resumes nothing"
+    );
+    let l = d.launch("ec2-1").await.unwrap();
+    assert_eq!(
+        api.lock()
+            .unwrap()
+            .instances
+            .values()
+            .next()
+            .unwrap()
+            .3
+            .as_deref(),
+        Some("sir-1"),
+        "launched from the pool template"
+    );
+    d.release(&l.instance).await.unwrap();
+    let (st, tags) = state_of(&api, &l.instance);
+    assert_eq!(st, "stopped");
+    assert_eq!(
+        tags.get("FleetPool").map(String::as_str),
+        Some("stage-test")
+    );
+    let r = d.resume("ec2-2").await.expect("the pooled tile starts");
+    assert_eq!(r.instance, l.instance);
+    assert_eq!(
+        r.frame_url.as_deref(),
+        Some("wss://ec2-2.fcvm.example/frames")
+    );
+    let (st, tags) = state_of(&api, &r.instance);
+    assert_eq!(st, "running");
+    assert_eq!(tags.get("FleetTile").map(String::as_str), Some("ec2-2"));
+    assert!(!tags.contains_key("FleetPool"));
+    let a = api.lock().unwrap();
+    assert_eq!(a.actions.iter().filter(|x| *x == "RunInstances").count(), 1);
+    assert!(a.uncancelled_terminates.is_empty());
+}
+
+/// A full pool, a tile of an older image, and the sweep terminate; every terminate cancels
+/// the instance's spot request first (a persistent request would launch a replacement),
+/// and a pooled tile that does not start yet stays in the pool for a later wake.
+#[tokio::test]
+async fn the_pool_keeps_at_most_its_size_and_cancels_spot_requests_before_terminating() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, api) = pool_driver(1).await;
+    let a1 = d.launch("ec2-1").await.unwrap();
+    let a2 = d.launch("ec2-2").await.unwrap();
+    d.release(&a1.instance).await.unwrap();
+    d.release(&a2.instance).await.unwrap();
+    assert_eq!(state_of(&api, &a1.instance).0, "stopped");
+    assert_eq!(
+        state_of(&api, &a2.instance).0,
+        "terminated",
+        "the pool holds one"
+    );
+    assert_eq!(api.lock().unwrap().cancelled, vec!["sir-2".to_string()]);
+    // Not startable yet: left pooled, and the tile launches.
+    let id1 = a1.instance.split_once('/').unwrap().1.to_string();
+    api.lock().unwrap().start_fails.push(id1.clone());
+    assert!(d.resume("ec2-3").await.is_none());
+    assert_eq!(state_of(&api, &a1.instance).0, "stopped");
+    api.lock().unwrap().start_fails.clear();
+    // A new image: the pooled tile is stale and is terminated, not started.
+    api.lock().unwrap().image = "ami-1123456789abcdef0".into();
+    assert!(d.resume("ec2-3").await.is_none());
+    assert_eq!(state_of(&api, &a1.instance).0, "terminated");
+    // A pooled tile launched more than POOL_MAX_AGE ago (its persistent request would have
+    // expired) is terminated, not started.
+    let c1 = d.launch("ec2-1").await.unwrap();
+    d.release(&c1.instance).await.unwrap();
+    assert_eq!(state_of(&api, &c1.instance).0, "stopped");
+    api.lock()
+        .unwrap()
+        .old
+        .push(c1.instance.split_once('/').unwrap().1.to_string());
+    assert!(d.resume("ec2-1").await.is_none());
+    assert_eq!(state_of(&api, &c1.instance).0, "terminated");
+    // The sweep keeps a pooled stopped tile and terminates a running one.
+    let b1 = d.launch("ec2-1").await.unwrap();
+    let b2 = d.launch("ec2-2").await.unwrap();
+    d.release(&b1.instance).await.unwrap();
+    assert_eq!(d.sweep().await.unwrap(), 1);
+    assert_eq!(state_of(&api, &b1.instance).0, "stopped");
+    assert_eq!(state_of(&api, &b2.instance).0, "terminated");
+    let a = api.lock().unwrap();
+    assert!(
+        a.uncancelled_terminates.is_empty(),
+        "{:?}",
+        a.uncancelled_terminates
+    );
+}
+
+/// The tiles of one wake resume at once: each starts a different pooled instance.
+#[tokio::test]
+async fn tiles_resuming_at_once_start_distinct_pooled_instances() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, _api) = pool_driver(2).await;
+    let d = Arc::new(d);
+    for t in ["ec2-1", "ec2-2"] {
+        let l = d.launch(t).await.unwrap();
+        d.release(&l.instance).await.unwrap();
+    }
+    let (a, b, c) = tokio::join!(d.resume("ec2-1"), d.resume("ec2-2"), d.resume("ec2-3"));
+    let got = [a, b, c];
+    let mut ids: Vec<String> = got.iter().flatten().map(|l| l.instance.clone()).collect();
+    assert_eq!(ids.len(), 2, "{got:?}");
+    ids.dedup();
+    assert_eq!(ids.len(), 2, "two tiles started one instance: {got:?}");
+}
+
+/// The tile task: a tile with no instance asks the pool first; the relaunch of a running
+/// tile (a race) launches cold; a tile that leaves the assignment releases its instance.
+struct PoolTask {
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ec2::Ec2Driver for PoolTask {
+    async fn launch(&self, tile: &str) -> Result<ec2::Launched, ec2::LaunchError> {
+        let mut c = self.calls.lock().unwrap();
+        c.push(format!("launch {tile}"));
+        Ok(ec2::Launched {
+            instance: format!("i-cold-{}", c.len()),
+            frame_url: None,
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn resume(&self, tile: &str) -> Option<ec2::Launched> {
+        self.calls.lock().unwrap().push(format!("resume {tile}"));
+        Some(ec2::Launched {
+            instance: "i-pooled".into(),
+            frame_url: None,
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn release(&self, instance: &str) -> anyhow::Result<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("release {instance}"));
+        Ok(())
+    }
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        Ok(l.clone())
+    }
+    async fn terminate(&self, instance: &str) -> anyhow::Result<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("terminate {instance}"));
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _t: &str,
+        _l: &ec2::Launched,
+        _b: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_budget(
+        &self,
+        _t: &str,
+        _l: &ec2::Launched,
+        _b: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn health(&self, _t: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("no renderer")
+    }
+}
+
+#[tokio::test]
+async fn a_wake_resumes_tiles_a_race_launches_them_and_a_sleep_releases_them() {
+    use fleet_core::protocol::AssignSlot;
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let driver: Arc<dyn ec2::Ec2Driver> = Arc::new(PoolTask {
+        calls: calls.clone(),
+    });
+    let (handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let slot = |g: u64| AssignSlot {
+        id: "ec2-1".into(),
+        sbdf: String::new(),
+        generation: g,
+        rect: None,
+        private_camera: None,
+        layout_generation: 0,
+        rect_from_frame: 0,
+        previous_rect: None,
+        standby: false,
+        warm: false,
+    };
+    let (assign, assign_rx) = tokio::sync::watch::channel(vec![slot(1)]);
+    let (_scene, scene_rx) = tokio::sync::watch::channel(None);
+    let (_budget, budget_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(ec2::run(driver, assign_rx, scene_rx, budget_rx, handle));
+    let until = |n: usize| {
+        let calls = calls.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while calls.lock().unwrap().len() < n {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{:?}", calls.lock().unwrap()));
+        }
+    };
+    until(1).await;
+    assign.send(vec![slot(2)]).unwrap();
+    until(3).await;
+    assign.send(vec![]).unwrap();
+    until(4).await;
+    let c = calls.lock().unwrap().clone();
+    assert_eq!(c[..2], ["resume ec2-1", "launch ec2-1"], "{c:?}");
+    // The race's old instance is terminated once its replacement is accepted (on a task of
+    // its own), and the sleep releases the replacement.
+    let mut rest = c[2..].to_vec();
+    rest.sort();
+    assert_eq!(rest, ["release i-cold-2", "terminate i-pooled"], "{c:?}");
+}
+
+/// Without the pool, tiles launch one-time spot; terminating one cancels nothing (a one-time
+/// request closes when fulfilled, and the role may not be allowed to cancel it).
+#[tokio::test]
+async fn a_one_time_spot_tile_is_terminated_without_a_cancel() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (mut d, api) = pool_driver(0).await;
+    d.pool_template = None;
+    let l = d.launch("ec2-1").await.unwrap();
+    d.release(&l.instance).await.unwrap();
+    assert_eq!(state_of(&api, &l.instance).0, "terminated");
+    let a = api.lock().unwrap();
+    assert!(a.cancelled.is_empty(), "{:?}", a.cancelled);
+    assert!(!a
+        .actions
+        .contains(&"CancelSpotInstanceRequests".to_string()));
+}
+
+/// A resume works from a list that can be older than its claim: an instance listed stopped
+/// and pooled may since have been started for another tile. It is started only if it is
+/// stopped and pooled when claimed, so a resume never takes a running tile's instance.
+#[tokio::test]
+async fn a_resume_does_not_take_an_instance_the_pool_list_shows_stale() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, api) = pool_driver(2).await;
+    let l = d.launch("ec2-1").await.unwrap();
+    let id = l.instance.split_once('/').unwrap().1.to_string();
+    // ec2-1 runs on it; the list still says stopped and pooled.
+    api.lock().unwrap().listed_stopped.push(id);
+    assert!(d.resume("ec2-2").await.is_none());
+    let (st, tags) = state_of(&api, &l.instance);
+    assert_eq!(st, "running");
+    assert_eq!(tags.get("FleetTile").map(String::as_str), Some("ec2-1"));
+    assert!(!api
+        .lock()
+        .unwrap()
+        .actions
+        .contains(&"StartInstances".to_string()));
 }

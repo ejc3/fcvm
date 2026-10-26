@@ -1105,9 +1105,9 @@ async fn export_localhost_image_disk(
         // Export into a UUID-keyed temp, then atomically rename. This avoids corrupt
         // archives from interrupted exports AND is safe under cross-VM concurrency: the
         // image-cache dir is shared across VMs and the per-digest flock above does not
-        // coordinate cross-VM (see image::unique_cache_tmp). A shared "<digest>.tmp"
+        // coordinate cross-VM (see crate::setup::store_temp_path). A shared "<digest>.tmp"
         // would let one VM's rename ENOENT the other's in-flight export.
-        let tmp_path = image::unique_cache_tmp(&archive_path);
+        let tmp_path = crate::setup::store_temp_path(&archive_path);
 
         // Export by the IMMUTABLE image ID captured at inspect time, not the mutable
         // tag (#598). A parallel build can repoint the tag between the cache-key
@@ -1473,8 +1473,8 @@ async fn prepare_vm_for_lifecycle(
         args.image_disk_override.clone()
     };
 
-    // Build identity (inode/size/mtime) of the exact file that will be
-    // attached; a rebuild at the same path is a different identity. Overlay
+    // Build identity (SHA-256, `utils::image_disk_digest`) of the exact file that
+    // will be attached; a rebuild at the same path is a different identity. Overlay
     // storage images ONLY: btrfs/archive modes import the archive into the
     // guest before the pre-start snapshot, so a restored VM never re-reads the
     // archive — keying those on identity would force a needless cold boot on
@@ -1483,8 +1483,8 @@ async fn prepare_vm_for_lifecycle(
         .as_deref()
         .filter(|p| crate::utils::is_overlay_storage_image(p))
         .map(|p| {
-            crate::utils::file_identity(p)
-                .with_context(|| format!("stat image disk {} for snapshot key", p.display()))
+            crate::utils::image_disk_digest(p)
+                .with_context(|| format!("hash image disk {} for snapshot key", p.display()))
         })
         .transpose()?;
 
@@ -1519,12 +1519,14 @@ async fn prepare_vm_for_lifecycle(
         let profile_name = args.kernel_profile.as_deref().unwrap_or("default");
         let module_type = crate::setup::profile_module_type(profile_name)?;
         for sbdf in &args.gpu {
-            crate::gpu::check_host_device(
+            // The lease is released at once: this VM cold-boots without the GPU,
+            // and the restore that attaches it takes its own lease and checks again.
+            drop(crate::gpu::check_host_device(
                 Path::new("/sys"),
                 Path::new("/dev"),
                 &crate::gpu::scrub::state_dir(),
                 sbdf,
-            )?;
+            )?);
             crate::gpu::check_driver_supports_device(
                 Path::new("/sys"),
                 sbdf,
@@ -3185,17 +3187,14 @@ fn finish_prepare<T>(operation: Result<T>, cleanup: Result<()>) -> Result<T> {
     }
 }
 
-/// Cancel `gate` on SIGTERM/SIGINT, describing the resulting shutdown as `shutdown_action`.
+/// Request this process's shutdown on SIGTERM/SIGINT, describing it as `shutdown_action`.
 ///
 /// Installed before the VM is created so a signal during the (potentially long) setup phase
 /// is recorded instead of killing the process and leaving host network state, the persisted
 /// VM state file, and the data directory behind. Shutdown is deferred until setup finishes,
-/// then the caller's cleanup runs.
-fn spawn_lifecycle_signal_handler(
-    gate: &super::common::LifecycleReadyGate,
-    shutdown_action: &'static str,
-) -> Result<()> {
-    let gate = gate.clone();
+/// then the caller's cleanup runs. The request cancels every lifecycle gate of the process,
+/// including one a cache-hit restore creates later (`common::request_process_shutdown`).
+fn spawn_lifecycle_signal_handler(shutdown_action: &'static str) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
     tokio::spawn(async move {
@@ -3203,7 +3202,7 @@ fn spawn_lifecycle_signal_handler(
             _ = sigterm.recv() => "SIGTERM",
             _ = sigint.recv() => "SIGINT",
         };
-        gate.cancel();
+        super::common::request_process_shutdown();
         info!("received {signal_name}, {shutdown_action}");
     });
     Ok(())
@@ -3229,7 +3228,7 @@ fn publish_prepared_snapshot_gated(
 pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     let lifecycle_gate = super::common::LifecycleReadyGate::new();
     let cancel = lifecycle_gate.cancellation_token();
-    spawn_lifecycle_signal_handler(&lifecycle_gate, "shutting down VM")?;
+    spawn_lifecycle_signal_handler("shutting down VM")?;
 
     let Some(mut ctx) = prepare_vm(args).await? else {
         return Ok(()); // Snapshot cache hit, already handled
@@ -3277,13 +3276,9 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // The run loop stopped on purpose right after producing the pre-start
     // snapshot: relaunch through the restore path (identical to a cache hit).
     if let Some(snapshot_args) = restore_args {
-        // A signal during the teardown window lands on a token nothing else
-        // checks anymore (cmd_snapshot_run installs fresh handlers) — honor it
-        // here or the "killed" VM would resurrect as a clone.
-        if cancel.is_cancelled() {
-            info!("shutdown requested during snapshot relaunch, not restoring");
-            bail!("interrupted by signal during snapshot relaunch");
-        }
+        // A signal during the teardown window cancelled this process's gates, so
+        // the restore's own gate is created cancelled and it stops before
+        // allocating anything (`common::ShutdownRegistry`).
         return super::snapshot::cmd_snapshot_run(snapshot_args).await;
     }
 
@@ -3306,7 +3301,7 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
     let lifecycle_gate = super::common::LifecycleReadyGate::new();
     let cancel = lifecycle_gate.cancellation_token();
-    spawn_lifecycle_signal_handler(&lifecycle_gate, "cancelling podman prepare")?;
+    spawn_lifecycle_signal_handler("cancelling podman prepare")?;
 
     let lifecycle = PodmanLifecycle::Prepare(PrepareOptions {
         tag: args.tag,

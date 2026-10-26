@@ -8,6 +8,12 @@
 //! - `<label>-v4.<subzone>` A: an IPv4 address: a GPU host's public address, shared by its
 //!   slots, each forwarded on its own port (`SlotReport::v4_port`), or a tile's own.
 //!
+//! A host's aggregator is named the same way under `agg-<host>-<token>`
+//! (`fleet_core::state::aggregate_id`): AAAA its own IPv6 address (port 443) and the `-v4` A
+//! the host's IPv4 address, on the aggregator's port. Its label lasts while it reports the
+//! same addresses. The EC2 half's aggregator, which runs beside the coordinator, is
+//! `agg-ec2-<token>`: the coordinator task's own addresses, both on 443.
+//!
 //! A name is never answered before it is minted, so no resolver holds a negative answer for
 //! it, and never changes address, so none holds a stale positive one.
 
@@ -29,30 +35,46 @@ pub struct Fact {
     pub published: Option<Published>,
 }
 
-/// The facts of every slot and tile in the fleet.
+/// The facts of every slot, tile and aggregator in the fleet. An aggregator has one launch
+/// (generation 0) for as long as it has the same addresses.
 pub fn facts(state: &State) -> Vec<Fact> {
     let f = &state.fleet;
-    f.slots
-        .values()
-        .chain(f.ec2.values())
-        .map(|s| Fact {
-            id: s.id.clone(),
-            generation: s.observed.generation,
-            ipv6: s.observed.ipv6.clone(),
-            ipv4: s.observed.ipv4.clone(),
-            v4_port: s.observed.v4_port,
-            published: s.published.clone(),
+    let units = f.slots.values().chain(f.ec2.values()).map(|s| Fact {
+        id: s.id.clone(),
+        generation: s.observed.generation,
+        ipv6: s.observed.ipv6.clone(),
+        ipv4: s.observed.ipv4.clone(),
+        v4_port: s.observed.v4_port,
+        published: s.published.clone(),
+    });
+    let aggregators = f.hosts.values().filter_map(|h| {
+        Some(Fact {
+            id: fleet_core::state::aggregate_id(&h.name)?,
+            generation: 0,
+            ipv6: h.aggregate_ipv6.clone(),
+            ipv4: h.aggregate_ipv4.clone(),
+            v4_port: h.aggregate_v4_port,
+            published: h.aggregate_published.clone(),
         })
+    });
+    let c = &state.config;
+    let ec2_aggregator = Fact {
+        id: fleet_core::state::EC2_AGGREGATE_ID.into(),
+        generation: 0,
+        ipv6: c.ec2_aggregate_ipv6.clone(),
+        ipv4: c.ec2_aggregate_ipv4.clone(),
+        v4_port: None,
+        published: f.ec2_aggregate_published.clone(),
+    };
+    units
+        .chain(aggregators)
+        .chain(std::iter::once(ec2_aggregator))
         .collect()
 }
 
-/// An address in its canonical text (`2001:db8::2` for `2001:0db8::2`), so a report and the
-/// published names compare as the same address; text that is not an address is kept as it is.
-fn canonical(a: &str) -> String {
-    a.parse::<std::net::IpAddr>()
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|_| a.to_string())
-}
+// Addresses compare in their canonical text, so a report and the published names agree on
+// one address however it was written.
+use fleet_core::state::canonical_ip as canonical;
 
 /// Whether `p` names exactly the launch `f` is on: its generation, its addresses and the
 /// IPv4 port in its URL. Anything else is a new launch, with a new label.

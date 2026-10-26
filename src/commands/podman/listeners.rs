@@ -429,9 +429,9 @@ pub(crate) async fn run_status_listener(
 /// JSON (the MMDS `latest` object: `{ "container-plan": {...}, "host-time": "..." }`) to
 /// each connecting guest, then close so the guest's `read_to_end` sees EOF.
 ///
-/// The serve loop sets "host-time" itself, at every accept, to the host clock in whole
-/// epoch seconds, replacing any value the caller put in `plan`. The guest sets its clock
-/// from the document it reads, and it can read it long after the caller built it: a
+/// The serve loop sets the host clock keys itself, at every accept, to the host clock
+/// (`utils::host_clock_fields`), replacing any value the caller put in `plan`. The
+/// guest sets its clock from the document it reads, and it can read it long after the caller built it: a
 /// snapshot restore binds this listener before the VMM is restored, and the guest
 /// connects only once it is running again.
 ///
@@ -465,38 +465,28 @@ pub(crate) fn spawn_bootplan_listener(
     Ok(tokio::spawn(serve_bootplan(
         listener,
         plan,
-        host_epoch_seconds,
+        crate::utils::host_clock_now,
     )))
 }
 
-/// The host clock in whole seconds since the Unix epoch, which is what "host-time"
-/// holds. fc-agent parses it as a decimal integer and rejects a fraction
-/// (`parse_epoch_seconds`, fc-agent/src/bootplan.rs). The agent that reads it after a
-/// restore is the one frozen in the snapshot, so the format stays what agents already
-/// in snapshots accept.
-fn host_epoch_seconds() -> i64 {
-    chrono::Utc::now().timestamp()
-}
-
-/// Accept loop for the boot-plan listener: set "host-time" from `now`, write the plan to
-/// the connecting guest, and close the write side so the guest's `read_to_end` observes
-/// EOF.
+/// Accept loop for the boot-plan listener: set the host clock keys
+/// (`utils::host_clock_fields`) from `now`, write the plan to the connecting guest, and
+/// close the write side so the guest's `read_to_end` observes EOF.
 ///
-/// `now` returns whole epoch seconds. It is called once per connection, after the accept,
-/// and is a parameter so a test can supply the clock.
+/// `now` returns the time since the Unix epoch. It is called once per connection, after
+/// the accept, and is a parameter so a test can supply the clock.
 async fn serve_bootplan(
     listener: tokio::net::UnixListener,
     mut plan: serde_json::Map<String, serde_json::Value>,
-    now: impl Fn() -> i64,
+    now: impl Fn() -> std::time::Duration,
 ) {
     use tokio::io::AsyncWriteExt;
     loop {
         match listener.accept().await {
             Ok((mut stream, _)) => {
-                plan.insert(
-                    "host-time".to_string(),
-                    serde_json::Value::String(now().to_string()),
-                );
+                for (key, value) in crate::utils::host_clock_fields(now()) {
+                    plan.insert(key.to_string(), serde_json::Value::String(value));
+                }
                 let payload = match serde_json::to_vec(&plan) {
                     Ok(payload) => payload,
                     Err(e) => {
@@ -2578,19 +2568,22 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Boot-plan listener: "host-time" is the host clock at each accept, in
-    // whole epoch seconds, whatever the caller put in the plan.
+    // Boot-plan listener: "host-time" and "host-time-ns" are the host clock at
+    // each accept, whatever the caller put in the plan.
     // -----------------------------------------------------------------------
 
-    /// The second the injected clock starts at: a fixed second in the past, which neither
-    /// a caller's stamp in these tests nor the real clock produces.
+    /// The instant the injected clock starts at, in nanoseconds since the epoch: a fixed
+    /// time in the past, which neither a caller's stamp in these tests nor the real clock
+    /// produces, three quarters of the way through its second.
+    const INJECTED_NANOS: u64 = 1_786_000_000_750_000_000;
     const INJECTED_EPOCH: i64 = 1_786_000_000;
 
-    /// Bind `socket_path` and serve `plan` on it with a clock the test owns.
+    /// Bind `socket_path` and serve `plan` on it with a clock the test owns, in
+    /// nanoseconds since the epoch.
     fn serve_bootplan_with_clock(
         socket_path: &std::path::Path,
         plan: serde_json::Value,
-        clock: Arc<std::sync::atomic::AtomicI64>,
+        clock: Arc<std::sync::atomic::AtomicU64>,
     ) -> tokio::task::JoinHandle<()> {
         let listener = tokio::net::UnixListener::bind(socket_path).unwrap();
         let plan = plan
@@ -2598,7 +2591,7 @@ mod tests {
             .expect("a test plan is a JSON object")
             .clone();
         tokio::spawn(serve_bootplan(listener, plan, move || {
-            clock.load(std::sync::atomic::Ordering::SeqCst)
+            std::time::Duration::from_nanos(clock.load(std::sync::atomic::Ordering::SeqCst))
         }))
     }
 
@@ -2618,33 +2611,52 @@ mod tests {
         serde_json::from_slice(&bytes).expect("the listener serves one JSON document")
     }
 
-    /// Take "host-time" out of a served document and return it as epoch seconds, read the
-    /// way fc-agent reads it: a JSON string holding a decimal integer.
-    fn take_host_time(document: &mut serde_json::Value) -> i64 {
+    /// Take one string key out of a served document and parse it as a decimal integer,
+    /// the way fc-agent reads it.
+    fn take_decimal<T: std::str::FromStr>(document: &mut serde_json::Value, key: &str) -> T
+    where
+        T::Err: std::fmt::Display,
+    {
         let removed = document
             .as_object_mut()
             .expect("the served document is a JSON object")
-            .remove("host-time");
+            .remove(key);
         let text = match &removed {
             Some(serde_json::Value::String(text)) => text,
             other => panic!(
-                "the served document must carry host-time as a string, found {other:?} \
+                "the served document must carry {key} as a string, found {other:?} \
                  beside {document}"
             ),
         };
-        text.parse().unwrap_or_else(|error| {
-            panic!("host-time {text:?} is not whole epoch seconds: {error}")
-        })
+        text.parse()
+            .unwrap_or_else(|error| panic!("{key} {text:?} is not a decimal integer: {error}"))
+    }
+
+    /// Take the host clock out of a served document: "host-time" in whole epoch seconds
+    /// and "host-time-ns" in nanoseconds. They name one instant, so the seconds are the
+    /// nanoseconds' whole seconds.
+    fn take_host_clock(document: &mut serde_json::Value) -> (i64, u64) {
+        let seconds: i64 = take_decimal(document, "host-time");
+        let nanos: u64 = take_decimal(document, "host-time-ns");
+        assert_eq!(
+            seconds as u64,
+            nanos / 1_000_000_000,
+            "host-time and host-time-ns name different instants"
+        );
+        (seconds, nanos)
     }
 
     /// The cold-boot plan arrives carrying the host-time its builder stamped. The guest
     /// reads the plan later, so the listener replaces that value with the clock at the
-    /// accept.
+    /// accept, to the nanosecond: a guest that stepped to the whole second ran behind the
+    /// host by the second's fraction (issue 1194).
+    ///
+    /// RED BEFORE THE FIX: the document carried whole seconds only.
     #[tokio::test]
     async fn bootplan_listener_replaces_a_callers_host_time_with_the_clock_at_the_accept() {
         let temp_dir = tempfile::tempdir().unwrap();
         let socket_path = temp_dir.path().join("bootplan.sock");
-        let clock = Arc::new(std::sync::atomic::AtomicI64::new(INJECTED_EPOCH));
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(INJECTED_NANOS));
         let task = serve_bootplan_with_clock(
             &socket_path,
             serde_json::json!({
@@ -2658,9 +2670,9 @@ mod tests {
         task.abort();
 
         assert_eq!(
-            take_host_time(&mut served),
-            INJECTED_EPOCH,
-            "host-time must be the clock at the accept, not the value the plan arrived with"
+            take_host_clock(&mut served),
+            (INJECTED_EPOCH, INJECTED_NANOS),
+            "the host clock must be the clock at the accept, not the value the plan arrived with"
         );
         assert_eq!(
             served,
@@ -2676,7 +2688,7 @@ mod tests {
     async fn bootplan_connections_thirty_seconds_apart_get_host_times_thirty_seconds_apart() {
         let temp_dir = tempfile::tempdir().unwrap();
         let socket_path = temp_dir.path().join("bootplan.sock");
-        let clock = Arc::new(std::sync::atomic::AtomicI64::new(INJECTED_EPOCH));
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(INJECTED_NANOS));
         // What a caller would have stamped 68 s before the first connection.
         let callers_stamp = (INJECTED_EPOCH - 68).to_string();
         let task = serve_bootplan_with_clock(
@@ -2690,21 +2702,21 @@ mod tests {
         );
 
         let mut first = fetch_bootplan(&socket_path).await;
-        clock.fetch_add(30, std::sync::atomic::Ordering::SeqCst);
+        clock.fetch_add(30_000_000_000, std::sync::atomic::Ordering::SeqCst);
         let mut second = fetch_bootplan(&socket_path).await;
         task.abort();
 
-        let first_time = take_host_time(&mut first);
-        let second_time = take_host_time(&mut second);
+        let (first_time, first_nanos) = take_host_clock(&mut first);
+        let (second_time, second_nanos) = take_host_clock(&mut second);
         assert_eq!(
-            second_time - first_time,
-            30,
-            "the clock moved 30 s between the two connections, so their host-times must be \
+            (second_time - first_time, second_nanos - first_nanos),
+            (30, 30_000_000_000),
+            "the clock moved 30 s between the two connections, so their host clocks must be \
              30 s apart: first={first_time} second={second_time}"
         );
         assert_eq!(
             first, second,
-            "two connections may differ in host-time and in nothing else"
+            "two connections may differ in the host clock and in nothing else"
         );
         assert_eq!(
             first,
@@ -2726,16 +2738,16 @@ mod tests {
         )
         .unwrap();
 
-        let before = chrono::Utc::now().timestamp();
+        let before = crate::utils::host_clock_now().as_nanos() as u64;
         let mut served = fetch_bootplan(&socket_path).await;
-        let after = chrono::Utc::now().timestamp();
+        let after = crate::utils::host_clock_now().as_nanos() as u64;
         task.abort();
 
-        let host_time = take_host_time(&mut served);
+        let (_, host_nanos) = take_host_clock(&mut served);
         assert!(
-            (before..=after).contains(&host_time),
-            "host-time {host_time} must be the host clock at the accept, which fell between \
-             {before} and {after}"
+            (before..=after).contains(&host_nanos),
+            "host-time-ns {host_nanos} must be the host clock at the accept, which fell \
+             between {before} and {after}"
         );
         assert_eq!(
             served,

@@ -8,13 +8,15 @@
 //! reports: `launch_ms` (request to accepted), `ready_ms` (accepted to the renderer's
 //! health), `total_ms`, and `capacity_wait_ms`: how long the tile's generation waited for
 //! EC2 to have capacity before the launch that was accepted. The race scoreboard leaves
-//! that wait out of the EC2 half's time and reports it on its own.
+//! that wait out of the EC2 half's time and reports it on its own. A tile whose instance
+//! was started from the driver's pool of stopped instances ([`Ec2Driver::resume`], a wake
+//! a tile with no instance, never the relaunch of a running one) also reports `resumed` = 1.
 
 use super::Handle;
 use anyhow::Result;
 use async_trait::async_trait;
 use fleet_core::protocol::{
-    AssignSlot, BudgetBody, HealthReport, RendererScene, SharedScene, SlotReport,
+    boot_id, AssignSlot, BudgetBody, HealthReport, RendererScene, SharedScene, SlotReport,
 };
 use fleet_core::Event;
 use std::collections::{BTreeMap, HashMap};
@@ -29,6 +31,10 @@ const CAPACITY_RETRY: Duration = Duration::from_secs(10);
 /// How often a running tile's instance is checked.
 const LIVENESS_EVERY: Duration = Duration::from_secs(15);
 
+/// How many checks in a row a running tile's renderer may leave unanswered before the tile
+/// is launched again (45 s at [`LIVENESS_EVERY`]): one lost probe is not a crash.
+const RENDERER_SILENT_LIMIT: u32 = 3;
+
 /// How long the EC2 side waits before trying a failed sweep again.
 const SWEEP_RETRY: Duration = Duration::from_secs(10);
 
@@ -42,6 +48,18 @@ pub struct Launched {
     pub ipv4: Option<String>,
 }
 
+/// What a liveness check found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Liveness {
+    Alive,
+    /// The instance is gone (a spot reclaim), or its renderer reports that it failed: the
+    /// tile is launched again.
+    Dead(String),
+    /// The instance runs and its renderer did not answer: after
+    /// [`RENDERER_SILENT_LIMIT`] such checks in a row the tile is launched again.
+    Silent(String),
+}
+
 #[derive(Debug)]
 pub enum LaunchError {
     /// EC2 has no spot capacity for the tile's types and zones right now.
@@ -53,6 +71,17 @@ pub enum LaunchError {
 pub trait Ec2Driver: Send + Sync {
     /// Launch one instance for `tile` from its launch template.
     async fn launch(&self, tile: &str) -> Result<Launched, LaunchError>;
+    /// Start a stopped instance kept from an earlier wake for `tile`, if the driver keeps a
+    /// pool of them and one starts. A tile with no instance (a wake) asks for one before
+    /// launching; the relaunch of a running tile (a race) always launches.
+    async fn resume(&self, _tile: &str) -> Option<Launched> {
+        None
+    }
+    /// The tile left the assignment (the fleet sleeps): keep its instance stopped for the
+    /// next wake, or terminate it.
+    async fn release(&self, instance: &str) -> Result<()> {
+        self.terminate(instance).await
+    }
     /// Resolves when the instance's renderer answers its health check, with what is known
     /// of the instance by then (its addresses and frame URL).
     async fn ready(&self, tile: &str, launched: &Launched) -> Result<Launched>;
@@ -76,10 +105,11 @@ pub trait Ec2Driver: Send + Sync {
         Ok(0)
     }
     /// Whether the instance still exists (not shutting down, terminated, stopping or
-    /// stopped). A running tile is checked every [`Ec2Driver::liveness_every`]; one that is
-    /// gone (a spot reclaim) is launched again. An error is taken as unknown.
-    async fn alive(&self, _launched: &Launched) -> Result<bool> {
-        Ok(true)
+    /// stopped) and its renderer still serves. A running tile is checked every
+    /// [`Ec2Driver::liveness_every`]; one that is gone (a spot reclaim) or whose renderer
+    /// stopped is launched again. An error is taken as unknown.
+    async fn alive(&self, _tile: &str, _launched: &Launched) -> Result<Liveness> {
+        Ok(Liveness::Alive)
     }
     fn liveness_every(&self) -> Duration {
         LIVENESS_EVERY
@@ -157,7 +187,11 @@ fn remove_own(running: &Running, id: &str, token: u64) {
 /// Post every running tile its renderer body whenever its rectangle, the layout or the
 /// scene changes, and the grid budget after every scene and whenever it changes (retrying
 /// a failed post once a second). Once a second it also reads each tile's health for the
-/// budget (`Event::Ec2Health`).
+/// budget (`Event::Ec2Health`). A `/health` whose `boot_id` differs from the one read
+/// before means the renderer restarted on the same instance (its service restarts it) and
+/// has lost its scene: the scene and the budget are posted again. The first scene post on
+/// an instance reads `/health` first, so a restart between that read and any later one is
+/// seen.
 async fn post_scenes(
     driver: Arc<dyn Ec2Driver>,
     mut assign: watch::Receiver<Vec<AssignSlot>>,
@@ -168,6 +202,8 @@ async fn post_scenes(
 ) {
     let mut posted: HashMap<String, (String, RendererScene)> = HashMap::new();
     let mut budget_posted: HashMap<String, (String, BudgetBody)> = HashMap::new();
+    // Per tile: the instance and the renderer's boot id last read from its `/health`.
+    let mut boots: HashMap<String, (String, Option<String>)> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut read_health = false;
     loop {
@@ -183,6 +219,30 @@ async fn post_scenes(
         if let Some(shared) = &shared {
             for (a, l) in now {
                 let Some(rect) = a.rect else { continue };
+                let known = boots.get(&a.id).is_some_and(|(i, _)| *i == l.instance);
+                if read_health || !known {
+                    match driver.health(&a.id, &l).await {
+                        Ok(h) => {
+                            let boot = boot_id(&h);
+                            if known && boots[&a.id].1 != boot {
+                                tracing::info!(tile = %a.id, instance = %l.instance, boot = ?boot, "the tile's renderer restarted; posting its scene again");
+                                posted.remove(&a.id);
+                                budget_posted.remove(&a.id);
+                            }
+                            boots.insert(a.id.clone(), (l.instance.clone(), boot));
+                            if read_health {
+                                let report = HealthReport::from_renderer(&a.id, &h);
+                                handle.send(Event::Ec2Health { at: 0, report }).await;
+                            }
+                        }
+                        // Unknown until a read succeeds: that read then counts as a
+                        // restart, and the scene is posted again.
+                        Err(_) if !known => {
+                            boots.insert(a.id.clone(), (l.instance.clone(), None));
+                        }
+                        Err(_) => {}
+                    }
+                }
                 let body = RendererScene {
                     layout_generation: a.layout_generation,
                     rect_from_frame: a.rect_from_frame,
@@ -212,12 +272,6 @@ async fn post_scenes(
                                 tracing::debug!(tile = %a.id, error = %format!("{e:#}"), "budget not posted yet")
                             }
                         }
-                    }
-                }
-                if read_health {
-                    if let Ok(h) = driver.health(&a.id, &l).await {
-                        let report = HealthReport::from_renderer(&a.id, &h);
-                        handle.send(Event::Ec2Health { at: 0, report }).await;
                     }
                 }
             }
@@ -300,8 +354,13 @@ pub async fn run(
     }
 }
 
+/// Report the tile's phase, unless its task is retired: once the tile has left the
+/// assignment (its sender is gone) a task for its return may already report on the same
+/// slot, and this task's report would overwrite it.
+#[allow(clippy::too_many_arguments)]
 async fn report(
     handle: &Handle,
+    want: &watch::Receiver<u64>,
     id: &str,
     phase: &str,
     generation: u64,
@@ -310,6 +369,9 @@ async fn report(
     // What went wrong, and when the tile tries again.
     problem: Option<(String, Option<Duration>)>,
 ) {
+    if want.has_changed().is_err() {
+        return;
+    }
     let (error, retry_in) = match problem {
         Some((e, r)) => (Some(e), r),
         None => (None, None),
@@ -364,6 +426,7 @@ async fn tile(
             }
             report(
                 &handle,
+                &want,
                 &id,
                 "launching",
                 generation,
@@ -372,7 +435,22 @@ async fn tile(
                 None,
             )
             .await;
-            match driver.launch(&id).await {
+            // A tile with no instance (it joined the assignment at a wake, or its instance
+            // failed or was reclaimed) may start a pooled one; a relaunch of a running tile
+            // (a race) launches.
+            let resumed = if current.is_none() {
+                driver.resume(&id).await
+            } else {
+                None
+            };
+            if resumed.is_some() {
+                timings.insert("resumed".into(), 1);
+            }
+            let launched = match resumed {
+                Some(l) => Ok(l),
+                None => driver.launch(&id).await,
+            };
+            match launched {
                 Ok(l) => {
                     waiting = None;
                     timings.insert("launch_ms".into(), t0.elapsed().as_millis() as u64);
@@ -386,6 +464,7 @@ async fn tile(
                     }
                     report(
                         &handle,
+                        &want,
                         &id,
                         "starting",
                         generation,
@@ -410,6 +489,7 @@ async fn tile(
                             timings.insert("total_ms".into(), t0.elapsed().as_millis() as u64);
                             report(
                                 &handle,
+                                &want,
                                 &id,
                                 "running",
                                 generation,
@@ -421,6 +501,14 @@ async fn tile(
                             retry = Duration::from_secs(1);
                             l
                         }
+                        // The tile left while its instance started: only terminate it. A
+                        // task for the tile's return may already run on the same slot.
+                        Err(_) if want.has_changed().is_err() => {
+                            if let Err(e) = driver.terminate(&l.instance).await {
+                                tracing::warn!(instance = %l.instance, error = %e, "terminate failed");
+                            }
+                            break;
+                        }
                         Err(e) => {
                             // The instance never served: terminate it and launch the
                             // generation again after the backoff.
@@ -428,6 +516,7 @@ async fn tile(
                             retry = (retry * 2).min(Duration::from_secs(30));
                             report(
                                 &handle,
+                                &want,
                                 &id,
                                 "failed",
                                 generation,
@@ -455,6 +544,7 @@ async fn tile(
                     );
                     report(
                         &handle,
+                        &want,
                         &id,
                         "waiting_capacity",
                         generation,
@@ -473,6 +563,7 @@ async fn tile(
                     retry = (retry * 2).min(Duration::from_secs(30));
                     report(
                         &handle,
+                        &want,
                         &id,
                         "failed",
                         generation,
@@ -488,6 +579,8 @@ async fn tile(
                 }
             }
         }
+        // Renderer checks left unanswered in a row.
+        let mut silent = 0;
         let gone = loop {
             let check = tokio::time::sleep(driver.liveness_every());
             tokio::select! {
@@ -495,13 +588,23 @@ async fn tile(
                     if r.is_err() {
                         break None;
                     }
-                    break Some(false);
+                    break Some(None);
                 }
                 _ = check => {
                     let Some((l, _)) = &current else { continue };
-                    match driver.alive(l).await {
-                        Ok(false) => break Some(true),
-                        Ok(true) => {}
+                    match driver.alive(&id, l).await {
+                        Ok(Liveness::Alive) => silent = 0,
+                        Ok(Liveness::Dead(why)) => break Some(Some(why)),
+                        Ok(Liveness::Silent(why)) => {
+                            silent += 1;
+                            tracing::debug!(tile = %id, silent, error = %why, "tile renderer did not answer");
+                            if silent >= RENDERER_SILENT_LIMIT {
+                                break Some(Some(format!(
+                                    "the renderer on {} did not answer {silent} checks in a row: {why}",
+                                    l.instance
+                                )));
+                            }
+                        }
                         Err(e) => tracing::debug!(tile = %id, error = %format!("{e:#}"), "tile liveness unknown"),
                     }
                 }
@@ -509,22 +612,24 @@ async fn tile(
         };
         match gone {
             None => break,
-            Some(false) => {}
-            Some(true) => {
-                // The instance went away under a running tile (a spot reclaim): report it,
-                // and launch the same generation again after the backoff.
+            Some(None) => {}
+            Some(Some(why)) => {
+                // The instance went away under a running tile (a spot reclaim), or its
+                // renderer stopped: report it, terminate the instance, and launch the same
+                // generation again after the backoff.
                 let (l, generation) = current.take().expect("checked a current instance");
                 remove_own(&running, &id, token);
                 let wait = retry;
                 retry = (retry * 2).min(Duration::from_secs(30));
                 report(
                     &handle,
+                    &want,
                     &id,
                     "failed",
                     generation,
                     Some(&l),
                     &BTreeMap::new(),
-                    Some((format!("instance {} is gone", l.instance), Some(wait))),
+                    Some((why, Some(wait))),
                 )
                 .await;
                 if let Err(e) = driver.terminate(&l.instance).await {
@@ -538,8 +643,8 @@ async fn tile(
     }
     remove_own(&running, &id, token);
     if let Some((l, _)) = current {
-        if let Err(e) = driver.terminate(&l.instance).await {
-            tracing::warn!(instance = %l.instance, error = %e, "terminate failed");
+        if let Err(e) = driver.release(&l.instance).await {
+            tracing::warn!(instance = %l.instance, error = %e, "releasing the tile's instance failed");
         }
     }
 }

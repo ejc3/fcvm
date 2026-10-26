@@ -317,7 +317,7 @@ pub async fn watch_restore_epoch(
                         &signals,
                         egress_gen_at_last_stable,
                         metadata.clone_ipv6.as_deref(),
-                        &metadata.host_time,
+                        &metadata.host_time_ns,
                         metadata.restore_hook.as_deref(),
                         &metadata.gpus,
                     )
@@ -341,7 +341,7 @@ pub async fn watch_restore_epoch(
                         &signals,
                         egress_gen_at_last_stable,
                         metadata.clone_ipv6.as_deref(),
-                        &metadata.host_time,
+                        &metadata.host_time_ns,
                         metadata.restore_hook.as_deref(),
                         &metadata.gpus,
                     )
@@ -559,7 +559,7 @@ pub async fn sync_clock_from_host() -> Result<()> {
     let metadata: LatestMetadata =
         serde_json::from_str(&body).context("parsing host-time from MMDS")?;
 
-    crate::bootplan::set_system_clock(&metadata.host_time, Duration::ZERO);
+    crate::bootplan::set_system_clock(&metadata.host_time_ns, Duration::ZERO);
     Ok(())
 }
 

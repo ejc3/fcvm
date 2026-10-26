@@ -837,7 +837,7 @@ pub(super) fn build_boot_plan_json(
         subuid_count: subuid_range.map(|(_, count)| count),
         subgid_start: subgid_range.map(|(start, _)| start),
         subgid_count: subgid_range.map(|(_, count)| count),
-        host_time: chrono::Utc::now().timestamp().to_string(),
+        host_clock: crate::utils::host_clock_now(),
         ntp_servers: host_ntp_servers(),
     };
 

@@ -8,6 +8,8 @@
 #                    it), nvidia-container-toolkit and its CDI spec, the TLS front, units
 #   build.sh image   loads the renderer image from $RENDERER_URL (podman save of the image
 #                    the host AMI runs) and checks one start to first frame
+#   build.sh units   installs the units and scripts again (a revision of an existing tile
+#                    AMI, launched from it with BASE_AMI)
 #   build.sh bake    cleans up for imaging
 set -euo pipefail
 PHASE=$1
@@ -27,6 +29,24 @@ DRIVER_SHA256=0aab0518db53cf73c412dc7f32bbc850ca95e839d8923d0de4bff42c1c9169ce
 TOOLKIT_URL=https://github.com/NVIDIA/nvidia-container-toolkit/releases/download/v1.20.1/nvidia-container-toolkit_1.20.1_deb_amd64.tar.gz
 TOOLKIT_SHA256=14dc22489851d4f1a6d1bbfdfb51524c8f110091738570cddaddc09778a63ad9
 IMG=localhost/fcvm-renderer:fleet
+
+# The tile's own units and scripts, and nginx's site. The renderer, the certificate fetch and
+# TLS start without waiting for cloud-init (see the units), so nginx runs from
+# fcvm-fleet-nginx.service and the distribution's nginx.service, ordered after
+# network-online.target, is disabled.
+install_units() {
+  install -d /usr/local/lib/fcvm-fleet /etc/fcvm-fleet/tls
+  install -m 0755 "$HERE/fetch-cert.py" "$HERE/first-frame.sh" /usr/local/lib/fcvm-fleet/
+  install -m 0644 "$HERE"/*.service /etc/systemd/system/
+  install -m 0644 "$HERE/nginx-renderer.conf" /etc/nginx/sites-available/renderer
+  rm -f /etc/nginx/sites-enabled/default
+  ln -sf /etc/nginx/sites-available/renderer /etc/nginx/sites-enabled/renderer
+  rm -rf /etc/systemd/system/nginx.service.d
+  systemctl disable --now nginx.service
+  systemctl mask nginx.service
+  systemctl daemon-reload
+  systemctl enable nvidia-persistenced.service fcvm-fleet-tls.service fcvm-fleet-renderer.service fcvm-fleet-first-frame.service fcvm-fleet-nginx.service
+}
 
 case "$PHASE" in
 prep)
@@ -89,16 +109,7 @@ X
   # The driver's modules load in sysinit, so nvidia-persistenced (DefaultDependencies=no)
   # initialises the GPU while cloud-init and the network come up.
   printf 'nvidia\nnvidia_uvm\n' > /etc/modules-load.d/nvidia.conf
-  install -d /usr/local/lib/fcvm-fleet /etc/fcvm-fleet/tls
-  install -m 0755 "$HERE/fetch-cert.py" "$HERE/first-frame.sh" /usr/local/lib/fcvm-fleet/
-  install -m 0644 "$HERE"/*.service /etc/systemd/system/
-  install -m 0644 "$HERE/nginx-renderer.conf" /etc/nginx/sites-available/renderer
-  rm -f /etc/nginx/sites-enabled/default
-  ln -sf /etc/nginx/sites-available/renderer /etc/nginx/sites-enabled/renderer
-  install -d /etc/systemd/system/nginx.service.d
-  printf '[Unit]\nRequires=fcvm-fleet-tls.service\nAfter=fcvm-fleet-tls.service\n' > /etc/systemd/system/nginx.service.d/fcvm-fleet.conf
-  systemctl daemon-reload
-  systemctl enable nvidia-persistenced.service fcvm-fleet-tls.service fcvm-fleet-renderer.service fcvm-fleet-first-frame.service nginx.service
+  install_units
   systemctl start nvidia-persistenced.service
   nvidia-smi -L
   ;;
@@ -118,6 +129,11 @@ image)
   # /health answers 200 whatever the renderer's state: the body decides.
   curl -fsS -m 2 http://127.0.0.1:8080/health | jq -e '.ready == true and .frame > 0' >/dev/null || { echo "renderer not ready after 300 s"; exit 1; }
   systemctl stop fcvm-fleet-renderer.service
+  ;;
+units)
+  # Revise the units of a tile AMI built earlier (build-ami.sh launch with BASE_AMI, then
+  # this phase and bake).
+  install_units
   ;;
 bake)
   $APT clean

@@ -5,6 +5,7 @@ mod container;
 mod exec;
 mod fuse;
 mod gpu;
+mod gpu_park;
 mod lock_test;
 mod mmds;
 mod mounts;
@@ -80,6 +81,24 @@ async fn main() {
     if let Some(result) = one_shot_result {
         if let Err(error) = result {
             eprintln!("[fc-agent] snapshot network boundary failed: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // Warm GPU snapshot one-shots, invoked by the host around a `snapshot create
+    // --gpu-warm` (gpu_park.rs). Failure is the exit status, so the host stops.
+    let gpu_result = match one_shot.as_deref() {
+        Some("--gpu-park") => Some(gpu_park::park().await.map(|_| ())),
+        Some("--gpu-unpark") => Some(gpu_park::unpark_source().await),
+        _ => None,
+    };
+    if let Some(result) = gpu_result {
+        if let Err(error) = result {
+            eprintln!(
+                "[fc-agent] {} failed: {error:#}",
+                one_shot.unwrap_or_default()
+            );
             std::process::exit(1);
         }
         return;

@@ -320,6 +320,15 @@ trait PacketReceiveBarrier {
 
 trait CommandRunner {
     async fn output(&self, program: &str, args: &[&str]) -> io::Result<std::process::Output>;
+
+    /// Run with `input` on stdin. For `iptables-restore`, which commits what
+    /// it reads as one transaction.
+    async fn output_with_input(
+        &self,
+        program: &str,
+        args: &[&str],
+        input: &[u8],
+    ) -> io::Result<std::process::Output>;
 }
 
 struct SystemCommandRunner;
@@ -327,6 +336,35 @@ struct SystemCommandRunner;
 impl CommandRunner for SystemCommandRunner {
     async fn output(&self, program: &str, args: &[&str]) -> io::Result<std::process::Output> {
         Command::new(program).args(args).output().await
+    }
+
+    async fn output_with_input(
+        &self,
+        program: &str,
+        args: &[&str],
+        input: &[u8],
+    ) -> io::Result<std::process::Output> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            io::Error::other(format!("{program} child has no stdin despite piped()"))
+        })?;
+        // A child that exits before reading all of its input breaks the pipe.
+        // Its exit status and stderr say why, so a failed child is reported
+        // through them; the write error stands only when the child succeeded.
+        let written = stdin.write_all(input).await;
+        drop(stdin);
+        let output = child.wait_with_output().await?;
+        match written {
+            Err(error) if output.status.success() => Err(error),
+            _ => Ok(output),
+        }
     }
 }
 
@@ -551,7 +589,8 @@ const IPV6_LOOPBACK: &str = "::1/128";
 /// of. The rule has to be in the snapshot, not added by the restore, so that no
 /// poll can leave between the resume and the restore's first step while the
 /// inherited gate verifies. (A reinstall over a gate that fails verification
-/// flushes each chain before refilling it, a window issue 1244 tracks.) A REJECT
+/// replaces each chain in one transaction, `configure_gate_chains`, so the rule
+/// holds through it too.) A REJECT
 /// in OUTPUT fails the send itself (`sendto` returns EPERM), so on the source
 /// VM a poll whose timer fires during the cookie dump fails and chronyd logs
 /// "Could not send". Both the source and a clone ask chronyd for a burst once
@@ -795,12 +834,6 @@ impl<R: CommandRunner, N: NetfilterOpener> IptablesGate<R, N> {
         Ok(())
     }
 
-    async fn chain_exists(&self, program: &str, chain: &str) -> Result<bool> {
-        let args = ["-w", "-L", chain];
-        let output = self.runner.output(program, &args).await?;
-        Ok(output.status.success())
-    }
-
     async fn read_family_state(&self, program: &str) -> Result<FamilyGateState> {
         let args = ["-w", "-S"];
         let output = self
@@ -837,21 +870,37 @@ impl<R: CommandRunner, N: NetfilterOpener> IptablesGate<R, N> {
         Ok(closed)
     }
 
-    async fn configure_gate_chain(
-        &self,
-        program: &str,
-        chain: &str,
-        loopback_flag: &str,
-        loopback_network: &str,
-    ) -> Result<()> {
-        if !self.chain_exists(program, chain).await? {
-            self.required(program, &["-w", "-N", chain]).await?;
+    /// Replace both gate chains of one family with exactly the gate's rules,
+    /// in one `iptables-restore --noflush` transaction. Declaring a chain
+    /// creates it, or flushes that chain only when it exists, and the table
+    /// is committed whole on both the legacy and nf_tables backends. So a
+    /// chain that is already hooked from INPUT or OUTPUT, which is what a
+    /// restored clone reinstalls over when its inherited gate fails
+    /// verification, goes from its old rules to the gate's with no moment in
+    /// between. Flushing it and appending one rule per process left it empty,
+    /// and so admitting every new flow and NTP poll, until the last append
+    /// (issue 1244).
+    async fn configure_gate_chains(&self, program: &str, loopback_network: &str) -> Result<()> {
+        let mut input = String::from("*filter\n");
+        for (chain, loopback_flag) in [(GATE_INPUT_CHAIN, "-s"), (GATE_OUTPUT_CHAIN, "-d")] {
+            input.push_str(&format!(":{chain} - [0:0]\n"));
+            for rule in gate_chain_rules(loopback_flag, loopback_network) {
+                input.push_str(&format!("-A {chain} {}\n", rule.join(" ")));
+            }
         }
-        self.required(program, &["-w", "-F", chain]).await?;
-        for rule in gate_chain_rules(loopback_flag, loopback_network) {
-            let mut args: Vec<&str> = vec!["-w", "-A", chain];
-            args.extend(rule.iter().map(String::as_str));
-            self.required(program, &args).await?;
+        input.push_str("COMMIT\n");
+        let restore = format!("{program}-restore");
+        let args = ["-w", "--noflush"];
+        let output = self
+            .runner
+            .output_with_input(&restore, &args, input.as_bytes())
+            .await
+            .with_context(|| format!("spawning {restore}"))?;
+        if !output.status.success() {
+            bail!(
+                "snapshot network gate command failed: {}",
+                command_failure(&restore, &args, &output)
+            );
         }
         Ok(())
     }
@@ -875,9 +924,7 @@ impl<R: CommandRunner, N: NetfilterOpener> IptablesGate<R, N> {
         // guest, and allowing its source subnet allowed every outbound packet.
         // Direction-specific chains preserve loopback only; gateway/NFS
         // sockets are restored explicitly after the clone gate opens.
-        self.configure_gate_chain(program, GATE_INPUT_CHAIN, "-s", loopback_network)
-            .await?;
-        self.configure_gate_chain(program, GATE_OUTPUT_CHAIN, "-d", loopback_network)
+        self.configure_gate_chains(program, loopback_network)
             .await?;
         self.install_hook(program, "INPUT", GATE_INPUT_CHAIN)
             .await?;
@@ -2699,6 +2746,30 @@ mod tests {
                 stderr: Vec::new(),
             })
         }
+
+        async fn output_with_input(
+            &self,
+            program: &str,
+            args: &[&str],
+            input: &[u8],
+        ) -> io::Result<std::process::Output> {
+            record_input(&self.0, program, args, input);
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    /// Records a command fed on stdin as the command line, then one
+    /// `<program>< <line>` entry per input line.
+    fn record_input(calls: &Mutex<Vec<String>>, program: &str, args: &[&str], input: &[u8]) {
+        let mut calls = calls.lock().unwrap();
+        calls.push(format!("{program} {}", args.join(" ")));
+        for line in String::from_utf8_lossy(input).lines() {
+            calls.push(format!("{program}< {line}"));
+        }
     }
 
     /// A restored clone is behind by the snapshot's age and chronyd steps at any
@@ -2718,7 +2789,7 @@ mod tests {
             ("iptables", "127.0.0.0/8", "icmp-port-unreachable"),
             ("ip6tables", "::1/128", "icmp6-port-unreachable"),
         ] {
-            let prefix = format!("{program} -w -A FCVM_SNAPSHOT_OUT ");
+            let prefix = format!("{program}-restore< -A FCVM_SNAPSHOT_OUT ");
             let appended: Vec<&str> = calls
                 .lines()
                 .filter_map(|call| call.strip_prefix(prefix.as_str()))
@@ -2772,13 +2843,16 @@ mod tests {
         IptablesGate::new(runner).close().await.unwrap();
         let calls = calls.lock().unwrap().join("\n");
 
-        assert!(calls.contains("iptables -w -A FCVM_SNAPSHOT_IN -p tcp -s 127.0.0.0/8 -j RETURN"));
-        assert!(calls.contains("iptables -w -A FCVM_SNAPSHOT_OUT -p tcp -d 127.0.0.0/8 -j RETURN"));
+        assert!(
+            calls.contains("iptables-restore< -A FCVM_SNAPSHOT_IN -p tcp -s 127.0.0.0/8 -j RETURN")
+        );
+        assert!(calls
+            .contains("iptables-restore< -A FCVM_SNAPSHOT_OUT -p tcp -d 127.0.0.0/8 -j RETURN"));
         assert!(calls.contains(
-            "iptables -w -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT"
+            "iptables-restore< -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT"
         ));
         assert!(calls.contains(
-            "iptables -w -A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT"
+            "iptables-restore< -A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT"
         ));
         assert!(
             !calls.contains("10.0.2.") && !calls.contains("fd00:"),
@@ -2795,8 +2869,8 @@ mod tests {
              cross the gate:\n{calls}"
         );
         assert!(
-            calls.contains("iptables -w -A FCVM_SNAPSHOT_IN -i lo -j RETURN")
-                && calls.contains("ip6tables -w -A FCVM_SNAPSHOT_IN -i lo -j RETURN"),
+            calls.contains("iptables-restore< -A FCVM_SNAPSHOT_IN -i lo -j RETURN")
+                && calls.contains("ip6tables-restore< -A FCVM_SNAPSHOT_IN -i lo -j RETURN"),
             "the egress proxy's redirected flows (entering on lo) must pass INPUT:\n{calls}"
         );
         // The UDP ingress rejection belongs to the restored clone only (see
@@ -2864,6 +2938,20 @@ mod tests {
             Ok(std::process::Output {
                 status: std::process::ExitStatus::from_raw(0),
                 stdout,
+                stderr: Vec::new(),
+            })
+        }
+
+        async fn output_with_input(
+            &self,
+            program: &str,
+            args: &[&str],
+            input: &[u8],
+        ) -> io::Result<std::process::Output> {
+            record_input(&self.calls, program, args, input);
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
                 stderr: Vec::new(),
             })
         }
@@ -2984,6 +3072,256 @@ mod tests {
             &parse_gate_state(&doubled),
             IPV4_LOOPBACK
         ));
+    }
+
+    /// One family's filter table, as far as `close()` touches it: the gate
+    /// chains and the built-in INPUT and OUTPUT chains, each rule as tokens.
+    #[derive(Clone, Default)]
+    struct ModelTable {
+        chains: std::collections::BTreeMap<String, Vec<Vec<String>>>,
+        input: Vec<Vec<String>>,
+        output: Vec<Vec<String>>,
+    }
+
+    impl ModelTable {
+        fn builtin(&mut self, chain: &str) -> Option<&mut Vec<Vec<String>>> {
+            match chain {
+                "INPUT" => Some(&mut self.input),
+                "OUTPUT" => Some(&mut self.output),
+                _ => None,
+            }
+        }
+
+        fn append(&mut self, chain: &str, rule: Vec<String>) -> bool {
+            if let Some(rules) = self.builtin(chain) {
+                rules.push(rule);
+                return true;
+            }
+            match self.chains.get_mut(chain) {
+                Some(rules) => {
+                    rules.push(rule);
+                    true
+                }
+                None => false,
+            }
+        }
+
+        /// The armed gate of one family, as a snapshot carries it.
+        fn armed(loopback_network: &str) -> Self {
+            let mut table = Self::default();
+            for (hook, chain, flag) in [
+                ("INPUT", GATE_INPUT_CHAIN, "-s"),
+                ("OUTPUT", GATE_OUTPUT_CHAIN, "-d"),
+            ] {
+                table
+                    .chains
+                    .insert(chain.to_string(), gate_chain_rules(flag, loopback_network));
+                let jump = hook_jump_args(chain).map(str::to_string).to_vec();
+                table.builtin(hook).unwrap().push(jump);
+            }
+            table
+        }
+    }
+
+    /// iptables and iptables-restore over one model table per family. After
+    /// every command that changes a table, it records each gate chain that is
+    /// hooked from INPUT or OUTPUT and does not hold every rule of the gate:
+    /// a moment in which that chain admits what the gate exists to reject.
+    #[derive(Clone)]
+    struct ModelIptables {
+        tables: Arc<Mutex<[ModelTable; 2]>>,
+        gaps: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ModelIptables {
+        fn new(ipv4: ModelTable, ipv6: ModelTable) -> Self {
+            Self {
+                tables: Arc::new(Mutex::new([ipv4, ipv6])),
+                gaps: Arc::default(),
+            }
+        }
+
+        fn check(&self, family: Family, command: &str) {
+            let tables = self.tables.lock().unwrap();
+            let table = &tables[family_index(family)];
+            let network = match family {
+                Family::Ipv4 => IPV4_LOOPBACK,
+                Family::Ipv6 => IPV6_LOOPBACK,
+            };
+            for (hooks, chain, flag) in [
+                (&table.input, GATE_INPUT_CHAIN, "-s"),
+                (&table.output, GATE_OUTPUT_CHAIN, "-d"),
+            ] {
+                let jump = hook_jump_args(chain);
+                if !hooks.iter().any(|rule| rule == &jump) {
+                    continue;
+                }
+                let held: Vec<Vec<String>> = table
+                    .chains
+                    .get(chain)
+                    .map(|rules| rules.iter().map(|rule| sorted_tokens(rule)).collect())
+                    .unwrap_or_default();
+                let complete = gate_chain_rules(flag, network)
+                    .iter()
+                    .all(|rule| held.contains(&sorted_tokens(rule)));
+                if !complete {
+                    self.gaps.lock().unwrap().push(format!(
+                        "after `{command}` the hooked {} chain {chain} holds {} rules",
+                        family.name(),
+                        held.len()
+                    ));
+                }
+            }
+        }
+
+        fn exit(code: i32) -> io::Result<std::process::Output> {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    impl CommandRunner for ModelIptables {
+        async fn output(&self, program: &str, args: &[&str]) -> io::Result<std::process::Output> {
+            let family = family_of(program);
+            let command = format!("{program} {}", args.join(" "));
+            let ok = {
+                let mut tables = self.tables.lock().unwrap();
+                let table = &mut tables[family_index(family)];
+                let owned = |tokens: &[&str]| tokens.iter().map(|t| t.to_string()).collect();
+                match args {
+                    ["-w", "-L", chain] => table.chains.contains_key(*chain),
+                    ["-w", "-N", chain] => {
+                        table.chains.insert(chain.to_string(), Vec::new()).is_none()
+                    }
+                    ["-w", "-F", chain] => match table.chains.get_mut(*chain) {
+                        Some(rules) => {
+                            rules.clear();
+                            true
+                        }
+                        None => false,
+                    },
+                    ["-w", "-A", chain, rule @ ..] => table.append(chain, owned(rule)),
+                    ["-w", "-I", hook, "1", rule @ ..] => match table.builtin(hook) {
+                        Some(rules) => {
+                            rules.insert(0, owned(rule));
+                            true
+                        }
+                        None => false,
+                    },
+                    ["-w", "-C", hook, rule @ ..] => {
+                        let rule: Vec<String> = owned(rule);
+                        table
+                            .builtin(hook)
+                            .is_some_and(|rules| rules.contains(&rule))
+                    }
+                    _ => panic!("the iptables model does not know `{command}`"),
+                }
+            };
+            self.check(family, &command);
+            Self::exit(if ok { 0 } else { 1 })
+        }
+
+        async fn output_with_input(
+            &self,
+            program: &str,
+            args: &[&str],
+            input: &[u8],
+        ) -> io::Result<std::process::Output> {
+            let family = family_of(program);
+            let command = format!("{program} {}", args.join(" "));
+            assert!(
+                program.ends_with("-restore") && args.contains(&"--noflush"),
+                "without --noflush iptables-restore flushes the whole table: `{command}`"
+            );
+            let input = String::from_utf8_lossy(input).to_string();
+            {
+                let mut tables = self.tables.lock().unwrap();
+                // Staged on a copy and committed whole at COMMIT, as
+                // iptables-restore does on both backends.
+                let mut staged = tables[family_index(family)].clone();
+                let mut committed = false;
+                for line in input.lines() {
+                    let tokens: Vec<&str> = line.split_whitespace().collect();
+                    match tokens.as_slice() {
+                        ["*filter"] => {}
+                        // With --noflush, declaring a chain flushes that chain
+                        // only, creating it when it does not exist.
+                        [declaration, "-", _counters] if declaration.starts_with(':') => {
+                            staged
+                                .chains
+                                .insert(declaration[1..].to_string(), Vec::new());
+                        }
+                        ["-A", chain, rule @ ..] => {
+                            let rule = rule.iter().map(|t| t.to_string()).collect();
+                            if !staged.append(chain, rule) {
+                                return Self::exit(1);
+                            }
+                        }
+                        ["COMMIT"] => committed = true,
+                        _ => panic!("the iptables-restore model does not know `{line}`"),
+                    }
+                }
+                if !committed {
+                    return Self::exit(1);
+                }
+                tables[family_index(family)] = staged;
+            }
+            self.check(family, &command);
+            Self::exit(0)
+        }
+    }
+
+    /// A restored clone whose inherited gate fails verification reinstalls
+    /// it, over chains that are already hooked from INPUT and OUTPUT. Every
+    /// moment in which a hooked chain holds less than the whole gate admits
+    /// new flows the cookie manifest never saw, and the guest's NTP polls,
+    /// while egress is gated. The reinstall replaces each chain in one
+    /// transaction, so no such moment exists, on the restore side or on a
+    /// fresh source.
+    ///
+    /// RED BEFORE THE FIX (issue 1244): close() flushed each chain with `-F`
+    /// and refilled it one `-A` at a time, leaving a hooked chain empty from
+    /// the flush to the first append and partial until the last.
+    #[tokio::test]
+    async fn reinstalling_the_gate_never_leaves_a_hooked_chain_incomplete() {
+        // The inherited gate, tampered so it fails verification: a foreign
+        // rule at the end of the INPUT gate chain.
+        let tampered = |network: &str| {
+            let mut table = ModelTable::armed(network);
+            table
+                .chains
+                .get_mut(GATE_INPUT_CHAIN)
+                .unwrap()
+                .push(["-p", "udp", "-j", "ACCEPT"].map(str::to_string).to_vec());
+            table
+        };
+        for (case, ipv4, ipv6) in [
+            ("restore", tampered(IPV4_LOOPBACK), tampered(IPV6_LOOPBACK)),
+            ("fresh", ModelTable::default(), ModelTable::default()),
+        ] {
+            let model = ModelIptables::new(ipv4, ipv6);
+            IptablesGate::new(model.clone()).close().await.unwrap();
+            let gaps = model.gaps.lock().unwrap().clone();
+            assert!(gaps.is_empty(), "{case}: {gaps:#?}");
+            let tables = model.tables.lock().unwrap();
+            for (family, network) in [(Family::Ipv4, IPV4_LOOPBACK), (Family::Ipv6, IPV6_LOOPBACK)]
+            {
+                let table = &tables[family_index(family)];
+                for (chain, flag) in [(GATE_INPUT_CHAIN, "-s"), (GATE_OUTPUT_CHAIN, "-d")] {
+                    assert_eq!(
+                        table.chains[chain],
+                        gate_chain_rules(flag, network),
+                        "{case}: {} {chain} after close()",
+                        family.name()
+                    );
+                }
+                assert_eq!(table.input[0], hook_jump_args(GATE_INPUT_CHAIN));
+                assert_eq!(table.output[0], hook_jump_args(GATE_OUTPUT_CHAIN));
+            }
+        }
     }
 
     /// Opens the model nf_tables kernel for an `IptablesGate` under test.

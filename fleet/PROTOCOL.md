@@ -336,25 +336,34 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   (`id`), with a label and this hold's votes; `holding` is the viewpoint held now (null
   while flying) and `next_hold_at` when the camera leaves it; `next` is the next hold once
   the vote has closed, `arrive_next_at` when the camera gets there.
-- `fleet.power` is whether the GPU capacity is up, when the coordinator owns the GPU hosts'
-  auto scaling groups (`--scale-group`), or with `--sleep-when-idle` on hosts it does not
-  scale (a fixed host, a test box); without either it stays `awake`. After
+- `fleet.power` is whether the GPU capacity is up, when the coordinator launches the GPU
+  hosts (`--host-template`), or with `--sleep-when-idle` on hosts it does not launch (a
+  fixed host, a test box); without either it stays `awake`. After
   `--idle-scale-down` seconds (default 600) with no active viewer (`viewers.active`), and
   never while a claim is active or a race is running, the fleet goes `asleep`
-  (`asleep_since`): every group is set to desired capacity 0, nothing is placed (every fcvm
+  (`asleep_since`): every GPU host is terminated, nothing is placed (every fcvm
   GPU still connected goes to standby, so its VM stops; the EC2 half's instances are
   terminated), no race is scheduled (`next_race_at` null) and
   `restart_now` is refused. Hosts that leave then are not reclaimed. When an active viewer
-  arrives it is `waking` from `woke_at`, the moment the wake began: every group goes back
-  to `--awake-capacity` (default 1) and the EC2 half launches as many tiles as the fcvm
+  arrives it is `waking` from `woke_at`, the moment the wake began: every host region gets
+  `--awake-capacity` hosts again (default 1) and the EC2 half launches as many tiles as the fcvm
   half had. `hosts` lists each GPU host by EC2 instance id with the phases it has reached,
-  in order: `instance_pending` and `booted` from the group (Pending, then InService),
+  in order: `instance_pending` and `booted` from EC2 (pending, then running),
   `store_ready` when the host marked its store mounted (the agent's hello reports it; the
   phase is absent when the host does not mark it), `agent_connected` when its agent says
   hello (the agent names itself by its instance id), `tiles_rendering` when all its placed
   slots run. Once every placed tile of both halves runs it is `awake`; `last_wake` gives
   the wake's start, when it was complete (`awake_at`), the tiles placed then (`gpus`, both
-  halves) and the time between (`ms`); `wakes` keeps the last 20.
+  halves) and the time between (`ms`); `wakes` keeps the last 20. The EC2 half can make
+  the image complete before a GPU host's agent has said hello (a host's slots are placed
+  only then), so the hosts' phases keep being recorded after the fleet is `awake`, until
+  every host of the wake has `tiles_rendering`. The coordinator logs each step at info
+  (`wake: started`, `wake: host phase`, `wake: host boot` with the hello's boot times,
+  `wake: tile running` with each tile's timings, `wake: fleet awake`), each with
+  `since_wake_ms`, and each EC2 tile's readiness (`tile ready`: since its launch was
+  accepted, when the instance was first seen running, when its renderer first answered
+  `/health`, and when it was ready). A starting tile is described every 3 s and, once it
+  runs with an address, its renderer's `/health` is asked every 250 ms in between.
 - `counters` are totals since the fleet first started, kept in the state file across
   coordinator restarts: `restores` counts fcvm GPU VMs that reached their first frame
   (the wall's, races', claims' and returns'), `restores_last_hour` those in the current
@@ -388,7 +397,11 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   and `failures` carry it.
 - `aggregates` lists the regions an aggregator serves (see Aggregator): one per GPU host
   that has placed tiles, with the tiles inside it, and the EC2 half when the coordinator
-  runs its aggregator. `frame_url` is null until the host's aggregator is serving.
+  runs its aggregator. `frame_url` is null until the host's aggregator is serving. With
+  the coordinator's subzone (`--dns-subzone`) a host aggregator's `frame_url` and
+  `frame_url_v4` are its published names (`wss://agg-<host>-<token>.<subzone>/frames`,
+  `wss://agg-<host>-<token>-v4.<subzone>:<port>/frames`), and both stay null for an
+  aggregator that serves no browser (no `--aggregate-tls-port`).
 - `actions` holds the latest 50 intents, committed and refused, oldest first: the
   `viewer` that sent it, the intent `id`, its `args` (a refused word's are `{}`, so its
   text appears nowhere), and the outcome.
@@ -410,16 +423,19 @@ relaunching (its region would be black; claimed GPUs and dark tiles do not count
 fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file <path>]
                  [--text-check bedrock --text-check-model <id> --text-check-region <region> | --text-check none]
                  [--max-tiles 100] [--ec2 none|fake] [--allowed-origin <scheme://host[:port]>]...
-                 [--ec2-aggregate-listen <addr:port> --ec2-aggregate-url <ws url>] [--aggregate-arg <arg>]...
+                 [--ec2-aggregate-listen <addr:port> (--ec2-aggregate-url <ws url> | --ec2-aggregate-tls
+                  [--ec2-aggregate-tls-dir /run/fcvm-fleet/tls])] [--aggregate-arg <arg>]...
                  [--race-every <secs>] [--restart-cooldown 60] [--camera-seed 1] [--max-borrowed <n>]
                  [--trust-cf-connecting-ip] [--turnstile-secret <secret> --turnstile-site-key <key>]
                  [--admin-listen <addr:port>] [--ffmpeg ffmpeg]
-                 [--scale-group <region>:<group name>]... [--awake-capacity 1] [--idle-scale-down 600]
-                 [--on-demand-group <region>:<group name>]... [--spot-wait 120]
+                 [--host-template <region>:<template>... --host-subnet <region>:<subnet id>...]
+                 [--awake-capacity 1] [--host-on-demand-max 8] [--idle-scale-down 600]
                  [--state-bucket <bucket> [--state-key state.json] [--state-region <region>]]
                  [--ec2 aws --ec2-tiles 8 --ec2-regions <r1,r2,...> [--ec2-template fcvm-fleet-tile-x86_64]
-                  [--ec2-on-demand-template <name>] [--fleet-name stage]] [--dns-zone fcvm.dev]
-                 [--dns-token-secret <secret> [--dns-zone-id <id>]]
+                  [--ec2-on-demand-template <name>] [--fleet-name stage]
+                  [--ec2-pool <n> --ec2-pool-template <name>]
+                  [--ec2-subnets <region>:<subnet>,... --ec2-security-group <region>:<group>]...]
+                 [--dns-zone fcvm.dev] [--dns-token-secret <secret> [--dns-zone-id <id>]]
                  [--dns-subzone <subzone> --dns-subzone-ns <ns>,... --dns-listen <addr:port> [--dns-rate-limit 200]]
                  [--tls-secret <secret>] [--secrets-region <region>]
 ```
@@ -433,7 +449,13 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   instance from the tile launch template (one-time spot), tagged `Purpose=fcvm-fleet-tile`,
   `FleetTile=<tile>` and `Fleet=<--fleet-name>` (`FLEET_NAME`, default `stage`) at launch,
   in the first of `--ec2-regions` (`FLEET_REGIONS`) with
-  capacity; when every region refuses for capacity it tries `--ec2-on-demand-template`,
+  capacity. In a region given `--ec2-subnets` (`FLEET_EC2_SUBNETS`, entries separated by
+  spaces; one subnet per AZ) a launch tries each subnet in order before the next region,
+  naming the interface itself: that subnet, the region's `--ec2-security-group`
+  (`FLEET_EC2_SECURITY_GROUPS`), a public IPv4 address and one IPv6 address. A refusal for
+  capacity, or `Unsupported` (the AZ does not offer the type), moves to the next subnet. A
+  region without subnets launches in the template's. When every region refuses for capacity
+  it tries `--ec2-on-demand-template` the same way,
   and without one the tile waits for capacity (recorded on its own) and asks again every
   10 s. A tile is ready once its instance runs and its renderer answers
   `https://ec2-<n>.<zone>/health` (the name resolved to the instance) with `ready` true; a
@@ -442,11 +464,34 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   new launch is accepted. A tile whose instance never serves `/health` has that instance
   terminated and is launched again after a backoff (1 s doubling to 30 s), and so does a
   running tile whose instance is found shutting down, stopped or terminated (a spot
-  reclaim; checked every 15 s). The coordinator
+  reclaim), whose renderer's `/health` carries an `error`, or whose renderer leaves
+  `/health` unanswered three checks in a row (checked every 15 s). A renderer that
+  restarts on its instance (`fcvm-fleet-renderer.service` restarts it) answers with a new
+  `boot_id`: the coordinator reads each tile's `/health` once a second (and once before the
+  first scene post on an instance) and posts the scene and the budget again when the
+  `boot_id` differs from the last one read. The coordinator
   keeps no instance ids across a restart, so before its first launch, and again when it
   stops, it terminates every instance tagged `Purpose=fcvm-fleet-tile` and
   `Fleet=<--fleet-name>` in `--ec2-regions`; another fleet's tiles in the same account (a
   different `--fleet-name`) are left alone.
+- `--ec2-pool <n>` with `--ec2-pool-template <name>` keeps up to `n` tile instances stopped
+  for the next wake. A tile that leaves the assignment (the fleet sleeps) has its instance
+  tagged `FleetPool=<--fleet-name>` and stopped instead of terminated, while fewer than `n`
+  are pooled and its image is the pool template's current one. A tile with no instance (a
+  wake, or after its instance failed) first starts a pooled instance in the first region,
+  retagged `FleetTile=<tile>`, and launches only when none starts; the tile's timings then
+  carry `resumed: 1`. The relaunch of a running tile (a race) always launches. Cold
+  launches use the pool template, which must give instances that can be stopped
+  (persistent spot that stops on interruption, or on demand). Every terminate cancels the
+  instance's spot request first when it is persistent, since a persistent request replaces
+  a terminated instance, and leaves the instance running when the request cannot be read
+  or cancelled. The start and stop sweeps keep up to `n` pooled instances that are stopped
+  or stopping. A pooled instance of an older image, or launched more than 6 days ago (a
+  persistent request without `ValidUntil` expires after 7), is terminated at the next wake
+  instead of started. Measured on g4dn.xlarge (2026-10-25): a
+  stopped tile started to its first frame in 15.5 s (persistent spot) and 17.2 to 17.5 s
+  (on demand), against 81 to 84 s for a launch; a stopped persistent spot instance can be
+  started again only once its request is `disabled`, 42 to 54 s after it stopped.
 - `--dns-token-secret` is the zone's Cloudflare token, which the certificate renewal writes
   its DNS-01 records with (see "Certificate").
 - `--dns-subzone` makes the coordinator the authoritative DNS server of a subzone of
@@ -455,7 +500,13 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   an address gets a label never used before, `slot-<n>-<token>` / `ec2-<n>-<token>` (8
   random base32 characters), and under it `<label>.<subzone>` AAAA (the slot's own IPv6
   address) and `<label>-v4.<subzone>` A (the host's or the tile's public IPv4 address), TTL
-  60. A launch's names answer until its slot has a newer launch or leaves the fleet. Minting a launch's label and publishing its names are
+  60. A launch's names answer until its slot has a newer launch or leaves the fleet. A
+  host aggregator that reports public addresses is named the same way under
+  `agg-<host>-<token>` (a host name of lowercase letters, digits and inner hyphens, at most
+  40 characters): AAAA its own IPv6 address, A the host's IPv4 address, with its port in
+  `frame_url_v4`; the EC2 half's aggregator is `agg-ec2-<token>` (see
+  `--ec2-aggregate-tls`). An aggregator's names answer while it reports the same
+  addresses; new addresses get a new label. Minting a label and publishing its names are
   one step of the coordinator's state, and the server answers from that state, so a name
   answers from the moment a viewer can learn it, with no wait. It listens on
   `--dns-listen`, UDP and TCP (a high port; a load balancer maps 53), and answers only for
@@ -466,6 +517,18 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   per source /24 or /56, every second response goes out truncated and the rest are
   dropped.
 - `--tls-secret` keeps the wildcard certificate renewed (see "Certificate").
+- `--ec2-aggregate-tls` (with `--ec2-aggregate-listen`, `--tls-secret` and
+  `--dns-subzone`) serves the EC2 half's aggregator to browsers with TLS on port 443
+  of the coordinator task's own addresses, read at start on ECS: the global IPv6 address
+  from the task metadata (`ECS_CONTAINER_METADATA_URI_V4`) and the public IPv4 address of
+  the task's network interface (EC2 `DescribeNetworkInterfaces` by its private address, in
+  `AWS_REGION`, with the task role). It writes the certificate (from `--tls-secret`) as
+  `tls.json` into `--ec2-aggregate-tls-dir` for the aggregator and reads the secret again
+  hourly, and names the addresses `agg-ec2-<token>` in the subzone (AAAA and `-v4` A, both
+  on 443) like a host aggregator. A non-root process binds 443 only where the task lowers
+  `net.ipv4.ip_unprivileged_port_start` (it covers IPv6 too). With published names the
+  EC2 aggregate's `frame_url`/`frame_url_v4` are those names, else null;
+  `--ec2-aggregate-url` is used only without the subzone.
 
 ### Certificate
 
@@ -482,26 +545,33 @@ renewal that fails is tried again 15 minutes later. Its key is PKCS#8 (`PRIVATE 
 both are PEM that nginx and rustls read. Renderers get it from their agent
 (`--tls-secret`), tiles from their own instance role.
 
-- `--scale-group` hands the coordinator the GPU hosts' auto scaling groups (repeatable,
-  one per region); it sets their desired capacity (Auto Scaling `SetDesiredCapacity`) and,
-  while waking, reads their instances (`DescribeAutoScalingGroups`) every 5 s, with the
-  credentials of its task or instance role. A call that fails marks the coordinator
-  degraded (`scale`) and is retried.
-- `--on-demand-group` names an on-demand group as the fallback of the `--scale-group` in its
-  region (at most one per region, and that region must have exactly one scale group). Auto
-  Scaling does not move a spot group's capacity to on demand by itself, so the coordinator
-  does: while waking, when the spot group and its on-demand group together have had fewer
-  live instances (any lifecycle state but `Terminating*`, `Terminated` and `Detach*`) than
-  `--awake-capacity` for `--spot-wait` seconds (default 120), it sets the on-demand group to
-  the shortfall and the spot group to the live instances it has, so a spot launch that
-  succeeds later cannot add a host. A split written only half way (one call failed) is
-  written again on every poll until both groups hold it, and `scale` stays degraded until
-  then. A group it cannot describe is not taken to be short. It never raises the on-demand
-  group otherwise, sets it to 0 with the spot group when the fleet sleeps, and the next
-  wake asks spot first. Before raising a spot group for a wake (also the first one after
-  the coordinator starts) it reads both groups' desired capacity: an on-demand group that
-  already holds hosts keeps them, and the spot group is held at the rest. The on-demand group's own `max_size` caps
-  what it can be given. The on-demand instances are listed with the spot ones in `hosts`.
+- `--host-template` names a GPU host launch template (`<region>:<template>`, repeatable;
+  the templates of a region are one request's pools, e.g. one per architecture), and
+  `--host-subnet` the subnets hosts may launch in (`<region>:<subnet id>`, repeatable, at
+  least one per region with a template). Both also come comma separated from
+  `FLEET_HOST_TEMPLATES` and `FLEET_HOST_SUBNETS`, and `--host-on-demand-max` from
+  `FLEET_HOST_ON_DEMAND_MAX`. The coordinator launches the hosts itself, with
+  the credentials of its task or instance role: a region with fewer pending or running
+  hosts than `--awake-capacity` asks EC2 for the shortfall on spot (`CreateFleet` of type
+  `instant` over every template and subnet of the region, `price-capacity-optimized`), and
+  when the answer refuses spot for capacity (`InsufficientInstanceCapacity`,
+  `MaxSpotInstanceCountExceeded`, `UnfulfillableCapacity`, `VcpuLimitExceeded`, ...) asks
+  for the rest on demand in the same pass (`spot launch refused; launching on demand now`
+  with the refusal), while the fleet runs fewer than `--host-on-demand-max` on-demand hosts
+  (default 8, at most 8) in all regions together. The on-demand hosts are counted only when
+  every region could be listed; otherwise no region falls back until it can. A region still
+  short asks again 10 s later, spot first. Each host is tagged `Purpose=fcvm-fleet-host`,
+  `Fleet=<--fleet-name>` and `Market=spot|on-demand`, and is found by those tags, so a
+  restarted coordinator keeps the hosts it finds. Asleep, every host of the fleet is
+  terminated; awake, a stopped host and a host over the awake capacity (on-demand first)
+  are terminated, and a host that is reclaimed or terminated is replaced. The regions are
+  listed (`DescribeInstances`) every 2 s while hosts come up or go away and every 15 s while
+  they run; an instance a launch named counts as pending while lists leave it out (60 s at
+  most), and a launch whose answer is lost is asked again with the same idempotency token. The coordinator logs `wake: host launch accepted` (`market`, `request_ms`, the
+  `CreateFleet` round trip), `wake: host running` (`request_to_running_ms`) and, once a
+  region runs its awake capacity, `wake: host capacity in service` with `path` (`spot`,
+  `on-demand`, or `spot and on-demand`) and `since_wake_ms`. A call that fails marks the
+  coordinator degraded (`scale`) and is retried at the next poll.
 - `--admin-listen` serves the operator's endpoint, `POST /quarantine/release` with
   `{"host": "<host>", "sbdf": "0000:05:00.0"}`, which returns a quarantined GPU to
   rotation. It has no authentication: keep it on loopback or a private network.
@@ -543,8 +613,9 @@ with the instance role). The VMs keep running while the connection is down; the 
 reconnects (1 s doubling to 30 s) and starts each new connection with its hello and the
 latest of every state message (each slot's report, the aggregator, a draining notice,
 quarantines), so a coordinator that lost the host learns where each slot is without a
-restart. A reported generation above the coordinator's is adopted, so the next relaunch
-goes past it. The coordinator serves `/agent` on its `/live` listener; Cloudflare Access
+restart. A slot's report is replayed while the slot is assigned; a quarantine until the
+coordinator answers it with `quarantine_stored` (below). A reported generation above the
+coordinator's is adopted, so the next relaunch goes past it. The coordinator serves `/agent` on its `/live` listener; Cloudflare Access
 admits only the agents' service token there.
 
 When its input closes (`--stdio`), the agent tears down every VM it started and exits. If the agent
@@ -555,12 +626,18 @@ is killed outright, each VM's fcvm gets SIGTERM from the kernel (the agent arms
 
 ```json
 {"type": "hello", "host": "<name>", "arch": "x86_64", "gpus": [{"sbdf": "0000:01:00.0", "name": "Tesla T4"}], "capacity": 8,
- "store_ready_at": 1761134470000}
+ "store_ready_at": 1761134470000,
+ "boot": {"kernel_started_at": 1761134405000, "store_started_at": 1761134417000, "store_mounted_at": 1761134418000, "agent_started_at": 1761134471000}}
 ```
 
 First line, once. `store_ready_at` (optional) is when the host's store was ready: the
-modification time of `--store-ready-file`, which the host's boot writes once the store is
-mounted. `gpus` are the NVIDIA display functions bound to `vfio-pci`, in address
+modification time of `--store-ready-file`, which the host's store unit
+(`fleet/ami/host/store.sh`) writes once the store is restored. `boot` (optional) is when the
+host's boot reached each step, Unix milliseconds on the host's clock: `kernel_started_at`
+(now less `/proc/uptime`), `agent_started_at`, and every `*_at` number in the store-ready
+file, which the store unit writes as a JSON object (`store_started_at`, `store_mounted_at`).
+The coordinator keeps the times that fall inside the current wake in the wake's host record
+(`power.hosts` in the state object) and logs them. `gpus` are the NVIDIA display functions bound to `vfio-pci`, in address
 order; `capacity` is how many VMs the host runs at once (default: one per GPU). The
 coordinator makes one slot per GPU and ignores a repeated address. The first hello binds the
 connection to `host`, and a later hello on the same connection must name the same host. A
@@ -625,13 +702,18 @@ until the host stops.
 A GPU scrub finished (with `--scrub`: `<fcvm> gpu scrub <sbdf>`, exit status 0 is ok).
 
 ```json
-{"type": "quarantine", "slot": "slot-5", "sbdf": "0000:05:00.0", "error": "..."}
+{"type": "quarantine", "slot": "slot-5", "sbdf": "0000:05:00.0", "error": "...", "report": "<32 hex>"}
 ```
 
 The agent took a GPU out of rotation and runs nothing on it again: its scrub failed, a
 relaunch failed with an error naming the GPU's address, or three relaunches in a row
 failed before fcvm's `restored` record (the GPU reset and attach) or while the GPU was
 still held. Failures after the restore (the container or the renderer) do not count.
+`report` names this report (random per quarantine). The agent sends it again at the start
+of every connection until the coordinator answers with `quarantine_stored` for that report.
+A replay of a report whose quarantine an operator released (the coordinator keeps the last
+released report per GPU in its state) is acknowledged and changes nothing; a new report for
+the same GPU quarantines it again.
 
 ### Coordinator to agent
 
@@ -656,6 +738,9 @@ none is placed). For each slot the agent reconciles:
   once.
 - `rect` changed, generation not: post the new scene to the running renderer, no
   relaunch. `rect: null` (the host drains): keep the VM, post nothing.
+- the renderer's `/health` names a different `boot_id` than the last read (the renderer
+  restarted inside its VM and lost its scene): post the scene and the budget again, no
+  relaunch.
 - `standby: true` (the standby pool): stop any VM, wait until the GPU is free, scrub it
   with `--scrub`, report `standby`, and run nothing until the slot is placed again.
 - `warm: true` (with `rect: null`): the GPU is joining. Run its VM as for a placed slot and
@@ -729,6 +814,21 @@ change and keeps a renderer that missed the original post on the grid's budget. 
 drawing the whole image for a claim gets no budget (it chooses its own). The coordinator posts the same
 body to each EC2 tile's renderer.
 
+```json
+{"type": "quarantine_stored", "sbdf": "0000:05:00.0", "report": "<32 hex>"}
+```
+
+A stored state holds the agent's `quarantine` report `report` for this GPU: the coordinator's
+state write (`--state-file` or `--state-bucket`) that came after the report succeeded.
+Without it a coordinator that stopped before its next write would come back with no record
+of the quarantine and assign the GPU again, so the agent keeps the report in its replay
+until this arrives for that report (a newer report for the same GPU stays). The
+coordinator sends it on the store tick (1 s) after the write, to the
+host's connection at the time; a host that reconnected first replays the report and is
+answered on the new connection. With no store configured it is sent on the next tick. A
+release by the operator before the write still gets it: the stored state then holds the
+release, and the report must no longer be replayed.
+
 ### Grid budget
 
 One budget for every tile of the wall, so tiles draw the same samples per pixel, and take
@@ -774,7 +874,8 @@ round that counts it.
 fcvm fleet agent (--stdio | --dial <wss url> [--access-secret <secret>]) --image <renderer image> --base-port <port>
                  [--host <name>] [--publish-ip <ip>] [--frame-host <name or ip>]
                  [--gpus <sbdf>=<name>,...] [--fcvm <path>] [--fcvm-arg <arg>]...
-                 [--spot-notice-url <url>] [--aggregate-port <port> [--aggregate-arg <arg>]...]
+                 [--spot-notice-url <url>] [--aggregate-port <port> [--aggregate-arg <arg>]...
+                  [--aggregate-tls-port <port>]]
                  [--scrub] [--store-ready-file <path>] [--host-from-imds] [--secret-region <region>]
                  [--tls-secret <secret> [--tls-dir /run/fcvm-fleet/tls]]
                  [--ipv6-prefix <prefix/len> | --ipv6-prefix-from-imds] [--frame-zone <zone>]
@@ -829,6 +930,16 @@ every assignment or scene change, and reports it once it answers:
 {"type": "aggregate", "frame_url": "ws://<frame host>:<port>/frames"}
 ```
 
+`--aggregate-tls-port <port>` (with `--tls-secret`) also serves the stream to browsers with
+TLS (the aggregator's `--tls-listen`, the renderers' certificate file): on `<publish ip>:<port>`,
+and with an IPv6 prefix on port 443 of `<prefix>::1`, the host's side of the prefix (fcvm
+never gives it to a VM), which the agent puts on the host's default IPv6 interface
+(`ip -6 addr replace <addr>/128 dev <iface> nodad`) before it starts. The message then
+carries what the coordinator names (`agg-<host>-<token>`, see `--dns-subzone`):
+`ipv6` (port 443), and with `--public-ipv4-from-imds` the host's `ipv4` and the port as
+`v4_port`. The aggregator's `--listen` stays on `<publish ip>:<aggregate port>`, which the
+host's security group does not admit.
+
 ## Aggregator
 
 `fcvm fleet aggregate` joins one region's tiles into one stream: the agent runs one per
@@ -860,17 +971,33 @@ processes; the host needs the `ffmpeg` CLI with libx264.
   that has delivered nothing is then drawn black), the new layout takes over at once, from
   the first frame every tile still holds, with a new header and a keyframe. Until then
   viewers hold the old composite's last frame. No frame mixes the two generations. A layout
-  of the same generation (a tile's URL changed) replaces the old one at once.
+  of the same generation (a tile's URL changed) replaces the old one at once. If the new
+  layout's pipeline stops before it takes over (its encoder failed), the old layout keeps
+  composing past `from_frame`; a publishing pipeline that stops is started again after 1 s,
+  doubling to 30 s. A viewer that falls behind the stream starts again from the newest
+  keyframe.
 - The region's size is its share of a whole image `--image-height` tall (default 1080):
   the fcvm half of a 1920 x 1080 image is 960 x 1080. `?h=` is accepted and ignored.
 - `POST /layout`: `{"epoch_unix_ms","image_aspect","region":{x,y,w,h},
   "tiles":[{"id","rect","url"}],"generation","from_frame"}` (`generation` and `from_frame`
   default to 0: the layout generation of the tiles' rects and its frame; the agent sends
   its placed slots' newest, the coordinator the EC2 side's); `GET /layout` returns it.
+  The listener also serves viewers, so a `POST /layout` needs
+  `Authorization: Bearer <token>` when the aggregator was started with
+  `FCVM_FLEET_AGGREGATE_TOKEN` in its environment (the agent and the coordinator make one
+  for the aggregator they run), and otherwise comes only from this host (a loopback
+  address); anything else is refused with 403.
 - `GET /stats`: frames out, the output bitrate over the last 10 s, and percentiles of
   `after_last_tile_ms` (last tile frame used to the region frame out of the encoder),
   `after_first_tile_ms`, `encode_ms`, `tile_lateness_ms` and `out_lateness_ms` (wall
   clock minus the slot's scene time), and per tile whether it is streaming.
+- `--tls-listen <addr:port>` (repeatable, with `--tls-file <path>`) also serves `GET
+  /frames` and `GET /healthz` with TLS on that address, for browsers on an https page.
+  `/layout` and `/stats` are served on `--listen` only, which the agent and the
+  coordinator keep on an address of their own. `--tls-file` is the file the agent writes
+  for its renderers (`tls.json`, `{"cert", "key"}`, PEM; see the agent's `--tls-secret`):
+  it is read again every 2 s and a new version is used for the connections that follow;
+  a version that does not load is logged and the previous one kept.
 
 ## Renderer
 
@@ -1185,7 +1312,7 @@ pixel in both, drawn identically.
 ```json
 {"fps":30.0,"heights":[240],"streams":[{"h":240,"q":"std"}],
  "gpu":{"name":"Tesla T4","temp_c":38,"power_w":64.2,"util_pct":70,"mem_used_mb":648.3},
- "t":1234.5,"frame":5678,
+ "t":1234.5,"frame":5678,"boot_id":"9f0c2a6e41d84b7c8e2f5a1b3c4d6e7f",
  "ready":true,"render_ms":13.0,"encode_ms":0.5,"spp":3,"checkerboard":1,"hold":false,"hold_samples":0,"slots_missed":0,
  "startup_ms":{"gpu_ready":1515,"first_frame_drawn":1845,"first_frame_sent":1899}}
 ```
@@ -1199,6 +1326,9 @@ encoded), `spp` (samples per pixel drawn in it), `checkerboard` (see below),
 subscriber was connected, since start), and `startup_ms`, milliseconds from the
 process start (read from `/proc/self/stat`) to CUDA being ready, the first
 frame drawn and the first frame sent to a subscriber (`-1` until it happens).
+`boot_id` is 32 hex digits drawn at random when the process starts: a client
+that reads a different one than before is talking to a restarted renderer,
+which has no scene and no budget until they are posted again.
 `layout_generation` is the layout in force (null without one), and
 `layout_pending` (`{"generation", "from_frame"}`, present only while one is
 waiting) the next.

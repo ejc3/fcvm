@@ -14,14 +14,16 @@ pub mod cert;
 pub mod dns;
 pub mod ec2;
 pub mod ec2_aws;
+pub mod ecs;
+pub mod hosts;
 pub mod live;
 pub mod poster;
-pub mod scale;
 pub mod secrets;
 pub mod sigv4;
 pub mod store;
 pub mod text_check;
 pub mod turnstile;
+pub mod wake_log;
 
 use crate::cli::{FleetAggregateCodec, FleetCoordArgs, FleetEc2, FleetTextCheck};
 use crate::fleet::aggregate::codec::{Codec, Ffmpeg, Raw};
@@ -91,9 +93,10 @@ pub enum Cmd {
     AgentClosed {
         conn: u64,
     },
-    /// Stop: publish the last snapshot, write the state file, then answer.
+    /// Stop: publish the last snapshot, write the state file, then answer whether the last
+    /// state is stored.
     Shutdown {
-        ack: oneshot::Sender<()>,
+        ack: oneshot::Sender<bool>,
     },
 }
 
@@ -127,6 +130,9 @@ pub struct Outputs {
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(50);
 /// Minimum time between two state file writes.
 const STORE_INTERVAL: Duration = Duration::from_secs(1);
+/// How many times shutdown asks for the last state to be written, and the pause between.
+const SHUTDOWN_WRITE_ATTEMPTS: u32 = 3;
+const SHUTDOWN_WRITE_PAUSE: Duration = Duration::from_secs(1);
 
 pub struct Actor {
     state: State,
@@ -137,6 +143,9 @@ pub struct Actor {
     last_at: u64,
     published: u64,
     stored: u64,
+    /// Quarantines agents reported and have not been told are stored: host, GPU address,
+    /// the report's id, and the state version that holds the report.
+    unacked: Vec<(String, String, Option<String>, u64)>,
     clock: Box<dyn Fn() -> u64 + Send>,
 }
 
@@ -160,6 +169,7 @@ impl Actor {
             state,
             out,
             agents: HashMap::new(),
+            unacked: Vec::new(),
             last_at: 0,
             clock,
         };
@@ -231,9 +241,11 @@ impl Actor {
         let at = self.stamp();
         set_at(&mut event, at);
         let before = self.state.version;
+        let marks = wake_log::Marks::of(&self.state);
         let state = std::mem::replace(&mut self.state, State::new(Config::default(), 0));
         self.state = apply(state, &event);
         self.name_launches();
+        wake_log::log(&wake_log::notes(&marks, &self.state, at));
         if self.state.version != before {
             self.dispatch_agents();
         }
@@ -329,23 +341,30 @@ impl Actor {
     }
 
     /// Queue the state for the writer if it changed; the returned receiver resolves once it
-    /// is written (at once when nothing needed writing). With `barrier`, an unchanged state
-    /// still waits for the writes already queued, so shutdown does not end while the
-    /// periodic store's last write is in flight.
-    fn store(&mut self, barrier: bool) -> oneshot::Receiver<()> {
+    /// is written (at once when nothing needed writing), with whether the newest state is
+    /// stored. With `barrier`, an unchanged state still waits for the writes already
+    /// queued, and retries one that failed, so shutdown does not end while the periodic
+    /// store's last write is in flight or lost.
+    fn store(&mut self, barrier: bool) -> oneshot::Receiver<bool> {
         let (ack, done) = oneshot::channel();
         let Some(tx) = &self.out.store else {
-            let _ = ack.send(());
+            let _ = ack.send(true);
             return done;
         };
         if self.state.version == self.stored {
+            // Nothing new to write; the writer retries a state whose write failed, so an
+            // unchanged state that is not stored yet is tried again every tick.
             if barrier {
                 let _ = tx.send(store::StoreCmd {
                     bytes: None,
                     ack: Some(ack),
                 });
             } else {
-                let _ = ack.send(());
+                let _ = tx.send(store::StoreCmd {
+                    bytes: None,
+                    ack: None,
+                });
+                let _ = ack.send(true);
             }
             return done;
         }
@@ -359,7 +378,7 @@ impl Actor {
             }
             Err(e) => {
                 tracing::error!(error = %e, "cannot serialize the state");
-                let _ = ack.send(());
+                let _ = ack.send(false);
             }
         }
         done
@@ -401,12 +420,17 @@ impl Actor {
                 let d = &f.director;
                 // Only aggregators with a region: one without (a host whose GPUs are all
                 // on standby, the EC2 side with no tile) never sends a frame, and the
-                // capture waits for every source.
+                // capture waits for every source. A host aggregator is read at its
+                // published name when it has one (IPv4 first): the URL its agent reported
+                // can be an address only that host reaches.
                 let mut sources: Vec<String> = f
                     .hosts
                     .values()
                     .filter(|h| h.region.is_some())
-                    .filter_map(|h| h.aggregate_url.clone())
+                    .filter_map(|h| {
+                        let (v6, v4) = fleet_core::view::host_aggregate_urls(&self.state, h);
+                        v4.or(v6).or_else(|| h.aggregate_url.clone())
+                    })
                     .collect();
                 if let Some(u) = self
                     .ec2_aggregate_local
@@ -514,11 +538,24 @@ impl Actor {
                 let Some(host) = self.agents.get(&conn).map(|a| a.host.clone()) else {
                     return;
                 };
-                self.apply(Event::Agent { at: 0, host, msg });
+                let quarantined = match &msg {
+                    AgentMsg::Quarantine { sbdf, report, .. } => {
+                        Some((sbdf.clone(), report.clone()))
+                    }
+                    _ => None,
+                };
+                self.apply(Event::Agent {
+                    at: 0,
+                    host: host.clone(),
+                    msg,
+                });
+                if let Some((sbdf, report)) = quarantined {
+                    self.unacked.push((host, sbdf, report, self.state.version));
+                }
             }
             Cmd::Shutdown { ack } => {
                 // `run` handles shutdown; a direct call only acknowledges.
-                let _ = ack.send(());
+                let _ = ack.send(true);
             }
             Cmd::AgentClosed { conn } => {
                 if let Some(a) = self.agents.remove(&conn) {
@@ -532,12 +569,34 @@ impl Actor {
         }
     }
 
+    /// Tell each agent whose quarantine report a stored state of `version` holds that it
+    /// is stored. A host whose connection is gone is not told: it replays the report on its
+    /// next connection, which is acknowledged in turn.
+    fn quarantines_stored(&mut self, version: u64) {
+        let agents = &self.agents;
+        self.unacked.retain(|(host, sbdf, report, v)| {
+            if *v > version {
+                return true;
+            }
+            if let Some(a) = agents.values().find(|a| &a.host == host) {
+                let _ = a.tx.send(CoordMsg::QuarantineStored {
+                    sbdf: sbdf.clone(),
+                    report: report.clone(),
+                });
+            }
+            false
+        });
+    }
+
     /// Run until every command sender is dropped.
     pub async fn run(mut self, mut rx: mpsc::Receiver<Cmd>) {
         let mut snap_tick = tokio::time::interval(SNAPSHOT_INTERVAL);
         snap_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut store_tick = tokio::time::interval(STORE_INTERVAL);
         store_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // A write whose outcome acknowledges quarantines: the state version it holds, and
+        // whether it was stored.
+        let mut quarantine_write: Option<(u64, oneshot::Receiver<bool>)> = None;
         let ack = loop {
             tokio::select! {
                 cmd = rx.recv() => match cmd {
@@ -547,16 +606,53 @@ impl Actor {
                 },
                 _ = snap_tick.tick() => self.publish(),
                 _ = store_tick.tick() => {
-                    drop(self.store(false));
+                    if quarantine_write.is_none() && !self.unacked.is_empty() {
+                        // The barrier's answer says whether the newest state, which holds
+                        // every report so far, is stored (also when it was written before).
+                        let version = self.state.version;
+                        quarantine_write = Some((version, self.store(true)));
+                    } else {
+                        drop(self.store(false));
+                    }
+                }
+                (version, stored) = written(&mut quarantine_write) => {
+                    quarantine_write = None;
+                    if stored {
+                        self.quarantines_stored(version);
+                    }
                 }
             }
         };
         self.publish();
-        let written = self.store(true);
-        let _ = written.await;
-        if let Some(ack) = ack {
-            let _ = ack.send(());
+        let mut stored = false;
+        for attempt in 1..=SHUTDOWN_WRITE_ATTEMPTS {
+            // A writer that is gone cannot store anything.
+            stored = self.store(true).await.unwrap_or(false);
+            if stored {
+                break;
+            }
+            tracing::warn!(attempt, "the last state is not stored yet");
+            if attempt < SHUTDOWN_WRITE_ATTEMPTS {
+                tokio::time::sleep(SHUTDOWN_WRITE_PAUSE).await;
+            }
         }
+        if !stored {
+            tracing::error!(
+                attempts = SHUTDOWN_WRITE_ATTEMPTS,
+                "the last state was not stored"
+            );
+        }
+        if let Some(ack) = ack {
+            let _ = ack.send(stored);
+        }
+    }
+}
+
+/// The outcome of the write in `w` (pending forever without one).
+async fn written(w: &mut Option<(u64, oneshot::Receiver<bool>)>) -> (u64, bool) {
+    match w {
+        Some((version, rx)) => (*version, rx.await.unwrap_or(false)),
+        None => std::future::pending().await,
     }
 }
 
@@ -599,12 +695,14 @@ impl Handle {
         rx.await.ok().flatten()
     }
 
-    /// Stop the actor; returns once the last state is on disk.
-    pub async fn shutdown(&self) {
+    /// Stop the actor; returns once the last state is stored, or its writes have failed,
+    /// with whether it is stored.
+    pub async fn shutdown(&self) -> bool {
         let (ack, done) = oneshot::channel();
-        if self.cmds.send(Cmd::Shutdown { ack }).await.is_ok() {
-            let _ = done.await;
+        if self.cmds.send(Cmd::Shutdown { ack }).await.is_err() {
+            return false;
         }
+        done.await.unwrap_or(false)
     }
 
     pub async fn send(&self, event: Event) {
@@ -677,7 +775,7 @@ pub fn start(
     store: Option<store::StoreTx>,
     ec2: Option<Arc<dyn ec2::Ec2Driver>>,
     ec2_aggregate_local: Option<String>,
-    power: Option<scale::PowerConfig>,
+    power: Option<hosts::HostConfig>,
     names: Option<Names>,
 ) -> (Handle, tokio::task::JoinHandle<()>) {
     let (cmds, rx) = mpsc::channel(4096);
@@ -745,7 +843,7 @@ pub fn start(
         ));
     }
     if let Some(cfg) = power {
-        tokio::spawn(scale::run(cfg, power_rx, handle.clone()));
+        tokio::spawn(hosts::run(cfg, power_rx, handle.clone()));
     }
     (handle, task)
 }
@@ -778,13 +876,35 @@ pub fn admin_router(handle: Handle) -> axum::Router {
         .with_state(handle)
 }
 
-/// Whether the fleet sleeps with no active viewer: it scales its host groups, or it was told
+/// Whether the fleet sleeps with no active viewer: it launches its GPU hosts, or it was told
 /// to sleep on fixed hosts.
 pub fn power_managed(args: &FleetCoordArgs) -> bool {
-    !args.scale_groups.is_empty() || args.sleep_when_idle
+    !args.host_templates.is_empty() || args.sleep_when_idle
 }
 
 pub async fn run(args: FleetCoordArgs) -> Result<()> {
+    if args.ec2_aggregate_listen.is_some()
+        && args.ec2_aggregate_url.is_none()
+        && !args.ec2_aggregate_tls
+    {
+        bail!("--ec2-aggregate-listen needs --ec2-aggregate-url or --ec2-aggregate-tls (how browsers reach it)");
+    }
+    let secrets_region = || {
+        args.secrets_region
+            .clone()
+            .or_else(|| std::env::var("AWS_REGION").ok())
+            .context("reading a secret needs --secrets-region or AWS_REGION")
+    };
+    // The EC2 aggregator serving browsers: the task's own addresses, fixed for its life.
+    let ec2_public = if args.ec2_aggregate_tls {
+        let region = std::env::var("AWS_REGION")
+            .context("--ec2-aggregate-tls reads the task's addresses in AWS_REGION")?;
+        let a = ecs::task_addresses(&region).await?;
+        tracing::info!(ipv6 = ?a.ipv6, ipv4 = ?a.ipv4, "the EC2 aggregator's public addresses");
+        Some(a)
+    } else {
+        None
+    };
     let config = Config {
         max_tiles: args.max_tiles,
         ec2_max: match args.ec2 {
@@ -792,6 +912,8 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             FleetEc2::Fake | FleetEc2::Aws => args.ec2_tiles.min(args.max_tiles),
         },
         ec2_aggregate_url: args.ec2_aggregate_url.clone(),
+        ec2_aggregate_ipv6: ec2_public.as_ref().and_then(|a| a.ipv6.clone()),
+        ec2_aggregate_ipv4: ec2_public.as_ref().and_then(|a| a.ipv4.clone()),
         race_interval_secs: args.race_every,
         restart_cooldown_secs: args.restart_cooldown,
         camera_seed: args.camera_seed,
@@ -860,6 +982,9 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
                 args.dns_zone.clone(),
             )?;
             d.fleet = args.fleet_name.clone();
+            d.pool_max = args.ec2_pool;
+            d.pool_template = args.ec2_pool_template.clone();
+            d.networks = ec2_aws::networks(&args.ec2_subnets, &args.ec2_security_group)?;
             Some(Arc::new(d))
         }
     };
@@ -869,24 +994,29 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             crate::fleet::aggregate::child::connect_addr(l)
         )
     });
-    let on_demand = scale::pair_on_demand(&args.scale_groups, &args.on_demand_groups)?;
-    let power = if args.scale_groups.is_empty() {
+    let power = if args.host_templates.is_empty() {
+        anyhow::ensure!(
+            args.host_subnets.is_empty(),
+            "--host-subnet needs a --host-template"
+        );
         None
     } else {
-        Some(scale::PowerConfig {
-            driver: Arc::new(scale::AwsAutoScaling::new()?),
-            groups: args.scale_groups.clone(),
+        let driver = hosts::AwsHosts::new(
+            &args.host_templates,
+            &args.host_subnets,
+            args.fleet_name.clone(),
+        )?;
+        Some(hosts::HostConfig {
+            regions: driver.regions(),
+            driver: Arc::new(driver),
             awake_capacity: args.awake_capacity,
-            poll: Duration::from_secs(5),
-            on_demand,
-            spot_wait: Duration::from_secs(args.spot_wait),
+            on_demand_max: args.host_on_demand_max,
+            // While hosts come up or go away: one DescribeInstances per region.
+            poll: Duration::from_secs(2),
+            // While they run: a reclaimed spot host is replaced within this.
+            liveness: Duration::from_secs(15),
+            capacity_retry: Duration::from_secs(10),
         })
-    };
-    let secrets_region = || {
-        args.secrets_region
-            .clone()
-            .or_else(|| std::env::var("AWS_REGION").ok())
-            .context("reading a secret needs --secrets-region or AWS_REGION")
     };
     let dns_token = match &args.dns_token_secret {
         Some(name) => Some(
@@ -969,6 +1099,24 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             "aggregate".into(),
         ];
         argv.extend(args.aggregate_args.iter().cloned());
+        if let (Some(a), Some(secret)) = (&ec2_public, &args.tls_secret) {
+            // The certificate file, written before the aggregator starts and kept current.
+            use crate::fleet::agent::tls;
+            let dir = args.ec2_aggregate_tls_dir.clone();
+            let secrets = secrets::Secrets::new(&secrets_region()?)?;
+            tls::refresh(&secrets, secret, &dir).await?;
+            tokio::spawn(tls::run(secrets, secret.clone(), dir.clone()));
+            argv.extend([
+                "--tls-file".into(),
+                dir.join(tls::FILE).to_string_lossy().into_owned(),
+            ]);
+            if a.ipv4.is_some() {
+                argv.extend(["--tls-listen".into(), format!("0.0.0.0:{}", tls::PORT)]);
+            }
+            if let Some(v6) = &a.ipv6 {
+                argv.extend(["--tls-listen".into(), format!("[{v6}]:{}", tls::PORT)]);
+            }
+        }
         tokio::spawn(crate::fleet::aggregate::child::supervise(
             argv,
             listen.clone(),
@@ -1040,8 +1188,10 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     }
     // The state file holds the last state before the process exits; the agents' commands
     // are killed when their handles drop, and their VMs follow them (PR_SET_PDEATHSIG).
-    handle.shutdown().await;
-    tracing::info!("coordinator stopped; state written");
+    let stored = handle.shutdown().await;
+    if stored {
+        tracing::info!("coordinator stopped; state written");
+    }
     // The next coordinator does not know these instances; terminate them now (it also
     // sweeps at its start, for a coordinator that was killed).
     if let Some(d) = ec2_sweep {
@@ -1051,6 +1201,10 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             Err(_) => tracing::warn!("EC2 tiles not terminated within 20 s"),
         }
     }
+    anyhow::ensure!(
+        stored,
+        "the coordinator stopped without storing its last state"
+    );
     Ok(())
 }
 
@@ -1072,13 +1226,31 @@ mod power_tests {
     }
 
     #[test]
-    fn the_fleet_sleeps_with_scale_groups_or_when_told_to() {
+    fn the_fleet_sleeps_with_host_templates_or_when_told_to() {
         assert!(!super::power_managed(&coord(&[])));
         assert!(super::power_managed(&coord(&["--sleep-when-idle"])));
         assert!(super::power_managed(&coord(&[
-            "--scale-group",
-            "us-east-1:fcvm-fleet-hosts"
+            "--host-template",
+            "us-east-1:fcvm-fleet-host-x86_64",
+            "--host-subnet",
+            "us-east-1:subnet-0123456789abcdef0"
         ])));
+    }
+
+    #[test]
+    fn the_on_demand_host_cap_is_at_most_eight() {
+        assert_eq!(coord(&[]).host_on_demand_max, 8);
+        assert_eq!(coord(&["--host-on-demand-max", "2"]).host_on_demand_max, 2);
+        let argv = [
+            "fcvm",
+            "fleet",
+            "coord",
+            "--listen",
+            "127.0.0.1:0",
+            "--host-on-demand-max",
+            "9",
+        ];
+        assert!(Cli::try_parse_from(argv).is_err());
     }
 }
 

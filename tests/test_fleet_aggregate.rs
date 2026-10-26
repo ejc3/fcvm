@@ -692,3 +692,137 @@ async fn a_re_tile_of_streaming_tiles_skips_no_slot() {
     );
     cancel.cancel();
 }
+
+/// A self-signed certificate for `name`, as the agent's `tls.json` holds it, and the
+/// certificate alone (PEM) for a client to trust.
+fn cert_file(name: &str) -> (String, String) {
+    let ck = rcgen::generate_simple_self_signed(vec![name.to_string()]).unwrap();
+    let body = serde_json::json!({"cert": ck.cert.pem(), "key": ck.signing_key.serialize_pem()});
+    (body.to_string(), ck.cert.pem())
+}
+
+fn trusting(pem: &str) -> Arc<rustls::ClientConfig> {
+    use rustls::pki_types::pem::PemObject;
+    let mut roots = rustls::RootCertStore::empty();
+    for c in rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes()) {
+        roots.add(c.unwrap()).unwrap();
+    }
+    Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
+    )
+}
+
+/// Open `/frames` at `addr` over TLS as `wss://<name>/frames`, trusting only `pem`.
+async fn open_wss(addr: std::net::SocketAddr, name: &str, pem: &str) -> anyhow::Result<Ws> {
+    let tcp = tokio::net::TcpStream::connect(addr).await?;
+    let (ws, _) = tokio_tungstenite::client_async_tls_with_config(
+        format!("wss://{name}:{}/frames", addr.port()),
+        tcp,
+        None,
+        Some(tokio_tungstenite::Connector::Rustls(trusting(pem))),
+    )
+    .await?;
+    Ok(ws)
+}
+
+/// The public listener (`--tls-listen`) serves the region stream with the certificate
+/// file's identity and a renewed file to the connections that follow; it does not serve
+/// the layout or the stats, which stay on the private listener.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_public_listener_serves_frames_with_tls_and_no_control_routes() {
+    use fcvm::fleet::aggregate::public_router;
+    use fcvm::fleet::aggregate::tls::{CertFile, TlsListener};
+    const NAME: &str = "agg.fleet.test";
+    let shared = Shared::new();
+    let region = Rect {
+        x: 0.5,
+        y: 0.0,
+        w: 0.5,
+        h: 1.0,
+    };
+    shared.set_layout(Layout {
+        epoch_unix_ms: now_ms(),
+        image_aspect: 16.0 / 9.0,
+        region,
+        tiles: vec![TileSpec {
+            id: "ec2-1".into(),
+            rect: region,
+            url: None,
+        }],
+        generation: 1,
+        from_frame: 0,
+    });
+    let cancel = CancellationToken::new();
+    let opts = Options {
+        image_height: 36,
+        ..Options::default()
+    };
+    tokio::spawn(run(shared.clone(), Arc::new(Raw), opts, cancel.clone()));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tls.json");
+    let (first, first_pem) = cert_file(NAME);
+    std::fs::write(&path, &first).unwrap();
+    let certs = CertFile::load(&path).unwrap();
+    let l = TlsListener::bind("127.0.0.1:0", certs.clone())
+        .await
+        .unwrap();
+    let addr = l.address();
+    let app = public_router(shared.clone());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+    let mut ws = open_wss(addr, NAME, &first_pem).await.unwrap();
+    let h: serde_json::Value = match next_msg(&mut ws).await {
+        Message::Text(t) => serde_json::from_str(&t).unwrap(),
+        other => panic!("header first, got {other:?}"),
+    };
+    assert_eq!((&h["x0"], &h["height"]), (&32.into(), &36.into()));
+    assert!(matches!(next_msg(&mut ws).await, Message::Binary(_)));
+
+    let http = |pem: &str| {
+        reqwest::Client::builder()
+            .use_rustls_tls()
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .resolve(NAME, addr)
+            .no_proxy()
+            .build()
+            .unwrap()
+    };
+    let base = format!("https://{NAME}:{}", addr.port());
+    let c = http(&first_pem);
+    let r = c.get(format!("{base}/healthz")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "ok");
+    for (method, path) in [("GET", "/layout"), ("POST", "/layout"), ("GET", "/stats")] {
+        let r = c
+            .request(method.parse().unwrap(), format!("{base}{path}"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "{method} {path} over the public listener");
+    }
+
+    // A renewal: the next connection gets the new certificate, and one that trusts only
+    // the old certificate is refused.
+    let (second, second_pem) = cert_file(NAME);
+    std::fs::write(&path, &second).unwrap();
+    assert!(certs.reload().unwrap(), "a new file is a new version");
+    assert!(!certs.reload().unwrap(), "the same file is not");
+    open_wss(addr, NAME, &second_pem).await.unwrap();
+    assert!(open_wss(addr, NAME, &first_pem).await.is_err());
+    // A file that does not load keeps the version in use.
+    std::fs::write(&path, "{}").unwrap();
+    assert!(certs.reload().is_err());
+    open_wss(addr, NAME, &second_pem).await.unwrap();
+    // The stream that was open before the renewal keeps going.
+    assert!(matches!(next_msg(&mut ws).await, Message::Binary(_)));
+    cancel.cancel();
+}

@@ -12,6 +12,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "typescript": "^5.0.0"
-  }
+    "typescript": "7.1.0-beta"
+  },
+  "packageManager": "pnpm@12.15.0"
 }

@@ -24,8 +24,8 @@ pub struct TileView {
     /// The slot behind the tile (`slot-3`, `ec2-2`); null when dark.
     pub slot: Option<String>,
     /// The frame WebSocket over IPv6 and over IPv4. With published names (the fleet's
-    /// coordinator) both are null until the launch's DNS names answer at the zone's
-    /// authoritative servers; a viewer uses one family for every tile.
+    /// coordinator) both are null until the launch's DNS names are published in its
+    /// subzone; a viewer uses one family for every tile.
     pub frame_url: Option<String>,
     pub frame_url_v4: Option<String>,
     pub gpu: Option<Gpu>,
@@ -272,9 +272,11 @@ pub struct AggregateView {
     pub half: Half,
     pub host: Option<String>,
     pub rect: Rect,
-    /// The aggregator's frame WebSocket; null until it is serving. `frame_url_v4` is its
-    /// IPv4 sibling (every `*_url` has one): null for now, since an aggregator serves plain
-    /// WebSocket on the GPU host or in the coordinator, not under a published name.
+    /// The aggregator's frame WebSocket over IPv6 and over IPv4; null until it is serving.
+    /// With published names (the fleet's DNS), those of the addresses it serves now, once
+    /// published: `wss://agg-<host>-<token>.<zone>/frames` and
+    /// `wss://agg-<host>-<token>-v4.<zone>:<port>/frames`. Otherwise the URL it was reported
+    /// at, with no IPv4 one. The EC2 half's are `agg-ec2-<token>`, both on 443.
     pub frame_url: Option<String>,
     pub frame_url_v4: Option<String>,
     /// The tiles inside the region, by tile id.
@@ -484,26 +486,31 @@ pub fn view(state: &State) -> View {
                 .filter_map(|s| Some((s.position?, tile_id(Half::Fcvm, s)?)))
                 .collect();
             placed.sort();
+            let (frame_url, frame_url_v4) = host_aggregate_urls(state, h);
             Some(AggregateView {
                 id: format!("agg:{}", h.name),
                 half: Half::Fcvm,
                 host: Some(h.name.clone()),
                 rect,
-                frame_url: h.aggregate_url.clone(),
-                frame_url_v4: None,
+                frame_url,
+                frame_url_v4,
                 tiles: placed.into_iter().map(|(_, id)| id).collect(),
             })
         })
         .collect();
     aggregates.sort_by(|a, b| a.rect.y.total_cmp(&b.rect.y));
-    if let (Some(url), Some(rect)) = (&c.ec2_aggregate_url, f.layout.ec2) {
+    let ec2_aggregator = c.ec2_aggregate_url.is_some()
+        || c.ec2_aggregate_ipv6.is_some()
+        || c.ec2_aggregate_ipv4.is_some();
+    if let (true, Some(rect)) = (ec2_aggregator, f.layout.ec2) {
+        let (frame_url, frame_url_v4) = ec2_aggregate_urls(state);
         aggregates.push(AggregateView {
             id: "agg:ec2".into(),
             half: Half::Ec2,
             host: None,
             rect,
-            frame_url: Some(url.clone()),
-            frame_url_v4: None,
+            frame_url,
+            frame_url_v4,
             tiles: (1..=f.ec2_n).map(|k| format!("ec2:{k}")).collect(),
         });
     }
@@ -835,28 +842,61 @@ pub fn shared_scene(state: &State) -> SharedScene {
     SharedScene::new(&state.fleet.scene, state.config.image_aspect)
 }
 
+/// A host aggregator's frame URLs (IPv6, IPv4). With published names, those of the
+/// addresses it reports now, once published; otherwise the URL it reported, with no IPv4 one.
+pub fn host_aggregate_urls(state: &State, h: &Host) -> (Option<String>, Option<String>) {
+    if !state.config.names_published {
+        return (h.aggregate_url.clone(), None);
+    }
+    match &h.aggregate_published {
+        Some(p)
+            if p.names(
+                h.aggregate_ipv6.as_deref(),
+                h.aggregate_ipv4.as_deref(),
+                h.aggregate_v4_port,
+            ) =>
+        {
+            (p.frame_url.clone(), p.frame_url_v4.clone())
+        }
+        _ => (None, None),
+    }
+}
+
+/// The EC2 half's aggregator's frame URLs (IPv6, IPv4), as for a host aggregator: with
+/// published names, those of the coordinator's addresses once published; otherwise
+/// `--ec2-aggregate-url`, with no IPv4 one.
+pub fn ec2_aggregate_urls(state: &State) -> (Option<String>, Option<String>) {
+    let c = &state.config;
+    if !c.names_published {
+        return (c.ec2_aggregate_url.clone(), None);
+    }
+    match &state.fleet.ec2_aggregate_published {
+        Some(p)
+            if p.names(
+                c.ec2_aggregate_ipv6.as_deref(),
+                c.ec2_aggregate_ipv4.as_deref(),
+                None,
+            ) =>
+        {
+            (p.frame_url.clone(), p.frame_url_v4.clone())
+        }
+        _ => (None, None),
+    }
+}
+
 /// A tile's frame URLs (IPv6, IPv4). With published names, those of the launch the slot is
 /// on, once published; otherwise the URL its agent reported, with no IPv4 one.
 pub fn frame_urls(state: &State, s: &Slot) -> (Option<String>, Option<String>) {
     if !state.config.names_published {
         return (s.observed.frame_url.clone(), None);
     }
-    let canonical = |a: &Option<String>| {
-        a.as_ref().map(|a| {
-            a.parse::<std::net::IpAddr>()
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|_| a.clone())
-        })
-    };
     let o = &s.observed;
     match &s.published {
         // The names of exactly what the slot runs now: a new address or port at the same
         // generation waits for its own names.
         Some(p)
             if p.generation == o.generation
-                && p.ipv6 == canonical(&o.ipv6)
-                && p.ipv4 == canonical(&o.ipv4)
-                && p.v4_port == o.v4_port =>
+                && p.names(o.ipv6.as_deref(), o.ipv4.as_deref(), o.v4_port) =>
         {
             (p.frame_url.clone(), p.frame_url_v4.clone())
         }

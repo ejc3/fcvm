@@ -6,15 +6,23 @@ The production boundaries are injected so scheduling, accounting, provenance,
 and fail-closed verdicts can be exercised with exact synthetic records.
 """
 
+import contextlib
+import dataclasses
+import errno
 import hashlib
 import io
 import json
 import os
+import re
 import select
+import shlex
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stderr
 from types import SimpleNamespace
@@ -1248,7 +1256,9 @@ class AnalyzerRejectsCorruptEvidence(unittest.TestCase):
     def test_green_summary_cannot_hide_a_failed_raw_request(self):
         schedule, summaries, records = self.fixture()
         records[0]["ok"] = False
-        with self.assertRaisesRegex(reqscale_analyze.AnalysisInvalid, "failed"):
+        # A failed request is data now (#1159), so the refusal is the summary
+        # disagreeing with the records it summarizes.
+        with self.assertRaisesRegex(reqscale_analyze.AnalysisInvalid, "differ from raw requests"):
             reqscale_analyze._validate_requests(
                 schedule, summaries, records, self.GENERATION, self.CONFIG_SHA
             )
@@ -1532,7 +1542,9 @@ class CompleteAnalyzerFixture(unittest.TestCase):
             }],
         }
         for row in requests:
-            faults = row["firecracker_process_faults_ready_to_artifact"]
+            faults = row.get("firecracker_process_faults_ready_to_artifact")
+            if faults is None:
+                continue
             observed[row["backend"]].append({
                 "pid": faults["pid"],
                 "pid_start_time_ticks": faults["pid_start_time_ticks"],
@@ -1602,101 +1614,8 @@ class CompleteAnalyzerFixture(unittest.TestCase):
         }
 
     @classmethod
-    def build_run(cls, directory, url="http://127.0.0.1/fixture",
-                  resolve_all_to=None):
-        criteria = reqscale.CapacityCriteria(
-            max_offered_rps_error_pct=1.0,
-            min_departure_ratio=0.95,
-            max_score_end_backlog=2,
-            max_p95_launch_lag_ms=20.0,
-            max_control_median_drift_pct=10.0,
-        )
-        schedule = reqscale.build_schedule(
-            reqscale.ScheduleConfig(
-                rates=(0.8,), scored_bursts=5, seed=776, criteria=criteria,
-                urls=(url,),
-            ),
-            RUN_ID,
-        )
-        summaries = []
-        requests = []
-        next_start = 100_000_000_000
-        next_pid = 1_000
-        for burst_number, raw_spec in enumerate(schedule["bursts"]):
-            spec = reqscale.BurstSpec.from_dict(raw_spec)
-            clock = FakeClock()
-            clock.now_ns = next_start
-            burst_rows, summary = reqscale.run_open_loop_burst(
-                RUN_ID, spec, lambda context: {"backend": context.backend,
-                                       "url": url},
-                clock, DeferredLauncher(),
-            )
-            for row in burst_rows:
-                row.update(
-                    schema=reqscale.RECORD_SCHEMA,
-                    kind="request",
-                    run_id=RUN_ID,
-                    block_id=spec.block_id,
-                    cell_id=f"{row['backend']}:r0.8",
-                    traced=False,
-                    trace_pair_id=None,
-                    snapshot_generation_id=cls.GENERATION,
-                    snapshot_config_sha256=cls.CONFIG_SHA,
-                    firecracker_process_faults_ready_to_artifact={
-                        "pid": next_pid,
-                        "pid_start_time_ticks": 10_000 + next_pid,
-                        "minor_faults": 2,
-                        "major_faults": 0,
-                        "before": {"minor_faults": 10, "major_faults": 1},
-                        "after": {"minor_faults": 12, "major_faults": 1},
-                        "scope": (
-                            "Firecracker process endpoint-ready through artifact return; "
-                            "all process VMAs, not guest-RAM-filtered and not UFFD events"
-                        ),
-                    },
-                )
-                next_pid += 1
-            drain_ns = max(row["finished_ns"] for row in burst_rows)
-            proc_before = cls._proc_capture(
-                10 + burst_number * 2, summary["burst_start_ns"] - 1_000_000
-            )
-            proc_after = cls._proc_capture(
-                11 + burst_number * 2, drain_ns + 1_000_000
-            )
-            cpu_before = {
-                name: {"usage_usec": burst_number * 1_000 + offset}
-                for offset, name in enumerate(
-                    ("run", "driver", "control", "file", "uffd")
-                )
-            }
-            cpu_after = {
-                name: {"usage_usec": value["usage_usec"] + 100}
-                for name, value in cpu_before.items()
-            }
-            summary.update(
-                machine_proc_stat_before=proc_before,
-                machine_proc_stat_after=proc_after,
-                machine_proc_stat_delta=reqscale.counter_delta(
-                    proc_before["cpu"], proc_after["cpu"]
-                ),
-                cgroup_cpu_stat_before=cpu_before,
-                cgroup_cpu_stat_after=cpu_after,
-                cgroup_cpu_stat_delta={
-                    name: reqscale.counter_delta(cpu_before[name], cpu_after[name])
-                    for name in cpu_before
-                },
-                interburst_cgroup_membership={
-                    "run": [], "driver": [cls.HARNESS_PID],
-                    "control": [cls.CONTROL_PID], "file": [],
-                    "uffd": [cls.SERVE_PID],
-                },
-            )
-            requests.extend(burst_rows)
-            summaries.append(summary)
-            next_start = drain_ns + 1_000_000_000
-
-        snapshot = cls._snapshot()
-        provenance = {
+    def _provenance(cls, schedule, snapshot, url, resolve_all_to):
+        return {
             "schema": "fcvm.chromium.reqscale.provenance.v2",
             "run_id": RUN_ID,
             "created_at": "2026-08-09T00:00:00+00:00",
@@ -1747,11 +1666,11 @@ class CompleteAnalyzerFixture(unittest.TestCase):
                 ),
             },
         }
-        run_path = f"/bench/fcvm-reqscale-{RUN_ID}"
-        final_cgroups = cls._final_cgroups(run_path, requests)
-        measurement_start = summaries[0]["burst_start_ns"]
-        measurement_end = max(row["finished_ns"] for row in requests)
 
+    @classmethod
+    def _time_bound(cls, schedule, summaries, measurement_start, measurement_end, run_path):
+        """The host-control and host-sample records a real run writes on wall
+        time, and their status entries, covering the measured window."""
         control_origin = measurement_start - 10_000_000_000
         control_stop = measurement_end + 1
         first_deadline = control_origin + schedule["control"]["phase_offset_ns"]
@@ -1793,6 +1712,147 @@ class CompleteAnalyzerFixture(unittest.TestCase):
             {"name": "teardown", "burst_id": None}, run_path,
         )
         samples.append(terminal)
+        control_status = {
+            "started": True, "origin_monotonic_ns": control_origin,
+            "phase_offset_ns": schedule["control"]["phase_offset_ns"],
+            "interval_ns": schedule["control"]["interval_ns"],
+            "requests": len(controls),
+            "stop_requested_monotonic_ns": control_stop,
+        }
+        sampler_status = {
+            "started": True, "origin_monotonic_ns": sample_origin,
+            "interval_ns": schedule["host_sample_interval_ns"],
+            "samples": len(samples), "periodic_samples": len(samples) - 1,
+            "terminal_sample": True,
+            "stop_requested_monotonic_ns": sample_stop,
+        }
+        return controls, control_status, samples, sampler_status
+
+    class FailingLauncher(DeferredLauncher):
+        """DeferredLauncher whose `fail(context)` requests fail: "render" after
+        the clone was ready (fault counters kept), "spawn" before it (none)."""
+
+        def __init__(self, fail):
+            super().__init__()
+            self.fail = fail
+
+        def drain(self, handles):
+            records = super().drain(handles)
+            for record, (context, _request_fn) in zip(records, handles):
+                how = self.fail(context)
+                if how:
+                    record.update(ok=False, blocking_ms=50.0,
+                                  error=f"fixture {how} failure", failed_how=how)
+                    del record["artifact_ns"]
+            return records
+
+    @classmethod
+    def build_run(cls, directory, url="http://127.0.0.1/fixture",
+                  resolve_all_to=None, rates=(0.8,), fail=lambda _context: None):
+        criteria = reqscale.CapacityCriteria(
+            max_offered_rps_error_pct=1.0,
+            min_departure_ratio=0.95,
+            max_score_end_backlog=2,
+            max_p95_launch_lag_ms=20.0,
+            max_control_median_drift_pct=10.0,
+        )
+        schedule = reqscale.build_schedule(
+            reqscale.ScheduleConfig(
+                rates=rates, scored_bursts=5, seed=776, criteria=criteria,
+                urls=(url,),
+            ),
+            RUN_ID,
+        )
+        summaries = []
+        requests = []
+        next_start = 100_000_000_000
+        next_pid = 1_000
+        for burst_number, raw_spec in enumerate(schedule["bursts"]):
+            spec = reqscale.BurstSpec.from_dict(raw_spec)
+            clock = FakeClock()
+            clock.now_ns = next_start
+            burst_rows, summary = reqscale.run_open_loop_burst(
+                RUN_ID, spec, lambda context: {"backend": context.backend,
+                                       "url": url},
+                clock, cls.FailingLauncher(fail),
+            )
+            for row in burst_rows:
+                row.update(
+                    schema=reqscale.RECORD_SCHEMA,
+                    kind="request",
+                    run_id=RUN_ID,
+                    block_id=spec.block_id,
+                    cell_id=f"{row['backend']}:r{format(spec.target_rps, '.12g')}",
+                    traced=False,
+                    trace_pair_id=None,
+                    snapshot_generation_id=cls.GENERATION,
+                    snapshot_config_sha256=cls.CONFIG_SHA,
+                    firecracker_process_faults_ready_to_artifact={
+                        "pid": next_pid,
+                        "pid_start_time_ticks": 10_000 + next_pid,
+                        "minor_faults": 2,
+                        "major_faults": 0,
+                        "before": {"minor_faults": 10, "major_faults": 1},
+                        "after": {"minor_faults": 12, "major_faults": 1},
+                        "scope": (
+                            "Firecracker process endpoint-ready through artifact return; "
+                            "all process VMAs, not guest-RAM-filtered and not UFFD events"
+                        ),
+                    },
+                )
+                if row.pop("failed_how", None) == "spawn":
+                    del row["firecracker_process_faults_ready_to_artifact"]
+                next_pid += 1
+            drain_ns = max(row["finished_ns"] for row in burst_rows)
+            proc_before = cls._proc_capture(
+                10 + burst_number * 2, summary["burst_start_ns"] - 1_000_000
+            )
+            proc_after = cls._proc_capture(
+                11 + burst_number * 2, drain_ns + 1_000_000
+            )
+            cpu_before = {
+                name: {"usage_usec": burst_number * 1_000 + offset}
+                for offset, name in enumerate(
+                    ("run", "driver", "control", "file", "uffd")
+                )
+            }
+            cpu_after = {
+                name: {"usage_usec": value["usage_usec"] + 100}
+                for name, value in cpu_before.items()
+            }
+            summary.update(
+                machine_proc_stat_before=proc_before,
+                machine_proc_stat_after=proc_after,
+                machine_proc_stat_delta=reqscale.counter_delta(
+                    proc_before["cpu"], proc_after["cpu"]
+                ),
+                cgroup_cpu_stat_before=cpu_before,
+                cgroup_cpu_stat_after=cpu_after,
+                cgroup_cpu_stat_delta={
+                    name: reqscale.counter_delta(cpu_before[name], cpu_after[name])
+                    for name in cpu_before
+                },
+                interburst_cgroup_membership={
+                    "run": [], "driver": [cls.HARNESS_PID],
+                    "control": [cls.CONTROL_PID], "file": [],
+                    "uffd": [cls.SERVE_PID],
+                },
+            )
+            requests.extend(burst_rows)
+            summaries.append(summary)
+            next_start = drain_ns + 1_000_000_000
+
+        snapshot = cls._snapshot()
+        provenance = cls._provenance(schedule, snapshot, url, resolve_all_to)
+        run_path = f"/bench/fcvm-reqscale-{RUN_ID}"
+        final_cgroups = cls._final_cgroups(run_path, requests)
+        measurement_start = summaries[0]["burst_start_ns"]
+        measurement_end = max(row["finished_ns"] for row in requests)
+
+        controls, control_status, samples, sampler_status = cls._time_bound(
+            schedule, summaries, measurement_start, measurement_end, run_path)
+        control_origin = control_status["origin_monotonic_ns"]
+        terminal = samples[-1]
         final_cgroups = {
             name: {
                 **row,
@@ -1847,25 +1907,19 @@ class CompleteAnalyzerFixture(unittest.TestCase):
                 for name in final_cgroups
             },
         }
+        failed_rates = {}
+        for summary in summaries:
+            failure = reqscale.burst_request_failures(summary)
+            if failure is not None:
+                failed_rates.setdefault(summary["target_rps"], []).append(failure)
         status = {
-            "schema": "fcvm.chromium.reqscale.status.v2",
+            "schema": reqscale.STATUS_SCHEMA,
             "run_id": RUN_ID, "valid": True,
             "bursts_completed": len(summaries),
             "bursts_planned": len(schedule["bursts"]),
-            "control": {
-                "started": True, "origin_monotonic_ns": control_origin,
-                "phase_offset_ns": schedule["control"]["phase_offset_ns"],
-                "interval_ns": schedule["control"]["interval_ns"],
-                "requests": len(controls),
-                "stop_requested_monotonic_ns": control_stop,
-            },
-            "sampler": {
-                "started": True, "origin_monotonic_ns": sample_origin,
-                "interval_ns": schedule["host_sample_interval_ns"],
-                "samples": len(samples), "periodic_samples": len(samples) - 1,
-                "terminal_sample": True,
-                "stop_requested_monotonic_ns": sample_stop,
-            },
+            "failed_rates": reqscale.failed_rate_records(failed_rates),
+            "control": control_status,
+            "sampler": sampler_status,
             "snapshot_identity_after": snapshot,
             "final_cgroups": final_cgroups,
             "run_before": run_before, "run_after": run_after,
@@ -1910,6 +1964,542 @@ class CompleteAnalyzerFixture(unittest.TestCase):
             report = reqscale_analyze.markdown_report(analysis)
             self.assertIn("Firecracker VMAs", report)
             self.assertIn("0.8", report)
+
+
+class AnalyzerReportsAFailedRate(unittest.TestCase):
+    """#1159: the analyzer reports a rate with a failed request as failed,
+    publishes no figure for it, and keeps every other rate."""
+
+    @staticmethod
+    def fail_at_1_6(context):
+        """One scored request of every 1.6 req/s burst fails: a render failure
+        after the clone was ready (as on 2026-10-22) in odd bursts, a failure
+        before it in even ones."""
+        if context.target_rps != 1.6 or context.request_index != 100:
+            return None
+        return "render" if int(context.burst_id[1:5]) % 2 else "spawn"
+
+    def _run(self, directory):
+        CompleteAnalyzerFixture.build_run(directory, rates=(0.8, 1.6), fail=self.fail_at_1_6)
+        with open(os.path.join(directory, "status.json")) as stream:
+            return json.load(stream)
+
+    @staticmethod
+    def _rewrite_status(directory, **edits):
+        path = os.path.join(directory, "status.json")
+        with open(path) as stream:
+            status = json.load(stream)
+        status.update(edits)
+        CompleteAnalyzerFixture._write_json(path, status)
+
+    def test_a_failed_rate_is_reported_failed_and_the_other_rate_kept(self):
+        """RED BEFORE THE FIX: analyze() raised "request (...) failed" for the
+        first failed request, so the 0.8 req/s cells were never reported."""
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(
+            reqscale_analyze, "BOOTSTRAP_DRAWS", 1000
+        ):
+            status = self._run(d)
+            failed = status["failed_rates"]
+            self.assertEqual([entry["target_rps"] for entry in failed], [1.6])
+            self.assertGreaterEqual(len(failed[0]["bursts"]), 2, failed)
+            analysis = reqscale_analyze.analyze(d)
+            self.assertTrue(analysis["publishable"], analysis["publication_blocked_by"])
+            self.assertEqual(analysis["failed_rates"], [1.6])
+            cells = {(cell["backend"], cell["target_rps"]): cell for cell in analysis["cells"]}
+            for backend in ("file", "uffd"):
+                kept, lost = cells[(backend, 0.8)], cells[(backend, 1.6)]
+                self.assertTrue(kept["passed"])
+                self.assertFalse(kept["rate_failed"])
+                self.assertIsNotNone(kept["artifact_latency_p95_ms"])
+                self.assertFalse(lost["passed"])
+                self.assertTrue(lost["rate_failed"])
+                for name in reqscale_analyze.CELL_MEASUREMENTS:
+                    self.assertIsNone(lost[name], name)
+            self.assertEqual(
+                sum(cells[(backend, 1.6)]["rate_failure"]["scored_failed"]
+                    for backend in ("file", "uffd")),
+                sum(entry["failed"] for entry in failed[0]["bursts"]
+                    if entry["population"] == "scored"))
+            self.assertEqual(
+                analysis["capacity"]["joint_highest_contiguous_passing_rate_per_second"], 0.8)
+            report = reqscale_analyze.markdown_report(analysis)
+            self.assertIn("no, rate failed", report)
+            self.assertIn("Failed rates per backend: 1.6.", report)
+
+    def test_a_rate_whose_every_request_failed_is_reported_failed(self):
+        """Codex review of #1293: with no artifact at 1.6 req/s, the ramp's
+        requests count in the score-end backlog, which then exceeds the scored
+        plan, and the per-burst capacity check refused the whole run ("score-end
+        backlog is not a valid request count") before the failed rate was set
+        aside."""
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(
+            reqscale_analyze, "BOOTSTRAP_DRAWS", 1000
+        ):
+            CompleteAnalyzerFixture.build_run(
+                d, rates=(0.8, 1.6),
+                fail=lambda context: "spawn" if context.target_rps == 1.6 else None)
+            analysis = reqscale_analyze.analyze(d)
+            self.assertEqual(analysis["failed_rates"], [1.6])
+            cells = {(cell["backend"], cell["target_rps"]): cell for cell in analysis["cells"]}
+            for backend in ("file", "uffd"):
+                self.assertTrue(cells[(backend, 0.8)]["passed"])
+                self.assertTrue(cells[(backend, 1.6)]["rate_failed"])
+                self.assertEqual(cells[(backend, 1.6)]["rate_failure"]["scored_failed"], 5 * 96)
+
+    def test_the_status_must_name_exactly_the_failed_rates_the_records_show(self):
+        for label, edit in (
+            ("omits the failed rate", lambda rates: []),
+            ("adds a clean rate", lambda rates: rates + [{"target_rps": 0.8, "bursts": []}]),
+        ):
+            with self.subTest(label), tempfile.TemporaryDirectory() as d:
+                status = self._run(d)
+                self._rewrite_status(d, failed_rates=edit(status["failed_rates"]))
+                with self.assertRaisesRegex(reqscale_analyze.AnalysisInvalid,
+                                            "status failed_rates differ"):
+                    reqscale_analyze.analyze(d)
+
+
+class FakeCgroupKernel:
+    """cgroup v2 membership over a plain directory tree, for an unprivileged test.
+
+    A pid written to a `cgroup.procs` file (by guardexec, guardsupervise or
+    RunCgroups) has migrated there; the latest write by mtime wins. A process
+    is in the cgroup of its nearest migrated ancestor when it descends from it
+    by forks made after that migration, as a forked child is, and anything
+    else keeps its real cgroup. A zombie still names its cgroup
+    but is no member of it, and a reaped process has no cgroup to read. Every
+    query re-reads the files first, so a pid the next guardexec overwrites in
+    the same file stays where it was.
+    """
+
+    def __init__(self, root):
+        self.root = os.path.realpath(root)
+        self.where = {}
+        self.ticks = 0
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _stat(pid):
+        try:
+            with open(f"/proc/{pid}/stat") as stream:
+                fields = stream.read().rpartition(")")[2].split()
+        except OSError:
+            return None
+        return fields[0], int(fields[1]), int(fields[19])
+
+    def _sync(self):
+        for directory, _dirs, files in os.walk(self.root):
+            if "cgroup.procs" not in files:
+                continue
+            path = os.path.join(directory, "cgroup.procs")
+            mtime = os.stat(path).st_mtime_ns
+            # The write's time in /proc/PID/stat's start-time unit (clock
+            # ticks since boot), to tell children forked before it from after.
+            migrated = (time.clock_gettime_ns(time.CLOCK_BOOTTIME) - (time.time_ns() - mtime)) \
+                * os.sysconf("SC_CLK_TCK") // 1_000_000_000
+            relative = "/" + os.path.relpath(directory, self.root)
+            with open(path) as stream:
+                pids = [int(value) for value in stream.read().split()]
+            for pid in pids:
+                stat = self._stat(pid)
+                if stat is None:
+                    continue
+                key = (pid, stat[2])
+                if key not in self.where or self.where[key][0] <= mtime:
+                    self.where[key] = (mtime, relative, migrated)
+
+    def _member(self, pid):
+        """The fake cgroup of pid, None outside the tree, or "gone"."""
+        if self._stat(pid) is None:
+            return "gone"
+        current, child_start = pid, None
+        while current > 1:
+            here = self._stat(current)
+            if here is None:
+                return None
+            found = self.where.get((current, here[2]))
+            if found is not None:
+                inherited = child_start is None or child_start >= found[2]
+                return found[1] if inherited else None
+            current, child_start = here[1], here[2]
+        return None
+
+    def cgroup_of(self, pid):
+        with self.lock:
+            self._sync()
+            member = self._member(pid)
+        if member == "gone":
+            raise reqscale.ProcessGone(f"pid {pid} exited")
+        if member is not None:
+            return member
+        with open(f"/proc/{pid}/cgroup") as stream:
+            return reqscale._unified_cgroup_from_raw(stream.read(), f"pid {pid}")
+
+    def live(self, relative):
+        with self.lock:
+            self._sync()
+            seeds = {pid for pid, _start in self.where}
+            pids = set()
+            while seeds:
+                pid = seeds.pop()
+                if pid in pids or self._stat(pid) is None:
+                    continue
+                pids.add(pid)
+                for tasks in (f"/proc/{pid}/task",):
+                    try:
+                        tids = os.listdir(tasks)
+                    except OSError:
+                        continue
+                    for tid in tids:
+                        try:
+                            with open(f"{tasks}/{tid}/children") as stream:
+                                seeds.update(int(value) for value in stream.read().split())
+                        except OSError:
+                            continue
+            return sorted(
+                pid for pid in pids
+                if (self._stat(pid) or ("X",))[0] not in ("Z", "X")
+                and self._member(pid) == relative
+            )
+
+    def cpu(self):
+        with self.lock:
+            self.ticks += 1_000_000
+            return {"usage_usec": self.ticks}
+
+    def rmdir(self, path, *, dir_fd=None, real=os.rmdir):
+        """rmdir of a cgroup: refused while it has members, and its interface
+        files go with it."""
+        if dir_fd is not None:
+            return real(path, dir_fd=dir_fd)
+        path = os.path.realpath(path)
+        if os.path.commonpath((self.root, path)) == self.root:
+            if self.live("/" + os.path.relpath(path, self.root)):
+                raise OSError(errno.EBUSY, os.strerror(errno.EBUSY), path)
+            for name in ("cgroup.procs", "cgroup.kill"):
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(os.path.join(path, name))
+        real(path)
+
+    def patches(self):
+        kernel = self
+        return (
+            mock.patch.object(reqscale.os, "rmdir", kernel.rmdir),
+            mock.patch.object(reqscale.ProcIdentity, "cgroup",
+                              lambda identity: kernel.cgroup_of(identity.pid)),
+            mock.patch.object(reqscale.CgroupAudit, "live_pids",
+                              lambda audit: kernel.live(audit.relative)),
+            mock.patch.object(reqscale.CgroupAudit, "cpu_snapshot",
+                              lambda _audit: kernel.cpu()),
+        )
+
+
+class HarnessOutputFeedsTheAnalyzer(unittest.TestCase):
+    """#1173: what reqscale.py's own code writes is what reqscale_analyze.py reads.
+
+    Four defects reached a real run because each side was tested against its
+    own fixtures: the request function ignored the cgroup guard and the fault
+    probe, the probe raced fcvm's helpers, and the analyzer could not read the
+    port mappings or the audit roles the harness writes. Here the harness's
+    own code produces every record those defects lived in, on a fake fcvm and
+    a fake Chromium, and the analyzer reads the directory:
+
+    - each request is the real request function (_make_request_fn, then
+      reqbench.run_cdp_request) spawning a fake fcvm through the real cgroup
+      guard, with the real Firecracker fault probe on its process tree (a
+      Firecracker-named child and a short-lived helper) and the real teardown;
+    - the memory server and the host control are the real UffdServe and
+      NativeChromiumControl, and the cgroup audits are the real RunCgroups and
+      CgroupAudit over FakeCgroupKernel;
+    - the snapshot identity is the real lease over an fcvm-shaped snapshot;
+    - bursts, their accounting and inter-burst membership are the real
+      run_open_loop_burst, _augment_burst_accounting and _interburst_membership.
+
+    What stays synthetic is what a real run produces on wall time: execute()'s
+    loop itself, the 15 s ramp and 60 s window (requests run one after another
+    and their milestones are set on the schedule's clock), the HostSampler and
+    ControlScheduler records, /proc/stat, and the provenance's host facts.
+    Driving those needs 75 s per burst and a delegated cgroup v2 tree.
+    """
+
+    RATE = 1 / 15  # one ramp request and 4 scored ones per path and burst
+    # Every spawn at this rate raises EAGAIN, as fork does at an overloaded
+    # rate: the failed rate must not cost the analysis of the healthy one.
+    FAILING_RATE = 2 / 15
+
+    def _stub(self, path, body):
+        with open(path, "w") as stream:
+            stream.write(body)
+        os.chmod(path, 0o755)
+        return path
+
+    def _fakes(self, d, state_dir):
+        os.makedirs(os.path.join(d, "bin"))
+        # A script, not a renamed `sleep`: a multicall coreutils (uutils on
+        # Ubuntu 26.04) dispatches on argv[0] and exits at once under another
+        # name. The kernel names a script's process after the script file.
+        firecracker = self._stub(os.path.join(d, "bin", "firecracker-0123456789abcdef"), (
+            f"#!{sys.executable}\n"
+            "import ctypes, signal, sys, time\n"
+            "ctypes.CDLL(None).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG, as fcvm arms it\n"
+            "open(sys.argv[1], 'w').close()\n"
+            "time.sleep(600)\n"
+        ))
+        serve = (
+            "import json,os,signal,sys,time\n"
+            "state = sys.argv[1]\n"
+            "def stop(*_):\n"
+            "    os.unlink(state)\n"
+            "    sys.exit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            "start = int(open('/proc/self/stat').read().rpartition(')')[2].split()[19])\n"
+            "with open(state + '.tmp', 'w') as f:\n"
+            "    json.dump({'vm_id': 'serve', 'pid': os.getpid(), 'pid_start_time': start,\n"
+            "               'config': {'process_type': 'serve', 'snapshot_name': sys.argv[2],\n"
+            "                          'uffd_mode': sys.argv[3]}}, f)\n"
+            "os.rename(state + '.tmp', state)\n"
+            "while True:\n"
+            "    time.sleep(60)\n"
+        )
+        fcvm = self._stub(os.path.join(d, "bin", "fcvm"), f"""#!/bin/bash
+# A fake fcvm: `snapshot serve` publishes a serve state and waits; `snapshot run`
+# starts a Firecracker-named child that dies with it and a helper that exits at
+# once, then publishes a ready clone state with a loopback endpoint.
+set -eu
+if [ "${{1:-}}" = --version ]; then echo "fcvm fake"; exit 0; fi
+if [ "$2" = serve ]; then
+    exec python3 -c {shlex.quote(serve)} {state_dir}/serve-$$.json "$3" "$5"
+fi
+name=""
+while [ $# -gt 0 ]; do [ "$1" = --name ] && name=$2; shift; done
+{firecracker} {d}/firecracker-$$.armed &
+until [ -e {d}/firecracker-$$.armed ]; do sleep 0.002; done
+true &
+read -r stat < /proc/$$/stat; stat=${{stat##*) }}; read -ra fields <<< "$stat"
+vm=vm-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \\n')
+printf '{{"vm_id":"%s","name":"%s","pid":%d,"pid_start_time":%d,"lifecycle_ready":true,"config":{{"network":{{"loopback_ip":"127.0.0.1"}}}}}}\\n' \\
+    "$vm" "$name" $$ "${{fields[19]}}" > {state_dir}/$vm.json.tmp
+: > {state_dir}/$vm.json.lock
+mv {state_dir}/$vm.json.tmp {state_dir}/$vm.json
+wait
+""")
+        chromium = self._stub(os.path.join(d, "bin", "chromium"), """#!/bin/bash
+# A fake Chromium: publishes DevToolsActivePort in its profile and waits.
+if [ "${1:-}" = --version ]; then echo "Chromium fake"; exit 0; fi
+for arg in "$@"; do
+    case "$arg" in --user-data-dir=*) profile=${arg#--user-data-dir=} ;; esac
+done
+printf '9\\n/devtools/browser/fake\\n' > "$profile/DevToolsActivePort.tmp"
+mv "$profile/DevToolsActivePort.tmp" "$profile/DevToolsActivePort"
+exec sleep 600
+""")
+        return fcvm, chromium
+
+    class SerialLauncher:
+        """reqscale.ThreadLauncher one request at a time, each record's
+        milestones set on the schedule's clock: a real request takes about
+        0.1 s of wall time, which the virtual 75 s burst cannot carry."""
+
+        def __init__(self):
+            self.pending = []
+
+        def launch(self, context, request_fn):
+            self.pending.append((context, request_fn))
+            return context
+
+        @staticmethod
+        def on_schedule(record, context):
+            launch = context.scheduled_ns
+            record.update(actual_launch_ns=launch, finished_ns=launch + 500_000_000,
+                          blocking_ms=300.0 if record.get("ok") else 50.0, wall_ms=500.0)
+            if "artifact_ns" in record:
+                record["artifact_ns"] = launch + 300_000_000
+            return record
+
+        def drain(self, _handles):
+            threads = reqscale.ThreadLauncher()
+            return [
+                self.on_schedule(threads.drain([threads.launch(context, request_fn)])[0], context)
+                for context, request_fn in self.pending
+            ]
+
+    def test_a_run_of_the_harness_on_a_fake_fcvm_is_analyzable(self):
+        import cdpdrive
+
+        with tempfile.TemporaryDirectory() as d, contextlib.ExitStack() as stack:
+            data_root = os.path.join(d, "data")
+            state_dir = os.path.join(data_root, "state")
+            os.makedirs(state_dir)
+            ProvenanceFailsClosed.make_snapshot(None, data_root)
+            fcvm, chromium = self._fakes(d, state_dir)
+            run_dir = os.path.join(d, "run")
+            log_dir = os.path.join(d, "logs")
+            os.makedirs(run_dir)
+            os.makedirs(log_dir)
+
+            kernel = FakeCgroupKernel(os.path.join(d, "cgroup"))
+            original = reqscale._read_unified_cgroup("/proc/self/cgroup")
+            os.makedirs(os.path.join(kernel.root, original.lstrip("/")))
+            for patch in kernel.patches():
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(reqscale, "MIN_SCORED_REQUESTS", 20))
+            stack.enter_context(mock.patch.object(
+                cdpdrive, "drive", return_value={"ok": True, "stages": {}}))
+            port = stack.enter_context(socket.socket())
+            port.bind(("127.0.0.1", 0))
+            port.listen(64)
+
+            url = "http://127.0.0.1/fixture"
+            criteria = reqscale.CapacityCriteria(
+                max_offered_rps_error_pct=1.0, min_departure_ratio=0.95,
+                max_score_end_backlog=2, max_p95_launch_lag_ms=20.0,
+                max_control_median_drift_pct=10.0)
+            schedule = reqscale.build_schedule(reqscale.ScheduleConfig(
+                rates=(self.RATE, self.FAILING_RATE), scored_bursts=5, seed=776,
+                criteria=criteria, urls=(url,)), RUN_ID)
+            overloaded = threading.Event()
+            spawn = reqscale.reqbench.spawn_clone_process
+
+            def spawn_or_refuse(*spawn_args, **spawn_kwargs):
+                if overloaded.is_set():
+                    raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+                return spawn(*spawn_args, **spawn_kwargs)
+
+            stack.enter_context(mock.patch.object(
+                reqscale.reqbench, "spawn_clone_process", spawn_or_refuse))
+            lease = stack.enter_context(reqscale.SnapshotGenerationLease(data_root, "golden"))
+            args = SimpleNamespace(
+                run_id=RUN_ID, snapshot_tag="golden", snapshot_identity=dict(lease.identity),
+                url=url, urls=[url], fcvm=fcvm, data_root=data_root, state_dir=state_dir,
+                timeout=20.0, teardown_timeout=10.0, rust_log="fcvm=debug",
+                uffd_mode="copy", uffd_prefetch="on", format="jpeg", quality=80,
+                cdp_port=port.getsockname()[1], ws_url="",
+                control_url=url, control_resolve_all_to="", control_chromium=chromium,
+                control_timeout=8.0, control_tmp_root=d,
+            )
+
+            scope = reqscale.RunCgroups(RUN_ID, kernel.root)
+            audits = scope.enter()
+            args.cgroup_paths = dict(scope.paths)
+            run_before_cgroups = {
+                "cgroup_cpu_stat": reqscale._cpu_snapshots(audits),
+                "cgroups": reqscale._cgroup_records(audits),
+            }
+            serve = reqscale.UffdServe(args, audits["uffd"], scope.paths["uffd"], log_dir)
+            control = reqscale.NativeChromiumControl(
+                args, audits["control"], scope.paths["control"], log_dir)
+            try:
+                serve_pid = serve.start()
+                warmup = control.start()
+                # Every milestone below is on the schedule's clock, set after
+                # the real warmup so the warmup precedes the control origin.
+                start = time.monotonic_ns() + 60_000_000_000
+                summaries, requests = [], []
+                global_base = 0
+                for number, raw in enumerate(schedule["bursts"]):
+                    spec = reqscale.BurstSpec.from_dict(raw)
+                    clock = FakeClock()
+                    clock.now_ns = start
+                    proc_before = CompleteAnalyzerFixture._proc_capture(10 + 2 * number, start - 1_000_000)
+                    cpu_before = reqscale._cpu_snapshots(audits)
+                    request_fn = reqscale._make_request_fn(
+                        args, spec, serve_pid, log_dir, audits, None, global_base)
+                    failing = spec.target_rps == self.FAILING_RATE
+                    (overloaded.set if failing else overloaded.clear)()
+                    records, summary = reqscale.run_open_loop_burst(
+                        RUN_ID, spec, request_fn, clock, self.SerialLauncher())
+                    for record in records:
+                        self.assertEqual(record["ok"], not failing, record.get("error"))
+                    drain = max(record["finished_ns"] for record in records)
+                    reqscale._augment_burst_accounting(
+                        summary, proc_before,
+                        CompleteAnalyzerFixture._proc_capture(11 + 2 * number, drain + 1_000_000),
+                        cpu_before, reqscale._cpu_snapshots(audits))
+                    summary["interburst_cgroup_membership"] = reqscale._interburst_membership(
+                        audits, serve_pid, control.proc.pid)
+                    summaries.append(summary)
+                    requests.extend(records)
+                    global_base += summary["total_planned"]
+                    start = drain + 1_000_000_000
+                failed = {}
+                for summary in summaries:
+                    failure = reqscale.burst_request_failures(summary)
+                    if failure is not None:
+                        failed.setdefault(summary["target_rps"], []).append(failure)
+            finally:
+                control.stop()
+                serve.stop()
+            run_after_cgroups = {
+                "cgroup_cpu_stat": reqscale._cpu_snapshots(audits),
+                "cgroups": reqscale._cgroup_records(audits),
+            }
+            final_cgroups = scope.leave()
+            snapshot_after = lease.verify()
+
+            measurement_start = summaries[0]["burst_start_ns"]
+            measurement_end = max(row["finished_ns"] for row in requests)
+            pids = type("LivePids", (CompleteAnalyzerFixture,), {
+                "HARNESS_PID": os.getpid(), "CONTROL_PID": control.proc.pid,
+                "SERVE_PID": serve_pid,
+            })
+            controls, control_status, samples, sampler_status = pids._time_bound(
+                schedule, summaries, measurement_start, measurement_end,
+                final_cgroups["run"]["path"])
+            # Sample counters sit between the real run-level snapshots.
+            base = max(row["usage_usec"] for row in run_before_cgroups["cgroup_cpu_stat"].values())
+            for index, sample in enumerate(samples):
+                for row in sample["cgroups"].values():
+                    row["cpu_stat"] = {"usage_usec": base + 1 + index}
+            provenance = CompleteAnalyzerFixture._provenance(
+                schedule, dict(lease.identity), url, None)
+            provenance["snapshot_generation_lease"]["path"] = os.path.abspath(lease.path)
+            status = {
+                "schema": reqscale.STATUS_SCHEMA, "run_id": RUN_ID, "valid": True,
+                "bursts_completed": len(summaries), "bursts_planned": len(schedule["bursts"]),
+                "failed_rates": reqscale.failed_rate_records(failed),
+                "control": control_status, "sampler": sampler_status,
+                "snapshot_identity_after": snapshot_after,
+                "run_before": {
+                    "machine_proc_stat": CompleteAnalyzerFixture._proc_capture(
+                        1, measurement_start - 2_000_000),
+                    **run_before_cgroups,
+                },
+                "run_after": {
+                    "machine_proc_stat": CompleteAnalyzerFixture._proc_capture(
+                        10_000, measurement_end + 2_000_000),
+                    **run_after_cgroups,
+                },
+                "final_cgroups": final_cgroups,
+                "error": None, "error_details": None, "errors": [],
+            }
+            write, write_lines = CompleteAnalyzerFixture._write_json, CompleteAnalyzerFixture._write_jsonl
+            write(os.path.join(run_dir, "schedule.json"), schedule)
+            write(os.path.join(run_dir, "provenance.json"), provenance)
+            write(os.path.join(run_dir, "status.json"), status)
+            write(os.path.join(run_dir, "host-control-warmup.json"), warmup)
+            write(os.path.join(run_dir, "uffd-serve.json"), serve.record)
+            write_lines(os.path.join(run_dir, "bursts.jsonl"), summaries)
+            write_lines(os.path.join(run_dir, "requests.jsonl"), requests)
+            write_lines(os.path.join(run_dir, "host-control.jsonl"), controls)
+            write_lines(os.path.join(run_dir, "host-samples.jsonl"), samples)
+
+            with mock.patch.object(reqscale_analyze, "BOOTSTRAP_DRAWS", 1000):
+                analysis = reqscale_analyze.analyze(run_dir)
+            self.assertTrue(analysis["publishable"], analysis["publication_blocked_by"])
+            self.assertEqual(analysis["failed_rates"], [self.FAILING_RATE])
+            cells = {(cell["backend"], cell["target_rps"]): cell for cell in analysis["cells"]}
+            for backend in ("file", "uffd"):
+                self.assertTrue(cells[(backend, self.RATE)]["passed"])
+                self.assertTrue(cells[(backend, self.FAILING_RATE)]["rate_failed"])
+            # The real probe found one Firecracker per request, in its path's cgroup.
+            roles = {name: {item["role"] for item in final_cgroups[name]["observed"]}
+                     for name in ("file", "uffd")}
+            self.assertIn("firecracker-012", roles["file"])
+            self.assertIn("uffd-serve", roles["uffd"])
+            served = [row["firecracker_process_faults_ready_to_artifact"]
+                      for row in requests if row["ok"]]
+            self.assertEqual(len({(faults["pid"], faults["pid_start_time_ticks"])
+                                  for faults in served}), len(served))
 
 
 class TracePerturbationIsAGate(unittest.TestCase):
@@ -2216,6 +2806,163 @@ class ProvenanceFailsClosed(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(d, "escape.lock")))
 
 
+class AFailedRateDoesNotVoidTheRun(unittest.TestCase):
+    """#1159: one teardown ENOENT in 2,015 requests refused an otherwise
+    complete run on 2026-10-22, and a rate above the ceiling voided every rate
+    measured with it. A failed request now fails its rate, not the run."""
+
+    class Audit:
+        def __init__(self):
+            self.ticks = 0
+
+        def cpu_snapshot(self):
+            self.ticks += 1
+            return {"usage_usec": self.ticks}
+
+        def record(self):
+            return {"path": "/fake", "live_pids": [], "observed": []}
+
+    def _execute(self, schedule, fail):
+        """Run execute() over `schedule` with every host boundary replaced;
+        a burst fails one request when fail(spec) says so."""
+        audit = self.Audit()
+
+        class Scope:
+            def __init__(self, *_args):
+                self.paths = {name: f"/sys/fs/cgroup/fake/{name}"
+                              for name in ("driver", "control", "file", "uffd")}
+
+            def enter(self):
+                return {name: audit for name in ("run", "driver", "control", "file", "uffd")}
+
+            def leave(self):
+                return {}
+
+        class Serve:
+            record = {"kind": "uffd-serve"}
+
+            def __init__(self, *_args):
+                pass
+
+            def start(self):
+                return 30
+
+            def stop(self):
+                pass
+
+        class Control:
+            proc = SimpleNamespace(pid=20)
+
+            def __init__(self, *_args):
+                pass
+
+            def start(self):
+                return {"kind": "host-control-warmup"}
+
+            def stop(self):
+                pass
+
+        class Background:
+            def __init__(self, *_args):
+                pass
+
+            def start(self):
+                pass
+
+            def check(self):
+                pass
+
+            def stop(self):
+                return {"started": True}
+
+        class Lease:
+            def verify(self):
+                return {"generation_id": "11111111-1111-4111-8111-111111111111"}
+
+        def burst(_run_id, spec, _request_fn, *_args):
+            failed = 1 if fail(spec) else 0
+            planned = len(spec.requests)
+            backend = {"artifact_completed": planned, "planned": planned}
+            return [], {
+                "burst_id": spec.burst_id, "population": spec.population,
+                "total_planned": planned, "failed": failed,
+                "total_artifact_completed": planned - failed,
+                "total_drained": planned, "total_cleanup_confirmed": planned,
+                "backends": {"file": backend, "uffd": backend}, "drain_span_ms": 1.0,
+            }
+
+        proc_stat = {"cpu": {"user": 1}, "raw": "cpu 1\n"}
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(reqscale, "RunCgroups", Scope), \
+                mock.patch.object(reqscale, "UffdServe", Serve), \
+                mock.patch.object(reqscale, "NativeChromiumControl", Control), \
+                mock.patch.object(reqscale, "ControlScheduler", Background), \
+                mock.patch.object(reqscale, "HostSampler", Background), \
+                mock.patch.object(reqscale, "read_machine_proc_stat", return_value=proc_stat), \
+                mock.patch.object(reqscale, "_interburst_membership", return_value={}), \
+                mock.patch.object(reqscale, "_make_request_fn", return_value=None), \
+                mock.patch.object(reqscale, "run_open_loop_burst", side_effect=burst):
+            args = SimpleNamespace(
+                out_dir=os.path.join(d, "run"), run_id=RUN_ID,
+                cgroup_root="/sys/fs/cgroup", trace_faults=False,
+                snapshot_generation_lease=Lease(),
+            )
+            with redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+                rc = reqscale.execute(args, schedule, {"schema": "test"})
+            with open(os.path.join(args.out_dir, "status.json")) as f:
+                status = json.load(f)
+            with open(os.path.join(args.out_dir, "bursts.jsonl")) as f:
+                summaries = [json.loads(line) for line in f]
+        return rc, status, summaries
+
+    @staticmethod
+    def _schedule():
+        return reqscale.build_schedule(reqscale.ScheduleConfig(
+            rates=(2.0, 4.0), scored_bursts=5, seed=776, urls=("http://x/",),
+            criteria=reqscale.CapacityCriteria(
+                max_offered_rps_error_pct=1.0, min_departure_ratio=0.95,
+                max_score_end_backlog=8, max_p95_launch_lag_ms=25.0,
+                max_control_median_drift_pct=10.0)), RUN_ID)
+
+    def test_a_failed_request_fails_its_rate_and_the_run_measures_the_rest(self):
+        """RED BEFORE THE FIX: execute() raised "burst ... has failed or
+        unconfirmed-clean requests" at the first failed request, returned 4,
+        and measured none of the bursts after it."""
+        schedule = self._schedule()
+        failing = [raw["burst_id"] for raw in schedule["bursts"]
+                   if raw["target_rps"] == 4.0][1:3]
+        rc, status, summaries = self._execute(
+            schedule, lambda spec: spec.burst_id in failing)
+        self.assertEqual(rc, 0, status["error"])
+        self.assertTrue(status["valid"])
+        self.assertEqual(status["schema"], reqscale.STATUS_SCHEMA)
+        self.assertEqual(status["bursts_completed"], len(schedule["bursts"]))
+        self.assertEqual(len(summaries), len(schedule["bursts"]))
+        self.assertEqual(status["failed_rates"], [{
+            "target_rps": 4.0,
+            "bursts": [{
+                "burst_id": burst_id,
+                "population": next(raw["population"] for raw in schedule["bursts"]
+                                   if raw["burst_id"] == burst_id),
+                "failed": 1, "artifact_missing": 1, "undrained": 0,
+                "cleanup_unconfirmed": 0,
+            } for burst_id in failing],
+        }])
+
+    def test_a_failed_trace_perturbation_request_still_refuses_the_run(self):
+        """The trace pairs compare one plan traced and untraced; a failure in
+        either leaves no pair to compare, so it stays a refusal."""
+        schedule = self._schedule()
+        schedule["bursts"][3]["population"] = "trace-perturbation"
+        trace_burst = schedule["bursts"][3]["burst_id"]
+        rc, status, summaries = self._execute(
+            schedule, lambda spec: spec.burst_id == trace_burst)
+        self.assertEqual(rc, 4)
+        self.assertFalse(status["valid"])
+        self.assertIn(f"trace burst {trace_burst} has failed", status["error"])
+        self.assertEqual(len(summaries), 4)
+
+
 class DurableOutput(unittest.TestCase):
     def test_schedule_is_exclusive_and_fsynced_before_records(self):
         with tempfile.TemporaryDirectory() as d:
@@ -2408,6 +3155,99 @@ class PlanOnlyCli(unittest.TestCase):
         self.assertIn("IPv4", result.stderr)
 
 
+class ScheduleCheckBeforeTheGolden(unittest.TestCase):
+    """#1159: the rate rules are checked in seconds, before anything is built.
+
+    `make bench-chromium-corpus MEASURE=scale` learned that SCALE_RATES broke
+    reqscale.py's schedule rules only from the measured run, after the golden
+    and the diag; two attempts (0.7 and 0.8 req/s) were refused that way.
+    """
+
+    REPO = os.path.dirname(os.path.dirname(HERE))
+
+    def _check(self, rates, out, urls=None, control_url="https://site0.example/"):
+        return subprocess.run(
+            [
+                sys.executable, PlanOnlyCli.SCRIPT, "--check-schedule",
+                "--snapshot-tag", "not-opened-by-the-check",
+                "--url", ",".join(urls or CORPUS), "--control-url", control_url,
+                "--rates", rates, "--bursts", "5", "--seed", "776",
+                "--out-dir", out, *PlanOnlyCli.criteria_args(),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+
+    def test_check_schedule_refuses_a_split_corpus_cycle_and_writes_nothing(self):
+        """RED BEFORE THE FIX: reqscale.py had no --check-schedule and exited 2
+        with "unrecognized arguments: --check-schedule"."""
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "run")
+            for rates, why in (
+                ("0.7", "0.7 * 15.0 = 10.5"),
+                ("0.8", "not a whole number of cycles of the 14-page corpus"),
+            ):
+                refused = self._check(rates, out)
+                self.assertEqual(refused.returncode, 2, refused.stderr)
+                self.assertIn(why, refused.stderr)
+            accepted = self._check("0.933333333333,1.4,1.866666666667", out)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn("schedule ok: 18 bursts", accepted.stdout)
+            self.assertEqual(os.listdir(d), [], "a schedule check wrote a run directory")
+
+    def test_the_make_check_runs_the_harness_rules_on_the_scale_arguments(self):
+        """RED BEFORE THE FIX: there was no check-chromium-scale target."""
+        variables = [
+            "SCALE_BURSTS=5", "SCALE_SEED=776", "SCALE_TAG=not-opened",
+            "SCALE_CONTROL_CHROMIUM=chromium", "SCALE_MAX_OFFERED_ERROR_PCT=1",
+            "SCALE_MIN_DEPARTURE_RATIO=0.95", "SCALE_MAX_BACKLOG=8",
+            "SCALE_MAX_LAUNCH_LAG_MS=25", "SCALE_MAX_CONTROL_DRIFT_PCT=10",
+            f"SCALE_URL={','.join(CORPUS)}", "SCALE_CONTROL_URL=https://site0.example/",
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            for rates, expected in (("0.8", 2), ("1.4", 0)):
+                result = subprocess.run(
+                    ["make", "-s", "-C", self.REPO, "check-chromium-scale",
+                     f"SCALE_RATES={rates}", f"SCALE_OUT={d}/run", *variables],
+                    capture_output=True, text=True, timeout=60,
+                )
+                self.assertEqual(result.returncode != 0, expected != 0,
+                                 (rates, result.stdout, result.stderr))
+            self.assertIn("not a whole number of cycles", subprocess.run(
+                ["make", "-s", "-C", self.REPO, "check-chromium-scale",
+                 "SCALE_RATES=0.8", f"SCALE_OUT={d}/run", *variables],
+                capture_output=True, text=True, timeout=60).stderr)
+            self.assertEqual(os.listdir(d), [])
+
+    def test_the_makefile_rate_examples_pass_the_harness_rules(self):
+        """The Makefile's only SCALE_RATES example, 2,4,8, is refused for the
+        14-page corpus. RED BEFORE THE FIX: no example in the message passed
+        the corpus rule."""
+        with open(os.path.join(self.REPO, "Makefile")) as handle:
+            message = re.search(r'echo "ERROR: SCALE_RATES required([^"]*)"', handle.read())
+        self.assertIsNotNone(message, "the Makefile no longer explains SCALE_RATES")
+        examples = re.findall(r"\d[\d.]*(?:,\d[\d.]*)*", message.group(1))
+        examples = [example for example in examples if "," in example or "." in example]
+        self.assertTrue(examples, message.group(1))
+
+        def refusal(rates, urls):
+            config = dataclasses.replace(
+                CorpusPairing._config(None, 1.0),
+                rates=tuple(float(rate) for rate in rates.split(",")), urls=urls)
+            try:
+                reqscale.build_schedule(config, RUN_ID)
+            except ValueError as error:
+                return str(error)
+            return None
+
+        corpus = {example: refusal(example, CORPUS) for example in examples}
+        self.assertTrue(any(error is None for error in corpus.values()),
+                        f"no SCALE_RATES example passes the 14-page corpus: {corpus}")
+        for example, error in corpus.items():
+            if error is not None:
+                self.assertIsNone(refusal(example, ("http://127.0.0.1/page",)),
+                                  f"{example} passes neither one page nor the corpus")
+
+
 
 class ConcurrentRequestRecords(unittest.TestCase):
     @staticmethod
@@ -2464,11 +3304,13 @@ class ConcurrentRequestRecords(unittest.TestCase):
                 args, spec, 1234, state_dir,
                 {"uffd": mock.Mock(), "file": mock.Mock()}, None, 0)
             # The clone launch is stopped right after the point where the
-            # request would have sampled the server before it.
+            # request would have sampled the server before it; the request
+            # function records that as a failed request.
             with mock.patch.object(reqscale.reqbench, "serve_cpu_sample", side_effect=sample), \
                     mock.patch.object(reqscale.reqbench, "state_path_baseline", side_effect=Stop):
-                with self.assertRaises(Stop):
-                    request(context)
+                record = request(context)
+        self.assertFalse(record["ok"])
+        self.assertIn("Stop", record["error"])
         self.assertEqual(reads, [], "a concurrent UFFD request read the memory server")
 
     def test_a_corpus_request_renders_its_pairs_url_and_says_so(self):

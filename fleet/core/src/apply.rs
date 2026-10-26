@@ -196,7 +196,33 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             None
         }
         Event::Published { slot, names, .. } => {
+            let c = &state.config;
+            if slot == crate::state::EC2_AGGREGATE_ID {
+                if names.names(
+                    c.ec2_aggregate_ipv6.as_deref(),
+                    c.ec2_aggregate_ipv4.as_deref(),
+                    None,
+                ) {
+                    state.fleet.ec2_aggregate_published = Some(names.clone());
+                }
+                return None;
+            }
             let f = &mut state.fleet;
+            // A host aggregator's names, for the addresses it reports now.
+            if let Some(h) = f
+                .hosts
+                .values_mut()
+                .find(|h| crate::state::aggregate_id(&h.name).as_deref() == Some(slot.as_str()))
+            {
+                if names.names(
+                    h.aggregate_ipv6.as_deref(),
+                    h.aggregate_ipv4.as_deref(),
+                    h.aggregate_v4_port,
+                ) {
+                    h.aggregate_published = Some(names.clone());
+                }
+                return None;
+            }
             if let Some(s) = f
                 .slots
                 .values_mut()
@@ -217,7 +243,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
         }
         Event::ScaleInstances { instances, .. } => {
             let p = &mut state.fleet.power;
-            if p.state == "waking" {
+            if wake_open(p) {
                 for i in instances {
                     let w = p.hosts.entry(i.id.clone()).or_default();
                     w.pending_at.get_or_insert(at);
@@ -261,19 +287,27 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     gpus,
                     capacity,
                     store_ready_at,
+                    boot,
                 } => {
                     // The connection names the host; a hello naming another is ignored.
                     if named == host {
                         hello(&mut state.fleet, host, arch, gpus, *capacity, at);
                         let p = &mut state.fleet.power;
-                        if p.state == "waking" {
+                        if wake_open(p) {
+                            let woke = p.woke_at;
                             let w = p.hosts.entry(host.clone()).or_default();
-                            w.agent_at.get_or_insert(at);
                             // The host's own clock: kept only when it falls inside this wake.
-                            if let Some(t) = store_ready_at
-                                .filter(|t| p.woke_at.is_some_and(|w| *t >= w) && *t <= at)
-                            {
-                                w.store_ready_at.get_or_insert(t);
+                            let inside = |t: &u64| woke.is_some_and(|w| *t >= w) && *t <= at;
+                            if w.agent_at.is_none() {
+                                w.agent_at = Some(at);
+                                if let Some(t) = store_ready_at.filter(inside) {
+                                    w.store_ready_at.get_or_insert(t);
+                                }
+                                w.boot = boot
+                                    .iter()
+                                    .filter(|(_, t)| inside(t))
+                                    .map(|(k, t)| (k.clone(), *t))
+                                    .collect();
                             }
                         }
                     }
@@ -299,9 +333,17 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                         at,
                     );
                 }
-                AgentMsg::Aggregate { frame_url } => {
+                AgentMsg::Aggregate {
+                    frame_url,
+                    ipv6,
+                    ipv4,
+                    v4_port,
+                } => {
                     if let Some(h) = state.fleet.hosts.get_mut(host) {
                         h.aggregate_url = Some(frame_url.clone());
+                        h.aggregate_ipv6 = ipv6.clone();
+                        h.aggregate_ipv4 = ipv4.clone();
+                        h.aggregate_v4_port = *v4_port;
                     }
                 }
                 AgentMsg::Scrub { ok, .. } => {
@@ -312,8 +354,18 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                         c.scrub_failures += 1;
                     }
                 }
-                AgentMsg::Quarantine { sbdf, error, .. } => {
-                    quarantine(&mut state.fleet, host, sbdf, error, at);
+                AgentMsg::Quarantine {
+                    sbdf,
+                    error,
+                    report,
+                    ..
+                } => {
+                    let key = gpu_key(host, sbdf);
+                    let released = report.is_some()
+                        && state.fleet.released_reports.get(&key) == report.as_ref();
+                    if !released {
+                        quarantine(&mut state.fleet, host, sbdf, error, report.clone(), at);
+                    }
                 }
             }
             None
@@ -351,7 +403,10 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             None
         }
         Event::ReleaseQuarantine { host, sbdf, .. } => {
-            state.fleet.quarantined.remove(&gpu_key(host, sbdf));
+            let key = gpu_key(host, sbdf);
+            if let Some(report) = state.fleet.quarantined.remove(&key).and_then(|q| q.report) {
+                state.fleet.released_reports.insert(key, report);
+            }
             None
         }
     }
@@ -427,7 +482,7 @@ fn power_step(state: &mut State, at: u64) {
         f.next_race_at = None;
         return;
     }
-    if f.power.state == "waking" {
+    if wake_open(&f.power) {
         let hosts = f.hosts.clone();
         for (id, w) in f.power.hosts.iter_mut() {
             if w.rendering_at.is_some() || !hosts.contains_key(id) {
@@ -447,27 +502,40 @@ fn power_step(state: &mut State, at: u64) {
                 w.rendering_at = Some(at);
             }
         }
-        if image_complete(f) {
-            let started = f.power.woke_at.unwrap_or(at);
-            let gpus = f
-                .slots
-                .values()
-                .chain(f.ec2.values())
-                .filter(|s| s.position.is_some())
-                .count();
-            f.power.wakes.push_back(Wake {
-                started_at: started,
-                awake_at: at,
-                gpus,
-                ms: at - started,
-            });
-            while f.power.wakes.len() > MAX_WAKES {
-                f.power.wakes.pop_front();
-            }
-            f.power.state = "awake".into();
-            f.next_race_at = interval.map(|s| at + s * 1000);
-        }
     }
+    if f.power.state == "waking" && image_complete(f) {
+        let started = f.power.woke_at.unwrap_or(at);
+        let gpus = f
+            .slots
+            .values()
+            .chain(f.ec2.values())
+            .filter(|s| s.position.is_some())
+            .count();
+        f.power.wakes.push_back(Wake {
+            started_at: started,
+            awake_at: at,
+            gpus,
+            ms: at - started,
+        });
+        while f.power.wakes.len() > MAX_WAKES {
+            f.power.wakes.pop_front();
+        }
+        f.power.state = "awake".into();
+        f.next_race_at = interval.map(|s| at + s * 1000);
+    }
+}
+
+/// Whether the hosts' progress still belongs to the current wake: while it wakes, and after
+/// it is awake until every host recorded for it renders. The fleet is awake once the image
+/// is complete, which the EC2 half can make before any GPU host's agent has said hello
+/// (staging, 2026-10-25: awake 53 s into a wake whose host rendered at 150 s), so the
+/// host's later phases are recorded too. A host that never renders keeps the record open
+/// until the fleet sleeps.
+pub fn wake_open(p: &crate::state::Power) -> bool {
+    p.woke_at.is_some()
+        && (p.state == "waking"
+            || p.hosts.is_empty()
+            || p.hosts.values().any(|w| w.rendering_at.is_none()))
 }
 
 /// Whether the GPU behind a slot is quarantined.
@@ -480,7 +548,7 @@ pub fn is_quarantined(f: &Fleet, s: &Slot) -> bool {
 
 /// Take a GPU out of rotation: its slot leaves the tiling (and any race and claim), and
 /// stays out until an operator releases it.
-fn quarantine(f: &mut Fleet, host: &str, sbdf: &str, error: &str, at: u64) {
+fn quarantine(f: &mut Fleet, host: &str, sbdf: &str, error: &str, report: Option<String>, at: u64) {
     let key = gpu_key(host, sbdf);
     if f.quarantined.contains_key(&key) {
         return;
@@ -492,6 +560,7 @@ fn quarantine(f: &mut Fleet, host: &str, sbdf: &str, error: &str, at: u64) {
             sbdf: sbdf.to_string(),
             error: error.to_string(),
             since: at,
+            report,
         },
     );
     let on_gpu = |s: &Slot| {
@@ -1012,6 +1081,10 @@ fn hello(f: &mut Fleet, host: &str, arch: &str, gpus: &[Gpu], capacity: usize, a
             joined_at: at,
             region: None,
             aggregate_url: None,
+            aggregate_ipv6: None,
+            aggregate_ipv4: None,
+            aggregate_v4_port: None,
+            aggregate_published: None,
         },
     );
     f.reclaimed.remove(host);

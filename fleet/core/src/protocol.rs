@@ -176,6 +176,16 @@ impl HealthReport {
     }
 }
 
+/// The renderer's process id in a `/health` reply (`boot_id`, random per process), when it
+/// reports one. A different one than the last read means the renderer restarted and has
+/// lost its scene.
+pub fn boot_id(health: &serde_json::Value) -> Option<String> {
+    health
+        .get("boot_id")
+        .and_then(|b| b.as_str())
+        .map(str::to_string)
+}
+
 /// Agent -> coordinator.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -188,6 +198,10 @@ pub enum AgentMsg {
         /// When the host's store was ready (Unix ms), if the host marks it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         store_ready_at: Option<u64>,
+        /// When the host's boot reached each of its steps (Unix ms, the host's clock):
+        /// `kernel_started_at`, `store_started_at`, `store_mounted_at`, `agent_started_at`.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        boot: BTreeMap<String, u64>,
     },
     Slot(SlotReport),
     Health(HealthReport),
@@ -195,9 +209,17 @@ pub enum AgentMsg {
     Draining {
         reason: String,
     },
-    /// The host's aggregator is serving the host's region at this frame WebSocket.
+    /// The host's aggregator is serving the host's region at this frame WebSocket, and,
+    /// when it serves browsers with TLS, at these public addresses: its own IPv6 address
+    /// (port 443) and the host's IPv4 address on `v4_port`. The coordinator names them.
     Aggregate {
         frame_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ipv6: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ipv4: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        v4_port: Option<u16>,
     },
     /// A GPU scrub finished (`ok`), or failed with `error`.
     Scrub {
@@ -207,11 +229,15 @@ pub enum AgentMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
-    /// The agent took a GPU out of rotation: its reset, scrub or attach failed.
+    /// The agent took a GPU out of rotation: its reset, scrub or attach failed. `report`
+    /// names this report (random per quarantine), so a replay of it is told apart from a
+    /// new failure of the same GPU.
     Quarantine {
         slot: String,
         sbdf: String,
         error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report: Option<String>,
     },
 }
 
@@ -299,6 +325,14 @@ pub enum CoordMsg {
     /// The grid's budget: every renderer draws `budget` pixel-samples per frame from the
     /// first frame at or after scene time `t` (`POST /budget`, again after every scene).
     Budget(BudgetBody),
+    /// A state that holds the agent's `quarantine` report `report` for this GPU (or an
+    /// operator's release that came after it) is stored: the agent stops replaying that
+    /// report.
+    QuarantineStored {
+        sbdf: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report: Option<String>,
+    },
 }
 
 /// The body of a renderer's `POST /budget`.

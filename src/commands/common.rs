@@ -44,10 +44,11 @@ pub struct RuntimeConfig {
     pub gpu_driver_image: Option<GpuDriverImage>,
 }
 
-/// A profile's NVIDIA driver image and the build identity (`utils::file_identity`)
+/// A profile's NVIDIA driver image and the build identity (`utils::image_disk_digest`)
 /// it had when resolved. The identity keys the snapshot cache: a rebuild at the same
 /// path is a different filesystem, which a snapshot holding the guest's mount of the
-/// old one must not be restored against.
+/// old one must not be restored against, while a copy of the same bytes (a store
+/// restored from an archive) keeps its snapshots.
 #[derive(Clone, Debug)]
 pub struct GpuDriverImage {
     pub path: PathBuf,
@@ -56,8 +57,8 @@ pub struct GpuDriverImage {
 
 impl GpuDriverImage {
     pub fn at(path: PathBuf) -> anyhow::Result<Self> {
-        let identity = crate::utils::file_identity(&path)
-            .with_context(|| format!("stat NVIDIA driver image {}", path.display()))?;
+        let identity = crate::utils::image_disk_digest(&path)
+            .with_context(|| format!("hash NVIDIA driver image {}", path.display()))?;
         Ok(Self { path, identity })
     }
 }
@@ -1661,8 +1662,84 @@ pub enum LifecycleReadyOutcome {
     Cancelled,
 }
 
+/// The process's shutdown request and the lifecycle gates it cancels.
+///
+/// One fcvm process can run several lifecycles in turn: `podman run` on a cache
+/// hit restores through `snapshot run`, which creates its own gate and signal
+/// streams after taking the snapshot's generation lock. A signal that reaches
+/// the process between the two only wakes the handlers already installed, so a
+/// gate created later has to learn of it from here. Every gate registers at
+/// creation, and a request cancels every live gate; a gate created after a
+/// request is cancelled at creation. Both happen under one lock, so a gate is
+/// either registered before the request and cancelled by it, or created after
+/// it and born cancelled. Issue 1162.
+pub(crate) struct ShutdownRegistry {
+    state: std::sync::Mutex<ShutdownState>,
+}
+
+#[derive(Default)]
+struct ShutdownState {
+    requested: bool,
+    gates: Vec<(
+        std::sync::Weak<std::sync::atomic::AtomicU8>,
+        tokio_util::sync::CancellationToken,
+    )>,
+}
+
+impl ShutdownRegistry {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(ShutdownState {
+                requested: false,
+                gates: Vec::new(),
+            }),
+        }
+    }
+
+    /// A new gate, registered with this registry, or cancelled at creation
+    /// when shutdown was already requested.
+    pub(crate) fn gate(&self) -> LifecycleReadyGate {
+        let gate = LifecycleReadyGate::unregistered();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.requested {
+            gate.cancel();
+        } else {
+            state.gates.retain(|(phase, _)| phase.strong_count() > 0);
+            state
+                .gates
+                .push((std::sync::Arc::downgrade(&gate.phase), gate.cancel.clone()));
+        }
+        gate
+    }
+
+    /// Record the request and cancel every live gate.
+    pub(crate) fn request_shutdown(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.requested = true;
+        for (phase, cancel) in state.gates.drain(..) {
+            if let Some(phase) = phase.upgrade() {
+                LifecycleReadyGate { phase, cancel }.cancel();
+            }
+        }
+    }
+}
+
+static PROCESS_SHUTDOWN: ShutdownRegistry = ShutdownRegistry::new();
+
+/// What a SIGTERM or SIGINT handler calls: cancel every lifecycle gate of this
+/// process, including gates created after this call.
+pub fn request_process_shutdown() {
+    PROCESS_SHUTDOWN.request_shutdown();
+}
+
 impl LifecycleReadyGate {
+    /// A gate that a shutdown requested of this process cancels, whenever the
+    /// request arrives (`ShutdownRegistry`).
     pub fn new() -> Self {
+        PROCESS_SHUTDOWN.gate()
+    }
+
+    fn unregistered() -> Self {
         Self {
             phase: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(LIFECYCLE_SETTING_UP)),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -3231,6 +3308,15 @@ pub(crate) fn new_restore_epoch() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// What a restore hands its caller: the VMM backend, the rootless namespace holder,
+/// and the part of the mount-target lease the VMM needs for its whole life
+/// (`storage::runtime_dir::MountTargetLease::after_load`).
+pub type RestoredVmm<B> = (
+    B,
+    Option<tokio::process::Child>,
+    Option<crate::storage::runtime_dir::MountTargetLease>,
+);
+
 /// Restore a VM from a snapshot.
 ///
 /// This is the core snapshot restore logic shared by:
@@ -3245,7 +3331,7 @@ pub async fn restore_from_snapshot(
     network: &mut dyn NetworkManager,
     state_manager: &StateManager,
     vm_state: &mut VmState,
-) -> Result<(FirecrackerBackend, Option<tokio::process::Child>)> {
+) -> Result<RestoredVmm<FirecrackerBackend>> {
     let RestoreParams {
         vm_id,
         vm_name,
@@ -3303,6 +3389,7 @@ pub async fn restore_from_snapshot(
     let rootfs_path = substrate.rootfs_path;
     let holder_pid_for_post_start = substrate.holder_pid_for_post_start;
     let mut mount_target_lease = Some(substrate.mount_target_lease);
+    let mut vsock_redirect_lease = None;
 
     let fc_log_path = data_dir.join("firecracker.log");
     let mut vm_manager = VmManager::new(
@@ -3430,8 +3517,11 @@ pub async fn restore_from_snapshot(
                 }
             })?;
         let load_duration = load_start.elapsed();
-        // The load opened every disk at its source path, so the source VMs may go.
-        drop(mount_target_lease.take());
+        // The load opened every disk at its source path, so the source VMs may go. A
+        // VMM without the vsock override keeps resolving its socket through the redirect.
+        vsock_redirect_lease = mount_target_lease
+            .take()
+            .and_then(|lease| lease.after_load(vsock_override.is_none()));
         info!(
             duration_ms = load_duration.as_millis(),
             track_dirty_pages, "snapshot load completed"
@@ -3538,9 +3628,11 @@ pub async fn restore_from_snapshot(
         // after VM resume — Firecracker accepts PUT /mmds while paused but the
         // guest-visible MMDS data isn't updated until after resume.
         let mut mmds_latest = serde_json::json!({
-            "host-time": chrono::Utc::now().timestamp().to_string(),
             "restore-epoch": restore_epoch
         });
+        for (key, value) in crate::utils::host_clock_fields(crate::utils::host_clock_now()) {
+            mmds_latest[key] = serde_json::Value::String(value);
+        }
         if let Some(ref ipv6) = clone_ipv6 {
             mmds_latest["clone-ipv6"] = serde_json::Value::String(ipv6.clone());
         }
@@ -3644,6 +3736,7 @@ pub async fn restore_from_snapshot(
     Ok((
         FirecrackerBackend::from_vm_manager(vm_manager),
         holder_child,
+        vsock_redirect_lease,
     ))
 }
 
@@ -3667,10 +3760,7 @@ pub async fn restore_from_snapshot_ch(
     network: &mut dyn NetworkManager,
     state_manager: &StateManager,
     vm_state: &mut VmState,
-) -> Result<(
-    crate::hypervisor::cloud_hypervisor::CloudHypervisorBackend,
-    Option<tokio::process::Child>,
-)> {
+) -> Result<RestoredVmm<crate::hypervisor::cloud_hypervisor::CloudHypervisorBackend>> {
     use crate::hypervisor::cloud_hypervisor::CloudHypervisorBackend;
     use crate::hypervisor::{Hypervisor, ProcessSpec};
 
@@ -3832,6 +3922,7 @@ pub async fn restore_from_snapshot_ch(
 
     let mut holder_child = substrate.holder_child.take();
     let mut mount_target_lease = Some(substrate.mount_target_lease);
+    let mut vsock_redirect_lease = None;
     // Everything after spawn runs in a fallible block so a failure kills the CH process
     // (callers may fall back to a fresh boot, so a half-restored process must not leak).
     let post_start = async {
@@ -3852,7 +3943,10 @@ pub async fn restore_from_snapshot_ch(
             .await
             .context("resuming Cloud Hypervisor after restore")?;
         // The restore opened every disk at its source path, so the source VMs may go.
-        drop(mount_target_lease.take());
+        // Cloud Hypervisor keeps resolving its vsock socket through the redirect.
+        vsock_redirect_lease = mount_target_lease
+            .take()
+            .and_then(|lease| lease.after_load(true));
 
         vm_state.pid = Some(std::process::id());
         // Future snapshots of this clone must redirect using the original vsock vm_id.
@@ -3897,7 +3991,7 @@ pub async fn restore_from_snapshot_ch(
         return Err(e);
     }
 
-    Ok((backend, holder_child))
+    Ok((backend, holder_child, vsock_redirect_lease))
 }
 
 /// Core snapshot creation logic with automatic diff snapshot support.
@@ -4132,6 +4226,7 @@ pub fn build_snapshot_config(
             firecracker_bin: snapshot_firecracker_bin(vm_state, firecracker_pid),
             balloon_mib: vm_state.config.balloon_mib,
             balloon_free_page_reporting: vm_state.config.balloon_free_page_reporting,
+            parked_gpus: 0,
         },
     })
 }
@@ -4474,11 +4569,48 @@ pub(crate) fn validate_snapshot_vm_identity(
 
 /// Extra files to write into the snapshot directory before it is atomically finalized.
 ///
-/// Returns (filename, contents) pairs. Invoked after the Firecracker snapshot is taken
-/// (and the VM resumed) so contents reflect host-side state at snapshot time — e.g.
-/// portable-volume inode tables.
+/// Returns (filename, contents) pairs. [`publish_snapshot_dir`] invokes it after the VM's
+/// memory and disks are captured and the VM resumed, on every backend, so contents reflect
+/// host-side state at snapshot time, e.g. portable-volume inode tables.
 pub type SnapshotExtraFiles<'a> =
     Option<&'a (dyn Fn() -> Result<Vec<(String, Vec<u8>)>> + Send + Sync)>;
+
+/// Publish a snapshot built in `temp_snapshot_dir` as `snapshot_dir`: write the caller's
+/// extra files (the portable volumes' inode tables) and fcvm's `config.json` into it, then
+/// atomically replace `snapshot_dir` with it.
+///
+/// Every backend's creator publishes through this, so no backend can finalize a snapshot
+/// (config.json present) without its extra files: a clone restored without a portable
+/// volume's inode table answers EIO for every file the guest held open through it. A
+/// failure removes the temp directory and fails the snapshot.
+async fn publish_snapshot_dir(
+    temp_snapshot_dir: &Path,
+    snapshot_dir: &Path,
+    snapshot_config: &crate::storage::snapshot::SnapshotConfig,
+    extra_files: SnapshotExtraFiles<'_>,
+) -> Result<()> {
+    let written: Result<()> = async {
+        if let Some(extra_files) = extra_files {
+            let files = extra_files().context("gathering snapshot extra files")?;
+            for (filename, contents) in files {
+                tokio::fs::write(temp_snapshot_dir.join(&filename), &contents)
+                    .await
+                    .with_context(|| format!("writing snapshot extra file {}", filename))?;
+            }
+        }
+        let config_json =
+            serde_json::to_string_pretty(snapshot_config).context("serializing snapshot config")?;
+        tokio::fs::write(temp_snapshot_dir.join("config.json"), &config_json)
+            .await
+            .context("writing snapshot config")
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_dir_all(temp_snapshot_dir).await;
+        return Err(e);
+    }
+    atomic_replace_dir(temp_snapshot_dir, snapshot_dir).await
+}
 
 /// What to do with the source VM after capturing its memory and disks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4768,6 +4900,15 @@ pub(crate) fn recorded_vsock_socket_path(vm_state: &VmState) -> Result<&Path> {
 /// This is intentionally part of both snapshot APIs: deriving a conventional
 /// runtime path here would silently bypass `--vsock-dir`.
 async fn run_snapshot_network_command(vsock_socket: &Path, vm_id: &str, flag: &str) -> Result<()> {
+    run_fc_agent_one_shot(vsock_socket, vm_id, flag).await
+}
+
+/// Run `fc-agent <flag>` in the guest over the exec channel and fail unless it exits 0.
+pub(crate) async fn run_fc_agent_one_shot(
+    vsock_socket: &Path,
+    vm_id: &str,
+    flag: &str,
+) -> Result<()> {
     use crate::commands::exec::run_exec_in_vm_captured;
 
     let command = vec![FC_AGENT_PATH.to_string(), flag.to_string()];
@@ -5419,41 +5560,18 @@ pub async fn create_snapshot_core(
         );
     }
 
-    // Write caller-provided extra files (e.g. portable-volume inode tables) into the
-    // temp directory BEFORE the atomic rename. A finalized snapshot (config.json present)
-    // must never be missing these files — clones would silently restore without them —
-    // so a write failure here fails the snapshot instead of being logged and ignored.
-    if let Some(extra_files) = extra_files {
-        let files = match extra_files() {
-            Ok(files) => files,
-            Err(e) => {
-                let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-                return Err(e).context("gathering snapshot extra files");
-            }
-        };
-        for (filename, contents) in files {
-            let path = temp_snapshot_dir.join(&filename);
-            if let Err(e) = tokio::fs::write(&path, &contents).await {
-                let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-                return Err(e).with_context(|| format!("writing snapshot extra file {}", filename));
-            }
-        }
-    }
-
     // Record parent snapshot for the diff chain.
     // Full snapshots: parent = None (self-contained).
     // Diff snapshots: parent = name of snapshot whose memory.bin the diff was written over.
     snapshot_config.parent_snapshot = if use_diff { diff_parent_name } else { None };
 
-    // Write config.json to temp directory
-    let temp_config_path = temp_snapshot_dir.join("config.json");
-    let config_json =
-        serde_json::to_string_pretty(&snapshot_config).context("serializing snapshot config")?;
-    tokio::fs::write(&temp_config_path, &config_json)
-        .await
-        .context("writing snapshot config")?;
-
-    atomic_replace_dir(&temp_snapshot_dir, snapshot_dir).await?;
+    publish_snapshot_dir(
+        &temp_snapshot_dir,
+        snapshot_dir,
+        &snapshot_config,
+        extra_files,
+    )
+    .await?;
 
     let actual_type = if use_diff { "Diff" } else { "Full" };
     info!(
@@ -5489,6 +5607,7 @@ pub async fn create_snapshot_ch(
     mut snapshot_config: crate::storage::snapshot::SnapshotConfig,
     disk_path: &Path,
     vsock_socket_path: &Path,
+    extra_files: SnapshotExtraFiles<'_>,
 ) -> Result<()> {
     // CH snapshots are always self-contained (no diff base / parent chain).
     snapshot_config.parent_snapshot = None;
@@ -5669,15 +5788,13 @@ pub async fn create_snapshot_ch(
 
     info!(snapshot = %snapshot_config.name, "CH VM and guest network resumed, finalizing snapshot");
 
-    // Write fcvm's metadata config.json, then atomically swap the dir into place.
-    let temp_config_path = temp_snapshot_dir.join("config.json");
-    let config_json =
-        serde_json::to_string_pretty(&snapshot_config).context("serializing snapshot config")?;
-    tokio::fs::write(&temp_config_path, &config_json)
-        .await
-        .context("writing snapshot config")?;
-
-    atomic_replace_dir(&temp_snapshot_dir, snapshot_dir).await?;
+    publish_snapshot_dir(
+        &temp_snapshot_dir,
+        snapshot_dir,
+        &snapshot_config,
+        extra_files,
+    )
+    .await?;
 
     info!(
         snapshot = %snapshot_config.name,
@@ -6192,6 +6309,40 @@ mod tests {
                 .unwrap()
                 .lifecycle_ready,
             "a stale process identity must not publish readiness"
+        );
+    }
+
+    /// A shutdown request reaches every gate of the process: one registered
+    /// before it is cancelled by it, and one created after it is created
+    /// cancelled. A gate that already claimed publication keeps it; its token
+    /// is still cancelled, which is how a published VM learns to stop.
+    #[test]
+    fn a_shutdown_request_cancels_gates_created_before_and_after_it() {
+        let registry = ShutdownRegistry::new();
+        let earlier = registry.gate();
+        let published = registry.gate();
+        assert_eq!(
+            published.claim_terminal_publication().unwrap(),
+            LifecycleReadyOutcome::Published
+        );
+        drop(registry.gate());
+        assert!(!earlier.cancellation_token().is_cancelled());
+
+        registry.request_shutdown();
+        let later = registry.gate();
+
+        for (name, gate) in [("earlier", &earlier), ("later", &later)] {
+            assert!(gate.cancellation_token().is_cancelled(), "{name}");
+            assert_eq!(
+                gate.claim_terminal_publication().unwrap(),
+                LifecycleReadyOutcome::Cancelled,
+                "{name}"
+            );
+        }
+        assert!(published.cancellation_token().is_cancelled());
+        assert_eq!(
+            published.claim_terminal_publication().unwrap(),
+            LifecycleReadyOutcome::Published
         );
     }
 
@@ -6817,7 +6968,7 @@ mod tests {
             core,
             &[
                 "let _permit = snapshot_semaphore()",
-                "atomic_replace_dir(&temp_snapshot_dir, snapshot_dir)",
+                "publish_snapshot_dir(",
                 "PublishedMemoryFile::open(",
             ],
         );
@@ -6860,6 +7011,60 @@ mod tests {
                 "inherit_working_set(&parent",
                 "drop(_generation_locks)",
             ],
+        );
+    }
+
+    /// A memory snapshot of a VM with portable volumes carries their inode tables on every
+    /// backend (#1200): a clone restored without them answers EIO for every file the guest
+    /// held open through a portable volume. `cmd_snapshot_create` hands each backend's
+    /// creator the hook that fetches the tables from the VM's fcvm process, and each creator
+    /// publishes its directory only through `publish_snapshot_dir`, with that hook, which
+    /// writes the tables before the rename that makes the snapshot visible. No fake VMM can
+    /// drive these functions, so the wiring is pinned by their source.
+    #[test]
+    fn every_memory_snapshot_backend_saves_the_portable_volume_inode_tables() {
+        /// The text of the first call to `callee` in `body`, through its `.await`.
+        fn call<'a>(name: &str, body: &'a str, callee: &str) -> &'a str {
+            let start = body
+                .find(callee)
+                .unwrap_or_else(|| panic!("{name} does not call `{callee}`"));
+            let end = body[start..]
+                .find(".await")
+                .unwrap_or_else(|| panic!("{name}'s call to `{callee}` is not awaited"));
+            &body[start..start + end]
+        }
+
+        let create = body_of(include_str!("snapshot.rs"), "async fn cmd_snapshot_create(");
+        let without_tables: Vec<&str> = ["create_snapshot_core(", "create_snapshot_ch("]
+            .into_iter()
+            .filter(|creator| {
+                !call("cmd_snapshot_create", create, creator).contains("inode_tables")
+            })
+            .collect();
+        assert!(
+            without_tables.is_empty(),
+            "cmd_snapshot_create does not hand the portable volumes' inode tables to {without_tables:?}"
+        );
+
+        let source = include_str!("common.rs");
+        for signature in [
+            "pub async fn create_snapshot_core(",
+            "pub async fn create_snapshot_ch(",
+        ] {
+            let body = body_of(source, signature);
+            assert!(
+                !body.contains("atomic_replace_dir("),
+                "{signature} publishes its directory without `publish_snapshot_dir`"
+            );
+            assert!(
+                call(signature, body, "publish_snapshot_dir(").contains("extra_files"),
+                "{signature} does not hand its extra files to `publish_snapshot_dir`"
+            );
+        }
+        assert_in_order(
+            "publish_snapshot_dir",
+            body_of(source, "async fn publish_snapshot_dir("),
+            &["extra_files()", "\"config.json\"", "atomic_replace_dir("],
         );
     }
 

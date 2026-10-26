@@ -58,9 +58,10 @@ pub struct FirecrackerConfig {
     /// modules were compiled against, and the snapshot holds the guest's mount of it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_driver_image: Option<PathBuf>,
-    /// Build identity of `gpu_driver_image` (`utils::file_identity`): a rebuild at the
-    /// same path is a different filesystem, so it is a cache miss. Set only on the key
-    /// config (launch-only configs carry None), and verified after the drive is attached.
+    /// Build identity of `gpu_driver_image` (`utils::image_disk_digest`, its SHA-256): a
+    /// rebuild at the same path is a different filesystem, so it is a cache miss. Set only
+    /// on the key config (launch-only configs carry None), and verified after the drive is
+    /// attached.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_driver_identity: Option<String>,
     /// Environment variables passed to the container.
@@ -170,8 +171,8 @@ pub struct FirecrackerConfig {
     /// None (the default) is skip-serialized so existing keys are unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra_boot_args: Option<String>,
-    /// Build identity (inode:size:mtime) of the attached image-delivery disk
-    /// (overlay storage image or Docker archive). The disk's PATH is
+    /// Build identity (`utils::image_disk_digest`, the SHA-256) of the attached
+    /// image-delivery disk (overlay storage image or Docker archive). The disk's PATH is
     /// content-addressed by image digest and so survives rebuilds — but
     /// `podman load` randomizes overlay layer link IDs per build, so a
     /// pre-start snapshot that provisioned its container against one build
@@ -531,7 +532,7 @@ impl FirecrackerConfig {
             .map(|mapping| mapping.guest_port.to_string())
             .collect::<Vec<_>>();
 
-        serde_json::json!({
+        let mut document = serde_json::json!({
             "latest": {
                 "container-plan": {
                     "image": self.container_image_name,
@@ -568,9 +569,12 @@ impl FirecrackerConfig {
                     "no_proxy": runtime.no_proxy,
                     "ntp_servers": runtime.ntp_servers,
                 },
-                "host-time": runtime.host_time,
             }
-        })
+        });
+        for (key, value) in crate::utils::host_clock_fields(runtime.host_clock) {
+            document["latest"][key] = serde_json::Value::String(value);
+        }
+        document
     }
 }
 
@@ -607,8 +611,9 @@ pub struct MmdsRuntime {
     pub subgid_start: Option<u64>,
     /// Host user's subordinate GID range count
     pub subgid_count: Option<u64>,
-    /// Host timestamp (UTC epoch seconds)
-    pub host_time: String,
+    /// The host clock when the plan was built, as time since the Unix epoch
+    /// (`utils::host_clock_fields`).
+    pub host_clock: std::time::Duration,
     /// The host's NTP servers, already resolved to addresses, for the guest's chronyd.
     ///
     /// Resolved host-side for the same reason proxies are: the guest writes them
@@ -857,6 +862,93 @@ mod tests {
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 
+    /// Write `bytes` at `path` with a modification time `secs` and a fractional second,
+    /// as a file built on this host has. A rebuild is written later, so it passes a
+    /// later `secs`.
+    fn image_file(path: &std::path::Path, bytes: &[u8], secs: u64) {
+        std::fs::write(path, bytes).unwrap();
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::new(secs, 123_456_789);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    /// Replace `path` the way `tar -x` restores it from the fleet store archive
+    /// (fleet/ami/host/store.sh): the same bytes in a new inode, with the modification
+    /// time cut to whole seconds (GNU tar's default format keeps no fraction).
+    fn restore_like_tar(path: &std::path::Path) {
+        use std::os::unix::fs::MetadataExt;
+        let before = std::fs::metadata(path).unwrap();
+        let copy = path.with_extension("tar-extract");
+        std::fs::write(&copy, std::fs::read(path).unwrap()).unwrap();
+        let whole = std::time::UNIX_EPOCH + std::time::Duration::from_secs(before.mtime() as u64);
+        std::fs::File::options()
+            .write(true)
+            .open(&copy)
+            .unwrap()
+            .set_modified(whole)
+            .unwrap();
+        std::fs::rename(&copy, path).unwrap();
+        let after = std::fs::metadata(path).unwrap();
+        assert_ne!(
+            after.ino(),
+            before.ino(),
+            "the restore must make a new inode"
+        );
+        assert_ne!(
+            after.mtime_nsec(),
+            before.mtime_nsec(),
+            "the restore must drop the fraction"
+        );
+    }
+
+    /// Issue #1219: the fleet host's store is restored from a tar archive of the AMI
+    /// build's store, so every file gets a new inode and loses the fraction of its
+    /// modification time. The NVIDIA driver image's identity and the overlay storage
+    /// image's identity are in the key; if either is the file's inode and mtime, the
+    /// host's first GPU VM misses the pre-start snapshot the build warmed and boots
+    /// cold. Restoring the same bytes must leave the key as it was, and different
+    /// bytes at the same path (a rebuild) must still change it.
+    #[test]
+    fn a_store_restored_from_tar_keeps_its_snapshot_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = dir.path().join("nvidia-gpu.img");
+        let overlay = dir.path().join("abc123.storage-v2.img");
+        image_file(&driver, b"driver build one", 1_765_574_672);
+        image_file(&overlay, b"overlay build one", 1_765_574_672);
+        let key = || {
+            let mut config = test_config();
+            let image = crate::commands::common::GpuDriverImage::at(driver.clone()).unwrap();
+            config.gpu_driver_image = Some(image.path);
+            config.gpu_driver_identity = Some(image.identity);
+            config.image_disk_identity = Some(crate::utils::image_disk_digest(&overlay).unwrap());
+            config.snapshot_key()
+        };
+        let warmed = key();
+
+        restore_like_tar(&driver);
+        restore_like_tar(&overlay);
+        assert_eq!(
+            key(),
+            warmed,
+            "the restored store misses the warmed snapshot"
+        );
+
+        image_file(&overlay, b"overlay build two", 1_765_581_300);
+        assert_ne!(key(), warmed, "a rebuilt overlay image kept the old key");
+        image_file(&overlay, b"overlay build one", 1_765_581_301);
+        assert_eq!(
+            key(),
+            warmed,
+            "the same overlay bytes rebuilt changed the key"
+        );
+        image_file(&driver, b"driver build two", 1_765_581_302);
+        assert_ne!(key(), warmed, "a rebuilt driver image kept the old key");
+    }
+
     #[test]
     fn test_snapshot_key_changes_with_image_disk_identity() {
         // The image disk's PATH is content-addressed by image digest and does
@@ -1080,7 +1172,7 @@ mod tests {
             subuid_count: None,
             subgid_start: None,
             subgid_count: None,
-            host_time: "0".to_string(),
+            host_clock: std::time::Duration::ZERO,
             ntp_servers: vec![],
         });
 
@@ -1108,7 +1200,7 @@ mod tests {
             subuid_count: None,
             subgid_start: None,
             subgid_count: None,
-            host_time: "0".to_string(),
+            host_clock: std::time::Duration::ZERO,
             ntp_servers: vec![],
         };
         let plan = test_config().to_mmds_json(runtime(Some("/dev/vdc")));

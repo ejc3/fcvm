@@ -5,7 +5,7 @@
 mod fleet_support;
 
 use fcvm::fleet::agent::slot::AgentCfg;
-use fcvm::fleet::agent::{serve, Agent};
+use fcvm::fleet::agent::{serve, Agent, AggregateCfg, AggregatePublic};
 use fcvm::fleet::lines::{spawn_writer, LineReader};
 use fleet_core::protocol::{AgentMsg, AssignSlot, CoordMsg, SharedScene, SlotReport};
 use fleet_core::scene::Scene;
@@ -114,6 +114,7 @@ impl Coord {
             spot_poll: Duration::from_millis(50),
             aggregate: None,
             store_ready_file: None,
+            boot: Default::default(),
         };
         let task = tokio::spawn(serve(agent, agent_in, agent_out));
         let (to_agent, _w) = spawn_writer::<CoordMsg, _>(coord_out, "agent");
@@ -396,6 +397,56 @@ async fn wait_len(
         assert!(Instant::now() < deadline, "{what}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// A renderer that restarts inside its VM (the VM keeps running) answers `/health` with a
+/// new `boot_id`, without the scene it was posted: the agent posts the scene and the budget
+/// to it again, without a relaunch.
+#[tokio::test]
+async fn a_renderer_restarted_in_its_vm_gets_its_scene_again() {
+    let f = fake(1, &[]);
+    let boot = f.dir.path().join(format!("port-{}.boot", f.base));
+    let set_boot = |id: &str| {
+        let tmp = boot.with_extension("boot.tmp");
+        std::fs::write(&tmp, id).unwrap();
+        std::fs::rename(&tmp, &boot).unwrap();
+    };
+    set_boot("boot-1");
+    let mut c = Coord::start(&f, 1, cfg(&f.fcvm));
+    c.next().await;
+    c.send(scene());
+    c.send(CoordMsg::Budget(fleet_core::protocol::BudgetBody {
+        budget: 500_000,
+        t: 11.2,
+    }));
+    c.assign(&[("slot-1", 0, 1, rect(0.0))]);
+    c.until(&["slot-1"], "running", 1).await;
+    wait_len(&f.budgets[0], 1, "the budget was not posted").await;
+    // Health is read every 200 ms; an unchanged boot id posts nothing again.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(f.scenes[0].lock().unwrap().len(), 1, "one scene post");
+    assert_eq!(f.budgets[0].lock().unwrap().len(), 1, "one budget post");
+    set_boot("boot-2");
+    wait_len(
+        &f.scenes[0],
+        2,
+        "the scene was not posted again after the renderer restarted",
+    )
+    .await;
+    wait_len(
+        &f.budgets[0],
+        2,
+        "the budget was not posted again after the renderer restarted",
+    )
+    .await;
+    let scenes = f.scenes[0].lock().unwrap().clone();
+    assert_eq!(scenes[1], scenes[0], "the same scene");
+    let starts = events(f.dir.path())
+        .iter()
+        .filter(|e| e.kind == "start")
+        .count();
+    assert_eq!(starts, 1, "a renderer restart is not a relaunch");
+    c.close().await;
 }
 
 /// The grid budget reaches a wall tile's renderer, again after every scene post (a new
@@ -890,14 +941,27 @@ async fn a_spot_notice_is_reported_as_draining() {
 
 /// With an aggregator port the agent runs `fcvm fleet aggregate` for its band, reports its
 /// frame URL, and gives it the layout: the assigned region and every placed slot's renderer.
+/// Serving browsers, the aggregator listens with TLS on its IPv4 port (with the renderers'
+/// certificate file) and the agent reports the host's public IPv4 address with that port.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_agent_runs_and_feeds_its_aggregator() {
     let f = fake(2, &[]);
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let free_port = || {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    };
+    let (port, tls_port) = (free_port(), free_port());
+    let tls_dir = tempfile::tempdir().unwrap();
+    let ck = rcgen::generate_simple_self_signed(vec!["agg.fleet.test".to_string()]).unwrap();
+    std::fs::write(
+        tls_dir.path().join("tls.json"),
+        serde_json::json!({"cert": ck.cert.pem(), "key": ck.signing_key.serialize_pem()})
+            .to_string(),
+    )
+    .unwrap();
     let (coord_side, agent_side) = tokio::io::duplex(1 << 20);
     let (agent_in, agent_out) = tokio::io::split(agent_side);
     let (coord_in, coord_out) = tokio::io::split(coord_side);
@@ -910,16 +974,23 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
         spot_notice_url: None,
         spot_poll: Duration::from_millis(50),
         store_ready_file: None,
-        aggregate: Some((
+        boot: Default::default(),
+        aggregate: Some(AggregateCfg {
             port,
-            vec![
+            argv: vec![
                 env!("CARGO_BIN_EXE_fcvm").to_string(),
                 "fleet".into(),
                 "aggregate".into(),
                 "--codec".into(),
                 "raw".into(),
             ],
-        )),
+            public: Some(AggregatePublic {
+                tls_file: tls_dir.path().join("tls.json"),
+                v4_port: tls_port,
+                ipv4: Some("192.0.2.7".into()),
+                ipv6: None,
+            }),
+        }),
     };
     let task = tokio::spawn(serve(agent, agent_in, agent_out));
     let (to_agent, _w) = spawn_writer::<CoordMsg, _>(coord_out, "agent");
@@ -973,11 +1044,45 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
             .expect("an agent message")
             .unwrap()
             .unwrap();
-        if let AgentMsg::Aggregate { frame_url } = m {
+        if let AgentMsg::Aggregate {
+            frame_url,
+            ipv6,
+            ipv4,
+            v4_port,
+        } = m
+        {
             assert_eq!(frame_url, format!("ws://gpu-host.example:{port}/frames"));
+            assert_eq!(
+                (ipv6, ipv4.as_deref(), v4_port),
+                (None, Some("192.0.2.7"), Some(tls_port))
+            );
             break;
         }
     }
+    // Browsers: TLS on the IPv4 port, the stream and the health check only.
+    let https = reqwest::Client::builder()
+        .use_rustls_tls()
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(reqwest::Certificate::from_pem(ck.cert.pem().as_bytes()).unwrap())
+        .resolve(
+            "agg.fleet.test",
+            std::net::SocketAddr::from(([127, 0, 0, 1], tls_port)),
+        )
+        .no_proxy()
+        .build()
+        .unwrap();
+    let r = https
+        .get(format!("https://agg.fleet.test:{tls_port}/healthz"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = https
+        .get(format!("https://agg.fleet.test:{tls_port}/layout"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404, "the layout is not served to browsers");
     let layout_url = format!("http://127.0.0.1:{port}/layout");
     let deadline = Instant::now() + Duration::from_secs(10);
     let layout = loop {
@@ -1226,6 +1331,7 @@ async fn the_hello_reports_when_the_store_was_ready() {
         spot_poll: Duration::from_millis(50),
         aggregate: None,
         store_ready_file: Some(marker),
+        boot: Default::default(),
     };
     let task = tokio::spawn(serve(agent, agent_in, agent_out));
     let mut from_agent = LineReader::new(coord_in, "agent");
@@ -1300,6 +1406,7 @@ async fn a_dialing_agent_reconnects_and_replays_its_state_without_restarting_vms
         spot_poll: Duration::from_millis(50),
         aggregate: None,
         store_ready_file: None,
+        boot: Default::default(),
     };
     let task = tokio::spawn(dial(
         agent,
@@ -1365,6 +1472,45 @@ async fn a_dialing_agent_reconnects_and_replays_its_state_without_restarting_vms
         .count();
     assert_eq!(starts, 1, "the VM kept running across the reconnect");
     task.abort();
+}
+
+/// `PutSecretValue` without a `ClientRequestToken` is refused by Secrets Manager (400
+/// InvalidRequestException: "You must provide a ClientRequestToken value"); the coordinator's
+/// certificate renewal stored nothing that way. Each put carries a fresh token.
+#[tokio::test]
+async fn a_stored_secret_version_carries_a_fresh_client_request_token() {
+    use fcvm::fleet::coord::secrets::Secrets;
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let tokens = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let t2 = tokens.clone();
+    let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap, body: String| {
+        let t2 = t2.clone();
+        async move {
+            assert_eq!(headers["x-amz-target"], "secretsmanager.PutSecretValue");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            match v["ClientRequestToken"].as_str() {
+                // The service's rule: 32 to 64 characters.
+                Some(t) if (32..=64).contains(&t.len()) => {
+                    t2.lock().unwrap().push(t.to_string());
+                    (axum::http::StatusCode::OK, axum::Json(serde_json::json!({"VersionId": t})))
+                }
+                _ => (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({"__type": "InvalidRequestException", "Message": "You must provide a ClientRequestToken value"})),
+                ),
+            }
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let secrets = Secrets::with_endpoint("us-east-2", &base).unwrap();
+    secrets.put("fcvm-fleet/tls-wildcard", "{}").await.unwrap();
+    secrets.put("fcvm-fleet/tls-wildcard", "{}").await.unwrap();
+    let t = tokens.lock().unwrap().clone();
+    assert_eq!(t.len(), 2);
+    assert_ne!(t[0], t[1], "each version needs its own token");
 }
 
 /// The renderers' certificate in the renderer's TLS interface: `tls.json` with `cert` and
@@ -1594,4 +1740,35 @@ async fn a_warming_slot_draws_the_whole_image_then_takes_its_place() {
         .count();
     assert_eq!(starts, 1, "joining the wall must not relaunch");
     c.close().await;
+}
+
+/// The hello's boot times: the kernel's start from `/proc/uptime`, the agent's start, and
+/// every `*_at` number in the store unit's ready file; anything else in that file is left
+/// out, and a file that is not a JSON object adds nothing.
+#[test]
+fn boot_times_come_from_uptime_the_agent_and_the_store_ready_file() {
+    use fcvm::fleet::agent::boot_times;
+    let b = boot_times(
+        Some("86.25 1201.50\n"),
+        1_000_000,
+        999_000,
+        Some(
+            r#"{"store_started_at": 920000, "store_mounted_at": 921000, "store_source": "s3", "bytes": 5}"#,
+        ),
+    );
+    assert_eq!(
+        b,
+        [
+            ("kernel_started_at".to_string(), 1_000_000 - 86_250),
+            ("agent_started_at".to_string(), 999_000),
+            ("store_started_at".to_string(), 920_000),
+            ("store_mounted_at".to_string(), 921_000),
+        ]
+        .into()
+    );
+    // The store unit of an older image wrote nothing (or an empty marker).
+    assert_eq!(
+        boot_times(None, 1_000_000, 999_000, Some("")),
+        [("agent_started_at".to_string(), 999_000)].into()
+    );
 }
