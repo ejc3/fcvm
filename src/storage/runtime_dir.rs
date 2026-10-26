@@ -15,15 +15,23 @@
 //! | the directory's own VM | around the removal of its directory at teardown | exclusive |
 //!
 //! A clone that waited behind a teardown holds a lock on a directory that no longer has
-//! a name, so it checks the inode it locked against the path and starts again (the
-//! directory it recreates is only a mountpoint, and nobody else removes it).
+//! a name, so it checks the inode it locked against the path and starts again.
+//!
+//! A directory a restore recreates, after its VM is gone, is only a mountpoint: empty in
+//! the host's namespace, with no VM of its own to remove it. The lease that ends last
+//! removes it (`MountTargetLease`'s drop), once it can take the lock exclusively without
+//! waiting and the directory is still the empty one it leased. A clone whose VMM keeps
+//! resolving its vsock socket through the redirect (Cloud Hypervisor, and Firecracker
+//! before 1.16.0) holds the lease on such a directory for its whole life
+//! (`MountTargetLease::after_load`), so another clone's release cannot remove it from
+//! under it.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const WAIT_LOG_INTERVAL: Duration = Duration::from_secs(5);
@@ -34,19 +42,96 @@ const MAX_LEASE_ATTEMPTS: usize = 8;
 
 /// Shared locks on the source VM directories a restoring VMM's mount redirect binds
 /// over. Their VMs' teardowns cannot remove them until this is dropped.
+///
+/// Dropping it removes each leased directory that was only a mountpoint, unless another
+/// lease still holds it (see the module documentation).
 #[must_use = "the source directories are protected only while the lease is held"]
 pub struct MountTargetLease {
-    _dirs: Vec<std::fs::File>,
+    dirs: Vec<LeasedDir>,
+}
+
+struct LeasedDir {
+    path: PathBuf,
+    file: std::fs::File,
+    /// Empty when it was leased: recreated as a mount target after its VM was gone. A
+    /// live VM's runtime directory always holds its disks.
+    mountpoint_only: bool,
+}
+
+impl MountTargetLease {
+    /// What a clone keeps once its VMM has opened the disks the snapshot names.
+    ///
+    /// A VMM that also resolves its vsock socket through the redirect for its whole life
+    /// (`vsock_through_redirect`) keeps the directories that are only mountpoints, so no
+    /// other clone's release removes them while it runs; the caller holds the returned
+    /// lease until the clone exits. A live VM's directory is released either way, so that
+    /// VM's teardown is not held up. Everything released here is removed if it was only a
+    /// mountpoint and no other lease holds it.
+    pub fn after_load(mut self, vsock_through_redirect: bool) -> Option<MountTargetLease> {
+        if !vsock_through_redirect {
+            return None;
+        }
+        let (kept, released): (Vec<_>, Vec<_>) =
+            self.dirs.drain(..).partition(|dir| dir.mountpoint_only);
+        drop(MountTargetLease { dirs: released });
+        (!kept.is_empty()).then_some(MountTargetLease { dirs: kept })
+    }
+}
+
+impl Drop for MountTargetLease {
+    fn drop(&mut self) {
+        for dir in self.dirs.drain(..) {
+            remove_if_unused(dir);
+        }
+    }
+}
+
+/// Remove `dir` if it was leased as a bare mountpoint, no other lease holds it, and it is
+/// still that directory and still empty. Never waits: a directory another lease holds is
+/// left to whichever lease ends last.
+fn remove_if_unused(dir: LeasedDir) {
+    if !dir.mountpoint_only || fs2::FileExt::try_lock_exclusive(&dir.file).is_err() {
+        return;
+    }
+    let same = match (dir.file.metadata(), std::fs::metadata(&dir.path)) {
+        (Ok(locked), Ok(named)) => (locked.dev(), locked.ino()) == (named.dev(), named.ino()),
+        _ => false,
+    };
+    let empty =
+        same && std::fs::read_dir(&dir.path).is_ok_and(|mut entries| entries.next().is_none());
+    if !empty {
+        return;
+    }
+    match std::fs::remove_dir(&dir.path) {
+        Ok(()) => debug!(dir = %dir.path.display(), "removed a recreated mount target"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn!(
+            dir = %dir.path.display(),
+            error = %error,
+            "could not remove a recreated mount target"
+        ),
+    }
 }
 
 /// Lease every directory in `dirs`, creating any that is missing (a mount target must
 /// exist).
 pub async fn lease_mount_targets(dirs: &[PathBuf]) -> Result<MountTargetLease> {
-    let mut held = Vec::with_capacity(dirs.len());
+    let mut held = MountTargetLease {
+        dirs: Vec::with_capacity(dirs.len()),
+    };
     for dir in dirs {
-        held.push(lease_one(dir).await?);
+        let file = lease_one(dir).await?;
+        let mountpoint_only = std::fs::read_dir(dir)
+            .with_context(|| format!("reading mount target {}", dir.display()))?
+            .next()
+            .is_none();
+        held.dirs.push(LeasedDir {
+            path: dir.clone(),
+            file,
+            mountpoint_only,
+        });
     }
-    Ok(MountTargetLease { _dirs: held })
+    Ok(held)
 }
 
 async fn lease_one(dir: &Path) -> Result<std::fs::File> {
@@ -202,6 +287,72 @@ mod tests {
         remove_runtime_dir(&source).await.unwrap();
     }
 
+    /// A restore of a snapshot whose VM is gone recreates the VM's directory as a
+    /// mountpoint. The lease that ends last removes it; until then it stays, because
+    /// another restore may still have to open its disks through it.
+    ///
+    /// RED BEFORE THE FIX (issue 1187): nothing removed a recreated directory.
+    #[tokio::test]
+    async fn the_last_lease_on_a_recreated_mount_target_removes_it() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let first = lease_mount_targets(std::slice::from_ref(&source))
+            .await
+            .unwrap();
+        let second = lease_mount_targets(std::slice::from_ref(&source))
+            .await
+            .unwrap();
+        assert!(first.after_load(false).is_none());
+        assert!(source.is_dir(), "removed while another lease held it");
+        drop(second);
+        assert!(
+            !source.exists(),
+            "the last lease left the recreated directory"
+        );
+    }
+
+    /// A VMM that reaches its vsock socket through the redirect keeps a recreated
+    /// directory for its life, so a clone that no longer needs it cannot remove it
+    /// first; its own exit removes it.
+    #[tokio::test]
+    async fn a_clone_with_vsock_through_the_redirect_keeps_the_recreated_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let redirected = lease_mount_targets(std::slice::from_ref(&source))
+            .await
+            .unwrap()
+            .after_load(true)
+            .expect("a recreated directory is kept by a clone that needs the redirect");
+        let overridden = lease_mount_targets(std::slice::from_ref(&source))
+            .await
+            .unwrap();
+        assert!(overridden.after_load(false).is_none());
+        assert!(
+            source.is_dir(),
+            "removed under a clone that still resolves through it"
+        );
+        drop(redirected);
+        assert!(!source.exists());
+    }
+
+    /// A live VM's directory holds its disks. A lease never removes it, and a clone
+    /// that needs the redirect for vsock does not keep it, so its VM's teardown is
+    /// not held up.
+    #[tokio::test]
+    async fn a_lease_never_removes_or_keeps_a_live_vm_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir_all(source.join("disks")).unwrap();
+        let lease = lease_mount_targets(std::slice::from_ref(&source))
+            .await
+            .unwrap();
+        assert!(lease.after_load(true).is_none());
+        assert!(source.join("disks").is_dir());
+        // Released: the teardown's exclusive lock is free.
+        let teardown = std::fs::File::open(&source).unwrap();
+        fs2::FileExt::try_lock_exclusive(&teardown).unwrap();
+    }
+
     /// `create_dir_all` answers `mkdir`'s EEXIST by checking that the path is a
     /// directory, and returns AlreadyExists when a teardown removed it in between.
     #[tokio::test]
@@ -249,7 +400,7 @@ mod tests {
             .unwrap();
         // The removed directory's inode number can be reused for the new one, so compare
         // the link count: a removed directory has none.
-        let leased = lease._dirs[0].metadata().unwrap();
+        let leased = lease.dirs[0].file.metadata().unwrap();
         assert!(leased.nlink() > 0, "the lease holds a removed directory");
         assert_eq!(leased.ino(), ino(&source));
     }

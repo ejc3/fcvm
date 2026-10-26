@@ -754,6 +754,30 @@ pub struct NamespaceParams {
     pub mount_redirects: Option<Vec<(std::path::PathBuf, std::path::PathBuf)>>,
 }
 
+/// Create the host-side directories the mount redirects bind over. The baseline VMs may
+/// have been cleaned up, but the directories must be present as mount targets.
+///
+/// A nested mountpoint (inside an earlier pair's mountpoint) resolves inside that pair's
+/// SOURCE at mount time, and the caller creates its backing directory there, so it is
+/// not created on the host. Creating it there left `<source>/disks` inside a recreated
+/// source directory, which then never read as empty and was never removed
+/// (`storage::runtime_dir`, issue 1187).
+fn create_mount_targets(
+    redirects: &[(std::path::PathBuf, std::path::PathBuf)],
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    for (index, (mountpoint, _)) in redirects.iter().enumerate() {
+        let nested = redirects[..index]
+            .iter()
+            .any(|(earlier, _)| mountpoint != earlier && mountpoint.starts_with(earlier));
+        if !nested && !mountpoint.exists() {
+            std::fs::create_dir_all(mountpoint)
+                .context("creating mountpoint directory for mount redirect")?;
+        }
+    }
+    Ok(())
+}
+
 /// Install `pre_exec` hooks on a VMM command that (1) enter the configured user/mount/network
 /// namespaces and apply the clone mount redirects, and (2) set `PR_SET_PDEATHSIG=SIGKILL` so
 /// the VMM dies with fcvm. Shared by the Firecracker and Cloud Hypervisor backends so both
@@ -772,18 +796,8 @@ pub fn install_namespace_pre_exec(
     let user_ns_path_clone = ns.user_namespace_path.clone();
     let net_ns_path_clone = ns.net_namespace_path.clone();
 
-    // Ensure mountpoint directories exist for the bind mounts. The baseline VMs may
-    // have been cleaned up, but the directories must be present as mount targets.
-    // A nested mountpoint (inside an earlier pair's mount) resolves inside that
-    // pair's SOURCE at mount time; its backing directory there is the caller's
-    // responsibility — creating the host-side path here is harmless either way.
     if let Some(ref redirects) = mount_redirects_clone {
-        for (mountpoint, _) in redirects {
-            if !mountpoint.exists() {
-                std::fs::create_dir_all(mountpoint)
-                    .context("creating mountpoint directory for mount redirect")?;
-            }
-        }
+        create_mount_targets(redirects)?;
     }
 
     if ns_id_clone.is_some()
@@ -945,6 +959,28 @@ pub fn install_namespace_pre_exec(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clone with its own vsock directory binds `<source>` to that directory and
+    /// `<source>/disks` back to its disks. The nested mountpoint resolves inside the
+    /// vsock directory, so only `<source>` is created on the host, and a recreated
+    /// source directory stays empty for its last lease to remove.
+    ///
+    /// RED BEFORE THE FIX (issue 1187): `<source>/disks` was created on the host.
+    #[test]
+    fn a_nested_mount_target_is_not_created_on_the_host() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let redirects = vec![
+            (source.clone(), root.path().join("vsock-dir")),
+            (
+                source.join("disks"),
+                root.path().join("clone").join("disks"),
+            ),
+        ];
+        create_mount_targets(&redirects).unwrap();
+        assert!(source.is_dir());
+        assert_eq!(std::fs::read_dir(&source).unwrap().count(), 0);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn wait_for_stderr_eof_waits_for_delayed_bulk_output() {

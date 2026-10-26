@@ -2536,3 +2536,153 @@ async fn test_lifecycle_interleave_source_teardown_waits_for_clone_disk_open() -
     );
     Ok(())
 }
+
+/// A restore of a snapshot whose source VM is gone recreates the source's runtime
+/// directory as a mountpoint for its disk redirect (issue 1187). Once the clone's VMM
+/// has opened its disks through it, and its Firecracker takes the vsock override
+/// (1.16.0 and later), nothing needs it, so the restore removes it. An older
+/// Firecracker resolves its vsock socket through the redirect for its whole life, so
+/// the directory stays until the clone exits. Either way none is left behind.
+///
+/// RED BEFORE THE FIX: the recreated directory outlived the clone.
+#[tokio::test]
+async fn test_lifecycle_interleave_restore_removes_a_recreated_source_dir() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("ilv-recreated");
+    let mut clone: Option<(tokio::process::Child, PinnedProcess)> = None;
+    let mut snapshot_created = false;
+
+    let exercise: Result<()> = async {
+        let (mut baseline_child, baseline_pid, _) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &baseline_name,
+                "--network",
+                "rootless",
+                "--no-snapshot",
+                common::TEST_IMAGE,
+            ],
+            &[],
+        )
+        .await
+        .context("spawning rootless baseline")?;
+        let baseline_process =
+            PinnedProcess::capture(baseline_pid).context("pinning rootless baseline")?;
+        let seeded: Result<PathBuf> = async {
+            common::poll_health_by_pid(baseline_pid, 180).await?;
+            let dir = artifacts_for_name(&baseline_name)?
+                .context("baseline published no state")?
+                .data_dir;
+            common::create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;
+            Ok(dir)
+        }
+        .await;
+        snapshot_created = seeded.is_ok();
+        stop_test_child(&mut baseline_child, &baseline_process)
+            .await
+            .context("stopping the baseline")?;
+        let baseline_dir = seeded.context("snapshotting the baseline")?;
+        anyhow::ensure!(
+            !baseline_dir.exists(),
+            "the baseline's teardown left {}",
+            baseline_dir.display()
+        );
+
+        let (clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snapshot_name,
+                "--name",
+                &clone_name,
+            ],
+            &[],
+        )
+        .await
+        .context("spawning the clone")?;
+        let clone_process = PinnedProcess::capture(clone_pid).context("pinning the clone")?;
+        clone = Some((clone_child, clone_process));
+        let (clone_child, _) = clone.as_mut().context("clone fixture disappeared")?;
+        common::poll_health(clone_child, 180)
+            .await
+            .with_context(|| {
+                format!(
+                    "the clone did not become healthy; log tail:\n{}",
+                    log_tail(&clone_log, 60)
+                )
+            })?;
+        let firecracker = ls_vm_by_pid(clone_pid)
+            .await?
+            .and_then(|state| state.config.firecracker_bin)
+            .context("the clone recorded no Firecracker binary")?;
+        let version = std::process::Command::new(&firecracker)
+            .arg("--version")
+            .output()
+            .with_context(|| format!("running {} --version", firecracker.display()))?;
+        let version = String::from_utf8_lossy(&version.stdout).to_string();
+        let word = version
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix('v'))
+            .with_context(|| format!("no version in {version:?}"))?;
+        let (release, prerelease) = match word.split_once('-') {
+            Some((release, _)) => (release, true),
+            None => (word, false),
+        };
+        let numbers: Vec<u32> = release
+            .split('.')
+            .map(|part| part.parse().context("parsing the Firecracker version"))
+            .collect::<Result<_>>()?;
+        // The rule restore applies (`FirecrackerVersion::at_least`): a pre-release of
+        // 1.16.0 can predate the override, so it counts as older.
+        let min = [1u32, 16, 0];
+        let overrides_vsock =
+            numbers.as_slice() > min.as_slice() || (numbers.as_slice() == min && !prerelease);
+        anyhow::ensure!(
+            baseline_dir.exists() != overrides_vsock,
+            "Firecracker {} (vsock override: {overrides_vsock}): the source directory the \
+             restore recreated is {} while the clone runs; log tail:\n{}",
+            version.trim(),
+            if baseline_dir.exists() {
+                "present"
+            } else {
+                "gone"
+            },
+            log_tail(&clone_log, 40)
+        );
+        let (clone_child, clone_process) = clone.as_mut().context("clone fixture disappeared")?;
+        stop_test_child(clone_child, clone_process)
+            .await
+            .context("stopping the clone")?;
+        clone = None;
+        anyhow::ensure!(
+            !baseline_dir.exists(),
+            "the restore left the source directory it recreated: {}",
+            baseline_dir.display()
+        );
+        Ok(())
+    }
+    .await;
+
+    let mut cleanup_errors = Vec::new();
+    let mut clone_stopped = true;
+    if let Some((child, process)) = clone.as_mut() {
+        if let Err(error) = stop_test_child(child, process).await {
+            clone_stopped = false;
+            cleanup_errors.push(format!("stopping clone: {error:#}"));
+        }
+    }
+    if snapshot_created && clone_stopped {
+        if let Err(error) = common::delete_snapshot(&snapshot_name).await {
+            cleanup_errors.push(format!("deleting snapshot {snapshot_name}: {error:#}"));
+        }
+    }
+    exercise?;
+    anyhow::ensure!(
+        cleanup_errors.is_empty(),
+        "fixture cleanup failed:\n- {}",
+        cleanup_errors.join("\n- ")
+    );
+    Ok(())
+}

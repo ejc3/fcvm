@@ -3308,6 +3308,15 @@ pub(crate) fn new_restore_epoch() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// What a restore hands its caller: the VMM backend, the rootless namespace holder,
+/// and the part of the mount-target lease the VMM needs for its whole life
+/// (`storage::runtime_dir::MountTargetLease::after_load`).
+pub type RestoredVmm<B> = (
+    B,
+    Option<tokio::process::Child>,
+    Option<crate::storage::runtime_dir::MountTargetLease>,
+);
+
 /// Restore a VM from a snapshot.
 ///
 /// This is the core snapshot restore logic shared by:
@@ -3322,7 +3331,7 @@ pub async fn restore_from_snapshot(
     network: &mut dyn NetworkManager,
     state_manager: &StateManager,
     vm_state: &mut VmState,
-) -> Result<(FirecrackerBackend, Option<tokio::process::Child>)> {
+) -> Result<RestoredVmm<FirecrackerBackend>> {
     let RestoreParams {
         vm_id,
         vm_name,
@@ -3380,6 +3389,7 @@ pub async fn restore_from_snapshot(
     let rootfs_path = substrate.rootfs_path;
     let holder_pid_for_post_start = substrate.holder_pid_for_post_start;
     let mut mount_target_lease = Some(substrate.mount_target_lease);
+    let mut vsock_redirect_lease = None;
 
     let fc_log_path = data_dir.join("firecracker.log");
     let mut vm_manager = VmManager::new(
@@ -3507,8 +3517,11 @@ pub async fn restore_from_snapshot(
                 }
             })?;
         let load_duration = load_start.elapsed();
-        // The load opened every disk at its source path, so the source VMs may go.
-        drop(mount_target_lease.take());
+        // The load opened every disk at its source path, so the source VMs may go. A
+        // VMM without the vsock override keeps resolving its socket through the redirect.
+        vsock_redirect_lease = mount_target_lease
+            .take()
+            .and_then(|lease| lease.after_load(vsock_override.is_none()));
         info!(
             duration_ms = load_duration.as_millis(),
             track_dirty_pages, "snapshot load completed"
@@ -3723,6 +3736,7 @@ pub async fn restore_from_snapshot(
     Ok((
         FirecrackerBackend::from_vm_manager(vm_manager),
         holder_child,
+        vsock_redirect_lease,
     ))
 }
 
@@ -3746,10 +3760,7 @@ pub async fn restore_from_snapshot_ch(
     network: &mut dyn NetworkManager,
     state_manager: &StateManager,
     vm_state: &mut VmState,
-) -> Result<(
-    crate::hypervisor::cloud_hypervisor::CloudHypervisorBackend,
-    Option<tokio::process::Child>,
-)> {
+) -> Result<RestoredVmm<crate::hypervisor::cloud_hypervisor::CloudHypervisorBackend>> {
     use crate::hypervisor::cloud_hypervisor::CloudHypervisorBackend;
     use crate::hypervisor::{Hypervisor, ProcessSpec};
 
@@ -3911,6 +3922,7 @@ pub async fn restore_from_snapshot_ch(
 
     let mut holder_child = substrate.holder_child.take();
     let mut mount_target_lease = Some(substrate.mount_target_lease);
+    let mut vsock_redirect_lease = None;
     // Everything after spawn runs in a fallible block so a failure kills the CH process
     // (callers may fall back to a fresh boot, so a half-restored process must not leak).
     let post_start = async {
@@ -3931,7 +3943,10 @@ pub async fn restore_from_snapshot_ch(
             .await
             .context("resuming Cloud Hypervisor after restore")?;
         // The restore opened every disk at its source path, so the source VMs may go.
-        drop(mount_target_lease.take());
+        // Cloud Hypervisor keeps resolving its vsock socket through the redirect.
+        vsock_redirect_lease = mount_target_lease
+            .take()
+            .and_then(|lease| lease.after_load(true));
 
         vm_state.pid = Some(std::process::id());
         // Future snapshots of this clone must redirect using the original vsock vm_id.
@@ -3976,7 +3991,7 @@ pub async fn restore_from_snapshot_ch(
         return Err(e);
     }
 
-    Ok((backend, holder_child))
+    Ok((backend, holder_child, vsock_redirect_lease))
 }
 
 /// Core snapshot creation logic with automatic diff snapshot support.
