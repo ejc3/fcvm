@@ -382,6 +382,9 @@ def reduce_net_trace(events: list, load_ts, drain_ms: float) -> dict:
     """
     rows: dict = {}
     order: list = []
+    # CDP allows requestWillBeSentExtraInfo to arrive before its
+    # requestWillBeSent; remember those ids and apply them when the row is made.
+    sent_early: set = set()
     for event in events:
         method = event.get("method", "")
         params = event.get("params", {})
@@ -389,6 +392,9 @@ def reduce_net_trace(events: list, load_ts, drain_ms: float) -> dict:
         if not method.startswith("Network.") or rid is None:
             continue
         row = rows.get(rid)
+        if method == "Network.requestWillBeSentExtraInfo" and row is None:
+            sent_early.add(rid)
+            continue
         if method == "Network.requestWillBeSent":
             if row is None:
                 rows[rid] = {
@@ -416,7 +422,7 @@ def reduce_net_trace(events: list, load_ts, drain_ms: float) -> dict:
                     # row that failed with no response never left the browser
                     # process; with it the request may have reached a server
                     # even though no response (and so no address) arrived.
-                    "sent_to_network": False,
+                    "sent_to_network": rid in sent_early,
                 }
                 order.append(rid)
             else:

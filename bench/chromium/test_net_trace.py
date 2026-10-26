@@ -426,6 +426,26 @@ class NetTraceRecorded(unittest.TestCase):
             {url: (row["canceled"], row["sent_to_network"]) for url, row in rows.items()},
             {"http://replay.test/frame": (True, False), "http://replay.test/sent": (True, True)})
 
+    def test_a_sending_event_that_arrives_before_the_request_is_announced_counts(self):
+        """CDP permits requestWillBeSentExtraInfo before requestWillBeSent for
+        the same request. Dropping it left sent_to_network false on a request
+        the network service had begun sending, which the diag then exempted
+        (Codex on #1347).
+
+        Red: the row said sent_to_network False.
+        """
+        events = [
+            {"method": "Network.requestWillBeSentExtraInfo",
+             "params": {"requestId": "r1", "headers": {}}},
+            request_will_be_sent("r1", "http://replay.test/early", 1000.000),
+            {"method": "Network.loadingFailed",
+             "params": {"requestId": "r1", "timestamp": 1000.003,
+                        "errorText": "net::ERR_ABORTED", "canceled": True}},
+            load_event_fired(1000.200),
+        ]
+        row = cdpdrive.reduce_net_trace(events, 1000.200, 100.0)["requests"][0]
+        self.assertIs(row["sent_to_network"], True)
+
     def test_pending_at_load_lists_at_most_ten_rows_in_start_order(self):
         """Twelve requests open at the load event: the list names the ten
         that started first, and the count still says twelve.
