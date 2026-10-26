@@ -153,7 +153,7 @@ fn hosts_joining_one_by_one_retile_every_n_up_to_max_tiles() {
         );
         let v = view(&s);
         assert_eq!(v.fleet.n, (110 - i as usize).min(100));
-        if let Some(first) = v.tiles.first() {
+        if let Some(first) = v.tiles.iter().find(|t| t.half == Half::Fcvm) {
             assert_eq!(
                 first.slot.as_deref(),
                 Some(format!("slot-{}", i + 1).as_str())
@@ -329,4 +329,211 @@ fn a_host_that_comes_up_after_the_fleet_is_awake_still_records_its_wake() {
     }
     s = apply(s, &again);
     assert_eq!(host(&s).agent_at, Some(230000));
+}
+
+/// Config defaults with `overrides` merged in by name.
+fn config_with(overrides: serde_json::Value) -> Config {
+    let mut base = serde_json::to_value(Config::default()).unwrap();
+    for (k, v) in overrides.as_object().unwrap() {
+        base[k] = v.clone();
+    }
+    serde_json::from_value(base).unwrap()
+}
+
+fn events(v: serde_json::Value) -> Vec<Event> {
+    serde_json::from_value(v).unwrap()
+}
+
+fn half(x: f64) -> Option<Rect> {
+    Some(Rect {
+        x,
+        y: 0.0,
+        w: 0.5,
+        h: 1.0,
+    })
+}
+
+/// A race darkens every tile: the fcvm VMs stop and restore, the EC2 instances are
+/// replaced. Both sides keep their configured widths and every tile keeps its place, so
+/// the wall does not re-tile mid-race and the dark tiles stay where viewers see them.
+#[test]
+fn a_race_that_darkens_every_tile_keeps_both_sides_and_every_place() {
+    let config = config_with(serde_json::json!({"ec2_max": 2, "fcvm_tiles": 2}));
+    let mut s = State::new(config, 0);
+    let mut setup = vec![hello(1000, "h1", 2)];
+    setup.push(running(1100, "h1", "slot-1"));
+    setup.push(running(1200, "h1", "slot-2"));
+    setup.extend(events(serde_json::json!([
+        {"type": "ec2", "at": 1300, "report": {"id": "ec2-1", "phase": "running", "generation": 1, "vm": "instance-1", "frame_url": "ws://ec2-1.example:443/frames", "timings": {}}},
+        {"type": "ec2", "at": 1400, "report": {"id": "ec2-2", "phase": "running", "generation": 1, "vm": "instance-2", "frame_url": "ws://ec2-2.example:443/frames", "timings": {}}},
+    ])));
+    for e in &setup {
+        s = apply(s, e);
+    }
+    let before = view(&s);
+    assert_eq!(before.layout.fcvm, half(0.0));
+    assert_eq!(before.layout.ec2, half(0.5));
+    let places = |v: &fleet_core::view::View| -> Vec<(String, Rect)> {
+        v.tiles.iter().map(|t| (t.id.clone(), t.rect)).collect()
+    };
+    assert_eq!(before.tiles.len(), 4);
+    let race = events(serde_json::json!([
+        {"type": "intent", "at": 2000, "viewer": "v1", "id": "ra", "name": "restart_now", "args": {}},
+        {"type": "agent", "at": 2100, "host": "h1", "msg": {"type": "slot", "id": "slot-1", "phase": "stopping", "generation": 2}},
+        {"type": "agent", "at": 2100, "host": "h1", "msg": {"type": "slot", "id": "slot-2", "phase": "restoring", "generation": 2}},
+        {"type": "ec2", "at": 2200, "report": {"id": "ec2-1", "phase": "launching", "generation": 2, "vm": null, "frame_url": null, "timings": {}}},
+        {"type": "ec2", "at": 2300, "report": {"id": "ec2-2", "phase": "waiting_capacity", "generation": 2, "vm": null, "frame_url": null, "timings": {}}},
+    ]));
+    for e in &race {
+        s = apply(s, e);
+        let v = view(&s);
+        assert_eq!(
+            v.layout.generation, before.layout.generation,
+            "re-tiled mid-race"
+        );
+        assert_eq!(v.layout.fcvm, half(0.0));
+        assert_eq!(v.layout.ec2, half(0.5));
+        assert_eq!(places(&v), places(&before));
+        check_layout(&s);
+    }
+    let v = view(&s);
+    assert!(
+        v.tiles.iter().all(|t| t.phase != "running"),
+        "every tile is dark"
+    );
+    let ec2: Vec<_> = v.tiles.iter().filter(|t| t.half == Half::Ec2).collect();
+    assert_eq!(
+        ec2.iter()
+            .map(|t| (t.slot.as_deref(), t.phase.as_str(), t.frame_url.is_none()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some("ec2-1"), "launching", true),
+            (Some("ec2-2"), "waiting_capacity", true)
+        ]
+    );
+}
+
+/// A side with no live GPU still holds its configured half, as dark tiles with no slot and
+/// no stream: before the fcvm host has said hello, and after it has gone.
+#[test]
+fn a_side_with_no_live_gpu_still_holds_its_half_as_dark_tiles() {
+    let config = config_with(serde_json::json!({"ec2_max": 2, "fcvm_tiles": 2}));
+    let mut s = State::new(config, 0);
+    for e in events(serde_json::json!([
+        {"type": "ec2", "at": 1300, "report": {"id": "ec2-1", "phase": "running", "generation": 1, "vm": "instance-1", "frame_url": "ws://ec2-1.example:443/frames", "timings": {}}},
+        {"type": "ec2", "at": 1400, "report": {"id": "ec2-2", "phase": "running", "generation": 1, "vm": "instance-2", "frame_url": "ws://ec2-2.example:443/frames", "timings": {}}},
+    ])) {
+        s = apply(s, &e);
+    }
+    let dark = |s: &State| {
+        let v = view(s);
+        assert_eq!(v.layout.fcvm, half(0.0));
+        assert_eq!(v.layout.ec2, half(0.5));
+        check_layout(s);
+        v.tiles
+            .iter()
+            .filter(|t| t.half == Half::Fcvm)
+            .map(|t| {
+                (
+                    t.id.clone(),
+                    t.phase.clone(),
+                    t.slot.clone(),
+                    t.frame_url.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let empty = |k: usize| {
+        (
+            format!("fcvm:{k}"),
+            "waiting_capacity".to_string(),
+            None,
+            None,
+        )
+    };
+    assert_eq!(
+        dark(&s),
+        vec![empty(1), empty(2)],
+        "before the host's hello"
+    );
+    let generation = view(&s).layout.generation;
+    s = apply(s, &hello(2000, "h1", 2));
+    s = apply(s, &running(2100, "h1", "slot-1"));
+    s = apply(s, &running(2200, "h1", "slot-2"));
+    assert!(view(&s)
+        .tiles
+        .iter()
+        .filter(|t| t.half == Half::Fcvm)
+        .all(|t| t.slot.is_some()));
+    s = apply(
+        s,
+        &Event::AgentGone {
+            at: 3000,
+            host: "h1".into(),
+        },
+    );
+    assert_eq!(
+        dark(&s),
+        vec![empty(1), empty(2)],
+        "after the host has gone"
+    );
+    assert!(view(&s).layout.generation > generation);
+}
+
+/// An EC2 tile without an instance holds its place but has no renderer to report a fit, so
+/// it does not hold back the grid budget of the tiles that render.
+#[test]
+fn an_ec2_tile_waiting_for_capacity_does_not_hold_back_the_budget() {
+    let config = config_with(serde_json::json!({"ec2_max": 2, "fcvm_tiles": 1}));
+    let mut s = State::new(config, 0);
+    let mut list = vec![hello(1000, "h1", 1)];
+    list.extend(events(serde_json::json!([
+        {"type": "agent", "at": 1100, "host": "h1", "msg": {"type": "slot", "id": "slot-1", "phase": "running", "generation": 1, "vm": "fleet-slot-1", "frame_url": "ws://h1:20001/frames", "timings": {}}},
+        {"type": "ec2", "at": 1300, "report": {"id": "ec2-1", "phase": "running", "generation": 1, "vm": "i-1", "frame_url": "wss://ec2-1.example/frames", "timings": {}}},
+        {"type": "ec2", "at": 1350, "report": {"id": "ec2-2", "phase": "waiting_capacity", "generation": 1, "vm": null, "frame_url": null, "timings": {}}},
+        {"type": "agent", "at": 1400, "host": "h1", "msg": {"type": "health", "id": "slot-1", "budget_fit": 2000000.0, "fps": 30.0, "gpu": null, "t": 10.0}},
+        {"type": "ec2_health", "at": 1500, "report": {"id": "ec2-1", "budget_fit": 1000000.0, "fps": 30.0, "gpu": null, "t": 10.1}},
+        {"type": "tick", "at": 2000},
+        {"type": "tick", "at": 4000},
+    ])));
+    for e in &list {
+        s = apply(s, e);
+    }
+    let v = view(&s);
+    assert_eq!(v.tiles.len(), 3);
+    assert!(
+        v.budget.is_some(),
+        "the budget waits on a tile with no renderer"
+    );
+}
+
+/// An EC2 place without an instance has no renderer: it is not a GPU of the wake that
+/// completes while it waits, and an EC2 tile still launching does not hold the image (and
+/// so the poster) as unsettled.
+#[test]
+fn an_ec2_place_without_an_instance_is_not_counted_as_a_live_gpu() {
+    let config = config_with(serde_json::json!({
+        "power_managed": true, "idle_scale_down_secs": 60, "ec2_max": 3
+    }));
+    let mut s = State::new(config, 0);
+    for e in events(serde_json::json!([
+        {"type": "viewer_joined", "at": 1000, "viewer": "v1", "client": "192.0.2.70"},
+        {"type": "visibility", "at": 1100, "viewer": "v1", "visible": false},
+        {"type": "tick", "at": 62000},
+        {"type": "visibility", "at": 100000, "viewer": "v1", "visible": true},
+        {"type": "ec2", "at": 110000, "report": {"id": "ec2-2", "phase": "waiting_capacity", "generation": 1, "vm": null, "frame_url": null, "timings": {}}},
+        {"type": "ec2", "at": 111000, "report": {"id": "ec2-3", "phase": "waiting_capacity", "generation": 1, "vm": null, "frame_url": null, "timings": {}}},
+        {"type": "ec2", "at": 150000, "report": {"id": "ec2-1", "phase": "running", "generation": 1, "vm": "instance-1", "frame_url": "ws://ec2-1.example:443/frames", "timings": {}}},
+    ])) {
+        s = apply(s, &e);
+    }
+    assert_eq!(s.fleet.power.state, "awake");
+    assert_eq!(s.fleet.power.wakes.back().map(|w| w.gpus), Some(1));
+    s = apply(
+        s,
+        &events(serde_json::json!([
+            {"type": "ec2", "at": 160000, "report": {"id": "ec2-2", "phase": "launching", "generation": 1, "vm": null, "frame_url": null, "timings": {}}},
+        ]))[0],
+    );
+    assert!(fleet_core::apply::image_settled(&s.fleet));
 }
