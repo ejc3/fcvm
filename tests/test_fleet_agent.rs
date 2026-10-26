@@ -1474,6 +1474,45 @@ async fn a_dialing_agent_reconnects_and_replays_its_state_without_restarting_vms
     task.abort();
 }
 
+/// `PutSecretValue` without a `ClientRequestToken` is refused by Secrets Manager (400
+/// InvalidRequestException: "You must provide a ClientRequestToken value"); the coordinator's
+/// certificate renewal stored nothing that way. Each put carries a fresh token.
+#[tokio::test]
+async fn a_stored_secret_version_carries_a_fresh_client_request_token() {
+    use fcvm::fleet::coord::secrets::Secrets;
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let tokens = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let t2 = tokens.clone();
+    let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap, body: String| {
+        let t2 = t2.clone();
+        async move {
+            assert_eq!(headers["x-amz-target"], "secretsmanager.PutSecretValue");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            match v["ClientRequestToken"].as_str() {
+                // The service's rule: 32 to 64 characters.
+                Some(t) if (32..=64).contains(&t.len()) => {
+                    t2.lock().unwrap().push(t.to_string());
+                    (axum::http::StatusCode::OK, axum::Json(serde_json::json!({"VersionId": t})))
+                }
+                _ => (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({"__type": "InvalidRequestException", "Message": "You must provide a ClientRequestToken value"})),
+                ),
+            }
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let secrets = Secrets::with_endpoint("us-east-2", &base).unwrap();
+    secrets.put("fcvm-fleet/tls-wildcard", "{}").await.unwrap();
+    secrets.put("fcvm-fleet/tls-wildcard", "{}").await.unwrap();
+    let t = tokens.lock().unwrap().clone();
+    assert_eq!(t.len(), 2);
+    assert_ne!(t[0], t[1], "each version needs its own token");
+}
+
 /// The renderers' certificate in the renderer's TLS interface: `tls.json` with `cert` and
 /// `key` from the secret (mode 0600), left alone while the secret is unchanged, replaced by
 /// a new file after a renewal; each VM gets the directory read-only, `TLS_CERT_FILE` and

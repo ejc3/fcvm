@@ -76,11 +76,17 @@ impl Secrets {
             .with_context(|| format!("secret {id} has no string value"))
     }
 
-    /// Store a new current version of the secret.
+    /// Store a new current version of the secret. The API requires a `ClientRequestToken`
+    /// (the SDKs fill it in; this client calls the API directly): a fresh one per call makes
+    /// each call a new version, and a retried request with the same token is not stored twice.
     pub async fn put(&self, id: &str, value: &str) -> Result<()> {
         self.call(
             "PutSecretValue",
-            serde_json::json!({ "SecretId": id, "SecretString": value }),
+            serde_json::json!({
+                "SecretId": id,
+                "SecretString": value,
+                "ClientRequestToken": uuid::Uuid::new_v4().to_string(),
+            }),
         )
         .await
         .map(|_| ())
