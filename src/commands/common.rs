@@ -7488,16 +7488,105 @@ mod tests {
         assert_eq!(config.metadata.firecracker_bin, None);
     }
 
+    /// Copy `sh` to `path`, run the copy, and return once the copy is running.
+    ///
+    /// `Command::spawn` returns before the child's /proc/<pid>/exe names `path`.
+    /// std spawns with posix_spawn, a CLONE_VM | CLONE_VFORK child running in this
+    /// process's memory map, and the kernel lets the parent go at the start of
+    /// exec_mmap (exec_mm_release), before it takes the old map's mmap lock and sets
+    /// the child's mm to the new one. A read of the child's exe link in that window
+    /// returns this test binary. Waiting for a line the copy prints itself puts the
+    /// read after the exec has finished. The copy keeps running until its stdin
+    /// closes or it is killed.
+    fn spawn_running_copy_of_sh(path: &Path) -> std::process::Child {
+        use std::io::BufRead;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::copy(which::which("sh").unwrap(), path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = std::process::Command::new(path)
+            .args(["-c", "echo running; read _"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(
+            line,
+            "running\n",
+            "the copy of sh at {} did not start",
+            path.display()
+        );
+        child
+    }
+
+    /// Threads that map and unmap memory contend for this process's mmap lock, which
+    /// a posix_spawn child takes after the parent is let go and before its exe link
+    /// names the new image. With spawn_running_copy_of_sh returning straight after
+    /// `Command::spawn`, without waiting for the copy's line, 19 and 4 of the 300
+    /// reads below named this test binary in two runs.
+    #[test]
+    fn a_running_copy_of_sh_names_its_own_image_under_mmap_lock_contention() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sh-copy.bin");
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let churn: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        // SAFETY: maps and unmaps a private anonymous region this
+                        // thread owns; nothing else refers to it.
+                        unsafe {
+                            let len = 1 << 20;
+                            let region = libc::mmap(
+                                std::ptr::null_mut(),
+                                len,
+                                libc::PROT_READ | libc::PROT_WRITE,
+                                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_POPULATE,
+                                -1,
+                                0,
+                            );
+                            assert_ne!(region, libc::MAP_FAILED);
+                            libc::munmap(region, len);
+                        }
+                    }
+                })
+            })
+            .collect();
+        let mut wrong = Vec::new();
+        for _ in 0..300 {
+            let mut child = spawn_running_copy_of_sh(&path);
+            let exe = std::fs::read_link(format!("/proc/{}/exe", child.id())).unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+            if exe != path {
+                wrong.push(exe);
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for thread in churn {
+            thread.join().unwrap();
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of 300 reads of the child's exe link did not name {}: {:?}",
+            wrong.len(),
+            path.display(),
+            wrong.first()
+        );
+    }
+
     /// A binary rebuilt at the same path while the VM runs: the path the state recorded
     /// at launch now names a different file than the one writing the snapshot.
     #[test]
     fn snapshot_records_no_firecracker_when_the_running_binary_was_replaced() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("firecracker-rebuilt.bin");
-        std::fs::copy(which::which("sleep").unwrap(), &path).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut process = std::process::Command::new(&path).arg("30").spawn().unwrap();
+        let mut process = spawn_running_copy_of_sh(&path);
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"a different build").unwrap();
         let mut state = make_vm_state("vm-rebuilt-under-it", None);
