@@ -907,6 +907,7 @@ mod tests {
                 view: PathBuf::from("/vm-disks"),
                 pairs: vec![(PathBuf::from("/base"), PathBuf::from("/clone"))],
                 keep: vec![],
+                keep_files: vec![],
             }),
             ..Default::default()
         });

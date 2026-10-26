@@ -2812,19 +2812,28 @@ fn build_clone_mount_redirects(
     Ok(redirects)
 }
 
-/// The directories directly inside `view`, sorted. Other entries (files) are no VM's.
+/// The directories directly inside `view`, sorted.
 fn view_entries(view: &Path) -> Result<Vec<PathBuf>> {
-    let mut dirs = Vec::new();
+    view_children(view, |kind| kind.is_dir())
+}
+
+/// The regular files directly inside `view`, sorted: a read-only `--disk` can sit there.
+fn view_files(view: &Path) -> Result<Vec<PathBuf>> {
+    view_children(view, |kind| kind.is_file())
+}
+
+fn view_children(view: &Path, wanted: fn(&std::fs::FileType) -> bool) -> Result<Vec<PathBuf>> {
+    let mut children = Vec::new();
     for entry in std::fs::read_dir(view)
         .with_context(|| format!("listing {} for the clone's mount view", view.display()))?
     {
         let entry = entry.with_context(|| format!("listing {}", view.display()))?;
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            dirs.push(entry.path());
+        if entry.file_type().is_ok_and(|kind| wanted(&kind)) {
+            children.push(entry.path());
         }
     }
-    dirs.sort();
-    Ok(dirs)
+    children.sort();
+    Ok(children)
 }
 
 /// The mount namespace for a clone's VMM: `pairs` (from [`build_clone_mount_redirects`])
@@ -2897,6 +2906,7 @@ fn clone_mount_view(
         view: view.to_path_buf(),
         pairs,
         keep,
+        keep_files: Vec::new(),
     })
 }
 
@@ -3313,7 +3323,10 @@ async fn prepare_clone_substrate(
     }
     let view = paths::data_dir().join("vm-disks");
     let redirects = match view_entries(&view).and_then(|entries| {
-        clone_mount_view(&view, redirects, data_dir, &vsock_target_dir, &entries)
+        let mut redirects =
+            clone_mount_view(&view, redirects, data_dir, &vsock_target_dir, &entries)?;
+        redirects.keep_files = view_files(&view)?;
+        Ok(redirects)
     }) {
         Ok(redirects) => redirects,
         Err(error) => {

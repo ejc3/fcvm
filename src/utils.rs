@@ -774,6 +774,9 @@ pub struct MountRedirects {
     /// still exists as the VMM starts: other VMs' directories, which their own teardowns
     /// can remove at any time.
     pub keep: Vec<std::path::PathBuf>,
+    /// Regular files directly inside `view` (a read-only `--disk` kept there), each bound
+    /// onto itself after `keep` when it still exists as the VMM starts.
+    pub keep_files: Vec<std::path::PathBuf>,
 }
 
 impl MountRedirects {
@@ -820,8 +823,33 @@ impl MountRedirects {
 /// or after it is opened and before it is bound, when the bind of the now unlinked
 /// directory fails with ENOENT. Measured in parallel clone runs before this was
 /// tolerated: a restore failed to spawn its VMM in 2 of 4 runs of the 40 clone tests.
-fn kept_dir_is_gone(optional: bool, error: nix::errno::Errno) -> bool {
+fn kept_entry_is_gone(optional: bool, error: nix::errno::Errno) -> bool {
     optional && error == nix::errno::Errno::ENOENT
+}
+
+/// Room for `/proc/self/fd/<fd>` and its NUL.
+const PROC_FD_PATH_LEN: usize = 32;
+
+/// `/proc/self/fd/<fd>`, written into `buf` without allocating (it runs in pre_exec).
+fn proc_fd_path(fd: std::os::fd::RawFd, buf: &mut [u8; PROC_FD_PATH_LEN]) -> &std::ffi::CStr {
+    const PREFIX: &[u8] = b"/proc/self/fd/";
+    buf.fill(0);
+    buf[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut digits = [0u8; 10];
+    let mut value = fd.unsigned_abs();
+    let mut len = 0;
+    loop {
+        digits[len] = b'0' + (value % 10) as u8;
+        len += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    for (at, digit) in digits[..len].iter().rev().enumerate() {
+        buf[PREFIX.len() + at] = *digit;
+    }
+    std::ffi::CStr::from_bytes_until_nul(buf).unwrap_or(c"/proc/self/fd")
 }
 
 /// Create the host-side directories the mount redirects bind over, which are the
@@ -942,11 +970,20 @@ pub fn install_namespace_pre_exec(
             // One slot per pair, filled in pre_exec without allocating.
             let source_fds: Vec<Option<std::os::fd::OwnedFd>> =
                 pair_cstrs.iter().map(|_| None).collect();
+            let file_cstrs: Vec<CString> = redirects
+                .keep_files
+                .iter()
+                .map(|file| cstring(file, "kept file"))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let file_fds: Vec<Option<std::os::fd::OwnedFd>> =
+                file_cstrs.iter().map(|_| None).collect();
             Some((
                 cstring(&redirects.view, "view")?,
                 view_dirs,
                 pair_cstrs,
                 source_fds,
+                file_cstrs,
+                file_fds,
             ))
         } else {
             None
@@ -978,8 +1015,14 @@ pub fn install_namespace_pre_exec(
                 }
 
                 // Step 1: Mount namespace for path redirects (before entering network ns).
-                if let Some((ref view_cstr, ref view_dirs, ref pair_cstrs, ref mut source_fds)) =
-                    mount_paths
+                if let Some((
+                    ref view_cstr,
+                    ref view_dirs,
+                    ref pair_cstrs,
+                    ref mut source_fds,
+                    ref file_cstrs,
+                    ref mut file_fds,
+                )) = mount_paths
                 {
                     unshare(CloneFlags::CLONE_NEWNS).map_err(std::io::Error::from)?;
                     // Make our mount namespace private so mounts don't propagate.
@@ -1000,7 +1043,18 @@ pub fn install_namespace_pre_exec(
                     {
                         match open(source_cstr.as_c_str(), o_path, Mode::empty()) {
                             Ok(fd) => *slot = Some(fd),
-                            Err(e) if kept_dir_is_gone(*optional, e) => {}
+                            Err(e) if kept_entry_is_gone(*optional, e) => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    for (slot, file_cstr) in file_fds.iter_mut().zip(file_cstrs.iter()) {
+                        match open(
+                            file_cstr.as_c_str(),
+                            OFlag::O_PATH | OFlag::O_CLOEXEC,
+                            Mode::empty(),
+                        ) {
+                            Ok(fd) => *slot = Some(fd),
+                            Err(e) if kept_entry_is_gone(true, e) => {}
                             Err(e) => return Err(e.into()),
                         }
                     }
@@ -1039,12 +1093,39 @@ pub fn install_namespace_pre_exec(
                             None::<&str>,
                         ) {
                             Ok(()) => {}
-                            Err(e) if kept_dir_is_gone(*optional, e) => {}
+                            Err(e) if kept_entry_is_gone(*optional, e) => {}
                             Err(e) => return Err(e.into()),
                         }
                     }
                     nix::unistd::fchdir(&cwd).map_err(std::io::Error::from)?;
-                    for slot in source_fds.iter_mut() {
+                    // A file cannot be the working directory, so a kept file is bound from
+                    // its descriptor's /proc/self/fd path onto an empty file in the tmpfs.
+                    for (file_cstr, fd) in file_cstrs.iter().zip(file_fds.iter()) {
+                        let Some(fd) = fd.as_ref() else {
+                            continue;
+                        };
+                        drop(
+                            open(
+                                file_cstr.as_c_str(),
+                                OFlag::O_CREAT | OFlag::O_WRONLY | OFlag::O_CLOEXEC,
+                                Mode::from_bits_truncate(0o644),
+                            )
+                            .map_err(std::io::Error::from)?,
+                        );
+                        let mut buf = [0u8; PROC_FD_PATH_LEN];
+                        match mount(
+                            Some(proc_fd_path(fd.as_raw_fd(), &mut buf)),
+                            file_cstr.as_c_str(),
+                            None::<&str>,
+                            MsFlags::MS_BIND,
+                            None::<&str>,
+                        ) {
+                            Ok(()) => {}
+                            Err(e) if kept_entry_is_gone(true, e) => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    for slot in source_fds.iter_mut().chain(file_fds.iter_mut()) {
                         *slot = None;
                     }
                 }
@@ -1103,6 +1184,7 @@ mod tests {
                 ),
             ],
             keep: vec![],
+            keep_files: vec![],
         };
         create_mount_targets(&redirects).unwrap();
         assert!(source.is_dir());
@@ -1113,15 +1195,26 @@ mod tests {
     /// on a pair, still stops the VMM. Binding a directory that was removed after it was
     /// opened fails with ENOENT, which the next test checks against the kernel.
     #[test]
-    fn only_a_gone_kept_directory_is_passed_over() {
-        use nix::errno::Errno;
-        assert!(kept_dir_is_gone(true, Errno::ENOENT));
-        assert!(!kept_dir_is_gone(false, Errno::ENOENT));
-        assert!(!kept_dir_is_gone(true, Errno::EACCES));
-        assert!(!kept_dir_is_gone(true, Errno::EINVAL));
+    fn proc_fd_paths_are_written_without_allocating() {
+        let mut buf = [0u8; PROC_FD_PATH_LEN];
+        assert_eq!(proc_fd_path(0, &mut buf), c"/proc/self/fd/0");
+        assert_eq!(proc_fd_path(1047, &mut buf), c"/proc/self/fd/1047");
+        assert_eq!(
+            proc_fd_path(i32::MAX, &mut buf),
+            c"/proc/self/fd/2147483647"
+        );
     }
 
-    /// The kernel behaviour kept_dir_is_gone relies on: a bind whose source is a directory
+    #[test]
+    fn only_a_gone_kept_directory_is_passed_over() {
+        use nix::errno::Errno;
+        assert!(kept_entry_is_gone(true, Errno::ENOENT));
+        assert!(!kept_entry_is_gone(false, Errno::ENOENT));
+        assert!(!kept_entry_is_gone(true, Errno::EACCES));
+        assert!(!kept_entry_is_gone(true, Errno::EINVAL));
+    }
+
+    /// The kernel behaviour kept_entry_is_gone relies on: a bind whose source is a directory
     /// that was removed after it was opened fails with ENOENT. Runs in a user and mount
     /// namespace of its own, in a child process.
     #[test]
@@ -1173,6 +1266,7 @@ mod tests {
                 PathBuf::from("/data/vm-disks/other"),
                 PathBuf::from("/data/vm-disks/source"),
             ],
+            keep_files: vec![],
         };
         assert_eq!(
             redirects.view_dirs(),
@@ -1207,6 +1301,8 @@ mod tests {
         let other = view.join("other");
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(other.join("marker"), "other\n").unwrap();
+        let disk = view.join("external.raw");
+        std::fs::write(&disk, "disk\n").unwrap();
 
         let mut holder = tokio::process::Command::new("unshare")
             .args([
@@ -1231,9 +1327,10 @@ mod tests {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c")
             .arg(format!(
-                "cat {0}; cat {1}; read _; cat {0} 2>/dev/null || echo gone",
+                "for f in {0} {1} {2}; do cat $f 2>/dev/null || echo missing; done; read _; cat {0} 2>/dev/null || echo gone",
                 marker.display(),
-                other.join("marker").display()
+                other.join("marker").display(),
+                disk.display()
             ))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1255,6 +1352,7 @@ mod tests {
                     // A VM directory that is gone by the time the child starts is
                     // passed over.
                     keep: vec![other.clone(), view.join("gone")],
+                    keep_files: vec![disk.clone(), view.join("gone.raw")],
                 }),
                 ..Default::default()
             },
@@ -1274,6 +1372,11 @@ mod tests {
             lines.next_line().await.unwrap().as_deref(),
             Some("other"),
             "the child does not see another directory of the view"
+        );
+        assert_eq!(
+            lines.next_line().await.unwrap().as_deref(),
+            Some("disk"),
+            "the child does not see a file kept in the view"
         );
 
         std::fs::remove_dir_all(&source).unwrap();
