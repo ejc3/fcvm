@@ -2920,8 +2920,29 @@ fn build_clone_mount_redirects(
     Ok(redirects)
 }
 
-/// The directories directly inside `view` that `snapshot_state` (vmstate.bin, or a Cloud
-/// Hypervisor config.json) names a path in, in the order they first appear.
+/// Every string in a Cloud Hypervisor config.json, NUL-separated, for
+/// [`view_dirs_named_in`]: the parsed values, so an escaped spelling of a path is read as
+/// the path it names.
+fn ch_config_strings(config: &serde_json::Value) -> Vec<u8> {
+    fn walk(value: &serde_json::Value, out: &mut Vec<u8>) {
+        match value {
+            serde_json::Value::String(text) => {
+                out.extend_from_slice(text.as_bytes());
+                out.push(0);
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
+            serde_json::Value::Object(fields) => fields.values().for_each(|item| walk(item, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(config, &mut out);
+    out
+}
+
+/// The directories directly inside `view` that `snapshot_state` (vmstate.bin, or the
+/// strings of a Cloud Hypervisor config.json) names a path in, in the order they first
+/// appear.
 fn view_dirs_named_in(snapshot_state: &[u8], view: &Path) -> Vec<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     let mut prefix = view.as_os_str().as_bytes().to_vec();
@@ -3231,8 +3252,8 @@ async fn prepare_clone_substrate(
     vm_state: &mut VmState,
     // What the snapshot load overrides, so needs no redirect.
     overrides: LoadOverrides,
-    // The snapshot's vmstate.bin (Firecracker) or config.json (Cloud Hypervisor), for the
-    // paths it names.
+    // The snapshot's vmstate.bin (Firecracker) or the strings of its config.json (Cloud
+    // Hypervisor, `ch_config_strings`), for the paths it names.
     snapshot_state: &[u8],
 ) -> Result<CloneSubstrate> {
     let vm_dir = data_dir.join("disks");
@@ -4082,7 +4103,7 @@ pub async fn restore_from_snapshot_ch(
         data_dir,
         vm_state,
         LoadOverrides::None,
-        &cfg_bytes,
+        &ch_config_strings(&cfg),
     )
     .await?;
 
@@ -6406,6 +6427,29 @@ mod tests {
                 ]
             ]
             .concat()
+        );
+    }
+
+    /// A Cloud Hypervisor config.json is read as JSON: a path spelled with escaped
+    /// slashes names the same directory as its plain spelling.
+    ///
+    /// RED BEFORE THE FIX: the raw config.json bytes were scanned, and the escaped
+    /// spelling named no directory.
+    #[test]
+    fn a_cloud_hypervisor_config_names_its_paths_as_json_strings() {
+        let view = Path::new("/data/vm-disks");
+        let config: serde_json::Value = serde_json::from_str(
+            r#"{"disks":[{"path":"/data/vm-disks/vm-source/disks/rootfs.raw"},
+                {"path":"\/data\/vm-disks\/vm-other\/disks\/data.raw","readonly":true}],
+                "vsock":{"cid":3,"socket":"/data/vm-disks/vm-source/vsock.sock"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            view_dirs_named_in(&ch_config_strings(&config), view),
+            vec![
+                PathBuf::from("/data/vm-disks/vm-source"),
+                PathBuf::from("/data/vm-disks/vm-other")
+            ]
         );
     }
 
