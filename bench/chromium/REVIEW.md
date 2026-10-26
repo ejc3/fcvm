@@ -238,9 +238,9 @@ change mid-run (sha256 in `hostinfo.json`).
 - **The ANGLE race** was not re-amplified in this run.
 - **The corpus open-loop throughput ceiling** is located in the replay server's listener
   (next section, #1159). Open: where the ceiling lies once the listener is out of the way
-  (4 guest vCPUs: between 4.2 and 5.6 requests per second per restore path with the
-  handshake in the handler thread, one run set each, and with the replay out of the path the
-  host passed 5.6 and collapsed at 8.4), and which stage is the next limit.
+  (4 guest vCPUs: the handshake-in-handler runs went to 4.2 per restore path, the static
+  page to 5.6; beyond that the harness's own limits end the runs first, see the section below), and which stage is
+  the next limit.
 - **Hugepage `minor` at 4K-equivalent page counts** — the hugepage win conflates page size with
   sharing mode; a 4K `minor` vs 2 MiB `minor` decomposition would separate them.
 - **Teardown** (175 ms, post-artifact) was not moved off the response path in this run.
@@ -485,18 +485,27 @@ before the replay's handler thread starts timing (`duration_ms` in the access lo
   scored requests among 1,960, 2,240 and 2,520 (a failed request fails its rate under the strict policy,
   and that run's analysis was refused for a 16.2% host-control drift), median navigation 322, 346 and
   392 ms, 38, 75 and 244 dropped connections. At 2 guest vCPUs the same setting had 4 failed of
-  2,520 at 4.2 and none of 1,680 at 2.8, and collapsed at 5.6 (1,065 of 3,360 completed, 267 drops).
+  2,520 at 4.2 and none of 1,680 at 2.8, and failed 2,295 of 3,360 requests at 5.6 (267 drops).
   Its 1.40 cell lost 62 requests in one burst (b0011) to the per-request Firecracker probe
   ("firecracker-def pid N is outside run cgroup", one line per thread of one clone), which is not a
   replay effect and is open.
 - **Replay out of the path** (one page the guest serves itself, `SCALE_URL_OVERRIDE`): 5.6 per path
-  completed 3,357 of 3,360 requests (median 502 ms against 423 ms at 1.40; 3 failures were the harness's
-  Firecracker-pid probe, not the host); 8.4 per path collapsed (151 of 504 completed in its first
-  burst). The host's own ceiling with this page is therefore between 5.6 and 8.4 per path, about 2
-  times the 4.2 the corpus reached with the handshake fix.
+  completed 3,357 of 3,360 requests (median 502 ms against 423 ms at 1.40; the 3 failures were the harness's
+  Firecracker-pid probe, not the host).
+- **Above about 4.2 per path the failures are the harness's own limits, not a host measurement.** Every
+  failed request at 5.6 with 2 vCPUs (2,021 "firecracker-def pid N is outside run cgroup", 976
+  `inotify_init1: Too many open files`) and at 8.4 and 6.5 with the page or the replay was one of those two
+  or a descriptor-exhaustion error. `reqbench.py` opens one inotify instance per request in flight, and
+  Ubuntu's `fs.inotify.max_user_instances` is 128. With it at 65,536 the static page again held 5.6
+  (669 ok, 3 failed) and at 8.4 completed 609 and failed 399 requests, 804 of the 805 failed requests at that
+  rate being the cgroup-membership probe (median 1.1 s); at 11.2 the driver ran out of file
+  descriptors. So the host's own ceiling is not established above 5.6 per path (static page) or 4.2 (corpus
+  with the handshake fix), and a rerun of the corpus arm with the sysctl raised stopped at its first burst
+  on a process left in a request's cgroup ("inter-burst cgroup membership is not quiescent").
 
-What this does not show: why the handler-placement run collapses between 4.2 and 5.6 (the accept thread is
-idle; at most 57 handler threads were running at 4.2 with 4 vCPUs, 149 at 5.6 with 2), whether the Python replay or the host side of pasta is
+What this does not show: what limits the corpus above 4.2 per path once the harness's inotify, descriptor and
+cgroup-probe limits are out of the way (the accept thread is idle; at most 57 handler threads were
+running at 4.2 with 4 vCPUs), whether the Python replay or the host side of pasta is
 the next limit, and what a page's navigation costs apart from the listener (with the listener fixed, 476 of 6,300
 scored requests in the 2.8-per-path run set took over 2 s navigation, and 460 of them are all 460
 requests for www.elmundo.es; the 5 s p95 of s13 is that page plus the listener's dropped connections). Every figure above is the 5 scored bursts of one

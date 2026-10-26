@@ -412,6 +412,11 @@ easy to get wrong:
   OCI runtime exit files directory: mkdir /run/user/1000: permission denied`. A user
   with no login session has no `XDG_RUNTIME_DIR`; `sudo -u <user>` does not create one.
   Fix is `loginctl enable-linger <user>`. Do not go looking for crun.
+- **Raise `fs.inotify.max_user_instances` before an open-loop run above about 4 requests per
+  second per path.** `reqbench.py` opens one inotify instance per request in flight and Ubuntu's
+  default is 128; the run then fails requests with `OSError: [Errno 24] inotify_init1 on
+  /mnt/fcvm-btrfs/state` and the failures look like a host ceiling (#1159). The same runs need a
+  descriptor limit well above 1024 in the driver.
 - **`fcvm setup` must have run, and `build` will not tell you.** Without the fc-agent
   initrd the golden phase dies one second in with `setting up fc-agent initrd:
   fc-agent initrd not found`, after `build` reported success — the two phases check
