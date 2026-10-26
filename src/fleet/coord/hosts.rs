@@ -645,9 +645,14 @@ pub struct AwsHosts {
     pub fleet: String,
     /// Per-region API base; default `https://ec2.<region>.amazonaws.com`.
     pub endpoints: BTreeMap<String, String>,
+    /// Each template's instance type, as its latest version says, and when it was read.
+    types: Mutex<HashMap<(String, String), (String, Instant)>>,
     chain: CredentialChain,
     http: reqwest::Client,
 }
+
+/// How long a template's instance type is reused before it is read again.
+const TEMPLATE_TYPE_TTL: Duration = Duration::from_secs(300);
 
 impl AwsHosts {
     pub fn new(templates: &[Regional], subnets: &[Regional], fleet: String) -> Result<Self> {
@@ -676,6 +681,7 @@ impl AwsHosts {
             subnets: s,
             fleet,
             endpoints: BTreeMap::new(),
+            types: Mutex::new(HashMap::new()),
             chain: CredentialChain::new()?,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
@@ -738,6 +744,38 @@ impl AwsHosts {
         ))
     }
 
+    /// The instance type of `template`'s latest version in `region`, read at most once per
+    /// `TEMPLATE_TYPE_TTL`.
+    async fn template_type(&self, region: &str, template: &str) -> Result<String> {
+        let key = (region.to_string(), template.to_string());
+        if let Some((ty, at)) = self.types.lock().unwrap().get(&key) {
+            if at.elapsed() < TEMPLATE_TYPE_TTL {
+                return Ok(ty.clone());
+            }
+        }
+        let xml = self
+            .call_ok(
+                region,
+                &[
+                    p("Action", "DescribeLaunchTemplateVersions"),
+                    p("LaunchTemplateName", template),
+                    p("LaunchTemplateVersion.1", "$Latest"),
+                ],
+            )
+            .await
+            .with_context(|| format!("reading launch template {template} in {region}"))?;
+        let ty = xml_tag(&xml, "instanceType")
+            .filter(|t| !t.is_empty())
+            .with_context(|| {
+                format!("launch template {template} in {region} names no instance type")
+            })?;
+        self.types
+            .lock()
+            .unwrap()
+            .insert(key, (ty.clone(), Instant::now()));
+        Ok(ty)
+    }
+
     async fn call_ok(&self, region: &str, params: &[(String, String)]) -> Result<String> {
         self.call(region, params)
             .await
@@ -750,9 +788,11 @@ fn p(k: impl Into<String>, v: impl Into<String>) -> (String, String) {
 }
 
 /// The `CreateFleet` (instant) parameters for `count` hosts in `market` over `templates` x
-/// `subnets`, tagged for `fleet`.
+/// `subnets`, tagged for `fleet`. `templates` pairs each template name with its instance
+/// type, which every override names: IAM checks `ec2:InstanceType` on the fleet's instances,
+/// and for `CreateFleet` it takes that key only from the request, not from the template.
 pub fn create_fleet_params(
-    templates: &[String],
+    templates: &[(String, String)],
     subnets: &[String],
     market: Market,
     count: u32,
@@ -791,7 +831,7 @@ pub fn create_fleet_params(
             ));
         }
     }
-    for (i, t) in templates.iter().enumerate() {
+    for (i, (t, ty)) in templates.iter().enumerate() {
         let c = format!("LaunchTemplateConfigs.{}", i + 1);
         v.push(p(
             format!("{c}.LaunchTemplateSpecification.LaunchTemplateName"),
@@ -803,6 +843,10 @@ pub fn create_fleet_params(
         ));
         for (j, s) in subnets.iter().enumerate() {
             v.push(p(format!("{c}.Overrides.{}.SubnetId", j + 1), s.as_str()));
+            v.push(p(
+                format!("{c}.Overrides.{}.InstanceType", j + 1),
+                ty.as_str(),
+            ));
         }
     }
     for (i, (k, val)) in [
@@ -935,7 +979,11 @@ impl HostDriver for AwsHosts {
             .subnets
             .get(region)
             .with_context(|| format!("no host subnet in {region}"))?;
-        let params = create_fleet_params(templates, subnets, market, count, &self.fleet, token);
+        let mut typed = Vec::with_capacity(templates.len());
+        for t in templates {
+            typed.push((t.clone(), self.template_type(region, t).await?));
+        }
+        let params = create_fleet_params(&typed, subnets, market, count, &self.fleet, token);
         match self.call(region, &params).await {
             Ok(xml) => Ok(parse_create_fleet(&xml)),
             // A request refused as a whole for capacity is a refusal like a per-pool one.
@@ -1148,7 +1196,10 @@ mod tests {
     #[test]
     fn create_fleet_asks_for_the_market_over_every_template_and_subnet() {
         let got = create_fleet_params(
-            &["tpl-a".into(), "tpl-b".into()],
+            &[
+                ("tpl-a".into(), "g4dn.metal".into()),
+                ("tpl-b".into(), "g5g.metal".into()),
+            ],
             &["subnet-1".into(), "subnet-2".into()],
             Market::Spot,
             2,
@@ -1180,11 +1231,19 @@ mod tests {
             get("LaunchTemplateConfigs.2.Overrides.2.SubnetId"),
             "subnet-2"
         );
+        assert_eq!(
+            get("LaunchTemplateConfigs.1.Overrides.2.InstanceType"),
+            "g4dn.metal"
+        );
+        assert_eq!(
+            get("LaunchTemplateConfigs.2.Overrides.1.InstanceType"),
+            "g5g.metal"
+        );
         assert_eq!(get("TagSpecification.1.ResourceType"), "instance");
         assert_eq!(get("TagSpecification.1.Tag.3.Key"), "Fleet");
         assert_eq!(get("TagSpecification.1.Tag.3.Value"), "stage");
         let od = create_fleet_params(
-            &["t".into()],
+            &[("t".into(), "g4dn.metal".into())],
             &["s".into()],
             Market::OnDemand,
             1,
