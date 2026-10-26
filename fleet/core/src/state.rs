@@ -230,9 +230,9 @@ pub struct Observed {
     pub v4_port: Option<u16>,
 }
 
-/// One launch's DNS names, written and confirmed at the zone's authoritative servers before
-/// they were published: `<label>.<zone>` (AAAA) and `<label>-v4.<zone>` (A). A label is
-/// made for one launch and never used again.
+/// One launch's DNS names in the coordinator's subzone, answered from the moment they are
+/// published: `<label>.<subzone>` (AAAA) and `<label>-v4.<subzone>` (A). A label is made for
+/// one launch (or one aggregator's addresses) and never used again.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Published {
     /// The launch (the slot's observed generation) the names belong to.

@@ -32,7 +32,7 @@ struct Opts {
     /// The EC2 aggregator as the coordinator reaches it.
     ec2_local: Option<String>,
     site_key: Option<String>,
-    /// How launches are named: tiles' and claims' frame URLs are then the published names.
+    /// The launch names' subzone: tiles' and claims' frame URLs are then the published names.
     dns: Option<fcvm::fleet::coord::Names>,
 }
 
@@ -765,24 +765,9 @@ async fn browser_intents_reach_the_agent_as_assignments() {
 /// tile's: the agent's own URL names a host that has no record.
 #[tokio::test]
 async fn a_claims_frame_urls_are_its_launchs_published_names() {
-    use fcvm::fleet::coord::dns::Cloudflare;
-    let cf = FakeCf::default();
-    let base = fake_cloudflare(cf.clone()).await;
-    let gate = GateConfirm {
-        open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        cf: cf.clone(),
-        asked_before_written: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    };
-    let writer = Cloudflare::with_endpoint(
-        "dns-token-for-tests".into(),
-        "fcvm.example".into(),
-        Some("zone-for-tests".into()),
-        &base,
-    )
-    .unwrap()
-    .with_confirm(Arc::new(gate));
+    let (names, zone) = subzone_names();
     let c = coordinator_with(Opts {
-        dns: Some(fcvm::fleet::coord::Names::Cloudflare(writer)),
+        dns: Some(names),
         ..Opts::default()
     })
     .await;
@@ -819,22 +804,18 @@ async fn a_claims_frame_urls_are_its_launchs_published_names() {
         .and_then(|u| u.strip_suffix("/frames"))
         .unwrap();
     assert!(
-        host.starts_with("slot-1-") && host.ends_with(".fcvm.example"),
+        host.starts_with("slot-1-") && host.ends_with(".tiles.fcvm.example"),
         "{claim}"
     );
     assert!(
-        cf.records
-            .lock()
-            .unwrap()
-            .values()
-            .any(|r| r["name"] == host),
+        zone.borrow().aaaa.contains_key(host),
         "the claim's URL names no record: {claim}"
     );
     assert_eq!(
         claim["frame_url_v4"],
         format!(
-            "wss://{}-v4.fcvm.example:20200/frames",
-            host.strip_suffix(".fcvm.example").unwrap()
+            "wss://{}-v4.tiles.fcvm.example:20200/frames",
+            host.strip_suffix(".tiles.fcvm.example").unwrap()
         )
     );
 }
@@ -2028,7 +2009,6 @@ async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
         power: tokio::sync::watch::channel(String::new()).0,
         scene: tokio::sync::watch::channel(None).0,
         budget: tokio::sync::watch::channel(None).0,
-        dns: None,
         zone: None,
         store: Some(tx),
     };
@@ -4053,550 +4033,6 @@ async fn the_aws_tile_driver_launches_waits_and_terminates() {
     }
 }
 
-/// A fake Cloudflare DNS API for one zone: records by id, and every write recorded.
-#[derive(Clone, Default)]
-struct FakeCf {
-    records: Arc<std::sync::Mutex<BTreeMap<String, Value>>>,
-    writes: Arc<std::sync::Mutex<Vec<String>>>,
-    next: Arc<std::sync::atomic::AtomicU64>,
-}
-
-async fn fake_cloudflare(cf: FakeCf) -> String {
-    use axum::extract::{Path, State as St};
-    use axum::routing::{get, put};
-    let app = axum::Router::new()
-        .route(
-            "/zones/{zid}/dns_records",
-            get(
-                |St(cf): St<FakeCf>, headers: axum::http::HeaderMap| async move {
-                    assert_eq!(headers["authorization"], "Bearer dns-token-for-tests");
-                    let all: Vec<Value> = cf.records.lock().unwrap().values().cloned().collect();
-                    axum::Json(
-                        json!({"success": true, "result": all, "result_info": {"total_pages": 1}}),
-                    )
-                },
-            )
-            .post(
-                |St(cf): St<FakeCf>, axum::Json(mut r): axum::Json<Value>| async move {
-                    let id = format!(
-                        "r{}",
-                        cf.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                    );
-                    r["id"] = json!(id);
-                    cf.writes.lock().unwrap().push(format!(
-                        "create {} {} {}",
-                        r["type"], r["name"], r["content"]
-                    ));
-                    cf.records.lock().unwrap().insert(id.clone(), r.clone());
-                    axum::Json(json!({"success": true, "result": r}))
-                },
-            ),
-        )
-        .route(
-            "/zones/{zid}/dns_records/{id}",
-            put(
-                |St(cf): St<FakeCf>,
-                 Path((_z, id)): Path<(String, String)>,
-                 axum::Json(mut r): axum::Json<Value>| async move {
-                    r["id"] = json!(id);
-                    cf.writes
-                        .lock()
-                        .unwrap()
-                        .push(format!("update {} {}", r["name"], r["content"]));
-                    cf.records.lock().unwrap().insert(id, r.clone());
-                    axum::Json(json!({"success": true, "result": r}))
-                },
-            )
-            .delete(
-                |St(cf): St<FakeCf>, Path((_z, id)): Path<(String, String)>| async move {
-                    let r = cf.records.lock().unwrap().remove(&id).unwrap();
-                    cf.writes
-                        .lock()
-                        .unwrap()
-                        .push(format!("delete {}", r["name"]));
-                    axum::Json(json!({"success": true, "result": {"id": id}}))
-                },
-            ),
-        )
-        .with_state(cf);
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", l.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
-    base
-}
-
-/// A confirmation the test opens: until it does, every launch's names count as not yet
-/// answering at the authoritative servers. It also checks, when asked, that the records it
-/// is asked about are already in the zone: confirmation comes after the write.
-#[derive(Clone)]
-struct GateConfirm {
-    open: Arc<std::sync::atomic::AtomicBool>,
-    cf: FakeCf,
-    asked_before_written: Arc<std::sync::atomic::AtomicBool>,
-}
-
-#[async_trait::async_trait]
-impl fcvm::fleet::coord::dns::Confirm for GateConfirm {
-    async fn confirmed(&self, records: &[fcvm::fleet::coord::dns::Record]) -> bool {
-        let zone = self.cf.records.lock().unwrap().clone();
-        for r in records {
-            if !zone
-                .values()
-                .any(|z| z["name"] == r.name.as_str() && z["content"] == r.content.as_str())
-            {
-                self.asked_before_written
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        self.open.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-struct DnsFixture {
-    cf: FakeCf,
-    gate: GateConfirm,
-    handle: Handle,
-    agent: FakeAgent,
-}
-
-async fn dns_fixture(pre: &[(&str, &str, &str)]) -> DnsFixture {
-    dns_fixture_with(pre, Config::default(), None).await
-}
-
-async fn dns_fixture_with(
-    pre: &[(&str, &str, &str)],
-    config: Config,
-    ec2: Option<Arc<dyn ec2::Ec2Driver>>,
-) -> DnsFixture {
-    use fcvm::fleet::coord::dns::Cloudflare;
-    let cf = FakeCf::default();
-    for (i, (kind, name, content)) in pre.iter().enumerate() {
-        cf.records.lock().unwrap().insert(
-            format!("pre{i}"),
-            json!({"id": format!("pre{i}"), "type": kind, "name": name, "content": content, "proxied": false}),
-        );
-    }
-    let base = fake_cloudflare(cf.clone()).await;
-    let gate = GateConfirm {
-        open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        cf: cf.clone(),
-        asked_before_written: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    };
-    let writer = Cloudflare::with_endpoint(
-        "dns-token-for-tests".into(),
-        "fcvm.example".into(),
-        Some("zone-for-tests".into()),
-        &base,
-    )
-    .unwrap()
-    .with_confirm(Arc::new(gate.clone()));
-    let (handle, _actor) = start(
-        State::new(config, now_ms()),
-        None,
-        ec2,
-        None,
-        None,
-        Some(fcvm::fleet::coord::Names::Cloudflare(writer)),
-    );
-    let mut agent = FakeAgent::connect(&handle, "gpu-a", 1);
-    agent.assign().await;
-    DnsFixture {
-        cf,
-        gate,
-        handle,
-        agent,
-    }
-}
-
-impl DnsFixture {
-    fn report(&self, phase: &str, generation: u64, v6: Option<&str>, v4: Option<&str>) {
-        self.agent
-            .to_coord
-            .send(AgentMsg::Slot(SlotReport {
-                id: "slot-1".into(),
-                phase: phase.into(),
-                generation,
-                ipv6: v6.map(str::to_string),
-                ipv4: v4.map(str::to_string),
-                v4_port: v4.map(|_| 20200),
-                ..Default::default()
-            }))
-            .unwrap();
-    }
-
-    fn tile(&self) -> Value {
-        serde_json::from_str::<Value>(&self.handle.snapshot.borrow().text).unwrap()["state"]
-            ["tiles"][0]
-            .clone()
-    }
-
-    /// The zone's records as (type, name, content), sorted.
-    fn zone(&self) -> Vec<(String, String, String)> {
-        let mut v: Vec<_> = self
-            .cf
-            .records
-            .lock()
-            .unwrap()
-            .values()
-            .map(|r| {
-                (
-                    r["type"].as_str().unwrap().to_string(),
-                    r["name"].as_str().unwrap().to_string(),
-                    r["content"].as_str().unwrap().to_string(),
-                )
-            })
-            .collect();
-        v.sort();
-        v
-    }
-
-    /// The label of the zone's AAAA record for `v6`, once there is one.
-    async fn label_for(&self, v6: &str) -> String {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some((_, name, _)) = self
-                .zone()
-                .into_iter()
-                .find(|(k, _, c)| k == "AAAA" && c == v6)
-            {
-                return name.strip_suffix(".fcvm.example").unwrap().to_string();
-            }
-            assert!(std::time::Instant::now() < deadline, "{:?}", self.zone());
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
-    async fn wait_until(&self, what: &str, f: impl Fn(&Self) -> bool) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !f(self) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{what}: zone {:?}, tile {}",
-                self.zone(),
-                self.tile()
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
-    fn open(&self, open: bool) {
-        self.gate
-            .open
-            .store(open, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-/// A launch gets a label never used before; its records are written (AAAA for the slot's own
-/// address, A for the host's IPv4, both unproxied with TTL 60), confirmed at the zone's
-/// authoritative servers, and only then do its frame URLs reach the page. The start-up sweep
-/// removes names of the fleet's shape that nothing references and leaves every other name.
-#[tokio::test]
-async fn a_launch_is_published_only_after_its_names_answer() {
-    let fx = dns_fixture(&[
-        ("CNAME", "stage.fcvm.example", "worker.example"),
-        ("AAAA", "fleet-api-stage.fcvm.example", "2001:db8::99"),
-        ("AAAA", "dnstest-1.fcvm.example", "2001:db8::98"),
-        ("AAAA", "slot-9.fcvm.example", "2001:db8::97"),
-        ("A", "slot-9-v4.fcvm.example", "192.0.2.97"),
-        ("AAAA", "slot-7-abcdefgh.fcvm.example", "2001:db8::96"),
-    ])
-    .await;
-    fx.report("running", 1, Some("2001:db8::1"), Some("192.0.2.10"));
-    let label = fx.label_for("2001:db8::1").await;
-    assert!(
-        label.starts_with("slot-1-") && label.len() == "slot-1-".len() + 8,
-        "{label}"
-    );
-    fx.wait_until("the A record", |fx| {
-        fx.zone().contains(&(
-            "A".into(),
-            format!("{label}-v4.fcvm.example"),
-            "192.0.2.10".into(),
-        ))
-    })
-    .await;
-    // Written, not yet answering: the page gets nothing.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(fx.tile()["phase"], "running");
-    assert!(fx.tile()["frame_url"].is_null(), "{}", fx.tile());
-    assert!(fx.tile()["frame_url_v4"].is_null(), "{}", fx.tile());
-    fx.open(true);
-    fx.wait_until("the published URLs", |fx| !fx.tile()["frame_url"].is_null())
-        .await;
-    assert_eq!(
-        fx.tile()["frame_url"],
-        format!("wss://{label}.fcvm.example/frames")
-    );
-    assert_eq!(
-        fx.tile()["frame_url_v4"],
-        format!("wss://{label}-v4.fcvm.example:20200/frames")
-    );
-    assert!(
-        !fx.gate
-            .asked_before_written
-            .load(std::sync::atomic::Ordering::SeqCst),
-        "a launch was confirmed before its records were written"
-    );
-    // No fleet record is proxied, and each has TTL 60.
-    for r in fx.cf.records.lock().unwrap().values() {
-        if r["name"].as_str().unwrap().starts_with("slot-") {
-            assert_eq!(
-                (r["proxied"].clone(), r["ttl"].clone()),
-                (json!(false), json!(60)),
-                "{r}"
-            );
-        }
-    }
-    // The sweep: the fleet's unreferenced names are gone, every other name stays.
-    let names: Vec<String> = fx.zone().into_iter().map(|(_, n, _)| n).collect();
-    for keep in [
-        "stage.fcvm.example",
-        "fleet-api-stage.fcvm.example",
-        "dnstest-1.fcvm.example",
-    ] {
-        assert!(names.contains(&keep.to_string()), "{keep}: {names:?}");
-    }
-    for gone in [
-        "slot-9.fcvm.example",
-        "slot-9-v4.fcvm.example",
-        "slot-7-abcdefgh.fcvm.example",
-    ] {
-        assert!(!names.contains(&gone.to_string()), "{gone}: {names:?}");
-    }
-}
-
-/// A slot that reports another address at the same generation shows no URL until that
-/// address has its own published names: its old names point at an address it left.
-#[tokio::test]
-async fn a_new_address_at_the_same_generation_hides_the_old_urls() {
-    let fx = dns_fixture(&[]).await;
-    fx.open(true);
-    fx.report("running", 1, Some("2001:db8::1"), Some("192.0.2.10"));
-    let first = fx.label_for("2001:db8::1").await;
-    fx.wait_until("published", |fx| !fx.tile()["frame_url"].is_null())
-        .await;
-    fx.open(false);
-    fx.report("running", 1, Some("2001:db8::5"), Some("192.0.2.10"));
-    let second = fx.label_for("2001:db8::5").await;
-    assert_ne!(first, second);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        fx.tile()["frame_url"].is_null() && fx.tile()["frame_url_v4"].is_null(),
-        "the old names were shown for a new address: {}",
-        fx.tile()
-    );
-    fx.open(true);
-    fx.wait_until("the new address published", |fx| {
-        fx.tile()["frame_url"] == format!("wss://{second}.fcvm.example/frames")
-    })
-    .await;
-}
-
-/// Every launch gets new names. A relaunch keeps the earlier launch's records while the new
-/// launch is written and confirmed (the page shows no URL for the new launch until then),
-/// and removes them only once the new names are published and nothing references the old.
-#[tokio::test]
-async fn each_launch_gets_new_names_and_old_ones_go_once_unreferenced() {
-    let fx = dns_fixture(&[]).await;
-    fx.open(true);
-    fx.report("running", 1, Some("2001:db8::1"), Some("192.0.2.10"));
-    let first = fx.label_for("2001:db8::1").await;
-    fx.wait_until("the first launch published", |fx| {
-        !fx.tile()["frame_url"].is_null()
-    })
-    .await;
-    // The relaunch: no address yet, then the new launch's addresses, confirmation held.
-    fx.open(false);
-    fx.report("starting", 2, None, None);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        fx.zone().iter().any(|(_, n, _)| n.starts_with(&first)),
-        "{:?}",
-        fx.zone()
-    );
-    assert!(fx.tile()["frame_url"].is_null(), "{}", fx.tile());
-    fx.report("running", 2, Some("2001:db8::2"), Some("192.0.2.11"));
-    let second = fx.label_for("2001:db8::2").await;
-    assert_ne!(first, second);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        fx.zone().iter().any(|(_, n, _)| n.starts_with(&first)),
-        "the first launch's names went before the second's were published: {:?}",
-        fx.zone()
-    );
-    assert!(fx.tile()["frame_url"].is_null(), "{}", fx.tile());
-    fx.open(true);
-    fx.wait_until("the second launch published", |fx| {
-        fx.tile()["frame_url"] == format!("wss://{second}.fcvm.example/frames")
-    })
-    .await;
-    fx.wait_until("the first launch's names removed", |fx| {
-        !fx.zone().iter().any(|(_, n, _)| n.starts_with(&first))
-    })
-    .await;
-    let w = fx.cf.writes.lock().unwrap().clone();
-    assert!(
-        !w.iter().any(|x| x.starts_with("update")),
-        "a name changed address in place: {w:?}"
-    );
-}
-
-impl DnsFixture {
-    fn aggregate_report(&self, v6: Option<&str>, v4: Option<&str>) {
-        self.agent
-            .to_coord
-            .send(AgentMsg::Aggregate {
-                frame_url: "ws://gpu-a.internal:20300/frames".into(),
-                ipv6: v6.map(str::to_string),
-                ipv4: v4.map(str::to_string),
-                v4_port: v4.map(|_| 20208),
-            })
-            .unwrap();
-    }
-
-    fn aggregate(&self) -> Value {
-        self.aggregate_of("agg:gpu-a")
-    }
-
-    fn aggregate_of(&self, id: &str) -> Value {
-        let state =
-            &serde_json::from_str::<Value>(&self.handle.snapshot.borrow().text).unwrap()["state"];
-        state["aggregates"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|a| a["id"] == id)
-            .cloned()
-            .unwrap_or(Value::Null)
-    }
-}
-
-/// The EC2 half's aggregator serving browsers with TLS is named `agg-ec2-<token>` at the
-/// coordinator's own addresses, both on 443, and its URLs reach the page only once the
-/// names answer.
-#[tokio::test]
-async fn the_ec2_aggregator_is_published_at_the_coordinators_addresses() {
-    let config = Config {
-        ec2_max: 1,
-        ec2_aggregate_ipv6: Some("2001:db8:20::5".into()),
-        ec2_aggregate_ipv4: Some("192.0.2.44".into()),
-        ..Config::default()
-    };
-    let ec2: Arc<dyn ec2::Ec2Driver> = Arc::new(ec2::FakeEc2::new(
-        Duration::from_millis(10),
-        Duration::from_millis(10),
-    ));
-    let fx = dns_fixture_with(&[], config, Some(ec2)).await;
-    fx.wait_until("the EC2 half's region", |fx| {
-        !fx.aggregate_of("agg:ec2").is_null()
-    })
-    .await;
-    let label = fx.label_for("2001:db8:20::5").await;
-    assert!(
-        label.starts_with("agg-ec2-") && label.len() == "agg-ec2-".len() + 8,
-        "{label}"
-    );
-    fx.wait_until("the A record", |fx| {
-        fx.zone().contains(&(
-            "A".into(),
-            format!("{label}-v4.fcvm.example"),
-            "192.0.2.44".into(),
-        ))
-    })
-    .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        fx.aggregate_of("agg:ec2")["frame_url"].is_null(),
-        "{}",
-        fx.aggregate_of("agg:ec2")
-    );
-    fx.open(true);
-    fx.wait_until("the EC2 aggregator published", |fx| {
-        !fx.aggregate_of("agg:ec2")["frame_url"].is_null()
-    })
-    .await;
-    let a = fx.aggregate_of("agg:ec2");
-    assert_eq!(a["frame_url"], format!("wss://{label}.fcvm.example/frames"));
-    assert_eq!(
-        a["frame_url_v4"],
-        format!("wss://{label}-v4.fcvm.example/frames")
-    );
-}
-
-/// A host aggregator that serves browsers is named like a launch, under
-/// `agg-<host>-<token>`: its own IPv6 address and the host's IPv4 address on the
-/// aggregator's port, written, confirmed, and only then given to the page. Before that,
-/// and for an aggregator that reports no public address, the page gets no URL (it is https
-/// and cannot open the aggregator's plain one). A new address is a new label, and the old
-/// names go once unreferenced.
-#[tokio::test]
-async fn a_host_aggregator_is_published_under_its_own_names() {
-    let fx = dns_fixture(&[]).await;
-    fx.report("running", 1, Some("2001:db8::2"), Some("192.0.2.10"));
-    fx.wait_until("the host's band", |fx| !fx.aggregate().is_null())
-        .await;
-    fx.aggregate_report(None, None);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        fx.aggregate()["frame_url"].is_null() && fx.aggregate()["frame_url_v4"].is_null(),
-        "the plain URL reached an https page: {}",
-        fx.aggregate()
-    );
-    assert!(
-        !fx.zone().iter().any(|(_, n, _)| n.starts_with("agg-")),
-        "{:?}",
-        fx.zone()
-    );
-
-    fx.aggregate_report(Some("2001:db8::1"), Some("192.0.2.10"));
-    let label = fx.label_for("2001:db8::1").await;
-    assert!(
-        label.starts_with("agg-gpu-a-") && label.len() == "agg-gpu-a-".len() + 8,
-        "{label}"
-    );
-    fx.wait_until("the A record", |fx| {
-        fx.zone().contains(&(
-            "A".into(),
-            format!("{label}-v4.fcvm.example"),
-            "192.0.2.10".into(),
-        ))
-    })
-    .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(fx.aggregate()["frame_url"].is_null(), "{}", fx.aggregate());
-    fx.open(true);
-    fx.wait_until("the aggregator published", |fx| {
-        !fx.aggregate()["frame_url"].is_null()
-    })
-    .await;
-    assert_eq!(
-        fx.aggregate()["frame_url"],
-        format!("wss://{label}.fcvm.example/frames")
-    );
-    assert_eq!(
-        fx.aggregate()["frame_url_v4"],
-        format!("wss://{label}-v4.fcvm.example:20208/frames")
-    );
-
-    // Another address (a new host prefix): the old names are hidden at once, the new ones
-    // shown once confirmed, and the old records removed.
-    fx.open(false);
-    fx.aggregate_report(Some("2001:db8:5::1"), Some("192.0.2.10"));
-    let second = fx.label_for("2001:db8:5::1").await;
-    assert_ne!(label, second);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(fx.aggregate()["frame_url"].is_null(), "{}", fx.aggregate());
-    fx.open(true);
-    fx.wait_until("the new address published", |fx| {
-        fx.aggregate()["frame_url"] == format!("wss://{second}.fcvm.example/frames")
-    })
-    .await;
-    fx.wait_until("the old names removed", |fx| {
-        !fx.zone().iter().any(|(_, n, _)| n.starts_with(&label))
-    })
-    .await;
-}
-
 /// A DNS query for `name` and `qtype` to `server` over UDP (or TCP): the rcode, whether AA
 /// is set, and the addresses of the answer.
 async fn ask_dns(
@@ -4653,15 +4089,12 @@ async fn ask_dns(
     (m[3] & 0xF, m[2] & 0x04 != 0, out)
 }
 
-/// A coordinator serving the launch names' subzone, its DNS server's address, the zone it
-/// answers from, and an agent with one slot.
-async fn subzone_fixture() -> (
-    Handle,
-    std::net::SocketAddr,
+/// Launch names in `tiles.fcvm.example`, and the zone the actor will publish.
+fn subzone_names() -> (
+    fcvm::fleet::coord::Names,
     tokio::sync::watch::Receiver<Arc<fcvm::fleet::coord::authority::Zone>>,
-    FakeAgent,
 ) {
-    use fcvm::fleet::coord::authority::{Authority, Zone, ZoneConfig};
+    use fcvm::fleet::coord::authority::{Zone, ZoneConfig};
     let cfg = Arc::new(
         ZoneConfig::new(
             "tiles.fcvm.example",
@@ -4670,21 +4103,46 @@ async fn subzone_fixture() -> (
         )
         .unwrap(),
     );
-    let (tx, rx) = tokio::sync::watch::channel(Arc::new(Zone::default()));
+    let (zone, rx) = tokio::sync::watch::channel(Arc::new(Zone::default()));
+    (fcvm::fleet::coord::Names { cfg, zone }, rx)
+}
+
+/// A coordinator serving the launch names' subzone, its DNS server's address, the zone it
+/// answers from, and an agent with one slot.
+async fn subzone_fixture() -> (
+    Handle,
+    std::net::SocketAddr,
+    tokio::sync::watch::Receiver<Arc<fcvm::fleet::coord::authority::Zone>>,
+    FakeAgent,
+) {
+    subzone_fixture_with(Config::default(), None).await
+}
+
+async fn subzone_fixture_with(
+    config: Config,
+    ec2: Option<Arc<dyn ec2::Ec2Driver>>,
+) -> (
+    Handle,
+    std::net::SocketAddr,
+    tokio::sync::watch::Receiver<Arc<fcvm::fleet::coord::authority::Zone>>,
+    FakeAgent,
+) {
+    use fcvm::fleet::coord::authority::Authority;
+    let (names, rx) = subzone_names();
     let server = Authority {
-        cfg: cfg.clone(),
+        cfg: names.cfg.clone(),
         zone: rx.clone(),
     }
     .serve("127.0.0.1:0".parse().unwrap(), 1000)
     .await
     .unwrap();
     let (handle, _actor) = start(
-        State::new(Config::default(), now_ms()),
+        State::new(config, now_ms()),
+        None,
+        ec2,
         None,
         None,
-        None,
-        None,
-        Some(fcvm::fleet::coord::Names::Subzone(cfg, tx)),
+        Some(names),
     );
     let mut agent = FakeAgent::connect(&handle, "gpu-a", 1);
     agent.assign().await;
@@ -4775,6 +4233,166 @@ async fn a_minted_name_answers_at_once_and_a_replaced_one_does_not() {
     assert_eq!(
         ask_dns(server, "slot-1.fcvm.example", 28, false).await,
         (5, false, vec![])
+    );
+}
+
+/// A slot that reports another address at the same generation gets new names at once; its
+/// old names pointed at an address it left, and stop answering.
+#[tokio::test]
+async fn a_new_address_at_the_same_generation_gets_new_names() {
+    let (handle, server, zone, agent) = subzone_fixture().await;
+    report_slot(&agent, 1, Some("2001:db8::1"), Some("192.0.2.10"));
+    let (first, _, _) = published_urls(&handle, &zone, None).await;
+    report_slot(&agent, 1, Some("2001:db8::5"), Some("192.0.2.10"));
+    let (second, _, _) = published_urls(&handle, &zone, Some(&first)).await;
+    assert_ne!(host_of(&first), host_of(&second));
+    assert_eq!(
+        ask_dns(server, &host_of(&second), 28, false).await,
+        (0, true, vec!["2001:db8::5".to_string()])
+    );
+    assert_eq!(
+        ask_dns(server, &host_of(&first), 28, false).await,
+        (3, true, vec![])
+    );
+}
+
+/// The aggregate `id` in the latest snapshot (`agg:gpu-a`, `agg:ec2`), or null.
+fn aggregate_of(handle: &Handle, id: &str) -> Value {
+    let state = &serde_json::from_str::<Value>(&handle.snapshot.borrow().text).unwrap()["state"];
+    state["aggregates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == id)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// The first snapshot in which aggregate `id` shows a `frame_url` other than `not`: its two
+/// frame URLs.
+async fn aggregate_urls(handle: &Handle, id: &str, not: Option<&str>) -> (String, String) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let a = aggregate_of(handle, id);
+        if let (Some(v6), Some(v4)) = (a["frame_url"].as_str(), a["frame_url_v4"].as_str()) {
+            if Some(v6) != not {
+                return (v6.to_string(), v4.to_string());
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no published aggregator URLs: {a}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn report_aggregate(agent: &FakeAgent, v6: Option<&str>, v4: Option<&str>) {
+    agent
+        .to_coord
+        .send(AgentMsg::Aggregate {
+            frame_url: "ws://gpu-a.internal:20300/frames".into(),
+            ipv6: v6.map(str::to_string),
+            ipv4: v4.map(str::to_string),
+            v4_port: v4.map(|_| 20208),
+        })
+        .unwrap();
+}
+
+/// A host aggregator that serves browsers is named like a launch, under
+/// `agg-<host>-<token>` in the subzone: AAAA its own IPv6 address, the `-v4` A the host's
+/// IPv4 address with the aggregator's port in `frame_url_v4`, and the coordinator's server
+/// answers both from the moment the page can read them. An aggregator that reports no
+/// public address gets no URL (the page is https and cannot open its plain one) and no
+/// names. A new address is a new label, and the old names stop answering.
+#[tokio::test]
+async fn a_host_aggregator_is_named_in_the_subzone_and_answers() {
+    let (handle, server, _zone, agent) = subzone_fixture().await;
+    report_slot(&agent, 1, Some("2001:db8::2"), Some("192.0.2.10"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while aggregate_of(&handle, "agg:gpu-a").is_null() {
+        assert!(Instant::now() < deadline, "the host's band never appeared");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    report_aggregate(&agent, None, None);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let a = aggregate_of(&handle, "agg:gpu-a");
+    assert!(
+        a["frame_url"].is_null() && a["frame_url_v4"].is_null(),
+        "the plain URL reached an https page: {a}"
+    );
+
+    report_aggregate(&agent, Some("2001:db8::1"), Some("192.0.2.10"));
+    let (v6_url, v4_url) = aggregate_urls(&handle, "agg:gpu-a", None).await;
+    let (v6, v4) = (host_of(&v6_url), host_of(&v4_url));
+    let label = v6
+        .strip_suffix(".tiles.fcvm.example")
+        .expect("in the subzone");
+    assert!(
+        label.starts_with("agg-gpu-a-") && label.len() == "agg-gpu-a-".len() + 8,
+        "{v6_url}"
+    );
+    assert_eq!(v6_url, format!("wss://{label}.tiles.fcvm.example/frames"));
+    assert_eq!(
+        v4_url,
+        format!("wss://{label}-v4.tiles.fcvm.example:20208/frames")
+    );
+    assert_eq!(
+        ask_dns(server, &v6, 28, false).await,
+        (0, true, vec!["2001:db8::1".to_string()])
+    );
+    assert_eq!(
+        ask_dns(server, &v4, 1, false).await,
+        (0, true, vec!["192.0.2.10".to_string()])
+    );
+
+    // Another address (a new host prefix): new names, and the old ones stop answering.
+    report_aggregate(&agent, Some("2001:db8:5::1"), Some("192.0.2.10"));
+    let (second, _) = aggregate_urls(&handle, "agg:gpu-a", Some(&v6_url)).await;
+    assert_ne!(host_of(&second), v6);
+    assert_eq!(
+        ask_dns(server, &host_of(&second), 28, false).await,
+        (0, true, vec!["2001:db8:5::1".to_string()])
+    );
+    assert_eq!(ask_dns(server, &v6, 28, false).await, (3, true, vec![]));
+    assert_eq!(ask_dns(server, &v4, 1, false).await, (3, true, vec![]));
+}
+
+/// The EC2 half's aggregator serving browsers with TLS is named `agg-ec2-<token>` in the
+/// subzone at the coordinator's own addresses, both on 443, and the server answers both.
+#[tokio::test]
+async fn the_ec2_aggregator_is_named_in_the_subzone_and_answers() {
+    let config = Config {
+        ec2_max: 1,
+        ec2_aggregate_ipv6: Some("2001:db8:20::5".into()),
+        ec2_aggregate_ipv4: Some("192.0.2.44".into()),
+        ..Config::default()
+    };
+    let ec2: Arc<dyn ec2::Ec2Driver> = Arc::new(ec2::FakeEc2::new(
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+    ));
+    let (handle, server, _zone, _agent) = subzone_fixture_with(config, Some(ec2)).await;
+    let (v6_url, v4_url) = aggregate_urls(&handle, "agg:ec2", None).await;
+    let (v6, v4) = (host_of(&v6_url), host_of(&v4_url));
+    let label = v6
+        .strip_suffix(".tiles.fcvm.example")
+        .expect("in the subzone");
+    assert!(
+        label.starts_with("agg-ec2-") && label.len() == "agg-ec2-".len() + 8,
+        "{v6_url}"
+    );
+    assert_eq!(
+        v4_url,
+        format!("wss://{label}-v4.tiles.fcvm.example/frames")
+    );
+    assert_eq!(
+        ask_dns(server, &v6, 28, false).await,
+        (0, true, vec!["2001:db8:20::5".to_string()])
+    );
+    assert_eq!(
+        ask_dns(server, &v4, 1, true).await,
+        (0, true, vec!["192.0.2.44".to_string()])
     );
 }
 

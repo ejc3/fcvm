@@ -317,9 +317,9 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   agent reported: `stopping`, `restoring`, `starting`, `running`, `failed`.
 - `frame_url` is the renderer's frame WebSocket as the browser should open it (append
   `?h=<height>`), over IPv6; `frame_url_v4` the same renderer over IPv4. Both are null while
-  borrowed. With `--dns-token-secret` both are the launch's own names (see "Running it"),
-  null until those names answer at the zone's authoritative servers, and a relaunch gives
-  new ones; without it `frame_url` is what the agent reported and `frame_url_v4` is null.
+  borrowed. With `--dns-subzone` both are the launch's own names (see "Running it"),
+  published with the launch's address, and a relaunch gives new ones; without it
+  `frame_url` is what the agent reported and `frame_url_v4` is null.
   A viewer uses one family for every tile of both halves. After a relaunch the tile
   reconnects when `phase` is `running` again and its URLs are set.
 - `last_relaunch.first_frame_at - clicked_at` is the tile's relaunch time; `phases` are
@@ -408,10 +408,10 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
 - `aggregates` lists the regions an aggregator serves (see Aggregator): one per GPU host
   that has placed tiles, with the tiles inside it, and the EC2 half when the coordinator
   runs its aggregator. `frame_url` is null until the host's aggregator is serving. With
-  the coordinator's DNS (`--dns-token-secret`) a host aggregator's `frame_url` and
-  `frame_url_v4` are its published names (`wss://agg-<host>-<token>.<zone>/frames`,
-  `wss://agg-<host>-<token>-v4.<zone>:<port>/frames`), and both stay null for an aggregator
-  that serves no browser (no `--aggregate-tls-port`).
+  the coordinator's subzone (`--dns-subzone`) a host aggregator's `frame_url` and
+  `frame_url_v4` are its published names (`wss://agg-<host>-<token>.<subzone>/frames`,
+  `wss://agg-<host>-<token>-v4.<subzone>:<port>/frames`), and both stay null for an
+  aggregator that serves no browser (no `--aggregate-tls-port`).
 - `actions` holds the latest 50 intents, committed and refused, oldest first: the
   `viewer` that sent it, the intent `id`, its `args` (a refused word's are `{}`, so its
   text appears nowhere), and the outcome.
@@ -445,8 +445,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                   [--ec2-on-demand-template <name>] [--fleet-name stage]
                   [--ec2-pool <n> --ec2-pool-template <name>]
                   [--ec2-subnets <region>:<subnet>,... --ec2-security-group <region>:<group>]...]
-                 [--dns-zone fcvm.dev]
-                 [--dns-token-secret <secret> [--dns-zone-id <id>] [--dns-nameservers <ns>,...]]
+                 [--dns-zone fcvm.dev] [--dns-token-secret <secret> [--dns-zone-id <id>]]
                  [--dns-subzone <subzone> --dns-subzone-ns <ns>,... --dns-listen <addr:port> [--dns-rate-limit 200]]
                  [--tls-secret <secret>] [--secrets-region <region>]
 ```
@@ -506,26 +505,21 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   stopped tile started to its first frame in 15.5 s (persistent spot) and 17.2 to 17.5 s
   (on demand), against 81 to 84 s for a launch; a stopped persistent spot instance can be
   started again only once its request is `disabled`, 42 to 54 s after it stopped.
-- `--dns-token-secret` names each launch in `--dns-zone` with the zone's Cloudflare token.
-  Every launch of an fcvm slot or EC2 tile that reports an address gets a label never used
-  before, `slot-<n>-<token>` / `ec2-<n>-<token>` (8 random base32 characters), and under it
-  `<label>.<zone>` AAAA (the slot's own IPv6 address) and `<label>-v4.<zone>` A (the host's
-  or the tile's public IPv4 address), both unproxied with TTL 60. The coordinator writes the
-  records, confirms them at every server in `--dns-nameservers` (asked directly, without
-  recursion), and only then sets the tile's `frame_url` and `frame_url_v4`. A name is never
-  asked for before it exists and never changes address, so no resolver holds a negative or
-  stale answer for it. A launch's records stay until its slot has a newer published launch
-  or leaves the fleet; names of the fleet's shape (`slot-<n>`, `ec2-<n>`, with or without a
-  token, `agg-<host>-<token>`, each with or without `-v4`) that nothing references are
-  deleted, at start too; every other name in the zone is left alone. A host aggregator
-  that reports public addresses is named the same way under `agg-<host>-<token>` (a host
-  name of lowercase letters, digits and inner hyphens, at most 40 characters): AAAA its own
-  IPv6 address, A the host's IPv4 address, with its port in `frame_url_v4`. Its names last
-  while it reports the same addresses.
+- `--dns-token-secret` is the zone's Cloudflare token, which the certificate renewal writes
+  its DNS-01 records with (see "Certificate").
 - `--dns-subzone` makes the coordinator the authoritative DNS server of a subzone of
   `--dns-zone` (the parent delegates it with NS records naming `--dns-subzone-ns`, and no DS
-  record) and names launches there instead: `<label>.<subzone>` AAAA and
-  `<label>-v4.<subzone>` A, TTL 60. Minting a launch's label and publishing its names are
+  record) and names launches there. Every launch of an fcvm slot or EC2 tile that reports
+  an address gets a label never used before, `slot-<n>-<token>` / `ec2-<n>-<token>` (8
+  random base32 characters), and under it `<label>.<subzone>` AAAA (the slot's own IPv6
+  address) and `<label>-v4.<subzone>` A (the host's or the tile's public IPv4 address), TTL
+  60. A launch's names answer until its slot has a newer launch or leaves the fleet. A
+  host aggregator that reports public addresses is named the same way under
+  `agg-<host>-<token>` (a host name of lowercase letters, digits and inner hyphens, at most
+  40 characters): AAAA its own IPv6 address, A the host's IPv4 address, with its port in
+  `frame_url_v4`; the EC2 half's aggregator is `agg-ec2-<token>` (see
+  `--ec2-aggregate-tls`). An aggregator's names answer while it reports the same
+  addresses; new addresses get a new label. Minting a label and publishing its names are
   one step of the coordinator's state, and the server answers from that state, so a name
   answers from the moment a viewer can learn it, with no wait. It listens on
   `--dns-listen`, UDP and TCP (a high port; a load balancer maps 53), and answers only for
@@ -534,21 +528,20 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   with the SOA; REFUSED for any other name; AA set, no recursion, EDNS(0), TC over UDP when
   the client's buffer is too small. Over UDP, past `--dns-rate-limit` responses a second
   per source /24 or /56, every second response goes out truncated and the rest are
-  dropped. With `--dns-token-secret` it deletes, once at start, the launch names earlier
-  written to the parent zone.
+  dropped.
 - `--tls-secret` keeps the wildcard certificate renewed (see "Certificate").
 - `--ec2-aggregate-tls` (with `--ec2-aggregate-listen`, `--tls-secret` and
-  `--dns-token-secret`) serves the EC2 half's aggregator to browsers with TLS on port 443
+  `--dns-subzone`) serves the EC2 half's aggregator to browsers with TLS on port 443
   of the coordinator task's own addresses, read at start on ECS: the global IPv6 address
   from the task metadata (`ECS_CONTAINER_METADATA_URI_V4`) and the public IPv4 address of
   the task's network interface (EC2 `DescribeNetworkInterfaces` by its private address, in
   `AWS_REGION`, with the task role). It writes the certificate (from `--tls-secret`) as
   `tls.json` into `--ec2-aggregate-tls-dir` for the aggregator and reads the secret again
-  hourly, and names the addresses `agg-ec2-<token>` (AAAA and `-v4` A, both on 443) like a
-  host aggregator. A non-root process binds 443 only where the task lowers
+  hourly, and names the addresses `agg-ec2-<token>` in the subzone (AAAA and `-v4` A, both
+  on 443) like a host aggregator. A non-root process binds 443 only where the task lowers
   `net.ipv4.ip_unprivileged_port_start` (it covers IPv6 too). With published names the
   EC2 aggregate's `frame_url`/`frame_url_v4` are those names, else null;
-  `--ec2-aggregate-url` is used only without the DNS writer.
+  `--ec2-aggregate-url` is used only without the subzone.
 
 ### Certificate
 
@@ -919,7 +912,7 @@ primary interface, `Ipv6PrefixCount = 1`) runs each slot's VM in fcvm's routed m
 `<prefix>::<GPU index + 2>` (`--network routed --ipv6-prefix <prefix> --ipv6-address
 <addr>`; fcvm refuses the prefix's addresses 0 and 1). The slot keeps the address across
 relaunches and reports it as `ipv6` in every slot message; the coordinator names it in DNS
-(see the coordinator's `--dns-token-secret`). The renderer's container shares the VM's
+(see the coordinator's `--dns-subzone`). The renderer's container shares the VM's
 network, so a browser reaches its TLS port at that address. `--frame-zone` reports the frame
 URL as `wss://<slot id>.<zone>/frames`.
 
@@ -956,7 +949,7 @@ TLS (the aggregator's `--tls-listen`, the renderers' certificate file): on `<pub
 and with an IPv6 prefix on port 443 of `<prefix>::1`, the host's side of the prefix (fcvm
 never gives it to a VM), which the agent puts on the host's default IPv6 interface
 (`ip -6 addr replace <addr>/128 dev <iface> nodad`) before it starts. The message then
-carries what the coordinator names (`agg-<host>-<token>`, see `--dns-token-secret`):
+carries what the coordinator names (`agg-<host>-<token>`, see `--dns-subzone`):
 `ipv6` (port 443), and with `--public-ipv4-from-imds` the host's `ipv4` and the port as
 `v4_port`. The aggregator's `--listen` stays on `<publish ip>:<aggregate port>`, which the
 host's security group does not admit.

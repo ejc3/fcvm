@@ -121,20 +121,27 @@ impl Zone {
     }
 }
 
-/// The subzone's records for a state: every slot's and tile's published launch, `<label>`
-/// with its IPv6 address and `<label>-v4` with its IPv4 address.
+/// The subzone's records for a state: every slot's and tile's published launch and every
+/// aggregator's published names (a host's `agg-<host>-<token>`, the EC2 half's
+/// `agg-ec2-<token>`), `<label>` with its IPv6 address and `<label>-v4` with its IPv4
+/// address.
 pub fn zone_of(state: &State, apex: &str) -> Zone {
     let mut z = Zone {
         serial: state.version as u32,
         ..Zone::default()
     };
     let f = &state.fleet;
-    for p in f
+    let launches = f
         .slots
         .values()
         .chain(f.ec2.values())
-        .filter_map(|s| s.published.as_ref())
-    {
+        .filter_map(|s| s.published.as_ref());
+    let aggregators = f
+        .hosts
+        .values()
+        .filter_map(|h| h.aggregate_published.as_ref())
+        .chain(f.ec2_aggregate_published.as_ref());
+    for p in launches.chain(aggregators) {
         let label = p.label.to_ascii_lowercase();
         if let Some(v6) = p.ipv6.as_deref().and_then(|a| a.parse().ok()) {
             z.aaaa.insert(format!("{label}.{apex}"), vec![v6]);

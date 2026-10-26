@@ -24,8 +24,8 @@ pub struct TileView {
     /// The slot behind the tile (`slot-3`, `ec2-2`); null for an fcvm place with no GPU.
     pub slot: Option<String>,
     /// The frame WebSocket over IPv6 and over IPv4. With published names (the fleet's
-    /// coordinator) both are null until the launch's DNS names answer at the zone's
-    /// authoritative servers; a viewer uses one family for every tile.
+    /// coordinator) both are null until the launch's DNS names are published in its
+    /// subzone; a viewer uses one family for every tile.
     pub frame_url: Option<String>,
     pub frame_url_v4: Option<String>,
     pub gpu: Option<Gpu>,
