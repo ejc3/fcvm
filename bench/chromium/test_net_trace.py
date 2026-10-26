@@ -398,6 +398,34 @@ class NetTraceRecorded(unittest.TestCase):
             },
         )
 
+    def test_a_row_says_whether_the_network_service_began_sending_it(self):
+        """A request that failed with no response has no address whether or not
+        it reached a server; only requestWillBeSentExtraInfo (the network
+        service sending the headers) separates it from one cancelled inside the
+        browser. The diag's exemption for cancelled requests reads this field.
+
+        Red: KeyError: 'sent_to_network'.
+        """
+        extra = {"method": "Network.requestWillBeSentExtraInfo",
+                 "params": {"requestId": "r2", "headers": {}}}
+        events = [
+            request_will_be_sent("r1", "http://replay.test/frame", 1000.000),
+            {"method": "Network.loadingFailed",
+             "params": {"requestId": "r1", "timestamp": 1000.003,
+                        "errorText": "net::ERR_ABORTED", "canceled": True}},
+            request_will_be_sent("r2", "http://replay.test/sent", 1000.010),
+            extra,
+            {"method": "Network.loadingFailed",
+             "params": {"requestId": "r2", "timestamp": 1000.013,
+                        "errorText": "net::ERR_ABORTED", "canceled": True}},
+            load_event_fired(1000.200),
+        ]
+        trace = cdpdrive.reduce_net_trace(events, 1000.200, 100.0)
+        rows = {row["url"]: row for row in trace["requests"]}
+        self.assertEqual(
+            {url: (row["canceled"], row["sent_to_network"]) for url, row in rows.items()},
+            {"http://replay.test/frame": (True, False), "http://replay.test/sent": (True, True)})
+
     def test_pending_at_load_lists_at_most_ten_rows_in_start_order(self):
         """Twelve requests open at the load event: the list names the ten
         that started first, and the count still says twelve.

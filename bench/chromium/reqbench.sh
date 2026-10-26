@@ -1890,7 +1890,7 @@ for i in range(0, len(pairs), 2):
                     foreign.setdefault(ip, []).append(row.get("url", ""))
             elif str(row.get("url", "")).split(":", 1)[0].lower() in ("http", "https") \
                     and not row.get("from_cache") and not row.get("from_service_worker") \
-                    and not (row.get("canceled") and not row.get("timing")):
+                    and not (row.get("canceled") and row.get("sent_to_network") is False):
                 # No address and nothing that explains one: the request
                 # failed, or was still open when the post-load drain ended.
                 # Either way the trace does not say where it went, which is
@@ -1923,12 +1923,14 @@ for i in range(0, len(pairs), 2):
             # without either being held to it. A cache or service-worker hit
             # names no address either and had no network hop to name one;
             # the trace marks those rows. The other is a request the page
-            # cancelled before the browser gave it any network timing: it
-            # never left the browser, so it cannot have gone anywhere
+            # cancelled before the network service began sending it (no
+            # requestWillBeSentExtraInfo, sent_to_network false): it never
+            # left the browser process, so it cannot have gone anywhere
             # (Chromium 156, www.elmundo.es: an iframe's document request,
             # net::ERR_ABORTED 3 ms after it started, failed 3 of 5 diags
-            # on 2026-10-26). A cancelled request that did get timing still
-            # has to name an address.
+            # on 2026-10-26). A cancelled request the network service had
+            # begun sending, or a trace that does not say, still has to name
+            # an address.
             violation("no_remote_ip",
                       f"{len(unaddressed)} of {len(rows)} traced request(s) name no "
                       f"remote address, first {unaddressed[0]}")

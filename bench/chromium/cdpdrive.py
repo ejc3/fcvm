@@ -411,6 +411,12 @@ def reduce_net_trace(events: list, load_ts, drain_ms: float) -> dict:
                     # row from a request that never got a response.
                     "from_cache": False,
                     "from_service_worker": False,
+                    # Network.requestWillBeSentExtraInfo is the network service
+                    # saying it is sending the request's headers. Without it a
+                    # row that failed with no response never left the browser
+                    # process; with it the request may have reached a server
+                    # even though no response (and so no address) arrived.
+                    "sent_to_network": False,
                 }
                 order.append(rid)
             else:
@@ -418,7 +424,9 @@ def reduce_net_trace(events: list, load_ts, drain_ms: float) -> dict:
             continue
         if row is None:
             continue  # announced before Network.enable; nothing to attach to
-        if method == "Network.requestServedFromCache":
+        if method == "Network.requestWillBeSentExtraInfo":
+            row["sent_to_network"] = True
+        elif method == "Network.requestServedFromCache":
             # The memory cache. It arrives before the response, which then
             # carries fromDiskCache false and no remote address.
             row["from_cache"] = True
@@ -484,6 +492,7 @@ def reduce_net_trace(events: list, load_ts, drain_ms: float) -> dict:
             "remote_port": r["remote_port"],
             "from_cache": r["from_cache"],
             "from_service_worker": r["from_service_worker"],
+            "sent_to_network": r["sent_to_network"],
             "protocol": r["protocol"],
             "status": r["status"],
             "finished_before_load": finished_before_load,
