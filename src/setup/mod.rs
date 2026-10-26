@@ -200,6 +200,15 @@ impl StoreTemp {
         &self.path
     }
 
+    /// A handle a helper that writes the temp inherits, so its record stays live while
+    /// the helper runs even if this process is killed (`crate::reclaim::Holder`).
+    pub(crate) fn holder(&self) -> Result<crate::reclaim::Holder> {
+        self.owner
+            .as_ref()
+            .context("a published or removed store temp has no owner")?
+            .holder()
+    }
+
     /// Rename the temp onto `dest` and hand it back to the sudo invoker.
     ///
     /// A rename replaces a file or an empty directory atomically, but fails on a

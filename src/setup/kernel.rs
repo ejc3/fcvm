@@ -1042,6 +1042,9 @@ async fn build_kernel_locally(
     // rootless build of the same profile.
     let mut cmd = Command::new(&script_path);
     super::run_build_as_sudo_invoker(&mut cmd);
+    // The script writes the staging path; a setup killed while it runs leaves it running,
+    // and the staging path's record must stay live until it exits.
+    staging.holder()?.hold_in(&mut cmd);
     let status = run_streaming(cmd, "kernel_build")
         .await
         .context("running build script")?;

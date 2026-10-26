@@ -716,6 +716,15 @@ impl NetworkManager for BridgedNetwork {
         // them go first (crate::reclaim). If they cannot be dropped, the objects stay,
         // still recorded, and the next launch removes them. A kill from here on leaks
         // what is left.
+        // The veth's FORWARD rule is named by the veth, which keeps the name this VM's
+        // until it is deleted below.
+        if let Some(ref host_veth) = self.host_veth {
+            if let Err(e) = veth::delete_veth_forward_rule(host_veth).await {
+                warn!(vm_id = %self.vm_id, error = %e, "failed to delete forward rule");
+                errors.push(format!("forward rule: {}", e));
+            }
+        }
+
         // A rule or route that could not be removed keeps its record, and with it the
         // veth and namespace that keep its address this VM's, for the next launch.
         let forgotten = if !errors.is_empty() {
@@ -736,10 +745,6 @@ impl NetworkManager for BridgedNetwork {
             ));
         } else {
             if let Some(ref host_veth) = self.host_veth {
-                if let Err(e) = veth::delete_veth_forward_rule(host_veth).await {
-                    warn!(vm_id = %self.vm_id, error = %e, "failed to delete forward rule");
-                    errors.push(format!("forward rule: {}", e));
-                }
                 if let Err(e) = veth::delete_veth_pair(host_veth).await {
                     warn!(vm_id = %self.vm_id, error = %e, "failed to delete veth pair");
                     errors.push(format!("veth pair: {}", e));
@@ -813,7 +818,10 @@ mod tests {
             .expect("cleanup guards its forget on earlier failures");
         let veth = cleanup.find("veth::delete_veth_pair(host_veth)").unwrap();
         let rules = cleanup.find("portmap::cleanup_port_mappings(").unwrap();
-        assert!(rules < guard && guard < veth);
+        let forward = cleanup
+            .find("veth::delete_veth_forward_rule(host_veth)")
+            .unwrap();
+        assert!(rules < guard && forward < guard && guard < veth);
     }
 
     /// Bridged forwarding is IPv4 DNAT scoped to the veth address, so it cannot honour

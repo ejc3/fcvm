@@ -186,36 +186,142 @@ pub fn owner_dir_in(data_dir: &Path) -> Result<PathBuf> {
     Ok(mine)
 }
 
-fn lock_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join(format!("{id}.lock"))
+/// A user's owner directory, held open. Every record is created, read, renamed and removed
+/// through this descriptor, never by path: under sudo root works in a data directory a
+/// user owns, and that user could otherwise move another directory in place of root's
+/// between the check and the use, and make root act on records it did not write.
+struct OwnerDir {
+    path: PathBuf,
+    fd: File,
 }
 
-fn record_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join(format!("{id}.json"))
-}
+impl OwnerDir {
+    /// Open `path` without following a symlink, and refuse it unless it is a directory of
+    /// this user's that no one else can write, judged on the descriptor itself.
+    fn open(path: &Path) -> Result<Self> {
+        use nix::fcntl::OFlag;
+        let fd = nix::fcntl::open(
+            path,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )
+        .with_context(|| format!("opening owner directory {}", path.display()))?;
+        let fd = File::from(fd);
+        let metadata = fd
+            .metadata()
+            .with_context(|| format!("reading owner directory {}", path.display()))?;
+        let euid = nix::unistd::geteuid().as_raw();
+        if metadata.uid() != euid || metadata.mode() & 0o022 != 0 {
+            bail!(
+                "refusing owner records in {}: it must be owned by uid {euid} and writable by \
+                 no one else (found uid {}, mode {:o})",
+                path.display(),
+                metadata.uid(),
+                metadata.mode() & 0o7777
+            );
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            fd,
+        })
+    }
 
-fn record_temp_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join(format!("{id}.json.tmp"))
-}
+    fn display(&self, name: &str) -> String {
+        self.path.join(name).display().to_string()
+    }
 
-fn remove_if_exists(path: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        result => result,
+    fn open_file(&self, name: &str, flags: nix::fcntl::OFlag) -> nix::Result<File> {
+        use nix::fcntl::OFlag;
+        nix::fcntl::openat(
+            &self.fd,
+            name,
+            flags | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .map(File::from)
+    }
+
+    /// The identity of `name` in the directory, or `None` when there is nothing there.
+    fn identity(&self, name: &str) -> Result<Option<(u64, u64)>> {
+        match nix::sys::stat::fstatat(&self.fd, name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(stat) => Ok(Some((stat.st_dev, stat.st_ino))),
+            Err(nix::errno::Errno::ENOENT) => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("reading {}", self.display(name))),
+        }
+    }
+
+    fn remove(&self, name: &str) -> Result<()> {
+        match nix::unistd::unlinkat(&self.fd, name, nix::unistd::UnlinkatFlags::NoRemoveDir) {
+            Ok(()) | Err(nix::errno::Errno::ENOENT) => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("removing {}", self.display(name))),
+        }
+    }
+
+    fn read(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        use std::io::Read;
+        let mut file = match self.open_file(name, nix::fcntl::OFlag::O_RDONLY) {
+            Ok(file) => file,
+            Err(nix::errno::Errno::ENOENT) => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("opening {}", self.display(name)))
+            }
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .with_context(|| format!("reading {}", self.display(name)))?;
+        Ok(Some(bytes))
+    }
+
+    fn names(&self) -> Result<Vec<String>> {
+        use nix::fcntl::OFlag;
+        let listing = nix::dir::Dir::openat(
+            &self.fd,
+            ".",
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )
+        .with_context(|| format!("listing {}", self.path.display()))?;
+        let mut names = Vec::new();
+        for entry in listing {
+            let entry = entry.with_context(|| format!("listing {}", self.path.display()))?;
+            if let Ok(name) = entry.file_name().to_str() {
+                if name != "." && name != ".." {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        Ok(names)
     }
 }
 
-/// Lock `path` exclusively, creating it if needed. `None` when `wait` is false and someone
-/// holds it. A lock file is unlinked by whoever completes or reclaims its owner while still
-/// holding it, so the lock is retaken until the inode held is the one at the path.
-fn lock_owner_file(path: &Path, wait: bool) -> Result<Option<Flock<File>>> {
+fn lock_name(id: &str) -> String {
+    format!("{id}.lock")
+}
+
+fn record_name(id: &str) -> String {
+    format!("{id}.json")
+}
+
+fn record_temp_name(id: &str) -> String {
+    format!("{id}.json.tmp")
+}
+
+#[cfg(test)]
+fn record_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(record_name(id))
+}
+
+/// Lock the owner `id`'s lock file exclusively, creating it if needed. `None` when `wait`
+/// is false and someone holds it. A lock file is unlinked by whoever completes or reclaims
+/// its owner while still holding it, so the lock is retaken until the inode held is the
+/// one at the name.
+fn lock_owner_file(dir: &OwnerDir, id: &str, wait: bool) -> Result<Option<Flock<File>>> {
+    use nix::fcntl::OFlag;
+    let name = lock_name(id);
     loop {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)
-            .with_context(|| format!("opening {}", path.display()))?;
+        let file = dir
+            .open_file(&name, OFlag::O_CREAT | OFlag::O_WRONLY)
+            .with_context(|| format!("opening {}", dir.display(&name)))?;
         let arg = if wait {
             FlockArg::LockExclusive
         } else {
@@ -225,19 +331,14 @@ fn lock_owner_file(path: &Path, wait: bool) -> Result<Option<Flock<File>>> {
             Ok(guard) => guard,
             Err((_, nix::errno::Errno::EWOULDBLOCK)) if !wait => return Ok(None),
             Err((_, error)) => {
-                return Err(error).with_context(|| format!("locking {}", path.display()))
+                return Err(error).with_context(|| format!("locking {}", dir.display(&name)))
             }
         };
         let held = guard
             .metadata()
-            .with_context(|| format!("reading the identity of {}", path.display()))?;
-        match std::fs::metadata(path) {
-            Ok(current) if (current.dev(), current.ino()) == (held.dev(), held.ino()) => {
-                return Ok(Some(guard))
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+            .with_context(|| format!("reading the identity of {}", dir.display(&name)))?;
+        if dir.identity(&name)? == Some((held.dev(), held.ino())) {
+            return Ok(Some(guard));
         }
     }
 }
@@ -252,25 +353,31 @@ fn release(lock: Flock<File>) {
     drop(file);
 }
 
-fn write_record(dir: &Path, id: &str, resources: &[Resource]) -> Result<()> {
+fn write_record(dir: &OwnerDir, id: &str, resources: &[Resource]) -> Result<()> {
+    use nix::fcntl::OFlag;
+    use std::io::Write;
     let record = Record {
         pid: std::process::id(),
         boot_id: boot_id(),
         resources: resources.to_vec(),
     };
-    let temp = record_temp_path(dir, id);
-    std::fs::write(&temp, serde_json::to_vec(&record)?)
-        .with_context(|| format!("writing {}", temp.display()))?;
-    std::fs::rename(&temp, record_path(dir, id))
+    let temp = record_temp_name(id);
+    let mut file = dir
+        .open_file(&temp, OFlag::O_CREAT | OFlag::O_WRONLY | OFlag::O_TRUNC)
+        .with_context(|| format!("creating {}", dir.display(&temp)))?;
+    file.write_all(&serde_json::to_vec(&record)?)
+        .with_context(|| format!("writing {}", dir.display(&temp)))?;
+    drop(file);
+    nix::fcntl::renameat(&dir.fd, temp.as_str(), &dir.fd, record_name(id).as_str())
         .with_context(|| format!("publishing the owner record of {id}"))
 }
 
 /// Delete an owner's files. The caller holds `lock`, and the lock file goes last so that
 /// no one can take a new lock on the id while its record still exists.
-fn delete_owner_files(dir: &Path, id: &str, lock: Flock<File>) -> Result<()> {
-    remove_if_exists(&record_path(dir, id))
-        .and_then(|()| remove_if_exists(&record_temp_path(dir, id)))
-        .and_then(|()| remove_if_exists(&lock_path(dir, id)))
+fn delete_owner_files(dir: &OwnerDir, id: &str, lock: Flock<File>) -> Result<()> {
+    dir.remove(&record_name(id))
+        .and_then(|()| dir.remove(&record_temp_name(id)))
+        .and_then(|()| dir.remove(&lock_name(id)))
         .with_context(|| format!("deleting the owner record of {id}"))?;
     release(lock);
     Ok(())
@@ -285,7 +392,7 @@ struct OwnerState {
 
 struct Inner {
     id: String,
-    dir: PathBuf,
+    dir: OwnerDir,
     state: Mutex<OwnerState>,
 }
 
@@ -317,9 +424,10 @@ impl Owner {
         if owners.get(id).and_then(Weak::upgrade).is_some() {
             bail!("resources under {id} already have an owner in this process");
         }
-        let lock = lock_owner_file(&lock_path(dir, id), true)?
+        let owner_dir = OwnerDir::open(dir)?;
+        let lock = lock_owner_file(&owner_dir, id, true)?
             .context("an owner lock taken with waiting returned none")?;
-        if record_path(dir, id).exists() {
+        if owner_dir.identity(&record_name(id))?.is_some() {
             bail!(
                 "an owner record for {id} already exists in {}; ids are never reused",
                 dir.display()
@@ -327,7 +435,7 @@ impl Owner {
         }
         let inner = Arc::new(Inner {
             id: id.to_string(),
-            dir: dir.to_path_buf(),
+            dir: owner_dir,
             state: Mutex::new(OwnerState {
                 lock: Some(lock),
                 resources: Vec::new(),
@@ -815,19 +923,19 @@ pub async fn reclaim_abandoned() -> Reclaimed {
 }
 
 /// [`reclaim_abandoned`] in an explicit owner directory.
-pub async fn reclaim_abandoned_in(dir: &Path) -> Reclaimed {
+pub async fn reclaim_abandoned_in(path: &Path) -> Reclaimed {
     let mut done = Reclaimed::default();
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
+    let names = match OwnerDir::open(path).and_then(|dir| dir.names().map(|names| (dir, names))) {
+        Ok(listed) => listed,
         Err(error) => {
-            warn!(dir = %dir.display(), %error, "cannot read owner records");
+            warn!(dir = %path.display(), error = %format!("{error:#}"), "cannot read owner records");
             return done;
         }
     };
+    let (dir, names) = names;
+    let dir = &dir;
     let mut ids = std::collections::BTreeSet::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
+    for name in &names {
         if let Some(id) = name
             .strip_suffix(".lock")
             .or_else(|| name.strip_suffix(".json"))
@@ -836,7 +944,7 @@ pub async fn reclaim_abandoned_in(dir: &Path) -> Reclaimed {
         }
     }
     for id in ids {
-        let lock = match lock_owner_file(&lock_path(dir, &id), false) {
+        let lock = match lock_owner_file(dir, &id, false) {
             Ok(Some(lock)) => lock,
             // Its owner is alive.
             Ok(None) => continue,
@@ -845,11 +953,11 @@ pub async fn reclaim_abandoned_in(dir: &Path) -> Reclaimed {
                 continue;
             }
         };
-        let record = match std::fs::read(record_path(dir, &id)) {
-            Ok(bytes) => bytes,
+        let record = match dir.read(&record_name(&id)) {
+            Ok(Some(bytes)) => bytes,
             // An owner that recorded nothing, or one that is between creating its lock
             // and taking it (it finds the file gone and makes a new one).
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None) => {
                 if let Err(error) = delete_owner_files(dir, &id, lock) {
                     warn!(owner = %id, error = %format!("{error:#}"), "cannot delete an empty owner lock");
                 }
@@ -1394,5 +1502,32 @@ mod tests {
         drop(own_lease);
         assert_eq!(reclaim_abandoned_in(&dir).await.owners, 1);
         assert!(!made.exists());
+    }
+
+    /// Records are read through the owner directory's own descriptor, opened without
+    /// following a symlink, so a directory put in its place (a symlink to one another
+    /// user wrote) is refused instead of read.
+    #[tokio::test]
+    async fn an_owner_directory_replaced_by_a_symlink_is_refused() {
+        let (root, _dir) = test_dir();
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let forged = root.path().join("forged");
+        std::fs::create_dir(&forged).unwrap();
+        let record = Record {
+            pid: 1,
+            boot_id: boot_id(),
+            resources: vec![Resource::Temp {
+                path: victim.clone(),
+            }],
+        };
+        std::fs::write(forged.join("x.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+        let link = root.path().join("swapped");
+        std::os::unix::fs::symlink(&forged, &link).unwrap();
+        assert_eq!(reclaim_abandoned_in(&link).await, Reclaimed::default());
+        assert!(
+            victim.exists(),
+            "a record read through a symlink removed its path"
+        );
     }
 }
