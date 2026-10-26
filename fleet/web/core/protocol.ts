@@ -111,6 +111,9 @@ export interface RelaunchAll {
   ec2_capacity_wait_ms: number;
   /** When the EC2 half's current wait for capacity began, or null. */
   ec2_waiting_since: number | null;
+  /** Each half's measured time once it is back (the coordinator's, capacity waits excluded per tile), or null. */
+  fcvm_ms: number | null;
+  ec2_ms: number | null;
 }
 
 /** One half's measured restart times. Every number is the coordinator's. */
@@ -660,6 +663,8 @@ function parseRelaunchAll(ra: unknown): RelaunchAll | null {
     ec2_gpus: numOrNull(ra, "ec2_gpus", w),
     ec2_capacity_wait_ms: numOrNull(ra, "ec2_capacity_wait_ms", w) ?? 0,
     ec2_waiting_since: numOrNull(ra, "ec2_waiting_since", w),
+    fcvm_ms: numOrNull(ra, "fcvm_ms", w),
+    ec2_ms: numOrNull(ra, "ec2_ms", w),
   };
 }
 

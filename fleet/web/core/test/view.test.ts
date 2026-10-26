@@ -67,6 +67,8 @@ function race(start: number, over: Partial<RelaunchAll> = {}): RelaunchAll {
     ec2_gpus: 4,
     ec2_capacity_wait_ms: 0,
     ec2_waiting_since: null,
+    fcvm_ms: null,
+    ec2_ms: null,
     ...over,
   };
 }
@@ -254,6 +256,21 @@ describe("failure states", () => {
     expect(v.race).toEqual({ label: "", clocks: [], end: "fcvm back in 3.1 s · EC2 back in 45 s · 15× faster" });
     expect(v.tiles.every((t) => t.chip === null && t.clock === "")).toBe(true);
     expect(view(stateWith(st), start + 49_000 + END_CARD_MS).race).toBeNull();
+    // The coordinator leaves each tile's own wait out, so its time can be longer than the half's
+    // wall time less the longest wait: a tile back at 60 s without waiting, another at 50 s after
+    // a 30 s wait, is 60 s, not 30 s. The card, the announcement and the half's frozen clock say its number.
+    const measured = fleet(2, 2, { relaunch_all: race(start, { fcvm_done_at: start + 3000, ec2_done_at: start + 60_000, fcvm_pending: 0, ec2_pending: 0, ec2_capacity_wait_ms: 30_000, fcvm_ms: 3000, ec2_ms: 60_000 }) });
+    expect(view(stateWith(measured), start + 61_000).race!.end).toBe("fcvm back in 3.0 s · EC2 back in 60 s · 20× faster");
+    expect(view(stateWith(measured), start + 61_000).score!.announce).toContain("EC2: all 4 GPUs streaming again 60 s after the restart");
+    // Without relaunch_all's own figure, the matching race in races[] gives it.
+    const kept = fleet(2, 2, {
+      relaunch_all: race(start, { fcvm_done_at: start + 3000, ec2_done_at: start + 60_000, fcvm_pending: 0, ec2_pending: 0, ec2_capacity_wait_ms: 30_000 }),
+      races: [{ id: 9, started_at: start, by: "v-3", fcvm: { done_at: start + 3000, time_ms: 3000, capacity_wait_ms: 0 }, ec2: { done_at: start + 60_000, time_ms: 60_000, capacity_wait_ms: 30_000 } }],
+    });
+    expect(view(stateWith(kept), start + 61_000).race!.end).toBe("fcvm back in 3.0 s · EC2 back in 60 s · 20× faster");
+    // And a half that is back mid-race freezes at the coordinator's number.
+    const half = fleet(2, 2, { relaunch_all: race(start, { fcvm_done_at: start + 3400, fcvm_pending: 0, fcvm_ms: 3100 }) });
+    expect(view(stateWith(half), start + 5000).race!.clocks[0]).toMatchObject({ value: "3.1 s", state: "done" });
   });
 
   it("reads the last race from races[] when the scoreboard has none, then from single restarts", () => {
@@ -468,6 +485,18 @@ describe("the stage", () => {
     expect(v.sentence).toBe("Each square is its own virtual machine with its own NVIDIA GPU. Restart them all and watch which side comes back.");
   });
 
+  it("shortens a half's tag to its name when that half is too narrow for the whole tag", () => {
+    // 960 wide, one fcvm GPU against seven EC2: the fcvm half is 120 px.
+    const v = view(stateWith(fleetSplit(1, 7, 1)), EPOCH, { mosaicArea: { x: 0, y: 0, w: 960, h: 540 } });
+    const [f, e] = v.labels.sides;
+    expect(v.layout!.halfLineX!).toBeLessThan(200);
+    expect(f).toMatchObject({ half: "fcvm", tag: "FCVM", text: "" });
+    expect(e).toMatchObject({ half: "ec2", tag: "EC2", text: "launched from an AMI" });
+    // A phone held upright: both halves are under 320 px.
+    const phone = view(stateWith(fleet()), EPOCH, { mosaicArea: { x: 0, y: 0, w: 390, h: 219 }, phone: true });
+    expect(phone.labels.sides.map((x) => x.text)).toEqual(["", ""]);
+  });
+
   it("says what draws the image in one line, from live numbers", () => {
     const v = view(stateWith(fleet()), EPOCH, { dpr: 2 });
     expect(v.spec).toBe("3200×1800 · 8 × NVIDIA T4 · 30 fps · path traced");
@@ -572,7 +601,7 @@ describe("the activity feed", () => {
       { at: EPOCH + 3, viewer: "v-4", id: "c", name: "word", args: {}, summary: "the text check refused it", outcome: "refused" },
       { at: EPOCH + 5, viewer: "v-4", id: "e", name: "light", args: { pos: [0, 1, 2], color: [1, 1, 1] }, summary: "light", outcome: "committed" },
     ];
-    const race = { started_at: EPOCH + 4, by: "schedule", fcvm_done_at: null, ec2_done_at: null, fcvm_pending: 2, ec2_pending: 2, fcvm_gpus: 2, ec2_gpus: 2, ec2_capacity_wait_ms: 0, ec2_waiting_since: null };
+    const race = { started_at: EPOCH + 4, by: "schedule", fcvm_done_at: null, ec2_done_at: null, fcvm_pending: 2, ec2_pending: 2, fcvm_gpus: 2, ec2_gpus: 2, ec2_capacity_wait_ms: 0, ec2_waiting_since: null, fcvm_ms: null, ec2_ms: null };
     let s = stateWith(fleet(2, 2, { actions, relaunch_all: race }));
     s = msg(s, { type: "hello", viewer: "v-4" });
     const v = view(s, EPOCH + 5000);

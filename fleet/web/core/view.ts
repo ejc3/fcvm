@@ -1102,8 +1102,11 @@ export interface StageLabels {
   empty: { half: Half; text: string; x: number; y: number; align: "right" | "left" } | null;
 }
 
-/** An image narrower than this tags each half with its name alone. */
-export const SIDE_TAG_FULL_W = 640;
+/**
+ * A half narrower than this is tagged with its name alone: the longer tag, 14 px uppercase,
+ * is about 290 px wide, and it must fit between the divider and the image's edge.
+ */
+export const SIDE_TAG_FULL_W = 320;
 
 /** The desktop's top row of controls is this tall; labels drawn on the image start below it. */
 export const HUD_BAND = 72;
@@ -1119,9 +1122,16 @@ function stageLabels(layout: MosaicLayout | null, awake: boolean, phone: boolean
   const img = layout.image;
   const mid = layout.halfLineX;
   const y = phone ? img.y + 8 : Math.max(img.y + 12, HUD_BAND);
-  // On a narrow image (a phone held upright) the tags say only whose half it is.
-  const short = img.w < SIDE_TAG_FULL_W;
-  const side = (half: Half, x: number, align: "left" | "right"): SideTag => ({ half, tag: SIDE_TAGS[half].tag, text: short ? "" : SIDE_TAGS[half].text, x, y, align });
+  // A half too narrow for its whole tag (a phone held upright, or a side with few GPUs) says only whose half it is.
+  const widthOf = (half: Half) => (mid === null ? img.w : half === "fcvm" ? mid - img.x : img.x + img.w - mid);
+  const side = (half: Half, x: number, align: "left" | "right"): SideTag => ({
+    half,
+    tag: SIDE_TAGS[half].tag,
+    text: widthOf(half) < SIDE_TAG_FULL_W ? "" : SIDE_TAGS[half].text,
+    x,
+    y,
+    align,
+  });
   if (mid === null) {
     // One side has every GPU: it takes the whole width, and the other says it is empty.
     const present: Half = layout.split >= 1 ? "fcvm" : "ec2";

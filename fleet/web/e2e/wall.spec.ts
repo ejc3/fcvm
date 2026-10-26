@@ -96,6 +96,23 @@ test("the render is the page: the image fills the screen, the controls sit over 
   await expect(page.getByTestId("hint")).toHaveCount(0);
 });
 
+test("every control stays on screen from just above the phone breakpoint up", async ({ page }) => {
+  await openWall(page, 15);
+  // The mock lends a GPU, so "Get your own GPU" is in the row too.
+  await expect(page.getByTestId("own-gpu")).toBeVisible();
+  for (const width of [701, 760, 860, 1024, 1280]) {
+    await page.setViewportSize({ width, height: 700 });
+    await page.waitForTimeout(150);
+    const off = await page.evaluate(() =>
+      [...document.querySelectorAll(".hud-top button, .hud-bottom button")]
+        .map((el) => ({ name: el.getAttribute("aria-label") ?? el.textContent?.trim() ?? "", r: el.getBoundingClientRect() }))
+        .filter((x) => x.r.width > 0 && (x.r.left < 0 || x.r.right > window.innerWidth || x.r.top < 0 || x.r.bottom > window.innerHeight))
+        .map((x) => `${x.name} ${Math.round(x.r.left)}..${Math.round(x.r.right)}`),
+    );
+    expect(off, `at ${width} px`).toEqual([]);
+  }
+});
+
 test("no seam: pixels on both sides of every boundary match the picture at the drawn t", { tag: "@engines" }, async ({ page }) => {
   await openWall(page, 15);
   const r = await seamReport(page);

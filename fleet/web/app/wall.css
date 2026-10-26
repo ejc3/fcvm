@@ -60,7 +60,10 @@ h1, h2, h3, p { margin: 0; }
 .brand h1 { font-size: 24px; font-weight: 600; line-height: 1.15; letter-spacing: -0.01em; }
 .live-badge { display: inline-flex; align-items: center; gap: 6px; padding: 1px 8px; border-radius: 4px; font: 600 14px var(--mono); letter-spacing: 0.08em; color: #ffd0d0; background: rgba(180, 20, 20, 0.55); text-shadow: none; }
 .live-badge .dot { width: 8px; height: 8px; border-radius: 4px; background: #ff5a5a; box-shadow: 0 0 8px #ff5a5a; }
-.hud-top .actions { flex: none; display: flex; align-items: flex-start; gap: 10px; }
+/* Between the phone breakpoint and a wide window the title and the controls do not fit one
+   row: the controls wrap under it, right-aligned, rather than run off the screen. */
+.hud-top { flex-wrap: wrap; }
+.hud-top .actions { flex: 0 1 auto; margin-left: auto; display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: flex-start; gap: 10px; }
 .hud-top .actions .viewers { align-self: center; text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8); }
 .viewers { font-size: 14px; color: var(--text); margin-right: 4px; }
 .own-btn { display: inline-flex; flex-direction: column; align-items: flex-end; gap: 2px; max-width: 260px; }

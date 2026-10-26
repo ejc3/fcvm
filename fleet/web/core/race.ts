@@ -92,6 +92,24 @@ function raceCounts(st: FleetState, ra: RelaunchAll, h: Half): { gpus: number; b
   return { gpus, back };
 }
 
+/**
+ * A finished half's time, click to its last first frame without capacity waits: the
+ * coordinator's own measurement (`relaunch_all.<half>_ms`, else the matching race in
+ * `races`), which leaves each tile's own wait out. Only a coordinator that sends neither
+ * gets the page's estimate, the half's wall time less the longest wait. Null while the
+ * half runs.
+ */
+export function halfTimeMs(st: FleetState, ra: RelaunchAll, h: Half): number | null {
+  const doneAt = h === "fcvm" ? ra.fcvm_done_at : ra.ec2_done_at;
+  if (doneAt === null) return null;
+  const measured = h === "fcvm" ? ra.fcvm_ms : ra.ec2_ms;
+  if (measured !== null) return measured;
+  const kept = st.races.find((r) => r.started_at === ra.started_at)?.[h]?.time_ms ?? null;
+  if (kept !== null) return kept;
+  const wall = doneAt - ra.started_at;
+  return h === "ec2" ? wall - Math.min(wall, capacityWaitMs(ra, doneAt)) : wall;
+}
+
 /** Milliseconds EC2 has waited for capacity in this race, up to now. */
 export function capacityWaitMs(ra: RelaunchAll, now: number): number {
   return ra.ec2_capacity_wait_ms + (ra.ec2_waiting_since !== null ? Math.max(0, now - ra.ec2_waiting_since) : 0);
@@ -144,7 +162,7 @@ function raceBar(st: FleetState, ra: RelaunchAll, h: Half, now: number, axis: nu
     hatch: wait / axis,
     hatchFirst: true,
     lastMark: null,
-    value: done ? fmt.seconds(counted) : fmt.raceClock(counted),
+    value: done ? fmt.seconds(halfTimeMs(st, ra, h)!) : fmt.raceClock(counted),
     valueLabel: done ? "back in" : "restarting",
     line: backLine(gpus, back, done) + outLine,
     hatchLabel: waitingNow
@@ -165,14 +183,13 @@ export function raceAnnouncement(st: FleetState): string {
   const parts: string[] = [];
   if (ra.fcvm_done_at !== null) {
     const { gpus } = raceCounts(st, ra, "fcvm");
-    parts.push(`fcvm: ${backLine(gpus, gpus, true)} ${fmt.seconds(ra.fcvm_done_at - ra.started_at)} after the restart.`);
+    parts.push(`fcvm: ${backLine(gpus, gpus, true)} ${fmt.seconds(halfTimeMs(st, ra, "fcvm")!)} after the restart.`);
   }
   if (ra.ec2_done_at !== null) {
     const { gpus } = raceCounts(st, ra, "ec2");
     const wait = Math.min(ra.ec2_done_at - ra.started_at, capacityWaitMs(ra, ra.ec2_done_at));
-    const counted = ra.ec2_done_at - ra.started_at - wait;
     const tail = wait > 0 ? `, not counting ${fmt.seconds(wait)} when AWS had no spot GPU` : "";
-    parts.push(`EC2: ${backLine(gpus, gpus, true)} ${fmt.seconds(counted)} after the restart${tail}.`);
+    parts.push(`EC2: ${backLine(gpus, gpus, true)} ${fmt.seconds(halfTimeMs(st, ra, "ec2")!)} after the restart${tail}.`);
   }
   return parts.join(" ");
 }
@@ -316,9 +333,8 @@ export function ratioText(fcvmMs: number, ec2Ms: number): string {
 /** The finished race in one line, from the coordinator's times, or null while a half still runs. */
 export function raceResult(st: FleetState, ra: RelaunchAll): string | null {
   if (ra.fcvm_done_at === null || ra.ec2_done_at === null) return null;
-  const f = raceCounts(st, ra, "fcvm").gpus > 0 ? ra.fcvm_done_at - ra.started_at : null;
-  const wait = Math.min(ra.ec2_done_at - ra.started_at, capacityWaitMs(ra, ra.ec2_done_at));
-  const e = raceCounts(st, ra, "ec2").gpus > 0 ? ra.ec2_done_at - ra.started_at - wait : null;
+  const f = raceCounts(st, ra, "fcvm").gpus > 0 ? halfTimeMs(st, ra, "fcvm") : null;
+  const e = raceCounts(st, ra, "ec2").gpus > 0 ? halfTimeMs(st, ra, "ec2") : null;
   const parts: string[] = [];
   if (f !== null) parts.push(`fcvm back in ${fmt.seconds(f)}`);
   if (e !== null) parts.push(`EC2 back in ${fmt.seconds(e)}`);
@@ -339,7 +355,7 @@ export function raceOnImage(st: FleetState, now: number, image: { x: number; y: 
     return { label: "", clocks: [], end: raceResult(st, ra) };
   }
   const clocks: HalfClock[] = [];
-  const fcvmMs = ra.fcvm_done_at === null ? null : ra.fcvm_done_at - ra.started_at;
+  const fcvmMs = halfTimeMs(st, ra, "fcvm");
   for (const h of ["fcvm", "ec2"] as const) {
     const { gpus, back } = raceCounts(st, ra, h);
     if (gpus === 0 || !image) continue;
@@ -349,6 +365,7 @@ export function raceOnImage(st: FleetState, now: number, image: { x: number; y: 
     const wait = h === "ec2" ? Math.min(total, capacityWaitMs(ra, end)) : 0;
     const counted = total - wait;
     const done = doneAt !== null;
+    const measured = halfTimeMs(st, ra, h);
     const x0 = h === "fcvm" ? image.x : image.x + image.w * split;
     const w = h === "fcvm" ? image.w * split : image.w * (1 - split);
     let sub = done ? (gpus === 1 ? "its GPU is back" : `all ${gpus} GPUs back`) : `${back} of ${fmt.count(gpus, "GPU", "GPUs")} back`;
@@ -364,7 +381,7 @@ export function raceOnImage(st: FleetState, now: number, image: { x: number; y: 
       half: h,
       x: x0 + w / 2,
       y: image.y + image.h * 0.62,
-      value: done ? fmt.seconds(counted) : fmt.raceClock(counted),
+      value: measured !== null ? fmt.seconds(measured) : fmt.raceClock(counted),
       state: done ? "done" : "counting",
       sub,
       hatch: wait > 0 ? `not counting ${Math.round(wait / 1000)} s AWS spent finding a spot GPU` : "",
