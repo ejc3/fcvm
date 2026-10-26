@@ -10,7 +10,7 @@ use crate::cli::{
     SnapshotsPruneArgs,
 };
 use crate::paths;
-use crate::storage::{SnapshotConfig, SnapshotManager, SnapshotType};
+use crate::storage::{SnapshotConfig, SnapshotGeneration, SnapshotManager, SnapshotType};
 
 /// Main dispatcher for snapshots management commands
 pub async fn cmd_snapshots(args: SnapshotsArgs) -> Result<()> {
@@ -369,6 +369,84 @@ pub(crate) fn prune_reclaims(
     }
 }
 
+/// A snapshot prune decided to delete, with the generation that decision read.
+struct PruneCandidate {
+    name: String,
+    config: SnapshotConfig,
+    generation: SnapshotGeneration,
+}
+
+/// The snapshots under `manager` that `prune_reclaims` selects.
+///
+/// The snapshot directory also holds a create's staging directories: `<key>.creating`,
+/// which holds the new generation's `config.json` until it is renamed to `<key>`, and
+/// `<key>.old`, the generation a replacement moved aside. Neither is a snapshot, and the
+/// creator holds `<key>.lock`, not their own lock, so a delete of one runs under the
+/// creator. A staging directory's config names the snapshot it belongs to, not the
+/// directory, so a directory is a snapshot only when its config names it.
+async fn prune_candidates(
+    manager: &SnapshotManager,
+    prune_all: bool,
+    image: Option<&str>,
+) -> Result<Vec<PruneCandidate>> {
+    let mut candidates = Vec::new();
+    for name in manager.list_snapshots().await? {
+        if let Ok((config, generation)) = manager.load_snapshot_with_generation(&name).await {
+            if config.name != name {
+                continue;
+            }
+            if prune_reclaims(&config, prune_all, image) {
+                candidates.push(PruneCandidate {
+                    name,
+                    config,
+                    generation,
+                });
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+struct PruneOutcome {
+    deleted: usize,
+    /// Candidates a create replaced after prune read them, kept.
+    retained: usize,
+    failed: usize,
+}
+
+/// Delete each candidate if it is still the generation prune decided on. The decision
+/// was an unlocked read; the delete takes the generation lock and compares, so a
+/// generation installed in between is kept rather than deleted in its predecessor's
+/// place.
+async fn prune_delete(manager: &SnapshotManager, candidates: Vec<PruneCandidate>) -> PruneOutcome {
+    let mut outcome = PruneOutcome {
+        deleted: 0,
+        retained: 0,
+        failed: 0,
+    };
+    for candidate in candidates {
+        let name = candidate.name;
+        match manager
+            .delete_snapshot_if_generation(&name, &candidate.generation)
+            .await
+        {
+            Ok(true) => {
+                outcome.deleted += 1;
+                info!("Deleted {}", name);
+            }
+            Ok(false) => {
+                outcome.retained += 1;
+                info!("Kept {}: it changed after prune selected it", name);
+            }
+            Err(e) => {
+                outcome.failed += 1;
+                tracing::warn!("Failed to delete {}: {}", name, e);
+            }
+        }
+    }
+    outcome
+}
+
 /// Delete snapshots (system-only by default, or all with --all)
 async fn cmd_snapshots_prune(args: SnapshotsPruneArgs) -> Result<()> {
     let prune_all = args.all;
@@ -377,18 +455,8 @@ async fn cmd_snapshots_prune(args: SnapshotsPruneArgs) -> Result<()> {
     info!("Pruning {} snapshots", type_desc);
 
     let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
-    let snapshot_names = snapshot_manager.list_snapshots().await?;
-
-    // Find snapshots to delete (all or just system, optionally filtered by image)
-    let mut snapshots_to_delete: Vec<(String, SnapshotConfig)> = Vec::new();
-
-    for name in snapshot_names {
-        if let Ok(config) = snapshot_manager.load_snapshot(&name).await {
-            if prune_reclaims(&config, prune_all, args.image.as_deref()) {
-                snapshots_to_delete.push((name, config));
-            }
-        }
-    }
+    let snapshots_to_delete =
+        prune_candidates(&snapshot_manager, prune_all, args.image.as_deref()).await?;
 
     if snapshots_to_delete.is_empty() {
         println!("No {} snapshots to prune.", type_desc);
@@ -397,8 +465,8 @@ async fn cmd_snapshots_prune(args: SnapshotsPruneArgs) -> Result<()> {
 
     // Calculate total size
     let mut total_size = 0u64;
-    for (name, _) in &snapshots_to_delete {
-        let dir = paths::snapshot_dir().join(name);
+    for candidate in &snapshots_to_delete {
+        let dir = paths::snapshot_dir().join(&candidate.name);
         total_size += calculate_dir_size(&dir).await.unwrap_or(0);
     }
 
@@ -410,10 +478,10 @@ async fn cmd_snapshots_prune(args: SnapshotsPruneArgs) -> Result<()> {
             type_desc,
             format_size(total_size)
         );
-        for (name, config) in &snapshots_to_delete {
+        for candidate in &snapshots_to_delete {
             println!(
                 "  {} ({}, {})",
-                name, config.snapshot_type, config.metadata.image
+                candidate.name, candidate.config.snapshot_type, candidate.config.metadata.image
             );
         }
         print!("\nDelete all? [y/N] ");
@@ -428,22 +496,11 @@ async fn cmd_snapshots_prune(args: SnapshotsPruneArgs) -> Result<()> {
         }
     }
 
-    // Delete snapshots
-    let mut deleted = 0;
-    let mut failed = 0;
-
-    for (name, _) in snapshots_to_delete {
-        match snapshot_manager.delete_snapshot(&name).await {
-            Ok(()) => {
-                deleted += 1;
-                info!("Deleted {}", name);
-            }
-            Err(e) => {
-                failed += 1;
-                tracing::warn!("Failed to delete {}: {}", name, e);
-            }
-        }
-    }
+    let PruneOutcome {
+        deleted,
+        retained,
+        failed,
+    } = prune_delete(&snapshot_manager, snapshots_to_delete).await;
 
     println!(
         "Pruned {} {} snapshot(s), freed ~{}",
@@ -451,6 +508,13 @@ async fn cmd_snapshots_prune(args: SnapshotsPruneArgs) -> Result<()> {
         type_desc,
         format_size(total_size)
     );
+
+    if retained > 0 {
+        println!(
+            "Kept {} snapshot(s) replaced after they were selected",
+            retained
+        );
+    }
 
     if failed > 0 {
         bail!("Failed to delete {} snapshot(s)", failed);
@@ -521,6 +585,91 @@ mod tests {
         assert!(prune_reclaims(&cache, false, None));
         assert!(!prune_reclaims(&named, false, None));
         assert!(prune_reclaims(&named, true, None));
+    }
+
+    /// Writes `config` as `<root>/<dir>/config.json`, the way a create writes
+    /// it into its staging directory before the rename.
+    fn write_config(root: &std::path::Path, dir: &str, config: &SnapshotConfig) {
+        let dir = root.join(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec_pretty(config).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn cache_snapshot(name: &str, vm_id: &str) -> SnapshotConfig {
+        let mut snapshot = config(SnapshotType::System, "nginx:alpine");
+        snapshot.name = name.to_string();
+        snapshot.vm_id = vm_id.to_string();
+        snapshot.generation_id = uuid::Uuid::new_v4();
+        snapshot
+    }
+
+    /// A create writes `config.json` into `<key>.creating` before it renames
+    /// the directory to `<key>`, and a replacement moves the previous
+    /// generation aside to `<key>.old`. Neither is a snapshot: the creator
+    /// holds `<key>.lock`, not `<key>.creating.lock`, so a prune that took the
+    /// staging directory for a cache entry removed it under the creator, and
+    /// the create failed at its rename.
+    ///
+    /// RED BEFORE THE FIX (issue 1180): both staging directories were selected
+    /// as System snapshots and deleted.
+    #[tokio::test]
+    async fn prune_never_deletes_a_snapshot_that_is_being_created_or_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SnapshotManager::new(root.path().to_path_buf());
+        write_config(
+            root.path(),
+            "key.creating",
+            &cache_snapshot("key", "vm-new"),
+        );
+        write_config(root.path(), "key.old", &cache_snapshot("key", "vm-old"));
+        // A published snapshot whose own tag ends in a staging suffix is
+        // still pruned: the name its config records is the directory's.
+        write_config(root.path(), "tag.old", &cache_snapshot("tag.old", "vm-tag"));
+
+        let candidates = prune_candidates(&manager, false, None).await.unwrap();
+        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["tag.old"]);
+        let outcome = prune_delete(&manager, candidates).await;
+        assert_eq!((outcome.deleted, outcome.failed), (1, 0));
+        for staging in ["key.creating", "key.old"] {
+            assert!(
+                root.path().join(staging).join("config.json").exists(),
+                "prune removed the staging directory {staging}"
+            );
+        }
+        assert!(!root.path().join("tag.old").exists());
+    }
+
+    /// Prune decides from an unlocked read and deletes later, under the
+    /// generation lock. A create that installs a new generation of the same key
+    /// in between holds that lock until its rename, so the delete runs after
+    /// it and must find the generation it decided on, not the replacement.
+    ///
+    /// RED BEFORE THE FIX (issue 1180): the delete removed whatever generation
+    /// was installed when it ran.
+    #[tokio::test]
+    async fn prune_retains_a_generation_installed_after_its_decision() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SnapshotManager::new(root.path().to_path_buf());
+        manager
+            .save_snapshot(cache_snapshot("key", "vm-decided"))
+            .await
+            .unwrap();
+        let candidates = prune_candidates(&manager, false, None).await.unwrap();
+        assert_eq!(candidates.len(), 1);
+
+        manager
+            .save_snapshot(cache_snapshot("key", "vm-replacement"))
+            .await
+            .unwrap();
+        let outcome = prune_delete(&manager, candidates).await;
+        assert_eq!((outcome.deleted, outcome.failed), (0, 0));
+        let retained = manager.load_snapshot("key").await.unwrap();
+        assert_eq!(retained.vm_id, "vm-replacement");
     }
 
     #[test]
