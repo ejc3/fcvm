@@ -300,6 +300,36 @@ per-launch path:
 The remaining `resume → exec-server-ready` (~221 ms) is guest-side work (fc-agent
 restore handshake) and is the next target.
 
+### Clone Clock Offset After Restore
+
+A restored clone's `CLOCK_REALTIME` against the host's, from the restore ACK to
+10 s after it (issue #1194, measured after #1301 sent the host clock in
+nanoseconds). Each clone's guest ran `date +%s.%N` once per line written to one
+`fcvm exec --vm -i` session, every 100 ms from the moment the clone's stdout
+summary line (printed after the guest's ACK) appeared. Every guest read is
+bracketed by two host reads; the offset is guest minus the bracket's midpoint.
+
+Measured on c8g.metal-24xl, nginx:alpine, rootless networking, UFFD copy mode,
+40 sequential clones of one snapshot, 1-minute load average 0.04 to 0.93:
+
+| After the ACK | median offset (guest - host) | p95 \|offset\| | max \|offset\| |
+|--------|--------|----------------|----------------|
+| 0.1 s | -1.14 ms | 2.32 ms | 2.92 ms |
+| 1 s | -1.15 ms | 2.34 ms | 2.92 ms |
+| 5 s | -1.15 ms | 2.34 ms | 2.94 ms |
+| 10 s | -0.77 ms | 3.25 ms | 4.59 ms |
+
+The first sample, 0.5 ms after the ACK, includes opening the exec session, so its
+bracket is 7 to 28 ms wide; the guest's read fell inside it for all 40 clones.
+After that the bracket's half-width was 0.22 ms (median). The guest
+lands about 1 ms behind the host and stays there: there is no offset to decay.
+Within one clone the offset moved by at most 4.6 ms between 0.1 s and 10 s
+(median 1.0 ms).
+The ACKs fell across the whole second (fraction 0.044 to 0.990); before #1301 the
+host's whole-second stamp left a clone behind by that fraction. `clock_ms` (the
+guest's step, from the ACK's phases) was 0.58 ms median. The integration test
+`test_clone_clock_matches_the_host_to_a_tenth_of_a_second` uses the same bracketing.
+
 ---
 
 ## Memory Efficiency
