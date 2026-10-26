@@ -2,19 +2,32 @@
 //
 // Each tile keeps a short buffer of decoded frames, each stamped with its scene
 // time t. Renderers share a clock and a frame rate, so their frames land on the
-// same t values. On every draw the page picks one T, the frame time the most
-// keeping-up tiles hold (the latest, on a tie), and shows each tile's frame at
-// exactly T. A tile with no frame at T
+// same t values. On every draw the page picks one T and shows each tile's frame at
+// exactly T. T is the latest frame time every keeping-up tile holds, so the image
+// waits for the slowest of them; when none is held by all, it holds where it is
+// while a keeping-up tile catches up to it, and otherwise it is the frame time the
+// most keeping-up tiles hold (the latest, on a tie). A tile with no frame at T
 // shows its newest frame from before T dimmed (it is behind), or nothing if all
 // its frames are after T (it just joined). Nothing is ever drawn from two
 // different times side by side undimmed, so there is no torn seam.
+//
+// A keeping-up tile is one at most MAX_LAG_S behind the newest frame, or, if it was
+// in step on the previous draw, MAX_LAG_S + HOLD_EXTRA_S: a tile whose decode
+// stalls for a moment holds the image instead of flipping between dimmed and in
+// step (the staging wall's fcvm half strobed that way, its frames 0.13 s later than
+// the EC2 half's and one decode in a hundred taking twice as long).
 
 /** Frames within this many seconds of each other are the same frame time. */
 export const SAME_T_EPS = 0.0005;
 /** A tile more than this many seconds behind the newest tile stops holding the others back. */
 export const MAX_LAG_S = 0.35;
-/** Frames a tile keeps decoded and waiting. */
-export const BUFFER_FRAMES = 10;
+/** How much further a tile that was in step may fall behind before it stops holding the others. */
+export const HOLD_EXTRA_S = 0.2;
+/**
+ * Frames a tile keeps decoded and waiting: enough at 30 fps for the tiles that keep up
+ * to still hold the frame a tile MAX_LAG_S + HOLD_EXTRA_S behind them is showing.
+ */
+export const BUFFER_FRAMES = 18;
 
 export interface TileBuffer {
   id: string;
@@ -41,13 +54,15 @@ function has(ts: readonly number[], t: number): boolean {
 
 /**
  * Choose the common time. `prevT` keeps T from going backwards when a tile is
- * dropped from the set; `maxLag` bounds how far one slow tile can hold the image.
+ * dropped from the set; `maxLag` bounds how far one slow tile can hold the image,
+ * and a tile in `inStep` (in step on the previous draw) may lag HOLD_EXTRA_S more.
  */
 export function chooseCommonT(
   buffers: readonly TileBuffer[],
   prevT: number | null,
   maxLag: number = MAX_LAG_S,
   maxT: number = Infinity,
+  inStep: ReadonlySet<string> = new Set(),
 ): SyncChoice {
   const show = new Map<string, TileShow>();
   // Frames after maxT are not chosen yet (a mode switch holds the image back
@@ -59,14 +74,14 @@ export function chooseCommonT(
 
   const newest = (b: TileBuffer) => b.ts[b.ts.length - 1]!;
   const newestMax = Math.max(...live.map(newest));
-  const floor = Math.max(newestMax - maxLag, prevT === null ? -Infinity : prevT - SAME_T_EPS);
-  const candidates = live.filter((b) => newest(b) >= floor);
+  const notBefore = prevT === null ? -Infinity : prevT - SAME_T_EPS;
+  const lagOf = (b: TileBuffer) => maxLag + (inStep.has(b.id) ? HOLD_EXTRA_S : 0);
+  const candidates = live.filter((b) => newest(b) >= newestMax - lagOf(b));
+  // Frame times before this are not chosen: too old for any keeping-up tile, or before prevT.
+  const floor = Math.max(newestMax - maxLag - HOLD_EXTRA_S, notBefore);
 
-  // The frame time held by the most keeping-up tiles, the latest of those on a
-  // tie. Counting over every tile's times keeps the choice independent of tile
-  // order, and a slow tile whose frames the others no longer hold loses to them
-  // instead of holding them dark.
-  let T: number | null = prevT;
+  // How many keeping-up tiles hold each frame time. Counting over every tile's
+  // times keeps the choice independent of tile order.
   const counts = new Map<number, { t: number; n: number }>();
   for (const c of candidates) {
     for (const t of c.ts) {
@@ -77,9 +92,26 @@ export function chooseCommonT(
       else counts.set(key, { t, n: 1 });
     }
   }
-  let best: { t: number; n: number } | null = null;
-  for (const e of counts.values()) if (best === null || e.n > best.n || (e.n === best.n && e.t > best.t)) best = e;
-  if (best !== null) T = best.t;
+  let T: number | null = prevT;
+  let all: number | null = null;
+  for (const e of counts.values()) if (e.n === candidates.length && (all === null || e.t > all)) all = e.t;
+  const catchingUp = prevT !== null && candidates.some((c) => newest(c) < prevT - SAME_T_EPS);
+  const othersHoldPrev = prevT !== null && candidates.every((c) => newest(c) < prevT - SAME_T_EPS || has(c.ts, prevT));
+  if (all !== null) {
+    // The latest frame time every keeping-up tile holds: the image waits for the slowest.
+    T = all;
+  } else if (catchingUp && othersHoldPrev) {
+    // A keeping-up tile is behind the picture on screen and the others still hold it:
+    // hold the picture until that tile reaches it, rather than leaving it dimmed.
+    T = prevT;
+  } else {
+    // No frame time all of them hold: the one the most hold, the latest of those on a
+    // tie, so a slow tile whose frames the others no longer hold loses to them
+    // instead of holding them dark.
+    let best: { t: number; n: number } | null = null;
+    for (const e of counts.values()) if (best === null || e.n > best.n || (e.n === best.n && e.t > best.t)) best = e;
+    if (best !== null) T = best.t;
+  }
   if (prevT !== null && T !== null && T < prevT) T = prevT;
 
   for (const b of live) {

@@ -226,9 +226,13 @@ once and answers a repeat with the first receipt.
 sample with the smallest round trip of the last eight. Race clocks, countdowns and frame
 age all use the coordinator's time.
 
-**One common t.** Each tile keeps up to six decoded frames. Every draw picks T, the
-frame time held by the most keeping-up tiles (the latest, on a tie), and draws each
-tile's frame at exactly T. A tile more than 0.35 s behind the newest, or whose frames the
+**One common t.** Each tile keeps up to 18 decoded frames. Every draw picks T and draws
+each tile's frame at exactly T: the latest frame time every keeping-up tile holds, so the
+image waits for the slowest of them; failing that, the picture holds while a keeping-up
+tile catches up to it; failing that, the frame time the most keeping-up tiles hold (the
+latest, on a tie). A tile keeps up while it is at most 0.35 s behind the newest, 0.55 s if
+it was in step on the previous draw, so a decode that stalls for a moment holds the image
+instead of flashing the tile dimmed and back. A tile that does not keep up, or whose frames the
 others no longer hold, is drawn dimmed from its newest frame before T; a tile that just
 joined stays dark until the image reaches its first frame; T never goes back. A decoder
 holding more than eight undecoded chunks drops input until the next keyframe. Two different times are never drawn side by
