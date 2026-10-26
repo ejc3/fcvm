@@ -411,6 +411,10 @@ pub struct SnapshotLoad {
     /// Omitted when None, so older binaries never see the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vsock_override: Option<VsockOverride>,
+    /// Host files the load opens drives from instead of the ones the snapshot names.
+    /// Omitted when None, so a binary without the field never sees it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drive_overrides: Option<Vec<DriveOverride>>,
     /// Host PCI devices the load attaches to the paused VM before any vCPU runs
     /// (ejc3/firecracker agent/vfio-hotplug-v1.17.0 and later). Omitted when None, so a
     /// Firecracker without the field never sees it.
@@ -451,6 +455,14 @@ pub struct NetworkOverride {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VsockOverride {
     pub uds_path: String,
+}
+
+/// A drive the snapshot load opens from another host file (ejc3/firecracker builds
+/// whose `--version` carries `+fcvm.drive-overrides`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriveOverride {
+    pub drive_id: String,
+    pub path_on_host: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

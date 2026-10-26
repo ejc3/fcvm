@@ -1518,7 +1518,8 @@ pub fn find_cloud_hypervisor() -> Result<std::path::PathBuf> {
 fn parse_firecracker_version(output: &str) -> Result<FirecrackerVersion> {
     // Find version number pattern vX.Y.Z, with an optional pre-release suffix (-dev).
     let version_re =
-        regex::Regex::new(r"v?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.]+)?").context("invalid regex")?;
+        regex::Regex::new(r"v?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?")
+            .context("invalid regex")?;
 
     let caps = version_re
         .captures(output)
@@ -1528,9 +1529,14 @@ fn parse_firecracker_version(output: &str) -> Result<FirecrackerVersion> {
     let minor: u32 = caps[2].parse().context("invalid minor version")?;
     let patch: u32 = caps[3].parse().context("invalid patch version")?;
 
+    let build: Vec<&str> = caps
+        .get(5)
+        .map(|build| build.as_str()[1..].split('.').collect())
+        .unwrap_or_default();
     Ok(FirecrackerVersion {
         release: (major, minor, patch),
         prerelease: caps.get(4).is_some(),
+        drive_overrides: build.first() == Some(&"fcvm") && build.contains(&"drive-overrides"),
     })
 }
 
@@ -1541,6 +1547,9 @@ pub(crate) struct FirecrackerVersion {
     pub release: (u32, u32, u32),
     /// Whether the version carries a pre-release suffix such as `-dev`.
     pub prerelease: bool,
+    /// Whether the build metadata says the snapshot load takes `drive_overrides`
+    /// (`+fcvm.drive-overrides`, ejc3/firecracker).
+    pub drive_overrides: bool,
 }
 
 impl FirecrackerVersion {
@@ -2452,6 +2461,95 @@ fn snapshot_load_vsock_override(
         })
 }
 
+/// What a restored clone's snapshot load overrides, which decides what its mount
+/// namespace has to redirect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadOverrides {
+    /// Nothing: disks and vsock both resolve through the redirect.
+    None,
+    /// The vsock path: the disks resolve through the redirect.
+    Vsock,
+    /// Every path the vmstate names under the source VMs' directories, so the VMM
+    /// needs no mount namespace.
+    Everything,
+}
+
+/// The drives a restored clone's load opens from the clone's own files, when the binary
+/// takes `drive_overrides`, the load also overrides the vsock path, and the vmstate names
+/// nothing under the source VMs' directories (`source_dirs`) but those drives and the
+/// vsock socket. Otherwise None, and the VMM keeps reaching those paths through its
+/// mount namespace.
+///
+/// The check is on the vmstate's bytes because a path the snapshot metadata does not list
+/// (a drive added outside fcvm, or metadata that disagrees with the vmstate) would
+/// otherwise be opened at the source VM's own file, the #608 corruption.
+fn snapshot_load_drive_overrides(
+    firecracker_version: FirecrackerVersion,
+    vsock_overridden: bool,
+    vmstate: &[u8],
+    source_dirs: &[PathBuf],
+    source_vsock_socket_path: &Path,
+    extra_disks: &[crate::storage::SnapshotExtraDisk],
+    clone_disk_dir: &Path,
+) -> Option<Vec<crate::firecracker::api::DriveOverride>> {
+    use std::os::unix::ffi::OsStrExt;
+    if !firecracker_version.drive_overrides || !vsock_overridden {
+        return None;
+    }
+    let mut known: Vec<PathBuf> = vec![source_vsock_socket_path.to_path_buf()];
+    for dir in source_dirs {
+        let disks = dir.join("disks");
+        known.push(disks.join("rootfs.raw"));
+        known.extend(extra_disks.iter().map(|disk| disks.join(&disk.filename)));
+    }
+    for dir in source_dirs {
+        let mut prefix = dir.as_os_str().as_bytes().to_vec();
+        prefix.push(b'/');
+        let unknown = vmstate
+            .windows(prefix.len())
+            .enumerate()
+            .filter(|(_, window)| *window == prefix.as_slice())
+            .any(|(at, _)| {
+                !known
+                    .iter()
+                    .any(|path| vmstate[at..].starts_with(path.as_os_str().as_bytes()))
+            });
+        if unknown {
+            info!(
+                source_dir = %dir.display(),
+                "the vmstate names a path under a source VM directory that no override \
+                 covers; the clone keeps its mount namespace"
+            );
+            return None;
+        }
+    }
+    let mut overrides = vec![crate::firecracker::api::DriveOverride {
+        drive_id: "rootfs".to_string(),
+        path_on_host: clone_disk_dir.join("rootfs.raw").display().to_string(),
+    }];
+    overrides.extend(
+        extra_disks
+            .iter()
+            .map(|disk| crate::firecracker::api::DriveOverride {
+                drive_id: disk.drive_id.clone(),
+                path_on_host: clone_disk_dir.join(&disk.filename).display().to_string(),
+            }),
+    );
+    Some(overrides)
+}
+
+/// The VM directories a restore's snapshot names its disks under: the VM the snapshot
+/// lineage started from, and the VM the snapshot was taken of when that is another one.
+fn clone_source_dirs(restore_config: &SnapshotRestoreConfig) -> Vec<PathBuf> {
+    let mut dirs = vec![paths::vm_runtime_dir(&restore_config.original_vm_id)];
+    if let Some(ref snapshot_vm_id) = restore_config.snapshot_vm_id {
+        if snapshot_vm_id != &restore_config.original_vm_id {
+            dirs.push(paths::vm_runtime_dir(snapshot_vm_id));
+        }
+    }
+    dirs
+}
+
 /// The vsock base path a restored VMM's state names, which a snapshot of the clone
 /// embeds: the clone's own path when the load overrode it, else the ancestor's.
 fn restored_vsock_source_path(
@@ -3081,8 +3179,8 @@ async fn prepare_clone_substrate(
     vm_id: &str,
     data_dir: &Path,
     vm_state: &mut VmState,
-    // True when the snapshot load overrides the vsock path, so it needs no redirect.
-    vsock_overridden: bool,
+    // What the snapshot load overrides, so needs no redirect.
+    overrides: LoadOverrides,
 ) -> Result<CloneSubstrate> {
     let vm_dir = data_dir.join("disks");
     let mut holder_child: Option<tokio::process::Child> = None;
@@ -3240,12 +3338,11 @@ async fn prepare_clone_substrate(
     // clone's actual listener should live). Ordered (mountpoint, source) pairs
     // make the VMM open only clone-local disks while binding its socket in the
     // clone's vsock target directory.
-    let mut disk_dirs = vec![paths::vm_runtime_dir(&restore_config.original_vm_id)];
-    if let Some(ref snapshot_vm_id) = restore_config.snapshot_vm_id {
-        if snapshot_vm_id != &restore_config.original_vm_id {
-            disk_dirs.push(paths::vm_runtime_dir(snapshot_vm_id));
-        }
-    }
+    // A load that overrides every such path needs neither the namespace nor the lease.
+    let disk_dirs = match overrides {
+        LoadOverrides::Everything => Vec::new(),
+        LoadOverrides::None | LoadOverrides::Vsock => clone_source_dirs(restore_config),
+    };
     let vsock_target_dir = restore_config
         .vsock_target_dir
         .clone()
@@ -3255,7 +3352,7 @@ async fn prepare_clone_substrate(
         &restore_config.source_vsock_socket_path,
         data_dir,
         &vsock_target_dir,
-        !vsock_overridden,
+        overrides == LoadOverrides::None,
     )?;
     // A split pair binds the clone's disks back INSIDE the vsock target mount,
     // so the nested mountpoint needs a backing directory there.
@@ -3284,7 +3381,13 @@ async fn prepare_clone_substrate(
         redirects = ?redirects.pairs.iter().map(|(m, s)| format!("{} <- {}", m.display(), s.display())).collect::<Vec<_>>(),
         "enabling mount namespace for path isolation"
     );
-    namespace.mount_redirects = Some(redirects);
+    if overrides == LoadOverrides::Everything {
+        info!(
+            "the snapshot load overrides every source path; the VMM runs without a mount namespace"
+        );
+    } else {
+        namespace.mount_redirects = Some(redirects);
+    }
 
     // The VMM opens the snapshot's disks at these directories' paths, which its view
     // binds to the clone's own (utils::MountRedirects), so a teardown that removes them
@@ -3428,6 +3531,27 @@ pub async fn restore_from_snapshot(
         .ok_or_else(|| anyhow::anyhow!("clone {vm_id} has no recorded vsock socket path"))?;
     let vsock_override =
         snapshot_load_vsock_override(firecracker_version, &clone_vsock_socket_path);
+    let vmstate = std::fs::read(&restore_config.vmstate_path).with_context(|| {
+        format!(
+            "reading vmstate for its source paths: {}",
+            restore_config.vmstate_path.display()
+        )
+    })?;
+    let drive_overrides = snapshot_load_drive_overrides(
+        firecracker_version,
+        vsock_override.is_some(),
+        &vmstate,
+        &clone_source_dirs(restore_config),
+        &restore_config.source_vsock_socket_path,
+        &restore_config.extra_disks,
+        &vm_dir,
+    );
+    drop(vmstate);
+    let load_overrides = match (&drive_overrides, &vsock_override) {
+        (Some(_), _) => LoadOverrides::Everything,
+        (None, Some(_)) => LoadOverrides::Vsock,
+        (None, None) => LoadOverrides::None,
+    };
     let firecracker_args = runtime_config.effective_firecracker_args();
 
     // Configure namespace isolation, create the CoW disk, copy extra disks, and compute the
@@ -3438,11 +3562,20 @@ pub async fn restore_from_snapshot(
         vm_id,
         data_dir,
         vm_state,
-        vsock_override.is_some(),
+        load_overrides,
     )
     .await?;
     failpoint::hit_async("restore.post_clone_disk").await;
     let rootfs_path = substrate.rootfs_path;
+    if drive_overrides.is_some() && rootfs_path != vm_dir.join("rootfs.raw") {
+        cleanup_failed_clone_holder(&mut substrate.holder_child, "checking the clone's rootfs")
+            .await;
+        bail!(
+            "the clone's rootfs is {}, not the {} its drive override names",
+            rootfs_path.display(),
+            vm_dir.join("rootfs.raw").display()
+        );
+    }
     let holder_pid_for_post_start = substrate.holder_pid_for_post_start;
     let mut mount_target_lease = Some(substrate.mount_target_lease);
     let mut vsock_redirect_lease = None;
@@ -3562,6 +3695,7 @@ pub async fn restore_from_snapshot(
                     host_dev_name: network_config.tap_device.clone(),
                 }]),
                 vsock_override: vsock_override.clone(),
+                drive_overrides: drive_overrides.clone(),
                 device_passthrough: crate::firecracker::api::DevicePassthrough::for_gpus(gpus),
             })
             .await
@@ -3583,24 +3717,28 @@ pub async fn restore_from_snapshot(
             duration_ms = load_duration.as_millis(),
             track_dirty_pages, "snapshot load completed"
         );
-        // Timing instrumentation: measure disk patch operation
+        // A load without drive overrides opened the rootfs at the snapshot's path; point
+        // the drive at the clone's file by name, so the state and a later snapshot of
+        // this clone name its own path.
         let patch_start = std::time::Instant::now();
-        client
-            .patch_drive(
-                "rootfs",
-                DrivePatch {
-                    drive_id: "rootfs".to_string(),
-                    path_on_host: Some(rootfs_path.display().to_string()),
-                    rate_limiter: None,
-                },
-            )
-            .await
-            .context("retargeting rootfs drive")?;
+        if drive_overrides.is_none() {
+            client
+                .patch_drive(
+                    "rootfs",
+                    DrivePatch {
+                        drive_id: "rootfs".to_string(),
+                        path_on_host: Some(rootfs_path.display().to_string()),
+                        rate_limiter: None,
+                    },
+                )
+                .await
+                .context("retargeting rootfs drive")?;
+            info!(
+                duration_ms = patch_start.elapsed().as_millis(),
+                "disk patch completed"
+            );
+        }
         let patch_duration = patch_start.elapsed();
-        info!(
-            duration_ms = patch_duration.as_millis(),
-            "disk patch completed"
-        );
 
         // The balloon. A snapshot key says whether a device exists and not its
         // target, so the loaded VM holds the target of the run that made the
@@ -3882,8 +4020,15 @@ pub async fn restore_from_snapshot_ch(
     assert_ch_config_vsock_source_matches(&cfg, &restore_config.source_vsock_socket_path)?;
 
     // Shared substrate: network namespace / CoW disk / mount-redirect / extra disks.
-    let mut substrate =
-        prepare_clone_substrate(network, restore_config, vm_id, data_dir, vm_state, false).await?;
+    let mut substrate = prepare_clone_substrate(
+        network,
+        restore_config,
+        vm_id,
+        data_dir,
+        vm_state,
+        LoadOverrides::None,
+    )
+    .await?;
 
     // Cloud Hypervisor reads its restore config (disk/vsock/net) from the snapshot's `ch/`
     // dir. Disk + vsock paths are the source VM's and are redirected to the clone's by the
@@ -7745,6 +7890,146 @@ mod tests {
         assert_eq!(restored_vsock_source_path(None, ancestor), ancestor);
     }
 
+    /// Only an ejc3/firecracker build that says so in its build metadata takes drive
+    /// overrides; upstream 1.17.0 rejects the field.
+    #[test]
+    fn the_version_says_whether_the_load_takes_drive_overrides() {
+        let fork = parse_firecracker_version("Firecracker v1.17.0+fcvm.drive-overrides\n").unwrap();
+        assert_eq!(fork.release, (1, 17, 0));
+        assert!(!fork.prerelease);
+        assert!(fork.drive_overrides);
+        let fuzzing =
+            parse_firecracker_version("Firecracker v1.17.0+fcvm.drive-overrides.fuzzing").unwrap();
+        assert!(fuzzing.drive_overrides);
+        for other in [
+            "Firecracker v1.17.0",
+            "Firecracker v1.17.0+fuzzing",
+            "Firecracker v1.17.0-dev",
+            "Firecracker v1.17.0+other.drive-overrides",
+        ] {
+            assert!(
+                !parse_firecracker_version(other).unwrap().drive_overrides,
+                "{other}"
+            );
+        }
+        let dev =
+            parse_firecracker_version("Firecracker v1.17.0-dev+fcvm.drive-overrides").unwrap();
+        assert!(dev.prerelease && dev.drive_overrides);
+    }
+
+    /// A load overrides the drives only when the binary takes the field, the vsock path is
+    /// overridden too, and the vmstate names nothing else under a source directory.
+    #[test]
+    fn drive_overrides_cover_every_source_path_or_none_is_sent() {
+        let capable = FirecrackerVersion {
+            release: (1, 17, 0),
+            prerelease: false,
+            drive_overrides: true,
+        };
+        let source = PathBuf::from("/data/vm-disks/vm-source");
+        let sources = vec![source.clone()];
+        let vsock = source.join("vsock.sock");
+        let extra = vec![crate::storage::SnapshotExtraDisk {
+            filename: "disk-dir-0.raw".to_string(),
+            mount_path: "/data".to_string(),
+            read_only: false,
+            drive_id: "disk0".to_string(),
+        }];
+        let clone_disks = Path::new("/data/vm-disks/vm-clone/disks");
+        let vmstate = |paths: &[&str]| -> Vec<u8> {
+            let mut bytes = b"header".to_vec();
+            for path in paths {
+                bytes.push(path.len() as u8);
+                bytes.extend_from_slice(path.as_bytes());
+            }
+            bytes
+        };
+        let known = vmstate(&[
+            "/data/vm-disks/vm-source/disks/rootfs.raw",
+            "/data/vm-disks/vm-source/disks/disk-dir-0.raw",
+            "/data/vm-disks/vm-source/vsock.sock",
+            "/srv/external.raw",
+        ]);
+        let overrides = snapshot_load_drive_overrides(
+            capable,
+            true,
+            &known,
+            &sources,
+            &vsock,
+            &extra,
+            clone_disks,
+        )
+        .expect("every source path is overridden");
+        assert_eq!(
+            overrides,
+            vec![
+                crate::firecracker::api::DriveOverride {
+                    drive_id: "rootfs".to_string(),
+                    path_on_host: "/data/vm-disks/vm-clone/disks/rootfs.raw".to_string(),
+                },
+                crate::firecracker::api::DriveOverride {
+                    drive_id: "disk0".to_string(),
+                    path_on_host: "/data/vm-disks/vm-clone/disks/disk-dir-0.raw".to_string(),
+                },
+            ]
+        );
+
+        let upstream = FirecrackerVersion {
+            drive_overrides: false,
+            ..capable
+        };
+        assert!(snapshot_load_drive_overrides(
+            upstream,
+            true,
+            &known,
+            &sources,
+            &vsock,
+            &extra,
+            clone_disks
+        )
+        .is_none());
+        assert!(snapshot_load_drive_overrides(
+            capable,
+            false,
+            &known,
+            &sources,
+            &vsock,
+            &extra,
+            clone_disks
+        )
+        .is_none());
+        let unlisted = vmstate(&[
+            "/data/vm-disks/vm-source/disks/rootfs.raw",
+            "/data/vm-disks/vm-source/disks/disk-dir-1.raw",
+            "/data/vm-disks/vm-source/vsock.sock",
+        ]);
+        assert!(snapshot_load_drive_overrides(
+            capable,
+            true,
+            &unlisted,
+            &sources,
+            &vsock,
+            &extra,
+            clone_disks
+        )
+        .is_none());
+        // A sibling directory whose name extends the source's is not under it.
+        let sibling = vmstate(&[
+            "/data/vm-disks/vm-source/disks/rootfs.raw",
+            "/data/vm-disks/vm-source2/disks/rootfs.raw",
+        ]);
+        assert!(snapshot_load_drive_overrides(
+            capable,
+            true,
+            &sibling,
+            &sources,
+            &vsock,
+            &[],
+            clone_disks
+        )
+        .is_some());
+    }
+
     #[test]
     fn snapshot_load_sends_the_vsock_override_only_when_set() {
         use crate::firecracker::api::{MemBackend, SnapshotLoad, VsockOverride};
@@ -7758,11 +8043,23 @@ mod tests {
             resume_vm: None,
             network_overrides: None,
             vsock_override: None,
+            drive_overrides: None,
             device_passthrough: None,
         };
         assert!(!serde_json::to_string(&load)
             .unwrap()
             .contains("vsock_override"));
+        assert!(!serde_json::to_string(&load)
+            .unwrap()
+            .contains("drive_overrides"));
+        load.drive_overrides = Some(vec![crate::firecracker::api::DriveOverride {
+            drive_id: "rootfs".to_string(),
+            path_on_host: "/clone/disks/rootfs.raw".to_string(),
+        }]);
+        assert!(serde_json::to_string(&load).unwrap().contains(
+            r#""drive_overrides":[{"drive_id":"rootfs","path_on_host":"/clone/disks/rootfs.raw"}]"#
+        ));
+        load.drive_overrides = None;
         load.vsock_override = Some(VsockOverride {
             uds_path: "/clone/vsock.sock".to_string(),
         });

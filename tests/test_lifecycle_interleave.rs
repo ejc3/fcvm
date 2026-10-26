@@ -2748,6 +2748,134 @@ async fn test_lifecycle_interleave_cloud_hypervisor_clone_vsock_outlives_its_sou
     clone_vsock_outlives_its_source("ilv-ch-vsock-src", "cloud-hypervisor").await
 }
 
+// ---------------------------------------------------------------------------
+// CASE: clone_vmm_shares_the_host_mount_namespace
+// ---------------------------------------------------------------------------
+
+/// The Firecracker fcvm builds (`[firecracker]` in rootfs-config.toml) overrides every
+/// path a snapshot names under its source VM's directory at load time: the drives
+/// (`drive_overrides`) and the vsock socket (`vsock_override`). Its clones then need no
+/// mount namespace, so the clone's Firecracker runs in the same one as this test, and
+/// nothing about it depends on the source VM's directory.
+///
+/// RED BEFORE THE CHANGE: every clone's Firecracker unshared a mount namespace to bind
+/// its directory over the source's.
+#[tokio::test]
+async fn test_lifecycle_interleave_clone_vmm_shares_the_host_mount_namespace() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("ilv-no-mntns");
+    let mut baseline: Option<(tokio::process::Child, PinnedProcess)> = None;
+    let mut clone: Option<(tokio::process::Child, PinnedProcess)> = None;
+    let mut snapshot_created = false;
+
+    let exercise: Result<()> = async {
+        let (baseline_child, baseline_pid, _) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &baseline_name,
+                "--network",
+                "rootless",
+                "--no-snapshot",
+                common::TEST_IMAGE,
+            ],
+            &[],
+        )
+        .await
+        .context("spawning the baseline")?;
+        let baseline_process =
+            PinnedProcess::capture(baseline_pid).context("pinning the baseline")?;
+        baseline = Some((baseline_child, baseline_process));
+        common::poll_health_by_pid(baseline_pid, 180)
+            .await
+            .context("waiting for baseline health")?;
+        common::create_snapshot_by_pid(baseline_pid, &snapshot_name)
+            .await
+            .context("snapshotting the baseline")?;
+        snapshot_created = true;
+
+        let (clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snapshot_name,
+                "--name",
+                &clone_name,
+            ],
+            &[],
+        )
+        .await
+        .context("spawning the clone")?;
+        let clone_process = PinnedProcess::capture(clone_pid).context("pinning the clone")?;
+        clone = Some((clone_child, clone_process));
+        let (clone_child, _) = clone.as_mut().context("clone fixture disappeared")?;
+        common::poll_health(clone_child, 180)
+            .await
+            .with_context(|| {
+                format!(
+                    "the clone did not become healthy; log tail:\n{}",
+                    log_tail(&clone_log, 60)
+                )
+            })?;
+
+        let clone_dir = artifacts_for_name(&clone_name)?
+            .context("the clone published no state")?
+            .data_dir;
+        let api = tokio::net::UnixStream::connect(clone_dir.join("firecracker.sock"))
+            .await
+            .context("connecting to the clone's Firecracker API socket")?;
+        let firecracker_pid = api
+            .peer_cred()
+            .context("reading the clone's Firecracker credentials")?
+            .pid()
+            .context("the clone's Firecracker has no pid")?;
+        let namespace = |pid: &str| {
+            std::fs::read_link(format!("/proc/{pid}/ns/mnt"))
+                .with_context(|| format!("reading the mount namespace of {pid}"))
+        };
+        let firecracker_namespace = namespace(&firecracker_pid.to_string())?;
+        let own_namespace = namespace("self")?;
+        anyhow::ensure!(
+            firecracker_namespace == own_namespace,
+            "the clone's Firecracker (pid {firecracker_pid}) runs in mount namespace {} and \
+             this test in {}; log tail:\n{}",
+            firecracker_namespace.display(),
+            own_namespace.display(),
+            log_tail(&clone_log, 40)
+        );
+        Ok(())
+    }
+    .await;
+
+    let mut cleanup_errors = Vec::new();
+    let mut all_children_stopped = true;
+    if let Some((child, process)) = clone.as_mut() {
+        if let Err(error) = stop_test_child(child, process).await {
+            all_children_stopped = false;
+            cleanup_errors.push(format!("stopping clone: {error:#}"));
+        }
+    }
+    if let Some((child, process)) = baseline.as_mut() {
+        if let Err(error) = stop_test_child(child, process).await {
+            all_children_stopped = false;
+            cleanup_errors.push(format!("stopping baseline: {error:#}"));
+        }
+    }
+    if snapshot_created && all_children_stopped {
+        if let Err(error) = common::delete_snapshot(&snapshot_name).await {
+            cleanup_errors.push(format!("deleting snapshot {snapshot_name}: {error:#}"));
+        }
+    }
+    exercise?;
+    anyhow::ensure!(
+        cleanup_errors.is_empty(),
+        "fixture cleanup failed:\n- {}",
+        cleanup_errors.join("\n- ")
+    );
+    Ok(())
+}
+
 /// A restore of a snapshot whose source VM is gone recreates the source's runtime
 /// directory as a mountpoint for its disk redirect (issue 1187). Once the clone's VMM
 /// has opened its disks through it, and its Firecracker takes the vsock override
@@ -2837,6 +2965,8 @@ async fn test_lifecycle_interleave_restore_removes_a_recreated_source_dir() -> R
             .split_whitespace()
             .find_map(|word| word.strip_prefix('v'))
             .with_context(|| format!("no version in {version:?}"))?;
+        // Build metadata (`+fcvm.drive-overrides`) does not order versions.
+        let word = word.split_once('+').map_or(word, |(version, _)| version);
         let (release, prerelease) = match word.split_once('-') {
             Some((release, _)) => (release, true),
             None => (word, false),
