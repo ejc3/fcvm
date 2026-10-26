@@ -2922,85 +2922,58 @@ fn build_clone_mount_redirects(
     Ok(redirects)
 }
 
-/// Every string in a Cloud Hypervisor config.json, NUL-separated, for
-/// [`view_dirs_named_in`]: the parsed values, so an escaped spelling of a path is read as
-/// the path it names.
-fn ch_config_strings(config: &serde_json::Value) -> Vec<u8> {
-    fn walk(value: &serde_json::Value, out: &mut Vec<u8>) {
-        match value {
-            serde_json::Value::String(text) => {
-                out.extend_from_slice(text.as_bytes());
-                out.push(0);
-            }
-            serde_json::Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
-            serde_json::Value::Object(fields) => fields.values().for_each(|item| walk(item, out)),
-            _ => {}
-        }
-    }
-    let mut out = Vec::new();
-    walk(config, &mut out);
-    out
-}
-
-/// The directories directly inside `view` that `snapshot_state` (vmstate.bin, or the
-/// strings of a Cloud Hypervisor config.json) names a path in, in the order they first
-/// appear.
-fn view_dirs_named_in(snapshot_state: &[u8], view: &Path) -> Vec<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-    let mut prefix = view.as_os_str().as_bytes().to_vec();
-    prefix.push(b'/');
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    let mut from = 0;
-    while let Some(at) = snapshot_state[from..]
-        .windows(prefix.len())
-        .position(|window| window == prefix.as_slice())
+/// The directories directly inside `view`, sorted. Other entries (files) are no VM's.
+fn view_entries(view: &Path) -> Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    for entry in std::fs::read_dir(view)
+        .with_context(|| format!("listing {} for the clone's mount view", view.display()))?
     {
-        let start = from + at + prefix.len();
-        let len = snapshot_state[start..]
-            .iter()
-            .take_while(|&&byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-            .count();
-        if len > 0 && snapshot_state.get(start + len) == Some(&b'/') {
-            let dir = view.join(std::ffi::OsStr::from_bytes(
-                &snapshot_state[start..start + len],
-            ));
-            if !dirs.contains(&dir) {
-                dirs.push(dir);
-            }
+        let entry = entry.with_context(|| format!("listing {}", view.display()))?;
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            dirs.push(entry.path());
         }
-        from = start;
     }
-    dirs
+    dirs.sort();
+    Ok(dirs)
 }
 
 /// The mount namespace for a clone's VMM: `pairs` (from [`build_clone_mount_redirects`])
 /// under a tmpfs over `view`, the directory every VM's runtime directory is in.
 ///
-/// Only what a pair names is visible under `view`, so each directory inside `view` that
-/// the VMM opens by path gets a pair onto itself, unless an earlier pair's mountpoint
-/// already contains it: the clone's runtime directory (API socket, log, disks), its vsock
-/// directory when the load overrides the vsock path, and every other VM directory the
-/// snapshot names a path in (a read-only `--disk` under another VM's directory), when it
-/// exists.
+/// Only what a pair names is visible under `view`. The clone's runtime directory (API
+/// socket, log, disks) and its vsock directory, when that is inside `view`, get a pair
+/// onto themselves. Every other directory `view` holds (`view_entries`, listed before the
+/// VMM starts) that no redirect replaces is kept: bound onto itself if it still exists as
+/// the VMM starts, so a read-only `--disk` under another VM's directory stays reachable,
+/// and passed over if that VM's teardown removed it first. Nothing is read out of the
+/// snapshot's state.
 ///
-/// Refuses a directory inside `view` that contains an earlier pair's mountpoint (a
-/// `--vsock-dir` of `vm-disks` itself): binding it onto itself would cover those
-/// redirects with the host's directories again.
+/// A directory that holds a redirect's mountpoint (a source's `--vsock-dir` under
+/// `vm-disks/<dir>/`) is bound first, so the redirect lands inside it. A directory of the
+/// clone's own that contains a redirect's mountpoint (a `--vsock-dir` of `vm-disks`
+/// itself) is refused: binding it onto itself after them would cover those redirects
+/// with the host's directories again.
 fn clone_mount_view(
     view: &Path,
     mut pairs: Vec<(PathBuf, PathBuf)>,
     clone_dir: &Path,
     vsock_target_dir: &Path,
-    snapshot_state: &[u8],
+    view_entries: &[PathBuf],
 ) -> Result<crate::utils::MountRedirects> {
-    let named: Vec<PathBuf> = view_dirs_named_in(snapshot_state, view)
-        .into_iter()
-        .filter(|dir| dir.is_dir())
-        .collect();
-    let owned = [clone_dir, vsock_target_dir]
-        .into_iter()
-        .chain(named.iter().map(PathBuf::as_path));
-    for own in owned {
+    let mut first = Vec::new();
+    for dir in view_entries {
+        let covered = pairs
+            .iter()
+            .any(|(mountpoint, _)| dir.starts_with(mountpoint));
+        let holds = pairs
+            .iter()
+            .any(|(mountpoint, _)| mountpoint != dir && mountpoint.starts_with(dir));
+        if !covered && holds {
+            first.push((dir.clone(), dir.clone()));
+        }
+    }
+    pairs.splice(0..0, first);
+    for own in [clone_dir, vsock_target_dir] {
         if !own.starts_with(view)
             || pairs
                 .iter()
@@ -3021,9 +2994,19 @@ fn clone_mount_view(
         }
         pairs.push((own.to_path_buf(), own.to_path_buf()));
     }
+    let keep = view_entries
+        .iter()
+        .filter(|dir| {
+            !pairs
+                .iter()
+                .any(|(mountpoint, _)| dir.starts_with(mountpoint))
+        })
+        .cloned()
+        .collect();
     Ok(crate::utils::MountRedirects {
         view: view.to_path_buf(),
         pairs,
+        keep,
     })
 }
 
@@ -3254,9 +3237,6 @@ async fn prepare_clone_substrate(
     vm_state: &mut VmState,
     // What the snapshot load overrides, so needs no redirect.
     overrides: LoadOverrides,
-    // The snapshot's vmstate.bin (Firecracker) or the strings of its config.json (Cloud
-    // Hypervisor, `ch_config_strings`), for the paths it names.
-    snapshot_state: &[u8],
 ) -> Result<CloneSubstrate> {
     let vm_dir = data_dir.join("disks");
     let mut holder_child: Option<tokio::process::Child> = None;
@@ -3440,13 +3420,10 @@ async fn prepare_clone_substrate(
             .await
             .context("creating disks backing dir inside the vsock target")?;
     }
-    let redirects = match clone_mount_view(
-        &paths::data_dir().join("vm-disks"),
-        redirects,
-        data_dir,
-        &vsock_target_dir,
-        snapshot_state,
-    ) {
+    let view = paths::data_dir().join("vm-disks");
+    let redirects = match view_entries(&view).and_then(|entries| {
+        clone_mount_view(&view, redirects, data_dir, &vsock_target_dir, &entries)
+    }) {
         Ok(redirects) => redirects,
         Err(error) => {
             cleanup_failed_clone_holder(&mut holder_child, "building the clone's mount view").await;
@@ -3639,10 +3616,8 @@ pub async fn restore_from_snapshot(
         data_dir,
         vm_state,
         load_overrides,
-        &vmstate,
     )
     .await?;
-    drop(vmstate);
     failpoint::hit_async("restore.post_clone_disk").await;
     let rootfs_path = substrate.rootfs_path;
     if drive_overrides.is_some() && rootfs_path != vm_dir.join("rootfs.raw") {
@@ -4105,7 +4080,6 @@ pub async fn restore_from_snapshot_ch(
         data_dir,
         vm_state,
         LoadOverrides::None,
-        &ch_config_strings(&cfg),
     )
     .await?;
 
@@ -6386,73 +6360,72 @@ mod tests {
         );
     }
 
-    /// A read-only `--disk` under another VM's directory stays reachable: the view
-    /// exposes every existing VM directory the snapshot names a path in, and the
-    /// directories the redirects already cover keep their redirect.
+    /// A read-only `--disk` under another directory of vm-disks stays reachable,
+    /// whatever that directory is called: every directory the view holds that no
+    /// redirect replaces is kept, bound onto itself when it still exists as the VMM starts.
     ///
     /// RED BEFORE THE FIX: the view held only the redirects and the clone's own
-    /// directories, so the tmpfs hid the other VM's directory and the load could not
-    /// open the disk.
+    /// directories, so the tmpfs hid the other directories and the load could not open
+    /// a disk in one.
     #[test]
-    fn the_clone_mount_view_exposes_other_vm_directories_the_snapshot_names() {
+    fn the_clone_mount_view_exposes_every_other_directory_of_the_view() {
         let root = tempfile::tempdir().unwrap();
         let view = root.path().join("vm-disks");
         let source = view.join("vm-source");
         let clone = view.join("vm-clone");
         let other = view.join("vm-other");
-        for dir in [&source, &clone, &other] {
+        let external = view.join("external.data");
+        for dir in [&source, &clone, &other, &external] {
             std::fs::create_dir_all(dir).unwrap();
         }
-        let disks = vec![(source.clone(), clone.clone())];
-        let mut state = b"\x20".to_vec();
-        for path in [
-            source.join("disks/rootfs.raw"),
-            other.join("disks/data.raw"),
-            view.join("vm-gone/disks/old.raw"),
-            source.join("vsock.sock"),
-        ] {
-            state.extend_from_slice(path.as_os_str().as_encoded_bytes());
-            state.push(0x11);
-        }
+        std::fs::write(view.join("not-a-dir"), b"").unwrap();
+        let entries = view_entries(&view).unwrap();
         assert_eq!(
-            view_dirs_named_in(&state, &view),
-            vec![source.clone(), other.clone(), view.join("vm-gone")]
+            entries,
+            vec![
+                external.clone(),
+                clone.clone(),
+                other.clone(),
+                source.clone()
+            ]
         );
-        let redirects = clone_mount_view(&view, disks.clone(), &clone, &clone, &state).unwrap();
+        let disks = vec![(source.clone(), clone.clone())];
+        let redirects = clone_mount_view(&view, disks.clone(), &clone, &clone, &entries).unwrap();
         assert_eq!(
             redirects.pairs,
-            [
-                disks,
-                vec![
-                    (clone.clone(), clone.clone()),
-                    (other.clone(), other.clone())
-                ]
-            ]
-            .concat()
+            [disks, vec![(clone.clone(), clone.clone())]].concat()
         );
+        assert_eq!(redirects.keep, vec![external.clone(), other.clone()]);
     }
 
-    /// A Cloud Hypervisor config.json is read as JSON: a path spelled with escaped
-    /// slashes names the same directory as its plain spelling.
+    /// A source whose `--vsock-dir` sits in a directory of its own inside vm-disks: that
+    /// directory holds the vsock redirect's mountpoint, so it is bound first and the
+    /// redirect lands inside it.
     ///
-    /// RED BEFORE THE FIX: the raw config.json bytes were scanned, and the escaped
-    /// spelling named no directory.
+    /// RED BEFORE THE FIX: the directory was refused for containing the redirect.
     #[test]
-    fn a_cloud_hypervisor_config_names_its_paths_as_json_strings() {
-        let view = Path::new("/data/vm-disks");
-        let config: serde_json::Value = serde_json::from_str(
-            r#"{"disks":[{"path":"/data/vm-disks/vm-source/disks/rootfs.raw"},
-                {"path":"\/data\/vm-disks\/vm-other\/disks\/data.raw","readonly":true}],
-                "vsock":{"cid":3,"socket":"/data/vm-disks/vm-source/vsock.sock"}}"#,
-        )
-        .unwrap();
+    fn a_named_directory_that_holds_a_redirect_is_bound_before_it() {
+        let root = tempfile::tempdir().unwrap();
+        let view = root.path().join("vm-disks");
+        let shared = view.join("shared");
+        let source_vsock = shared.join("source");
+        let clone = view.join("vm-clone");
+        for dir in [&source_vsock, &clone] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let redirect = (source_vsock.clone(), clone.clone());
+        let entries = view_entries(&view).unwrap();
+        let redirects =
+            clone_mount_view(&view, vec![redirect.clone()], &clone, &clone, &entries).unwrap();
         assert_eq!(
-            view_dirs_named_in(&ch_config_strings(&config), view),
+            redirects.pairs,
             vec![
-                PathBuf::from("/data/vm-disks/vm-source"),
-                PathBuf::from("/data/vm-disks/vm-other")
+                (shared.clone(), shared.clone()),
+                redirect,
+                (clone.clone(), clone.clone())
             ]
         );
+        assert!(redirects.keep.is_empty(), "{:?}", redirects.keep);
     }
 
     /// A vsock directory that contains a redirect's mountpoint (`--vsock-dir` set to

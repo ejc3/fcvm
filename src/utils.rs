@@ -770,6 +770,10 @@ pub struct MountRedirects {
     /// (the source runtime dir is redirected to a custom vsock dir first, then the
     /// clone's `disks/` is bound back on top).
     pub pairs: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+    /// Directories directly inside `view`, each bound onto itself after the pairs when it
+    /// still exists as the VMM starts: other VMs' directories, which their own teardowns
+    /// can remove at any time.
+    pub keep: Vec<std::path::PathBuf>,
 }
 
 impl MountRedirects {
@@ -801,8 +805,23 @@ impl MountRedirects {
                 }
             }
         }
+        for dir in &self.keep {
+            if dir.parent() == Some(self.view.as_path()) && !dirs.contains(dir) {
+                dirs.push(dir.clone());
+            }
+        }
         dirs
     }
+}
+
+/// Whether a failed step on a kept directory (`MountRedirects::keep`) means only that the
+/// directory is gone, so the VMM starts without it. Another VM's teardown can remove its
+/// directory after the view was listed: before the directory is opened (`open` fails),
+/// or after it is opened and before it is bound, when the bind of the now unlinked
+/// directory fails with ENOENT. Measured in parallel clone runs before this was
+/// tolerated: a restore failed to spawn its VMM in 2 of 4 runs of the 40 clone tests.
+fn kept_dir_is_gone(optional: bool, error: nix::errno::Errno) -> bool {
+    optional && error == nix::errno::Errno::ENOENT
 }
 
 /// Create the host-side directories the mount redirects bind over, which are the
@@ -900,13 +919,18 @@ pub fn install_namespace_pre_exec(
                 CString::new(path.as_os_str().as_encoded_bytes())
                     .with_context(|| format!("{what} path contains invalid characters"))
             };
-            let pair_cstrs: Vec<(CString, CString)> = redirects
+            // The kept directories follow the pairs, each onto itself; an entry is
+            // optional when it is one of them.
+            let pair_cstrs: Vec<(CString, CString, bool)> = redirects
                 .pairs
                 .iter()
-                .map(|(mountpoint, source)| {
+                .map(|(mountpoint, source)| (mountpoint, source, false))
+                .chain(redirects.keep.iter().map(|dir| (dir, dir, true)))
+                .map(|(mountpoint, source, optional)| {
                     Ok((
                         cstring(mountpoint, "mountpoint")?,
                         cstring(source, "redirect source")?,
+                        optional,
                     ))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -928,6 +952,8 @@ pub fn install_namespace_pre_exec(
             None
         };
 
+        // A failed step returns its errno: std reports a pre_exec error to the parent by
+        // its OS error code alone, so an error without one reads as EINVAL there.
         // SAFETY: pre_exec runs after fork() but before exec().
         // 1. Only async-signal-safe functions are called (open, setns, unshare, mount).
         // 2. No heap allocations after fork (CStrings created before fork).
@@ -947,21 +973,15 @@ pub fn install_namespace_pre_exec(
                 // entering it gives UID 0 with full capabilities inside the namespace.
                 if let Some(ref user_ns_path) = user_ns_cstr {
                     let ns_fd = open(user_ns_path.as_c_str(), OFlag::O_RDONLY, Mode::empty())
-                        .map_err(|e| {
-                            std::io::Error::other(format!("failed to open user namespace: {}", e))
-                        })?;
-                    setns(&ns_fd, CloneFlags::CLONE_NEWUSER).map_err(|e| {
-                        std::io::Error::other(format!("failed to enter user namespace: {}", e))
-                    })?;
+                        .map_err(std::io::Error::from)?;
+                    setns(&ns_fd, CloneFlags::CLONE_NEWUSER).map_err(std::io::Error::from)?;
                 }
 
                 // Step 1: Mount namespace for path redirects (before entering network ns).
                 if let Some((ref view_cstr, ref view_dirs, ref pair_cstrs, ref mut source_fds)) =
                     mount_paths
                 {
-                    unshare(CloneFlags::CLONE_NEWNS).map_err(|e| {
-                        std::io::Error::other(format!("failed to unshare mount namespace: {}", e))
-                    })?;
+                    unshare(CloneFlags::CLONE_NEWNS).map_err(std::io::Error::from)?;
                     // Make our mount namespace private so mounts don't propagate.
                     mount::<str, str, str, str>(
                         None,
@@ -970,23 +990,19 @@ pub fn install_namespace_pre_exec(
                         MsFlags::MS_REC | MsFlags::MS_PRIVATE,
                         None,
                     )
-                    .map_err(|e| {
-                        std::io::Error::other(format!("failed to make mount private: {}", e))
-                    })?;
+                    .map_err(std::io::Error::from)?;
                     // Open every source while the host's directories are still visible:
                     // the tmpfs below covers the ones inside the view.
                     let o_path = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
-                    let cwd = open(c".", o_path, Mode::empty()).map_err(|e| {
-                        std::io::Error::other(format!("failed to open the working directory: {e}"))
-                    })?;
-                    for (slot, (_, source_cstr)) in source_fds.iter_mut().zip(pair_cstrs.iter()) {
-                        *slot = Some(open(source_cstr.as_c_str(), o_path, Mode::empty()).map_err(
-                            |e| {
-                                std::io::Error::other(format!(
-                                    "failed to open redirect source {source_cstr:?}: {e}"
-                                ))
-                            },
-                        )?);
+                    let cwd = open(c".", o_path, Mode::empty()).map_err(std::io::Error::from)?;
+                    for (slot, (_, source_cstr, optional)) in
+                        source_fds.iter_mut().zip(pair_cstrs.iter())
+                    {
+                        match open(source_cstr.as_c_str(), o_path, Mode::empty()) {
+                            Ok(fd) => *slot = Some(fd),
+                            Err(e) if kept_dir_is_gone(*optional, e) => {}
+                            Err(e) => return Err(e.into()),
+                        }
                     }
                     mount(
                         Some(c"tmpfs"),
@@ -995,56 +1011,39 @@ pub fn install_namespace_pre_exec(
                         MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
                         Some(c"mode=0755"),
                     )
-                    .map_err(|e| {
-                        std::io::Error::other(format!(
-                            "failed to mount a tmpfs over {view_cstr:?}: {e}"
-                        ))
-                    })?;
+                    .map_err(std::io::Error::from)?;
                     for dir in view_dirs {
                         nix::unistd::mkdir(dir.as_c_str(), Mode::from_bits_truncate(0o755))
-                            .map_err(|e| {
-                                std::io::Error::other(format!(
-                                    "failed to create {dir:?} in the view: {e}"
-                                ))
-                            })?;
+                            .map_err(std::io::Error::from)?;
                     }
                     // Bind each pair's source over its mountpoint, IN ORDER: a later
                     // mountpoint may resolve inside an earlier pair's mount (that is how
                     // the clone's disks are bound back inside a custom vsock target). The
                     // source is the directory opened above, reached as the working
                     // directory, so the tmpfs over its path does not hide it.
-                    for ((mountpoint_cstr, source_cstr), fd) in
+                    for ((mountpoint_cstr, _, optional), fd) in
                         pair_cstrs.iter().zip(source_fds.iter())
                     {
-                        let fd = fd.as_ref().ok_or_else(|| {
-                            std::io::Error::other(format!(
-                                "redirect source {source_cstr:?} was not opened"
-                            ))
-                        })?;
-                        nix::unistd::fchdir(fd).map_err(|e| {
-                            std::io::Error::other(format!(
-                                "failed to enter redirect source {source_cstr:?}: {e}"
-                            ))
-                        })?;
-                        mount(
+                        let Some(fd) = fd.as_ref() else {
+                            if *optional {
+                                continue;
+                            }
+                            return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+                        };
+                        nix::unistd::fchdir(fd).map_err(std::io::Error::from)?;
+                        match mount(
                             Some(c"."),
                             mountpoint_cstr.as_c_str(),
                             None::<&str>,
                             MsFlags::MS_BIND,
                             None::<&str>,
-                        )
-                        .map_err(|e| {
-                            std::io::Error::other(format!(
-                                "failed to bind mount {:?} over {:?}: {}",
-                                source_cstr, mountpoint_cstr, e
-                            ))
-                        })?;
+                        ) {
+                            Ok(()) => {}
+                            Err(e) if kept_dir_is_gone(*optional, e) => {}
+                            Err(e) => return Err(e.into()),
+                        }
                     }
-                    nix::unistd::fchdir(&cwd).map_err(|e| {
-                        std::io::Error::other(format!(
-                            "failed to return to the working directory: {e}"
-                        ))
-                    })?;
+                    nix::unistd::fchdir(&cwd).map_err(std::io::Error::from)?;
                     for slot in source_fds.iter_mut() {
                         *slot = None;
                     }
@@ -1055,13 +1054,9 @@ pub fn install_namespace_pre_exec(
                 // (/var/run/netns/NAME, bridged mode).
                 let net_ns_to_enter = net_ns_cstr.as_ref().or(ns_path_cstr.as_ref());
                 if let Some(ns_path) = net_ns_to_enter {
-                    let ns_fd =
-                        open(ns_path.as_c_str(), OFlag::O_RDONLY, Mode::empty()).map_err(|e| {
-                            std::io::Error::other(format!("failed to open net namespace: {}", e))
-                        })?;
-                    setns(&ns_fd, CloneFlags::CLONE_NEWNET).map_err(|e| {
-                        std::io::Error::other(format!("failed to enter net namespace: {}", e))
-                    })?;
+                    let ns_fd = open(ns_path.as_c_str(), OFlag::O_RDONLY, Mode::empty())
+                        .map_err(std::io::Error::from)?;
+                    setns(&ns_fd, CloneFlags::CLONE_NEWNET).map_err(std::io::Error::from)?;
                 }
 
                 Ok(())
@@ -1107,10 +1102,50 @@ mod tests {
                     root.path().join("clone").join("disks"),
                 ),
             ],
+            keep: vec![],
         };
         create_mount_targets(&redirects).unwrap();
         assert!(source.is_dir());
         assert_eq!(std::fs::read_dir(&source).unwrap().count(), 0);
+    }
+
+    /// A kept directory that vanished is passed over; any other failure, and any failure
+    /// on a pair, still stops the VMM. Binding a directory that was removed after it was
+    /// opened fails with ENOENT, which the next test checks against the kernel.
+    #[test]
+    fn only_a_gone_kept_directory_is_passed_over() {
+        use nix::errno::Errno;
+        assert!(kept_dir_is_gone(true, Errno::ENOENT));
+        assert!(!kept_dir_is_gone(false, Errno::ENOENT));
+        assert!(!kept_dir_is_gone(true, Errno::EACCES));
+        assert!(!kept_dir_is_gone(true, Errno::EINVAL));
+    }
+
+    /// The kernel behaviour kept_dir_is_gone relies on: a bind whose source is a directory
+    /// that was removed after it was opened fails with ENOENT. Runs in a user and mount
+    /// namespace of its own, in a child process.
+    #[test]
+    fn binding_a_removed_directory_fails_with_enoent() {
+        let root = tempfile::tempdir().unwrap();
+        let gone = root.path().join("gone");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&gone).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let script = format!(
+            "cd {gone} && rmdir {gone} && mount --bind . {target}; echo status=$?",
+            gone = gone.display(),
+            target = target.display()
+        );
+        let output = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "sh", "-c", &script])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains("status=32") && stderr.contains("No such file or directory"),
+            "stdout: {stdout} stderr: {stderr}"
+        );
     }
 
     /// The tmpfs directories a view needs: each mountpoint inside the view that is not
@@ -1134,6 +1169,10 @@ mod tests {
                     PathBuf::from("/data/vm-disks/deep/clone"),
                 ),
             ],
+            keep: vec![
+                PathBuf::from("/data/vm-disks/other"),
+                PathBuf::from("/data/vm-disks/source"),
+            ],
         };
         assert_eq!(
             redirects.view_dirs(),
@@ -1141,6 +1180,7 @@ mod tests {
                 PathBuf::from("/data/vm-disks/source"),
                 PathBuf::from("/data/vm-disks/deep"),
                 PathBuf::from("/data/vm-disks/deep/clone"),
+                PathBuf::from("/data/vm-disks/other"),
             ]
         );
     }
@@ -1164,6 +1204,9 @@ mod tests {
         std::fs::create_dir_all(&clone).unwrap();
         std::fs::write(source.join("marker"), "source\n").unwrap();
         std::fs::write(clone.join("marker"), "clone\n").unwrap();
+        let other = view.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("marker"), "other\n").unwrap();
 
         let mut holder = tokio::process::Command::new("unshare")
             .args([
@@ -1188,8 +1231,9 @@ mod tests {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c")
             .arg(format!(
-                "cat {0}; read _; cat {0} 2>/dev/null || echo gone",
-                marker.display()
+                "cat {0}; cat {1}; read _; cat {0} 2>/dev/null || echo gone",
+                marker.display(),
+                other.join("marker").display()
             ))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1208,6 +1252,9 @@ mod tests {
                         (source.clone(), clone.clone()),
                         (clone.clone(), clone.clone()),
                     ],
+                    // A VM directory that is gone by the time the child starts is
+                    // passed over.
+                    keep: vec![other.clone(), view.join("gone")],
                 }),
                 ..Default::default()
             },
@@ -1222,6 +1269,11 @@ mod tests {
             lines.next_line().await.unwrap().as_deref(),
             Some("clone"),
             "the child does not see its own directory at the source's path"
+        );
+        assert_eq!(
+            lines.next_line().await.unwrap().as_deref(),
+            Some("other"),
+            "the child does not see another directory of the view"
         );
 
         std::fs::remove_dir_all(&source).unwrap();
