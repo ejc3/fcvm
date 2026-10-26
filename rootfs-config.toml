@@ -277,8 +277,8 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # Device passthrough (PUT /device-passthrough and LoadSnapshot
 # device_passthrough) on the PCI transport.
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "agent/vfio-passthrough-hotplug"
-firecracker_commit = "14aaaf9d09d4bdc37ff8b113fa0205c80436b9ce"
+firecracker_branch = "agent/vfio-uffd-populate"
+firecracker_commit = "1433710c4f343d392380e1e4f6876e2ecf215926"
 firecracker_args = "--enable-pci"
 # On the PCI transport the guest's virtio-net NIC is a PCI device, which udev renames
 # to enp0s<slot>; fc-agent and fcvm configure "eth0" (IPv6, routes, the snapshot gate),
@@ -322,8 +322,8 @@ kernel_config = "kernel/gpu-x86.conf"
 patches_dir = "kernel/patches-gpu-x86"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "agent/vfio-passthrough-hotplug"
-firecracker_commit = "14aaaf9d09d4bdc37ff8b113fa0205c80436b9ce"
+firecracker_branch = "agent/vfio-uffd-populate"
+firecracker_commit = "1433710c4f343d392380e1e4f6876e2ecf215926"
 firecracker_args = "--enable-pci"
 # On the PCI transport the guest's virtio-net NIC is a PCI device, which udev renames
 # to enp0s<slot>; fc-agent and fcvm configure "eth0" (IPv6, routes, the snapshot gate),

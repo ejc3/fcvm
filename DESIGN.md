@@ -2714,11 +2714,21 @@ source (each list sorted). The kernel modules stay loaded through the park, so t
 container's device nodes keep their numbers. The guest needs memory for the GPU
 state it holds: a process's device memory is in guest RAM from the park on.
 
-GPU restores load with Firecracker's File backend. Through a UFFD server (`snapshot
-serve`, then `snapshot run --pid`) the load fails: VFIO pins all guest memory for
-DMA, and pinning memory registered with userfaultfd returns `Bad address`
-(`failed to add guest memory map into iommu table`). That is so for any GPU
-restore, warm or not.
+A GPU restore, warm or not, also loads through a UFFD server (`snapshot serve`, then
+`snapshot run --pid`). Attaching the GPU pins all guest memory for DMA with a
+long-term `pin_user_pages_remote`, whose page walk cannot wait for a userfaultfd
+handler: on a page the server had not filled yet it failed with `Bad address`
+(`failed to add guest memory map into iommu table`). The gpu profile's Firecracker
+(fork branch `agent/vfio-uffd-populate`) runs `madvise(MADV_POPULATE_WRITE)` over
+each memory region before the pin; the populate faults every page as user space
+does, the server fills it, and the pin finds it present. Every page is then a
+recorded fault, so the snapshot's working set holds all of guest memory and later
+clones replay it. Measured on a g4dn.metal, 4 GiB guest, one snapshot: ACK 11.2 s
+for the first clone through a serve (every page a demand fault), 3.4 s for clones
+that replayed the recorded set (three runs, 3.37 to 3.43 s), against 3.9 s through
+the File backend (three runs, 3.86 to 3.92 s). Warm llama.cpp clones through a
+serve answered their first token in 3.75 and 4.13 s after the recording clone
+(16.2 s), against 5.5 to 6.6 s through the File backend.
 
 Measured on 2026-10-23 on a g4dn.metal (eight T4) with Qwen2.5-0.5B-Instruct and two
 servers: vLLM 0.32.0 (`vllm/vllm-openai:v0.32.0-cu129`, fp16, TRITON_ATTN,
