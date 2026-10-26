@@ -135,29 +135,39 @@
       "checks": {
         "/ec2_assign/2/id": "ec2-3",
         "/view/fleet/ec2_waiting": 3,
-        "/view/tiles/3": null
-      }
+        "/view/layout/ec2": {
+          "h": 1.0,
+          "w": 0.5,
+          "x": 0.5,
+          "y": 0.0
+        },
+        "/view/tiles/3/frame_url": null,
+        "/view/tiles/3/id": "ec2:1",
+        "/view/tiles/3/phase": "pending",
+        "/view/tiles/3/slot": "ec2-1"
+      },
+      "note": "every EC2 tile has its place before it has an instance"
     },
     {
       "after": 1,
       "checks": {
         "/view/fleet/ec2_instances": 1,
-        "/view/fleet/ec2_n": 1,
+        "/view/fleet/ec2_n": 3,
         "/view/layout/ec2": {
           "h": 1.0,
-          "w": 0.25,
-          "x": 0.75,
+          "w": 0.5,
+          "x": 0.5,
           "y": 0.0
         },
         "/view/layout/fcvm": {
           "h": 1.0,
-          "w": 0.75,
+          "w": 0.5,
           "x": 0.0,
           "y": 0.0
         },
         "/view/tiles/0/rect": {
           "h": 0.5,
-          "w": 0.75,
+          "w": 0.5,
           "x": 0.0,
           "y": 0.0
         },
@@ -165,9 +175,9 @@
         "/view/tiles/3/id": "ec2:1",
         "/view/tiles/3/phase": "running",
         "/view/tiles/3/rect": {
-          "h": 1.0,
-          "w": 0.25,
-          "x": 0.75,
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.5,
           "y": 0.0
         },
         "/view/tiles/3/slot": "ec2-1"
@@ -177,15 +187,19 @@
       "after": 2,
       "checks": {
         "/view/fleet/ec2_waiting": 2,
-        "/view/tiles/4": null
-      }
+        "/view/tiles/4/frame_url": null,
+        "/view/tiles/4/id": "ec2:2",
+        "/view/tiles/4/phase": "waiting_capacity",
+        "/view/tiles/4/slot": "ec2-2"
+      },
+      "note": "a tile waiting for capacity is a dark tile in its place"
     },
     {
       "after": 3,
       "checks": {
         "/ec2_assign/0/generation": 2,
         "/view/races/0/ec2/tiles/ec2-1/tile": "ec2:1",
-        "/view/races/0/ec2/tiles/ec2-2/tile": "ec2-2",
+        "/view/races/0/ec2/tiles/ec2-2/tile": "ec2:2",
         "/view/relaunch_all/ec2_gpus": 3,
         "/view/relaunch_all/ec2_waiting_since": null
       }
@@ -309,7 +323,7 @@
       "fcvm": null,
       "from_frame": 645,
       "from_t": 21.5,
-      "generation": 5
+      "generation": 2
     },
     "next_race_at": null,
     "nudges": {
@@ -366,7 +380,7 @@
                 "launch_ms": 1200,
                 "ready_ms": 4800
               },
-              "tile": "ec2-2",
+              "tile": "ec2:2",
               "waiting_since": 4000
             },
             "ec2-3": {
@@ -378,7 +392,7 @@
                 "launch_ms": 1600,
                 "ready_ms": 5000
               },
-              "tile": "ec2-3",
+              "tile": "ec2:3",
               "waiting_since": null
             }
           },

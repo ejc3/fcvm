@@ -3425,6 +3425,20 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
                     "TerminateInstances" => (StatusCode::OK, "<TerminateInstancesResponse/>".into()),
                     // An instant EC2 Fleet: spot is refused per pool where the region has no spot
                     // capacity (a 200 with an errorSet, as EC2 answers it); on demand launches.
+                    "DescribeLaunchTemplateVersions" => (StatusCode::OK, "<DescribeLaunchTemplateVersionsResponse><launchTemplateVersionSet><item><launchTemplateData><instanceType>g4dn.metal</instanceType></launchTemplateData></item></launchTemplateVersionSet></DescribeLaunchTemplateVersionsResponse>".into()),
+                    // IAM's FleetTypesOnly checks ec2:InstanceType on the fleet's instances, and
+                    // CreateFleet supplies that key only from the request's overrides: an override
+                    // that names no host type is refused as a whole, as EC2 answers it.
+                    "CreateFleet" if params.iter().any(|(k, _)| {
+                        k.ends_with(".SubnetId")
+                            && !matches!(
+                                params.get(&k.replace(".SubnetId", ".InstanceType")).map(String::as_str),
+                                Some("g4dn.metal" | "g5g.metal")
+                            )
+                    }) => (
+                        StatusCode::FORBIDDEN,
+                        "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>You are not authorized to perform this operation.</Message></Error></Errors></Response>".into(),
+                    ),
                     "CreateFleet" => {
                         let spot = params["TargetCapacitySpecification.DefaultTargetCapacityType"] == "spot";
                         if spot && !api.spot_capacity.contains(&region) {
@@ -3483,9 +3497,22 @@ async fn the_aws_host_driver_launches_through_an_instant_fleet() {
         .unwrap();
     assert_eq!(od.ids, vec!["i-0fedcba9876543210".to_string()]);
     let calls = api.calls.lock().unwrap().clone();
-    let (region, p) = &calls[0];
+    // The template's type is read once and reused for the second launch.
+    let reads: Vec<_> = calls
+        .iter()
+        .filter(|(_, p)| p["Action"] == "DescribeLaunchTemplateVersions")
+        .collect();
+    assert_eq!(reads.len(), 1, "{calls:?}");
+    assert_eq!(reads[0].1["LaunchTemplateName"], "fcvm-fleet-host-x86_64");
+    let (region, p) = calls
+        .iter()
+        .find(|(_, p)| p["Action"] == "CreateFleet")
+        .unwrap();
     assert_eq!(region, "us-east-1");
-    assert_eq!(p["Action"], "CreateFleet");
+    assert_eq!(
+        p["LaunchTemplateConfigs.1.Overrides.1.InstanceType"],
+        "g4dn.metal"
+    );
     assert_eq!(p["ClientToken"], "token-spot");
     assert_eq!(p["Type"], "instant");
     assert_eq!(
@@ -3500,7 +3527,15 @@ async fn the_aws_host_driver_launches_through_an_instant_fleet() {
     let hosts = d.hosts("us-east-1").await.unwrap();
     assert_eq!(hosts.len(), 1);
     assert_eq!(hosts[0].id, "i-0123456789abcdef0");
-    let list = &api.calls.lock().unwrap()[2].1;
+    let list = &api
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, p)| p["Action"] == "DescribeInstances")
+        .unwrap()
+        .1
+        .clone();
     assert_eq!(list["Filter.1.Value.1"], "fcvm-fleet-host");
     assert_eq!(list["Filter.2.Value.1"], "stage");
     // A template with no subnet in its region is refused at start.

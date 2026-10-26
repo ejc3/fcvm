@@ -786,7 +786,7 @@ async fn test_storage_image_build_removes_its_store_of_private_directories() -> 
     let archive = dir.path().join("image.docker.tar");
     let image = dir.path().join("image.storage.img");
     let result = async {
-        fcvm::commands::podman::export_image_archive(&id, &image_name, &archive)
+        fcvm::commands::podman::export_image_archive(&id, &image_name, &archive, None)
             .await
             .context("export_image_archive")?;
         fcvm::commands::podman::build_storage_image(&archive, &image)

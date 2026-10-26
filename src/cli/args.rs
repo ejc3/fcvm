@@ -185,6 +185,12 @@ pub struct FleetCoordArgs {
     #[arg(long, default_value_t = 100)]
     pub max_tiles: usize,
 
+    /// Places on the fcvm side (at most --max-tiles): with fewer live fcvm GPUs the rest are
+    /// dark tiles, with more the side has one place per GPU. With --ec2-tiles it sizes the
+    /// two sides.
+    #[arg(long, default_value_t = 8)]
+    pub fcvm_tiles: usize,
+
     /// Where EC2 tiles come from
     #[arg(long, value_enum, default_value_t = FleetEc2::None)]
     pub ec2: FleetEc2,
@@ -308,7 +314,7 @@ pub struct FleetCoordArgs {
     #[arg(long)]
     pub admin_listen: Option<String>,
 
-    /// EC2 tiles the EC2 side runs (each side shows the GPUs it has live)
+    /// EC2 tiles the EC2 side runs; one without an instance is a dark tile
     #[arg(long, default_value_t = 8)]
     pub ec2_tiles: usize,
 

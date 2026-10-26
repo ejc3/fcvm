@@ -43,6 +43,11 @@ fn host_veth_of(namespace: &str) -> String {
 
 #[tokio::test]
 async fn two_vm_ids_sharing_leading_hex_digits_get_separate_network_names() {
+    // Network setup records what it creates with the VM's owner (fcvm::reclaim).
+    let records = tempfile::tempdir().unwrap();
+    let owners = fcvm::reclaim::owner_dir_in(records.path()).unwrap();
+    let owner_a = fcvm::reclaim::Owner::begin_in(&owners, VM_ID_A).unwrap();
+    let owner_b = fcvm::reclaim::Owner::begin_in(&owners, VM_ID_B).unwrap();
     let mut a = BridgedNetwork::new(
         VM_ID_A.to_string(),
         format!("tap-{}", &VM_ID_A[..8]),
@@ -84,6 +89,8 @@ async fn two_vm_ids_sharing_leading_hex_digits_get_separate_network_names() {
 
     let _ = b.cleanup().await;
     let _ = a.cleanup().await;
+    owner_b.complete().await.unwrap();
+    owner_a.complete().await.unwrap();
 
     let config_a = setup_a.expect("baseline VM A must set up");
     let config_b = setup_b
