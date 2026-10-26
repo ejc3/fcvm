@@ -150,8 +150,11 @@ jobs:
       # mock used about 2.2 cores of its 3 at 10 frames per second through the suite.
       # Before the render loop lost its per-pixel allocations it needed more than 3,
       # dropped frames from the first test, and later tests timed out waiting for
-      # every tile at one common t. Smaller screens leave tiles too few pixels for the
-      # seam checks' colour fit.
+      # every tile at one common t. A stream switch serves the aggregates and the
+      # direct tiles at once (18 streams, about 1.75 times the pixels) for a second or
+      # so; the mock then skips whole frames, the same ones for every stream, so the
+      # page still finds a t every tile holds. Smaller screens leave tiles too few
+      # pixels for the seam checks' colour fit.
       FLEET_E2E_VIEW: "960x600"
       FLEET_MOCK_FPS: "10"
       FLEET_MOCK_THREADS: "3"

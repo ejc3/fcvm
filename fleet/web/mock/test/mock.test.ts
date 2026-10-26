@@ -744,3 +744,41 @@ describe("the mock speaks the coordinator's snapshot shapes", () => {
     expect([...mock].filter((p) => p !== "" && !allowed(p)).sort()).toEqual([]);
   });
 });
+
+describe("mock renderer, more streams than it can draw", () => {
+  it("drops whole frames: every stream gets the same frame numbers, so the page can draw them at one t", async () => {
+    // One render thread asked for eight 360-high tiles at 30 fps: it draws a few frames a
+    // second. A renderer behind on its clock skips frames for every tile at once; skipping
+    // per stream gives each tile a different subset of t, and the page, which draws every
+    // tile at one common t, then has no t that all of them hold.
+    const scene = coord.patternScene();
+    const r = new MockRenderers({ port: 0, publicHost: "localhost", fps: 30, threads: 1, maxHeight: 360, epochUnixMs: scene.epoch_unix_ms, scene: () => scene });
+    await r.listen();
+    const ids = Array.from({ length: 8 }, (_, i) => `t${i}`);
+    ids.forEach((id, i) => r.setTile(id, { x: (i % 4) / 4, y: Math.floor(i / 4) / 2, w: 0.25, h: 0.5 }));
+    const got = new Map<string, number[]>(ids.map((id) => [id, []]));
+    const sockets = ids.map((id) => {
+      const ws = new WebSocket(`${r.frameUrl(id)}?h=360`);
+      ws.on("message", (d, bin) => {
+        if (!bin) return;
+        const p = parseFrame(new Uint8Array(d as Buffer));
+        if (p.ok) got.get(id)!.push(p.frame.frame);
+      });
+      return ws;
+    });
+    await new Promise((res) => setTimeout(res, 4000));
+    for (const ws of sockets) ws.close();
+    await r.close();
+    // Frames after the first second, once every encoder has started.
+    const first = Math.max(...ids.map((id) => got.get(id)![0] ?? Infinity));
+    const sets = ids.map((id) => new Set(got.get(id)!.filter((n) => n >= first + 30)));
+    const all = new Set<number>();
+    for (const s of sets) for (const n of s) all.add(n);
+    const everywhere = [...all].filter((n) => sets.every((s) => s.has(n)));
+    // It is behind (far fewer than 30 frames a second) ...
+    expect(all.size).toBeGreaterThan(0);
+    expect(all.size).toBeLessThan(2.5 * 30);
+    // ... and still every frame number it sent, it sent on every stream (the last one may be in flight).
+    expect(everywhere.length, `frames on all 8 streams: ${everywhere.length} of ${all.size}`).toBeGreaterThanOrEqual(all.size - 1);
+  }, 20_000);
+});
