@@ -1170,7 +1170,7 @@ python3 "$BENCH/serve_guardian.py" \
             --completion-token "$completion_token" \
             --finalizer "$finalizer" --finalizer-timeout 60 -- \
             sh -c "$phase_command" _ "$dnsmasq_was_active" \
-                "$8" "$9" "${10}" "${11}"
+                "$8" "$9" "${10}" "${11}" "${12}"
     ' _ "$BENCH/phase_supervisor.py" "$SERVE_CONTROL_PATH" \
         "$BENCH/host_resource_finalizer.py" \
         "$SERVE_COMPLETION_PATH" "$SERVE_COMPLETION_TOKEN" \
@@ -1180,9 +1180,10 @@ python3 "$BENCH/serve_guardian.py" \
          fi
          exec python3 "$2" --root "$3" --port 80 --tls-port 443 \
             --dns-addr 127.0.0.1 --dns-port 53 --answer-ip 10.0.2.2 \
-            --dns-log "$4" --access-log "$5"' \
+            --dns-log "$4" --access-log "$5" $6' \
         "$BENCH/corpus_serve.py" "$BENCH/corpus-live" \
         "$RESULTS/corpus-dns.log" "$RESULTS/corpus-access.log" \
+        "${CORPUS_SERVE_ARGS:-}" \
     > "$LOGDIR/corpus_serve.log" 2>&1 &
 SERVE_JOB_PID=$!
 for _ in $(seq 1 50); do
