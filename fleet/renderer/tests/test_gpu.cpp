@@ -344,9 +344,7 @@ int main(int argc, char** argv) {
     r.set_text_overlay(false);
     r.set_quality(0);
     Img mv = draw(r, f, Rect{0, 0, 1, 1}, 2 * h, seq, true);
-    CamPose pose = camera_at(f.camera, kq / 30.0);
-    Scene held = f;
-    held.camera = {Keyframe{kq / 30.0, {pose.pos[0], pose.pos[1], pose.pos[2]}, {pose.look[0], pose.look[1], pose.look[2]}, pose.fov_deg}};
+    Scene held = held_reference(f, kq / 30.0);
     std::vector<std::pair<double, int>> hold;
     for (int n = 0; n < 16; n++) hold.push_back({kq / 30.0, 64});
     Img ref = draw(r, held, Rect{0, 0, 1, 1}, 2 * h, hold, true);

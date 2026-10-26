@@ -140,9 +140,7 @@ static int cmd_quality(int argc, char** argv) {
     w.rect = Rect{0, 0, 1.0 / cols, 1.0 / rows};
     for (int f = 0; f < 90; f++) r.render(w, whole, t - 3 + f / 30.0, true);
   }
-  CamPose pose = camera_at(sc.camera, scene_time(sc, t));
-  Scene hs = sc;
-  hs.camera = {Keyframe{t, {pose.pos[0], pose.pos[1], pose.pos[2]}, {pose.look[0], pose.look[1], pose.look[2]}, pose.fov_deg}};
+  Scene hs = held_reference(sc, t);
   double se_all = 0;
   long n_all = 0;
   printf("{\"t\":%.4f,\"budget\":%.0f,\"full_w\":%d,\"full_h\":%d,\"tiles\":[", t, budget, W, H);
