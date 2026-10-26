@@ -1,6 +1,7 @@
 // Seam test on a GPU: the whole image and a 2x2 grid of tiles, drawn
 // separately, must agree pixel for pixel when stitched by whole-image
 // coordinates. Run in the container: fleet-renderer-test.
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -10,6 +11,12 @@
 #include "../src/render.h"
 #include "../src/scene.h"
 #include "check.h"
+
+// Section 10's bounds: the moving frame's error against its reference.
+// Measured on a T4 (round 13): rmse 15.34 and grain 7.02 with round 12's 5 x 5 filter and plain
+// reprojection of the sky; 6.10 and 4.45 with the a-trous denoiser and the sky's history clamp.
+#define RMSE_MAX 9.0
+#define GRAIN_MAX 5.5
 
 static Scene test_scene() {
   Scene s = default_scene();
@@ -312,6 +319,67 @@ int main(int argc, char** argv) {
     double behind = nb ? back / nb : 0.0;
     CHECK(behind > 0.5, "the clock's box is over cloud (mean luminance behind it %.2f)", behind);
     CHECK(nc > 150 && contrast >= 0.3, "the clock reads over cloud: %ld letter pixels, contrast %.2f", nc, contrast);
+  }
+
+  // 10. Image quality while the camera moves. The directed camera's flight
+  // from peak-seam to sunset-ridge, at the wall's sample rate (1 sample per
+  // pixel per frame, 12 frames of history), drawn whole and compared with the
+  // same pose and scene time held to 1024 samples. "grain" is the RMS of the
+  // high-frequency part of the luminance error (the error minus its 5 x 5
+  // mean); "rmse" is over RGB and also counts clouds that history drags
+  // behind the camera. Both on 8-bit values.
+  {
+    Scene f = s;
+    f.words.clear();
+    f.lights.clear();
+    f.time_of_day = 0.735;
+    Keyframe a{0, {-47, 2.6, -101}, {-56, 2.75, -114.75}, 55}, b{20, {-36, 2.4, -70}, {-73.5, 2.4, -121.75}, 60};
+    Keyframe a2 = a, b2 = b;
+    a2.t = 7;
+    b2.t = 27;
+    f.camera = {a, a2, b, b2};
+    const long kq = (long)std::llround(13.5 * 30);
+    std::vector<std::pair<double, int>> seq;
+    for (int k = 11; k >= 0; k--) seq.push_back({(kq - k) / 30.0, 1});
+    r.set_text_overlay(false);
+    r.set_quality(0);
+    Img mv = draw(r, f, Rect{0, 0, 1, 1}, 2 * h, seq, true);
+    CamPose pose = camera_at(f.camera, kq / 30.0);
+    Scene held = f;
+    held.camera = {Keyframe{kq / 30.0, {pose.pos[0], pose.pos[1], pose.pos[2]}, {pose.look[0], pose.look[1], pose.look[2]}, pose.fov_deg}};
+    std::vector<std::pair<double, int>> hold;
+    for (int n = 0; n < 16; n++) hold.push_back({kq / 30.0, 64});
+    Img ref = draw(r, held, Rect{0, 0, 1, 1}, 2 * h, hold, true);
+    CHECK(r.stats().hold && r.stats().hold_samples == 1024, "the reference is a hold of 1024 samples (%d)", r.stats().hold_samples);
+    r.set_text_overlay(true);
+    r.set_quality(-1);
+    int W = mv.tile.w, H = mv.tile.h;
+    std::vector<double> le((size_t)W * H);
+    double se = 0;
+    for (int p = 0; p < W * H; p++) {
+      double l = 0;
+      for (int c = 0; c < 3; c++) {
+        double e = (double)mv.rgba[4 * p + c] - ref.rgba[4 * p + c];
+        se += e * e;
+        l += e * (c == 0 ? 0.2126 : c == 1 ? 0.7152 : 0.0722);
+      }
+      le[p] = l;
+    }
+    double hf = 0;
+    long nh = 0;
+    for (int y = 2; y < H - 2; y++)
+      for (int x = 2; x < W - 2; x++) {
+        double m = 0;
+        for (int dy = -2; dy <= 2; dy++)
+          for (int dx = -2; dx <= 2; dx++) m += le[(size_t)(y + dy) * W + x + dx];
+        double d = le[(size_t)y * W + x] - m / 25;
+        hf += d * d;
+        nh++;
+      }
+    double rmse = std::sqrt(se / (3.0 * W * H)), grain = std::sqrt(hf / nh);
+    fprintf(stderr, "moving flight against a 1024-sample hold: rmse %.2f, grain %.2f\n", rmse, grain);
+    CHECK(grain < GRAIN_MAX, "moving frame's grain against the reference: %.2f (< %.1f)", grain, GRAIN_MAX);
+    CHECK(rmse < RMSE_MAX, "moving frame's error against the reference: rmse %.2f (< %.1f)", rmse, RMSE_MAX);
   }
   DONE();
 }

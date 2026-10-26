@@ -14,7 +14,12 @@
 #define TEMPORAL_WINDOW 8      // a moving frame averages itself and its 7 predecessors
 #define TEMPORAL_FRAME_CAP 64  // a previous frame weighs at most this many samples
 #define GUARD_FRAC 0.015f      // reprojection reach: 1.5% of the whole image's height
-#define DENOISE_R 2            // the finishing filter's radius, pixels
+#define DENOISE_PASSES 4       // a-trous passes of the denoiser, at steps 1, 2, 4, 8 pixels
+#define DENOISE_R 16           // the denoiser's reach: 1 (variance) + 1 + 2 + 4 + 8 pixels
+#define DENOISE_SIGMA_L 4.0f   // luminance stop, in standard deviations of the local noise
+#define DENOISE_SIGMA_P 1.0f   // tangent-plane stop, in pixel footprints at the hit
+#define DENOISE_LO 16.0f       // the denoiser's output in full below this many samples per pixel
+#define DENOISE_HI 48.0f       // and not at all from this many
 #define CLOUD_TILE_KM 14.0f    // the cloud volume repeats every this many km
 
 struct GCam {

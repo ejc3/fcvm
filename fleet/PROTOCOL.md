@@ -1472,7 +1472,7 @@ stride as `checkerboard` (1 when every pixel draws).
 
 **While the camera moves:** frame `k` (at `t = k/30`) draws its samples at
 its own `t`, seeded by (pixel, `t`, sample index), over its rect **plus a guard
-band** of `g + 4` pixels past the stream overlap on each side, where `g = ceil(0.015 * full_h)`
+band** of `g + 18` pixels past the stream overlap on each side, where `g = ceil(0.015 * full_h)`
 (clipped to the image). It keeps the last 8 frames it drew. Each pixel of the
 rect is then the sample-weighted average of
 
@@ -1489,18 +1489,35 @@ rect is then the sample-weighted average of
   from the pixel's first sample. Its hit kind stays that of what lies behind.
   Before, a near cloud was reprojected through the terrain behind it, or
   through the sky at infinity, and smeared while the camera moved fast.
+- Round 13: over the sky (hit kind sky, with or without a cloud in front), each
+  earlier frame's color is first clamped, per channel, to the range of this
+  frame's own colors over the 3 x 3 pixels around it that are sky. A cloud near
+  the eye crosses the sky faster than reprojection through the sky's distance
+  follows, and before this it left a trail of itself up to 7 frames long
+  behind the camera.
 
-This is computed for the rect plus the stream overlap (16 pixels) plus 2
-pixels on each side. Where a pixel's
-total weight is under 48 samples (fast motion, a fresh renderer, a 1080p view)
-it is then filtered: a 5 x 5 edge-aware average of those resolved pixels with
-the same hit kind, a depth within 3% and similar brightness, blended in fully
-below 16 samples and not at all from 48. Converged holds are not filtered.
+This is computed for the rect plus the stream overlap (16 pixels) plus 16
+pixels on each side (the denoiser's reach), together with an albedo guide (the
+mean, over a pixel's samples, of its first hit's surface albedo, weighted
+toward 1 by the haze and cloud in front of it, reprojected and weighted like
+the color) and the first sample's normal. Where a pixel's total weight is
+under 48 samples (fast motion, a fresh renderer, a 1080p view) it is then
+denoised, blended in fully below 16 samples and not at all from 48 (converged
+holds are not filtered): the color divided by the albedo guide is filtered by
+an edge-aware a-trous wavelet (Dammertz et al. 2010) of four 3 x 3 passes at
+steps 1, 2, 4 and 8 pixels, and multiplied back. A neighbour's weight falls
+with its distance off this pixel's tangent plane (against the pixel's
+footprint at its hit distance), with the angle between the normals (cosine to
+the 64th) and with the luminance difference over 4 standard deviations of the
+local noise (the variance of the luminance over the 3 x 3 pixels on the same
+surface, carried through the passes as in SVGF, Schied et al. 2017); it is
+zero across hit kinds, and the sky with the clouds over it is one surface that
+only the luminance stops.
 
 Every input of that rule is a whole-image pixel, a frame time or the scene, and
 every pixel it can read lies inside the drawing renderer's guard band (the
-filter reads 2 pixels past the overlap, whose reprojection reads `g + 1` past
-those), so:
+denoiser reads 16 pixels past the overlap, whose reprojection reads `g + 1`
+past those), so:
 **two renderers that drew the same frames `k-7 .. k` give identical pixels for
 frame `k`**, whatever their rects. A renderer that started (or missed a slot)
 less than 8 frames ago differs only until 8 frames have passed. History older

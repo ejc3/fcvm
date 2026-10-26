@@ -2,6 +2,8 @@
 // streams it as H.264 over WebSocket. See fleet/PROTOCOL.md.
 #include <unistd.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -22,6 +24,8 @@ static void usage() {
           "usage: fleet-renderer [serve]                      serve on $PORT (8080)\n"
           "       fleet-renderer still OUT.ppm [--t T] [--h H] [--scene FILE] [--spp N] [--frames N | --seq N] [--checker 0|2|4] [--hq 0|1]\n"
           "       fleet-renderer bench [--h H]... [--frames N]   time render + encode per height\n"
+          "       fleet-renderer quality OUTDIR --t T [--scene FILE] [--h H] [--cols C --rows R] [--frames N] [--ref N] [--tile I]\n"
+          "                                                     a moving frame of a C x R grid against a held reference: RMSE, render ms\n"
           "       fleet-renderer test [H]                       the seam test (whole image vs 2x2 tiles)\n"
           "       fleet-renderer startup [H]                    ms from process start to GPU ready, first frame, first encode\n"
           "       fleet-renderer sleep                          wait forever without using the GPU\n"
@@ -87,6 +91,121 @@ static int cmd_still(int argc, char** argv) {
 
 static int cmd_bench(int argc, char** argv);
 
+// quality OUTDIR: a moving frame of a grid of tiles, each drawn in a fresh
+// renderer with its history as the wall draws it, against a reference of the
+// same frame (the same pose and scene time held and accumulated to --ref
+// samples). Prints per-tile and whole-image RMSE (8-bit RGB) and render times;
+// writes frame.ppm and ref.ppm, the whole image stitched from the tiles.
+static void write_ppm(const std::string& path, int w, int h, const std::vector<uint8_t>& rgb) {
+  FILE* fp = fopen(path.c_str(), "wb");
+  if (!fp) throw std::runtime_error("cannot write " + path);
+  fprintf(fp, "P6\n%d %d\n255\n", w, h);
+  fwrite(rgb.data(), 1, rgb.size(), fp);
+  fclose(fp);
+}
+
+static int cmd_quality(int argc, char** argv) {
+  if (argc < 3) { usage(); return 2; }
+  std::string out = argv[2];
+  double t = 0;
+  int h = 360, frames = 24, ref = 1024, cols = 4, rows = 4, only = -1;
+  Scene sc = default_scene();
+  for (int i = 3; i + 1 < argc; i += 2) {
+    std::string k = argv[i];
+    if (k == "--t") t = atof(argv[i + 1]);
+    else if (k == "--h") h = atoi(argv[i + 1]);
+    else if (k == "--frames") frames = atoi(argv[i + 1]);
+    else if (k == "--ref") ref = atoi(argv[i + 1]);
+    else if (k == "--cols") cols = atoi(argv[i + 1]);
+    else if (k == "--rows") rows = atoi(argv[i + 1]);
+    else if (k == "--tile") only = atoi(argv[i + 1]);
+    else if (k == "--scene") sc = parse_scene(read_file(argv[i + 1]));
+    else { usage(); return 2; }
+  }
+  Renderer r;
+  double budget = envd("BUDGET", 2.5e5);
+  r.set_budget(budget);
+  r.set_margin((int)envd("MARGIN", 16));
+  r.set_text_overlay(false);
+  std::string err;
+  if (!r.init(&err)) { fprintf(stderr, "init: %s\n", err.c_str()); return 1; }
+  long long k = std::llround(t * 30);
+  t = k / 30.0;
+  Tile whole = tile_geometry(Rect{0, 0, 1.0 / cols, 1.0 / rows}, sc.image_aspect, h);
+  int W = whole.full_w, H = whole.full_h;
+  std::vector<uint8_t> img(3 * (size_t)W * H, 0), refimg(3 * (size_t)W * H, 0);
+  // warm the GPU out of its idle clocks
+  {
+    Scene w = sc;
+    w.rect = Rect{0, 0, 1.0 / cols, 1.0 / rows};
+    for (int f = 0; f < 90; f++) r.render(w, whole, t - 3 + f / 30.0, true);
+  }
+  CamPose pose = camera_at(sc.camera, scene_time(sc, t));
+  Scene hs = sc;
+  hs.camera = {Keyframe{t, {pose.pos[0], pose.pos[1], pose.pos[2]}, {pose.look[0], pose.look[1], pose.look[2]}, pose.fov_deg}};
+  double se_all = 0;
+  long n_all = 0;
+  printf("{\"t\":%.4f,\"budget\":%.0f,\"full_w\":%d,\"full_h\":%d,\"tiles\":[", t, budget, W, H);
+  bool first = true;
+  for (int ti = 0; ti < cols * rows; ti++) {
+    if (only >= 0 && ti != only) continue;
+    Rect rc{(double)(ti % cols) / cols, (double)(ti / cols) / rows, 1.0 / cols, 1.0 / rows};
+    Scene s = sc;
+    s.rect = rc;
+    Tile tl = tile_geometry(rc, sc.image_aspect, h);
+    r.reset_history();
+    r.set_quality(-1);
+    std::vector<double> ms;
+    for (int f = frames - 1; f >= 0; f--) {
+      r.render(s, tl, (k - f) / 30.0, true);
+      if (f < frames - 8) ms.push_back(r.stats().render_ms);
+    }
+    int spp = r.stats().spp;
+    bool hq = r.stats().hq;
+    std::vector<uint8_t> a, b;
+    r.download_rgba(&a);
+    if (ref <= 0) b = a;  // timing only
+    // the reference: the same pose and scene time, held, on the same path
+    Scene rs = hs;
+    rs.rect = rc;
+    r.reset_history();
+    r.set_quality(hq ? 1 : 0);
+    for (int n = 0; n < ref; n += 64) r.render(rs, tl, t, true, 64);
+    if (ref > 0) r.download_rgba(&b);
+    r.set_quality(-1);
+    double se = 0;
+    for (int j = 0; j < tl.h; j++)
+      for (int i = 0; i < tl.w; i++) {
+        int X = tl.x0 + i, Y = tl.y0 + j;
+        if (X >= W || Y >= H) continue;
+        for (int c = 0; c < 3; c++) {
+          uint8_t va = a[4 * ((size_t)j * tl.w + i) + c], vb = b[4 * ((size_t)j * tl.w + i) + c];
+          img[3 * ((size_t)Y * W + X) + c] = va;
+          refimg[3 * ((size_t)Y * W + X) + c] = vb;
+          se += (double)(va - vb) * (va - vb);
+        }
+      }
+    long n = 3L * tl.w * tl.h;
+    se_all += se;
+    n_all += n;
+    std::sort(ms.begin(), ms.end());
+    double mean = 0;
+    for (double m : ms) mean += m;
+    mean /= std::max<size_t>(1, ms.size());
+    printf("%s{\"tile\":%d,\"w\":%d,\"h\":%d,\"spp\":%d,\"hq\":%d,\"drawn_px\":%.0f,\"render_ms_mean\":%.2f,\"render_ms_max\":%.2f,"
+           "\"rmse\":%.3f}",
+           first ? "" : ",", ti, tl.w, tl.h, spp, (int)hq, r.drawn_pixels(tl), mean, ms.empty() ? 0.0 : ms.back(),
+           std::sqrt(se / n));
+    fflush(stdout);
+    first = false;
+  }
+  printf("],\"rmse\":%.3f}\n", std::sqrt(se_all / std::max(1L, n_all)));
+  write_ppm(out + "/frame.ppm", W, H, img);
+  write_ppm(out + "/ref.ppm", W, H, refimg);
+  return 0;
+}
+
+
 // Process start to: GPU ready, first frame drawn, first frame encoded. The
 // same steps `serve` takes before its first frame, without the network.
 static int cmd_startup(int argc, char** argv) {
@@ -119,6 +238,7 @@ int main(int argc, char** argv) {
   try {
     if (cmd == "still") return cmd_still(argc, argv);
     if (cmd == "bench") return cmd_bench(argc, argv);
+    if (cmd == "quality") return cmd_quality(argc, argv);
     if (cmd == "startup") return cmd_startup(argc, argv);
     if (cmd == "sleep") {  // hold the container open without touching the GPU
       for (;;) pause();
