@@ -3424,7 +3424,7 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
                         if spot && !api.spot_capacity.contains(&region) {
                             return (StatusCode::OK, "<CreateFleetResponse><fleetId>fleet-0</fleetId><errorSet><item><lifecycle>spot</lifecycle><errorCode>UnfulfillableCapacity</errorCode><errorMessage>Unable to fulfill capacity due to your request configuration.</errorMessage></item></errorSet><fleetInstanceSet/></CreateFleetResponse>".into());
                         }
-                        (StatusCode::OK, "<CreateFleetResponse><fleetId>fleet-1</fleetId><fleetInstanceSet><item><instanceIds><item>i-0fedcba9876543210</item></instanceIds></item></fleetInstanceSet></CreateFleetResponse>".into())
+                        (StatusCode::OK, "<CreateFleetResponse><fleetId>fleet-1</fleetId><fleetInstanceSet><item><instanceIds><item>i-1234567890abcdef0</item></instanceIds></item></fleetInstanceSet></CreateFleetResponse>".into())
                     }
                     _ => error("InvalidAction"),
                 }
@@ -3475,7 +3475,7 @@ async fn the_aws_host_driver_launches_through_an_instant_fleet() {
         .launch("us-east-1", Market::OnDemand, 1, "token-od")
         .await
         .unwrap();
-    assert_eq!(od.ids, vec!["i-0fedcba9876543210".to_string()]);
+    assert_eq!(od.ids, vec!["i-1234567890abcdef0".to_string()]);
     let calls = api.calls.lock().unwrap().clone();
     // The template's type is read once and reused for the second launch.
     let reads: Vec<_> = calls
