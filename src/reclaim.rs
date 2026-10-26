@@ -473,6 +473,15 @@ impl Inner {
         if remaining.is_empty() {
             return delete_owner_files(&self.dir, &self.id, lock);
         }
+        if remaining.iter().all(|(_, why)| why.starts_with(IN_USE)) {
+            // This process, or another, still leases them (a clone keeps the mountpoint
+            // its VMM's vsock path goes through until it exits). The record stays, and
+            // the first launch after the lease ends removes them.
+            let resources: Vec<Resource> = remaining.into_iter().map(|(r, _)| r).collect();
+            write_record(&self.dir, &self.id, &resources)?;
+            release(lock);
+            return Ok(());
+        }
         let kept = remaining
             .iter()
             .map(|(resource, why)| format!("{resource}: {why}"))
@@ -545,7 +554,13 @@ pub(crate) enum Undo {
     Done,
     /// Still there; a later launch tries again.
     Kept(String),
+    /// Still there because a live process uses it: a lease on it is held. Not a failure;
+    /// the record stays until a launch finds it unused.
+    InUse(String),
 }
+
+/// How the reason of an [`Undo::InUse`] resource starts, in what `undo_all` returns.
+const IN_USE: &str = "in use: ";
 
 /// Undo `resources` newest first, returning the ones that stay. `same_boot` is false for
 /// a record written before the last reboot, whose kernel objects are gone.
@@ -578,6 +593,7 @@ async fn undo_all(
             match undo(&resource).await {
                 Undo::Done => debug!(owner = %id, %resource, "undone"),
                 Undo::Kept(why) => remaining.push((resource, why)),
+                Undo::InUse(why) => remaining.push((resource, format!("{IN_USE}{why}"))),
             }
             continue;
         }
@@ -595,15 +611,18 @@ async fn undo_all(
             remaining.push((resource, why));
             continue;
         }
-        match undo(&resource).await {
-            Undo::Done => debug!(owner = %id, %resource, "undone"),
-            Undo::Kept(why) => {
-                hold_kernel = Some(format!("{resource} could not be removed"));
-                remaining.push((resource, why));
-                // Still this owner's: record it again.
-                let _ = persist(&record(&pending, &remaining));
+        let left = match undo(&resource).await {
+            Undo::Done => {
+                debug!(owner = %id, %resource, "undone");
+                continue;
             }
-        }
+            Undo::Kept(why) => why,
+            Undo::InUse(why) => format!("{IN_USE}{why}"),
+        };
+        hold_kernel = Some(format!("{IN_USE}{resource} stays"));
+        remaining.push((resource, left));
+        // Still this owner's: record it again.
+        let _ = persist(&record(&pending, &remaining));
     }
     remaining.reverse();
     remaining
@@ -695,7 +714,7 @@ async fn undo_runtime_dir(path: &Path) -> Undo {
         Ok(Some(file)) => file,
         Ok(None) => return Undo::Done,
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            return Undo::Kept("a restore leases it".to_string())
+            return Undo::InUse("a restore leases it".to_string())
         }
         Err(error) => return Undo::Kept(error.to_string()),
     };
@@ -724,9 +743,11 @@ async fn undo_mount_target(path: &Path) -> Undo {
     let _lock = match lock_directory(path) {
         Ok(Some(file)) => file,
         Ok(None) => return Undo::Done,
-        // Every process that leases a mount target records it first, so a live one is
-        // responsible for it now.
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Undo::Done,
+        // A restore leases it: removed by whichever lease ends last, or by a later
+        // launch once none does (a clone that exits without dropping its lease).
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            return Undo::InUse("a restore leases it".to_string())
+        }
         Err(error) => return Undo::Kept(error.to_string()),
     };
     // Empty, as `storage::runtime_dir` judges a mountpoint a restore made: a live VM's
@@ -864,7 +885,11 @@ pub async fn reclaim_abandoned_in(dir: &Path) -> Reclaimed {
         }
         done.remaining += remaining.len();
         for (resource, why) in &remaining {
-            warn!(owner = %id, pid = record.pid, %resource, reason = %why, "cannot reclaim yet");
+            if why.starts_with(IN_USE) {
+                debug!(owner = %id, pid = record.pid, %resource, reason = %why, "still in use");
+            } else {
+                warn!(owner = %id, pid = record.pid, %resource, reason = %why, "cannot reclaim yet");
+            }
         }
         let resources: Vec<Resource> = remaining.into_iter().map(|(r, _)| r).collect();
         if let Err(error) = write_record(dir, &id, &resources) {
@@ -1114,12 +1139,13 @@ mod tests {
         let other_clone = std::fs::File::open(&held).unwrap();
         fs2::FileExt::try_lock_shared(&other_clone).unwrap();
 
+        // The held one stays recorded until no restore leases it.
         assert_eq!(
             reclaim_abandoned_in(&dir).await,
             Reclaimed {
-                owners: 1,
-                resources: 3,
-                remaining: 0
+                owners: 0,
+                resources: 2,
+                remaining: 1
             }
         );
         assert!(!made.exists(), "an unleased empty mountpoint was left");
@@ -1130,6 +1156,12 @@ mod tests {
         assert!(
             held.exists(),
             "a mountpoint another clone holds was removed"
+        );
+        drop(other_clone);
+        assert_eq!(reclaim_abandoned_in(&dir).await.owners, 1);
+        assert!(
+            !held.exists(),
+            "the mountpoint was left once no lease held it"
         );
     }
 
@@ -1338,5 +1370,29 @@ mod tests {
         assert_eq!(state.resources, [netns]);
         drop(state);
         drop(owner);
+    }
+
+    /// A clone whose VMM goes through the redirect keeps its lease on the mountpoint past
+    /// its teardown. Completing its owner then leaves the record, so a clone that exits
+    /// without dropping the lease still has its mountpoint reclaimed.
+    #[tokio::test]
+    async fn completing_an_owner_keeps_a_mount_target_it_still_leases() {
+        let (root, dir) = test_dir();
+        let made = root.path().join("vm-disks/vm-gone-source");
+        std::fs::create_dir_all(&made).unwrap();
+        let owner = Owner::begin_in(&dir, "vm-clone-leasing").unwrap();
+        owner
+            .record(Resource::MountTarget { path: made.clone() })
+            .unwrap();
+        let own_lease = std::fs::File::open(&made).unwrap();
+        fs2::FileExt::try_lock_shared(&own_lease).unwrap();
+        owner.complete().await.unwrap();
+        assert!(
+            dir.join("vm-clone-leasing.json").exists(),
+            "completion dropped the record of a mountpoint still leased"
+        );
+        drop(own_lease);
+        assert_eq!(reclaim_abandoned_in(&dir).await.owners, 1);
+        assert!(!made.exists());
     }
 }

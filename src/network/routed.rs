@@ -164,12 +164,45 @@ pub(crate) async fn release_address(
     iface: &str,
     masquerade: bool,
 ) -> crate::reclaim::Undo {
+    release_address_in(
+        std::path::Path::new(ADDRESS_LEASE_DIR),
+        address,
+        iface,
+        masquerade,
+    )
+    .await
+}
+
+/// [`release_address`] with the leases in `lease_dir`.
+async fn release_address_in(
+    lease_dir: &std::path::Path,
+    address: std::net::Ipv6Addr,
+    iface: &str,
+    masquerade: bool,
+) -> crate::reclaim::Undo {
     use crate::reclaim::Undo;
-    let lease = match lease_address(std::path::Path::new(ADDRESS_LEASE_DIR), address, "reclaim") {
+    let lease = match lease_address(lease_dir, address, "reclaim") {
         Ok(LeaseAttempt::Leased(lease)) => lease,
-        Ok(LeaseAttempt::Held { .. }) => return Undo::Done,
+        // Another VM holds the address now, or holds it while it checks for leftovers
+        // like these; either way not now.
+        Ok(LeaseAttempt::Held { .. }) => {
+            return Undo::InUse(format!("the lease of {address} is held"))
+        }
         Err(error) => return Undo::Kept(format!("{error:#}")),
     };
+    let removed = remove_address_objects(address, iface, masquerade).await;
+    drop(lease);
+    removed
+}
+
+/// Remove `address`'s proxy NDP entry and, with `masquerade`, its MASQUERADE rule. The
+/// caller holds the address's lease. Either one already gone is not a failure.
+async fn remove_address_objects(
+    address: std::net::Ipv6Addr,
+    iface: &str,
+    masquerade: bool,
+) -> crate::reclaim::Undo {
+    use crate::reclaim::Undo;
     let source = format!("{address}/128");
     if masquerade {
         let rule = [
@@ -205,11 +238,14 @@ pub(crate) async fn release_address(
         .output()
         .await
     {
-        // A missing entry fails with an error, and is gone either way.
-        Ok(_) => {}
+        Ok(output) if output.status.success() => {}
+        // RTNETLINK's ENOENT: the entry is gone already.
+        Ok(output) if String::from_utf8_lossy(&output.stderr).contains("No such file") => {}
+        Ok(output) => {
+            return Undo::Kept(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
         Err(error) => return Undo::Kept(error.to_string()),
     }
-    drop(lease);
     Undo::Done
 }
 
@@ -1307,46 +1343,24 @@ impl NetworkManager for RoutedNetwork {
         tcp_proxy::stop_relays(self.proxy_handles.drain(..)).await;
 
         // Remove IPv6 MASQUERADE and proxy NDP
+        let mut address_left = false;
         if let Some(ref vm_ipv6) = self.vm_ipv6 {
             let default_iface = self.default_iface.as_deref().unwrap_or("eth0");
 
-            // Remove IPv6 MASQUERADE rule (only if we set one — skipped with --ipv6-prefix)
-            if self.ipv6_prefix.is_none() {
-                match tokio::process::Command::new("ip6tables")
-                    .args([
-                        "-t",
-                        "nat",
-                        "-D",
-                        "POSTROUTING",
-                        "-o",
-                        default_iface,
-                        "-s",
-                        &format!("{}/128", vm_ipv6),
-                        "-j",
-                        "MASQUERADE",
-                    ])
-                    .output()
-                    .await
-                {
-                    Ok(o) if !o.status.success() => {
-                        warn!(stderr = %String::from_utf8_lossy(&o.stderr).trim(), "ip6tables MASQUERADE cleanup failed");
+            // Remove the IPv6 MASQUERADE rule (only set without --ipv6-prefix) and the
+            // proxy NDP entry. One that cannot be removed keeps its record, under this
+            // address's lease, for the next launch.
+            match vm_ipv6.parse() {
+                Ok(address) => {
+                    if let crate::reclaim::Undo::Kept(why) =
+                        remove_address_objects(address, default_iface, self.ipv6_prefix.is_none())
+                            .await
+                    {
+                        warn!(vm_ipv6 = %vm_ipv6, reason = %why, "MASQUERADE or proxy NDP cleanup failed");
+                        address_left = true;
                     }
-                    Err(e) => warn!(error = %e, "ip6tables command failed"),
-                    _ => {}
                 }
-            }
-
-            // Remove proxy NDP
-            match tokio::process::Command::new("ip")
-                .args(["-6", "neigh", "del", "proxy", vm_ipv6, "dev", default_iface])
-                .output()
-                .await
-            {
-                Ok(o) if !o.status.success() => {
-                    warn!(stderr = %String::from_utf8_lossy(&o.stderr).trim(), "proxy NDP cleanup failed");
-                }
-                Err(e) => warn!(error = %e, "proxy NDP command failed"),
-                _ => {}
+                Err(e) => warn!(vm_ipv6 = %vm_ipv6, error = %e, "unparseable VM IPv6 address"),
             }
 
             // Remove host route (use dev qualifier for parallel safety)
@@ -1376,7 +1390,9 @@ impl NetworkManager for RoutedNetwork {
         // so the records go first (crate::reclaim). If they cannot be dropped, the veth
         // and the namespace stay, still recorded, and the next launch removes them.
         if let Err(e) = crate::reclaim::forget(&self.vm_id, |r| {
-            r.is_network() && !matches!(r, crate::reclaim::Resource::Netns { .. })
+            r.is_network()
+                && !matches!(r, crate::reclaim::Resource::Netns { .. })
+                && !(address_left && matches!(r, crate::reclaim::Resource::RoutedAddress { .. }))
         }) {
             self.address_lease.take();
             anyhow::bail!(
@@ -1653,6 +1669,23 @@ pub(crate) async fn detect_default_ipv6_interface() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A routed VM's proxy NDP entry and MASQUERADE rule are keyed by its address alone.
+    /// While another process holds the address's lease, the reclaim leaves them recorded
+    /// instead of dropping the record of objects it did not remove.
+    #[tokio::test]
+    async fn a_held_address_keeps_its_record() {
+        let leases = tempfile::tempdir().unwrap();
+        let address: std::net::Ipv6Addr = "2001:db8::42".parse().unwrap();
+        let LeaseAttempt::Leased(_held) = lease_address(leases.path(), address, "vm-live").unwrap()
+        else {
+            panic!("a fresh lease directory refused the address");
+        };
+        assert!(matches!(
+            release_address_in(leases.path(), address, "eth-test", true).await,
+            crate::reclaim::Undo::InUse(_)
+        ));
+    }
 
     /// A restored routed guest pins its neighbour entry for its IPv6 gateway
     /// to `NAMESPACE_MAC` (#1160). That is right only while the gateway is

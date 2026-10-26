@@ -716,13 +716,20 @@ impl NetworkManager for BridgedNetwork {
         // them go first (crate::reclaim). If they cannot be dropped, the objects stay,
         // still recorded, and the next launch removes them. A kill from here on leaks
         // what is left.
-        let forgotten = crate::reclaim::forget(&self.vm_id, |r| {
-            r.is_network()
-                && !matches!(
-                    r,
-                    crate::reclaim::Resource::Netns { .. } | crate::reclaim::Resource::GlobalNat
-                )
-        });
+        // A rule or route that could not be removed keeps its record, and with it the
+        // veth and namespace that keep its address this VM's, for the next launch.
+        let forgotten = if !errors.is_empty() {
+            Err(anyhow::anyhow!("rules or routes of this VM remain"))
+        } else {
+            crate::reclaim::forget(&self.vm_id, |r| {
+                r.is_network()
+                    && !matches!(
+                        r,
+                        crate::reclaim::Resource::Netns { .. }
+                            | crate::reclaim::Resource::GlobalNat
+                    )
+            })
+        };
         if let Err(e) = forgotten {
             errors.push(format!(
                 "dropping network records, so the veth and namespace stay for the next launch: {e:#}"
@@ -794,6 +801,20 @@ impl NetworkManager for BridgedNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rule or route that cleanup could not remove keeps its record, and the veth and
+    /// namespace that keep its address this VM's are not deleted (or forgotten) after it.
+    #[test]
+    fn cleanup_keeps_the_records_when_a_rule_stays() {
+        let source = include_str!("bridged.rs");
+        let cleanup = &source[source.find("async fn cleanup(&mut self)").unwrap()..];
+        let guard = cleanup
+            .find("let forgotten = if !errors.is_empty() {")
+            .expect("cleanup guards its forget on earlier failures");
+        let veth = cleanup.find("veth::delete_veth_pair(host_veth)").unwrap();
+        let rules = cleanup.find("portmap::cleanup_port_mappings(").unwrap();
+        assert!(rules < guard && guard < veth);
+    }
 
     /// Bridged forwarding is IPv4 DNAT scoped to the veth address, so it cannot honour
     /// an IPv6 HOSTIP. setup() says so before it creates anything.

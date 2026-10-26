@@ -35,6 +35,8 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         // Use /tmp for kernel build (no btrfs required)
         paths::init_with_paths("/tmp/fcvm-kernel", "/tmp/fcvm-kernel");
         std::fs::create_dir_all("/tmp/fcvm-kernel/kernels")?;
+        // Store temps of host kernel builds killed before they finished (crate::reclaim).
+        crate::reclaim::reclaim_abandoned().await;
 
         let profile = get_kernel_profile(profile_name)?.ok_or_else(|| {
             anyhow::anyhow!("kernel profile '{}' not found in config", profile_name)

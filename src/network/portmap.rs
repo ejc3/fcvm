@@ -165,9 +165,12 @@ async fn delete_rule(rule: &str) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Ignore "No chain/target/match" errors - rule already gone
-        if !stderr.contains("No chain") && !stderr.contains("does not exist") {
-            warn!("failed to delete iptables rule: {}", stderr);
+        // "No chain/target/match", "Bad rule": the rule is gone already.
+        if !stderr.contains("No chain")
+            && !stderr.contains("does not exist")
+            && !stderr.contains("Bad rule")
+        {
+            anyhow::bail!("deleting iptables rule {rule}: {}", stderr.trim());
         }
     }
 
@@ -193,13 +196,15 @@ pub async fn cleanup_port_mappings(rules: &[String]) -> Result<()> {
 
     debug!(rules = rules.len(), "cleaning up port mapping rules");
 
-    // Delete in reverse order
+    // Delete in reverse order, every one, and report the ones that stayed.
+    let mut failures = Vec::new();
     for rule in rules.iter().rev() {
         if let Err(e) = delete_rule(rule).await {
             warn!(rule = %rule, error = %e, "failed to delete port mapping rule");
+            failures.push(format!("{e:#}"));
         }
     }
-
+    anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
     Ok(())
 }
 
