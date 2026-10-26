@@ -165,13 +165,14 @@ fn parked(dir: &Path) -> Option<PathBuf> {
 }
 
 /// #1181: a restore of a snapshot whose source VM is gone recreates the source's
-/// directory as a mountpoint. The clone's teardown removes it, and after a SIGKILL of a
-/// restore that made it (with the clone's own runtime directory, #1183) the next launch
-/// removes both.
+/// directory as a mountpoint, and the last lease on it removes it (#1304). After a
+/// SIGKILL of a restore that made it, with the clone's own runtime directory (#1183), the
+/// next launch removes both.
 #[cfg(feature = "integration-slow")]
 #[tokio::test]
-async fn a_restore_removes_the_mountpoint_it_makes_over_a_gone_source() -> Result<()> {
-    let (source_name, clone_name, snapshot, _) = common::unique_names("reclaim-mount");
+async fn a_sigkilled_restore_leaves_its_mountpoint_and_runtime_dir_to_the_next_launch() -> Result<()>
+{
+    let (source_name, _, snapshot, _) = common::unique_names("reclaim-mount");
 
     let (mut source, source_pid) = common::spawn_fcvm(&[
         "podman",
@@ -201,31 +202,6 @@ async fn a_restore_removes_the_mountpoint_it_makes_over_a_gone_source() -> Resul
     );
 
     let result = async {
-        // A clone that exits normally.
-        let (mut clone, clone_pid) = common::spawn_fcvm(&[
-            "snapshot",
-            "run",
-            "--snapshot",
-            &snapshot,
-            "--name",
-            &clone_name,
-        ])
-        .await?;
-        let healthy = common::poll_health_by_pid(clone_pid, 120).await;
-        let made = source_dir.is_dir();
-        stop(&mut clone, clone_pid).await?;
-        healthy?;
-        anyhow::ensure!(
-            made,
-            "the running clone has no mountpoint at {}",
-            source_dir.display()
-        );
-        anyhow::ensure!(
-            !source_dir.exists(),
-            "the clone's teardown left the mountpoint it made at {}",
-            source_dir.display()
-        );
-
         // A restore killed after it made the mountpoint and its own directory, before
         // its VMM loaded the snapshot.
         let park = tempfile::tempdir()?;

@@ -1384,7 +1384,7 @@ pub async fn ensure_rootfs(allow_create: bool, rootfs_type: Option<&str>) -> Res
     // Log the generated script for debugging
     debug!("generated setup script:\n{}", setup_script);
 
-    let temp_rootfs = super::StoreTemp::new(&rootfs_path);
+    let temp_rootfs = super::StoreTemp::new(&rootfs_path)?;
     let result = match create_layer2_rootless(
         &plan,
         script_sha_short,
@@ -1750,7 +1750,7 @@ pub async fn ensure_fc_agent_initrd(allow_create: bool) -> Result<PathBuf> {
     // Directory for the initrd contents, unique to this builder and removed when
     // `build_dir` drops.
     let build_dir =
-        super::StoreTemp::new(&initrd_dir.join(format!(".initrd-build-{}", initrd_sha_short)));
+        super::StoreTemp::new(&initrd_dir.join(format!(".initrd-build-{}", initrd_sha_short)))?;
     let temp_dir = build_dir.path();
     tokio::fs::create_dir_all(temp_dir).await?;
     // A killed root run leaves this directory behind; hand it to the invoker so a
@@ -1798,7 +1798,7 @@ pub async fn ensure_fc_agent_initrd(allow_create: bool) -> Result<PathBuf> {
 
     // Create cpio archive (initrd format)
     // Use bash with pipefail so cpio errors aren't masked by gzip success (v3)
-    let temp_initrd = super::StoreTemp::new(&initrd_path);
+    let temp_initrd = super::StoreTemp::new(&initrd_path)?;
     let output = Command::new("bash")
         .args([
             "-c",
@@ -1930,7 +1930,7 @@ async fn create_layer2_rootless(
     info!("converting qcow2 to raw format (no root required)");
     // Intermediates beside the output, unique to this builder like it and removed
     // when they drop.
-    let full_disk = super::StoreTemp::new(output_path);
+    let full_disk = super::StoreTemp::new(output_path)?;
     let full_disk_path = full_disk.path();
     let output = Command::new("qemu-img")
         .args([
@@ -1956,7 +1956,7 @@ async fn create_layer2_rootless(
     // Step 3: Extract partition 1 (root filesystem) using fdisk and dd
     // This avoids GPT partition table issues with Firecracker
     info!("extracting root partition from GPT disk (no root required)");
-    let partition = super::StoreTemp::new(output_path);
+    let partition = super::StoreTemp::new(output_path)?;
     let partition_path = partition.path();
 
     // Get partition info using sfdisk
@@ -2259,7 +2259,7 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
     // rename it to the final cache path on success. An interrupted or failed
     // download must never leave a partial package set at the content-addressed
     // path, and the temp is removed when `download` drops unpublished.
-    let download = super::StoreTemp::new(&packages_dir);
+    let download = super::StoreTemp::new(&packages_dir)?;
     let download_dir = download.path();
     tokio::fs::create_dir_all(download_dir).await?;
     super::give_store_entry_to_invoker(&cache_dir);
@@ -2405,7 +2405,7 @@ async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
         "downloading Ubuntu cloud image (this may take several minutes)"
     );
 
-    let temp = super::StoreTemp::new(&image_path);
+    let temp = super::StoreTemp::new(&image_path)?;
 
     // -f makes curl fail on HTTP errors instead of saving the error page as the
     // image; -S still prints the error despite --progress-bar.

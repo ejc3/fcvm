@@ -68,6 +68,9 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
     // Load config and initialize paths (with helpful error if config missing)
     let (config, _, _) = load_config(args.config.as_deref())?;
     paths::init_with_paths(&config.paths.data_dir, &config.paths.assets_dir);
+    // Store temps of setups killed before they finished (crate::reclaim). A setup under
+    // sudo reclaims root's records, which no rootless launch reads.
+    crate::reclaim::reclaim_abandoned().await;
 
     // Build the optional Cloud Hypervisor backend binary (#632) and exit. CH is an
     // optional VMM backend, so it is built on demand via `--cloud-hypervisor` rather

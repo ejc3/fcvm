@@ -26,7 +26,7 @@
 //! that does not exist, and undoing it finds nothing. That is safe only for names no other
 //! process can create, which holds for every resource here: a VM's directory is named by
 //! its random vm_id and a temporary by a random UUID. A mountpoint can be another process's
-//! too, and its undo removes it only if it holds nothing but empty directories and nobody
+//! too, and its undo removes it only if it is empty and nobody
 //! leases it (`storage::runtime_dir`).
 //!
 //! Each user reclaims only the records in its own directory, which it creates mode 0700
@@ -52,7 +52,7 @@ pub enum Resource {
     /// A VM's runtime directory. Removed whole, once no restore leases it.
     RuntimeDir { path: PathBuf },
     /// A source VM's directory that a restore binds its own directory over. Removed only
-    /// while it holds nothing but empty directories and no restore leases it, so a live
+    /// while it is empty and no restore leases it, so a live
     /// VM's directory is never touched.
     MountTarget { path: PathBuf },
     /// A temporary file or directory that is renamed into place or removed when its
@@ -216,9 +216,6 @@ struct OwnerState {
     /// Held until the owner completes or is dropped.
     lock: Option<Flock<File>>,
     resources: Vec<Resource>,
-    /// Files kept open for the owner's lifetime, such as the shared lease a restore holds
-    /// on a mount target it made (`storage::runtime_dir`).
-    pins: Vec<File>,
     completed: bool,
 }
 
@@ -270,7 +267,6 @@ impl Owner {
             state: Mutex::new(OwnerState {
                 lock: Some(lock),
                 resources: Vec::new(),
-                pins: Vec::new(),
                 completed: false,
             }),
         });
@@ -281,6 +277,19 @@ impl Owner {
     /// Record `resource` before creating it.
     pub fn record(&self, resource: Resource) -> Result<()> {
         self.inner.record(resource)
+    }
+
+    /// Delete the record without undoing anything: the caller removed or published every
+    /// resource it recorded.
+    pub fn discard(self) -> Result<()> {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.completed = true;
+        state.resources.clear();
+        let lock = state
+            .lock
+            .take()
+            .context("a discarded owner holds its lock")?;
+        delete_owner_files(&self.inner.dir, &self.inner.id, lock)
     }
 
     /// Undo whatever is still recorded and delete the record (see [`complete`]).
@@ -351,7 +360,6 @@ impl Drop for Owner {
                 "owner ended without completing; the next launch reclaims what it recorded"
             );
         }
-        state.pins.clear();
         if let Some(lock) = state.lock.take() {
             release(lock);
         }
@@ -379,18 +387,13 @@ impl Inner {
     }
 
     async fn complete(&self) -> Result<()> {
-        let (resources, pins) = {
+        let resources = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.completed {
                 return Ok(());
             }
-            (
-                std::mem::take(&mut state.resources),
-                std::mem::take(&mut state.pins),
-            )
+            std::mem::take(&mut state.resources)
         };
-        // A pin is a lease on a resource below, which its undo must be able to take.
-        drop(pins);
         let remaining = undo_all(&self.id, resources).await;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.completed = true;
@@ -432,18 +435,7 @@ pub fn record(id: &str, resource: Resource) -> Result<()> {
     owner(id)?.record(resource)
 }
 
-/// Keep `file` open until the owner under `id` completes or exits.
-pub fn pin(id: &str, file: File) -> Result<()> {
-    let inner = owner(id)?;
-    let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
-    if state.completed {
-        bail!("the owner {id} has completed; nothing can be pinned to it");
-    }
-    state.pins.push(file);
-    Ok(())
-}
-
-/// End the owner registered under `id`: release its pins, undo every resource still
+/// End the owner registered under `id`: undo every resource still
 /// recorded, and delete its record. Teardown has removed most of them already, and undoing
 /// a resource that is gone does nothing. A resource that cannot be undone stays recorded
 /// for the next launch and fails this call.
@@ -539,19 +531,16 @@ async fn undo_mount_target(path: &Path) -> Undo {
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Undo::Done,
         Err(error) => return Undo::Kept(error.to_string()),
     };
-    let path = path.to_path_buf();
-    let removed = tokio::task::spawn_blocking(move || {
-        if !crate::storage::runtime_dir::holds_only_empty_dirs(&path)? {
-            // A VM's own directory, not a mountpoint a restore made.
-            return Ok(());
-        }
-        crate::storage::runtime_dir::remove_empty_dirs(&path)
-    })
-    .await;
+    // Empty, as `storage::runtime_dir` judges a mountpoint a restore made: a live VM's
+    // directory holds its disks.
+    let removed = match std::fs::read_dir(path).map(|mut entries| entries.next().is_none()) {
+        Ok(true) => std::fs::remove_dir(path),
+        Ok(false) => Ok(()),
+        Err(error) => Err(error),
+    };
     match removed {
-        Ok(Ok(())) => Undo::Done,
-        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Undo::Done,
-        Ok(Err(error)) => Undo::Kept(error.to_string()),
+        Ok(()) => Undo::Done,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Undo::Done,
         Err(error) => Undo::Kept(error.to_string()),
     }
 }
@@ -739,6 +728,11 @@ mod tests {
         owner.record(Resource::Temp { path: temp.clone() }).unwrap();
         std::fs::create_dir_all(temp.parent().unwrap()).unwrap();
         std::fs::write(&temp, b"partial export").unwrap();
+        // A setup store build (#1182): its uniquely named temp.
+        let store_temp =
+            crate::setup::StoreTemp::new_in(&dir, &root.join("kernels/vmlinux.bin")).unwrap();
+        std::fs::create_dir_all(root.join("kernels")).unwrap();
+        std::fs::write(store_temp.path(), b"partial kernel").unwrap();
         println!("{CHILD_READY}");
         loop {
             std::thread::sleep(std::time::Duration::from_secs(60));
@@ -796,18 +790,28 @@ mod tests {
         )
         .unwrap();
         child.wait().unwrap();
+        let store_temps = || -> Vec<PathBuf> {
+            std::fs::read_dir(root.path().join("kernels"))
+                .map(|entries| entries.map(|e| e.unwrap().path()).collect())
+                .unwrap_or_default()
+        };
         assert!(
-            runtime_dir.exists() && temp.exists(),
+            runtime_dir.exists() && temp.exists() && store_temps().len() == 1,
             "the resources are gone before any pass ran"
         );
 
         assert_eq!(
             reclaim_abandoned_in(&dir).await,
             Reclaimed {
-                owners: 1,
-                resources: 2,
+                owners: 2,
+                resources: 3,
                 remaining: 0
             }
+        );
+        assert!(
+            store_temps().is_empty(),
+            "the store temp is left: {:?}",
+            store_temps()
         );
         assert!(!runtime_dir.exists(), "the runtime directory is left");
         assert!(!temp.exists(), "the temporary is left");
@@ -886,12 +890,12 @@ mod tests {
         assert!(files_in(&dir).is_empty());
     }
 
-    /// A mount target is removed only when it is an unleased tree of empty directories.
+    /// A mount target is removed only when it is empty and unleased.
     #[tokio::test]
     async fn a_mount_target_is_removed_only_when_it_is_an_empty_unleased_tree() {
         let (root, dir) = test_dir();
         let made = root.path().join("vm-disks/vm-made");
-        std::fs::create_dir_all(made.join("disks")).unwrap();
+        std::fs::create_dir_all(&made).unwrap();
         let live = root.path().join("vm-disks/vm-live");
         std::fs::create_dir_all(live.join("disks")).unwrap();
         std::fs::write(live.join("disks/rootfs.raw"), b"disk").unwrap();
