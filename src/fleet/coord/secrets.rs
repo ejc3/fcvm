@@ -78,11 +78,39 @@ impl Secrets {
 
     /// Store a new current version of the secret.
     pub async fn put(&self, id: &str, value: &str) -> Result<()> {
-        self.call(
-            "PutSecretValue",
-            serde_json::json!({ "SecretId": id, "SecretString": value }),
-        )
-        .await
-        .map(|_| ())
+        self.call("PutSecretValue", Self::put_body(id, value))
+            .await
+            .map(|_| ())
+    }
+
+    fn put_body(id: &str, value: &str) -> serde_json::Value {
+        // Raw API calls do not get the SDK's automatic token. Build it once per
+        // write so resending this request keeps the same secret version.
+        serde_json::json!({
+            "SecretId": id,
+            "SecretString": value,
+            "ClientRequestToken": uuid::Uuid::new_v4().to_string(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_put_request_has_a_fresh_uuid_for_each_secret_version() {
+        let body = Secrets::put_body("example-secret", "example-value");
+        let wire = serde_json::to_vec(&body).unwrap();
+        let request: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(request["SecretId"], "example-secret");
+        assert_eq!(request["SecretString"], "example-value");
+        let token = request["ClientRequestToken"]
+            .as_str()
+            .expect("raw PutSecretValue requests require ClientRequestToken");
+        assert!((32..=64).contains(&token.len()));
+        assert_eq!(uuid::Uuid::parse_str(token).unwrap().get_version_num(), 4);
+        let next = Secrets::put_body("example-secret", "example-value");
+        assert_ne!(next["ClientRequestToken"], token);
     }
 }
