@@ -440,7 +440,7 @@ pub fn image_settled(f: &Fleet) -> bool {
 /// waiting for capacity (a wait the EC2 side shows on its own).
 fn image_complete(f: &Fleet) -> bool {
     let running = |s: &Slot| s.observed.phase == "running" && s.observed.generation >= s.generation;
-    f.n + f.ec2_n > 0
+    f.n + f.ec2.values().filter(|s| s.observed.vm.is_some()).count() > 0
         && f.slots.values().all(|s| s.position.is_none() || running(s))
         && f.ec2
             .values()
@@ -1253,7 +1253,8 @@ fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport) {
 }
 
 /// One budget round over every placed tile that draws its part of the wall (a claimed GPU
-/// draws the whole image and adapts itself).
+/// draws the whole image and adapts itself; an EC2 tile without an instance has no
+/// renderer).
 fn budget_round(f: &mut Fleet, at: u64) {
     if at < f.budget.next_round_at {
         return;
@@ -1262,7 +1263,7 @@ fn budget_round(f: &mut Fleet, at: u64) {
     let tiles: Vec<&Slot> = f
         .slots
         .values()
-        .chain(f.ec2.values())
+        .chain(f.ec2.values().filter(|s| s.observed.vm.is_some()))
         .filter(|s| s.position.is_some() && s.claim.is_none())
         .collect();
     let fits: Vec<Option<f64>> = tiles.iter().map(|s| s.observed.budget_fit).collect();
@@ -1325,17 +1326,17 @@ fn drop_missing_from_races(f: &mut Fleet, at: u64) {
     }
 }
 
-/// Recompute N, the EC2 tiles wanted and every slot's rectangle. Deterministic in the
-/// state, so it runs after every event.
+/// Recompute each side's places and every slot's rectangle. Deterministic in the state, so
+/// it runs after every event.
 ///
-/// - fcvm GPUs: slots whose host is present and not draining, in slot-number order; a
-///   GPU claimed from standby is left out, a borrowed wall tile keeps its place.
-/// - EC2 tiles wanted: `min(ec2_max, max_tiles, fcvm GPUs)`; `ec2-1..ec2-D` exist, higher
-///   ones are dropped (the driver terminates their instances).
-/// - EC2 instances: EC2 tiles that report an instance.
-/// - N = min(max_tiles, max(fcvm GPUs, EC2 instances)); the first N fcvm slots are grouped
-///   into one band per host, the EC2 half repeats the layout, and the rest of each half is
-///   dark. fcvm slots beyond N are standby.
+/// - fcvm GPUs: slots whose host is present and not draining, in slot-number order, at
+///   most `max_tiles`; a GPU claimed from standby is left out, a borrowed wall tile keeps
+///   its place. fcvm slots beyond `max_tiles` are standby.
+/// - EC2 tiles wanted: `min(ec2_max, max_tiles)`; `ec2-1..ec2-D` exist, higher ones are
+///   dropped (the driver terminates their instances). Each has a place, instance or not.
+/// - fcvm places: `max(min(fcvm_tiles, max_tiles), fcvm GPUs)`. The GPUs are grouped into
+///   one band per host and the places left over are one dark band below them.
+/// - Asleep, neither side has a place.
 fn retile(f: &mut Fleet, c: &Config, at: u64) {
     // Asleep, nothing is placed: the fcvm side's GPUs go to standby (their VMs stop) as the
     // EC2 side's tiles go away, whether or not their hosts scale down with them.
@@ -1391,18 +1392,19 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
             .entry(n)
             .or_insert_with(|| new_slot(ec2_name(n), Half::Ec2, None, None, at));
     }
-    // Each side is as wide as its share of the live GPUs. An EC2 tile is live once it has
-    // an instance; one still waiting for capacity is not on the wall.
-    let live_ec2: Vec<u32> = f
-        .ec2
-        .iter()
-        .filter(|(_, s)| s.observed.vm.is_some())
-        .map(|(n, _)| *n)
-        .take(c.max_tiles)
-        .collect();
+    // Each side is as wide as its share of the configured places, so a tile going dark (a
+    // race replacing the EC2 instances, a capacity wait, a host not yet connected or
+    // reclaimed) re-tiles nothing. Every EC2 tile has its place, with an instance or not;
+    // the fcvm side has `fcvm_tiles` places, or one per live GPU when there are more.
+    let ec2_places: Vec<u32> = f.ec2.keys().copied().take(c.max_tiles).collect();
+    let fcvm_places = if asleep {
+        0
+    } else {
+        c.fcvm_tiles.min(c.max_tiles).max(active.len())
+    };
     f.n = active.len();
-    f.ec2_n = live_ec2.len();
-    let (fcvm_side, ec2_side) = sides(f.n, f.ec2_n);
+    f.ec2_n = ec2_places.len();
+    let (fcvm_side, ec2_side) = sides(fcvm_places, f.ec2_n);
     // fcvm: one band per host, hosts ordered by their lowest placed slot.
     let mut groups: Vec<(String, Vec<u32>)> = Vec::new();
     for num in &active {
@@ -1412,11 +1414,21 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
             None => groups.push((host, vec![*num])),
         }
     }
-    let counts: Vec<usize> = groups.iter().map(|(_, v)| v.len()).collect();
-    let host_bands = if f.n == 0 {
+    // The places with no GPU are one band below the hosts'.
+    let mut counts: Vec<usize> = groups.iter().map(|(_, v)| v.len()).collect();
+    let dark = fcvm_places - f.n;
+    if dark > 0 {
+        counts.push(dark);
+    }
+    let host_bands = if fcvm_places == 0 {
         Vec::new()
     } else {
         bands(fcvm_side, &counts, c.image_aspect, c.tile_aspect)
+    };
+    let fcvm_dark: Vec<Rect> = if dark > 0 {
+        host_bands.last().expect("a band per count").1.clone()
+    } else {
+        Vec::new()
     };
     let ec2_rects = grid_in(ec2_side, f.ec2_n, c.image_aspect, c.tile_aspect);
     // The new place of every slot, then compare with the old.
@@ -1434,7 +1446,7 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
             k += 1;
         }
     }
-    for (i, num) in live_ec2.iter().enumerate() {
+    for (i, num) in ec2_places.iter().enumerate() {
         placed.insert((Half::Ec2, *num), (i, ec2_rects[i]));
     }
     let changed = f
@@ -1444,8 +1456,10 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
         .chain(f.ec2.iter().map(|(n, s)| ((Half::Ec2, *n), s)))
         .any(|(key, s)| placed.get(&key).map(|p| (p.0, p.1)) != s.position.zip(s.rect))
         // A slot that left moved nothing still here, but the sides changed.
-        || f.layout.fcvm != (f.n > 0).then_some(fcvm_side)
+        || f.fcvm_dark != fcvm_dark
+        || f.layout.fcvm != (fcvm_places > 0).then_some(fcvm_side)
         || f.layout.ec2 != (f.ec2_n > 0).then_some(ec2_side);
+    f.fcvm_dark = fcvm_dark;
     let generation = if changed {
         f.layout.generation + 1
     } else {
@@ -1455,7 +1469,7 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
         f.layout = LayoutGen {
             generation,
             from_frame: crate::state::layout_from_frame(f.scene.t_at(at)),
-            fcvm: (f.n > 0).then_some(fcvm_side),
+            fcvm: (fcvm_places > 0).then_some(fcvm_side),
             ec2: (f.ec2_n > 0).then_some(ec2_side),
         };
     }

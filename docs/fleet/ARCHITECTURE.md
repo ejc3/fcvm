@@ -220,8 +220,8 @@ picture changes from coarser to finer tiles at one frame `t`. When a host is rec
 two-minute spot notice) the coordinator re-tiles onto the remaining GPUs at once, before
 the host disappears, so the image never shows a hole for a lost host. Slot names are
 reused lowest-first, so a stable fleet keeps stable names. Both sides are re-tiled in the
-same event (each side's width follows its live GPU count), as a new layout generation that
-takes effect at a stated frame; the EC2 side keeps its configured number of tiles.
+same event, as a new layout generation that takes effect at a stated frame; each side keeps
+its configured number of places, and a place with no GPU is dark.
 
 Within a host's life a slot keeps its address across relaunches, so a browser reconnects
 to the same address. Two fcvm changes make that possible:
@@ -322,13 +322,16 @@ detail view for 1080p.
 **The image is fixed; its tiling follows the fleet.** The picture is always the same
 frame of the same scene. The coordinator splits each half into as many rectangles as that
 half has GPUs, so more hosts make each GPU's rectangle smaller and the whole image finer
-(more pixels and more ray-marching steps per pixel in total). **DECIDED (2026-10-23, replacing "the halves are symmetrical"): each side shows the GPUs it
-has live.** The fcvm and EC2 sides no longer mirror each other: each is as wide as its
-share of the live GPUs (fcvm 100 and EC2 12 give the fcvm side 100/112 of the width), one
-rectangle per GPU, never more, and no dark "waiting for capacity" tiles. An EC2 tile still
-waiting for spot capacity is not on the wall; its wait is shown in its own panel and kept
-out of the EC2 side's race time. A side with no GPU has no width, and with none on either
-side (asleep) there is no tile. A change of capacity re-tiles without a hitch: the
+(more pixels and more ray-marching steps per pixel in total). **DECIDED (2026-10-26, replacing "each side shows the GPUs it has live" of 2026-10-23):
+each side is sized by its configured GPUs.** The fcvm side has `--fcvm-tiles` places (or
+one per live fcvm GPU when there are more) and the EC2 side `--ec2-tiles`; each is as wide
+as its share of the places (8 and 8 give two halves, fcvm 100 and EC2 12 give the fcvm side
+100/112 of the width). A place with no live renderer keeps its rectangle and is drawn dark
+with its phase: an EC2 tile waiting for spot capacity or for its new instance in a race, an
+fcvm place whose host has not connected or was reclaimed. Sizing the sides by the live GPUs
+re-tiled the wall in the middle of every race, when the EC2 instances are replaced, so the
+dark tiles the race counts up vanished. A capacity wait is kept out of the EC2 side's race
+time. With no places on either side (asleep) there is no tile. A change of capacity re-tiles without a hitch: the
 coordinator publishes a new layout generation with the frame it takes effect at, each
 renderer switches to its new rectangle at that frame, and the page keeps the old tiles on
 screen until every new tile's first frame has arrived, then swaps them all at once. A GPU
