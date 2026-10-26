@@ -277,8 +277,8 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # Device passthrough (PUT /device-passthrough and LoadSnapshot
 # device_passthrough) on the PCI transport.
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "agent/vfio-hotplug-v1.17.0"
-firecracker_commit = "7277f695e0541c35d7da88cb5a64a4d177ea4338"
+firecracker_branch = "agent/vfio-passthrough-hotplug"
+firecracker_commit = "14aaaf9d09d4bdc37ff8b113fa0205c80436b9ce"
 firecracker_args = "--enable-pci"
 # On the PCI transport the guest's virtio-net NIC is a PCI device, which udev renames
 # to enp0s<slot>; fc-agent and fcvm configure "eth0" (IPv6, routes, the snapshot gate),
@@ -290,7 +290,10 @@ boot_args = "net.ifnames=0"
 # user-space driver and the GSP firmware of one version, so the modules and
 # libraries match exactly. SHA-256 values match the .sha256sum files NVIDIA
 # publishes beside the same files under download.nvidia.com/XFree86/; the
-# toolkit's match its release's checksums.txt.
+# toolkit's match its release's checksums.txt. cuda-checkpoint is the binary
+# at a fixed commit of NVIDIA/cuda-checkpoint (warm GPU snapshots, R580 for
+# --device-map); its SHA-256 is of that file. Its ARM support needs driver 595,
+# so `snapshot create --gpu-warm` is refused on arm64 while this pins 580.
 #
 # The proprietary modules with the GSP firmware off, as on amd64: on a
 # g5g.metal (T4G) nvidia-persistenced's start at restore took 609 ms against
@@ -304,6 +307,8 @@ driver_sha256 = "5b7d2319a1e5228cb47a67e07733a5abfb614cd8d4350a750211022343d27ee
 toolkit_version = "1.20.1"
 toolkit_url = "https://github.com/NVIDIA/nvidia-container-toolkit/releases/download/v1.20.1/nvidia-container-toolkit_1.20.1_deb_arm64.tar.gz"
 toolkit_sha256 = "2b58b68ec388cede52815a63fc87f3f019af96e21b7d29c3cb2890341db14b21"
+cuda_checkpoint_url = "https://raw.githubusercontent.com/NVIDIA/cuda-checkpoint/00d5cce84c628088d6caa203fc4af40c1538b6f7/bin/aarch64_Linux/cuda-checkpoint"
+cuda_checkpoint_sha256 = "4636b2615135b87e5ff524d2e80ecc0d4a4e599f1e61fab07374747e3b3c8414"
 
 [kernel_profiles.gpu.amd64]
 description = "GPU passthrough guest kernel (PCI, MSI-X, NVIDIA proprietary kernel modules) (x86_64)"
@@ -317,8 +322,8 @@ kernel_config = "kernel/gpu-x86.conf"
 patches_dir = "kernel/patches-gpu-x86"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "agent/vfio-hotplug-v1.17.0"
-firecracker_commit = "7277f695e0541c35d7da88cb5a64a4d177ea4338"
+firecracker_branch = "agent/vfio-passthrough-hotplug"
+firecracker_commit = "14aaaf9d09d4bdc37ff8b113fa0205c80436b9ce"
 firecracker_args = "--enable-pci"
 # On the PCI transport the guest's virtio-net NIC is a PCI device, which udev renames
 # to enp0s<slot>; fc-agent and fcvm configure "eth0" (IPv6, routes, the snapshot gate),
@@ -336,6 +341,8 @@ driver_sha256 = "0aab0518db53cf73c412dc7f32bbc850ca95e839d8923d0de4bff42c1c9169c
 toolkit_version = "1.20.1"
 toolkit_url = "https://github.com/NVIDIA/nvidia-container-toolkit/releases/download/v1.20.1/nvidia-container-toolkit_1.20.1_deb_amd64.tar.gz"
 toolkit_sha256 = "14dc22489851d4f1a6d1bbfdfb51524c8f110091738570cddaddc09778a63ad9"
+cuda_checkpoint_url = "https://raw.githubusercontent.com/NVIDIA/cuda-checkpoint/00d5cce84c628088d6caa203fc4af40c1538b6f7/bin/x86_64_Linux/cuda-checkpoint"
+cuda_checkpoint_sha256 = "707fa7f54136824d6c1d6dd724b9b1717610f831033c00d06da474de363a06db"
 
 # arm64 nested profile (ARM64 NV2 with custom kernel and firecracker)
 [kernel_profiles.nested.arm64]

@@ -381,7 +381,7 @@ fn kernel_release() -> Result<String> {
 }
 
 /// The last NVRM lines of the kernel log, for an error message.
-async fn nvrm_log_tail() -> String {
+pub(crate) async fn nvrm_log_tail() -> String {
     let output = tokio::process::Command::new("dmesg").output().await;
     let Ok(output) = output else {
         return "(dmesg could not run)".to_string();
@@ -400,7 +400,7 @@ async fn nvrm_log_tail() -> String {
 }
 
 /// Run a command with a deadline and return its combined output on success.
-async fn run_checked(
+pub(crate) async fn run_checked(
     what: &str,
     mut command: tokio::process::Command,
     timeout: Duration,
@@ -536,8 +536,18 @@ pub async fn preload(driver_root: &Path) -> Result<()> {
 /// only its length is compared with what the guest sees, because the guest
 /// address of a passed-through device is assigned by the VMM.
 /// Returns the number of GPUs the driver initialised and each step's duration.
+///
+/// A clone of a warm GPU snapshot (`fc-agent --gpu-park` ran before it was taken)
+/// already runs its container, with its CUDA processes checkpointed into their
+/// memory: for it the GPUs are brought up again and those processes restored
+/// onto them ([`crate::gpu_park::unpark`]) instead of going through the launch
+/// gate, which refuses a GPU for a running container.
 pub async fn attach(announced: &[String]) -> Result<AttachReport> {
     anyhow::ensure!(!announced.is_empty(), "attach called with no GPUs");
+    if let Some(parked) = crate::gpu_park::Parked::load(Path::new(crate::gpu_park::PARKED_RECORD))?
+    {
+        return crate::gpu_park::unpark(&parked, announced).await;
+    }
     GATE.attach(announced.len(), || attach_devices(announced))
         .await
 }
@@ -593,6 +603,22 @@ impl StepClock {
 }
 
 async fn attach_devices(announced: &[String]) -> Result<AttachReport> {
+    Ok(bring_up(announced, true).await?.report)
+}
+
+/// What [`bring_up`] found.
+pub struct BroughtUp {
+    /// The GPUs `nvidia-smi -L` lists and each step's duration.
+    pub report: AttachReport,
+    /// Their UUIDs, in `nvidia-smi -L` order.
+    pub uuids: Vec<String>,
+}
+
+/// Rescan for the announced GPUs, load the driver if it is not loaded, create
+/// the device nodes, start nvidia-persistenced, zero the GPUs' memory and check
+/// that `nvidia-smi -L` lists every GPU. With `cdi`, also write the CDI spec
+/// the container's launch reads; a warm restore's container is already running.
+pub async fn bring_up(announced: &[String], cdi: bool) -> Result<BroughtUp> {
     eprintln!(
         "[fc-agent] gpu: host attached {} device(s): {}",
         announced.len(),
@@ -641,10 +667,13 @@ async fn attach_devices(announced: &[String]) -> Result<AttachReport> {
 
     // Both only read the GPUs the daemon has initialised, so they run together.
     // The spec is generated after the daemon starts so it mounts its socket.
-    let ((smi_ms, listed), (cdi_ms, spec)) = tokio::join!(
-        timed(list_gpus(driver_root)),
-        timed(generate_cdi_spec(driver_root)),
-    );
+    let ((smi_ms, listed), (cdi_ms, spec)) = tokio::join!(timed(list_gpus(driver_root)), async {
+        if cdi {
+            timed(generate_cdi_spec(driver_root)).await
+        } else {
+            (0.0, Ok(()))
+        }
+    });
     steps.smi_ms = smi_ms;
     steps.cdi_ms = cdi_ms;
     eprintln!("[fc-agent] gpu: step=nvidia-smi elapsed_ms={smi_ms:.3}");
@@ -660,11 +689,29 @@ async fn attach_devices(announced: &[String]) -> Result<AttachReport> {
     }
     eprintln!("[fc-agent] gpu: {}", listed.trim().replace('\n', "; "));
     spec?;
-    eprintln!("[fc-agent] gpu: wrote CDI spec {CDI_SPEC}");
-    Ok(AttachReport {
-        gpus: initialised,
-        steps,
+    if cdi {
+        eprintln!("[fc-agent] gpu: wrote CDI spec {CDI_SPEC}");
+    }
+    Ok(BroughtUp {
+        report: AttachReport {
+            gpus: initialised,
+            steps,
+        },
+        uuids: parse_smi_uuids(&listed),
     })
+}
+
+/// The GPU UUIDs in `nvidia-smi -L` output (`GPU 0: Tesla T4 (UUID: GPU-...)`), in order.
+pub fn parse_smi_uuids(listed: &str) -> Vec<String> {
+    listed
+        .lines()
+        .filter(|line| line.starts_with("GPU "))
+        .filter_map(|line| {
+            let start = line.find("(UUID: ")? + "(UUID: ".len();
+            let rest = &line[start..];
+            Some(rest[..rest.find(')')?].trim().to_string())
+        })
+        .collect()
 }
 
 /// Run `future` and return its milliseconds with its output.
@@ -792,7 +839,7 @@ pub fn parse_scrub_summary(output: &str) -> Option<(usize, u64)> {
 /// 0.023 to 0.031 s with the daemon running. It starts before `nvidia-smi -L`,
 /// so that check opens a GPU the daemon has initialised, and before the CDI spec
 /// is generated, which then mounts the daemon's socket into the container.
-async fn start_persistenced(driver_root: &Path) -> Result<()> {
+pub(crate) async fn start_persistenced(driver_root: &Path) -> Result<()> {
     run_checked(
         "nvidia-persistenced",
         persistenced_command(driver_root),
@@ -850,14 +897,21 @@ mod tests {
         assert_eq!(libraries, Some(super::library_dir(root).as_os_str()));
     }
 
-    /// The body of `attach_devices`, for the source-order tests below.
+    /// The body of `bring_up`, the steps `attach_devices` runs, for the
+    /// source-order tests below.
     fn attach_devices_body() -> &'static str {
         let source = include_str!("gpu.rs");
         let code = source.split("#[cfg(test)]").next().unwrap();
-        let body = &code[code
+        let attach = &code[code
             .find("async fn attach_devices(")
             .expect("no attach_devices")..];
-        &body[..body.find("\n}\n").expect("attach_devices does not end")]
+        let attach = &attach[..attach.find("\n}\n").expect("attach_devices does not end")];
+        assert!(
+            attach.contains("bring_up(announced, true)"),
+            "attach_devices does not bring the GPUs up with the CDI spec"
+        );
+        let body = &code[code.find("pub async fn bring_up(").expect("no bring_up")..];
+        &body[..body.find("\n}\n").expect("bring_up does not end")]
     }
 
     /// The daemon must start once the device nodes exist, and before the checks
