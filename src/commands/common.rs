@@ -2505,14 +2505,24 @@ fn snapshot_load_drive_overrides(
     for dir in source_dirs {
         let mut prefix = dir.as_os_str().as_bytes().to_vec();
         prefix.push(b'/');
+        // Each path runs from the prefix to the first byte no fcvm path holds. A byte of
+        // the following field that happens to be a path byte makes the path longer and
+        // unknown, which keeps the namespace.
         let unknown = vmstate
             .windows(prefix.len())
             .enumerate()
             .filter(|(_, window)| *window == prefix.as_slice())
             .any(|(at, _)| {
+                let len = vmstate[at..]
+                    .iter()
+                    .take_while(|&&byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'-' | b'_')
+                    })
+                    .count();
+                let named = &vmstate[at..at + len];
                 !known
                     .iter()
-                    .any(|path| vmstate[at..].starts_with(path.as_os_str().as_bytes()))
+                    .any(|path| path.as_os_str().as_bytes() == named)
             });
         if unknown {
             info!(
@@ -8032,9 +8042,12 @@ mod tests {
         let clone_disks = Path::new("/data/vm-disks/vm-clone/disks");
         let vmstate = |paths: &[&str]| -> Vec<u8> {
             let mut bytes = b"header".to_vec();
+            // A length byte before each path and a field byte after it, neither of them
+            // a path byte, as a serialized string sits between other fields.
             for path in paths {
-                bytes.push(path.len() as u8);
+                bytes.push(0x80 | path.len() as u8);
                 bytes.extend_from_slice(path.as_bytes());
+                bytes.push(0x01);
             }
             bytes
         };
@@ -8101,6 +8114,22 @@ mod tests {
             capable,
             true,
             &unlisted,
+            &sources,
+            &vsock,
+            &extra,
+            clone_disks
+        )
+        .is_none());
+        // A path that only starts with a known one is not that path.
+        let extended = vmstate(&[
+            "/data/vm-disks/vm-source/disks/rootfs.raw",
+            "/data/vm-disks/vm-source/disks/rootfs.raw.unlisted",
+            "/data/vm-disks/vm-source/vsock.sock",
+        ]);
+        assert!(snapshot_load_drive_overrides(
+            capable,
+            true,
+            &extended,
             &sources,
             &vsock,
             &extra,
