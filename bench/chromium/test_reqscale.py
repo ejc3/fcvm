@@ -648,6 +648,66 @@ class ContinuousAccounting(unittest.TestCase):
             )
             self.assertEqual(sample["pressure"]["io"]["parsed"]["some"]["total"], 42)
 
+    def _sources(self, d):
+        proc_stat = os.path.join(d, "stat")
+        loadavg = os.path.join(d, "loadavg")
+        meminfo = os.path.join(d, "meminfo")
+        pressure = os.path.join(d, "pressure")
+        os.mkdir(pressure)
+        with open(proc_stat, "w") as f:
+            f.write("cpu 1 2 3 4 5 6 7 8 9 10\ncpu0 1 2 3 4 5 6 7 8 9 10\nctxt 3\n")
+        with open(loadavg, "w") as f:
+            f.write("0.10 0.20 0.30 2/100 4321\n")
+        with open(meminfo, "w") as f:
+            f.write("MemTotal: 1000 kB\nMemAvailable: 750 kB\n")
+        for resource in ("cpu", "memory", "io"):
+            with open(os.path.join(pressure, resource), "w") as f:
+                f.write("some avg10=0.10 avg60=0.20 avg300=0.30 total=42\n")
+                if resource != "cpu":
+                    f.write("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        return reqscale.HostSampleSource(proc_stat, loadavg, pressure, meminfo)
+
+    class MovingAudit(Audit):
+        """Reports `reads` (a list of pid lists) one call at a time, then the last."""
+
+        def __init__(self, name, reads):
+            super().__init__(name)
+            self.reads = list(reads)
+
+        def live_pids(self):
+            return self.reads.pop(0) if len(self.reads) > 1 else self.reads[0]
+
+    def test_a_pid_caught_moving_between_leaves_is_read_again_not_refused(self):
+        """guardexec enters a request's leaf as the request starts, so a pid read
+        in the driver leaf can be read in the file leaf a moment later. Refused
+        the 2026-10-26 backlog run at burst 12 of 18, and the first run before it.
+
+        RED BEFORE THE FIX: MeasurementInvalid "pid 77 appears in both driver and
+        file leaf cgroups" on the first pass.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            source = self._sources(d)
+            audits = {
+                "run": self.Audit("run"),
+                "driver": self.MovingAudit("driver", [[77, 5], [5]]),
+                "file": self.MovingAudit("file", [[77], [77]]),
+            }
+            sample = source.capture(audits, {"name": "burst", "burst_id": "b3"})
+            self.assertEqual(sample["cgroups"]["driver"]["live_pids"], [5])
+            self.assertEqual(sample["cgroups"]["file"]["live_pids"], [77])
+
+    def test_a_pid_that_stays_in_two_leaves_is_still_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            source = self._sources(d)
+            audits = {
+                "run": self.Audit("run"),
+                "driver": self.MovingAudit("driver", [[77]]),
+                "file": self.MovingAudit("file", [[77]]),
+            }
+            with self.assertRaisesRegex(reqscale.MeasurementInvalid,
+                                        "pid 77 appears in both driver and file leaf"):
+                source.capture(audits, {"name": "burst", "burst_id": "b3"})
+
     def test_split_cgroup_paths_are_fixed_before_entry(self):
         with tempfile.TemporaryDirectory() as d:
             proc = os.path.join(d, "proc")
