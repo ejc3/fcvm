@@ -168,11 +168,28 @@ def navigate(host, session, url, timeout=120.0, poll_s=0.01):
     wd(host, "POST", f"/session/{session}/url", {"url": url},
        timeout=max(1.0, deadline - time.monotonic()))
     while True:
-        state = wd(host, "POST", f"/session/{session}/execute/sync",
-                   {"script": ("return [document.readyState, "
-                               "typeof window.__fcvmNavSentinel === 'undefined']"),
-                    "args": []},
-                   timeout=max(1.0, deadline - time.monotonic()))
+        try:
+            state = wd(host, "POST", f"/session/{session}/execute/sync",
+                       {"script": ("return [document.readyState, "
+                                   "typeof window.__fcvmNavSentinel === 'undefined']"),
+                        "args": []},
+                       timeout=max(1.0, deadline - time.monotonic()))
+        except WdError as error:
+            # The poll runs while the document we are navigating away from
+            # unloads, so an execute/sync can land exactly on the unload:
+            # "no such window: Callback was not called before the unload
+            # event". That is the swap the sentinel waits for, not a failure
+            # (27 of 880 WebKit corpus requests, 2026-10-26, on pages from
+            # example.com to the Guardian). Only that message is waited out;
+            # any other error propagates, and the deadline still bounds the loop.
+            if "Callback was not called before the unload event" not in str(error):
+                raise
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"the document kept unloading for {timeout:.0f}s; the page "
+                    "never reached complete") from error
+            time.sleep(poll_s)
+            continue
         ready, swapped = (state[0], state[1]) if isinstance(state, list) else (state, True)
         if ready == "complete" and (swapped or not sentinel or same_document):
             # readyState "complete" is NOT proof the requested page loaded.

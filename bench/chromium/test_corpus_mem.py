@@ -11151,5 +11151,26 @@ class RecordReadiness(unittest.TestCase):
             "await_complete_record:\n" + "\n".join(offenders))
 
 
+class ReplayListenerOptions(unittest.TestCase):
+    """The memory phase starts its own replay server. At 2 guest vCPUs the 48-clone
+    pass failed on 2026-10-26 (`failed to render https://www.elmundo.es/ ...
+    local-deadline`) while 48 guests fetched through a replay that accepts, and
+    runs the TLS handshake, in one thread behind a listen queue of 5
+    (reqscale_stages.py / #1159). CORPUS_SERVE_ARGS reaches that server the way
+    corpus_campaign.sh passes it.
+
+    RED BEFORE THE CHANGE: the launch took no extra arguments.
+    """
+
+    def test_the_replay_launch_passes_corpus_serve_args_word_split(self):
+        with open(EXTRA) as handle:
+            body = handle.read()
+        start = body.index('exec python3 "$2" --root "$3" --port 80 --tls-port 443')
+        launch = body[start:body.index("corpus_serve.log", start)]
+        self.assertIn('--access-log "$5" $6\'', launch)
+        self.assertIn('"${CORPUS_SERVE_ARGS:-}"', launch)
+        self.assertIn('"$8" "$9" "${10}" "${11}" "${12}"', body)
+
+
 if __name__ == "__main__":
     unittest.main()
