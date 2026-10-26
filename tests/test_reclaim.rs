@@ -360,6 +360,45 @@ fn recorded_temps(pid: u32) -> Vec<PathBuf> {
     temps
 }
 
+/// The lock files of the records the fcvm process `pid` wrote.
+fn record_locks(pid: u32) -> Vec<PathBuf> {
+    let dir = fcvm::paths::data_dir()
+        .join("reclaim")
+        .join(nix::unistd::geteuid().as_raw().to_string());
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(entry.path()).ok()?).ok()?;
+            (record.get("pid").and_then(|p| p.as_u64()) == Some(u64::from(pid)))
+                .then(|| entry.path().with_extension("lock"))
+        })
+        .collect()
+}
+
+/// Wait until no process holds any of `locks`. A helper of the killed fcvm (skopeo,
+/// mkfs.ext4) inherits its owner's lock and keeps writing until it exits; until then the
+/// reclaim leaves its temporaries alone, as it must.
+async fn wait_for_helpers(locks: &[PathBuf]) -> Result<()> {
+    wait_for(
+        "a helper of the killed fcvm still holds its owner lock",
+        Duration::from_secs(180),
+        || {
+            locks
+                .iter()
+                .all(|lock| match std::fs::File::open(lock) {
+                    Ok(file) => fs2::FileExt::try_lock_exclusive(&file).is_ok(),
+                    Err(_) => true,
+                })
+                .then_some(())
+        },
+    )
+    .await
+}
+
 /// #1186: a SIGKILLed export of a localhost image leaves its temporary archive, and a
 /// SIGKILLed storage image build leaves its temporary store and image. The next launch
 /// removes them.
@@ -384,8 +423,10 @@ async fn a_sigkilled_image_export_leaves_its_temporaries_to_the_next_launch() ->
             },
         )
         .await;
+        let locks = record_locks(pid);
         sigkill(&mut child, pid).await?;
         let archive_temp = observed?;
+        wait_for_helpers(&locks).await?;
         next_launch().await?;
         anyhow::ensure!(
             !archive_temp.exists(),
@@ -409,7 +450,9 @@ async fn a_sigkilled_image_export_leaves_its_temporaries_to_the_next_launch() ->
         )
         .await;
         let recorded = recorded_temps(pid);
+        let locks = record_locks(pid);
         sigkill(&mut child, pid).await?;
+        wait_for_helpers(&locks).await?;
         let storage_temp = observed?;
         let store = recorded.iter().find(|p| {
             p.file_name()
