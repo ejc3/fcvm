@@ -117,6 +117,16 @@ function RestartIcon() {
 export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: string }) {
   const client = useMemo(() => new WallClient(coordUrl), [coordUrl]);
   const poster = useMemo(() => posterUrl(coordUrl), [coordUrl]);
+  // A coordinator with no poster yet (just restarted) answers 404: show no image rather than
+  // the browser's broken-image icon.
+  const [posterFailed, setPosterFailed] = useState(false);
+  // The server-rendered <img> can fail before React attaches onError, so also check it once
+  // mounted: a finished load with no picture is a failure.
+  const posterRef = useRef<HTMLImageElement>(null);
+  useEffect(() => {
+    const el = posterRef.current;
+    if (el && el.complete && el.naturalWidth === 0) setPosterFailed(true);
+  }, [poster]);
   const state = useSyncExternalStore(client.subscribe, client.getState, client.getState);
   const [now, setNow] = useState(0);
   const [canDecode, setCanDecode] = useState(true);
@@ -476,10 +486,12 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
       onPointerLeave={onPointerLeave}
       onContextMenu={(e) => e.preventDefault()}
     >
-      {poster ? (
+      {poster && !posterFailed ? (
         <img
           className={`poster${painted ? " gone" : ""}`}
+          ref={posterRef}
           src={poster}
+          onError={() => setPosterFailed(true)}
           alt=""
           aria-hidden="true"
           data-testid="poster"
