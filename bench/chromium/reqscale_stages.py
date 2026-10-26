@@ -127,9 +127,12 @@ def summarize_listen(rows, windows, offset_ns):
         kernel = [r for r in picked if r.get("listener") == "kernel"]
         if kernel:
             depth = [q[0] for r in kernel for q in (r.get("accept_queue") or {}).values()]
+            # A kernel row without the counters means /proc/net/netstat could not be
+            # read for that second; the total is then unknown, not zero.
+            counted = all(r.get("listen_overflows") is not None for r in kernel)
             agg["kernel"] = {
-                "listen_overflows": sum(r.get("listen_overflows") or 0 for r in kernel),
-                "listen_drops": sum(r.get("listen_drops") or 0 for r in kernel),
+                "listen_overflows": sum(r["listen_overflows"] for r in kernel) if counted else None,
+                "listen_drops": sum(r["listen_drops"] for r in kernel) if counted else None,
                 "accept_queue_peak": max(depth) if depth else None,
             }
         out[rate] = agg

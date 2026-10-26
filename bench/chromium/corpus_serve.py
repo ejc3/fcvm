@@ -182,7 +182,11 @@ class ListenStats:
                     "accept_errors": self.accept_errors,
                     "accept_ms_sum": round(self.accept_ms_sum, 3),
                     "accept_ms_max": round(self.accept_ms_max, 3),
-                    # the share of the interval the accept thread was inside accept()
+                    # accept time of the connections that finished in this interval,
+                    # over the interval. A single accept() that spans several
+                    # intervals (a stalled TLS client) is charged to the one it ends
+                    # in, so a row can read above 1.0; totals over a longer window
+                    # (accept_ms_sum) are not biased by it.
                     "accept_busy": round(self.accept_ms_sum / (interval_s * 1000.0), 4),
                     "handshakes": self.handshakes,
                     "handshake_errors": self.handshake_errors,

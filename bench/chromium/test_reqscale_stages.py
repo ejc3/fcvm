@@ -115,6 +115,12 @@ class Listen(Fixture):
         self.assertAlmostEqual(one["tls"]["accept_busy_mean"], 1200.0 / 10000.0)
         self.assertEqual(one["kernel"], {"listen_overflows": 3, "listen_drops": 3, "accept_queue_peak": 6})
         self.assertNotIn("tls", two)
+        # a second whose counters could not be read makes the total unknown, not zero
+        rows.append({"ts": WALL_MINUS_MONO_NS / 1e9 + 106, "listener": "kernel", "accept_queue": {}})
+        write_jsonl(path, [{"listener": "start"}] + rows)
+        again = reqscale_stages.summarize(self.dir, path)["listen"][1.0]["kernel"]
+        self.assertIsNone(again["listen_overflows"])
+        self.assertIsNone(again["listen_drops"])
         self.assertEqual(two["kernel"]["listen_overflows"], 11)
 
 
