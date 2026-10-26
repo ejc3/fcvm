@@ -1728,25 +1728,40 @@ class HostSampleSource:
         self.pressure_root = pressure_root
         self.meminfo = meminfo
 
+    SAMPLE_REREADS = 5
+
     def capture(self, audits: dict[str, CgroupAudit], phase: dict) -> dict:
         captured_wall_ns = time.time_ns()
         captured_monotonic_ns = time.monotonic_ns()
-        cgroups = {}
-        seen_pids = {}
-        for name, audit in sorted(audits.items()):
-            pids = audit.live_pids()
-            if name != "run":
-                for pid in pids:
-                    prior = seen_pids.setdefault(pid, name)
-                    if prior != name:
-                        raise MeasurementInvalid(
-                            f"pid {pid} appears in both {prior} and {name} leaf cgroups"
-                        )
-            cgroups[name] = {
-                "path": audit.relative,
-                "live_pids": pids,
-                "cpu_stat": audit.cpu_snapshot(),
-            }
+        # The leaves are read one after another, so a process that moves from
+        # one leaf to another between two reads (guardexec enters a request's
+        # leaf as the request starts) shows up in both. A process is in one
+        # cgroup at a time: read the leaves again, and refuse only a pid that
+        # stays in two across SAMPLE_REREADS complete passes (a 2026-10-26 run
+        # was refused at burst 12 of 18 by a pid caught mid-move).
+        for attempt in range(self.SAMPLE_REREADS):
+            cgroups = {}
+            seen_pids = {}
+            doubled = None
+            for name, audit in sorted(audits.items()):
+                pids = audit.live_pids()
+                if name != "run":
+                    for pid in pids:
+                        prior = seen_pids.setdefault(pid, name)
+                        if prior != name and doubled is None:
+                            doubled = (pid, prior, name)
+                cgroups[name] = {
+                    "path": audit.relative,
+                    "live_pids": pids,
+                    "cpu_stat": audit.cpu_snapshot(),
+                }
+            if doubled is None:
+                break
+        else:
+            pid, prior, name = doubled
+            raise MeasurementInvalid(
+                f"pid {pid} appears in both {prior} and {name} leaf cgroups"
+            )
         sample = {
             "schema": "fcvm.chromium.reqscale.host-sample.v1",
             "captured_wall_ns": captured_wall_ns,
