@@ -362,9 +362,9 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   phase is absent when the host does not mark it), `agent_connected` when its agent says
   hello (the agent names itself by its instance id), `tiles_rendering` when all its placed
   slots run. Once every placed tile of both halves runs it is `awake`; `last_wake` gives
-  the wake's start, when it was complete (`awake_at`), the tiles placed then (`gpus`, both
-  halves) and the time between (`ms`); `wakes` keeps the last 20. The EC2 half can make
-  the image complete before a GPU host's agent has said hello (a host's slots are placed
+  the wake's start, when it was complete (`awake_at`), the tiles rendering then (`gpus`,
+  both halves; an EC2 place without an instance is not one) and the time between (`ms`);
+  `wakes` keeps the last 20. The EC2 half can make the image complete before a GPU host's agent has said hello (a host's slots are placed
   only then), so the hosts' phases keep being recorded after the fleet is `awake`, until
   every host of the wake has `tiles_rendering`. The coordinator logs each step at info
   (`wake: started`, `wake: host phase`, `wake: host boot` with the hello's boot times,

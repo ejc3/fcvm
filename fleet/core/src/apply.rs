@@ -412,6 +412,13 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
     }
 }
 
+/// A tile on the wall with a renderer behind it: a placed fcvm slot, or a placed EC2 tile
+/// with an instance. An EC2 tile without one holds its place, dark, and is no GPU of the
+/// wall's: not counted, not waited on.
+pub fn renders_on_wall(s: &Slot) -> bool {
+    s.position.is_some() && (s.half == Half::Fcvm || s.observed.vm.is_some())
+}
+
 /// A race whose halves are not all done.
 pub fn race_running(f: &Fleet) -> bool {
     f.races.back().is_some_and(|r| {
@@ -425,7 +432,7 @@ pub fn race_running(f: &Fleet) -> bool {
 /// that failed or waits for capacity is dark for a while and does not hold this back.
 pub fn image_settled(f: &Fleet) -> bool {
     let starting = |s: &Slot| {
-        s.position.is_some()
+        renders_on_wall(s)
             && s.claim.is_none()
             && (s.observed.generation < s.generation
                 || matches!(
@@ -440,7 +447,7 @@ pub fn image_settled(f: &Fleet) -> bool {
 /// waiting for capacity (a wait the EC2 side shows on its own).
 fn image_complete(f: &Fleet) -> bool {
     let running = |s: &Slot| s.observed.phase == "running" && s.observed.generation >= s.generation;
-    f.n + f.ec2.values().filter(|s| s.observed.vm.is_some()).count() > 0
+    f.slots.values().chain(f.ec2.values()).any(renders_on_wall)
         && f.slots.values().all(|s| s.position.is_none() || running(s))
         && f.ec2
             .values()
@@ -509,7 +516,7 @@ fn power_step(state: &mut State, at: u64) {
             .slots
             .values()
             .chain(f.ec2.values())
-            .filter(|s| s.position.is_some())
+            .filter(|s| renders_on_wall(s))
             .count();
         f.power.wakes.push_back(Wake {
             started_at: started,
@@ -1263,8 +1270,8 @@ fn budget_round(f: &mut Fleet, at: u64) {
     let tiles: Vec<&Slot> = f
         .slots
         .values()
-        .chain(f.ec2.values().filter(|s| s.observed.vm.is_some()))
-        .filter(|s| s.position.is_some() && s.claim.is_none())
+        .chain(f.ec2.values())
+        .filter(|s| renders_on_wall(s) && s.claim.is_none())
         .collect();
     let fits: Vec<Option<f64>> = tiles.iter().map(|s| s.observed.budget_fit).collect();
     let overloaded = tiles.iter().any(|s| {

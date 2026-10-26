@@ -506,3 +506,34 @@ fn an_ec2_tile_waiting_for_capacity_does_not_hold_back_the_budget() {
         "the budget waits on a tile with no renderer"
     );
 }
+
+/// An EC2 place without an instance has no renderer: it is not a GPU of the wake that
+/// completes while it waits, and an EC2 tile still launching does not hold the image (and
+/// so the poster) as unsettled.
+#[test]
+fn an_ec2_place_without_an_instance_is_not_counted_as_a_live_gpu() {
+    let config = config_with(serde_json::json!({
+        "power_managed": true, "idle_scale_down_secs": 60, "ec2_max": 3
+    }));
+    let mut s = State::new(config, 0);
+    for e in events(serde_json::json!([
+        {"type": "viewer_joined", "at": 1000, "viewer": "v1", "client": "192.0.2.70"},
+        {"type": "visibility", "at": 1100, "viewer": "v1", "visible": false},
+        {"type": "tick", "at": 62000},
+        {"type": "visibility", "at": 100000, "viewer": "v1", "visible": true},
+        {"type": "ec2", "at": 110000, "report": {"id": "ec2-2", "phase": "waiting_capacity", "generation": 1, "vm": null, "frame_url": null, "timings": {}}},
+        {"type": "ec2", "at": 111000, "report": {"id": "ec2-3", "phase": "waiting_capacity", "generation": 1, "vm": null, "frame_url": null, "timings": {}}},
+        {"type": "ec2", "at": 150000, "report": {"id": "ec2-1", "phase": "running", "generation": 1, "vm": "instance-1", "frame_url": "ws://ec2-1.example:443/frames", "timings": {}}},
+    ])) {
+        s = apply(s, &e);
+    }
+    assert_eq!(s.fleet.power.state, "awake");
+    assert_eq!(s.fleet.power.wakes.back().map(|w| w.gpus), Some(1));
+    s = apply(
+        s,
+        &events(serde_json::json!([
+            {"type": "ec2", "at": 160000, "report": {"id": "ec2-2", "phase": "launching", "generation": 1, "vm": null, "frame_url": null, "timings": {}}},
+        ]))[0],
+    );
+    assert!(fleet_core::apply::image_settled(&s.fleet));
+}
