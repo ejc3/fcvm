@@ -235,6 +235,16 @@ double scene_time(const Scene& s, double t) {
   return t;
 }
 
+Scene held_reference(const Scene& s, double t) {
+  double st = scene_time(s, t);
+  CamPose pose = camera_at(s.camera, st);
+  // one keyframe at the frame's layer time: the camera is held there from it
+  // on, and a hold draws its layer at its start
+  Scene h = s;
+  h.camera = {Keyframe{pose.held ? pose.hold_start : st, {pose.pos[0], pose.pos[1], pose.pos[2]}, {pose.look[0], pose.look[1], pose.look[2]}, pose.fov_deg}};
+  return h;
+}
+
 CamPose camera_at(const std::vector<Keyframe>& kf, double t) {
   CamPose out{};
   size_t n = kf.size();

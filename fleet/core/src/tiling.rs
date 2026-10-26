@@ -1,9 +1,9 @@
-//! Cutting the image into one rectangle per live GPU.
+//! Cutting the image into one rectangle per tile.
 //!
 //! The image is the unit square in its own coordinates: `x` and `w` are fractions of the
 //! image width, `y` and `h` of its height, origin top left. The fcvm side is on the left
-//! and the EC2 side on the right, each as wide as its share of the live GPUs: 100 fcvm GPUs
-//! and 12 EC2 tiles give the fcvm side 100/112 of the width. A side with no GPU has no
+//! and the EC2 side on the right, each as wide as its share of the tiles: 100 fcvm tiles
+//! and 12 EC2 tiles give the fcvm side 100/112 of the width. A side with no tile has no
 //! width; with none on either side there is no rectangle at all.
 //!
 //! A grid of N rectangles has `r` rows of equal height. Row `i` holds `N / r` or `N / r + 1`
@@ -71,7 +71,7 @@ pub fn row_counts(n: usize, rows: usize) -> Vec<usize> {
         .collect()
 }
 
-/// The two sides for `fcvm` and `ec2` live GPUs, each as wide as its share of them.
+/// The two sides for `fcvm` and `ec2` tiles, each as wide as its share of them.
 pub fn sides(fcvm: usize, ec2: usize) -> (Rect, Rect) {
     let total = fcvm + ec2;
     let w = if total == 0 {

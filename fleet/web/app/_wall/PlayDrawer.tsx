@@ -1,7 +1,8 @@
 "use client";
 
-// The Play drawer: choosing the camera's next stop, writing a word, dropping a
-// light, the time of day, how the streams arrive, and the stats overlay. Every
+// The drawer: directing the scene (choosing the camera's next stop, writing a word, dropping a
+// light), how the streams arrive, the stats overlay, and what the page is (the
+// counters, recent actions, how a square is isolated). Every
 // label comes from the view model; every action goes through WallClient.act,
 // which holds it until the Turnstile check passes when the coordinator asks for one.
 
@@ -173,6 +174,41 @@ export function PlayDrawer({ client, view, onClose, section }: { client: WallCli
         <p className="note" data-testid="family">
           {p.stats.family}
         </p>
+      </section>
+      <section className="about" aria-labelledby="about-title" data-testid="about">
+        <h3 id="about-title" tabIndex={-1}>
+          {view.title}
+        </h3>
+        <p data-testid="sentence">{view.sentence}</p>
+        {view.counter ? (
+          <p className="counter" data-testid="counter">
+            {view.counter.label}:{" "}
+            {/* A new key per total restarts the highlight, so the count visibly ticks. */}
+            <b key={view.counter.total} className="tick" data-testid="counter-value">
+              {view.counter.value}
+            </b>
+            <span className="sub">{view.counter.lastHour}</span>
+            {view.counter.wake ? (
+              <span className="sub" data-testid="wake-stat">
+                {view.counter.wake}
+              </span>
+            ) : null}
+            {view.counter.scrubs ? (
+              <span className="sub" data-testid="counter-scrubs">
+                {view.counter.scrubs}
+              </span>
+            ) : null}
+          </p>
+        ) : null}
+        {view.feed.length > 0 ? (
+          <ol className="feed" aria-label="Recent actions" data-testid="feed">
+            {view.feed.map((x) => (
+              <li key={x.key}>
+                {x.text} <span className="when">{x.when}</span>
+              </li>
+            ))}
+          </ol>
+        ) : null}
       </section>
       <section className="isolation" aria-labelledby="isolation-title" data-testid="isolation">
         <h3 id="isolation-title" tabIndex={-1}>

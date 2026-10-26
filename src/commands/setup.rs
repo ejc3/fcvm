@@ -35,6 +35,8 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         // Use /tmp for kernel build (no btrfs required)
         paths::init_with_paths("/tmp/fcvm-kernel", "/tmp/fcvm-kernel");
         std::fs::create_dir_all("/tmp/fcvm-kernel/kernels")?;
+        // Store temps of host kernel builds killed before they finished (crate::reclaim).
+        crate::reclaim::reclaim_abandoned().await;
 
         let profile = get_kernel_profile(profile_name)?.ok_or_else(|| {
             anyhow::anyhow!("kernel profile '{}' not found in config", profile_name)
@@ -68,6 +70,9 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
     // Load config and initialize paths (with helpful error if config missing)
     let (config, _, _) = load_config(args.config.as_deref())?;
     paths::init_with_paths(&config.paths.data_dir, &config.paths.assets_dir);
+    // Store temps of setups killed before they finished (crate::reclaim). A setup under
+    // sudo reclaims root's records, which no rootless launch reads.
+    crate::reclaim::reclaim_abandoned().await;
 
     // Build the optional Cloud Hypervisor backend binary (#632) and exit. CH is an
     // optional VMM backend, so it is built on demand via `--cloud-hypervisor` rather

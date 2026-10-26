@@ -2409,9 +2409,10 @@ release is published for it yet; `make setup-gpu` builds it locally.
 
 ### The NVIDIA driver image
 
-`[kernel_profiles.gpu.<arch>.nvidia]` pins one driver version (580.196.07, the
-R580 long-term branch, which supports Turing T4/T4G with the open modules) and
-one nvidia-container-toolkit version (1.20.1), each by URL and SHA-256.
+`[kernel_profiles.gpu.<arch>.nvidia]` pins one driver version per architecture
+(amd64 580.196.07, the R580 long-term branch; arm64 595.112.07, the first branch
+whose cuda-checkpoint supports ARM CPUs; both support Turing T4/T4G) and one
+nvidia-container-toolkit version (1.20.1), each by URL and SHA-256.
 `fcvm setup --kernel-profile gpu` builds a read-only ext4 image
 (`src/setup/nvidia.rs`) holding:
 
@@ -2672,9 +2673,9 @@ device, so the GPU state leaves the GPU first, through NVIDIA's cuda-checkpoint
 (`cuCheckpointProcess*`, R550 and later; `--device-map` from R580), which the driver
 image carries at `usr/bin/cuda-checkpoint`.
 
-x86_64 only for now: cuda-checkpoint supports ARM CPUs from NVIDIA driver 595
-(its README, "595 Features"), and the arm64 gpu profile pins 580, so `--gpu-warm`
-is refused on arm64 before the guest parks anything. If the source does not get
+cuda-checkpoint supports ARM CPUs from NVIDIA driver 595 (its README, "595
+Features"), which is why the arm64 gpu profile pins 595.112.07 (measured on arm64
+below). If the source does not get
 its GPUs back after a snapshot that was taken, the snapshot is still recorded as
 the VM's diff parent before the failure is reported: the VMM has reset its dirty
 pages against it.
@@ -2774,6 +2775,59 @@ Rechecked on 2026-10-25 after rebasing onto the proprietary NVIDIA modules and t
 in-guest memory scrub, which now runs in the warm restore's bring-up too (llama.cpp,
 6 GiB guest, three restores on three GPUs other than the source's, every answer the
 source's): first token 6.56, 5.53 and 5.52 s; the snapshot took 10.2 s.
+
+On arm64, measured on 2026-10-26 on a g5g.metal (two NVIDIA T4G, driver 595.112.07,
+proprietary modules with the GSP firmware off), with the same llama.cpp server
+(`ghcr.io/ggml-org/llama.cpp:server-cuda`, its arm64 image, the same fp16 GGUF in the
+image, 8 vCPU and 6 GiB guests, rootless). The source ran on one T4G and every clone
+on the other, so every warm restore used `--device-map`. The fcvm store was a btrfs
+loop file on the box's EBS work volume, not local NVMe. 8 runs each, nearest-rank
+percentiles, time to first token as above:
+
+| server | path | p50 | p95 | min | max |
+|--------|------|-----|-----|-----|-----|
+| llama.cpp | warm | 5.15 s | 6.46 s | 5.14 s | 6.46 s |
+| llama.cpp | cold | 67.48 s | 68.46 s | 56.64 s | 68.46 s |
+
+Every answer was the source's (" Paris. It is the largest city in Europe and the
+second largest city in the"), as on x86. The slowest warm run was the first after
+the snapshot. Warm restores (p50): snapshot load 3,441 ms, bring-up 842 ms,
+cuda-checkpoint's restore 750 ms, ACK 5,100 ms. Taking the snapshot took 46.7 s:
+park 1,201 ms, detach 9,806 ms, snapshot 33,231 ms, attach 720 ms, unpark 1,716 ms.
+The source answered the same afterwards, and again after the eight clones. The
+snapshot step writes the 6 GiB memory file to the EBS-backed store.
+
+The detach was 17 times longer than on x86 (9.8 s against 573 ms) and grew with the
+guest (6.65 s for 4 GiB) because it unmapped guest memory from the IOMMU. Dropping
+the GPU's VFIO device took its group out of the container, and the kernel then
+unmapped and unpinned all of guest memory. The g5g.metal's SMMUv3 has no range
+invalidation (`features 0x00120d4f` at boot, bit 15 clear), so every 4 KiB page of
+that unmap is one IOTLB invalidation command. bpftrace on a 6 GiB guest's detach
+(9,883 ms): 9,495 ms in `vfio_unmap_unpin`, 9,176 ms of it in
+`__arm_smmu_tlb_inv_range`, over 24,738 command lists; the three device resets took
+576 ms. The arm64 gpu profile's Firecracker (#1317) now keeps a detached device's VFIO
+device open, reset and with MSI-X disabled, so the container keeps its mappings,
+and the attach after the snapshot reuses both instead of mapping guest memory again.
+Measured on 2026-10-26 on a g5g.metal, rootless, a VM running `sleep infinity` with
+one T4G, three warm snapshots per size, before and after:
+
+| guest | detach before | detach after | attach before | attach after |
+|---|---|---|---|---|
+| 4 GiB | 6,678-6,683 ms | 182-191 ms | 611-623 ms | 198-200 ms |
+| 6 GiB | 9,812-9,820 ms | 183-187 ms | 703-708 ms | 193-198 ms |
+
+With the CUDA probe below (6 GiB guest, 1 GiB of device memory) the warm snapshot
+took park 936 ms, detach 190 ms, snapshot 14,084 ms, attach 196 ms, unpark 2,004 ms;
+the source and a clone on the other T4G kept counting with no mismatched word.
+
+The device memory survives the move: a CUDA program that fills 1 GiB of device
+memory with a position-derived pattern, increments a device-side counter every
+200 ms and compares the whole buffer against the pattern on every step (4 GiB
+guest) was snapshotted with `--gpu-warm` and restored eight times onto the other
+T4G. Every clone resumed counting from the value at the park and found no
+mismatched word, `nvidia-smi` in a clone showed the other T4G holding the
+process's 1,128 MiB, and the source kept counting with no mismatch through the
+snapshot and all eight clones.
 
 ### Verified on hardware
 

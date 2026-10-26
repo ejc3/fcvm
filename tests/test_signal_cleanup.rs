@@ -2099,13 +2099,11 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
                 clone_log.display()
             );
         }
-        assert!(
-            data_survived,
-            "expected the clone's data dir to SURVIVE the SIGKILL (at {}). It holds a reflinked \
-             copy of the golden rootfs, so a harness that does not reap it leaks disk without \
-             leaking a process — invisible to every stray-VM guard.",
-            data_dir.display()
-        );
+        // Whether the clone's data dir is still on disk is not asserted: since the reclaim
+        // records, any fcvm launching on the box removes a SIGKILLed VM's directory once its
+        // owner lock is free, and parallel tests launch VMs all the time. The log checks
+        // above are the evidence that fcvm's own cleanup did not run under SIGKILL.
+        println!("clone data dir still present after SIGKILL: {data_survived}");
 
         // ...and the FIXTURE is held to the same standard as the thing under test.
         // The baseline is torn down with SIGTERM, so `cleanup_vm` runs and both of

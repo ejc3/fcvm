@@ -8,14 +8,27 @@ import tempfile
 import time
 from pathlib import Path
 
+TOKEN = re.compile(r"[A-Za-z0-9.:_-]{1,64}")
+
+
+class CommandFailed(RuntimeError):
+    def __init__(self, name, returncode):
+        super().__init__("command failed: " + name)
+        self.returncode = returncode
+
 
 def command(args, *, body=None, env=None, allow_missing=False):
     result = subprocess.run(args, input=body, capture_output=True, text=True, env=env)
     if result.returncode:
         if allow_missing and "ImageNotFoundException" in result.stderr:
             return None
-        raise RuntimeError("command failed: " + args[0])
+        raise CommandFailed(args[0], result.returncode)
     return result.stdout
+
+
+def attribution(result):
+    """The release function's failed step and AWS error code: the only fields of its result repeated here."""
+    return {k: result[k] for k in ("step", "code") if isinstance(result.get(k), str) and TOKEN.fullmatch(result[k])}
 
 
 def main():
@@ -49,9 +62,20 @@ def main():
     with tempfile.TemporaryDirectory(prefix="coordinator-release-") as tmp:
         output = Path(tmp) / "result.json"  # Only status, task ARN and image digest; no credentials.
         for attempt in range(11):
-            meta = json.loads(command(["aws", "lambda", "invoke", "--region", "us-west-1",
-                "--function-name", os.environ["COORDINATOR_RELEASE"], "--cli-binary-format", "raw-in-base64-out",
-                "--payload", "file:///dev/stdin", "--cli-read-timeout", "910", str(output)], body=payload))
+            try:
+                meta = json.loads(command(["aws", "lambda", "invoke", "--region", "us-west-1",
+                    "--function-name", os.environ["COORDINATOR_RELEASE"], "--cli-binary-format", "raw-in-base64-out",
+                    "--payload", "file:///dev/stdin", "--cli-read-timeout", "910", str(output)], body=payload))
+            except CommandFailed as error:
+                # The call can end while the function keeps running (its connection was dropped, then the
+                # CLI's own retries were throttled by the function's single reserved slot). The release is
+                # serialized and idempotent: a later invocation reports busy, then the finished release.
+                if attempt == 10:
+                    raise
+                print(f"The release invocation ended without a result (aws exit {error.returncode}); "
+                      "retrying in 60 seconds", flush=True)
+                time.sleep(60)
+                continue
             if meta.get("FunctionError"):
                 raise RuntimeError("release function failed")
             result = json.loads(output.read_text())
@@ -61,6 +85,8 @@ def main():
                 time.sleep(60)
                 continue
             if status not in ("deployed", "unchanged") or result.get("digest") != images[0]["imageDigest"]:
+                if attribution(result):
+                    print(json.dumps({"release": attribution(result)}), flush=True)
                 raise RuntimeError("staging release did not complete")
             print(json.dumps({"status": status, "commit": commit, "digest": result["digest"]}))
             return

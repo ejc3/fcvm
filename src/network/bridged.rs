@@ -300,6 +300,12 @@ impl NetworkManager for BridgedNetwork {
             .await
             .context("acquiring bridged subnet allocation lock")?;
 
+        // Everything below outlives this process unless cleanup() removes it, so it is
+        // recorded with the VM's owner (crate::reclaim): the shared NAT first, so that it
+        // is undone last, then each object before it exists, except the namespace, whose
+        // creation decides who owns the name.
+        crate::reclaim::record(&self.vm_id, crate::reclaim::Resource::GlobalNat)?;
+
         // Namespace and veth pair are subnet-independent; they exist before
         // subnet selection so each candidate /30 can be assigned to the real
         // veth and verified against the kernel's actual routing decision.
@@ -323,6 +329,24 @@ impl NetworkManager for BridgedNetwork {
         // settled by the reservation and not by the caller's derivation, which
         // two VMs sharing leading hex digits render identically.
         self.tap_device = vm_names.link("tap-");
+        let recorded = [
+            crate::reclaim::Resource::Netns {
+                name: namespace_id.clone(),
+            },
+            crate::reclaim::Resource::Link {
+                name: host_veth.clone(),
+            },
+            // Added by setup_host_veth below.
+            veth::forward_rule(&host_veth),
+        ]
+        .into_iter()
+        .try_for_each(|resource| crate::reclaim::record(&self.vm_id, resource));
+        if let Err(e) = recorded {
+            // The namespace exists and nothing records it: remove it here.
+            self.host_veth = Some(host_veth.clone());
+            let _ = self.cleanup().await;
+            return Err(e);
+        }
         if let Err(e) = veth::create_veth_pair(&host_veth, &guest_veth, &namespace_id).await {
             let _ = self.cleanup().await;
             return Err(e).context("creating veth pair");
@@ -536,6 +560,14 @@ impl NetworkManager for BridgedNetwork {
             // Add host route to guest IP for direct access
             // This allows curling the guest IP directly from the host
             // Traffic: host → veth0 → veth1 (namespace) → br0 → TAP → guest
+            let route = crate::reclaim::Resource::HostRoute {
+                guest_ip: guest_ip.clone(),
+                via: veth_inner_ip.clone(),
+            };
+            if let Err(e) = crate::reclaim::record(&self.vm_id, route) {
+                let _ = self.cleanup().await;
+                return Err(e);
+            }
             if let Err(e) =
                 veth::add_host_route_to_guest(&host_veth, &guest_ip, &veth_inner_ip).await
             {
@@ -607,6 +639,15 @@ impl NetworkManager for BridgedNetwork {
                 })
                 .collect();
 
+            let recorded = portmap::port_mapping_rules(&target_ip, &scoped_mappings)
+                .into_iter()
+                .try_for_each(|rule| {
+                    crate::reclaim::record(&self.vm_id, portmap::rule_resource(&rule))
+                });
+            if let Err(e) = recorded {
+                let _ = self.cleanup().await;
+                return Err(e);
+            }
             match portmap::setup_port_mappings(&target_ip, &scoped_mappings).await {
                 Ok(rules) => self.port_mapping_rules = rules,
                 Err(e) => {
@@ -670,28 +711,83 @@ impl NetworkManager for BridgedNetwork {
             }
         }
 
-        // Step 3: Delete FORWARD rule and veth pair
+        // Step 3: Delete FORWARD rule and veth pair. With the veth gone its address, and
+        // the rules and routes that name it, can be another VM's, so this VM's records of
+        // them go first (crate::reclaim). If they cannot be dropped, the objects stay,
+        // still recorded, and the next launch removes them. A kill from here on leaks
+        // what is left.
+        // The veth's FORWARD rule is named by the veth, which keeps the name this VM's
+        // until it is deleted below.
         if let Some(ref host_veth) = self.host_veth {
             if let Err(e) = veth::delete_veth_forward_rule(host_veth).await {
                 warn!(vm_id = %self.vm_id, error = %e, "failed to delete forward rule");
                 errors.push(format!("forward rule: {}", e));
             }
-            if let Err(e) = veth::delete_veth_pair(host_veth).await {
-                warn!(vm_id = %self.vm_id, error = %e, "failed to delete veth pair");
-                errors.push(format!("veth pair: {}", e));
+        }
+
+        // A rule or route that could not be removed keeps its record, and with it the
+        // veth and namespace that keep its address this VM's, for the next launch.
+        let forgotten = if !errors.is_empty() {
+            Err(anyhow::anyhow!("rules or routes of this VM remain"))
+        } else {
+            crate::reclaim::forget(&self.vm_id, |r| {
+                r.is_network()
+                    && !matches!(
+                        r,
+                        crate::reclaim::Resource::Netns { .. }
+                            | crate::reclaim::Resource::GlobalNat
+                    )
+            })
+        };
+        let network_kept = forgotten.is_err();
+        if let Err(e) = forgotten {
+            errors.push(format!(
+                "dropping network records, so the veth and namespace stay for the next launch: {e:#}"
+            ));
+        } else {
+            if let Some(ref host_veth) = self.host_veth {
+                if let Err(e) = veth::delete_veth_pair(host_veth).await {
+                    warn!(vm_id = %self.vm_id, error = %e, "failed to delete veth pair");
+                    errors.push(format!("veth pair: {}", e));
+                }
+            }
+
+            // Step 4: Delete network namespace
+            match crate::reclaim::forget(&self.vm_id, |r| {
+                matches!(r, crate::reclaim::Resource::Netns { .. })
+            }) {
+                Err(e) => errors.push(format!(
+                    "dropping the namespace record, so it stays for the next launch: {e:#}"
+                )),
+                Ok(()) => {
+                    if let Some(ref namespace_id) = self.namespace_id {
+                        if let Err(e) = namespace::delete_namespace(namespace_id).await {
+                            warn!(vm_id = %self.vm_id, error = %e, "failed to delete namespace");
+                            errors.push(format!("namespace: {}", e));
+                        }
+                    }
+                }
             }
         }
 
-        // Step 4: Delete network namespace
-        if let Some(ref namespace_id) = self.namespace_id {
-            if let Err(e) = namespace::delete_namespace(namespace_id).await {
-                warn!(vm_id = %self.vm_id, error = %e, "failed to delete namespace");
-                errors.push(format!("namespace: {}", e));
+        // Step 5: Remove global NAT rules if no other bridged VMs are running. A failure
+        // leaves the record, so the next launch tries again. While this VM's own veth
+        // stays for the next launch, the shared rules stay recorded with it: the reclaim
+        // removes them after the veth (it recorded them first).
+        if !network_kept {
+            match portmap::cleanup_global_nat_if_unused().await {
+                Ok(()) => {
+                    if let Err(e) = crate::reclaim::forget(&self.vm_id, |r| {
+                        matches!(r, crate::reclaim::Resource::GlobalNat)
+                    }) {
+                        errors.push(format!("dropping the shared NAT record: {e:#}"));
+                    }
+                }
+                Err(e) => {
+                    warn!(vm_id = %self.vm_id, error = %format!("{e:#}"), "global NAT cleanup")
+                }
             }
         }
-
-        // Step 5: Remove global NAT rules if no other bridged VMs are running
-        portmap::cleanup_global_nat_if_unused().await;
 
         if errors.is_empty() {
             debug!(vm_id = %self.vm_id, "network cleanup complete");
@@ -717,6 +813,28 @@ impl NetworkManager for BridgedNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rule or route that cleanup could not remove keeps its record, and the veth and
+    /// namespace that keep its address this VM's are not deleted (or forgotten) after it.
+    #[test]
+    fn cleanup_keeps_the_records_when_a_rule_stays() {
+        let source = include_str!("bridged.rs");
+        let cleanup = &source[source.find("async fn cleanup(&mut self)").unwrap()..];
+        let guard = cleanup
+            .find("let forgotten = if !errors.is_empty() {")
+            .expect("cleanup guards its forget on earlier failures");
+        let veth = cleanup.find("veth::delete_veth_pair(host_veth)").unwrap();
+        let rules = cleanup.find("portmap::cleanup_port_mappings(").unwrap();
+        let forward = cleanup
+            .find("veth::delete_veth_forward_rule(host_veth)")
+            .unwrap();
+        assert!(rules < guard && forward < guard && guard < veth);
+        // The shared NAT record goes only with this VM's network.
+        let nat = cleanup
+            .find("if !network_kept {")
+            .expect("the shared NAT cleanup waits for this VM's network to be gone");
+        assert!(veth < nat && nat < cleanup.find("cleanup_global_nat_if_unused()").unwrap());
+    }
 
     /// Bridged forwarding is IPv4 DNAT scoped to the veth address, so it cannot honour
     /// an IPv6 HOSTIP. setup() says so before it creates anything.

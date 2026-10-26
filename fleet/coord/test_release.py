@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Offline checks for publishing and the live IPv4/name-regression probe."""
 import importlib.util
+import contextlib
 import fnmatch
+import io
 import copy
 import json
 import os
@@ -273,6 +275,61 @@ class PublishTests(unittest.TestCase):
         with patch.dict(os.environ, env), patch.object(publish, "command") as command:
             with self.assertRaises(ValueError): publish.main()
             command.assert_not_called()
+
+
+class ReleaseInvocationTests(unittest.TestCase):
+    """The Lambda invocation: what a failed release prints, and a call that ends without a result."""
+
+    DIGEST = "sha256:" + "c" * 64
+
+    def run_publish(self, results):
+        """Run main() with each `aws lambda invoke` taking the next entry: a result dict, or an exit status."""
+        results, sleeps = list(results), []
+        def command(args, body=None, env=None, allow_missing=False):
+            if args[1] == "ecr":
+                return json.dumps({"imageDetails": [{"imageDigest": self.DIGEST}]})
+            outcome = results.pop(0)
+            if isinstance(outcome, int):
+                raise publish.CommandFailed(args[0], outcome)
+            Path(args[-1]).write_text(json.dumps(outcome))
+            return json.dumps({"StatusCode": 200})
+        env = {"GITHUB_SHA": "a" * 40, "COORDINATOR_REPO": "111122223333.dkr.ecr.us-east-2.amazonaws.com/fcvm-fleet/coordinator",
+               "COORDINATOR_RELEASE": "fcvm-coordinator-release"}
+        out = io.StringIO()
+        with patch.dict(os.environ, env), patch.object(publish, "command", command), \
+                patch.object(publish.time, "sleep", sleeps.append), contextlib.redirect_stdout(out):
+            try:
+                publish.main()
+                error = None
+            except Exception as caught:
+                error = caught
+        self.assertEqual(results, [], "not every scripted invocation ran")
+        return out.getvalue(), error, sleeps
+
+    def test_a_failed_release_prints_its_step_and_code_and_nothing_else(self):
+        printed, error, _ = self.run_publish([{
+            "status": "failed", "errorType": "ClientError", "step": "unlock",
+            "code": "ConditionalCheckFailedException", "message": "secret detail", "taskDefinition": "secret"}])
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual([json.loads(line) for line in printed.splitlines()],
+                         [{"release": {"step": "unlock", "code": "ConditionalCheckFailedException"}}])
+
+    def test_a_field_that_is_not_a_plain_token_is_not_printed(self):
+        printed, error, _ = self.run_publish([{"status": "failed", "step": "rollout", "code": "has spaces: secret"}])
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual([json.loads(line) for line in printed.splitlines()], [{"release": {"step": "rollout"}}])
+
+    def test_an_invocation_that_ends_without_a_result_is_retried_until_the_release_reports(self):
+        printed, error, sleeps = self.run_publish(
+            [255, 254, {"status": "busy"}, {"status": "unchanged", "digest": self.DIGEST}])
+        self.assertIsNone(error)
+        self.assertEqual(sleeps, [60, 60, 60])
+        self.assertEqual(json.loads(printed.splitlines()[-1])["status"], "unchanged")
+
+    def test_invocations_that_never_return_a_result_still_fail(self):
+        printed, error, sleeps = self.run_publish([255] * 11)
+        self.assertIsInstance(error, publish.CommandFailed)
+        self.assertEqual(len(sleeps), 10)
 
 
 class WorkflowTests(unittest.TestCase):

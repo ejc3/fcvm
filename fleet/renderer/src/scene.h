@@ -70,6 +70,10 @@ struct CamPose {
 // Catmull-Rom on pos and look, linear fov; holds as described in PROTOCOL.md.
 CamPose camera_at(const std::vector<Keyframe>& kf, double t);
 
+// The scene holding the camera where frame t of s has it, with the clouds and
+// water as frame t draws them: frame t's reference, accumulated to many
+// samples (fleet-renderer quality, the GPU test's quality check).
+Scene held_reference(const Scene& s, double t);
 // Scene time that drives the camera and animation (wraps for the demo loop).
 double scene_time(const Scene& s, double t);
 // The tile height that gives a whole image full_h pixels tall for rect r (the

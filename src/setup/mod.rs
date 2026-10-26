@@ -157,22 +157,56 @@ pub(crate) fn store_temp_path(final_path: &Path) -> std::path::PathBuf {
 /// most one behind. A unique name is never reused, so every failure path (including
 /// a `?` return and a cancelled future) has to remove its own, and dropping the
 /// guard does that.
+///
+/// A SIGKILLed build drops nothing, so the temp is recorded with an owner of its own
+/// before it exists (`crate::reclaim`), and the next launch removes it.
 pub(crate) struct StoreTemp {
     path: std::path::PathBuf,
     published: bool,
+    owner: Option<crate::reclaim::Owner>,
 }
 
 impl StoreTemp {
-    /// Name a unique temp beside `final_path`. Nothing is created.
-    pub(crate) fn new(final_path: &Path) -> Self {
-        Self {
-            path: store_temp_path(final_path),
+    /// Name a unique temp beside `final_path` and record it. Nothing is created.
+    pub(crate) fn new(final_path: &Path) -> Result<Self> {
+        Self::new_in(&crate::reclaim::owner_dir()?, final_path)
+    }
+
+    /// [`StoreTemp::new`] with its record in the owner directory `owners`.
+    pub(crate) fn new_in(owners: &Path, final_path: &Path) -> Result<Self> {
+        let path = store_temp_path(final_path);
+        let owner = crate::reclaim::Owner::begin_in(
+            owners,
+            &format!("store-temp-{}", uuid::Uuid::new_v4().simple()),
+        )?;
+        owner.record(crate::reclaim::Resource::Temp { path: path.clone() })?;
+        Ok(Self {
+            path,
             published: false,
+            owner: Some(owner),
+        })
+    }
+
+    /// Delete the record once the temp is published or removed.
+    fn discard_record(&mut self) {
+        if let Some(owner) = self.owner.take() {
+            if let Err(err) = owner.discard() {
+                warn!(path = %self.path.display(), err = %format!("{err:#}"), "deleting a store temp's record");
+            }
         }
     }
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// A handle a helper that writes the temp inherits, so its record stays live while
+    /// the helper runs even if this process is killed (`crate::reclaim::Holder`).
+    pub(crate) fn holder(&self) -> Result<crate::reclaim::Holder> {
+        self.owner
+            .as_ref()
+            .context("a published or removed store temp has no owner")?
+            .holder()
     }
 
     /// Rename the temp onto `dest` and hand it back to the sudo invoker.
@@ -185,6 +219,7 @@ impl StoreTemp {
         match tokio::fs::rename(&self.path, dest).await {
             Ok(()) => {
                 self.published = true;
+                self.discard_record();
                 give_store_entry_to_invoker(dest);
                 Ok(())
             }
@@ -216,8 +251,12 @@ impl Drop for StoreTemp {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err),
         };
-        if let Err(err) = removed {
-            warn!(path = %self.path.display(), %err, "removing an unpublished store temp");
+        match removed {
+            Ok(()) => self.discard_record(),
+            // The record stays, and the next launch tries again.
+            Err(err) => {
+                warn!(path = %self.path.display(), %err, "removing an unpublished store temp")
+            }
         }
     }
 }
@@ -386,26 +425,39 @@ mod store_ownership_tests {
     #[tokio::test]
     async fn an_unpublished_store_temp_is_removed_on_drop() {
         let tmp = tempfile::tempdir().unwrap();
-        let file = StoreTemp::new(&tmp.path().join("kernel.bin"));
+        let records = tempfile::tempdir().unwrap();
+        let owners = crate::reclaim::owner_dir_in(records.path()).unwrap();
+        let file = StoreTemp::new_in(&owners, &tmp.path().join("kernel.bin")).unwrap();
         std::fs::write(file.path(), b"partial").unwrap();
-        let dir = StoreTemp::new(&tmp.path().join("packages-abc"));
+        let dir = StoreTemp::new_in(&owners, &tmp.path().join("packages-abc")).unwrap();
         std::fs::create_dir_all(dir.path().join("nested")).unwrap();
         std::fs::write(dir.path().join("nested/a.deb"), b"x").unwrap();
-        let never_created = StoreTemp::new(&tmp.path().join("missing"));
+        let never_created = StoreTemp::new_in(&owners, &tmp.path().join("missing")).unwrap();
         let paths = [file.path().to_path_buf(), dir.path().to_path_buf()];
         drop((file, dir, never_created));
         for path in paths {
             assert!(!path.exists(), "{} was left behind", path.display());
         }
-        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        let left: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        assert_eq!(
+            std::fs::read_dir(&owners).unwrap().count(),
+            0,
+            "the temps' records were left"
+        );
     }
 
     #[tokio::test]
     async fn store_temp_publish_renames_into_place() {
         let tmp = tempfile::tempdir().unwrap();
+        let records = tempfile::tempdir().unwrap();
+        let owners = crate::reclaim::owner_dir_in(records.path()).unwrap();
         let dest = tmp.path().join("artifact.bin");
         std::fs::write(&dest, b"old").unwrap();
-        let temp = StoreTemp::new(&dest);
+        let temp = StoreTemp::new_in(&owners, &dest).unwrap();
         let staged = temp.path().to_path_buf();
         std::fs::write(&staged, b"new").unwrap();
         temp.publish(&dest, "test artifact").await.unwrap();
@@ -419,9 +471,11 @@ mod store_ownership_tests {
     #[tokio::test]
     async fn two_builders_publish_one_directory_entry() {
         let tmp = tempfile::tempdir().unwrap();
+        let records = tempfile::tempdir().unwrap();
+        let owners = crate::reclaim::owner_dir_in(records.path()).unwrap();
         let dest = tmp.path().join("packages-abc");
-        let first = StoreTemp::new(&dest);
-        let second = StoreTemp::new(&dest);
+        let first = StoreTemp::new_in(&owners, &dest).unwrap();
+        let second = StoreTemp::new_in(&owners, &dest).unwrap();
         for (temp, body) in [(&first, b"first"), (&second, b"other")] {
             std::fs::create_dir_all(temp.path()).unwrap();
             std::fs::write(temp.path().join("a.deb"), body).unwrap();
@@ -435,6 +489,11 @@ mod store_ownership_tests {
             "the losing builder's temp was left behind"
         );
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(&owners).unwrap().count(),
+            0,
+            "records were left"
+        );
     }
 
     #[tokio::test]

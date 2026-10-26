@@ -15,9 +15,9 @@ pub mod dns;
 pub mod ec2;
 pub mod ec2_aws;
 pub mod ecs;
+pub mod hosts;
 pub mod live;
 pub mod poster;
-pub mod scale;
 pub mod secrets;
 pub mod sigv4;
 pub mod store;
@@ -120,14 +120,9 @@ pub struct Outputs {
     pub scene: watch::Sender<Option<SharedScene>>,
     /// The grid budget, for the EC2 tiles' renderers.
     pub budget: watch::Sender<Option<BudgetBody>>,
-    /// The slots' DNS records, when the coordinator writes them (zone, wanted records).
-    pub dns: Option<watch::Sender<Vec<dns::Fact>>>,
     /// The launch names' subzone, when this coordinator serves it: its records follow the
     /// published names.
-    pub zone: Option<(
-        Arc<authority::ZoneConfig>,
-        watch::Sender<Arc<authority::Zone>>,
-    )>,
+    pub zone: Option<Names>,
     pub store: Option<store::StoreTx>,
 }
 
@@ -191,7 +186,7 @@ impl Actor {
     /// them in the same step: the zone the server answers from is updated from this state
     /// before any snapshot or claim names them.
     fn name_launches(&mut self) {
-        let Some(apex) = self.out.zone.as_ref().map(|(c, _)| c.apex.clone()) else {
+        let Some(apex) = self.out.zone.as_ref().map(|n| n.cfg.apex.clone()) else {
             return;
         };
         for f in dns::facts(&self.state) {
@@ -222,9 +217,9 @@ impl Actor {
 
     /// The subzone's records, from the published names.
     fn update_zone(&mut self) {
-        if let Some((cfg, tx)) = &self.out.zone {
-            let z = authority::zone_of(&self.state, &cfg.apex);
-            tx.send_if_modified(|cur| {
+        if let Some(n) = &self.out.zone {
+            let z = authority::zone_of(&self.state, &n.cfg.apex);
+            n.zone.send_if_modified(|cur| {
                 if cur.same_records(&z) {
                     false
                 } else {
@@ -327,14 +322,6 @@ impl Actor {
             *cur = power.clone();
             changed
         });
-        if let Some(tx) = &self.out.dns {
-            let facts = dns::facts(&self.state);
-            tx.send_if_modified(|cur| {
-                let changed = *cur != facts;
-                *cur = facts;
-                changed
-            });
-        }
         let ec2 = ec2_assignment(&self.state);
         self.out.ec2.send_if_modified(|cur| {
             if *cur == ec2 {
@@ -774,16 +761,11 @@ impl Handle {
     }
 }
 
-/// How launches' DNS names are made.
-pub enum Names {
-    /// Written through the Cloudflare API and published once the zone's servers answer them.
-    Cloudflare(dns::Cloudflare),
-    /// Served by this coordinator as the subzone's authoritative server ([`authority`]):
-    /// published as they are minted, with the zone sent on the channel.
-    Subzone(
-        Arc<authority::ZoneConfig>,
-        watch::Sender<Arc<authority::Zone>>,
-    ),
+/// The launch names' subzone, served by this coordinator ([`authority`]): names are
+/// published as they are minted, and the zone the server answers from is sent on `zone`.
+pub struct Names {
+    pub cfg: Arc<authority::ZoneConfig>,
+    pub zone: watch::Sender<Arc<authority::Zone>>,
 }
 
 /// Start the actor, the tick timer and the EC2 driver; returns the handle the transports
@@ -793,7 +775,7 @@ pub fn start(
     store: Option<store::StoreTx>,
     ec2: Option<Arc<dyn ec2::Ec2Driver>>,
     ec2_aggregate_local: Option<String>,
-    power: Option<scale::PowerConfig>,
+    power: Option<hosts::HostConfig>,
     names: Option<Names>,
 ) -> (Handle, tokio::task::JoinHandle<()>) {
     let (cmds, rx) = mpsc::channel(4096);
@@ -809,15 +791,6 @@ pub fn start(
     let mut state = state;
     // With named launches, tiles' frame URLs are the launches' published names.
     state.config.names_published = names.is_some();
-    let (dns_writer, zone) = match names {
-        Some(Names::Cloudflare(cf)) => (Some(cf), None),
-        Some(Names::Subzone(cfg, tx)) => (None, Some((cfg, tx))),
-        None => (None, None),
-    };
-    let dns_out = dns_writer.map(|cf| {
-        let (tx, rx) = watch::channel(dns::facts(&state));
-        (cf, tx, rx)
-    });
     let actor = Actor::new(
         state,
         Outputs {
@@ -827,8 +800,7 @@ pub fn start(
             power: power_tx,
             scene: scene_tx,
             budget: budget_tx,
-            dns: dns_out.as_ref().map(|(_, tx, _)| tx.clone()),
-            zone,
+            zone: names,
             store,
         },
         Box::new(now_ms),
@@ -871,10 +843,7 @@ pub fn start(
         ));
     }
     if let Some(cfg) = power {
-        tokio::spawn(scale::run(cfg, power_rx, handle.clone()));
-    }
-    if let Some((cf, _, rx)) = dns_out {
-        tokio::spawn(dns::run(cf, rx, handle.clone()));
+        tokio::spawn(hosts::run(cfg, power_rx, handle.clone()));
     }
     (handle, task)
 }
@@ -907,10 +876,10 @@ pub fn admin_router(handle: Handle) -> axum::Router {
         .with_state(handle)
 }
 
-/// Whether the fleet sleeps with no active viewer: it scales its host groups, or it was told
+/// Whether the fleet sleeps with no active viewer: it launches its GPU hosts, or it was told
 /// to sleep on fixed hosts.
 pub fn power_managed(args: &FleetCoordArgs) -> bool {
-    !args.scale_groups.is_empty() || args.sleep_when_idle
+    !args.host_templates.is_empty() || args.sleep_when_idle
 }
 
 pub async fn run(args: FleetCoordArgs) -> Result<()> {
@@ -938,6 +907,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     };
     let config = Config {
         max_tiles: args.max_tiles,
+        fcvm_tiles: args.fcvm_tiles.min(args.max_tiles),
         ec2_max: match args.ec2 {
             FleetEc2::None => 0,
             FleetEc2::Fake | FleetEc2::Aws => args.ec2_tiles.min(args.max_tiles),
@@ -1025,19 +995,28 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             crate::fleet::aggregate::child::connect_addr(l)
         )
     });
-    let on_demand = scale::pair_on_demand(&args.scale_groups, &args.on_demand_groups)?;
-    let power = if args.scale_groups.is_empty() {
+    let power = if args.host_templates.is_empty() {
+        anyhow::ensure!(
+            args.host_subnets.is_empty(),
+            "--host-subnet needs a --host-template"
+        );
         None
     } else {
-        Some(scale::PowerConfig {
-            driver: Arc::new(scale::AwsAutoScaling::new()?),
-            groups: args.scale_groups.clone(),
+        let driver = hosts::AwsHosts::new(
+            &args.host_templates,
+            &args.host_subnets,
+            args.fleet_name.clone(),
+        )?;
+        Some(hosts::HostConfig {
+            regions: driver.regions(),
+            driver: Arc::new(driver),
             awake_capacity: args.awake_capacity,
-            // While the groups come up: a failed spot launch is seen at most 2 s after Auto
-            // Scaling records it. Two or three describe calls per poll, only then.
+            on_demand_max: args.host_on_demand_max,
+            // While hosts come up or go away: one DescribeInstances per region.
             poll: Duration::from_secs(2),
-            on_demand,
-            spot_wait: Duration::from_secs(args.spot_wait),
+            // While they run: a reclaimed spot host is replaced within this.
+            liveness: Duration::from_secs(15),
+            capacity_retry: Duration::from_secs(10),
         })
     };
     let dns_token = match &args.dns_token_secret {
@@ -1085,28 +1064,9 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             .serve(listen, args.dns_rate_limit)
             .await?;
             tracing::info!(zone = %cfg.apex, listen = %bound, "serving the launch names' subzone");
-            // Launch names written to the parent zone before the switch are referenced by
-            // nothing now.
-            if let Some(t) = &dns_token {
-                tokio::spawn(dns::sweep(cloudflare(t)?));
-            }
-            Some(Names::Subzone(cfg, tx))
+            Some(Names { cfg, zone: tx })
         }
-        None => match &dns_token {
-            Some(t) => {
-                if args.dns_nameservers.is_empty() {
-                    tracing::warn!(
-                        "--dns-nameservers is empty: launches' names are published without confirming them at the zone's authoritative servers"
-                    );
-                }
-                Some(Names::Cloudflare(cloudflare(t)?.with_confirm(Arc::new(
-                    dns::Authoritative {
-                        servers: args.dns_nameservers.clone(),
-                    },
-                ))))
-            }
-            None => None,
-        },
+        None => None,
     };
     if let Some(secret) = &args.tls_secret {
         let token = dns_token
@@ -1267,13 +1227,31 @@ mod power_tests {
     }
 
     #[test]
-    fn the_fleet_sleeps_with_scale_groups_or_when_told_to() {
+    fn the_fleet_sleeps_with_host_templates_or_when_told_to() {
         assert!(!super::power_managed(&coord(&[])));
         assert!(super::power_managed(&coord(&["--sleep-when-idle"])));
         assert!(super::power_managed(&coord(&[
-            "--scale-group",
-            "us-east-1:fcvm-fleet-hosts"
+            "--host-template",
+            "us-east-1:fcvm-fleet-host-x86_64",
+            "--host-subnet",
+            "us-east-1:subnet-0123456789abcdef0"
         ])));
+    }
+
+    #[test]
+    fn the_on_demand_host_cap_is_at_most_eight() {
+        assert_eq!(coord(&[]).host_on_demand_max, 8);
+        assert_eq!(coord(&["--host-on-demand-max", "2"]).host_on_demand_max, 2);
+        let argv = [
+            "fcvm",
+            "fleet",
+            "coord",
+            "--listen",
+            "127.0.0.1:0",
+            "--host-on-demand-max",
+            "9",
+        ];
+        assert!(Cli::try_parse_from(argv).is_err());
     }
 }
 
