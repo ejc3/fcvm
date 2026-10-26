@@ -115,7 +115,11 @@ def summarize_listen(rows, windows, offset_ns):
                 "handshake_ms_max": max(r["handshake_ms_max"] for r in mine),
                 "thread_start_ms_max": max(r["thread_start_ms_max"] for r in mine),
                 "requests": sum(r["requests"] for r in mine),
+                "request_ms_mean": round(sum(r["request_ms_sum"] for r in mine)
+                                         / max(1, sum(r["requests"] for r in mine)), 3),
                 "request_ms_max": max(r["request_ms_max"] for r in mine),
+                "thread_start_ms_mean": round(sum(r["thread_start_ms_sum"] for r in mine)
+                                              / max(1, sum(r["thread_starts"] for r in mine)), 3),
                 "active_peak": max(r["active_peak"] for r in mine),
             }
         kernel = [r for r in picked if r.get("listener") == "kernel"]

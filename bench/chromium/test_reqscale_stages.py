@@ -69,7 +69,8 @@ class Fixture(unittest.TestCase):
         else:
             row.update(accepts=0, accept_errors=0, accept_ms_sum=0.0, accept_ms_max=0.0,
                        accept_busy=0.0, handshakes=0, handshake_ms_max=0.0,
-                       thread_start_ms_max=0.0, requests=0, request_ms_max=0.0, active_peak=0)
+                       thread_start_ms_max=0.0, thread_start_ms_sum=0.0, thread_starts=0,
+                       requests=0, request_ms_sum=0.0, request_ms_max=0.0, active_peak=0)
         row.update(kw)
         return row
 
@@ -89,9 +90,11 @@ class Listen(Fixture):
     def test_rows_are_joined_to_windows_through_the_two_clocks(self):
         rows = [
             self.listen_row("tls", 101, accepts=40, accept_ms_sum=300.0, accept_ms_max=12.0,
-                            accept_busy=0.3, requests=40, thread_start_ms_max=2.0, active_peak=7),
+                            accept_busy=0.3, requests=40, request_ms_sum=80.0, thread_starts=40,
+                            thread_start_ms_sum=20.0, thread_start_ms_max=2.0, active_peak=7),
             self.listen_row("tls", 105, accepts=10, accept_ms_sum=900.0, accept_ms_max=80.0,
-                            accept_busy=0.9, requests=10, thread_start_ms_max=9.0, active_peak=3),
+                            accept_busy=0.9, requests=10, request_ms_sum=70.0, thread_starts=10,
+                            thread_start_ms_sum=30.0, thread_start_ms_max=9.0, active_peak=3),
             self.listen_row("tls", 150, accepts=999, accept_ms_sum=999.0, accept_busy=0.99),  # between bursts
             self.listen_row("kernel", 104, listen_overflows=3, listen_drops=3,
                             accept_queue={"443": [6, 5], "80": [0, 5]}),
@@ -105,6 +108,8 @@ class Listen(Fixture):
         one, two = out["listen"][1.0], out["listen"][2.0]
         self.assertEqual(one["tls"]["accepts"], 50)
         self.assertEqual(one["tls"]["accept_busy_max_second"], 0.9)
+        self.assertEqual(one["tls"]["request_ms_mean"], 3.0)
+        self.assertEqual(one["tls"]["thread_start_ms_mean"], 1.0)
         self.assertEqual(one["tls"]["accept_ms_max"], 80.0)
         self.assertAlmostEqual(one["tls"]["accept_busy_mean"], 1200.0 / 10000.0)
         self.assertEqual(one["kernel"], {"listen_overflows": 3, "listen_drops": 3, "accept_queue_peak": 6})
