@@ -142,12 +142,14 @@ const LIST_GRACE: Duration = Duration::from_secs(60);
 /// that died mid-launch is found and terminated within this).
 const ASLEEP_CHECK: Duration = Duration::from_secs(300);
 
-/// An instance a launch named, until a list shows it running or gone.
+/// An instance a launch named, retained through the launch visibility grace even after it runs.
 struct Recent {
     region: String,
     market: Market,
     /// When the launch was asked for.
     asked: Instant,
+    /// The first running observation has already been logged.
+    running_reported: bool,
 }
 
 /// One region's progress through a wake.
@@ -304,17 +306,26 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                 id: h.id.clone(),
                 lifecycle: lifecycle(&h.state).into(),
             }));
-            // Running instances whose launch is still recent: log how long they took. An
-            // instance is followed only while it is pending.
+            // Log the first running observation, retaining visibility protection through
+            // the launch grace period.
             for h in hosts.iter().filter(|h| h.state == "running") {
-                if let Some(r) = recent.remove(&h.id) {
-                    tracing::info!(%region, instance = %h.id, market = h.market.name(),
-                        request_to_running_ms = now.duration_since(r.asked).as_millis() as u64,
-                        "wake: host running");
+                if let Some(r) = recent.get_mut(&h.id) {
+                    if !r.running_reported {
+                        tracing::info!(%region, instance = %h.id, market = h.market.name(),
+                            request_to_running_ms = now.duration_since(r.asked).as_millis() as u64,
+                            "wake: host running");
+                        r.running_reported = true;
+                    }
                 }
             }
             recent.retain(|id, r| {
-                r.region != *region || hosts.iter().any(|h| h.id == *id && h.state == "pending")
+                r.region != *region
+                    || hosts.iter().any(|h| {
+                        h.id == *id
+                            && (h.state == "pending"
+                                || (h.state == "running"
+                                    && now.duration_since(r.asked) < LIST_GRACE))
+                    })
             });
             // Stopped or stopping hosts serve nothing: terminate them, as everything when
             // asleep, and what is over the awake capacity.
@@ -479,6 +490,7 @@ async fn reconcile(
                             region: region.to_string(),
                             market,
                             asked,
+                            running_reported: false,
                         },
                     );
                 }
@@ -571,6 +583,7 @@ async fn launch_shortfall(
                     region: region.to_string(),
                     market,
                     asked,
+                    running_reported: false,
                 },
             );
         }
@@ -1291,6 +1304,7 @@ mod tests {
                 region: "us-east-1".into(),
                 market: Market::Spot,
                 asked: now,
+                running_reported: false,
             },
         );
         let got = with_recent("us-east-1", vec![], &mut recent, now);
@@ -1316,6 +1330,7 @@ mod tests {
                 region: "us-east-1".into(),
                 market: Market::Spot,
                 asked: now,
+                running_reported: false,
             },
         );
         assert!(with_recent("us-east-1", vec![], &mut stale, now + LIST_GRACE).is_empty());

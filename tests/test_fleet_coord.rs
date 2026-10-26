@@ -2927,6 +2927,30 @@ async fn a_host_a_later_list_leaves_out_is_not_launched_again() {
     assert_eq!(fake.present("us-east-1").len(), 1);
 }
 
+/// A running host remains protected when a later list omits it during the launch grace.
+#[tokio::test]
+async fn a_running_host_a_later_list_leaves_out_is_not_launched_again() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let fake = Arc::new(FakeHosts::default());
+    *fake.launch_state.lock().unwrap() = Some("running".into());
+    *fake.hide_new.lock().unwrap() = Some((1, 4));
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    // One visible list, four omitted lists, and subsequent visible lists have all run.
+    until_hosts(&fake, "past the omitted running-host lists", |f| {
+        f.calls().iter().filter(|c| c.starts_with("list ")).count() >= 8
+    })
+    .await;
+    assert_eq!(launches(&fake).len(), 1, "{:?}", fake.calls());
+    assert_eq!(fake.present("us-east-1").len(), 1);
+}
+
 /// A coordinator that restarts keeps the hosts it finds (an on-demand fallback from before
 /// the restart included): nothing is launched beside them.
 #[tokio::test]
