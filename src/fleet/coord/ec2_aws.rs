@@ -5,18 +5,30 @@
 //! it tries the on-demand template the same way, if one is configured, and otherwise reports
 //! no capacity, which the tile records as a capacity wait.
 //!
+//! The pool (`pool_max` above 0, with `pool_template`): a tile that leaves the assignment
+//! (the fleet sleeps) has its instance stopped and tagged `FleetPool=<fleet>` instead of
+//! terminated, while fewer than `pool_max` instances are pooled, and a tile with no instance
+//! (the next wake) starts a pooled one before it launches. A stopped tile starts to its first
+//! frame in 15.5 s, against 81 to 84 s for a launch (g4dn.xlarge, staging, 2026-10-25), since
+//! its volume is already read from its snapshot and its first boot is done. Cold launches use
+//! `pool_template` (persistent spot that stops on interruption, so the instance can be
+//! stopped) in place of the one-time spot template. Every terminate cancels the instance's
+//! spot request first, or a persistent request would launch a replacement. A pooled
+//! instance whose image is not the pool template's current one is terminated, not started.
+//! A relaunch of a running tile (a race) never uses the pool.
+//!
 //! The tile serves its renderer over TLS on 443 with the fleet's wildcard certificate, as
 //! `<tile>.<zone>` (the coordinator's DNS writes that name). `ready` waits for the instance to
 //! run, then for `/health` there, resolving the name to the instance's address itself so
 //! readiness does not wait for DNS. `alive` reads the instance's state and asks the same
 //! `/health` again, so a renderer that crashed on a running instance is noticed.
 
-use super::aws::{signed, xml_tag, CredentialChain};
+use super::aws::{set_items, signed, xml_tag, CredentialChain};
 use super::ec2::{Ec2Driver, LaunchError, Launched, Liveness};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use fleet_core::protocol::{BudgetBody, RendererScene};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
 pub struct AwsEc2 {
@@ -38,11 +50,69 @@ pub struct AwsEc2 {
     /// This fleet's name, tagged on every tile at launch (`Fleet=<name>`): the sweep
     /// terminates only this fleet's tiles, not another coordinator's in the same account.
     pub fleet: String,
+    /// Stopped instances kept for the next wake, at most this many (0: no pool).
+    pub pool_max: usize,
+    /// The template cold launches use while the pool is on (an instance that can be stopped).
+    pub pool_template: Option<String>,
+    /// Pooled instances this coordinator has started and not released since.
+    claimed: std::sync::Mutex<HashSet<String>>,
+    /// Held while a release counts the pool and tags an instance into it.
+    pool_lock: tokio::sync::Mutex<()>,
     /// Per region, the subnets (one per AZ) a launch tries in order, and the security group
     /// the tile's interface gets there. A region without subnets launches in the template's.
     pub networks: BTreeMap<String, Network>,
     chain: CredentialChain,
     http: reqwest::Client,
+}
+
+/// One instance of a DescribeInstances answer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Instance {
+    pub id: String,
+    pub state: String,
+    pub image: Option<String>,
+    pub spot_request: Option<String>,
+    /// Tagged `FleetPool`.
+    pub pooled: bool,
+    /// When it was launched (Unix seconds), if the answer says.
+    pub launched_at: Option<i64>,
+}
+
+/// A pooled instance launched longer ago than this is terminated, not started: a
+/// persistent spot request launched without `ValidUntil` expires after 7 days, and its
+/// stopped instance cannot be started after that.
+pub const POOL_MAX_AGE: Duration = Duration::from_secs(6 * 24 * 3600);
+
+/// The persistent requests of a DescribeSpotInstanceRequests answer, one per item of its
+/// `spotInstanceRequestSet`.
+pub fn persistent_requests(xml: &str) -> Vec<String> {
+    set_items(xml, "spotInstanceRequestSet")
+        .into_iter()
+        .filter(|item| xml_tag(item, "type").as_deref() == Some("persistent"))
+        .filter_map(|item| xml_tag(item, "spotInstanceRequestId"))
+        .collect()
+}
+
+/// The instances of a DescribeInstances answer, one per item of its `instancesSet` lists:
+/// an instance's fields can come in any order, so the item bounds it.
+pub fn parse_instances(xml: &str) -> Vec<Instance> {
+    set_items(xml, "instancesSet")
+        .into_iter()
+        .filter_map(|seg| {
+            Some(Instance {
+                id: xml_tag(seg, "instanceId")?,
+                state: xml_tag(seg, "instanceState")
+                    .and_then(|s| xml_tag(&s, "name"))
+                    .unwrap_or_default(),
+                image: xml_tag(seg, "imageId"),
+                spot_request: xml_tag(seg, "spotInstanceRequestId").filter(|r| !r.is_empty()),
+                pooled: seg.contains("<key>FleetPool</key>"),
+                launched_at: xml_tag(seg, "launchTime")
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+                    .map(|t| t.timestamp()),
+            })
+        })
+        .collect()
 }
 
 /// A region's tile network: its subnets, tried in order, and the security group.
@@ -228,6 +298,10 @@ impl AwsEc2 {
             // A local HTTP request to the instance, not an EC2 API call: a ready renderer
             // is seen within 250 ms instead of up to `poll` (3 s) later.
             health_poll: HEALTH_POLL,
+            pool_max: 0,
+            pool_template: None,
+            claimed: std::sync::Mutex::new(HashSet::new()),
+            pool_lock: tokio::sync::Mutex::new(()),
             fleet: "stage".into(),
             networks: BTreeMap::new(),
             chain: CredentialChain::new()?,
@@ -284,6 +358,333 @@ impl AwsEc2 {
         }
     }
 
+    /// Whether stopped instances are kept for the next wake.
+    fn pooling(&self) -> bool {
+        self.pool_max > 0 && self.pool_template.is_some()
+    }
+
+    /// The region the pool lives in: the first fleet region.
+    fn pool_region(&self) -> &str {
+        &self.regions[0]
+    }
+
+    async fn call_ok(&self, region: &str, params: &[(&str, String)]) -> Result<String> {
+        match self.call(region, params).await {
+            Ok(x) => Ok(x),
+            Err(CallError::Capacity(e)) => bail!("{e}"),
+            Err(CallError::Other(e)) => Err(e),
+        }
+    }
+
+    /// This fleet's tile instances in `region` in any of `states`.
+    async fn fleet_instances(&self, region: &str, states: &[&str]) -> Result<Vec<Instance>> {
+        let mut out = Vec::new();
+        let mut next: Option<String> = None;
+        loop {
+            let mut params = vec![
+                ("Action", "DescribeInstances".to_string()),
+                ("Filter.1.Name", "tag:Purpose".into()),
+                ("Filter.1.Value.1", "fcvm-fleet-tile".into()),
+                ("Filter.2.Name", "instance-state-name".into()),
+                ("Filter.3.Name", "tag:Fleet".into()),
+                ("Filter.3.Value.1", self.fleet.clone()),
+            ];
+            let keys: Vec<String> = (1..=states.len())
+                .map(|i| format!("Filter.2.Value.{i}"))
+                .collect();
+            for (k, st) in keys.iter().zip(states) {
+                params.push((k.as_str(), st.to_string()));
+            }
+            if let Some(t) = &next {
+                params.push(("NextToken", t.clone()));
+            }
+            let xml = self.call_ok(region, &params).await?;
+            out.extend(parse_instances(&xml));
+            next = xml_tag(&xml, "nextToken").filter(|t| !t.is_empty());
+            if next.is_none() {
+                break;
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out.dedup_by(|a, b| a.id == b.id);
+        Ok(out)
+    }
+
+    async fn one_instance(&self, region: &str, id: &str) -> Result<Instance> {
+        let xml = self
+            .call_ok(
+                region,
+                &[
+                    ("Action", "DescribeInstances".into()),
+                    ("InstanceId.1", id.into()),
+                ],
+            )
+            .await?;
+        parse_instances(&xml)
+            .into_iter()
+            .find(|i| i.id == id)
+            .with_context(|| format!("DescribeInstances did not name {id}"))
+    }
+
+    /// Terminate `insts`, cancelling their persistent spot requests first: a persistent
+    /// request whose instance is terminated launches a replacement. A one-time request
+    /// closes when it is fulfilled and is left alone. When the requests cannot be read or
+    /// cancelled nothing is terminated: the instances stay tagged for the next sweep.
+    async fn terminate_all(&self, region: &str, insts: &[Instance]) -> Result<()> {
+        if insts.is_empty() {
+            return Ok(());
+        }
+        let requests: Vec<&String> = insts
+            .iter()
+            .filter_map(|i| i.spot_request.as_ref())
+            .collect();
+        if !requests.is_empty() {
+            let mut params = vec![("Action", "DescribeSpotInstanceRequests".to_string())];
+            let keys: Vec<String> = (1..=requests.len())
+                .map(|i| format!("SpotInstanceRequestId.{i}"))
+                .collect();
+            for (k, r) in keys.iter().zip(&requests) {
+                params.push((k.as_str(), (*r).clone()));
+            }
+            let xml = self
+                .call_ok(region, &params)
+                .await
+                .context("reading the tiles' spot requests")?;
+            let persistent = persistent_requests(&xml);
+            if !persistent.is_empty() {
+                let mut params = vec![("Action", "CancelSpotInstanceRequests".to_string())];
+                let keys: Vec<String> = (1..=persistent.len())
+                    .map(|i| format!("SpotInstanceRequestId.{i}"))
+                    .collect();
+                for (k, r) in keys.iter().zip(&persistent) {
+                    params.push((k.as_str(), r.clone()));
+                }
+                self.call_ok(region, &params)
+                    .await
+                    .context("cancelling the tiles' persistent spot requests")?;
+            }
+        }
+        let mut params = vec![("Action", "TerminateInstances".to_string())];
+        let keys: Vec<String> = (1..=insts.len())
+            .map(|i| format!("InstanceId.{i}"))
+            .collect();
+        for (k, i) in keys.iter().zip(insts) {
+            params.push((k.as_str(), i.id.clone()));
+        }
+        self.call_ok(region, &params).await.map(|_| ())
+    }
+
+    /// The image the pool template launches now; a pooled instance of another image is stale.
+    async fn pool_image(&self) -> Result<String> {
+        let template = self.pool_template.as_deref().context("no pool template")?;
+        let xml = self
+            .call_ok(
+                self.pool_region(),
+                &[
+                    ("Action", "DescribeLaunchTemplateVersions".into()),
+                    ("LaunchTemplateName", template.into()),
+                    ("LaunchTemplateVersion.1", "$Latest".into()),
+                ],
+            )
+            .await?;
+        xml_tag(&xml, "launchTemplateData")
+            .and_then(|d| xml_tag(&d, "imageId"))
+            .with_context(|| format!("launch template {template} names no image"))
+    }
+
+    async fn tag(&self, region: &str, id: &str, key: &str, value: &str) -> Result<()> {
+        self.call_ok(
+            region,
+            &[
+                ("Action", "CreateTags".into()),
+                ("ResourceId.1", id.into()),
+                ("Tag.1.Key", key.into()),
+                ("Tag.1.Value", value.into()),
+            ],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn untag(&self, region: &str, id: &str, key: &str) -> Result<()> {
+        self.call_ok(
+            region,
+            &[
+                ("Action", "DeleteTags".into()),
+                ("ResourceId.1", id.into()),
+                ("Tag.1.Key", key.into()),
+            ],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Start one pooled instance for `tile`: the first of the fresh pooled ones that starts.
+    async fn resume_from_pool(&self, tile: &str) -> Result<Option<Launched>> {
+        let region = self.pool_region().to_string();
+        let pooled: Vec<Instance> = self
+            .fleet_instances(&region, &["stopped"])
+            .await?
+            .into_iter()
+            .filter(|i| i.pooled)
+            .collect();
+        if pooled.is_empty() {
+            return Ok(None);
+        }
+        let image = self.pool_image().await?;
+        let oldest = chrono::Utc::now().timestamp() - POOL_MAX_AGE.as_secs() as i64;
+        let (fresh, stale): (Vec<Instance>, Vec<Instance>) = pooled.into_iter().partition(|i| {
+            i.image.as_deref() == Some(image.as_str()) && i.launched_at.is_some_and(|t| t >= oldest)
+        });
+        if !stale.is_empty() {
+            let stale: Vec<Instance> = {
+                let mut c = self.claimed.lock().unwrap();
+                stale
+                    .into_iter()
+                    .filter(|i| c.insert(i.id.clone()))
+                    .collect()
+            };
+            let ids: Vec<&str> = stale.iter().map(|i| i.id.as_str()).collect();
+            tracing::info!(%region, instances = ?ids, %image, "terminating pooled tiles of an older image or past the pool's age");
+            let done = self.terminate_all(&region, &stale).await;
+            // Released either way: a terminated instance is not listed as stopped again, and
+            // one whose termination failed is tried again at the next resume.
+            {
+                let mut c = self.claimed.lock().unwrap();
+                for i in &stale {
+                    c.remove(&i.id);
+                }
+            }
+            done?;
+        }
+        for cand in fresh {
+            if !self.claimed.lock().unwrap().insert(cand.id.clone()) {
+                continue;
+            }
+            // The list can be older than the claim: the instance may have been started for
+            // another tile and released since (a release holds its claim until its stop is
+            // sent, and tags the instance FleetPool while it still runs). Start it only if
+            // it is stopped and pooled now.
+            match self.one_instance(&region, &cand.id).await {
+                Ok(now) if now.state == "stopped" && now.pooled => {}
+                Ok(_) | Err(_) => {
+                    self.claimed.lock().unwrap().remove(&cand.id);
+                    continue;
+                }
+            }
+            match self
+                .call(
+                    &region,
+                    &[
+                        ("Action", "StartInstances".into()),
+                        ("InstanceId.1", cand.id.clone()),
+                    ],
+                )
+                .await
+            {
+                Ok(_) => {
+                    // The instance is this tile's now, whatever the tags say; a failed tag
+                    // only leaves it counted in the pool until it is released again.
+                    if let Err(e) = self.tag(&region, &cand.id, "FleetTile", tile).await {
+                        tracing::warn!(instance = %cand.id, error = %format!("{e:#}"), "tagging a resumed tile failed");
+                    }
+                    if let Err(e) = self.untag(&region, &cand.id, "FleetPool").await {
+                        tracing::warn!(instance = %cand.id, error = %format!("{e:#}"), "untagging a resumed tile failed");
+                    }
+                    tracing::info!(%tile, %region, instance = %cand.id, "tile resumed from the pool");
+                    return Ok(Some(Launched {
+                        instance: format!("{region}/{}", cand.id),
+                        frame_url: Some(format!("wss://{tile}.{}/frames", self.zone)),
+                        ipv6: None,
+                        ipv4: None,
+                    }));
+                }
+                Err(e) => {
+                    let why = match e {
+                        CallError::Capacity(w) => w,
+                        CallError::Other(e) => format!("{e:#}"),
+                    };
+                    // Left in the pool for a later wake (a spot request that is not yet
+                    // disabled after its stop, or no capacity right now).
+                    tracing::info!(%tile, instance = %cand.id, reason = %why, "a pooled tile did not start");
+                    self.claimed.lock().unwrap().remove(&cand.id);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Put `id` in the pool (tag, then stop) when there is room and its image is current;
+    /// otherwise, or when it cannot be stopped, terminate it.
+    async fn release_into_pool(&self, region: &str, id: &str) -> Result<()> {
+        let inst = match self.one_instance(region, id).await {
+            Ok(i) => i,
+            Err(e) => {
+                self.claimed.lock().unwrap().remove(id);
+                return Err(e);
+            }
+        };
+        let keep = {
+            let _g = self.pool_lock.lock().await;
+            let image = self.pool_image().await.ok();
+            let room = self
+                .fleet_instances(region, &["pending", "running", "stopping", "stopped"])
+                .await
+                .map(|v| v.iter().filter(|i| i.pooled && i.id != id).count() < self.pool_max)
+                .unwrap_or(false);
+            let oldest = chrono::Utc::now().timestamp() - POOL_MAX_AGE.as_secs() as i64;
+            let keep = region == self.pool_region()
+                && room
+                && image.is_some()
+                && inst.image == image
+                && inst.launched_at.is_some_and(|t| t >= oldest);
+            // An instance that could not be tagged into the pool is not pooled: it is
+            // terminated below, not left running with no owner.
+            keep && match self.tag(region, id, "FleetPool", &self.fleet).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(%region, instance = %id, error = %format!("{e:#}"), "tagging a tile into the pool failed; terminating it");
+                    false
+                }
+            }
+        };
+        let done = self.stop_or_terminate(region, id, inst, keep).await;
+        // Held until the stop or terminate is sent, so a resume cannot claim it before.
+        self.claimed.lock().unwrap().remove(id);
+        done
+    }
+
+    async fn stop_or_terminate(
+        &self,
+        region: &str,
+        id: &str,
+        inst: Instance,
+        keep: bool,
+    ) -> Result<()> {
+        if keep {
+            match self
+                .call_ok(
+                    region,
+                    &[
+                        ("Action", "StopInstances".into()),
+                        ("InstanceId.1", id.into()),
+                    ],
+                )
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!(%region, instance = %id, "tile stopped into the pool");
+                    return Ok(());
+                }
+                // One-time spot cannot be stopped: terminate it.
+                Err(e) => {
+                    tracing::info!(instance = %id, error = %format!("{e:#}"), "a tile could not be stopped; terminating it")
+                }
+            }
+        }
+        self.terminate_all(region, &[inst]).await
+    }
+
     /// One RunInstances from `template`, in `subnet` when given. Naming a subnet means naming
     /// the whole interface the template describes (its group, a public IPv4 and one IPv6
     /// address), since a request's interface replaces the template's.
@@ -325,21 +726,6 @@ impl AwsEc2 {
     }
 }
 
-/// The text of every `<tag>` element in `xml`, in order.
-fn all_tags(xml: &str, tag: &str) -> Vec<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(i) = rest.find(&open) {
-        rest = &rest[i + open.len()..];
-        let Some(j) = rest.find(&close) else { break };
-        out.push(rest[..j].to_string());
-        rest = &rest[j + close.len()..];
-    }
-    out
-}
-
 /// `<region>/<instance id>`, how a launched tile's instance is named.
 fn split(instance: &str) -> Result<(&str, &str)> {
     instance
@@ -351,7 +737,13 @@ fn split(instance: &str) -> Result<(&str, &str)> {
 impl Ec2Driver for AwsEc2 {
     async fn launch(&self, tile: &str) -> Result<Launched, LaunchError> {
         let mut refusals = Vec::new();
-        let templates = std::iter::once(&self.spot_template).chain(self.on_demand_template.iter());
+        // With the pool on, cold launches come from the pool template so the instance can
+        // be stopped into the pool when the fleet sleeps.
+        let first = match (&self.pool_template, self.pooling()) {
+            (Some(t), true) => t,
+            _ => &self.spot_template,
+        };
+        let templates = std::iter::once(first).chain(self.on_demand_template.iter());
         for template in templates {
             for region in &self.regions {
                 // The region's subnets, one AZ each, or the template's own.
@@ -385,6 +777,27 @@ impl Ec2Driver for AwsEc2 {
             }
         }
         Err(LaunchError::NoCapacity(refusals.join("; ")))
+    }
+
+    async fn resume(&self, tile: &str) -> Option<Launched> {
+        if !self.pooling() {
+            return None;
+        }
+        match self.resume_from_pool(tile).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(%tile, error = %format!("{e:#}"), "reading the tile pool failed; launching");
+                None
+            }
+        }
+    }
+
+    async fn release(&self, instance: &str) -> Result<()> {
+        let (region, id) = split(instance)?;
+        if !self.pooling() {
+            return self.terminate(instance).await;
+        }
+        self.release_into_pool(region, id).await
     }
 
     async fn ready(&self, tile: &str, launched: &Launched) -> Result<Launched> {
@@ -520,75 +933,44 @@ impl Ec2Driver for AwsEc2 {
     }
 
     /// Every instance of this fleet (tagged `Purpose=fcvm-fleet-tile` and `Fleet=<name>`)
-    /// that is not terminated or shutting down, in every fleet region, terminated by id.
+    /// that is not terminated or shutting down, in every fleet region, terminated by id
+    /// (spot requests cancelled first), except the pool: up to `pool_max` pooled instances
+    /// that are stopped or stopping in the pool region stay for the next wake.
     async fn sweep(&self) -> Result<usize> {
         let mut total = 0;
         for region in &self.regions {
-            let mut ids = Vec::new();
-            let mut next: Option<String> = None;
-            loop {
-                let mut params = vec![
-                    ("Action", "DescribeInstances".to_string()),
-                    ("Filter.1.Name", "tag:Purpose".into()),
-                    ("Filter.1.Value.1", "fcvm-fleet-tile".into()),
-                    ("Filter.2.Name", "instance-state-name".into()),
-                    ("Filter.2.Value.1", "pending".into()),
-                    ("Filter.2.Value.2", "running".into()),
-                    ("Filter.2.Value.3", "stopping".into()),
-                    ("Filter.2.Value.4", "stopped".into()),
-                    ("Filter.3.Name", "tag:Fleet".into()),
-                    ("Filter.3.Value.1", self.fleet.clone()),
-                ];
-                if let Some(t) = &next {
-                    params.push(("NextToken", t.clone()));
-                }
-                let xml = match self.call(region, &params).await {
-                    Ok(x) => x,
-                    Err(CallError::Capacity(e)) => bail!("{e}"),
-                    Err(CallError::Other(e)) => return Err(e),
-                };
-                ids.extend(all_tags(&xml, "instanceId"));
-                next = xml_tag(&xml, "nextToken").filter(|t| !t.is_empty());
-                if next.is_none() {
-                    break;
-                }
-            }
-            ids.sort();
-            ids.dedup();
-            if ids.is_empty() {
+            let all = self
+                .fleet_instances(region, &["pending", "running", "stopping", "stopped"])
+                .await?;
+            let mut kept = 0;
+            let gone: Vec<Instance> = all
+                .into_iter()
+                .filter(|i| {
+                    let keep = self.pooling()
+                        && region == self.pool_region()
+                        && i.pooled
+                        && matches!(i.state.as_str(), "stopped" | "stopping")
+                        && kept < self.pool_max;
+                    kept += keep as usize;
+                    !keep
+                })
+                .collect();
+            if gone.is_empty() {
                 continue;
             }
-            let mut params = vec![("Action", "TerminateInstances".to_string())];
-            let keys: Vec<String> = (1..=ids.len()).map(|i| format!("InstanceId.{i}")).collect();
-            for (k, id) in keys.iter().zip(&ids) {
-                params.push((k.as_str(), id.clone()));
-            }
-            match self.call(region, &params).await {
-                Ok(_) => {}
-                Err(CallError::Capacity(e)) => bail!("{e}"),
-                Err(CallError::Other(e)) => return Err(e),
-            }
-            tracing::info!(%region, instances = ?ids, "terminated tile instances");
-            total += ids.len();
+            self.terminate_all(region, &gone).await?;
+            let ids: Vec<&str> = gone.iter().map(|i| i.id.as_str()).collect();
+            tracing::info!(%region, instances = ?ids, pooled_kept = kept, "terminated tile instances");
+            total += gone.len();
         }
         Ok(total)
     }
 
     async fn terminate(&self, instance: &str) -> Result<()> {
         let (region, id) = split(instance)?;
-        match self
-            .call(
-                region,
-                &[
-                    ("Action", "TerminateInstances".into()),
-                    ("InstanceId.1", id.into()),
-                ],
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(CallError::Capacity(e)) => bail!("{e}"),
-            Err(CallError::Other(e)) => Err(e),
-        }
+        let inst = self.one_instance(region, id).await?;
+        let done = self.terminate_all(region, &[inst]).await;
+        self.claimed.lock().unwrap().remove(id);
+        done
     }
 }

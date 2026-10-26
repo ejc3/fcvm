@@ -433,6 +433,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--state-bucket <bucket> [--state-key state.json] [--state-region <region>]]
                  [--ec2 aws --ec2-tiles 8 --ec2-regions <r1,r2,...> [--ec2-template fcvm-fleet-tile-x86_64]
                   [--ec2-on-demand-template <name>] [--fleet-name stage]
+                  [--ec2-pool <n> --ec2-pool-template <name>]
                   [--ec2-subnets <region>:<subnet>,... --ec2-security-group <region>:<group>]...]
                  [--dns-zone fcvm.dev]
                  [--dns-token-secret <secret> [--dns-zone-id <id>] [--dns-nameservers <ns>,...]]
@@ -474,6 +475,24 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   stops, it terminates every instance tagged `Purpose=fcvm-fleet-tile` and
   `Fleet=<--fleet-name>` in `--ec2-regions`; another fleet's tiles in the same account (a
   different `--fleet-name`) are left alone.
+- `--ec2-pool <n>` with `--ec2-pool-template <name>` keeps up to `n` tile instances stopped
+  for the next wake. A tile that leaves the assignment (the fleet sleeps) has its instance
+  tagged `FleetPool=<--fleet-name>` and stopped instead of terminated, while fewer than `n`
+  are pooled and its image is the pool template's current one. A tile with no instance (a
+  wake, or after its instance failed) first starts a pooled instance in the first region,
+  retagged `FleetTile=<tile>`, and launches only when none starts; the tile's timings then
+  carry `resumed: 1`. The relaunch of a running tile (a race) always launches. Cold
+  launches use the pool template, which must give instances that can be stopped
+  (persistent spot that stops on interruption, or on demand). Every terminate cancels the
+  instance's spot request first when it is persistent, since a persistent request replaces
+  a terminated instance, and leaves the instance running when the request cannot be read
+  or cancelled. The start and stop sweeps keep up to `n` pooled instances that are stopped
+  or stopping. A pooled instance of an older image, or launched more than 6 days ago (a
+  persistent request without `ValidUntil` expires after 7), is terminated at the next wake
+  instead of started. Measured on g4dn.xlarge (2026-10-25): a
+  stopped tile started to its first frame in 15.5 s (persistent spot) and 17.2 to 17.5 s
+  (on demand), against 81 to 84 s for a launch; a stopped persistent spot instance can be
+  started again only once its request is `disabled`, 42 to 54 s after it stopped.
 - `--dns-token-secret` names each launch in `--dns-zone` with the zone's Cloudflare token.
   Every launch of an fcvm slot or EC2 tile that reports an address gets a label never used
   before, `slot-<n>-<token>` / `ec2-<n>-<token>` (8 random base32 characters), and under it

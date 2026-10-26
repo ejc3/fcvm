@@ -250,6 +250,42 @@ pub async fn imds(path: &str) -> Result<String> {
         .to_string())
 }
 
+/// The top-level `<item>` elements of every `<set>` list in an AWS XML answer (EC2's
+/// `instancesSet`, `spotInstanceRequestSet`, ...), each with everything nested in it. EC2 does
+/// not promise an order for an item's elements, so an item, not one of its fields, bounds a
+/// record. Nested lists (tag sets, interfaces) are inside their item.
+pub fn set_items<'a>(xml: &'a str, set: &str) -> Vec<&'a str> {
+    let (open, close) = (format!("<{set}>"), format!("</{set}>"));
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find(&open) {
+        let body = &rest[i + open.len()..];
+        let end = body.find(&close).unwrap_or(body.len());
+        let list = &body[..end];
+        let (mut depth, mut start, mut at) = (0usize, 0usize, 0usize);
+        while at < list.len() {
+            let tail = &list[at..];
+            if tail.starts_with("<item>") {
+                if depth == 0 {
+                    start = at + "<item>".len();
+                }
+                depth += 1;
+                at += "<item>".len();
+            } else if tail.starts_with("</item>") {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    out.push(&list[start..at]);
+                }
+                at += "</item>".len();
+            } else {
+                at += tail.chars().next().map_or(1, char::len_utf8);
+            }
+        }
+        rest = &body[end..];
+    }
+    out
+}
+
 /// The text of the first `<name>` element in an AWS XML answer.
 pub fn xml_tag(xml: &str, name: &str) -> Option<String> {
     let open = format!("<{name}>");

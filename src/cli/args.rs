@@ -314,6 +314,16 @@ pub struct FleetCoordArgs {
     #[arg(long)]
     pub ec2_on_demand_template: Option<String>,
 
+    /// Keep up to this many EC2 tile instances stopped when the fleet sleeps, and start
+    /// them at the next wake instead of launching (needs --ec2-pool-template)
+    #[arg(long, default_value_t = 0, requires = "ec2_pool_template")]
+    pub ec2_pool: usize,
+
+    /// The tile launch template cold launches use while --ec2-pool is above 0: one whose
+    /// instances can be stopped (persistent spot that stops on interruption, or on demand)
+    #[arg(long)]
+    pub ec2_pool_template: Option<String>,
+
     /// The subnets (one per AZ) to launch EC2 tiles in, per region, tried in order before
     /// the next region: `<region>:<subnet>[,<subnet>...]`, repeatable (FLEET_EC2_SUBNETS:
     /// entries separated by spaces). A region without any launches in the template's subnet.
