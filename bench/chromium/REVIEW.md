@@ -476,8 +476,11 @@ before the replay's handler thread starts timing (`duration_ms` in the access lo
   both failed (2.8: 244 of 336 requests failed, the accept thread spent up to 11.2 s inside one
   `accept()`, 15,182 drops; navigation median 33 s). A dropped SYN is retried after 1 s, so the 5 s p95
   that s13 recorded at every rate comes partly from here.
-- **`--backlog 1024` alone**: 0 drops, median navigation 267 to 306 ms from 1.40 to 2.33 per path, all
-  three rates pass. The accept thread is then 37% to 61% busy at 2.4 to 2.5 ms per connection, which puts
+- **`--backlog 1024` alone**: 0 drops, median navigation 267 to 306 ms from 1.40 to 2.33 per path. In the
+  second run (`backlog-1024-b`, the only one with an analysis) 1.40 and 1.87 pass every gate and 2.33 is
+  recorded as a failed rate (one failed request among 1,400, a teardown leaving a lock file); the first run
+  was stopped at burst 12 of 18 by the sampler fault fixed in this PR, so its windows are 240 s at 1.40 and
+  180 s at 1.87 and 2.33 and it has no analysis. The accept thread is then 37% to 61% busy at 2.4 to 2.5 ms per connection, which puts
   its own limit near 3.8 per path (1 / 2.44 ms = 410 connections per second, 53 per page load, two paths).
 - **`--tls-handshake-in-handler`** (the default backlog): the accept thread is 0.5% to 2.4% busy (0.03 to
   0.05 ms per connection), handler time per request 6 to 9 ms (mean), and 1.40, 1.87, 2.33 and 2.8 all pass
@@ -509,7 +512,8 @@ running at 4.2 with 4 vCPUs), whether the Python replay or the host side of past
 the next limit, and what a page's navigation costs apart from the listener (with the listener fixed, 476 of 6,300
 scored requests in the 2.8-per-path run set took over 2 s navigation, and 460 of them are all 460
 requests for www.elmundo.es; the 5 s p95 of s13 is that page plus the listener's dropped connections). Every figure above is the 5 scored bursts of one
-run; none has a repeat except the default-replay 1.40 (median navigation 362.7 and 370.0 ms in two runs, 355.4 in s13).
+run (300 s of scoring windows per rate), except the `base-first` rows, which are 60 s windows of the first
+attempt, and the `backlog-1024-a` rows (240 and 180 s); none has a repeat except the default-replay 1.40 (median navigation 362.7 and 370.0 ms in two runs, 355.4 in s13).
 
 The earlier s13 record (`reqbench-20261022-corpus-s13`) used the default replay, so its 1.40 and 1.87
 results are this table's first rows. The replay options default to the old behavior; the 2026-10-22 serial
