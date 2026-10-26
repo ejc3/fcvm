@@ -130,6 +130,17 @@ where
                         match connect().await {
                             Ok(mut upstream) => {
                                 let mut client = client;
+                                // A relay writes each read as it arrives and must not
+                                // coalesce: with Nagle on, a write that follows one the
+                                // peer has not acknowledged waits for its (delayed) ACK,
+                                // 40 ms on Linux and longer on macOS, on every message
+                                // sent in more than one piece. The endpoints keep their
+                                // own setting.
+                                for (side, stream) in [("client", &client), ("upstream", &upstream)] {
+                                    if let Err(e) = stream.set_nodelay(true) {
+                                        debug!(error = %e, %peer, "{label} relay: TCP_NODELAY on the {side} socket");
+                                    }
+                                }
                                 match tokio::io::copy_bidirectional(&mut client, &mut upstream)
                                     .await
                                 {
@@ -446,6 +457,72 @@ pub fn parse_proxy_addr(proxy: &str) -> Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A message the upstream writes in two parts reaches the relay's client without
+    /// waiting for the client to acknowledge the first part. The relay writes each read
+    /// as it comes, so without TCP_NODELAY on its client socket Nagle holds the second
+    /// part until the client's (delayed) ACK of the first arrives: on the GPU wall a
+    /// renderer frame is TLS records written back to back, and through the relay every
+    /// fcvm frame's tail waited for that ACK, while the EC2 tiles' frames did not.
+    #[tokio::test]
+    async fn a_message_written_in_two_parts_crosses_the_relay_without_waiting_for_an_ack() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const ROUNDS: usize = 30;
+        const FIRST: usize = 16_384;
+        const SECOND: usize = 12_000;
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = listener.local_addr().unwrap();
+        let relay = spawn_relay_loop(
+            listener,
+            move || async move { Ok(tokio::net::TcpStream::connect(upstream_addr).await?) },
+            "test",
+        );
+        let mut client = tokio::net::TcpStream::connect(relay_addr).await.unwrap();
+        let (mut server, _) = upstream.accept().await.unwrap();
+        // The renderer sets TCP_NODELAY on its own sockets (fleet/renderer/src/server.cpp).
+        server.set_nodelay(true).unwrap();
+        // A browser's receiver delays its ACKs (macOS by up to 100 ms or more). Loopback
+        // starts in quick-ACK mode, so it is turned off before every message, as the
+        // kernel turns it back on: then the client acknowledges a lone segment only when
+        // its delayed-ACK timer fires (40 ms here).
+        let quickack_off = |s: &tokio::net::TcpStream| {
+            use std::os::fd::AsRawFd;
+            let off: libc::c_int = 0;
+            // SAFETY: a valid socket fd and a c_int option value that outlives the call.
+            let rc = unsafe {
+                libc::setsockopt(
+                    s.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_QUICKACK,
+                    &off as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(rc, 0, "TCP_QUICKACK: {}", std::io::Error::last_os_error());
+        };
+        let mut took = Vec::with_capacity(ROUNDS);
+        let mut buf = vec![0u8; FIRST + SECOND];
+        for _ in 0..ROUNDS {
+            quickack_off(&client);
+            let started = std::time::Instant::now();
+            server.write_all(&[1u8; FIRST]).await.unwrap();
+            // A moment apart, as two TLS records are: the relay reads them separately.
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            server.write_all(&[2u8; SECOND]).await.unwrap();
+            client.read_exact(&mut buf).await.unwrap();
+            took.push(started.elapsed());
+            tokio::time::sleep(std::time::Duration::from_millis(33)).await;
+        }
+        stop_relays([relay]).await;
+        took.sort();
+        let median = took[ROUNDS / 2];
+        assert!(
+            median < std::time::Duration::from_millis(15),
+            "median {median:?} for a message in two parts through the relay; all: {took:?}"
+        );
+    }
 
     #[test]
     fn test_parse_proxy_addr_ip_port() {
