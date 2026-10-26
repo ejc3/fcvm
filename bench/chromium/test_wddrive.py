@@ -163,6 +163,36 @@ class NavigateReadiness(unittest.TestCase):
         ])
         self.assertTrue(self.navigated)
 
+    def test_a_poll_that_lands_on_the_unload_of_the_old_document_is_retried(self):
+        """The readiness poll races the unload of the document being navigated
+        away from: execute/sync answers "no such window: Callback was not
+        called before the unload event". That failed 27 of 880 WebKit corpus
+        requests (2026-10-26), one cdp request in 12.
+
+        RED BEFORE THE FIX: the poll raised WdError on the first such reply
+        and the request failed with two results unconsumed.
+        """
+        self.drive([
+            1,
+            wddrive.WdError("no such window: Callback was not called before "
+                            "the unload event."),
+            ["loading", True],
+            wddrive.WdError("no such window: Callback was not called before "
+                            "the unload event."),
+            ["complete", True],
+        ])
+        self.assertEqual(self.remaining, 0)
+
+    def test_a_poll_error_that_is_not_the_unload_still_propagates(self):
+        with self.assertRaises(wddrive.WdError):
+            self.drive([1, wddrive.WdError("unknown error: driver went away")])
+
+    def test_unloads_that_never_stop_end_at_the_deadline(self):
+        unload = wddrive.WdError(
+            "no such window: Callback was not called before the unload event.")
+        with self.assertRaises(TimeoutError):
+            self.drive([1] + [unload] * 200, timeout=0.2)
+
     def test_any_other_sentinel_failure_propagates(self):
         """Anything but the fresh-session case must NOT fall back silently.
 
