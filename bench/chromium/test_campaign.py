@@ -1188,6 +1188,48 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
         self.assertIsNotNone(run, "the campaign has no MEASURE=scale branch")
         self.assertIn("scale_make bench-chromium-scale", run.group(1))
 
+    def test_a_scale_url_override_replaces_the_corpus_for_the_measured_run(self):
+        """#1159: a throughput run with the replay out of the request path
+        measures one page the guest serves itself, in the same golden, verify
+        and DNS-evidence bracket. SCALE_URL_OVERRIDE changes the run's URL and
+        nothing else: the brackets and the diag still take the corpus.
+
+        RED BEFORE THE CHANGE: scale_make always passed SCALE_URL=$URLS, so
+        the override was ignored.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            script = ('set -euo pipefail\n'
+                      f'URLS="{self._urls()}"\nUFFD_MODE=minor\nUFFD_PREFETCH=on\n'
+                      'TAG=cb-req-corpus\nSCALE_DIR="$RESULTS/scale-attempt"\n'
+                      f'{self._helpers()}\nscale_make bench-chromium-scale\n')
+            page = "http://127.0.0.1:8000/medium.html"
+            run = self._run(script, dict(env, SCALE_URL_OVERRIDE=page))
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            seen = self._make_env(env)
+            self.assertEqual(seen.get("SCALE_URL"), page)
+            # The control still renders the corpus's first page through the replay.
+            self.assertEqual(seen.get("SCALE_CONTROL_URL"), self._urls().split(",")[0])
+            plain = self._run(script, env)
+            self.assertEqual(plain.returncode, 0, plain.stdout + plain.stderr)
+            self.assertEqual(self._make_env(env).get("SCALE_URL"), self._urls())
+
+    def test_the_replay_server_is_started_with_a_listen_log_and_the_caller_s_listener_options(self):
+        """#1159: the campaign keeps the replay's listener measurements beside
+        its other logs, and CORPUS_SERVE_ARGS reaches the server's command line
+        word-split, so --backlog N and --tls-handshake-in-handler are two words.
+
+        RED BEFORE THE CHANGE: the launch passed neither.
+        """
+        body = campaign()
+        start = body.index("sudo -b sh -c 'python3")
+        text = body[start:body.index("corpus_serve.log\" 2>&1", start)]
+        self.assertIn('--listen-log "$8" $7 &', text)
+        self.assertIn('"${CORPUS_SERVE_ARGS:-}"', text)
+        self.assertIn('"$RESULTS/corpus-listen.log"', text)
+        self.assertIn('"$RESULTS"/corpus-listen.log', body.split("release_diag_lock\n")[0],
+                      "an earlier attempt's listen log is not removed at the campaign's start")
+
     def test_measure_scale_runs_the_open_loop_benchmark_over_the_corpus(self):
         """MEASURE=scale replaces the serial run with bench-chromium-scale over
         the same corpus, in the campaign's memory-server mode, with the host

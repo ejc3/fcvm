@@ -162,7 +162,8 @@ acquire_diag_lock || exit 2
 # logs under logs/ are not the record and stay.
 rm -f "$RESULTS"/dns-evidence.json "$RESULTS"/verify-dns*.json "$RESULTS"/dns-owner.log \
     "$RESULTS"/replay-queries.log \
-    "$RESULTS"/corpus-dns.log "$RESULTS"/corpus-access.log "$RESULTS"/corpus-serve.status \
+    "$RESULTS"/corpus-dns.log "$RESULTS"/corpus-access.log "$RESULTS"/corpus-listen.log \
+    "$RESULTS"/corpus-serve.status \
     "$RESULTS"/reqbench.jsonl "$RESULTS"/analysis.json "$RESULTS"/diag/summary.json
 release_diag_lock
 
@@ -649,12 +650,13 @@ write_dns_evidence() {
     printf '%s\n' "$verdict"
 }
 
-# The scale run's sub-make, with the corpus, tag, memory-server mode, output
-# directory and control page this campaign decides. The schedule check in the
+# The scale run's sub-make, with the corpus (or SCALE_URL_OVERRIDE: one page
+# the guest serves itself, to take the replay out of the request path), tag,
+# memory-server mode, output directory and control page this campaign decides. The schedule check in the
 # preflight and the measured run both go through it, so the check validates
 # exactly what the run will be given.
 scale_make() {
-    SCALE_URL="$URLS" SCALE_TAG="$TAG" SCALE_OUT="$SCALE_DIR" \
+    SCALE_URL="${SCALE_URL_OVERRIDE:-$URLS}" SCALE_TAG="$TAG" SCALE_OUT="$SCALE_DIR" \
         SCALE_UFFD_MODE="$UFFD_MODE" SCALE_UFFD_PREFETCH="$UFFD_PREFETCH" \
         SCALE_CONTROL_URL="${SCALE_CONTROL_URL:-${URLS%%,*}}" \
         SCALE_CONTROL_RESOLVE_ALL_TO="${SCALE_CONTROL_RESOLVE_ALL_TO:-127.0.0.1}" \
@@ -828,9 +830,13 @@ SERVE_STATUS_FILE="$RESULTS/corpus-serve.status"
 rm -f "$SERVE_PIDFILE" "$SERVE_STATUS_FILE"
 # --dns-log / --access-log: the server's per-query DNS log and HTTP access
 # log, kept with the run; dns-evidence.json records their sha256.
-sudo -b sh -c 'python3 "$2" --root "$3" --port 80 --tls-port 443 --dns-addr 127.0.0.1 --dns-port 53 --answer-ip 10.0.2.2 --dns-log "$4" --access-log "$5" & pid=$!; echo "$pid" > "$1"; wait "$pid"; rc=$?; echo "$rc" > "$6.tmp" && mv "$6.tmp" "$6"' \
+# $7 is CORPUS_SERVE_ARGS, word-split on purpose: listener options for an
+# experiment (--backlog N, --tls-handshake-in-handler), none by default.
+# --listen-log is a measurement of the listeners, not evidence.
+sudo -b sh -c 'python3 "$2" --root "$3" --port 80 --tls-port 443 --dns-addr 127.0.0.1 --dns-port 53 --answer-ip 10.0.2.2 --dns-log "$4" --access-log "$5" --listen-log "$8" $7 & pid=$!; echo "$pid" > "$1"; wait "$pid"; rc=$?; echo "$rc" > "$6.tmp" && mv "$6.tmp" "$6"' \
     _ "$SERVE_PIDFILE" "$REPO/bench/chromium/corpus_serve.py" "$REPO/bench/chromium/corpus-live" \
-    "$RESULTS/corpus-dns.log" "$RESULTS/corpus-access.log" "$SERVE_STATUS_FILE" \
+    "$RESULTS/corpus-dns.log" "$RESULTS/corpus-access.log" "$SERVE_STATUS_FILE" "${CORPUS_SERVE_ARGS:-}" \
+    "$RESULTS/corpus-listen.log" \
     > "$LOGDIR/corpus_serve.log" 2>&1
 # `[ -s f ] && break` would be the last command in the body, so on the first
 # iteration (pidfile not written yet) it returns 1 and `set -e` kills the whole

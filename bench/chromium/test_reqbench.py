@@ -6602,6 +6602,15 @@ if os.environ.get("STUB_UNADDRESSED") == "1":
                 "path": raw, "status": 404, "bytes": 0, "duration_ms": 0.2}
         with open(os.environ["STUB_ACCESS_LOG"], "a") as log:
             log.write(json.dumps(line) + "\n")
+# STUB_CANCELED=1: the page cancelled a request before the browser gave it
+# network timing (ERR_ABORTED, no address, no timing). STUB_CANCELED=timed:
+# the same, but the request had already started connecting.
+if os.environ.get("STUB_CANCELED"):
+    rows.append({"request_id": "r8", "url": url + "frame.html", "remote_ip": "",
+                 "status": None, "failed": True, "canceled": True, "pending_at_load": False,
+                 "error_text": "net::ERR_ABORTED", "from_cache": False,
+                 "from_service_worker": False,
+                 "timing": ({"connect_start": 1.0} if os.environ["STUB_CANCELED"] == "timed" else None)})
 if os.environ.get("STUB_CACHED") == "1":
     rows.append({"request_id": "r6", "url": url + "logo.png", "remote_ip": "",
                  "status": 200, "failed": False, "pending_at_load": False,
@@ -6915,6 +6924,28 @@ exec __PYTHON__ "$@"
             result = self._diag(env)
             self.assertEqual(result.returncode, 0, result.stdout)
             self.assertIs(self._diag_summary(env)["passed"], True)
+
+    def test_a_request_the_page_cancelled_before_any_network_timing_is_not_an_escape(self):
+        """Chromium 156 renders www.elmundo.es with an iframe document request
+        that the page cancels 3 ms after it starts (net::ERR_ABORTED, no
+        address, timing null). It failed 3 of 5 corpus diags on 2026-10-26 as
+        'no_remote_ip' although it never left the browser.
+
+        RED BEFORE THE CHANGE: the untimed cancelled row failed the diag with
+        one no_remote_ip violation. A cancelled request that had started
+        connecting still fails it (the second half).
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", STUB_CANCELED="1")
+            result = self._diag(env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr[-2000:])
+            self.assertIs(self._diag_summary(env)["passed"], True)
+        with tempfile.TemporaryDirectory() as d:
+            env, _state_dir = self._diag_fixture(d, reps="1", STUB_CANCELED="timed")
+            result = self._diag(env)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            summary = self._diag_summary(env)
+            self.assertEqual({v["kind"] for v in summary["violations"]}, {"no_remote_ip"})
 
     def test_a_load_event_over_the_limit_is_a_stall_and_no_limit_is_no_gate(self):
         with tempfile.TemporaryDirectory() as d:
@@ -9741,6 +9772,81 @@ class NoHostIdentifiersInTree(unittest.TestCase):
         for field in self.FIELDS:
             self.assertNotIn(f'"{field}"', body)
         self.assertNotIn("platform.uname()", body, "uname() carries the node name")
+
+
+class CloneEndpointWait(unittest.TestCase):
+    """fcvm saves a clone's state, with its owner PID, before it configures the
+    network; the address lands about 15 ms later (measured on a restored clone:
+    loopback_ip, host_ip and guest_ip null at 297 ms, loopback_ip at 312 ms).
+    find_state returns on the first save, so asking for the endpoint at once
+    failed every request with "no usable host-side IP" (2026-10-26, WebKit
+    corpus run, all four arms).
+
+    Red against the previous harness: `AttributeError: module 'reqbench' has no
+    attribute 'wait_clone_endpoint'` (the callers called clone_cdp_endpoint on
+    the first state and raised RuntimeError).
+    """
+
+    EARLY = {"vm_id": "vm-x", "config": {"network": {
+        "loopback_ip": None, "host_ip": None, "guest_ip": None}}}
+
+    def _write(self, path, state):
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, path)
+
+    def test_a_state_saved_before_the_network_is_reread_until_it_has_an_address(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "vm-x.json")
+            self._write(path, self.EARLY)
+            watch = reqbench.DirWatch(d)
+            self.addCleanup(os.close, watch.fd)
+            later = {"vm_id": "vm-x", "config": {"network": {"loopback_ip": "127.0.0.7"}}}
+            timer = threading.Timer(0.15, self._write, (path, later))
+            timer.start()
+            self.addCleanup(timer.cancel)
+            t0 = time.monotonic()
+            state, endpoint = reqbench.wait_clone_endpoint(
+                path, self.EARLY, 9222, time.monotonic() + 5, watch, None)
+            self.assertEqual(endpoint, "127.0.0.7:9222")
+            self.assertEqual(state["config"]["network"]["loopback_ip"], "127.0.0.7")
+            self.assertLess(time.monotonic() - t0, 2.0)
+
+    def test_a_state_that_already_has_an_address_is_returned_without_waiting(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "vm-x.json")
+            state = {"config": {"network": {"loopback_ip": "127.0.0.9"}}}
+            self._write(path, state)
+            watch = reqbench.DirWatch(d)
+            self.addCleanup(os.close, watch.fd)
+            self.assertEqual(
+                reqbench.wait_clone_endpoint(path, state, 80, time.monotonic() + 5, watch, None),
+                (state, "127.0.0.9:80"))
+
+    def test_a_state_that_never_gets_an_address_times_out(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "vm-x.json")
+            self._write(path, self.EARLY)
+            watch = reqbench.DirWatch(d)
+            self.addCleanup(os.close, watch.fd)
+            with self.assertRaisesRegex(TimeoutError, "never named a host-side address"):
+                reqbench.wait_clone_endpoint(
+                    path, self.EARLY, 9222, time.monotonic() + 0.3, watch, None)
+
+    def test_a_clone_that_exits_first_ends_the_wait_at_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "vm-x.json")
+            self._write(path, self.EARLY)
+            watch = reqbench.DirWatch(d)
+            self.addCleanup(os.close, watch.fd)
+            proc = subprocess.Popen(["true"])
+            proc.wait()
+            t0 = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "exited with status 0 before publishing"):
+                reqbench.wait_clone_endpoint(
+                    path, self.EARLY, 9222, time.monotonic() + 30, watch, proc)
+            self.assertLess(time.monotonic() - t0, 2.0)
 
 
 if __name__ == "__main__":
