@@ -774,10 +774,15 @@ grep -Eq '^[[:space:]]*user_allow_other[[:space:]]*$' /etc/fuse.conf || echo use
 #    setup builds a kernel locally whenever a profile's release artifact is
 #    absent, and a fresh box hits that path. libseccomp-dev is the firecracker
 #    fork's: setup builds it from source and the link fails with
-#    "cannot find -lseccomp" without the headers.
+#    "cannot find -lseccomp" without the headers. debhelper, libdw-dev, rsync,
+#    kmod, cpio and patch are `make install-host-kernel`'s (bindeb-pkg); that
+#    target checks them, and 40 GiB free in its build directory, before it
+#    compiles anything (scripts/check-host-kernel-build.sh), and builds on
+#    /mnt/fcvm-btrfs when /tmp is on the root disk.
 sudo apt-get install -y build-essential git jq qemu-utils busybox-static \
     pkg-config libssl-dev clang make podman skopeo uidmap slirp4netns fuse3 passt \
-    btrfs-progs bc bison flex libelf-dev libseccomp-dev
+    btrfs-progs bc bison flex libelf-dev libseccomp-dev \
+    debhelper libdw-dev rsync kmod cpio patch
 
 # 3. Fast local storage. Instance-store NVMe is WIPED by a cloud stop/start —
 #    put /mnt/fcvm-btrfs on it (rebuildable cache), keep sources on the durable

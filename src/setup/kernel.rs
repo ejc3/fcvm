@@ -1303,6 +1303,25 @@ fn compute_host_kernel_sha(config: &HostKernelConfig, repo_root: &Path) -> Resul
     Ok(compute_sha256_short(&content))
 }
 
+/// Environment variable naming the host kernel build directory.
+/// `scripts/check-host-kernel-build.sh` (run by `make install-host-kernel`)
+/// picks it: a directory on the scratch disk when `/tmp` is on the root disk.
+const HOST_KERNEL_BUILD_DIR_ENV: &str = "FCVM_HOST_KERNEL_BUILD_DIR";
+
+/// Where the host kernel is built when nothing names a directory.
+const DEFAULT_HOST_KERNEL_BUILD_DIR: &str = "/tmp/kernel-build-host";
+
+fn host_kernel_build_dir_from(value: Option<std::ffi::OsString>) -> PathBuf {
+    match value {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(DEFAULT_HOST_KERNEL_BUILD_DIR),
+    }
+}
+
+fn host_kernel_build_dir() -> PathBuf {
+    host_kernel_build_dir_from(std::env::var_os(HOST_KERNEL_BUILD_DIR_ENV))
+}
+
 /// Build and install host kernel with fcvm patches.
 ///
 /// Uses the running kernel's config as base (includes EC2/AWS modules),
@@ -1379,7 +1398,9 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
 
     // Stays root by design: this interactive EC2 flow pairs the build with
     // dpkg -i and update-grub, which require root anyway.
-    let cmd = Command::new(&script_path);
+    let build_dir = host_kernel_build_dir();
+    let mut cmd = Command::new(&script_path);
+    cmd.env("BUILD_DIR", &build_dir);
     let status = run_streaming(cmd, "host_kernel_build")
         .await
         .context("running host kernel build script")?;
@@ -1397,7 +1418,6 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
     // Find the linux-image deb for THIS build (exclude dbg packages). The build
     // dir is shared across builds and may still hold debs from older SHAs, so
     // filter by the expected package name instead of taking any linux-image-*.deb.
-    let build_dir = Path::new("/tmp/kernel-build-host");
     let pattern = format!("{}/{}_*.deb", build_dir.display(), expected_pkg);
     let debs: Vec<_> = glob::glob(&pattern)
         .context("globbing for deb files")?
@@ -2959,6 +2979,25 @@ async fn update_grub_config(kernel_name: &str, boot_args: Option<&str>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `make install-host-kernel` points the build at the scratch disk through
+    /// FCVM_HOST_KERNEL_BUILD_DIR; the build script and the search for its debs
+    /// must use that one directory.
+    #[test]
+    fn the_host_kernel_build_dir_is_the_one_the_environment_names() {
+        assert_eq!(
+            host_kernel_build_dir_from(Some("/scratch/kernel-build-host".into())),
+            PathBuf::from("/scratch/kernel-build-host")
+        );
+        assert_eq!(
+            host_kernel_build_dir_from(None),
+            PathBuf::from("/tmp/kernel-build-host")
+        );
+        assert_eq!(
+            host_kernel_build_dir_from(Some("".into())),
+            PathBuf::from("/tmp/kernel-build-host")
+        );
+    }
 
     fn write_executable(path: &Path, contents: &str) {
         std::fs::write(path, contents).unwrap();
