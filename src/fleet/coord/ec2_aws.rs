@@ -617,7 +617,13 @@ impl AwsEc2 {
     /// Put `id` in the pool (tag, then stop) when there is room and its image is current;
     /// otherwise, or when it cannot be stopped, terminate it.
     async fn release_into_pool(&self, region: &str, id: &str) -> Result<()> {
-        let inst = self.one_instance(region, id).await?;
+        let inst = match self.one_instance(region, id).await {
+            Ok(i) => i,
+            Err(e) => {
+                self.claimed.lock().unwrap().remove(id);
+                return Err(e);
+            }
+        };
         let keep = {
             let _g = self.pool_lock.lock().await;
             let image = self.pool_image().await.ok();
@@ -632,10 +638,15 @@ impl AwsEc2 {
                 && image.is_some()
                 && inst.image == image
                 && inst.launched_at.is_some_and(|t| t >= oldest);
-            if keep {
-                self.tag(region, id, "FleetPool", &self.fleet).await?;
+            // An instance that could not be tagged into the pool is not pooled: it is
+            // terminated below, not left running with no owner.
+            keep && match self.tag(region, id, "FleetPool", &self.fleet).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(%region, instance = %id, error = %format!("{e:#}"), "tagging a tile into the pool failed; terminating it");
+                    false
+                }
             }
-            keep
         };
         let done = self.stop_or_terminate(region, id, inst, keep).await;
         // Held until the stop or terminate is sent, so a resume cannot claim it before.

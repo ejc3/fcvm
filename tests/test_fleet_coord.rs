@@ -4778,6 +4778,8 @@ struct PoolEc2 {
     listed_stopped: Vec<String>,
     /// TerminateInstances calls that fail before one succeeds.
     terminate_fails: u32,
+    /// CreateTags calls for FleetPool that fail before one succeeds.
+    pool_tag_fails: u32,
     actions: Vec<String>,
 }
 
@@ -4883,6 +4885,10 @@ async fn pool_ec2_api(api: Arc<std::sync::Mutex<PoolEc2>>) -> String {
                 "CreateTags" => {
                     let id = p["ResourceId.1"].clone();
                     let (k, v) = (p["Tag.1.Key"].clone(), p["Tag.1.Value"].clone());
+                    if k == "FleetPool" && a.pool_tag_fails > 0 {
+                        a.pool_tag_fails -= 1;
+                        return (StatusCode::SERVICE_UNAVAILABLE, "<Response><Errors><Error><Code>RequestLimitExceeded</Code><Message>slow down</Message></Error></Errors></Response>".into());
+                    }
                     a.instances.get_mut(&id).unwrap().1.insert(k, v);
                     ok("<CreateTagsResponse/>".into())
                 }
@@ -4966,6 +4972,20 @@ fn state_of(
     let a = api.lock().unwrap();
     let (st, tags, _, _) = &a.instances[id];
     (st.clone(), tags.clone())
+}
+
+/// A tile whose FleetPool tag fails while the fleet sleeps is terminated, not left running
+/// with no owner: nothing would stop it until the coordinator's next start sweeps.
+#[tokio::test]
+async fn a_tile_that_cannot_be_tagged_into_the_pool_is_terminated() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, api) = pool_driver(2).await;
+    let l = d.launch("ec2-1").await.unwrap();
+    api.lock().unwrap().pool_tag_fails = 1;
+    d.release(&l.instance).await.unwrap();
+    let (st, tags) = state_of(&api, &l.instance);
+    assert_eq!(st, "terminated", "tags {tags:?}");
+    assert!(api.lock().unwrap().uncancelled_terminates.is_empty());
 }
 
 /// A stale pooled instance (an older image) whose termination fails is tried again at the
