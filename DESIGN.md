@@ -2794,10 +2794,31 @@ second largest city in the"), as on x86. The slowest warm run was the first afte
 the snapshot. Warm restores (p50): snapshot load 3,441 ms, bring-up 842 ms,
 cuda-checkpoint's restore 750 ms, ACK 5,100 ms. Taking the snapshot took 46.7 s:
 park 1,201 ms, detach 9,806 ms, snapshot 33,231 ms, attach 720 ms, unpark 1,716 ms.
-The source answered the same afterwards, and again after the eight clones. Against
-x86 the detach is 17 times longer (9.8 s against 573 ms) and grows with the guest:
-6.65 s for a 4 GiB guest holding 1 GiB of device memory; this was not investigated.
-The snapshot step writes the 6 GiB memory file to the EBS-backed store.
+The source answered the same afterwards, and again after the eight clones. The
+snapshot step writes the 6 GiB memory file to the EBS-backed store.
+
+The detach was 17 times longer than on x86 (9.8 s against 573 ms) and grew with the
+guest (6.65 s for 4 GiB) because it unmapped guest memory from the IOMMU. Dropping
+the GPU's VFIO device took its group out of the container, and the kernel then
+unmapped and unpinned all of guest memory. The g5g.metal's SMMUv3 has no range
+invalidation (`features 0x00120d4f` at boot, bit 15 clear), so every 4 KiB page of
+that unmap is one IOTLB invalidation command. bpftrace on a 6 GiB guest's detach
+(9,883 ms): 9,495 ms in `vfio_unmap_unpin`, 9,176 ms of it in
+`__arm_smmu_tlb_inv_range`, over 24,738 command lists; the three device resets took
+576 ms. The arm64 gpu profile's Firecracker (#1317) now keeps a detached device's VFIO
+device open, reset and with MSI-X disabled, so the container keeps its mappings,
+and the attach after the snapshot reuses both instead of mapping guest memory again.
+Measured on 2026-10-26 on a g5g.metal, rootless, a VM running `sleep infinity` with
+one T4G, three warm snapshots per size, before and after:
+
+| guest | detach before | detach after | attach before | attach after |
+|---|---|---|---|---|
+| 4 GiB | 6,678-6,683 ms | 182-191 ms | 611-623 ms | 198-200 ms |
+| 6 GiB | 9,812-9,820 ms | 183-187 ms | 703-708 ms | 193-198 ms |
+
+With the CUDA probe below (6 GiB guest, 1 GiB of device memory) the warm snapshot
+took park 936 ms, detach 190 ms, snapshot 14,084 ms, attach 196 ms, unpark 2,004 ms;
+the source and a clone on the other T4G kept counting with no mismatched word.
 
 The device memory survives the move: a CUDA program that fills 1 GiB of device
 memory with a position-derived pattern, increments a device-side counter every

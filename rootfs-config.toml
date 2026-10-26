@@ -275,10 +275,14 @@ kernel_config = "kernel/gpu.conf"
 patches_dir = "kernel/patches-gpu"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-aarch64-6.1.config"
 # Device passthrough (PUT /device-passthrough and LoadSnapshot
-# device_passthrough) on the PCI transport.
+# device_passthrough) on the PCI transport. A detach keeps the VFIO device open,
+# so guest memory stays mapped for DMA until the device is attached again: on a
+# g5g.metal (SMMUv3 without range invalidation) unmapping it took 9.8 s of a
+# 6 GiB guest's detach (DESIGN.md "arm64: g5g.metal", #1317). amd64 stays on the
+# previous commit until the change is measured on a g4dn.metal.
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "agent/vfio-uffd-populate"
-firecracker_commit = "1433710c4f343d392380e1e4f6876e2ecf215926"
+firecracker_branch = "agent/vfio-keep-dma-on-detach"
+firecracker_commit = "99d02803727de7f69b7d53a7b147fb490a8ff5fa"
 firecracker_args = "--enable-pci"
 # On the PCI transport the guest's virtio-net NIC is a PCI device, which udev renames
 # to enp0s<slot>; fc-agent and fcvm configure "eth0" (IPv6, routes, the snapshot gate),
