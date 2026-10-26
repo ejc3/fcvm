@@ -2493,15 +2493,23 @@ async fn test_lifecycle_interleave_restore_removes_a_recreated_source_dir() -> R
             .output()
             .with_context(|| format!("running {} --version", firecracker.display()))?;
         let version = String::from_utf8_lossy(&version.stdout).to_string();
-        let numbers: Vec<u32> = version
+        let word = version
             .split_whitespace()
             .find_map(|word| word.strip_prefix('v'))
-            .with_context(|| format!("no version in {version:?}"))?
-            .split(['.', '-'])
-            .take(3)
+            .with_context(|| format!("no version in {version:?}"))?;
+        let (release, prerelease) = match word.split_once('-') {
+            Some((release, _)) => (release, true),
+            None => (word, false),
+        };
+        let numbers: Vec<u32> = release
+            .split('.')
             .map(|part| part.parse().context("parsing the Firecracker version"))
             .collect::<Result<_>>()?;
-        let overrides_vsock = numbers.as_slice() >= [1u32, 16, 0].as_slice();
+        // The rule restore applies (`FirecrackerVersion::at_least`): a pre-release of
+        // 1.16.0 can predate the override, so it counts as older.
+        let min = [1u32, 16, 0];
+        let overrides_vsock =
+            numbers.as_slice() > min.as_slice() || (numbers.as_slice() == min && !prerelease);
         anyhow::ensure!(
             baseline_dir.exists() != overrides_vsock,
             "Firecracker {} (vsock override: {overrides_vsock}): the source directory the \
