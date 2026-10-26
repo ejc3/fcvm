@@ -265,7 +265,7 @@ fn round_timings(value: &mut serde_json::Value) {
     }
 }
 
-fn elapsed_ms(since: std::time::Instant) -> f64 {
+pub(crate) fn elapsed_ms(since: std::time::Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
 }
 

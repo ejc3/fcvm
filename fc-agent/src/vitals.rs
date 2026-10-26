@@ -419,6 +419,20 @@ fn cpu_times(stat: &str) -> String {
         .join(" ")
 }
 
+/// Scheduling evidence for a failure line: threads in uninterruptible sleep and
+/// per-CPU ticks (steal included), which move when the host is not running the
+/// vCPUs, where the memory fields of `sample_line` do not.
+pub fn scheduling_line() -> String {
+    match read_proc("/proc/stat") {
+        Ok(stat) => format!(
+            "procs_blocked={} {}",
+            blocked_count(&stat).map_or_else(|| "?".to_string(), |count| count.to_string()),
+            cpu_times(&stat)
+        ),
+        Err(error) => format!("stat-unavailable({error})"),
+    }
+}
+
 /// Whether a failed read under /proc means the process or thread exited since
 /// it was listed, which is not a failed read. Any other failure is counted, so
 /// `unreadable=0` cannot stand over threads that were left out.
