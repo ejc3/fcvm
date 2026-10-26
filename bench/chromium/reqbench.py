@@ -1440,6 +1440,45 @@ def clone_cdp_endpoint(state: dict, port: int) -> str:
     raise RuntimeError(f"no usable host-side IP in network config: {sorted(net)}")
 
 
+def wait_clone_endpoint(state_path, state, port, deadline, watch, proc, log_path=""):
+    """(state, endpoint) once the clone's state names a host-side address.
+
+    fcvm saves the clone's state, with its owner PID, before it allocates the
+    loopback IP and configures the network (measured on a restored clone: the
+    first save at 297 ms has loopback_ip, host_ip and guest_ip all null, the
+    address follows 15 ms later). find_state returns on the first save, so a
+    caller that asked for the endpoint at once read the null state and every
+    request failed with "no usable host-side IP" (the 2026-10-26 WebKit run, 4 of
+    4 arms). Re-read the state when the directory changes until it has an
+    address, bounded by the caller's deadline and by the clone's own exit.
+    """
+    poller = select.poll()
+    poller.register(watch.fd, select.POLLIN)
+    while True:
+        try:
+            return state, clone_cdp_endpoint(state, port)
+        except RuntimeError:
+            pass
+        raise_if_harness_interrupted()
+        watch.drain()
+        try:
+            with open(state_path) as f:
+                state = json.load(f)
+        except (OSError, ValueError):
+            pass
+        else:
+            try:
+                return state, clone_cdp_endpoint(state, port)
+            except RuntimeError:
+                pass
+        if proc is not None and proc.poll() is not None:
+            raise exited_before(proc, "publishing its network configuration", log_path)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"state {state_path} never named a host-side address")
+        poller.poll(min(remaining, 0.1) * 1000)
+
+
 def clone_data_dir(data_root: str, state: dict) -> str:
     """Return the exact per-clone disk directory from a complete state record."""
     vm_id = state.get("vm_id")
@@ -3940,7 +3979,8 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
             data_dir = clone_data_dir(args.data_root, state)
             rec["vm_id"] = vm_id
 
-            endpoint = clone_cdp_endpoint(state, args.cdp_port)
+            state, endpoint = wait_clone_endpoint(
+                state_path, state, args.cdp_port, deadline, watch, proc, log)
             rec["endpoint"] = endpoint
             rec["state_to_port_ms"] = wait_port(endpoint, deadline, proc, log)
             rec["spawn_to_port_ms"] = (time.monotonic() - t_spawn) * 1000
@@ -4199,7 +4239,8 @@ def run_noop_request(args, rep: int, fast: bool = False) -> dict:
             rec["discover_ms"] = (time.monotonic() - t) * 1000
             rec["vm_id"] = state.get("vm_id", "")
             data_dir = clone_data_dir(args.data_root, state)
-            endpoint = clone_cdp_endpoint(state, args.cdp_port)
+            state, endpoint = wait_clone_endpoint(
+                state_path, state, args.cdp_port, deadline, watch, proc, log)
             rec["endpoint"] = endpoint
             rec["state_to_port_ms"] = wait_port(endpoint, deadline, proc, log)
             rec["spawn_to_port_ms"] = (time.monotonic() - t_spawn) * 1000

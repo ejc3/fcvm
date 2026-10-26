@@ -9743,6 +9743,81 @@ class NoHostIdentifiersInTree(unittest.TestCase):
         self.assertNotIn("platform.uname()", body, "uname() carries the node name")
 
 
+class CloneEndpointWait(unittest.TestCase):
+    """fcvm saves a clone's state, with its owner PID, before it configures the
+    network; the address lands about 15 ms later (measured on a restored clone:
+    loopback_ip, host_ip and guest_ip null at 297 ms, loopback_ip at 312 ms).
+    find_state returns on the first save, so asking for the endpoint at once
+    failed every request with "no usable host-side IP" (2026-10-26, WebKit
+    corpus run, all four arms).
+
+    Red against the previous harness: `AttributeError: module 'reqbench' has no
+    attribute 'wait_clone_endpoint'` (the callers called clone_cdp_endpoint on
+    the first state and raised RuntimeError).
+    """
+
+    EARLY = {"vm_id": "vm-x", "config": {"network": {
+        "loopback_ip": None, "host_ip": None, "guest_ip": None}}}
+
+    def _write(self, path, state):
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, path)
+
+    def test_a_state_saved_before_the_network_is_reread_until_it_has_an_address(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "vm-x.json")
+            self._write(path, self.EARLY)
+            watch = reqbench.DirWatch(d)
+            self.addCleanup(os.close, watch.fd)
+            later = {"vm_id": "vm-x", "config": {"network": {"loopback_ip": "127.0.0.7"}}}
+            timer = threading.Timer(0.15, self._write, (path, later))
+            timer.start()
+            self.addCleanup(timer.cancel)
+            t0 = time.monotonic()
+            state, endpoint = reqbench.wait_clone_endpoint(
+                path, self.EARLY, 9222, time.monotonic() + 5, watch, None)
+            self.assertEqual(endpoint, "127.0.0.7:9222")
+            self.assertEqual(state["config"]["network"]["loopback_ip"], "127.0.0.7")
+            self.assertLess(time.monotonic() - t0, 2.0)
+
+    def test_a_state_that_already_has_an_address_is_returned_without_waiting(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "vm-x.json")
+            state = {"config": {"network": {"loopback_ip": "127.0.0.9"}}}
+            self._write(path, state)
+            watch = reqbench.DirWatch(d)
+            self.addCleanup(os.close, watch.fd)
+            self.assertEqual(
+                reqbench.wait_clone_endpoint(path, state, 80, time.monotonic() + 5, watch, None),
+                (state, "127.0.0.9:80"))
+
+    def test_a_state_that_never_gets_an_address_times_out(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "vm-x.json")
+            self._write(path, self.EARLY)
+            watch = reqbench.DirWatch(d)
+            self.addCleanup(os.close, watch.fd)
+            with self.assertRaisesRegex(TimeoutError, "never named a host-side address"):
+                reqbench.wait_clone_endpoint(
+                    path, self.EARLY, 9222, time.monotonic() + 0.3, watch, None)
+
+    def test_a_clone_that_exits_first_ends_the_wait_at_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "vm-x.json")
+            self._write(path, self.EARLY)
+            watch = reqbench.DirWatch(d)
+            self.addCleanup(os.close, watch.fd)
+            proc = subprocess.Popen(["true"])
+            proc.wait()
+            t0 = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "exited with status 0 before publishing"):
+                reqbench.wait_clone_endpoint(
+                    path, self.EARLY, 9222, time.monotonic() + 30, watch, proc)
+            self.assertLess(time.monotonic() - t0, 2.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
