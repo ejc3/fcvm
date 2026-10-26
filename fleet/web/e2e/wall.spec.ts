@@ -580,6 +580,21 @@ test("a resize that moves tiles to q=lo reopens their streams at q=lo", async ({
   await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBeGreaterThanOrEqual(15);
 });
 
+test("a coordinator with no poster yet shows no broken image", async ({ page }) => {
+  // After a coordinator restart /poster.jpg answers 404 until a scene is captured.
+  await admin("/mock/fault", { renderers_silent: true, no_poster: true });
+  try {
+    await page.goto("/?debug=1");
+    await page.waitForFunction(() => window.__fleet !== undefined);
+    await expect.poll(() =>
+      page.evaluate(() => [...document.querySelectorAll("img")].filter((i) => i.complete && i.naturalWidth === 0 && i.getAttribute("src")).map((i) => `${i.className}|${i.getAttribute("src")}`)),
+    ).toEqual([]);
+    await expect(page.getByTestId("poster")).toHaveCount(0);
+  } finally {
+    await admin("/mock/fault", { renderers_silent: false, no_poster: false });
+  }
+});
+
 test("first load paints the coordinator's poster at once, before any stream arrives", async ({ page }) => {
   // No renderer answers: the poster is all there is to show.
   await admin("/mock/fault", { renderers_silent: true });
