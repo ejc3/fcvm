@@ -289,9 +289,13 @@ export const END_CARD_MS = 8000;
 /** One half's big clock, centred low in its half of the image. */
 export interface HalfClock {
   half: Half;
-  /** Its centre, in CSS pixels. */
+  /** Its centre, in CSS pixels, kept far enough from the image's edges that the whole card is on it. */
   x: number;
   y: number;
+  /** The big figure's font size, px: 9% of the image width within 56 to 160, smaller to fit a narrow half. */
+  size: number;
+  /** The card's width as drawn, px (estimated from the size: a running clock is six monospace characters). */
+  width: number;
   /** "0:04.9" while counting, "3.1 s" once the half is back. */
   value: string;
   state: "counting" | "done";
@@ -311,6 +315,14 @@ export interface RaceOnImage {
   /** For END_CARD_MS after both halves are back: "fcvm back in 3.1 s · EC2 back in 48 s · 15× faster". */
   end: string | null;
 }
+
+/** IBM Plex Mono's advance is 0.6 em; a running clock ("0:04.9") is six of them, and the card adds 56 px of padding. */
+const CLOCK_EM = 6 * 0.6;
+const CLOCK_PAD = 56;
+/** The narrowest the figure gets, px, however narrow its half: below this it is not read from across a room. */
+const CLOCK_MIN_PX = 24;
+/** The steps line ("instance → OS → driver → app") at 15 px is about this wide. */
+const STEPS_W = 260;
 
 /** Where an EC2 tile is in its restart: the four steps a viewer reads. */
 const EC2_STEPS = ["instance", "OS", "driver", "app"] as const;
@@ -377,10 +389,17 @@ export function raceOnImage(st: FleetState, now: number, image: { x: number; y: 
       const at = dark.length === 0 ? EC2_STEPS.length - 1 : Math.min(...dark.map((t) => EC2_STEP_OF[t.phase] ?? 0));
       steps = EC2_STEPS.map((label, i) => ({ label, state: i < at ? "done" : i === at ? "now" : "todo" }));
     }
+    // The design's clamp(56px, 9vw, 160px), and no wider than its own half.
+    const size = Math.max(CLOCK_MIN_PX, Math.min(Math.min(160, Math.max(56, image.w * 0.09)), (w - CLOCK_PAD) / CLOCK_EM));
+    const width = Math.max(size * CLOCK_EM + CLOCK_PAD, steps.length > 0 ? STEPS_W : 0);
+    // A half narrower than the card: the card moves in from the image's edge rather than off it.
+    const x = Math.min(Math.max(x0 + w / 2, image.x + width / 2), image.x + image.w - width / 2);
     clocks.push({
       half: h,
-      x: x0 + w / 2,
+      x,
       y: image.y + image.h * 0.62,
+      size,
+      width,
       value: measured !== null ? fmt.seconds(measured) : fmt.raceClock(counted),
       state: done ? "done" : "counting",
       sub,

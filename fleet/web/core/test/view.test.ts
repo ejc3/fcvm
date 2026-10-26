@@ -249,6 +249,28 @@ describe("failure states", () => {
     expect(view(stateWith(behind), start + 5000).race!.clocks[1]).toMatchObject({ value: "0:01.0", sub: "0 of 4 GPUs back" });
   });
 
+  it("sizes each half's clock to its own half and keeps the whole card on the image", () => {
+    const start = EPOCH + 10_000;
+    const area = { mosaicArea: { x: 0, y: 0, w: 1600, h: 900 } };
+    // Even halves on a 1600 px image: 9% of the width, 144 px, centred in each half.
+    const even = view(stateWith(fleet(2, 2, { relaunch_all: race(start) })), start + 2000, area).race!.clocks;
+    expect(even.map((c) => Math.round(c.size))).toEqual([144, 144]);
+    expect(even[0]!.x).toBeCloseTo(400, 0);
+    // One fcvm GPU against fifteen EC2: the fcvm half is 100 px. Its figure shrinks to the
+    // floor and its card moves in from the left edge instead of hanging off it.
+    const st = fleetSplit(1, 15, 1);
+    st.relaunch_all = race(start, { fcvm_gpus: 1, fcvm_pending: 1, ec2_gpus: 15, ec2_pending: 15 });
+    const v = view(stateWith(st), start + 2000, area);
+    const L = v.layout!;
+    const f = v.race!.clocks.find((c) => c.half === "fcvm")!;
+    expect(L.halfLineX! - L.image.x).toBeCloseTo(100, 0);
+    expect(f.size).toBeLessThan(56);
+    for (const c of v.race!.clocks) {
+      expect(c.x - c.width / 2, c.half).toBeGreaterThanOrEqual(L.image.x);
+      expect(c.x + c.width / 2, c.half).toBeLessThanOrEqual(L.image.x + L.image.w);
+    }
+  });
+
   it("ends a race with one card in the coordinator's numbers, then hands over to the strip's line", () => {
     const start = EPOCH + 10_000;
     const st = fleet(2, 2, { relaunch_all: race(start, { fcvm_done_at: start + 3100, ec2_done_at: start + 49_000, fcvm_pending: 0, ec2_pending: 0, ec2_capacity_wait_ms: 4000 }), scoreboard: SCORES });
