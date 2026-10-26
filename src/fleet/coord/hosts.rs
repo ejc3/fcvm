@@ -407,14 +407,13 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                 busy = true;
             }
         }
-        if state == "waking" || watch.iter().any(|w| w.coming_up) {
-            handle
-                .send(Event::ScaleInstances {
-                    at: 0,
-                    instances: report,
-                })
-                .await;
-        }
+        // The core decides whether these observations belong to an open wake.
+        handle
+            .send(Event::ScaleInstances {
+                at: 0,
+                instances: report,
+            })
+            .await;
         if !errors.is_empty() {
             reported = true;
             degraded(&handle, &errors.join("; ")).await;

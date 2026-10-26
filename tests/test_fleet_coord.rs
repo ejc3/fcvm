@@ -2576,6 +2576,57 @@ fn launches(fake: &fcvm::fleet::coord::hosts::FakeHosts) -> Vec<String> {
         .collect()
 }
 
+/// The EC2 half can make the fleet awake before the GPU host finishes booting. The
+/// snapshot must still publish that host's final running observation.
+#[tokio::test]
+async fn a_host_that_runs_after_the_fleet_is_awake_publishes_its_booted_phase() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let now = now_ms();
+    let mut state = State::new(
+        Config {
+            power_managed: true,
+            ..Config::default()
+        },
+        now,
+    );
+    state.fleet.power.state = "awake".into();
+    state.fleet.power.woke_at = Some(now);
+    let fake = Arc::new(FakeHosts::default());
+    let (handle, _actor) = start(
+        state,
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    let mut viewer = page_viewer(&handle).await;
+    let pending = viewer
+        .until(|s| {
+            s["fleet"]["power"]["hosts"]
+                .as_array()
+                .is_some_and(|h| !h.is_empty())
+        })
+        .await;
+    assert_eq!(pending["fleet"]["power"]["state"], "awake");
+    assert_eq!(
+        pending["fleet"]["power"]["hosts"][0]["phases"][0]["phase"],
+        "instance_pending"
+    );
+    fake.set_state("us-east-1", "pending", "running");
+    let booted = tokio::time::timeout(
+        Duration::from_secs(2),
+        viewer.until(|s| {
+            s["fleet"]["power"]["hosts"][0]["phases"]
+                .as_array()
+                .is_some_and(|p| p.iter().any(|p| p["phase"] == "booted"))
+        }),
+    )
+    .await
+    .expect("a running host's booted phase is published after the fleet is awake");
+    assert_eq!(booted["fleet"]["power"]["state"], "awake");
+}
+
 /// The coordinator launches the GPU hosts itself, spot first: awake at start it launches
 /// the awake capacity, with no active viewer it terminates every host, and a viewer's
 /// visible page launches them again. While it wakes, the hosts show in the snapshot.
