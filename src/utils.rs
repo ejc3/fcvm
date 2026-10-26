@@ -104,6 +104,28 @@ impl DirEventSource for Option<DirWatch> {
     }
 }
 
+/// The host clock as time since the Unix epoch.
+pub fn host_clock_now() -> Duration {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+}
+
+/// The keys a guest's boot plan or restore document carries the host clock in.
+///
+/// "host-time-ns" holds nanoseconds since the epoch, which fc-agent steps to.
+/// "host-time" holds the same instant in whole seconds, the only clock key an
+/// fc-agent frozen in a snapshot taken before "host-time-ns" existed reads; it
+/// refuses a document without it, so a restore of such a snapshot needs it. Whole
+/// seconds left a guest behind the host by the fraction of the second at which the
+/// host read its clock, half a second on average (issue 1194).
+pub fn host_clock_fields(since_epoch: Duration) -> Vec<(&'static str, String)> {
+    vec![
+        ("host-time", since_epoch.as_secs().to_string()),
+        ("host-time-ns", since_epoch.as_nanos().to_string()),
+    ]
+}
+
 /// Check if a process is alive by checking /proc/{pid} existence.
 ///
 /// This is more reliable than sending signal 0 because it doesn't require

@@ -3615,9 +3615,11 @@ pub async fn restore_from_snapshot(
         // after VM resume — Firecracker accepts PUT /mmds while paused but the
         // guest-visible MMDS data isn't updated until after resume.
         let mut mmds_latest = serde_json::json!({
-            "host-time": chrono::Utc::now().timestamp().to_string(),
             "restore-epoch": restore_epoch
         });
+        for (key, value) in crate::utils::host_clock_fields(crate::utils::host_clock_now()) {
+            mmds_latest[key] = serde_json::Value::String(value);
+        }
         if let Some(ref ipv6) = clone_ipv6 {
             mmds_latest["clone-ipv6"] = serde_json::Value::String(ipv6.clone());
         }

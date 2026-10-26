@@ -6,7 +6,7 @@
 //! line: `fcvm_bootplan=vsock` selects vsock, otherwise MMDS (the Firecracker default).
 //!
 //! Wire format (vsock): the host serves the same `latest` object MMDS would expose —
-//! `{ "container-plan": { ...Plan... }, "host-time": "<epoch>" }` — on
+//! `{ "container-plan": { ...Plan... }, "host-time-ns": "<epoch ns>" }` — on
 //! [`BOOTPLAN_VSOCK_PORT`]. The guest connects to the host (CID 2), reads the JSON to
 //! EOF, and extracts the plan and metadata. Snapshot restore always exposes the
 //! restore epoch on this vsock port, including for Firecracker: a snapshot is
@@ -104,13 +104,13 @@ pub async fn sync_clock_from_host(transport: Transport) -> Result<()> {
             let doc = read_vsock_doc().await?;
             let meta: LatestMetadata =
                 serde_json::from_value(doc).context("parsing host-time from vsock boot plan")?;
-            set_system_clock(&meta.host_time, std::time::Duration::ZERO);
+            set_system_clock(&meta.host_time_ns, std::time::Duration::ZERO);
             Ok(())
         }
     }
 }
 
-/// Set the system clock to `host_time` (UTC epoch seconds). Shared by both transports.
+/// Set the system clock to the host's clock. Shared by both transports.
 ///
 /// Steps the clock with `clock_settime(2)` directly: fc-agent holds
 /// CAP_SYS_TIME, and this runs on the restore critical path where a process
@@ -121,11 +121,15 @@ pub async fn sync_clock_from_host(transport: Transport) -> Result<()> {
 /// `since_read` is how long ago the host's value was read: a caller that steps
 /// the clock some time after it fetched the value passes that time, so the
 /// clock lands on the host's present rather than on the moment of the read.
+///
+/// `host_time` is the document's "host-time-ns", nanoseconds since the epoch.
+/// The document also carries "host-time", whole seconds, which only an agent
+/// frozen in a snapshot taken before "host-time-ns" existed reads.
 pub(crate) fn set_system_clock(host_time: &str, since_read: std::time::Duration) {
-    eprintln!("[fc-agent] received host time: {host_time} (read {since_read:?} ago)");
-    match parse_epoch_seconds(host_time) {
-        Ok(seconds) => {
-            let spec = clock_target(seconds, since_read);
+    eprintln!("[fc-agent] received host time: {host_time} ns (read {since_read:?} ago)");
+    match parse_epoch_nanos(host_time) {
+        Ok(instant) => {
+            let spec = clock_target(instant, since_read);
             // SAFETY: `spec` is fully initialized and outlives the call.
             let rc = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &spec) };
             if rc != 0 {
@@ -145,27 +149,22 @@ pub(crate) fn set_system_clock(host_time: &str, since_read: std::time::Duration)
     }
 }
 
-/// Parse the host's clock value: non-negative decimal epoch seconds.
-///
-/// Returns i64 rather than `libc::time_t`, which is deprecated because musl
-/// widened it; the cast at the one call site adapts to whatever the target's
-/// `timespec` field actually is.
-/// The time to set: the host's epoch seconds plus the time since they were read.
-fn clock_target(seconds: i64, since_read: std::time::Duration) -> libc::timespec {
-    let total = std::time::Duration::from_secs(seconds as u64) + since_read;
+/// The time to set: the host's instant plus the time since it was read.
+fn clock_target(instant: std::time::Duration, since_read: std::time::Duration) -> libc::timespec {
+    let total = instant + since_read;
     libc::timespec {
         tv_sec: total.as_secs() as _,
         tv_nsec: total.subsec_nanos() as _,
     }
 }
 
-fn parse_epoch_seconds(host_time: &str) -> Result<i64> {
-    let seconds: i64 = host_time
+/// Parse the host's clock value: decimal nanoseconds since the epoch.
+fn parse_epoch_nanos(host_time: &str) -> Result<std::time::Duration> {
+    let nanos: u64 = host_time
         .trim()
         .parse()
-        .with_context(|| format!("host time {host_time:?} is not decimal epoch seconds"))?;
-    anyhow::ensure!(seconds >= 0, "host time {host_time:?} is before the epoch");
-    Ok(seconds)
+        .with_context(|| format!("host time {host_time:?} is not decimal epoch nanoseconds"))?;
+    Ok(std::time::Duration::from_nanos(nanos))
 }
 
 #[cfg(test)]
@@ -174,21 +173,48 @@ mod clock_tests {
 
     #[test]
     fn the_clock_target_adds_the_time_since_the_host_value_was_read() {
-        let spec = clock_target(1_700_000_000, std::time::Duration::from_millis(31_250));
+        let host = std::time::Duration::from_secs(1_700_000_000);
+        let spec = clock_target(host, std::time::Duration::from_millis(31_250));
         assert_eq!(spec.tv_sec as i64, 1_700_000_031);
         assert_eq!(spec.tv_nsec as i64, 250_000_000);
-        let spec = clock_target(1_700_000_000, std::time::Duration::ZERO);
+        let spec = clock_target(host, std::time::Duration::ZERO);
         assert_eq!(
             (spec.tv_sec as i64, spec.tv_nsec as i64),
             (1_700_000_000, 0)
         );
     }
 
+    /// The host stamps its clock to the nanosecond in "host-time-ns", and the
+    /// guest steps to that instant. Whole seconds left a restored guest behind
+    /// the host by the fraction of the second at which the host read its clock:
+    /// up to a second, half a second on average (issue 1194).
+    ///
+    /// RED BEFORE THE FIX: the guest stepped to the whole second, 750 ms
+    /// behind here.
     #[test]
-    fn epoch_seconds_parse_rejects_garbage_and_pre_epoch_values() {
-        assert_eq!(parse_epoch_seconds("1786000000\n").unwrap(), 1786000000);
-        assert!(parse_epoch_seconds("-1").is_err(), "before the epoch");
-        assert!(parse_epoch_seconds("").is_err(), "empty");
-        assert!(parse_epoch_seconds("1786000000.5").is_err(), "fractional");
+    fn the_clock_lands_on_the_hosts_instant_to_the_nanosecond() {
+        let meta: crate::types::LatestMetadata = serde_json::from_str(
+            r#"{"host-time": "1700000000", "host-time-ns": "1700000000750000123"}"#,
+        )
+        .unwrap();
+        let spec = clock_target(
+            parse_epoch_nanos(&meta.host_time_ns).unwrap(),
+            std::time::Duration::from_millis(20),
+        );
+        assert_eq!(
+            (spec.tv_sec as i64, spec.tv_nsec as i64),
+            (1_700_000_000, 770_000_123)
+        );
+    }
+
+    #[test]
+    fn epoch_nanos_parse_rejects_garbage_and_pre_epoch_values() {
+        assert_eq!(
+            parse_epoch_nanos("1786000000250000000\n").unwrap(),
+            std::time::Duration::new(1_786_000_000, 250_000_000)
+        );
+        assert!(parse_epoch_nanos("-1").is_err(), "before the epoch");
+        assert!(parse_epoch_nanos("").is_err(), "empty");
+        assert!(parse_epoch_nanos("1786000000.5").is_err(), "fractional");
     }
 }
