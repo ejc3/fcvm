@@ -320,6 +320,14 @@ trait PacketReceiveBarrier {
 
 trait CommandRunner {
     async fn output(&self, program: &str, args: &[&str]) -> io::Result<std::process::Output>;
+
+    /// `output` with `input` written to the command's standard input.
+    async fn output_with_input(
+        &self,
+        program: &str,
+        args: &[&str],
+        input: &str,
+    ) -> io::Result<std::process::Output>;
 }
 
 struct SystemCommandRunner;
@@ -327,6 +335,49 @@ struct SystemCommandRunner;
 impl CommandRunner for SystemCommandRunner {
     async fn output(&self, program: &str, args: &[&str]) -> io::Result<std::process::Output> {
         Command::new(program).args(args).output().await
+    }
+
+    async fn output_with_input(
+        &self,
+        program: &str,
+        args: &[&str],
+        input: &str,
+    ) -> io::Result<std::process::Output> {
+        use tokio::io::AsyncWriteExt;
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        // Written while the child runs and is waited on: a child that exits before
+        // reading it all closes the pipe, and its status and stderr say why, so a
+        // broken pipe here is not the error to report. Sequential writing would also
+        // block on an input larger than the pipe buffer while the child's own output
+        // filled its pipes.
+        let write = async move { stdin.write_all(input.as_bytes()).await };
+        let (written, output) = tokio::join!(write, child.wait_with_output());
+        match (written, output) {
+            (Ok(()), Ok(output)) => Ok(output),
+            // The child closed its input early: its status says why, unless it
+            // claims success, which a command that did not read its input cannot.
+            (Err(error), Ok(output)) if error.kind() == io::ErrorKind::BrokenPipe => {
+                if output.status.success() {
+                    Err(io::Error::other(format!(
+                        "{program} exited 0 without reading all of its input"
+                    )))
+                } else {
+                    Ok(output)
+                }
+            }
+            (Err(error), Ok(_)) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(write), Err(wait)) => Err(io::Error::new(
+                wait.kind(),
+                format!("{wait}; writing its input also failed: {write}"),
+            )),
+        }
     }
 }
 
@@ -506,6 +557,27 @@ fn family_of(program: &str) -> Family {
     }
 }
 
+/// Fail unless `output` is a success. A failure quotes the command's input, when it
+/// had one, on one line: iptables-restore names the failing line by its number in
+/// it, and the restore path prints this error to the console line by line.
+fn checked(
+    program: &str,
+    args: &[&str],
+    output: &std::process::Output,
+    input: Option<&str>,
+) -> Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let given = input.map_or_else(String::new, |input| {
+        format!(", given {:?}", input.trim_end())
+    });
+    bail!(
+        "snapshot network gate command failed: {}{given}",
+        command_failure(program, args, output)
+    )
+}
+
 fn command_failure(program: &str, args: &[&str], output: &std::process::Output) -> String {
     format!(
         "{} {} exited {} (stdout={:?}, stderr={:?})",
@@ -526,7 +598,7 @@ const IPV6_LOOPBACK: &str = "::1/128";
 
 /// The exact rule bodies a gate chain carries, without the `-A <chain>`
 /// prefix. Shared by installation and verification so the two can never
-/// drift: what close() appends is literally what is_closed() expects.
+/// drift: what close() writes is literally what is_closed() expects.
 ///
 /// Loopback passes in both chains: the direction's own end (`loopback_flag`:
 /// `-s` for INPUT, `-d` for OUTPUT) is the guest talking to itself. INPUT also
@@ -549,9 +621,9 @@ const IPV6_LOOPBACK: &str = "::1/128";
 /// jump the clock while every daemon whose session ran out in the jump is
 /// refused a connection: the window the restore keeps its own clock step out
 /// of. The rule has to be in the snapshot, not added by the restore, so that no
-/// poll can leave between the resume and the restore's first step while the
-/// inherited gate verifies. (A reinstall over a gate that fails verification
-/// flushes each chain before refilling it, a window issue 1244 tracks.) A REJECT
+/// poll can leave between the resume and the restore's first step, and a
+/// reinstall over a gate that fails verification replaces each family's chains
+/// in one transaction (`configure_gate_chains`), so they never empty. A REJECT
 /// in OUTPUT fails the send itself (`sendto` returns EPERM), so on the source
 /// VM a poll whose timer fires during the cookie dump fails and chronyd logs
 /// "Could not send". Both the source and a clone ask chronyd for a burst once
@@ -610,6 +682,23 @@ pub async fn chrony_burst() {
         .args(["burst", "4/4"])
         .output()
         .await;
+}
+
+/// The `iptables-restore --noflush` input that sets one family's two gate chains to
+/// `gate_chain_rules`, INPUT's chain with the `-s` loopback exemption and OUTPUT's with
+/// `-d`, in one commit.
+fn gate_restore_input(loopback_network: &str) -> String {
+    let mut input = String::from("*filter\n");
+    for chain in [GATE_INPUT_CHAIN, GATE_OUTPUT_CHAIN] {
+        input.push_str(&format!(":{chain} - [0:0]\n"));
+    }
+    for (chain, flag) in [(GATE_INPUT_CHAIN, "-s"), (GATE_OUTPUT_CHAIN, "-d")] {
+        for rule in gate_chain_rules(flag, loopback_network) {
+            input.push_str(&format!("-A {chain} {}\n", rule.join(" ")));
+        }
+    }
+    input.push_str("COMMIT\n");
+    input
 }
 
 /// The ICMP reply a UDP REJECT sends, by the family of `loopback_network`.
@@ -785,20 +874,8 @@ impl<R: CommandRunner, N: NetfilterOpener> IptablesGate<R, N> {
             .runner
             .output(program, args)
             .await
-            .with_context(|| format!("spawning {program}"))?;
-        if !output.status.success() {
-            bail!(
-                "snapshot network gate command failed: {}",
-                command_failure(program, args, &output)
-            );
-        }
-        Ok(())
-    }
-
-    async fn chain_exists(&self, program: &str, chain: &str) -> Result<bool> {
-        let args = ["-w", "-L", chain];
-        let output = self.runner.output(program, &args).await?;
-        Ok(output.status.success())
+            .with_context(|| format!("running {program}"))?;
+        checked(program, args, &output, None)
     }
 
     async fn read_family_state(&self, program: &str) -> Result<FamilyGateState> {
@@ -837,23 +914,30 @@ impl<R: CommandRunner, N: NetfilterOpener> IptablesGate<R, N> {
         Ok(closed)
     }
 
-    async fn configure_gate_chain(
-        &self,
-        program: &str,
-        chain: &str,
-        loopback_flag: &str,
-        loopback_network: &str,
-    ) -> Result<()> {
-        if !self.chain_exists(program, chain).await? {
-            self.required(program, &["-w", "-N", chain]).await?;
-        }
-        self.required(program, &["-w", "-F", chain]).await?;
-        for rule in gate_chain_rules(loopback_flag, loopback_network) {
-            let mut args: Vec<&str> = vec!["-w", "-A", chain];
-            args.extend(rule.iter().map(String::as_str));
-            self.required(program, &args).await?;
-        }
-        Ok(())
+    /// Write both gate chains of one family in a single `iptables-restore --noflush`
+    /// transaction. Declaring a chain there creates it, or replaces every rule of an
+    /// existing one, and the table is committed in one step: a chain the hooks already
+    /// jump to (a restored clone reasserting the gate it inherited) goes straight from
+    /// its old rules to the gate's, never empty, and a commit that fails leaves the old
+    /// rules in place. Measured on iptables 1.8.10, legacy and nf_tables alike.
+    async fn configure_gate_chains(&self, program: &str, loopback_network: &str) -> Result<()> {
+        let restore = format!("{program}-restore");
+        self.required_with_input(
+            &restore,
+            &["-w", "--noflush"],
+            &gate_restore_input(loopback_network),
+        )
+        .await
+    }
+
+    /// `required` for a command that reads `input` on stdin.
+    async fn required_with_input(&self, program: &str, args: &[&str], input: &str) -> Result<()> {
+        let output = self
+            .runner
+            .output_with_input(program, args, input)
+            .await
+            .with_context(|| format!("running {program}"))?;
+        checked(program, args, &output, Some(input))
     }
 
     async fn install_hook(&self, program: &str, hook: &str, chain: &str) -> Result<()> {
@@ -875,9 +959,7 @@ impl<R: CommandRunner, N: NetfilterOpener> IptablesGate<R, N> {
         // guest, and allowing its source subnet allowed every outbound packet.
         // Direction-specific chains preserve loopback only; gateway/NFS
         // sockets are restored explicitly after the clone gate opens.
-        self.configure_gate_chain(program, GATE_INPUT_CHAIN, "-s", loopback_network)
-            .await?;
-        self.configure_gate_chain(program, GATE_OUTPUT_CHAIN, "-d", loopback_network)
+        self.configure_gate_chains(program, loopback_network)
             .await?;
         self.install_hook(program, "INPUT", GATE_INPUT_CHAIN)
             .await?;
@@ -1636,7 +1718,7 @@ async fn restore_boundary_with<
     // Verifying the chains is sound because a restored image was captured
     // behind them and reinstalling identical rules changes nothing: the check
     // reads what `close()` would have written and skips the write when they
-    // match. That is where the cost was, roughly 25 process spawns.
+    // match: one iptables-restore and four hook commands per family.
     //
     // The link and the barrier are not verified, because reading them proves
     // less than asserting them. A `--privileged` workload resumes in this
@@ -2699,6 +2781,37 @@ mod tests {
                 stderr: Vec::new(),
             })
         }
+
+        async fn output_with_input(
+            &self,
+            program: &str,
+            args: &[&str],
+            input: &str,
+        ) -> io::Result<std::process::Output> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{program} {}\n{input}", args.join(" ")));
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    /// The `iptables-restore` input `program`'s family was given, from recorded calls.
+    fn restored(calls: &str, program: &str) -> String {
+        let head = format!("{program}-restore -w --noflush\n");
+        let start = calls
+            .find(&head)
+            .unwrap_or_else(|| panic!("no {program}-restore transaction:\n{calls}"))
+            + head.len();
+        let end = start
+            + calls[start..]
+                .find("COMMIT\n")
+                .expect("the transaction commits");
+        calls[start..end].to_string()
     }
 
     /// A restored clone is behind by the snapshot's age and chronyd steps at any
@@ -2718,10 +2831,10 @@ mod tests {
             ("iptables", "127.0.0.0/8", "icmp-port-unreachable"),
             ("ip6tables", "::1/128", "icmp6-port-unreachable"),
         ] {
-            let prefix = format!("{program} -w -A FCVM_SNAPSHOT_OUT ");
-            let appended: Vec<&str> = calls
+            let input = restored(&calls, program);
+            let appended: Vec<&str> = input
                 .lines()
-                .filter_map(|call| call.strip_prefix(prefix.as_str()))
+                .filter_map(|line| line.strip_prefix("-A FCVM_SNAPSHOT_OUT "))
                 .collect();
             let ntp = format!("-p udp -m udp --dport 123 -j REJECT --reject-with {unreachable}");
             let local = format!("-p tcp -d {loopback} -j RETURN");
@@ -2765,6 +2878,226 @@ mod tests {
         assert!(reopened < burst, "reopened={reopened} burst={burst}");
     }
 
+    /// A restored clone whose inherited gate fails verification reinstalls it over
+    /// chains its hooks already jump to. Reinstalled with a flush and then one append
+    /// per rule, a chain held nothing, and so admitted every packet, until the last
+    /// append (issue 1244). The reinstall is now one transaction per family, with
+    /// every chain declared and every rule in it, so the chains change in one commit.
+    #[tokio::test]
+    async fn reasserting_the_gate_rewrites_each_family_in_one_transaction() {
+        let runner = RecordingRunner::default();
+        let calls = runner.0.clone();
+        IptablesGate::new(runner).close().await.unwrap();
+        let calls = calls.lock().unwrap().clone();
+        for (program, loopback) in [("iptables", IPV4_LOOPBACK), ("ip6tables", IPV6_LOOPBACK)] {
+            // Outside the transaction a plain command may name a gate chain only as a
+            // hook's target, in INPUT or OUTPUT.
+            let outside: Vec<&String> = calls
+                .iter()
+                .filter(|call| {
+                    call.starts_with(&format!("{program} ")) && call.contains("FCVM_SNAPSHOT_")
+                })
+                .filter(|call| {
+                    let args: Vec<&str> = call.split_whitespace().skip(1).collect();
+                    !matches!(
+                        args.as_slice(),
+                        ["-w", "-I", "INPUT", "1", "-j", "FCVM_SNAPSHOT_IN"]
+                            | ["-w", "-I", "OUTPUT", "1", "-j", "FCVM_SNAPSHOT_OUT"]
+                            | ["-w", "-C", "INPUT", "-j", "FCVM_SNAPSHOT_IN"]
+                            | ["-w", "-C", "OUTPUT", "-j", "FCVM_SNAPSHOT_OUT"]
+                    )
+                })
+                .collect();
+            assert!(
+                outside.is_empty(),
+                "{program} changes a gate chain outside its transaction: {outside:#?}"
+            );
+            // Nor may a plain command flush or delete chains wholesale, which names
+            // no chain at all.
+            assert!(
+                !calls.iter().any(|call| {
+                    let args: Vec<&str> = call.split_whitespace().collect();
+                    args.first() == Some(&program)
+                        && matches!(args.as_slice(), [_, "-w", "-F" | "-X"])
+                }),
+                "{program} flushes every chain: {calls:#?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .filter(|call| call.starts_with(&format!("{program}-restore ")))
+                    .all(|call| call.starts_with(&format!("{program}-restore -w --noflush\n"))),
+                "a {program}-restore without --noflush replaces the whole table: {calls:#?}"
+            );
+            let transactions: Vec<&String> = calls
+                .iter()
+                .filter(|call| call.starts_with(&format!("{program}-restore -w --noflush\n")))
+                .collect();
+            assert_eq!(transactions.len(), 1, "{program}:\n{calls:#?}");
+            assert_eq!(
+                transactions[0].split_once('\n').unwrap().1,
+                gate_restore_input(loopback),
+                "{program}'s transaction"
+            );
+        }
+        for loopback in [IPV4_LOOPBACK, IPV6_LOOPBACK] {
+            let input = gate_restore_input(loopback);
+            assert!(input
+                .starts_with("*filter\n:FCVM_SNAPSHOT_IN - [0:0]\n:FCVM_SNAPSHOT_OUT - [0:0]\n"));
+            assert!(input.ends_with("COMMIT\n"));
+            for (chain, flag) in [(GATE_INPUT_CHAIN, "-s"), (GATE_OUTPUT_CHAIN, "-d")] {
+                let rules: Vec<String> = input
+                    .lines()
+                    .filter_map(|line| line.strip_prefix(&format!("-A {chain} ")))
+                    .map(str::to_string)
+                    .collect();
+                let expected: Vec<String> = gate_chain_rules(flag, loopback)
+                    .iter()
+                    .map(|rule| rule.join(" "))
+                    .collect();
+                assert_eq!(rules, expected, "{chain} for {loopback}");
+            }
+        }
+        // The IPv6 transaction, as a literal, so the builder is not checked
+        // against itself alone.
+        let v6 = gate_restore_input(IPV6_LOOPBACK);
+        assert!(v6.contains(
+            "-A FCVM_SNAPSHOT_OUT -p udp -m udp --dport 123 -j REJECT --reject-with icmp6-port-unreachable\n"
+        ));
+        assert!(v6.contains("-A FCVM_SNAPSHOT_IN -p tcp -s ::1/128 -j RETURN\n"));
+    }
+
+    /// A restored clone whose inherited gate holds a stale rule fails verification
+    /// and reinstalls through `close()`: one transaction per family, and no plain
+    /// command touching a gate chain. The restore path reaches it by that call.
+    #[tokio::test]
+    async fn a_stale_inherited_gate_is_reinstalled_in_one_transaction_per_family() {
+        let stale = ARMED_V4_DUMP.replace(
+            "-A FCVM_SNAPSHOT_OUT -j RETURN\n",
+            "-A FCVM_SNAPSHOT_OUT -j ACCEPT\n-A FCVM_SNAPSHOT_OUT -j RETURN\n",
+        );
+        let runner = ScriptedRunner {
+            dump: stale,
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let calls = runner.calls.clone();
+        let gate = IptablesGate::new(runner);
+        assert!(
+            !gate.is_closed().await.unwrap(),
+            "a stale rule verified as the armed gate"
+        );
+        gate.close().await.unwrap();
+        let calls = calls.lock().unwrap().clone();
+        for program in ["iptables", "ip6tables"] {
+            let transactions = calls
+                .iter()
+                .filter(|call| call.starts_with(&format!("{program}-restore -w --noflush\n")))
+                .count();
+            assert_eq!(transactions, 1, "{program}: {calls:#?}");
+            assert!(
+                !calls
+                    .iter()
+                    .any(|call| call.starts_with(&format!("{program} "))
+                        && [" -F ", " -A ", " -N ", " -X ", " -R ", " -D FCVM"]
+                            .iter()
+                            .any(|op| call.contains(op))),
+                "{program} changed a gate chain outside its transaction: {calls:#?}"
+            );
+        }
+        let source = include_str!("snapshot_network.rs");
+        let unverified = source
+            .find("    if !verified_armed {\n        gate.close()")
+            .expect("the restore path no longer reinstalls an unverified gate through close()");
+        assert!(unverified > 0);
+    }
+
+    /// Runner whose iptables-restore exits 4, as a commit iptables refuses does.
+    #[derive(Clone, Default)]
+    struct RefusingRestoreRunner(Arc<Mutex<Vec<String>>>);
+
+    impl CommandRunner for RefusingRestoreRunner {
+        async fn output(&self, program: &str, args: &[&str]) -> io::Result<std::process::Output> {
+            RecordingRunner(self.0.clone()).output(program, args).await
+        }
+
+        async fn output_with_input(
+            &self,
+            program: &str,
+            args: &[&str],
+            input: &str,
+        ) -> io::Result<std::process::Output> {
+            RecordingRunner(self.0.clone())
+                .output_with_input(program, args, input)
+                .await?;
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(4 << 8),
+                stdout: Vec::new(),
+                stderr: b"line 6: RULE_APPEND failed".to_vec(),
+            })
+        }
+    }
+
+    /// A transaction iptables refuses fails close(), before any hook is installed,
+    /// and the error quotes what was given, since iptables-restore names the
+    /// failing line by its number in its input.
+    #[tokio::test]
+    async fn a_refused_transaction_fails_the_gate_with_its_input() {
+        let runner = RefusingRestoreRunner::default();
+        let calls = runner.0.clone();
+        let error = IptablesGate::new(runner).close().await.unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("iptables-restore -w --noflush exited 4"),
+            "{text}"
+        );
+        assert!(text.contains("RULE_APPEND failed"), "{text}");
+        assert!(
+            text.contains(r#"given "*filter\n:FCVM_SNAPSHOT_IN - [0:0]\n"#),
+            "{text}"
+        );
+        assert!(
+            !text.contains('\n'),
+            "the error spans console lines: {text}"
+        );
+        let calls = calls.lock().unwrap().clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.contains(" -I INPUT ") || call.contains(" -I OUTPUT ")),
+            "a hook was installed after a refused transaction: {calls:#?}"
+        );
+    }
+
+    /// The system runner reports a child that exits without reading its input by
+    /// the child's own status, not as a broken pipe, also for input larger than a
+    /// pipe buffer.
+    #[tokio::test]
+    async fn a_command_that_exits_without_reading_its_input_reports_its_status() {
+        let input = "x".repeat(1 << 20);
+        let output = SystemCommandRunner
+            .output_with_input("sh", &["-c", "echo refused >&2; exit 3"], &input)
+            .await
+            .expect("the child's status, not an error");
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "refused");
+        let error = SystemCommandRunner
+            .output_with_input("sh", &["-c", "exit 0"], &input)
+            .await
+            .expect_err("a command that reads none of its input cannot have applied it");
+        assert!(
+            error.to_string().contains("exited 0 without reading"),
+            "{error}"
+        );
+        let output = SystemCommandRunner
+            .output_with_input("sh", &["-c", "wc -c"], &input)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            (1 << 20).to_string()
+        );
+    }
+
     #[tokio::test]
     async fn gateway_address_cannot_bypass_directional_new_flow_gate() {
         let runner = RecordingRunner::default();
@@ -2772,14 +3105,14 @@ mod tests {
         IptablesGate::new(runner).close().await.unwrap();
         let calls = calls.lock().unwrap().join("\n");
 
-        assert!(calls.contains("iptables -w -A FCVM_SNAPSHOT_IN -p tcp -s 127.0.0.0/8 -j RETURN"));
-        assert!(calls.contains("iptables -w -A FCVM_SNAPSHOT_OUT -p tcp -d 127.0.0.0/8 -j RETURN"));
-        assert!(calls.contains(
-            "iptables -w -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT"
-        ));
-        assert!(calls.contains(
-            "iptables -w -A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT"
-        ));
+        assert!(restored(&calls, "iptables")
+            .contains("-A FCVM_SNAPSHOT_IN -p tcp -s 127.0.0.0/8 -j RETURN"));
+        assert!(restored(&calls, "iptables")
+            .contains("-A FCVM_SNAPSHOT_OUT -p tcp -d 127.0.0.0/8 -j RETURN"));
+        assert!(restored(&calls, "iptables")
+            .contains("-A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT"));
+        assert!(restored(&calls, "iptables")
+            .contains("-A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT"));
         assert!(
             !calls.contains("10.0.2.") && !calls.contains("fd00:"),
             "gateway exemptions let routed external clients cross the generation boundary:\n{calls}"
@@ -2795,8 +3128,8 @@ mod tests {
              cross the gate:\n{calls}"
         );
         assert!(
-            calls.contains("iptables -w -A FCVM_SNAPSHOT_IN -i lo -j RETURN")
-                && calls.contains("ip6tables -w -A FCVM_SNAPSHOT_IN -i lo -j RETURN"),
+            restored(&calls, "iptables").contains("-A FCVM_SNAPSHOT_IN -i lo -j RETURN")
+                && restored(&calls, "ip6tables").contains("-A FCVM_SNAPSHOT_IN -i lo -j RETURN"),
             "the egress proxy's redirected flows (entering on lo) must pass INPUT:\n{calls}"
         );
         // The UDP ingress rejection belongs to the restored clone only (see
@@ -2864,6 +3197,23 @@ mod tests {
             Ok(std::process::Output {
                 status: std::process::ExitStatus::from_raw(0),
                 stdout,
+                stderr: Vec::new(),
+            })
+        }
+
+        async fn output_with_input(
+            &self,
+            program: &str,
+            args: &[&str],
+            input: &str,
+        ) -> io::Result<std::process::Output> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{program} {}\n{input}", args.join(" ")));
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
                 stderr: Vec::new(),
             })
         }
