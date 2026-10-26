@@ -2837,6 +2837,32 @@ async fn a_lost_on_demand_launch_holds_its_place_under_the_cap() {
     );
 }
 
+/// A lost launch's host can fill its region before a later list omits it. The recovered
+/// host still has visibility protection, so this never creates a second instance.
+#[tokio::test]
+async fn a_lost_launch_whose_host_is_listed_stays_protected_from_later_omissions() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let fake = Arc::new(FakeHosts::default());
+    *fake.ambiguous.lock().unwrap() = 1;
+    *fake.launch_state.lock().unwrap() = Some("running".into());
+    *fake.hide_new.lock().unwrap() = Some((1, 4));
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    until_hosts(&fake, "past the omitted recovered-host lists", |f| {
+        f.calls().iter().filter(|c| c.starts_with("list ")).count() >= 8
+    })
+    .await;
+    // Include terminated instances: a duplicate may already have been removed as excess.
+    let launched = fake.hosts.lock().unwrap()["us-east-1"].len();
+    assert_eq!(launched, 1, "{:?}", fake.calls());
+}
+
 /// A lost on-demand launch whose host the next list shows releases its reservation: the
 /// region is full, its token is dropped, and the host is counted once. With a cap of 2, the
 /// other region still gets an on-demand host when its spot host is reclaimed and spot is

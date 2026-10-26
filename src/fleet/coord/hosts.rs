@@ -353,13 +353,8 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                 continue;
             }
             let mut live = hosts.iter().filter(|h| h.live()).count() as u32;
-            if live >= want {
-                // A lost launch here either launched nothing or its hosts are listed (any
-                // over the capacity are terminated above): its token goes, and its on-demand
-                // count stops being reserved.
-                drop_tokens(region, &mut tokens, &mut on_demand);
-            } else if watch[i].next_launch.is_none_or(|t| now >= t) {
-                busy = true;
+            if live >= want || watch[i].next_launch.is_none_or(|t| now >= t) {
+                busy |= live < want;
                 // Lost launches first, each asked again with its own token and count, so EC2
                 // answers with what it launched; only the shortfall left after them is new.
                 if let Some(found) = reconcile(
@@ -374,6 +369,7 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                 .await
                 {
                     live += found;
+                    busy |= found > 0;
                     if live < want {
                         let short = want - live;
                         let (launched, retry) = launch_shortfall(
@@ -440,21 +436,6 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
     }
 }
 
-/// Drop `region`'s lost launches, and their on-demand reservation.
-fn drop_tokens(region: &str, tokens: &mut Tokens, on_demand: &mut Option<u32>) {
-    tokens.retain(|(r, m), (_, c)| {
-        if r != region {
-            return true;
-        }
-        if *m == Market::OnDemand {
-            if let Some(n) = on_demand.as_mut() {
-                *n = n.saturating_sub(*c);
-            }
-        }
-        false
-    });
-}
-
 /// Ask `region`'s lost launches again with their tokens. Returns how many instances they
 /// launched that `hosts` does not list yet (now followed as pending), or `None` when one
 /// still has no answer (asked again at the next poll, and nothing new is launched).
@@ -482,17 +463,22 @@ async fn reconcile(
                     .iter()
                     .filter(|id| !hosts.iter().any(|h| h.id == **id))
                     .collect();
-                for id in &new {
-                    tracing::info!(%region, instance = %id, market = market.name(), "wake: host launch accepted (answer of a lost request)");
-                    recent.insert(
-                        (*id).clone(),
+                // A listed host can disappear from the next eventually consistent list.
+                // Remember every recovered live host, not only those still unlisted.
+                for id in got
+                    .ids
+                    .iter()
+                    .filter(|id| !hosts.iter().any(|h| h.id == **id && !h.live()))
+                {
+                    recent.entry(id.clone()).or_insert_with(|| {
+                        tracing::info!(%region, instance = %id, market = market.name(), "wake: host launch accepted (answer of a lost request)");
                         Recent {
                             region: region.to_string(),
                             market,
                             asked,
                             running_reported: false,
-                        },
-                    );
+                        }
+                    });
                 }
                 if market == Market::OnDemand {
                     // The reservation gives way to the hosts the list does not count yet.
