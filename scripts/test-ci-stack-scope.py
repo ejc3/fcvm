@@ -284,6 +284,9 @@ def evaluate(expression, context):
             return left == right if isinstance(node.ops[0], ast.Eq) else left != right
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'always':
             return True
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'format':
+            args = [visit(a) for a in node.args]
+            return args[0].format(*args[1:])
         raise AssertionError(f'Unsupported expression: {ast.dump(node)}')
 
     return visit(tree)
@@ -309,6 +312,24 @@ class Workflow(unittest.TestCase):
                 gate = job_if(block)
                 self.assertIsNotNone(gate, f'{name} has no if: and would run on a deferred PR')
                 self.assertFalse(evaluate(gate, context), f'{name} runs on a deferred PR: {gate}')
+
+    def test_a_merged_pr_closure_never_joins_mains_concurrency_group(self):
+        # For a merged PR's `closed` event github.ref is the target branch; grouping by it
+        # would cancel main's run (cancel-in-progress is on for pull_request) and leave the
+        # PR's own runs alone.
+        text = CI.read_text()
+        group = re.search(r'^concurrency:\n  group: \$\{\{ (.*) \}\}$', text, re.M)[1]
+        def g(ctx):
+            # The group is "<workflow>-<expr>": evaluate the expression part.
+            part = group.split('}}-${{', 1)[1] if '}}-${{' in group else group.split('-', 1)[1]
+            return 'CI-' + str(evaluate(part.strip(), ctx))
+        merged = {'github': {'ref': 'refs/heads/main', 'event_name': 'pull_request',
+                             'event': {'pull_request': {'number': 1234}}}}
+        opened = {'github': {'ref': 'refs/pull/1234/merge', 'event_name': 'pull_request',
+                             'event': {'pull_request': {'number': 1234}}}}
+        push = {'github': {'ref': 'refs/heads/main', 'event_name': 'push', 'event': {}}}
+        self.assertEqual(g(merged), g(opened), 'a merged PR\'s closed run is not in its PR\'s group')
+        self.assertNotEqual(g(merged), g(push), 'a merged PR\'s closed run joins main\'s group')
 
     def test_a_deferred_summary_is_not_named_summary(self):
         block = jobs(CI.read_text())['summary']

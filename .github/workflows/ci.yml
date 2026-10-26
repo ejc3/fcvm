@@ -48,8 +48,11 @@ on:
 # land faster than the matrix (about 40 minutes) left main with no completed host or
 # container run at all (2026-10-24: runs on 8e2fb2b2 and e121e7f0 both cancelled with
 # every self-hosted job still queued).
+# Pull request runs are grouped by PR number: for a merged PR's `closed` event GitHub sets
+# github.ref to the target branch, which would put that run in main's group and cancel
+# main's run instead of the PR's.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
