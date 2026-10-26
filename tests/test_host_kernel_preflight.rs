@@ -183,12 +183,33 @@ fn a_scratch_directory_on_the_root_disk_does_not_move_the_build() {
 /// install-host-kernel. Read from make's own database, not the Makefile text.
 #[test]
 fn install_host_kernel_orders_the_check_before_the_build_steps() {
-    let out = Command::new("make")
+    // The Makefile refuses to run as root on a host, and the privileged lanes run this
+    // test as root, so make reads its database as the user sudo came from.
+    let mut cmd = if nix::unistd::geteuid().is_root() {
+        let uid = std::env::var("SUDO_UID").unwrap_or_else(|_| "65534".into());
+        let gid = std::env::var("SUDO_GID").unwrap_or_else(|_| "65534".into());
+        let mut c = Command::new("setpriv");
+        c.args([
+            &format!("--reuid={uid}"),
+            &format!("--regid={gid}"),
+            "--clear-groups",
+            "make",
+        ]);
+        c
+    } else {
+        Command::new("make")
+    };
+    let out = cmd
         .args(["-qp", "install-host-kernel"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("run make -qp");
     let db = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        db.contains("install-host-kernel:"),
+        "make printed no database: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     for target in ["build", "setup-btrfs"] {
         let rule = db
             .lines()

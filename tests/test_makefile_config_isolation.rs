@@ -27,9 +27,22 @@ fn sudo_fcvm_setup_recipes_forward_the_config_dir() {
          use $(SUDO_FCVM) instead:\n{}",
         bare.join("\n")
     );
+    // `$(SUDO_FCVM) env VAR=value ./target/release/fcvm setup` forwards the config dir too:
+    // SUDO_FCVM's own env sets it, and a further env only adds variables.
     let forwarded = makefile
         .lines()
-        .filter(|line| line.contains("$(SUDO_FCVM) ./target/release/fcvm setup"))
+        .filter(|line| {
+            line.split("$(SUDO_FCVM) ").skip(1).any(|rest| {
+                let mut words = rest.split_whitespace().peekable();
+                if words.peek() == Some(&"env") {
+                    words.next();
+                    while words.peek().is_some_and(|w| w.contains('=')) {
+                        words.next();
+                    }
+                }
+                words.next() == Some("./target/release/fcvm") && words.next() == Some("setup")
+            })
+        })
         .count();
     assert!(
         forwarded >= 8,
