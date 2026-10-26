@@ -485,7 +485,12 @@ fn nv2_invalidation_unmaps_only_the_shadow_mappings_of_the_invalidated_range() {
     }
     let mut failures = Vec::new();
     for scenario in scenarios {
-        let result = Command::new(&binary)
+        // Without address randomization: GCC 13's AddressSanitizer crashes in a loop of
+        // "AddressSanitizer:DEADLYSIGNAL" for some layouts when vm.mmap_rnd_bits is 32
+        // (Ubuntu 24.04's kernels), which failed this test at random on CI's x64 lanes.
+        let result = Command::new("setarch")
+            .args([std::env::consts::ARCH, "-R"])
+            .arg(&binary)
             .arg(scenario)
             // The harness counts its own allocations; LeakSanitizer needs
             // ptrace, which some CI containers refuse.

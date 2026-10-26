@@ -120,7 +120,8 @@ impl ModuleType {
     /// configuration was measured with on Turing only; they are allowed on Turing
     /// and Ampere, and refused on anything later (Blackwell has no proprietary
     /// module support at all). The ranges cover exactly the Turing and Ampere
-    /// entries of the driver's `supported-gpus.json` (580.196.07): Turing
+    /// entries of the driver's `supported-gpus.json` (580.196.07 and 595.112.07
+    /// list the same ones): Turing
     /// 0x1E00-0x1FFF and 0x2180-0x21FF, Ampere 0x2080-0x20FF, 0x2200-0x22FF and
     /// 0x2400-0x25FF. Volta (0x1Dxx), Hopper (0x23xx), Ada (0x26xx-0x28xx) and
     /// Blackwell (0x29xx and up) fall outside them.
@@ -1176,6 +1177,44 @@ __attribute__((destructor)) static void report(void) {
         );
         assert!(DRIVER_IMAGE_STAGE.contains(r#"make -C "$NV_DIR/driver/$NV_MODULE_SRC""#));
         assert!(DRIVER_IMAGE_STAGE.contains(r#""$NV_MODULE_PARAMS" > "$MODDIR/nvidia.params""#));
+    }
+
+    /// `snapshot create --gpu-warm` runs the image's cuda-checkpoint on both
+    /// architectures. It supports ARM CPUs from driver 595 and `--device-map` (a warm
+    /// clone on other GPUs than its source's) from 580 (NVIDIA/cuda-checkpoint README),
+    /// so every pinned driver must be at least that on its architecture.
+    #[test]
+    fn every_pinned_driver_supports_warm_gpu_snapshots_on_its_architecture() {
+        let plan: crate::setup::rootfs::Plan =
+            toml::from_str(include_str!("../../rootfs-config.toml")).unwrap();
+        let mut pinned = 0;
+        for (name, arches) in &plan.kernel_profiles {
+            for (arch, profile) in arches {
+                let Some(nvidia) = &profile.nvidia else {
+                    continue;
+                };
+                let minimum = match arch.as_str() {
+                    "arm64" => 595,
+                    "amd64" => 580,
+                    other => panic!("kernel_profiles.{name}.{other}: unknown architecture"),
+                };
+                let major: u32 = nvidia
+                    .driver_version
+                    .split('.')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(
+                    major >= minimum,
+                    "kernel_profiles.{name}.{arch}.nvidia pins driver {}; cuda-checkpoint \
+                     needs {minimum} or later on {arch}",
+                    nvidia.driver_version
+                );
+                pinned += 1;
+            }
+        }
+        assert!(pinned >= 2, "found {pinned} pinned NVIDIA drivers");
     }
 
     #[test]

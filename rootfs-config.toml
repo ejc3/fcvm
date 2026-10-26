@@ -275,35 +275,40 @@ kernel_config = "kernel/gpu.conf"
 patches_dir = "kernel/patches-gpu"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-aarch64-6.1.config"
 # Device passthrough (PUT /device-passthrough and LoadSnapshot
-# device_passthrough) on the PCI transport.
+# device_passthrough) on the PCI transport. A detach keeps the VFIO device open,
+# so guest memory stays mapped for DMA until the device is attached again: on a
+# g5g.metal (SMMUv3 without range invalidation) unmapping it took 9.8 s of a
+# 6 GiB guest's detach (DESIGN.md "arm64: g5g.metal", #1317). amd64 stays on the
+# previous commit until the change is measured on a g4dn.metal.
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "agent/vfio-uffd-populate"
-firecracker_commit = "1433710c4f343d392380e1e4f6876e2ecf215926"
+firecracker_branch = "agent/vfio-keep-dma-on-detach"
+firecracker_commit = "afeb8da92d1d6aaaa4ff009e8df88aafbfc3b1a4"
 firecracker_args = "--enable-pci"
 # On the PCI transport the guest's virtio-net NIC is a PCI device, which udev renames
 # to enp0s<slot>; fc-agent and fcvm configure "eth0" (IPv6, routes, the snapshot gate),
 # so the guest keeps the kernel's name.
 boot_args = "net.ifnames=0"
 
-# R580 is NVIDIA's long-term support branch and supports Turing (T4, T4G)
-# with the open kernel modules. The .run carries the open module sources, the
-# user-space driver and the GSP firmware of one version, so the modules and
-# libraries match exactly. SHA-256 values match the .sha256sum files NVIDIA
-# publishes beside the same files under download.nvidia.com/XFree86/; the
-# toolkit's match its release's checksums.txt. cuda-checkpoint is the binary
-# at a fixed commit of NVIDIA/cuda-checkpoint (warm GPU snapshots, R580 for
-# --device-map); its SHA-256 is of that file. Its ARM support needs driver 595,
-# so `snapshot create --gpu-warm` is refused on arm64 while this pins 580.
+# R595, because cuda-checkpoint (warm GPU snapshots) supports ARM CPUs from
+# driver 595 (NVIDIA/cuda-checkpoint README, "595 Features"); amd64 stays on
+# R580, NVIDIA's long-term support branch. Both support Turing (T4, T4G). The
+# .run carries the module sources, the user-space driver and the GSP firmware
+# of one version, so the modules and libraries match exactly. SHA-256 values
+# match the .sha256sum files NVIDIA publishes beside the same files under
+# download.nvidia.com/XFree86/; the toolkit's match its release's
+# checksums.txt. cuda-checkpoint is the binary at a fixed commit of
+# NVIDIA/cuda-checkpoint (R580 for --device-map); its SHA-256 is of that file.
 #
 # The proprietary modules with the GSP firmware off, as on amd64: on a
 # g5g.metal (T4G) nvidia-persistenced's start at restore took 609 ms against
 # 1,285 ms with the open modules, and gpu_ms 1,026 against 1,823 (medians of
-# eight restores; DESIGN.md "arm64: g5g.metal").
+# eight restores with driver 580; DESIGN.md "arm64: g5g.metal"). With 595 the
+# proprietary modules load with the GSP firmware off on the T4G too.
 [kernel_profiles.gpu.arm64.nvidia]
 module_type = "proprietary"
-driver_version = "580.196.07"
-driver_url = "https://us.download.nvidia.com/tesla/580.196.07/NVIDIA-Linux-aarch64-580.196.07.run"
-driver_sha256 = "5b7d2319a1e5228cb47a67e07733a5abfb614cd8d4350a750211022343d27eed"
+driver_version = "595.112.07"
+driver_url = "https://us.download.nvidia.com/tesla/595.112.07/NVIDIA-Linux-aarch64-595.112.07.run"
+driver_sha256 = "eea42e38a5fdc52ff0a4a6be6c43aab12d9eb898c9bb5f36be5fba514e9bc51d"
 toolkit_version = "1.20.1"
 toolkit_url = "https://github.com/NVIDIA/nvidia-container-toolkit/releases/download/v1.20.1/nvidia-container-toolkit_1.20.1_deb_arm64.tar.gz"
 toolkit_sha256 = "2b58b68ec388cede52815a63fc87f3f019af96e21b7d29c3cb2890341db14b21"

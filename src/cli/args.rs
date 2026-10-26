@@ -185,6 +185,12 @@ pub struct FleetCoordArgs {
     #[arg(long, default_value_t = 100)]
     pub max_tiles: usize,
 
+    /// Places on the fcvm side (at most --max-tiles): with fewer live fcvm GPUs the rest are
+    /// dark tiles, with more the side has one place per GPU. With --ec2-tiles it sizes the
+    /// two sides.
+    #[arg(long, default_value_t = 8)]
+    pub fcvm_tiles: usize,
+
     /// Where EC2 tiles come from
     #[arg(long, value_enum, default_value_t = FleetEc2::None)]
     pub ec2: FleetEc2,
@@ -207,8 +213,8 @@ pub struct FleetCoordArgs {
     /// Serve the EC2 half's aggregator to browsers with TLS (the --tls-secret certificate)
     /// on port 443 of the coordinator task's own addresses, read on ECS (the task metadata
     /// for IPv6, EC2 DescribeNetworkInterfaces for the public IPv4 address), and name them
-    /// `agg-ec2-<token>` (needs --dns-token-secret)
-    #[arg(long, requires_all = ["ec2_aggregate_listen", "tls_secret", "dns_token_secret"])]
+    /// `agg-ec2-<token>` in --dns-subzone
+    #[arg(long, requires_all = ["ec2_aggregate_listen", "tls_secret", "dns_subzone"])]
     pub ec2_aggregate_tls: bool,
 
     /// Where the coordinator keeps the certificate file of --ec2-aggregate-tls
@@ -260,34 +266,44 @@ pub struct FleetCoordArgs {
     #[arg(long)]
     pub max_borrowed: Option<usize>,
 
-    /// A GPU host auto scaling group the coordinator owns (`<region>:<name>`, repeatable).
-    /// With any, the fleet scales them to 0 after --idle-scale-down seconds with no active
-    /// viewer and back to --awake-capacity when one arrives.
-    #[arg(long = "scale-group")]
-    pub scale_groups: Vec<crate::fleet::coord::scale::Group>,
+    /// A GPU host launch template (`<region>:<name>`, repeatable; several in a region are
+    /// one request's pools). With any, the coordinator launches the GPU hosts itself: spot
+    /// first, on demand at once when spot is refused for capacity, and terminates them after
+    /// --idle-scale-down seconds with no active viewer.
+    #[arg(
+        long = "host-template",
+        env = "FLEET_HOST_TEMPLATES",
+        value_delimiter = ','
+    )]
+    pub host_templates: Vec<crate::fleet::coord::hosts::Regional>,
+
+    /// A subnet GPU hosts may launch in (`<region>:<subnet id>`, repeatable); every region
+    /// with a --host-template needs at least one
+    #[arg(
+        long = "host-subnet",
+        env = "FLEET_HOST_SUBNETS",
+        value_delimiter = ','
+    )]
+    pub host_subnets: Vec<crate::fleet::coord::hosts::Regional>,
 
     /// Sleep with no active viewer (no tiles, every VM stopped) and wake for the next one,
-    /// on hosts the coordinator does not scale (a fixed host, a test box). Implied by any
-    /// --scale-group.
+    /// on hosts the coordinator does not launch (a fixed host, a test box). Implied by any
+    /// --host-template.
     #[arg(long)]
     pub sleep_when_idle: bool,
 
-    /// Desired capacity of each scale group while the fleet is awake
+    /// GPU hosts per region while the fleet is awake
     #[arg(long, default_value_t = 1)]
     pub awake_capacity: u32,
 
-    /// An on-demand GPU host auto scaling group (`<region>:<name>`, repeatable), the
-    /// fallback of the --scale-group in its region. It is 0 unless a wake leaves that spot
-    /// group short of --awake-capacity and Auto Scaling reports a failed launch of it, or
-    /// short for --spot-wait seconds; then it takes the shortfall and the spot group is
-    /// held at what it has. Both go to 0 when the fleet sleeps.
-    #[arg(long = "on-demand-group")]
-    pub on_demand_groups: Vec<crate::fleet::coord::scale::Group>,
-
-    /// Seconds a waking spot group may stay short before its on-demand group takes over,
-    /// when Auto Scaling has reported no failed launch of it
-    #[arg(long, default_value_t = 120)]
-    pub spot_wait: u64,
+    /// Most on-demand GPU hosts the fleet runs, all regions together (spot's fallback)
+    #[arg(
+        long,
+        env = "FLEET_HOST_ON_DEMAND_MAX",
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u32).range(0..=8)
+    )]
+    pub host_on_demand_max: u32,
 
     /// Seconds with no active viewer before the fleet scales down
     #[arg(long, default_value_t = 600)]
@@ -298,7 +314,7 @@ pub struct FleetCoordArgs {
     #[arg(long)]
     pub admin_listen: Option<String>,
 
-    /// EC2 tiles the EC2 side runs (each side shows the GPUs it has live)
+    /// EC2 tiles the EC2 side runs; one without an instance is a dark tile
     #[arg(long, default_value_t = 8)]
     pub ec2_tiles: usize,
 
@@ -341,26 +357,23 @@ pub struct FleetCoordArgs {
     #[arg(long, env = "FLEET_NAME", default_value = "stage")]
     pub fleet_name: String,
 
-    /// The DNS zone tiles and slots are named in (`ec2-<n>.<zone>`, `slot-<n>.<zone>`)
+    /// The fleet's DNS zone: the certificate's (`*.<zone>`), the EC2 tiles' health name
+    /// (`ec2-<n>.<zone>`), and the parent of --dns-subzone
     #[arg(long, default_value = "fcvm.dev")]
     pub dns_zone: String,
 
-    /// Write the slots' DNS records with the Cloudflare token in this Secrets Manager secret
+    /// The Cloudflare token for --dns-zone, in this Secrets Manager secret: the certificate
+    /// renewal writes its DNS-01 records with it
     #[arg(long)]
     pub dns_token_secret: Option<String>,
 
     /// The zone's Cloudflare id (default: looked up by name)
     #[arg(long)]
     pub dns_zone_id: Option<String>,
-    /// The zone's authoritative nameservers (comma separated). A launch's names are
-    /// published to viewers only once every one of them answers with the new records.
-    #[arg(long, value_delimiter = ',')]
-    pub dns_nameservers: Vec<String>,
-
-    /// Serve the launch names from this subzone of --dns-zone as its authoritative DNS
-    /// server (`<label>.<subzone>`) instead of writing them through the Cloudflare API: a
-    /// name answers from the moment it is published. The parent zone delegates the subzone
-    /// with NS records and no DS record.
+    /// Name launches in this subzone of --dns-zone (`<label>.<subzone>`) and serve it as
+    /// its authoritative DNS server: a name answers from the moment it is published. The
+    /// parent zone delegates the subzone with NS records and no DS record. Without it,
+    /// launches are not named and tiles show the URLs their agents report.
     #[arg(long, requires_all = ["dns_subzone_ns", "dns_listen"])]
     pub dns_subzone: Option<String>,
 

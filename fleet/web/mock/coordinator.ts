@@ -246,6 +246,8 @@ export class MockCoordinator {
   private offlineUntil = 0;
   private sitekey: string | null;
   private poster: { at: number; jpeg: Promise<Buffer> } | null = null;
+  /** `/mock/fault {no_poster}`: answer /poster.jpg as a coordinator that has none yet. */
+  private noPoster = false;
   private restoresTotal = 0;
   private scrubsTotal = 0;
   /** Unix ms of each restore in the last hour. */
@@ -1300,6 +1302,12 @@ export class MockCoordinator {
       return;
     }
     if (req.method === "GET" && url.pathname === "/poster.jpg") {
+      // The real coordinator holds its poster in memory and answers 404 until it has one
+      // (after a restart, before any scene was captured).
+      if (this.noPoster) {
+        res.writeHead(404, { "content-type": "text/plain", "access-control-allow-origin": "*" }).end("no poster yet");
+        return;
+      }
       this.posterJpeg().then(
         (jpeg) => res.writeHead(200, { "content-type": "image/jpeg", "access-control-allow-origin": "*", "cache-control": "no-store" }).end(jpeg),
         () => res.writeHead(503).end(),
@@ -1337,6 +1345,7 @@ export class MockCoordinator {
             this.setGpus(typeof b["fcvm_gpus"] === "number" ? b["fcvm_gpus"] : this.fcvmSlots.length, typeof b["ec2_gpus"] === "number" ? b["ec2_gpus"] : this.ec2Count);
           }
           if (typeof b["renderers_silent"] === "boolean") this.opts.renderers.setSilent(b["renderers_silent"]);
+          if (typeof b["no_poster"] === "boolean") this.noPoster = b["no_poster"];
           if (typeof b["ipv6_down"] === "boolean") this.opts.renderers.setV6Down(b["ipv6_down"]);
           return { ok: true };
         });

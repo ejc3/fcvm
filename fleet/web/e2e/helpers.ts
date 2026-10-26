@@ -19,9 +19,16 @@ export async function openWall(page: Page, minSynced = 15, mode: "direct" | "agg
   }, mode);
   await page.goto("/?debug=1");
   await page.waitForFunction(() => window.__fleet !== undefined);
-  await expect
-    .poll(async () => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 })
-    .toBeGreaterThanOrEqual(minSynced);
+  try {
+    await expect
+      .poll(async () => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 })
+      .toBeGreaterThanOrEqual(minSynced);
+  } catch (e) {
+    // Whether the mock kept up: frames it dropped because a render was still in flight, and renders queued.
+    const rs = (await (await fetch(`${COORD}/mock/render-stats`)).json()) as { subscribers: number; framesSent: number; framesSkipped: number; renderBacklog: number };
+    console.log(`openWall: mock render stats at the timeout ${JSON.stringify(rs)}`);
+    throw e;
+  }
 }
 
 export async function mockState(): Promise<{

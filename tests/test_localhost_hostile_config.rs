@@ -153,7 +153,7 @@ async fn export_from_hostile_config(root: &Path) -> Result<()> {
     let image_id = String::from_utf8(inspected.stdout)?.trim().to_owned();
     let archive = root.join("image.tar");
     let result = async {
-        fcvm::commands::podman::export_image_archive(&image_id, &image, &archive).await?;
+        fcvm::commands::podman::export_image_archive(&image_id, &image, &archive, None).await?;
         let inspected = Command::new("skopeo")
             .args(["inspect", "--config"])
             .arg(format!("docker-archive:{}", archive.display()))

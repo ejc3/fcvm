@@ -13,7 +13,7 @@ import type { ReelView } from "../../core/index.ts";
 /** The crossfade from the recording to the live image (wall.css uses the same). */
 const FADE_MS = 700;
 
-export function Reel({ reel, box, onDone }: { reel: ReelView; box: CSSProperties | undefined; onDone: () => void }) {
+export function Reel({ reel, box, onDone, badgeTop }: { reel: ReelView; box: CSSProperties | undefined; onDone: () => void; badgeTop: number }) {
   const video = useRef<HTMLVideoElement | null>(null);
   const [playing, setPlaying] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -72,8 +72,8 @@ export function Reel({ reel, box, onDone }: { reel: ReelView; box: CSSProperties
         </span>
       ) : null}
       {playing && !failed && (reel.badge || reel.caption) ? (
-        <span className="reel-badge plate" data-testid="reel-badge">
-          {reel.badge}
+        <span className={`reel-badge${reel.leaving ? " live" : ""}`} data-testid="reel-badge" style={{ top: badgeTop }}>
+          <span className="mark">{reel.badge}</span>
           {reel.caption ? <span className="caption-line">{reel.caption}</span> : null}
         </span>
       ) : null}

@@ -13,7 +13,7 @@
 # Every lookup that fails runs the full matrix: a scope that cannot be computed
 # must not skip anything.
 #
-# Environment: EVENT, REPO, PR, DRAFT, HEAD_REPO, HEAD_REF, HEAD_SHA, BASE_REF,
+# Environment: EVENT, REPO, PR, ACTION, DRAFT, HEAD_REPO, HEAD_REF, HEAD_SHA, BASE_REF,
 # DEFAULT_BRANCH, GITHUB_OUTPUT; GH overrides the gh command (tests).
 set -euo pipefail
 GH=${GH:-gh}
@@ -49,6 +49,11 @@ fi
 # stacks. A fork's branch can share a name with one of ours.
 stackable=true
 [ "$HEAD_REPO" = "$REPO" ] || stackable=false
+
+if [ "${ACTION:-}" = "closed" ]; then
+  emit false "closed: this run only cancels the PR's earlier runs" false false false false
+  exit 0
+fi
 
 if [ "$DRAFT" = "true" ]; then
   emit false "draft: CI runs when the PR is marked ready" false false false false

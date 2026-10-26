@@ -212,15 +212,13 @@ export function shade(
   const ringBand = inRing
     ? (0.55 + 0.45 * Math.sin(ringR * 95)) * Math.min(1, (ringR - R * 1.3) * 40, (R * 2.15 - ringR) * 40)
     : 0;
-  const drawRing = (front: boolean) => {
-    if (ringBand <= 0 || (py > 0) !== front) return;
-    const shadowed = !front && d < R ? 0 : 1;
-    const a = ringBand * 0.75 * shadowed;
+  // The ring behind the planet (drawn here) and in front of it (after the planet).
+  if (ringBand > 0 && py <= 0) {
+    const a = ringBand * 0.75 * (d < R ? 0 : 1);
     r = r * (1 - a) + 0.85 * a * (0.5 + 0.5 * f.day);
     g = g * (1 - a) + 0.74 * a * (0.5 + 0.5 * f.day);
     b = b * (1 - a) + 0.6 * a * (0.5 + 0.5 * f.day);
-  };
-  drawRing(false);
+  }
   if (d < R) {
     const nz = Math.sqrt(R * R - d2) / R;
     const nx = px / R;
@@ -245,7 +243,12 @@ export function shade(
     g += rim * 0.6;
     b += rim * 1.0;
   }
-  drawRing(true);
+  if (ringBand > 0 && py > 0) {
+    const a = ringBand * 0.75;
+    r = r * (1 - a) + 0.85 * a * (0.5 + 0.5 * f.day);
+    g = g * (1 - a) + 0.74 * a * (0.5 + 0.5 * f.day);
+    b = b * (1 - a) + 0.6 * a * (0.5 + 0.5 * f.day);
+  }
 
   // Stars, fixed in the world.
   const sx = Math.floor(X * 28);
@@ -406,18 +409,12 @@ export function renderI420(g: TileGeometry, f: FrameCtx, black: readonly { x: nu
   const vOff = ySize + cw * ch;
   for (let j = 0; j < ch; j++) {
     for (let i = 0; i < cw; i++) {
-      let R = 0;
-      let G = 0;
-      let B = 0;
-      for (const [di, dj] of [[0, 0], [1, 0], [0, 1], [1, 1]] as const) {
-        const k = ((2 * j + dj) * width + 2 * i + di) * 3;
-        R += rgb[k]!;
-        G += rgb[k + 1]!;
-        B += rgb[k + 2]!;
-      }
-      R /= 4;
-      G /= 4;
-      B /= 4;
+      // The 2x2 block's mean, its four pixels read directly (no per-pixel array of offsets).
+      const k0 = (2 * j * width + 2 * i) * 3;
+      const k1 = k0 + width * 3;
+      const R = (rgb[k0]! + rgb[k0 + 3]! + rgb[k1]! + rgb[k1 + 3]!) / 4;
+      const G = (rgb[k0 + 1]! + rgb[k0 + 4]! + rgb[k1 + 1]! + rgb[k1 + 4]!) / 4;
+      const B = (rgb[k0 + 2]! + rgb[k0 + 5]! + rgb[k1 + 2]! + rgb[k1 + 5]!) / 4;
       const Yp = 0.2126 * R + 0.7152 * G + 0.0722 * B;
       out[uOff + j * cw + i] = Math.round(128 + (224 * (B - Yp)) / 1.8556);
       out[vOff + j * cw + i] = Math.round(128 + (224 * (R - Yp)) / 1.5748);

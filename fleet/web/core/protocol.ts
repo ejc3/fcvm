@@ -111,6 +111,9 @@ export interface RelaunchAll {
   ec2_capacity_wait_ms: number;
   /** When the EC2 half's current wait for capacity began, or null. */
   ec2_waiting_since: number | null;
+  /** Each half's measured time once it is back (the coordinator's, capacity waits excluded per tile), or null. */
+  fcvm_ms: number | null;
+  ec2_ms: number | null;
 }
 
 /** One half's measured restart times. Every number is the coordinator's. */
@@ -168,12 +171,68 @@ export interface Power {
   woke_at: number | null;
   hosts: HostWake[];
   /** The last completed wake: when it began, when every GPU was rendering, how many GPUs. */
-  last_wake: { started_at: number; awake_at: number; gpus: number } | null;
+  last_wake: Wake | null;
+  /** The last completed wakes, oldest first (the coordinator keeps 20). */
+  wakes: Wake[];
+}
+
+export interface Wake {
+  started_at: number;
+  awake_at: number;
+  gpus: number;
+}
+
+/** One half of a finished or running race, as `races[]` keeps it. */
+export interface RaceHalf {
+  done_at: number | null;
+  /** Click to the half's last first frame, capacity waits excluded. */
+  time_ms: number | null;
+  capacity_wait_ms: number;
+}
+
+/** A race the coordinator kept (`races`, the last 10). */
+export interface RaceRecord {
+  id: number;
+  started_at: number;
+  by: string;
+  fcvm: RaceHalf | null;
+  ec2: RaceHalf | null;
+}
+
+function parseWake(v: unknown, where: string): Wake | null {
+  if (!isObj(v)) return null;
+  return { started_at: num(v, "started_at", where), awake_at: num(v, "awake_at", where), gpus: num(v, "gpus", where) };
+}
+
+function parseRaceHalf(v: unknown, where: string): RaceHalf | null {
+  if (!isObj(v)) return null;
+  return {
+    done_at: numOrNull(v, "done_at", where),
+    time_ms: numOrNull(v, "time_ms", where),
+    capacity_wait_ms: numOrNull(v, "capacity_wait_ms", where) ?? 0,
+  };
+}
+
+function parseRaces(v: unknown): RaceRecord[] {
+  if (!Array.isArray(v)) return [];
+  return v.flatMap((r, i) => {
+    const where = `races[${i}]`;
+    if (!isObj(r)) return [];
+    return [
+      {
+        id: num(r, "id", where),
+        started_at: num(r, "started_at", where),
+        by: strOrNull(r, "by", where) ?? "",
+        fcvm: parseRaceHalf(r["fcvm"], `${where}.fcvm`),
+        ec2: parseRaceHalf(r["ec2"], `${where}.ec2`),
+      },
+    ];
+  });
 }
 
 function parsePower(v: unknown): Power {
   // A coordinator that does not scale to zero sends nothing: always awake.
-  if (!isObj(v)) return { state: "awake", asleep_since: null, woke_at: null, hosts: [], last_wake: null };
+  if (!isObj(v)) return { state: "awake", asleep_since: null, woke_at: null, hosts: [], last_wake: null, wakes: [] };
   const w = "fleet.power";
   const state = str(v, "state", w);
   if (state !== "asleep" && state !== "waking" && state !== "awake") throw new ProtocolError(`${w}.state is ${state}`);
@@ -194,9 +253,11 @@ function parsePower(v: unknown): Power {
           ]
         : [],
     ),
-    last_wake: isObj(lw)
-      ? { started_at: num(lw, "started_at", `${w}.last_wake`), awake_at: num(lw, "awake_at", `${w}.last_wake`), gpus: num(lw, "gpus", `${w}.last_wake`) }
-      : null,
+    last_wake: parseWake(lw, `${w}.last_wake`),
+    wakes: arr(v, "wakes", w).flatMap((x, i) => {
+      const wk = parseWake(x, `${w}.wakes[${i}]`);
+      return wk ? [wk] : [];
+    }),
   };
 }
 
@@ -276,6 +337,8 @@ export interface FleetState {
   failures: FleetFailure[];
   scene: Scene;
   relaunch_all: RelaunchAll | null;
+  /** The last races the coordinator kept, oldest first. */
+  races: RaceRecord[];
   /** When the owner's cadence restarts everything next. */
   next_race_at: number | null;
   /** A viewer's `restart_now` is refused until then. */
@@ -600,6 +663,8 @@ function parseRelaunchAll(ra: unknown): RelaunchAll | null {
     ec2_gpus: numOrNull(ra, "ec2_gpus", w),
     ec2_capacity_wait_ms: numOrNull(ra, "ec2_capacity_wait_ms", w) ?? 0,
     ec2_waiting_since: numOrNull(ra, "ec2_waiting_since", w),
+    fcvm_ms: numOrNull(ra, "fcvm_ms", w),
+    ec2_ms: numOrNull(ra, "ec2_ms", w),
   };
 }
 
@@ -666,6 +731,7 @@ function parseState(o: Obj): FleetState {
     }),
     scene: parseScene(obj(o, "scene", "state")),
     relaunch_all: parseRelaunchAll(o["relaunch_all"]),
+    races: parseRaces(o["races"]),
     next_race_at: numOrNull(o, "next_race_at", "state"),
     cooldown_until: numOrNull(o, "cooldown_until", "state"),
     scoreboard: { fcvm: parseHalfScore(sb["fcvm"], "scoreboard.fcvm"), ec2: parseHalfScore(sb["ec2"], "scoreboard.ec2") },

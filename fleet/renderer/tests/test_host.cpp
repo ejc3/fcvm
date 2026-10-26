@@ -648,6 +648,23 @@ int main() {
     CHECK(!ok && dist == 0.0f && at.x == sky.pos.x && at.y == sky.pos.y && at.z == sky.pos.z,
           "a ridge search that finds no land still writes its outputs (ok %d, dist %g, at.y %g)", ok, dist, at.y);
   }
+  // The quality reference holds the camera where the frame has it and draws
+  // the clouds and water at the frame's layer time: moving and after the
+  // demo loop wraps (t 136 is scene time 16), and inside a hold (scene time
+  // 5 of the hold 0..10, whose layer time is its start).
+  {
+    Scene s = default_scene();
+    Tile tl = tile_geometry(Rect{}, s.image_aspect, 270);
+    for (double t : {16.0, 136.0, 125.0}) {
+      uint64_t k1, k2;
+      bool h1, h2;
+      FrameParams a = build_frame(s, tl, t, &k1, &h1);
+      FrameParams b = build_frame(held_reference(s, t), tl, t, &k2, &h2);
+      CHECK(h2 && b.layer_t == a.layer_t && b.wind.x == a.wind.x && b.wave_t == a.wave_t &&
+                std::fabs(b.cam.pos.x - a.cam.pos.x) < 1e-6f && std::fabs(b.cam.fwd.z - a.cam.fwd.z) < 1e-6f,
+            "the held reference of t %g: held %d, layer_t %g against %g", t, (int)h2, b.layer_t, a.layer_t);
+    }
+  }
   tlscheck::run();
   DONE();
 }

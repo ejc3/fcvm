@@ -803,13 +803,13 @@ impl IpBatchScript {
     }
 }
 
-/// Name of the PID file pasta signals readiness through.
+/// The PID file pasta signals readiness through, in the VM's runtime directory.
 ///
-/// The whole `vm_id`, not a truncation of it: this is a file name in
-/// `data_dir` with no length limit, and two VMs sharing a name would delete
-/// each other's file as stale and then read the other's readiness (#888).
-fn pasta_pid_file_name(vm_id: &str) -> String {
-    format!("pasta-{vm_id}.pid")
+/// One directory per `vm_id`, so two VMs never share the file (#888), and the file goes
+/// with the directory when teardown removes it or when the next launch reclaims the
+/// directory of a VM whose fcvm was killed (`crate::reclaim`).
+fn pasta_pid_file(vm_id: &str) -> PathBuf {
+    paths::vm_runtime_dir(vm_id).join("pasta.pid")
 }
 
 /// Rootless networking using pasta with bridge architecture
@@ -1441,7 +1441,11 @@ impl PastaNetwork {
     /// pasta creates its own TAP device (pasta0) in the namespace and provides
     /// L2↔L4 translation to the host. Uses PID file for readiness signaling.
     pub async fn start_pasta(&mut self, namespace_pid: u32) -> Result<()> {
-        let pid_file = paths::data_dir().join(pasta_pid_file_name(&self.vm_id));
+        let pid_file = pasta_pid_file(&self.vm_id);
+        let pid_dir = pid_file
+            .parent()
+            .context("the pasta PID file has no directory")?
+            .to_path_buf();
 
         // Register the inotify watch BEFORE the stale-file cleanup and spawn:
         // pasta's PID-file write after this point always produces an event, so
@@ -1450,7 +1454,7 @@ impl PastaNetwork {
         // concurrent clone starts as one user) must not fail start_pasta — the
         // old poll never had that failure mode. Degrade to the 250ms safety
         // tick below, same as the vm.rs API-socket watch.
-        let mut pid_file_watch = match crate::utils::DirWatch::new(&paths::data_dir()) {
+        let mut pid_file_watch = match crate::utils::DirWatch::new(&pid_dir) {
             Ok(w) => Some(w),
             Err(e) => {
                 warn!(

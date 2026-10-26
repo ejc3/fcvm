@@ -47,7 +47,7 @@ export interface ReelView {
   autoplay: boolean;
   sources: ReelSource[];
   track: { src: string; label: string; lang: string };
-  /** "Recorded 22 Oct 2026, 23:14 UTC. The live wall is waking up.", or "" without the metadata. */
+  /** "◉ RECORDING · 22 Oct 2026, 23:14 UTC" (no date without the metadata), "● LIVE" once the live image is whole. */
   badge: string;
   /** What the recording shows, from its measured numbers, or "". */
   caption: string;
@@ -69,11 +69,9 @@ export interface ReelInput {
 }
 
 export function reelView(i: ReelInput): ReelView {
-  const asleep = i.power === "asleep";
   const sleeping = i.power !== "awake";
   const base = i.base.replace(/\/$/, "");
   const m = i.meta;
-  const tail = asleep ? "The live wall is asleep; it wakes when someone watches." : "The live wall is waking up.";
   return {
     show: sleeping || i.reelOn,
     leaving: !sleeping && i.allLive,
@@ -83,7 +81,7 @@ export function reelView(i: ReelInput): ReelView {
       { src: `${base}/wall-reel.webm`, type: "video/webm" },
     ],
     track: { src: `${base}/wall-reel.vtt`, label: "English", lang: "en" },
-    badge: m === null ? "" : `Recorded ${fmt.utcDate(m.recorded_at)}. ${sleeping ? tail : "The live wall is back."}`,
+    badge: !sleeping && i.allLive ? "● LIVE" : m === null ? "◉ RECORDING" : `◉ RECORDING · ${fmt.utcDate(m.recorded_at)}`,
     caption:
       m?.measured == null
         ? ""

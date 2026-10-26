@@ -199,7 +199,7 @@ impl Drop for DiskDirStaging {
 
 /// Give owner read, write and search to every directory under `dir`, not following
 /// symlinks. Errors are left to the removal that follows, which reports them.
-fn make_removable(dir: &Path) {
+pub(crate) fn make_removable(dir: &Path) {
     let Ok(md) = std::fs::symlink_metadata(dir) else {
         return;
     };

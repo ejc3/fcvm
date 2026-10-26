@@ -219,6 +219,12 @@ impl CloneSetupResources {
                 ));
             }
         }
+        // The mount targets the restore made, and the owner record.
+        if let Err(error) = crate::reclaim::complete(&self.vm_id).await {
+            errors.push(format!(
+                "reclaiming the clone's resources after failed setup: {error:#}"
+            ));
+        }
         if errors.is_empty() {
             info!(vm_id = %self.vm_id, "clone setup cleanup complete");
             Ok(())
@@ -785,9 +791,6 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
 
     ensure_gpu_snapshot_mode(&vm_state.config.gpus, args.disk_only, args.gpu_warm)?;
     if args.gpu_warm {
-        ensure_warm_gpu_arch(std::env::consts::ARCH)?;
-    }
-    if args.gpu_warm {
         anyhow::ensure!(
             matches!(
                 vm_state.config.hypervisor,
@@ -1292,19 +1295,6 @@ fn ensure_gpu_snapshot_mode(gpus: &[String], disk_only: bool, gpu_warm: bool) ->
              snapshot it with its GPU state, snapshot the VM it was restored from (fcvm \
              attaches GPUs to a restore of a snapshot taken without them), or use --disk-only",
             gpus.join(", ")
-        );
-    }
-    Ok(())
-}
-
-/// Refuse `--gpu-warm` where the gpu profile's driver cannot checkpoint, before the
-/// guest parks anything. cuda-checkpoint's ARM support needs NVIDIA driver 595 or later
-/// (NVIDIA/cuda-checkpoint README, "595 Features"), and the arm64 gpu profile pins 580.
-fn ensure_warm_gpu_arch(arch: &str) -> Result<()> {
-    if arch == "aarch64" {
-        bail!(
-            "--gpu-warm is not supported on arm64: cuda-checkpoint supports ARM CPUs from \
-             NVIDIA driver 595, and the gpu profile's arm64 driver is 580"
         );
     }
     Ok(())
@@ -2132,7 +2122,16 @@ async fn cmd_snapshot_run_inner(
     // snapshot-miss path, which tears its throwaway VM down (deleting its
     // state) and relaunches through here. No pre-restore exec session can
     // reference this state file, so restore needs no vsock-epoch bump.
+    //
+    // What VMs of processes killed without teardown left on the host goes first. The
+    // clone's data directory is recorded before anything creates it, so a SIGKILLed
+    // clone leaves it to the next launch to reclaim (crate::reclaim).
+    crate::reclaim::reclaim_abandoned().await;
     let vm_id = generate_vm_id();
+    let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
+    reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
+        path: paths::vm_runtime_dir(&vm_id),
+    })?;
     let (mut runtime_config, firecracker_choice) = snapshot_restore_runtime_config(
         &args,
         snapshot_config.metadata.kernel_profile.as_deref(),
@@ -5237,28 +5236,6 @@ mod tests {
         let recorded = at("state.config.snapshot_name = Some(recorded_snapshot_name);");
         let returned = at("Some(error) => Err(error),");
         assert!(kept < recorded && recorded < returned);
-    }
-
-    /// cuda-checkpoint cannot park CUDA processes on ARM with the arm64 profile's 580
-    /// driver, so `--gpu-warm` is refused there before the guest parks anything.
-    #[test]
-    fn a_warm_gpu_snapshot_is_refused_on_arm64() {
-        let err = format!("{:#}", ensure_warm_gpu_arch("aarch64").unwrap_err());
-        assert!(err.contains("driver 595"), "{err}");
-        ensure_warm_gpu_arch("x86_64").unwrap();
-        let code = include_str!("snapshot.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
-        let body = &code[code.find("async fn cmd_snapshot_create(").unwrap()..];
-        let check = body
-            .find("ensure_warm_gpu_arch(std::env::consts::ARCH)")
-            .expect("cmd_snapshot_create does not check the host architecture");
-        let core = body.find("create_snapshot_core(").unwrap();
-        assert!(
-            check < core,
-            "the architecture is checked after the snapshot starts"
-        );
     }
 
     #[test]

@@ -26,10 +26,55 @@ pub fn require_ipv4_host_addresses(mappings: &[PortMapping]) -> Result<()> {
     Ok(())
 }
 
+/// The iptables rules that publish `mappings` on `guest_ip`, as `-A` rule
+/// specifications, four per mapping and in the order they are added: DNAT for traffic
+/// arriving from outside, DNAT for locally generated traffic, MASQUERADE so the guest's
+/// reply returns, and FORWARD to let the traffic through.
+pub fn port_mapping_rules(guest_ip: &str, mappings: &[PortMapping]) -> Vec<String> {
+    let mut rules = Vec::with_capacity(mappings.len() * 4);
+    for mapping in mappings {
+        let proto = match mapping.proto {
+            Protocol::Tcp => "tcp",
+            Protocol::Udp => "udp",
+        };
+        // If host_ip is specified, only match packets destined to that IP (security:
+        // prevents exposing on all interfaces).
+        let destination = mapping
+            .host_ip
+            .as_ref()
+            .map(|host_ip| format!("-d {host_ip} "))
+            .unwrap_or_default();
+        for chain in ["PREROUTING", "OUTPUT"] {
+            rules.push(format!(
+                "-t nat -A {chain} {destination}-p {proto} --dport {} -j DNAT --to-destination {guest_ip}:{}",
+                mapping.host_port, mapping.guest_port
+            ));
+        }
+        rules.push(format!(
+            "-t nat -A POSTROUTING -d {guest_ip} -p {proto} --dport {} -j MASQUERADE",
+            mapping.guest_port
+        ));
+        rules.push(format!(
+            "-A FORWARD -p {proto} -d {guest_ip} --dport {} -j ACCEPT",
+            mapping.guest_port
+        ));
+    }
+    rules
+}
+
+/// One of [`port_mapping_rules`], as the record that lets a later launch remove it
+/// (`crate::reclaim`).
+pub fn rule_resource(rule: &str) -> crate::reclaim::Resource {
+    crate::reclaim::Resource::Rule {
+        program: "iptables".to_string(),
+        args: rule.split_whitespace().map(str::to_string).collect(),
+    }
+}
+
 /// Sets up port mapping rules for a VM
 ///
-/// Creates iptables DNAT rules to forward traffic from host ports to guest ports.
-/// Returns a list of rule specifications that can be used for cleanup.
+/// Adds the rules of [`port_mapping_rules`]. Returns them, for cleanup. A rule that
+/// cannot be added removes the ones added before it.
 pub async fn setup_port_mappings(guest_ip: &str, mappings: &[PortMapping]) -> Result<Vec<String>> {
     if mappings.is_empty() {
         return Ok(Vec::new());
@@ -42,129 +87,36 @@ pub async fn setup_port_mappings(guest_ip: &str, mappings: &[PortMapping]) -> Re
     );
 
     let mut created_rules: Vec<String> = Vec::new();
-
+    for rule in port_mapping_rules(guest_ip, mappings) {
+        let added = Command::new("iptables")
+            .args(rule.split_whitespace())
+            .output()
+            .await
+            .with_context(|| format!("adding iptables rule {rule}"));
+        let failure = match added {
+            Ok(output) if output.status.success() => None,
+            Ok(output) => Some(anyhow::anyhow!(
+                "failed to add iptables rule {rule}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )),
+            Err(error) => Some(error),
+        };
+        if let Some(error) = failure {
+            for rule in created_rules.iter().rev() {
+                let _ = delete_rule(rule).await;
+            }
+            return Err(error);
+        }
+        created_rules.push(rule);
+    }
     for mapping in mappings {
-        let proto_str = match mapping.proto {
-            Protocol::Tcp => "tcp",
-            Protocol::Udp => "udp",
-        };
-
-        // DNAT rule: Rewrite destination for incoming traffic
-        // If host_ip is specified, only match packets destined to that IP (security: prevents exposing on all interfaces)
-        let dnat_rule = if let Some(ref host_ip) = mapping.host_ip {
-            format!(
-                "-t nat -A PREROUTING -d {} -p {} --dport {} -j DNAT --to-destination {}:{}",
-                host_ip, proto_str, mapping.host_port, guest_ip, mapping.guest_port
-            )
-        } else {
-            format!(
-                "-t nat -A PREROUTING -p {} --dport {} -j DNAT --to-destination {}:{}",
-                proto_str, mapping.host_port, guest_ip, mapping.guest_port
-            )
-        };
-
-        let output = Command::new("iptables")
-            .args(dnat_rule.split_whitespace())
-            .output()
-            .await
-            .with_context(|| format!("adding DNAT rule for port {}", mapping.host_port))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Cleanup previously created rules
-            for rule in &created_rules {
-                let _ = delete_rule(rule).await;
-            }
-            anyhow::bail!("failed to add DNAT rule: {}", stderr);
-        }
-
-        created_rules.push(dnat_rule);
-
-        // OUTPUT DNAT rule: Rewrite destination for locally-generated traffic (localhost access)
-        let output_dnat_rule = if let Some(ref host_ip) = mapping.host_ip {
-            format!(
-                "-t nat -A OUTPUT -d {} -p {} --dport {} -j DNAT --to-destination {}:{}",
-                host_ip, proto_str, mapping.host_port, guest_ip, mapping.guest_port
-            )
-        } else {
-            format!(
-                "-t nat -A OUTPUT -p {} --dport {} -j DNAT --to-destination {}:{}",
-                proto_str, mapping.host_port, guest_ip, mapping.guest_port
-            )
-        };
-
-        let output = Command::new("iptables")
-            .args(output_dnat_rule.split_whitespace())
-            .output()
-            .await
-            .with_context(|| format!("adding OUTPUT DNAT rule for port {}", mapping.host_port))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Cleanup previously created rules
-            for rule in &created_rules {
-                let _ = delete_rule(rule).await;
-            }
-            anyhow::bail!("failed to add OUTPUT DNAT rule: {}", stderr);
-        }
-
-        created_rules.push(output_dnat_rule);
-
-        // MASQUERADE rule: SNAT locally-generated traffic to guest so return path works
-        // Without this, localhost -> guest traffic would have source 127.0.0.1 which
-        // the guest can't respond to
-        let masq_rule = format!(
-            "-t nat -A POSTROUTING -d {} -p {} --dport {} -j MASQUERADE",
-            guest_ip, proto_str, mapping.guest_port
-        );
-
-        let output = Command::new("iptables")
-            .args(masq_rule.split_whitespace())
-            .output()
-            .await
-            .with_context(|| format!("adding MASQUERADE rule for port {}", mapping.guest_port))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            for rule in &created_rules {
-                let _ = delete_rule(rule).await;
-            }
-            anyhow::bail!("failed to add MASQUERADE rule: {}", stderr);
-        }
-
-        created_rules.push(masq_rule);
-
-        // FORWARD rule: Allow forwarded traffic to guest
-        let forward_rule = format!(
-            "-A FORWARD -p {} -d {} --dport {} -j ACCEPT",
-            proto_str, guest_ip, mapping.guest_port
-        );
-
-        let output = Command::new("iptables")
-            .args(forward_rule.split_whitespace())
-            .output()
-            .await
-            .with_context(|| format!("adding FORWARD rule for port {}", mapping.guest_port))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Cleanup all rules including DNAT
-            for rule in &created_rules {
-                let _ = delete_rule(rule).await;
-            }
-            anyhow::bail!("failed to add FORWARD rule: {}", stderr);
-        }
-
-        created_rules.push(forward_rule);
-
         info!(
             host_port = mapping.host_port,
             guest_port = mapping.guest_port,
-            proto = proto_str,
+            proto = ?mapping.proto,
             "port mapping created"
         );
     }
-
     Ok(created_rules)
 }
 
@@ -213,9 +165,12 @@ async fn delete_rule(rule: &str) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Ignore "No chain/target/match" errors - rule already gone
-        if !stderr.contains("No chain") && !stderr.contains("does not exist") {
-            warn!("failed to delete iptables rule: {}", stderr);
+        // "No chain/target/match", "Bad rule": the rule is gone already.
+        if !stderr.contains("No chain")
+            && !stderr.contains("does not exist")
+            && !stderr.contains("Bad rule")
+        {
+            anyhow::bail!("deleting iptables rule {rule}: {}", stderr.trim());
         }
     }
 
@@ -241,13 +196,15 @@ pub async fn cleanup_port_mappings(rules: &[String]) -> Result<()> {
 
     debug!(rules = rules.len(), "cleaning up port mapping rules");
 
-    // Delete in reverse order
+    // Delete in reverse order, every one, and report the ones that stayed.
+    let mut failures = Vec::new();
     for rule in rules.iter().rev() {
         if let Err(e) = delete_rule(rule).await {
             warn!(rule = %rule, error = %e, "failed to delete port mapping rule");
+            failures.push(format!("{e:#}"));
         }
     }
-
+    anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
     Ok(())
 }
 
@@ -387,44 +344,39 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
 /// The list-then-delete sequence runs under the host-level `bridged-nat.lock`,
 /// serializing it against `ensure_global_nat()` in concurrently starting fcvm
 /// processes so this never deletes a MASQUERADE rule another VM just confirmed.
-pub async fn cleanup_global_nat_if_unused() {
+pub async fn cleanup_global_nat_if_unused() -> Result<()> {
     // Serialize against ensure_global_nat() in other fcvm processes.
-    let _nat_lock = match super::acquire_host_network_lock("bridged-nat.lock").await {
-        Ok(lock) => lock,
-        Err(e) => {
-            warn!(error = %e, "failed to acquire bridged NAT lock, leaving global NAT rules in place");
-            return;
-        }
-    };
+    let _nat_lock = super::acquire_host_network_lock("bridged-nat.lock")
+        .await
+        .context("acquiring the bridged NAT lock; global NAT rules left in place")?;
 
     // Check if any veth0- interfaces exist (active bridged VMs)
-    let output = match Command::new("ip")
+    let output = Command::new("ip")
         .args(["-o", "link", "show"])
         .output()
         .await
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return, // Can't check — leave rules in place
-    };
+        .context("listing interfaces to see whether bridged VMs remain")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "`ip -o link show` failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     if stdout.lines().any(|line| line.contains("veth0-")) {
         debug!("other bridged VMs still running, keeping global NAT rules");
-        return;
+        return Ok(());
     }
 
     info!("no bridged VMs running, cleaning up global NAT rules");
 
     // Detect outbound interface for MASQUERADE rule deletion
-    let outbound_iface = match detect_default_interface().await {
-        Ok(iface) => iface,
-        Err(e) => {
-            warn!(error = %e, "failed to detect default interface for NAT cleanup");
-            return;
-        }
-    };
+    let outbound_iface = detect_default_interface()
+        .await
+        .context("detecting the default interface for NAT cleanup")?;
 
     // Remove the fcvm-tagged MASQUERADE rules for both subnets
+    let mut failures = Vec::new();
     for subnet in &["172.30.0.0/16", "10.0.0.0/8"] {
         let output = Command::new("iptables")
             .args([
@@ -457,12 +409,10 @@ pub async fn cleanup_global_nat_if_unused() {
                     && !stderr.contains("No chain")
                     && !stderr.contains("Bad rule")
                 {
-                    warn!(subnet = %subnet, error = %stderr, "failed to remove MASQUERADE rule");
+                    failures.push(format!("{subnet}: {}", stderr.trim()));
                 }
             }
-            Err(e) => {
-                warn!(subnet = %subnet, error = %e, "failed to run iptables for NAT cleanup");
-            }
+            Err(e) => failures.push(format!("{subnet}: {e}")),
         }
     }
 
@@ -471,7 +421,13 @@ pub async fn cleanup_global_nat_if_unused() {
     // IP forwarding being enabled. Since we can't know whether fcvm was the one
     // that enabled it, the safe default is to leave it on.
 
+    anyhow::ensure!(
+        failures.is_empty(),
+        "removing the shared MASQUERADE rules failed: {}",
+        failures.join("; ")
+    );
     debug!("global NAT cleanup complete");
+    Ok(())
 }
 
 /// Detects the default network interface for outbound traffic

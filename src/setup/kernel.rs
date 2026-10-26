@@ -245,7 +245,7 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
     // builder's own, then rename; the temp is removed if it is not published)
     if !tarball_path.exists() {
         println!("  → Downloading tarball...");
-        let tarball_temp = super::StoreTemp::new(&tarball_path);
+        let tarball_temp = super::StoreTemp::new(&tarball_path)?;
 
         let output = Command::new("curl")
             .args(["-fSL", url, "-o"])
@@ -270,7 +270,7 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
 
     // Extract kernel from tarball (atomic: extract to temp, then move)
     println!("  → Extracting kernel...");
-    let extract_dir = super::StoreTemp::new(&cache_dir.join(format!("kernel-{}", url_hash)));
+    let extract_dir = super::StoreTemp::new(&cache_dir.join(format!("kernel-{}", url_hash)))?;
     let extract_temp = extract_dir.path();
     tokio::fs::create_dir_all(extract_temp).await?;
     // A killed root run leaves this directory behind; hand it to the invoker so
@@ -309,7 +309,7 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
     // Copy to a temp name in the same directory, then atomically rename onto the
     // final content-addressed path. An interrupted or failed copy (kill, ENOSPC)
     // must never leave a partial file that later runs treat as a valid kernel.
-    let kernel_temp = super::StoreTemp::new(&kernel_path);
+    let kernel_temp = super::StoreTemp::new(&kernel_path)?;
     if let Err(e) = tokio::fs::copy(&extracted_path, kernel_temp.path()).await {
         let _ = flock.unlock();
         return Err(e).context("copying kernel to staging location");
@@ -641,7 +641,7 @@ pub fn custom_kernel_filename(profile_name: &str, kernel_version: &str, sha: &st
 }
 
 async fn download_kernel_binary(url: &str, dest: &Path) -> Result<()> {
-    let temp = super::StoreTemp::new(dest);
+    let temp = super::StoreTemp::new(dest)?;
     let temp_path = temp.path();
     let max_retries = 3;
 
@@ -1016,7 +1016,7 @@ async fn build_kernel_locally(
     // The build writes a staging path of its own, renamed onto `dest` only when
     // it succeeds, so a failed build leaves an existing kernel untouched and two
     // builders sharing the store never write the same file.
-    let staging = super::StoreTemp::new(dest);
+    let staging = super::StoreTemp::new(dest)?;
 
     // Generate the build script
     let script_content = generate_vm_kernel_build_script(
@@ -1042,6 +1042,9 @@ async fn build_kernel_locally(
     // rootless build of the same profile.
     let mut cmd = Command::new(&script_path);
     super::run_build_as_sudo_invoker(&mut cmd);
+    // The script writes the staging path; a setup killed while it runs leaves it running,
+    // and the staging path's record must stay live until it exits.
+    staging.holder()?.hold_in(&mut cmd);
     let status = run_streaming(cmd, "kernel_build")
         .await
         .context("running build script")?;
@@ -1303,6 +1306,28 @@ fn compute_host_kernel_sha(config: &HostKernelConfig, repo_root: &Path) -> Resul
     Ok(compute_sha256_short(&content))
 }
 
+/// Environment variable naming the host kernel build directory.
+/// `scripts/check-host-kernel-build.sh` (run by `make install-host-kernel`)
+/// picks it: a directory on the scratch disk when `/tmp` is on the root disk.
+const HOST_KERNEL_BUILD_DIR_ENV: &str = "FCVM_HOST_KERNEL_BUILD_DIR";
+
+/// Where the host kernel is built when nothing names a directory.
+const DEFAULT_HOST_KERNEL_BUILD_DIR: &str = "/tmp/kernel-build-host";
+
+/// The build directory, made absolute: the build script changes into it before it changes
+/// into the source directory beneath it, so a relative path would resolve twice.
+fn host_kernel_build_dir_from(value: Option<std::ffi::OsString>) -> PathBuf {
+    let dir = match value {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(DEFAULT_HOST_KERNEL_BUILD_DIR),
+    };
+    std::path::absolute(&dir).unwrap_or(dir)
+}
+
+fn host_kernel_build_dir() -> PathBuf {
+    host_kernel_build_dir_from(std::env::var_os(HOST_KERNEL_BUILD_DIR_ENV))
+}
+
 /// Build and install host kernel with fcvm patches.
 ///
 /// Uses the running kernel's config as base (includes EC2/AWS modules),
@@ -1379,7 +1404,9 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
 
     // Stays root by design: this interactive EC2 flow pairs the build with
     // dpkg -i and update-grub, which require root anyway.
-    let cmd = Command::new(&script_path);
+    let build_dir = host_kernel_build_dir();
+    let mut cmd = Command::new(&script_path);
+    cmd.env("BUILD_DIR", &build_dir);
     let status = run_streaming(cmd, "host_kernel_build")
         .await
         .context("running host kernel build script")?;
@@ -1397,7 +1424,6 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
     // Find the linux-image deb for THIS build (exclude dbg packages). The build
     // dir is shared across builds and may still hold debs from older SHAs, so
     // filter by the expected package name instead of taking any linux-image-*.deb.
-    let build_dir = Path::new("/tmp/kernel-build-host");
     let pattern = format!("{}/{}_*.deb", build_dir.display(), expected_pkg);
     let debs: Vec<_> = glob::glob(&pattern)
         .context("globbing for deb files")?
@@ -2870,7 +2896,7 @@ pub async fn ensure_cloud_hypervisor(repo: &str, branch: &str) -> Result<PathBuf
     // Copy to a temp name in the same directory, then atomically rename onto the
     // content-addressed path. An interrupted copy (kill, ENOSPC) must never leave
     // a partial binary that later runs treat as valid.
-    let temp = super::StoreTemp::new(&bin_path);
+    let temp = super::StoreTemp::new(&bin_path)?;
     if let Err(e) = tokio::fs::copy(&binary, temp.path()).await {
         let _ = flock.unlock();
         return Err(e).context("installing cloud-hypervisor binary");
@@ -2959,6 +2985,29 @@ async fn update_grub_config(kernel_name: &str, boot_args: Option<&str>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `make install-host-kernel` points the build at the scratch disk through
+    /// FCVM_HOST_KERNEL_BUILD_DIR; the build script and the search for its debs
+    /// must use that one directory.
+    #[test]
+    fn the_host_kernel_build_dir_is_the_one_the_environment_names() {
+        assert_eq!(
+            host_kernel_build_dir_from(Some("/scratch/kernel-build-host".into())),
+            PathBuf::from("/scratch/kernel-build-host")
+        );
+        assert_eq!(
+            host_kernel_build_dir_from(None),
+            PathBuf::from("/tmp/kernel-build-host")
+        );
+        assert_eq!(
+            host_kernel_build_dir_from(Some("".into())),
+            PathBuf::from("/tmp/kernel-build-host")
+        );
+        assert_eq!(
+            host_kernel_build_dir_from(Some("relative-build".into())),
+            std::env::current_dir().unwrap().join("relative-build")
+        );
+    }
 
     fn write_executable(path: &Path, contents: &str) {
         std::fs::write(path, contents).unwrap();

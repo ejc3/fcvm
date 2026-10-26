@@ -253,7 +253,7 @@ pub async fn setup_host_veth(veth_name: &str, ip_with_cidr: &str) -> Result<()> 
     // DNS: VMs now use host DNS servers directly (read from /etc/resolv.conf)
     // No dnsmasq needed - the host DNS servers are reachable via the veth bridge
 
-    // Add FORWARD rule to allow outbound traffic from this veth
+    // Add FORWARD rule to allow outbound traffic from this veth (`forward_rule`)
     let forward_rule = format!("-A FORWARD -i {} -j ACCEPT", veth_name);
     let output = Command::new("iptables")
         .args(["-t", "filter", "-C", "FORWARD"]) // Include chain name for -C check
@@ -943,6 +943,19 @@ pub async fn delete_veth_pair(host_veth: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The FORWARD rule `setup_host_veth` adds for `veth_name`, as the record that lets a
+/// later launch remove it (`crate::reclaim`).
+pub fn forward_rule(veth_name: &str) -> crate::reclaim::Resource {
+    crate::reclaim::Resource::Rule {
+        program: "iptables".to_string(),
+        args: [
+            "-t", "filter", "-A", "FORWARD", "-i", veth_name, "-j", "ACCEPT",
+        ]
+        .map(str::to_string)
+        .to_vec(),
+    }
 }
 
 /// Deletes the FORWARD rule for a veth interface

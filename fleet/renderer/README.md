@@ -78,9 +78,12 @@ scene is at golden hour (sun about 7 degrees up):
 
 Convergence: exact accumulation while the camera holds; while it moves, each
 frame averages itself with its last 7 frames reprojected through a guard band
-the renderer draws around its rect, and pixels with few samples get an
-edge-aware 5 x 5 filter over pixels drawn under the same rules, so moving
-frames also match across tile edges. Views that would get under half a sample
+the renderer draws around its rect (over the sky, clamped to the frame's own
+colors around each pixel, so a near cloud leaves no trail), and pixels with
+few samples are denoised by an edge-aware a-trous filter over the radiance
+divided by an albedo guide, guided by the first hit's distance and normal,
+over pixels drawn under the same rules, so moving frames also match across
+tile edges. Views that would get under half a sample
 per pixel (720p and 1080p at the default budget) draw a checkerboard, half or
 a quarter of the pixels per frame, and fill the rest along the edge through
 each gap. A cloud covering most of a pixel is reprojected at its own distance,
@@ -101,7 +104,7 @@ src/server.cpp     HTTP/1.1 and WebSocket
 src/nvenc.cpp      NVENC (libnvidia-encode loaded at run time; header from nv-codec-headers, MIT)
 src/gpustats.cpp   NVML (libnvidia-ml loaded at run time)
 tests/test_host.cpp  scene parsing, splines and holds, tile geometry, wire formats (no GPU)
-tests/test_gpu.cpp   the seam test (GPU)
+tests/test_gpu.cpp   the seam test, and a moving frame's error against a held reference (GPU)
 tools/             Python clients: smoke, measure, relaunch, mosaic, rawmosaic, seam_metric
 ```
 
@@ -126,7 +129,12 @@ directory private to another container user (`/home/ubuntu`,
 
 Other commands of the binary: `still OUT.ppm [--t T] [--h H] [--scene FILE]
 [--spp N] [--frames N]` renders one frame (or a hold of N frames) to a file;
-`bench` times render and encode per height.
+`bench` times render and encode per height. `quality OUTDIR --t T [--scene
+FILE] [--h H] [--cols C --rows R]` draws a moving frame of a C x R grid, each
+tile in a fresh renderer with its history, against the same pose held to 1024
+samples, and prints each tile's samples per pixel, render ms and RMSE
+(`BUDGET`, `MARGIN` as for `serve`); it writes the stitched frame and
+reference as PPM.
 
 Tools (Python 3 standard library, plus Pillow and the `ffmpeg` CLI for
 decoding):
@@ -143,6 +151,42 @@ python3 tools/mosaic.py out 4 2 540 25 tools/scene-hold.json HOST1:8080 ... HOST
 python3 tools/rawmosaic.py out 4 2 540 tools/scene-move.json HOST1:8080 ...   # unencoded tiles of one frame (GET /raw)
 python3 tools/seam_metric.py out.png 4 2              # seam ratio at every tile boundary
 ```
+
+## Moving frames at the wall's size (round 13, 2026-10-26)
+
+One g4dn.metal, each run in an fcvm VM on its own T4. The staging wall is a
+4 x 4 grid of 640 x 360 tiles (a 2560 x 1440 image, `h=360`); its grid
+budget was 420,448 pixel-samples, which gives each tile's 321,456 drawn
+pixels 1 sample per pixel (2 samples need 500,000, and at 707,107 the slowest
+tile took 27.0 ms against the controller's 23.3 ms target, so the budget
+cannot rise at this size). `fleet-renderer quality` on three flights of the
+directed camera, each frame the 16 tiles drawn in fresh renderers with 24
+frames of history, against the same pose held to 1024 samples. rmse: 8-bit
+RGB over the whole image; grain: RMS of the luminance error minus its 5 x 5
+mean; SSIM of luminance, 7 x 7 windows.
+
+| flight, frame | rmse before -> after | grain | SSIM | slowest tile, render ms |
+|---|---|---|---|---|
+| high-lakes -> peak-seam, t 16 (9 s into 18) | 7.04 -> 4.24 | 4.42 -> 3.14 | 0.929 -> 0.957 | 13.1 -> 15.5 |
+| peak-seam -> sunset-ridge, t 13.5 (6.5 of 13) | 15.43 -> 4.55 | 6.49 -> 3.10 | 0.821 -> 0.939 | 11.5 -> 12.7 |
+| dawn-valley -> peak-close, t 16 (9 of 18) | 21.93 -> 5.17 | 5.90 -> 3.24 | 0.836 -> 0.941 | 12.3 -> 13.6 |
+
+Of the rmse, the sky's history clamp alone took the second flight from 15.43
+to 7.78 and the third from 21.93 to 7.13 (the trail of near clouds); the
+denoiser alone (an earlier 5 x 5 variant, without the clamp) 7.04 -> 6.61 on
+the first. Drawn pixels
+per tile rise from 321,456 to 354,944 (the denoiser's 16-pixel reach), still 1
+sample per pixel at 420,448. The denoiser itself (5 passes over the resolved
+region) took 0.44 ms on a wall tile and 1.15 ms on a whole 720p frame.
+Larger views pay more: the whole 720p image (stride 4) 28.1 -> 30.7 ms render,
+a 1080 detail tile 27.9 -> 32.3 ms, a claimed tile 720 tall at 420,448 34.8 ->
+40.0 ms. `shots/moving-denoise-before-after.jpg` (terrain of the first two
+flights) and `shots/moving-clouds-before-after.jpg` (the third flight's sky):
+before, after, reference. The seam test passes on two T4s with the same
+hashes (36 checks), and its new check pins the improvement: on the second
+flight at 960 x 540, 1 sample per pixel, rmse 15.34 and grain 7.02 before,
+6.10 and 4.45 after (bounds 9.0 and 5.5; without the clamp rmse is 14.21,
+without the denoiser grain is 9.94).
 
 ## Measured (2026-10-23, g4dn.metal from the fleet host AMI, one T4 per fcvm VM)
 

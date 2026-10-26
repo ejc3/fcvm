@@ -13,9 +13,10 @@ Conventions:
   `_secs`.
 - Scene time `t` is seconds since the scene's `epoch_unix_ms`.
 - A rectangle `{"x","y","w","h"}` is a fraction of the whole image: `x` and `w` of its
-  width, `y` and `h` of its height, origin top left. The fcvm half is `x` in [0, 0.5), the
-  EC2 half `x` in [0.5, 1). `image_aspect` is the whole image's width / height (default
-  16/9, the renderer's: each half is 8:9).
+  width, `y` and `h` of its height, origin top left. The fcvm side is on the left and the
+  EC2 side on the right, each as wide as its share of the configured tiles (`layout`).
+  `image_aspect` is the whole image's width / height (default 16/9, the renderer's; with
+  as many tiles configured on each side, each side is 8:9).
 - Camera `pos` is the camera position and `look` the world point it looks at, as
   `[x, altitude, z]` in kilometres (the renderer's world units); `fov_deg` is the vertical
   field of view. `time_of_day` is a fraction of the day in [0, 1) (0.25 sunrise, 0.5 noon,
@@ -218,7 +219,8 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
      "borrowed": {"session": "claim-3", "viewer": "v-9", "since": 1761134400000, "until": 1761134460000}, ...},
     {"id": "fcvm:3", "phase": "failed", "error": "...",
      "failure": {"kind": "relaunch_failed", "message": "fcvm exited ...", "retry_at": 1761134402000}, ...},
-    {"id": "ec2:1", "half": "ec2", "rect": {"x": 0.5, "y": 0, "w": 0.25, "h": 0.5}, "phase": "waiting_capacity", "slot": null, ...}
+    {"id": "fcvm:8", "phase": "waiting_capacity", "slot": null, "frame_url": null, "host": null, ...},
+    {"id": "ec2:1", "half": "ec2", "rect": {"x": 0.5, "y": 0, "w": 0.25, "h": 0.5}, "phase": "waiting_capacity", "slot": "ec2-1", "frame_url": null, ...}
   ],
   "aggregates": [
     {"id": "agg:<host>", "half": "fcvm", "host": "<host>", "rect": {"x": 0, "y": 0, "w": 0.5, "h": 1},
@@ -273,17 +275,24 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
 }
 ```
 
-- `tiles` lists one tile per live GPU, the fcvm side then the EC2 side: `fleet.n` fcvm
-  tiles (fcvm GPUs on hosts that are not draining, at most `max_tiles`) and `fleet.ec2_n`
-  EC2 tiles (EC2 tiles with an instance, at most `max_tiles`). Each side is as wide as its
-  share of the live GPUs (`layout.fcvm`, `layout.ec2`: fcvm 100 and EC2 12 give the fcvm
-  side 100/112 of the width); a side with none has no rectangle (null) and the other takes
-  the whole width; with none on either side there are no tiles. There are no dark tiles:
-  an EC2 tile still waiting for capacity is not on the wall (`fleet.ec2_waiting` counts
-  them, and the race's `relaunch_all` shows the wait). The fcvm side is cut into
-  full-width bands, one per GPU host (hosts in the order of their lowest slot number), as
-  tall as the host's share of its tiles, each band its own grid, row-major, so a host's
-  tiles cover one rectangle, which its aggregator encodes whole; the EC2 side is one grid.
+- `tiles` lists one tile per configured place, the fcvm side then the EC2 side: `fleet.n`
+  fcvm tiles and `fleet.ec2_n` EC2 tiles. The fcvm side has `--fcvm-tiles` places, or one
+  per live fcvm GPU (GPUs on hosts that are not draining, at most `max_tiles`) when there
+  are more of those; the EC2 side has `--ec2-tiles` places (at most `max_tiles`), one per
+  EC2 tile, with an instance or not. Asleep, both sides have none. Each side is as wide as
+  its share of the places (`layout.fcvm`, `layout.ec2`: 8 and 8 give each side half the
+  width, fcvm 100 and EC2 12 give the fcvm side 100/112), so the halves do not change when
+  GPUs go dark: a race, an EC2 tile waiting for capacity, a host not yet connected or
+  reclaimed. A side with no places has no rectangle (null) and the other takes the whole
+  width; with none on either side there are no tiles. A place with no live renderer is a
+  dark tile: an fcvm place with no GPU has `phase` `waiting_capacity` and a null `slot`,
+  `host` and `frame_url`; an EC2 tile without an instance keeps its `slot` and reports its
+  own phase (`fleet.ec2_waiting` counts those, and the race's `relaunch_all` shows a
+  capacity wait). The fcvm side is cut into full-width bands, one per GPU host (hosts in
+  the order of their lowest slot number) and, below them, one for the places with no GPU,
+  each as tall as its share of the side's tiles and cut into its own grid, row-major, so a
+  host's tiles cover one rectangle, which its aggregator encodes whole; the EC2 side is
+  one grid.
   Tile ids `fcvm:<k>` and `ec2:<k>` (1-based) name places; `slot` names the GPU behind the
   place. A GPU keeps its slot (and its addresses) when the fleet re-tiles: only its
   rectangle changes. Slot ids are `slot-<n>` (fcvm, reused lowest first) and `ec2-<n>`. A
@@ -299,18 +308,18 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   generation has delivered its first frame at or after `from_t`, then swaps them all at
   once.
 - `budget` is the grid's render budget in pixel-samples per frame per tile and
-  `budget_from_t` the scene time it took effect at (both null until every placed tile has
-  reported a fit); see "Grid budget" below. The page may show it; it needs nothing from
+  `budget_from_t` the scene time it took effect at (both null until every placed tile with a
+  renderer has reported a fit; a dark place and an EC2 tile without an instance have none); see "Grid budget" below. The page may show it; it needs nothing from
   it.
-- `phase`: `waiting_capacity` (dark: no GPU behind the tile, or EC2 refused capacity),
+- `phase`: `waiting_capacity` (dark: no fcvm GPU in the place, or EC2 refused capacity),
   `borrowed` (lent to a visitor, drawn black), `pending` (assigned, nothing reported yet),
   `relaunching` (a newer generation is wanted than the agent has reported), or what the
   agent reported: `stopping`, `restoring`, `starting`, `running`, `failed`.
 - `frame_url` is the renderer's frame WebSocket as the browser should open it (append
   `?h=<height>`), over IPv6; `frame_url_v4` the same renderer over IPv4. Both are null while
-  borrowed. With `--dns-token-secret` both are the launch's own names (see "Running it"),
-  null until those names answer at the zone's authoritative servers, and a relaunch gives
-  new ones; without it `frame_url` is what the agent reported and `frame_url_v4` is null.
+  borrowed. With `--dns-subzone` both are the launch's own names (see "Running it"),
+  published with the launch's address, and a relaunch gives new ones; without it
+  `frame_url` is what the agent reported and `frame_url_v4` is null.
   A viewer uses one family for every tile of both halves. After a relaunch the tile
   reconnects when `phase` is `running` again and its URLs are set.
 - `last_relaunch.first_frame_at - clicked_at` is the tile's relaunch time; `phases` are
@@ -336,26 +345,26 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   (`id`), with a label and this hold's votes; `holding` is the viewpoint held now (null
   while flying) and `next_hold_at` when the camera leaves it; `next` is the next hold once
   the vote has closed, `arrive_next_at` when the camera gets there.
-- `fleet.power` is whether the GPU capacity is up, when the coordinator owns the GPU hosts'
-  auto scaling groups (`--scale-group`), or with `--sleep-when-idle` on hosts it does not
-  scale (a fixed host, a test box); without either it stays `awake`. After
+- `fleet.power` is whether the GPU capacity is up, when the coordinator launches the GPU
+  hosts (`--host-template`), or with `--sleep-when-idle` on hosts it does not launch (a
+  fixed host, a test box); without either it stays `awake`. After
   `--idle-scale-down` seconds (default 600) with no active viewer (`viewers.active`), and
   never while a claim is active or a race is running, the fleet goes `asleep`
-  (`asleep_since`): every group is set to desired capacity 0, nothing is placed (every fcvm
+  (`asleep_since`): every GPU host is terminated, nothing is placed (every fcvm
   GPU still connected goes to standby, so its VM stops; the EC2 half's instances are
   terminated), no race is scheduled (`next_race_at` null) and
   `restart_now` is refused. Hosts that leave then are not reclaimed. When an active viewer
-  arrives it is `waking` from `woke_at`, the moment the wake began: every group goes back
-  to `--awake-capacity` (default 1) and the EC2 half launches as many tiles as the fcvm
-  half had. `hosts` lists each GPU host by EC2 instance id with the phases it has reached,
-  in order: `instance_pending` and `booted` from the group (Pending, then InService),
+  arrives it is `waking` from `woke_at`, the moment the wake began: every host region gets
+  `--awake-capacity` hosts again (default 1) and the EC2 half launches its `--ec2-tiles`
+  tiles. `hosts` lists each GPU host by EC2 instance id with the phases it has reached, in
+  order: `instance_pending` and `booted` from EC2 (pending, then running),
   `store_ready` when the host marked its store mounted (the agent's hello reports it; the
   phase is absent when the host does not mark it), `agent_connected` when its agent says
   hello (the agent names itself by its instance id), `tiles_rendering` when all its placed
   slots run. Once every placed tile of both halves runs it is `awake`; `last_wake` gives
-  the wake's start, when it was complete (`awake_at`), the tiles placed then (`gpus`, both
-  halves) and the time between (`ms`); `wakes` keeps the last 20. The EC2 half can make
-  the image complete before a GPU host's agent has said hello (a host's slots are placed
+  the wake's start, when it was complete (`awake_at`), the tiles rendering then (`gpus`,
+  both halves; an EC2 place without an instance is not one) and the time between (`ms`);
+  `wakes` keeps the last 20. The EC2 half can make the image complete before a GPU host's agent has said hello (a host's slots are placed
   only then), so the hosts' phases keep being recorded after the fleet is `awake`, until
   every host of the wake has `tiles_rendering`. The coordinator logs each step at info
   (`wake: started`, `wake: host phase`, `wake: host boot` with the hello's boot times,
@@ -392,16 +401,17 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   one tile's, each with its own `kind`: `host_reclaimed` (a spot notice or the agent went
   away; kept for a minute after the host is gone) and `coordinator_degraded` (a component
   such as the text check is failing). A reclaimed host's tiles leave the tiling in the
-  event that reports it (its slots are re-tiled onto the other hosts at once), so there is
+  event that reports it (the side keeps its places: the other hosts' GPUs are re-tiled
+  at once and the places left over are dark), so there is
   no `draining` tile phase and no tile-level `host_reclaimed`; `fleet.hosts[].draining`
   and `failures` carry it.
 - `aggregates` lists the regions an aggregator serves (see Aggregator): one per GPU host
   that has placed tiles, with the tiles inside it, and the EC2 half when the coordinator
   runs its aggregator. `frame_url` is null until the host's aggregator is serving. With
-  the coordinator's DNS (`--dns-token-secret`) a host aggregator's `frame_url` and
-  `frame_url_v4` are its published names (`wss://agg-<host>-<token>.<zone>/frames`,
-  `wss://agg-<host>-<token>-v4.<zone>:<port>/frames`), and both stay null for an aggregator
-  that serves no browser (no `--aggregate-tls-port`).
+  the coordinator's subzone (`--dns-subzone`) a host aggregator's `frame_url` and
+  `frame_url_v4` are its published names (`wss://agg-<host>-<token>.<subzone>/frames`,
+  `wss://agg-<host>-<token>-v4.<subzone>:<port>/frames`), and both stay null for an
+  aggregator that serves no browser (no `--aggregate-tls-port`).
 - `actions` holds the latest 50 intents, committed and refused, oldest first: the
   `viewer` that sent it, the intent `id`, its `args` (a refused word's are `{}`, so its
   text appears nowhere), and the outcome.
@@ -422,21 +432,20 @@ relaunching (its region would be black; claimed GPUs and dark tiles do not count
 ```
 fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file <path>]
                  [--text-check bedrock --text-check-model <id> --text-check-region <region> | --text-check none]
-                 [--max-tiles 100] [--ec2 none|fake] [--allowed-origin <scheme://host[:port]>]...
+                 [--max-tiles 100] [--fcvm-tiles 8] [--ec2 none|fake] [--allowed-origin <scheme://host[:port]>]...
                  [--ec2-aggregate-listen <addr:port> (--ec2-aggregate-url <ws url> | --ec2-aggregate-tls
                   [--ec2-aggregate-tls-dir /run/fcvm-fleet/tls])] [--aggregate-arg <arg>]...
                  [--race-every <secs>] [--restart-cooldown 60] [--camera-seed 1] [--max-borrowed <n>]
                  [--trust-cf-connecting-ip] [--turnstile-secret <secret> --turnstile-site-key <key>]
                  [--admin-listen <addr:port>] [--ffmpeg ffmpeg]
-                 [--scale-group <region>:<group name>]... [--awake-capacity 1] [--idle-scale-down 600]
-                 [--on-demand-group <region>:<group name>]... [--spot-wait 120]
+                 [--host-template <region>:<template>... --host-subnet <region>:<subnet id>...]
+                 [--awake-capacity 1] [--host-on-demand-max 8] [--idle-scale-down 600]
                  [--state-bucket <bucket> [--state-key state.json] [--state-region <region>]]
                  [--ec2 aws --ec2-tiles 8 --ec2-regions <r1,r2,...> [--ec2-template fcvm-fleet-tile-x86_64]
                   [--ec2-on-demand-template <name>] [--fleet-name stage]
                   [--ec2-pool <n> --ec2-pool-template <name>]
                   [--ec2-subnets <region>:<subnet>,... --ec2-security-group <region>:<group>]...]
-                 [--dns-zone fcvm.dev]
-                 [--dns-token-secret <secret> [--dns-zone-id <id>] [--dns-nameservers <ns>,...]]
+                 [--dns-zone fcvm.dev] [--dns-token-secret <secret> [--dns-zone-id <id>]]
                  [--dns-subzone <subzone> --dns-subzone-ns <ns>,... --dns-listen <addr:port> [--dns-rate-limit 200]]
                  [--tls-secret <secret>] [--secrets-region <region>]
 ```
@@ -446,6 +455,9 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   keeps versions) at most once a second while it changes and at shutdown. A missing object
   is no state; a refused read (403, which S3 also answers for a missing object to a caller
   without `s3:ListBucket`) stops the coordinator rather than start it empty.
+- `--fcvm-tiles` (default 8, at most `--max-tiles`) is the fcvm side's places: with fewer
+  live fcvm GPUs the rest are dark tiles, with more the side has one place per GPU. It and
+  the EC2 side's `--ec2-tiles` size the two sides (see `tiles` above).
 - `--ec2 aws` runs `--ec2-tiles` EC2 tiles, whatever the fcvm side has. Each is one
   instance from the tile launch template (one-time spot), tagged `Purpose=fcvm-fleet-tile`,
   `FleetTile=<tile>` and `Fleet=<--fleet-name>` (`FLEET_NAME`, default `stage`) at launch,
@@ -493,26 +505,21 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   stopped tile started to its first frame in 15.5 s (persistent spot) and 17.2 to 17.5 s
   (on demand), against 81 to 84 s for a launch; a stopped persistent spot instance can be
   started again only once its request is `disabled`, 42 to 54 s after it stopped.
-- `--dns-token-secret` names each launch in `--dns-zone` with the zone's Cloudflare token.
-  Every launch of an fcvm slot or EC2 tile that reports an address gets a label never used
-  before, `slot-<n>-<token>` / `ec2-<n>-<token>` (8 random base32 characters), and under it
-  `<label>.<zone>` AAAA (the slot's own IPv6 address) and `<label>-v4.<zone>` A (the host's
-  or the tile's public IPv4 address), both unproxied with TTL 60. The coordinator writes the
-  records, confirms them at every server in `--dns-nameservers` (asked directly, without
-  recursion), and only then sets the tile's `frame_url` and `frame_url_v4`. A name is never
-  asked for before it exists and never changes address, so no resolver holds a negative or
-  stale answer for it. A launch's records stay until its slot has a newer published launch
-  or leaves the fleet; names of the fleet's shape (`slot-<n>`, `ec2-<n>`, with or without a
-  token, `agg-<host>-<token>`, each with or without `-v4`) that nothing references are
-  deleted, at start too; every other name in the zone is left alone. A host aggregator
-  that reports public addresses is named the same way under `agg-<host>-<token>` (a host
-  name of lowercase letters, digits and inner hyphens, at most 40 characters): AAAA its own
-  IPv6 address, A the host's IPv4 address, with its port in `frame_url_v4`. Its names last
-  while it reports the same addresses.
+- `--dns-token-secret` is the zone's Cloudflare token, which the certificate renewal writes
+  its DNS-01 records with (see "Certificate").
 - `--dns-subzone` makes the coordinator the authoritative DNS server of a subzone of
   `--dns-zone` (the parent delegates it with NS records naming `--dns-subzone-ns`, and no DS
-  record) and names launches there instead: `<label>.<subzone>` AAAA and
-  `<label>-v4.<subzone>` A, TTL 60. Minting a launch's label and publishing its names are
+  record) and names launches there. Every launch of an fcvm slot or EC2 tile that reports
+  an address gets a label never used before, `slot-<n>-<token>` / `ec2-<n>-<token>` (8
+  random base32 characters), and under it `<label>.<subzone>` AAAA (the slot's own IPv6
+  address) and `<label>-v4.<subzone>` A (the host's or the tile's public IPv4 address), TTL
+  60. A launch's names answer until its slot has a newer launch or leaves the fleet. A
+  host aggregator that reports public addresses is named the same way under
+  `agg-<host>-<token>` (a host name of lowercase letters, digits and inner hyphens, at most
+  40 characters): AAAA its own IPv6 address, A the host's IPv4 address, with its port in
+  `frame_url_v4`; the EC2 half's aggregator is `agg-ec2-<token>` (see
+  `--ec2-aggregate-tls`). An aggregator's names answer while it reports the same
+  addresses; new addresses get a new label. Minting a label and publishing its names are
   one step of the coordinator's state, and the server answers from that state, so a name
   answers from the moment a viewer can learn it, with no wait. It listens on
   `--dns-listen`, UDP and TCP (a high port; a load balancer maps 53), and answers only for
@@ -521,21 +528,20 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   with the SOA; REFUSED for any other name; AA set, no recursion, EDNS(0), TC over UDP when
   the client's buffer is too small. Over UDP, past `--dns-rate-limit` responses a second
   per source /24 or /56, every second response goes out truncated and the rest are
-  dropped. With `--dns-token-secret` it deletes, once at start, the launch names earlier
-  written to the parent zone.
+  dropped.
 - `--tls-secret` keeps the wildcard certificate renewed (see "Certificate").
 - `--ec2-aggregate-tls` (with `--ec2-aggregate-listen`, `--tls-secret` and
-  `--dns-token-secret`) serves the EC2 half's aggregator to browsers with TLS on port 443
+  `--dns-subzone`) serves the EC2 half's aggregator to browsers with TLS on port 443
   of the coordinator task's own addresses, read at start on ECS: the global IPv6 address
   from the task metadata (`ECS_CONTAINER_METADATA_URI_V4`) and the public IPv4 address of
   the task's network interface (EC2 `DescribeNetworkInterfaces` by its private address, in
   `AWS_REGION`, with the task role). It writes the certificate (from `--tls-secret`) as
   `tls.json` into `--ec2-aggregate-tls-dir` for the aggregator and reads the secret again
-  hourly, and names the addresses `agg-ec2-<token>` (AAAA and `-v4` A, both on 443) like a
-  host aggregator. A non-root process binds 443 only where the task lowers
+  hourly, and names the addresses `agg-ec2-<token>` in the subzone (AAAA and `-v4` A, both
+  on 443) like a host aggregator. A non-root process binds 443 only where the task lowers
   `net.ipv4.ip_unprivileged_port_start` (it covers IPv6 too). With published names the
   EC2 aggregate's `frame_url`/`frame_url_v4` are those names, else null;
-  `--ec2-aggregate-url` is used only without the DNS writer.
+  `--ec2-aggregate-url` is used only without the subzone.
 
 ### Certificate
 
@@ -552,35 +558,33 @@ renewal that fails is tried again 15 minutes later. Its key is PKCS#8 (`PRIVATE 
 both are PEM that nginx and rustls read. Renderers get it from their agent
 (`--tls-secret`), tiles from their own instance role.
 
-- `--scale-group` hands the coordinator the GPU hosts' auto scaling groups (repeatable,
-  one per region); it sets their desired capacity (Auto Scaling `SetDesiredCapacity`) and,
-  while they come up, reads their instances (`DescribeAutoScalingGroups`) every 2 s, with the
-  credentials of its task or instance role. A call that fails marks the coordinator
-  degraded (`scale`) and is retried.
-- `--on-demand-group` names an on-demand group as the fallback of the `--scale-group` in its
-  region (at most one per region, and that region must have exactly one scale group). Auto
-  Scaling does not move a spot group's capacity to on demand by itself, so the coordinator
-  does: while the groups come up, when the spot group and its on-demand group together
-  have fewer live instances (any lifecycle state but `Terminating*`, `Terminated` and
-  `Detach*`) than `--awake-capacity`, and either Auto Scaling has recorded a failed launch
-  of the spot group since the wake raised it (`DescribeScalingActivities`, a `Failed`
-  activity, e.g. `UnfulfillableCapacity` or `MaxSpotInstanceCountExceeded`, about 10 s after
-  the raise) or they have stayed short for `--spot-wait` seconds (default 120; the only rule
-  when the activities cannot be read), it sets the on-demand group to the shortfall and the
-  spot group to the live instances it has, so a spot launch that succeeds later cannot add
-  a host. It logs which rule fell back (`spot launch failed; falling back to on-demand now`
-  with the activity's message, or `spot group still short after the spot wait`). The groups
-  come up from the wake (or the coordinator's start) until they hold `--awake-capacity`
-  instances in service, also after the fleet is `awake` (the EC2 half can complete the
-  image first); the coordinator then logs `wake: host capacity in service` with `path`
-  (`spot`, `on-demand`, or `spot and on-demand`). A split written only half way (one call failed) is
-  written again on every poll until both groups hold it, and `scale` stays degraded until
-  then. A group it cannot describe is not taken to be short. It never raises the on-demand
-  group otherwise, sets it to 0 with the spot group when the fleet sleeps, and the next
-  wake asks spot first. Before raising a spot group for a wake (also the first one after
-  the coordinator starts) it reads both groups' desired capacity: an on-demand group that
-  already holds hosts keeps them, and the spot group is held at the rest. The on-demand group's own `max_size` caps
-  what it can be given. The on-demand instances are listed with the spot ones in `hosts`.
+- `--host-template` names a GPU host launch template (`<region>:<template>`, repeatable;
+  the templates of a region are one request's pools, e.g. one per architecture), and
+  `--host-subnet` the subnets hosts may launch in (`<region>:<subnet id>`, repeatable, at
+  least one per region with a template). Both also come comma separated from
+  `FLEET_HOST_TEMPLATES` and `FLEET_HOST_SUBNETS`, and `--host-on-demand-max` from
+  `FLEET_HOST_ON_DEMAND_MAX`. The coordinator launches the hosts itself, with
+  the credentials of its task or instance role: a region with fewer pending or running
+  hosts than `--awake-capacity` asks EC2 for the shortfall on spot (`CreateFleet` of type
+  `instant` over every template and subnet of the region, `price-capacity-optimized`), and
+  when the answer refuses spot for capacity (`InsufficientInstanceCapacity`,
+  `MaxSpotInstanceCountExceeded`, `UnfulfillableCapacity`, `VcpuLimitExceeded`, ...) asks
+  for the rest on demand in the same pass (`spot launch refused; launching on demand now`
+  with the refusal), while the fleet runs fewer than `--host-on-demand-max` on-demand hosts
+  (default 8, at most 8) in all regions together. The on-demand hosts are counted only when
+  every region could be listed; otherwise no region falls back until it can. A region still
+  short asks again 10 s later, spot first. Each host is tagged `Purpose=fcvm-fleet-host`,
+  `Fleet=<--fleet-name>` and `Market=spot|on-demand`, and is found by those tags, so a
+  restarted coordinator keeps the hosts it finds. Asleep, every host of the fleet is
+  terminated; awake, a stopped host and a host over the awake capacity (on-demand first)
+  are terminated, and a host that is reclaimed or terminated is replaced. The regions are
+  listed (`DescribeInstances`) every 2 s while hosts come up or go away and every 15 s while
+  they run; an instance a launch named counts as pending while lists leave it out (60 s at
+  most), and a launch whose answer is lost is asked again with the same idempotency token. The coordinator logs `wake: host launch accepted` (`market`, `request_ms`, the
+  `CreateFleet` round trip), `wake: host running` (`request_to_running_ms`) and, once a
+  region runs its awake capacity, `wake: host capacity in service` with `path` (`spot`,
+  `on-demand`, or `spot and on-demand`) and `since_wake_ms`. A call that fails marks the
+  coordinator degraded (`scale`) and is retried at the next poll.
 - `--admin-listen` serves the operator's endpoint, `POST /quarantine/release` with
   `{"host": "<host>", "sbdf": "0000:05:00.0"}`, which returns a quarantined GPU to
   rotation. It has no authentication: keep it on loopback or a private network.
@@ -847,10 +851,11 @@ coordinator runs the rule of the renderer's reference controller
 (`fleet/renderer/tools/budgetctl.py` at 55e81ad5 on `fleet-renderer-adapt`) in the pure core
 (`fleet_core::budget`), on its 1 s tick:
 
-- Every 2 s, a round over every placed tile of both sides that is not lent to a claim. No
-  decision until every one of them has reported a `budget_fit` (a tile that just joined
-  holds the round until its first report; a held round changes nothing, so the count of
-  rounds below carries over it). A renderer that is not `ready` reports no fit.
+- Every 2 s, a round over every placed tile of both sides that is not lent to a claim (an
+  EC2 tile without an instance has no renderer and is left out). No decision until every
+  one of them has reported a `budget_fit` (a tile that just joined holds the round until
+  its first report; a held round changes nothing, so the count of rounds below carries
+  over it). A renderer that is not `ready` reports no fit.
 - The smallest fit governs, smoothed half the way each round.
 - The first budget is the ladder rung under smoothed fit / 1.15 (the ladder is
   250,000 x 2^(n/4), n from -8 to 40).
@@ -907,7 +912,7 @@ primary interface, `Ipv6PrefixCount = 1`) runs each slot's VM in fcvm's routed m
 `<prefix>::<GPU index + 2>` (`--network routed --ipv6-prefix <prefix> --ipv6-address
 <addr>`; fcvm refuses the prefix's addresses 0 and 1). The slot keeps the address across
 relaunches and reports it as `ipv6` in every slot message; the coordinator names it in DNS
-(see the coordinator's `--dns-token-secret`). The renderer's container shares the VM's
+(see the coordinator's `--dns-subzone`). The renderer's container shares the VM's
 network, so a browser reaches its TLS port at that address. `--frame-zone` reports the frame
 URL as `wss://<slot id>.<zone>/frames`.
 
@@ -944,7 +949,7 @@ TLS (the aggregator's `--tls-listen`, the renderers' certificate file): on `<pub
 and with an IPv6 prefix on port 443 of `<prefix>::1`, the host's side of the prefix (fcvm
 never gives it to a VM), which the agent puts on the host's default IPv6 interface
 (`ip -6 addr replace <addr>/128 dev <iface> nodad`) before it starts. The message then
-carries what the coordinator names (`agg-<host>-<token>`, see `--dns-token-secret`):
+carries what the coordinator names (`agg-<host>-<token>`, see `--dns-subzone`):
 `ipv6` (port 443), and with `--public-ipv4-from-imds` the host's `ipv4` and the port as
 `v4_port`. The aggregator's `--listen` stays on `<publish ip>:<aggregate port>`, which the
 host's security group does not admit.
@@ -1467,7 +1472,7 @@ stride as `checkerboard` (1 when every pixel draws).
 
 **While the camera moves:** frame `k` (at `t = k/30`) draws its samples at
 its own `t`, seeded by (pixel, `t`, sample index), over its rect **plus a guard
-band** of `g + 4` pixels past the stream overlap on each side, where `g = ceil(0.015 * full_h)`
+band** of `g + 18` pixels past the stream overlap on each side, where `g = ceil(0.015 * full_h)`
 (clipped to the image). It keeps the last 8 frames it drew. Each pixel of the
 rect is then the sample-weighted average of
 
@@ -1484,18 +1489,35 @@ rect is then the sample-weighted average of
   from the pixel's first sample. Its hit kind stays that of what lies behind.
   Before, a near cloud was reprojected through the terrain behind it, or
   through the sky at infinity, and smeared while the camera moved fast.
+- Round 13: over the sky (hit kind sky, with or without a cloud in front), each
+  earlier frame's color is first clamped, per channel, to the range of this
+  frame's own colors over the 3 x 3 pixels around it that are sky. A cloud near
+  the eye crosses the sky faster than reprojection through the sky's distance
+  follows, and before this it left a trail of itself up to 7 frames long
+  behind the camera.
 
-This is computed for the rect plus the stream overlap (16 pixels) plus 2
-pixels on each side. Where a pixel's
-total weight is under 48 samples (fast motion, a fresh renderer, a 1080p view)
-it is then filtered: a 5 x 5 edge-aware average of those resolved pixels with
-the same hit kind, a depth within 3% and similar brightness, blended in fully
-below 16 samples and not at all from 48. Converged holds are not filtered.
+This is computed for the rect plus the stream overlap (16 pixels) plus 16
+pixels on each side (the denoiser's reach), together with an albedo guide (the
+mean, over a pixel's samples, of its first hit's surface albedo, weighted
+toward 1 by the haze and cloud in front of it, reprojected and weighted like
+the color) and the first sample's normal. Where a pixel's total weight is
+under 48 samples (fast motion, a fresh renderer, a 1080p view) it is then
+denoised, blended in fully below 16 samples and not at all from 48 (converged
+holds are not filtered): the color divided by the albedo guide is filtered by
+an edge-aware a-trous wavelet (Dammertz et al. 2010) of four 3 x 3 passes at
+steps 1, 2, 4 and 8 pixels, and multiplied back. A neighbour's weight falls
+with its distance off this pixel's tangent plane (against the pixel's
+footprint at its hit distance), with the angle between the normals (cosine to
+the 64th) and with the luminance difference over 4 standard deviations of the
+local noise (the variance of the luminance over the 3 x 3 pixels on the same
+surface, carried through the passes as in SVGF, Schied et al. 2017); it is
+zero across hit kinds, and the sky with the clouds over it is one surface that
+only the luminance stops.
 
 Every input of that rule is a whole-image pixel, a frame time or the scene, and
 every pixel it can read lies inside the drawing renderer's guard band (the
-filter reads 2 pixels past the overlap, whose reprojection reads `g + 1` past
-those), so:
+denoiser reads 16 pixels past the overlap, whose reprojection reads `g + 1`
+past those), so:
 **two renderers that drew the same frames `k-7 .. k` give identical pixels for
 frame `k`**, whatever their rects. A renderer that started (or missed a slot)
 less than 8 frames ago differs only until 8 frames have passed. History older

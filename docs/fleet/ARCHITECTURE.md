@@ -77,7 +77,7 @@ coordinator (Rust, `fcvm fleet coord`)     v
    ^  wss, agents dial out                 |
    |                                       v
 agent (Rust, `fcvm fleet agent`)         renderer in the slot's VM (container, GPU)
-  one per GPU host: spot g4dn.metal / g5g.metal in auto scaling groups, several regions
+  one per GPU host: spot g4dn.metal / g5g.metal the coordinator launches, several regions
    |  spawns, supervises, tears down
    v
 fcvm snapshot run --snapshot <gold> --gpu <sbdf> --network routed --ipv6-address <slot addr>
@@ -125,12 +125,15 @@ stdio and ssh transports, so the three transports share one protocol and one tes
 
 ### Hosts and capacity
 
-The GPU hosts are spot instances in EC2 auto scaling groups, one group per region, each
-with a mixed instances policy over both bare-metal GPU types (g4dn.metal: x86, eight T4;
-g5g.metal: arm64, two T4G; fcvm needs `/dev/kvm`, so nothing smaller qualifies), every AZ
-the region offers, and the `price-capacity-optimized` allocation strategy. The groups run
-in us-east-2, us-west-2 and us-east-1, so one region losing spot capacity leaves the
-others. Each group's desired capacity is 1, so up to three hosts render at once; one host is
+The GPU hosts are spot instances the coordinator launches itself with EC2 Fleet
+(`CreateFleet`, type `instant`), one request per region over both bare-metal GPU types'
+launch templates (g4dn.metal: x86, eight T4; g5g.metal: arm64, two T4G; fcvm needs
+`/dev/kvm`, so nothing smaller qualifies), every AZ the region offers a host type in, and
+the `price-capacity-optimized` allocation strategy. When spot is refused for capacity the
+same pass launches on demand, at most 8 on-demand hosts across the fleet
+(fleet/PROTOCOL.md, `--host-template`). The regions are us-east-2, us-west-2 and us-east-1,
+so one region losing spot capacity leaves the others. Each region runs 1 host while the
+fleet is awake, so up to three hosts render at once; one host is
 enough to show the whole image, at coarser tiles. The account's G spot quota is 96 vCPUs per
 region (64 in us-east-1), which is one g4dn.metal or one g5g.metal, so three regions give
 up to three hosts; a quota increase raises it.
@@ -217,8 +220,8 @@ picture changes from coarser to finer tiles at one frame `t`. When a host is rec
 two-minute spot notice) the coordinator re-tiles onto the remaining GPUs at once, before
 the host disappears, so the image never shows a hole for a lost host. Slot names are
 reused lowest-first, so a stable fleet keeps stable names. Both sides are re-tiled in the
-same event (each side's width follows its live GPU count), as a new layout generation that
-takes effect at a stated frame; the EC2 side keeps its configured number of tiles.
+same event, as a new layout generation that takes effect at a stated frame; each side keeps
+its configured number of places, and a place with no GPU is dark.
 
 Within a host's life a slot keeps its address across relaunches, so a browser reconnects
 to the same address. Two fcvm changes make that possible:
@@ -319,13 +322,16 @@ detail view for 1080p.
 **The image is fixed; its tiling follows the fleet.** The picture is always the same
 frame of the same scene. The coordinator splits each half into as many rectangles as that
 half has GPUs, so more hosts make each GPU's rectangle smaller and the whole image finer
-(more pixels and more ray-marching steps per pixel in total). **DECIDED (2026-10-23, replacing "the halves are symmetrical"): each side shows the GPUs it
-has live.** The fcvm and EC2 sides no longer mirror each other: each is as wide as its
-share of the live GPUs (fcvm 100 and EC2 12 give the fcvm side 100/112 of the width), one
-rectangle per GPU, never more, and no dark "waiting for capacity" tiles. An EC2 tile still
-waiting for spot capacity is not on the wall; its wait is shown in its own panel and kept
-out of the EC2 side's race time. A side with no GPU has no width, and with none on either
-side (asleep) there is no tile. A change of capacity re-tiles without a hitch: the
+(more pixels and more ray-marching steps per pixel in total). **DECIDED (2026-10-26, replacing "each side shows the GPUs it has live" of 2026-10-23):
+each side is sized by its configured GPUs.** The fcvm side has `--fcvm-tiles` places (or
+one per live fcvm GPU when there are more) and the EC2 side `--ec2-tiles`; each is as wide
+as its share of the places (8 and 8 give two halves, fcvm 100 and EC2 12 give the fcvm side
+100/112 of the width). A place with no live renderer keeps its rectangle and is drawn dark
+with its phase: an EC2 tile waiting for spot capacity or for its new instance in a race, an
+fcvm place whose host has not connected or was reclaimed. Sizing the sides by the live GPUs
+re-tiled the wall in the middle of every race, when the EC2 instances are replaced, so the
+dark tiles the race counts up vanished. A capacity wait is kept out of the EC2 side's race
+time. With no places on either side (asleep) there is no tile. A change of capacity re-tiles without a hitch: the
 coordinator publishes a new layout generation with the frame it takes effect at, each
 renderer switches to its new rectangle at that frame, and the page keeps the old tiles on
 screen until every new tile's first frame has arrived, then swaps them all at once. A GPU
@@ -362,8 +368,8 @@ All of it is Terraform in ejc3/aws, applied by the jumpbox:
   security group allowing TCP 443 from `::/0` and nothing else inbound (no SSH; SSM for
   access).
 - **Hosts:** a launch template per region and architecture (the AMI, IOMMU kernel
-  arguments, `Ipv6PrefixCount = 1`, the instance role), and one spot auto scaling group per
-  region with the mixed instances policy above.
+  arguments, `Ipv6PrefixCount = 1`, the instance role), which the coordinator launches
+  from as above.
 - **AMI:** built by a pipeline from the fcvm release (fcvm, the gpu kernel and Firecracker,
   the driver image), one per architecture, copied to each region.
 - **Coordinator:** a dedicated ECS cluster, one Fargate service with the coordinator and a

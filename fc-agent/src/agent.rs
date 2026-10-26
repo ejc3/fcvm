@@ -1343,4 +1343,21 @@ mod tests {
              snapshot can capture a covered mount"
         );
     }
+
+    /// Every time source chronyd gets reaches it over NTP, which the snapshot gate's
+    /// OUTPUT rule rejects (`snapshot_network::gate_chain_rules`). A reference clock
+    /// such as the KVM PTP device needs no network, so a restored clone's chronyd
+    /// could read it between the resume and the restore's own clock step and jump
+    /// the clock while egress is still gated.
+    #[test]
+    fn chronyd_gets_no_time_source_the_snapshot_gate_cannot_hold() {
+        let source = include_str!("agent.rs");
+        let start = source.find("async fn start_chronyd(").unwrap();
+        let end = source[start..].find("\n}\n").unwrap() + start;
+        let body = &source[start..end];
+        assert!(
+            body.contains("server {addr} iburst") && !body.contains("refclock"),
+            "start_chronyd must give chronyd NTP sources only"
+        );
+    }
 }

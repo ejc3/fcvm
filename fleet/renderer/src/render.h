@@ -117,6 +117,12 @@ class Renderer {
   double hold_budget_ = 0;  // the budget the current hold started with
   void* fill_c_ = nullptr;  // checkerboard fill output, swapped into the ring
   void* fill_a_ = nullptr;
+  void* fill_g_ = nullptr;
+  void* ring_g_[TEMPORAL_WINDOW] = {};  // float4: frame's mean albedo guide + packed normal of the first sample
+  void* hold_g_ = nullptr;     // float4: hold's albedo guide sum + packed normal
+  void* display_g_ = nullptr;  // float4 over the resolved region: resolved albedo guide
+  void* dn_[2] = {};           // float4 over the resolved region: the denoiser's ping-pong (E, variance)
+  void* dn_gp_ = nullptr;      // float4 over the resolved region: the denoiser's guide (k_resolve)
   void* stream_ = nullptr;
   void* ev0_ = nullptr;
   void* ev1_ = nullptr;

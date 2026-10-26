@@ -82,12 +82,13 @@ pub enum Event {
         at: u64,
         report: crate::protocol::HealthReport,
     },
-    /// The GPU hosts' auto scaling groups, polled while the fleet wakes.
+    /// The GPU hosts' instances, listed while the fleet wakes.
     ScaleInstances {
         at: u64,
         instances: Vec<ScaleInstance>,
     },
-    /// A launch's DNS names were written and answer at the zone's authoritative servers.
+    /// A launch's or an aggregator's DNS names were minted; the coordinator's subzone
+    /// answers them from the state this event is applied to.
     Published {
         at: u64,
         /// The slot or tile id (`slot-<n>`, `ec2-<n>`).
@@ -96,11 +97,11 @@ pub enum Event {
     },
 }
 
-/// One instance in a GPU host auto scaling group.
+/// One GPU host instance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScaleInstance {
     pub id: String,
-    /// The group's lifecycle state (`Pending`, `InService`, ...).
+    /// Its lifecycle state: `Pending`, `InService` (EC2 `running`), `Terminating`, ...
     pub lifecycle: String,
 }
 
