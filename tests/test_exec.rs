@@ -1246,48 +1246,53 @@ async fn test_exec_tty_when_conmon_reaps_the_runtime_before_the_console() -> Res
         // pipe open and podman waits for it. The tracer on podman detaches from
         // podman's children at their execve, so conmon and crun are not delayed.
         // The output and conmon's journal follow, for a failure to show.
-        let run = "timeout 60 script -qec \
-            'strace -f --detach-on=execve -qq -o /dev/null \
-            -e trace=connect -e inject=connect:delay_enter=1000000 \
-            podman --log-level=debug --conmon /tmp/slow-conmon exec -t --latest tty' \
-            /dev/null </dev/null >/tmp/conmon-race.out 2>&1; echo \"rc=$?\"; \
-            tr -d '\\r' </tmp/conmon-race.out | grep -c '^/dev/pts/[0-9]'; \
-            journalctl -q -t conmon --no-pager -o cat | grep -E 'did not set up terminal|after the runtime exited' || true; \
-            echo '--- exec output'; tr -d '\\r' </tmp/conmon-race.out; \
-            echo '--- conmon journal'; journalctl -q -t conmon --no-pager -o short-precise";
-        let out = common::exec_in_vm(fcvm_pid, &[run])
-            .await
-            .context("running the TTY exec under the delayed conmon")?;
-        println!("conmon race exec:\n{}", out);
+        // The delays make conmon's first poll precede podman's attach connect,
+        // but do not force it: a scheduler that runs podman's connect first lets
+        // attach_cb accept normally, and the exec proves nothing about the race.
+        // So every attempt must produce correct output, and the test fails only if
+        // no attempt in RACE_ATTEMPTS took both late paths. The journal is read
+        // from the attempt's own start (each attempt lasts over 3 s).
+        const RACE_ATTEMPTS: usize = 5;
+        for attempt in 1..=RACE_ATTEMPTS {
+            let run = "since=@$(date +%s); timeout 60 script -qec \
+                'strace -f --detach-on=execve -qq -o /dev/null \
+                -e trace=connect -e inject=connect:delay_enter=1000000 \
+                podman --log-level=debug --conmon /tmp/slow-conmon exec -t --latest tty' \
+                /dev/null </dev/null >/tmp/conmon-race.out 2>&1; echo \"rc=$?\"; \
+                tr -d '\\r' </tmp/conmon-race.out | grep -c '^/dev/pts/[0-9]'; \
+                journalctl -q -t conmon --since \"$since\" --no-pager -o cat | grep -E 'did not set up terminal|after the runtime exited' || true; \
+                echo '--- exec output'; tr -d '\\r' </tmp/conmon-race.out; \
+                echo '--- conmon journal'; journalctl -q -t conmon --since \"$since\" --no-pager -o short-precise";
+            let out = common::exec_in_vm(fcvm_pid, &[run])
+                .await
+                .context("running the TTY exec under the delayed conmon")?;
+            println!("conmon race exec, attempt {attempt}:\n{}", out);
 
-        anyhow::ensure!(
-            !out.contains("Runtime did not set up terminal"),
-            "#841 regression: conmon quit before accepting the console:\n{}",
-            out
+            anyhow::ensure!(
+                !out.contains("Runtime did not set up terminal"),
+                "#841 regression: conmon quit before accepting the console:\n{}",
+                out
+            );
+            anyhow::ensure!(
+                out.lines().next() == Some("rc=0"),
+                "TTY exec under the delayed conmon did not exit 0:\n{}",
+                out
+            );
+            anyhow::ensure!(
+                out.lines().nth(1).and_then(|n| n.trim().parse::<u32>().ok()) >= Some(1),
+                "the TTY exec printed no terminal name:\n{}",
+                out
+            );
+            if out.contains("accepting the console after the runtime exited")
+                && out.contains("accepted 1 attach connection after the runtime exited")
+            {
+                return Ok(());
+            }
+        }
+        anyhow::bail!(
+            "conmon took the late console and attach paths in none of {RACE_ATTEMPTS} attempts, \
+             so the race was never exercised"
         );
-        anyhow::ensure!(
-            out.lines().next() == Some("rc=0"),
-            "TTY exec under the delayed conmon did not exit 0:\n{}",
-            out
-        );
-        anyhow::ensure!(
-            out.lines().nth(1).and_then(|n| n.trim().parse::<u32>().ok()) >= Some(1),
-            "the TTY exec printed no terminal name:\n{}",
-            out
-        );
-        // Without this line the delay did not open the gap, and the pass above
-        // says nothing about the race.
-        anyhow::ensure!(
-            out.contains("accepting the console after the runtime exited"),
-            "conmon never took the late-console path, so the race was not exercised:\n{}",
-            out
-        );
-        anyhow::ensure!(
-            out.contains("accepted 1 attach connection after the runtime exited"),
-            "conmon never took the late-attach path, so the race was not exercised:\n{}",
-            out
-        );
-        Ok(())
     }
     .await;
 
