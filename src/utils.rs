@@ -827,6 +827,19 @@ fn kept_entry_is_gone(optional: bool, error: nix::errno::Errno) -> bool {
     optional && error == nix::errno::Errno::ENOENT
 }
 
+/// The bind flags for a pair, or for a kept directory (`optional`). A kept directory is
+/// bound with its submounts (MS_REC): the tmpfs over the view hides the host's mount
+/// tree under it, so a disk on a mount below another VM's directory would otherwise be
+/// gone. A pair's source is a clone directory fcvm made and stays a plain bind.
+fn redirect_bind_flags(optional: bool) -> nix::mount::MsFlags {
+    use nix::mount::MsFlags;
+    if optional {
+        MsFlags::MS_BIND | MsFlags::MS_REC
+    } else {
+        MsFlags::MS_BIND
+    }
+}
+
 /// Room for `/proc/self/fd/<fd>` and its NUL.
 const PROC_FD_PATH_LEN: usize = 32;
 
@@ -1089,7 +1102,7 @@ pub fn install_namespace_pre_exec(
                             Some(c"."),
                             mountpoint_cstr.as_c_str(),
                             None::<&str>,
-                            MsFlags::MS_BIND,
+                            redirect_bind_flags(*optional),
                             None::<&str>,
                         ) {
                             Ok(()) => {}
@@ -1194,6 +1207,46 @@ mod tests {
     /// A kept directory that vanished is passed over; any other failure, and any failure
     /// on a pair, still stops the VMM. Binding a directory that was removed after it was
     /// opened fails with ENOENT, which the next test checks against the kernel.
+    /// A kept directory carries its submounts into the view; a pair stays a plain bind.
+    ///
+    /// RED BEFORE THE FIX: kept directories were bound with MS_BIND alone.
+    #[test]
+    fn kept_directories_are_bound_with_their_submounts() {
+        use nix::mount::MsFlags;
+        assert_eq!(
+            redirect_bind_flags(true),
+            MsFlags::MS_BIND | MsFlags::MS_REC
+        );
+        assert_eq!(redirect_bind_flags(false), MsFlags::MS_BIND);
+    }
+
+    /// The kernel behaviour redirect_bind_flags relies on: a plain bind leaves a
+    /// directory's submounts behind, and a recursive one carries them. Runs in a user
+    /// and mount namespace of its own, in a child process.
+    #[test]
+    fn only_a_recursive_bind_carries_submounts() {
+        let root = tempfile::tempdir().unwrap();
+        let script = format!(
+            "set -e; cd {root}; mkdir -p src/mounted plain rec; \
+             mount -t tmpfs t src/mounted; echo disk > src/mounted/disk.raw; \
+             mount --bind src plain; mount --rbind src rec; \
+             echo plain=$(cat plain/mounted/disk.raw 2>/dev/null || echo missing); \
+             echo rec=$(cat rec/mounted/disk.raw 2>/dev/null || echo missing)",
+            root = root.path().display()
+        );
+        let output = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "sh", "-c", &script])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout,
+            "plain=missing\nrec=disk\n",
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn proc_fd_paths_are_written_without_allocating() {
         let mut buf = [0u8; PROC_FD_PATH_LEN];
