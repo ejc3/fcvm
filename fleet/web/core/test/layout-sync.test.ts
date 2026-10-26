@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   fitContain,
+  layoutFocus,
   layoutMosaic,
+  MAX_TILE_PX,
+  STREAM_HEIGHTS,
   neighbour,
   seamSegments,
   streamHeightFor,
@@ -11,7 +14,7 @@ import {
   frameFitsBox,
 } from "../layout.ts";
 import { acquireFrozen, chooseCommonT, type SyncChoice } from "../sync.ts";
-import { fitBandwidth, MIN_STREAM_BPS, streamBitrate } from "../bandwidth.ts";
+import { ENC_BPP, fitBandwidth, MAX_STREAM_BPS, MIN_STREAM_BPS, streamBitrate } from "../bandwidth.ts";
 import { addDrag, cameraAt, emptyDrag, lightPosition, poseAt, projectPoint, takeDrag } from "../scene.ts";
 import { fleet } from "./fixtures.ts";
 
@@ -51,8 +54,30 @@ describe("layout", () => {
 
   it("asks a tile for its on-screen device height", () => {
     const st = fleet(2, 4); // 8 per half, tiles 1/4 of the image tall
+    const L = layoutMosaic({ x: 0, y: 0, w: 1920, h: 1080 }, st.tiles, 1);
+    expect(L.tiles[0]!.streamHeight).toBe(270); // 270 css px * 1
+  });
+
+  it("never asks one tile for more than MAX_TILE_PX, so no viewer drives a renderer under one sample per pixel", () => {
+    // 8 per half, each tile a quarter of the image wide and tall: 16:9 tiles.
+    const st = fleet(2, 4);
+    // A 1920 x 1080 window on a 2x screen covers 540 device pixels per tile: 960 x 540 = 518,400 px.
     const L = layoutMosaic({ x: 0, y: 0, w: 1920, h: 1080 }, st.tiles, 2);
-    expect(L.tiles[0]!.streamHeight).toBe(540); // 270 css px * 2
+    for (const p of L.tiles) {
+      const t = st.tiles.find((x) => x.id === p.id)!;
+      const g = tileGeometry(t.rect, 16 / 9, p.streamHeight);
+      expect(g.width * g.height, p.id).toBeLessThanOrEqual(MAX_TILE_PX);
+      expect(STREAM_HEIGHTS as readonly number[]).toContain(p.streamHeight);
+    }
+    expect(L.tiles[0]!.streamHeight).toBe(432);
+    // One tile alone on a 4K screen: the cap, not 1080.
+    const one = { ...st.tiles[0]!, rect: { x: 0, y: 0, w: 1, h: 1 } };
+    const big = layoutMosaic({ x: 0, y: 0, w: 1920, h: 1080 }, [one], 2);
+    const g = tileGeometry(one.rect, 16 / 9, big.tiles[0]!.streamHeight);
+    expect(g.width * g.height).toBeLessThanOrEqual(MAX_TILE_PX);
+    // A tall narrow tile may be taller: the cap is on pixels, not height.
+    const tall = layoutFocus({ x: 0, y: 0, w: 1920, h: 1080 }, { ...one, rect: { x: 0, y: 0, w: 1 / 16, h: 1 } }, 2);
+    expect(tall.streamHeight).toBe(1080);
   });
 
   it("follows the renderer's tile geometry, including the encoder's minimum", () => {
@@ -220,16 +245,33 @@ describe("stream overlap and bandwidth", () => {
     expect(deliveredGeometry({ width: 100, height: 50, fullWidth: 1000, fullHeight: 500, x0: 7, y0: 0 })).toEqual({ width: 122, height: 66, crop: { left: 7, top: 0, right: 15, bottom: 16 } });
   });
 
-  it("asks small tiles for q=lo first, then steps the tallest down, keeping the opened one", () => {
+  it("prices streams as fleet/PROTOCOL.md's quality table: bits per pixel, floor and cap per q", () => {
+    // 0.25 / 0.8 / 4 bits per delivered pixel at 30 fps.
+    const r = { x: 0.25, y: 0, w: 0.25, h: 0.5 };
+    const px = 512 * 556; // deliveredGeometry at h=540, as the renderer's example
+    expect(streamBitrate(r, 16 / 9, 540, "lo")).toBeCloseTo(px * 0.25 * 30, 0);
+    expect(streamBitrate(r, 16 / 9, 540, "std")).toBeCloseTo(px * 0.8 * 30, 0);
+    expect(streamBitrate(r, 16 / 9, 540, "hi")).toBeCloseTo(px * 4 * 30, 0);
+    // Floors: 0.15, 0.6 and 2 Mbit/s.
+    expect(MIN_STREAM_BPS).toEqual({ hi: 2_000_000, std: 600_000, lo: 150_000 });
+    // Caps: 20 Mbit/s for std and lo, 160 for hi.
+    const whole = { x: 0, y: 0, w: 1, h: 1 };
+    expect(streamBitrate(whole, 16 / 9, 1080, "std")).toBe(20_000_000);
+    expect(streamBitrate(whole, 16 / 9, 1080, "lo")).toBeLessThanOrEqual(20_000_000);
+    expect(streamBitrate(whole, 16 / 9, 2160, "hi")).toBe(160_000_000);
+    expect(ENC_BPP).toEqual({ hi: 4, std: 0.8, lo: 0.25 });
+    expect(MAX_STREAM_BPS).toEqual({ hi: 160_000_000, std: 20_000_000, lo: 20_000_000 });
+  });
+
+  it("moves every tile together: all to q=lo, then all down a height, keeping the opened one", () => {
     const rect = (x: number, w: number) => ({ x, y: 0, w, h: 1 / 9 });
     const asks = Array.from({ length: 16 }, (_, i) => ({ id: `t${i}`, rect: rect(i / 32, i < 8 ? 1 / 32 : 1 / 16), height: 540, keep: i === 0 }));
     const before = asks.reduce((a, x) => a + streamBitrate(x.rect, 16 / 9, x.height), 0);
     const mild = fitBandwidth(asks, 16 / 9, before * 0.85);
     expect(mild.bps).toBeLessThanOrEqual(before * 0.85);
-    // Only small tiles went to lo, and no height changed.
-    const lo = asks.filter((a) => mild.quality.get(a.id) === "lo");
-    expect(lo.length).toBeGreaterThan(0);
-    expect(lo.every((a) => a.rect.w === 1 / 32)).toBe(true);
+    // No patchwork: every tile but the opened one is at lo, none at std beside it, and no height changed.
+    expect(asks.slice(1).every((a) => mild.quality.get(a.id) === "lo")).toBe(true);
+    expect(mild.quality.get("t0")).toBe("std");
     expect([...mild.heights.values()].every((h) => h === 540)).toBe(true);
     // A tight budget: everyone but the opened tile at lo, then heights fall.
     const tight = fitBandwidth(asks, 16 / 9, 30e6);
@@ -237,7 +279,9 @@ describe("stream overlap and bandwidth", () => {
     expect(tight.quality.get("t0")).toBe("std");
     expect(tight.heights.get("t0")).toBe(540);
     expect(asks.slice(1).every((a) => tight.quality.get(a.id) === "lo")).toBe(true);
-    expect(Math.max(...asks.slice(1).map((a) => tight.heights.get(a.id)!))).toBeLessThan(540);
+    // Every other tile stepped down together, to one height.
+    expect(new Set(asks.slice(1).map((a) => tight.heights.get(a.id)!)).size).toBe(1);
+    expect(tight.heights.get("t1")!).toBeLessThan(540);
     // Under the budget nothing changes.
     const easy = fitBandwidth(asks, 16 / 9, 1e12);
     expect(easy.heights.get("t5")).toBe(540);

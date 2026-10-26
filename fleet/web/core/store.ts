@@ -91,6 +91,10 @@ export interface UiState {
   keyId: string | null;
   /** The pointer is over the image (or a long press is held). */
   pointerOverImage: boolean;
+  /** When the pointer last moved over the image (local Unix ms), or null. */
+  pointerMovedAt: number | null;
+  /** A touch long press is held on a tile. */
+  longPress: boolean;
   stats: boolean;
   lightMode: boolean;
   /** The Play drawer is open. */
@@ -261,6 +265,8 @@ export function initialState(): ClientState {
       hoverId: null,
       keyId: null,
       pointerOverImage: false,
+      pointerMovedAt: null,
+      longPress: false,
       stats: false,
       lightMode: false,
       drawer: false,

@@ -1,10 +1,13 @@
 # fleet/web: the GPU wall page
 
 The page for `docs/fleet/ARCHITECTURE.md`: one image tiled across every GPU, fcvm on the
-left and EC2 on the right, each side as wide as the GPUs it has live, live from each tile's own renderer. It is a stage, not a
-dashboard: the image sits letterboxed between the race (a countdown to the next restart
-and two bars, fcvm against EC2) and one button, "Restart all N GPUs". Everything else
-(the camera's next stop, words, lights, how the streams arrive, stream stats) is in the Play drawer, where the sender of a word also picks how it is drawn:
+left and EC2 on the right, each side as wide as the GPUs it has live, live from each tile's own renderer. The render is the
+page: the image fills the screen (contain-fit, centred), with a row of controls over its top and a strip over its
+bottom (the one button, "Restart all N GPUs", the last race in one line, the next scheduled restart, and what draws the
+image: resolution, GPUs, frame rate). The controls fade when the pointer rests. While a race runs, its two bars,
+fcvm against EC2, sit over the bottom of the image. Each tile asks its renderer for at most `MAX_TILE_PX` (0.5 M)
+pixels, so one viewer on a large screen cannot push a GPU under one sample per pixel. Everything else
+(the camera's next stop, words, lights, how the streams arrive, stream stats, the counters and recent actions) is in the drawer, where the sender of a word also picks how it is drawn:
 Lockup (type above the clock), Skywriting (smoke in the sky) or Landmark (big letters
 standing on a ridge). The three thumbnails are crops of the renderer's
 `shots/text-styles.jpg` (#1178, commit 46feb782), in `public/text-styles/`. A viewer can also borrow one of the wall's GPUs for a
@@ -72,7 +75,7 @@ FLEET_SCREENSHOT_DIR=$PWD/docs/screenshots pnpm test:e2e   # also rewrites the p
 pnpm build && pnpm measure [16 50 100]       # decode and draw cost
 ```
 
-On a small machine, `FLEET_E2E_VIEW=1280x800 FLEET_MOCK_FPS=10 FLEET_MOCK_THREADS=3`
+On a small machine, `FLEET_E2E_VIEW=960x600 FLEET_MOCK_FPS=10 FLEET_MOCK_THREADS=3`
 makes the mock's work fit (CI uses these on a 4-vCPU runner). The mock needs `ffmpeg` with libx264 (`FLEET_FFMPEG` names another binary; CI uses the one in the `ffmpeg-static` package). Its knobs (`FLEET_MOCK_FCVM_GPUS`, `FLEET_MOCK_EC2_GPUS`, `FLEET_MOCK_FCVM_MS`,
 `FLEET_MOCK_EC2_MS`, `FLEET_MOCK_RACE_EVERY_S`, `FLEET_MOCK_TURNSTILE`, ...) are listed at the top of `mock/main.ts`.
 By default it restarts every GPU 20 s after start and every 5 minutes after that, holds
