@@ -92,6 +92,24 @@ function raceCounts(st: FleetState, ra: RelaunchAll, h: Half): { gpus: number; b
   return { gpus, back };
 }
 
+/**
+ * A finished half's time, click to its last first frame without capacity waits: the
+ * coordinator's own measurement (`relaunch_all.<half>_ms`, else the matching race in
+ * `races`), which leaves each tile's own wait out. Only a coordinator that sends neither
+ * gets the page's estimate, the half's wall time less the longest wait. Null while the
+ * half runs.
+ */
+export function halfTimeMs(st: FleetState, ra: RelaunchAll, h: Half): number | null {
+  const doneAt = h === "fcvm" ? ra.fcvm_done_at : ra.ec2_done_at;
+  if (doneAt === null) return null;
+  const measured = h === "fcvm" ? ra.fcvm_ms : ra.ec2_ms;
+  if (measured !== null) return measured;
+  const kept = st.races.find((r) => r.started_at === ra.started_at)?.[h]?.time_ms ?? null;
+  if (kept !== null) return kept;
+  const wall = doneAt - ra.started_at;
+  return h === "ec2" ? wall - Math.min(wall, capacityWaitMs(ra, doneAt)) : wall;
+}
+
 /** Milliseconds EC2 has waited for capacity in this race, up to now. */
 export function capacityWaitMs(ra: RelaunchAll, now: number): number {
   return ra.ec2_capacity_wait_ms + (ra.ec2_waiting_since !== null ? Math.max(0, now - ra.ec2_waiting_since) : 0);
@@ -144,7 +162,7 @@ function raceBar(st: FleetState, ra: RelaunchAll, h: Half, now: number, axis: nu
     hatch: wait / axis,
     hatchFirst: true,
     lastMark: null,
-    value: done ? fmt.seconds(counted) : fmt.raceClock(counted),
+    value: done ? fmt.seconds(halfTimeMs(st, ra, h)!) : fmt.raceClock(counted),
     valueLabel: done ? "back in" : "restarting",
     line: backLine(gpus, back, done) + outLine,
     hatchLabel: waitingNow
@@ -165,14 +183,13 @@ export function raceAnnouncement(st: FleetState): string {
   const parts: string[] = [];
   if (ra.fcvm_done_at !== null) {
     const { gpus } = raceCounts(st, ra, "fcvm");
-    parts.push(`fcvm: ${backLine(gpus, gpus, true)} ${fmt.seconds(ra.fcvm_done_at - ra.started_at)} after the restart.`);
+    parts.push(`fcvm: ${backLine(gpus, gpus, true)} ${fmt.seconds(halfTimeMs(st, ra, "fcvm")!)} after the restart.`);
   }
   if (ra.ec2_done_at !== null) {
     const { gpus } = raceCounts(st, ra, "ec2");
     const wait = Math.min(ra.ec2_done_at - ra.started_at, capacityWaitMs(ra, ra.ec2_done_at));
-    const counted = ra.ec2_done_at - ra.started_at - wait;
     const tail = wait > 0 ? `, not counting ${fmt.seconds(wait)} when AWS had no spot GPU` : "";
-    parts.push(`EC2: ${backLine(gpus, gpus, true)} ${fmt.seconds(counted)} after the restart${tail}.`);
+    parts.push(`EC2: ${backLine(gpus, gpus, true)} ${fmt.seconds(halfTimeMs(st, ra, "ec2")!)} after the restart${tail}.`);
   }
   return parts.join(" ");
 }
@@ -262,4 +279,133 @@ export function scoreView(i: ScoreInput): ScoreView {
     button: restartButton(i),
     announce: raceAnnouncement(st),
   };
+}
+
+// ---- the race on the picture ------------------------------------------------------
+
+/** A finished race's result card stays this long, then the strip's one line takes over. */
+export const END_CARD_MS = 8000;
+
+/** One half's big clock, centred low in its half of the image. */
+export interface HalfClock {
+  half: Half;
+  /** Its centre, in CSS pixels, kept far enough from the image's edges that the whole card is on it. */
+  x: number;
+  y: number;
+  /** The big figure's font size, px: 9% of the image width within 56 to 160, smaller to fit a narrow half. */
+  size: number;
+  /** The card's width as drawn, px (estimated from the size: a running clock is six monospace characters). */
+  width: number;
+  /** "0:04.9" while counting, "3.1 s" once the half is back. */
+  value: string;
+  state: "counting" | "done";
+  /** "3 of 8 back", "+12 s and counting". */
+  sub: string;
+  /** "not counting 21 s AWS spent finding a spot GPU", or "". */
+  hatch: string;
+  /** EC2 while counting: where its slowest tile is, instance to app. Empty otherwise. */
+  steps: { label: string; state: "done" | "now" | "todo" }[];
+}
+
+export interface RaceOnImage {
+  /** Who started it: "Restart running", "Scheduled restart, running". */
+  label: string;
+  /** While the race runs: one clock per half that restarts GPUs. */
+  clocks: HalfClock[];
+  /** For END_CARD_MS after both halves are back: "fcvm back in 3.1 s · EC2 back in 48 s · 15× faster". */
+  end: string | null;
+}
+
+/** IBM Plex Mono's advance is 0.6 em; a running clock ("0:04.9") is six of them, and the card adds 56 px of padding. */
+const CLOCK_EM = 6 * 0.6;
+const CLOCK_PAD = 56;
+/** The narrowest the figure gets, px, however narrow its half: below this it is not read from across a room. */
+const CLOCK_MIN_PX = 24;
+/** The steps line ("instance → OS → driver → app") at 15 px is about this wide. */
+const STEPS_W = 260;
+
+/** Where an EC2 tile is in its restart: the four steps a viewer reads. */
+const EC2_STEPS = ["instance", "OS", "driver", "app"] as const;
+const EC2_STEP_OF: Record<string, number> = {
+  requested: 0,
+  relaunching: 0,
+  stopping: 0,
+  waiting_capacity: 0,
+  pending: 0,
+  launching: 1,
+  starting: 2,
+};
+
+/** How many times faster fcvm came back than EC2: "14×", "2.5×". */
+export function ratioText(fcvmMs: number, ec2Ms: number): string {
+  const r = ec2Ms / Math.max(1, fcvmMs);
+  return `${r >= 10 ? Math.round(r) : r.toFixed(1)}×`;
+}
+
+/** The finished race in one line, from the coordinator's times, or null while a half still runs. */
+export function raceResult(st: FleetState, ra: RelaunchAll): string | null {
+  if (ra.fcvm_done_at === null || ra.ec2_done_at === null) return null;
+  const f = raceCounts(st, ra, "fcvm").gpus > 0 ? halfTimeMs(st, ra, "fcvm") : null;
+  const e = raceCounts(st, ra, "ec2").gpus > 0 ? halfTimeMs(st, ra, "ec2") : null;
+  const parts: string[] = [];
+  if (f !== null) parts.push(`fcvm back in ${fmt.seconds(f)}`);
+  if (e !== null) parts.push(`EC2 back in ${fmt.seconds(e)}`);
+  if (f !== null && e !== null) parts.push(`${ratioText(f, e)} faster`);
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+/**
+ * The race drawn on the image: a big clock per half while it runs, then the result for
+ * END_CARD_MS. Null between races. `image` and `split` place the clocks in their halves.
+ */
+export function raceOnImage(st: FleetState, now: number, image: { x: number; y: number; w: number; h: number } | null, split: number): RaceOnImage | null {
+  const ra = st.relaunch_all;
+  if (ra === null) return null;
+  const label = ra.by === "schedule" ? "Scheduled restart, running" : "Restart running";
+  if (raceOver(ra)) {
+    if (now - Math.max(ra.fcvm_done_at!, ra.ec2_done_at!) >= END_CARD_MS) return null;
+    return { label: "", clocks: [], end: raceResult(st, ra) };
+  }
+  const clocks: HalfClock[] = [];
+  const fcvmMs = halfTimeMs(st, ra, "fcvm");
+  for (const h of ["fcvm", "ec2"] as const) {
+    const { gpus, back } = raceCounts(st, ra, h);
+    if (gpus === 0 || !image) continue;
+    const doneAt = h === "fcvm" ? ra.fcvm_done_at : ra.ec2_done_at;
+    const end = doneAt ?? now;
+    const total = Math.max(0, end - ra.started_at);
+    const wait = h === "ec2" ? Math.min(total, capacityWaitMs(ra, end)) : 0;
+    const counted = total - wait;
+    const done = doneAt !== null;
+    const measured = halfTimeMs(st, ra, h);
+    const x0 = h === "fcvm" ? image.x : image.x + image.w * split;
+    const w = h === "fcvm" ? image.w * split : image.w * (1 - split);
+    let sub = done ? (gpus === 1 ? "its GPU is back" : `all ${gpus} GPUs back`) : `${back} of ${fmt.count(gpus, "GPU", "GPUs")} back`;
+    // Once fcvm is back and EC2's counted time has passed it: how far behind EC2 is.
+    if (h === "ec2" && !done && fcvmMs !== null && counted >= fcvmMs + 1000) sub = `+${Math.floor((counted - fcvmMs) / 1000)} s and counting`;
+    let steps: HalfClock["steps"] = [];
+    if (h === "ec2" && !done) {
+      const dark = halfTiles(st, "ec2").filter((t) => t.phase !== "running" && t.borrowed === null);
+      const at = dark.length === 0 ? EC2_STEPS.length - 1 : Math.min(...dark.map((t) => EC2_STEP_OF[t.phase] ?? 0));
+      steps = EC2_STEPS.map((label, i) => ({ label, state: i < at ? "done" : i === at ? "now" : "todo" }));
+    }
+    // The design's clamp(56px, 9vw, 160px), and no wider than its own half.
+    const size = Math.max(CLOCK_MIN_PX, Math.min(Math.min(160, Math.max(56, image.w * 0.09)), (w - CLOCK_PAD) / CLOCK_EM));
+    const width = Math.max(size * CLOCK_EM + CLOCK_PAD, steps.length > 0 ? STEPS_W : 0);
+    // A half narrower than the card: the card moves in from the image's edge rather than off it.
+    const x = Math.min(Math.max(x0 + w / 2, image.x + width / 2), image.x + image.w - width / 2);
+    clocks.push({
+      half: h,
+      x,
+      y: image.y + image.h * 0.62,
+      size,
+      width,
+      value: measured !== null ? fmt.seconds(measured) : fmt.raceClock(counted),
+      state: done ? "done" : "counting",
+      sub,
+      hatch: wait > 0 ? `not counting ${Math.round(wait / 1000)} s AWS spent finding a spot GPU` : "",
+      steps,
+    });
+  }
+  return { label, clocks, end: null };
 }

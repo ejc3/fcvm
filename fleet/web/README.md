@@ -4,8 +4,9 @@ The page for `docs/fleet/ARCHITECTURE.md`: one image tiled across every GPU, fcv
 left and EC2 on the right, each side as wide as the GPUs it has live, live from each tile's own renderer. The render is the
 page: the image fills the screen (contain-fit, centred), with a row of controls over its top and a strip over its
 bottom (the one button, "Restart all N GPUs", the last race in one line, the next scheduled restart, and what draws the
-image: resolution, GPUs, frame rate). The controls fade when the pointer rests. While a race runs, its two bars,
-fcvm against EC2, sit over the bottom of the image. Each tile asks its renderer for at most `MAX_TILE_PX` (0.5 M)
+image: resolution, GPUs, frame rate). The controls fade when the pointer rests. A race is drawn on the picture: every
+dark tile counts, each half has one large clock (fcvm freezes when its last tile is back, EC2 keeps counting), each tile
+shows its own time as it relights, and a card gives the result for 8 s before the strip's line takes it over. Each tile asks its renderer for at most `MAX_TILE_PX` (0.5 M)
 pixels, so one viewer on a large screen cannot push a GPU under one sample per pixel. Everything else
 (the camera's next stop, words, lights, how the streams arrive, stream stats, the counters and recent actions) is in the drawer, where the sender of a word also picks how it is drawn:
 Lockup (type above the clock), Skywriting (smoke in the sky) or Landmark (big letters
