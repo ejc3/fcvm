@@ -325,8 +325,11 @@ After that the bracket's half-width was 0.22 ms (median). The guest
 lands about 1 ms behind the host and stays there: there is no offset to decay.
 Within one clone the offset moved by at most 4.6 ms between 0.1 s and 10 s
 (median 1.0 ms).
-The ACKs fell across the whole second (fraction 0.044 to 0.990); before #1301 the
-host's whole-second stamp left a clone behind by that fraction. `clock_ms` (the
+The ACKs fell across the whole second (fraction 0.044 to 0.990). The host stamps
+its clock during the restore, under 0.1 s before the ACK here (`ack_ms` 69 to 99 ms
+from the start of the restore call), so the stamps spread across the second too;
+before #1301 a clone was left behind by the fraction the whole-second stamp
+discarded. `clock_ms` (the
 guest's step, from the ACK's phases) was 0.58 ms median. The integration test
 `test_clone_clock_matches_the_host_to_a_tenth_of_a_second` uses the same bracketing.
 
