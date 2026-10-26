@@ -178,31 +178,58 @@ fn a_scratch_directory_on_the_root_disk_does_not_move_the_build() {
     );
 }
 
-/// The Makefile target runs the check before it compiles, and gives the build
-/// the directory the check chose.
+/// Under `make -j` a prerequisite's position orders nothing, so the check must
+/// be an order-only prerequisite of the build steps when the goal is
+/// install-host-kernel. Read from make's own database, not the Makefile text.
 #[test]
-fn install_host_kernel_checks_before_it_builds_and_passes_the_directory() {
+fn install_host_kernel_orders_the_check_before_the_build_steps() {
+    let out = Command::new("make")
+        .args(["-qp", "install-host-kernel"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run make -qp");
+    let db = String::from_utf8_lossy(&out.stdout);
+    for target in ["build", "setup-btrfs"] {
+        let rule = db
+            .lines()
+            .find(|l| l.starts_with(&format!("{target}:")) && !l.contains('='))
+            .unwrap_or_else(|| panic!("{target} rule missing from make's database"));
+        let order_only = rule.split_once('|').map(|(_, o)| o).unwrap_or("");
+        assert!(
+            order_only
+                .split_whitespace()
+                .any(|p| p == "check-host-kernel-build"),
+            "{target} must wait for check-host-kernel-build under -j: {rule}"
+        );
+    }
+}
+
+/// The recipe gives the build the directory the check chose, and stops when
+/// the repeated check fails (an empty value would send the build to /tmp).
+#[test]
+fn install_host_kernel_stops_when_the_repeated_check_fails() {
     let makefile =
         std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Makefile"))
             .unwrap();
-    let rule = makefile
+    let recipe: Vec<&str> = makefile
         .lines()
-        .find(|l| l.starts_with("install-host-kernel:") && !l.contains("private"))
-        .expect("install-host-kernel rule");
-    let prereqs: Vec<&str> = rule.split_whitespace().skip(1).collect();
-    let check = prereqs.iter().position(|p| *p == "check-host-kernel-build");
-    let build = prereqs.iter().position(|p| *p == "build");
+        .skip_while(|l| !(l.starts_with("install-host-kernel:") && !l.contains("private")))
+        .skip(1)
+        .take_while(|l| l.starts_with('\t'))
+        .collect();
+    let capture = recipe
+        .iter()
+        .find(|l| l.contains("scripts/check-host-kernel-build.sh"))
+        .expect("recipe runs the check");
     assert!(
-        check.is_some() && check < build,
-        "check must come before build: {rule}"
+        capture.trim_start().starts_with("dir=$$(") && capture.contains(") || exit"),
+        "the check's result must be captured on its own and fail the recipe: {capture}"
     );
-    let recipe = makefile
-        .lines()
-        .find(|l| l.contains("--install-host-kernel") && l.contains("fcvm setup"))
-        .expect("install recipe");
     assert!(
-        recipe.contains("FCVM_HOST_KERNEL_BUILD_DIR=")
-            && recipe.contains("scripts/check-host-kernel-build.sh"),
-        "recipe must pass the checked directory: {recipe}"
+        recipe
+            .iter()
+            .any(|l| l.contains("FCVM_HOST_KERNEL_BUILD_DIR=\"$$dir\"")
+                && l.contains("--install-host-kernel")),
+        "recipe must pass the checked directory: {recipe:?}"
     );
 }

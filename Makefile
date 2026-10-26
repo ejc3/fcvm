@@ -905,7 +905,14 @@ gpu-residue-test: setup-gpu
 # Requires reboot to activate the new kernel
 install-host-kernel: private SHELL := $(TARGET_LEASE_SHELL)
 install-host-kernel: check-host-kernel-build build setup-btrfs
-	$(SUDO_FCVM) env FCVM_HOST_KERNEL_BUILD_DIR="$$($(MAKEFILE_DIR)scripts/check-host-kernel-build.sh)" ./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel
+	dir=$$($(MAKEFILE_DIR)scripts/check-host-kernel-build.sh) || exit 2; \
+	$(SUDO_FCVM) env FCVM_HOST_KERNEL_BUILD_DIR="$$dir" ./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel
+
+# Under make -j a prerequisite's position orders nothing, so when the goal is
+# install-host-kernel the check is an order-only prerequisite of the build steps.
+ifneq ($(filter install-host-kernel,$(MAKECMDGOALS)),)
+build setup-btrfs: | check-host-kernel-build
+endif
 
 # Fails before anything is compiled when a package `bindeb-pkg` needs is missing
 # or the build directory lacks room (scripts/check-host-kernel-build.sh), and
