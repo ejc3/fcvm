@@ -739,6 +739,7 @@ impl NetworkManager for BridgedNetwork {
                     )
             })
         };
+        let network_kept = forgotten.is_err();
         if let Err(e) = forgotten {
             errors.push(format!(
                 "dropping network records, so the veth and namespace stay for the next launch: {e:#}"
@@ -770,16 +771,22 @@ impl NetworkManager for BridgedNetwork {
         }
 
         // Step 5: Remove global NAT rules if no other bridged VMs are running. A failure
-        // leaves the record, so the next launch tries again.
-        match portmap::cleanup_global_nat_if_unused().await {
-            Ok(()) => {
-                if let Err(e) = crate::reclaim::forget(&self.vm_id, |r| {
-                    matches!(r, crate::reclaim::Resource::GlobalNat)
-                }) {
-                    errors.push(format!("dropping the shared NAT record: {e:#}"));
+        // leaves the record, so the next launch tries again. While this VM's own veth
+        // stays for the next launch, the shared rules stay recorded with it: the reclaim
+        // removes them after the veth (it recorded them first).
+        if !network_kept {
+            match portmap::cleanup_global_nat_if_unused().await {
+                Ok(()) => {
+                    if let Err(e) = crate::reclaim::forget(&self.vm_id, |r| {
+                        matches!(r, crate::reclaim::Resource::GlobalNat)
+                    }) {
+                        errors.push(format!("dropping the shared NAT record: {e:#}"));
+                    }
+                }
+                Err(e) => {
+                    warn!(vm_id = %self.vm_id, error = %format!("{e:#}"), "global NAT cleanup")
                 }
             }
-            Err(e) => warn!(vm_id = %self.vm_id, error = %format!("{e:#}"), "global NAT cleanup"),
         }
 
         if errors.is_empty() {
@@ -822,6 +829,11 @@ mod tests {
             .find("veth::delete_veth_forward_rule(host_veth)")
             .unwrap();
         assert!(rules < guard && forward < guard && guard < veth);
+        // The shared NAT record goes only with this VM's network.
+        let nat = cleanup
+            .find("if !network_kept {")
+            .expect("the shared NAT cleanup waits for this VM's network to be gone");
+        assert!(veth < nat && nat < cleanup.find("cleanup_global_nat_if_unused()").unwrap());
     }
 
     /// Bridged forwarding is IPv4 DNAT scoped to the veth address, so it cannot honour
