@@ -18,8 +18,8 @@ fn vm_disks(vm_id: &str) -> PathBuf {
     fcvm::paths::data_dir().join("vm-disks").join(vm_id)
 }
 
-/// The vm_id of the VM whose fcvm process is `pid`.
-async fn vm_id_of(pid: u32) -> Result<String> {
+/// What `fcvm ls --json` says about the VM whose fcvm process is `pid`.
+async fn listed(pid: u32) -> Result<serde_json::Value> {
     let output = tokio::process::Command::new(common::find_fcvm_binary()?)
         .args(["ls", "--json", "--pid", &pid.to_string()])
         .output()
@@ -29,10 +29,17 @@ async fn vm_id_of(pid: u32) -> Result<String> {
         serde_json::from_slice(&output.stdout).context("parsing fcvm ls --json")?;
     listed
         .get(0)
-        .and_then(|vm| vm.get("vm_id"))
-        .and_then(|id| id.as_str())
-        .map(str::to_string)
+        .cloned()
         .with_context(|| format!("fcvm ls lists no VM for pid {pid}: {listed}"))
+}
+
+/// The vm_id of the VM whose fcvm process is `pid`.
+async fn vm_id_of(pid: u32) -> Result<String> {
+    let vm = listed(pid).await?;
+    vm["vm_id"]
+        .as_str()
+        .map(str::to_string)
+        .with_context(|| format!("no vm_id in {vm}"))
 }
 
 async fn sigkill(child: &mut tokio::process::Child, pid: u32) -> Result<()> {
@@ -61,12 +68,20 @@ async fn stop(child: &mut tokio::process::Child, pid: u32) -> Result<()> {
 
 /// Run a VM to completion. Its launch reclaims what killed fcvm processes left.
 async fn next_launch() -> Result<()> {
+    next_launch_on("rootless").await
+}
+
+/// [`next_launch`] in a network mode, so that it runs as the user that the killed
+/// process ran as: each user reclaims only its own records.
+async fn next_launch_on(network: &str) -> Result<()> {
     let (name, _, _, _) = common::unique_names("reclaim-next");
     let (mut child, _) = common::spawn_fcvm(&[
         "podman",
         "run",
         "--name",
         &name,
+        "--network",
+        network,
         "--no-snapshot",
         common::TEST_IMAGE,
         "true",
@@ -345,6 +360,45 @@ fn recorded_temps(pid: u32) -> Vec<PathBuf> {
     temps
 }
 
+/// The lock files of the records the fcvm process `pid` wrote.
+fn record_locks(pid: u32) -> Vec<PathBuf> {
+    let dir = fcvm::paths::data_dir()
+        .join("reclaim")
+        .join(nix::unistd::geteuid().as_raw().to_string());
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(entry.path()).ok()?).ok()?;
+            (record.get("pid").and_then(|p| p.as_u64()) == Some(u64::from(pid)))
+                .then(|| entry.path().with_extension("lock"))
+        })
+        .collect()
+}
+
+/// Wait until no process holds any of `locks`. A helper of the killed fcvm (skopeo,
+/// mkfs.ext4) inherits its owner's lock and keeps writing until it exits; until then the
+/// reclaim leaves its temporaries alone, as it must.
+async fn wait_for_helpers(locks: &[PathBuf]) -> Result<()> {
+    wait_for(
+        "a helper of the killed fcvm still holds its owner lock",
+        Duration::from_secs(180),
+        || {
+            locks
+                .iter()
+                .all(|lock| match std::fs::File::open(lock) {
+                    Ok(file) => fs2::FileExt::try_lock_exclusive(&file).is_ok(),
+                    Err(_) => true,
+                })
+                .then_some(())
+        },
+    )
+    .await
+}
+
 /// #1186: a SIGKILLed export of a localhost image leaves its temporary archive, and a
 /// SIGKILLed storage image build leaves its temporary store and image. The next launch
 /// removes them.
@@ -369,8 +423,10 @@ async fn a_sigkilled_image_export_leaves_its_temporaries_to_the_next_launch() ->
             },
         )
         .await;
+        let locks = record_locks(pid);
         sigkill(&mut child, pid).await?;
         let archive_temp = observed?;
+        wait_for_helpers(&locks).await?;
         next_launch().await?;
         anyhow::ensure!(
             !archive_temp.exists(),
@@ -394,7 +450,9 @@ async fn a_sigkilled_image_export_leaves_its_temporaries_to_the_next_launch() ->
         )
         .await;
         let recorded = recorded_temps(pid);
+        let locks = record_locks(pid);
         sigkill(&mut child, pid).await?;
+        wait_for_helpers(&locks).await?;
         let storage_temp = observed?;
         let store = recorded.iter().find(|p| {
             p.file_name()
@@ -428,4 +486,278 @@ async fn a_sigkilled_image_export_leaves_its_temporaries_to_the_next_launch() ->
         }
     }
     result
+}
+
+#[cfg(feature = "privileged-tests")]
+fn command_output(program: &str, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("running {program} {args:?}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{program} {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The /30 peer of a bridged veth's host-end address (`.1` to `.2`).
+#[cfg(feature = "privileged-tests")]
+fn peer_of(host_ip: &str) -> String {
+    let (prefix, last) = host_ip.rsplit_once('.').expect("an IPv4 address");
+    format!(
+        "{prefix}.{}",
+        last.parse::<u8>().expect("an IPv4 address") + 1
+    )
+}
+
+#[cfg(feature = "privileged-tests")]
+/// The host objects of one bridged VM, read from its state.
+#[derive(Debug)]
+struct BridgedObjects {
+    namespace: String,
+    host_veth: String,
+    host_ip: String,
+    /// A clone's host route to its guest address: `(guest_ip, via)`.
+    route: Option<(String, String)>,
+}
+
+#[cfg(feature = "privileged-tests")]
+impl BridgedObjects {
+    async fn of(pid: u32, clone: bool) -> Result<Self> {
+        let vm = listed(pid).await?;
+        let network = &vm["config"]["network"];
+        let field = |name: &str| {
+            network[name]
+                .as_str()
+                .map(str::to_string)
+                .with_context(|| format!("no {name} in {network}"))
+        };
+        let host_veth = field("host_veth")?;
+        let host_ip = field("host_ip")?;
+        let base = host_veth
+            .strip_prefix("veth0-")
+            .with_context(|| format!("unexpected host veth {host_veth}"))?;
+        let route = if clone {
+            // The namespace end of a clone's veth is the host end's /30 peer.
+            Some((field("guest_ip")?, peer_of(&host_ip)))
+        } else {
+            None
+        };
+        Ok(Self {
+            namespace: format!("fcvm-{base}"),
+            host_veth,
+            host_ip,
+            route,
+        })
+    }
+
+    /// Every object of this VM that is still on the host.
+    fn present(&self) -> Result<Vec<String>> {
+        let mut present = Vec::new();
+        if Path::new("/var/run/netns").join(&self.namespace).exists() {
+            present.push(format!("namespace {}", self.namespace));
+        }
+        if Path::new("/sys/class/net").join(&self.host_veth).exists() {
+            present.push(format!("interface {}", self.host_veth));
+        }
+        let rules = command_output("iptables-save", &[])?;
+        for rule in rules.lines() {
+            // Token-exact, so that 172.30.0.1 does not match 172.30.0.13.
+            // The host end's address and its /30 peer: the guest of a baseline and the
+            // namespace end of a clone's veth, which the published ports target.
+            let peer = peer_of(&self.host_ip);
+            let named = rule.split_whitespace().any(|token| {
+                token == self.host_veth
+                    || [&self.host_ip, &peer].into_iter().any(|ip| {
+                        token == ip.as_str()
+                            || token == format!("{ip}/32")
+                            || token.starts_with(&format!("{ip}:"))
+                    })
+            });
+            if named {
+                present.push(format!("rule {rule}"));
+            }
+        }
+        if let Some((guest_ip, via)) = &self.route {
+            let routes = command_output("ip", &["route", "show", &format!("{guest_ip}/32")])?;
+            if routes.split_whitespace().any(|token| token == via) {
+                present.push(format!("route {guest_ip}/32 via {via}"));
+            }
+        }
+        Ok(present)
+    }
+}
+
+/// #1184: a bridged VM's namespace, veth, FORWARD and DNAT rules, and a bridged clone's
+/// host route stay when fcvm is SIGKILLed, and the next launch removes them.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn a_sigkilled_bridged_vm_leaves_its_network_to_the_next_launch() -> Result<()> {
+    let (name, clone_name, snapshot, _) = common::unique_names("reclaim-bridged");
+    // Two host ports on one guest port: their MASQUERADE and FORWARD rules are the
+    // same rule twice.
+    let port = common::find_available_high_port()?;
+    let publish = format!("{port}:80");
+    let second_port = common::find_available_port(port + 1, 1000)?;
+    let second_publish = format!("{second_port}:80");
+    let (mut baseline, baseline_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &name,
+        "--network",
+        "bridged",
+        "--no-snapshot",
+        "--publish",
+        &publish,
+        "--publish",
+        &second_publish,
+        common::TEST_IMAGE,
+    ])
+    .await?;
+    let mut clone = None;
+    let observed = async {
+        common::poll_health_by_pid(baseline_pid, 120).await?;
+        let baseline_objects = BridgedObjects::of(baseline_pid, false).await?;
+        common::create_snapshot_by_pid(baseline_pid, &snapshot).await?;
+        let (child, clone_pid) = common::spawn_fcvm(&[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &snapshot,
+            "--name",
+            &clone_name,
+        ])
+        .await?;
+        clone = Some((child, clone_pid));
+        common::poll_health_by_pid(clone_pid, 120).await?;
+        let clone_objects = BridgedObjects::of(clone_pid, true).await?;
+        for objects in [&baseline_objects, &clone_objects] {
+            let present = objects.present()?;
+            // Namespace, veth, its FORWARD rule, and for the baseline four rules per
+            // published port and for the clone its route.
+            anyhow::ensure!(
+                present.iter().any(|p| p.starts_with("namespace"))
+                    && present.iter().any(|p| p.starts_with("interface"))
+                    && present.iter().any(|p| p.starts_with("rule")),
+                "the running VM's network is not all there: {present:?} ({objects:?})"
+            );
+        }
+        anyhow::ensure!(
+            baseline_objects
+                .present()?
+                .iter()
+                .any(|p| p.contains("DNAT")),
+            "the baseline has no DNAT rule for --publish {publish}"
+        );
+        anyhow::ensure!(
+            clone_objects
+                .present()?
+                .iter()
+                .any(|p| p.starts_with("route")),
+            "the clone has no host route to its guest"
+        );
+        Ok((baseline_objects, clone_objects))
+    }
+    .await;
+    sigkill(&mut baseline, baseline_pid).await?;
+    if let Some((mut child, pid)) = clone.take() {
+        sigkill(&mut child, pid).await?;
+    }
+    let result = async {
+        let (baseline_objects, clone_objects) = observed?;
+        next_launch_on("bridged").await?;
+        for objects in [&baseline_objects, &clone_objects] {
+            let present = objects.present()?;
+            anyhow::ensure!(
+                present.is_empty(),
+                "the killed VM's network survived the next launch: {present:?}"
+            );
+        }
+        Ok(())
+    }
+    .await;
+    common::delete_snapshot(&snapshot).await.ok();
+    result
+}
+
+/// #1184: a routed VM's namespace, veth, and the proxy NDP entry and MASQUERADE rule
+/// its setup managed to add (a host whose interface refuses proxy NDP, or a run with
+/// `--ipv6-prefix`, has neither) stay when fcvm is SIGKILLed, and the next launch removes
+/// them.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn a_sigkilled_routed_vm_leaves_its_network_to_the_next_launch() -> Result<()> {
+    let (name, _, _, _) = common::unique_names("reclaim-routed");
+    let (mut child, pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &name,
+        "--network",
+        "routed",
+        "--no-snapshot",
+        common::TEST_IMAGE,
+    ])
+    .await?;
+    let observed = async {
+        common::poll_health_by_pid(pid, 120).await?;
+        let vm = listed(pid).await?;
+        let network = &vm["config"]["network"];
+        let field = |name: &str| {
+            network[name]
+                .as_str()
+                .map(str::to_string)
+                .with_context(|| format!("no {name} in {network}"))
+        };
+        Ok::<_, anyhow::Error>((
+            field("namespace_name")?,
+            field("host_veth")?,
+            // Recorded with its prefix length.
+            field("guest_ipv6")?.trim_end_matches("/128").to_string(),
+        ))
+    }
+    .await;
+    // Every routed object this VM's setup created and its teardown removes.
+    let present =
+        |(namespace, host_veth, address): &(String, String, String)| -> Result<Vec<String>> {
+            let mut present = Vec::new();
+            if Path::new("/var/run/netns").join(namespace).exists() {
+                present.push(format!("namespace {namespace}"));
+            }
+            if Path::new("/sys/class/net").join(host_veth).exists() {
+                present.push(format!("interface {host_veth}"));
+            }
+            let proxies = command_output("ip", &["-6", "neigh", "show", "proxy"])?;
+            if proxies.split_whitespace().any(|token| token == address) {
+                present.push(format!("proxy NDP entry {address}"));
+            }
+            let source = format!("{address}/128");
+            let rules = command_output("ip6tables-save", &["-t", "nat"])?;
+            for rule in rules.lines() {
+                if rule.split_whitespace().any(|token| token == source) {
+                    present.push(format!("rule {rule}"));
+                }
+            }
+            Ok(present)
+        };
+    let before = observed.as_ref().ok().map(present);
+    sigkill(&mut child, pid).await?;
+    let objects = observed?;
+    let before = before.context("the routed VM's objects were not read")??;
+    println!("routed objects before the kill: {before:?}");
+    anyhow::ensure!(
+        before.iter().any(|p| p.starts_with("namespace"))
+            && before.iter().any(|p| p.starts_with("interface")),
+        "the running routed VM's network is not all there: {before:?}"
+    );
+    next_launch_on("routed").await?;
+    let after = present(&objects)?;
+    anyhow::ensure!(
+        after.is_empty(),
+        "the killed routed VM's network survived the next launch: {after:?}"
+    );
+    Ok(())
 }

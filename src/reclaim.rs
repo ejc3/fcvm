@@ -29,6 +29,16 @@
 //! too, and its undo removes it only if it is empty and nobody
 //! leases it (`storage::runtime_dir`).
 //!
+//! Network objects follow the same rule with one change, because their names are not
+//! random: a namespace is named from a few characters of the vm_id and settled by
+//! `ip netns add` (`network::names`), so it is recorded right after it is created, and a
+//! kill between the two leaks it. Every other object of a VM's network is named from the
+//! namespace's base or carries an address the VM's veth holds, so no other VM can have it
+//! while the namespace exists, and is recorded before it is created. Teardown drops those
+//! records before it deletes the veth and the namespace, which is when another VM can
+//! take the names (`forget`). Kernel objects are gone after a reboot and their names
+//! can be taken again, so a record from another boot is never acted on for them.
+//!
 //! Each user reclaims only the records in its own directory, which it creates mode 0700
 //! and refuses when anyone else can write it, so root never acts on a record another user
 //! wrote. Records stay per data_dir, like the VMs they describe: flock is authoritative
@@ -58,6 +68,40 @@ pub enum Resource {
     /// A temporary file or directory that is renamed into place or removed when its
     /// operation finishes.
     Temp { path: PathBuf },
+    /// A named network namespace (`ip netns add`).
+    Netns { name: String },
+    /// A host network interface. Deleting one end of a veth pair deletes the other.
+    Link { name: String },
+    /// An iptables or ip6tables rule, as the arguments that append it (`-A`).
+    Rule { program: String, args: Vec<String> },
+    /// A bridged clone's host route to its guest address through its own veth.
+    HostRoute { guest_ip: String, via: String },
+    /// The MASQUERADE rules every bridged VM shares, removed once no bridged VM's veth
+    /// remains (`portmap::cleanup_global_nat_if_unused`).
+    GlobalNat,
+    /// A routed VM's proxy NDP entry and, without `--ipv6-prefix`, its MASQUERADE rule,
+    /// both keyed by its IPv6 address. Undone only while nobody holds the address's
+    /// lease, which every routed VM holds for as long as it uses the address.
+    RoutedAddress {
+        address: std::net::Ipv6Addr,
+        iface: String,
+        masquerade: bool,
+    },
+}
+
+impl Resource {
+    /// An object of the running kernel, which a reboot discards.
+    fn is_kernel_object(&self) -> bool {
+        !matches!(
+            self,
+            Resource::RuntimeDir { .. } | Resource::MountTarget { .. } | Resource::Temp { .. }
+        )
+    }
+
+    /// Part of a VM's network, which its teardown removes (`forget`).
+    pub fn is_network(&self) -> bool {
+        self.is_kernel_object()
+    }
 }
 
 impl std::fmt::Display for Resource {
@@ -66,6 +110,16 @@ impl std::fmt::Display for Resource {
             Resource::RuntimeDir { path } => write!(f, "runtime directory {}", path.display()),
             Resource::MountTarget { path } => write!(f, "mount target {}", path.display()),
             Resource::Temp { path } => write!(f, "temporary {}", path.display()),
+            Resource::Netns { name } => write!(f, "network namespace {name}"),
+            Resource::Link { name } => write!(f, "interface {name}"),
+            Resource::Rule { program, args } => write!(f, "{program} {}", args.join(" ")),
+            Resource::HostRoute { guest_ip, via } => {
+                write!(f, "host route {guest_ip}/32 via {via}")
+            }
+            Resource::GlobalNat => write!(f, "shared bridged MASQUERADE rules"),
+            Resource::RoutedAddress { address, iface, .. } => {
+                write!(f, "proxy NDP and MASQUERADE of {address} on {iface}")
+            }
         }
     }
 }
@@ -74,7 +128,16 @@ impl std::fmt::Display for Resource {
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
     pid: u32,
+    /// The kernel's boot id when the record was written. Kernel objects of another boot
+    /// are gone.
+    boot_id: String,
     resources: Vec<Resource>,
+}
+
+fn boot_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|id| id.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// The directory this user's owner records live in, under `data_dir`.
@@ -123,36 +186,142 @@ pub fn owner_dir_in(data_dir: &Path) -> Result<PathBuf> {
     Ok(mine)
 }
 
-fn lock_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join(format!("{id}.lock"))
+/// A user's owner directory, held open. Every record is created, read, renamed and removed
+/// through this descriptor, never by path: under sudo root works in a data directory a
+/// user owns, and that user could otherwise move another directory in place of root's
+/// between the check and the use, and make root act on records it did not write.
+struct OwnerDir {
+    path: PathBuf,
+    fd: File,
 }
 
-fn record_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join(format!("{id}.json"))
-}
+impl OwnerDir {
+    /// Open `path` without following a symlink, and refuse it unless it is a directory of
+    /// this user's that no one else can write, judged on the descriptor itself.
+    fn open(path: &Path) -> Result<Self> {
+        use nix::fcntl::OFlag;
+        let fd = nix::fcntl::open(
+            path,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )
+        .with_context(|| format!("opening owner directory {}", path.display()))?;
+        let fd = File::from(fd);
+        let metadata = fd
+            .metadata()
+            .with_context(|| format!("reading owner directory {}", path.display()))?;
+        let euid = nix::unistd::geteuid().as_raw();
+        if metadata.uid() != euid || metadata.mode() & 0o022 != 0 {
+            bail!(
+                "refusing owner records in {}: it must be owned by uid {euid} and writable by \
+                 no one else (found uid {}, mode {:o})",
+                path.display(),
+                metadata.uid(),
+                metadata.mode() & 0o7777
+            );
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            fd,
+        })
+    }
 
-fn record_temp_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join(format!("{id}.json.tmp"))
-}
+    fn display(&self, name: &str) -> String {
+        self.path.join(name).display().to_string()
+    }
 
-fn remove_if_exists(path: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        result => result,
+    fn open_file(&self, name: &str, flags: nix::fcntl::OFlag) -> nix::Result<File> {
+        use nix::fcntl::OFlag;
+        nix::fcntl::openat(
+            &self.fd,
+            name,
+            flags | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .map(File::from)
+    }
+
+    /// The identity of `name` in the directory, or `None` when there is nothing there.
+    fn identity(&self, name: &str) -> Result<Option<(u64, u64)>> {
+        match nix::sys::stat::fstatat(&self.fd, name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(stat) => Ok(Some((stat.st_dev, stat.st_ino))),
+            Err(nix::errno::Errno::ENOENT) => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("reading {}", self.display(name))),
+        }
+    }
+
+    fn remove(&self, name: &str) -> Result<()> {
+        match nix::unistd::unlinkat(&self.fd, name, nix::unistd::UnlinkatFlags::NoRemoveDir) {
+            Ok(()) | Err(nix::errno::Errno::ENOENT) => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("removing {}", self.display(name))),
+        }
+    }
+
+    fn read(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        use std::io::Read;
+        let mut file = match self.open_file(name, nix::fcntl::OFlag::O_RDONLY) {
+            Ok(file) => file,
+            Err(nix::errno::Errno::ENOENT) => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("opening {}", self.display(name)))
+            }
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .with_context(|| format!("reading {}", self.display(name)))?;
+        Ok(Some(bytes))
+    }
+
+    fn names(&self) -> Result<Vec<String>> {
+        use nix::fcntl::OFlag;
+        let listing = nix::dir::Dir::openat(
+            &self.fd,
+            ".",
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )
+        .with_context(|| format!("listing {}", self.path.display()))?;
+        let mut names = Vec::new();
+        for entry in listing {
+            let entry = entry.with_context(|| format!("listing {}", self.path.display()))?;
+            if let Ok(name) = entry.file_name().to_str() {
+                if name != "." && name != ".." {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        Ok(names)
     }
 }
 
-/// Lock `path` exclusively, creating it if needed. `None` when `wait` is false and someone
-/// holds it. A lock file is unlinked by whoever completes or reclaims its owner while still
-/// holding it, so the lock is retaken until the inode held is the one at the path.
-fn lock_owner_file(path: &Path, wait: bool) -> Result<Option<Flock<File>>> {
+fn lock_name(id: &str) -> String {
+    format!("{id}.lock")
+}
+
+fn record_name(id: &str) -> String {
+    format!("{id}.json")
+}
+
+fn record_temp_name(id: &str) -> String {
+    format!("{id}.json.tmp")
+}
+
+#[cfg(test)]
+fn record_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(record_name(id))
+}
+
+/// Lock the owner `id`'s lock file exclusively, creating it if needed. `None` when `wait`
+/// is false and someone holds it. A lock file is unlinked by whoever completes or reclaims
+/// its owner while still holding it, so the lock is retaken until the inode held is the
+/// one at the name.
+fn lock_owner_file(dir: &OwnerDir, id: &str, wait: bool) -> Result<Option<Flock<File>>> {
+    use nix::fcntl::OFlag;
+    let name = lock_name(id);
     loop {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)
-            .with_context(|| format!("opening {}", path.display()))?;
+        let file = dir
+            .open_file(&name, OFlag::O_CREAT | OFlag::O_WRONLY)
+            .with_context(|| format!("opening {}", dir.display(&name)))?;
         let arg = if wait {
             FlockArg::LockExclusive
         } else {
@@ -162,19 +331,14 @@ fn lock_owner_file(path: &Path, wait: bool) -> Result<Option<Flock<File>>> {
             Ok(guard) => guard,
             Err((_, nix::errno::Errno::EWOULDBLOCK)) if !wait => return Ok(None),
             Err((_, error)) => {
-                return Err(error).with_context(|| format!("locking {}", path.display()))
+                return Err(error).with_context(|| format!("locking {}", dir.display(&name)))
             }
         };
         let held = guard
             .metadata()
-            .with_context(|| format!("reading the identity of {}", path.display()))?;
-        match std::fs::metadata(path) {
-            Ok(current) if (current.dev(), current.ino()) == (held.dev(), held.ino()) => {
-                return Ok(Some(guard))
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+            .with_context(|| format!("reading the identity of {}", dir.display(&name)))?;
+        if dir.identity(&name)? == Some((held.dev(), held.ino())) {
+            return Ok(Some(guard));
         }
     }
 }
@@ -189,24 +353,31 @@ fn release(lock: Flock<File>) {
     drop(file);
 }
 
-fn write_record(dir: &Path, id: &str, resources: &[Resource]) -> Result<()> {
+fn write_record(dir: &OwnerDir, id: &str, resources: &[Resource]) -> Result<()> {
+    use nix::fcntl::OFlag;
+    use std::io::Write;
     let record = Record {
         pid: std::process::id(),
+        boot_id: boot_id(),
         resources: resources.to_vec(),
     };
-    let temp = record_temp_path(dir, id);
-    std::fs::write(&temp, serde_json::to_vec(&record)?)
-        .with_context(|| format!("writing {}", temp.display()))?;
-    std::fs::rename(&temp, record_path(dir, id))
+    let temp = record_temp_name(id);
+    let mut file = dir
+        .open_file(&temp, OFlag::O_CREAT | OFlag::O_WRONLY | OFlag::O_TRUNC)
+        .with_context(|| format!("creating {}", dir.display(&temp)))?;
+    file.write_all(&serde_json::to_vec(&record)?)
+        .with_context(|| format!("writing {}", dir.display(&temp)))?;
+    drop(file);
+    nix::fcntl::renameat(&dir.fd, temp.as_str(), &dir.fd, record_name(id).as_str())
         .with_context(|| format!("publishing the owner record of {id}"))
 }
 
 /// Delete an owner's files. The caller holds `lock`, and the lock file goes last so that
 /// no one can take a new lock on the id while its record still exists.
-fn delete_owner_files(dir: &Path, id: &str, lock: Flock<File>) -> Result<()> {
-    remove_if_exists(&record_path(dir, id))
-        .and_then(|()| remove_if_exists(&record_temp_path(dir, id)))
-        .and_then(|()| remove_if_exists(&lock_path(dir, id)))
+fn delete_owner_files(dir: &OwnerDir, id: &str, lock: Flock<File>) -> Result<()> {
+    dir.remove(&record_name(id))
+        .and_then(|()| dir.remove(&record_temp_name(id)))
+        .and_then(|()| dir.remove(&lock_name(id)))
         .with_context(|| format!("deleting the owner record of {id}"))?;
     release(lock);
     Ok(())
@@ -221,7 +392,7 @@ struct OwnerState {
 
 struct Inner {
     id: String,
-    dir: PathBuf,
+    dir: OwnerDir,
     state: Mutex<OwnerState>,
 }
 
@@ -253,9 +424,10 @@ impl Owner {
         if owners.get(id).and_then(Weak::upgrade).is_some() {
             bail!("resources under {id} already have an owner in this process");
         }
-        let lock = lock_owner_file(&lock_path(dir, id), true)?
+        let owner_dir = OwnerDir::open(dir)?;
+        let lock = lock_owner_file(&owner_dir, id, true)?
             .context("an owner lock taken with waiting returned none")?;
-        if record_path(dir, id).exists() {
+        if owner_dir.identity(&record_name(id))?.is_some() {
             bail!(
                 "an owner record for {id} already exists in {}; ids are never reused",
                 dir.display()
@@ -263,7 +435,7 @@ impl Owner {
         }
         let inner = Arc::new(Inner {
             id: id.to_string(),
-            dir: dir.to_path_buf(),
+            dir: owner_dir,
             state: Mutex::new(OwnerState {
                 lock: Some(lock),
                 resources: Vec::new(),
@@ -375,7 +547,9 @@ impl Inner {
                 self.id
             );
         }
-        if state.resources.contains(&resource) {
+        // Two published ports can append one rule twice (the same guest port), and each
+        // copy needs its own delete.
+        if !matches!(resource, Resource::Rule { .. }) && state.resources.contains(&resource) {
             return Ok(());
         }
         state.resources.push(resource);
@@ -394,7 +568,10 @@ impl Inner {
             }
             std::mem::take(&mut state.resources)
         };
-        let remaining = undo_all(&self.id, resources).await;
+        let remaining = undo_all(&self.id, resources, true, |list| {
+            write_record(&self.dir, &self.id, list)
+        })
+        .await;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.completed = true;
         let lock = state
@@ -403,6 +580,15 @@ impl Inner {
             .context("a completing owner holds its lock")?;
         if remaining.is_empty() {
             return delete_owner_files(&self.dir, &self.id, lock);
+        }
+        if remaining.iter().all(|(_, why)| why.starts_with(IN_USE)) {
+            // This process, or another, still leases them (a clone keeps the mountpoint
+            // its VMM's vsock path goes through until it exits). The record stays, and
+            // the first launch after the lease ends removes them.
+            let resources: Vec<Resource> = remaining.into_iter().map(|(r, _)| r).collect();
+            write_record(&self.dir, &self.id, &resources)?;
+            release(lock);
+            return Ok(());
         }
         let kept = remaining
             .iter()
@@ -435,6 +621,33 @@ pub fn record(id: &str, resource: Resource) -> Result<()> {
     owner(id)?.record(resource)
 }
 
+/// Drop the records of the owner under `id` that `matches` selects, without undoing
+/// them: teardown is about to remove those objects itself, after which their names can
+/// belong to another VM. Nothing is recorded without an owner, so none is not an error.
+pub fn forget(id: &str, matches: impl Fn(&Resource) -> bool) -> Result<()> {
+    let Ok(inner) = owner(id) else {
+        return Ok(());
+    };
+    let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.completed {
+        return Ok(());
+    }
+    let kept: Vec<Resource> = state
+        .resources
+        .iter()
+        .filter(|resource| !matches(resource))
+        .cloned()
+        .collect();
+    if kept.len() == state.resources.len() {
+        return Ok(());
+    }
+    // On disk first: until the write lands the objects are still recorded there, and
+    // the caller must not delete them.
+    write_record(&inner.dir, &inner.id, &kept)?;
+    state.resources = kept;
+    Ok(())
+}
+
 /// End the owner registered under `id`: undo every resource still
 /// recorded, and delete its record. Teardown has removed most of them already, and undoing
 /// a resource that is gone does nothing. A resource that cannot be undone stays recorded
@@ -444,21 +657,80 @@ pub async fn complete(id: &str) -> Result<()> {
 }
 
 /// Why an undo left a resource in place.
-enum Undo {
+pub(crate) enum Undo {
     /// The resource is gone, or is not this owner's to remove.
     Done,
     /// Still there; a later launch tries again.
     Kept(String),
+    /// Still there because a live process uses it: a lease on it is held. Not a failure;
+    /// the record stays until a launch finds it unused.
+    InUse(String),
 }
 
-/// Undo `resources` newest first, returning the ones that stay.
-async fn undo_all(id: &str, resources: Vec<Resource>) -> Vec<(Resource, String)> {
-    let mut remaining = Vec::new();
-    for resource in resources.into_iter().rev() {
-        match undo(&resource).await {
-            Undo::Done => debug!(owner = %id, %resource, "undone"),
-            Undo::Kept(why) => remaining.push((resource, why)),
+/// How the reason of an [`Undo::InUse`] resource starts, in what `undo_all` returns.
+const IN_USE: &str = "in use: ";
+
+/// Undo `resources` newest first, returning the ones that stay. `same_boot` is false for
+/// a record written before the last reboot, whose kernel objects are gone.
+///
+/// A kernel object's name can be another VM's once the object is deleted, so its record
+/// is rewritten without it (`persist`) before it is deleted: a kill in between leaks the
+/// object instead of leaving a record that would delete a namesake. When one cannot be
+/// deleted, the older kernel objects stay as well, because they are what keeps its names
+/// and addresses this owner's (the namespace and the veth outlive the rules that name
+/// them).
+async fn undo_all(
+    id: &str,
+    resources: Vec<Resource>,
+    same_boot: bool,
+    persist: impl Fn(&[Resource]) -> Result<()>,
+) -> Vec<(Resource, String)> {
+    let mut pending = resources;
+    // Newest first.
+    let mut remaining: Vec<(Resource, String)> = Vec::new();
+    let mut hold_kernel: Option<String> = None;
+    let record = |pending: &[Resource], remaining: &[(Resource, String)]| -> Vec<Resource> {
+        pending
+            .iter()
+            .cloned()
+            .chain(remaining.iter().rev().map(|(r, _)| r.clone()))
+            .collect()
+    };
+    while let Some(resource) = pending.pop() {
+        if !resource.is_kernel_object() {
+            match undo(&resource).await {
+                Undo::Done => debug!(owner = %id, %resource, "undone"),
+                Undo::Kept(why) => remaining.push((resource, why)),
+                Undo::InUse(why) => remaining.push((resource, format!("{IN_USE}{why}"))),
+            }
+            continue;
         }
+        if !same_boot {
+            debug!(owner = %id, %resource, "recorded before the last boot; gone with it");
+            continue;
+        }
+        if let Some(why) = &hold_kernel {
+            remaining.push((resource, why.clone()));
+            continue;
+        }
+        if let Err(error) = persist(&record(&pending, &remaining)) {
+            let why = format!("its record could not be retired first: {error:#}");
+            hold_kernel = Some(why.clone());
+            remaining.push((resource, why));
+            continue;
+        }
+        let left = match undo(&resource).await {
+            Undo::Done => {
+                debug!(owner = %id, %resource, "undone");
+                continue;
+            }
+            Undo::Kept(why) => why,
+            Undo::InUse(why) => format!("{IN_USE}{why}"),
+        };
+        hold_kernel = Some(format!("{IN_USE}{resource} stays"));
+        remaining.push((resource, left));
+        // Still this owner's: record it again.
+        let _ = persist(&record(&pending, &remaining));
     }
     remaining.reverse();
     remaining
@@ -469,6 +741,59 @@ async fn undo(resource: &Resource) -> Undo {
         Resource::RuntimeDir { path } => undo_runtime_dir(path).await,
         Resource::MountTarget { path } => undo_mount_target(path).await,
         Resource::Temp { path } => undo_temp(path).await,
+        Resource::Netns { name } => {
+            undo_result(crate::network::namespace::delete_namespace(name).await)
+        }
+        Resource::Link { name } => undo_result(crate::network::veth::delete_veth_pair(name).await),
+        Resource::Rule { program, args } => undo_rule(program, args).await,
+        Resource::HostRoute { guest_ip, via } => {
+            undo_result(crate::network::veth::delete_host_route_to_guest(guest_ip, via).await)
+        }
+        Resource::GlobalNat => {
+            undo_result(crate::network::portmap::cleanup_global_nat_if_unused().await)
+        }
+        Resource::RoutedAddress {
+            address,
+            iface,
+            masquerade,
+        } => crate::network::routed::release_address(*address, iface, *masquerade).await,
+    }
+}
+
+fn undo_result(result: Result<()>) -> Undo {
+    match result {
+        Ok(()) => Undo::Done,
+        Err(error) => Undo::Kept(format!("{error:#}")),
+    }
+}
+
+/// Delete a rule recorded by the arguments that appended it.
+async fn undo_rule(program: &str, args: &[String]) -> Undo {
+    let mut delete = args.to_vec();
+    let Some(append) = delete.iter().position(|arg| arg == "-A") else {
+        return Undo::Kept(format!("{program} rule {args:?} has no -A"));
+    };
+    delete[append] = "-D".to_string();
+    match tokio::process::Command::new(program)
+        .args(&delete)
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => Undo::Done,
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // The rule is not there: never added, or removed already.
+            if stderr.contains("Bad rule")
+                || stderr.contains("does a matching rule exist")
+                || stderr.contains("No chain")
+                || stderr.contains("does not exist")
+            {
+                Undo::Done
+            } else {
+                Undo::Kept(stderr.trim().to_string())
+            }
+        }
+        Err(error) => Undo::Kept(error.to_string()),
     }
 }
 
@@ -497,7 +822,7 @@ async fn undo_runtime_dir(path: &Path) -> Undo {
         Ok(Some(file)) => file,
         Ok(None) => return Undo::Done,
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            return Undo::Kept("a restore leases it".to_string())
+            return Undo::InUse("a restore leases it".to_string())
         }
         Err(error) => return Undo::Kept(error.to_string()),
     };
@@ -526,9 +851,11 @@ async fn undo_mount_target(path: &Path) -> Undo {
     let _lock = match lock_directory(path) {
         Ok(Some(file)) => file,
         Ok(None) => return Undo::Done,
-        // Every process that leases a mount target records it first, so a live one is
-        // responsible for it now.
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Undo::Done,
+        // A restore leases it: removed by whichever lease ends last, or by a later
+        // launch once none does (a clone that exits without dropping its lease).
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            return Undo::InUse("a restore leases it".to_string())
+        }
         Err(error) => return Undo::Kept(error.to_string()),
     };
     // Empty, as `storage::runtime_dir` judges a mountpoint a restore made: a live VM's
@@ -596,19 +923,19 @@ pub async fn reclaim_abandoned() -> Reclaimed {
 }
 
 /// [`reclaim_abandoned`] in an explicit owner directory.
-pub async fn reclaim_abandoned_in(dir: &Path) -> Reclaimed {
+pub async fn reclaim_abandoned_in(path: &Path) -> Reclaimed {
     let mut done = Reclaimed::default();
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
+    let names = match OwnerDir::open(path).and_then(|dir| dir.names().map(|names| (dir, names))) {
+        Ok(listed) => listed,
         Err(error) => {
-            warn!(dir = %dir.display(), %error, "cannot read owner records");
+            warn!(dir = %path.display(), error = %format!("{error:#}"), "cannot read owner records");
             return done;
         }
     };
+    let (dir, names) = names;
+    let dir = &dir;
     let mut ids = std::collections::BTreeSet::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
+    for name in &names {
         if let Some(id) = name
             .strip_suffix(".lock")
             .or_else(|| name.strip_suffix(".json"))
@@ -617,7 +944,7 @@ pub async fn reclaim_abandoned_in(dir: &Path) -> Reclaimed {
         }
     }
     for id in ids {
-        let lock = match lock_owner_file(&lock_path(dir, &id), false) {
+        let lock = match lock_owner_file(dir, &id, false) {
             Ok(Some(lock)) => lock,
             // Its owner is alive.
             Ok(None) => continue,
@@ -626,11 +953,11 @@ pub async fn reclaim_abandoned_in(dir: &Path) -> Reclaimed {
                 continue;
             }
         };
-        let record = match std::fs::read(record_path(dir, &id)) {
-            Ok(bytes) => bytes,
+        let record = match dir.read(&record_name(&id)) {
+            Ok(Some(bytes)) => bytes,
             // An owner that recorded nothing, or one that is between creating its lock
             // and taking it (it finds the file gone and makes a new one).
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None) => {
                 if let Err(error) = delete_owner_files(dir, &id, lock) {
                     warn!(owner = %id, error = %format!("{error:#}"), "cannot delete an empty owner lock");
                 }
@@ -649,7 +976,11 @@ pub async fn reclaim_abandoned_in(dir: &Path) -> Reclaimed {
             }
         };
         let total = record.resources.len();
-        let remaining = undo_all(&id, record.resources).await;
+        let same_boot = record.boot_id == boot_id();
+        let remaining = undo_all(&id, record.resources, same_boot, |list| {
+            write_record(dir, &id, list)
+        })
+        .await;
         done.resources += total - remaining.len();
         if remaining.is_empty() {
             match delete_owner_files(dir, &id, lock) {
@@ -662,7 +993,11 @@ pub async fn reclaim_abandoned_in(dir: &Path) -> Reclaimed {
         }
         done.remaining += remaining.len();
         for (resource, why) in &remaining {
-            warn!(owner = %id, pid = record.pid, %resource, reason = %why, "cannot reclaim yet");
+            if why.starts_with(IN_USE) {
+                debug!(owner = %id, pid = record.pid, %resource, reason = %why, "still in use");
+            } else {
+                warn!(owner = %id, pid = record.pid, %resource, reason = %why, "cannot reclaim yet");
+            }
         }
         let resources: Vec<Resource> = remaining.into_iter().map(|(r, _)| r).collect();
         if let Err(error) = write_record(dir, &id, &resources) {
@@ -912,12 +1247,13 @@ mod tests {
         let other_clone = std::fs::File::open(&held).unwrap();
         fs2::FileExt::try_lock_shared(&other_clone).unwrap();
 
+        // The held one stays recorded until no restore leases it.
         assert_eq!(
             reclaim_abandoned_in(&dir).await,
             Reclaimed {
-                owners: 1,
-                resources: 3,
-                remaining: 0
+                owners: 0,
+                resources: 2,
+                remaining: 1
             }
         );
         assert!(!made.exists(), "an unleased empty mountpoint was left");
@@ -928,6 +1264,12 @@ mod tests {
         assert!(
             held.exists(),
             "a mountpoint another clone holds was removed"
+        );
+        drop(other_clone);
+        assert_eq!(reclaim_abandoned_in(&dir).await.owners, 1);
+        assert!(
+            !held.exists(),
+            "the mountpoint was left once no lease held it"
         );
     }
 
@@ -993,5 +1335,199 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = owner_dir_in(&root.path().join("new/data")).unwrap();
         assert!(dir.is_dir());
+    }
+
+    /// Teardown drops a network object's record before it deletes the object, after
+    /// which another VM can take its name.
+    #[tokio::test]
+    async fn forget_drops_records_without_undoing_them() {
+        let (root, dir) = test_dir();
+        let kept = root.path().join("kept.tmp");
+        std::fs::write(&kept, b"x").unwrap();
+        let owner = Owner::begin_in(&dir, "vm-forget").unwrap();
+        owner
+            .record(Resource::Netns {
+                name: "fcvm-vm-forget".into(),
+            })
+            .unwrap();
+        owner.record(Resource::Temp { path: kept.clone() }).unwrap();
+        forget("vm-forget", Resource::is_network).unwrap();
+        drop(owner);
+        let record: Record =
+            serde_json::from_slice(&std::fs::read(dir.join("vm-forget.json")).unwrap()).unwrap();
+        assert_eq!(record.resources, [Resource::Temp { path: kept.clone() }]);
+        assert!(kept.exists(), "forget undid a resource");
+        forget("vm-without-owner", |_| true).unwrap();
+    }
+
+    /// A reboot discards kernel objects, and a later VM can hold their names, so a record
+    /// from another boot is never acted on for them.
+    #[tokio::test]
+    async fn kernel_objects_recorded_before_the_last_boot_are_left_alone() {
+        let (root, dir) = test_dir();
+        let temp = root.path().join("before-reboot.tmp");
+        std::fs::write(&temp, b"x").unwrap();
+        let record = Record {
+            pid: 1,
+            boot_id: "a-boot-before-this-one".into(),
+            resources: vec![
+                // Its undo cannot run, so a pass that acted on it would keep it.
+                Resource::Rule {
+                    program: "/nonexistent/iptables".into(),
+                    args: vec!["-A".into(), "FORWARD".into()],
+                },
+                Resource::Temp { path: temp.clone() },
+            ],
+        };
+        std::fs::write(
+            record_path(&dir, "vm-before-reboot"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reclaim_abandoned_in(&dir).await,
+            Reclaimed {
+                owners: 1,
+                resources: 2,
+                remaining: 0
+            }
+        );
+        assert!(!temp.exists());
+        assert!(files_in(&dir).is_empty());
+    }
+
+    fn rule(program: &str, chain: &str) -> Resource {
+        Resource::Rule {
+            program: program.into(),
+            args: vec!["-A".into(), chain.into()],
+        }
+    }
+
+    /// A kernel object's record is rewritten without it before it is deleted, so a pass
+    /// killed in between leaks it instead of later deleting a namesake.
+    #[tokio::test]
+    async fn a_kernel_object_is_retired_from_the_record_before_it_is_deleted() {
+        let temp = PathBuf::from("/nonexistent/reclaim-test.tmp");
+        let persisted = std::sync::Mutex::new(Vec::new());
+        let remaining = undo_all(
+            "vm-retire",
+            vec![
+                Resource::Temp { path: temp.clone() },
+                rule("true", "FORWARD"),
+            ],
+            true,
+            |list| {
+                persisted.lock().unwrap().push(list.to_vec());
+                Ok(())
+            },
+        )
+        .await;
+        assert!(remaining.is_empty());
+        assert_eq!(
+            persisted.into_inner().unwrap(),
+            [vec![Resource::Temp { path: temp }]],
+            "the rule was not retired before its delete"
+        );
+    }
+
+    /// A kernel object that cannot be removed keeps the older ones that hold its names.
+    #[tokio::test]
+    async fn an_object_that_cannot_be_removed_keeps_the_ones_recorded_before_it() {
+        let veth = Resource::Link {
+            name: "veth0-vm-reclm0".into(),
+        };
+        let stuck = rule("/nonexistent/iptables", "FORWARD");
+        let remaining = undo_all("vm-stuck", vec![veth.clone(), stuck.clone()], true, |_| {
+            Ok(())
+        })
+        .await;
+        let remaining: Vec<Resource> = remaining.into_iter().map(|(r, _)| r).collect();
+        assert_eq!(remaining, [veth, stuck]);
+    }
+
+    /// Two published ports with one guest port append the same rule twice; each copy is
+    /// recorded, so each gets a delete.
+    #[tokio::test]
+    async fn a_rule_recorded_twice_is_kept_twice() {
+        let (_root, dir) = test_dir();
+        let owner = Owner::begin_in(&dir, "vm-twice").unwrap();
+        let twice = rule("iptables", "FORWARD");
+        owner.record(twice.clone()).unwrap();
+        owner.record(twice.clone()).unwrap();
+        let record: Record =
+            serde_json::from_slice(&std::fs::read(dir.join("vm-twice.json")).unwrap()).unwrap();
+        assert_eq!(record.resources, [twice.clone(), twice]);
+        drop(owner);
+    }
+
+    /// A forget whose write fails changes nothing, so the caller keeps the objects.
+    #[tokio::test]
+    async fn a_failed_forget_keeps_the_records() {
+        let (_root, dir) = test_dir();
+        let owner = Owner::begin_in(&dir, "vm-forget-fails").unwrap();
+        let netns = Resource::Netns {
+            name: "fcvm-vm-ffails".into(),
+        };
+        owner.record(netns.clone()).unwrap();
+        // A directory in the record's place makes the rename onto it fail, as root too.
+        let record = dir.join("vm-forget-fails.json");
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir_all(record.join("blocker")).unwrap();
+        assert!(forget("vm-forget-fails", Resource::is_network).is_err());
+        let state = owner.inner.state.lock().unwrap();
+        assert_eq!(state.resources, [netns]);
+        drop(state);
+        drop(owner);
+    }
+
+    /// A clone whose VMM goes through the redirect keeps its lease on the mountpoint past
+    /// its teardown. Completing its owner then leaves the record, so a clone that exits
+    /// without dropping the lease still has its mountpoint reclaimed.
+    #[tokio::test]
+    async fn completing_an_owner_keeps_a_mount_target_it_still_leases() {
+        let (root, dir) = test_dir();
+        let made = root.path().join("vm-disks/vm-gone-source");
+        std::fs::create_dir_all(&made).unwrap();
+        let owner = Owner::begin_in(&dir, "vm-clone-leasing").unwrap();
+        owner
+            .record(Resource::MountTarget { path: made.clone() })
+            .unwrap();
+        let own_lease = std::fs::File::open(&made).unwrap();
+        fs2::FileExt::try_lock_shared(&own_lease).unwrap();
+        owner.complete().await.unwrap();
+        assert!(
+            dir.join("vm-clone-leasing.json").exists(),
+            "completion dropped the record of a mountpoint still leased"
+        );
+        drop(own_lease);
+        assert_eq!(reclaim_abandoned_in(&dir).await.owners, 1);
+        assert!(!made.exists());
+    }
+
+    /// Records are read through the owner directory's own descriptor, opened without
+    /// following a symlink, so a directory put in its place (a symlink to one another
+    /// user wrote) is refused instead of read.
+    #[tokio::test]
+    async fn an_owner_directory_replaced_by_a_symlink_is_refused() {
+        let (root, _dir) = test_dir();
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let forged = root.path().join("forged");
+        std::fs::create_dir(&forged).unwrap();
+        let record = Record {
+            pid: 1,
+            boot_id: boot_id(),
+            resources: vec![Resource::Temp {
+                path: victim.clone(),
+            }],
+        };
+        std::fs::write(forged.join("x.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+        let link = root.path().join("swapped");
+        std::os::unix::fs::symlink(&forged, &link).unwrap();
+        assert_eq!(reclaim_abandoned_in(&link).await, Reclaimed::default());
+        assert!(
+            victim.exists(),
+            "a record read through a symlink removed its path"
+        );
     }
 }
