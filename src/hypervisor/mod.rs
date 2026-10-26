@@ -117,10 +117,9 @@ pub struct ProcessSpec {
     pub user_namespace_path: Option<PathBuf>,
     /// Net namespace path for rootless clones (entered via setns in pre_exec).
     pub net_namespace_path: Option<PathBuf>,
-    /// Ordered mount-namespace redirects for clone isolation: each
-    /// `(mountpoint, source)` pair bind-mounts `source` over `mountpoint`, in
-    /// order (a later mountpoint may resolve inside an earlier pair's mount).
-    pub mount_redirects: Option<Vec<(PathBuf, PathBuf)>>,
+    /// The mount namespace a restored clone's VMM runs in
+    /// ([`crate::utils::MountRedirects`]).
+    pub mount_redirects: Option<crate::utils::MountRedirects>,
 }
 
 /// A block device to attach (rootfs or data disk), VMM-neutral.

@@ -767,12 +767,15 @@ __device__ float landmark_vis(V3 p, V3 l) {
 }
 
 // Radiance leaving a terrain point toward the eye, with one bounce of sky and ground light.
-__device__ V3 shade_terrain(V3 p, V3 rd, float t, float pix, Rng& rng, bool full) {
+__device__ V3 shade_terrain(V3 p, V3 rd, float t, float pix, Rng& rng, bool full, V3* alb_out = nullptr,
+                             V3* nrm_out = nullptr) {
   float h = terrain_s(v2(p.x, p.z), 8);
   float eps = fmaxf(0.0012f, t * pix);
   int oct = (int)clampf(floorf(log2f(2.0f / eps)) + 1.0f, 5.0f, 12.0f);
   V3 n = terrain_normal(p, eps, oct);
   Material m = terrain_material(p, h, n);
+  if (alb_out) *alb_out = m.albedo;
+  if (nrm_out) *nrm_out = n;
   // Rock detail the heightfield cannot carry: gullies running down the slope
   // and fractured faces, as a normal perturbation, faded out where a pixel
   // covers more than the detail.
@@ -1049,6 +1052,8 @@ __device__ V3 shade_water(V3 p, V3 rd, float t, float level, Rng& rng, bool full
 
 struct Hit {
   V3 L;
+  V3 alb;      // the share of L a surface's albedo scales (1 where none does): the denoiser's guide
+  V3 nrm;      // the first hit's normal (toward the eye where a cloud or the sky is what shows)
   float dist;  // primary distance, 1e9 for sky
   float id;    // 0 sky, 1 land, 2 water (what lies behind any cloud)
 };
@@ -1063,6 +1068,8 @@ __global__ void k_sunvis() {
 
 __device__ Hit trace(V3 o, V3 d, float pix, Rng& rng) {
   Hit hres;
+  hres.alb = v3(1.0f);
+  hres.nrm = -d;
   // far enough to reach the horizon from any height (from 100 km it is 1,130 km away)
   float hz = sqrtf(2.0f * PLANET_R * fmaxf(alt_flat(o), 0.0f)) + 300.0f;
   // below 10 km the horizon is inside 360 km and haze hides what lies past it;
@@ -1077,13 +1084,18 @@ __device__ Hit trace(V3 o, V3 d, float pix, Rng& rng) {
     if (h <= wl) {
       L = shade_water(p, d, th, wl, rng, true);
       hres.id = 2.0f;
+      hres.nrm = v3(0.0f, 1.0f, 0.0f);
     } else {
-      L = shade_terrain(p, d, th, pix, rng, true);
+      V3 a, n;
+      L = shade_terrain(p, d, th, pix, rng, true, &a, &n);
       hres.id = 1.0f;
+      hres.alb = a;
+      hres.nrm = n;
     }
     V3 T;
     V3 ins = scatter(o, d, th, cP.hq ? 12 : 8, &T);
     L = L * T + ins;
+    hres.alb = mix(v3(1.0f), hres.alb, lum(T));  // the haze in front is not the surface's
     hres.dist = th;
   } else {
     L = sky_ray(o, d, true);
@@ -1096,6 +1108,7 @@ __device__ Hit trace(V3 o, V3 d, float pix, Rng& rng) {
     V3 Ta;
     V3 ins = scatter(o, d, c.depth, 8, &Ta);
     L = L * c.T + c.L * Ta + ins * (1.0f - c.T);
+    hres.alb = mix(v3(1.0f), hres.alb, c.T);
   }
   // Where the cloud is most of what the pixel shows, its distance is the one
   // that moves with the camera: reprojecting a near cloud through the terrain
@@ -1103,7 +1116,10 @@ __device__ Hit trace(V3 o, V3 d, float pix, Rng& rng) {
   // The hit kind stays that of what lies behind it. Over land and water, where
   // the depth also decides which texels count, only a nearly opaque cloud
   // takes over: a thin one would split the ground into islands.
-  if (c.T < (hres.id == 0.0f ? 0.5f : 0.2f)) hres.dist = c.depth;
+  if (c.T < (hres.id == 0.0f ? 0.5f : 0.2f)) {
+    hres.dist = c.depth;
+    hres.nrm = -d;
+  }
   hres.L = L;
   return hres;
 }
@@ -1368,10 +1384,33 @@ __device__ __forceinline__ bool draws_here(uint32_t X, uint32_t Y) {
   return ((X & 1u) + 2u * (Y & 1u)) == order[cP.parity & 3];
 }
 
+// A unit normal in one float: octahedral, 15 bits per axis (so the bits are
+// never a NaN and survive any copy).
+__device__ __forceinline__ float pack_nrm(V3 n) {
+  float l1 = fabsf(n.x) + fabsf(n.y) + fabsf(n.z) + 1e-20f;
+  float x = n.x / l1, z = n.z / l1;
+  if (n.y < 0.0f) {
+    float ox = (1.0f - fabsf(z)) * (x >= 0.0f ? 1.0f : -1.0f), oz = (1.0f - fabsf(x)) * (z >= 0.0f ? 1.0f : -1.0f);
+    x = ox; z = oz;
+  }
+  uint32_t a = (uint32_t)__float2int_rn(sat(x * 0.5f + 0.5f) * 32767.0f), b = (uint32_t)__float2int_rn(sat(z * 0.5f + 0.5f) * 32767.0f);
+  return __uint_as_float(a | (b << 15));
+}
+__device__ __forceinline__ V3 unpack_nrm(float f) {
+  uint32_t u = __float_as_uint(f);
+  float x = (u & 32767u) * (2.0f / 32767.0f) - 1.0f, z = ((u >> 15) & 32767u) * (2.0f / 32767.0f) - 1.0f;
+  float y = 1.0f - fabsf(x) - fabsf(z);
+  if (y < 0.0f) {
+    float ox = (1.0f - fabsf(z)) * (x >= 0.0f ? 1.0f : -1.0f), oz = (1.0f - fabsf(x)) * (z >= 0.0f ? 1.0f : -1.0f);
+    x = ox; z = oz;
+  }
+  return normalize(v3(x, y, z));
+}
+
 // Draw this frame's samples over the drawn region (tile plus guard band) into
 // the ring entry for the frame: the mean of `spp` samples seeded by (pixel,
 // frame seed, s), the first sample's hit distance and kind.
-__global__ void k_moving(float4* ring, float2* ring_aux) {
+__global__ void k_moving(float4* ring, float2* ring_aux, float4* ring_g) {
   int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y * blockDim.y + threadIdx.y;
   if (i >= cP.ew || j >= cP.eh) return;
   uint32_t X = (uint32_t)(cP.ex0 + i), Y = (uint32_t)(cP.ey0 + j);
@@ -1379,29 +1418,33 @@ __global__ void k_moving(float4* ring, float2* ring_aux) {
   if (!draws_here(X, Y)) {  // another part of the checkerboard
     ring[idx] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     ring_aux[idx] = make_float2(0.0f, -1.0f);
+    ring_g[idx] = make_float4(1.0f, 1.0f, 1.0f, 0.0f);
     return;
   }
   const GCam& cam = cP.cam;
   float pix = 2.0f * cam.tan_half / cP.full_h;
-  V3 sum = v3(0.0f);
-  float depth = 1e9f, id = 0.0f;
+  V3 sum = v3(0.0f), asum = v3(0.0f);
+  float depth = 1e9f, id = 0.0f, nrm = 0.0f;
   for (int s = 0; s < cP.spp; s++) {
     Rng rng{hash4(X, Y, cP.seed, (uint32_t)s)};
     float jx = rng.next(), jy = rng.next();
     Hit hh = trace(cam.pos, ray_dir(cam, X + jx, Y + jy), pix, rng);
     if (!isfinite(hh.L.x + hh.L.y + hh.L.z)) { atomicAdd(&g_bad, 1u); hh.L = v3(0.0f); }
     sum += hh.L;
-    if (s == 0) { depth = hh.dist; id = hh.id; }
+    asum += hh.alb;
+    if (s == 0) { depth = hh.dist; id = hh.id; nrm = pack_nrm(hh.nrm); }
   }
   sum = sum / (float)cP.spp;
+  asum = asum / (float)cP.spp;
   ring[idx] = make_float4(sum.x, sum.y, sum.z, (float)cP.spp);
   ring_aux[idx] = make_float2(depth, id);
+  ring_g[idx] = make_float4(asum.x, asum.y, asum.z, nrm);
 }
 
 // Hold: add samples sample_base.. to each pixel's sum, in order, so the sum
 // after n samples does not depend on how frames split them; the ring entry for
 // this frame is the hold's current average.
-__global__ void k_hold(float4* hold_sum, float2* hold_aux, float4* ring, float2* ring_aux) {
+__global__ void k_hold(float4* hold_sum, float2* hold_aux, float4* hold_g, float4* ring, float2* ring_aux, float4* ring_g) {
   int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y * blockDim.y + threadIdx.y;
   if (i >= cP.ew || j >= cP.eh) return;
   uint32_t X = (uint32_t)(cP.ex0 + i), Y = (uint32_t)(cP.ey0 + j);
@@ -1410,6 +1453,7 @@ __global__ void k_hold(float4* hold_sum, float2* hold_aux, float4* ring, float2*
   int idx = j * cP.ew + i;
   float4 acc = hold_sum[idx];
   float2 aux = hold_aux[idx];
+  float4 ga = hold_g[idx];
   // A pixel's next sample index is its own count, so the sum after n samples
   // is the same however frames (and the checkerboard) split them.
   int base = (int)acc.w;
@@ -1422,13 +1466,19 @@ __global__ void k_hold(float4* hold_sum, float2* hold_aux, float4* ring, float2*
     Hit hh = trace(cam.pos, ray_dir(cam, X + jx, Y + jy), pix, rng);
     if (!isfinite(hh.L.x + hh.L.y + hh.L.z)) { atomicAdd(&g_bad, 1u); hh.L = v3(0.0f); }
     acc.x += hh.L.x; acc.y += hh.L.y; acc.z += hh.L.z; acc.w += 1.0f;
-    if (k == 0) aux = make_float2(hh.dist, hh.id);
+    ga.x += hh.alb.x; ga.y += hh.alb.y; ga.z += hh.alb.z;
+    if (k == 0) {
+      aux = make_float2(hh.dist, hh.id);
+      ga.w = pack_nrm(hh.nrm);
+    }
   }
   hold_sum[idx] = acc;
   hold_aux[idx] = aux;
+  hold_g[idx] = ga;
   float inv = 1.0f / fmaxf(acc.w, 1.0f);
   ring[idx] = make_float4(acc.x * inv, acc.y * inv, acc.z * inv, acc.w);
   ring_aux[idx] = acc.w > 0.0f ? aux : make_float2(0.0f, -1.0f);
+  ring_g[idx] = acc.w > 0.0f ? make_float4(ga.x * inv, ga.y * inv, ga.z * inv, ga.w) : make_float4(1.0f, 1.0f, 1.0f, 0.0f);
 }
 
 // Checkerboard frames: fill each pixel that has no samples (hit kind -1)
@@ -1441,7 +1491,7 @@ __global__ void k_hold(float4* hold_sum, float2* hold_aux, float4* ring, float2*
 // the drawn region whose neighbours all lie in it are ever read afterwards,
 // and the image's edges are the same for every renderer, so the fill matches
 // across tiles.
-__global__ void k_fill(const float4* c, const float2* a, float4* co, float2* ao) {
+__global__ void k_fill(const float4* c, const float2* a, const float4* g, float4* co, float2* ao, float4* go) {
   int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y * blockDim.y + threadIdx.y;
   if (i >= cP.ew || j >= cP.eh) return;
   int idx = j * cP.ew + i;
@@ -1449,6 +1499,7 @@ __global__ void k_fill(const float4* c, const float2* a, float4* co, float2* ao)
   if (me.y >= 0.0f) {
     co[idx] = c[idx];
     ao[idx] = me;
+    go[idx] = g[idx];
     return;
   }
   // the 4 edge neighbours first, then the 4 diagonal ones (a stride-4 frame
@@ -1479,14 +1530,17 @@ __global__ void k_fill(const float4* c, const float2* a, float4* co, float2* ao)
     if (na[k0].x < 1e8f) cost += fabsf(na[k0].x - na[k1].x) / (na[k0].x + na[k1].x);
     if (cost < bcost) { bcost = cost; best = pr; }
   }
-  float id = -1.0f, n = 0.0f, dsum = 0.0f, wsum = 0.0f;
-  V3 col = v3(0.0f);
+  float id = -1.0f, n = 0.0f, dsum = 0.0f, wsum = 0.0f, nrm = 0.0f;
+  V3 col = v3(0.0f), alb = v3(0.0f);
   for (int k = 0; k < 8; k++) {
     if (!ok[k]) continue;
     if (best >= 0 && k / 2 != best) continue;
     if (id < 0.0f) id = na[k].y;
     if (na[k].y != id) continue;
+    float4 gk = g[(j + dy[k]) * cP.ew + (i + dx[k])];
+    if (n == 0.0f) nrm = gk.w;
     col += v3(nc[k].x, nc[k].y, nc[k].z);
+    alb += v3(gk.x, gk.y, gk.z);
     wsum += nc[k].w;
     dsum += na[k].x;
     n += 1.0f;
@@ -1494,16 +1548,20 @@ __global__ void k_fill(const float4* c, const float2* a, float4* co, float2* ao)
   if (n == 0.0f) {
     co[idx] = c[idx];
     ao[idx] = me;
+    go[idx] = g[idx];
     return;
   }
   col = col / n;
+  alb = alb / n;
   co[idx] = make_float4(col.x, col.y, col.z, 0.5f * wsum / n);
   ao[idx] = make_float2(dsum / n, id);
+  go[idx] = make_float4(alb.x, alb.y, alb.z, nrm);
 }
 
 struct Ring {
   const float4* c[TEMPORAL_WINDOW];
   const float2* a[TEMPORAL_WINDOW];
+  const float4* g[TEMPORAL_WINDOW];
 };
 
 // Resolve the tile's pixels. Moving: this frame's samples plus the previous
@@ -1515,8 +1573,8 @@ struct Ring {
 // lies in the drawn region, so the result is the same on every renderer that
 // drew the same frames. Hold: the hold's average, with the motion output it
 // started from blended in until HOLD_BLEND_OUT samples.
-__global__ void k_resolve(float4* resolved, const float4* hold_blend, const float4* hold_sum, const float2* /*hold_aux*/,
-                          const float4* cur, const float2* cur_aux, Ring hist) {
+__global__ void k_resolve(float4* resolved, float4* resolved_g, float4* guide, const float4* hold_blend, const float4* hold_sum,
+                          const float2* /*hold_aux*/, const float4* cur, const float2* cur_aux, const float4* cur_g, Ring hist) {
   int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y * blockDim.y + threadIdx.y;
   if (i >= cP.rw || j >= cP.rh) return;
   int X = cP.rx0 + i, Y = cP.ry0 + j;
@@ -1526,6 +1584,8 @@ __global__ void k_resolve(float4* resolved, const float4* hold_blend, const floa
   V3 d0 = ray_dir(cam, X + 0.5f, Y + 0.5f);
   V3 color;
   float depth, wtot;
+  float4 g0 = cur_g[eidx];
+  V3 alb = v3(g0.x, g0.y, g0.z);
   if (cP.hold && hold_sum[eidx].w == 0.0f) {
     float4 c0 = cur[eidx];  // no samples here yet (checkerboard): the filled value
     color = v3(c0.x, c0.y, c0.z);
@@ -1543,7 +1603,25 @@ __global__ void k_resolve(float4* resolved, const float4* hold_blend, const floa
     depth = a0.x;
     float id = a0.y;
     V3 sum = v3(c0.x, c0.y, c0.z) * c0.w;
+    V3 asum = alb * c0.w;
     wtot = c0.w;
+    // The sky: a cloud moves across it at its own speed, which reprojection
+    // through the sky's (infinite) distance does not follow, so history is
+    // clamped to the colors of this frame's 3 x 3 neighbourhood.
+    bool clamp = id == 0.0f;
+    V3 lo = v3(1e30f), hi = v3(-1e30f);
+    if (clamp) {
+      for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+          int xx = X + dx - cP.ex0, yy = Y + dy - cP.ey0;  // inside the drawn region (it ends at the image's edges)
+          if (xx < 0 || yy < 0 || xx >= cP.ew || yy >= cP.eh) continue;
+          int e = yy * cP.ew + xx;
+          if (cur_aux[e].y != 0.0f) continue;
+          float4 v = cur[e];
+          lo = v3(fminf(lo.x, v.x), fminf(lo.y, v.y), fminf(lo.z, v.z));
+          hi = v3(fmaxf(hi.x, v.x), fmaxf(hi.y, v.y), fmaxf(hi.z, v.z));
+        }
+    }
     for (int h = 0; h < TEMPORAL_WINDOW - 1; h++) {
       if (!hist.c[h]) continue;
       const GCam& pc = cP.hist_cam[h];
@@ -1558,7 +1636,7 @@ __global__ void k_resolve(float4* resolved, const float4* hold_blend, const floa
       float expect = depth < 1e8f ? length(rel) : 1e9f;
       int ix = (int)floorf(qx), iy = (int)floorf(qy);
       float fx = qx - ix, fy = qy - iy;
-      V3 hc = v3(0.0f);
+      V3 hc = v3(0.0f), ha = v3(0.0f);
       float ws = 0.0f, wn = 1e9f;
       for (int b = 0; b < 4; b++) {
         int xx = min(ix + (b & 1), cP.full_w - 1), yy = min(iy + (b >> 1), cP.full_h - 1);
@@ -1572,25 +1650,145 @@ __global__ void k_resolve(float4* resolved, const float4* hold_blend, const floa
         // dropping its history
         if (id != 0.0f && depth < 1e8f && fabsf(a.x - expect) > 0.04f * expect + 0.002f) continue;
         float4 hv = hist.c[h][e];
+        float4 hg = hist.g[h][e];
         hc += v3(hv.x, hv.y, hv.z) * w;
+        ha += v3(hg.x, hg.y, hg.z) * w;
         ws += w;
         wn = fminf(wn, hv.w);
       }
       if (ws < 0.3f) continue;
+      if (clamp) {
+        V3 m = hc / ws;
+        hc = v3(clampf(m.x, lo.x, hi.x), clampf(m.y, lo.y, hi.y), clampf(m.z, lo.z, hi.z)) * ws;
+      }
       float wf = fminf(wn, (float)TEMPORAL_FRAME_CAP);
       sum += hc * (wf / ws);
+      asum += ha * (wf / ws);
       wtot += wf;
     }
     color = sum / wtot;
+    alb = asum / wtot;
   }
   resolved[idx] = make_float4(color.x, color.y, color.z, fminf(wtot, (float)HOLD_MAX_SAMPLES));
+  resolved_g[idx] = make_float4(alb.x, alb.y, alb.z, 0.0f);
+  // the denoiser's guide: the first hit relative to the eye (0 for the sky
+  // and the clouds over it), its packed normal, bit 31 set on water
+  float2 a0 = cur_aux[eidx];
+  V3 P = (a0.y != 0.0f && a0.x < 1e8f) ? d0 * a0.x : v3(0.0f);
+  float n = __uint_as_float(__float_as_uint(g0.w) | (a0.y == 2.0f ? 0x80000000u : 0u));
+  guide[idx] = make_float4(P.x, P.y, P.z, n);
 }
 
-// Finish the out region (the tile plus the stream margin): where few samples are in (fast motion, a fresh
-// renderer), an edge-aware 5x5 filter over the resolved region (which reaches
-// DENOISE_R pixels past the tile, drawn under the same rules, so the filter
-// matches across tile edges); then the overlays, tone mapping and dither.
-__global__ void k_finish(uint8_t* rgba, float4* hdr, const float4* resolved, const float2* aux) {
+// ---------------------------------------------------------------- denoiser
+// An edge-aware a-trous wavelet filter over the resolved region (Dammertz et
+// al. 2010; luminance stopping by the local variance as in SVGF, Schied et al.
+// 2017). It filters the radiance divided by the albedo guide, so surface
+// texture is put back after it unblurred. Edges stop it where the hit kind
+// differs, a neighbour lies off this pixel's tangent plane (from the first
+// hit's distance and normal), the normals differ, or the luminance differs by
+// more than the noise. Every input is a whole-image pixel's, every pass reads
+// only pixels whose own inputs lie in the resolved region (which reaches the
+// filter's whole radius past the out region), so it matches across tiles.
+
+// The geometric part of a neighbour's weight from two pixels' guides (k_resolve):
+// hit kind, distance off this pixel's tangent plane (against the pixel
+// footprint at that distance), normal. The sky and the clouds over it (P = 0)
+// are one surface, which only the luminance stops.
+struct DnG {
+  V3 P, N;
+  float t;
+  uint32_t water;
+};
+__device__ __forceinline__ DnG dn_g(float4 g) {
+  DnG q;
+  q.P = v3(g.x, g.y, g.z);
+  q.t = length(q.P);
+  q.water = __float_as_uint(g.w) >> 31;
+  q.N = unpack_nrm(__uint_as_float(__float_as_uint(g.w) & 0x7FFFFFFFu));
+  return q;
+}
+__device__ __forceinline__ float dn_geo(const DnG& p, float4 g, float dpx) {
+  float t = sqrtf(g.x * g.x + g.y * g.y + g.z * g.z);
+  if ((p.t == 0.0f) != (t == 0.0f)) return 0.0f;
+  if (p.t == 0.0f) return 1.0f;
+  if ((__float_as_uint(g.w) >> 31) != p.water) return 0.0f;
+  float foot = p.t * (2.0f * cP.cam.tan_half / cP.full_h) * (1.0f + dpx);
+  float pd = fabsf((g.x - p.P.x) * p.N.x + (g.y - p.P.y) * p.N.y + (g.z - p.P.z) * p.N.z);
+  V3 qn = unpack_nrm(__uint_as_float(__float_as_uint(g.w) & 0x7FFFFFFFu));
+  float nn = fmaxf(dot(qn, p.N), 0.0f);
+  nn *= nn; nn *= nn; nn *= nn; nn *= nn; nn *= nn; nn *= nn;  // ^64
+  return __expf(-pd / (DENOISE_SIGMA_P * foot + 1e-6f)) * nn;
+}
+__device__ __forceinline__ V3 dn_demod(V3 c, float4 g) {
+  return c / v3(fmaxf(g.x, 0.02f), fmaxf(g.y, 0.02f), fmaxf(g.z, 0.02f));
+}
+
+// Pass 0: E (radiance divided by the albedo guide) and the variance of its
+// luminance over the 3 x 3 neighbourhood on the same surface.
+__global__ void k_dn_pre(float4* out, const float4* resolved, const float4* rg, const float4* guide) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y * blockDim.y + threadIdx.y;
+  if (i >= cP.rw || j >= cP.rh) return;
+  int idx = j * cP.rw + i;
+  float4 c = resolved[idx];
+  V3 E = dn_demod(v3(c.x, c.y, c.z), rg[idx]);
+  DnG p = dn_g(guide[idx]);
+  float s1 = 0.0f, s2 = 0.0f, ws = 0.0f;
+  for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+      int ii = i + dx, jj = j + dy;
+      if (ii < 0 || jj < 0 || ii >= cP.rw || jj >= cP.rh) continue;
+      int n = jj * cP.rw + ii;
+      float w = dn_geo(p, guide[n], sqrtf((float)(dx * dx + dy * dy)));
+      if (w <= 1e-3f) continue;
+      float4 cn = resolved[n];
+      float l = lum(dn_demod(v3(cn.x, cn.y, cn.z), rg[n]));
+      s1 += w * l;
+      s2 += w * l * l;
+      ws += w;
+    }
+  float m = s1 / fmaxf(ws, 1e-6f);
+  float var = fmaxf(s2 / fmaxf(ws, 1e-6f) - m * m, 0.0f);
+  out[idx] = make_float4(E.x, E.y, E.z, var);
+}
+
+// One a-trous pass at `step` pixels: a 3 x 3 B-spline kernel (1/4, 1/2, 1/4),
+// edge-stopped; the variance is carried through as the weighted sum's (SVGF).
+__global__ void k_dn_atrous(float4* out, const float4* in, const float4* guide, int step) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y * blockDim.y + threadIdx.y;
+  if (i >= cP.rw || j >= cP.rh) return;
+  int idx = j * cP.rw + i;
+  float4 c = in[idx];
+  DnG p = dn_g(guide[idx]);
+  float lp = lum(v3(c.x, c.y, c.z));
+  float sig = DENOISE_SIGMA_L * sqrtf(c.w) + 1e-4f * lp + 1e-7f;
+  const float h[2] = {0.5f, 0.25f};
+  V3 sum = v3(0.0f);
+  float ws = 0.0f, vs = 0.0f;
+  for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+      int ii = i + dx * step, jj = j + dy * step;
+      if (ii < 0 || jj < 0 || ii >= cP.rw || jj >= cP.rh) continue;
+      int n = jj * cP.rw + ii;
+      float4 cn = in[n];
+      float w = h[abs(dx)] * h[abs(dy)];
+      if (dx != 0 || dy != 0) {
+        w *= dn_geo(p, guide[n], step * sqrtf((float)(dx * dx + dy * dy)));
+        w *= __expf(-fabsf(lum(v3(cn.x, cn.y, cn.z)) - lp) / sig);
+      }
+      if (w <= 0.0f) continue;
+      sum += v3(cn.x, cn.y, cn.z) * w;
+      vs += w * w * cn.w;
+      ws += w;
+    }
+  sum = sum / ws;
+  out[idx] = make_float4(sum.x, sum.y, sum.z, vs / (ws * ws));
+}
+
+// Finish the out region (the tile plus the stream margin): where few samples
+// are in (fast motion, a fresh renderer), the denoiser's output (k_dn_*); then
+// the overlays, tone mapping and dither.
+__global__ void k_finish(uint8_t* rgba, float4* hdr, const float4* resolved, const float2* aux, const float4* rg,
+                         const float4* dn) {
   int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y * blockDim.y + threadIdx.y;
   if (i >= cP.ow || j >= cP.oh) return;
   int X = cP.ox0 + i, Y = cP.oy0 + j;
@@ -1602,26 +1800,12 @@ __global__ void k_finish(uint8_t* rgba, float4* hdr, const float4* resolved, con
   float2 ca = aux[(Y - cP.ey0) * cP.ew + (X - cP.ex0)];
   float depth = ca.x;
   V3 color = v3(c.x, c.y, c.z);
-  float strength = sat(1.5f - c.w / 32.0f);
+  // where few samples are in, the denoiser's output (remodulated by the albedo guide)
+  float strength = sat((DENOISE_HI - c.w) / (DENOISE_HI - DENOISE_LO));
   if (strength > 0.0f) {
-    float lc = lum(color);
-    V3 sum = v3(0.0f);
-    float ws = 0.0f;
-    for (int dy = -DENOISE_R; dy <= DENOISE_R; dy++)
-      for (int dx = -DENOISE_R; dx <= DENOISE_R; dx++) {
-        int xx = X + dx, yy = Y + dy;
-        if (xx < cP.rx0 || yy < cP.ry0 || xx >= cP.rx0 + cP.rw || yy >= cP.ry0 + cP.rh) continue;
-        float2 na = aux[(yy - cP.ey0) * cP.ew + (xx - cP.ex0)];
-        if (na.y != ca.y) continue;
-        if (depth < 1e8f && fabsf(na.x - depth) > 0.03f * depth + 0.002f) continue;
-        float4 nv = resolved[(yy - cP.ry0) * cP.rw + (xx - cP.rx0)];
-        V3 n = v3(nv.x, nv.y, nv.z);
-        float w = __expf(-(float)(dx * dx + dy * dy) * (1.0f / 4.5f)) *
-                  __expf(-fabsf(lum(n) - lc) / (0.35f * lc + 0.02f));
-        sum += n * w;
-        ws += w;
-      }
-    if (ws > 0.0f) color = mix(color, sum / ws, strength);
+    float4 e = dn[(Y - cP.ry0) * cP.rw + (X - cP.rx0)];
+    float4 g = rg[(Y - cP.ry0) * cP.rw + (X - cP.rx0)];
+    color = mix(color, v3(e.x, e.y, e.z) * v3(fmaxf(g.x, 0.02f), fmaxf(g.y, 0.02f), fmaxf(g.z, 0.02f)), strength);
   }
   color = overlay(cam.pos, d0, color, pix, ca.y == 0.0f ? 1e9f : depth);  // clouds in the sky do not hide words
   // sun glare: the sun's disc spread by the eye and lens, scaled by how much
@@ -1940,10 +2124,17 @@ void Renderer::ensure_buffers(const Tile& t) {
   size_t ne = (size_t)(ex1 - ex0) * (ey1 - ey0);
   cudaFree(rgba_); cudaFree(hdr_); cudaFree(display_); cudaFree(hold_blend_);
   cudaFree(hold_sum_); cudaFree(hold_aux_);
-  for (int i = 0; i < TEMPORAL_WINDOW; i++) { cudaFree(ring_[i]); cudaFree(ring_aux_[i]); }
-  cudaFree(fill_c_); cudaFree(fill_a_);
+  for (int i = 0; i < TEMPORAL_WINDOW; i++) { cudaFree(ring_[i]); cudaFree(ring_aux_[i]); cudaFree(ring_g_[i]); }
+  cudaFree(fill_c_); cudaFree(fill_a_); cudaFree(fill_g_); cudaFree(hold_g_); cudaFree(display_g_);
+  cudaFree(dn_[0]); cudaFree(dn_[1]); cudaFree(dn_gp_);
+  CK(cudaMalloc(&dn_gp_, nr * sizeof(float4)));
   CK(cudaMalloc(&fill_c_, ne * sizeof(float4)));
   CK(cudaMalloc(&fill_a_, ne * sizeof(float2)));
+  CK(cudaMalloc(&fill_g_, ne * sizeof(float4)));
+  CK(cudaMalloc(&hold_g_, ne * sizeof(float4)));
+  CK(cudaMalloc(&display_g_, nr * sizeof(float4)));
+  CK(cudaMalloc(&dn_[0], nr * sizeof(float4)));
+  CK(cudaMalloc(&dn_[1], nr * sizeof(float4)));
   CK(cudaMalloc(&rgba_, no * 4));
   CK(cudaMalloc(&hdr_, no * sizeof(float4)));
   CK(cudaMalloc(&display_, nr * sizeof(float4)));
@@ -1953,6 +2144,7 @@ void Renderer::ensure_buffers(const Tile& t) {
   for (int i = 0; i < TEMPORAL_WINDOW; i++) {
     CK(cudaMalloc(&ring_[i], ne * sizeof(float4)));
     CK(cudaMalloc(&ring_aux_[i], ne * sizeof(float2)));
+    CK(cudaMalloc(&ring_g_[i], ne * sizeof(float4)));
   }
   tile_ = t;
   ex0_ = ex0; ey0_ = ey0; ew_ = ex1 - ex0; eh_ = ey1 - ey0; guard_ = g;
@@ -2018,6 +2210,7 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
     if (new_hold) {
       CK(cudaMemsetAsync(hold_sum_, 0, ne * sizeof(float4), st));
       CK(cudaMemsetAsync(hold_aux_, 0, ne * sizeof(float2), st));
+      CK(cudaMemsetAsync(hold_g_, 0, ne * sizeof(float4), st));
       CK(cudaMemcpyAsync(hold_blend_, display_, nr * sizeof(float4), cudaMemcpyDeviceToDevice, st));
       hold_key_ = key;
       hold_frames_ = 0;
@@ -2042,6 +2235,7 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
     bool have = accumulate && !held && ring_slot_[r] == kk;
     ring.c[h] = have ? (const float4*)ring_[r] : nullptr;
     ring.a[h] = have ? (const float2*)ring_aux_[r] : nullptr;
+    ring.g[h] = have ? (const float4*)ring_g_[r] : nullptr;
     if (have) p.hist_cam[h] = ring_cam_[r];
   }
   CK(cudaMemcpyToSymbolAsync(cP, &p, sizeof p, 0, cudaMemcpyHostToDevice, st));
@@ -2054,26 +2248,36 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
   dim3 bs(8, 8);
   CK(cudaEventRecord((cudaEvent_t)evt0_, st));
   if (held && p.sample_base < HOLD_MAX_SAMPLES) {
-    k_hold<<<dim3((ew_ + 7) / 8, (eh_ + 7) / 8), bs, 0, st>>>((float4*)hold_sum_, (float2*)hold_aux_, (float4*)ring_[ri],
-                                                               (float2*)ring_aux_[ri]);
+    k_hold<<<dim3((ew_ + 7) / 8, (eh_ + 7) / 8), bs, 0, st>>>((float4*)hold_sum_, (float2*)hold_aux_, (float4*)hold_g_,
+                                                               (float4*)ring_[ri], (float2*)ring_aux_[ri], (float4*)ring_g_[ri]);
   } else if (!held) {
-    k_moving<<<dim3((ew_ + 7) / 8, (eh_ + 7) / 8), bs, 0, st>>>((float4*)ring_[ri], (float2*)ring_aux_[ri]);
+    k_moving<<<dim3((ew_ + 7) / 8, (eh_ + 7) / 8), bs, 0, st>>>((float4*)ring_[ri], (float2*)ring_aux_[ri], (float4*)ring_g_[ri]);
   }
   CK(cudaGetLastError());
   CK(cudaEventRecord((cudaEvent_t)evt1_, st));
   if (half && !(held && p.sample_base >= HOLD_MAX_SAMPLES)) {
     k_fill<<<dim3((ew_ + 7) / 8, (eh_ + 7) / 8), bs, 0, st>>>((const float4*)ring_[ri], (const float2*)ring_aux_[ri],
-                                                               (float4*)fill_c_, (float2*)fill_a_);
+                                                               (const float4*)ring_g_[ri], (float4*)fill_c_, (float2*)fill_a_,
+                                                               (float4*)fill_g_);
     CK(cudaGetLastError());
     std::swap(ring_[ri], fill_c_);
     std::swap(ring_aux_[ri], fill_a_);
+    std::swap(ring_g_[ri], fill_g_);
   }
-  k_resolve<<<dim3((rw_ + 7) / 8, (rh_ + 7) / 8), bs, 0, st>>>((float4*)display_, (const float4*)hold_blend_,
-                                                                (const float4*)hold_sum_, (const float2*)hold_aux_,
-                                                                (const float4*)ring_[ri], (const float2*)ring_aux_[ri], ring);
+  k_resolve<<<dim3((rw_ + 7) / 8, (rh_ + 7) / 8), bs, 0, st>>>(
+      (float4*)display_, (float4*)display_g_, (float4*)dn_gp_, (const float4*)hold_blend_, (const float4*)hold_sum_,
+      (const float2*)hold_aux_, (const float4*)ring_[ri], (const float2*)ring_aux_[ri], (const float4*)ring_g_[ri], ring);
   CK(cudaGetLastError());
-  k_finish<<<dim3((ow_ + 7) / 8, (oh_ + 7) / 8), bs, 0, st>>>(
-      (uint8_t*)rgba_, (float4*)hdr_, (const float4*)display_, (const float2*)ring_aux_[ri]);
+  {
+    dim3 gr((rw_ + 7) / 8, (rh_ + 7) / 8);
+    k_dn_pre<<<gr, bs, 0, st>>>((float4*)dn_[0], (const float4*)display_, (const float4*)display_g_, (const float4*)dn_gp_);
+    for (int it = 0; it < DENOISE_PASSES; it++)
+      k_dn_atrous<<<gr, bs, 0, st>>>((float4*)dn_[(it + 1) & 1], (const float4*)dn_[it & 1], (const float4*)dn_gp_, 1 << it);
+    CK(cudaGetLastError());
+  }
+  k_finish<<<dim3((ow_ + 7) / 8, (oh_ + 7) / 8), bs, 0, st>>>((uint8_t*)rgba_, (float4*)hdr_, (const float4*)display_,
+                                                              (const float2*)ring_aux_[ri], (const float4*)display_g_,
+                                                              (const float4*)dn_[DENOISE_PASSES & 1]);
   CK(cudaGetLastError());
   CK(cudaEventRecord((cudaEvent_t)ev1_, st));
   CK(cudaEventSynchronize((cudaEvent_t)ev1_));
@@ -2099,6 +2303,7 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
       if (prev >= 0 && prev != ri) {
         CK(cudaMemcpyAsync(ring_[ri], ring_[prev], ne * sizeof(float4), cudaMemcpyDeviceToDevice, st));
         CK(cudaMemcpyAsync(ring_aux_[ri], ring_aux_[prev], ne * sizeof(float2), cudaMemcpyDeviceToDevice, st));
+        CK(cudaMemcpyAsync(ring_g_[ri], ring_g_[prev], ne * sizeof(float4), cudaMemcpyDeviceToDevice, st));
         CK(cudaStreamSynchronize(st));
       }
     }

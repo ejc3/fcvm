@@ -8,6 +8,7 @@ pub mod hypervisor;
 pub mod kvm_trace;
 pub mod network;
 pub mod paths;
+pub mod reclaim;
 pub mod setup;
 pub mod state;
 pub mod storage;

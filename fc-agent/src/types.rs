@@ -122,8 +122,9 @@ pub struct NfsMount {
 
 #[derive(Debug, Deserialize)]
 pub struct LatestMetadata {
-    #[serde(rename = "host-time")]
-    pub host_time: String,
+    /// The host's clock in nanoseconds since the epoch (`bootplan::set_system_clock`).
+    #[serde(rename = "host-time-ns")]
+    pub host_time_ns: String,
     #[serde(rename = "restore-epoch")]
     pub restore_epoch: Option<String>,
     /// For routed mode clones: unique IPv6 to replace the snapshot's shared guest IPv6.
@@ -247,9 +248,9 @@ mod tests {
 
     #[test]
     fn test_latest_metadata() {
-        let json = r#"{"host-time": "1731301800", "restore-epoch": "abc123"}"#;
+        let json = r#"{"host-time-ns": "1731301800000000000", "restore-epoch": "abc123"}"#;
         let meta: LatestMetadata = serde_json::from_str(json).unwrap();
-        assert_eq!(meta.host_time, "1731301800");
+        assert_eq!(meta.host_time_ns, "1731301800000000000");
         assert_eq!(meta.restore_epoch.as_deref(), Some("abc123"));
     }
 
@@ -264,17 +265,17 @@ mod tests {
         assert!(bare.gpu_driver.is_none());
 
         let meta: LatestMetadata = serde_json::from_str(
-            r#"{"host-time": "1", "restore-epoch": "e", "gpus": ["0000:01:00.0", "0000:02:00.0"]}"#,
+            r#"{"host-time-ns": "1", "restore-epoch": "e", "gpus": ["0000:01:00.0", "0000:02:00.0"]}"#,
         )
         .unwrap();
         assert_eq!(meta.gpus.len(), 2);
-        let meta: LatestMetadata = serde_json::from_str(r#"{"host-time": "1"}"#).unwrap();
+        let meta: LatestMetadata = serde_json::from_str(r#"{"host-time-ns": "1"}"#).unwrap();
         assert!(meta.gpus.is_empty());
     }
 
     #[test]
     fn test_latest_metadata_no_epoch() {
-        let json = r#"{"host-time": "1731301800"}"#;
+        let json = r#"{"host-time-ns": "1731301800000000000"}"#;
         let meta: LatestMetadata = serde_json::from_str(json).unwrap();
         assert!(meta.restore_epoch.is_none());
     }

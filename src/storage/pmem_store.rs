@@ -38,7 +38,8 @@
 //! is authoritative only within one kernel, and assets_dir is shared across nesting
 //! levels over fuse-pipe. Ingest holds `.lock` shared from creating its temp until it
 //! removes it, so a collector that takes it exclusively can remove `tmp/*` safely. An
-//! ingest that is killed leaves its temp in `tmp/`; nothing removes temps or entries yet.
+//! ingest that is killed leaves its temp in `tmp/`, and the next launch removes it
+//! (`collect_abandoned_temps`); nothing removes entries yet.
 //!
 //! A run opens the store directory and `tmp` once, refusing a symlink or another file in
 //! place of either, and reaches everything it creates, links, removes or locks there
@@ -426,6 +427,56 @@ impl PmemStore {
             .map_err(|(_, errno)| errno)
             .with_context(|| format!("locking {}", path.display()))
     }
+}
+
+/// Remove the temps that ingests killed before they finished left in the store's `tmp`
+/// under `data_dir`, and return how many. An ingest holds `.lock` shared from creating
+/// its temp until it removes it, and the kernel releases it however the ingest's process
+/// dies, so with `.lock` held exclusively every temp is abandoned. Never waits: while an
+/// ingest runs this removes nothing. Creates nothing, and reaches every name through the
+/// store's descriptors, as the store's own operations do.
+pub fn collect_abandoned_temps(data_dir: &Path) -> Result<usize> {
+    let Some(data) = open_data_dir(data_dir)? else {
+        return Ok(0);
+    };
+    let pmem_path = data_dir.join("pmem");
+    let Some(pmem) = open_existing_dir(&data, "pmem", &pmem_path)? else {
+        return Ok(0);
+    };
+    let tmp_path = pmem_path.join("tmp");
+    let Some(tmp) = open_existing_dir(&pmem, "tmp", &tmp_path)? else {
+        return Ok(0);
+    };
+    let lock_path = pmem_path.join(".lock");
+    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC;
+    let lock = match nix::fcntl::openat(&pmem, ".lock", flags, Mode::empty()) {
+        Ok(fd) => File::from(fd),
+        // No ingest has ever taken it, so none made a temp.
+        Err(Errno::ENOENT) => return Ok(0),
+        Err(errno) => {
+            return Err(errno).with_context(|| format!("opening {}", lock_path.display()))
+        }
+    };
+    let _held = match Flock::lock(lock, FlockArg::LockExclusiveNonblock) {
+        Ok(held) => held,
+        Err((_, Errno::EWOULDBLOCK)) => return Ok(0),
+        Err((_, errno)) => {
+            return Err(errno).with_context(|| format!("locking {}", lock_path.display()))
+        }
+    };
+    let mut removed = 0;
+    for name in entries(&tmp, &tmp_path)? {
+        let name = name?;
+        match nix::unistd::unlinkat(&tmp, name.as_os_str(), UnlinkatFlags::NoRemoveDir) {
+            Ok(()) => removed += 1,
+            Err(Errno::ENOENT) => {}
+            Err(errno) => {
+                return Err(errno)
+                    .with_context(|| format!("removing {}", tmp_path.join(&name).display()))
+            }
+        }
+    }
+    Ok(removed)
 }
 
 /// Whether `path` names an entry of the store directory `dir`: its parent is `dir` and its
@@ -1324,6 +1375,33 @@ fn seek(file: &File, offset: u64, whence: libc::c_int) -> Result<Option<u64>> {
         return Ok(None);
     }
     Err(error).with_context(|| format!("lseek to {offset}"))
+}
+
+#[cfg(test)]
+mod collect_tests {
+    use super::*;
+
+    /// #1186: an ingest killed after it created its temp leaves it in `tmp/`. A collector
+    /// leaves it while any ingest holds the store's lock, and removes it once none does.
+    #[test]
+    fn a_killed_ingests_temp_is_collected_once_no_ingest_runs() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(collect_abandoned_temps(root.path()).unwrap(), 0);
+        let store = PmemStore::open(root.path()).unwrap();
+        let ingest = store.lock_shared().unwrap();
+        let temp = root.path().join("pmem/tmp/killed-ingest.tmp");
+        std::fs::write(&temp, b"partial copy").unwrap();
+        assert_eq!(collect_abandoned_temps(root.path()).unwrap(), 0);
+        assert!(
+            temp.exists(),
+            "a temp was removed while an ingest held the lock"
+        );
+        // What the kernel does when the ingest's process dies.
+        drop(ingest);
+        assert_eq!(collect_abandoned_temps(root.path()).unwrap(), 1);
+        assert!(!temp.exists());
+        assert!(root.path().join("pmem/tmp").is_dir());
+    }
 }
 
 #[cfg(test)]

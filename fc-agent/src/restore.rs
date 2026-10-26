@@ -294,10 +294,10 @@ fn elapsed_ms(since: std::time::Instant) -> f64 {
 /// snapshot's shared guest IPv6 on eth0. Without this, all clones share the same
 /// IPv6 and return traffic gets ECMP-routed to the wrong clone.
 ///
-/// `host_time`: epoch seconds already fetched with the restore epoch by the
+/// `host_time`: the host's clock in nanoseconds, already fetched with the restore epoch by the
 /// metadata watcher. Re-fetching the metadata document here would repeat the
-/// transport round trip milliseconds after the watcher completed it, for a
-/// value with one-second resolution.
+/// transport round trip milliseconds after the watcher completed it; the step
+/// adds the time since the read instead.
 pub async fn handle_clone_restore(
     signals: &RestoreSignals,
     clone_ipv6: Option<&str>,

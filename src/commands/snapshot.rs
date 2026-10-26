@@ -219,6 +219,12 @@ impl CloneSetupResources {
                 ));
             }
         }
+        // The mount targets the restore made, and the owner record.
+        if let Err(error) = crate::reclaim::complete(&self.vm_id).await {
+            errors.push(format!(
+                "reclaiming the clone's resources after failed setup: {error:#}"
+            ));
+        }
         if errors.is_empty() {
             info!(vm_id = %self.vm_id, "clone setup cleanup complete");
             Ok(())
@@ -783,7 +789,16 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     // Fail fast: the disk-only capture path (freeze -> reflink -> unfreeze, no
     // memory dump) is dispatched below when args.disk_only is set.
 
-    ensure_no_passthrough_in_memory_snapshot(&vm_state.config.gpus, args.disk_only)?;
+    ensure_gpu_snapshot_mode(&vm_state.config.gpus, args.disk_only, args.gpu_warm)?;
+    if args.gpu_warm {
+        anyhow::ensure!(
+            matches!(
+                vm_state.config.hypervisor,
+                crate::hypervisor::Backend::Firecracker
+            ),
+            "--gpu-warm needs a Firecracker VM: fcvm attaches GPUs only to Firecracker"
+        );
+    }
 
     // Block snapshots when VM has read-write extra disks
     let rw_disks: Vec<_> = vm_state
@@ -874,6 +889,9 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     if args.disk_only {
         snapshot_config.kind = crate::storage::SnapshotKind::DiskOnly;
     }
+    if args.gpu_warm {
+        snapshot_config.metadata.parked_gpus = vm_state.config.gpus.len();
+    }
 
     // Snapshot generation locks are acquired BEFORE the per-VM lock. The target is held
     // exclusive through its atomic replacement, and a distinct diff parent is held shared
@@ -936,6 +954,11 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         );
     };
 
+    // A warm GPU snapshot that was published although the source did not get its GPUs
+    // back. Returned only after the snapshot is recorded as the VM's diff parent: the VMM
+    // reset its dirty pages against this snapshot, so a later diff on the older parent
+    // would miss every page written in between.
+    let mut gpu_recovery_failure: Option<anyhow::Error> = None;
     let published_memory = if args.disk_only {
         // Disk-only: no vCPU pause, no memory dump — fsfreeze the guest over the
         // exec vsock, reflink the disk, unfreeze. Cold-boot clones run from it.
@@ -973,33 +996,60 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         .await?;
         None
     } else {
+        // The VM's own fcvm process holds the portable volumes' inode tables; without them
+        // every inode the guest held at the snapshot answers EIO in a clone. Every backend's
+        // creator takes the same hook.
+        let has_portable = snapshot_config.metadata.volumes.iter().any(|v| v.portable);
+        let table_vsock = vsock_socket_path.clone();
+        let fetch_tables = move || crate::volume::fetch_inode_tables(&table_vsock);
+        let inode_tables: super::common::SnapshotExtraFiles<'_> = if has_portable {
+            Some(&fetch_tables)
+        } else {
+            None
+        };
         // Memory snapshot: drive the VM's actual control plane. Both backends listen on
         // the same `firecracker.sock` path; the client type + snapshot mechanism differ.
         match vm_state.config.hypervisor {
             crate::hypervisor::Backend::Firecracker => {
                 use crate::firecracker::FirecrackerClient;
                 let client = FirecrackerClient::new(socket_path.clone())?;
-                // The VM's own fcvm process holds the portable volumes' inode tables; without
-                // them every inode the guest held at the snapshot answers EIO in a clone.
-                let has_portable = snapshot_config.metadata.volumes.iter().any(|v| v.portable);
-                let table_vsock = vsock_socket_path.clone();
-                let fetch_tables = move || crate::volume::fetch_inode_tables(&table_vsock);
-                Some(
+                let core = || {
                     super::common::create_snapshot_core(
                         &client,
                         snapshot_config.clone(),
                         &vm_disk_path,
                         &vsock_socket_path,
                         parent_dir.as_deref(),
-                        if has_portable {
-                            Some(&fetch_tables)
-                        } else {
-                            None
-                        },
+                        inode_tables,
                         super::common::SnapshotSourceDisposition::Resume,
                     )
-                    .await?,
-                )
+                };
+                if args.gpu_warm {
+                    let devices =
+                        crate::firecracker::api::DevicePassthrough::for_gpus(&vm_state.config.gpus)
+                            .unwrap_or_default();
+                    let mut steps = FirecrackerWarmGpu {
+                        client: &client,
+                        vsock_socket: &vsock_socket_path,
+                        vm_id: &vm_state.vm_id,
+                        core: Some(core),
+                        timings: Vec::new(),
+                    };
+                    let warm = crate::gpu::warm_gpu_snapshot(&mut steps, &devices).await;
+                    info!(
+                        snapshot = %snapshot_name,
+                        gpus = devices.len(),
+                        steps = %steps.timings.join(" "),
+                        ok = matches!(&warm, Ok(w) if w.recovery.is_none()),
+                        "warm GPU snapshot"
+                    );
+                    let warm = warm?;
+                    // Published: record it as the VM's diff parent below, then report.
+                    gpu_recovery_failure = warm.recovery;
+                    Some(warm.snapshot)
+                } else {
+                    Some(core().await?)
+                }
             }
             crate::hypervisor::Backend::CloudHypervisor => {
                 let client =
@@ -1009,6 +1059,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                     snapshot_config.clone(),
                     &vm_disk_path,
                     &vsock_socket_path,
+                    inode_tables,
                 )
                 .await?;
                 None
@@ -1156,7 +1207,10 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         published_memory.log_data_runs().await;
     }
 
-    Ok(())
+    match gpu_recovery_failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// How long serve shutdown waits for clones to exit after SIGTERM before escalating to SIGKILL.
@@ -1229,13 +1283,17 @@ fn clone_port_mappings(
 }
 
 /// A passthrough device's state lives on the device, outside the memory image, so a
-/// VM with one cannot be memory-snapshotted. A disk-only capture takes no memory image.
-fn ensure_no_passthrough_in_memory_snapshot(gpus: &[String], disk_only: bool) -> Result<()> {
-    if !disk_only && !gpus.is_empty() {
+/// VM with one is memory-snapshotted only with `--gpu-warm`, which takes the GPUs out
+/// first. A disk-only capture takes no memory image.
+fn ensure_gpu_snapshot_mode(gpus: &[String], disk_only: bool, gpu_warm: bool) -> Result<()> {
+    if gpu_warm && gpus.is_empty() {
+        bail!("--gpu-warm parks the VM's GPUs, and this VM has none attached");
+    }
+    if !disk_only && !gpu_warm && !gpus.is_empty() {
         bail!(
-            "Cannot create snapshot: VM has passthrough GPU(s) {} attached. Snapshot the VM \
-             it was restored from instead (fcvm attaches GPUs to a restore of a snapshot \
-             taken without them), or use --disk-only",
+            "Cannot create snapshot: VM has passthrough GPU(s) {} attached. Use --gpu-warm to \
+             snapshot it with its GPU state, snapshot the VM it was restored from (fcvm \
+             attaches GPUs to a restore of a snapshot taken without them), or use --disk-only",
             gpus.join(", ")
         );
     }
@@ -1303,6 +1361,88 @@ fn clone_volumes(
         volume.host_path = mapping.host_path;
     }
     Ok(volumes)
+}
+
+/// A warm GPU snapshot's CUDA processes wait, checkpointed, for as many GPUs as the
+/// source parked; a restore with another count would leave them stuck, so it is refused
+/// before any side effect.
+fn check_parked_gpus(parked: usize, gpus: &[String]) -> Result<()> {
+    if parked != 0 && gpus.len() != parked {
+        bail!(
+            "this is a warm GPU snapshot: its source parked {parked} GPU(s) and its CUDA \
+             processes are waiting to be restored onto them. Restore it with {parked} --gpu \
+             address(es); {} given",
+            gpus.len()
+        );
+    }
+    Ok(())
+}
+
+/// [`crate::gpu::WarmGpuSteps`] for a Firecracker VM: the guest steps are fc-agent
+/// one-shots over the exec channel, the device steps are the VMM's passthrough API,
+/// and the snapshot is `create_snapshot_core`.
+struct FirecrackerWarmGpu<'a, F> {
+    client: &'a crate::firecracker::FirecrackerClient,
+    vsock_socket: &'a Path,
+    vm_id: &'a str,
+    core: Option<F>,
+    /// `step=ms` for each step taken, for the log line.
+    timings: Vec<String>,
+}
+
+impl<F, Fut> crate::gpu::WarmGpuSteps for FirecrackerWarmGpu<'_, F>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<super::common::PublishedMemoryFile>>,
+{
+    type Snapshot = super::common::PublishedMemoryFile;
+
+    async fn park(&mut self) -> Result<()> {
+        let started = std::time::Instant::now();
+        let result =
+            super::common::run_fc_agent_one_shot(self.vsock_socket, self.vm_id, "--gpu-park").await;
+        self.timings
+            .push(format!("park_ms={}", started.elapsed().as_millis()));
+        result
+    }
+
+    async fn detach(&mut self, id: &str) -> Result<()> {
+        let started = std::time::Instant::now();
+        let result = self.client.detach_passthrough(id).await;
+        self.timings
+            .push(format!("detach_{id}_ms={}", started.elapsed().as_millis()));
+        result
+    }
+
+    async fn snapshot(&mut self) -> Result<super::common::PublishedMemoryFile> {
+        let core = self.core.take().context("the snapshot step runs once")?;
+        let started = std::time::Instant::now();
+        let result = core().await;
+        self.timings
+            .push(format!("snapshot_ms={}", started.elapsed().as_millis()));
+        result
+    }
+
+    async fn attach(&mut self, device: &crate::firecracker::api::DevicePassthrough) -> Result<()> {
+        let started = std::time::Instant::now();
+        let result = self.client.attach_passthrough(device).await;
+        self.timings.push(format!(
+            "attach_{}_ms={}",
+            device.id,
+            started.elapsed().as_millis()
+        ));
+        result
+    }
+
+    async fn unpark(&mut self) -> Result<()> {
+        let started = std::time::Instant::now();
+        let result =
+            super::common::run_fc_agent_one_shot(self.vsock_socket, self.vm_id, "--gpu-unpark")
+                .await;
+        self.timings
+            .push(format!("unpark_ms={}", started.elapsed().as_millis()));
+        result
+    }
 }
 
 /// Refuse the `snapshot run` flags a disk-only clone cannot honour, so the cold-boot
@@ -1931,23 +2071,27 @@ async fn cmd_snapshot_run_inner(
     // Construct signal streams synchronously before either restore path can
     // allocate clone state.  Installing them inside a spawned task leaves the
     // process's default SIGTERM disposition live until that task first polls.
+    //
+    // The gate is created cancelled when this process was already asked to shut
+    // down: `podman run` takes a cache hit through here, and a signal its own
+    // handler received before this point would otherwise reach no gate this
+    // restore checks (`common::ShutdownRegistry`, issue 1162).
     let lifecycle_gate = super::common::LifecycleReadyGate::new();
     let cancel = lifecycle_gate.cancellation_token();
-    let signal_gate = lifecycle_gate.clone();
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
     tokio::spawn(async move {
-        tokio::select! {
-            _ = sigterm.recv() => {
-                signal_gate.cancel();
-                info!("received SIGTERM, shutting down VM");
-            }
-            _ = sigint.recv() => {
-                signal_gate.cancel();
-                info!("received SIGINT, shutting down VM");
-            }
-        }
+        let signal_name = tokio::select! {
+            _ = sigterm.recv() => "SIGTERM",
+            _ = sigint.recv() => "SIGINT",
+        };
+        super::common::request_process_shutdown();
+        info!("received {signal_name}, shutting down VM");
     });
+    if cancel.is_cancelled() {
+        info!(snapshot = %snapshot_name, "shutdown requested before the restore began");
+        bail!("interrupted by signal before snapshot restore");
+    }
     // The --pid (UFFD) and --snapshot (direct memory restore) paths both resume
     // from a memory image; a disk-only tag has none — it cold-boots a fresh VM
     // from the captured disk instead. Dispatch to that path before any
@@ -1978,7 +2122,16 @@ async fn cmd_snapshot_run_inner(
     // snapshot-miss path, which tears its throwaway VM down (deleting its
     // state) and relaunches through here. No pre-restore exec session can
     // reference this state file, so restore needs no vsock-epoch bump.
+    //
+    // What VMs of processes killed without teardown left on the host goes first. The
+    // clone's data directory is recorded before anything creates it, so a SIGKILLed
+    // clone leaves it to the next launch to reclaim (crate::reclaim).
+    crate::reclaim::reclaim_abandoned().await;
     let vm_id = generate_vm_id();
+    let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
+    reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
+        path: paths::vm_runtime_dir(&vm_id),
+    })?;
     let (mut runtime_config, firecracker_choice) = snapshot_restore_runtime_config(
         &args,
         snapshot_config.metadata.kernel_profile.as_deref(),
@@ -2070,6 +2223,10 @@ async fn cmd_snapshot_run_inner(
     // --gpu devices are attached by the snapshot load. The host side is checked before
     // any side effects, so a host that is not ready fails with what to fix.
     let gpus = crate::gpu::canonical_sbdfs(&args.gpu)?;
+    // The VM's lease on each GPU, taken before its quarantine check and held to the
+    // end of this function, after the clone's VMM is gone: no scrub can start
+    // between the check and the load opening the GPU, or while the clone runs.
+    let mut _gpu_leases = Vec::with_capacity(gpus.len());
     if !gpus.is_empty() {
         anyhow::ensure!(
             snapshot_config.metadata.hypervisor == crate::hypervisor::Backend::Firecracker,
@@ -2081,14 +2238,18 @@ async fn cmd_snapshot_run_inner(
         // clone restores the image recorded in the snapshot, whose module type the
         // current profile does not determine. The guest's attach fails closed instead.
         for sbdf in &gpus {
-            crate::gpu::check_host_device(
-                Path::new("/sys"),
-                Path::new("/dev"),
-                &crate::gpu::scrub::state_dir(),
-                sbdf,
-            )?;
+            _gpu_leases.push(
+                crate::gpu::check_host_device(
+                    Path::new("/sys"),
+                    Path::new("/dev"),
+                    &crate::gpu::scrub::state_dir(),
+                    sbdf,
+                )?
+                .lease,
+            );
         }
     }
+    check_parked_gpus(snapshot_config.metadata.parked_gpus, &gpus)?;
     vm_state.config.gpus = gpus.clone();
 
     // Setup paths
@@ -2835,33 +2996,32 @@ async fn cmd_snapshot_run_inner(
     // Host-observed end-to-end restore clock: from the start of the restore
     // call through the guest's ACK. Published as ack_ms in the restored record.
     let restore_started = std::time::Instant::now();
-    let setup_result: Result<(
-        Box<dyn crate::hypervisor::Hypervisor>,
-        Option<tokio::process::Child>,
-    )> = if is_ch {
-        super::common::restore_from_snapshot_ch(
-            restore_params,
-            setup.network_mut(),
-            &state_manager,
-            &mut vm_state,
-        )
-        .await
-        .map(|(backend, holder)| {
-            (
-                Box::new(backend) as Box<dyn crate::hypervisor::Hypervisor>,
-                holder,
+    let setup_result: Result<super::common::RestoredVmm<Box<dyn crate::hypervisor::Hypervisor>>> =
+        if is_ch {
+            super::common::restore_from_snapshot_ch(
+                restore_params,
+                setup.network_mut(),
+                &state_manager,
+                &mut vm_state,
             )
-        })
-    } else {
-        super::common::restore_from_snapshot(
-            restore_params,
-            setup.network_mut(),
-            &state_manager,
-            &mut vm_state,
-        )
-        .await
-        .map(|(b, h)| (Box::new(b) as Box<dyn crate::hypervisor::Hypervisor>, h))
-    };
+            .await
+            .map(|(backend, holder, lease)| {
+                (
+                    Box::new(backend) as Box<dyn crate::hypervisor::Hypervisor>,
+                    holder,
+                    lease,
+                )
+            })
+        } else {
+            super::common::restore_from_snapshot(
+                restore_params,
+                setup.network_mut(),
+                &state_manager,
+                &mut vm_state,
+            )
+            .await
+            .map(|(b, h, l)| (Box::new(b) as Box<dyn crate::hypervisor::Hypervisor>, h, l))
+        };
 
     // The restore has opened/reflinked everything it needs from the snapshot directory;
     // release the shared per-snapshot lock so creators are not blocked for the lifetime
@@ -2869,7 +3029,10 @@ async fn cmd_snapshot_run_inner(
     drop(snapshot_shared_lock);
     failpoint::hit_async("restore.unlocked").await;
 
-    let (mut vm_manager, mut holder_child) = setup_try!(setup_result);
+    // `_vsock_redirect_lease` is held until this function returns, after the clone's
+    // teardown: its VMM resolves its vsock socket through the mount redirect for its
+    // whole life (storage::runtime_dir).
+    let (mut vm_manager, mut holder_child, _vsock_redirect_lease) = setup_try!(setup_result);
 
     // The VMM is now owned by the normal lifecycle. Move every companion out of
     // the setup transaction exactly once; failed setup never reaches this point.
@@ -4655,6 +4818,7 @@ mod tests {
             firecracker_bin: None,
             balloon_mib: None,
             balloon_free_page_reporting: false,
+            parked_gpus: 0,
         }
     }
 
@@ -5048,16 +5212,64 @@ mod tests {
         assert!(error.contains("published no ports"), "{error}");
     }
 
+    /// A warm GPU snapshot that was published while the source did not get its GPUs
+    /// back is still recorded as the VM's diff parent before the failure is returned:
+    /// the VMM reset its dirty pages against it, so a later diff over the older parent
+    /// would miss every page written in between.
     #[test]
-    fn a_gpu_vm_refuses_a_memory_snapshot_but_not_a_disk_only_one() {
+    fn a_warm_snapshot_whose_source_recovery_failed_is_recorded_before_the_error() {
+        let code = include_str!("snapshot.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let body = &code[code.find("async fn cmd_snapshot_create(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("cmd_snapshot_create has no `{needle}`"))
+        };
+        assert!(
+            !body.contains("Some(published?)"),
+            "a failed source recovery returns before the snapshot is recorded"
+        );
+        let kept = at("gpu_recovery_failure = warm.recovery;");
+        let recorded = at("state.config.snapshot_name = Some(recorded_snapshot_name);");
+        let returned = at("Some(error) => Err(error),");
+        assert!(kept < recorded && recorded < returned);
+    }
+
+    #[test]
+    fn a_gpu_vm_refuses_a_plain_memory_snapshot_but_not_a_disk_only_or_warm_one() {
         let gpus = vec!["0000:01:00.0".to_string()];
         let err = format!(
             "{:#}",
-            ensure_no_passthrough_in_memory_snapshot(&gpus, false).unwrap_err()
+            ensure_gpu_snapshot_mode(&gpus, false, false).unwrap_err()
         );
         assert!(err.contains("passthrough GPU(s) 0000:01:00.0"), "{err}");
-        assert!(ensure_no_passthrough_in_memory_snapshot(&gpus, true).is_ok());
-        assert!(ensure_no_passthrough_in_memory_snapshot(&[], false).is_ok());
+        assert!(err.contains("--gpu-warm"), "{err}");
+        assert!(ensure_gpu_snapshot_mode(&gpus, true, false).is_ok());
+        assert!(ensure_gpu_snapshot_mode(&gpus, false, true).is_ok());
+        assert!(ensure_gpu_snapshot_mode(&[], false, false).is_ok());
+        let err = format!(
+            "{:#}",
+            ensure_gpu_snapshot_mode(&[], false, true).unwrap_err()
+        );
+        assert!(err.contains("has none attached"), "{err}");
+    }
+
+    #[test]
+    fn a_warm_gpu_snapshot_restores_only_with_as_many_gpus_as_it_parked() {
+        let one = vec!["0000:01:00.0".to_string()];
+        assert!(check_parked_gpus(0, &[]).is_ok());
+        assert!(check_parked_gpus(0, &one).is_ok());
+        assert!(check_parked_gpus(1, &one).is_ok());
+        let err = format!("{:#}", check_parked_gpus(1, &[]).unwrap_err());
+        assert!(
+            err.contains("parked 1 GPU(s)") && err.contains("--gpu"),
+            "{err}"
+        );
+        let two = vec!["0000:01:00.0".to_string(), "0000:02:00.0".to_string()];
+        assert!(check_parked_gpus(1, &two).is_err());
     }
 
     #[test]

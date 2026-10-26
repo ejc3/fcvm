@@ -1,5 +1,7 @@
 import { expect, test, devices, type Page } from "@playwright/test";
 import { seconds, thousands, utcDate } from "../core/format.ts";
+import { layoutMosaic, streamHeightFor } from "../core/layout.ts";
+import { streamBitrate } from "../core/bandwidth.ts";
 import { COORD, admin, fleetNow, focusError, mockState, openWall, raceOver, seamReport, setSkew, setTimeOfDay } from "./helpers.ts";
 
 const view = (page: Page) =>
@@ -41,6 +43,76 @@ test("the mosaic draws every GPU live, 15 tiles at one common t, each side as wi
   await expect(page.locator(".dark-tile")).toHaveCount(0);
 });
 
+test("the render is the page: the image fills the screen, the controls sit over it and fade when the pointer rests", async ({ page }) => {
+  await openWall(page, 15);
+  const vp = page.viewportSize()!;
+  const L = await page.evaluate(() => window.__fleet!.view().layout!);
+  // Contain-fit to the whole viewport, centred: no band reserved under it.
+  const fill = Math.min(vp.width / L.image.w, vp.height / L.image.h);
+  expect(fill).toBeCloseTo(1, 2);
+  expect(Math.abs(L.image.x + L.image.w / 2 - vp.width / 2)).toBeLessThanOrEqual(1);
+  expect(Math.abs(L.image.y + L.image.h / 2 - vp.height / 2)).toBeLessThanOrEqual(1);
+  // What used to stand between the title and the image is gone from the main view.
+  await expect(page.getByTestId("sentence")).toHaveCount(0);
+  await expect(page.getByTestId("counter")).toHaveCount(0);
+  await expect(page.getByTestId("feed")).toHaveCount(0);
+  await expect(page.getByTestId("race-clock-fcvm")).toHaveCount(0);
+  await expect(page.getByTestId("play")).toHaveText("Direct the scene");
+  // Each half's tag on the image, either side of the divider, which sits exactly on halfLineX.
+  const line = await page.getByTestId("half-line").boundingBox();
+  expect(line!.x + line!.width / 2).toBeCloseTo(L.halfLineX!, 3);
+  const f = await page.getByTestId("side-fcvm").boundingBox();
+  const e = await page.getByTestId("side-ec2").boundingBox();
+  await expect(page.getByTestId("side-fcvm")).toHaveText("FCVM · restored from a snapshot");
+  await expect(page.getByTestId("side-ec2")).toHaveText("EC2 · launched from an AMI");
+  expect(f!.x + f!.width).toBeLessThanOrEqual(L.halfLineX!);
+  expect(e!.x).toBeGreaterThanOrEqual(L.halfLineX!);
+  for (const b of [f!, e!]) {
+    expect(b.y).toBeGreaterThanOrEqual(L.image.y);
+    expect(b.y + b.height).toBeLessThan(L.image.y + L.image.h / 3);
+  }
+  // The spec line, from live numbers: the image in device pixels, the GPUs, the frame rate.
+  await expect(page.getByTestId("spec")).toHaveText(new RegExp(`^${Math.round(L.image.w)}×${Math.round(L.image.h)} · 15 × .+ · \\d+ fps · path traced$`));
+  await expect(page.getByTestId("live")).toHaveText("LIVE");
+  // The first time the pointer is over the image, a hint says what a click does; once per browser.
+  const t = (await view(page)).tiles.find((x) => x.id === "fcvm:3")!.box!;
+  await page.mouse.move(t.x + t.w / 2, t.y + t.h / 2);
+  await expect(page.getByTestId("hint")).toHaveText("Click a square to look at its VM.");
+  await expect(page.getByTestId("hint")).toHaveCount(0, { timeout: 8000 });
+  // At rest the controls fade, but not the title; any pointer move brings them back.
+  await expect(page.locator(".wall")).toHaveClass(/\bidle\b/, { timeout: 6000 });
+  expect(await page.locator(".hud-top .actions").evaluate((el) => getComputedStyle(el).opacity)).toBe("0");
+  expect(await page.locator(".brand").evaluate((el) => getComputedStyle(el).opacity)).toBe("1");
+  // Resting over the image, the seams and the outline have gone too.
+  await expect(page.getByTestId("seams")).toHaveAttribute("data-visible", "0");
+  await expect(page.getByTestId("hover-outline")).toHaveCount(0);
+  await page.mouse.move(t.x + t.w / 2 + 5, t.y + t.h / 2);
+  await expect(page.locator(".wall")).not.toHaveClass(/\bidle\b/);
+  await expect(page.getByTestId("seams")).toHaveAttribute("data-visible", "1");
+  await page.reload();
+  await page.waitForFunction(() => window.__fleet !== undefined && window.__fleet.view().layout !== null);
+  await page.mouse.move(t.x + t.w / 2, t.y + t.h / 2 + 3);
+  await page.waitForTimeout(500);
+  await expect(page.getByTestId("hint")).toHaveCount(0);
+});
+
+test("every control stays on screen from just above the phone breakpoint up", async ({ page }) => {
+  await openWall(page, 15);
+  // The mock lends a GPU, so "Get your own GPU" is in the row too.
+  await expect(page.getByTestId("own-gpu")).toBeVisible();
+  for (const width of [701, 760, 860, 1024, 1280]) {
+    await page.setViewportSize({ width, height: 700 });
+    await page.waitForTimeout(150);
+    const off = await page.evaluate(() =>
+      [...document.querySelectorAll(".hud-top button, .hud-bottom button")]
+        .map((el) => ({ name: el.getAttribute("aria-label") ?? el.textContent?.trim() ?? "", r: el.getBoundingClientRect() }))
+        .filter((x) => x.r.width > 0 && (x.r.left < 0 || x.r.right > window.innerWidth || x.r.top < 0 || x.r.bottom > window.innerHeight))
+        .map((x) => `${x.name} ${Math.round(x.r.left)}..${Math.round(x.r.right)}`),
+    );
+    expect(off, `at ${width} px`).toEqual([]);
+  }
+});
+
 test("no seam: pixels on both sides of every boundary match the picture at the drawn t", { tag: "@engines" }, async ({ page }) => {
   await openWall(page, 15);
   const r = await seamReport(page);
@@ -72,45 +144,55 @@ test("the seam check catches a renderer that draws another t than it stamps", as
   }
 });
 
-test("restart all: the race is the hero, one counter per half, fcvm's bar stops while EC2's grows, results announced", async ({ page, browser }) => {
+test("restart all: the race is on the picture, a clock per half and per tile, fcvm freezes while EC2 counts, results announced", async ({ page, browser }) => {
   await openWall(page, 15);
   const watcher = await (await browser.newContext()).newPage();
   await openWall(watcher, 15);
   await expect(page.getByTestId("restart-all")).toHaveText("Restart all 15 GPUs");
   await expect(page.getByTestId("announce")).toHaveAttribute("aria-live", "polite");
   await page.getByTestId("restart-all").click();
+  // Who started it, briefly, on the image.
+  await expect(page.getByTestId("toast")).toHaveText("you restarted every GPU");
+  await expect(watcher.getByTestId("toast")).toHaveText(/viewer \d+ restarted every GPU/);
   await expect(page.getByTestId("restart-all")).toBeDisabled();
   await expect(page.getByTestId("restart-all")).toHaveText("Restarting now");
   await expect(page.getByTestId("countdown")).toContainText("Restart running");
   await expect(watcher.getByTestId("countdown")).toContainText("Restart running");
-  // No per-tile clock: a dark tile shows how far its restart is.
+  // Every dark tile counts, with how far its restart is; each half has one big clock.
   await expect(page.locator('[data-testid^="dark-fcvm"] svg.glyph.progress').first()).toBeVisible();
-  await expect(page.locator(".dark-tile .clock")).toHaveCount(0);
-  // fcvm comes back: its counter freezes, with a check mark, while EC2's runs on.
-  await expect(page.getByTestId("bar-fcvm")).toHaveClass(/done/, { timeout: 10_000 });
-  await expect(page.getByTestId("line-fcvm")).toHaveText("all 8 GPUs streaming again");
-  const a = { f: await page.getByTestId("value-fcvm").textContent(), e: await page.getByTestId("value-ec2").textContent(), fs: Number(await page.getByTestId("bar-fcvm").getAttribute("data-solid")), es: Number(await page.getByTestId("bar-ec2").getAttribute("data-solid")) };
+  await expect(page.getByTestId("clock-ec2:1")).toHaveText(/^0:\d\d\.\d$/);
+  await expect(page.getByTestId("race-clock-fcvm")).toBeVisible();
+  await expect(page.getByTestId("race-clock-ec2")).toHaveAttribute("data-state", "counting");
+  // fcvm comes back: its clock freezes, while EC2's runs on, and each relit tile shows its own time.
+  await expect(page.getByTestId("race-clock-fcvm")).toHaveAttribute("data-state", "done", { timeout: 10_000 });
+  await expect(page.getByTestId("race-sub-fcvm")).toHaveText("all 8 GPUs back");
+  await expect(page.getByTestId("chip-fcvm:1")).toHaveText(/^\d\.\d s$/);
+  await expect(page.getByTestId("race-sub-ec2")).toHaveText(/^\+\d+ s and counting$/);
+  await expect(page.getByTestId("race-steps-ec2")).toContainText("instance");
+  const a = { f: await page.getByTestId("race-value-fcvm").textContent(), e: await page.getByTestId("race-value-ec2").textContent() };
   await page.waitForTimeout(1200);
-  const b = { f: await page.getByTestId("value-fcvm").textContent(), e: await page.getByTestId("value-ec2").textContent(), fs: Number(await page.getByTestId("bar-fcvm").getAttribute("data-solid")), es: Number(await page.getByTestId("bar-ec2").getAttribute("data-solid")) };
+  const b = { f: await page.getByTestId("race-value-fcvm").textContent(), e: await page.getByTestId("race-value-ec2").textContent() };
   expect(a.f).toMatch(/^\d\.\d s$/);
   expect(b.f).toBe(a.f);
-  expect(b.fs).toBeLessThanOrEqual(a.fs);
   expect(b.e).not.toBe(a.e);
-  expect(b.es).toBeGreaterThan(a.es);
   await expect(page.getByTestId("announce")).toHaveText(/^fcvm: all 8 GPUs streaming again \d\.\d s after the restart\.$/);
-  // EC2 comes back; both results are announced and both bars show what they were measured on.
+  // EC2 comes back; both results are announced, and one card says the race in the coordinator's numbers.
   await expect(page.getByTestId("announce")).toContainText(/EC2: all 7 GPUs streaming again \d+ s after the restart\./, { timeout: 30_000 });
-  await expect(page.getByTestId("measured-fcvm")).toHaveText("measured on 8 GPUs");
-  await expect(page.getByTestId("measured-ec2")).toHaveText("measured on 7 GPUs");
   const st = await fleetNow();
   const ra = st.relaunch_all!;
-  expect(ra.fcvm_done_at! - ra.started_at).toBeLessThan(ra.ec2_done_at! - ra.started_at);
-  // Every number is the coordinator's: the last restart, as it measured it.
-  await expect(page.getByTestId("line-fcvm")).toHaveText(`last restart ${seconds(st.scoreboard.fcvm!.last_ms)}`);
-  await expect(page.getByTestId("value-ec2")).toHaveText(seconds(st.scoreboard.ec2!.median_ms));
+  const f = ra.fcvm_done_at! - ra.started_at;
+  const e = ra.ec2_done_at! - ra.started_at - ra.ec2_capacity_wait_ms;
+  expect(f).toBeLessThan(e);
+  const ratio = (x: number, y: number) => (y / x >= 10 ? Math.round(y / x) : (y / x).toFixed(1));
+  await expect(page.getByTestId("end-card")).toHaveText(`fcvm back in ${seconds(f)} · EC2 back in ${seconds(e)} · ${ratio(f, e)}× faster`);
+  await expect(page.getByTestId("race-clock-fcvm")).toHaveCount(0);
   await expect(page.getByTestId("restart-all")).toBeEnabled();
-  await expect(page.getByTestId("feed")).toContainText("you restarted every GPU");
-  await expect(watcher.getByTestId("feed")).toContainText(/viewer \d+ restarted every GPU/);
+  // The card stays a few seconds, then the strip's one line says how the race went.
+  await expect(page.getByTestId("end-card")).toHaveCount(0, { timeout: 15_000 });
+  await expect(page.getByTestId("last-race")).toHaveText(
+    `Last race: fcvm back in ${seconds(st.scoreboard.fcvm!.last_ms)} · EC2 back in ${seconds(st.scoreboard.ec2!.last_ms)} · ${ratio(st.scoreboard.fcvm!.last_ms, st.scoreboard.ec2!.last_ms)}× faster`,
+  );
+  await expect(page.getByTestId("toast")).toHaveCount(0);
   await watcher.context().close();
 });
 
@@ -119,26 +201,23 @@ test("the owner's schedule: a shared countdown, a restart by the schedule, a coo
   const other = await (await browser.newContext()).newPage();
   await openWall(other, 15);
   await admin("/mock/schedule", { next_in_ms: 4000, cooldown_s: 40, capacity_wait_ms: 3000 });
-  await expect(page.getByTestId("countdown")).toContainText("Next restart in");
+  await expect(page.getByTestId("countdown")).toContainText("auto in");
   await expect(page.getByTestId("countdown-value")).toHaveText(/^0:0[1-4]$/);
   await expect(other.getByTestId("countdown-value")).toHaveText(/^0:0[1-4]$/);
   await expect(page.getByTestId("countdown")).toContainText("Scheduled restart, running", { timeout: 8000 });
-  await expect(page.getByTestId("feed")).toContainText("the scheduled restart of every GPU began");
-  // While AWS has no spot GPU: hatched, first on EC2's bar, labelled, and the tiles say so.
-  await expect(page.getByTestId("hatch-ec2")).toBeVisible();
-  await expect(page.getByTestId("hatch-label-ec2")).toHaveText(/^AWS had no spot GPU: waiting 0:0\d, not counted$/);
+  await expect(page.getByTestId("toast")).toHaveText("the scheduled restart of every GPU began");
+  // While AWS has no spot GPU: EC2's clock says it is not counting the wait, and the tiles say so, hatched.
+  await expect(page.getByTestId("race-hatch-ec2")).toHaveText(/^not counting \d s AWS spent finding a spot GPU$/);
   await expect(page.getByTestId("dark-ec2:1")).toHaveAttribute("data-kind", "capacity");
   await expect(page.locator(".key-grid button[aria-label^='EC2 VM 1,']")).toHaveAttribute("aria-label", /AWS had no spot GPU/);
-  const track = page.getByTestId("bar-ec2").locator(".track > span").first();
-  await expect(track).toHaveClass("hatch");
+  await expect(page.getByTestId("dark-ec2:1")).toHaveClass(/hatched/);
   await raceOver();
   const st = await fleetNow();
   expect(st.relaunch_all!.by).toBe("schedule");
   expect(st.scoreboard.ec2!.last_capacity_wait_ms).toBe(3000);
   // The headline leaves the wait out: EC2's last time is click to last frame less the wait.
   expect(st.scoreboard.ec2!.last_ms).toBe(st.relaunch_all!.ec2_done_at! - st.relaunch_all!.started_at - 3000);
-  await expect(page.getByTestId("line-ec2")).toHaveText(`last restart ${seconds(st.scoreboard.ec2!.last_ms)}`);
-  await expect(page.getByTestId("hatch-label-ec2")).toHaveText("last restart: AWS had no spot GPU for 3.0 s, not counted");
+  await expect(page.getByTestId("end-card")).toContainText(`EC2 back in ${seconds(st.scoreboard.ec2!.last_ms)}`);
   // The cooldown, shown to everyone: the button waits.
   await expect(other.getByTestId("restart-all")).toBeDisabled();
   await expect(other.getByTestId("restart-note")).toHaveText(/^available again in 0:[0-3]\d$/);
@@ -236,7 +315,8 @@ test("one side with no GPUs: the other takes the full width, and a small label s
     const boxes = await page.evaluate(() => window.__fleet!.view().tiles.map((t) => t.box!));
     expect(Math.max(...boxes.map((b) => b.x + b.w))).toBeCloseTo(L.image.x + L.image.w, 0);
     await expect(page.getByTestId("empty-ec2")).toHaveText("EC2: no GPUs live right now");
-    await expect(page.getByTestId("caption-ec2")).toHaveCount(0);
+    await expect(page.getByTestId("side-ec2")).toHaveCount(0);
+    await expect(page.getByTestId("side-fcvm")).toHaveText("FCVM · restored from a snapshot");
     await expect(page.locator(".half-line")).toHaveCount(0);
   } finally {
     await retile(page, 8, 7, 15);
@@ -309,11 +389,12 @@ test("an opened VM streams at its native size, with its restart timeline and liv
   const wanted = await page.evaluate(() => window.__fleet!.view().plan.direct.find((x) => x.id === "d:fcvm:3")!.height);
   expect(wanted).toBe(placed.streamHeight);
   expect(wanted).toBeLessThanOrEqual(720);
-  // 720p at one device pixel per pixel when it fits; on a smaller screen the box
-  // shrinks and asks for the next stream height up from what it covers.
+  // 720p, or less where 720p would pass MAX_TILE_PX, at one device pixel per pixel when
+  // it fits; on a smaller screen the box shrinks and asks for the next stream height up.
   expect(wanted).toBeGreaterThanOrEqual(placed.box.h);
-  if (placed.box.h < 720) expect(await page.evaluate(() => window.__fleet!.view().focus!.placed!.box.h < 720)).toBe(true);
-  else expect(placed.box.h).toBe(720);
+  const r = await page.evaluate(() => window.__fleet!.client.getState().accepted!.tiles.find((t) => t.id === "fcvm:3")!.rect);
+  const native = Math.min(720, streamHeightFor(Number.POSITIVE_INFINITY, (r.w * 16) / 9 / r.h));
+  expect(placed.box.h).toBeLessThanOrEqual(native);
   await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().frames!.tiles["d:fcvm:3"]!.height), { timeout: 15_000 }).toBe(wanted);
   await expect(page.getByTestId("focus-stream")).toHaveText(new RegExp(`^${wanted}p · \\d+ fps · (native size|shown at \\d+%)$`));
   const others = await page.evaluate(() => window.__fleet!.view().plan.direct.filter((x) => x.id !== "d:fcvm:3").map((x) => x.height));
@@ -397,6 +478,10 @@ test("the count of GPU VMs restored ticks as VMs restore; the isolation panel sa
   await openWall(page, 15);
   const counters = async () => ((await mockState()).state as unknown as { counters: { restores: number; scrubs: number } }).counters;
   const n0 = (await counters()).restores;
+  // The counters are in the drawer's About section, not on the image.
+  await expect(page.getByTestId("counter")).toHaveCount(0);
+  await page.getByTestId("menu").click();
+  await expect(page.locator("#about-title")).toBeFocused();
   await expect(page.getByTestId("counter")).toContainText("GPU VMs restored:");
   await expect(page.getByTestId("counter-value")).toHaveText(thousands(n0));
   await expect(page.getByTestId("counter-scrubs")).toHaveCount(0);
@@ -404,6 +489,7 @@ test("the count of GPU VMs restored ticks as VMs restore; the isolation panel sa
   await expect(page.getByTestId("counter-value")).toHaveText(thousands(n0 + 1), { timeout: 10_000 });
   // The new total arrives highlighted: it ticks.
   expect(await page.getByTestId("counter-value").evaluate((el) => getComputedStyle(el).animationName)).toBe("tick");
+  await page.getByRole("button", { name: "Close" }).click();
   await page.getByTestId("isolation-link").click();
   await expect(page.getByTestId("drawer")).toBeVisible();
   await expect(page.locator("#isolation-title")).toBeFocused();
@@ -483,6 +569,8 @@ test("two viewers hold the same state at the same version", async ({ browser }) 
 test("this viewer's own actions read as you", async ({ page }) => {
   await openWall(page, 15);
   await page.evaluate(() => window.__fleet!.client.send("light", { pos: [0, 1, -2], color: [1, 0.8, 0.5] }));
+  await expect(page.getByTestId("toast")).toHaveText("you dropped a light");
+  await page.getByTestId("menu").click();
   await expect(page.getByTestId("feed")).toContainText("you dropped a light");
 });
 
@@ -534,50 +622,75 @@ test("aggregated is the default: no seam, and tile state drawn exactly as in dir
   await expect(page.getByTestId("streams-switch")).toHaveText("See every VM's own stream");
 });
 
-test("over the bandwidth budget, small direct tiles ask for q=lo", async ({ page }) => {
+test("over the bandwidth budget, every direct tile asks for q=lo", async ({ page }) => {
   await page.addInitScript(() => window.localStorage.setItem("fleet-wall.mode", "direct"));
-  // Under what 15 streams cost at their floor (9 Mbit/s), whatever the screen.
+  // Under what 15 streams cost at std's floor (9 Mbit/s), whatever the screen.
   await page.goto("/?debug=1&budget=5");
   await page.waitForFunction(() => window.__fleet !== undefined && window.__fleet.view().plan.direct.length > 0);
   const urls = await page.evaluate(() => window.__fleet!.view().plan.direct.map((d) => d.url!));
-  expect(urls.filter((u) => u.includes("q=lo")).length).toBeGreaterThan(0);
+  // All of them, so no lo tile sits beside a std one.
+  expect(urls.filter((u) => u.includes("q=lo"))).toHaveLength(15);
   await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBeGreaterThanOrEqual(15);
 });
 
-test("a resize that moves tiles to q=lo reopens their streams at q=lo", async ({ page }) => {
+test("a resize that moves the tiles to q=lo reopens their streams at q=lo, all of them together", async ({ page }) => {
   const stats = async () => (await (await fetch(`${COORD}/mock/render-stats`)).json()) as { subscribersByQuality: Record<string, number> };
   const plan = () => page.evaluate(() => window.__fleet!.view().plan);
   await page.addInitScript(() => window.localStorage.setItem("fleet-wall.mode", "direct"));
-  // 15 streams cost 9 Mbit/s at 1280x800 and 27 Mbit/s at 1920x1080 (both at the default quality).
-  await page.setViewportSize({ width: 1280, height: 800 });
-  await page.goto("/?debug=1&budget=20");
+  // A budget between what the 15 streams cost at std on a 960x600 window and on a 1920x1080 one,
+  // from the page's own layout and bit-rate rules.
+  await page.setViewportSize({ width: 960, height: 600 });
+  await page.goto("/?debug=1");
+  await page.waitForFunction(() => window.__fleet !== undefined && window.__fleet.view().plan.direct.length > 0);
+  const st = await page.evaluate(() => window.__fleet!.client.getState().accepted!);
+  const cost = (w: number, h: number) =>
+    layoutMosaic({ x: 0, y: 0, w, h }, st.tiles, 1, st.image_aspect).tiles.reduce((sum, p) => sum + streamBitrate(st.tiles.find((t) => t.id === p.id)!.rect, st.image_aspect, p.streamHeight, "std"), 0);
+  const small = cost(960, 600);
+  const big = cost(1920, 1080);
+  expect(big).toBeGreaterThan(small * 1.5);
+  const budget = (small + big) / 2;
+  await page.goto(`/?debug=1&budget=${budget / 1e6}`);
   await page.waitForFunction(() => window.__fleet !== undefined && window.__fleet.view().plan.direct.length > 0);
   await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBeGreaterThanOrEqual(15);
   const before = await plan();
   expect(before.direct.some((d) => d.url!.includes("q=lo"))).toBe(false);
   await expect.poll(async () => (await stats()).subscribersByQuality.std ?? 0).toBeGreaterThanOrEqual(15);
-  // A bigger screen asks for more pixels: the same budget now puts small tiles at lo, on the same streams.
+  // A bigger screen asks for more pixels: the same budget now puts every tile at lo, on the same streams.
   await page.setViewportSize({ width: 1920, height: 1080 });
-  await expect.poll(async () => (await plan()).direct.filter((d) => d.url!.includes("q=lo")).length, { timeout: 15_000 }).toBeGreaterThan(0);
+  await expect.poll(async () => (await plan()).direct.filter((d) => d.url!.includes("q=lo")).length, { timeout: 15_000 }).toBe(15);
   const after = await plan();
-  const lo = after.direct.filter((d) => d.url!.includes("q=lo")).length;
-  console.log(`bps ${before.estimatedBps} -> ${after.estimatedBps}; ${lo} of ${after.direct.length} tiles asked for q=lo`);
+  console.log(`bps ${before.estimatedBps} -> ${after.estimatedBps}; budget ${Math.round(budget)}; every tile asked for q=lo`);
   // The renderer reads q only when a socket opens, so these tiles are served at lo only if their sockets were reopened.
-  await expect.poll(async () => (await stats()).subscribersByQuality.lo ?? 0, { timeout: 15_000 }).toBe(lo);
-  // Every tile moved to lo decodes frames from its reopened stream.
-  const loIds = after.direct.filter((d) => d.url!.includes("q=lo")).map((d) => d.id);
-  const newest = () => page.evaluate((ids) => ids.map((id) => window.__fleet!.client.getState().frames?.tiles[id]?.newestT ?? null), loIds);
+  await expect.poll(async () => (await stats()).subscribersByQuality.lo ?? 0, { timeout: 15_000 }).toBe(15);
+  // Every tile decodes frames from its reopened stream.
+  const ids = after.direct.map((d) => d.id);
+  const newest = () => page.evaluate((x) => x.map((id) => window.__fleet!.client.getState().frames?.tiles[id]?.newestT ?? null), ids);
   const reopened = await newest();
   await expect
     .poll(async () => (await newest()).filter((t, i) => t !== null && (reopened[i] === null || t > reopened[i]!)).length, { timeout: 15_000 })
-    .toBe(lo);
-  // Back to the size this job's renderer is provisioned for (1280x800, ci.yml): the tiles
+    .toBe(15);
+  // Back to the size this job's renderer is provisioned for (960x600, ci.yml): the tiles
   // reopen at std, and every one draws at the common t again. At 1920x1080 "all 15 in
   // sync" measures whether the mock keeps up; on one core it does not (6 of 15 after 33 s,
   // 3757 frames skipped against 2024 sent).
-  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.setViewportSize({ width: 960, height: 600 });
   await expect.poll(async () => (await stats()).subscribersByQuality.std ?? 0, { timeout: 15_000 }).toBe(15);
   await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBeGreaterThanOrEqual(15);
+});
+
+test("a coordinator with no poster yet shows no broken image", async ({ page }) => {
+  // After a coordinator restart /poster.jpg answers 404 until a scene is captured.
+  await admin("/mock/fault", { renderers_silent: true, no_poster: true });
+  try {
+    await page.goto("/?debug=1");
+    await page.waitForFunction(() => window.__fleet !== undefined);
+    await expect.poll(() =>
+      page.evaluate(() => [...document.querySelectorAll("img")].filter((i) => i.complete && i.naturalWidth === 0 && i.getAttribute("src")).map((i) => `${i.className}|${i.getAttribute("src")}`)),
+    ).toEqual([]);
+    await expect(page.getByTestId("poster")).toHaveCount(0);
+  } finally {
+    await admin("/mock/fault", { renderers_silent: false, no_poster: false });
+  }
 });
 
 test("first load paints the coordinator's poster at once, before any stream arrives", async ({ page }) => {
@@ -620,7 +733,7 @@ test("pause holds the picture; resume moves it again", async ({ page }) => {
   await openWall(page, 15);
   await page.getByTestId("pause").click();
   await expect(page.getByTestId("pause")).toHaveAttribute("aria-pressed", "true");
-  await expect(page.getByTestId("pause")).toHaveText("Resume");
+  await expect(page.getByTestId("pause")).toHaveAttribute("aria-label", "Resume");
   const t0 = await drawnT(page);
   await page.waitForTimeout(1200);
   expect(await drawnT(page)).toBe(t0);
@@ -1032,15 +1145,15 @@ test("asleep: the recording plays over the poster with its badge, the scores are
     await raceOver();
   }
   await sleepNow();
-  await expect(page.getByTestId("sleep-card")).toContainText("The GPUs are asleep");
+  await expect(page.getByTestId("sleep-card")).toContainText("Asleep.");
   await expect(page.locator(".dark-tile")).toHaveCount(0);
   await expect(page.getByTestId("reel")).toHaveAttribute("data-state", "playing", { timeout: 15_000 });
   const t0 = await page.getByTestId("reel-video").evaluate((v) => (v as HTMLVideoElement).currentTime);
   await page.waitForTimeout(600);
   expect(await page.getByTestId("reel-video").evaluate((v) => (v as HTMLVideoElement).currentTime)).not.toBe(t0);
   expect(await page.getByTestId("reel-video").evaluate((v) => { const x = v as HTMLVideoElement; return [x.muted, x.loop, x.playsInline, x.textTracks[0]?.mode]; })).toEqual([true, true, true, "showing"]);
-  await expect(page.getByTestId("reel-badge")).toHaveText(`Recorded ${await reelDate()}. The live wall is asleep; it wakes when someone watches.`);
-  await expect(page.getByTestId("scoreboard")).toHaveAttribute("aria-label", /· last measured \d+ \w+ \d{4}, \d\d:\d\d UTC$/);
+  await expect(page.getByTestId("reel-badge")).toContainText(`◉ RECORDING · ${await reelDate()}`);
+  await expect(page.getByTestId("last-race")).toHaveText(/^Last race: fcvm back in .+ · measured \d+ \w+ \d{4}, \d\d:\d\d UTC$/);
   await expect(page.getByTestId("restart-note")).toHaveText("works once the GPUs are awake");
   await expect(page.getByTestId("own-note")).toHaveText("works once the GPUs are awake");
   await expect(page.getByTestId("restart-all")).toBeDisabled();
@@ -1062,8 +1175,8 @@ test("asleep: the recording plays over the poster with its badge, the scores are
     requestAnimationFrame(tick);
   });
   await admin("/mock/power", { wake: true });
-  await expect(page.getByTestId("sleep-card")).toContainText("Waking up the GPUs");
-  await expect(page.getByTestId("reel-badge")).toHaveText(`Recorded ${await reelDate()}. The live wall is waking up.`);
+  await expect(page.getByTestId("sleep-card")).toContainText(/WAKING (\d+ GPUs|THE GPUs)/);
+  await expect(page.getByTestId("reel-badge")).toContainText(`◉ RECORDING · ${await reelDate()}`);
   await expect(page.getByTestId("wake-clock")).toHaveText(/^0:0\d\.\d$/);
   await expect(page.getByTestId("wake-instance_pending")).toHaveAttribute("data-state", "done");
   await expect(page.getByTestId("wake-booted")).toHaveAttribute("data-state", "done", { timeout: 10_000 });
@@ -1079,7 +1192,8 @@ test("asleep: the recording plays over the poster with its badge, the scores are
   expect(await page.evaluate(() => (window as unknown as { __leaving: boolean[] }).__leaving)).toEqual([false, true]);
   const trace = await page.evaluate(() => window.__fleet!.client.traceStop());
   expect(trace.filter((e) => e.T !== null && e.missing > 0 && !e.poster)).toEqual([]);
-  // The wake, measured once.
+  // The wake, measured once, in the drawer's About section.
+  await page.getByTestId("menu").click();
   await expect(page.getByTestId("wake-stat")).toHaveText(/^Last wake: 15 GPUs from zero in 0:\d\d \(\d+ \w+ \d{4}, \d\d:\d\d UTC\)$/);
   await expect(page.getByTestId("restart-all")).toBeEnabled();
 });
@@ -1114,7 +1228,7 @@ test("a missing recording leaves the poster, with nothing broken on top", async 
     await page.waitForTimeout(500);
     const trace = await page.evaluate(() => window.__fleet!.client.traceStop());
     expect(trace.at(-1)!.poster).toBe(true);
-    await expect(page.getByTestId("sleep-card")).toContainText("The GPUs are asleep");
+    await expect(page.getByTestId("sleep-card")).toContainText("Asleep.");
   } finally {
     await admin("/mock/media", { missing: false });
     await wakeUp(page);
@@ -1159,19 +1273,26 @@ test("touch: a long press shows the pressed tile's seams and label", async ({ br
   await ctx.close();
 });
 
-test("phone: the image full width, the two bars, one button, and a hint to turn the phone", async ({ browser }) => {
+test("phone: the image full width at the top, the strip under it, one button in a dock, and a hint to turn the phone", async ({ browser }) => {
   const ctx = await browser.newContext({ ...devices["iPhone 13"], deviceScaleFactor: 1 });
   const page = await ctx.newPage();
   await page.goto("/?debug=1");
   await page.waitForFunction(() => window.__fleet !== undefined && window.__fleet.view().layout !== null);
   const vw = page.viewportSize()!.width;
+  const vh = page.viewportSize()!.height;
   const img = await page.evaluate(() => window.__fleet!.view().layout!.image);
   expect(img.w).toBe(vw);
-  await expect(page.getByTestId("scoreboard")).toBeVisible();
-  await expect(page.getByTestId("bar-fcvm")).toBeVisible();
-  await expect(page.getByTestId("bar-ec2")).toBeVisible();
-  // One button; Play is a text link under it.
+  expect(img.y).toBeLessThan(80);
+  // The tags sit on the image.
+  const tag = await page.getByTestId("side-fcvm").boundingBox();
+  expect(tag!.y).toBeGreaterThanOrEqual(img.y);
+  expect(tag!.y + tag!.height).toBeLessThanOrEqual(img.y + img.h);
+  await expect(page.getByTestId("spec")).toHaveText(/^\d+×\d+ · \d+ × .+ · path traced$|^\d+×\d+ · \d+ × .+ · \d+ fps · path traced$/);
+  // One button, in a dock in the thumb zone; the drawer is a text link and a menu icon.
   await expect(page.locator(".phone .btn:visible")).toHaveCount(1);
+  const dock = await page.getByTestId("restart-all").boundingBox();
+  expect(dock!.y + dock!.height).toBeLessThanOrEqual(vh);
+  expect(dock!.y).toBeGreaterThan(vh / 2);
   await page.getByTestId("phone-play").click();
   await expect(page.getByTestId("drawer")).toBeVisible();
   await page.getByTestId("text-style-landmark").click();
@@ -1179,9 +1300,24 @@ test("phone: the image full width, the two bars, one button, and a hint to turn 
   expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0);
   await page.getByRole("button", { name: "Close" }).click();
   await expect(page.getByTestId("restart-all")).toBeVisible();
-  await expect(page.getByTestId("rotate-hint")).toHaveText("Turn your phone sideways for a bigger picture.");
+  await expect(page.getByTestId("rotate-hint")).toHaveText("Turn sideways for full screen");
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
   expect(overflow).toBeLessThanOrEqual(0);
+  await ctx.close();
+});
+
+test("phone, landscape: full-bleed like the desktop", async ({ browser }) => {
+  const ctx = await browser.newContext({ ...devices["iPhone 13 landscape"], deviceScaleFactor: 1 });
+  const page = await ctx.newPage();
+  await page.goto("/?debug=1");
+  await page.waitForFunction(() => window.__fleet !== undefined && window.__fleet.view().layout !== null);
+  const v = page.viewportSize()!;
+  const img = await page.evaluate(() => window.__fleet!.view().layout!.image);
+  // Contain-fit to the whole screen: the full height, centred.
+  expect(img.h).toBe(v.height);
+  expect(Math.abs(img.x + img.w / 2 - v.width / 2)).toBeLessThanOrEqual(1);
+  await expect(page.locator(".hud-top")).toBeVisible();
+  await expect(page.getByTestId("restart-all")).toBeVisible();
   await ctx.close();
 });
 

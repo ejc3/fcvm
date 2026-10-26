@@ -348,6 +348,14 @@ export class MockRenderers {
       for (const s of this.subs) if (s.tile === id) this.resize(s, s.reqH);
     }
     this.stats.renderBacklog = this.pool.backlog;
+    // Behind its clock (the last frame's draws have not all started), the renderer skips
+    // this frame for every stream at once. Skipping per stream would leave each tile a
+    // different subset of t, and a page draws all of them at one t: with 15 tiles each
+    // missing 4 frames in 10, no t is held by all 15, and the page never shows them in sync.
+    if (this.pool.backlog > 0) {
+      for (const s of this.subs) if (s.encoder) this.stats.framesSkipped++;
+      return;
+    }
     const groups = new Map<string, Sub[]>();
     for (const s of this.subs) {
       if (!s.encoder) continue;

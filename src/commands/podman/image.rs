@@ -1,27 +1,15 @@
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use tracing::{info, warn};
 
-/// Build a unique sibling temp path for atomically publishing a content-addressed cache file.
-///
-/// The image-cache dir is content-addressed and SHARED across VMs: nested tests `--map` the
-/// host `/mnt/fcvm-btrfs` into multiple L1 VMs, so two VMs preparing the same image write to
-/// the same directory on the host backing store. The per-digest `flock` guarding image prep
-/// does NOT coordinate this: it is `flock()` over a fuse-pipe mount that negotiates no
-/// `FUSE_FLOCK_LOCKS`, so each guest kernel grants it locally and never forwards it to the
-/// host. A shared `"<final>.tmp"` therefore lets two builders mkfs/resize the same file
-/// (corruption) and one's rename ENOENT the other's in-flight temp.
-///
-/// Keyed by a fresh UUID — NOT the pid, which is not unique across VMs (separate PID
-/// namespaces reuse the same numbers). The caller atomically renames to `final_path`; because
-/// the bytes are content-addressed, a rename race between builders is idempotent (same result).
-pub(super) fn unique_cache_tmp(final_path: &Path) -> PathBuf {
-    PathBuf::from(format!(
-        "{}.{}.tmp",
-        final_path.display(),
-        uuid::Uuid::new_v4()
-    ))
+/// An owner for the temporaries of one image-cache operation, so a SIGKILLed one leaves
+/// them to the next launch to reclaim (`crate::reclaim`). The temporaries sit in the
+/// shared assets directory, but the record is in this nesting level's data directory,
+/// where its flock is authoritative.
+pub(super) fn temp_owner() -> Result<crate::reclaim::Owner> {
+    crate::reclaim::Owner::begin(&format!("image-temp-{}", uuid::Uuid::new_v4().simple()))
 }
 
 /// Remove podman state files from a storage root, keeping only image/layer data.
@@ -30,6 +18,7 @@ pub(super) fn unique_cache_tmp(final_path: &Path) -> PathBuf {
 /// contain hardcoded paths. When the storage root is mounted at a different path
 /// in the guest, these stale files cause "database graph driver does not match".
 async fn clean_podman_state(dir: &Path, keep: &[&str]) {
+    let mut state = Vec::new();
     if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name();
@@ -37,14 +26,67 @@ async fn clean_podman_state(dir: &Path, keep: &[&str]) {
             if keep.iter().any(|&k| k == name_str.as_ref()) {
                 continue;
             }
-            let path = entry.path();
-            if path.is_dir() {
-                tokio::fs::remove_dir_all(&path).await.ok();
-            } else {
-                tokio::fs::remove_file(&path).await.ok();
-            }
+            state.push(entry.path());
         }
     }
+    if let Err(e) = remove_store_paths(&state).await {
+        warn!("removing podman state from the storage root: {e:#}");
+    }
+}
+
+/// Who reads and removes a temporary podman store's files.
+///
+/// Rootless podman writes a store inside its user namespace: a file a container's uid 0
+/// owns is the invoking user's on the host, and one that any other container uid owns
+/// belongs to a subordinate id. The invoking user can neither read a directory such a
+/// file makes private (`/var/cache/apt/archives/partial` in ubuntu:24.04, mode 0700 and
+/// owned by `_apt`) nor unlink anything inside a directory a subordinate id owns. Run in
+/// that user namespace, through `podman unshare`, the same command sees the container
+/// ids as podman wrote them and has every permission over them, so mkfs.ext4 can copy
+/// the whole store and records the container ids, as it does for a store built by root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StoreReader {
+    /// The calling process, for a directory the caller owns (`--disk-dir`).
+    Caller,
+    /// The user namespace the store was written in: rootless podman's, or the caller's
+    /// own when it is root.
+    PodmanUserNamespace,
+}
+
+impl StoreReader {
+    /// `program`, run as this reader.
+    fn command(self, program: &str) -> tokio::process::Command {
+        if self == StoreReader::PodmanUserNamespace && !nix::unistd::geteuid().is_root() {
+            let mut command = tokio::process::Command::new("podman");
+            command.args(["unshare", program]);
+            command
+        } else {
+            tokio::process::Command::new(program)
+        }
+    }
+}
+
+/// Remove `paths`, files or directory trees of a temporary podman store, as the user
+/// namespace that wrote them (see [`StoreReader`]).
+async fn remove_store_paths(paths: &[PathBuf]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let output = StoreReader::PodmanUserNamespace
+        .command("rm")
+        .arg("-rf")
+        .arg("--")
+        .args(paths)
+        .output()
+        .await
+        .with_context(|| format!("running rm -rf {paths:?}"))?;
+    if !output.status.success() {
+        bail!(
+            "rm -rf {paths:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Validate that a Docker archive contains manifest.json.
@@ -168,12 +210,24 @@ fn parse_image_cache_ref(image: &str, stdout: &str) -> Result<ImageCacheRef> {
 ///
 /// `repo_tag` may contain a `:` (e.g. `localhost/foo:latest`); skopeo treats everything
 /// after the archive path as the reference, so the colon is preserved.
-pub async fn export_image_archive(image_id: &str, repo_tag: &str, dest: &Path) -> Result<()> {
+///
+/// `holder`, when given, keeps the owner of `dest` live while skopeo runs
+/// (`crate::reclaim::Holder`).
+pub async fn export_image_archive(
+    image_id: &str,
+    repo_tag: &str,
+    dest: &Path,
+    holder: Option<&crate::reclaim::Holder>,
+) -> Result<()> {
     let dest_str = dest
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("archive path is not valid UTF-8: {}", dest.display()))?;
 
-    let output = tokio::process::Command::new("skopeo")
+    let mut skopeo = tokio::process::Command::new("skopeo");
+    if let Some(holder) = holder {
+        holder.hold_in(&mut skopeo);
+    }
+    let output = skopeo
         .args([
             "copy",
             &format!(
@@ -298,9 +352,30 @@ pub(super) async fn create_disk_from_dir(
     source_dir: &std::path::Path,
     output_path: &std::path::Path,
     shrink: bool,
+    holder: Option<&crate::reclaim::Holder>,
 ) -> Result<()> {
+    create_disk_from_dir_as(source_dir, output_path, shrink, StoreReader::Caller, holder).await
+}
+
+/// [`create_disk_from_dir`], reading `source_dir` as `reader`.
+async fn create_disk_from_dir_as(
+    source_dir: &std::path::Path,
+    output_path: &std::path::Path,
+    shrink: bool,
+    reader: StoreReader,
+    holder: Option<&crate::reclaim::Holder>,
+) -> Result<()> {
+    // Each helper runs as `reader` and keeps the owner of `output_path` live while it runs,
+    // when it has one.
+    let command = |program: &str| {
+        let mut command = reader.command(program);
+        if let Some(holder) = holder {
+            holder.hold_in(&mut command);
+        }
+        command
+    };
     // Calculate directory size for ext4 image sizing
-    let dir_size = tokio::process::Command::new("du")
+    let dir_size = command("du")
         .args(["-sb", source_dir.to_str().unwrap()])
         .output()
         .await
@@ -327,7 +402,7 @@ pub(super) async fn create_disk_from_dir(
     );
 
     // Create sparse file
-    let truncate_status = tokio::process::Command::new("truncate")
+    let truncate_status = command("truncate")
         .args(["-s", &image_size.to_string(), output_path.to_str().unwrap()])
         .status()
         .await
@@ -342,7 +417,7 @@ pub(super) async fn create_disk_from_dir(
 
     // Format as ext4 and populate from source directory in one step.
     // Uses mkfs.ext4 -d which doesn't require root (no mount/loop device needed).
-    let mkfs = tokio::process::Command::new("mkfs.ext4")
+    let mkfs = command("mkfs.ext4")
         .args([
             "-q",
             "-F",
@@ -365,7 +440,7 @@ pub(super) async fn create_disk_from_dir(
         // Shrink the filesystem to its minimum size. The sparse file was deliberately
         // oversized to ensure mkfs.ext4 had enough space; resize2fs -M reclaims the slack.
         // Only used for read-only images; read-write images need the free space.
-        let resize = tokio::process::Command::new("resize2fs")
+        let resize = command("resize2fs")
             .args(["-M", output_path.to_str().unwrap()])
             .output()
             .await
@@ -396,10 +471,11 @@ const RUNROOT_PARENT: &str = "/tmp";
 
 const RUNROOT_PREFIX: &str = "fcvm-rr-";
 
-/// Random characters tempfile appends to `RUNROOT_PREFIX`.
-const RUNROOT_RANDOM_CHARS: usize = 6;
+/// Characters of the UUID that names a runroot: a simple UUID, so the name is this
+/// store's alone and can be recorded before it exists (`crate::reclaim`).
+const RUNROOT_RANDOM_CHARS: usize = 32;
 
-// `/tmp/fcvm-rr-XXXXXX` is 19 bytes. A change here that stops it fitting fails the build.
+// `/tmp/fcvm-rr-<32 hex>` is 45 bytes. A change here that stops it fitting fails the build.
 const _: () = assert!(
     RUNROOT_PARENT.len() + 1 + RUNROOT_PREFIX.len() + RUNROOT_RANDOM_CHARS <= PODMAN_RUNROOT_LIMIT
 );
@@ -423,25 +499,61 @@ const _: () = assert!(
 /// files, the mount record and the overlay driver's feature checks, a few kilobytes.
 struct TempStore {
     graphroot: PathBuf,
-    runroot: tempfile::TempDir,
+    runroot: Runroot,
+    /// Keeps the owner of the store's temporaries live while a podman of it runs.
+    holder: Option<crate::reclaim::Holder>,
+}
+
+/// A temporary store's runroot, removed when this is dropped.
+struct Runroot(PathBuf);
+
+impl Runroot {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Runroot {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!(runroot = %self.0.display(), %error, "removing a podman runroot");
+            }
+        }
+    }
 }
 
 impl TempStore {
-    fn new(graphroot: &Path) -> Result<Self> {
-        let runroot = tempfile::Builder::new()
-            .prefix(RUNROOT_PREFIX)
-            .rand_bytes(RUNROOT_RANDOM_CHARS)
-            .tempdir_in(RUNROOT_PARENT)
-            .with_context(|| format!("creating a podman runroot under {RUNROOT_PARENT}"))?;
+    /// A store at `graphroot` with a new runroot. With `temps`, the runroot is recorded
+    /// with that owner before it exists, and every podman of the store keeps the owner
+    /// live while it runs.
+    fn new(graphroot: &Path, temps: Option<&crate::reclaim::Owner>) -> Result<Self> {
+        let path = Path::new(RUNROOT_PARENT)
+            .join(format!("{RUNROOT_PREFIX}{}", uuid::Uuid::new_v4().simple()));
+        let holder = match temps {
+            Some(temps) => {
+                temps.record(crate::reclaim::Resource::Temp { path: path.clone() })?;
+                Some(temps.holder()?)
+            }
+            None => None,
+        };
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .with_context(|| format!("creating podman runroot {}", path.display()))?;
         Ok(Self {
             graphroot: graphroot.to_path_buf(),
-            runroot,
+            runroot: Runroot(path),
+            holder,
         })
     }
 
     /// `podman` aimed at this store.
     fn podman(&self) -> tokio::process::Command {
         let mut podman = tokio::process::Command::new("podman");
+        if let Some(holder) = &self.holder {
+            holder.hold_in(&mut podman);
+        }
         podman
             .arg("--root")
             .arg(&self.graphroot)
@@ -455,8 +567,12 @@ impl TempStore {
 /// Load `archive` into a new temporary store at `graphroot` and return what podman
 /// printed. The store's runroot exists only inside this function, so it is removed on
 /// every way out of it.
-async fn load_into_temp_store(graphroot: &Path, archive: &Path) -> Result<String> {
-    let store = TempStore::new(graphroot)?;
+async fn load_into_temp_store(
+    graphroot: &Path,
+    archive: &Path,
+    temps: &crate::reclaim::Owner,
+) -> Result<String> {
+    let store = TempStore::new(graphroot, Some(temps))?;
     let output = store
         .podman()
         .arg("load")
@@ -472,6 +588,13 @@ async fn load_into_temp_store(graphroot: &Path, archive: &Path) -> Result<String
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Remove a temporary store, logging what could not be removed.
+async fn remove_temp_store(dir: &Path) {
+    if let Err(e) = remove_store_paths(&[dir.to_path_buf()]).await {
+        warn!("removing the temporary podman store: {e:#}");
+    }
 }
 
 /// Build a podman storage image from a Docker archive.
@@ -490,11 +613,40 @@ pub async fn build_storage_image(
         .ok_or_else(|| anyhow::anyhow!("output_path has no parent directory"))?;
 
     // Temp paths are UUID-keyed because the image-cache dir is shared across VMs and the
-    // per-digest flock does not coordinate cross-VM (see `unique_cache_tmp`). A shared
+    // per-digest flock does not coordinate cross-VM (see `crate::setup::store_temp_path`). A shared
     // "tmp-storage-{pid}" would collide too — separate PID namespaces reuse pid numbers.
     let tmp_dir = cache_dir.join(format!("tmp-storage-{}", uuid::Uuid::new_v4()));
+    let tmp_img = crate::setup::store_temp_path(output_path);
 
-    tokio::fs::create_dir_all(&tmp_dir)
+    // Both temporaries are recorded before they exist, so a SIGKILLed build leaves them
+    // to the next launch to reclaim (crate::reclaim). Completing the owner removes
+    // whatever the build did not remove or rename into place.
+    let temps = temp_owner()?;
+    for path in [&tmp_dir, &tmp_img] {
+        temps.record(crate::reclaim::Resource::Temp { path: path.clone() })?;
+    }
+    let built = build_storage_image_in(archive_path, output_path, &tmp_dir, &tmp_img, &temps).await;
+    complete_temps(temps).await;
+    built
+}
+
+/// Complete an owner of image-cache temporaries. A temporary that cannot be removed does
+/// not fail the operation, as it did not before it was recorded: it stays recorded, and
+/// the next launch tries again.
+pub(super) async fn complete_temps(temps: crate::reclaim::Owner) {
+    if let Err(error) = temps.complete().await {
+        warn!(error = %format!("{error:#}"), "image-cache temporaries remain");
+    }
+}
+
+async fn build_storage_image_in(
+    archive_path: &Path,
+    output_path: &Path,
+    tmp_dir: &Path,
+    tmp_img: &Path,
+    temps: &crate::reclaim::Owner,
+) -> Result<()> {
+    tokio::fs::create_dir_all(tmp_dir)
         .await
         .context("creating temp storage dir")?;
 
@@ -505,10 +657,10 @@ pub async fn build_storage_image(
         tmp_dir.display()
     );
 
-    let loaded_msg = match load_into_temp_store(&tmp_dir, archive_path).await {
+    let loaded_msg = match load_into_temp_store(tmp_dir, archive_path, temps).await {
         Ok(message) => message,
         Err(e) => {
-            tokio::fs::remove_dir_all(&tmp_dir).await.ok();
+            remove_temp_store(tmp_dir).await;
             return Err(e);
         }
     };
@@ -517,27 +669,33 @@ pub async fn build_storage_image(
     // Remove podman state files that contain hardcoded paths from the temp dir.
     // Keep only image/layer data directories. When the guest mounts this read-only
     // at a different path, stale state files cause "database graph driver does not match".
-    clean_podman_state(&tmp_dir, &["overlay", "overlay-images", "overlay-layers"]).await;
+    clean_podman_state(tmp_dir, &["overlay", "overlay-images", "overlay-layers"]).await;
 
     // Package the storage tree as an ext4 image, building into a UUID-keyed temp and
-    // atomically renaming (see `unique_cache_tmp` — a shared "<digest>.tmp" lets two VMs
+    // atomically renaming (see `crate::setup::store_temp_path`: a shared "<digest>.tmp" lets two VMs
     // mkfs/resize2fs the same file and one's rename ENOENTs the other's in-flight temp).
-    let tmp_img = unique_cache_tmp(output_path);
-    let result = create_disk_from_dir(&tmp_dir, &tmp_img, true).await;
+    let result = create_disk_from_dir_as(
+        tmp_dir,
+        tmp_img,
+        true,
+        StoreReader::PodmanUserNamespace,
+        Some(&temps.holder()?),
+    )
+    .await;
 
     // Clean up temp storage dir regardless of result
-    tokio::fs::remove_dir_all(&tmp_dir).await.ok();
+    remove_temp_store(tmp_dir).await;
 
     if let Err(e) = result {
         // Clean up partial .tmp image file on failure
-        tokio::fs::remove_file(&tmp_img).await.ok();
+        tokio::fs::remove_file(tmp_img).await.ok();
         return Err(e).context("creating ext4 image from storage dir");
     }
 
     // Atomic rename to final path
-    if let Err(e) = tokio::fs::rename(&tmp_img, output_path).await {
+    if let Err(e) = tokio::fs::rename(tmp_img, output_path).await {
         // Clean up .tmp image file if rename fails
-        tokio::fs::remove_file(&tmp_img).await.ok();
+        tokio::fs::remove_file(tmp_img).await.ok();
         return Err(e).context("renaming storage image to final path");
     }
 
@@ -603,8 +761,8 @@ mod tests {
         // #944: with only a graphroot, the temporary store shares the default runroot and
         // erases the mount records of the default store's running containers.
         let graphroot = default_graphroot();
-        let first = TempStore::new(&graphroot).unwrap();
-        let second = TempStore::new(&graphroot).unwrap();
+        let first = TempStore::new(&graphroot, None).unwrap();
+        let second = TempStore::new(&graphroot, None).unwrap();
         let podman = first.podman();
         let args: Vec<&std::ffi::OsStr> = podman.as_std().get_args().collect();
 
@@ -626,7 +784,7 @@ mod tests {
 
     #[test]
     fn the_runroot_fits_what_podman_before_5_1_accepts() {
-        let store = TempStore::new(&default_graphroot()).unwrap();
+        let store = TempStore::new(&default_graphroot(), None).unwrap();
         let runroot = store.runroot.path();
         assert!(
             runroot.as_os_str().len() <= PODMAN_RUNROOT_LIMIT,
@@ -639,7 +797,7 @@ mod tests {
 
     #[test]
     fn the_runroot_is_removed_with_the_store() {
-        let store = TempStore::new(&default_graphroot()).unwrap();
+        let store = TempStore::new(&default_graphroot(), None).unwrap();
         let runroot = store.runroot.path().to_path_buf();
         std::fs::create_dir(runroot.join("overlay-layers")).unwrap();
         std::fs::write(runroot.join("overlay-layers/mountpoints.json"), "[]").unwrap();
@@ -764,25 +922,5 @@ mod tests {
             fc_mock.contains("cmd.env(\"XDG_RUNTIME_DIR\""),
             "fc-mock no longer gives podman a runtime directory of its own, so its graphroot needs a runroot"
         );
-    }
-
-    #[test]
-    fn cache_tmp_is_unique_per_call() {
-        // Regression for the cross-VM image-cache race (PR #677): two builders preparing the
-        // same content-addressed file must NOT share a temp name. A fixed "<final>.tmp" let
-        // concurrent VMs (sharing the host image-cache via --map, where flock does not
-        // coordinate) corrupt each other's image and ENOENT each other's rename. The temp
-        // MUST be unique per call.
-        let final_path = Path::new("/mnt/fcvm-btrfs/image-cache/abc123.storage-v2.img");
-        let a = unique_cache_tmp(final_path);
-        let b = unique_cache_tmp(final_path);
-        assert_ne!(a, b, "concurrent builders must get distinct temp paths");
-
-        // It must remain a sibling of the final file (same dir → rename is an atomic
-        // intra-filesystem replace, not a cross-device copy) and carry the final name.
-        assert_eq!(a.parent(), final_path.parent());
-        let a_str = a.to_str().unwrap();
-        assert!(a_str.contains("abc123.storage-v2.img"), "got {a_str}");
-        assert!(a_str.ends_with(".tmp"), "got {a_str}");
     }
 }

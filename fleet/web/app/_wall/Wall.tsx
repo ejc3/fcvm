@@ -1,9 +1,10 @@
 "use client";
 
-// The wall page: a stage, not a dashboard. The image sits letterboxed between
-// the race (countdown and two bars) above and the one button below; everything
-// else is in the Play drawer. The page measures the screen, forwards input as
-// actions, and draws the view model core/ computes. It computes nothing itself.
+// The wall page: the render is the page. The image fills the screen (contain-fit,
+// centred); a row of controls sits over its top and a strip over its bottom, both on
+// scrims, and the controls fade when the pointer rests. Everything else is in the
+// drawer. The page measures the screen, forwards input as actions, and draws the
+// view model core/ computes. It computes nothing itself.
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
@@ -21,6 +22,7 @@ import {
   lightPosition,
   sceneT,
   serverNow,
+  HUD_BAND,
   LIGHT_COLORS,
   wallView,
   type Box,
@@ -30,14 +32,20 @@ import {
 import { canDecodeH264, WallClient } from "./wall-client.ts";
 import { FocusPanel } from "./FocusPanel.tsx";
 import { OwnGpu } from "./OwnGpu.tsx";
-import { Overlays } from "./Overlays.tsx";
+import { HalfClockView, Overlays, WakeCard } from "./Overlays.tsx";
 import { PlayDrawer, VerifyBox } from "./PlayDrawer.tsx";
 import { Reel } from "./Reel.tsx";
-import { Countdown, Scoreboard } from "./Score.tsx";
 import type { DrawSettings } from "./worker-msgs.ts";
 
 const localNow = () => performance.timeOrigin + performance.now();
 const MODE_KEY = "fleet-wall.mode";
+const HINT_KEY = "fleet-wall.hint-seen";
+/** The controls fade after this long with no pointer, key or touch. */
+const IDLE_MS = 3000;
+/** How long the one-time hint stays. */
+const HINT_MS = 4000;
+/** Pointer moves are passed on at most this often (they only refresh the seams' hold). */
+const MOVE_EVERY_MS = 250;
 
 /** A bandwidth budget from ?budget=<Mbit/s>, for trying the q=lo rule on a fast link. */
 function budgetParam(): number | undefined {
@@ -103,6 +111,31 @@ declare global {
 
 type Areas = { mosaic: Box | null; focus: Box | null; own: Box | null };
 
+function PauseIcon({ paused }: { paused: boolean }) {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      {paused ? <path d="M7 4.5v15l13-7.5z" /> : <path d="M6 4h4v16H6zM14 4h4v16h-4z" />}
+    </svg>
+  );
+}
+
+function InfoIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 11v6M12 7.5v.5" />
+    </svg>
+  );
+}
+
+function MenuIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+      <path d="M4 7h16M4 12h16M4 17h16" />
+    </svg>
+  );
+}
+
 function RestartIcon() {
   return (
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -117,6 +150,16 @@ function RestartIcon() {
 export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: string }) {
   const client = useMemo(() => new WallClient(coordUrl), [coordUrl]);
   const poster = useMemo(() => posterUrl(coordUrl), [coordUrl]);
+  // A coordinator with no poster yet (just restarted) answers 404: show no image rather than
+  // the browser's broken-image icon.
+  const [posterFailed, setPosterFailed] = useState(false);
+  // The server-rendered <img> can fail before React attaches onError, so also check it once
+  // mounted: a finished load with no picture is a failure.
+  const posterRef = useRef<HTMLImageElement>(null);
+  useEffect(() => {
+    const el = posterRef.current;
+    if (el && el.complete && el.naturalWidth === 0) setPosterFailed(true);
+  }, [poster]);
   const state = useSyncExternalStore(client.subscribe, client.getState, client.getState);
   const [now, setNow] = useState(0);
   const [canDecode, setCanDecode] = useState(true);
@@ -140,6 +183,54 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   const gridRefs = useRef(new Map<string, HTMLButtonElement>());
   const returnFocus = useRef<HTMLElement | null>(null);
   const playButtonRef = useRef<HTMLButtonElement | null>(null);
+  const lastMoveSent = useRef(0);
+  const [idle, setIdle] = useState(false);
+  const [hint, setHint] = useState<"unseen" | "showing" | "seen">("seen");
+
+  // The controls fade when nothing moves for IDLE_MS, and come back on any pointer move,
+  // key or touch; never while one of them has focus.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const wake = () => {
+      setIdle(false);
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        if (document.activeElement?.closest("[data-hud]")) return;
+        setIdle(true);
+      }, IDLE_MS);
+    };
+    wake();
+    const events = ["pointermove", "pointerdown", "keydown", "wheel", "touchstart", "focusin"] as const;
+    for (const e of events) window.addEventListener(e, wake, { passive: true });
+    return () => {
+      if (timer) clearTimeout(timer);
+      for (const e of events) window.removeEventListener(e, wake);
+    };
+  }, []);
+
+  // "Click a square" is said once per browser, the first time the pointer is over the image.
+  useEffect(() => {
+    try {
+      if (window.localStorage.getItem(HINT_KEY) === null) setHint("unseen");
+    } catch {
+      setHint("unseen");
+    }
+  }, []);
+  const overImage = state.ui.pointerOverImage;
+  useEffect(() => {
+    if (hint !== "unseen" || !overImage) return;
+    setHint("showing");
+    try {
+      window.localStorage.setItem(HINT_KEY, "1");
+    } catch {
+      // Not remembered: it shows once more on the next visit.
+    }
+  }, [hint, overImage]);
+  useEffect(() => {
+    if (hint !== "showing") return;
+    const id = setTimeout(() => setHint("seen"), HINT_MS);
+    return () => clearTimeout(id);
+  }, [hint]);
 
   // Clock, capability, connection.
   useEffect(() => {
@@ -343,7 +434,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
       longPress:
         e.pointerType === "touch" && tile
           ? setTimeout(() => {
-              client.ui({ hoverId: tile.id, pointerOverImage: true });
+              client.ui({ hoverId: tile.id, pointerOverImage: true, longPress: true });
               if (press.current) {
                 press.current.longPress = null;
                 press.current.long = true;
@@ -367,7 +458,12 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
     const tile = tileUnder(e.clientX, e.clientY);
     const over = imagePoint(e.clientX, e.clientY) !== null;
     const s = client.getState().ui;
-    if (s.hoverId !== (tile?.id ?? null) || s.pointerOverImage !== over) client.ui({ hoverId: tile?.id ?? null, pointerOverImage: over });
+    const at = localNow();
+    const refresh = over && at - lastMoveSent.current >= MOVE_EVERY_MS;
+    if (s.hoverId !== (tile?.id ?? null) || s.pointerOverImage !== over || refresh) {
+      if (over) lastMoveSent.current = at;
+      client.ui({ hoverId: tile?.id ?? null, pointerOverImage: over, ...(over ? { pointerMovedAt: at } : {}) });
+    }
   };
 
   const endPointer = (e: React.PointerEvent, cancelled: boolean) => {
@@ -376,7 +472,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
     if (d.longPress) clearTimeout(d.longPress);
     press.current = null;
     if (d.long) {
-      client.ui({ hoverId: null, pointerOverImage: false });
+      client.ui({ hoverId: null, pointerOverImage: false, longPress: false });
       return;
     }
     if (d.moved || cancelled) return;
@@ -476,10 +572,12 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
       onPointerLeave={onPointerLeave}
       onContextMenu={(e) => e.preventDefault()}
     >
-      {poster ? (
+      {poster && !posterFailed ? (
         <img
           className={`poster${painted ? " gone" : ""}`}
+          ref={posterRef}
           src={poster}
+          onError={() => setPosterFailed(true)}
           alt=""
           aria-hidden="true"
           data-testid="poster"
@@ -495,6 +593,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
           reel={view.reel}
           onDone={reelDone}
           box={{ left: view.plan.image.x - areas.mosaic.x, top: view.plan.image.y - areas.mosaic.y, width: view.plan.image.w, height: view.plan.image.h }}
+          badgeTop={phone ? 10 : Math.max(10, HUD_BAND - (view.plan.image.y - areas.mosaic.y))}
         />
       ) : null}
     </div>
@@ -526,7 +625,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
     </div>
   ) : null;
 
-  const restart = score ? (
+  const restart = score && !score.button.hidden ? (
     <div className="restart">
       <button
         type="button"
@@ -539,13 +638,63 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
         <RestartIcon />
         {score.button.label}
       </button>
-      <span className="note" id="restart-note" data-testid="restart-note">
-        {score.button.note}
-      </span>
+      {score.button.note ? (
+        <span className="note" id="restart-note" data-testid="restart-note">
+          {score.button.note}
+        </span>
+      ) : null}
     </div>
   ) : null;
 
+  const openDrawer = (section: string | null) => {
+    setDrawerSection(section);
+    client.ui({ drawer: true, lightMode: false });
+  };
+
   const needsVerifyPrompt = view.play?.verify.needed && state.turnstile.queued.length > 0 && !state.ui.drawer;
+
+  const brand = (
+    <div className="brand">
+      <span className="site">{view.site}</span>
+      <h1>{view.title}</h1>
+      {view.live ? (
+        <span className="live-badge" data-testid="live">
+          <span className="dot" aria-hidden="true" />
+          LIVE
+        </span>
+      ) : null}
+    </div>
+  );
+
+  const next = score?.countdown.show ? (
+    <span className={`next${score.countdown.racing ? " racing" : ""}`} data-testid="countdown">
+      <span className="label">{score.countdown.label}</span> <span className="value" data-testid="countdown-value">{score.countdown.value}</span>
+    </span>
+  ) : null;
+
+  // While a race runs the strip says who started it (the clocks are on the image); after
+  // its result card, one line says how the last race went.
+  const racing = view.race !== null;
+  const info = (
+    <div className="info">
+      {view.race?.label ? (
+        <span className="next racing" data-testid="countdown">
+          {view.race.label}
+        </span>
+      ) : null}
+      {!racing && view.lastRace ? (
+        <span className="last-race" data-testid="last-race">
+          {view.lastRace}
+        </span>
+      ) : null}
+      {!racing ? next : null}
+      {view.spec ? (
+        <span className="spec" data-testid="spec">
+          {view.spec}
+        </span>
+      ) : null}
+    </div>
+  );
 
   return (
     <>
@@ -553,35 +702,53 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
       {phone ? (
         <div className="phone" data-version={view.version} style={covered ? { visibility: "hidden" } : undefined}>
           <header>
-            <span className="site">{view.site}</span>
-            <h1>{view.title}</h1>
-            <p className="sentence">{view.sentence}</p>
+            {brand}
+            <button type="button" className="icon-btn" aria-label="About this page" data-testid="menu" onClick={() => openDrawer("about")}>
+              <MenuIcon />
+            </button>
           </header>
-          {score ? <Countdown score={score} counter={view.counter} /> : null}
-          {score ? <Scoreboard score={score} compact /> : null}
           {stage}
+          {view.race && view.race.clocks.length > 0 ? (
+            <div className="race-row">
+              {view.race.clocks.map((c) => (
+                <HalfClockView key={c.half} c={c} />
+              ))}
+            </div>
+          ) : null}
+          {view.sleep ? <WakeCard sleep={view.sleep} /> : null}
+          {view.race?.end ? (
+            <p className="end-line" data-testid="end-card">
+              {view.race.end}
+            </p>
+          ) : null}
+          {info}
           <p className="rotate-hint" data-testid="rotate-hint">
             {view.rotateHint}
           </p>
           {view.play ? (
-            <button type="button" className="link play-link" data-testid="phone-play" aria-expanded={view.playButton.open} onClick={() => client.ui({ drawer: true, lightMode: false })}>
+            <button type="button" className="link play-link" data-testid="phone-play" aria-expanded={view.playButton.open} onClick={() => openDrawer(null)}>
               {view.playButton.phoneLabel}
             </button>
           ) : null}
           <div className="dock">{restart}</div>
         </div>
       ) : (
-        <main className={`wall${state.ui.returning ? " arrive" : ""}`} data-version={view.version} style={covered ? { visibility: "hidden" } : undefined}>
-          <header className="top">
-            <div className="brand">
-              <span className="site">{view.site}</span>
-              <h1>{view.title}</h1>
-              <p className="sentence" data-testid="sentence">{view.sentence}</p>
-            </div>
-            <div className="actions">
+        <main className={`wall${state.ui.returning ? " arrive" : ""}${idle ? " idle" : ""}`} data-version={view.version} style={covered ? { visibility: "hidden" } : undefined}>
+          {stage}
+          <header className="hud-top" data-hud="">
+            {brand}
+            <div className="actions fades">
               {view.viewers ? <span className="viewers" data-testid="viewers">{view.viewers}</span> : null}
-              <button type="button" className="btn" aria-pressed={view.pause.on} onClick={() => client.ui({ paused: !view.pause.on })} data-testid="pause">
-                {view.pause.label}
+              <button
+                type="button"
+                className="icon-btn"
+                aria-pressed={view.pause.on}
+                aria-label={view.pause.label}
+                title={view.pause.label}
+                onClick={() => client.ui({ paused: !view.pause.on })}
+                data-testid="pause"
+              >
+                <PauseIcon paused={view.pause.on} />
               </button>
               {view.play ? (
                 <button
@@ -600,46 +767,38 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
               ) : null}
               {view.ownButton ? (
                 <span className="own-btn">
-                  <button type="button" className="btn accent" disabled={view.ownButton.disabled} onClick={(e) => getOwnGpu(e.currentTarget)} data-testid="own-gpu">
+                  <button type="button" className="btn accent" disabled={view.ownButton.disabled} onClick={(e) => getOwnGpu(e.currentTarget)} data-testid="own-gpu" title={view.ownButton.note}>
                     {view.ownButton.label}
                   </button>
-                  <span className="note" data-testid="own-note">{view.ownButton.note}</span>
+                  {view.ownButton.disabled ? <span className="note" data-testid="own-note">{view.ownButton.note}</span> : null}
                 </span>
               ) : null}
+              <button type="button" className="icon-btn" aria-label={view.isolation.open} title={view.isolation.open} onClick={() => openDrawer("isolation")} data-testid="isolation-link">
+                <InfoIcon />
+              </button>
+              <button type="button" className="icon-btn" aria-label="About this page" title="About this page" onClick={() => openDrawer("about")} data-testid="menu">
+                <MenuIcon />
+              </button>
             </div>
           </header>
-          {score ? (
-            <section className="score" aria-label="The race">
-              <Countdown
-                score={score}
-                counter={view.counter}
-                isolation={{
-                  label: view.isolation.open,
-                  onOpen: () => {
-                    setDrawerSection("isolation");
-                    client.ui({ drawer: true, lightMode: false });
-                  },
-                }}
-              />
-              <Scoreboard score={score} compact={false} />
-            </section>
-          ) : (
-            <section className="score" aria-hidden="true" />
-          )}
-          {stage}
-          <footer className="bottom">
-            {restart}
-            <ol className="feed" aria-label="Recent actions" data-testid="feed">
-              {view.feed.map((a) => (
-                <li key={a.key}>
-                  {a.text} <span className="when">{a.when}</span>
-                </li>
-              ))}
-            </ol>
-            <span className="help">{view.help}</span>
+          <footer className="hud-bottom" data-hud="">
+            <div className="strip">
+              <div className="fades">{restart}</div>
+              {info}
+            </div>
           </footer>
         </main>
       )}
+      {view.toast && !covered ? (
+        <div className="toast" key={view.toast.key} data-testid="toast" role="status">
+          {view.toast.text}
+        </div>
+      ) : null}
+      {hint === "showing" && !covered && !phone ? (
+        <div className="hint" data-testid="hint">
+          {view.hint}
+        </div>
+      ) : null}
       <Overlays view={view} phone={phone} />
       {keyGrid}
       {state.ui.drawer && view.play && !covered ? <PlayDrawer client={client} view={view} onClose={closeDrawer} section={drawerSection} /> : null}

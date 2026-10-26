@@ -1005,6 +1005,18 @@ async fn cleanup_failed_prepare(
     if let Err(e) = tokio::fs::remove_dir_all(data_dir).await {
         warn!(vm_id = %vm_id, error = %e, "failed to remove VM data directory after setup error");
     }
+    if let Err(e) = crate::reclaim::complete(vm_id).await {
+        warn!(vm_id = %vm_id, error = %format!("{e:#}"), "failed to reclaim the VM's resources after setup error");
+    }
+}
+
+/// End the owner of a launch that a cache hit served, which made nothing of its own
+/// beyond what its record lists. A failure here does not fail the run that already
+/// finished: what remains stays recorded for the next launch.
+async fn complete_unused_owner(owner: crate::reclaim::Owner) {
+    if let Err(e) = owner.complete().await {
+        warn!(error = %format!("{e:#}"), "resources of a launch served from a snapshot remain");
+    }
 }
 
 pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
@@ -1105,9 +1117,9 @@ async fn export_localhost_image_disk(
         // Export into a UUID-keyed temp, then atomically rename. This avoids corrupt
         // archives from interrupted exports AND is safe under cross-VM concurrency: the
         // image-cache dir is shared across VMs and the per-digest flock above does not
-        // coordinate cross-VM (see image::unique_cache_tmp). A shared "<digest>.tmp"
+        // coordinate cross-VM (see crate::setup::store_temp_path). A shared "<digest>.tmp"
         // would let one VM's rename ENOENT the other's in-flight export.
-        let tmp_path = image::unique_cache_tmp(&archive_path);
+        let tmp_path = crate::setup::store_temp_path(&archive_path);
 
         // Export by the IMMUTABLE image ID captured at inspect time, not the mutable
         // tag (#598). A parallel build can repoint the tag between the cache-key
@@ -1118,18 +1130,27 @@ async fn export_localhost_image_disk(
         let image_id = localhost_image_id.ok_or_else(|| {
             anyhow::anyhow!("internal: localhost image id was not captured at inspect time")
         })?;
-        if let Err(e) = image::export_image_archive(image_id, &args.image, &tmp_path).await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
+        // A UUID-keyed orphan is never overwritten by the next run, so the temp is
+        // recorded before it exists and a SIGKILLed export leaves it to the next launch
+        // to reclaim (crate::reclaim).
+        let temps = image::temp_owner()?;
+        temps.record(crate::reclaim::Resource::Temp {
+            path: tmp_path.clone(),
+        })?;
+        let exported = async {
+            image::export_image_archive(image_id, &args.image, &tmp_path, Some(&temps.holder()?))
+                .await?;
+            // Atomic rename within the same filesystem
+            tokio::fs::rename(&tmp_path, &archive_path)
+                .await
+                .context("renaming exported archive to final path")
+        }
+        .await;
+        // Removes the temp when the export or the rename failed.
+        image::complete_temps(temps).await;
+        if let Err(e) = exported {
             drop(lock_file);
             return Err(e);
-        }
-
-        // Atomic rename within the same filesystem
-        if let Err(e) = tokio::fs::rename(&tmp_path, &archive_path).await {
-            // Clean up the UUID-keyed temp — unlike the old fixed-name temp, a UUID
-            // orphan is never overwritten by the next run.
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(e).context("renaming exported archive to final path");
         }
 
         info!(path = %archive_path.display(), "Image exported as Docker archive");
@@ -1519,12 +1540,14 @@ async fn prepare_vm_for_lifecycle(
         let profile_name = args.kernel_profile.as_deref().unwrap_or("default");
         let module_type = crate::setup::profile_module_type(profile_name)?;
         for sbdf in &args.gpu {
-            crate::gpu::check_host_device(
+            // The lease is released at once: this VM cold-boots without the GPU,
+            // and the restore that attaches it takes its own lease and checks again.
+            drop(crate::gpu::check_host_device(
                 Path::new("/sys"),
                 Path::new("/dev"),
                 &crate::gpu::scrub::state_dir(),
                 sbdf,
-            )?;
+            )?);
             crate::gpu::check_driver_supports_device(
                 Path::new("/sys"),
                 sbdf,
@@ -1539,10 +1562,19 @@ async fn prepare_vm_for_lifecycle(
     // value cannot diverge on a mid-launch resolv.conf change (#863).
     let boot_inputs = GuestBootInputs::resolve(args.dns.as_deref(), &runtime_config);
 
+    // What VMs of processes killed without teardown left on the host goes first.
+    crate::reclaim::reclaim_abandoned().await;
     // Generated before the snapshot key so the staging path of a read-only --disk-dir
     // is in this VM's data directory, which teardown removes.
     let vm_id = generate_vm_id();
     let vm_name = args.name.clone();
+    // The data directory outlives this process unless teardown removes it, so it is
+    // recorded before anything creates it, and a SIGKILLed run leaves it to the next
+    // launch to reclaim (crate::reclaim).
+    let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
+    reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
+        path: paths::vm_runtime_dir(&vm_id),
+    })?;
 
     // Resolve the extra disks for the snapshot key ONCE: the key carries each read-only
     // --disk-dir's content hash, taken in place, so a cache hit copies nothing. A cold
@@ -1608,6 +1640,7 @@ async fn prepare_vm_for_lifecycle(
                     generation_id = %prepared.output.generation_id,
                     "Prepared startup snapshot hit"
                 );
+                complete_unused_owner(reclaim_owner).await;
                 return Ok(VmPreparation::Prepared(prepared));
             }
             prepare_target = Some(target);
@@ -1636,7 +1669,10 @@ async fn prepare_vm_for_lifecycle(
             );
             let attempt = super::snapshot::cmd_snapshot_run_attempt(snapshot_args).await;
             match attempt.result {
-                Ok(()) => return Ok(VmPreparation::RunCompleted),
+                Ok(()) => {
+                    complete_unused_owner(reclaim_owner).await;
+                    return Ok(VmPreparation::RunCompleted);
+                }
                 Err(e) if is_snapshot_load_failure(&e) => {
                     invalidate_unusable_snapshot(&startup_key, attempt.generation.as_ref(), &e)
                         .await;
@@ -1663,7 +1699,10 @@ async fn prepare_vm_for_lifecycle(
             );
             let attempt = super::snapshot::cmd_snapshot_run_attempt(snapshot_args).await;
             match attempt.result {
-                Ok(()) => return Ok(VmPreparation::RunCompleted),
+                Ok(()) => {
+                    complete_unused_owner(reclaim_owner).await;
+                    return Ok(VmPreparation::RunCompleted);
+                }
                 Err(e) if is_snapshot_load_failure(&e) => {
                     invalidate_unusable_snapshot(&key, attempt.generation.as_ref(), &e).await;
                     // fall through to a fresh boot (which re-creates the snapshot)
@@ -2284,6 +2323,7 @@ async fn prepare_vm_for_lifecycle(
         reboot_requested,
         container_exit_seen,
         reboot_spec,
+        reclaim_owner,
     })))
 }
 
@@ -3185,17 +3225,14 @@ fn finish_prepare<T>(operation: Result<T>, cleanup: Result<()>) -> Result<T> {
     }
 }
 
-/// Cancel `gate` on SIGTERM/SIGINT, describing the resulting shutdown as `shutdown_action`.
+/// Request this process's shutdown on SIGTERM/SIGINT, describing it as `shutdown_action`.
 ///
 /// Installed before the VM is created so a signal during the (potentially long) setup phase
 /// is recorded instead of killing the process and leaving host network state, the persisted
 /// VM state file, and the data directory behind. Shutdown is deferred until setup finishes,
-/// then the caller's cleanup runs.
-fn spawn_lifecycle_signal_handler(
-    gate: &super::common::LifecycleReadyGate,
-    shutdown_action: &'static str,
-) -> Result<()> {
-    let gate = gate.clone();
+/// then the caller's cleanup runs. The request cancels every lifecycle gate of the process,
+/// including one a cache-hit restore creates later (`common::request_process_shutdown`).
+fn spawn_lifecycle_signal_handler(shutdown_action: &'static str) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
     tokio::spawn(async move {
@@ -3203,7 +3240,7 @@ fn spawn_lifecycle_signal_handler(
             _ = sigterm.recv() => "SIGTERM",
             _ = sigint.recv() => "SIGINT",
         };
-        gate.cancel();
+        super::common::request_process_shutdown();
         info!("received {signal_name}, {shutdown_action}");
     });
     Ok(())
@@ -3229,7 +3266,7 @@ fn publish_prepared_snapshot_gated(
 pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     let lifecycle_gate = super::common::LifecycleReadyGate::new();
     let cancel = lifecycle_gate.cancellation_token();
-    spawn_lifecycle_signal_handler(&lifecycle_gate, "shutting down VM")?;
+    spawn_lifecycle_signal_handler("shutting down VM")?;
 
     let Some(mut ctx) = prepare_vm(args).await? else {
         return Ok(()); // Snapshot cache hit, already handled
@@ -3277,13 +3314,9 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // The run loop stopped on purpose right after producing the pre-start
     // snapshot: relaunch through the restore path (identical to a cache hit).
     if let Some(snapshot_args) = restore_args {
-        // A signal during the teardown window lands on a token nothing else
-        // checks anymore (cmd_snapshot_run installs fresh handlers) — honor it
-        // here or the "killed" VM would resurrect as a clone.
-        if cancel.is_cancelled() {
-            info!("shutdown requested during snapshot relaunch, not restoring");
-            bail!("interrupted by signal during snapshot relaunch");
-        }
+        // A signal during the teardown window cancelled this process's gates, so
+        // the restore's own gate is created cancelled and it stops before
+        // allocating anything (`common::ShutdownRegistry`).
         return super::snapshot::cmd_snapshot_run(snapshot_args).await;
     }
 
@@ -3306,7 +3339,7 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
     let lifecycle_gate = super::common::LifecycleReadyGate::new();
     let cancel = lifecycle_gate.cancellation_token();
-    spawn_lifecycle_signal_handler(&lifecycle_gate, "cancelling podman prepare")?;
+    spawn_lifecycle_signal_handler("cancelling podman prepare")?;
 
     let lifecycle = PodmanLifecycle::Prepare(PrepareOptions {
         tag: args.tag,
@@ -3602,6 +3635,54 @@ mod tests {
         args.network = NetworkMode::Rootless;
         let restore = snapshot_restore_args(&args, "key", None, (None, None));
         assert_eq!(restore.ipv6_prefix, None);
+    }
+
+    /// #1183: a launch records its runtime directory with its owner before anything in
+    /// it exists (the --disk-dir staging, then the directory itself), and reclaims what
+    /// killed launches left before it records anything. A launch killed in between
+    /// leaves the directory to the next launch only if the record comes first.
+    #[test]
+    fn a_launch_records_its_runtime_dir_before_creating_it() {
+        let source = include_str!("mod.rs");
+        let body = &source[source
+            .find("async fn prepare_vm_for_lifecycle(")
+            .expect("podman's lifecycle")..];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("prepare_vm_for_lifecycle has no {needle:?}"))
+        };
+        let reclaimed = at("crate::reclaim::reclaim_abandoned().await");
+        let owned = at("crate::reclaim::Owner::begin(&vm_id)?");
+        let recorded = at("crate::reclaim::Resource::RuntimeDir {");
+        let staged = at("DiskDirStaging::resolve(");
+        let created = at("tokio::fs::create_dir_all(&data_dir)");
+        assert!(
+            reclaimed < owned && owned < recorded,
+            "the launch must reclaim, then begin its owner, then record"
+        );
+        assert!(
+            recorded < staged && recorded < created,
+            "the runtime directory is created before it is recorded"
+        );
+
+        // The same order in a restore.
+        let source = include_str!("../snapshot.rs");
+        let body = &source[source
+            .find("async fn cmd_snapshot_run_inner(")
+            .expect("snapshot run")..];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("cmd_snapshot_run_inner has no {needle:?}"))
+        };
+        let reclaimed = at("crate::reclaim::reclaim_abandoned().await");
+        let owned = at("crate::reclaim::Owner::begin(&vm_id)?");
+        let recorded = at("crate::reclaim::Resource::RuntimeDir {");
+        let created = at("tokio::fs::create_dir_all(&data_dir)");
+        assert!(
+            reclaimed < owned && owned < recorded && recorded < created,
+            "a restore must reclaim, begin its owner and record its runtime directory, in \
+             that order, before creating the directory"
+        );
     }
 
     /// A refused name claim must remove what the launch created before it, the runtime

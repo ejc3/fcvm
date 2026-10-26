@@ -6,6 +6,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { INTENT_NAMES, parseServerMsg, type FleetState } from "../protocol.ts";
+import { lastRaceLine, wakeMedianMs } from "../view.ts";
 
 type Fixture = { source: { commit: string }; intents: { known: string[]; unknown: string[] }; views: Record<string, Record<string, unknown>> };
 const fixture = JSON.parse(readFileSync(new URL("./fixtures/coordinator.json", import.meta.url), "utf8")) as Fixture;
@@ -78,6 +79,20 @@ describe(`the coordinator's snapshot states (#1146 at ${fixture.source.commit})`
       expect(p.counters?.scrubs).toBe(w["counters"]!["scrubs"]);
       expect(p.viewers.active).toBe(w["viewers"]!["active"]);
     }
+  });
+
+  it("keeps the races and the wakes, so the strip and the asleep line have measured numbers", () => {
+    const sb = parse(fixture.views["15_scoreboard"]!);
+    const wire = fixture.views["15_scoreboard"]!["races"] as { id: number; fcvm: { time_ms: number | null } | null; ec2: { time_ms: number | null } | null }[];
+    expect(sb.races.map((r) => r.id)).toEqual(wire.map((r) => r.id));
+    expect(sb.races.map((r) => r.fcvm?.time_ms ?? null)).toEqual(wire.map((r) => r.fcvm?.time_ms ?? null));
+    expect(sb.races.map((r) => r.ec2?.time_ms ?? null)).toEqual(wire.map((r) => r.ec2?.time_ms ?? null));
+    // With no scoreboard, the newest race the coordinator kept still gives the strip its line.
+    const gen = parse(fixture.views["02_relaunch_generations"]!);
+    expect(lastRaceLine({ ...gen, scoreboard: { fcvm: null, ec2: null } })).toBe("Last race: fcvm back in 4.0 s");
+    const power = parse(fixture.views["20_power"]!).fleet.power;
+    expect(power.wakes).toEqual([{ started_at: 400_000, awake_at: 481_000, gpus: 4 }]);
+    expect(wakeMedianMs(power)).toBe(81_000);
   });
 
   it("the page sends only intents the coordinator knows", () => {

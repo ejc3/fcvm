@@ -16,6 +16,9 @@
 //!   nvidia-container-toolkit release;
 //! - `usr/bin/fcvm-gpu-scrub`, built here from [`GPU_SCRUB_SOURCE`], which
 //!   fc-agent runs to zero the GPUs' memory before a container gets them.
+//! - `usr/bin/cuda-checkpoint`, NVIDIA's pinned checkpoint utility, which
+//!   fc-agent uses to park a GPU's CUDA processes for a warm GPU snapshot
+//!   (fc-agent/src/gpu_park.rs).
 //!
 //! The modules and the user-space libraries come from one archive, so their
 //! versions match by construction, and the build checks it (`modinfo` version
@@ -60,6 +63,12 @@ pub struct NvidiaDriverConfig {
     /// Which of the `.run`'s kernel modules the image carries.
     #[serde(default)]
     pub module_type: ModuleType,
+    /// NVIDIA's `cuda-checkpoint` binary for this architecture, at a fixed commit
+    /// of github.com/NVIDIA/cuda-checkpoint. It drives the driver's checkpoint API
+    /// through `libcuda.so.1`, so the image's driver decides what it supports.
+    pub cuda_checkpoint_url: String,
+    /// SHA-256 of that binary, lowercase hex.
+    pub cuda_checkpoint_sha256: String,
 }
 
 /// The NVIDIA kernel modules a driver image carries. Both come from the same
@@ -111,7 +120,8 @@ impl ModuleType {
     /// configuration was measured with on Turing only; they are allowed on Turing
     /// and Ampere, and refused on anything later (Blackwell has no proprietary
     /// module support at all). The ranges cover exactly the Turing and Ampere
-    /// entries of the driver's `supported-gpus.json` (580.196.07): Turing
+    /// entries of the driver's `supported-gpus.json` (580.196.07 and 595.112.07
+    /// list the same ones): Turing
     /// 0x1E00-0x1FFF and 0x2180-0x21FF, Ampere 0x2080-0x20FF, 0x2200-0x22FF and
     /// 0x2400-0x25FF. Volta (0x1Dxx), Hopper (0x23xx), Ada (0x26xx-0x28xx) and
     /// Blackwell (0x29xx and up) fall outside them.
@@ -164,6 +174,7 @@ impl NvidiaDriverConfig {
         for (name, value) in [
             ("driver_sha256", &self.driver_sha256),
             ("toolkit_sha256", &self.toolkit_sha256),
+            ("cuda_checkpoint_sha256", &self.cuda_checkpoint_sha256),
         ] {
             if !is_sha256(value) {
                 bail!("nvidia.{name} must be 64 lowercase hexadecimal characters, got {value:?}");
@@ -172,6 +183,7 @@ impl NvidiaDriverConfig {
         for (name, value) in [
             ("driver_url", &self.driver_url),
             ("toolkit_url", &self.toolkit_url),
+            ("cuda_checkpoint_url", &self.cuda_checkpoint_url),
         ] {
             let safe = value.starts_with("https://")
                 && value
@@ -245,6 +257,7 @@ fetch_verified() {
 }
 fetch_verified "$NV_DRIVER_URL" "$NV_DRIVER_SHA256" "$NV_DIR/driver-$NV_DRIVER_VERSION.run"
 fetch_verified "$NV_TOOLKIT_URL" "$NV_TOOLKIT_SHA256" "$NV_DIR/toolkit-$NV_TOOLKIT_VERSION.tar.gz"
+fetch_verified "$NV_CUDA_CHECKPOINT_URL" "$NV_CUDA_CHECKPOINT_SHA256" "$NV_DIR/cuda-checkpoint-$NV_CUDA_CHECKPOINT_SHA256"
 
 rm -rf "$NV_DIR/driver" "$NV_DIR/toolkit" "$NV_ROOT"
 sh "$NV_DIR/driver-$NV_DRIVER_VERSION.run" --extract-only --target "$NV_DIR/driver" >/dev/null
@@ -330,13 +343,15 @@ if [[ "$(printf '%s\nGLIBC_2.34\n' "$newest_glibc" | sort -V | tail -1)" != "GLI
     echo "ERROR: fcvm-gpu-scrub needs $newest_glibc, newer than GLIBC_2.34" >&2
     exit 1
 fi
+# cuda-checkpoint, for warm GPU snapshots.
+install -m 0755 "$NV_DIR/cuda-checkpoint-$NV_CUDA_CHECKPOINT_SHA256" "$NV_ROOT/usr/bin/cuda-checkpoint"
 
 for required in \
     "$MODDIR/nvidia.ko" "$MODDIR/nvidia-uvm.ko" \
     "$LIBDIR/libcuda.so.$NV_DRIVER_VERSION" "$LIBDIR/libcuda.so.1" \
     "$LIBDIR/libnvidia-ml.so.$NV_DRIVER_VERSION" "$LIBDIR/libnvidia-ml.so.1" \
     "$NV_ROOT/usr/bin/nvidia-smi" "$NV_ROOT/usr/bin/nvidia-ctk" "$NV_ROOT/usr/bin/nvidia-cdi-hook" \
-    "$NV_ROOT/usr/bin/fcvm-gpu-scrub"; do
+    "$NV_ROOT/usr/bin/cuda-checkpoint" "$NV_ROOT/usr/bin/fcvm-gpu-scrub"; do
     if [[ ! -e "$required" ]]; then
         echo "ERROR: driver image is missing $required" >&2
         exit 1
@@ -392,6 +407,7 @@ fn stage_header(
     format!(
         "NV_DRIVER_VERSION=\"{}\"\nNV_DRIVER_URL=\"{}\"\nNV_DRIVER_SHA256=\"{}\"\n\
          NV_TOOLKIT_VERSION=\"{}\"\nNV_TOOLKIT_URL=\"{}\"\nNV_TOOLKIT_SHA256=\"{}\"\n\
+         NV_CUDA_CHECKPOINT_URL=\"{}\"\nNV_CUDA_CHECKPOINT_SHA256=\"{}\"\n\
          NV_LIB_TRIPLET=\"{}\"\nNV_IMAGE_TMP=\"{}\"\n\
          NV_MODULE_SRC=\"{}\"\nNV_MODULE_PARAMS=\"{}\"\nNV_SCRUB_SOURCE=\"{}\"\n",
         config.driver_version,
@@ -400,6 +416,8 @@ fn stage_header(
         config.toolkit_version,
         config.toolkit_url,
         config.toolkit_sha256,
+        config.cuda_checkpoint_url,
+        config.cuda_checkpoint_sha256,
         triplet,
         image_tmp.display(),
         config.module_type.source_dir(),
@@ -431,6 +449,8 @@ pub fn driver_image_key(
         &config.toolkit_url,
         &config.toolkit_sha256,
         config.module_type.as_str(),
+        &config.cuda_checkpoint_url,
+        &config.cuda_checkpoint_sha256,
         DRIVER_IMAGE_STAGE,
         GPU_SCRUB_SOURCE,
     ] {
@@ -732,6 +752,9 @@ mod tests {
                 .to_string(),
             toolkit_sha256: "b".repeat(64),
             module_type: ModuleType::Open,
+            cuda_checkpoint_url: "https://example.invalid/0123abc/bin/x86_64_Linux/cuda-checkpoint"
+                .to_string(),
+            cuda_checkpoint_sha256: "e".repeat(64),
         }
     }
 
@@ -782,6 +805,12 @@ mod tests {
             ("toolkit url for another version", |c| {
                 c.toolkit_version = "1.20.2".to_string()
             }),
+            ("short cuda-checkpoint sha", |c| {
+                c.cuda_checkpoint_sha256 = "e".repeat(63)
+            }),
+            ("quote in cuda-checkpoint url", |c| {
+                c.cuda_checkpoint_url.push('"')
+            }),
         ];
         for (what, mutate) in cases {
             let mut config = pinned();
@@ -808,6 +837,8 @@ mod tests {
             |c: &mut NvidiaDriverConfig| c.toolkit_url.push('1'),
             |c: &mut NvidiaDriverConfig| c.toolkit_sha256 = "d".repeat(64),
             |c: &mut NvidiaDriverConfig| c.module_type = ModuleType::Proprietary,
+            |c: &mut NvidiaDriverConfig| c.cuda_checkpoint_url.push('1'),
+            |c: &mut NvidiaDriverConfig| c.cuda_checkpoint_sha256 = "f".repeat(64),
         ] {
             let mut config = pinned();
             mutate(&mut config);
@@ -1112,7 +1143,8 @@ __attribute__((destructor)) static void report(void) {
         let parse = |extra: &str| -> Result<NvidiaDriverConfig, toml::de::Error> {
             toml::from_str(&format!(
                 "driver_version = \"1\"\ndriver_url = \"u\"\ndriver_sha256 = \"s\"\n\
-                 toolkit_version = \"1\"\ntoolkit_url = \"u\"\ntoolkit_sha256 = \"s\"\n{extra}"
+                 toolkit_version = \"1\"\ntoolkit_url = \"u\"\ntoolkit_sha256 = \"s\"\n\
+                 cuda_checkpoint_url = \"u\"\ncuda_checkpoint_sha256 = \"s\"\n{extra}"
             ))
         };
         assert_eq!(parse("").unwrap().module_type, ModuleType::Open);
@@ -1145,6 +1177,44 @@ __attribute__((destructor)) static void report(void) {
         );
         assert!(DRIVER_IMAGE_STAGE.contains(r#"make -C "$NV_DIR/driver/$NV_MODULE_SRC""#));
         assert!(DRIVER_IMAGE_STAGE.contains(r#""$NV_MODULE_PARAMS" > "$MODDIR/nvidia.params""#));
+    }
+
+    /// `snapshot create --gpu-warm` runs the image's cuda-checkpoint on both
+    /// architectures. It supports ARM CPUs from driver 595 and `--device-map` (a warm
+    /// clone on other GPUs than its source's) from 580 (NVIDIA/cuda-checkpoint README),
+    /// so every pinned driver must be at least that on its architecture.
+    #[test]
+    fn every_pinned_driver_supports_warm_gpu_snapshots_on_its_architecture() {
+        let plan: crate::setup::rootfs::Plan =
+            toml::from_str(include_str!("../../rootfs-config.toml")).unwrap();
+        let mut pinned = 0;
+        for (name, arches) in &plan.kernel_profiles {
+            for (arch, profile) in arches {
+                let Some(nvidia) = &profile.nvidia else {
+                    continue;
+                };
+                let minimum = match arch.as_str() {
+                    "arm64" => 595,
+                    "amd64" => 580,
+                    other => panic!("kernel_profiles.{name}.{other}: unknown architecture"),
+                };
+                let major: u32 = nvidia
+                    .driver_version
+                    .split('.')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(
+                    major >= minimum,
+                    "kernel_profiles.{name}.{arch}.nvidia pins driver {}; cuda-checkpoint \
+                     needs {minimum} or later on {arch}",
+                    nvidia.driver_version
+                );
+                pinned += 1;
+            }
+        }
+        assert!(pinned >= 2, "found {pinned} pinned NVIDIA drivers");
     }
 
     #[test]

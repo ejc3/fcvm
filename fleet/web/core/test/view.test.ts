@@ -6,6 +6,9 @@ import {
   TEXT_STYLES,
   wordArgs,
   REPOSITORY_URL,
+  HUD_BAND,
+  SEAM_HOLD_MS,
+  TOAST_MS,
   isolationView,
   REDUCED_MOTION_DARK_FADE_MS,
   needsVerify,
@@ -19,6 +22,7 @@ import {
   type WallInput,
 } from "../view.ts";
 import { suggestMode } from "../mode.ts";
+import { END_CARD_MS } from "../race.ts";
 import { tileAt as tileAtPoint } from "../layout.ts";
 import { familyProbeTargets } from "../net.ts";
 import { parseReelMeta, reelView } from "../reel.ts";
@@ -63,6 +67,8 @@ function race(start: number, over: Partial<RelaunchAll> = {}): RelaunchAll {
     ec2_gpus: 4,
     ec2_capacity_wait_ms: 0,
     ec2_waiting_since: null,
+    fcvm_ms: null,
+    ec2_ms: null,
     ...over,
   };
 }
@@ -99,13 +105,16 @@ describe("the scoreboard at rest", () => {
     expect(sc.fcvm.lastMark).toBeCloseTo(2900 / 71_000, 6);
     expect(sc.fcvm).toMatchObject({ value: "3.0 s", valueLabel: "median of 12 restarts", line: "last restart 2.9 s", measured: "measured on 4 GPUs" });
     expect(sc.ec2).toMatchObject({ value: "50 s", hatchLabel: "last restart: AWS had no spot GPU for 21 s, not counted" });
-    expect(sc.countdown).toMatchObject({ label: "Next restart in", value: "0:41", racing: false });
+    expect(sc.countdown).toMatchObject({ label: "auto in", value: "0:41", racing: false, show: true });
   });
 
   it("shows no number before the coordinator has measured one", () => {
     const sc = view(stateWith(fleet()), EPOCH).score!;
     expect(sc.fcvm).toMatchObject({ value: "--", line: "no restart measured yet", measured: "", solid: 0 });
-    expect(sc.countdown).toMatchObject({ value: "--", note: "none scheduled" });
+    // Nothing scheduled: nothing shown, not a dash.
+    expect(sc.countdown).toMatchObject({ show: false, note: "none scheduled" });
+    // No race measured: the strip falls back to each half's newest single restart, never a dash.
+    expect(view(stateWith(fleet()), EPOCH).lastRace).toBe("Last single restarts: fcvm VM 1 back in 2.8 s · EC2 VM 1 back in 58 s");
   });
 });
 
@@ -170,8 +179,8 @@ describe("the race", () => {
 describe("the one button", () => {
   it("names the GPUs it restarts, waits out the cooldown, and pauses while the coordinator is offline", () => {
     const st = fleet(2, 2, { cooldown_until: EPOCH + 23_000 });
-    expect(view(stateWith(st), EPOCH).score!.button).toEqual({ label: "Restart all 8 GPUs", disabled: true, note: "available again in 0:23" });
-    expect(view(stateWith(st), EPOCH + 23_000).score!.button).toEqual({ label: "Restart all 8 GPUs", disabled: false, note: "" });
+    expect(view(stateWith(st), EPOCH).score!.button).toEqual({ label: "Restart all 8 GPUs", disabled: true, note: "available again in 0:23", hidden: false });
+    expect(view(stateWith(st), EPOCH + 23_000).score!.button).toEqual({ label: "Restart all 8 GPUs", disabled: false, note: "", hidden: false });
     const off = reduce(stateWith(st), { type: "socket", status: "closed", at: EPOCH });
     const v = view(off, EPOCH + 30_000);
     expect(v.score!.button).toMatchObject({ disabled: true, note: "paused while the coordinator is offline" });
@@ -202,6 +211,99 @@ describe("failure states", () => {
     // Two reported hosts, one of them also draining: counted once each.
     v = view(stateWith({ ...st, failures: [{ kind: "host_reclaimed", host: "a", since: EPOCH }, { kind: "host_reclaimed", host: "b", since: EPOCH }, { kind: "coordinator_degraded", host: null, since: EPOCH }], fleet: { ...st.fleet, hosts: [{ name: "a", draining: true }] } }), EPOCH);
     expect(v.banners.find((b) => b.kind === "reclaimed")!.text).toBe("AWS reclaimed 2 fcvm hosts. The image is re-tiled onto the GPUs left.");
+  });
+
+  it("draws the race on the picture: a clock per half, a clock per dark tile, and each relit tile's time", () => {
+    const start = EPOCH + 10_000;
+    const st = fleet(2, 2, { relaunch_all: race(start, { fcvm_done_at: start + 3100, fcvm_pending: 0 }) });
+    for (const t of st.tiles) {
+      if (t.half === "fcvm") {
+        t.last_relaunch = { clicked_at: start, first_frame_at: start + (t.id === "fcvm:1" ? 1500 : 3100), phases: {} };
+      } else {
+        t.last_relaunch = { clicked_at: start, first_frame_at: null, phases: {} };
+        t.phase = t.id === "ec2:1" ? "pending" : "starting";
+      }
+    }
+    const v = view(stateWith(st), start + 5000);
+    const [f, e] = v.race!.clocks;
+    expect(f).toMatchObject({ half: "fcvm", value: "3.1 s", state: "done", sub: "all 4 GPUs back" });
+    expect(e).toMatchObject({ half: "ec2", value: "0:05.0", state: "counting", sub: "+1 s and counting", hatch: "" });
+    // EC2's slowest tile is still getting its instance.
+    expect(e!.steps.map((x) => `${x.label}:${x.state}`)).toEqual(["instance:now", "OS:todo", "driver:todo", "app:todo"]);
+    // Each clock sits low in its own half.
+    const L = v.layout!;
+    expect(f!.x).toBeLessThan(L.halfLineX!);
+    expect(e!.x).toBeGreaterThan(L.halfLineX!);
+    expect(f!.y).toBeGreaterThan(L.image.y + L.image.h / 2);
+    // A dark tile counts; a relit one shows its own time, big for three seconds, then in its corner.
+    const dark = v.tiles.find((t) => t.id === "ec2:2")!;
+    expect(dark).toMatchObject({ dark: true, clock: "0:05.0", chip: null });
+    expect(v.tiles.find((t) => t.id === "fcvm:1")!.chip).toEqual({ text: "1.5 s", fresh: false });
+    expect(view(stateWith(st), start + 4000).tiles.find((t) => t.id === "fcvm:2")!.chip).toEqual({ text: "3.1 s", fresh: true });
+    expect(v.race!.end).toBeNull();
+    // AWS without a spot GPU: EC2's clock stops counting and says how long it did not count.
+    const waiting = fleet(2, 2, { relaunch_all: race(start, { ec2_capacity_wait_ms: 21_000 }) });
+    expect(view(stateWith(waiting), start + 30_000).race!.clocks[1]).toMatchObject({ value: "0:09.0", hatch: "not counting 21 s AWS spent finding a spot GPU" });
+    // fcvm back while EC2's counted time is still under fcvm's: no "+0 s", just how many are back.
+    const behind = fleet(2, 2, { relaunch_all: race(start, { fcvm_done_at: start + 3100, fcvm_pending: 0, ec2_capacity_wait_ms: 4000 }) });
+    expect(view(stateWith(behind), start + 5000).race!.clocks[1]).toMatchObject({ value: "0:01.0", sub: "0 of 4 GPUs back" });
+  });
+
+  it("sizes each half's clock to its own half and keeps the whole card on the image", () => {
+    const start = EPOCH + 10_000;
+    const area = { mosaicArea: { x: 0, y: 0, w: 1600, h: 900 } };
+    // Even halves on a 1600 px image: 9% of the width, 144 px, centred in each half.
+    const even = view(stateWith(fleet(2, 2, { relaunch_all: race(start) })), start + 2000, area).race!.clocks;
+    expect(even.map((c) => Math.round(c.size))).toEqual([144, 144]);
+    expect(even[0]!.x).toBeCloseTo(400, 0);
+    // One fcvm GPU against fifteen EC2: the fcvm half is 100 px. Its figure shrinks to the
+    // floor and its card moves in from the left edge instead of hanging off it.
+    const st = fleetSplit(1, 15, 1);
+    st.relaunch_all = race(start, { fcvm_gpus: 1, fcvm_pending: 1, ec2_gpus: 15, ec2_pending: 15 });
+    const v = view(stateWith(st), start + 2000, area);
+    const L = v.layout!;
+    const f = v.race!.clocks.find((c) => c.half === "fcvm")!;
+    expect(L.halfLineX! - L.image.x).toBeCloseTo(100, 0);
+    expect(f.size).toBeLessThan(56);
+    for (const c of v.race!.clocks) {
+      expect(c.x - c.width / 2, c.half).toBeGreaterThanOrEqual(L.image.x);
+      expect(c.x + c.width / 2, c.half).toBeLessThanOrEqual(L.image.x + L.image.w);
+    }
+  });
+
+  it("ends a race with one card in the coordinator's numbers, then hands over to the strip's line", () => {
+    const start = EPOCH + 10_000;
+    const st = fleet(2, 2, { relaunch_all: race(start, { fcvm_done_at: start + 3100, ec2_done_at: start + 49_000, fcvm_pending: 0, ec2_pending: 0, ec2_capacity_wait_ms: 4000 }), scoreboard: SCORES });
+    const v = view(stateWith(st), start + 50_000);
+    expect(v.race).toEqual({ label: "", clocks: [], end: "fcvm back in 3.1 s · EC2 back in 45 s · 15× faster" });
+    expect(v.tiles.every((t) => t.chip === null && t.clock === "")).toBe(true);
+    expect(view(stateWith(st), start + 49_000 + END_CARD_MS).race).toBeNull();
+    // The coordinator leaves each tile's own wait out, so its time can be longer than the half's
+    // wall time less the longest wait: a tile back at 60 s without waiting, another at 50 s after
+    // a 30 s wait, is 60 s, not 30 s. The card, the announcement and the half's frozen clock say its number.
+    const measured = fleet(2, 2, { relaunch_all: race(start, { fcvm_done_at: start + 3000, ec2_done_at: start + 60_000, fcvm_pending: 0, ec2_pending: 0, ec2_capacity_wait_ms: 30_000, fcvm_ms: 3000, ec2_ms: 60_000 }) });
+    expect(view(stateWith(measured), start + 61_000).race!.end).toBe("fcvm back in 3.0 s · EC2 back in 60 s · 20× faster");
+    expect(view(stateWith(measured), start + 61_000).score!.announce).toContain("EC2: all 4 GPUs streaming again 60 s after the restart");
+    // Without relaunch_all's own figure, the matching race in races[] gives it.
+    const kept = fleet(2, 2, {
+      relaunch_all: race(start, { fcvm_done_at: start + 3000, ec2_done_at: start + 60_000, fcvm_pending: 0, ec2_pending: 0, ec2_capacity_wait_ms: 30_000 }),
+      races: [{ id: 9, started_at: start, by: "v-3", fcvm: { done_at: start + 3000, time_ms: 3000, capacity_wait_ms: 0 }, ec2: { done_at: start + 60_000, time_ms: 60_000, capacity_wait_ms: 30_000 } }],
+    });
+    expect(view(stateWith(kept), start + 61_000).race!.end).toBe("fcvm back in 3.0 s · EC2 back in 60 s · 20× faster");
+    // And a half that is back mid-race freezes at the coordinator's number.
+    const half = fleet(2, 2, { relaunch_all: race(start, { fcvm_done_at: start + 3400, fcvm_pending: 0, fcvm_ms: 3100 }) });
+    expect(view(stateWith(half), start + 5000).race!.clocks[0]).toMatchObject({ value: "3.1 s", state: "done" });
+  });
+
+  it("reads the last race from races[] when the scoreboard has none, then from single restarts", () => {
+    const st = fleet(2, 2, {
+      races: [
+        { id: 3, started_at: EPOCH - 90_000, by: "schedule", fcvm: { done_at: EPOCH - 86_900, time_ms: 3100, capacity_wait_ms: 0 }, ec2: { done_at: EPOCH - 40_000, time_ms: 50_000, capacity_wait_ms: 0 } },
+        { id: 4, started_at: EPOCH - 9000, by: "v-2", fcvm: { done_at: null, time_ms: null, capacity_wait_ms: 0 }, ec2: null },
+      ],
+    });
+    expect(view(stateWith(st), EPOCH).lastRace).toBe("Last race: fcvm back in 3.1 s · EC2 back in 50 s · 16× faster");
+    expect(view(stateWith(fleet(2, 2, { scoreboard: SCORES, races: st.races })), EPOCH).lastRace).toBe("Last race: fcvm back in 2.9 s · EC2 back in 49 s · 17× faster");
   });
 
   it("shows a place with no GPU behind it plainly, and leaves it out of the race", () => {
@@ -297,7 +399,8 @@ describe("your own GPU", () => {
     v = view(s, EPOCH + 13_900, { ownArea: { x: 0, y: 0, w: 1600, h: 900 } });
     expect(v.own).toMatchObject({ status: "Your GPU is streaming", timerRunning: false, timer: "2.9 s", countdownLabel: "Back to the pool in", countdown: "0:50" });
     expect(v.plan.focus).toMatchObject({ id: "o:claim-1", box: { x: 0, y: 0, w: 1600, h: 900 } });
-    expect(v.plan.focus!.url).toBe("ws://example-host:2/frames/claim-1?h=720");
+    // The whole image on one GPU: 768 x 432, the tallest stream height within MAX_TILE_PX.
+    expect(v.plan.focus!.url).toBe("ws://example-host:2/frames/claim-1?h=432");
     s = msg(s, { type: "claim", claim: claim({ phase: "ended", first_frame_at: EPOCH + 3900, ended: "Your minute is up. The GPU went back to the pool." }) });
     v = view(s, EPOCH + 64_000);
     expect(v.own).toMatchObject({ ended: true, status: "Your minute is up. The GPU went back to the pool.", countdown: "" });
@@ -385,17 +488,41 @@ describe("tiles", () => {
 });
 
 describe("the stage", () => {
-  it("keeps a band under the image for one caption per half, and labels the seam", () => {
+  it("fills the stage with the image, contain-fit and centred, and tags each half on the image", () => {
     const v = view(stateWith(fleet()), EPOCH);
     const img = v.layout!.image;
-    expect(img.y + img.h).toBeLessThanOrEqual(900);
-    expect(v.labels.captions.map((c) => c.text)).toEqual([
-      "a fresh VM restored from a snapshot on a running host, GPU reset",
-      "a fresh EC2 instance launched from an AMI",
+    // 1600 x 930: the full width, 900 tall, centred with 15 px over and under.
+    expect(img).toEqual({ x: 0, y: 15, w: 1600, h: 900 });
+    expect(v.labels.sides.map((l) => [l.half, l.tag, l.text, l.align])).toEqual([
+      ["fcvm", "FCVM", "restored from a snapshot", "right"],
+      ["ec2", "EC2", "launched from an AMI", "left"],
     ]);
-    expect(v.labels.captions[0]!.box.y).toBeGreaterThan(img.y + img.h);
-    expect(v.labels.seam.map((l) => [l.text, l.align])).toEqual([["fcvm", "right"], ["EC2", "left"]]);
+    // On the image, beside the line between the halves, under the row of controls.
+    for (const l of v.labels.sides) {
+      expect(l.y).toBeGreaterThanOrEqual(HUD_BAND);
+      expect(l.y).toBeLessThan(img.y + img.h / 4);
+    }
+    expect(v.labels.sides[0]!.x).toBeLessThan(v.layout!.halfLineX!);
+    expect(v.labels.sides[1]!.x).toBeGreaterThan(v.layout!.halfLineX!);
     expect(v.sentence).toBe("Each square is its own virtual machine with its own NVIDIA GPU. Restart them all and watch which side comes back.");
+  });
+
+  it("shortens a half's tag to its name when that half is too narrow for the whole tag", () => {
+    // 960 wide, one fcvm GPU against seven EC2: the fcvm half is 120 px.
+    const v = view(stateWith(fleetSplit(1, 7, 1)), EPOCH, { mosaicArea: { x: 0, y: 0, w: 960, h: 540 } });
+    const [f, e] = v.labels.sides;
+    expect(v.layout!.halfLineX!).toBeLessThan(200);
+    expect(f).toMatchObject({ half: "fcvm", tag: "FCVM", text: "" });
+    expect(e).toMatchObject({ half: "ec2", tag: "EC2", text: "launched from an AMI" });
+    // A phone held upright: both halves are under 320 px.
+    const phone = view(stateWith(fleet()), EPOCH, { mosaicArea: { x: 0, y: 0, w: 390, h: 219 }, phone: true });
+    expect(phone.labels.sides.map((x) => x.text)).toEqual(["", ""]);
+  });
+
+  it("says what draws the image in one line, from live numbers", () => {
+    const v = view(stateWith(fleet()), EPOCH, { dpr: 2 });
+    expect(v.spec).toBe("3200×1800 · 8 × NVIDIA T4 · 30 fps · path traced");
+    expect(view(stateWith(fleet(2, 2, { scoreboard: SCORES })), EPOCH).lastRace).toBe("Last race: fcvm back in 2.9 s · EC2 back in 49 s · 17× faster");
   });
 
   it("puts the poster where the image goes before the first snapshot", () => {
@@ -403,22 +530,27 @@ describe("the stage", () => {
     expect(v.plan.poster).toBe("http://example-host:1/poster.jpg");
     const img = v.plan.image!;
     expect(img.w / img.h).toBeCloseTo(16 / 9, 6);
-    // Above the band the captions take, as the image will be once the snapshot comes.
-    expect(img.y + img.h).toBeLessThanOrEqual(930 - 44);
-    expect(img.h).toBeGreaterThan(800);
+    // The whole stage, as the image will be once the snapshot comes.
+    expect(img).toEqual({ x: 0, y: 15, w: 1600, h: 900 });
   });
 });
 
 describe("seams and hover", () => {
-  it("shows boundaries while the pointer is over the image, and outlines the hovered tile", () => {
+  it("shows boundaries while the pointer moves over the image, and outlines the hovered tile", () => {
     let s = stateWith(fleet());
     expect(view(s, EPOCH).seams.visible).toBe(false);
-    s = reduce(s, { type: "ui", patch: { pointerOverImage: true, hoverId: "ec2:2" } });
-    const v = view(s, EPOCH);
+    s = reduce(s, { type: "ui", patch: { pointerOverImage: true, hoverId: "ec2:2", pointerMovedAt: EPOCH } });
+    const v = view(s, EPOCH + 1000);
     expect(v.seams.visible).toBe(true);
     expect(v.seams.outline!.color).toBe("#F5A524");
     expect(v.seams.label).toMatchObject({ id: "EC2 VM 2", kind: "EC2", gpu: "NVIDIA T4", last: "last restart 58 s" });
     expect(v.seams.lineWidth).toBe(1);
+    // Full-bleed the pointer is always over the image: once it rests, the seams and the outline go.
+    const rest = view(s, EPOCH + SEAM_HOLD_MS);
+    expect(rest.seams.visible).toBe(false);
+    expect(rest.seams.outline).toBeNull();
+    // A long press holds them for as long as it is held.
+    expect(view(reduce(s, { type: "ui", patch: { longPress: true } }), EPOCH + 60_000).seams.visible).toBe(true);
   });
 
   it("gives keyboard focus the same outline and label", () => {
@@ -491,11 +623,14 @@ describe("the activity feed", () => {
       { at: EPOCH + 3, viewer: "v-4", id: "c", name: "word", args: {}, summary: "the text check refused it", outcome: "refused" },
       { at: EPOCH + 5, viewer: "v-4", id: "e", name: "light", args: { pos: [0, 1, 2], color: [1, 1, 1] }, summary: "light", outcome: "committed" },
     ];
-    const race = { started_at: EPOCH + 4, by: "schedule", fcvm_done_at: null, ec2_done_at: null, fcvm_pending: 2, ec2_pending: 2, fcvm_gpus: 2, ec2_gpus: 2, ec2_capacity_wait_ms: 0, ec2_waiting_since: null };
+    const race = { started_at: EPOCH + 4, by: "schedule", fcvm_done_at: null, ec2_done_at: null, fcvm_pending: 2, ec2_pending: 2, fcvm_gpus: 2, ec2_gpus: 2, ec2_capacity_wait_ms: 0, ec2_waiting_since: null, fcvm_ms: null, ec2_ms: null };
     let s = stateWith(fleet(2, 2, { actions, relaunch_all: race }));
     s = msg(s, { type: "hello", viewer: "v-4" });
     const v = view(s, EPOCH + 5000);
-    expect(v.feed.map((t) => t.text)).toEqual(["you dropped a light", "the scheduled restart of every GPU began", "viewer 7 restarted every GPU"]);
+    expect(v.feed.map((t) => t.text)).toEqual(["you dropped a light", "the scheduled restart of every GPU began", "viewer 7 restarted every GPU", "you restarted fcvm VM 3"]);
+    // On the image, only the newest, and only for a few seconds.
+    expect(view(s, EPOCH + 1000).toast).toMatchObject({ text: "you dropped a light" });
+    expect(view(s, EPOCH + 5 + TOAST_MS).toast).toBeNull();
     // A race a viewer started is in `actions` already: no second line for it.
     const byViewer = view(msg(stateWith(fleet(2, 2, { actions, relaunch_all: { ...race, by: "viewer:v-7" } })), { type: "hello", viewer: "v-4" }), EPOCH + 5000);
     expect(byViewer.feed.map((t) => t.text)).toEqual(["you dropped a light", "viewer 7 restarted every GPU", "you restarted fcvm VM 3"]);
@@ -582,7 +717,7 @@ describe("counters and isolation", () => {
 });
 
 describe("asleep and waking", () => {
-  const power = (p: Partial<Power>): Power => ({ state: "awake", asleep_since: null, woke_at: null, hosts: [], last_wake: null, ...p });
+  const power = (p: Partial<Power>): Power => ({ state: "awake", asleep_since: null, woke_at: null, hosts: [], last_wake: null, wakes: [], ...p });
   // As the coordinator: asleep, nothing is placed; waking, tiles arrive as their GPUs join.
   const sleeping = (p: Partial<Power>, over: Partial<FleetState> = {}) => {
     const st = fleet(2, 2, over);
@@ -607,7 +742,11 @@ describe("asleep and waking", () => {
       { scoreboard: SCORES, relaunch_all: race(Date.UTC(2026, 9, 22, 23, 14), { fcvm_done_at: 1, ec2_done_at: 2 }) },
     );
     const v = view(stateWith(st), EPOCH);
-    expect(v.sleep).toEqual({ state: "asleep", title: "The GPUs are asleep", line: "Nobody was watching, so the fleet scaled to zero 10 min ago. It wakes when someone watches.", clock: "", steps: [] });
+    expect(v.sleep).toEqual({ state: "asleep", title: "Asleep.", line: "The GPUs wake when someone watches.", clock: "", steps: [] });
+    // With wakes measured: how many GPUs, and the median wake.
+    const wakes = [81_000, 98_000, 120_000].map((ms, i) => ({ started_at: i * 1e6, awake_at: i * 1e6 + ms, gpus: 16 }));
+    const st2 = sleeping({ state: "asleep", asleep_since: EPOCH - 600_000, wakes, last_wake: wakes[2]! });
+    expect(view(stateWith(st2), EPOCH).sleep!.line).toBe("16 GPUs wake in about 1:38 when you stay.");
     expect(v.tiles.every((t) => !t.dark)).toBe(true);
     expect(v.plan.tiles.every((t) => !t.dark)).toBe(true);
     expect(v.plan.posterFull).toBe(true);
@@ -615,9 +754,9 @@ describe("asleep and waking", () => {
     expect(v.score!.title).toBe("Restart time: click to the last GPU's first frame · last measured 22 Oct 2026, 23:14 UTC");
     expect(v.score!.fcvm.value).toBe("3.0 s");
     // No tiles are placed, so no count: "Restart all 0 GPUs" would be wrong.
-    expect(v.score!.button).toEqual({ label: "Restart all GPUs", disabled: true, note: "works once the GPUs are awake" });
+    expect(v.score!.button).toEqual({ label: "Restart all GPUs", disabled: true, note: "works once the GPUs are awake", hidden: false });
     expect(v.ownButton).toEqual({ label: "Get your own GPU", disabled: true, note: "works once the GPUs are awake" });
-    expect(v.score!.countdown.label).toBe("Restarts resume once the GPUs are awake");
+    expect(v.score!.countdown).toMatchObject({ label: "Restarts resume once the GPUs are awake", show: false });
   });
 
   it("waking: a clock since the wake began and each real phase as every host reaches it", () => {
@@ -631,7 +770,7 @@ describe("asleep and waking", () => {
       ],
     });
     const v = view(stateWith(st), start + 63_400);
-    expect(v.sleep!.title).toBe("Waking up the GPUs");
+    expect(v.sleep!.title).toBe("WAKING THE GPUs");
     expect(v.sleep!.clock).toBe("1:03.4");
     expect(v.sleep!.steps.map((x) => [x.label, x.state, x.value])).toEqual([
       ["instances requested", "done", "0:00.5"],
@@ -664,16 +803,18 @@ describe("the recording", () => {
     expect(r.sources).toEqual([{ src: "/media/wall-reel.mp4", type: "video/mp4" }, { src: "/media/wall-reel.webm", type: "video/webm" }]);
     expect(r.track.src).toBe("/media/wall-reel.vtt");
     expect(r).toMatchObject({ show: true, leaving: false, autoplay: true });
-    expect(r.badge).toBe("Recorded 21 Oct 2026, 18:30 UTC. The live wall is waking up.");
+    expect(r.badge).toBe("◉ RECORDING · 21 Oct 2026, 18:30 UTC");
     expect(r.caption).toBe("In this recording 16 GPUs restart: fcvm is back in 3.1 s, EC2 in 52 s.");
-    expect(reelView({ ...base, power: "asleep" }).badge).toBe("Recorded 21 Oct 2026, 18:30 UTC. The live wall is asleep; it wakes when someone watches.");
+    expect(reelView({ ...base, power: "asleep" }).badge).toBe("◉ RECORDING · 21 Oct 2026, 18:30 UTC");
+    // Once the live image is whole, the badge says so as the recording fades.
+    expect(reelView({ ...base, power: "awake", allLive: true })).toMatchObject({ leaving: true, badge: "● LIVE" });
     expect(reelView({ ...base, base: "https://example-host/media/" }).sources[0]!.src).toBe("https://example-host/media/wall-reel.mp4");
   });
 
   it("does not start by itself with less motion or data saving, and says nothing it was not told", () => {
     expect(reelView({ ...base, reducedMotion: true })).toMatchObject({ autoplay: false, manualNote: "Not started by itself, as your device asks for less motion." });
     expect(reelView({ ...base, saveData: true })).toMatchObject({ autoplay: false, manualNote: "Not started by itself, as your browser asks to save data." });
-    expect(reelView({ ...base, meta: null })).toMatchObject({ badge: "", caption: "" });
+    expect(reelView({ ...base, meta: null })).toMatchObject({ badge: "◉ RECORDING", caption: "" });
     expect(parseReelMeta({ duration_s: 4 })).toBeNull();
     expect(parseReelMeta("x")).toBeNull();
   });
@@ -772,24 +913,21 @@ describe("re-tiling: each side as wide as the GPUs it has", () => {
       expect(Math.min(...xs.map((b) => b.x))).toBeCloseTo(v.layout!.image.x, 0);
       expect(Math.max(...xs.map((b) => b.x + b.w))).toBeCloseTo(v.layout!.image.x + v.layout!.image.w, 0);
       expect(v.labels.empty).toMatchObject({ half: empty, text: empty === "ec2" ? "EC2: no GPUs live right now" : "fcvm: no GPUs live right now" });
-      expect(v.labels.captions.map((c) => c.half)).toEqual([nf === 0 ? "ec2" : "fcvm"]);
-      expect(v.labels.captions[0]!.box.w).toBe(v.layout!.image.w);
-      expect(v.labels.seam).toHaveLength(1);
+      expect(v.labels.sides.map((c) => c.half)).toEqual([nf === 0 ? "ec2" : "fcvm"]);
     }
     // Waking, a side not placed yet is still coming: no "empty" label (it would sit on the recording's badge).
     const waking = fleetSplit(0, 6, 1);
-    waking.fleet.power = { state: "waking", asleep_since: null, woke_at: EPOCH - 5000, hosts: [{ host: "h1", phases: [{ phase: "instance_pending", at: EPOCH - 5000 }] }], last_wake: null };
+    waking.fleet.power = { state: "waking", asleep_since: null, woke_at: EPOCH - 5000, hosts: [{ host: "h1", phases: [{ phase: "instance_pending", at: EPOCH - 5000 }] }], last_wake: null, wakes: [] };
     expect(view(stateWith(waking), EPOCH).labels.empty).toBeNull();
     // And with nothing placed (asleep), the halves stay even.
     const asleep = fleetSplit(0, 0, 1);
-    asleep.fleet.power = { state: "asleep", asleep_since: EPOCH - 5000, woke_at: null, hosts: [], last_wake: null };
+    asleep.fleet.power = { state: "asleep", asleep_since: EPOCH - 5000, woke_at: null, hosts: [], last_wake: null, wakes: [] };
     const av = view(stateWith(asleep), EPOCH);
     expect(av.layout!.split).toBe(0.5);
     expect(av.labels.empty).toBeNull();
     const both = view(stateWith(fleetSplit(10, 2, 1)), EPOCH);
     expect(both.labels.empty).toBeNull();
-    // EC2's side is a sixth of the image: too narrow for its caption, so they stack.
-    expect(both.labels.captions[1]!.box.y).toBeGreaterThan(both.labels.captions[0]!.box.y);
+    expect(both.labels.sides.map((c) => c.half)).toEqual(["fcvm", "ec2"]);
   });
 
   it("a generation change mid-magnify: the opened VM's stream follows its new rectangle, and a VM that left closes", () => {

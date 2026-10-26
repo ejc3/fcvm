@@ -18,6 +18,10 @@ pub struct Config {
     pub tile_aspect: f64,
     /// The most EC2 tiles the coordinator asks for. 0 runs the EC2 half dark.
     pub ec2_max: usize,
+    /// Places on the fcvm side: with fewer live fcvm GPUs the rest are dark tiles, with
+    /// more the side has one place per GPU. 0: one place per live fcvm GPU.
+    #[serde(default)]
+    pub fcvm_tiles: usize,
     /// Minimum milliseconds between two words from one viewer.
     pub word_interval_ms: u64,
     /// Minimum milliseconds between two lights from one viewer.
@@ -49,7 +53,7 @@ pub struct Config {
     /// (rounded up), whichever is smaller.
     #[serde(default)]
     pub max_borrowed: Option<usize>,
-    /// The coordinator can scale the GPU hosts (it has auto scaling groups to set): the
+    /// The coordinator launches and terminates the GPU hosts (or was told to sleep): the
     /// fleet sleeps after `idle_scale_down_secs` with no active viewer and wakes on one.
     #[serde(default)]
     pub power_managed: bool,
@@ -68,7 +72,7 @@ fn ten_minutes() -> u64 {
 /// One GPU host's way back up while the fleet wakes, by its EC2 instance id.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct HostWake {
-    /// The auto scaling group reported it pending, then in service.
+    /// EC2 reported it pending, then running.
     pub pending_at: Option<u64>,
     pub booted_at: Option<u64>,
     /// The host marked its store ready (reported in the agent's hello).
@@ -137,6 +141,7 @@ impl Default for Config {
             image_aspect: 16.0 / 9.0,
             tile_aspect: 16.0 / 9.0,
             ec2_max: 0,
+            fcvm_tiles: 0,
             word_interval_ms: 5_000,
             light_interval_ms: 1_000,
             relaunch_interval_ms: 2_000,
@@ -225,9 +230,9 @@ pub struct Observed {
     pub v4_port: Option<u16>,
 }
 
-/// One launch's DNS names, written and confirmed at the zone's authoritative servers before
-/// they were published: `<label>.<zone>` (AAAA) and `<label>-v4.<zone>` (A). A label is
-/// made for one launch and never used again.
+/// One launch's DNS names in the coordinator's subzone, answered from the moment they are
+/// published: `<label>.<subzone>` (AAAA) and `<label>-v4.<subzone>` (A). A label is made for
+/// one launch (or one aggregator's addresses) and never used again.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Published {
     /// The launch (the slot's observed generation) the names belong to.
@@ -481,9 +486,12 @@ pub struct Fleet {
     pub slots: BTreeMap<u32, Slot>,
     /// EC2 tiles by number (`ec2-<n>`).
     pub ec2: BTreeMap<u32, Slot>,
-    /// Tiles on the fcvm side (one per live fcvm GPU, at most `max_tiles`).
+    /// Live fcvm GPUs on the wall (at most `max_tiles`), at places `0..n`.
     pub n: usize,
-    /// Tiles on the EC2 side (one per EC2 tile with an instance, at most `max_tiles`).
+    /// The fcvm side's places with no GPU (dark tiles), at places `n..`, in order.
+    #[serde(default)]
+    pub fcvm_dark: Vec<Rect>,
+    /// Places on the EC2 side: one per EC2 tile, with an instance or not.
     #[serde(default)]
     pub ec2_n: usize,
     /// The current layout: its generation, the frame it takes effect at, the two sides.
@@ -562,6 +570,7 @@ impl State {
                 slots: BTreeMap::new(),
                 ec2: BTreeMap::new(),
                 n: 0,
+                fcvm_dark: Vec::new(),
                 ec2_n: 0,
                 layout: LayoutGen::default(),
                 scene,
@@ -605,6 +614,7 @@ impl State {
         f.slots.clear();
         f.ec2.clear();
         f.n = 0;
+        f.fcvm_dark.clear();
         f.layout = LayoutGen::default();
         f.ec2_n = 0;
         // Viewer ids restart with the process, so which were hidden means nothing now.

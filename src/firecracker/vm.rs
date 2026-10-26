@@ -111,7 +111,7 @@ pub struct VmManager {
     holder_pid: Option<u32>, // namespace holder PID for rootless mode (use nsenter to run FC)
     user_namespace_path: Option<PathBuf>, // User namespace path for rootless clones (enter via setns in pre_exec)
     net_namespace_path: Option<PathBuf>, // Net namespace path for rootless clones (enter via setns in pre_exec)
-    mount_redirects: Option<Vec<(PathBuf, PathBuf)>>, // ordered (mountpoint, source) binds for mount namespace isolation
+    mount_redirects: Option<crate::utils::MountRedirects>, // mount namespace for a restored clone
     process: Option<Child>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>, // last few Firecracker stderr lines, for launch failure errors
     // Reader task for the child's stderr pipe. Awaited (bounded) before rendering
@@ -218,7 +218,7 @@ impl VmManager {
     /// The bind mounts make Firecracker see the clone's (or the caller's vsock)
     /// directory contents when accessing any baseline path, so each clone binds
     /// its own socket files.
-    pub fn set_mount_redirects(&mut self, redirects: Vec<(PathBuf, PathBuf)>) {
+    pub fn set_mount_redirects(&mut self, redirects: crate::utils::MountRedirects) {
         self.mount_redirects = Some(redirects);
     }
 

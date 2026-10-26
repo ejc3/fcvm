@@ -9,7 +9,6 @@ import {
   layoutMosaic,
   rectOnScreen,
   snap,
-  splitOf,
   streamHeightFor,
   seamSegments,
   tileAt,
@@ -22,7 +21,7 @@ import { FAMILY_PROBE_ATTEMPTS, FAMILY_PROBE_MS, frameSocketUrl, streamUrl, type
 import { fitBandwidth, type StreamAsk } from "./bandwidth.ts";
 import { suggestMode } from "./mode.ts";
 import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type Aggregate, type FleetState, type Half, type IntentMsg, type Rect, type Tile } from "./protocol.ts";
-import { KIND_TAG, NOT_AWAKE_NOTE, scoreView, type ScoreView } from "./race.ts";
+import { KIND_TAG, NOT_AWAKE_NOTE, raceOnImage, ratioText, runningRace, scoreView, type RaceOnImage, type ScoreView } from "./race.ts";
 import { sceneUnixMs } from "./scene.ts";
 import { reelView, type ReelMeta, type ReelView } from "./reel.ts";
 import type { ClientState, FrameStats, GpuSample, Notice, StreamMode } from "./store.ts";
@@ -30,6 +29,11 @@ import type { ClientState, FrameStats, GpuSample, Notice, StreamMode } from "./s
 export const SITE = "fcvm.dev";
 export const TITLE = "Every GPU, live";
 export const SENTENCE = "Each square is its own virtual machine with its own NVIDIA GPU. Restart them all and watch which side comes back.";
+/** The tag on each half of the image: who it is, and how its VMs start. */
+export const SIDE_TAGS: Record<Half, { tag: string; text: string }> = {
+  fcvm: { tag: "FCVM", text: "restored from a snapshot" },
+  ec2: { tag: "EC2", text: "launched from an AMI" },
+};
 export const CAPTIONS: Record<Half, string> = {
   fcvm: "a fresh VM restored from a snapshot on a running host, GPU reset",
   ec2: "a fresh EC2 instance launched from an AMI",
@@ -190,7 +194,14 @@ export interface TileView {
   ariaLabel: string;
   hover: HoverLabel;
   stats: string[];
+  /** While a race runs and this tile is still dark: its own clock since the race began, or "". */
+  clock: string;
+  /** Once it has relit in the running race: its measured time, big for CHIP_FRESH_MS, then in its corner. */
+  chip: { text: string; fresh: boolean } | null;
 }
+
+/** A relit tile's time stays big this long before it moves to the tile's corner. */
+export const CHIP_FRESH_MS = 3000;
 
 const STEPS: Record<Half, Record<string, number>> = {
   fcvm: { relaunching: 0, requested: 0, stopping: 1, restoring: 2, starting: 3 },
@@ -280,6 +291,12 @@ function tileView(
   }
   stats.push(name);
 
+  // In a running race: a dark tile counts, a relit one shows when it came back.
+  const ra = runningRace(st);
+  const ff = t.last_relaunch?.first_frame_at ?? null;
+  const clock = ra !== null && dark && glyph.kind === "progress" ? fmt.raceClock(Math.max(0, srvNow - ra.started_at)) : "";
+  const chip = ra !== null && !dark && ff !== null && ff >= ra.started_at ? { text: fmt.seconds(ff - ra.started_at), fresh: srvNow - ff < CHIP_FRESH_MS } : null;
+
   const ariaLabel = `${name}, ${KIND_NAME[t.half]}, ${dark ? [phaseLine, detail].filter(Boolean).join(", ") : "streaming"}${
     rms === null ? "" : `, last restart ${fmt.seconds(rms)}`
   }. Open it.`;
@@ -301,6 +318,8 @@ function tileView(
     ariaLabel,
     hover,
     stats,
+    clock,
+    chip,
   };
 }
 
@@ -403,15 +422,27 @@ export interface SleepView {
   steps: WakeStep[];
 }
 
+/** The median of the coordinator's measured wakes (`wakes`, else `last_wake`), in ms, or null. */
+export function wakeMedianMs(p: FleetState["fleet"]["power"]): number | null {
+  const ms = (p.wakes.length > 0 ? p.wakes : p.last_wake ? [p.last_wake] : []).map((w) => w.awake_at - w.started_at).sort((a, b) => a - b);
+  if (ms.length === 0) return null;
+  const m = Math.floor(ms.length / 2);
+  return ms.length % 2 === 1 ? ms[m]! : (ms[m - 1]! + ms[m]!) / 2;
+}
+
 function sleepView(st: FleetState, srvNow: number): SleepView | null {
   const p = st.fleet.power;
   if (p.state === "awake") return null;
+  const gpus = p.last_wake?.gpus ?? p.wakes.at(-1)?.gpus ?? 0;
   if (p.state === "asleep") {
-    const since = p.asleep_since === null ? "" : ` ${fmt.ago(srvNow - p.asleep_since)}`;
+    const median = wakeMedianMs(p);
     return {
       state: "asleep",
-      title: "The GPUs are asleep",
-      line: `Nobody was watching, so the fleet scaled to zero${since}. It wakes when someone watches.`,
+      title: "Asleep.",
+      line:
+        median === null || gpus === 0
+          ? "The GPUs wake when someone watches."
+          : `${fmt.count(gpus, "GPU", "GPUs")} wake in about ${fmt.minSec(median)} when you stay.`,
       clock: "",
       steps: [],
     };
@@ -431,8 +462,8 @@ function sleepView(st: FleetState, srvNow: number): SleepView | null {
   });
   return {
     state: "waking",
-    title: "Waking up the GPUs",
-    line: "The fleet scaled to zero while nobody was watching. Each step below is reported by the hosts as it completes.",
+    title: gpus > 0 ? `WAKING ${fmt.count(gpus, "GPU", "GPUs")}` : "WAKING THE GPUs",
+    line: "The fleet scaled to zero while nobody was watching. Each step is reported by the hosts as it completes.",
     clock: fmt.raceClock(srvNow - start),
     steps,
   };
@@ -540,7 +571,7 @@ function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMs
 
   const ts = s.turnstile;
   return {
-    title: "Play",
+    title: "Direct the scene",
     close: "Close",
     nudge,
     word: {
@@ -610,7 +641,18 @@ export interface FeedItem {
   when: string;
 }
 
-function feedView(st: FleetState, srvNow: number, you: string | null, n: number): FeedItem[] {
+/** How long the newest action stays on screen as a toast. */
+export const TOAST_MS = 4000;
+
+/** The newest action, for TOAST_MS after it happened, or null. */
+function toastView(st: FleetState, srvNow: number, you: string | null): FeedItem | null {
+  const newest = feedView(st, srvNow, you, 1)[0];
+  if (!newest) return null;
+  const age = srvNow - newest.at;
+  return age >= -1000 && age < TOAST_MS ? { key: newest.key, text: newest.text, when: newest.when } : null;
+}
+
+function feedView(st: FleetState, srvNow: number, you: string | null, n: number): (FeedItem & { at: number })[] {
   const items: { at: number; key: string; text: string }[] = [];
   for (const a of st.actions) {
     const text = actionText(a, st, you);
@@ -622,7 +664,7 @@ function feedView(st: FleetState, srvNow: number, you: string | null, n: number)
   return items
     .sort((a, b) => b.at - a.at)
     .slice(0, n)
-    .map((x) => ({ key: x.key, text: x.text, when: fmt.ago(srvNow - x.at) }));
+    .map((x) => ({ key: x.key, text: x.text, at: x.at, when: fmt.ago(srvNow - x.at) }));
 }
 
 // ---- one VM opened -------------------------------------------------------------
@@ -677,17 +719,18 @@ function sparkline(samples: readonly GpuSample[], key: "temp_c" | "power_w" | "u
   return vals.map((v, i) => `${((i / (vals.length - 1)) * 100).toFixed(1)},${(22 - ((v - lo) / span) * 20).toFixed(1)}`).join(" ");
 }
 
-/** Where a VM's stream goes: its native height at one device pixel per pixel, smaller only when the area is. */
+/** Where a VM's stream goes: its native height (within MAX_TILE_PX) at one device pixel per pixel, smaller only when the area is. */
 export function nativePlacement(area: Box, rect: Rect, imageAspect: number, dpr: number): { box: Box; streamHeight: number } {
   const aspect = (rect.w * imageAspect) / rect.h;
-  const nativeH = NATIVE_TILE_HEIGHT / dpr;
+  // Native is the renderer's own height, or the tallest it may be asked for at this aspect (MAX_TILE_PX).
+  const nativeH = Math.min(NATIVE_TILE_HEIGHT, streamHeightFor(Number.POSITIVE_INFINITY, aspect)) / dpr;
   const fit = fitContain(area, aspect);
   const h = Math.min(fit.h, nativeH);
   const w = h * aspect;
   const x = area.x + (area.w - w) / 2;
   const y = area.y + (area.h - h) / 2;
   const box = { x: snap(x, dpr), y: snap(y, dpr), w: snap(x + w, dpr) - snap(x, dpr), h: snap(y + h, dpr) - snap(y, dpr) };
-  return { box, streamHeight: Math.min(NATIVE_TILE_HEIGHT, streamHeightFor(box.h * dpr)) };
+  return { box, streamHeight: Math.min(NATIVE_TILE_HEIGHT, streamHeightFor(box.h * dpr, aspect)) };
 }
 
 function timelineOf(phases: Record<string, number>): { steps: TimelineStep[]; total: number } {
@@ -812,11 +855,12 @@ export interface OwnButton {
 
 export const OWN_GPU_SECONDS = 60;
 
-function ownButton(st: FleetState, srvNow: number, online: boolean, busy: boolean): OwnButton {
+/** The button to borrow a GPU, or null: this fleet lends none, so there is nothing to offer. */
+function ownButton(st: FleetState, srvNow: number, online: boolean, busy: boolean): OwnButton | null {
   const b = st.borrow;
   const label = "Get your own GPU";
+  if (b === null || b.cap === 0) return null;
   if (st.fleet.power.state !== "awake") return { label, note: NOT_AWAKE_NOTE, disabled: true };
-  if (b === null || b.cap === 0) return { label, note: "this fleet lends no GPUs", disabled: true };
   if (b.lent >= b.cap) {
     const when = b.next_return_at === null ? "soon" : `in ${fmt.countdown(b.next_return_at - srvNow)}`;
     const out = b.cap === 1 ? "the one GPU we lend is out" : `all ${b.cap} GPUs we lend are out`;
@@ -835,7 +879,7 @@ function ownView(s: ClientState, st: FleetState, srvNow: number, input: WallInpu
   const placed = input.ownArea && c && !ended ? (() => {
     const box = fitContain(input.ownArea!, st.image_aspect);
     const b = { x: snap(box.x, input.dpr), y: snap(box.y, input.dpr), w: snap(box.x + box.w, input.dpr) - snap(box.x, input.dpr), h: snap(box.y + box.h, input.dpr) - snap(box.y, input.dpr) };
-    return { box: b, streamHeight: Math.min(NATIVE_TILE_HEIGHT, streamHeightFor(b.h * input.dpr)) };
+    return { box: b, streamHeight: Math.min(NATIVE_TILE_HEIGHT, streamHeightFor(b.h * input.dpr, st.image_aspect)) };
   })() : null;
   const left = c?.expires_at != null ? c.expires_at - srvNow : null;
   const status = ended
@@ -1012,9 +1056,16 @@ export function stillReturning(st: FleetState, id: string | null, srvNow: number
   return ff !== null && srvNow - ff < RETURNING_HOLD_MS;
 }
 
+/** Seams show for this long after the pointer last moved over the image. */
+export const SEAM_HOLD_MS = 1500;
+
 function seamView(s: ClientState, layout: MosaicLayout | null, tiles: TileView[], input: WallInput, returning: boolean): SeamView {
   const dpr = input.dpr;
-  const hovered = s.ui.hoverId ?? s.ui.keyId;
+  // Full-bleed, the pointer is always over the image: the seams and the hovered tile's
+  // outline show only while it moves (or for a long press, or the keyboard).
+  const moving = s.ui.pointerOverImage && (s.ui.longPress || (s.ui.pointerMovedAt !== null && input.now - s.ui.pointerMovedAt < SEAM_HOLD_MS));
+  const visible = moving || s.ui.keyId !== null;
+  const hovered = s.ui.keyId ?? (moving ? s.ui.hoverId : null);
   const target = hovered ?? (returning ? s.ui.returning : null);
   const back = hovered === null && returning;
   const found = target === null ? null : tiles.find((t) => t.id === target) ?? null;
@@ -1027,7 +1078,7 @@ function seamView(s: ClientState, layout: MosaicLayout | null, tiles: TileView[]
     label = { ...tv.hover, accent: tv.accent, x: at.x, y: at.y };
   }
   return {
-    visible: s.ui.pointerOverImage || s.ui.keyId !== null,
+    visible,
     segments,
     lineWidth: 1 / dpr,
     outline: tv && tv.box ? { box: tv.box, color: tv.accent } : null,
@@ -1035,105 +1086,67 @@ function seamView(s: ClientState, layout: MosaicLayout | null, tiles: TileView[]
   };
 }
 
+export interface SideTag {
+  half: Half;
+  tag: string;
+  text: string;
+  x: number;
+  y: number;
+  align: "right" | "left";
+}
+
 export interface StageLabels {
-  /** "fcvm" and "EC2" on backplates either side of the seam, top of the image. */
-  seam: { half: Half; text: string; x: number; y: number; align: "right" | "left" }[];
-  /** One line under each side, side by side, or one under the other when a side is narrow. */
-  captions: { half: Half; tag: string; text: string; box: Box; align: "left" | "right" }[];
+  /** Each half's tag, drawn on the image at its top: beside the line between the halves, or at the image's edge. */
+  sides: SideTag[];
   /** A side with no GPUs live: a small label where it would be, or null. */
   empty: { half: Half; text: string; x: number; y: number; align: "right" | "left" } | null;
 }
 
-/** Least height kept under the image for the captions. */
-export const CAPTION_BAND = 44;
-/** A side narrower than this puts the captions one under the other, full width. */
-export const CAPTION_MIN_W = 260;
+/**
+ * A half narrower than this is tagged with its name alone: the longer tag, 14 px uppercase,
+ * is about 290 px wide, and it must fit between the divider and the image's edge.
+ */
+export const SIDE_TAG_FULL_W = 320;
+
+/** The desktop's top row of controls is this tall; labels drawn on the image start below it. */
+export const HUD_BAND = 72;
 
 export const EMPTY_SIDE: Record<Half, string> = {
   fcvm: "fcvm: no GPUs live right now",
   ec2: "EC2: no GPUs live right now",
 };
 
-/** Caption text: 14 px IBM Plex Sans averages about 7.4 px a character; lines are 18 px. */
-const CAPTION_CHAR_PX = 7.4;
-const CAPTION_LINE_PX = 18;
-
-function captionLines(half: Half, width: number): number {
-  return Math.max(1, Math.ceil(((CAPTIONS[half].length + 6) * CAPTION_CHAR_PX) / Math.max(1, width)));
-}
-
-/**
- * The captions' boxes for an image and where its fcvm side ends: each under its
- * side, or stacked full width when a side is too narrow; a side with no tiles has none.
- */
-function captionBoxes(img: Box, split: number): { half: Half; box: Box }[] {
-  const y = img.y + img.h + 6;
-  const sides: Half[] = split <= 0 ? ["ec2"] : split >= 1 ? ["fcvm"] : ["fcvm", "ec2"];
-  if (sides.length === 1) return [{ half: sides[0]!, box: { x: img.x, y, w: img.w, h: 0 } }];
-  const mid = img.x + img.w * split;
-  const fw = mid - img.x - 8;
-  const ew = img.x + img.w - mid - 8;
-  if (Math.min(fw, ew) >= CAPTION_MIN_W) {
-    return [
-      { half: "fcvm", box: { x: img.x, y, w: fw, h: 0 } },
-      { half: "ec2", box: { x: mid + 8, y, w: ew, h: 0 } },
-    ];
-  }
-  const first = captionLines("fcvm", img.w) * CAPTION_LINE_PX;
-  return [
-    { half: "fcvm", box: { x: img.x, y, w: img.w, h: 0 } },
-    { half: "ec2", box: { x: img.x, y: y + first, w: img.w, h: 0 } },
-  ];
-}
-
-/** Height the captions take under an image of this width. */
-function captionBand(imgW: number, split: number): number {
-  const boxes = captionBoxes({ x: 0, y: 0, w: imgW, h: 0 }, split);
-  const stacked = boxes.length === 2 && boxes[1]!.box.y > boxes[0]!.box.y;
-  const lines = boxes.map((b) => captionLines(b.half, b.box.w));
-  const total = stacked ? lines.reduce((a, b) => a + b, 0) : Math.max(...lines);
-  return Math.max(CAPTION_BAND, total * CAPTION_LINE_PX + 8);
-}
-
 /** `awake`: a side with no GPUs is only "empty" once the fleet is up; asleep or waking it is still to come. */
-function stageLabels(layout: MosaicLayout | null, awake: boolean): StageLabels {
-  if (!layout) return { seam: [], captions: [], empty: null };
+function stageLabels(layout: MosaicLayout | null, awake: boolean, phone: boolean): StageLabels {
+  if (!layout) return { sides: [], empty: null };
   const img = layout.image;
   const mid = layout.halfLineX;
-  const captions = captionBoxes(img, layout.split).map((c) => ({
-    half: c.half,
-    tag: KIND_TAG[c.half],
-    text: CAPTIONS[c.half],
-    box: c.box,
-    // Under its own side, the EC2 caption keeps to the right edge.
-    align: (c.half === "ec2" && c.box.x > img.x ? "right" : "left") as "left" | "right",
-  }));
+  const y = phone ? img.y + 8 : Math.max(img.y + 12, HUD_BAND);
+  // A half too narrow for its whole tag (a phone held upright, or a side with few GPUs) says only whose half it is.
+  const widthOf = (half: Half) => (mid === null ? img.w : half === "fcvm" ? mid - img.x : img.x + img.w - mid);
+  const side = (half: Half, x: number, align: "left" | "right"): SideTag => ({
+    half,
+    tag: SIDE_TAGS[half].tag,
+    text: widthOf(half) < SIDE_TAG_FULL_W ? "" : SIDE_TAGS[half].text,
+    x,
+    y,
+    align,
+  });
   if (mid === null) {
     // One side has every GPU: it takes the whole width, and the other says it is empty.
     const present: Half = layout.split >= 1 ? "fcvm" : "ec2";
     const absent: Half = present === "fcvm" ? "ec2" : "fcvm";
+    const ey = y + 32;
     return {
-      seam: [
-        present === "fcvm"
-          ? { half: "fcvm", text: "fcvm", x: img.x + 10, y: img.y + 10, align: "left" }
-          : { half: "ec2", text: "EC2", x: img.x + img.w - 10, y: img.y + 10, align: "right" },
-      ],
-      captions,
+      sides: [present === "fcvm" ? side("fcvm", img.x + 12, "left") : side("ec2", img.x + img.w - 12, "right")],
       empty: !awake
         ? null
         : absent === "ec2"
-          ? { half: "ec2", text: EMPTY_SIDE.ec2, x: img.x + img.w - 10, y: img.y + 10, align: "right" }
-          : { half: "fcvm", text: EMPTY_SIDE.fcvm, x: img.x + 10, y: img.y + 10, align: "left" },
+          ? { half: "ec2", text: EMPTY_SIDE.ec2, x: img.x + img.w - 12, y: ey, align: "right" }
+          : { half: "fcvm", text: EMPTY_SIDE.fcvm, x: img.x + 12, y: ey, align: "left" },
     };
   }
-  return {
-    seam: [
-      { half: "fcvm", text: "fcvm", x: mid - 8, y: img.y + 10, align: "right" },
-      { half: "ec2", text: "EC2", x: mid + 8, y: img.y + 10, align: "left" },
-    ],
-    captions,
-    empty: null,
-  };
+  return { sides: [side("fcvm", mid - 12, "right"), side("ec2", mid + 12, "left")], empty: null };
 }
 
 // ---- the whole page ------------------------------------------------------------
@@ -1159,6 +1172,9 @@ export interface WallView {
   /** The phone's way into the Play drawer: a text link under its one button. */
   playButton: { label: string; open: boolean; phoneLabel: string };
   pause: { label: string; on: boolean };
+  /** The newest action, briefly. */
+  toast: FeedItem | null;
+  /** The last few actions, newest first, for the drawer's About section. */
   feed: FeedItem[];
   counter: CounterView | null;
   isolation: IsolationView;
@@ -1168,12 +1184,22 @@ export interface WallView {
   reel: ReelView | null;
   focus: FocusView | null;
   own: OwnView | null;
+  /** Null when this fleet lends no GPUs: the button is not shown. */
   ownButton: OwnButton | null;
   /** Shown when this viewer's claim was refused. */
   ownRefusal: { text: string; dismiss: string } | null;
   viewers: string;
-  help: string;
+  /** A one-time hint the first time the pointer is over the image. */
+  hint: string;
   rotateHint: string;
+  /** The live image is whole and the fleet awake. */
+  live: boolean;
+  /** "2560×1440 · 15 × NVIDIA T4 · 30 fps · path traced", or "". */
+  spec: string;
+  /** The last race in one line, or "". */
+  lastRace: string;
+  /** The race drawn on the image: a clock per half while it runs, then the result. */
+  race: RaceOnImage | null;
   plan: DrawPlan;
   seams: SeamView;
   /** This viewer's borrowed tile is coming back into the image (labelled until it streams). */
@@ -1231,14 +1257,59 @@ export function pendingIntents(s: ClientState): IntentMsg[] {
 }
 
 /**
- * The image's area: the stage less the band its captions sit in, tall enough for
- * the captions at the widths the two sides will have (`split`: where fcvm ends).
+ * The image's area: the whole stage. The image is contain-fitted in it, and the bands a
+ * different aspect leaves (top and bottom, or the sides) hold the controls; nothing is
+ * reserved under the image any more.
  */
-export function imageArea(stage: Box, phone: boolean, aspect: number = 16 / 9, split = 0.5): Box {
-  if (phone) return stage;
-  let band = CAPTION_BAND;
-  for (let i = 0; i < 3; i++) band = captionBand(Math.min(stage.w, (stage.h - band) * aspect), split);
-  return { x: stage.x, y: stage.y, w: stage.w, h: Math.max(0, stage.h - band) };
+export function imageArea(stage: Box): Box {
+  return stage;
+}
+
+/** The line under the image that says what is drawing it: "2560×1440 · 15 × NVIDIA T4 · 30 fps · path traced". */
+export function specLine(st: FleetState, s: ClientState, image: Box | null, dpr: number): string {
+  if (!image || st.fleet.power.state !== "awake") return "";
+  const live = st.tiles.filter(isLive);
+  if (live.length === 0) return "";
+  const names = new Map<string, number>();
+  for (const t of live) if (t.gpu) names.set(t.gpu.name, (names.get(t.gpu.name) ?? 0) + 1);
+  const gpu = [...names.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "GPU";
+  // The renderers' own rate where they report it; else what this page receives.
+  const reported = live.map((t) => t.fps).filter((x): x is number => x !== null && x > 0);
+  const fps = (reported.length > 0 ? reported : Object.values(s.frames?.tiles ?? {}).filter((x) => x.newestT !== null && x.fps > 0).map((x) => x.fps)).sort((a, b) => a - b);
+  const parts = [`${Math.round(image.w * dpr)}×${Math.round(image.h * dpr)}`, `${live.length} × ${gpu}`];
+  if (fps.length > 0) parts.push(`${Math.round(fps[Math.floor(fps.length / 2)]!)} fps`);
+  parts.push("path traced");
+  return parts.join(" · ");
+}
+
+/**
+ * The last race in one line, so the strip never shows dashes: the scoreboard, else the
+ * newest race the coordinator kept (`races`), else each half's newest single restart,
+ * else "". Asleep or waking, dated.
+ */
+export function lastRaceLine(st: FleetState): string {
+  const asleep = st.fleet.power.state !== "awake";
+  const line = (f: number | null, e: number | null, at: number | null): string => {
+    const parts: string[] = [];
+    if (f !== null) parts.push(`fcvm back in ${fmt.seconds(f)}`);
+    if (e !== null) parts.push(`EC2 back in ${fmt.seconds(e)}`);
+    if (f !== null && e !== null) parts.push(`${ratioText(f, e)} faster`);
+    return `Last race: ${parts.join(" · ")}${asleep && at !== null ? ` · measured ${fmt.utcDate(at)}` : ""}`;
+  };
+  const { fcvm, ec2 } = st.scoreboard;
+  if (fcvm !== null || ec2 !== null) return line(fcvm?.last_ms ?? null, ec2?.last_ms ?? null, st.relaunch_all?.started_at ?? null);
+  const race = [...st.races].reverse().find((r) => r.fcvm?.time_ms != null || r.ec2?.time_ms != null);
+  if (race) return line(race.fcvm?.time_ms ?? null, race.ec2?.time_ms ?? null, race.started_at);
+  const single = (h: Half): string | null => {
+    let best: Tile | null = null;
+    for (const t of st.tiles) {
+      if (t.half !== h || relaunchMs(t) === null) continue;
+      if (best === null || t.last_relaunch!.first_frame_at! > best.last_relaunch!.first_frame_at!) best = t;
+    }
+    return best === null ? null : `${tileName(best)} back in ${fmt.seconds(relaunchMs(best)!)}`;
+  };
+  const singles = [single("fcvm"), single("ec2")].filter((x): x is string => x !== null);
+  return singles.length > 0 ? `Last single restarts: ${singles.join(" · ")}` : "";
 }
 
 export function wallView(input: WallInput): WallView {
@@ -1288,7 +1359,7 @@ export function wallView(input: WallInput): WallView {
     atT: 0,
   };
   const area = input.mosaicArea
-    ? imageArea(input.mosaicArea, input.phone, s.accepted?.image_aspect, s.accepted ? splitOf(input.canDecode ? drawnTiles(s) : s.accepted.tiles) : 0.5)
+    ? imageArea(input.mosaicArea)
     : null;
   const common = {
     title: TITLE,
@@ -1297,10 +1368,10 @@ export function wallView(input: WallInput): WallView {
     version: s.version,
     online,
     banners,
-    playButton: { label: "Play", open: s.ui.drawer, phoneLabel: "Play: write a word in the sky, drop a light" },
+    playButton: { label: "Direct the scene", open: s.ui.drawer, phoneLabel: "Direct the scene: write a word in the sky, drop a light" },
     pause: { label: s.ui.paused ? "Resume" : "Pause", on: s.ui.paused },
-    help: "Click a square to look at its VM.",
-    rotateHint: "Turn your phone sideways for a bigger picture.",
+    hint: "Click a square to look at its VM.",
+    rotateHint: "Turn sideways for full screen",
   };
   if (!st) {
     // Before the first snapshot the poster still goes where the image will be.
@@ -1311,8 +1382,9 @@ export function wallView(input: WallInput): WallView {
       layout: null,
       tiles: [],
       score: null,
-      labels: { seam: [], captions: [], empty: null },
+      labels: { sides: [], empty: null },
       play: null,
+      toast: null,
       feed: [],
       counter: null,
       isolation: isolationView(null),
@@ -1323,6 +1395,10 @@ export function wallView(input: WallInput): WallView {
       ownButton: null,
       ownRefusal: null,
       viewers: "",
+      live: false,
+      spec: "",
+      lastRace: "",
+      race: null,
       plan: { ...emptyPlan, image },
       seams: { visible: false, segments: [], lineWidth: 1 / input.dpr, outline: null, label: null },
       returning: false,
@@ -1418,9 +1494,10 @@ export function wallView(input: WallInput): WallView {
     layout,
     tiles,
     score: scoreView({ st, now: srvNow, pending: pend, online }),
-    labels: stageLabels(covered ? null : layout, st.fleet.power.state === "awake"),
+    labels: stageLabels(covered ? null : layout, st.fleet.power.state === "awake", input.phone),
     play,
-    feed: feedView(st, srvNow, s.you, input.phone ? 1 : 3),
+    toast: toastView(st, srvNow, s.you),
+    feed: feedView(st, srvNow, s.you, 5),
     counter: counterView(st),
     isolation: isolationView(st),
     sleep,
@@ -1440,6 +1517,10 @@ export function wallView(input: WallInput): WallView {
     ownButton: ownButton(st, srvNow, online, s.own.requestId !== null || (s.own.claim !== null && s.own.claim.phase !== "ended")),
     ownRefusal: s.own.refused === null ? null : { text: `No GPU is free right now: ${s.own.refused}. Try again in a minute.`, dismiss: "OK" },
     viewers: fmt.count(st.viewers.active, "person watching", "people watching"),
+    live: st.fleet.power.state === "awake" && imageWhole(plan, s.frames),
+    spec: specLine(st, s, planLayout?.image ?? null, input.dpr),
+    lastRace: lastRaceLine(st),
+    race: covered ? null : raceOnImage(st, srvNow, layout?.image ?? null, layout?.split ?? 0.5),
     plan,
     seams: seamView(s, covered ? null : layout, tiles, input, returning),
     returning,

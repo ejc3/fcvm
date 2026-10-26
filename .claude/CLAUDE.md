@@ -774,10 +774,15 @@ grep -Eq '^[[:space:]]*user_allow_other[[:space:]]*$' /etc/fuse.conf || echo use
 #    setup builds a kernel locally whenever a profile's release artifact is
 #    absent, and a fresh box hits that path. libseccomp-dev is the firecracker
 #    fork's: setup builds it from source and the link fails with
-#    "cannot find -lseccomp" without the headers.
+#    "cannot find -lseccomp" without the headers. debhelper, libdw-dev, rsync,
+#    kmod, cpio and patch are `make install-host-kernel`'s (bindeb-pkg); that
+#    target checks them, and 40 GiB free in its build directory, before it
+#    compiles anything (scripts/check-host-kernel-build.sh), and builds on
+#    /mnt/fcvm-btrfs when /tmp is on the root disk.
 sudo apt-get install -y build-essential git jq qemu-utils busybox-static \
     pkg-config libssl-dev clang make podman skopeo uidmap slirp4netns fuse3 passt \
-    btrfs-progs bc bison flex libelf-dev libseccomp-dev
+    btrfs-progs bc bison flex libelf-dev libseccomp-dev \
+    debhelper libdw-dev rsync kmod cpio patch
 
 # 3. Fast local storage. Instance-store NVMe is WIPED by a cloud stop/start —
 #    put /mnt/fcvm-btrfs on it (rebuildable cache), keep sources on the durable
@@ -2131,6 +2136,13 @@ every self-hosted job plus the `scripts/ci-stray-vm-guard.sh` pre/post steps in 
 `always()` cleanup step does not run when the process is SIGKILLed — which is exactly the case
 that leaked. If teardown matters, it must survive SIGKILL.
 
+**Host state the kernel does not reap is recorded before it is made.** A VM's runtime
+directory, the mountpoint a restore makes over a gone source's directory, and image-cache
+temporaries are recorded with an owner (`src/reclaim.rs`) whose flock the kernel releases on
+SIGKILL, and every launch first reclaims what dead owners recorded. A new resource that
+outlives fcvm unless teardown removes it gets a `reclaim::Resource` and a SIGKILL case in
+`tests/test_reclaim.rs`.
+
 ### Container Build Rules
 
 **Container builds work naturally with layer caching.** No workarounds needed.
@@ -3124,6 +3136,7 @@ assets_dir (default: /mnt/fcvm-btrfs)
 data_dir (default: /mnt/fcvm-btrfs, override per nesting level)
 ├── vm-disks/{vm_id}/disks/       # CoW reflink copies per VM
 ├── state/{vm_id}.json            # VM state files
+├── reclaim/{euid}/{id}.json       # what a live fcvm made on the host; the next launch reclaims a dead one's (src/reclaim.rs)
 ├── pmem/{sha}.img                # --pmem copies, one per image version, read-only
 └── snapshots/{name}/             # Firecracker snapshots
     └── disk/                     # the snapshot's disks, a btrfs subvolume (clones snapshot it)

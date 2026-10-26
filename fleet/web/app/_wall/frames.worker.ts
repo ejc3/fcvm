@@ -785,6 +785,7 @@ function draw(): void {
     needsClear = false;
   }
   ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
   const at = now();
   let missing = 0;
   for (const src of shown) {

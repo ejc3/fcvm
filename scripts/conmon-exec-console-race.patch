@@ -1,4 +1,4 @@
-conmon: accept the console when the runtime exits before the loop sees it
+conmon: accept the console and attach connections when the runtime exits before the loop sees them
 
 For `exec -t`, the runtime connects to the console socket and sends the
 terminal before it exits. conmon accepts that connection from a main-loop
@@ -15,6 +15,16 @@ conmon bytes ""` for an exec whose process already ran.
 After the loop, if the runtime succeeded and no terminal was received, take
 a connection that is already queued on the console socket.
 
+The attach connection can be queued for the same reason. podman connects to
+the attach socket before it lets the runtime start, so when the poll before
+the reaping callback ran ahead of that connect, the loop quits with it still
+queued. If the exec'd process has also exited, conmon does not run its
+second loop: it drains the terminal with no attach connection accepted,
+which drops the output, and exits, which resets the queued connection.
+podman reads the reset as end of output, so the exec exits 0 with no
+output. So after taking the late console, also accept the attach
+connections already queued.
+
 Carried by fcvm (issue #841). The race is still present in upstream conmon
 main, which since 05eff515 reports the same failure on the sync pipe.
 
@@ -28,7 +38,7 @@ main, which since 05eff515 reports the same failure on the sync pipe.
  
  static void disconnect_std_streams(int dev_null_r, int dev_null_w)
  {
-@@ -340,8 +341,9 @@
+@@ -340,8 +341,9 @@ int main(int argc, char *argv[])
  	if (seccomp_listener != NULL)
  		g_unix_fd_add(seccomp_socket_fd, G_IO_IN, seccomp_accept_cb, csname);
  
@@ -39,7 +49,7 @@ main, which since 05eff515 reports the same failure on the sync pipe.
  		/* Process any SIGCHLD we may have missed before the signal handler was in place.  */
  		if (!opt_exec || !opt_terminal || container_status < 0) {
  			GHashTable *exit_status_cache = g_hash_table_new_full(g_int_hash, g_int_equal, g_free, g_free);
-@@ -385,6 +387,29 @@
+@@ -385,6 +387,37 @@ int main(int argc, char *argv[])
  		nexitf("Failed to create container: exit status %d", get_exit_status(runtime_status));
  	}
  
@@ -63,9 +73,107 @@ main, which since 05eff515 reports the same failure on the sync pipe.
 +			ndebug("accepting the console after the runtime exited");
 +			g_source_remove(console_watch);
 +			terminal_accept_cb(console_socket_fd, G_IO_IN, csname);
++			/*
++			 * The loop missed the attach connection for the same
++			 * reason: the client connected before the runtime
++			 * started. If the process has also exited, the loop
++			 * below does not run, and output drained to no
++			 * accepted connection is lost.
++			 */
++			accept_queued_attach_connections();
 +		}
 +	}
 +
  	if (opt_terminal && mainfd_stdout == -1)
  		nexit("Runtime did not set up terminal");
  
+--- a/src/conn_sock.c
++++ b/src/conn_sock.c
+@@ -16,6 +16,7 @@
+ #include <sys/stat.h>
+ 
+ static gboolean attach_cb(int fd, G_GNUC_UNUSED GIOCondition condition, gpointer user_data);
++static gboolean accept_attach_connection(int fd, struct remote_sock_s *srcsock);
+ static gboolean remote_sock_cb(int fd, GIOCondition condition, gpointer user_data);
+ static void init_remote_sock(struct remote_sock_s *sock, struct remote_sock_s *src);
+ static gboolean read_remote_sock(struct remote_sock_s *sock);
+@@ -370,29 +371,51 @@ void write_back_to_remote_consoles(char *buf, int len)
+ /* Internal */
+ static gboolean attach_cb(int fd, G_GNUC_UNUSED GIOCondition condition, gpointer user_data)
+ {
+-	struct remote_sock_s *srcsock = (struct remote_sock_s *)user_data;
++	accept_attach_connection(fd, (struct remote_sock_s *)user_data);
++	return G_SOURCE_CONTINUE;
++}
++
++/*
++ * Accept the attach connections already queued, for when the main loop quit
++ * before dispatching attach_cb. Output is relayed only to accepted
++ * connections, and a connection still queued when conmon exits is reset, so
++ * the client reads neither output nor an error.
++ */
++void accept_queued_attach_connections(void)
++{
++	int accepted = 0;
++	if (remote_attach_sock.fd < 0)
++		return;
++	while (accept_attach_connection(remote_attach_sock.fd, &remote_attach_sock))
++		accepted++;
++	if (accepted > 0)
++		ndebugf("accepted %d attach connection%s after the runtime exited", accepted, accepted == 1 ? "" : "s");
++}
++
++/* Returns TRUE when it accepted a connection. */
++static gboolean accept_attach_connection(int fd, struct remote_sock_s *srcsock)
++{
+ 	int new_fd = accept(fd, NULL, NULL);
+ 	if (new_fd == -1) {
+ 		if (errno != EWOULDBLOCK)
+ 			nwarn("Failed to accept client connection on attach socket");
+-	} else {
+-		struct remote_sock_s *remote_sock;
+-		set_socket_buffers(new_fd);
+-		if (srcsock->dest->readers == NULL) {
+-			srcsock->dest->readers = g_ptr_array_new_with_free_func(free);
+-		}
+-		remote_sock = malloc(sizeof(*remote_sock));
+-		if (remote_sock == NULL) {
+-			pexit("Failed to allocate memory");
+-		}
+-		init_remote_sock(remote_sock, srcsock);
+-		remote_sock->fd = new_fd;
+-		g_unix_fd_add(remote_sock->fd, G_IO_IN | G_IO_HUP | G_IO_ERR, remote_sock_cb, remote_sock);
+-		g_ptr_array_add(remote_sock->dest->readers, remote_sock);
+-		ndebugf("Accepted%s connection %d", SOCK_IS_CONSOLE(srcsock->sock_type) ? " console" : "", remote_sock->fd);
++		return FALSE;
+ 	}
+-
+-	return G_SOURCE_CONTINUE;
++	struct remote_sock_s *remote_sock;
++	set_socket_buffers(new_fd);
++	if (srcsock->dest->readers == NULL) {
++		srcsock->dest->readers = g_ptr_array_new_with_free_func(free);
++	}
++	remote_sock = malloc(sizeof(*remote_sock));
++	if (remote_sock == NULL) {
++		pexit("Failed to allocate memory");
++	}
++	init_remote_sock(remote_sock, srcsock);
++	remote_sock->fd = new_fd;
++	g_unix_fd_add(remote_sock->fd, G_IO_IN | G_IO_HUP | G_IO_ERR, remote_sock_cb, remote_sock);
++	g_ptr_array_add(remote_sock->dest->readers, remote_sock);
++	ndebugf("Accepted%s connection %d", SOCK_IS_CONSOLE(srcsock->sock_type) ? " console" : "", remote_sock->fd);
++	return TRUE;
+ }
+ 
+ static gboolean remote_sock_cb(G_GNUC_UNUSED int fd, GIOCondition condition, gpointer user_data)
+--- a/src/conn_sock.h
++++ b/src/conn_sock.h
+@@ -50,6 +50,7 @@ struct local_sock_s {
+ char *setup_console_socket(void);
+ char *setup_seccomp_socket(const char *socket);
+ char *setup_attach_socket(void);
++void accept_queued_attach_connections(void);
+ void setup_notify_socket(char *);
+ void schedule_main_stdin_write();
+ void write_back_to_remote_consoles(char *buf, int len);

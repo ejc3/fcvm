@@ -503,7 +503,7 @@ pub(super) async fn attach_extra_disks(
                     source_dir.display()
                 );
             }
-            super::image::create_disk_from_dir(source_dir, &image_path, false).await?;
+            super::image::create_disk_from_dir(source_dir, &image_path, false, None).await?;
         } else {
             info!(
                 image = %image_path.display(),
@@ -671,6 +671,36 @@ fn guest_reachable_ntp(ip: &std::net::IpAddr) -> bool {
     }
 }
 
+/// The NTP addresses a guest gets: at most `NTP_SERVER_LIMIT`, guest-reachable, without
+/// repeats, alternating between IPv6 and IPv4 while both remain.
+///
+/// A guest may reach only one family: a routed VM has no IPv4 egress, and a VM without
+/// `--enable-ipv6` none over IPv6. Taking the first addresses in resolver order gave a
+/// routed GPU guest four IPv4 addresses of `ntp.ubuntu.com` (it has four A records), so
+/// its chronyd reached none of them and the clock kept whatever error the restore left
+/// it with: 0.3 to 1.0 s behind on the GPU wall, for the life of the VM.
+fn pick_ntp_addresses(resolved: impl IntoIterator<Item = std::net::IpAddr>) -> Vec<String> {
+    let mut v6 = Vec::new();
+    let mut v4 = Vec::new();
+    for ip in resolved.into_iter().filter(guest_reachable_ntp) {
+        let family = if ip.is_ipv6() { &mut v6 } else { &mut v4 };
+        if !family.contains(&ip) {
+            family.push(ip);
+        }
+    }
+    let (mut v6, mut v4) = (v6.into_iter(), v4.into_iter());
+    let mut picked = Vec::new();
+    while picked.len() < NTP_SERVER_LIMIT {
+        let next: Vec<_> = [v6.next(), v4.next()].into_iter().flatten().collect();
+        if next.is_empty() {
+            break;
+        }
+        picked.extend(next.into_iter().map(|ip| ip.to_string()));
+    }
+    picked.truncate(NTP_SERVER_LIMIT);
+    picked
+}
+
 /// The host's NTP servers, resolved to addresses, for the guest's chronyd.
 ///
 /// The guest cannot read the host's chrony.conf — nothing mounts the host's /etc into
@@ -681,9 +711,9 @@ fn guest_reachable_ntp(ip: &std::net::IpAddr) -> bool {
 /// This is a blocking lookup on the launch path, so it was measured rather than
 /// assumed: 0.2-0.5ms warm and 5.5ms on the first (cold-resolver) call on a c7g box
 /// whose host chronyd keeps these names in the local resolver cache. That is in line
-/// with the launch path's existing millisecond-scale steps; the cap below keeps it to
-/// a single lookup in the common case, since one `pool` name already yields four
-/// addresses.
+/// with the launch path's existing millisecond-scale steps. Every configured name is
+/// resolved (Ubuntu's config names one pool), so that both families are known before
+/// `pick_ntp_addresses` chooses.
 fn host_ntp_servers() -> Vec<String> {
     let names = HOST_CHRONY_CONFS
         .iter()
@@ -695,23 +725,14 @@ fn host_ntp_servers() -> Vec<String> {
             vec![DEFAULT_NTP_POOL.to_string()]
         });
 
-    let mut addrs: Vec<String> = Vec::new();
+    let mut resolved: Vec<std::net::IpAddr> = Vec::new();
     for name in names {
         match std::net::ToSocketAddrs::to_socket_addrs(&(name.as_str(), 123u16)) {
-            Ok(resolved) => {
-                for addr in resolved.filter(|a| guest_reachable_ntp(&a.ip())) {
-                    let ip = addr.ip().to_string();
-                    if !addrs.contains(&ip) {
-                        addrs.push(ip);
-                    }
-                    if addrs.len() >= NTP_SERVER_LIMIT {
-                        return addrs;
-                    }
-                }
-            }
+            Ok(addrs) => resolved.extend(addrs.map(|a| a.ip())),
             Err(e) => warn!(server = %name, error = %e, "failed to resolve host NTP server"),
         }
     }
+    let addrs = pick_ntp_addresses(resolved);
     if addrs.is_empty() {
         warn!("no host NTP servers resolved; guest clock will rely on host-time sync only");
     }
@@ -837,7 +858,7 @@ pub(super) fn build_boot_plan_json(
         subuid_count: subuid_range.map(|(_, count)| count),
         subgid_start: subgid_range.map(|(start, _)| start),
         subgid_count: subgid_range.map(|(_, count)| count),
-        host_time: chrono::Utc::now().timestamp().to_string(),
+        host_clock: crate::utils::host_clock_now(),
         ntp_servers: host_ntp_servers(),
     };
 
@@ -2693,6 +2714,44 @@ driftfile /var/lib/chrony/drift
         assert!(reachable("91.189.91.157"));
         assert!(reachable("10.0.0.1"), "private but routable from a guest");
         assert!(reachable("2620:2d:4000:1::3f"));
+    }
+
+    /// A guest that reaches only one address family still gets servers in it: a pool
+    /// whose first four answers are IPv4 must not crowd out its IPv6 addresses.
+    #[test]
+    fn test_pick_ntp_addresses_gives_both_families() {
+        let ips = |list: &[&str]| -> Vec<std::net::IpAddr> {
+            list.iter().map(|s| s.parse().unwrap()).collect()
+        };
+        let pool = ips(&[
+            "192.0.2.1",
+            "192.0.2.2",
+            "192.0.2.3",
+            "192.0.2.4",
+            "2001:db8::1",
+            "2001:db8::2",
+            "169.254.169.123",
+            "192.0.2.1",
+        ]);
+        assert_eq!(
+            pick_ntp_addresses(pool),
+            ["2001:db8::1", "192.0.2.1", "2001:db8::2", "192.0.2.2"]
+        );
+        assert_eq!(
+            pick_ntp_addresses(ips(&["192.0.2.1", "192.0.2.2", "192.0.2.1"])),
+            ["192.0.2.1", "192.0.2.2"]
+        );
+        assert_eq!(
+            pick_ntp_addresses(ips(&[
+                "2001:db8::1",
+                "2001:db8::2",
+                "2001:db8::3",
+                "2001:db8::4",
+                "2001:db8::5"
+            ])),
+            ["2001:db8::1", "2001:db8::2", "2001:db8::3", "2001:db8::4"]
+        );
+        assert!(pick_ntp_addresses(ips(&["fe80::1", "127.0.0.1"])).is_empty());
     }
 
     /// A guest with no NTP source silently drifts, so the plan must never be empty

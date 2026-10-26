@@ -21,12 +21,14 @@ on:
   # reported it CLEAN (PR #785 was mechanically mergeable that way). The
   # expensive matrix is skipped per-job via the `changes` job below instead, so
   # every PR still gets exactly one `Summary` check and it can be required.
+  # `closed` starts a run that tests nothing: it joins the PR's concurrency group, which
+  # cancels the PR's queued and running jobs, so a merged or closed PR stops using runners.
   # `ready_for_review` is listed so marking a draft ready starts a run: the draft's own
   # runs may have been cancelled, superseded or never started, and the flip is the
   # point at which the PR is offered for review. Listing types replaces the default
   # set, so the defaults (opened, synchronize, reopened) are listed too.
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, closed]
   push:
     branches: [main]
     paths-ignore:
@@ -46,8 +48,11 @@ on:
 # land faster than the matrix (about 40 minutes) left main with no completed host or
 # container run at all (2026-10-24: runs on 8e2fb2b2 and e121e7f0 both cancelled with
 # every self-hosted job still queued).
+# Pull request runs are grouped by PR number: for a merged PR's `closed` event GitHub sets
+# github.ref to the target branch, which would put that run in main's group and cancel
+# main's run instead of the PR's.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -88,6 +93,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR: ${{ github.event.number }}
           REPO: ${{ github.repository }}
+          ACTION: ${{ github.event.action }}
           DRAFT: ${{ github.event.pull_request.draft }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
@@ -137,11 +143,19 @@ jobs:
     env:
       # Ports for the mock fleet and the page under test: this runner runs nothing else.
       FLEET_TEST_BASE_PORT: "24100"
-      # The mock renders every pixel in JavaScript. On a 4-vCPU runner it keeps up
-      # with 16 tiles at 10 frames per second on a 1280x800 screen, where the stage
-      # letterboxes the image to about 700x390 (smaller screens leave tiles too few
-      # pixels for the seam checks' colour fit).
-      FLEET_E2E_VIEW: "1280x800"
+      # The mock renders every pixel in JavaScript, on FLEET_MOCK_THREADS threads.
+      # The image fills the window: 960x600 is a 960x540 image, tiles asked at 144,
+      # 752,640 pixels a frame with the overlap. `node scripts/mock-render-cost.ts
+      # 960 600 10` prints what that costs; on this runner (4 vCPU, EPYC 7763) the
+      # mock used about 2.2 cores of its 3 at 10 frames per second through the suite.
+      # Before the render loop lost its per-pixel allocations it needed more than 3,
+      # dropped frames from the first test, and later tests timed out waiting for
+      # every tile at one common t. A stream switch serves the aggregates and the
+      # direct tiles at once (18 streams, about 1.75 times the pixels) for a second or
+      # so; the mock then skips whole frames, the same ones for every stream, so the
+      # page still finds a t every tile holds. Smaller screens leave tiles too few
+      # pixels for the seam checks' colour fit.
+      FLEET_E2E_VIEW: "960x600"
       FLEET_MOCK_FPS: "10"
       FLEET_MOCK_THREADS: "3"
     steps:
