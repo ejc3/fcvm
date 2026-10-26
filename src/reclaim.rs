@@ -84,6 +84,8 @@ pub fn owner_dir() -> Result<PathBuf> {
 
 /// [`owner_dir`] under an explicit data directory.
 pub fn owner_dir_in(data_dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating data directory {}", data_dir.display()))?;
     let shared = data_dir.join("reclaim");
     match std::fs::DirBuilder::new().mode(0o1777).create(&shared) {
         // Like /tmp: every user makes a directory of its own here, and the sticky bit
@@ -177,6 +179,16 @@ fn lock_owner_file(path: &Path, wait: bool) -> Result<Option<Flock<File>>> {
     }
 }
 
+/// Close this process's descriptor of an owner lock without unlocking it. An explicit
+/// unlock would release the lock for every descriptor of it, including the ones helpers
+/// inherited (`Holder`), as a process that dies does not.
+fn release(lock: Flock<File>) {
+    let lock = std::mem::ManuallyDrop::new(lock);
+    // SAFETY: the wrapper is never dropped, so the file is read out of it exactly once.
+    let file: File = unsafe { std::ptr::read(&**lock) };
+    drop(file);
+}
+
 fn write_record(dir: &Path, id: &str, resources: &[Resource]) -> Result<()> {
     let record = Record {
         pid: std::process::id(),
@@ -196,7 +208,7 @@ fn delete_owner_files(dir: &Path, id: &str, lock: Flock<File>) -> Result<()> {
         .and_then(|()| remove_if_exists(&record_temp_path(dir, id)))
         .and_then(|()| remove_if_exists(&lock_path(dir, id)))
         .with_context(|| format!("deleting the owner record of {id}"))?;
-    drop(lock);
+    release(lock);
     Ok(())
 }
 
@@ -277,6 +289,50 @@ impl Owner {
     }
 }
 
+impl Owner {
+    /// A handle on this owner's lock that a child process can inherit (`Holder::hold_in`).
+    /// The lock is one open file description, so it stays held while any process holds a
+    /// descriptor of it: a helper that writes this owner's resources keeps the owner live
+    /// until it exits, and nothing reclaims what it is still writing.
+    pub fn holder(&self) -> Result<Holder> {
+        use std::os::fd::AsFd;
+        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = state
+            .lock
+            .as_ref()
+            .context("a completed owner has no lock to hold")?;
+        let fd = lock
+            .as_fd()
+            .try_clone_to_owned()
+            .context("duplicating the owner lock")?;
+        Ok(Holder(std::sync::Arc::new(fd)))
+    }
+}
+
+/// A descriptor of an owner's lock (`Owner::holder`).
+#[derive(Clone)]
+pub struct Holder(std::sync::Arc<std::os::fd::OwnedFd>);
+
+impl Holder {
+    /// Let the process `command` starts inherit the lock, so the owner stays live until
+    /// that process exits, whatever happens to this one.
+    pub fn hold_in(&self, command: &mut tokio::process::Command) {
+        use std::os::fd::AsRawFd;
+        let fd = self.0.as_raw_fd();
+        let keep = self.0.clone();
+        // SAFETY: fcntl is async-signal-safe and touches only the child's descriptor table.
+        unsafe {
+            command.pre_exec(move || {
+                let _ = &keep;
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
 impl Drop for Owner {
     fn drop(&mut self) {
         let mut owners = OWNERS.lock().unwrap_or_else(|e| e.into_inner());
@@ -296,7 +352,9 @@ impl Drop for Owner {
             );
         }
         state.pins.clear();
-        state.lock.take();
+        if let Some(lock) = state.lock.take() {
+            release(lock);
+        }
     }
 }
 
@@ -350,7 +408,7 @@ impl Inner {
             .join("; ");
         let resources: Vec<Resource> = remaining.into_iter().map(|(r, _)| r).collect();
         write_record(&self.dir, &self.id, &resources)?;
-        drop(lock);
+        release(lock);
         bail!(
             "{} resource(s) of {} remain for the next launch to reclaim: {kept}",
             resources.len(),
@@ -526,6 +584,18 @@ pub struct Reclaimed {
 /// owner directory. Called when a VM launch starts. Never waits on a live owner, and never
 /// fails the launch: what it cannot undo is logged and left for the next one.
 pub async fn reclaim_abandoned() -> Reclaimed {
+    // The pmem store keeps its own record of who is using `tmp/`: its lock.
+    let data_dir = crate::paths::data_dir();
+    match tokio::task::spawn_blocking(move || {
+        crate::storage::pmem_store::collect_abandoned_temps(&data_dir)
+    })
+    .await
+    {
+        Ok(Ok(0)) => {}
+        Ok(Ok(removed)) => info!(removed, "removed temps of killed pmem ingests"),
+        Ok(Err(error)) => warn!(error = %format!("{error:#}"), "cannot collect pmem store temps"),
+        Err(error) => warn!(%error, "cannot collect pmem store temps"),
+    }
     let dir = match owner_dir() {
         Ok(dir) => dir,
         Err(error) => {
@@ -609,7 +679,7 @@ pub async fn reclaim_abandoned_in(dir: &Path) -> Reclaimed {
         if let Err(error) = write_record(dir, &id, &resources) {
             warn!(owner = %id, error = %format!("{error:#}"), "cannot rewrite owner record");
         }
-        drop(lock);
+        release(lock);
     }
     if done != Reclaimed::default() {
         info!(
@@ -883,5 +953,41 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
         let error = owner_dir_in(root.path()).unwrap_err().to_string();
         assert!(error.contains("no one else can write"), "{error}");
+    }
+
+    /// A helper that writes an owner's resources inherits its lock, so a pass leaves them
+    /// while the helper runs, even after the owner itself is gone.
+    #[tokio::test]
+    async fn a_helper_holding_the_lock_keeps_its_owners_resources() {
+        let (root, dir) = test_dir();
+        let temp = root.path().join("being-written.tmp");
+        std::fs::write(&temp, b"x").unwrap();
+        let owner = Owner::begin_in(&dir, "image-temp-helper").unwrap();
+        owner.record(Resource::Temp { path: temp.clone() }).unwrap();
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("600").kill_on_drop(true);
+        owner.holder().unwrap().hold_in(&mut command);
+        let mut helper = command.spawn().unwrap();
+        // This process's copy of the descriptor goes with the command.
+        drop(command);
+        // The owner's process dies; its helper does not.
+        drop(owner);
+        assert_eq!(
+            reclaim_abandoned_in(&dir).await,
+            Reclaimed::default(),
+            "a pass reclaimed what a running helper is writing"
+        );
+        assert!(temp.exists());
+        helper.kill().await.unwrap();
+        assert_eq!(reclaim_abandoned_in(&dir).await.resources, 1);
+        assert!(!temp.exists());
+    }
+
+    /// The first launch with a new data directory creates it, as it did before owners.
+    #[test]
+    fn the_owner_directory_is_made_in_a_data_directory_that_does_not_exist_yet() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = owner_dir_in(&root.path().join("new/data")).unwrap();
+        assert!(dir.is_dir());
     }
 }

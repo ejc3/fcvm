@@ -503,7 +503,7 @@ pub(super) async fn attach_extra_disks(
                     source_dir.display()
                 );
             }
-            super::image::create_disk_from_dir(source_dir, &image_path, false).await?;
+            super::image::create_disk_from_dir(source_dir, &image_path, false, None).await?;
         } else {
             info!(
                 image = %image_path.display(),

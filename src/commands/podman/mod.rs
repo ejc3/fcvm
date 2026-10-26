@@ -1138,7 +1138,8 @@ async fn export_localhost_image_disk(
             path: tmp_path.clone(),
         })?;
         let exported = async {
-            image::export_image_archive(image_id, &args.image, &tmp_path).await?;
+            image::export_image_archive(image_id, &args.image, &tmp_path, Some(&temps.holder()?))
+                .await?;
             // Atomic rename within the same filesystem
             tokio::fs::rename(&tmp_path, &archive_path)
                 .await

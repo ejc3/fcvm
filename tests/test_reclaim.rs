@@ -310,8 +310,10 @@ async fn unique_localhost_image(name: &str) -> Result<String> {
         .await
         .context("running podman image inspect")?;
     anyhow::ensure!(inspected.status.success(), "podman image inspect failed");
+    // Only the line end: a locally built image has an empty digest, so the line starts
+    // with the tab.
     let line = String::from_utf8_lossy(&inspected.stdout)
-        .trim()
+        .trim_end()
         .to_string();
     let (digest, id) = line
         .split_once('\t')
