@@ -265,7 +265,7 @@ CONTAINER_RUN_BASE := "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" \
 # Container run with high process limits (for parallel test suites)
 CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=65536
 
-.PHONY: all help build clean clean-test-data check-disk \
+.PHONY: all help build clean clean-test-data check-disk check-host-kernel-build \
 	test test-unit test-agent-unit test-fast test-all test-root test-packaging test-ci-infrastructure test-clone-floor-overlap fuzz race-gym _race-gym race-gym-cases \
 	_test-unit _test-agent-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
@@ -326,6 +326,7 @@ help:
 	@echo "  setup-pjdfstest    Build pjdfstest"
 	@echo "  setup-lint-tools   Install cargo-audit and cargo-deny"
 	@echo "  install-host-kernel  Build and install host kernel with patches (requires reboot)"
+	@echo "  check-host-kernel-build  Check packages and free space install-host-kernel needs"
 	@echo ""
 	@echo "Kernel patches:"
 	@echo "  kernel-patch-create PROFILE=nested NAME=0004-fix FILE=fs/fuse/dir.c"
@@ -903,8 +904,22 @@ gpu-residue-test: setup-gpu
 # Build and install host kernel with all patches from kernel/patches/
 # Requires reboot to activate the new kernel
 install-host-kernel: private SHELL := $(TARGET_LEASE_SHELL)
-install-host-kernel: build setup-btrfs
-	$(SUDO_FCVM) ./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel
+install-host-kernel: check-host-kernel-build build setup-btrfs
+	dir=$$($(MAKEFILE_DIR)scripts/check-host-kernel-build.sh) || exit 2; \
+	$(SUDO_FCVM) env FCVM_HOST_KERNEL_BUILD_DIR="$$dir" ./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel
+
+# Under make -j a prerequisite's position orders nothing, so when the goal is
+# install-host-kernel the check is an order-only prerequisite of the build steps.
+ifneq ($(filter install-host-kernel,$(MAKECMDGOALS)),)
+build setup-btrfs: | check-host-kernel-build
+endif
+
+# Fails before anything is compiled when a package `bindeb-pkg` needs is missing
+# or the build directory lacks room (scripts/check-host-kernel-build.sh), and
+# prints the directory the build will use: on the scratch disk when /tmp is on
+# the root disk.
+check-host-kernel-build:
+	@dir=$$($(MAKEFILE_DIR)scripts/check-host-kernel-build.sh) && echo "==> host kernel build directory: $$dir"
 
 # Run setup inside container (for CI - container has Firecracker)
 container-setup-fcvm: cargo-target-link container-build setup-btrfs
