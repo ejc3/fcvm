@@ -1,0 +1,1405 @@
+{
+ "memory": [
+  {
+   "fits": {
+    "fcvm-clone": {
+     "cgroup_mib": {
+      "ci95": [
+       230.0,
+       380.0
+      ],
+      "fixed_mib": -300.0,
+      "marginal_mib_per_instance": 300.0
+     },
+     "pss_mib": {
+      "ci95": [
+       180.0,
+       300.0
+      ],
+      "fixed_mib": 230.0,
+      "marginal_mib_per_instance": 230.0
+     }
+    },
+    "host-container": {
+     "cgroup_mib": {
+      "ci95": [
+       220.0,
+       300.0
+      ],
+      "fixed_mib": 140.0,
+      "marginal_mib_per_instance": 260.0
+     },
+     "pss_mib": {
+      "ci95": [
+       200.0,
+       270.0
+      ],
+      "fixed_mib": 380.0,
+      "marginal_mib_per_instance": 230.0
+     }
+    }
+   },
+   "label": "memory-2vcpu-screenshot",
+   "ns": [
+    2,
+    8,
+    16,
+    32,
+    48
+   ],
+   "render_op": "screenshot",
+   "run_dir": "corpusextra-20261026-065045-f42c813c7be94a4f8ddf8992a1f81200",
+   "source_revision": "6464a355b2f490e317f817aa51b8a6520b2abea6",
+   "uffd_mode": "minor"
+  },
+  {
+   "fits": {
+    "fcvm-clone": {
+     "cgroup_mib": {
+      "ci95": [
+       230.0,
+       380.0
+      ],
+      "fixed_mib": -300.0,
+      "marginal_mib_per_instance": 290.0
+     },
+     "pss_mib": {
+      "ci95": [
+       200.0,
+       320.0
+      ],
+      "fixed_mib": 230.0,
+      "marginal_mib_per_instance": 250.0
+     }
+    },
+    "host-container": {
+     "cgroup_mib": {
+      "ci95": [
+       220.0,
+       300.0
+      ],
+      "fixed_mib": 140.0,
+      "marginal_mib_per_instance": 260.0
+     },
+     "pss_mib": {
+      "ci95": [
+       200.0,
+       270.0
+      ],
+      "fixed_mib": 390.0,
+      "marginal_mib_per_instance": 230.0
+     }
+    }
+   },
+   "label": "memory-8vcpu-screenshot",
+   "ns": [
+    2,
+    8,
+    16,
+    32,
+    48
+   ],
+   "render_op": "screenshot",
+   "run_dir": "corpusextra-20261026-041623-c8b4b00739a346da8088bb72c59b1f77",
+   "source_revision": "70a1bf25ae71483f8a5cafe1a724db6244f96973",
+   "uffd_mode": "minor"
+  }
+ ],
+ "scale": [
+  {
+   "label": "scale-2vcpu",
+   "listen": {
+    "1.4": {
+     "kernel": {
+      "accept_queue_peak": 1,
+      "listen_drops": 0,
+      "listen_overflows": 0
+     },
+     "rate": 1.4,
+     "tls": {
+      "accept_busy_max_second": 0.0155,
+      "accept_busy_mean": 0.0039,
+      "accept_errors": 0,
+      "accept_ms_max": 4.835,
+      "accept_ms_mean": 0.028,
+      "accepts": 41702,
+      "active_peak": 50,
+      "handshake_ms_max": 298.567,
+      "handshakes_in_handler": 41676,
+      "request_ms_max": 9997.56,
+      "request_ms_mean": 15.402,
+      "requests": 40509,
+      "thread_start_ms_max": 2.363,
+      "thread_start_ms_mean": 0.086
+     },
+     "window_s": 300.0
+    },
+    "2.8": {
+     "kernel": {
+      "accept_queue_peak": 1,
+      "listen_drops": 1,
+      "listen_overflows": 1
+     },
+     "rate": 2.8,
+     "tls": {
+      "accept_busy_max_second": 0.0211,
+      "accept_busy_mean": 0.0102,
+      "accept_errors": 0,
+      "accept_ms_max": 3.305,
+      "accept_ms_mean": 0.034,
+      "accepts": 91151,
+      "active_peak": 54,
+      "handshake_ms_max": 171.649,
+      "handshakes_in_handler": 91119,
+      "request_ms_max": 9999.024,
+      "request_ms_mean": 12.517,
+      "requests": 88551,
+      "thread_start_ms_max": 3.737,
+      "thread_start_ms_mean": 0.1
+     },
+     "window_s": 300.0
+    },
+    "4.2": {
+     "kernel": {
+      "accept_queue_peak": 4,
+      "listen_drops": 88,
+      "listen_overflows": 88
+     },
+     "rate": 4.2,
+     "tls": {
+      "accept_busy_max_second": 0.0404,
+      "accept_busy_mean": 0.0212,
+      "accept_errors": 0,
+      "accept_ms_max": 3.455,
+      "accept_ms_mean": 0.046,
+      "accepts": 137159,
+      "active_peak": 82,
+      "handshake_ms_max": 209.144,
+      "handshakes_in_handler": 137083,
+      "request_ms_max": 9997.945,
+      "request_ms_mean": 11.823,
+      "requests": 133204,
+      "thread_start_ms_max": 5.888,
+      "thread_start_ms_mean": 0.125
+     },
+     "window_s": 300.0
+    },
+    "5.6": {
+     "kernel": {
+      "accept_queue_peak": 4,
+      "listen_drops": 267,
+      "listen_overflows": 267
+     },
+     "rate": 5.6,
+     "tls": {
+      "accept_busy_max_second": 0.0731,
+      "accept_busy_mean": 0.0137,
+      "accept_errors": 0,
+      "accept_ms_max": 7.861,
+      "accept_ms_mean": 0.063,
+      "accepts": 65275,
+      "active_peak": 149,
+      "handshake_ms_max": 9065.275,
+      "handshakes_in_handler": 65176,
+      "request_ms_max": 10973.994,
+      "request_ms_mean": 17.885,
+      "requests": 63339,
+      "thread_start_ms_max": 15.67,
+      "thread_start_ms_mean": 0.168
+     },
+     "window_s": 300.0
+    }
+   },
+   "rates_per_path": "1.4,2.8,4.2,5.6",
+   "requests": {
+    "1.4": {
+     "blocking_ms": {
+      "median": 838.4,
+      "n": 778,
+      "p95": 4568.0
+     },
+     "navigate_ms": {
+      "median": 437.4,
+      "n": 778,
+      "p95": 3795.8
+     },
+     "navigate_over_2s": 99,
+     "rate": 1.4,
+     "resolve_ms": {
+      "median": 127.5,
+      "n": 778,
+      "p95": 152.3
+     },
+     "scored_failed": 62,
+     "scored_ok": 778,
+     "screenshot_ms": {
+      "median": 82.3,
+      "n": 778,
+      "p95": 284.8
+     },
+     "spawn_to_port_ms": {
+      "median": 131.2,
+      "n": 778,
+      "p95": 152.5
+     },
+     "total_ms": {
+      "median": 704.9,
+      "n": 778,
+      "p95": 4432.1
+     }
+    },
+    "2.8": {
+     "blocking_ms": {
+      "median": 879.7,
+      "n": 1680,
+      "p95": 4733.6
+     },
+     "navigate_ms": {
+      "median": 470.1,
+      "n": 1680,
+      "p95": 3854.9
+     },
+     "navigate_over_2s": 235,
+     "rate": 2.8,
+     "resolve_ms": {
+      "median": 129.2,
+      "n": 1680,
+      "p95": 154.8
+     },
+     "scored_failed": 0,
+     "scored_ok": 1680,
+     "screenshot_ms": {
+      "median": 86.9,
+      "n": 1680,
+      "p95": 252.9
+     },
+     "spawn_to_port_ms": {
+      "median": 140.2,
+      "n": 1680,
+      "p95": 174.2
+     },
+     "total_ms": {
+      "median": 740.0,
+      "n": 1680,
+      "p95": 4589.8
+     }
+    },
+    "4.2": {
+     "blocking_ms": {
+      "median": 962.4,
+      "n": 2516,
+      "p95": 4913.4
+     },
+     "navigate_ms": {
+      "median": 512.8,
+      "n": 2516,
+      "p95": 4078.3
+     },
+     "navigate_over_2s": 360,
+     "rate": 4.2,
+     "resolve_ms": {
+      "median": 140.0,
+      "n": 2516,
+      "p95": 165.0
+     },
+     "scored_failed": 4,
+     "scored_ok": 2516,
+     "screenshot_ms": {
+      "median": 95.5,
+      "n": 2516,
+      "p95": 259.0
+     },
+     "spawn_to_port_ms": {
+      "median": 158.3,
+      "n": 2516,
+      "p95": 212.8
+     },
+     "total_ms": {
+      "median": 794.1,
+      "n": 2516,
+      "p95": 4729.5
+     }
+    },
+    "5.6": {
+     "blocking_ms": {
+      "median": 3086.8,
+      "n": 1065,
+      "p95": 15694.5
+     },
+     "navigate_ms": {
+      "median": 1032.2,
+      "n": 1065,
+      "p95": 5409.5
+     },
+     "navigate_over_2s": 264,
+     "rate": 5.6,
+     "resolve_ms": {
+      "median": 443.0,
+      "n": 1065,
+      "p95": 2723.0
+     },
+     "scored_failed": 2295,
+     "scored_ok": 1065,
+     "screenshot_ms": {
+      "median": 147.8,
+      "n": 1065,
+      "p95": 692.5
+     },
+     "spawn_to_port_ms": {
+      "median": 304.5,
+      "n": 1065,
+      "p95": 11487.7
+     },
+     "total_ms": {
+      "median": 2657.4,
+      "n": 1065,
+      "p95": 7692.9
+     }
+    }
+   },
+   "run_dir": "corpus-20261026m-s2",
+   "source_revision": "6464a355b2f490e317f817aa51b8a6520b2abea6"
+  },
+  {
+   "analysis": {
+    "file:r1.4": {
+     "passed": true,
+     "rate_failed": false
+    },
+    "file:r2.8": {
+     "passed": false,
+     "rate_failed": true
+    },
+    "file:r4.2": {
+     "passed": false,
+     "rate_failed": true
+    },
+    "uffd:r1.4": {
+     "passed": true,
+     "rate_failed": false
+    },
+    "uffd:r2.8": {
+     "passed": false,
+     "rate_failed": true
+    },
+    "uffd:r4.2": {
+     "passed": false,
+     "rate_failed": true
+    }
+   },
+   "label": "scale-8vcpu",
+   "listen": {
+    "1.4": {
+     "kernel": {
+      "accept_queue_peak": 0,
+      "listen_drops": 3,
+      "listen_overflows": 3
+     },
+     "rate": 1.4,
+     "tls": {
+      "accept_busy_max_second": 0.0235,
+      "accept_busy_mean": 0.0043,
+      "accept_errors": 0,
+      "accept_ms_max": 1.633,
+      "accept_ms_mean": 0.029,
+      "accepts": 43978,
+      "active_peak": 49,
+      "handshake_ms_max": 73.307,
+      "handshakes_in_handler": 43959,
+      "request_ms_max": 9999.804,
+      "request_ms_mean": 7.064,
+      "requests": 42768,
+      "thread_start_ms_max": 7.813,
+      "thread_start_ms_mean": 0.079
+     },
+     "window_s": 300.0
+    },
+    "2.8": {
+     "kernel": {
+      "accept_queue_peak": 0,
+      "listen_drops": 16,
+      "listen_overflows": 16
+     },
+     "rate": 2.8,
+     "tls": {
+      "accept_busy_max_second": 0.0328,
+      "accept_busy_mean": 0.0099,
+      "accept_errors": 0,
+      "accept_ms_max": 1.836,
+      "accept_ms_mean": 0.033,
+      "accepts": 88738,
+      "active_peak": 45,
+      "handshake_ms_max": 105.465,
+      "handshakes_in_handler": 88686,
+      "request_ms_max": 9999.804,
+      "request_ms_mean": 5.751,
+      "requests": 86239,
+      "thread_start_ms_max": 2.895,
+      "thread_start_ms_mean": 0.089
+     },
+     "window_s": 300.0
+    },
+    "4.2": {
+     "kernel": {
+      "accept_queue_peak": 3,
+      "listen_drops": 81,
+      "listen_overflows": 81
+     },
+     "rate": 4.2,
+     "tls": {
+      "accept_busy_max_second": 0.0585,
+      "accept_busy_mean": 0.0184,
+      "accept_errors": 0,
+      "accept_ms_max": 4.03,
+      "accept_ms_mean": 0.041,
+      "accepts": 135052,
+      "active_peak": 47,
+      "handshake_ms_max": 237.027,
+      "handshakes_in_handler": 134944,
+      "request_ms_max": 10001.339,
+      "request_ms_mean": 5.365,
+      "requests": 131196,
+      "thread_start_ms_max": 4.006,
+      "thread_start_ms_mean": 0.105
+     },
+     "window_s": 300.0
+    }
+   },
+   "rates_per_path": "1.4,2.8,4.2",
+   "requests": {
+    "1.4": {
+     "blocking_ms": {
+      "median": 561.8,
+      "n": 840,
+      "p95": 2700.3
+     },
+     "navigate_ms": {
+      "median": 233.2,
+      "n": 840,
+      "p95": 2136.6
+     },
+     "navigate_over_2s": 57,
+     "rate": 1.4,
+     "resolve_ms": {
+      "median": 118.9,
+      "n": 840,
+      "p95": 165.4
+     },
+     "scored_failed": 0,
+     "scored_ok": 840,
+     "screenshot_ms": {
+      "median": 75.2,
+      "n": 840,
+      "p95": 211.5
+     },
+     "spawn_to_port_ms": {
+      "median": 102.0,
+      "n": 840,
+      "p95": 119.3
+     },
+     "total_ms": {
+      "median": 451.9,
+      "n": 840,
+      "p95": 2594.5
+     }
+    },
+    "2.8": {
+     "blocking_ms": {
+      "median": 611.6,
+      "n": 1679,
+      "p95": 3039.4
+     },
+     "navigate_ms": {
+      "median": 260.2,
+      "n": 1679,
+      "p95": 2468.6
+     },
+     "navigate_over_2s": 119,
+     "rate": 2.8,
+     "resolve_ms": {
+      "median": 124.0,
+      "n": 1679,
+      "p95": 175.3
+     },
+     "scored_failed": 1,
+     "scored_ok": 1679,
+     "screenshot_ms": {
+      "median": 78.7,
+      "n": 1679,
+      "p95": 282.0
+     },
+     "spawn_to_port_ms": {
+      "median": 114.1,
+      "n": 1679,
+      "p95": 151.6
+     },
+     "total_ms": {
+      "median": 489.8,
+      "n": 1679,
+      "p95": 2923.3
+     }
+    },
+    "4.2": {
+     "blocking_ms": {
+      "median": 752.8,
+      "n": 2514,
+      "p95": 3368.9
+     },
+     "navigate_ms": {
+      "median": 347.8,
+      "n": 2514,
+      "p95": 2739.6
+     },
+     "navigate_over_2s": 183,
+     "rate": 4.2,
+     "resolve_ms": {
+      "median": 143.6,
+      "n": 2514,
+      "p95": 206.9
+     },
+     "scored_failed": 6,
+     "scored_ok": 2514,
+     "screenshot_ms": {
+      "median": 89.2,
+      "n": 2514,
+      "p95": 299.6
+     },
+     "spawn_to_port_ms": {
+      "median": 130.7,
+      "n": 2514,
+      "p95": 193.8
+     },
+     "total_ms": {
+      "median": 612.6,
+      "n": 2514,
+      "p95": 3227.3
+     }
+    }
+   },
+   "run_dir": "corpus-20261026r-s8",
+   "source_revision": "6464a355b2f490e317f817aa51b8a6520b2abea6"
+  }
+ ],
+ "serial": [
+  {
+   "arms": {
+    "cdp": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 1728.8,
+      "lo": 1648.7,
+      "median": 1689.3,
+      "n": 202
+     },
+     "failed": 0,
+     "navigate_ms": {
+      "hi": 653.0,
+      "lo": 494.5,
+      "median": 542.7,
+      "n": 202
+     },
+     "resolve_ms": {
+      "hi": 104.5,
+      "lo": 103.6,
+      "median": 103.8,
+      "n": 202
+     },
+     "screenshot_ms": {
+      "hi": 804.7,
+      "lo": 380.5,
+      "median": 508.1,
+      "n": 202
+     },
+     "spawn_to_port_ms": {
+      "hi": 61.6,
+      "lo": 61.4,
+      "median": 61.5,
+      "n": 202
+     },
+     "wall_ms": {
+      "hi": 1804.3,
+      "lo": 1718.9,
+      "median": 1765.5,
+      "n": 202
+     }
+    },
+    "cdp-fast": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 1719.7,
+      "lo": 1639.8,
+      "median": 1683.4,
+      "n": 202
+     },
+     "failed": 0,
+     "navigate_ms": {
+      "hi": 642.8,
+      "lo": 493.7,
+      "median": 539.2,
+      "n": 202
+     },
+     "resolve_ms": {
+      "hi": 105.2,
+      "lo": 103.8,
+      "median": 104.1,
+      "n": 202
+     },
+     "screenshot_ms": {
+      "hi": 819.2,
+      "lo": 388.9,
+      "median": 548.6,
+      "n": 202
+     },
+     "spawn_to_port_ms": {
+      "hi": 61.5,
+      "lo": 61.4,
+      "median": 61.5,
+      "n": 202
+     },
+     "wall_ms": {
+      "hi": 1844.8,
+      "lo": 1765.6,
+      "median": 1802.9,
+      "n": 202
+     }
+    },
+    "noop": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 61.7,
+      "lo": 61.6,
+      "median": 61.6,
+      "n": 202
+     },
+     "failed": 0,
+     "wall_ms": {
+      "hi": 286.9,
+      "lo": 279.0,
+      "median": 285.3,
+      "n": 202
+     }
+    },
+    "noop-fast": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 61.6,
+      "lo": 61.4,
+      "median": 61.5,
+      "n": 202
+     },
+     "failed": 0,
+     "wall_ms": {
+      "hi": 55773.0,
+      "lo": 306.9,
+      "median": 55769.7,
+      "n": 202
+     }
+    }
+   },
+   "browser_version": "WebKitGTK 2.54.0-1~deb13u3",
+   "diag_passed": true,
+   "dns_verdict": "clean",
+   "engine": "webkit",
+   "guest_vcpus": 4,
+   "hugepages": false,
+   "label": "webkit-c4",
+   "n_failed": 0,
+   "publishable": true,
+   "run_dir": "corpus-20261026g-c4w",
+   "source_revision": "6d3cf87c658028355fd3fb7481fe5df1547e25ec",
+   "uffd_mode": "minor",
+   "uffd_prefetch": "on"
+  },
+  {
+   "arms": {
+    "cdp": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 848.0,
+      "lo": 620.5,
+      "median": 815.5,
+      "n": 202
+     },
+     "failed": 0,
+     "navigate_ms": {
+      "hi": 480.5,
+      "lo": 339.8,
+      "median": 407.7,
+      "n": 202
+     },
+     "resolve_ms": {
+      "hi": 103.7,
+      "lo": 103.1,
+      "median": 103.5,
+      "n": 202
+     },
+     "screenshot_ms": {
+      "hi": 89.8,
+      "lo": 80.7,
+      "median": 85.5,
+      "n": 202
+     },
+     "spawn_to_port_ms": {
+      "hi": 87.9,
+      "lo": 86.2,
+      "median": 86.6,
+      "n": 202
+     },
+     "wall_ms": {
+      "hi": 917.2,
+      "lo": 688.0,
+      "median": 884.9,
+      "n": 202
+     }
+    },
+    "cdp-fast": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 850.5,
+      "lo": 614.3,
+      "median": 788.7,
+      "n": 202
+     },
+     "failed": 0,
+     "navigate_ms": {
+      "hi": 494.8,
+      "lo": 341.0,
+      "median": 433.9,
+      "n": 202
+     },
+     "resolve_ms": {
+      "hi": 103.6,
+      "lo": 103.1,
+      "median": 103.3,
+      "n": 202
+     },
+     "screenshot_ms": {
+      "hi": 91.2,
+      "lo": 80.4,
+      "median": 86.3,
+      "n": 202
+     },
+     "spawn_to_port_ms": {
+      "hi": 87.1,
+      "lo": 85.4,
+      "median": 86.4,
+      "n": 202
+     },
+     "wall_ms": {
+      "hi": 961.1,
+      "lo": 724.5,
+      "median": 899.6,
+      "n": 202
+     }
+    },
+    "html-fast": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 792.0,
+      "lo": 567.0,
+      "median": 767.6,
+      "n": 202
+     },
+     "failed": 0,
+     "navigate_ms": {
+      "hi": 513.0,
+      "lo": 337.9,
+      "median": 432.1,
+      "n": 202
+     },
+     "resolve_ms": {
+      "hi": 103.5,
+      "lo": 102.9,
+      "median": 103.2,
+      "n": 202
+     },
+     "spawn_to_port_ms": {
+      "hi": 87.1,
+      "lo": 86.1,
+      "median": 86.5,
+      "n": 202
+     },
+     "wall_ms": {
+      "hi": 902.8,
+      "lo": 674.4,
+      "median": 877.6,
+      "n": 202
+     }
+    },
+    "noop": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 88.9,
+      "lo": 86.7,
+      "median": 88.5,
+      "n": 202
+     },
+     "failed": 0,
+     "wall_ms": {
+      "hi": 278.1,
+      "lo": 275.7,
+      "median": 277.1,
+      "n": 202
+     }
+    },
+    "noop-fast": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 86.0,
+      "lo": 84.7,
+      "median": 84.9,
+      "n": 202
+     },
+     "failed": 0,
+     "wall_ms": {
+      "hi": 55767.4,
+      "lo": 55764.1,
+      "median": 55765.4,
+      "n": 202
+     }
+    }
+   },
+   "browser_version": "Chromium 156.0.8078.47 built on Debian GNU/Linux 12 (bookworm)",
+   "diag_passed": true,
+   "dns_verdict": "clean",
+   "engine": "chromium",
+   "guest_vcpus": 2,
+   "hugepages": false,
+   "label": "chromium-c2c",
+   "n_failed": 0,
+   "publishable": true,
+   "run_dir": "corpus-20261026b-c2c",
+   "source_revision": "70a1bf25ae71483f8a5cafe1a724db6244f96973",
+   "uffd_mode": "minor",
+   "uffd_prefetch": "on"
+  },
+  {
+   "arms": {
+    "cdp": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 591.9,
+      "lo": 465.0,
+      "median": 537.7,
+      "n": 202
+     },
+     "failed": 0,
+     "navigate_ms": {
+      "hi": 282.4,
+      "lo": 211.2,
+      "median": 247.9,
+      "n": 202
+     },
+     "resolve_ms": {
+      "hi": 151.9,
+      "lo": 103.6,
+      "median": 114.4,
+      "n": 202
+     },
+     "screenshot_ms": {
+      "hi": 78.8,
+      "lo": 72.5,
+      "median": 74.8,
+      "n": 202
+     },
+     "spawn_to_port_ms": {
+      "hi": 61.8,
+      "lo": 61.6,
+      "median": 61.7,
+      "n": 202
+     },
+     "wall_ms": {
+      "hi": 662.9,
+      "lo": 540.7,
+      "median": 614.1,
+      "n": 202
+     }
+    },
+    "cdp-fast": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 593.2,
+      "lo": 460.9,
+      "median": 549.9,
+      "n": 202
+     },
+     "failed": 0,
+     "navigate_ms": {
+      "hi": 276.0,
+      "lo": 210.0,
+      "median": 242.8,
+      "n": 202
+     },
+     "resolve_ms": {
+      "hi": 128.0,
+      "lo": 103.4,
+      "median": 103.7,
+      "n": 202
+     },
+     "screenshot_ms": {
+      "hi": 78.1,
+      "lo": 71.5,
+      "median": 75.1,
+      "n": 202
+     },
+     "spawn_to_port_ms": {
+      "hi": 61.8,
+      "lo": 61.7,
+      "median": 61.7,
+      "n": 202
+     },
+     "wall_ms": {
+      "hi": 713.8,
+      "lo": 581.0,
+      "median": 668.9,
+      "n": 202
+     }
+    },
+    "html-fast": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 526.5,
+      "lo": 401.2,
+      "median": 487.1,
+      "n": 202
+     },
+     "failed": 0,
+     "navigate_ms": {
+      "hi": 279.5,
+      "lo": 208.4,
+      "median": 253.4,
+      "n": 202
+     },
+     "resolve_ms": {
+      "hi": 151.9,
+      "lo": 103.6,
+      "median": 104.7,
+      "n": 202
+     },
+     "spawn_to_port_ms": {
+      "hi": 61.8,
+      "lo": 61.6,
+      "median": 61.7,
+      "n": 202
+     },
+     "wall_ms": {
+      "hi": 649.2,
+      "lo": 520.1,
+      "median": 608.3,
+      "n": 202
+     }
+    },
+    "noop": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 61.9,
+      "lo": 61.7,
+      "median": 61.8,
+      "n": 202
+     },
+     "failed": 0,
+     "wall_ms": {
+      "hi": 294.3,
+      "lo": 284.4,
+      "median": 292.9,
+      "n": 202
+     }
+    },
+    "noop-fast": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 61.8,
+      "lo": 61.7,
+      "median": 61.7,
+      "n": 202
+     },
+     "failed": 0,
+     "wall_ms": {
+      "hi": 55775.0,
+      "lo": 28049.3,
+      "median": 55767.4,
+      "n": 202
+     }
+    }
+   },
+   "browser_version": "Chromium 156.0.8078.47 built on Debian GNU/Linux 12 (bookworm)",
+   "diag_passed": true,
+   "dns_verdict": "clean",
+   "engine": "chromium",
+   "guest_vcpus": 8,
+   "hugepages": false,
+   "label": "chromium-c8c",
+   "n_failed": 0,
+   "publishable": true,
+   "run_dir": "corpus-20261026b-c8c",
+   "source_revision": "70a1bf25ae71483f8a5cafe1a724db6244f96973",
+   "uffd_mode": "minor",
+   "uffd_prefetch": "on"
+  },
+  {
+   "arms": {
+    "cdp": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 454.2,
+      "lo": 348.9,
+      "median": 412.3,
+      "n": 202
+     },
+     "failed": 0,
+     "navigate_ms": {
+      "hi": 196.3,
+      "lo": 127.2,
+      "median": 171.0,
+      "n": 202
+     },
+     "resolve_ms": {
+      "hi": 105.6,
+      "lo": 105.3,
+      "median": 105.4,
+      "n": 202
+     },
+     "screenshot_ms": {
+      "hi": 57.9,
+      "lo": 52.1,
+      "median": 54.1,
+      "n": 202
+     },
+     "spawn_to_port_ms": {
+      "hi": 60.9,
+      "lo": 60.8,
+      "median": 60.8,
+      "n": 202
+     },
+     "wall_ms": {
+      "hi": 491.1,
+      "lo": 385.5,
+      "median": 462.5,
+      "n": 202
+     }
+    },
+    "noop": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 61.0,
+      "lo": 60.9,
+      "median": 61.0,
+      "n": 202
+     },
+     "failed": 0,
+     "wall_ms": {
+      "hi": 263.3,
+      "lo": 261.2,
+      "median": 262.5,
+      "n": 202
+     }
+    }
+   },
+   "browser_version": "Chromium 156.0.8078.47 built on Debian GNU/Linux 12 (bookworm)",
+   "diag_passed": true,
+   "dns_verdict": "clean",
+   "engine": "chromium",
+   "guest_vcpus": 4,
+   "hugepages": true,
+   "label": "hugepage-minor-a",
+   "n_failed": 0,
+   "publishable": true,
+   "run_dir": "corpus-20261026w-c4h",
+   "source_revision": "6d3cf87c658028355fd3fb7481fe5df1547e25ec",
+   "uffd_mode": "minor",
+   "uffd_prefetch": "on"
+  },
+  {
+   "arms": {
+    "cdp": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 434.5,
+      "lo": 340.6,
+      "median": 377.4,
+      "n": 202
+     },
+     "failed": 0,
+     "navigate_ms": {
+      "hi": 184.0,
+      "lo": 122.7,
+      "median": 167.9,
+      "n": 202
+     },
+     "resolve_ms": {
+      "hi": 101.8,
+      "lo": 101.5,
+      "median": 101.7,
+      "n": 202
+     },
+     "screenshot_ms": {
+      "hi": 59.7,
+      "lo": 52.1,
+      "median": 54.5,
+      "n": 202
+     },
+     "spawn_to_port_ms": {
+      "hi": 60.8,
+      "lo": 60.6,
+      "median": 60.7,
+      "n": 202
+     },
+     "wall_ms": {
+      "hi": 471.0,
+      "lo": 377.1,
+      "median": 414.5,
+      "n": 202
+     }
+    },
+    "noop": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 60.9,
+      "lo": 60.8,
+      "median": 60.8,
+      "n": 202
+     },
+     "failed": 0,
+     "wall_ms": {
+      "hi": 253.2,
+      "lo": 251.5,
+      "median": 252.5,
+      "n": 202
+     }
+    }
+   },
+   "browser_version": "Chromium 156.0.8078.47 built on Debian GNU/Linux 12 (bookworm)",
+   "diag_passed": true,
+   "dns_verdict": "clean",
+   "engine": "chromium",
+   "guest_vcpus": 4,
+   "hugepages": true,
+   "label": "hugepage-copy",
+   "n_failed": 0,
+   "publishable": true,
+   "run_dir": "corpus-20261026w-c4h-copy",
+   "source_revision": "6d3cf87c658028355fd3fb7481fe5df1547e25ec",
+   "uffd_mode": "copy",
+   "uffd_prefetch": "on"
+  },
+  {
+   "arms": {
+    "cdp": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 453.7,
+      "lo": 348.1,
+      "median": 398.2,
+      "n": 202
+     },
+     "failed": 0,
+     "navigate_ms": {
+      "hi": 196.2,
+      "lo": 124.3,
+      "median": 169.1,
+      "n": 202
+     },
+     "resolve_ms": {
+      "hi": 105.5,
+      "lo": 105.3,
+      "median": 105.4,
+      "n": 202
+     },
+     "screenshot_ms": {
+      "hi": 57.9,
+      "lo": 52.2,
+      "median": 54.9,
+      "n": 202
+     },
+     "spawn_to_port_ms": {
+      "hi": 60.9,
+      "lo": 60.8,
+      "median": 60.8,
+      "n": 202
+     },
+     "wall_ms": {
+      "hi": 490.2,
+      "lo": 384.9,
+      "median": 434.4,
+      "n": 202
+     }
+    },
+    "noop": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 60.9,
+      "lo": 60.9,
+      "median": 60.9,
+      "n": 202
+     },
+     "failed": 0,
+     "wall_ms": {
+      "hi": 263.7,
+      "lo": 261.9,
+      "median": 262.9,
+      "n": 202
+     }
+    }
+   },
+   "browser_version": "Chromium 156.0.8078.47 built on Debian GNU/Linux 12 (bookworm)",
+   "diag_passed": true,
+   "dns_verdict": "clean",
+   "engine": "chromium",
+   "guest_vcpus": 4,
+   "hugepages": true,
+   "label": "hugepage-minor-b",
+   "n_failed": 0,
+   "publishable": true,
+   "run_dir": "corpus-20261026w-c4h-minorb",
+   "source_revision": "6d3cf87c658028355fd3fb7481fe5df1547e25ec",
+   "uffd_mode": "minor",
+   "uffd_prefetch": "on"
+  },
+  {
+   "arms": {
+    "cdp": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 622.9,
+      "lo": 456.1,
+      "median": 582.3,
+      "n": 202
+     },
+     "failed": 0,
+     "navigate_ms": {
+      "hi": 328.3,
+      "lo": 213.5,
+      "median": 285.1,
+      "n": 202
+     },
+     "resolve_ms": {
+      "hi": 103.8,
+      "lo": 103.5,
+      "median": 103.6,
+      "n": 202
+     },
+     "screenshot_ms": {
+      "hi": 79.9,
+      "lo": 73.7,
+      "median": 76.8,
+      "n": 202
+     },
+     "spawn_to_port_ms": {
+      "hi": 60.6,
+      "lo": 59.0,
+      "median": 60.5,
+      "n": 202
+     },
+     "wall_ms": {
+      "hi": 691.8,
+      "lo": 524.7,
+      "median": 651.1,
+      "n": 202
+     }
+    },
+    "noop": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 60.8,
+      "lo": 60.6,
+      "median": 60.7,
+      "n": 202
+     },
+     "failed": 0,
+     "wall_ms": {
+      "hi": 262.4,
+      "lo": 259.0,
+      "median": 260.2,
+      "n": 202
+     }
+    }
+   },
+   "browser_version": "Chromium 156.0.8078.47 built on Debian GNU/Linux 12 (bookworm)",
+   "diag_passed": true,
+   "dns_verdict": "clean",
+   "engine": "chromium",
+   "guest_vcpus": 4,
+   "hugepages": false,
+   "label": "prefetch-on-c4g",
+   "n_failed": 0,
+   "publishable": true,
+   "run_dir": "corpus-20261026w-c4g",
+   "source_revision": "6d3cf87c658028355fd3fb7481fe5df1547e25ec",
+   "uffd_mode": "minor",
+   "uffd_prefetch": "on"
+  },
+  {
+   "arms": {
+    "cdp": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 828.7,
+      "lo": 649.8,
+      "median": 776.7,
+      "n": 202
+     },
+     "failed": 0,
+     "navigate_ms": {
+      "hi": 482.3,
+      "lo": 346.9,
+      "median": 421.9,
+      "n": 202
+     },
+     "resolve_ms": {
+      "hi": 108.8,
+      "lo": 107.9,
+      "median": 108.1,
+      "n": 202
+     },
+     "screenshot_ms": {
+      "hi": 101.7,
+      "lo": 95.8,
+      "median": 99.3,
+      "n": 202
+     },
+     "spawn_to_port_ms": {
+      "hi": 60.7,
+      "lo": 59.1,
+      "median": 60.5,
+      "n": 202
+     },
+     "wall_ms": {
+      "hi": 896.7,
+      "lo": 718.7,
+      "median": 845.1,
+      "n": 202
+     }
+    },
+    "noop": {
+     "attempted": 230,
+     "blocking_ms": {
+      "hi": 61.0,
+      "lo": 60.8,
+      "median": 60.9,
+      "n": 202
+     },
+     "failed": 0,
+     "wall_ms": {
+      "hi": 283.9,
+      "lo": 274.6,
+      "median": 278.0,
+      "n": 202
+     }
+    }
+   },
+   "browser_version": "Chromium 156.0.8078.47 built on Debian GNU/Linux 12 (bookworm)",
+   "diag_passed": true,
+   "dns_verdict": "clean",
+   "engine": "chromium",
+   "guest_vcpus": 4,
+   "hugepages": false,
+   "label": "prefetch-off-c4g",
+   "n_failed": 0,
+   "publishable": true,
+   "run_dir": "corpus-20261026w-c4g-off",
+   "source_revision": "6d3cf87c658028355fd3fb7481fe5df1547e25ec",
+   "uffd_mode": "minor",
+   "uffd_prefetch": "off"
+  }
+ ]
+}

@@ -519,6 +519,33 @@ The earlier s13 record (`reqbench-20261022-corpus-s13`) used the default replay,
 results are this table's first rows. The replay options default to the old behavior; the 2026-10-22 serial
 records are unchanged by this work.
 
+## Follow-ups from the 2026-10-22 corpus campaign, run 2026-10-26 (#1173)
+
+`results/campaign-20261026-extras/` (`summary.json`, `commands.txt`). c8g.metal-48xl, on demand; Chromium 156
+and WebKitGTK 2.54 (the 2026-10-22 runs used Chromium 155, an older fcvm and firecracker; compare across the two
+campaigns with that in mind: the `noop` arm reads 61 to 88 ms here against 53 ms then). Every run below is
+DNS-clean with its diag passed and 0 failures in 230 attempts per arm unless stated.
+
+| item | result |
+|---|---|
+| WebKit corpus, 4 vCPUs, arms cdp, cdp-fast, noop, noop-fast | cdp 1,689 ms [1,649, 1,729], cdp-fast 1,683 ms [1,640, 1,720] (n=202 each), noop 61.6 ms; navigation 543 ms and screenshot 508 to 549 ms, against Chromium's 4 vCPU 285 and 77 ms on the same corpus. The first attempts failed on two harness defects (below). |
+| Serial runs at 2 and 8 vCPUs, a third run each | 2 vCPUs cdp 815.5 ms [620, 848] (the 10-22 runs: 805.3 and 777.0); 8 vCPUs cdp 537.7 ms [465, 592] (10-22: 704.6 and 671.6). The 8 vCPU third run is 130 to 170 ms below the first two, with another Chromium and fcvm build, so it is not a repeat of them; 4 vCPUs at the same revision was not rerun. |
+| 2 MiB pages, minor, copy, minor on one `HUGEPAGES=1` golden | cdp median 412.3 ms [349, 454] minor, 377.4 [341, 435] copy, 398.2 [348, 454] minor again (the two minor runs differ by 14 ms, inside either interval; copy is 21 to 35 ms lower, as on the 4 KiB golden in 10-22). The 4 KiB run beside it, `prefetch-on-c4g`, is 582.3 ms, but it is a different golden, so the page-size effect is not separated from the golden's (the note in this file's "Hugepage `minor`" bullet stands). |
+| Third prefetch on/off pair (4 vCPUs, minor) | on 582.3 ms [456, 623], off 776.7 ms [650, 829]: off is 33% longer, with navigation 422 against 285 ms (10-22 pairs: 35% on both goldens). |
+| Memory per added clone, screenshot, N = 2 to 48 | cgroup 300 MiB [230, 380] at 2 vCPUs and 290 [230, 380] at 8 (4 vCPUs in 10-22: 340 [280, 410]); PSS 230 [180, 300] and 250 [200, 320] (240 [190, 290]). Host containers 260 and 260 cgroup, 230 and 230 PSS. The vCPU count does not move the per-clone figure outside its interval. |
+| Memory per added clone, HTML extraction at 2 and 8 vCPUs | **Not published**: both runs were refused by the harness's own gate, "fcvm-clone cross-basis observed N=2 estimates differ by 2.05x (2 vCPUs) and 2.37x (8 vCPUs)" (cgroup 430 and 394 MiB against PSS 880 and 933 MiB at N=2). The 10-22 HTML run at 4 vCPUs passed this gate; what changed at N=2 is not explained. |
+| Open-loop throughput at 2 and 8 vCPUs | Run with `--tls-handshake-in-handler` (the default replay's listener limit, #1159). 8 vCPUs: 1.4 per path passes every gate; 2.8 and 4.2 are recorded as failed rates for 1 and 6 failed requests among 1,680 and 2,520 (a teardown that left a lock file; Firecracker-cgroup probe), median navigation 233, 260, 348 ms. 2 vCPUs: 1.4, 2.8, 4.2 completed 778, 1,680 and 2,516 of 840, 1,680 and 2,520 (62, 0 and 4 failed, all from the cgroup probe or teardown), median navigation 437, 470, 513 ms; at 5.6 2,295 of 3,360 failed, almost all `inotify_init1` EMFILE or the cgroup probe, so no ceiling is read from it. Neither run is an analysis-passing rate set above 1.4. |
+
+Harness defects found by these runs, each with a test that fails without the fix (commits in #1173 and #1340):
+the clone's state is saved before its network is configured and every WebKit request failed with "no usable
+host-side IP"; a request the page cancelled before any network timing failed the diag as an unaddressed
+request (www.elmundo.es on Chromium 156); WebKitWebDriver answers a readiness poll that lands on the old
+document's unload with "no such window", which failed 27 of 880 WebKit requests; the host sampler refused a run
+when a pid was read in two cgroup leaves while moving between them; `corpus_extra.sh` could not pass options to the
+replay server. Left open: the per-request Firecracker cgroup probe still fails requests under load
+("firecracker pid N is outside run cgroup", 62 at 2 vCPUs and 1.4 per path), and `fs.inotify.max_user_instances`
+must be raised for runs above about 4 requests per second per path (AGENTS.md).
+
 ## Binding requirements for any future run
 
 Unchanged from the previous ledger, plus:
