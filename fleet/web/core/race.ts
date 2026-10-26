@@ -42,12 +42,16 @@ export interface CountdownView {
   value: string;
   note: string;
   racing: boolean;
+  /** Something to say: a race running, or a restart scheduled while the GPUs are awake. */
+  show: boolean;
 }
 
 export interface RestartButton {
   label: string;
   disabled: boolean;
   note: string;
+  /** Not shown: it would offer to restart zero GPUs. */
+  hidden: boolean;
 }
 
 export interface ScoreView {
@@ -200,16 +204,17 @@ export function restartButton(i: ScoreInput): RestartButton {
   const n = restartableGpus(st);
   // Asleep or waking, the GPUs placed are none or some: the count would say less than a restart will.
   const label = st.fleet.power.state === "awake" ? `Restart all ${fmt.count(n, "GPU", "GPUs")}` : "Restart all GPUs";
-  if (!i.online) return { label, disabled: true, note: "paused while the coordinator is offline" };
-  if (st.fleet.power.state !== "awake") return { label, disabled: true, note: NOT_AWAKE_NOTE };
+  const zero = st.fleet.power.state === "awake" && n === 0;
+  if (!i.online) return { label, disabled: true, note: "paused while the coordinator is offline", hidden: zero };
+  if (st.fleet.power.state !== "awake") return { label, disabled: true, note: NOT_AWAKE_NOTE, hidden: false };
   const ra = runningRace(st);
-  if (ra) return { label: "Restarting now", disabled: true, note: "" };
-  if (i.pending.some((p) => p.name === "restart_now")) return { label: "Restart requested", disabled: true, note: "" };
+  if (ra) return { label: "Restarting now", disabled: true, note: "", hidden: false };
+  if (i.pending.some((p) => p.name === "restart_now")) return { label: "Restart requested", disabled: true, note: "", hidden: false };
   if (st.cooldown_until !== null && st.cooldown_until > now) {
-    return { label, disabled: true, note: `available again in ${fmt.countdown(st.cooldown_until - now)}` };
+    return { label, disabled: true, note: `available again in ${fmt.countdown(st.cooldown_until - now)}`, hidden: zero };
   }
-  if (n === 0) return { label, disabled: true, note: "no GPU to restart" };
-  return { label, disabled: false, note: "" };
+  if (n === 0) return { label, disabled: true, note: "no GPU to restart", hidden: true };
+  return { label, disabled: false, note: "", hidden: false };
 }
 
 export function scoreView(i: ScoreInput): ScoreView {
@@ -232,6 +237,7 @@ export function scoreView(i: ScoreInput): ScoreView {
       value: fmt.raceClock(now - ra.started_at),
       note: "",
       racing: true,
+      show: true,
     };
   } else {
     const axis = Math.max(1000, sb.fcvm?.median_ms ?? 0, sb.fcvm?.last_ms ?? 0, (sb.ec2?.median_ms ?? 0) + (sb.ec2?.last_capacity_wait_ms ?? 0), sb.ec2?.last_ms ?? 0);
@@ -239,10 +245,10 @@ export function scoreView(i: ScoreInput): ScoreView {
     ec2 = restBar("ec2", sb.ec2, axis);
     countdown =
       st.fleet.power.state !== "awake"
-        ? { label: "Restarts resume once the GPUs are awake", value: "--", note: "", racing: false }
+        ? { label: "Restarts resume once the GPUs are awake", value: "", note: "", racing: false, show: false }
         : st.next_race_at === null
-        ? { label: "Next restart", value: "--", note: "none scheduled", racing: false }
-        : { label: "Next restart in", value: fmt.countdown(st.next_race_at - now), note: "every GPU, both sides at once", racing: false };
+        ? { label: "", value: "", note: "none scheduled", racing: false, show: false }
+        : { label: "auto in", value: fmt.countdown(st.next_race_at - now), note: "every GPU, both sides at once", racing: false, show: true };
   }
   // Asleep or waking, the bars are the last measured ones: say when.
   const last = st.relaunch_all?.started_at ?? null;

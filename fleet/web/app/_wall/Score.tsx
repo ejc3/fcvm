@@ -1,11 +1,10 @@
 "use client";
 
-// The race, drawn outside the image: the countdown to the next restart and the
-// two bars, fcvm against EC2, on one time axis. Every word and number comes
-// from the view model.
+// The race's two bars, fcvm against EC2, on one time axis, shown over the
+// bottom of the image while a race runs. Every word and number comes from the
+// view model.
 
-import type { CSSProperties } from "react";
-import type { BarView, CounterView, ScoreView } from "../../core/index.ts";
+import type { BarView, ScoreView } from "../../core/index.ts";
 
 function pct(f: number): string {
   return `${(Math.max(0, Math.min(1, f)) * 100).toFixed(2)}%`;
@@ -34,52 +33,6 @@ function Bar({ b, compact }: { b: BarView; compact: boolean }) {
           {b.hatchLabel ? <span className="hatch-label" data-testid={`hatch-label-${b.half}`}>{b.hatchLabel}</span> : null}
         </span>
       )}
-    </div>
-  );
-}
-
-export function Countdown({
-  score,
-  counter,
-  isolation,
-  style,
-}: {
-  score: ScoreView;
-  counter?: CounterView | null;
-  isolation?: { label: string; onOpen: () => void } | null;
-  style?: CSSProperties;
-}) {
-  const c = score.countdown;
-  return (
-    <div className={`countdown${c.racing ? " racing" : ""}`} data-testid="countdown" style={style}>
-      <span className="label">{c.label}</span>
-      <span className="value" data-testid="countdown-value">{c.value}</span>
-      {c.note ? <span className="note">{c.note}</span> : null}
-      {counter ? (
-        <span className="counter" data-testid="counter">
-          {counter.label}:{" "}
-          {/* A new key per total restarts the highlight, so the count visibly ticks. */}
-          <b key={counter.total} className="tick" data-testid="counter-value">
-            {counter.value}
-          </b>
-          <span className="sub">{counter.lastHour}</span>
-          {counter.wake ? (
-            <span className="sub wake" data-testid="wake-stat">
-              {counter.wake}
-            </span>
-          ) : null}
-          {counter.scrubs ? (
-            <span className="sub" data-testid="counter-scrubs">
-              {counter.scrubs}
-            </span>
-          ) : null}
-        </span>
-      ) : null}
-      {isolation ? (
-        <button type="button" className="link" onClick={isolation.onOpen} data-testid="isolation-link">
-          {isolation.label}
-        </button>
-      ) : null}
     </div>
   );
 }

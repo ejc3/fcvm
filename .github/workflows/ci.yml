@@ -147,7 +147,7 @@ jobs:
       # with 16 tiles at 10 frames per second on a 1280x800 screen, where the stage
       # letterboxes the image to about 700x390 (smaller screens leave tiles too few
       # pixels for the seam checks' colour fit).
-      FLEET_E2E_VIEW: "1280x800"
+      FLEET_E2E_VIEW: "960x600"
       FLEET_MOCK_FPS: "10"
       FLEET_MOCK_THREADS: "3"
     steps:

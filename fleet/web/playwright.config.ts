@@ -9,8 +9,11 @@ if (!Number.isInteger(base) || base <= 0) {
   throw new Error("FLEET_TEST_BASE_PORT is not set. Put it in fleet/web/.env.ports (see README.md).");
 }
 export const PORTS = { web: base, coord: base + 1, render: base + 2 };
-// A smaller screen and frame rate let a small CI runner draw the whole mock fleet.
-const [vw, vh] = (process.env.FLEET_E2E_VIEW ?? "1440x900").split("x").map(Number) as [number, number];
+// A smaller screen and frame rate let a small CI runner draw the whole mock fleet. The
+// image fills the viewport, and the mock draws every pixel of it in JavaScript and encodes
+// each stream with its own ffmpeg: 1024x640 asks it for a 1024x576 image, half the pixels
+// of 1440x900's 1440x810. At 1440x900 the suite's later tests fell behind on this mock.
+const [vw, vh] = (process.env.FLEET_E2E_VIEW ?? "1024x640").split("x").map(Number) as [number, number];
 const viewport = { width: vw, height: vh };
 process.env.FLEET_E2E_COORD_PORT = String(PORTS.coord);
 

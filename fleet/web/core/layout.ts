@@ -52,10 +52,39 @@ export function rectOnScreen(image: Box, r: Rect, dpr: number): Box {
   return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
 }
 
-/** The smallest stream height that covers `devicePixels`, capped at the largest. */
-export function streamHeightFor(devicePixels: number): number {
-  for (const h of STREAM_HEIGHTS) if (h >= devicePixels - 0.5) return h;
-  return STREAM_HEIGHTS[STREAM_HEIGHTS.length - 1]!;
+/**
+ * The most pixels one tile's stream may ask for. A renderer draws at the largest height any
+ * subscriber asks, within the pixel-samples per frame its GPU fits at 30 fps
+ * (fleet/renderer/README.md, "Grid-wide budget": 0.4 to 0.5 M for a terrain tile on a T4),
+ * so a larger tile drops under one sample per pixel while the camera moves. One viewer on a
+ * big screen must not ask for more and blur the picture every other viewer sees.
+ */
+export const MAX_TILE_PX = 0.5e6;
+
+/**
+ * The smallest stream height that covers `devicePixels`, capped at the largest. With
+ * `tileAspect` (the tile's width over its height on screen) it is also capped so the tile is at
+ * most MAX_TILE_PX: h <= sqrt(MAX_TILE_PX / tileAspect), snapped down to a stream height.
+ */
+export function streamHeightFor(devicePixels: number, tileAspect?: number): number {
+  let h: number = STREAM_HEIGHTS[STREAM_HEIGHTS.length - 1]!;
+  for (const x of STREAM_HEIGHTS) {
+    if (x >= devicePixels - 0.5) {
+      h = x;
+      break;
+    }
+  }
+  if (tileAspect === undefined || !(tileAspect > 0)) return h;
+  const cap = Math.sqrt(MAX_TILE_PX / tileAspect);
+  if (h <= cap) return h;
+  let best: number = STREAM_HEIGHTS[0];
+  for (const x of STREAM_HEIGHTS) if (x <= cap) best = x;
+  return best;
+}
+
+/** A tile's width over its height, from its rectangle of an image of `imageAspect`. */
+export function tileAspectOf(rect: Rect, imageAspect: number): number {
+  return (rect.w * imageAspect) / rect.h;
 }
 
 export interface PlacedTile {
@@ -101,7 +130,7 @@ export function layoutMosaic(area: Box, tiles: readonly Tile[], dpr: number, asp
     image: snapped,
     tiles: tiles.map((t) => {
       const box = rectOnScreen(image, t.rect, dpr);
-      return { id: t.id, box, streamHeight: streamHeightFor(box.h * dpr) };
+      return { id: t.id, box, streamHeight: streamHeightFor(box.h * dpr, tileAspectOf(t.rect, aspect)) };
     }),
     halfLineX: split > 0 && split < 1 ? snap(image.x + image.w * split, dpr) : null,
     split,
@@ -110,14 +139,15 @@ export function layoutMosaic(area: Box, tiles: readonly Tile[], dpr: number, asp
 
 /** The box a single tile is drawn in when opened: its own aspect, fitted to `area`. */
 export function layoutFocus(area: Box, tile: Tile, dpr: number, imageAspect: number = DEFAULT_IMAGE_ASPECT): PlacedTile {
-  const fit = fitContain(area, (tile.rect.w * imageAspect) / tile.rect.h);
+  const tileAspect = tileAspectOf(tile.rect, imageAspect);
+  const fit = fitContain(area, tileAspect);
   const box = {
     x: snap(fit.x, dpr),
     y: snap(fit.y, dpr),
     w: snap(fit.x + fit.w, dpr) - snap(fit.x, dpr),
     h: snap(fit.y + fit.h, dpr) - snap(fit.y, dpr),
   };
-  return { id: tile.id, box, streamHeight: streamHeightFor(box.h * dpr) };
+  return { id: tile.id, box, streamHeight: streamHeightFor(box.h * dpr, tileAspect) };
 }
 
 /** NVENC's smallest H.264 frame on a T4: nothing narrower than 145 or shorter than 49 px. */

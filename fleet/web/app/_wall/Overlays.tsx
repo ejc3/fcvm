@@ -1,7 +1,7 @@
 "use client";
 
-// Everything drawn over and around the frames: the line between the halves
-// and its labels, the captions under each half, dark tiles' glyphs and phases,
+// Everything drawn over the frames: the line between the halves, each half's
+// tag, dark tiles' glyphs and phases,
 // the stats switch's per-tile lines, the seams and the hovered tile's outline
 // and label, banners and notices.
 
@@ -85,7 +85,7 @@ function DarkTile({ t }: { t: TileView }) {
   );
 }
 
-export function Overlays({ view, phone }: { view: WallView; phone: boolean }) {
+export function Overlays({ view }: { view: WallView; phone: boolean }) {
   const L = view.layout;
   const showMosaic = L !== null && view.focus === null && view.own === null;
   const img = L?.image;
@@ -95,7 +95,7 @@ export function Overlays({ view, phone }: { view: WallView; phone: boolean }) {
     <div className="layer" data-testid="overlays">
       {showMosaic && img ? (
         <>
-          {L.halfLineX !== null ? <div className="half-line" style={{ left: L.halfLineX, top: img.y, height: img.h }} aria-hidden="true" /> : null}
+          {L.halfLineX !== null ? <div className="half-line" data-testid="half-line" style={{ left: L.halfLineX - 1, top: img.y, height: img.h }} aria-hidden="true" /> : null}
           {view.labels.empty ? (
             <span
               className={`empty-side plate ${view.labels.empty.half}`}
@@ -136,29 +136,18 @@ export function Overlays({ view, phone }: { view: WallView; phone: boolean }) {
               style={{ ...accent(seams.outline.color), left: seams.outline.box.x, top: seams.outline.box.y, width: seams.outline.box.w, height: seams.outline.box.h }}
             />
           ) : null}
-          {view.labels.seam.map((l) => (
+          {view.labels.sides.map((l) => (
             <span
               key={l.half}
               data-avoid=""
-              className={`seam-label plate ${l.half}`}
-              data-testid={`seam-label-${l.half}`}
+              className={`side-tag ${l.half}`}
+              data-testid={`side-${l.half}`}
               style={l.align === "right" ? { right: `calc(100vw - ${l.x}px)`, top: l.y } : { left: l.x, top: l.y }}
             >
-              {l.text}
+              <b>{l.tag}</b>
+              {l.text ? ` · ${l.text}` : null}
             </span>
           ))}
-          {phone
-            ? null
-            : view.labels.captions.map((c) => (
-                <p
-                  key={c.half}
-                  className={`caption ${c.half}`}
-                  data-testid={`caption-${c.half}`}
-                  style={{ left: c.box.x, top: c.box.y, width: c.box.w, textAlign: c.align }}
-                >
-                  <b>{c.tag}</b> {c.text}
-                </p>
-              ))}
           {seams.label ? (
             <div className="hover-label" data-testid="hover-label" style={{ ...accent(seams.label.accent), left: seams.label.x, top: seams.label.y }}>
               <span className="row1">
@@ -183,7 +172,7 @@ export function Overlays({ view, phone }: { view: WallView; phone: boolean }) {
         </>
       ) : null}
       {view.sleep && img ? (
-        <div className={`sleep-card ${view.sleep.state}`} data-testid="sleep-card" style={{ right: `calc(100vw - ${img.x + img.w - 12}px)`, top: img.y + 12 }} role="status">
+        <div className={`sleep-card ${view.sleep.state}`} data-testid="sleep-card" style={{ right: `calc(100vw - ${img.x + img.w - 12}px)`, top: Math.max(img.y + 12, 120) }} role="status">
           <span className="title">{view.sleep.title}</span>
           {view.sleep.clock ? (
             <span className="clock" data-testid="wake-clock">
