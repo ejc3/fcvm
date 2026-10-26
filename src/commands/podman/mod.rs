@@ -1105,9 +1105,9 @@ async fn export_localhost_image_disk(
         // Export into a UUID-keyed temp, then atomically rename. This avoids corrupt
         // archives from interrupted exports AND is safe under cross-VM concurrency: the
         // image-cache dir is shared across VMs and the per-digest flock above does not
-        // coordinate cross-VM (see image::unique_cache_tmp). A shared "<digest>.tmp"
+        // coordinate cross-VM (see crate::setup::store_temp_path). A shared "<digest>.tmp"
         // would let one VM's rename ENOENT the other's in-flight export.
-        let tmp_path = image::unique_cache_tmp(&archive_path);
+        let tmp_path = crate::setup::store_temp_path(&archive_path);
 
         // Export by the IMMUTABLE image ID captured at inspect time, not the mutable
         // tag (#598). A parallel build can repoint the tag between the cache-key
