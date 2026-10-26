@@ -2873,9 +2873,10 @@ fn view_dirs_named_in(snapshot_state: &[u8], view: &Path) -> Vec<PathBuf> {
 /// snapshot names a path in (a read-only `--disk` under another VM's directory), when it
 /// exists.
 ///
-/// Refuses a directory inside `view` that contains an earlier pair's mountpoint (a
-/// `--vsock-dir` of `vm-disks` itself): binding it onto itself would cover those
-/// redirects with the host's directories again.
+/// A named directory that holds a redirect's mountpoint is bound first, so the redirect
+/// lands inside it. A directory of the clone's that contains a redirect's mountpoint (a
+/// `--vsock-dir` of `vm-disks` itself) is refused: binding it onto itself after them
+/// would cover those redirects with the host's directories again.
 fn clone_mount_view(
     view: &Path,
     mut pairs: Vec<(PathBuf, PathBuf)>,
@@ -2887,6 +2888,21 @@ fn clone_mount_view(
         .into_iter()
         .filter(|dir| dir.is_dir())
         .collect();
+    // A named directory that holds a redirect's mountpoint (a source's --vsock-dir under
+    // vm-disks/<dir>/) is bound before the redirects, so they land inside it.
+    let mut first = Vec::new();
+    for dir in &named {
+        let covered = pairs
+            .iter()
+            .any(|(mountpoint, _)| dir.starts_with(mountpoint));
+        let holds = pairs
+            .iter()
+            .any(|(mountpoint, _)| mountpoint != dir && mountpoint.starts_with(dir));
+        if !covered && holds {
+            first.push((dir.clone(), dir.clone()));
+        }
+    }
+    pairs.splice(0..0, first);
     let owned = [clone_dir, vsock_target_dir]
         .into_iter()
         .chain(named.iter().map(PathBuf::as_path));
@@ -6287,6 +6303,40 @@ mod tests {
                 ]
             ]
             .concat()
+        );
+    }
+
+    /// A source whose `--vsock-dir` sits in a directory of its own inside vm-disks: the
+    /// snapshot names that directory, which holds the vsock redirect's mountpoint, so it
+    /// is bound first and the redirect lands inside it.
+    ///
+    /// RED BEFORE THE FIX: the named directory was refused for containing the redirect.
+    #[test]
+    fn a_named_directory_that_holds_a_redirect_is_bound_before_it() {
+        let root = tempfile::tempdir().unwrap();
+        let view = root.path().join("vm-disks");
+        let shared = view.join("shared");
+        let source_vsock = shared.join("source");
+        let clone = view.join("vm-clone");
+        for dir in [&source_vsock, &clone] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let redirect = (source_vsock.clone(), clone.clone());
+        let mut state = source_vsock
+            .join("vsock.sock")
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec();
+        state.push(0);
+        let redirects =
+            clone_mount_view(&view, vec![redirect.clone()], &clone, &clone, &state).unwrap();
+        assert_eq!(
+            redirects.pairs,
+            vec![
+                (shared.clone(), shared.clone()),
+                redirect,
+                (clone.clone(), clone.clone())
+            ]
         );
     }
 
