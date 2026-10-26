@@ -1218,6 +1218,135 @@ async fn test_lifecycle_interleave_quiesce_survives_long_prepause() -> Result<()
 }
 
 // ---------------------------------------------------------------------------
+// CASE: sigterm_before_cache_hit_restore_gate
+// ---------------------------------------------------------------------------
+
+/// Pins issue 1162: a SIGTERM that reaches `podman run` during a snapshot cache
+/// hit, after `podman run` installed its signal handler and before the restore
+/// created its own lifecycle gate and signal streams, stops the run.
+///
+/// Run 1 cold-boots a unique command and creates its pre-start snapshot. Run 2
+/// repeats the command, so it restores, and is held at `restore.locked`: the
+/// restore holds the snapshot's shared generation lock and has not yet created
+/// its gate. SIGTERM is sent there, and `podman run`'s own handler records it
+/// before the hold is released.
+///
+/// RED BEFORE THE FIX: the signal cancelled only `podman run`'s gate, which
+/// nothing on the cache-hit path checks. The restore created a fresh gate, the
+/// clone published lifecycle readiness and ran until the test killed it.
+#[tokio::test]
+async fn test_lifecycle_interleave_sigterm_before_cache_hit_restore_gate() -> Result<()> {
+    let (run1_name, run2_name, _, _) = common::unique_names("ilv-hit-sigterm");
+    // Unique command, unique snapshot key: run 1 is always cold, run 2 a hit.
+    let script = format!("echo {run1_name}; sleep 3600");
+    let go_file = PathBuf::from(format!("/tmp/{run2_name}-restore-locked-go"));
+    remove_file_if_exists(&go_file).context("removing stale restore.locked go-file")?;
+
+    let (mut child1, pid1, log1) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &run1_name,
+            common::ALPINE_IMAGE,
+            "sh",
+            "-c",
+            &script,
+        ],
+        &[],
+    )
+    .await?;
+    let seeded: Result<Option<String>> = async {
+        common::poll_health_by_pid(pid1, 300).await?;
+        wait_for_marker(
+            &log1,
+            "Pre-start snapshot created successfully",
+            0,
+            Duration::from_secs(60),
+        )
+        .await?;
+        Ok(ls_vm_by_pid(pid1)
+            .await?
+            .and_then(|state| state.config.snapshot_name))
+    }
+    .await;
+    common::kill_process(pid1).await;
+    let _ = child1.wait().await;
+    let base_key = seeded.context("run 1 must create the pre-start snapshot")?;
+    anyhow::ensure!(base_key.is_some(), "run 1 recorded no snapshot key");
+
+    let failpoint_spec = format!("restore.locked:block_until_file:{}", go_file.display());
+    let (mut child2, pid2, log2) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &run2_name,
+            common::ALPINE_IMAGE,
+            "sh",
+            "-c",
+            &script,
+        ],
+        &[("FCVM_FAILPOINT", &failpoint_spec)],
+    )
+    .await?;
+    let exercise: Result<std::process::ExitStatus> = async {
+        let held_at = wait_for_marker(
+            &log2,
+            "FAILPOINT restore.locked reached",
+            0,
+            Duration::from_secs(120),
+        )
+        .await
+        .context("run 2 must restore the cached snapshot")?;
+        sigterm(pid2).await;
+        wait_for_marker(
+            &log2,
+            "received SIGTERM, shutting down VM",
+            held_at,
+            Duration::from_secs(30),
+        )
+        .await
+        .context("podman run's handler must record the signal while the restore is held")?;
+        anyhow::ensure!(
+            search_log_from(&log2, "FAILPOINT restore.locked released", held_at).is_none(),
+            "the restore left restore.locked before the signal was recorded"
+        );
+        std::fs::write(&go_file, b"go").context("releasing restore.locked")?;
+        wait_exit(&mut child2, Duration::from_secs(60))
+            .await
+            .with_context(|| {
+                format!(
+                    "run 2 kept running after SIGTERM; log tail:\n{}",
+                    log_tail(&log2, 40)
+                )
+            })
+    }
+    .await;
+
+    let _ = std::fs::write(&go_file, b"cleanup");
+    if exercise.is_err() {
+        common::kill_process(pid2).await;
+        let _ = child2.wait().await;
+    }
+    cleanup_snapshot_keys(&[base_key]).await;
+    let _ = remove_file_if_exists(&go_file);
+
+    let status = exercise?;
+    anyhow::ensure!(
+        !status.success(),
+        "run 2 reported success after SIGTERM; log tail:\n{}",
+        log_tail(&log2, 40)
+    );
+    anyhow::ensure!(
+        !log_contains(&log2, "VM lifecycle ready"),
+        "the clone published lifecycle readiness after SIGTERM; log tail:\n{}",
+        log_tail(&log2, 40)
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // CASE: no_leaks_after_interleaved_teardown
 // ---------------------------------------------------------------------------
 
@@ -2400,6 +2529,156 @@ async fn test_lifecycle_interleave_source_teardown_waits_for_clone_disk_open() -
             cleanup_errors.join("\n- ")
         )));
     }
+    anyhow::ensure!(
+        cleanup_errors.is_empty(),
+        "fixture cleanup failed:\n- {}",
+        cleanup_errors.join("\n- ")
+    );
+    Ok(())
+}
+
+/// A restore of a snapshot whose source VM is gone recreates the source's runtime
+/// directory as a mountpoint for its disk redirect (issue 1187). Once the clone's VMM
+/// has opened its disks through it, and its Firecracker takes the vsock override
+/// (1.16.0 and later), nothing needs it, so the restore removes it. An older
+/// Firecracker resolves its vsock socket through the redirect for its whole life, so
+/// the directory stays until the clone exits. Either way none is left behind.
+///
+/// RED BEFORE THE FIX: the recreated directory outlived the clone.
+#[tokio::test]
+async fn test_lifecycle_interleave_restore_removes_a_recreated_source_dir() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("ilv-recreated");
+    let mut clone: Option<(tokio::process::Child, PinnedProcess)> = None;
+    let mut snapshot_created = false;
+
+    let exercise: Result<()> = async {
+        let (mut baseline_child, baseline_pid, _) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &baseline_name,
+                "--network",
+                "rootless",
+                "--no-snapshot",
+                common::TEST_IMAGE,
+            ],
+            &[],
+        )
+        .await
+        .context("spawning rootless baseline")?;
+        let baseline_process =
+            PinnedProcess::capture(baseline_pid).context("pinning rootless baseline")?;
+        let seeded: Result<PathBuf> = async {
+            common::poll_health_by_pid(baseline_pid, 180).await?;
+            let dir = artifacts_for_name(&baseline_name)?
+                .context("baseline published no state")?
+                .data_dir;
+            common::create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;
+            Ok(dir)
+        }
+        .await;
+        snapshot_created = seeded.is_ok();
+        stop_test_child(&mut baseline_child, &baseline_process)
+            .await
+            .context("stopping the baseline")?;
+        let baseline_dir = seeded.context("snapshotting the baseline")?;
+        anyhow::ensure!(
+            !baseline_dir.exists(),
+            "the baseline's teardown left {}",
+            baseline_dir.display()
+        );
+
+        let (clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snapshot_name,
+                "--name",
+                &clone_name,
+            ],
+            &[],
+        )
+        .await
+        .context("spawning the clone")?;
+        let clone_process = PinnedProcess::capture(clone_pid).context("pinning the clone")?;
+        clone = Some((clone_child, clone_process));
+        let (clone_child, _) = clone.as_mut().context("clone fixture disappeared")?;
+        common::poll_health(clone_child, 180)
+            .await
+            .with_context(|| {
+                format!(
+                    "the clone did not become healthy; log tail:\n{}",
+                    log_tail(&clone_log, 60)
+                )
+            })?;
+        let firecracker = ls_vm_by_pid(clone_pid)
+            .await?
+            .and_then(|state| state.config.firecracker_bin)
+            .context("the clone recorded no Firecracker binary")?;
+        let version = std::process::Command::new(&firecracker)
+            .arg("--version")
+            .output()
+            .with_context(|| format!("running {} --version", firecracker.display()))?;
+        let version = String::from_utf8_lossy(&version.stdout).to_string();
+        let word = version
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix('v'))
+            .with_context(|| format!("no version in {version:?}"))?;
+        let (release, prerelease) = match word.split_once('-') {
+            Some((release, _)) => (release, true),
+            None => (word, false),
+        };
+        let numbers: Vec<u32> = release
+            .split('.')
+            .map(|part| part.parse().context("parsing the Firecracker version"))
+            .collect::<Result<_>>()?;
+        // The rule restore applies (`FirecrackerVersion::at_least`): a pre-release of
+        // 1.16.0 can predate the override, so it counts as older.
+        let min = [1u32, 16, 0];
+        let overrides_vsock =
+            numbers.as_slice() > min.as_slice() || (numbers.as_slice() == min && !prerelease);
+        anyhow::ensure!(
+            baseline_dir.exists() != overrides_vsock,
+            "Firecracker {} (vsock override: {overrides_vsock}): the source directory the \
+             restore recreated is {} while the clone runs; log tail:\n{}",
+            version.trim(),
+            if baseline_dir.exists() {
+                "present"
+            } else {
+                "gone"
+            },
+            log_tail(&clone_log, 40)
+        );
+        let (clone_child, clone_process) = clone.as_mut().context("clone fixture disappeared")?;
+        stop_test_child(clone_child, clone_process)
+            .await
+            .context("stopping the clone")?;
+        clone = None;
+        anyhow::ensure!(
+            !baseline_dir.exists(),
+            "the restore left the source directory it recreated: {}",
+            baseline_dir.display()
+        );
+        Ok(())
+    }
+    .await;
+
+    let mut cleanup_errors = Vec::new();
+    let mut clone_stopped = true;
+    if let Some((child, process)) = clone.as_mut() {
+        if let Err(error) = stop_test_child(child, process).await {
+            clone_stopped = false;
+            cleanup_errors.push(format!("stopping clone: {error:#}"));
+        }
+    }
+    if snapshot_created && clone_stopped {
+        if let Err(error) = common::delete_snapshot(&snapshot_name).await {
+            cleanup_errors.push(format!("deleting snapshot {snapshot_name}: {error:#}"));
+        }
+    }
+    exercise?;
     anyhow::ensure!(
         cleanup_errors.is_empty(),
         "fixture cleanup failed:\n- {}",

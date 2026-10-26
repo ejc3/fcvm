@@ -271,12 +271,12 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
 	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu gpu-residue-test gpu-routed-test setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
-	bench-container-import bench-computesdk bench-gpu-restore test-gpu-restore bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
+	bench-container-import bench-computesdk bench-gpu-restore test-gpu-restore test-computesdk bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
 	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-chromium-corpus-extra bench-stop \
 	bench-chromium-request-run bench-chromium-request-all bench-chromium-hostcdp bench-chromium-fault \
 	bench-chromium-request-diag bench-webkit-request-diag \
-	bench-chromium-scale analyze-chromium-scale report-chromium-scale test-chromium-scale \
+	bench-chromium-scale check-chromium-scale analyze-chromium-scale report-chromium-scale test-chromium-scale \
 	test-chromium-fault \
 	bench-quick bench-throughput bench-operations bench-protocol \
 	lint fmt update-dependency ssh test-serve-sdk
@@ -361,8 +361,10 @@ help:
 	@echo "  analyze-chromium-campaign  Index retained CAMPAIGN_RUNS='run1 run2' into CAMPAIGN_OUT=path"
 	@echo "  test-chromium          Run ALL bench unit tests (what CI runs)"
 	@echo "  test-gpu-restore       Run bench/gpu-restore/summarize.py's unit tests"
+	@echo "  test-computesdk        Run bench/computesdk/run.sh's output-directory checks"
 	@echo "  test-chromium-request  Run the request benchmark's deterministic unit tests"
 	@echo "  bench-chromium-scale  Open-loop FILE/UFFD Chromium request scalability run"
+	@echo "  check-chromium-scale  Validate the SCALE_* variables and their schedule, no VM"
 	@echo "  analyze-chromium-scale  Validate a scale run and write deterministic JSON"
 	@echo "  report-chromium-scale   Validate a scale run and write plain Markdown"
 	@echo "  test-chromium-scale  Run the scale harness's deterministic unit tests"
@@ -1266,6 +1268,10 @@ test-gpu-restore:
 	@python3 -m unittest discover -s bench/gpu-restore -p 'test_*.py' \
 		$(if $(FILTER),-k '$(FILTER)',)
 
+test-computesdk:
+	@python3 -m unittest discover -s bench/computesdk -p 'test_*.py' \
+		$(if $(FILTER),-k '$(FILTER)',)
+
 test-chromium-request:
 	@python3 -m unittest discover -s bench/chromium -p 'test_reqbench.py' \
 		$(if $(FILTER),-k '$(FILTER)',)
@@ -1295,8 +1301,26 @@ SCALE_UFFD_MODE ?= copy
 SCALE_UFFD_PREFETCH ?= on
 SCALE_CONTROL_URL ?=
 SCALE_CONTROL_RESOLVE_ALL_TO ?=
-bench-chromium-scale:
-	@test -n "$(SCALE_RATES)" || (echo "ERROR: SCALE_RATES required (for example 2,4,8)"; exit 1)
+# reqscale.py's arguments, one list for the schedule check and the measured run,
+# so the check validates exactly what the run will be given.
+SCALE_REQSCALE_ARGS = --url "$(SCALE_URL)" --rates "$(SCALE_RATES)" \
+	--bursts "$(SCALE_BURSTS)" --control-chromium "$(SCALE_CONTROL_CHROMIUM)" \
+	--max-offered-rps-error-pct "$(SCALE_MAX_OFFERED_ERROR_PCT)" \
+	--min-departure-ratio "$(SCALE_MIN_DEPARTURE_RATIO)" \
+	--max-score-end-backlog "$(SCALE_MAX_BACKLOG)" \
+	--max-p95-launch-lag-ms "$(SCALE_MAX_LAUNCH_LAG_MS)" \
+	--max-control-median-drift-pct "$(SCALE_MAX_CONTROL_DRIFT_PCT)" \
+	--seed "$(SCALE_SEED)" \
+	--uffd-mode "$(SCALE_UFFD_MODE)" --uffd-prefetch "$(SCALE_UFFD_PREFETCH)" \
+	$(if $(SCALE_CONTROL_URL),--control-url "$(SCALE_CONTROL_URL)") \
+	$(if $(SCALE_CONTROL_RESOLVE_ALL_TO),--control-resolve-all-to "$(SCALE_CONTROL_RESOLVE_ALL_TO)") \
+	--out-dir "$(SCALE_OUT)" $(SCALE_TRACE_ARGS)
+# Validates the SCALE_* variables and the schedule they make with reqscale.py's
+# own rules (whole requests per 15 s ramp, whole corpus cycles per 60 s window,
+# at least 200 scored requests per cell), in seconds and without a VM.
+# corpus_campaign.sh runs it before the golden; bench-chromium-scale runs it first.
+check-chromium-scale:
+	@test -n "$(SCALE_RATES)" || (echo "ERROR: SCALE_RATES required, per path: e.g. 2,4,8 for one page, or 0.933333333333,1.4,1.866666666667 for the 14-page corpus (multiples of 7/15)"; exit 1)
 	@test -n "$(SCALE_BURSTS)" || (echo "ERROR: SCALE_BURSTS required (must be at least 5)"; exit 1)
 	@test -n "$(SCALE_SEED)" || (echo "ERROR: SCALE_SEED required"; exit 1)
 	@test -n "$(SCALE_OUT)" || (echo "ERROR: SCALE_OUT required"; exit 1)
@@ -1308,20 +1332,13 @@ bench-chromium-scale:
 	@test -n "$(SCALE_MAX_BACKLOG)" || (echo "ERROR: SCALE_MAX_BACKLOG required"; exit 1)
 	@test -n "$(SCALE_MAX_LAUNCH_LAG_MS)" || (echo "ERROR: SCALE_MAX_LAUNCH_LAG_MS required"; exit 1)
 	@test -n "$(SCALE_MAX_CONTROL_DRIFT_PCT)" || (echo "ERROR: SCALE_MAX_CONTROL_DRIFT_PCT required"; exit 1)
+	@python3 bench/chromium/reqscale.py --check-schedule --snapshot-tag "$(SCALE_TAG)" \
+		$(SCALE_REQSCALE_ARGS)
+
+bench-chromium-scale: check-chromium-scale
 	@echo "==> Running open-loop Chromium request scalability benchmark..."
 	TAG="$(SCALE_TAG)" RESULTS="$(RESULTS)" bash bench/chromium/reqbench.sh scale \
-		--url "$(SCALE_URL)" --rates "$(SCALE_RATES)" \
-		--bursts "$(SCALE_BURSTS)" --control-chromium "$(SCALE_CONTROL_CHROMIUM)" \
-		--max-offered-rps-error-pct "$(SCALE_MAX_OFFERED_ERROR_PCT)" \
-		--min-departure-ratio "$(SCALE_MIN_DEPARTURE_RATIO)" \
-		--max-score-end-backlog "$(SCALE_MAX_BACKLOG)" \
-		--max-p95-launch-lag-ms "$(SCALE_MAX_LAUNCH_LAG_MS)" \
-		--max-control-median-drift-pct "$(SCALE_MAX_CONTROL_DRIFT_PCT)" \
-		--seed "$(SCALE_SEED)" \
-		--uffd-mode "$(SCALE_UFFD_MODE)" --uffd-prefetch "$(SCALE_UFFD_PREFETCH)" \
-		$(if $(SCALE_CONTROL_URL),--control-url "$(SCALE_CONTROL_URL)") \
-		$(if $(SCALE_CONTROL_RESOLVE_ALL_TO),--control-resolve-all-to "$(SCALE_CONTROL_RESOLVE_ALL_TO)") \
-		--out-dir "$(SCALE_OUT)" $(SCALE_TRACE_ARGS)
+		$(SCALE_REQSCALE_ARGS)
 
 analyze-chromium-scale:
 	@test -n "$(SCALE_RUN_DIR)" || (echo "ERROR: SCALE_RUN_DIR required"; exit 1)

@@ -532,7 +532,7 @@ impl FirecrackerConfig {
             .map(|mapping| mapping.guest_port.to_string())
             .collect::<Vec<_>>();
 
-        serde_json::json!({
+        let mut document = serde_json::json!({
             "latest": {
                 "container-plan": {
                     "image": self.container_image_name,
@@ -569,9 +569,12 @@ impl FirecrackerConfig {
                     "no_proxy": runtime.no_proxy,
                     "ntp_servers": runtime.ntp_servers,
                 },
-                "host-time": runtime.host_time,
             }
-        })
+        });
+        for (key, value) in crate::utils::host_clock_fields(runtime.host_clock) {
+            document["latest"][key] = serde_json::Value::String(value);
+        }
+        document
     }
 }
 
@@ -608,8 +611,9 @@ pub struct MmdsRuntime {
     pub subgid_start: Option<u64>,
     /// Host user's subordinate GID range count
     pub subgid_count: Option<u64>,
-    /// Host timestamp (UTC epoch seconds)
-    pub host_time: String,
+    /// The host clock when the plan was built, as time since the Unix epoch
+    /// (`utils::host_clock_fields`).
+    pub host_clock: std::time::Duration,
     /// The host's NTP servers, already resolved to addresses, for the guest's chronyd.
     ///
     /// Resolved host-side for the same reason proxies are: the guest writes them
@@ -1168,7 +1172,7 @@ mod tests {
             subuid_count: None,
             subgid_start: None,
             subgid_count: None,
-            host_time: "0".to_string(),
+            host_clock: std::time::Duration::ZERO,
             ntp_servers: vec![],
         });
 
@@ -1196,7 +1200,7 @@ mod tests {
             subuid_count: None,
             subgid_start: None,
             subgid_count: None,
-            host_time: "0".to_string(),
+            host_clock: std::time::Duration::ZERO,
             ntp_servers: vec![],
         };
         let plan = test_config().to_mmds_json(runtime(Some("/dev/vdc")));

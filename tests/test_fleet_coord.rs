@@ -106,6 +106,41 @@ fn light(x: f64) -> Value {
     json!({"pos": [x, 2.0, -90.0], "color": [1.0, 0.5, 0.0]})
 }
 
+/// Stops a coordinator started with `start` and returns the version its last publish
+/// carries, which is the version of the state it stored.
+///
+/// `start` runs a 1 s ticker, and a tick that changes the fleet moves the version without
+/// a receipt. A stored or published version therefore cannot be compared to the last
+/// receipt's: it equals it when no tick landed and is larger when one did. This applies a
+/// viewer join first, which moves the version the same way on every run, so a test that
+/// compares against the last receipt fails every time instead of one run in a while. The
+/// join also makes the returned version greater than `last_receipt`, which is asserted.
+async fn shutdown_at_final_version(
+    handle: &Handle,
+    actor: tokio::task::JoinHandle<()>,
+    last_receipt: u64,
+) -> u64 {
+    let join = handle
+        .apply(Event::ViewerJoined {
+            at: 0,
+            viewer: "v-final".into(),
+            client: None,
+        })
+        .await;
+    assert!(join.is_none(), "a join carries no receipt");
+    handle.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(5), actor)
+        .await
+        .unwrap()
+        .unwrap();
+    let published = handle.snapshot.borrow().version;
+    assert!(
+        published > last_receipt,
+        "the join moved the version past the last receipt: {published} after {last_receipt}"
+    );
+    published
+}
+
 /// A browser: every message it receives, snapshots kept by version.
 struct Viewer {
     ws: Ws,
@@ -322,10 +357,9 @@ async fn a_repeated_intent_id_returns_its_first_receipt_and_applies_once() {
         repeats[0], repeats[1],
         "a repeated id must get the first receipt"
     );
-    assert_eq!(
-        first["version"].as_u64().unwrap() + 1,
-        marker["version"].as_u64().unwrap()
-    );
+    // The ticker can move the version between the two receipts, so only the order is
+    // fixed; that the repeat applied nothing is the action count below.
+    assert!(first["version"].as_u64().unwrap() < marker["version"].as_u64().unwrap());
     let s = a.at_least(marker["version"].as_u64().unwrap()).await;
     let named: Vec<&Value> = s["actions"]
         .as_array()
@@ -601,6 +635,7 @@ impl FakeAgent {
                     .collect(),
                 capacity: gpus,
                 store_ready_at: None,
+                boot: Default::default(),
             })
             .unwrap();
         FakeAgent {
@@ -1123,17 +1158,13 @@ async fn shutdown_writes_the_last_state_to_the_state_file() {
             .unwrap();
         last = r.version;
     }
-    handle.shutdown().await;
+    let final_version = shutdown_at_final_version(&handle, actor, last).await;
     let saved = store::load(&path).unwrap().expect("a state file");
     assert_eq!(
-        saved.version, last,
+        saved.version, final_version,
         "the state file misses the last changes"
     );
     assert!(saved.receipts.contains_key("l-4"));
-    tokio::time::timeout(Duration::from_secs(5), actor)
-        .await
-        .unwrap()
-        .unwrap();
 }
 
 /// A tile's instance that goes away after it was ready (a spot reclaim) is reported
@@ -3286,35 +3317,14 @@ async fn the_state_lives_in_s3_and_a_refused_read_is_an_error() {
             .unwrap()
             .version;
     }
-    // The coordinator's 1 s ticker moves the version without a receipt whenever a tick
-    // changes the fleet, so the stored version can pass the last receipt's. A viewer
-    // joining does the same on demand, which makes that happen on every run.
-    let after = handle
-        .apply(Event::ViewerJoined {
-            at: 0,
-            viewer: "v-2".into(),
-            client: None,
-        })
-        .await;
-    assert!(after.is_none(), "a join carries no receipt");
-    handle.shutdown().await;
-    tokio::time::timeout(Duration::from_secs(5), actor)
-        .await
-        .unwrap()
-        .unwrap();
+    let final_version = shutdown_at_final_version(&handle, actor, last).await;
     assert!(s3
         .objects
         .lock()
         .unwrap()
         .contains_key("/fleet-state/state.json"));
     let back = obj().load().await.unwrap().expect("the state object");
-    // The stored state is the state the actor ended with, which the shutdown publishes.
-    let final_version = handle.snapshot.borrow().version;
     assert_eq!(back.version, final_version);
-    assert!(
-        back.version > last,
-        "the join moved the version past the last receipt"
-    );
     for i in 0..3 {
         assert!(
             back.receipts.contains_key(&format!("l-{i}")),
@@ -3692,6 +3702,64 @@ async fn the_aws_tile_driver_waits_for_a_ready_renderer_and_refuses_a_failed_one
         .await
         .expect_err("a failed renderer is not a ready tile");
     assert!(format!("{e:#}").contains("CUDA init failed"), "{e:#}");
+}
+
+/// A starting tile's renderer is asked for `/health` every 250 ms, not every describe
+/// (3 s): the coordinator saw tiles ready up to 3 s late. EC2 is described once per `poll`
+/// all the same, so an instance reclaimed while it boots is still noticed.
+#[tokio::test]
+async fn a_starting_tile_is_seen_ready_within_the_health_poll_not_the_describe_poll() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    use fcvm::fleet::coord::ec2_aws::{AwsEc2, HEALTH_POLL};
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let n2 = n.clone();
+    let app = axum::Router::new().route(
+        "/health",
+        axum::routing::get(move || {
+            let i = n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { axum::Json(json!({"ready": i >= 2})) }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let api = FakeEc2Api::default();
+    let base = fake_ec2_api(api.clone()).await;
+    let mut d = AwsEc2::new(
+        vec!["us-east-1".to_string()],
+        "fcvm-fleet-tile-x86_64".into(),
+        None,
+        "fcvm.example".into(),
+    )
+    .unwrap();
+    assert!(d.health_poll == HEALTH_POLL && HEALTH_POLL <= Duration::from_millis(250));
+    d.endpoints.insert("us-east-1".into(), base);
+    d.health_scheme = "http".into();
+    d.health_port = port;
+    d.poll = Duration::from_secs(3);
+    d.ready_timeout = Duration::from_secs(20);
+    let launched = ec2::Launched {
+        instance: "us-east-1/i-0123456789abcdef0".into(),
+        frame_url: None,
+        ipv6: None,
+        ipv4: None,
+    };
+    let t = std::time::Instant::now();
+    d.ready("ec2-1", &launched).await.unwrap();
+    let took = t.elapsed();
+    assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 3);
+    // Two not-ready answers, then ready: two health polls, far less than one describe poll.
+    assert!(took < Duration::from_millis(1500), "ready after {took:?}");
+    let describes = api
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, p)| p["Action"] == "DescribeInstances")
+        .count();
+    assert_eq!(describes, 1, "one describe within the first poll");
 }
 
 /// With subnets configured for a region, a launch tries each of them (one per AZ) in order,
@@ -4775,4 +4843,596 @@ async fn the_slowest_tile_sets_one_budget_for_every_tile() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(driver.posted.lock().unwrap()[0], got);
+}
+
+/// One instance of [`PoolEc2`]: state, tags, image, spot request.
+type PoolInstance = (String, BTreeMap<String, String>, String, Option<String>);
+
+/// A stateful EC2 for the tile pool: instances with states, tags, images and spot requests.
+#[derive(Default)]
+struct PoolEc2 {
+    instances: BTreeMap<String, PoolInstance>,
+    next: u32,
+    /// The pool template's current image.
+    image: String,
+    cancelled: Vec<String>,
+    /// Instances terminated while their spot request was not cancelled.
+    uncancelled_terminates: Vec<String>,
+    /// Instances whose StartInstances fails (a spot request not yet disabled).
+    start_fails: Vec<String>,
+    /// Instances launched more than a week ago.
+    old: Vec<String>,
+    /// Instances a filtered DescribeInstances lists as stopped and pooled whatever they are
+    /// (a list read before a resume and a release changed them).
+    listed_stopped: Vec<String>,
+    /// TerminateInstances calls that fail before one succeeds.
+    terminate_fails: u32,
+    /// CreateTags calls for FleetPool that fail before one succeeds.
+    pool_tag_fails: u32,
+    actions: Vec<String>,
+}
+
+async fn pool_ec2_api(api: Arc<std::sync::Mutex<PoolEc2>>) -> String {
+    use axum::http::StatusCode;
+    let app = axum::Router::new().fallback(move |body: String| {
+        let api = api.clone();
+        async move {
+            let p: BTreeMap<String, String> = body
+                .split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .map(|(k, v)| {
+                    let v = v.replace("%24", "$").replace("%3A", ":").replace("%2F", "/");
+                    (k.replace("%2E", "."), v)
+                })
+                .collect();
+            let mut a = api.lock().unwrap();
+            let action = p["Action"].clone();
+            a.actions.push(action.clone());
+            let ids = |p: &BTreeMap<String, String>, key: &str| -> Vec<String> {
+                (1..)
+                    .map_while(|i| p.get(&format!("{key}.{i}")).cloned())
+                    .collect()
+            };
+            let old = a.old.clone();
+            let item = |id: &str, (st, tags, img, sir): &PoolInstance| {
+                let at = if old.contains(&id.to_string()) {
+                    "2020-01-01T00:00:00.000Z".to_string()
+                } else {
+                    chrono::Utc::now().to_rfc3339()
+                };
+                let tags: String = tags
+                    .iter()
+                    .map(|(k, v)| format!("<item><key>{k}</key><value>{v}</value></item>"))
+                    .collect();
+                let sir = sir.as_ref().map(|r| format!("<spotInstanceRequestId>{r}</spotInstanceRequestId>")).unwrap_or_default();
+                format!("<item><instancesSet><item><instanceId>{id}</instanceId><imageId>{img}</imageId><instanceState><name>{st}</name></instanceState><launchTime>{at}</launchTime><ipAddress>127.0.0.1</ipAddress>{sir}<tagSet>{tags}</tagSet></item></instancesSet></item>")
+            };
+            let ok = |s: String| (StatusCode::OK, s);
+            match action.as_str() {
+                "RunInstances" => {
+                    a.next += 1;
+                    let id = format!("i-pool{:012}", a.next);
+                    let mut tags = BTreeMap::new();
+                    for i in 1.. {
+                        let Some(k) = p.get(&format!("TagSpecification.1.Tag.{i}.Key")) else { break };
+                        tags.insert(k.clone(), p[&format!("TagSpecification.1.Tag.{i}.Value")].clone());
+                    }
+                    // The pool template's requests are persistent; the spot template's one-time.
+                    let sir = match p["LaunchTemplate.LaunchTemplateName"].as_str() {
+                        "tile-pool" => Some(format!("sir-{}", a.next)),
+                        "tile-spot" => Some(format!("sir-once-{}", a.next)),
+                        _ => None,
+                    };
+                    let img = a.image.clone();
+                    a.instances.insert(id.clone(), ("running".into(), tags, img, sir));
+                    ok(format!("<RunInstancesResponse><instancesSet><item><instanceId>{id}</instanceId></item></instancesSet></RunInstancesResponse>"))
+                }
+                "DescribeInstances" => {
+                    let wanted = ids(&p, "InstanceId");
+                    let states = ids(&p, "Filter.2.Value");
+                    let fleet = p.get("Filter.3.Value.1").cloned();
+                    let items: String = a
+                        .instances
+                        .iter()
+                        .map(|(id, i)| {
+                            let mut i = i.clone();
+                            if wanted.is_empty() && a.listed_stopped.contains(id) {
+                                i.0 = "stopped".into();
+                                i.1.insert("FleetPool".into(), "stage-test".into());
+                            }
+                            (id, i)
+                        })
+                        .filter(|(id, (st, tags, _, _))| {
+                            if !wanted.is_empty() {
+                                return wanted.contains(id);
+                            }
+                            states.contains(st)
+                                && tags.get("Purpose").map(String::as_str) == Some("fcvm-fleet-tile")
+                                && tags.get("Fleet") == fleet.as_ref()
+                        })
+                        .map(|(id, i)| item(id, &i))
+                        .collect();
+                    ok(format!("<DescribeInstancesResponse><reservationSet>{items}</reservationSet></DescribeInstancesResponse>"))
+                }
+                "DescribeLaunchTemplateVersions" => ok(format!(
+                    "<DescribeLaunchTemplateVersionsResponse><launchTemplateVersionSet><item><launchTemplateData><imageId>{}</imageId></launchTemplateData></item></launchTemplateVersionSet></DescribeLaunchTemplateVersionsResponse>",
+                    a.image
+                )),
+                "StartInstances" => {
+                    let id = p["InstanceId.1"].clone();
+                    if a.start_fails.contains(&id) {
+                        return (StatusCode::BAD_REQUEST, "<Response><Errors><Error><Code>IncorrectSpotRequestState</Code><Message>not yet</Message></Error></Errors></Response>".into());
+                    }
+                    a.instances.get_mut(&id).unwrap().0 = "running".into();
+                    ok("<StartInstancesResponse/>".into())
+                }
+                "StopInstances" => {
+                    let id = p["InstanceId.1"].clone();
+                    a.instances.get_mut(&id).unwrap().0 = "stopped".into();
+                    ok("<StopInstancesResponse/>".into())
+                }
+                "CreateTags" => {
+                    let id = p["ResourceId.1"].clone();
+                    let (k, v) = (p["Tag.1.Key"].clone(), p["Tag.1.Value"].clone());
+                    if k == "FleetPool" && a.pool_tag_fails > 0 {
+                        a.pool_tag_fails -= 1;
+                        return (StatusCode::SERVICE_UNAVAILABLE, "<Response><Errors><Error><Code>RequestLimitExceeded</Code><Message>slow down</Message></Error></Errors></Response>".into());
+                    }
+                    a.instances.get_mut(&id).unwrap().1.insert(k, v);
+                    ok("<CreateTagsResponse/>".into())
+                }
+                "DeleteTags" => {
+                    let id = p["ResourceId.1"].clone();
+                    let k = p["Tag.1.Key"].clone();
+                    a.instances.get_mut(&id).unwrap().1.remove(&k);
+                    ok("<DeleteTagsResponse/>".into())
+                }
+                "DescribeSpotInstanceRequests" => {
+                    let items: String = ids(&p, "SpotInstanceRequestId")
+                        .iter()
+                        .map(|r| {
+                            let t = if r.starts_with("sir-once-") { "one-time" } else { "persistent" };
+                            format!("<item><spotInstanceRequestId>{r}</spotInstanceRequestId><type>{t}</type></item>")
+                        })
+                        .collect();
+                    ok(format!("<DescribeSpotInstanceRequestsResponse><spotInstanceRequestSet>{items}</spotInstanceRequestSet></DescribeSpotInstanceRequestsResponse>"))
+                }
+                "CancelSpotInstanceRequests" => {
+                    let r = ids(&p, "SpotInstanceRequestId");
+                    a.cancelled.extend(r);
+                    ok("<CancelSpotInstanceRequestsResponse/>".into())
+                }
+                "TerminateInstances" => {
+                    if a.terminate_fails > 0 {
+                        a.terminate_fails -= 1;
+                        return (StatusCode::SERVICE_UNAVAILABLE, "<Response><Errors><Error><Code>RequestLimitExceeded</Code><Message>slow down</Message></Error></Errors></Response>".into());
+                    }
+                    for id in ids(&p, "InstanceId") {
+                        let sir = a.instances[&id].3.clone();
+                        if sir.is_some_and(|r| !r.starts_with("sir-once-") && !a.cancelled.contains(&r)) {
+                            a.uncancelled_terminates.push(id.clone());
+                        }
+                        a.instances.get_mut(&id).unwrap().0 = "terminated".into();
+                    }
+                    ok("<TerminateInstancesResponse/>".into())
+                }
+                _ => (StatusCode::BAD_REQUEST, "<Response><Errors><Error><Code>InvalidAction</Code><Message>no</Message></Error></Errors></Response>".into()),
+            }
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    base
+}
+
+async fn pool_driver(
+    max: usize,
+) -> (
+    fcvm::fleet::coord::ec2_aws::AwsEc2,
+    Arc<std::sync::Mutex<PoolEc2>>,
+) {
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let api = Arc::new(std::sync::Mutex::new(PoolEc2 {
+        image: "ami-0123456789abcdef0".into(),
+        ..Default::default()
+    }));
+    let base = pool_ec2_api(api.clone()).await;
+    let mut d = fcvm::fleet::coord::ec2_aws::AwsEc2::new(
+        vec!["us-east-1".to_string()],
+        "tile-spot".into(),
+        Some("tile-on-demand".into()),
+        "fcvm.example".into(),
+    )
+    .unwrap();
+    d.endpoints.insert("us-east-1".into(), base);
+    d.fleet = "stage-test".into();
+    d.pool_max = max;
+    d.pool_template = Some("tile-pool".into());
+    (d, api)
+}
+
+fn state_of(
+    api: &Arc<std::sync::Mutex<PoolEc2>>,
+    instance: &str,
+) -> (String, BTreeMap<String, String>) {
+    let id = instance.split_once('/').unwrap().1;
+    let a = api.lock().unwrap();
+    let (st, tags, _, _) = &a.instances[id];
+    (st.clone(), tags.clone())
+}
+
+/// A tile whose FleetPool tag fails while the fleet sleeps is terminated, not left running
+/// with no owner: nothing would stop it until the coordinator's next start sweeps.
+#[tokio::test]
+async fn a_tile_that_cannot_be_tagged_into_the_pool_is_terminated() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, api) = pool_driver(2).await;
+    let l = d.launch("ec2-1").await.unwrap();
+    api.lock().unwrap().pool_tag_fails = 1;
+    d.release(&l.instance).await.unwrap();
+    let (st, tags) = state_of(&api, &l.instance);
+    assert_eq!(st, "terminated", "tags {tags:?}");
+    assert!(api.lock().unwrap().uncancelled_terminates.is_empty());
+}
+
+/// A stale pooled instance (an older image) whose termination fails is tried again at the
+/// next resume: its claim is released with the failure, not kept for the coordinator's
+/// lifetime, where every later resume would step over it and it would stay counted in the pool.
+#[tokio::test]
+async fn a_stale_pooled_tile_whose_termination_fails_is_terminated_at_the_next_resume() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, api) = pool_driver(2).await;
+    {
+        let mut a = api.lock().unwrap();
+        let tags: BTreeMap<String, String> = [
+            ("Purpose", "fcvm-fleet-tile"),
+            ("Fleet", "stage-test"),
+            ("FleetPool", "stage-test"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        a.instances.insert(
+            "i-stale000000001".into(),
+            (
+                "stopped".into(),
+                tags,
+                "ami-0older0000000000".into(),
+                Some("sir-7".into()),
+            ),
+        );
+        a.terminate_fails = 1;
+    }
+    assert!(d.resume("ec2-1").await.is_none());
+    assert_eq!(
+        api.lock().unwrap().instances["i-stale000000001"].0,
+        "stopped"
+    );
+    assert!(d.resume("ec2-1").await.is_none());
+    let (state, actions) = {
+        let a = api.lock().unwrap();
+        (a.instances["i-stale000000001"].0.clone(), a.actions.clone())
+    };
+    assert_eq!(
+        state, "terminated",
+        "the second resume did not try the stale instance again: {actions:?}"
+    );
+}
+
+/// DescribeInstances and DescribeSpotInstanceRequests are read item by item: EC2 does not
+/// promise the order of an item's elements, so a field before `<instanceId>` (or a request
+/// type before its id) belongs to its own item, not to the one before it.
+#[test]
+fn ec2_answers_parse_by_item_whatever_the_field_order() {
+    use fcvm::fleet::coord::ec2_aws::{parse_instances, persistent_requests};
+    let xml = "<DescribeInstancesResponse><reservationSet><item><instancesSet>\
+        <item><imageId>ami-a</imageId><instanceState><name>stopped</name></instanceState>\
+        <tagSet><item><key>FleetPool</key><value>stage</value></item></tagSet>\
+        <spotInstanceRequestId>sir-a</spotInstanceRequestId><instanceId>i-a</instanceId></item>\
+        <item><instanceId>i-b</instanceId><imageId>ami-b</imageId>\
+        <instanceState><name>running</name></instanceState></item>\
+        </instancesSet></item></reservationSet></DescribeInstancesResponse>";
+    let got = parse_instances(xml);
+    assert_eq!(got.len(), 2, "{got:?}");
+    let a = got.iter().find(|i| i.id == "i-a").unwrap();
+    let b = got.iter().find(|i| i.id == "i-b").unwrap();
+    assert_eq!(
+        (a.image.as_deref(), a.state.as_str()),
+        (Some("ami-a"), "stopped")
+    );
+    assert!(
+        a.pooled && a.spot_request.as_deref() == Some("sir-a"),
+        "{a:?}"
+    );
+    assert_eq!(
+        (b.image.as_deref(), b.state.as_str()),
+        (Some("ami-b"), "running")
+    );
+    assert!(!b.pooled && b.spot_request.is_none(), "{b:?}");
+    let sirs = "<DescribeSpotInstanceRequestsResponse><spotInstanceRequestSet>\
+        <item><type>persistent</type><spotInstanceRequestId>sir-p</spotInstanceRequestId></item>\
+        <item><spotInstanceRequestId>sir-o</spotInstanceRequestId><type>one-time</type></item>\
+        </spotInstanceRequestSet></DescribeSpotInstanceRequestsResponse>";
+    assert_eq!(persistent_requests(sirs), vec!["sir-p".to_string()]);
+}
+
+/// A tile released when the fleet sleeps is stopped into the pool, and the next wake starts
+/// it (15.5 s to a first frame on staging, against 81 to 84 s for a launch) instead of
+/// launching; cold launches use the pool template, whose instances can be stopped.
+#[tokio::test]
+async fn a_tile_released_into_the_pool_is_started_at_the_next_wake() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, api) = pool_driver(2).await;
+    assert!(
+        d.resume("ec2-1").await.is_none(),
+        "an empty pool resumes nothing"
+    );
+    let l = d.launch("ec2-1").await.unwrap();
+    assert_eq!(
+        api.lock()
+            .unwrap()
+            .instances
+            .values()
+            .next()
+            .unwrap()
+            .3
+            .as_deref(),
+        Some("sir-1"),
+        "launched from the pool template"
+    );
+    d.release(&l.instance).await.unwrap();
+    let (st, tags) = state_of(&api, &l.instance);
+    assert_eq!(st, "stopped");
+    assert_eq!(
+        tags.get("FleetPool").map(String::as_str),
+        Some("stage-test")
+    );
+    let r = d.resume("ec2-2").await.expect("the pooled tile starts");
+    assert_eq!(r.instance, l.instance);
+    assert_eq!(
+        r.frame_url.as_deref(),
+        Some("wss://ec2-2.fcvm.example/frames")
+    );
+    let (st, tags) = state_of(&api, &r.instance);
+    assert_eq!(st, "running");
+    assert_eq!(tags.get("FleetTile").map(String::as_str), Some("ec2-2"));
+    assert!(!tags.contains_key("FleetPool"));
+    let a = api.lock().unwrap();
+    assert_eq!(a.actions.iter().filter(|x| *x == "RunInstances").count(), 1);
+    assert!(a.uncancelled_terminates.is_empty());
+}
+
+/// A full pool, a tile of an older image, and the sweep terminate; every terminate cancels
+/// the instance's spot request first (a persistent request would launch a replacement),
+/// and a pooled tile that does not start yet stays in the pool for a later wake.
+#[tokio::test]
+async fn the_pool_keeps_at_most_its_size_and_cancels_spot_requests_before_terminating() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, api) = pool_driver(1).await;
+    let a1 = d.launch("ec2-1").await.unwrap();
+    let a2 = d.launch("ec2-2").await.unwrap();
+    d.release(&a1.instance).await.unwrap();
+    d.release(&a2.instance).await.unwrap();
+    assert_eq!(state_of(&api, &a1.instance).0, "stopped");
+    assert_eq!(
+        state_of(&api, &a2.instance).0,
+        "terminated",
+        "the pool holds one"
+    );
+    assert_eq!(api.lock().unwrap().cancelled, vec!["sir-2".to_string()]);
+    // Not startable yet: left pooled, and the tile launches.
+    let id1 = a1.instance.split_once('/').unwrap().1.to_string();
+    api.lock().unwrap().start_fails.push(id1.clone());
+    assert!(d.resume("ec2-3").await.is_none());
+    assert_eq!(state_of(&api, &a1.instance).0, "stopped");
+    api.lock().unwrap().start_fails.clear();
+    // A new image: the pooled tile is stale and is terminated, not started.
+    api.lock().unwrap().image = "ami-1123456789abcdef0".into();
+    assert!(d.resume("ec2-3").await.is_none());
+    assert_eq!(state_of(&api, &a1.instance).0, "terminated");
+    // A pooled tile launched more than POOL_MAX_AGE ago (its persistent request would have
+    // expired) is terminated, not started.
+    let c1 = d.launch("ec2-1").await.unwrap();
+    d.release(&c1.instance).await.unwrap();
+    assert_eq!(state_of(&api, &c1.instance).0, "stopped");
+    api.lock()
+        .unwrap()
+        .old
+        .push(c1.instance.split_once('/').unwrap().1.to_string());
+    assert!(d.resume("ec2-1").await.is_none());
+    assert_eq!(state_of(&api, &c1.instance).0, "terminated");
+    // The sweep keeps a pooled stopped tile and terminates a running one.
+    let b1 = d.launch("ec2-1").await.unwrap();
+    let b2 = d.launch("ec2-2").await.unwrap();
+    d.release(&b1.instance).await.unwrap();
+    assert_eq!(d.sweep().await.unwrap(), 1);
+    assert_eq!(state_of(&api, &b1.instance).0, "stopped");
+    assert_eq!(state_of(&api, &b2.instance).0, "terminated");
+    let a = api.lock().unwrap();
+    assert!(
+        a.uncancelled_terminates.is_empty(),
+        "{:?}",
+        a.uncancelled_terminates
+    );
+}
+
+/// The tiles of one wake resume at once: each starts a different pooled instance.
+#[tokio::test]
+async fn tiles_resuming_at_once_start_distinct_pooled_instances() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, _api) = pool_driver(2).await;
+    let d = Arc::new(d);
+    for t in ["ec2-1", "ec2-2"] {
+        let l = d.launch(t).await.unwrap();
+        d.release(&l.instance).await.unwrap();
+    }
+    let (a, b, c) = tokio::join!(d.resume("ec2-1"), d.resume("ec2-2"), d.resume("ec2-3"));
+    let got = [a, b, c];
+    let mut ids: Vec<String> = got.iter().flatten().map(|l| l.instance.clone()).collect();
+    assert_eq!(ids.len(), 2, "{got:?}");
+    ids.dedup();
+    assert_eq!(ids.len(), 2, "two tiles started one instance: {got:?}");
+}
+
+/// The tile task: a tile with no instance asks the pool first; the relaunch of a running
+/// tile (a race) launches cold; a tile that leaves the assignment releases its instance.
+struct PoolTask {
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ec2::Ec2Driver for PoolTask {
+    async fn launch(&self, tile: &str) -> Result<ec2::Launched, ec2::LaunchError> {
+        let mut c = self.calls.lock().unwrap();
+        c.push(format!("launch {tile}"));
+        Ok(ec2::Launched {
+            instance: format!("i-cold-{}", c.len()),
+            frame_url: None,
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn resume(&self, tile: &str) -> Option<ec2::Launched> {
+        self.calls.lock().unwrap().push(format!("resume {tile}"));
+        Some(ec2::Launched {
+            instance: "i-pooled".into(),
+            frame_url: None,
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn release(&self, instance: &str) -> anyhow::Result<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("release {instance}"));
+        Ok(())
+    }
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        Ok(l.clone())
+    }
+    async fn terminate(&self, instance: &str) -> anyhow::Result<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("terminate {instance}"));
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _t: &str,
+        _l: &ec2::Launched,
+        _b: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_budget(
+        &self,
+        _t: &str,
+        _l: &ec2::Launched,
+        _b: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn health(&self, _t: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("no renderer")
+    }
+}
+
+#[tokio::test]
+async fn a_wake_resumes_tiles_a_race_launches_them_and_a_sleep_releases_them() {
+    use fleet_core::protocol::AssignSlot;
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let driver: Arc<dyn ec2::Ec2Driver> = Arc::new(PoolTask {
+        calls: calls.clone(),
+    });
+    let (handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let slot = |g: u64| AssignSlot {
+        id: "ec2-1".into(),
+        sbdf: String::new(),
+        generation: g,
+        rect: None,
+        private_camera: None,
+        layout_generation: 0,
+        rect_from_frame: 0,
+        previous_rect: None,
+        standby: false,
+        warm: false,
+    };
+    let (assign, assign_rx) = tokio::sync::watch::channel(vec![slot(1)]);
+    let (_scene, scene_rx) = tokio::sync::watch::channel(None);
+    let (_budget, budget_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(ec2::run(driver, assign_rx, scene_rx, budget_rx, handle));
+    let until = |n: usize| {
+        let calls = calls.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while calls.lock().unwrap().len() < n {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{:?}", calls.lock().unwrap()));
+        }
+    };
+    until(1).await;
+    assign.send(vec![slot(2)]).unwrap();
+    until(3).await;
+    assign.send(vec![]).unwrap();
+    until(4).await;
+    let c = calls.lock().unwrap().clone();
+    assert_eq!(c[..2], ["resume ec2-1", "launch ec2-1"], "{c:?}");
+    // The race's old instance is terminated once its replacement is accepted (on a task of
+    // its own), and the sleep releases the replacement.
+    let mut rest = c[2..].to_vec();
+    rest.sort();
+    assert_eq!(rest, ["release i-cold-2", "terminate i-pooled"], "{c:?}");
+}
+
+/// Without the pool, tiles launch one-time spot; terminating one cancels nothing (a one-time
+/// request closes when fulfilled, and the role may not be allowed to cancel it).
+#[tokio::test]
+async fn a_one_time_spot_tile_is_terminated_without_a_cancel() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (mut d, api) = pool_driver(0).await;
+    d.pool_template = None;
+    let l = d.launch("ec2-1").await.unwrap();
+    d.release(&l.instance).await.unwrap();
+    assert_eq!(state_of(&api, &l.instance).0, "terminated");
+    let a = api.lock().unwrap();
+    assert!(a.cancelled.is_empty(), "{:?}", a.cancelled);
+    assert!(!a
+        .actions
+        .contains(&"CancelSpotInstanceRequests".to_string()));
+}
+
+/// A resume works from a list that can be older than its claim: an instance listed stopped
+/// and pooled may since have been started for another tile. It is started only if it is
+/// stopped and pooled when claimed, so a resume never takes a running tile's instance.
+#[tokio::test]
+async fn a_resume_does_not_take_an_instance_the_pool_list_shows_stale() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, api) = pool_driver(2).await;
+    let l = d.launch("ec2-1").await.unwrap();
+    let id = l.instance.split_once('/').unwrap().1.to_string();
+    // ec2-1 runs on it; the list still says stopped and pooled.
+    api.lock().unwrap().listed_stopped.push(id);
+    assert!(d.resume("ec2-2").await.is_none());
+    let (st, tags) = state_of(&api, &l.instance);
+    assert_eq!(st, "running");
+    assert_eq!(tags.get("FleetTile").map(String::as_str), Some("ec2-1"));
+    assert!(!api
+        .lock()
+        .unwrap()
+        .actions
+        .contains(&"StartInstances".to_string()));
 }

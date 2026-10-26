@@ -114,6 +114,7 @@ impl Coord {
             spot_poll: Duration::from_millis(50),
             aggregate: None,
             store_ready_file: None,
+            boot: Default::default(),
         };
         let task = tokio::spawn(serve(agent, agent_in, agent_out));
         let (to_agent, _w) = spawn_writer::<CoordMsg, _>(coord_out, "agent");
@@ -973,6 +974,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
         spot_notice_url: None,
         spot_poll: Duration::from_millis(50),
         store_ready_file: None,
+        boot: Default::default(),
         aggregate: Some(AggregateCfg {
             port,
             argv: vec![
@@ -1329,6 +1331,7 @@ async fn the_hello_reports_when_the_store_was_ready() {
         spot_poll: Duration::from_millis(50),
         aggregate: None,
         store_ready_file: Some(marker),
+        boot: Default::default(),
     };
     let task = tokio::spawn(serve(agent, agent_in, agent_out));
     let mut from_agent = LineReader::new(coord_in, "agent");
@@ -1403,6 +1406,7 @@ async fn a_dialing_agent_reconnects_and_replays_its_state_without_restarting_vms
         spot_poll: Duration::from_millis(50),
         aggregate: None,
         store_ready_file: None,
+        boot: Default::default(),
     };
     let task = tokio::spawn(dial(
         agent,
@@ -1468,6 +1472,45 @@ async fn a_dialing_agent_reconnects_and_replays_its_state_without_restarting_vms
         .count();
     assert_eq!(starts, 1, "the VM kept running across the reconnect");
     task.abort();
+}
+
+/// `PutSecretValue` without a `ClientRequestToken` is refused by Secrets Manager (400
+/// InvalidRequestException: "You must provide a ClientRequestToken value"); the coordinator's
+/// certificate renewal stored nothing that way. Each put carries a fresh token.
+#[tokio::test]
+async fn a_stored_secret_version_carries_a_fresh_client_request_token() {
+    use fcvm::fleet::coord::secrets::Secrets;
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let tokens = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let t2 = tokens.clone();
+    let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap, body: String| {
+        let t2 = t2.clone();
+        async move {
+            assert_eq!(headers["x-amz-target"], "secretsmanager.PutSecretValue");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            match v["ClientRequestToken"].as_str() {
+                // The service's rule: 32 to 64 characters.
+                Some(t) if (32..=64).contains(&t.len()) => {
+                    t2.lock().unwrap().push(t.to_string());
+                    (axum::http::StatusCode::OK, axum::Json(serde_json::json!({"VersionId": t})))
+                }
+                _ => (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({"__type": "InvalidRequestException", "Message": "You must provide a ClientRequestToken value"})),
+                ),
+            }
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let secrets = Secrets::with_endpoint("us-east-2", &base).unwrap();
+    secrets.put("fcvm-fleet/tls-wildcard", "{}").await.unwrap();
+    secrets.put("fcvm-fleet/tls-wildcard", "{}").await.unwrap();
+    let t = tokens.lock().unwrap().clone();
+    assert_eq!(t.len(), 2);
+    assert_ne!(t[0], t[1], "each version needs its own token");
 }
 
 /// The renderers' certificate in the renderer's TLS interface: `tls.json` with `cert` and
@@ -1697,4 +1740,35 @@ async fn a_warming_slot_draws_the_whole_image_then_takes_its_place() {
         .count();
     assert_eq!(starts, 1, "joining the wall must not relaunch");
     c.close().await;
+}
+
+/// The hello's boot times: the kernel's start from `/proc/uptime`, the agent's start, and
+/// every `*_at` number in the store unit's ready file; anything else in that file is left
+/// out, and a file that is not a JSON object adds nothing.
+#[test]
+fn boot_times_come_from_uptime_the_agent_and_the_store_ready_file() {
+    use fcvm::fleet::agent::boot_times;
+    let b = boot_times(
+        Some("86.25 1201.50\n"),
+        1_000_000,
+        999_000,
+        Some(
+            r#"{"store_started_at": 920000, "store_mounted_at": 921000, "store_source": "s3", "bytes": 5}"#,
+        ),
+    );
+    assert_eq!(
+        b,
+        [
+            ("kernel_started_at".to_string(), 1_000_000 - 86_250),
+            ("agent_started_at".to_string(), 999_000),
+            ("store_started_at".to_string(), 920_000),
+            ("store_mounted_at".to_string(), 921_000),
+        ]
+        .into()
+    );
+    // The store unit of an older image wrote nothing (or an empty marker).
+    assert_eq!(
+        boot_times(None, 1_000_000, 999_000, Some("")),
+        [("agent_started_at".to_string(), 999_000)].into()
+    );
 }

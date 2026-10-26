@@ -8,7 +8,9 @@
 //! reports: `launch_ms` (request to accepted), `ready_ms` (accepted to the renderer's
 //! health), `total_ms`, and `capacity_wait_ms`: how long the tile's generation waited for
 //! EC2 to have capacity before the launch that was accepted. The race scoreboard leaves
-//! that wait out of the EC2 half's time and reports it on its own.
+//! that wait out of the EC2 half's time and reports it on its own. A tile whose instance
+//! was started from the driver's pool of stopped instances ([`Ec2Driver::resume`], a wake
+//! a tile with no instance, never the relaunch of a running one) also reports `resumed` = 1.
 
 use super::Handle;
 use anyhow::Result;
@@ -69,6 +71,17 @@ pub enum LaunchError {
 pub trait Ec2Driver: Send + Sync {
     /// Launch one instance for `tile` from its launch template.
     async fn launch(&self, tile: &str) -> Result<Launched, LaunchError>;
+    /// Start a stopped instance kept from an earlier wake for `tile`, if the driver keeps a
+    /// pool of them and one starts. A tile with no instance (a wake) asks for one before
+    /// launching; the relaunch of a running tile (a race) always launches.
+    async fn resume(&self, _tile: &str) -> Option<Launched> {
+        None
+    }
+    /// The tile left the assignment (the fleet sleeps): keep its instance stopped for the
+    /// next wake, or terminate it.
+    async fn release(&self, instance: &str) -> Result<()> {
+        self.terminate(instance).await
+    }
     /// Resolves when the instance's renderer answers its health check, with what is known
     /// of the instance by then (its addresses and frame URL).
     async fn ready(&self, tile: &str, launched: &Launched) -> Result<Launched>;
@@ -422,7 +435,22 @@ async fn tile(
                 None,
             )
             .await;
-            match driver.launch(&id).await {
+            // A tile with no instance (it joined the assignment at a wake, or its instance
+            // failed or was reclaimed) may start a pooled one; a relaunch of a running tile
+            // (a race) launches.
+            let resumed = if current.is_none() {
+                driver.resume(&id).await
+            } else {
+                None
+            };
+            if resumed.is_some() {
+                timings.insert("resumed".into(), 1);
+            }
+            let launched = match resumed {
+                Some(l) => Ok(l),
+                None => driver.launch(&id).await,
+            };
+            match launched {
                 Ok(l) => {
                     waiting = None;
                     timings.insert("launch_ms".into(), t0.elapsed().as_millis() as u64);
@@ -615,8 +643,8 @@ async fn tile(
     }
     remove_own(&running, &id, token);
     if let Some((l, _)) = current {
-        if let Err(e) = driver.terminate(&l.instance).await {
-            tracing::warn!(instance = %l.instance, error = %e, "terminate failed");
+        if let Err(e) = driver.release(&l.instance).await {
+            tracing::warn!(instance = %l.instance, error = %e, "releasing the tile's instance failed");
         }
     }
 }

@@ -22,6 +22,7 @@ fn hello(at: u64, host: &str, gpus: usize) -> Event {
                 .collect(),
             capacity: 8,
             store_ready_at: None,
+            boot: Default::default(),
         },
     }
 }
@@ -242,4 +243,90 @@ fn forgetting_a_rate_limit_keeps_the_version() {
         s.version, before.0,
         "a tick that only forgot a limit moved the version"
     );
+}
+
+/// The EC2 half can complete the image (the fleet turns awake) before any GPU host's agent
+/// has said hello, as it did on staging on 2026-10-25 (awake 53 s into a wake whose host
+/// rendered at 150 s). The host's later phases still belong to that wake: its hello, its
+/// store and boot times, and its tiles rendering are recorded after the fleet is awake.
+#[test]
+fn a_host_that_comes_up_after_the_fleet_is_awake_still_records_its_wake() {
+    let config: Config = serde_json::from_value(serde_json::json!({
+        "power_managed": true, "idle_scale_down_secs": 60, "ec2_max": 2,
+        "race_interval_secs": 300, "restart_cooldown_secs": 1, "claim_secs": 120
+    }))
+    .map(|o: serde_json::Value| {
+        let mut base = serde_json::to_value(Config::default()).unwrap();
+        for (k, v) in o.as_object().unwrap() {
+            base[k] = v.clone();
+        }
+        serde_json::from_value(base).unwrap()
+    })
+    .unwrap();
+    let events: Vec<Event> = serde_json::from_value(serde_json::json!([
+        {"type": "viewer_joined", "at": 1000, "viewer": "v1", "client": "192.0.2.70"},
+        {"type": "visibility", "at": 1100, "viewer": "v1", "visible": false},
+        {"type": "tick", "at": 62000},
+        {"type": "visibility", "at": 100000, "viewer": "v1", "visible": true},
+        {"type": "scale_instances", "at": 116000, "instances": [{"id": "h1", "lifecycle": "Pending"}]},
+        {"type": "scale_instances", "at": 121000, "instances": [{"id": "h1", "lifecycle": "InService"}]},
+        {"type": "ec2", "at": 150000, "report": {"id": "ec2-1", "phase": "running", "generation": 1, "vm": "instance-1", "frame_url": "ws://ec2-1.example:443/frames", "timings": {}}},
+        {"type": "ec2", "at": 153000, "report": {"id": "ec2-2", "phase": "running", "generation": 1, "vm": "instance-2", "frame_url": "ws://ec2-2.example:443/frames", "timings": {}}},
+    ]))
+    .unwrap();
+    let mut s = State::new(config, 0);
+    for e in &events {
+        s = apply(s, e);
+    }
+    assert_eq!(
+        s.fleet.power.state, "awake",
+        "the EC2 half completed the image"
+    );
+    let host = |s: &State| s.fleet.power.hosts.get("h1").cloned().unwrap();
+    assert_eq!(host(&s).booted_at, Some(121000));
+    let mut later = vec![Event::Agent {
+        at: 230000,
+        host: "h1".into(),
+        msg: AgentMsg::Hello {
+            host: "h1".into(),
+            arch: "x86_64".into(),
+            gpus: vec![Gpu {
+                sbdf: "0000:01:00.0".into(),
+                name: "Tesla T4".into(),
+            }],
+            capacity: 1,
+            store_ready_at: Some(229000),
+            boot: [
+                ("kernel_started_at".to_string(), 160000),
+                ("store_started_at".to_string(), 176000),
+                // Before the wake began: not this wake's.
+                ("agent_started_at".to_string(), 99000),
+            ]
+            .into(),
+        },
+    }];
+    later.push(running(240000, "h1", "slot-1"));
+    for e in &later {
+        s = apply(s, e);
+    }
+    let w = host(&s);
+    assert_eq!(w.agent_at, Some(230000));
+    assert_eq!(w.store_ready_at, Some(229000));
+    assert_eq!(
+        w.boot,
+        [
+            ("kernel_started_at".to_string(), 160000),
+            ("store_started_at".to_string(), 176000)
+        ]
+        .into()
+    );
+    assert_eq!(w.rendering_at, Some(240000));
+    // The wake's record is closed once every host of it renders: a later reconnect of the
+    // same agent changes nothing.
+    let mut again = later[0].clone();
+    if let Event::Agent { at, .. } = &mut again {
+        *at = 900000;
+    }
+    s = apply(s, &again);
+    assert_eq!(host(&s).agent_at, Some(230000));
 }

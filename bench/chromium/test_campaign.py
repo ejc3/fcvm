@@ -1143,6 +1143,51 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             with open(env["MAKE_ARGV"]) as handle:
                 self.assertIn("bench-chromium-request-run", handle.read())
 
+    def test_a_scale_campaign_checks_its_schedule_before_the_golden(self):
+        """#1159: reqscale.py refuses SCALE_RATES that give a fractional
+        request per ramp or split a corpus cycle, and a campaign learned that
+        only from the measured run, after the golden and the diag (two
+        attempts at 0.7 and 0.8 req/s were refused about 8 minutes in).
+
+        RED BEFORE THE FIX: the campaign had no schedule check, so the block
+        below is missing.
+        """
+        body = campaign()
+        check = re.search(
+            r'(if \[ "\$MEASURE" = scale \]; then\n    scale_make check-chromium-scale.*?\nfi\n)',
+            body, re.S)
+        self.assertIsNotNone(check, "the campaign does not check the scale schedule up front")
+        for later in ("# --- host replay server", "engine_target golden)", "run_diag ||"):
+            self.assertLess(body.index(check.group(1)), body.index(later),
+                            f"the schedule check runs after {later!r}")
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            script = ('set -euo pipefail\n'
+                      f'URLS="{self._urls()}"\nUFFD_MODE=minor\nUFFD_PREFETCH=on\n'
+                      'MEASURE=scale\nTAG=cb-req-corpus\nSCALE_DIR="$RESULTS/scale-attempt"\n'
+                      f'{self._helpers()}\n{check.group(1)}echo GOLDEN\n')
+            refused = self._run(script, dict(env, MAKE_RC="2"))
+            self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+            self.assertIn("BLOCKED: reqscale.py refused the scale schedule", refused.stderr)
+            self.assertNotIn("GOLDEN", refused.stdout)
+            accepted = self._run(script, env)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn("GOLDEN", accepted.stdout)
+            with open(env["MAKE_ARGV"] + ".all") as handle:
+                calls = handle.read().splitlines()
+            self.assertTrue(all("check-chromium-scale" in call for call in calls), calls)
+            # The check sees what the measured run will be given.
+            seen = self._make_env(dict(env, MAKE_ENV_DUMP=env["MAKE_ENV_DUMP"]
+                                       + ".check-chromium-scale"))
+            self.assertEqual(seen.get("SCALE_URL"), self._urls())
+            self.assertEqual(seen.get("SCALE_TAG"), "cb-req-corpus")
+            self.assertEqual(seen.get("SCALE_OUT"), os.path.join(results, "scale-attempt"))
+            self.assertEqual(seen.get("SCALE_CONTROL_URL"), self._urls().split(",")[0])
+        run = re.search(r'(if \[ "\$MEASURE" = scale \]; then\n    say "measured run: open-loop.*?\nfi\n)',
+                        body, re.S)
+        self.assertIsNotNone(run, "the campaign has no MEASURE=scale branch")
+        self.assertIn("scale_make bench-chromium-scale", run.group(1))
+
     def test_measure_scale_runs_the_open_loop_benchmark_over_the_corpus(self):
         """MEASURE=scale replaces the serial run with bench-chromium-scale over
         the same corpus, in the campaign's memory-server mode, with the host

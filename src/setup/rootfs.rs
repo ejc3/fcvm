@@ -435,21 +435,33 @@ if [ -n "${{http_proxy:-}}" ]; then
 fi
 # Configure apt to retry on transient failures (e.g. 403 from mirrors)
 echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/80retries
-apt-get update -qq
-# Retry apt-get download up to 3 times with delay for transient mirror errors
-for attempt in 1 2 3; do
-    if apt-get install --download-only --yes --no-install-recommends {packages}; then
-        break
-    fi
-    if [ "$attempt" -lt 3 ]; then
-        echo "apt-get download failed (attempt $attempt/3), retrying in $((attempt * 10))s..."
-        sleep $((attempt * 10))
-        apt-get update -qq
-    else
-        echo "apt-get download failed after 3 attempts"
-        exit 1
-    fi
-done
+# Run a command up to 3 times. Between attempts: wait attempt*10 s (the delay is
+# FCVM_APT_RETRY_DELAY, default 10), run `apt-get update`, and call the function
+# named by APT_RETRY_CLEAN, if any, to undo what the failed attempt left behind.
+# A mirror error that outlasts Acquire::Retries fails only after the third attempt.
+apt_retry() {{
+    local attempt delay="${{FCVM_APT_RETRY_DELAY:-10}}"
+    for attempt in 1 2 3; do
+        if "$@"; then
+            return 0
+        fi
+        if [ "$attempt" -lt 3 ]; then
+            echo "apt step failed (attempt $attempt/3): $*; retrying in $((attempt * delay))s..." >&2
+            sleep $((attempt * delay))
+            apt-get update -qq || true
+            "${{APT_RETRY_CLEAN:-:}}"
+        fi
+    done
+    echo "apt step failed after 3 attempts: $*" >&2
+    exit 1
+}}
+# apt-get source leaves a partly unpacked conmon-*/ tree and fetched source files
+# when it fails; the later `cd conmon-*/` needs exactly one tree.
+conmon_source_clean() {{
+    rm -rf -- "$conmon_build_dir"/conmon-*/ "$conmon_build_dir"/conmon_*
+}}
+apt_retry apt-get update -qq
+apt_retry apt-get install --download-only --yes --no-install-recommends {packages}
 cp /var/cache/apt/archives/*.deb /packages/ 2>/dev/null || true
 
 # Rebuild conmon from the same archive's source with fcvm's fix for its
@@ -466,17 +478,18 @@ if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
 else
     sed -i 's/^# *deb-src /deb-src /' /etc/apt/sources.list
 fi
-apt-get update -qq
-apt-get install --yes --no-install-recommends -qq dpkg-dev patch >/dev/null
-mkdir -p /tmp/conmon-build
-cd /tmp/conmon-build
-apt-get source conmon="$(dpkg-deb -f "${{stock[0]}}" Version)"
-apt-get build-dep --yes -qq conmon >/dev/null
+apt_retry apt-get update -qq
+apt_retry apt-get install --yes --no-install-recommends -qq dpkg-dev patch >/dev/null
+conmon_build_dir=/tmp/conmon-build
+mkdir -p "$conmon_build_dir"
+cd "$conmon_build_dir"
+APT_RETRY_CLEAN=conmon_source_clean apt_retry apt-get source conmon="$(dpkg-deb -f "${{stock[0]}}" Version)"
+apt_retry apt-get build-dep --yes -qq conmon >/dev/null
 cat > console-race.patch <<'FCVM_CONMON_PATCH'
 {conmon_patch}FCVM_CONMON_PATCH
 (cd conmon-*/ && patch -p1 --forward < ../console-race.patch && dpkg-buildpackage -b -uc -us >../build.log 2>&1) \
     || {{ tail -50 build.log 2>/dev/null; echo "conmon rebuild failed"; exit 1; }}
-built=(/tmp/conmon-build/conmon_*.deb)
+built=("$conmon_build_dir"/conmon_*.deb)
 if [ "${{#built[@]}}" -ne 1 ] || [ "$(dpkg-deb -f "${{built[0]}}" Version)" != "$(dpkg-deb -f "${{stock[0]}}" Version)" ]; then
     echo "conmon rebuild produced ${{built[*]}}, not one package at the archive's version"
     exit 1
@@ -1371,27 +1384,25 @@ pub async fn ensure_rootfs(allow_create: bool, rootfs_type: Option<&str>) -> Res
     // Log the generated script for debugging
     debug!("generated setup script:\n{}", setup_script);
 
-    let temp_rootfs_path = rootfs_path.with_extension("raw.tmp");
-    let _ = tokio::fs::remove_file(&temp_rootfs_path).await;
-
-    let result = create_layer2_rootless(
+    let temp_rootfs = super::StoreTemp::new(&rootfs_path);
+    let result = match create_layer2_rootless(
         &plan,
         script_sha_short,
         &setup_script,
-        &temp_rootfs_path,
+        temp_rootfs.path(),
         rootfs_type,
     )
-    .await;
-
+    .await
+    {
+        Ok(()) => temp_rootfs.publish(&rootfs_path, "rootfs").await,
+        Err(err) => Err(err),
+    };
     if result.is_ok() {
-        super::publish_store_entry(&temp_rootfs_path, &rootfs_path, "rootfs").await?;
         info!(
             path = %rootfs_path.display(),
             script_sha = %script_sha_short,
             "Layer 2 rootfs creation complete"
         );
-    } else {
-        let _ = tokio::fs::remove_file(&temp_rootfs_path).await;
     }
 
     // Release lock. Deliberately leave the lock file in place (matching the kernel
@@ -1736,18 +1747,15 @@ pub async fn ensure_fc_agent_initrd(allow_create: bool) -> Result<PathBuf> {
         "creating fc-agent initrd"
     );
 
-    // Create temporary directory for initrd contents
-    // Use PID in temp dir name to avoid conflicts even with same sha
-    let temp_dir = initrd_dir.join(format!(
-        ".initrd-build-{}-{}",
-        initrd_sha_short,
-        std::process::id()
-    ));
-    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-    tokio::fs::create_dir_all(&temp_dir).await?;
-    // A killed root run would otherwise leave a directory whose contents a
-    // rootless run's remove_dir_all cannot unlink.
-    super::give_store_entry_to_invoker(&temp_dir);
+    // Directory for the initrd contents, unique to this builder and removed when
+    // `build_dir` drops.
+    let build_dir =
+        super::StoreTemp::new(&initrd_dir.join(format!(".initrd-build-{}", initrd_sha_short)));
+    let temp_dir = build_dir.path();
+    tokio::fs::create_dir_all(temp_dir).await?;
+    // A killed root run leaves this directory behind; hand it to the invoker so a
+    // rootless operator can remove it.
+    super::give_store_entry_to_invoker(temp_dir);
 
     // Create directory structure
     for dir in &["bin", "sbin", "dev", "proc", "sys", "newroot"] {
@@ -1790,14 +1798,14 @@ pub async fn ensure_fc_agent_initrd(allow_create: bool) -> Result<PathBuf> {
 
     // Create cpio archive (initrd format)
     // Use bash with pipefail so cpio errors aren't masked by gzip success (v3)
-    let temp_initrd = initrd_path.with_extension("initrd.tmp");
+    let temp_initrd = super::StoreTemp::new(&initrd_path);
     let output = Command::new("bash")
         .args([
             "-c",
             &format!(
                 "set -o pipefail && cd {} && find . | cpio -o -H newc | gzip > {}",
                 temp_dir.display(),
-                temp_initrd.display()
+                temp_initrd.path().display()
             ),
         ])
         .output()
@@ -1815,10 +1823,8 @@ pub async fn ensure_fc_agent_initrd(allow_create: bool) -> Result<PathBuf> {
     }
 
     // Rename to final path (atomic)
-    super::publish_store_entry(&temp_initrd, &initrd_path, "initrd").await?;
-
-    // Cleanup temp directory
-    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    temp_initrd.publish(&initrd_path, "initrd").await?;
+    drop(build_dir);
 
     info!(
         path = %initrd_path.display(),
@@ -1922,7 +1928,10 @@ async fn create_layer2_rootless(
 
     // Step 2: Convert qcow2 to raw (no root required!)
     info!("converting qcow2 to raw format (no root required)");
-    let full_disk_path = output_path.with_extension("full");
+    // Intermediates beside the output, unique to this builder like it and removed
+    // when they drop.
+    let full_disk = super::StoreTemp::new(output_path);
+    let full_disk_path = full_disk.path();
     let output = Command::new("qemu-img")
         .args([
             "convert",
@@ -1931,7 +1940,7 @@ async fn create_layer2_rootless(
             "-O",
             "raw",
             path_to_str(&cloud_image)?,
-            path_to_str(&full_disk_path)?,
+            path_to_str(full_disk_path)?,
         ])
         .output()
         .await
@@ -1947,11 +1956,12 @@ async fn create_layer2_rootless(
     // Step 3: Extract partition 1 (root filesystem) using fdisk and dd
     // This avoids GPT partition table issues with Firecracker
     info!("extracting root partition from GPT disk (no root required)");
-    let partition_path = output_path.with_extension("converting");
+    let partition = super::StoreTemp::new(output_path);
+    let partition_path = partition.path();
 
     // Get partition info using sfdisk
     let output = Command::new("sfdisk")
-        .args(["-J", path_to_str(&full_disk_path)?])
+        .args(["-J", path_to_str(full_disk_path)?])
         .output()
         .await
         .context("getting partition info")?;
@@ -1999,8 +2009,8 @@ async fn create_layer2_rootless(
     // Extract partition using dd (sector size is 512 bytes)
     let output = Command::new("dd")
         .args([
-            &format!("if={}", path_to_str(&full_disk_path)?),
-            &format!("of={}", path_to_str(&partition_path)?),
+            &format!("if={}", path_to_str(full_disk_path)?),
+            &format!("of={}", path_to_str(partition_path)?),
             "bs=512",
             &format!("skip={}", root_part.start),
             &format!("count={}", root_part.size),
@@ -2015,12 +2025,12 @@ async fn create_layer2_rootless(
     }
 
     // Remove full disk image (no longer needed)
-    let _ = tokio::fs::remove_file(&full_disk_path).await;
+    drop(full_disk);
 
     // Step 4: Expand the extracted partition to 10GB
     info!("expanding partition to {}", LAYER2_SIZE);
     let output = Command::new("truncate")
-        .args(["-s", LAYER2_SIZE, path_to_str(&partition_path)?])
+        .args(["-s", LAYER2_SIZE, path_to_str(partition_path)?])
         .output()
         .await
         .context("expanding partition")?;
@@ -2035,14 +2045,14 @@ async fn create_layer2_rootless(
     // Resize the ext4 filesystem to fill the partition
     info!("resizing ext4 filesystem");
     let _output = Command::new("e2fsck")
-        .args(["-f", "-y", path_to_str(&partition_path)?])
+        .args(["-f", "-y", path_to_str(partition_path)?])
         .output()
         .await
         .context("running e2fsck")?;
     // e2fsck may return non-zero even on success (exit code 1 = errors corrected)
 
     let output = Command::new("resize2fs")
-        .args([path_to_str(&partition_path)?])
+        .args([path_to_str(partition_path)?])
         .output()
         .await
         .context("running resize2fs")?;
@@ -2057,7 +2067,7 @@ async fn create_layer2_rootless(
     // Step 4b: Convert ext4 to btrfs if requested (before setup VM boot)
     if rootfs_type == Some("btrfs") {
         info!("converting rootfs from ext4 to btrfs");
-        convert_to_btrfs(&partition_path).await?;
+        convert_to_btrfs(partition_path).await?;
     }
 
     // Step 5: Download packages on host (host has network!)
@@ -2083,12 +2093,10 @@ async fn create_layer2_rootless(
         "booting VM with setup initrd (packages embedded)"
     );
 
-    boot_vm_for_setup(&partition_path, &setup_initrd, rootfs_type).await?;
+    boot_vm_for_setup(partition_path, &setup_initrd, rootfs_type).await?;
 
-    // Step 8: Rename to final path
-    tokio::fs::rename(&partition_path, output_path)
-        .await
-        .context("renaming partition to output path")?;
+    // Step 8: Rename to the output path
+    partition.publish(output_path, "rootfs partition").await?;
 
     info!("Layer 2 creation complete (packages embedded in initrd)");
     Ok(())
@@ -2224,8 +2232,8 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
     // The directory is populated under a temp name and renamed into place only
     // after the download succeeds, so its existence implies a complete set.
     if packages_dir.exists() {
+        let mut has_debs = false;
         if let Ok(mut entries) = tokio::fs::read_dir(&packages_dir).await {
-            let mut has_debs = false;
             while let Ok(Some(entry)) = entries.next_entry().await {
                 if entry
                     .path()
@@ -2237,20 +2245,23 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
                     break;
                 }
             }
-            if has_debs {
-                info!(path = %packages_dir.display(), "using cached packages directory");
-                return Ok(packages_dir);
-            }
         }
+        if has_debs {
+            info!(path = %packages_dir.display(), "using cached packages directory");
+            return Ok(packages_dir);
+        }
+        // The publish below never produces a directory without packages, and a
+        // rename cannot replace a directory that holds entries.
+        let _ = tokio::fs::remove_dir_all(&packages_dir).await;
     }
 
-    // Download into a temp directory, then atomically rename to the final cache
-    // path on success. An interrupted or failed download must never leave a
-    // partial package set at the content-addressed path.
-    let download_dir = cache_dir.join(format!("packages-{}.tmp", script_sha_short));
-    let _ = tokio::fs::remove_dir_all(&packages_dir).await;
-    let _ = tokio::fs::remove_dir_all(&download_dir).await;
-    tokio::fs::create_dir_all(&download_dir).await?;
+    // Download into a temp directory of this builder's own, then atomically
+    // rename it to the final cache path on success. An interrupted or failed
+    // download must never leave a partial package set at the content-addressed
+    // path, and the temp is removed when `download` drops unpublished.
+    let download = super::StoreTemp::new(&packages_dir);
+    let download_dir = download.path();
+    tokio::fs::create_dir_all(download_dir).await?;
     super::give_store_entry_to_invoker(&cache_dir);
 
     let codename = &plan.base.codename;
@@ -2308,7 +2319,6 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = tokio::fs::remove_dir_all(&download_dir).await;
         bail!(
             "Package download failed (podman exited with {:?}). stdout={}, stderr={}",
             output.status.code(),
@@ -2319,7 +2329,7 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
 
     // Count downloaded packages
     let mut count = 0;
-    if let Ok(mut entries) = tokio::fs::read_dir(&download_dir).await {
+    if let Ok(mut entries) = tokio::fs::read_dir(download_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             if entry
                 .path()
@@ -2335,7 +2345,6 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
     if count == 0 {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = tokio::fs::remove_dir_all(&download_dir).await;
         bail!(
             "No packages downloaded. stdout={}, stderr={}",
             stdout.trim(),
@@ -2343,11 +2352,14 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
         );
     }
 
-    // Atomically publish the completed download as the cache directory.
-    // The .deb files inside may stay root-owned after a sudo run; that is
-    // fine — the handed-back parent directory is what governs a rootless
-    // run's ability to read, replace, or unlink them.
-    super::publish_store_entry(&download_dir, &packages_dir, "downloaded packages").await?;
+    // Atomically publish the completed download as the cache directory. When
+    // another VM sharing the store published the same set first, its directory
+    // is kept and this one removed. The .deb files inside may stay root-owned
+    // after a sudo run; that is fine, because the handed-back parent directory is what
+    // governs a rootless run's ability to read, replace, or unlink them.
+    download
+        .publish(&packages_dir, "downloaded packages")
+        .await?;
 
     info!(path = %packages_dir.display(), count = count, "packages downloaded");
     Ok(packages_dir)
@@ -2393,9 +2405,7 @@ async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
         "downloading Ubuntu cloud image (this may take several minutes)"
     );
 
-    let temp_path = image_path.with_extension("img.download");
-    // Clean up any leftover temp file from a previous failed attempt
-    let _ = tokio::fs::remove_file(&temp_path).await;
+    let temp = super::StoreTemp::new(&image_path);
 
     // -f makes curl fail on HTTP errors instead of saving the error page as the
     // image; -S still prints the error despite --progress-bar.
@@ -2403,7 +2413,7 @@ async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
         .args([
             "-fSL",
             "-o",
-            path_to_str(&temp_path)?,
+            path_to_str(temp.path())?,
             "--progress-bar",
             &arch_config.url,
         ])
@@ -2412,7 +2422,6 @@ async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
         .context("downloading cloud image")?;
 
     if !output.success() {
-        let _ = tokio::fs::remove_file(&temp_path).await;
         bail!(
             "curl failed to download cloud image from {}",
             arch_config.url
@@ -2420,7 +2429,7 @@ async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
     }
 
     // Rename to final path
-    super::publish_store_entry(&temp_path, &image_path, "downloaded cloud image").await?;
+    temp.publish(&image_path, "downloaded cloud image").await?;
 
     info!(
         path = %image_path.display(),
@@ -2676,6 +2685,198 @@ fn path_to_str(path: &Path) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bash functions of the generated download script, by name: from the
+    /// `name() {` line to the next line that is a bare `}`.
+    fn download_script_function(script: &str, name: &str) -> String {
+        let head = format!("{name}() {{");
+        let mut out = Vec::new();
+        let mut inside = false;
+        for line in script.lines() {
+            if line == head {
+                inside = true;
+            }
+            if inside {
+                out.push(line);
+                if line == "}" {
+                    return out.join("\n") + "\n";
+                }
+            }
+        }
+        panic!("download script has no function {name}");
+    }
+
+    fn embedded_download_script() -> String {
+        let plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        generate_download_script(&plan)
+    }
+
+    /// Every apt-get call in the download script outside the helper's own body goes
+    /// through `apt_retry`, so a mirror error that outlasts apt's own retries re-runs
+    /// the step (issue #1202).
+    #[test]
+    fn every_apt_get_call_in_the_download_script_goes_through_apt_retry() {
+        let script = embedded_download_script();
+        let mut in_helper = false;
+        let mut calls = 0;
+        let mut bare = Vec::new();
+        for line in script.lines() {
+            if line == "apt_retry() {" {
+                in_helper = true;
+            }
+            if in_helper {
+                if line == "}" {
+                    in_helper = false;
+                }
+                continue;
+            }
+            let code = line.trim_start();
+            if code.starts_with('#') || code.starts_with("echo") || !code.contains("apt-get") {
+                continue;
+            }
+            calls += 1;
+            if !code.contains("apt_retry apt-get") {
+                bare.push(line.to_string());
+            }
+        }
+        assert!(
+            bare.is_empty(),
+            "apt-get calls outside apt_retry:\n{}",
+            bare.join("\n")
+        );
+        assert_eq!(
+            calls, 6,
+            "expected update, install, update, install dpkg-dev, source, build-dep:\n{script}"
+        );
+        let source = script
+            .lines()
+            .find(|l| l.contains("apt_retry apt-get source"))
+            .expect("apt-get source goes through apt_retry");
+        assert!(
+            source.starts_with("APT_RETRY_CLEAN=conmon_source_clean "),
+            "a retried apt-get source must clear the partial tree first: {source}"
+        );
+    }
+
+    /// Runs `body` under bash with `apt_retry` and `conmon_source_clean` from the
+    /// generated script and a stub `apt-get` that logs its arguments to `calls`.
+    /// Returns (exit status, calls log, stderr).
+    fn run_apt_retry(
+        dir: &std::path::Path,
+        stub_apt_get: &str,
+        body: &str,
+    ) -> (bool, String, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = embedded_download_script();
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("apt-get");
+        std::fs::write(&stub, format!("#!/bin/bash\n{stub_apt_get}")).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = format!(
+            "set -euo pipefail\n{}{}conmon_build_dir={}\n{body}\n",
+            download_script_function(&script, "apt_retry"),
+            download_script_function(&script, "conmon_source_clean"),
+            dir.join("build").display(),
+        );
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(program)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("FCVM_APT_RETRY_DELAY", "0")
+            .env("STUB_DIR", dir)
+            .output()
+            .unwrap();
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap_or_default();
+        (
+            out.status.success(),
+            calls,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// A stub whose `install` fails until it has been called more than twice.
+    const STUB_FLAKY_INSTALL: &str = r#"echo "$*" >> "$STUB_DIR/calls"
+if [ "$1" = update ]; then exit 0; fi
+n=$(grep -c '^install' "$STUB_DIR/calls")
+[ "$n" -gt 2 ]
+"#;
+
+    #[test]
+    fn apt_retry_reruns_a_failing_step_after_an_apt_get_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ok, calls, err) = run_apt_retry(
+            dir.path(),
+            STUB_FLAKY_INSTALL,
+            "apt_retry apt-get install --yes foo",
+        );
+        assert!(ok, "two failures then a success must pass: {err}");
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            [
+                "install --yes foo",
+                "update -qq",
+                "install --yes foo",
+                "update -qq",
+                "install --yes foo"
+            ]
+        );
+    }
+
+    #[test]
+    fn apt_retry_gives_up_after_three_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ok, calls, err) = run_apt_retry(
+            dir.path(),
+            "echo \"$*\" >> \"$STUB_DIR/calls\"\n[ \"$1\" = update ]\n",
+            "apt_retry apt-get install --yes foo\necho reached-after-failure",
+        );
+        assert!(!ok, "three failures must fail the script");
+        assert!(err.contains("after 3 attempts"), "{err}");
+        assert_eq!(calls.matches("install --yes foo").count(), 3, "{calls}");
+        assert_eq!(calls.matches("update -qq").count(), 2, "{calls}");
+    }
+
+    #[test]
+    fn apt_retry_clears_a_partial_conmon_tree_before_retrying_the_source_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let build = dir.path().join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        // First `source` leaves a half-unpacked tree and a fetched tarball, then fails.
+        let stub = r#"echo "$*" >> "$STUB_DIR/calls"
+if [ "$1" = update ]; then exit 0; fi
+if [ ! -e "$STUB_DIR/second" ]; then
+    touch "$STUB_DIR/second"
+    mkdir conmon-2.1.0-partial
+    touch conmon_2.1.0.orig.tar.xz
+    exit 1
+fi
+mkdir conmon-2.1.0
+"#;
+        let (ok, calls, err) = run_apt_retry(
+            dir.path(),
+            stub,
+            "cd \"$conmon_build_dir\"\n\
+             APT_RETRY_CLEAN=conmon_source_clean apt_retry apt-get source conmon=2.1.0\n\
+             ls -d conmon-*/ > \"$STUB_DIR/trees\"\n\
+             ls conmon_* > \"$STUB_DIR/files\" 2>/dev/null || true",
+        );
+        assert!(ok, "second attempt must succeed: {err}");
+        assert_eq!(calls.matches("source conmon=2.1.0").count(), 2, "{calls}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("trees")).unwrap(),
+            "conmon-2.1.0/\n",
+            "the glob `cd conmon-*/` must see exactly one tree"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("files")).unwrap(),
+            "",
+            "files from the failed attempt must be gone"
+        );
+    }
 
     #[test]
     fn global_firecracker_config_without_a_commit_is_refused() {
