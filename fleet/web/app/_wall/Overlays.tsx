@@ -1,12 +1,13 @@
 "use client";
 
 // Everything drawn over the frames: the line between the halves, each half's
-// tag, dark tiles' glyphs and phases,
+// tag, dark tiles' clocks, glyphs and phases, the race's clocks and result,
+// the wake's progress,
 // the stats switch's per-tile lines, the seams and the hovered tile's outline
 // and label, banners and notices.
 
 import type { CSSProperties } from "react";
-import type { Glyph, TileView, WallView } from "../../core/index.ts";
+import type { Glyph, HalfClock, SleepView, TileView, WallView } from "../../core/index.ts";
 
 function accent(color: string): CSSProperties {
   return { ["--accent" as string]: color };
@@ -66,7 +67,7 @@ export function GlyphMark({ g, size }: { g: Glyph; size: number }) {
 function DarkTile({ t }: { t: TileView }) {
   const b = t.box!;
   const big = b.h >= 64 && b.w >= 110;
-  const size = Math.max(14, Math.min(34, b.h / 3.2));
+  const size = Math.max(14, Math.min(34, b.h / (t.clock ? 5 : 3.2)));
   return (
     <div
       className={`dark-tile${t.hatch ? " hatched" : ""} ${t.glyph.kind}`}
@@ -74,6 +75,11 @@ function DarkTile({ t }: { t: TileView }) {
       data-kind={t.glyph.kind}
       style={{ ...accent(t.accent), left: b.x, top: b.y, width: b.w, height: b.h }}
     >
+      {t.clock && big ? (
+        <span className="clock" data-testid={`clock-${t.id}`} style={{ fontSize: `clamp(18px, ${Math.round(b.h / 5)}px, 56px)` }}>
+          {t.clock}
+        </span>
+      ) : null}
       <GlyphMark g={t.glyph} size={size} />
       {big ? (
         <span className="phase plate" data-testid={`phase-${t.id}`}>
@@ -85,7 +91,64 @@ function DarkTile({ t }: { t: TileView }) {
   );
 }
 
-export function Overlays({ view }: { view: WallView; phone: boolean }) {
+/** One half's big clock: on the image (absolute), or in the phone's strip under it. */
+export function HalfClockView({ c, style }: { c: HalfClock; style?: CSSProperties }) {
+  return (
+    <div className={`half-clock ${c.half} ${c.state}${style ? " on-image" : ""}`} data-testid={`race-clock-${c.half}`} data-state={c.state} style={style}>
+      <span className="value" data-testid={`race-value-${c.half}`}>
+        {c.value}
+      </span>
+      <span className="sub" data-testid={`race-sub-${c.half}`}>
+        {c.sub}
+      </span>
+      {c.hatch ? (
+        <span className="hatch-line" data-testid={`race-hatch-${c.half}`}>
+          {c.hatch}
+        </span>
+      ) : null}
+      {c.steps.length > 0 ? (
+        <span className="steps" data-testid={`race-steps-${c.half}`}>
+          {c.steps.map((st, i) => (
+            <span key={st.label} className={st.state}>
+              {i > 0 ? <span className="arrow" aria-hidden="true">→</span> : null}
+              {st.label}
+            </span>
+          ))}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+/** Asleep or waking, in one lower third: on the image, or under it on an upright phone. */
+export function WakeCard({ sleep, style }: { sleep: SleepView; style?: CSSProperties }) {
+  return (
+    <div className={`lower-third ${sleep.state}${style ? " on-image" : ""}`} data-testid="sleep-card" style={style} role="status">
+      <span className="title">
+        {sleep.title}
+        {sleep.clock ? (
+          <span className="clock" data-testid="wake-clock">
+            {sleep.clock}
+          </span>
+        ) : null}
+      </span>
+      {sleep.state === "asleep" ? <span className="line">{sleep.line}</span> : null}
+      {sleep.steps.length > 0 ? (
+        <ol className="dots" data-testid="wake-steps">
+          {sleep.steps.map((st) => (
+            <li key={st.phase} className={st.state} data-testid={`wake-${st.phase}`} data-state={st.state}>
+              <span className="mark" aria-hidden="true" />
+              <span className="label">{st.label}</span>
+              {st.value ? <span className="v">{st.value}</span> : null}
+            </li>
+          ))}
+        </ol>
+      ) : null}
+    </div>
+  );
+}
+
+export function Overlays({ view, phone }: { view: WallView; phone: boolean }) {
   const L = view.layout;
   const showMosaic = L !== null && view.focus === null && view.own === null;
   const img = L?.image;
@@ -107,6 +170,28 @@ export function Overlays({ view }: { view: WallView; phone: boolean }) {
             </span>
           ) : null}
           {view.tiles.map((t) => (t.dark && t.box ? <DarkTile key={t.id} t={t} /> : null))}
+          {view.tiles.map((t) =>
+            t.chip && t.box ? (
+              <div
+                key={`relit-${t.id}`}
+                className={`relit ${t.half}${t.chip.fresh ? " fresh" : ""}`}
+                style={{ left: t.box.x, top: t.box.y, width: t.box.w, height: t.box.h }}
+                data-testid={`relit-${t.id}`}
+              >
+                {t.box.w >= 56 && t.box.h >= 28 ? (
+                  <span className="chip" data-testid={`chip-${t.id}`}>
+                    {t.chip.text}
+                  </span>
+                ) : null}
+              </div>
+            ) : null,
+          )}
+          {phone ? null : view.race?.clocks.map((c) => <HalfClockView key={c.half} c={c} style={{ left: c.x, top: c.y }} />)}
+          {view.race?.end && !phone ? (
+            <div className="end-card" data-testid="end-card" style={{ left: img.x + img.w / 2, top: img.y + img.h * 0.68 }}>
+              {view.race.end}
+            </div>
+          ) : null}
           {statsOn
             ? view.tiles.map((t) =>
                 t.box ? (
@@ -171,28 +256,7 @@ export function Overlays({ view }: { view: WallView; phone: boolean }) {
           ) : null}
         </>
       ) : null}
-      {view.sleep && img ? (
-        <div className={`sleep-card ${view.sleep.state}`} data-testid="sleep-card" style={{ right: `calc(100vw - ${img.x + img.w - 12}px)`, top: Math.max(img.y + 12, 120) }} role="status">
-          <span className="title">{view.sleep.title}</span>
-          {view.sleep.clock ? (
-            <span className="clock" data-testid="wake-clock">
-              {view.sleep.clock}
-            </span>
-          ) : null}
-          <span className="line">{view.sleep.line}</span>
-          {view.sleep.steps.length > 0 ? (
-            <ol className="steps" data-testid="wake-steps">
-              {view.sleep.steps.map((st) => (
-                <li key={st.phase} className={st.state} data-testid={`wake-${st.phase}`} data-state={st.state}>
-                  <span className="mark" aria-hidden="true" />
-                  <span className="label">{st.label}</span>
-                  <span className="v">{st.value}</span>
-                </li>
-              ))}
-            </ol>
-          ) : null}
-        </div>
-      ) : null}
+      {view.sleep && img && !phone ? <WakeCard sleep={view.sleep} style={{ left: img.x + img.w / 2, top: img.y + img.h * 0.74 }} /> : null}
       {view.banners.length > 0 ? (
         <div className="banners" role="status">
           {view.banners.map((b) => (

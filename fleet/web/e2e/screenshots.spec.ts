@@ -40,7 +40,7 @@ test("screenshots", async ({ page, browser }) => {
   // A race with a wait for spot capacity, mid-way: fcvm back, EC2 waiting and hatched.
   await admin("/mock/schedule", { capacity_wait_ms: 5000, clear_cooldown: true, cooldown_s: 45 });
   await page.getByTestId("restart-all").click();
-  await expect(page.getByTestId("bar-fcvm")).toHaveClass(/done/, { timeout: 10_000 });
+  await expect(page.getByTestId("race-clock-fcvm")).toHaveAttribute("data-state", "done", { timeout: 10_000 });
   await page.mouse.move(away.x, away.y);
   await page.waitForTimeout(400);
   await shot(page, "race-mid");

@@ -21,7 +21,7 @@ import { FAMILY_PROBE_ATTEMPTS, FAMILY_PROBE_MS, frameSocketUrl, streamUrl, type
 import { fitBandwidth, type StreamAsk } from "./bandwidth.ts";
 import { suggestMode } from "./mode.ts";
 import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type Aggregate, type FleetState, type Half, type IntentMsg, type Rect, type Tile } from "./protocol.ts";
-import { KIND_TAG, NOT_AWAKE_NOTE, scoreView, type ScoreView } from "./race.ts";
+import { KIND_TAG, NOT_AWAKE_NOTE, raceOnImage, ratioText, runningRace, scoreView, type RaceOnImage, type ScoreView } from "./race.ts";
 import { sceneUnixMs } from "./scene.ts";
 import { reelView, type ReelMeta, type ReelView } from "./reel.ts";
 import type { ClientState, FrameStats, GpuSample, Notice, StreamMode } from "./store.ts";
@@ -194,7 +194,14 @@ export interface TileView {
   ariaLabel: string;
   hover: HoverLabel;
   stats: string[];
+  /** While a race runs and this tile is still dark: its own clock since the race began, or "". */
+  clock: string;
+  /** Once it has relit in the running race: its measured time, big for CHIP_FRESH_MS, then in its corner. */
+  chip: { text: string; fresh: boolean } | null;
 }
+
+/** A relit tile's time stays big this long before it moves to the tile's corner. */
+export const CHIP_FRESH_MS = 3000;
 
 const STEPS: Record<Half, Record<string, number>> = {
   fcvm: { relaunching: 0, requested: 0, stopping: 1, restoring: 2, starting: 3 },
@@ -284,6 +291,12 @@ function tileView(
   }
   stats.push(name);
 
+  // In a running race: a dark tile counts, a relit one shows when it came back.
+  const ra = runningRace(st);
+  const ff = t.last_relaunch?.first_frame_at ?? null;
+  const clock = ra !== null && dark && glyph.kind === "progress" ? fmt.raceClock(Math.max(0, srvNow - ra.started_at)) : "";
+  const chip = ra !== null && !dark && ff !== null && ff >= ra.started_at ? { text: fmt.seconds(ff - ra.started_at), fresh: srvNow - ff < CHIP_FRESH_MS } : null;
+
   const ariaLabel = `${name}, ${KIND_NAME[t.half]}, ${dark ? [phaseLine, detail].filter(Boolean).join(", ") : "streaming"}${
     rms === null ? "" : `, last restart ${fmt.seconds(rms)}`
   }. Open it.`;
@@ -305,6 +318,8 @@ function tileView(
     ariaLabel,
     hover,
     stats,
+    clock,
+    chip,
   };
 }
 
@@ -407,15 +422,27 @@ export interface SleepView {
   steps: WakeStep[];
 }
 
+/** The median of the coordinator's measured wakes (`wakes`, else `last_wake`), in ms, or null. */
+export function wakeMedianMs(p: FleetState["fleet"]["power"]): number | null {
+  const ms = (p.wakes.length > 0 ? p.wakes : p.last_wake ? [p.last_wake] : []).map((w) => w.awake_at - w.started_at).sort((a, b) => a - b);
+  if (ms.length === 0) return null;
+  const m = Math.floor(ms.length / 2);
+  return ms.length % 2 === 1 ? ms[m]! : (ms[m - 1]! + ms[m]!) / 2;
+}
+
 function sleepView(st: FleetState, srvNow: number): SleepView | null {
   const p = st.fleet.power;
   if (p.state === "awake") return null;
+  const gpus = p.last_wake?.gpus ?? p.wakes.at(-1)?.gpus ?? 0;
   if (p.state === "asleep") {
-    const since = p.asleep_since === null ? "" : ` ${fmt.ago(srvNow - p.asleep_since)}`;
+    const median = wakeMedianMs(p);
     return {
       state: "asleep",
-      title: "The GPUs are asleep",
-      line: `Nobody was watching, so the fleet scaled to zero${since}. It wakes when someone watches.`,
+      title: "Asleep.",
+      line:
+        median === null || gpus === 0
+          ? "The GPUs wake when someone watches."
+          : `${fmt.count(gpus, "GPU", "GPUs")} wake in about ${fmt.minSec(median)} when you stay.`,
       clock: "",
       steps: [],
     };
@@ -435,8 +462,8 @@ function sleepView(st: FleetState, srvNow: number): SleepView | null {
   });
   return {
     state: "waking",
-    title: "Waking up the GPUs",
-    line: "The fleet scaled to zero while nobody was watching. Each step below is reported by the hosts as it completes.",
+    title: gpus > 0 ? `WAKING ${fmt.count(gpus, "GPU", "GPUs")}` : "WAKING THE GPUs",
+    line: "The fleet scaled to zero while nobody was watching. Each step is reported by the hosts as it completes.",
     clock: fmt.raceClock(srvNow - start),
     steps,
   };
@@ -1161,8 +1188,8 @@ export interface WallView {
   spec: string;
   /** The last race in one line, or "". */
   lastRace: string;
-  /** The race's bars are up (a race runs, or just finished). */
-  racePanel: boolean;
+  /** The race drawn on the image: a clock per half while it runs, then the result. */
+  race: RaceOnImage | null;
   plan: DrawPlan;
   seams: SeamView;
   /** This viewer's borrowed tile is coming back into the image (labelled until it streams). */
@@ -1236,44 +1263,43 @@ export function specLine(st: FleetState, s: ClientState, image: Box | null, dpr:
   const names = new Map<string, number>();
   for (const t of live) if (t.gpu) names.set(t.gpu.name, (names.get(t.gpu.name) ?? 0) + 1);
   const gpu = [...names.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "GPU";
-  const fps = Object.values(s.frames?.tiles ?? {})
-    .filter((x) => x.newestT !== null && x.fps > 0)
-    .map((x) => x.fps)
-    .sort((a, b) => a - b);
+  // The renderers' own rate where they report it; else what this page receives.
+  const reported = live.map((t) => t.fps).filter((x): x is number => x !== null && x > 0);
+  const fps = (reported.length > 0 ? reported : Object.values(s.frames?.tiles ?? {}).filter((x) => x.newestT !== null && x.fps > 0).map((x) => x.fps)).sort((a, b) => a - b);
   const parts = [`${Math.round(image.w * dpr)}×${Math.round(image.h * dpr)}`, `${live.length} × ${gpu}`];
   if (fps.length > 0) parts.push(`${Math.round(fps[Math.floor(fps.length / 2)]!)} fps`);
   parts.push("path traced");
   return parts.join(" · ");
 }
 
-/** How many times faster fcvm came back than EC2: "14×", "2.5×". */
-export function ratioText(fcvmMs: number, ec2Ms: number): string {
-  const r = ec2Ms / Math.max(1, fcvmMs);
-  return `${r >= 10 ? Math.round(r) : r.toFixed(1)}×`;
-}
-
-/** How long a finished race's bars stay up before the strip goes back to one line. */
-export const RESULT_HOLD_MS = 8000;
-
-/** The race panel is up: a race runs, or one finished less than RESULT_HOLD_MS ago. */
-export function racePanelShown(st: FleetState, srvNow: number): boolean {
-  const ra = st.relaunch_all;
-  if (ra === null) return false;
-  if (ra.fcvm_done_at === null || ra.ec2_done_at === null) return true;
-  return srvNow - Math.max(ra.fcvm_done_at, ra.ec2_done_at) < RESULT_HOLD_MS;
-}
-
-/** The last race in one line, from the coordinator's scoreboard, or "". Asleep or waking, dated. */
+/**
+ * The last race in one line, so the strip never shows dashes: the scoreboard, else the
+ * newest race the coordinator kept (`races`), else each half's newest single restart,
+ * else "". Asleep or waking, dated.
+ */
 export function lastRaceLine(st: FleetState): string {
+  const asleep = st.fleet.power.state !== "awake";
+  const line = (f: number | null, e: number | null, at: number | null): string => {
+    const parts: string[] = [];
+    if (f !== null) parts.push(`fcvm back in ${fmt.seconds(f)}`);
+    if (e !== null) parts.push(`EC2 back in ${fmt.seconds(e)}`);
+    if (f !== null && e !== null) parts.push(`${ratioText(f, e)} faster`);
+    return `Last race: ${parts.join(" · ")}${asleep && at !== null ? ` · measured ${fmt.utcDate(at)}` : ""}`;
+  };
   const { fcvm, ec2 } = st.scoreboard;
-  if (fcvm === null && ec2 === null) return "";
-  const parts: string[] = [];
-  if (fcvm) parts.push(`fcvm back in ${fmt.seconds(fcvm.last_ms)}`);
-  if (ec2) parts.push(`EC2 back in ${fmt.seconds(ec2.last_ms)}`);
-  if (fcvm && ec2) parts.push(`${ratioText(fcvm.last_ms, ec2.last_ms)} faster`);
-  const last = st.relaunch_all?.started_at ?? null;
-  const dated = st.fleet.power.state !== "awake" && last !== null ? ` · measured ${fmt.utcDate(last)}` : "";
-  return `Last race: ${parts.join(" · ")}${dated}`;
+  if (fcvm !== null || ec2 !== null) return line(fcvm?.last_ms ?? null, ec2?.last_ms ?? null, st.relaunch_all?.started_at ?? null);
+  const race = [...st.races].reverse().find((r) => r.fcvm?.time_ms != null || r.ec2?.time_ms != null);
+  if (race) return line(race.fcvm?.time_ms ?? null, race.ec2?.time_ms ?? null, race.started_at);
+  const single = (h: Half): string | null => {
+    let best: Tile | null = null;
+    for (const t of st.tiles) {
+      if (t.half !== h || relaunchMs(t) === null) continue;
+      if (best === null || t.last_relaunch!.first_frame_at! > best.last_relaunch!.first_frame_at!) best = t;
+    }
+    return best === null ? null : `${tileName(best)} back in ${fmt.seconds(relaunchMs(best)!)}`;
+  };
+  const singles = [single("fcvm"), single("ec2")].filter((x): x is string => x !== null);
+  return singles.length > 0 ? `Last single restarts: ${singles.join(" · ")}` : "";
 }
 
 export function wallView(input: WallInput): WallView {
@@ -1362,7 +1388,7 @@ export function wallView(input: WallInput): WallView {
       live: false,
       spec: "",
       lastRace: "",
-      racePanel: false,
+      race: null,
       plan: { ...emptyPlan, image },
       seams: { visible: false, segments: [], lineWidth: 1 / input.dpr, outline: null, label: null },
       returning: false,
@@ -1484,7 +1510,7 @@ export function wallView(input: WallInput): WallView {
     live: st.fleet.power.state === "awake" && imageWhole(plan, s.frames),
     spec: specLine(st, s, planLayout?.image ?? null, input.dpr),
     lastRace: lastRaceLine(st),
-    racePanel: racePanelShown(st, srvNow),
+    race: covered ? null : raceOnImage(st, srvNow, layout?.image ?? null, layout?.split ?? 0.5),
     plan,
     seams: seamView(s, covered ? null : layout, tiles, input, returning),
     returning,

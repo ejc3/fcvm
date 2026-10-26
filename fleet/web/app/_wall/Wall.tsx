@@ -22,6 +22,7 @@ import {
   lightPosition,
   sceneT,
   serverNow,
+  HUD_BAND,
   LIGHT_COLORS,
   wallView,
   type Box,
@@ -31,10 +32,9 @@ import {
 import { canDecodeH264, WallClient } from "./wall-client.ts";
 import { FocusPanel } from "./FocusPanel.tsx";
 import { OwnGpu } from "./OwnGpu.tsx";
-import { Overlays } from "./Overlays.tsx";
+import { HalfClockView, Overlays, WakeCard } from "./Overlays.tsx";
 import { PlayDrawer, VerifyBox } from "./PlayDrawer.tsx";
 import { Reel } from "./Reel.tsx";
-import { Scoreboard } from "./Score.tsx";
 import type { DrawSettings } from "./worker-msgs.ts";
 
 const localNow = () => performance.timeOrigin + performance.now();
@@ -593,6 +593,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
           reel={view.reel}
           onDone={reelDone}
           box={{ left: view.plan.image.x - areas.mosaic.x, top: view.plan.image.y - areas.mosaic.y, width: view.plan.image.w, height: view.plan.image.h }}
+          badgeTop={phone ? 10 : Math.max(10, HUD_BAND - (view.plan.image.y - areas.mosaic.y))}
         />
       ) : null}
     </div>
@@ -671,22 +672,22 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
     </span>
   ) : null;
 
-  // While a race runs, and for a few seconds after, its two bars sit over the bottom of the image; at rest, one line says how the last one went.
-  const race = score && view.racePanel ? (
-    <section className="race-panel" aria-label="The race" data-hud="">
-      {next}
-      <Scoreboard score={score} compact={phone} />
-    </section>
-  ) : null;
-
+  // While a race runs the strip says who started it (the clocks are on the image); after
+  // its result card, one line says how the last race went.
+  const racing = view.race !== null;
   const info = (
     <div className="info">
-      {!view.racePanel && view.lastRace ? (
+      {view.race?.label ? (
+        <span className="next racing" data-testid="countdown">
+          {view.race.label}
+        </span>
+      ) : null}
+      {!racing && view.lastRace ? (
         <span className="last-race" data-testid="last-race">
           {view.lastRace}
         </span>
       ) : null}
-      {!view.racePanel ? next : null}
+      {!racing ? next : null}
       {view.spec ? (
         <span className="spec" data-testid="spec">
           {view.spec}
@@ -707,7 +708,19 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
             </button>
           </header>
           {stage}
-          {race}
+          {view.race && view.race.clocks.length > 0 ? (
+            <div className="race-row">
+              {view.race.clocks.map((c) => (
+                <HalfClockView key={c.half} c={c} />
+              ))}
+            </div>
+          ) : null}
+          {view.sleep ? <WakeCard sleep={view.sleep} /> : null}
+          {view.race?.end ? (
+            <p className="end-line" data-testid="end-card">
+              {view.race.end}
+            </p>
+          ) : null}
           {info}
           <p className="rotate-hint" data-testid="rotate-hint">
             {view.rotateHint}
@@ -769,7 +782,6 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
             </div>
           </header>
           <footer className="hud-bottom" data-hud="">
-            {race}
             <div className="strip">
               <div className="fades">{restart}</div>
               {info}

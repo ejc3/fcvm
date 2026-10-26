@@ -56,7 +56,7 @@ test("the render is the page: the image fills the screen, the controls sit over 
   await expect(page.getByTestId("sentence")).toHaveCount(0);
   await expect(page.getByTestId("counter")).toHaveCount(0);
   await expect(page.getByTestId("feed")).toHaveCount(0);
-  await expect(page.getByTestId("scoreboard")).toHaveCount(0);
+  await expect(page.getByTestId("race-clock-fcvm")).toHaveCount(0);
   await expect(page.getByTestId("play")).toHaveText("Direct the scene");
   // Each half's tag on the image, either side of the divider, which sits exactly on halfLineX.
   const line = await page.getByTestId("half-line").boundingBox();
@@ -127,7 +127,7 @@ test("the seam check catches a renderer that draws another t than it stamps", as
   }
 });
 
-test("restart all: the race is the hero, one counter per half, fcvm's bar stops while EC2's grows, results announced", async ({ page, browser }) => {
+test("restart all: the race is on the picture, a clock per half and per tile, fcvm freezes while EC2 counts, results announced", async ({ page, browser }) => {
   await openWall(page, 15);
   const watcher = await (await browser.newContext()).newPage();
   await openWall(watcher, 15);
@@ -141,37 +141,39 @@ test("restart all: the race is the hero, one counter per half, fcvm's bar stops 
   await expect(page.getByTestId("restart-all")).toHaveText("Restarting now");
   await expect(page.getByTestId("countdown")).toContainText("Restart running");
   await expect(watcher.getByTestId("countdown")).toContainText("Restart running");
-  // No per-tile clock: a dark tile shows how far its restart is.
+  // Every dark tile counts, with how far its restart is; each half has one big clock.
   await expect(page.locator('[data-testid^="dark-fcvm"] svg.glyph.progress').first()).toBeVisible();
-  await expect(page.locator(".dark-tile .clock")).toHaveCount(0);
-  // fcvm comes back: its counter freezes, with a check mark, while EC2's runs on.
-  await expect(page.getByTestId("bar-fcvm")).toHaveClass(/done/, { timeout: 10_000 });
-  await expect(page.getByTestId("line-fcvm")).toHaveText("all 8 GPUs streaming again");
-  const a = { f: await page.getByTestId("value-fcvm").textContent(), e: await page.getByTestId("value-ec2").textContent(), fs: Number(await page.getByTestId("bar-fcvm").getAttribute("data-solid")), es: Number(await page.getByTestId("bar-ec2").getAttribute("data-solid")) };
+  await expect(page.getByTestId("clock-ec2:1")).toHaveText(/^0:\d\d\.\d$/);
+  await expect(page.getByTestId("race-clock-fcvm")).toBeVisible();
+  await expect(page.getByTestId("race-clock-ec2")).toHaveAttribute("data-state", "counting");
+  // fcvm comes back: its clock freezes, while EC2's runs on, and each relit tile shows its own time.
+  await expect(page.getByTestId("race-clock-fcvm")).toHaveAttribute("data-state", "done", { timeout: 10_000 });
+  await expect(page.getByTestId("race-sub-fcvm")).toHaveText("all 8 GPUs back");
+  await expect(page.getByTestId("chip-fcvm:1")).toHaveText(/^\d\.\d s$/);
+  await expect(page.getByTestId("race-sub-ec2")).toHaveText(/^\+\d+ s and counting$/);
+  await expect(page.getByTestId("race-steps-ec2")).toContainText("instance");
+  const a = { f: await page.getByTestId("race-value-fcvm").textContent(), e: await page.getByTestId("race-value-ec2").textContent() };
   await page.waitForTimeout(1200);
-  const b = { f: await page.getByTestId("value-fcvm").textContent(), e: await page.getByTestId("value-ec2").textContent(), fs: Number(await page.getByTestId("bar-fcvm").getAttribute("data-solid")), es: Number(await page.getByTestId("bar-ec2").getAttribute("data-solid")) };
+  const b = { f: await page.getByTestId("race-value-fcvm").textContent(), e: await page.getByTestId("race-value-ec2").textContent() };
   expect(a.f).toMatch(/^\d\.\d s$/);
   expect(b.f).toBe(a.f);
-  expect(b.fs).toBeLessThanOrEqual(a.fs);
   expect(b.e).not.toBe(a.e);
-  expect(b.es).toBeGreaterThan(a.es);
   await expect(page.getByTestId("announce")).toHaveText(/^fcvm: all 8 GPUs streaming again \d\.\d s after the restart\.$/);
-  // EC2 comes back; both results are announced and both bars show what they were measured on.
+  // EC2 comes back; both results are announced, and one card says the race in the coordinator's numbers.
   await expect(page.getByTestId("announce")).toContainText(/EC2: all 7 GPUs streaming again \d+ s after the restart\./, { timeout: 30_000 });
-  await expect(page.getByTestId("measured-fcvm")).toHaveText("measured on 8 GPUs");
-  await expect(page.getByTestId("measured-ec2")).toHaveText("measured on 7 GPUs");
   const st = await fleetNow();
   const ra = st.relaunch_all!;
-  expect(ra.fcvm_done_at! - ra.started_at).toBeLessThan(ra.ec2_done_at! - ra.started_at);
-  // Every number is the coordinator's: the last restart, as it measured it.
-  await expect(page.getByTestId("line-fcvm")).toHaveText(`last restart ${seconds(st.scoreboard.fcvm!.last_ms)}`);
-  await expect(page.getByTestId("value-ec2")).toHaveText(seconds(st.scoreboard.ec2!.median_ms));
+  const f = ra.fcvm_done_at! - ra.started_at;
+  const e = ra.ec2_done_at! - ra.started_at - ra.ec2_capacity_wait_ms;
+  expect(f).toBeLessThan(e);
+  const ratio = (x: number, y: number) => (y / x >= 10 ? Math.round(y / x) : (y / x).toFixed(1));
+  await expect(page.getByTestId("end-card")).toHaveText(`fcvm back in ${seconds(f)} · EC2 back in ${seconds(e)} · ${ratio(f, e)}× faster`);
+  await expect(page.getByTestId("race-clock-fcvm")).toHaveCount(0);
   await expect(page.getByTestId("restart-all")).toBeEnabled();
-  // The bars stay a few seconds, then one line says how the race went, in the coordinator's numbers.
-  await expect(page.getByTestId("scoreboard")).toHaveCount(0, { timeout: 15_000 });
-  const ratio = st.scoreboard.ec2!.last_ms / st.scoreboard.fcvm!.last_ms;
+  // The card stays a few seconds, then the strip's one line says how the race went.
+  await expect(page.getByTestId("end-card")).toHaveCount(0, { timeout: 15_000 });
   await expect(page.getByTestId("last-race")).toHaveText(
-    `Last race: fcvm back in ${seconds(st.scoreboard.fcvm!.last_ms)} · EC2 back in ${seconds(st.scoreboard.ec2!.last_ms)} · ${ratio >= 10 ? Math.round(ratio) : ratio.toFixed(1)}× faster`,
+    `Last race: fcvm back in ${seconds(st.scoreboard.fcvm!.last_ms)} · EC2 back in ${seconds(st.scoreboard.ec2!.last_ms)} · ${ratio(st.scoreboard.fcvm!.last_ms, st.scoreboard.ec2!.last_ms)}× faster`,
   );
   await expect(page.getByTestId("toast")).toHaveCount(0);
   await watcher.context().close();
@@ -187,21 +189,18 @@ test("the owner's schedule: a shared countdown, a restart by the schedule, a coo
   await expect(other.getByTestId("countdown-value")).toHaveText(/^0:0[1-4]$/);
   await expect(page.getByTestId("countdown")).toContainText("Scheduled restart, running", { timeout: 8000 });
   await expect(page.getByTestId("toast")).toHaveText("the scheduled restart of every GPU began");
-  // While AWS has no spot GPU: hatched, first on EC2's bar, labelled, and the tiles say so.
-  await expect(page.getByTestId("hatch-ec2")).toBeVisible();
-  await expect(page.getByTestId("hatch-label-ec2")).toHaveText(/^AWS had no spot GPU: waiting 0:0\d, not counted$/);
+  // While AWS has no spot GPU: EC2's clock says it is not counting the wait, and the tiles say so, hatched.
+  await expect(page.getByTestId("race-hatch-ec2")).toHaveText(/^not counting \d s AWS spent finding a spot GPU$/);
   await expect(page.getByTestId("dark-ec2:1")).toHaveAttribute("data-kind", "capacity");
   await expect(page.locator(".key-grid button[aria-label^='EC2 VM 1,']")).toHaveAttribute("aria-label", /AWS had no spot GPU/);
-  const track = page.getByTestId("bar-ec2").locator(".track > span").first();
-  await expect(track).toHaveClass("hatch");
+  await expect(page.getByTestId("dark-ec2:1")).toHaveClass(/hatched/);
   await raceOver();
   const st = await fleetNow();
   expect(st.relaunch_all!.by).toBe("schedule");
   expect(st.scoreboard.ec2!.last_capacity_wait_ms).toBe(3000);
   // The headline leaves the wait out: EC2's last time is click to last frame less the wait.
   expect(st.scoreboard.ec2!.last_ms).toBe(st.relaunch_all!.ec2_done_at! - st.relaunch_all!.started_at - 3000);
-  await expect(page.getByTestId("line-ec2")).toHaveText(`last restart ${seconds(st.scoreboard.ec2!.last_ms)}`);
-  await expect(page.getByTestId("hatch-label-ec2")).toHaveText("last restart: AWS had no spot GPU for 3.0 s, not counted");
+  await expect(page.getByTestId("end-card")).toContainText(`EC2 back in ${seconds(st.scoreboard.ec2!.last_ms)}`);
   // The cooldown, shown to everyone: the button waits.
   await expect(other.getByTestId("restart-all")).toBeDisabled();
   await expect(other.getByTestId("restart-note")).toHaveText(/^available again in 0:[0-3]\d$/);
@@ -1129,14 +1128,14 @@ test("asleep: the recording plays over the poster with its badge, the scores are
     await raceOver();
   }
   await sleepNow();
-  await expect(page.getByTestId("sleep-card")).toContainText("The GPUs are asleep");
+  await expect(page.getByTestId("sleep-card")).toContainText("Asleep.");
   await expect(page.locator(".dark-tile")).toHaveCount(0);
   await expect(page.getByTestId("reel")).toHaveAttribute("data-state", "playing", { timeout: 15_000 });
   const t0 = await page.getByTestId("reel-video").evaluate((v) => (v as HTMLVideoElement).currentTime);
   await page.waitForTimeout(600);
   expect(await page.getByTestId("reel-video").evaluate((v) => (v as HTMLVideoElement).currentTime)).not.toBe(t0);
   expect(await page.getByTestId("reel-video").evaluate((v) => { const x = v as HTMLVideoElement; return [x.muted, x.loop, x.playsInline, x.textTracks[0]?.mode]; })).toEqual([true, true, true, "showing"]);
-  await expect(page.getByTestId("reel-badge")).toHaveText(`Recorded ${await reelDate()}. The live wall is asleep; it wakes when someone watches.`);
+  await expect(page.getByTestId("reel-badge")).toContainText(`◉ RECORDING · ${await reelDate()}`);
   await expect(page.getByTestId("last-race")).toHaveText(/^Last race: fcvm back in .+ · measured \d+ \w+ \d{4}, \d\d:\d\d UTC$/);
   await expect(page.getByTestId("restart-note")).toHaveText("works once the GPUs are awake");
   await expect(page.getByTestId("own-note")).toHaveText("works once the GPUs are awake");
@@ -1159,8 +1158,8 @@ test("asleep: the recording plays over the poster with its badge, the scores are
     requestAnimationFrame(tick);
   });
   await admin("/mock/power", { wake: true });
-  await expect(page.getByTestId("sleep-card")).toContainText("Waking up the GPUs");
-  await expect(page.getByTestId("reel-badge")).toHaveText(`Recorded ${await reelDate()}. The live wall is waking up.`);
+  await expect(page.getByTestId("sleep-card")).toContainText(/WAKING (\d+ GPUs|THE GPUs)/);
+  await expect(page.getByTestId("reel-badge")).toContainText(`◉ RECORDING · ${await reelDate()}`);
   await expect(page.getByTestId("wake-clock")).toHaveText(/^0:0\d\.\d$/);
   await expect(page.getByTestId("wake-instance_pending")).toHaveAttribute("data-state", "done");
   await expect(page.getByTestId("wake-booted")).toHaveAttribute("data-state", "done", { timeout: 10_000 });
@@ -1212,7 +1211,7 @@ test("a missing recording leaves the poster, with nothing broken on top", async 
     await page.waitForTimeout(500);
     const trace = await page.evaluate(() => window.__fleet!.client.traceStop());
     expect(trace.at(-1)!.poster).toBe(true);
-    await expect(page.getByTestId("sleep-card")).toContainText("The GPUs are asleep");
+    await expect(page.getByTestId("sleep-card")).toContainText("Asleep.");
   } finally {
     await admin("/mock/media", { missing: false });
     await wakeUp(page);
