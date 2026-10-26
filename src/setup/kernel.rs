@@ -1311,11 +1311,14 @@ const HOST_KERNEL_BUILD_DIR_ENV: &str = "FCVM_HOST_KERNEL_BUILD_DIR";
 /// Where the host kernel is built when nothing names a directory.
 const DEFAULT_HOST_KERNEL_BUILD_DIR: &str = "/tmp/kernel-build-host";
 
+/// The build directory, made absolute: the build script changes into it before it changes
+/// into the source directory beneath it, so a relative path would resolve twice.
 fn host_kernel_build_dir_from(value: Option<std::ffi::OsString>) -> PathBuf {
-    match value {
+    let dir = match value {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => PathBuf::from(DEFAULT_HOST_KERNEL_BUILD_DIR),
-    }
+    };
+    std::path::absolute(&dir).unwrap_or(dir)
 }
 
 fn host_kernel_build_dir() -> PathBuf {
@@ -2996,6 +2999,10 @@ mod tests {
         assert_eq!(
             host_kernel_build_dir_from(Some("".into())),
             PathBuf::from("/tmp/kernel-build-host")
+        );
+        assert_eq!(
+            host_kernel_build_dir_from(Some("relative-build".into())),
+            std::env::current_dir().unwrap().join("relative-build")
         );
     }
 

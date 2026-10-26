@@ -213,7 +213,7 @@ fn install_host_kernel_stops_when_the_repeated_check_fails() {
             .unwrap();
     let recipe: Vec<&str> = makefile
         .lines()
-        .skip_while(|l| !(l.starts_with("install-host-kernel:") && !l.contains("private")))
+        .skip_while(|l| !l.starts_with("install-host-kernel:") || l.contains("private"))
         .skip(1)
         .take_while(|l| l.starts_with('\t'))
         .collect();
