@@ -2279,6 +2279,13 @@ async fn cleanup_vm_inner(
     failures.record("deleting state", state_deleted);
     failures.record("saving the container's output", logs_saved);
     failures.record("removing VM data directory", data_dir_removed);
+    // Teardown removed what it made. This removes the mountpoints a restore made over
+    // source VM directories and deletes the VM's owner record; a resource it cannot
+    // remove stays recorded for the next launch (crate::reclaim).
+    failures.record(
+        "reclaiming the VM's recorded resources",
+        crate::reclaim::complete(&vm_id).await,
+    );
     let disk_us = disk_start.elapsed().as_micros();
 
     info!(
@@ -3234,7 +3241,18 @@ async fn prepare_clone_substrate(
     // The VMM opens the snapshot's disks through the binds over these directories. Their
     // own VMs' teardowns remove them, which detaches the binds in this clone's namespace
     // too, so hold them until the disks are open (storage::runtime_dir).
-    let mount_target_lease = match crate::storage::runtime_dir::lease_mount_targets(&disk_dirs)
+    // Recorded before the lease, which creates a directory whose VM is gone as an empty
+    // mountpoint: the clone's teardown, or the next launch after a SIGKILL, removes it.
+    let leased = async {
+        for dir in &disk_dirs {
+            crate::reclaim::record(
+                vm_id,
+                crate::reclaim::Resource::MountTarget { path: dir.clone() },
+            )?;
+        }
+        crate::storage::runtime_dir::lease_mount_targets(&disk_dirs).await
+    };
+    let mount_target_lease = match leased
         .await
         .context("leasing the source VM directories the clone's disks are bound over")
     {

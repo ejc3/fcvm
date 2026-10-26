@@ -131,6 +131,9 @@ pub struct VmContext {
     pub container_exit_seen: Arc<AtomicBool>,
     /// Inputs to replay the Firecracker API config + boot on an in-place relaunch.
     pub reboot_spec: RebootSpec,
+    /// Records what this VM creates on the host until teardown completes it
+    /// (`crate::reclaim`).
+    pub reclaim_owner: crate::reclaim::Owner,
 }
 
 /// A log line from the VM's container output.

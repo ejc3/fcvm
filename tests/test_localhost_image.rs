@@ -339,7 +339,7 @@ async fn test_export_pins_immutable_content_across_tag_rebuild() -> Result<()> {
     // Export by the v1 id (what fcvm captured before the rebuild).
     let tmp = tempfile::TempDir::new()?;
     let archive = tmp.path().join("out.docker.tar");
-    fcvm::commands::podman::export_image_archive(&v1_id, &image_name, &archive)
+    fcvm::commands::podman::export_image_archive(&v1_id, &image_name, &archive, None)
         .await
         .context("export_image_archive")?;
 
