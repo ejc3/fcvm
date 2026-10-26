@@ -2505,24 +2505,26 @@ fn snapshot_load_drive_overrides(
     for dir in source_dirs {
         let mut prefix = dir.as_os_str().as_bytes().to_vec();
         prefix.push(b'/');
-        // Each path runs from the prefix to the first byte no fcvm path holds. A byte of
-        // the following field that happens to be a path byte makes the path longer and
-        // unknown, which keeps the namespace.
+        // The serialized form gives no reliable end to a path, so each occurrence of the
+        // prefix has to start with a known path, and no known path may account for two
+        // occurrences: an unlisted path that merely starts with a known one is then a
+        // second occurrence of it. fcvm writes each of these paths into a VM's state once.
+        let mut used = vec![false; known.len()];
         let unknown = vmstate
             .windows(prefix.len())
             .enumerate()
             .filter(|(_, window)| *window == prefix.as_slice())
             .any(|(at, _)| {
-                let len = vmstate[at..]
+                match known
                     .iter()
-                    .take_while(|&&byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'-' | b'_')
-                    })
-                    .count();
-                let named = &vmstate[at..at + len];
-                !known
-                    .iter()
-                    .any(|path| path.as_os_str().as_bytes() == named)
+                    .position(|path| vmstate[at..].starts_with(path.as_os_str().as_bytes()))
+                {
+                    Some(index) if !used[index] => {
+                        used[index] = true;
+                        false
+                    }
+                    _ => true,
+                }
             });
         if unknown {
             info!(
@@ -8164,22 +8166,36 @@ mod tests {
             clone_disks
         )
         .is_none());
-        // A path that only starts with a known one is not that path.
-        let extended = vmstate(&[
-            "/data/vm-disks/vm-source/disks/rootfs.raw",
+        // A path that only starts with a known one is not that path, whatever byte
+        // follows the known part, and whether or not another known path is absent.
+        for unlisted in [
             "/data/vm-disks/vm-source/disks/rootfs.raw.unlisted",
-            "/data/vm-disks/vm-source/vsock.sock",
-        ]);
-        assert!(snapshot_load_drive_overrides(
-            capable,
-            true,
-            &extended,
-            &sources,
-            &vsock,
-            &extra,
-            clone_disks
-        )
-        .is_none());
+            "/data/vm-disks/vm-source/disks/rootfs.raw@unlisted",
+            "/data/vm-disks/vm-source/disks/rootfs.raw unlisted",
+        ] {
+            for state in [
+                vmstate(&[
+                    "/data/vm-disks/vm-source/disks/rootfs.raw",
+                    unlisted,
+                    "/data/vm-disks/vm-source/vsock.sock",
+                ]),
+                vmstate(&["/data/vm-disks/vm-source/disks/rootfs.raw", unlisted]),
+            ] {
+                assert!(
+                    snapshot_load_drive_overrides(
+                        capable,
+                        true,
+                        &state,
+                        &sources,
+                        &vsock,
+                        &extra,
+                        clone_disks
+                    )
+                    .is_none(),
+                    "{unlisted}"
+                );
+            }
+        }
         // A sibling directory whose name extends the source's is not under it.
         let sibling = vmstate(&[
             "/data/vm-disks/vm-source/disks/rootfs.raw",
