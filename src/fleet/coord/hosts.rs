@@ -1293,15 +1293,15 @@ mod tests {
     #[test]
     fn describe_answers_parse_to_hosts_with_their_market() {
         let xml = r#"<DescribeInstancesResponse><reservationSet><item><instancesSet>
-  <item><instanceId>i-0000000000000000a</instanceId><instanceState><code>16</code><name>running</name></instanceState>
+  <item><instanceId>i-0123456789abcdef0</instanceId><instanceState><code>16</code><name>running</name></instanceState>
     <instanceLifecycle>spot</instanceLifecycle><tagSet><item><key>Purpose</key><value>fcvm-fleet-host</value></item></tagSet></item>
-  <item><instanceId>i-0000000000000000b</instanceId><instanceState><code>0</code><name>pending</name></instanceState></item>
+  <item><instanceId>i-1234567890abcdef0</instanceId><instanceState><code>0</code><name>pending</name></instanceState></item>
 </instancesSet></item></reservationSet></DescribeInstancesResponse>"#;
         assert_eq!(
             parse_hosts(xml),
             vec![
-                host("i-0000000000000000a", "running", Market::Spot),
-                host("i-0000000000000000b", "pending", Market::OnDemand),
+                host("i-0123456789abcdef0", "running", Market::Spot),
+                host("i-1234567890abcdef0", "pending", Market::OnDemand),
             ]
         );
     }
@@ -1312,14 +1312,14 @@ mod tests {
     fn describe_answers_parse_by_item_whatever_the_field_order() {
         let xml = r#"<DescribeInstancesResponse><reservationSet><item><instancesSet>
   <item><instanceState><code>16</code><name>running</name></instanceState><instanceLifecycle>spot</instanceLifecycle>
-    <tagSet><item><key>Purpose</key><value>fcvm-fleet-host</value></item></tagSet><instanceId>i-0000000000000000a</instanceId></item>
-  <item><instanceId>i-0000000000000000b</instanceId><instanceState><code>0</code><name>pending</name></instanceState></item>
+    <tagSet><item><key>Purpose</key><value>fcvm-fleet-host</value></item></tagSet><instanceId>i-0123456789abcdef0</instanceId></item>
+  <item><instanceId>i-1234567890abcdef0</instanceId><instanceState><code>0</code><name>pending</name></instanceState></item>
 </instancesSet></item></reservationSet></DescribeInstancesResponse>"#;
         assert_eq!(
             parse_hosts(xml),
             vec![
-                host("i-0000000000000000a", "running", Market::Spot),
-                host("i-0000000000000000b", "pending", Market::OnDemand),
+                host("i-0123456789abcdef0", "running", Market::Spot),
+                host("i-1234567890abcdef0", "pending", Market::OnDemand),
             ]
         );
     }
