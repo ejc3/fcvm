@@ -260,34 +260,44 @@ pub struct FleetCoordArgs {
     #[arg(long)]
     pub max_borrowed: Option<usize>,
 
-    /// A GPU host auto scaling group the coordinator owns (`<region>:<name>`, repeatable).
-    /// With any, the fleet scales them to 0 after --idle-scale-down seconds with no active
-    /// viewer and back to --awake-capacity when one arrives.
-    #[arg(long = "scale-group")]
-    pub scale_groups: Vec<crate::fleet::coord::scale::Group>,
+    /// A GPU host launch template (`<region>:<name>`, repeatable; several in a region are
+    /// one request's pools). With any, the coordinator launches the GPU hosts itself: spot
+    /// first, on demand at once when spot is refused for capacity, and terminates them after
+    /// --idle-scale-down seconds with no active viewer.
+    #[arg(
+        long = "host-template",
+        env = "FLEET_HOST_TEMPLATES",
+        value_delimiter = ','
+    )]
+    pub host_templates: Vec<crate::fleet::coord::hosts::Regional>,
+
+    /// A subnet GPU hosts may launch in (`<region>:<subnet id>`, repeatable); every region
+    /// with a --host-template needs at least one
+    #[arg(
+        long = "host-subnet",
+        env = "FLEET_HOST_SUBNETS",
+        value_delimiter = ','
+    )]
+    pub host_subnets: Vec<crate::fleet::coord::hosts::Regional>,
 
     /// Sleep with no active viewer (no tiles, every VM stopped) and wake for the next one,
-    /// on hosts the coordinator does not scale (a fixed host, a test box). Implied by any
-    /// --scale-group.
+    /// on hosts the coordinator does not launch (a fixed host, a test box). Implied by any
+    /// --host-template.
     #[arg(long)]
     pub sleep_when_idle: bool,
 
-    /// Desired capacity of each scale group while the fleet is awake
+    /// GPU hosts per region while the fleet is awake
     #[arg(long, default_value_t = 1)]
     pub awake_capacity: u32,
 
-    /// An on-demand GPU host auto scaling group (`<region>:<name>`, repeatable), the
-    /// fallback of the --scale-group in its region. It is 0 unless a wake leaves that spot
-    /// group short of --awake-capacity and Auto Scaling reports a failed launch of it, or
-    /// short for --spot-wait seconds; then it takes the shortfall and the spot group is
-    /// held at what it has. Both go to 0 when the fleet sleeps.
-    #[arg(long = "on-demand-group")]
-    pub on_demand_groups: Vec<crate::fleet::coord::scale::Group>,
-
-    /// Seconds a waking spot group may stay short before its on-demand group takes over,
-    /// when Auto Scaling has reported no failed launch of it
-    #[arg(long, default_value_t = 120)]
-    pub spot_wait: u64,
+    /// Most on-demand GPU hosts the fleet runs, all regions together (spot's fallback)
+    #[arg(
+        long,
+        env = "FLEET_HOST_ON_DEMAND_MAX",
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u32).range(0..=8)
+    )]
+    pub host_on_demand_max: u32,
 
     /// Seconds with no active viewer before the fleet scales down
     #[arg(long, default_value_t = 600)]

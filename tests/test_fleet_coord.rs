@@ -2516,41 +2516,26 @@ async fn a_replayed_quarantine_does_not_undo_an_operators_release() {
     assert_eq!(acked(&mut agent, "report-2", 2).await, 1, "a new failure");
 }
 
-/// With scale groups, the fleet scales them to zero after the idle time with no active
-/// viewer (a hidden page does not count), and back up when a viewer's page is visible
-/// again; while it wakes, the groups' instances show in the snapshot.
-#[tokio::test]
-async fn no_active_viewer_scales_the_gpus_to_zero_and_one_wakes_them() {
-    use fcvm::fleet::coord::scale::{FakeScale, Group, PowerConfig};
-    let config = Config {
-        power_managed: true,
-        idle_scale_down_secs: 1,
-        ..Config::default()
-    };
-    let fake = Arc::new(FakeScale::default());
-    *fake.instances.lock().unwrap() = vec![fleet_core::event::ScaleInstance {
-        id: "i-0123456789abcdef0".into(),
-        lifecycle: "Pending".into(),
-    }];
-    let power = PowerConfig {
+/// The coordinator's host launcher over `fake` in `regions`, polling every 50 ms.
+fn host_config(
+    fake: &Arc<fcvm::fleet::coord::hosts::FakeHosts>,
+    regions: &[&str],
+    awake_capacity: u32,
+    on_demand_max: u32,
+) -> fcvm::fleet::coord::hosts::HostConfig {
+    fcvm::fleet::coord::hosts::HostConfig {
         driver: fake.clone(),
-        groups: vec![Group {
-            region: "us-east-1".into(),
-            name: "fleet-hosts".into(),
-        }],
-        awake_capacity: 2,
-        poll: Duration::from_millis(100),
-        on_demand: vec![],
-        spot_wait: Duration::from_secs(120),
-    };
-    let (handle, _actor) = start(
-        State::new(config, now_ms()),
-        None,
-        None,
-        None,
-        Some(power),
-        None,
-    );
+        regions: regions.iter().map(|r| r.to_string()).collect(),
+        awake_capacity,
+        on_demand_max,
+        poll: Duration::from_millis(50),
+        liveness: Duration::from_millis(100),
+        capacity_retry: Duration::from_millis(300),
+    }
+}
+
+/// Serves the page for `handle` and connects one viewer to it.
+async fn page_viewer(handle: &Handle) -> Viewer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/live", listener.local_addr().unwrap());
     let cfg = live::LiveConfig {
@@ -2563,472 +2548,494 @@ async fn no_active_viewer_scales_the_gpus_to_zero_and_one_wakes_them() {
     };
     let h = handle.clone();
     tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
-    let calls = || fake.calls.lock().unwrap().clone();
-    let mut v = Viewer::connect(&url).await;
-    v.until(|s| s["viewers"]["active"] == 1).await;
-    assert_eq!(
-        calls(),
-        vec![("fleet-hosts".to_string(), 2)],
-        "awake at start"
+    Viewer::connect(&url).await
+}
+
+/// Waits until `cond` holds for `fake`, or fails with its calls.
+async fn until_hosts(
+    fake: &Arc<fcvm::fleet::coord::hosts::FakeHosts>,
+    what: &str,
+    cond: impl Fn(&fcvm::fleet::coord::hosts::FakeHosts) -> bool,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !cond(fake) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: calls {:?}",
+            fake.calls()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The launch calls `fake` received, in order.
+fn launches(fake: &fcvm::fleet::coord::hosts::FakeHosts) -> Vec<String> {
+    fake.calls()
+        .into_iter()
+        .filter(|c| c.starts_with("launch "))
+        .collect()
+}
+
+/// The coordinator launches the GPU hosts itself, spot first: awake at start it launches
+/// the awake capacity, with no active viewer it terminates every host, and a viewer's
+/// visible page launches them again. While it wakes, the hosts show in the snapshot.
+#[tokio::test]
+async fn no_active_viewer_terminates_the_gpu_hosts_and_one_launches_them() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let config = Config {
+        power_managed: true,
+        idle_scale_down_secs: 1,
+        ..Config::default()
+    };
+    let fake = Arc::new(FakeHosts::default());
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 2, 8)),
+        None,
     );
+    let mut v = page_viewer(&handle).await;
+    v.until(|s| s["viewers"]["active"] == 1).await;
+    until_hosts(&fake, "awake at start", |f| {
+        f.present("us-east-1").len() == 2
+    })
+    .await;
+    assert_eq!(launches(&fake), vec!["launch us-east-1 spot 2"]);
     v.send(json!({"type": "visibility", "visible": false}))
         .await;
-    let s = v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
-    assert_eq!(s["viewers"]["active"], 0);
-    assert_eq!(s["viewers"]["count"], 1);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while calls().len() < 2 {
-        assert!(std::time::Instant::now() < deadline, "{:?}", calls());
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(calls()[1], ("fleet-hosts".to_string(), 0));
+    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    until_hosts(&fake, "asleep", |f| f.present("us-east-1").is_empty()).await;
     v.send(json!({"type": "visibility", "visible": true})).await;
     let s = v
         .until(|s| {
             s["fleet"]["power"]["state"] == "waking"
-                && s["fleet"]["power"]["hosts"][0]["phases"][0]["phase"] == "instance_pending"
+                && s["fleet"]["power"]["hosts"]
+                    .as_array()
+                    .is_some_and(|h| h.len() == 2)
         })
         .await;
+    for h in s["fleet"]["power"]["hosts"].as_array().unwrap() {
+        assert!(h["host"].as_str().unwrap().starts_with("i-"), "{s}");
+        assert_eq!(h["phases"][0]["phase"], "instance_pending", "{s}");
+    }
     assert_eq!(
-        s["fleet"]["power"]["hosts"][0]["host"],
-        "i-0123456789abcdef0"
+        launches(&fake),
+        vec!["launch us-east-1 spot 2", "launch us-east-1 spot 2"]
     );
-    assert!(s["fleet"]["power"]["woke_at"].is_u64());
-    assert_eq!(calls()[2], ("fleet-hosts".to_string(), 2));
 }
 
-/// A wake that leaves the spot group with no instance for the spot wait moves the
-/// shortfall to the on-demand group and holds the spot group at what it has; sleeping sets
-/// both to zero, and the next wake asks spot first again.
+/// A spot request EC2 refuses for capacity is followed by the on-demand request in the
+/// same pass: no list or wait comes between them (the Auto Scaling path waited for a failed
+/// activity, then for the next poll). The next wake asks spot first again.
 #[tokio::test]
-async fn a_spot_group_short_after_the_wait_falls_back_to_on_demand_and_sleeps_to_zero() {
-    use fcvm::fleet::coord::scale::{FakeScale, Group, PowerConfig};
+async fn a_refused_spot_launch_launches_on_demand_in_the_same_pass() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Market};
     let config = Config {
         power_managed: true,
         idle_scale_down_secs: 1,
         ..Config::default()
     };
-    let fake = Arc::new(FakeScale::default());
-    let spot = Group {
-        region: "us-east-1".into(),
-        name: "fleet-hosts".into(),
-    };
-    let od = Group {
-        region: "us-east-1".into(),
-        name: "fleet-hosts-on-demand".into(),
-    };
-    let power = PowerConfig {
-        driver: fake.clone(),
-        groups: vec![spot],
-        awake_capacity: 1,
-        poll: Duration::from_millis(50),
-        on_demand: vec![Some(od)],
-        spot_wait: Duration::from_millis(300),
-    };
-    fake.by_group.lock().unwrap().insert(
-        "fleet-hosts".into(),
-        vec![fleet_core::event::ScaleInstance {
-            id: "i-1234567890abcdef0".into(),
-            lifecycle: "InService".into(),
-        }],
-    );
+    let fake = Arc::new(FakeHosts::default());
+    fake.capacity
+        .lock()
+        .unwrap()
+        .insert(("us-east-1".into(), Market::Spot), 0);
     let (handle, _actor) = start(
         State::new(config, now_ms()),
         None,
         None,
         None,
-        Some(power),
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
         None,
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/live", listener.local_addr().unwrap());
-    let cfg = live::LiveConfig {
-        checker: allow_all(),
-        allowed_origins: vec![],
-        verifier: Arc::new(turnstile::Off),
-        trust_cf_connecting_ip: false,
-        turnstile_site_key: None,
-        poster: Arc::new(poster::Poster::default()),
-    };
-    let h = handle.clone();
-    tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
-    let calls = || fake.calls.lock().unwrap().clone();
-    let wait_for = |n: usize| {
-        let fake = fake.clone();
-        async move {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while fake.calls.lock().unwrap().len() < n {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "{:?}",
-                    fake.calls.lock().unwrap()
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }
-    };
-    let c = |g: &str, d: u32| (g.to_string(), d);
-    let mut v = Viewer::connect(&url).await;
+    let mut v = page_viewer(&handle).await;
     v.until(|s| s["viewers"]["active"] == 1).await;
-    // Awake at start with the spot host in service: the spot group only; the on-demand
-    // group is not raised.
-    assert_eq!(calls(), vec![c("fleet-hosts", 1)]);
-    v.send(json!({"type": "visibility", "visible": false}))
-        .await;
-    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
-    wait_for(3).await;
+    until_hosts(&fake, "on-demand host", |f| {
+        f.present("us-east-1").len() == 1
+    })
+    .await;
+    let calls = fake.calls();
+    let spot = calls
+        .iter()
+        .position(|c| c == "launch us-east-1 spot 1")
+        .expect("spot asked first");
     assert_eq!(
-        calls()[1..3],
-        [c("fleet-hosts", 0), c("fleet-hosts-on-demand", 0)]
+        calls[spot + 1],
+        "launch us-east-1 on-demand 1",
+        "the on-demand launch did not follow the refusal at once: {calls:?}"
     );
-    // Asleep, the spot host is gone, and spot has no capacity for the next wake.
-    fake.by_group.lock().unwrap().remove("fleet-hosts");
-    // Wake with no spot capacity: after the wait, on-demand takes the one host.
-    v.send(json!({"type": "visibility", "visible": true})).await;
-    wait_for(6).await;
-    assert_eq!(
-        calls()[3..6],
-        [
-            c("fleet-hosts", 1),
-            c("fleet-hosts-on-demand", 1),
-            c("fleet-hosts", 0)
-        ]
-    );
-    // The on-demand host shows on the page and nothing more is launched.
-    fake.by_group.lock().unwrap().insert(
-        "fleet-hosts-on-demand".into(),
-        vec![fleet_core::event::ScaleInstance {
-            id: "i-0123456789abcdef0".into(),
-            lifecycle: "Pending".into(),
-        }],
-    );
-    v.until(|s| s["fleet"]["power"]["hosts"][0]["host"] == "i-0123456789abcdef0")
-        .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(calls().len(), 6, "{:?}", calls());
-    // Sleep: both groups to zero.
-    v.send(json!({"type": "visibility", "visible": false}))
-        .await;
-    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
-    wait_for(8).await;
-    assert_eq!(
-        calls()[6..8],
-        [c("fleet-hosts", 0), c("fleet-hosts-on-demand", 0)]
-    );
-}
-
-fn fallback_power(
-    fake: &Arc<fcvm::fleet::coord::scale::FakeScale>,
-    spot_wait: Duration,
-) -> fcvm::fleet::coord::scale::PowerConfig {
-    use fcvm::fleet::coord::scale::{Group, PowerConfig};
-    PowerConfig {
-        driver: fake.clone(),
-        groups: vec![Group {
-            region: "us-east-1".into(),
-            name: "fleet-hosts".into(),
-        }],
-        awake_capacity: 1,
-        poll: Duration::from_millis(50),
-        on_demand: vec![Some(Group {
-            region: "us-east-1".into(),
-            name: "fleet-hosts-on-demand".into(),
-        })],
-        spot_wait,
-    }
-}
-
-/// Waits until `fake`'s desired capacities hold `want` for every group named there.
-async fn until_desired(
-    fake: &Arc<fcvm::fleet::coord::scale::FakeScale>,
-    want: &[(&str, u32)],
-    within: Duration,
-) {
-    let deadline = std::time::Instant::now() + within;
-    loop {
-        let d = fake.desired.lock().unwrap().clone();
-        if want.iter().all(|(g, n)| d.get(*g) == Some(n)) {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "desired {d:?} after {within:?}, calls {:?}",
-            fake.calls.lock().unwrap()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-/// Auto Scaling reports a refused spot launch as a failed activity about 10 s after the
-/// desired capacity is raised, and then keeps retrying spot on its own. The coordinator
-/// falls back on that report at its next poll instead of waiting out --spot-wait (120 s on
-/// staging), and an activity from before the wake does not count.
-#[tokio::test]
-async fn a_failed_spot_launch_falls_back_to_on_demand_without_waiting() {
-    use fcvm::fleet::coord::scale::FakeScale;
-    let fake = Arc::new(FakeScale::default());
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    // An old failure (a previous wake's) changes nothing.
-    fake.failed.lock().unwrap().insert(
-        "fleet-hosts".into(),
-        vec![(
-            now - 3_600_000,
-            "Could not launch Spot Instances. UnfulfillableCapacity".into(),
-        )],
-    );
-    let (_handle, _actor) = start(
-        State::new(Config::default(), now_ms()),
-        None,
-        None,
-        None,
-        Some(fallback_power(&fake, Duration::from_secs(60))),
-        None,
-    );
-    until_desired(&fake, &[("fleet-hosts", 1)], Duration::from_secs(5)).await;
+    assert_eq!(fake.present("us-east-1")[0].market, Market::OnDemand);
+    // Running: nothing more is launched.
+    fake.set_state("us-east-1", "pending", "running");
     tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(launches(&fake).len(), 2, "{:?}", fake.calls());
+    // Sleep, then wake with spot capacity: spot first again, no on-demand.
+    v.send(json!({"type": "visibility", "visible": false}))
+        .await;
+    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    until_hosts(&fake, "asleep", |f| f.present("us-east-1").is_empty()).await;
+    fake.capacity.lock().unwrap().clear();
+    v.send(json!({"type": "visibility", "visible": true})).await;
+    until_hosts(&fake, "spot host", |f| f.present("us-east-1").len() == 1).await;
     assert_eq!(
-        fake.desired
+        launches(&fake)[2..],
+        ["launch us-east-1 spot 1".to_string()]
+    );
+}
+
+/// The fleet never runs more on-demand hosts than the cap, all regions together: with
+/// spot refused in two regions and a cap of 1, one region gets an on-demand host and the
+/// other waits for capacity (asking spot again, never on demand).
+#[tokio::test]
+async fn on_demand_hosts_stay_within_the_cap_across_regions() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Market};
+    let fake = Arc::new(FakeHosts::default());
+    for r in ["us-east-1", "us-east-2"] {
+        fake.capacity
             .lock()
             .unwrap()
-            .get("fleet-hosts-on-demand")
-            .copied()
-            .unwrap_or(0),
-        0,
-        "fell back on a failure from before the wake: {:?}",
-        fake.calls.lock().unwrap()
-    );
-    // This wake's spot launch fails.
-    fake.failed
-        .lock()
-        .unwrap()
-        .get_mut("fleet-hosts")
-        .unwrap()
-        .insert(
-            0,
-            (
-                now + 1,
-                "Could not launch Spot Instances. MaxSpotInstanceCountExceeded".into(),
-            ),
-        );
-    until_desired(
-        &fake,
-        &[("fleet-hosts", 0), ("fleet-hosts-on-demand", 1)],
-        Duration::from_secs(5),
-    )
-    .await;
-}
-
-/// The EC2 half can make the fleet awake before the GPU hosts are up (53 s into the
-/// staging wake of 2026-10-25). A spot group still short then falls back after the spot
-/// wait all the same; the groups are watched until they hold the awake capacity in service,
-/// not only while the fleet is waking.
-#[tokio::test]
-async fn a_spot_group_still_short_once_the_fleet_is_awake_falls_back() {
-    use fcvm::fleet::coord::scale::FakeScale;
-    let fake = Arc::new(FakeScale::default());
-    // State::new starts awake: the EC2 half is up, the spot group has nothing.
+            .insert((r.into(), Market::Spot), 0);
+    }
     let (_handle, _actor) = start(
         State::new(Config::default(), now_ms()),
         None,
         None,
         None,
-        Some(fallback_power(&fake, Duration::from_millis(300))),
+        Some(host_config(&fake, &["us-east-1", "us-east-2"], 1, 1)),
         None,
     );
-    until_desired(
-        &fake,
-        &[("fleet-hosts", 0), ("fleet-hosts-on-demand", 1)],
-        Duration::from_secs(5),
-    )
+    until_hosts(&fake, "one on-demand host", |f| {
+        f.present("us-east-1").len() + f.present("us-east-2").len() == 1
+    })
     .await;
-    // The on-demand host comes up: the groups are no longer watched, and nothing more is set.
-    fake.by_group.lock().unwrap().insert(
-        "fleet-hosts-on-demand".into(),
-        vec![fleet_core::event::ScaleInstance {
+    // Past several capacity retries.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let od: Vec<String> = launches(&fake)
+        .into_iter()
+        .filter(|c| c.contains("on-demand"))
+        .collect();
+    assert_eq!(od.len(), 1, "{:?}", fake.calls());
+    assert_eq!(
+        fake.present("us-east-1").len() + fake.present("us-east-2").len(),
+        1
+    );
+    assert!(
+        launches(&fake)
+            .iter()
+            .filter(|c| c.starts_with("launch us-east-2 spot"))
+            .count()
+            >= 2,
+        "the short region did not ask spot again: {:?}",
+        fake.calls()
+    );
+}
+
+/// A region that cannot be listed leaves the fleet's on-demand hosts uncounted, so no region
+/// falls back to on demand until it can be: the cap fails closed.
+#[tokio::test]
+async fn an_uncounted_region_holds_back_the_on_demand_fallback() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Market};
+    let fake = Arc::new(FakeHosts::default());
+    fake.capacity
+        .lock()
+        .unwrap()
+        .insert(("us-east-1".into(), Market::Spot), 0);
+    fake.fail_lists
+        .lock()
+        .unwrap()
+        .insert("us-east-2".into(), 3);
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1", "us-east-2"], 1, 8)),
+        None,
+    );
+    until_hosts(&fake, "us-east-2 listed", |f| {
+        f.fail_lists.lock().unwrap()["us-east-2"] == 0 && !f.present("us-east-2").is_empty()
+    })
+    .await;
+    let calls = fake.calls();
+    let first_od = calls
+        .iter()
+        .position(|c| c == "launch us-east-1 on-demand 1")
+        .expect("on demand once both regions are counted");
+    let listed_ok = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| *c == "list us-east-2")
+        .map(|(i, _)| i)
+        .nth(3)
+        .expect("a fourth list of us-east-2");
+    assert!(
+        first_od > listed_ok,
+        "on demand launched while us-east-2 was uncounted: {calls:?}"
+    );
+}
+
+/// A host that is reclaimed (spot) or terminated while the fleet is awake is replaced.
+#[tokio::test]
+async fn a_reclaimed_host_is_replaced() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let fake = Arc::new(FakeHosts::default());
+    *fake.launch_state.lock().unwrap() = Some("running".into());
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    until_hosts(&fake, "first host", |f| f.present("us-east-1").len() == 1).await;
+    fake.set_state("us-east-1", "running", "terminated");
+    until_hosts(&fake, "replacement", |f| f.present("us-east-1").len() == 1).await;
+    assert_eq!(launches(&fake).len(), 2, "{:?}", fake.calls());
+}
+
+/// A launch whose answer is lost (EC2 launched, the reply never came) is asked again with
+/// the same token, so EC2 answers with the instance it launched and no second host starts,
+/// although no list names the first one yet.
+#[tokio::test]
+async fn a_launch_whose_answer_is_lost_is_asked_again_with_its_token() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let fake = Arc::new(FakeHosts::default());
+    *fake.ambiguous.lock().unwrap() = 1;
+    *fake.hide_new.lock().unwrap() = Some((0, 4));
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    until_hosts(&fake, "asked again", |f| launches(f).len() >= 2).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Every instance ever launched, terminated ones included: a second one would be
+    // terminated as excess once both are listed, so the present count cannot tell.
+    let launched = fake.hosts.lock().unwrap()["us-east-1"].len();
+    assert_eq!(
+        launched,
+        1,
+        "a second host for one shortfall: {:?}",
+        fake.calls()
+    );
+}
+
+/// An on-demand launch whose answer is lost counts against the fleet-wide cap until its
+/// retry answers: with a cap of 1 and spot refused in two regions, the second region does
+/// not launch on demand beside a host the first may have.
+#[tokio::test]
+async fn a_lost_on_demand_launch_holds_its_place_under_the_cap() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Market};
+    let fake = Arc::new(FakeHosts::default());
+    for r in ["us-east-1", "us-east-2"] {
+        fake.capacity
+            .lock()
+            .unwrap()
+            .insert((r.into(), Market::Spot), 0);
+    }
+    *fake.ambiguous.lock().unwrap() = 1;
+    *fake.hide_new.lock().unwrap() = Some((0, 4));
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1", "us-east-2"], 1, 1)),
+        None,
+    );
+    until_hosts(&fake, "an on-demand launch", |f| {
+        launches(f).iter().any(|c| c.contains("on-demand"))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let hosts = fake.hosts.lock().unwrap().clone();
+    let od = hosts
+        .values()
+        .flatten()
+        .filter(|h| h.market == Market::OnDemand)
+        .count();
+    assert_eq!(
+        od,
+        1,
+        "on-demand instances over the cap: {:?}",
+        fake.calls()
+    );
+}
+
+/// A lost launch's host can fill its region before a later list omits it. The recovered
+/// host still has visibility protection, so this never creates a second instance.
+#[tokio::test]
+async fn a_lost_launch_whose_host_is_listed_stays_protected_from_later_omissions() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let fake = Arc::new(FakeHosts::default());
+    *fake.ambiguous.lock().unwrap() = 1;
+    *fake.launch_state.lock().unwrap() = Some("running".into());
+    *fake.hide_new.lock().unwrap() = Some((1, 4));
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    until_hosts(&fake, "past the omitted recovered-host lists", |f| {
+        f.calls().iter().filter(|c| c.starts_with("list ")).count() >= 8
+    })
+    .await;
+    // Include terminated instances: a duplicate may already have been removed as excess.
+    let launched = fake.hosts.lock().unwrap()["us-east-1"].len();
+    assert_eq!(launched, 1, "{:?}", fake.calls());
+}
+
+/// A lost on-demand launch whose host the next list shows releases its reservation: the
+/// region is full, its token is dropped, and the host is counted once. With a cap of 2, the
+/// other region still gets an on-demand host when its spot host is reclaimed and spot is
+/// refused.
+#[tokio::test]
+async fn a_lost_launch_whose_host_is_listed_releases_its_reservation() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Market};
+    let fake = Arc::new(FakeHosts::default());
+    fake.capacity.lock().unwrap().extend([
+        (("us-east-1".to_string(), Market::Spot), 0),
+        (("us-east-2".to_string(), Market::Spot), 1),
+    ]);
+    *fake.ambiguous.lock().unwrap() = 1;
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1", "us-east-2"], 1, 2)),
+        None,
+    );
+    until_hosts(&fake, "a host in each region", |f| {
+        f.present("us-east-1").len() == 1 && f.present("us-east-2").len() == 1
+    })
+    .await;
+    // Past the pass that lists the lost launch's host.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    fake.set_state("us-east-2", "pending", "terminated");
+    until_hosts(&fake, "an on-demand host in us-east-2", |f| {
+        f.present("us-east-2")
+            .iter()
+            .any(|h| h.market == Market::OnDemand)
+    })
+    .await;
+}
+
+/// A lost launch that launched part of its count is asked again with its token, and the
+/// instances its answer names that the list already shows are not counted twice: only the
+/// one host still missing falls back to on demand.
+#[tokio::test]
+async fn a_lost_partial_launch_counts_its_listed_hosts_once() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Market};
+    let fake = Arc::new(FakeHosts::default());
+    fake.capacity
+        .lock()
+        .unwrap()
+        .insert(("us-east-1".into(), Market::Spot), 2);
+    *fake.ambiguous.lock().unwrap() = 1;
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 3, 8)),
+        None,
+    );
+    until_hosts(&fake, "three hosts", |f| f.present("us-east-1").len() == 3).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let hosts = fake.hosts.lock().unwrap()["us-east-1"].clone();
+    let count = |m: Market| hosts.iter().filter(|h| h.market == m).count();
+    assert_eq!(
+        (count(Market::Spot), count(Market::OnDemand)),
+        (2, 1),
+        "{:?}",
+        fake.calls()
+    );
+}
+
+/// A list can name a new host and the next one leave it out (DescribeInstances is eventually
+/// consistent): the host still counts, and no second one is launched.
+#[tokio::test]
+async fn a_host_a_later_list_leaves_out_is_not_launched_again() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let fake = Arc::new(FakeHosts::default());
+    *fake.hide_new.lock().unwrap() = Some((1, 4));
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    until_hosts(&fake, "launched", |f| !launches(f).is_empty()).await;
+    // Past the one list that names it, the four that leave it out, and more.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(launches(&fake).len(), 1, "{:?}", fake.calls());
+    assert_eq!(fake.present("us-east-1").len(), 1);
+}
+
+/// A running host remains protected when a later list omits it during the launch grace.
+#[tokio::test]
+async fn a_running_host_a_later_list_leaves_out_is_not_launched_again() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let fake = Arc::new(FakeHosts::default());
+    *fake.launch_state.lock().unwrap() = Some("running".into());
+    *fake.hide_new.lock().unwrap() = Some((1, 4));
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    // One visible list, four omitted lists, and subsequent visible lists have all run.
+    until_hosts(&fake, "past the omitted running-host lists", |f| {
+        f.calls().iter().filter(|c| c.starts_with("list ")).count() >= 8
+    })
+    .await;
+    assert_eq!(launches(&fake).len(), 1, "{:?}", fake.calls());
+    assert_eq!(fake.present("us-east-1").len(), 1);
+}
+
+/// A coordinator that restarts keeps the hosts it finds (an on-demand fallback from before
+/// the restart included): nothing is launched beside them.
+#[tokio::test]
+async fn a_restart_keeps_the_hosts_it_finds() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Host, Market};
+    let fake = Arc::new(FakeHosts::default());
+    fake.hosts.lock().unwrap().insert(
+        "us-east-1".into(),
+        vec![Host {
             id: "i-0123456789abcdef0".into(),
-            lifecycle: "InService".into(),
+            state: "running".into(),
+            market: Market::OnDemand,
         }],
     );
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let n = fake.calls.lock().unwrap().len();
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(
-        fake.calls.lock().unwrap().len(),
-        n,
-        "{:?}",
-        fake.calls.lock().unwrap()
-    );
-}
-
-/// A coordinator that restarts while a fallback is in force (the on-demand group holds a
-/// host) keeps that split: it reads the groups' desired capacity first and never raises
-/// the spot group beside the on-demand host.
-#[tokio::test]
-async fn a_restart_keeps_an_on_demand_fallback_instead_of_raising_spot_beside_it() {
-    use fcvm::fleet::coord::scale::FakeScale;
-    let fake = Arc::new(FakeScale::default());
-    fake.desired.lock().unwrap().extend([
-        ("fleet-hosts".to_string(), 0),
-        ("fleet-hosts-on-demand".to_string(), 1),
-    ]);
-    // The fleet resumes awake (a viewer is watching the on-demand host's tiles).
     let (_handle, _actor) = start(
         State::new(Config::default(), now_ms()),
         None,
         None,
         None,
-        Some(fallback_power(&fake, Duration::from_secs(120))),
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
         None,
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while fake.calls.lock().unwrap().len() < 2 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{:?}",
-            fake.calls.lock().unwrap()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let calls = fake.calls.lock().unwrap().clone();
-    assert!(
-        !calls.contains(&("fleet-hosts".to_string(), 1)),
-        "spot raised beside the on-demand host: {calls:?}"
-    );
-    let desired = fake.desired.lock().unwrap().clone();
-    assert_eq!(desired["fleet-hosts"], 0, "{calls:?}");
-    assert_eq!(desired["fleet-hosts-on-demand"], 1, "{calls:?}");
-}
-
-/// A fallback whose spot write fails is retried until both groups hold their split, and
-/// the coordinator stops reporting `scale` degraded once it is.
-#[tokio::test]
-async fn a_failed_fallback_write_is_retried_and_clears_the_degraded_scale() {
-    use fcvm::fleet::coord::scale::FakeScale;
-    let fake = Arc::new(FakeScale::default());
-    fake.fail_sets.lock().unwrap().extend([
-        ("fleet-hosts".to_string(), 0),
-        ("fleet-hosts".to_string(), 0),
-    ]);
-    let mut state = State::new(Config::default(), now_ms());
-    state.fleet.power.state = "waking".into();
-    let (handle, _actor) = start(
-        state,
-        None,
-        None,
-        None,
-        Some(fallback_power(&fake, Duration::from_millis(200))),
-        None,
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/live", listener.local_addr().unwrap());
-    let cfg = live::LiveConfig {
-        checker: allow_all(),
-        allowed_origins: vec![],
-        verifier: Arc::new(turnstile::Off),
-        trust_cf_connecting_ip: false,
-        turnstile_site_key: None,
-        poster: Arc::new(poster::Poster::default()),
-    };
-    let h = handle.clone();
-    tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let d = fake.desired.lock().unwrap().clone();
-        if d.get("fleet-hosts") == Some(&0) && d.get("fleet-hosts-on-demand") == Some(&1) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{:?}",
-            fake.calls.lock().unwrap()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(
-        fake.fail_sets.lock().unwrap().is_empty(),
-        "both failures injected"
-    );
-    let scale_degraded = |s: &serde_json::Value| {
-        s["failures"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|f| f["kind"] == "coordinator_degraded" && f["component"] == "scale")
-    };
-    let mut v = Viewer::connect(&url).await;
-    let s = tokio::time::timeout(Duration::from_secs(5), v.until(|s| !scale_degraded(s)))
-        .await
-        .expect("scale still degraded 5 s after the fallback was applied");
-    assert!(!scale_degraded(&s));
-}
-
-/// A sleep whose on-demand write fails after the spot group went to 0, followed by a wake
-/// before the retry, still raises the spot group: a half-done transition is not taken
-/// for the target it was heading to.
-#[tokio::test]
-async fn a_wake_after_a_half_done_sleep_raises_the_spot_group_again() {
-    use fcvm::fleet::coord::scale::FakeScale;
-    let config = Config {
-        power_managed: true,
-        idle_scale_down_secs: 1,
-        ..Config::default()
-    };
-    let fake = Arc::new(FakeScale::default());
-    fake.fail_sets
-        .lock()
-        .unwrap()
-        .push(("fleet-hosts-on-demand".to_string(), 0));
-    let mut power = fallback_power(&fake, Duration::from_secs(120));
-    // No retry before the wake below.
-    power.poll = Duration::from_secs(30);
-    let (handle, _actor) = start(
-        State::new(config, now_ms()),
-        None,
-        None,
-        None,
-        Some(power),
-        None,
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/live", listener.local_addr().unwrap());
-    let cfg = live::LiveConfig {
-        checker: allow_all(),
-        allowed_origins: vec![],
-        verifier: Arc::new(turnstile::Off),
-        trust_cf_connecting_ip: false,
-        turnstile_site_key: None,
-        poster: Arc::new(poster::Poster::default()),
-    };
-    let h = handle.clone();
-    tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
-    let mut v = Viewer::connect(&url).await;
-    v.until(|s| s["viewers"]["active"] == 1).await;
-    v.send(json!({"type": "visibility", "visible": false}))
-        .await;
-    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !fake.fail_sets.lock().unwrap().is_empty() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the sleep never tried the on-demand group"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(fake.desired.lock().unwrap()["fleet-hosts"], 0);
-    v.send(json!({"type": "visibility", "visible": true})).await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while fake.desired.lock().unwrap()["fleet-hosts"] != 1 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "spot left at 0 after the wake: {:?}",
-            fake.calls.lock().unwrap()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    until_hosts(&fake, "listed", |f| {
+        f.calls().iter().filter(|c| c.starts_with("list")).count() >= 3
+    })
+    .await;
+    assert!(launches(&fake).is_empty(), "{:?}", fake.calls());
+    assert_eq!(fake.present("us-east-1").len(), 1);
 }
 
 /// No poster is taken while tiles are starting or a race relaunches them: their regions
@@ -3416,6 +3423,15 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
                     "DescribeInstances" if api.gone.contains(&params["InstanceId.1"]) => (StatusCode::OK, format!("<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>{}</instanceId><instanceState><code>48</code><name>terminated</name></instanceState></item></instancesSet></item></reservationSet></DescribeInstancesResponse>", params["InstanceId.1"])),
                     "DescribeInstances" => (StatusCode::OK, "<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>i-0123456789abcdef0</instanceId><instanceState><code>16</code><name>running</name></instanceState><ipAddress>127.0.0.1</ipAddress><ipv6Address>2001:db8::5</ipv6Address></item></instancesSet></item></reservationSet></DescribeInstancesResponse>".into()),
                     "TerminateInstances" => (StatusCode::OK, "<TerminateInstancesResponse/>".into()),
+                    // An instant EC2 Fleet: spot is refused per pool where the region has no spot
+                    // capacity (a 200 with an errorSet, as EC2 answers it); on demand launches.
+                    "CreateFleet" => {
+                        let spot = params["TargetCapacitySpecification.DefaultTargetCapacityType"] == "spot";
+                        if spot && !api.spot_capacity.contains(&region) {
+                            return (StatusCode::OK, "<CreateFleetResponse><fleetId>fleet-0</fleetId><errorSet><item><lifecycle>spot</lifecycle><errorCode>UnfulfillableCapacity</errorCode><errorMessage>Unable to fulfill capacity due to your request configuration.</errorMessage></item></errorSet><fleetInstanceSet/></CreateFleetResponse>".into());
+                        }
+                        (StatusCode::OK, "<CreateFleetResponse><fleetId>fleet-1</fleetId><fleetInstanceSet><item><instanceIds><item>i-0fedcba9876543210</item></instanceIds></item></fleetInstanceSet></CreateFleetResponse>".into())
+                    }
                     _ => error("InvalidAction"),
                 }
             },
@@ -3425,6 +3441,70 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
     let base = format!("http://{}", l.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
     base
+}
+
+/// The host driver asks EC2 Fleet for every template and subnet of the region at once, reads a
+/// spot refusal for capacity out of the answer's errorSet (EC2 answers 200), and an on-demand
+/// request launches; the fleet's hosts are listed by their tags.
+#[tokio::test]
+async fn the_aws_host_driver_launches_through_an_instant_fleet() {
+    use fcvm::fleet::coord::hosts::{AwsHosts, HostDriver, Market};
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let api = FakeEc2Api {
+        tagged: [(
+            "us-east-1".to_string(),
+            vec!["i-0123456789abcdef0".to_string()],
+        )]
+        .into(),
+        ..Default::default()
+    };
+    let base = fake_ec2_api(api.clone()).await;
+    let mut d = AwsHosts::new(
+        &["us-east-1:fcvm-fleet-host-x86_64".parse().unwrap()],
+        &[
+            "us-east-1:subnet-0000000000000000a".parse().unwrap(),
+            "us-east-1:subnet-0000000000000000b".parse().unwrap(),
+        ],
+        "stage".into(),
+    )
+    .unwrap();
+    d.endpoints.insert("us-east-1".into(), base);
+    let spot = d
+        .launch("us-east-1", Market::Spot, 1, "token-spot")
+        .await
+        .unwrap();
+    assert!(spot.ids.is_empty(), "{spot:?}");
+    assert_eq!(spot.refused.len(), 1, "{spot:?}");
+    assert!(spot.refused[0].starts_with("UnfulfillableCapacity: "));
+    let od = d
+        .launch("us-east-1", Market::OnDemand, 1, "token-od")
+        .await
+        .unwrap();
+    assert_eq!(od.ids, vec!["i-0fedcba9876543210".to_string()]);
+    let calls = api.calls.lock().unwrap().clone();
+    let (region, p) = &calls[0];
+    assert_eq!(region, "us-east-1");
+    assert_eq!(p["Action"], "CreateFleet");
+    assert_eq!(p["ClientToken"], "token-spot");
+    assert_eq!(p["Type"], "instant");
+    assert_eq!(
+        p["LaunchTemplateConfigs.1.LaunchTemplateSpecification.LaunchTemplateName"],
+        "fcvm-fleet-host-x86_64"
+    );
+    assert_eq!(
+        p["LaunchTemplateConfigs.1.Overrides.2.SubnetId"],
+        "subnet-0000000000000000b"
+    );
+    assert_eq!(p["TagSpecification.1.Tag.2.Value"], "fcvm-fleet-host");
+    let hosts = d.hosts("us-east-1").await.unwrap();
+    assert_eq!(hosts.len(), 1);
+    assert_eq!(hosts[0].id, "i-0123456789abcdef0");
+    let list = &api.calls.lock().unwrap()[2].1;
+    assert_eq!(list["Filter.1.Value.1"], "fcvm-fleet-host");
+    assert_eq!(list["Filter.2.Value.1"], "stage");
+    // A template with no subnet in its region is refused at start.
+    assert!(AwsHosts::new(&["us-east-1:t".parse().unwrap()], &[], "stage".into()).is_err());
 }
 
 /// `alive` reads the instance's state and asks its renderer: a running tile whose renderer

@@ -82,7 +82,7 @@ pub enum Event {
         at: u64,
         report: crate::protocol::HealthReport,
     },
-    /// The GPU hosts' auto scaling groups, polled while the fleet wakes.
+    /// The GPU hosts' instances, listed while the fleet wakes.
     ScaleInstances {
         at: u64,
         instances: Vec<ScaleInstance>,
@@ -96,11 +96,11 @@ pub enum Event {
     },
 }
 
-/// One instance in a GPU host auto scaling group.
+/// One GPU host instance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScaleInstance {
     pub id: String,
-    /// The group's lifecycle state (`Pending`, `InService`, ...).
+    /// Its lifecycle state: `Pending`, `InService` (EC2 `running`), `Terminating`, ...
     pub lifecycle: String,
 }
 

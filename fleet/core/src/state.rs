@@ -49,7 +49,7 @@ pub struct Config {
     /// (rounded up), whichever is smaller.
     #[serde(default)]
     pub max_borrowed: Option<usize>,
-    /// The coordinator can scale the GPU hosts (it has auto scaling groups to set): the
+    /// The coordinator launches and terminates the GPU hosts (or was told to sleep): the
     /// fleet sleeps after `idle_scale_down_secs` with no active viewer and wakes on one.
     #[serde(default)]
     pub power_managed: bool,
@@ -68,7 +68,7 @@ fn ten_minutes() -> u64 {
 /// One GPU host's way back up while the fleet wakes, by its EC2 instance id.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct HostWake {
-    /// The auto scaling group reported it pending, then in service.
+    /// EC2 reported it pending, then running.
     pub pending_at: Option<u64>,
     pub booted_at: Option<u64>,
     /// The host marked its store ready (reported in the agent's hello).
