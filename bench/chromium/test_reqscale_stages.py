@@ -108,6 +108,7 @@ class Listen(Fixture):
         one, two = out["listen"][1.0], out["listen"][2.0]
         self.assertEqual(one["tls"]["accepts"], 50)
         self.assertEqual(one["tls"]["accept_busy_max_second"], 0.9)
+        self.assertEqual(one["tls"]["accept_ms_mean"], 24.0)
         self.assertEqual(one["tls"]["request_ms_mean"], 3.0)
         self.assertEqual(one["tls"]["thread_start_ms_mean"], 1.0)
         self.assertEqual(one["tls"]["accept_ms_max"], 80.0)

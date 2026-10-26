@@ -110,6 +110,8 @@ def summarize_listen(rows, windows, offset_ns):
                 "accept_errors": sum(r["accept_errors"] for r in mine),
                 "accept_busy_mean": round(sum(r["accept_ms_sum"] for r in mine) / (seconds * 1000.0), 4),
                 "accept_busy_max_second": max(busy),
+                "accept_ms_mean": round(sum(r["accept_ms_sum"] for r in mine)
+                                        / max(1, sum(r["accepts"] for r in mine)), 3),
                 "accept_ms_max": max(r["accept_ms_max"] for r in mine),
                 "handshakes_in_handler": sum(r["handshakes"] for r in mine),
                 "handshake_ms_max": max(r["handshake_ms_max"] for r in mine),
