@@ -817,23 +817,32 @@ impl MountRedirects {
     }
 }
 
-/// Whether a failed step on a kept directory (`MountRedirects::keep`) means only that the
-/// directory is gone, so the VMM starts without it. Another VM's teardown can remove its
-/// directory after the view was listed: before the directory is opened (`open` fails),
-/// or after it is opened and before it is bound, when the bind of the now unlinked
-/// directory fails with ENOENT. Measured in parallel clone runs before this was
-/// tolerated: a restore failed to spawn its VMM in 2 of 4 runs of the 40 clone tests.
-fn kept_entry_is_gone(optional: bool, error: nix::errno::Errno) -> bool {
-    optional && error == nix::errno::Errno::ENOENT
+/// Whether a failed step on a kept entry (`MountRedirects::keep`, `keep_files`) means
+/// only that the VMM cannot have that entry, so it starts without it. Two causes:
+///
+/// - Another VM's teardown can remove its directory after the view was listed: before
+///   it is opened (`open` fails), or after it is opened and before it is bound, when the
+///   bind of the now unlinked directory fails with ENOENT. Measured in parallel clone
+///   runs before this was tolerated: a restore failed to spawn its VMM in 2 of 4 runs of
+///   the 40 clone tests.
+/// - An entry this VMM may not enter, such as a root-owned 0700 directory seen from a
+///   rootless clone's user namespace: `open(O_PATH)` succeeds, and `fchdir` or the bind
+///   fails with EACCES or EPERM. The VMM could not open anything under it anyway.
+///
+/// A pair is never skipped: its failure stops the VMM.
+fn skip_kept_entry(optional: bool, error: nix::errno::Errno) -> bool {
+    use nix::errno::Errno;
+    optional && matches!(error, Errno::ENOENT | Errno::EACCES | Errno::EPERM)
 }
 
-/// The bind flags for a pair, or for a kept directory (`optional`). A kept directory is
-/// bound with its submounts (MS_REC): the tmpfs over the view hides the host's mount
-/// tree under it, so a disk on a mount below another VM's directory would otherwise be
-/// gone. A pair's source is a clone directory fcvm made and stays a plain bind.
-fn redirect_bind_flags(optional: bool) -> nix::mount::MsFlags {
+/// The bind flags for a redirect, or for a directory bound onto itself (`onto_itself`: a
+/// kept directory, or a pair whose mountpoint is its source). A directory bound onto
+/// itself carries its submounts (MS_REC): the tmpfs over the view hides the host's mount
+/// tree under it, so a disk on a mount below it would otherwise be gone. A redirect's
+/// source is a clone directory fcvm made and stays a plain bind.
+fn redirect_bind_flags(onto_itself: bool) -> nix::mount::MsFlags {
     use nix::mount::MsFlags;
-    if optional {
+    if onto_itself {
         MsFlags::MS_BIND | MsFlags::MS_REC
     } else {
         MsFlags::MS_BIND
@@ -1064,7 +1073,7 @@ pub fn install_namespace_pre_exec(
                     {
                         match open(source_cstr.as_c_str(), o_path, Mode::empty()) {
                             Ok(fd) => *slot = Some(fd),
-                            Err(e) if kept_entry_is_gone(*optional, e) => {}
+                            Err(e) if skip_kept_entry(*optional, e) => {}
                             Err(e) => return Err(e.into()),
                         }
                     }
@@ -1075,7 +1084,7 @@ pub fn install_namespace_pre_exec(
                             Mode::empty(),
                         ) {
                             Ok(fd) => *slot = Some(fd),
-                            Err(e) if kept_entry_is_gone(true, e) => {}
+                            Err(e) if skip_kept_entry(true, e) => {}
                             Err(e) => return Err(e.into()),
                         }
                     }
@@ -1096,7 +1105,7 @@ pub fn install_namespace_pre_exec(
                     // the clone's disks are bound back inside a custom vsock target). The
                     // source is the directory opened above, reached as the working
                     // directory, so the tmpfs over its path does not hide it.
-                    for ((mountpoint_cstr, _, optional), fd) in
+                    for ((mountpoint_cstr, source_cstr, optional), fd) in
                         pair_cstrs.iter().zip(source_fds.iter())
                     {
                         let Some(fd) = fd.as_ref() else {
@@ -1105,16 +1114,20 @@ pub fn install_namespace_pre_exec(
                             }
                             return Err(std::io::Error::from_raw_os_error(libc::EBADF));
                         };
-                        nix::unistd::fchdir(fd).map_err(std::io::Error::from)?;
+                        match nix::unistd::fchdir(fd) {
+                            Ok(()) => {}
+                            Err(e) if skip_kept_entry(*optional, e) => continue,
+                            Err(e) => return Err(e.into()),
+                        }
                         match mount(
                             Some(c"."),
                             mountpoint_cstr.as_c_str(),
                             None::<&str>,
-                            redirect_bind_flags(*optional),
+                            redirect_bind_flags(*optional || mountpoint_cstr == source_cstr),
                             None::<&str>,
                         ) {
                             Ok(()) => {}
-                            Err(e) if kept_entry_is_gone(*optional, e) => {}
+                            Err(e) if skip_kept_entry(*optional, e) => {}
                             Err(e) => return Err(e.into()),
                         }
                     }
@@ -1142,7 +1155,7 @@ pub fn install_namespace_pre_exec(
                             None::<&str>,
                         ) {
                             Ok(()) => {}
-                            Err(e) if kept_entry_is_gone(true, e) => {}
+                            Err(e) if skip_kept_entry(true, e) => {}
                             Err(e) => return Err(e.into()),
                         }
                     }
@@ -1215,7 +1228,8 @@ mod tests {
     /// A kept directory that vanished is passed over; any other failure, and any failure
     /// on a pair, still stops the VMM. Binding a directory that was removed after it was
     /// opened fails with ENOENT, which the next test checks against the kernel.
-    /// A kept directory carries its submounts into the view; a pair stays a plain bind.
+    /// A directory bound onto itself carries its submounts into the view; a redirect
+    /// stays a plain bind.
     ///
     /// RED BEFORE THE FIX: kept directories were bound with MS_BIND alone.
     #[test]
@@ -1266,16 +1280,20 @@ mod tests {
         );
     }
 
+    /// RED BEFORE THE FIX (EACCES, EPERM): a kept directory the VMM may not enter
+    /// stopped it, so one root-owned 0700 directory in vm-disks failed every rootless
+    /// clone.
     #[test]
-    fn only_a_gone_kept_directory_is_passed_over() {
+    fn only_a_gone_or_forbidden_kept_entry_is_passed_over() {
         use nix::errno::Errno;
-        assert!(kept_entry_is_gone(true, Errno::ENOENT));
-        assert!(!kept_entry_is_gone(false, Errno::ENOENT));
-        assert!(!kept_entry_is_gone(true, Errno::EACCES));
-        assert!(!kept_entry_is_gone(true, Errno::EINVAL));
+        for error in [Errno::ENOENT, Errno::EACCES, Errno::EPERM] {
+            assert!(skip_kept_entry(true, error), "{error}");
+            assert!(!skip_kept_entry(false, error), "{error}");
+        }
+        assert!(!skip_kept_entry(true, Errno::EINVAL));
     }
 
-    /// The kernel behaviour kept_entry_is_gone relies on: a bind whose source is a directory
+    /// The kernel behaviour skip_kept_entry relies on: a bind whose source is a directory
     /// that was removed after it was opened fails with ENOENT. Runs in a user and mount
     /// namespace of its own, in a child process.
     #[test]
