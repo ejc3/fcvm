@@ -766,11 +766,10 @@ async fn test_localhost_rootless_image_with_private_directory() -> Result<()> {
 /// owns, and a `tmp-storage-<uuid>` directory is left next to the image for every build.
 #[tokio::test]
 async fn test_storage_image_build_removes_its_store_of_private_directories() -> Result<()> {
-    // build_storage_image runs mkfs.ext4 by name, and an unprivileged PATH often leaves
-    // out /usr/sbin, where it lives. This test owns its process (nextest runs one test
-    // per process) and its runtime has started no other thread yet.
-    let path = std::env::var("PATH").unwrap_or_default();
-    std::env::set_var("PATH", format!("{path}:/usr/sbin:/sbin"));
+    // build_storage_image runs mkfs.ext4 by name from /usr/sbin, which fcvm's main puts on
+    // PATH. Do the same here: nextest runs this test in a process of its own, and its
+    // current-thread runtime has started no other thread.
+    fcvm::utils::ensure_sbin_on_path();
     let image_name = format!(
         "localhost/test-storage-private-dir-{}",
         std::process::id() % 10000
