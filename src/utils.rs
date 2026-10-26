@@ -866,7 +866,8 @@ fn proc_fd_path(fd: std::os::fd::RawFd, buf: &mut [u8; PROC_FD_PATH_LEN]) -> &st
 }
 
 /// Create the host-side directories the mount redirects bind over, which are the
-/// mountpoints outside the view (a source VM's custom vsock directory that is gone).
+/// mountpoints outside the view (a source VM's custom vsock directory that is gone), and
+/// those nested in a directory bound onto itself.
 ///
 /// A mountpoint inside the view is created in the view's tmpfs, in the VMM's own mount
 /// namespace, and never on the host. A nested mountpoint (inside an earlier pair's
@@ -875,7 +876,14 @@ fn proc_fd_path(fd: std::os::fd::RawFd, buf: &mut [u8; PROC_FD_PATH_LEN]) -> &st
 fn create_mount_targets(redirects: &MountRedirects) -> anyhow::Result<()> {
     use anyhow::Context;
     for (index, (mountpoint, _)) in redirects.pairs.iter().enumerate() {
-        if mountpoint.starts_with(&redirects.view) || redirects.nested(index) {
+        // A mountpoint nested in a directory bound onto itself resolves at its own host
+        // path, so it is created there like one outside the view.
+        let in_identity = redirects.pairs[..index]
+            .iter()
+            .filter(|(earlier, _)| mountpoint != earlier && mountpoint.starts_with(earlier))
+            .max_by_key(|(earlier, _)| earlier.as_os_str().len())
+            .is_some_and(|(earlier, source)| earlier == source);
+        if !in_identity && (mountpoint.starts_with(&redirects.view) || redirects.nested(index)) {
             continue;
         }
         if !mountpoint.exists() {
@@ -1292,6 +1300,31 @@ mod tests {
             stdout.contains("status=32") && stderr.contains("No such file or directory"),
             "stdout: {stdout} stderr: {stderr}"
         );
+    }
+
+    /// A redirect nested in a directory bound onto itself resolves at its host path, so a
+    /// missing one is created there: a source `--vsock-dir` of `vm-disks/shared/source`
+    /// that is gone while `shared` remains.
+    ///
+    /// RED BEFORE THE FIX: nested mountpoints were never created, and the bind failed.
+    #[test]
+    fn a_redirect_nested_in_an_identity_bind_gets_its_host_mountpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let view = root.path().join("vm-disks");
+        let shared = view.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let redirects = MountRedirects {
+            view: view.clone(),
+            pairs: vec![
+                (shared.clone(), shared.clone()),
+                (shared.join("source"), view.join("clone")),
+            ],
+            keep: vec![],
+            keep_files: vec![],
+        };
+        create_mount_targets(&redirects).unwrap();
+        assert!(shared.join("source").is_dir());
+        assert_eq!(redirects.view_dirs(), vec![shared.clone()]);
     }
 
     /// The tmpfs directories a view needs: each mountpoint inside the view that is not
