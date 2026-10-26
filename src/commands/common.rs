@@ -1662,8 +1662,84 @@ pub enum LifecycleReadyOutcome {
     Cancelled,
 }
 
+/// The process's shutdown request and the lifecycle gates it cancels.
+///
+/// One fcvm process can run several lifecycles in turn: `podman run` on a cache
+/// hit restores through `snapshot run`, which creates its own gate and signal
+/// streams after taking the snapshot's generation lock. A signal that reaches
+/// the process between the two only wakes the handlers already installed, so a
+/// gate created later has to learn of it from here. Every gate registers at
+/// creation, and a request cancels every live gate; a gate created after a
+/// request is cancelled at creation. Both happen under one lock, so a gate is
+/// either registered before the request and cancelled by it, or created after
+/// it and born cancelled. Issue 1162.
+pub(crate) struct ShutdownRegistry {
+    state: std::sync::Mutex<ShutdownState>,
+}
+
+#[derive(Default)]
+struct ShutdownState {
+    requested: bool,
+    gates: Vec<(
+        std::sync::Weak<std::sync::atomic::AtomicU8>,
+        tokio_util::sync::CancellationToken,
+    )>,
+}
+
+impl ShutdownRegistry {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(ShutdownState {
+                requested: false,
+                gates: Vec::new(),
+            }),
+        }
+    }
+
+    /// A new gate, registered with this registry, or cancelled at creation
+    /// when shutdown was already requested.
+    pub(crate) fn gate(&self) -> LifecycleReadyGate {
+        let gate = LifecycleReadyGate::unregistered();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.requested {
+            gate.cancel();
+        } else {
+            state.gates.retain(|(phase, _)| phase.strong_count() > 0);
+            state
+                .gates
+                .push((std::sync::Arc::downgrade(&gate.phase), gate.cancel.clone()));
+        }
+        gate
+    }
+
+    /// Record the request and cancel every live gate.
+    pub(crate) fn request_shutdown(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.requested = true;
+        for (phase, cancel) in state.gates.drain(..) {
+            if let Some(phase) = phase.upgrade() {
+                LifecycleReadyGate { phase, cancel }.cancel();
+            }
+        }
+    }
+}
+
+static PROCESS_SHUTDOWN: ShutdownRegistry = ShutdownRegistry::new();
+
+/// What a SIGTERM or SIGINT handler calls: cancel every lifecycle gate of this
+/// process, including gates created after this call.
+pub fn request_process_shutdown() {
+    PROCESS_SHUTDOWN.request_shutdown();
+}
+
 impl LifecycleReadyGate {
+    /// A gate that a shutdown requested of this process cancels, whenever the
+    /// request arrives (`ShutdownRegistry`).
     pub fn new() -> Self {
+        PROCESS_SHUTDOWN.gate()
+    }
+
+    fn unregistered() -> Self {
         Self {
             phase: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(LIFECYCLE_SETTING_UP)),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -6203,6 +6279,40 @@ mod tests {
                 .unwrap()
                 .lifecycle_ready,
             "a stale process identity must not publish readiness"
+        );
+    }
+
+    /// A shutdown request reaches every gate of the process: one registered
+    /// before it is cancelled by it, and one created after it is created
+    /// cancelled. A gate that already claimed publication keeps it; its token
+    /// is still cancelled, which is how a published VM learns to stop.
+    #[test]
+    fn a_shutdown_request_cancels_gates_created_before_and_after_it() {
+        let registry = ShutdownRegistry::new();
+        let earlier = registry.gate();
+        let published = registry.gate();
+        assert_eq!(
+            published.claim_terminal_publication().unwrap(),
+            LifecycleReadyOutcome::Published
+        );
+        drop(registry.gate());
+        assert!(!earlier.cancellation_token().is_cancelled());
+
+        registry.request_shutdown();
+        let later = registry.gate();
+
+        for (name, gate) in [("earlier", &earlier), ("later", &later)] {
+            assert!(gate.cancellation_token().is_cancelled(), "{name}");
+            assert_eq!(
+                gate.claim_terminal_publication().unwrap(),
+                LifecycleReadyOutcome::Cancelled,
+                "{name}"
+            );
+        }
+        assert!(published.cancellation_token().is_cancelled());
+        assert_eq!(
+            published.claim_terminal_publication().unwrap(),
+            LifecycleReadyOutcome::Published
         );
     }
 

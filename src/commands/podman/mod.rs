@@ -3187,17 +3187,14 @@ fn finish_prepare<T>(operation: Result<T>, cleanup: Result<()>) -> Result<T> {
     }
 }
 
-/// Cancel `gate` on SIGTERM/SIGINT, describing the resulting shutdown as `shutdown_action`.
+/// Request this process's shutdown on SIGTERM/SIGINT, describing it as `shutdown_action`.
 ///
 /// Installed before the VM is created so a signal during the (potentially long) setup phase
 /// is recorded instead of killing the process and leaving host network state, the persisted
 /// VM state file, and the data directory behind. Shutdown is deferred until setup finishes,
-/// then the caller's cleanup runs.
-fn spawn_lifecycle_signal_handler(
-    gate: &super::common::LifecycleReadyGate,
-    shutdown_action: &'static str,
-) -> Result<()> {
-    let gate = gate.clone();
+/// then the caller's cleanup runs. The request cancels every lifecycle gate of the process,
+/// including one a cache-hit restore creates later (`common::request_process_shutdown`).
+fn spawn_lifecycle_signal_handler(shutdown_action: &'static str) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
     tokio::spawn(async move {
@@ -3205,7 +3202,7 @@ fn spawn_lifecycle_signal_handler(
             _ = sigterm.recv() => "SIGTERM",
             _ = sigint.recv() => "SIGINT",
         };
-        gate.cancel();
+        super::common::request_process_shutdown();
         info!("received {signal_name}, {shutdown_action}");
     });
     Ok(())
@@ -3231,7 +3228,7 @@ fn publish_prepared_snapshot_gated(
 pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     let lifecycle_gate = super::common::LifecycleReadyGate::new();
     let cancel = lifecycle_gate.cancellation_token();
-    spawn_lifecycle_signal_handler(&lifecycle_gate, "shutting down VM")?;
+    spawn_lifecycle_signal_handler("shutting down VM")?;
 
     let Some(mut ctx) = prepare_vm(args).await? else {
         return Ok(()); // Snapshot cache hit, already handled
@@ -3279,13 +3276,9 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // The run loop stopped on purpose right after producing the pre-start
     // snapshot: relaunch through the restore path (identical to a cache hit).
     if let Some(snapshot_args) = restore_args {
-        // A signal during the teardown window lands on a token nothing else
-        // checks anymore (cmd_snapshot_run installs fresh handlers) — honor it
-        // here or the "killed" VM would resurrect as a clone.
-        if cancel.is_cancelled() {
-            info!("shutdown requested during snapshot relaunch, not restoring");
-            bail!("interrupted by signal during snapshot relaunch");
-        }
+        // A signal during the teardown window cancelled this process's gates, so
+        // the restore's own gate is created cancelled and it stops before
+        // allocating anything (`common::ShutdownRegistry`).
         return super::snapshot::cmd_snapshot_run(snapshot_args).await;
     }
 
@@ -3308,7 +3301,7 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
     let lifecycle_gate = super::common::LifecycleReadyGate::new();
     let cancel = lifecycle_gate.cancellation_token();
-    spawn_lifecycle_signal_handler(&lifecycle_gate, "cancelling podman prepare")?;
+    spawn_lifecycle_signal_handler("cancelling podman prepare")?;
 
     let lifecycle = PodmanLifecycle::Prepare(PrepareOptions {
         tag: args.tag,
