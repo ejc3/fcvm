@@ -9,6 +9,7 @@ use tracing::{info, warn};
 /// contain hardcoded paths. When the storage root is mounted at a different path
 /// in the guest, these stale files cause "database graph driver does not match".
 async fn clean_podman_state(dir: &Path, keep: &[&str]) {
+    let mut state = Vec::new();
     if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name();
@@ -16,14 +17,67 @@ async fn clean_podman_state(dir: &Path, keep: &[&str]) {
             if keep.iter().any(|&k| k == name_str.as_ref()) {
                 continue;
             }
-            let path = entry.path();
-            if path.is_dir() {
-                tokio::fs::remove_dir_all(&path).await.ok();
-            } else {
-                tokio::fs::remove_file(&path).await.ok();
-            }
+            state.push(entry.path());
         }
     }
+    if let Err(e) = remove_store_paths(&state).await {
+        warn!("removing podman state from the storage root: {e:#}");
+    }
+}
+
+/// Who reads and removes a temporary podman store's files.
+///
+/// Rootless podman writes a store inside its user namespace: a file a container's uid 0
+/// owns is the invoking user's on the host, and one that any other container uid owns
+/// belongs to a subordinate id. The invoking user can neither read a directory such a
+/// file makes private (`/var/cache/apt/archives/partial` in ubuntu:24.04, mode 0700 and
+/// owned by `_apt`) nor unlink anything inside a directory a subordinate id owns. Run in
+/// that user namespace, through `podman unshare`, the same command sees the container
+/// ids as podman wrote them and has every permission over them, so mkfs.ext4 can copy
+/// the whole store and records the container ids, as it does for a store built by root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StoreReader {
+    /// The calling process, for a directory the caller owns (`--disk-dir`).
+    Caller,
+    /// The user namespace the store was written in: rootless podman's, or the caller's
+    /// own when it is root.
+    PodmanUserNamespace,
+}
+
+impl StoreReader {
+    /// `program`, run as this reader.
+    fn command(self, program: &str) -> tokio::process::Command {
+        if self == StoreReader::PodmanUserNamespace && !nix::unistd::geteuid().is_root() {
+            let mut command = tokio::process::Command::new("podman");
+            command.args(["unshare", program]);
+            command
+        } else {
+            tokio::process::Command::new(program)
+        }
+    }
+}
+
+/// Remove `paths`, files or directory trees of a temporary podman store, as the user
+/// namespace that wrote them (see [`StoreReader`]).
+async fn remove_store_paths(paths: &[PathBuf]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let output = StoreReader::PodmanUserNamespace
+        .command("rm")
+        .arg("-rf")
+        .arg("--")
+        .args(paths)
+        .output()
+        .await
+        .with_context(|| format!("running rm -rf {paths:?}"))?;
+    if !output.status.success() {
+        bail!(
+            "rm -rf {paths:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Validate that a Docker archive contains manifest.json.
@@ -278,8 +332,19 @@ pub(super) async fn create_disk_from_dir(
     output_path: &std::path::Path,
     shrink: bool,
 ) -> Result<()> {
+    create_disk_from_dir_as(source_dir, output_path, shrink, StoreReader::Caller).await
+}
+
+/// [`create_disk_from_dir`], reading `source_dir` as `reader`.
+async fn create_disk_from_dir_as(
+    source_dir: &std::path::Path,
+    output_path: &std::path::Path,
+    shrink: bool,
+    reader: StoreReader,
+) -> Result<()> {
     // Calculate directory size for ext4 image sizing
-    let dir_size = tokio::process::Command::new("du")
+    let dir_size = reader
+        .command("du")
         .args(["-sb", source_dir.to_str().unwrap()])
         .output()
         .await
@@ -321,7 +386,8 @@ pub(super) async fn create_disk_from_dir(
 
     // Format as ext4 and populate from source directory in one step.
     // Uses mkfs.ext4 -d which doesn't require root (no mount/loop device needed).
-    let mkfs = tokio::process::Command::new("mkfs.ext4")
+    let mkfs = reader
+        .command("mkfs.ext4")
         .args([
             "-q",
             "-F",
@@ -453,6 +519,13 @@ async fn load_into_temp_store(graphroot: &Path, archive: &Path) -> Result<String
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// Remove a temporary store, logging what could not be removed.
+async fn remove_temp_store(dir: &Path) {
+    if let Err(e) = remove_store_paths(&[dir.to_path_buf()]).await {
+        warn!("removing the temporary podman store: {e:#}");
+    }
+}
+
 /// Build a podman storage image from a Docker archive.
 ///
 /// Loads the archive into a temporary podman storage root using the overlay driver,
@@ -487,7 +560,7 @@ pub async fn build_storage_image(
     let loaded_msg = match load_into_temp_store(&tmp_dir, archive_path).await {
         Ok(message) => message,
         Err(e) => {
-            tokio::fs::remove_dir_all(&tmp_dir).await.ok();
+            remove_temp_store(&tmp_dir).await;
             return Err(e);
         }
     };
@@ -502,10 +575,11 @@ pub async fn build_storage_image(
     // atomically renaming (see `crate::setup::store_temp_path`: a shared "<digest>.tmp" lets two VMs
     // mkfs/resize2fs the same file and one's rename ENOENTs the other's in-flight temp).
     let tmp_img = crate::setup::store_temp_path(output_path);
-    let result = create_disk_from_dir(&tmp_dir, &tmp_img, true).await;
+    let result =
+        create_disk_from_dir_as(&tmp_dir, &tmp_img, true, StoreReader::PodmanUserNamespace).await;
 
     // Clean up temp storage dir regardless of result
-    tokio::fs::remove_dir_all(&tmp_dir).await.ok();
+    remove_temp_store(&tmp_dir).await;
 
     if let Err(e) = result {
         // Clean up partial .tmp image file on failure

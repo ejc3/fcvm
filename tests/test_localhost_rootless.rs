@@ -673,3 +673,144 @@ async fn run_btrfs_keepid_test(rootfs_type: Option<&str>) -> Result<()> {
 
     Ok(())
 }
+
+/// Build `image_name` with a directory only its owner, container uid 42, may enter
+/// (#1145). ubuntu:24.04 ships one, `/var/cache/apt/archives/partial` (mode 0700, owned
+/// by `_apt`), so every image built on it has it. Rootless podman stores the directory
+/// as a subordinate uid of the invoking user, who therefore cannot read it.
+async fn build_private_dir_image(image_name: &str, marker: &str) -> Result<()> {
+    use std::io::Write;
+
+    let temp_dir = tempfile::TempDir::new().context("creating temp dir")?;
+    let containerfile_path = temp_dir.path().join("Containerfile");
+    let mut file = std::fs::File::create(&containerfile_path)?;
+    writeln!(
+        file,
+        r#"FROM public.ecr.aws/nginx/nginx:alpine
+RUN mkdir /private && echo '{marker}' > /private/file && chown -R 42:42 /private && chmod 0700 /private && chmod 0600 /private/file
+CMD ["sleep", "600"]"#
+    )?;
+    let output = tokio::process::Command::new("podman")
+        .args(["build", "-t", image_name, "-f"])
+        .arg(&containerfile_path)
+        .arg(temp_dir.path())
+        .output()
+        .await
+        .context("running podman build")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "podman build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+async fn remove_image(image_name: &str) {
+    let _ = tokio::process::Command::new("podman")
+        .args(["rmi", "-f", image_name])
+        .output()
+        .await;
+}
+
+/// A rootless run of a `localhost/` image with a directory private to a container uid
+/// other than 0. On main the overlay storage image is built by the invoking user, and
+/// the run fails before the VM boots with `mkfs.ext4 -d failed: __populate_fs:
+/// Permission denied while changing working directory to "private"`.
+///
+/// The container must also see the directory as the image built it: owned by uid and
+/// gid 42, mode 0700, with its file readable by the container's root.
+#[tokio::test]
+async fn test_localhost_rootless_image_with_private_directory() -> Result<()> {
+    let image_name = format!(
+        "localhost/test-rootless-private-dir-{}",
+        std::process::id() % 10000
+    );
+    let marker = format!("private-dir-ok {image_name}");
+    build_private_dir_image(&image_name, &marker).await?;
+
+    let (vm_name, _, _, _) = common::unique_names("private-dir");
+    let (mut child, fcvm_pid) =
+        common::spawn_fcvm(&["podman", "run", "--name", &vm_name, &image_name])
+            .await
+            .context("spawning fcvm")?;
+    let result = async {
+        common::poll_health(&mut child, 180)
+            .await
+            .context("VM failed to become healthy")?;
+        let stat = common::exec_in_container(fcvm_pid, &["stat", "-c", "%u:%g:%a", "/private"])
+            .await
+            .context("stat of /private in the container")?;
+        anyhow::ensure!(
+            stat.trim() == "42:42:700",
+            "/private in the container is {:?}, expected 42:42:700",
+            stat.trim()
+        );
+        let content = common::exec_in_container(fcvm_pid, &["cat", "/private/file"])
+            .await
+            .context("reading /private/file in the container")?;
+        anyhow::ensure!(
+            content.trim() == marker,
+            "/private/file in the container holds {:?}, expected {marker:?}",
+            content.trim()
+        );
+        Ok(())
+    }
+    .await;
+    common::kill_process(fcvm_pid).await;
+    remove_image(&image_name).await;
+    result
+}
+
+/// Building the storage image of that image removes its temporary podman store. On main
+/// the store is removed by the invoking user, who cannot unlink what a subordinate uid
+/// owns, and a `tmp-storage-<uuid>` directory is left next to the image for every build.
+#[tokio::test]
+async fn test_storage_image_build_removes_its_store_of_private_directories() -> Result<()> {
+    // build_storage_image runs mkfs.ext4 by name, and an unprivileged PATH often leaves
+    // out /usr/sbin, where it lives. This test owns its process (nextest runs one test
+    // per process) and its runtime has started no other thread yet.
+    let path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", format!("{path}:/usr/sbin:/sbin"));
+    let image_name = format!(
+        "localhost/test-storage-private-dir-{}",
+        std::process::id() % 10000
+    );
+    build_private_dir_image(&image_name, &format!("storage-private-dir {image_name}")).await?;
+    let id = tokio::process::Command::new("podman")
+        .args(["image", "inspect", "--format", "{{.Id}}", &image_name])
+        .output()
+        .await
+        .context("podman image inspect")?;
+    let id = String::from_utf8(id.stdout)?.trim().to_string();
+
+    let dir = tempfile::TempDir::new_in("/mnt/fcvm-btrfs").context("creating a work dir")?;
+    let archive = dir.path().join("image.docker.tar");
+    let image = dir.path().join("image.storage.img");
+    let result = async {
+        fcvm::commands::podman::export_image_archive(&id, &image_name, &archive)
+            .await
+            .context("export_image_archive")?;
+        fcvm::commands::podman::build_storage_image(&archive, &image)
+            .await
+            .context("build_storage_image")?;
+        let left: Vec<std::path::PathBuf> = std::fs::read_dir(dir.path())?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path != &archive && path != &image)
+            .collect();
+        anyhow::ensure!(
+            left.is_empty(),
+            "build_storage_image left files next to the image: {left:?}"
+        );
+        Ok(())
+    }
+    .await;
+    // What a failing run leaves is owned by subordinate ids: remove it as they are.
+    let _ = tokio::process::Command::new("podman")
+        .args(["unshare", "rm", "-rf", "--"])
+        .arg(dir.path())
+        .output()
+        .await;
+    remove_image(&image_name).await;
+    result
+}
