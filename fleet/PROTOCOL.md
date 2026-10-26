@@ -354,7 +354,16 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   hello (the agent names itself by its instance id), `tiles_rendering` when all its placed
   slots run. Once every placed tile of both halves runs it is `awake`; `last_wake` gives
   the wake's start, when it was complete (`awake_at`), the tiles placed then (`gpus`, both
-  halves) and the time between (`ms`); `wakes` keeps the last 20.
+  halves) and the time between (`ms`); `wakes` keeps the last 20. The EC2 half can make
+  the image complete before a GPU host's agent has said hello (a host's slots are placed
+  only then), so the hosts' phases keep being recorded after the fleet is `awake`, until
+  every host of the wake has `tiles_rendering`. The coordinator logs each step at info
+  (`wake: started`, `wake: host phase`, `wake: host boot` with the hello's boot times,
+  `wake: tile running` with each tile's timings, `wake: fleet awake`), each with
+  `since_wake_ms`, and each EC2 tile's readiness (`tile ready`: since its launch was
+  accepted, when the instance was first seen running, when its renderer first answered
+  `/health`, and when it was ready). A starting tile is described every 3 s and, once it
+  runs with an address, its renderer's `/health` is asked every 250 ms in between.
 - `counters` are totals since the fleet first started, kept in the state file across
   coordinator restarts: `restores` counts fcvm GPU VMs that reached their first frame
   (the wall's, races', claims' and returns'), `restores_last_hour` those in the current
@@ -607,12 +616,18 @@ is killed outright, each VM's fcvm gets SIGTERM from the kernel (the agent arms
 
 ```json
 {"type": "hello", "host": "<name>", "arch": "x86_64", "gpus": [{"sbdf": "0000:01:00.0", "name": "Tesla T4"}], "capacity": 8,
- "store_ready_at": 1761134470000}
+ "store_ready_at": 1761134470000,
+ "boot": {"kernel_started_at": 1761134405000, "store_started_at": 1761134417000, "store_mounted_at": 1761134418000, "agent_started_at": 1761134471000}}
 ```
 
 First line, once. `store_ready_at` (optional) is when the host's store was ready: the
-modification time of `--store-ready-file`, which the host's boot writes once the store is
-mounted. `gpus` are the NVIDIA display functions bound to `vfio-pci`, in address
+modification time of `--store-ready-file`, which the host's store unit
+(`fleet/ami/host/store.sh`) writes once the store is restored. `boot` (optional) is when the
+host's boot reached each step, Unix milliseconds on the host's clock: `kernel_started_at`
+(now less `/proc/uptime`), `agent_started_at`, and every `*_at` number in the store-ready
+file, which the store unit writes as a JSON object (`store_started_at`, `store_mounted_at`).
+The coordinator keeps the times that fall inside the current wake in the wake's host record
+(`power.hosts` in the state object) and logs them. `gpus` are the NVIDIA display functions bound to `vfio-pci`, in address
 order; `capacity` is how many VMs the host runs at once (default: one per GPU). The
 coordinator makes one slot per GPU and ignores a repeated address. The first hello binds the
 connection to `host`, and a later hello on the same connection must name the same host. A

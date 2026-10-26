@@ -649,6 +649,18 @@ write_dns_evidence() {
     printf '%s\n' "$verdict"
 }
 
+# The scale run's sub-make, with the corpus, tag, memory-server mode, output
+# directory and control page this campaign decides. The schedule check in the
+# preflight and the measured run both go through it, so the check validates
+# exactly what the run will be given.
+scale_make() {
+    SCALE_URL="$URLS" SCALE_TAG="$TAG" SCALE_OUT="$SCALE_DIR" \
+        SCALE_UFFD_MODE="$UFFD_MODE" SCALE_UFFD_PREFETCH="$UFFD_PREFETCH" \
+        SCALE_CONTROL_URL="${SCALE_CONTROL_URL:-${URLS%%,*}}" \
+        SCALE_CONTROL_RESOLVE_ALL_TO="${SCALE_CONTROL_RESOLVE_ALL_TO:-127.0.0.1}" \
+        make -C "$REPO" "$@"
+}
+
 campaign_fail() {
     # A bracket failed before the measured run: record the unclean verdict so
     # the run directory says why it holds no records, then exit.
@@ -699,6 +711,13 @@ fi
 for f in corpus_serve.py reqbench.sh; do
     [ -f "$REPO/bench/chromium/$f" ] || { echo "BLOCKED: missing bench/chromium/$f" >&2; exit 2; }
 done
+# reqscale.py refuses SCALE_RATES that give a fractional request per ramp or
+# split a corpus cycle in a scoring window. Ask it now: it used to say so only
+# after the golden and the diag, about 8 minutes in.
+if [ "$MEASURE" = scale ]; then
+    scale_make check-chromium-scale \
+        || { echo "BLOCKED: reqscale.py refused the scale schedule (SCALE_* variables, above); nothing was built" >&2; exit 2; }
+fi
 
 # --- host replay server ----------------------------------------------------
 DNSMASQ_WAS_ACTIVE=no
@@ -962,11 +981,7 @@ if [ "$MEASURE" = scale ]; then
     # after a verify that started under 1.5). Settle again, under the sampler,
     # so the resolver evidence covers the wait too.
     settle_quiet
-    SCALE_URL="$URLS" SCALE_TAG="$TAG" SCALE_OUT="$SCALE_DIR" \
-        SCALE_UFFD_MODE="$UFFD_MODE" SCALE_UFFD_PREFETCH="$UFFD_PREFETCH" \
-        SCALE_CONTROL_URL="${SCALE_CONTROL_URL:-${URLS%%,*}}" \
-        SCALE_CONTROL_RESOLVE_ALL_TO="${SCALE_CONTROL_RESOLVE_ALL_TO:-127.0.0.1}" \
-        make -C "$REPO" bench-chromium-scale 2>&1 | tee "$LOGDIR/run.log" || run_rc=$?
+    scale_make bench-chromium-scale 2>&1 | tee "$LOGDIR/run.log" || run_rc=$?
     stop_dns_sampler
     # The analyzer writes the run id the DNS evidence below binds to, and
     # withholds publication until that evidence exists beside the run, so it

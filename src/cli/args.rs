@@ -1066,6 +1066,20 @@ pub struct SnapshotCreateArgs {
     /// snapshot without a set.
     #[arg(long, conflicts_with = "disk_only")]
     pub inherit_working_set: bool,
+
+    /// Snapshot a VM that has GPUs attached, with its CUDA processes' GPU memory in the
+    /// snapshot (a "warm GPU snapshot").
+    ///
+    /// fc-agent checkpoints every process holding a GPU with NVIDIA's cuda-checkpoint, which
+    /// copies its device memory into the process's memory and releases the GPU, stops
+    /// nvidia-persistenced and removes the GPUs from the guest's PCI bus. fcvm then detaches
+    /// them from Firecracker, takes the snapshot, attaches them again and has fc-agent
+    /// restore the processes onto them, so the source VM keeps its GPUs; its CUDA processes
+    /// are stopped for the duration. A clone must be restored with as many `--gpu`s as the
+    /// source had, and its processes continue on them. The guest needs memory for the GPU
+    /// state it holds.
+    #[arg(long, conflicts_with = "disk_only")]
+    pub gpu_warm: bool,
 }
 
 #[derive(Args, Debug)]

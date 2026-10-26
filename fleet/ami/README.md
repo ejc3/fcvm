@@ -39,7 +39,7 @@ fleet/tools/gpubox.sh list              # every gpubox, owner, lease end
 
 | | built by | boots to |
 |---|---|---|
-| `fcvm-fleet-host-x86_64-<commit>-<date>` (g4dn.metal) | `host/build.sh` prep, build, bake | `fcvm-fleet-vfio.service` binds every NVIDIA function to vfio-pci and fails unless each is passable; `fcvm-fleet-store.service` formats the instance-store NVMe as btrfs at `/mnt/fcvm-btrfs` and restores the store from the asset bucket (`/etc/fcvm-fleet/store.env`), falling back to the AMI's copy; `fcvm-fleet-agent.service` is installed disabled; the host's boot writes `/etc/fcvm-fleet/agent.env` and starts it (ejc3/aws `fcvm_fleet_host_agent_args`), and the agent dials the coordinator |
+| `fcvm-fleet-host-x86_64-<commit>-<date>` (g4dn.metal) | `host/build.sh` prep, build, bake | `fcvm-fleet-vfio.service` binds every NVIDIA function to vfio-pci and fails unless each is passable; `fcvm-fleet-store.service` formats the instance-store NVMe as btrfs at `/mnt/fcvm-btrfs` and restores the store from the asset bucket (`/etc/fcvm-fleet/store.env`), falling back to the AMI's copy (`/var/lib/fcvm-fleet/store/`: the parts `host/store-pack.py` packs at bake, extracted at once); `fcvm-fleet-agent.service` is enabled and runs where the host's boot wrote `/etc/fcvm-fleet/agent.env` (ejc3/aws `fcvm_fleet_host_agent_args`), after the store; the agent dials the coordinator. Units a host does not use (podman's own, apport, fwupd and others, `host/build.sh` prep) are disabled, and the store unit waits for the network only, not for cloud-init's network stage |
 | `fcvm-fleet-tile-x86_64-<commit>-<date>` (g4dn.xlarge) | `tile/build.sh` prep, image, bake (`units` and bake revise one launched with `BASE_AMI`) | nvidia-persistenced, the certificate from `fcvm-fleet/tls-wildcard`, the renderer on 127.0.0.1:8080 behind nginx on 443 (`fcvm-fleet-nginx.service`); none of them waits for cloud-init's network stage |
 
 ```bash
@@ -49,10 +49,12 @@ fleet/ami/build-ami.sh env $H FCVM_COMMIT=<commit>
 fleet/ami/build-ami.sh start $H host/build.sh prep && fleet/ami/build-ami.sh wait $H prep
 fleet/ami/build-ami.sh reboot $H                         # IOMMU on
 fleet/ami/build-ami.sh start $H host/build.sh build && fleet/ami/build-ami.sh wait $H build
-fleet/ami/build-ami.sh env $H STORE_S3_REGION=us-east-2 STORE_S3_BUCKET=<assets bucket> STORE_S3_KEY=store/<name>.tar.zst
+fleet/ami/build-ami.sh env $H STORE_S3_REGION=us-east-2 STORE_S3_BUCKET=<assets bucket> STORE_S3_PREFIX=store/<name>/
 fleet/ami/build-ami.sh start $H host/build.sh bake && fleet/ami/build-ami.sh wait $H bake
-U=$(fleet/ami/build-ami.sh put-url store/<name>.tar.zst)       # the key STORE_S3_KEY names
-fleet/ami/build-ami.sh sh $H "curl -sS -o /dev/null -w '%{http_code}\n' -X PUT -T /var/lib/fcvm-fleet/store.tar.zst '$U'"   # must print 200
+for f in $(fleet/ami/build-ami.sh sh $H 'cd /var/lib/fcvm-fleet/store && ls *.tar.zst'); do   # each part, under STORE_S3_PREFIX
+  U=$(fleet/ami/build-ami.sh put-url store/<name>/$f)
+  fleet/ami/build-ami.sh sh $H "curl -sS -o /dev/null -w '%{http_code}\n' -X PUT -T /var/lib/fcvm-fleet/store/$f '$U'"   # must print 200
+done
 fleet/ami/build-ami.sh image $H fcvm-fleet-host-x86_64-<commit>-<date>
 fleet/ami/measure-boot.sh host <ami>                    # and: measure-boot.sh tile <ami>
 ```

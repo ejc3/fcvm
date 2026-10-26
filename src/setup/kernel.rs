@@ -104,22 +104,14 @@ pub async fn rebuild_kernel_from_source(profile_name: &str) -> Result<PathBuf> {
     )
     .await?;
 
-    // Build to a unique sibling and rename into place, so a build that fails
-    // partway leaves the existing artifact untouched instead of destroying a
-    // usable cached kernel (measured: an early version deleted first, and a
-    // build that died on a DNS failure took the cache with it). Unique per
-    // builder via uuid, not pid — separate PID namespaces reuse numbers — and
-    // the rename is atomic and happens under the same lock.
-    let staging_path = kernel_dir.join(format!("{}.rebuild-{}", filename, uuid::Uuid::new_v4()));
+    // build_kernel_locally builds to a unique sibling and renames it into place,
+    // so a build that fails partway leaves the existing artifact untouched
+    // instead of destroying a usable cached kernel (measured: an early version
+    // deleted first, and a build that died on a DNS failure took the cache with
+    // it).
     println!("⚙️  Rebuilding kernel from source (profile: {profile_name})...");
-    info!(profile = %profile_name, path = %kernel_path.display(), staging = %staging_path.display(), "forced source rebuild, skipping release download");
-    let publish_result = match build_kernel_locally(&profile, profile_name, &staging_path).await {
-        Ok(()) => super::publish_store_entry(&staging_path, &kernel_path, "rebuilt kernel").await,
-        Err(error) => {
-            let _ = tokio::fs::remove_file(&staging_path).await;
-            Err(error)
-        }
-    };
+    info!(profile = %profile_name, path = %kernel_path.display(), "forced source rebuild, skipping release download");
+    let publish_result = build_kernel_locally(&profile, profile_name, &kernel_path).await;
     flock.unlock().map_err(|(_, err)| err)?;
     publish_result?;
     println!("  ✓ Kernel rebuilt from source (profile: {profile_name})");
@@ -248,30 +240,29 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
     super::give_store_entry_to_invoker(&cache_dir);
 
     let tarball_path = cache_dir.join(format!("kernel-{}.tar.zst", url_hash));
-    let tarball_temp = cache_dir.join(format!("kernel-{}.tar.zst.downloading", url_hash));
 
-    // Download tarball if not cached (atomic: download to temp, then rename)
+    // Download tarball if not cached (atomic: download to a temp of this
+    // builder's own, then rename; the temp is removed if it is not published)
     if !tarball_path.exists() {
         println!("  → Downloading tarball...");
-        // Clean up any leftover temp file from previous failed attempt
-        let _ = tokio::fs::remove_file(&tarball_temp).await;
+        let tarball_temp = super::StoreTemp::new(&tarball_path);
 
         let output = Command::new("curl")
             .args(["-fSL", url, "-o"])
-            .arg(&tarball_temp)
+            .arg(tarball_temp.path())
             .output()
             .await
             .context("running curl")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let _ = tokio::fs::remove_file(&tarball_temp).await;
             let _ = flock.unlock();
             bail!("Failed to download kernel: {}", stderr);
         }
 
         // Atomic rename on success
-        super::publish_store_entry(&tarball_temp, &tarball_path, "downloaded kernel tarball")
+        tarball_temp
+            .publish(&tarball_path, "downloaded kernel tarball")
             .await?;
     } else {
         info!(path = %tarball_path.display(), "using cached tarball");
@@ -279,19 +270,19 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
 
     // Extract kernel from tarball (atomic: extract to temp, then move)
     println!("  → Extracting kernel...");
-    let extract_temp = cache_dir.join(format!("kernel-{}-extract", url_hash));
-    let _ = tokio::fs::remove_dir_all(&extract_temp).await;
-    tokio::fs::create_dir_all(&extract_temp).await?;
-    // Deterministic name: a killed root run would otherwise leave a directory
-    // whose contents the next rootless run's remove_dir_all cannot unlink.
-    super::give_store_entry_to_invoker(&extract_temp);
+    let extract_dir = super::StoreTemp::new(&cache_dir.join(format!("kernel-{}", url_hash)));
+    let extract_temp = extract_dir.path();
+    tokio::fs::create_dir_all(extract_temp).await?;
+    // A killed root run leaves this directory behind; hand it to the invoker so
+    // a rootless operator can remove it.
+    super::give_store_entry_to_invoker(extract_temp);
 
     let extract_path = format!("./{}", archive_path);
     let output = Command::new("tar")
         .args(["--use-compress-program=zstd", "-xf"])
         .arg(&tarball_path)
         .arg("-C")
-        .arg(&extract_temp)
+        .arg(extract_temp)
         .arg(&extract_path)
         .output()
         .await
@@ -299,9 +290,8 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Delete corrupted tarball and temp dir so next run re-downloads
+        // Delete corrupted tarball so next run re-downloads
         let _ = tokio::fs::remove_file(&tarball_path).await;
-        let _ = tokio::fs::remove_dir_all(&extract_temp).await;
         let _ = flock.unlock();
         bail!("Failed to extract kernel: {}", stderr);
     }
@@ -309,7 +299,6 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
     // Move to final location
     let extracted_path = extract_temp.join(archive_path);
     if !extracted_path.exists() {
-        let _ = tokio::fs::remove_dir_all(&extract_temp).await;
         let _ = flock.unlock();
         bail!(
             "Kernel not found after extraction at {}",
@@ -320,25 +309,18 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
     // Copy to a temp name in the same directory, then atomically rename onto the
     // final content-addressed path. An interrupted or failed copy (kill, ENOSPC)
     // must never leave a partial file that later runs treat as a valid kernel.
-    let kernel_temp = kernel_path.with_extension("downloading");
-    let _ = tokio::fs::remove_file(&kernel_temp).await;
-    if let Err(e) = tokio::fs::copy(&extracted_path, &kernel_temp).await {
-        let _ = tokio::fs::remove_file(&kernel_temp).await;
-        let _ = tokio::fs::remove_dir_all(&extract_temp).await;
+    let kernel_temp = super::StoreTemp::new(&kernel_path);
+    if let Err(e) = tokio::fs::copy(&extracted_path, kernel_temp.path()).await {
         let _ = flock.unlock();
         return Err(e).context("copying kernel to staging location");
     }
-    if let Err(e) =
-        super::publish_store_entry(&kernel_temp, &kernel_path, "downloaded kernel").await
-    {
-        let _ = tokio::fs::remove_file(&kernel_temp).await;
-        let _ = tokio::fs::remove_dir_all(&extract_temp).await;
+    if let Err(e) = kernel_temp.publish(&kernel_path, "downloaded kernel").await {
         let _ = flock.unlock();
         return Err(e);
     }
 
     // Clean up temp extraction dir
-    let _ = tokio::fs::remove_dir_all(&extract_temp).await;
+    drop(extract_dir);
 
     println!("  ✓ Kernel ready");
     info!(path = %kernel_path.display(), url_hash = %url_hash, "kernel ready");
@@ -659,13 +641,14 @@ pub fn custom_kernel_filename(profile_name: &str, kernel_version: &str, sha: &st
 }
 
 async fn download_kernel_binary(url: &str, dest: &Path) -> Result<()> {
-    let temp_path = dest.with_extension("downloading");
+    let temp = super::StoreTemp::new(dest);
+    let temp_path = temp.path();
     let max_retries = 3;
 
     for attempt in 1..=max_retries {
         let output = Command::new("curl")
             .args(["-fSL", url, "-o"])
-            .arg(&temp_path)
+            .arg(temp_path)
             .output()
             .await
             .context("running curl")?;
@@ -675,7 +658,7 @@ async fn download_kernel_binary(url: &str, dest: &Path) -> Result<()> {
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = tokio::fs::remove_file(temp_path).await;
 
         if attempt < max_retries {
             warn!(
@@ -692,18 +675,17 @@ async fn download_kernel_binary(url: &str, dest: &Path) -> Result<()> {
 
     // Verify it's a valid kernel binary
     let output = Command::new("file")
-        .arg(&temp_path)
+        .arg(temp_path)
         .output()
         .await
         .context("running file command")?;
 
     let file_type = String::from_utf8_lossy(&output.stdout);
     if !file_type.contains("ELF") && !file_type.contains("Linux kernel") {
-        let _ = tokio::fs::remove_file(&temp_path).await;
         bail!("Downloaded file is not a valid kernel: {}", file_type);
     }
 
-    super::publish_store_entry(&temp_path, dest, "release kernel").await?;
+    temp.publish(dest, "release kernel").await?;
 
     Ok(())
 }
@@ -918,15 +900,14 @@ echo ""
 echo "Building kernel with $NPROC parallel jobs..."
 make ARCH="$KERNEL_ARCH" -j"$NPROC" "$KERNEL_IMAGE"{modules_target}
 
-# Copy output (Firecracker needs uncompressed ELF vmlinux, not bzImage)
-# Copy to a temp name then atomically rename so an interrupted copy never
-# leaves a partial kernel at the content-addressed path.
+# Copy output (Firecracker needs uncompressed ELF vmlinux, not bzImage).
+# KERNEL_PATH is a staging path unique to this build; the caller renames it
+# into the store, so an interrupted copy never reaches the content-addressed path.
 echo "Copying kernel to $KERNEL_PATH..."
 case "$KERNEL_ARCH" in
-    arm64)  cp "arch/arm64/boot/Image" "$KERNEL_PATH.tmp" ;;
-    x86_64) cp "vmlinux" "$KERNEL_PATH.tmp" ;;
+    arm64)  cp "arch/arm64/boot/Image" "$KERNEL_PATH" ;;
+    x86_64) cp "vmlinux" "$KERNEL_PATH" ;;
 esac
-mv -f "$KERNEL_PATH.tmp" "$KERNEL_PATH"
 
 echo ""
 echo "=== Build Complete ==="
@@ -1032,9 +1013,20 @@ async fn build_kernel_locally(
     // Compute SHA for this build
     let sha = compute_profile_kernel_sha(profile)?;
 
+    // The build writes a staging path of its own, renamed onto `dest` only when
+    // it succeeds, so a failed build leaves an existing kernel untouched and two
+    // builders sharing the store never write the same file.
+    let staging = super::StoreTemp::new(dest);
+
     // Generate the build script
-    let script_content =
-        generate_vm_kernel_build_script(profile, profile_name, &sha, dest, &repo_root, None)?;
+    let script_content = generate_vm_kernel_build_script(
+        profile,
+        profile_name,
+        &sha,
+        staging.path(),
+        &repo_root,
+        None,
+    )?;
 
     // Write to temp file
     let script_path = std::env::temp_dir().join(format!("fcvm-kernel-build-{}.sh", sha));
@@ -1061,11 +1053,14 @@ async fn build_kernel_locally(
         bail!("Kernel build failed with exit code: {:?}", status.code());
     }
 
-    if !dest.exists() {
-        bail!("Build completed but kernel not found at {}", dest.display());
+    if !staging.path().exists() {
+        bail!(
+            "Build completed but kernel not found at {}",
+            staging.path().display()
+        );
     }
 
-    Ok(())
+    staging.publish(dest, "built kernel").await
 }
 
 // ============================================================================
@@ -2875,17 +2870,12 @@ pub async fn ensure_cloud_hypervisor(repo: &str, branch: &str) -> Result<PathBuf
     // Copy to a temp name in the same directory, then atomically rename onto the
     // content-addressed path. An interrupted copy (kill, ENOSPC) must never leave
     // a partial binary that later runs treat as valid.
-    let temp_path = bin_path.with_extension("tmp");
-    let _ = tokio::fs::remove_file(&temp_path).await;
-    if let Err(e) = tokio::fs::copy(&binary, &temp_path).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
+    let temp = super::StoreTemp::new(&bin_path);
+    if let Err(e) = tokio::fs::copy(&binary, temp.path()).await {
         let _ = flock.unlock();
         return Err(e).context("installing cloud-hypervisor binary");
     }
-    if let Err(e) =
-        super::publish_store_entry(&temp_path, &bin_path, "cloud-hypervisor binary").await
-    {
-        let _ = tokio::fs::remove_file(&temp_path).await;
+    if let Err(e) = temp.publish(&bin_path, "cloud-hypervisor binary").await {
         let _ = flock.unlock();
         return Err(e);
     }

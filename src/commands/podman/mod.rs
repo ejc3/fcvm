@@ -1105,9 +1105,9 @@ async fn export_localhost_image_disk(
         // Export into a UUID-keyed temp, then atomically rename. This avoids corrupt
         // archives from interrupted exports AND is safe under cross-VM concurrency: the
         // image-cache dir is shared across VMs and the per-digest flock above does not
-        // coordinate cross-VM (see image::unique_cache_tmp). A shared "<digest>.tmp"
+        // coordinate cross-VM (see crate::setup::store_temp_path). A shared "<digest>.tmp"
         // would let one VM's rename ENOENT the other's in-flight export.
-        let tmp_path = image::unique_cache_tmp(&archive_path);
+        let tmp_path = crate::setup::store_temp_path(&archive_path);
 
         // Export by the IMMUTABLE image ID captured at inspect time, not the mutable
         // tag (#598). A parallel build can repoint the tag between the cache-key
@@ -1519,12 +1519,14 @@ async fn prepare_vm_for_lifecycle(
         let profile_name = args.kernel_profile.as_deref().unwrap_or("default");
         let module_type = crate::setup::profile_module_type(profile_name)?;
         for sbdf in &args.gpu {
-            crate::gpu::check_host_device(
+            // The lease is released at once: this VM cold-boots without the GPU,
+            // and the restore that attaches it takes its own lease and checks again.
+            drop(crate::gpu::check_host_device(
                 Path::new("/sys"),
                 Path::new("/dev"),
                 &crate::gpu::scrub::state_dir(),
                 sbdf,
-            )?;
+            )?);
             crate::gpu::check_driver_supports_device(
                 Path::new("/sys"),
                 sbdf,

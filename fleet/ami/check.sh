@@ -13,7 +13,7 @@ if command -v shellcheck >/dev/null; then
 else
   no "shellcheck is not installed"
 fi
-python3 -m py_compile fleet/ami/host/s3-cat.py fleet/ami/tile/fetch-cert.py || no "py_compile"
+python3 -m py_compile fleet/ami/host/s3-cat.py fleet/ami/host/store-pack.py fleet/ami/tile/fetch-cert.py || no "py_compile"
 
 # `build-ami.sh start` must clear the phase's markers before it launches the phase:
 # `wait` reads <phase>.done / <phase>.failed, and a builder from a BASE_AMI (or a
@@ -116,6 +116,20 @@ else
 fi
 rm -rf "$gt"
 
+# The store unit writes the file the agent reads as --store-ready-file (the host's agent
+# arguments, fleet/PROTOCOL.md "Running it"), with the boot times the agent reports. Nothing
+# wrote it before, so every hello carried no store time.
+agent_file=$(grep '^FLEET_AGENT_ARGS=' fleet/PROTOCOL.md | grep -o -- '--store-ready-file [^ ]*' | head -1 | cut -d' ' -f2)
+store_file=$(sed -n 's/^READY=\${STORE_READY_FILE:-\([^}]*\)}$/\1/p' fleet/ami/host/store.sh)
+[ -n "$agent_file" ] && [ "$agent_file" = "$store_file" ] ||
+  no "store.sh writes '${store_file}', the agent reads --store-ready-file '${agent_file}'"
+grep -q 'mv -f "$READY.tmp" "$READY"' fleet/ami/host/store.sh || no "store.sh does not replace the ready file by rename"
+st=$(mktemp -d)
+sed -n '/^printf .{"store_started_at"/,/> "\$READY.tmp"/p' fleet/ami/host/store.sh |
+  sed "s|\$READY|$st/ready|; s|\$((t0 / 1000000))|1|; s|\$((t1 / 1000000))|2|; s|\"\$src\"|s3|" > "$st/w.sh"
+bash "$st/w.sh" 2>/dev/null && jq -e '.store_started_at == 1 and .store_mounted_at == 2' "$st/ready.tmp" >/dev/null 2>&1 ||
+  no "store.sh's ready file is not a JSON object of the store's times"
+rm -rf "$st"
 # The tile's boot path (certificate, TLS, renderer, first-frame log) must not wait for
 # cloud-init's network stage: cloud-init.service is ordered before sysinit.target and
 # network-online.target, so a unit with default dependencies (after sysinit.target), or one
@@ -135,22 +149,83 @@ done
 enable=$(grep -E '^ *systemctl enable ' fleet/ami/tile/build.sh)
 grep -qw 'fcvm-fleet-nginx.service' <<<"$enable" || no "tile/build.sh does not enable fcvm-fleet-nginx.service"
 grep -qE '(^| )nginx\.service' <<<"$enable" && no "tile/build.sh enables the distribution's nginx.service, which waits for network-online.target"
-# The store archive must keep nanosecond modification times through host/build.sh's bake
-# and host/store.sh's restore: fcvm's cached image digests (version-cache/) are valid for
-# the image's exact mtime, so a whole-second mtime makes a host hash its images again.
-create=$(sed -n 's/^  tar -c \(.*\) \\$/\1/p' fleet/ami/host/build.sh)
-extract=$(sed -n 's/^  zstd -q -d -T0 -c "\$ARCHIVE" | tar -x \(.*\) -C "\$M"$/\1/p' fleet/ami/host/store.sh)
-tt=$(mktemp -d)
-if [ -z "$create" ] || [ -z "$extract" ]; then
-  no "host/build.sh's store tar or host/store.sh's restore tar not found"
-else
-  mkdir "$tt/in" "$tt/out"; echo image > "$tt/in/img"; touch -d '2026-10-24 00:00:00.123456789' "$tt/in/img"
-  # shellcheck disable=SC2086 # the recipes' own flags, split as the recipes split them
-  tar -c $create -C "$tt/in" . | tar -x $extract -C "$tt/out"
-  [ "$(stat -c %y "$tt/out/img")" = "$(stat -c %y "$tt/in/img")" ] ||
-    no "the store archive drops the fraction of a modification time ($(stat -c %y "$tt/out/img"))"
-fi
-rm -rf "$tt"
+
+# store-pack.py packs the store into parts and store.sh restores them all at once, each
+# part decompressed and extracted while the others are (one zstd stream decompresses on one
+# core), then the directories, then the staging copy. Both ways (staged and direct) the
+# restore must give the tree one tar of the store gives: names, types, modes, owners,
+# mtimes (directories' too, and to the nanosecond: fcvm's cached image digests in
+# version-cache/ are valid for the image's exact mtime, so a whole-second mtime makes a host
+# hash its images again, #1219), hard links, holes, bytes. The fetch below holds every part
+# until all of them have been asked for, so a restore that takes the parts one by one fails.
+fx=$(mktemp -d)
+# Each step ends in `|| exit 1`: `set -e` does nothing in a subshell that is part of `||`.
+(
+  mkdir -p "$fx/src/d/e" "$fx/src/vm-disks/x" "$fx/src/f" || exit 1
+  printf 'one' > "$fx/src/d/a" && ln "$fx/src/d/a" "$fx/src/d/e/a-link" && ln -s ../a "$fx/src/d/e/sym" || exit 1
+  ln -s d/e "$fx/src/dir-link" && printf 'x' > "$fx/src/vm-disks/x/disk" && printf 'l' > "$fx/src/f/k.lock" || exit 1
+  for i in 1 2 3 4 5 6; do head -c $((i * 4096)) /dev/urandom > "$fx/src/f/file$i" || exit 1; done
+  # Hard links of equal size: split across parts, a name's link would become a copy.
+  for i in 1 2 3 4; do printf 'h%s' "$i" > "$fx/src/f/h$i" && ln "$fx/src/f/h$i" "$fx/src/f/h$i-link" || exit 1; done
+  truncate -s 64M "$fx/src/d/sparse" || exit 1
+  printf 'tail' | dd of="$fx/src/d/sparse" bs=1 seek=$((32 << 20)) conv=notrunc status=none || exit 1
+  chmod 0750 "$fx/src/d/e" && touch -d '2026-01-02 03:04:05.123456789' "$fx/src/d/a" || exit 1
+  # A directory that holds a file (so a part creates it) and an empty directory (which only
+  # the directory pass creates): its mtime must survive the empty one being made in it.
+  mkdir -p "$fx/src/g/empty" && printf 'g' > "$fx/src/g/file" || exit 1
+  touch -d '2026-01-03 00:00:00' "$fx/src/d" "$fx/src/d/e" "$fx/src/f" "$fx/src/g/empty" "$fx/src/g" "$fx/src" || exit 1
+  ex=(--exclude=./vm-disks --exclude='./*.lock')
+  tar -c --sparse --numeric-owner --format=posix "${ex[@]}" -C "$fx/src" . > "$fx/one.tar" || exit 1
+  mkdir "$fx/one" && tar -x --sparse --same-owner --numeric-owner -C "$fx/one" < "$fx/one.tar" || exit 1
+  python3 fleet/ami/host/store-pack.py "$fx/src" "$fx/pack" 3 "${ex[@]}" > /dev/null || exit 1
+  mapfile -t parts < "$fx/pack/parts"
+  [ "${#parts[@]}" = 3 ] || exit 1
+  fns=$(sed -n '/^# --- restore functions/,/^# --- end of restore functions/p' fleet/ami/host/store.sh)
+  [ -n "$fns" ] || exit 1
+  for mode in direct staged; do
+    M="$fx/$mode"; mkdir "$M" "$fx/seen-$mode" || exit 1; stage=""
+    if [ "$mode" = staged ]; then stage=$(mktemp -d) || exit 1; fi
+    fetch() {
+      if [ "$1" != dirs ]; then
+        touch "$fx/seen-$mode/$1"
+        for _ in $(seq 100); do
+          [ "$(find "$fx/seen-$mode" -type f | wc -l)" -ge "${#parts[@]}" ] && break
+          sleep 0.1
+        done
+        [ "$(find "$fx/seen-$mode" -type f | wc -l)" -ge "${#parts[@]}" ] || return 1
+      fi
+      cat "$fx/pack/$1.tar.zst"
+    }
+    eval "$fns"
+    restore fetch "${parts[@]}" || exit 1
+    if [ -n "$stage" ]; then rm -rf "$stage"; fi
+  done
+  tree() { (cd "$1" && find . -printf '%p %y %m %U %G %T@ %n %s %l\n' | sort && find . -type f -exec sha256sum {} + | sort -k2); }
+  for mode in direct staged; do
+    [ "$(stat -c %y "$fx/$mode/d/a")" = "$(stat -c %y "$fx/src/d/a")" ] || { touch "$fx/mtime-lost"; exit 1; }
+    diff <(tree "$fx/one") <(tree "$fx/$mode") >&2 || exit 1
+    [ "$(stat -c %h "$fx/$mode/d/a")" = 2 ] || exit 1
+    # The hole stays a hole: far fewer blocks than the 64 MiB the file spans.
+    [ "$(stat -c %b "$fx/$mode/d/sparse")" -lt 1024 ] || exit 1
+  done
+) 2>/dev/null || no "store.sh does not restore store-pack.py's parts at once into the tree one tar gives"
+[ -e "$fx/mtime-lost" ] && no "the store parts drop the fraction of a modification time"
+rm -rf "$fx"
+
+# The store waits for the network and nothing else of the boot: with default dependencies
+# it waited for sysinit.target and basic.target, so for cloud-init's network stage (2.1 s of
+# a cold g4dn.metal boot), and multi-user.target, so cloud-final, waited for the store.
+su=fleet/ami/host/fcvm-fleet-store.service
+after=$(sed -n 's/^After=//p' "$su" | tr ' ' '\n')
+grep -qx 'DefaultDependencies=no' "$su" &&
+  grep -qx 'systemd-networkd-wait-online.service' <<<"$after" && grep -qx 'nss-lookup.target' <<<"$after" &&
+  grep -qx 'local-fs.target' <<<"$after" && ! grep -qE '^(cloud-init|sysinit|basic|network-online)' <<<"$after" &&
+  grep -qx 'Conflicts=shutdown.target' "$su" && grep -qx 'Before=shutdown.target' "$su" ||
+  no "fcvm-fleet-store.service must order itself after the network only (DefaultDependencies=no)"
+# The agent is enabled in the image, so a host whose boot wrote agent.env starts it as soon
+# as the store is restored, without waiting for the user data's `systemctl start`.
+sed -n '/^prep)/,/;;/p' fleet/ami/host/build.sh | grep -qE '^  systemctl enable .*fcvm-fleet-agent\.service' ||
+  no "host/build.sh prep does not enable fcvm-fleet-agent.service"
 
 [ "$fail" = 0 ] && echo "fleet/ami checks: ok"
 exit "$fail"
