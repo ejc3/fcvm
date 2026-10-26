@@ -906,6 +906,7 @@ mod tests {
             mount_redirects: Some(crate::utils::MountRedirects {
                 view: PathBuf::from("/vm-disks"),
                 pairs: vec![(PathBuf::from("/base"), PathBuf::from("/clone"))],
+                keep: vec![],
             }),
             ..Default::default()
         });
