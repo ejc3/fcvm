@@ -419,16 +419,20 @@ pub async fn handle_clone_restore(
     let clock_started = std::time::Instant::now();
     crate::bootplan::set_system_clock(host_time, restore_started.elapsed());
     // Reset chrony after the clock jump so it doesn't lose its sources:
-    // `makestep` forces it to accept the stepped time. Its convergence is
+    // `makestep` forces it to accept the stepped time, and `reset sources`
+    // drops the measurements it took before the snapshot
+    // (`chronyc_restore_commands`). Its convergence is
     // not part of the readiness contract (the clock is already stepped),
     // so it must not hold the host's ACK.
     // Then a burst, since the snapshot gate rejected any poll chronyd made
     // before egress opened; it matters most when the step above failed.
     spawn_restore_side_job(async {
-        let _ = tokio::process::Command::new("chronyc")
-            .args(["makestep"])
-            .output()
-            .await;
+        for args in chronyc_restore_commands() {
+            let _ = tokio::process::Command::new("chronyc")
+                .args(args)
+                .output()
+                .await;
+        }
         crate::snapshot_network::chrony_burst().await;
     });
     phases.clock_ms = elapsed_ms(clock_started);
@@ -553,6 +557,20 @@ pub async fn handle_clone_restore(
         restore_epoch, phases.total_ms
     );
     Ok(phases)
+}
+
+/// The chronyc commands a restore runs once it has stepped the clock, in order.
+///
+/// `reset sources` after `makestep`: chronyd's measurements from before the
+/// snapshot were taken against the clock the step replaced, and kept, they set
+/// the offset it steers by after the restore. Measured on a routed GPU restore
+/// (g4dn.metal, the KVM PTP clock as chronyd's only reachable source), a clone
+/// stepped to within 5 ms of the host went 50 ms behind 36 s later and stayed
+/// there for 45 s; a clone given `reset sources` stayed within 5 ms for 240 s.
+/// chrony's documentation names this command for a clock reset by resuming from
+/// a low-power state, which a restore is.
+fn chronyc_restore_commands() -> [&'static [&'static str]; 2] {
+    [&["makestep"], &["reset", "sources"]]
 }
 
 /// Background jobs a restore started that must not outlive the VM.
@@ -1149,5 +1167,16 @@ mod tests {
             "restore must flush inherited neighbours, then pin the health-check \
              entry, then announce. Got flush={flush} pin={pin} announce={announce}"
         );
+    }
+
+    /// After the restore steps the clock, chronyd drops what it measured before the
+    /// snapshot, after `makestep` (see `chronyc_restore_commands`).
+    #[test]
+    fn the_restore_drops_chronys_pre_snapshot_measurements_after_the_step() {
+        let commands = super::chronyc_restore_commands();
+        let at = |c: &[&str]| commands.iter().position(|x| *x == c);
+        let step = at(&["makestep"]).expect("the restore runs chronyc makestep");
+        let reset = at(&["reset", "sources"]).expect("the restore runs chronyc reset sources");
+        assert!(step < reset, "{commands:?}");
     }
 }

@@ -802,16 +802,10 @@ async fn start_chronyd(host_servers: Vec<String>) {
         sources.push(FALLBACK_NTP_SOURCE.to_string());
     }
 
-    // `makestep 1 -1`: step the clock at ANY update, not just the first few. A
-    // restored VM can resume hours off; slewing that back would take days.
-    let config = format!(
-        "# Written by fc-agent at boot; chronyd is started with -f on this path.\n\
-         # NTP sources from {origin}.\n\
-         {}\n\
-         makestep 1 -1\n\
-         driftfile /var/lib/chrony/drift\n\
-         cmdallow 127.0.0.1\n",
-        sources.join("\n")
+    let config = chrony_config(
+        &sources,
+        &origin,
+        kvm_ptp_device("/sys/class/ptp").as_deref(),
     );
 
     let _ = tokio::fs::create_dir_all("/var/lib/chrony").await;
@@ -856,6 +850,52 @@ async fn start_chronyd(host_servers: Vec<String>) {
         Ok(count) => eprintln!("[fc-agent] chronyd started with {count} NTP source(s)"),
         Err(e) => eprintln!("[fc-agent] ERROR: chronyd is not usable: {e}"),
     }
+}
+
+/// The host's clock as the KVM PTP device (`ptp_kvm`) presents it: `/dev/ptpN` for the
+/// `/sys/class/ptp/ptpN` whose `clock_name` is "KVM virtual PTP", or `None` without one.
+///
+/// Read from sysfs, not from udev's `/dev/ptp_kvm` link, because fc-agent configures
+/// chronyd before udev has necessarily made the link; devtmpfs makes `/dev/ptpN` itself.
+fn kvm_ptp_device(class_dir: &str) -> Option<String> {
+    let mut names: Vec<String> = std::fs::read_dir(class_dir)
+        .ok()?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    names.into_iter().find_map(|name| {
+        let clock = std::fs::read_to_string(format!("{class_dir}/{name}/clock_name")).ok()?;
+        (clock.trim() == "KVM virtual PTP").then(|| format!("/dev/{name}"))
+    })
+}
+
+/// The chrony config fc-agent writes.
+///
+/// `phc` is the KVM PTP device, when the guest has one. chronyd reads the host's
+/// clock from it with no network, so the guest follows the host whatever network it
+/// is on. Without it a guest that can reach no NTP server keeps whatever error its
+/// clock has: a routed VM has no IPv4 egress and the host's servers are IPv4
+/// addresses, and a restore of a snapshot whose fc-agent stepped to whole seconds left
+/// such guests 0.3 to 1.0 s behind the host for as long as they ran. The line is left
+/// out without the device because chronyd refuses to start on a refclock it cannot
+/// open, and the NTP sources would then go with it.
+///
+/// `makestep 1 -1`: step the clock at ANY update, not just the first few. A
+/// restored VM can resume hours off; slewing that back would take days.
+fn chrony_config(sources: &[String], origin: &str, phc: Option<&str>) -> String {
+    let refclock = phc
+        .map(|dev| format!("refclock PHC {dev} poll 2 dpoll 0\n"))
+        .unwrap_or_default();
+    format!(
+        "# Written by fc-agent at boot; chronyd is started with -f on this path.\n\
+         # NTP sources from {origin}.\n\
+         {}\n\
+         {refclock}\
+         makestep 1 -1\n\
+         driftfile /var/lib/chrony/drift\n\
+         cmdallow 127.0.0.1\n",
+        sources.join("\n")
+    )
 }
 
 /// The `server`/`pool` directives from the rootfs's chrony config.
@@ -1342,5 +1382,35 @@ mod tests {
             "fc-agent checks the mounts after the cache-ready handshake, so the pre-start \
              snapshot can capture a covered mount"
         );
+    }
+
+    /// A guest with the KVM PTP device gets it as a chrony refclock; one without gets
+    /// no refclock line, because chronyd refuses to start on a device it cannot open.
+    #[test]
+    fn chrony_reads_the_hosts_clock_from_the_kvm_ptp_device_when_there_is_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let class = dir.path().to_str().unwrap();
+        assert_eq!(super::kvm_ptp_device(class), None);
+        for (name, clock) in [("ptp0", "vmclock"), ("ptp1", "KVM virtual PTP")] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+            std::fs::write(
+                dir.path().join(name).join("clock_name"),
+                format!("{clock}\n"),
+            )
+            .unwrap();
+        }
+        assert_eq!(super::kvm_ptp_device(class).as_deref(), Some("/dev/ptp1"));
+
+        let sources = vec!["server 192.0.2.1 iburst".to_string()];
+        let with = super::chrony_config(&sources, "the host", Some("/dev/ptp1"));
+        assert!(
+            with.contains("\nrefclock PHC /dev/ptp1 poll 2 dpoll 0\n"),
+            "{with}"
+        );
+        assert!(with.contains("\nserver 192.0.2.1 iburst\n"), "{with}");
+        assert!(with.contains("\nmakestep 1 -1\n"), "{with}");
+        let without = super::chrony_config(&sources, "the host", None);
+        assert!(!without.contains("refclock"), "{without}");
+        assert!(without.contains("\nmakestep 1 -1\n"), "{without}");
     }
 }
