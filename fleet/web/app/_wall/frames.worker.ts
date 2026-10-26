@@ -740,7 +740,9 @@ function draw(): void {
   if (!nextPlan) pinT = drawable.some((src) => streamOf(src)!.frames.some((h) => !fitsPlan(h, src, plan))) ? prevT : null;
   // While a re-tile waits, the old tiles show only frames from before its first frame.
   const cap = nextPlan ? Math.min(switchCap(), nextPlan.atT - SAME_T_EPS) : switchCap();
-  const choice = plan.paused && !unfrozen ? (acquired ?? lastChoice) : chooseCommonT(buffers, prevT, undefined, cap);
+  // The tiles in step on the previous draw may lag a little more before they stop holding the image (sync.ts).
+  const inStep = new Set([...lastChoice.show].filter(([, sh]) => sh.kind === "sync").map(([id]) => id));
+  const choice = plan.paused && !unfrozen ? (acquired ?? lastChoice) : chooseCommonT(buffers, prevT, undefined, cap, inStep);
   if (resuming) {
     // Back from hidden: the picture holds until every region has a frame at one
     // t (the mode switch's rule), then the live image fades in over it.

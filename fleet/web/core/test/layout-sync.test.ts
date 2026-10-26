@@ -13,7 +13,7 @@ import {
   tileAt,
   frameFitsBox,
 } from "../layout.ts";
-import { acquireFrozen, chooseCommonT, type SyncChoice } from "../sync.ts";
+import { acquireFrozen, BUFFER_FRAMES, chooseCommonT, releaseBefore, type SyncChoice } from "../sync.ts";
 import { ENC_BPP, fitBandwidth, MAX_STREAM_BPS, MIN_STREAM_BPS, streamBitrate } from "../bandwidth.ts";
 import { addDrag, cameraAt, emptyDrag, lightPosition, poseAt, projectPoint, takeDrag } from "../scene.ts";
 import { fleet } from "./fixtures.ts";
@@ -371,5 +371,77 @@ describe("a frozen picture takes a frame for a tile that had none", () => {
 
   it("does not add a tile the choice never named", () => {
     expect(acquireFrozen(frozen, [b("d", [2])])).toBeNull();
+  });
+});
+
+describe("a half that arrives late does not strobe", () => {
+  // The wall as the page's frame worker runs it: every tile at 30 fps, each stream's
+  // frames decoded in order (a decode that takes long delays the ones behind it), the
+  // worker keeping at most BUFFER_FRAMES decoded frames per stream and releasing those
+  // before the shown t, and a draw every 1/60 s. The second half's frames reach the page
+  // 0.13 s after the first's, and one decode in a hundred takes 0.45 to 0.52 s instead of
+  // about 0.25 s: what the owner's Mac measured on the staging wall when every fcvm tile
+  // flipped between in step and dimmed every few hundred ms.
+  function simulate(seconds: number): { onsets: Map<string, number>; lastT: number | null; end: number } {
+    let seed = 11;
+    const rnd = () => ((seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
+    const FPS = 30;
+    const tiles = Array.from({ length: 16 }, (_, i) => ({ id: i < 8 ? `fcvm:${i + 1}` : `ec2:${i - 7}`, late: i < 8 ? 0.13 : 0 }));
+    // When each frame k of each tile is decoded and in the worker's buffer.
+    const ready = new Map<string, number[]>();
+    for (const tile of tiles) {
+      const out: number[] = [];
+      let last = 0;
+      for (let k = 0; k <= seconds * FPS; k++) {
+        const arrives = k / FPS + 0.04 + tile.late;
+        const decode = rnd() < 0.01 ? 0.45 + rnd() * 0.07 : 0.24 + rnd() * 0.02;
+        // Decoded frames come out in order, so a long decode holds back the ones after it.
+        last = Math.max(last, arrives + decode);
+        out.push(last);
+      }
+      ready.set(tile.id, out);
+    }
+    const held = new Map<string, number[]>(tiles.map((t) => [t.id, []]));
+    const next = new Map<string, number>(tiles.map((t) => [t.id, 0]));
+    const kinds = new Map<string, string>();
+    const onsets = new Map<string, number>(tiles.map((t) => [t.id, 0]));
+    let prevT: number | null = null;
+    let synced = new Set<string>();
+    for (let now = 0; now < seconds; now += 1 / 60) {
+      for (const tile of tiles) {
+        const r = ready.get(tile.id)!;
+        const buf = held.get(tile.id)!;
+        let k = next.get(tile.id)!;
+        while (k < r.length && r[k]! <= now) buf.push(k++ / FPS);
+        next.set(tile.id, k);
+        while (buf.length > BUFFER_FRAMES) buf.shift();
+      }
+      const c = chooseCommonT(
+        tiles.map((t) => ({ id: t.id, ts: held.get(t.id)! })),
+        prevT,
+        undefined,
+        undefined,
+        synced,
+      );
+      if (c.T !== null) prevT = c.T;
+      synced = new Set([...c.show].filter(([, s]) => s.kind === "sync").map(([id]) => id));
+      for (const tile of tiles) {
+        const kind = c.show.get(tile.id)?.kind ?? "none";
+        if (now > 2 && kinds.get(tile.id) === "sync" && kind === "behind") onsets.set(tile.id, onsets.get(tile.id)! + 1);
+        kinds.set(tile.id, kind);
+        const keep = releaseBefore(c, tile.id);
+        const buf = held.get(tile.id)!;
+        if (keep !== null) while (buf.length > 1 && buf[0]! < keep) buf.shift();
+      }
+    }
+    return { onsets, lastT: prevT, end: seconds };
+  }
+
+  it("keeps every tile in step through decode stalls, waiting for the late half", () => {
+    const { onsets, lastT, end } = simulate(12);
+    expect(Object.fromEntries(onsets)).toEqual(Object.fromEntries([...onsets.keys()].map((id) => [id, 0])));
+    // The image waits for the late half, and only for it: it is never more than a second behind.
+    expect(lastT).not.toBeNull();
+    expect(lastT!).toBeGreaterThan(end - 1);
   });
 });
