@@ -938,6 +938,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     };
     let config = Config {
         max_tiles: args.max_tiles,
+        fcvm_tiles: args.fcvm_tiles.min(args.max_tiles),
         ec2_max: match args.ec2 {
             FleetEc2::None => 0,
             FleetEc2::Fake | FleetEc2::Aws => args.ec2_tiles.min(args.max_tiles),

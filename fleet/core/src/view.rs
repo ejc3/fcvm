@@ -21,7 +21,7 @@ pub struct TileView {
     /// `waiting_capacity` (dark), `borrowed` (lent to a visitor, drawn black),
     /// `relaunching` (desired generation not yet reported), or the slot's reported phase.
     pub phase: String,
-    /// The slot behind the tile (`slot-3`, `ec2-2`); null when dark.
+    /// The slot behind the tile (`slot-3`, `ec2-2`); null for an fcvm place with no GPU.
     pub slot: Option<String>,
     /// The frame WebSocket over IPv6 and over IPv4. With published names (the fleet's
     /// coordinator) both are null until the launch's DNS names answer at the zone's
@@ -49,7 +49,7 @@ pub struct LayoutView {
     pub generation: u64,
     pub from_frame: i64,
     pub from_t: f64,
-    /// Each side's rectangle; null for a side with no GPU.
+    /// Each side's rectangle; null for a side with no places.
     pub fcvm: Option<Rect>,
     pub ec2: Option<Rect>,
 }
@@ -96,10 +96,11 @@ pub struct FleetView {
     pub fcvm_gpus: usize,
     /// EC2 tiles holding an instance.
     pub ec2_instances: usize,
-    /// Tiles on the fcvm side and on the EC2 side (one per live GPU).
+    /// Tiles on the fcvm side and on the EC2 side: their configured places, dark ones
+    /// included.
     pub n: usize,
     pub ec2_n: usize,
-    /// EC2 tiles still waiting for an instance (capacity): not on the wall.
+    /// EC2 tiles without an instance (launching or waiting for capacity): dark tiles.
     pub ec2_waiting: usize,
     pub max_tiles: usize,
     /// The standby pool: GPUs beyond `max_tiles`, kept reset, scrubbed and bound with no
@@ -439,7 +440,7 @@ fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) 
 pub fn view(state: &State) -> View {
     let f = &state.fleet;
     let c = &state.config;
-    let mut tiles = Vec::with_capacity(f.n + f.ec2_n);
+    let mut tiles = Vec::with_capacity(f.n + f.fcvm_dark.len() + f.ec2_n);
     for (half, units) in [(Half::Fcvm, &f.slots), (Half::Ec2, &f.ec2)] {
         let mut placed: Vec<&Slot> = units.values().filter(|s| s.position.is_some()).collect();
         placed.sort_by_key(|s| s.position);
@@ -455,6 +456,13 @@ pub fn view(state: &State) -> View {
                 .then_some(s.previous_rect)
                 .flatten();
             tiles.push(t);
+        }
+        // The fcvm places with no GPU follow the live ones, dark.
+        if half == Half::Fcvm {
+            for (i, rect) in f.fcvm_dark.iter().enumerate() {
+                let id = format!("fcvm:{}", f.n + i + 1);
+                tiles.push(tile(state, id, half, *rect, None));
+            }
         }
     }
     let pool: Vec<&Slot> = f.slots.values().filter(|s| in_standby(state, s)).collect();
@@ -540,7 +548,7 @@ pub fn view(state: &State) -> View {
             gpus: f.hosts.values().map(|h| h.gpus.len()).sum(),
             fcvm_gpus,
             ec2_instances: f.ec2.values().filter(|s| s.observed.vm.is_some()).count(),
-            n: f.n,
+            n: f.n + f.fcvm_dark.len(),
             ec2_n: f.ec2_n,
             ec2_waiting: f.ec2.values().filter(|s| s.observed.vm.is_none()).count(),
             max_tiles: c.max_tiles,

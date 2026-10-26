@@ -13,9 +13,10 @@ Conventions:
   `_secs`.
 - Scene time `t` is seconds since the scene's `epoch_unix_ms`.
 - A rectangle `{"x","y","w","h"}` is a fraction of the whole image: `x` and `w` of its
-  width, `y` and `h` of its height, origin top left. The fcvm half is `x` in [0, 0.5), the
-  EC2 half `x` in [0.5, 1). `image_aspect` is the whole image's width / height (default
-  16/9, the renderer's: each half is 8:9).
+  width, `y` and `h` of its height, origin top left. The fcvm side is on the left and the
+  EC2 side on the right, each as wide as its share of the configured tiles (`layout`).
+  `image_aspect` is the whole image's width / height (default 16/9, the renderer's; with
+  as many tiles configured on each side, each side is 8:9).
 - Camera `pos` is the camera position and `look` the world point it looks at, as
   `[x, altitude, z]` in kilometres (the renderer's world units); `fov_deg` is the vertical
   field of view. `time_of_day` is a fraction of the day in [0, 1) (0.25 sunrise, 0.5 noon,
@@ -218,7 +219,8 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
      "borrowed": {"session": "claim-3", "viewer": "v-9", "since": 1761134400000, "until": 1761134460000}, ...},
     {"id": "fcvm:3", "phase": "failed", "error": "...",
      "failure": {"kind": "relaunch_failed", "message": "fcvm exited ...", "retry_at": 1761134402000}, ...},
-    {"id": "ec2:1", "half": "ec2", "rect": {"x": 0.5, "y": 0, "w": 0.25, "h": 0.5}, "phase": "waiting_capacity", "slot": null, ...}
+    {"id": "fcvm:8", "phase": "waiting_capacity", "slot": null, "frame_url": null, "host": null, ...},
+    {"id": "ec2:1", "half": "ec2", "rect": {"x": 0.5, "y": 0, "w": 0.25, "h": 0.5}, "phase": "waiting_capacity", "slot": "ec2-1", "frame_url": null, ...}
   ],
   "aggregates": [
     {"id": "agg:<host>", "half": "fcvm", "host": "<host>", "rect": {"x": 0, "y": 0, "w": 0.5, "h": 1},
@@ -273,17 +275,24 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
 }
 ```
 
-- `tiles` lists one tile per live GPU, the fcvm side then the EC2 side: `fleet.n` fcvm
-  tiles (fcvm GPUs on hosts that are not draining, at most `max_tiles`) and `fleet.ec2_n`
-  EC2 tiles (EC2 tiles with an instance, at most `max_tiles`). Each side is as wide as its
-  share of the live GPUs (`layout.fcvm`, `layout.ec2`: fcvm 100 and EC2 12 give the fcvm
-  side 100/112 of the width); a side with none has no rectangle (null) and the other takes
-  the whole width; with none on either side there are no tiles. There are no dark tiles:
-  an EC2 tile still waiting for capacity is not on the wall (`fleet.ec2_waiting` counts
-  them, and the race's `relaunch_all` shows the wait). The fcvm side is cut into
-  full-width bands, one per GPU host (hosts in the order of their lowest slot number), as
-  tall as the host's share of its tiles, each band its own grid, row-major, so a host's
-  tiles cover one rectangle, which its aggregator encodes whole; the EC2 side is one grid.
+- `tiles` lists one tile per configured place, the fcvm side then the EC2 side: `fleet.n`
+  fcvm tiles and `fleet.ec2_n` EC2 tiles. The fcvm side has `--fcvm-tiles` places, or one
+  per live fcvm GPU (GPUs on hosts that are not draining, at most `max_tiles`) when there
+  are more of those; the EC2 side has `--ec2-tiles` places (at most `max_tiles`), one per
+  EC2 tile, with an instance or not. Asleep, both sides have none. Each side is as wide as
+  its share of the places (`layout.fcvm`, `layout.ec2`: 8 and 8 give each side half the
+  width, fcvm 100 and EC2 12 give the fcvm side 100/112), so the halves do not change when
+  GPUs go dark: a race, an EC2 tile waiting for capacity, a host not yet connected or
+  reclaimed. A side with no places has no rectangle (null) and the other takes the whole
+  width; with none on either side there are no tiles. A place with no live renderer is a
+  dark tile: an fcvm place with no GPU has `phase` `waiting_capacity` and a null `slot`,
+  `host` and `frame_url`; an EC2 tile without an instance keeps its `slot` and reports its
+  own phase (`fleet.ec2_waiting` counts those, and the race's `relaunch_all` shows a
+  capacity wait). The fcvm side is cut into full-width bands, one per GPU host (hosts in
+  the order of their lowest slot number) and, below them, one for the places with no GPU,
+  each as tall as its share of the side's tiles and cut into its own grid, row-major, so a
+  host's tiles cover one rectangle, which its aggregator encodes whole; the EC2 side is
+  one grid.
   Tile ids `fcvm:<k>` and `ec2:<k>` (1-based) name places; `slot` names the GPU behind the
   place. A GPU keeps its slot (and its addresses) when the fleet re-tiles: only its
   rectangle changes. Slot ids are `slot-<n>` (fcvm, reused lowest first) and `ec2-<n>`. A
@@ -299,10 +308,10 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   generation has delivered its first frame at or after `from_t`, then swaps them all at
   once.
 - `budget` is the grid's render budget in pixel-samples per frame per tile and
-  `budget_from_t` the scene time it took effect at (both null until every placed tile has
-  reported a fit); see "Grid budget" below. The page may show it; it needs nothing from
+  `budget_from_t` the scene time it took effect at (both null until every placed tile with a
+  renderer has reported a fit; a dark place and an EC2 tile without an instance have none); see "Grid budget" below. The page may show it; it needs nothing from
   it.
-- `phase`: `waiting_capacity` (dark: no GPU behind the tile, or EC2 refused capacity),
+- `phase`: `waiting_capacity` (dark: no fcvm GPU in the place, or EC2 refused capacity),
   `borrowed` (lent to a visitor, drawn black), `pending` (assigned, nothing reported yet),
   `relaunching` (a newer generation is wanted than the agent has reported), or what the
   agent reported: `stopping`, `restoring`, `starting`, `running`, `failed`.
@@ -346,16 +355,16 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   terminated), no race is scheduled (`next_race_at` null) and
   `restart_now` is refused. Hosts that leave then are not reclaimed. When an active viewer
   arrives it is `waking` from `woke_at`, the moment the wake began: every host region gets
-  `--awake-capacity` hosts again (default 1) and the EC2 half launches as many tiles as the fcvm
-  half had. `hosts` lists each GPU host by EC2 instance id with the phases it has reached,
-  in order: `instance_pending` and `booted` from EC2 (pending, then running),
+  `--awake-capacity` hosts again (default 1) and the EC2 half launches its `--ec2-tiles`
+  tiles. `hosts` lists each GPU host by EC2 instance id with the phases it has reached, in
+  order: `instance_pending` and `booted` from EC2 (pending, then running),
   `store_ready` when the host marked its store mounted (the agent's hello reports it; the
   phase is absent when the host does not mark it), `agent_connected` when its agent says
   hello (the agent names itself by its instance id), `tiles_rendering` when all its placed
   slots run. Once every placed tile of both halves runs it is `awake`; `last_wake` gives
-  the wake's start, when it was complete (`awake_at`), the tiles placed then (`gpus`, both
-  halves) and the time between (`ms`); `wakes` keeps the last 20. The EC2 half can make
-  the image complete before a GPU host's agent has said hello (a host's slots are placed
+  the wake's start, when it was complete (`awake_at`), the tiles rendering then (`gpus`,
+  both halves; an EC2 place without an instance is not one) and the time between (`ms`);
+  `wakes` keeps the last 20. The EC2 half can make the image complete before a GPU host's agent has said hello (a host's slots are placed
   only then), so the hosts' phases keep being recorded after the fleet is `awake`, until
   every host of the wake has `tiles_rendering`. The coordinator logs each step at info
   (`wake: started`, `wake: host phase`, `wake: host boot` with the hello's boot times,
@@ -392,7 +401,8 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   one tile's, each with its own `kind`: `host_reclaimed` (a spot notice or the agent went
   away; kept for a minute after the host is gone) and `coordinator_degraded` (a component
   such as the text check is failing). A reclaimed host's tiles leave the tiling in the
-  event that reports it (its slots are re-tiled onto the other hosts at once), so there is
+  event that reports it (the side keeps its places: the other hosts' GPUs are re-tiled
+  at once and the places left over are dark), so there is
   no `draining` tile phase and no tile-level `host_reclaimed`; `fleet.hosts[].draining`
   and `failures` carry it.
 - `aggregates` lists the regions an aggregator serves (see Aggregator): one per GPU host
@@ -422,7 +432,7 @@ relaunching (its region would be black; claimed GPUs and dark tiles do not count
 ```
 fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file <path>]
                  [--text-check bedrock --text-check-model <id> --text-check-region <region> | --text-check none]
-                 [--max-tiles 100] [--ec2 none|fake] [--allowed-origin <scheme://host[:port]>]...
+                 [--max-tiles 100] [--fcvm-tiles 8] [--ec2 none|fake] [--allowed-origin <scheme://host[:port]>]...
                  [--ec2-aggregate-listen <addr:port> (--ec2-aggregate-url <ws url> | --ec2-aggregate-tls
                   [--ec2-aggregate-tls-dir /run/fcvm-fleet/tls])] [--aggregate-arg <arg>]...
                  [--race-every <secs>] [--restart-cooldown 60] [--camera-seed 1] [--max-borrowed <n>]
@@ -446,6 +456,9 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   keeps versions) at most once a second while it changes and at shutdown. A missing object
   is no state; a refused read (403, which S3 also answers for a missing object to a caller
   without `s3:ListBucket`) stops the coordinator rather than start it empty.
+- `--fcvm-tiles` (default 8, at most `--max-tiles`) is the fcvm side's places: with fewer
+  live fcvm GPUs the rest are dark tiles, with more the side has one place per GPU. It and
+  the EC2 side's `--ec2-tiles` size the two sides (see `tiles` above).
 - `--ec2 aws` runs `--ec2-tiles` EC2 tiles, whatever the fcvm side has. Each is one
   instance from the tile launch template (one-time spot), tagged `Purpose=fcvm-fleet-tile`,
   `FleetTile=<tile>` and `Fleet=<--fleet-name>` (`FLEET_NAME`, default `stage`) at launch,
@@ -845,10 +858,11 @@ coordinator runs the rule of the renderer's reference controller
 (`fleet/renderer/tools/budgetctl.py` at 55e81ad5 on `fleet-renderer-adapt`) in the pure core
 (`fleet_core::budget`), on its 1 s tick:
 
-- Every 2 s, a round over every placed tile of both sides that is not lent to a claim. No
-  decision until every one of them has reported a `budget_fit` (a tile that just joined
-  holds the round until its first report; a held round changes nothing, so the count of
-  rounds below carries over it). A renderer that is not `ready` reports no fit.
+- Every 2 s, a round over every placed tile of both sides that is not lent to a claim (an
+  EC2 tile without an instance has no renderer and is left out). No decision until every
+  one of them has reported a `budget_fit` (a tile that just joined holds the round until
+  its first report; a held round changes nothing, so the count of rounds below carries
+  over it). A renderer that is not `ready` reports no fit.
 - The smallest fit governs, smoothed half the way each round.
 - The first budget is the ladder rung under smoothed fit / 1.15 (the ladder is
   250,000 x 2^(n/4), n from -8 to 40).
