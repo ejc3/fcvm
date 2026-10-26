@@ -110,6 +110,8 @@ def summarize_listen(rows, windows, offset_ns):
                 "accept_errors": sum(r["accept_errors"] for r in mine),
                 "accept_busy_mean": round(sum(r["accept_ms_sum"] for r in mine) / (seconds * 1000.0), 4),
                 "accept_busy_max_second": max(busy),
+                "accept_ms_mean": round(sum(r["accept_ms_sum"] for r in mine)
+                                        / max(1, sum(r["accepts"] for r in mine)), 3),
                 "accept_ms_max": max(r["accept_ms_max"] for r in mine),
                 "handshakes_in_handler": sum(r["handshakes"] for r in mine),
                 "handshake_ms_max": max(r["handshake_ms_max"] for r in mine),
@@ -125,9 +127,12 @@ def summarize_listen(rows, windows, offset_ns):
         kernel = [r for r in picked if r.get("listener") == "kernel"]
         if kernel:
             depth = [q[0] for r in kernel for q in (r.get("accept_queue") or {}).values()]
+            # A kernel row without the counters means /proc/net/netstat could not be
+            # read for that second; the total is then unknown, not zero.
+            counted = all(r.get("listen_overflows") is not None for r in kernel)
             agg["kernel"] = {
-                "listen_overflows": sum(r.get("listen_overflows") or 0 for r in kernel),
-                "listen_drops": sum(r.get("listen_drops") or 0 for r in kernel),
+                "listen_overflows": sum(r["listen_overflows"] for r in kernel) if counted else None,
+                "listen_drops": sum(r["listen_drops"] for r in kernel) if counted else None,
                 "accept_queue_peak": max(depth) if depth else None,
             }
         out[rate] = agg

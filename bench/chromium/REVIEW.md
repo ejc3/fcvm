@@ -20,6 +20,7 @@ the table below records why.
 | `results/reqbench-20260816-*-corpus` (14 runs), `results/reqbench-20260814-042319-uffd`, `results/cpuprobe-20260816` | 2026-08-14 to 2026-08-16 | **WITHDRAWN IN FULL** on 2026-09-02, live-DNS contamination; see "The 2026-08-16 corpus series" below. Each directory carries a `WITHDRAWN` marker with its evidence and stays in the tree. `results/campaign-20260816-summary.json` is a hand-written index of these cells, not a record. |
 | `results/reqbench-20260830-171007-corpus` | 2026-08-30 | DNS-verified corpus record (`dns-evidence.json` verdict clean); 712.6 ms [610.5, 808.5] cdp p50 at 2 vCPU. Still verified; the headline moved to the 4 vCPU rung of the ladder below. |
 | `results/reqbench-20260902-023115-corpus-c2`, `results/reqbench-20260902-025115-corpus-c4`, `results/reqbench-20260902-031115-corpus-c8` | 2026-09-02 | DNS-verified 2/4/8 vCPU ladder, one golden per rung on one runtime bundle (each `dns-evidence.json` verdict clean, first_mismatch null, diag violations none); cdp p50 770.3 [596.2, 807.8], 549.4 [467.9, 632.4] and 580.2 [520.8, 645.9] ms, n=202 each. 549.4 at 4 vCPU is the current corpus headline. Each rung ran once: from 2 to 4 vCPUs the median fell 220.9 ms, the 4 and 8 vCPU medians each sit inside the other's interval, and the stage where 8 loses (the wait for the target, +53.1 ms in the mean) moves in 50 ms poll steps, so these runs do not show that 4 is faster than 8 or locate a knee. Indexed by `results/campaign-20260902-box2-ladder-summary.json`. |
+| `results/scale-ceiling-20261026/` | 2026-10-26 | Open-loop corpus throughput with the replay server's listener measured (#1159): the default replay's single accept thread, which runs the TLS handshake, and its listen backlog of 5 are what limited the s13 run; section "The corpus open-loop ceiling is the replay server's listener" below. |
 | `results/reqbench-20261022-corpus-*` (serial runs), `results/reqbench-20261022-corpus-s13/scale-*`, `results/corpusextra-2026102[23]-*` | 2026-10-22 to 10-23 | The corpus campaign the report now quotes, on one c8g.metal-48xl (spot; reclaimed once, resumed on a replacement): serial runs at 2, 4 and 8 vCPUs, prefetch pairs, the poll-interval and copy-mode A/B/As, memory with many clones (screenshot and HTML), host Chromium controls, and an open-loop throughput run. Every serial run DNS-verified clean with 0 failures in 230 attempts per arm. Records carry `host_boot_sha256` (#1153). Harness defects found on the way are items 1 to 19 of "Harness bugs the 2026-10-22 campaign's first runs exposed" below. |
 
 ---
@@ -235,10 +236,11 @@ change mid-run (sha256 in `hostinfo.json`).
 - **Egress-mode ordering** needs repeated *independent runs*, not more reps within one run —
   run-to-run variance dominates within-run SE by ~6x.
 - **The ANGLE race** was not re-amplified in this run.
-- **`minor` sustained-throughput ceiling** was observed but not root-caused (single serve process
-  suspected; not proven). The 2026-10-22 corpus scale attempts collapsed at 2.8 requests per
-  second per restore path, FILE and UFFD alike (harness bug 15 below), so the limit is not the
-  memory server alone; what limits it is still not identified.
+- **The corpus open-loop throughput ceiling** is located in the replay server's listener
+  (next section, #1159). Open: where the ceiling lies once the listener is out of the way
+  (4 guest vCPUs: the handshake-in-handler runs went to 4.2 per restore path, the static
+  page to 5.6; beyond that the harness's own limits end the runs first, see the section below), and which stage is
+  the next limit.
 - **Hugepage `minor` at 4K-equivalent page counts** — the hugepage win conflates page size with
   sharing mode; a 4K `minor` vs 2 MiB `minor` decomposition would separate them.
 - **Teardown** (175 ms, post-artifact) was not moved off the response path in this run.
@@ -457,6 +459,65 @@ own probe reached the guest (#1135); the published memory fit stops at 48
 clones. Two spot hosts were terminated mid-run by the parallel-box idle
 watchdog, which reads a measured run of one request at a time on a
 192-vCPU host as idle; their unfinished runs are not records.
+
+## The corpus open-loop ceiling is the replay server's listener (#1159)
+
+`results/scale-ceiling-20261026/` (`summary.json`, `commands.txt`, the listener logs). c8g.metal-48xl,
+on demand, 4 guest vCPUs unless stated, FILE and UFFD interleaved, the s13 gates, seed 20261022.
+`corpus_serve.py --listen-log` was added for these runs; it records, once a second, what happens
+before the replay's handler thread starts timing (`duration_ms` in the access log starts there).
+
+- **Default replay (listen backlog 5, TLS handshake inside the one accept thread).** At 1.40 per
+  path the accept thread was inside `accept()` 43% of the time on average (2.8 ms per connection, 46,392
+  connections in the 300 s of scoring windows, 52 per page load) and the kernel dropped 13,869
+  connections for a full accept queue (`ListenOverflows`). At 1.87 it was 62% busy (3.0 ms), 26,105 drops,
+  median navigation 1,072 ms against 370 ms at 1.40, 364 of 1,120 requests over 2 s, and the run failed the
+  `departure` gate (1.78 completed per second) as s13 did. The first run on this tree offered 2.33 and 2.8:
+  both failed (2.8: 244 of 336 requests failed, the accept thread spent up to 11.2 s inside one
+  `accept()`, 15,182 drops; navigation median 33 s). A dropped SYN is retried after 1 s, so the 5 s p95
+  that s13 recorded at every rate comes partly from here.
+- **`--backlog 1024` alone**: 0 drops, median navigation 267 to 306 ms from 1.40 to 2.33 per path. In the
+  second run (`backlog-1024-b`, the only one with an analysis) 1.40 and 1.87 pass every gate and 2.33 is
+  recorded as a failed rate (one failed request among 1,400, a teardown leaving a lock file); the first run
+  was stopped at burst 12 of 18 by the sampler fault fixed in this PR, so its windows are 240 s at 1.40 and
+  180 s at 1.87 and 2.33 and it has no analysis. The accept thread is then 37% to 61% busy at 2.4 to 2.5 ms per connection, which puts
+  its own limit near 3.8 per path (1 / 2.44 ms = 410 connections per second, 53 per page load, two paths).
+- **`--tls-handshake-in-handler`** (the default backlog): the accept thread is 0.5% to 2.4% busy (0.03 to
+  0.05 ms per connection), handler time per request 6 to 9 ms (mean), and 1.40, 1.87, 2.33 and 2.8 all pass
+  (median navigation 262, 290, 307, 281 ms). In a second run set 3.27, 3.73 and 4.20 had 0, 3 and 1 failed
+  scored requests among 1,960, 2,240 and 2,520 (a failed request fails its rate under the strict policy,
+  and that run's analysis was refused for a 16.2% host-control drift), median navigation 322, 346 and
+  392 ms, 38, 75 and 244 dropped connections. At 2 guest vCPUs the same setting had 4 failed of
+  2,520 at 4.2 and none of 1,680 at 2.8, and failed 2,295 of 3,360 requests at 5.6 (267 drops).
+  Its 1.40 cell lost 62 requests in one burst (b0011) to the per-request Firecracker probe
+  ("firecracker-def pid N is outside run cgroup", one line per thread of one clone), which is not a
+  replay effect and is open.
+- **Replay out of the path** (one page the guest serves itself, `SCALE_URL_OVERRIDE`): 5.6 per path
+  completed 3,357 of 3,360 requests (median 502 ms against 423 ms at 1.40; the 3 failures were the harness's
+  Firecracker-pid probe, not the host).
+- **Above about 4.2 per path the failures are the harness's own limits, not a host measurement.** Every
+  failed request at 5.6 with 2 vCPUs (2,021 "firecracker-def pid N is outside run cgroup", 976
+  `inotify_init1: Too many open files`) and at 8.4 and 6.5 with the page or the replay was one of those two
+  or a descriptor-exhaustion error. `reqbench.py` opens one inotify instance per request in flight, and
+  Ubuntu's `fs.inotify.max_user_instances` is 128. With it at 65,536 the static page again held 5.6
+  (669 ok, 3 failed) and at 8.4 completed 609 and failed 399 requests, 804 of the 805 failed requests at that
+  rate being the cgroup-membership probe (median 1.1 s); at 11.2 the driver ran out of file
+  descriptors. So the host's own ceiling is not established above 5.6 per path (static page) or 4.2 (corpus
+  with the handshake fix), and a rerun of the corpus arm with the sysctl raised stopped at its first burst
+  on a process left in a request's cgroup ("inter-burst cgroup membership is not quiescent").
+
+What this does not show: what limits the corpus above 4.2 per path once the harness's inotify, descriptor and
+cgroup-probe limits are out of the way (the accept thread is idle; at most 57 handler threads were
+running at 4.2 with 4 vCPUs), whether the Python replay or the host side of pasta is
+the next limit, and what a page's navigation costs apart from the listener (with the listener fixed, 476 of 6,300
+scored requests in the 2.8-per-path run set took over 2 s navigation, and 460 of them are all 460
+requests for www.elmundo.es; the 5 s p95 of s13 is that page plus the listener's dropped connections). Every figure above is the 5 scored bursts of one
+run (300 s of scoring windows per rate), except the `base-first` rows, which are 60 s windows of the first
+attempt, and the `backlog-1024-a` rows (240 and 180 s); none has a repeat except the default-replay 1.40 (median navigation 362.7 and 370.0 ms in two runs, 355.4 in s13).
+
+The earlier s13 record (`reqbench-20261022-corpus-s13`) used the default replay, so its 1.40 and 1.87
+results are this table's first rows. The replay options default to the old behavior; the 2026-10-22 serial
+records are unchanged by this work.
 
 ## Binding requirements for any future run
 

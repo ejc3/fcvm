@@ -72,3 +72,7 @@ results/corpusextra-*/corpus-dns.log
 # The pointer from a run to the replay logs kept in ejc3/fcvm-bench-records
 # (campaign_summary.py EXTERNAL_LOGS).
 !results/**/external-logs.json
+# The replay server's listener log (corpus_serve.py --listen-log): one row a second per
+# busy listener plus the kernel's accept-queue overflows. A measurement, not DNS evidence.
+!results/**/*.corpus-listen.log
+!results/**/corpus-listen.log
