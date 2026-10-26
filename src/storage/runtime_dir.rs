@@ -1,13 +1,17 @@
 //! A VM's runtime directory (`vm-disks/<vm_id>`) as a mount target for its clones.
 //!
 //! A snapshot names its disks at the source VM's paths (`vm-disks/<source>/disks/...`).
-//! A clone's VMM reaches its own disks through those paths only because its mount
-//! namespace binds the clone's directory over `vm-disks/<source>`, and it opens them
-//! when the snapshot is loaded. When the source VM's teardown removes its directory,
-//! the kernel detaches every mount on it in every other namespace, so a clone whose VMM
-//! is spawned but has not loaded the snapshot yet finds no disk at all.
+//! A clone's VMM reaches its own disks through those paths because its mount namespace
+//! binds the clone's directory at `vm-disks/<source>`, and it opens them when the
+//! snapshot is loaded. The binds used to sit on the source VM's directory, and when the
+//! source VM's teardown removed it, the kernel detached them in every other namespace,
+//! so a clone whose VMM was spawned but had not loaded the snapshot yet found no disk.
+//! The binds now sit on directories of a tmpfs over `vm-disks` in the clone's own
+//! namespace (`utils::MountRedirects`), which the teardown cannot remove, so the lease
+//! below no longer protects a bind. It is still taken; removing it needs the race gym
+//! case that records its wait re-recorded (#1311).
 //!
-//! The lock that closes that window is a `flock` on the directory itself:
+//! The lock is a `flock` on the directory itself:
 //!
 //! | who | when | lock |
 //! |-----|------|------|

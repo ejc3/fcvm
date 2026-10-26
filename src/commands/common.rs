@@ -2445,10 +2445,8 @@ const VSOCK_OVERRIDE_MIN_FIRECRACKER: (u32, u32, u32) = (1, 16, 0);
 ///
 /// Without it the vsock device keeps the snapshot's embedded path, which is under the
 /// source VM's directory and reaches the clone's sockets only through the mount
-/// redirect. When the source VM exits and removes that directory, the kernel detaches
-/// every mount on it in every namespace, and the vsock device resolves the path again
-/// for each guest-initiated connection, so from then on each one is reset. With the
-/// override the device uses the clone's own path and never depends on the redirect.
+/// redirect, which the device resolves again for each guest-initiated connection. With
+/// the override the device uses the clone's own path and never depends on the redirect.
 /// A 1.16.0 pre-release counts as older, because it can predate the change.
 fn snapshot_load_vsock_override(
     firecracker_version: FirecrackerVersion,
@@ -2819,6 +2817,104 @@ fn build_clone_mount_redirects(
         redirects.push((source_vsock_dir, vsock_target_dir.to_path_buf()));
     }
     Ok(redirects)
+}
+
+/// The directories directly inside `view`, sorted.
+fn view_entries(view: &Path) -> Result<Vec<PathBuf>> {
+    view_children(view, |kind| kind.is_dir())
+}
+
+/// The regular files directly inside `view`, sorted: a read-only `--disk` can sit there.
+fn view_files(view: &Path) -> Result<Vec<PathBuf>> {
+    view_children(view, |kind| kind.is_file())
+}
+
+fn view_children(view: &Path, wanted: fn(&std::fs::FileType) -> bool) -> Result<Vec<PathBuf>> {
+    let mut children = Vec::new();
+    for entry in std::fs::read_dir(view)
+        .with_context(|| format!("listing {} for the clone's mount view", view.display()))?
+    {
+        let entry = entry.with_context(|| format!("listing {}", view.display()))?;
+        if entry.file_type().is_ok_and(|kind| wanted(&kind)) {
+            children.push(entry.path());
+        }
+    }
+    children.sort();
+    Ok(children)
+}
+
+/// The mount namespace for a clone's VMM: `pairs` (from [`build_clone_mount_redirects`])
+/// under a tmpfs over `view`, the directory every VM's runtime directory is in.
+///
+/// Only what a pair names is visible under `view`. The clone's runtime directory (API
+/// socket, log, disks) and its vsock directory, when that is inside `view`, get a pair
+/// onto themselves. Every other directory `view` holds (`view_entries`, listed before the
+/// VMM starts) that no redirect replaces is kept: bound onto itself if it still exists as
+/// the VMM starts, so a read-only `--disk` under another VM's directory stays reachable,
+/// and passed over if that VM's teardown removed it first. Nothing is read out of the
+/// snapshot's state.
+///
+/// A directory that holds a redirect's mountpoint (a source's `--vsock-dir` under
+/// `vm-disks/<dir>/`) is bound first, so the redirect lands inside it. A directory of the
+/// clone's own that contains a redirect's mountpoint (a `--vsock-dir` of `vm-disks`
+/// itself) is refused: binding it onto itself after them would cover those redirects
+/// with the host's directories again.
+fn clone_mount_view(
+    view: &Path,
+    mut pairs: Vec<(PathBuf, PathBuf)>,
+    clone_dir: &Path,
+    vsock_target_dir: &Path,
+    view_entries: &[PathBuf],
+) -> Result<crate::utils::MountRedirects> {
+    let mut first = Vec::new();
+    for dir in view_entries {
+        let covered = pairs
+            .iter()
+            .any(|(mountpoint, _)| dir.starts_with(mountpoint));
+        let holds = pairs
+            .iter()
+            .any(|(mountpoint, _)| mountpoint != dir && mountpoint.starts_with(dir));
+        if !covered && holds {
+            first.push((dir.clone(), dir.clone()));
+        }
+    }
+    pairs.splice(0..0, first);
+    for own in [clone_dir, vsock_target_dir] {
+        if !own.starts_with(view)
+            || pairs
+                .iter()
+                .any(|(mountpoint, _)| own.starts_with(mountpoint))
+        {
+            continue;
+        }
+        if let Some((covered, _)) = pairs
+            .iter()
+            .find(|(mountpoint, _)| mountpoint.starts_with(own))
+        {
+            bail!(
+                "the clone's directory {} contains {}, which its mount namespace redirects; \
+                 give the clone a directory of its own (--vsock-dir)",
+                own.display(),
+                covered.display()
+            );
+        }
+        pairs.push((own.to_path_buf(), own.to_path_buf()));
+    }
+    let keep = view_entries
+        .iter()
+        .filter(|dir| {
+            !pairs
+                .iter()
+                .any(|(mountpoint, _)| dir.starts_with(mountpoint))
+        })
+        .cloned()
+        .collect();
+    Ok(crate::utils::MountRedirects {
+        view: view.to_path_buf(),
+        pairs,
+        keep,
+        keep_files: Vec::new(),
+    })
 }
 
 /// True if vmstate references a rootfs path under one of the baseline bind-mount dirs,
@@ -3232,17 +3328,32 @@ async fn prepare_clone_substrate(
             .await
             .context("creating disks backing dir inside the vsock target")?;
     }
+    let view = paths::data_dir().join("vm-disks");
+    let redirects = match view_entries(&view).and_then(|entries| {
+        let mut redirects =
+            clone_mount_view(&view, redirects, data_dir, &vsock_target_dir, &entries)?;
+        redirects.keep_files = view_files(&view)?;
+        Ok(redirects)
+    }) {
+        Ok(redirects) => redirects,
+        Err(error) => {
+            cleanup_failed_clone_holder(&mut holder_child, "building the clone's mount view").await;
+            return Err(error);
+        }
+    };
     info!(
-        redirects = ?redirects.iter().map(|(m, s)| format!("{} <- {}", m.display(), s.display())).collect::<Vec<_>>(),
+        view = %redirects.view.display(),
+        redirects = ?redirects.pairs.iter().map(|(m, s)| format!("{} <- {}", m.display(), s.display())).collect::<Vec<_>>(),
         "enabling mount namespace for path isolation"
     );
     namespace.mount_redirects = Some(redirects);
 
-    // The VMM opens the snapshot's disks through the binds over these directories. Their
-    // own VMs' teardowns remove them, which detaches the binds in this clone's namespace
-    // too, so hold them until the disks are open (storage::runtime_dir).
+    // The VMM opens the snapshot's disks at these directories' paths, which its view
+    // binds to the clone's own (utils::MountRedirects), so a teardown that removes them
+    // no longer detaches anything here. The lease is still held until the disks are
+    // open (storage::runtime_dir).
     // Recorded before the lease, which creates a directory whose VM is gone as an empty
-    // mountpoint: the clone's teardown, or the next launch after a SIGKILL, removes it.
+    // directory: the clone's teardown, or the next launch after a SIGKILL, removes it.
     let leased = async {
         for dir in &disk_dirs {
             crate::reclaim::record(
@@ -3536,7 +3647,8 @@ pub async fn restore_from_snapshot(
             })?;
         let load_duration = load_start.elapsed();
         // The load opened every disk at its source path, so the source VMs may go. A
-        // VMM without the vsock override keeps resolving its socket through the redirect.
+        // VMM without the vsock override keeps resolving its socket through the redirect,
+        // which its view keeps whether or not the source directory exists.
         vsock_redirect_lease = mount_target_lease
             .take()
             .and_then(|lease| lease.after_load(vsock_override.is_none()));
@@ -3961,7 +4073,8 @@ pub async fn restore_from_snapshot_ch(
             .await
             .context("resuming Cloud Hypervisor after restore")?;
         // The restore opened every disk at its source path, so the source VMs may go.
-        // Cloud Hypervisor keeps resolving its vsock socket through the redirect.
+        // Cloud Hypervisor keeps resolving its vsock socket through the redirect, which its
+        // view keeps whether or not the source directory exists.
         vsock_redirect_lease = mount_target_lease
             .take()
             .and_then(|lease| lease.after_load(true));
@@ -6049,6 +6162,163 @@ mod tests {
                 PathBuf::from("/runtime/source-vm"),
                 PathBuf::from("/runtime/clone")
             )]
+        );
+    }
+
+    /// The clone's own directories inside the view get a pair onto themselves, so the
+    /// tmpfs over the view does not hide them: its runtime directory always, and a vsock
+    /// directory inside the view unless a pair already covers it.
+    #[test]
+    fn the_clone_mount_view_keeps_the_clone_s_own_directories_visible() {
+        let view = Path::new("/data/vm-disks");
+        let clone = Path::new("/data/vm-disks/clone");
+        let disks = vec![(
+            PathBuf::from("/data/vm-disks/source"),
+            PathBuf::from("/data/vm-disks/clone"),
+        )];
+        let own = |dir: &str| (PathBuf::from(dir), PathBuf::from(dir));
+
+        let redirects = clone_mount_view(view, disks.clone(), clone, clone, &[]).unwrap();
+        assert_eq!(redirects.view, view);
+        assert_eq!(
+            redirects.pairs,
+            [disks.clone(), vec![own("/data/vm-disks/clone")]].concat()
+        );
+
+        let redirects =
+            clone_mount_view(view, disks.clone(), clone, Path::new("/srv/vsock"), &[]).unwrap();
+        assert_eq!(
+            redirects.pairs,
+            [disks.clone(), vec![own("/data/vm-disks/clone")]].concat()
+        );
+
+        let redirects = clone_mount_view(
+            view,
+            disks.clone(),
+            clone,
+            Path::new("/data/vm-disks/clone/v"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            redirects.pairs,
+            [disks.clone(), vec![own("/data/vm-disks/clone")]].concat()
+        );
+
+        let redirects = clone_mount_view(
+            view,
+            disks.clone(),
+            clone,
+            Path::new("/data/vm-disks/vsock"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            redirects.pairs,
+            [
+                disks.clone(),
+                vec![own("/data/vm-disks/clone"), own("/data/vm-disks/vsock")]
+            ]
+            .concat()
+        );
+
+        // A relaunch that restores into the source's own directory already has its pair.
+        let same = vec![(
+            PathBuf::from("/data/vm-disks/clone"),
+            PathBuf::from("/data/vm-disks/clone"),
+        )];
+        assert_eq!(
+            clone_mount_view(view, same.clone(), clone, clone, &[])
+                .unwrap()
+                .pairs,
+            same
+        );
+    }
+
+    /// A read-only `--disk` under another directory of vm-disks stays reachable,
+    /// whatever that directory is called: every directory the view holds that no
+    /// redirect replaces is kept, bound onto itself when it still exists as the VMM starts.
+    ///
+    /// RED BEFORE THE FIX: the view held only the redirects and the clone's own
+    /// directories, so the tmpfs hid the other directories and the load could not open
+    /// a disk in one.
+    #[test]
+    fn the_clone_mount_view_exposes_every_other_directory_of_the_view() {
+        let root = tempfile::tempdir().unwrap();
+        let view = root.path().join("vm-disks");
+        let source = view.join("vm-source");
+        let clone = view.join("vm-clone");
+        let other = view.join("vm-other");
+        let external = view.join("external.data");
+        for dir in [&source, &clone, &other, &external] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(view.join("not-a-dir"), b"").unwrap();
+        let entries = view_entries(&view).unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                external.clone(),
+                clone.clone(),
+                other.clone(),
+                source.clone()
+            ]
+        );
+        let disks = vec![(source.clone(), clone.clone())];
+        let redirects = clone_mount_view(&view, disks.clone(), &clone, &clone, &entries).unwrap();
+        assert_eq!(
+            redirects.pairs,
+            [disks, vec![(clone.clone(), clone.clone())]].concat()
+        );
+        assert_eq!(redirects.keep, vec![external.clone(), other.clone()]);
+    }
+
+    /// A source whose `--vsock-dir` sits in a directory of its own inside vm-disks: that
+    /// directory holds the vsock redirect's mountpoint, so it is bound first and the
+    /// redirect lands inside it.
+    ///
+    /// RED BEFORE THE FIX: the directory was refused for containing the redirect.
+    #[test]
+    fn a_named_directory_that_holds_a_redirect_is_bound_before_it() {
+        let root = tempfile::tempdir().unwrap();
+        let view = root.path().join("vm-disks");
+        let shared = view.join("shared");
+        let source_vsock = shared.join("source");
+        let clone = view.join("vm-clone");
+        for dir in [&source_vsock, &clone] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let redirect = (source_vsock.clone(), clone.clone());
+        let entries = view_entries(&view).unwrap();
+        let redirects =
+            clone_mount_view(&view, vec![redirect.clone()], &clone, &clone, &entries).unwrap();
+        assert_eq!(
+            redirects.pairs,
+            vec![
+                (shared.clone(), shared.clone()),
+                redirect,
+                (clone.clone(), clone.clone())
+            ]
+        );
+        assert!(redirects.keep.is_empty(), "{:?}", redirects.keep);
+    }
+
+    /// A vsock directory that contains a redirect's mountpoint (`--vsock-dir` set to
+    /// `vm-disks` itself) is refused: a pair binding it onto itself, applied after the
+    /// disk redirects, would cover them with the host's directories, and the VMM would
+    /// open the source VM's disks again.
+    #[test]
+    fn a_vsock_dir_that_contains_a_redirect_is_refused() {
+        let view = Path::new("/data/vm-disks");
+        let clone = Path::new("/data/vm-disks/clone");
+        let disks = vec![(
+            PathBuf::from("/data/vm-disks/source"),
+            PathBuf::from("/data/vm-disks/clone"),
+        )];
+        let error = clone_mount_view(view, disks, clone, view, &[]).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("/data/vm-disks contains /data/vm-disks/source"),
+            "{error:#}"
         );
     }
 

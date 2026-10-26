@@ -2537,6 +2537,217 @@ async fn test_lifecycle_interleave_source_teardown_waits_for_clone_disk_open() -
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// CASE: clone_vsock_outlives_its_source
+// ---------------------------------------------------------------------------
+
+/// A vsock port no fcvm listener uses, for the guest-initiated probe below.
+const PROBE_VSOCK_PORT: u32 = 47131;
+
+/// Open one guest-initiated vsock stream from the clone to `<its vsock path>_<port>`
+/// on the host, and require the host side to accept it and the guest to read the
+/// host's reply. Every connection the guest starts (container status, output,
+/// egress, a TTY) takes this path.
+async fn probe_guest_initiated_vsock(clone_pid: u32, listener_path: &Path) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    remove_file_if_exists(listener_path)?;
+    let listener = tokio::net::UnixListener::bind(listener_path)
+        .with_context(|| format!("binding {}", listener_path.display()))?;
+    // The VMM may run as another user than this test (root in the clone's user
+    // namespace); connecting needs write permission on the socket.
+    std::fs::set_permissions(
+        listener_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o777),
+    )?;
+    let accept = async {
+        let (mut stream, _) = listener.accept().await?;
+        let mut hello = [0u8; 6];
+        stream.read_exact(&mut hello).await?;
+        anyhow::ensure!(&hello == b"probe\n", "the guest sent {hello:?}");
+        stream.write_all(b"ok\n").await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    // exec_in_vm joins its arguments into one `sh -c` line.
+    let probe = format!(
+        "python3 -c 'import socket; s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM); \
+         s.settimeout(10); s.connect((2, {PROBE_VSOCK_PORT})); s.sendall(b\"probe\\n\"); \
+         print(s.recv(3).decode().strip())'"
+    );
+    let argv = [probe.as_str()];
+    let guest = common::exec_in_vm(clone_pid, &argv);
+    let (accepted, replied) =
+        tokio::join!(tokio::time::timeout(Duration::from_secs(20), accept), guest);
+    let result = (|| {
+        let replied = replied.context("the guest's vsock connection to the host failed")?;
+        anyhow::ensure!(
+            replied.trim() == "ok",
+            "the guest read {replied:?} from the host"
+        );
+        accepted
+            .context("the host never accepted the guest's vsock connection")?
+            .context("the host side of the guest's vsock connection")?;
+        Ok(())
+    })();
+    remove_file_if_exists(listener_path)?;
+    result
+}
+
+/// A clone's VMM connects each guest-initiated vsock stream to `<uds>_<port>`, where
+/// `<uds>` is the path its vsock device holds: the source VM's
+/// `vm-disks/<source>/vsock.sock` unless the snapshot load overrode it (Firecracker
+/// 1.16.0 and later). Cloud Hypervisor takes no override, so its clones resolve that
+/// path in their mount namespace for their whole life, and a running source VM's
+/// teardown removes the directory it names (issue 1187).
+///
+/// 1. boot a baseline, snapshot it, restore a clone while the baseline runs;
+/// 2. probe a guest-initiated vsock stream from the clone;
+/// 3. stop the baseline and wait for its teardown to remove its directory;
+/// 4. probe again: the clone must still reach its own listener.
+///
+/// RED BEFORE THE FIX on Cloud Hypervisor: the clone's bind sat on the baseline's
+/// directory, the teardown's removal detached it, and the second probe's connection
+/// was reset.
+async fn clone_vsock_outlives_its_source(prefix: &str, hypervisor: &str) -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names(prefix);
+    let mut baseline: Option<(tokio::process::Child, PinnedProcess)> = None;
+    let mut clone: Option<(tokio::process::Child, PinnedProcess, PathBuf)> = None;
+    let mut snapshot_created = false;
+
+    let exercise: Result<()> = async {
+        let (baseline_child, baseline_pid, _) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &baseline_name,
+                "--network",
+                "rootless",
+                "--hypervisor",
+                hypervisor,
+                "--no-snapshot",
+                common::TEST_IMAGE,
+            ],
+            &[],
+        )
+        .await
+        .context("spawning the baseline")?;
+        let baseline_process =
+            PinnedProcess::capture(baseline_pid).context("pinning the baseline")?;
+        baseline = Some((baseline_child, baseline_process));
+        common::poll_health_by_pid(baseline_pid, 300)
+            .await
+            .context("waiting for baseline health")?;
+        let baseline_dir = artifacts_for_name(&baseline_name)?
+            .context("baseline published no state")?
+            .data_dir;
+        common::create_snapshot_by_pid(baseline_pid, &snapshot_name)
+            .await
+            .context("snapshotting the baseline")?;
+        snapshot_created = true;
+
+        let (clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snapshot_name,
+                "--name",
+                &clone_name,
+            ],
+            &[],
+        )
+        .await
+        .context("spawning the clone")?;
+        let clone_process = PinnedProcess::capture(clone_pid).context("pinning the clone")?;
+        clone = Some((clone_child, clone_process, clone_log.clone()));
+        let (clone_child, _, _) = clone.as_mut().context("clone fixture disappeared")?;
+        common::poll_health(clone_child, 300)
+            .await
+            .with_context(|| {
+                format!(
+                    "the clone did not become healthy; log tail:\n{}",
+                    log_tail(&clone_log, 60)
+                )
+            })?;
+        let clone_vsock = ls_vm_by_pid(clone_pid)
+            .await?
+            .and_then(|state| state.config.vsock_socket_path)
+            .context("the clone recorded no vsock socket path")?;
+        let listener_path = PathBuf::from(format!("{}_{PROBE_VSOCK_PORT}", clone_vsock.display()));
+
+        probe_guest_initiated_vsock(clone_pid, &listener_path)
+            .await
+            .context("probing the clone's vsock while its source runs")?;
+
+        let (baseline_child, baseline_process) =
+            baseline.as_mut().context("baseline fixture disappeared")?;
+        stop_test_child(baseline_child, baseline_process)
+            .await
+            .context("stopping the baseline")?;
+        baseline = None;
+        anyhow::ensure!(
+            !baseline_dir.exists(),
+            "the baseline's teardown left {}",
+            baseline_dir.display()
+        );
+
+        probe_guest_initiated_vsock(clone_pid, &listener_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "probing the clone's vsock after its source's teardown; log tail:\n{}",
+                    log_tail(&clone_log, 40)
+                )
+            })?;
+        Ok(())
+    }
+    .await;
+
+    let mut cleanup_errors = Vec::new();
+    let mut all_children_stopped = true;
+    if let Some((child, process, _)) = clone.as_mut() {
+        if let Err(error) = stop_test_child(child, process).await {
+            all_children_stopped = false;
+            cleanup_errors.push(format!("stopping clone: {error:#}"));
+        }
+    }
+    if let Some((child, process)) = baseline.as_mut() {
+        if let Err(error) = stop_test_child(child, process).await {
+            all_children_stopped = false;
+            cleanup_errors.push(format!("stopping baseline: {error:#}"));
+        }
+    }
+    if snapshot_created && all_children_stopped {
+        if let Err(error) = common::delete_snapshot(&snapshot_name).await {
+            cleanup_errors.push(format!("deleting snapshot {snapshot_name}: {error:#}"));
+        }
+    }
+    exercise?;
+    anyhow::ensure!(
+        cleanup_errors.is_empty(),
+        "fixture cleanup failed:\n- {}",
+        cleanup_errors.join("\n- ")
+    );
+    Ok(())
+}
+
+/// Firecracker clones take the load's vsock override, so this guards that path.
+#[tokio::test]
+async fn test_lifecycle_interleave_clone_vsock_outlives_its_source() -> Result<()> {
+    clone_vsock_outlives_its_source("ilv-vsock-src", "firecracker").await
+}
+
+/// Cloud Hypervisor clones reach their vsock listeners through the mount namespace.
+// Host-Root CI provisions Cloud Hypervisor; container-test-all does not.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_lifecycle_interleave_cloud_hypervisor_clone_vsock_outlives_its_source() -> Result<()>
+{
+    fcvm::commands::common::find_cloud_hypervisor()
+        .context("this test requires the Cloud Hypervisor backend")?;
+    clone_vsock_outlives_its_source("ilv-ch-vsock-src", "cloud-hypervisor").await
+}
+
 /// A restore of a snapshot whose source VM is gone recreates the source's runtime
 /// directory as a mountpoint for its disk redirect (issue 1187). Once the clone's VMM
 /// has opened its disks through it, and its Firecracker takes the vsock override
