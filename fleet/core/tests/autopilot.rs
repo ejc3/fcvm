@@ -77,6 +77,7 @@ fn pose_at(c: &Claim, t: f64) -> Keyframe {
         time_of_day: 0.0,
         words: vec![],
         lights: vec![],
+        weather: vec![],
     }
     .camera_at(t)
 }
@@ -307,6 +308,7 @@ fn lap_fixture() -> serde_json::Value {
         time_of_day: 0.0,
         words: vec![],
         lights: vec![],
+        weather: vec![],
     };
     let to = paused.camera_at(20.3 + autopilot::PAUSE_SECS / 2.0);
     paused.steer_over(20.3, to, autopilot::PAUSE_SECS);
@@ -318,6 +320,7 @@ fn lap_fixture() -> serde_json::Value {
             time_of_day: 0.0,
             words: vec![],
             lights: vec![],
+            weather: vec![],
         };
         let n = ((to - from) / 0.25).round() as i64;
         (0..=n)
