@@ -238,7 +238,7 @@
     {
       "after": 9,
       "checks": {
-        "/assign/h1/2/private_camera/2/intent": "s1",
+        "/assign/h1/2/private_camera/3/intent": "s1",
         "/receipts/s1/outcome": "committed"
       }
     },

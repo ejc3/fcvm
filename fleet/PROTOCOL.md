@@ -77,17 +77,20 @@ The answer to a `verify`.
  "frame_url": "ws://<host>:<port>/frames", "token": "<secret>",
  "clicked_at": 1761134400000, "first_frame_at": 1761134405400, "expires_at": 1761134465400,
  "gpu": "Tesla T4", "phases": {"teardown_ms": 310, "restore_ms": 4300, "gpu_ms": 3100, "total_ms": 5400},
- "camera": [{"t": 812.0, "pos": [...], "look": [...], "fov_deg": 60, "intent": "<id>"}], "ended": null}}
+ "camera": [{"t": 812.0, "pos": [...], "look": [...], "fov_deg": 60, "intent": "<id>"}],
+ "autopilot": true, "ended": null}}
 ```
 
 Sent only to the connection whose `claim_gpu` committed, whenever the claim changes:
 first with `phase: "restoring"` (no frame URL yet), then `running` once the private VM
 has drawn its first frame (its `frame_url`, `first_frame_at - clicked_at` the click to
-first frame, `phases` the agent's timings of the restore), again when `claim_camera`
-moves its camera, and a last time with `phase: "ended"` and `ended` saying why
+first frame, `phases` the agent's timings of the restore), again whenever its camera
+keyframes change (`claim_camera`, `claim_autopilot`, and the autopilot's next keyframes
+about every 8 s while it flies), and a last time with `phase: "ended"` and `ended` saying why
 (`expired`, or `released`: `release_gpu`, the viewer leaving, or the GPU leaving the
 fleet). The frame URL and the token appear in no snapshot. `tile` is the wall tile it
-borrowed, null for a standby GPU.
+borrowed, null for a standby GPU. `autopilot` is true while the camera flies the
+autopilot's loop (below) and false once the viewer has paused it or taken the camera.
 
 ```json
 {"type": "clock", "server_unix_ms": 1761134400123, "client_unix_ms": 1761134400100.5}
@@ -130,7 +133,8 @@ Intents:
 | `light` | `{"pos": [x, y, z], "color": [r, g, b]}` | one per client per second; each client keeps its latest 3 (its oldest goes); `color` components are clamped to [0, 1], then scaled so they add up to at most 2; the scene keeps the latest 32 |
 | `claim_gpu` | `{}` | a GPU of your own for 60 s (below) |
 | `release_gpu` | `{"claim": "claim-3"}` (or `{}`) | ends your claim early; a `claim` that is not yours is refused |
-| `claim_camera` | `{"drag": {"yaw_deg", "pitch_deg", "dive"}}` | turns and moves your claimed GPU's camera (only yours; refused without a claim), easing over 0.3 s; the keyframe it eases to gets `"intent": <id>`. Yaw within 360, pitch within 180, dive within 50 |
+| `claim_camera` | `{"drag": {"yaw_deg", "pitch_deg", "dive"}}` | turns and moves your claimed GPU's camera (only yours; refused without a claim), easing over 0.3 s; the keyframe it eases to gets `"intent": <id>`. Yaw within 360, pitch within 180, dive within 50. On a camera flying its autopilot it also stops the autopilot: the camera eases to rest along its path over 0.5 s while it turns by the drag |
+| `claim_autopilot` | `{"on": false}` or `{"on": true}` | stops your claimed GPU's autopilot (the camera comes to rest along its path over 1 s, on a keyframe with `"intent": <id>`, and stays there) or starts it again (the camera flies from where it is to the nearest point of the loop in 2 to 8 s, that keyframe carrying the intent, and on around it). Refused without a claim; the state it already has commits and changes nothing |
 
 There is no intent to move the wall's camera, set its time of day, relaunch every tile
 on a viewer's schedule, or change the race cadence: the director and the owner's
@@ -210,7 +214,14 @@ running its current generation (not relaunching, not still racing). The tile kee
 place in the layout, its `phase` becomes `borrowed` and its frame URL is withheld; its
 host's aggregator draws it black. The agent tears the tile's VM down and restores a
 private VM on that GPU drawing the whole image with the session's own camera, which only
-its viewer can move (`claim_camera`). The coordinator times the click to that VM's first frame and
+its viewer can move (`claim_camera`, `claim_autopilot`). The camera waits at the start of
+the autopilot's loop and flies it from 0.5 s after the first frame: a 56 s loop
+(`fleet/core/src/autopilot.rs`) low over the lake west of the main peak, up the ridge
+face, along the peak's flank, up through the cloud layer to 7 km, over the top, down
+through the clouds, low over the water and hills to the south, and back onto the lake. Its
+keyframes come a second apart and reach at least 8 s ahead (16 s after each batch). It
+flies until the viewer pauses it or drags, scrolls or presses a camera key, and does not
+start again on its own. The coordinator times the click to that VM's first frame and
 sends the viewer, alone, `claim` messages. After 60 s (`claim_secs`), on `release_gpu`, or
 when the viewer disconnects, the private VM is destroyed and the tile's VM restores back
 into the wall, timed like any relaunch (`last_relaunch.by` is `return:<session>`). Refused:

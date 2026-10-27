@@ -406,6 +406,8 @@ export interface Claim {
   gpu: string | null;
   phases: Record<string, number>;
   camera: CameraKey[];
+  /** The camera flies the coordinator's autopilot loop (true) or is the viewer's (false). */
+  autopilot: boolean;
   /** Why it ended, once it has. */
   ended: string | null;
 }
@@ -440,7 +442,7 @@ export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg | HelloMs
 export const DEFAULT_IMAGE_ASPECT = 16 / 9;
 
 /** The intents the page sends, by the coordinator's names (PROTOCOL.md, "Intents"). */
-export const INTENT_NAMES = ["relaunch", "restart_now", "nudge", "word", "light", "claim_gpu", "claim_camera", "release_gpu"] as const;
+export const INTENT_NAMES = ["relaunch", "restart_now", "nudge", "word", "light", "claim_gpu", "claim_camera", "claim_autopilot", "release_gpu"] as const;
 export type IntentName = (typeof INTENT_NAMES)[number];
 
 export interface IntentMsg {
@@ -493,6 +495,11 @@ function isObj(v: unknown): v is Obj {
 function num(o: Obj, k: string, where: string): number {
   const v = o[k];
   if (typeof v !== "number" || !Number.isFinite(v)) throw new ProtocolError(`${where}.${k} is not a number`);
+  return v;
+}
+function bool(o: Obj, k: string, where: string): boolean {
+  const v = o[k];
+  if (typeof v !== "boolean") throw new ProtocolError(`${where}.${k} is not true or false`);
   return v;
 }
 function numOrNull(o: Obj, k: string, where: string): number | null {
@@ -801,6 +808,7 @@ function parseClaim(v: Obj): Claim {
     gpu: strOrNull(v, "gpu", w),
     phases,
     camera: parseCamera(v, "claim"),
+    autopilot: bool(v, "autopilot", w),
     ended: strOrNull(v, "ended", w),
   };
 }

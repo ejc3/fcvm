@@ -32,7 +32,7 @@ import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type Aggregate, type 
 import { KIND_TAG, NOT_AWAKE_NOTE, raceOnImage, ratioText, runningRace, scoreView, type RaceOnImage, type ScoreView } from "./race.ts";
 import { sceneUnixMs } from "./scene.ts";
 import { reelView, type ReelMeta, type ReelView } from "./reel.ts";
-import type { ClientState, FrameStats, GpuSample, Notice, StreamMode, TileFrameStats } from "./store.ts";
+import { ownAutopilot, type ClientState, type FrameStats, type GpuSample, type Notice, type StreamMode, type TileFrameStats } from "./store.ts";
 import { sceneAgeMs } from "./lag.ts";
 
 export const SITE = "fcvm.dev";
@@ -934,6 +934,29 @@ export interface OwnView {
   gpu: string;
   steps: TimelineStep[];
   placed: { box: Box; streamHeight: number } | null;
+  /** The autopilot control, or null before a claim arrives and after it ends. */
+  autopilot: OwnAutopilot | null;
+}
+
+/** The pause and play control of the viewer's own camera. */
+export interface OwnAutopilot {
+  on: boolean;
+  /** The button's text and accessible name: what pressing it does. */
+  button: string;
+  /** The state shown next to it. */
+  state: string;
+  /** The key that toggles it. */
+  key: string;
+}
+
+/** Toggles the autopilot on the viewer's own GPU. */
+export const AUTOPILOT_KEY = " ";
+
+function ownAutopilotView(on: boolean | null): OwnAutopilot | null {
+  if (on === null) return null;
+  return on
+    ? { on, button: "Pause", state: "Autopilot", key: "Space" }
+    : { on, button: "Play", state: "Paused", key: "Space" };
 }
 
 export interface OwnButton {
@@ -971,6 +994,7 @@ function ownView(s: ClientState, st: FleetState, srvNow: number, input: WallInpu
     return { box: b, streamHeight: Math.min(NATIVE_TILE_HEIGHT, streamHeightFor(b.h * input.dpr, st.image_aspect)) };
   })() : null;
   const left = c?.expires_at != null ? c.expires_at - srvNow : null;
+  const autopilot = ownAutopilot(s);
   const status = ended
     ? c?.ended ?? "Your minute is up. The GPU went back to the pool."
     : first === null
@@ -988,11 +1012,15 @@ function ownView(s: ClientState, st: FleetState, srvNow: number, input: WallInpu
     countdown: ended ? "" : left === null ? fmt.countdown(OWN_GPU_SECONDS * 1000) : fmt.countdown(left),
     ended,
     back: "Back to the wall",
-    help: "Drag to turn the camera, scroll to move closer. Arrow keys and plus or minus work too.",
+    help:
+      autopilot === true
+        ? "Flying on autopilot. Drag, scroll, an arrow key or plus or minus takes the camera; Space pauses."
+        : "Drag to turn the camera, scroll to move closer. Arrow keys and plus or minus work too; Space flies again.",
     latency: s.lastInputLatencyMs === null ? "move the camera to measure input to pixels" : `input to pixels: ${fmt.millis(s.lastInputLatencyMs)}`,
     gpu: c?.gpu ?? "",
     steps: c ? timelineOf(c.phases).steps : [],
     placed,
+    autopilot: ended ? null : ownAutopilotView(autopilot),
   };
 }
 

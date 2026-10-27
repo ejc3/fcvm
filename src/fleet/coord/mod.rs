@@ -482,6 +482,7 @@ impl Actor {
                             Default::default()
                         },
                         camera: c.camera.clone(),
+                        autopilot: c.autopilot,
                         ended: None,
                     })
                 });

@@ -93,6 +93,9 @@ pub struct ClaimMsg {
     /// The agent's timings of the private VM's restore.
     pub phases: BTreeMap<String, u64>,
     pub camera: Vec<crate::scene::Keyframe>,
+    /// The camera flies the autopilot's loop (`claim_autopilot`); false once the viewer
+    /// paused it or took the camera.
+    pub autopilot: bool,
     /// Why it ended: `expired` (its time ran out) or `released` (`release_gpu`, or the GPU
     /// left the fleet); null while it lasts.
     pub ended: Option<String>,

@@ -1050,6 +1050,49 @@ test("your own GPU: a wall tile's GPU is lent, streams full screen with its own 
   await other.context().close();
 });
 
+test("your own GPU flies on autopilot from its first frame; Space, the button and an arrow key pause it", async ({ page }) => {
+  await openWall(page, 15);
+  await page.getByTestId("own-gpu").click();
+  await expect(page.getByTestId("own-status")).toHaveText("Your GPU is streaming", { timeout: 10_000 });
+  const state = page.getByTestId("own-autopilot-state");
+  const button = page.getByTestId("own-autopilot");
+  await expect(state).toHaveText("Autopilot");
+  await expect(button).toHaveText("Pause");
+  // Flying: the claim's camera has keys ahead, and they move.
+  const ahead = () =>
+    page.evaluate(() => {
+      const s = window.__fleet!.client.getState();
+      const keys = s.own.claim?.camera ?? [];
+      const xs = new Set(keys.map((k) => Math.round(((k as { x?: number }).x ?? 0) * 1000)));
+      return { autopilot: s.own.claim?.autopilot, moving: xs.size > 2 };
+    });
+  await expect.poll(ahead).toEqual({ autopilot: true, moving: true });
+  // Space pauses whichever button has focus (Back to the wall has it now) and does not close the view.
+  await expect(page.getByTestId("own-back")).toBeFocused();
+  await page.keyboard.press(" ");
+  await expect(state).toHaveText("Paused");
+  await expect(button).toHaveText("Play");
+  await expect(page.getByTestId("own")).toBeVisible();
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().own.claim?.autopilot)).toBe(false);
+  // The button flies again, and Space pressed on the button toggles once, not twice.
+  await button.click();
+  await expect(state).toHaveText("Autopilot");
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().own.claim?.autopilot)).toBe(true);
+  await button.focus();
+  await page.keyboard.press(" ");
+  await expect(state).toHaveText("Paused");
+  await page.waitForTimeout(300);
+  await expect(state).toHaveText("Paused");
+  await page.keyboard.press(" ");
+  await expect(state).toHaveText("Autopilot");
+  // An arrow key takes the camera: paused, and the coordinator agrees.
+  await page.keyboard.press("ArrowLeft");
+  await expect(state).toHaveText("Paused");
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().own.claim?.autopilot)).toBe(false);
+  await page.getByTestId("own-back").click();
+  await expect(page.getByTestId("own")).toHaveCount(0, { timeout: 5000 });
+});
+
 test("text is 14 px or larger at 4.5:1 or better, and race results go to a live region", async ({ page }) => {
   await openWall(page, 15);
   await page.getByTestId("play").click();
