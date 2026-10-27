@@ -415,6 +415,29 @@ int main() {
     CHECK(cheap.last_h == 432, "720 is not drawn again within the backoff (drew %d)", cheap.last_h);
     Run back = run(s, {432, 720}, 16.0, 110, 60);
     CHECK(back.last_h == 720 && back.skipped == 0, "after the backoff it is (drew %d)", back.last_h);
+    // a tile too slow to draw min_frames frames in the 2 s window still steps down
+    // (Codex on #1380: 432 and 2160 asked, 2160 at about 3 fps)
+    HeightGuard crawl;
+    Run c = run(crawl, {432, 2160}, 33.0, 0, 6);
+    Run c2 = run(crawl, {432, 2160}, 33.0, 6, 20);
+    CHECK(c.last_h == 432 && c2.skipped == 0 && c2.last_h == 432,
+          "a 3 fps tile steps down (drew %d, then %lld skipped)", c2.last_h, c2.skipped);
+    // a renderer at another frame rate judges frames against its own slot
+    // (Codex on #1380: at FPS=60 a 20 ms 720 frame overruns every slot)
+    HeightGuard sixty;
+    sixty.slot_ms = 1000.0 / 60;
+    double t60 = 0;
+    for (int i = 0; i < 200; i++, t60 += 1.0 / 30) {  // 20 ms at 720 skips every other 60 fps slot
+      int h = sixty.choose({432, 720}, px, t60);
+      sixty.observe(t60, h, h == 720 ? 20.0 : 20.0 * px(432) / px(720));
+    }
+    CHECK(sixty.drawn() == 432, "a 60 fps renderer leaves a 20 ms height (drew %d)", sixty.drawn());
+    {
+      bool set = false;
+      for (auto& l : source_lines("../src/pipeline.cpp"))
+        set = set || l.find("height_guard_.slot_ms = 1000.0 / o.fps;") != std::string::npos;
+      CHECK(set, "the pipeline gives the height guard its own frame slot");
+    }
     // a single asked height is drawn however slow (nothing lower to go to)
     HeightGuard one;
     Run solo = run(one, {720}, 33.0, 0, 5);

@@ -56,6 +56,7 @@ Pipeline::Pipeline(const Options& o) : opt_(o) {
   fit_scale_ = o.fit_scale;
   r_.set_fps(o.fps);
   r_.set_margin(o.margin);
+  height_guard_.slot_ms = 1000.0 / o.fps;
 }
 
 Pipeline::~Pipeline() {

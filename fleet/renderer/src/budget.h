@@ -197,7 +197,8 @@ class HeightGuard {
   double over_frac = 0.85;   // frames whose 90th percentile passes this share of a slot: the height is too tall
   double fit_frac = 0.70;    // a step down goes to the tallest height predicted within this share
   double up_frac = 0.65;     // a step up goes only to a height predicted within this share
-  double window_s = 2.0;     // frames judged
+  double window_s = 2.0;     // frames judged: the last window_s, or the last min_frames if older
+  double stale_s = 10.0;     // frames older than this are never judged (the tile stopped streaming)
   double settle_s = 0.3;     // frames this soon after a switch are not judged (priming, new encoder)
   double hold_s = 10.0;      // a height is drawn this long before a taller one is tried
   double backoff_s = 60.0;   // a height that overran is not drawn again for this long
@@ -207,7 +208,7 @@ class HeightGuard {
   void observe(double now_s, int h, double frame_ms) {
     if (h != drawn_ || now_s - since_ < settle_s) return;
     frames_.push_back({now_s, frame_ms});
-    while (!frames_.empty() && frames_.front().first < now_s - window_s) frames_.pop_front();
+    prune(now_s);
   }
 
   // The height to draw for the asked heights (ascending, distinct); px(h) is
@@ -215,13 +216,17 @@ class HeightGuard {
   template <class Px>
   int choose(const std::vector<int>& asked, Px px, double now_s) {
     if (asked.empty()) return 0;
-    while (!frames_.empty() && frames_.front().first < now_s - window_s) frames_.pop_front();
+    prune(now_s);
     auto in = [&](int h) { return std::find(asked.begin(), asked.end(), h) != asked.end(); };
     auto banned = [&](int h) {
       auto it = banned_.find(h);
       return it != banned_.end() && now_s < it->second;
     };
-    double p90 = frames_.size() >= min_frames ? pct90() : -1;
+    // judged once min_frames are in, or, for a tile too slow to draw that many,
+    // once three frames span the window
+    bool enough = frames_.size() >= min_frames ||
+                  (frames_.size() >= 3 && now_s - frames_.front().first >= window_s);
+    double p90 = enough ? pct90() : -1;
     // the tallest asked height under `below` predicted within frac of a slot
     auto fitting = [&](int below, double frac) {
       int best = 0;
@@ -258,6 +263,11 @@ class HeightGuard {
     drawn_ = h;
     since_ = now_s;
     frames_.clear();
+  }
+  void prune(double now_s) {
+    while (!frames_.empty() && (frames_.front().first < now_s - stale_s ||
+                                (frames_.size() > min_frames && frames_.front().first < now_s - window_s)))
+      frames_.pop_front();
   }
   double pct90() const {
     std::vector<double> v;
