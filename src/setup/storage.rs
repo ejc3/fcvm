@@ -233,9 +233,12 @@ fn ensure_storage_with(
 
     // Mount the loopback image
     info!("Mounting btrfs filesystem...");
+    // user_subvol_rm_allowed lets an unprivileged owner delete the subvolumes fcvm makes for
+    // snapshot directories; without it a rootless delete removes them file by file, one
+    // reference per extent of each memory file.
     let status = Command::new("mount")
         .arg("-o")
-        .arg("loop")
+        .arg("loop,user_subvol_rm_allowed")
         .arg(&loopback_image)
         .arg(&mount_point)
         .status()
