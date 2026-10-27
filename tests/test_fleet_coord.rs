@@ -3462,6 +3462,10 @@ struct FakeEc2Api {
     /// does not offer the type (`Unsupported`).
     spot_subnets: Vec<String>,
     unsupported_subnets: Vec<String>,
+    /// How many RunInstances calls are answered RequestLimitExceeded before any is served.
+    throttle_runs: Arc<std::sync::atomic::AtomicU32>,
+    /// How long a RunInstances answer takes.
+    run_delay: Duration,
     calls: Arc<std::sync::Mutex<Vec<Ec2Call>>>,
 }
 
@@ -3506,6 +3510,17 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
                 };
                 match action {
                     "RunInstances" => {
+                        tokio::time::sleep(api.run_delay).await;
+                        let throttled = api
+                            .throttle_runs
+                            .fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1))
+                            .is_ok();
+                        if throttled {
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "<Response><Errors><Error><Code>RequestLimitExceeded</Code><Message>Request limit exceeded.</Message></Error></Errors></Response>".into(),
+                            );
+                        }
                         let spot = params["LaunchTemplate.LaunchTemplateName"] == "fcvm-fleet-tile-x86_64";
                         match params.get("NetworkInterface.1.SubnetId") {
                             Some(s) if api.unsupported_subnets.contains(s) => return error("Unsupported"),
@@ -3905,6 +3920,124 @@ async fn a_starting_tile_is_seen_ready_within_the_health_poll_not_the_describe_p
         .filter(|(_, p)| p["Action"] == "DescribeInstances")
         .count();
     assert_eq!(describes, 1, "one describe within the first poll");
+}
+
+/// A tile driver for [`FakeEc2Api`] in us-east-1 over `subnets`, with an on-demand template.
+fn subnet_tile_driver(base: &str, subnets: &str) -> fcvm::fleet::coord::ec2_aws::AwsEc2 {
+    use fcvm::fleet::coord::ec2_aws::{networks, AwsEc2};
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let mut d = AwsEc2::new(
+        vec!["us-east-1".to_string()],
+        "fcvm-fleet-tile-x86_64".into(),
+        Some("fcvm-fleet-tile-on-demand-x86_64".into()),
+        "fcvm.example".into(),
+    )
+    .unwrap();
+    d.endpoints.insert("us-east-1".into(), base.to_string());
+    d.networks = networks(
+        &[format!("us-east-1:{subnets}")],
+        &["us-east-1:sg-0fleet".to_string()],
+    )
+    .unwrap();
+    d
+}
+
+/// A RunInstances that EC2 throttles is sent again after a short backoff, so the launch
+/// goes on through its AZs to an instance. Before, a throttle failed the whole launch: on
+/// 2026-10-27 a wake's eight tiles sent 56 RunInstances at once, most were throttled, and
+/// each throttled tile waited out the tile backoff (1 to 30 s) and started over; the last
+/// tile launched 3 min 36 s after the wake.
+#[tokio::test]
+async fn a_throttled_launch_is_sent_again_not_failed() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let api = FakeEc2Api {
+        spot_subnets: vec!["subnet-a".into()],
+        throttle_runs: Arc::new(std::sync::atomic::AtomicU32::new(3)),
+        ..Default::default()
+    };
+    let base = fake_ec2_api(api.clone()).await;
+    let d = subnet_tile_driver(&base, "subnet-a");
+    let l = match d.launch("ec2-1").await {
+        Ok(l) => l,
+        Err(e) => panic!("the launch failed: {e:?}"),
+    };
+    assert_eq!(l.instance, "us-east-1/i-0123456789abcdef0");
+    let runs = api
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, p)| p["Action"] == "RunInstances")
+        .count();
+    assert_eq!(runs, 4, "three throttled sends and the one that launched");
+}
+
+/// The waits before a throttled call is sent again are spread, so the tiles EC2 throttled
+/// together do not all send again in the same instant and get throttled again, and they
+/// start short (the RunInstances bucket refills within seconds) and stay under the cap.
+#[test]
+fn throttled_calls_wait_short_jittered_backoffs() {
+    use fcvm::fleet::coord::ec2_aws::{throttle_wait, THROTTLE_MAX_WAIT};
+    let base = Duration::from_millis(250);
+    let first: Vec<Duration> = (0..64).map(|_| throttle_wait(base, 1)).collect();
+    assert!(
+        first.iter().all(|w| *w >= base / 2 && *w <= base),
+        "{first:?}"
+    );
+    let distinct: std::collections::BTreeSet<Duration> = first.iter().copied().collect();
+    assert!(
+        distinct.len() > 32,
+        "64 waits took {} values: {first:?}",
+        distinct.len()
+    );
+    for attempt in 1..20 {
+        assert!(throttle_wait(base, attempt) <= THROTTLE_MAX_WAIT);
+    }
+    assert!(throttle_wait(base, 3) >= base * 2, "the wait doubles");
+}
+
+/// Tiles launching at once share what each option (template, AZ) answered: one launch tries
+/// an option whose answer is unknown while the others wait for it, and every launch skips a
+/// fresh capacity refusal. Eight tiles over three refused spot AZs then send three spot
+/// RunInstances, not 24, and each reaches the on-demand template.
+#[tokio::test]
+async fn tiles_launching_together_try_a_refused_az_once() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let api = FakeEc2Api {
+        // No spot capacity in any AZ; on demand launches.
+        run_delay: Duration::from_millis(20),
+        ..Default::default()
+    };
+    let base = fake_ec2_api(api.clone()).await;
+    let d = Arc::new(subnet_tile_driver(&base, "subnet-a,subnet-b,subnet-c"));
+    let launches: Vec<_> = (1..=8)
+        .map(|n| {
+            let d = d.clone();
+            tokio::spawn(async move { d.launch(&format!("ec2-{n}")).await })
+        })
+        .collect();
+    for l in launches {
+        match l.await.unwrap() {
+            Ok(l) => assert_eq!(l.instance, "us-east-1/i-0123456789abcdef0"),
+            Err(e) => panic!("a launch failed: {e:?}"),
+        }
+    }
+    let calls = api.calls.lock().unwrap();
+    let runs = |template: &str| {
+        calls
+            .iter()
+            .filter(|(_, p)| {
+                p["Action"] == "RunInstances" && p["LaunchTemplate.LaunchTemplateName"] == template
+            })
+            .count()
+    };
+    assert_eq!(runs("fcvm-fleet-tile-x86_64"), 3, "one spot try per AZ");
+    assert_eq!(
+        runs("fcvm-fleet-tile-on-demand-x86_64"),
+        8,
+        "one on-demand launch per tile"
+    );
 }
 
 /// With subnets configured for a region, a launch tries each of them (one per AZ) in order,
@@ -4759,7 +4892,8 @@ async fn pool_ec2_api(api: Arc<std::sync::Mutex<PoolEc2>>) -> String {
                     let (k, v) = (p["Tag.1.Key"].clone(), p["Tag.1.Value"].clone());
                     if k == "FleetPool" && a.pool_tag_fails > 0 {
                         a.pool_tag_fails -= 1;
-                        return (StatusCode::SERVICE_UNAVAILABLE, "<Response><Errors><Error><Code>RequestLimitExceeded</Code><Message>slow down</Message></Error></Errors></Response>".into());
+                        // Not a throttle: the driver sends a throttled call again.
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "<Response><Errors><Error><Code>InternalError</Code><Message>failed</Message></Error></Errors></Response>".into());
                     }
                     a.instances.get_mut(&id).unwrap().1.insert(k, v);
                     ok("<CreateTagsResponse/>".into())
@@ -4788,7 +4922,7 @@ async fn pool_ec2_api(api: Arc<std::sync::Mutex<PoolEc2>>) -> String {
                 "TerminateInstances" => {
                     if a.terminate_fails > 0 {
                         a.terminate_fails -= 1;
-                        return (StatusCode::SERVICE_UNAVAILABLE, "<Response><Errors><Error><Code>RequestLimitExceeded</Code><Message>slow down</Message></Error></Errors></Response>".into());
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "<Response><Errors><Error><Code>InternalError</Code><Message>failed</Message></Error></Errors></Response>".into());
                     }
                     for id in ids(&p, "InstanceId") {
                         let sir = a.instances[&id].3.clone();
