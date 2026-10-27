@@ -145,6 +145,12 @@ configuration own those. Two names differ from what the page (#1143) assumed:
   snapshot's `relaunch_all`.
 - There is no `time_of_day` intent. The directed camera's day cycle sets the time of day
   (below), so a viewer's setting would be undone within a flight.
+- There is no weather intent either. The director sets the scene's `weather` keys per
+  stop (`weather_of_step` in `fleet/core/src/director.rs`): cover from a six-stop cycle,
+  towering cumulus every fifth stop in daylight, crepuscular rays when the sun is low, and
+  a snow line between 0.7 and 2.3 km over 36 stops. The current stop's weather holds from
+  its arrival; once the next stop is decided its weather is published at its arrival, and
+  the renderer eases into it over the flight.
 
 **Clients and limits.** Every limit counts per client address, not per connection: the
 `CF-Connecting-IP` header when the coordinator runs with `--trust-cf-connecting-ip`

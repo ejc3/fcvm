@@ -1100,6 +1100,10 @@ fn tick(state: &mut State, at: u64) {
     let now_t = f.scene.t_at(at);
     f.director.tick(now_t);
     f.scene.time_of_day = f.director.time_of_day(now_t);
+    let weather = f.director.weather();
+    if f.scene.weather != weather {
+        f.scene.weather = weather;
+    }
     let cam = f.director.camera();
     if f.scene.camera != cam {
         f.scene.camera = cam;

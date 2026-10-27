@@ -913,6 +913,22 @@
       "epoch_unix_ms": 0,
       "lights": [],
       "time_of_day": 0.735,
+      "weather": [
+        {
+          "cover": 0.5,
+          "rays": 1.0,
+          "snow_line_km": 0.7122,
+          "t": 44.0,
+          "towers": 0.0
+        },
+        {
+          "cover": 0.6,
+          "rays": 1.0,
+          "snow_line_km": 0.7482,
+          "t": 68.0,
+          "towers": 0.0
+        }
+      ],
       "words": []
     },
     "scoreboard": {

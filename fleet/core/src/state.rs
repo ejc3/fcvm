@@ -586,6 +586,7 @@ impl State {
         let mut scene = Scene::new(now_ms);
         scene.camera = director.camera();
         scene.time_of_day = director.time_of_day(0.0);
+        scene.weather = director.weather();
         State {
             version: 0,
             fleet: Fleet {
