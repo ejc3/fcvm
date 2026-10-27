@@ -66,6 +66,13 @@ export function FocusPanel({
   onMove: (dir: Direction) => void;
 }) {
   const backRef = useRef<HTMLButtonElement | null>(null);
+  // The Details button and the sheet's Hide button replace each other, so focus moves to the one that stays.
+  const detailsRef = useRef<HTMLButtonElement | null>(null);
+  const hideRef = useRef<HTMLButtonElement | null>(null);
+  const fold = (open: boolean) => {
+    onSheet(open);
+    requestAnimationFrame(() => (open ? hideRef : detailsRef).current?.focus());
+  };
   useEffect(() => {
     backRef.current?.focus();
   }, []);
@@ -122,12 +129,13 @@ export function FocusPanel({
         <h1 id="focus-title">{focus.title}</h1>
         <span className="state" data-testid="focus-state">{focus.state}</span>
         {!phone && !sheetOpen ? (
-          <button type="button" className="btn sheet-open" aria-expanded="false" aria-controls="focus-sheet" onClick={() => onSheet(true)} data-testid="sheet-toggle">
+          <button ref={detailsRef} type="button" className="btn sheet-open" aria-expanded="false" aria-controls="focus-sheet" onClick={() => fold(true)} data-testid="sheet-toggle">
             Details
           </button>
         ) : null}
       </nav>
-      <aside id="focus-sheet" className={`sheet${sheetOpen ? " open" : ""}`} data-testid="focus-sheet" aria-label={`${focus.title} details`}>
+      {/* Folded on a wide screen the sheet is off screen and out of the keyboard path; on a phone its handle stays. */}
+      <aside id="focus-sheet" className={`sheet${sheetOpen ? " open" : ""}`} data-testid="focus-sheet" aria-label={`${focus.title} details`} inert={!phone && !sheetOpen}>
         <div className="sheet-head">
           {phone ? (
             <button type="button" className="sheet-handle" aria-expanded={sheetOpen} aria-controls="focus-sheet" onClick={() => onSheet(!sheetOpen)} data-testid="sheet-toggle">
@@ -145,7 +153,7 @@ export function FocusPanel({
           ) : (
             <>
               <p className="kind">{focus.kind}</p>
-              <button type="button" className="btn icon" aria-label="Hide details" aria-expanded="true" aria-controls="focus-sheet" onClick={() => onSheet(false)} data-testid="sheet-hide">
+              <button ref={hideRef} type="button" className="btn icon" aria-label="Hide details" aria-expanded="true" aria-controls="focus-sheet" onClick={() => fold(false)} data-testid="sheet-hide">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                   <path d="M9 18l6-6-6-6" />
                 </svg>

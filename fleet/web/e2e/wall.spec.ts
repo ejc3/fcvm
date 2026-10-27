@@ -460,6 +460,25 @@ test("an opened VM zooms to fill the screen at its detail height, with the tiles
   await expect.poll(() => page.evaluate(() => window.__fleet!.view().zoom)).toBeNull();
 });
 
+test("a folded side sheet leaves the keyboard path, and focus goes back to its Details button", async ({ page }) => {
+  await openWall(page, 15);
+  const t = await tileBox(page, "fcvm:3");
+  await page.mouse.click(t.x + t.w / 2, t.y + t.h / 2);
+  await expect(page.getByTestId("focus")).toBeVisible();
+  const sheet = page.getByTestId("focus-sheet");
+  if (!(await sheet.getAttribute("class"))!.includes("open")) await page.getByTestId("sheet-toggle").click();
+  await expect(sheet).toHaveClass(/open/);
+  await page.getByTestId("sheet-hide").focus();
+  await page.keyboard.press("Enter");
+  await expect(sheet).not.toHaveClass(/open/);
+  await expect(page.getByTestId("sheet-toggle")).toBeFocused();
+  // Nothing in the folded sheet takes focus: Tab from the Details button leaves the dialog's visible controls.
+  for (let i = 0; i < 6; i++) {
+    await page.keyboard.press("Tab");
+    expect(await page.evaluate(() => document.activeElement?.closest("#focus-sheet") !== null)).toBe(false);
+  }
+});
+
 test("a repeated intent id applies once, and both receipts are the same", async ({ page }) => {
   await openWall(page, 15);
   await page.getByTestId("play").click();
