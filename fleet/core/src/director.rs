@@ -22,7 +22,7 @@
 //! late vote or a renderer that gets the scene late never sees the path move under it.
 //! Times are scene seconds; legs last whole seconds so the timeline is exact.
 
-use crate::scene::Keyframe;
+use crate::scene::{Keyframe, WeatherKey};
 use crate::terrain::ground_h;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -280,6 +280,36 @@ pub const DAY_START: usize = 11;
 /// The time of day at the stop held at `step`.
 pub fn tod_of_step(step: u64) -> f64 {
     DAY_CYCLE[(step as usize + DAY_START) % DAY_CYCLE.len()]
+}
+
+/// Cloud cover by stop, a short cycle around the default 0.5.
+pub const COVER_CYCLE: [f64; 6] = [0.5, 0.35, 0.6, 0.45, 0.25, 0.55];
+/// Stops in one turn of the seasons (the snow line), about 16 minutes of the program.
+pub const SEASON_STOPS: u64 = 36;
+
+/// The weather at the stop held at `step` (fleet/PROTOCOL.md, "Weather"): cover from
+/// `COVER_CYCLE`; towering cumulus every fifth stop in daylight; crepuscular rays when the
+/// sun is low (they show looking toward it); a snow line that moves between 0.7 and 2.3 km
+/// over `SEASON_STOPS`. Towers and rays never fall on the same stop, so a stop's frames
+/// pay for at most one of them.
+pub fn weather_of_step(step: u64) -> WeatherKey {
+    let tod = tod_of_step(step);
+    let low_sun = !(0.3..=0.7).contains(&tod);
+    let towers = !low_sun && step % 5 == 2;
+    let mut cover = COVER_CYCLE[(step % COVER_CYCLE.len() as u64) as usize];
+    if towers || low_sun {
+        cover = cover.max(0.5);
+    }
+    let season = (step % SEASON_STOPS) as f64 / SEASON_STOPS as f64;
+    let snow = 1.5 - 0.8 * (2.0 * std::f64::consts::PI * season).cos();
+    let r = |v: f64| (v * 1e4).round() / 1e4;
+    WeatherKey {
+        t: 0.0,
+        cover: r(cover),
+        towers: if towers { 1.0 } else { 0.0 },
+        rays: if low_sun { 1.0 } else { 0.0 },
+        snow_line_km: r(snow),
+    }
 }
 
 /// How a flight gets from one stop to the next.
@@ -950,6 +980,30 @@ impl Director {
         (tod * 1e4).round() / 1e4
     }
 
+    /// The scene's weather keys: the current stop's weather from its arrival and, once the
+    /// next stop is decided, the next stop's at its arrival, which the renderer eases into
+    /// over the flight. Like the keyframes, they change only when a stop is decided or
+    /// reached.
+    pub fn weather(&self) -> Vec<WeatherKey> {
+        let here = WeatherKey {
+            t: self.arrive_t,
+            ..weather_of_step(self.step)
+        };
+        match self.arrive_next_at() {
+            Some(at) => vec![
+                WeatherKey {
+                    t: self.hold_until(),
+                    ..here
+                },
+                WeatherKey {
+                    t: at,
+                    ..weather_of_step(self.step + 1)
+                },
+            ],
+            None => vec![here],
+        }
+    }
+
     /// Record a vote in the open vote; `Err` names why it does not count. A client's later
     /// vote replaces its earlier one; picking the same target again keeps its first time.
     pub fn vote(
@@ -1079,6 +1133,48 @@ impl Director {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_weather_changes_at_stops_eases_over_flights_and_covers_every_kind() {
+        let mut d = Director::new(1, 0.0);
+        let (mut towers, mut rays, mut winter, mut clear, mut both) = (0, 0, false, false, 0);
+        let mut last = d.weather();
+        let mut t = 0.0;
+        while t < 3600.0 {
+            t += 0.5;
+            d.tick(t);
+            let w = d.weather();
+            for k in &w {
+                assert!((0.0..=1.0).contains(&k.cover) && (0.0..=1.0).contains(&k.towers));
+                assert!((0.0..=1.0).contains(&k.rays) && (0.0..=4.0).contains(&k.snow_line_km));
+                assert!(
+                    k.towers == 0.0 || k.rays == 0.0,
+                    "towers and rays on one stop: {k:?}"
+                );
+            }
+            assert!(
+                w.windows(2).all(|p| p[0].t < p[1].t),
+                "keys in time order: {w:?}"
+            );
+            if w != last {
+                // a key published once keeps its value: the earliest key that is still
+                // there, or a new one, nothing in between moves
+                for k in &w {
+                    if let Some(o) = last.iter().find(|o| o.t == k.t) {
+                        assert_eq!(o, k, "a committed weather key changed at t={t}");
+                    }
+                }
+                last = w.clone();
+            }
+            let cur = weather_of_step(d.step);
+            towers += (cur.towers > 0.0) as usize;
+            rays += (cur.rays > 0.0) as usize;
+            both += (cur.towers > 0.0 && cur.rays > 0.0) as usize;
+            winter |= cur.snow_line_km < 1.0;
+            clear |= cur.cover < 0.3;
+        }
+        assert!(towers > 0 && rays > 0 && winter && clear && both == 0);
+    }
     use crate::scene::Scene;
 
     /// Run the director with no votes, a tick a second, for `secs`; returns the union of the
