@@ -148,7 +148,11 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 .and_then(|intent| intent_effect(state, &ctx, &intent, check.as_ref()));
             let (outcome, reason, summary) = match result {
                 Ok(summary) => (Outcome::Committed, None, summary),
-                Err(reason) => (Outcome::Refused, Some(reason.clone()), reason),
+                // The reason reaches the public actions feed and the viewer's receipt.
+                Err(reason) => {
+                    let reason = crate::view::hide_account_ids(&reason);
+                    (Outcome::Refused, Some(reason.clone()), reason)
+                }
             };
             // A refused word's text is never shown: its args are left out and the summary
             // is the reason only.
@@ -174,7 +178,10 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 outcome,
                 reason,
                 version: 0,
-                check: check.clone(),
+                check: check.clone().map(|mut k| {
+                    k.reason = crate::view::hide_account_ids(&k.reason);
+                    k
+                }),
             })
         }
         Event::ViewerJoined { viewer, client, .. } => {

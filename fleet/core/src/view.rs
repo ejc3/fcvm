@@ -226,6 +226,31 @@ pub enum FailureView {
 }
 
 /// The slot's rectangle before the current layout generation moved it.
+/// An error as the public view shows it: the text as written, with every AWS account id (a
+/// run of exactly 12 digits, also inside an ARN) replaced.
+pub fn hide_account_ids(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut digits = String::new();
+    let flush = |digits: &mut String, out: &mut String| {
+        if digits.len() == 12 {
+            out.push_str("(account hidden)");
+        } else {
+            out.push_str(digits);
+        }
+        digits.clear();
+    };
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+        } else {
+            flush(&mut digits, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut digits, &mut out);
+    out
+}
+
 fn moved_from(state: &State, s: &Slot) -> Option<Rect> {
     (s.rect_generation == state.fleet.layout.generation)
         .then_some(s.previous_rect)
@@ -422,7 +447,7 @@ fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) 
             generation: Some(s.generation),
             fps: s.observed.fps,
             gpu_stats: s.observed.gpu_stats.clone(),
-            error: s.observed.error.clone(),
+            error: s.observed.error.as_deref().map(hide_account_ids),
             last_relaunch: s.last_relaunch.as_ref().map(|r| RelaunchView {
                 clicked_at: r.clicked_at,
                 by: r.by.clone(),
@@ -433,7 +458,12 @@ fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) 
             failure: (s.observed.phase == "failed" && s.observed.generation >= s.generation).then(
                 || TileFailure {
                     kind: "relaunch_failed".into(),
-                    message: s.observed.error.clone().unwrap_or_default(),
+                    message: s
+                        .observed
+                        .error
+                        .as_deref()
+                        .map(hide_account_ids)
+                        .unwrap_or_default(),
                     retry_at: s.observed.retry_at,
                 },
             ),
@@ -771,14 +801,14 @@ fn failures(state: &State) -> Vec<FailureView> {
             .iter()
             .map(|(c, (r, since))| FailureView::CoordinatorDegraded {
                 component: c.clone(),
-                reason: r.clone(),
+                reason: hide_account_ids(r),
                 since: *since,
             }),
     );
     out.extend(f.quarantined.values().map(|q| FailureView::GpuQuarantined {
         host: q.host.clone(),
         sbdf: q.sbdf.clone(),
-        error: q.error.clone(),
+        error: hide_account_ids(&q.error),
         since: q.since,
     }));
     out
