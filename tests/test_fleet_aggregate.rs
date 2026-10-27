@@ -928,3 +928,72 @@ async fn a_supervised_aggregator_that_needs_a_layout_stops_without_one() {
         .expect("supervision ends with its layouts")
         .unwrap();
 }
+
+/// The push's ffmpeg dies with its aggregator (PR_SET_PDEATHSIG), whatever ffmpeg is
+/// doing: a SIGKILL to the aggregator (the supervisor's stop) leaves no ingest child behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_push_child_dies_with_its_aggregator() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("ffmpeg.pid");
+    let fake = dir.path().join("ffmpeg");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho $$ > {}\nexec sleep 600\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let mut agg = tokio::process::Command::new(env!("CARGO_BIN_EXE_fcvm"))
+        .args([
+            "fleet",
+            "aggregate",
+            "--codec",
+            "raw",
+            "--image-height",
+            "36",
+        ])
+        .args(["--listen", &format!("127.0.0.1:{port}")])
+        .arg("--ffmpeg")
+        .arg(&fake)
+        .args(["--push-url-env", "TEST_PUSH_URL"])
+        .env("TEST_PUSH_URL", "rtmps://ingest.example/app/k")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(s) = std::fs::read_to_string(&pid_file) {
+                if let Ok(p) = s.trim().parse::<i32>() {
+                    return p;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the push started its ffmpeg");
+    let alive = |p: i32| unsafe { libc::kill(p, 0) } == 0;
+    assert!(alive(pid));
+    agg.start_kill().unwrap();
+    agg.wait().await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while alive(pid) {
+        // A zombie still answers kill(0) until its new parent reaps it; its state says.
+        let state = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        if state.split_whitespace().nth(2) == Some("Z") {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            panic!("the push's ffmpeg outlived its aggregator");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
