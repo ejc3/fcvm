@@ -995,11 +995,23 @@ fn review_gate_accepts_the_codex_breezy_signoff() {
 /// after the head `deadbeef` arrived on a PR with no review object, and returns (exit code,
 /// combined output).
 fn run_gate_on_bot_comment(name: &str, login: &str, body: &str) -> (Option<i32>, String) {
+    run_gate_on_comment(name, login, "Bot", body, "deadbeef")
+}
+
+/// The same payload for one top-level comment, with the account type and the head sha chosen
+/// by the caller. `body` is a JSON string literal.
+fn run_gate_on_comment(
+    name: &str,
+    login: &str,
+    typename: &str,
+    body: &str,
+    head: &str,
+) -> (Option<i32>, String) {
     let comments = format!(
-        r#"[{{"author":{{"login":"{login}","__typename":"Bot"}},"createdAt":"2026-01-02T01:00:00Z","updatedAt":"2026-01-02T01:00:00Z","body":{body}}}]"#
+        r#"[{{"author":{{"login":"{login}","__typename":"{typename}"}},"createdAt":"2026-01-02T01:00:00Z","updatedAt":"2026-01-02T01:00:00Z","body":{body}}}]"#
     );
     let payload = format!(
-        r#"{{"data":{{"repository":{{"pullRequest":{{"author":{{"login":"me"}},"headRefOid":"deadbeef","commits":{{"nodes":[{{"commit":{{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{{"nodes":[{{"createdAt":"2026-01-02T00:30:00Z"}}]}}}}}}]}},"reviewThreads":{{"nodes":[]}},"reviews":{{"nodes":[]}},"comments":{{"nodes":{comments}}},"recheck":{{"comments":{{"nodes":{comments}}}}}}}}}}}}}"#
+        r#"{{"data":{{"repository":{{"pullRequest":{{"author":{{"login":"me"}},"headRefOid":"{head}","commits":{{"nodes":[{{"commit":{{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{{"nodes":[{{"createdAt":"2026-01-02T00:30:00Z"}}]}}}}}}]}},"reviewThreads":{{"nodes":[]}},"reviews":{{"nodes":[]}},"comments":{{"nodes":{comments}}},"recheck":{{"comments":{{"nodes":{comments}}}}}}}}}}}}}"#
     );
     let dir = std::env::temp_dir().join(format!("fcvm-gate-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -2344,4 +2356,201 @@ fn a_clean_greptile_review_covers_the_head_through_its_check_run() {
     assert!(out.contains("BLOCKED"), "{out}");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A body recorded under tests/fixtures/review-gate, as a JSON string literal. The fixtures
+/// hold bodies CodeRabbit posted on ejc3/fcvm with their ids replaced by made-up values.
+fn review_gate_fixture(name: &str) -> String {
+    let path = repo_root().join("tests/fixtures/review-gate").join(name);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    serde_json::to_string(&text).unwrap()
+}
+
+/// The head the walkthrough fixture's review range ends at.
+const WALKTHROUGH_HEAD: &str = "5f8a63e13cd9fdc777d23165ecd5f149fb93f848";
+
+/// CodeRabbit's summary comment after a review that found nothing, in the layout it has
+/// posted since the review stack link was added (#1386, 2026-10-27), needs no disposition
+/// and covers the head its reviewed range ends at.
+///
+/// Before this the gate listed the walkthrough as a comment like any other, so it asked for
+/// an answer to text that reports no findings, on #1351, #1386 and #1392.
+#[test]
+fn review_gate_treats_a_coderabbit_walkthrough_with_no_findings_as_needing_no_disposition() {
+    require_jq();
+    let (code, out) = run_gate_on_comment(
+        "cr-walkthrough",
+        "coderabbitai",
+        "Bot",
+        &review_gate_fixture("cr-clean-walkthrough.md"),
+        WALKTHROUGH_HEAD,
+    );
+    assert!(
+        !out.contains("carry no disposition") && !out.contains("UNANSWERED"),
+        "a walkthrough reporting no actionable comments is not a finding.\n{out}"
+    );
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains("HEAD COVERED"),
+        "a range that ends at the head covers it.\n{out}"
+    );
+}
+
+/// The same walkthrough, on a PR whose head is not where its reviewed range ends, needs no
+/// disposition and covers nothing.
+#[test]
+fn review_gate_does_not_let_a_coderabbit_walkthrough_cover_another_head() {
+    require_jq();
+    let (code, out) = run_gate_on_comment(
+        "cr-walkthrough-other-head",
+        "coderabbitai",
+        "Bot",
+        &review_gate_fixture("cr-clean-walkthrough.md"),
+        "deadbeef",
+    );
+    assert!(
+        !out.contains("carry no disposition") && !out.contains("UNANSWERED"),
+        "a walkthrough reporting no actionable comments is not a finding.\n{out}"
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("UNREVIEWED HEAD") && !out.contains("HEAD COVERED"),
+        "a range that ends elsewhere covers no head.\n{out}"
+    );
+}
+
+/// The clean walkthrough with anything added, or with a listed shape altered, is a claim.
+///
+/// Green on the gate before and after the walkthrough was listed: each case must keep the
+/// comment claimable. The cases are text added after the last block, between two blocks and
+/// inside the tips block, a Merge Risk other than Minimal, and the recent-review line
+/// replaced by a count of findings.
+#[test]
+fn review_gate_treats_a_coderabbit_walkthrough_with_additions_as_a_claim() {
+    require_jq();
+    let text = std::fs::read_to_string(
+        repo_root().join("tests/fixtures/review-gate/cr-clean-walkthrough.md"),
+    )
+    .unwrap();
+    let cases = [
+        ("a finding appended", format!("{text}\nP1: this drops the last row\n")),
+        (
+            "a finding between two blocks",
+            text.replace(
+                "<!-- walkthrough_end -->\n",
+                "<!-- walkthrough_end -->\nP1: this drops the last row\n",
+            ),
+        ),
+        (
+            "a finding inside the tips block",
+            text.replace("<!-- tips_end -->", "P1: this drops the last row\n<!-- tips_end -->"),
+        ),
+        (
+            "a Merge Risk of High",
+            text.replace("Minimal</strong> · up to", "High</strong> · up to"),
+        ),
+        (
+            "findings in place of the clean line",
+            text.replace(
+                "No actionable comments were generated in the recent review.",
+                "Actionable comments posted: 1",
+            ),
+        ),
+        (
+            "a second walkthrough block",
+            format!("{text}\n<!-- walkthrough_start -->\nP1: this drops the last row\n<!-- walkthrough_end -->\n"),
+        ),
+    ];
+    for (case, body) in cases {
+        assert_ne!(body, text, "{case}: the fixture edit did not apply");
+        let (code, out) = run_gate_on_comment(
+            "cr-walkthrough-claim",
+            "coderabbitai",
+            "Bot",
+            &serde_json::to_string(&body).unwrap(),
+            WALKTHROUGH_HEAD,
+        );
+        assert_eq!(code, Some(1), "{case}\n{out}");
+        assert!(
+            out.contains("carry no disposition"),
+            "the walkthrough with {case} is a claim.\n{out}"
+        );
+    }
+}
+
+/// The clean walkthrough from any account but CodeRabbit's bot is an ordinary comment.
+#[test]
+fn review_gate_treats_a_coderabbit_walkthrough_from_another_account_as_a_claim() {
+    require_jq();
+    for (login, typename) in [
+        ("helpful-human", "User"),
+        ("coderabbitai", "User"),
+        ("other-bot", "Bot"),
+    ] {
+        let (code, out) = run_gate_on_comment(
+            "cr-walkthrough-other-account",
+            login,
+            typename,
+            &review_gate_fixture("cr-clean-walkthrough.md"),
+            WALKTHROUGH_HEAD,
+        );
+        assert_eq!(code, Some(1), "{login} as {typename}\n{out}");
+        assert!(
+            out.contains("carry no disposition") && !out.contains("HEAD COVERED"),
+            "{login} as {typename}: claimable, never coverage.\n{out}"
+        );
+    }
+}
+
+/// CodeRabbit's reply "Review finished." under "Action performed", in the layout it has
+/// posted since the folds gained <dl><dd> wrappers (#1392), needs no disposition and covers
+/// no head.
+#[test]
+fn review_gate_treats_a_coderabbit_review_finished_reply_as_neither_a_finding_nor_coverage() {
+    require_jq();
+    let (code, out) = run_gate_on_comment(
+        "cr-finished",
+        "coderabbitai",
+        "Bot",
+        &review_gate_fixture("cr-review-finished-reply.md"),
+        "deadbeef",
+    );
+    assert!(
+        !out.contains("carry no disposition") && !out.contains("UNANSWERED"),
+        "a reply saying the review finished is not a finding.\n{out}"
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("UNREVIEWED HEAD") && !out.contains("HEAD COVERED"),
+        "a reply that names no commit covers no head.\n{out}"
+    );
+}
+
+/// The reply with text added, or from another account, is a claim.
+#[test]
+fn review_gate_treats_the_review_finished_reply_with_additions_or_from_a_human_as_a_claim() {
+    require_jq();
+    let text = std::fs::read_to_string(
+        repo_root().join("tests/fixtures/review-gate/cr-review-finished-reply.md"),
+    )
+    .unwrap();
+    let appended =
+        serde_json::to_string(&format!("{text}\nP1: this drops the last row\n")).unwrap();
+    for (case, login, typename, body) in [
+        ("a finding appended", "coderabbitai", "Bot", appended),
+        (
+            "a human as the author",
+            "helpful-human",
+            "User",
+            review_gate_fixture("cr-review-finished-reply.md"),
+        ),
+    ] {
+        let (code, out) =
+            run_gate_on_comment("cr-finished-claim", login, typename, &body, "deadbeef");
+        assert_eq!(code, Some(1), "{case}\n{out}");
+        assert!(
+            out.contains("carry no disposition"),
+            "the reply with {case} is a claim.\n{out}"
+        );
+    }
 }

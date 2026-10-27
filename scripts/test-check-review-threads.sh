@@ -16,12 +16,13 @@ pass=0; fail=0
 
 # $1 name, $2 fixture json, $3 expected exit code, $4 and $5 substrings expected in output
 run_case() {
-  local name=$1 json=$2 want_rc=$3 want_txt=${4:-} want_txt2=${5:-}
+  local name=$1 json=$2 want_rc=$3 want_txt=${4:-} want_txt2=${5:-} unwanted=${6:-}
   printf '%s' "$json" > "$TMP/f.json"
   local out rc
   out=$(bash "$GATE" --from-file "$TMP/f.json" 2>&1); rc=$?
   if [ "$rc" = "$want_rc" ] && { [ -z "$want_txt" ] || grep -qF "$want_txt" <<<"$out"; } \
-     && { [ -z "$want_txt2" ] || grep -qF "$want_txt2" <<<"$out"; }; then
+     && { [ -z "$want_txt2" ] || grep -qF "$want_txt2" <<<"$out"; } \
+     && { [ -z "$unwanted" ] || ! grep -qF "$unwanted" <<<"$out"; }; then
     echo "  PASS  $name"; pass=$((pass+1))
   else
     echo "  FAIL  $name (rc=$rc want=$want_rc)"
@@ -2271,6 +2272,48 @@ run_case "the #1282 receipt with a finding appended is claimable" \
 run_case "a human posting the #1282 receipt is claimable" \
   "$(wrap9 "$(cmt helpful-human User 2026-01-02T01:00:00Z "$(receipt_nocommit " Can't wait for the next one!")")")" \
   1 "carry no disposition"
+
+echo "== finding 51: CodeRabbit's clean walkthrough and its \"Review finished.\" reply =="
+# Two bodies CodeRabbit posted on #1386 and #1392 (2026-10-27), read from tests/fixtures/review-gate
+# with their ids replaced. The walkthrough is the summary comment edited in place after a
+# review that found nothing: it opens with the review stack link and says no actionable
+# comments were generated. The reply is the "Action performed" fold with <dl><dd> wrappers.
+# Both read as unanswered findings. The first covers the head its range ends at (the fixture
+# ends at HEAD40); the second names no commit and covers nothing.
+FIXDIR=$(dirname "$GATE")/../tests/fixtures/review-gate
+CR_WT=$(jq -Rs . < "$FIXDIR/cr-clean-walkthrough.md")
+CR_FIN=$(jq -Rs . < "$FIXDIR/cr-review-finished-reply.md")
+wt_edit() { jq -c "$1" <<<"$CR_WT"; }
+run_case "the clean walkthrough needs no disposition" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$CR_WT" 2026-01-02T01:00:00Z)")" 0 "CLEAR"
+run_case "the clean walkthrough covers the head its range ends at" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$CR_WT" 2026-01-02T01:00:00Z)]")" 0 "HEAD COVERED"
+run_case "the clean walkthrough edited before the head arrived covers nothing" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$CR_WT" 2026-01-01T01:00:00Z)]")" 1 "UNREVIEWED HEAD" "" "carry no disposition"
+run_case "the clean walkthrough whose range ends at an older commit covers nothing" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(wt_edit 'gsub("5f8a63e13cd9fdc777d23165ecd5f149fb93f848"; "0123456789abcdef0123456789abcdef01234567")')" 2026-01-02T01:00:00Z)]")" 1 "UNREVIEWED HEAD" "" "carry no disposition"
+run_case "the clean walkthrough with a finding appended is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(wt_edit '. + "\nP1: this drops the last row\n"')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+run_case "the clean walkthrough with a finding between two blocks is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(wt_edit 'sub("<!-- walkthrough_end -->\n"; "<!-- walkthrough_end -->\nP1: this drops the last row\n")')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+run_case "the clean walkthrough with a finding in its tips block is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(wt_edit 'sub("<!-- tips_end -->"; "P1: this drops the last row\n<!-- tips_end -->")')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+run_case "the clean walkthrough with a Merge Risk of High is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(wt_edit 'sub("Minimal</strong> · up to"; "High</strong> · up to")')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+run_case "the clean walkthrough with findings in place of its clean line is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(wt_edit 'sub("No actionable comments were generated in the recent review."; "Actionable comments posted: 1")')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+run_case "the clean walkthrough from a human is claimable, not coverage" \
+  "$(wrap7 "[$(cmt helpful-human User 2026-01-01T00:00:00Z "$CR_WT" 2026-01-02T01:00:00Z)]")" 1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "the clean walkthrough from another bot is claimable, not coverage" \
+  "$(wrap7 "[$(cmt other-bot Bot 2026-01-01T00:00:00Z "$CR_WT" 2026-01-02T01:00:00Z)]")" 1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "the Review finished reply needs no disposition" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$CR_FIN")")" 0 "CLEAR"
+run_case "the Review finished reply covers no head" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$CR_FIN")]")" 1 "UNREVIEWED HEAD" "" "carry no disposition"
+run_case "the Review finished reply with a finding appended is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(jq -c '. + "\nP1: this drops the last row\n"' <<<"$CR_FIN")")")" 1 "carry no disposition"
+run_case "the Review finished reply from a human is claimable" \
+  "$(wrap9 "$(cmt helpful-human User 2026-01-02T01:00:00Z "$CR_FIN")")" 1 "carry no disposition"
 
 echo
 echo "passed=$pass failed=$fail"
