@@ -285,6 +285,129 @@ fn cargo_target_link_refuses_inside_a_leased_recipe_line() {
     assert_target_usable(work.path(), "after the refused leased line");
 }
 
+/// A leased recipe line that runs Cargo must not take the checkout lock again.
+///
+/// `_test-root` (and `test-packaging`) name `cargo-target-run.sh` as the recipe's SHELL, so
+/// the line holds the generation's shared lease for its whole length, and the Cargo command
+/// inside it goes through the same wrapper. The wrapper took the checkout lock first and the
+/// generation second; the line already held the generation, so the order was generation then
+/// checkout. A concurrent `make test-unit` runs `cargo-target-link.sh`, which takes the
+/// checkout lock exclusively and then the generation exclusively. The two orders cross: the
+/// link holds the checkout and waits for the generation, the line holds the generation and
+/// waits for the checkout.
+///
+/// The test holds the interleaving: the leased line waits until a link run owns the checkout
+/// lock (a non-blocking shared probe on the checkout fails), and only then starts its inner
+/// wrapper call. RED BEFORE THE FIX: neither side can ever proceed and the test kills the
+/// process groups at the deadline.
+#[test]
+fn leased_line_and_concurrent_link_take_the_locks_in_one_order() {
+    use std::os::unix::process::CommandExt;
+
+    let work = tempfile::tempdir().expect("tempdir");
+    let btrfs = tempfile::tempdir().expect("tempdir");
+    let (ok, out) = run_link(work.path(), btrfs.path());
+    assert!(ok, "cargo-target-link.sh failed:\n{out}");
+
+    let started = work.path().join("link-started");
+    let inner_done = work.path().join("inner-done");
+    // The leased line: hold the lease, wait until the link owns the checkout lock, then run
+    // Cargo's wrapper the way `$(NEXTEST)` does inside `_test-root`.
+    let line = format!(
+        "touch {started}; \
+         for _ in $(seq 1 400); do \
+           flock -n -s . true || break; sleep 0.05; \
+         done; \
+         flock -n -s . true && {{ echo 'the link run never took the checkout lock' >&2; exit 7; }}; \
+         {wrapper} true && touch {inner_done}",
+        started = shell_quote(&started),
+        inner_done = shell_quote(&inner_done),
+        wrapper = shell_quote(&repo_root().join("scripts/cargo-target-run.sh")),
+    );
+    let mut leased = ChildGuard(Some(
+        Command::new(repo_root().join("scripts/cargo-target-run.sh"))
+            .args(["-c", &line])
+            .env("BTRFS_ROOT", btrfs.path())
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_TARGET_LINK_LOCKED")
+            .env_remove("FCVM_TARGET_LEASE_HELD")
+            .current_dir(work.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn leased line"),
+    ));
+    let leased_pgid = leased.child_mut().id() as libc::pid_t;
+
+    // Start the concurrent link only once the line holds its lease.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the leased line never started"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mut link = ChildGuard(Some(
+        Command::new(repo_root().join("scripts/cargo-target-link.sh"))
+            .env("BTRFS_ROOT", btrfs.path())
+            .env_remove("CARGO_TARGET_LINK_LOCKED")
+            .env_remove("FCVM_TARGET_LEASE_HELD")
+            .current_dir(work.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn concurrent link"),
+    ));
+    let link_pgid = link.child_mut().id() as libc::pid_t;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let leased_done = leased
+            .child_mut()
+            .try_wait()
+            .expect("poll leased")
+            .is_some();
+        let link_done = link.child_mut().try_wait().expect("poll link").is_some();
+        if leased_done && link_done {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            // SAFETY: plain libc calls on pgids this test created with process_group(0).
+            unsafe {
+                libc::kill(-leased_pgid, libc::SIGKILL);
+                libc::kill(-link_pgid, libc::SIGKILL);
+            }
+            panic!(
+                "deadlock: leased line finished={leased_done}, concurrent link finished={link_done}. \
+                 The link holds the checkout lock and waits for the generation; the line holds \
+                 the generation and its inner cargo-target-run.sh waits for the checkout lock."
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let leased_out = leased.wait_with_output().expect("collect leased");
+    let link_out = link.wait_with_output().expect("collect link");
+    assert!(
+        leased_out.status.success(),
+        "leased line failed:\n{}{}",
+        String::from_utf8_lossy(&leased_out.stdout),
+        String::from_utf8_lossy(&leased_out.stderr)
+    );
+    assert!(
+        link_out.status.success(),
+        "concurrent link failed:\n{}{}",
+        String::from_utf8_lossy(&link_out.stdout),
+        String::from_utf8_lossy(&link_out.stderr)
+    );
+    assert!(inner_done.exists(), "the inner wrapper call did not run");
+    assert_target_usable(work.path(), "after the leased line and the link");
+}
+
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
