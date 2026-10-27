@@ -793,8 +793,10 @@ adb and the emulator console listen only inside the container.
   `ACCEPT_ANDROID_SDK_LICENSE=1` says the agreement was read. A public wall of phones is not
   app development, so what ships is built from AOSP source: the emulator (`external/qemu`,
   QEMU's parts under the GPL; we serve video, not binaries) and gfxstream (Apache 2.0) from
-  our forks, and a system image built from AOSP (Apache 2.0, without Google's apps or
-  services). Building them from source is also what the detach change needs.
+  our forks, and an AOSP-based system image without Google's apps or services, whose
+  components keep their own licenses and notices (the Linux kernel under the GPL, most of
+  the platform under Apache 2.0). Building them from source is also what the detach change
+  needs.
 - **The Android robot** is CC BY 3.0 with the attribution line above; "Android" and Google's
   marks follow Google's brand guidelines, as under "Branding".
 
