@@ -36,6 +36,28 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 . "$script_dir/cargo-target-lib.sh"
 link_script="$script_dir/cargo-target-link.sh"
 
+# ONE LOCK ORDER: checkout directory, then generation. A caller that already
+# holds this checkout's generation lease (a recipe line whose SHELL is this
+# script, running Cargo through this script again) must not take the checkout
+# lock a second time. It would acquire generation-then-checkout, the reverse of
+# cargo-target-link.sh (checkout exclusive, then generation exclusive). A
+# concurrent make that is publishing target/ holds the checkout and waits for
+# the generation this line holds, while this line waits for the checkout: a
+# deadlock between `make test-unit` and `make test-root` in one worktree.
+# The inherited lease descriptor already pins the generation (the pruner and the
+# link script need it exclusively, and the ancestor holds it shared), so the
+# inner command just runs under it. The marker alone is not proof, so require
+# that target/ still resolves to the leased generation and that this process
+# still has a descriptor open on it.
+if [[ -n ${FCVM_TARGET_LEASE_HELD:-} && -d $target ]] &&
+	[[ "$(stat -Lc '%d:%i' -- "$target" 2>/dev/null || true)" == "$FCVM_TARGET_LEASE_HELD" ]]; then
+	for held_fd in "/proc/$$"/fd/*; do
+		if [[ "$(stat -Lc '%d:%i' -- "$held_fd" 2>/dev/null || true)" == "$FCVM_TARGET_LEASE_HELD" ]]; then
+			exec "$@"
+		fi
+	done
+fi
+
 while :; do
 	# cargo-target-link.sh takes this same checkout-directory lock exclusively
 	# before publishing target/. Hold it shared until the resolved generation fd
