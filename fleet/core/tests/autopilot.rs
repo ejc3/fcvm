@@ -339,18 +339,68 @@ fn lap_fixture() -> serde_json::Value {
     })
 }
 
+/// Whether two fixtures hold the same structure and text, with numbers equal to within a
+/// few parts in 10^12. The camera goes through the system libm (`atan2`, `hypot`, `sin`,
+/// `cos`), whose last bit differs between glibc versions: 2.34's x86_64 `hypot` is one ulp
+/// from 2.36's at two of the lap's keyframes, so a fixture compared as text fails on one
+/// host and passes on another.
+fn fixtures_agree(got: &serde_json::Value, want: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (got, want) {
+        (Value::Number(g), Value::Number(w)) => match (g.as_f64(), w.as_f64()) {
+            (Some(g), Some(w)) => (g - w).abs() <= 1e-12 * g.abs().max(w.abs()).max(1.0),
+            _ => false,
+        },
+        (Value::Array(g), Value::Array(w)) => {
+            g.len() == w.len() && g.iter().zip(w).all(|(g, w)| fixtures_agree(g, w))
+        }
+        (Value::Object(g), Value::Object(w)) => {
+            g.len() == w.len()
+                && g.iter()
+                    .all(|(k, g)| w.get(k).is_some_and(|w| fixtures_agree(g, w)))
+        }
+        (g, w) => g == w,
+    }
+}
+
 #[test]
 fn the_lap_fixture_is_what_the_code_flies() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/autopilot_lap.json");
-    // Compared as text: serde_json's default parser can round a long decimal differently
-    // from the value that printed it.
-    let want = serde_json::to_string_pretty(&lap_fixture()).unwrap() + "\n";
+    let want = lap_fixture();
     if std::env::var("FLEET_VECTORS_BLESS").as_deref() == Ok("1") {
-        std::fs::write(&path, &want).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&want).unwrap() + "\n").unwrap();
     }
-    let got = std::fs::read_to_string(&path).expect("tests/autopilot_lap.json");
+    let got: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("tests/autopilot_lap.json"))
+            .expect("tests/autopilot_lap.json is JSON");
     assert!(
-        got == want,
+        fixtures_agree(&got, &want),
         "tests/autopilot_lap.json is stale: rerun with FLEET_VECTORS_BLESS=1"
+    );
+}
+
+/// The comparison forgives the last bits of a libm result and nothing a code change makes.
+#[test]
+fn the_lap_fixture_comparison_catches_a_moved_camera() {
+    let want = lap_fixture();
+    let mut ulp = want.clone();
+    let look = &mut ulp["lap"]["camera"][36]["look"][1];
+    let v = look.as_f64().unwrap();
+    *look = json!(f64::from_bits(v.to_bits() + 1));
+    assert!(
+        fixtures_agree(&ulp, &want),
+        "one ulp must not fail the fixture"
+    );
+    let mut moved = want.clone();
+    moved["lap"]["camera"][36]["look"][1] = json!(v + 1e-6);
+    assert!(
+        !fixtures_agree(&moved, &want),
+        "a camera moved by a millimetre must fail the fixture"
+    );
+    let mut shorter = want.clone();
+    shorter["lap"]["samples"].as_array_mut().unwrap().pop();
+    assert!(
+        !fixtures_agree(&shorter, &want),
+        "a missing sample must fail the fixture"
     );
 }
