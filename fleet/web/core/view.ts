@@ -233,6 +233,29 @@ function glyphFor(t: Tile, phase: string): Glyph {
   return { kind: "progress", steps, done: step ?? 0 };
 }
 
+/** What a tile that is not up is waiting for, in a phrase that follows "waiting for". */
+function waitingFor(t: Tile): string {
+  if (t.phase === "waiting_capacity") return t.half === "ec2" ? "EC2 capacity" : "a free GPU";
+  return t.half === "ec2" ? "the instance to launch" : "the VM to restore";
+}
+
+/**
+ * The hover card's three lines. A line with nothing to report says why: a tile that is up
+ * says the coordinator has not named it, one that is not up says what it waits for. The
+ * host line is the tile's public place, never the agent's own host name.
+ */
+export function hoverLabel(t: Tile, name: string, rms: number | null): HoverLabel {
+  const up = t.phase === "running";
+  const wait = `waiting for ${waitingFor(t)}`;
+  return {
+    id: name,
+    kind: KIND_TAG[t.half],
+    gpu: t.gpu?.name ?? (up ? "GPU model not reported" : wait),
+    host: t.place ?? (up ? "location not reported" : wait),
+    last: rms !== null ? `last restart ${fmt.seconds(rms)}` : up ? "launch time not recorded" : "no launch recorded",
+  };
+}
+
 function tileView(
   t: Tile,
   s: ClientState,
@@ -265,13 +288,7 @@ function tileView(
     detail = retry === null ? "" : retry > srvNow ? `retrying in ${fmt.countdown(retry - srvNow)}` : "retrying now";
   }
 
-  const hover: HoverLabel = {
-    id: name,
-    kind: KIND_TAG[t.half],
-    gpu: t.gpu?.name ?? "no GPU yet",
-    host: t.host ?? "no host yet",
-    last: rms === null ? "no restart yet" : `last restart ${fmt.seconds(rms)}`,
-  };
+  const hover = hoverLabel(t, name, rms);
 
   const stats: string[] = [];
   if (fs && fs.newestT !== null) {
@@ -784,7 +801,7 @@ function focusView(s: ClientState, st: FleetState, tv: TileView, t: Tile, input:
     streamTag,
     rows: [
       { term: "GPU", value: g?.name ?? "none yet" },
-      { term: "Host", value: t.host ?? "none yet" },
+      { term: "Host", value: t.place ?? "none yet" },
       { term: "VM", value: t.vm ?? "none yet" },
       { term: "Started", value: t.generation === null ? "--" : fmt.count(t.generation, "time", "times") },
       { term: "Up for", value: up === null || tv.dark ? "--" : fmt.span(srvNow - up) },

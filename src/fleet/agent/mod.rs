@@ -202,6 +202,19 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
     } else {
         None
     };
+    // Only a host that reads its instance id from the metadata service is on EC2; it tells
+    // viewers its region, never the id. A host the service does not answer for shows none.
+    let place = if args.host_from_imds {
+        match crate::fleet::coord::aws::imds("placement/region").await {
+            Ok(region) => fleet_core::protocol::place_label(region.trim()),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "cannot read the host's region; its tiles show no place");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let fcvm = match args.fcvm {
         Some(p) => p,
         None => std::env::current_exe().context("locating this fcvm binary")?,
@@ -220,6 +233,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             frame_zone: args.frame_zone,
             tls_publish_base: args.tls_publish_base,
             public_ipv4: public_ipv4.clone(),
+            place,
             publish_ip: args.publish_ip,
             sysfs_root: args.sysfs_root,
             start_timeout: Duration::from_secs(args.start_timeout_secs),
@@ -581,6 +595,7 @@ fn assign(
                 ipv6: None,
                 ipv4: None,
                 v4_port: None,
+                place: cfg.place.clone(),
             }));
             continue;
         };

@@ -228,6 +228,9 @@ pub struct Observed {
     pub ipv4: Option<String>,
     #[serde(default)]
     pub v4_port: Option<u16>,
+    /// Where the slot runs, as last reported (`protocol::place_label`).
+    #[serde(default)]
+    pub place: Option<String>,
 }
 
 /// One launch's DNS names in the coordinator's subzone, answered from the moment they are

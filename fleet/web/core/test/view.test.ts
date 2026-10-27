@@ -553,6 +553,62 @@ describe("seams and hover", () => {
     expect(view(reduce(s, { type: "ui", patch: { longPress: true } }), EPOCH + 60_000).seams.visible).toBe(true);
   });
 
+  describe("the hover card", () => {
+    const label = (id: string, edit: (t: ReturnType<typeof fleet>["tiles"][number]) => void) => {
+      const st = fleet();
+      edit(st.tiles.find((t) => t.id === id)!);
+      const s = reduce(stateWith(st), { type: "ui", patch: { pointerOverImage: true, hoverId: id, pointerMovedAt: EPOCH } });
+      return view(s, EPOCH + 1000).seams.label!;
+    };
+    const lines = (l: { gpu: string; host: string; last: string }) => [l.gpu, l.host, l.last];
+
+    it("names a live tile's GPU, place and last launch from what the coordinator reported", () => {
+      const l = label("ec2:2", (t) => {
+        t.gpu = { name: "Tesla T4", temp_c: 40, power_w: 50, util_pct: 90 };
+        t.place = "EC2 in us-east-1";
+        t.host = "i-example-host";
+        t.last_relaunch = { clicked_at: EPOCH, first_frame_at: EPOCH + 58_000, phases: {} };
+      });
+      expect(lines(l)).toEqual(["Tesla T4", "EC2 in us-east-1", "last restart 58 s"]);
+    });
+
+    it("never shows the agent's own host name, which can be an instance id", () => {
+      const l = label("fcvm:1", (t) => {
+        t.host = "i-example-host";
+        t.place = null;
+      });
+      expect(JSON.stringify(l)).not.toContain("i-example-host");
+    });
+
+    it("never says \"yet\" on a live tile, whatever the coordinator left out", () => {
+      for (const id of ["fcvm:1", "ec2:2"]) {
+        const l = label(id, (t) => {
+          t.gpu = null;
+          t.place = null;
+          t.last_relaunch = null;
+        });
+        expect(lines(l).join(" | ")).not.toMatch(/\byet\b/);
+        expect(lines(l)).toEqual(["GPU model not reported", "location not reported", "launch time not recorded"]);
+      }
+    });
+
+    it("says what a tile that is not up is waiting for", () => {
+      const dark = (id: string, phase: string) =>
+        label(id, (t) => {
+          t.phase = phase;
+          t.gpu = null;
+          t.place = null;
+          t.last_relaunch = null;
+          t.frame_url = null;
+          t.frame_url_v4 = null;
+        });
+      expect(lines(dark("ec2:2", "waiting_capacity"))).toEqual(["waiting for EC2 capacity", "waiting for EC2 capacity", "no launch recorded"]);
+      expect(lines(dark("ec2:2", "launching"))).toEqual(["waiting for the instance to launch", "waiting for the instance to launch", "no launch recorded"]);
+      expect(lines(dark("fcvm:1", "waiting_capacity"))[0]).toBe("waiting for a free GPU");
+      expect(lines(dark("fcvm:1", "relaunching"))[0]).toBe("waiting for the VM to restore");
+    });
+  });
+
   it("gives keyboard focus the same outline and label", () => {
     const s = reduce(stateWith(fleet()), { type: "ui", patch: { keyId: "fcvm:1" } });
     const v = view(s, EPOCH, { dpr: 2 });

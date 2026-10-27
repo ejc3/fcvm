@@ -25,6 +25,7 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
           frame_url_v4: `ws://example-host-v4:1/frames/${half}-${n}`,
           gpu: { name: "NVIDIA T4", temp_c: 61, power_w: 70.4, util_pct: 98 },
           host: half === "fcvm" ? "g4dn.metal · example-region" : "g4dn.xlarge · example-region",
+          place: "EC2 in example-region",
           last_relaunch: {
             clicked_at: EPOCH + 1000,
             first_frame_at: EPOCH + 1000 + (half === "fcvm" ? 2800 : 58_000),

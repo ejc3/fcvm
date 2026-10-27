@@ -737,8 +737,14 @@
         "half": "fcvm",
         "host": "h1",
         "id": "fcvm:1",
-        "last_relaunch": null,
+        "last_relaunch": {
+          "by": "wake",
+          "clicked_at": 1100,
+          "first_frame_at": 1100,
+          "phases": {}
+        },
         "phase": "running",
+        "place": null,
         "previous_rect": {
           "h": 0.6666666666666666,
           "w": 0.375,
@@ -770,8 +776,14 @@
         "half": "fcvm",
         "host": "h1",
         "id": "fcvm:2",
-        "last_relaunch": null,
+        "last_relaunch": {
+          "by": "wake",
+          "clicked_at": 1200,
+          "first_frame_at": 1200,
+          "phases": {}
+        },
         "phase": "running",
+        "place": null,
         "previous_rect": {
           "h": 0.6666666666666666,
           "w": 0.375,
@@ -800,8 +812,14 @@
         "half": "ec2",
         "host": null,
         "id": "ec2:1",
-        "last_relaunch": null,
+        "last_relaunch": {
+          "by": "wake",
+          "clicked_at": 1300,
+          "first_frame_at": 1300,
+          "phases": {}
+        },
         "phase": "running",
+        "place": null,
         "previous_rect": {
           "h": 1.0,
           "w": 0.25,

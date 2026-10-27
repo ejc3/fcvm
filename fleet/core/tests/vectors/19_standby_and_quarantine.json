@@ -411,8 +411,14 @@
         "half": "fcvm",
         "host": "h1",
         "id": "fcvm:1",
-        "last_relaunch": null,
+        "last_relaunch": {
+          "by": "wake",
+          "clicked_at": 5500,
+          "first_frame_at": 5500,
+          "phases": {}
+        },
         "phase": "running",
+        "place": null,
         "previous_rect": {
           "h": 1.0,
           "w": 1.0,
@@ -446,6 +452,7 @@
         "id": "fcvm:2",
         "last_relaunch": null,
         "phase": "pending",
+        "place": null,
         "previous_rect": {
           "h": 1.0,
           "w": 0.5,

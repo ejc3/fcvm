@@ -61,6 +61,8 @@ export interface Tile {
   frame_url_v4: string | null;
   gpu: GpuInfo | null;
   host: string | null;
+  /** Where the tile runs, worded for a viewer (`EC2 in us-east-1`); null until the slot reports it. */
+  place: string | null;
   last_relaunch: LastRelaunch | null;
   /** Lent to a visitor as their own GPU until this time; it sits out races meanwhile. */
   borrowed: { until: number } | null;
@@ -564,6 +566,7 @@ function parseTile(v: unknown, i: number): Tile {
     frame_url_v4: strOrNull(v, "frame_url_v4", where),
     gpu: parseGpu(v["gpu"], v["gpu_stats"], `${where}.gpu`),
     host: strOrNull(v, "host", where),
+    place: strOrNull(v, "place", where),
     last_relaunch: parseLastRelaunch(v["last_relaunch"], `${where}.last_relaunch`),
     borrowed: isObj(v["borrowed"]) ? { until: num(v["borrowed"], "until", `${where}.borrowed`) } : null,
   };

@@ -621,6 +621,7 @@
           "phases": {}
         },
         "phase": "running",
+        "place": null,
         "previous_rect": null,
         "rect": {
           "h": 0.5,
@@ -654,6 +655,7 @@
           "phases": {}
         },
         "phase": "running",
+        "place": null,
         "previous_rect": null,
         "rect": {
           "h": 0.5,
@@ -687,6 +689,7 @@
           "phases": {}
         },
         "phase": "running",
+        "place": null,
         "previous_rect": null,
         "rect": {
           "h": 0.5,

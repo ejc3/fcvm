@@ -675,6 +675,7 @@ impl FakeAgent {
                 ipv6: None,
                 ipv4: None,
                 v4_port: None,
+                place: None,
             }))
             .unwrap();
     }
@@ -1798,6 +1799,99 @@ async fn an_ec2_tile_is_reported_running_only_after_its_renderer_has_its_scene()
         1,
         "the same scene was posted again"
     );
+}
+
+/// An instance the driver names `<region>/<id>`, as the AWS driver does.
+struct RegionNamedEc2;
+
+#[async_trait::async_trait]
+impl ec2::Ec2Driver for RegionNamedEc2 {
+    async fn launch(&self, _tile: &str) -> Result<ec2::Launched, ec2::LaunchError> {
+        Ok(ec2::Launched {
+            instance: "us-east-1/i-example".into(),
+            frame_url: None,
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        Ok(l.clone())
+    }
+    async fn terminate(&self, _instance: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_budget(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn health(&self, _tile: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("no renderer")
+    }
+}
+
+/// A viewer is told the region a tile runs in, never its instance id.
+#[tokio::test]
+async fn a_running_ec2_tile_reports_its_region_as_its_place_and_not_its_instance() {
+    use fleet_core::protocol::{AssignSlot, BudgetBody, SharedScene};
+    let (handle, reports) = recording_handle();
+    let tile = AssignSlot {
+        id: "ec2-1".into(),
+        sbdf: String::new(),
+        generation: 1,
+        rect: Some(fleet_core::tiling::Rect {
+            x: 0.5,
+            y: 0.0,
+            w: 0.25,
+            h: 1.0,
+        }),
+        private_camera: None,
+        layout_generation: 0,
+        rect_from_frame: 0,
+        previous_rect: None,
+        standby: false,
+        warm: false,
+    };
+    let (_assign, assign) = tokio::sync::watch::channel(vec![tile]);
+    let (_scene, scene) = tokio::sync::watch::channel(Some(SharedScene::new(
+        &fleet_core::scene::Scene::new(1_000),
+        32.0 / 9.0,
+    )));
+    let (_budget, budget) = tokio::sync::watch::channel(Some(BudgetBody {
+        budget: 500_000,
+        t: 1.0,
+    }));
+    tokio::spawn(ec2::run(
+        Arc::new(RegionNamedEc2),
+        assign,
+        scene,
+        budget,
+        handle,
+    ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !reports.lock().unwrap().iter().any(|r| r.phase == "running") {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the tile runs");
+    let reports = reports.lock().unwrap();
+    let running = reports.iter().find(|r| r.phase == "running").unwrap();
+    assert_eq!(running.place.as_deref(), Some("EC2 in us-east-1"));
+    assert!(reports
+        .iter()
+        .all(|r| r.place.as_deref().is_none_or(|p| !p.contains("i-example"))));
 }
 
 /// A running tile whose renderer stops answering on an instance that keeps running is

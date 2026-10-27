@@ -498,6 +498,7 @@
           }
         },
         "phase": "running",
+        "place": null,
         "previous_rect": {
           "h": 0.5,
           "w": 0.5,
@@ -537,6 +538,7 @@
           }
         },
         "phase": "running",
+        "place": null,
         "previous_rect": {
           "h": 0.5,
           "w": 0.25,
@@ -576,6 +578,7 @@
           }
         },
         "phase": "running",
+        "place": null,
         "previous_rect": {
           "h": 0.5,
           "w": 0.25,

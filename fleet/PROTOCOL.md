@@ -205,6 +205,7 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
       "frame_url_v4": "wss://slot-1-k3x7q2ab-v4.<zone>:20200/frames",
       "gpu": {"sbdf": "0000:01:00.0", "name": "Tesla T4"},
       "host": "<host name>",
+      "place": "EC2 in us-east-1",
       "vm": "fleet-slot-1",
       "generation": 3,
       "fps": 30.0,
@@ -661,11 +662,15 @@ host's slots stay, and the old connection's later messages are ignored.
 ```json
 {"type": "slot", "id": "slot-3", "phase": "running", "generation": 4, "vm": "fleet-slot-3",
  "frame_url": "ws://<host>:<port>/frames", "ipv6": "2001:db8::3", "ipv4": "192.0.2.10", "v4_port": 20202,
+ "place": "EC2 in us-east-1",
  "timings": {"teardown_ms": 310, "restore_ms": 4300, "ack_ms": 4300, "gpu_ms": 3100, "container_ms": 600, "first_frame_ms": 250, "total_ms": 5200},
  "error": null, "retry_in_ms": null}
 ```
 
-On every phase change. `generation` is the generation the agent is working toward or
+On every phase change. `place` is where the host runs, `EC2 in <region>` (`protocol::place_label`;
+absent off EC2): the browser view shows it as the tile's `place` instead of the host name. A slot
+that first reports `running` with no `last_relaunch` gets one (`by` is `wake`) timed from
+`timings.total_ms`, so a tile that came up at a wake has a last launch. `generation` is the generation the agent is working toward or
 running. Phases, in order: `stopping` (tearing the old VM down), `restoring` (fcvm started;
 the snapshot restore and GPU attach run inside it), `starting` (fcvm acknowledged the
 restore; the container and renderer are coming up), `running` (the renderer reported its

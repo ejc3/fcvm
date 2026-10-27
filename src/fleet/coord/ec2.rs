@@ -438,6 +438,13 @@ pub async fn run(
     }
 }
 
+/// The public label of where an instance runs. A driver names an instance `<region>/<id>`
+/// (see `ec2_aws::split`); the region is the only part a viewer is told, never the id.
+fn place_of(instance: &str) -> Option<String> {
+    let (region, _) = instance.split_once('/')?;
+    fleet_core::protocol::place_label(region)
+}
+
 /// Report the tile's phase, unless its task is retired: once the tile has left the
 /// assignment (its sender is gone) a task for its return may already report on the same
 /// slot, and this task's report would overwrite it.
@@ -476,6 +483,7 @@ async fn report(
                 ipv4: l.and_then(|l| l.ipv4.clone()),
                 // A tile serves TLS on 443 at its own IPv4 address.
                 v4_port: None,
+                place: l.and_then(|l| place_of(&l.instance)),
             },
         })
         .await;

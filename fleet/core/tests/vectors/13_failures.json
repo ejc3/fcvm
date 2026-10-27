@@ -363,8 +363,14 @@
         "half": "fcvm",
         "host": "h2",
         "id": "fcvm:1",
-        "last_relaunch": null,
+        "last_relaunch": {
+          "by": "wake",
+          "clicked_at": 1500,
+          "first_frame_at": 1500,
+          "phases": {}
+        },
         "phase": "failed",
+        "place": null,
         "previous_rect": {
           "h": 0.5,
           "w": 1.0,

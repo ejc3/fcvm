@@ -492,8 +492,14 @@
         "half": "fcvm",
         "host": "hC",
         "id": "fcvm:1",
-        "last_relaunch": null,
+        "last_relaunch": {
+          "by": "wake",
+          "clicked_at": 4100,
+          "first_frame_at": 4100,
+          "phases": {}
+        },
         "phase": "running",
+        "place": null,
         "previous_rect": {
           "h": 1.0,
           "w": 1.0,
@@ -525,8 +531,14 @@
         "half": "fcvm",
         "host": "hB",
         "id": "fcvm:2",
-        "last_relaunch": null,
+        "last_relaunch": {
+          "by": "wake",
+          "clicked_at": 2100,
+          "first_frame_at": 2100,
+          "phases": {}
+        },
         "phase": "running",
+        "place": null,
         "previous_rect": {
           "h": 0.5,
           "w": 1.0,
@@ -558,8 +570,14 @@
         "half": "fcvm",
         "host": "hB",
         "id": "fcvm:3",
-        "last_relaunch": null,
+        "last_relaunch": {
+          "by": "wake",
+          "clicked_at": 2100,
+          "first_frame_at": 2100,
+          "phases": {}
+        },
         "phase": "running",
+        "place": null,
         "previous_rect": {
           "h": 0.5,
           "w": 0.5,
@@ -591,8 +609,14 @@
         "half": "fcvm",
         "host": "hB",
         "id": "fcvm:4",
-        "last_relaunch": null,
+        "last_relaunch": {
+          "by": "wake",
+          "clicked_at": 2100,
+          "first_frame_at": 2100,
+          "phases": {}
+        },
         "phase": "running",
+        "place": null,
         "previous_rect": {
           "h": 0.5,
           "w": 0.5,

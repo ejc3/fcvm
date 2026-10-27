@@ -1153,6 +1153,9 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
     slot.observed.ipv6 = r.ipv6.clone();
     slot.observed.ipv4 = r.ipv4.clone();
     slot.observed.v4_port = r.v4_port;
+    if r.place.is_some() {
+        slot.observed.place = r.place.clone();
+    }
     if r.phase == "waiting_capacity" {
         let id = slot.id.clone();
         let since = at.saturating_sub(r.timings.get("capacity_wait_ms").copied().unwrap_or(0));
@@ -1183,10 +1186,24 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
         slot.observed.frame_t = None;
         return;
     }
-    if let Some(rl) = slot.last_relaunch.as_mut() {
-        if rl.generation == r.generation && rl.first_frame_at.is_none() {
-            rl.first_frame_at = Some(at);
-            rl.phases = r.timings.clone();
+    match slot.last_relaunch.as_mut() {
+        Some(rl) => {
+            if rl.generation == r.generation && rl.first_frame_at.is_none() {
+                rl.first_frame_at = Some(at);
+                rl.phases = r.timings.clone();
+            }
+        }
+        // A slot that came up at a wake was never relaunched by anyone, so nothing timed
+        // it: its launch (or resume) is the last one, timed by the slot's own report.
+        None => {
+            let took = r.timings.get("total_ms").copied().unwrap_or(0);
+            slot.last_relaunch = Some(Relaunch {
+                generation: r.generation,
+                clicked_at: at.saturating_sub(took),
+                by: "wake".into(),
+                first_frame_at: Some(at),
+                phases: r.timings.clone(),
+            });
         }
     }
     if let Some(c) = slot.claim.as_mut() {
@@ -1253,6 +1270,23 @@ fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport) {
         return;
     }
     slot.observed.fps = h.fps.is_finite().then_some(h.fps);
+    // An EC2 tile has no inventory to name its GPU: the renderer says which one it drew on.
+    if host.is_none() {
+        if let Some(name) = h
+            .gpu
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            if slot.gpu.as_ref().map(|g| g.name.as_str()) != Some(name) {
+                slot.gpu = Some(Gpu {
+                    sbdf: String::new(),
+                    name: name.to_string(),
+                });
+            }
+        }
+    }
     slot.observed.gpu_stats = Some(h.gpu.clone());
     slot.observed.budget_fit = h.budget_fit.filter(|v| v.is_finite());
     slot.observed.render_ms_max = h.render_ms_max.filter(|v| v.is_finite());

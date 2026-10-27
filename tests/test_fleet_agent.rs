@@ -72,6 +72,7 @@ fn cfg(fcvm: &Path) -> AgentCfg {
         frame_zone: None,
         tls_publish_base: None,
         public_ipv4: None,
+        place: None,
         sysfs_root: PathBuf::from("/nonexistent-sysfs"),
         start_timeout: Duration::from_secs(20),
         stop_grace: Duration::from_secs(10),
