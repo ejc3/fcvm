@@ -179,14 +179,13 @@ fn parked(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// #1181: a restore of a snapshot whose source VM is gone recreates the source's
-/// directory as a mountpoint, and the last lease on it removes it (#1304). After a
-/// SIGKILL of a restore that made it, with the clone's own runtime directory (#1183), the
-/// next launch removes both.
+/// #1183: after a SIGKILL of a restore that made its own runtime directory, the next
+/// launch removes it. The Firecracker fcvm builds overrides every source path at load
+/// (#1318), so the restore makes no mountpoint at the source VM's directory (#1181); the
+/// reclaim of one an older binary made is covered by the unit tests in `src/reclaim.rs`.
 #[cfg(feature = "integration-slow")]
 #[tokio::test]
-async fn a_sigkilled_restore_leaves_its_mountpoint_and_runtime_dir_to_the_next_launch() -> Result<()>
-{
+async fn a_sigkilled_restore_leaves_its_runtime_dir_to_the_next_launch() -> Result<()> {
     let (source_name, _, snapshot, _) = common::unique_names("reclaim-mount");
 
     let (mut source, source_pid) = common::spawn_fcvm(&[
@@ -217,8 +216,8 @@ async fn a_sigkilled_restore_leaves_its_mountpoint_and_runtime_dir_to_the_next_l
     );
 
     let result = async {
-        // A restore killed after it made the mountpoint and its own directory, before
-        // its VMM loaded the snapshot.
+        // A restore killed after it made its own directory, before its VMM loaded the
+        // snapshot.
         let park = tempfile::tempdir()?;
         let spec = format!("restore.pre_load:park:{}", park.path().display());
         let (killed_name, _, _, _) = common::unique_names("reclaim-mount-killed");
@@ -243,10 +242,15 @@ async fn a_sigkilled_restore_leaves_its_mountpoint_and_runtime_dir_to_the_next_l
             .await?;
             let killed_dir = vm_disks(&vm_id_of(killed_pid).await?);
             anyhow::ensure!(
-                source_dir.is_dir() && killed_dir.join("disks").is_dir(),
-                "the parked restore has not made {} and {}",
-                source_dir.display(),
+                killed_dir.join("disks").is_dir(),
+                "the parked restore has not made {}",
                 killed_dir.display()
+            );
+            anyhow::ensure!(
+                !source_dir.exists(),
+                "the parked restore recreated the source VM's directory {}, which a load \
+                 that overrides every source path does not need",
+                source_dir.display()
             );
             Ok(killed_dir)
         }
@@ -255,11 +259,6 @@ async fn a_sigkilled_restore_leaves_its_mountpoint_and_runtime_dir_to_the_next_l
         let killed_dir = observed?;
 
         next_launch().await?;
-        anyhow::ensure!(
-            !source_dir.exists(),
-            "the killed restore's mountpoint survived the next launch: {}",
-            source_dir.display()
-        );
         anyhow::ensure!(
             !killed_dir.exists(),
             "the killed restore's runtime directory survived the next launch: {}",
