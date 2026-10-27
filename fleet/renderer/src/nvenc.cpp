@@ -7,6 +7,8 @@
 #include <cstring>
 #include <mutex>
 #include <algorithm>
+#include <iterator>
+#include <vector>
 
 #include "ffnvcodec/nvEncodeAPI.h"
 
@@ -68,6 +70,115 @@ long find_sps(const uint8_t* p, size_t n, size_t* len) {
     i = s - 1;
   }
   return -1;
+}
+
+namespace {
+struct Bits {
+  std::vector<uint8_t> b;  // RBSP: emulation prevention bytes removed
+  size_t pos = 0;
+  bool bad = false;
+  uint32_t u1() {
+    if (pos >= b.size() * 8) { bad = true; return 0; }
+    uint32_t v = (b[pos >> 3] >> (7 - (pos & 7))) & 1;
+    pos++;
+    return v;
+  }
+  uint32_t u(int n) {
+    uint32_t v = 0;
+    for (int i = 0; i < n; i++) v = (v << 1) | u1();
+    return v;
+  }
+  uint32_t ue() {
+    int lz = 0;
+    while (!bad && u1() == 0)
+      if (++lz > 31) { bad = true; return 0; }
+    return (uint32_t)(((uint64_t)1 << lz) - 1 + u(lz));
+  }
+  void se() { ue(); }
+};
+
+void skip_hrd(Bits& r) {
+  uint32_t cpb = r.ue() + 1;
+  r.u(8);
+  for (uint32_t i = 0; i < cpb && !r.bad; i++) { r.ue(); r.ue(); r.u1(); }
+  r.u(20);
+}
+}  // namespace
+
+// H.264 7.3.2.1.1 and E.1.1, as far as bitstream_restriction.
+SpsReorder sps_reorder(const uint8_t* p, size_t n) {
+  SpsReorder out;
+  Bits r;
+  int zeros = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (zeros >= 2 && p[i] == 3) { zeros = 0; continue; }
+    r.b.push_back(p[i]);
+    zeros = p[i] == 0 ? zeros + 1 : 0;
+  }
+  if (r.b.size() < 4 || (r.b[0] & 0x1f) != 7) return out;
+  r.u(8);
+  uint32_t profile = r.u(8);
+  r.u(16);  // constraint flags, level_idc
+  r.ue();   // seq_parameter_set_id
+  static const uint32_t high[] = {100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135};
+  if (std::find(std::begin(high), std::end(high), profile) != std::end(high)) {
+    uint32_t chroma = r.ue();
+    if (chroma == 3) r.u1();
+    r.ue(); r.ue(); r.u1();
+    if (r.u1()) {
+      for (int i = 0; i < (chroma != 3 ? 8 : 12) && !r.bad; i++) {
+        if (!r.u1()) continue;
+        int last = 8, next = 8;
+        for (int j = 0; j < (i < 6 ? 16 : 64) && !r.bad; j++) {
+          if (next != 0) {
+            uint32_t k = r.ue();
+            int d = (k & 1) ? (int)((k + 1) / 2) : -(int)(k / 2);
+            next = ((last + d) % 256 + 256) % 256;
+          }
+          if (next != 0) last = next;
+        }
+      }
+    }
+  }
+  r.ue();  // log2_max_frame_num_minus4
+  uint32_t poc = r.ue();
+  if (poc == 0) r.ue();
+  else if (poc == 1) {
+    r.u1(); r.se(); r.se();
+    uint32_t c = r.ue();
+    for (uint32_t i = 0; i < c && !r.bad; i++) r.se();
+  }
+  out.max_num_ref_frames = r.ue();
+  r.u1();
+  r.ue(); r.ue();
+  if (!r.u1()) r.u1();  // frame_mbs_only_flag, mb_adaptive_frame_field_flag
+  r.u1();
+  if (r.u1()) { r.ue(); r.ue(); r.ue(); r.ue(); }
+  if (r.u1()) {  // vui_parameters_present_flag
+    if (r.u1() && r.u(8) == 255) r.u(32);
+    if (r.u1()) r.u1();
+    if (r.u1()) { r.u(4); if (r.u1()) r.u(24); }
+    if (r.u1()) { r.ue(); r.ue(); }
+    if (r.u1()) { r.u(32); r.u(32); r.u1(); }
+    uint32_t nal_hrd = r.u1();
+    if (nal_hrd) skip_hrd(r);
+    uint32_t vcl_hrd = r.u1();
+    if (vcl_hrd) skip_hrd(r);
+    if (nal_hrd || vcl_hrd) r.u1();
+    r.u1();  // pic_struct_present_flag
+    if (r.u1()) {
+      out.restriction = true;
+      r.u1(); r.ue(); r.ue(); r.ue(); r.ue();
+      out.max_num_reorder_frames = r.ue();
+      out.max_dec_frame_buffering = r.ue();
+    }
+  }
+  // what follows must be rbsp_trailing_bits: a 1, then zeros
+  if (r.bad || r.u1() != 1) return SpsReorder();
+  while (r.pos < r.b.size() * 8)
+    if (r.u1()) return SpsReorder();
+  out.parsed = true;
+  return out;
 }
 
 std::string avc_codec_string(const uint8_t* sps, size_t n) {
@@ -184,6 +295,12 @@ bool H264Encoder::open(void* cu_ctx, void* nv12, size_t pitch, int w, int h, int
   vui.colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
   vui.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
   vui.colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_BT709;
+  // With no bitstream_restriction a decoder must assume frames are reordered
+  // by up to the level's MaxDpbFrames, and holds that many before outputting
+  // one (7 or 8 frames, 234 to 268 ms, in Chrome on macOS). With it NVENC
+  // writes max_num_reorder_frames 0 (no B-frames) and max_dec_frame_buffering
+  // max_num_ref_frames; open() reads both back.
+  vui.bitstreamRestrictionFlag = 1;
 
   NV_ENC_INITIALIZE_PARAMS ip;
   memset(&ip, 0, sizeof ip);
@@ -234,6 +351,11 @@ bool H264Encoder::open(void* cu_ctx, void* nv12, size_t pitch, int w, int h, int
   long off = find_sps(hdr, hn, &sl);
   if (off < 0) { *err = "no SPS in the encoder's sequence header"; return false; }
   codec_ = avc_codec_string(hdr + off, sl);
+  reorder_ = sps_reorder(hdr + off, sl);
+  if (!reorder_.parsed || !reorder_.restriction || reorder_.max_num_reorder_frames != 0)
+    fprintf(stderr, "fleet-renderer: encoder %dx%d: the SPS does not say frames are never reordered "
+            "(parsed %d, restriction %d, max_num_reorder_frames %u); decoders will hold frames\n",
+            w, h, (int)reorder_.parsed, (int)reorder_.restriction, reorder_.max_num_reorder_frames);
   return true;
 }
 

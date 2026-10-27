@@ -31,9 +31,9 @@ $(OUT)/render.o: src/render.cu src/*.h
 $(OUT)/fleet-renderer: $(HOST_O) $(OUT)/render.o $(OUT)/main.o
 	$(NVCC) $(GENCODE) -o $@ $^ $(LDLIBS)
 
-$(OUT)/fleet-renderer-test: tests/test_gpu.cpp tests/check.h $(CORE_O) $(OUT)/render.o
+$(OUT)/fleet-renderer-test: tests/test_gpu.cpp tests/check.h $(CORE_O) $(OUT)/nvenc.o $(OUT)/render.o
 	$(CXX) $(CXXFLAGS) -c tests/test_gpu.cpp -o $(OUT)/test_gpu.o
-	$(NVCC) $(GENCODE) -o $@ $(OUT)/test_gpu.o $(CORE_O) $(OUT)/render.o $(LDLIBS)
+	$(NVCC) $(GENCODE) -o $@ $(OUT)/test_gpu.o $(CORE_O) $(OUT)/nvenc.o $(OUT)/render.o $(LDLIBS)
 
 # Host-only tests need no CUDA: g++ and the NVENC header.
 $(OUT)/test-host: tests/test_host.cpp tests/check.h src/*.cpp src/*.h

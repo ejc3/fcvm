@@ -1250,6 +1250,13 @@ Then binary messages, each one access unit:
 - H.264 High profile, no B-frames, NVENC with ultra-low-latency tuning,
   BT.709 limited range (signalled in the VUI), CBR at the quality's rate (the
   header's `bitrate`, bits per second).
+- The SPS's VUI carries a `bitstream_restriction` with
+  `max_num_reorder_frames` 0 and `max_dec_frame_buffering` equal to
+  `max_num_ref_frames`. Without it a decoder must assume the level's
+  MaxDpbFrames of reordering and holds that many frames before outputting
+  one (Chrome on macOS: 7 or 8 frames, 234 to 268 ms). The page adds the
+  restriction itself to an SPS without one (`fleet/web/core/sps.ts`), for
+  renderers built before it.
 - The first binary message is a keyframe. Keyframes follow at least every 2 s.
 - **A stream's first frames (round 10).** A moving frame averages the 7
   frames before it, so a tile whose stream starts must have those 7 or its
