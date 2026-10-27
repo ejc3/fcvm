@@ -1319,7 +1319,7 @@ export interface WallView {
   /** What the streams cost, for the stats switch. */
   bandwidth: string;
   /** Broadcast mode: the player's URL (with its token) and the latency line; null otherwise. */
-  broadcast: { url: string; latency: string } | null;
+  broadcast: { url: string; latency: string; paused: boolean } | null;
   /** The stream stats' line on the wall's rate and the renderer holding it back (wallRateLine). */
   wallRate: string;
 }
@@ -1642,6 +1642,9 @@ export function wallView(input: WallInput): WallView {
   };
 
   const play = playView(s, st, srvNow, pend, plan, input, online);
+  // The live picture is whole: every stream has a frame at one t, or in broadcast mode the
+  // player has presented one (the canvas streams nothing then).
+  const pictureWhole = broadcast ? input.broadcastLatencyMs !== undefined && input.broadcastLatencyMs !== null : imageWhole(plan, s.frames);
   const returning = stillReturning(st, s.ui.returning, srvNow);
   const latestNudge = [...s.notices].reverse().find((n) => n.intent === "nudge")?.id ?? null;
   return {
@@ -1663,7 +1666,7 @@ export function wallView(input: WallInput): WallView {
           meta: input.media.meta,
           power: st.fleet.power.state,
           reelOn: s.ui.reelOn,
-          allLive: imageWhole(plan, s.frames),
+          allLive: pictureWhole,
           reducedMotion: input.reducedMotion ?? false,
           saveData: input.saveData ?? false,
         })
@@ -1674,7 +1677,7 @@ export function wallView(input: WallInput): WallView {
     ownButton: broadcast ? null : ownButton(st, srvNow, online, s.own.requestId !== null || (s.own.claim !== null && s.own.claim.phase !== "ended")),
     ownRefusal: s.own.refused === null ? null : { text: `No GPU is free right now: ${s.own.refused}. Try again in a minute.`, dismiss: "OK" },
     viewers: fmt.count(st.viewers.active, "person watching", "people watching"),
-    live: st.fleet.power.state === "awake" && imageWhole(plan, s.frames),
+    live: st.fleet.power.state === "awake" && pictureWhole,
     spec: specLine(st, s, planLayout?.image ?? null, input.dpr),
     lastRace: lastRaceLine(st),
     race: covered ? null : raceOnImage(st, srvNow, layout?.image ?? null, layout?.split ?? 0.5),
@@ -1687,6 +1690,7 @@ export function wallView(input: WallInput): WallView {
       broadcast && s.admission?.broadcast
         ? {
             url: s.admission.broadcast.value,
+            paused: s.ui.paused,
             latency:
               input.broadcastLatencyMs === undefined || input.broadcastLatencyMs === null
                 ? "broadcast, waiting for its first frame"

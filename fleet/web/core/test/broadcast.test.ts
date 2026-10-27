@@ -193,3 +193,36 @@ describe("frame URLs and the direct token", () => {
     expect(frameSocketUrl("wss://x/frames", 180)).toBe("wss://x/frames?h=180");
   });
 });
+
+describe("the broadcast's own state on the page", () => {
+  const media = { base: "/media", meta: null };
+  function asleepThenAwake(s: ClientState): ClientState {
+    // The recording went on while the fleet slept; the snapshot now says awake.
+    return { ...s, ui: { ...s.ui, reelOn: true } };
+  }
+
+  it("lets the recording go once the broadcast presents a frame", () => {
+    const late = asleepThenAwake(withSnapshots(admission(LATE), [fleet()]));
+    const waiting = wallView({ state: late, now: EPOCH, dpr: 1, mosaicArea: { x: 0, y: 0, w: 1600, h: 930 }, canDecode: true, phone: false, media });
+    expect(waiting.reel?.leaving).toBe(false);
+    expect(waiting.live).toBe(false);
+    const playing = wallView({
+      state: late,
+      now: EPOCH,
+      dpr: 1,
+      mosaicArea: { x: 0, y: 0, w: 1600, h: 930 },
+      canDecode: true,
+      phone: false,
+      media,
+      broadcastLatencyMs: 1800,
+    });
+    expect(playing.reel?.leaving).toBe(true);
+    expect(playing.live).toBe(true);
+  });
+
+  it("tells the player the page is paused", () => {
+    const late = withSnapshots(admission(LATE), [fleet()]);
+    expect(view(late).broadcast?.paused).toBe(false);
+    expect(view({ ...late, ui: { ...late.ui, paused: true } }).broadcast?.paused).toBe(true);
+  });
+});

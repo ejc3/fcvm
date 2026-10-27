@@ -20,6 +20,7 @@ interface IvsPlayer {
   addEventListener(name: string, fn: (payload: unknown) => void): void;
   load(url: string): void;
   play(): void;
+  pause(): void;
   setMuted(m: boolean): void;
   delete(): void;
 }
@@ -72,10 +73,13 @@ export type BroadcastStatus = "loading" | "playing" | "buffering" | "reconnectin
 
 export function Broadcast({
   url,
+  paused,
   box,
   onFrame,
 }: {
   url: string;
+  /** The page's Pause: the picture stops (the player holds its frame). */
+  paused: boolean;
   box: { left: number; top: number; width: number; height: number };
   onFrame: (f: ShownFrame) => void;
 }) {
@@ -85,6 +89,9 @@ export function Broadcast({
   urlRef.current = url;
   const onFrameRef = useRef(onFrame);
   onFrameRef.current = onFrame;
+  const pausedRef = useRef(paused);
+  pausedRef.current = paused;
+  const playerRef = useRef<IvsPlayer | null>(null);
   const [status, setStatus] = useState<BroadcastStatus>("loading");
   const [attempt, setAttempt] = useState(0);
 
@@ -115,6 +122,7 @@ export function Broadcast({
         }
         const p = IVS.create();
         player = p;
+        playerRef.current = p;
         p.attachHTMLVideoElement(video);
         p.setMuted(true);
         p.addEventListener(IVS.PlayerState.PLAYING, () => setStatus("playing"));
@@ -132,7 +140,7 @@ export function Broadcast({
         });
         if ("requestVideoFrameCallback" in video) callback = video.requestVideoFrameCallback(onPresented);
         p.load(urlRef.current);
-        p.play();
+        if (!pausedRef.current) p.play();
       })
       .catch(again);
     return () => {
@@ -140,8 +148,17 @@ export function Broadcast({
       if (retry) clearTimeout(retry);
       if (callback && "cancelVideoFrameCallback" in video) video.cancelVideoFrameCallback(callback);
       player?.delete();
+      playerRef.current = null;
     };
   }, [attempt]);
+
+  // The page's Pause and Resume.
+  useEffect(() => {
+    const p = playerRef.current;
+    if (!p) return;
+    if (paused) p.pause();
+    else p.play();
+  }, [paused]);
 
   const note =
     status === "reconnecting"

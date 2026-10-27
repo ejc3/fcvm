@@ -690,6 +690,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
       {view.broadcast && view.plan.image && areas.mosaic ? (
         <Broadcast
           url={view.broadcast.url}
+          paused={view.broadcast.paused}
           box={{ left: view.plan.image.x - areas.mosaic.x, top: view.plan.image.y - areas.mosaic.y, width: view.plan.image.w, height: view.plan.image.h }}
           onFrame={(f) => {
             client.shown = f;
