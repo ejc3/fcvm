@@ -834,6 +834,7 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

@@ -7,7 +7,7 @@ use fcvm::fleet::aggregate::codec::Raw;
 use fcvm::fleet::aggregate::frame::Frame;
 use fcvm::fleet::coord::text_check::{FakeCheck, NoCheck, TextChecker, CHECK_FAILED, WORDS_OFF};
 use fcvm::fleet::coord::turnstile::{self, Verifier};
-use fcvm::fleet::coord::{agents, ec2, live, poster, start, store, Handle};
+use fcvm::fleet::coord::{admission, agents, ec2, live, poster, start, store, Handle};
 use fcvm::fleet::lines::{spawn_writer, LineReader};
 use fcvm::fleet::now_ms;
 use fleet_core::protocol::{AgentMsg, CoordMsg, SlotReport};
@@ -34,6 +34,8 @@ struct Opts {
     site_key: Option<String>,
     /// The launch names' subzone: tiles' and claims' frame URLs are then the published names.
     dns: Option<fcvm::fleet::coord::Names>,
+    /// Seats and tokens; everyone seated when absent.
+    gate: Option<Arc<admission::Gate>>,
 }
 
 impl Default for Opts {
@@ -49,6 +51,7 @@ impl Default for Opts {
             ec2_local: None,
             dns: None,
             site_key: None,
+            gate: None,
         }
     }
 }
@@ -76,6 +79,7 @@ async fn coordinator_with(o: Opts) -> Coord {
         trust_cf_connecting_ip: o.trust_cf,
         turnstile_site_key: o.site_key,
         poster: Arc::new(poster::Poster::default()),
+        gate: o.gate.unwrap_or_else(|| Arc::new(admission::Gate::open())),
     };
     let h = handle.clone();
     tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
@@ -276,6 +280,15 @@ async fn a_viewer_gets_a_snapshot_on_connect_and_receipts_with_rising_versions()
     assert_eq!(hello["type"], "hello", "the first message names the viewer");
     assert!(hello["viewer"].as_str().unwrap().starts_with("v-"));
     assert_eq!(hello["turnstile"], Value::Null, "no Turnstile configured");
+    let admission = a.recv().await;
+    assert_eq!(
+        admission["type"], "admission",
+        "the second says how it receives the image"
+    );
+    assert_eq!(
+        admission["locked"], false,
+        "everyone is seated without a broadcast"
+    );
     let first = a.recv().await;
     assert_eq!(first["type"], "snapshot");
     for key in [
@@ -615,7 +628,8 @@ async fn pings_get_the_server_clock_and_garbage_gets_an_error() {
     a.send(json!({"type": "ping", "client_unix_ms": 123.5}))
         .await;
     a.send(json!({"type": "nonsense"})).await;
-    while a.other.len() < 3 {
+    // hello, admission, clock, error
+    while a.other.len() < 4 {
         a.recv().await;
     }
     let clock = a.other.iter().find(|m| m["type"] == "clock").unwrap();
@@ -1021,6 +1035,7 @@ async fn the_poster_is_the_whole_image_at_a_hold() {
         trust_cf_connecting_ip: false,
         turnstile_site_key: None,
         poster,
+        gate: Arc::new(admission::Gate::open()),
     };
     let h = handle.clone();
     tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
@@ -2768,6 +2783,7 @@ async fn page_viewer(handle: &Handle) -> Viewer {
         trust_cf_connecting_ip: false,
         turnstile_site_key: None,
         poster: Arc::new(poster::Poster::default()),
+        gate: Arc::new(admission::Gate::open()),
     };
     let h = handle.clone();
     tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
@@ -5547,4 +5563,128 @@ async fn the_broadcast_layout_is_the_whole_image_of_every_placed_tile() {
         .await
         .expect("no layout once the host is gone")
         .unwrap();
+}
+
+/// A gate of `seats` seats, a known key, an open playback URL, and short timers.
+fn test_gate(seats: usize, grace: Duration) -> Arc<admission::Gate> {
+    Arc::new(admission::Gate {
+        seats: admission::Seats::new(Some(seats)).with_grace(grace),
+        key: admission::AdmitKey([3; 32]),
+        playback: Some(admission::Playback::Open(
+            "https://playback.example/channel.m3u8".into(),
+        )),
+        tick: Duration::from_millis(50),
+    })
+}
+
+/// With every seat held, a new viewer is late: told so, given the broadcast and no direct
+/// token, and refused a GPU of its own, so no client state it flips can open a direct
+/// stream. The seated viewers' direct tokens validate under the coordinator's key.
+#[tokio::test]
+async fn a_viewer_past_the_direct_capacity_gets_the_broadcast_and_no_direct_token() {
+    let gate = test_gate(2, Duration::from_secs(60));
+    let c = coordinator_with(Opts {
+        gate: Some(gate.clone()),
+        ..Opts::default()
+    })
+    .await;
+    let now = || now_ms() / 1000;
+    let mut seated = Vec::new();
+    for _ in 0..2 {
+        let mut v = Viewer::connect(&c.url).await;
+        let a = v.message("admission").await;
+        assert_eq!(a["locked"], false);
+        assert!(a["seat"].is_string());
+        let hello = v.message("hello").await;
+        let token = a["direct"]["value"].as_str().unwrap();
+        assert!(admission::direct_token_valid(
+            std::slice::from_ref(&gate.key),
+            token,
+            now()
+        ));
+        assert!(
+            token.contains(hello["viewer"].as_str().unwrap()),
+            "the token names its viewer"
+        );
+        assert_eq!(
+            a["broadcast"]["value"],
+            "https://playback.example/channel.m3u8"
+        );
+        seated.push(v);
+    }
+    let mut late = Viewer::connect(&c.url).await;
+    let a = late.message("admission").await;
+    assert_eq!(a["locked"], true);
+    assert_eq!(a["seat"], Value::Null);
+    assert_eq!(
+        a["direct"],
+        Value::Null,
+        "a late viewer holds no direct token"
+    );
+    assert_eq!(a["reason"], admission::LATE_REASON);
+    assert_eq!(
+        a["broadcast"]["value"],
+        "https://playback.example/channel.m3u8"
+    );
+    assert_eq!(a["seat_free"], false);
+    assert_eq!(a["capacity"], 2);
+    // A GPU of its own is a direct stream too.
+    late.intent("own", "claim_gpu", json!({})).await;
+    let r = late.receipt("own").await;
+    assert_eq!(r["outcome"], "refused");
+    assert_eq!(r["reason"], live::LATE_CLAIM);
+    // No later admission ever gives it a token.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    while let Ok(Some(Ok(m))) =
+        tokio::time::timeout(Duration::from_millis(100), late.ws.next()).await
+    {
+        if let Message::Text(t) = m {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v["type"] == "admission" {
+                assert_eq!(v["direct"], Value::Null);
+            }
+        }
+    }
+}
+
+/// A seat stays with its ticket for the grace after its connection closes: a newcomer is
+/// still late, the page that comes back with the ticket has its seat again. Past the grace
+/// the seat frees, a late viewer still connected is told (and stays late: no promotion
+/// mid-session), and the next connection is seated.
+#[tokio::test]
+async fn a_closed_seat_is_kept_for_its_ticket_then_freed_without_promoting_anyone() {
+    let gate = test_gate(1, Duration::from_millis(600));
+    let c = coordinator_with(Opts {
+        gate: Some(gate.clone()),
+        ..Opts::default()
+    })
+    .await;
+    let mut first = Viewer::connect(&c.url).await;
+    let a = first.message("admission").await;
+    let ticket = a["seat"].as_str().unwrap().to_string();
+    let mut late = Viewer::connect(&c.url).await;
+    assert_eq!(late.message("admission").await["locked"], true);
+    first.ws.close(None).await.unwrap();
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Within the grace: the newcomer is late, the ticket's page is seated again.
+    let mut other = Viewer::connect(&c.url).await;
+    assert_eq!(other.message("admission").await["locked"], true);
+    drop(other);
+    let mut back = Viewer::connect(&format!("{}?seat={ticket}", c.url)).await;
+    let a = back.message("admission").await;
+    assert_eq!(a["locked"], false);
+    assert_eq!(a["seat"], ticket.as_str());
+    // Closed again and past the grace: the late viewer is told a seat is free, and is
+    // still late.
+    back.ws.close(None).await.unwrap();
+    drop(back);
+    let freed = late
+        .message_where("admission", |m| m["seat_free"] == true)
+        .await;
+    assert_eq!(freed["locked"], true);
+    assert_eq!(freed["direct"], Value::Null);
+    // A reload is a new connection, admitted afresh.
+    let mut reload = Viewer::connect(&c.url).await;
+    assert_eq!(reload.message("admission").await["locked"], false);
 }

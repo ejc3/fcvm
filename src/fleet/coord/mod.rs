@@ -7,6 +7,7 @@
 //! assignment, and the state file. No other task reads or writes the state, so there is
 //! nothing to lock and no order to race on.
 
+pub mod admission;
 pub mod agents;
 pub mod authority;
 pub mod aws;
@@ -1139,6 +1140,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             || {},
         ));
     }
+    let mut gate = admission::Gate::open();
     if let Some(listen) = &args.broadcast_listen {
         let json = match (&args.broadcast_secret, &args.broadcast_file) {
             (Some(secret), _) => secrets::Secrets::new(&secrets_region()?)?
@@ -1152,6 +1154,8 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             }
         };
         let b = broadcast::BroadcastSecret::parse(&json)?;
+        gate.playback = b.playback()?;
+        gate.seats = admission::Seats::new(Some(args.direct_capacity));
         let mut argv = vec![
             std::env::current_exe()
                 .context("locating this fcvm binary")?
@@ -1230,6 +1234,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         trust_cf_connecting_ip: args.trust_cf_connecting_ip,
         turnstile_site_key: args.turnstile_site_key,
         poster,
+        gate: Arc::new(gate),
     };
     tokio::select! {
         r = live::serve(listener, handle.clone(), cfg) => r?,

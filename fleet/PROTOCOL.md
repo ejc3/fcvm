@@ -41,6 +41,25 @@ names it, so a page can find its own intents in the shared list), and the Turnst
 key when intents need a `verify` first (`null` when they do not).
 
 ```json
+{"type": "admission", "seat": "<ticket>", "locked": false, "reason": null,
+ "direct": {"value": "v1.1761135000.v-17.<mac>", "expires_at": 1761135000000},
+ "broadcast": {"value": "https://<playback host>/<channel>.m3u8?token=<jwt>", "expires_at": 1761138000000},
+ "seat_free": false, "capacity": 500}
+```
+
+Second on every connection, then again every 5 minutes with fresh tokens, and to a late
+viewer whenever `seat_free` changes (docs/fleet/ARCHITECTURE.md, "Broadcast mode"). A
+connection admitted while fewer than `capacity` seats are held gets a `seat` ticket and a
+`direct` token, which every frame URL it opens carries as `admit=<value>`; one admitted
+with every seat held is late: `locked`, `seat` and `direct` null, `reason` the sentence the
+page shows, and `seat_free` true once a new connection would be seated (the page offers a
+reload; a late connection is never promoted). A page that reconnects passes its ticket as
+`GET /live?seat=<ticket>` and keeps its seat if the ticket's connection closed less than 60 s
+before. `broadcast` is the playback URL (signed for a private channel, valid for an hour),
+null without a broadcast; `capacity` is null when every viewer is seated (no broadcast).
+`claim_gpu` from a late connection is refused unrecorded (`version: 0`).
+
+```json
 {"type": "snapshot", "version": 42, "state": { ... }}
 ```
 
@@ -486,7 +505,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--dns-subzone <subzone> --dns-subzone-ns <ns>,... --dns-listen <addr:port> [--dns-rate-limit 200]]
                  [--tls-secret <secret>] [--secrets-region <region>]
                  [--broadcast-listen <addr:port> (--broadcast-secret <secret> | --broadcast-file <path>)
-                  [--broadcast-arg <arg>]...]
+                  [--broadcast-arg <arg>]... [--direct-capacity 500]]
 ```
 
 - `--broadcast-listen` runs the broadcast (docs/fleet/ARCHITECTURE.md, "Broadcast mode"): an
@@ -494,8 +513,12 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   whole image, every placed tile read directly at its published IPv6 name. It runs while a
   tile is placed and is stopped while none is (asleep), and pushes to the ingest URL of
   `--broadcast-secret` (a Secrets Manager secret, read in `--secrets-region`) or
-  `--broadcast-file`: JSON `{"ingest_url": "rtmps://<endpoint>:443/app/<stream key>"}`. The
-  coordinator does not start when it cannot read it. Its arguments are `--image-height 720
+  `--broadcast-file`: JSON `{"ingest_url": "rtmps://<endpoint>:443/app/<stream key>",
+  "playback_url": "https://<...>.m3u8", "channel_arn": "<arn>", "playback_key_pem": "<PKCS#8
+  P-384 private key>"}` (`playback_url` optional; the last two together, for a private
+  channel, or neither). The coordinator does not start when it cannot read it. With a
+  broadcast, `--direct-capacity` (also `FLEET_DIRECT_CAPACITY`, default 500) seats that many
+  viewers; the rest watch the broadcast (`admission` above). Its arguments are `--image-height 720
   --tile-query q=std --maxrate-kbps 4500 --crf 21 --preset veryfast`, then any
   `--broadcast-arg`.
 

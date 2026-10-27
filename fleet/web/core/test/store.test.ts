@@ -272,3 +272,36 @@ describe("a hidden tab", () => {
     expect(plan(s).suspended).toBe(false);
   });
 });
+
+describe("admission", () => {
+  it("keeps the coordinator's admission: a seat with its token, or the broadcast alone", () => {
+    let s = feed(initialState(), snapshotText(1, fleet()));
+    s = feed(
+      s,
+      JSON.stringify({
+        type: "admission",
+        seat: null,
+        locked: true,
+        reason: "Direct streams are full, so you are watching the broadcast.",
+        direct: null,
+        broadcast: { value: "https://playback.example/c.m3u8?token=x", expires_at: 2 },
+        seat_free: false,
+        capacity: 500,
+      }),
+    );
+    expect(s.protocolErrors).toBe(0);
+    expect(s.admission).toEqual({
+      seat: null,
+      locked: true,
+      reason: "Direct streams are full, so you are watching the broadcast.",
+      direct: null,
+      broadcast: { value: "https://playback.example/c.m3u8?token=x", expires_at: 2 },
+      seat_free: false,
+      capacity: 500,
+    });
+  });
+
+  it("refuses a malformed admission", () => {
+    expect(() => parseServerMsg(JSON.stringify({ type: "admission", direct: { value: 3 } }))).toThrow(ProtocolError);
+  });
+});
