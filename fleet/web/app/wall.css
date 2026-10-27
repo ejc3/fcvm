@@ -229,16 +229,46 @@ h1, h2, h3, p { margin: 0; }
 
 /* ---- one VM opened ------------------------------------------------------------- */
 
-.focus { position: fixed; inset: 0; z-index: 5; display: flex; flex-direction: column; gap: 14px; padding: 16px clamp(16px, 3vw, 36px) 24px; overflow: hidden; }
-.focus nav, .own nav { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
-.focus nav h1, .own nav h1 { font: 600 22px var(--mono); color: var(--accent, var(--text)); }
-.focus nav .state, .own nav .status { font-size: 15px; color: var(--muted); }
-.focus .body { flex: 1; min-height: 0; display: flex; gap: 22px; align-items: stretch; }
-.focus figure { margin: 0; flex: 999 1 640px; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
-.focus .shot { position: relative; flex: 1; min-height: 0; }
-.focus .shot .tag { position: absolute; top: 10px; left: 10px; font: 14px var(--mono); background: var(--plate); color: var(--text); }
-.focus figcaption { font-size: 14px; color: var(--muted); }
-.focus aside { flex: 1 1 320px; min-width: 280px; max-width: 420px; display: flex; flex-direction: column; gap: 14px; overflow: auto; }
+/* The canvas draws the zoomed image and the dim (plan.zoom); this layer only sits over it.
+   Clicks fall through to .zoom-hit, which opens the tile under them. */
+.zoom { position: fixed; inset: 0; z-index: 5; pointer-events: none; animation: zoom-in 260ms ease-out both; }
+.zoom > * { pointer-events: auto; }
+.zoom-hit { position: absolute; inset: 0; cursor: zoom-in; touch-action: pan-y; }
+.zoom-ring { position: absolute; pointer-events: none !important; box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent), 0 18px 60px rgba(0, 0, 0, 0.55); border-radius: 2px; }
+.zoom-ring .tag { position: absolute; left: 10px; bottom: 10px; font: 14px var(--mono); color: var(--text); }
+.zoom-bar { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; padding: 12px 24px 22px; pointer-events: none !important; background-image: linear-gradient(rgba(0, 0, 0, 0.7), rgba(0, 0, 0, 0)); }
+.zoom-bar > * { pointer-events: auto; }
+.zoom-bar h1, .own nav h1 { font: 600 22px var(--mono); color: var(--accent, var(--text)); text-shadow: 0 1px 8px rgba(0, 0, 0, 0.7); }
+.zoom-bar .state, .own nav .status { font-size: 15px; color: var(--muted); }
+.zoom-bar .state { text-shadow: 0 1px 6px rgba(0, 0, 0, 0.9); }
+.zoom-bar .sheet-open { margin-left: auto; }
+.own nav { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.sheet { position: absolute; top: 64px; right: 16px; bottom: 16px; width: 380px; max-width: calc(100vw - 32px); display: flex; flex-direction: column; border-radius: 14px; background: rgba(13, 16, 20, 0.7); border: 1px solid rgba(255, 255, 255, 0.09); backdrop-filter: blur(16px) saturate(1.2); -webkit-backdrop-filter: blur(16px) saturate(1.2); box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45); transition: transform 240ms cubic-bezier(0.2, 0.7, 0.2, 1), opacity 200ms ease-out; }
+.sheet:not(.open) { transform: translateX(calc(100% + 24px)); opacity: 0; pointer-events: none; }
+.sheet-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 10px 4px 16px; }
+.sheet-head .kind { font-size: 14px; color: var(--muted); }
+.btn.icon { min-width: 44px; padding: 0; justify-content: center; }
+.sheet-body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 12px; padding: 6px 12px 12px; }
+.zoom .card { background: rgba(255, 255, 255, 0.035); border-color: rgba(255, 255, 255, 0.08); }
+.phone-zoom .zoom-bar { padding: 8px 12px 18px; gap: 4px 10px; }
+.phone-zoom .zoom-bar h1 { font-size: 18px; }
+.phone-zoom .zoom-bar .state { flex-basis: 100%; font-size: 14px; }
+.phone-zoom .zoom-ring .tag { left: 8px; bottom: 8px; }
+.phone-zoom .sheet { top: auto; left: 0; right: 0; bottom: 0; width: auto; max-width: none; max-height: min(70dvh, 620px); border-radius: 16px 16px 0 0; border-bottom: 0; padding-bottom: env(safe-area-inset-bottom); transform: translateY(calc(100% - 68px - env(safe-area-inset-bottom))); opacity: 1; pointer-events: auto; }
+.phone-zoom .sheet.open { transform: none; }
+.phone-zoom .sheet-head { padding: 0; }
+.sheet-handle { position: relative; flex: 1; min-width: 0; display: flex; align-items: center; gap: 12px; min-height: 68px; padding: 14px 16px 10px; background: none; border: 0; text-align: left; cursor: pointer; }
+.sheet-handle .grip { position: absolute; top: 6px; left: 50%; width: 36px; height: 4px; margin-left: -18px; border-radius: 2px; background: rgba(255, 255, 255, 0.28); }
+.sheet-handle .peek { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.sheet-handle .kind { display: block; font-size: 14px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sheet-handle .more { flex: none; }
+.sheet-handle .up { font: 15px var(--mono); }
+.sheet-handle .more { font-size: 14px; color: var(--accent); }
+@keyframes zoom-in { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .zoom { animation: none; }
+  .sheet { transition: none; }
+}
 .card { background: var(--panel); border: 1px solid #262c35; border-radius: 12px; padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
 .card h2 { font-size: 16px; font-weight: 600; }
 .card .head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }

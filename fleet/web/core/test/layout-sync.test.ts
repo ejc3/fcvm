@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  DETAIL_TILE_PX,
+  easeZoom,
   fitContain,
-  layoutFocus,
   layoutMosaic,
+  layoutZoom,
+  sheetClears,
+  zoomTarget,
+  tileAspectOf,
   MAX_TILE_PX,
   STREAM_HEIGHTS,
   neighbour,
@@ -76,8 +81,7 @@ describe("layout", () => {
     const g = tileGeometry(one.rect, 16 / 9, big.tiles[0]!.streamHeight);
     expect(g.width * g.height).toBeLessThanOrEqual(MAX_TILE_PX);
     // A tall narrow tile may be taller: the cap is on pixels, not height.
-    const tall = layoutFocus({ x: 0, y: 0, w: 1920, h: 1080 }, { ...one, rect: { x: 0, y: 0, w: 1 / 16, h: 1 } }, 2);
-    expect(tall.streamHeight).toBe(1080);
+    expect(streamHeightFor(2160, tileAspectOf({ x: 0, y: 0, w: 1 / 16, h: 1 }, 16 / 9))).toBe(1080);
   });
 
   it("follows the renderer's tile geometry, including the encoder's minimum", () => {
@@ -103,6 +107,98 @@ describe("layout", () => {
     expect(segs.filter((s) => s.x0 === s.x1)).toHaveLength(6);
     expect(segs.filter((s) => s.y0 === s.y1)).toHaveLength(4);
     expect(segs.every((s) => s.x0 % 1 === 0.5 || s.y0 % 1 === 0.5)).toBe(true);
+  });
+});
+
+describe("one tile opened: the image zoomed around it", () => {
+  const desk = { top: 64, right: 24, bottom: 24, left: 24, sheet: 396 };
+  const stage = { x: 0, y: 0, w: 1600, h: 900 };
+
+  it("fills the stage less its insets at the tile's own aspect, and moves clear of the sheet only when that costs no size", () => {
+    // fleet(2, 2): each tile is a quarter of the width and half the height of a 16:9 image, 0.889 wide per unit tall.
+    const r = fleet(2, 2).tiles[0]!.rect;
+    const z = zoomTarget(stage, r, 16 / 9, desk);
+    expect(z.h).toBeCloseTo(900 - 64 - 24, 6);
+    expect(z.w / z.h).toBeCloseTo(tileAspectOf(r, 16 / 9), 9);
+    // Centred in the room left of the 396 px sheet already: it stays centred.
+    expect(z.x).toBeCloseTo(24 + (1552 - z.w) / 2, 6);
+    // A wider sheet: it moves left until its right edge meets the sheet, at the same size.
+    const wide = zoomTarget(stage, r, 16 / 9, { ...desk, sheet: 700 });
+    expect(wide.w).toBeCloseTo(z.w, 9);
+    expect(wide.x + wide.w).toBeCloseTo(1600 - 700, 6);
+    // A 16:9 tile on a 16:10 screen fills the width: it is never shrunk for the sheet, and lies under it.
+    const flat = zoomTarget({ x: 0, y: 0, w: 1600, h: 1000 }, fleet(1, 2).tiles[0]!.rect, 16 / 9, desk);
+    expect(flat.w).toBeCloseTo(1552, 6);
+    expect(flat.x).toBeCloseTo(24, 6);
+    // The sheet starts open only where the tile at full size lies clear of it.
+    expect(sheetClears(stage, r, 16 / 9, desk)).toBe(true);
+    expect(sheetClears({ x: 0, y: 0, w: 1600, h: 1000 }, fleet(1, 2).tiles[0]!.rect, 16 / 9, desk)).toBe(false);
+    // A phone: full width, between the bar and the sheet's handle.
+    const phone = zoomTarget({ x: 0, y: 0, w: 390, h: 844 }, fleet(1, 2).tiles[0]!.rect, 16 / 9, { top: 56, right: 0, bottom: 76, left: 0, sheet: 0 });
+    expect(phone.w).toBe(390);
+    expect(phone.h).toBeCloseTo((390 * 9) / 16, 6);
+  });
+
+  it("puts the opened tile on its target and every other tile where its wall rectangle says, sharing its edges", () => {
+    const st = fleet(3, 3);
+    const wall = layoutMosaic(stage, st.tiles, 1).image;
+    const open = st.tiles.find((t) => t.id === "fcvm:5")!; // the middle of the fcvm half
+    const z = layoutZoom(wall, stage, st.tiles, { from: open.id, to: open.id, progress: 1 }, 1, 16 / 9, desk)!;
+    const target = zoomTarget(stage, open.rect, 16 / 9, desk);
+    const f = z.focus!.box;
+    expect(z.focus!.id).toBe("fcvm:5");
+    expect(Math.abs(f.x - target.x)).toBeLessThanOrEqual(1);
+    expect(Math.abs(f.y - target.y)).toBeLessThanOrEqual(1);
+    expect(Math.abs(f.w - target.w)).toBeLessThanOrEqual(1);
+    expect(Math.abs(f.h - target.h)).toBeLessThanOrEqual(1);
+    expect(z.dim).toBe(1);
+    // Every tile is the image's rectangle for it, the image being scaled so the opened tile fills its target.
+    const img = z.layout.image;
+    expect(img.w / f.w).toBeCloseTo(1 / open.rect.w, 2);
+    for (const p of z.layout.tiles) {
+      const t = st.tiles.find((x) => x.id === p.id)!;
+      expect(Math.abs(p.box.x - (img.x + t.rect.x * img.w)), p.id).toBeLessThanOrEqual(1);
+      expect(Math.abs(p.box.y - (img.y + t.rect.y * img.h)), p.id).toBeLessThanOrEqual(1);
+    }
+    // The neighbours touch it: the scene continues past its edges.
+    const at = (id: string) => z.layout.tiles.find((p) => p.id === id)!.box;
+    expect(at("fcvm:6").x).toBe(f.x + f.w);
+    expect(at("fcvm:4").x + at("fcvm:4").w).toBe(f.x);
+    expect(at("fcvm:8").y).toBe(f.y + f.h);
+    expect(at("fcvm:2").y + at("fcvm:2").h).toBe(f.y);
+  });
+
+  it("starts from the wall, eases into the tile, and back out the same way", () => {
+    const st = fleet(3, 3);
+    const wallL = layoutMosaic(stage, st.tiles, 1);
+    const step = (progress: number, from: string | null, to: string | null) => layoutZoom(wallL.image, stage, st.tiles, { from, to, progress }, 1, 16 / 9, desk)!;
+    const start = step(0, null, "fcvm:5");
+    expect(start.dim).toBe(0);
+    expect(start.layout.tiles).toEqual(wallL.tiles);
+    const mid = step(0.5, null, "fcvm:5");
+    expect(mid.dim).toBeCloseTo(0.5, 9);
+    const end = step(1, null, "fcvm:5");
+    const wallBox = wallL.tiles.find((p) => p.id === "fcvm:5")!.box;
+    expect(mid.focus!.box.w).toBeGreaterThan(wallBox.w);
+    expect(mid.focus!.box.w).toBeLessThan(end.focus!.box.w);
+    // Closing is the opening run backwards; with no tile on either side it is the wall.
+    expect(step(0.3, "fcvm:5", null).layout).toEqual(step(0.7, null, "fcvm:5").layout);
+    expect(step(1, "fcvm:5", null).dim).toBe(0);
+    expect(layoutZoom(wallL.image, stage, st.tiles, { from: null, to: null, progress: 1 }, 1, 16 / 9, desk)).toBeNull();
+    expect(easeZoom(0)).toBe(0);
+    expect(easeZoom(1)).toBe(1);
+    expect(easeZoom(0.25) + easeZoom(0.75)).toBeCloseTo(1, 12);
+  });
+
+  it("asks an opened tile for the renderer's detail view: 1080 for a square tile, 720 for a 16:9 one", () => {
+    expect(streamHeightFor(2000, 1, DETAIL_TILE_PX)).toBe(1080);
+    expect(streamHeightFor(2000, 16 / 9, DETAIL_TILE_PX)).toBe(720);
+    // Never past the measured detail view's pixels, and not above what the box covers.
+    for (const a of [0.5, 0.889, 1, 1.4, 16 / 9, 2.5]) {
+      const h = streamHeightFor(4000, a, DETAIL_TILE_PX);
+      expect(h * h * a, String(a)).toBeLessThanOrEqual(DETAIL_TILE_PX + 1);
+    }
+    expect(streamHeightFor(400, 1, DETAIL_TILE_PX)).toBe(432);
   });
 });
 

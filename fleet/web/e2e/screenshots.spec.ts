@@ -1,7 +1,7 @@
 // The pictures for the PR and the README: the stage at rest, hover, the Play
 // drawer, a race mid-way (with EC2 waiting for spot capacity) and after it, an
 // opened VM, a viewer's own GPU and the tile it borrowed, the failure states and
-// a phone. Written to FLEET_SCREENSHOT_DIR when set, else to the test's output folder.
+// a phone, with a VM opened on it. Written to FLEET_SCREENSHOT_DIR when set, else to the test's output folder.
 
 import { expect, test, devices, type Page } from "@playwright/test";
 import { admin, openWall, raceOver, setTimeOfDay } from "./helpers.ts";
@@ -115,6 +115,15 @@ test("screenshots", async ({ page, browser }) => {
   await openWall(phone, 3, "aggregated");
   await phone.waitForTimeout(800);
   await shot(phone, "phone");
+  // An opened VM on a phone: full width, the tiles around it dimmed, the sheet folded to its handle, then open.
+  const pt = await tileBox(phone, "fcvm:6");
+  await phone.mouse.click(pt.x + pt.w / 2, pt.y + pt.h / 2);
+  await expect(phone.getByTestId("focus-stream")).toContainText(/^\d+p · \d+ fps/, { timeout: 15_000 });
+  await phone.waitForTimeout(1500);
+  await shot(phone, "phone-tile-opened");
+  await phone.getByTestId("sheet-toggle").click();
+  await phone.waitForTimeout(500);
+  await shot(phone, "phone-tile-details");
   await ctx.close();
 
   // Leave the fleet at rest.

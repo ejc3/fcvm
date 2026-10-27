@@ -204,31 +204,52 @@ export async function seamReport(page: Page): Promise<SeamReport> {
   return { T: res.T, shown: res.shown, perTile, boundaries, samples };
 }
 
-/** Mean error of the opened tile against the picture at the drawn t, 0..255. */
-export async function focusError(page: Page, tileId: string): Promise<{ err: number; shown: string; T: number | null }> {
+/**
+ * The opened tile against the picture at the drawn t: its mean error (0..255), and how bright the
+ * tiles around it are drawn against what the same colour map predicts for them (1: not dimmed).
+ */
+export async function focusError(page: Page, tileId: string): Promise<{ err: number; shown: string; T: number | null; around: number }> {
   const v = await page.evaluate((id) => {
     const view = window.__fleet!.view();
     const t = window.__fleet!.client.getState().accepted!.tiles.find((x) => x.id === id)!;
-    return { box: view.plan.focus!.box!, rect: t.rect };
+    return { box: view.plan.zoom!.box!, image: view.plan.image!, rect: t.rect, vw: window.innerWidth, vh: window.innerHeight };
   }, tileId);
   const pts: { x: number; y: number }[] = [];
   for (let j = 1; j < 10; j++) for (let i = 1; i < 16; i++) pts.push({ x: v.box.x + (v.box.w * i) / 16, y: v.box.y + (v.box.h * j) / 10 });
+  const inner = pts.length;
+  // Points around it: on the image and on screen, at least 12 px off the opened tile's box.
+  for (let j = 1; j < 20; j++)
+    for (let i = 1; i < 30; i++) {
+      const x = (v.vw * i) / 30;
+      const y = (v.vh * j) / 20;
+      const off = x < v.box.x - 12 || x > v.box.x + v.box.w + 12 || y < v.box.y - 12 || y > v.box.y + v.box.h + 12;
+      const onImage = x > v.image.x && x < v.image.x + v.image.w && y > v.image.y && y < v.image.y + v.image.h;
+      if (off && onImage) pts.push({ x, y });
+    }
   const res = (await page.evaluate((p) => window.__fleet!.client.capture(p), pts)) as CaptureResult;
   const f = frameCtx(res.T!, (await mockState()).pattern);
   const samples = pts.map((p, k) => {
-    const u = v.rect.x + ((p.x - v.box.x) / v.box.w) * v.rect.w;
-    const vv = v.rect.y + ((p.y - v.box.y) / v.box.h) * v.rect.h;
+    const inside = k < inner;
+    const u = inside ? v.rect.x + ((p.x - v.box.x) / v.box.w) * v.rect.w : (p.x - v.image.x) / v.image.w;
+    const vv = inside ? v.rect.y + ((p.y - v.box.y) / v.box.h) * v.rect.h : (p.y - v.image.y) / v.image.h;
     const o = res.pixels[k]!;
     return { e: expectedRgb(u, vv, f), o: [o[0], o[1], o[2]] as [number, number, number] };
   });
-  // Up to the browser's colour conversion, as in seamReport.
-  const map = fitColour(samples);
+  // Up to the browser's colour conversion, as in seamReport, fitted on the opened tile alone.
+  const map = fitColour(samples.slice(0, inner));
   let err = 0;
-  for (const s of samples) {
+  for (const s of samples.slice(0, inner)) {
     const m = map(s.e);
     err += (Math.abs(s.o[0] - m[0]) + Math.abs(s.o[1] - m[1]) + Math.abs(s.o[2] - m[2])) / 3;
   }
-  return { err: err / samples.length, shown: res.shown[`d:${tileId}`] ?? "", T: res.T };
+  let seen = 0;
+  let predicted = 0;
+  for (const s of samples.slice(inner)) {
+    const m = map(s.e);
+    seen += s.o[0] + s.o[1] + s.o[2];
+    predicted += Math.max(0, m[0]) + Math.max(0, m[1]) + Math.max(0, m[2]);
+  }
+  return { err: err / inner, shown: res.shown[`d:${tileId}`] ?? "", T: res.T, around: predicted > 0 ? seen / predicted : Number.NaN };
 }
 
 /**

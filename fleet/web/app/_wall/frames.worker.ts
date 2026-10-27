@@ -38,6 +38,7 @@ import {
   type DrawPlan,
   type DrawSource,
   type DrawTile,
+  type ZoomDraw,
   type StreamMode,
   type FrameStats,
   type SyncChoice,
@@ -308,6 +309,7 @@ let plan: DrawPlan = {
   aggregated: [],
   tiles: [],
   focus: null,
+  zoom: null,
   image: null,
   dpr: 1,
   darkFill: "#06080B",
@@ -379,6 +381,12 @@ function sourcesOf(mode: StreamMode, p: DrawPlan = plan): DrawSource[] {
   return mode === "direct" ? p.direct : p.aggregated;
 }
 
+/** What a draw shows: the viewer's own GPU alone, else the mosaic, with an opened VM's own stream last (over it). */
+function shownSources(p: DrawPlan = plan, mode: StreamMode = shownMode): DrawSource[] {
+  if (p.focus) return [p.focus];
+  return p.zoom?.source ? [...sourcesOf(mode, p), p.zoom.source] : sourcesOf(mode, p);
+}
+
 /** The streams to hold: the mode drawn, the mode wanted (while switching), and an opened tile. */
 function wantedSources(): Map<string, DrawSource> {
   const out = new Map<string, DrawSource>();
@@ -386,11 +394,9 @@ function wantedSources(): Map<string, DrawSource> {
   for (const src of sourcesOf(shownMode)) out.set(keyOf(src), src);
   if (plan.mode !== shownMode) for (const src of sourcesOf(plan.mode)) out.set(keyOf(src), src);
   if (plan.focus) out.set(keyOf(plan.focus), plan.focus);
+  if (plan.zoom?.source) out.set(keyOf(plan.zoom.source), plan.zoom.source);
   // A waiting re-tile's streams open now, so its tiles have frames by its frame.
-  if (nextPlan) {
-    for (const src of sourcesOf(shownMode, nextPlan)) out.set(keyOf(src), src);
-    if (nextPlan.focus) out.set(keyOf(nextPlan.focus), nextPlan.focus);
-  }
+  if (nextPlan) for (const src of shownSources(nextPlan)) out.set(keyOf(src), src);
   return out;
 }
 
@@ -587,7 +593,7 @@ function trySwitch(): void {
 function tryRetile(): void {
   const n = nextPlan;
   if (!n) return;
-  const target = (n.focus ? [n.focus] : sourcesOf(shownMode, n)).filter((src) => src.box !== null && src.url !== null);
+  const target = shownSources(n).filter((src) => src.box !== null && src.url !== null);
   let ready = now() - retileStarted > SWITCH_HOLD_LIMIT_MS;
   if (!ready && target.every((src) => streams.has(keyOf(src)))) {
     const c = chooseCommonT(
@@ -661,6 +667,40 @@ function drawDark(t: DrawTile, alpha: number): void {
   ctx.globalAlpha = 1;
 }
 
+/**
+ * The dim around an opened VM: black over the image outside its box, `near` at the box and
+ * rising to `far` at the canvas corner farthest from it.
+ */
+function drawZoomDim(z: ZoomDraw): void {
+  if (!ctx || !canvas || !plan.image || (z.near <= 0 && z.far <= 0)) return;
+  const [ix, iy, iw, ih] = devBox(plan.image);
+  const x0 = Math.max(0, ix);
+  const y0 = Math.max(0, iy);
+  const x1 = Math.min(canvas.width, ix + iw);
+  const y1 = Math.min(canvas.height, iy + ih);
+  if (x1 <= x0 || y1 <= y0) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x0, y0, x1 - x0, y1 - y0);
+  let fill: string | CanvasGradient = `rgba(0,0,0,${z.near})`;
+  if (z.box) {
+    const [bx, by, bw, bh] = devBox(z.box);
+    ctx.rect(bx, by, bw, bh);
+    const cx = bx + bw / 2;
+    const cy = by + bh / 2;
+    const r0 = Math.max(bw, bh) / 2;
+    const r1 = Math.max(r0 + 1, Math.hypot(Math.max(cx, canvas.width - cx), Math.max(cy, canvas.height - cy)));
+    const g = ctx.createRadialGradient(cx, cy, r0, cx, cy, r1);
+    g.addColorStop(0, `rgba(0,0,0,${z.near})`);
+    g.addColorStop(1, `rgba(0,0,0,${z.far})`);
+    fill = g;
+  }
+  ctx.clip("evenodd");
+  ctx.fillStyle = fill;
+  ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+  ctx.restore();
+}
+
 /** The frames each shown source's stream holds for the place the plan draws it. */
 function buffersOf(shown: DrawSource[]): { id: string; ts: number[] }[] {
   return shown
@@ -690,7 +730,7 @@ function draw(): void {
   let unfrozen = false;
   let acquired: SyncChoice | null = null;
   if (plan.paused) {
-    const shown = plan.focus ? [plan.focus] : sourcesOf(shownMode);
+    const shown = shownSources();
     const lost = new Set<string>();
     let kept = 0;
     for (const src of shown) {
@@ -723,7 +763,7 @@ function draw(): void {
   if (!plan.paused) trySwitch();
   if (nextPlan && !plan.paused) tryRetile();
   // The mode drawn can have changed in the switch above.
-  const shown = plan.focus ? [plan.focus] : sourcesOf(shownMode);
+  const shown = shownSources();
   const drawable = shown.filter((src) => src.box !== null && streams.has(keyOf(src)));
   const buffers = buffersOf(shown);
   // Frames that do not fit (a re-tile the page has not heard of yet): keep the one on screen.
@@ -770,6 +810,8 @@ function draw(): void {
   dirty = false;
 
   ctx.globalAlpha = 1;
+  // Zoomed, the dim goes over the whole image each draw, so the image is painted whole each draw.
+  if (plan.zoom) needsClear = true;
   if (needsClear) {
     ctx.fillStyle = settings.background;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -788,7 +830,8 @@ function draw(): void {
     if (!st || !show || !frame) {
       if (st) st.appearedAt = null;
       if (src.url !== null) missing++;
-      fillEmpty(src.box);
+      // An opened VM's own stream with no frame yet leaves its aggregate's picture of it showing.
+      if (src !== plan.zoom?.source || shownMode === "direct") fillEmpty(src.box);
       continue;
     }
     const inner = innerRect({ width: frame.frame.displayWidth, height: frame.frame.displayHeight, crop: frame.crop });
@@ -862,6 +905,7 @@ function draw(): void {
       dirty = true;
     }
   }
+  if (plan.zoom) drawZoomDim(plan.zoom);
   for (const src of shown) {
     const st = streamOf(src);
     if (!st) continue;
@@ -989,7 +1033,7 @@ function report(): void {
     drawsPerSec: drawTimes.length / 2,
     tilesSynced: kinds.filter((k) => k.kind === "sync").length,
     tilesBehind: kinds.filter((k) => k.kind === "behind").length,
-    tilesDrawn: (plan.focus ? [plan.focus] : sourcesOf(shownMode)).filter((src) => src.box !== null).length,
+    tilesDrawn: shownSources().filter((src) => src.box !== null).length,
   };
   post({ type: "stats", stats, bench });
 }

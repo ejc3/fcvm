@@ -16,6 +16,11 @@ import {
   LONG_PRESS_MS,
   neighbour,
   posterUrl,
+  tileAt,
+  ZOOM_MS,
+  ZOOM_SHEET_W,
+  sheetClears,
+  zoomInsetsFor,
   readingOrder,
   screenToImage,
   pointerTile,
@@ -28,6 +33,7 @@ import {
   type Box,
   type Direction,
   type WallView,
+  type ZoomStep,
 } from "../../core/index.ts";
 import { canDecodeH264, WallClient } from "./wall-client.ts";
 import { FocusPanel } from "./FocusPanel.tsx";
@@ -109,7 +115,43 @@ declare global {
   }
 }
 
-type Areas = { mosaic: Box | null; focus: Box | null; own: Box | null };
+type Areas = { mosaic: Box | null; own: Box | null };
+
+/**
+ * The zoom between the wall and an opened tile, stepped once per display frame for ZOOM_MS.
+ * A change of target while one runs back the way it came reverses from where it is; any other
+ * change starts from the last target. Null once it has zoomed back out to the wall.
+ */
+function useZoomStep(target: string | null, reducedMotion: boolean): ZoomStep | null {
+  const [anim, setAnim] = useState<{ from: string | null; to: string | null; start: number }>({ from: null, to: null, start: 0 });
+  const [progress, setProgress] = useState(1);
+  if (target !== anim.to) {
+    // Derived during render, so no frame shows the new target at the old step.
+    const at = performance.now();
+    const back = target === anim.from && progress < 1;
+    setAnim({ from: anim.to, to: target, start: back ? at - (1 - progress) * ZOOM_MS : at });
+    setProgress(reducedMotion ? 1 : back ? 1 - progress : 0);
+  }
+  useEffect(() => {
+    if (reducedMotion) {
+      setProgress(1);
+      return;
+    }
+    let id = 0;
+    const tick = () => {
+      const p = Math.min(1, (performance.now() - anim.start) / ZOOM_MS);
+      setProgress(p);
+      if (p < 1) id = requestAnimationFrame(tick);
+    };
+    id = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(id);
+  }, [anim, reducedMotion]);
+  return useMemo(() => {
+    if (anim.from === null && anim.to === null) return null;
+    if (anim.to === null && progress >= 1) return null;
+    return { from: anim.from, to: anim.to, progress };
+  }, [anim, progress]);
+}
 
 function PauseIcon({ paused }: { paused: boolean }) {
   return (
@@ -168,7 +210,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   const [reelMeta, setReelMeta] = useState<ReelMeta | null>(null);
   const [dpr, setDpr] = useState(1);
   const [viewport, setViewport] = useState({ w: 0, h: 0 });
-  const [areas, setAreas] = useState<Areas>({ mosaic: null, focus: null, own: null });
+  const [areas, setAreas] = useState<Areas>({ mosaic: null, own: null });
   const [avoid, setAvoid] = useState<Box[]>([]);
   const [labelSize, setLabelSize] = useState<{ w: number; h: number } | undefined>(undefined);
   /** The drawer section to show when it opens (the isolation link), or null for its top. */
@@ -177,7 +219,6 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   const reducedMotion = useMedia("(prefers-reduced-motion: reduce)");
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
-  const focusShotRef = useRef<HTMLDivElement | null>(null);
   const ownShotRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<WallView | null>(null);
   const gridRefs = useRef(new Map<string, HTMLButtonElement>());
@@ -307,13 +348,13 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
       setDpr(window.devicePixelRatio || 1);
       setViewport((v) => (v.w === window.innerWidth && v.h === window.innerHeight ? v : { w: window.innerWidth, h: window.innerHeight }));
       setAreas((a) => {
-        const next = { mosaic: boxOf(stageRef.current), focus: boxOf(focusShotRef.current), own: boxOf(ownShotRef.current) };
-        return sameBox(a.mosaic, next.mosaic) && sameBox(a.focus, next.focus) && sameBox(a.own, next.own) ? a : next;
+        const next = { mosaic: boxOf(stageRef.current), own: boxOf(ownShotRef.current) };
+        return sameBox(a.mosaic, next.mosaic) && sameBox(a.own, next.own) ? a : next;
       });
     };
     measure();
     const ro = new ResizeObserver(measure);
-    for (const el of [stageRef.current, focusShotRef.current, ownShotRef.current]) if (el) ro.observe(el);
+    for (const el of [stageRef.current, ownShotRef.current]) if (el) ro.observe(el);
     window.addEventListener("resize", measure);
     const mq = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
     mq.addEventListener("change", measure);
@@ -324,6 +365,15 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
     };
   }, [phone, state.ui.focusId, ownOpen, state.ui.drawer, state.accepted === null]);
 
+  const zoom = useZoomStep(state.ui.focusId, reducedMotion);
+  const zoomArea = useMemo(() => (viewport.w > 0 ? { x: 0, y: 0, w: viewport.w, h: viewport.h } : null), [viewport.w, viewport.h]);
+  const zoomInsets = useMemo(() => zoomInsetsFor(phone, phone ? 0 : ZOOM_SHEET_W + 16), [phone]);
+  // The sheet over an opened tile starts open on a wide screen where the tile lies clear of it, and
+  // folded otherwise (always to its handle on a phone), until the viewer opens or folds it.
+  const [sheetChoice, setSheetChoice] = useState<boolean | null>(null);
+  const focusRect = state.accepted?.tiles.find((t) => t.id === state.ui.focusId)?.rect ?? null;
+  const sheetOpen =
+    sheetChoice ?? (!phone && zoomArea !== null && focusRect !== null && sheetClears(zoomArea, focusRect, state.accepted!.image_aspect, zoomInsets));
   const view = useMemo(
     () =>
       wallView({
@@ -331,7 +381,9 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
         now: now || 0,
         dpr,
         mosaicArea: areas.mosaic,
-        focusArea: state.ui.focusId ? areas.focus : null,
+        zoom,
+        zoomArea,
+        zoomInsets,
         ownArea: ownOpen ? areas.own : null,
         canDecode,
         phone,
@@ -345,7 +397,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
         media: { base: mediaUrl, meta: reelMeta },
         saveData: saveData(),
       }),
-    [state, now, dpr, areas, canDecode, phone, reducedMotion, client, avoid, labelSize, poster, ownOpen, mediaUrl, reelMeta],
+    [state, now, dpr, areas, zoom, zoomArea, zoomInsets, canDecode, phone, reducedMotion, client, avoid, labelSize, poster, ownOpen, mediaUrl, reelMeta],
   );
   viewRef.current = view;
 
@@ -395,11 +447,12 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   useEffect(() => {
     client.resize(viewport.w, viewport.h, dpr);
   }, [client, viewport.w, viewport.h, dpr]);
-  const covered = view.focus !== null || view.own !== null;
+  const covered = view.focus !== null || view.own !== null || view.zoom !== null;
+  const ownShown = view.own !== null;
   useEffect(() => {
-    const settings: DrawSettings = { background: covered ? "#0B0D10" : "#000000", dimAlpha: 0.5, fadeInMs: 280 };
+    const settings: DrawSettings = { background: ownShown ? "#0B0D10" : "#000000", dimAlpha: 0.5, fadeInMs: 280 };
     client.plan(view.plan, settings);
-  }, [client, view.plan, covered]);
+  }, [client, view.plan, ownShown]);
 
   // Test hooks, only with ?debug=1.
   useEffect(() => {
@@ -510,10 +563,41 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
     returnFocus.current = null;
     requestAnimationFrame(() => el?.focus());
   };
+  // Focus goes back to where the tile was opened from once the zoom has run back out: the wall is hidden until then.
+  const [restoreAfterZoom, setRestoreAfterZoom] = useState(false);
   const closeTile = useCallback(() => {
     client.ui({ focusId: null });
-    restoreFocus();
+    setRestoreAfterZoom(true);
   }, [client]);
+  const zoomGone = view.zoom === null;
+  useEffect(() => {
+    if (!restoreAfterZoom || !zoomGone) return;
+    setRestoreAfterZoom(false);
+    restoreFocus();
+  }, [restoreAfterZoom, zoomGone]);
+  // Opened, a click on a dimmed tile around it, or an arrow key, opens that tile instead.
+  const pickZoomed = useCallback(
+    (x: number, y: number) => {
+      const v = viewRef.current;
+      const st = client.getState();
+      const L = v?.zoom?.layout;
+      if (!L || !st.accepted) return;
+      const p = screenToImage(L.image, x, y);
+      const t = p ? tileAt(st.accepted.tiles, p.u, p.v) : null;
+      if (t && t.id !== st.ui.focusId) client.ui({ focusId: t.id });
+    },
+    [client],
+  );
+  const moveZoomed = useCallback(
+    (dir: Direction) => {
+      const st = client.getState();
+      const tiles = st.accepted?.tiles ?? [];
+      const from = tiles.find((t) => t.id === st.ui.focusId);
+      const to = from ? neighbour(tiles, from, dir) : null;
+      if (to) client.ui({ focusId: to.id });
+    },
+    [client],
+  );
   const closeDrawer = useCallback(() => {
     client.ui({ drawer: false });
     requestAnimationFrame(() => playButtonRef.current?.focus());
@@ -808,7 +892,16 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
         </div>
       ) : null}
       {view.focus ? (
-        <FocusPanel focus={view.focus} shotRef={focusShotRef} onClose={closeTile} onRestart={() => client.act("relaunch", { tile: view.focus!.id })} />
+        <FocusPanel
+          focus={view.focus}
+          phone={phone}
+          sheetOpen={sheetOpen}
+          onSheet={setSheetChoice}
+          onClose={closeTile}
+          onRestart={() => client.act("relaunch", { tile: view.focus!.id })}
+          onPick={pickZoomed}
+          onMove={moveZoomed}
+        />
       ) : null}
       {view.own ? <OwnGpu own={view.own} client={client} shotRef={ownShotRef} onClose={closeOwn} /> : null}
       {view.ownRefusal ? (

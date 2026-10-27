@@ -1,11 +1,13 @@
 "use client";
 
-// One VM opened: its own stream at the renderer's native size, the timeline of
-// its last restart, and its GPU's live readings. The canvas draws the stream
-// into the measured shot box; this panel draws everything around it.
+// One VM opened: the canvas zooms the image until that VM fills the screen, with the
+// tiles around it dimmed (core/view.ts, plan.zoom). This overlay draws what sits over
+// the picture: a bar with the way back, an outline on the VM, and a sheet with its
+// details, restart timeline and live GPU readings. The sheet lies over the picture
+// (a side sheet on a wide screen, a bottom sheet on a phone) and folds away.
 
-import { useEffect, useRef, type CSSProperties, type RefObject } from "react";
-import type { FocusView, TimelineStep } from "../../core/index.ts";
+import { useEffect, useRef, type CSSProperties } from "react";
+import type { Direction, FocusView, TimelineStep } from "../../core/index.ts";
 
 const BLUES = ["#BFE3FF", "#7CC4FF", "#3E95D6", "#2A6FA3", "#1B4A6E", "#123552"];
 const ORANGES = ["#FFD089", "#F5A524", "#B8780F", "#7A4F08", "#5A3A06", "#3F2904"];
@@ -39,31 +41,85 @@ export function Timeline({ steps, ec2 }: { steps: TimelineStep[]; ec2: boolean }
   );
 }
 
+const ARROWS: Record<string, Direction> = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
+
 export function FocusPanel({
   focus,
-  shotRef,
+  phone,
+  sheetOpen,
+  onSheet,
   onClose,
   onRestart,
+  onPick,
+  onMove,
 }: {
   focus: FocusView;
-  shotRef: RefObject<HTMLDivElement | null>;
+  phone: boolean;
+  /** The sheet is open (a wide screen) or expanded (a phone). */
+  sheetOpen: boolean;
+  onSheet: (open: boolean) => void;
   onClose: () => void;
   onRestart: () => void;
+  /** A click on the picture: the page opens the tile under it, if it is another. */
+  onPick: (x: number, y: number) => void;
+  /** An arrow key: the page opens the neighbouring tile that way. */
+  onMove: (dir: Direction) => void;
 }) {
   const backRef = useRef<HTMLButtonElement | null>(null);
+  // The Details button and the sheet's Hide button replace each other, so focus moves to the one that stays.
+  const detailsRef = useRef<HTMLButtonElement | null>(null);
+  const hideRef = useRef<HTMLButtonElement | null>(null);
+  const fold = (open: boolean) => {
+    onSheet(open);
+    requestAnimationFrame(() => (open ? hideRef : detailsRef).current?.focus());
+  };
   useEffect(() => {
     backRef.current?.focus();
+  }, []);
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") {
+        onClose();
+        return;
+      }
+      const dir = ARROWS[e.key];
+      const el = e.target as HTMLElement | null;
+      // Arrows still scroll the sheet and move through its controls.
+      if (!dir || el?.closest(".sheet") || el?.closest("input, textarea, select")) return;
+      e.preventDefault();
+      onMove(dir);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [onClose, onMove]);
+  // A tap that ends a drag on the picture is not a pick.
+  const down = useRef<{ x: number; y: number } | null>(null);
   const accent = { ["--accent" as string]: focus.accent } as CSSProperties;
   const ec2 = focus.id.startsWith("ec2");
+  const box = focus.placed?.box ?? null;
+  const summary = focus.rows.find((r) => r.term === "Up for");
   return (
-    <div className="focus" role="dialog" aria-modal="true" aria-labelledby="focus-title" data-testid="focus" style={accent}>
-      <nav>
+    <div className={`zoom${phone ? " phone-zoom" : ""}`} role="dialog" aria-modal="true" aria-labelledby="focus-title" data-testid="focus" style={accent}>
+      <div
+        className="zoom-hit"
+        data-testid="zoom-hit"
+        onPointerDown={(e) => {
+          down.current = { x: e.clientX, y: e.clientY };
+        }}
+        onPointerUp={(e) => {
+          const d = down.current;
+          down.current = null;
+          if (d && Math.hypot(e.clientX - d.x, e.clientY - d.y) <= 8) onPick(e.clientX, e.clientY);
+        }}
+      />
+      {box ? (
+        <div className="zoom-ring" data-testid="focus-shot" style={{ left: box.x, top: box.y, width: box.w, height: box.h }}>
+          <span className="tag plate" data-testid="focus-stream">
+            {focus.streamTag}
+          </span>
+        </div>
+      ) : null}
+      <nav className="zoom-bar">
         <button ref={backRef} type="button" className="btn" onClick={onClose}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M15 18l-6-6 6-6" />
@@ -72,17 +128,40 @@ export function FocusPanel({
         </button>
         <h1 id="focus-title">{focus.title}</h1>
         <span className="state" data-testid="focus-state">{focus.state}</span>
+        {!phone && !sheetOpen ? (
+          <button ref={detailsRef} type="button" className="btn sheet-open" aria-expanded="false" aria-controls="focus-sheet" onClick={() => fold(true)} data-testid="sheet-toggle">
+            Details
+          </button>
+        ) : null}
       </nav>
-      <div className="body">
-        <figure>
-          <div className="shot" ref={shotRef} data-testid="focus-shot">
-            <span className="tag plate" data-testid="focus-stream">
-              {focus.streamTag}
-            </span>
-          </div>
-          <figcaption>{focus.kind}</figcaption>
-        </figure>
-        <aside>
+      {/* Folded on a wide screen the sheet is off screen and out of the keyboard path; on a phone its handle stays. */}
+      <aside id="focus-sheet" className={`sheet${sheetOpen ? " open" : ""}`} data-testid="focus-sheet" aria-label={`${focus.title} details`} inert={!phone && !sheetOpen}>
+        <div className="sheet-head">
+          {phone ? (
+            <button type="button" className="sheet-handle" aria-expanded={sheetOpen} aria-controls="focus-sheet" onClick={() => onSheet(!sheetOpen)} data-testid="sheet-toggle">
+              <span className="grip" aria-hidden="true" />
+              <span className="peek">
+                <span className="kind">{focus.kind}</span>
+                {summary ? (
+                  <span className="up">
+                    {summary.term} {summary.value}
+                  </span>
+                ) : null}
+              </span>
+              <span className="more">{sheetOpen ? "Less" : "Details"}</span>
+            </button>
+          ) : (
+            <>
+              <p className="kind">{focus.kind}</p>
+              <button ref={hideRef} type="button" className="btn icon" aria-label="Hide details" aria-expanded="true" aria-controls="focus-sheet" onClick={() => fold(false)} data-testid="sheet-hide">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <path d="M9 18l6-6-6-6" />
+                </svg>
+              </button>
+            </>
+          )}
+        </div>
+        <div className="sheet-body" inert={!sheetOpen}>
           <section className="card">
             <dl>
               {focus.rows.map((r) => (
@@ -119,8 +198,8 @@ export function FocusPanel({
             {focus.now ? <p className="now">{focus.now}</p> : null}
             <Timeline steps={focus.timeline} ec2={ec2} />
           </section>
-        </aside>
-      </div>
+        </div>
+      </aside>
     </div>
   );
 }

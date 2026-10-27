@@ -4,18 +4,26 @@
 import { serverNow } from "./clock.ts";
 import * as fmt from "./format.ts";
 import {
+  DETAIL_TILE_PX,
   STREAM_HEIGHTS,
+  boxesMeet,
   fitContain,
   layoutMosaic,
+  layoutZoom,
   rectOnScreen,
   snap,
   streamHeightFor,
   seamSegments,
+  tileAspectOf,
   tileAt,
+  zoomTarget,
   type Box,
   type MosaicLayout,
   type PlacedTile,
   type Segment,
+  type ZoomInsets,
+  type ZoomLayout,
+  type ZoomStep,
 } from "./layout.ts";
 import { FAMILY_PROBE_ATTEMPTS, FAMILY_PROBE_MS, frameSocketUrl, streamUrl, type Family } from "./net.ts";
 import { fitBandwidth, type StreamAsk } from "./bandwidth.ts";
@@ -126,8 +134,15 @@ export interface WallInput {
   dpr: number;
   /** Where the image and its captions may go, measured by the page. */
   mosaicArea: Box | null;
-  /** Where an opened VM's stream is drawn, measured by the page. */
-  focusArea: Box | null;
+  /**
+   * The zoom between the wall and an opened VM as the page animates it. Absent, an opened VM
+   * (ui.focusId) is shown fully zoomed.
+   */
+  zoom?: ZoomStep | null;
+  /** Where an opened VM may fill: the viewport (mosaicArea when absent). */
+  zoomArea?: Box | null;
+  /** Room an opened VM leaves for the page's controls (zoomInsetsFor(phone, 0) when absent). */
+  zoomInsets?: ZoomInsets;
   /** Where the viewer's own GPU is drawn, measured by the page. */
   ownArea?: Box | null;
   /** WebCodecs H.264 is available. */
@@ -722,11 +737,27 @@ export interface FocusView {
   now: string;
   readingsTitle: string;
   readings: Reading[];
+  /** Where the VM is drawn at this step of the zoom, and the height its stream is asked for. */
   placed: { box: Box; streamHeight: number } | null;
 }
 
-/** The renderer's own resolution for one tile: what "native size" asks for. */
+/** The renderer's own resolution for one tile: what the viewer's own GPU asks for. */
 export const NATIVE_TILE_HEIGHT = 720;
+
+/** How dark the picture around an opened VM is: next to it, and at the far corners. */
+export const ZOOM_DIM_NEAR = 0.55;
+export const ZOOM_DIM_FAR = 0.82;
+/** The side sheet's width on a wide screen, CSS pixels. */
+export const ZOOM_SHEET_W = 380;
+
+/**
+ * Room an opened VM leaves around it. On a phone it is full width, under a bar and above the
+ * bottom sheet's handle; elsewhere a margin all round wide enough to show the tiles next to it,
+ * with the bar over the top, and clear of a side sheet `sheet` wide when that costs no size.
+ */
+export function zoomInsetsFor(phone: boolean, sheet: number): ZoomInsets {
+  return phone ? { top: 56, right: 0, bottom: 76, left: 0, sheet: 0 } : { top: 72, right: 56, bottom: 48, left: 56, sheet };
+}
 
 function sparkline(samples: readonly GpuSample[], key: "temp_c" | "power_w" | "util_pct"): string {
   const vals = samples.map((x) => x[key]).filter((v): v is number => v !== null);
@@ -735,20 +766,6 @@ function sparkline(samples: readonly GpuSample[], key: "temp_c" | "power_w" | "u
   const hi = Math.max(...vals);
   const span = hi - lo || 1;
   return vals.map((v, i) => `${((i / (vals.length - 1)) * 100).toFixed(1)},${(22 - ((v - lo) / span) * 20).toFixed(1)}`).join(" ");
-}
-
-/** Where a VM's stream goes: its native height (within MAX_TILE_PX) at one device pixel per pixel, smaller only when the area is. */
-export function nativePlacement(area: Box, rect: Rect, imageAspect: number, dpr: number): { box: Box; streamHeight: number } {
-  const aspect = (rect.w * imageAspect) / rect.h;
-  // Native is the renderer's own height, or the tallest it may be asked for at this aspect (MAX_TILE_PX).
-  const nativeH = Math.min(NATIVE_TILE_HEIGHT, streamHeightFor(Number.POSITIVE_INFINITY, aspect)) / dpr;
-  const fit = fitContain(area, aspect);
-  const h = Math.min(fit.h, nativeH);
-  const w = h * aspect;
-  const x = area.x + (area.w - w) / 2;
-  const y = area.y + (area.h - h) / 2;
-  const box = { x: snap(x, dpr), y: snap(y, dpr), w: snap(x + w, dpr) - snap(x, dpr), h: snap(y + h, dpr) - snap(y, dpr) };
-  return { box, streamHeight: Math.min(NATIVE_TILE_HEIGHT, streamHeightFor(box.h * dpr, aspect)) };
 }
 
 function timelineOf(phases: Record<string, number>): { steps: TimelineStep[]; total: number } {
@@ -770,12 +787,19 @@ function timelineOf(phases: Record<string, number>): { steps: TimelineStep[]; to
   return { steps, total };
 }
 
-function focusView(s: ClientState, st: FleetState, tv: TileView, t: Tile, input: WallInput, srvNow: number, online: boolean): FocusView {
+function focusView(
+  s: ClientState,
+  tv: TileView,
+  t: Tile,
+  input: WallInput,
+  srvNow: number,
+  online: boolean,
+  placed: { box: Box; streamHeight: number } | null,
+): FocusView {
   const fs = s.frames?.tiles[`d:${t.id}`];
   const lr = t.last_relaunch;
   const { steps, total } = lr ? timelineOf(lr.phases) : { steps: [], total: 0 };
   const rms = relaunchMs(t);
-  const placed = input.focusArea ? nativePlacement(input.focusArea, t.rect, st.image_aspect, input.dpr) : null;
   const history = s.gpuHistory[t.id] ?? [];
   const g = t.gpu;
   const readings: Reading[] = g
@@ -787,8 +811,8 @@ function focusView(s: ClientState, st: FleetState, tv: TileView, t: Tile, input:
     : [];
   let streamTag = "no frames yet";
   if (fs && fs.newestT !== null && placed) {
-    const scale = placed.box.h * input.dpr / fs.height;
-    streamTag = `${fs.height}p · ${Math.round(fs.fps)} fps · ${scale >= 0.995 ? "native size" : `shown at ${Math.round(scale * 100)}%`}`;
+    const scale = (placed.box.h * input.dpr) / fs.height;
+    streamTag = `${fs.height}p · ${Math.round(fs.fps)} fps · ${Math.abs(scale - 1) < 0.005 ? "native size" : `shown at ${Math.round(scale * 100)}%`}`;
   }
   const restarting = tv.dark && lr !== null && lr.first_frame_at === null;
   const up = lr?.first_frame_at ?? null;
@@ -939,6 +963,17 @@ export interface DrawSource {
   box: Box | null;
 }
 
+/** What the drawer adds to the mosaic while a VM is opened. */
+export interface ZoomDraw {
+  /** The opened VM's box; it is not dimmed. */
+  box: Box | null;
+  /** Its own stream, drawn over the mosaic in that box (in Aggregated mode, over its aggregate). */
+  source: DrawSource | null;
+  /** Black over the rest of the image: `near` at the opened box's edge, rising to `far` at the stage's corners. */
+  near: number;
+  far: number;
+}
+
 /** A tile's own state, drawn the same way whatever stream its pixels came from. */
 export interface DrawTile {
   id: string;
@@ -958,8 +993,10 @@ export interface DrawPlan {
   direct: DrawSource[];
   aggregated: DrawSource[];
   tiles: DrawTile[];
-  /** With a VM opened or the viewer's own GPU: that stream, drawn alone. */
+  /** The viewer's own GPU: that stream, drawn alone. */
   focus: DrawSource | null;
+  /** A VM opened: the image is zoomed so it fills the stage, and the rest is dimmed around it. */
+  zoom: ZoomDraw | null;
   image: Box | null;
   dpr: number;
   darkFill: string;
@@ -1201,6 +1238,8 @@ export interface WallView {
   /** The recording of the wall, while asleep or waking and until the live image replaces it. */
   reel: ReelView | null;
   focus: FocusView | null;
+  /** The image zoomed around an opened VM (also while it zooms back out), or null. */
+  zoom: ZoomLayout | null;
   own: OwnView | null;
   /** Null when this fleet lends no GPUs: the button is not shown. */
   ownButton: OwnButton | null;
@@ -1364,6 +1403,7 @@ export function wallView(input: WallInput): WallView {
     aggregated: [],
     tiles: [],
     focus: null,
+    zoom: null,
     image: null,
     dpr: input.dpr,
     darkFill: "#06080B",
@@ -1409,6 +1449,7 @@ export function wallView(input: WallInput): WallView {
       sleep: null,
       reel: null,
       focus: null,
+      zoom: null,
       own: null,
       ownButton: null,
       ownRefusal: null,
@@ -1439,52 +1480,82 @@ export function wallView(input: WallInput): WallView {
   const tiles = shownTiles.map((t) => asleepFix(tileView(t, s, st, placedById.get(t.id)?.box ?? null, srvNow, pend)));
   const planViews = shownTiles === st.tiles ? tiles : st.tiles.map((t) => asleepFix(tileView(t, s, st, placedPlan.get(t.id)?.box ?? null, srvNow, pend)));
   const focusTile = s.ui.focusId === null ? null : st.tiles.find((t) => t.id === s.ui.focusId) ?? null;
-  const focus = focusTile ? focusView(s, st, tiles.find((x) => x.id === focusTile.id)!, focusTile, input, srvNow, online) : null;
   const own = ownView(s, st, srvNow, input);
-  const covered = focus !== null || own !== null;
 
-  // Direct: each tile asks for the device pixels it covers; with a VM opened
-  // or the viewer's own GPU on screen, the others (still streaming, not drawn)
-  // ask for the smallest; then small tiles drop to q=lo and the tallest step
-  // down until the streams fit the bandwidth budget.
-  const opened = focus && focus.placed && !own ? focusTile : null;
+  // A VM opened: the whole image zooms until that VM fills the stage, and the tiles around it
+  // stay in place, dimmed. The page animates `zoom`; without it an opened VM is fully zoomed.
+  const insets = input.zoomInsets ?? zoomInsetsFor(input.phone, 0);
+  const step: ZoomStep | null = input.zoom !== undefined && input.zoom !== null ? input.zoom : focusTile ? { from: null, to: focusTile.id, progress: 1 } : null;
+  const zArea = input.zoomArea ?? area;
+  const zoom = !own && zArea && planLayout && step ? layoutZoom(planLayout.image, zArea, st.tiles, step, input.dpr, st.image_aspect, insets) : null;
+  // Where the zoom ends while it opens: what the streams are asked for (a height change keeps each
+  // stream and its frames, so they can follow the target and not every step of the animation).
+  const opening = zoom && focusTile && zoom.focus?.id === focusTile.id ? focusTile : null;
+  const target = opening && zArea && planLayout ? layoutZoom(planLayout.image, zArea, st.tiles, { from: opening.id, to: opening.id, progress: 1 }, input.dpr, st.image_aspect, insets) : null;
+  const detailHeight = opening && zArea ? streamHeightFor(zoomTarget(zArea, opening.rect, st.image_aspect, insets).h * input.dpr, tileAspectOf(opening.rect, st.image_aspect), DETAIL_TILE_PX) : null;
+  const zoomBox = (id: string): Box | null => {
+    const b = zoom?.layout.tiles.find((p) => p.id === id)?.box ?? null;
+    return b && zArea && boxesMeet(b, zArea) ? b : null;
+  };
+  const focusPlaced = zoom?.focus && focusTile && zoom.focus.id === focusTile.id ? { box: zoom.focus.box, streamHeight: detailHeight ?? zoom.focus.streamHeight } : null;
+  const focus = focusTile ? focusView(s, tiles.find((x) => x.id === focusTile.id)!, focusTile, input, srvNow, online, focusPlaced) : null;
+  const covered = focus !== null || own !== null || zoom !== null;
+
+  // Direct: each tile asks for the device pixels it covers. With the viewer's own GPU on screen
+  // the others (still streaming, not drawn) ask for the smallest. While a VM opens it asks for its
+  // detail height and is kept out of the budget; the tiles still on screen around it keep their
+  // wall height and start at q=lo (they are dimmed), and the ones the zoom pushed off screen ask
+  // for the smallest. Then everything but the kept one drops to q=lo and steps down until the
+  // streams fit the bandwidth budget.
   const asks: StreamAsk[] = st.tiles.filter(isLive).map((t) => {
-    const focused = opened !== null && opened.id === t.id;
-    const height = focused ? focus!.placed!.streamHeight : covered ? STREAM_HEIGHTS[0] : placedPlan.get(t.id)?.streamHeight ?? 144;
-    return { id: t.id, rect: t.rect, height, keep: focused };
+    const wall = placedPlan.get(t.id)?.streamHeight ?? 144;
+    if (own) return { id: t.id, rect: t.rect, height: STREAM_HEIGHTS[0], keep: false };
+    if (opening && target) {
+      if (t.id === opening.id) return { id: t.id, rect: t.rect, height: detailHeight!, keep: true };
+      const b = target.layout.tiles.find((p) => p.id === t.id)?.box;
+      return b && zArea && boxesMeet(b, zArea) ? { id: t.id, rect: t.rect, height: wall, keep: false, dim: true } : { id: t.id, rect: t.rect, height: STREAM_HEIGHTS[0], keep: false };
+    }
+    return { id: t.id, rect: t.rect, height: wall, keep: false };
   });
   const fitted = fitBandwidth(asks, st.image_aspect, input.budgetBps);
   // Every tile streams over the one family the probe chose; until it answers, none does.
   const family = s.net.family;
+  const zoomed = zoom?.focus ?? null;
   const direct: DrawSource[] = st.tiles.filter((t) => isLive(t) && streamUrl(t, family) !== null).map((t) => {
     const height = fitted.heights.get(t.id) ?? 144;
     const q = fitted.quality.get(t.id) ?? "std";
     const base = streamUrl(t, family)!;
-    return {
-      id: `d:${t.id}`,
-      url: frameSocketUrl(base, height, q),
-      baseUrl: base,
-      height,
-      box: covered ? (opened?.id === t.id ? focus!.placed!.box : null) : placedPlan.get(t.id)?.box ?? null,
-    };
+    // Zoomed, the opened VM is drawn on its own over the mosaic (plan.zoom.source), so its entry here keeps streaming undrawn.
+    const box = own ? null : zoom ? (zoomed?.id === t.id ? null : zoomBox(t.id)) : placedPlan.get(t.id)?.box ?? null;
+    return { id: `d:${t.id}`, url: frameSocketUrl(base, height, q), baseUrl: base, height, box };
   });
-  // Aggregated: each region is one big tile; it asks for the height it covers. Only the
+  // Aggregated: each region is one big tile; it asks for the height it covers on the wall. Only the
   // aggregates with a URL in this viewer's family stream.
   const aggregated: DrawSource[] = st.aggregates
     .filter((g) => streamUrl(g, family) !== null)
     .map((g) => {
       const box = planLayout ? rectOnScreen(planLayout.image, g.rect, input.dpr) : null;
-      const height = covered || !box ? STREAM_HEIGHTS[0] : streamHeightFor(box.h * input.dpr);
+      const height = own || !box ? STREAM_HEIGHTS[0] : streamHeightFor(box.h * input.dpr);
       const base = streamUrl(g, family)!;
-      return { id: `a:${g.id}`, url: frameSocketUrl(base, height), baseUrl: base, height, box: covered ? null : box };
+      const zb = zoom ? rectOnScreen(zoom.layout.image, g.rect, input.dpr) : null;
+      const drawn = own ? null : zoom ? (zb && zArea && boxesMeet(zb, zArea) ? zb : null) : box;
+      return { id: `a:${g.id}`, url: frameSocketUrl(base, height), baseUrl: base, height, box: drawn };
     });
   let focusSource: DrawSource | null = null;
   const claimUrl = s.own.claim ? streamUrl(s.own.claim, family) : null;
   if (own && own.placed && s.own.claim && claimUrl) {
     const c = s.own.claim;
     focusSource = { id: `o:${c.id}`, url: frameSocketUrl(claimUrl, own.placed.streamHeight), baseUrl: claimUrl, height: own.placed.streamHeight, box: own.placed.box };
-  } else if (opened) {
-    focusSource = direct.find((d) => d.id === `d:${opened.id}`) ?? null;
+  }
+  let zoomDraw: ZoomDraw | null = null;
+  if (zoom) {
+    const src = zoomed ? direct.find((d) => d.id === `d:${zoomed.id}`) : undefined;
+    zoomDraw = {
+      box: zoomed?.box ?? null,
+      source: src && zoomed ? { ...src, box: zoomed.box } : null,
+      near: ZOOM_DIM_NEAR * zoom.dim,
+      far: ZOOM_DIM_FAR * zoom.dim,
+    };
   }
   const plan: DrawPlan = {
     ...emptyPlan,
@@ -1493,14 +1564,16 @@ export function wallView(input: WallInput): WallView {
     direct,
     aggregated,
     focus: focusSource,
+    zoom: zoomDraw,
     estimatedBps: fitted.bps,
-    image: covered ? null : planLayout?.image ?? null,
+    image: own ? null : zoom ? zoom.layout.image : planLayout?.image ?? null,
     posterFull: sleep !== null,
     gen: st.layout.generation,
     atT: st.layout.from_frame / FRAME_RATE,
     tiles: st.tiles.map((t, i) => {
       const tv = planViews[i]!;
-      return { id: t.id, half: t.half, box: covered ? null : placedPlan.get(t.id)?.box ?? null, dark: tv.dark, outline: tv.darkOutline, slowFade: tv.slowFade };
+      const box = own ? null : zoom ? zoomBox(t.id) : placedPlan.get(t.id)?.box ?? null;
+      return { id: t.id, half: t.half, box, dark: tv.dark, outline: tv.darkOutline, slowFade: tv.slowFade };
     }),
   };
 
@@ -1532,6 +1605,7 @@ export function wallView(input: WallInput): WallView {
         })
       : null,
     focus,
+    zoom,
     own,
     ownButton: ownButton(st, srvNow, online, s.own.requestId !== null || (s.own.claim !== null && s.own.claim.phase !== "ended")),
     ownRefusal: s.own.refused === null ? null : { text: `No GPU is free right now: ${s.own.refused}. Try again in a minute.`, dismiss: "OK" },
