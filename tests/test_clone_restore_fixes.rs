@@ -1,5 +1,6 @@
 //! Integration tests for clone restore fixes:
 //! - Clock sync after snapshot restore (chronyd + MMDS time sync), to well under a second
+//! - A snapshot's source agrees with the host's clock once `snapshot create` returns
 //! - exact restore cleanup re-establishes gateway and container connectivity
 //! - --no-swap creates dedicated cgroup with memory.swap.max=0
 //! - --no-dirty-tracking passes track_dirty_pages=false
@@ -71,9 +72,9 @@ async fn test_clock_synced_after_clone_restore() -> Result<()> {
 /// the moment it is healthy (issue 1194). Each sample brackets one guest read of
 /// CLOCK_REALTIME between two host reads, so the exec's own latency cannot be
 /// mistaken for an offset: the guest's value has to fall inside the bracket,
-/// widened by `TOLERANCE` on both sides.
+/// widened by `CLOCK_TOLERANCE` on both sides.
 ///
-/// `TOLERANCE` covers what the step cannot compensate: the host stamps its clock
+/// `CLOCK_TOLERANCE` covers what the step cannot compensate: the host stamps its clock
 /// when the guest connects to the restore document's listener, and the guest
 /// adds the time from its read of that document to its step, so only the
 /// document's transfer over vsock is uncounted. That is milliseconds; 100 ms
@@ -84,9 +85,6 @@ async fn test_clock_synced_after_clone_restore() -> Result<()> {
 /// (fc-agent) and the boot-plan listener tests.
 #[tokio::test]
 async fn test_clone_clock_matches_the_host_to_a_tenth_of_a_second() -> Result<()> {
-    const TOLERANCE: Duration = Duration::from_millis(100);
-    const SAMPLES: usize = 20;
-
     let fixture = common::SnapshotFixture::new("clockoffset", "rootless").await?;
     // The snapshot's clock falls behind while it waits, so the restore has to step it.
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -104,32 +102,39 @@ async fn test_clone_clock_matches_the_host_to_a_tenth_of_a_second() -> Result<()
         &clone_name,
     )
     .await?;
-    let measured: Result<Vec<(f64, f64)>> = async {
+    let measured: Result<f64> = async {
         common::poll_health_by_pid(clone_pid, 120).await?;
-        let mut samples = Vec::with_capacity(SAMPLES);
-        for _ in 0..SAMPLES {
-            let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
-            let guest = common::exec_in_vm(clone_pid, &["date", "+%s.%N"]).await?;
-            let after = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
-            let guest: f64 = guest.trim().parse().context("parsing the guest's clock")?;
-            // Signed distance from the bracket, zero inside it.
-            let offset = if guest < before.as_secs_f64() {
-                guest - before.as_secs_f64()
-            } else if guest > after.as_secs_f64() {
-                guest - after.as_secs_f64()
-            } else {
-                0.0
-            };
-            samples.push((offset, (after - before).as_secs_f64()));
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        Ok(samples)
+        worst_clock_offset(clone_pid).await
     }
     .await;
     common::kill_process(clone_pid).await;
     fixture.cleanup().await;
 
-    let samples = measured?;
+    let worst = measured?;
+    assert!(
+        worst <= CLOCK_TOLERANCE.as_secs_f64(),
+        "the restored clone's clock was {:.1} ms off the host's (tolerance {} ms)",
+        worst * 1000.0,
+        CLOCK_TOLERANCE.as_millis()
+    );
+    Ok(())
+}
+
+/// How far a guest's clock may sit outside the host bracket of a sample
+/// (`worst_clock_offset`).
+const CLOCK_TOLERANCE: Duration = Duration::from_millis(100);
+
+/// Sample the guest's CLOCK_REALTIME 20 times, 100 ms apart, each read bracketed
+/// between two host reads, and return the largest distance in seconds by which the
+/// guest's value fell outside its bracket (zero inside it). The bracket keeps the
+/// exec's own latency from being mistaken for an offset.
+async fn worst_clock_offset(pid: u32) -> Result<f64> {
+    const SAMPLES: usize = 20;
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        samples.push(clock_offset(pid).await?);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     for (index, (offset, bracket)) in samples.iter().enumerate() {
         println!(
             "  sample {index:2}: guest outside the host bracket by {:+8.1} ms (bracket {:.1} ms)",
@@ -137,15 +142,109 @@ async fn test_clone_clock_matches_the_host_to_a_tenth_of_a_second() -> Result<()
             bracket * 1000.0
         );
     }
-    let worst = samples
+    Ok(samples
         .iter()
         .map(|(offset, _)| offset.abs())
-        .fold(0.0, f64::max);
+        .fold(0.0, f64::max))
+}
+
+/// One bracketed sample: the signed distance in seconds by which the guest's
+/// CLOCK_REALTIME fell outside two host reads around it (zero inside them), and the
+/// bracket's width.
+async fn clock_offset(pid: u32) -> Result<(f64, f64)> {
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let guest = common::exec_in_vm(pid, &["date", "+%s.%N"]).await?;
+    let after = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let guest: f64 = guest.trim().parse().context("parsing the guest's clock")?;
+    let offset = if guest < before.as_secs_f64() {
+        guest - before.as_secs_f64()
+    } else if guest > after.as_secs_f64() {
+        guest - after.as_secs_f64()
+    } else {
+        0.0
+    };
+    Ok((offset, (after - before).as_secs_f64()))
+}
+
+/// The source of a snapshot agrees with the host's clock as soon as `snapshot
+/// create` returns. On the arm64 `nested` (NV2) profile the Firecracker fork freezes
+/// the guest's counters while the snapshot pauses the VM, so a source resumed without
+/// a step is behind by the pause until chronyd corrects it: without the step the first
+/// sample was 1561 ms behind after a 1.6 s pause. The host failpoint lengthens the
+/// pause by 300 ms, so the lag is over the tolerance however fast the save is.
+///
+/// The baseline cold-boots (`--no-snapshot`), and its clock starts about a second
+/// behind the host until chronyd corrects it (a separate defect: the boot plan's host
+/// time is stamped before the VM boots), so the snapshot waits until the clock agrees
+/// with the host's. The sampling starts right after the create returns.
+#[tokio::test]
+async fn test_source_clock_matches_the_host_after_snapshot_create() -> Result<()> {
+    let (baseline_name, _, snapshot_name, _) = common::unique_names("srcclock");
+    let (_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "rootless",
+            "--kernel-profile",
+            "nested",
+            "--no-snapshot",
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await?;
+    let measured: Result<f64> = async {
+        common::poll_health_by_pid(baseline_pid, 180).await?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let (offset, _) = clock_offset(baseline_pid).await?;
+            if offset.abs() <= 0.01 {
+                break;
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "the cold-booted source's clock was still {:.1} ms off the host's 60 s \
+                 after healthy, before any snapshot",
+                offset * 1000.0
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let output = tokio::process::Command::new(common::find_fcvm_binary()?)
+            .args([
+                "snapshot",
+                "create",
+                "--pid",
+                &baseline_pid.to_string(),
+                "--tag",
+                &snapshot_name,
+            ])
+            .env("FCVM_FAILPOINT", "snapshot.post_save_pre_resume:sleep:300")
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "snapshot create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        worst_clock_offset(baseline_pid).await
+    }
+    .await;
+    common::kill_process(baseline_pid).await;
+    // Nothing restores this snapshot; a create that never ran leaves nothing to delete.
+    let deleted = common::delete_snapshot(&snapshot_name).await;
+
+    let worst = measured?;
+    deleted?;
     assert!(
-        worst <= TOLERANCE.as_secs_f64(),
-        "the restored clone's clock was {:.1} ms off the host's (tolerance {} ms)",
+        worst <= CLOCK_TOLERANCE.as_secs_f64(),
+        "the snapshot's source was {:.1} ms off the host's clock after `snapshot create` \
+         returned (tolerance {} ms)",
         worst * 1000.0,
-        TOLERANCE.as_millis()
+        CLOCK_TOLERANCE.as_millis()
     );
     Ok(())
 }

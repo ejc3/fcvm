@@ -75,7 +75,13 @@ async fn main() {
         Some("--prepare-snapshot-network") => {
             Some(snapshot_network::prepare_snapshot_network().await)
         }
-        Some("--resume-snapshot-network") => Some(snapshot_network::resume_source_network().await),
+        Some("--resume-snapshot-network") => {
+            let args: Vec<String> = std::env::args().collect();
+            Some(
+                snapshot_network::resume_source_network(snapshot_network::resume_host_time(&args))
+                    .await,
+            )
+        }
         _ => None,
     };
     if let Some(result) = one_shot_result {

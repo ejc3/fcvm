@@ -126,6 +126,37 @@ pub async fn sync_clock_from_host(transport: Transport) -> Result<()> {
 /// The document also carries "host-time", whole seconds, which only an agent
 /// frozen in a snapshot taken before "host-time-ns" existed reads.
 pub(crate) fn set_system_clock(host_time: &str, since_read: std::time::Duration) {
+    step_system_clock(host_time, since_read, ClockStep::Always);
+}
+
+/// [`set_system_clock`], except that a clock already at or past the target is left
+/// alone.
+///
+/// The target is a lower bound on the present: the host read its clock before the
+/// value reached the guest, and only the time since the guest read it is added. So a
+/// forward step always moves the clock closer to the host's, and a backward step can
+/// only move a clock that is already right behind it. A snapshot's source uses this
+/// (`snapshot_network::resume_source_network`): its clock is behind by the pause when
+/// the VMM froze it, and right when it did not (the arm64 `default` profile keeps it
+/// running through a pause, and a pause that failed may not have happened).
+pub(crate) fn advance_system_clock(host_time: &str, since_read: std::time::Duration) {
+    step_system_clock(host_time, since_read, ClockStep::ForwardOnly);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClockStep {
+    Always,
+    ForwardOnly,
+}
+
+impl ClockStep {
+    /// Whether to step by `step` seconds (target minus the current clock).
+    fn takes(self, step: f64) -> bool {
+        self == ClockStep::Always || step > 0.0
+    }
+}
+
+fn step_system_clock(host_time: &str, since_read: std::time::Duration, mode: ClockStep) {
     eprintln!("[fc-agent] received host time: {host_time} ns (read {since_read:?} ago)");
     match parse_epoch_nanos(host_time) {
         Ok(instant) => {
@@ -133,11 +164,18 @@ pub(crate) fn set_system_clock(host_time: &str, since_read: std::time::Duration)
             let before = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default();
-            // SAFETY: `spec` is fully initialized and outlives the call.
-            let rc = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &spec) };
             let step = std::time::Duration::new(spec.tv_sec as u64, spec.tv_nsec as u32)
                 .as_secs_f64()
                 - before.as_secs_f64();
+            if !mode.takes(step) {
+                eprintln!(
+                    "[fc-agent] system clock already at or past the host's (target {step:+.6} s); \
+                     not stepped"
+                );
+                return;
+            }
+            // SAFETY: `spec` is fully initialized and outlives the call.
+            let rc = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &spec) };
             if rc != 0 {
                 eprintln!(
                     "[fc-agent] WARNING: failed to set clock: {}",
@@ -211,6 +249,17 @@ mod clock_tests {
             (spec.tv_sec as i64, spec.tv_nsec as i64),
             (1_700_000_000, 770_000_123)
         );
+    }
+
+    /// The source's step never moves its clock back: the host's instant plus the
+    /// time since the guest read it is a lower bound on the present, so a clock past
+    /// it is closer to the host's than the target is.
+    #[test]
+    fn a_forward_only_step_leaves_a_clock_that_is_ahead_alone() {
+        assert!(ClockStep::ForwardOnly.takes(0.9));
+        assert!(!ClockStep::ForwardOnly.takes(-0.004));
+        assert!(!ClockStep::ForwardOnly.takes(0.0));
+        assert!(ClockStep::Always.takes(-0.004));
     }
 
     #[test]
