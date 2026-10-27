@@ -2,6 +2,7 @@
 //! - Clock sync after snapshot restore (chronyd + MMDS time sync), to well under a second
 //! - A cold-booted VM agrees with the host's clock once healthy
 //! - A snapshot's source agrees with the host's clock once `snapshot create` returns
+//! - A clone agrees with the host's clock after a restore that stalls in the guest
 //! - exact restore cleanup re-establishes gateway and container connectivity
 //! - --no-swap creates dedicated cgroup with memory.swap.max=0
 //! - --no-dirty-tracking passes track_dirty_pages=false
@@ -115,6 +116,117 @@ async fn test_clone_clock_matches_the_host_to_a_tenth_of_a_second() -> Result<()
     assert!(
         worst <= CLOCK_TOLERANCE.as_secs_f64(),
         "the restored clone's clock was {:.1} ms off the host's (tolerance {} ms)",
+        worst * 1000.0,
+        CLOCK_TOLERANCE.as_millis()
+    );
+    Ok(())
+}
+
+/// A restored clone whose guest stalls after reading the restore document still
+/// agrees with the host's clock once healthy (issue 1375). The restore used to step
+/// to the host time in that document plus the time since the restore sequence
+/// started, so a stall between the two left the clone behind by the stall: about
+/// 130 ms on staging after a 26 s cold restore, and here the guest failpoint holds
+/// fc-agent for `STALL` at that spot. The step now reads the host's clock right
+/// before it.
+///
+/// The golden cold-boots with the failpoint armed (`FCVM_NO_SNAPSHOT=1`, so no
+/// pre-start snapshot keyed by the failpoint is restored or left in the cache), its
+/// snapshot carries the armed fc-agent, and only the clone's restore hits the point.
+#[tokio::test]
+async fn test_clone_clock_matches_the_host_after_a_stalled_restore() -> Result<()> {
+    const STALL: Duration = Duration::from_secs(3);
+    let (golden_name, clone_name, snapshot_name, _) = common::unique_names("stallclock");
+    let stall = format!("restore.post_epoch_read:sleep:{}", STALL.as_millis());
+
+    let (mut golden_child, golden_pid, _golden_log) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &golden_name,
+            "--network",
+            "rootless",
+            common::TEST_IMAGE,
+        ],
+        &[
+            ("FCVM_GUEST_FAILPOINT", stall.as_str()),
+            ("FCVM_NO_SNAPSHOT", "1"),
+        ],
+    )
+    .await
+    .context("spawning the golden VM with the restore stall armed")?;
+    let created: Result<()> = async {
+        common::poll_health_by_pid(golden_pid, 180).await?;
+        let output = tokio::process::Command::new(common::find_fcvm_binary()?)
+            .args([
+                "snapshot",
+                "create",
+                "--pid",
+                &golden_pid.to_string(),
+                "--tag",
+                &snapshot_name,
+            ])
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "snapshot create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+    .await;
+    common::kill_process(golden_pid).await;
+    let _ = golden_child.wait().await;
+    if let Err(error) = created {
+        let _ = common::delete_snapshot(&snapshot_name).await;
+        return Err(error);
+    }
+
+    let spawned = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &snapshot_name,
+            "--name",
+            &clone_name,
+        ],
+        &[],
+    )
+    .await
+    .context("spawning the restored clone");
+    let (mut clone_child, clone_pid, clone_log) = match spawned {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            let _ = common::delete_snapshot(&snapshot_name).await;
+            return Err(error);
+        }
+    };
+    let measured: Result<f64> = async {
+        common::poll_health_by_pid(clone_pid, 120).await?;
+        worst_clock_offset(clone_pid).await
+    }
+    .await;
+    common::kill_process(clone_pid).await;
+    let _ = clone_child.wait().await;
+    let deleted = common::delete_snapshot(&snapshot_name).await;
+
+    let worst = measured?;
+    deleted?;
+    let log = std::fs::read_to_string(&clone_log).unwrap_or_default();
+    assert!(
+        log.contains("FAILPOINT restore.post_epoch_read reached"),
+        "the clone's restore never hit the stall, so nothing was tested ({})",
+        clone_log.display()
+    );
+    assert!(
+        worst <= CLOCK_TOLERANCE.as_secs_f64(),
+        "after a restore stalled {} ms past its read of the restore document, the clone's \
+         clock was {:.1} ms off the host's (tolerance {} ms)",
+        STALL.as_millis(),
         worst * 1000.0,
         CLOCK_TOLERANCE.as_millis()
     );
