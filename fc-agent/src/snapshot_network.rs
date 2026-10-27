@@ -593,8 +593,9 @@ const IPV6_LOOPBACK: &str = "::1/128";
 /// holds through it too.) A REJECT
 /// in OUTPUT fails the send itself (`sendto` returns EPERM), so on the source
 /// VM a poll whose timer fires during the cookie dump fails and chronyd logs
-/// "Could not send". Both the source and a clone ask chronyd for a burst once
-/// egress is open again (`chrony_burst`), so neither waits a poll interval.
+/// "Could not send". The source asks chronyd for a burst once egress is open
+/// again (`chrony_burst`), so it does not wait a poll interval; a clone starts
+/// a fresh chronyd after its clock step, which polls at once.
 fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<String>> {
     let owned = |tokens: &[&str]| tokens.iter().map(|token| token.to_string()).collect();
     let mut rules = vec![owned(&[
@@ -644,7 +645,7 @@ fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<Stri
 /// Ask chronyd to measure now: four polls, four answers needed. Run once the
 /// gate's egress half is open, because a poll the gate rejected leaves chronyd
 /// waiting its whole poll interval (up to 1024 s) to measure again.
-pub async fn chrony_burst() {
+async fn chrony_burst() {
     let _ = tokio::process::Command::new("chronyc")
         .args(["burst", "4/4"])
         .output()

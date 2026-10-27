@@ -814,39 +814,28 @@ async fn start_chronyd(host_servers: Vec<String>) {
         sources.join("\n")
     );
 
+    // Held while this changes which daemon runs, so a restore that lands mid-way
+    // (the pre-start snapshot is taken while this task can still be running)
+    // waits for it instead of interleaving with it. Not held across the
+    // readiness wait, which a restore must never queue behind.
+    let mut lifecycle = CHRONYD_LIFECYCLE.clone().lock_owned().await;
     let _ = tokio::fs::create_dir_all("/var/lib/chrony").await;
     let _ = tokio::fs::create_dir_all("/var/run/chrony").await;
     if let Err(e) = tokio::fs::write(CHRONY_CONF, config).await {
         eprintln!("[fc-agent] ERROR: cannot write {CHRONY_CONF}: {e}; no NTP time sync");
         return;
     }
+    *lifecycle = true;
 
     // The rootfs enables chrony.service, so systemd starts its own chronyd as the
     // _chrony user — which cannot send UDP in this VM. Replace it, and wait for it
     // to be GONE, because the replacement binds the same command socket.
     stop_running_chronyd().await;
 
-    // chronyd daemonizes: this command returns as soon as the daemon is spawned,
-    // which is BEFORE the daemon has bound its command socket.
-    match tokio::process::Command::new("/usr/sbin/chronyd")
-        .args(["-f", CHRONY_CONF, "-u", "root"])
-        .output()
-        .await
-    {
-        Ok(out) if out.status.success() => {}
-        Ok(out) => {
-            eprintln!(
-                "[fc-agent] ERROR: chronyd failed to start ({}): {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-            return;
-        }
-        Err(e) => {
-            eprintln!("[fc-agent] ERROR: failed to exec chronyd: {e}");
-            return;
-        }
+    if !spawn_chronyd().await {
+        return;
     }
+    drop(lifecycle);
 
     // Positive verification. Waiting for chronyc to answer proves the daemon is
     // up; counting its sources proves the config we wrote was actually loaded.
@@ -855,6 +844,124 @@ async fn start_chronyd(host_servers: Vec<String>) {
     match wait_for_chrony_sources().await {
         Ok(count) => eprintln!("[fc-agent] chronyd started with {count} NTP source(s)"),
         Err(e) => eprintln!("[fc-agent] ERROR: chronyd is not usable: {e}"),
+    }
+}
+
+/// Start chronyd on [`CHRONY_CONF`]. Returns whether the daemon was spawned.
+///
+/// chronyd daemonizes: the command returns as soon as the daemon is spawned,
+/// which is BEFORE the daemon has bound its command socket.
+async fn spawn_chronyd() -> bool {
+    match tokio::process::Command::new("/usr/sbin/chronyd")
+        .args(["-f", CHRONY_CONF, "-u", "root"])
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => {
+            eprintln!(
+                "[fc-agent] ERROR: chronyd failed to start ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] ERROR: failed to exec chronyd: {e}");
+            false
+        }
+    }
+}
+
+/// Serializes every change to which chronyd runs: the boot setup replacing
+/// systemd's daemon, and a restore replacing the snapshot's. The value says
+/// whether the boot setup has written [`CHRONY_CONF`]; until it has, a restore
+/// leaves starting the daemon to it.
+static CHRONYD_LIFECYCLE: std::sync::LazyLock<std::sync::Arc<tokio::sync::Mutex<bool>>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Mutex::new(false)));
+
+/// The snapshot's chronyd, gone. Holds [`CHRONYD_LIFECYCLE`] so no daemon can
+/// start between the kill and the restore's clock step;
+/// [`restart_chronyd_after_restore`] consumes it once the step is done.
+pub(crate) struct RetiredChronyd(tokio::sync::OwnedMutexGuard<bool>);
+
+/// Kill the chronyd a restored clone inherited from its snapshot, before the
+/// restore steps the clock.
+///
+/// The step happens behind chronyd's back, and chronyd notices an unannounced
+/// forward jump only when it exceeds 10 s beyond what it expected
+/// (`JUMP_DETECT_THRESHOLD` in chrony's sched.c); a clone restored within
+/// seconds of its snapshot is under that. Such a daemon keeps what it was doing
+/// in the snapshot. A source VM falls behind by the length of every pause a
+/// snapshot takes, so its chronyd is often correcting that lag when the next
+/// snapshot is taken, and the clone then applied the leftover correction to a
+/// clock the restore had already set to the host's: as a step when the
+/// restore's `chronyc makestep` ran (+2.19 s seen on x86_64), otherwise as a
+/// slew at chronyd's maximum rate (+146 ms after 2 s on arm64).
+///
+/// SIGKILL, not SIGTERM: on SIGTERM chronyd writes its frequency estimate to
+/// the drift file, which the next daemon loads, and that estimate comes from the
+/// measurements the step invalidated. A killed daemon also leaves the kernel's
+/// frequency correction where its slew put it, so this zeroes it: the next
+/// daemon takes the drift file's frequency, or the kernel's when there is none.
+pub(crate) async fn retire_chronyd_for_restore() -> RetiredChronyd {
+    let lifecycle = CHRONYD_LIFECYCLE.clone().lock_owned().await;
+    for pid in running_chronyd_pids() {
+        let Some(pidfd) = PidFd::open(pid) else {
+            continue;
+        };
+        if pidfd.send_signal(libc::SIGKILL) && !pidfd.wait_for_exit(CHRONYD_TERM_TIMEOUT).await {
+            eprintln!(
+                "[fc-agent] WARNING: chronyd pid {pid} survived SIGKILL for \
+                 {CHRONYD_TERM_TIMEOUT:?}; it may still act on the snapshot's measurements"
+            );
+        }
+    }
+    reset_kernel_frequency();
+    RetiredChronyd(lifecycle)
+}
+
+/// Start a fresh chronyd once the restore has stepped the clock. Its first
+/// measurements are all taken against the stepped clock.
+pub(crate) async fn restart_chronyd_after_restore(retired: RetiredChronyd) {
+    let RetiredChronyd(lifecycle) = retired;
+    if !*lifecycle {
+        eprintln!(
+            "[fc-agent] chronyd: the boot setup has not run yet in this clone; it starts the daemon"
+        );
+        return;
+    }
+    if !spawn_chronyd().await {
+        return;
+    }
+    drop(lifecycle);
+    match wait_for_chrony_sources().await {
+        Ok(count) => {
+            eprintln!("[fc-agent] chronyd restarted after restore with {count} NTP source(s)")
+        }
+        Err(e) => eprintln!("[fc-agent] ERROR: chronyd is not usable after restore: {e}"),
+    }
+}
+
+/// Zero the kernel's frequency correction: no frequency offset, nominal tick.
+fn reset_kernel_frequency() {
+    // SAFETY: sysconf has no preconditions.
+    let user_hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if user_hz <= 0 {
+        eprintln!("[fc-agent] WARNING: sysconf(_SC_CLK_TCK) failed; kernel frequency not reset");
+        return;
+    }
+    // SAFETY: timex is plain data; all-zero is a valid value for every field.
+    let mut timex: libc::timex = unsafe { std::mem::zeroed() };
+    timex.modes = (libc::ADJ_FREQUENCY | libc::ADJ_TICK) as _;
+    timex.freq = 0;
+    timex.tick = (1_000_000 / user_hz) as _;
+    // SAFETY: `timex` is initialized and outlives the call.
+    if unsafe { libc::adjtimex(&mut timex) } < 0 {
+        eprintln!(
+            "[fc-agent] WARNING: failed to reset the kernel frequency: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 
