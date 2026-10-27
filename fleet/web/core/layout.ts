@@ -64,9 +64,9 @@ export const MAX_TILE_PX = 0.5e6;
 /**
  * The smallest stream height that covers `devicePixels`, capped at the largest. With
  * `tileAspect` (the tile's width over its height on screen) it is also capped so the tile is at
- * most MAX_TILE_PX: h <= sqrt(MAX_TILE_PX / tileAspect), snapped down to a stream height.
+ * most `maxPx` (MAX_TILE_PX unless given): h <= sqrt(maxPx / tileAspect), snapped down to a stream height.
  */
-export function streamHeightFor(devicePixels: number, tileAspect?: number): number {
+export function streamHeightFor(devicePixels: number, tileAspect?: number, maxPx: number = MAX_TILE_PX): number {
   let h: number = STREAM_HEIGHTS[STREAM_HEIGHTS.length - 1]!;
   for (const x of STREAM_HEIGHTS) {
     if (x >= devicePixels - 0.5) {
@@ -75,7 +75,7 @@ export function streamHeightFor(devicePixels: number, tileAspect?: number): numb
     }
   }
   if (tileAspect === undefined || !(tileAspect > 0)) return h;
-  const cap = Math.sqrt(MAX_TILE_PX / tileAspect);
+  const cap = Math.sqrt(maxPx / tileAspect);
   if (h <= cap) return h;
   let best: number = STREAM_HEIGHTS[0];
   for (const x of STREAM_HEIGHTS) if (x <= cap) best = x;
@@ -118,7 +118,11 @@ export function splitOf(tiles: readonly Tile[]): number {
 }
 
 export function layoutMosaic(area: Box, tiles: readonly Tile[], dpr: number, aspect: number = DEFAULT_IMAGE_ASPECT): MosaicLayout {
-  const image = fitContain(area, aspect);
+  return layoutImage(fitContain(area, aspect), tiles, dpr, aspect);
+}
+
+/** Every tile placed in an image already sized and positioned (the wall's, or a zoomed one larger than the screen). */
+export function layoutImage(image: Box, tiles: readonly Tile[], dpr: number, aspect: number = DEFAULT_IMAGE_ASPECT): MosaicLayout {
   const split = splitOf(tiles);
   const snapped: Box = {
     x: snap(image.x, dpr),
@@ -137,17 +141,114 @@ export function layoutMosaic(area: Box, tiles: readonly Tile[], dpr: number, asp
   };
 }
 
-/** The box a single tile is drawn in when opened: its own aspect, fitted to `area`. */
-export function layoutFocus(area: Box, tile: Tile, dpr: number, imageAspect: number = DEFAULT_IMAGE_ASPECT): PlacedTile {
-  const tileAspect = tileAspectOf(tile.rect, imageAspect);
-  const fit = fitContain(area, tileAspect);
-  const box = {
-    x: snap(fit.x, dpr),
-    y: snap(fit.y, dpr),
-    w: snap(fit.x + fit.w, dpr) - snap(fit.x, dpr),
-    h: snap(fit.y + fit.h, dpr) - snap(fit.y, dpr),
+// ---- one tile opened: the image zoomed until that tile fills the stage ------------------
+
+/**
+ * The most pixels an opened tile's stream may ask for. The renderer README ("Measured", round 7)
+ * runs the detail view, one wall tile at 1080 x 1080, at 30 fps on a T4: it draws a quarter of
+ * the pixels each frame (checker stride 4) and accumulates the rest. So an opened tile asks up to
+ * that many pixels: 1080 for a square tile, 720 for a 16:9 one (1280 x 720, the whole-image
+ * 720p row of the same table, also 30 fps).
+ */
+export const DETAIL_TILE_PX = 1080 * 1080;
+
+/** Room an opened tile leaves around it, in CSS pixels. */
+export interface ZoomInsets {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+  /** Width of a side sheet over the right edge, which the tile moves clear of when it can without shrinking. */
+  sheet: number;
+}
+
+/**
+ * The box an opened tile fills: its own aspect, as large as fits in the area less the insets.
+ * It moves left to clear a side sheet when there is room, and is never made smaller for one.
+ */
+export function zoomTarget(area: Box, rect: Rect, imageAspect: number, insets: ZoomInsets): Box {
+  const inner: Box = {
+    x: area.x + insets.left,
+    y: area.y + insets.top,
+    w: Math.max(0, area.w - insets.left - insets.right),
+    h: Math.max(0, area.h - insets.top - insets.bottom),
   };
-  return { id: tile.id, box, streamHeight: streamHeightFor(box.h * dpr, tileAspect) };
+  const fit = fitContain(inner, tileAspectOf(rect, imageAspect));
+  const clear = area.x + area.w - insets.sheet - fit.w;
+  return { ...fit, x: Math.max(inner.x, Math.min(fit.x, clear)) };
+}
+
+/** Whether an opened tile, at full size, lies clear of the side sheet: then the sheet starts open. */
+export function sheetClears(area: Box, rect: Rect, imageAspect: number, insets: ZoomInsets): boolean {
+  const z = zoomTarget(area, rect, imageAspect, insets);
+  return z.x + z.w <= area.x + area.w - insets.sheet + 0.5;
+}
+
+/** The image box that puts the tile with rectangle `rect` exactly on `target`. */
+export function imageBehind(target: Box, rect: Rect): Box {
+  const w = target.w / rect.w;
+  const h = target.h / rect.h;
+  return { x: target.x - rect.x * w, y: target.y - rect.y * h, w, h };
+}
+
+export function lerpBox(a: Box, b: Box, p: number): Box {
+  return { x: a.x + (b.x - a.x) * p, y: a.y + (b.y - a.y) * p, w: a.w + (b.w - a.w) * p, h: a.h + (b.h - a.h) * p };
+}
+
+/** How long the zoom between the wall and a tile (or from one tile to another) takes. */
+export const ZOOM_MS = 420;
+
+/** Cubic ease in and out of the zoom's linear progress. */
+export function easeZoom(p: number): number {
+  const x = Math.min(1, Math.max(0, p));
+  return x < 0.5 ? 4 * x * x * x : 1 - (-2 * x + 2) ** 3 / 2;
+}
+
+/** The zoom as the page animates it: from the wall or a tile, to the wall or a tile, `progress` of the way (linear time). */
+export interface ZoomStep {
+  from: string | null;
+  to: string | null;
+  progress: number;
+}
+
+export interface ZoomLayout {
+  /** The image and every tile at this step of the zoom; most of the image lies off screen. */
+  layout: MosaicLayout;
+  /** The tile zoomed into (while closing, the one zoomed out of) and its box now. */
+  focus: PlacedTile | null;
+  /** How far the picture around it has dimmed, 0 (the wall) to 1 (fully open). */
+  dim: number;
+}
+
+/**
+ * The image and tiles at a step of the zoom. The image box moves (eased) from where the `from`
+ * side puts it to where the `to` side does: the wall's image box for null, else the box that
+ * puts that tile on its zoomTarget in `area`. Null when neither side is a tile of `tiles`.
+ */
+export function layoutZoom(
+  wall: Box,
+  area: Box,
+  tiles: readonly Tile[],
+  step: ZoomStep,
+  dpr: number,
+  aspect: number,
+  insets: ZoomInsets,
+): ZoomLayout | null {
+  const from = step.from === null ? null : tiles.find((t) => t.id === step.from) ?? null;
+  const to = step.to === null ? null : tiles.find((t) => t.id === step.to) ?? null;
+  if (!from && !to) return null;
+  const imageFor = (t: Tile | null) => (t ? imageBehind(zoomTarget(area, t.rect, aspect, insets), t.rect) : wall);
+  const e = easeZoom(step.progress);
+  const layout = layoutImage(lerpBox(imageFor(from), imageFor(to), e), tiles, dpr, aspect);
+  const opened = to ?? from!;
+  const focus = layout.tiles.find((p) => p.id === opened.id) ?? null;
+  const dim = (from ? 1 : 0) + ((to ? 1 : 0) - (from ? 1 : 0)) * e;
+  return { layout, focus, dim };
+}
+
+/** Whether two boxes overlap by more than a hairline. */
+export function boxesMeet(a: Box, b: Box): boolean {
+  return a.x < b.x + b.w - 0.5 && b.x < a.x + a.w - 0.5 && a.y < b.y + b.h - 0.5 && b.y < a.y + a.h - 0.5;
 }
 
 /** NVENC's smallest H.264 frame on a T4: nothing narrower than 145 or shorter than 49 px. */

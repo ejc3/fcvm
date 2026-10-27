@@ -253,11 +253,19 @@ report says why: "waiting for EC2 capacity" while the tile is not up, "not repor
 same on a touch screen; keyboard users tab into a grid of the tiles and move with the
 arrow keys. All of it is drawn by the page over the frames, never in them.
 
-**An opened VM** is drawn at the renderer's native size, 720 px tall at one device pixel
-per pixel (smaller only when the screen is, and the tag says how much), with the
+**An opened VM** fills the screen. The whole image zooms (420 ms, eased; at once with
+reduced motion) until that tile fills the stage less a margin, and every other tile stays
+where its rectangle of the image puts it, dimmed by a vignette (55% black next to it, 82% at
+the far corners), so the scene runs on past its edges. Its stream asks for the height that
+covers its box, up to the renderer's measured detail view (`DETAIL_TILE_PX`, 1080 x 1080 at
+30 fps): 1080 for a square tile, 720 for a 16:9 one. A sheet over the picture holds the
 timeline of its last restart as the coordinator measured it and its GPU's temperature,
-power and load with two minutes of history. Only its renderer is asked for the taller
-stream (`{"h": ...}` on the open socket).
+power and load with two minutes of history: at the right on a wide screen (it folds away,
+and the tile moves clear of it only when that costs no size), at the bottom on a phone,
+where the tile is full width and the sheet starts folded to a handle. A click on a dimmed
+tile, or an arrow key, opens that tile instead.
+
+<img src="docs/screenshots/phone-tile-opened.jpg" alt="An opened VM on a phone" width="260"> <img src="docs/screenshots/phone-tile-details.jpg" alt="Its details on a phone" width="260">
 
 ## Measurements
 
@@ -300,8 +308,10 @@ asks for `q=lo` (small tiles lose least on screen), and once every tile is at `l
 tallest stream steps down one height. `?budget=<Mbit/s>` sets another budget for trying it.
 The page models `lo` as half the default rate and floor, and `hi` as double; the renderer
 has not documented its figures yet. With a tile
-opened, every other tile keeps streaming at the smallest height (72) so closing it is
-instant, and only the opened tile asks for its full size. The floor of 0.6 Mbit/s a
+opened, the tiles still on screen around it keep their wall height at `q=lo` (they are
+dimmed), the ones the zoom pushed off screen keep streaming at the smallest height (72) so
+closing it is instant, and the opened tile asks for its detail height and is kept out of the
+budget's steps. The floor of 0.6 Mbit/s a
 stream sets the cost of a large wall: 100 tiles cost 60 Mbit/s at any height, so a
 fleet that wants 100 tiles on ordinary connections needs a lower floor or fewer tiles
 per viewer. The stats switch shows the current total.
@@ -352,8 +362,8 @@ viewer, id, name, args, summary, outcome}`, `gpu` is `{sbdf, name}` with reading
 answer echoes `client_unix_ms`, snapshots may skip versions, frames fall on `t = k/30`,
 the stream header carries `full_width`, `full_height`, `x0`, `y0`, `fps` and `crop`, the
 stream may be larger than asked, and `{"h": N}` brings a new header and a keyframe. The
-page draws only a stream's inner rectangle, placed at `x0, y0` of the full grid (an opened
-VM fills its box), by drawing the whole frame scaled and clipped, because WebKit ignores a
+page draws only a stream's inner rectangle, placed at `x0, y0` of the full grid (also for an
+opened VM, whose zoomed image is larger than the screen), by drawing the whole frame scaled and clipped, because WebKit ignores a
 VideoFrame's source rectangle and `visibleRect`.
 
 **The coordinator's names, held by a test.** `core/test/contract.test.ts` parses the

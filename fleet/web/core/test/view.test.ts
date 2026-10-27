@@ -12,8 +12,10 @@ import {
   isolationView,
   REDUCED_MOTION_DARK_FADE_MS,
   needsVerify,
-  nativePlacement,
   placeLabel,
+  ZOOM_DIM_FAR,
+  ZOOM_DIM_NEAR,
+  zoomInsetsFor,
   familyLine,
   pointerTile,
   relaunchParts,
@@ -23,7 +25,7 @@ import {
 } from "../view.ts";
 import { suggestMode } from "../mode.ts";
 import { END_CARD_MS } from "../race.ts";
-import { tileAt as tileAtPoint } from "../layout.ts";
+import { boxesMeet, DETAIL_TILE_PX, layoutMosaic, tileAt as tileAtPoint, tileGeometry, zoomTarget } from "../layout.ts";
 import { familyProbeTargets } from "../net.ts";
 import { parseReelMeta, reelView } from "../reel.ts";
 import type { Aggregate, Claim, FleetState, Nudges, Power, RelaunchAll } from "../protocol.ts";
@@ -48,7 +50,6 @@ function view(s: ClientState, now: number, over: Partial<WallInput> = {}) {
     now,
     dpr: 1,
     mosaicArea: { x: 0, y: 0, w: 1600, h: 930 },
-    focusArea: null,
     canDecode: true,
     phone: false,
     ...over,
@@ -707,16 +708,108 @@ describe("seams and hover", () => {
 });
 
 describe("one VM opened", () => {
-  it("asks that VM alone for its native-size stream, at one device pixel per pixel", () => {
+  const AREA = { x: 0, y: 0, w: 1600, h: 930 };
+  const opened = (st: FleetState, id: string, over: Partial<WallInput> = {}) => view(reduce(stateWith(st), { type: "ui", patch: { focusId: id } }), EPOCH, over);
+
+  it("zooms the image until that VM fills the stage at its own aspect, with every other tile in place around it", () => {
     const st = fleet(5, 5);
-    const s = reduce(stateWith(st), { type: "ui", patch: { focusId: "fcvm:7" } });
-    const v = view(s, EPOCH, { focusArea: { x: 0, y: 0, w: 1400, h: 800 } });
-    const t = v.plan.direct.find((x) => x.id === "d:fcvm:7")!;
-    expect(t.height).toBe(720);
-    expect(t.box!.h).toBe(720);
-    expect(t.box!.w / t.box!.h).toBeCloseTo((0.1 * 16) / 9 / 0.2, 2);
-    expect(v.plan.focus!.id).toBe("d:fcvm:7");
-    expect(new Set(v.plan.direct.filter((x) => x.id !== "d:fcvm:7").map((x) => x.height))).toEqual(new Set([72]));
+    const v = opened(st, "fcvm:13");
+    const t = st.tiles.find((x) => x.id === "fcvm:13")!;
+    const z = v.plan.zoom!;
+    const target = zoomTarget(AREA, t.rect, 16 / 9, zoomInsetsFor(false, 0));
+    expect(Math.abs(z.box!.h - target.h)).toBeLessThanOrEqual(1);
+    expect(z.box!.w / z.box!.h).toBeCloseTo((t.rect.w * 16) / 9 / t.rect.h, 2);
+    // The image is the zoomed one: the opened VM's rectangle of it is its box.
+    const img = v.plan.image!;
+    expect(Math.abs(img.x + t.rect.x * img.w - z.box!.x)).toBeLessThanOrEqual(1);
+    expect(Math.abs(img.w * t.rect.w - z.box!.w)).toBeLessThanOrEqual(1);
+    // The opened VM is drawn on its own over the mosaic; its mosaic entry streams undrawn.
+    expect(z.source).toMatchObject({ id: "d:fcvm:13", box: z.box });
+    expect(v.plan.direct.find((x) => x.id === "d:fcvm:13")!.box).toBeNull();
+    expect(v.plan.focus).toBeNull();
+    // Every tile on screen is drawn where its wall rectangle puts it in the zoomed image, the rest not at all.
+    for (const d of v.plan.direct.filter((x) => x.id !== "d:fcvm:13")) {
+      const r = st.tiles.find((x) => `d:${x.id}` === d.id)!.rect;
+      const b = { x: img.x + r.x * img.w, y: img.y + r.y * img.h, w: r.w * img.w, h: r.h * img.h };
+      if (boxesMeet(b, AREA)) {
+        expect(d.box, d.id).not.toBeNull();
+        expect(Math.abs(d.box!.x - b.x), d.id).toBeLessThanOrEqual(1);
+        expect(Math.abs(d.box!.y - b.y), d.id).toBeLessThanOrEqual(1);
+      } else expect(d.box, d.id).toBeNull();
+    }
+    const left = v.plan.direct.find((x) => x.id === "d:fcvm:12")!.box!;
+    expect(left.x + left.w).toBe(z.box!.x);
+    // Dimmed around it, fully once open; nothing of the wall's overlays is drawn over the zoom.
+    expect([z.near, z.far]).toEqual([ZOOM_DIM_NEAR, ZOOM_DIM_FAR]);
+    expect(v.zoom!.dim).toBe(1);
+    expect(v.race).toBeNull();
+    expect(v.seams.segments).toEqual([]);
+    expect(v.focus!.placed!.box).toEqual(z.box);
+  });
+
+  it("asks that VM for the renderer's detail view, the dimmed tiles on screen for their wall height at q=lo, and the rest for the smallest", () => {
+    const st = fleet(5, 5);
+    const wall = view(stateWith(st), EPOCH, { dpr: 2 });
+    const v = opened(st, "fcvm:13", { dpr: 2 });
+    const t = st.tiles.find((x) => x.id === "fcvm:13")!;
+    const z = v.plan.zoom!;
+    // 810 CSS px tall on a 2x screen, a tile 0.89 as wide as tall: 1080, at most the detail view's pixels.
+    expect(z.source!.height).toBe(1080);
+    expect(z.source!.url).toBe("ws://example-host:1/frames/fcvm-13?h=1080");
+    const g = tileGeometry(t.rect, 16 / 9, z.source!.height);
+    expect(g.width * g.height).toBeLessThanOrEqual(DETAIL_TILE_PX);
+    expect(v.focus!.placed!.streamHeight).toBe(1080);
+    for (const d of v.plan.direct.filter((x) => x.id !== "d:fcvm:13")) {
+      const onWall = wall.plan.direct.find((x) => x.id === d.id)!;
+      if (d.box) {
+        expect(d.height, d.id).toBe(onWall.height);
+        expect(d.url, d.id).toContain("q=lo");
+      } else expect(d.height, d.id).toBe(72);
+    }
+    // A 16:9 tile on a large 2x screen: 720, not 1080.
+    const flat = fleet(1, 2);
+    const fv = opened(flat, "fcvm:1", { dpr: 2, mosaicArea: { x: 0, y: 0, w: 2560, h: 1440 } });
+    expect(fv.plan.zoom!.source!.height).toBe(720);
+    // A small window asks only for what the box covers.
+    const small = opened(st, "fcvm:13", { mosaicArea: { x: 0, y: 0, w: 800, h: 500 } });
+    expect(small.plan.zoom!.source!.height).toBe(432);
+  });
+
+  it("keeps the opened VM at its detail height inside the bandwidth budget: the dimmed tiles give way", () => {
+    const st = fleet(5, 5);
+    const v = opened(st, "fcvm:13", { dpr: 2, budgetBps: 8_000_000 });
+    expect(v.plan.zoom!.source!.height).toBe(1080);
+    const shown = v.plan.direct.filter((x) => x.box !== null);
+    expect(shown.length).toBeGreaterThan(0);
+    for (const d of shown) expect(d.url, d.id).toContain("q=lo");
+    const wall = view(stateWith(st), EPOCH, { dpr: 2 });
+    expect(Math.max(...shown.map((d) => d.height))).toBeLessThan(Math.max(...wall.plan.direct.map((d) => d.height)));
+  });
+
+  it("follows the page's zoom step: half way in, half dimmed; closing, the wall's heights come back while it shrinks", () => {
+    const st = fleet(5, 5);
+    const s = reduce(stateWith(st), { type: "ui", patch: { focusId: "fcvm:13" } });
+    const wallImage = layoutMosaic(AREA, st.tiles, 1).image;
+    const full = view(s, EPOCH).plan.image!;
+    const half = view(s, EPOCH, { zoom: { from: null, to: "fcvm:13", progress: 0.5 } });
+    expect(half.plan.zoom!.near).toBeCloseTo(ZOOM_DIM_NEAR / 2, 9);
+    expect(half.plan.image!.w).toBeGreaterThan(wallImage.w);
+    expect(half.plan.image!.w).toBeLessThan(full.w);
+    // While it opens, the streams already ask for where it ends.
+    expect(half.plan.zoom!.source!.height).toBe(view(s, EPOCH).plan.zoom!.source!.height);
+    const closed = reduce(s, { type: "ui", patch: { focusId: null } });
+    const out = view(closed, EPOCH, { zoom: { from: "fcvm:13", to: null, progress: 0.5 } });
+    expect(out.focus).toBeNull();
+    expect(out.zoom!.focus!.id).toBe("fcvm:13");
+    expect(out.plan.zoom!.box).toEqual(out.zoom!.focus!.box);
+    const wall = view(closed, EPOCH);
+    expect(out.plan.direct.map((d) => d.url)).toEqual(wall.plan.direct.map((d) => d.url));
+    expect(wall.plan.zoom).toBeNull();
+    expect(wall.plan.image).toEqual(wallImage);
+  });
+
+  it("shows its restart timeline and live GPU readings", () => {
+    const v = opened(fleet(5, 5), "fcvm:7");
     expect(v.focus!.timeline.map((x) => [x.label, x.value])).toEqual([
       ["old VM stopped", "0.30 s"],
       ["snapshot restored", "0.40 s"],
@@ -728,11 +821,11 @@ describe("one VM opened", () => {
     expect(v.focus!.readings.map((r) => [r.label, r.value])).toEqual([["Temperature", "61 °C"], ["Power", "70 W"], ["GPU busy", "98%"]]);
   });
 
-  it("shrinks a native stream only to fit, and on a 2x screen asks for the same pixels at half the CSS size", () => {
-    expect(nativePlacement({ x: 0, y: 0, w: 600, h: 300 }, { x: 0, y: 0, w: 0.25, h: 0.5 }, 16 / 9, 1).box.h).toBe(300);
-    const hi = nativePlacement({ x: 0, y: 0, w: 1400, h: 800 }, { x: 0, y: 0, w: 0.25, h: 0.5 }, 16 / 9, 2);
-    expect(hi.box.h).toBe(360);
-    expect(hi.streamHeight).toBe(720);
+  it("on a phone fills the viewport's width, not the 16:9 stage band", () => {
+    const st = fleet(1, 2);
+    const v = opened(st, "fcvm:1", { phone: true, mosaicArea: { x: 0, y: 0, w: 390, h: 219 }, zoomArea: { x: 0, y: 0, w: 390, h: 844 } });
+    expect(v.plan.zoom!.box!.w).toBe(390);
+    expect(v.plan.zoom!.box!.y).toBeGreaterThanOrEqual(56);
   });
 
   it("keeps GPU readings as a short history for the sparklines", () => {
@@ -1075,22 +1168,22 @@ describe("re-tiling: each side as wide as the GPUs it has", () => {
   });
 
   it("a generation change mid-magnify: the opened VM's stream follows its new rectangle, and a VM that left closes", () => {
-    const area = { focusArea: { x: 0, y: 0, w: 1400, h: 800 } };
+    const area = { mosaicArea: { x: 0, y: 0, w: 1400, h: 800 } };
     let s = reduce(stateWith(fleetSplit(4, 4, 1)), { type: "ui", patch: { focusId: "fcvm:2" } });
     let v = view(s, EPOCH, area);
     const r1 = fleetSplit(4, 4, 1).tiles.find((t) => t.id === "fcvm:2")!.rect;
-    expect(v.plan.focus!.box!.w / v.plan.focus!.box!.h).toBeCloseTo((r1.w * 16) / 9 / r1.h, 1);
+    expect(v.plan.zoom!.box!.w / v.plan.zoom!.box!.h).toBeCloseTo((r1.w * 16) / 9 / r1.h, 1);
     s = snap(s, 2, fleetSplit(2, 4, 2));
     v = view(s, EPOCH, area);
     const r2 = fleetSplit(2, 4, 2).tiles.find((t) => t.id === "fcvm:2")!.rect;
     expect(v.focus!.title).toBe("fcvm VM 2");
     expect(v.plan.gen).toBe(2);
-    expect(v.plan.focus!.box!.w / v.plan.focus!.box!.h).toBeCloseTo((r2.w * 16) / 9 / r2.h, 1);
+    expect(v.plan.zoom!.box!.w / v.plan.zoom!.box!.h).toBeCloseTo((r2.w * 16) / 9 / r2.h, 1);
     // The VM leaves in the next generation: nothing is opened any more.
     s = snap(s, 3, fleetSplit(1, 4, 3));
     v = view(s, EPOCH, area);
     expect(v.focus).toBeNull();
-    expect(v.plan.focus).toBeNull();
+    expect(v.plan.zoom).toBeNull();
   });
 
   it("Aggregated mode takes the new regions with the new generation", () => {

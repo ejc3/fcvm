@@ -1,6 +1,7 @@
 import { expect, test, devices, type Page } from "@playwright/test";
 import { seconds, thousands, utcDate } from "../core/format.ts";
-import { layoutMosaic, streamHeightFor } from "../core/layout.ts";
+import { DETAIL_TILE_PX, layoutMosaic, sheetClears, streamHeightFor, zoomTarget } from "../core/layout.ts";
+import { ZOOM_DIM_NEAR, ZOOM_SHEET_W, zoomInsetsFor } from "../core/view.ts";
 import { streamBitrate } from "../core/bandwidth.ts";
 import { COORD, admin, fleetNow, focusError, mockState, openWall, raceOver, seamReport, setSkew, setTimeOfDay } from "./helpers.ts";
 
@@ -380,25 +381,34 @@ test("keyboard: the tile grid takes focus, arrows move the outline, Enter opens,
   await expect(page.locator(".key-grid button:focus")).toHaveAttribute("aria-label", /^EC2 VM 3,/);
 });
 
-test("an opened VM streams at its native size, with its restart timeline and live GPU readings", async ({ page }) => {
+test("an opened VM zooms to fill the screen at its detail height, with the tiles around it dimmed, its timeline and live GPU readings", async ({ page }) => {
   await openWall(page, 15);
   const t = await tileBox(page, "fcvm:3");
   await page.mouse.click(t.x + t.w / 2, t.y + t.h / 2);
   await expect(page.getByTestId("focus")).toBeVisible();
-  const placed = await page.evaluate(() => window.__fleet!.view().focus!.placed!);
-  const wanted = await page.evaluate(() => window.__fleet!.view().plan.direct.find((x) => x.id === "d:fcvm:3")!.height);
-  expect(wanted).toBe(placed.streamHeight);
-  expect(wanted).toBeLessThanOrEqual(720);
-  // 720p, or less where 720p would pass MAX_TILE_PX, at one device pixel per pixel when
-  // it fits; on a smaller screen the box shrinks and asks for the next stream height up.
-  expect(wanted).toBeGreaterThanOrEqual(placed.box.h);
+  await expect.poll(() => page.evaluate(() => window.__fleet!.view().zoom?.dim ?? 0)).toBe(1);
+  const z = await page.evaluate(() => window.__fleet!.view().plan.zoom!);
+  const vp = page.viewportSize()!;
   const r = await page.evaluate(() => window.__fleet!.client.getState().accepted!.tiles.find((t) => t.id === "fcvm:3")!.rect);
-  const native = Math.min(720, streamHeightFor(Number.POSITIVE_INFINITY, (r.w * 16) / 9 / r.h));
-  expect(placed.box.h).toBeLessThanOrEqual(native);
+  const aspect = (r.w * 16) / 9 / r.h;
+  // It fills the room the bar, the margins and (when it costs no size) the sheet leave.
+  const target = zoomTarget({ x: 0, y: 0, w: vp.width, h: vp.height }, r, 16 / 9, zoomInsetsFor(false, ZOOM_SHEET_W + 16));
+  expect(Math.abs(z.box!.w - target.w)).toBeLessThanOrEqual(1);
+  expect(Math.abs(z.box!.h - target.h)).toBeLessThanOrEqual(1);
+  expect(z.box!.w / z.box!.h).toBeCloseTo(aspect, 1);
+  // Its stream: the detail height that covers the box at 1x, so the picture is not scaled up.
+  const wanted = z.source!.height;
+  expect(wanted).toBe(streamHeightFor(z.box!.h, aspect, DETAIL_TILE_PX));
+  expect(wanted).toBeGreaterThanOrEqual(z.box!.h);
   await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().frames!.tiles["d:fcvm:3"]!.height), { timeout: 15_000 }).toBe(wanted);
   await expect(page.getByTestId("focus-stream")).toHaveText(new RegExp(`^${wanted}p · \\d+ fps · (native size|shown at \\d+%)$`));
-  const others = await page.evaluate(() => window.__fleet!.view().plan.direct.filter((x) => x.id !== "d:fcvm:3").map((x) => x.height));
-  expect(new Set(others)).toEqual(new Set([72]));
+  // The tiles still on screen keep streaming, at q=lo; the ones the zoom pushed off screen ask for the smallest.
+  const others = await page.evaluate(() => window.__fleet!.view().plan.direct.filter((x) => x.id !== "d:fcvm:3").map((x) => ({ shown: x.box !== null, h: x.height, url: x.url })));
+  expect(others.some((o) => o.shown)).toBe(true);
+  for (const o of others) {
+    if (o.shown) expect(o.url).toContain("q=lo");
+    else expect(o.h).toBe(72);
+  }
   await expect(page.getByTestId("readings")).toContainText("Temperature");
   await expect(page.getByTestId("readings")).toContainText(/\d+ °C/);
   await expect(page.getByTestId("readings")).toContainText(/\d+ W/);
@@ -407,11 +417,47 @@ test("an opened VM streams at its native size, with its restart timeline and liv
   await expect(page.getByTestId("timeline-total")).toHaveText(/^\d\.\d s$/);
   await page.waitForTimeout(1000);
   const fe = await focusError(page, "fcvm:3");
-  console.log(`opened VM: error ${fe.err.toFixed(2)} shown ${fe.shown}`);
+  console.log(`opened VM: error ${fe.err.toFixed(2)} shown ${fe.shown} brightness around it ${fe.around.toFixed(2)}`);
   expect(fe.shown).toBe(`sync@${fe.T}`);
   expect(fe.err).toBeLessThan(6);
+  // Dimmed: at most 1 - ZOOM_DIM_NEAR of the brightness the same scene has in the opened tile.
+  expect(fe.around).toBeLessThan(1 - ZOOM_DIM_NEAR + 0.08);
+  expect(fe.around).toBeGreaterThan(0.05);
+  // The sheet starts open only where the tile lies clear of it; it folds away and comes back, and never moves the picture.
+  const clears = sheetClears({ x: 0, y: 0, w: vp.width, h: vp.height }, r, 16 / 9, zoomInsetsFor(false, ZOOM_SHEET_W + 16));
+  const sheet = page.getByTestId("focus-sheet");
+  if (clears) await expect(sheet).toHaveClass(/open/);
+  else {
+    await expect(sheet).not.toHaveClass(/open/);
+    await page.getByTestId("sheet-toggle").click();
+    await expect(sheet).toHaveClass(/open/);
+  }
+  await page.getByTestId("sheet-hide").click();
+  await expect(sheet).not.toHaveClass(/open/);
+  expect(await page.evaluate(() => window.__fleet!.view().plan.zoom!.box)).toEqual(z.box);
+  await page.getByTestId("sheet-toggle").click();
+  await expect(sheet).toHaveClass(/open/);
+  // A click on a dimmed tile opens it instead: the middle of the first one with a clear patch on
+  // screen, below the bar and left of the sheet.
+  const pick = await page.evaluate(({ w, h }) => {
+    const v = window.__fleet!.view();
+    for (const d of v.plan.direct) {
+      if (!d.box) continue;
+      const x0 = Math.max(d.box.x, 0) + 8;
+      const x1 = Math.min(d.box.x + d.box.w, w - 420) - 8;
+      const y0 = Math.max(d.box.y, 80) + 8;
+      const y1 = Math.min(d.box.y + d.box.h, h) - 8;
+      if (x1 > x0 && y1 > y0) return { id: d.id.slice(2), x: (x0 + x1) / 2, y: (y0 + y1) / 2 };
+    }
+    return null;
+  }, { w: vp.width, h: vp.height });
+  expect(pick).not.toBeNull();
+  await page.mouse.click(pick!.x, pick!.y);
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().ui.focusId)).toBe(pick!.id);
+  await expect(page.locator("#focus-title")).not.toHaveText("fcvm VM 3");
   await page.getByRole("button", { name: "Back to the wall" }).click();
   await expect(page.getByTestId("focus")).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => window.__fleet!.view().zoom)).toBeNull();
 });
 
 test("a repeated intent id applies once, and both receipts are the same", async ({ page }) => {

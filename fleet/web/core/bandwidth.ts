@@ -27,6 +27,8 @@ export interface StreamAsk {
   height: number;
   /** Not lowered to fit the budget (the opened tile). */
   keep: boolean;
+  /** Drawn dimmed around an opened tile: starts at `lo`, where the dimming hides the coarser picture. */
+  dim?: boolean;
 }
 
 export interface Fitted {
@@ -36,15 +38,15 @@ export interface Fitted {
 }
 
 /**
- * Heights and qualities that fit the budget. Every stream but the kept one moves
- * together, so neighbouring tiles never differ in quality: while the sum is over
+ * Heights and qualities that fit the budget. Dimmed streams start at `lo`. Every stream but the
+ * kept one moves together, so neighbouring tiles never differ in quality: while the sum is over
  * the budget, all of them drop from `std` to `lo`; then all of them step down one
  * height at a time. Streams at the smallest height stay there, so the floors can
  * leave the sum over budget.
  */
 export function fitBandwidth(asks: readonly StreamAsk[], imageAspect: number, budgetBps: number = BANDWIDTH_BUDGET_BPS): Fitted {
   const heights = new Map(asks.map((a) => [a.id, a.height]));
-  const quality = new Map<string, Quality>(asks.map((a) => [a.id, "std"]));
+  const quality = new Map<string, Quality>(asks.map((a) => [a.id, a.dim ? "lo" : "std"]));
   const total = () => asks.reduce((s, a) => s + streamBitrate(a.rect, imageAspect, heights.get(a.id)!, quality.get(a.id)!), 0);
   const movable = asks.filter((a) => !a.keep);
   const smallest = STREAM_HEIGHTS[0];
