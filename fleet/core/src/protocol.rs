@@ -140,6 +140,23 @@ pub struct SlotReport {
     /// IPv4 address is shared by its slots, each forwarded on its own port); 443 when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v4_port: Option<u16>,
+    /// Where the slot runs, as a viewer may be told (`place_label`); never the instance id
+    /// or an address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place: Option<String>,
+}
+
+/// The public label of where a slot runs: `EC2 in <region>`. The one place the wording is
+/// made, for fcvm hosts and EC2 tiles alike. None for text that is not an AWS region name
+/// (lowercase letters, digits and dashes), so nothing else reaches a viewer through it.
+pub fn place_label(region: &str) -> Option<String> {
+    let ok = !region.is_empty()
+        && region.len() <= 32
+        && region.starts_with(|c: char| c.is_ascii_lowercase())
+        && region
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    ok.then(|| format!("EC2 in {region}"))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

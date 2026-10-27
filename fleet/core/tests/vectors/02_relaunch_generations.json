@@ -500,6 +500,7 @@
           "phases": {}
         },
         "phase": "running",
+        "place": null,
         "previous_rect": null,
         "rect": {
           "h": 1.0,
@@ -539,6 +540,7 @@
           }
         },
         "phase": "running",
+        "place": null,
         "previous_rect": null,
         "rect": {
           "h": 1.0,

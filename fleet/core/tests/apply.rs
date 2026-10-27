@@ -185,6 +185,7 @@ fn version_moves_exactly_when_the_view_or_a_receipt_changes() {
                 ipv6: None,
                 ipv4: None,
                 v4_port: None,
+                place: None,
             }),
         });
     }
@@ -536,4 +537,66 @@ fn an_ec2_place_without_an_instance_is_not_counted_as_a_live_gpu() {
         ]))[0],
     );
     assert!(fleet_core::apply::image_settled(&s.fleet));
+}
+
+/// What a viewer's hover card is built from: a running EC2 tile names its GPU (from the
+/// renderer's health), where it runs (the region, never the instance id) and its last launch.
+#[test]
+fn a_running_ec2_tile_reports_its_gpu_place_and_last_launch() {
+    let config = config_with(serde_json::json!({"ec2_max": 1, "fcvm_tiles": 0}));
+    let mut s = State::new(config, 0);
+    for e in events(serde_json::json!([
+        {"type": "tick", "at": 1000},
+        {"type": "ec2", "at": 5000, "report": {"id": "ec2-1", "phase": "running", "generation": 1, "vm": "us-east-1/i-example", "frame_url": "wss://ec2-1.example/frames", "place": "EC2 in us-east-1", "timings": {"total_ms": 4000}}},
+        {"type": "ec2_health", "at": 6000, "report": {"id": "ec2-1", "fps": 30.0, "gpu": {"name": "Tesla T4", "temp_c": 40.0}, "t": 1.0}},
+    ])) {
+        s = apply(s, &e);
+    }
+    let v = view(&s);
+    let t = v
+        .tiles
+        .iter()
+        .find(|t| t.id == "ec2:1")
+        .expect("the EC2 tile");
+    assert_eq!(t.gpu.as_ref().map(|g| g.name.as_str()), Some("Tesla T4"));
+    assert_eq!(t.place.as_deref(), Some("EC2 in us-east-1"));
+    let l = t
+        .last_relaunch
+        .as_ref()
+        .expect("the wake's launch is recorded");
+    assert_eq!((l.clicked_at, l.first_frame_at), (1000, Some(5000)));
+    assert_eq!(l.by, "wake");
+    assert!(!t.place.as_deref().unwrap().contains("i-example"));
+}
+
+/// An fcvm slot that came up at a wake was never relaunched, and still has a last launch.
+#[test]
+fn an_fcvm_tile_that_came_up_at_a_wake_has_a_last_launch_and_its_hosts_place() {
+    let mut s = State::new(Config::default(), 0);
+    s = apply(s, &hello(1000, "h1", 1));
+    s = apply(
+        s,
+        &Event::Agent {
+            at: 9000,
+            host: "h1".into(),
+            msg: AgentMsg::Slot(SlotReport {
+                id: "slot-1".into(),
+                phase: "running".into(),
+                generation: 1,
+                place: Some("EC2 in us-east-1".into()),
+                timings: [("total_ms".to_string(), 3000)].into(),
+                ..Default::default()
+            }),
+        },
+    );
+    let v = view(&s);
+    let t = v
+        .tiles
+        .iter()
+        .find(|t| t.half == Half::Fcvm && t.slot.is_some())
+        .unwrap();
+    assert_eq!(t.place.as_deref(), Some("EC2 in us-east-1"));
+    assert_eq!(t.gpu.as_ref().map(|g| g.name.as_str()), Some("Tesla T4"));
+    let l = t.last_relaunch.as_ref().expect("a last launch");
+    assert_eq!((l.clicked_at, l.first_frame_at), (6000, Some(9000)));
 }

@@ -418,6 +418,7 @@
           "phases": {}
         },
         "phase": "pending",
+        "place": null,
         "previous_rect": null,
         "rect": {
           "h": 1.0,
@@ -451,6 +452,7 @@
           "phases": {}
         },
         "phase": "pending",
+        "place": null,
         "previous_rect": null,
         "rect": {
           "h": 1.0,

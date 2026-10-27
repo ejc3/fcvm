@@ -470,6 +470,7 @@
           "phases": {}
         },
         "phase": "relaunching",
+        "place": null,
         "previous_rect": {
           "h": 0.33333333333333337,
           "w": 1.0,

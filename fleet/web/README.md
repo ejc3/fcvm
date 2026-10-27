@@ -247,7 +247,9 @@ occupies in device pixels, rounded up to one of 72, 90, 108, 144, 180, 216, 270,
 
 **Seams on demand.** With the pointer over the image every tile boundary fades in as a
 1-device-pixel line at 25% white, and the tile under the pointer gets an outline in its
-half's colour and a label (VM, kind, GPU, host, last restart). A long press does the
+half's colour and a label (VM, kind, GPU, place, last restart). A line with nothing to
+report says why: "waiting for EC2 capacity" while the tile is not up, "not reported" or
+"not recorded" once it is. The place is `EC2 in <region>`, never the host name. A long press does the
 same on a touch screen; keyboard users tab into a grid of the tiles and move with the
 arrow keys. All of it is drawn by the page over the frames, never in them.
 

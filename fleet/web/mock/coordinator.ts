@@ -379,6 +379,7 @@ export class MockCoordinator {
         frame_url_v4: t.slot ? this.opts.renderers.frameUrlV4(t.slot) : null,
         gpu: t.gpu,
         host: t.host,
+        place: t.host === null ? null : "EC2 in mock-region",
         vm: t.slot ? `fleet-${t.slot}` : null,
         generation: t.slot ? t.generation : null,
         fps: t.phase === "running" ? 30 : null,

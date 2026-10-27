@@ -30,6 +30,9 @@ pub struct TileView {
     pub frame_url_v4: Option<String>,
     pub gpu: Option<Gpu>,
     pub host: Option<String>,
+    /// Where the tile runs, safe to show a viewer (`EC2 in <region>`): the same wording for
+    /// both halves, unlike `host`, which is the agent's own name. Null until the slot reports it.
+    pub place: Option<String>,
     pub vm: Option<String>,
     pub generation: Option<u64>,
     pub fps: Option<f64>,
@@ -380,6 +383,7 @@ fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) 
             frame_url_v4: None,
             gpu: None,
             host: None,
+            place: None,
             vm: None,
             generation: None,
             fps: None,
@@ -413,6 +417,7 @@ fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) 
             },
             gpu: s.gpu.clone(),
             host: s.host.clone(),
+            place: s.observed.place.clone(),
             vm: s.observed.vm.clone(),
             generation: Some(s.generation),
             fps: s.observed.fps,

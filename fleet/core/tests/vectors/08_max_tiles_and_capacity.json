@@ -315,6 +315,7 @@
         "id": "fcvm:1",
         "last_relaunch": null,
         "phase": "pending",
+        "place": null,
         "previous_rect": null,
         "rect": {
           "h": 0.5,
@@ -343,6 +344,7 @@
         "id": "fcvm:2",
         "last_relaunch": null,
         "phase": "pending",
+        "place": null,
         "previous_rect": null,
         "rect": {
           "h": 0.5,
@@ -371,6 +373,7 @@
         "id": "fcvm:3",
         "last_relaunch": null,
         "phase": "pending",
+        "place": null,
         "previous_rect": null,
         "rect": {
           "h": 0.5,
@@ -399,6 +402,7 @@
         "id": "fcvm:4",
         "last_relaunch": null,
         "phase": "pending",
+        "place": null,
         "previous_rect": null,
         "rect": {
           "h": 0.5,

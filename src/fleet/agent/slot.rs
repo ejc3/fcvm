@@ -40,6 +40,8 @@ pub struct AgentCfg {
     /// The host's public IPv4 address: a slot whose TLS port is published reports it with
     /// that port, its IPv4 path (one address per host, a port per slot).
     pub public_ipv4: Option<String>,
+    /// Where the host runs, for its slots' reports (`protocol::place_label`).
+    pub place: Option<String>,
     pub sysfs_root: PathBuf,
     pub start_timeout: Duration,
     pub stop_grace: Duration,
@@ -166,6 +168,7 @@ impl SlotCtx {
             ipv6: self.ipv6.map(|a| a.to_string()),
             ipv4: self.tls_port.and(self.cfg.public_ipv4.clone()),
             v4_port: self.cfg.public_ipv4.as_ref().and(self.tls_port),
+            place: self.cfg.place.clone(),
         }));
     }
 
