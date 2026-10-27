@@ -81,6 +81,11 @@ export interface FrameStats {
   live: string[];
   /** The mode the drawer drew when it reported: `live` holds that mode's sources. */
   mode: StreamMode;
+  /**
+   * New common times drawn per second over the last 2 s: the rate the wall moves at, which is
+   * its slowest renderer's (core/sync.ts shows every tile at one time).
+   */
+  wallFps?: number;
 }
 
 export type StreamMode = "direct" | "aggregated";
