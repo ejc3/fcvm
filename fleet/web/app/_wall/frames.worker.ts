@@ -43,6 +43,7 @@ import {
   type SyncChoice,
   acquireFrozen,
   type TileFrameStats,
+  accessUnitWithNoReorder,
 } from "../../core/index.ts";
 import type { BenchStats, CaptureResult, DrawSettings, FromWorker, ToWorker, TraceEntry } from "./worker-msgs.ts";
 
@@ -213,7 +214,10 @@ class TileStream {
     this.decodeMeta.set(ts, { crop: this.crop, grid: this.grid });
     if (this.decodeMeta.size > 64) this.decodeMeta.delete(this.decodeMeta.keys().next().value!);
     try {
-      this.decoder.decode(new EncodedVideoChunk({ type: f.keyframe ? "key" : "delta", timestamp: ts, data: f.data }));
+      // An SPS without a VUI bitstream_restriction makes the decoder hold the
+      // level's whole DPB (7 or 8 frames on the wall's tiles) before it outputs
+      // each frame; the rewrite says no frame is reordered (core/sps.ts).
+      this.decoder.decode(new EncodedVideoChunk({ type: f.keyframe ? "key" : "delta", timestamp: ts, data: accessUnitWithNoReorder(f.data) }));
     } catch {
       this.resetDecoder();
     }
