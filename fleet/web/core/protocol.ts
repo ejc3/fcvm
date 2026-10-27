@@ -406,6 +406,11 @@ export interface Claim {
   gpu: string | null;
   phases: Record<string, number>;
   camera: CameraKey[];
+  /**
+   * The camera flies the coordinator's autopilot loop (true) or is the viewer's (false);
+   * null from a coordinator that has no autopilot.
+   */
+  autopilot: boolean | null;
   /** Why it ended, once it has. */
   ended: string | null;
 }
@@ -440,7 +445,7 @@ export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg | HelloMs
 export const DEFAULT_IMAGE_ASPECT = 16 / 9;
 
 /** The intents the page sends, by the coordinator's names (PROTOCOL.md, "Intents"). */
-export const INTENT_NAMES = ["relaunch", "restart_now", "nudge", "word", "light", "claim_gpu", "claim_camera", "release_gpu"] as const;
+export const INTENT_NAMES = ["relaunch", "restart_now", "nudge", "word", "light", "claim_gpu", "claim_camera", "claim_autopilot", "release_gpu"] as const;
 export type IntentName = (typeof INTENT_NAMES)[number];
 
 export interface IntentMsg {
@@ -801,6 +806,7 @@ function parseClaim(v: Obj): Claim {
     gpu: strOrNull(v, "gpu", w),
     phases,
     camera: parseCamera(v, "claim"),
+    autopilot: typeof v["autopilot"] === "boolean" ? v["autopilot"] : null,
     ended: strOrNull(v, "ended", w),
   };
 }

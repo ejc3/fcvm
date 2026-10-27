@@ -12,7 +12,8 @@ pixels, so one viewer on a large screen cannot push a GPU under one sample per p
 Lockup (type above the clock), Skywriting (smoke in the sky) or Landmark (big letters
 standing on a ridge). The three thumbnails are crops of the renderer's
 `shots/text-styles.jpg` (#1178, commit 46feb782), in `public/text-styles/`. A viewer can also borrow one of the wall's GPUs for a
-minute. It runs against a mock fleet (`mock/`) until the coordinator and renderers are
+minute; its camera flies the coordinator's autopilot loop from the first frame until the
+viewer pauses it (the Pause button or Space) or drags, scrolls or presses a camera key. It runs against a mock fleet (`mock/`) until the coordinator and renderers are
 deployed.
 
 ![The wall at rest](docs/screenshots/wall-desktop.jpg)

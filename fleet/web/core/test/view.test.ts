@@ -384,6 +384,7 @@ describe("your own GPU", () => {
     gpu: "Tesla T4",
     phases: {},
     camera: [{ t: 0, x: 0, y: 0, zoom: 1 }],
+    autopilot: true,
     ended: null,
     ...over,
   });
@@ -414,6 +415,42 @@ describe("your own GPU", () => {
     expect(v.own).toBeNull();
     expect(v.ownRefusal!.text).toBe("No GPU is free right now: all 2 GPUs we lend are out; the next comes back in 41 s. Try again in a minute.");
     expect(v.notices).toEqual([]);
+  });
+
+  it("starts on autopilot; a drag pauses it at once and the button flies again", () => {
+    const running = (over: Partial<Claim>) => claim({ phase: "running", frame_url: "ws://example-host:2/frames/claim-1", first_frame_at: EPOCH + 3900, expires_at: EPOCH + 63_900, ...over });
+    let s = reduce(stateWith(fleet()), { type: "intent-sent", intent: makeIntent("own", "claim_gpu"), at: EPOCH + 1000 });
+    s = msg(s, { type: "claim", claim: running({}) });
+    const at = EPOCH + 5000;
+    expect(view(s, at).own!.autopilot).toEqual({ on: true, button: "Pause", state: "Autopilot", key: "Space" });
+    expect(view(s, at).own!.help).toMatch(/^Flying on autopilot\./);
+    // A drag takes the camera: paused at once, before the coordinator answers...
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("d1", "claim_camera", { drag: { yaw_deg: 5, pitch_deg: 0, dive: 0 } }), at });
+    expect(view(s, at).own!.autopilot).toMatchObject({ on: false, button: "Play", state: "Paused" });
+    // ...and a claim message sent before the coordinator applied it does not undo that.
+    s = msg(s, { type: "claim", claim: running({ camera: [{ t: 0, x: 0, y: 0, zoom: 1 }, { t: 9, x: 0.1, y: 0, zoom: 1 }] }) });
+    expect(view(s, at).own!.autopilot!.on).toBe(false);
+    s = msg(s, { type: "claim", claim: running({ autopilot: false }) });
+    expect(s.own.autopilot).toBeNull();
+    expect(view(s, at).own!.autopilot!.on).toBe(false);
+    // The button flies again; a refusal puts the claim's state back.
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("p1", "claim_autopilot", { on: true }), at });
+    expect(view(s, at).own!.autopilot).toMatchObject({ on: true, button: "Pause" });
+    s = msg(s, { type: "receipt", id: "p1", outcome: "refused", reason: "claim_autopilot needs a GPU of your own (claim_gpu)", version: 3 });
+    expect(view(s, at).own!.autopilot!.on).toBe(false);
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("p2", "claim_autopilot", { on: true }), at });
+    s = msg(s, { type: "claim", claim: running({ autopilot: true }) });
+    expect(view(s, at).own!.autopilot!.on).toBe(true);
+    expect(s.own.autopilot).toBeNull();
+  });
+
+  it("shows no autopilot control for a coordinator without one, or once the minute is over", () => {
+    let s = reduce(stateWith(fleet()), { type: "intent-sent", intent: makeIntent("own", "claim_gpu"), at: EPOCH + 1000 });
+    s = msg(s, { type: "claim", claim: claim({ phase: "running", first_frame_at: EPOCH + 3900, autopilot: null }) });
+    expect(view(s, EPOCH + 5000).own!.autopilot).toBeNull();
+    expect(view(s, EPOCH + 5000).own!.help).toBe("Drag to turn the camera, scroll to move closer. Arrow keys and plus or minus work too.");
+    s = msg(s, { type: "claim", claim: claim({ phase: "ended", first_frame_at: EPOCH + 3900, ended: "released" }) });
+    expect(view(s, EPOCH + 9000).own!.autopilot).toBeNull();
   });
 
   it("ignores a claim message it did not ask for", () => {

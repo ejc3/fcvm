@@ -105,49 +105,83 @@ impl Scene {
         (unix_ms as f64 - self.epoch_unix_ms as f64) / 1000.0
     }
 
-    /// The camera at scene time `t`: linear between keyframes, held before the first and
-    /// after the last.
+    /// The camera at scene time `t`, as the renderer draws it (fleet/renderer/src/scene.cpp
+    /// `camera_at`): Catmull-Rom on `pos` and `look` with tangents scaled to each segment
+    /// and zero next to a hold (two equal consecutive keyframes) or an end, `fov_deg`
+    /// linear, held before the first keyframe and after the last. A steer starts from
+    /// this pose, so taking over a moving camera starts where its frames are.
     pub fn camera_at(&self, t: f64) -> Keyframe {
         let k = &self.camera;
         if k.is_empty() {
             return Scene::new(0).camera[0].clone();
         }
-        if t <= k[0].t {
-            return Keyframe {
-                t,
-                intent: None,
-                ..k[0].clone()
-            };
-        }
-        for w in k.windows(2) {
-            let (a, b) = (&w[0], &w[1]);
-            if t <= b.t {
-                let span = b.t - a.t;
-                let f = if span > 0.0 { (t - a.t) / span } else { 1.0 };
-                return Keyframe {
-                    t,
-                    pos: lerp3(a.pos, b.pos, f),
-                    look: lerp3(a.look, b.look, f),
-                    fov_deg: a.fov_deg + (b.fov_deg - a.fov_deg) * f,
-                    intent: None,
-                };
-            }
-        }
-        Keyframe {
+        let held = |kf: &Keyframe| Keyframe {
             t,
             intent: None,
-            ..k.last().unwrap().clone()
+            ..kf.clone()
+        };
+        let n = k.len();
+        if t <= k[0].t {
+            return held(&k[0]);
+        }
+        if t >= k[n - 1].t {
+            return held(&k[n - 1]);
+        }
+        let i = k.partition_point(|x| x.t <= t) - 1;
+        let (k1, k2) = (&k[i], &k[i + 1]);
+        if same_pose(k1, k2) {
+            return held(k1);
+        }
+        let dt = k2.t - k1.t;
+        let u = (t - k1.t) / dt;
+        let ease_in = i == 0 || same_pose(&k[i - 1], k1);
+        let ease_out = i + 2 >= n || same_pose(k2, &k[i + 2]);
+        let h00 = 2.0 * u * u * u - 3.0 * u * u + 1.0;
+        let h10 = u * u * u - 2.0 * u * u + u;
+        let h01 = -2.0 * u * u * u + 3.0 * u * u;
+        let h11 = u * u * u - u * u;
+        let interp = |get: fn(&Keyframe) -> [f64; 3]| {
+            let mut o = [0.0; 3];
+            for (c, out) in o.iter_mut().enumerate() {
+                let (p1, p2) = (get(k1)[c], get(k2)[c]);
+                let m1 = if ease_in {
+                    0.0
+                } else {
+                    let k0 = &k[i - 1];
+                    (p2 - get(k0)[c]) / (k2.t - k0.t) * dt
+                };
+                let m2 = if ease_out {
+                    0.0
+                } else {
+                    let k3 = &k[i + 2];
+                    (get(k3)[c] - p1) / (k3.t - k1.t) * dt
+                };
+                *out = h00 * p1 + h10 * m1 + h01 * p2 + h11 * m2;
+            }
+            o
+        };
+        Keyframe {
+            t,
+            pos: interp(|x| x.pos),
+            look: interp(|x| x.look),
+            fov_deg: k1.fov_deg + (k2.fov_deg - k1.fov_deg) * u,
+            intent: None,
         }
     }
 
     /// Replace the path from `now` on with a move from the current camera to `to`, easing
     /// over `DRAG_EASE_SECS`, and drop history older than `KEYFRAME_HISTORY_SECS`.
     pub fn steer(&mut self, now: f64, to: Keyframe) {
+        self.steer_over(now, to, DRAG_EASE_SECS);
+    }
+
+    /// `steer`, easing over `ease` seconds.
+    pub fn steer_over(&mut self, now: f64, to: Keyframe, ease: f64) {
         let here = self.camera_at(now);
         self.camera.retain(|k| k.t < now);
         self.camera.push(here);
         self.camera.push(Keyframe {
-            t: now + DRAG_EASE_SECS,
+            t: now + ease,
             ..to
         });
         self.trim_history(now);
@@ -165,12 +199,9 @@ impl Scene {
     }
 }
 
-fn lerp3(a: [f64; 3], b: [f64; 3], f: f64) -> [f64; 3] {
-    [
-        a[0] + (b[0] - a[0]) * f,
-        a[1] + (b[1] - a[1]) * f,
-        a[2] + (b[2] - a[2]) * f,
-    ]
+/// The renderer's hold test: the same position, look point and field of view.
+pub fn same_pose(a: &Keyframe, b: &Keyframe) -> bool {
+    a.pos == b.pos && a.look == b.look && a.fov_deg == b.fov_deg
 }
 
 /// Turn the camera by `yaw_deg` about the world up axis and `pitch_deg` up or down, then

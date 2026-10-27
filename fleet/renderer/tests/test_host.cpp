@@ -69,7 +69,56 @@ static Scene two_holds() {
   return s;
 }
 
+// The own-GPU autopilot (fleet/core/src/autopilot.rs) as the coordinator hands it to a
+// renderer: fleet/core/tests/autopilot_lap.json holds one lap of keyframes, the same
+// path paused part way, and the pose the coordinator computes at every quarter second.
+// The coordinator starts a pause or a drag from the pose it computes, so it must be the
+// pose this renderer draws; and the eye must clear the ground by more than the 60 m the
+// renderer would otherwise lift it, which would move the camera off the path.
+static void check_autopilot_lap() {
+  std::string me = __FILE__;
+  std::string dir = me.substr(0, me.find_last_of('/') + 1);
+  std::ifstream f(dir + "../../core/tests/autopilot_lap.json");
+  std::stringstream ss;
+  ss << f.rdbuf();
+  CHECK(f.good() && ss.str().size() > 0, "fleet/core/tests/autopilot_lap.json is readable");
+  if (ss.str().empty()) return;
+  Json j = Json::parse(ss.str());
+  const V4* tab = host_noise().tab.data();
+  double min_clear = 1e9, worst_t = 0, max_err = 0;
+  int samples = 0;
+  for (const char* part : {"lap", "paused"}) {
+    std::vector<Keyframe> kf;
+    for (const Json& k : j.at(part).at("camera").array("camera")) {
+      Keyframe x{};
+      x.t = k.at("t").number("t");
+      for (int c = 0; c < 3; c++) {
+        x.pos[c] = k.at("pos").arr[c].num;
+        x.look[c] = k.at("look").arr[c].num;
+      }
+      x.fov_deg = k.at("fov_deg").number("fov_deg");
+      kf.push_back(x);
+    }
+    for (const Json& s : j.at(part).at("samples").array("samples")) {
+      double t = s.at("t").number("t");
+      CamPose p = camera_at(kf, t);
+      for (int c = 0; c < 3; c++) {
+        max_err = std::max(max_err, std::fabs(p.pos[c] - s.at("pos").arr[c].num));
+        max_err = std::max(max_err, std::fabs(p.look[c] - s.at("look").arr[c].num));
+      }
+      max_err = std::max(max_err, std::fabs(p.fov_deg - s.at("fov_deg").number("fov_deg")));
+      double ground = std::max(0.0, (double)surface_h(v2((float)p.pos[0], (float)p.pos[2]), 9, tab));
+      if (p.pos[1] - ground < min_clear) { min_clear = p.pos[1] - ground; worst_t = t; }
+      samples++;
+    }
+  }
+  CHECK(samples > 200, "%d samples", samples);
+  CHECK(max_err < 1e-9, "the coordinator's camera differs from the renderer's by %g", max_err);
+  CHECK(min_clear > 0.15, "the eye is %.3f km above the ground at t=%.2f", min_clear, worst_t);
+}
+
 int main() {
+  check_autopilot_lap();
   // --- WebSocket handshake (RFC 6455 section 1.3 example)
   CHECK(ws_accept("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "got %s",
         ws_accept("dGhlIHNhbXBsZSBub25jZQ==").c_str());

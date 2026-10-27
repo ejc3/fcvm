@@ -303,6 +303,14 @@ h1, h2, h3, p { margin: 0; }
 .own .clocks .value { font: 600 32px/1.1 var(--mono); font-variant-numeric: tabular-nums; color: var(--fcvm); }
 .own .countdown-own .value { color: var(--text); }
 .own footer { display: flex; align-items: center; gap: 10px 20px; flex-wrap: wrap; }
+.own .ap { display: flex; align-items: center; gap: 10px; }
+.own .ap .btn { min-width: 92px; justify-content: center; gap: 8px; }
+.own .ap-state { display: inline-flex; align-items: center; gap: 7px; font: 600 14px var(--mono); color: var(--muted); }
+.own .ap-state::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.own .ap.on .ap-state { color: var(--fcvm); }
+.own .ap.on .ap-state::before { background: var(--fcvm); animation: ap-pulse 1.6s ease-in-out infinite; }
+@keyframes ap-pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .own .ap.on .ap-state::before { animation: none; } }
 .own .cam { display: flex; gap: 6px; }
 .own .cam .btn { min-width: 44px; justify-content: center; padding: 0 10px; font-size: 18px; }
 .own .help, .own .latency { font-size: 14px; color: var(--muted); }

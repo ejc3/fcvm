@@ -1,0 +1,494 @@
+{
+  "config": {
+    "claim_secs": 60,
+    "max_tiles": 2
+  },
+  "description": "A viewer's own GPU flies its autopilot from the first frame: claim_autopilot off brings the camera to rest where it is (the last keyframe is the pause's), ticks leave a paused camera alone, on flies again from there (the join's keyframe carries the intent and flight keyframes follow it), and a viewer without a GPU or a non-boolean `on` is refused.",
+  "events": [
+    {
+      "at": 1000,
+      "host": "h1",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 8,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:02:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:03:00.0"
+          }
+        ],
+        "host": "h1",
+        "type": "hello"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20003/frames",
+        "generation": 1,
+        "id": "slot-3",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-3"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2500,
+      "client": "198.51.100.20",
+      "type": "viewer_joined",
+      "viewer": "v1"
+    },
+    {
+      "at": 2500,
+      "client": "198.51.100.21",
+      "type": "viewer_joined",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 3000,
+      "client": "198.51.100.20",
+      "id": "c1",
+      "name": "claim_gpu",
+      "secret": "token-a",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "at": 9000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20003/frames",
+        "generation": 2,
+        "id": "slot-3",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-3"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 20000,
+      "type": "tick"
+    },
+    {
+      "args": {
+        "on": false
+      },
+      "at": 20300,
+      "client": "198.51.100.20",
+      "id": "p1",
+      "name": "claim_autopilot",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "at": 30000,
+      "type": "tick"
+    },
+    {
+      "args": {
+        "on": true
+      },
+      "at": 30500,
+      "client": "198.51.100.20",
+      "id": "p2",
+      "name": "claim_autopilot",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "on": false
+      },
+      "at": 30600,
+      "client": "198.51.100.21",
+      "id": "p3",
+      "name": "claim_autopilot",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "on": "yes"
+      },
+      "at": 30700,
+      "client": "198.51.100.20",
+      "id": "p4",
+      "name": "claim_autopilot",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "at": 31000,
+      "type": "tick"
+    }
+  ],
+  "expect": [
+    {
+      "after": 4,
+      "checks": {
+        "/assign/h1/2/private_camera/0/intent": "c1",
+        "/assign/h1/2/private_camera/1": null,
+        "/receipts/c1/outcome": "committed"
+      },
+      "note": "restoring: the camera waits at the loop's start"
+    },
+    {
+      "after": 7,
+      "checks": {
+        "/assign/h1/2/private_camera/12/intent": "p1",
+        "/assign/h1/2/private_camera/13": null,
+        "/receipts/p1/outcome": "committed"
+      },
+      "note": "flying until the pause at 20.3: the camera comes to rest a second later on the pause keyframe, the last one"
+    },
+    {
+      "after": 8,
+      "checks": {
+        "/assign/h1/2/private_camera/12/intent": "p1",
+        "/assign/h1/2/private_camera/13": null,
+        "/receipts/p1/outcome": "committed"
+      },
+      "note": "a tick leaves a paused camera alone"
+    },
+    {
+      "after": 9,
+      "checks": {
+        "/assign/h1/2/private_camera/2/t": 30.5,
+        "/assign/h1/2/private_camera/3/intent": "p2",
+        "/assign/h1/2/private_camera/3/t": 32.5,
+        "/assign/h1/2/private_camera/4/t": 33.5,
+        "/receipts/p2/outcome": "committed"
+      },
+      "note": "from where it rests at 30.5 back to the loop by 32.5, then a keyframe a second"
+    },
+    {
+      "after": 10,
+      "checks": {
+        "/receipts/p3/reason": "claim_autopilot needs a GPU of your own (claim_gpu)"
+      }
+    },
+    {
+      "after": 11,
+      "checks": {
+        "/receipts/p4/reason": "args.on must be true or false"
+      }
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "args": {},
+        "at": 3000,
+        "id": "c1",
+        "name": "claim_gpu",
+        "outcome": "committed",
+        "summary": "claim-1 on slot-3",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "on": false
+        },
+        "at": 20300,
+        "id": "p1",
+        "name": "claim_autopilot",
+        "outcome": "committed",
+        "summary": "autopilot off",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "on": true
+        },
+        "at": 30500,
+        "id": "p2",
+        "name": "claim_autopilot",
+        "outcome": "committed",
+        "summary": "autopilot on",
+        "viewer": "v1"
+      },
+      {
+        "args": {
+          "on": false
+        },
+        "at": 30600,
+        "id": "p3",
+        "name": "claim_autopilot",
+        "outcome": "refused",
+        "summary": "claim_autopilot needs a GPU of your own (claim_gpu)",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "on": "yes"
+        },
+        "at": 30700,
+        "id": "p4",
+        "name": "claim_autopilot",
+        "outcome": "refused",
+        "summary": "args.on must be true or false",
+        "viewer": "v1"
+      }
+    ],
+    "aggregates": [
+      {
+        "frame_url": null,
+        "frame_url_v4": null,
+        "half": "fcvm",
+        "host": "h1",
+        "id": "agg:h1",
+        "rect": {
+          "h": 1.0,
+          "w": 1.0,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "tiles": [
+          "fcvm:1",
+          "fcvm:2"
+        ]
+      }
+    ],
+    "borrow": {
+      "cap": 1,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "budget": null,
+    "budget_from_t": null,
+    "claims": [
+      {
+        "borrowed": null,
+        "claimed_at": 3000,
+        "click_to_first_frame_ms": 6000,
+        "expires_at": 63000,
+        "first_frame_at": 9000,
+        "gpu": {
+          "name": "Tesla T4",
+          "sbdf": "0000:03:00.0"
+        },
+        "host": "h1",
+        "session": "claim-1",
+        "slot": "slot-3",
+        "viewer": "v1"
+      }
+    ],
+    "cooldown_until": null,
+    "counters": {
+      "restores": 1,
+      "restores_last_hour": 1,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
+    "failures": [],
+    "fleet": {
+      "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
+      "fcvm_gpus": 3,
+      "gpus": 3,
+      "hosts": [
+        {
+          "arch": "x86_64",
+          "draining": false,
+          "gpus": [
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:01:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:02:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:03:00.0"
+            }
+          ],
+          "name": "h1"
+        }
+      ],
+      "max_tiles": 2,
+      "n": 2,
+      "power": {
+        "asleep_since": null,
+        "hosts": [],
+        "idle_since": null,
+        "last_wake": null,
+        "state": "awake",
+        "wakes": [],
+        "woke_at": null
+      },
+      "standby": [],
+      "standby_ready": 0,
+      "warming": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": {
+        "h": 1.0,
+        "w": 1.0,
+        "x": 0.0,
+        "y": 0.0
+      },
+      "from_frame": 75,
+      "from_t": 2.5,
+      "generation": 1
+    },
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": null,
+      "closes_at": 35000,
+      "holding": "horizon",
+      "holding_label": "High above: the curve of the horizon",
+      "leading": "dawn-valley",
+      "next": null,
+      "next_hold_at": 37000,
+      "next_label": null,
+      "opened_at": 20000,
+      "targets": [
+        {
+          "arrive_at": 55000,
+          "id": "dawn-valley",
+          "label": "Dawn in the valley",
+          "votes": 0
+        },
+        {
+          "arrive_at": 55000,
+          "id": "peak-seam-low-sun",
+          "label": "The peak at a low sun",
+          "votes": 0
+        },
+        {
+          "arrive_at": 55000,
+          "id": "peak-close",
+          "label": "Close to the peak",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [],
+    "relaunch_all": null,
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 70.0,
+          "look": [
+            -75.0,
+            28.0,
+            -170.0
+          ],
+          "pos": [
+            -30.0,
+            38.0,
+            -60.0
+          ],
+          "t": 30.0
+        },
+        {
+          "fov_deg": 70.0,
+          "look": [
+            -75.0,
+            28.0,
+            -170.0
+          ],
+          "pos": [
+            -30.0,
+            38.0,
+            -60.0
+          ],
+          "t": 37.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.45,
+      "words": []
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": null
+    },
+    "tiles": [
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": null,
+        "frame_url_v4": null,
+        "generation": 1,
+        "gpu": {
+          "name": "Tesla T4",
+          "sbdf": "0000:01:00.0"
+        },
+        "gpu_stats": null,
+        "half": "fcvm",
+        "host": "h1",
+        "id": "fcvm:1",
+        "last_relaunch": null,
+        "phase": "pending",
+        "place": null,
+        "previous_rect": null,
+        "rect": {
+          "h": 1.0,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "slot": "slot-1",
+        "vm": null
+      },
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": null,
+        "frame_url_v4": null,
+        "generation": 1,
+        "gpu": {
+          "name": "Tesla T4",
+          "sbdf": "0000:02:00.0"
+        },
+        "gpu_stats": null,
+        "half": "fcvm",
+        "host": "h1",
+        "id": "fcvm:2",
+        "last_relaunch": null,
+        "phase": "pending",
+        "place": null,
+        "previous_rect": null,
+        "rect": {
+          "h": 1.0,
+          "w": 0.5,
+          "x": 0.5,
+          "y": 0.0
+        },
+        "slot": "slot-2",
+        "vm": null
+      }
+    ],
+    "viewers": {
+      "active": 2,
+      "count": 2
+    }
+  },
+  "start_ms": 0
+}
