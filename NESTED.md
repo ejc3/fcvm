@@ -146,6 +146,7 @@ What the repo's own evidence supports (#664, commit fc81ab1c):
 - `/dev/kvm` is present in an x86_64 guest. `test_kvm_available_in_vm` runs on both architectures and checks that the node exists, is a character device, and is readable and writable from the guest and from the container. It does not open KVM or start an inner VM, and it does not pass `--no-snapshot`, so it says nothing about whether KVM is usable there.
 - Running fcvm inside that guest works only when the outer VM cold booted. In CI run 27323861536 the five L2 tests passed on the x64 runner with the snapshot cache disabled and failed with it enabled: an outer VM restored from the snapshot cache has no usable VMX, and the inner VM's start times out.
 - Start the outer VM with `--no-snapshot` (or `FCVM_NO_SNAPSHOT=1`) so it never restores from the cache.
+- The cause was Firecracker not saving KVM's nested state: Linux executes VMXON when kvm_intel loads, and a restore without that state leaves the guest's next VMX instruction faulting (its kernel oopses in `kvm_spurious_fault`). The `phone` profile's Firecracker (`agent/vfio-nested-state` in the fork) saves and restores it, and `make phone-test` runs a VM inside a restored phone VM (docs/fleet/ARCHITECTURE.md, "Phones mode"). The `nested` profile's x86 Firecracker does not have the change yet.
 - The L2 tests are compiled for aarch64 only, so CI does not cover the x86_64 inner-VM flow.
 
 ## Known Issues
