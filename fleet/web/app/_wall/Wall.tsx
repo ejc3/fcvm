@@ -19,7 +19,6 @@ import {
   tileAt,
   ZOOM_MS,
   ZOOM_SHEET_W,
-  sheetClears,
   zoomInsetsFor,
   readingOrder,
   screenToImage,
@@ -368,12 +367,10 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   const zoom = useZoomStep(state.ui.focusId, reducedMotion);
   const zoomArea = useMemo(() => (viewport.w > 0 ? { x: 0, y: 0, w: viewport.w, h: viewport.h } : null), [viewport.w, viewport.h]);
   const zoomInsets = useMemo(() => zoomInsetsFor(phone, phone ? 0 : ZOOM_SHEET_W + 16), [phone]);
-  // The sheet over an opened tile starts open on a wide screen where the tile lies clear of it, and
-  // folded otherwise (always to its handle on a phone), until the viewer opens or folds it.
+  // The sheet with an opened tile's details starts open, beside it on a wide screen and under it on a
+  // phone, until the viewer folds it.
   const [sheetChoice, setSheetChoice] = useState<boolean | null>(null);
-  const focusRect = state.accepted?.tiles.find((t) => t.id === state.ui.focusId)?.rect ?? null;
-  const sheetOpen =
-    sheetChoice ?? (!phone && zoomArea !== null && focusRect !== null && sheetClears(zoomArea, focusRect, state.accepted!.image_aspect, zoomInsets));
+  const sheetOpen = sheetChoice ?? true;
   const view = useMemo(
     () =>
       wallView({

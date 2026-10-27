@@ -5,7 +5,6 @@ import {
   fitContain,
   layoutMosaic,
   layoutZoom,
-  sheetClears,
   zoomTarget,
   tileAspectOf,
   MAX_TILE_PX,
@@ -130,13 +129,12 @@ describe("one tile opened: the image zoomed around it", () => {
     const flat = zoomTarget({ x: 0, y: 0, w: 1600, h: 1000 }, fleet(1, 2).tiles[0]!.rect, 16 / 9, desk);
     expect(flat.w).toBeCloseTo(1552, 6);
     expect(flat.x).toBeCloseTo(24, 6);
-    // The sheet starts open only where the tile at full size lies clear of it.
-    expect(sheetClears(stage, r, 16 / 9, desk)).toBe(true);
-    expect(sheetClears({ x: 0, y: 0, w: 1600, h: 1000 }, fleet(1, 2).tiles[0]!.rect, 16 / 9, desk)).toBe(false);
     // A phone: full width, between the bar and the sheet's handle.
-    const phone = zoomTarget({ x: 0, y: 0, w: 390, h: 844 }, fleet(1, 2).tiles[0]!.rect, 16 / 9, { top: 56, right: 0, bottom: 76, left: 0, sheet: 0 });
+    // A phone: full width, at the top under the bar, so the sheet below it covers none of it.
+    const phone = zoomTarget({ x: 0, y: 0, w: 390, h: 844 }, fleet(1, 2).tiles[0]!.rect, 16 / 9, { top: 56, right: 0, bottom: 240, left: 0, sheet: 0, align: "top" });
     expect(phone.w).toBe(390);
     expect(phone.h).toBeCloseTo((390 * 9) / 16, 6);
+    expect(phone.y).toBe(56);
   });
 
   it("puts the opened tile on its target and every other tile where its wall rectangle says, sharing its edges", () => {

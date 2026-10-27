@@ -1,6 +1,6 @@
 import { expect, test, devices, type Page } from "@playwright/test";
 import { seconds, thousands, utcDate } from "../core/format.ts";
-import { DETAIL_TILE_PX, layoutMosaic, sheetClears, streamHeightFor, zoomTarget } from "../core/layout.ts";
+import { DETAIL_TILE_PX, layoutMosaic, streamHeightFor, zoomTarget } from "../core/layout.ts";
 import { ZOOM_DIM_NEAR, ZOOM_SHEET_W, zoomInsetsFor } from "../core/view.ts";
 import { streamBitrate } from "../core/bandwidth.ts";
 import { COORD, admin, fleetNow, focusError, mockState, openWall, raceOver, seamReport, setSkew, setTimeOfDay } from "./helpers.ts";
@@ -425,15 +425,9 @@ test("an opened VM zooms to fill the screen at its detail height, with the tiles
   // Dimmed: at most 1 - ZOOM_DIM_NEAR of the brightness the same scene has in the opened tile.
   expect(fe.around).toBeLessThan(1 - ZOOM_DIM_NEAR + 0.08);
   expect(fe.around).toBeGreaterThan(0.05);
-  // The sheet starts open only where the tile lies clear of it; it folds away and comes back, and never moves the picture.
-  const clears = sheetClears({ x: 0, y: 0, w: vp.width, h: vp.height }, r, 16 / 9, zoomInsetsFor(false, ZOOM_SHEET_W + 16));
+  // The sheet starts open; it folds away and comes back, and never moves the picture.
   const sheet = page.getByTestId("focus-sheet");
-  if (clears) await expect(sheet).toHaveClass(/open/);
-  else {
-    await expect(sheet).not.toHaveClass(/open/);
-    await page.getByTestId("sheet-toggle").click();
-    await expect(sheet).toHaveClass(/open/);
-  }
+  await expect(sheet).toHaveClass(/open/);
   await page.getByTestId("sheet-hide").click();
   await expect(sheet).not.toHaveClass(/open/);
   expect(await page.evaluate(() => window.__fleet!.view().plan.zoom!.box)).toEqual(z.box);
@@ -460,6 +454,44 @@ test("an opened VM zooms to fill the screen at its detail height, with the tiles
   await page.getByRole("button", { name: "Back to the wall" }).click();
   await expect(page.getByTestId("focus")).toHaveCount(0);
   await expect.poll(() => page.evaluate(() => window.__fleet!.view().zoom)).toBeNull();
+});
+
+test("an opened VM shows its details, GPU graph and restart timeline on screen without a click, on a desktop and on a phone", async ({ page, browser }) => {
+  // `fits`: the whole sheet is on screen without scrolling (a laptop-sized window). A phone's sheet scrolls.
+  const check = async (p: Page, fits: boolean) => {
+    const t = await p.evaluate(() => window.__fleet!.view().tiles.find((x) => x.id === "fcvm:3")!.box!);
+    await p.mouse.click(t.x + t.w / 2, t.y + t.h / 2);
+    await expect(p.getByTestId("focus")).toBeVisible();
+    await expect.poll(() => p.evaluate(() => window.__fleet!.view().zoom?.dim ?? 0)).toBe(1);
+    const sheet = p.getByTestId("focus-sheet");
+    await expect(sheet).toHaveClass(/open/);
+    expect(await sheet.evaluate((el) => getComputedStyle(el).opacity)).toBe("1");
+    expect(await sheet.evaluate((el) => el.hasAttribute("inert") || el.querySelector("[inert]") !== null)).toBe(false);
+    for (const id of ["readings", "restart-one"]) await expect(p.getByTestId(id), id).toBeInViewport();
+    if (!fits) await p.getByTestId("timeline-total").scrollIntoViewIfNeeded();
+    await expect(p.getByTestId("timeline-total")).toBeInViewport();
+    await expect(p.locator(".zoom .phase-bar")).toBeInViewport();
+    await expect(p.locator(".zoom dl")).toContainText("GPU");
+    await expect(p.locator(".zoom dl")).toContainText("Up for");
+    // The GPU graph: a sparkline per reading once two samples have arrived.
+    await expect.poll(() => p.locator('[data-testid="readings"] polyline').count(), { timeout: 15_000 }).toBeGreaterThan(0);
+    await expect(p.locator('[data-testid="readings"] polyline').first()).toBeInViewport();
+    // The picture is not under the sheet's top edge: the opened VM is still on screen beside or above it.
+    const box = await p.evaluate(() => window.__fleet!.view().plan.zoom!.box!);
+    const sb = (await sheet.boundingBox())!;
+    expect(box.y).toBeLessThan(sb.y + sb.height);
+  };
+  await openWall(page, 15);
+  await check(page, true);
+  const ctx = await browser.newContext({ ...devices["iPhone 13"], deviceScaleFactor: 1 });
+  const phone = await ctx.newPage();
+  await openWall(phone, 3);
+  await check(phone, false);
+  // On a phone the sheet starts below the picture, so the whole opened VM stays in view.
+  const box = await phone.evaluate(() => window.__fleet!.view().plan.zoom!.box!);
+  const sb = (await phone.getByTestId("focus-sheet").boundingBox())!;
+  expect(box.y + box.h).toBeLessThanOrEqual(sb.y + 1);
+  await ctx.close();
 });
 
 test("a folded side sheet leaves the keyboard path, and focus goes back to its Details button", async ({ page }) => {
