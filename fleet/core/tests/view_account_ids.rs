@@ -32,6 +32,19 @@ fn events() -> Vec<Event> {
         }
     }
     assert!(replaced > 0, "the vector carries no error to replace");
+    // A word whose text check failed with the same error: its reason reaches the public
+    // actions feed and the viewer's receipt.
+    let last = vector["events"].as_array().unwrap().last().unwrap()["at"]
+        .as_u64()
+        .unwrap();
+    vector["events"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "type": "intent", "at": last + 1, "viewer": "v-aws", "client": "198.51.100.9",
+            "id": "w-aws", "name": "word", "args": {"text": "hello"},
+            "check": {"verdict": "error", "reason": aws_error(), "sky": []}
+        }));
     serde_json::from_value(vector["events"].clone()).unwrap()
 }
 
@@ -40,7 +53,11 @@ fn the_view_shows_an_aws_error_without_its_account_id() {
     let state = events()
         .iter()
         .fold(State::new(Config::default(), 0), apply);
-    let text = serde_json::to_string(&view(&state)).unwrap();
+    let text = format!(
+        "{} {}",
+        serde_json::to_string(&view(&state)).unwrap(),
+        serde_json::to_string(&state.receipts).unwrap()
+    );
     assert!(
         text.contains("RequestLimitExceeded"),
         "the error's text is gone from the view: {text}"
