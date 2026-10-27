@@ -5548,3 +5548,47 @@ async fn the_broadcast_layout_is_the_whole_image_of_every_placed_tile() {
         .expect("no layout once the host is gone")
         .unwrap();
 }
+
+/// A tile lent to a visitor ("Your own GPU") draws that visitor's private camera over the
+/// whole image: the broadcast keeps its rectangle black instead of streaming it.
+#[tokio::test]
+async fn the_broadcast_never_streams_a_borrowed_tile() {
+    let (url, handle) = coordinator(allow_all()).await;
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 2);
+    agent.assign().await;
+    agent.report("slot-1", "running", 1);
+    agent.report("slot-2", "running", 1);
+    let mut a = Viewer::connect_from(&url, Some("198.51.100.1")).await;
+    a.until(|s| s["tiles"][1]["phase"] == "running").await;
+    a.intent("c1", "claim_gpu", json!({})).await;
+    assert_eq!(a.receipt("c1").await["outcome"], "committed");
+    loop {
+        if agent.assign().await[1].private_camera.is_some() {
+            break;
+        }
+    }
+    // The private VM is up and has its frames.
+    agent.report("slot-2", "running", 2);
+    a.message_where("claim", |m| m["claim"]["phase"] == "running")
+        .await;
+    let mut layouts = handle.broadcast_layout.clone();
+    let l = tokio::time::timeout(
+        Duration::from_secs(10),
+        layouts.wait_for(|l| {
+            l.as_ref()
+                .is_some_and(|l| l.tiles.iter().any(|t| t.id == "slot-1" && t.url.is_some()))
+        }),
+    )
+    .await
+    .expect("a broadcast layout")
+    .unwrap()
+    .clone()
+    .unwrap();
+    for t in &l.tiles {
+        assert!(
+            t.id != "slot-2" || t.url.is_none(),
+            "the broadcast streams the borrowed tile: {:?}",
+            t.url
+        );
+    }
+}
