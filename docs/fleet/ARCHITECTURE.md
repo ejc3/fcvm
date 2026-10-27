@@ -44,8 +44,9 @@ recording:
   rendered by the GPUs from `t`, continuous across tile seams.
 - **Input to pixels, measured.** After a camera drag the page shows the time from the
   viewer's input to the first frame that reflects it.
-- **A stats switch.** It overlays each tile with frames per second, frame age (now minus
-  the frame's `t`, against a clock the page syncs with the coordinator), the GPU's
+- **A stats switch.** It overlays each tile with frames per second, frame age (when the
+  page drew the frame minus its `t`, against a clock the page syncs with the coordinator,
+  with when the frame arrived and when it was decoded), the GPU's
   temperature, power draw and utilization (`nvidia-smi`, sampled by the renderer once a
   second), and the VM's name and time since its last relaunch.
 - **Kill one.** Clicking a tile relaunches its VM; the square goes dark for everyone.

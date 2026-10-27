@@ -32,7 +32,8 @@ import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type Aggregate, type 
 import { KIND_TAG, NOT_AWAKE_NOTE, raceOnImage, ratioText, runningRace, scoreView, type RaceOnImage, type ScoreView } from "./race.ts";
 import { sceneUnixMs } from "./scene.ts";
 import { reelView, type ReelMeta, type ReelView } from "./reel.ts";
-import type { ClientState, FrameStats, GpuSample, Notice, StreamMode } from "./store.ts";
+import type { ClientState, FrameStats, GpuSample, Notice, StreamMode, TileFrameStats } from "./store.ts";
+import { sceneAgeMs } from "./lag.ts";
 
 export const SITE = "fcvm.dev";
 export const TITLE = "Every GPU, live";
@@ -271,6 +272,25 @@ export function hoverLabel(t: Tile, name: string, rms: number | null): HoverLabe
   };
 }
 
+/**
+ * A tile's frame ages on the coordinator's clock, ms: when its frames arrived, came out of
+ * the decoder and were first drawn in step (p50 of the drawer's recent frames), and the
+ * age shown on its card: the drawn age, or before any draw, the newest frame's age when
+ * the drawer reported (not now: the report can be up to 500 ms old).
+ */
+export function frameAges(
+  fs: TileFrameStats,
+  s: ClientState,
+  epochUnixMs: number,
+): { shown: number; arrive: number | null; decoded: number | null; drawn: number | null } {
+  const off = s.clock.offsetMs ?? 0;
+  const lag = fs.lag;
+  const at = (x: number | null | undefined) => (x === null || x === undefined ? null : sceneAgeMs(x, off, epochUnixMs));
+  const drawn = at(lag?.drawn);
+  const newest = fs.newestT === null || s.frames === null ? null : serverNow(s.clock, s.frames.at) - sceneUnixMs(epochUnixMs, fs.newestT);
+  return { shown: drawn ?? newest ?? 0, arrive: at(lag?.arrive), decoded: at(lag?.decoded), drawn };
+}
+
 function tileView(
   t: Tile,
   s: ClientState,
@@ -308,8 +328,11 @@ function tileView(
   const stats: string[] = [];
   if (fs && fs.newestT !== null) {
     stats.push(`${Math.round(fs.fps)} fps · ${fs.height}p`);
-    const age = srvNow - sceneUnixMs(st.scene.epoch_unix_ms, fs.newestT);
-    stats.push(`frame age ${fmt.millis(Math.max(0, age))}`);
+    const ages = frameAges(fs, s, st.scene.epoch_unix_ms);
+    stats.push(`frame age ${fmt.millis(Math.max(0, ages.shown))}`);
+    if (ages.arrive !== null && ages.decoded !== null && ages.drawn !== null) {
+      stats.push(`arrives ${fmt.millis(Math.max(0, ages.arrive))} · decoded ${fmt.millis(Math.max(0, ages.decoded))} · drawn ${fmt.millis(Math.max(0, ages.drawn))}`);
+    }
   } else {
     stats.push(dark ? phaseLine : waitingForFrames ? "connecting" : "no frames");
   }

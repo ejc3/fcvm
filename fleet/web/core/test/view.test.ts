@@ -36,8 +36,8 @@ function stateWith(st: FleetState, version = 1): ClientState {
   s = reduce(s, { type: "family", family: "v6", probeMs: 180, via: "race" });
   s = reduce(s, { type: "message", text: snapshotText(version, st), at: EPOCH });
   const tiles: FrameStats["tiles"] = {};
-  for (const t of st.tiles) tiles[`d:${t.id}`] = { connected: true, fps: 24, newestT: 100, width: 320, height: 180, behind: false, decodeMs: 2 };
-  return reduce(s, { type: "frame-stats", stats: { T: 100, tiles, drawMsP50: 1, drawMsP95: 2, rafMsP50: 16.7, rafMsP95: 17, allLive: true, live: [], mode: "direct" } });
+  for (const t of st.tiles) tiles[`d:${t.id}`] = { connected: true, fps: 24, newestT: 100, width: 320, height: 180, behind: false, decodeMs: 2, lag: null };
+  return reduce(s, { type: "frame-stats", stats: { at: EPOCH, T: 100, tiles, drawMsP50: 1, drawMsP95: 2, rafMsP50: 16.7, rafMsP95: 17, allLive: true, live: [], mode: "direct" } });
 }
 
 function msg(s: ClientState, m: unknown, at = EPOCH): ClientState {
@@ -1339,5 +1339,33 @@ describe("the family choice covers every stream the page opens", () => {
     expect(new URL(own("v4", "ws://example-host-v4:2/frames/claim-1")!.url!).hostname).toBe("example-host-v4");
     expect(new URL(own("v6", "ws://example-host-v4:2/frames/claim-1")!.url!).hostname).toBe("example-host");
     expect(own("v4", null)).toBeNull();
+  });
+});
+
+describe("frame age on a tile's card", () => {
+  // The drawer reports every 500 ms; the card is drawn every 100 ms.
+  function reported(lag: FrameStats["tiles"][string]["lag"], at: number, newestT: number): ClientState {
+    const st = fleet(1, 1);
+    let s = stateWith(st);
+    const tiles: FrameStats["tiles"] = {};
+    for (const t of st.tiles) tiles[`d:${t.id}`] = { connected: true, fps: 30, newestT, width: 320, height: 180, behind: false, decodeMs: 2, lag };
+    s = reduce(s, { type: "frame-stats", stats: { at, T: newestT, tiles, drawMsP50: 1, drawMsP95: 2, rafMsP50: 16.7, rafMsP95: 17, allLive: true, live: [], mode: "direct" } });
+    return s;
+  }
+
+  it("is the newest frame's age when the drawer reported it, not that age plus how old the report is", () => {
+    // Newest frame at t = 100 s, reported 80 ms after it; the card is drawn 400 ms after the report.
+    const at = EPOCH + 100_080;
+    const v = view(reported(null, at, 100), at + 400);
+    expect(v.tiles[0]!.stats[1]).toBe("frame age 80 ms");
+  });
+
+  it("is the drawn age when the drawer has drawn frames, with where it went", () => {
+    const at = EPOCH + 100_080;
+    // Local minus scene ms, as core/lag.ts records them (the clock offset is 0 here).
+    const lag = { arrive: EPOCH + 55, decoded: EPOCH + 58, drawn: EPOCH + 90, n: 60 };
+    const v = view(reported(lag, at, 100), at + 400);
+    expect(v.tiles[0]!.stats[1]).toBe("frame age 90 ms");
+    expect(v.tiles[0]!.stats[2]).toBe("arrives 55 ms · decoded 58 ms · drawn 90 ms");
   });
 });

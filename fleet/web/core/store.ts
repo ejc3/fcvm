@@ -20,6 +20,7 @@ import {
   type ReceiptMsg,
 } from "./protocol.ts";
 import type { Family, FamilyVia } from "./net.ts";
+import type { LagStats } from "./lag.ts";
 
 export interface PendingIntent {
   intent: IntentMsg;
@@ -57,9 +58,13 @@ export interface TileFrameStats {
   /** Shown dimmed: behind the common time. */
   behind: boolean;
   decodeMs: number | null;
+  /** Where its frames' age goes on the page (core/lag.ts), or null before a frame arrives. */
+  lag: LagStats | null;
 }
 
 export interface FrameStats {
+  /** Local Unix ms when the drawer reported: the time newestT and the lag stats are as of. */
+  at: number;
   T: number | null;
   tiles: Record<string, TileFrameStats>;
   drawMsP50: number;

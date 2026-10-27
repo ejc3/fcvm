@@ -43,6 +43,7 @@ import {
   type FrameStats,
   type SyncChoice,
   acquireFrozen,
+  FrameLog,
   type TileFrameStats,
   accessUnitWithNoReorder,
 } from "../../core/index.ts";
@@ -94,6 +95,8 @@ class TileStream {
   bytes = 0;
   /** When the tile last went from nothing shown to a frame (for the fade-in). */
   appearedAt: number | null = null;
+  /** When each recent frame arrived, was decoded and was first drawn in step (core/lag.ts). */
+  readonly log = new FrameLog();
 
   constructor(id: string, baseUrl: string, url: string, height: number) {
     this.id = id;
@@ -195,9 +198,11 @@ class TileStream {
 
   private onFrame(buf: Uint8Array): void {
     this.bytes += buf.byteLength;
+    const arrivedAt = now();
     const p = parseFrame(buf);
     if (!p.ok) return;
     const f = p.frame;
+    this.log.arrived(f.t, arrivedAt);
     if (f.keyframe && (f.width !== this.codedW || f.height !== this.codedH || !this.decoder || this.decoder.state !== "configured")) {
       // A size change, or no header: take the codec from the keyframe's SPS.
       const sps = splitNals(f.data).find((n) => nalType(n) === NAL_SPS);
@@ -226,6 +231,7 @@ class TileStream {
 
   private onDecoded(frame: VideoFrame): void {
     const t = frame.timestamp / 1e6;
+    this.log.decoded(t, now());
     const started = this.decodeStart.get(frame.timestamp);
     if (started !== undefined) {
       this.decodeMs.push(performance.now() - started);
@@ -839,6 +845,7 @@ function draw(): void {
     // the whole image (x0, y0 of full_width x full_height); opened, it fills its box.
     const [x, y, w, h] = plan.image && frame.grid && !plan.focus ? gridBox(plan.image, frame.grid, inner.sw, inner.sh, dpr) : devBox(src.box);
     if (st.appearedAt === null) st.appearedAt = at;
+    if (show.kind === "sync") st.log.drawn(show.t, at);
     const fade = Math.min(1, (at - st.appearedAt) / settings.fadeInMs);
     if (fade < 1) {
       fillEmpty(src.box);
@@ -1011,9 +1018,11 @@ function report(): void {
       height: s.lastH,
       behind: show?.kind === "behind",
       decodeMs: s.decodeMs.length > 0 ? pct(s.decodeMs, 0.5) : null,
+      lag: s.log.summary(),
     };
   }
   const stats: FrameStats = {
+    at,
     T: lastChoice.T,
     tiles,
     drawMsP50: pct(drawMs, 0.5),
