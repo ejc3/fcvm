@@ -69,7 +69,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
 
     // Load config and initialize paths (with helpful error if config missing)
     let (config, _, _) = load_config(args.config.as_deref())?;
-    paths::init_with_paths(&config.paths.data_dir, &config.paths.assets_dir);
+    paths::init_from_loaded_config(&config);
     // Store temps of setups killed before they finished (crate::reclaim). A setup under
     // sudo reclaims root's records, which no rootless launch reads.
     crate::reclaim::reclaim_abandoned().await;

@@ -15,23 +15,29 @@ const DEFAULT_BASE_DIR: &str = "/mnt/fcvm-btrfs";
 ///
 /// For nested VM support, each nesting level uses a different data_dir
 /// while sharing the same assets_dir for content-addressed files.
-///
-/// The FCVM_DATA_DIR environment variable overrides config data_dir,
-/// allowing test isolation between root/container/rootless modes.
 pub fn init_from_config() {
-    // Check for env var override first (test isolation)
-    if let Ok(data_dir) = std::env::var("FCVM_DATA_DIR") {
-        let (config, _, _) = crate::setup::rootfs::load_config(None)
-            .expect("Failed to load config - run 'fcvm setup --generate-config' first");
-        let _ = DATA_DIR.set(PathBuf::from(data_dir));
-        let _ = ASSETS_DIR.set(PathBuf::from(&config.paths.assets_dir));
-        return;
-    }
-
     let (config, _, _) = crate::setup::rootfs::load_config(None)
         .expect("Failed to load config - run 'fcvm setup --generate-config' first");
-    let _ = DATA_DIR.set(PathBuf::from(&config.paths.data_dir));
+    init_from_loaded_config(&config);
+}
+
+/// Initialize directories from an already loaded config. The FCVM_DATA_DIR environment
+/// variable overrides its data_dir, which keeps root, container and rootless runs on one host
+/// in separate data directories: a rootless container's root is another uid on the host, so
+/// sharing a directory such as `reclaim/0` with host root fails its ownership check.
+pub fn init_from_loaded_config(config: &crate::setup::rootfs::Plan) {
+    let _ = DATA_DIR.set(resolve_data_dir(&config.paths.data_dir));
     let _ = ASSETS_DIR.set(PathBuf::from(&config.paths.assets_dir));
+}
+
+/// FCVM_DATA_DIR when set, otherwise the configured data_dir.
+fn resolve_data_dir(configured: &str) -> PathBuf {
+    resolve_data_dir_from(std::env::var_os("FCVM_DATA_DIR"), configured)
+}
+
+fn resolve_data_dir_from(env: Option<std::ffi::OsString>, configured: &str) -> PathBuf {
+    env.map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(configured))
 }
 
 /// Initialize directories with default values (no config file required).
@@ -54,13 +60,12 @@ pub fn init_with_paths(data_dir: impl Into<PathBuf>, assets_dir: impl Into<PathB
 pub fn data_dir() -> PathBuf {
     DATA_DIR
         .get_or_init(|| {
-            // Check env var first (test isolation)
-            if let Ok(data_dir) = std::env::var("FCVM_DATA_DIR") {
+            if let Some(data_dir) = std::env::var_os("FCVM_DATA_DIR") {
                 return PathBuf::from(data_dir);
             }
             let (config, _, _) =
                 crate::setup::rootfs::load_config(None).expect("Failed to load config");
-            PathBuf::from(&config.paths.data_dir)
+            resolve_data_dir(&config.paths.data_dir)
         })
         .clone()
 }
@@ -263,5 +268,40 @@ mod tests {
         let over = format!("{at_limit}x");
         check_socket_path_budget_under(Path::new(&over), VM_ID)
             .expect_err("one byte over SUN_PATH_MAX must be refused");
+    }
+}
+
+#[cfg(test)]
+mod data_dir_override_tests {
+    use super::*;
+
+    #[test]
+    fn fcvm_data_dir_overrides_the_configured_data_dir() {
+        assert_eq!(
+            resolve_data_dir_from(Some("/mnt/store/container".into()), "/mnt/store"),
+            PathBuf::from("/mnt/store/container")
+        );
+        assert_eq!(
+            resolve_data_dir_from(None, "/mnt/store"),
+            PathBuf::from("/mnt/store")
+        );
+    }
+
+    /// `fcvm setup` must take its data dir through the same override as every other
+    /// command. When it read the configured data_dir directly, setup in CI's rootless
+    /// container (FCVM_DATA_DIR=<store>/container) wrote root's owner records into the host's
+    /// `<store>/reclaim/0` as host uid 1000, and the next host-root job on that runner
+    /// refused the directory (and the reverse, as uid 65534).
+    #[test]
+    fn setup_initializes_paths_through_the_data_dir_override() {
+        let setup = include_str!("commands/setup.rs");
+        assert!(
+            setup.contains("paths::init_from_loaded_config(&config)"),
+            "fcvm setup does not initialize its paths through init_from_loaded_config"
+        );
+        assert!(
+            !setup.contains("init_with_paths(&config.paths.data_dir"),
+            "fcvm setup reads the configured data_dir past FCVM_DATA_DIR"
+        );
     }
 }
