@@ -870,6 +870,29 @@ fn diff_bytes_written(snapshot: &str, measured: std::io::Result<u64>) -> u64 {
     }
 }
 
+/// Why `file` cannot take an in-place diff, or None: it is not `memory_bytes` long
+/// (Firecracker truncates a memory file of another length and writes only the dirty pages
+/// into it), or its filesystem does not report which extents it shares, which is how the
+/// snapshot finds the pages Firecracker wrote.
+fn memory_file_refuses_in_place_diff(
+    file: &std::fs::File,
+    memory_bytes: u64,
+) -> std::io::Result<Option<String>> {
+    let len = file.metadata()?.len();
+    if len != memory_bytes {
+        return Ok(Some(format!(
+            "the parent's memory file is {len} bytes, the VM's memory {memory_bytes}"
+        )));
+    }
+    Ok(
+        match crate::storage::extents::reports_shared_extents(file) {
+            Ok(true) => None,
+            Ok(false) => Some("the filesystem does not report shared extents".to_string()),
+            Err(e) => Some(format!("the filesystem cannot report extents: {e}")),
+        },
+    )
+}
+
 /// Clone the parent's memory file to `dst` for an in-place diff snapshot, with FICLONE.
 ///
 /// Returns false, leaving no `dst`, when the snapshot has to be written as a sparse diff and
@@ -905,11 +928,8 @@ async fn clone_base_for_in_place_diff(
                 .open(&dst)
                 .with_context(|| format!("creating {}", dst.display()))?;
             let refused = match crate::storage::pmem_store::ficlone(&base_file, &dst_file) {
-                Ok(()) => match crate::storage::extents::reports_shared_extents(&dst_file) {
-                    Ok(true) => None,
-                    Ok(false) => Some("the filesystem does not report shared extents".to_string()),
-                    Err(e) => Some(format!("the filesystem cannot report extents: {e}")),
-                },
+                Ok(()) => memory_file_refuses_in_place_diff(&dst_file, memory_bytes)
+                    .context("checking the cloned memory file")?,
                 Err(e) => match e.raw_os_error() {
                     Some(libc::EXDEV | libc::EOPNOTSUPP | libc::EINVAL | libc::ENOTTY) => Some(
                         format!("the store cannot clone the parent's memory file: {e}"),
@@ -945,6 +965,80 @@ async fn clone_base_for_in_place_diff(
             Ok(false)
         }
     }
+}
+
+/// Why the memory file a staged subvolume snapshot brought from the parent cannot take the
+/// diff in place, or None. Firecracker opens the memory file by name and follows a symlink, so
+/// the staged entry must be the regular file the subvolume snapshot made; opening it for
+/// writing here finds a read-only file before the pause, where Firecracker would find it after.
+fn staged_memory_refusal(path: &Path, memory_bytes: u64) -> Result<Option<String>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let meta =
+        std::fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
+    if !meta.file_type().is_file() {
+        return Ok(Some(
+            "the parent's memory file is not a regular file".to_string(),
+        ));
+    }
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            return Ok(Some(format!(
+                "the staged memory file cannot be opened for writing: {e}"
+            )))
+        }
+    };
+    memory_file_refuses_in_place_diff(&file, memory_bytes)
+        .context("checking the staged memory file")
+}
+
+/// Whether the memory file a staged subvolume snapshot brought from the parent can take the
+/// diff in place (`memory_file_refuses_in_place_diff`). The caller discards a refused
+/// staging as a whole subvolume, since removing the file alone drops its references one
+/// extent at a time.
+async fn staged_memory_takes_in_place_diff(
+    memory: &Path,
+    memory_bytes: u64,
+    snapshot: &str,
+) -> Result<bool> {
+    let path = memory.to_path_buf();
+    let refused = tokio::task::spawn_blocking(move || staged_memory_refusal(&path, memory_bytes))
+        .await
+        .context("staged memory check task panicked")??;
+    match refused {
+        None => {
+            info!(snapshot = %snapshot,
+                "staged as a subvolume snapshot of the parent, the diff is written into its memory file");
+            Ok(true)
+        }
+        Some(reason) => {
+            info!(snapshot = %snapshot, reason = %reason, "writing the diff to memory.diff and merging it");
+            Ok(false)
+        }
+    }
+}
+
+/// The free bytes on the filesystem holding `path`, or None when statvfs fails. When fewer
+/// than `required` are free, it first waits for btrfs to free the space of deleted
+/// subvolumes: a replaced or pruned snapshot directory is deleted as a subvolume, and its
+/// space comes back on the cleaner thread after the delete returns.
+async fn available_after_deletes(path: &Path, required: u64) -> Option<u64> {
+    let available = |path: &Path| {
+        nix::sys::statvfs::statvfs(path)
+            .ok()
+            .map(|stat| stat.blocks_available() * stat.fragment_size())
+    };
+    let now = available(path)?;
+    if now >= required {
+        return Some(now);
+    }
+    crate::storage::disk::wait_for_deleted_subvolumes(path).await;
+    available(path)
 }
 
 /// What giving an in-place diff's long zero runs back as holes did.
@@ -4359,14 +4453,14 @@ async fn atomic_replace_dir(temp_dir: &Path, final_dir: &Path) -> Result<()> {
 async fn replace_dir(temp_dir: &Path, final_dir: &Path) -> Result<()> {
     if final_dir.exists() {
         let old = snapshot_sibling(final_dir, "old");
-        let _ = tokio::fs::remove_dir_all(&old).await;
+        let _ = crate::storage::disk::remove_snapshot_dir(&old).await;
         tokio::fs::rename(final_dir, &old)
             .await
             .context("moving old snapshot out of the way")?;
         tokio::fs::rename(temp_dir, final_dir)
             .await
             .context("renaming temp snapshot to final location")?;
-        let _ = tokio::fs::remove_dir_all(&old).await;
+        let _ = crate::storage::disk::remove_snapshot_dir(&old).await;
     } else {
         tokio::fs::rename(temp_dir, final_dir)
             .await
@@ -4893,7 +4987,7 @@ async fn publish_snapshot_dir(
     }
     .await;
     if let Err(e) = written {
-        let _ = tokio::fs::remove_dir_all(temp_snapshot_dir).await;
+        let _ = crate::storage::disk::remove_snapshot_dir(temp_snapshot_dir).await;
         return Err(e);
     }
     atomic_replace_dir(temp_snapshot_dir, snapshot_dir).await
@@ -4934,8 +5028,8 @@ pub async fn create_disk_only_snapshot_core(
         .to_path_buf();
     let temp_snapshot_dir = snapshot_sibling(&snapshot_dir, "creating");
 
-    let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-    tokio::fs::create_dir_all(&temp_snapshot_dir)
+    crate::storage::disk::clear_staging(&temp_snapshot_dir).await?;
+    crate::storage::disk::create_dir_or_subvolume(&temp_snapshot_dir)
         .await
         .context("creating temp snapshot directory")?;
 
@@ -4952,7 +5046,7 @@ pub async fn create_disk_only_snapshot_core(
             .await
             .context("checking provisioned marker in guest")?;
     if marker_out.exit_code != 0 {
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         anyhow::bail!(
             "source VM has no provisioned marker (/var/lib/fcvm/provisioned); a clone \
              of this disk would wipe its container storage on boot. The source must be \
@@ -4972,7 +5066,7 @@ pub async fn create_disk_only_snapshot_core(
         .await
         .context("guest sync before freeze")?;
     if sync_out.exit_code != 0 {
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         anyhow::bail!(
             "guest sync failed before disk capture (exit {}): {}",
             sync_out.exit_code,
@@ -5007,7 +5101,7 @@ pub async fn create_disk_only_snapshot_core(
                 ];
                 let _ = run_exec_in_vm_captured(vsock_socket, &thaw, false, &snapshot_config.vm_id)
                     .await;
-                let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+                let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
                 return Err(e).context("freezing guest filesystems");
             }
         };
@@ -5022,7 +5116,7 @@ pub async fn create_disk_only_snapshot_core(
             ),
         ];
         let _ = run_exec_in_vm_captured(vsock_socket, &thaw, false, &snapshot_config.vm_id).await;
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         anyhow::bail!(
             "fsfreeze failed (exit {}): {}",
             freeze_out.exit_code,
@@ -5064,14 +5158,14 @@ pub async fn create_disk_only_snapshot_core(
         run_exec_in_vm_captured(vsock_socket, &unfreeze_cmd, false, &snapshot_config.vm_id).await;
 
     if let Err(e) = copy_result {
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return Err(e).context("reflinking disk for disk-only snapshot");
     }
 
     match unfreeze_result {
         Ok(o) if o.exit_code == 0 => info!(snapshot = %snapshot_config.name, "guest unfrozen"),
         Ok(o) => {
-            let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
             anyhow::bail!(
                 "fsfreeze --unfreeze failed (exit {}): {} — source VM may be wedged",
                 o.exit_code,
@@ -5079,7 +5173,7 @@ pub async fn create_disk_only_snapshot_core(
             );
         }
         Err(e) => {
-            let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
             return Err(e).context("unfreezing guest — source VM may be wedged");
         }
     }
@@ -5095,14 +5189,14 @@ pub async fn create_disk_only_snapshot_core(
     // Atomic replace into the final location.
     if snapshot_dir.exists() {
         let old = snapshot_sibling(&snapshot_dir, "old");
-        let _ = tokio::fs::remove_dir_all(&old).await;
+        let _ = crate::storage::disk::remove_snapshot_dir(&old).await;
         tokio::fs::rename(&snapshot_dir, &old)
             .await
             .context("moving old snapshot aside")?;
         tokio::fs::rename(&temp_snapshot_dir, &snapshot_dir)
             .await
             .context("finalizing snapshot")?;
-        let _ = tokio::fs::remove_dir_all(&old).await;
+        let _ = crate::storage::disk::remove_snapshot_dir(&old).await;
     } else {
         tokio::fs::rename(&temp_snapshot_dir, &snapshot_dir)
             .await
@@ -5414,7 +5508,7 @@ pub async fn create_snapshot_core(
     // to prevent confusion and reclaim disk space.
     if snapshot_dir.exists() && !snapshot_dir.join("config.json").exists() {
         info!(snapshot = %snapshot_config.name, "cleaning up stale snapshot directory");
-        let _ = tokio::fs::remove_dir_all(snapshot_dir).await;
+        let _ = crate::storage::disk::remove_snapshot_dir(snapshot_dir).await;
     }
 
     let memory_bytes = (snapshot_config.metadata.memory_mib as u64) * 1024 * 1024;
@@ -5438,8 +5532,7 @@ pub async fn create_snapshot_core(
         } else {
             snapshot_dir.parent().unwrap_or(snapshot_dir)
         };
-        if let Ok(stat) = nix::sys::statvfs::statvfs(statvfs_path) {
-            let available_bytes = stat.blocks_available() * stat.fragment_size();
+        if let Some(available_bytes) = available_after_deletes(statvfs_path, required_bytes).await {
             if available_bytes < required_bytes {
                 anyhow::bail!(
                     "Not enough disk space for {} snapshot: need {} MiB, have {} MiB free on {}. \
@@ -5462,17 +5555,45 @@ pub async fn create_snapshot_core(
     );
 
     // Clean up any leftover temp directory from previous failed attempt
-    let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-    tokio::fs::create_dir_all(&temp_snapshot_dir)
-        .await
-        .context("creating temp snapshot directory")?;
+    crate::storage::disk::clear_staging(&temp_snapshot_dir).await?;
 
-    // A diff snapshot is written in place when the store can clone the parent's memory file:
-    // Firecracker writes the dirty pages into the clone, so there is no diff file to merge
-    // afterwards. The clone is made here, before the pause. Otherwise Firecracker writes the
-    // dirty pages to a sparse memory.diff, merged onto a copy of the parent's memory.bin after
-    // the resume. A full snapshot writes memory.bin.
+    // A diff snapshot whose parent's directory is a btrfs subvolume is staged as a subvolume
+    // snapshot of it, which brings the parent's memory file along at the cost of one
+    // transaction commit. Any other snapshot directory is created as a subvolume where the
+    // store allows, so that the snapshots taken after it can be staged that way. A parent
+    // memory file of another length cannot take the diff in place, so it is not staged.
+    let parent_fits = base_memory_source
+        .as_ref()
+        .and_then(|base| std::fs::metadata(base).ok())
+        .is_some_and(|meta| meta.len() == memory_bytes);
+    let staged = match parent_snapshot_dir {
+        Some(parent_dir) if has_base && parent_fits => {
+            crate::storage::disk::stage_from_parent_subvolume(parent_dir, &temp_snapshot_dir)
+                .await?
+        }
+        _ => false,
+    };
+    if !staged {
+        crate::storage::disk::create_dir_or_subvolume(&temp_snapshot_dir)
+            .await
+            .context("creating temp snapshot directory")?;
+    }
+
+    // A diff snapshot is written in place when its memory file shares the parent's extents:
+    // Firecracker writes the dirty pages into it, so there is no diff file to merge afterwards.
+    // The file comes from the staged subvolume snapshot, or is a clone of the parent's made
+    // here, before the pause. Otherwise Firecracker writes the dirty pages to a sparse
+    // memory.diff, merged onto a copy of the parent's memory.bin after the resume. A full
+    // snapshot writes memory.bin.
     let diff_in_place = match base_memory_source.as_ref() {
+        Some(_) if has_base && staged => {
+            staged_memory_takes_in_place_diff(
+                &temp_snapshot_dir.join("memory.bin"),
+                memory_bytes,
+                &snapshot_config.name,
+            )
+            .await
+        }
         Some(base) if has_base => {
             clone_base_for_in_place_diff(
                 base,
@@ -5487,10 +5608,18 @@ pub async fn create_snapshot_core(
     let diff_in_place = match diff_in_place {
         Ok(in_place) => in_place,
         Err(e) => {
-            let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
             return Err(e);
         }
     };
+    // A staged memory file that cannot take the diff goes with its whole subvolume, and the
+    // diff is written to memory.diff in a fresh directory and merged.
+    if staged && !diff_in_place {
+        crate::storage::disk::clear_staging(&temp_snapshot_dir).await?;
+        crate::storage::disk::create_dir_or_subvolume(&temp_snapshot_dir)
+            .await
+            .context("creating temp snapshot directory")?;
+    }
     let temp_memory_path = if has_base && !diff_in_place {
         temp_snapshot_dir.join("memory.diff")
     } else {
@@ -5538,7 +5667,7 @@ pub async fn create_snapshot_core(
         )
         .await
         .context("reopening guest network after Firecracker preparation failure");
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return combine_snapshot_boundary_results(
             Err(operation_error),
             Ok(()),
@@ -5571,7 +5700,7 @@ pub async fn create_snapshot_core(
             resume_paused_source(vsock_socket_path, &snapshot_config.vm_id)
                 .await
                 .context("reopening guest network after Firecracker pause failure");
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return combine_snapshot_boundary_results(
             Err(pause_error),
             hypervisor_resume_result,
@@ -5759,7 +5888,7 @@ pub async fn create_snapshot_core(
         hypervisor_resume_result,
         guest_network_resume_result,
     ) {
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return Err(error);
     }
 
@@ -5804,7 +5933,7 @@ pub async fn create_snapshot_core(
         let punched = match punched {
             Ok(punched) => punched,
             Err(e) => {
-                let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+                let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
                 return Err(e);
             }
         };
@@ -5840,7 +5969,7 @@ pub async fn create_snapshot_core(
 
         // Copy base memory to temp dir as memory.bin (will merge diff into this copy)
         if let Err(e) = tokio::fs::copy(base_source, &final_memory_path).await {
-            let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
             return Err(e).context("copying base memory to temp for merge");
         }
 
@@ -5866,7 +5995,7 @@ pub async fn create_snapshot_core(
             Ok(merged) => merged,
             Err(e) => {
                 // The unfinished directory holds a copy of the memory file. Nothing reads it again.
-                let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+                let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
                 return Err(e);
             }
         };
@@ -5956,7 +6085,7 @@ pub async fn create_snapshot_ch(
     // Clean up a stale (incomplete) snapshot dir — one with no config.json.
     if snapshot_dir.exists() && !snapshot_dir.join("config.json").exists() {
         info!(snapshot = %snapshot_config.name, "cleaning up stale snapshot directory");
-        let _ = tokio::fs::remove_dir_all(snapshot_dir).await;
+        let _ = crate::storage::disk::remove_snapshot_dir(snapshot_dir).await;
     }
 
     // Disk-space guard: a full memory dump needs ~memory_mib. Failing ENOSPC mid-dump
@@ -5968,8 +6097,7 @@ pub async fn create_snapshot_ch(
         } else {
             snapshot_dir.parent().unwrap_or(snapshot_dir)
         };
-        if let Ok(stat) = nix::sys::statvfs::statvfs(statvfs_path) {
-            let available_bytes = stat.blocks_available() * stat.fragment_size();
+        if let Some(available_bytes) = available_after_deletes(statvfs_path, required_bytes).await {
             if available_bytes < required_bytes {
                 anyhow::bail!(
                     "Not enough disk space for Cloud Hypervisor snapshot: need {} MiB, \
@@ -5983,7 +6111,10 @@ pub async fn create_snapshot_ch(
     }
 
     // Fresh temp dir + the CH sub-dir CH dumps its files into.
-    let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+    crate::storage::disk::clear_staging(&temp_snapshot_dir).await?;
+    crate::storage::disk::create_dir_or_subvolume(&temp_snapshot_dir)
+        .await
+        .context("creating temp CH snapshot directory")?;
     let ch_dir = temp_snapshot_dir.join(CH_SNAPSHOT_SUBDIR);
     tokio::fs::create_dir_all(&ch_dir)
         .await
@@ -6012,7 +6143,7 @@ pub async fn create_snapshot_ch(
         )
         .await
         .context("reopening guest network after Cloud Hypervisor preparation failure");
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return combine_snapshot_boundary_results(
             Err(operation_error),
             Ok(()),
@@ -6040,7 +6171,7 @@ pub async fn create_snapshot_ch(
             resume_paused_source(vsock_socket_path, &snapshot_config.vm_id)
                 .await
                 .context("reopening guest network after Cloud Hypervisor pause failure");
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return combine_snapshot_boundary_results(
             Err(pause_error),
             hypervisor_resume_result,
@@ -6101,7 +6232,7 @@ pub async fn create_snapshot_ch(
         hypervisor_resume_result,
         guest_network_resume_result,
     ) {
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return Err(error);
     }
 
@@ -6125,6 +6256,24 @@ pub async fn create_snapshot_ch(
 
 #[cfg(test)]
 mod tests {
+    /// A staged memory.bin that is a symlink is refused, so Firecracker cannot write the diff
+    /// into the file it points at.
+    #[test]
+    fn a_staged_memory_symlink_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other.bin");
+        std::fs::write(&other, vec![0u8; 8192]).unwrap();
+        let staged = dir.path().join("memory.bin");
+        std::os::unix::fs::symlink(&other, &staged).unwrap();
+        let refused = staged_memory_refusal(&staged, 8192).unwrap();
+        assert!(
+            refused
+                .as_deref()
+                .is_some_and(|r| r.contains("not a regular file")),
+            "{refused:?}"
+        );
+    }
+
     use super::*;
     use crate::state::VmState;
     use crate::storage::SnapshotType;

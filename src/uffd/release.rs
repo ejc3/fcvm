@@ -54,8 +54,7 @@ use std::path::Path;
 use std::time::Duration;
 use tracing::{info, warn};
 
-/// The memory file's name in a snapshot's directory.
-const MEMORY_FILE: &str = "memory.bin";
+use crate::storage::snapshot::SNAPSHOT_MEMORY_FILE as MEMORY_FILE;
 
 /// The endings of the directories a snapshot create works in beside the installed
 /// snapshots (`commands::common::snapshot_sibling`).
