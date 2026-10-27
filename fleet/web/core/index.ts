@@ -4,6 +4,7 @@ export * from "./sps.ts";
 export * from "./clock.ts";
 export * from "./layout.ts";
 export * from "./sync.ts";
+export * from "./lag.ts";
 export * from "./scene.ts";
 export * from "./net.ts";
 export * from "./stream.ts";
