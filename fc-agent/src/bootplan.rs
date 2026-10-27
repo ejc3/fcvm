@@ -130,8 +130,14 @@ pub(crate) fn set_system_clock(host_time: &str, since_read: std::time::Duration)
     match parse_epoch_nanos(host_time) {
         Ok(instant) => {
             let spec = clock_target(instant, since_read);
+            let before = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
             // SAFETY: `spec` is fully initialized and outlives the call.
             let rc = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &spec) };
+            let step = std::time::Duration::new(spec.tv_sec as u64, spec.tv_nsec as u32)
+                .as_secs_f64()
+                - before.as_secs_f64();
             if rc != 0 {
                 eprintln!(
                     "[fc-agent] WARNING: failed to set clock: {}",
@@ -139,7 +145,7 @@ pub(crate) fn set_system_clock(host_time: &str, since_read: std::time::Duration)
                 );
                 eprintln!("[fc-agent] continuing anyway (will rely on chronyd)");
             } else {
-                eprintln!("[fc-agent] system clock synchronized from host");
+                eprintln!("[fc-agent] system clock synchronized from host (stepped {step:+.6} s)");
             }
         }
         Err(error) => {

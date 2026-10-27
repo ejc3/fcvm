@@ -13,8 +13,8 @@ use anyhow::{Context, Result};
 use std::time::Duration;
 
 /// After snapshot restore, the VM clock should be within a few seconds of host
-/// time (not stuck at snapshot time). This verifies the MMDS clock sync +
-/// chronyc makestep path in fc-agent/src/restore.rs.
+/// time (not stuck at snapshot time). This verifies the host-time clock step
+/// in fc-agent/src/restore.rs.
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_clock_synced_after_clone_restore() -> Result<()> {
@@ -146,6 +146,77 @@ async fn test_clone_clock_matches_the_host_to_a_tenth_of_a_second() -> Result<()
         "the restored clone's clock was {:.1} ms off the host's (tolerance {} ms)",
         worst * 1000.0,
         TOLERANCE.as_millis()
+    );
+    Ok(())
+}
+
+/// A restored clone runs a chronyd started after its restore, never the one in
+/// the snapshot. The restore steps the clock behind chronyd's back, and chronyd
+/// misses a forward step under 10 s, so the snapshot's daemon kept whatever
+/// correction it was making and applied it to the stepped clock: a clone of a
+/// source whose chronyd was still correcting a snapshot pause came up 0.42 to
+/// 2.19 s off the host. The source keeps its daemon (it is resumed, not
+/// restored), so its chronyd PID is the snapshot's.
+#[tokio::test]
+async fn test_clone_runs_a_chronyd_started_after_the_restore() -> Result<()> {
+    let fixture = common::SnapshotFixture::new("chronydpid", "rootless").await?;
+    // Every chronyd PID in the guest, from /proc/<pid>/comm. Not pidof: exec's
+    // PATH is minimal and the probe must not depend on a tool being on it. The
+    // helper already runs its words as one `sh -c` script.
+    let chronyd_pid = |pid: u32| async move {
+        let out =
+            common::exec_in_vm(pid, &["/usr/bin/grep -lx chronyd /proc/[0-9]*/comm; true"]).await?;
+        let pids: Vec<&str> = out
+            .split_whitespace()
+            .filter_map(|path| path.strip_prefix("/proc/")?.strip_suffix("/comm"))
+            .collect();
+        Ok::<_, anyhow::Error>(pids.join(" "))
+    };
+    let snapshot_daemon = chronyd_pid(fixture.baseline_pid).await;
+
+    let (_, clone_name, _, _) = common::unique_names("chronydpid-c");
+    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &fixture.serve_pid.to_string(),
+            "--name",
+            &clone_name,
+        ],
+        &clone_name,
+    )
+    .await?;
+    let clone_daemon: Result<String> = async {
+        common::poll_health_by_pid(clone_pid, 120).await?;
+        // The fresh daemon is started off the readiness path, after the restore ACK.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let daemon = chronyd_pid(clone_pid).await?;
+            if !daemon.is_empty() || std::time::Instant::now() > deadline {
+                return Ok(daemon);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    .await;
+    common::kill_process(clone_pid).await;
+    fixture.cleanup().await;
+
+    let snapshot_daemon = snapshot_daemon?;
+    let clone_daemon = clone_daemon?;
+    println!("  snapshot's chronyd: {snapshot_daemon:?}, clone's chronyd: {clone_daemon:?}");
+    assert!(
+        !snapshot_daemon.is_empty() && !snapshot_daemon.contains(' '),
+        "the source should run exactly one chronyd, got {snapshot_daemon:?}"
+    );
+    assert!(
+        !clone_daemon.is_empty() && !clone_daemon.contains(' '),
+        "the clone should run exactly one chronyd within 10 s of healthy, got {clone_daemon:?}"
+    );
+    assert_ne!(
+        clone_daemon, snapshot_daemon,
+        "the clone still runs the snapshot's chronyd"
     );
     Ok(())
 }

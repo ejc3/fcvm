@@ -311,6 +311,11 @@ pub async fn handle_clone_restore(
     let mut phases = RestorePhases::default();
     eprintln!("[fc-agent] handling restore (epoch={})", restore_epoch);
 
+    // The chronyd inherited from the snapshot must be gone before the clock step
+    // below, which it would not notice (`agent::retire_chronyd_for_restore`).
+    // Started now so the kill overlaps the network phases; awaited at the step.
+    let chronyd_retired = tokio::spawn(crate::agent::retire_chronyd_for_restore());
+
     // GPUs the host attached before resuming: rescan, load the driver and
     // write the CDI spec. Started first and awaited before publication, so it
     // overlaps the network phases (it touches no network state) and a failure
@@ -417,20 +422,15 @@ pub async fn handle_clone_restore(
     // The NFS remount and the hook run after it. The host's value was read just
     // before this function started, so the step adds the time since then.
     let clock_started = std::time::Instant::now();
+    let chronyd_retired = chronyd_retired.await;
     crate::bootplan::set_system_clock(host_time, restore_started.elapsed());
-    // Reset chrony after the clock jump so it doesn't lose its sources:
-    // `makestep` forces it to accept the stepped time. Its convergence is
-    // not part of the readiness contract (the clock is already stepped),
-    // so it must not hold the host's ACK.
-    // Then a burst, since the snapshot gate rejected any poll chronyd made
-    // before egress opened; it matters most when the step above failed.
-    spawn_restore_side_job(async {
-        let _ = tokio::process::Command::new("chronyc")
-            .args(["makestep"])
-            .output()
-            .await;
-        crate::snapshot_network::chrony_burst().await;
-    });
+    // A fresh chronyd, whose every measurement is taken against the stepped
+    // clock. Its convergence is not part of the readiness contract (the clock
+    // is already stepped), so it must not hold the host's ACK.
+    match chronyd_retired {
+        Ok(retired) => spawn_restore_side_job(crate::agent::restart_chronyd_after_restore(retired)),
+        Err(e) => eprintln!("[fc-agent] ERROR: retiring the snapshot's chronyd panicked: {e}"),
+    }
     phases.clock_ms = elapsed_ms(clock_started);
 
     // Restart journald in the background without ever holding the ACK. The
@@ -1062,6 +1062,36 @@ mod tests {
         }
     }
 
+    /// The clone's chronyd is replaced around the clock step: the snapshot's
+    /// daemon is killed (and awaited) before the step and a fresh one starts
+    /// after it, and nothing asks the snapshot's daemon for its leftover
+    /// correction (`chronyc makestep`), which is what stepped a clone 2.19 s off
+    /// the host after the restore had set it right.
+    #[test]
+    fn the_snapshots_chronyd_is_gone_before_the_clock_step_and_a_fresh_one_starts_after() {
+        let body = handle_clone_restore_source();
+        let retire = body
+            .find("tokio::spawn(crate::agent::retire_chronyd_for_restore())")
+            .expect("the restore no longer kills the snapshot's chronyd");
+        let retired = body
+            .find("let chronyd_retired = chronyd_retired.await;")
+            .expect("the restore no longer waits for the snapshot's chronyd to be gone");
+        let clock = body
+            .find("crate::bootplan::set_system_clock(host_time")
+            .expect("the restore path no longer steps the clock");
+        let restart = body
+            .find("crate::agent::restart_chronyd_after_restore(retired)")
+            .expect("the restore no longer starts a fresh chronyd");
+        assert!(
+            retire < retired && retired < clock && clock < restart,
+            "retire={retire} retired={retired} clock={clock} restart={restart}"
+        );
+        assert!(
+            !body.contains("\"makestep\""),
+            "the restore asks the snapshot's chronyd to apply its leftover correction"
+        );
+    }
+
     #[test]
     fn the_clock_steps_after_the_egress_gate_opens_and_before_publication() {
         let body = handle_clone_restore_source();
@@ -1080,13 +1110,6 @@ mod tests {
         assert!(
             clock < nfs,
             "the NFS remount must see the stepped clock: clock={clock} nfs={nfs}"
-        );
-        let burst = body.find("crate::snapshot_network::chrony_burst()").expect(
-            "the restore no longer asks chronyd to measure after the gate rejected its polls",
-        );
-        assert!(
-            clock < burst,
-            "the burst must follow the step: clock={clock} burst={burst}"
         );
         assert!(
             boundary < clock && clock < publish,
