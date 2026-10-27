@@ -115,7 +115,7 @@ test("screenshots", async ({ page, browser }) => {
   await openWall(phone, 3, "aggregated");
   await phone.waitForTimeout(800);
   await shot(phone, "phone");
-  // An opened VM on a phone: full width, the tiles around it dimmed, the sheet folded to its handle, then open.
+  // An opened VM on a phone: full width at the top, the tiles around it dimmed, its details below; then folded.
   const pt = await tileBox(phone, "fcvm:6");
   await phone.mouse.click(pt.x + pt.w / 2, pt.y + pt.h / 2);
   await expect(phone.getByTestId("focus-stream")).toContainText(/^\d+p · \d+ fps/, { timeout: 15_000 });
@@ -123,7 +123,7 @@ test("screenshots", async ({ page, browser }) => {
   await shot(phone, "phone-tile-opened");
   await phone.getByTestId("sheet-toggle").click();
   await phone.waitForTimeout(500);
-  await shot(phone, "phone-tile-details");
+  await shot(phone, "phone-tile-folded");
   await ctx.close();
 
   // Leave the fleet at rest.

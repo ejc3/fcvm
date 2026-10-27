@@ -160,6 +160,8 @@ export interface ZoomInsets {
   left: number;
   /** Width of a side sheet over the right edge, which the tile moves clear of when it can without shrinking. */
   sheet: number;
+  /** Where the tile sits in the room left: centred, or at its top (a phone, with the sheet below it). */
+  align?: "center" | "top";
 }
 
 /**
@@ -175,13 +177,7 @@ export function zoomTarget(area: Box, rect: Rect, imageAspect: number, insets: Z
   };
   const fit = fitContain(inner, tileAspectOf(rect, imageAspect));
   const clear = area.x + area.w - insets.sheet - fit.w;
-  return { ...fit, x: Math.max(inner.x, Math.min(fit.x, clear)) };
-}
-
-/** Whether an opened tile, at full size, lies clear of the side sheet: then the sheet starts open. */
-export function sheetClears(area: Box, rect: Rect, imageAspect: number, insets: ZoomInsets): boolean {
-  const z = zoomTarget(area, rect, imageAspect, insets);
-  return z.x + z.w <= area.x + area.w - insets.sheet + 0.5;
+  return { ...fit, x: Math.max(inner.x, Math.min(fit.x, clear)), y: insets.align === "top" ? inner.y : fit.y };
 }
 
 /** The image box that puts the tile with rectangle `rect` exactly on `target`. */

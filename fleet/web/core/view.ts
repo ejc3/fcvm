@@ -762,6 +762,8 @@ export interface FocusView {
   readings: Reading[];
   /** Where the VM is drawn at this step of the zoom, and the height its stream is asked for. */
   placed: { box: Box; streamHeight: number } | null;
+  /** Where it ends once zoomed (a phone's bottom sheet starts under it). */
+  target: Box | null;
 }
 
 /** The renderer's own resolution for one tile: what the viewer's own GPU asks for. */
@@ -774,12 +776,12 @@ export const ZOOM_DIM_FAR = 0.82;
 export const ZOOM_SHEET_W = 380;
 
 /**
- * Room an opened VM leaves around it. On a phone it is full width, under a bar and above the
- * bottom sheet's handle; elsewhere a margin all round wide enough to show the tiles next to it,
+ * Room an opened VM leaves around it. On a phone it is full width, at the top under a bar, with at
+ * least 240 px below it for the bottom sheet; elsewhere a margin all round wide enough to show the tiles next to it,
  * with the bar over the top, and clear of a side sheet `sheet` wide when that costs no size.
  */
 export function zoomInsetsFor(phone: boolean, sheet: number): ZoomInsets {
-  return phone ? { top: 56, right: 0, bottom: 76, left: 0, sheet: 0 } : { top: 72, right: 56, bottom: 48, left: 56, sheet };
+  return phone ? { top: 56, right: 0, bottom: 240, left: 0, sheet: 0, align: "top" } : { top: 72, right: 56, bottom: 48, left: 56, sheet };
 }
 
 function sparkline(samples: readonly GpuSample[], key: "temp_c" | "power_w" | "util_pct"): string {
@@ -818,6 +820,7 @@ function focusView(
   srvNow: number,
   online: boolean,
   placed: { box: Box; streamHeight: number } | null,
+  target: Box | null,
 ): FocusView {
   const fs = s.frames?.tiles[`d:${t.id}`];
   const lr = t.last_relaunch;
@@ -864,6 +867,7 @@ function focusView(
     readingsTitle: "GPU, live",
     readings,
     placed,
+    target,
   };
 }
 
@@ -1521,7 +1525,7 @@ export function wallView(input: WallInput): WallView {
     return b && zArea && boxesMeet(b, zArea) ? b : null;
   };
   const focusPlaced = zoom?.focus && focusTile && zoom.focus.id === focusTile.id ? { box: zoom.focus.box, streamHeight: detailHeight ?? zoom.focus.streamHeight } : null;
-  const focus = focusTile ? focusView(s, tiles.find((x) => x.id === focusTile.id)!, focusTile, input, srvNow, online, focusPlaced) : null;
+  const focus = focusTile ? focusView(s, tiles.find((x) => x.id === focusTile.id)!, focusTile, input, srvNow, online, focusPlaced, opening && zArea ? zoomTarget(zArea, opening.rect, st.image_aspect, insets) : null) : null;
   const covered = focus !== null || own !== null || zoom !== null;
 
   // Direct: each tile asks for the device pixels it covers. With the viewer's own GPU on screen

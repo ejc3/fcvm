@@ -3,8 +3,8 @@
 // One VM opened: the canvas zooms the image until that VM fills the screen, with the
 // tiles around it dimmed (core/view.ts, plan.zoom). This overlay draws what sits over
 // the picture: a bar with the way back, an outline on the VM, and a sheet with its
-// details, restart timeline and live GPU readings. The sheet lies over the picture
-// (a side sheet on a wide screen, a bottom sheet on a phone) and folds away.
+// details, restart timeline and live GPU readings. The sheet starts open (over the
+// picture's right side on a wide screen, under the picture on a phone) and folds away.
 
 import { useEffect, useRef, type CSSProperties } from "react";
 import type { Direction, FocusView, TimelineStep } from "../../core/index.ts";
@@ -135,7 +135,10 @@ export function FocusPanel({
         ) : null}
       </nav>
       {/* Folded on a wide screen the sheet is off screen and out of the keyboard path; on a phone its handle stays. */}
-      <aside id="focus-sheet" className={`sheet${sheetOpen ? " open" : ""}`} data-testid="focus-sheet" aria-label={`${focus.title} details`} inert={!phone && !sheetOpen}>
+      <aside id="focus-sheet" className={`sheet${sheetOpen ? " open" : ""}`} data-testid="focus-sheet" aria-label={`${focus.title} details`}
+        inert={!phone && !sheetOpen}
+        style={phone && focus.target ? { top: Math.round(focus.target.y + focus.target.h + 8) } : undefined}
+      >
         <div className="sheet-head">
           {phone ? (
             <button type="button" className="sheet-handle" aria-expanded={sheetOpen} aria-controls="focus-sheet" onClick={() => onSheet(!sheetOpen)} data-testid="sheet-toggle">
