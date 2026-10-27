@@ -137,19 +137,35 @@ export interface Scoreboard {
   ec2: HalfScore | null;
 }
 
-/** Where the directed camera can hold next, with this hold's votes. */
+/** A stop the open vote is among, with its votes. */
 export interface NudgeTarget {
   id: string;
   label: string;
   votes: number;
+  /** When the camera gets there if it wins the open vote. */
+  arrive_at: number | null;
 }
 
+/**
+ * The directed camera. The vote is always open, for the first hold not yet decided: `next`
+ * while it is null, else the hold after it.
+ */
 export interface Nudges {
   targets: NudgeTarget[];
-  /** The target the camera holds on now, or null while it flies. */
+  /** The target the camera holds on now, or null while it flies, and its label. */
   holding: string | null;
+  holding_label: string | null;
   /** When the camera leaves for the next hold. */
   next_hold_at: number | null;
+  /** The next hold once decided, its label, and when the camera gets there. */
+  next: string | null;
+  next_label: string | null;
+  arrive_next_at: number | null;
+  /** The target that wins if the open vote closed now. */
+  leading: string | null;
+  /** When the open vote opened and when it closes. */
+  opened_at: number | null;
+  closes_at: number | null;
 }
 
 export interface Host {
@@ -644,10 +660,17 @@ function parseNudges(v: unknown): Nudges | null {
     targets: arr(v, "targets", "nudges").map((t, i) => {
       const where = `nudges.targets[${i}]`;
       if (!isObj(t)) throw new ProtocolError(`${where} is not an object`);
-      return { id: str(t, "id", where), label: str(t, "label", where), votes: numOrNull(t, "votes", where) ?? 0 };
+      return { id: str(t, "id", where), label: str(t, "label", where), votes: numOrNull(t, "votes", where) ?? 0, arrive_at: numOrNull(t, "arrive_at", where) };
     }),
     holding: strOrNull(v, "holding", "nudges"),
+    holding_label: strOrNull(v, "holding_label", "nudges"),
     next_hold_at: numOrNull(v, "next_hold_at", "nudges"),
+    next: strOrNull(v, "next", "nudges"),
+    next_label: strOrNull(v, "next_label", "nudges"),
+    arrive_next_at: numOrNull(v, "arrive_next_at", "nudges"),
+    leading: strOrNull(v, "leading", "nudges"),
+    opened_at: numOrNull(v, "opened_at", "nudges"),
+    closes_at: numOrNull(v, "closes_at", "nudges"),
   };
 }
 

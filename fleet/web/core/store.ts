@@ -468,7 +468,8 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
                   s.version,
                 )
               : s.pending.filter((p) => p.intent.id !== msg.id);
-            if (!applied || mine.intent.name === "word") {
+            // A word and a stop choice say what happened to them; other actions speak only when refused.
+            if (!applied || mine.intent.name === "word" || mine.intent.name === "nudge") {
               notices = [
                 ...s.notices,
                 {
