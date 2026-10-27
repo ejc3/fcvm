@@ -613,25 +613,17 @@ async fn relaunch(
     timings.insert("teardown_ms".to_string(), ms(t0.elapsed()));
 
     ctx.report("restoring", generation, &timings, None, None);
-    let spec = VmSpec {
-        fcvm: ctx.cfg.fcvm.clone(),
-        name: ctx.vm_name(),
-        sbdf: ctx.sbdf.clone(),
-        publish: format!("{}:{}:8080", ctx.cfg.publish_ip, ctx.port),
-        extra_args: {
-            let mut a = match (&ctx.cfg.ipv6_prefix, ctx.ipv6) {
-                (Some(p), Some(a)) => super::addr::vm_args(p, a),
-                _ => Vec::new(),
-            };
-            if let Some(p) = ctx.tls_port {
-                a.push("--publish".into());
-                a.push(format!("{}:{p}:443", ctx.cfg.publish_ip));
-            }
-            a.extend(ctx.cfg.extra_args.iter().cloned());
-            a
-        },
-        image: ctx.cfg.image.clone(),
-    };
+    let spec = VmSpec::for_slot(
+        ctx.cfg.fcvm.clone(),
+        ctx.vm_name(),
+        ctx.sbdf.clone(),
+        &ctx.cfg.publish_ip,
+        ctx.port,
+        ctx.tls_port,
+        ctx.cfg.ipv6_prefix.as_ref().zip(ctx.ipv6),
+        &ctx.cfg.extra_args,
+        ctx.cfg.image.clone(),
+    );
     let mut vm = Vm::spawn(&spec, &ctx.id).map_err(|e| Failure::Failed {
         error: format!("{e:#}"),
         attach: false,

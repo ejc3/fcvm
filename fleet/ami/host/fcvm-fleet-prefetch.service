@@ -1,0 +1,19 @@
+# Reads what a GPU VM launch reads from the root volume (prefetch.sh) as soon as the root
+# file system is mounted, while cloud-init, the network and the store come up, so the
+# agent's first launches after a wake do not fetch those blocks from S3 one fault at a
+# time. A hint: nothing waits for it and its failure stops nothing.
+[Unit]
+Description=fcvm fleet: read the GPU VM launch's root volume files ahead of the agent
+DefaultDependencies=no
+After=local-fs.target
+Before=shutdown.target
+Conflicts=shutdown.target
+ConditionPathExists=/etc/fcvm-fleet/prefetch.list
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/fcvm-fleet/prefetch.sh
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

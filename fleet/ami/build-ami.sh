@@ -64,8 +64,12 @@ launch)
     tile) type=${TYPE:-g4dn.xlarge}; profile=fcvm-fleet-tile; size=32 ;;
     *) echo "launch host|tile" >&2; exit 2 ;;
   esac
-  id=$(A ec2 run-instances --image-id "${BASE_AMI:-$(ubuntu_ami)}" --instance-type "$type" --subnet-id "$(subnet)" \
-    --security-group-ids "$(sg)" --iam-instance-profile Name=$profile \
+  # A host builder gets an IPv6 prefix, as a fleet host does: build.sh's root warm-up
+  # (warm-root.sh) launches a routed VM at an address in it.
+  net="DeviceIndex=0,SubnetId=$(subnet),Groups=$(sg),AssociatePublicIpAddress=true,DeleteOnTermination=true"
+  [ "$kind" = host ] && net="$net,Ipv6PrefixCount=1"
+  id=$(A ec2 run-instances --image-id "${BASE_AMI:-$(ubuntu_ami)}" --instance-type "$type" \
+    --network-interfaces "$net" --iam-instance-profile Name=$profile \
     --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled \
     --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":$size,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=fcvm-fleet-ami-builder-$kind},{Key=Purpose,Value=fcvm-fleet-ami-build}]" \

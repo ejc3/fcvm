@@ -40,7 +40,7 @@ prep)
   $APT update
   $APT install -y build-essential git jq qemu-utils busybox-static pkg-config libssl-dev clang make \
     podman skopeo uidmap slirp4netns fuse3 passt btrfs-progs bc bison flex libelf-dev libseccomp-dev \
-    curl zstd ffmpeg python3-pil python3-boto3
+    curl zstd ffmpeg python3-pil python3-boto3 strace
   # AGENTS.md "Fresh Bare-Metal Box Quickstart", steps 1, 1b, 1c and 4, made persistent.
   usermod -aG kvm "$U"
   loginctl enable-linger "$U"
@@ -68,11 +68,13 @@ X
   update-initramfs -u
   update-grub
   install -d /usr/local/lib/fcvm-fleet /var/lib/fcvm-fleet /etc/fcvm-fleet
-  install -m 0755 "$HERE/bind-vfio.sh" "$HERE/store.sh" "$HERE/s3-cat.py" /usr/local/lib/fcvm-fleet/
-  install -m 0644 "$HERE/fcvm-fleet-vfio.service" "$HERE/fcvm-fleet-store.service" "$HERE/fcvm-fleet-agent.service" /etc/systemd/system/
+  install -m 0755 "$HERE/bind-vfio.sh" "$HERE/store.sh" "$HERE/s3-cat.py" "$HERE/prefetch.sh" "$HERE/warm-root.sh" /usr/local/lib/fcvm-fleet/
+  install -m 0644 "$HERE/fcvm-fleet-vfio.service" "$HERE/fcvm-fleet-store.service" "$HERE/fcvm-fleet-agent.service" \
+    "$HERE/fcvm-fleet-prefetch.service" /etc/systemd/system/
   systemctl daemon-reload
-  # The agent starts once the store is restored, on a host whose boot wrote agent.env.
-  systemctl enable fcvm-fleet-vfio.service fcvm-fleet-store.service fcvm-fleet-agent.service
+  # The agent starts once the store is restored, on a host whose boot wrote agent.env. The
+  # prefetch reads the agent's launch files from the root volume first (warm-root.sh).
+  systemctl enable fcvm-fleet-vfio.service fcvm-fleet-store.service fcvm-fleet-agent.service fcvm-fleet-prefetch.service
   # Units a GPU host does not use. At the first boot each reads its files from the lazily
   # loaded root volume while the store is restored (podman's own units, apport, fwupd,
   # ModemManager, udisks2 and the rest started within 1 s of the store on a cold boot).
@@ -123,13 +125,20 @@ build)
   # the same config as the build user's.
   podman load -q -i /mnt/fcvm-btrfs/renderer.oci.tar
   install -D -m 0644 "$UH/.config/fcvm/rootfs-config.toml" /root/.config/fcvm/rootfs-config.toml
+  # One GPU VM as root, launched as the agent launches a slot: the pre-start snapshot the
+  # agent's restores hit, and the list of root volume files the prefetch reads at boot.
+  bash "$HERE/warm-root.sh" "$G0" /etc/fcvm-fleet/prefetch.list
   zstd -q -T0 -f --rm /mnt/fcvm-btrfs/renderer.oci.tar -o /mnt/fcvm-btrfs/renderer.oci.tar.zst
   sha256sum /mnt/fcvm-btrfs/renderer.oci.tar.zst | tee "$S/renderer.sha256"
   as_user "podman image inspect localhost/fcvm-renderer:fleet --format '{{.Id}}'" | tee "$S/renderer.id"
   ;;
 bake)
   pkill -TERM -x fcvm || true; sleep 2
-  install -m 0755 "$HERE/warm.sh" "$HERE/store.sh" "$HERE/s3-cat.py" /usr/local/lib/fcvm-fleet/
+  install -m 0755 "$HERE/warm.sh" "$HERE/store.sh" "$HERE/s3-cat.py" "$HERE/prefetch.sh" "$HERE/warm-root.sh" /usr/local/lib/fcvm-fleet/
+  install -m 0644 "$HERE/fcvm-fleet-prefetch.service" /etc/systemd/system/
+  systemctl daemon-reload
+  systemctl enable fcvm-fleet-prefetch.service
+  [ -s /etc/fcvm-fleet/prefetch.list ] || { echo "no /etc/fcvm-fleet/prefetch.list: run the build phase (warm-root.sh)"; exit 1; }
   # Where the store's parts are fetched at boot (<prefix><part>.tar.zst); they are uploaded
   # there after bake (fleet/ami/README.md).
   if [ -n "${STORE_S3_PREFIX:-}" ]; then

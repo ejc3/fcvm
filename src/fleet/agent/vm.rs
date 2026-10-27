@@ -29,6 +29,42 @@ pub struct VmSpec {
 }
 
 impl VmSpec {
+    /// A slot's VM: its renderer published on `port` (HTTP, guest 8080) and `tls_port` (TLS,
+    /// guest 443) at `publish_ip`, routed at `ipv6` when the host has a prefix.
+    /// fleet/ami/host/warm-root.sh launches the AMI's warm-up VM the same way, so a woken
+    /// host's first restores find its pre-start snapshot
+    /// (`the_ami_warm_up_launches_its_vm_as_a_slot_is_launched`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_slot(
+        fcvm: PathBuf,
+        name: String,
+        sbdf: String,
+        publish_ip: &str,
+        port: u16,
+        tls_port: Option<u16>,
+        ipv6: Option<(&super::addr::Prefix, std::net::Ipv6Addr)>,
+        extra: &[String],
+        image: String,
+    ) -> VmSpec {
+        let mut extra_args = match ipv6 {
+            Some((p, a)) => super::addr::vm_args(p, a),
+            None => Vec::new(),
+        };
+        if let Some(p) = tls_port {
+            extra_args.push("--publish".into());
+            extra_args.push(format!("{publish_ip}:{p}:443"));
+        }
+        extra_args.extend(extra.iter().cloned());
+        VmSpec {
+            fcvm,
+            name,
+            sbdf,
+            publish: format!("{publish_ip}:{port}:8080"),
+            extra_args,
+            image,
+        }
+    }
+
     pub fn args(&self) -> Vec<String> {
         let mut a: Vec<String> = [
             "podman",
@@ -307,6 +343,70 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// The shape of a `podman run` command: each flag and its value, except that a publish
+    /// is its guest port and a name, GPU or address is `v` (those differ per VM and are in
+    /// no snapshot key).
+    fn shape(words: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < words.len() {
+            let w = &words[i];
+            if w.starts_with("--") && i + 1 < words.len() {
+                out.push(w.clone());
+                let v = &words[i + 1];
+                out.push(match w.as_str() {
+                    "--publish" => format!("guest:{}", v.rsplit(':').next().unwrap()),
+                    "--name" | "--gpu" | "--ipv6-prefix" | "--ipv6-address" => "v".into(),
+                    _ => v.clone(),
+                });
+                i += 2;
+            } else {
+                out.push(w.clone());
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// fleet/ami/host/warm-root.sh's VM leaves the pre-start snapshot a woken host's slots
+    /// restore, so it must be launched as a slot is: the same flags in the same order, the
+    /// same guest ports, the agent's image. The AMI's only warm-up used to be warm.sh, a
+    /// rootless VM published on one port, whose snapshot key no slot ever had: every slot of
+    /// every woken host cold-booted and took a snapshot before its first restore.
+    #[test]
+    fn the_ami_warm_up_launches_its_vm_as_a_slot_is_launched() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fleet/ami/host/warm-root.sh");
+        let script = std::fs::read_to_string(path).unwrap();
+        let img = script
+            .lines()
+            .find_map(|l| l.strip_prefix("IMG="))
+            .expect("warm-root.sh sets IMG");
+        let joined = script.replace("\\\n", " ").replace("\"$IMG\"", img);
+        let line = joined
+            .lines()
+            .find(|l| l.contains("fcvm podman run"))
+            .expect("warm-root.sh runs fcvm podman run");
+        let words: Vec<String> = line[line.find("podman run").unwrap()..]
+            .split_whitespace()
+            .take_while(|w| !w.starts_with('>'))
+            .map(str::to_string)
+            .collect();
+        let prefix = super::super::addr::Prefix::parse("2001:db8:1:2:3::/80").unwrap();
+        let slot = VmSpec::for_slot(
+            "fcvm".into(),
+            "fleet-slot-3".into(),
+            "0000:18:00.0".into(),
+            "0.0.0.0",
+            20103,
+            Some(20203),
+            Some((&prefix, "2001:db8:1:2:3::5".parse().unwrap())),
+            &[],
+            // The agent's --image on the fleet's hosts (ejc3/aws fcvm-fleet.tf).
+            "localhost/fcvm-renderer:fleet".into(),
+        );
+        assert_eq!(shape(&words), shape(&slot.args()), "warm-root.sh: {line}");
     }
 
     #[test]
