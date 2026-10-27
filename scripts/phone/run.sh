@@ -19,12 +19,13 @@
 set -euo pipefail
 GPU=${1:?usage: run.sh <gpu pci address>}
 F=${FCVM:-./target/release/fcvm}
-SDK=${ANDROID_SDK:-/mnt/fcvm-btrfs/android-sdk}
-WORK=$SDK/phone-work
+SDK=$("$(dirname "$0")/sdk.sh" --sdk-path)
+APK=$(ANDROID_SDK="$SDK" "$(dirname "$0")/sdk.sh" --probe-path)
+WORK=$(dirname "$APK")
 IMAGE=localhost/fcvm-phone
 NAME=phone-test-$$
 SRC=$(cd "$(dirname "$0")/../.." && pwd)
-[ -f "$WORK/probe.apk" ] && [ -x "$SDK/emulator/emulator" ] || { echo "run.sh: run scripts/phone/sdk.sh first" >&2; exit 2; }
+[ -f "$APK" ] && [ -x "$SDK/emulator/emulator" ] || { echo "run.sh: run scripts/phone/sdk.sh first" >&2; exit 2; }
 [ "$(cat /sys/module/kvm_intel/parameters/nested 2>/dev/null)" = Y ] || { echo "run.sh: the host's kvm_intel needs nested=1" >&2; exit 2; }
 LOGS=$(mktemp -d)
 podman build -q -t "$IMAGE" "$SRC/fleet/phone" > "$LOGS/build.log" 2>&1 || { cat "$LOGS/build.log"; exit 1; }
@@ -65,7 +66,7 @@ if boot=$(timeout 400 "$F" exec --pid "$pid" -- /usr/local/bin/phone.sh boot 2>&
   ok "Android booted with the host GPU: $boot"
   renderer=$(X /usr/local/bin/phone.sh renderer 2>&1 || true)
   [[ "$renderer" == *"$gpu_name"* ]] && ok "SurfaceFlinger: $renderer" || bad "SurfaceFlinger does not render on '$gpu_name': $renderer"
-  out=$(timeout 120 "$F" exec --pid "$pid" -- /usr/local/bin/phone.sh probe 6 2>&1 || true)
+  out=$(timeout 120 "$F" exec --pid "$pid" -- /usr/local/bin/phone.sh probe 6 "/work/$(basename "$APK")" 2>&1 || true)
   echo "$out" > "$LOGS/probe.log"
   app_renderer=$(grep -m1 -o 'renderer=.* vendor=' <<< "$out" || true)
   [[ "$app_renderer" == *"$gpu_name"* ]] && ok "the app's GLES context: $app_renderer" || bad "the app's renderer does not name '$gpu_name': ${app_renderer:-none} (log $LOGS/probe.log)"

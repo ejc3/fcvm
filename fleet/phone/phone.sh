@@ -6,7 +6,7 @@
 #
 #   phone.sh boot            cold boot; prints boot_completed_ms
 #   phone.sh renderer        prints the GLES renderer SurfaceFlinger composes with
-#   phone.sh probe [secs]    installs and starts /work/probe.apk, prints its log lines
+#   phone.sh probe secs apk  installs and starts the probe app, prints its log lines
 #   phone.sh stop
 set -euo pipefail
 export ANDROID_SDK_ROOT=/sdk ANDROID_HOME=/sdk ANDROID_AVD_HOME=/root/.android/avd
@@ -73,7 +73,7 @@ renderer)
   "$ADB" shell dumpsys SurfaceFlinger | tr -d '\r' | grep -m1 '^GLES:'
   ;;
 probe)
-  "$ADB" install -r /work/probe.apk > /dev/null
+  "$ADB" install -r "${3:?usage: phone.sh probe secs apk}" > /dev/null
   "$ADB" logcat -c
   "$ADB" shell am start -W -n dev.fcvm.probe/.MainActivity | tr -d '\r' | grep -E '^(Status|TotalTime)'
   sleep "${2:-5}"
@@ -83,7 +83,7 @@ stop)
   "$ADB" emu kill > /dev/null 2>&1 || true
   ;;
 *)
-  echo "usage: phone.sh boot|renderer|probe [secs]|stop" >&2
+  echo "usage: phone.sh boot|renderer|probe secs apk|stop" >&2
   exit 2
   ;;
 esac
