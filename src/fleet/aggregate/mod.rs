@@ -66,6 +66,11 @@ pub struct Layout {
     pub generation: u64,
     #[serde(default)]
     pub from_frame: i64,
+    /// The coordinator's admission keys (hex): with any, the public listener's `/frames`
+    /// needs a direct token made with one, and this aggregator's own tile subscriptions carry
+    /// one it makes with the first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admit_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -580,6 +585,10 @@ async fn pipeline(
                 full.push('&');
                 full.push_str(&opts.tile_query);
             }
+            if let Some(token) = own_token(&layout.admit_keys) {
+                full.push_str("&admit=");
+                full.push_str(&token);
+            }
             tokio::spawn(tile::read(
                 i,
                 full,
@@ -853,6 +862,50 @@ async fn frames_route(ws: WebSocketUpgrade, State(app): State<Arc<Shared>>) -> i
     ws.on_upgrade(move |socket| viewer(socket, app))
 }
 
+/// The public listener's `/frames`: with admission keys in the layout, only a request with a
+/// direct token made with one of them (`admit=`) gets the stream; anything else gets 403.
+async fn admitted_frames_route(
+    ws: WebSocketUpgrade,
+    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    State(app): State<Arc<Shared>>,
+) -> axum::response::Response {
+    let keys = app
+        .layout
+        .borrow()
+        .as_ref()
+        .map(|l| l.admit_keys.clone())
+        .unwrap_or_default();
+    if !admitted(&keys, q.get("admit").map(String::as_str)) {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "a direct token is required",
+        )
+            .into_response();
+    }
+    ws.on_upgrade(move |socket| viewer(socket, app))
+        .into_response()
+}
+
+/// Whether a request with `token` may stream, under the layout's admission keys (hex).
+pub fn admitted(keys_hex: &[String], token: Option<&str>) -> bool {
+    use crate::fleet::coord::admission::{direct_token_valid, AdmitKey};
+    if keys_hex.is_empty() {
+        return true;
+    }
+    let keys: Vec<AdmitKey> = keys_hex
+        .iter()
+        .filter_map(|h| AdmitKey::from_hex(h))
+        .collect();
+    token.is_some_and(|t| direct_token_valid(&keys, t, now_ms() / 1000))
+}
+
+/// A direct token for this aggregator's own tile subscriptions, made with the newest key.
+fn own_token(keys_hex: &[String]) -> Option<String> {
+    use crate::fleet::coord::admission::{AdmitKey, DIRECT_TOKEN_SECS};
+    let key = AdmitKey::from_hex(keys_hex.first()?)?;
+    Some(key.direct_token("aggregator", now_ms() / 1000 + DIRECT_TOKEN_SECS))
+}
+
 async fn viewer(socket: WebSocket, app: Arc<Shared>) {
     let (sink, mut stream) = socket.split();
     // Read and ignore what the viewer sends (a height request), so pings get answered.
@@ -936,7 +989,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
 /// never the layout or the stats.
 pub fn public_router(shared: Arc<Shared>) -> Router {
     Router::new()
-        .route("/frames", get(frames_route))
+        .route("/frames", get(admitted_frames_route))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(shared)
 }
@@ -1056,6 +1109,7 @@ mod tests {
             }],
             generation: 1,
             from_frame: 0,
+            admit_keys: Vec::new(),
         };
         let opts = Options {
             image_height: 36,
@@ -1106,6 +1160,7 @@ mod tests {
             }],
             generation,
             from_frame,
+            admit_keys: Vec::new(),
         }
     }
 

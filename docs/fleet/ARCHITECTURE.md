@@ -400,7 +400,8 @@ browser: IVS web player; the overlay drawn from the state in effect at the shown
 
 **Enforcement is server side.** A renderer's or aggregator's `GET /frames` needs an `admit`
 token once it holds an admission key: `v1.<expiry, unix s>.<viewer>.<mac>`, the mac an
-HMAC-SHA256 of the first three fields with a 32-byte key the coordinator makes at start. The
+HMAC-SHA256 of the first three fields with a 32-byte key the coordinator makes at start (it sends
+keys only when it runs a broadcast, so a fleet without one checks nothing). The
 key reaches renderers in the scene the agent posts (the coordinator posts the EC2 tiles'
 scenes) and aggregators in their layout, and never appears in a snapshot. A renderer
 accepts the current key and the one before it, so a new key does not cut off a viewer between

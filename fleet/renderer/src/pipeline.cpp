@@ -1,4 +1,6 @@
 #include "pipeline.h"
+#include "admit.h"
+#include <ctime>
 
 #include <sys/resource.h>
 #include <time.h>
@@ -254,6 +256,9 @@ bool Pipeline::post_scene(const std::string& body, std::string* err) {
       k_last = std::llround(last_t_ * opt_.fps);
     }
     std::lock_guard<std::mutex> l(mu_);
+    // A scene with keys turns the check on (keeping the keys before them for a token made
+    // just before a new one); a scene without turns it off.
+    admit_keys_ = sc->admit_keys.empty() ? std::vector<std::string>{} : admit_keys_after(admit_keys_, sc->admit_keys);
     bool same_clock = scene_->epoch_unix_ms == sc->epoch_unix_ms;
     scene_ = sc;
     scene_prev_ = prev;
@@ -274,6 +279,15 @@ bool Pipeline::post_scene(const std::string& body, std::string* err) {
   }
   cv_.notify_all();
   return true;
+}
+
+bool Pipeline::admits(const std::string& token) {
+  std::vector<std::string> keys;
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    keys = admit_keys_;
+  }
+  return keys.empty() || admit_token_valid(keys, token, (int64_t)time(nullptr));
 }
 
 bool Pipeline::post_budget(const std::string& body, std::string* err) {

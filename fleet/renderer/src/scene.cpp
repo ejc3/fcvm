@@ -1,4 +1,5 @@
 #include "scene.h"
+#include "admit.h"
 
 #include <algorithm>
 #include <map>
@@ -133,6 +134,11 @@ Scene parse_scene(const std::string& body) {
         if (!(c >= 0 && c <= 64)) throw std::runtime_error("'lights[].color' components must be in 0..64");
       s.lights.push_back(sl);
     }
+  }
+  if (j.has("admit_keys") && j.at("admit_keys").type != Json::Null) {
+    const auto& ks = j.at("admit_keys").array("admit_keys");
+    if (ks.size() > 4) throw std::runtime_error("'admit_keys' has more than 4 keys");
+    for (const Json& k : ks) s.admit_keys.push_back(admit_key_from_hex(k.string("admit_keys[]")));
   }
   if (j.has("budget")) {
     s.budget = j.at("budget").number("budget");

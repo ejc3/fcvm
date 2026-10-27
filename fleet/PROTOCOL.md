@@ -1070,6 +1070,10 @@ processes; the host needs the `ffmpeg` CLI with libx264.
   keyframe.
 - The region's size is its share of a whole image `--image-height` tall (default 1080):
   the fcvm half of a 1920 x 1080 image is 960 x 1080. `?h=` is accepted and ignored.
+- `admit_keys` in a layout (the coordinator's admission keys, hex): the public
+  listener's `/frames` then needs `admit=<direct token>` made with one of them (`403`
+  otherwise), and the aggregator's own tile subscriptions carry a token it makes with the
+  first. The agent passes its scene's keys; the coordinator its own.
 - `POST /layout`: `{"epoch_unix_ms","image_aspect","region":{x,y,w,h},
   "tiles":[{"id","rect","url"}],"generation","from_frame"}` (`generation` and `from_frame`
   default to 0: the layout generation of the tiles' rects and its frame; the agent sends
@@ -1172,6 +1176,10 @@ grants. The body is at most 1 MiB.
  "words": [{"text": "HELLO", "t": 12.0}],
  "lights": [{"pos": [-36, 1.75, -61], "color": [1.0, 0.45, 0.15], "t": 30.0}]}
 ```
+
+`admit_keys` (optional): the coordinator's admission keys, hex, newest first, at
+most 4 (see `GET /frames`). The coordinator sends them only when it runs a
+broadcast; they never appear in a browser's snapshot.
 
 | field | meaning | accepted |
 |-------|---------|----------|
@@ -1299,7 +1307,12 @@ screen.
 ### `GET /frames?h=<height>&q=<quality>` (WebSocket)
 
 `h` is 16 to 2160. `q` is optional: `hi`, `std` (the default) or `lo`; see
-"Stream quality". The tile's size follows from `h` and the rect; see
+"Stream quality". Once a scene has brought `admit_keys`, the request also needs
+`admit=<direct token>` (the coordinator's `admission` message) made with one of
+them and not expired; anything else is `403` before the upgrade. The renderer
+keeps the newest keys and the ones before them (at most 4), so a token made just
+before a new key still opens a stream; a scene without `admit_keys` turns the
+check off. The token is checked when the stream opens, not while it runs. The tile's size follows from `h` and the rect; see
 "Tile geometry". The first message is text:
 
 ```json

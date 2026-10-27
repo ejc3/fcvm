@@ -51,6 +51,9 @@ pub struct Snapshot {
 }
 
 pub enum Cmd {
+    /// The admission keys (hex, newest first) renderers and aggregators check direct
+    /// tokens with; empty turns the check off.
+    AdmitKeys(Vec<String>),
     /// Apply an event; its `at` is replaced with the actor's clock. Replies with the
     /// receipt for an intent.
     Apply {
@@ -142,6 +145,8 @@ pub struct Actor {
     state: State,
     /// The EC2 aggregator as the coordinator reaches it (it runs as our child).
     ec2_aggregate_local: Option<String>,
+    /// The admission keys every scene and layout carries (empty: no check).
+    admit_keys: Vec<String>,
     out: Outputs,
     agents: HashMap<u64, AgentConn>,
     last_at: u64,
@@ -168,6 +173,7 @@ impl Actor {
     pub fn new(state: State, out: Outputs, clock: Box<dyn Fn() -> u64 + Send>) -> Self {
         let mut actor = Actor {
             ec2_aggregate_local: None,
+            admit_keys: Vec::new(),
             stored: state.version,
             published: state.version,
             state,
@@ -261,7 +267,8 @@ impl Actor {
         self.update_zone();
         let assignments = host_assignments(&self.state);
         let regions = host_regions(&self.state);
-        let scene = shared_scene(&self.state);
+        let mut scene = shared_scene(&self.state);
+        scene.admit_keys = self.admit_keys.clone();
         self.out.scene.send_if_modified(|cur| {
             let changed = cur.as_ref() != Some(&scene);
             *cur = Some(scene.clone());
@@ -314,13 +321,17 @@ impl Actor {
                 .collect(),
             generation: f.layout.generation,
             from_frame: f.layout.from_frame,
+            admit_keys: self.admit_keys.clone(),
         });
         self.out.ec2_layout.send_if_modified(|cur| {
             let changed = *cur != ec2_layout;
             *cur = ec2_layout.clone();
             changed
         });
-        let broadcast_layout = broadcast::layout(&self.state);
+        let broadcast_layout = broadcast::layout(&self.state).map(|l| Layout {
+            admit_keys: self.admit_keys.clone(),
+            ..l
+        });
         self.out.broadcast_layout.send_if_modified(|cur| {
             let changed = *cur != broadcast_layout;
             *cur = broadcast_layout.clone();
@@ -420,6 +431,10 @@ impl Actor {
             Cmd::Sky { reply } => {
                 let _ = reply.send(fleet_core::apply::sky(&self.state));
             }
+            Cmd::AdmitKeys(keys) => {
+                self.admit_keys = keys;
+                self.dispatch_agents();
+            }
             Cmd::PosterPlan { reply } => {
                 let f = &self.state.fleet;
                 // Starting tiles (a race, a first launch) are black until they run.
@@ -449,6 +464,22 @@ impl Actor {
                     .filter(|_| f.layout.ec2.is_some())
                 {
                     sources.push(u);
+                }
+                // The poster reads the aggregators' public streams: with admission keys, as
+                // a holder of a direct token.
+                if let Some(key) = self
+                    .admit_keys
+                    .first()
+                    .and_then(|h| admission::AdmitKey::from_hex(h))
+                {
+                    let token = key.direct_token(
+                        "poster",
+                        crate::fleet::now_ms() / 1000 + admission::DIRECT_TOKEN_SECS,
+                    );
+                    for u in &mut sources {
+                        let sep = if u.contains('?') { '&' } else { '?' };
+                        u.push_str(&format!("{sep}admit={token}"));
+                    }
                 }
                 let plan = poster::Plan {
                     step: d.step,
@@ -738,6 +769,11 @@ impl Handle {
             return Vec::new();
         }
         rx.await.unwrap_or_default()
+    }
+
+    /// Have renderers and aggregators check direct tokens made with these keys.
+    pub async fn set_admit_keys(&self, keys: Vec<String>) {
+        let _ = self.cmds.send(Cmd::AdmitKeys(keys)).await;
     }
 
     pub async fn poster_plan(&self) -> Option<poster::Plan> {
@@ -1227,6 +1263,11 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         decoder,
         encoder,
     ));
+    // With a broadcast, direct streams are for seated viewers only: renderers and aggregators
+    // check the direct token made with this key. Without one, nothing is checked.
+    if gate.seats.capacity().is_some() {
+        handle.set_admit_keys(vec![gate.key.hex()]).await;
+    }
     let cfg = live::LiveConfig {
         checker,
         allowed_origins: args.allowed_origins,

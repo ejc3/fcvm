@@ -120,6 +120,7 @@ pub fn layout(state: &State) -> Option<Layout> {
         tiles,
         generation: f.layout.generation,
         from_frame: f.layout.from_frame,
+        admit_keys: Vec::new(),
     })
 }
 

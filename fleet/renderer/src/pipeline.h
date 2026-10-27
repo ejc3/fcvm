@@ -59,6 +59,9 @@ class Pipeline {
   void unsubscribe(const std::shared_ptr<Subscriber>& s);
   void wake();
   bool post_scene(const std::string& body, std::string* err);
+  // Whether a GET /frames with this direct token may stream (admit.h): always while no
+  // scene has brought admission keys.
+  bool admits(const std::string& token);
   // POST /budget: {"budget": B, "t": T}, B pixel-samples per frame from the
   // first slot at or after scene time T.
   bool post_budget(const std::string& body, std::string* err);
@@ -149,6 +152,7 @@ class Pipeline {
   // layout generations: the scene with previous_rect, drawn before
   // rect_from_frame; the generation in effect and a pending switch (under mu_)
   std::shared_ptr<const Scene> scene_prev_;
+  std::vector<std::string> admit_keys_;  // under mu_ (post_scene writes it)
   LayoutSwitch lay_;  // under mu_ (post_scene writes it)
   uint64_t scene_version_ = 0;
   std::vector<std::shared_ptr<Subscriber>> subs_;

@@ -246,6 +246,9 @@ void Server::handle(Conn& c) {
   if (path == "/frames" && method == "GET") {
     if (lower(hdr["upgrade"]) != "websocket" || hdr["sec-websocket-key"].empty())
       return respond(c, 426, "Upgrade Required", "{\"error\":\"WebSocket upgrade required\"}");
+    // With the coordinator's admission keys, only a seated viewer's direct token opens a stream.
+    if (!p_.admits(query_str(query, "admit", "")))
+      return respond(c, 403, "Forbidden", "{\"error\":\"a direct token is required\"}");
     int h = query_int(query, "h", 0);
     if (h < 16 || h > 2160) return respond(c, 400, "Bad Request", "{\"error\":\"h must be 16..2160\"}");
     std::string qs = query_str(query, "q", "std");

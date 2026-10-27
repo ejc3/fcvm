@@ -5688,3 +5688,54 @@ async fn a_closed_seat_is_kept_for_its_ticket_then_freed_without_promoting_anyon
     let mut reload = Viewer::connect(&c.url).await;
     assert_eq!(reload.message("admission").await["locked"], false);
 }
+
+/// The coordinator's admission keys reach every renderer through the scene the agents post,
+/// and the broadcast aggregator through its layout, and never appear in a snapshot.
+#[tokio::test]
+async fn admission_keys_reach_renderers_and_layouts_but_no_browser() {
+    let config = Config {
+        max_tiles: 1,
+        fcvm_tiles: 1,
+        ..Config::default()
+    };
+    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None, None);
+    let key = "ab".repeat(32);
+    handle.set_admit_keys(vec![key.clone()]).await;
+    let mut a = FakeAgent::connect(&handle, "gpu-a", 1);
+    let scene = loop {
+        if let CoordMsg::Scene(s) = a.next().await {
+            if !s.admit_keys.is_empty() {
+                break s;
+            }
+        }
+    };
+    assert_eq!(scene.admit_keys, vec![key.clone()]);
+    assert_eq!(
+        scene
+            .for_renderer(fleet_core::tiling::Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 1.0,
+                h: 1.0
+            })
+            .admit_keys,
+        vec![key.clone()],
+        "the renderer's body carries them"
+    );
+    a.assign().await;
+    a.report("slot-1", "running", 1);
+    let mut layouts = handle.broadcast_layout.clone();
+    let l = tokio::time::timeout(
+        Duration::from_secs(10),
+        layouts.wait_for(|l| l.as_ref().is_some_and(|l| !l.tiles.is_empty())),
+    )
+    .await
+    .expect("a broadcast layout")
+    .unwrap()
+    .clone()
+    .unwrap();
+    assert_eq!(l.admit_keys, vec![key.clone()]);
+    let text = handle.snapshot.borrow().text.clone();
+    assert!(!text.is_empty());
+    assert!(!text.contains(&key), "a snapshot carries an admission key");
+}

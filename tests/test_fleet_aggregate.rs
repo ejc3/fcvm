@@ -214,6 +214,7 @@ async fn tiles_are_joined_at_one_t_without_their_margins() {
             .collect(),
         generation: 1,
         from_frame: 0,
+        admit_keys: Vec::new(),
     });
     let cancel = CancellationToken::new();
     let opts = Options {
@@ -379,6 +380,7 @@ async fn a_region_with_no_tiles_streams_black() {
         }],
         generation: 1,
         from_frame: 0,
+        admit_keys: Vec::new(),
     });
     let cancel = CancellationToken::new();
     let opts = Options {
@@ -467,6 +469,7 @@ async fn a_new_generation_replaces_the_old_composite_all_at_once() {
             .collect(),
         generation,
         from_frame,
+        admit_keys: Vec::new(),
     };
     let shared = Shared::new();
     // Slot a draws the whole region until frame F, then the top half (its renderer sends a
@@ -640,6 +643,7 @@ async fn a_re_tile_of_streaming_tiles_skips_no_slot() {
         ],
         generation: 1,
         from_frame: 0,
+        admit_keys: Vec::new(),
     });
     let cancel = CancellationToken::new();
     let opts = Options {
@@ -671,6 +675,7 @@ async fn a_re_tile_of_streaming_tiles_skips_no_slot() {
         ],
         generation: 2,
         from_frame: f,
+        admit_keys: Vec::new(),
     });
     let k_of = |t: f64| (t * FPS as f64).round() as i64;
     let mut last_old = None;
@@ -757,6 +762,7 @@ async fn the_public_listener_serves_frames_with_tls_and_no_control_routes() {
         }],
         generation: 1,
         from_frame: 0,
+        admit_keys: Vec::new(),
     });
     let cancel = CancellationToken::new();
     let opts = Options {
@@ -898,6 +904,7 @@ async fn a_supervised_aggregator_that_needs_a_layout_stops_without_one() {
         tiles: vec![],
         generation: 0,
         from_frame: 0,
+        admit_keys: Vec::new(),
     };
     tx.send(Some(layout.clone())).unwrap();
     until(true).await;
@@ -927,4 +934,103 @@ async fn a_supervised_aggregator_that_needs_a_layout_stops_without_one() {
         .await
         .expect("supervision ends with its layouts")
         .unwrap();
+}
+
+/// With the coordinator's admission keys in its layout, the aggregator's public `/frames`
+/// streams only to a request with a direct token made with one of them, and its own tile
+/// subscriptions carry such a token (the renderers check it too).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_admission_keys_frames_need_a_direct_token_and_tiles_get_one() {
+    use fcvm::fleet::aggregate::public_router;
+    use fcvm::fleet::coord::admission::{direct_token_valid, AdmitKey};
+    let key = AdmitKey([9; 32]);
+    let epoch = now_ms() - 5_000;
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let tile = FakeTile {
+        header: Header {
+            codec: "raw".into(),
+            width: 64,
+            height: 36,
+            full_width: 64,
+            full_height: 36,
+            x0: 0,
+            y0: 0,
+            fps: FPS,
+            crop: Crop::default(),
+        },
+        id_u: 50,
+        epoch,
+        queries: queries.clone(),
+        from_k: i64::MIN,
+        switch: None,
+        lag_ms: 0.0,
+    };
+    let url = start_tile(tile).await;
+    let whole = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+    let shared = Shared::new();
+    shared.set_layout(Layout {
+        epoch_unix_ms: epoch,
+        image_aspect: 16.0 / 9.0,
+        region: whole,
+        tiles: vec![TileSpec {
+            id: "slot-1".into(),
+            rect: whole,
+            url: Some(url),
+        }],
+        generation: 0,
+        from_frame: 0,
+        admit_keys: vec![key.hex()],
+    });
+    let cancel = CancellationToken::new();
+    let opts = Options {
+        image_height: 36,
+        ..Options::default()
+    };
+    tokio::spawn(run(shared.clone(), Arc::new(Raw), opts, cancel.clone()));
+    // The tile was asked with a token the key validates.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let asked = loop {
+        if let Some(q) = queries.lock().unwrap().first().cloned() {
+            break q;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tile was never subscribed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let token = asked
+        .get("admit")
+        .expect("the subscription carries a token");
+    assert!(direct_token_valid(
+        std::slice::from_ref(&key),
+        token,
+        now_ms() / 1000
+    ));
+    // The public listener: refused without a token or with a forged one, served with one.
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, public_router(shared)).await.unwrap() });
+    let refused = |r: Result<_, tokio_tungstenite::tungstenite::Error>| match r {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => resp.status() == 403,
+        _ => false,
+    };
+    assert!(refused(
+        tokio_tungstenite::connect_async(format!("ws://{addr}/frames")).await
+    ));
+    let forged = AdmitKey([1; 32]).direct_token("v-9", now_ms() / 1000 + 600);
+    assert!(refused(
+        tokio_tungstenite::connect_async(format!("ws://{addr}/frames?admit={forged}")).await
+    ));
+    let good = key.direct_token("v-1", now_ms() / 1000 + 600);
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/frames?admit={good}"))
+        .await
+        .expect("a seated viewer's token opens the stream");
+    assert!(matches!(next_msg(&mut ws).await, Message::Text(_)));
+    cancel.cancel();
 }
