@@ -11,6 +11,9 @@ WORKDIR /src
 COPY Makefile ./
 COPY src ./src
 COPY tests ./tests
+# test-host reads the own-GPU autopilot's lap from fleet/core (make image passes it as the
+# `core` build context), at the path it has beside the source tree.
+COPY --from=core tests/autopilot_lap.json /core/tests/autopilot_lap.json
 RUN make -j"$(nproc)" all && ./build/test-host
 
 FROM docker.io/library/ubuntu:24.04
