@@ -5190,27 +5190,70 @@ async fn run_snapshot_network_command(vsock_socket: &Path, vm_id: &str, flag: &s
     run_fc_agent_one_shot(vsock_socket, vm_id, flag).await
 }
 
+/// Reopen the source's network once a pause has been invoked, and set the source's
+/// clock to the host's before the gate opens.
+///
+/// On the arm64 `nested` (NV2) profile the Firecracker fork freezes the guest's
+/// counters while the VM is paused, so the resumed source is behind the host by the
+/// pause (1.56 s after a 1.6 s pause). chronyd would see that only once the gate lets
+/// its polls out, and would then slew it away at 83 ms/s at most, or step it when it
+/// is over 1 s. The guest steps its clock forward to the host's instant read here
+/// before it reopens the gate, so chronyd's first measurement after the resume is
+/// against the corrected clock. The step is short by the exec's dispatch time, which
+/// the guest cannot measure, and the guest never steps back
+/// (`bootplan::advance_system_clock`), so a source whose clock kept running through
+/// the pause (the arm64 `default` profile: 0 ms behind after the same pause) is left
+/// alone.
+async fn resume_paused_source(vsock_socket: &Path, vm_id: &str) -> Result<()> {
+    let host_time = crate::utils::host_clock_now().as_nanos().to_string();
+    let output = run_fc_agent_command(
+        vsock_socket,
+        vm_id,
+        &["--resume-snapshot-network", "--host-time-ns", &host_time],
+    )
+    .await?;
+    // The one-shot's own report, including the size of the clock step, reaches no
+    // console: it is this exec's stderr.
+    debug!(vm_id, guest = %output.stderr.trim(), "source network reopened");
+    Ok(())
+}
+
 /// Run `fc-agent <flag>` in the guest over the exec channel and fail unless it exits 0.
 pub(crate) async fn run_fc_agent_one_shot(
     vsock_socket: &Path,
     vm_id: &str,
     flag: &str,
 ) -> Result<()> {
+    run_fc_agent_command(vsock_socket, vm_id, &[flag])
+        .await
+        .map(|_| ())
+}
+
+/// Run `fc-agent <args>` in the guest over the exec channel and fail unless it exits 0.
+async fn run_fc_agent_command(
+    vsock_socket: &Path,
+    vm_id: &str,
+    args: &[&str],
+) -> Result<crate::commands::exec::ExecOutput> {
     use crate::commands::exec::run_exec_in_vm_captured;
 
-    let command = vec![FC_AGENT_PATH.to_string(), flag.to_string()];
+    let command: Vec<String> = std::iter::once(FC_AGENT_PATH)
+        .chain(args.iter().copied())
+        .map(str::to_string)
+        .collect();
+    let shown = command.join(" ");
     let output = run_exec_in_vm_captured(vsock_socket, &command, false, vm_id)
         .await
-        .with_context(|| format!("running `{FC_AGENT_PATH} {flag}` in guest {vm_id}"))?;
+        .with_context(|| format!("running `{shown}` in guest {vm_id}"))?;
     anyhow::ensure!(
         output.exit_code == 0,
-        "`{FC_AGENT_PATH} {flag}` failed in guest {vm_id} with exit code {}: \
+        "`{shown}` failed in guest {vm_id} with exit code {}: \
          stdout={:?}, stderr={:?}",
         output.exit_code,
         output.stdout,
         output.stderr
     );
-    Ok(())
+    Ok(output)
 }
 
 /// Preserve the primary snapshot error plus every recovery error in execution
@@ -5524,13 +5567,10 @@ pub async fn create_snapshot_core(
             error!(snapshot = %snapshot_config.name, error = %error,
                 "CRITICAL: failed to resume VM after pause error — VM may be paused!");
         }
-        let guest_network_resume_result = run_snapshot_network_command(
-            vsock_socket_path,
-            &snapshot_config.vm_id,
-            "--resume-snapshot-network",
-        )
-        .await
-        .context("reopening guest network after Firecracker pause failure");
+        let guest_network_resume_result =
+            resume_paused_source(vsock_socket_path, &snapshot_config.vm_id)
+                .await
+                .context("reopening guest network after Firecracker pause failure");
         let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
         return combine_snapshot_boundary_results(
             Err(pause_error),
@@ -5701,13 +5741,11 @@ pub async fn create_snapshot_core(
     // never run again), and must not: the closed gate inside the artifact IS
     // the socket-generation boundary its restored clones consume.
     let guest_network_resume_result = match source_disposition {
-        SnapshotSourceDisposition::Resume => run_snapshot_network_command(
-            vsock_socket_path,
-            &snapshot_config.vm_id,
-            "--resume-snapshot-network",
-        )
-        .await
-        .context("reopening guest network after Firecracker snapshot"),
+        SnapshotSourceDisposition::Resume => {
+            resume_paused_source(vsock_socket_path, &snapshot_config.vm_id)
+                .await
+                .context("reopening guest network after Firecracker snapshot")
+        }
         SnapshotSourceDisposition::LeavePaused => Ok(()),
     };
     if let Err(e) = &guest_network_resume_result {
@@ -5998,13 +6036,10 @@ pub async fn create_snapshot_ch(
             error!(snapshot = %snapshot_config.name, error = %error,
                 "CRITICAL: failed to resume Cloud Hypervisor VM after pause error — VM may be paused!");
         }
-        let guest_network_resume_result = run_snapshot_network_command(
-            vsock_socket_path,
-            &snapshot_config.vm_id,
-            "--resume-snapshot-network",
-        )
-        .await
-        .context("reopening guest network after Cloud Hypervisor pause failure");
+        let guest_network_resume_result =
+            resume_paused_source(vsock_socket_path, &snapshot_config.vm_id)
+                .await
+                .context("reopening guest network after Cloud Hypervisor pause failure");
         let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
         return combine_snapshot_boundary_results(
             Err(pause_error),
@@ -6051,13 +6086,10 @@ pub async fn create_snapshot_ch(
             "CRITICAL: failed to resume Cloud Hypervisor VM after snapshot — VM may be paused!");
     }
 
-    let guest_network_resume_result = run_snapshot_network_command(
-        vsock_socket_path,
-        &snapshot_config.vm_id,
-        "--resume-snapshot-network",
-    )
-    .await
-    .context("reopening guest network after Cloud Hypervisor snapshot");
+    let guest_network_resume_result =
+        resume_paused_source(vsock_socket_path, &snapshot_config.vm_id)
+            .await
+            .context("reopening guest network after Cloud Hypervisor snapshot");
     if let Err(e) = &guest_network_resume_result {
         error!(snapshot = %snapshot_config.name, error = %e,
             "CRITICAL: failed to reopen guest network after Cloud Hypervisor snapshot!");
@@ -7344,6 +7376,43 @@ mod tests {
             offsets.windows(2).all(|pair| pair[0] < pair[1]),
             "{name} does not run {steps:?} in that order: offsets {offsets:?}"
         );
+    }
+
+    /// Every reopen of the source's network after a pause has been invoked sets the
+    /// source's clock to the host's (`resume_paused_source`), on both backends. Where
+    /// the VMM freezes the guest's clock during the pause (the arm64 `nested` profile),
+    /// a source reopened without the step stays behind the host by the pause until
+    /// chronyd corrects it. The reopen after a failed prepare comes before any pause and
+    /// does not step. No fake VMM can drive these functions, so this is pinned by their
+    /// source; `test_source_clock_matches_the_host_after_snapshot_create` measures it.
+    #[test]
+    fn every_reopen_after_a_pause_sets_the_sources_clock() {
+        let source = include_str!("common.rs");
+        for (name, pause) in [
+            ("create_snapshot_core", "state: \"Paused\".to_string()"),
+            ("create_snapshot_ch", ".pause_vm()"),
+        ] {
+            let body = body_of(source, &format!("pub async fn {name}("));
+            let (before, after) = body.split_at(
+                body.find(pause)
+                    .unwrap_or_else(|| panic!("{name} has no `{pause}`")),
+            );
+            assert_eq!(
+                before.matches("\"--resume-snapshot-network\"").count(),
+                1,
+                "{name}: the reopen after a failed prepare changed"
+            );
+            assert!(
+                !after.contains("\"--resume-snapshot-network\""),
+                "{name} reopens the source after its pause without setting its clock"
+            );
+            assert_eq!(
+                after.matches("resume_paused_source(").count(),
+                2,
+                "{name} must reopen through resume_paused_source after a failed pause and \
+                 after the save"
+            );
+        }
     }
 
     /// A memory snapshot's balloon record is read from the VMM inside

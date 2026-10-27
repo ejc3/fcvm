@@ -189,6 +189,19 @@ that must stay: its grace period is the barrier.
 `frames_are_sent_through_the_socket_that_is_never_released` and
 `opening_each_half_is_one_transaction_for_both_families` pin it.
 
+### The source's clock is stepped forward before its gate reopens
+
+On the arm64 `nested` (NV2) profile the Firecracker fork freezes the guest's
+counters while a VM is paused, so a resumed source was behind the host by the
+pause (1.56 s after a 1.6 s pause) until chronyd slewed or stepped it back. Every
+reopen after a pause now passes the host's clock (`resume_paused_source`,
+`src/commands/common.rs`) and the guest steps to it before the gate lets chronyd's
+polls out (`resume_source_network`), so chronyd never measures the lag. The step is
+forward only (`bootplan::advance_system_clock`): the host's instant is a lower bound
+on the present, and the `default` profile keeps the clock running through a pause.
+`test_source_clock_matches_the_host_after_snapshot_create` measures it;
+`every_reopen_after_a_pause_sets_the_sources_clock` pins the host side.
+
 ## MAXIMUM REUSE / CACHEABILITY
 
 **The whole goal of fcvm is to cache and reuse as much as humanly possible.** Kernels,

@@ -1860,8 +1860,37 @@ pub async fn prepare_snapshot_network() -> Result<()> {
     Ok(())
 }
 
-pub async fn resume_source_network() -> Result<()> {
+/// The host's clock that `--resume-snapshot-network` was given, as decimal
+/// nanoseconds since the epoch: the value after `--host-time-ns`. The host passes it
+/// on every reopen that follows a pause, and none on the reopen after a failed
+/// prepare, which no pause preceded.
+pub fn resume_host_time(args: &[String]) -> Option<&str> {
+    args.iter()
+        .position(|arg| arg == "--host-time-ns")
+        .and_then(|flag| args.get(flag + 1))
+        .map(String::as_str)
+}
+
+/// Reopen the source VM's network after a snapshot, first setting its clock to
+/// `host_time` when the host passed one.
+///
+/// Where the VMM freezes the guest's clock while the VM is paused (the arm64 `nested`
+/// profile), a resumed source is behind the host by the length of the pause. The step
+/// goes in before the gate reopens:
+/// until then the gate rejects chronyd's polls (`gate_chain_rules`), so chronyd has
+/// measured nothing since the resume and keeps no correction for the lag. Its first
+/// measurement afterwards, the burst below, is taken against the stepped clock. The
+/// step is a restored clone's (`bootplan::set_system_clock`), forward only
+/// (`bootplan::advance_system_clock`), because the source's clock may not have stopped.
+/// A clone also replaces its chronyd, because the daemon it inherits may have
+/// measured a lag before the snapshot, and the source's daemon has not. A failed step
+/// is logged and does not stop the reopen.
+pub async fn resume_source_network(host_time: Option<&str>) -> Result<()> {
+    let started = std::time::Instant::now();
     let _transaction_lock = acquire_boundary_lock()?;
+    if let Some(host_time) = host_time {
+        crate::bootplan::advance_system_clock(host_time, started.elapsed());
+    }
     let gate = IptablesGate::new(SystemCommandRunner);
     let store = FileManifestStore::default();
     // No routes to read back: the boundary never takes the link down, so it
@@ -2903,6 +2932,54 @@ mod tests {
             .find("tokio::spawn(chrony_burst())")
             .expect("the source no longer asks chronyd to measure after its gate reopens");
         assert!(reopened < burst, "reopened={reopened} burst={burst}");
+    }
+
+    /// The source's clock is set to the host's before its gate reopens: until then
+    /// the gate rejects chronyd's polls, so chronyd cannot have measured the pause's
+    /// lag and started correcting it on top of the step.
+    #[test]
+    fn the_source_steps_its_clock_before_its_gate_reopens() {
+        let source = include_str!("snapshot_network.rs");
+        let start = source
+            .find("pub async fn resume_source_network(")
+            .expect("resume_source_network is in snapshot_network.rs");
+        let len = source[start..]
+            .find("\n}\n")
+            .expect("resume_source_network has a closing brace");
+        let body = &source[start..start + len];
+        let step = body
+            .find("crate::bootplan::advance_system_clock(host_time, started.elapsed())")
+            .expect("the source no longer steps its clock to the host's");
+        let reopen = body
+            .find("reopen_with(&gate)")
+            .expect("the source no longer reopens its gate");
+        assert!(step < reopen, "step={step} reopen={reopen}");
+    }
+
+    #[test]
+    fn the_resume_takes_the_host_time_after_its_flag() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            resume_host_time(&args(&[
+                "fc-agent",
+                "--resume-snapshot-network",
+                "--host-time-ns",
+                "1731301800123456789",
+            ])),
+            Some("1731301800123456789")
+        );
+        assert_eq!(
+            resume_host_time(&args(&["fc-agent", "--resume-snapshot-network"])),
+            None
+        );
+        assert_eq!(
+            resume_host_time(&args(&[
+                "fc-agent",
+                "--resume-snapshot-network",
+                "--host-time-ns"
+            ])),
+            None
+        );
     }
 
     #[tokio::test]
