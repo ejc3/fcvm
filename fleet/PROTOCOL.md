@@ -1394,6 +1394,16 @@ frame drawn and the first frame sent to a subscriber (`-1` until it happens).
 `boot_id` is 32 hex digits drawn at random when the process starts: a client
 that reads a different one than before is talking to a restarted renderer,
 which has no scene and no budget until they are posted again.
+`drawn_h` is the stream height the last frame was drawn at (0 while nothing
+streams). A renderer draws at the tallest height its streams ask whose frame
+fits a frame slot, judged from its last 2 s of frames (render and encode), and
+scales that frame to the taller streams: an opened 16:9 tile asks 720 against
+the wall's 432, and on terrain a 720 frame overran its slot at the lowest
+budget, which held the whole wall to that tile's rate. A height whose frames'
+90th percentile passes 85% of a slot is left for the tallest height predicted
+(frame time in proportion to drawn pixels) within 70%, and not drawn again for
+60 s; a taller height is taken after 10 s at one height when predicted within
+65%.
 `layout_generation` is the layout in force (null without one), and
 `layout_pending` (`{"generation", "from_frame"}`, present only while one is
 waiting) the next.
@@ -1468,7 +1478,9 @@ the ladder `250,000 x 2^(n/4)` (n from -8 to 40) with hysteresis: down, to the
 rung under the fit, when the budget exceeds the smoothed fit by more than 5%,
 and by at least a rung at once when any tile's `render_ms_max` is over 90% of
 a slot; up, to the rung under fit / 1.15, after three rounds in a row that
-allow it. It posts only when every tile has reported. Tiles never adapt on
+allow it. It posts a first budget, and raises one, only when every tile has
+reported a fit; while a tile has none (a model starting again at a new drawn
+size), an overloaded frame and the fits that are known still step it down. Tiles never adapt on
 their own. `tools/budgetctl.py` is the reference controller; the fleet
 coordinator is to run the same rule.
 

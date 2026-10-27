@@ -544,6 +544,17 @@ Round 12, text (PROTOCOL.md "Words, the clock and lights"):
   The landmark's tile is terrain the default budget draws at 15 fps in the
   detail view with or without the letters.
 
+The height a tile draws (round 15, 2026-10-27). A renderer draws one frame
+per slot at the tallest height its streams ask and scales it to the others.
+An opened 16:9 tile asks 720 against the wall's 432 (2.65x the drawn pixels).
+On staging, slot-6 (terrain) with one 720 subscriber: render 29 ms, frame
+36 ms at the lowest budget (stride 4, 1 sample), 15 fps, 374 slots skipped in
+45 s, and the page, which shows every tile at one scene time, drew the whole
+wall at that tile's rate. Its wall frames at 432 took 13 ms. A renderer now
+draws at the tallest asked height whose frame fits its slot (`HeightGuard`,
+budget.h; PROTOCOL.md `/health` `drawn_h`), and a taller stream is scaled up
+from it.
+
 Stream quality at 180 px tiles (4 x 2 grid, 160 x 180 inner, 192 x 212
 delivered; one moving frame unencoded and as the eight streams decode it,
 cropped; `tools/seam_metric.py`):

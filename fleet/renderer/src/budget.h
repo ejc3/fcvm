@@ -3,9 +3,11 @@
 // rounds to. Header-only so host tests use it without a GPU.
 #pragma once
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <utility>
 #include <deque>
+#include <map>
 #include <vector>
 
 // Budgets that take effect from a frame slot: every tile is given the same
@@ -173,4 +175,99 @@ struct CostModel {
     if (!ready(now_s)) return 0;
     return fit_from(w_fixed, w_fast, w_hq, hq_prior, px, hq_spp, slot_ms, frac);
   }
+};
+
+// The height a tile draws at. A renderer draws one frame per slot, at the
+// tallest height its streams ask, and scales it to the others. An opened tile
+// asks a 16:9 wall tile for 720 against the wall's 432, 2.65x the drawn pixels:
+// on terrain that frame takes longer than a slot even at the lowest budget (a
+// stride-4 checkerboard with one sample is the least a frame draws), so the
+// tile skips slots, and the page, which shows every tile at one scene time,
+// draws the whole wall at that tile's rate (staging, 2026-10-27: 36 ms frames,
+// 15 fps, the wall at 19 fps). So a tile draws at the tallest asked height whose
+// frame fits its slot, and a taller stream is scaled up from it.
+//
+// A frame's time is taken to grow with its drawn pixels (at the stride-4 floor
+// every per-pixel pass and the samples do), so a taller height is predicted
+// from the frames at the height drawn now. That overestimates a tile whose
+// budget gives it more than the floor, which only keeps it lower.
+class HeightGuard {
+ public:
+  double slot_ms = 1000.0 / 30;
+  double over_frac = 0.85;   // frames whose 90th percentile passes this share of a slot: the height is too tall
+  double fit_frac = 0.70;    // a step down goes to the tallest height predicted within this share
+  double up_frac = 0.65;     // a step up goes only to a height predicted within this share
+  double window_s = 2.0;     // frames judged
+  double settle_s = 0.3;     // frames this soon after a switch are not judged (priming, new encoder)
+  double hold_s = 10.0;      // a height is drawn this long before a taller one is tried
+  double backoff_s = 60.0;   // a height that overran is not drawn again for this long
+  size_t min_frames = 15;
+
+  // One frame drawn at height h took frame_ms (render and encode).
+  void observe(double now_s, int h, double frame_ms) {
+    if (h != drawn_ || now_s - since_ < settle_s) return;
+    frames_.push_back({now_s, frame_ms});
+    while (!frames_.empty() && frames_.front().first < now_s - window_s) frames_.pop_front();
+  }
+
+  // The height to draw for the asked heights (ascending, distinct); px(h) is
+  // the pixels a frame at h draws. 0 when nothing is asked.
+  template <class Px>
+  int choose(const std::vector<int>& asked, Px px, double now_s) {
+    if (asked.empty()) return 0;
+    while (!frames_.empty() && frames_.front().first < now_s - window_s) frames_.pop_front();
+    auto in = [&](int h) { return std::find(asked.begin(), asked.end(), h) != asked.end(); };
+    auto banned = [&](int h) {
+      auto it = banned_.find(h);
+      return it != banned_.end() && now_s < it->second;
+    };
+    double p90 = frames_.size() >= min_frames ? pct90() : -1;
+    // the tallest asked height under `below` predicted within frac of a slot
+    auto fitting = [&](int below, double frac) {
+      int best = 0;
+      for (int h : asked)
+        if (h < below && !banned(h) && p90 >= 0 && p90 * px(h) / px(drawn_) <= frac * slot_ms) best = h;
+      return best;
+    };
+    if (drawn_ == 0 || !in(drawn_)) {
+      // a new set of streams: predicted from the frames drawn so far, else the tallest
+      int h = drawn_ > 0 ? fitting(INT_MAX, fit_frac) : 0;
+      if (h == 0)
+        for (int a : asked)
+          if (!banned(a)) h = a;
+      switch_to(h ? h : asked.front(), now_s);
+      return drawn_;
+    }
+    if (p90 > over_frac * slot_ms && drawn_ > asked.front()) {
+      banned_[drawn_] = now_s + backoff_s;
+      int h = fitting(drawn_, fit_frac);
+      switch_to(h ? h : asked.front(), now_s);
+      return drawn_;
+    }
+    if (p90 >= 0 && now_s - since_ >= hold_s) {
+      int h = fitting(INT_MAX, up_frac);
+      if (h > drawn_) switch_to(h, now_s);
+    }
+    return drawn_;
+  }
+  int drawn() const { return drawn_; }
+
+ private:
+  void switch_to(int h, double now_s) {
+    if (h == drawn_) return;
+    drawn_ = h;
+    since_ = now_s;
+    frames_.clear();
+  }
+  double pct90() const {
+    std::vector<double> v;
+    for (auto& f : frames_) v.push_back(f.second);
+    size_t n = std::min(v.size() - 1, (size_t)(0.9 * v.size()));
+    std::nth_element(v.begin(), v.begin() + n, v.end());
+    return v[n];
+  }
+  int drawn_ = 0;
+  double since_ = -1e18;
+  std::deque<std::pair<double, double>> frames_;
+  std::map<int, double> banned_;
 };

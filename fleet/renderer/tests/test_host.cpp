@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "../src/budget.h"
+#include "../src/params.h"
 #include "../src/font_sdf.h"
 #include "../src/jpeg.h"
 #include "../src/json.h"
@@ -349,6 +350,77 @@ int main() {
     CHECK(std::fabs(f2 - (0.7 * fslot - 4.0) / 3e-5) < 1000, "high-quality fit from its own cost (%.0f)", f2);
     // and the frame it predicts lands at 70% of the slot
     CHECK(std::fabs(4.0 + f2 * 3e-5 - 0.7 * fslot) < 0.05, "predicted frame at the target");
+  }
+  {
+    // The height a tile draws (HeightGuard). Staging, 2026-10-27: one viewer
+    // opened a 16:9 terrain tile, which asked its renderer for 720 against the
+    // wall's 432. Its frames took 36 ms (render 29 ms and two encodes) at the
+    // lowest budget, so it drew every other slot and the wall, held to one
+    // scene time, drew at 15 to 19 fps. A frame here costs 33 ns per drawn
+    // pixel (14.5 ms at 432, the same tile's wall frames); a sky tile 16 ns.
+    const double fslot = 1000.0 / 30;
+    Rect r16{0.25, 0.5, 0.25, 0.25};
+    auto px = [&](int h) {  // Renderer::drawn_pixels with the 16 px stream overlap
+      Tile t = tile_geometry(r16, 16.0 / 9, h);
+      int g = (int)std::ceil(GUARD_FRAC * t.full_h) + 2 + DENOISE_R + 16;
+      return (double)(t.w + 2 * g) * (t.h + 2 * g);
+    };
+    // run the frame clock for `secs`: each frame takes ns_px * drawn pixels,
+    // and a frame longer than a slot skips the slots it overran
+    struct Run { long long frames = 0, skipped = 0, skipped_late = 0; int last_h = 0; };
+    auto run = [&](HeightGuard& g, std::vector<int> asked, double ns_px, double t0, double secs) {
+      Run o;
+      double t = t0;
+      while (t < t0 + secs) {
+        int h = g.choose(asked, px, t);
+        double ms = ns_px * 1e-6 * px(h);
+        long long slots = std::max(1LL, (long long)std::ceil(ms / fslot - 1e-9));
+        g.observe(t, h, ms);
+        o.frames++;
+        o.skipped += slots - 1;
+        if (t >= t0 + 1.5) o.skipped_late += slots - 1;
+        o.last_h = h;
+        t += slots * fslot / 1000.0;
+      }
+      return o;
+    };
+    // the terrain tile: drawn at the wall's height for a minute, then a viewer opens it
+    HeightGuard g;
+    Run wall = run(g, {432}, 33.0, 0, 60);
+    CHECK(wall.skipped == 0 && wall.last_h == 432, "the wall tile alone draws every slot (%lld skipped)", wall.skipped);
+    Run open = run(g, {432, 720}, 33.0, 60, 60);
+    CHECK(open.skipped_late == 0, "an opened terrain tile keeps every wall slot (%lld of %lld skipped after 1.5 s)",
+          open.skipped_late, open.frames + open.skipped);
+    CHECK(open.last_h == 432, "it draws at the wall's height and scales the opened stream up (drew %d)", open.last_h);
+    // a fresh renderer asked for both at once tries the taller and steps down within 1.5 s
+    HeightGuard f;
+    Run fresh = run(f, {432, 720}, 33.0, 0, 30);
+    CHECK(fresh.skipped <= 30 && fresh.skipped_late == 0 && fresh.last_h == 432,
+          "a fresh terrain tile steps down within 1.5 s (%lld skipped, %lld after 1.5 s, drew %d)", fresh.skipped,
+          fresh.skipped_late, fresh.last_h);
+    // and does not try 720 again while the view stays as costly
+    Run later = run(f, {432, 720}, 33.0, 30, 120);
+    CHECK(later.skipped == 0 && later.last_h == 432, "no retry while 720 is predicted over its slot (%lld skipped)",
+          later.skipped);
+    // a sky tile affords 720: it draws the opened stream at its own height
+    HeightGuard s;
+    run(s, {432}, 16.0, 0, 30);
+    Run sky = run(s, {432, 720}, 16.0, 30, 30);
+    CHECK(sky.last_h == 720 && sky.skipped == 0, "a sky tile draws 720 (drew %d, %lld skipped)", sky.last_h, sky.skipped);
+    // a view that turns costly while drawing 720 steps down; once cheap again, 720 comes back after the backoff
+    Run turn = run(s, {432, 720}, 33.0, 60, 20);
+    CHECK(turn.last_h == 432 && turn.skipped_late == 0, "costly view: back to 432 (drew %d, %lld skipped after 1.5 s)",
+          turn.last_h, turn.skipped_late);
+    Run cheap = run(s, {432, 720}, 16.0, 80, 30);
+    CHECK(cheap.last_h == 432, "720 is not drawn again within the backoff (drew %d)", cheap.last_h);
+    Run back = run(s, {432, 720}, 16.0, 110, 60);
+    CHECK(back.last_h == 720 && back.skipped == 0, "after the backoff it is (drew %d)", back.last_h);
+    // a single asked height is drawn however slow (nothing lower to go to)
+    HeightGuard one;
+    Run solo = run(one, {720}, 33.0, 0, 5);
+    CHECK(solo.last_h == 720, "one height asked: drawn (%d)", solo.last_h);
+    // and nothing asked is 0
+    CHECK(one.choose({}, px, 10) == 0, "nothing asked");
   }
   {
     // The windowed fit: a camera path whose cost per sample swings 2x every
