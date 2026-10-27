@@ -269,20 +269,18 @@ impl Director {
         }
     }
 
-    /// The open vote is among viewpoints that follow the hold it decides after, never that
-    /// hold itself. A vote whose offer holds it is one already decided (a state stored before
-    /// the vote stayed open kept it until the camera arrived): it starts again.
-    fn keep_the_vote_open(&mut self) {
+    /// Start the open vote again at scene time `now_t`, with no votes: what a coordinator
+    /// does when it resumes a stored state, since the process that counted the votes is gone.
+    pub fn restart_vote(&mut self, now_t: f64) {
         let (from, _) = self.vote_from();
-        if self.offer.contains(&from) {
-            let step = if self.next.is_some() {
-                self.step + 1
-            } else {
-                self.step
-            };
-            self.offer = self.make_offer(step, from);
-            self.votes.clear();
-        }
+        let step = if self.next.is_some() {
+            self.step + 1
+        } else {
+            self.step
+        };
+        self.offer = self.make_offer(step, from);
+        self.votes.clear();
+        self.vote_opened_t = now_t;
     }
 
     /// When the open vote closes.
@@ -356,7 +354,6 @@ impl Director {
         intent: &str,
         at: u64,
     ) -> Result<(), String> {
-        self.keep_the_vote_open();
         let vps = viewpoints();
         // A pick of the hold just decided (the offer moved on while it was on its way) is
         // already what happens: nothing to record.
@@ -407,7 +404,6 @@ impl Director {
             self.arrive_t = now_t;
         }
         for _ in 0..4 {
-            self.keep_the_vote_open();
             if self.next.is_none() && now_t >= self.decide_at() {
                 let (pick, intent) = self.leading();
                 self.next = Some(pick);
@@ -516,29 +512,6 @@ mod tests {
         let d: Director = serde_json::from_value(v).unwrap();
         assert_eq!(d.vote_opened_t, 0.0);
         assert_eq!(d.votes["192.0.2.1"].at, 0);
-    }
-
-    #[test]
-    fn a_round_left_from_a_decided_hold_is_not_counted_again() {
-        let mut d = Director::new(3, 0.0);
-        d.tick(5.0);
-        let n = d.next.unwrap();
-        // What a coordinator stored before the open vote: the decided round's offer and
-        // votes, kept until the camera arrived.
-        d.offer = d.make_offer(d.step, d.current);
-        d.votes.insert(
-            "192.0.2.1".into(),
-            Vote {
-                target: n,
-                intent: "n1".into(),
-                at: 0,
-            },
-        );
-        d.tick(d.arrive_next_at().unwrap());
-        assert_eq!(d.current, n);
-        assert!(!d.offer.contains(&n));
-        d.tick(d.decide_at());
-        assert_ne!(d.next, Some(n), "the camera would fly to where it is");
     }
 
     #[test]
