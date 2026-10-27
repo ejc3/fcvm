@@ -515,6 +515,13 @@ describe("a stop choice says what the camera will do", () => {
     expect(view(s, EPOCH + 1).notices).toEqual([{ key: "n2", text: "Next up: your pick, the star field, in 0:12" }]);
   });
 
+  it("tells a pick to come back to the held stop from one already reached", () => {
+    // The vote after the decided hold can offer the stop the camera is still holding.
+    const n = nudges({ holding: "stars", holding_label: "the star field", next: "planet", next_label: "the ringed planet", arrive_next_at: EPOCH + 9_000 });
+    n.targets[1]!.arrive_at = EPOCH + 41_000;
+    expect(view(picked(n, "stars"), EPOCH).notices[0]!.text).toBe("Your pick, the star field, comes after the ringed planet, in 0:41");
+  });
+
   it("says the camera is there once the pick is held", () => {
     const n = nudges({ holding: "stars", holding_label: "the star field" });
     n.targets = n.targets.filter((x) => x.id !== "stars");

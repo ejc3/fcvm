@@ -1606,7 +1606,8 @@ function stopChoiceText(n: Notice, nd: Nudges, srvNow: number, srvAt: number): s
     return [why, nextUp].filter(Boolean).join(" ");
   }
   if (target === nd.next) return nextUp;
-  if (target === nd.holding) return `Your pick, ${nd.holding_label ?? "this stop"}: the camera is there now`;
+  // Reached, unless the open vote offers it again (a return after the hold already decided).
+  if (target === nd.holding && mine === null) return `Your pick, ${nd.holding_label ?? "this stop"}: the camera is there now`;
   // The vote this pick was in has closed and chose another stop.
   if (mine === null || (nd.opened_at !== null && srvAt < nd.opened_at)) {
     return `The vote went to ${nd.next_label ?? label(nd.leading) ?? "another stop"}. Pick again for the stop after it.`;
