@@ -609,6 +609,19 @@ test("the three header buttons open distinct panels, each at its top", async ({ 
   await only("play");
 });
 
+test("a word being typed survives switching to another panel and back", async ({ page }) => {
+  await openWall(page, 1);
+  await page.getByTestId("play").click();
+  await page.getByLabel("Write a word into the world").fill("half a thought");
+  await page.getByTestId("menu").focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("drawer")).toHaveAttribute("data-panel", "about");
+  await page.getByTestId("play").focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("drawer")).toHaveAttribute("data-panel", "play");
+  await expect(page.getByLabel("Write a word into the world")).toHaveValue("half a thought");
+});
+
 test("the count of GPU VMs restored ticks as VMs restore; the isolation panel says how a square is isolated", async ({ page }) => {
   await openWall(page, 15);
   const counters = async () => ((await mockState()).state as unknown as { counters: { restores: number; scrubs: number } }).counters;
@@ -1034,6 +1047,33 @@ test("Turnstile: the first action waits for the check, then goes through", async
     await expect(other.locator(".verify-pop [data-testid=verify]")).toBeVisible();
     expect((await fleetNow()).relaunch_all?.by ?? "").not.toMatch(/^v-/);
     await other.context().close();
+  } finally {
+    await admin("/mock/turnstile", { sitekey: null });
+  }
+});
+
+test("Turnstile: the check shows in the About panel too, for an action queued while it is open", async ({ page }) => {
+  await admin("/mock/turnstile", { sitekey: "example-sitekey" });
+  try {
+    await page.addInitScript(() => {
+      window.turnstile = {
+        render(el: HTMLElement, o: { callback: (t: string) => void }) {
+          const b = document.createElement("button");
+          b.textContent = "Verify (test)";
+          b.onclick = () => o.callback("mock-pass");
+          el.appendChild(b);
+          return "w";
+        },
+        remove() {},
+      };
+    });
+    await openWall(page, 15);
+    await page.getByTestId("menu").click();
+    await expect(page.getByTestId("drawer")).toHaveAttribute("data-panel", "about");
+    await page.getByTestId("restart-all").click();
+    await expect(page.getByTestId("drawer").getByTestId("verify")).toBeVisible();
+    await page.getByRole("button", { name: "Verify (test)" }).click();
+    await expect(page.getByTestId("verify")).toHaveCount(0);
   } finally {
     await admin("/mock/turnstile", { sitekey: null });
   }

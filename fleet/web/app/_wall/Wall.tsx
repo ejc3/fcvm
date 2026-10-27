@@ -234,6 +234,8 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   const [labelSize, setLabelSize] = useState<{ w: number; h: number } | undefined>(undefined);
   /** Which panel the drawer shows: the controls, About, or how a square is isolated. */
   const [drawerPanel, setDrawerPanel] = useState<DrawerPanel>("play");
+  /** The word being typed; it outlives panel switches. */
+  const [wordDraft, setWordDraft] = useState("");
   /** The button that opened the drawer; closing it returns focus there. */
   const drawerOpener = useRef<HTMLElement | null>(null);
   const phone = useMedia("(max-width: 700px)");
@@ -921,7 +923,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
       ) : null}
       <Overlays view={view} phone={phone} />
       {keyGrid}
-      {state.ui.drawer && view.play && !covered ? <PlayDrawer key={drawerPanel} client={client} view={view} onClose={closeDrawer} panel={drawerPanel} isolationInAbout={phone} /> : null}
+      {state.ui.drawer && view.play && !covered ? <PlayDrawer client={client} view={view} onClose={closeDrawer} panel={drawerPanel} isolationInAbout={phone} word={wordDraft} setWord={setWordDraft} /> : null}
       {needsVerifyPrompt ? (
         <div className="verify-pop" role="dialog" aria-label={view.play!.verify.title}>
           <VerifyBox client={client} view={view} />

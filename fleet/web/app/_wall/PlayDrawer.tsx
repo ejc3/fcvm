@@ -9,7 +9,7 @@
 // the view model; every action goes through WallClient.act, which holds it until the Turnstile
 // check passes when the coordinator asks for one.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { wordArgs, type WallView } from "../../core/index.ts";
 import { TurnstileWidget } from "./Turnstile.tsx";
 import type { WallClient } from "./wall-client.ts";
@@ -33,7 +33,7 @@ export function VerifyBox({ client, view }: { client: WallClient; view: WallView
 
 export type DrawerPanel = "play" | "about" | "isolation";
 
-export function PlayDrawer({ client, view, onClose, panel, isolationInAbout }: { client: WallClient; view: WallView; onClose: () => void; panel: DrawerPanel; isolationInAbout: boolean }) {
+export function PlayDrawer({ client, view, onClose, panel, isolationInAbout, word, setWord }: { client: WallClient; view: WallView; onClose: () => void; panel: DrawerPanel; isolationInAbout: boolean; word: string; setWord: (word: string) => void }) {
   const p = view.play!;
   const shell = useRef<HTMLElement | null>(null);
   const title = panel === "about" ? view.title : panel === "isolation" ? view.isolation.title : p.title;
@@ -60,20 +60,20 @@ export function PlayDrawer({ client, view, onClose, panel, isolationInAbout }: {
           {p.close}
         </button>
       </header>
+      {/* In the shell, so a queued action's check is there whichever panel is open. */}
+      <VerifyBox client={client} view={view} />
       {panel === "about" ? <AboutSection view={view} /> : null}
       {panel === "about" && isolationInAbout ? <IsolationSection view={view} heading /> : null}
       {panel === "isolation" ? <IsolationSection view={view} /> : null}
-      {panel === "play" ? <PlaySections client={client} view={view} /> : null}
+      {panel === "play" ? <PlaySections client={client} view={view} word={word} setWord={setWord} /> : null}
     </aside>
   );
 }
 
-function PlaySections({ client, view }: { client: WallClient; view: WallView }) {
+function PlaySections({ client, view, word, setWord }: { client: WallClient; view: WallView; word: string; setWord: (word: string) => void }) {
   const p = view.play!;
-  const [word, setWord] = useState("");
   return (
     <>
-      <VerifyBox client={client} view={view} />
       {p.nudge ? (
         <section aria-labelledby="nudge-title">
           <h3 id="nudge-title">{p.nudge.title}</h3>
