@@ -5,7 +5,8 @@
 # their probe builds must be in different directories. And a run's probe app must stay its
 # own until it is installed: two checkouts with different probe sources build in turn, and
 # the app the first would install must still be the first's. Checkouts with different pins
-# must not share an SDK directory, where one would replace a package the other is using.
+# must not share an SDK directory, where one would replace a package the other is using,
+# and checkouts whose phone container differs must not share an image tag.
 # A stub curl records how many sdk.sh runs are inside it at once, holds each call for 2 s
 # and then fails, which stops that run; with the SDK lock the second run waits for the
 # first to exit, so at most one is ever inside. Stub javac and keytool satisfy the tool
@@ -133,3 +134,14 @@ sed -i 's/b08fc43d/c08fc43d/' "$dir/B/scripts/phone/sdk.sh"
 other=$(env -u ANDROID_SDK "$dir/B/scripts/phone/sdk.sh" --sdk-path 2>/dev/null || true)
 [ "$other" != "$same" ] || { echo "FAIL: a checkout with other pins uses the same SDK directory ($same)"; exit 1; }
 echo "ok   checkouts with other pins use another SDK directory"
+
+# The phone image's tag follows fleet/phone: the same sources share it, other sources do not.
+for c in A B; do mkdir -p "$dir/$c/fleet/phone" && cp -r "$root/fleet/phone/." "$dir/$c/fleet/phone/"; done
+tag_a=$("$dir/A/scripts/phone/run.sh" --image 2>/dev/null || true)
+tag_b=$("$dir/B/scripts/phone/run.sh" --image 2>/dev/null || true)
+case "$tag_a" in localhost/*:*) ;; *) echo "FAIL: run.sh --image names no tagged local image: '$tag_a'"; exit 1 ;; esac
+[ "$tag_a" = "$tag_b" ] || { echo "FAIL: two checkouts with the same phone container use different tags"; exit 1; }
+echo "# checkout B" >> "$dir/B/fleet/phone/phone.sh"
+tag_b=$("$dir/B/scripts/phone/run.sh" --image 2>/dev/null || true)
+[ "$tag_b" != "$tag_a" ] || { echo "FAIL: two checkouts with different phone containers share the tag $tag_a"; exit 1; }
+echo "ok   checkouts with other phone containers use another image tag"

@@ -14,17 +14,20 @@
 #
 #   FCVM=./target/release/fcvm scripts/phone/run.sh <gpu pci address>
 # PHONE_PROFILE names another kernel profile to run the same checks on (default phone).
+# `run.sh --image` prints the image tag it builds: fleet/phone's contents name it, so
+# concurrent runs from checkouts with other sources never replace each other's image.
 # Needs a GPU on vfio-pci, the phone profile set up (make setup-phone), the host's kvm_intel
 # loaded with nested=1, and the SDK and probe app from scripts/phone/sdk.sh.
 set -euo pipefail
+SRC=$(cd "$(dirname "$0")/../.." && pwd)
+IMAGE=localhost/fcvm-phone:$(cd "$SRC/fleet/phone" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
+if [ "${1:-}" = --image ]; then echo "$IMAGE"; exit 0; fi
 GPU=${1:?usage: run.sh <gpu pci address>}
 F=${FCVM:-./target/release/fcvm}
 SDK=$("$(dirname "$0")/sdk.sh" --sdk-path)
 APK=$(ANDROID_SDK="$SDK" "$(dirname "$0")/sdk.sh" --probe-path)
 WORK=$(dirname "$APK")
-IMAGE=localhost/fcvm-phone
 NAME=phone-test-$$
-SRC=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$APK" ] && [ -x "$SDK/emulator/emulator" ] || { echo "run.sh: run scripts/phone/sdk.sh first" >&2; exit 2; }
 [ "$(cat /sys/module/kvm_intel/parameters/nested 2>/dev/null)" = Y ] || { echo "run.sh: the host's kvm_intel needs nested=1" >&2; exit 2; }
 LOGS=$(mktemp -d)
