@@ -605,7 +605,7 @@ number below is from that box.
 | renderer SurfaceFlinger composes with, and the app's own GLES context | `Android Emulator OpenGL ES Translator (Tesla T4/PCIe/SSE2)`, `OpenGL ES 3.2 NVIDIA 580.196.07` |
 | the emulator's Vulkan device | Tesla T4, Vulkan 1.4.312 |
 | cold boot to `sys.boot_completed` | 26.5 s (16 GiB VM, 4 GiB phone); 30.6 s (6 GiB VM, 2 GiB phone) |
-| probe app: 25,600 instanced, lit cubes, GLES 3 | 60.0 fps (the display's vsync), the emulator using 64% of one core |
+| probe app: 25,600 instanced, lit cubes, GLES 3 | 60.0 fps (the display's vsync), the emulator using 64% of one core; the T4 19% utilized at a 360 MHz graphics clock, 15 W |
 | app start (`am start -W`) | 372 ms |
 | emulator snapshot save with the app running | 3.9 s (4 GiB phone: 1.8 GB RAM image, 3.3 MB of textures); 4.8 s (2 GiB phone) |
 | emulator snapshot load into a new emulator process, same VM: adb up, app's next frame | 5.4 s and 5.7 s with a cold cache; 4.0 s and 4.2 s warm |

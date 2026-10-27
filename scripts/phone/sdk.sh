@@ -31,6 +31,11 @@ $B/build-tools_r35_linux.zip bd3a4966912eb8b30ed0d00b0cda6b6543b949d5ffe00bea54c
 $B/platform-35_r02.zip 0988cacad01b38a18a47bac14a0695f246bc76c1b06c0eeb8eb0dc825ab0c8e0 android-35 platforms/android-35
 $B/sys-img/android/x86_64-35_r02.zip 6dd7de33e63ef105cf2fabea6badda1dbe7665c96d8908e5f6e1407e63ff4556 x86_64 system-images/android-35/default/x86_64"
 mkdir -p "$SDK/.downloads" "$WORK"
+# One install at a time per SDK: concurrent runs (two GPUs, two worktrees) share the
+# downloads, the unpack directory, the packages and the probe build. The lock is held
+# until this script exits. run.sh reads only the probe app, which is published by rename.
+exec 9> "$SDK/.lock"
+flock 9
 while read -r url sha top dest; do
   [ -f "$SDK/$dest/.fcvm-sha256" ] && [ "$(cat "$SDK/$dest/.fcvm-sha256")" = "$sha" ] && continue
   zip="$SDK/.downloads/$(basename "$url")"
@@ -74,5 +79,6 @@ python3 -I -c 'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1],"a"); z.write(s
 "$BT/zipalign" -f 4 "$OUT/base.apk" "$OUT/aligned.apk"
 [ -f "$WORK/debug.keystore" ] || keytool -genkeypair -keystore "$WORK/debug.keystore" -storepass android -keypass android \
   -alias probe -keyalg RSA -dname CN=probe -validity 10000 > /dev/null 2>&1
-"$BT/apksigner" sign --ks "$WORK/debug.keystore" --ks-pass pass:android --out "$WORK/probe.apk" "$OUT/aligned.apk"
+"$BT/apksigner" sign --ks "$WORK/debug.keystore" --ks-pass pass:android --out "$OUT/probe.apk" "$OUT/aligned.apk"
+mv -f "$OUT/probe.apk" "$WORK/probe.apk"
 echo "sdk.sh: $SDK ready, probe app $WORK/probe.apk"
