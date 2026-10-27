@@ -527,42 +527,6 @@ impl RestoreMetadataControl {
     }
 }
 
-/// Sync VM clock from host time via MMDS.
-pub async fn sync_clock_from_host() -> Result<()> {
-    eprintln!("[fc-agent] syncing VM clock from host time via MMDS");
-
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
-    let token_response = client
-        .put("http://169.254.169.254/latest/api/token")
-        .header("X-metadata-token-ttl-seconds", "21600")
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .context("getting MMDS token for time sync")?;
-
-    let token = token_response.text().await?;
-
-    let metadata_response = client
-        .get("http://169.254.169.254/latest")
-        .header("X-metadata-token", &token)
-        .header("Accept", "application/json")
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .context("fetching host-time from MMDS")?;
-
-    let body = metadata_response.text().await?;
-    let metadata: LatestMetadata =
-        serde_json::from_str(&body).context("parsing host-time from MMDS")?;
-
-    crate::bootplan::set_system_clock(&metadata.host_time_ns, Duration::ZERO);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

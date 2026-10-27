@@ -120,7 +120,7 @@ pub async fn run() -> Result<()> {
         None
     };
 
-    if let Err(e) = bootplan::sync_clock_from_host(transport).await {
+    if let Err(e) = bootplan::sync_clock_from_host().await {
         eprintln!("[fc-agent] WARNING: clock sync failed: {:?}", e);
         eprintln!("[fc-agent] continuing anyway (will rely on chronyd)");
     }

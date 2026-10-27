@@ -762,7 +762,7 @@ async fn test_snapshot_of_a_relaunched_clone_leaves_it_running() -> Result<()> {
         let checked = async {
             common::poll_health_by_pid(clone_pid, 120).await?;
             // Control: the restored clone's port serves the restore's epoch, so a
-            // port that serves nothing after the relaunch is not a blind probe.
+            // document without one after the relaunch is not a blind probe.
             let served = served_boot_plan(clone_pid).await?;
             anyhow::ensure!(
                 served
@@ -783,9 +783,14 @@ async fn test_snapshot_of_a_relaunched_clone_leaves_it_running() -> Result<()> {
             .context("the relaunch check panicked")??;
 
             let mut wrong = Vec::new();
-            if let Some(document) = served_boot_plan(clone_pid).await? {
+            // The relaunch serves the new guest's boot plan on the port (the guest steps
+            // its clock from it), and that document must not carry the restore's epoch.
+            if let Some(document) = served_boot_plan(clone_pid)
+                .await?
+                .filter(|document| document.get("restore-epoch").is_some())
+            {
                 wrong.push(format!(
-                    "after the relaunch the host still serves the restore's document on the \
+                    "after the relaunch the host still serves the restore's epoch on the \
                      boot-plan port: {document}"
                 ));
             }

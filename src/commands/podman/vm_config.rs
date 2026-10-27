@@ -1430,8 +1430,9 @@ pub(crate) fn build_launch_config(
 ///   * `None` (reboot relaunch): the host substrate (disk, namespace/holder, pasta,
 ///     NFS exports, listeners, persisted state) is already live and is reused untouched.
 ///
-/// Returns the boot-plan vsock listener's task handle when `bootplan_over_vsock` is set
-/// (the caller owns its lifetime and aborts it on cleanup); `None` for the MMDS path.
+/// Returns the boot-plan vsock listener's task handle, which every backend gets (the
+/// caller owns its lifetime and aborts it on cleanup). `bootplan_over_vsock` selects
+/// whether the plan is also published via MMDS.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn configure_and_boot_vm(
     hv: &mut dyn crate::hypervisor::Hypervisor,
@@ -1580,8 +1581,12 @@ pub(crate) async fn configure_and_boot_vm(
     .await?;
 
     // Build the container boot plan and deliver it. For VMMs without a metadata service
-    // (Cloud Hypervisor), serve it over vsock and return the listener handle; otherwise
-    // publish it via MMDS (Firecracker).
+    // (Cloud Hypervisor), the vsock listener is the only transport; Firecracker also
+    // publishes the plan via MMDS. The listener is bound on both backends, because the
+    // guest steps its clock at boot from the host time this listener stamps at each
+    // accept (`bootplan::sync_clock_from_host`): the MMDS copy is stamped here, before
+    // the VM boots, and a guest that stepped to it came up about a second behind the
+    // host (issue 1354).
     let plan_json = build_boot_plan_json(
         &plan.launch_config,
         network_config,
@@ -1591,31 +1596,29 @@ pub(crate) async fn configure_and_boot_vm(
         gpu_driver_device,
         !args.gpu.is_empty(),
     );
-    // Wrapped in an abort-on-drop guard: if a later boot-config step (entropy/balloon/
-    // boot) returns Err, the guard drops and aborts the listener task instead of leaking
-    // it. On success we disarm and hand the handle to the caller.
-    let bootplan_guard = AbortOnDrop(if bootplan_over_vsock {
-        // fc-agent reads the inner `latest` object; the host listens on
-        // `{vsock_socket}_{VSOCK_BOOTPLAN_PORT}` (Firecracker/CH vsock proxy naming).
-        // Bind happens synchronously here so a bind failure fails setup fast rather than
-        // leaving the guest looping forever waiting for a plan that is never served.
-        let inner = plan_json
-            .get("latest")
-            .cloned()
-            .unwrap_or_else(|| plan_json.clone());
-        let socket = format!(
-            "{}_{}",
-            plan.vsock_socket_path.display(),
-            crate::commands::common::VSOCK_BOOTPLAN_PORT
-        );
-        Some(
-            super::listeners::spawn_bootplan_listener(&socket, &inner)
-                .context("starting boot-plan vsock listener")?,
-        )
-    } else {
+    // fc-agent reads the inner `latest` object; the host listens on
+    // `{vsock_socket}_{VSOCK_BOOTPLAN_PORT}` (Firecracker/CH vsock proxy naming).
+    // Bind happens synchronously here so a bind failure fails setup fast rather than
+    // leaving the guest looping forever waiting for a plan that is never served.
+    let inner = plan_json
+        .get("latest")
+        .cloned()
+        .unwrap_or_else(|| plan_json.clone());
+    let socket = format!(
+        "{}_{}",
+        plan.vsock_socket_path.display(),
+        crate::commands::common::VSOCK_BOOTPLAN_PORT
+    );
+    // Wrapped in an abort-on-drop guard: if a later boot-config step (MMDS/entropy/
+    // balloon/boot) returns Err, the guard drops and aborts the listener task instead of
+    // leaking it. On success we disarm and hand the handle to the caller.
+    let bootplan_guard = AbortOnDrop(Some(
+        super::listeners::spawn_bootplan_listener(&socket, &inner)
+            .context("starting boot-plan vsock listener")?,
+    ));
+    if !bootplan_over_vsock {
         hv.publish_boot_plan(plan_json).await?;
-        None
-    });
+    }
 
     // Configure entropy device (virtio-rng) for better random number generation.
     hv.add_entropy_device().await?;

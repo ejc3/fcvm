@@ -4,6 +4,8 @@
 //! (Firecracker's metadata service) or over **vsock** (for VMMs without MMDS, e.g.
 //! Cloud Hypervisor — #632 P0.5). The transport is chosen from the kernel command
 //! line: `fcvm_bootplan=vsock` selects vsock, otherwise MMDS (the Firecracker default).
+//! The clock step at boot reads the vsock document on both transports
+//! ([`sync_clock_from_host`]): the host serves it for every backend.
 //!
 //! Wire format (vsock): the host serves the same `latest` object MMDS would expose —
 //! `{ "container-plan": { ...Plan... }, "host-time-ns": "<epoch ns>" }` — on
@@ -96,18 +98,26 @@ pub async fn fetch_metadata(transport: Transport) -> Result<LatestMetadata> {
     }
 }
 
-/// Sync the VM clock from host time via the selected transport.
-pub async fn sync_clock_from_host(transport: Transport) -> Result<()> {
-    match transport {
-        Transport::Mmds => crate::mmds::sync_clock_from_host().await,
-        Transport::Vsock => {
-            let doc = read_vsock_doc().await?;
-            let meta: LatestMetadata =
-                serde_json::from_value(doc).context("parsing host-time from vsock boot plan")?;
-            set_system_clock(&meta.host_time_ns, std::time::Duration::ZERO);
-            Ok(())
-        }
-    }
+/// Step the VM clock at boot to the host's, read over vsock on both transports.
+///
+/// The host binds the boot-plan listener for every backend and stamps its clock at
+/// each accept, so the value is at most one vsock round trip old when the guest
+/// steps to it. The MMDS copy of the plan is stamped while the host builds it, before
+/// the VM boots; a guest that stepped to it came up 0.86 to 1.14 s behind the host
+/// (issue 1354). This runs before fc-agent starts its own chronyd, so the daemon
+/// measures the stepped clock and has no correction to make for the boot.
+///
+/// The step goes both ways (`set_system_clock`, not `advance_system_clock`). Before it,
+/// an arm64 guest's clock comes from the RTC: whole seconds, to which the kernel's
+/// `rtc_hctosys` adds half a second, so it can be up to 0.5 s ahead of the host, and a
+/// forward-only step left one boot 367 ms ahead.
+pub async fn sync_clock_from_host() -> Result<()> {
+    let doc = read_vsock_doc().await?;
+    let read = std::time::Instant::now();
+    let meta: LatestMetadata =
+        serde_json::from_value(doc).context("parsing host-time from vsock boot plan")?;
+    set_system_clock(&meta.host_time_ns, read.elapsed());
+    Ok(())
 }
 
 /// Set the system clock to the host's clock. Shared by both transports.
@@ -248,6 +258,25 @@ mod clock_tests {
         assert_eq!(
             (spec.tv_sec as i64, spec.tv_nsec as i64),
             (1_700_000_000, 770_000_123)
+        );
+    }
+
+    /// The boot step moves the clock back as well as forward: before it, an arm64
+    /// guest's clock is the RTC's second plus the half second `rtc_hctosys` adds, up to
+    /// 0.5 s ahead of the host. With a forward-only step one cold boot stayed 367 ms
+    /// ahead (`test_cold_boot_clock_matches_the_host`).
+    #[test]
+    fn the_boot_step_moves_the_clock_back_too() {
+        let source = include_str!("bootplan.rs");
+        let start = source
+            .find("pub async fn sync_clock_from_host(")
+            .expect("sync_clock_from_host is gone");
+        let end = source[start..].find("\n}\n").unwrap() + start;
+        let body = &source[start..end];
+        assert!(
+            body.contains("set_system_clock(&meta.host_time_ns")
+                && !body.contains("advance_system_clock("),
+            "the boot clock step must go both ways: {body}"
         );
     }
 

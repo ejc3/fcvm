@@ -3683,11 +3683,15 @@ async fn cmd_snapshot_run_inner(
                                     plan.bootplan_over_vsock,
                                 )
                                 .await
-                                .map(|_bootplan_handle| ())
                             }
                             .await;
                             match relaunch_result {
-                                Ok(()) => {
+                                Ok(relaunch_bootplan) => {
+                                    // The relaunched guest's boot-plan listener: it carries
+                                    // no restore epoch, and the guest steps its clock at
+                                    // boot from the host time it stamps. Owned here so the
+                                    // exit path aborts it like the restore's.
+                                    bootplan_handle = relaunch_bootplan;
                                     // The rebooted VM's memory is a fresh boot, not a
                                     // descendant of the restored snapshot — clear the
                                     // recorded parent so a later `snapshot create`
