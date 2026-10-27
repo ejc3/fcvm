@@ -214,3 +214,59 @@ fn every_line_fits_the_word_limit_in_a_scene() {
         assert!(l.chars().count() <= MAX_WORD_CHARS, "{l:?}");
     }
 }
+
+#[test]
+fn a_system_word_never_pushes_a_viewer_word_out_of_the_sky() {
+    use fleet_core::apply::sky;
+    use fleet_core::scene::MAX_WORDS;
+    let mut s = State::new(config(), 0);
+    // MAX_WORDS viewers, each with a distinct client address, each add one word.
+    for i in 0..MAX_WORDS {
+        s = apply(
+            s,
+            &Event::ViewerJoined {
+                at: 1_000,
+                viewer: format!("viewer-{i}"),
+                client: Some(format!("198.51.100.{}", i + 1)),
+            },
+        );
+    }
+    for i in 0..MAX_WORDS {
+        let at = 2_000 + i as u64 * 100;
+        let checked = sky(&s);
+        let e: Event = serde_json::from_value(serde_json::json!({
+            "type": "intent", "at": at, "viewer": format!("viewer-{i}"),
+            "client": format!("198.51.100.{}", i + 1), "id": format!("w{i}"), "name": "word",
+            "args": {"text": format!("word {i}")},
+            "check": {"verdict": "allow", "reason": "ok", "sky": checked},
+        }))
+        .unwrap();
+        s = apply(s, &e);
+        assert_eq!(
+            s.receipt(&format!("w{i}")).map(|r| r.outcome),
+            Some(Outcome::Committed)
+        );
+    }
+    let before = sky(&s);
+    assert_eq!(before.len(), MAX_WORDS);
+    // The idle gap passes: a system word is written. The viewer words, and so the sky a
+    // text check in flight was made against, are unchanged.
+    let (s, at) = run(s, 4_000, 400_000, 1_000, |s| !system_words(s).is_empty());
+    assert!(at.is_some());
+    assert_eq!(sky(&s), before);
+    // A later viewer word still keeps the viewer words to MAX_WORDS.
+    let e = word(
+        at.unwrap() + 1_000,
+        "viewer-0",
+        "late",
+        "late",
+        &before.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let s = apply(s, &e);
+    assert_eq!(
+        s.receipt("late").map(|r| r.outcome),
+        Some(Outcome::Committed)
+    );
+    assert_eq!(sky(&s).len(), MAX_WORDS);
+    assert_eq!(sky(&s).last().map(String::as_str), Some("late"));
+}

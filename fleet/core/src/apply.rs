@@ -703,9 +703,7 @@ fn intent_effect(
                 text_style: *text_style,
                 system: false,
             });
-            while f.scene.words.len() > MAX_WORDS {
-                f.scene.words.remove(0);
-            }
+            trim_viewer_words(&mut f.scene.words);
             // The newest word is the one drawn, so a viewer's word replaces a system word
             // at once; system words wait until it has left the sky and the gap has passed.
             if state.config.history_idle_secs > 0 {
@@ -1011,6 +1009,15 @@ fn start_race(state: &mut State, by: &str, at: u64) -> u64 {
     f.race_count
 }
 
+/// Keep the latest `MAX_WORDS` viewer words. A system word is never counted or evicted
+/// here, so placing one cannot change the sky a viewer's text check was made against.
+fn trim_viewer_words(words: &mut Vec<Word>) {
+    while words.iter().filter(|w| !w.system).count() > MAX_WORDS {
+        let oldest = words.iter().position(|w| !w.system).expect("a viewer word");
+        words.remove(oldest);
+    }
+}
+
 /// Write a line of GPU history into the scene when a viewer is watching an awake wall and
 /// nothing has been in the sky for `history_idle_secs`. It goes in through the scene like
 /// a viewer's word (no text check: the lines are ours), marked `system`, and takes no
@@ -1041,9 +1048,6 @@ fn history_step(state: &mut State, at: u64) {
                 text_style,
                 system: true,
             });
-            while f.scene.words.len() > MAX_WORDS {
-                f.scene.words.remove(0);
-            }
             f.history_count += 1;
             f.history_ready_at = Some(at + history::hold_ms(text_style) + gap);
         }

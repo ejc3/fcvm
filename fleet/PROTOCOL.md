@@ -198,7 +198,8 @@ A system word goes into `scene.words` like a viewer's, with `"system": true`
 (absent when false; the renderer ignores it). It skips the text check, creates no receipt
 and no `actions` entry, and is not part of the sky a viewer's word is checked against. A
 viewer's word is newer, so the renderer draws it instead at once, and the next system word
-waits for that word's hold and the gap. At most one system word is in the scene.
+waits for that word's hold and the gap. At most one system word is in the scene, and it
+is not counted among the latest 16 words nor does it push one out.
 
 **Your own GPU** (`claim_gpu`). The claim takes a standby GPU when there is one. Normally
 every GPU draws the wall, so the claim borrows one: the last tile in slot order that is
