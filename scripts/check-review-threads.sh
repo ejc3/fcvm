@@ -845,10 +845,11 @@ def cr_finishing_res:
   ];
 # What may stand between the accounted regions of a clean walkthrough: the folds that wrap
 # them and the Merge Risk summary line. Only a Minimal risk is listed.
+def cr_risk_summary_re: "^<summary><strong>Merge Risk:</strong> <strong><picture><img src=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-comment-icons-v1/risk-unassessed-16\\.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> Minimal</strong> · up to <code>[0-9a-f]{5,40}</code></summary>$";
 def cr_frame_res:
   [ "^</?details>$"
   , "^</?(dl|dd)>$"
-  , "^<summary><strong>Merge Risk:</strong> <strong><picture><img src=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-comment-icons-v1/risk-unassessed-16\\.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> Minimal</strong> · up to <code>[0-9a-f]{5,40}</code></summary>$"
+  , cr_risk_summary_re
   ];
 def accounted_regions:
   [ { name: "cr_tips", rendered: true, lines: cr_tips_res,
@@ -1093,7 +1094,7 @@ def is_cr_notice: is_cr_reply_notice or is_cr_summary_notice;
 # The CodeRabbit summary comment once its review has finished with nothing to report: the
 # summarize marker and no other marker, each of six regions exactly once, the recent-review
 # block saying no actionable comments were generated, and nothing left between the regions
-# but folds and a Minimal Merge Risk line. The review stack link, the recent-review block, the
+# but folds and one Minimal Merge Risk line. The review stack link, the recent-review block, the
 # finishing touches and the tips and Autofix blocks are shape-checked. The walkthrough, the
 # risk text and the pre-merge checks are the bot own description of the change, listed
 # as free regions in accounted_regions: findings reach this gate as review threads and review
@@ -1116,7 +1117,8 @@ def is_cr_clean_walkthrough:
     and (($b | strip_accounted(["cr_stack", "cr_recent", "cr_finishing", "cr_walkthrough", "cr_risk", "cr_premerge", "cr_tips", "cr_autopilot", "html_comment"])) as $rest
          | $rest != null
            and ($rest | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0))
-                | all(.[]; . as $line | any(cr_frame_res[]; . as $re | $line | test($re)))));
+                | all(.[]; . as $line | any(cr_frame_res[]; . as $re | $line | test($re)))
+                  and (map(if test(cr_risk_summary_re) then 1 else 0 end) | add) == 1));
 def greptile_status_marker: "<!-- greptile-status -->";
 def greptile_bypass_re: "^Bypass the limit by tagging `@greptile-apps` to review\\.$";
 def greptile_status_shapes:

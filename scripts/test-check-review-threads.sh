@@ -2300,6 +2300,8 @@ run_case "the clean walkthrough with a finding in its tips block is claimable" \
   "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(wt_edit 'sub("<!-- tips_end -->"; "P1: this drops the last row\n<!-- tips_end -->")')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
 run_case "the clean walkthrough with a Merge Risk of High is claimable" \
   "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(wt_edit 'sub("Minimal</strong> · up to"; "High</strong> · up to")')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+run_case "the clean walkthrough without its Merge Risk summary is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(wt_edit 'gsub("<summary><strong>Merge Risk:</strong>[^\n]*\n"; "")')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
 run_case "the clean walkthrough with findings in place of its clean line is claimable" \
   "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(wt_edit 'sub("No actionable comments were generated in the recent review."; "Actionable comments posted: 1")')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
 run_case "the clean walkthrough from a human is claimable, not coverage" \

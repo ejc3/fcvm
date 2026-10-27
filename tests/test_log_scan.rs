@@ -2423,7 +2423,7 @@ fn review_gate_does_not_let_a_coderabbit_walkthrough_cover_another_head() {
 ///
 /// Green on the gate before and after the walkthrough was listed: each case must keep the
 /// comment claimable. The cases are text added after the last block, between two blocks and
-/// inside the tips block, a Merge Risk other than Minimal, and the recent-review line
+/// inside the tips block, a Merge Risk other than Minimal or none, and the recent-review line
 /// replaced by a count of findings.
 #[test]
 fn review_gate_treats_a_coderabbit_walkthrough_with_additions_as_a_claim() {
@@ -2448,6 +2448,14 @@ fn review_gate_treats_a_coderabbit_walkthrough_with_additions_as_a_claim() {
         (
             "a Merge Risk of High",
             text.replace("Minimal</strong> · up to", "High</strong> · up to"),
+        ),
+        (
+            "the Merge Risk summary removed",
+            text.lines()
+                .filter(|l| !l.starts_with("<summary><strong>Merge Risk:</strong>"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
         ),
         (
             "findings in place of the clean line",
