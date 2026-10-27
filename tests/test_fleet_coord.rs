@@ -2100,9 +2100,10 @@ async fn shutdown_waits_for_a_state_write_already_in_flight() {
         "the write is still running"
     );
     handle.shutdown().await;
-    assert_eq!(
-        written.lock().unwrap().len(),
-        1,
+    // The queued write has finished. The directed camera moves the time of day every tick
+    // while it flies, so the state may have changed since and shutdown writes it after.
+    assert!(
+        !written.lock().unwrap().is_empty(),
         "shutdown returned before the queued write finished"
     );
     tokio::time::timeout(Duration::from_secs(5), actor)
