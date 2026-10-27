@@ -6,11 +6,12 @@
 //! A relaunch launches the replacement first and terminates the old instance once the
 //! launch is accepted, so termination stays out of the measured time. The timings it
 //! reports: `launch_ms` (request to accepted), `ready_ms` (accepted to the renderer's
-//! health), `total_ms`, and `capacity_wait_ms`: how long the tile's generation waited for
-//! EC2 to have capacity before the launch that was accepted. The race scoreboard leaves
-//! that wait out of the EC2 half's time and reports it on its own. A tile whose instance
-//! was started from the driver's pool of stopped instances ([`Ec2Driver::resume`], a wake
-//! a tile with no instance, never the relaunch of a running one) also reports `resumed` = 1.
+//! health and its first scene), `total_ms`, and `capacity_wait_ms`: how long the tile's
+//! generation waited for EC2 to have capacity before the launch that was accepted. The race
+//! scoreboard leaves that wait out of the EC2 half's time and reports it on its own. A tile
+//! whose instance was started from the driver's pool of stopped instances
+//! ([`Ec2Driver::resume`], a wake a tile with no instance, never the relaunch of a running
+//! one) also reports `resumed` = 1.
 
 use super::Handle;
 use anyhow::Result;
@@ -163,12 +164,86 @@ impl Ec2Driver for FakeEc2 {
     }
 }
 
-/// The running instance of each tile, for the scene poster.
-/// The running instance of each tile, with the token of the tile task that put it there.
-/// A tile that leaves the assignment and rejoins gets a new task while the old one can
-/// still be waiting in `launch` or `ready`; the token keeps the old task from overwriting
-/// or removing the new one's entry.
-type Running = Arc<std::sync::Mutex<HashMap<String, (u64, Launched)>>>;
+/// The running instance of each tile, with the token of the tile task that put it there
+/// and what that task gave its renderer. A tile that leaves the assignment and rejoins gets
+/// a new task while the old one can still be waiting in `launch` or `ready`; the token keeps
+/// the old task from overwriting or removing the new one's entry.
+type Running = Arc<std::sync::Mutex<HashMap<String, (u64, Launched, Option<Given>)>>>;
+
+/// What a tile task gave a new instance's renderer before it reported the tile running:
+/// the boot id `/health` named just before, and the scene body it posted. The scene poster
+/// starts from it instead of posting the same scene again.
+#[derive(Debug, Clone)]
+struct Given {
+    boot: Option<String>,
+    body: RendererScene,
+}
+
+/// How many times a tile task tries to post a new instance's scene, a second apart,
+/// before it counts the instance as one that never served.
+const SCENE_POST_ATTEMPTS: u32 = 10;
+
+/// The renderer body of an assigned tile: its rectangle and layout over the shared scene.
+/// None for a tile with no rectangle, which no viewer streams.
+fn renderer_body(a: &AssignSlot, shared: &SharedScene) -> Option<RendererScene> {
+    let rect = a.rect?;
+    Some(RendererScene {
+        layout_generation: a.layout_generation,
+        rect_from_frame: a.rect_from_frame,
+        previous_rect: a.previous_rect,
+        ..shared.for_renderer(rect)
+    })
+}
+
+/// Post the tile's scene to a new instance's renderer, before the tile is reported
+/// running. A viewer starts streaming a tile as soon as it is running, and a renderer that
+/// has no scene draws against its default one, whose epoch is 0: its frames are stamped
+/// with scene times about 1.8e9 s past the wall's, and the page cannot place them. `/health`
+/// is read first, so the poster sees a restart that comes after this post. Returns None
+/// when there is nothing to post (no scene yet, or no rectangle) or the tile was removed.
+async fn give_scene(
+    driver: &dyn Ec2Driver,
+    id: &str,
+    l: &Launched,
+    want: &watch::Receiver<u64>,
+    assign: &watch::Receiver<Vec<AssignSlot>>,
+    scene: &watch::Receiver<Option<SharedScene>>,
+) -> Result<Option<Given>> {
+    let mut last = None;
+    for attempt in 0..SCENE_POST_ATTEMPTS {
+        if attempt > 0 {
+            // Not `wait_or_removed`: it would mark a new generation seen, and the running
+            // tile would then miss the relaunch it asks for.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if want.has_changed().is_err() {
+                return Ok(None);
+            }
+        }
+        let body = {
+            let shared = scene.borrow().clone();
+            let list = assign.borrow();
+            match (shared, list.iter().find(|a| a.id == id)) {
+                (Some(shared), Some(a)) => renderer_body(a, &shared),
+                _ => None,
+            }
+        };
+        let Some(body) = body else { return Ok(None) };
+        let boot = driver.health(id, l).await.ok().and_then(|h| boot_id(&h));
+        match driver.post_scene(id, l, &body).await {
+            Ok(()) => return Ok(Some(Given { boot, body })),
+            Err(e) => {
+                tracing::debug!(tile = %id, error = %format!("{e:#}"), "scene not posted yet");
+                last = Some(e);
+            }
+        }
+    }
+    Err(last
+        .unwrap_or_else(|| anyhow::anyhow!("no attempt"))
+        .context(format!(
+            "the renderer on {} did not take its scene in {SCENE_POST_ATTEMPTS} attempts",
+            l.instance
+        )))
+}
 
 /// A distinct token for every tile task.
 fn task_token() -> u64 {
@@ -179,7 +254,7 @@ fn task_token() -> u64 {
 /// Remove `id`'s entry if this task (`token`) put it there.
 fn remove_own(running: &Running, id: &str, token: u64) {
     let mut r = running.lock().unwrap();
-    if r.get(id).is_some_and(|(t, _)| *t == token) {
+    if r.get(id).is_some_and(|(t, _, _)| *t == token) {
         r.remove(id);
     }
 }
@@ -189,9 +264,9 @@ fn remove_own(running: &Running, id: &str, token: u64) {
 /// a failed post once a second). Once a second it also reads each tile's health for the
 /// budget (`Event::Ec2Health`). A `/health` whose `boot_id` differs from the one read
 /// before means the renderer restarted on the same instance (its service restarts it) and
-/// has lost its scene: the scene and the budget are posted again. The first scene post on
-/// an instance reads `/health` first, so a restart between that read and any later one is
-/// seen.
+/// has lost its scene: the scene and the budget are posted again. A new instance's first
+/// scene is posted by its tile task ([`give_scene`]), which read `/health` first, so a
+/// restart between that read and any later one is seen.
 async fn post_scenes(
     driver: Arc<dyn Ec2Driver>,
     mut assign: watch::Receiver<Vec<AssignSlot>>,
@@ -204,21 +279,35 @@ async fn post_scenes(
     let mut budget_posted: HashMap<String, (String, BudgetBody)> = HashMap::new();
     // Per tile: the instance and the renderer's boot id last read from its `/health`.
     let mut boots: HashMap<String, (String, Option<String>)> = HashMap::new();
+    // Per tile: the running entry (task token and instance) whose `Given` was taken.
+    let mut taken: HashMap<String, (u64, String)> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut read_health = false;
     loop {
         let list = assign.borrow_and_update().clone();
         let shared = scene.borrow_and_update().clone();
         let grid = *budget.borrow_and_update();
-        let now: Vec<(AssignSlot, Launched)> = {
+        let now: Vec<(AssignSlot, Launched, u64, Option<Given>)> = {
             let r = running.lock().unwrap();
             list.into_iter()
-                .filter_map(|a| r.get(&a.id).map(|(_, l)| (a, l.clone())))
+                .filter_map(|a| r.get(&a.id).map(|(t, l, g)| (a, l.clone(), *t, g.clone())))
                 .collect()
         };
         if let Some(shared) = &shared {
-            for (a, l) in now {
-                let Some(rect) = a.rect else { continue };
+            for (a, l, token, given) in now {
+                // What the tile task gave this instance is what it has: start from it.
+                let entry = (token, l.instance.clone());
+                if taken.get(&a.id) != Some(&entry) {
+                    if let Some(g) = given {
+                        boots.insert(a.id.clone(), (l.instance.clone(), g.boot));
+                        posted.insert(a.id.clone(), (l.instance.clone(), g.body));
+                        budget_posted.remove(&a.id);
+                    }
+                    taken.insert(a.id.clone(), entry);
+                }
+                let Some(body) = renderer_body(&a, shared) else {
+                    continue;
+                };
                 let known = boots.get(&a.id).is_some_and(|(i, _)| *i == l.instance);
                 if read_health || !known {
                     match driver.health(&a.id, &l).await {
@@ -243,12 +332,6 @@ async fn post_scenes(
                         Err(_) => {}
                     }
                 }
-                let body = RendererScene {
-                    layout_generation: a.layout_generation,
-                    rect_from_frame: a.rect_from_frame,
-                    previous_rect: a.previous_rect,
-                    ..shared.for_renderer(rect)
-                };
                 if posted.get(&a.id) != Some(&(l.instance.clone(), body.clone())) {
                     match driver.post_scene(&a.id, &l, &body).await {
                         Ok(()) => {
@@ -316,7 +399,7 @@ pub async fn run(
     tokio::spawn(post_scenes(
         driver.clone(),
         assign.clone(),
-        scene,
+        scene.clone(),
         budget,
         running.clone(),
         handle.clone(),
@@ -343,6 +426,7 @@ pub async fn run(
                         rx,
                         handle.clone(),
                         running.clone(),
+                        (assign.clone(), scene.clone()),
                     ));
                     tiles.insert(id, tx);
                 }
@@ -403,6 +487,11 @@ async fn tile(
     mut want: watch::Receiver<u64>,
     handle: Handle,
     running: Running,
+    // The assignment and the shared scene, for a new instance's first scene.
+    (assign, scene): (
+        watch::Receiver<Vec<AssignSlot>>,
+        watch::Receiver<Option<SharedScene>>,
+    ),
 ) {
     let token = task_token();
     let mut current: Option<(Launched, u64)> = None;
@@ -474,16 +563,27 @@ async fn tile(
                     )
                     .await;
                     let accepted = Instant::now();
-                    let l = match driver.ready(&id, &l).await {
+                    // Ready means the renderer answers and has its scene: a viewer streams
+                    // a running tile at once.
+                    let up = match driver.ready(&id, &l).await {
+                        Ok(up) if want.has_changed().is_ok() => {
+                            give_scene(&*driver, &id, &up, &want, &assign, &scene)
+                                .await
+                                .map(|given| (up, given))
+                        }
+                        Ok(up) => Ok((up, None)),
+                        Err(e) => Err(e),
+                    };
+                    let l = match up {
                         // The tile left the assignment while its instance started (its
                         // sender is gone), and a task for its return may already own the
                         // entry: this instance is only terminated, below.
-                        Ok(l) if want.has_changed().is_err() => l,
-                        Ok(l) => {
+                        Ok((l, _)) if want.has_changed().is_err() => l,
+                        Ok((l, given)) => {
                             running
                                 .lock()
                                 .unwrap()
-                                .insert(id.clone(), (token, l.clone()));
+                                .insert(id.clone(), (token, l.clone(), given));
                             timings
                                 .insert("ready_ms".into(), accepted.elapsed().as_millis() as u64);
                             timings.insert("total_ms".into(), t0.elapsed().as_millis() as u64);

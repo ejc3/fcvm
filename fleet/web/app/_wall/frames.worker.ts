@@ -6,8 +6,8 @@
 
 import {
   BORROW_FADE_MS,
-  BUFFER_FRAMES,
   chooseCommonT,
+  holdFrame,
   codecFromSps,
   admitChunk,
   heightMessage,
@@ -238,25 +238,11 @@ class TileStream {
     this.lastW = frame.displayWidth - crop.left - crop.right;
     this.lastH = frame.displayHeight - crop.top - crop.bottom;
     this.decodedTimes.push(now());
-    // Keep ascending order; a repeated t replaces the old frame.
-    const at = this.frames.findIndex((h) => h.t >= t - SAME_T_EPS);
-    if (at >= 0 && Math.abs(this.frames[at]!.t - t) <= SAME_T_EPS) {
-      this.frames[at]!.frame.close();
-      this.frames[at] = { t, frame, crop, grid };
-    } else if (at >= 0) {
-      this.frames.splice(at, 0, { t, frame, crop, grid });
-    } else {
-      this.frames.push({ t, frame, crop, grid });
-    }
     // While a re-tile waits, the frame on screen is kept: the old tiles are drawn from it.
     // While paused, so is the frame the frozen choice shows for this stream: a resize or a new plan redraws from it.
     const heldT = plan.paused ? shownT(lastChoice.show.get(this.id)) : null;
     const keeps = (h: Held) => (pinT !== null && Math.abs(h.t - pinT) <= SAME_T_EPS) || (heldT !== null && Math.abs(h.t - heldT) <= SAME_T_EPS);
-    while (this.frames.length > BUFFER_FRAMES) {
-      const i = this.frames.findIndex((h) => !keeps(h));
-      if (i < 0) break;
-      this.frames.splice(i, 1)[0]!.frame.close();
-    }
+    for (const h of holdFrame(this.frames, { t, frame, crop, grid }, keeps)) h.frame.close();
   }
 
   resetDecoder(): void {

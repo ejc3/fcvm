@@ -13,7 +13,7 @@ import {
   tileAt,
   frameFitsBox,
 } from "../layout.ts";
-import { acquireFrozen, BUFFER_FRAMES, chooseCommonT, releaseBefore, type SyncChoice } from "../sync.ts";
+import { acquireFrozen, BUFFER_FRAMES, chooseCommonT, CLOCK_BACK_S, holdFrame, releaseBefore, type SyncChoice } from "../sync.ts";
 import { ENC_BPP, fitBandwidth, MAX_STREAM_BPS, MIN_STREAM_BPS, streamBitrate } from "../bandwidth.ts";
 import { addDrag, cameraAt, emptyDrag, lightPosition, poseAt, projectPoint, takeDrag } from "../scene.ts";
 import { fleet } from "./fixtures.ts";
@@ -154,6 +154,42 @@ describe("one common t", () => {
       const synced = [...c.show.values()].filter((s) => s.kind === "sync").map((s) => (s as { t: number }).t);
       expect(new Set(synced).size).toBeLessThanOrEqual(1);
     }
+  });
+});
+
+describe("a tile's held frames", () => {
+  const hold = (frames: { t: number }[], t: number) => holdFrame(frames, { t }, () => false);
+
+  it("keeps the newest BUFFER_FRAMES frames, a repeated t replacing the old one", () => {
+    const frames: { t: number }[] = [];
+    for (let k = 0; k < BUFFER_FRAMES + 5; k++) hold(frames, k / 30);
+    expect(frames.length).toBe(BUFFER_FRAMES);
+    expect(frames[frames.length - 1]!.t).toBeCloseTo((BUFFER_FRAMES + 4) / 30);
+    expect(hold(frames, (BUFFER_FRAMES + 4) / 30).length).toBe(1);
+    expect(frames.length).toBe(BUFFER_FRAMES);
+  });
+
+  // Staging, after a wake: EC2 renderers streamed against their default scene (epoch 0,
+  // scene times near 1.8e9 s) until their scene arrived. Those frames stayed the newest the
+  // tile held, every frame on the wall's clock was let go as the oldest, and the tiles
+  // never showed a frame again.
+  it("lets go of frames from before the renderer's clock moved back", () => {
+    const frames: { t: number }[] = [];
+    const unix = 1_793_073_096;
+    for (let k = 0; k < BUFFER_FRAMES; k++) hold(frames, unix + k / 30);
+    const wall = 266_223;
+    const gone = hold(frames, wall);
+    expect(gone.length).toBe(BUFFER_FRAMES);
+    expect(frames.map((h) => h.t)).toEqual([wall]);
+    hold(frames, wall + 1 / 30);
+    expect(frames[frames.length - 1]!.t).toBeCloseTo(wall + 1 / 30);
+  });
+
+  it("keeps frames a stream reorders by less than CLOCK_BACK_S", () => {
+    const frames: { t: number }[] = [];
+    for (let k = 0; k < 10; k++) hold(frames, 100 + k / 30);
+    expect(hold(frames, 100 + 10 / 30 - CLOCK_BACK_S / 2).length).toBe(0);
+    expect(frames.length).toBe(11);
   });
 });
 

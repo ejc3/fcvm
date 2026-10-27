@@ -782,7 +782,9 @@ agent posts `scene` plus the slot's `rect` to each running renderer as
 `{"epoch_unix_ms", "rect", "layout_generation", "rect_from_frame", "previous_rect",
 "image_aspect", "camera", "time_of_day", "words", "lights"}`. The
 coordinator posts the same body to each EC2 tile's renderer
-(`POST https://ec2-<n>.<zone>/scene`).
+(`POST https://ec2-<n>.<zone>/scene`). A tile is reported `running` only after its
+renderer has taken the scene: a viewer streams a running tile at once, and a renderer
+with no scene draws against epoch 0.
 
 The layout fields of that body, for the renderer (#1174 implements them):
 
