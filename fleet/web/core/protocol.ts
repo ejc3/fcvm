@@ -406,11 +406,8 @@ export interface Claim {
   gpu: string | null;
   phases: Record<string, number>;
   camera: CameraKey[];
-  /**
-   * The camera flies the coordinator's autopilot loop (true) or is the viewer's (false);
-   * null from a coordinator that has no autopilot.
-   */
-  autopilot: boolean | null;
+  /** The camera flies the coordinator's autopilot loop (true) or is the viewer's (false). */
+  autopilot: boolean;
   /** Why it ended, once it has. */
   ended: string | null;
 }
@@ -498,6 +495,11 @@ function isObj(v: unknown): v is Obj {
 function num(o: Obj, k: string, where: string): number {
   const v = o[k];
   if (typeof v !== "number" || !Number.isFinite(v)) throw new ProtocolError(`${where}.${k} is not a number`);
+  return v;
+}
+function bool(o: Obj, k: string, where: string): boolean {
+  const v = o[k];
+  if (typeof v !== "boolean") throw new ProtocolError(`${where}.${k} is not true or false`);
   return v;
 }
 function numOrNull(o: Obj, k: string, where: string): number | null {
@@ -806,7 +808,7 @@ function parseClaim(v: Obj): Claim {
     gpu: strOrNull(v, "gpu", w),
     phases,
     camera: parseCamera(v, "claim"),
-    autopilot: typeof v["autopilot"] === "boolean" ? v["autopilot"] : null,
+    autopilot: bool(v, "autopilot", w),
     ended: strOrNull(v, "ended", w),
   };
 }

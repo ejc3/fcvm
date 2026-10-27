@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import * as fmt from "../format.ts";
 import { initialState, makeIntent, reduce, type ClientState, type FrameStats } from "../store.ts";
+import { parseServerMsg } from "../protocol.ts";
 import {
   BORROW_FADE_MS,
   TEXT_STYLES,
@@ -444,13 +445,14 @@ describe("your own GPU", () => {
     expect(s.own.autopilot).toBeNull();
   });
 
-  it("shows no autopilot control for a coordinator without one, or once the minute is over", () => {
+  it("shows no autopilot control once the minute is over, and refuses a claim without autopilot", () => {
     let s = reduce(stateWith(fleet()), { type: "intent-sent", intent: makeIntent("own", "claim_gpu"), at: EPOCH + 1000 });
-    s = msg(s, { type: "claim", claim: claim({ phase: "running", first_frame_at: EPOCH + 3900, autopilot: null }) });
-    expect(view(s, EPOCH + 5000).own!.autopilot).toBeNull();
-    expect(view(s, EPOCH + 5000).own!.help).toBe("Drag to turn the camera, scroll to move closer. Arrow keys and plus or minus work too.");
+    s = msg(s, { type: "claim", claim: claim({ phase: "running", first_frame_at: EPOCH + 3900 }) });
+    expect(view(s, EPOCH + 5000).own!.autopilot!.on).toBe(true);
     s = msg(s, { type: "claim", claim: claim({ phase: "ended", first_frame_at: EPOCH + 3900, ended: "released" }) });
     expect(view(s, EPOCH + 9000).own!.autopilot).toBeNull();
+    const { autopilot: _, ...old } = claim({ phase: "running" });
+    expect(() => parseServerMsg(JSON.stringify({ type: "claim", claim: old }))).toThrow("claim.autopilot is not true or false");
   });
 
   it("ignores a claim message it did not ask for", () => {
@@ -1365,7 +1367,7 @@ describe("the family choice covers every stream the page opens", () => {
   });
 
   it("opens a borrowed GPU's stream over the viewer's family, and none when it has no URL in it", () => {
-    const claimMsg = (v4: string | null) => ({ type: "claim", claim: { id: "claim-1", tile: "fcvm:4", phase: "running", frame_url: "ws://example-host:2/frames/claim-1", frame_url_v4: v4, clicked_at: EPOCH, first_frame_at: EPOCH + 2900, expires_at: EPOCH + 62_900, gpu: "Tesla T4", phases: {}, camera: [], ended: null } });
+    const claimMsg = (v4: string | null) => ({ type: "claim", claim: { id: "claim-1", tile: "fcvm:4", phase: "running", frame_url: "ws://example-host:2/frames/claim-1", frame_url_v4: v4, clicked_at: EPOCH, first_frame_at: EPOCH + 2900, expires_at: EPOCH + 62_900, gpu: "Tesla T4", phases: {}, camera: [], autopilot: true, ended: null } });
     const own = (family: "v6" | "v4", v4: string | null) => {
       let s = stateWith(fleet(2, 2));
       s = { ...s, net: { family, probeMs: 180, via: "race" } };

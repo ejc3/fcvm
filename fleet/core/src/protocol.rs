@@ -95,7 +95,6 @@ pub struct ClaimMsg {
     pub camera: Vec<crate::scene::Keyframe>,
     /// The camera flies the autopilot's loop (`claim_autopilot`); false once the viewer
     /// paused it or took the camera.
-    #[serde(default)]
     pub autopilot: bool,
     /// Why it ended: `expired` (its time ran out) or `released` (`release_gpu`, or the GPU
     /// left the fleet); null while it lasts.

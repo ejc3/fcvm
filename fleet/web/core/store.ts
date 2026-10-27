@@ -249,12 +249,11 @@ const NO_OWN: OwnGpu = { requestId: null, requestedAt: null, claim: null, refuse
 
 /**
  * Whether the viewer's own camera is on autopilot: what the viewer last asked for until
- * the coordinator agrees, else the claim's. Null when there is no claim or its
- * coordinator has no autopilot.
+ * the coordinator agrees, else the claim's. Null when there is no claim.
  */
 export function ownAutopilot(s: ClientState): boolean | null {
   const c = s.own.claim;
-  if (c === null || c.autopilot === null) return null;
+  if (c === null) return null;
   return s.own.autopilot?.on ?? c.autopilot;
 }
 

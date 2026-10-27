@@ -910,7 +910,7 @@ export interface OwnView {
   gpu: string;
   steps: TimelineStep[];
   placed: { box: Box; streamHeight: number } | null;
-  /** The autopilot control, or null when this coordinator flies none. */
+  /** The autopilot control, or null before a claim arrives and after it ends. */
   autopilot: OwnAutopilot | null;
 }
 
@@ -991,9 +991,7 @@ function ownView(s: ClientState, st: FleetState, srvNow: number, input: WallInpu
     help:
       autopilot === true
         ? "Flying on autopilot. Drag, scroll, an arrow key or plus or minus takes the camera; Space pauses."
-        : autopilot === false
-          ? "Drag to turn the camera, scroll to move closer. Arrow keys and plus or minus work too; Space flies again."
-          : "Drag to turn the camera, scroll to move closer. Arrow keys and plus or minus work too.",
+        : "Drag to turn the camera, scroll to move closer. Arrow keys and plus or minus work too; Space flies again.",
     latency: s.lastInputLatencyMs === null ? "move the camera to measure input to pixels" : `input to pixels: ${fmt.millis(s.lastInputLatencyMs)}`,
     gpu: c?.gpu ?? "",
     steps: c ? timelineOf(c.phases).steps : [],
