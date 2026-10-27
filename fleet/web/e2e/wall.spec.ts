@@ -539,6 +539,76 @@ test("viewers choose the directed camera's next stop", async ({ page }) => {
   await admin("/mock/schedule", { hold_in_ms: 600_000 });
 });
 
+test("the header links to the fcvm repository, with the address the isolation panel uses", async ({ page }) => {
+  await openWall(page, 1);
+  const gh = page.getByTestId("github-link");
+  await expect(gh).toHaveCount(1);
+  await expect(gh).toHaveAttribute("href", "https://github.com/ejc3/fcvm");
+  await expect(gh).toHaveAttribute("target", "_blank");
+  await expect(gh).toHaveAttribute("rel", "noopener noreferrer");
+  await expect(gh).toHaveAttribute("aria-label", "fcvm on GitHub");
+  await expect(gh).toHaveAttribute("title", "fcvm on GitHub");
+
+  await page.getByTestId("isolation-link").click();
+  await expect(page.getByTestId("isolation-repo")).toHaveAttribute("href", (await gh.getAttribute("href")) ?? "missing");
+});
+
+test("the three header buttons open distinct panels, each at its top", async ({ page }) => {
+  await openWall(page, 1);
+  const drawer = page.getByTestId("drawer");
+  const scrollTop = () => drawer.evaluate((el) => el.scrollTop);
+  // What only the controls have, what only About has, what only the isolation panel has.
+  const controls = [page.getByLabel("Write a word into the world"), page.getByTestId("streams-switch"), page.getByTestId("stats-switch")];
+  const about = [page.getByTestId("about"), page.getByTestId("sentence"), page.getByTestId("counter")];
+  const isolation = [page.getByTestId("isolation"), page.getByTestId("isolation-repo")];
+  const only = async (panel: "play" | "about" | "isolation") => {
+    await expect(drawer).toHaveCount(1);
+    for (const [name, els] of [["play", controls], ["about", about], ["isolation", isolation]] as const) {
+      for (const el of els) await expect(el, `${name} content in the ${panel} panel`).toHaveCount(name === panel ? 1 : 0);
+    }
+    await expect(drawer).toHaveAttribute("data-panel", panel);
+    expect(await scrollTop()).toBe(0);
+  };
+
+  // Direct the scene: the controls, without About or the isolation text.
+  await page.getByTestId("play").click();
+  await only("play");
+  // Scroll the controls down; the other panels still open at their top.
+  await drawer.evaluate((el) => {
+    el.scrollTop = 300;
+  });
+
+  // The menu: About only. Opened from the keyboard because the open drawer covers the header.
+  await page.getByTestId("menu").focus();
+  await page.keyboard.press("Enter");
+  await only("about");
+  await expect(page.locator("#about-title")).toBeFocused();
+  await expect(page.getByTestId("counter")).toContainText("GPU VMs restored:");
+
+  // The (i): the isolation text only. Opening it replaced About.
+  await page.getByTestId("isolation-link").focus();
+  await page.keyboard.press("Enter");
+  await only("isolation");
+  await expect(page.locator("#isolation-title")).toBeFocused();
+  await expect(page.getByTestId("isolation-repo")).toHaveAttribute("href", "https://github.com/ejc3/fcvm");
+
+  // Escape closes the panel, and focus goes back to the button that opened it.
+  await page.keyboard.press("Escape");
+  await expect(drawer).toHaveCount(0);
+  await expect(page.getByTestId("isolation-link")).toBeFocused();
+
+  // Each button opens its panel on its own, from closed, at the top.
+  await page.getByTestId("menu").click();
+  await only("about");
+  await page.keyboard.press("Escape");
+  await page.getByTestId("isolation-link").click();
+  await only("isolation");
+  await page.getByRole("button", { name: "Close" }).click();
+  await expect(drawer).toHaveCount(0);
+  await page.getByTestId("play").click();
+  await only("play");
+});
+
 test("the count of GPU VMs restored ticks as VMs restore; the isolation panel says how a square is isolated", async ({ page }) => {
   await openWall(page, 15);
   const counters = async () => ((await mockState()).state as unknown as { counters: { restores: number; scrubs: number } }).counters;
@@ -572,6 +642,10 @@ test("the count of GPU VMs restored ticks as VMs restore; the isolation panel sa
   try {
     await page.evaluate(() => window.__fleet!.client.send("relaunch", { tile: "fcvm:1" }));
     await expect(panel.locator("p").last()).toHaveText("GPU memory is cleared before a GPU moves to the next virtual machine.", { timeout: 10_000 });
+    // The count is About's, not the isolation panel's.
+    await expect(page.getByTestId("counter-scrubs")).toHaveCount(0);
+    await page.getByTestId("menu").focus();
+    await page.keyboard.press("Enter");
     await expect(page.getByTestId("counter-scrubs")).toHaveText("GPU memory scrubs: 1");
   } finally {
     await admin("/mock/schedule", { gpu_scrub: false });
@@ -1358,7 +1432,26 @@ test("phone: the image full width at the top, the strip under it, one button in 
   const dock = await page.getByTestId("restart-all").boundingBox();
   expect(dock!.y + dock!.height).toBeLessThanOrEqual(vh);
   expect(dock!.y).toBeGreaterThan(vh / 2);
+  // The header holds the GitHub link and the menu in one row with the title; no (i): About carries
+  // the isolation section on a phone.
+  const header = await page.locator(".phone header").boundingBox();
+  for (const id of ["github-link", "menu"]) {
+    const box = await page.getByTestId(id).boundingBox();
+    expect(box!.x + box!.width, id).toBeLessThanOrEqual(vw);
+    expect(box!.y + box!.height, id).toBeLessThanOrEqual(header!.y + header!.height);
+  }
+  await expect(page.getByTestId("isolation-link")).toHaveCount(0);
+  await expect(page.getByTestId("github-link")).toHaveAttribute("href", "https://github.com/ejc3/fcvm");
+  await page.getByTestId("menu").click();
+  await expect(page.getByTestId("drawer")).toHaveAttribute("data-panel", "about");
+  await expect(page.getByTestId("counter")).toHaveCount(1);
+  await expect(page.getByTestId("isolation-repo")).toHaveAttribute("href", "https://github.com/ejc3/fcvm");
+  await expect(page.getByTestId("word-status")).toHaveCount(0);
+  expect(await page.getByTestId("drawer").evaluate((el) => el.scrollTop)).toBe(0);
+  await page.getByRole("button", { name: "Close" }).click();
   await page.getByTestId("phone-play").click();
+  await expect(page.getByTestId("drawer")).toHaveAttribute("data-panel", "play");
+  await expect(page.getByTestId("about")).toHaveCount(0);
   await expect(page.getByTestId("drawer")).toBeVisible();
   await page.getByTestId("text-style-landmark").click();
   await expect(page.getByRole("radio", { name: "Landmark" })).toBeChecked();
