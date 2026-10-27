@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -15,6 +16,7 @@
 #include "../src/proto.h"
 #include "../src/scene.h"
 #include "../src/subscriber.h"
+#include "../src/threads.h"
 #include "../src/world.h"
 #include "check.h"
 #include "tls_check.h"
@@ -658,6 +660,37 @@ int main() {
     }
     CHECK(restarts && restart_locked, "frame_once restarts the headers of open streams when the numbered layout ended");
     CHECK(idr_forced, "the encoders force a keyframe for the restarted headers");
+  }
+  // --- a connection the system has no thread for is refused, not fatal
+  {
+    // a maker that refuses, as std::thread's constructor does at a pids limit
+    ThreadMaker refuse = [](std::function<void()>) -> std::thread {
+      throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+    };
+    bool ran = false;
+    std::thread t;
+    CHECK(!start_thread([&] { ran = true; }, &t, refuse) && !ran && !t.joinable(),
+          "a refused joinable thread reports false and its function never runs");
+    CHECK(!start_thread([&] { ran = true; }, nullptr, refuse) && !ran,
+          "a refused detached thread reports false and its function never runs");
+    std::atomic<int> runs{0};
+    CHECK(start_thread([&] { runs++; }, &t) && t.joinable(), "a thread the system gives is started");
+    t.join();
+    CHECK(runs == 1, "its function ran once");
+    // every per-connection thread in server.cpp goes through start_thread: the
+    // accept loop's and the stream writer's, and no other thread is started per
+    // connection
+    std::vector<std::string> src = source_lines("../src/server.cpp");
+    // a thread constructed in place: std::thread(...) or std::thread name(...) / {...};
+    // serve()'s TLS accept loop, started once at startup, is the one allowed
+    const std::regex constructed(R"(std::thread(\s+\w+)?\s*[({])");
+    int starts = 0, raw = 0;
+    for (auto& l : src) {
+      if (l.find("start_thread(") != std::string::npos) starts++;
+      if (std::regex_search(l, constructed) && l.find("accept_loop(tfd_, true)") == std::string::npos) raw++;
+    }
+    CHECK(starts == 2 && raw == 0, "server.cpp starts its per-connection threads with start_thread (%d) and no other way (%d)",
+          starts, raw);
   }
   // --- a slow subscriber whose queue is cleared still gets the stream header
   {

@@ -19,6 +19,7 @@
 #include "nvenc.h"
 #include "jpeg.h"
 #include "proto.h"
+#include "threads.h"
 
 namespace {
 void respond(Conn& c, int code, const char* reason, const std::string& body, const char* ctype = "application/json",
@@ -121,19 +122,27 @@ void Server::accept_loop(int lfd, bool tls) {
       perror("accept");
       continue;
     }
-    std::thread([this, fd, tls] {
-      int one = 1;
-      setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-      std::unique_ptr<Conn> c;
-      if (tls) {
-        std::string err;
-        c = tls_->accept(fd, 10000, &err);  // closes fd on failure
-        if (!c) return;
-      } else {
-        c.reset(new Conn(fd, nullptr));
-      }
-      handle(*c);
-    }).detach();
+    bool started = start_thread(
+        [this, fd, tls] {
+          int one = 1;
+          setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+          std::unique_ptr<Conn> c;
+          if (tls) {
+            std::string err;
+            c = tls_->accept(fd, 10000, &err);  // closes fd on failure
+            if (!c) return;
+          } else {
+            c.reset(new Conn(fd, nullptr));
+          }
+          handle(*c);
+        },
+        nullptr);
+    if (!started) {
+      // no thread for it (a pids or thread limit): refuse this connection
+      close(fd);
+      unsigned long long n = ++refused_;
+      if ((n & (n - 1)) == 0) fprintf(stderr, "fleet-renderer: no thread for a new connection; refused %llu so far\n", n);
+    }
   }
 }
 
@@ -255,7 +264,8 @@ void Server::websocket(Conn& c, int h, int q, const std::string& key) {
   c.set_option(SOL_SOCKET, SO_SNDBUF, 1 << 20);
   auto sub = p_.subscribe(h, q);
   // writer: drains the subscriber's queue
-  std::thread writer([&c, sub] {
+  std::thread writer;
+  bool started = start_thread([&c, sub] {
     while (true) {
       std::shared_ptr<const std::string> m;
       {
@@ -272,7 +282,14 @@ void Server::websocket(Conn& c, int h, int q, const std::string& key) {
       }
     }
     c.shutdown_both();
-  });
+  }, &writer);
+  if (!started) {
+    // no thread for the writer (a pids or thread limit): end this stream only
+    p_.unsubscribe(sub);
+    unsigned long long n = ++refused_;
+    if ((n & (n - 1)) == 0) fprintf(stderr, "fleet-renderer: no thread for a stream's writer; refused %llu so far\n", n);
+    return;
+  }
   // reader: control messages from the client
   while (true) {
     uint8_t b2[2];

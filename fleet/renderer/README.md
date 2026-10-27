@@ -101,6 +101,7 @@ src/scene.cpp      scene JSON, camera splines and holds, tile geometry, per-fram
 src/pipeline.cpp   frame clock, subscribers, per-height encoders, sample budget, /health
 src/subscriber.cpp a subscriber's queue: header and keyframe rules, a slow reader dropped to the next keyframe
 src/server.cpp     HTTP/1.1 and WebSocket
+src/threads.h      starting a connection's threads when the system has none to give
 src/nvenc.cpp      NVENC (libnvidia-encode loaded at run time; header from nv-codec-headers, MIT)
 src/gpustats.cpp   NVML (libnvidia-ml loaded at run time)
 tests/test_host.cpp  scene parsing, splines and holds, tile geometry, wire formats (no GPU)
@@ -151,6 +152,174 @@ python3 tools/mosaic.py out 4 2 540 25 tools/scene-hold.json HOST1:8080 ... HOST
 python3 tools/rawmosaic.py out 4 2 540 tools/scene-move.json HOST1:8080 ...   # unencoded tiles of one frame (GET /raw)
 python3 tools/seam_metric.py out.png 4 2              # seam ratio at every tile boundary
 ```
+
+`tools/viewerload.cpp` (C++ and OpenSSL, built with the `g++` line in
+"Viewers per renderer") opens many frame streams as the page does and reports
+each stream's frame rate, frame delay, and frames dropped for a slow reader.
+
+## Viewers per renderer (round 14, 2026-10-27)
+
+Every viewer subscribes to every tile, so the wall serves as many viewers as
+its weakest tile. Measured in isolation, not on staging:
+
+- **fcvm half:** one g4dn.metal (on demand) from the fleet host AMI, eight
+  renderer VMs started as the agent starts them (`--network routed` at the
+  slot's IPv6 address, TLS in the VM on 443, the IPv4 relay published on the
+  host, 2 vCPUs and 1 GiB), each drawing one 1/4 x 1/4 rect of the fcvm half of
+  a 4 x 4 wall, camera moving.
+- **EC2 half:** one g4dn.xlarge from the fleet tile AMI (the renderer behind
+  nginx's TLS on 443), drawing one such rect.
+- **Viewers:** `tools/viewerload.cpp` on two c8g.24xlarge in another region,
+  subscribing over IPv6 as the page does. The page's asks for this wall
+  (`fleet/web/core/layout.ts`, `bandwidth.ts`): a 1920 x 1080 desktop asks
+  `h=270`, `q=std` (496 x 286 delivered, 2.4 to 3.7 Mbit/s per tile by its
+  content); a phone, 390 x 844 at DPR 3 in portrait, asks `h=180`, `q=std`
+  (336 x 196, 0.8 to 1.8 Mbit/s).
+
+```bash
+g++ -O2 -std=c++17 -pthread -o viewerload tools/viewerload.cpp -lssl -lcrypto
+./viewerload --epoch-ms <the scene's epoch_unix_ms> --conns 500 --h 270 --warmup 8 --secs 15 \
+  'wss://[<slot address>]:443/frames' ...       # each URL gets --conns viewers
+```
+
+A step passes when every viewer of every tile gets at least 29.5 frames a
+second, no frame is dropped for a slow reader (no gap in frame numbers, no
+repeated stream header), and the frame delay's 95th percentile is at most 50 ms
+above the tile's fastest frame in the same run (absolute delays carry each VM's
+clock offset, so delays are compared within a tile). 15 s per step after 5 to 8
+s to settle. No step dropped a frame for a slow reader, so the columns below are
+frame rate and delay.
+
+**Viewers of the whole wall**, at that criterion:
+
+| | desktop (`h=270`) | phone (`h=180`) |
+|---|---|---|
+| fcvm half, as deployed (2 vCPUs per VM) | 500 (750 fails) | 500 (750 fails) |
+| fcvm half, 4 vCPUs per VM and RPS (below) | 750, at the edge (1000 fails) | 750 (1000 fails) |
+| EC2 half (g4dn.xlarge) | 750 (1000 fails) | not measured |
+| coordinator (0.5 vCPU, 1 GiB) | about 5,000 (memory) | same |
+
+So the wall as deployed serves about 500 simultaneous viewers, desktop or
+phone; the fcvm half is the first to fail.
+
+All eight fcvm VMs at once, as deployed:
+
+| viewers per tile | Mbit/s per viewer per tile | host NIC | slowest tile, fps | delay p95 over fastest | busiest VMM thread | busiest renderer process |
+|---|---|---|---|---|---|---|
+| desktop 250 | 2.98 | 6.4 Gbit/s | 29.93 | 14 ms | 29% | 67% |
+| desktop 500 | 2.97 | 12.7 Gbit/s | 29.60 | 27 ms | 55% | 98% |
+| desktop 750 | 2.63 | 16.8 Gbit/s | 20.53 | 485 ms | 100% | 130% |
+| phone 500 | 1.48 | 6.3 Gbit/s | 29.93 | 25 ms | 39% | 92% |
+| phone 750 | 1.45 | 9.3 Gbit/s | 28.33 | 50 ms | 65% | 119% |
+| phone 1000 | 1.12 | 9.6 Gbit/s | 14.93 | 64 ms | 81% | 122% |
+
+**The first bottleneck is the VM's two vCPUs, with the VMM's event-loop
+thread close behind.** One VM (an interior tile, desktop asks):
+
+| viewers | fps | slots missed in 14 s | render thread's frame time, p50 | renderer process | VMM thread |
+|---|---|---|---|---|---|
+| 1 | 30.0 | 0 | 13.7 ms | 39% | |
+| 250 | 29.93 | 0 | 17.1 ms | 61% | |
+| 500 | 29.87 | 1 | 20.9 ms | 88% | |
+| 750 | 27.93 | 28 | 26.8 ms | 114% | 77% |
+| 1000 | 16.80 | 183 | 34.6 ms | 92% | 71% |
+
+The render thread draws, encodes and queues each frame for every viewer, and
+each viewer has a writer thread and a reader thread. Its frame time grows by
+about 20 us per viewer (13.7 ms alone, 34.6 ms at 1000), and once it passes the
+33.3 ms slot the renderer skips every other slot (15 fps). Most of that is
+waiting, not queueing work: the guest's scheduler counters at 1000 viewers had the render
+thread runnable but waiting for a CPU 26% of the time (1.32 s of 5 s; the
+2,010 renderer threads together waited 431 s). Waking all writers with one
+futex call per frame, instead of one per viewer, did not move it (16.6 fps at
+1000 viewers with RPS, against 15.1 without the change), so that change is not
+here. Heavier tiles (terrain, longer render) fail first, and phones, at half
+the bytes, fail at the same count.
+
+The VMM's one event-loop thread carries everything the guest sends: a frame
+written to the TAP crosses the namespace bridge, the veth, routing and the
+software segmentation ENA leaves to the kernel (ENA has no TSO) inside that
+`write`. A bpftrace profile of a 4-vCPU VM at 1000 viewers had it 98% busy,
+nearly all in the kernel (`tun_get_user` 14%, `tcp_gso_segment` 10%,
+`ena_start_xmit` 7%). It
+caps a VM at about 2.8 Gbit/s (desktop 750, all eight VMs: two VMM threads at
+98 to 100%, delay p95 485 ms over the fastest frame). fcvm now spreads the
+TAP's receive processing over every host CPU (RPS, `veth::create_tap_in_ns`),
+so the VMM's `write` hands each packet to another CPU:
+
+| one VM, desktop | fps | delay p95 over fastest | VMM thread | throughput |
+|---|---|---|---|---|
+| 2 vCPUs, 750 viewers | 27.93 | 49 ms | 77% | 2.62 Gbit/s |
+| 2 vCPUs, 750 viewers, RPS | 29.53 | 14 ms | 43% | 2.75 Gbit/s |
+| 4 vCPUs, 1000 viewers | 18.80 | 622 ms | 98% | 2.62 Gbit/s |
+| 4 vCPUs, 1000 viewers, RPS | 29.93 | 21 ms | 69% | 3.71 Gbit/s |
+| 4 vCPUs, 1500 viewers, RPS | 19.87 | 31 ms | 63% | 3.69 Gbit/s |
+
+With RPS and 2 vCPUs the delays stay low but the render thread still starves
+(all eight VMs, desktop 750: slowest tile 15.0 fps, delay p95 28 ms over the
+fastest), so the agent's VMs need 4 vCPUs as well (`--fcvm-arg=--cpu
+--fcvm-arg=4` in the agent's arguments; the vCPU count is part of the snapshot,
+so the host AMI's warmed store needs the same). At 4 vCPUs one VM tops out at
+about 30,000 frame sends a second (1000 viewers at 30 fps, 1500 at 20, 2000 at
+15) with neither the VMM thread nor the vCPUs saturated.
+
+All eight VMs at once, 4 vCPUs each:
+
+| viewers per tile | RPS | Mbit/s per viewer per tile | host NIC | slowest tile, fps | delay p95 over fastest | busiest VMM thread |
+|---|---|---|---|---|---|---|
+| desktop 750 | no | 2.68 | 17.1 Gbit/s | 20.33 | 799 ms | 100% |
+| desktop 750 | yes | 3.00 | 19.2 Gbit/s | 29.47 | 41 ms | 62% |
+| desktop 1000 | yes | 2.38 | 20.3 Gbit/s | 19.93 | 249 ms | 93% |
+| phone 750 | yes | 0.76 | 4.9 Gbit/s | 29.73 | 50 ms | 44% |
+| phone 1000 | yes | 1.42 | 12.1 Gbit/s | 27.00 | 67 ms | 65% |
+
+The phone 750 step ran at a point of the flight whose tiles encoded at half
+the usual rate; the per-viewer cost the renderer pays is per frame more than
+per byte, so it is listed as measured.
+
+**The IPv4 relay** (the corner tile through the host's IPv4 address and fcvm's
+relay, desktop asks, 1.6 Mbit/s per viewer for that sky tile): 750 viewers
+passed (29.80 fps, delay p95 15 ms over the fastest), and the relay's fcvm
+process used 44% of one core at 1.17 Gbit/s, spread over its tokio workers.
+Not a bottleneck at these counts.
+
+**The EC2 half** (g4dn.xlarge, desktop asks, about 3.6 Mbit/s per viewer):
+
+| viewers | fps | delay p95 over fastest | renderer | nginx | instance CPU (4 vCPUs) | NIC |
+|---|---|---|---|---|---|---|
+| 250 | 30.00 | 15 ms | 55% | 54% | 28% | 0.96 Gbit/s |
+| 500 | 30.00 | 28 ms | 81% | 120% | 53% | 1.93 Gbit/s |
+| 750 | 29.67 | 40 ms | 111% | 193% | 79% | 2.85 Gbit/s |
+| 1000 | 27.60 | 104 ms | 139% | 222% | 93% | 3.52 Gbit/s |
+| 1500 | the renderer terminated | | | | | |
+
+CPU binds it: nginx's TLS proxy takes more than the renderer. The network is
+far from the instance's 5 Gbit/s baseline. At 1500 the renderer died: podman's
+default pids limit (2048) refused a thread at about the 1,020th viewer, the
+uncaught `std::system_error` terminated the process, and every viewer of the
+tile lost its stream. The renderer now refuses that one connection instead
+(`start_thread`, `src/threads.h`), and the tile's unit raises the limit
+(`--pids-limit=32768`). With both, 1500 viewers: the renderer kept running at
+19.7 fps (CPU), and nginx refused 36 handshakes ("worker_connections are not
+enough": the stock 768 per worker, two per proxied stream); with the fix and
+the old limit, 1,032 viewers streamed and the rest were refused.
+
+**The coordinator** (`fcvm fleet coord --ec2 fake`, so 16 places, at the
+Fargate task's 0.5 vCPU through a cgroup CPU quota, on Graviton; without the
+`cloudflared` sidecar that shares the task): N `/live` connections, one of them
+dropping a light every 2 s, timed from the intent to each viewer's snapshot at
+or past its version.
+
+| viewers | snapshot | to every viewer, p50 / p95 / max | sent | resident memory |
+|---|---|---|---|---|
+| 1,008 | 9.6 KB, 0.65 a second | 45 / 57 / 60 ms | 51 Mbit/s | not read |
+| 2,512 | 11.7 KB, 0.55 a second | 34 / 51 / 57 ms | 135 Mbit/s | 408 MB |
+| 5,008 | 13.7 KB, 0.70 a second | 73 / 102 / 145 ms | 351 Mbit/s | 793 MB (peak 844 MB) |
+
+Memory binds first: about 160 KB per connection, so the 1 GiB task, which
+`cloudflared` shares, holds about 5,000 viewers, ten times what the fcvm half
+serves. CPU averaged 11% of a core over the 5,008 run (the quota is 50%). Connecting 5,008 viewers at
+once took up to 29 s (every join is a new version sent to everyone).
 
 ## Moving frames at the wall's size (round 13, 2026-10-26)
 
