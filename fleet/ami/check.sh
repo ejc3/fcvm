@@ -233,6 +233,13 @@ grep -qx 'DefaultDependencies=no' fleet/ami/host/fcvm-fleet-prefetch.service &&
   no "fcvm-fleet-prefetch.service must start once local file systems are up (DefaultDependencies=no)"
 sed -n '/^prep)/,/;;/p' fleet/ami/host/build.sh | grep -qE '^  systemctl enable .*fcvm-fleet-prefetch\.service' ||
   no "host/build.sh prep does not enable fcvm-fleet-prefetch.service"
+# warm-root.sh lists the prefetch from a launch that restores the snapshot (what a woken
+# host's slots run), not from the first launch, which also boots and exports the image.
+wr=fleet/ami/host/warm-root.sh
+first=$(grep -n '^launch ||' "$wr" | head -1 | cut -d: -f1)
+traced=$(grep -n '^launch trace ||' "$wr" | head -1 | cut -d: -f1)
+[ -n "$first" ] && [ -n "$traced" ] && [ "$first" -lt "$traced" ] && grep -q "Pre-start snapshot hit" "$wr" ||
+  no "warm-root.sh must list the prefetch from a second, traced launch that hits the first one's snapshot"
 # prefetch.sh reads every listed file in 1 MiB pieces (a file of 2 MiB and one byte is three
 # pieces) and skips a listed file the image lacks.
 pf=$(mktemp -d)

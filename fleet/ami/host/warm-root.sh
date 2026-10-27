@@ -39,23 +39,36 @@ P=$(curl -fsS -H "X-aws-ec2-metadata-token: $T" "http://169.254.169.254/latest/m
 [ -n "$P" ] || { echo "warm-root: this instance has no IPv6 prefix (build-ami.sh launch host gives it one)"; exit 1; }
 # The agent's slot address: the prefix with the GPU index plus two in its last group.
 A=$(python3 -c 'import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1], strict=False).network_address + 2)' "$P")
-t0=$(date +%s%N)
-setsid strace -f -qq --seccomp-bpf -e trace=openat,execve -o /tmp/warm-root.strace \
-  fcvm podman run --name warm-root --kernel-profile gpu --gpu "$G" --publish 127.0.0.1:20099:8080 \
-  --network routed --ipv6-prefix "$P" --ipv6-address "$A" --publish 127.0.0.1:20098:443 \
-  --map "$TLS_DIR":/run/fleet-tls:ro --env TLS_CERT_FILE=/run/fleet-tls/tls.json --env TLS_PORT=443 "$IMG" \
-  > "$LOG" 2>&1 < /dev/null &
-WP=$!
-ok=0
-for _ in $(seq 1 1800); do
-  if curl -fsS -m 2 http://127.0.0.1:20099/health 2>/dev/null | jq -e '.ready == true and .frame > 0' >/dev/null 2>&1; then ok=1; break; fi
-  kill -0 $WP 2>/dev/null || break
-  sleep 1
-done
-echo "warm-root: ok=$ok first_frame_ms=$(( ($(date +%s%N) - t0) / 1000000 )) gpu=$G"
-pkill -TERM -x fcvm; wait $WP
+# One launch, as the agent launches a slot; with "trace", under strace into /tmp/warm-root.strace.
+launch() {
+  local trace=()
+  [ "${1:-}" = trace ] && trace=(strace -f -qq --seccomp-bpf -e "trace=openat,execve" -o /tmp/warm-root.strace)
+  local t0; t0=$(date +%s%N)
+  setsid "${trace[@]}" \
+    fcvm podman run --name warm-root --kernel-profile gpu --gpu "$G" --publish 127.0.0.1:20099:8080 \
+    --network routed --ipv6-prefix "$P" --ipv6-address "$A" --publish 127.0.0.1:20098:443 \
+    --map "$TLS_DIR":/run/fleet-tls:ro --env TLS_CERT_FILE=/run/fleet-tls/tls.json --env TLS_PORT=443 "$IMG" \
+    >> "$LOG" 2>&1 < /dev/null &
+  local wp=$! ok=0
+  for _ in $(seq 1 1800); do
+    if curl -fsS -m 2 http://127.0.0.1:20099/health 2>/dev/null | jq -e '.ready == true and .frame > 0' >/dev/null 2>&1; then ok=1; break; fi
+    kill -0 $wp 2>/dev/null || break
+    sleep 1
+  done
+  echo "warm-root: ${1:-launch} ok=$ok first_frame_ms=$(( ($(date +%s%N) - t0) / 1000000 )) gpu=$G"
+  pkill -TERM -x fcvm; wait $wp
+  [ $ok = 1 ] || { tail -20 "$LOG"; return 1; }
+}
+# The first launch boots the VM and takes the pre-start snapshot (and exports the image for
+# root's podman store). The list comes from a second launch, which restores that snapshot
+# as a woken host's slots do: listed from the first, it named 6163 files (334 MiB, mostly
+# image layers the export read) that the prefetch then read for 20 s at every boot, beside
+# cloud-init and the store (2026-10-27).
+: > "$LOG"
+launch || { rm -rf "$TLS_DIR"; exit 1; }
+launch trace || { rm -rf "$TLS_DIR"; exit 1; }
 rm -rf "$TLS_DIR"
-[ $ok = 1 ] || { tail -20 "$LOG"; exit 1; }
+grep -q 'Pre-start snapshot hit' "$LOG" || { echo "warm-root: the second launch did not restore the first one's snapshot"; exit 1; }
 grep -oE '(openat\([^"]*|execve\()"[^"]+"' /tmp/warm-root.strace | sed -E 's/.*"([^"]+)"$/\1/' |
   grep '^/' | grep -vE '^/(proc|sys|dev|run|tmp|mnt/fcvm-btrfs)/' | sort -u |
   while read -r f; do [ -f "$f" ] && echo "$f"; done > "$LIST"
