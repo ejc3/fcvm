@@ -102,8 +102,9 @@ pub struct FirecrackerConfig {
     /// it changes how podman sets up user namespaces and storage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
-    /// Published port mappings (host:guest forwarding).
-    /// Part of VM identity — clones inherit these from snapshot metadata.
+    /// Published port mappings (host:guest forwarding). Only their guest side (guest port
+    /// and protocol) is in the snapshot key (`snapshot_key`); a restore publishes the host
+    /// side its own run asks for.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub port_mappings: Vec<crate::network::PortMapping>,
     /// Ports to forward from guest localhost to host localhost.
@@ -415,9 +416,37 @@ impl FirecrackerConfig {
         // schema in the cache key so an old cache directory cannot become a
         // permanent parse miss that also blocks creation at the same tag.
         const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
-        let json = serde_json::to_string(&(SNAPSHOT_SCHEMA_VERSION, self))
+        let json = serde_json::to_string(&(SNAPSHOT_SCHEMA_VERSION, self.keyed()))
             .expect("FirecrackerConfig serialization failed");
         compute_sha256(json.as_bytes())[..12].to_string()
+    }
+
+    /// The config as the snapshot key sees it: each published port's guest side only, once
+    /// and in order. The guest sees nothing of a mapping but its guest port and protocol
+    /// (fc-agent DNATs each published TCP port to its loopback), and a restore publishes
+    /// the host address and port its own run asks for (`clone_port_mappings` in
+    /// `commands/snapshot.rs`). With the host side in the key, VMs that differ only in the
+    /// host port they publish on, as every slot of a fleet host does, each cold-booted and
+    /// kept a snapshot of their own.
+    fn keyed(&self) -> std::borrow::Cow<'_, Self> {
+        if self.port_mappings.is_empty() {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut keyed = self.clone();
+        let mut guest: Vec<crate::network::PortMapping> = self
+            .port_mappings
+            .iter()
+            .map(|m| crate::network::PortMapping {
+                host_ip: None,
+                host_port: 0,
+                guest_port: m.guest_port,
+                proto: m.proto,
+            })
+            .collect();
+        guest.sort_by_key(|m| (m.guest_port, m.proto.to_string()));
+        guest.dedup();
+        keyed.port_mappings = guest;
+        std::borrow::Cow::Owned(keyed)
     }
 
     /// Return a copy of this config with the rootfs path replaced.
@@ -1128,6 +1157,40 @@ mod tests {
             proto: crate::network::types::Protocol::Tcp,
         }];
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+        let mut config3 = config2.clone();
+        config3.port_mappings[0].guest_port = 81;
+        assert_ne!(config2.snapshot_key(), config3.snapshot_key());
+        let mut config4 = config2.clone();
+        config4.port_mappings[0].proto = crate::network::types::Protocol::Udp;
+        assert_ne!(config2.snapshot_key(), config4.snapshot_key());
+    }
+
+    /// The host side of a published port is not in the key: VMs that publish the same
+    /// guest ports on different host addresses and ports, in any order, share a snapshot.
+    /// A fleet host publishes each slot's renderer on its own host ports, and every slot
+    /// cold-booted and kept its own snapshot (2026-10-27: eight snapshot keys for eight
+    /// slots of one image on one host).
+    #[test]
+    fn the_snapshot_key_holds_only_the_guest_side_of_a_published_port() {
+        use crate::network::types::Protocol;
+        let mapping = |host_ip: Option<&str>, host_port, guest_port| crate::network::PortMapping {
+            host_ip: host_ip.map(str::to_string),
+            host_port,
+            guest_port,
+            proto: Protocol::Tcp,
+        };
+        let mut slot1 = test_config();
+        slot1.port_mappings = vec![
+            mapping(Some("0.0.0.0"), 20101, 8080),
+            mapping(Some("0.0.0.0"), 20201, 443),
+        ];
+        let mut slot2 = test_config();
+        slot2.port_mappings = vec![
+            mapping(None, 20202, 443),
+            mapping(Some("127.0.0.1"), 20102, 8080),
+            mapping(None, 20302, 443),
+        ];
+        assert_eq!(slot1.snapshot_key(), slot2.snapshot_key());
     }
 
     #[test]

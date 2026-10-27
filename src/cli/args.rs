@@ -441,7 +441,7 @@ pub struct FleetAgentArgs {
     pub tls_secret: Option<String>,
 
     /// Where the renderers' certificate files are kept on the host
-    #[arg(long, default_value = "/run/fcvm-fleet/tls")]
+    #[arg(long, default_value = crate::fleet::agent::tls::HOST_DIR)]
     pub tls_dir: std::path::PathBuf,
 
     /// Name the host by its EC2 instance id (from the instance metadata service)

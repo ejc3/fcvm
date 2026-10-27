@@ -3727,6 +3727,25 @@ mod tests {
         assert_eq!(key(Some("2001:db8::5")), key(Some("2001:db8::6")));
     }
 
+    /// The restore publishes the run's own host address and port for each published guest
+    /// port, so only the guest side of `--publish` is in the snapshot key: a fleet host's
+    /// slots publish their renderers on different host ports and restore one snapshot.
+    #[test]
+    fn the_host_side_of_publish_is_in_no_snapshot_key() {
+        let key = |publish: &[&str]| {
+            let mut args = test_args();
+            args.network = NetworkMode::Routed;
+            args.publish = publish.iter().map(|p| p.to_string()).collect();
+            key_for(&args, GuestBootInputs::default())
+        };
+        assert_eq!(
+            key(&["0.0.0.0:20101:8080", "0.0.0.0:20201:443"]),
+            key(&["0.0.0.0:20102:8080", "0.0.0.0:20202:443"])
+        );
+        assert_ne!(key(&["0.0.0.0:20101:8080"]), key(&["0.0.0.0:20101:8081"]));
+        assert_ne!(key(&[]), key(&["0.0.0.0:20101:8080"]));
+    }
+
     /// #1079: a restore takes the run's IPv6 prefix, so the prefix is in no snapshot key. A
     /// routed run on a host whose prefix changed keeps the snapshot it has, and exporting
     /// FCVM_IPV6_PREFIX costs no run its snapshot.
