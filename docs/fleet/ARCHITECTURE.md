@@ -311,7 +311,8 @@ suggests one from its measured bandwidth); the choice is per viewer, not shared.
   coordinator places a host's tiles as one contiguous region), and one serves the EC2 half.
 
 Hover outlines and labels, dark tiles, phases and clocks are drawn by the page from the
-shared state in both modes, so they behave identically. Switching never hitches: the page
+shared state in both modes, so they behave identically. A third way, one CDN stream of the whole wall
+for viewers beyond what direct streaming serves, is "Broadcast mode" below. Switching never hitches: the page
 opens the other mode's streams in the background, waits until it has a decoded frame for
 every region at a `t` it is already showing, swaps in one draw, and only then closes the
 old streams.
@@ -350,6 +351,205 @@ same URL once the coordinator reports the slot running again; no state is resync
 
 Staging is `<app>-stage` behind Cloudflare Access. A public URL needs the owner's go-ahead.
 
+## Broadcast mode
+
+Every direct or aggregated viewer opens streams to the fleet's own machines, so the fleet
+serves a bounded number of them: about 500 at once on the wall as deployed (the fcvm half
+fails first, at 750 viewers per tile, its renderer VM's 2 vCPUs binding first;
+fleet/renderer/README.md, "Viewers per renderer"). Beyond that, viewers get the
+**broadcast**: the whole wall composited into one video, encoded once and delivered by
+Amazon IVS. The owner, 2026-10-27: "stream the aggregate video with less controls. Things
+like skywriting can still happen"; on the toggle, "it's forced on / can't change if you are
+a late viewer"; on delivery, "IVS is good".
+
+```
+renderers (every placed tile, at the broadcast's height)
+   |  FCVF frames over wss, the published IPv6 names
+   v
+broadcast aggregator (`fcvm fleet aggregate --push-url-env`), a child of the coordinator
+   |  one 1280x720 H.264 stream at 30 fps, every frame's SEI carrying its scene t
+   |  FLV, copied by an ffmpeg child over RTMPS
+   v
+Amazon IVS low-latency channel, standard type: 720p, 480p, 360p and 160p renditions
+   |  HLS from IVS's CDN; a private channel, so every request carries a playback token
+   v
+browser: IVS web player; the overlay drawn from the state in effect at the shown frame's t
+```
+
+### Who gets the broadcast
+
+- **`--direct-capacity N`** on the coordinator (also `FLEET_DIRECT_CAPACITY`, default 500) is
+  how many viewers hold a seat: direct or aggregated streams. 500 is the measured capacity
+  of the wall as deployed; a fleet whose renderer VMs have 4 vCPUs may raise it toward 750.
+- **A seat** is taken by a `/live` connection admitted while fewer than N are held. The
+  admission message gives it a direct token (below) and a seat ticket. The seat is held while
+  the connection is open and for 60 s after it closes, so a page that reconnects with its
+  ticket (`/live?seat=<ticket>`) keeps it. A hidden tab keeps its seat while its socket is
+  open.
+- **Every viewer has a broadcast toggle.** A seated viewer may switch to the broadcast and
+  back; switching does not give up the seat.
+- **A late viewer**, one that connects while all N seats are held, is admitted to the
+  broadcast only. Its toggle is shown on and disabled, with the reason ("Direct streams are
+  full, so you are watching the broadcast"). It never receives a direct token, and
+  `claim_gpu` (a private GPU, also a direct stream) is refused to it.
+- **No promotion mid-session.** A late viewer stays on the broadcast for as long as its
+  connection lasts. When a seat is free the coordinator says so in the admission message and
+  the page offers a reload; the new connection is admitted afresh. Promoting a viewer in the
+  middle of a session would swap its picture for the direct tiles while it watched, and two
+  late viewers would race for one seat; a reload makes the order the order of connections.
+
+**Enforcement is server side.** A renderer's or aggregator's `GET /frames` needs an `admit`
+token once it holds an admission key: `v1.<expiry, unix s>.<viewer>.<mac>`, the mac an
+HMAC-SHA256 of the first three fields with a 32-byte key the coordinator makes at start. The
+key reaches renderers in the scene the agent posts (the coordinator posts the EC2 tiles'
+scenes) and aggregators in their layout, and never appears in a snapshot. A renderer
+accepts the current key and the one before it, so a new key does not cut off a viewer between
+two token refreshes. Tokens last 10 minutes and each seated connection gets a fresh one every
+5 minutes; a token is checked when a stream opens, not while it runs. A late viewer that
+flips its page into direct mode opens sockets that are refused with 403, because nothing it
+holds is a token. The coordinator mints tokens for the streams it reads itself (the EC2
+aggregator, the broadcast, the poster), and an agent's aggregator mints its own from the
+key. A known limit: `POST /scene` answers anyone who can reach a renderer and forges a JSON
+content type, so a determined client can replace the key. That is the scene's own exposure,
+not the broadcast's, and is tracked separately.
+
+**Past about 5,000 viewers the coordinator needs more.** A broadcast viewer still holds a
+`/live` socket for state, intents and its tokens, and the coordinator holds about 5,000 of
+them, bound by memory at about 160 KB each. Beyond that, either the task gets more memory, or
+the broadcast page gets a lighter state feed: the overlay's data carried in the stream as IVS
+timed metadata (it already carries `t`), with no per-viewer socket, and intents sent over
+short requests.
+
+### The composite
+
+The coordinator runs the broadcast aggregator beside itself (`--broadcast-listen`), as it runs
+the EC2 half's. Its layout (`coord::broadcast::layout`) is the whole image, every placed tile
+read directly at its published IPv6 name and at the broadcast's own height, so each renderer
+encodes one small extra stream for it (`q=std`) and one decoder thread keeps up with each. A
+region aggregator's stream is a near-lossless region a whole image tall, which one decoder
+thread does not keep up with (a 1280x720 renderer stream at `q=hi` fell 3 s behind on a
+g4dn.2xlarge). The aggregator waits for every tile at each slot as a region aggregator does,
+draws a tile with nothing to send black, and encodes the image once: 1280x720, libx264
+`veryfast`, zero-latency, High profile, no B-frames, a keyframe every 2 s, CRF 21 capped at
+4.5 Mbit/s. IVS's standard channel transcodes it into the 720p, 480p, 360p and 160p
+renditions players switch between, so the fleet encodes one stream, not a ladder. 720 lines,
+not 1080: a 1080p rendition costs IVS's Full HD rate per viewer-hour (twice HD), and the
+encode about twice the CPU. The aggregator runs only while a tile is placed: asleep, it is
+stopped and nothing is pushed, and every viewer sees the wake reel.
+
+The aggregator writes FLV itself, so each frame's timestamp is its scene time (a skipped
+slot is a gap, never a drift). It opens the stream with an `onMetaData` tag naming the size,
+so the copy probes nothing (with ffmpeg's default probing a copy held frames back 0.9 s at
+the median), carries a silent AAC track beside the video (without audio IVS served every
+frame about 3.4 s later), and puts an SEI message before each frame's first slice: user data unregistered under a fixed UUID
+(`push::SEI_UUID`), payload `{"t": <scene seconds>, "e": <scene epoch, unix ms>}`. An `ffmpeg`
+child copies it to `rtmps://<ingest>:443/app/<key>`. A child that exits is started again after 1 s, doubling to 30 s, at the next
+keyframe. The ingest URL comes from the broadcast secret through the environment, so the
+only command line holding it is that ffmpeg's, inside the coordinator's task.
+
+The coordinator task grows from 0.5 vCPU and 1 GB to 2 vCPU and 4 GB (ARM64 Fargate). The
+composite above took 1.7 cores on the measurement box's Xeon (encode 0.9, decode of one
+1280x720 source 0.5, composing and the copy the rest); 16 small tile streams decode
+the same pixels.
+
+### The overlay follows the frame shown
+
+IVS keeps the SEI through its transcode: every rendition's segments carry one per frame
+(measured: 60 in each 2 s segment of the 720p and 480p renditions). The IVS web player raises
+`MetadataEventType.SEI` with the message and its presentation timestamp, which is the video
+element's own media time, so the page matches each presented frame
+(`requestVideoFrameCallback`'s `mediaTime`) to its `t` exactly. The page keeps the snapshots
+of the last 30 s with the coordinator time each arrived at (`serverNow`, from the clock it
+already syncs) and in broadcast mode draws the overlay (scoreboard, race clocks, phases, dark
+tiles, labels, nudges, words) from the newest snapshot that arrived at or before the shown
+frame's wall time, `e + 1000 t`. A tile that went dark at a relaunch is drawn dark when the
+video shows it dark, not seconds before. The page's "now" in broadcast mode is that frame
+time plus the time since the frame was presented, so the overlay's clocks tick with the
+picture. The stats line shows the broadcast's latency: the synced now minus the shown frame's
+wall time.
+
+### What a broadcast viewer can do
+
+Scene inputs that go through the coordinator stay: words (the text check is unchanged),
+lights (placed with the camera of the frame shown), camera votes, and "restart now" under its
+global cooldown. Each appears in the video when the composite catches up, about one broadcast
+latency later, and the page marks it pending until the frame shown is past the snapshot that
+holds it. Gone in broadcast mode: clicking a tile to relaunch it, the detail view, "Your own
+GPU", per-tile stats and the stream choice; the broadcast toggle is the only stream control.
+
+### Staging access
+
+The channel is private (authorization required): IVS refuses a playback request without a
+token signed by the channel's playback key pair. The coordinator holds the private key (in the
+broadcast secret) and gives each `/live` connection a playback URL with a token in its
+admission message: an ES384 JWT with `aws:channel-arn`, `aws:access-control-allow-origin` set
+to the page's origin, and a 1-hour expiry, refreshed every 30 minutes. On staging `/live` is
+reached only through Cloudflare Access, so only Access-authenticated viewers ever get a
+token; the playback URL alone returns 403. A public launch keeps the tokens, with `/live`
+open.
+
+### Failure behavior
+
+| failure | what happens |
+|---|---|
+| the broadcast aggregator or its ffmpeg exits | restarted after 1 s, doubling to 30 s; the push resumes at the next keyframe. The player reports buffering, the page says "the broadcast is reconnecting" over the last frame, and the overlay resyncs with the next frame's SEI |
+| a tile stops | drawn black, as an aggregator draws a missing tile; the overlay's phases say why |
+| the fleet sleeps | no tile placed: the aggregator stops, the channel goes offline, every viewer sees the wake reel; waking starts the push again |
+| IVS refuses the stream or is down | the push retries with backoff; broadcast viewers see "the broadcast is unavailable"; late viewers are not moved to direct, which would pass the measured capacity |
+| the broadcast secret cannot be read at start | the coordinator does not start (fail closed), as for the TLS secret |
+| the coordinator restarts | a new admission key: open tile streams continue, new ones need the tokens each reconnected page receives; seats are taken again in the order pages reconnect |
+| a frame arrives without its SEI | the overlay keeps the last matched frame time and advances it with the player's clock, and the stats line says the sync is estimated |
+
+### Delivery: IVS or CloudFront (measured 2026-10-27)
+
+The rig: a g4dn.2xlarge (one T4) from the fleet's tile AMI, its renderer drawing the whole
+image at 1280x720 (one T4 draws 1920x1080 at only 15 fps), the broadcast aggregator from this
+stack reading it, an IVS standard low-latency channel in us-east-1, and headless Chrome 156
+with IVS player 1.57.0 on the same instance, so the renderer, the composite and the player
+read one clock. Five cycles of 60 s, each a fresh player; the page matches each presented
+frame to its SEI by media time (`fleet/tools/ivsmeasure`).
+
+| | IVS low latency, standard channel |
+|---|---|
+| glass to glass: scene time to the frame displayed, every frame (7,514) | 1.79 s median, 1.87 s p95 |
+| of which the composite: scene time to the encoded frame leaving the aggregator | 84 ms median, 88 ms p95 |
+| IVS's own `getLiveLatency()` (its ingest to the player) | 1.62 s median, 1.81 s p95 |
+| startup: `load()` to the first frame presented, on a live channel | 0.21 s median (0.18 to 0.32, 5 loads) |
+| the same stream with no audio track | 5.18 s median glass to glass |
+| SEI through the transcode | one per frame in every segment checked (720p and 480p renditions) |
+| CPU of the composite (decode, compose, 720p encode, copy) | 1.69 cores of the box's Xeon |
+
+Without audio IVS served every frame about 3.4 s later, so the push carries a silent AAC
+track (`push::AAC_SILENCE`). CloudFront in front of a self-packaged LL-HLS origin was not
+built: the owner approved IVS on 2026-10-27 ("IVS is good") and asked for the LL-HLS origin
+only if IVS did not measure as expected; 1.8 s glass to glass does. Its cost and build were
+compared instead:
+
+| per 1000 viewer-hours, North America, list prices 2026-10-27 | IVS low latency | CloudFront + self-packaged LL-HLS |
+|---|---|---|
+| delivery at 720p | $72 (HD output, first 10,000 h a month) | $115 (3 Mbit/s, 1.35 GB at $0.085/GB) plus about $11 of requests (LL-HLS parts and playlists, about 4 a second per viewer) |
+| delivery at 480p | $36 (SD output) | $57 (1.5 Mbit/s) plus requests |
+| ingest and transcode | $2.00 an hour while the channel is live | our own 3-rendition encode (about 3 more vCPU) or MediaLive |
+| player, CDN, timed metadata, tokens | included | to build: packager, origin, signed cookies, player integration |
+
+The channel is live, and billed $2.00 an hour, while the fleet is awake; the fleet sleeps
+after 10 minutes with no viewer. The coordinator's larger task adds about $43 a month (1.5
+vCPU and 3 GB more, us-east-2). **DECIDED (2026-10-27): IVS**, on the measured latency and
+the cost: it is cheaper per viewer-hour at every rendition, it keeps the per-frame SEI
+through its transcode, and it has nothing to run.
+
+### Stack
+
+1. This section and the measurement page (`fleet/tools/ivsmeasure`).
+2. The push (`fcvm fleet aggregate --push-url-env`: FLV with scene-time stamps, SEI and the
+   silent track) and the coordinator's broadcast aggregator (`--broadcast-listen`).
+3. Admission: seats, `--direct-capacity`, direct and playback tokens in an `admission`
+   message, `claim_gpu` refused to late viewers.
+4. Enforcement: renderers and aggregators refuse `GET /frames` without a valid direct token.
+5. The page: the toggle, the IVS player, the overlay synced by `t`, the reduced controls.
+6. ejc3/aws: the IVS channel, its playback key pair, the broadcast secret, the coordinator's
+   larger task and its flags.
+
 ## Invariants (each becomes a test)
 
 1. At most one VM runs per slot, and at most one slot holds a GPU.
@@ -360,6 +560,11 @@ Staging is `<app>-stage` behind Cloudflare Access. A public URL needs the owner'
 6. A browser never sends a scene change to a renderer; only the agent does.
 7. An agent that loses its coordinator, and a coordinator that loses an agent, leave no VM
    running that nothing supervises.
+8. A connection admitted while every seat is held never receives a direct token, and a
+   renderer or aggregator that holds an admission key streams to no request without a valid
+   one.
+9. The broadcast overlay draws the state in effect at the shown frame's `t`, never a later
+   one.
 
 ## Infrastructure
 
