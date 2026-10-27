@@ -20,7 +20,7 @@ set -euo pipefail
 GPU=${1:?usage: run.sh <gpu pci address>}
 F=${FCVM:-./target/release/fcvm}
 SDK=${ANDROID_SDK:-/mnt/fcvm-btrfs/android-sdk}
-WORK=$(dirname "$SDK")/phone-work
+WORK=$SDK/phone-work
 IMAGE=localhost/fcvm-phone
 NAME=phone-test-$$
 SRC=$(cd "$(dirname "$0")/../.." && pwd)

@@ -1,7 +1,8 @@
 #!/bin/bash
 # Fetches the pinned Android SDK pieces the phone VM uses into $ANDROID_SDK (default
 # /mnt/fcvm-btrfs/android-sdk), checking each archive's SHA-256, and builds the probe app
-# (fleet/phone/probe) into $ANDROID_SDK/../phone-work/probe.apk without Gradle.
+# (fleet/phone/probe) into $ANDROID_SDK/phone-work/probe.apk without Gradle; the work
+# directory is inside the SDK directory, so the SDK lock (below) covers it.
 #
 #   ACCEPT_ANDROID_SDK_LICENSE=1 scripts/phone/sdk.sh
 #
@@ -21,7 +22,7 @@ for tool in curl python3 javac keytool sha256sum; do
   command -v "$tool" > /dev/null || { echo "sdk.sh: $tool is missing (javac/keytool: apt-get install openjdk-17-jdk-headless)" >&2; exit 2; }
 done
 SDK=${ANDROID_SDK:-/mnt/fcvm-btrfs/android-sdk}
-WORK=$(dirname "$SDK")/phone-work
+WORK=$SDK/phone-work
 SRC=$(cd "$(dirname "$0")/../.." && pwd)/fleet/phone/probe
 B=https://dl.google.com/android/repository
 # url sha256 directory-in-zip destination-under-sdk
