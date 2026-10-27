@@ -2,7 +2,7 @@
 //! (newline-delimited JSON), and the body the agent posts to each renderer's `/scene`.
 //! `fleet/PROTOCOL.md` documents them.
 
-use crate::scene::{Keyframe, Light, Scene, Word};
+use crate::scene::{Keyframe, Light, Scene, WeatherKey, Word};
 use crate::state::{Gpu, TextCheck};
 use crate::tiling::Rect;
 use serde::{Deserialize, Serialize};
@@ -297,6 +297,8 @@ pub struct SharedScene {
     pub time_of_day: f64,
     pub words: Vec<Word>,
     pub lights: Vec<Light>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weather: Vec<WeatherKey>,
 }
 
 impl SharedScene {
@@ -308,6 +310,7 @@ impl SharedScene {
             time_of_day: scene.time_of_day,
             words: scene.words.clone(),
             lights: scene.lights.clone(),
+            weather: scene.weather.clone(),
         }
     }
 
@@ -323,6 +326,7 @@ impl SharedScene {
             time_of_day: self.time_of_day,
             words: self.words.clone(),
             lights: self.lights.clone(),
+            weather: self.weather.clone(),
         }
     }
 }
@@ -377,6 +381,8 @@ pub struct RendererScene {
     pub time_of_day: f64,
     pub words: Vec<Word>,
     pub lights: Vec<Light>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weather: Vec<WeatherKey>,
 }
 
 #[cfg(test)]

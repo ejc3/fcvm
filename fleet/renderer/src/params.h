@@ -94,6 +94,10 @@ struct FrameParams {
   V3 sun_e;            // solar irradiance above the atmosphere
   float exposure;
   V2 wind;             // cloud offset in km, already reduced modulo the noise period
+  float cloud_cover;   // weather (WeatherKey, at layer_t): 0 clear .. 1 nearly overcast
+  float cloud_top;     // top of the cloud layer, km (5.6 fair-weather cumulus .. 9.6 towering)
+  float rays;          // crepuscular rays: shadowed haze, 0 off
+  float snow_line;     // km
   float wave_t;        // water animation phase, reduced modulo its period
   int n_text;
   GText text[MAX_TEXTS];

@@ -61,6 +61,48 @@ pub struct Light {
     pub t: f64,
 }
 
+/// The weather from scene time `t` (PROTOCOL.md, "Weather"). The renderer eases each field
+/// from one key to the next and holds it before the first key and after the last; a held
+/// camera keeps the weather of its hold's start.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WeatherKey {
+    pub t: f64,
+    /// Cloud cover in [0, 1]: 0 clear, 0.5 the default sky, 1 nearly overcast.
+    #[serde(default = "WeatherKey::default_cover")]
+    pub cover: f64,
+    /// In [0, 1]: 0 fair-weather cumulus with tops at 5.6 km, 1 towering cumulus to 9.6 km.
+    #[serde(default)]
+    pub towers: f64,
+    /// Crepuscular rays in [0, 1]: haze lit by the sun through the gaps between clouds.
+    #[serde(default)]
+    pub rays: f64,
+    /// Altitude in km where snow starts on flatter ground, in [0, 4].
+    #[serde(default = "WeatherKey::default_snow_line_km")]
+    pub snow_line_km: f64,
+}
+
+impl WeatherKey {
+    pub const DEFAULT_COVER: f64 = 0.5;
+    pub const DEFAULT_SNOW_LINE_KM: f64 = 1.6;
+    fn default_cover() -> f64 {
+        Self::DEFAULT_COVER
+    }
+    fn default_snow_line_km() -> f64 {
+        Self::DEFAULT_SNOW_LINE_KM
+    }
+
+    /// The renderer's defaults (today's sky) at scene time `t`.
+    pub fn new(t: f64) -> Self {
+        WeatherKey {
+            t,
+            cover: Self::DEFAULT_COVER,
+            towers: 0.0,
+            rays: 0.0,
+            snow_line_km: Self::DEFAULT_SNOW_LINE_KM,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scene {
     pub epoch_unix_ms: u64,
@@ -69,6 +111,10 @@ pub struct Scene {
     pub time_of_day: f64,
     pub words: Vec<Word>,
     pub lights: Vec<Light>,
+    /// Weather keys, sorted by `t` (the renderer takes at most 64); empty means the renderer's
+    /// defaults throughout.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weather: Vec<WeatherKey>,
 }
 
 /// Bounds on what viewers can put into the scene.
@@ -97,6 +143,7 @@ impl Scene {
             time_of_day: 0.30,
             words: Vec::new(),
             lights: Vec::new(),
+            weather: Vec::new(),
         }
     }
 
@@ -252,6 +299,14 @@ mod tests {
         assert!((m.pos[2] + 5.0).abs() < 1e-9 && m.pos[0].abs() < 1e-9);
         let turned = drag(&k, 90.0, 0.0, 0.0);
         assert!((turned.look[0] - 10.0).abs() < 1e-9, "{turned:?}");
+    }
+
+    #[test]
+    fn weather_keys_default_and_stay_off_the_wire_when_absent() {
+        let v = serde_json::to_value(Scene::new(0)).unwrap();
+        assert!(v.get("weather").is_none(), "no keys, no field: {v}");
+        let k: WeatherKey = serde_json::from_value(serde_json::json!({"t": 3.0})).unwrap();
+        assert_eq!(k, WeatherKey::new(3.0));
     }
 
     #[test]
