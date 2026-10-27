@@ -13,6 +13,26 @@ use std::time::Duration;
 /// How long a word may wait for its check.
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// What a viewer reads when no checker is configured (`--text-check none`).
+pub const WORDS_OFF: &str = "words are turned off right now";
+
+/// What a viewer reads when the check could not answer (an error or a timeout). The
+/// reason itself goes to the coordinator log only: it can name the model, the region or
+/// an AWS error, and the receipt and the actions list are public.
+pub const CHECK_FAILED: &str = "couldn't check that word, try again";
+
+/// The error `NoCheck` answers with, so the verdict can tell "turned off" from "failed".
+#[derive(Debug)]
+pub struct Disabled;
+
+impl std::fmt::Display for Disabled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no text check is configured")
+    }
+}
+
+impl std::error::Error for Disabled {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Allow,
@@ -46,19 +66,30 @@ async fn check_inner(checker: &dyn TextChecker, sky: &[String], text: &str) -> T
             reason,
             sky: vec![],
         },
+        Ok(Err(e)) if e.downcast_ref::<Disabled>().is_some() => TextCheck {
+            verdict: "error".into(),
+            reason: WORDS_OFF.into(),
+            sky: vec![],
+        },
         Ok(Err(e)) => {
             tracing::warn!(error = %format!("{e:#}"), "text check failed");
             TextCheck {
                 verdict: "error".into(),
-                reason: format!("{e:#}"),
+                reason: CHECK_FAILED.into(),
                 sky: vec![],
             }
         }
-        Err(_) => TextCheck {
-            verdict: "error".into(),
-            reason: format!("no answer within {} s", CHECK_TIMEOUT.as_secs()),
-            sky: vec![],
-        },
+        Err(_) => {
+            tracing::warn!(
+                timeout_s = CHECK_TIMEOUT.as_secs(),
+                "text check failed: no answer in time"
+            );
+            TextCheck {
+                verdict: "error".into(),
+                reason: CHECK_FAILED.into(),
+                sky: vec![],
+            }
+        }
     }
 }
 
@@ -68,7 +99,7 @@ pub struct NoCheck;
 #[async_trait]
 impl TextChecker for NoCheck {
     async fn check(&self, _sky: &[String], _text: &str) -> Result<Verdict> {
-        bail!("no text check is configured")
+        Err(Disabled.into())
     }
 }
 
@@ -289,6 +320,27 @@ mod tests {
         };
         let v = check_text(&slow, &[], "hi").await;
         assert_eq!(v.verdict, "error");
-        assert!(v.reason.contains("no answer"), "{v:?}");
+        assert_eq!(v.reason, CHECK_FAILED, "{v:?}");
+    }
+
+    /// The reason travels to the viewer (receipt, actions list, coordinator status), so it
+    /// is one of two fixed sentences and never the checker's own error.
+    #[tokio::test]
+    async fn viewers_read_a_fixed_reason_not_the_checker_error() {
+        let off = check_text(&NoCheck, &[], "Hi!").await;
+        assert_eq!(
+            (off.verdict.as_str(), off.reason.as_str()),
+            ("error", WORDS_OFF)
+        );
+        let down = FakeCheck {
+            refuse: vec![],
+            fail: true,
+            delay: Duration::ZERO,
+        };
+        let failed = check_text(&down, &[], "Hi!").await;
+        assert_eq!(
+            (failed.verdict.as_str(), failed.reason.as_str()),
+            ("error", CHECK_FAILED)
+        );
     }
 }

@@ -179,7 +179,10 @@ Amazon Bedrock whether the text may be shown publicly, read together with every 
 in the sky (so words cannot combine into something unacceptable). The model id and region
 come from the coordinator's configuration (`--text-check-model`, `--text-check-region`).
 Only an explicit allow commits the word; a refusal, an error, a timeout (5 s) or a
-coordinator started without a text check (`--text-check none`) refuses it. A word checked
+coordinator started without a text check (`--text-check none`) refuses it. An error's
+reason, in the receipt, its `check` and `actions`, is one of two fixed sentences, "words are
+turned off right now" (`--text-check none`) or "couldn't check that word, try again"
+(anything else); what went wrong is in the coordinator's log. A word checked
 against a sky that changed meanwhile is refused (send it again). A check that cannot run
 marks the coordinator degraded (`failures`) until one runs again. The scene keeps the
 latest 16 words. A refused word's text appears nowhere: not in the scene, not in

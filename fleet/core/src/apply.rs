@@ -680,9 +680,9 @@ fn intent_effect(
             word_rate(state, c.client, at)?;
             match check {
                 None => return Err("the text check did not run".into()),
-                Some(k) if k.verdict == "error" => {
-                    return Err(format!("the text check failed: {}", k.reason))
-                }
+                // The coordinator words an error's reason for the viewer ("words are
+                // turned off right now"); the detail is in its log.
+                Some(k) if k.verdict == "error" => return Err(k.reason.clone()),
                 Some(k) if !k.allowed() => {
                     return Err(format!("the text check refused it: {}", k.reason))
                 }

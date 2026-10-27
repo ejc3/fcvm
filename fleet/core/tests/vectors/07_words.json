@@ -71,7 +71,7 @@
       },
       "at": 9000,
       "check": {
-        "reason": "text check unavailable",
+        "reason": "couldn't check that word, try again",
         "sky": [
           "hello"
         ],
@@ -185,7 +185,7 @@
     {
       "after": 5,
       "checks": {
-        "/receipts/w4/reason": "the text check failed: text check unavailable"
+        "/receipts/w4/reason": "couldn't check that word, try again"
       }
     },
     {
@@ -255,7 +255,7 @@
         "id": "w4",
         "name": "word",
         "outcome": "refused",
-        "summary": "the text check failed: text check unavailable",
+        "summary": "couldn't check that word, try again",
         "viewer": "v2"
       },
       {
