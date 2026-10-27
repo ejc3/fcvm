@@ -6,6 +6,7 @@
 //
 //   viewerload --epoch-ms E --conns N [--h 270] [--q std] [--warmup 5] [--secs 20]
 //              [--threads 16] [--connect-threads 64] [--out FILE] URL...
+//   viewerload --self-test     the delay statistics on fixed samples (make test-host runs it)
 //
 // URL is ws://HOST:PORT/frames or wss://HOST:PORT/frames (HOST may be [v6]); each
 // gets N connections. The certificate is not verified. Prints one JSON object per
@@ -77,16 +78,19 @@ bool parse_url(const std::string& s, Url* u) {
   return true;
 }
 
-// delay histogram: 0.25 ms buckets up to 30 s, the last bucket holds the rest
+// delay histogram: 0.25 ms buckets from -10 s to +20 s, the end buckets hold the rest.
+// A delay is negative when the renderer's clock is ahead of this one; the offset
+// keeps those samples apart, so a percentile minus the minimum still cancels it.
 constexpr int kBuckets = 120000;
 constexpr double kBucketMs = 0.25;
+constexpr double kOffsetMs = 10000;
 
 struct Stats {
   uint64_t frames = 0, bytes = 0, keyframes = 0, gap_events = 0, gap_frames = 0, headers = 0, extra_headers = 0;
   std::vector<uint32_t> hist = std::vector<uint32_t>(kBuckets, 0);
   double delay_max = 0, delay_min = 1e18;
   void add_delay(double d) {
-    int b = d < 0 ? 0 : (int)std::min<double>(kBuckets - 1, d / kBucketMs);
+    int b = (int)std::clamp((d + kOffsetMs) / kBucketMs, 0.0, (double)(kBuckets - 1));
     hist[b]++;
     delay_max = std::max(delay_max, d);
     delay_min = std::min(delay_min, d);
@@ -101,14 +105,14 @@ struct Stats {
   double pct(double q) const {
     uint64_t n = 0;
     for (auto v : hist) n += v;
-    if (!n) return -1;
+    if (!n) return NAN;
     uint64_t want = (uint64_t)std::ceil(q * n), acc = 0;
     if (want == 0) want = 1;
     for (int i = 0; i < kBuckets; i++) {
       acc += hist[i];
-      if (acc >= want) return (i + 0.5) * kBucketMs;
+      if (acc >= want) return (i + 0.5) * kBucketMs - kOffsetMs;
     }
-    return kBuckets * kBucketMs;
+    return kBuckets * kBucketMs - kOffsetMs;
   }
 };
 
@@ -358,16 +362,40 @@ void work(Worker* w, Shared* sh) {
   }
 }
 
-std::string jnum(double v) {
+std::string jnum(double v) {  // NaN (no value) is null
   char b[64];
-  if (v < 0 || std::isnan(v)) return "null";
+  if (std::isnan(v) || std::isinf(v)) return "null";
   snprintf(b, sizeof b, "%.2f", v);
   return b;
+}
+
+// The delay statistics on fixed samples; returns the number of failed checks.
+int self_test() {
+  int failed = 0;
+  auto check = [&](bool ok, const char* what, double got) {
+    if (!ok) {
+      fprintf(stderr, "viewerload self-test FAIL: %s (got %.3f)\n", what, got);
+      failed++;
+    }
+  };
+  Stats ahead;  // a renderer clock 100 ms ahead of this one: every delay is -100 ms
+  for (int i = 0; i < 100; i++) ahead.add_delay(-100.0);
+  check(std::fabs(ahead.pct(0.95) - ahead.delay_min) < 1.0, "equal negative delays have p95 over min near 0",
+        ahead.pct(0.95) - ahead.delay_min);
+  check(std::fabs(ahead.pct(0.5) + 100.0) < 1.0, "their p50 is -100 ms", ahead.pct(0.5));
+  Stats spread;  // -50..49 ms
+  for (int i = 0; i < 100; i++) spread.add_delay(i - 50.0);
+  check(std::fabs(spread.pct(0.95) - spread.delay_min - 94.0) < 1.0, "-50..49 ms has p95 over min near 94 ms",
+        spread.pct(0.95) - spread.delay_min);
+  check(jnum(-3.5) == "-3.50" && jnum(NAN) == "null", "a negative number prints, a missing one is null", 0);
+  if (!failed) fprintf(stderr, "viewerload self-test: ok\n");
+  return failed;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::string(argv[1]) == "--self-test") return self_test() ? 1 : 0;
   int conns = 1, threads = 16, cthreads = 64, h = 270;
   double warmup = 5, secs = 20, epoch = -1;
   std::string q, out;
@@ -480,15 +508,15 @@ int main(int argc, char** argv) {
   for (auto& t : wt) t.join();
 
   std::sort(connect_ms.begin(), connect_ms.end());
-  auto cpct = [&](double p) { return connect_ms.empty() ? -1.0 : connect_ms[std::min(connect_ms.size() - 1, (size_t)(p * connect_ms.size()))]; };
+  auto cpct = [&](double p) { return connect_ms.empty() ? NAN : connect_ms[std::min(connect_ms.size() - 1, (size_t)(p * connect_ms.size()))]; };
   std::string res = "{\"conns_per_url\":" + std::to_string(conns) + ",\"h\":" + std::to_string(h) + ",\"q\":\"" +
                     (q.empty() ? "std" : q) + "\",\"secs\":" + jnum(secs) + ",\"connect_ms_p50\":" + jnum(cpct(0.5)) +
-                    ",\"connect_ms_p95\":" + jnum(cpct(0.95)) + ",\"connect_ms_max\":" + jnum(connect_ms.empty() ? -1 : connect_ms.back()) +
+                    ",\"connect_ms_p95\":" + jnum(cpct(0.95)) + ",\"connect_ms_max\":" + jnum(connect_ms.empty() ? NAN : connect_ms.back()) +
                     ",\"connect_wall_ms\":" + jnum(c1 - c0) + ",\"win0_ms\":" + jnum(sh.win0.load()) + ",\"win1_ms\":" + jnum(sh.win1.load()) + ",\"urls\":[";
   Stats all;
   uint64_t all_closed = 0;
   int all_ok = 0, all_failed = 0;
-  double all_fps_min = 1e18, worst_p50 = -1, worst_p95 = -1;
+  double all_fps_min = 1e18, worst_p50 = NAN, worst_p95 = NAN;
   for (size_t u = 0; u < sh.urls.size(); u++) {
     Stats st;
     uint64_t closed = 0;
@@ -507,29 +535,29 @@ int main(int argc, char** argv) {
     all_failed += failed[u];
     all_fps_min = std::min(all_fps_min, fps_min);
     if (st.frames) {
-      worst_p50 = std::max(worst_p50, st.pct(0.5) - st.delay_min);
-      worst_p95 = std::max(worst_p95, st.pct(0.95) - st.delay_min);
+      worst_p50 = std::isnan(worst_p50) ? st.pct(0.5) - st.delay_min : std::max(worst_p50, st.pct(0.5) - st.delay_min);
+      worst_p95 = std::isnan(worst_p95) ? st.pct(0.95) - st.delay_min : std::max(worst_p95, st.pct(0.95) - st.delay_min);
     }
     double nc = std::max(1, ok[u].load());
     res += std::string(u ? "," : "") + "{\"url\":\"" + sh.urls[u].text + "\",\"ok\":" + std::to_string(ok[u]) +
            ",\"failed\":" + std::to_string(failed[u]) + ",\"first_error\":\"" + first_err[u] + "\",\"closed_in_window\":" +
            std::to_string(closed) + ",\"fps_per_conn\":" + jnum(st.frames / nc / secs) + ",\"fps_min_conn\":" +
-           jnum(fps_min > 1e17 ? -1 : fps_min) + ",\"mbit_per_conn\":" + jnum(st.bytes * 8.0 / nc / secs / 1e6) +
+           jnum(fps_min > 1e17 ? NAN : fps_min) + ",\"mbit_per_conn\":" + jnum(st.bytes * 8.0 / nc / secs / 1e6) +
            ",\"delay_p50_ms\":" + jnum(st.pct(0.5)) + ",\"delay_p95_ms\":" + jnum(st.pct(0.95)) +
-           ",\"delay_p99_ms\":" + jnum(st.pct(0.99)) + ",\"delay_max_ms\":" + jnum(st.delay_max) +
-           ",\"delay_min_ms\":" + jnum(st.frames ? st.delay_min : -1) +
-           ",\"p50_over_min_ms\":" + jnum(st.frames ? st.pct(0.5) - st.delay_min : -1) +
-           ",\"p95_over_min_ms\":" + jnum(st.frames ? st.pct(0.95) - st.delay_min : -1) +
+           ",\"delay_p99_ms\":" + jnum(st.pct(0.99)) + ",\"delay_max_ms\":" + jnum(st.frames ? st.delay_max : NAN) +
+           ",\"delay_min_ms\":" + jnum(st.frames ? st.delay_min : NAN) +
+           ",\"p50_over_min_ms\":" + jnum(st.frames ? st.pct(0.5) - st.delay_min : NAN) +
+           ",\"p95_over_min_ms\":" + jnum(st.frames ? st.pct(0.95) - st.delay_min : NAN) +
            ",\"gap_events\":" + std::to_string(st.gap_events) + ",\"gap_frames\":" + std::to_string(st.gap_frames) +
            ",\"extra_headers\":" + std::to_string(st.extra_headers) + ",\"keyframes_per_conn\":" + jnum(st.keyframes / nc) + "}";
   }
   double nc = std::max(1, all_ok);
   res += "],\"all\":{\"ok\":" + std::to_string(all_ok) + ",\"failed\":" + std::to_string(all_failed) +
          ",\"closed_in_window\":" + std::to_string(all_closed) + ",\"fps_per_conn\":" + jnum(all.frames / nc / secs) +
-         ",\"fps_min_conn\":" + jnum(all_fps_min > 1e17 ? -1 : all_fps_min) + ",\"mbit_per_conn\":" +
+         ",\"fps_min_conn\":" + jnum(all_fps_min > 1e17 ? NAN : all_fps_min) + ",\"mbit_per_conn\":" +
          jnum(all.bytes * 8.0 / nc / secs / 1e6) + ",\"gbit_total\":" + jnum(all.bytes * 8.0 / secs / 1e9) +
          ",\"delay_p50_ms\":" + jnum(all.pct(0.5)) + ",\"delay_p95_ms\":" + jnum(all.pct(0.95)) +
-         ",\"delay_p99_ms\":" + jnum(all.pct(0.99)) + ",\"delay_max_ms\":" + jnum(all.delay_max) +
+         ",\"delay_p99_ms\":" + jnum(all.pct(0.99)) + ",\"delay_max_ms\":" + jnum(all.frames ? all.delay_max : NAN) +
          ",\"worst_url_p50_over_min_ms\":" + jnum(worst_p50) + ",\"worst_url_p95_over_min_ms\":" + jnum(worst_p95) +
          ",\"gap_events\":" + std::to_string(all.gap_events) + ",\"gap_frames\":" + std::to_string(all.gap_frames) +
          ",\"extra_headers\":" + std::to_string(all.extra_headers) + ",\"keyframes_per_conn\":" + jnum(all.keyframes / nc) + "}}";

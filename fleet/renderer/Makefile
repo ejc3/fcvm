@@ -40,8 +40,14 @@ $(OUT)/test-host: tests/test_host.cpp tests/check.h src/*.cpp src/*.h
 	@mkdir -p $(OUT)
 	$(CXX) -O1 -std=c++17 -Wall -I$(NVCH) -o $@ tests/test_host.cpp src/json.cpp src/scene.cpp src/proto.cpp src/subscriber.cpp src/nvenc.cpp src/jpeg.cpp src/tls.cpp -lssl -lcrypto -ldl -lpthread
 
-test-host: $(OUT)/test-host
+# The synthetic viewer (tools/viewerload.cpp); test-host runs its self-test.
+$(OUT)/viewerload: tools/viewerload.cpp
+	@mkdir -p $(OUT)
+	$(CXX) -O2 -std=c++17 -Wall -pthread -o $@ $< -lssl -lcrypto
+
+test-host: $(OUT)/test-host $(OUT)/viewerload
 	$(OUT)/test-host
+	$(OUT)/viewerload --self-test
 
 image:
 	podman build --squash-all -t $(IMAGE) -f Containerfile .
