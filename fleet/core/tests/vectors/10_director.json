@@ -1,5 +1,5 @@
 {
-  "description": "The directed camera holds at the seed's first viewpoint, closes the vote 2 s before the hold ends, flies to the default next hold when nobody voted, and arrives on whole seconds; once the next hold is decided the vote for the hold after it opens; free camera and time-of-day intents are gone.",
+  "description": "The directed camera starts at the seed's first stop and keeps moving through it; the vote closes 2 s before the stay ends and commits the flight and the next stop (keyframes a second apart through the next stop's launch); the time of day moves on only while the camera flies; arriving trims the path to 4 s of history; once the next stop is decided the vote for the stop after it opens; free camera and time-of-day intents are gone.",
   "events": [
     {
       "at": 1000,
@@ -7,23 +7,27 @@
       "viewer": "v1"
     },
     {
-      "at": 4999,
+      "at": 7999,
       "type": "tick"
     },
     {
-      "at": 5000,
+      "at": 8000,
       "type": "tick"
     },
     {
-      "at": 7000,
+      "at": 10000,
       "type": "tick"
     },
     {
-      "at": 29999,
+      "at": 13000,
       "type": "tick"
     },
     {
-      "at": 30000,
+      "at": 33999,
+      "type": "tick"
+    },
+    {
+      "at": 34000,
       "type": "tick"
     },
     {
@@ -33,7 +37,7 @@
           "yaw_deg": 5
         }
       },
-      "at": 30010,
+      "at": 34010,
       "id": "c1",
       "name": "camera",
       "type": "intent",
@@ -43,7 +47,7 @@
       "args": {
         "v": 0.5
       },
-      "at": 30020,
+      "at": 34020,
       "id": "t1",
       "name": "time_of_day",
       "type": "intent",
@@ -55,82 +59,100 @@
       "after": 0,
       "checks": {
         "/view/nudges/arrive_next_at": null,
-        "/view/nudges/holding": "coast",
+        "/view/nudges/holding": "plains",
         "/view/nudges/next": null,
-        "/view/nudges/next_hold_at": 7000,
+        "/view/nudges/next_hold_at": 10000,
         "/view/nudges/targets": [
           {
-            "arrive_at": 30000,
-            "id": "horizon",
-            "label": "High above: the curve of the horizon",
+            "arrive_at": 34000,
+            "id": "ridges",
+            "label": "Across the ridges",
             "votes": 0
           },
           {
-            "arrive_at": 25000,
-            "id": "dawn-valley",
-            "label": "Dawn in the valley",
+            "arrive_at": 34000,
+            "id": "western-sea",
+            "label": "Over the western sea",
             "votes": 0
           },
           {
-            "arrive_at": 21000,
-            "id": "peak-seam-low-sun",
-            "label": "The peak at a low sun",
+            "arrive_at": 34000,
+            "id": "peak-close",
+            "label": "Circling the peak",
             "votes": 0
           }
         ],
         "/view/scene/camera/0/t": 0.0,
-        "/view/scene/camera/1/t": 7.0,
-        "/view/scene/camera/2": null
-      }
+        "/view/scene/camera/1/t": 1.0,
+        "/view/scene/camera/11/t": 11.0,
+        "/view/scene/camera/12": null,
+        "/view/scene/time_of_day": 0.71
+      },
+      "note": "a keyframe a second through the 10 s stay, then the launch at 11 s"
     },
     {
       "after": 1,
       "checks": {
-        "/view/nudges/next": null
+        "/view/nudges/next": null,
+        "/view/scene/camera/12": null
       }
     },
     {
       "after": 2,
       "checks": {
-        "/view/nudges/arrive_next_at": 30000,
-        "/view/nudges/closes_at": 35000,
-        "/view/nudges/next": "horizon",
-        "/view/nudges/targets/0/id": "dawn-valley",
-        "/view/scene/camera/1/t": 7.0,
-        "/view/scene/camera/2/t": 18.5
-      }
+        "/view/nudges/arrive_next_at": 34000,
+        "/view/nudges/closes_at": 42000,
+        "/view/nudges/next": "ridges",
+        "/view/nudges/targets/0/id": "peak-close",
+        "/view/scene/camera/11/t": 11.0,
+        "/view/scene/camera/34/t": 34.0,
+        "/view/scene/camera/45/t": 45.0,
+        "/view/scene/camera/46": null
+      },
+      "note": "the flight and the next stop are committed when the vote closes; the default is the first offered"
     },
     {
       "after": 3,
       "checks": {
         "/view/nudges/holding": null,
-        "/view/nudges/next_hold_at": null
+        "/view/nudges/next_hold_at": null,
+        "/view/scene/time_of_day": 0.71
       },
-      "note": "flying: no hold"
+      "note": "flying"
     },
     {
       "after": 4,
+      "checks": {
+        "/view/scene/time_of_day": 0.7131
+      },
+      "note": "the time of day moves on during the flight"
+    },
+    {
+      "after": 5,
       "checks": {
         "/view/nudges/holding": null
       }
     },
     {
-      "after": 5,
+      "after": 6,
       "checks": {
-        "/view/nudges/holding": "horizon",
+        "/view/nudges/holding": "ridges",
         "/view/nudges/next": null,
-        "/view/nudges/next_hold_at": 37000,
-        "/view/nudges/targets/0/id": "dawn-valley"
-      }
+        "/view/nudges/next_hold_at": 44000,
+        "/view/nudges/targets/0/id": "peak-close",
+        "/view/scene/camera/0/t": 30.0,
+        "/view/scene/time_of_day": 0.735
+      },
+      "note": "arrived: 4 s of history kept"
     },
     {
-      "after": 6,
+      "after": 7,
       "checks": {
         "/receipts/c1/reason": "unknown intent \"camera\""
       }
     },
     {
-      "after": 7,
+      "after": 8,
       "checks": {
         "/receipts/t1/reason": "unknown intent \"time_of_day\""
       }
@@ -145,7 +167,7 @@
             "yaw_deg": 5
           }
         },
-        "at": 30010,
+        "at": 34010,
         "id": "c1",
         "name": "camera",
         "outcome": "refused",
@@ -156,7 +178,7 @@
         "args": {
           "v": 0.5
         },
-        "at": 30020,
+        "at": 34020,
         "id": "t1",
         "name": "time_of_day",
         "outcome": "refused",
@@ -214,31 +236,31 @@
     "next_race_at": null,
     "nudges": {
       "arrive_next_at": null,
-      "closes_at": 35000,
-      "holding": "horizon",
-      "holding_label": "High above: the curve of the horizon",
-      "leading": "dawn-valley",
+      "closes_at": 42000,
+      "holding": "ridges",
+      "holding_label": "Across the ridges",
+      "leading": "peak-close",
       "next": null,
-      "next_hold_at": 37000,
+      "next_hold_at": 44000,
       "next_label": null,
-      "opened_at": 5000,
+      "opened_at": 8000,
       "targets": [
         {
-          "arrive_at": 55000,
-          "id": "dawn-valley",
-          "label": "Dawn in the valley",
-          "votes": 0
-        },
-        {
-          "arrive_at": 55000,
-          "id": "peak-seam-low-sun",
-          "label": "The peak at a low sun",
-          "votes": 0
-        },
-        {
-          "arrive_at": 55000,
+          "arrive_at": 61000,
           "id": "peak-close",
-          "label": "Close to the peak",
+          "label": "Circling the peak",
+          "votes": 0
+        },
+        {
+          "arrive_at": 68000,
+          "id": "peak-west",
+          "label": "The peak from the west",
+          "votes": 0
+        },
+        {
+          "arrive_at": 68000,
+          "id": "lake-skim",
+          "label": "Low over the western lakes",
           "votes": 0
         }
       ]
@@ -248,37 +270,233 @@
     "scene": {
       "camera": [
         {
-          "fov_deg": 70.0,
+          "fov_deg": 62.641957,
           "look": [
-            -75.0,
-            28.0,
-            -170.0
+            -85.416255,
+            0.959022,
+            -97.319808
           ],
           "pos": [
-            -30.0,
-            38.0,
-            -60.0
+            -30.821399,
+            2.183617,
+            -71.591669
           ],
           "t": 30.0
         },
         {
-          "fov_deg": 70.0,
+          "fov_deg": 61.646649,
           "look": [
-            -75.0,
-            28.0,
-            -170.0
+            -82.854021,
+            2.196468,
+            -107.041988
           ],
           "pos": [
-            -30.0,
-            38.0,
-            -60.0
+            -32.312498,
+            2.237366,
+            -71.390428
+          ],
+          "t": 31.0
+        },
+        {
+          "fov_deg": 60.806858,
+          "look": [
+            -78.550373,
+            2.464257,
+            -115.214027
+          ],
+          "pos": [
+            -33.503134,
+            2.327439,
+            -71.221981
+          ],
+          "t": 32.0
+        },
+        {
+          "fov_deg": 60.221383,
+          "look": [
+            -74.295133,
+            2.380238,
+            -120.639428
+          ],
+          "pos": [
+            -34.347855,
+            2.381619,
+            -71.066239
+          ],
+          "t": 33.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -72.3,
+            2.4,
+            -122.65
+          ],
+          "pos": [
+            -34.8,
+            2.4,
+            -70.9
+          ],
+          "t": 34.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -72.54,
+            2.4,
+            -122.47
+          ],
+          "pos": [
+            -35.04,
+            2.4,
+            -70.72
+          ],
+          "t": 35.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -72.78,
+            2.4,
+            -122.29
+          ],
+          "pos": [
+            -35.28,
+            2.4,
+            -70.54
+          ],
+          "t": 36.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.02,
+            2.4,
+            -122.11
+          ],
+          "pos": [
+            -35.52,
+            2.4,
+            -70.36
           ],
           "t": 37.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.26,
+            2.4,
+            -121.93
+          ],
+          "pos": [
+            -35.76,
+            2.4,
+            -70.18
+          ],
+          "t": 38.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.5,
+            2.4,
+            -121.75
+          ],
+          "pos": [
+            -36.0,
+            2.4,
+            -70.0
+          ],
+          "t": 39.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.74,
+            2.4,
+            -121.57
+          ],
+          "pos": [
+            -36.24,
+            2.4,
+            -69.82
+          ],
+          "t": 40.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.98,
+            2.4,
+            -121.39
+          ],
+          "pos": [
+            -36.48,
+            2.4,
+            -69.64
+          ],
+          "t": 41.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.22,
+            2.4,
+            -121.21
+          ],
+          "pos": [
+            -36.72,
+            2.4,
+            -69.46
+          ],
+          "t": 42.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.46,
+            2.4,
+            -121.03
+          ],
+          "pos": [
+            -36.96,
+            2.4,
+            -69.28
+          ],
+          "t": 43.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.7,
+            2.4,
+            -120.85
+          ],
+          "pos": [
+            -37.2,
+            2.4,
+            -69.1
+          ],
+          "t": 44.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.94,
+            2.4,
+            -120.67
+          ],
+          "pos": [
+            -37.44,
+            2.4,
+            -68.92
+          ],
+          "t": 45.0
         }
       ],
       "epoch_unix_ms": 0,
       "lights": [],
-      "time_of_day": 0.45,
+      "time_of_day": 0.735,
       "words": []
     },
     "scoreboard": {

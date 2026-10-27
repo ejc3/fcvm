@@ -239,31 +239,31 @@
     "next_race_at": null,
     "nudges": {
       "arrive_next_at": null,
-      "closes_at": 5000,
-      "holding": "coast",
-      "holding_label": "From the coast",
-      "leading": "horizon",
+      "closes_at": 8000,
+      "holding": "plains",
+      "holding_label": "Across the plains to the mountains",
+      "leading": "ridges",
       "next": null,
-      "next_hold_at": 7000,
+      "next_hold_at": 10000,
       "next_label": null,
       "opened_at": 0,
       "targets": [
         {
-          "arrive_at": 30000,
-          "id": "horizon",
-          "label": "High above: the curve of the horizon",
+          "arrive_at": 34000,
+          "id": "ridges",
+          "label": "Across the ridges",
           "votes": 0
         },
         {
-          "arrive_at": 25000,
-          "id": "dawn-valley",
-          "label": "Dawn in the valley",
+          "arrive_at": 34000,
+          "id": "western-sea",
+          "label": "Over the western sea",
           "votes": 0
         },
         {
-          "arrive_at": 21000,
-          "id": "peak-seam-low-sun",
-          "label": "The peak at a low sun",
+          "arrive_at": 34000,
+          "id": "peak-close",
+          "label": "Circling the peak",
           "votes": 0
         }
       ]
@@ -275,13 +275,13 @@
         {
           "fov_deg": 60.0,
           "look": [
-            -63.5,
-            2.2,
-            -87.0
+            -12.861588,
+            1.35,
+            -101.722203
           ],
           "pos": [
-            -100.0,
-            0.35,
+            3.0,
+            0.55,
             -90.0
           ],
           "t": 0.0
@@ -289,21 +289,161 @@
         {
           "fov_deg": 60.0,
           "look": [
-            -63.5,
-            2.2,
-            -87.0
+            -13.1036,
+            1.36,
+            -100.987452
           ],
           "pos": [
-            -100.0,
-            0.35,
-            -90.0
+            3.0,
+            0.56,
+            -89.6
+          ],
+          "t": 1.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -13.338549,
+            1.37,
+            -100.247706
+          ],
+          "pos": [
+            3.0,
+            0.57,
+            -89.2
+          ],
+          "t": 2.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -13.566332,
+            1.38,
+            -99.503114
+          ],
+          "pos": [
+            3.0,
+            0.58,
+            -88.8
+          ],
+          "t": 3.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -13.786847,
+            1.39,
+            -98.753828
+          ],
+          "pos": [
+            3.0,
+            0.59,
+            -88.4
+          ],
+          "t": 4.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.0,
+            1.4,
+            -98.0
+          ],
+          "pos": [
+            3.0,
+            0.6,
+            -88.0
+          ],
+          "t": 5.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.205696,
+            1.41,
+            -97.241786
+          ],
+          "pos": [
+            3.0,
+            0.61,
+            -87.6
+          ],
+          "t": 6.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.403845,
+            1.42,
+            -96.479342
+          ],
+          "pos": [
+            3.0,
+            0.62,
+            -87.2
           ],
           "t": 7.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.59436,
+            1.43,
+            -95.712828
+          ],
+          "pos": [
+            3.0,
+            0.63,
+            -86.8
+          ],
+          "t": 8.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.777157,
+            1.44,
+            -94.942405
+          ],
+          "pos": [
+            3.0,
+            0.64,
+            -86.4
+          ],
+          "t": 9.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.952157,
+            1.45,
+            -94.168235
+          ],
+          "pos": [
+            3.0,
+            0.65,
+            -86.0
+          ],
+          "t": 10.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -15.123232,
+            1.46,
+            -93.392246
+          ],
+          "pos": [
+            3.0,
+            0.66,
+            -85.6
+          ],
+          "t": 11.0
         }
       ],
       "epoch_unix_ms": 0,
       "lights": [],
-      "time_of_day": 0.33,
+      "time_of_day": 0.71,
       "words": []
     },
     "scoreboard": {

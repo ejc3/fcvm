@@ -277,10 +277,12 @@ the dropped lights; both are part of the camera-and-scene state every renderer f
 
 **Convergence. DECIDED (2026-10-22).** A path-traced frame averages a few random light
 paths per pixel and is grainy; averaging the same pixel over many frames removes the grain,
-but only while nothing in the view changes. So the camera path holds at viewpoints for a
-few seconds, where each tile converges toward noise-free and a relaunched tile shows as a
-grainy patch healing in; and while the camera moves, each renderer reuses its previous
-frames' samples by reprojection (temporal accumulation), so motion is clean too.
+but only while nothing in the view changes. While the camera moves, each renderer reuses
+its previous frames' samples by reprojection (temporal accumulation) and denoises what is
+left, so motion is clean too. REVISED (2026-10-27): the directed camera no longer holds
+still. Stopping dead at every viewpoint read as the motion dying, so a stop is a slow move
+(an orbit, a push-in, a drift) that the reprojected history follows, and the renderer's
+exact accumulation is left to a claimed GPU whose viewer stops steering.
 
 **No seams.** The browser shows every tile at one common `t`, holding each stream in a
 short buffer (a few frames) until all visible tiles have that frame; a tile that falls
@@ -402,9 +404,11 @@ All of it is Terraform in ejc3/aws, applied by the jumpbox:
   coordinator), and says how many GPUs it was measured on.
 - **EC2 capacity waits are shown, not counted. DECIDED.** A wait for spot capacity is drawn
   hatched and labelled "AWS had no spot GPU", and kept out of EC2's headline time.
-- **Directed camera with nudges. DECIDED.** The camera flies a choreographed path with
-  scenic holds, where the path-traced image converges; viewers vote or queue where the
-  next hold goes instead of steering continuously.
+- **Directed camera with nudges. DECIDED.** The camera flies a choreographed path of
+  stops and flights; viewers vote where the next stop goes instead of steering
+  continuously. REVISED (2026-10-27): the path never stops moving (slow moves at stops,
+  several flight styles, the day cycling through golden hour, dusk, night and dawn), and
+  its order is drawn per stop rather than a fixed loop.
 - **Your own GPU. DECIDED.** Any viewer can claim a GPU: a private VM restores for them in
   seconds, with their own camera, full screen, timed from click to first frame, for 60
   seconds. The GPU is borrowed from the wall: the claimed tile visibly leaves the image,
@@ -518,7 +522,8 @@ None of these exist yet; each is taken on a parallel box, never on a shared host
    and pixel position, so a relaunched GPU rejoins at the current frame with no state to
    catch up and tile edges match exactly; and while the camera holds still each GPU keeps
    adding samples, so the image converges to near-photoreal and a relaunched tile shows as
-   a noisy patch healing. Viewers share the camera, the time of day, and lights they drop
+   a noisy patch healing (the wall's directed camera never holds still since 2026-10-27;
+   its moving frames rely on the reprojected history). Viewers share the camera, the time of day, and lights they drop
    into the world. A scene with shared simulation state (particles, fluid) across tiles is
    ruled out: it needs the GPUs to agree on state and a relaunched GPU could not rejoin
    at once.

@@ -143,9 +143,8 @@ configuration own those. Two names differ from what the page (#1143) assumed:
 - The race button's intent is `restart_now`, the owner's name for it in the second
   design review, not `relaunch_all`. The race it starts is still reported as the
   snapshot's `relaunch_all`.
-- There is no `time_of_day` intent. Each hold's viewpoint sets the time of day (the
-  low-sun holds are viewpoints), so a viewer's setting would undo the director's next
-  hold or be undone by it within seconds.
+- There is no `time_of_day` intent. The directed camera's day cycle sets the time of day
+  (below), so a viewer's setting would be undone within a flight.
 
 **Clients and limits.** Every limit counts per client address, not per connection: the
 `CF-Connecting-IP` header when the coordinator runs with `--trust-cf-connecting-ip`
@@ -159,24 +158,41 @@ default 60 s) during which `restart_now` is refused for everyone; `restart_now` 
 starts one at once and the schedule restarts from it. Tiles on a draining host and GPUs
 lent to a visitor sit the race out.
 
-**The directed camera.** The coordinator flies the wall's camera along a path generated
-from `--camera-seed`: holds of 7 s at named viewpoints (low sun, a high leg showing the
-horizon's curve, the main peak and the clock in the sky framed across the fcvm/EC2 seam at
-image centre), joined by flights. The order loops and is the same for the same seed.
+**The directed camera.** The coordinator flies the wall's camera along a program generated
+from `--camera-seed`, and the camera never stands still. At each stop (a named viewpoint:
+the main peak and the clock in the sky framed across the fcvm/EC2 seam at image centre,
+valleys and ridgelines, the lakes, the plains, above and up through the cloud layer, high
+above the horizon's curve) it makes a slow move for the stop's stay of 9 to 12 s (an orbit,
+a push-in, a crane, a pan or a tracking drift), then flies to the next stop in one of four
+styles: a banking glide, an arc over the cloud deck, a dive through the cloud layer into a
+stop below it, or a skim low over the ground. A leg over 45 km low down always goes over
+the deck. Each leg starts with the velocity the previous one ended with and keeps 250 m
+above the ground and water; keyframes are one second apart and no two in a row are equal,
+so the renderer's spline ("Camera interpolation and holds" below) never holds. The time of
+day follows a cycle of 18 stops (late afternoon, golden hour, sunset, dusk, dawn, then the
+day, about every 8 minutes): each stop has its own, and the time moves on to the next
+stop's only while the camera flies, a step per coordinator tick. No stop is at night; the
+night passes in the middle of the one flight from the last dusk stop to the first dawn
+stop. The offered stops are never among the last six visited; they are the stops visited
+longest ago, shuffled a little by a draw from the seed, the step and the stop being left,
+with any stop that would repeat a run of four stops among the last 48 put last. With no
+votes the next stop is the first offered. The same seed gives the same program, and it does
+not repeat in a short loop.
 
-Viewers pick the stops by vote, and the vote is always open: it is for the first hold not
-yet decided. Two seconds before a hold ends the open vote closes and decides the next hold:
-the offered viewpoint with the most `nudge` votes, of tied ones the one picked first (a
-client that picks the same viewpoint again keeps its first time), and with no votes the
-default (the next in the order). The winning nudge's id is stamped on that hold's keyframes
-(`camera[].intent`). The decision is when the camera commits: the next hold's keyframes are
-published then, so every renderer has the flight before it starts, and a decided hold is
-not replaced. In the same step the vote for the hold after it opens, offering the
-viewpoints that follow it in the order, so a pick made while the camera finishes a hold or
-flies counts for the hold after the one it is heading to; votes are not cleared when the
-camera arrives. A viewer's pick therefore always counts, and the camera reaches it at the
-target's `arrive_at` when it wins. Ties going to the earlier pick mean one viewer cannot
-overturn another's pick within its vote; two viewers who agree outvote one.
+Viewers pick the stops by vote, and the vote is always open: it is for the first stop not
+yet decided. Two seconds before a stop's stay ends the open vote closes and decides the
+next stop: the offered viewpoint with the most `nudge` votes, of tied ones the one picked
+first (a client that picks the same viewpoint again keeps its first time), and with no
+votes the default (the first offered). The winning nudge's id is stamped on that stop's
+keyframes (`camera[].intent`). The decision is when the camera commits: the flight and the
+next stop's keyframes are appended then and are never changed afterwards (the path is only
+trimmed from the front, keeping 4 s before the current stop), so every renderer has the
+flight before it starts and no renderer sees the path move under it. In the same step the
+vote for the stop after it opens, so a pick made while the camera finishes a stop or flies
+counts for the stop after the one it is heading to; votes are not cleared when the camera
+arrives. A viewer's pick therefore always counts, and the camera reaches it at the target's
+`arrive_at` when it wins. Ties going to the earlier pick mean one viewer cannot overturn
+another's pick within its vote; two viewers who agree outvote one.
 
 **Viewer text** (`word`). Before the event is applied the coordinator asks Claude Haiku on
 Amazon Bedrock whether the text may be shown publicly, read together with every word now
@@ -387,10 +403,11 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   reclaimed mid-race are `dropped`, borrowed ones `sitting_out`.
 - `nudges` is the directed camera: `targets` are the viewpoints the open vote is among,
   the ones `nudge` may name now (`id`), each with a label, its votes and `arrive_at`, when
-  the camera gets there if it wins; `holding` (and `holding_label`) is the viewpoint held
-  now (null while flying) and `next_hold_at` when the camera leaves it; `next` (and `next_label`) is the next hold
-  once decided, `arrive_next_at` when the camera gets there. While `next` is null the open
-  vote decides it; otherwise it decides the hold after `next`. `leading` is the target that
+  the camera gets there if it wins; `holding` (and `holding_label`) is the stop the camera
+  is at now, moving slowly through it (null while flying), and `next_hold_at` when the
+  camera leaves it; `next` (and `next_label`) is the next stop once decided,
+  `arrive_next_at` when the camera gets there. While `next` is null the open vote decides
+  it; otherwise it decides the stop after `next`. `leading` is the target that
   wins if the vote closed now (the default when nobody voted); `opened_at` and
   `closes_at` bound the open vote.
 - `fleet.power` is whether the GPU capacity is up, when the coordinator launches the GPU
@@ -467,12 +484,13 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
 ### `GET /poster.jpg`
 
 The latest converged still of the whole image, for link previews and the page's first
-paint. Once per camera hold, 5.5 s into it, the coordinator subscribes to every aggregator
-(each host's band and the EC2 half), decodes the first frame at or after that scene time,
+paint. Once per camera stop, 5.5 s into it, the coordinator subscribes to every aggregator
+(each host's band and the EC2 half), decodes the first frame at or after that scene time
+(every aggregator draws the same frame times, so the regions are one frame),
 places each region in the whole image and encodes one JPEG (through the `ffmpeg` CLI).
 Served with `Cache-Control: public, max-age=10` and `Access-Control-Allow-Origin: *` (the
-page reads it from its own origin); `404` with `no-store` until the first poster exists. A hold whose capture does not finish before the flight keeps the previous
-poster, and so does a hold while a race runs or any placed tile is starting or
+page reads it from its own origin); `404` with `no-store` until the first poster exists. A stop whose capture does not finish before the flight keeps the previous
+poster, and so does a stop while a race runs or any placed tile is starting or
 relaunching (its region would be black; claimed GPUs and dark tiles do not count). Borrowed tiles are black in it, as on the wall.
 
 ### Running it
@@ -1198,7 +1216,8 @@ for that: at least 0.5 s after the last post arrives.
   it starts or ends).
 - Next to a hold the tangent is zero, so motion eases out of and into holds.
 - To let the image converge, include holds: two equal keyframes a few seconds
-  apart.
+  apart. The coordinator's directed camera includes none: its path never stands still,
+  and its moving frames rely on the reprojected history (below).
 
 #### Words, the clock and lights
 

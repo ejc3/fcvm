@@ -585,6 +585,14 @@ test-fleet-coordinator: private SHELL := $(TARGET_LEASE_SHELL)
 test-fleet-coordinator: cargo-target-link dep-provenance
 	CARGO_TARGET_DIR=target $(CARGO) test --locked --release --no-default-features -p fcvm --test test_fleet_coord
 
+# The directed camera's program with no votes, as JSON (fleet/core/examples/program.rs):
+# make fleet-program SEED=1 SECS=600 OUT=program.json
+.PHONY: fleet-program
+fleet-program: private SHELL := $(TARGET_LEASE_SHELL)
+fleet-program: cargo-target-link
+	@test -n "$(OUT)" || { echo "fleet-program needs OUT=FILE" >&2; exit 2; }
+	CARGO_TARGET_DIR=target $(CARGO) run --locked --release -q -p fleet-core --example program -- $(or $(SEED),1) $(or $(SECS),600) > $(OUT)
+
 build-fc-mock: private SHELL := $(TARGET_LEASE_SHELL)
 build-fc-mock: cargo-target-link
 	@echo "==> Building fc-mock..."

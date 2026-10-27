@@ -1,5 +1,5 @@
 {
-  "description": "Viewers vote among the offered next holds, one vote per client address (a later vote replaces it); the most votes win and the winning nudge's id is stamped on that hold's keyframes; a target not offered is refused, and a vote after the choice counts for the hold after; actions carry the viewer, the intent id and its args.",
+  "description": "Viewers vote among the offered next stops, one vote per client address (a later vote replaces it); the most votes win and the winning nudge's id is stamped on every keyframe of that stop (not the flight's); a target not offered is refused, and a vote after the choice counts for the stop after; actions carry the viewer, the intent id and its args.",
   "events": [
     {
       "at": 1000,
@@ -21,7 +21,7 @@
     },
     {
       "args": {
-        "target": "dawn-valley"
+        "target": "western-sea"
       },
       "at": 1000,
       "client": "192.0.2.1",
@@ -32,7 +32,7 @@
     },
     {
       "args": {
-        "target": "peak-seam-low-sun"
+        "target": "peak-close"
       },
       "at": 1100,
       "client": "192.0.2.2",
@@ -43,7 +43,7 @@
     },
     {
       "args": {
-        "target": "dawn-valley"
+        "target": "western-sea"
       },
       "at": 1200,
       "client": "192.0.2.2",
@@ -64,14 +64,14 @@
       "viewer": "v1"
     },
     {
-      "at": 5000,
+      "at": 8000,
       "type": "tick"
     },
     {
       "args": {
-        "target": "peak-close"
+        "target": "high-lakes"
       },
-      "at": 5100,
+      "at": 8100,
       "client": "192.0.2.2",
       "id": "n5",
       "name": "nudge",
@@ -84,7 +84,7 @@
       "after": 5,
       "checks": {
         "/view/actions/2/args": {
-          "target": "dawn-valley"
+          "target": "western-sea"
         },
         "/view/actions/2/id": "n3",
         "/view/actions/2/viewer": "v3",
@@ -102,54 +102,57 @@
     {
       "after": 7,
       "checks": {
-        "/view/nudges/arrive_next_at": 25000,
-        "/view/nudges/next": "dawn-valley",
-        "/view/scene/camera/2/intent": "n1"
-      }
+        "/view/nudges/arrive_next_at": 34000,
+        "/view/nudges/next": "western-sea",
+        "/view/scene/camera/33/intent": null,
+        "/view/scene/camera/34/intent": "n1",
+        "/view/scene/camera/46/intent": "n1"
+      },
+      "note": "every keyframe of the chosen stop carries the nudge, the flight's do not"
     },
     {
       "after": 8,
       "checks": {
         "/receipts/n5/outcome": "committed",
-        "/view/nudges/leading": "peak-close",
-        "/view/nudges/next": "dawn-valley"
+        "/view/nudges/leading": "high-lakes",
+        "/view/nudges/next": "western-sea"
       },
-      "note": "a vote after the choice counts for the hold after it"
+      "note": "a vote after the choice counts for the stop after it"
     }
   ],
   "final_view": {
     "actions": [
       {
         "args": {
-          "target": "dawn-valley"
+          "target": "western-sea"
         },
         "at": 1000,
         "id": "n1",
         "name": "nudge",
         "outcome": "committed",
-        "summary": "nudge dawn-valley",
+        "summary": "nudge western-sea",
         "viewer": "v1"
       },
       {
         "args": {
-          "target": "peak-seam-low-sun"
+          "target": "peak-close"
         },
         "at": 1100,
         "id": "n2",
         "name": "nudge",
         "outcome": "committed",
-        "summary": "nudge peak-seam-low-sun",
+        "summary": "nudge peak-close",
         "viewer": "v2"
       },
       {
         "args": {
-          "target": "dawn-valley"
+          "target": "western-sea"
         },
         "at": 1200,
         "id": "n3",
         "name": "nudge",
         "outcome": "committed",
-        "summary": "nudge dawn-valley",
+        "summary": "nudge western-sea",
         "viewer": "v3"
       },
       {
@@ -160,18 +163,18 @@
         "id": "n4",
         "name": "nudge",
         "outcome": "refused",
-        "summary": "\"nowhere\" is not offered; the choices are [\"horizon\", \"dawn-valley\", \"peak-seam-low-sun\"]",
+        "summary": "\"nowhere\" is not offered; the choices are [\"ridges\", \"western-sea\", \"peak-close\"]",
         "viewer": "v1"
       },
       {
         "args": {
-          "target": "peak-close"
+          "target": "high-lakes"
         },
-        "at": 5100,
+        "at": 8100,
         "id": "n5",
         "name": "nudge",
         "outcome": "committed",
-        "summary": "nudge peak-close",
+        "summary": "nudge high-lakes",
         "viewer": "v2"
       }
     ],
@@ -224,32 +227,32 @@
     },
     "next_race_at": null,
     "nudges": {
-      "arrive_next_at": 25000,
-      "closes_at": 30000,
-      "holding": "coast",
-      "holding_label": "From the coast",
-      "leading": "peak-close",
-      "next": "dawn-valley",
-      "next_hold_at": 7000,
-      "next_label": "Dawn in the valley",
-      "opened_at": 5000,
+      "arrive_next_at": 34000,
+      "closes_at": 43000,
+      "holding": "plains",
+      "holding_label": "Across the plains to the mountains",
+      "leading": "high-lakes",
+      "next": "western-sea",
+      "next_hold_at": 10000,
+      "next_label": "Over the western sea",
+      "opened_at": 8000,
       "targets": [
         {
-          "arrive_at": 50000,
-          "id": "peak-seam-low-sun",
-          "label": "The peak at a low sun",
+          "arrive_at": 67000,
+          "id": "peak-lake",
+          "label": "The peak over the lake",
           "votes": 0
         },
         {
-          "arrive_at": 50000,
-          "id": "peak-close",
-          "label": "Close to the peak",
+          "arrive_at": 69000,
+          "id": "high-lakes",
+          "label": "The high lakes",
           "votes": 1
         },
         {
-          "arrive_at": 50000,
-          "id": "high-lakes",
-          "label": "The high lakes",
+          "arrive_at": 67000,
+          "id": "peak-close",
+          "label": "Circling the peak",
           "votes": 0
         }
       ]
@@ -261,13 +264,13 @@
         {
           "fov_deg": 60.0,
           "look": [
-            -63.5,
-            2.2,
-            -87.0
+            -12.861588,
+            1.35,
+            -101.722203
           ],
           "pos": [
-            -100.0,
-            0.35,
+            3.0,
+            0.55,
             -90.0
           ],
           "t": 0.0
@@ -275,51 +278,664 @@
         {
           "fov_deg": 60.0,
           "look": [
-            -63.5,
-            2.2,
-            -87.0
+            -13.1036,
+            1.36,
+            -100.987452
           ],
           "pos": [
-            -100.0,
-            0.35,
-            -90.0
+            3.0,
+            0.56,
+            -89.6
+          ],
+          "t": 1.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -13.338549,
+            1.37,
+            -100.247706
+          ],
+          "pos": [
+            3.0,
+            0.57,
+            -89.2
+          ],
+          "t": 2.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -13.566332,
+            1.38,
+            -99.503114
+          ],
+          "pos": [
+            3.0,
+            0.58,
+            -88.8
+          ],
+          "t": 3.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -13.786847,
+            1.39,
+            -98.753828
+          ],
+          "pos": [
+            3.0,
+            0.59,
+            -88.4
+          ],
+          "t": 4.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.0,
+            1.4,
+            -98.0
+          ],
+          "pos": [
+            3.0,
+            0.6,
+            -88.0
+          ],
+          "t": 5.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.205696,
+            1.41,
+            -97.241786
+          ],
+          "pos": [
+            3.0,
+            0.61,
+            -87.6
+          ],
+          "t": 6.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.403845,
+            1.42,
+            -96.479342
+          ],
+          "pos": [
+            3.0,
+            0.62,
+            -87.2
           ],
           "t": 7.0
         },
         {
-          "fov_deg": 62.0,
-          "intent": "n1",
+          "fov_deg": 60.0,
           "look": [
-            -10.75,
-            2.6,
-            -105.5
+            -14.59436,
+            1.43,
+            -95.712828
           ],
           "pos": [
-            -18.0,
-            1.8,
-            -92.0
+            3.0,
+            0.63,
+            -86.8
+          ],
+          "t": 8.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.777157,
+            1.44,
+            -94.942405
+          ],
+          "pos": [
+            3.0,
+            0.64,
+            -86.4
+          ],
+          "t": 9.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.952157,
+            1.45,
+            -94.168235
+          ],
+          "pos": [
+            3.0,
+            0.65,
+            -86.0
+          ],
+          "t": 10.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -15.123232,
+            1.46,
+            -93.392246
+          ],
+          "pos": [
+            3.0,
+            0.66,
+            -85.6
+          ],
+          "t": 11.0
+        },
+        {
+          "fov_deg": 60.232396,
+          "look": [
+            -16.166973,
+            1.76972,
+            -92.250843
+          ],
+          "pos": [
+            2.328874,
+            0.929797,
+            -85.037749
+          ],
+          "t": 12.0
+        },
+        {
+          "fov_deg": 60.849597,
+          "look": [
+            -18.897012,
+            2.583347,
+            -90.246537
+          ],
+          "pos": [
+            0.396768,
+            1.636977,
+            -84.219522
+          ],
+          "t": 13.0
+        },
+        {
+          "fov_deg": 61.739852,
+          "look": [
+            -22.961197,
+            3.758615,
+            -87.77399
+          ],
+          "pos": [
+            -2.674592,
+            2.658928,
+            -83.240638
+          ],
+          "t": 14.0
+        },
+        {
+          "fov_deg": 62.802391,
+          "look": [
+            -28.102685,
+            5.154707,
+            -85.20607
+          ],
+          "pos": [
+            -6.763717,
+            3.873712,
+            -82.186453
+          ],
+          "t": 15.0
+        },
+        {
+          "fov_deg": 63.94742,
+          "look": [
+            -34.164246,
+            6.627426,
+            -82.913436
+          ],
+          "pos": [
+            -11.749359,
+            5.159768,
+            -81.132362
+          ],
+          "t": 16.0
+        },
+        {
+          "fov_deg": 65.096122,
+          "look": [
+            -41.053254,
+            8.024972,
+            -81.244282
+          ],
+          "pos": [
+            -17.510507,
+            6.395708,
+            -80.143796
+          ],
+          "t": 17.0
+        },
+        {
+          "fov_deg": 66.18066,
+          "look": [
+            -48.69269,
+            8.945102,
+            -80.498114
+          ],
+          "pos": [
+            -23.926389,
+            7.460165,
+            -79.276225
+          ],
+          "t": 18.0
+        },
+        {
+          "fov_deg": 67.144171,
+          "look": [
+            -56.971686,
+            8.797197,
+            -80.312982
+          ],
+          "pos": [
+            -30.876471,
+            8.231732,
+            -78.575156
+          ],
+          "t": 19.0
+        },
+        {
+          "fov_deg": 67.940774,
+          "look": [
+            -65.699754,
+            8.191788,
+            -80.358523
+          ],
+          "pos": [
+            -38.240461,
+            8.588961,
+            -78.076134
+          ],
+          "t": 20.0
+        },
+        {
+          "fov_deg": 68.535561,
+          "look": [
+            -74.754257,
+            7.705337,
+            -80.666438
+          ],
+          "pos": [
+            -45.898302,
+            8.6,
+            -77.804743
+          ],
+          "t": 21.0
+        },
+        {
+          "fov_deg": 68.904607,
+          "look": [
+            -84.01459,
+            7.613359,
+            -81.257867
+          ],
+          "pos": [
+            -53.730177,
+            8.6,
+            -77.776603
+          ],
+          "t": 22.0
+        },
+        {
+          "fov_deg": 69.034959,
+          "look": [
+            -93.328898,
+            7.531004,
+            -82.139827
+          ],
+          "pos": [
+            -61.616509,
+            8.6,
+            -77.997372
+          ],
+          "t": 23.0
+        },
+        {
+          "fov_deg": 68.924646,
+          "look": [
+            -102.552978,
+            7.430735,
+            -83.308922
+          ],
+          "pos": [
+            -69.437958,
+            8.6,
+            -78.462747
+          ],
+          "t": 24.0
+        },
+        {
+          "fov_deg": 68.582674,
+          "look": [
+            -111.521627,
+            6.798438,
+            -84.747733
+          ],
+          "pos": [
+            -77.075424,
+            8.588984,
+            -79.158462
           ],
           "t": 25.0
+        },
+        {
+          "fov_deg": 68.029024,
+          "look": [
+            -120.049739,
+            5.080465,
+            -86.423844
+          ],
+          "pos": [
+            -84.410046,
+            8.232891,
+            -80.060288
+          ],
+          "t": 26.0
+        },
+        {
+          "fov_deg": 67.294657,
+          "look": [
+            -127.997997,
+            2.800966,
+            -88.301751
+          ],
+          "pos": [
+            -91.3232,
+            7.465184,
+            -81.134036
+          ],
+          "t": 27.0
+        },
+        {
+          "fov_deg": 66.421511,
+          "look": [
+            -135.29227,
+            0.655525,
+            -90.379558
+          ],
+          "pos": [
+            -97.696502,
+            6.408771,
+            -82.335553
+          ],
+          "t": 28.0
+        },
+        {
+          "fov_deg": 65.462502,
+          "look": [
+            -141.932693,
+            -0.738316,
+            -92.460902
+          ],
+          "pos": [
+            -103.411807,
+            5.186516,
+            -83.610722
+          ],
+          "t": 29.0
+        },
+        {
+          "fov_deg": 64.481523,
+          "look": [
+            -147.83854,
+            -1.284391,
+            -94.237437
+          ],
+          "pos": [
+            -108.351208,
+            3.921012,
+            -84.895469
+          ],
+          "t": 30.0
+        },
+        {
+          "fov_deg": 63.553446,
+          "look": [
+            -152.826594,
+            -1.091727,
+            -95.513738
+          ],
+          "pos": [
+            -112.397038,
+            2.734281,
+            -86.115753
+          ],
+          "t": 31.0
+        },
+        {
+          "fov_deg": 62.76412,
+          "look": [
+            -156.6594,
+            -0.435362,
+            -96.230781
+          ],
+          "pos": [
+            -115.431867,
+            1.747397,
+            -87.187572
+          ],
+          "t": 32.0
+        },
+        {
+          "fov_deg": 62.210369,
+          "look": [
+            -159.111544,
+            0.286038,
+            -96.480127
+          ],
+          "pos": [
+            -117.338505,
+            1.080045,
+            -88.016963
+          ],
+          "t": 33.0
         },
         {
           "fov_deg": 62.0,
           "intent": "n1",
           "look": [
-            -10.75,
-            2.6,
-            -105.5
+            -160.0,
+            0.6,
+            -96.5
           ],
           "pos": [
-            -18.0,
-            1.8,
-            -92.0
+            -118.0,
+            0.85,
+            -88.5
           ],
-          "t": 32.0
+          "t": 34.0
+        },
+        {
+          "fov_deg": 62.0,
+          "intent": "n1",
+          "look": [
+            -160.0,
+            0.6,
+            -96.772727
+          ],
+          "pos": [
+            -118.0,
+            0.877273,
+            -88.772727
+          ],
+          "t": 35.0
+        },
+        {
+          "fov_deg": 62.0,
+          "intent": "n1",
+          "look": [
+            -160.0,
+            0.6,
+            -97.045455
+          ],
+          "pos": [
+            -118.0,
+            0.904545,
+            -89.045455
+          ],
+          "t": 36.0
+        },
+        {
+          "fov_deg": 62.0,
+          "intent": "n1",
+          "look": [
+            -160.0,
+            0.6,
+            -97.318182
+          ],
+          "pos": [
+            -118.0,
+            0.931818,
+            -89.318182
+          ],
+          "t": 37.0
+        },
+        {
+          "fov_deg": 62.0,
+          "intent": "n1",
+          "look": [
+            -160.0,
+            0.6,
+            -97.590909
+          ],
+          "pos": [
+            -118.0,
+            0.959091,
+            -89.590909
+          ],
+          "t": 38.0
+        },
+        {
+          "fov_deg": 62.0,
+          "intent": "n1",
+          "look": [
+            -160.0,
+            0.6,
+            -97.863636
+          ],
+          "pos": [
+            -118.0,
+            0.986364,
+            -89.863636
+          ],
+          "t": 39.0
+        },
+        {
+          "fov_deg": 62.0,
+          "intent": "n1",
+          "look": [
+            -160.0,
+            0.6,
+            -98.136364
+          ],
+          "pos": [
+            -118.0,
+            1.013636,
+            -90.136364
+          ],
+          "t": 40.0
+        },
+        {
+          "fov_deg": 62.0,
+          "intent": "n1",
+          "look": [
+            -160.0,
+            0.6,
+            -98.409091
+          ],
+          "pos": [
+            -118.0,
+            1.040909,
+            -90.409091
+          ],
+          "t": 41.0
+        },
+        {
+          "fov_deg": 62.0,
+          "intent": "n1",
+          "look": [
+            -160.0,
+            0.6,
+            -98.681818
+          ],
+          "pos": [
+            -118.0,
+            1.068182,
+            -90.681818
+          ],
+          "t": 42.0
+        },
+        {
+          "fov_deg": 62.0,
+          "intent": "n1",
+          "look": [
+            -160.0,
+            0.6,
+            -98.954545
+          ],
+          "pos": [
+            -118.0,
+            1.095455,
+            -90.954545
+          ],
+          "t": 43.0
+        },
+        {
+          "fov_deg": 62.0,
+          "intent": "n1",
+          "look": [
+            -160.0,
+            0.6,
+            -99.227273
+          ],
+          "pos": [
+            -118.0,
+            1.122727,
+            -91.227273
+          ],
+          "t": 44.0
+        },
+        {
+          "fov_deg": 62.0,
+          "intent": "n1",
+          "look": [
+            -160.0,
+            0.6,
+            -99.5
+          ],
+          "pos": [
+            -118.0,
+            1.15,
+            -91.5
+          ],
+          "t": 45.0
+        },
+        {
+          "fov_deg": 62.0,
+          "intent": "n1",
+          "look": [
+            -160.0,
+            0.6,
+            -99.772727
+          ],
+          "pos": [
+            -118.0,
+            1.177273,
+            -91.772727
+          ],
+          "t": 46.0
         }
       ],
       "epoch_unix_ms": 0,
       "lights": [],
-      "time_of_day": 0.33,
+      "time_of_day": 0.71,
       "words": []
     },
     "scoreboard": {
