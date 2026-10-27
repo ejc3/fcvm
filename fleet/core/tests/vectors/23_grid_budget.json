@@ -629,23 +629,31 @@
     "next_race_at": null,
     "nudges": {
       "arrive_next_at": 55000,
+      "closes_at": 60000,
       "holding": null,
+      "holding_label": null,
+      "leading": "peak-seam-low-sun",
       "next": "dawn-valley",
       "next_hold_at": null,
+      "next_label": "Dawn in the valley",
+      "opened_at": 35000,
       "targets": [
         {
-          "id": "dawn-valley",
-          "label": "Dawn in the valley",
-          "votes": 0
-        },
-        {
+          "arrive_at": 80000,
           "id": "peak-seam-low-sun",
           "label": "The peak at a low sun",
           "votes": 0
         },
         {
+          "arrive_at": 80000,
           "id": "peak-close",
           "label": "Close to the peak",
+          "votes": 0
+        },
+        {
+          "arrive_at": 80000,
+          "id": "high-lakes",
+          "label": "The high lakes",
           "votes": 0
         }
       ]

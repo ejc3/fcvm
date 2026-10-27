@@ -6,8 +6,9 @@
 //! vote (`nudge`) among a few offered viewpoints for the next hold; the vote closes
 //! `DECIDE_LEAD_SECS` before the hold ends, the winner (or the default when nobody voted)
 //! becomes the next hold, and its keyframes are published so every renderer has them before
-//! the flight starts. Times are scene seconds; flight times are whole seconds so the
-//! timeline is exact.
+//! the flight starts. The vote never closes for a viewer: the moment one hold is decided, the
+//! vote for the hold after it opens, so a nudge always counts for the first hold not yet
+//! decided. Times are scene seconds; flight times are whole seconds so the timeline is exact.
 
 use crate::scene::Keyframe;
 use serde::{Deserialize, Serialize};
@@ -159,6 +160,10 @@ pub struct Vote {
     pub target: usize,
     /// The nudge intent's id, stamped on the hold's keyframes when its target wins.
     pub intent: String,
+    /// When the client first picked this target (Unix ms): of tied targets, the one picked
+    /// first wins, so a later viewer cannot overturn an earlier pick on their own.
+    #[serde(default)]
+    pub at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -174,9 +179,14 @@ pub struct Director {
     pub next: Option<usize>,
     /// The nudge that chose `next`, if one did.
     pub next_intent: Option<String>,
+    /// The viewpoints the open vote is among: for `next` while it is undecided, else for the
+    /// hold after it.
     pub offer: Vec<usize>,
-    /// One vote per client address.
+    /// The open vote, one per client address.
     pub votes: BTreeMap<String, Vote>,
+    /// Scene time the open vote opened (the previous decision, or the director's start).
+    #[serde(default)]
+    pub vote_opened_t: f64,
     /// The flight to `next` has begun (its time of day is in the scene).
     pub flying: bool,
 }
@@ -212,20 +222,22 @@ impl Director {
             next_intent: None,
             offer: Vec::new(),
             votes: BTreeMap::new(),
+            vote_opened_t: now_t,
             flying: false,
         };
-        d.offer = d.make_offer();
+        d.offer = d.make_offer(d.step, d.current);
         d
     }
 
-    /// The default next hold and the next ones in the order, never the current one.
-    fn make_offer(&self) -> Vec<usize> {
+    /// The offer for the hold that follows `from`, held at step `step`: the default (the next
+    /// in the order) and the ones after it, never `from` itself.
+    fn make_offer(&self, step: u64, from: usize) -> Vec<usize> {
         let n = self.order.len() as u64;
         let mut out = Vec::new();
         let mut k = 1;
         while out.len() < OFFER.min(self.order.len() - 1) {
-            let v = self.order[((self.step + k) % n) as usize];
-            if v != self.current && !out.contains(&v) {
+            let v = self.order[((step + k) % n) as usize];
+            if v != from && !out.contains(&v) {
                 out.push(v);
             }
             k += 1;
@@ -245,6 +257,58 @@ impl Director {
         let vps = viewpoints();
         self.next
             .map(|n| self.hold_until() + flight_secs(&vps[self.current], &vps[n]))
+    }
+
+    /// The hold the open vote decides follows this viewpoint, and the flight to it starts at
+    /// this time: the current hold and its end while `next` is undecided, else `next` and
+    /// the end of its hold.
+    fn vote_from(&self) -> (usize, f64) {
+        match (self.next, self.arrive_next_at()) {
+            (Some(n), Some(at)) => (n, at + HOLD_SECS),
+            _ => (self.current, self.hold_until()),
+        }
+    }
+
+    /// When the open vote closes.
+    pub fn vote_closes_at(&self) -> f64 {
+        self.vote_from().1 - DECIDE_LEAD_SECS
+    }
+
+    /// When the camera reaches offered viewpoint `i` if it wins the open vote.
+    pub fn arrive_offered_at(&self, i: usize) -> f64 {
+        let vps = viewpoints();
+        let (from, leave) = self.vote_from();
+        leave + flight_secs(&vps[from], &vps[i])
+    }
+
+    /// The offered viewpoint that wins if the open vote closed now, and the nudge it stamps
+    /// on its keyframes. Most votes wins; of tied targets, the one picked first; no votes:
+    /// the default.
+    pub fn leading(&self) -> (usize, Option<String>) {
+        let mut best: Option<(usize, usize, u64, &str)> = None;
+        for i in &self.offer {
+            let picks: Vec<&Vote> = self.votes.values().filter(|v| v.target == *i).collect();
+            let Some(first) = picks
+                .iter()
+                .min_by(|a, b| (a.at, &a.intent).cmp(&(b.at, &b.intent)))
+            else {
+                continue;
+            };
+            let better = match best {
+                None => true,
+                Some((_, c, at, intent)) => {
+                    picks.len() > c
+                        || (picks.len() == c && (first.at, first.intent.as_str()) < (at, intent))
+                }
+            };
+            if better {
+                best = Some((*i, picks.len(), first.at, first.intent.as_str()));
+            }
+        }
+        match best {
+            Some((i, _, _, intent)) => (i, Some(intent.to_string())),
+            None => (self.offer[0], None),
+        }
     }
 
     /// The keyframes for the current hold and, once decided, the flight and the next hold.
@@ -267,23 +331,37 @@ impl Director {
         k
     }
 
-    /// Record a vote; `Err` names why it does not count.
-    pub fn vote(&mut self, client: &str, target: &str, intent: &str) -> Result<(), String> {
-        if self.next.is_some() {
-            return Err("the next hold is already chosen; vote again during it".into());
-        }
+    /// Record a vote in the open vote; `Err` names why it does not count. A client's later
+    /// vote replaces its earlier one; picking the same target again keeps its first time.
+    pub fn vote(
+        &mut self,
+        client: &str,
+        target: &str,
+        intent: &str,
+        at: u64,
+    ) -> Result<(), String> {
         let vps = viewpoints();
+        // A pick of the hold just decided (the offer moved on while it was on its way) is
+        // already what happens: nothing to record.
+        if self.next.is_some_and(|n| vps[n].name == target) {
+            return Ok(());
+        }
         let Some(i) = self.offer.iter().copied().find(|i| vps[*i].name == target) else {
             let names: Vec<&str> = self.offer.iter().map(|i| vps[*i].name).collect();
             return Err(format!(
                 "{target:?} is not offered; the choices are {names:?}"
             ));
         };
+        let at = match self.votes.get(client) {
+            Some(v) if v.target == i => v.at,
+            _ => at,
+        };
         self.votes.insert(
             client.to_string(),
             Vote {
                 target: i,
                 intent: intent.to_string(),
+                at,
             },
         );
         Ok(())
@@ -313,27 +391,13 @@ impl Director {
         }
         for _ in 0..4 {
             if self.next.is_none() && now_t >= self.decide_at() {
-                // Most votes wins; ties go to the earlier offered; no votes: the default.
-                let tally: Vec<(usize, usize)> = self
-                    .offer
-                    .iter()
-                    .map(|i| (*i, self.votes.values().filter(|v| v.target == *i).count()))
-                    .collect();
-                let best = tally.iter().map(|(_, c)| *c).max().unwrap_or(0);
-                let (pick, intent) = if best == 0 {
-                    (self.offer[0], None)
-                } else {
-                    let pick = tally.iter().find(|(_, c)| *c == best).unwrap().0;
-                    let first = self
-                        .votes
-                        .values()
-                        .filter(|v| v.target == pick)
-                        .map(|v| v.intent.clone())
-                        .min();
-                    (pick, first)
-                };
+                let (pick, intent) = self.leading();
                 self.next = Some(pick);
                 self.next_intent = intent;
+                // The vote for the hold after it opens now.
+                self.votes.clear();
+                self.offer = self.make_offer(self.step + 1, pick);
+                self.vote_opened_t = self.decide_at();
             }
             if let Some(n) = self.next {
                 if !self.flying && now_t >= self.hold_until() {
@@ -348,8 +412,6 @@ impl Director {
                     self.next = None;
                     self.next_intent = None;
                     self.flying = false;
-                    self.votes.clear();
-                    self.offer = self.make_offer();
                     continue;
                 }
             }
@@ -425,5 +487,16 @@ mod tests {
             first,
             "the loop comes back to its start"
         );
+    }
+
+    #[test]
+    fn a_director_stored_before_the_open_vote_fields_still_loads() {
+        // The coordinator refuses to start on a stored state it cannot read.
+        let mut v = serde_json::to_value(Director::new(3, 0.0)).unwrap();
+        v.as_object_mut().unwrap().remove("vote_opened_t");
+        v["votes"] = serde_json::json!({"192.0.2.1": {"target": v["offer"][0], "intent": "n1"}});
+        let d: Director = serde_json::from_value(v).unwrap();
+        assert_eq!(d.vote_opened_t, 0.0);
+        assert_eq!(d.votes["192.0.2.1"].at, 0);
     }
 }

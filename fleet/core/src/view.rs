@@ -184,19 +184,28 @@ pub struct NudgeTarget {
     pub id: String,
     pub label: String,
     pub votes: usize,
+    /// When the camera gets there if it wins the open vote (Unix ms).
+    pub arrive_at: u64,
 }
 
-/// The directed camera: where it can hold next, with this hold's votes.
+/// The directed camera: the open vote, for the first hold not yet decided, with its votes.
 #[derive(Debug, Clone, Serialize)]
 pub struct NudgesView {
     pub targets: Vec<NudgeTarget>,
-    /// The viewpoint the camera holds on now, or null while it flies.
+    /// The viewpoint the camera holds on now, or null while it flies, and its label.
     pub holding: Option<String>,
+    pub holding_label: Option<String>,
     /// While holding, when the camera leaves for the next hold (Unix ms).
     pub next_hold_at: Option<u64>,
     /// The next hold once the vote has closed, and when the camera arrives there.
     pub next: Option<String>,
+    pub next_label: Option<String>,
     pub arrive_next_at: Option<u64>,
+    /// The target that wins if the open vote closed now (the default when nobody voted).
+    pub leading: String,
+    /// When the open vote opened and when it closes (Unix ms).
+    pub opened_at: u64,
+    pub closes_at: u64,
 }
 
 /// What can be wrong, each with its own kind so the page can label it.
@@ -731,12 +740,18 @@ fn nudges(d: &crate::director::Director, epoch_unix_ms: u64) -> NudgesView {
                 id: vps[*i].name.to_string(),
                 label: vps[*i].label.to_string(),
                 votes: tally.get(vps[*i].name).copied().unwrap_or(0),
+                arrive_at: unix_ms(epoch_unix_ms, d.arrive_offered_at(*i)),
             })
             .collect(),
         holding: (!d.flying).then(|| vps[d.current].name.to_string()),
+        holding_label: (!d.flying).then(|| vps[d.current].label.to_string()),
         next_hold_at: (!d.flying).then(|| unix_ms(epoch_unix_ms, d.hold_until())),
         next: d.next.map(|n| vps[n].name.to_string()),
+        next_label: d.next.map(|n| vps[n].label.to_string()),
         arrive_next_at: d.arrive_next_at().map(|t| unix_ms(epoch_unix_ms, t)),
+        leading: vps[d.leading().0].name.to_string(),
+        opened_at: unix_ms(epoch_unix_ms, d.vote_opened_t),
+        closes_at: unix_ms(epoch_unix_ms, d.vote_closes_at()),
     }
 }
 
