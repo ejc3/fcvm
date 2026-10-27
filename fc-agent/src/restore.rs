@@ -294,10 +294,13 @@ pub(crate) fn elapsed_ms(since: std::time::Instant) -> f64 {
 /// snapshot's shared guest IPv6 on eth0. Without this, all clones share the same
 /// IPv6 and return traffic gets ECMP-routed to the wrong clone.
 ///
-/// `host_time`: the host's clock in nanoseconds, already fetched with the restore epoch by the
-/// metadata watcher. Re-fetching the metadata document here would repeat the
-/// transport round trip milliseconds after the watcher completed it; the step
-/// adds the time since the read instead.
+/// `host_time`: the host's clock in nanoseconds, fetched with the restore epoch by the
+/// metadata watcher. The step reads the host's clock again instead
+/// (`bootplan::sync_clock_from_host`) and uses this value only when that read fails,
+/// adding the time since this function started. The time between the host's stamp
+/// and that start is not counted: a restore that pages in from a cold memory file
+/// stalled long enough there to leave a clone 130 ms behind the host for 9 minutes
+/// (issue 1375).
 pub async fn handle_clone_restore(
     signals: &RestoreSignals,
     clone_ipv6: Option<&str>,
@@ -419,11 +422,18 @@ pub async fn handle_clone_restore(
     // jump makes every daemon whose lease ran out in it reconnect at once, and a
     // connect the gated egress answers with a reset is a definitive refusal to
     // ServiceRouter (.claude/CLAUDE.md, "SUSPENDING A VM DOES NOT DISTURB IT").
-    // The NFS remount and the hook run after it. The host's value was read just
-    // before this function started, so the step adds the time since then.
+    // The NFS remount and the hook run after it. The host's clock is read here,
+    // right before the step, not taken from the restore document the watcher read
+    // before this function started (see `host_time` above).
     let clock_started = std::time::Instant::now();
     let chronyd_retired = chronyd_retired.await;
-    crate::bootplan::set_system_clock(host_time, restore_started.elapsed());
+    if let Err(error) = crate::bootplan::sync_clock_from_host().await {
+        eprintln!(
+            "[fc-agent] WARNING: reading the host's clock for the restore step failed: \
+             {error:#}; stepping to the restore document's"
+        );
+        crate::bootplan::set_system_clock(host_time, restore_started.elapsed());
+    }
     // A fresh chronyd, whose every measurement is taken against the stepped
     // clock. Its convergence is not part of the readiness contract (the clock
     // is already stepped), so it must not hold the host's ACK.
@@ -1077,7 +1087,7 @@ mod tests {
             .find("let chronyd_retired = chronyd_retired.await;")
             .expect("the restore no longer waits for the snapshot's chronyd to be gone");
         let clock = body
-            .find("crate::bootplan::set_system_clock(host_time")
+            .find("crate::bootplan::sync_clock_from_host()")
             .expect("the restore path no longer steps the clock");
         let restart = body
             .find("crate::agent::restart_chronyd_after_restore(retired)")
@@ -1099,7 +1109,7 @@ mod tests {
             .find("crate::snapshot_network::restore_snapshot_network(")
             .expect("the restore path no longer runs the snapshot boundary");
         let clock = body
-            .find("crate::bootplan::set_system_clock(host_time")
+            .find("crate::bootplan::sync_clock_from_host()")
             .expect("the restore path no longer steps the clock");
         let nfs = body
             .find("mount_nfs_shares(")

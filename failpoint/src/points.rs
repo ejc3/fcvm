@@ -36,5 +36,6 @@ pub const GUEST_POINTS: &[&str] = &[
     "cache_ready.pre_send",
     "exec.post_accept_pre_read",
     "exec.post_ack_pre_go",
+    "restore.post_epoch_read",
     "restore.pre_ack_connect",
 ];

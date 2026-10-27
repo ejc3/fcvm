@@ -388,6 +388,10 @@ async fn apply_restore_epoch(
     restore_hook: Option<&str>,
     gpus: &[String],
 ) {
+    // Test-only hold between the watcher's read of the restore document and the
+    // restore sequence: a guest that stalls here, as one paging its memory in from a
+    // cold file does, must still step its clock to the host's (issue 1375).
+    failpoint::hit_async("restore.post_epoch_read").await;
     if let Err(error) = signals.restore_status.begin() {
         eprintln!(
             "[fc-agent] FATAL: cannot begin clone restore (epoch={}): {:#}; \
