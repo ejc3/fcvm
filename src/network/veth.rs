@@ -370,7 +370,75 @@ pub async fn create_tap_in_ns(ns_name: &str, tap_name: &str) -> Result<()> {
         );
     }
 
+    spread_tap_receive(ns_name, tap_name).await;
     Ok(())
+}
+
+/// The `rps_cpus` mask naming CPUs 0 to `cpus - 1`: hexadecimal words of 32 CPUs,
+/// most significant first, separated by commas, as sysfs writes it.
+pub fn rps_mask(cpus: usize) -> String {
+    let cpus = cpus.max(1);
+    let words = cpus.div_ceil(32);
+    (0..words)
+        .rev()
+        .map(|w| {
+            let n = (cpus - w * 32).min(32);
+            let v: u32 = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
+            if w == words - 1 {
+                format!("{v:x}")
+            } else {
+                format!("{v:08x}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Process what the guest sends on every host CPU (RPS on the TAP's receive queue).
+///
+/// A frame the VMM writes to the TAP is otherwise carried through the whole host path
+/// (the bridge, the veth, routing, and the software segmentation that ENA's lack of TSO
+/// leaves to the kernel) inside that `write`, on the VMM's one device event-loop thread,
+/// which caps the VM's egress. Measured on a g4dn.metal, eight 4-vCPU routed VMs each
+/// streaming to 750 TLS clients: the busiest event-loop thread went from 100% to 62%, and
+/// the worst client's frame delay (95th percentile) from 799 ms to 41 ms.
+///
+/// A kernel without RPS has no `rps_cpus`; the VM still works, with its egress on the
+/// event-loop thread, so a failure is logged and not returned.
+pub async fn spread_tap_receive(ns_name: &str, tap_name: &str) {
+    // SAFETY: sysconf has no preconditions.
+    let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
+    let mask = rps_mask(usize::try_from(cpus).unwrap_or(1));
+    let path = format!("/sys/class/net/{tap_name}/queues/rx-0/rps_cpus");
+    match exec_in_namespace(
+        ns_name,
+        &[
+            "sh",
+            "-c",
+            "printf '%s\\n' \"$1\" > \"$2\"",
+            "sh",
+            &mask,
+            &path,
+        ],
+    )
+    .await
+    {
+        Ok(o) if o.status.success() => {
+            debug!(namespace = %ns_name, tap = %tap_name, %mask, "RPS on the TAP's receive queue");
+        }
+        Ok(o) => warn!(
+            namespace = %ns_name,
+            tap = %tap_name,
+            stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+            "could not set RPS on the TAP; its egress stays on the VMM's event-loop thread"
+        ),
+        Err(e) => warn!(
+            namespace = %ns_name,
+            tap = %tap_name,
+            error = %e,
+            "could not set RPS on the TAP; its egress stays on the VMM's event-loop thread"
+        ),
+    }
 }
 
 /// Connects TAP device to veth interface via bridge inside namespace
@@ -998,6 +1066,16 @@ mod parse_tests {
     use super::*;
 
     #[test]
+    fn rps_mask_names_every_cpu_in_32_bit_words() {
+        assert_eq!(rps_mask(1), "1");
+        assert_eq!(rps_mask(4), "f");
+        assert_eq!(rps_mask(32), "ffffffff");
+        assert_eq!(rps_mask(33), "1,ffffffff");
+        assert_eq!(rps_mask(96), "ffffffff,ffffffff,ffffffff");
+        assert_eq!(rps_mask(100), "f,ffffffff,ffffffff,ffffffff");
+    }
+
+    #[test]
     fn exact_ip_on_managed_veth_matches() {
         let line = "4: veth0-vm-abc12345    inet 172.30.0.1/30 brd 172.30.0.3 scope global veth0-vm-abc12345";
         assert!(line_has_exact_ip_on_managed_veth(line, "172.30.0.1"));
@@ -1128,6 +1206,24 @@ mod tests {
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains(tap_name));
+
+        // Its receive queue (what the guest sends) is spread over every CPU, so the
+        // host's forwarding of a VM's egress does not run on the VMM's event-loop thread.
+        let path = format!("/sys/class/net/{tap_name}/queues/rx-0/rps_cpus");
+        let output = exec_in_namespace(ns_name, &["cat", &path]).await.unwrap();
+        assert!(output.status.success(), "{path} is readable");
+        // SAFETY: sysconf has no preconditions.
+        let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) } as usize;
+        let want = rps_mask(cpus);
+        let got = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // sysfs pads the mask to the kernel's CPU count (nr_cpu_ids), with zero words
+        // before ours
+        let got_tail = got.trim_start_matches(['0', ',']);
+        assert_eq!(
+            got_tail,
+            want.trim_start_matches(['0', ',']),
+            "rps_cpus is {got}"
+        );
 
         // Cleanup
         delete_namespace(ns_name).await.unwrap();
