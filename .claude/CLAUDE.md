@@ -195,8 +195,10 @@ On the arm64 `nested` (NV2) profile the Firecracker fork freezes the guest's
 counters while a VM is paused, so a resumed source was behind the host by the
 pause (1.56 s after a 1.6 s pause) until chronyd slewed or stepped it back. Every
 reopen after a pause now passes the host's clock (`resume_paused_source`,
-`src/commands/common.rs`) and the guest steps to it before the gate lets chronyd's
-polls out (`resume_source_network`), so chronyd never measures the lag. The step is
+`src/commands/common.rs`). The guest (`resume_source_network`) takes chronyd offline
+while the gate still rejects its polls, opens the gate, steps the clock, and brings
+chronyd back online, so chronyd never measures the lag and a workload timer the step
+expires reconnects through an open gate. The step is
 forward only (`bootplan::advance_system_clock`): the host's instant is a lower bound
 on the present, and the `default` profile keeps the clock running through a pause.
 `test_source_clock_matches_the_host_after_snapshot_create` measures it;

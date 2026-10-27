@@ -646,10 +646,26 @@ fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<Stri
 /// gate's egress half is open, because a poll the gate rejected leaves chronyd
 /// waiting its whole poll interval (up to 1024 s) to measure again.
 async fn chrony_burst() {
-    let _ = tokio::process::Command::new("chronyc")
-        .args(["burst", "4/4"])
+    if let Err(error) = chronyc(&["burst", "4/4"]).await {
+        eprintln!("[fc-agent] WARNING: {error:#}");
+    }
+}
+
+/// Run one chronyc command and fail unless chronyd accepted it.
+async fn chronyc(args: &[&str]) -> Result<()> {
+    let out = tokio::process::Command::new("/usr/bin/chronyc")
+        .args(args)
         .output()
-        .await;
+        .await
+        .with_context(|| format!("running chronyc {}", args.join(" ")))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "chronyc {} failed ({}): {}",
+        args.join(" "),
+        out.status,
+        String::from_utf8_lossy(&out.stdout).trim()
+    );
+    Ok(())
 }
 
 /// The ICMP reply a UDP REJECT sends, by the family of `loopback_network`.
@@ -1875,22 +1891,38 @@ pub fn resume_host_time(args: &[String]) -> Option<&str> {
 /// `host_time` when the host passed one.
 ///
 /// Where the VMM freezes the guest's clock while the VM is paused (the arm64 `nested`
-/// profile), a resumed source is behind the host by the length of the pause. The step
-/// goes in before the gate reopens:
-/// until then the gate rejects chronyd's polls (`gate_chain_rules`), so chronyd has
-/// measured nothing since the resume and keeps no correction for the lag. Its first
-/// measurement afterwards, the burst below, is taken against the stepped clock. The
-/// step is a restored clone's (`bootplan::set_system_clock`), forward only
+/// profile), a resumed source is behind the host by the length of the pause.
+///
+/// The order around the step:
+/// 1. chronyd is taken offline (`chronyc offline`) while the gate still rejects its
+///    polls (`gate_chain_rules`), so it has measured nothing since the resume.
+/// 2. The gate opens.
+/// 3. The clock steps. A workload timer the step expires reconnects through an open
+///    gate, not into the gate's TCP reset.
+/// 4. chronyd comes back online and is asked for a burst, so every measurement it
+///    makes after the pause is against the stepped clock and it keeps no correction
+///    for the lag.
+///
+/// The step is a restored clone's (`bootplan::set_system_clock`), forward only
 /// (`bootplan::advance_system_clock`), because the source's clock may not have stopped.
 /// A clone also replaces its chronyd, because the daemon it inherits may have
 /// measured a lag before the snapshot, and the source's daemon has not. A failed step
-/// is logged and does not stop the reopen.
+/// or chronyc call is logged and does not stop the reopen.
 pub async fn resume_source_network(host_time: Option<&str>) -> Result<()> {
     let started = std::time::Instant::now();
     let _transaction_lock = acquire_boundary_lock()?;
-    if let Some(host_time) = host_time {
-        crate::bootplan::advance_system_clock(host_time, started.elapsed());
-    }
+    let chronyd_offline = match host_time {
+        Some(_) => match chronyc(&["offline"]).await {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!(
+                    "[fc-agent] WARNING: {error:#}; stepping the clock with chronyd as it is"
+                );
+                false
+            }
+        },
+        None => false,
+    };
     let gate = IptablesGate::new(SystemCommandRunner);
     let store = FileManifestStore::default();
     // No routes to read back: the boundary never takes the link down, so it
@@ -1905,6 +1937,14 @@ pub async fn resume_source_network(host_time: Option<&str>) -> Result<()> {
     let reopened = reopen_with(&gate)
         .await
         .context("reopening source VM network");
+    if let Some(host_time) = host_time {
+        crate::bootplan::advance_system_clock(host_time, started.elapsed());
+    }
+    if chronyd_offline {
+        if let Err(error) = chronyc(&["online"]).await {
+            eprintln!("[fc-agent] WARNING: {error:#}; chronyd stays offline until set online");
+        }
+    }
     let retired = store
         .remove()
         .context("retiring source snapshot network manifest after publication");
@@ -1927,7 +1967,8 @@ pub async fn resume_source_network(host_time: Option<&str>) -> Result<()> {
          (link never taken down)"
     );
     // A poll the gate rejected would leave chronyd waiting its whole interval.
-    tokio::spawn(chrony_burst());
+    // Awaited: a task spawned here dies with this one-shot's runtime when it returns.
+    chrony_burst().await;
     // The snapshot reset the vsock transport under the running agent's output writer,
     // which reconnects only when asked; nothing else asks a resumed source.
     if let Err(error) = crate::output::request_reconnect() {
@@ -2929,16 +2970,17 @@ mod tests {
             .find("source VM snapshot network reopened")
             .expect("the source no longer reports its reopened gate");
         let burst = body
-            .find("tokio::spawn(chrony_burst())")
+            .find("chrony_burst().await")
             .expect("the source no longer asks chronyd to measure after its gate reopens");
         assert!(reopened < burst, "reopened={reopened} burst={burst}");
     }
 
-    /// The source's clock is set to the host's before its gate reopens: until then
-    /// the gate rejects chronyd's polls, so chronyd cannot have measured the pause's
-    /// lag and started correcting it on top of the step.
+    /// chronyd goes offline while the gate still rejects its polls, so it cannot
+    /// have measured the pause's lag; the gate opens before the clock steps, so a
+    /// workload timer the step expires does not reconnect into the gate's reset; and
+    /// chronyd comes back online only after the step.
     #[test]
-    fn the_source_steps_its_clock_before_its_gate_reopens() {
+    fn the_source_steps_its_clock_between_the_reopen_and_chronyd_coming_back() {
         let source = include_str!("snapshot_network.rs");
         let start = source
             .find("pub async fn resume_source_network(")
@@ -2947,13 +2989,22 @@ mod tests {
             .find("\n}\n")
             .expect("resume_source_network has a closing brace");
         let body = &source[start..start + len];
-        let step = body
-            .find("crate::bootplan::advance_system_clock(host_time, started.elapsed())")
-            .expect("the source no longer steps its clock to the host's");
+        let offline = body
+            .find("chronyc(&[\"offline\"])")
+            .expect("the source no longer takes chronyd offline around the step");
         let reopen = body
             .find("reopen_with(&gate)")
             .expect("the source no longer reopens its gate");
-        assert!(step < reopen, "step={step} reopen={reopen}");
+        let step = body
+            .find("crate::bootplan::advance_system_clock(host_time, started.elapsed())")
+            .expect("the source no longer steps its clock to the host's");
+        let online = body
+            .find("chronyc(&[\"online\"])")
+            .expect("the source no longer brings chronyd back online");
+        assert!(
+            offline < reopen && reopen < step && step < online,
+            "offline={offline} reopen={reopen} step={step} online={online}"
+        );
     }
 
     #[test]

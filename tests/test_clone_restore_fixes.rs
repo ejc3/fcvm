@@ -234,8 +234,11 @@ async fn test_source_clock_matches_the_host_after_snapshot_create() -> Result<()
     }
     .await;
     common::kill_process(baseline_pid).await;
+    // Nothing restores this snapshot; a create that never ran leaves nothing to delete.
+    let deleted = common::delete_snapshot(&snapshot_name).await;
 
     let worst = measured?;
+    deleted?;
     assert!(
         worst <= CLOCK_TOLERANCE.as_secs_f64(),
         "the snapshot's source was {:.1} ms off the host's clock after `snapshot create` \
