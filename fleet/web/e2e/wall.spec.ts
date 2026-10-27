@@ -341,8 +341,10 @@ test("hovering the image fades in every seam, outlines the tile and labels it, o
   const label = page.getByTestId("hover-label");
   await expect(label).toContainText("EC2 VM 3");
   await expect(label).toContainText("Tesla T4");
-  await expect(label).toContainText("g4dn.xlarge");
-  await expect(label).toContainText(/no restart yet|last restart \d/);
+  // The public place, never the host or instance name (#1366).
+  await expect(label).toContainText("EC2 in mock-region");
+  await expect(label).not.toContainText("mock-i-");
+  await expect(label).toContainText(/launch time not recorded|last restart \d/);
   // Under the seam's own labels: the hover label covers none of them.
   const top = v.tiles.find((x) => x.id === "fcvm:2")!;
   await page.mouse.move(top.box!.x + top.box!.w / 2, top.box!.y + 12);
