@@ -1,0 +1,72 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>broadcast measure</title>
+<video id="v" playsinline muted autoplay style="width:640px"></video>
+<script src="https://player.live-video.net/1.57.0/amazon-ivs-player.min.js"></script>
+<script>
+// Measures an IVS low-latency stream whose frames carry {"t","e"} SEI (the fcvm broadcast,
+// fleet/PROTOCOL.md "Pushing to a live ingest"): startup (load to the first SEI, to PLAYING,
+// to the first presented frame) and glass-to-glass latency per presented frame (its display
+// time minus its wall time e + 1000 t). `latency` is the coarser SEI-event time.
+const q = new URLSearchParams(location.search);
+const url = q.get("url"), cycles = +(q.get("cycles") || 3), secs = +(q.get("secs") || 60);
+const report = (o) => fetch("/report", {method: "POST", body: JSON.stringify(o)});
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function cycle(n) {
+  const video = document.getElementById("v");
+  const p = IVSPlayer.create();
+  p.attachHTMLVideoElement(video);
+  p.setMuted(true);
+  const t0 = performance.now();
+  const r = {cycle: n, startup: {}, latency: [], frame_latency: [], live_latency: [], sei: 0, rendition: null, errors: []};
+  const byTs = new Map();  // SEI timestamp (media time, ms) -> wall time of its frame
+  p.addEventListener(IVSPlayer.PlayerState.PLAYING, () => { r.startup.playing_ms ??= performance.now() - t0; });
+  p.addEventListener(IVSPlayer.PlayerEventType.ERROR, (e) => r.errors.push(String(e && e.message || e)));
+  p.addEventListener(IVSPlayer.MetadataEventType.SEI, (ev) => {
+    const now = Date.now();
+    try {
+      const m = JSON.parse(new TextDecoder().decode(ev.data));
+      r.sei++;
+      r.startup.sei_ms ??= performance.now() - t0;
+      r.latency.push(now - (m.e + 1000 * m.t));
+      // The SEI's timestamp is the frame's media time (seconds), the video element's own.
+      byTs.set(Math.round(ev.timestamp * 1000), m.e + 1000 * m.t);
+      if (byTs.size > 600) byTs.delete(byTs.keys().next().value);
+    } catch (e) { r.errors.push("sei: " + e); }
+  });
+  // Each presented frame's own latency: displayed at expectedDisplayTime, drawn for wall
+  // time e + 1000 t (its SEI, matched by media time). SEI events can arrive just after
+  // the frame they name, so a frame is matched up to 0.5 s later.
+  const pend = [];
+  let callback = 0;
+  const onFrame = (_now, md) => {
+    r.startup.frame_ms ??= performance.now() - t0;
+    pend.push([Math.round(md.mediaTime * 1000), performance.timeOrigin + md.expectedDisplayTime, performance.now()]);
+    while (pend.length && (byTs.has(pend[0][0]) || performance.now() - pend[0][2] > 500)) {
+      const [mt, shown] = pend.shift();
+      const w = byTs.get(mt);
+      if (w !== undefined) r.frame_latency.push([performance.now() - t0, Math.round(shown - w)]);
+    }
+    callback = video.requestVideoFrameCallback(onFrame);
+  };
+  callback = video.requestVideoFrameCallback(onFrame);
+  p.load(url);
+  p.play();
+  const end = performance.now() + secs * 1000;
+  while (performance.now() < end) {
+    await sleep(1000);
+    const l = p.getLiveLatency();
+    if (Number.isFinite(l) && l > 0) r.live_latency.push(Math.round(l * 1000));
+    const qq = p.getQuality();
+    r.rendition = qq ? `${qq.name} ${qq.width}x${qq.height} ${qq.bitrate}` : null;
+  }
+  // The <video> outlives the cycle: its callback must not.
+  video.cancelVideoFrameCallback(callback);
+  p.delete();
+  await report(r);
+}
+(async () => {
+  for (let n = 0; n < cycles; n++) { await cycle(n); await sleep(3000); }
+  await report({done: true});
+})();
+</script>
