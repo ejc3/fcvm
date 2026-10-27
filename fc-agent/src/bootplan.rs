@@ -98,13 +98,55 @@ pub async fn fetch_metadata(transport: Transport) -> Result<LatestMetadata> {
     }
 }
 
-/// Step the VM clock at boot to the host's, read over vsock on both transports.
+/// How many times [`sync_clock_from_host`] reads the host's clock. It steps to the
+/// reading with the shortest round trip.
+const HOST_CLOCK_READINGS: usize = 3;
+
+/// One reading of the host's clock from the boot-plan listener.
+struct HostClockReading {
+    /// The document's "host-time-ns".
+    host_time_ns: String,
+    /// When the guest finished reading the document.
+    read: std::time::Instant,
+    /// From the guest's connect to the end of its read. The host stamped its clock
+    /// inside this interval, so a step to the stamp plus the time since `read` is
+    /// behind the host by at most this much.
+    round_trip: std::time::Duration,
+}
+
+async fn read_host_clock() -> Result<HostClockReading> {
+    let started = std::time::Instant::now();
+    let doc = read_vsock_doc().await?;
+    let read = std::time::Instant::now();
+    let meta: LatestMetadata =
+        serde_json::from_value(doc).context("parsing host-time from vsock boot plan")?;
+    Ok(HostClockReading {
+        host_time_ns: meta.host_time_ns,
+        read,
+        round_trip: read - started,
+    })
+}
+
+/// The reading with the shortest round trip, whose stamp is the closest to its read.
+fn closest_reading(readings: Vec<HostClockReading>) -> Option<HostClockReading> {
+    readings
+        .into_iter()
+        .min_by_key(|reading| reading.round_trip)
+}
+
+/// Step the VM clock to the host's, read over vsock on both transports. Used at boot
+/// and by a restored clone right before its step (`restore::handle_clone_restore`).
 ///
 /// The host binds the boot-plan listener for every backend and stamps its clock at
-/// each accept, so the value is at most one vsock round trip old when the guest
-/// steps to it. The MMDS copy of the plan is stamped while the host builds it, before
+/// each accept, so a reading is at most one vsock round trip old when the guest
+/// steps to it. Of [`HOST_CLOCK_READINGS`] readings the one with the shortest round
+/// trip is used: a guest that stalls during one (a restore paging its memory in from
+/// a cold file) would otherwise step behind by the stall. A failed reading ends the
+/// sampling; this fails only when no reading succeeded.
+///
+/// The MMDS copy of the plan is stamped while the host builds it, before
 /// the VM boots; a guest that stepped to it came up 0.86 to 1.14 s behind the host
-/// (issue 1354). This runs before fc-agent starts its own chronyd, so the daemon
+/// (issue 1354). At boot this runs before fc-agent starts its own chronyd, so the daemon
 /// measures the stepped clock and has no correction to make for the boot.
 ///
 /// The step goes both ways (`set_system_clock`, not `advance_system_clock`). Before it,
@@ -112,11 +154,26 @@ pub async fn fetch_metadata(transport: Transport) -> Result<LatestMetadata> {
 /// `rtc_hctosys` adds half a second, so it can be up to 0.5 s ahead of the host, and a
 /// forward-only step left one boot 367 ms ahead.
 pub async fn sync_clock_from_host() -> Result<()> {
-    let doc = read_vsock_doc().await?;
-    let read = std::time::Instant::now();
-    let meta: LatestMetadata =
-        serde_json::from_value(doc).context("parsing host-time from vsock boot plan")?;
-    set_system_clock(&meta.host_time_ns, read.elapsed());
+    let mut readings = Vec::with_capacity(HOST_CLOCK_READINGS);
+    let mut failure = None;
+    for _ in 0..HOST_CLOCK_READINGS {
+        match read_host_clock().await {
+            Ok(reading) => readings.push(reading),
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+    let round_trips: Vec<_> = readings.iter().map(|r| r.round_trip).collect();
+    let Some(reading) = closest_reading(readings) else {
+        return Err(failure.unwrap_or_else(|| anyhow::anyhow!("no host clock reading taken")));
+    };
+    eprintln!(
+        "[fc-agent] host clock round trips {round_trips:?}; stepping to the {:?} one",
+        reading.round_trip
+    );
+    set_system_clock(&reading.host_time_ns, reading.read.elapsed());
     Ok(())
 }
 
@@ -274,10 +331,26 @@ mod clock_tests {
         let end = source[start..].find("\n}\n").unwrap() + start;
         let body = &source[start..end];
         assert!(
-            body.contains("set_system_clock(&meta.host_time_ns")
+            body.contains("set_system_clock(&reading.host_time_ns")
                 && !body.contains("advance_system_clock("),
             "the boot clock step must go both ways: {body}"
         );
+    }
+
+    /// The step uses the reading with the shortest round trip: the host stamped its
+    /// clock inside the round trip, so that reading's stamp is the closest to its read.
+    #[test]
+    fn the_step_uses_the_reading_with_the_shortest_round_trip() {
+        let now = std::time::Instant::now();
+        let reading = |ns: &str, ms: u64| HostClockReading {
+            host_time_ns: ns.to_string(),
+            read: now,
+            round_trip: std::time::Duration::from_millis(ms),
+        };
+        let best = closest_reading(vec![reading("1", 130), reading("2", 1), reading("3", 4)])
+            .expect("three readings");
+        assert_eq!(best.host_time_ns, "2");
+        assert!(closest_reading(Vec::new()).is_none());
     }
 
     /// The source's step never moves its clock back: the host's instant plus the

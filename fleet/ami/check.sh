@@ -226,6 +226,24 @@ grep -qx 'DefaultDependencies=no' "$su" &&
 # as the store is restored, without waiting for the user data's `systemctl start`.
 sed -n '/^prep)/,/;;/p' fleet/ami/host/build.sh | grep -qE '^  systemctl enable .*fcvm-fleet-agent\.service' ||
   no "host/build.sh prep does not enable fcvm-fleet-agent.service"
+# The prefetch must start before the network and the store (it competes with nothing that
+# waits on it), and the image must enable it.
+grep -qx 'DefaultDependencies=no' fleet/ami/host/fcvm-fleet-prefetch.service &&
+  grep -qx 'After=local-fs.target' fleet/ami/host/fcvm-fleet-prefetch.service ||
+  no "fcvm-fleet-prefetch.service must start once local file systems are up (DefaultDependencies=no)"
+sed -n '/^prep)/,/;;/p' fleet/ami/host/build.sh | grep -qE '^  systemctl enable .*fcvm-fleet-prefetch\.service' ||
+  no "host/build.sh prep does not enable fcvm-fleet-prefetch.service"
+# prefetch.sh reads every listed file in 1 MiB pieces (a file of 2 MiB and one byte is three
+# pieces) and skips a listed file the image lacks.
+pf=$(mktemp -d)
+head -c $((2 * 1048576 + 1)) /dev/zero > "$pf/a"
+printf '%s\n%s\n' "$pf/a" "$pf/missing" > "$pf/list"
+mkdir "$pf/bin"
+printf '#!/bin/sh\necho "$@" >> %s/dd.log\n' "$pf" > "$pf/bin/dd" && chmod +x "$pf/bin/dd"
+out=$(PATH="$pf/bin:$PATH" bash fleet/ami/host/prefetch.sh "$pf/list" 2>&1) || no "prefetch.sh failed: $out"
+[ "$(sort "$pf/dd.log" 2>/dev/null | grep -c "if=$pf/a ")" = 3 ] || no "prefetch.sh did not read 3 pieces of a 2 MiB + 1 byte file: $(cat "$pf/dd.log" 2>/dev/null)"
+grep -q missing "$pf/dd.log" 2>/dev/null && no "prefetch.sh read a file that does not exist"
+rm -rf "$pf"
 
 [ "$fail" = 0 ] && echo "fleet/ami checks: ok"
 exit "$fail"

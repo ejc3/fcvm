@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "../src/budget.h"
+#include "../src/params.h"
 #include "../src/font_sdf.h"
 #include "../src/jpeg.h"
 #include "../src/json.h"
@@ -69,7 +70,56 @@ static Scene two_holds() {
   return s;
 }
 
+// The own-GPU autopilot (fleet/core/src/autopilot.rs) as the coordinator hands it to a
+// renderer: fleet/core/tests/autopilot_lap.json holds one lap of keyframes, the same
+// path paused part way, and the pose the coordinator computes at every quarter second.
+// The coordinator starts a pause or a drag from the pose it computes, so it must be the
+// pose this renderer draws; and the eye must clear the ground by more than the 60 m the
+// renderer would otherwise lift it, which would move the camera off the path.
+static void check_autopilot_lap() {
+  std::string me = __FILE__;
+  std::string dir = me.substr(0, me.find_last_of('/') + 1);
+  std::ifstream f(dir + "../../core/tests/autopilot_lap.json");
+  std::stringstream ss;
+  ss << f.rdbuf();
+  CHECK(f.good() && ss.str().size() > 0, "fleet/core/tests/autopilot_lap.json is readable");
+  if (ss.str().empty()) return;
+  Json j = Json::parse(ss.str());
+  const V4* tab = host_noise().tab.data();
+  double min_clear = 1e9, worst_t = 0, max_err = 0;
+  int samples = 0;
+  for (const char* part : {"lap", "paused"}) {
+    std::vector<Keyframe> kf;
+    for (const Json& k : j.at(part).at("camera").array("camera")) {
+      Keyframe x{};
+      x.t = k.at("t").number("t");
+      for (int c = 0; c < 3; c++) {
+        x.pos[c] = k.at("pos").arr[c].num;
+        x.look[c] = k.at("look").arr[c].num;
+      }
+      x.fov_deg = k.at("fov_deg").number("fov_deg");
+      kf.push_back(x);
+    }
+    for (const Json& s : j.at(part).at("samples").array("samples")) {
+      double t = s.at("t").number("t");
+      CamPose p = camera_at(kf, t);
+      for (int c = 0; c < 3; c++) {
+        max_err = std::max(max_err, std::fabs(p.pos[c] - s.at("pos").arr[c].num));
+        max_err = std::max(max_err, std::fabs(p.look[c] - s.at("look").arr[c].num));
+      }
+      max_err = std::max(max_err, std::fabs(p.fov_deg - s.at("fov_deg").number("fov_deg")));
+      double ground = std::max(0.0, (double)surface_h(v2((float)p.pos[0], (float)p.pos[2]), 9, tab));
+      if (p.pos[1] - ground < min_clear) { min_clear = p.pos[1] - ground; worst_t = t; }
+      samples++;
+    }
+  }
+  CHECK(samples > 200, "%d samples", samples);
+  CHECK(max_err < 1e-9, "the coordinator's camera differs from the renderer's by %g", max_err);
+  CHECK(min_clear > 0.15, "the eye is %.3f km above the ground at t=%.2f", min_clear, worst_t);
+}
+
 int main() {
+  check_autopilot_lap();
   // --- WebSocket handshake (RFC 6455 section 1.3 example)
   CHECK(ws_accept("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "got %s",
         ws_accept("dGhlIHNhbXBsZSBub25jZQ==").c_str());
@@ -181,6 +231,47 @@ int main() {
           "fractional epoch rejected");
     CHECK(bad(R"({"epoch_unix_ms":0,"rect":{"x":0,"y":0,"w":1,"h":1},"image_aspect":1.7,"camera":[{"t":0,"pos":[0,1],"look":[0,1,1],"fov_deg":60}],"time_of_day":0.5})"),
           "pos with 2 numbers rejected");
+  }
+
+  // --- weather: keys parsed, eased between them, held outside them, in the hold key
+  {
+    const char* head = R"({"epoch_unix_ms":0,"rect":{"x":0,"y":0,"w":1,"h":1},"image_aspect":1.7778,
+        "camera":[{"t":0,"pos":[0,1,0],"look":[0,1,1],"fov_deg":60}],"time_of_day":0.5,"weather":)";
+    auto with = [&](const char* w) { return std::string(head) + w + "}"; };
+    Scene s = parse_scene(with(R"([{"t":10,"cover":1,"towers":1,"rays":1,"snow_line_km":0.5},{"t":0}])"));
+    CHECK(s.weather.size() == 2 && s.weather[0].t == 0 && s.weather[1].towers == 1, "weather keys sorted by t");
+    CHECK(s.weather[0].cover == 0.5 && s.weather[0].towers == 0 && s.weather[0].rays == 0 && s.weather[0].snow_line_km == 1.6,
+          "absent weather fields take the defaults");
+    WeatherKey m = weather_at(s.weather, 5), a = weather_at(s.weather, -3), b = weather_at(s.weather, 99);
+    CHECK(std::fabs(m.cover - 0.75) < 1e-12 && std::fabs(m.snow_line_km - 1.05) < 1e-12, "halfway eases halfway");
+    WeatherKey q = weather_at(s.weather, 2.5);
+    CHECK(q.towers > 0.0 && q.towers < 0.25, "eased, not linear, a quarter of the way (%g)", q.towers);
+    CHECK(a.cover == 0.5 && b.cover == 1 && b.rays == 1, "held before the first and after the last key");
+    CHECK(weather_at({}, 3).cover == 0.5 && weather_at({}, 3).snow_line_km == 1.6, "no keys: the defaults");
+    auto bad = [&](const char* w) {
+      try { parse_scene(with(w)); } catch (const std::exception&) { return true; }
+      return false;
+    };
+    CHECK(bad(R"([{"t":0,"cover":1.5}])") && bad(R"([{"t":0,"snow_line_km":-1}])") && bad(R"([{"cover":0.2}])") &&
+              bad(R"({"t":0})"),
+          "out-of-range field, missing t and a non-array refused");
+    // a held frame's key and parameters follow the weather at the hold's start
+    Scene h = s;
+    h.camera = {Keyframe{0, {0, 1, 0}, {0, 1, 1}, 60}, Keyframe{100, {0, 1, 0}, {0, 1, 1}, 60}};
+    Tile tl = tile_geometry(Rect{}, 16.0 / 9.0, 90);
+    uint64_t k1, k2;
+    bool held;
+    FrameParams p1 = build_frame(h, tl, 20, &k1, &held);
+    CHECK(held && p1.cloud_cover == 0.5f && p1.cloud_top == 5.6f && p1.snow_line == 1.6f, "a hold draws its start's weather");
+    Scene h2 = h;
+    h2.weather[0].cover = 0.2;
+    build_frame(h2, tl, 20, &k2, &held);
+    CHECK(k1 != k2, "the weather is in the hold key");
+    Scene mv = s;
+    mv.camera = {Keyframe{0, {0, 1, 0}, {0, 1, 1}, 60}, Keyframe{100, {5, 1, 0}, {5, 1, 1}, 60}};
+    FrameParams p2 = build_frame(mv, tl, 10, &k2, &held);
+    CHECK(!held && p2.cloud_cover == 1.0f && std::fabs(p2.cloud_top - 9.6f) < 1e-5f && p2.rays == 1.0f && p2.snow_line == 0.5f,
+          "a moving frame draws the weather at its own time");
   }
 
   // --- camera: keyframes are hit exactly, outside the range the nearest holds, holds detected
@@ -349,6 +440,100 @@ int main() {
     CHECK(std::fabs(f2 - (0.7 * fslot - 4.0) / 3e-5) < 1000, "high-quality fit from its own cost (%.0f)", f2);
     // and the frame it predicts lands at 70% of the slot
     CHECK(std::fabs(4.0 + f2 * 3e-5 - 0.7 * fslot) < 0.05, "predicted frame at the target");
+  }
+  {
+    // The height a tile draws (HeightGuard). Staging, 2026-10-27: one viewer
+    // opened a 16:9 terrain tile, which asked its renderer for 720 against the
+    // wall's 432. Its frames took 36 ms (render 29 ms and two encodes) at the
+    // lowest budget, so it drew every other slot and the wall, held to one
+    // scene time, drew at 15 to 19 fps. A frame here costs 33 ns per drawn
+    // pixel (14.5 ms at 432, the same tile's wall frames); a sky tile 16 ns.
+    const double fslot = 1000.0 / 30;
+    Rect r16{0.25, 0.5, 0.25, 0.25};
+    auto px = [&](int h) {  // Renderer::drawn_pixels with the 16 px stream overlap
+      Tile t = tile_geometry(r16, 16.0 / 9, h);
+      int g = (int)std::ceil(GUARD_FRAC * t.full_h) + 2 + DENOISE_R + 16;
+      return (double)(t.w + 2 * g) * (t.h + 2 * g);
+    };
+    // run the frame clock for `secs`: each frame takes ns_px * drawn pixels,
+    // and a frame longer than a slot skips the slots it overran
+    struct Run { long long frames = 0, skipped = 0, skipped_late = 0; int last_h = 0; };
+    auto run = [&](HeightGuard& g, std::vector<int> asked, double ns_px, double t0, double secs) {
+      Run o;
+      double t = t0;
+      while (t < t0 + secs) {
+        int h = g.choose(asked, px, t);
+        double ms = ns_px * 1e-6 * px(h);
+        long long slots = std::max(1LL, (long long)std::ceil(ms / fslot - 1e-9));
+        g.observe(t, h, ms);
+        o.frames++;
+        o.skipped += slots - 1;
+        if (t >= t0 + 1.5) o.skipped_late += slots - 1;
+        o.last_h = h;
+        t += slots * fslot / 1000.0;
+      }
+      return o;
+    };
+    // the terrain tile: drawn at the wall's height for a minute, then a viewer opens it
+    HeightGuard g;
+    Run wall = run(g, {432}, 33.0, 0, 60);
+    CHECK(wall.skipped == 0 && wall.last_h == 432, "the wall tile alone draws every slot (%lld skipped)", wall.skipped);
+    Run open = run(g, {432, 720}, 33.0, 60, 60);
+    CHECK(open.skipped_late == 0, "an opened terrain tile keeps every wall slot (%lld of %lld skipped after 1.5 s)",
+          open.skipped_late, open.frames + open.skipped);
+    CHECK(open.last_h == 432, "it draws at the wall's height and scales the opened stream up (drew %d)", open.last_h);
+    // a fresh renderer asked for both at once tries the taller and steps down within 1.5 s
+    HeightGuard f;
+    Run fresh = run(f, {432, 720}, 33.0, 0, 30);
+    CHECK(fresh.skipped <= 30 && fresh.skipped_late == 0 && fresh.last_h == 432,
+          "a fresh terrain tile steps down within 1.5 s (%lld skipped, %lld after 1.5 s, drew %d)", fresh.skipped,
+          fresh.skipped_late, fresh.last_h);
+    // and does not try 720 again while the view stays as costly
+    Run later = run(f, {432, 720}, 33.0, 30, 120);
+    CHECK(later.skipped == 0 && later.last_h == 432, "no retry while 720 is predicted over its slot (%lld skipped)",
+          later.skipped);
+    // a sky tile affords 720: it draws the opened stream at its own height
+    HeightGuard s;
+    run(s, {432}, 16.0, 0, 30);
+    Run sky = run(s, {432, 720}, 16.0, 30, 30);
+    CHECK(sky.last_h == 720 && sky.skipped == 0, "a sky tile draws 720 (drew %d, %lld skipped)", sky.last_h, sky.skipped);
+    // a view that turns costly while drawing 720 steps down; once cheap again, 720 comes back after the backoff
+    Run turn = run(s, {432, 720}, 33.0, 60, 20);
+    CHECK(turn.last_h == 432 && turn.skipped_late == 0, "costly view: back to 432 (drew %d, %lld skipped after 1.5 s)",
+          turn.last_h, turn.skipped_late);
+    Run cheap = run(s, {432, 720}, 16.0, 80, 30);
+    CHECK(cheap.last_h == 432, "720 is not drawn again within the backoff (drew %d)", cheap.last_h);
+    Run back = run(s, {432, 720}, 16.0, 110, 60);
+    CHECK(back.last_h == 720 && back.skipped == 0, "after the backoff it is (drew %d)", back.last_h);
+    // a tile too slow to draw min_frames frames in the 2 s window still steps down
+    // (Codex on #1380: 432 and 2160 asked, 2160 at about 3 fps)
+    HeightGuard crawl;
+    Run c = run(crawl, {432, 2160}, 33.0, 0, 6);
+    Run c2 = run(crawl, {432, 2160}, 33.0, 6, 20);
+    CHECK(c.last_h == 432 && c2.skipped == 0 && c2.last_h == 432,
+          "a 3 fps tile steps down (drew %d, then %lld skipped)", c2.last_h, c2.skipped);
+    // a renderer at another frame rate judges frames against its own slot
+    // (Codex on #1380: at FPS=60 a 20 ms 720 frame overruns every slot)
+    HeightGuard sixty;
+    sixty.slot_ms = 1000.0 / 60;
+    double t60 = 0;
+    for (int i = 0; i < 200; i++, t60 += 1.0 / 30) {  // 20 ms at 720 skips every other 60 fps slot
+      int h = sixty.choose({432, 720}, px, t60);
+      sixty.observe(t60, h, h == 720 ? 20.0 : 20.0 * px(432) / px(720));
+    }
+    CHECK(sixty.drawn() == 432, "a 60 fps renderer leaves a 20 ms height (drew %d)", sixty.drawn());
+    {
+      bool set = false;
+      for (auto& l : source_lines("../src/pipeline.cpp"))
+        set = set || l.find("height_guard_.slot_ms = 1000.0 / o.fps;") != std::string::npos;
+      CHECK(set, "the pipeline gives the height guard its own frame slot");
+    }
+    // a single asked height is drawn however slow (nothing lower to go to)
+    HeightGuard one;
+    Run solo = run(one, {720}, 33.0, 0, 5);
+    CHECK(solo.last_h == 720, "one height asked: drawn (%d)", solo.last_h);
+    // and nothing asked is 0
+    CHECK(one.choose({}, px, 10) == 0, "nothing asked");
   }
   {
     // The windowed fit: a camera path whose cost per sample swings 2x every

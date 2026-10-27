@@ -56,6 +56,7 @@ Pipeline::Pipeline(const Options& o) : opt_(o) {
   fit_scale_ = o.fit_scale;
   r_.set_fps(o.fps);
   r_.set_margin(o.margin);
+  height_guard_.slot_ms = 1000.0 / o.fps;
 }
 
 Pipeline::~Pipeline() {
@@ -497,9 +498,20 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     if (nowc < still_until_) render_h = encode_geometry(*sc, still_h_).h;
     else if (nowc < warm_until_) render_h = encode_geometry(*sc, warm_h_).h;
   }
+  // Draw at the tallest stream height whose frame fits a slot, and scale it to
+  // the taller streams (HeightGuard, budget.h): one slow tile holds the whole
+  // wall to its rate.
+  int drawn_h = 0;
   if (!encs_.empty()) {
-    render_h = encode_geometry(*sc, encs_.rbegin()->first / 4).h;
-    warm_h_ = encs_.rbegin()->first / 4;  // a later scene warms at the height last streamed
+    std::vector<int> asked;
+    for (auto& [ekey, e] : encs_)
+      if (asked.empty() || asked.back() != ekey / 4) asked.push_back(ekey / 4);
+    auto px_at = [&](int h) {
+      return r_.drawn_pixels(tile_geometry(sc->rect, sc->image_aspect, encode_geometry(*sc, h).h));
+    };
+    drawn_h = height_guard_.choose(asked, px_at, mono_s());
+    render_h = encode_geometry(*sc, drawn_h).h;
+    warm_h_ = drawn_h;  // a later scene warms at the height last streamed
   }
   Tile rt = tile_geometry(sc->rect, sc->image_aspect, render_h);
   double px = r_.drawn_pixels(rt);
@@ -750,10 +762,12 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     }
     for (auto& e : left) retire(e);
   }
+  if (!prime && drawn_h > 0) height_guard_.observe(mono_s(), drawn_h, r_.stats().render_ms + enc_ms);
   std::lock_guard<std::mutex> l(hmu_);
   last_t_ = t;
   frame_ = frame_no;
   heights_ = heights;
+  drawn_h_ = drawn_h;
   streams_ = streams;
   rstats_ = r_.stats();
   encode_ms_ = enc_ms;
@@ -809,7 +823,7 @@ std::string Pipeline::health_json() {
   o.precision(6);
   o << "{\"fps\":" << std::round(fps_ * 10) / 10 << ",\"heights\":[";
   for (size_t i = 0; i < heights_.size(); i++) o << (i ? "," : "") << heights_[i];
-  o << "],\"streams\":[";
+  o << "],\"drawn_h\":" << drawn_h_ << ",\"streams\":[";
   for (size_t i = 0; i < streams_.size(); i++)
     o << (i ? "," : "") << "{\"h\":" << streams_[i].first << ",\"q\":\"" << quality_name(streams_[i].second) << "\"}";
   o << "],\"gpu\":{\"name\":\"" << json_escape(g.ok ? g.name : gpu_name_) << "\"";

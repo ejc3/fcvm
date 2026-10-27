@@ -1,6 +1,6 @@
 import { expect, test, devices, type Page } from "@playwright/test";
 import { seconds, thousands, utcDate } from "../core/format.ts";
-import { DETAIL_TILE_PX, layoutMosaic, sheetClears, streamHeightFor, zoomTarget } from "../core/layout.ts";
+import { DETAIL_TILE_PX, layoutMosaic, streamHeightFor, zoomTarget } from "../core/layout.ts";
 import { ZOOM_DIM_NEAR, ZOOM_SHEET_W, zoomInsetsFor } from "../core/view.ts";
 import { streamBitrate } from "../core/bandwidth.ts";
 import { COORD, admin, fleetNow, focusError, mockState, openWall, raceOver, seamReport, setSkew, setTimeOfDay } from "./helpers.ts";
@@ -341,8 +341,10 @@ test("hovering the image fades in every seam, outlines the tile and labels it, o
   const label = page.getByTestId("hover-label");
   await expect(label).toContainText("EC2 VM 3");
   await expect(label).toContainText("Tesla T4");
-  await expect(label).toContainText("g4dn.xlarge");
-  await expect(label).toContainText(/no restart yet|last restart \d/);
+  // The public place, never the host or instance name (#1366).
+  await expect(label).toContainText("EC2 in mock-region");
+  await expect(label).not.toContainText("mock-i-");
+  await expect(label).toContainText(/launch time not recorded|last restart \d/);
   // Under the seam's own labels: the hover label covers none of them.
   const top = v.tiles.find((x) => x.id === "fcvm:2")!;
   await page.mouse.move(top.box!.x + top.box!.w / 2, top.box!.y + 12);
@@ -423,15 +425,9 @@ test("an opened VM zooms to fill the screen at its detail height, with the tiles
   // Dimmed: at most 1 - ZOOM_DIM_NEAR of the brightness the same scene has in the opened tile.
   expect(fe.around).toBeLessThan(1 - ZOOM_DIM_NEAR + 0.08);
   expect(fe.around).toBeGreaterThan(0.05);
-  // The sheet starts open only where the tile lies clear of it; it folds away and comes back, and never moves the picture.
-  const clears = sheetClears({ x: 0, y: 0, w: vp.width, h: vp.height }, r, 16 / 9, zoomInsetsFor(false, ZOOM_SHEET_W + 16));
+  // The sheet starts open; it folds away and comes back, and never moves the picture.
   const sheet = page.getByTestId("focus-sheet");
-  if (clears) await expect(sheet).toHaveClass(/open/);
-  else {
-    await expect(sheet).not.toHaveClass(/open/);
-    await page.getByTestId("sheet-toggle").click();
-    await expect(sheet).toHaveClass(/open/);
-  }
+  await expect(sheet).toHaveClass(/open/);
   await page.getByTestId("sheet-hide").click();
   await expect(sheet).not.toHaveClass(/open/);
   expect(await page.evaluate(() => window.__fleet!.view().plan.zoom!.box)).toEqual(z.box);
@@ -458,6 +454,44 @@ test("an opened VM zooms to fill the screen at its detail height, with the tiles
   await page.getByRole("button", { name: "Back to the wall" }).click();
   await expect(page.getByTestId("focus")).toHaveCount(0);
   await expect.poll(() => page.evaluate(() => window.__fleet!.view().zoom)).toBeNull();
+});
+
+test("an opened VM shows its details, GPU graph and restart timeline on screen without a click, on a desktop and on a phone", async ({ page, browser }) => {
+  // `fits`: the whole sheet is on screen without scrolling (a laptop-sized window). A phone's sheet scrolls.
+  const check = async (p: Page, fits: boolean) => {
+    const t = await p.evaluate(() => window.__fleet!.view().tiles.find((x) => x.id === "fcvm:3")!.box!);
+    await p.mouse.click(t.x + t.w / 2, t.y + t.h / 2);
+    await expect(p.getByTestId("focus")).toBeVisible();
+    await expect.poll(() => p.evaluate(() => window.__fleet!.view().zoom?.dim ?? 0)).toBe(1);
+    const sheet = p.getByTestId("focus-sheet");
+    await expect(sheet).toHaveClass(/open/);
+    expect(await sheet.evaluate((el) => getComputedStyle(el).opacity)).toBe("1");
+    expect(await sheet.evaluate((el) => el.hasAttribute("inert") || el.querySelector("[inert]") !== null)).toBe(false);
+    for (const id of ["readings", "restart-one"]) await expect(p.getByTestId(id), id).toBeInViewport();
+    if (!fits) await p.getByTestId("timeline-total").scrollIntoViewIfNeeded();
+    await expect(p.getByTestId("timeline-total")).toBeInViewport();
+    await expect(p.locator(".zoom .phase-bar")).toBeInViewport();
+    await expect(p.locator(".zoom dl")).toContainText("GPU");
+    await expect(p.locator(".zoom dl")).toContainText("Up for");
+    // The GPU graph: a sparkline per reading once two samples have arrived.
+    await expect.poll(() => p.locator('[data-testid="readings"] polyline').count(), { timeout: 15_000 }).toBeGreaterThan(0);
+    await expect(p.locator('[data-testid="readings"] polyline').first()).toBeInViewport();
+    // The picture is not under the sheet's top edge: the opened VM is still on screen beside or above it.
+    const box = await p.evaluate(() => window.__fleet!.view().plan.zoom!.box!);
+    const sb = (await sheet.boundingBox())!;
+    expect(box.y).toBeLessThan(sb.y + sb.height);
+  };
+  await openWall(page, 15);
+  await check(page, true);
+  const ctx = await browser.newContext({ ...devices["iPhone 13"], deviceScaleFactor: 1 });
+  const phone = await ctx.newPage();
+  await openWall(phone, 3);
+  await check(phone, false);
+  // On a phone the sheet starts below the picture, so the whole opened VM stays in view.
+  const box = await phone.evaluate(() => window.__fleet!.view().plan.zoom!.box!);
+  const sb = (await phone.getByTestId("focus-sheet").boundingBox())!;
+  expect(box.y + box.h).toBeLessThanOrEqual(sb.y + 1);
+  await ctx.close();
 });
 
 test("a folded side sheet leaves the keyboard path, and focus goes back to its Details button", async ({ page }) => {
@@ -1128,6 +1162,49 @@ test("your own GPU: a wall tile's GPU is lent, streams full screen with its own 
   expect(t.phase).toBe("running");
   await expect(page.getByTestId("hover-label")).toHaveCount(0, { timeout: 10_000 });
   await other.context().close();
+});
+
+test("your own GPU flies on autopilot from its first frame; Space, the button and an arrow key pause it", async ({ page }) => {
+  await openWall(page, 15);
+  await page.getByTestId("own-gpu").click();
+  await expect(page.getByTestId("own-status")).toHaveText("Your GPU is streaming", { timeout: 10_000 });
+  const state = page.getByTestId("own-autopilot-state");
+  const button = page.getByTestId("own-autopilot");
+  await expect(state).toHaveText("Autopilot");
+  await expect(button).toHaveText("Pause");
+  // Flying: the claim's camera has keys ahead, and they move.
+  const ahead = () =>
+    page.evaluate(() => {
+      const s = window.__fleet!.client.getState();
+      const keys = s.own.claim?.camera ?? [];
+      const xs = new Set(keys.map((k) => Math.round(((k as { x?: number }).x ?? 0) * 1000)));
+      return { autopilot: s.own.claim?.autopilot, moving: xs.size > 2 };
+    });
+  await expect.poll(ahead).toEqual({ autopilot: true, moving: true });
+  // Space pauses whichever button has focus (Back to the wall has it now) and does not close the view.
+  await expect(page.getByTestId("own-back")).toBeFocused();
+  await page.keyboard.press(" ");
+  await expect(state).toHaveText("Paused");
+  await expect(button).toHaveText("Play");
+  await expect(page.getByTestId("own")).toBeVisible();
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().own.claim?.autopilot)).toBe(false);
+  // The button flies again, and Space pressed on the button toggles once, not twice.
+  await button.click();
+  await expect(state).toHaveText("Autopilot");
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().own.claim?.autopilot)).toBe(true);
+  await button.focus();
+  await page.keyboard.press(" ");
+  await expect(state).toHaveText("Paused");
+  await page.waitForTimeout(300);
+  await expect(state).toHaveText("Paused");
+  await page.keyboard.press(" ");
+  await expect(state).toHaveText("Autopilot");
+  // An arrow key takes the camera: paused, and the coordinator agrees.
+  await page.keyboard.press("ArrowLeft");
+  await expect(state).toHaveText("Paused");
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().own.claim?.autopilot)).toBe(false);
+  await page.getByTestId("own-back").click();
+  await expect(page.getByTestId("own")).toHaveCount(0, { timeout: 5000 });
 });
 
 test("text is 14 px or larger at 4.5:1 or better, and race results go to a live region", async ({ page }) => {

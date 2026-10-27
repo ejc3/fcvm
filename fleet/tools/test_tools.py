@@ -19,6 +19,7 @@ sys.path.insert(0, HERE)
 
 import aggstream  # noqa: E402
 import fleetlive  # noqa: E402
+import pathrun  # noqa: E402
 
 
 def server(handle):
@@ -196,3 +197,14 @@ class RunScripts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PathrunLighting(unittest.TestCase):
+    def test_a_late_pass_posts_the_latest_time_of_day_not_the_next(self):
+        # The director's time of day moves every second while the camera flies; pathrun
+        # polls every 2 s, so a pass must catch up to the value due now, not the one after
+        # the last it posted, or the lighting falls behind the camera for the whole run.
+        tods = [(0.0, 0.71), (11.0, 0.7106), (12.0, 0.7112), (13.0, 0.7118), (30.0, 0.735)]
+        v, i = pathrun.due(tods, 1, 13.5)
+        self.assertEqual((v, i), (0.7118, 4))
+        self.assertEqual(pathrun.due(tods, i, 14.0), (None, 4))

@@ -32,7 +32,7 @@ import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type Aggregate, type 
 import { KIND_TAG, NOT_AWAKE_NOTE, raceOnImage, ratioText, runningRace, scoreView, type RaceOnImage, type ScoreView } from "./race.ts";
 import { sceneUnixMs } from "./scene.ts";
 import { reelView, type ReelMeta, type ReelView } from "./reel.ts";
-import type { ClientState, FrameStats, GpuSample, Notice, StreamMode, TileFrameStats } from "./store.ts";
+import { ownAutopilot, type ClientState, type FrameStats, type GpuSample, type Notice, type StreamMode, type TileFrameStats } from "./store.ts";
 import { sceneAgeMs } from "./lag.ts";
 
 export const SITE = "fcvm.dev";
@@ -117,6 +117,26 @@ export function phaseText(phase: string): string {
 export function tileName(t: { id: string; half: Half }): string {
   const k = /:(\d+)$/.exec(t.id)?.[1];
   return k === undefined ? t.id : `${KIND_TAG[t.half]} VM ${k}`;
+}
+
+/** A renderer under this rate skips slots, and the wall drops to its rate. */
+const SLOW_RENDERER_FPS = 29;
+
+/**
+ * The stream stats' line on the wall's rate. The page shows every tile at one scene time
+ * (core/sync.ts), so the wall moves at its slowest renderer's rate; a renderer that has
+ * dropped under SLOW_RENDERER_FPS (its own `/health` fps, as the coordinator reports it) is
+ * named. Empty until the drawer reports a rate.
+ */
+export function wallRateLine(frames: FrameStats | null, tiles: readonly Tile[]): string {
+  if (frames === null || frames.wallFps === undefined) return "";
+  const wall = `wall ${Math.round(frames.wallFps)} fps`;
+  let slow: Tile | null = null;
+  for (const t of tiles) {
+    if (!isLive(t) || t.fps === null || t.fps <= 0) continue;
+    if (slow === null || t.fps < slow.fps!) slow = t;
+  }
+  return slow !== null && slow.fps! < SLOW_RENDERER_FPS ? `${wall} · held back by ${tileName(slow)} at ${Math.round(slow.fps!)} fps` : wall;
 }
 
 /** A viewer as the activity feed names it. */
@@ -762,6 +782,8 @@ export interface FocusView {
   readings: Reading[];
   /** Where the VM is drawn at this step of the zoom, and the height its stream is asked for. */
   placed: { box: Box; streamHeight: number } | null;
+  /** Where it ends once zoomed (a phone's bottom sheet starts under it). */
+  target: Box | null;
 }
 
 /** The renderer's own resolution for one tile: what the viewer's own GPU asks for. */
@@ -774,12 +796,12 @@ export const ZOOM_DIM_FAR = 0.82;
 export const ZOOM_SHEET_W = 380;
 
 /**
- * Room an opened VM leaves around it. On a phone it is full width, under a bar and above the
- * bottom sheet's handle; elsewhere a margin all round wide enough to show the tiles next to it,
+ * Room an opened VM leaves around it. On a phone it is full width, at the top under a bar, with at
+ * least 240 px below it for the bottom sheet; elsewhere a margin all round wide enough to show the tiles next to it,
  * with the bar over the top, and clear of a side sheet `sheet` wide when that costs no size.
  */
 export function zoomInsetsFor(phone: boolean, sheet: number): ZoomInsets {
-  return phone ? { top: 56, right: 0, bottom: 76, left: 0, sheet: 0 } : { top: 72, right: 56, bottom: 48, left: 56, sheet };
+  return phone ? { top: 56, right: 0, bottom: 240, left: 0, sheet: 0, align: "top" } : { top: 72, right: 56, bottom: 48, left: 56, sheet };
 }
 
 function sparkline(samples: readonly GpuSample[], key: "temp_c" | "power_w" | "util_pct"): string {
@@ -818,6 +840,7 @@ function focusView(
   srvNow: number,
   online: boolean,
   placed: { box: Box; streamHeight: number } | null,
+  target: Box | null,
 ): FocusView {
   const fs = s.frames?.tiles[`d:${t.id}`];
   const lr = t.last_relaunch;
@@ -864,6 +887,7 @@ function focusView(
     readingsTitle: "GPU, live",
     readings,
     placed,
+    target,
   };
 }
 
@@ -910,6 +934,29 @@ export interface OwnView {
   gpu: string;
   steps: TimelineStep[];
   placed: { box: Box; streamHeight: number } | null;
+  /** The autopilot control, or null before a claim arrives and after it ends. */
+  autopilot: OwnAutopilot | null;
+}
+
+/** The pause and play control of the viewer's own camera. */
+export interface OwnAutopilot {
+  on: boolean;
+  /** The button's text and accessible name: what pressing it does. */
+  button: string;
+  /** The state shown next to it. */
+  state: string;
+  /** The key that toggles it. */
+  key: string;
+}
+
+/** Toggles the autopilot on the viewer's own GPU. */
+export const AUTOPILOT_KEY = " ";
+
+function ownAutopilotView(on: boolean | null): OwnAutopilot | null {
+  if (on === null) return null;
+  return on
+    ? { on, button: "Pause", state: "Autopilot", key: "Space" }
+    : { on, button: "Play", state: "Paused", key: "Space" };
 }
 
 export interface OwnButton {
@@ -947,6 +994,7 @@ function ownView(s: ClientState, st: FleetState, srvNow: number, input: WallInpu
     return { box: b, streamHeight: Math.min(NATIVE_TILE_HEIGHT, streamHeightFor(b.h * input.dpr, st.image_aspect)) };
   })() : null;
   const left = c?.expires_at != null ? c.expires_at - srvNow : null;
+  const autopilot = ownAutopilot(s);
   const status = ended
     ? c?.ended ?? "Your minute is up. The GPU went back to the pool."
     : first === null
@@ -964,11 +1012,15 @@ function ownView(s: ClientState, st: FleetState, srvNow: number, input: WallInpu
     countdown: ended ? "" : left === null ? fmt.countdown(OWN_GPU_SECONDS * 1000) : fmt.countdown(left),
     ended,
     back: "Back to the wall",
-    help: "Drag to turn the camera, scroll to move closer. Arrow keys and plus or minus work too.",
+    help:
+      autopilot === true
+        ? "Flying on autopilot. Drag, scroll, an arrow key or plus or minus takes the camera; Space pauses."
+        : "Drag to turn the camera, scroll to move closer. Arrow keys and plus or minus work too; Space flies again.",
     latency: s.lastInputLatencyMs === null ? "move the camera to measure input to pixels" : `input to pixels: ${fmt.millis(s.lastInputLatencyMs)}`,
     gpu: c?.gpu ?? "",
     steps: c ? timelineOf(c.phases).steps : [],
     placed,
+    autopilot: ended ? null : ownAutopilotView(autopilot),
   };
 }
 
@@ -1288,6 +1340,8 @@ export interface WallView {
   notices: { key: string; text: string }[];
   /** What the streams cost, for the stats switch. */
   bandwidth: string;
+  /** The stream stats' line on the wall's rate and the renderer holding it back (wallRateLine). */
+  wallRate: string;
 }
 
 /**
@@ -1487,6 +1541,7 @@ export function wallView(input: WallInput): WallView {
       gridLabel: "",
       notices: [],
       bandwidth: "",
+      wallRate: "",
     };
   }
   const pend = pendingIntents(s);
@@ -1521,7 +1576,7 @@ export function wallView(input: WallInput): WallView {
     return b && zArea && boxesMeet(b, zArea) ? b : null;
   };
   const focusPlaced = zoom?.focus && focusTile && zoom.focus.id === focusTile.id ? { box: zoom.focus.box, streamHeight: detailHeight ?? zoom.focus.streamHeight } : null;
-  const focus = focusTile ? focusView(s, tiles.find((x) => x.id === focusTile.id)!, focusTile, input, srvNow, online, focusPlaced) : null;
+  const focus = focusTile ? focusView(s, tiles.find((x) => x.id === focusTile.id)!, focusTile, input, srvNow, online, focusPlaced, opening && zArea ? zoomTarget(zArea, opening.rect, st.image_aspect, insets) : null) : null;
   const covered = focus !== null || own !== null || zoom !== null;
 
   // Direct: each tile asks for the device pixels it covers. With the viewer's own GPU on screen
@@ -1641,6 +1696,7 @@ export function wallView(input: WallInput): WallView {
     seams: seamView(s, covered ? null : layout, tiles, input, returning),
     returning,
     bandwidth: `${fmt.count(plan.direct.length, "direct stream", "direct streams")}, about ${fmt.mbps(plan.estimatedBps)} at the renderer's bit rate`,
+    wallRate: wallRateLine(s.frames, st.tiles),
     notices: s.notices.flatMap((n) => {
       // Only the latest stop choice speaks: a later pick replaced the earlier one's vote.
       if (n.intent === "nudge" && n.id !== latestNudge) return [];

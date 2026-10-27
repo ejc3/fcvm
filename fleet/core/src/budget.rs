@@ -5,7 +5,8 @@
 //! drawn pixel) at the same slot, and moving frames match across their edges:
 //!
 //! - every round (2 s), once every placed tile has reported a fit, it takes the smallest
-//!   `budget_fit` (the slowest tile governs) and smooths it, half the way each round;
+//!   `budget_fit` (the slowest tile governs) and smooths it, half the way each round; while a
+//!   tile has no fit, only the two steps down below run, from the fits that are known;
 //! - down, to the ladder rung under the fit (the lower of the smoothed fit and this round's),
 //!   when the budget exceeds the smoothed fit by more than 5%; and at least one rung down at
 //!   once when any tile's frame took over 90% of its slot (`render_ms_max`);
@@ -67,15 +68,39 @@ impl Budget {
     /// One round. `fits` holds every placed tile's fit (`None` for a tile that has not
     /// reported); `overloaded` whether any tile's frame took over 90% of its slot;
     /// `newest_t` the newest frame any tile has drawn. Returns whether the budget changed.
+    ///
+    /// The first budget and every raise need every tile's fit. A tile without one (just
+    /// started, or drawing at a new size, whose cost model starts again for 60 s) holds back
+    /// neither an overloaded frame's rung down nor a step down to a fit that is known.
     pub fn round(&mut self, fits: &[Option<f64>], overloaded: bool, newest_t: f64) -> bool {
-        if fits.is_empty()
-            || fits
-                .iter()
-                .any(|f| f.is_none_or(|v| !v.is_finite() || v <= 0.0))
-        {
+        if fits.is_empty() {
             return false;
         }
-        let m = fits.iter().flatten().copied().fold(f64::INFINITY, f64::min);
+        let known: Vec<f64> = fits
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .collect();
+        if known.len() < fits.len() {
+            let Some(cur) = self.current else {
+                return false;
+            };
+            let mut b = cur;
+            if let Some(m) = known.iter().copied().reduce(f64::min) {
+                if m < 0.95 * cur as f64 {
+                    b = b.min(ladder_floor(m));
+                }
+            }
+            if overloaded {
+                b = b.min(ladder_floor(cur as f64 * 0.999));
+            }
+            if b < cur {
+                self.up_rounds = 0;
+            }
+            return self.set(b < cur, b, newest_t);
+        }
+        let m = known.iter().copied().fold(f64::INFINITY, f64::min);
         let f = match self.smoothed {
             None => m,
             Some(f) => f + (m - f) * 0.5,
@@ -108,13 +133,18 @@ impl Budget {
             }
         };
         match next {
-            Some(b) => {
-                self.current = Some(b);
-                self.from_t = Some(((newest_t + LEAD_SECS) * 30.0).ceil() / 30.0);
-                true
-            }
+            Some(b) => self.set(true, b, newest_t),
             None => false,
         }
+    }
+
+    /// Put budget `b` in force a second past the newest frame, when `change`.
+    fn set(&mut self, change: bool, b: u64, newest_t: f64) -> bool {
+        if change {
+            self.current = Some(b);
+            self.from_t = Some(((newest_t + LEAD_SECS) * 30.0).ceil() / 30.0);
+        }
+        change
     }
 }
 
@@ -128,6 +158,41 @@ mod tests {
         assert_eq!(ladder_floor(297_302.0), 297_302);
         assert_eq!(ladder_floor(297_300.0), 250_000);
         assert_eq!(ladder_floor(1.0), 62_500);
+    }
+
+    #[test]
+    fn a_tile_without_a_fit_does_not_hold_the_grid_up() {
+        // Staging, 2026-10-27: a viewer opened slot-6, its renderer started drawing at a
+        // new size and its cost model started again (`budget_fit` 0 for 60 s). Its frames
+        // overran their slot, and no round ran until its fit came back, because a round
+        // needed every tile's fit.
+        let mut b = Budget::default();
+        assert!(b.round(&[Some(4e5), Some(4e5)], false, 10.0));
+        let top = b.current.unwrap();
+        assert!(
+            b.round(&[Some(4e5), None], true, 12.0),
+            "an overloaded frame steps down with a fit missing"
+        );
+        assert_eq!(b.current, Some(ladder_floor(top as f64 * 0.999)));
+        let cur = b.current.unwrap();
+        assert!(
+            b.round(&[Some(1.5e5), None], false, 14.0),
+            "a reported fit under the budget steps down with another missing"
+        );
+        assert!(b.current.unwrap() < cur);
+        let low = b.current;
+        for _ in 0..5 {
+            assert!(
+                !b.round(&[Some(4e6), None], false, 16.0),
+                "never up while a tile has not reported"
+            );
+        }
+        assert_eq!(b.current, low);
+        let mut fresh = Budget::default();
+        assert!(
+            !fresh.round(&[Some(4e5), None], true, 10.0),
+            "no first budget until every tile reports"
+        );
     }
 
     #[test]

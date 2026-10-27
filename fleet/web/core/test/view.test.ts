@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import * as fmt from "../format.ts";
 import { initialState, makeIntent, reduce, type ClientState, type FrameStats } from "../store.ts";
+import { parseServerMsg } from "../protocol.ts";
 import {
   BORROW_FADE_MS,
   TEXT_STYLES,
@@ -23,6 +24,7 @@ import {
   wallView,
   type WallInput,
 } from "../view.ts";
+import { wallRateLine } from "../view.ts";
 import { suggestMode } from "../mode.ts";
 import { END_CARD_MS } from "../race.ts";
 import { boxesMeet, DETAIL_TILE_PX, layoutMosaic, tileAt as tileAtPoint, tileGeometry, zoomTarget } from "../layout.ts";
@@ -384,6 +386,7 @@ describe("your own GPU", () => {
     gpu: "Tesla T4",
     phases: {},
     camera: [{ t: 0, x: 0, y: 0, zoom: 1 }],
+    autopilot: true,
     ended: null,
     ...over,
   });
@@ -414,6 +417,43 @@ describe("your own GPU", () => {
     expect(v.own).toBeNull();
     expect(v.ownRefusal!.text).toBe("No GPU is free right now: all 2 GPUs we lend are out; the next comes back in 41 s. Try again in a minute.");
     expect(v.notices).toEqual([]);
+  });
+
+  it("starts on autopilot; a drag pauses it at once and the button flies again", () => {
+    const running = (over: Partial<Claim>) => claim({ phase: "running", frame_url: "ws://example-host:2/frames/claim-1", first_frame_at: EPOCH + 3900, expires_at: EPOCH + 63_900, ...over });
+    let s = reduce(stateWith(fleet()), { type: "intent-sent", intent: makeIntent("own", "claim_gpu"), at: EPOCH + 1000 });
+    s = msg(s, { type: "claim", claim: running({}) });
+    const at = EPOCH + 5000;
+    expect(view(s, at).own!.autopilot).toEqual({ on: true, button: "Pause", state: "Autopilot", key: "Space" });
+    expect(view(s, at).own!.help).toMatch(/^Flying on autopilot\./);
+    // A drag takes the camera: paused at once, before the coordinator answers...
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("d1", "claim_camera", { drag: { yaw_deg: 5, pitch_deg: 0, dive: 0 } }), at });
+    expect(view(s, at).own!.autopilot).toMatchObject({ on: false, button: "Play", state: "Paused" });
+    // ...and a claim message sent before the coordinator applied it does not undo that.
+    s = msg(s, { type: "claim", claim: running({ camera: [{ t: 0, x: 0, y: 0, zoom: 1 }, { t: 9, x: 0.1, y: 0, zoom: 1 }] }) });
+    expect(view(s, at).own!.autopilot!.on).toBe(false);
+    s = msg(s, { type: "claim", claim: running({ autopilot: false }) });
+    expect(s.own.autopilot).toBeNull();
+    expect(view(s, at).own!.autopilot!.on).toBe(false);
+    // The button flies again; a refusal puts the claim's state back.
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("p1", "claim_autopilot", { on: true }), at });
+    expect(view(s, at).own!.autopilot).toMatchObject({ on: true, button: "Pause" });
+    s = msg(s, { type: "receipt", id: "p1", outcome: "refused", reason: "claim_autopilot needs a GPU of your own (claim_gpu)", version: 3 });
+    expect(view(s, at).own!.autopilot!.on).toBe(false);
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("p2", "claim_autopilot", { on: true }), at });
+    s = msg(s, { type: "claim", claim: running({ autopilot: true }) });
+    expect(view(s, at).own!.autopilot!.on).toBe(true);
+    expect(s.own.autopilot).toBeNull();
+  });
+
+  it("shows no autopilot control once the minute is over, and refuses a claim without autopilot", () => {
+    let s = reduce(stateWith(fleet()), { type: "intent-sent", intent: makeIntent("own", "claim_gpu"), at: EPOCH + 1000 });
+    s = msg(s, { type: "claim", claim: claim({ phase: "running", first_frame_at: EPOCH + 3900 }) });
+    expect(view(s, EPOCH + 5000).own!.autopilot!.on).toBe(true);
+    s = msg(s, { type: "claim", claim: claim({ phase: "ended", first_frame_at: EPOCH + 3900, ended: "released" }) });
+    expect(view(s, EPOCH + 9000).own!.autopilot).toBeNull();
+    const { autopilot: _, ...old } = claim({ phase: "running" });
+    expect(() => parseServerMsg(JSON.stringify({ type: "claim", claim: old }))).toThrow("claim.autopilot is not true or false");
   });
 
   it("ignores a claim message it did not ask for", () => {
@@ -1328,7 +1368,7 @@ describe("the family choice covers every stream the page opens", () => {
   });
 
   it("opens a borrowed GPU's stream over the viewer's family, and none when it has no URL in it", () => {
-    const claimMsg = (v4: string | null) => ({ type: "claim", claim: { id: "claim-1", tile: "fcvm:4", phase: "running", frame_url: "ws://example-host:2/frames/claim-1", frame_url_v4: v4, clicked_at: EPOCH, first_frame_at: EPOCH + 2900, expires_at: EPOCH + 62_900, gpu: "Tesla T4", phases: {}, camera: [], ended: null } });
+    const claimMsg = (v4: string | null) => ({ type: "claim", claim: { id: "claim-1", tile: "fcvm:4", phase: "running", frame_url: "ws://example-host:2/frames/claim-1", frame_url_v4: v4, clicked_at: EPOCH, first_frame_at: EPOCH + 2900, expires_at: EPOCH + 62_900, gpu: "Tesla T4", phases: {}, camera: [], autopilot: true, ended: null } });
     const own = (family: "v6" | "v4", v4: string | null) => {
       let s = stateWith(fleet(2, 2));
       s = { ...s, net: { family, probeMs: 180, via: "race" } };
@@ -1367,5 +1407,37 @@ describe("frame age on a tile's card", () => {
     const v = view(reported(lag, at, 100), at + 400);
     expect(v.tiles[0]!.stats[1]).toBe("frame age 90 ms");
     expect(v.tiles[0]!.stats[2]).toBe("arrives 55 ms · decoded 58 ms · drawn 90 ms");
+  });
+});
+
+describe("the wall's rate in the stream stats", () => {
+  // Staging, 2026-10-27: slot-6's renderer drew 15 fps (its frames took 36 ms), and the page,
+  // which shows every tile at one scene time, drew the whole wall at 19 fps. Nothing on the
+  // page said which tile it was.
+  function withRates(fps: (id: string) => number | null, wallFps: number) {
+    const st = fleet(4, 4);
+    st.tiles = st.tiles.map((t) => ({ ...t, fps: fps(t.id) }));
+    let s = stateWith(st);
+    const tiles: FrameStats["tiles"] = {};
+    for (const t of st.tiles) tiles[`d:${t.id}`] = { connected: true, fps: 30, newestT: 100, width: 768, height: 432, behind: false, decodeMs: 2, lag: null };
+    s = reduce(s, { type: "frame-stats", stats: { at: EPOCH, T: 100, tiles, drawMsP50: 1, drawMsP95: 2, rafMsP50: 16.7, rafMsP95: 17, allLive: true, live: [], mode: "direct", wallFps } });
+    return { s, st };
+  }
+
+  it("names the renderer holding the wall back", () => {
+    const { s, st } = withRates((id) => (id === "fcvm:3" ? 15 : 30), 19.5);
+    expect(wallRateLine(s.frames, st.tiles)).toBe("wall 20 fps · held back by fcvm VM 3 at 15 fps");
+    const v = view(s, EPOCH);
+    expect(v.wallRate).toBe("wall 20 fps · held back by fcvm VM 3 at 15 fps");
+  });
+
+  it("names none when every renderer keeps its slot", () => {
+    const { s, st } = withRates(() => 30, 30);
+    expect(wallRateLine(s.frames, st.tiles)).toBe("wall 30 fps");
+  });
+
+  it("says nothing before the drawer reports a rate", () => {
+    const { st } = withRates(() => 30, 30);
+    expect(wallRateLine(null, st.tiles)).toBe("");
   });
 });

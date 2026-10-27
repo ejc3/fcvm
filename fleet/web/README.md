@@ -12,7 +12,8 @@ pixels, so one viewer on a large screen cannot push a GPU under one sample per p
 Lockup (type above the clock), Skywriting (smoke in the sky) or Landmark (big letters
 standing on a ridge). The three thumbnails are crops of the renderer's
 `shots/text-styles.jpg` (#1178, commit 46feb782), in `public/text-styles/`. A viewer can also borrow one of the wall's GPUs for a
-minute. It runs against a mock fleet (`mock/`) until the coordinator and renderers are
+minute; its camera flies the coordinator's autopilot loop from the first frame until the
+viewer pauses it (the Pause button or Space) or drags, scrolls or presses a camera key. It runs against a mock fleet (`mock/`) until the coordinator and renderers are
 deployed.
 
 ![The wall at rest](docs/screenshots/wall-desktop.jpg)
@@ -260,12 +261,13 @@ the far corners), so the scene runs on past its edges. Its stream asks for the h
 covers its box, up to the renderer's measured detail view (`DETAIL_TILE_PX`, 1080 x 1080 at
 30 fps): 1080 for a square tile, 720 for a 16:9 one. A sheet over the picture holds the
 timeline of its last restart as the coordinator measured it and its GPU's temperature,
-power and load with two minutes of history: at the right on a wide screen (it folds away,
-and the tile moves clear of it only when that costs no size), at the bottom on a phone,
-where the tile is full width and the sheet starts folded to a handle. A click on a dimmed
+power and load with two minutes of history. It starts open: at the right on a wide screen,
+translucent over the picture (the tile moves clear of it when that costs no size), and under
+the picture on a phone, where the tile is full width at the top. It folds away (to a handle on
+a phone) and comes back. A click on a dimmed
 tile, or an arrow key, opens that tile instead.
 
-<img src="docs/screenshots/phone-tile-opened.jpg" alt="An opened VM on a phone" width="260"> <img src="docs/screenshots/phone-tile-details.jpg" alt="Its details on a phone" width="260">
+<img src="docs/screenshots/phone-tile-opened.jpg" alt="An opened VM on a phone" width="260"> <img src="docs/screenshots/phone-tile-folded.jpg" alt="Its details folded on a phone" width="260">
 
 ## Measurements
 

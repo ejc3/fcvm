@@ -317,6 +317,14 @@ pub struct Claim {
     pub first_frame_at: Option<u64>,
     /// The private camera path (the session's own, steerable by its viewer).
     pub camera: Vec<Keyframe>,
+    /// The camera flies the autopilot's loop (`crate::autopilot`) until the viewer pauses
+    /// it or takes the camera; resuming flies back to the loop.
+    #[serde(default)]
+    pub autopilot: bool,
+    /// Scene time at which the loop's phase is 0, once the flight has started (the first
+    /// frame showed with the autopilot on); `None` while the camera is the viewer's.
+    #[serde(default)]
+    pub flight_t0: Option<f64>,
     /// The wall tile this GPU was drawing when it was lent (`fcvm:3`); `None` for a
     /// standby GPU. A borrowed tile keeps its place in the layout and is drawn black.
     #[serde(default)]
@@ -577,7 +585,8 @@ impl State {
         let director = Director::new(config.camera_seed, 0.0);
         let mut scene = Scene::new(now_ms);
         scene.camera = director.camera();
-        scene.time_of_day = crate::director::viewpoints()[director.current].time_of_day;
+        scene.time_of_day = director.time_of_day(0.0);
+        scene.weather = director.weather();
         State {
             version: 0,
             fleet: Fleet {

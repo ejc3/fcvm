@@ -81,6 +81,11 @@ export interface FrameStats {
   live: string[];
   /** The mode the drawer drew when it reported: `live` holds that mode's sources. */
   mode: StreamMode;
+  /**
+   * New common times drawn per second over the last 2 s: the rate the wall moves at, which is
+   * its slowest renderer's (core/sync.ts shows every tile at one time).
+   */
+  wallFps?: number;
 }
 
 export type StreamMode = "direct" | "aggregated";
@@ -166,6 +171,11 @@ export interface OwnGpu {
   abandoned: string | null;
   /** A claim to release: it arrived for the abandoned request. The client sends release_gpu, then "own-released". */
   release: string | null;
+  /**
+   * The autopilot as the viewer last set it (the pause button, or a drag that takes the
+   * camera), shown until a claim message agrees or the intent is refused.
+   */
+  autopilot: { id: string; on: boolean } | null;
 }
 
 /**
@@ -240,7 +250,17 @@ const WATCHES_KEPT = 32;
 /** GPU readings kept per tile: two minutes at the coordinator's two-second cadence. */
 export const GPU_HISTORY = 60;
 
-const NO_OWN: OwnGpu = { requestId: null, requestedAt: null, claim: null, refused: null, abandoned: null, release: null };
+const NO_OWN: OwnGpu = { requestId: null, requestedAt: null, claim: null, refused: null, abandoned: null, release: null, autopilot: null };
+
+/**
+ * Whether the viewer's own camera is on autopilot: what the viewer last asked for until
+ * the coordinator agrees, else the claim's. Null when there is no claim.
+ */
+export function ownAutopilot(s: ClientState): boolean | null {
+  const c = s.own.claim;
+  if (c === null) return null;
+  return s.own.autopilot?.on ?? c.autopilot;
+}
 
 export function initialState(): ClientState {
   return {
@@ -347,8 +367,19 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
               { id: e.intent.id, inputAt: e.at, keysBefore: latestKeyT(ownKeys(s)), receiptVersion: null, tEff: null },
             ].slice(-WATCHES_KEPT)
           : s.cameraWatches;
+      // Pressing pause or play, or taking the camera with a drag, shows at once.
+      const on =
+        e.intent.name === "claim_autopilot"
+          ? e.intent.args["on"] === true
+          : e.intent.name === "claim_camera" && ownAutopilot(s) === true
+            ? false
+            : null;
       const own =
-        e.intent.name === "claim_gpu" ? { ...NO_OWN, requestId: e.intent.id, requestedAt: e.at } : s.own;
+        e.intent.name === "claim_gpu"
+          ? { ...NO_OWN, requestId: e.intent.id, requestedAt: e.at }
+          : on !== null
+            ? { ...s.own, autopilot: { id: e.intent.id, on } }
+            : s.own;
       // Asking for a GPU resumes the picture: the private view's stream has no place in a
       // paused wall's frame choice, and the view hides the Resume button.
       const ui = e.intent.name === "claim_gpu" && s.ui.paused ? { ...s.ui, paused: false } : s.ui;
@@ -435,7 +466,8 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
             return s;
           }
           if (s.own.claim !== null && s.own.claim.id !== msg.claim.id) return s;
-          const own = { ...s.own, requestId: null, claim: msg.claim };
+          const agreed = s.own.autopilot !== null && msg.claim.autopilot === s.own.autopilot.on;
+          const own = { ...s.own, requestId: null, claim: msg.claim, autopilot: agreed ? null : s.own.autopilot };
           const cameraWatches = s.cameraWatches.map((w) => resolveWatch(w, msg.claim.camera, s.version));
           return { ...s, own, cameraWatches };
         }
@@ -499,6 +531,8 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
             if (!applied) own = { ...s.own, requestId: null, requestedAt: null, refused: msg.reason ?? "refused" };
           } else if (s.own.abandoned === msg.id && !applied) {
             own = { ...s.own, abandoned: null };
+          } else if (s.own.autopilot?.id === msg.id && !applied) {
+            own = { ...s.own, autopilot: null };
           }
           return { ...s, handled, pending, notices, cameraWatches, own };
         }

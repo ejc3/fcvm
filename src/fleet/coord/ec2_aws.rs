@@ -17,6 +17,11 @@
 //! instance whose image is not the pool template's current one is terminated, not started.
 //! A relaunch of a running tile (a race) never uses the pool.
 //!
+//! A call EC2 throttles (`RequestLimitExceeded`) is sent again after a short jittered
+//! backoff instead of failing the tile, and the tiles launching at once share what each
+//! launch option answered ([`LaunchOption`]), so a wake sends one RunInstances per refused
+//! AZ instead of one per tile and AZ.
+//!
 //! The tile serves its renderer over TLS on 443 with the fleet's wildcard certificate, as
 //! `<tile>.<zone>` (the coordinator's DNS writes that name). `ready` waits for the instance to
 //! run, then for `/health` there, resolving the name to the instance's address itself so
@@ -28,7 +33,8 @@ use super::ec2::{Ec2Driver, LaunchError, Launched, Liveness};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use fleet_core::protocol::{BudgetBody, RendererScene};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub struct AwsEc2 {
@@ -58,12 +64,97 @@ pub struct AwsEc2 {
     claimed: std::sync::Mutex<HashSet<String>>,
     /// Held while a release counts the pool and tags an instance into it.
     pool_lock: tokio::sync::Mutex<()>,
+    /// What the last launch through each option (template, region, subnet) found, shared
+    /// by every tile's launch. See [`AwsEc2::launch`].
+    options: std::sync::Mutex<HashMap<String, Arc<LaunchOption>>>,
+    /// How long a capacity refusal of an option stands for the other tiles' launches.
+    pub refusal_memo: Duration,
+    /// The first wait after EC2 throttles a call; each further wait doubles, up to
+    /// [`THROTTLE_MAX_WAIT`].
+    pub throttle_backoff: Duration,
+    /// How many times a throttled call is sent before its throttling is the call's error.
+    pub throttle_attempts: u32,
     /// Per region, the subnets (one per AZ) a launch tries in order, and the security group
     /// the tile's interface gets there. A region without subnets launches in the template's.
     pub networks: BTreeMap<String, Network>,
     chain: CredentialChain,
     http: reqwest::Client,
 }
+
+/// One launch option (template, region, subnet) and what the last launch through it found.
+/// At a wake every tile launches at once, and each walked every option itself: eight tiles
+/// over seven refused spot subnets sent 56 RunInstances, which EC2 throttles (its
+/// RunInstances bucket refills at a few calls a second), so most tiles failed into the tile
+/// backoff and the last one launched minutes later (2026-10-27). Now one launch tries an
+/// option whose answer is unknown while the others wait for that answer, and a refusal
+/// stands for [`AwsEc2::refusal_memo`].
+#[derive(Default)]
+struct LaunchOption {
+    /// Held by the one launch that tries the option while its answer is unknown.
+    gate: tokio::sync::Mutex<()>,
+    /// When the last launch through it ended, and its capacity refusal if it was refused.
+    last: std::sync::Mutex<Option<(Instant, Option<String>)>>,
+}
+
+impl LaunchOption {
+    /// The last answer, if it is younger than `memo`: None (unknown), Some(None) (it
+    /// launched), Some(Some(why)) (refused for capacity).
+    fn answer(&self, memo: Duration) -> Option<Option<String>> {
+        self.last
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < memo)
+            .map(|(_, why)| why.clone())
+    }
+
+    /// Record the answer of a launch that was sent at `sent`. A launch that succeeded does
+    /// not clear a refusal another launch recorded after this one was sent: two launches
+    /// sent together, one launching the last capacity and answered late, one refused and
+    /// answered first, leave the refusal standing, or the other tiles would all try the
+    /// exhausted option again at once.
+    fn record(&self, sent: Instant, refused: Option<String>) {
+        let mut last = self.last.lock().unwrap();
+        if refused.is_none() && matches!(&*last, Some((at, Some(_))) if *at > sent) {
+            return;
+        }
+        *last = Some((Instant::now(), refused));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_late_success_leaves_a_refusal_recorded_after_it_was_sent() {
+        let option = LaunchOption::default();
+        let memo = Duration::from_secs(60);
+        let b_sent = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        option.record(Instant::now(), Some("InsufficientInstanceCapacity".into()));
+        option.record(b_sent, None);
+        assert_eq!(
+            option.answer(memo),
+            Some(Some("InsufficientInstanceCapacity".to_string()))
+        );
+        // A success sent after the refusal was recorded clears it.
+        option.record(Instant::now(), None);
+        assert_eq!(option.answer(memo), Some(None));
+    }
+}
+
+/// EC2's answers to a request it throttled. A throttled call is sent again after a backoff
+/// with jitter, as the AWS SDKs do, instead of failing the tile.
+const THROTTLE_CODES: &[&str] = &[
+    "RequestLimitExceeded",
+    "Throttling",
+    "ThrottlingException",
+    "RequestThrottled",
+];
+
+/// The longest wait between two sends of a throttled call.
+pub const THROTTLE_MAX_WAIT: Duration = Duration::from_secs(2);
 
 /// One instance of a DescribeInstances answer.
 #[derive(Debug, Clone, PartialEq)]
@@ -302,6 +393,10 @@ impl AwsEc2 {
             pool_template: None,
             claimed: std::sync::Mutex::new(HashSet::new()),
             pool_lock: tokio::sync::Mutex::new(()),
+            options: std::sync::Mutex::new(HashMap::new()),
+            refusal_memo: Duration::from_secs(10),
+            throttle_backoff: Duration::from_millis(250),
+            throttle_attempts: 8,
             fleet: "stage".into(),
             networks: BTreeMap::new(),
             chain: CredentialChain::new()?,
@@ -326,36 +421,56 @@ impl AwsEc2 {
             body.push('=');
             body.push_str(&super::sigv4::uri_encode(v));
         }
-        let (status, bytes) = signed(
-            &self.chain,
-            &self.http,
-            &self.base(region),
-            reqwest::Method::POST,
-            "/",
-            "",
-            region,
-            "ec2",
-            &[(
-                "content-type",
-                "application/x-www-form-urlencoded; charset=utf-8".into(),
-            )],
-            body.into_bytes(),
-        )
-        .await
-        .map_err(CallError::Other)?;
-        let xml = String::from_utf8_lossy(&bytes).to_string();
-        if status.is_success() {
-            return Ok(xml);
+        let mut attempt = 0;
+        loop {
+            let (status, bytes) = signed(
+                &self.chain,
+                &self.http,
+                &self.base(region),
+                reqwest::Method::POST,
+                "/",
+                "",
+                region,
+                "ec2",
+                &[(
+                    "content-type",
+                    "application/x-www-form-urlencoded; charset=utf-8".into(),
+                )],
+                body.clone().into_bytes(),
+            )
+            .await
+            .map_err(CallError::Other)?;
+            let xml = String::from_utf8_lossy(&bytes).to_string();
+            if status.is_success() {
+                return Ok(xml);
+            }
+            let code = xml_tag(&xml, "Code").unwrap_or_default();
+            let msg = xml_tag(&xml, "Message").unwrap_or_default();
+            attempt += 1;
+            if THROTTLE_CODES.contains(&code.as_str()) && attempt < self.throttle_attempts {
+                let wait = throttle_wait(self.throttle_backoff, attempt);
+                tracing::debug!(%region, action = %params.first().map(|p| p.1.as_str()).unwrap_or(""), attempt, wait_ms = wait.as_millis() as u64, "EC2 throttled the call; sending it again");
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            return if CAPACITY_CODES.contains(&code.as_str()) {
+                Err(CallError::Capacity(format!("{region}: {code}: {msg}")))
+            } else {
+                Err(CallError::Other(anyhow::anyhow!(
+                    "EC2 in {region} answered {status}: {code}: {msg}"
+                )))
+            };
         }
-        let code = xml_tag(&xml, "Code").unwrap_or_default();
-        let msg = xml_tag(&xml, "Message").unwrap_or_default();
-        if CAPACITY_CODES.contains(&code.as_str()) {
-            Err(CallError::Capacity(format!("{region}: {code}: {msg}")))
-        } else {
-            Err(CallError::Other(anyhow::anyhow!(
-                "EC2 in {region} answered {status}: {code}: {msg}"
-            )))
-        }
+    }
+
+    /// The option `key`'s shared record, made on first use.
+    fn option(&self, key: &str) -> Arc<LaunchOption> {
+        self.options
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_default()
+            .clone()
     }
 
     /// Whether stopped instances are kept for the next wake.
@@ -726,6 +841,18 @@ impl AwsEc2 {
     }
 }
 
+/// The wait before the next send of a call EC2 throttled for the `attempt`th time: `base`
+/// doubled each attempt, capped at [`THROTTLE_MAX_WAIT`], with the upper half jittered so
+/// the tiles throttled together do not all send again at once.
+pub fn throttle_wait(base: Duration, attempt: u32) -> Duration {
+    use rand::Rng;
+    let full = base
+        .saturating_mul(1 << attempt.saturating_sub(1).min(16))
+        .min(THROTTLE_MAX_WAIT);
+    let half = full / 2;
+    half + rand::thread_rng().gen_range(Duration::ZERO..=half)
+}
+
 /// `<region>/<instance id>`, how a launched tile's instance is named.
 fn split(instance: &str) -> Result<(&str, &str)> {
     instance
@@ -757,7 +884,43 @@ impl Ec2Driver for AwsEc2 {
                 };
                 for net in nets {
                     let subnet = net.map(|(s, _)| s);
-                    match self.run(region, template, tile, net).await {
+                    let refusal = |why: &str| match subnet {
+                        Some(s) => format!("{template} in {s} of {why}"),
+                        None => format!("{template} in {why}"),
+                    };
+                    // One launch tries an option whose answer is unknown; the others wait
+                    // for its answer and skip a refusal younger than `refusal_memo`. An
+                    // option that launched is tried by every launch at once.
+                    let option =
+                        self.option(&format!("{template} {region} {}", subnet.unwrap_or("")));
+                    let mut gate = None;
+                    match option.answer(self.refusal_memo) {
+                        Some(Some(why)) => {
+                            refusals.push(refusal(&why));
+                            continue;
+                        }
+                        Some(None) => {}
+                        None => {
+                            let g = option.gate.lock().await;
+                            match option.answer(self.refusal_memo) {
+                                Some(Some(why)) => {
+                                    refusals.push(refusal(&why));
+                                    continue;
+                                }
+                                Some(None) => drop(g),
+                                None => gate = Some(g),
+                            }
+                        }
+                    }
+                    let sent = Instant::now();
+                    let tried = self.run(region, template, tile, net).await;
+                    match &tried {
+                        Ok(_) => option.record(sent, None),
+                        Err(CallError::Capacity(why)) => option.record(sent, Some(why.clone())),
+                        Err(CallError::Other(_)) => {}
+                    }
+                    drop(gate);
+                    match tried {
                         Ok(id) => {
                             tracing::info!(%tile, %region, %template, ?subnet, instance = %id, "tile launched");
                             return Ok(Launched {
@@ -767,10 +930,7 @@ impl Ec2Driver for AwsEc2 {
                                 ipv4: None,
                             });
                         }
-                        Err(CallError::Capacity(why)) => refusals.push(match subnet {
-                            Some(s) => format!("{template} in {s} of {why}"),
-                            None => format!("{template} in {why}"),
-                        }),
+                        Err(CallError::Capacity(why)) => refusals.push(refusal(&why)),
                         Err(CallError::Other(e)) => return Err(LaunchError::Failed(e)),
                     }
                 }
