@@ -161,21 +161,29 @@
     "next_race_at": null,
     "nudges": {
       "arrive_next_at": null,
+      "closes_at": 5000,
       "holding": "coast",
+      "holding_label": "From the coast",
+      "leading": "horizon",
       "next": null,
       "next_hold_at": 7000,
+      "next_label": null,
+      "opened_at": 0,
       "targets": [
         {
+          "arrive_at": 30000,
           "id": "horizon",
           "label": "High above: the curve of the horizon",
           "votes": 0
         },
         {
+          "arrive_at": 25000,
           "id": "dawn-valley",
           "label": "Dawn in the valley",
           "votes": 0
         },
         {
+          "arrive_at": 21000,
           "id": "peak-seam-low-sun",
           "label": "The peak at a low sun",
           "votes": 0

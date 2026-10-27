@@ -600,3 +600,44 @@ fn an_fcvm_tile_that_came_up_at_a_wake_has_a_last_launch_and_its_hosts_place() {
     let l = t.last_relaunch.as_ref().expect("a last launch");
     assert_eq!((l.clicked_at, l.first_frame_at), (6000, Some(9000)));
 }
+
+#[test]
+fn a_resumed_coordinator_does_not_count_a_decided_vote_again() {
+    // A state stored before the stop vote stayed open: after a decision it kept the decided
+    // round's offer and votes until the camera arrived, and the new code no longer clears them
+    // on arrival, so the camera would fly to the stop it was at.
+    let mut state = apply(State::new(Config::default(), 0), &Event::Tick { at: 5000 });
+    let d = &mut state.fleet.director;
+    let n = d.next.expect("decided at 5 s");
+    d.offer.insert(0, n);
+    d.offer.truncate(3);
+    d.votes.insert(
+        "192.0.2.1".into(),
+        fleet_core::director::Vote {
+            target: n,
+            intent: "n1".into(),
+            at: 0,
+        },
+    );
+    let mut state = state.resumed(Config::default(), 6000);
+    let arrive = state.fleet.director.arrive_next_at().unwrap();
+    state = apply(
+        state,
+        &Event::Tick {
+            at: (arrive * 1000.0) as u64,
+        },
+    );
+    assert_eq!(state.fleet.director.current, n);
+    let decide = state.fleet.director.decide_at();
+    state = apply(
+        state,
+        &Event::Tick {
+            at: (decide * 1000.0) as u64,
+        },
+    );
+    assert_ne!(
+        state.fleet.director.next,
+        Some(n),
+        "the camera would fly to where it is"
+    );
+}

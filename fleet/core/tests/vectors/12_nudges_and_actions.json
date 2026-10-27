@@ -1,5 +1,5 @@
 {
-  "description": "Viewers vote among the offered next holds, one vote per client address (a later vote replaces it); the most votes win and the winning nudge's id is stamped on that hold's keyframes; a target not offered, or a vote after the choice, is refused; actions carry the viewer, the intent id and its args.",
+  "description": "Viewers vote among the offered next holds, one vote per client address (a later vote replaces it); the most votes win and the winning nudge's id is stamped on that hold's keyframes; a target not offered is refused, and a vote after the choice counts for the hold after; actions carry the viewer, the intent id and its args.",
   "events": [
     {
       "at": 1000,
@@ -69,7 +69,7 @@
     },
     {
       "args": {
-        "target": "horizon"
+        "target": "peak-close"
       },
       "at": 5100,
       "client": "192.0.2.2",
@@ -110,8 +110,11 @@
     {
       "after": 8,
       "checks": {
-        "/receipts/n5/reason": "the next hold is already chosen; vote again during it"
-      }
+        "/receipts/n5/outcome": "committed",
+        "/view/nudges/leading": "peak-close",
+        "/view/nudges/next": "dawn-valley"
+      },
+      "note": "a vote after the choice counts for the hold after it"
     }
   ],
   "final_view": {
@@ -162,13 +165,13 @@
       },
       {
         "args": {
-          "target": "horizon"
+          "target": "peak-close"
         },
         "at": 5100,
         "id": "n5",
         "name": "nudge",
-        "outcome": "refused",
-        "summary": "the next hold is already chosen; vote again during it",
+        "outcome": "committed",
+        "summary": "nudge peak-close",
         "viewer": "v2"
       }
     ],
@@ -222,23 +225,31 @@
     "next_race_at": null,
     "nudges": {
       "arrive_next_at": 25000,
+      "closes_at": 30000,
       "holding": "coast",
+      "holding_label": "From the coast",
+      "leading": "peak-close",
       "next": "dawn-valley",
       "next_hold_at": 7000,
+      "next_label": "Dawn in the valley",
+      "opened_at": 5000,
       "targets": [
         {
-          "id": "horizon",
-          "label": "High above: the curve of the horizon",
+          "arrive_at": 50000,
+          "id": "peak-seam-low-sun",
+          "label": "The peak at a low sun",
           "votes": 0
         },
         {
-          "id": "dawn-valley",
-          "label": "Dawn in the valley",
-          "votes": 2
+          "arrive_at": 50000,
+          "id": "peak-close",
+          "label": "Close to the peak",
+          "votes": 1
         },
         {
-          "id": "peak-seam-low-sun",
-          "label": "The peak at a low sun",
+          "arrive_at": 50000,
+          "id": "high-lakes",
+          "label": "The high lakes",
           "votes": 0
         }
       ]

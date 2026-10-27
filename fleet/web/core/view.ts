@@ -20,7 +20,7 @@ import {
 import { FAMILY_PROBE_ATTEMPTS, FAMILY_PROBE_MS, frameSocketUrl, streamUrl, type Family } from "./net.ts";
 import { fitBandwidth, type StreamAsk } from "./bandwidth.ts";
 import { suggestMode } from "./mode.ts";
-import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type Aggregate, type FleetState, type Half, type IntentMsg, type Rect, type Tile } from "./protocol.ts";
+import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type Aggregate, type FleetState, type Half, type IntentMsg, type Nudges, type Rect, type Tile } from "./protocol.ts";
 import { KIND_TAG, NOT_AWAKE_NOTE, raceOnImage, ratioText, runningRace, scoreView, type RaceOnImage, type ScoreView } from "./race.ts";
 import { sceneUnixMs } from "./scene.ts";
 import { reelView, type ReelMeta, type ReelView } from "./reel.ts";
@@ -553,14 +553,15 @@ function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMs
   let nudge: PlayView["nudge"] = null;
   const nd = st.nudges;
   if (nd) {
-    const mine = lastMine(st, s.you, "nudge", nd.next_hold_at);
+    // This viewer's pick in the open vote (a pick before it opened was counted in an earlier one).
+    const mine = lastMine(st, s.you, "nudge", nd.opened_at);
     const pendingNudge = [...pend].reverse().find((i) => i.name === "nudge");
     const chosen = pendingNudge ? String(pendingNudge.args["target"] ?? "") : mine ? String(mine.args?.["target"] ?? "") : null;
-    const holding = nd.targets.find((x) => x.id === nd.holding);
+    const holding = nd.holding_label ?? nd.targets.find((x) => x.id === nd.holding)?.label ?? null;
     const next = nd.next_hold_at === null ? "" : `next stop in ${fmt.countdown(nd.next_hold_at - srvNow)}`;
     nudge = {
-      title: "Where the camera stops next",
-      note: [holding ? `holding on ${holding.label}` : "flying", next].filter(Boolean).join(" · "),
+      title: nd.next !== null && nd.next_label !== null ? `Where the camera stops after ${nd.next_label}` : "Where the camera stops next",
+      note: [holding !== null ? `holding on ${holding}` : "flying", next].filter(Boolean).join(" · "),
       options: nd.targets.map((x) => ({
         id: x.id,
         label: x.label,
@@ -613,12 +614,12 @@ function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMs
   };
 }
 
-/** This viewer's latest committed action of a kind since a time. */
-function lastMine(st: FleetState, you: string | null, name: string, before: number | null): Action | null {
+/** This viewer's latest committed action of a kind at or after a time. */
+function lastMine(st: FleetState, you: string | null, name: string, since: number | null): Action | null {
   let best: Action | null = null;
   for (const a of st.actions) {
     if (a.name !== name || a.outcome === "refused" || !sameViewer(a.viewer, you)) continue;
-    if (before !== null && a.at > before) continue;
+    if (since !== null && a.at < since) continue;
     if (best === null || a.at >= best.at) best = a;
   }
   return best;
@@ -1505,6 +1506,7 @@ export function wallView(input: WallInput): WallView {
 
   const play = playView(s, st, srvNow, pend, plan, input, online);
   const returning = stillReturning(st, s.ui.returning, srvNow);
+  const latestNudge = [...s.notices].reverse().find((n) => n.intent === "nudge")?.id ?? null;
   return {
     ...common,
     ready: true,
@@ -1543,7 +1545,11 @@ export function wallView(input: WallInput): WallView {
     returning,
     bandwidth: `${fmt.count(plan.direct.length, "direct stream", "direct streams")}, about ${fmt.mbps(plan.estimatedBps)} at the renderer's bit rate`,
     notices: s.notices.flatMap((n) => {
-      const text = noticeText(n);
+      // Only the latest stop choice speaks: a later pick replaced the earlier one's vote.
+      if (n.intent === "nudge" && n.id !== latestNudge) return [];
+      // A pick is dated by when the coordinator applied it, which says which vote it was in.
+      const applied = st.actions.find((a) => a.id === n.id && a.name === n.intent);
+      const text = noticeText(n, { nudges: st.nudges, srvNow, srvAt: applied?.at ?? serverNow(s.clock, n.at) });
       return text === null ? [] : [{ key: n.id, text }];
     }),
     gridLabel: `The image, ${fmt.count(st.tiles.length, "square", "squares")}: fcvm on the left, EC2 on the right. Arrow keys move between squares, Enter opens one.`,
@@ -1560,11 +1566,59 @@ const INTENT_LABEL: Record<string, string> = {
   nudge: "Your choice of stop",
 };
 
-/** A refused action, as the page says it. Words and claims have their own lines. */
-export function noticeText(n: Notice): string | null {
+/** What a notice needs from the fleet: the directed camera, the server time now and at the notice. */
+export interface NoticeContext {
+  nudges: Nudges | null;
+  srvNow: number;
+  srvAt: number;
+}
+
+/**
+ * A notice, as the page says it: a refused action, and what a stop choice will do. Words and
+ * claims have their own lines.
+ */
+export function noticeText(n: Notice, ctx: NoticeContext | null = null): string | null {
+  if (n.intent === "nudge" && ctx?.nudges) return stopChoiceText(n, ctx.nudges, ctx.srvNow, ctx.srvAt);
   if (n.kind !== "refused" || n.intent === "word" || n.intent === "claim_gpu" || n.intent === "claim_camera" || n.intent === "release_gpu") return null;
   const what = INTENT_LABEL[n.intent] ?? n.intent;
   return `${what} was not applied${n.reason ? `: ${n.reason}` : ""}`;
+}
+
+/**
+ * What a viewer's stop choice will do, from the open vote now: the vote is always open, for
+ * the first hold not yet decided, so a counted pick is next up, comes after the hold already
+ * decided, or trails the leader until the vote closes.
+ */
+function stopChoiceText(n: Notice, nd: Nudges, srvNow: number, srvAt: number): string {
+  const target = String(n.args["target"] ?? "");
+  const label = (id: string | null) => nd.targets.find((x) => x.id === id)?.label ?? null;
+  const inT = (at: number | null) => (at === null ? "" : `, in ${fmt.countdown(at - srvNow)}`);
+  const leader = nd.targets.find((x) => x.id === nd.leading) ?? null;
+  const nextUp =
+    nd.next !== null
+      ? `Next up: ${nd.next_label ?? "the next stop"}${inT(nd.arrive_next_at)}`
+      : leader
+        ? `Next up: ${leader.label}${inT(leader.arrive_at)}`
+        : "";
+  const mine = nd.targets.find((x) => x.id === target) ?? null;
+  if (n.kind === "refused") {
+    const why = mine === null && target !== nd.next ? "That stop is not offered now." : `Your pick did not count${n.reason ? `: ${n.reason}` : ""}.`;
+    return [why, nextUp].filter(Boolean).join(" ");
+  }
+  if (target === nd.next) return nextUp;
+  // Reached, unless the open vote offers it again (a return after the hold already decided).
+  if (target === nd.holding && mine === null) return `Your pick, ${nd.holding_label ?? "this stop"}: the camera is there now`;
+  // The vote this pick was in has closed and chose another stop.
+  if (mine === null || (nd.opened_at !== null && srvAt < nd.opened_at)) {
+    return `The vote went to ${nd.next_label ?? label(nd.leading) ?? "another stop"}. Pick again for the stop after it.`;
+  }
+  if (target === nd.leading) {
+    return nd.next === null
+      ? `Next up: your pick, ${mine.label}${inT(mine.arrive_at)}`
+      : `Your pick, ${mine.label}, comes after ${nd.next_label ?? "the next stop"}${inT(mine.arrive_at)}`;
+  }
+  const closes = nd.closes_at === null ? "" : ` The vote closes in ${fmt.countdown(nd.closes_at - srvNow)}.`;
+  return `Your vote for ${mine.label} is in; ${leader ? `${leader.label} leads ${leader.votes} to ${mine.votes}` : "another stop leads"}.${closes}`;
 }
 
 /** Whether the page must verify the viewer before sending an action. */

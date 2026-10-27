@@ -125,7 +125,7 @@ Intents:
 |------|------|--------|
 | `restart_now` | `{}` | starts a race now (below); refused while the global cooldown runs (`race.cooldown_until`) |
 | `relaunch` | `{"tile": "fcvm:3"}` (a tile id) or `{"tile": "slot-3"}` / `{"tile": "ec2-2"}` (a slot id) | bumps that slot's generation; refused for a dark tile, a draining host, a borrowed GPU, or a second relaunch from the client within 2 s |
-| `nudge` | `{"target": "<viewpoint>"}` | a vote for the next camera hold, among `nudges.targets`; one vote per client, the latest counts; refused once the vote has closed |
+| `nudge` | `{"target": "<viewpoint>"}` | a vote in the open vote (below), among `nudges.targets`; one vote per client, the latest counts; a pick of the hold just decided (`nudges.next`) is accepted and changes nothing; refused only for a target not offered |
 | `word` | `{"text": "hello", "text_style": "skywriting"}` | 1 to 28 characters (the renderer's limit) after collapsing whitespace, no control characters, one per client per 5 s; checked together with every word in the sky first (below). `text_style` is how the renderer draws it (#1178): `lockup` (when absent or null), `skywriting` or `landmark`; anything else is refused before the text check |
 | `light` | `{"pos": [x, y, z], "color": [r, g, b]}` | one per client per second; each client keeps its latest 3 (its oldest goes); `color` components are clamped to [0, 1], then scaled so they add up to at most 2; the scene keeps the latest 32 |
 | `claim_gpu` | `{}` | a GPU of your own for 60 s (below) |
@@ -158,10 +158,21 @@ lent to a visitor sit the race out.
 **The directed camera.** The coordinator flies the wall's camera along a path generated
 from `--camera-seed`: holds of 7 s at named viewpoints (low sun, a high leg showing the
 horizon's curve, the main peak and the clock in the sky framed across the fcvm/EC2 seam at
-image centre), joined by flights. The order loops and is the same for the same seed. Two
-seconds before a hold ends the vote closes: the offered viewpoint with the most `nudge`
-votes is next (ties go to the earlier offered; no votes, the default next). The winning
-nudge's id is stamped on that hold's keyframes (`camera[].intent`).
+image centre), joined by flights. The order loops and is the same for the same seed.
+
+Viewers pick the stops by vote, and the vote is always open: it is for the first hold not
+yet decided. Two seconds before a hold ends the open vote closes and decides the next hold:
+the offered viewpoint with the most `nudge` votes, of tied ones the one picked first (a
+client that picks the same viewpoint again keeps its first time), and with no votes the
+default (the next in the order). The winning nudge's id is stamped on that hold's keyframes
+(`camera[].intent`). The decision is when the camera commits: the next hold's keyframes are
+published then, so every renderer has the flight before it starts, and a decided hold is
+not replaced. In the same step the vote for the hold after it opens, offering the
+viewpoints that follow it in the order, so a pick made while the camera finishes a hold or
+flies counts for the hold after the one it is heading to; votes are not cleared when the
+camera arrives. A viewer's pick therefore always counts, and the camera reaches it at the
+target's `arrive_at` when it wins. Ties going to the earlier pick mean one viewer cannot
+overturn another's pick within its vote; two viewers who agree outvote one.
 
 **Viewer text** (`word`). Before the event is applied the coordinator asks Claude Haiku on
 Amazon Bedrock whether the text may be shown publicly, read together with every word now
@@ -257,10 +268,12 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
                       "dropped": 0, "done_at": 1761134407530, "time_ms": 7530, "last": "slot-6",
                       "capacity_wait_ms": 0, "sitting_out": ["fcvm:2"]},
              "ec2": { ... }}],
-  "nudges": {"targets": [{"id": "coast", "label": "From the coast", "votes": 2},
-                         {"id": "horizon", "label": "High above: the curve of the horizon", "votes": 0},
-                         {"id": "dawn-valley", "label": "Dawn in the valley", "votes": 1}],
-             "holding": "peak-seam", "next_hold_at": 1761134407000, "next": null, "arrive_next_at": null},
+  "nudges": {"targets": [{"id": "coast", "label": "From the coast", "votes": 2, "arrive_at": 1761134422000},
+                         {"id": "horizon", "label": "High above: the curve of the horizon", "votes": 0, "arrive_at": 1761134431000},
+                         {"id": "dawn-valley", "label": "Dawn in the valley", "votes": 1, "arrive_at": 1761134420000}],
+             "holding": "peak-seam", "holding_label": "The peak across the seam", "next_hold_at": 1761134407000, "next": null, "next_label": null,
+             "arrive_next_at": null, "leading": "coast", "opened_at": 1761134383000,
+             "closes_at": 1761134405000},
   "borrow": {"cap": 1, "lent": 1, "next_return_at": 1761134460000},
   "failures": [
     {"kind": "host_reclaimed", "host": "<host>", "since": 1761134400000, "retiling": true},
@@ -342,10 +355,14 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   its id. A race with no tiles in a half does not count for it.
 - `races` keeps the last 10 races with every tile's phases; tiles whose host was
   reclaimed mid-race are `dropped`, borrowed ones `sitting_out`.
-- `nudges` is the directed camera: `targets` are the viewpoints `nudge` may name now
-  (`id`), with a label and this hold's votes; `holding` is the viewpoint held now (null
-  while flying) and `next_hold_at` when the camera leaves it; `next` is the next hold once
-  the vote has closed, `arrive_next_at` when the camera gets there.
+- `nudges` is the directed camera: `targets` are the viewpoints the open vote is among,
+  the ones `nudge` may name now (`id`), each with a label, its votes and `arrive_at`, when
+  the camera gets there if it wins; `holding` (and `holding_label`) is the viewpoint held
+  now (null while flying) and `next_hold_at` when the camera leaves it; `next` (and `next_label`) is the next hold
+  once decided, `arrive_next_at` when the camera gets there. While `next` is null the open
+  vote decides it; otherwise it decides the hold after `next`. `leading` is the target that
+  wins if the vote closed now (the default when nobody voted); `opened_at` and
+  `closes_at` bound the open vote.
 - `fleet.power` is whether the GPU capacity is up, when the coordinator launches the GPU
   hosts (`--host-template`), or with `--sleep-when-idle` on hosts it does not launch (a
   fixed host, a test box); without either it stays `awake`. After

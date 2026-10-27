@@ -233,7 +233,7 @@ export class MockCoordinator {
   private cooldownUntil: number | null = null;
   /** A test's forced capacity wait for the next race. */
   private forcedWaitMs: number | null = null;
-  private nudge: { holding: string | null; nextHoldAt: number; votes: Map<string, string> };
+  private nudge: { holding: string | null; nextHoldAt: number; openedAt: number; votes: Map<string, string> };
   private nextClaim = 0;
   private aggregates: { id: string; half: Half; host: string | null; rect: Rect; tiles: string[] }[] = [];
   /** The fcvm GPUs live, by slot number (a host has slots of one block of gpusPerHost). */
@@ -285,7 +285,7 @@ export class MockCoordinator {
     this.applyLayout(null);
     const start = this.now();
     this.nextRaceAt = opts.raceEverySecs > 0 ? start + opts.firstRaceSecs * 1000 : null;
-    this.nudge = { holding: "planet", nextHoldAt: start + (opts.holdSecs + opts.travelSecs) * 1000, votes: new Map() };
+    this.nudge = { holding: "planet", nextHoldAt: start + (opts.holdSecs + opts.travelSecs) * 1000, openedAt: start, votes: new Map() };
     const t0 = sceneT(opts.epochUnixMs, start);
     const first = NUDGE_TARGETS[0]!;
     this.camera = [{ t: t0, x: first.x, y: first.y, zoom: first.zoom }];
@@ -428,9 +428,22 @@ export class MockCoordinator {
       cooldown_until: this.cooldownUntil !== null && this.cooldownUntil > now ? this.cooldownUntil : null,
       scoreboard: this.scoreboard(),
       nudges: {
-        targets: NUDGE_TARGETS.map((x) => ({ id: x.id, label: x.label, votes: [...this.nudge.votes.values()].filter((v) => v === x.id).length })),
+        targets: NUDGE_TARGETS.map((x) => ({
+          id: x.id,
+          label: x.label,
+          votes: [...this.nudge.votes.values()].filter((v) => v === x.id).length,
+          arrive_at: this.nudge.nextHoldAt + this.opts.travelSecs * 1000,
+        })),
         holding: this.nudge.holding,
+        holding_label: NUDGE_TARGETS.find((x) => x.id === this.nudge.holding)?.label ?? null,
         next_hold_at: this.nudge.nextHoldAt,
+        // The mock decides when the camera leaves, so no next hold is ever decided ahead.
+        next: null,
+        next_label: null,
+        arrive_next_at: null,
+        leading: this.leadingStop(),
+        opened_at: this.nudge.openedAt,
+        closes_at: this.nudge.nextHoldAt,
       },
       viewers: { count: this.clients.size, active: [...this.clients].filter((c) => c.visible).length },
       actions: this.actions,
@@ -849,8 +862,8 @@ export class MockCoordinator {
     }
   }
 
-  /** The camera leaves for the stop with the most votes (ties: the next in order). */
-  private nextStop(now: number): void {
+  /** The stop with the most votes (ties: the next in order). */
+  private leadingStop(): string {
     const order = NUDGE_TARGETS.map((x) => x.id);
     const cur = this.nudge.holding === null ? -1 : order.indexOf(this.nudge.holding);
     const counts = new Map<string, number>();
@@ -865,6 +878,12 @@ export class MockCoordinator {
         bestVotes = n;
       }
     }
+    return best;
+  }
+
+  /** The camera leaves for the leading stop. */
+  private nextStop(now: number): void {
+    const best = this.leadingStop();
     const target = NUDGE_TARGETS.find((x) => x.id === best)!;
     const t = sceneT(this.opts.epochUnixMs, now);
     const here = cameraAt(this.camera, t);
@@ -874,7 +893,7 @@ export class MockCoordinator {
       { t, x: here["x"] ?? 0, y: here["y"] ?? 0, zoom: here["zoom"] ?? 1 },
       { t: t + this.opts.travelSecs, x: words?.x ?? target.x, y: words?.y ?? target.y, zoom: target.zoom },
     ];
-    this.nudge = { holding: best, nextHoldAt: now + (this.opts.holdSecs + this.opts.travelSecs) * 1000, votes: new Map() };
+    this.nudge = { holding: best, nextHoldAt: now + (this.opts.holdSecs + this.opts.travelSecs) * 1000, openedAt: now, votes: new Map() };
     this.markDirty();
   }
 

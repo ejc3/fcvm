@@ -26,7 +26,7 @@ import { END_CARD_MS } from "../race.ts";
 import { tileAt as tileAtPoint } from "../layout.ts";
 import { familyProbeTargets } from "../net.ts";
 import { parseReelMeta, reelView } from "../reel.ts";
-import type { Aggregate, Claim, FleetState, Power, RelaunchAll } from "../protocol.ts";
+import type { Aggregate, Claim, FleetState, Nudges, Power, RelaunchAll } from "../protocol.ts";
 import { EPOCH, fleet, fleetSplit, snapshotText } from "./fixtures.ts";
 
 function stateWith(st: FleetState, version = 1): ClientState {
@@ -441,6 +441,94 @@ describe("Turnstile", () => {
   });
 });
 
+/** The directed camera holding on the ringed planet, the vote open for the next stop. */
+function nudges(over: Partial<Nudges> = {}): Nudges {
+  return {
+    targets: [
+      { id: "moon", label: "the moon", votes: 0, arrive_at: EPOCH + 20_000 },
+      { id: "stars", label: "the star field", votes: 1, arrive_at: EPOCH + 12_000 },
+    ],
+    holding: "planet",
+    holding_label: "the ringed planet",
+    next_hold_at: EPOCH + 12_000,
+    next: null,
+    next_label: null,
+    arrive_next_at: null,
+    leading: "stars",
+    opened_at: EPOCH - 1_000,
+    closes_at: EPOCH + 5_000,
+    ...over,
+  };
+}
+
+/** The page after this viewer picked `target` and the coordinator answered. */
+function picked(n: Nudges, target: string, receipt: Record<string, unknown> = { outcome: "committed" }): ClientState {
+  let s = msg(stateWith(fleet(2, 2, { nudges: n })), { type: "hello", viewer: "v-3", turnstile: null });
+  s = reduce(s, { type: "intent-sent", intent: makeIntent("n", "nudge", { target }), at: EPOCH });
+  return msg(s, { type: "receipt", id: "n", version: 2, ...receipt });
+}
+
+describe("a stop choice says what the camera will do", () => {
+  it("is next up when it leads the open vote", () => {
+    expect(view(picked(nudges(), "stars"), EPOCH).notices).toEqual([{ key: "n", text: "Next up: your pick, the star field, in 0:12" }]);
+  });
+
+  it("comes after the hold already decided", () => {
+    const n = nudges({ holding: null, next_hold_at: null, next: "planet", next_label: "the ringed planet", arrive_next_at: EPOCH + 9_000 });
+    n.targets[1]!.arrive_at = EPOCH + 41_000;
+    expect(view(picked(n, "stars"), EPOCH).notices[0]!.text).toBe("Your pick, the star field, comes after the ringed planet, in 0:41");
+  });
+
+  it("is next up when it is the hold just decided", () => {
+    const n = nudges({ next: "stars", next_label: "the star field", arrive_next_at: EPOCH + 20_000 });
+    expect(view(picked(n, "stars"), EPOCH).notices[0]!.text).toBe("Next up: the star field, in 0:20");
+  });
+
+  it("trails the leader until the vote closes", () => {
+    const n = nudges({ leading: "moon" });
+    n.targets[0]!.votes = 2;
+    expect(view(picked(n, "stars"), EPOCH).notices[0]!.text).toBe(
+      "Your vote for the star field is in; the moon leads 2 to 1. The vote closes in 0:05.",
+    );
+  });
+
+  it("says where the camera goes when a pick is refused", () => {
+    const s = picked(nudges(), "comet", { outcome: "refused", reason: "\"comet\" is not offered" });
+    expect(view(s, EPOCH).notices[0]!.text).toBe("That stop is not offered now. Next up: the star field, in 0:12");
+    const verify = picked(nudges(), "stars", { outcome: "refused", reason: "verify first" });
+    expect(view(verify, EPOCH).notices[0]!.text).toBe("Your pick did not count: verify first. Next up: the star field, in 0:12");
+  });
+
+  it("dates a pick by when the coordinator applied it, not when its receipt arrived", () => {
+    // Applied 100 ms before the vote it was in closed; the receipt came after the next one opened.
+    const n = nudges({ next: "planet", next_label: "the ringed planet", arrive_next_at: EPOCH + 9_000, opened_at: EPOCH, leading: "moon" });
+    let s = msg(stateWith(fleet(2, 2, { nudges: n, actions: [{ at: EPOCH - 100, viewer: "v-3", id: "n", name: "nudge", args: { target: "stars" }, summary: "nudge stars", outcome: "committed" }] })), { type: "hello", viewer: "v-3", turnstile: null });
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("n", "nudge", { target: "stars" }), at: EPOCH - 150 });
+    s = msg(s, { type: "receipt", id: "n", version: 2, outcome: "committed" }, EPOCH);
+    expect(view(s, EPOCH).notices[0]!.text).toBe("The vote went to the ringed planet. Pick again for the stop after it.");
+  });
+
+  it("speaks only for the latest pick", () => {
+    let s = picked(nudges(), "moon");
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("n2", "nudge", { target: "stars" }), at: EPOCH + 1 });
+    s = msg(s, { type: "receipt", id: "n2", version: 3, outcome: "committed" }, EPOCH + 1);
+    expect(view(s, EPOCH + 1).notices).toEqual([{ key: "n2", text: "Next up: your pick, the star field, in 0:12" }]);
+  });
+
+  it("tells a pick to come back to the held stop from one already reached", () => {
+    // The vote after the decided hold can offer the stop the camera is still holding.
+    const n = nudges({ holding: "stars", holding_label: "the star field", next: "planet", next_label: "the ringed planet", arrive_next_at: EPOCH + 9_000 });
+    n.targets[1]!.arrive_at = EPOCH + 41_000;
+    expect(view(picked(n, "stars"), EPOCH).notices[0]!.text).toBe("Your pick, the star field, comes after the ringed planet, in 0:41");
+  });
+
+  it("says the camera is there once the pick is held", () => {
+    const n = nudges({ holding: "stars", holding_label: "the star field" });
+    n.targets = n.targets.filter((x) => x.id !== "stars");
+    expect(view(picked(n, "stars"), EPOCH).notices[0]!.text).toBe("Your pick, the star field: the camera is there now");
+  });
+});
+
 describe("the Play drawer", () => {
   it("reports a word that is being checked, then refused", () => {
     let s = stateWith(fleet());
@@ -452,7 +540,7 @@ describe("the Play drawer", () => {
 
   it("lists the camera's next stops with votes and marks this viewer's choice", () => {
     const st = fleet(2, 2, {
-      nudges: { targets: [{ id: "planet", label: "the ringed planet", votes: 0 }, { id: "stars", label: "the star field", votes: 2 }], holding: "planet", next_hold_at: EPOCH + 12_000 },
+      nudges: nudges({ targets: [{ id: "planet", label: "the ringed planet", votes: 0, arrive_at: null }, { id: "stars", label: "the star field", votes: 2, arrive_at: null }] }),
     });
     let s = msg(stateWith(st), { type: "hello", viewer: "v-3", turnstile: null });
     s = reduce(s, { type: "intent-sent", intent: makeIntent("n", "nudge", { target: "stars" }), at: EPOCH });

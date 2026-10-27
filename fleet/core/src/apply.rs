@@ -668,7 +668,7 @@ fn intent_effect(
             Ok(format!("race {id}"))
         }
         Intent::Nudge { target } => {
-            state.fleet.director.vote(c.client, target, c.id)?;
+            state.fleet.director.vote(c.client, target, c.id, c.at)?;
             Ok(format!("nudge {target}"))
         }
         Intent::Word { text, text_style } => {

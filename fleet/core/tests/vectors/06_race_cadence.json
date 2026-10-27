@@ -250,21 +250,29 @@
     "next_race_at": 110000,
     "nudges": {
       "arrive_next_at": null,
+      "closes_at": 85000,
       "holding": "peak-seam-low-sun",
+      "holding_label": "The peak at a low sun",
+      "leading": "peak-close",
       "next": null,
       "next_hold_at": 87000,
+      "next_label": null,
+      "opened_at": 79999,
       "targets": [
         {
+          "arrive_at": 95000,
           "id": "peak-close",
           "label": "Close to the peak",
           "votes": 0
         },
         {
+          "arrive_at": 105000,
           "id": "high-lakes",
           "label": "The high lakes",
           "votes": 0
         },
         {
+          "arrive_at": 95000,
           "id": "peak-seam",
           "label": "The peak across the seam",
           "votes": 0

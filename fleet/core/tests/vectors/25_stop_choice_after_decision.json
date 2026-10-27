@@ -1,0 +1,286 @@
+{
+  "description": "A stop chosen after the director has decided the next hold on its own is not refused: it counts for the hold after, wins that vote, and the camera arrives there at the time the offer promised. A pick of the hold just decided (the offer moved on while the click was on its way) is accepted as what already happens.",
+  "events": [
+    {
+      "at": 1000,
+      "client": "192.0.2.1",
+      "type": "viewer_joined",
+      "viewer": "v1"
+    },
+    {
+      "at": 1000,
+      "client": "192.0.2.2",
+      "type": "viewer_joined",
+      "viewer": "v2"
+    },
+    {
+      "at": 5000,
+      "type": "tick"
+    },
+    {
+      "args": {
+        "target": "horizon"
+      },
+      "at": 5500,
+      "client": "192.0.2.2",
+      "id": "n0",
+      "name": "nudge",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "target": "peak-close"
+      },
+      "at": 6000,
+      "client": "192.0.2.1",
+      "id": "n1",
+      "name": "nudge",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "at": 30000,
+      "type": "tick"
+    },
+    {
+      "at": 35000,
+      "type": "tick"
+    }
+  ],
+  "expect": [
+    {
+      "after": 2,
+      "checks": {
+        "/view/nudges/closes_at": 35000,
+        "/view/nudges/next": "horizon",
+        "/view/nudges/opened_at": 5000,
+        "/view/scene/camera/3/intent": null
+      },
+      "note": "nobody voted: the director chose the default, and the vote for the hold after opened"
+    },
+    {
+      "after": 3,
+      "checks": {
+        "/receipts/n0/outcome": "committed",
+        "/view/nudges/next": "horizon",
+        "/view/nudges/targets/0/votes": 0,
+        "/view/nudges/targets/1/votes": 0,
+        "/view/nudges/targets/2/votes": 0
+      },
+      "note": "a pick of the hold just decided is what happens already"
+    },
+    {
+      "after": 4,
+      "checks": {
+        "/receipts/n1/outcome": "committed",
+        "/view/nudges/leading": "peak-close",
+        "/view/nudges/next": "horizon",
+        "/view/nudges/targets/2/arrive_at": 55000,
+        "/view/nudges/targets/2/id": "peak-close",
+        "/view/nudges/targets/2/votes": 1
+      }
+    },
+    {
+      "after": 5,
+      "checks": {
+        "/view/nudges/holding": "horizon",
+        "/view/nudges/leading": "peak-close",
+        "/view/nudges/next": null,
+        "/view/nudges/targets/2/votes": 1
+      },
+      "note": "the vote survives the arrival"
+    },
+    {
+      "after": 6,
+      "checks": {
+        "/view/nudges/arrive_next_at": 55000,
+        "/view/nudges/next": "peak-close",
+        "/view/nudges/opened_at": 35000,
+        "/view/scene/camera/2/intent": "n1"
+      }
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "args": {
+          "target": "horizon"
+        },
+        "at": 5500,
+        "id": "n0",
+        "name": "nudge",
+        "outcome": "committed",
+        "summary": "nudge horizon",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "target": "peak-close"
+        },
+        "at": 6000,
+        "id": "n1",
+        "name": "nudge",
+        "outcome": "committed",
+        "summary": "nudge peak-close",
+        "viewer": "v1"
+      }
+    ],
+    "aggregates": [],
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "budget": null,
+    "budget_from_t": null,
+    "claims": [],
+    "cooldown_until": null,
+    "counters": {
+      "restores": 0,
+      "restores_last_hour": 0,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
+    "failures": [],
+    "fleet": {
+      "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
+      "fcvm_gpus": 0,
+      "gpus": 0,
+      "hosts": [],
+      "max_tiles": 100,
+      "n": 0,
+      "power": {
+        "asleep_since": null,
+        "hosts": [],
+        "idle_since": null,
+        "last_wake": null,
+        "state": "awake",
+        "wakes": [],
+        "woke_at": null
+      },
+      "standby": [],
+      "standby_ready": 0,
+      "warming": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": null,
+      "from_frame": 0,
+      "from_t": 0.0,
+      "generation": 0
+    },
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": 55000,
+      "closes_at": 60000,
+      "holding": "horizon",
+      "holding_label": "High above: the curve of the horizon",
+      "leading": "peak-seam-low-sun",
+      "next": "peak-close",
+      "next_hold_at": 37000,
+      "next_label": "Close to the peak",
+      "opened_at": 35000,
+      "targets": [
+        {
+          "arrive_at": 70000,
+          "id": "peak-seam-low-sun",
+          "label": "The peak at a low sun",
+          "votes": 0
+        },
+        {
+          "arrive_at": 80000,
+          "id": "high-lakes",
+          "label": "The high lakes",
+          "votes": 0
+        },
+        {
+          "arrive_at": 70000,
+          "id": "peak-seam",
+          "label": "The peak across the seam",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [],
+    "relaunch_all": null,
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 70.0,
+          "look": [
+            -75.0,
+            28.0,
+            -170.0
+          ],
+          "pos": [
+            -30.0,
+            38.0,
+            -60.0
+          ],
+          "t": 30.0
+        },
+        {
+          "fov_deg": 70.0,
+          "look": [
+            -75.0,
+            28.0,
+            -170.0
+          ],
+          "pos": [
+            -30.0,
+            38.0,
+            -60.0
+          ],
+          "t": 37.0
+        },
+        {
+          "fov_deg": 50.0,
+          "intent": "n1",
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -62.0,
+            3.5,
+            -105.0
+          ],
+          "t": 55.0
+        },
+        {
+          "fov_deg": 50.0,
+          "intent": "n1",
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -62.0,
+            3.5,
+            -105.0
+          ],
+          "t": 62.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.45,
+      "words": []
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": null
+    },
+    "tiles": [],
+    "viewers": {
+      "active": 2,
+      "count": 2
+    }
+  }
+}
