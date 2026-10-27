@@ -1,0 +1,271 @@
+{
+  "config": {
+    "history_idle_secs": 60
+  },
+  "description": "With a viewer on an awake wall and no word in the sky for history_idle_secs, a tick writes a line of GPU history as a system word: no receipt, no action, the next line in the seeded rotation and the next style. A viewer's word is the newest and so replaces it, and pushes the next system word out by its hold (90 s for lockup) plus the gap. Nothing is written once the wall is empty.",
+  "events": [
+    {
+      "at": 1000,
+      "client": "198.51.100.31",
+      "type": "viewer_joined",
+      "viewer": "v1"
+    },
+    {
+      "at": 2000,
+      "type": "tick"
+    },
+    {
+      "at": 61000,
+      "type": "tick"
+    },
+    {
+      "at": 62000,
+      "type": "tick"
+    },
+    {
+      "args": {
+        "text": "hello"
+      },
+      "at": 70000,
+      "check": {
+        "reason": "ok",
+        "sky": [],
+        "verdict": "allow"
+      },
+      "client": "198.51.100.31",
+      "id": "w1",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "at": 219000,
+      "type": "tick"
+    },
+    {
+      "at": 220000,
+      "type": "tick"
+    },
+    {
+      "at": 221000,
+      "type": "viewer_left",
+      "viewer": "v1"
+    },
+    {
+      "at": 900000,
+      "type": "tick"
+    }
+  ],
+  "expect": [
+    {
+      "after": 1,
+      "checks": {
+        "/view/scene/words": []
+      },
+      "note": "the gap starts at the first tick with a viewer"
+    },
+    {
+      "after": 2,
+      "checks": {
+        "/view/scene/words": []
+      }
+    },
+    {
+      "after": 3,
+      "checks": {
+        "/receipts": {},
+        "/view/actions": [],
+        "/view/scene/words/0/system": true,
+        "/view/scene/words/0/t": 62.0,
+        "/view/scene/words/0/text_style": "lockup"
+      }
+    },
+    {
+      "after": 4,
+      "checks": {
+        "/receipts/w1/outcome": "committed",
+        "/view/scene/words/1/system": null,
+        "/view/scene/words/1/text": "hello"
+      },
+      "note": "the viewer's word is newest, so it is the one drawn"
+    },
+    {
+      "after": 5,
+      "checks": {
+        "/view/scene/words/2": null
+      }
+    },
+    {
+      "after": 6,
+      "checks": {
+        "/view/scene/words/0/text": "hello",
+        "/view/scene/words/1/system": true,
+        "/view/scene/words/1/t": 220.0,
+        "/view/scene/words/1/text_style": "skywriting",
+        "/view/scene/words/2": null
+      },
+      "note": "the first system word is replaced by the second; the viewer's word stays"
+    },
+    {
+      "after": 8,
+      "checks": {
+        "/view/scene/words/1/t": 220.0,
+        "/view/scene/words/2": null
+      },
+      "note": "an empty wall gets no word"
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "args": {
+          "text": "hello"
+        },
+        "at": 70000,
+        "id": "w1",
+        "name": "word",
+        "outcome": "committed",
+        "summary": "word \"hello\"",
+        "viewer": "v1"
+      }
+    ],
+    "aggregates": [],
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "budget": null,
+    "budget_from_t": null,
+    "claims": [],
+    "cooldown_until": null,
+    "counters": {
+      "restores": 0,
+      "restores_last_hour": 0,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
+    "failures": [],
+    "fleet": {
+      "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
+      "fcvm_gpus": 0,
+      "gpus": 0,
+      "hosts": [],
+      "max_tiles": 100,
+      "n": 0,
+      "power": {
+        "asleep_since": null,
+        "hosts": [],
+        "idle_since": null,
+        "last_wake": null,
+        "state": "awake",
+        "wakes": [],
+        "woke_at": null
+      },
+      "standby": [],
+      "standby_ready": 0,
+      "warming": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": null,
+      "from_frame": 0,
+      "from_t": 0.0,
+      "generation": 0
+    },
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": null,
+      "closes_at": 905000,
+      "holding": "peak-seam",
+      "holding_label": "The peak across the seam",
+      "leading": "sunset-ridge",
+      "next": null,
+      "next_hold_at": 907000,
+      "next_label": null,
+      "opened_at": 219000,
+      "targets": [
+        {
+          "arrive_at": 920000,
+          "id": "sunset-ridge",
+          "label": "Sunset over the ridge",
+          "votes": 0
+        },
+        {
+          "arrive_at": 925000,
+          "id": "coast",
+          "label": "From the coast",
+          "votes": 0
+        },
+        {
+          "arrive_at": 921000,
+          "id": "horizon",
+          "label": "High above: the curve of the horizon",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [],
+    "relaunch_all": null,
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.75,
+            -114.75
+          ],
+          "pos": [
+            -47.0,
+            2.6,
+            -101.0
+          ],
+          "t": 900.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.75,
+            -114.75
+          ],
+          "pos": [
+            -47.0,
+            2.6,
+            -101.0
+          ],
+          "t": 907.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.4,
+      "words": [
+        {
+          "t": 70.0,
+          "text": "hello",
+          "text_style": "lockup"
+        },
+        {
+          "system": true,
+          "t": 220.0,
+          "text": "1999: GeForce 256, 'a GPU'",
+          "text_style": "skywriting"
+        }
+      ]
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": null
+    },
+    "tiles": [],
+    "viewers": {
+      "active": 0,
+      "count": 0
+    }
+  }
+}

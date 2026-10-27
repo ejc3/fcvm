@@ -10,6 +10,7 @@ pub mod apply;
 pub mod budget;
 pub mod director;
 pub mod event;
+pub mod history;
 pub mod protocol;
 pub mod scene;
 pub mod state;

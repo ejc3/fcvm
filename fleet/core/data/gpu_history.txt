@@ -1,0 +1,58 @@
+# Idle words for the wall: one short line of GPU history per line, drawn when no viewer
+# word has been shown for a while (fleet/PROTOCOL.md, "System words").
+#
+# Rules, enforced by tests in fleet/core/src/history.rs: printable ASCII only, at most 28
+# characters (the renderer's and the core's word limit), no blank or duplicate lines.
+# Lines starting with # are comments. Order is not significant: the core shuffles each
+# pass deterministically.
+#
+# Every fact was checked against the English Wikipedia article for its subject on
+# 2026-10-27 (GeForce 256, CUDA, AlexNet, Turing, Volta, Ampere, Hopper, Ada Lovelace,
+# Blackwell, Voodoo Graphics, OpenGL, GeForce 3 and 8 series, Radeon R300, Titan,
+# Tianhe-1, PlayStation 4, Xbox, Nvidia, Nvidia Tesla, Sketchpad, Rendering equation,
+# Toy Story, Vulkan, DirectX Raytracing, OpenCL, ATI Technologies, Graphics processing
+# unit). A line that could not be checked is not here.
+1963: Sutherland's Sketchpad
+1979: Galaxian's sprites
+1986: The rendering equation
+1987: IBM introduces VGA
+1992: OpenGL 1.0 ships
+1993: Nvidia is founded
+1994: Sony's PlayStation GPU
+1995: Toy Story, all CGI
+1996: 3dfx Voodoo on shelves
+1997: Nvidia RIVA 128
+1998: Voodoo2 brings SLI
+1999: GeForce 256, 'a GPU'
+GeForce 256: 17M transistors
+2000: Nvidia buys 3dfx's IP
+2001: GeForce 3 adds shaders
+2001: Xbox ships Nvidia NV2A
+2002: Radeon 9700 ships DX9
+2006: AMD buys ATI, $5.6B
+2006: GeForce 8800 unifies
+2007: CUDA SDK goes public
+2007: Tesla C870 launches
+2009: OpenCL 1.0 ships
+2010: Tianhe-1A, TOP500 #1
+2012: AlexNet, two GTX 580s
+2012: AlexNet wins ImageNet
+2012: Titan, 18,688 GPUs
+2012: Kepler GTX 680
+2013: PS4, 1.84 teraflops
+2016: Pascal, GTX 1080
+2016: Vulkan 1.0 released
+2017: Volta, tensor cores
+GV100: 21.1B transistors
+2018: Turing adds RT cores
+TU102: 18.6B transistors
+2018: Tesla T4 debuts
+2018: Microsoft unveils DXR
+A100: 54.2B transistors
+H100: 80B transistors
+Hopper honors Grace Hopper
+2022: Ada Lovelace announced
+2024: Blackwell announced
+Blackwell: 208B transistors
+This wall: path traced live
+Each tile: one GPU, one VM

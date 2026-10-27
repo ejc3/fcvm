@@ -4,6 +4,7 @@
 
 use crate::director::viewpoints;
 use crate::event::{Event, Intent};
+use crate::history;
 use crate::protocol::{AgentMsg, HealthReport, SlotReport};
 use crate::scene::{drag, Keyframe, Light, Word, MAX_LIGHTS, MAX_WORDS};
 use crate::state::*;
@@ -25,6 +26,7 @@ fn same_bookkeeping(before: &mut Fleet, after: &Fleet) {
     before.last_light_at = after.last_light_at.clone();
     before.last_relaunch_at = after.last_relaunch_at.clone();
     before.last_claim_end = after.last_claim_end.clone();
+    before.history_ready_at = after.history_ready_at;
     before.budget.next_round_at = after.budget.next_round_at;
     before.budget.smoothed = after.budget.smoothed;
     before.budget.up_rounds = after.budget.up_rounds;
@@ -82,13 +84,16 @@ pub fn precheck_word(
     }
 }
 
-/// The words in the sky now, which a new word must be checked together with.
+/// The viewers' words in the sky now, which a new word must be checked together with. A
+/// system word is the wall's own and is not part of what is checked, so one placed while a
+/// viewer's word is being checked does not make that check stale.
 pub fn sky(state: &State) -> Vec<String> {
     state
         .fleet
         .scene
         .words
         .iter()
+        .filter(|w| !w.system)
         .map(|w| w.text.clone())
         .collect()
 }
@@ -696,9 +701,15 @@ fn intent_effect(
                 text: text.clone(),
                 t,
                 text_style: *text_style,
+                system: false,
             });
-            while f.scene.words.len() > MAX_WORDS {
-                f.scene.words.remove(0);
+            trim_viewer_words(&mut f.scene.words);
+            // The newest word is the one drawn, so a viewer's word replaces a system word
+            // at once; system words wait until it has left the sky and the gap has passed.
+            if state.config.history_idle_secs > 0 {
+                f.history_ready_at = Some(
+                    at + history::hold_ms(*text_style) + state.config.history_idle_secs * 1000,
+                );
             }
             Ok(format!("word {text:?}"))
         }
@@ -998,6 +1009,52 @@ fn start_race(state: &mut State, by: &str, at: u64) -> u64 {
     f.race_count
 }
 
+/// Keep the latest `MAX_WORDS` viewer words. A system word is never counted or evicted
+/// here, so placing one cannot change the sky a viewer's text check was made against.
+fn trim_viewer_words(words: &mut Vec<Word>) {
+    while words.iter().filter(|w| !w.system).count() > MAX_WORDS {
+        let oldest = words.iter().position(|w| !w.system).expect("a viewer word");
+        words.remove(oldest);
+    }
+}
+
+/// Write a line of GPU history into the scene when a viewer is watching an awake wall and
+/// nothing has been in the sky for `history_idle_secs`. It goes in through the scene like
+/// a viewer's word (no text check: the lines are ours), marked `system`, and takes no
+/// action or receipt, so the feed credits nobody. A viewer's word, being newer, replaces it
+/// and moves `history_ready_at` past its own hold.
+fn history_step(state: &mut State, at: u64) {
+    let gap = state.config.history_idle_secs * 1000;
+    if gap == 0 {
+        return;
+    }
+    let seed = state.config.camera_seed;
+    let f = &mut state.fleet;
+    let watched = f.power.state == "awake" && f.viewers.keys().any(|v| !f.hidden.contains(v));
+    if !watched {
+        // The gap starts when someone is there to see it.
+        f.history_ready_at = Some(f.history_ready_at.map_or(at + gap, |r| r.max(at + gap)));
+        return;
+    }
+    match f.history_ready_at {
+        None => f.history_ready_at = Some(at + gap),
+        Some(ready) if at >= ready => {
+            let (text, text_style) = history::pick(seed, f.history_count);
+            f.scene.words.retain(|w| !w.system);
+            let t = f.scene.t_at(at);
+            f.scene.words.push(Word {
+                text: text.to_string(),
+                t,
+                text_style,
+                system: true,
+            });
+            f.history_count += 1;
+            f.history_ready_at = Some(at + history::hold_ms(text_style) + gap);
+        }
+        Some(_) => {}
+    }
+}
+
 fn tick(state: &mut State, at: u64) {
     if state.fleet.power.state != "asleep" && state.fleet.next_race_at.is_some_and(|t| at >= t) {
         start_race(state, "schedule", at);
@@ -1012,6 +1069,8 @@ fn tick(state: &mut State, at: u64) {
     if f.scene.camera != cam {
         f.scene.camera = cam;
     }
+    history_step(state, at);
+    let f = &mut state.fleet;
     // Claims expire.
     let expired: Vec<u32> = f
         .slots

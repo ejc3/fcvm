@@ -24,6 +24,10 @@ pub struct Config {
     pub fcvm_tiles: usize,
     /// Minimum milliseconds between two words from one viewer.
     pub word_interval_ms: u64,
+    /// Seconds with a viewer on the wall, after the last word has left the sky, before the
+    /// wall writes a line of GPU history itself (a system word). 0: never.
+    #[serde(default)]
+    pub history_idle_secs: u64,
     /// Minimum milliseconds between two lights from one viewer.
     pub light_interval_ms: u64,
     /// Minimum milliseconds between two committed `relaunch` intents from one viewer.
@@ -143,6 +147,7 @@ impl Default for Config {
             ec2_max: 0,
             fcvm_tiles: 0,
             word_interval_ms: 5_000,
+            history_idle_secs: 0,
             light_interval_ms: 1_000,
             relaunch_interval_ms: 2_000,
             ec2_aggregate_url: None,
@@ -519,6 +524,13 @@ pub struct Fleet {
     pub last_light_at: BTreeMap<String, u64>,
     pub last_relaunch_at: BTreeMap<String, u64>,
     pub last_claim_end: BTreeMap<String, u64>,
+    /// System words placed so far: which line comes next, and in which style.
+    #[serde(default)]
+    pub history_count: u64,
+    /// The time from which the wall may write its next system word: a word's hold and the
+    /// idle gap after it, or the idle gap after a viewer arrives at an empty wall.
+    #[serde(default)]
+    pub history_ready_at: Option<u64>,
     pub claim_count: u64,
     /// Hosts reclaimed (a spot notice, or gone): since when, and when they went away. Kept
     /// for a minute after they are gone so the page can say so.
@@ -589,6 +601,8 @@ impl State {
                 last_light_at: BTreeMap::new(),
                 last_relaunch_at: BTreeMap::new(),
                 last_claim_end: BTreeMap::new(),
+                history_count: 0,
+                history_ready_at: None,
                 claim_count: 0,
                 reclaimed: BTreeMap::new(),
                 degraded: BTreeMap::new(),

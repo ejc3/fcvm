@@ -309,6 +309,11 @@ pub struct FleetCoordArgs {
     #[arg(long, default_value_t = 600)]
     pub idle_scale_down: u64,
 
+    /// Seconds a viewer watches an empty sky, after the last word has left it, before the
+    /// wall writes a line of GPU history itself. 0 turns it off.
+    #[arg(long, env = "FLEET_HISTORY_IDLE", default_value_t = 60)]
+    pub history_idle: u64,
+
     /// Operator endpoint (POST /quarantine/release) on this address; keep it on loopback
     /// or a private network. Off without it.
     #[arg(long)]

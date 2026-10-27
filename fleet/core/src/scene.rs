@@ -40,13 +40,17 @@ impl TextStyle {
     }
 }
 
-/// A viewer's word, placed at scene time `t`, drawn in `text_style`.
+/// A word placed at scene time `t`, drawn in `text_style`: a viewer's, or a system word
+/// (a line of GPU history the wall wrote itself, `system: true`; see `crate::history`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Word {
     pub text: String,
     pub t: f64,
     #[serde(default)]
     pub text_style: TextStyle,
+    /// Written by the wall, not by a viewer. Absent from the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub system: bool,
 }
 
 /// A light a viewer dropped: world position, linear RGB in [0, 1], scene time placed.

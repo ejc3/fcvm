@@ -921,6 +921,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         max_borrowed: args.max_borrowed,
         power_managed: power_managed(&args),
         idle_scale_down_secs: args.idle_scale_down,
+        history_idle_secs: args.history_idle,
         ..Config::default()
     };
     if config.max_tiles == 0 {

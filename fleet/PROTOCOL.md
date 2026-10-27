@@ -185,6 +185,22 @@ marks the coordinator degraded (`failures`) until one runs again. The scene keep
 latest 16 words. A refused word's text appears nowhere: not in the scene, not in
 `actions`.
 
+**System words.** When no viewer's word has been in the sky for a while, the coordinator
+writes a short line of GPU history into the scene itself (`--history-idle`, default 60 s;
+0 turns it off). The lines are in `fleet/core/data/gpu_history.txt` (about 40, each at most
+28 characters, each checked against a published source). The schedule is part of the
+state, not of the coordinator's clock: a `Tick` places the next line once a viewer is on
+an awake wall and `--history-idle` seconds have passed since the last word left the sky
+(a lockup or landmark word holds for 90 s, skywriting for about 45 s), or since the
+viewer arrived at an empty wall. The lines come in a seeded shuffle (`--camera-seed`) that
+shows every line before any repeats, and the styles rotate lockup, skywriting, landmark.
+A system word goes into `scene.words` like a viewer's, with `"system": true`
+(absent when false; the renderer ignores it). It skips the text check, creates no receipt
+and no `actions` entry, and is not part of the sky a viewer's word is checked against. A
+viewer's word is newer, so the renderer draws it instead at once, and the next system word
+waits for that word's hold and the gap. At most one system word is in the scene, and it
+is not counted among the latest 16 words nor does it push one out.
+
 **Your own GPU** (`claim_gpu`). The claim takes a standby GPU when there is one. Normally
 every GPU draws the wall, so the claim borrows one: the last tile in slot order that is
 running its current generation (not relaunching, not still racing). The tile keeps its
@@ -250,7 +266,7 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
                                             {"phase": "agent_connected", "at": 1761134492000}]}],
                       "last_wake": {"started_at": ..., "awake_at": ..., "gpus": 16, "ms": 98000},
                       "wakes": [...]}},
-  "scene": {"epoch_unix_ms": ..., "camera": [...], "time_of_day": 0.3, "words": [{"text", "t", "text_style"}], "lights": [{"pos", "color", "t"}]},
+  "scene": {"epoch_unix_ms": ..., "camera": [...], "time_of_day": 0.3, "words": [{"text", "t", "text_style", "system"}], "lights": [{"pos", "color", "t"}]},
   "image_aspect": 1.7777777777777777,
   "next_race_at": 1761134700000,
   "cooldown_until": 1761134460000,
@@ -457,7 +473,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--trust-cf-connecting-ip] [--turnstile-secret <secret> --turnstile-site-key <key>]
                  [--admin-listen <addr:port>] [--ffmpeg ffmpeg]
                  [--host-template <region>:<template>... --host-subnet <region>:<subnet id>...]
-                 [--awake-capacity 1] [--host-on-demand-max 8] [--idle-scale-down 600]
+                 [--awake-capacity 1] [--host-on-demand-max 8] [--idle-scale-down 600] [--history-idle 60]
                  [--state-bucket <bucket> [--state-key state.json] [--state-region <region>]]
                  [--ec2 aws --ec2-tiles 8 --ec2-regions <r1,r2,...> [--ec2-template fcvm-fleet-tile-x86_64]
                   [--ec2-on-demand-template <name>] [--fleet-name stage]
@@ -1177,6 +1193,7 @@ A word (an entry of `words`):
 | `text` | the message | a string; printable ASCII is kept (other bytes below 0x80 become `?`, bytes from 0x80 are dropped), at most 28 characters, case kept |
 | `t` | scene time at which it appears | a number |
 | `text_style` | how it is drawn (round 12) | optional; `lockup` (the default), `skywriting` or `landmark`; absent or null means `lockup`; any other value is refused with `400` naming `words[].text_style` |
+| `system` | the coordinator wrote it, not a viewer (see "System words") | optional boolean the renderer ignores; absent means false |
 
 - Each word is drawn in the `text_style` it was sent with. Only the newest
   word that has appeared and not yet expired is drawn: a newer one replaces
