@@ -585,7 +585,7 @@ impl State {
         let director = Director::new(config.camera_seed, 0.0);
         let mut scene = Scene::new(now_ms);
         scene.camera = director.camera();
-        scene.time_of_day = crate::director::viewpoints()[director.current].time_of_day;
+        scene.time_of_day = director.time_of_day(0.0);
         State {
             version: 0,
             fleet: Fleet {

@@ -1,19 +1,18 @@
 """The coordinator's directed camera on a grid of renderers, with the grid
 budget controller, to count budget changes.
 
-    python3 tools/pathrun.py OUT_PREFIX SECONDS COLS ROWS H HOST:PORT ...
+    make fleet-program SEED=1 SECS=900 OUT=program.json
+    python3 tools/pathrun.py PROGRAM.json OUT_PREFIX SECONDS COLS ROWS H HOST:PORT ...
 
-Builds the camera path fleet-control's director flies with its default seed
-(fleet/core/src/director.rs: holds of 7 s at eight named viewpoints joined by
-flights, each flight setting the next viewpoint's time of day), posts it to
-every tile as one scene (the tile's cell of a COLS x ROWS grid), re-posts the
-scene with the next time of day when each flight starts (same epoch, as the
-coordinator does), streams every tile at H px, and runs tools/budgetctl.py
-(period 2 s) against all tiles. Records in OUT_PREFIX.json the budget each
-round posted and every tile's /health every 2 s.
+PROGRAM.json is the path fleet-control's director flies with no votes
+(fleet/core/examples/program.rs): its keyframes and the time of day at each
+second. Posts the keyframes to every tile as one scene (the tile's cell of a
+COLS x ROWS grid), re-posts the scene whenever the time of day changes (same
+epoch, as the coordinator's tick does), streams every tile at H px, and runs
+tools/budgetctl.py (period 2 s) against all tiles. Records in OUT_PREFIX.json
+the budget each round posted and every tile's /health every 2 s.
 """
 import json
-import math
 import os
 import subprocess
 import sys
@@ -23,71 +22,34 @@ import urllib.request
 
 import fleetclient as fc
 
-HOLD = 7.0
-VIEWPOINTS = [  # name, pos, look, fov, time of day, via (director.rs)
-    ("peak-seam", [-47.0, 2.6, -101.0], [-56.0, 2.75, -114.75], 55.0, 0.40, None),
-    ("sunset-ridge", [-36.0, 2.4, -70.0], [-73.5, 2.4, -121.75], 60.0, 0.735, None),
-    ("dawn-valley", [-18.0, 1.8, -92.0], [-10.75, 2.6, -105.5], 62.0, 0.265, None),
-    ("horizon", [-30.0, 38.0, -60.0], [-75.0, 28.0, -170.0], 70.0, 0.45, [-40.0, 20.0, -80.0]),
-    ("coast", [-100.0, 0.35, -90.0], [-63.5, 2.2, -87.0], 60.0, 0.33, None),
-    ("peak-close", [-62.0, 3.5, -105.0], [-56.0, 2.9, -114.75], 50.0, 0.70, None),
-    ("high-lakes", [-25.0, 2.4, -140.0], [-21.25, 2.3, -150.0], 65.0, 0.52, None),
-    ("peak-seam-low-sun", [-66.0, 2.5, -101.0], [-56.0, 2.75, -114.75], 55.0, 0.255, None),
-]
-M64 = (1 << 64) - 1
+
+def path(program):
+    """Keyframes and the (t, time_of_day) changes."""
+    p = json.load(open(program))
+    tods, last = [], None
+    for t, v in p["time_of_day"]:
+        if v != last:
+            tods.append((float(t), v))
+            last = v
+    return p["camera"], tods
 
 
-def splitmix(state):
-    state = (state + 0x9E3779B97F4A7C15) & M64
-    z = state
-    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & M64
-    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & M64
-    return state, z ^ (z >> 31)
-
-
-def order(seed, n):
-    o = list(range(n))
-    s = seed
-    for i in range(n - 1, 0, -1):
-        s, r = splitmix(s)
-        j = r % (i + 1)
-        o[i], o[j] = o[j], o[i]
-    return o
-
-
-def dist(a, b):
-    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
-
-
-def flight_secs(a, b):
-    km = dist(a[1], b[5]) + dist(b[5], b[1]) if b[5] else dist(a[1], b[1])
-    lo, hi, speed = (14.0, 24.0, 4.0) if b[5] else (8.0, 18.0, 2.5)
-    return float(round(min(max(km / speed, lo), hi)))
-
-
-def path(seed, seconds):
-    """Keyframes and the (t, time_of_day) changes, the default order with no votes."""
-    o = order(seed, len(VIEWPOINTS))
-    keys, tods = [], [(0.0, VIEWPOINTS[o[0]][4])]
-    t, step = 0.0, 0
-    while t < seconds + 30:
-        cur, nxt = VIEWPOINTS[o[step % len(o)]], VIEWPOINTS[o[(step + 1) % len(o)]]
-        for tt in (t, t + HOLD):
-            keys.append({"t": tt, "pos": cur[1], "look": cur[2], "fov_deg": cur[3]})
-        fly = flight_secs(cur, nxt)
-        if nxt[5]:
-            keys.append({"t": t + HOLD + fly / 2, "pos": nxt[5], "look": nxt[2], "fov_deg": (cur[3] + nxt[3]) / 2})
-        tods.append((t + HOLD, nxt[4]))
-        t += HOLD + fly
-        step += 1
-    return keys, tods
+def due(tods, posted, st):
+    """The time of day to post at scene time `st` when `tods[:posted]` are posted: the latest
+    entry at or before `st` (skipping any that came due since the last pass), and the new
+    `posted`; (None, posted) when nothing is due."""
+    i = posted
+    while i < len(tods) and st >= tods[i][0]:
+        i += 1
+    return (tods[i - 1][1], i) if i > posted else (None, posted)
 
 
 def main():
-    out, secs, cols, rows, h = sys.argv[1], float(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
-    ends = [(a.rsplit(":", 1)[0], int(a.rsplit(":", 1)[1])) for a in sys.argv[6:]]
+    program, out, secs = sys.argv[1], sys.argv[2], float(sys.argv[3])
+    cols, rows, h = int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
+    ends = [(a.rsplit(":", 1)[0], int(a.rsplit(":", 1)[1])) for a in sys.argv[7:]]
     assert len(ends) == cols * rows
-    keys, tods = path(1, secs)
+    keys, tods = path(program)
     epoch = int(time.time() * 1000)
     rects = [{"x": (k % cols) / cols, "y": (k // cols) / rows, "w": 1 / cols, "h": 1 / rows} for k in range(len(ends))]
 
@@ -127,23 +89,28 @@ def main():
     health = []
     next_tod = 1
     t0 = time.time()
+    next_health = t0
+    # the time of day is re-posted when it comes due (a step a second while the camera
+    # flies), checked four times a second; /health is read every 2 s
     while time.time() - t0 < secs:
         st = (time.time() * 1000 - epoch) / 1000
-        if next_tod < len(tods) and st >= tods[next_tod][0]:
-            post_all(tods[next_tod][1])
-            next_tod += 1
-        snap = []
-        for hh, p in ends:
-            try:
-                x = fc.health(hh, p)
-                y = {k: x.get(k) for k in ("t", "budget", "budget_source", "budget_fit", "budget_fit_now", "render_ms",
-                                           "slots_missed", "fps")}
-                y["render_ms_max"] = (x.get("frames_2s") or {}).get("render_ms_max")  # over the last 2 s of frames
-                snap.append(y)
-            except Exception as e:  # noqa: BLE001
-                snap.append({"error": str(e)})
-        health.append({"at": st, "tiles": snap})
-        time.sleep(2.0)
+        v, next_tod = due(tods, next_tod, st)
+        if v is not None:
+            post_all(v)
+        if time.time() >= next_health:
+            next_health += 2.0
+            snap = []
+            for hh, p in ends:
+                try:
+                    x = fc.health(hh, p)
+                    y = {k: x.get(k) for k in ("t", "budget", "budget_source", "budget_fit", "budget_fit_now",
+                                               "render_ms", "slots_missed", "fps")}
+                    y["render_ms_max"] = (x.get("frames_2s") or {}).get("render_ms_max")  # over the last 2 s
+                    snap.append(y)
+                except Exception as e:  # noqa: BLE001
+                    snap.append({"error": str(e)})
+            health.append({"at": st, "tiles": snap})
+        time.sleep(0.25)
     stop[0] = True
     ctl.terminate()
     ctl.wait(timeout=10)

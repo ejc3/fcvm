@@ -1098,9 +1098,8 @@ fn tick(state: &mut State, at: u64) {
     let f = &mut state.fleet;
     // The directed camera.
     let now_t = f.scene.t_at(at);
-    if let Some(tod) = f.director.tick(now_t) {
-        f.scene.time_of_day = tod;
-    }
+    f.director.tick(now_t);
+    f.scene.time_of_day = f.director.time_of_day(now_t);
     let cam = f.director.camera();
     if f.scene.camera != cam {
         f.scene.camera = cam;
