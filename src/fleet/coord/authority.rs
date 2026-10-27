@@ -634,19 +634,50 @@ pub struct Authority {
     pub zone: watch::Receiver<Arc<Zone>>,
 }
 
+/// The addresses `Authority::serve` bound: one per protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Served {
+    pub udp: SocketAddr,
+    pub tcp: SocketAddr,
+}
+
+impl std::fmt::Display for Served {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.udp == self.tcp {
+            write!(f, "{}", self.udp)
+        } else {
+            write!(f, "udp {} tcp {}", self.udp, self.tcp)
+        }
+    }
+}
+
 impl Authority {
-    /// Answer UDP and TCP on `listen` until the process ends.
-    pub async fn serve(self, listen: SocketAddr, per_second: u32) -> Result<SocketAddr> {
+    /// Answer UDP and TCP on `listen` until the process ends. A port of 0 is asked of the
+    /// kernel once per protocol: UDP and TCP have separate port spaces, so a port the kernel
+    /// found free for UDP says nothing about TCP, and binding TCP to it fails whenever any
+    /// other socket on the host holds that TCP port. A nameserver on a fixed port answers
+    /// both protocols there.
+    pub async fn serve(self, listen: SocketAddr, per_second: u32) -> Result<Served> {
         let udp = tokio::net::UdpSocket::bind(listen)
             .await
             .with_context(|| format!("binding UDP {listen}"))?;
-        let addr = udp.local_addr()?;
-        let tcp = tokio::net::TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("binding TCP {addr}"))?;
+        let tcp = tokio::net::TcpListener::bind(SocketAddr::new(
+            listen.ip(),
+            if listen.port() == 0 {
+                0
+            } else {
+                udp.local_addr()?.port()
+            },
+        ))
+        .await
+        .with_context(|| format!("binding TCP {listen}"))?;
+        let served = Served {
+            udp: udp.local_addr()?,
+            tcp: tcp.local_addr()?,
+        };
         tokio::spawn(self.clone().udp(udp, RateLimit::new(per_second)));
         tokio::spawn(self.tcp(tcp));
-        Ok(addr)
+        Ok(served)
     }
 
     async fn udp(self, sock: tokio::net::UdpSocket, mut limit: RateLimit) {
