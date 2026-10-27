@@ -826,3 +826,105 @@ async fn the_public_listener_serves_frames_with_tls_and_no_control_routes() {
     assert!(matches!(next_msg(&mut ws).await, Message::Binary(_)));
     cancel.cancel();
 }
+
+/// A broadcast aggregator runs only while it has a layout: started for one, stopped when
+/// the layout goes away (the fleet asleep: nothing to push), and started again for the next.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_supervised_aggregator_that_needs_a_layout_stops_without_one() {
+    use fcvm::fleet::aggregate::child::{supervise_with, Supervision};
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let listen = format!("127.0.0.1:{port}");
+    let (tx, rx) = tokio::sync::watch::channel(None::<Layout>);
+    let argv = vec![
+        env!("CARGO_BIN_EXE_fcvm").to_string(),
+        "fleet".into(),
+        "aggregate".into(),
+        "--codec".into(),
+        "raw".into(),
+        "--image-height".into(),
+        "36".into(),
+    ];
+    let sup = tokio::spawn(supervise_with(
+        argv,
+        listen.clone(),
+        rx,
+        || {},
+        Supervision {
+            env: vec![],
+            only_with_layout: true,
+        },
+    ));
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let healthy = |http: reqwest::Client, listen: String| async move {
+        http.get(format!("http://{listen}/healthz"))
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+    };
+    let until = |want: bool| {
+        let http = http.clone();
+        let listen = listen.clone();
+        async move {
+            for _ in 0..200 {
+                if healthy(http.clone(), listen.clone()).await == want {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!(
+                "the aggregator never became {}",
+                if want { "healthy" } else { "stopped" }
+            );
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !healthy(http.clone(), listen.clone()).await,
+        "started without a layout"
+    );
+    let layout = Layout {
+        epoch_unix_ms: now_ms(),
+        image_aspect: 16.0 / 9.0,
+        region: Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+        },
+        tiles: vec![],
+        generation: 0,
+        from_frame: 0,
+    };
+    tx.send(Some(layout.clone())).unwrap();
+    until(true).await;
+    // The supervisor posts the layout once the child answers.
+    let mut posted: Option<Layout> = None;
+    for _ in 0..100 {
+        posted = http
+            .get(format!("http://{listen}/layout"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if posted.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(posted, Some(layout.clone()));
+    tx.send(None).unwrap();
+    until(false).await;
+    tx.send(Some(layout)).unwrap();
+    until(true).await;
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs(10), sup)
+        .await
+        .expect("supervision ends with its layouts")
+        .unwrap();
+}

@@ -1449,6 +1449,7 @@ fn recording_handle() -> (Handle, Arc<std::sync::Mutex<Vec<SlotReport>>>) {
             cmds: tx,
             snapshot,
             ec2_layout,
+            broadcast_layout: tokio::sync::watch::channel(None).1,
         },
         reports,
     )
@@ -2246,6 +2247,7 @@ async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
         snapshot,
         ec2: tokio::sync::watch::channel(Vec::new()).0,
         ec2_layout,
+        broadcast_layout: tokio::sync::watch::channel(None).0,
         power: tokio::sync::watch::channel(String::new()).0,
         scene: tokio::sync::watch::channel(None).0,
         budget: tokio::sync::watch::channel(None).0,
@@ -2260,6 +2262,7 @@ async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
         cmds,
         snapshot: snapshot_rx,
         ec2_layout: ec2_layout_rx,
+        broadcast_layout: tokio::sync::watch::channel(None).1,
     };
     let before = handle.snapshot.borrow().version;
     handle
@@ -5462,4 +5465,86 @@ async fn a_resume_does_not_take_an_instance_the_pool_list_shows_stale() {
         .unwrap()
         .actions
         .contains(&"StartInstances".to_string()));
+}
+
+/// The broadcast aggregator's layout is the whole image, every placed tile read directly
+/// (also when its host runs an aggregator), and nothing at all while no tile is placed (the
+/// aggregator is then stopped and nothing is pushed).
+#[tokio::test]
+async fn the_broadcast_layout_is_the_whole_image_of_every_placed_tile() {
+    let config = Config {
+        max_tiles: 2,
+        fcvm_tiles: 2,
+        ..Config::default()
+    };
+    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None, None);
+    let mut layouts = handle.broadcast_layout.clone();
+    assert!(layouts.borrow().is_none(), "a layout with no host");
+    let mut a = FakeAgent::connect(&handle, "gpu-a", 2);
+    let slots = a.assign().await;
+    assert_eq!(slots.len(), 2);
+    a.report("slot-1", "running", 1);
+    a.report("slot-2", "running", 1);
+    let wait =
+        |layouts: &mut tokio::sync::watch::Receiver<Option<fcvm::fleet::aggregate::Layout>>,
+         ok: fn(&fcvm::fleet::aggregate::Layout) -> bool| {
+            let mut layouts = layouts.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    layouts.wait_for(|l| l.as_ref().is_some_and(ok)),
+                )
+                .await
+                .expect("the broadcast layout within 10 s")
+                .unwrap()
+                .clone()
+                .unwrap()
+            }
+        };
+    let l = wait(&mut layouts, |l| {
+        l.tiles.len() == 2 && l.tiles.iter().all(|t| t.url.is_some())
+    })
+    .await;
+    assert_eq!(
+        l.region,
+        fleet_core::tiling::Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0
+        }
+    );
+    let mut ids: Vec<&str> = l.tiles.iter().map(|t| t.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["slot-1", "slot-2"]);
+    let urls: Vec<&str> = l.tiles.iter().filter_map(|t| t.url.as_deref()).collect();
+    assert!(
+        urls.contains(&"ws://gpu-host.example:20001/frames"),
+        "{urls:?}"
+    );
+    let tile_rects: Vec<_> = slots.iter().filter_map(|s| s.rect).collect();
+    for t in &l.tiles {
+        assert!(tile_rects.contains(&t.rect), "a tile at its own rectangle");
+    }
+    // The host reports its aggregator: the broadcast still reads the tiles, at its own height.
+    a.to_coord
+        .send(AgentMsg::Aggregate {
+            frame_url: "ws://gpu-a.example:20200/frames".into(),
+            ipv6: None,
+            ipv4: None,
+            v4_port: None,
+        })
+        .unwrap();
+    a.report("slot-1", "running", 1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let l = layouts.borrow().clone().unwrap();
+    assert_eq!(l.tiles.len(), 2);
+    assert!(l.tiles.iter().all(|t| t.id.starts_with("slot-")));
+    // The host leaves: no region has a tile, so there is no broadcast layout.
+    drop(a.to_coord);
+    a.conn.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), layouts.wait_for(|l| l.is_none()))
+        .await
+        .expect("no layout once the host is gone")
+        .unwrap();
 }

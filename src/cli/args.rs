@@ -59,7 +59,7 @@ pub enum FleetCommand {
     /// Run the agent on a GPU host: one fcvm GPU VM per assigned slot
     Agent(Box<FleetAgentArgs>),
     /// Join a region's tile streams into one stream (POST /layout, GET /frames)
-    Aggregate(FleetAggregateArgs),
+    Aggregate(Box<FleetAggregateArgs>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -120,6 +120,12 @@ pub struct FleetAggregateArgs {
     /// agent writes for its renderers; read again every 2 s
     #[arg(long, requires = "tls_listen")]
     pub tls_file: Option<std::path::PathBuf>,
+
+    /// Also push the stream to a live ingest (the broadcast): the name of the environment
+    /// variable that holds the ingest URL (`rtmps://<endpoint>:443/app/<stream key>`), so
+    /// the key stays off the command line
+    #[arg(long)]
+    pub push_url_env: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -224,6 +230,26 @@ pub struct FleetCoordArgs {
     /// Extra argument for the EC2 half's aggregator. Repeatable.
     #[arg(long = "aggregate-arg", allow_hyphen_values = true)]
     pub aggregate_args: Vec<String>,
+
+    /// Run the broadcast (one composite of the whole wall pushed to a live ingest, Amazon
+    /// IVS): its aggregator's layout and stats listener. Needs --broadcast-secret or
+    /// --broadcast-file. The aggregator runs while the image has a tile.
+    #[arg(long)]
+    pub broadcast_listen: Option<String>,
+
+    /// The broadcast's settings in Secrets Manager (--secrets-region): JSON
+    /// {"ingest_url": "rtmps://<endpoint>:443/app/<stream key>", ...}
+    #[arg(long, requires = "broadcast_listen", conflicts_with = "broadcast_file")]
+    pub broadcast_secret: Option<String>,
+
+    /// The broadcast's settings in a file (the same JSON as --broadcast-secret)
+    #[arg(long, requires = "broadcast_listen")]
+    pub broadcast_file: Option<std::path::PathBuf>,
+
+    /// Extra argument for the broadcast aggregator, after its defaults
+    /// (fleet/PROTOCOL.md, "Broadcast"). Repeatable.
+    #[arg(long = "broadcast-arg", allow_hyphen_values = true)]
+    pub broadcast_args: Vec<String>,
 
     /// The owner's race cadence: relaunch every tile this many seconds after the last race.
     /// Viewers cannot change it.

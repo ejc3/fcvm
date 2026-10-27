@@ -1,0 +1,121 @@
+//! The broadcast: one composite of the whole wall, encoded once and pushed to a live ingest
+//! (Amazon IVS), for viewers beyond what direct streaming serves (docs/fleet/ARCHITECTURE.md,
+//! "Broadcast mode").
+//!
+//! The coordinator runs an aggregator for it beside itself (`--broadcast-listen`), like the
+//! EC2 half's, and gives it a layout of the whole image: every placed tile. That aggregator
+//! pushes its output with `--push-url-env`, every frame stamped with its scene time.
+
+use crate::fleet::aggregate::{Layout, TileSpec};
+use anyhow::{Context, Result};
+use fleet_core::state::State;
+use fleet_core::tiling::Rect;
+use serde::Deserialize;
+
+/// The environment variable the broadcast aggregator reads its ingest URL from.
+pub const PUSH_URL_ENV: &str = "FCVM_FLEET_BROADCAST_INGEST";
+
+/// The broadcast aggregator's settings before `--broadcast-arg`: a 720-line image (H.264
+/// High, a keyframe every 2 s, at most 4.5 Mbit/s), which IVS's standard channel transcodes
+/// into 720p, 480p, 360p and 160p renditions; tiles at their standard quality.
+pub const DEFAULT_ARGS: &[&str] = &[
+    "--image-height",
+    "720",
+    "--tile-query",
+    "q=std",
+    "--maxrate-kbps",
+    "4500",
+    "--crf",
+    "21",
+    "--preset",
+    "veryfast",
+];
+
+/// The whole image.
+pub const WHOLE: Rect = Rect {
+    x: 0.0,
+    y: 0.0,
+    w: 1.0,
+    h: 1.0,
+};
+
+/// The broadcast's settings: the ingest and the playback side of one IVS channel. Kept in
+/// Secrets Manager (`--broadcast-secret`) or a file (`--broadcast-file`), never on a command
+/// line.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BroadcastSecret {
+    /// `rtmps://<ingest endpoint>:443/app/<stream key>`.
+    pub ingest_url: String,
+}
+
+impl BroadcastSecret {
+    pub fn parse(json: &str) -> Result<Self> {
+        let s: BroadcastSecret =
+            serde_json::from_str(json).context("the broadcast secret is not the expected JSON")?;
+        anyhow::ensure!(
+            s.ingest_url.starts_with("rtmps://") || s.ingest_url.starts_with("rtmp://"),
+            "the broadcast ingest URL is not rtmp(s)"
+        );
+        Ok(s)
+    }
+}
+
+/// The broadcast aggregator's layout, or `None` while there is nothing to show (the fleet
+/// is asleep: no tile is placed). Every placed tile is read directly, at the broadcast's own
+/// height: each renderer then encodes a small stream for it, which one decoder thread keeps
+/// up with. A region aggregator's stream is a near-lossless region a whole image tall, which
+/// one decoder thread does not (a 1280x720 renderer stream at `q=hi` fell 3 s behind on a
+/// g4dn.2xlarge).
+pub fn layout(state: &State) -> Option<Layout> {
+    let f = &state.fleet;
+    let placed = |s: &&fleet_core::state::Slot| match s.half {
+        fleet_core::tiling::Half::Fcvm => s
+            .host
+            .as_ref()
+            .is_some_and(|h| f.hosts.get(h).is_some_and(|h| h.region.is_some())),
+        fleet_core::tiling::Half::Ec2 => f.layout.ec2.is_some(),
+    };
+    let tiles: Vec<TileSpec> = f
+        .slots
+        .values()
+        .chain(f.ec2.values())
+        .filter(placed)
+        .filter_map(|s| tile(state, s))
+        .collect();
+    if tiles.is_empty() {
+        return None;
+    }
+    Some(Layout {
+        epoch_unix_ms: f.scene.epoch_unix_ms,
+        image_aspect: state.config.image_aspect,
+        region: WHOLE,
+        tiles,
+        generation: f.layout.generation,
+        from_frame: f.layout.from_frame,
+    })
+}
+
+/// One tile read directly: its published IPv6 name, which reaches the VM without a proxy
+/// (the IPv4 name of an fcvm tile goes through Cloudflare).
+fn tile(state: &State, s: &fleet_core::state::Slot) -> Option<TileSpec> {
+    let (v6, v4) = fleet_core::view::frame_urls(state, s);
+    Some(TileSpec {
+        id: s.id.clone(),
+        rect: s.rect?,
+        url: v6.or(v4),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_secret_needs_an_rtmp_ingest() {
+        let s =
+            BroadcastSecret::parse(r#"{"ingest_url":"rtmps://ingest.example:443/app/k"}"#).unwrap();
+        assert!(s.ingest_url.ends_with("/app/k"));
+        assert!(BroadcastSecret::parse(r#"{"ingest_url":"https://x"}"#).is_err());
+        assert!(BroadcastSecret::parse("{}").is_err());
+    }
+}
