@@ -6,8 +6,10 @@ import {
   initialClock,
   pingSent,
   clockReceived,
+  serverNow,
   type ClockState,
 } from "./clock.ts";
+import { addHistory, type HistoryEntry } from "./broadcast.ts";
 import {
   parseServerMsg,
   ProtocolError,
@@ -89,7 +91,8 @@ export interface FrameStats {
   wallFps?: number;
 }
 
-export type StreamMode = "direct" | "aggregated";
+/** "broadcast": the one CDN video of the whole wall (core/broadcast.ts). */
+export type StreamMode = "direct" | "aggregated" | "broadcast";
 
 export interface UiState {
   /** How this viewer receives the image: the mode it wants (aggregated unless it asks to see every VM). */
@@ -215,6 +218,8 @@ export interface ClientState {
   shownLayout: ShownLayout | null;
   /** How this connection receives the image, from the coordinator's admission message. */
   admission: Admission | null;
+  /** With a broadcast, the snapshots of the last HISTORY_MS and when each arrived, for the overlay. */
+  history: HistoryEntry[];
   ui: UiState;
 }
 
@@ -272,6 +277,7 @@ export function initialState(): ClientState {
     gpuHistory: {},
     shownLayout: null,
     admission: null,
+    history: [],
     ui: {
       mode: "aggregated",
       shownMode: "aggregated",
@@ -462,6 +468,10 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
             s.shownLayout === null || accepted.layout.generation <= s.shownLayout.gen
               ? { gen: accepted.layout.generation, tiles: accepted.tiles, aggregates: accepted.aggregates }
               : s.shownLayout;
+          const history =
+            s.admission?.broadcast != null
+              ? addHistory(s.history, { at: serverNow(s.clock, e.at), version: msg.version, state: accepted })
+              : s.history;
           return {
             ...s,
             accepted,
@@ -470,6 +480,7 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
             pending: settle(s.pending, msg.version),
             cameraWatches,
             gpuHistory: appendGpu(s.gpuHistory, accepted, e.at),
+            history,
           };
         }
         case "receipt": {

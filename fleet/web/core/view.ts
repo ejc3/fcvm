@@ -26,6 +26,7 @@ import {
   type ZoomStep,
 } from "./layout.ts";
 import { FAMILY_PROBE_ATTEMPTS, FAMILY_PROBE_MS, frameSocketUrl, streamUrl, type Family } from "./net.ts";
+import { broadcastToggle, watchesBroadcast, type BroadcastToggle } from "./broadcast.ts";
 import { fitBandwidth, type StreamAsk } from "./bandwidth.ts";
 import { suggestMode } from "./mode.ts";
 import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type Aggregate, type FleetState, type Half, type IntentMsg, type Nudges, type Rect, type Tile } from "./protocol.ts";
@@ -187,6 +188,8 @@ export interface WallInput {
   media?: { base: string; meta: ReelMeta | null };
   /** The browser asks to save data. */
   saveData?: boolean;
+  /** In broadcast mode, how far the frame on screen is behind the coordinator (ms), once one is shown. */
+  broadcastLatencyMs?: number | null;
 }
 
 // ---- tiles -------------------------------------------------------------------
@@ -583,6 +586,8 @@ export interface PlayView {
   };
   light: { label: string; on: boolean };
   streams: { label: string; on: boolean; note: string; disabled: boolean };
+  /** The broadcast switch: null when the fleet runs no broadcast. Forced on and disabled for a late viewer. */
+  broadcast: BroadcastToggle | null;
   /** `family`: the stats drawer's line on the address family every tile streams over. */
   stats: { label: string; on: boolean; family: string };
   verify: { needed: boolean; title: string; text: string; error: string };
@@ -660,7 +665,8 @@ function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMs
       style: { legend: "How it is drawn", options: TEXT_STYLES.map((o) => ({ ...o, selected: o.value === s.ui.textStyle })) },
     },
     light: { label: s.ui.lightMode ? "Click the picture to drop it" : "Drop a light", on: s.ui.lightMode },
-    streams: { label: "See every VM's own stream", on: direct, note: streamsNote, disabled: !hasAgg },
+    streams: { label: "See every VM's own stream", on: direct, note: streamsNote, disabled: !hasAgg || watchesBroadcast(s) },
+    broadcast: broadcastToggle(s),
     stats: { label: "Show stream stats", on: s.ui.stats, family: familyLine(s.net) },
     verify: {
       needed: ts.sitekey !== null && !ts.verified,
@@ -1312,6 +1318,8 @@ export interface WallView {
   notices: { key: string; text: string }[];
   /** What the streams cost, for the stats switch. */
   bandwidth: string;
+  /** Broadcast mode: the player's URL (with its token) and the latency line; null otherwise. */
+  broadcast: { url: string; latency: string } | null;
   /** The stream stats' line on the wall's rate and the renderer holding it back (wallRateLine). */
   wallRate: string;
 }
@@ -1477,7 +1485,7 @@ export function wallView(input: WallInput): WallView {
     banners,
     playButton: { label: "Direct the scene", open: s.ui.drawer, phoneLabel: "Direct the scene: write a word in the sky, drop a light" },
     pause: { label: s.ui.paused ? "Resume" : "Pause", on: s.ui.paused },
-    hint: "Click a square to look at its VM.",
+    hint: watchesBroadcast(s) ? "This is the broadcast: write a word or drop a light from Direct the scene." : "Click a square to look at its VM.",
     rotateHint: "Turn sideways for full screen",
   };
   if (!st) {
@@ -1514,6 +1522,7 @@ export function wallView(input: WallInput): WallView {
       notices: [],
       bandwidth: "",
       wallRate: "",
+      broadcast: null,
     };
   }
   const pend = pendingIntents(s);
@@ -1529,8 +1538,11 @@ export function wallView(input: WallInput): WallView {
   const asleepFix = (tv: TileView) => (sleep && tv.dark ? { ...tv, dark: false, hatch: false } : tv);
   const tiles = shownTiles.map((t) => asleepFix(tileView(t, s, st, placedById.get(t.id)?.box ?? null, srvNow, pend)));
   const planViews = shownTiles === st.tiles ? tiles : st.tiles.map((t) => asleepFix(tileView(t, s, st, placedPlan.get(t.id)?.box ?? null, srvNow, pend)));
-  const focusTile = s.ui.focusId === null ? null : st.tiles.find((t) => t.id === s.ui.focusId) ?? null;
-  const own = ownView(s, st, srvNow, input);
+  // Broadcast mode: one video of the whole wall; no VM opens, no GPU of one's own, no streams.
+  const broadcast = watchesBroadcast(s);
+  const admit = s.admission?.direct?.value ?? null;
+  const focusTile = broadcast || s.ui.focusId === null ? null : st.tiles.find((t) => t.id === s.ui.focusId) ?? null;
+  const own = broadcast ? null : ownView(s, st, srvNow, input);
 
   // A VM opened: the whole image zooms until that VM fills the stage, and the tiles around it
   // stay in place, dimmed. The page animates `zoom`; without it an opened VM is fully zoomed.
@@ -1577,7 +1589,7 @@ export function wallView(input: WallInput): WallView {
     const base = streamUrl(t, family)!;
     // Zoomed, the opened VM is drawn on its own over the mosaic (plan.zoom.source), so its entry here keeps streaming undrawn.
     const box = own ? null : zoom ? (zoomed?.id === t.id ? null : zoomBox(t.id)) : placedPlan.get(t.id)?.box ?? null;
-    return { id: `d:${t.id}`, url: frameSocketUrl(base, height, q), baseUrl: base, height, box };
+    return { id: `d:${t.id}`, url: frameSocketUrl(base, height, q, admit), baseUrl: base, height, box };
   });
   // Aggregated: each region is one big tile; it asks for the height it covers on the wall. Only the
   // aggregates with a URL in this viewer's family stream.
@@ -1589,13 +1601,13 @@ export function wallView(input: WallInput): WallView {
       const base = streamUrl(g, family)!;
       const zb = zoom ? rectOnScreen(zoom.layout.image, g.rect, input.dpr) : null;
       const drawn = own ? null : zoom ? (zb && zArea && boxesMeet(zb, zArea) ? zb : null) : box;
-      return { id: `a:${g.id}`, url: frameSocketUrl(base, height), baseUrl: base, height, box: drawn };
+      return { id: `a:${g.id}`, url: frameSocketUrl(base, height, "std", admit), baseUrl: base, height, box: drawn };
     });
   let focusSource: DrawSource | null = null;
   const claimUrl = s.own.claim ? streamUrl(s.own.claim, family) : null;
   if (own && own.placed && s.own.claim && claimUrl) {
     const c = s.own.claim;
-    focusSource = { id: `o:${c.id}`, url: frameSocketUrl(claimUrl, own.placed.streamHeight), baseUrl: claimUrl, height: own.placed.streamHeight, box: own.placed.box };
+    focusSource = { id: `o:${c.id}`, url: frameSocketUrl(claimUrl, own.placed.streamHeight, "std", admit), baseUrl: claimUrl, height: own.placed.streamHeight, box: own.placed.box };
   }
   let zoomDraw: ZoomDraw | null = null;
   if (zoom) {
@@ -1610,9 +1622,11 @@ export function wallView(input: WallInput): WallView {
   const plan: DrawPlan = {
     ...emptyPlan,
     // Aggregated only where the serving aggregates serve this viewer's family; otherwise direct.
-    mode: aggregatedAvailable(st.aggregates, family) ? s.ui.mode : "direct",
-    direct,
-    aggregated,
+    // Broadcast mode streams nothing to the canvas: the video plays over it.
+    mode: aggregatedAvailable(st.aggregates, family) && s.ui.mode === "aggregated" ? "aggregated" : "direct",
+    direct: broadcast ? [] : direct,
+    aggregated: broadcast ? [] : aggregated,
+    suspended: s.ui.suspended || broadcast,
     focus: focusSource,
     zoom: zoomDraw,
     estimatedBps: fitted.bps,
@@ -1657,7 +1671,7 @@ export function wallView(input: WallInput): WallView {
     focus,
     zoom,
     own,
-    ownButton: ownButton(st, srvNow, online, s.own.requestId !== null || (s.own.claim !== null && s.own.claim.phase !== "ended")),
+    ownButton: broadcast ? null : ownButton(st, srvNow, online, s.own.requestId !== null || (s.own.claim !== null && s.own.claim.phase !== "ended")),
     ownRefusal: s.own.refused === null ? null : { text: `No GPU is free right now: ${s.own.refused}. Try again in a minute.`, dismiss: "OK" },
     viewers: fmt.count(st.viewers.active, "person watching", "people watching"),
     live: st.fleet.power.state === "awake" && imageWhole(plan, s.frames),
@@ -1669,6 +1683,16 @@ export function wallView(input: WallInput): WallView {
     returning,
     bandwidth: `${fmt.count(plan.direct.length, "direct stream", "direct streams")}, about ${fmt.mbps(plan.estimatedBps)} at the renderer's bit rate`,
     wallRate: wallRateLine(s.frames, st.tiles),
+    broadcast:
+      broadcast && s.admission?.broadcast
+        ? {
+            url: s.admission.broadcast.value,
+            latency:
+              input.broadcastLatencyMs === undefined || input.broadcastLatencyMs === null
+                ? "broadcast, waiting for its first frame"
+                : `broadcast, ${(input.broadcastLatencyMs / 1000).toFixed(1)} s behind the fleet`,
+          }
+        : null,
     notices: s.notices.flatMap((n) => {
       // Only the latest stop choice speaks: a later pick replaced the earlier one's vote.
       if (n.intent === "nudge" && n.id !== latestNudge) return [];

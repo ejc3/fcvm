@@ -26,6 +26,9 @@ import {
   lightPosition,
   sceneT,
   serverNow,
+  broadcastLatencyMs,
+  broadcastShown,
+  watchesBroadcast,
   HUD_BAND,
   LIGHT_COLORS,
   wallView,
@@ -40,6 +43,7 @@ import { OwnGpu } from "./OwnGpu.tsx";
 import { HalfClockView, Overlays, WakeCard } from "./Overlays.tsx";
 import { PlayDrawer, VerifyBox } from "./PlayDrawer.tsx";
 import { Reel } from "./Reel.tsx";
+import { Broadcast } from "./Broadcast.tsx";
 import type { DrawSettings } from "./worker-msgs.ts";
 
 const localNow = () => performance.timeOrigin + performance.now();
@@ -371,11 +375,18 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   // phone, until the viewer folds it.
   const [sheetChoice, setSheetChoice] = useState<boolean | null>(null);
   const sheetOpen = sheetChoice ?? true;
+  // Broadcast mode: the overlay is drawn for the frame on screen, seconds behind the coordinator.
+  const inBroadcast = watchesBroadcast(state);
+  if (!inBroadcast) client.shown = null;
+  const shownFrame = inBroadcast ? client.shown : null;
+  const shown = inBroadcast ? broadcastShown(state, shownFrame, now || 0) : { state, now: now || 0 };
+  const latencyMs = shownFrame ? broadcastLatencyMs(shownFrame, state.clock, now || 0) : null;
   const view = useMemo(
     () =>
       wallView({
-        state,
-        now: now || 0,
+        state: shown.state,
+        now: shown.now,
+        broadcastLatencyMs: latencyMs,
         dpr,
         mosaicArea: areas.mosaic,
         zoom,
@@ -394,7 +405,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
         media: { base: mediaUrl, meta: reelMeta },
         saveData: saveData(),
       }),
-    [state, now, dpr, areas, zoom, zoomArea, zoomInsets, canDecode, phone, reducedMotion, client, avoid, labelSize, poster, ownOpen, mediaUrl, reelMeta],
+    [shown.state, shown.now, latencyMs, dpr, areas, zoom, zoomArea, zoomInsets, canDecode, phone, reducedMotion, client, avoid, labelSize, poster, ownOpen, mediaUrl, reelMeta],
   );
   viewRef.current = view;
 
@@ -417,7 +428,9 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   useEffect(() => {
     try {
       const saved = window.localStorage.getItem(MODE_KEY);
-      if (saved === "direct" || saved === "aggregated") client.ui({ mode: saved });
+      if (saved === "direct" || saved === "aggregated" || saved === "broadcast") client.ui({ mode: saved });
+      // ?broadcast=1 asks for the broadcast whatever was saved (it plays once the coordinator offers one).
+      if (new URLSearchParams(window.location.search).get("broadcast") === "1") client.ui({ mode: "broadcast" });
     } catch {
       // No storage here: the default stands.
     }
@@ -532,7 +545,10 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
       const st = s.accepted;
       if (p && st) {
         // The world point under the click, on the camera as it was drawn.
-        const t = s.frames?.T ?? sceneT(st.scene.epoch_unix_ms, serverNow(s.clock, localNow()));
+        const t =
+          watchesBroadcast(s) && client.shown
+            ? client.shown.t
+            : s.frames?.T ?? sceneT(st.scene.epoch_unix_ms, serverNow(s.clock, localNow()));
         const pos = lightPosition(st.scene.camera, t, p.u, p.v, st.image_aspect);
         const color = LIGHT_COLORS[st.scene.lights.length % LIGHT_COLORS.length]!;
         if (pos) client.act("light", { pos, color });
@@ -552,6 +568,8 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   // ---- open and close ----------------------------------------------------------------
 
   const openTile = (id: string, from: HTMLElement | null) => {
+    // The broadcast is one video: no VM opens from it.
+    if (viewRef.current?.broadcast) return;
     returnFocus.current = from ?? (document.activeElement as HTMLElement | null);
     client.ui({ focusId: id, hoverId: null, pointerOverImage: false, drawer: false });
   };
@@ -669,6 +687,15 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
           }
         />
       ) : null}
+      {view.broadcast && view.plan.image && areas.mosaic ? (
+        <Broadcast
+          url={view.broadcast.url}
+          box={{ left: view.plan.image.x - areas.mosaic.x, top: view.plan.image.y - areas.mosaic.y, width: view.plan.image.w, height: view.plan.image.h }}
+          onFrame={(f) => {
+            client.shown = f;
+          }}
+        />
+      ) : null}
       {view.reel?.show && view.plan.image && areas.mosaic ? (
         <Reel
           reel={view.reel}
@@ -772,6 +799,11 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
       {view.spec ? (
         <span className="spec" data-testid="spec">
           {view.spec}
+        </span>
+      ) : null}
+      {view.broadcast ? (
+        <span className="spec" data-testid="broadcast-latency">
+          {view.broadcast.latency}
         </span>
       ) : null}
     </div>

@@ -25,11 +25,37 @@ import {
   type DrawPlan,
   type Family,
   type IntentName,
+  type ShownFrame,
   type UiState,
 } from "../../core/index.ts";
 import type { BenchStats, CaptureResult, DrawSettings, FromWorker, ToWorker, TraceEntry } from "./worker-msgs.ts";
 
 const now = () => performance.timeOrigin + performance.now();
+/** This tab's seat ticket, kept across a reload so a page that comes back keeps its seat. */
+const SEAT_KEY = "fleet-wall.seat";
+
+function savedSeat(): string | null {
+  try {
+    return window.sessionStorage.getItem(SEAT_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function saveSeat(seat: string | null): void {
+  try {
+    if (seat === null) window.sessionStorage.removeItem(SEAT_KEY);
+    else window.sessionStorage.setItem(SEAT_KEY, seat);
+  } catch {
+    // Not kept: a reconnect is admitted afresh.
+  }
+}
+
+/** The /live URL with the seat ticket this tab holds, if any. */
+export function liveUrlWithSeat(url: string, seat: string | null): string {
+  if (seat === null) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}seat=${encodeURIComponent(seat)}`;
+}
 
 function newId(): string {
   return crypto.randomUUID();
@@ -63,6 +89,8 @@ export class WallClient {
   private probeFailures = 0;
   private probeRetry: ReturnType<typeof setTimeout> | null = null;
   readonly url: string;
+  /** In broadcast mode, the frame the player presented last (set by the player, read each draw). */
+  shown: ShownFrame | null = null;
 
   constructor(url: string) {
     this.url = url;
@@ -94,7 +122,9 @@ export class WallClient {
     const watches = cameraTargets(next);
     if (watches.length !== hadWatches.length || watches.some((w, i) => w.tEff !== hadWatches[i]?.tEff)) this.postWatch();
     for (const l of this.listeners) l();
-    if (next.net.family === null && this.probe === null && next.accepted) this.probeFamily(next);
+    if (next.admission !== before.admission && next.admission !== null) saveSeat(next.admission.seat);
+    // A late viewer opens no direct stream, so it has no family to find.
+    if (next.net.family === null && this.probe === null && next.accepted && next.admission?.locked !== true) this.probeFamily(next);
     // A claim came for a request the viewer dismissed: give the GPU back.
     const release = next.own.release;
     if (release !== null && before.own.release !== release) {
@@ -175,7 +205,7 @@ export class WallClient {
         tried[family]++;
         let ws: WebSocket;
         try {
-          ws = new WebSocket(frameSocketUrl(url, STREAM_HEIGHTS[0]!));
+          ws = new WebSocket(frameSocketUrl(url, STREAM_HEIGHTS[0]!, "std", this.state.admission?.direct?.value ?? null));
         } catch {
           failed[family]++;
           continue;
@@ -228,7 +258,7 @@ export class WallClient {
   private connect(): void {
     if (this.stopped) return;
     this.dispatch({ type: "socket", status: "connecting", at: now() });
-    const ws = new WebSocket(this.url);
+    const ws = new WebSocket(liveUrlWithSeat(this.url, savedSeat()));
     this.ws = ws;
     ws.onopen = () => {
       this.attempt = 0;
