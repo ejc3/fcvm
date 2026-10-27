@@ -2,6 +2,7 @@
 // GET /still, GET /raw. Plain on one port; with a TlsFront, also HTTPS/WSS
 // on another.
 #pragma once
+#include <atomic>
 #include <string>
 
 #include "pipeline.h"
@@ -23,4 +24,5 @@ class Server {
   Pipeline& p_;
   int lfd_ = -1, tfd_ = -1;
   TlsFront* tls_ = nullptr;
+  std::atomic<unsigned long long> refused_{0};  // connections refused for want of a thread (both accept loops)
 };
