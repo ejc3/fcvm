@@ -70,8 +70,9 @@ pub struct VmContext {
     pub data_dir: PathBuf,
     pub vm_manager: Box<dyn Hypervisor>,
     pub holder_child: Option<tokio::process::Child>,
-    /// Boot-plan vsock listener task (Some only when the plan is served over vsock for
-    /// VMMs without a metadata service). Aborted during cleanup.
+    /// Boot-plan vsock listener task. Every backend binds one: it carries the plan for
+    /// VMMs without a metadata service, and the host clock the guest steps to at boot
+    /// on all of them. Aborted during cleanup.
     pub bootplan_handle: Option<tokio::task::JoinHandle<()>>,
     pub volume_servers: crate::volume::SpawnedVolumes,
     pub network: Box<dyn NetworkManager>,

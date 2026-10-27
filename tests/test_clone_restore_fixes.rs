@@ -1,5 +1,6 @@
 //! Integration tests for clone restore fixes:
 //! - Clock sync after snapshot restore (chronyd + MMDS time sync), to well under a second
+//! - A cold-booted VM agrees with the host's clock once healthy
 //! - A snapshot's source agrees with the host's clock once `snapshot create` returns
 //! - exact restore cleanup re-establishes gateway and container connectivity
 //! - --no-swap creates dedicated cgroup with memory.swap.max=0
@@ -166,6 +167,48 @@ async fn clock_offset(pid: u32) -> Result<(f64, f64)> {
     Ok((offset, (after - before).as_secs_f64()))
 }
 
+/// A cold-booted Firecracker VM agrees with the host's clock from the moment it is
+/// healthy (issue 1354). The guest used to step its clock to the host time stamped
+/// into MMDS while the boot plan was built, before the VM booted, so it came up
+/// 0.86 to 1.14 s behind the host and stayed there until chronyd corrected it, about
+/// 12 s later. The guest now reads the host's clock over vsock, stamped when it
+/// connects. Sampling starts right after healthy, while chronyd has not yet
+/// corrected anything.
+#[tokio::test]
+async fn test_cold_boot_clock_matches_the_host() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("bootclock");
+    let (_child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "rootless",
+            "--no-snapshot",
+            common::TEST_IMAGE,
+        ],
+        &vm_name,
+    )
+    .await?;
+    let measured: Result<f64> = async {
+        common::poll_health_by_pid(pid, 180).await?;
+        worst_clock_offset(pid).await
+    }
+    .await;
+    common::kill_process(pid).await;
+
+    let worst = measured?;
+    assert!(
+        worst <= CLOCK_TOLERANCE.as_secs_f64(),
+        "the cold-booted VM's clock was {:.1} ms off the host's after healthy \
+         (tolerance {} ms)",
+        worst * 1000.0,
+        CLOCK_TOLERANCE.as_millis()
+    );
+    Ok(())
+}
+
 /// The source of a snapshot agrees with the host's clock as soon as `snapshot
 /// create` returns. On the arm64 `nested` (NV2) profile the Firecracker fork freezes
 /// the guest's counters while the snapshot pauses the VM, so a source resumed without
@@ -173,10 +216,8 @@ async fn clock_offset(pid: u32) -> Result<(f64, f64)> {
 /// sample was 1561 ms behind after a 1.6 s pause. The host failpoint lengthens the
 /// pause by 300 ms, so the lag is over the tolerance however fast the save is.
 ///
-/// The baseline cold-boots (`--no-snapshot`), and its clock starts about a second
-/// behind the host until chronyd corrects it (a separate defect: the boot plan's host
-/// time is stamped before the VM boots), so the snapshot waits until the clock agrees
-/// with the host's. The sampling starts right after the create returns.
+/// The baseline cold-boots (`--no-snapshot`). The sampling starts right after the
+/// create returns.
 #[tokio::test]
 async fn test_source_clock_matches_the_host_after_snapshot_create() -> Result<()> {
     let (baseline_name, _, snapshot_name, _) = common::unique_names("srcclock");
@@ -198,20 +239,6 @@ async fn test_source_clock_matches_the_host_after_snapshot_create() -> Result<()
     .await?;
     let measured: Result<f64> = async {
         common::poll_health_by_pid(baseline_pid, 180).await?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            let (offset, _) = clock_offset(baseline_pid).await?;
-            if offset.abs() <= 0.01 {
-                break;
-            }
-            anyhow::ensure!(
-                std::time::Instant::now() < deadline,
-                "the cold-booted source's clock was still {:.1} ms off the host's 60 s \
-                 after healthy, before any snapshot",
-                offset * 1000.0
-            );
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
         let output = tokio::process::Command::new(common::find_fcvm_binary()?)
             .args([
                 "snapshot",

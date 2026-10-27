@@ -612,7 +612,9 @@ pub struct MmdsRuntime {
     /// Host user's subordinate GID range count
     pub subgid_count: Option<u64>,
     /// The host clock when the plan was built, as time since the Unix epoch
-    /// (`utils::host_clock_fields`).
+    /// (`utils::host_clock_fields`). The guest does not step to it at boot: it is
+    /// stale by the time the guest reads it, so fc-agent reads the boot-plan vsock
+    /// listener's stamp instead (`bootplan::sync_clock_from_host`).
     pub host_clock: std::time::Duration,
     /// The host's NTP servers, already resolved to addresses, for the guest's chronyd.
     ///

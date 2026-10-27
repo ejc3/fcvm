@@ -424,7 +424,9 @@ pub(crate) async fn run_status_listener(
 /// Bind the boot-plan vsock listener and spawn its serve loop (#632 P0.5).
 ///
 /// For VMMs without a metadata service (Cloud Hypervisor), fc-agent fetches its plan
-/// from this listener instead of MMDS. Firecracker forwards a guest connection to vsock
+/// from this listener instead of MMDS. On every backend, fc-agent steps its clock at
+/// boot from the host time this listener stamps (`bootplan::sync_clock_from_host`).
+/// Firecracker forwards a guest connection to vsock
 /// port N to the Unix socket `{uds_path}_{N}`, so we bind that path and write the plan
 /// JSON (the MMDS `latest` object: `{ "container-plan": {...}, "host-time": "..." }`) to
 /// each connecting guest, then close so the guest's `read_to_end` sees EOF.
