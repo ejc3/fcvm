@@ -14,6 +14,11 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+/// Where the agent keeps the file on the host by default (`--tls-dir`). Mapped into every
+/// VM, so it is part of the VMs' snapshot key, which the AMI's warm-up
+/// (fleet/ami/host/warm-root.sh) must match.
+pub const HOST_DIR: &str = "/run/fcvm-fleet/tls";
+
 /// Where the file appears inside a VM, its name, and the renderer's TLS port.
 pub const GUEST_DIR: &str = "/run/fleet-tls";
 pub const FILE: &str = "tls.json";

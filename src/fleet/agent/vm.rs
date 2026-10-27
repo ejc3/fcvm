@@ -379,11 +379,19 @@ mod tests {
     fn the_ami_warm_up_launches_its_vm_as_a_slot_is_launched() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fleet/ami/host/warm-root.sh");
         let script = std::fs::read_to_string(path).unwrap();
-        let img = script
-            .lines()
-            .find_map(|l| l.strip_prefix("IMG="))
-            .expect("warm-root.sh sets IMG");
-        let joined = script.replace("\\\n", " ").replace("\"$IMG\"", img);
+        // The script's constants (`NAME=value` with no expansion), substituted into the command.
+        let mut joined = script.replace("\\\n", " ");
+        for (name, value) in script.lines().filter_map(|l| l.split_once('=')) {
+            if name.chars().all(|c| c.is_ascii_uppercase() || c == '_') && !value.contains('$') {
+                joined = joined
+                    .replace(&format!("\"${name}\""), value)
+                    .replace(&format!("${name}"), value);
+            }
+        }
+        assert!(
+            joined.contains("localhost/fcvm-renderer:fleet"),
+            "warm-root.sh sets IMG"
+        );
         let line = joined
             .lines()
             .find(|l| l.contains("fcvm podman run"))
@@ -402,7 +410,8 @@ mod tests {
             20103,
             Some(20203),
             Some((&prefix, "2001:db8:1:2:3::5".parse().unwrap())),
-            &[],
+            // What --tls-secret adds to every slot's command, at the default --tls-dir.
+            &super::super::tls::vm_args(std::path::Path::new(super::super::tls::HOST_DIR)),
             // The agent's --image on the fleet's hosts (ejc3/aws fcvm-fleet.tf).
             "localhost/fcvm-renderer:fleet".into(),
         );

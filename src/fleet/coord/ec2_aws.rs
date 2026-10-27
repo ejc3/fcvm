@@ -108,8 +108,39 @@ impl LaunchOption {
             .map(|(_, why)| why.clone())
     }
 
-    fn record(&self, refused: Option<String>) {
-        *self.last.lock().unwrap() = Some((Instant::now(), refused));
+    /// Record the answer of a launch that was sent at `sent`. A launch that succeeded does
+    /// not clear a refusal another launch recorded after this one was sent: two launches
+    /// sent together, one launching the last capacity and answered late, one refused and
+    /// answered first, leave the refusal standing, or the other tiles would all try the
+    /// exhausted option again at once.
+    fn record(&self, sent: Instant, refused: Option<String>) {
+        let mut last = self.last.lock().unwrap();
+        if refused.is_none() && matches!(&*last, Some((at, Some(_))) if *at > sent) {
+            return;
+        }
+        *last = Some((Instant::now(), refused));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_late_success_leaves_a_refusal_recorded_after_it_was_sent() {
+        let option = LaunchOption::default();
+        let memo = Duration::from_secs(60);
+        let b_sent = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        option.record(Instant::now(), Some("InsufficientInstanceCapacity".into()));
+        option.record(b_sent, None);
+        assert_eq!(
+            option.answer(memo),
+            Some(Some("InsufficientInstanceCapacity".to_string()))
+        );
+        // A success sent after the refusal was recorded clears it.
+        option.record(Instant::now(), None);
+        assert_eq!(option.answer(memo), Some(None));
     }
 }
 
@@ -881,10 +912,11 @@ impl Ec2Driver for AwsEc2 {
                             }
                         }
                     }
+                    let sent = Instant::now();
                     let tried = self.run(region, template, tile, net).await;
                     match &tried {
-                        Ok(_) => option.record(None),
-                        Err(CallError::Capacity(why)) => option.record(Some(why.clone())),
+                        Ok(_) => option.record(sent, None),
+                        Err(CallError::Capacity(why)) => option.record(sent, Some(why.clone())),
                         Err(CallError::Other(_)) => {}
                     }
                     drop(gate);
