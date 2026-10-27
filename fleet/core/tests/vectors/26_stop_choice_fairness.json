@@ -71,7 +71,7 @@
       "after": 5,
       "checks": {
         "/view/nudges/next": "peak-seam-low-sun",
-        "/view/scene/camera/2/intent": "n3"
+        "/view/scene/camera/2/intent": "n1"
       }
     }
   ],
@@ -224,7 +224,7 @@
         },
         {
           "fov_deg": 55.0,
-          "intent": "n3",
+          "intent": "n1",
           "look": [
             -56.0,
             2.75,
@@ -239,7 +239,7 @@
         },
         {
           "fov_deg": 55.0,
-          "intent": "n3",
+          "intent": "n1",
           "look": [
             -56.0,
             2.75,

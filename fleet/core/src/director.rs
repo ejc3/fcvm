@@ -269,6 +269,22 @@ impl Director {
         }
     }
 
+    /// The open vote is among viewpoints that follow the hold it decides after, never that
+    /// hold itself. A vote whose offer holds it is one already decided (a state stored before
+    /// the vote stayed open kept it until the camera arrived): it starts again.
+    fn keep_the_vote_open(&mut self) {
+        let (from, _) = self.vote_from();
+        if self.offer.contains(&from) {
+            let step = if self.next.is_some() {
+                self.step + 1
+            } else {
+                self.step
+            };
+            self.offer = self.make_offer(step, from);
+            self.votes.clear();
+        }
+    }
+
     /// When the open vote closes.
     pub fn vote_closes_at(&self) -> f64 {
         self.vote_from().1 - DECIDE_LEAD_SECS
@@ -340,6 +356,7 @@ impl Director {
         intent: &str,
         at: u64,
     ) -> Result<(), String> {
+        self.keep_the_vote_open();
         let vps = viewpoints();
         // A pick of the hold just decided (the offer moved on while it was on its way) is
         // already what happens: nothing to record.
@@ -352,10 +369,10 @@ impl Director {
                 "{target:?} is not offered; the choices are {names:?}"
             ));
         };
-        let at = match self.votes.get(client) {
-            Some(v) if v.target == i => v.at,
-            _ => at,
-        };
+        if self.votes.get(client).is_some_and(|v| v.target == i) {
+            // The same pick again keeps its first time and intent, so its place in a tie.
+            return Ok(());
+        }
         self.votes.insert(
             client.to_string(),
             Vote {
@@ -390,6 +407,7 @@ impl Director {
             self.arrive_t = now_t;
         }
         for _ in 0..4 {
+            self.keep_the_vote_open();
             if self.next.is_none() && now_t >= self.decide_at() {
                 let (pick, intent) = self.leading();
                 self.next = Some(pick);
@@ -397,7 +415,7 @@ impl Director {
                 // The vote for the hold after it opens now.
                 self.votes.clear();
                 self.offer = self.make_offer(self.step + 1, pick);
-                self.vote_opened_t = self.decide_at();
+                self.vote_opened_t = now_t;
             }
             if let Some(n) = self.next {
                 if !self.flying && now_t >= self.hold_until() {
@@ -498,5 +516,49 @@ mod tests {
         let d: Director = serde_json::from_value(v).unwrap();
         assert_eq!(d.vote_opened_t, 0.0);
         assert_eq!(d.votes["192.0.2.1"].at, 0);
+    }
+
+    #[test]
+    fn a_round_left_from_a_decided_hold_is_not_counted_again() {
+        let mut d = Director::new(3, 0.0);
+        d.tick(5.0);
+        let n = d.next.unwrap();
+        // What a coordinator stored before the open vote: the decided round's offer and
+        // votes, kept until the camera arrived.
+        d.offer = d.make_offer(d.step, d.current);
+        d.votes.insert(
+            "192.0.2.1".into(),
+            Vote {
+                target: n,
+                intent: "n1".into(),
+                at: 0,
+            },
+        );
+        d.tick(d.arrive_next_at().unwrap());
+        assert_eq!(d.current, n);
+        assert!(!d.offer.contains(&n));
+        d.tick(d.decide_at());
+        assert_ne!(d.next, Some(n), "the camera would fly to where it is");
+    }
+
+    #[test]
+    fn picking_the_same_stop_again_keeps_its_place_in_a_tie() {
+        let mut d = Director::new(3, 0.0);
+        let vps = viewpoints();
+        let (t, u) = (d.offer[1], d.offer[2]);
+        d.vote("192.0.2.1", vps[u].name, "n-b", 1000).unwrap();
+        d.vote("192.0.2.2", vps[t].name, "n-a", 1000).unwrap();
+        assert_eq!(d.leading().0, t, "same millisecond: the lower intent id");
+        d.vote("192.0.2.1", vps[u].name, "n-0", 2000).unwrap();
+        assert_eq!(d.leading().0, t, "picking again does not move a pick ahead");
+    }
+
+    #[test]
+    fn the_vote_after_a_decision_opens_when_the_decision_is_made() {
+        // A vote applied between the close and the tick that decides counts in the closing
+        // vote, so the new one opens at the tick, not at the close.
+        let mut d = Director::new(3, 0.0);
+        d.tick(5.007);
+        assert_eq!(d.vote_opened_t, 5.007);
     }
 }

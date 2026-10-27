@@ -1506,6 +1506,7 @@ export function wallView(input: WallInput): WallView {
 
   const play = playView(s, st, srvNow, pend, plan, input, online);
   const returning = stillReturning(st, s.ui.returning, srvNow);
+  const latestNudge = [...s.notices].reverse().find((n) => n.intent === "nudge")?.id ?? null;
   return {
     ...common,
     ready: true,
@@ -1544,7 +1545,11 @@ export function wallView(input: WallInput): WallView {
     returning,
     bandwidth: `${fmt.count(plan.direct.length, "direct stream", "direct streams")}, about ${fmt.mbps(plan.estimatedBps)} at the renderer's bit rate`,
     notices: s.notices.flatMap((n) => {
-      const text = noticeText(n, { nudges: st.nudges, srvNow, srvAt: serverNow(s.clock, n.at) });
+      // Only the latest stop choice speaks: a later pick replaced the earlier one's vote.
+      if (n.intent === "nudge" && n.id !== latestNudge) return [];
+      // A pick is dated by when the coordinator applied it, which says which vote it was in.
+      const applied = st.actions.find((a) => a.id === n.id && a.name === n.intent);
+      const text = noticeText(n, { nudges: st.nudges, srvNow, srvAt: applied?.at ?? serverNow(s.clock, n.at) });
       return text === null ? [] : [{ key: n.id, text }];
     }),
     gridLabel: `The image, ${fmt.count(st.tiles.length, "square", "squares")}: fcvm on the left, EC2 on the right. Arrow keys move between squares, Enter opens one.`,

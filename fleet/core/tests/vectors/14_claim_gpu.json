@@ -483,7 +483,7 @@
       "next": null,
       "next_hold_at": 37000,
       "next_label": null,
-      "opened_at": 5000,
+      "opened_at": 32999,
       "targets": [
         {
           "arrive_at": 55000,

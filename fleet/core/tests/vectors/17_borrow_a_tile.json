@@ -449,7 +449,7 @@
       "next": "peak-seam-low-sun",
       "next_hold_at": null,
       "next_label": "The peak at a low sun",
-      "opened_at": 60000,
+      "opened_at": 62999,
       "targets": [
         {
           "arrive_at": 95000,
