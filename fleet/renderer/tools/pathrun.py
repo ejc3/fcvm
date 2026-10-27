@@ -34,6 +34,16 @@ def path(program):
     return p["camera"], tods
 
 
+def due(tods, posted, st):
+    """The time of day to post at scene time `st` when `tods[:posted]` are posted: the latest
+    entry at or before `st` (skipping any that came due since the last pass), and the new
+    `posted`; (None, posted) when nothing is due."""
+    i = posted
+    while i < len(tods) and st >= tods[i][0]:
+        i += 1
+    return (tods[i - 1][1], i) if i > posted else (None, posted)
+
+
 def main():
     program, out, secs = sys.argv[1], sys.argv[2], float(sys.argv[3])
     cols, rows, h = int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
@@ -79,23 +89,28 @@ def main():
     health = []
     next_tod = 1
     t0 = time.time()
+    next_health = t0
+    # the time of day is re-posted when it comes due (a step a second while the camera
+    # flies), checked four times a second; /health is read every 2 s
     while time.time() - t0 < secs:
         st = (time.time() * 1000 - epoch) / 1000
-        if next_tod < len(tods) and st >= tods[next_tod][0]:
-            post_all(tods[next_tod][1])
-            next_tod += 1
-        snap = []
-        for hh, p in ends:
-            try:
-                x = fc.health(hh, p)
-                y = {k: x.get(k) for k in ("t", "budget", "budget_source", "budget_fit", "budget_fit_now", "render_ms",
-                                           "slots_missed", "fps")}
-                y["render_ms_max"] = (x.get("frames_2s") or {}).get("render_ms_max")  # over the last 2 s of frames
-                snap.append(y)
-            except Exception as e:  # noqa: BLE001
-                snap.append({"error": str(e)})
-        health.append({"at": st, "tiles": snap})
-        time.sleep(2.0)
+        v, next_tod = due(tods, next_tod, st)
+        if v is not None:
+            post_all(v)
+        if time.time() >= next_health:
+            next_health += 2.0
+            snap = []
+            for hh, p in ends:
+                try:
+                    x = fc.health(hh, p)
+                    y = {k: x.get(k) for k in ("t", "budget", "budget_source", "budget_fit", "budget_fit_now",
+                                               "render_ms", "slots_missed", "fps")}
+                    y["render_ms_max"] = (x.get("frames_2s") or {}).get("render_ms_max")  # over the last 2 s
+                    snap.append(y)
+                except Exception as e:  # noqa: BLE001
+                    snap.append({"error": str(e)})
+            health.append({"at": st, "tiles": snap})
+        time.sleep(0.25)
     stop[0] = True
     ctl.terminate()
     ctl.wait(timeout=10)
