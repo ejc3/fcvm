@@ -23,6 +23,7 @@ import {
   wallView,
   type WallInput,
 } from "../view.ts";
+import { wallRateLine } from "../view.ts";
 import { suggestMode } from "../mode.ts";
 import { END_CARD_MS } from "../race.ts";
 import { boxesMeet, DETAIL_TILE_PX, layoutMosaic, tileAt as tileAtPoint, tileGeometry, zoomTarget } from "../layout.ts";
@@ -1367,5 +1368,37 @@ describe("frame age on a tile's card", () => {
     const v = view(reported(lag, at, 100), at + 400);
     expect(v.tiles[0]!.stats[1]).toBe("frame age 90 ms");
     expect(v.tiles[0]!.stats[2]).toBe("arrives 55 ms · decoded 58 ms · drawn 90 ms");
+  });
+});
+
+describe("the wall's rate in the stream stats", () => {
+  // Staging, 2026-10-27: slot-6's renderer drew 15 fps (its frames took 36 ms), and the page,
+  // which shows every tile at one scene time, drew the whole wall at 19 fps. Nothing on the
+  // page said which tile it was.
+  function withRates(fps: (id: string) => number | null, wallFps: number) {
+    const st = fleet(4, 4);
+    st.tiles = st.tiles.map((t) => ({ ...t, fps: fps(t.id) }));
+    let s = stateWith(st);
+    const tiles: FrameStats["tiles"] = {};
+    for (const t of st.tiles) tiles[`d:${t.id}`] = { connected: true, fps: 30, newestT: 100, width: 768, height: 432, behind: false, decodeMs: 2, lag: null };
+    s = reduce(s, { type: "frame-stats", stats: { at: EPOCH, T: 100, tiles, drawMsP50: 1, drawMsP95: 2, rafMsP50: 16.7, rafMsP95: 17, allLive: true, live: [], mode: "direct", wallFps } });
+    return { s, st };
+  }
+
+  it("names the renderer holding the wall back", () => {
+    const { s, st } = withRates((id) => (id === "fcvm:3" ? 15 : 30), 19.5);
+    expect(wallRateLine(s.frames, st.tiles)).toBe("wall 20 fps · held back by fcvm VM 3 at 15 fps");
+    const v = view(s, EPOCH);
+    expect(v.wallRate).toBe("wall 20 fps · held back by fcvm VM 3 at 15 fps");
+  });
+
+  it("names none when every renderer keeps its slot", () => {
+    const { s, st } = withRates(() => 30, 30);
+    expect(wallRateLine(s.frames, st.tiles)).toBe("wall 30 fps");
+  });
+
+  it("says nothing before the drawer reports a rate", () => {
+    const { st } = withRates(() => 30, 30);
+    expect(wallRateLine(null, st.tiles)).toBe("");
   });
 });

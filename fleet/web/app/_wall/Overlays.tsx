@@ -254,6 +254,11 @@ export function Overlays({ view, phone }: { view: WallView; phone: boolean }) {
               {view.bandwidth}
             </span>
           ) : null}
+          {statsOn && view.wallRate !== "" ? (
+            <span className="stats-note plate" data-testid="wall-rate" style={{ left: img.x + 12, top: img.y + img.h - 68 }}>
+              {view.wallRate}
+            </span>
+          ) : null}
         </>
       ) : null}
       {view.sleep && img && !phone ? <WakeCard sleep={view.sleep} style={{ left: img.x + img.w / 2, top: img.y + img.h * 0.74 }} /> : null}

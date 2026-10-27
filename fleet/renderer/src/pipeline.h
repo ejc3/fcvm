@@ -164,6 +164,7 @@ class Pipeline {
   // renderer's fit (budget at 70% of a slot, smoothed)
   double used_budget_ = 0, fit_ = 0, fit_now_ = 0, fit_px_ = 0, fit_scale_ = 1.0;
   CostModel cost_;
+  HeightGuard height_guard_;  // render thread only
   struct FrameLog {
     std::chrono::steady_clock::time_point at;
     double frame_ms, render_ms, encode_ms;
@@ -176,6 +177,7 @@ class Pipeline {
   uint32_t frame_ = 0;
   double fps_ = 0;
   std::vector<int> heights_;
+  int drawn_h_ = 0;  // the stream height the last frame was drawn at (0: none streaming)
   std::vector<std::pair<int, int>> streams_;  // (height, quality) being encoded
   RenderStats rstats_;
   double encode_ms_ = 0;

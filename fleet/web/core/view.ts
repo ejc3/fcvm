@@ -119,6 +119,26 @@ export function tileName(t: { id: string; half: Half }): string {
   return k === undefined ? t.id : `${KIND_TAG[t.half]} VM ${k}`;
 }
 
+/** A renderer under this rate skips slots, and the wall drops to its rate. */
+const SLOW_RENDERER_FPS = 29;
+
+/**
+ * The stream stats' line on the wall's rate. The page shows every tile at one scene time
+ * (core/sync.ts), so the wall moves at its slowest renderer's rate; a renderer that has
+ * dropped under SLOW_RENDERER_FPS (its own `/health` fps, as the coordinator reports it) is
+ * named. Empty until the drawer reports a rate.
+ */
+export function wallRateLine(frames: FrameStats | null, tiles: readonly Tile[]): string {
+  if (frames === null || frames.wallFps === undefined) return "";
+  const wall = `wall ${Math.round(frames.wallFps)} fps`;
+  let slow: Tile | null = null;
+  for (const t of tiles) {
+    if (!isLive(t) || t.fps === null || t.fps <= 0) continue;
+    if (slow === null || t.fps < slow.fps!) slow = t;
+  }
+  return slow !== null && slow.fps! < SLOW_RENDERER_FPS ? `${wall} · held back by ${tileName(slow)} at ${Math.round(slow.fps!)} fps` : wall;
+}
+
 /** A viewer as the activity feed names it. */
 export function viewerName(v: string | null, you: string | null): string {
   if (v === null || v === "") return "someone";
@@ -1292,6 +1312,8 @@ export interface WallView {
   notices: { key: string; text: string }[];
   /** What the streams cost, for the stats switch. */
   bandwidth: string;
+  /** The stream stats' line on the wall's rate and the renderer holding it back (wallRateLine). */
+  wallRate: string;
 }
 
 /**
@@ -1491,6 +1513,7 @@ export function wallView(input: WallInput): WallView {
       gridLabel: "",
       notices: [],
       bandwidth: "",
+      wallRate: "",
     };
   }
   const pend = pendingIntents(s);
@@ -1645,6 +1668,7 @@ export function wallView(input: WallInput): WallView {
     seams: seamView(s, covered ? null : layout, tiles, input, returning),
     returning,
     bandwidth: `${fmt.count(plan.direct.length, "direct stream", "direct streams")}, about ${fmt.mbps(plan.estimatedBps)} at the renderer's bit rate`,
+    wallRate: wallRateLine(s.frames, st.tiles),
     notices: s.notices.flatMap((n) => {
       // Only the latest stop choice speaks: a later pick replaced the earlier one's vote.
       if (n.intent === "nudge" && n.id !== latestNudge) return [];

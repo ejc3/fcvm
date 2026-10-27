@@ -370,6 +370,8 @@ let captures: { req: number; points: { x: number; y: number }[] }[] = [];
 const drawMs: number[] = [];
 const rafMs: number[] = [];
 const drawTimes: number[] = [];
+/** Local ms at which each new common time was first drawn (the last 2 s): the wall's rate. */
+const newTimes: number[] = [];
 let lastFrameAt: number | null = null;
 
 let mainTicks = false;
@@ -804,6 +806,7 @@ function draw(): void {
     }
     dirty = true;
   }
+  if (choice.T !== null && (lastChoice.T === null || Math.abs(choice.T - lastChoice.T) > SAME_T_EPS)) newTimes.push(now());
   lastChoice = choice;
   if (choice.T !== null) prevT = choice.T;
 
@@ -999,6 +1002,7 @@ function pct(xs: readonly number[], p: number): number {
 function report(): void {
   const at = now();
   while (drawTimes.length > 0 && drawTimes[0]! < at - 2000) drawTimes.shift();
+  while (newTimes.length > 0 && newTimes[0]! < at - 2000) newTimes.shift();
   const tiles: Record<string, TileFrameStats> = {};
   let decoded = 0;
   let bytes = 0;
@@ -1032,6 +1036,7 @@ function report(): void {
     allLive: allLive(),
     live: liveKeys(),
     mode: shownMode,
+    wallFps: newTimes.length / 2,
   };
   const kinds = [...lastChoice.show.values()];
   const bench: BenchStats = {
