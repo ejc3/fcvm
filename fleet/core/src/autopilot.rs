@@ -162,6 +162,7 @@ fn path(c: &Claim) -> Scene {
         time_of_day: 0.0,
         words: vec![],
         lights: vec![],
+        weather: vec![],
     }
 }
 
