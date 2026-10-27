@@ -1670,6 +1670,136 @@ async fn an_ec2_renderer_restarted_on_its_instance_gets_its_scene_again() {
     assert_eq!(scenes.lock().unwrap()[1], "i-test-0", "the same instance");
 }
 
+/// A viewer streams an EC2 tile as soon as it is `running`, and a renderer that has not
+/// been given its scene draws against its default one, whose epoch is 0: every frame is
+/// stamped about 1.8e9 s past the wall's scene time and the page cannot place the tile.
+/// On staging after a wake, six of eight EC2 tiles were reported running while the scene
+/// poster had not yet reached them, and their frames carried that epoch. The tile must be
+/// reported running only once its renderer has taken the scene. This driver holds the
+/// first scene post until the test lets it go.
+struct SceneGateEc2 {
+    gate: Arc<tokio::sync::Notify>,
+    called: Arc<tokio::sync::Notify>,
+    scenes: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ec2::Ec2Driver for SceneGateEc2 {
+    async fn launch(&self, _tile: &str) -> Result<ec2::Launched, ec2::LaunchError> {
+        Ok(ec2::Launched {
+            instance: "i-test-0".into(),
+            frame_url: Some("wss://ec2-1.example/frames".into()),
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        Ok(l.clone())
+    }
+    async fn terminate(&self, _instance: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _tile: &str,
+        l: &ec2::Launched,
+        _body: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
+        if self.scenes.lock().unwrap().is_empty() {
+            self.called.notify_one();
+            self.gate.notified().await;
+        }
+        self.scenes.lock().unwrap().push(l.instance.clone());
+        Ok(())
+    }
+    async fn post_budget(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn health(&self, _tile: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        Ok(json!({"ready": true, "fps": 30.0, "boot_id": "boot-1"}))
+    }
+}
+
+#[tokio::test]
+async fn an_ec2_tile_is_reported_running_only_after_its_renderer_has_its_scene() {
+    use fleet_core::protocol::{AssignSlot, BudgetBody, SharedScene};
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let called = Arc::new(tokio::sync::Notify::new());
+    let scenes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let driver: Arc<dyn ec2::Ec2Driver> = Arc::new(SceneGateEc2 {
+        gate: gate.clone(),
+        called: called.clone(),
+        scenes: scenes.clone(),
+    });
+    let (handle, reports) = recording_handle();
+    let tile = AssignSlot {
+        id: "ec2-1".into(),
+        sbdf: String::new(),
+        generation: 1,
+        rect: Some(fleet_core::tiling::Rect {
+            x: 0.5,
+            y: 0.0,
+            w: 0.25,
+            h: 1.0,
+        }),
+        private_camera: None,
+        layout_generation: 0,
+        rect_from_frame: 0,
+        previous_rect: None,
+        standby: false,
+        warm: false,
+    };
+    let (_assign, assign) = tokio::sync::watch::channel(vec![tile]);
+    let (_scene, scene) = tokio::sync::watch::channel(Some(SharedScene::new(
+        &fleet_core::scene::Scene::new(1_000),
+        32.0 / 9.0,
+    )));
+    let (_budget, budget) = tokio::sync::watch::channel(Some(BudgetBody {
+        budget: 500_000,
+        t: 1.0,
+    }));
+    tokio::spawn(ec2::run(driver, assign, scene, budget, handle));
+    tokio::time::timeout(Duration::from_secs(10), called.notified())
+        .await
+        .expect("the instance's renderer is sent its scene");
+    let running = |r: &Arc<std::sync::Mutex<Vec<SlotReport>>>| {
+        r.lock().unwrap().iter().any(|r| r.phase == "running")
+    };
+    // While the scene post is held, the tile must not be reported running.
+    let early = tokio::time::timeout(Duration::from_secs(2), async {
+        while !running(&reports) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        early.is_err(),
+        "the tile was reported running before its renderer had its scene: {:#?}",
+        reports.lock().unwrap()
+    );
+    gate.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !running(&reports) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the tile runs once its renderer has its scene");
+    assert_eq!(*scenes.lock().unwrap(), vec!["i-test-0".to_string()]);
+    // The scene poster starts from what the tile task gave: no second post of the same scene.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        scenes.lock().unwrap().len(),
+        1,
+        "the same scene was posted again"
+    );
+}
+
 /// A running tile whose renderer stops answering on an instance that keeps running is
 /// launched again after three silent checks in a row; a check it answers starts the count
 /// again. Before, only the instance's state was checked and the tile stayed `running`.

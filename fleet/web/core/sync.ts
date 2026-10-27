@@ -28,6 +28,46 @@ export const HOLD_EXTRA_S = 0.2;
  * to still hold the frame a tile MAX_LAG_S + HOLD_EXTRA_S behind them is showing.
  */
 export const BUFFER_FRAMES = 18;
+/**
+ * A stream's frames only move forward in scene time. A frame this many seconds older than
+ * the newest one a tile holds means its renderer's clock moved back: it drew against its
+ * default scene (epoch 0, so scene times near 1.8e9 s) until its scene arrived, or it was
+ * given a scene with a later epoch.
+ */
+export const CLOCK_BACK_S = 5;
+
+/**
+ * Whether a frame at `t` is on an earlier clock than the frames held (`ts`, ascending): the
+ * held frames are then dropped. Kept, they stay the newest the tile holds and every frame on
+ * the new clock is evicted as the oldest, so the tile never shows a frame again.
+ */
+export function clockMovedBack(ts: readonly number[], t: number): boolean {
+  return ts.length > 0 && t < ts[ts.length - 1]! - CLOCK_BACK_S;
+}
+
+/**
+ * Add a decoded frame to a tile's held frames (ascending t; a repeated t replaces the old
+ * frame) and keep at most BUFFER_FRAMES, letting go of the oldest that `keeps` does not
+ * pin. Returns the frames let go, for the caller to close.
+ */
+export function holdFrame<H extends { t: number }>(frames: H[], f: H, keeps: (h: H) => boolean): H[] {
+  const gone = clockMovedBack(frames.map((h) => h.t), f.t) ? frames.splice(0) : [];
+  const at = frames.findIndex((h) => h.t >= f.t - SAME_T_EPS);
+  if (at >= 0 && Math.abs(frames[at]!.t - f.t) <= SAME_T_EPS) {
+    gone.push(frames[at]!);
+    frames[at] = f;
+  } else if (at >= 0) {
+    frames.splice(at, 0, f);
+  } else {
+    frames.push(f);
+  }
+  while (frames.length > BUFFER_FRAMES) {
+    const i = frames.findIndex((h) => !keeps(h));
+    if (i < 0) break;
+    gone.push(frames.splice(i, 1)[0]!);
+  }
+  return gone;
+}
 
 export interface TileBuffer {
   id: string;
