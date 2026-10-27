@@ -195,7 +195,7 @@ frame rate and delay.
 | | desktop (`h=270`) | phone (`h=180`) |
 |---|---|---|
 | fcvm half, as deployed (2 vCPUs per VM) | 500 (750 fails) | 500 (750 fails) |
-| fcvm half, 4 vCPUs per VM and RPS (below) | 750, at the edge (1000 fails) | 750 (1000 fails) |
+| fcvm half, 4 vCPUs per VM and RPS (below) | 750 misses by one tile at 29.47 fps (1000 fails) | 750 (1000 fails) |
 | EC2 half (g4dn.xlarge) | 750 (1000 fails) | not measured |
 | coordinator (0.5 vCPU, 1 GiB) | about 5,000 (memory) | same |
 
@@ -302,7 +302,10 @@ tile lost its stream. The renderer now refuses that one connection instead
 (`--pids-limit=32768`). With both, 1500 viewers: the renderer kept running at
 19.7 fps (CPU), and nginx refused 36 handshakes ("worker_connections are not
 enough": the stock 768 per worker, two per proxied stream); with the fix and
-the old limit, 1,032 viewers streamed and the rest were refused.
+the old limit, 1,032 connections were upgraded and the rest refused, a few of
+the upgraded ones got no frames (their writer thread was refused after the
+upgrade), the others streamed at 29.4 fps on average, and the renderer did not
+restart.
 
 **The coordinator** (`fcvm fleet coord --ec2 fake`, so 16 places, at the
 Fargate task's 0.5 vCPU through a cgroup CPU quota, on Graviton; without the
