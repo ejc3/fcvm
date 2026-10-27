@@ -102,6 +102,46 @@ int main() {
     CHECK(avc_codec_string(au + off, len) == "avc1.640028", "%s", avc_codec_string(au + off, len).c_str());
   }
 
+  // --- reordering an SPS declares (fleet/web/core/test/sps.test.ts has the same fixtures)
+  {
+    auto bytes = [](const char* hex) {
+      std::vector<uint8_t> v;
+      for (size_t i = 0; hex[i] && hex[i + 1]; i += 2) v.push_back((uint8_t)strtoul(std::string(hex + i, 2).c_str(), nullptr, 16));
+      return v;
+    };
+    // The renderer's SPS before bitstreamRestrictionFlag (staging, h=360): no restriction.
+    auto old = bytes("6764001eac2b2014863f2e02d404040500000303e80000ea6084");
+    SpsReorder r = sps_reorder(old.data(), old.size());
+    CHECK(r.parsed && !r.restriction && r.max_num_ref_frames == 3, "old renderer SPS: parsed %d restriction %d refs %u",
+          (int)r.parsed, (int)r.restriction, r.max_num_ref_frames);
+    // The same SPS with the restriction added (read by ffmpeg's trace_headers as 0 and 3).
+    auto fixed = bytes("6764001eac2b2014863f2e02d404040500000303e80000ea608da0804248");
+    r = sps_reorder(fixed.data(), fixed.size());
+    CHECK(r.parsed && r.restriction && r.max_num_reorder_frames == 0 && r.max_dec_frame_buffering == 3,
+          "restricted SPS: parsed %d restriction %d reorder %u dec %u", (int)r.parsed, (int)r.restriction,
+          r.max_num_reorder_frames, r.max_dec_frame_buffering);
+    // x264 with 3 B-frames (POC type 0), and with NAL HRD parameters before the restriction.
+    auto bf = bytes("6764000dacd941419f9f0110000003001000000303c0f1429960");
+    r = sps_reorder(bf.data(), bf.size());
+    CHECK(r.parsed && r.restriction && r.max_num_reorder_frames == 2 && r.max_dec_frame_buffering == 4, "x264 -bf 3");
+    auto hrd = bytes("67640014acb202833f3e022000000300200000079c04001e848003d09c58600f142a48");
+    r = sps_reorder(hrd.data(), hrd.size());
+    CHECK(r.parsed && r.restriction && r.max_num_reorder_frames == 0 && r.max_dec_frame_buffering == 3, "x264 nal-hrd");
+    // No VUI at all.
+    auto novui = bytes("6764001eac2b2014863f2a");
+    r = sps_reorder(novui.data(), novui.size());
+    CHECK(r.parsed && !r.restriction, "no VUI");
+    // Truncated, a stray bit after the VUI, and a PPS: not a whole SPS.
+    r = sps_reorder(fixed.data(), 12);
+    CHECK(!r.parsed, "truncated SPS parsed");
+    auto stray = fixed;
+    stray.back() |= 0x01;
+    r = sps_reorder(stray.data(), stray.size());
+    CHECK(!r.parsed, "stray bit parsed");
+    const uint8_t pps[] = {0x68, 0xee, 0x3c, 0xb0};
+    CHECK(!sps_reorder(pps, sizeof pps).parsed, "PPS parsed as an SPS");
+  }
+
   // --- JPEG: markers, and a flat image codes small (the decode is checked with ffmpeg in the PR)
   {
     std::vector<uint8_t> px(37 * 21 * 4, 128);

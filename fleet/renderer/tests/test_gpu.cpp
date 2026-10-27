@@ -1,6 +1,7 @@
 // Seam test on a GPU: the whole image and a 2x2 grid of tiles, drawn
 // separately, must agree pixel for pixel when stitched by whole-image
-// coordinates. Run in the container: fleet-renderer-test.
+// coordinates. Then the encoder's SPS must say frames are never reordered.
+// Run in the container: fleet-renderer-test.
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -8,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "../src/nvenc.h"
 #include "../src/render.h"
 #include "../src/scene.h"
 #include "check.h"
@@ -379,5 +381,41 @@ int main(int argc, char** argv) {
     CHECK(grain < GRAIN_MAX, "moving frame's grain against the reference: %.2f (< %.1f)", grain, GRAIN_MAX);
     CHECK(rmse < RMSE_MAX, "moving frame's error against the reference: rmse %.2f (< %.1f)", rmse, RMSE_MAX);
   }
+
+  // 7. The encoder's SPS, in the sequence header and in a keyframe, carries a VUI
+  // bitstream_restriction with max_num_reorder_frames 0. Without it a decoder
+  // holds the level's MaxDpbFrames (Chrome on macOS: 7 or 8 frames at the
+  // wall's tile sizes) before outputting each frame. Every quality, at tile
+  // sizes that select levels 2.0 to 4.2.
+  for (int q = 0; q < 3; q++)
+    for (auto wh : {std::pair<int, int>{336, 196}, {656, 376}, {976, 556}, {1936, 1096}}) {
+      size_t pitch = 0;
+      void* nv12 = r.alloc_nv12(wh.first, wh.second, &pitch);
+      H264Encoder enc;
+      bool ok = enc.open(r.cu_context(), nv12, pitch, wh.first, wh.second, 30, q, &err);
+      CHECK(ok, "encoder %dx%d q%d: %s", wh.first, wh.second, q, err.c_str());
+      if (ok) {
+        const SpsReorder& h0 = enc.reorder();
+        CHECK(h0.parsed && h0.restriction && h0.max_num_reorder_frames == 0 &&
+                  h0.max_dec_frame_buffering == h0.max_num_ref_frames,
+              "%dx%d q%d sequence header: parsed %d restriction %d reorder %u dec_frame_buffering %u refs %u", wh.first,
+              wh.second, q, (int)h0.parsed, (int)h0.restriction, h0.max_num_reorder_frames, h0.max_dec_frame_buffering,
+              h0.max_num_ref_frames);
+        std::vector<uint8_t> au;
+        bool key = false;
+        ok = enc.encode(true, &au, &key, &err);
+        CHECK(ok && key, "keyframe %dx%d q%d: %s", wh.first, wh.second, q, err.c_str());
+        size_t len = 0;
+        long off = find_sps(au.data(), au.size(), &len);
+        SpsReorder k = off >= 0 ? sps_reorder(au.data() + off, len) : SpsReorder();
+        CHECK(k.parsed && k.restriction && k.max_num_reorder_frames == 0 && k.max_dec_frame_buffering == k.max_num_ref_frames,
+              "%dx%d q%d keyframe SPS: parsed %d restriction %d reorder %u dec_frame_buffering %u refs %u", wh.first,
+              wh.second, q, (int)k.parsed, (int)k.restriction, k.max_num_reorder_frames, k.max_dec_frame_buffering,
+              k.max_num_ref_frames);
+        if (q == 1) fprintf(stderr, "encoder %dx%d %s: max_num_ref_frames %u, max_dec_frame_buffering %u\n", wh.first,
+                            wh.second, enc.codec().c_str(), k.max_num_ref_frames, k.max_dec_frame_buffering);
+      }
+      r.free_dev(nv12);
+    }
   DONE();
 }

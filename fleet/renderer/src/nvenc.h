@@ -6,6 +6,20 @@
 #include <string>
 #include <vector>
 
+// What an SPS NAL unit (first byte the NAL header, emulation prevention bytes
+// in place) says about frame reordering. Without a VUI bitstream_restriction a
+// decoder must assume the level's MaxDpbFrames: Chromium's H264Decoder then
+// holds that many frames (7 or 8 at the wall's tile sizes) before outputting
+// one. parsed is false when the bytes are not a whole SPS.
+struct SpsReorder {
+  bool parsed = false;
+  bool restriction = false;  // bitstream_restriction_flag
+  uint32_t max_num_ref_frames = 0;
+  uint32_t max_num_reorder_frames = 0;
+  uint32_t max_dec_frame_buffering = 0;
+};
+SpsReorder sps_reorder(const uint8_t* sps, size_t n);
+
 class H264Encoder {
  public:
   H264Encoder() = default;
@@ -24,6 +38,9 @@ class H264Encoder {
   bool encode(bool force_idr, std::vector<uint8_t>* out, bool* keyframe, std::string* err);
   // RFC 6381 codec string from the SPS, e.g. "avc1.640028".
   const std::string& codec() const { return codec_; }
+  // The encoder's SPS as it reads back: open() sets a bitstream_restriction with
+  // no reordering and checks that NVENC wrote it.
+  const SpsReorder& reorder() const { return reorder_; }
   int width() const { return w_; }
   int height() const { return h_; }
 
@@ -35,6 +52,7 @@ class H264Encoder {
   size_t pitch_ = 0;
   uint64_t n_ = 0;
   std::string codec_;
+  SpsReorder reorder_;
   uint32_t rate_ = 0;
 };
 
