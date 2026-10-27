@@ -118,4 +118,26 @@ mod tests {
         assert!(BroadcastSecret::parse(r#"{"ingest_url":"https://x"}"#).is_err());
         assert!(BroadcastSecret::parse("{}").is_err());
     }
+
+    /// `--broadcast-arg` changes a default: the child parses the defaults then the overrides,
+    /// and the last value of a repeated option wins (a conflict would stop the child at
+    /// start, again and again).
+    #[test]
+    fn a_broadcast_arg_overrides_a_default() {
+        use clap::Parser;
+        let mut argv = vec!["fcvm", "fleet", "aggregate", "--listen", "127.0.0.1:1"];
+        argv.extend(DEFAULT_ARGS);
+        argv.extend(["--crf", "23", "--image-height", "1080"]);
+        let cli =
+            crate::cli::Cli::try_parse_from(argv).expect("the broadcast's command line parses");
+        let crate::cli::Commands::Fleet(f) = cli.cmd else {
+            panic!("not a fleet command")
+        };
+        let crate::cli::FleetCommand::Aggregate(a) = f.cmd else {
+            panic!("not the aggregator")
+        };
+        assert_eq!(a.crf, 23);
+        assert_eq!(a.image_height, 1080);
+        assert_eq!(a.maxrate_kbps, 4500, "a default left alone stays");
+    }
 }

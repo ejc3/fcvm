@@ -70,7 +70,10 @@ pub enum FleetAggregateCodec {
     Raw,
 }
 
+/// A repeated option takes its last value: the coordinator passes the broadcast's defaults,
+/// then the operator's `--broadcast-arg` overrides.
 #[derive(Args, Debug)]
+#[command(args_override_self = true)]
 pub struct FleetAggregateArgs {
     /// Address to serve /frames, /layout, /stats and /healthz on
     #[arg(long)]

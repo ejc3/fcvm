@@ -363,6 +363,10 @@ pub fn ffmpeg_args(url: &str) -> Vec<String> {
     .collect()
 }
 
+/// How long a write to the child may make no progress before the child is replaced: the
+/// ingest stalled, ffmpeg stopped reading, and nothing else would notice.
+pub const WRITE_STALL: Duration = Duration::from_secs(5);
+
 /// Push the aggregator's output to `url` until `cancel`.
 pub async fn run(shared: Arc<Shared>, ffmpeg: String, url: String, cancel: CancellationToken) {
     let mut backoff = Duration::from_secs(1);
@@ -430,7 +434,16 @@ async fn once(shared: &Shared, ffmpeg: &str, url: &str, cancel: &CancellationTok
         if out.is_empty() {
             continue;
         }
-        stdin.write_all(&out).await.context("writing to ffmpeg")?;
+        // Bounded and cancellable: a stalled ingest stops ffmpeg reading, and a write that
+        // waited on it would hold up both cancellation and the restart.
+        tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            status = child.wait() => anyhow::bail!("ffmpeg exited ({status:?}) after {pushed} frames"),
+            r = tokio::time::timeout(WRITE_STALL, stdin.write_all(&out)) => match r {
+                Ok(r) => r.context("writing to ffmpeg")?,
+                Err(_) => anyhow::bail!("ffmpeg took no data for {WRITE_STALL:?}: the ingest stalled"),
+            },
+        }
         pushed += 1;
     }
 }
@@ -775,5 +788,99 @@ mod tests {
             i += 15 + size;
         }
         assert_eq!(seis, ks.len(), "one SEI per frame");
+    }
+
+    /// A child that takes nothing (a stalled ingest: ffmpeg alive, its stdin full) must
+    /// neither hold up cancellation nor keep the push from starting again.
+    fn stalled_ffmpeg(dir: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("ffmpeg");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho started >> {}/starts\nexec sleep 600\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Frames big enough that a few fill the pipe to a child that does not read.
+    fn publish_big_frames(shared: &Shared, n: usize) {
+        for i in 0..n {
+            let mut f = frame(10.0 + i as f64 / 30.0, true);
+            f.au.extend_from_slice(&[0, 0, 0, 1, 0x0c]);
+            f.au.extend(std::iter::repeat_n(0xff, 256 * 1024));
+            shared.publish(Out::Frame {
+                key: true,
+                bytes: f.encode(),
+            });
+        }
+    }
+
+    async fn subscribed(shared: &Shared) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while shared.out.receiver_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the pusher subscribes");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_ingest_does_not_hold_up_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Shared::new();
+        let cancel = CancellationToken::new();
+        let pusher = tokio::spawn(run(
+            shared.clone(),
+            stalled_ffmpeg(dir.path()),
+            "rtmps://ingest.example/app/k".into(),
+            cancel.clone(),
+        ));
+        subscribed(&shared).await;
+        publish_big_frames(&shared, 8);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), pusher)
+            .await
+            .expect("the pusher stops within 2 s of its cancellation")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stalled_ingest_is_started_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Shared::new();
+        let cancel = CancellationToken::new();
+        let pusher = tokio::spawn(run(
+            shared.clone(),
+            stalled_ffmpeg(dir.path()),
+            "rtmps://ingest.example/app/k".into(),
+            cancel.clone(),
+        ));
+        subscribed(&shared).await;
+        publish_big_frames(&shared, 8);
+        let starts = dir.path().join("starts");
+        let deadline = std::time::Instant::now() + WRITE_STALL + Duration::from_secs(5);
+        loop {
+            let n = std::fs::read_to_string(&starts)
+                .unwrap_or_default()
+                .lines()
+                .count();
+            if n >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stalled child was not replaced ({n} start)"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        cancel.cancel();
+        pusher.await.unwrap();
     }
 }
