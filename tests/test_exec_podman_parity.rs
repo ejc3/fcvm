@@ -425,13 +425,23 @@ fn cases(env_file: &str) -> Vec<Case> {
         // taken by the forked child in the shell's own handler, the real sleep
         // then runs its full time, and how often that happens depends on how
         // fast the client delivers the key.
+        //
+        // The kernel signals the shell before it echoes "^C", so a handler that
+        // prints at once can land before the echo (seen once in CI, in the VM).
+        // The handler reads a line first, typed only after the echo has arrived
+        // (`signal_key_order_problems`).
         sh(
             "it_ctrl_c_interrupts",
             &["-it"],
-            "trap 'echo CAUGHT; exit 130' INT; echo READY; while :; do :; done",
+            "trap 'read line; echo CAUGHT; exit 130' INT; echo READY; while :; do :; done",
         )
         .pty()
-        .steps(&[WaitFor(b"READY"), Type(b"\x03")]),
+        .steps(&[
+            WaitFor(b"READY"),
+            Type(b"\x03"),
+            WaitFor(b"^C"),
+            Type(b"\n"),
+        ]),
         // Without -i the typed line never reaches the PTY, so it is not echoed.
         sh(
             "t_without_i_ignores_typing",
@@ -1231,4 +1241,64 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
         failures.join("\n")
     );
     Ok(())
+}
+
+/// Keys the line discipline turns into a signal (VINTR, VQUIT and VSUSP at
+/// their defaults), each with the echo ECHOCTL writes for it.
+const SIGNAL_KEYS: &[(u8, &[u8])] = &[(0x03, b"^C"), (0x1c, b"^\\"), (0x1a, b"^Z")];
+
+/// Where a case would compare an order the kernel does not fix.
+///
+/// For a signal key, n_tty sends the signal (`isig`) before it queues the key's
+/// echo, and writes the echo out only at the end of that receive call
+/// (`n_tty_receive_signal_char`, `flush_echoes` in drivers/tty/n_tty.c). A
+/// handler running on another CPU can write in between, so its output and the
+/// echo arrive in either order. A case that compares stdout must therefore wait
+/// for the echo and gate the handler's output on input typed after it: the
+/// echo of a newline is queued before the line wakes its reader, and every
+/// write to the terminal sends queued echoes first.
+fn signal_key_order_problems(case: &Case) -> Vec<String> {
+    if !case.checks.contains(&Check::Stdout) {
+        return Vec::new();
+    }
+    let mut problems = Vec::new();
+    for (at, step) in case.steps.iter().enumerate() {
+        let Step::Type(bytes) = step else { continue };
+        for (key, echo) in SIGNAL_KEYS {
+            if !bytes.contains(key) {
+                continue;
+            }
+            let waits_for_echo =
+                matches!(case.steps.get(at + 1), Some(Step::WaitFor(needle)) if needle == echo);
+            let gated = matches!(case.steps.get(at + 2), Some(Step::Type(_)));
+            if !(waits_for_echo && gated) {
+                problems.push(format!(
+                    "{}: step {at} types {key:#04x}; the next steps must be WaitFor({:?}) and a Type the handler waits for",
+                    case.name,
+                    String::from_utf8_lossy(echo)
+                ));
+            }
+        }
+    }
+    problems
+}
+
+#[test]
+fn a_typed_signal_key_is_compared_only_after_its_echo() {
+    use Step::*;
+    // The check itself fires on the shape that raced in CI.
+    let raced = case("raced", &["-it"], &["sh"])
+        .pty()
+        .steps(&[WaitFor(b"READY"), Type(b"\x03")]);
+    assert_eq!(signal_key_order_problems(&raced).len(), 1);
+
+    let problems: Vec<String> = cases("/nonexistent-env-file")
+        .iter()
+        .flat_map(signal_key_order_problems)
+        .collect();
+    assert!(
+        problems.is_empty(),
+        "these cases compare a signal handler's output against the kernel's echo of the key, whose order is not fixed:\n{}",
+        problems.join("\n")
+    );
 }
