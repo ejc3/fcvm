@@ -238,7 +238,9 @@ sed -n '/^prep)/,/;;/p' fleet/ami/host/build.sh | grep -qE '^  systemctl enable 
 wr=fleet/ami/host/warm-root.sh
 first=$(grep -n '^launch ||' "$wr" | head -1 | cut -d: -f1)
 traced=$(grep -n '^launch trace ||' "$wr" | head -1 | cut -d: -f1)
-[ -n "$first" ] && [ -n "$traced" ] && [ "$first" -lt "$traced" ] && grep -q "Pre-start snapshot hit" "$wr" ||
+# fcvm logs the hit at info and its default filter is warn: the launches set RUST_LOG.
+[ -n "$first" ] && [ -n "$traced" ] && [ "$first" -lt "$traced" ] && grep -q "Pre-start snapshot hit" "$wr" &&
+  grep -qE 'RUST_LOG=[^ ]*info[^ ]* +"\$\{trace\[@\]\}"|RUST_LOG=info' "$wr" ||
   no "warm-root.sh must list the prefetch from a second, traced launch that hits the first one's snapshot"
 # prefetch.sh reads every listed file in 1 MiB pieces (a file of 2 MiB and one byte is three
 # pieces) and skips a listed file the image lacks.

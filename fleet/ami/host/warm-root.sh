@@ -40,11 +40,12 @@ P=$(curl -fsS -H "X-aws-ec2-metadata-token: $T" "http://169.254.169.254/latest/m
 # The agent's slot address: the prefix with the GPU index plus two in its last group.
 A=$(python3 -c 'import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1], strict=False).network_address + 2)' "$P")
 # One launch, as the agent launches a slot; with "trace", under strace into /tmp/warm-root.strace.
+# At info, so the log says whether the launch restored a snapshot (fcvm defaults to warn).
 launch() {
   local trace=()
   [ "${1:-}" = trace ] && trace=(strace -f -qq --seccomp-bpf -e "trace=openat,execve" -o /tmp/warm-root.strace)
   local t0; t0=$(date +%s%N)
-  setsid "${trace[@]}" \
+  RUST_LOG=info setsid "${trace[@]}" \
     fcvm podman run --name warm-root --kernel-profile gpu --gpu "$G" --publish 127.0.0.1:20099:8080 \
     --network routed --ipv6-prefix "$P" --ipv6-address "$A" --publish 127.0.0.1:20098:443 \
     --map "$TLS_DIR":/run/fleet-tls:ro --env TLS_CERT_FILE=/run/fleet-tls/tls.json --env TLS_PORT=443 "$IMG" \
