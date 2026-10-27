@@ -1020,11 +1020,15 @@ impl Director {
         self.path.extend(stop_keyframes(b, at, &self.next_intent));
     }
 
-    /// Start the current stop afresh at `now_t` (a new director, or one that was away).
+    /// Pick up again at `now_t` after the path ran out (a coordinator that was away, or a
+    /// director stored before the path was kept): the current stop is laid out so that its
+    /// launch, the last keyframe renderers were holding, falls at `now_t`, so the vote closes
+    /// at once and the flight to the next stop leaves from where the camera stands.
     fn restart_at(&mut self, now_t: f64) {
-        self.arrive_t = now_t;
+        let stay = viewpoints()[self.current].stay_secs;
+        self.arrive_t = now_t - stay - 1.0;
         self.flying = false;
-        self.path = stop_keyframes(&viewpoints()[self.current], now_t, &None);
+        self.path = stop_keyframes(&viewpoints()[self.current], self.arrive_t, &None);
         if self.next.is_some() {
             self.commit_next();
         }
@@ -1032,10 +1036,10 @@ impl Director {
 
     /// Advance to scene time `now_t`.
     pub fn tick(&mut self, now_t: f64) {
-        // A coordinator that was away for longer than a whole step starts the stop afresh;
-        // so does a director stored before the path was kept.
+        // A coordinator that was away past the end of the committed path picks up from where
+        // the camera stands; so does a director stored before the path was kept.
         if (now_t > self.hold_until() + 60.0 && self.next.is_none()) || self.path.is_empty() {
-            self.restart_at(now_t.max(self.arrive_t));
+            self.restart_at(now_t);
         }
         for _ in 0..4 {
             if self.next.is_none() && now_t >= self.decide_at() {
@@ -1198,6 +1202,29 @@ mod tests {
                 "seed {seed}: every flight style flies in an hour: {styles:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_coordinator_back_from_a_pause_flies_on_from_where_the_camera_was() {
+        // Away before the vote closed: renderers hold the last committed keyframe (the
+        // stop's launch). Restarting the stop from its beginning moved the camera 4.4 km in
+        // one frame on seed 1; it flies on from the held pose instead.
+        let mut d = Director::new(1, 0.0);
+        d.tick(5.0);
+        let held = d.camera().last().unwrap().clone();
+        let back = d.hold_until() + 61.0;
+        d.tick(back);
+        let s = scene_of(d.camera());
+        let now = s.camera_at(back);
+        assert!(
+            dist(now.pos, held.pos) < 1e-6,
+            "jumped {:.3} km",
+            dist(now.pos, held.pos)
+        );
+        assert!(dist(now.look, held.look) < 1e-6);
+        let later = s.camera_at(back + 1.0);
+        assert!(dist(later.pos, now.pos) > 0.01, "and moves on");
+        assert!(d.next.is_some());
     }
 
     #[test]
