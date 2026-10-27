@@ -5,7 +5,7 @@
 
 use fcvm::fleet::aggregate::codec::Raw;
 use fcvm::fleet::aggregate::frame::Frame;
-use fcvm::fleet::coord::text_check::{FakeCheck, TextChecker};
+use fcvm::fleet::coord::text_check::{FakeCheck, NoCheck, TextChecker, CHECK_FAILED, WORDS_OFF};
 use fcvm::fleet::coord::turnstile::{self, Verifier};
 use fcvm::fleet::coord::{agents, ec2, live, poster, start, store, Handle};
 use fcvm::fleet::lines::{spawn_writer, LineReader};
@@ -521,7 +521,23 @@ async fn a_failing_text_check_degrades_the_coordinator() {
         .unwrap()
         .clone();
     assert_eq!(f["component"], "text_check");
-    assert!(f["reason"].as_str().unwrap().contains("down"), "{f}");
+    // The receipt, its check and the failures list are public: they carry a fixed
+    // sentence, and the checker's own error ("fake text check is down") stays in the log.
+    assert_eq!(f["reason"], CHECK_FAILED, "{f}");
+    assert_eq!(r["reason"], CHECK_FAILED, "{r}");
+    assert_eq!(r["check"]["reason"], CHECK_FAILED, "{r}");
+}
+
+/// A coordinator started with `--text-check none` tells the viewer words are off, not
+/// that a check failed.
+#[tokio::test]
+async fn without_a_text_check_viewers_read_that_words_are_off() {
+    let (url, _h) = coordinator(Arc::new(NoCheck)).await;
+    let mut c = Viewer::connect(&url).await;
+    c.intent("w", "word", json!({"text": "Hi!"})).await;
+    let r = c.receipt("w").await;
+    assert_eq!(r["outcome"], "refused");
+    assert_eq!(r["reason"], WORDS_OFF, "{r}");
 }
 
 /// Limits are per client address: `CF-Connecting-IP` when the coordinator trusts it (it
