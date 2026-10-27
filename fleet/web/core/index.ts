@@ -1,5 +1,6 @@
 export * from "./protocol.ts";
 export * from "./frame.ts";
+export * from "./sps.ts";
 export * from "./clock.ts";
 export * from "./layout.ts";
 export * from "./sync.ts";
