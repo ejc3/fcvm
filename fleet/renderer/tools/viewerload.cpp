@@ -128,7 +128,8 @@ struct Conn {
 struct Shared {
   std::vector<Url> urls;
   double epoch_ms = 0;
-  double win0 = 0, win1 = 0;  // measurement window, unix ms
+  // measurement window, unix ms: set by main once every connection is open, read by the workers
+  std::atomic<double> win0{1e18}, win1{1e18};
   std::atomic<bool> stop{false};
 };
 
@@ -255,7 +256,7 @@ struct Worker {
 // Parse complete WebSocket frames from c->buf.
 void consume(Conn* c, Shared& sh, Worker& w, double at) {
   Stats& st = w.per_url[c->url];
-  bool in_win = at >= sh.win0 && at < sh.win1;
+  bool in_win = at >= sh.win0.load() && at < sh.win1.load();
   size_t p = 0;
   const std::string& b = c->buf;
   while (b.size() - p >= 2) {
@@ -315,7 +316,7 @@ void consume(Conn* c, Shared& sh, Worker& w, double at) {
 void close_conn(Conn* c, Shared& sh, double at) {
   if (c->closed && c->fd < 0) return;
   c->closed = true;
-  if (at >= sh.win0 && at < sh.win1) c->closed_in_window = true;
+  if (at >= sh.win0.load() && at < sh.win1.load()) c->closed_in_window = true;
   if (c->fd >= 0) {
     close(c->fd);
     c->fd = -1;
@@ -404,8 +405,6 @@ int main(int argc, char** argv) {
     if (!parse_url(s, &u)) { fprintf(stderr, "viewerload: bad url %s\n", s.c_str()); return 2; }
     sh.urls.push_back(u);
   }
-  sh.win0 = 1e18;
-  sh.win1 = 1e18;
   std::string query = "?h=" + std::to_string(h) + (q.empty() || q == "std" ? "" : "&q=" + q);
 
   std::vector<std::unique_ptr<Worker>> ws;
@@ -472,11 +471,11 @@ int main(int argc, char** argv) {
     });
   for (auto& t : ct) t.join();
   double c1 = now_ms();
+  sh.win1 = now_ms() + (warmup + secs) * 1000.0;  // win1 first: a worker never sees win0 set and win1 not
   sh.win0 = now_ms() + warmup * 1000.0;
-  sh.win1 = sh.win0 + secs * 1000.0;
   fprintf(stderr, "viewerload: %zu connections opened in %.0f ms; measuring %.0f s after %.0f s\n", connect_ms.size(),
           c1 - c0, secs, warmup);
-  while (now_ms() < sh.win1 + 200) usleep(50000);
+  while (now_ms() < sh.win1.load() + 200) usleep(50000);
   sh.stop = true;
   for (auto& t : wt) t.join();
 
@@ -485,7 +484,7 @@ int main(int argc, char** argv) {
   std::string res = "{\"conns_per_url\":" + std::to_string(conns) + ",\"h\":" + std::to_string(h) + ",\"q\":\"" +
                     (q.empty() ? "std" : q) + "\",\"secs\":" + jnum(secs) + ",\"connect_ms_p50\":" + jnum(cpct(0.5)) +
                     ",\"connect_ms_p95\":" + jnum(cpct(0.95)) + ",\"connect_ms_max\":" + jnum(connect_ms.empty() ? -1 : connect_ms.back()) +
-                    ",\"connect_wall_ms\":" + jnum(c1 - c0) + ",\"win0_ms\":" + jnum(sh.win0) + ",\"win1_ms\":" + jnum(sh.win1) + ",\"urls\":[";
+                    ",\"connect_wall_ms\":" + jnum(c1 - c0) + ",\"win0_ms\":" + jnum(sh.win0.load()) + ",\"win1_ms\":" + jnum(sh.win1.load()) + ",\"urls\":[";
   Stats all;
   uint64_t all_closed = 0;
   int all_ok = 0, all_failed = 0;
