@@ -31,7 +31,6 @@
 #define SKY_H 64
 #define CLOUD_N 128
 #define CLOUD_BASE 2.7f
-#define CLOUD_TOP 5.6f
 #define PI_F 3.14159265f
 
 // Checkerboard frames: does whole-image pixel (X, Y) draw a sample in the
@@ -266,6 +265,18 @@ __device__ __forceinline__ V3 sun_at(V3 p) {
 
 // ---------------------------------------------------------------- clouds
 
+// 0 for fair-weather cumulus (tops at 5.6 km) .. 1 for towering cumulus (9.6 km).
+__device__ __forceinline__ float cloud_towers() { return (cP.cloud_top - 5.6f) * 0.25f; }
+
+// Towering weather: how much a column at coverage cov towers (0..1). The
+// cells where coverage is strongest grow into towers; the rest stay
+// fair-weather cumulus.
+__device__ __forceinline__ float cloud_tw(float cov) { return cloud_towers() * smoothstepf(0.35f, 0.75f, cov); }
+// The height at which the volume is read: the layer's own height for
+// fair-weather cumulus, stretched in a tower so its cells rise with it
+// instead of stacking into separate tiers.
+__device__ __forceinline__ float cloud_vh(float h, float tw) { return CLOUD_BASE + (h - CLOUD_BASE) / (1.0f + 0.7f * tw); }
+
 __device__ __forceinline__ float cloud_tex(V3 q) { return tex3D<float>(cG.cloud, q.x, q.y, q.z); }
 
 // Coverage (where clouds form, fixed to the ground) at wp, and a warp for the
@@ -277,7 +288,10 @@ __device__ __forceinline__ float cloud_cov(V2 wp, V2* warp) {
   V3 n1 = noised(p, cG.noise), n2 = noised(oct_step(p), cG.noise);
   *warp = v2(0.45f * n2.x, 0.11f * (n2.y - n2.z));
   float cov = (0.5f * n1.x + 0.25f * n2.x) * 0.5f + 0.5f;  // fbm(p, 2) * 0.5 + 0.5
-  return smoothstepf(0.27f, 0.64f, cov) * 0.97f;
+  // the weather's cover moves the threshold: 0.5 is the default sky, 0 leaves
+  // only the strongest cells, 1 nearly closes the gaps
+  float lo = 0.27f + 0.5f * (0.5f - cP.cloud_cover);
+  return smoothstepf(lo, lo + 0.37f, cov) * 0.97f;
 }
 
 // The cloud body: two octaves of the volume, the second rotated and scaled by
@@ -294,51 +308,58 @@ __device__ __forceinline__ float cloud_base(V3 p, float h, V2 w, V3* qo) {
 // the height profile and the detail erosion, which only remove density).
 __device__ bool cloud_maybe(V3 p) {
   float h = alt_flat(p);
-  float h01 = (h - CLOUD_BASE) * (1.0f / (CLOUD_TOP - CLOUD_BASE));
+  float h01 = (h - CLOUD_BASE) * (1.0f / (cP.cloud_top - CLOUD_BASE));
   if (h01 <= 0.0f || h01 >= 1.0f) return false;
   V2 w;
   float cov = cloud_cov(v2(p.x, p.z) * (1.0f / 42.0f), &w);
   if (cov <= 0.01f) return false;
   V3 q;
-  return cloud_base(p, h, w, &q) > 1.0f - cov;
+  return cloud_base(p, cloud_vh(h, cloud_tw(cov)), w, &q) > 1.0f - cov;
 }
 
 __device__ float cloud_density(V3 p, bool detail) {
   float h = alt_flat(p);
-  float h01 = (h - CLOUD_BASE) * (1.0f / (CLOUD_TOP - CLOUD_BASE));
+  float h01 = (h - CLOUD_BASE) * (1.0f / (cP.cloud_top - CLOUD_BASE));
   if (h01 <= 0.0f || h01 >= 1.0f) return 0.0f;
   V2 w;
   float cov = cloud_cov(v2(p.x, p.z) * (1.0f / 42.0f), &w);  // where clouds form; fixed to the ground
   if (cov <= 0.01f) return 0.0f;
   // two octaves of the volume for the body: cells of ~3.5 and ~1.3 km
   V3 q;
-  float base = cloud_base(p, h, w, &q);
+  float tw = cloud_tw(cov);
+  float base = cloud_base(p, cloud_vh(h, tw), w, &q);
   // coverage picks where the volume is cloud; the height profile then gives
   // flat bases and lets denser cores rise higher, so tops round into towers
   // instead of every cloud being cut into a lens by one height threshold
   float d0 = (base - (1.0f - cov)) / fmaxf(cov, 1e-3f);
   if (d0 <= 0.0f) return 0.0f;
-  float d = d0 * smoothstepf(0.0f, 0.05f, h01) * smoothstepf(1.0f, 0.55f, h01 + 0.6f * (1.0f - sat(d0 * 1.6f)));
+  // (hs: height as a fraction of the fair-weather layer's depth; a tower
+  // stretches the profile up to 2.4 times, to the towering layer's top)
+  float hs = (h - CLOUD_BASE) * (1.0f / (5.6f - CLOUD_BASE)) / (1.0f + 1.4f * tw);
+  float d = d0 * smoothstepf(0.0f, 0.15f, h - CLOUD_BASE) * smoothstepf(1.0f, 0.55f, hs + 0.6f * (1.0f - sat(d0 * 1.6f)));
   if (d <= 0.0f) return 0.0f;
   if (detail) {
     // erode the edges with finer noise: billows at the top, wisps below
     V3 q2 = v3(q.x * 9.0f + 0.31f, q.y * 7.0f, q.z * 9.0f + 0.57f);
     V3 q3 = v3(q.x * 31.0f + 0.71f, q.y * 23.0f, q.z * 31.0f + 0.13f);
     float det = 0.65f * cloud_tex(q2) + 0.35f * cloud_tex(q3);
-    float e = 0.65f * mixf(1.0f - det, det, sat(h01 * 2.5f)) * (1.0f - 0.35f * sat(d));
+    float e = 0.65f * mixf(1.0f - det, det, sat(hs * 2.5f)) * (1.0f - 0.35f * sat(d));
     d = (d - e) / (1.0f - e);
     if (d <= 0.0f) return 0.0f;
   }
   // The remap above rises slowly where coverage is high: a deep region of thin
   // cloud, which seen from inside or near the layer read as a uniform fog
   // bank (it took kilometres of 30 m steps to become opaque). Density
-  // saturates at a third of it, so cloud bodies get surfaces and shading.
-  return sat(d * 3.0f) * 60.0f;  // extinction per km
+  // saturates at a quarter of it, so cloud bodies get surfaces and shading,
+  // and the square keeps a soft fringe where the eroded edge thins out (a
+  // linear ramp made every lump a hard surface lit in flat patches).
+  float x = sat(d * 4.0f);
+  return x * x * 60.0f;  // extinction per km
 }
 
 // Optical depth from p toward the sun through the cloud layer.
 __device__ float cloud_light_od(V3 p, int n) {
-  const float steps[6] = {0.08f, 0.18f, 0.4f, 0.9f, 0.7f, 1.2f};
+  const float steps[6] = {0.08f, 0.18f, 0.4f, 0.8f, 1.2f, 1.2f};
   float od = 0.0f, s = 0.0f;
   for (int k = 0; k < n; k++) {
     float ds = steps[k];
@@ -351,7 +372,7 @@ __device__ float cloud_light_od(V3 p, int n) {
 // Transmittance of sunlight through clouds reaching a ground point.
 __device__ float cloud_shadow(V3 p, V3 l) {
   if (l.y <= 0.01f) return 1.0f;
-  float t0 = sphere_near(p, l, CLOUD_BASE), t1 = sphere_near(p, l, CLOUD_TOP);
+  float t0 = sphere_near(p, l, CLOUD_BASE), t1 = sphere_near(p, l, cP.cloud_top);
   if (t0 < 0.0f || t1 < 0.0f) return 1.0f;
   // A low sun crosses 20 km or more of the layer, and five samples that far
   // apart found a cloud on almost every path, shading whole plains at once.
@@ -368,6 +389,41 @@ __device__ float cloud_shadow(V3 p, V3 l) {
   return 0.14f + 0.86f * __expf(-od * 0.7f);
 }
 
+// Crepuscular rays (weather `rays`): haze in the lower air, lit by the sun
+// only where the clouds let it through, so the gaps between clouds throw
+// beams across the view and the clouds' shadows lie across the air as dark
+// bars. 12 jittered steps over the first 40 km of the ray (or up to the
+// cloud or ground it meets); the sun's path is tested against the cloud body
+// at two heights of the layer. Returns the light added, and in *T the haze's
+// transmittance over the same span.
+__device__ V3 shafts(V3 o, V3 d, float tmax, float u, float* T) {
+  *T = 1.0f;
+  float smax = fminf(tmax, 40.0f);
+  if (cP.rays <= 0.0f || cP.sun_dir.y < -0.02f || smax <= 0.0f) return v3(0.0f);
+  const int N = 12;
+  float ds = smax / N;
+  float c = dot(d, cP.sun_dir);
+  float ph = mixf(phase_hg(c, 0.7f), phase_hg(c, 0.0f), 0.25f);
+  float tb = 0.4f / fmaxf(cP.sun_dir.y, 0.05f), tt = 1.3f / fmaxf(cP.sun_dir.y, 0.05f);  // along the sun to two heights
+  V3 L = v3(0.0f);
+  float tr = 1.0f;
+  for (int k = 0; k < N; k++) {
+    V3 p = o + d * ((k + u) * ds);
+    float h = alt_flat(p);
+    if (h > CLOUD_BASE) continue;
+    float sig = cP.rays * 0.05f * __expf(-fmaxf(h, 0.0f) * (1.0f / 2.5f));  // per km
+    float hb = CLOUD_BASE - h;
+    V3 pb = p + cP.sun_dir * (hb / fmaxf(cP.sun_dir.y, 0.05f));
+    float od = (cloud_density(pb + cP.sun_dir * tb, false) + cloud_density(pb + cP.sun_dir * tt, false)) * 0.3f;
+    float vis = __expf(-od);
+    float st = __expf(-sig * ds);
+    L += sun_at(p) * (tr * (1.0f - st) * ph * PI_F * vis);  // pi: the haze's brightness, set by eye
+    tr *= st;
+  }
+  *T = tr;
+  return L;
+}
+
 struct CloudOut {
   V3 L;
   float T;
@@ -377,15 +433,40 @@ struct CloudOut {
 // March the cloud layer along o + d*s, s in [0, tmax].
 // Several orders of scattering of sunlight that crossed optical depth od to
 // reach a point, each softer and less directional (c: cosine between the view
-// ray and the sun). Clouds and the skywriting smoke share it.
-__device__ __forceinline__ float cloud_scatter(float c, float od) {
-  float S = 0.0f, a = 1.0f, b = 1.0f, g = 1.0f;
-  for (int o2 = 0; o2 < 3; o2++) {
-    float ph = mixf(phase_hg(c, 0.85f * g), phase_hg(c, -0.2f * g), 0.4f);
-    S += a * __expf(-od * b) * ph;
-    a *= 0.55f; b *= 0.3f; g *= 0.5f;
+// ray and the sun). Clouds and the skywriting smoke share it. Each order is
+// a dual-lobe Henyey-Greenstein phase (a strong forward lobe for the silver
+// lining, a weak back lobe), and the later orders reach deeper (b), so the
+// inside of a cloud keeps a gradient of light instead of one flat shade
+// wherever the sun's path is opaque.
+#define CLOUD_ORDERS 4
+// The phase of each order for cosine c, weighted by its share (constant
+// along a ray, so a march takes it once).
+__device__ __forceinline__ void cloud_phases(float c, float* ph) {
+  float a = 1.0f, g = 1.0f;
+  for (int o2 = 0; o2 < CLOUD_ORDERS; o2++) {
+    ph[o2] = a * mixf(phase_hg(c, 0.85f * g), phase_hg(c, -0.25f * g), 0.35f);
+    a *= 0.5f; g *= 0.5f;
+  }
+}
+__device__ __forceinline__ float cloud_scatter_ph(const float* ph, float od) {
+  float S = 0.0f, b = 1.0f;
+  for (int o2 = 0; o2 < CLOUD_ORDERS; o2++) {
+    S += __expf(-od * b) * ph[o2];
+    b *= 0.35f;
   }
   return S;
+}
+__device__ __forceinline__ float cloud_scatter(float c, float od) {
+  float ph[CLOUD_ORDERS];
+  cloud_phases(c, ph);
+  return cloud_scatter_ph(ph, od);
+}
+
+// Optical depth from p up through the cloud above it: how much of the sky's
+// light reaches p. It darkens the underside of every lump against its top.
+__device__ __forceinline__ float cloud_up_od(V3 p) {
+  V3 u = up_at(p);
+  return cloud_density(p + u * 0.12f, false) * 0.2f + cloud_density(p + u * 0.45f, false) * 0.5f;
 }
 
 __device__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bool cheap) {
@@ -395,21 +476,21 @@ __device__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bo
   if (ho < CLOUD_BASE) {
     ta = sphere_near(o, d, CLOUD_BASE);
     if (ta < 0.0f) return out;
-    tb = sphere_near(o, d, CLOUD_TOP);
-  } else if (ho > CLOUD_TOP) {
-    ta = sphere_near(o, d, CLOUD_TOP);
+    tb = sphere_near(o, d, cP.cloud_top);
+  } else if (ho > cP.cloud_top) {
+    ta = sphere_near(o, d, cP.cloud_top);
     if (ta < 0.0f) return out;
     float tbase = sphere_near(o, d, CLOUD_BASE);
-    tb = tbase > 0.0f ? tbase : sphere_far(o, d, CLOUD_TOP);
+    tb = tbase > 0.0f ? tbase : sphere_far(o, d, cP.cloud_top);
   } else {
     ta = 0.0f;
-    float t1 = sphere_near(o, d, CLOUD_TOP), t2 = sphere_near(o, d, CLOUD_BASE);
+    float t1 = sphere_near(o, d, cP.cloud_top), t2 = sphere_near(o, d, CLOUD_BASE);
     tb = (t2 > 0.0f && (t1 < 0.0f || t2 < t1)) ? t2 : t1;
   }
   if (tb < 0.0f) tb = ta + 30.0f;
   tb = fminf(tb, tmax);
   tb = fminf(tb, ta + 45.0f);
-  float fade_start = 70.0f + 1.5f * fmaxf(ho - CLOUD_TOP, 0.0f);  // seen from high up, clouds are far but not grazing
+  float fade_start = 70.0f + 1.5f * fmaxf(ho - cP.cloud_top, 0.0f);  // seen from high up, clouds are far but not grazing
   if (ta >= tb || ta > 160.0f + 2.0f * fmaxf(ho, 0.0f)) return out;
   // Two step sizes: coarse through empty air (the shape only), fine inside
   // clouds, 2% of the distance (120 to 800 m), so the
@@ -425,20 +506,26 @@ __device__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bo
   float s = ta + jitter * ds_c;
   bool fine = false;
   int empty = 0, lit_age = 0;
-  float od = 0.0f;
+  float od = 0.0f, odu = 0.0f;
+  float ph[CLOUD_ORDERS];
+  cloud_phases(c, ph);
+  const float tstep = 1.0f + 0.6f * cloud_towers();
   const int max_fine = cheap ? 40 : 64;  // fine steps; coarse steps are bounded by the segment
   int nfine = 0;
   for (int k = 0; k < N + max_fine + 2 && s < tb && nfine < max_fine; k++) {
     V3 p = o + d * s;
     if (!fine) {
       if (!cloud_maybe(p)) { s += ds_c; continue; }
-      // entered a cloud: back up one coarse step and walk in finely
-      s = fmaxf(ta, s - ds_c);
+      // entered a cloud: back up one coarse step and walk in finely, from a
+      // jittered start (where the back-up stops at ta, every pixel would
+      // start at the same distance and the flat bases would show the steps)
+      s = fmaxf(ta, s - ds_c) + jitter * clampf(0.02f * s, 0.06f, 0.8f);
       fine = true;
       empty = 0;
       continue;
     }
     float ds = cheap ? fmaxf(0.06f, 0.012f * s) : cP.hq ? clampf(0.015f * s, 0.12f, 0.6f) : clampf(0.02f * s, 0.12f, 0.8f);
+    ds *= tstep;  // towers: a deeper layer, crossed in longer steps
     nfine++;
     float sig = cloud_density(p, !cheap && out.T > 0.15f);
     if (s > fade_start) sig *= __expf(-(s - fade_start) * (1.0f / 40.0f));
@@ -450,13 +537,20 @@ __device__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bo
     empty = 0;
     // the light march is the expensive part; inside a cloud it changes
     // slowly, so take it on every fourth fine step
-    if (lit_age++ % (cP.hq ? 2 : 4) == 0) od = cloud_light_od(p, cP.hq ? 4 : 3);
+    if (lit_age++ % (cP.hq ? 2 : 4) == 0) {
+      od = cloud_light_od(p, cP.hq ? 5 : 4);
+      odu = cloud_up_od(p);
+    }
     // several orders of scattering, each softer and less directional
-    float S = cloud_scatter(c, od);
-    float h01 = sat((alt_flat(p) - CLOUD_BASE) / (CLOUD_TOP - CLOUD_BASE));
-    // light reaching the inside is softer near the edges: "powder"
-    float powder = 1.0f - 0.6f * __expf(-sig * 0.25f);
-    V3 Lin = sun_at(p) * (S * 4.0f * PI_F * 0.55f * powder) + mix(amb_bot, amb_top, h01) * (0.2f + 0.8f * h01);
+    float S = cloud_scatter_ph(ph, od);
+    // "powder": the rim of a lump with no cloud between it and the sun lacks
+    // the light scattered out of the cloud behind it, so lumps facing the sun
+    // get darker outlines; looking toward the sun the silver lining wins
+    float powder = 1.0f - 0.5f * __expf(-2.0f * od) * sat(0.8f - 0.8f * c);
+    // sky light from above, through the cloud over this point, plus the
+    // horizon and the ground below
+    V3 amb = amb_top * (0.12f + 0.88f * __expf(-0.08f * odu)) + amb_bot * 0.35f;
+    V3 Lin = sun_at(p) * (S * 4.0f * PI_F * 0.55f * powder) + amb;
     float st = __expf(-sig * ds);
     V3 Sint = Lin * (1.0f - st);
     out.L += Sint * out.T;
@@ -626,7 +720,8 @@ __device__ Material terrain_material(V3 p, float h, V3 n) {
   float ws = smoothstepf(0.014f, 0.003f, h + 0.004f * v2_) * smoothstepf(0.55f, 0.8f, slope);
   a = mix(a, sand, ws);
   V3 snow = v3(0.95f, 0.96f, 1.0f);
-  float wsn = smoothstepf(1.45f, 1.75f, h + v * 0.4f + 0.45f * (slope - 0.7f)) * smoothstepf(0.6f, 0.74f, slope + 0.05f * v2_);
+  float sl = cP.snow_line;  // weather: 1.6 km by default
+  float wsn = smoothstepf(sl - 0.15f, sl + 0.15f, h + v * 0.4f + 0.45f * (slope - 0.7f)) * smoothstepf(0.6f, 0.74f, slope + 0.05f * v2_);
   a = mix(a, snow, wsn);
   // fine albedo variation (tens of metres)
   float fd = fbm(q * 23.0f + v2(1.3f, 8.1f), 4, cG.noise);
@@ -1119,6 +1214,12 @@ __device__ Hit trace(V3 o, V3 d, float pix, Rng& rng) {
   if (c.T < (hres.id == 0.0f ? 0.5f : 0.2f)) {
     hres.dist = c.depth;
     hres.nrm = -d;
+  }
+  // crepuscular rays, in front of the cloud or ground they reach
+  if (cP.rays > 0.0f) {
+    float Tr;
+    V3 sh = shafts(o, d, c.T < 0.5f ? c.depth : (th >= 0.0f ? th : 1e9f), rng.next(), &Tr);
+    L = L * Tr + sh;
   }
   hres.L = L;
   return hres;

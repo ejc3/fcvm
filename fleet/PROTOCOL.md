@@ -832,7 +832,8 @@ The scene shared by every renderer, sent after the hello and whenever it changes
 agent posts `scene` plus the slot's `rect` to each running renderer as
 `POST http://<publish ip>:<port>/scene`, with the body
 `{"epoch_unix_ms", "rect", "layout_generation", "rect_from_frame", "previous_rect",
-"image_aspect", "camera", "time_of_day", "words", "lights"}`. The
+"image_aspect", "camera", "time_of_day", "words", "lights", "weather"}` (`weather` only when
+the scene has weather keys: renderer `POST /scene`, "Weather"). The
 coordinator posts the same body to each EC2 tile's renderer
 (`POST https://ec2-<n>.<zone>/scene`). A tile is reported `running` only after its
 renderer has taken the scene: a viewer streams a running tile at once, and a renderer
@@ -1136,6 +1137,7 @@ grants. The body is at most 1 MiB.
 | `time_of_day` | sun position: 0.25 sunrise, 0.5 noon, 0.75 sunset (the built-in scene uses 0.245, golden hour) | 0 to 1 |
 | `words` | viewer text: `{"text", "t", "text_style"}` (see "Words, the clock and lights") | optional; may be empty |
 | `lights` | viewer lights | optional; may be empty; `color` components 0 to 64 |
+| `weather` | weather keys: `{"t", "cover", "towers", "rays", "snow_line_km"}` (see "Weather") | optional; at most 64; absent, null or empty means the defaults throughout |
 | `budget` | pixel-samples per frame for every tile (see "Budget") | optional; 10,000 to 50,000,000; absent means the renderer's `BUDGET` |
 | `layout_generation` | the coordinator's layout this rect belongs to (see "Layout generations") | optional; a non-negative integer or null |
 | `rect_from_frame` | the first frame (scene time x 30) drawn with `rect` | optional; a non-negative integer or null |
@@ -1249,6 +1251,26 @@ screen.
 
 - A **light** appears at its `t` as a glowing sphere (35 m) of its `color`, and
   lights the terrain within 3 km. At most 32.
+
+#### Weather (addition, round 14)
+
+`weather` is a list of keys. A frame draws the weather at its layer's time:
+the frame's `t`, or the hold's start while the camera holds (so a hold keeps
+one weather and converges). Between two keys each field eases from one to the
+next (smoothstep of the fraction of the span); before the first key and after
+the last the nearest key holds. With no keys every field has its default,
+which is the sky through round 13.
+
+| field | meaning | accepted |
+|-------|---------|----------|
+| `t` | scene time of the key | a finite number; keys are sorted by `t` on arrival |
+| `cover` | cloud cover: 0 a clear sky, 0.5 the default, 1 nearly overcast (it moves the coverage threshold of the cloud field) | optional; 0 to 1; default 0.5 |
+| `towers` | 0 fair-weather cumulus with tops at 5.6 km (the default), 1 towering cumulus whose densest cores reach 9.6 km | optional; 0 to 1; default 0 |
+| `rays` | crepuscular rays: haze below the cloud base, densest near the ground, lit by the sun only where the clouds let it through, so the gaps throw beams and the clouds' shadows lie across the air; strongest looking toward a low sun. 0 draws no haze and costs nothing | optional; 0 to 1; default 0 |
+| `snow_line_km` | altitude where snow starts on flatter ground (steeper slopes need more height); 1.6 is the default, 0.5 a winter landscape, 2.6 only the peaks | optional; 0 to 4; default 1.6 |
+
+A field outside its range, or a key without `t`, is refused with `400` naming
+the field. A change of the weather a hold draws starts a new hold.
 
 ### `GET /frames?h=<height>&q=<quality>` (WebSocket)
 

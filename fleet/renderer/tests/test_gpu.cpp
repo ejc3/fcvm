@@ -253,6 +253,43 @@ int main(int argc, char** argv) {
     fprintf(stderr, "%s moving whole: fnv64 %016llx\n", name[style], (unsigned long long)fnv(w1.rgba));
   }
 
+  // 7b. Weather (towers, cover, crepuscular rays, snow line), easing from the
+  // defaults to its key: a moving camera toward a low sun with history, and a
+  // hold in different batches, stitch exactly; the weather changes the image.
+  {
+    Scene ws = s;
+    ws.time_of_day = 0.27;
+    ws.camera = {Keyframe{0, {-100, 0.35, -90}, {-63.5, 2.6, -87}, 60}, Keyframe{60, {-96, 0.45, -92}, {-59.5, 2.7, -89}, 60}};
+    WeatherKey a, b;
+    a.t = 0;
+    b.t = 20;
+    b.cover = 0.62;
+    b.towers = 1;
+    b.rays = 1;
+    b.snow_line_km = 0.8;
+    ws.weather = {a, b};
+    std::vector<std::pair<double, int>> seq;
+    for (int k = 0; k < 12; k++) seq.push_back({(14 * 30 + k) / 30.0, 2});
+    Img w1 = draw(r, ws, Rect{0, 0, 1, 1}, 2 * h, seq, true);
+    quads(r, ws, h, seq, true, q);
+    d = compare(w1, q, &hd);
+    CHECK(d == 0 && hd == 0, "weather, moving with history: %ld pixels differ (8-bit), %ld (float)", d, hd);
+    Scene wh2 = ws;
+    wh2.camera = {ws.camera[0]};
+    wh2.weather = {b};
+    Img w2 = draw(r, wh2, Rect{0, 0, 1, 1}, 2 * h, {{22, 4}, {23, 4}, {24, 4}, {25, 4}}, true);
+    quads(r, wh2, h, {{24.5, 8}, {25, 8}}, true, q);
+    d = compare(w2, q, &hd);
+    CHECK(d == 0 && hd == 0, "weather, hold in different batches: %ld pixels differ (8-bit), %ld (float)", d, hd);
+    Scene nw = ws;
+    nw.weather.clear();
+    Img w3 = draw(r, nw, Rect{0, 0, 1, 1}, 2 * h, seq, true);
+    long dw = 0;
+    for (size_t p = 0; p < w1.rgba.size(); p += 4) dw += memcmp(&w1.rgba[p], &w3.rgba[p], 3) != 0;
+    CHECK(dw > (long)(w1.rgba.size() / 4 / 4), "the weather changes the image (%ld of %zu pixels)", dw, w1.rgba.size() / 4);
+    fprintf(stderr, "weather moving whole: fnv64 %016llx\n", (unsigned long long)fnv(w1.rgba));
+  }
+
   // 8. Landmark letters cast shadows in the path-traced samples: with the
   // overlay off (the letters themselves not drawn), the hold still darkens
   // where they shade the terrain.

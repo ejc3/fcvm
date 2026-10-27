@@ -792,6 +792,7 @@ fn intent_effect(
                 time_of_day: 0.0,
                 words: vec![],
                 lights: vec![],
+                weather: vec![],
             };
             let to = Keyframe {
                 intent: Some(c.id.to_string()),
