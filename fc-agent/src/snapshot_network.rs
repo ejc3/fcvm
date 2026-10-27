@@ -1949,6 +1949,12 @@ struct BoundedOutput {
     stderr: Vec<u8>,
 }
 
+/// How long `run_bounded` waits for a child it killed at its budget to be reaped.
+/// A SIGKILLed process is normally reaped in milliseconds (the timeout test logs
+/// the measured reap); one in uninterruptible sleep dies only when its I/O
+/// completes, and past this bound the restore fails closed rather than wait.
+const RUN_BOUNDED_REAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Run `argv` with a budget. The child is killed when the budget ends (and when
 /// this future is dropped), and at most `RESTORE_HOOK_OUTPUT_LIMIT` bytes of each
 /// stream are kept.
@@ -1996,12 +2002,58 @@ async fn run_bounded(argv: &[String], budget: std::time::Duration) -> Result<Bou
         Ok(result) => result,
         Err(_) => {
             // The future above is dropped by the timeout; kill the child and reap it,
-            // so nothing it spawned keeps running under the clone's name.
+            // so nothing it spawned keeps running under the clone's name. The reap has
+            // its own bound: a child stuck in uninterruptible sleep does not die on
+            // SIGKILL, and an unbounded wait would leave the restore hanging with
+            // ingress gated instead of failing closed.
+            let pid = child.id();
             let _ = child.start_kill();
-            let _ = child.wait().await;
-            bail!("did not finish within {budget:?}")
+            let reap_started = std::time::Instant::now();
+            let reap = match tokio::time::timeout(RUN_BOUNDED_REAP_BUDGET, child.wait()).await {
+                Ok(Ok(_)) => Reap::Reaped(crate::restore::elapsed_ms(reap_started)),
+                Ok(Err(error)) => Reap::WaitFailed(error),
+                Err(_) => Reap::NotReaped,
+            };
+            let vitals = tokio::task::spawn_blocking(|| {
+                format!(
+                    "{}; {}",
+                    crate::vitals::sample_line(),
+                    crate::vitals::scheduling_line()
+                )
+            })
+            .await
+            .unwrap_or_else(|error| format!("vitals unavailable: {error}"));
+            bail!("{}", timeout_message(budget, pid, reap, &vitals))
         }
     }
+}
+
+/// What happened to a child `run_bounded` killed at its budget.
+enum Reap {
+    /// Reaped this many milliseconds after the kill.
+    Reaped(f64),
+    /// Waiting for it failed; whether it still runs is not known.
+    WaitFailed(std::io::Error),
+    /// Not reaped within RUN_BOUNDED_REAP_BUDGET.
+    NotReaped,
+}
+
+/// The error of a `run_bounded` command that ran out of `budget`.
+fn timeout_message(
+    budget: std::time::Duration,
+    pid: Option<u32>,
+    reap: Reap,
+    vitals: &str,
+) -> String {
+    let pid = pid.map_or_else(|| "?".to_string(), |pid| pid.to_string());
+    let reaped = match reap {
+        Reap::Reaped(ms) => format!("killed and reaped elapsed_ms={ms:.0} later"),
+        Reap::WaitFailed(error) => format!("killed pid {pid}, and waiting for it failed: {error}"),
+        Reap::NotReaped => {
+            format!("pid {pid} was not reaped {RUN_BOUNDED_REAP_BUDGET:?} after SIGKILL")
+        }
+    };
+    format!("did not finish within {budget:?}; {reaped}; {vitals}")
 }
 
 /// The plan's hook, run inside the container through `podman exec`, as the
@@ -2089,9 +2141,25 @@ impl ContainerRestoreHook {
 
 impl RestoreHook for ContainerRestoreHook {
     async fn run(&self) -> Result<()> {
+        // Timed either way: a read that ran out says how long it waited, and one that
+        // finished gives the healthy distribution to compare a starved one against.
+        let inspect_started = std::time::Instant::now();
         let inspect = run_bounded(&Self::inspect_argv(), HOOK_INSPECT_BUDGET)
             .await
-            .context("reading fcvm-container's state before the restore hook")?;
+            .with_context(|| {
+                format!(
+                    "reading fcvm-container's state before the restore hook (elapsed_ms={:.0})",
+                    crate::restore::elapsed_ms(inspect_started)
+                )
+            })?;
+        eprintln!(
+            "[fc-agent] podman inspect before the restore hook returned code={} elapsed_ms={:.0}",
+            inspect
+                .status
+                .code()
+                .map_or_else(|| "signal".to_string(), |code| code.to_string()),
+            crate::restore::elapsed_ms(inspect_started)
+        );
         match hook_eligibility(&inspect) {
             HookEligibility::Run => {}
             HookEligibility::Skip(reason) => {
@@ -4214,7 +4282,16 @@ mod tests {
         let error = run_bounded(&argv, std::time::Duration::from_millis(300))
             .await
             .expect_err("a 30 s command cannot finish in 300 ms");
-        assert!(format!("{error:#}").contains("did not finish"), "{error:#}");
+        let text = format!("{error:#}");
+        // The error says it hit the budget, how long the reap after the kill took,
+        // and what the guest looked like, which is what tells a starved restore
+        // from a slow one.
+        assert!(text.contains("did not finish within 300ms"), "{text}");
+        assert!(text.contains("killed and reaped elapsed_ms="), "{text}");
+        assert!(
+            text.contains("MemAvailable") && text.contains("procs_blocked="),
+            "the error carries no vitals: {text}"
+        );
         let pid: u32 = std::fs::read_to_string(&pid_file)
             .unwrap()
             .trim()
@@ -4226,6 +4303,25 @@ mod tests {
         assert!(
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "the hook's shell (pid {pid}) is still running after the budget"
+        );
+    }
+
+    /// A killed child that is not reaped, or whose wait fails, is named by its pid,
+    /// and the restore fails closed rather than waiting on it.
+    #[test]
+    fn a_timeout_names_a_child_that_was_not_reaped() {
+        let budget = std::time::Duration::from_millis(300);
+        assert_eq!(
+            timeout_message(budget, Some(1234), Reap::NotReaped, "v"),
+            "did not finish within 300ms; pid 1234 was not reaped 5s after SIGKILL; v"
+        );
+        let failed = Reap::WaitFailed(std::io::Error::from_raw_os_error(libc::ECHILD));
+        let text = timeout_message(budget, None, failed, "v");
+        assert!(
+            text.starts_with(
+                "did not finish within 300ms; killed pid ?, and waiting for it failed: "
+            ),
+            "{text}"
         );
     }
 
