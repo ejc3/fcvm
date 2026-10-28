@@ -1,0 +1,24 @@
+[Unit]
+Description=fcvm fleet tile: read the first boot's root volume pieces ahead of the units that need them
+# The root volume of an instance made from the AMI fetches each block from S3 on its first
+# read. A first boot read the NVIDIA modules (190 MB), the renderer image and the rest one
+# request after another: systemd-modules-load took 35 s and the container 14 s to start. The
+# list (written at build by `build.sh trace` from a real first boot) is read here many pieces
+# at a time instead. It starts in the first transaction, ordered after nothing, so it runs
+# beside the units that need those pieces and not ahead of them: a read of a piece in flight
+# waits for that fetch instead of starting its own. A hint: nothing waits for it and its
+# failure stops nothing.
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
+ConditionPathExists=/etc/fcvm-fleet/prefetch.list
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/fcvm-fleet/prefetch /etc/fcvm-fleet/prefetch.list 256 1048576
+Nice=-5
+# A oneshot never reads as active, so build.sh `trace` looks for this file to know the boot prefetched.
+ExecStartPost=/bin/sh -c ': > /run/fcvm-fleet-prefetched'
+
+[Install]
+WantedBy=sysinit.target
