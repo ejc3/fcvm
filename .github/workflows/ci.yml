@@ -221,8 +221,8 @@ jobs:
         run: make test-ci-scope
 
   # The fleet renderer's host tests (fleet/renderer/tests/test_host.cpp: scene
-  # parsing, tile geometry, wire formats, TLS). They need g++, OpenSSL and the
-  # NVENC API header, no GPU. The GPU seam test (test_gpu.cpp) needs a GPU and
+  # parsing, tile geometry, wire formats, TLS), and the phone app's scene tests.
+  # They need g++, OpenSSL and the NVENC API header (and podman), no GPU. The GPU seam test (test_gpu.cpp) needs a GPU and
   # does not run here.
   fleet-renderer:
     name: Fleet Renderer
@@ -236,6 +236,10 @@ jobs:
         run: python3 -B fleet/coord/test_release.py
       - name: Operator script tests (fleet/tools)
         run: make -C fleet/tools test
+      # Robot Park's scene model, control protocol and shader check (fleet/phone-app), in
+      # its build container. The app itself needs the Android SDK and is built by phone-test.
+      - name: Phone app scene tests (fleet/phone-app)
+        run: make -C fleet/phone-app test GRADLE_HOME="$RUNNER_TEMP/gradle-home"
       - name: Renderer host tests
         run: |
           set -euo pipefail
