@@ -31,7 +31,8 @@ class PhoneApp : Application() {
             is Command.Clock -> { Store.clockOffsetMs = c.unixMs - System.currentTimeMillis(); ok("offset_ms" to Store.clockOffsetMs) }
             is Command.Freeze -> {
                 val from = Store.local.third
-                if (c.t != null && c.t < from) mapOf("error" to "t: before t=$from, where this phone's own older moves were pruned")
+                val t = c.t
+                if (t != null && t < from) mapOf("error" to "t: before t=$from, where this phone's own older moves were pruned")
                 else { Store.frozenT = c.t; ok() }
             }
             is Command.Capture -> GlThread.current?.capture(c) ?: mapOf("error" to "no renderer: the app is not on screen")
