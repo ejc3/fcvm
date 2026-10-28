@@ -55,8 +55,9 @@ with every seat held is late: `locked`, `seat` and `direct` null, `reason` the s
 page shows, and `seat_free` true once a new connection would be seated (the page offers a
 reload; a late connection is never promoted). A page that reconnects passes its ticket as
 `GET /live?seat=<ticket>` and keeps its seat if the ticket's connection closed less than 60 s
-before. `broadcast` is the playback URL (signed for a private channel, valid for an hour),
-null without a broadcast; `capacity` is null when every viewer is seated (no broadcast).
+before. `broadcast` is the playback URL (signed for a private channel, bound to the page's
+`Origin` and valid for an hour), null without a broadcast or, on a private channel, for a
+connection that sent no `Origin`; `capacity` is null when every viewer is seated (no broadcast).
 `claim_gpu` from a late connection is refused unrecorded (`version: 0`).
 
 ```json
