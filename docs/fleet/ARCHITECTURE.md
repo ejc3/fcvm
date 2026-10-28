@@ -646,16 +646,18 @@ Every GPU VM in fcvm is a restored clone (the snapshot is taken without the devi
 GPU is attached at restore), so KVM inside a phone VM has to survive a snapshot. Linux 6.18
 executes VMXON when kvm_intel loads (`kvm.enable_virt_at_load`), and Firecracker did not save
 KVM's nested state, so a restored guest believed it was in VMX operation and KVM did not:
-the guest's next VMX instruction faulted. The fork's commit on `agent/vfio-nested-state`
-(based on the gpu profile's amd64 commit) saves `KVM_GET_NESTED_STATE` in the vCPU state,
-header included (kvm-ioctls reports a header-only state as none, but the header holds
+the guest's next VMX instruction faulted. The fork's change (ejc3/firecracker#23, merged
+into `agent/vfio-uffd-populate`, the gpu profile's amd64 branch) saves
+`KVM_GET_NESTED_STATE` in the vCPU state, header included (kvm-ioctls reports a header-only
+state as none, but the header holds
 `vmxon_pa`), and restores it after `SET_SREGS` and `IA32_FEATURE_CONTROL` and before
 `SET_REGS`, QEMU's order, so a vCPU saved while running a nested guest re-enters guest mode
 first. `SNAPSHOT_VERSION` goes to 13.0.0. The unit test
 `test_vmx_operation_survives_save_and_restore` fails on the base commit (`vmxon_pa` comes back
 as `u64::MAX`) and passes with the change; `make phone-test` checks it end to end with
-`kvmprobe` in a restored VM. The `phone` profile pins that commit; the wall's `gpu` profile
-keeps its own.
+`kvmprobe` in a restored VM. The release build's vCPU seccomp filter allows
+`KVM_GET_NESTED_STATE` (`test_vcpu_filter_allows_saving_nested_state`). The `phone` profile
+pins the merge commit; the wall's `gpu` profile keeps its own.
 
 ### Snapshots: the phone restore
 
@@ -689,25 +691,65 @@ carry, and the app handles surface loss correctly either way (`onSurfaceDestroye
 
 **The flow.** Gold: boot the phone VM, boot Android, start the app, then
 `fcvm snapshot create --gpu-warm`. fc-agent's park asks every GPU holder that is not a CUDA
-process to let go through a hook (the emulator's console, `gpu detach`), waits until no
+process to let go through a hook (the emulator's console, `gpu release`), waits until no
 process holds an NVIDIA device, and continues as today. A clone restores, attaches its GPU
-and loads the driver as any GPU restore does, then unpark calls `gpu attach` and waits for
+and loads the driver as any GPU restore does, then unpark calls `gpu retake` and waits for
 the app's next frame.
 
 | flow | click to the app's first frame (6 GiB phone VM) |
 |---|---|
 | A: clone restore, then the emulator loads its own snapshot | 12.8 to 13.1 s, measured |
-| B: clone restore of a running phone, renderer re-attached | about 5.5 s, projected: ACK 4.7 to 5.0 s plus the renderer's start and GPU state load from the warm load above (0.13 s and 0.42 s) |
+| B: clone restore of a running phone, renderer retaken | 5.75 to 6.19 s, measured (projected about 5.5 s) |
 
-B is the design. Its largest part is the memory pin, so the phone VM's size and hugepages
-are measured in the same PR as the hooks.
+B is the design and is what fcvm does now (below). Its largest part is the memory pin; the
+phone VM's size and hugepages are the next thing to measure.
 
-The emulator is built from source for this, forked like Firecracker: `ejc3/` forks of the
-emulator (`external/qemu`) and of gfxstream. The SDK's 37.2 emulator was built from an
-`emu-37-2-release` branch that AOSP does not publish; the public branches are `emu-main-dev`
-(a manifest of 76 projects) and `emu-36-1-release`, so the fork starts from `emu-main-dev`.
-The SDK's license forbids modifying its emulator (below), and a source build also leaves
-out the SwiftShader libraries the spike masks.
+#### Flow B, measured (2026-10-28)
+
+The container's image names a GPU hook in the `dev.fcvm.gpu-hook` label
+(`fleet/phone/gpu-hook`). fc-agent's park runs it with `release` before it reads which
+processes hold an NVIDIA device, so the emulator, which has let go of the GPU, is not taken
+for a CUDA process; a later park step that fails runs `retake` to undo it. The parked record
+names the hook, and unpark runs `retake` once the GPUs are up and the CUDA processes are
+restored, in the source VM after the snapshot and in a clone inside the restore's GPU attach,
+before the clone is acknowledged; a failed retake fails the clone. The hook's `retake`
+returns once the phone has posted a frame on the new GPU, so the acknowledgement follows
+the app's first frame. The phone VM maps its volumes with `--portable-volumes`: the
+emulator holds its system image and libraries open on them, and only portable inodes let a
+clone find those files again.
+
+On a g4dn.metal (T4, driver 580.196.07), a 6 GiB phone VM (2 GiB phone, the app drawing
+25,600 cubes at 60 fps), one warm snapshot and three clones restored one at a time onto
+three other T4s (`snapshot run --snapshot --gpu`, File backend), 1-minute load 1.6 at the
+start:
+
+| | clone 1 | clone 2 | clone 3 |
+|---|---|---|---|
+| click to the app's first frame on the clone's GPU | 6140 ms | 5751 ms | 6193 ms |
+| restore ACK | 6138 ms | 5743 ms | 6184 ms |
+| of which the guest's GPU phase (`gpu_ms`) | 1930 ms | 1912 ms | 2191 ms |
+| of that, `gpu retake` | 922 ms | 816 ms | 916 ms |
+| retake to the first frame | 987 ms | 912 ms | 1226 ms |
+
+The GPU phase is the driver bring-up of any GPU restore (about 950 ms, mostly
+nvidia-persistenced and the memory scrub) plus the retake and the first frame; the rest of
+the ACK is mostly the VFIO memory pin, about 3.8 s for 6 GiB. The projection counted the
+renderer's start and the state load of an emulator quickboot load (0.55 s); the retake
+measures 0.8 to 0.9 s, since it also loads the host driver and initializes EGL, and
+recreates the 22 render threads. The warm snapshot of the running phone took 12.6 to 13.0 s
+(the park's release about 0.5 s, the source's retake about 0.8 s), and the source phone
+kept drawing. In the first 3 s after a clone's restore the app's lowest fps sample was 36
+to 38; four seconds in it was 56. `make phone-test GPU= GPU2=` checks all of it; without the
+label the park refuses ("every process with a GPU open must be a CUDA process") and the
+check fails.
+
+The emulator is built from source for this, forked like Firecracker: ejc3/platform_external_qemu
+(the emulator, `external/qemu`) and ejc3/gfxstream, each with AOSP's `emu-main-dev` on a
+branch of that name and the fcvm change on `fcvm-main`. The SDK's 37.2 emulator was built
+from an `emu-37-2-release` branch that AOSP does not publish; the public branches are
+`emu-main-dev` (a manifest of 76 projects) and `emu-36-1-release`, so the forks start from
+`emu-main-dev`. The SDK's license forbids modifying its emulator (below). The source build
+still ships SwiftShader's libraries, and `phone.sh` masks them as it did the SDK's.
 
 #### Detaching the renderer, measured (2026-10-28)
 
@@ -749,8 +791,45 @@ The change in gfxstream, from its own entry points (`host/RendererImpl.cpp`,
 - **attach:** load the libraries, `RendererImpl::initialize` on the GPU now present,
   `RendererImpl::load` from memory, `RendererImpl::resumeAll`, resume the guest.
 
-Both are emulator console commands (`gpu detach`, `gpu attach`), which fc-agent's park and
+Both are emulator console commands (`gpu release`, `gpu retake`), which fc-agent's park and
 unpark call through the hook (stack PR 3).
+
+#### Releasing and retaking the GPU in the emulator (2026-10-28)
+
+Built as above, with what the measurement left out:
+
+- **The transport is the GLES pipe.** The AOSP x86_64 Android 15 image renders through
+  `opengles` pipe channels (`ro.boot.qemu.gltransport.name=pipe`), one render thread each
+  (22 on a booted phone with the app running), not address space graphics. The release
+  pauses the guest and the render threads, saves the frame buffer into memory, has every
+  pipe save its channel's state (the render thread's and its queues) and drop the channel,
+  and then makes each paused render thread exit instead of resuming: it unbinds its context
+  without draining it, since the contexts are in the saved frame buffer. The retake loads the
+  frame buffer into a new one and gives every pipe a channel loaded from its saved state, the
+  path a quickboot load takes for a new emulator process. A renderer with address space
+  graphics consumers refuses.
+- **Teardown order.** The translator's displays go first (an EGL image a load restored is the
+  display's, and destroying it calls the GLES dispatch), then the dispatch, then the
+  EGL-on-EGL host engine, the host display (`eglTerminate`) and the host `libEGL` and
+  `libGLESv2`. A retake's load restores textures on a background thread, which a release
+  stops first.
+- **Vulkan.** With Vulkan emulation on and no `VulkanSnapshots`, the saved state holds no
+  Vulkan objects, so `gpu release` refuses while the guest has a Vulkan instance. HWUI runs
+  on Skia GL here (`debug.hwui.renderer=skiagl`), and the phone has none.
+- **Snapshots while released.** The emulator's own snapshot save and load refuse with an
+  error naming `gpu retake`.
+
+On the phone above, in its VM: `gpu release` takes 400 to 590 ms and leaves the emulator
+with 0 of its 80 `/dev/nvidia*` descriptors, 0 of its 291 mappings and none of the NVIDIA,
+EGL and GLES libraries mapped (the Vulkan loader stays, with no driver loaded); `gpu retake`
+takes 600 to 830 ms, the guest posts a frame within 50 to 100 ms of it, and the app draws at
+60 fps again. `make phone-test` checks the release and the retake.
+
+`scripts/phone/emulator.sh` builds the emulator from `fleet/phone/emulator.xml`, the
+`emu-main-dev` manifest with every project pinned and the two forks moved, into
+`/mnt/fcvm-btrfs/android-emulator/<hash>` (on a g4dn.metal about 14 minutes to fetch 95 GB
+of sources and 8 to build; 606 MB installed); `phone.sh` runs it from `/emu`, and the SDK
+no longer supplies an emulator.
 
 ### The app: an Android-themed scene
 
@@ -872,13 +951,16 @@ adb and the emulator console listen only inside the container.
 1. Merged (#1400): the phone profile: the Firecracker fork's nested state, the guest kernel
    with KVM, the phone container (emulator with `-gpu host` and EGL-on-EGL), the probe app,
    and `make phone-test`. Then this design's "Detaching the renderer, measured".
-2. The emulator from source: forks of the emulator and gfxstream from `emu-main-dev`, built
-   with the AOSP system image into the phone image; `gpu detach` and `gpu attach` on a
-   running phone, tested by detaching (no `/dev/nvidia*` descriptor or mapping left in the
-   emulator), attaching, and checking the app's renderer and frames.
-3. Snapshots of a running phone: fc-agent's park and unpark hooks for GPU holders that are
+2. Done: the emulator from source (ejc3/platform_external_qemu, ejc3/gfxstream,
+   `scripts/phone/emulator.sh`), with `gpu release` and `gpu retake` on a running phone,
+   tested by releasing (no `/dev/nvidia*` descriptor or mapping left in the emulator),
+   retaking, and checking the app's frames. The phone still boots the SDK's AOSP system
+   image, which the SDK license allows for testing; an image built from AOSP for the public
+   wall is tracked in #1412.
+3. Done: snapshots of a running phone: fc-agent's park and unpark hooks for GPU holders that are
    not CUDA processes, `--gpu-warm` of a running phone, and a test that a clone's app renders
-   on the clone's GPU; restore-to-first-app-frame measured, with the VM's size and hugepages.
+   on the clone's GPU; restore-to-first-app-frame measured ("Flow B, measured"). The VM's size
+   and hugepages are next.
 4. The app's scene (Robot Park, `fleet/phone-app`): the Android-themed scene, deterministic
    by rectangle, its info tab, the action intents and socket, surface-loss handling; the seam
    test in `make phone-test`.

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::OnceLock;
 use tokio::{
@@ -479,9 +480,45 @@ fn write_containers_conf(conf_path: &str) {
 /// Empty when running as root (no user mapping).
 static PODMAN_CMD_PREFIX: OnceLock<Vec<String>> = OnceLock::new();
 
-/// Store the command prefix for use by exec and other podman commands.
+/// Where [`set_podman_cmd_prefix`] leaves the prefix for one-shot `fc-agent` processes
+/// (`--gpu-park`, `--gpu-unpark`), which run apart from the agent and need the same
+/// container user context. On /run, which is guest memory, so a restored clone keeps it.
+pub const PODMAN_CMD_PREFIX_RECORD: &str = "/run/fcvm-podman-cmd-prefix.json";
+
+/// Store the command prefix for use by exec and other podman commands, and record it
+/// at [`PODMAN_CMD_PREFIX_RECORD`] for the one-shot processes.
 pub fn set_podman_cmd_prefix(prefix: Vec<String>) {
+    if let Err(e) = store_podman_cmd_prefix(Path::new(PODMAN_CMD_PREFIX_RECORD), &prefix) {
+        eprintln!("[fc-agent] WARNING: recording the podman command prefix failed: {e:#}");
+    }
     let _ = PODMAN_CMD_PREFIX.set(prefix);
+}
+
+fn store_podman_cmd_prefix(path: &Path, prefix: &[String]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec(prefix)?)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))
+}
+
+fn load_podman_cmd_prefix(path: &Path) -> Result<Vec<String>> {
+    let bytes = std::fs::read(path).with_context(|| {
+        format!(
+            "reading {} (the agent writes it once the container user is set up)",
+            path.display()
+        )
+    })?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// In a one-shot process: take the agent's command prefix from
+/// [`PODMAN_CMD_PREFIX_RECORD`], so podman commands run as the container's user. A
+/// missing record is an error, since assuming root would look in another user's
+/// container store.
+pub fn restore_podman_cmd_prefix() -> Result<()> {
+    let prefix = load_podman_cmd_prefix(Path::new(PODMAN_CMD_PREFIX_RECORD))?;
+    let _ = PODMAN_CMD_PREFIX.set(prefix);
+    Ok(())
 }
 
 /// Get the command prefix (empty vec if running as root).
@@ -527,6 +564,39 @@ fn get_filesystem_size_bytes(path: &str) -> Option<u64> {
         .filter(|&b: &u64| b > 0)
 }
 
+/// Grow a btrfs root filesystem to fill its disk, which the host extends for
+/// `--rootfs-size`, and return whether the root is btrfs. An ext4 root is grown on the
+/// host. Every image mode needs it: the container's writable layer is on the root.
+/// A failed resize is a warning; the VM still runs on the smaller filesystem.
+pub fn grow_btrfs_root() -> bool {
+    let root_is_btrfs = std::process::Command::new("findmnt")
+        .args(["-n", "-o", "FSTYPE", "/"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "btrfs")
+        .unwrap_or(false);
+    if !root_is_btrfs {
+        return false;
+    }
+    match std::process::Command::new("btrfs")
+        .args(["filesystem", "resize", "max", "/"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            eprintln!("[fc-agent] root filesystem is btrfs, resized to fill disk");
+        }
+        Ok(output) => {
+            eprintln!(
+                "[fc-agent] WARNING: btrfs resize failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: btrfs resize command failed: {}", e);
+        }
+    }
+    true
+}
+
 /// Set up btrfs storage if the kernel supports it.
 /// Creates a sparse loopback btrfs filesystem sized to the root disk capacity
 /// and configures podman to use it.
@@ -551,32 +621,8 @@ pub fn setup_btrfs_storage_if_available(
         return Ok(());
     }
 
-    // If root filesystem is natively btrfs, resize to fill disk and skip loopback.
-    // The host may have expanded the sparse file for --rootfs-size.
-    let root_is_btrfs = std::process::Command::new("findmnt")
-        .args(["-n", "-o", "FSTYPE", "/"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "btrfs")
-        .unwrap_or(false);
-
-    if root_is_btrfs {
-        match std::process::Command::new("btrfs")
-            .args(["filesystem", "resize", "max", "/"])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                eprintln!("[fc-agent] root filesystem is btrfs, resized to fill disk");
-            }
-            Ok(output) => {
-                eprintln!(
-                    "[fc-agent] WARNING: btrfs resize failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-            }
-            Err(e) => {
-                eprintln!("[fc-agent] WARNING: btrfs resize command failed: {}", e);
-            }
-        }
+    // A native btrfs root is grown to fill its disk and holds the storage itself.
+    if grow_btrfs_root() {
         let storage_dir = "/var/lib/containers/storage";
         let _ = std::fs::create_dir_all(storage_dir);
         write_btrfs_storage_conf(
@@ -2254,6 +2300,20 @@ pub async fn run_async(
 
 #[cfg(test)]
 mod tests {
+    /// A one-shot process recovers the agent's prefix, and a missing record is an error
+    /// rather than an empty (root) prefix.
+    #[test]
+    fn podman_cmd_prefix_record_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefix.json");
+        assert!(load_podman_cmd_prefix(&path).is_err());
+        let prefix = run_as_user_prefix("example-user", "/run/user/1000");
+        store_podman_cmd_prefix(&path, &prefix).unwrap();
+        assert_eq!(load_podman_cmd_prefix(&path).unwrap(), prefix);
+        store_podman_cmd_prefix(&path, &[]).unwrap();
+        assert!(load_podman_cmd_prefix(&path).unwrap().is_empty());
+    }
+
     use super::*;
 
     /// podman's `--userns=keep-id` mapping, as `GetKeepIDMapping` in podman 4.9 builds

@@ -7,6 +7,8 @@
 #   phone.sh boot            cold boot; prints boot_completed_ms
 #   phone.sh renderer        prints the GLES renderer SurfaceFlinger composes with
 #   phone.sh probe secs apk  installs and starts the probe app, prints its log lines
+#   phone.sh draws secs      the probe app's log lines over the next secs seconds
+#   phone.sh holds           the emulator's /dev/nvidia* descriptors and mappings
 #   phone.sh app apk         installs and starts Robot Park (fleet/phone-app), forwards
 #                            127.0.0.1:7070 in this container to its control socket, and waits
 #                            for its first frame; prints its renderer line
@@ -22,7 +24,10 @@ export ANDROID_SDK_ROOT=/sdk ANDROID_HOME=/sdk ANDROID_AVD_HOME=/root/.android/a
 # headless ("GlxEngine getDefaultDisplay: Failed to open display").
 export ANDROID_EGL_ON_EGL=1
 ADB=/sdk/platform-tools/adb
-EMU=/sdk/emulator/emulator
+# The emulator built from source (scripts/phone/emulator.sh), mapped at /emu: the SDK's may
+# not be modified, and the phone needs the console's gpu release and gpu retake.
+EMU_DIR=${EMU_DIR:-/emu}
+EMU=$EMU_DIR/emulator
 CTL_PORT=7070
 AVD=$ANDROID_AVD_HOME/phone.avd
 ms() { date +%s%3N; }
@@ -49,13 +54,14 @@ PlayStore.enabled=no
 CONFIG
 }
 
-# The SDK emulator dlopens libEGL.so and libGLESv2.so from its own SwiftShader directory
+# The emulator dlopens libEGL.so and libGLESv2.so from its own SwiftShader directory
 # before the system's, so EGL-on-EGL would render in software. Masking those three files
-# for this container (a bind mount of /dev/null, nothing in the SDK changes) makes the
+# for this container (a bind mount of /dev/null, the mapped build is not changed) makes the
 # lookup fall through to libEGL.so.1 and libGLESv2.so.2, which glvnd sends to NVIDIA.
 use_system_egl() {
-  local dir=/sdk/emulator/lib64/gles_swiftshader lib
+  local dir=$EMU_DIR/lib64/gles_swiftshader lib
   for lib in libEGL.so libGLESv2.so libGLES_CM.so; do
+    [ -e "$dir/$lib" ] || continue
     mountpoint -q "$dir/$lib" || mount --bind /dev/null "$dir/$lib"
   done
 }
@@ -86,6 +92,16 @@ probe)
   "$ADB" shell am start -W -n dev.fcvm.probe/.MainActivity | tr -d '\r' | grep -E '^(Status|TotalTime)'
   sleep "${2:-5}"
   "$ADB" logcat -d -s PHONEPROBE:I | tr -d '\r' | grep PHONEPROBE
+  ;;
+draws)
+  "$ADB" logcat -c
+  sleep "${2:-4}"
+  "$ADB" logcat -d -s PHONEPROBE:I | tr -d '\r' | grep PHONEPROBE
+  ;;
+holds)
+  q=$(pgrep -f qemu-system-x86_64 | head -1)
+  [ -n "$q" ] || { echo "no emulator running"; exit 1; }
+  echo "fds=$(find /proc/"$q"/fd -lname '/dev/nvidia*' 2> /dev/null | wc -l) mappings=$(grep -c /dev/nvidia /proc/"$q"/maps || true)"
   ;;
 app)
   # a fresh install: another build host signs with another debug key
@@ -125,7 +141,7 @@ stop)
   "$ADB" emu kill > /dev/null 2>&1 || true
   ;;
 *)
-  echo "usage: phone.sh boot|renderer|probe secs apk|app apk|ctl json|pull path dest|shot dest.png|applog|stop" >&2
+  echo "usage: phone.sh boot|renderer|probe secs apk|draws secs|holds|app apk|ctl json|pull path dest|shot dest.png|applog|stop" >&2
   exit 2
   ;;
 esac

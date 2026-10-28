@@ -1007,6 +1007,19 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         } else {
             None
         };
+        // The save consumes the VM's dirty-page bitmap, so from here on the recorded parent no
+        // longer describes what a diff over it would need: a create that fails after the save
+        // would leave a parent whose diff misses every page dirtied before it. The parent is
+        // cleared before the save, and the create stops if that write fails; the snapshot is
+        // recorded as the parent only once it is published. This create's diff base was read
+        // above, under the VM lock it still holds.
+        if record_diff_parent(&state_manager, &vm_state.vm_id, None)
+            .await
+            .context("clearing the VM's diff parent before the snapshot")?
+            .is_none()
+        {
+            warn!(vm_id = %vm_state.vm_id, "VM state file no longer exists; diff parent not cleared");
+        }
         // Memory snapshot: drive the VM's actual control plane. Both backends listen on
         // the same `firecracker.sock` path; the client type + snapshot mechanism differ.
         match vm_state.config.hypervisor {
@@ -4495,8 +4508,88 @@ pub(crate) fn restore_hook_for(
     }
 }
 
+/// Record `parent` as the snapshot the VM's next diff is written over, or none. Returns None when
+/// the VM's state file no longer exists.
+async fn record_diff_parent(
+    state_manager: &StateManager,
+    vm_id: &str,
+    parent: Option<String>,
+) -> Result<Option<()>> {
+    state_manager
+        .update_state(vm_id, |state| state.config.snapshot_name = parent)
+        .await
+        .map(|opt| opt.map(|_| ()))
+}
+
 #[cfg(test)]
 mod tests {
+    /// The VM's diff parent is cleared before the memory snapshot's save, and the create stops if
+    /// that write fails: a create that failed after the save has consumed the dirty-page bitmap,
+    /// and a diff over the old parent would miss the pages dirtied before it (CodeRabbit findings
+    /// on PR 1403).
+    ///
+    /// RED BEFORE THE FIX: the parent stayed recorded through the save, and a failed create
+    /// returned with it unchanged.
+    #[test]
+    fn the_diff_parent_is_cleared_before_the_save_and_a_failed_clear_stops_the_create() {
+        let source = include_str!("snapshot.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let body = &code[code.find("async fn cmd_snapshot_create(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let cleared = body
+            .find("record_diff_parent(&state_manager, &vm_state.vm_id, None)")
+            .expect("cmd_snapshot_create does not clear the diff parent");
+        let saved = body
+            .find("create_snapshot_core(")
+            .expect("the memory snapshot");
+        assert!(cleared < saved, "the diff parent is cleared after the save");
+        let clear = &body[cleared..saved];
+        assert!(
+            clear.contains(".context(\"clearing the VM's diff parent before the snapshot\")?"),
+            "a failed clear does not stop the create"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_diff_parent_is_recorded_and_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = StateManager::new(dir.path().to_path_buf());
+        manager.init().await.unwrap();
+        let mut state = crate::state::VmState::new(
+            "vm-lineage".to_string(),
+            "alpine:latest".to_string(),
+            1,
+            512,
+        );
+        state.config.snapshot_name = Some("old".to_string());
+        manager.save_state(&state).await.unwrap();
+        record_diff_parent(&manager, "vm-lineage", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .load_state("vm-lineage")
+                .await
+                .unwrap()
+                .config
+                .snapshot_name,
+            None
+        );
+        record_diff_parent(&manager, "vm-lineage", Some("new".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .load_state("vm-lineage")
+                .await
+                .unwrap()
+                .config
+                .snapshot_name
+                .as_deref(),
+            Some("new")
+        );
+    }
+
     /// A disk-only clone (`snapshot run --snapshot <disk-only> --on-restore <cmd>`)
     /// runs the caller's hook, resolved the same way as a memory restore, instead of
     /// copying the snapshot's recorded hook over an accepted flag (a Codex finding on

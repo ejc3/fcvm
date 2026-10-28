@@ -26,4 +26,7 @@ RUN mkdir -p /usr/share/glvnd/egl_vendor.d /usr/share/vulkan/icd.d \
       > /usr/share/vulkan/icd.d/nvidia_icd.json
 COPY --from=kvmprobe /kvmprobe /usr/local/bin/kvmprobe
 COPY phone.sh /usr/local/bin/phone.sh
+# fc-agent runs the hook to release the GPU before a warm snapshot and retake it after.
+COPY gpu-hook /usr/local/bin/gpu-hook
+LABEL dev.fcvm.gpu-hook=/usr/local/bin/gpu-hook
 CMD ["sleep", "infinity"]

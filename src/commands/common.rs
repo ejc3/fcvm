@@ -870,6 +870,20 @@ fn diff_bytes_written(snapshot: &str, measured: std::io::Result<u64>) -> u64 {
     }
 }
 
+/// The name a diff is renamed to in its snapshot directory when the Full retry replaces it.
+const SET_ASIDE_DIFF: &str = "memory.set-aside";
+
+/// Rename the diff at `diff` out of the way of a Full snapshot written into `dir`, and return
+/// where it went, or None when there was no diff.
+fn set_diff_aside(diff: &Path, dir: &Path) -> std::io::Result<Option<PathBuf>> {
+    let aside = dir.join(SET_ASIDE_DIFF);
+    match std::fs::rename(diff, &aside) {
+        Ok(()) => Ok(Some(aside)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Why `file` cannot take an in-place diff, or None: it is not `memory_bytes` long
 /// (Firecracker truncates a memory file of another length and writes only the dirty pages
 /// into it), or its filesystem does not report which extents it shares, which is how the
@@ -5732,6 +5746,8 @@ pub async fn create_snapshot_core(
 
     // VM is now paused — we MUST resume it before returning, no matter what.
     let mut use_diff = has_base;
+    // A diff the Full retry set aside, removed once the VM is resumed.
+    let mut set_aside_diff: Option<PathBuf> = None;
     // The snapshot's balloon record comes from the VMM, which is the authority on
     // its device: the target can be changed on the API socket after boot and
     // nothing writes that to the VM's state. Read here, with the VM paused and
@@ -5801,18 +5817,19 @@ pub async fn create_snapshot_core(
                      diff could not be measured. Retrying as Full snapshot (VM still paused)."
                 );
 
-                // Remove the diff and retry as Full; the removal must succeed. An in-place diff
-                // is memory.bin itself, and a Full snapshot leaves all-zero pages as holes, so a
-                // clone left in place would keep the parent's bytes there. A sparse memory.diff
-                // left behind would be published beside the Full memory.bin.
-                let removed = std::fs::remove_file(&temp_memory_path);
+                // Move the diff aside and retry as Full; the move must succeed. An in-place
+                // diff is memory.bin itself, and a Full snapshot leaves all-zero pages as holes,
+                // so a clone left in place would keep the parent's bytes there. A sparse
+                // memory.diff left behind would be published beside the Full memory.bin. The
+                // diff is renamed, not removed: an in-place diff shares the parent's extents,
+                // and removing it drops one reference per extent (52 s for a memory file of
+                // 11.8 million extents) while the VM is paused.
                 let full_memory_path = temp_snapshot_dir.join("memory.bin");
-                let retry = match removed {
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                        Err(anyhow::Error::new(e)
-                            .context("removing the diff before the Full retry"))
-                    }
-                    _ => {
+                let retry = match set_diff_aside(&temp_memory_path, &temp_snapshot_dir) {
+                    Err(e) => Err(anyhow::Error::new(e)
+                        .context("setting the diff aside before the Full retry")),
+                    Ok(aside) => {
+                        set_aside_diff = aside;
                         snapshot_client
                             .create_snapshot(SnapshotCreate {
                                 snapshot_type: Some("Full".to_string()),
@@ -5941,6 +5958,15 @@ pub async fn create_snapshot_core(
     // it never reaches the guest. It only tells host exec clients that byte streams
     // in flight across the pause were silently lost (the CI-observed orphan mode),
     // so their blocked reads abort instead of hanging.
+
+    if let Some(aside) = set_aside_diff {
+        if let Err(e) = tokio::fs::remove_file(&aside).await {
+            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
+            return Err(
+                anyhow::Error::new(e).context("removing the diff set aside for the Full retry")
+            );
+        }
+    }
 
     if use_diff && diff_in_place {
         // The dirty pages are already in memory.bin. Its long zero runs become holes, as a
@@ -6278,6 +6304,50 @@ pub async fn create_snapshot_ch(
 
 #[cfg(test)]
 mod tests {
+    /// The Full retry moves the diff aside while the VM is paused and removes it after the
+    /// resume: an in-place diff shares the parent's extents, so removing it costs one
+    /// reference per extent, which must not lengthen the pause (#1391).
+    #[test]
+    fn the_full_retry_removes_nothing_while_the_vm_is_paused() {
+        let all = include_str!("common.rs");
+        let src = &all[..all
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("the test module")];
+        let retry = src
+            .find("Retrying as Full snapshot (VM still paused)")
+            .expect("the Full retry");
+        let resume = retry
+            + src[retry..]
+                .find("snapshot.post_save_pre_resume")
+                .expect("the resume after the retry");
+        let paused = &src[retry..resume];
+        assert!(
+            !paused.contains("remove_file("),
+            "the Full retry removes a file while the VM is paused"
+        );
+        assert!(
+            paused.contains("set_diff_aside("),
+            "the Full retry does not set the diff aside"
+        );
+        assert!(
+            src[resume..].contains("removing the diff set aside for the Full retry"),
+            "the diff set aside for the Full retry is not removed after the resume"
+        );
+    }
+
+    #[test]
+    fn a_diff_set_aside_leaves_the_name_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let diff = dir.path().join("memory.bin");
+        std::fs::write(&diff, b"diff").unwrap();
+        let aside = set_diff_aside(&diff, dir.path())
+            .unwrap()
+            .expect("a diff to set aside");
+        assert!(!diff.exists());
+        assert_eq!(std::fs::read(&aside).unwrap(), b"diff");
+        assert_eq!(set_diff_aside(&diff, dir.path()).unwrap(), None);
+    }
+
     /// A staged memory.bin that is a symlink is refused, so Firecracker cannot write the diff
     /// into the file it points at.
     #[test]

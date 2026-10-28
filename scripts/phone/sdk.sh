@@ -21,8 +21,7 @@
 set -euo pipefail
 B=https://dl.google.com/android/repository
 # url sha256 directory-in-zip destination-under-sdk
-PINS="$B/emulator-linux_x64-16428233.zip b08fc43d8608d2955f607f1b287beb525041e730086bdca3af152accac3af9c1 emulator emulator
-$B/platform-tools_r37.0.1-linux.zip d230f13842f60f782a8645f9c813f8f845bf36089ea7289f28c48f17979313f1 platform-tools platform-tools
+PINS="$B/platform-tools_r37.0.1-linux.zip d230f13842f60f782a8645f9c813f8f845bf36089ea7289f28c48f17979313f1 platform-tools platform-tools
 $B/build-tools_r35_linux.zip bd3a4966912eb8b30ed0d00b0cda6b6543b949d5ffe00bea54c04c81e1561d88 android-15 build-tools/35.0.0
 $B/platform-35_r02.zip 0988cacad01b38a18a47bac14a0695f246bc76c1b06c0eeb8eb0dc825ab0c8e0 android-35 platforms/android-35
 $B/sys-img/android/x86_64-35_r02.zip 6dd7de33e63ef105cf2fabea6badda1dbe7665c96d8908e5f6e1407e63ff4556 x86_64 system-images/android-35/default/x86_64"

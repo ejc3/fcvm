@@ -1,0 +1,65 @@
+#!/bin/bash
+# The phone container's GPU hook: the running phone lets go of the VM's GPU and takes it up
+# again, through the emulator's console, while the phone keeps its state. The image label
+# dev.fcvm.gpu-hook names it, and fc-agent runs it when it parks the VM's GPUs for a warm
+# snapshot (release) and when it brings them up again in the source VM or in a clone
+# (retake); `make phone-test` also runs it directly.
+#
+#   gpu-hook release   'gpu release': the emulator pauses the phone, keeps its GPU state in
+#                      memory and unloads the graphics driver, so it holds no /dev/nvidia*
+#                      descriptor or mapping; prints released_ms
+#   gpu-hook retake    'gpu retake': the emulator loads the driver, restores the state onto
+#                      the GPU the VM has now and resumes the phone; then waits for the
+#                      phone's next frame on that GPU and prints retaken_ms, first_frame_ms
+#                      and first_frame_at_ms (the wall clock, in ms since the epoch, when it
+#                      saw the frame; a restore steps the guest clock to the host's)
+#
+# No emulator running is not an error: there is nothing to let go of. Each call's output is
+# also appended to /tmp/gpu-hook.log.
+set -euo pipefail
+# The test (scripts/phone/test-gpu-hook.sh) points these at stubs.
+ADB=${GPU_HOOK_ADB:-/sdk/platform-tools/adb}
+STATE=${GPU_HOOK_STATE:-/tmp}
+exec > >(tee -a "$STATE/gpu-hook.log") 2>&1
+ms() { date +%s%3N; }
+console() { timeout 30 "$ADB" emu "$@" | tr -d '\r'; }
+running() { [ -f "$STATE/emulator.pid" ] && kill -0 "$(cat "$STATE/emulator.pid")" 2> /dev/null; }
+
+case "${1:-}" in
+release)
+  running || { echo "no emulator running"; exit 0; }
+  out=$(console gpu release)
+  echo "$out"
+  grep -q '^released_ms=' <<< "$out"
+  ;;
+retake)
+  running || { echo "no emulator running"; exit 0; }
+  # Only an answer of "held" means there is nothing to take up again; a console that
+  # does not answer is an error, or a released phone would stay paused.
+  status=$(console gpu status) || { echo "the emulator's console did not answer 'gpu status'"; exit 1; }
+  case "$(head -1 <<< "$status")" in
+  released) ;;
+  held) echo "the emulator holds the GPU"; exit 0 ;;
+  *) echo "unexpected 'gpu status' answer: $status"; exit 1 ;;
+  esac
+  t0=$(ms)
+  out=$(console gpu retake)
+  echo "$out"
+  grep -q '^retaken_ms=' <<< "$out"
+  deadline=$(( t0 + ${FRAME_TIMEOUT_MS:-10000} ))
+  while [ "$(ms)" -lt "$deadline" ]; do
+    if [ "$(console gpu frame | head -1)" = posted ]; then
+      now=$(ms)
+      echo "first_frame_ms=$(( now - t0 )) first_frame_at_ms=$now"
+      exit 0
+    fi
+    sleep 0.02
+  done
+  echo "the phone posted no frame within ${FRAME_TIMEOUT_MS:-10000} ms of the retake"
+  exit 1
+  ;;
+*)
+  echo "usage: gpu-hook release|retake" >&2
+  exit 2
+  ;;
+esac
