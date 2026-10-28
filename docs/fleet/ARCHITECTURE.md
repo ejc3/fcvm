@@ -585,7 +585,7 @@ phone, let's have something more androidy."
 ```
 fcvm VM, `phone` profile: one GPU (VFIO), KVM inside (nested), restored from a snapshot
   container fleet/phone (privileged: /dev/kvm; the GPU as CDI devices)
-    Android Emulator: QEMU with KVM, Android 15 (AOSP x86_64 image)
+    Android Emulator: QEMU with KVM, Android 15 (x86_64 image built from AOSP source)
       gfxstream, the emulator's host-side renderer: EGL-on-EGL through glvnd to NVIDIA's
       EGL (no X display), and Vulkan through NVIDIA's ICD, both on the passed-through GPU
     the app (guest GLES 3 / Vulkan through goldfish -> gfxstream -> the GPU)
@@ -597,8 +597,9 @@ the fleet's host AMI already loads `kvm_intel` with `nested=Y`. The arm64 hosts 
 rendering the wall.
 
 The spike rig: g4dn.metal (T4, driver 580.196.07), host `kvm_intel nested=Y`, emulator
-37.2.12, the AOSP `default` x86_64 Android 15 image, a 720x1280 phone with 4 cores. Every
-number below is from that box.
+37.2.12, the SDK's `default` x86_64 Android 15 image, a 720x1280 phone with 4 cores. Every
+number below is from that box (the phone has since moved to an emulator and an image built
+from source).
 
 | measurement | result |
 |---|---|
@@ -831,6 +832,68 @@ takes 600 to 830 ms, the guest posts a frame within 50 to 100 ms of it, and the 
 of sources and 8 to build; 606 MB installed); `phone.sh` runs it from `/emu`, and the SDK
 no longer supplies an emulator.
 
+#### The system image from AOSP source (2026-10-28)
+
+The phone boots an Android 15 image built from AOSP, not the SDK's (Licensing, below):
+AOSP's `android-15.0.0_r36` (build BP1A.250505.005.D1, security patch 2025-05-05), the
+target `sdk_phone64_x86_64-bp1a-userdebug`, which is the product the SDK's image was built
+as (its build.prop: `sdk_phone64_x86_64-userdebug 15 AE3A.240806.019`). `fleet/phone/aosp.xml`
+pins each of the tag's 1030 Linux projects to the commit its superproject records.
+`make phone-system-image` (`scripts/phone/aosp-build.sh`) syncs them, builds the image with
+`m emu_img_zip`, and packages two archives into `/mnt/fcvm-btrfs/aosp-build/<id>/dist`,
+`<id>` a hash of the script and the manifest:
+
+- `aosp-system-<id>.zip`: the system image in the layout of the SDK's
+  `system-images/android-35/default/x86_64` (system, vendor, ramdisk, the kernel, and the
+  image's NOTICE).
+- `aosp-tools-<id>.tar.gz`: `adb`, and what builds an app without the SDK: `aapt2`, `d8`,
+  `zipalign`, `apksigner`, and an `android.jar` of the public API's stubs and
+  `framework-res`'s resource table, with each tool's license.
+
+The build fixes the stamps a build takes from its host (date, user, host name and build
+number; the fingerprint is `Android/sdk_phone64_x86_64/emu64x:15/BP1A.250505.005.D1/<id>`),
+and the tools archive is written with fixed owners, modes and times; a second build from
+the same pins has not been compared byte for byte. AOSP's toolchains are
+x86_64 Linux prebuilts, so it runs on an x86_64 host only; every pbox compute flavor is
+Graviton, and the build ran on a `kvm-gpu-96` (g4dn.metal, 96 vCPU, its NVMe): 32 minutes to
+sync about 160 GB of sources (16 fetches at once; at 64, android.googlesource.com answered
+`RESOURCE_EXHAUSTED`), and 42 minutes (2532 s) to build from an empty `out/`. The archives are the
+GitHub release `aosp-<id>` on ejc3/fcvm; `scripts/phone/aosp.sh` pins the build id and each
+archive's SHA-256, fetches and checks them into `/mnt/fcvm-btrfs/android-aosp/<hash of the
+pins>` (mapped at `/android` in the phone container), and builds the probe app with the
+fetched tools. It refuses when the build id it pins is not what this checkout's recipe and
+manifest build.
+
+The kernel and its modules are the tree's prebuilt GKI build (`kernel/prebuilts/6.6/x86-64`
+and the virtual-device modules: `6.6.57-android15-8-g8b48c9979699`, Android CI build
+12748506), as the SDK's image carries the same branch's (`6.6.30-android15-8`). One difference from the SDK's image needed
+a change: this image's `advancedFeatures.ini` turns UWB on, and with no emulated UWB peer
+the guest's UWB stack reports a device error at boot (`am_wtf UwbServiceCore: Error device
+status received`), on which system_server takes a full bug report; dumpstate then holds a
+core for about 30 s, and the app's lowest fps sample after the warm snapshot read 27.9 and
+24.0 in two runs. `phone.sh` starts the emulator with `-feature -Uwb`, and `make
+phone-test` fails when the system has asked for a bug report.
+
+`make phone-test` passes on the AOSP image, and the two images measure alike. Four
+runs of each, alternating, on one g4dn.metal (T4, driver 580.196.07, 6 GiB phone VM, 2 GiB
+phone; the source-built emulator for both):
+
+| | SDK image (AE3A.240806.019) | AOSP image (BP1A.250505.005.D1) |
+|---|---|---|
+| SurfaceFlinger's GLES line | `Google (NVIDIA Corporation), Android Emulator OpenGL ES Translator (Tesla T4/PCIe/SSE2), OpenGL ES 3.1 (OpenGL ES 3.2 NVIDIA 580.196.07)` | the same |
+| the app's GLES renderer | `Android Emulator OpenGL ES Translator (Tesla T4/PCIe/SSE2)` | the same |
+| cold boot to `sys.boot_completed` | 30.8 to 31.6 s | 31.1 to 32.3 s |
+| the probe app's fps, 24 samples a run: median, mean | 60.0, 59.1 | 60.0, 59.3 |
+| `gpu release`, `gpu retake` | 496 to 540 ms, 671 to 826 ms | 425 to 495 ms, 587 to 738 ms |
+| warm snapshot of the running phone | 15.4 to 15.8 s | 15.6 to 15.8 s |
+| flow B: click to the app's first frame on the clone's GPU | 6180 to 6579 ms | 5843 to 6260 ms |
+| of which the guest's GPU phase (`gpu_ms`) | 1682 to 1851 ms | 1580 to 1698 ms |
+| the app on the clone's GPU, lowest fps sample in 4 s | 44.0 to 52.0 | 54.3 to 56.4 |
+
+The first `make phone-test` on that box, right after the fetch, measured flow B at 8973 ms
+with a `gpu_ms` of 1633; the other 2.8 s are outside the guest's GPU phase and were not
+broken down.
+
 ### The app: an Android-themed scene
 
 DECIDED (owner, 2026-10-27): the phones render their own scene, not the wall's terrain: the
@@ -911,16 +974,24 @@ adb and the emulator console listen only inside the container.
 - **The SDK's emulator and system images** are under the Android SDK License Agreement
   (developer.android.com/studio/terms): 3.1 grants use "solely to develop applications for
   compatible implementations of Android"; 3.4 forbids copying except for backup, modifying,
-  redistributing or creating derivative works. The spike and `make phone-test` use them to
-  develop and test the app, on our own hosts, unmodified, fetched from Google with their
-  checksums pinned, and `scripts/phone/sdk.sh` refuses to fetch until
-  `ACCEPT_ANDROID_SDK_LICENSE=1` says the agreement was read. A public wall of phones is not
-  app development, so what ships is built from AOSP source: the emulator (`external/qemu`,
-  QEMU's parts under the GPL; we serve video, not binaries) and gfxstream (Apache 2.0) from
-  our forks, and an AOSP-based system image without Google's apps or services, whose
-  components keep their own licenses and notices (the Linux kernel under the GPL, most of
-  the platform under Apache 2.0). Building them from source is also what the detach change
-  needs.
+  redistributing or creating derivative works. A public wall of phones is not app
+  development, so the phone uses nothing from the SDK, and `make phone-test` fetches nothing
+  from it (there is no `ACCEPT_ANDROID_SDK_LICENSE` gate left):
+  - the emulator (`external/qemu`, QEMU's parts under the GPL) and gfxstream (Apache 2.0)
+    are built from our forks (`scripts/phone/emulator.sh`);
+  - the system image, `adb`, and the tools that build the app (`aapt2`, `d8`, `zipalign`,
+    `apksigner`, `android.jar`) are built from AOSP's `android-15.0.0_r36`
+    (`scripts/phone/aosp-build.sh`, "The system image from AOSP source"), without Google's
+    apps or services. Their components keep their own licenses and notices: the image
+    carries its NOTICE file, and the tools archive each tool's license. Most of the platform
+    and the tools are Apache 2.0; the Linux kernel and its modules (AOSP's prebuilt GKI
+    build in the tree) are GPL-2.0; `d8` is the R8 project's BSD-licensed release in
+    `prebuilts/r8`.
+  - The archives are published as a GitHub release of this repository; its corresponding
+    source is `fleet/phone/aosp.xml` (every project at a commit on
+    android.googlesource.com) and, for the kernel, the release notes' kernel commit.
+  The SDK's emulator and image remain fine for developing the app on our own hosts, as the
+  spike used them; nothing in this repository fetches them.
 - **The Android robot** is CC BY 3.0 with the attribution line above; "Android" and Google's
   marks follow Google's brand guidelines, as under "Branding".
 
@@ -932,9 +1003,8 @@ adb and the emulator console listen only inside the container.
 2. Done: the emulator from source (ejc3/platform_external_qemu, ejc3/gfxstream,
    `scripts/phone/emulator.sh`), with `gpu release` and `gpu retake` on a running phone,
    tested by releasing (no `/dev/nvidia*` descriptor or mapping left in the emulator),
-   retaking, and checking the app's frames. The phone still boots the SDK's AOSP system
-   image, which the SDK license allows for testing; an image built from AOSP for the public
-   wall is tracked in #1412.
+   retaking, and checking the app's frames. Then the system image, `adb` and the app's build
+   tools from AOSP source (#1412), so nothing the phone runs is under the SDK license.
 3. Done: snapshots of a running phone: fc-agent's park and unpark hooks for GPU holders that are
    not CUDA processes, `--gpu-warm` of a running phone, and a test that a clone's app renders
    on the clone's GPU; restore-to-first-app-frame measured ("Flow B, measured"). The VM's size
