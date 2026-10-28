@@ -25,6 +25,7 @@ import {
   type DrawPlan,
   type Family,
   type IntentName,
+  type HistoryEntry,
   type ShownFrame,
   type UiState,
 } from "../../core/index.ts";
@@ -91,6 +92,8 @@ export class WallClient {
   readonly url: string;
   /** In broadcast mode, the frame the player presented last (set by the player, read each draw). */
   shown: ShownFrame | null = null;
+  /** The snapshot the overlay drew for that frame, kept while the picture is frozen. */
+  pinned: HistoryEntry | null = null;
 
   constructor(url: string) {
     this.url = url;

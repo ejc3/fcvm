@@ -377,9 +377,13 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   const sheetOpen = sheetChoice ?? true;
   // Broadcast mode: the overlay is drawn for the frame on screen, seconds behind the coordinator.
   const inBroadcast = watchesBroadcast(state);
-  if (!inBroadcast) client.shown = null;
+  if (!inBroadcast) {
+    client.shown = null;
+    client.pinned = null;
+  }
   const shownFrame = inBroadcast ? client.shown : null;
-  const shown = inBroadcast ? broadcastShown(state, shownFrame, now || 0) : { state, now: now || 0 };
+  const shown = inBroadcast ? broadcastShown(state, shownFrame, now || 0, client.pinned) : { state, now: now || 0, entry: null };
+  if (inBroadcast) client.pinned = shown.entry;
   const latencyMs = shownFrame ? broadcastLatencyMs(shownFrame, state.clock, now || 0) : null;
   const view = useMemo(
     () =>

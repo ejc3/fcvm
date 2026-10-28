@@ -6,14 +6,12 @@
 // the frame on screen and draws the overlay for that moment (core/broadcast.ts).
 
 import { useEffect, useRef, useState } from "react";
-import type { ShownFrame } from "../../core/index.ts";
+import { FrameMatcher, type ShownFrame } from "../../core/index.ts";
 
 /** The IVS web player, pinned. */
 export const IVS_PLAYER_URL = "https://player.live-video.net/1.57.0/amazon-ivs-player.min.js";
 /** After an error or the end of the stream, the player is loaded again this much later. */
 const RETRY_MS = 3000;
-/** SEI timestamps kept for matching (a few seconds of frames at 30 fps). */
-const SEI_KEPT = 300;
 
 interface IvsPlayer {
   attachHTMLVideoElement(v: HTMLVideoElement): void;
@@ -102,15 +100,15 @@ export function Broadcast({
     let player: IvsPlayer | null = null;
     let retry: ReturnType<typeof setTimeout> | null = null;
     let callback = 0;
-    const byTime = new Map<number, { t: number; e: number }>();
+    const matcher = new FrameMatcher();
     const again = () => {
       if (gone || retry) return;
       setStatus("reconnecting");
       retry = setTimeout(() => setAttempt((a) => a + 1), RETRY_MS);
     };
     const onPresented = (_now: number, md: VideoFrameCallbackMetadata) => {
-      const f = byTime.get(Math.round(md.mediaTime * 1000));
-      if (f) onFrameRef.current({ ...f, at: performance.timeOrigin + md.expectedDisplayTime });
+      const f = matcher.presented(Math.round(md.mediaTime * 1000), performance.timeOrigin + md.expectedDisplayTime);
+      if (f) onFrameRef.current(f);
       callback = video.requestVideoFrameCallback(onPresented);
     };
     void loadPlayer()
@@ -133,8 +131,7 @@ export function Broadcast({
           const m = ev as { timestamp?: unknown; data?: unknown };
           const f = seiFrame(m.data);
           if (!f || typeof m.timestamp !== "number") return;
-          byTime.set(Math.round(m.timestamp * 1000), f);
-          if (byTime.size > SEI_KEPT) byTime.delete(byTime.keys().next().value!);
+          for (const shown of matcher.sei(Math.round(m.timestamp * 1000), f)) onFrameRef.current(shown);
           // Without frame callbacks the SEI's own moment stands in for the frame's.
           if (!("requestVideoFrameCallback" in video)) onFrameRef.current({ ...f, at: performance.timeOrigin + performance.now() });
         });
