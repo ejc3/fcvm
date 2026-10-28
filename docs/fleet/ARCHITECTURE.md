@@ -699,10 +699,49 @@ the app's next frame.
 | flow | click to the app's first frame (6 GiB phone VM) |
 |---|---|
 | A: clone restore, then the emulator loads its own snapshot | 12.8 to 13.1 s, measured |
-| B: clone restore of a running phone, renderer re-attached | about 5.5 s, projected: ACK 4.7 to 5.0 s plus the renderer's start and GPU state load from the warm load above (0.13 s and 0.42 s) |
+| B: clone restore of a running phone, renderer retaken | 5.75 to 6.19 s, measured (projected about 5.5 s) |
 
-B is the design. Its largest part is the memory pin, so the phone VM's size and hugepages
-are measured in the same PR as the hooks.
+B is the design and is what fcvm does now (below). Its largest part is the memory pin; the
+phone VM's size and hugepages are the next thing to measure.
+
+#### Flow B, measured (2026-10-28)
+
+The container's image names a GPU hook in the `dev.fcvm.gpu-hook` label
+(`fleet/phone/gpu-hook`). fc-agent's park runs it with `release` before it reads which
+processes hold an NVIDIA device, so the emulator, which has let go of the GPU, is not taken
+for a CUDA process; a later park step that fails runs `retake` to undo it. The parked record
+names the hook, and unpark runs `retake` once the GPUs are up and the CUDA processes are
+restored, in the source VM after the snapshot and in a clone inside the restore's GPU attach,
+before the clone is acknowledged; a failed retake fails the clone. The hook's `retake`
+returns once the phone has posted a frame on the new GPU, so the acknowledgement follows
+the app's first frame. The phone VM maps its volumes with `--portable-volumes`: the
+emulator holds its system image and libraries open on them, and only portable inodes let a
+clone find those files again.
+
+On a g4dn.metal (T4, driver 580.196.07), a 6 GiB phone VM (2 GiB phone, the app drawing
+25,600 cubes at 60 fps), one warm snapshot and three clones restored one at a time onto
+three other T4s (`snapshot run --snapshot --gpu`, File backend), 1-minute load 1.6 at the
+start:
+
+| | clone 1 | clone 2 | clone 3 |
+|---|---|---|---|
+| click to the app's first frame on the clone's GPU | 6140 ms | 5751 ms | 6193 ms |
+| restore ACK | 6138 ms | 5743 ms | 6184 ms |
+| of which the guest's GPU phase (`gpu_ms`) | 1930 ms | 1912 ms | 2191 ms |
+| of that, `gpu retake` | 922 ms | 816 ms | 916 ms |
+| retake to the first frame | 987 ms | 912 ms | 1226 ms |
+
+The GPU phase is the driver bring-up of any GPU restore (about 950 ms, mostly
+nvidia-persistenced and the memory scrub) plus the retake and the first frame; the rest of
+the ACK is mostly the VFIO memory pin, about 3.8 s for 6 GiB. The projection counted the
+renderer's start and the state load of an emulator quickboot load (0.55 s); the retake
+measures 0.8 to 0.9 s, since it also loads the host driver and initializes EGL, and
+recreates the 22 render threads. The warm snapshot of the running phone took 12.6 to 13.0 s
+(the park's release about 0.5 s, the source's retake about 0.8 s), and the source phone
+kept drawing. In the first 3 s after a clone's restore the app's lowest fps sample was 36
+to 38; four seconds in it was 56. `make phone-test GPU= GPU2=` checks all of it; without the
+label the park refuses ("every process with a GPU open must be a CUDA process") and the
+check fails.
 
 The emulator is built from source for this, forked like Firecracker: ejc3/platform_external_qemu
 (the emulator, `external/qemu`) and ejc3/gfxstream, each with AOSP's `emu-main-dev` on a
@@ -896,9 +935,10 @@ adb and the emulator console listen only inside the container.
    retaking, and checking the app's frames. The phone still boots the SDK's AOSP system
    image, which the SDK license allows for testing; an image built from AOSP for the public
    wall is tracked in #1412.
-3. Snapshots of a running phone: fc-agent's park and unpark hooks for GPU holders that are
+3. Done: snapshots of a running phone: fc-agent's park and unpark hooks for GPU holders that are
    not CUDA processes, `--gpu-warm` of a running phone, and a test that a clone's app renders
-   on the clone's GPU; restore-to-first-app-frame measured, with the VM's size and hugepages.
+   on the clone's GPU; restore-to-first-app-frame measured ("Flow B, measured"). The VM's size
+   and hugepages are next.
 4. The app's scene: the Android-themed scene, deterministic by rectangle, its info tab, the
    action intents and surface-loss handling; the seam test.
 5. The phone streamer: screen capture, NVENC, FCVF frames stamped with `t`.

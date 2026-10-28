@@ -1,6 +1,9 @@
 #!/bin/bash
 # The phone container's GPU hook: the running phone lets go of the VM's GPU and takes it up
-# again, through the emulator's console, while the phone keeps its state.
+# again, through the emulator's console, while the phone keeps its state. The image label
+# dev.fcvm.gpu-hook names it, and fc-agent runs it when it parks the VM's GPUs for a warm
+# snapshot (release) and when it brings them up again in the source VM or in a clone
+# (retake); `make phone-test` also runs it directly.
 #
 #   gpu-hook release   'gpu release': the emulator pauses the phone, keeps its GPU state in
 #                      memory and unloads the graphics driver, so it holds no /dev/nvidia*
@@ -9,7 +12,7 @@
 #                      the GPU the VM has now and resumes the phone; then waits for the
 #                      phone's next frame on that GPU and prints retaken_ms, first_frame_ms
 #                      and first_frame_at_ms (the wall clock, in ms since the epoch, when it
-#                      saw the frame)
+#                      saw the frame; a restore steps the guest clock to the host's)
 #
 # No emulator running is not an error: there is nothing to let go of. Each call's output is
 # also appended to /tmp/gpu-hook.log.

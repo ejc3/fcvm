@@ -1,6 +1,6 @@
 #!/bin/bash
-# A phone VM renders on its GPU and can let go of it and take it up again: an fcvm VM of the
-# phone profile with one GPU, restored from its pre-start snapshot as every GPU VM is,
+# A phone VM renders on its GPU and survives a warm snapshot onto another GPU: an fcvm VM of
+# the phone profile with one GPU, restored from its pre-start snapshot as every GPU VM is,
 # runs an Android Emulator built from source (scripts/phone/emulator.sh) whose GPU rendering
 # goes to that GPU. Checks, each failing the run:
 #   1. the VM was restored from a snapshot, and KVM runs a VM inside it (fleet/phone/kvmprobe.c):
@@ -14,26 +14,35 @@
 #      names the GPU and it reports at least 30 frames a second;
 #   5. the running phone lets go of the GPU (the container's GPU hook, `gpu release` on the
 #      emulator's console): the emulator then holds no /dev/nvidia* descriptor or mapping;
-#      and takes it up again (`gpu retake`): the app draws 30 frames a second again.
+#      and takes it up again (`gpu retake`): the app draws 30 frames a second again;
+#   6. a warm snapshot of the running phone (`fcvm snapshot create --gpu-warm`, whose park
+#      runs the hook) is taken and the source phone keeps drawing; a clone restored from it
+#      with the second GPU (`fcvm snapshot run --gpu`) runs the same phone on that GPU:
+#      nvidia-smi names a different GPU than the source's, SurfaceFlinger's renderer names
+#      it, the emulator holds it open, and the app draws 30 frames a second there. Prints the
+#      time from the restore command to the phone's first frame on the clone's GPU.
 #
-#   FCVM=./target/release/fcvm scripts/phone/run.sh <gpu pci address>
+#   FCVM=./target/release/fcvm scripts/phone/run.sh <gpu pci address> <second gpu pci address>
 # PHONE_PROFILE names another kernel profile to run the same checks on (default phone).
 # `run.sh --image` prints the image tag it builds: fleet/phone's contents name it, so
 # concurrent runs from checkouts with other sources never replace each other's image.
-# Needs a GPU on vfio-pci, the phone profile set up (make setup-phone), the host's
+# Needs two GPUs on vfio-pci, the phone profile set up (make setup-phone), the host's
 # kvm_intel loaded with nested=1, the SDK and probe app from scripts/phone/sdk.sh and the
 # emulator from scripts/phone/emulator.sh.
 set -euo pipefail
 SRC=$(cd "$(dirname "$0")/../.." && pwd)
 IMAGE=localhost/fcvm-phone:$(cd "$SRC/fleet/phone" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
 if [ "${1:-}" = --image ]; then echo "$IMAGE"; exit 0; fi
-GPU=${1:?usage: run.sh <gpu pci address>}
+GPU=${1:?usage: run.sh <gpu pci address> <second gpu pci address>}
+GPU2=${2:?usage: run.sh <gpu pci address> <second gpu pci address>}
+[ "$GPU" != "$GPU2" ] || { echo "run.sh: the clone needs a second GPU" >&2; exit 2; }
 F=${FCVM:-./target/release/fcvm}
 SDK=$("$(dirname "$0")/sdk.sh" --sdk-path)
 APK=$(ANDROID_SDK="$SDK" "$(dirname "$0")/sdk.sh" --probe-path)
 WORK=$(dirname "$APK")
 EMU=$("$(dirname "$0")/emulator.sh" --path)
 NAME=phone-test-$$
+TAG=phone-test-$$-warm
 [ -f "$APK" ] || { echo "run.sh: run scripts/phone/sdk.sh first" >&2; exit 2; }
 [ -x "$EMU/emulator" ] || { echo "run.sh: run scripts/phone/emulator.sh first" >&2; exit 2; }
 [ "$(cat /sys/module/kvm_intel/parameters/nested 2>/dev/null)" = Y ] || { echo "run.sh: the host's kvm_intel needs nested=1" >&2; exit 2; }
@@ -43,17 +52,28 @@ fail=0
 ok() { echo "ok   $*"; }
 bad() { echo "FAIL $*"; fail=1; }
 runner=""
+clone=""
+snapshot_dir=""
 stop_runner() {
-  [ -n "$runner" ] || return 0
-  kill -TERM "$runner" 2>/dev/null || true
-  wait "$runner" 2>/dev/null || true
+  local r
+  for r in "$clone" "$runner"; do
+    [ -n "$r" ] || continue
+    kill -TERM "$r" 2>/dev/null || true
+    wait "$r" 2>/dev/null || true
+  done
   runner=""
+  clone=""
+  # The warm snapshot is this run's alone (its tag names the run).
+  if [ -n "$snapshot_dir" ]; then
+    rm -rf "$snapshot_dir" "$snapshot_dir.lock"
+    snapshot_dir=""
+  fi
 }
 trap stop_runner EXIT
 trap 'exit 130' INT TERM
 t0=$(date +%s%3N)
 "$F" podman run --name "$NAME" --kernel-profile "${PHONE_PROFILE:-phone}" --gpu "$GPU" --privileged --cpu 6 --mem 6144 \
-  --map "$SDK:/sdk:ro" --map "$WORK:/work:ro" --map "$EMU:/emu:ro" \
+  --portable-volumes --map "$SDK:/sdk:ro" --map "$WORK:/work:ro" --map "$EMU:/emu:ro" \
   "$IMAGE" > "$LOGS/vm.log" 2>&1 < /dev/null &
 runner=$!
 pid=""
@@ -99,6 +119,53 @@ in_place_release_and_retake() {
     || bad "the app does not draw 30 fps after the retake: lowest '${fps:-none}'"
 }
 
+warm_snapshot_onto_the_second_gpu() {
+  local source_uuid fps cpid click ack first clone_uuid holds renderer
+  source_uuid=$(X /usr/bin/nvidia-smi --query-gpu=uuid --format=csv,noheader 2>&1 | head -1)
+  local started=$(date +%s%3N)
+  if ! "$F" snapshot create --pid "$pid" --tag "$TAG" --gpu-warm > "$LOGS/snapshot.log" 2>&1; then
+    bad "the warm snapshot of the running phone failed: $(grep -a -m1 -E 'Error|error' "$LOGS/snapshot.log") (log $LOGS/snapshot.log)"
+    return
+  fi
+  snapshot_dir=$(grep -a -o -E "/[^ \",]*/snapshots/$TAG" "$LOGS/snapshot.log" | head -1)
+  ok "a warm snapshot of the running phone in $(( $(date +%s%3N) - started )) ms"
+  fps=$(lowest_fps "$pid")
+  at_least_30 "$fps" && ok "the source phone draws after the snapshot: lowest fps sample $fps" \
+    || bad "the source phone does not draw 30 fps after the snapshot: lowest '${fps:-none}'"
+  click=$(date +%s%3N)
+  "$F" snapshot run --snapshot "$TAG" --gpu "$GPU2" --name "$NAME-clone" > "$LOGS/clone.log" 2>&1 < /dev/null &
+  clone=$!
+  cpid=""
+  for _ in $(seq 1 1200); do
+    cpid=$("$F" ls --json 2>/dev/null | jq -r --arg n "$NAME-clone" '.[] | select(.name == $n and .health_status == "healthy") | .pid' | head -1)
+    [ -n "$cpid" ] && break
+    kill -0 "$clone" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [ -z "$cpid" ]; then
+    bad "the clone on $GPU2 never became healthy (log $LOGS/clone.log)"
+    return
+  fi
+  ack=$(grep -a -m1 '"ack_ms"' "$LOGS/clone.log" || true)
+  # The hook waited for the phone's first frame on the clone's GPU before the restore was
+  # acknowledged; the clone's clock was stepped to the host's at restore.
+  first=$("$F" exec --pid "$cpid" -- sh -c 'grep -o "first_frame_at_ms=[0-9]*" /tmp/gpu-hook.log | tail -1 | cut -d= -f2' 2>/dev/null || true)
+  echo "flow B: click to the app's first frame on the clone's GPU $(( ${first:-0} - click )) ms; restore ack_ms=$(jq -r '.ack_ms' <<< "$ack") gpu_ms=$(jq -r '.guest_phases.gpu_ms' <<< "$ack")"
+  [ -n "$first" ] && [ "$first" -ge "$click" ] && ok "the clone's phone posted a frame on its GPU before the restore was acknowledged" \
+    || bad "the clone's GPU hook recorded no first frame after the restore"
+  clone_uuid=$("$F" exec --pid "$cpid" -- /usr/bin/nvidia-smi --query-gpu=uuid --format=csv,noheader 2>&1 | head -1)
+  [ -n "$clone_uuid" ] && [ "$clone_uuid" != "$source_uuid" ] && ok "the clone has another GPU ($clone_uuid, the source $source_uuid)" \
+    || bad "the clone's GPU '$clone_uuid' is not another GPU than the source's '$source_uuid'"
+  holds=$("$F" exec --pid "$cpid" -- /usr/local/bin/phone.sh holds 2>&1 || true)
+  [[ "$holds" =~ ^fds=[1-9] ]] && ok "the clone's emulator holds its GPU: $holds" || bad "the clone's emulator does not hold its GPU: $holds"
+  renderer=$("$F" exec --pid "$cpid" -- /usr/local/bin/phone.sh renderer 2>&1 || true)
+  [[ "$renderer" == *"$gpu_name"* ]] && ok "the clone's SurfaceFlinger: $renderer" || bad "the clone's SurfaceFlinger does not render on '$gpu_name': $renderer"
+  fps=$(lowest_fps "$cpid")
+  at_least_30 "$fps" && ok "the app draws on the clone's GPU: lowest fps sample $fps" \
+    || bad "the app does not draw 30 fps on the clone's GPU: lowest '${fps:-none}'"
+  "$F" exec --pid "$cpid" -- /usr/local/bin/phone.sh stop > /dev/null 2>&1 || true
+}
+
 if boot=$(timeout 400 "$F" exec --pid "$pid" -- /usr/local/bin/phone.sh boot 2>&1); then
   ok "Android booted with the host GPU: $boot"
   renderer=$(X /usr/local/bin/phone.sh renderer 2>&1 || true)
@@ -111,6 +178,7 @@ if boot=$(timeout 400 "$F" exec --pid "$pid" -- /usr/local/bin/phone.sh boot 2>&
   python3 -c 'import sys; sys.exit(0 if sys.argv[1] and float(sys.argv[1]) >= 30 else 1)' "${fps:-}" \
     && ok "the app draws: lowest of its last 8 fps samples $fps" || bad "the app does not draw 30 fps: lowest '${fps:-none}' (log $LOGS/probe.log)"
   in_place_release_and_retake
+  warm_snapshot_onto_the_second_gpu
 else
   bad "Android did not boot: $boot"
   X sh -c 'grep -aE "ERROR|FATAL" /tmp/emulator.log | head -20' || true
