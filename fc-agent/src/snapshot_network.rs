@@ -2176,7 +2176,23 @@ fn hook_eligibility(inspect: &BoundedOutput) -> HookEligibility {
 
 /// How long the container-state read may take. A read that does not finish in
 /// time fails the restore closed, like any other inspect failure.
-const HOOK_INSPECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+///
+/// The read runs at the moment a restored guest is busiest. In restores of a
+/// 128 GiB www guest that is busy at snapshot time (32 vCPUs, load 107 to 128,
+/// 2 to 5 percent idle, about half of the busy time in the guest kernel),
+/// `podman inspect` started as the hook's read would start took 27.4 s alone and
+/// 12.0 to 23.0 s while other reads and probes ran beside it, against 0.1 to
+/// 0.4 s once the guest had settled; the 10 s budget this replaced failed every such restore
+/// closed. The time is not mostly run-queue wait a priority could buy back: the
+/// inspect used 3.6 to 9.3 s of CPU itself, three quarters of it in the kernel,
+/// and `nice -n -20` took reads that ran side by side from 15 to 19 s only to 12
+/// to 14 s. The budget is a little over twice the slowest read.
+const HOOK_INSPECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The slowest container-state read measured in a restored guest (see
+/// `HOOK_INSPECT_BUDGET`), monotonic time from spawn to exit.
+#[cfg(test)]
+const SLOWEST_RESTORE_TIME_INSPECT: std::time::Duration = std::time::Duration::from_millis(27_420);
 
 impl ContainerRestoreHook {
     fn inspect_argv() -> Vec<String> {
@@ -4605,6 +4621,21 @@ mod tests {
             argv.windows(3)
                 .any(|w| w == ["inspect", "--format", "{{.State.Running}}"]),
             "the hook does not read the container's state: {argv:?}"
+        );
+    }
+
+    /// The container-state read gets at least twice the slowest read measured in
+    /// a restored guest, so a guest that is busy at restore is not failed closed
+    /// for a read that was going to answer.
+    ///
+    /// RED BEFORE THE FIX: the budget was 10 s, and the first read after a
+    /// restore of a busy 128 GiB guest took 27.4 s.
+    #[test]
+    fn the_inspect_budget_outlasts_a_busy_restored_guests_read() {
+        assert!(
+            HOOK_INSPECT_BUDGET >= SLOWEST_RESTORE_TIME_INSPECT * 2,
+            "inspect budget {HOOK_INSPECT_BUDGET:?} is less than twice the slowest \
+             measured read ({SLOWEST_RESTORE_TIME_INSPECT:?})"
         );
     }
 
