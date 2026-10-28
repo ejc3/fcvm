@@ -41,6 +41,8 @@ data class SceneInput(
     val rectFromFrame: Long? = null,
     /** Walking time frozen by moves no longer listed (the phone's own, pruned; not on the wire). */
     val walkOffset: Double = 0.0,
+    /** The end of the last pruned move window: frames before it are refused (not on the wire). */
+    val walkOffsetFrom: Double = Double.NEGATIVE_INFINITY,
 ) {
     /** The rect frame `t` is drawn with: `previous_rect` before `rect_from_frame` (on the 1/30 s grid). */
     fun rectAt(t: Double): Rect {

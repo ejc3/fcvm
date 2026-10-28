@@ -115,6 +115,11 @@ class SceneTest {
         for (dt in listOf(0.0, 3.0, 9.5, 30.0)) {
             assertEquals("walking clock at t=${now + dt}", frame(full, now + dt).walkT, frame(pruned, now + dt).walkT, 1e-3f)
         }
+        // a frame from before the pruned windows ended cannot be drawn exactly, so it is refused
+        val (_, _, until) = FrameState.pruneMoves(moves, emptyList(), now, 64)
+        val dated = pruned.copy(walkOffsetFrom = until)
+        assertEquals(frame(full, now).walkT, frame(dated, now).walkT, 1e-3f)
+        try { frame(dated, 5.0); fail("drew t=5 after the moves before it were pruned") } catch (e: IllegalArgumentException) { /* refused */ }
         // a window still running, or shared with a scene move, is not pruned
         assertEquals(66, FrameState.pruneMoves(moves.take(66), emptyList(), 15.0, 64).first.size)
         assertEquals(66, FrameState.pruneMoves(moves.take(66), listOf(Move(12.0, MoveKind.DANCE)), now, 64).first.size)

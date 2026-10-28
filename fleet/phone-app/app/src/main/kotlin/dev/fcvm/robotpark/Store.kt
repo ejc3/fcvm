@@ -13,10 +13,11 @@ import dev.fcvm.robotpark.scene.SceneInput
 object Store {
     @Volatile var scene: SceneInput = SceneInput()
     /**
-     * dance and wave actions taken on this phone (the coordinator's own are in the scene), and
-     * the walking time frozen by those pruned from the list, swapped as one value.
+     * dance and wave actions taken on this phone (the coordinator's own are in the scene), the
+     * walking time frozen by those pruned from the list, and the end of the last pruned window,
+     * swapped as one value.
      */
-    @Volatile var local: Pair<List<Move>, Double> = emptyList<Move>() to 0.0
+    @Volatile var local: Triple<List<Move>, Double, Double> = Triple(emptyList(), 0.0, Double.NEGATIVE_INFINITY)
     @Volatile var nightOverride: Boolean? = null
     @Volatile var systemNight = false
     @Volatile var frozenT: Double? = null
@@ -47,10 +48,10 @@ object Store {
 
     fun effectiveScene(): SceneInput {
         val s = scene
-        val (moves, offset) = local
+        val (moves, offset, from) = local
         val night = nightOverride ?: s.night
         if (moves.isEmpty() && night == s.night && offset == 0.0) return s
-        return s.copy(moves = (s.moves + moves).sortedBy { it.t }, night = night, walkOffset = offset)
+        return s.copy(moves = (s.moves + moves).sortedBy { it.t }, night = night, walkOffset = offset, walkOffsetFrom = from)
     }
 
     /**
@@ -65,8 +66,8 @@ object Store {
 
     @Synchronized fun addMove(kind: MoveKind, t: Double) {
         val s = scene
-        val (moves, offset) = local
-        val (kept, gained) = FrameState.pruneMoves(moves + Move(t, kind), s.moves, frameTime(s), 64)
-        local = kept to offset + gained
+        val (moves, offset, from) = local
+        val (kept, gained, until) = FrameState.pruneMoves(moves + Move(t, kind), s.moves, frameTime(s), 64)
+        local = Triple(kept, offset + gained, maxOf(from, until))
     }
 }

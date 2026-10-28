@@ -67,6 +67,9 @@ class FrameState(
         fun frameIndexAt(unixMs: Long, epochUnixMs: Long): Long = Math.floorDiv((unixMs - epochUnixMs) * FPS, 1000L)
 
         fun compute(scene: SceneInput, t: Double, surfaceAspect: Double, nightDefault: Boolean): FrameState {
+            require(t >= scene.walkOffsetFrom) {
+                "t=$t is before t=${scene.walkOffsetFrom}, where this phone's own older moves were pruned; it cannot be drawn exactly"
+            }
             val aspect = scene.imageAspect ?: surfaceAspect
             val cam = CameraPath.at(scene.camera, t)
             val view = Mat.lookAt(cam.pos, cam.look, Vec3(0.0, 1.0, 0.0))
@@ -154,22 +157,25 @@ class FrameState(
          * Keeps the phone's own moves (`local`) to `max`: drops the oldest only as whole merged
          * windows that ended before `now` and hold no scene move, and returns the walking time
          * they froze, which the caller adds to [SceneInput.walkOffset] so the walking clock
-         * does not jump. A window still running or shared with a scene move is kept, so the
-         * list can stay longer than `max` until it ends.
+         * does not jump, and the end of the last window dropped ([SceneInput.walkOffsetFrom]:
+         * frames before it cannot be drawn exactly any more). A window still running or shared
+         * with a scene move is kept, so the list can stay longer than `max` until it ends.
          */
-        fun pruneMoves(local: List<Move>, scene: List<Move>, now: Double, max: Int): Pair<List<Move>, Double> {
+        fun pruneMoves(local: List<Move>, scene: List<Move>, now: Double, max: Int): Triple<List<Move>, Double, Double> {
             val sorted = local.sortedBy { it.t }
-            if (sorted.size <= max) return sorted to 0.0
+            if (sorted.size <= max) return Triple(sorted, 0.0, Double.NEGATIVE_INFINITY)
             val windows = merge((sorted + scene).map { it.t })
             var from = 0
             var gained = 0.0
+            var until = Double.NEGATIVE_INFINITY
             while (sorted.size - from > max) {
                 val w = windows.first { sorted[from].t >= it.first && sorted[from].t < it.second }
                 if (w.second > now || scene.any { it.t >= w.first && it.t < w.second }) break
                 gained += frozen(listOf(w), w.second)
+                until = w.second
                 while (from < sorted.size && sorted[from].t < w.second) from++
             }
-            return sorted.subList(from, sorted.size) to gained
+            return Triple(sorted.subList(from, sorted.size), gained, until)
         }
 
         /** Disjoint [start, end) windows covering moves that start at `starts`. */

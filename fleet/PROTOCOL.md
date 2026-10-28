@@ -1858,7 +1858,7 @@ every phone. `scripts/phone/scene-test.sh` measures it on the T4 (see "The seam 
 | `scene`, `info` | the scene tab, or the info tab: device model, Android version, the GLES renderer, vendor and version of the app's context, frames per second, uptime, the place (below), the benchmark result, and the attribution lines |
 | `rotate` | portrait to landscape or back (the surface becomes 1280 x 720). A phone turned the other way from its rect has left the wall: it draws the whole image on its own, at its own aspect, until it turns back |
 | `dark`, `light` | night or day on this phone, over the scene's `night` |
-| `dance`, `wave` | a move on this phone from `t` (default: the current frame's). For moves every phone shows together, put them in the scene's `moves` |
+| `dance`, `wave` | a move on this phone from `t` (default: the current frame's). For moves every phone shows together, put them in the scene's `moves`. The phone keeps its last 64; once older ones are dropped, `capture` and `freeze` refuse a `t` before the end of the last dropped one |
 | `benchmark` | draws the scene offscreen at 2,400, 9,600 and 38,400 robots, 30 frames each, and reports milliseconds per frame (in `status` and on the info tab) |
 | `restart` | the app exits and starts again in a new process |
 
