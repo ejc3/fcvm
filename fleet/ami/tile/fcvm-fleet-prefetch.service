@@ -17,6 +17,8 @@ ConditionPathExists=/etc/fcvm-fleet/prefetch.list
 Type=oneshot
 ExecStart=/usr/local/lib/fcvm-fleet/prefetch /etc/fcvm-fleet/prefetch.list 256 1048576
 Nice=-5
+# A oneshot never reads as active, so build.sh `trace` looks for this file to know the boot prefetched.
+ExecStartPost=/bin/sh -c ': > /run/fcvm-fleet-prefetched'
 
 [Install]
 WantedBy=sysinit.target

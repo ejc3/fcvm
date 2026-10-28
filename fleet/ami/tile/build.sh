@@ -149,7 +149,7 @@ trace)
   # from the root volume. A boot that prefetched holds the old list's pieces as well, which
   # would keep every piece on the list whether or not a boot still reads it.
   [ -s /var/log/fcvm-fleet-first-frame.log ] || { echo "trace: this boot has not served a first frame"; exit 1; }
-  [ "$(systemctl show -p ActiveEnterTimestampMonotonic --value fcvm-fleet-prefetch.service)" = 0 ] ||
+  [ ! -e /run/fcvm-fleet-prefetched ] ||
     { echo "trace: this boot ran fcvm-fleet-prefetch.service; launch from an image whose boot reads on its own, or remove the list and reboot first"; exit 1; }
   install -d /etc/fcvm-fleet
   python3 "$HERE/resident.py" /etc/fcvm-fleet/prefetch.list.new /

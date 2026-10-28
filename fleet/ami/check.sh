@@ -287,7 +287,9 @@ bake=$(sed -n '/^bake)/,/;;/p' fleet/ami/tile/build.sh)
 grep -qF '[ ! -s /etc/fcvm-fleet/prefetch.list ] && [ "${NO_PREFETCH_LIST:-}" != 1 ]' <<<"$bake" ||
   no "tile/build.sh bake does not refuse an image without a prefetch list"
 trace=$(sed -n '/^trace)/,/;;/p' fleet/ami/tile/build.sh)
-grep -qF 'ActiveEnterTimestampMonotonic --value fcvm-fleet-prefetch.service' <<<"$trace" &&
+grep -qF '[ ! -e /run/fcvm-fleet-prefetched ]' <<<"$trace" &&
+  grep -qF "ExecStartPost=/bin/sh -c ': > /run/fcvm-fleet-prefetched'" fleet/ami/tile/fcvm-fleet-prefetch.service &&
+  ! grep -q 'ActiveEnterTimestampMonotonic' <<<"$trace" &&
   grep -qF '/resident.py" /etc/fcvm-fleet/prefetch.list' <<<"$trace" ||
   no "tile/build.sh trace does not list a boot that did not prefetch with resident.py"
 # prefetch.c reads exactly the listed pieces (a piece longer than the chunk in several reads,
