@@ -421,6 +421,12 @@ async fn test_user_snapshot_from_clone_uses_parent() -> Result<()> {
             stderr.contains("staged as a subvolume snapshot of the parent"),
             "the diff was not staged from the parent's subvolume:\n{stderr}"
         );
+        // The clone's disk directory is a subvolume snapshot of the first snapshot's disk/, so the
+        // second snapshot takes its disks with one subvolume snapshot instead of a reflink.
+        assert!(
+            stderr.contains("snapshotted the VM's disk subvolume"),
+            "the clone's disks were not taken as a subvolume snapshot:\n{stderr}"
+        );
         let snapshot2_dir = snapshot_dir().join(&snapshot2_name);
         assert!(
             fcvm::storage::disk::is_btrfs_subvolume(&snapshot2_dir),
