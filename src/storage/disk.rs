@@ -231,7 +231,25 @@ pub async fn snapshot_disk_subvolume(
         clear_staging(dest).await?;
         return Ok(false);
     }
+    // An extra disk the snapshot records but the VM's disk directory does not hold would make
+    // every clone's restore fail; the reflink path reports it now instead.
+    let missing = missing_disks(dest, keep);
+    if !missing.is_empty() {
+        info!(dest = %dest.display(), missing = ?missing,
+            "the VM's disk subvolume lacks disks the snapshot records; reflinking instead");
+        clear_staging(dest).await?;
+        return Ok(false);
+    }
     Ok(true)
+}
+
+/// The disks a snapshot's disk directory `dir` must hold that it does not: `disk.raw` and `keep`.
+fn missing_disks(dir: &Path, keep: &[String]) -> Vec<String> {
+    std::iter::once("disk.raw")
+        .chain(keep.iter().map(String::as_str))
+        .filter(|name| !dir.join(name).is_file())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Stage a diff snapshot's directory as a subvolume snapshot of its parent's, keeping only
@@ -795,6 +813,18 @@ mod snapshot_dir_tests {
         clear_staging(&staging).await.unwrap();
         assert!(!staging.exists());
         clear_staging(&staging).await.unwrap();
+    }
+
+    /// A snapshot's disk directory must hold disk.raw and every extra disk it records.
+    #[test]
+    fn a_missing_extra_disk_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("disk.raw"), b"disk").unwrap();
+        std::fs::write(dir.path().join("data.raw"), b"data").unwrap();
+        let keep = ["data.raw".to_string(), "gone.raw".to_string()];
+        assert_eq!(missing_disks(dir.path(), &keep), ["gone.raw"]);
+        std::fs::remove_file(dir.path().join("disk.raw")).unwrap();
+        assert_eq!(missing_disks(dir.path(), &keep[..1]), ["disk.raw"]);
     }
 
     /// A disk directory that is not a subvolume is not snapshotted; the caller reflinks.
