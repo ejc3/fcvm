@@ -1,14 +1,16 @@
 #!/bin/bash
 # The phone inside a phone VM: an Android Emulator whose GPU rendering goes to the VM's
 # NVIDIA GPU. Runs in the fleet/phone container, which fcvm starts privileged (for
-# /dev/kvm and the bind mounts below) with the GPU's CDI devices, the SDK mapped at /sdk
-# and the test's files at /work. scripts/phone/run.sh drives it:
+# /dev/kvm and the bind mounts below) with the GPU's CDI devices, the system image and adb
+# built from AOSP source mapped at /android (scripts/phone/aosp.sh) and the test's files at
+# /work. scripts/phone/run.sh drives it:
 #
 #   phone.sh boot            cold boot; prints boot_completed_ms
 #   phone.sh renderer        prints the GLES renderer SurfaceFlinger composes with
 #   phone.sh probe secs apk  installs and starts the probe app, prints its log lines
 #   phone.sh draws secs      the probe app's log lines over the next secs seconds
 #   phone.sh holds           the emulator's /dev/nvidia* descriptors and mappings
+#   phone.sh bugreports      how many bug reports the system has asked for since boot
 #   phone.sh app apk         installs and starts Robot Park (fleet/phone-app), forwards
 #                            127.0.0.1:7070 in this container to its control socket, and waits
 #                            for its first frame; prints its renderer line
@@ -18,14 +20,16 @@
 #   phone.sh applog          the app's log lines so far
 #   phone.sh stop
 set -euo pipefail
-export ANDROID_SDK_ROOT=/sdk ANDROID_HOME=/sdk ANDROID_AVD_HOME=/root/.android/avd
+# The emulator finds the system image under ANDROID_SDK_ROOT; nothing in it is from the SDK.
+export ANDROID_SDK_ROOT=/android ANDROID_HOME=/android ANDROID_AVD_HOME=/root/.android/avd
 # gfxstream's EGL-on-EGL engine: the host side renders through EGL (NVIDIA's, through glvnd)
 # with no X display. Without it the emulator's "host" mode on Linux opens GLX and fails
 # headless ("GlxEngine getDefaultDisplay: Failed to open display").
 export ANDROID_EGL_ON_EGL=1
-ADB=/sdk/platform-tools/adb
-# The emulator built from source (scripts/phone/emulator.sh), mapped at /emu: the SDK's may
-# not be modified, and the phone needs the console's gpu release and gpu retake.
+# scripts/phone/test-phone-sh.sh points PHONE_ADB at a stub.
+ADB=${PHONE_ADB:-/android/platform-tools/adb}
+# The emulator built from source (scripts/phone/emulator.sh), mapped at /emu: the phone needs
+# the console's gpu release and gpu retake.
 EMU_DIR=${EMU_DIR:-/emu}
 EMU=$EMU_DIR/emulator
 CTL_PORT=7070
@@ -72,8 +76,12 @@ boot)
   use_system_egl
   "$ADB" start-server > /dev/null 2>&1
   t0=$(ms)
+  # -feature -Uwb: the AOSP image turns UWB on (its advancedFeatures.ini), and without an
+  # emulated UWB peer the guest's UWB stack reports a device error at boot, which makes
+  # system_server take a full bug report (dumpstate at 100% of a core for about 30 s, the
+  # app's frames dropping under 30 a second).
   setsid "$EMU" -avd phone -no-window -no-audio -no-boot-anim -gpu host -accel on \
-    -no-snapshot-load -verbose > /tmp/emulator.log 2>&1 < /dev/null &
+    -no-snapshot-load -feature -Uwb -verbose > /tmp/emulator.log 2>&1 < /dev/null &
   echo $! > /tmp/emulator.pid
   timeout "${BOOT_TIMEOUT:-300}" "$ADB" wait-for-device
   until [ "$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; do
@@ -102,6 +110,11 @@ holds)
   q=$(pgrep -f qemu-system-x86_64 | head -1)
   [ -n "$q" ] || { echo "no emulator running"; exit 1; }
   echo "fds=$(find /proc/"$q"/fd -lname '/dev/nvidia*' 2> /dev/null | wc -l) mappings=$(grep -c /dev/nvidia /proc/"$q"/maps || true)"
+  ;;
+bugreports)
+  # A log that cannot be read fails; a log with no bug report prints 0.
+  log=$("$ADB" logcat -d -b events) || { echo "phone.sh: adb could not read the events log" >&2; exit 1; }
+  tr -d '\r' <<< "$log" | grep -c 'BugreportRequestedReceiver' || true
   ;;
 app)
   # a fresh install: another build host signs with another debug key
@@ -141,7 +154,7 @@ stop)
   "$ADB" emu kill > /dev/null 2>&1 || true
   ;;
 *)
-  echo "usage: phone.sh boot|renderer|probe secs apk|draws secs|holds|app apk|ctl json|pull path dest|shot dest.png|applog|stop" >&2
+  echo "usage: phone.sh boot|renderer|probe secs apk|draws secs|holds|bugreports|app apk|ctl json|pull path dest|shot dest.png|applog|stop" >&2
   exit 2
   ;;
 esac

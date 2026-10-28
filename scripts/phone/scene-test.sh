@@ -19,7 +19,7 @@ F=$1 PID=$2 APK=$3 OUT=$4 GPU_NAME=$5
 IN=${OUT_IN:-/out}
 HERE=$(cd "$(dirname "$0")" && pwd)
 X() { timeout "${XTIMEOUT:-120}" "$F" exec --pid "$PID" -- "$@"; }
-A() { X /sdk/platform-tools/adb "$@"; }
+A() { X /android/platform-tools/adb "$@"; }
 C() { X /usr/local/bin/phone.sh ctl "$1"; }
 fail=0
 ok() { echo "ok   $*"; }

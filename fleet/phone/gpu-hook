@@ -18,7 +18,7 @@
 # also appended to /tmp/gpu-hook.log.
 set -euo pipefail
 # The test (scripts/phone/test-gpu-hook.sh) points these at stubs.
-ADB=${GPU_HOOK_ADB:-/sdk/platform-tools/adb}
+ADB=${GPU_HOOK_ADB:-/android/platform-tools/adb}
 STATE=${GPU_HOOK_STATE:-/tmp}
 exec > >(tee -a "$STATE/gpu-hook.log") 2>&1
 ms() { date +%s%3N; }

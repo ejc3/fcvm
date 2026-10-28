@@ -270,7 +270,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	_test-unit _test-agent-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
-	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu setup-phone phone-emulator phone-test phone-app-test gpu-residue-test gpu-routed-test setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
+	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu setup-phone phone-emulator phone-system-image phone-test phone-app-test gpu-residue-test gpu-routed-test setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-computesdk bench-gpu-restore test-gpu-restore test-computesdk bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
 	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-chromium-corpus-extra bench-stop \
@@ -322,6 +322,7 @@ help:
 	@echo "  setup-gpu          Build the gpu profile kernel and NVIDIA driver image"
 	@echo "  setup-phone        Build the phone profile (gpu + KVM) kernel, Firecracker and driver image"
 	@echo "  phone-emulator     Build the Android Emulator from source for the phone (about 25 min once)"
+	@echo "  phone-system-image Build the phone's Android system image and tools from AOSP source (x86_64 host)"
 	@echo "  phone-test         A phone VM renders on the GPU and moves to GPU2 by warm snapshot (GPU=, GPU2=)"
 	@echo "  phone-app-test     Robot Park's scene unit tests and shader check (fleet/phone-app)"
 	@echo "  gpu-residue-test   GPU memory residue between VMs (GPU=<pci address>)"
@@ -913,19 +914,29 @@ setup-phone: build setup-btrfs
 phone-emulator:
 	./scripts/phone/emulator.sh
 
+# The phone's Android 15 system image and the tools the phone test uses (adb, and what
+# builds the probe app), built from AOSP source (scripts/phone/aosp-build.sh) into
+# /mnt/fcvm-btrfs/aosp-build/<id>/dist. Runs only on an x86_64 host and needs about 400 GB
+# free. scripts/phone/aosp.sh fetches the published build by its pinned checksums.
+phone-system-image:
+	./scripts/phone/aosp-build.sh
+
 # A phone VM renders on its GPU and survives a warm snapshot onto a second GPU
 # (scripts/phone/run.sh): KVM works in the restored VM, an Android Emulator built from source
-# boots with -gpu host, SurfaceFlinger and an app render on the GPU, the running phone
-# releases the GPU and takes it up again, and a clone of its warm snapshot runs the app on
-# GPU2. Fetches the pinned SDK first (scripts/phone/sdk.sh), which needs
-# ACCEPT_ANDROID_SDK_LICENSE=1, and builds the emulator and Robot Park (scripts/phone/app.sh),
-# which then draws seamless tiles, survives surface loss and takes its actions
-# (scripts/phone/scene-test.sh).
+# boots the AOSP-built system image with -gpu host, SurfaceFlinger and an app render on the
+# GPU, the running phone releases the GPU and takes it up again, and a clone of its warm
+# snapshot runs the app on GPU2. Fetches the pinned system image and tools first
+# (scripts/phone/aosp.sh), builds the emulator, and builds Robot Park (scripts/phone/app.sh)
+# against the SDK's API 35 platform (scripts/phone/sdk.sh, which needs
+# ACCEPT_ANDROID_SDK_LICENSE=1), which then draws seamless tiles, survives surface loss and
+# takes its actions (scripts/phone/scene-test.sh).
 phone-test: private SHELL := $(TARGET_LEASE_SHELL)
 phone-test: $(if $(strip $(GPU)),setup-phone phone-emulator)
 	@test -n "$(GPU)" && test -n "$(GPU2)" || { echo "usage: make phone-test GPU=<pci address> GPU2=<another pci address> ACCEPT_ANDROID_SDK_LICENSE=1" >&2; exit 2; }
-	./scripts/phone/test-sdk-lock.sh
+	./scripts/phone/test-aosp-lock.sh
 	./scripts/phone/test-gpu-hook.sh
+	./scripts/phone/test-phone-sh.sh
+	./scripts/phone/aosp.sh
 	ACCEPT_ANDROID_SDK_LICENSE="$(ACCEPT_ANDROID_SDK_LICENSE)" ./scripts/phone/sdk.sh
 	./scripts/phone/app.sh > /dev/null
 	FCVM=./target/release/fcvm ./scripts/phone/run.sh "$(GPU)" "$(GPU2)"

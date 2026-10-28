@@ -1,6 +1,7 @@
-# The phone container: runs the Android Emulator from an SDK mapped at /sdk, rendering on
-# the VM's NVIDIA GPU (fcvm passes the GPU in as CDI devices, which mount the driver's
-# libraries). scripts/phone/run.sh builds and runs it.
+# The phone container: runs the Android Emulator (mapped at /emu) on the system image and adb
+# built from AOSP source (mapped at /android), rendering on the VM's NVIDIA GPU (fcvm passes
+# the GPU in as CDI devices, which mount the driver's libraries). scripts/phone/run.sh builds
+# and runs it.
 FROM docker.io/library/ubuntu:24.04 AS kvmprobe
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc libc6-dev linux-libc-dev \
     && rm -rf /var/lib/apt/lists/*

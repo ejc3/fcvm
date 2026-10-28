@@ -7,7 +7,8 @@
 #      a restored guest keeps its nested virtualization state only with the phone profile's
 #      Firecracker (KVM_GET/SET_NESTED_STATE; with the gpu profile's commit the guest's
 #      kvm_intel oopses in kvm_spurious_fault and the probe dies);
-#   2. Android boots (sys.boot_completed) with -gpu host;
+#   2. Android boots (sys.boot_completed) with -gpu host, and the system asks for no bug
+#      report (one, which a failing device such as UWB triggers, takes a core for ~30 s);
 #   3. SurfaceFlinger composes with GLES on that GPU: its renderer names the GPU nvidia-smi
 #      reports in the VM;
 #   4. an app (fleet/phone/probe) gets a GLES 3 context on that GPU and draws: its renderer
@@ -29,8 +30,9 @@
 # `run.sh --image` prints the image tag it builds: fleet/phone's contents name it, so
 # concurrent runs from checkouts with other sources never replace each other's image.
 # Needs two GPUs on vfio-pci, the phone profile set up (make setup-phone), the host's
-# kvm_intel loaded with nested=1, the SDK and probe app from scripts/phone/sdk.sh, the
-# emulator from scripts/phone/emulator.sh and Robot Park from scripts/phone/app.sh.
+# kvm_intel loaded with nested=1, the system image, adb and probe app from
+# scripts/phone/aosp.sh, the emulator from scripts/phone/emulator.sh and Robot Park from
+# scripts/phone/app.sh.
 set -euo pipefail
 SRC=$(cd "$(dirname "$0")/../.." && pwd)
 IMAGE=localhost/fcvm-phone:$(cd "$SRC/fleet/phone" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
@@ -39,14 +41,14 @@ GPU=${1:?usage: run.sh <gpu pci address> <second gpu pci address>}
 GPU2=${2:?usage: run.sh <gpu pci address> <second gpu pci address>}
 [ "$GPU" != "$GPU2" ] || { echo "run.sh: the clone needs a second GPU" >&2; exit 2; }
 F=${FCVM:-./target/release/fcvm}
-SDK=$("$(dirname "$0")/sdk.sh" --sdk-path)
-APK=$(ANDROID_SDK="$SDK" "$(dirname "$0")/sdk.sh" --probe-path)
+AOSP=$("$(dirname "$0")/aosp.sh" --root-path)
+APK=$(ANDROID_AOSP="$AOSP" "$(dirname "$0")/aosp.sh" --probe-path)
 APP=$("$(dirname "$0")/app.sh" --apk-path)
 WORK=$(dirname "$APK")
 EMU=$("$(dirname "$0")/emulator.sh" --path)
 NAME=phone-test-$$
 TAG=phone-test-$$-warm
-[ -f "$APK" ] || { echo "run.sh: run scripts/phone/sdk.sh first" >&2; exit 2; }
+[ -f "$APK" ] || { echo "run.sh: run scripts/phone/aosp.sh first" >&2; exit 2; }
 [ -x "$EMU/emulator" ] || { echo "run.sh: run scripts/phone/emulator.sh first" >&2; exit 2; }
 [ -f "$APP" ] && [ "$(dirname "$APP")" = "$WORK" ] || { echo "run.sh: run scripts/phone/app.sh first" >&2; exit 2; }
 [ "$(cat /sys/module/kvm_intel/parameters/nested 2>/dev/null)" = Y ] || { echo "run.sh: the host's kvm_intel needs nested=1" >&2; exit 2; }
@@ -78,7 +80,7 @@ trap stop_runner EXIT
 trap 'exit 130' INT TERM
 t0=$(date +%s%3N)
 "$F" podman run --name "$NAME" --kernel-profile "${PHONE_PROFILE:-phone}" --gpu "$GPU" --privileged --cpu 6 --mem 6144 \
-  --portable-volumes --map "$SDK:/sdk:ro" --map "$WORK:/work:ro" --map "$EMU:/emu:ro" --map "$LOGS/out:/out" \
+  --portable-volumes --map "$AOSP:/android:ro" --map "$WORK:/work:ro" --map "$EMU:/emu:ro" --map "$LOGS/out:/out" \
   "$IMAGE" > "$LOGS/vm.log" 2>&1 < /dev/null &
 runner=$!
 pid=""
@@ -182,6 +184,8 @@ if boot=$(timeout 400 "$F" exec --pid "$pid" -- /usr/local/bin/phone.sh boot 2>&
   fps=$(grep -o 'fps=[0-9.]*' <<< "$out" | tail -8 | cut -d= -f2 | sort -n | head -1)
   python3 -c 'import sys; sys.exit(0 if sys.argv[1] and float(sys.argv[1]) >= 30 else 1)' "${fps:-}" \
     && ok "the app draws: lowest of its last 8 fps samples $fps" || bad "the app does not draw 30 fps: lowest '${fps:-none}' (log $LOGS/probe.log)"
+  reports=$(X /usr/local/bin/phone.sh bugreports 2>&1 || true)
+  [ "$reports" = 0 ] && ok "the system asked for no bug report" || bad "the system asked for a bug report: '$reports' (a device failed at boot; logcat -b events)"
   in_place_release_and_retake
   warm_snapshot_onto_the_second_gpu
   "$(dirname "$0")/scene-test.sh" "$F" "$pid" "/work/$(basename "$APP")" "$LOGS/out" "$gpu_name" || fail=1
