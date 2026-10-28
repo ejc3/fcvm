@@ -187,6 +187,34 @@ class SceneTest {
         assertFalse(Json.write(mapOf("n" to 2.0)).contains("2.0"))
     }
 
+    private fun appSource(name: String) = File(System.getProperty("appSrcDir") ?: error("appSrcDir is not set"), name).readText()
+
+    /**
+     * A frame's time comes from the same scene snapshot as the frame: reading Store.scene again
+     * for the epoch could pair one scene's inputs with another's clock when a scene arrives
+     * between the two reads. Pinned on the source, since the interleaving needs Android.
+     */
+    @Test fun frameTimeComesFromTheFramesOwnSceneSnapshot() {
+        assertTrue("Store.frameTime takes the snapshot", Regex("""fun frameTime\(scene: SceneInput\)""").containsMatchIn(appSource("Store.kt")))
+        for (f in listOf("GlThread.kt", "PhoneApp.kt", "MainActivity.kt", "SceneRenderer.kt")) {
+            assertFalse("$f reads the time without a snapshot", appSource(f).contains("frameTime()"))
+        }
+    }
+
+    /**
+     * A queued task (a capture, a context drop, the benchmark) leaves the queue only once a
+     * context is current, so a context that cannot be made current delays it instead of
+     * dropping it (a dropped benchmark left benchmarkRunning set for good).
+     */
+    @Test fun queuedTasksLeaveTheQueueOnlyWithACurrentContext() {
+        val src = appSource("GlThread.kt")
+        val loop = src.substring(src.indexOf("private fun loop()"), src.indexOf("private fun frame("))
+        val take = loop.indexOf("tasks.removeFirstOrNull()")
+        assertTrue("the loop takes tasks", take >= 0)
+        assertTrue("a task is taken only after makeCurrent succeeds", loop.lastIndexOf("makeCurrent(", take) in 0 until take)
+        assertEquals("the loop takes a task in one place", take, loop.lastIndexOf("tasks.removeFirstOrNull()"))
+    }
+
     /** Every program the app links compiles as GLSL ES 3.00 (glslangValidator, in the build container). */
     @Test fun shadersCompile() {
         val dir = File(System.getProperty("shaderDir") ?: error("shaderDir is not set"))

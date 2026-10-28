@@ -110,7 +110,8 @@ class GlThread(private val context: Context) : Thread("robotpark-gl") {
         synchronized(lock) {
             tasks.addLast {
                 try {
-                    Store.benchmark = renderer?.benchmark(Store.effectiveScene(), Store.frameTime(),
+                    val scene = Store.effectiveScene()
+                    Store.benchmark = renderer?.benchmark(scene, Store.frameTime(scene),
                         if (Store.surfaceW > 0) Store.surfaceW else 720, if (Store.surfaceH > 0) Store.surfaceH else 1280)
                 } finally {
                     Store.benchmarkRunning = false
@@ -135,7 +136,7 @@ class GlThread(private val context: Context) : Thread("robotpark-gl") {
 
     private fun loop() {
         while (true) {
-            var task: (() -> Unit)? = null
+            var hasTask: Boolean
             var want: Surface?
             var w: Int
             var h: Int
@@ -144,17 +145,18 @@ class GlThread(private val context: Context) : Thread("robotpark-gl") {
             synchronized(lock) {
                 while (true) {
                     if (quit) return
-                    task = tasks.removeFirstOrNull()
+                    hasTask = tasks.isNotEmpty()
                     draw = window != null && !paused
-                    if (task != null || draw || windowGen != boundGen) break
+                    if (hasTask || draw || windowGen != boundGen) break
                     lock.wait()
                 }
                 want = window; w = windowW; h = windowH; gen = windowGen
             }
             if (!ensureContext()) { SystemClock.sleep(500); continue }
             if (gen != boundGen) rebind(want, gen)
-            if (task != null) {
-                if (makeCurrent(if (win != EGL14.EGL_NO_SURFACE) win else pbuffer)) task!!()
+            if (hasTask) {
+                // a task leaves the queue only with a current context: a lost one delays it
+                if (makeCurrent(if (win != EGL14.EGL_NO_SURFACE) win else pbuffer)) synchronized(lock) { tasks.removeFirstOrNull() }?.invoke()
                 continue
             }
             if (draw && win != EGL14.EGL_NO_SURFACE) frame(w, h)
@@ -167,7 +169,7 @@ class GlThread(private val context: Context) : Thread("robotpark-gl") {
         val r = renderer ?: return
         val t0 = SystemClock.elapsedRealtimeNanos()
         val scene = Store.effectiveScene()
-        val t = Store.frameTime()
+        val t = Store.frameTime(scene)
         val (rect, aspect) = scene.viewAt(t, w, h)
         val tile = Tile.of(rect, aspect, w, h)
         val fs = FrameState.compute(scene.copy(imageAspect = aspect), t, w.toDouble() / h, Store.systemNight)

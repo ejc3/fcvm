@@ -50,8 +50,11 @@ object Store {
         return s.copy(moves = (s.moves + local).sortedBy { it.t }, night = night)
     }
 
-    /** The scene time of the frame due now: the 1/60 s grid every phone draws on, or the frozen t. */
-    fun frameTime(): Double {
+    /**
+     * The scene time of the frame due now: the 1/60 s grid every phone draws on, or the frozen t.
+     * It takes the scene snapshot the frame draws, so the two never come from different scenes.
+     */
+    fun frameTime(scene: SceneInput): Double {
         frozenT?.let { return it }
         val k = FrameState.frameIndexAt(System.currentTimeMillis() + clockOffsetMs, scene.epochUnixMs)
         return k.toDouble() / FrameState.FPS

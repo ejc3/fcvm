@@ -76,28 +76,32 @@ else
 fi
 echo "$seam" > "$OUT/seam/report.json"
 
-# Surface loss: home destroys the surface, coming back creates a new one.
-f0=$(field .frames "$(status)")
+# Surface loss: home destroys the surface, coming back creates a new one. Drawing is judged by
+# frames counted between two status samples taken after the change (fps alone keeps its last
+# value when drawing stops).
+drawn() { # frames drawn over 2 s, now
+  local a b
+  a=$(field .frames "$(status)"); sleep 2; b=$(field .frames "$(status)")
+  echo $(( ${b:-0} - ${a:-0} ))
+}
 A shell input keyevent KEYCODE_HOME
 sleep 2
 A shell am start -n dev.fcvm.robotpark/.MainActivity > /dev/null 2>&1
-sleep 4
-s=$(status); f1=$(field .frames "$s")
-if [ "${f1:-0}" -gt "${f0:-0}" ] && python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= 30 else 1)' "$(field .fps "$s")"; then
-  ok "after the surface was destroyed and created again it draws at $(field .fps "$s") fps"
-else
-  bad "no frames after the surface came back: $s"
-fi
-g0=$(field .context_generation "$s")
-r=$(C '{"type":"drop_context"}')
 sleep 3
+n=$(drawn)
+[ "$n" -ge 60 ] && ok "after the surface was destroyed and created again it drew $n frames in 2 s" \
+  || bad "after the surface came back it drew $n frames in 2 s: $(status)"
+g0=$(field .context_generation "$(status)")
+r=$(C '{"type":"drop_context"}')
+sleep 1
+n=$(drawn)
 s=$(status)
 again2=$(capture "left-12-recreated" 12 0 0.5 720)
-if [ "$(field .context_generation "$s")" = $(( g0 + 1 )) ] && python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= 30 else 1)' "$(field .fps "$s")" \
+if [ "$(field .context_generation "$s")" = $(( g0 + 1 )) ] && [ "$n" -ge 60 ] \
    && [ "$(field .fnv64 "$again2")" = "$(field .fnv64 "$first")" ]; then
-  ok "a torn-down and rebuilt EGL context (generation $(field .context_generation "$s")) draws at $(field .fps "$s") fps and the same pixels"
+  ok "a torn-down and rebuilt EGL context (generation $(field .context_generation "$s")) drew $n frames in 2 s and the same pixels"
 else
-  bad "context rebuild: $r; status $s; capture $(field .fnv64 "$again2") against $(field .fnv64 "$first")"
+  bad "context rebuild: $r; $n frames in 2 s; status $s; capture $(field .fnv64 "$again2") against $(field .fnv64 "$first")"
 fi
 
 # The fixed actions.
