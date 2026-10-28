@@ -138,6 +138,19 @@ class SceneTest {
         assertEquals(64, local.applyTo(before, null).moves.size)
     }
 
+    /** An action timed before the pruned history is refused: its window may already be counted. */
+    @Test fun anActionBeforeThePrunedHistoryIsRefused() {
+        val bare = scene.copy(moves = emptyList())
+        var local = LocalMoves(bare.epochUnixMs)
+        for (i in 0 until 65) local = local.add(Move(10.0 + 20.0 * i, MoveKind.DANCE), bare, 2000.0)
+        assertTrue("the first move was pruned", local.from > 10.0)
+        val offset = local.walkOffset
+        try {
+            local = local.add(Move(10.0, MoveKind.DANCE), bare, 2000.0)
+            fail("took a move at t=10 behind the pruned history (offset ${local.walkOffset}, was $offset)")
+        } catch (e: IllegalArgumentException) { /* refused */ }
+    }
+
     @Test fun cameraHoldsAreStillAndPathsAreContinuous() {
         val k = scene.camera
         assertEquals(CameraPath.at(k, 21.0), CameraPath.at(k, 29.0))

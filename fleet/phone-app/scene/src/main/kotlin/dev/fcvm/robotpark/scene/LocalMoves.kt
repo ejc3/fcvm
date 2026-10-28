@@ -15,8 +15,13 @@ data class LocalMoves(
     /** These moves in `scene`'s clock: none when the scene has another epoch, since its t restarted. */
     fun forScene(scene: SceneInput): LocalMoves = if (scene.epochUnixMs == epochUnixMs) this else LocalMoves(scene.epochUnixMs)
 
+    /**
+     * These moves with `move` added (and pruned to `max`). A move timed before the pruned
+     * history is refused: whether its window overlaps one already counted is not known any more.
+     */
     fun add(move: Move, scene: SceneInput, now: Double, max: Int = MAX): LocalMoves {
         val base = forScene(scene)
+        require(move.t >= base.from) { "t: before t=${base.from}, where this phone's own older moves were pruned" }
         val (kept, gained, until) = FrameState.pruneMoves(base.moves + move, scene.moves, now, max)
         return LocalMoves(scene.epochUnixMs, kept, base.walkOffset + gained, maxOf(base.from, until))
     }
