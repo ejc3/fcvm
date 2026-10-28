@@ -270,7 +270,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	_test-unit _test-agent-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
-	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu setup-phone phone-test gpu-residue-test gpu-routed-test setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
+	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu setup-phone phone-emulator phone-test gpu-residue-test gpu-routed-test setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-computesdk bench-gpu-restore test-gpu-restore test-computesdk bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
 	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-chromium-corpus-extra bench-stop \
@@ -321,6 +321,7 @@ help:
 	@echo "  setup-fcvm         Download kernel and create rootfs"
 	@echo "  setup-gpu          Build the gpu profile kernel and NVIDIA driver image"
 	@echo "  setup-phone        Build the phone profile (gpu + KVM) kernel, Firecracker and driver image"
+	@echo "  phone-emulator     Build the Android Emulator from source for the phone (about 25 min once)"
 	@echo "  phone-test         An Android Emulator in a phone VM renders on the GPU (GPU=<pci address>)"
 	@echo "  gpu-residue-test   GPU memory residue between VMs (GPU=<pci address>)"
 	@echo "  gpu-routed-test    A routed GPU VM and its restore hold their IPv6 address (GPU=<pci address>)"
@@ -906,13 +907,21 @@ setup-phone: private SHELL := $(TARGET_LEASE_SHELL)
 setup-phone: build setup-btrfs
 	./target/release/fcvm setup --kernel-profile phone --build-kernels --config "$(CURDIR)/rootfs-config.toml"
 
+# The Android Emulator built from source with the console's gpu release and gpu retake
+# (scripts/phone/emulator.sh): about 25 minutes the first time, then reused.
+phone-emulator:
+	./scripts/phone/emulator.sh
+
 # A phone VM renders on its GPU (scripts/phone/run.sh): KVM works in the restored VM, an
-# Android Emulator boots with -gpu host, and SurfaceFlinger and an app render on the GPU.
-# Fetches the pinned SDK first (scripts/phone/sdk.sh), which needs ACCEPT_ANDROID_SDK_LICENSE=1.
+# Android Emulator built from source boots with -gpu host, SurfaceFlinger and an app render
+# on the GPU, and the running phone releases the GPU and takes it up again. Fetches the
+# pinned SDK first (scripts/phone/sdk.sh), which needs ACCEPT_ANDROID_SDK_LICENSE=1, and
+# builds the emulator.
 phone-test: private SHELL := $(TARGET_LEASE_SHELL)
-phone-test: $(if $(strip $(GPU)),setup-phone)
+phone-test: $(if $(strip $(GPU)),setup-phone phone-emulator)
 	@test -n "$(GPU)" || { echo "usage: make phone-test GPU=<pci address> ACCEPT_ANDROID_SDK_LICENSE=1" >&2; exit 2; }
 	./scripts/phone/test-sdk-lock.sh
+	./scripts/phone/test-gpu-hook.sh
 	ACCEPT_ANDROID_SDK_LICENSE="$(ACCEPT_ANDROID_SDK_LICENSE)" ./scripts/phone/sdk.sh
 	FCVM=./target/release/fcvm ./scripts/phone/run.sh "$(GPU)"
 

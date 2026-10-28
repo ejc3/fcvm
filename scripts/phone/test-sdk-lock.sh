@@ -67,7 +67,7 @@ for s in a b; do
   done
 done
 pins=$(wc -l < "$dir/pins")
-[ "$pins" -eq 10 ] || { echo "FAIL: read $pins pins from sdk.sh, expected 5 for each of two SDKs"; exit 1; }
+[ "$pins" -eq 8 ] || { echo "FAIL: read $pins pins from sdk.sh, expected 4 for each of two SDKs"; exit 1; }
 printf '#!/bin/bash
 while [ $# -gt 0 ]; do [ "$1" = -d ] && echo "$2" >> "%s/javac-out"; shift; done
 exit 1
@@ -130,7 +130,7 @@ echo "ok   a checkout's probe app stays its own when another checkout builds"
 same=$(env -u ANDROID_SDK "$dir/B/scripts/phone/sdk.sh" --sdk-path 2>/dev/null || true)
 [ -n "$same" ] && [ "$same" = "$(env -u ANDROID_SDK "$dir/A/scripts/phone/sdk.sh" --sdk-path 2>/dev/null || true)" ] \
   || { echo "FAIL: two checkouts with the same pins use different SDK directories"; exit 1; }
-sed -i 's/b08fc43d/c08fc43d/' "$dir/B/scripts/phone/sdk.sh"
+sed -i 's/d230f138/e230f138/' "$dir/B/scripts/phone/sdk.sh"
 other=$(env -u ANDROID_SDK "$dir/B/scripts/phone/sdk.sh" --sdk-path 2>/dev/null || true)
 [ "$other" != "$same" ] || { echo "FAIL: a checkout with other pins uses the same SDK directory ($same)"; exit 1; }
 echo "ok   checkouts with other pins use another SDK directory"
