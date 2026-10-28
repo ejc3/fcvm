@@ -17,10 +17,10 @@
 set -euo pipefail
 SRC=$(cd "$(dirname "$0")/../.." && pwd)
 MANIFEST=$SRC/fleet/phone/emulator.xml
-# A versioned launcher: the unversioned .../repo is replaced by every release, so a
-# checksum of it goes stale (it had by 2026-10-28).
-REPO_URL=https://storage.googleapis.com/git-repo-downloads/repo-2.71
-REPO_SHA256=05f571deafd6ed6da0d20fa707dde29aa5624dbf35553d697a40dbdd4c8d178a
+# The repo launcher of git-repo tag v2.70, served base64 by gitiles. The unversioned download
+# (storage.googleapis.com/git-repo-downloads/repo) moved to v2.71 and stopped matching.
+REPO_URL='https://gerrit.googlesource.com/git-repo/+/refs/tags/v2.70/repo?format=TEXT'
+REPO_SHA256=6ed2f6325705b6ea0af99466d6ebd04adec387a5b6a906cd77bc8c6da65123e5
 ID=$(cat "$0" "$MANIFEST" | sha256sum | cut -c1-12)
 ROOT=${ANDROID_EMULATOR:-/mnt/fcvm-btrfs/android-emulator/$ID}
 OUT=$ROOT/emulator
@@ -39,7 +39,7 @@ LOG=$ROOT/build.log
 mkdir -p "$WORK"
 repo=$ROOT/repo
 if [ ! -x "$repo" ]; then
-  curl -fsSL -o "$repo.tmp" "$REPO_URL"
+  curl -fsSL "$REPO_URL" | base64 -d > "$repo.tmp"
   echo "$REPO_SHA256  $repo.tmp" | sha256sum -c --status \
     || { echo "emulator.sh: $REPO_URL does not have SHA-256 $REPO_SHA256" >&2; rm -f "$repo.tmp"; exit 1; }
   chmod +x "$repo.tmp" && mv "$repo.tmp" "$repo"

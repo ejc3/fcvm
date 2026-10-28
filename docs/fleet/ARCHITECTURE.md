@@ -866,8 +866,8 @@ manifest build.
 
 The kernel and its modules are the tree's prebuilt GKI build (`kernel/prebuilts/6.6/x86-64`
 and the virtual-device modules: `6.6.57-android15-8-g8b48c9979699`, Android CI build
-12748506), as the SDK's image carries the same branch's (`6.6.30-android15-8`). One difference from the SDK's image needed
-a change: this image's `advancedFeatures.ini` turns UWB on, and with no emulated UWB peer
+12748506), as the SDK's image carries the same branch's (`6.6.30-android15-8`). One
+difference from the SDK's image needed a change: this image's `advancedFeatures.ini` turns UWB on, and with no emulated UWB peer
 the guest's UWB stack reports a device error at boot (`am_wtf UwbServiceCore: Error device
 status received`), on which system_server takes a full bug report; dumpstate then holds a
 core for about 30 s, and the app's lowest fps sample after the warm snapshot read 27.9 and
@@ -912,7 +912,29 @@ Vulkan path is measured on the T4.
   counters, no random numbers that are not hashed from ids and `t`. Every phone runs the same
   GPU and driver. A seam test, like the renderer's, renders adjacent rectangles and the whole
   image at one `t` and compares the shared edges.
-- **Cost.** About 1,500 lines of Java and GLSL and the seam test, two PRs.
+- **Built** as Robot Park (`fleet/phone-app`, Kotlin and GLES 3, built with Gradle in a
+  container; its control socket and scene fields are "Phone app" in `fleet/PROTOCOL.md`).
+  Every robot's pose, every particle and sign is computed on the GPU from `t` and the robot's
+  table entry. Measured on a T4 through the emulator (720 x 1280, 4x MSAA): 60 fps with 2,400
+  robots, shadows, particles and a sign; the in-app benchmark draws a frame in 4.1 to 5.7 ms
+  at 2,400 robots, 6.8 to 7.9 ms at 9,600 and 23.1 to 23.8 ms at 38,400.
+- **How the tiles stay seamless.** A phone draws the whole image into a framebuffer of the
+  whole image's size, scissored to its own part, so the GPU rasterizes the same window
+  coordinates on every phone. Moving the viewport instead (the obvious off-axis approach) left
+  10 to 116 pixels in 921,600 a level or two apart at a seam, because the GPU's attribute
+  interpolation rounds differently at other window positions, even with vertices snapped to a
+  subpixel grid. Blended particles are drawn unscissored (scissored, a few glow pixels blended
+  1 level differently), and no two particles start at one point (a leaper's coincident
+  sparkles made the same frame come out two ways from run to run). `scripts/phone/seam.py`
+  allows up to 9 pixels a tile 1 level apart for one residual it has seen in 3 of 10 runs, the same
+  pixel in a light's glow.
+- **The emulator crashes when a guest GL client exits during composition.** Emulator 37.2.12
+  logs `Failed to make display surface context current: 12290` (EGL_BAD_ACCESS) as a guest
+  process with a GLES connection exits, then calls GL with no context and dies. Seen three
+  times: after `screencap`, after the app was killed for a reinstall, and after a restart
+  that exited without releasing EGL. The app now releases EGL before it exits for a restart (5
+  of 5 restarts survived), and `make phone-test` installs onto a freshly booted phone. The
+  emulator built from source (stack PR 2) is where to fix it.
 - **Branding.** The robot may be reproduced or modified under CC BY 3.0 with Google's
   attribution line ("The Android robot is reproduced or modified from work created and shared
   by Google and used according to terms described in the Creative Commons 3.0 Attribution
@@ -975,11 +997,10 @@ adb and the emulator console listen only inside the container.
   (developer.android.com/studio/terms): 3.1 grants use "solely to develop applications for
   compatible implementations of Android"; 3.4 forbids copying except for backup, modifying,
   redistributing or creating derivative works. A public wall of phones is not app
-  development, so the phone uses nothing from the SDK, and `make phone-test` fetches nothing
-  from it (there is no `ACCEPT_ANDROID_SDK_LICENSE` gate left):
+  development, so nothing the phone runs is from the SDK:
   - the emulator (`external/qemu`, QEMU's parts under the GPL) and gfxstream (Apache 2.0)
     are built from our forks (`scripts/phone/emulator.sh`);
-  - the system image, `adb`, and the tools that build the app (`aapt2`, `d8`, `zipalign`,
+  - the system image, `adb`, and the tools that build the probe app (`aapt2`, `d8`, `zipalign`,
     `apksigner`, `android.jar`) are built from AOSP's `android-15.0.0_r36`
     (`scripts/phone/aosp-build.sh`, "The system image from AOSP source"), without Google's
     apps or services. Their components keep their own licenses and notices: the image
@@ -990,8 +1011,11 @@ adb and the emulator console listen only inside the container.
   - The archives are published as a GitHub release of this repository; its corresponding
     source is `fleet/phone/aosp.xml` (every project at a commit on
     android.googlesource.com) and, for the kernel, the release notes' kernel commit.
-  The SDK's emulator and image remain fine for developing the app on our own hosts, as the
-  spike used them; nothing in this repository fetches them.
+  - Robot Park (`fleet/phone-app`) is still compiled by Gradle against the SDK's API 35
+    platform and build-tools (`scripts/phone/sdk.sh`, which alone keeps the
+    `ACCEPT_ANDROID_SDK_LICENSE` gate). That is the use the SDK license grants, developing
+    an app, and the APK carries none of the SDK: `android.jar` is compile-only. Building it
+    against the AOSP build's own platform instead is the remaining step.
 - **The Android robot** is CC BY 3.0 with the attribution line above; "Android" and Google's
   marks follow Google's brand guidelines, as under "Branding".
 
@@ -1009,8 +1033,9 @@ adb and the emulator console listen only inside the container.
    not CUDA processes, `--gpu-warm` of a running phone, and a test that a clone's app renders
    on the clone's GPU; restore-to-first-app-frame measured ("Flow B, measured"). The VM's size
    and hugepages are next.
-4. The app's scene: the Android-themed scene, deterministic by rectangle, its info tab, the
-   action intents and surface-loss handling; the seam test.
+4. The app's scene (Robot Park, `fleet/phone-app`): the Android-themed scene, deterministic
+   by rectangle, its info tab, the action intents and socket, surface-loss handling; the seam
+   test in `make phone-test`.
 5. The phone streamer: screen capture, NVENC, FCVF frames stamped with `t`.
 6. Fleet: phone slots in the agent and coordinator (`--phones`), the phone scene fields,
    `claim_phone` and its actions, phone restore timings in the state.

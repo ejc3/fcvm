@@ -22,6 +22,8 @@
 #      nvidia-smi names a different GPU than the source's, SurfaceFlinger's renderer names
 #      it, the emulator holds it open, and the app draws 30 frames a second there. Prints the
 #      time from the restore command to the phone's first frame on the clone's GPU.
+#   7. Robot Park (fleet/phone-app), last, on the source phone: seams, surface loss and
+#      actions (scripts/phone/scene-test.sh).
 #
 #   FCVM=./target/release/fcvm scripts/phone/run.sh <gpu pci address> <second gpu pci address>
 # PHONE_PROFILE names another kernel profile to run the same checks on (default phone).
@@ -29,7 +31,8 @@
 # concurrent runs from checkouts with other sources never replace each other's image.
 # Needs two GPUs on vfio-pci, the phone profile set up (make setup-phone), the host's
 # kvm_intel loaded with nested=1, the system image, adb and probe app from
-# scripts/phone/aosp.sh and the emulator from scripts/phone/emulator.sh.
+# scripts/phone/aosp.sh, the emulator from scripts/phone/emulator.sh and Robot Park from
+# scripts/phone/app.sh.
 set -euo pipefail
 SRC=$(cd "$(dirname "$0")/../.." && pwd)
 IMAGE=localhost/fcvm-phone:$(cd "$SRC/fleet/phone" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
@@ -40,14 +43,17 @@ GPU2=${2:?usage: run.sh <gpu pci address> <second gpu pci address>}
 F=${FCVM:-./target/release/fcvm}
 AOSP=$("$(dirname "$0")/aosp.sh" --root-path)
 APK=$(ANDROID_AOSP="$AOSP" "$(dirname "$0")/aosp.sh" --probe-path)
+APP=$("$(dirname "$0")/app.sh" --apk-path)
 WORK=$(dirname "$APK")
 EMU=$("$(dirname "$0")/emulator.sh" --path)
 NAME=phone-test-$$
 TAG=phone-test-$$-warm
 [ -f "$APK" ] || { echo "run.sh: run scripts/phone/aosp.sh first" >&2; exit 2; }
 [ -x "$EMU/emulator" ] || { echo "run.sh: run scripts/phone/emulator.sh first" >&2; exit 2; }
+[ -f "$APP" ] && [ "$(dirname "$APP")" = "$WORK" ] || { echo "run.sh: run scripts/phone/app.sh first" >&2; exit 2; }
 [ "$(cat /sys/module/kvm_intel/parameters/nested 2>/dev/null)" = Y ] || { echo "run.sh: the host's kvm_intel needs nested=1" >&2; exit 2; }
 LOGS=$(mktemp -d)
+mkdir -p "$LOGS/out"
 podman build -q -t "$IMAGE" "$SRC/fleet/phone" > "$LOGS/build.log" 2>&1 || { cat "$LOGS/build.log"; exit 1; }
 fail=0
 ok() { echo "ok   $*"; }
@@ -74,7 +80,7 @@ trap stop_runner EXIT
 trap 'exit 130' INT TERM
 t0=$(date +%s%3N)
 "$F" podman run --name "$NAME" --kernel-profile "${PHONE_PROFILE:-phone}" --gpu "$GPU" --privileged --cpu 6 --mem 6144 \
-  --portable-volumes --map "$AOSP:/android:ro" --map "$WORK:/work:ro" --map "$EMU:/emu:ro" \
+  --portable-volumes --map "$AOSP:/android:ro" --map "$WORK:/work:ro" --map "$EMU:/emu:ro" --map "$LOGS/out:/out" \
   "$IMAGE" > "$LOGS/vm.log" 2>&1 < /dev/null &
 runner=$!
 pid=""
@@ -182,6 +188,7 @@ if boot=$(timeout 400 "$F" exec --pid "$pid" -- /usr/local/bin/phone.sh boot 2>&
   [ "$reports" = 0 ] && ok "the system asked for no bug report" || bad "the system asked for a bug report: '$reports' (a device failed at boot; logcat -b events)"
   in_place_release_and_retake
   warm_snapshot_onto_the_second_gpu
+  "$(dirname "$0")/scene-test.sh" "$F" "$pid" "/work/$(basename "$APP")" "$LOGS/out" "$gpu_name" || fail=1
 else
   bad "Android did not boot: $boot"
   X sh -c 'grep -aE "ERROR|FATAL" /tmp/emulator.log | head -20' || true

@@ -7,7 +7,7 @@
 # first would install must still be the first's. Checkouts with different pins must not
 # share a directory, where one would replace a piece the other is using, and checkouts whose
 # phone container differs must not share an image tag.
-# A stub curl records how many aosp.sh runs are inside it at once, holds each call for 2 s
+# A stub curl records how many runs are inside it at once, holds each call for 2 s
 # and then fails, which stops that run; with the lock the second run waits for the first to
 # exit, so at most one is ever inside. Stub javac, java and keytool satisfy the tool check.
 # The test fails unless both runs reached curl, so a run that stopped earlier cannot read as
@@ -36,26 +36,32 @@ printf '#!/bin/sh\nexit 0\n' > "$dir/bin/javac"
 cp "$dir/bin/javac" "$dir/bin/keytool"
 cp "$dir/bin/javac" "$dir/bin/java"
 chmod +x "$dir/bin/curl" "$dir/bin/javac" "$dir/bin/keytool" "$dir/bin/java"
-run() {
-  PATH="$dir/bin:$PATH" ANDROID_AOSP="$dir/aosp" "$here/aosp.sh" > "$dir/out.$1" 2>&1 || true
+# took_turns script var: two runs of script on one directory (var names it) at once.
+# sdk.sh, which fetches what Robot Park compiles against, installs under the same kind of lock.
+took_turns() {
+  local script=$1 var=$2 a b calls max
+  rm -f "$dir/calls" "$dir/max" "$dir/active"
+  mkdir -p "$dir/$script.d"
+  for n in 1 2; do
+    env PATH="$dir/bin:$PATH" ACCEPT_ANDROID_SDK_LICENSE=1 "$var=$dir/$script.d" "$here/$script" > "$dir/out.$n" 2>&1 &
+    eval "p$n=\$!"
+  done
+  wait "$p1" "$p2" || true
+  calls=$(wc -l < "$dir/calls" 2>/dev/null || echo 0)
+  max=$(cat "$dir/max" 2>/dev/null || echo 0)
+  if [ "$calls" -lt 2 ]; then
+    echo "FAIL: only $calls of the two $script runs reached the download"
+    cat "$dir/out.1" "$dir/out.2"
+    exit 1
+  fi
+  if [ "$max" -ne 1 ]; then
+    echo "FAIL: $max $script runs were installing into one directory at the same time"
+    exit 1
+  fi
+  echo "ok   two $script runs on one directory took turns ($calls downloads, at most $max at once)"
 }
-run 1 &
-a=$!
-run 2 &
-b=$!
-wait "$a" "$b"
-calls=$(wc -l < "$dir/calls" 2>/dev/null || echo 0)
-max=$(cat "$dir/max" 2>/dev/null || echo 0)
-if [ "$calls" -lt 2 ]; then
-  echo "FAIL: only $calls of the two aosp.sh runs reached the download"
-  cat "$dir/out.1" "$dir/out.2"
-  exit 1
-fi
-if [ "$max" -ne 1 ]; then
-  echo "FAIL: $max aosp.sh runs were installing into one directory at the same time"
-  exit 1
-fi
-echo "ok   two aosp.sh runs on one directory took turns ($calls downloads, at most $max at once)"
+took_turns aosp.sh ANDROID_AOSP
+took_turns sdk.sh ANDROID_SDK
 
 
 # The pins as "sha256 destination" lines, read from aosp.sh's PINS.
