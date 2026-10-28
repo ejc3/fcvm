@@ -164,6 +164,76 @@ async fn delete_subvolume(path: &Path) -> bool {
     }
 }
 
+/// Take a snapshot's disk directory `dest` as a subvolume snapshot of the VM's disk directory `src`,
+/// rename the root disk `root_name` to `disk.raw`, and keep only `disk.raw` and `keep`. Returns false,
+/// leaving no `dest`, when `src` is not a subvolume this process may snapshot or the snapshot fails;
+/// the caller then reflinks the disks. A restored clone's disk directory is a subvolume snapshot of
+/// its snapshot's `disk/`, so this costs one transaction commit where a reflink of a 154 GB root disk
+/// of 860,177 extents measured 9 to 11 s, 14.5 s with the VM paused in one www snapshot.
+pub async fn snapshot_disk_subvolume(
+    src: &Path,
+    dest: &Path,
+    root_name: &std::ffi::OsStr,
+    keep: &[String],
+) -> Result<bool> {
+    if !is_btrfs_subvolume(src) || !can_own_subvolume_snapshot_of(src) {
+        return Ok(false);
+    }
+    if dest.exists() {
+        bail!(
+            "{} exists; a subvolume snapshot would land inside it",
+            dest.display()
+        );
+    }
+    let output = tokio::process::Command::new("btrfs")
+        .args(["subvolume", "snapshot"])
+        .arg(src)
+        .arg(dest)
+        .output()
+        .await;
+    let refused = match output {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+        Err(error) => Some(format!("btrfs tool unavailable: {error}")),
+    };
+    if let Some(reason) = refused {
+        info!(src = %src.display(), %reason,
+            "could not snapshot the VM's disk subvolume; reflinking the disks instead");
+        clear_staging(dest).await?;
+        return Ok(false);
+    }
+    let disk = std::ffi::OsStr::new("disk.raw");
+    let kept = async {
+        if root_name != disk {
+            fs::rename(dest.join(root_name), dest.join(disk))
+                .await
+                .context("naming the snapshot's root disk")?;
+        }
+        let mut entries = fs::read_dir(dest).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            if name == disk || keep.iter().any(|k| std::ffi::OsStr::new(k) == name) {
+                continue;
+            }
+            let path = entry.path();
+            if entry.file_type().await?.is_dir() {
+                remove_snapshot_dir(&path).await?;
+            } else {
+                fs::remove_file(&path).await?;
+            }
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    if let Err(error) = kept {
+        warn!(dest = %dest.display(), error = %format!("{error:#}"),
+            "could not keep only the disks in the snapshot's disk subvolume; reflinking instead");
+        clear_staging(dest).await?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// Stage a diff snapshot's directory as a subvolume snapshot of its parent's, keeping only
 /// the parent's memory file, which the diff is then written into. A subvolume snapshot costs
 /// one transaction commit whatever the memory file's extent count, where a reflink of the
@@ -725,6 +795,21 @@ mod snapshot_dir_tests {
         clear_staging(&staging).await.unwrap();
         assert!(!staging.exists());
         clear_staging(&staging).await.unwrap();
+    }
+
+    /// A disk directory that is not a subvolume is not snapshotted; the caller reflinks.
+    #[tokio::test]
+    async fn a_plain_disk_directory_is_not_snapshotted() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("disks");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("rootfs.raw"), b"disk").unwrap();
+        let dest = dir.path().join("snap").join("disk");
+        let taken = snapshot_disk_subvolume(&src, &dest, std::ffi::OsStr::new("rootfs.raw"), &[])
+            .await
+            .unwrap();
+        assert!(!taken);
+        assert!(!dest.exists());
     }
 
     /// A staged snapshot keeps the parent's memory file and nothing else of its directory.

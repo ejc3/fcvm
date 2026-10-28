@@ -4422,6 +4422,28 @@ async fn reflink_disks_to_snapshot(
     temp_snapshot_dir: &Path,
 ) -> Result<()> {
     let disk_dir = crate::storage::snapshot::snapshot_disk_dir(temp_snapshot_dir);
+    // A VM whose disk directory is a subvolume (a restored clone's is a snapshot of its snapshot's
+    // disk/) has it snapshotted whole: one transaction commit, while the VM is paused, where a
+    // reflink of the root disk costs one reference per extent.
+    let runtime_disks = paths::vm_runtime_dir(&snapshot_config.vm_id).join("disks");
+    if let (Some(src), Some(root_name)) = (disk_path.parent(), disk_path.file_name()) {
+        if src == runtime_disks {
+            let keep: Vec<String> = snapshot_config
+                .metadata
+                .extra_disks
+                .iter()
+                .map(|d| d.filename.clone())
+                .collect();
+            let started = std::time::Instant::now();
+            if crate::storage::disk::snapshot_disk_subvolume(src, &disk_dir, root_name, &keep)
+                .await?
+            {
+                info!(snapshot = %snapshot_config.name, snapshot_ms = started.elapsed().as_millis() as u64,
+                    "snapshotted the VM's disk subvolume");
+                return Ok(());
+            }
+        }
+    }
     crate::storage::disk::create_dir_or_subvolume(&disk_dir)
         .await
         .context("creating the snapshot's disk directory")?;
