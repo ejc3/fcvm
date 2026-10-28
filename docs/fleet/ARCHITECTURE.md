@@ -784,7 +784,7 @@ Vulkan path is measured on the T4.
   subpixel grid. Blended particles are drawn unscissored (scissored, a few glow pixels blended
   1 level differently), and no two particles start at one point (a leaper's coincident
   sparkles made the same frame come out two ways from run to run). `scripts/phone/seam.py`
-  allows up to 9 pixels a tile 1 level apart for one residual it has seen once in 5 runs, a
+  allows up to 9 pixels a tile 1 level apart for one residual it has seen in 2 of 7 runs, the same
   pixel in a light's glow.
 - **The emulator crashes when a guest GL client exits during composition.** Emulator 37.2.12
   logs `Failed to make display surface context current: 12290` (EGL_BAD_ACCESS) as a guest

@@ -12,8 +12,8 @@ each with the reply's `path` (a local copy of the raw RGBA file), `w`, `h`, `x0`
 
 For every tile pixel, the whole image's pixel at the same whole-image position must be the
 same bytes; that makes the tiles stitch into the whole image with no seam. One allowance,
-measured on the T4 through the emulator: in rare runs a pixel where a light's glow is blended
-comes out 1 level apart (1 pixel at t=41.5 in 1 of 5 full runs, while 96 repeat captures of
+measured on the T4 through the emulator: in some runs a pixel where a light's glow is blended
+comes out 1 level apart (the same pixel at t=41.5 in 2 of 7 full runs, while 96 repeat captures of
 the same frames were identical), so a tile may have up to ONE_LEVEL_MAX pixels 1 level apart.
 Anything more, or any pixel more than 1 level apart, fails. Each `repeats` pair is one rect
 drawn twice, which must match byte for byte. Prints a JSON summary with the exact counts,
