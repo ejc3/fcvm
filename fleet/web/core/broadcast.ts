@@ -135,6 +135,15 @@ function trim<V>(m: Map<number, V>): void {
   while (m.size > FrameMatcher.PENDING_KEPT) m.delete(m.keys().next().value!);
 }
 
+/**
+ * The state an input on the picture is placed with (a light: the camera and image of the
+ * frame the viewer clicked on). In broadcast mode, once a frame is shown, that frame's
+ * snapshot; otherwise the live one.
+ */
+export function inputScene(s: ClientState, pinned: HistoryEntry | null): FleetState | null {
+  return watchesBroadcast(s) && pinned !== null ? pinned.state : s.accepted;
+}
+
 /** The broadcast switch in the drawer. */
 export interface BroadcastToggle {
   label: string;

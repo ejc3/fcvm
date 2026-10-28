@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   addHistory,
   FrameMatcher,
+  inputScene,
   broadcastShown,
   broadcastToggle,
   frameWallMs,
@@ -262,5 +263,19 @@ describe("a frozen picture keeps its overlay", () => {
     const later = broadcastShown(s, frame, EPOCH + HISTORY_MS + 31_000, first.entry);
     expect(later.state.accepted!.tiles[0]!.phase).not.toBe("restoring");
     expect(later.entry?.version).toBe(1);
+  });
+});
+
+describe("input placed on the broadcast", () => {
+  it("uses the state of the frame on screen, not the live one", () => {
+    const shownState = fleet();
+    const live = fleet();
+    const late = withSnapshots(admission(LATE), [live]);
+    const pinned = { at: EPOCH, version: 1, state: shownState };
+    expect(inputScene(late, pinned)).toBe(shownState);
+    // Before a frame is shown, and outside broadcast mode, it is the live state.
+    expect(inputScene(late, null)).toBe(late.accepted);
+    const seated = withSnapshots(admission(), [live]);
+    expect(inputScene(seated, pinned)).toBe(seated.accepted);
   });
 });

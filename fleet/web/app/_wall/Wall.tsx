@@ -28,6 +28,7 @@ import {
   serverNow,
   broadcastLatencyMs,
   broadcastShown,
+  inputScene,
   watchesBroadcast,
   HUD_BAND,
   LIGHT_COLORS,
@@ -546,7 +547,8 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
     const s = client.getState();
     if (s.ui.lightMode) {
       const p = imagePoint(e.clientX, e.clientY);
-      const st = s.accepted;
+      // In broadcast mode, the frame on screen's camera and image, not the live ones.
+      const st = inputScene(s, client.pinned);
       if (p && st) {
         // The world point under the click, on the camera as it was drawn.
         const t =
