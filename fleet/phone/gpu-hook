@@ -1,0 +1,53 @@
+#!/bin/bash
+# The phone container's GPU hook: the running phone lets go of the VM's GPU and takes it up
+# again, through the emulator's console, while the phone keeps its state.
+#
+#   gpu-hook release   'gpu release': the emulator pauses the phone, keeps its GPU state in
+#                      memory and unloads the graphics driver, so it holds no /dev/nvidia*
+#                      descriptor or mapping; prints released_ms
+#   gpu-hook retake    'gpu retake': the emulator loads the driver, restores the state onto
+#                      the GPU the VM has now and resumes the phone; then waits for the
+#                      phone's next frame on that GPU and prints retaken_ms, first_frame_ms
+#                      and first_frame_at_ms (the wall clock, in ms since the epoch, when it
+#                      saw the frame)
+#
+# No emulator running is not an error: there is nothing to let go of. Each call's output is
+# also appended to /tmp/gpu-hook.log.
+set -euo pipefail
+exec > >(tee -a /tmp/gpu-hook.log) 2>&1
+ADB=/sdk/platform-tools/adb
+ms() { date +%s%3N; }
+console() { timeout 30 "$ADB" emu "$@" | tr -d '\r'; }
+running() { [ -f /tmp/emulator.pid ] && kill -0 "$(cat /tmp/emulator.pid)" 2> /dev/null; }
+
+case "${1:-}" in
+release)
+  running || { echo "no emulator running"; exit 0; }
+  out=$(console gpu release)
+  echo "$out"
+  grep -q '^released_ms=' <<< "$out"
+  ;;
+retake)
+  running || { echo "no emulator running"; exit 0; }
+  [ "$(console gpu status | head -1)" = released ] || { echo "the emulator holds the GPU"; exit 0; }
+  t0=$(ms)
+  out=$(console gpu retake)
+  echo "$out"
+  grep -q '^retaken_ms=' <<< "$out"
+  deadline=$(( t0 + ${FRAME_TIMEOUT_MS:-10000} ))
+  while [ "$(ms)" -lt "$deadline" ]; do
+    if [ "$(console gpu frame | head -1)" = posted ]; then
+      now=$(ms)
+      echo "first_frame_ms=$(( now - t0 )) first_frame_at_ms=$now"
+      exit 0
+    fi
+    sleep 0.02
+  done
+  echo "the phone posted no frame within ${FRAME_TIMEOUT_MS:-10000} ms of the retake"
+  exit 1
+  ;;
+*)
+  echo "usage: gpu-hook release|retake" >&2
+  exit 2
+  ;;
+esac

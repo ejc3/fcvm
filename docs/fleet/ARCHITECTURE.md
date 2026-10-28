@@ -691,9 +691,9 @@ carry, and the app handles surface loss correctly either way (`onSurfaceDestroye
 
 **The flow.** Gold: boot the phone VM, boot Android, start the app, then
 `fcvm snapshot create --gpu-warm`. fc-agent's park asks every GPU holder that is not a CUDA
-process to let go through a hook (the emulator's console, `gpu detach`), waits until no
+process to let go through a hook (the emulator's console, `gpu release`), waits until no
 process holds an NVIDIA device, and continues as today. A clone restores, attaches its GPU
-and loads the driver as any GPU restore does, then unpark calls `gpu attach` and waits for
+and loads the driver as any GPU restore does, then unpark calls `gpu retake` and waits for
 the app's next frame.
 
 | flow | click to the app's first frame (6 GiB phone VM) |
@@ -704,12 +704,13 @@ the app's next frame.
 B is the design. Its largest part is the memory pin, so the phone VM's size and hugepages
 are measured in the same PR as the hooks.
 
-The emulator is built from source for this, forked like Firecracker: `ejc3/` forks of the
-emulator (`external/qemu`) and of gfxstream. The SDK's 37.2 emulator was built from an
-`emu-37-2-release` branch that AOSP does not publish; the public branches are `emu-main-dev`
-(a manifest of 76 projects) and `emu-36-1-release`, so the fork starts from `emu-main-dev`.
-The SDK's license forbids modifying its emulator (below), and a source build also leaves
-out the SwiftShader libraries the spike masks.
+The emulator is built from source for this, forked like Firecracker: ejc3/platform_external_qemu
+(the emulator, `external/qemu`) and ejc3/gfxstream, each with AOSP's `emu-main-dev` on a
+branch of that name and the fcvm change on `fcvm-main`. The SDK's 37.2 emulator was built
+from an `emu-37-2-release` branch that AOSP does not publish; the public branches are
+`emu-main-dev` (a manifest of 76 projects) and `emu-36-1-release`, so the forks start from
+`emu-main-dev`. The SDK's license forbids modifying its emulator (below). The source build
+still ships SwiftShader's libraries, and `phone.sh` masks them as it did the SDK's.
 
 #### Detaching the renderer, measured (2026-10-28)
 
@@ -751,8 +752,45 @@ The change in gfxstream, from its own entry points (`host/RendererImpl.cpp`,
 - **attach:** load the libraries, `RendererImpl::initialize` on the GPU now present,
   `RendererImpl::load` from memory, `RendererImpl::resumeAll`, resume the guest.
 
-Both are emulator console commands (`gpu detach`, `gpu attach`), which fc-agent's park and
+Both are emulator console commands (`gpu release`, `gpu retake`), which fc-agent's park and
 unpark call through the hook (stack PR 3).
+
+#### Releasing and retaking the GPU in the emulator (2026-10-28)
+
+Built as above, with what the measurement left out:
+
+- **The transport is the GLES pipe.** The AOSP x86_64 Android 15 image renders through
+  `opengles` pipe channels (`ro.boot.qemu.gltransport.name=pipe`), one render thread each
+  (22 on a booted phone with the app running), not address space graphics. The release
+  pauses the guest and the render threads, saves the frame buffer into memory, has every
+  pipe save its channel's state (the render thread's and its queues) and drop the channel,
+  and then makes each paused render thread exit instead of resuming: it unbinds its context
+  without draining it, since the contexts are in the saved frame buffer. The retake loads the
+  frame buffer into a new one and gives every pipe a channel loaded from its saved state, the
+  path a quickboot load takes for a new emulator process. A renderer with address space
+  graphics consumers refuses.
+- **Teardown order.** The translator's displays go first (an EGL image a load restored is the
+  display's, and destroying it calls the GLES dispatch), then the dispatch, then the
+  EGL-on-EGL host engine, the host display (`eglTerminate`) and the host `libEGL` and
+  `libGLESv2`. A retake's load restores textures on a background thread, which a release
+  stops first.
+- **Vulkan.** With Vulkan emulation on and no `VulkanSnapshots`, the saved state holds no
+  Vulkan objects, so `gpu release` refuses while the guest has a Vulkan instance. HWUI runs
+  on Skia GL here (`debug.hwui.renderer=skiagl`), and the phone has none.
+- **Snapshots while released.** The emulator's own snapshot save and load refuse with an
+  error naming `gpu retake`.
+
+On the phone above, in its VM: `gpu release` takes 400 to 590 ms and leaves the emulator
+with 0 of its 80 `/dev/nvidia*` descriptors, 0 of its 291 mappings and none of the NVIDIA,
+EGL and GLES libraries mapped (the Vulkan loader stays, with no driver loaded); `gpu retake`
+takes 600 to 830 ms, the guest posts a frame within 50 to 100 ms of it, and the app draws at
+60 fps again. `make phone-test` checks the release and the retake.
+
+`scripts/phone/emulator.sh` builds the emulator from `fleet/phone/emulator.xml`, the
+`emu-main-dev` manifest with every project pinned and the two forks moved, into
+`/mnt/fcvm-btrfs/android-emulator/<hash>` (on a g4dn.metal about 14 minutes to fetch 95 GB
+of sources and 8 to build; 606 MB installed); `phone.sh` runs it from `/emu`, and the SDK
+no longer supplies an emulator.
 
 ### The app: an Android-themed scene
 
@@ -852,10 +890,12 @@ adb and the emulator console listen only inside the container.
 1. Merged (#1400): the phone profile: the Firecracker fork's nested state, the guest kernel
    with KVM, the phone container (emulator with `-gpu host` and EGL-on-EGL), the probe app,
    and `make phone-test`. Then this design's "Detaching the renderer, measured".
-2. The emulator from source: forks of the emulator and gfxstream from `emu-main-dev`, built
-   with the AOSP system image into the phone image; `gpu detach` and `gpu attach` on a
-   running phone, tested by detaching (no `/dev/nvidia*` descriptor or mapping left in the
-   emulator), attaching, and checking the app's renderer and frames.
+2. Done: the emulator from source (ejc3/platform_external_qemu, ejc3/gfxstream,
+   `scripts/phone/emulator.sh`), with `gpu release` and `gpu retake` on a running phone,
+   tested by releasing (no `/dev/nvidia*` descriptor or mapping left in the emulator),
+   retaking, and checking the app's frames. The phone still boots the SDK's AOSP system
+   image, which the SDK license allows for testing; an image built from AOSP for the public
+   wall is tracked in #1412.
 3. Snapshots of a running phone: fc-agent's park and unpark hooks for GPU holders that are
    not CUDA processes, `--gpu-warm` of a running phone, and a test that a clone's app renders
    on the clone's GPU; restore-to-first-app-frame measured, with the VM's size and hugepages.

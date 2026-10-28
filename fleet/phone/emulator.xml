@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The Android Emulator's sources for the phone (scripts/phone/emulator.sh): AOSP's
+     emu-main-dev with every project pinned to a commit, and external/qemu and
+     hardware/google/gfxstream from the ejc3 forks that add the console's gpu release and
+     gpu retake. `repo manifest -r` of a synced tree, with those two projects moved
+     and the Linux toolchain projects added. -->
+<manifest>
+  <remote name="aosp" fetch="https://android.googlesource.com/"/>
+  <remote name="github" fetch="https://github.com/"/>
+  
+  <default remote="aosp" revision="emu-main-dev" sync-j="4"/>
+  
+  <project name="device/google/cuttlefish" revision="d8fd28618566c7b7f44420310a4d8503646fbae3"/>
+  <project name="platform/build" path="build/make" revision="0984226dbac1a947ad34490e0647cf7e5c5e6d14"/>
+  <project name="platform/build/bazel" path="build/bazel" revision="0d382f91916499455604916a191e3bcf0cddf4fe">
+    <linkfile src="toplevel.bazelrc" dest=".bazelrc"/>
+    <linkfile src="toplevel.bazelversion" dest=".bazelversion"/>
+  </project>
+  <project name="platform/external/abseil-cpp" path="external/abseil-cpp" revision="000dabbd0c985dae5c40eb3a9531d4c8ee3f9d18"/>
+  <project name="platform/external/adt-infra" path="external/adt-infra" revision="e905f98eddeeffc9979e93803cf555b476b6bfeb"/>
+  <project name="platform/external/angle" path="external/angle" revision="901e32aa9923b05c3a2af846f8a28fc79c93d0be"/>
+  <project name="platform/external/astc-codec" path="external/astc-codec" revision="17ae36822a8084f45ae51f9031e81f8318254f33"/>
+  <project name="platform/external/bluetooth/glib" path="external/glib" revision="9f3ee561eee2bc195845201a4931d4709ff597e5"/>
+  <project name="platform/external/boringssl" path="external/boringssl" revision="72c090b7f8d4f161f6b17c95ebaebe649b6b8e5a" clone-depth="1"/>
+  <project name="platform/external/c-ares" path="external/cares" revision="42cf8dee534419f1826f474d2f5fd67ac94a1706"/>
+  <project name="platform/external/crashpad" path="external/crashpad" revision="1967b1e3f928ce7660abc0966954c03e695011d6" clone-depth="1"/>
+  <project name="platform/external/curl" path="external/curl" revision="1da4b04273638c8afe6f88bd7a7ccfb693640773"/>
+  <project name="platform/external/deqp" path="external/deqp" revision="2b13668b2330546b9cd7b58eda25fb9e950f3021"/>
+  <project name="platform/external/dtc" path="external/dtc" revision="ea98781975c28111bc55f915c83edc164ae069d4"/>
+  <project name="platform/external/flatbuffers" path="external/flatbuffers" revision="a551e2263a3f5036b46502aa6822257ed1a8a49f"/>
+  <project name="platform/external/fmtlib" path="external/fmtlib" revision="246368ddc2535f35d613cb6152a89cd6c2289f8f"/>
+  <project name="platform/external/gfxstream-protocols" path="external/gfxstream-protocols" revision="9bc1eed18fdb082e78966ecb9324a08f7cd8d76f"/>
+  <project name="platform/external/google-benchmark" path="external/google-benchmark" revision="1bff076dad8a0cbb740e7f68586d59c3bb3e1bfd"/>
+  <project name="platform/external/google-breakpad" path="external/google-breakpad" revision="61a8ef3ca8494875cb37e28a69500ed366328810"/>
+  <project name="platform/external/googletest" path="external/googletest" revision="013ef6db94e3677b24b8e4c9fbdf1708ecea516b"/>
+  <project name="platform/external/grpc-grpc" path="external/grpc" revision="fea7de5acfa2da17203f8eea78f974b41bcb6807"/>
+  <project name="platform/external/libpng" path="external/libpng" revision="7d392175b041b963cdc97f5b973e4d59682b8b96"/>
+  <project name="platform/external/libusb" path="external/libusb" revision="23f123a3f531572d14a253db3451c950e21d2447"/>
+  <project name="platform/external/libxml2" path="external/libxml2" revision="27570c2a5b96dc5aea1a0085f610f37ab744f643"/>
+  <project name="platform/external/lz4" path="external/lz4" revision="649782b223e2d62ca5743140f3d4e6afccb85eb4"/>
+  <project name="platform/external/mesa3d" path="external/mesa3d" revision="1cb5223f931cf7c2e4931decd89b594a3064146c"/>
+  <project name="platform/external/mobly-bundled-snippets" path="external/mobly-bundled-snippets" revision="b0bdd3a435593ede2e353d4ff80cc3d949cf5529"/>
+  <project name="platform/external/moltenvk" path="external/moltenvk" revision="4d44e42aacc0734d4c55e26602e5aded66f73f6c"/>
+  <project name="platform/external/nasm" path="external/nasm" revision="8d91dd49f13808eb2c9a25f899edcfef6f5930d7"/>
+  <project name="platform/external/perfetto" path="external/perfetto" revision="37518c39e3db120322359090db3d54f6ac100078"/>
+  <project name="platform/external/pkg-config" path="third_party/pkg-config" revision="110660333d9126a57154408fff5f675867cfd1f7" clone-depth="1"/>
+  <project name="platform/external/protobuf" path="external/protobuf" revision="623d88a75a0b17ad2cc4be8fa79c3b97e7384a40"/>
+  <project name="ejc3/platform_external_qemu" path="external/qemu" remote="github" revision="6d34145840df261250f38b8cdf2393d39fc44cd3">
+    <copyfile src="android/vscode/emu.code-workspace" dest="emu.code-workspace"/>
+    <linkfile src="toplevel.MODULE.bazel" dest="MODULE.bazel"/>
+    <linkfile src="toplevel.MODULE.bazel.lock" dest="MODULE.bazel.lock"/>
+  </project>
+  <project name="platform/external/rapidjson" path="external/rapidjson" revision="4d42830893d6728eba192789c0629d76a359fca0"/>
+  <project name="platform/external/regex-re2" path="external/regex-re2" revision="3b76205b4a5ab7fd9a11df8ac930d21cf52ad189"/>
+  <project name="platform/external/tink" path="external/tink" revision="f416fdeb6d1ebafda566d4ecff80eace51a750f2"/>
+  <project name="platform/external/tinyobjloader" path="external/tinyobjloader" revision="d16a940067fbc191364fc1d3e2a2d907209c9320"/>
+  <project name="platform/external/virglrenderer" path="external/virglrenderer" revision="5d6e453751926c5209c7bad5ef7a6285feef5bb6"/>
+  <project name="platform/external/webrtc" path="external/webrtc" revision="34c5ae008bf811fce3006818f26f922b3647237a"/>
+  <project name="platform/external/wpa_supplicant_8" path="external/wpa_supplicant_8" revision="db64ab725acee6991a7ee9746d960731cca0b563"/>
+  <project name="platform/external/zlib" path="external/zlib" revision="5a4f1701693dff36e495d13dd14b70e15abe0d01"/>
+  <project name="platform/hardware/google/aemu" path="hardware/google/aemu" revision="6f34f9788fd595e597f191bece8fdaceed00d20a" groups="pdk"/>
+  <project name="ejc3/gfxstream" path="hardware/google/gfxstream" remote="github" revision="c5b6b2b1db78737a10a6f5023365e762acd608fe"/>
+  <project name="platform/prebuilts/android-emulator-build/archive" path="prebuilts/android-emulator-build/archive" revision="9b0bdade8b09267282fb901d21219ab6af013c60" clone-depth="1"/>
+  <project name="platform/prebuilts/android-emulator-build/common" path="prebuilts/android-emulator-build/common" revision="1ebd9720117e7e3c495a1e1c43e069f1727d60d5" clone-depth="1"/>
+  <project name="platform/prebuilts/android-emulator-build/mesa" path="prebuilts/android-emulator-build/mesa" revision="be7c00f399b415511d73308f0af0c0310512aced" clone-depth="1"/>
+  <project name="platform/prebuilts/android-emulator-build/mesa-deps" path="prebuilts/android-emulator-build/mesa-deps" revision="17837fdb1889014fa01cbbbda56afc9b6034815f" clone-depth="1"/>
+  <project name="platform/prebuilts/android-emulator-build/qemu-android-deps" path="prebuilts/android-emulator-build/qemu-android-deps" revision="b06aee625002d0738c5576bbf437b9378229bef0" clone-depth="1"/>
+  <project name="platform/prebuilts/android-emulator-build/qt" path="prebuilts/android-emulator-build/qt" revision="f2d41b8d15c2a628e95c2e755ed92186d03b763c" clone-depth="1"/>
+  <project name="platform/prebuilts/android-emulator-build/system-images" path="prebuilts/android-emulator-build/system-images" revision="6d526de777b61fdbdaae61a24b1002db80870016" clone-depth="1">
+    <linkfile src="android-sdk" dest="prebuilts/android/android-sdk"/>
+  </project>
+  <project name="platform/prebuilts/studio/jdk" path="prebuilts/studio/jdk" revision="ab98332f5597d8e2eecbe4c4b35a3d1272bc4783" clone-depth="1"/>
+  <project name="platform/tools/buildSrc" path="tools/buildSrc" revision="84f5a11087cc9fcd353ccd6cfc490fb2a226948e"/>
+  <project name="platform/tools/emulator" path="tools/emulator" revision="0861a1ad273555d0eb3bd1abffa4912d9d24bc2c"/>
+  <project name="platform/tools/netsim" path="tools/netsim" revision="c4297ba555eb804cd76ae3ad35227ae09a947595"/>
+  <project name="platform/tools/repohooks" path="tools/repohooks" revision="ee593394dd36395f0f9433b738abf1859e92193d" groups="developers,tools"/>
+  <project name="platform/tools/rootcanal" path="tools/rootcanal" revision="96f4f4e243fc47baeca49fca4584ecff9bd0ff4a"/>
+  <project name="trusty/external/qemu-libslirp" path="external/libslirp" revision="6559d5fa78a9afc4e21cffdad4b91e45265d359b"/>
+  
+  <repo-hooks in-project="platform/tools/repohooks" enabled-list="pre-upload"/>
+  <!-- The Linux host's toolchain and tools: in upstream's manifest these carry
+       groups="notdefault,platform-linux", which repo syncs on Linux and
+       `repo manifest -r` leaves out. -->
+  <project name="platform/prebuilts/bazel/linux-x86_64" path="prebuilts/bazel/linux-x86_64" revision="08fd1838a4e418bb9386f083280166caf4b82239" clone-depth="1"/>
+  <project name="platform/prebuilts/clang/host/linux-x86" path="prebuilts/clang/host/linux-x86" revision="6599d0b82da42c78c5f30e73ba71aa3db907e5aa" clone-depth="1"/>
+  <project name="platform/prebuilts/cmake/linux-x86" path="prebuilts/cmake/linux-x86" revision="1b2f676e865ec717ff17781425a28318db910eaf" clone-depth="1"/>
+  <project name="platform/prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8" path="prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8" revision="f58b56eac26d03223f438e985f3d6334f6590cc6" clone-depth="1"/>
+  <project name="platform/prebuilts/ninja/linux-x86" path="prebuilts/ninja/linux-x86" revision="d738ecc92e8af6ba336de6a095ad46c2d7a117a2" clone-depth="1"/>
+  <project name="platform/prebuilts/python/linux-x86" path="prebuilts/python/linux-x86" revision="3665e3a3bd0cd0d93f6247eb596938cea48268be" clone-depth="1"/>
+  <project name="platform/external/bison" path="external/bison" revision="ab70b64baf6d65c35498bfce689c0b8991f832db"/>
+  <project name="platform/external/flex" path="external/flex" revision="104fbfc36067cd630eff3430ee9736febbe26956"/>
+  <project name="toolchain/m4" path="external/m4" revision="4c63838f0ccd1a8850a3d17f31c3427668a78a23"/>
+</manifest>
