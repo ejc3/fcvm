@@ -4563,6 +4563,29 @@ async fn dns_port_zero_is_asked_of_the_kernel_once_per_protocol() {
     );
 }
 
+/// `serve` binds TCP to `listen` itself. Rebuilding the address from its IP and a port
+/// drops the scope id of a link-local IPv6 address (`fe80::1%eth0`): UDP binds, TCP fails with
+/// EINVAL, and the coordinator does not start. A runtime test needs an interface with a
+/// link-local address, which a CI host may not have, so this pins the source.
+#[test]
+fn dns_serve_binds_tcp_to_the_listen_address_as_given() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/fleet/coord/authority.rs"
+    ))
+    .unwrap();
+    let from = src.find("pub async fn serve").expect("serve");
+    let body = &src[from..from + src[from..].find("\n    }\n").expect("end of serve")];
+    assert!(
+        body.contains("TcpListener::bind(listen)"),
+        "serve must bind TCP to `listen`:\n{body}"
+    );
+    assert!(
+        !body.contains("SocketAddr::new"),
+        "serve must not rebuild an address from its IP: the scope id is lost:\n{body}"
+    );
+}
+
 /// The first snapshot whose tile shows both frame URLs other than `not`; the zone the DNS
 /// server answers from is read right after it.
 async fn published_urls(
