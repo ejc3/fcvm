@@ -34,6 +34,79 @@ async fn test_localhost_overlay_mode_with_user() -> Result<()> {
     .await
 }
 
+/// The file the store tests look for: in the image store, and nowhere in the user's own
+/// podman storage.
+const STORE_MARKER: &str = "fcvm-store-marker";
+
+/// Overlay mode with a container user runs the container on the image's layers in the
+/// store. The guest's rootless podman runs it with `--userns=keep-id`; when the store's
+/// layers do not carry the ids that mapping wants, podman copies every file of the image
+/// into the container's layer in the user's storage to change its owner, which for a
+/// large image fills the guest's disk ("storage-chown-by-maps ... no space left on
+/// device"). The marker file is in the store, and must not be under /home.
+#[tokio::test]
+async fn test_localhost_overlay_mode_with_user_runs_on_the_store() -> Result<()> {
+    let suffix = "localhost-overlay-user-store";
+    let image_name = image_name_for_suffix(suffix);
+    build_marker_image(&image_name, suffix).await?;
+
+    let (vm_name, _, _, _) = common::unique_names(suffix);
+    let args = [
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--image-mode",
+        "overlay",
+        "--user",
+        "1000:1000",
+        &image_name,
+    ];
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&args).await.context("spawning fcvm")?;
+
+    let checked = async {
+        common::poll_health_by_pid(fcvm_pid, 180)
+            .await
+            .context("VM failed to become healthy")?;
+        let in_store = common::exec_in_vm(
+            fcvm_pid,
+            &[&format!(
+                "find /mnt/image-store/overlay -name {STORE_MARKER} | wc -l"
+            )],
+        )
+        .await
+        .context("looking for the marker in the image store")?;
+        let in_user_storage = common::exec_in_vm(
+            fcvm_pid,
+            &[&format!("find /home -name {STORE_MARKER} | wc -l")],
+        )
+        .await
+        .context("looking for the marker in the user's storage")?;
+        println!(
+            "  marker copies: {} in the image store, {} under /home",
+            in_store.trim(),
+            in_user_storage.trim()
+        );
+        anyhow::ensure!(
+            in_store.trim() == "1",
+            "the image store should hold the marker once, found {:?}",
+            in_store.trim()
+        );
+        anyhow::ensure!(
+            in_user_storage.trim() == "0",
+            "podman copied the image's files into the user's storage ({:?} copies of the \
+             marker under /home): the store's layers do not carry the ids keep-id wants",
+            in_user_storage.trim()
+        );
+        Ok(())
+    }
+    .await;
+
+    common::kill_process(fcvm_pid).await;
+    let _ = child.wait().await;
+    checked
+}
+
 /// Test with archive mode (podman load at boot)
 #[tokio::test]
 async fn test_localhost_archive_mode() -> Result<()> {
@@ -246,6 +319,31 @@ CMD ["echo", "{marker}"]"#
     }
 
     println!("  Built {} image", image_name);
+    Ok(())
+}
+
+/// Build an image that stays running and holds [`STORE_MARKER`] at its root. `suffix`
+/// goes into the marker's content, so each test's image has its own digest.
+async fn build_marker_image(image_name: &str, suffix: &str) -> Result<()> {
+    let temp_dir = tempfile::TempDir::new().context("creating temp dir")?;
+    std::fs::write(temp_dir.path().join(STORE_MARKER), format!("{suffix}\n"))?;
+    std::fs::write(
+        temp_dir.path().join("Containerfile"),
+        format!(
+            "FROM public.ecr.aws/nginx/nginx:alpine\nCOPY {STORE_MARKER} /{STORE_MARKER}\nCMD [\"sleep\", \"3600\"]\n"
+        ),
+    )?;
+    let output = tokio::process::Command::new("podman")
+        .args(["build", "-t", image_name])
+        .arg(temp_dir.path())
+        .output()
+        .await
+        .context("running podman build")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Failed to build test image: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     Ok(())
 }
 

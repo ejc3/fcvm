@@ -702,8 +702,13 @@ pub async fn run() -> Result<()> {
     mounts::unmount_paths(&mounted_pmem_paths, "pmem device");
     mounts::unmount_disks(&mounted_disk_paths);
     if let Some("overlay") = plan.image_mode.as_deref() {
-        // A run with a user binds the store over its device, and the bind comes off first.
-        let mut store_paths = vec![container::IMAGE_STORE_PATH.to_string()];
+        // A run with a user binds the store over its device and a layer list over the
+        // store's own; the binds come off first, the last one made first.
+        let mut store_paths = Vec::new();
+        if user_info.is_some() {
+            store_paths.push(container::IMAGE_STORE_LAYERS_PATH.to_string());
+        }
+        store_paths.push(container::IMAGE_STORE_PATH.to_string());
         if user_info.is_some() {
             store_paths.push(container::IMAGE_STORE_RAW_PATH.to_string());
         }
