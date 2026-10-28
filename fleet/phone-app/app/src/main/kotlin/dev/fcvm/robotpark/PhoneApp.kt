@@ -44,9 +44,7 @@ class PhoneApp : Application() {
             Log.i(ControlServer.TAG, "action ${a.wire}" + (t?.let { " t=$it" } ?: ""))
             when (a) {
                 Action.DANCE, Action.WAVE -> {
-                    val at = t ?: Store.frameTime(Store.scene)
-                    Store.addMove(if (a == Action.DANCE) MoveKind.DANCE else MoveKind.WAVE, at)
-                    return ok("t" to at)
+                    return ok("t" to Store.addMove(if (a == Action.DANCE) MoveKind.DANCE else MoveKind.WAVE, t))
                 }
                 Action.DARK -> Store.nightOverride = true
                 Action.LIGHT -> Store.nightOverride = false

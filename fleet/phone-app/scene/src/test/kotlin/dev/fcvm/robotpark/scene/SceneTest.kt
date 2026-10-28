@@ -236,6 +236,17 @@ class SceneTest {
     }
 
     /**
+     * A local action's default time and the epoch its move is filed under come from one scene
+     * snapshot, inside Store.addMove: computed in PhoneApp from one read and filed by addMove
+     * under another, a scene arriving in between put the move in the wrong clock.
+     */
+    @Test fun aLocalActionIsTimedAndFiledInOneSceneSnapshot() {
+        assertTrue("addMove takes the optional time and returns the one it used",
+            Regex("""fun addMove\(kind: MoveKind, t: Double\?\): Double""").containsMatchIn(appSource("Store.kt")))
+        assertFalse("PhoneApp computes no frame time of its own", appSource("PhoneApp.kt").contains("frameTime("))
+    }
+
+    /**
      * A queued task (a capture, a context drop, the benchmark) leaves the queue only once a
      * context is current, so a context that cannot be made current delays it instead of
      * dropping it (a dropped benchmark left benchmarkRunning set for good).

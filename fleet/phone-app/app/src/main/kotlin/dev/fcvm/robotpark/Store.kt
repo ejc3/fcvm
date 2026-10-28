@@ -58,8 +58,16 @@ object Store {
         return k.toDouble() / FrameState.FPS
     }
 
-    @Synchronized fun addMove(kind: MoveKind, t: Double) {
+    /**
+     * Adds a move at `t`, or at the current frame's time, and returns that time. The time and
+     * the epoch the move is filed under come from one scene snapshot; a scene of another epoch
+     * arriving meanwhile clears the move with the rest of the old clock's (LocalMoves).
+     */
+    @Synchronized fun addMove(kind: MoveKind, t: Double?): Double {
         val s = scene
-        local = local.add(Move(t, kind), s, frameTime(s))
+        val now = frameTime(s)
+        val at = t ?: now
+        local = local.add(Move(at, kind), s, now)
+        return at
     }
 }
