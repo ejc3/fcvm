@@ -125,6 +125,19 @@ class SceneTest {
         assertEquals(66, FrameState.pruneMoves(moves.take(66), listOf(Move(12.0, MoveKind.DANCE)), now, 64).first.size)
     }
 
+    /** A scene with a new epoch restarts t, so the phone's own moves (in the old clock) are cleared. */
+    @Test fun aNewEpochClearsThePhonesOwnMoves() {
+        val before = SceneInput() // the app's default before any scene: epoch 0
+        var local = LocalMoves()
+        for (i in 0 until 100) local = local.add(Move(1.7e9 + 20.0 * i, MoveKind.DANCE), before, 1.7e9 + 2010.0)
+        assertTrue("some were pruned", local.from > 1.7e9)
+        val s = local.applyTo(scene, scene.night)
+        assertEquals(scene.moves, s.moves)
+        assertEquals(12.0, frame(s, 12.0).t, 0.0) // draws: the old clock's boundary does not apply
+        // the same epoch keeps them
+        assertEquals(64, local.applyTo(before, null).moves.size)
+    }
+
     @Test fun cameraHoldsAreStillAndPathsAreContinuous() {
         val k = scene.camera
         assertEquals(CameraPath.at(k, 21.0), CameraPath.at(k, 29.0))

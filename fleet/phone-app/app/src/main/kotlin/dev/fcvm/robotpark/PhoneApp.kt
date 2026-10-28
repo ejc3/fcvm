@@ -30,7 +30,7 @@ class PhoneApp : Application() {
             is Command.Place -> { Store.place = c.fields; ok() }
             is Command.Clock -> { Store.clockOffsetMs = c.unixMs - System.currentTimeMillis(); ok("offset_ms" to Store.clockOffsetMs) }
             is Command.Freeze -> {
-                val from = Store.local.third
+                val from = Store.local.forScene(Store.scene).from
                 val t = c.t
                 if (t != null && t < from) mapOf("error" to "t: before t=$from, where this phone's own older moves were pruned")
                 else { Store.frozenT = c.t; ok() }
