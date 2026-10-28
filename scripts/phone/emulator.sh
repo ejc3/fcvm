@@ -17,8 +17,10 @@
 set -euo pipefail
 SRC=$(cd "$(dirname "$0")/../.." && pwd)
 MANIFEST=$SRC/fleet/phone/emulator.xml
-REPO_URL=https://storage.googleapis.com/git-repo-downloads/repo
-REPO_SHA256=6ed2f6325705b6ea0af99466d6ebd04adec387a5b6a906cd77bc8c6da65123e5
+# A versioned launcher: the unversioned .../repo is replaced by every release, so a
+# checksum of it goes stale (it had by 2026-10-28).
+REPO_URL=https://storage.googleapis.com/git-repo-downloads/repo-2.71
+REPO_SHA256=05f571deafd6ed6da0d20fa707dde29aa5624dbf35553d697a40dbdd4c8d178a
 ID=$(cat "$0" "$MANIFEST" | sha256sum | cut -c1-12)
 ROOT=${ANDROID_EMULATOR:-/mnt/fcvm-btrfs/android-emulator/$ID}
 OUT=$ROOT/emulator
