@@ -83,7 +83,7 @@ class FrameState(
             val all = merge(scene.moves.map { it.t })
             val dances = merge(scene.moves.filter { it.kind == MoveKind.DANCE }.map { it.t })
             val waves = merge(scene.moves.filter { it.kind == MoveKind.WAVE }.map { it.t })
-            val walk = t - frozen(all, t)
+            val walk = t - frozen(all, t) - scene.walkOffset
             val danceStart = dances.lastOrNull { it.first <= t && t < it.second }?.first
                 ?: dances.lastOrNull { it.first <= t }?.first
             val danceAge = if (danceStart == null) 1.0e4 else StrictMath.min(1.0e4, t - danceStart)
@@ -149,6 +149,28 @@ class FrameState(
         }
 
         fun smooth(x: Double): Double { val c = x.coerceIn(0.0, 1.0); return c * c * (3 - 2 * c) }
+
+        /**
+         * Keeps the phone's own moves (`local`) to `max`: drops the oldest only as whole merged
+         * windows that ended before `now` and hold no scene move, and returns the walking time
+         * they froze, which the caller adds to [SceneInput.walkOffset] so the walking clock
+         * does not jump. A window still running or shared with a scene move is kept, so the
+         * list can stay longer than `max` until it ends.
+         */
+        fun pruneMoves(local: List<Move>, scene: List<Move>, now: Double, max: Int): Pair<List<Move>, Double> {
+            val sorted = local.sortedBy { it.t }
+            if (sorted.size <= max) return sorted to 0.0
+            val windows = merge((sorted + scene).map { it.t })
+            var from = 0
+            var gained = 0.0
+            while (sorted.size - from > max) {
+                val w = windows.first { sorted[from].t >= it.first && sorted[from].t < it.second }
+                if (w.second > now || scene.any { it.t >= w.first && it.t < w.second }) break
+                gained += frozen(listOf(w), w.second)
+                while (from < sorted.size && sorted[from].t < w.second) from++
+            }
+            return sorted.subList(from, sorted.size) to gained
+        }
 
         /** Disjoint [start, end) windows covering moves that start at `starts`. */
         fun merge(starts: List<Double>): List<Pair<Double, Double>> {

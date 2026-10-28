@@ -104,6 +104,22 @@ class SceneTest {
         assertEquals(1.0, FrameState.weight(w, 16.0), 0.0)
     }
 
+    /** Pruning the phone's own old moves keeps the walking clock where it was (no jump). */
+    @Test fun pruningOldMovesKeepsTheWalkingClock() {
+        val moves = (0 until 100).map { Move(10.0 + 20.0 * it, if (it % 2 == 0) MoveKind.DANCE else MoveKind.WAVE) }
+        val now = 2010.0
+        val full = scene.copy(moves = moves)
+        val (kept, offset) = FrameState.pruneMoves(moves, emptyList(), now, 64)
+        assertEquals(64, kept.size)
+        val pruned = scene.copy(moves = kept, walkOffset = offset)
+        for (dt in listOf(0.0, 3.0, 9.5, 30.0)) {
+            assertEquals("walking clock at t=${now + dt}", frame(full, now + dt).walkT, frame(pruned, now + dt).walkT, 1e-3f)
+        }
+        // a window still running, or shared with a scene move, is not pruned
+        assertEquals(66, FrameState.pruneMoves(moves.take(66), emptyList(), 15.0, 64).first.size)
+        assertEquals(66, FrameState.pruneMoves(moves.take(66), listOf(Move(12.0, MoveKind.DANCE)), now, 64).first.size)
+    }
+
     @Test fun cameraHoldsAreStillAndPathsAreContinuous() {
         val k = scene.camera
         assertEquals(CameraPath.at(k, 21.0), CameraPath.at(k, 29.0))
