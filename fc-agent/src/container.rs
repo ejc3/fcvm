@@ -18,11 +18,15 @@ pub const IMAGE_STORE_PATH: &str = "/mnt/image-store";
 /// its mount point impossible to create.
 pub const IMAGE_STORE_RAW_PATH: &str = "/run/fcvm-image-store-raw";
 /// The store's layer list as a run with a user shows it, each layer carrying the id
-/// mapping the store is shown through. It is bound over the store's own list at
-/// [`IMAGE_STORE_LAYERS_PATH`].
+/// mapping the store is shown through. It is bound over the store's own list.
 pub const IMAGE_STORE_LAYERS_COPY: &str = "/run/fcvm-image-store-layers.json";
-/// The layer list podman reads from the store.
-pub const IMAGE_STORE_LAYERS_PATH: &str = "/mnt/image-store/overlay-layers/layers.json";
+/// Where podman reads a store's layer list, relative to the store.
+const STORE_LAYER_LIST: &str = "overlay-layers/layers.json";
+
+/// The layer list podman reads from the image store.
+pub fn image_store_layers_path() -> String {
+    format!("{IMAGE_STORE_PATH}/{STORE_LAYER_LIST}")
+}
 
 /// The container user's ids, which the overlay store is shown with. Rootless podman's
 /// user namespace has the user's own id as its id 0 and the user's subordinate ids from
@@ -194,7 +198,9 @@ impl StoreUser {
                     .is_some_and(|map| !map.is_empty())
                 {
                     anyhow::bail!(
-                        "layer {} in the image store already has a {key}",
+                        "layer {} in the image store already has a {key}; a run with a \
+                         user needs a store whose layers carry no mapping, so rebuild the \
+                         image's overlay storage image",
                         layer
                             .get("id")
                             .and_then(|id| id.as_str())
@@ -264,28 +270,17 @@ pub fn mount_overlay_image(
         })?;
         record.record(format!("image store bind of {device}"), mount_path)?;
 
-        let layers =
-            std::fs::read_to_string(format!("{IMAGE_STORE_RAW_PATH}/overlay-layers/layers.json"))
-                .context("reading the image store's layers.json")?;
-        std::fs::write(IMAGE_STORE_LAYERS_COPY, user.layers_with_keep_id(&layers)?)
-            .with_context(|| format!("writing {IMAGE_STORE_LAYERS_COPY}"))?;
+        let layers = std::fs::read_to_string(format!("{IMAGE_STORE_RAW_PATH}/{STORE_LAYER_LIST}"))
+            .context("reading the image store's layers.json")?;
+        let layers_path = image_store_layers_path();
+        write_readable(IMAGE_STORE_LAYERS_COPY, &user.layers_with_keep_id(&layers)?)?;
         let output = std::process::Command::new("mount")
-            .args([
-                "--bind",
-                "-o",
-                "ro",
-                IMAGE_STORE_LAYERS_COPY,
-                IMAGE_STORE_LAYERS_PATH,
-            ])
+            .args(["--bind", "-o", "ro", IMAGE_STORE_LAYERS_COPY, &layers_path])
             .output()
             .context("running mount for the image store's layer list")?;
-        mount_succeeded(&output).with_context(|| {
-            format!("binding {IMAGE_STORE_LAYERS_COPY} over {IMAGE_STORE_LAYERS_PATH}")
-        })?;
-        record.record(
-            format!("image store layer list of {device}"),
-            IMAGE_STORE_LAYERS_PATH,
-        )?;
+        mount_succeeded(&output)
+            .with_context(|| format!("binding {IMAGE_STORE_LAYERS_COPY} over {layers_path}"))?;
+        record.record(format!("image store layer list of {device}"), &layers_path)?;
         eprintln!(
             "[fc-agent] image store owned by uid {} on disk, shown through an id-mapped \
              mount as a keep-id container of uid {} sees it",
@@ -366,6 +361,20 @@ pub fn mount_overlay_image(
 
     // Fallback: return expected name (downstream will fail with clear error if wrong)
     Ok(image_name.to_string())
+}
+
+/// Write `contents` to `path` with mode 0644 whatever the umask. The layer list copy
+/// belongs to root, which the user's namespace does not map, so rootless podman reads it
+/// through its "other" permission bits.
+fn write_readable(path: &str, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let mut file = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
+    // The mode given at creation is masked by the umask, so it is set after.
+    file.set_permissions(std::fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("setting the mode of {path}"))?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("writing {path}"))
 }
 
 /// Whether a mount(8) run succeeded; a failure carries its stderr.
@@ -2265,6 +2274,13 @@ mod tests {
                 range(1002, 1002, 64535)
             ]
         );
+        // Id 0 (a --user with group 0): podman 4.9.3 still emits its first range, with
+        // size 0, as `min(gid, maxGID)`, so the layer's map carries it too. (crun then
+        // refuses that map: "writing file /proc/<pid>/gid_map: Invalid argument".)
+        assert_eq!(
+            keep_id_map(0, 65536),
+            [range(0, 1, 0), range(0, 0, 1), range(1, 1, 65536)]
+        );
         // An id beyond the subordinate range has nothing above it.
         assert_eq!(
             keep_id_map(70000, 65536),
@@ -2345,12 +2361,19 @@ mod tests {
         assert!(format!("{error:#}").contains("layer a"), "{error:#}");
     }
 
+    /// The layer list copy is readable by every user even under a umask of 077: root
+    /// owns it, and the user's namespace does not map root.
     #[test]
-    fn the_layer_list_podman_reads_is_in_the_store() {
-        assert_eq!(
-            IMAGE_STORE_LAYERS_PATH,
-            format!("{IMAGE_STORE_PATH}/overlay-layers/layers.json")
-        );
+    fn the_layer_list_copy_is_world_readable_whatever_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layers.json");
+        // SAFETY: umask only sets this process's file mode creation mask; nextest runs
+        // each test in a process of its own.
+        unsafe { libc::umask(0o077) };
+        write_readable(path.to_str().unwrap(), "[]").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "mode {mode:o}");
     }
 
     /// The guest's /etc/subgid takes the host's gid range when the plan carries one,

@@ -35,18 +35,25 @@ async fn test_localhost_overlay_mode_with_user() -> Result<()> {
 }
 
 /// The file the store tests look for: in the image store, and nowhere in the user's own
-/// podman storage.
+/// podman storage. It is owned by root in the image.
 const STORE_MARKER: &str = "fcvm-store-marker";
+/// A file the image gives to 1234:1234.
+const STORE_CHOWNED: &str = "fcvm-store-chowned";
 
 /// Overlay mode with a container user runs the container on the image's layers in the
-/// store. The guest's rootless podman runs it with `--userns=keep-id`; when the store's
-/// layers do not carry the ids that mapping wants, podman copies every file of the image
-/// into the container's layer in the user's storage to change its owner, which for a
-/// large image fills the guest's disk ("storage-chown-by-maps ... no space left on
-/// device"). The marker file is in the store, and must not be under /home.
+/// store, with the ownership the image gives its files. The guest's rootless podman runs
+/// it with `--userns=keep-id`; when the store's layers do not carry the ids that mapping
+/// wants, podman copies every file of the image into the container's layer in the user's
+/// storage to change its owner, which for a large image fills the guest's disk
+/// ("storage-chown-by-maps ... no space left on device"). The marker file is in the
+/// store, must not be under /home, and the container sees each file's owner as the
+/// image set it.
 #[tokio::test]
 async fn test_localhost_overlay_mode_with_user_runs_on_the_store() -> Result<()> {
-    let suffix = "localhost-overlay-user-store";
+    run_on_the_store("1000:1000", "localhost-overlay-user-store").await
+}
+
+async fn run_on_the_store(user: &str, suffix: &str) -> Result<()> {
     let image_name = image_name_for_suffix(suffix);
     build_marker_image(&image_name, suffix).await?;
 
@@ -59,7 +66,7 @@ async fn test_localhost_overlay_mode_with_user_runs_on_the_store() -> Result<()>
         "--image-mode",
         "overlay",
         "--user",
-        "1000:1000",
+        user,
         &image_name,
     ];
     let (mut child, fcvm_pid) = common::spawn_fcvm(&args).await.context("spawning fcvm")?;
@@ -82,10 +89,17 @@ async fn test_localhost_overlay_mode_with_user_runs_on_the_store() -> Result<()>
         )
         .await
         .context("looking for the marker in the user's storage")?;
+        let owners = common::exec_in_container(
+            fcvm_pid,
+            &[&format!("stat -c %u:%g /{STORE_MARKER} /{STORE_CHOWNED}")],
+        )
+        .await
+        .context("reading the owners the container sees")?;
         println!(
-            "  marker copies: {} in the image store, {} under /home",
+            "  marker copies: {} in the image store, {} under /home; owners in the container: {}",
             in_store.trim(),
-            in_user_storage.trim()
+            in_user_storage.trim(),
+            owners.split_whitespace().collect::<Vec<_>>().join(" ")
         );
         anyhow::ensure!(
             in_store.trim() == "1",
@@ -97,6 +111,12 @@ async fn test_localhost_overlay_mode_with_user_runs_on_the_store() -> Result<()>
             "podman copied the image's files into the user's storage ({:?} copies of the \
              marker under /home): the store's layers do not carry the ids keep-id wants",
             in_user_storage.trim()
+        );
+        anyhow::ensure!(
+            owners.split_whitespace().collect::<Vec<_>>() == ["0:0", "1234:1234"],
+            "the container sees the image's files owned by {:?}, where the image sets 0:0 \
+             and 1234:1234",
+            owners.trim()
         );
         Ok(())
     }
@@ -284,55 +304,22 @@ async fn run_localhost_test_with_kernel(
 /// pulling from registry `localhost`, which fails. The `{marker}` makes each
 /// image's content — and therefore its digest — distinct.
 async fn build_test_image(image_name: &str, marker: &str) -> Result<()> {
-    use std::io::Write;
-    use tempfile::TempDir;
-
-    // Create a temporary directory for the Containerfile
-    let temp_dir = TempDir::new().context("creating temp dir")?;
-    let containerfile_path = temp_dir.path().join("Containerfile");
-
-    // Write a simple Containerfile (use ECR to avoid Docker Hub rate limits)
-    let mut file = std::fs::File::create(&containerfile_path)?;
-    writeln!(
-        file,
-        r#"FROM public.ecr.aws/nginx/nginx:alpine
-CMD ["echo", "{marker}"]"#
-    )?;
-
-    // Build the image with podman
-    let output = tokio::process::Command::new("podman")
-        .args([
-            "build",
-            "-t",
-            image_name,
-            "-f",
-            &containerfile_path.to_string_lossy(),
-            temp_dir.path().to_str().unwrap(),
-        ])
-        .output()
-        .await
-        .context("running podman build")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to build test image: {}", stderr);
-    }
-
-    println!("  Built {} image", image_name);
-    Ok(())
+    build_image(
+        image_name,
+        &format!("FROM public.ecr.aws/nginx/nginx:alpine\nCMD [\"echo\", \"{marker}\"]\n"),
+        &[],
+    )
+    .await
 }
 
-/// Build an image that stays running and holds [`STORE_MARKER`] at its root. `suffix`
-/// goes into the marker's content, so each test's image has its own digest.
-async fn build_marker_image(image_name: &str, suffix: &str) -> Result<()> {
+/// Build `image_name` from `containerfile` (use ECR to avoid Docker Hub rate limits),
+/// with `files` (name, content) in the build context.
+async fn build_image(image_name: &str, containerfile: &str, files: &[(&str, &str)]) -> Result<()> {
     let temp_dir = tempfile::TempDir::new().context("creating temp dir")?;
-    std::fs::write(temp_dir.path().join(STORE_MARKER), format!("{suffix}\n"))?;
-    std::fs::write(
-        temp_dir.path().join("Containerfile"),
-        format!(
-            "FROM public.ecr.aws/nginx/nginx:alpine\nCOPY {STORE_MARKER} /{STORE_MARKER}\nCMD [\"sleep\", \"3600\"]\n"
-        ),
-    )?;
+    std::fs::write(temp_dir.path().join("Containerfile"), containerfile)?;
+    for (name, content) in files {
+        std::fs::write(temp_dir.path().join(name), content)?;
+    }
     let output = tokio::process::Command::new("podman")
         .args(["build", "-t", image_name])
         .arg(temp_dir.path())
@@ -344,7 +331,25 @@ async fn build_marker_image(image_name: &str, suffix: &str) -> Result<()> {
         "Failed to build test image: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    println!("  Built {} image", image_name);
     Ok(())
+}
+
+/// Build an image that stays running and holds [`STORE_MARKER`], owned by root, and
+/// [`STORE_CHOWNED`], owned by 1234:1234, at its root. `suffix` goes into the marker's
+/// content, so each test's image has its own digest.
+async fn build_marker_image(image_name: &str, suffix: &str) -> Result<()> {
+    build_image(
+        image_name,
+        &format!(
+            "FROM public.ecr.aws/nginx/nginx:alpine\n\
+             COPY {STORE_MARKER} /{STORE_MARKER}\n\
+             COPY --chown=1234:1234 {STORE_MARKER} /{STORE_CHOWNED}\n\
+             CMD [\"sleep\", \"3600\"]\n"
+        ),
+        &[(STORE_MARKER, &format!("{suffix}\n"))],
+    )
+    .await
 }
 
 /// Get the immutable image ID (`sha256:…`) of a localhost image via podman.
