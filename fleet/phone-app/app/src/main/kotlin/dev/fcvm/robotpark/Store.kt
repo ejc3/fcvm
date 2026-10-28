@@ -63,6 +63,18 @@ object Store {
      * the epoch the move is filed under come from one scene snapshot; a scene of another epoch
      * arriving meanwhile clears the move with the rest of the old clock's (LocalMoves).
      */
+    /**
+     * Freezes the screen at `t` (null: run again), unless `t` is before the pruned history.
+     * Under the same lock as [addMove], so a move pruned meanwhile cannot leave an accepted t
+     * undrawable; and while frozen, addMove prunes against the frozen t (frameTime returns it).
+     */
+    @Synchronized fun freeze(t: Double?): String? {
+        val from = local.forScene(scene).from
+        if (t != null && t < from) return "t: before t=$from, where this phone's own older moves were pruned"
+        frozenT = t
+        return null
+    }
+
     @Synchronized fun addMove(kind: MoveKind, t: Double?): Double {
         val s = scene
         val now = frameTime(s)

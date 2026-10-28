@@ -135,6 +135,24 @@ class SceneTest {
         }
     }
 
+    /** The beat keeps going for the whole of a long dance window; only its confetti ends at 10.5 s. */
+    @Test fun theBeatKeepsGoingThroughALongDance() {
+        val long = scene.copy(moves = listOf(Move(0.0, MoveKind.DANCE), Move(7.0, MoveKind.DANCE)))
+        val a = frame(long, 11.0); val b = frame(long, 12.25)
+        assertEquals(1f, b.dance)
+        assertNotEquals("the beat moves at t=11..12.25", a.beat, b.beat)
+        assertEquals(1.0e4f, b.danceAge) // its confetti is over
+    }
+
+    /**
+     * A freeze is checked against the pruned history and published under the lock addMove
+     * prunes under, so a move pruned in between cannot leave an accepted frozen t undrawable.
+     */
+    @Test fun aFreezeIsCheckedAndSetUnderTheMovesLock() {
+        assertTrue("Store.freeze is synchronized with addMove", Regex("""@Synchronized fun freeze\(""").containsMatchIn(appSource("Store.kt")))
+        assertTrue("PhoneApp freezes through Store.freeze", appSource("PhoneApp.kt").contains("Store.freeze(") && !appSource("PhoneApp.kt").contains("Store.frozenT ="))
+    }
+
     /** The phone's own moves set the pose and never the walk; the scene's moves stop it. */
     @Test fun onlyTheScenesMovesStopTheCrowd() {
         val bare = scene.copy(moves = emptyList())

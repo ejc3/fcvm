@@ -94,8 +94,8 @@ class FrameState(
             val dances = merge(posed.filter { it.kind == MoveKind.DANCE }.map { it.t })
             val waves = merge(posed.filter { it.kind == MoveKind.WAVE }.map { it.t })
             val walk = t - frozen(all, t)
-            val danceStart = dances.lastOrNull { it.first <= t && t < it.second }?.first
-                ?: dances.lastOrNull { it.first <= t }?.first
+            val activeDance = dances.lastOrNull { it.first <= t && t < it.second }?.first
+            val danceStart = activeDance ?: dances.lastOrNull { it.first <= t }?.first
             // past its confetti, a dance leaves nothing in the frame: the same age as no dance at all
             val danceAge = if (danceStart == null || t - danceStart >= CONFETTI_SECS) 1.0e4 else t - danceStart
 
@@ -140,7 +140,8 @@ class FrameState(
                 dance = weight(dances, t).toFloat(),
                 wave = weight(waves, t).toFloat(),
                 still = weight(all, t).toFloat(),
-                beat = Time.wrap(danceAge * 2.0, 64.0).toFloat(),
+                // 120 bpm from the start of the dance window being danced (0 when none is)
+                beat = (if (activeDance == null) 0.0 else Time.wrap((t - activeDance) * 2.0, 64.0)).toFloat(),
                 danceAge = danceAge.toFloat(),
                 night = if (night) 1f else 0f,
                 sunDir = v(sun),
