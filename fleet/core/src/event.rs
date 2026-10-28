@@ -157,6 +157,10 @@ pub enum Intent {
         pitch_deg: f64,
         dive: f64,
     },
+    /// Fly the private session's camera on its autopilot (`on`), or stop it where it is.
+    ClaimAutopilot {
+        on: bool,
+    },
 }
 
 fn num(args: &serde_json::Value, key: &str) -> Result<f64, String> {
@@ -305,6 +309,12 @@ impl Intent {
                     dive,
                 })
             }
+            "claim_autopilot" => Ok(Intent::ClaimAutopilot {
+                on: args
+                    .get("on")
+                    .and_then(|v| v.as_bool())
+                    .ok_or("args.on must be true or false")?,
+            }),
             other => Err(format!("unknown intent {other:?}")),
         }
     }

@@ -388,14 +388,17 @@ pub async fn run(shared: Arc<Shared>, ffmpeg: String, url: String, cancel: Cance
 }
 
 async fn once(shared: &Shared, ffmpeg: &str, url: &str, cancel: &CancellationToken) -> Result<()> {
-    let mut child = tokio::process::Command::new(ffmpeg)
-        .args(ffmpeg_args(url))
+    let mut cmd = tokio::process::Command::new(ffmpeg);
+    cmd.args(ffmpeg_args(url))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("starting {ffmpeg}"))?;
+        .kill_on_drop(true);
+    // kill_on_drop cannot run when the aggregator itself is killed (the supervisor's stop is
+    // a SIGKILL), and an ffmpeg blocked on a stalled ingest does not exit when its stdin
+    // closes: the kernel ends it with its parent.
+    super::child::arm_pdeathsig(cmd.as_std_mut());
+    let mut child = cmd.spawn().with_context(|| format!("starting {ffmpeg}"))?;
     let mut stdin = child.stdin.take().context("ffmpeg stdin")?;
     let mut rx = shared.out.subscribe();
     let mut line = Timeline::default();

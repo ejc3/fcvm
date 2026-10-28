@@ -1,12 +1,15 @@
 "use client";
 
-// The drawer: directing the scene (choosing the camera's next stop, writing a word, dropping a
-// light), how the streams arrive, the stats overlay, and what the page is (the
-// counters, recent actions, how a square is isolated). Every
-// label comes from the view model; every action goes through WallClient.act,
-// which holds it until the Turnstile check passes when the coordinator asks for one.
+// The drawer shell and its three panels. "play" directs the scene (choosing the camera's next
+// stop, writing a word, dropping a light, how the streams arrive, the stats overlay). "about"
+// is what the page is (title, sentence, counters, recent actions). "isolation" is how a square
+// is isolated. Each header button opens its own panel in the same shell, so they share the
+// close button, Escape and focus handling, and each opens at its top. On a phone the header has
+// no room for a third icon, so About carries the isolation section too (`isolationInAbout`). Every label comes from
+// the view model; every action goes through WallClient.act, which holds it until the Turnstile
+// check passes when the coordinator asks for one.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { wordArgs, type WallView } from "../../core/index.ts";
 import { TurnstileWidget } from "./Turnstile.tsx";
 import type { WallClient } from "./wall-client.ts";
@@ -28,36 +31,49 @@ export function VerifyBox({ client, view }: { client: WallClient; view: WallView
   );
 }
 
-export function PlayDrawer({ client, view, onClose, section }: { client: WallClient; view: WallView; onClose: () => void; section: string | null }) {
+export type DrawerPanel = "play" | "about" | "isolation";
+
+export function PlayDrawer({ client, view, onClose, panel, isolationInAbout, word, setWord }: { client: WallClient; view: WallView; onClose: () => void; panel: DrawerPanel; isolationInAbout: boolean; word: string; setWord: (word: string) => void }) {
   const p = view.play!;
-  const [word, setWord] = useState("");
-  const panel = useRef<HTMLElement | null>(null);
-  const iso = view.isolation;
+  const shell = useRef<HTMLElement | null>(null);
+  const title = panel === "about" ? view.title : panel === "isolation" ? view.isolation.title : p.title;
 
   useEffect(() => {
-    const target = section ? panel.current?.querySelector<HTMLElement>(`#${section}-title`) : null;
-    if (target) {
-      target.scrollIntoView({ block: "start" });
-      target.focus();
-    } else {
-      panel.current?.querySelector<HTMLElement>("button, input")?.focus();
-    }
+    // Every panel opens at its top: focus without scrolling, then pin the scroll to 0.
+    const target = panel === "play" ? shell.current?.querySelector<HTMLElement>("button, input") : shell.current?.querySelector<HTMLElement>(`#${panel}-title`);
+    target?.focus({ preventScroll: true });
+    if (shell.current) shell.current.scrollTop = 0;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose, section]);
+  }, [onClose, panel]);
 
   return (
-    <aside ref={panel} className="drawer" role="dialog" aria-modal="false" aria-labelledby="play-title" data-testid="drawer">
+    <aside ref={shell} className="drawer" role="dialog" aria-modal="false" aria-labelledby={`${panel}-title`} data-testid="drawer" data-panel={panel}>
       <header>
-        <h2 id="play-title">{p.title}</h2>
+        <h2 id={`${panel}-title`} tabIndex={panel === "play" ? undefined : -1}>
+          {title}
+        </h2>
         <button type="button" className="btn" onClick={onClose}>
           {p.close}
         </button>
       </header>
+      {/* In the shell, so a queued action's check is there whichever panel is open. */}
       <VerifyBox client={client} view={view} />
+      {panel === "about" ? <AboutSection view={view} /> : null}
+      {panel === "about" && isolationInAbout ? <IsolationSection view={view} heading /> : null}
+      {panel === "isolation" ? <IsolationSection view={view} /> : null}
+      {panel === "play" ? <PlaySections client={client} view={view} word={word} setWord={setWord} /> : null}
+    </aside>
+  );
+}
+
+function PlaySections({ client, view, word, setWord }: { client: WallClient; view: WallView; word: string; setWord: (word: string) => void }) {
+  const p = view.play!;
+  return (
+    <>
       {p.nudge ? (
         <section aria-labelledby="nudge-title">
           <h3 id="nudge-title">{p.nudge.title}</h3>
@@ -175,11 +191,14 @@ export function PlayDrawer({ client, view, onClose, section }: { client: WallCli
           {p.stats.family}
         </p>
       </section>
-      <section className="about" aria-labelledby="about-title" data-testid="about">
-        <h3 id="about-title" tabIndex={-1}>
-          {view.title}
-        </h3>
-        <p data-testid="sentence">{view.sentence}</p>
+    </>
+  );
+}
+
+function AboutSection({ view }: { view: WallView }) {
+  return (
+    <section className="about" data-testid="about">
+      <p data-testid="sentence">{view.sentence}</p>
         {view.counter ? (
           <p className="counter" data-testid="counter">
             {view.counter.label}:{" "}
@@ -209,18 +228,21 @@ export function PlayDrawer({ client, view, onClose, section }: { client: WallCli
             ))}
           </ol>
         ) : null}
-      </section>
-      <section className="isolation" aria-labelledby="isolation-title" data-testid="isolation">
-        <h3 id="isolation-title" tabIndex={-1}>
-          {iso.title}
-        </h3>
-        {iso.sentences.map((t) => (
-          <p key={t}>{t}</p>
-        ))}
-        <a href={iso.link.href} target="_blank" rel="noopener noreferrer" data-testid="isolation-repo">
-          {iso.link.label}
-        </a>
-      </section>
-    </aside>
+    </section>
+  );
+}
+
+function IsolationSection({ view, heading = false }: { view: WallView; heading?: boolean }) {
+  const iso = view.isolation;
+  return (
+    <section className="isolation" data-testid="isolation">
+      {heading ? <h3>{iso.title}</h3> : null}
+      {iso.sentences.map((t) => (
+        <p key={t}>{t}</p>
+      ))}
+      <a href={iso.link.href} target="_blank" rel="noopener noreferrer" data-testid="isolation-repo">
+        {iso.link.label}
+      </a>
+    </section>
   );
 }

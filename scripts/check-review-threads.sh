@@ -735,8 +735,26 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 #   cr_autopilot  <!-- autopilot:start --> .. <!-- autopilot:end -->
 #                                                                 rendered, shape-checked
 #   codex_about   <details> <summary>ℹ️ About Codex ..</details>  rendered, shape-checked
+#   cr_stack      <!-- review_stack_entry_start --> .. _end       rendered, shape-checked
+#   cr_recent     <!-- recent_review_start --> .. _end             rendered, shape-checked
+#   cr_finishing  <!-- finishing_touch_checkbox_start --> .. _end  rendered, shape-checked
+#   cr_walkthrough, cr_risk, cr_premerge                          FREE regions, see below
 #   html_comment  <!-- .. -->                                     removed only where
 #                                                                 CommonMark hides it
+#
+# The three FREE regions are the one place a rendered region is removed without its lines
+# being read: the walkthrough, the Merge Risk text and the pre-merge checks of CodeRabbit's
+# summary comment, which are the bot's prose about the change and cannot be shape-listed.
+# They are removed only inside is_cr_clean_walkthrough, which requires the summarize marker
+# and no other marker, each of the six blocks exactly once, the recent-review block saying
+# "No actionable comments were generated in the recent review." over a reviewed range, a
+# Merge Risk of Minimal, and every line outside the blocks to be a fold or that Merge Risk
+# line. Findings reach this gate as review threads and review bodies, which are judged on
+# their own; text added to the comment anywhere outside a free region is left over and makes
+# the comment claimable. The exemption grants no coverage: walkthrough_sha decides that.
+# Read off #1304 through #1386 (8 comments, all matched), 2026-10-27. The
+# "Review finished." reply was posted with <dl><dd> wrappers on #1392; is_verdict lists
+# both layouts, and the reply names no commit, so it covers nothing.
 #
 # Both shape lists were read off what the bots posted on ejc3/fcvm #789 through #901 (13
 # About blocks, 17 tips blocks) and match all of it with nothing left over. Every shape is
@@ -795,6 +813,44 @@ def cr_autopilot_res:
   [ "^- \\[ \\] <!-- \\{\"checkboxId\": ?\"[0-9a-f-]+\"\\} --> <strong title=\"Keep fixing CodeRabbit findings and required CI, and resolving merge conflicts\">(Autofix|Autopilot)</strong> · Keep fixing CodeRabbit findings and required CI, and resolving merge conflicts$"
   , "^> Autopilot is currently an internal CodeRabbit preview\\.$"
   ];
+def cr_icon_summary_re($icon; $name):
+  "^<summary><strong><picture><source media=\"\\(prefers-color-scheme: dark\\)\" srcset=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-comment-icons-v1/\($icon)-dark\\.svg\"><img src=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-comment-icons-v1/\($icon)\\.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> \($name)</strong></summary>$";
+def cr_stack_res:
+  [ "^<a href=\"https://app\\.coderabbit\\.ai/change-stack/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+\\?scope=[A-Za-z0-9_]+&amp;cs_source=review_comment\"><picture><source media=\"\\(prefers-color-scheme: dark\\)\" srcset=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-stack-in-coderabbit-ui-dark\\.svg\\?v=3\"><source media=\"\\(prefers-color-scheme: light\\)\" srcset=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-stack-in-coderabbit-ui\\.svg\\?v=3\"><img src=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-stack-in-coderabbit-ui\\.svg\\?v=3\" alt=\"Review in Change Stack →\" height=\"32\"></picture></a>$"
+  ];
+def cr_recent_res:
+  [ "^No actionable comments were generated in the recent review\\.$"
+  , "^</?details>$"
+  , "^</?(dl|dd)>$"
+  , "^<!-- review_info_content -->$"
+  , "^<summary><strong><picture><img src=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-comment-icons-v1/info\\.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> Recent review info</strong></summary>$"
+  , cr_icon_summary_re("cog"; "Run configuration")
+  , cr_icon_summary_re("git-commit-horizontal"; "Commits")
+  , cr_icon_summary_re("file-plus-corner"; "Files selected for processing: [0-9]+")
+  , cr_icon_summary_re("file-minus-corner"; "Files ignored due to path filters: [0-9]+")
+  , cr_icon_summary_re("file-no-changes"; "Files with no reviewable changes: [0-9]+")
+  , "^\\* `[^`]+`( is excluded by `[^`]+`)?$"
+  , "^\\* [A-Za-z0-9_./@+-]+$"
+  , "^- \\*\\*(Source mode\\*\\*: Auto|(Repository|Branch|Commit)\\*\\*: Unavailable|File\\*\\*: No configuration file from this repository applied|(Layers|Configuration used)\\*\\*: defaults|Review profile\\*\\*: CHILL|Plan\\*\\*: (Advanced|Pro Plus|Team))$"
+  , "^- \\*\\*Run ID\\*\\*: `[0-9a-f-]+`$"
+  , "^Reviewing files that changed from the base of the PR and between [0-9a-f]{40} and [0-9a-f]{40}\\.$"
+  , "^\\*\\*Included review availability:\\*\\* This review used your included allowance\\. Your plan provides up to [0-9]+ included reviews? per hour; [0-9]+ remain after this review\\.$"
+  ];
+def cr_finishing_res:
+  [ "^</?details( open)?>$"
+  , "^</?(dl|dd)>$"
+  , "^<summary><strong>(Finishing Touches(: 💡 [0-9]+)?|📝 Generate docstrings(: 💡)?|🧪 Generate unit tests \\(beta\\))</strong></summary>$"
+  , "^<!-- finishing_touch_suggestion:[a-z_]+ -->$"
+  , "^- \\[ \\] <!-- \\{\"checkboxId\": ?\"[0-9a-f-]+\"(, \"radioGroupId\": \"[A-Za-z0-9_-]+\")?\\} --> (Commit to this branch|Create a new PR)$"
+  ];
+# What may stand between the accounted regions of a clean walkthrough: the folds that wrap
+# them and the Merge Risk summary line. Only a Minimal risk is listed.
+def cr_risk_summary_re: "^<summary><strong>Merge Risk:</strong> <strong><picture><img src=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-comment-icons-v1/risk-unassessed-16\\.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> Minimal</strong> · up to <code>[0-9a-f]{5,40}</code></summary>$";
+def cr_frame_res:
+  [ "^</?details>$"
+  , "^</?(dl|dd)>$"
+  , cr_risk_summary_re
+  ];
 def accounted_regions:
   [ { name: "cr_tips", rendered: true, lines: cr_tips_res,
       re: "<!-- tips_start -->(?<inner>(.|\n)*?)<!-- tips_end -->" }
@@ -802,6 +858,18 @@ def accounted_regions:
       re: "<!-- autopilot:start -->(?<inner>(.|\n)*?)<!-- autopilot:end -->" }
   , { name: "codex_about", rendered: true, lines: codex_about_res,
       re: "<details> <summary>ℹ️ About Codex in GitHub</summary>(?<inner>(.|\n)*?)</details>" }
+  , { name: "cr_stack", rendered: true, lines: cr_stack_res,
+      re: "<!-- review_stack_entry_start -->(?<inner>(.|\n)*?)<!-- review_stack_entry_end -->" }
+  , { name: "cr_recent", rendered: true, lines: cr_recent_res,
+      re: "<!-- recent_review_start -->(?<inner>(.|\n)*?)<!-- recent_review_end -->" }
+  , { name: "cr_finishing", rendered: true, lines: cr_finishing_res,
+      re: "<!-- finishing_touch_checkbox_start -->(?<inner>(.|\n)*?)<!-- finishing_touch_checkbox_end -->" }
+  , { name: "cr_walkthrough", rendered: true, free: true, lines: null,
+      re: "<!-- walkthrough_start -->(?<inner>(.|\n)*?)<!-- walkthrough_end -->" }
+  , { name: "cr_risk", rendered: true, free: true, lines: null,
+      re: "<!-- final_review_risk_start -->(?<inner>(.|\n)*?)<!-- final_review_risk_end -->" }
+  , { name: "cr_premerge", rendered: true, free: true, lines: null,
+      re: "<!-- pre_merge_checks_walkthrough_start -->(?<inner>(.|\n)*?)<!-- pre_merge_checks_walkthrough_end -->" }
   , { name: "html_comment", rendered: false, lines: null, re: null }
   ];
 # One complete comment on one line. Spanning lines is deliberately not matched: GitHub
@@ -847,6 +915,7 @@ def strip_accounted($names):
     if . == null then null
     elif ($r.name | IN($names[]) | not) then .
     elif ($r.rendered | not) then strip_hidden_comments
+    elif ($r.free // false) then gsub($r.re; "")
     elif (($r.lines // []) | length) == 0 then null
     elif ([match($r.re; "g")] | all(.[];
             [.captures[] | select(.name == "inner") | .string] as $c
@@ -870,6 +939,8 @@ def is_verdict:
   | verdict_lines as $l
   | ($l == ["<details>", "<summary>✅ Action performed</summary>", "Full review finished.", "</details>"])
     or ($l == ["<details>", "<summary>✅ Action performed</summary>", "Review finished.", "</details>"])
+    or ($l == ["<details>", "<summary>✅ Action performed</summary>", "<dl>", "<dd>", "Full review finished.", "</dd>", "</dl>", "</details>"])
+    or ($l == ["<details>", "<summary>✅ Action performed</summary>", "<dl>", "<dd>", "Review finished.", "</dd>", "</dl>", "</details>"])
     or (($l | length) == 2 and ($l[0] | test(codex_line_re)) and ($l[1] | test(reviewed_re)))
     or (($l | length) == 1 and ($l[0] | test(codex_line_re)) and ($b | test(codex_receipt_re)));
 def verdict_sha:
@@ -953,8 +1024,6 @@ def cr_notice_heading_re: "^## (Review limit reached|Review skipped|Reviews paus
 # shapes were listed. A line outside this list makes the comment claimable, which is what it
 # was before the exemption existed: the cost of an unlisted shape is one disposition, and
 # the cost of accepting one is a finding nobody has to answer.
-def cr_icon_summary_re($icon; $name):
-  "^<summary><strong><picture><source media=\"\\(prefers-color-scheme: dark\\)\" srcset=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-comment-icons-v1/\($icon)-dark\\.svg\"><img src=\"https://storage\\.googleapis\\.com/coderabbit_public_assets/review-comment-icons-v1/\($icon)\\.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> \($name)</strong></summary>$";
 def cr_notice_payload_res:
   [ "^$"
   , "^</?details>$"
@@ -1022,6 +1091,34 @@ def is_cr_summary_notice:
                   and ((($p[0] + $q[1]) | strip_accounted(["cr_tips", "cr_autopilot", "html_comment"])) as $rest
                        | $rest != null and ($rest | test("[^[:space:]]") | not))));
 def is_cr_notice: is_cr_reply_notice or is_cr_summary_notice;
+# The CodeRabbit summary comment once its review has finished with nothing to report: the
+# summarize marker and no other marker, each of six regions exactly once, the recent-review
+# block saying no actionable comments were generated, and nothing left between the regions
+# but folds and one Minimal Merge Risk line. The review stack link, the recent-review block, the
+# finishing touches and the tips and Autofix blocks are shape-checked. The walkthrough, the
+# risk text and the pre-merge checks are the bot own description of the change, listed
+# as free regions in accounted_regions: findings reach this gate as review threads and review
+# bodies, which are judged on their own, and the recent-review block above is where the bot
+# says there are none. Anything appended or inserted outside those regions is left over and
+# makes the comment claimable. This exempts the comment from answers; it grants no coverage,
+# which walkthrough_sha decides.
+def cr_walkthrough_names:
+  ["review_stack_entry", "recent_review", "walkthrough", "final_review_risk", "pre_merge_checks_walkthrough", "finishing_touch_checkbox"];
+def is_cr_clean_walkthrough:
+  (. // "") as $b
+  | ([$b | scan(cr_marker_re)] == [cr_summarize_marker])
+    and ($b | test("(?m)^>[[:space:]]*##") | not)
+    and all(cr_walkthrough_names[]; . as $n
+            | ([$b | scan("<!-- \($n)_start -->")] | length) == 1
+              and ([$b | scan("<!-- \($n)_end -->")] | length) == 1)
+    and (($b | capture("<!-- recent_review_start -->(?<r>(.|\n)*?)<!-- recent_review_end -->") | .r)
+         | test("(?m)^No actionable comments were generated in the recent review\\.$")
+           and test(cr_range_re))
+    and (($b | strip_accounted(["cr_stack", "cr_recent", "cr_finishing", "cr_walkthrough", "cr_risk", "cr_premerge", "cr_tips", "cr_autopilot", "html_comment"])) as $rest
+         | $rest != null
+           and ($rest | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0))
+                | all(.[]; . as $line | any(cr_frame_res[]; . as $re | $line | test($re)))
+                  and (map(if test(cr_risk_summary_re) then 1 else 0 end) | add) == 1));
 def greptile_status_marker: "<!-- greptile-status -->";
 def greptile_bypass_re: "^Bypass the limit by tagging `@greptile-apps` to review\\.$";
 def greptile_status_shapes:
@@ -1251,6 +1348,7 @@ bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" 
                        or (($c.author.login // "") == $cr and ($c.body | is_cr_notice))))
          or ((($c.author.__typename // "") == "Bot") and (($c.author.login // "") == $greptile)
              and ($c.body | is_greptile_status_notice))) as $notice
+      | ($listed and (($c.author.login // "") == $cr) and ($c.body | is_cr_clean_walkthrough)) as $wt
       | (($gclean != null) and (($c.author.__typename // "") == "Bot")
          and (($c.author.login // "") == $greptile) and ($c.body | is_greptile_summary)
          and (($c.body | greptile_summary_sha($owner; $repo)) as $gs
@@ -1265,7 +1363,7 @@ bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" 
                          | map(select((.sha // "") != "" and (.at // "") != ""))),
          claimable: ((.author.login | IN($skip[]) | not)
                      and ((.body // "") | test($trig; "i") | not)
-                     and (($v or $sum or $notice or $gsum) | not))}))' \
+                     and (($v or $sum or $notice or $gsum or $wt) | not))}))' \
          <(echo "$reviews") <(echo "$prcomments")) || {
   echo "verdict: BLOCKED — could not merge PR-level bodies." >&2; exit 2; }
 

@@ -70,7 +70,56 @@ static Scene two_holds() {
   return s;
 }
 
+// The own-GPU autopilot (fleet/core/src/autopilot.rs) as the coordinator hands it to a
+// renderer: fleet/core/tests/autopilot_lap.json holds one lap of keyframes, the same
+// path paused part way, and the pose the coordinator computes at every quarter second.
+// The coordinator starts a pause or a drag from the pose it computes, so it must be the
+// pose this renderer draws; and the eye must clear the ground by more than the 60 m the
+// renderer would otherwise lift it, which would move the camera off the path.
+static void check_autopilot_lap() {
+  std::string me = __FILE__;
+  std::string dir = me.substr(0, me.find_last_of('/') + 1);
+  std::ifstream f(dir + "../../core/tests/autopilot_lap.json");
+  std::stringstream ss;
+  ss << f.rdbuf();
+  CHECK(f.good() && ss.str().size() > 0, "fleet/core/tests/autopilot_lap.json is readable");
+  if (ss.str().empty()) return;
+  Json j = Json::parse(ss.str());
+  const V4* tab = host_noise().tab.data();
+  double min_clear = 1e9, worst_t = 0, max_err = 0;
+  int samples = 0;
+  for (const char* part : {"lap", "paused"}) {
+    std::vector<Keyframe> kf;
+    for (const Json& k : j.at(part).at("camera").array("camera")) {
+      Keyframe x{};
+      x.t = k.at("t").number("t");
+      for (int c = 0; c < 3; c++) {
+        x.pos[c] = k.at("pos").arr[c].num;
+        x.look[c] = k.at("look").arr[c].num;
+      }
+      x.fov_deg = k.at("fov_deg").number("fov_deg");
+      kf.push_back(x);
+    }
+    for (const Json& s : j.at(part).at("samples").array("samples")) {
+      double t = s.at("t").number("t");
+      CamPose p = camera_at(kf, t);
+      for (int c = 0; c < 3; c++) {
+        max_err = std::max(max_err, std::fabs(p.pos[c] - s.at("pos").arr[c].num));
+        max_err = std::max(max_err, std::fabs(p.look[c] - s.at("look").arr[c].num));
+      }
+      max_err = std::max(max_err, std::fabs(p.fov_deg - s.at("fov_deg").number("fov_deg")));
+      double ground = std::max(0.0, (double)surface_h(v2((float)p.pos[0], (float)p.pos[2]), 9, tab));
+      if (p.pos[1] - ground < min_clear) { min_clear = p.pos[1] - ground; worst_t = t; }
+      samples++;
+    }
+  }
+  CHECK(samples > 200, "%d samples", samples);
+  CHECK(max_err < 1e-9, "the coordinator's camera differs from the renderer's by %g", max_err);
+  CHECK(min_clear > 0.15, "the eye is %.3f km above the ground at t=%.2f", min_clear, worst_t);
+}
+
 int main() {
+  check_autopilot_lap();
   // --- WebSocket handshake (RFC 6455 section 1.3 example)
   CHECK(ws_accept("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "got %s",
         ws_accept("dGhlIHNhbXBsZSBub25jZQ==").c_str());
@@ -182,6 +231,47 @@ int main() {
           "fractional epoch rejected");
     CHECK(bad(R"({"epoch_unix_ms":0,"rect":{"x":0,"y":0,"w":1,"h":1},"image_aspect":1.7,"camera":[{"t":0,"pos":[0,1],"look":[0,1,1],"fov_deg":60}],"time_of_day":0.5})"),
           "pos with 2 numbers rejected");
+  }
+
+  // --- weather: keys parsed, eased between them, held outside them, in the hold key
+  {
+    const char* head = R"({"epoch_unix_ms":0,"rect":{"x":0,"y":0,"w":1,"h":1},"image_aspect":1.7778,
+        "camera":[{"t":0,"pos":[0,1,0],"look":[0,1,1],"fov_deg":60}],"time_of_day":0.5,"weather":)";
+    auto with = [&](const char* w) { return std::string(head) + w + "}"; };
+    Scene s = parse_scene(with(R"([{"t":10,"cover":1,"towers":1,"rays":1,"snow_line_km":0.5},{"t":0}])"));
+    CHECK(s.weather.size() == 2 && s.weather[0].t == 0 && s.weather[1].towers == 1, "weather keys sorted by t");
+    CHECK(s.weather[0].cover == 0.5 && s.weather[0].towers == 0 && s.weather[0].rays == 0 && s.weather[0].snow_line_km == 1.6,
+          "absent weather fields take the defaults");
+    WeatherKey m = weather_at(s.weather, 5), a = weather_at(s.weather, -3), b = weather_at(s.weather, 99);
+    CHECK(std::fabs(m.cover - 0.75) < 1e-12 && std::fabs(m.snow_line_km - 1.05) < 1e-12, "halfway eases halfway");
+    WeatherKey q = weather_at(s.weather, 2.5);
+    CHECK(q.towers > 0.0 && q.towers < 0.25, "eased, not linear, a quarter of the way (%g)", q.towers);
+    CHECK(a.cover == 0.5 && b.cover == 1 && b.rays == 1, "held before the first and after the last key");
+    CHECK(weather_at({}, 3).cover == 0.5 && weather_at({}, 3).snow_line_km == 1.6, "no keys: the defaults");
+    auto bad = [&](const char* w) {
+      try { parse_scene(with(w)); } catch (const std::exception&) { return true; }
+      return false;
+    };
+    CHECK(bad(R"([{"t":0,"cover":1.5}])") && bad(R"([{"t":0,"snow_line_km":-1}])") && bad(R"([{"cover":0.2}])") &&
+              bad(R"({"t":0})"),
+          "out-of-range field, missing t and a non-array refused");
+    // a held frame's key and parameters follow the weather at the hold's start
+    Scene h = s;
+    h.camera = {Keyframe{0, {0, 1, 0}, {0, 1, 1}, 60}, Keyframe{100, {0, 1, 0}, {0, 1, 1}, 60}};
+    Tile tl = tile_geometry(Rect{}, 16.0 / 9.0, 90);
+    uint64_t k1, k2;
+    bool held;
+    FrameParams p1 = build_frame(h, tl, 20, &k1, &held);
+    CHECK(held && p1.cloud_cover == 0.5f && p1.cloud_top == 5.6f && p1.snow_line == 1.6f, "a hold draws its start's weather");
+    Scene h2 = h;
+    h2.weather[0].cover = 0.2;
+    build_frame(h2, tl, 20, &k2, &held);
+    CHECK(k1 != k2, "the weather is in the hold key");
+    Scene mv = s;
+    mv.camera = {Keyframe{0, {0, 1, 0}, {0, 1, 1}, 60}, Keyframe{100, {5, 1, 0}, {5, 1, 1}, 60}};
+    FrameParams p2 = build_frame(mv, tl, 10, &k2, &held);
+    CHECK(!held && p2.cloud_cover == 1.0f && std::fabs(p2.cloud_top - 9.6f) < 1e-5f && p2.rays == 1.0f && p2.snow_line == 0.5f,
+          "a moving frame draws the weather at its own time");
   }
 
   // --- camera: keyframes are hit exactly, outside the range the nearest holds, holds detected

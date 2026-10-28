@@ -5,7 +5,7 @@
 // before it goes back to the pool.
 
 import { useEffect, useRef, type RefObject } from "react";
-import { addDrag, CAMERA_KEYS, CAMERA_MOVES, emptyDrag, takeDrag, wheelDive, type DragAccumulator, type OwnView } from "../../core/index.ts";
+import { addDrag, AUTOPILOT_KEY, CAMERA_KEYS, CAMERA_MOVES, emptyDrag, takeDrag, wheelDive, type DragAccumulator, type OwnView } from "../../core/index.ts";
 import { Timeline } from "./FocusPanel.tsx";
 import type { WallClient } from "./wall-client.ts";
 
@@ -18,11 +18,21 @@ export function OwnGpu({ own, client, shotRef, onClose }: { own: OwnView; client
   const live = !own.ended && own.placed !== null;
   const liveRef = useRef(live);
   liveRef.current = live;
+  const autopilotRef = useRef(own.autopilot);
+  autopilotRef.current = own.autopilot;
 
   useEffect(() => {
     backRef.current?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
+      if (e.key === AUTOPILOT_KEY && (e.target as HTMLElement | null)?.tagName !== "INPUT") {
+        // Space toggles the autopilot, whichever button has focus: without this a focused
+        // button would take the key as a click (Back to the wall, or Pause a second time).
+        e.preventDefault();
+        const ap = autopilotRef.current;
+        if (ap && liveRef.current && !e.repeat) client.send("claim_autopilot", { on: !ap.on });
+        return;
+      }
       const i = CAMERA_KEYS[e.key];
       const m = i === undefined ? undefined : CAMERA_MOVES[i];
       if (!m || !liveRef.current || (e.target as HTMLElement | null)?.tagName === "INPUT") return;
@@ -102,6 +112,33 @@ export function OwnGpu({ own, client, shotRef, onClose }: { own: OwnView; client
         </div>
       </div>
       <footer>
+        {own.autopilot ? (
+          <div className={`ap${own.autopilot.on ? " on" : ""}`}>
+            <button
+              type="button"
+              className="btn"
+              disabled={!live}
+              onClick={() => client.send("claim_autopilot", { on: !own.autopilot!.on })}
+              aria-keyshortcuts={own.autopilot.key}
+              data-testid="own-autopilot"
+            >
+              {own.autopilot.on ? (
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                  <rect x="5" y="4" width="5" height="16" rx="1" />
+                  <rect x="14" y="4" width="5" height="16" rx="1" />
+                </svg>
+              ) : (
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                  <path d="M7 4.5v15a1 1 0 0 0 1.5.86l12.5-7.5a1 1 0 0 0 0-1.72L8.5 3.64A1 1 0 0 0 7 4.5z" />
+                </svg>
+              )}
+              {own.autopilot.button}
+            </button>
+            <span className="ap-state" role="status" data-testid="own-autopilot-state">
+              {own.autopilot.state}
+            </span>
+          </div>
+        ) : null}
         <div className="cam" role="group" aria-label={own.cameraLabel}>
           {own.moves.map((m) => (
             <button key={m.label} type="button" className="btn" disabled={!live} onClick={() => nudge(m.dx, m.dy, m.dive)} aria-label={m.label}>

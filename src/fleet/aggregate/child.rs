@@ -146,7 +146,9 @@ pub fn connect_addr(listen: &str) -> String {
     }
 }
 
-fn arm_pdeathsig(command: &mut std::process::Command) {
+/// Kill the child when this process dies (SIGTERM), with the parent rechecked after the
+/// fork, so no hop of the teardown chain outlives its parent.
+pub(crate) fn arm_pdeathsig(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
     let parent = std::process::id() as libc::pid_t;
     // SAFETY: two async-signal-safe calls in the forked child; no allocation.

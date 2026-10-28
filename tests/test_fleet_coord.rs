@@ -2116,9 +2116,10 @@ async fn shutdown_waits_for_a_state_write_already_in_flight() {
         "the write is still running"
     );
     handle.shutdown().await;
-    assert_eq!(
-        written.lock().unwrap().len(),
-        1,
+    // The queued write has finished. The directed camera moves the time of day every tick
+    // while it flies, so the state may have changed since and shutdown writes it after.
+    assert!(
+        !written.lock().unwrap().is_empty(),
         "shutdown returned before the queued write finished"
     );
     tokio::time::timeout(Duration::from_secs(5), actor)
@@ -5687,4 +5688,46 @@ async fn a_closed_seat_is_kept_for_its_ticket_then_freed_without_promoting_anyon
     // A reload is a new connection, admitted afresh.
     let mut reload = Viewer::connect(&c.url).await;
     assert_eq!(reload.message("admission").await["locked"], false);
+/// A tile lent to a visitor ("Your own GPU") draws that visitor's private camera over the
+/// whole image: the broadcast keeps its rectangle black instead of streaming it.
+#[tokio::test]
+async fn the_broadcast_never_streams_a_borrowed_tile() {
+    let (url, handle) = coordinator(allow_all()).await;
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 2);
+    agent.assign().await;
+    agent.report("slot-1", "running", 1);
+    agent.report("slot-2", "running", 1);
+    let mut a = Viewer::connect_from(&url, Some("198.51.100.1")).await;
+    a.until(|s| s["tiles"][1]["phase"] == "running").await;
+    a.intent("c1", "claim_gpu", json!({})).await;
+    assert_eq!(a.receipt("c1").await["outcome"], "committed");
+    loop {
+        if agent.assign().await[1].private_camera.is_some() {
+            break;
+        }
+    }
+    // The private VM is up and has its frames.
+    agent.report("slot-2", "running", 2);
+    a.message_where("claim", |m| m["claim"]["phase"] == "running")
+        .await;
+    let mut layouts = handle.broadcast_layout.clone();
+    let l = tokio::time::timeout(
+        Duration::from_secs(10),
+        layouts.wait_for(|l| {
+            l.as_ref()
+                .is_some_and(|l| l.tiles.iter().any(|t| t.id == "slot-1" && t.url.is_some()))
+        }),
+    )
+    .await
+    .expect("a broadcast layout")
+    .unwrap()
+    .clone()
+    .unwrap();
+    for t in &l.tiles {
+        assert!(
+            t.id != "slot-2" || t.url.is_none(),
+            "the broadcast streams the borrowed tile: {:?}",
+            t.url
+        );
+    }
 }

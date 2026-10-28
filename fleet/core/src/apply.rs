@@ -2,7 +2,6 @@
 //! no randomness; the time is in the event (and a claim's token arrives as the intent's
 //! `secret`).
 
-use crate::director::viewpoints;
 use crate::event::{Event, Intent};
 use crate::history;
 use crate::protocol::{AgentMsg, HealthReport, SlotReport};
@@ -772,20 +771,62 @@ fn intent_effect(
                 .claim
                 .as_mut()
                 .unwrap();
+            // A drag on a flying camera takes it from the autopilot: it eases to rest
+            // along its path while it turns by the drag.
+            let (from, ease) = if claim.autopilot {
+                claim.autopilot = false;
+                claim.flight_t0 = None;
+                (
+                    crate::autopilot::camera_at(claim, now + crate::autopilot::TAKEOVER_SECS / 2.0),
+                    crate::autopilot::TAKEOVER_SECS,
+                )
+            } else {
+                (
+                    crate::autopilot::camera_at(claim, now),
+                    crate::scene::DRAG_EASE_SECS,
+                )
+            };
             let mut cam = crate::scene::Scene {
                 epoch_unix_ms: 0,
                 camera: claim.camera.clone(),
                 time_of_day: 0.0,
                 words: vec![],
                 lights: vec![],
+                weather: vec![],
             };
             let to = Keyframe {
                 intent: Some(c.id.to_string()),
-                ..drag(&cam.camera_at(now), *yaw_deg, *pitch_deg, *dive)
+                ..drag(&from, *yaw_deg, *pitch_deg, *dive)
             };
-            cam.steer(now, to);
+            cam.steer_over(now, to, ease);
             claim.camera = cam.camera;
             Ok("claim camera".into())
+        }
+        Intent::ClaimAutopilot { on } => {
+            let n = own_claim(&state.fleet, c.viewer)
+                .ok_or("claim_autopilot needs a GPU of your own (claim_gpu)")?;
+            let now = state.fleet.scene.t_at(at);
+            let claim = state
+                .fleet
+                .slots
+                .get_mut(&n)
+                .unwrap()
+                .claim
+                .as_mut()
+                .unwrap();
+            let intent = Some(c.id.to_string());
+            match (*on, claim.autopilot) {
+                (true, true) => Ok("autopilot already on".into()),
+                (false, false) => Ok("autopilot already off".into()),
+                (true, false) => {
+                    crate::autopilot::resume(claim, now, intent);
+                    Ok("autopilot on".into())
+                }
+                (false, true) => {
+                    crate::autopilot::pause(claim, now, crate::autopilot::PAUSE_SECS, intent);
+                    Ok("autopilot off".into())
+                }
+            }
         }
     }
 }
@@ -882,15 +923,8 @@ fn claim(state: &mut State, c: &Ctx) -> Result<String, String> {
     };
     f.claim_count += 1;
     let session = format!("claim-{}", f.claim_count);
-    let vp = &viewpoints()[f.director.current];
-    let now = f.scene.t_at(at);
-    let start = Keyframe {
-        t: now,
-        pos: vp.pos,
-        look: vp.look,
-        fov_deg: vp.fov_deg,
-        intent: Some(c.id.to_string()),
-    };
+    // The camera waits at the autopilot's start until the first frame shows, then flies.
+    let start = crate::autopilot::start_pose(f.scene.t_at(at), Some(c.id.to_string()));
     let slot = f.slots.get_mut(&n).unwrap();
     bump(slot, &format!("claim:{session}"), at);
     slot.claim = Some(Claim {
@@ -903,6 +937,8 @@ fn claim(state: &mut State, c: &Ctx) -> Result<String, String> {
         generation: slot.generation,
         first_frame_at: None,
         camera: vec![start],
+        autopilot: true,
+        flight_t0: None,
         borrowed,
     });
     Ok(format!("{session} on {}", slot.id))
@@ -1062,8 +1098,11 @@ fn tick(state: &mut State, at: u64) {
     let f = &mut state.fleet;
     // The directed camera.
     let now_t = f.scene.t_at(at);
-    if let Some(tod) = f.director.tick(now_t) {
-        f.scene.time_of_day = tod;
+    f.director.tick(now_t);
+    f.scene.time_of_day = f.director.time_of_day(now_t);
+    let weather = f.director.weather();
+    if f.scene.weather != weather {
+        f.scene.weather = weather;
     }
     let cam = f.director.camera();
     if f.scene.camera != cam {
@@ -1071,6 +1110,12 @@ fn tick(state: &mut State, at: u64) {
     }
     history_step(state, at);
     let f = &mut state.fleet;
+    // Flying claims get their next keyframes.
+    for s in f.slots.values_mut() {
+        if let Some(c) = s.claim.as_mut() {
+            crate::autopilot::extend(c, now_t);
+        }
+    }
     // Claims expire.
     let expired: Vec<u32> = f
         .slots
@@ -1272,9 +1317,11 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
             });
         }
     }
+    let scene_now = f.scene.t_at(at);
     if let Some(c) = slot.claim.as_mut() {
         if c.generation == r.generation && c.first_frame_at.is_none() {
             c.first_frame_at = Some(at);
+            crate::autopilot::start(c, scene_now + crate::autopilot::START_LEAD_SECS, scene_now);
         }
     }
     let id = slot.id.clone();

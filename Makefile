@@ -500,6 +500,10 @@ clean-test-data: build
 	sudo rm -rf /mnt/fcvm-btrfs/state/*.json /mnt/fcvm-btrfs/state/*.lock
 	sudo rm -rf $(ROOT_DATA_DIR)/state/*.json $(ROOT_DATA_DIR)/state/*.lock
 	sudo rm -rf $(CONTAINER_DATA_DIR)/state/*.json $(CONTAINER_DATA_DIR)/state/*.lock
+	@echo "==> Removing root owner records that root does not own..."
+	@# A reclaim/0 owned by another uid was written by a rootless container's root (host uid
+	@# 1000), and every root fcvm on this host refuses it. Root's own records stay for reclaim.
+	sudo find /mnt/fcvm-btrfs/reclaim -mindepth 1 -maxdepth 1 -name 0 ! -uid 0 -exec rm -rf {} + 2>/dev/null || true
 	@echo "==> Cleaning UFFD sockets..."
 	sudo rm -f /mnt/fcvm-btrfs/uffd-*.sock
 	sudo rm -f $(ROOT_DATA_DIR)/uffd-*.sock $(CONTAINER_DATA_DIR)/uffd-*.sock
@@ -584,6 +588,14 @@ build-fleet-coordinator: cargo-target-link dep-provenance
 test-fleet-coordinator: private SHELL := $(TARGET_LEASE_SHELL)
 test-fleet-coordinator: cargo-target-link dep-provenance
 	CARGO_TARGET_DIR=target $(CARGO) test --locked --release --no-default-features -p fcvm --test test_fleet_coord
+
+# The directed camera's program with no votes, as JSON (fleet/core/examples/program.rs):
+# make fleet-program SEED=1 SECS=600 OUT=program.json
+.PHONY: fleet-program
+fleet-program: private SHELL := $(TARGET_LEASE_SHELL)
+fleet-program: cargo-target-link
+	@test -n "$(OUT)" || { echo "fleet-program needs OUT=FILE" >&2; exit 2; }
+	CARGO_TARGET_DIR=target $(CARGO) run --locked --release -q -p fleet-core --example program -- $(or $(SEED),1) $(or $(SECS),600) > $(OUT)
 
 build-fc-mock: private SHELL := $(TARGET_LEASE_SHELL)
 build-fc-mock: cargo-target-link

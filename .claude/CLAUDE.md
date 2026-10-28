@@ -358,6 +358,15 @@ Three rules the gate enforces, each of them a hole it once had:
   reviews when a PR opens and on `@greptileai`, not on every push, because each review
   spends a free open-source credit. `greptile_config_keeps_its_results_where_the_gate_reads_them`
   pins it.
+- **CodeRabbit's finished-clean comment and its "Review finished." reply need no answer either.**
+  The summary comment, once its review found nothing, is exempt when it has the review stack
+  link, the recent-review block saying "No actionable comments were generated in the recent
+  review.", a Minimal Merge Risk and nothing outside its blocks; the walkthrough, risk text and
+  pre-merge checks are the bot's own prose and are the only unread regions
+  (`is_cr_clean_walkthrough`). Text added anywhere else makes it claimable, and it covers a head
+  only through the range rule above. The "Action performed" reply, in either layout, covers
+  nothing. Pinned by the `cr-clean-walkthrough.md` and `cr-review-finished-reply.md` fixtures in
+  `tests/fixtures/review-gate`, which both harnesses read. #1351, #1386 and #1392 were blocked on them.
 - **The head commit must have been reviewed.** Answering every finding proves nothing if
   nobody reviewed the code you are merging. This gate shipped with five open findings that
   way: the branch was pushed, the prior round was answered, the gate went CLEAR, and it
@@ -2547,6 +2556,17 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   owner, so it would get a disk it cannot write or remove). `rm -rf` removes subvolumes, so teardown is unchanged, but
   btrfs reclaims a removed subvolume's space on its cleaner thread after the rmdir returns, where an unlinked reflink
   freed its space at once; `df` right after many clone teardowns can read high for a while.
+- Each snapshot directory is a btrfs subvolume too, and a diff snapshot is staged as a subvolume snapshot of its
+  parent's directory, keeping only the parent's `memory.bin`, which the diff is then written into
+  (`stage_from_parent_subvolume`). A memory file written by in-place diffs fragments: one written by eight of them
+  held 11,824,233 extents, a reflink of it took 133 s and removing that copy 52 s, while the subvolume snapshot and
+  its delete each finished within a second (2026-10-27). The parent's directory was synced when its own snapshot
+  finished, so the flush a subvolume snapshot does first finds little. Snapshot directories are deleted with
+  `btrfs subvolume delete` (`remove_snapshot_dir`), which detaches them at once, where `rm -rf` would drop the memory
+  file's references one by one first. A parent that is not a subvolume (made before this, or on a store that cannot
+  make one) is reflinked as before. An unprivileged user may delete a subvolume only on a filesystem mounted with
+  `user_subvol_rm_allowed`; fcvm's own loopback store is mounted with it, and on a btrfs store mounted without it a
+  rootless delete falls back to removing the files one by one.
 - Initrd: `/mnt/fcvm-btrfs/initrd/fc-agent-{sha}.initrd` (injects fc-agent at boot)
 
 **Per-VM Disk Sizing (`--rootfs-size`):**
