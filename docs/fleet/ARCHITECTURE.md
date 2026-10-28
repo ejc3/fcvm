@@ -775,7 +775,7 @@ Vulkan path is measured on the T4.
   Every robot's pose, every particle and sign is computed on the GPU from `t` and the robot's
   table entry. Measured on a T4 through the emulator (720 x 1280, 4x MSAA): 60 fps with 2,400
   robots, shadows, particles and a sign; the in-app benchmark draws a frame in 4.2 to 5.7 ms
-  at 2,400 robots, 6.8 to 7.8 ms at 9,600 and 23.1 to 23.6 ms at 38,400.
+  at 2,400 robots, 6.8 to 7.9 ms at 9,600 and 23.1 to 23.7 ms at 38,400.
 - **How the tiles stay seamless.** A phone draws the whole image into a framebuffer of the
   whole image's size, scissored to its own part, so the GPU rasterizes the same window
   coordinates on every phone. Moving the viewport instead (the obvious off-axis approach) left
@@ -784,7 +784,7 @@ Vulkan path is measured on the T4.
   subpixel grid. Blended particles are drawn unscissored (scissored, a few glow pixels blended
   1 level differently), and no two particles start at one point (a leaper's coincident
   sparkles made the same frame come out two ways from run to run). `scripts/phone/seam.py`
-  allows up to 9 pixels a tile 1 level apart for one residual it has seen in 3 of 8 runs, the same
+  allows up to 9 pixels a tile 1 level apart for one residual it has seen in 3 of 9 runs, the same
   pixel in a light's glow.
 - **The emulator crashes when a guest GL client exits during composition.** Emulator 37.2.12
   logs `Failed to make display surface context current: 12290` (EGL_BAD_ACCESS) as a guest
