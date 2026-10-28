@@ -26,7 +26,8 @@ export ANDROID_SDK_ROOT=/android ANDROID_HOME=/android ANDROID_AVD_HOME=/root/.a
 # with no X display. Without it the emulator's "host" mode on Linux opens GLX and fails
 # headless ("GlxEngine getDefaultDisplay: Failed to open display").
 export ANDROID_EGL_ON_EGL=1
-ADB=/android/platform-tools/adb
+# scripts/phone/test-phone-sh.sh points PHONE_ADB at a stub.
+ADB=${PHONE_ADB:-/android/platform-tools/adb}
 # The emulator built from source (scripts/phone/emulator.sh), mapped at /emu: the phone needs
 # the console's gpu release and gpu retake.
 EMU_DIR=${EMU_DIR:-/emu}
@@ -111,7 +112,9 @@ holds)
   echo "fds=$(find /proc/"$q"/fd -lname '/dev/nvidia*' 2> /dev/null | wc -l) mappings=$(grep -c /dev/nvidia /proc/"$q"/maps || true)"
   ;;
 bugreports)
-  "$ADB" logcat -d -b events | tr -d '\r' | grep -c 'BugreportRequestedReceiver' || true
+  # A log that cannot be read fails; a log with no bug report prints 0.
+  log=$("$ADB" logcat -d -b events) || { echo "phone.sh: adb could not read the events log" >&2; exit 1; }
+  tr -d '\r' <<< "$log" | grep -c 'BugreportRequestedReceiver' || true
   ;;
 app)
   # a fresh install: another build host signs with another debug key

@@ -935,6 +935,7 @@ phone-test: $(if $(strip $(GPU)),setup-phone phone-emulator)
 	@test -n "$(GPU)" && test -n "$(GPU2)" || { echo "usage: make phone-test GPU=<pci address> GPU2=<another pci address> ACCEPT_ANDROID_SDK_LICENSE=1" >&2; exit 2; }
 	./scripts/phone/test-aosp-lock.sh
 	./scripts/phone/test-gpu-hook.sh
+	./scripts/phone/test-phone-sh.sh
 	./scripts/phone/aosp.sh
 	ACCEPT_ANDROID_SDK_LICENSE="$(ACCEPT_ANDROID_SDK_LICENSE)" ./scripts/phone/sdk.sh
 	./scripts/phone/app.sh > /dev/null
