@@ -369,10 +369,10 @@ build_inputs = [
 kernel_config = "kernel/phone-x86.conf"
 patches_dir = "kernel/patches-gpu-x86"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
-# The gpu profile's Firecracker plus the nested state in snapshots.
+# The fork's VFIO branch with the nested state in snapshots merged (ejc3/firecracker#23).
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "agent/vfio-nested-state"
-firecracker_commit = "57203e6485201e7d750e29b6bef6e4fa448ced86"
+firecracker_branch = "agent/vfio-uffd-populate"
+firecracker_commit = "69894de0188292bf3afc0a5d7f8900a80ca74d56"
 firecracker_args = "--enable-pci"
 boot_args = "net.ifnames=0"
 

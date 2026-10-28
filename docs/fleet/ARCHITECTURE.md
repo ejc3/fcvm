@@ -646,16 +646,18 @@ Every GPU VM in fcvm is a restored clone (the snapshot is taken without the devi
 GPU is attached at restore), so KVM inside a phone VM has to survive a snapshot. Linux 6.18
 executes VMXON when kvm_intel loads (`kvm.enable_virt_at_load`), and Firecracker did not save
 KVM's nested state, so a restored guest believed it was in VMX operation and KVM did not:
-the guest's next VMX instruction faulted. The fork's commit on `agent/vfio-nested-state`
-(based on the gpu profile's amd64 commit) saves `KVM_GET_NESTED_STATE` in the vCPU state,
-header included (kvm-ioctls reports a header-only state as none, but the header holds
+the guest's next VMX instruction faulted. The fork's change (ejc3/firecracker#23, merged
+into `agent/vfio-uffd-populate`, the gpu profile's amd64 branch) saves
+`KVM_GET_NESTED_STATE` in the vCPU state, header included (kvm-ioctls reports a header-only
+state as none, but the header holds
 `vmxon_pa`), and restores it after `SET_SREGS` and `IA32_FEATURE_CONTROL` and before
 `SET_REGS`, QEMU's order, so a vCPU saved while running a nested guest re-enters guest mode
 first. `SNAPSHOT_VERSION` goes to 13.0.0. The unit test
 `test_vmx_operation_survives_save_and_restore` fails on the base commit (`vmxon_pa` comes back
 as `u64::MAX`) and passes with the change; `make phone-test` checks it end to end with
-`kvmprobe` in a restored VM. The `phone` profile pins that commit; the wall's `gpu` profile
-keeps its own.
+`kvmprobe` in a restored VM. The release build's vCPU seccomp filter allows
+`KVM_GET_NESTED_STATE` (`test_vcpu_filter_allows_saving_nested_state`). The `phone` profile
+pins the merge commit; the wall's `gpu` profile keeps its own.
 
 ### Snapshots: the phone restore
 
