@@ -156,11 +156,29 @@ class GlThread(private val context: Context) : Thread("robotpark-gl") {
             if (gen != boundGen) rebind(want, gen)
             if (hasTask) {
                 // a task leaves the queue only with a current context: a lost one delays it
-                if (makeCurrent(if (win != EGL14.EGL_NO_SURFACE) win else pbuffer)) synchronized(lock) { tasks.removeFirstOrNull() }?.invoke()
+                if (makeCurrent(if (win != EGL14.EGL_NO_SURFACE) win else pbuffer)) {
+                    val task = synchronized(lock) { tasks.removeFirstOrNull() }
+                    survive("task") { task?.invoke() }
+                } else SystemClock.sleep(50)
                 continue
             }
-            if (draw && win != EGL14.EGL_NO_SURFACE) frame(w, h)
+            if (draw && win != EGL14.EGL_NO_SURFACE) survive("frame") { frame(w, h) }
             else if (draw) SystemClock.sleep(50) // a window we could not bind: wait for the next one
+        }
+    }
+
+    /**
+     * Runs one frame or task; a failure (a scene too large for the GPU's framebuffers, a
+     * framebuffer the driver refused) is reported and the thread goes on, so the next scene
+     * draws again. It backs off 200 ms so a scene that fails every frame does not flood the log.
+     */
+    private fun survive(what: String, f: () -> Unit) {
+        try {
+            f()
+        } catch (e: RuntimeException) {
+            Log.e(TAG, "$what failed", e)
+            Store.lastError = "$what: ${e.message}"
+            SystemClock.sleep(200)
         }
     }
 

@@ -104,6 +104,17 @@ else
   bad "context rebuild: $r; $n frames in 2 s; status $s; capture $(field .fnv64 "$again2") against $(field .fnv64 "$first")"
 fi
 
+# A scene the GPU cannot draw (a whole image 204,800 pixels wide, past its framebuffers) is
+# reported, and the next scene draws again.
+r=$(C "$(jq -c '.rect = {x:0.5, y:0, w:0.00390625, h:0.0625} | .image_aspect = 10' <<< "$SCENE")")
+sleep 1
+e=$(field '.last_error // empty' "$(status)")
+C "$SCENE" > /dev/null
+sleep 1
+n=$(drawn)
+[ -n "$e" ] && [ "$n" -ge 60 ] && ok "a scene too large to draw is reported ($e) and the next scene drew $n frames in 2 s" \
+  || bad "after a scene too large to draw: last_error '$e', $n frames in 2 s (scene reply $r)"
+
 # The fixed actions.
 act() { C "{\"type\":\"action\",\"name\":\"$1\"}"; }
 r=$(act shell); [ -n "$(field .error "$r")" ] && [ "$(field .ok "$r")" != true ] && ok "an unknown action is refused: $(field .error "$r")" || bad "an unknown action was taken: $r"
