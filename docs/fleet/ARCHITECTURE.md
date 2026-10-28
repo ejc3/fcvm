@@ -552,6 +552,273 @@ through its transcode, and it has nothing to run.
 6. ejc3/aws: the IVS channel, its playback key pair, the broadcast secret, the coordinator's
    larger task and its flags.
 
+## Phones mode
+
+Status: **design**, from a feasibility spike on a g4dn.metal (2026-10-27). The first PR of
+its stack is the phone VM profile and its test (`make phone-test`). The owner, 2026-10-27:
+"I want to stand up Android phones in this environment that have access to the gpu. So by
+default it's still this seamless view, but then you can 'zoom out' and the phone is revealed
+running the simulation in an app ... If you take over the phone, we give predefined actions
+you can take, not free form input. Have this as alternative mode with a query param for now.
+Need to pass through the gpu all the way to the emulator." Later the same day: "Android has
+snapshot capability now", "We can change the emulator to support attach", "Fix firecracker
+if it doesn't support what we need out of the box", and "The scene we are rendering on the
+phone, let's have something more androidy."
+
+### What a viewer sees
+
+- `?mode=phones` opens it; without the parameter the wall is unchanged.
+- **Seamless by default.** Every phone renders its rectangle of one Android-themed scene
+  (below), and the page stitches them with the same `t` sync and seam rules as the wall.
+- **Zoom out.** The image animates apart into phone frames: the page draws a bezel around
+  each tile and the phone shows its whole screen, the app's own interface around the scene.
+  The app has two tabs, the scene and an info screen: device model, Android version, the
+  GLES renderer string of its own context (the GPU's name), frames per second, uptime, the
+  fcvm VM it runs in (slot, GPU, its last restore time) and the attribution lines.
+- **Restore time.** A phone shows "Phone restored in X s" the way a wall tile shows its
+  restore, measured from the click to the app's first frame on the restored GPU.
+- **Take over.** A viewer borrows one phone like "Your own GPU" and gets a panel of fixed
+  actions; nothing typed reaches the phone.
+
+### The phone
+
+```
+fcvm VM, `phone` profile: one GPU (VFIO), KVM inside (nested), restored from a snapshot
+  container fleet/phone (privileged: /dev/kvm; the GPU as CDI devices)
+    Android Emulator: QEMU with KVM, Android 15 (AOSP x86_64 image)
+      gfxstream, the emulator's host-side renderer: EGL-on-EGL through glvnd to NVIDIA's
+      EGL (no X display), and Vulkan through NVIDIA's ICD, both on the passed-through GPU
+    the app (guest GLES 3 / Vulkan through goldfish -> gfxstream -> the GPU)
+    phone streamer: the screen -> NVENC H.264 -> FCVF frames over wss, stamped with t
+```
+
+Phones run on the x86 hosts (g4dn.metal): the emulator's x86_64 Android needs x86 KVM, and
+the fleet's host AMI already loads `kvm_intel` with `nested=Y`. The arm64 hosts keep
+rendering the wall.
+
+The spike rig: g4dn.metal (T4, driver 580.196.07), host `kvm_intel nested=Y`, emulator
+37.2.12, the AOSP `default` x86_64 Android 15 image, a 720x1280 phone with 4 cores. Every
+number below is from that box.
+
+| measurement | result |
+|---|---|
+| renderer SurfaceFlinger composes with, and the app's own GLES context | `Android Emulator OpenGL ES Translator (Tesla T4/PCIe/SSE2)`, `OpenGL ES 3.2 NVIDIA 580.196.07` |
+| the emulator's Vulkan device | Tesla T4, Vulkan 1.4.312 |
+| cold boot to `sys.boot_completed` | 26.5 s (16 GiB VM, 4 GiB phone); 30.6 s (6 GiB VM, 2 GiB phone) |
+| probe app: 25,600 instanced, lit cubes, GLES 3 | 60.0 fps (the display's vsync), the emulator using 64% of one core; the T4 19% utilized at a 360 MHz graphics clock, 15 W |
+| app start (`am start -W`) | 372 ms |
+| emulator snapshot save with the app running | 3.9 s (4 GiB phone: 1.8 GB RAM image, 3.3 MB of textures); 4.8 s (2 GiB phone) |
+| emulator snapshot load into a new emulator process, same VM: adb up, app's next frame | 5.4 s and 5.7 s with a cold cache; 4.0 s and 4.2 s warm |
+| of a warm load: renderer up; RAM image; GPU state (framebuffer, 48 color buffers, 9 process resources) | 0.66 s; 1.60 to 2.94 s; 3.00 to 3.42 s |
+| clone restore of a phone VM, `fcvm snapshot run --gpu`, 16 GiB | ACK 10.2 and 12.3 s, of which the memory load 9.06 s |
+| the same, 6 GiB, three clones on three GPUs | ACK 4.72 to 4.99 s, of which the memory load 3.80 to 4.08 s and `gpu_ms` 0.86 to 0.87 s |
+| flow A: clone restore, then the emulator loads its own snapshot; click to the app's first frame | 12.8 to 13.1 s (6 GiB, three clones; the load took 7.9 to 8.1 s in the fresh clone) |
+| `fcvm snapshot create --gpu-warm` with the emulator holding the GPU | refused: "every process with a GPU open must be a CUDA process"; the park is undone and the phone keeps drawing |
+| KVM in a restored VM (`fleet/phone/kvmprobe.c`), Firecracker without nested state | the guest's kernel oopses in `kvm_spurious_fault`, the probe dies with SIGSEGV; with the fork, `kvm ok` |
+
+The memory load is the VFIO pin: a VM with a passed-through device has all its memory
+faulted in and pinned for DMA at restore, about 0.65 s per GiB here, so the phone VM is
+sized small (6 GiB for a 2 GiB phone) and hugepages are the next thing to measure.
+
+**Headless host rendering.** The emulator's `-gpu host` on Linux opens GLX and fails with
+no X display. gfxstream's EGL-on-EGL engine (`ANDROID_EGL_ON_EGL=1`) renders through EGL
+instead, and NVIDIA's EGL works headless. The SDK's emulator then loads SwiftShader's
+`libEGL.so` from its own directory before the system's, which renders in software; the spike
+masks those files inside the container (`phone.sh`, a bind mount over them; nothing in the
+SDK changes), and the emulator built from source (below) does not ship them.
+
+**Paths considered.** In the order the task gave:
+
+1. *The Android Emulator in the fcvm VM.* Works, above. **Chosen.**
+2. *Cuttlefish with gfxstream.* The same renderer behind crosvm, also on nested KVM, and it
+   needs vhost-vsock and vhost-net in the guest and its own host packages. Not spiked: path
+   1 met every requirement and Cuttlefish changes nothing about the GPU path. It is the
+   fallback if the emulator's QEMU side blocks the detach work.
+3. *No KVM: Android in a container on the guest kernel (Redroid).* Ruled out. Android
+   userspace has no GPU driver for a T4: NVIDIA ships Android drivers only for its Tegra
+   parts, Mesa's NVIDIA drivers do not run on the proprietary kernel driver the VM loads, and
+   gfxstream and virgl both need a virtual GPU device between a guest and a host renderer,
+   which a container does not have. It would render in software.
+
+### Nested virtualization through a snapshot
+
+Every GPU VM in fcvm is a restored clone (the snapshot is taken without the device and the
+GPU is attached at restore), so KVM inside a phone VM has to survive a snapshot. Linux 6.18
+executes VMXON when kvm_intel loads (`kvm.enable_virt_at_load`), and Firecracker did not save
+KVM's nested state, so a restored guest believed it was in VMX operation and KVM did not:
+the guest's next VMX instruction faulted. The fork's commit on `agent/vfio-nested-state`
+(based on the gpu profile's amd64 commit) saves `KVM_GET_NESTED_STATE` in the vCPU state,
+header included (kvm-ioctls reports a header-only state as none, but the header holds
+`vmxon_pa`), and restores it after `SET_SREGS` and `IA32_FEATURE_CONTROL` and before
+`SET_REGS`, QEMU's order, so a vCPU saved while running a nested guest re-enters guest mode
+first. `SNAPSHOT_VERSION` goes to 13.0.0. The unit test
+`test_vmx_operation_survives_save_and_restore` fails on the base commit (`vmxon_pa` comes back
+as `u64::MAX`) and passes with the change; `make phone-test` checks it end to end with
+`kvmprobe` in a restored VM. The `phone` profile pins that commit; the wall's `gpu` profile
+keeps its own.
+
+### Snapshots: the phone restore
+
+The target, from the owner: an fcvm snapshot of a VM with the phone booted and the app
+running; a restored clone attaches its GPU, the phone carries on, and the app keeps running
+on the clone's GPU. Firecracker cannot save a passthrough device, so fcvm snapshots a GPU VM
+without its GPU (`--gpu-warm` parks it: CUDA processes move their GPU memory to RAM with
+cuda-checkpoint, then the GPU leaves the guest's PCI bus). The emulator holds EGL and Vulkan
+objects on the GPU, so today the park refuses (measured above).
+
+**The mechanism: detach and re-attach the emulator's renderer, with gfxstream's own
+snapshot code.** gfxstream already saves and restores everything a guest sees of the host
+GPU for the emulator's quickboot snapshots: `FrameBuffer::onSave` and `onLoad`
+(`hardware/google/gfxstream`, `host/FrameBuffer.cpp`) carry the display configuration, the
+guest's EGL contexts and surfaces, every color buffer, EGLImages and texture contents
+(`eglPreSaveContext`, `eglSaveAllImages`), and Vulkan objects under the `VulkanSnapshots`
+feature. The spike shows that state reloads onto a T4 and the app carries on at 60 fps, in a
+new emulator process and on a different T4 in a clone. Detach is: pause the vCPUs, `onSave`
+into memory, tear the renderer down until no handle on `/dev/nvidia*` remains. Attach is:
+initialize EGL and Vulkan on the GPU the clone has, `onLoad`, resume. The guest sees what it
+sees after a quickboot load, which is nothing.
+
+**Why not hotplug first.** The owner suggested making Android adjust as for a display change.
+A display hotplug makes SurfaceFlinger rebuild its display surfaces, but the app's contexts,
+textures and buffers live in gfxstream color buffers that a hotplug does not recreate; a
+device-lost would need every process to recover from `EGL_CONTEXT_LOST`, and SurfaceFlinger
+and HWUI abort on GPU errors rather than recover. The in-process `onSave`/`onLoad` keeps every
+object, so it is the main path. A hotplug is the fallback for a renderer state `onSave` cannot
+carry, and the app handles surface loss correctly either way (`onSurfaceDestroyed` and
+`onSurfaceCreated`, and recreating its GL objects on `EGL_CONTEXT_LOST`).
+
+**The flow.** Gold: boot the phone VM, boot Android, start the app, then
+`fcvm snapshot create --gpu-warm`. fc-agent's park asks every GPU holder that is not a CUDA
+process to let go through a hook (the emulator's console, `gpu detach`), waits until no
+process holds an NVIDIA device, and continues as today. A clone restores, attaches its GPU
+and loads the driver as any GPU restore does, then unpark calls `gpu attach` and waits for
+the app's next frame.
+
+| flow | click to the app's first frame (6 GiB phone VM) |
+|---|---|
+| A: clone restore, then the emulator loads its own snapshot | 12.8 to 13.1 s, measured |
+| B: clone restore of a running phone, renderer re-attached | about 5.5 s, projected: ACK 4.7 to 5.0 s plus the renderer's start and GPU state load from the warm load above (0.13 s and 0.42 s) |
+
+B is the design. Its largest part is the memory pin, so the phone VM's size and hugepages
+are measured in the same PR as the hooks.
+
+The emulator is built from source for this, forked like Firecracker: `ejc3/` forks of the
+emulator (`external/qemu`, its `emu-37-2-release` branch) and of gfxstream. The SDK's
+license forbids modifying its emulator (below), and a source build also leaves out the
+SwiftShader libraries the spike masks.
+
+### The app: an Android-themed scene
+
+DECIDED (owner, 2026-10-27): the phones render their own scene, not the wall's terrain: the
+Android robot and friends in a playful world in Material You colours. The plan: a park of
+robots walking across the phones, a crowd that dances, robots that jump from one phone's
+screen to the next, a viewer's word on a robot's sign, with lighting, shadows, thousands of
+instances and particles. GLES 3 first (the path measured above); Vulkan once the emulator's
+Vulkan path is measured on the T4.
+
+- **One scene across the phones.** Each phone renders its rectangle of the whole image with an
+  off-axis projection, from the coordinator's scene: the shared clock `t`, camera keyframes,
+  words and the take-over actions (the renderer's `POST /scene` shape, with the phone's
+  fields added). Nothing in the scene has state: every robot's position, pose and colour is
+  a function of `t` and its id, so a restored phone draws the current frame at once.
+- **Deterministic.** The same `t` and rectangle give the same pixels on every phone: no frame
+  counters, no random numbers that are not hashed from ids and `t`. Every phone runs the same
+  GPU and driver. A seam test, like the renderer's, renders adjacent rectangles and the whole
+  image at one `t` and compares the shared edges.
+- **Cost.** About 1,500 lines of Java and GLSL and the seam test, two PRs.
+- **Branding.** The robot may be reproduced or modified under CC BY 3.0 with Google's
+  attribution line ("The Android robot is reproduced or modified from work created and shared
+  by Google and used according to terms described in the Creative Commons 3.0 Attribution
+  License."), shown on the info screen. "Android" may not be in the app's name, may only be a
+  descriptor followed by a generic term, carries "Android is a trademark of Google LLC.", and
+  the Android wordmark and Google's logos are not used. Nothing says or suggests Google made
+  or endorses it.
+
+### Getting the screen to the page
+
+The page's frame protocol stays: FCVF frames of H.264 over a WebSocket, each stamped with
+its `t`. A phone streamer in the container reads the emulator's screen (its gRPC screen
+stream or the shared-memory video bridge it writes with `-share-vid`, whichever measures
+faster), encodes with NVENC on the same GPU (the driver image already carries
+`libnvidia-encode`), and serves the renderer's `/frames` route with its encoder and socket
+code. The app writes the `t` it drew into a strip of pixels at the edge of its surface, which
+the streamer reads and crops, so each frame carries the exact `t` it shows and the page's
+seam sync works unchanged. In seamless mode the app is full screen (system bars hidden) and
+the page shows the scene rectangle; zooming out is a scene field that tells every phone to
+show its interface from a stated `t`, so all phones change together.
+
+### Taking over
+
+`claim_phone` borrows a phone with `claim_gpu`'s rules (one per viewer, a cooldown, a cap on
+phones lent at once, refused to a broadcast-only viewer). The take-over panel sends one of a
+fixed set of actions, which the coordinator validates as an enum and the agent passes to a
+controller in the phone container that maps each to one fixed command: the info tab or the
+scene tab, rotate (`adb emu rotate`), dark mode (`cmd uimode night`), robots wave or dance
+(an intent to the app), a GPU benchmark run inside the app, restart the app
+(`am force-stop`, then start), and reboot the phone, which restores the phone VM from its
+snapshot and shows the restore time. The controller takes nothing but the action's name;
+adb and the emulator console listen only inside the container.
+
+### Invariants (each becomes a test)
+
+1. A phone renders on its VM's GPU: SurfaceFlinger's renderer and the app's both name the
+   GPU `nvidia-smi` reports, and a phone that cannot is reported failed, never shown in
+   software (`make phone-test`; the streamer checks the same at start).
+2. A restored phone VM can run a VM (`kvmprobe`), and Firecracker restores the nested state
+   it saved (`test_vmx_operation_survives_save_and_restore`).
+3. A phone VM is snapshotted only when no process holds its GPU (the park already refuses).
+4. After a restore the app draws on the clone's GPU within the restore deadline.
+5. The same `t` and rectangle give the same pixels on every phone (the seam test).
+6. Nothing a viewer sends reaches a phone except scene fields and the enumerated actions.
+
+### Failure states
+
+| failure | what happens |
+|---|---|
+| the host's `kvm_intel` has no nested virtualization | the phone slot reports failed at the agent's inventory; `make phone-test` refuses to start |
+| the renderer cannot reach the GPU (EGL or Vulkan init fails, or the renderer string is not the GPU) | the slot is failed and dark; never a software fallback |
+| detach does not release the GPU within its deadline | the park is undone (as today) and the snapshot is refused |
+| attach fails in a clone | the clone fails closed, as a failed GPU attach does, and the slot is relaunched with backoff |
+| the emulator exits | the container exits, the VM reports it, and the agent relaunches the slot |
+| the app stops drawing | the streamer's frame age passes its deadline and the tile is drawn dim, then failed |
+
+### Licensing
+
+- **The SDK's emulator and system images** are under the Android SDK License Agreement
+  (developer.android.com/studio/terms): 3.1 grants use "solely to develop applications for
+  compatible implementations of Android"; 3.4 forbids copying except for backup, modifying,
+  redistributing or creating derivative works. The spike and `make phone-test` use them to
+  develop and test the app, on our own hosts, unmodified, fetched from Google with their
+  checksums pinned, and `scripts/phone/sdk.sh` refuses to fetch until
+  `ACCEPT_ANDROID_SDK_LICENSE=1` says the agreement was read. A public wall of phones is not
+  app development, so what ships is built from AOSP source: the emulator (`external/qemu`,
+  QEMU's parts under the GPL; we serve video, not binaries) and gfxstream (Apache 2.0) from
+  our forks, and an AOSP-based system image without Google's apps or services, whose
+  components keep their own licenses and notices (the Linux kernel under the GPL, most of
+  the platform under Apache 2.0). Building them from source is also what the detach change
+  needs.
+- **The Android robot** is CC BY 3.0 with the attribution line above; "Android" and Google's
+  marks follow Google's brand guidelines, as under "Branding".
+
+### Stack of PRs
+
+1. The phone profile (this PR): the Firecracker fork's nested state, the guest kernel with
+   KVM, the phone container (emulator with `-gpu host` and EGL-on-EGL), the probe app, and
+   `make phone-test`.
+2. The emulator from source: forks of the emulator and gfxstream, built with the AOSP system
+   image into the phone image; `gpu detach` and `gpu attach` on a running phone, tested by
+   detaching, attaching and checking the app's renderer and frames.
+3. Snapshots of a running phone: fc-agent's park and unpark hooks for GPU holders that are
+   not CUDA processes, `--gpu-warm` of a running phone, and a test that a clone's app renders
+   on the clone's GPU; restore-to-first-app-frame measured, with the VM's size and hugepages.
+4. The app's scene: the Android-themed scene, deterministic by rectangle, its info tab, the
+   action intents and surface-loss handling; the seam test.
+5. The phone streamer: screen capture, NVENC, FCVF frames stamped with `t`.
+6. Fleet: phone slots in the agent and coordinator (`--phones`), the phone scene fields,
+   `claim_phone` and its actions, phone restore timings in the state.
+7. Web: `?mode=phones`, the zoom out, the bezels, the take-over panel.
+8. ejc3/aws: the host AMI with the phone image and assets.
+
 ## Invariants (each becomes a test)
 
 1. At most one VM runs per slot, and at most one slot holds a GPU.

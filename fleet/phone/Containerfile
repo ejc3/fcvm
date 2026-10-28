@@ -1,0 +1,29 @@
+# The phone container: runs the Android Emulator from an SDK mapped at /sdk, rendering on
+# the VM's NVIDIA GPU (fcvm passes the GPU in as CDI devices, which mount the driver's
+# libraries). scripts/phone/run.sh builds and runs it.
+FROM docker.io/library/ubuntu:24.04 AS kvmprobe
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc libc6-dev linux-libc-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY kvmprobe.c /src/kvmprobe.c
+RUN gcc -O2 -static -Wall -Wextra -Werror -o /kvmprobe /src/kvmprobe.c
+
+FROM docker.io/library/ubuntu:24.04
+# The emulator's own libraries cover most of what it loads; these are the system ones it
+# links or dlopens (X client libraries even headless), glvnd's EGL and GLES dispatch, and
+# the Vulkan loader.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      libx11-6 libx11-xcb1 libxkbfile1 libegl1 libgl1 libgles2 libvulkan1 libpulse0 libnss3 \
+      libxcomposite1 libxcursor1 libxi6 libxtst6 libxdamage1 libxrandr2 libasound2t64 libdbus-1-3 \
+      libbsd0 libgbm1 libdrm2 libxext6 libxfixes3 libxrender1 libfontconfig1 libfreetype6 libsm6 \
+      libice6 libxcb1 libxkbcommon0 libxkbcommon-x11-0 libnspr4 libexpat1 libuuid1 \
+      iproute2 procps util-linux ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+# glvnd and the Vulkan loader find NVIDIA's libraries (mounted by the CDI spec) through these.
+RUN mkdir -p /usr/share/glvnd/egl_vendor.d /usr/share/vulkan/icd.d \
+ && printf '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}\n' \
+      > /usr/share/glvnd/egl_vendor.d/10_nvidia.json \
+ && printf '{"file_format_version":"1.0.1","ICD":{"library_path":"libGLX_nvidia.so.0","api_version":"1.4.0"}}\n' \
+      > /usr/share/vulkan/icd.d/nvidia_icd.json
+COPY --from=kvmprobe /kvmprobe /usr/local/bin/kvmprobe
+COPY phone.sh /usr/local/bin/phone.sh
+CMD ["sleep", "infinity"]
