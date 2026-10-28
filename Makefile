@@ -270,7 +270,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	_test-unit _test-agent-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
-	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu setup-phone phone-test gpu-residue-test gpu-routed-test setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
+	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu setup-phone phone-test phone-app-test gpu-residue-test gpu-routed-test setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-computesdk bench-gpu-restore test-gpu-restore test-computesdk bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
 	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-chromium-corpus-extra bench-stop \
@@ -322,6 +322,7 @@ help:
 	@echo "  setup-gpu          Build the gpu profile kernel and NVIDIA driver image"
 	@echo "  setup-phone        Build the phone profile (gpu + KVM) kernel, Firecracker and driver image"
 	@echo "  phone-test         An Android Emulator in a phone VM renders on the GPU (GPU=<pci address>)"
+	@echo "  phone-app-test     Robot Park's scene unit tests and shader check (fleet/phone-app)"
 	@echo "  gpu-residue-test   GPU memory residue between VMs (GPU=<pci address>)"
 	@echo "  gpu-routed-test    A routed GPU VM and its restore hold their IPv6 address (GPU=<pci address>)"
 	@echo "  setup-passt        Build and install the pinned upstream pasta/passt"
@@ -907,14 +908,21 @@ setup-phone: build setup-btrfs
 	./target/release/fcvm setup --kernel-profile phone --build-kernels --config "$(CURDIR)/rootfs-config.toml"
 
 # A phone VM renders on its GPU (scripts/phone/run.sh): KVM works in the restored VM, an
-# Android Emulator boots with -gpu host, and SurfaceFlinger and an app render on the GPU.
-# Fetches the pinned SDK first (scripts/phone/sdk.sh), which needs ACCEPT_ANDROID_SDK_LICENSE=1.
+# Android Emulator boots with -gpu host, SurfaceFlinger and an app render on the GPU, and
+# Robot Park (fleet/phone-app) draws seamless tiles, survives surface loss and takes its
+# actions (scripts/phone/scene-test.sh). Fetches the pinned SDK first (scripts/phone/sdk.sh),
+# which needs ACCEPT_ANDROID_SDK_LICENSE=1, then builds the app (scripts/phone/app.sh).
 phone-test: private SHELL := $(TARGET_LEASE_SHELL)
 phone-test: $(if $(strip $(GPU)),setup-phone)
 	@test -n "$(GPU)" || { echo "usage: make phone-test GPU=<pci address> ACCEPT_ANDROID_SDK_LICENSE=1" >&2; exit 2; }
 	./scripts/phone/test-sdk-lock.sh
 	ACCEPT_ANDROID_SDK_LICENSE="$(ACCEPT_ANDROID_SDK_LICENSE)" ./scripts/phone/sdk.sh
+	./scripts/phone/app.sh > /dev/null
 	FCVM=./target/release/fcvm ./scripts/phone/run.sh "$(GPU)"
+
+# Robot Park's scene tests and shader check (fleet/phone-app), in its build container; no SDK.
+phone-app-test:
+	$(MAKE) -C fleet/phone-app test
 
 # A routed GPU VM, and one restored from its snapshot at another address, hold the
 # --ipv6-address they were given on eth0 and reach the internet over IPv6

@@ -10,14 +10,16 @@
 #   3. SurfaceFlinger composes with GLES on that GPU: its renderer names the GPU nvidia-smi
 #      reports in the VM;
 #   4. an app (fleet/phone/probe) gets a GLES 3 context on that GPU and draws: its renderer
-#      names the GPU and it reports at least 30 frames a second.
+#      names the GPU and it reports at least 30 frames a second;
+#   5. Robot Park (fleet/phone-app): seams, surface loss and actions (scripts/phone/scene-test.sh).
 #
 #   FCVM=./target/release/fcvm scripts/phone/run.sh <gpu pci address>
 # PHONE_PROFILE names another kernel profile to run the same checks on (default phone).
 # `run.sh --image` prints the image tag it builds: fleet/phone's contents name it, so
 # concurrent runs from checkouts with other sources never replace each other's image.
 # Needs a GPU on vfio-pci, the phone profile set up (make setup-phone), the host's kvm_intel
-# loaded with nested=1, and the SDK and probe app from scripts/phone/sdk.sh.
+# loaded with nested=1, the SDK and probe app from scripts/phone/sdk.sh, and Robot Park from
+# scripts/phone/app.sh.
 set -euo pipefail
 SRC=$(cd "$(dirname "$0")/../.." && pwd)
 IMAGE=localhost/fcvm-phone:$(cd "$SRC/fleet/phone" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
@@ -26,11 +28,14 @@ GPU=${1:?usage: run.sh <gpu pci address>}
 F=${FCVM:-./target/release/fcvm}
 SDK=$("$(dirname "$0")/sdk.sh" --sdk-path)
 APK=$(ANDROID_SDK="$SDK" "$(dirname "$0")/sdk.sh" --probe-path)
+APP=$("$(dirname "$0")/app.sh" --apk-path)
 WORK=$(dirname "$APK")
 NAME=phone-test-$$
 [ -f "$APK" ] && [ -x "$SDK/emulator/emulator" ] || { echo "run.sh: run scripts/phone/sdk.sh first" >&2; exit 2; }
+[ -f "$APP" ] && [ "$(dirname "$APP")" = "$WORK" ] || { echo "run.sh: run scripts/phone/app.sh first" >&2; exit 2; }
 [ "$(cat /sys/module/kvm_intel/parameters/nested 2>/dev/null)" = Y ] || { echo "run.sh: the host's kvm_intel needs nested=1" >&2; exit 2; }
 LOGS=$(mktemp -d)
+mkdir -p "$LOGS/out"
 podman build -q -t "$IMAGE" "$SRC/fleet/phone" > "$LOGS/build.log" 2>&1 || { cat "$LOGS/build.log"; exit 1; }
 fail=0
 ok() { echo "ok   $*"; }
@@ -46,7 +51,7 @@ trap stop_runner EXIT
 trap 'exit 130' INT TERM
 t0=$(date +%s%3N)
 "$F" podman run --name "$NAME" --kernel-profile "${PHONE_PROFILE:-phone}" --gpu "$GPU" --privileged --cpu 6 --mem 6144 \
-  --map "$SDK:/sdk:ro" --map "$WORK:/work:ro" "$IMAGE" > "$LOGS/vm.log" 2>&1 < /dev/null &
+  --map "$SDK:/sdk:ro" --map "$WORK:/work:ro" --map "$LOGS/out:/out" "$IMAGE" > "$LOGS/vm.log" 2>&1 < /dev/null &
 runner=$!
 pid=""
 for _ in $(seq 1 600); do
@@ -76,6 +81,7 @@ if boot=$(timeout 400 "$F" exec --pid "$pid" -- /usr/local/bin/phone.sh boot 2>&
   fps=$(grep -o 'fps=[0-9.]*' <<< "$out" | tail -8 | cut -d= -f2 | sort -n | head -1)
   python3 -c 'import sys; sys.exit(0 if sys.argv[1] and float(sys.argv[1]) >= 30 else 1)' "${fps:-}" \
     && ok "the app draws: lowest of its last 8 fps samples $fps" || bad "the app does not draw 30 fps: lowest '${fps:-none}' (log $LOGS/probe.log)"
+  "$(dirname "$0")/scene-test.sh" "$F" "$pid" "/work/$(basename "$APP")" "$LOGS/out" "$gpu_name" || fail=1
 else
   bad "Android did not boot: $boot"
   X sh -c 'grep -aE "ERROR|FATAL" /tmp/emulator.log | head -20' || true

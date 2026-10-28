@@ -1763,3 +1763,176 @@ compared pixel for pixel with the same frame drawn whole
 - Environment: `PORT` (8080), `FPS` (30), `BUDGET` (250000), `ADAPT` (1), `MARGIN` (16), `ENC_BPP` (0.8),
   `ACCUMULATE` (1), `TLS_CERT_FILE` (unset: no TLS listener), `TLS_PORT` (443). `FIT_SCALE`
   (1) scales the reported `budget_fit`, to test a grid of unequal GPUs; never set it in production.
+
+## Phone app
+
+Robot Park (`fleet/phone-app`) is the app every phone of phones mode runs
+(docs/fleet/ARCHITECTURE.md, "Phones mode"). It draws its rectangle of one
+Android-themed scene, the same way a renderer draws its tile of the wall, and takes
+its scene, its place and a fixed set of actions from the phone container over a
+local socket. Source of truth for the messages: `fleet/phone-app/scene/src/main/kotlin/dev/fcvm/robotpark/scene/Protocol.kt`.
+
+### Transport
+
+The app listens on an abstract-namespace Unix socket, `dev.fcvm.robotpark`, inside
+Android. It needs no network permission, and nothing outside the emulator can reach it.
+The phone container forwards a TCP port on its own loopback to it:
+
+```
+adb forward tcp:7070 localabstract:dev.fcvm.robotpark
+```
+
+`fleet/phone/phone.sh app <apk>` installs the app, starts it and sets up that forward;
+`phone.sh ctl '<json>'` sends one request and prints the reply. Only processes in the
+phone container (the agent's controller) reach port 7070; a viewer never does.
+
+Each request is one JSON object on one line (UTF-8, at most 1 MiB), with a `type`.
+Each gets exactly one reply line, in order: `{"ok": true, ...}` or
+`{"error": "<what is wrong>"}` naming the field, as the renderer's `POST /scene` does.
+A connection may carry any number of requests; several connections may be open.
+
+### Scene time
+
+`t` is the renderer's: seconds since `epoch_unix_ms` on the phone's clock. A phone
+draws on the grid `t = k / 60` (`k = floor((now_unix_ms - epoch_unix_ms) * 60 / 1000)`),
+so phones that agree on the clock draw the same `t` at the same moment. The Android
+emulator takes its clock from the VM's at boot; `clock` (below) corrects it.
+
+Every pixel is a function of `t`, the scene and the rect: every robot's position, pose
+and colour, every particle and sign are computed from `t` and its index, with no frame
+counter and no state carried from frame to frame. A phone restored from a snapshot,
+restarted, or given its scene late draws the right frame at once.
+
+### `scene`
+
+The renderer's `POST /scene` body with `"type": "scene"`, plus the phone's fields.
+
+```json
+{"type": "scene", "epoch_unix_ms": 1761100000000,
+ "rect": {"x": 0.5, "y": 0.0, "w": 0.5, "h": 1.0}, "image_aspect": 1.125,
+ "camera": [{"t": 0.0, "pos": [0, 8, 30], "look": [0, 1.6, -4], "fov_deg": 40}],
+ "words": [{"text": "HELLO PHONES", "t": 20.0}],
+ "lights": [{"pos": [-2, 1.6, 6], "color": [1.0, 0.45, 0.15], "t": 0.0}],
+ "moves": [{"t": 60.0, "move": "dance"}],
+ "night": false, "chrome": [{"t": 90.0, "on": true}], "stamp": false}
+```
+
+| field | meaning | accepted |
+|---|---|---|
+| `epoch_unix_ms`, `rect`, `image_aspect` | as the renderer's | as the renderer's: `rect` inside the unit square, `w`, `h` at least 1/256; `image_aspect` 0.1 to 10 |
+| `camera` | keyframes, with the renderer's interpolation and holds; **units are metres of the park** (x across, y up, z toward the camera; robots walk along x between z = -46 and 16, about 1 m tall) | optional, at most 4096; empty means the park's own slow sway from (0, 8, 30) toward (0, 1.6, -4), fov 40 |
+| `words` | a word appears on a sign a robot carries across the whole image, left to right, over 45 s | optional, at most 256; the renderer's text rule (printable ASCII, 28 characters); the 3 newest show |
+| `lights` | a glowing orb at `pos` (metres) that lights what is near it, fading in over 1.5 s | optional, at most 32; the 16 newest show; `color` 0 to 64 |
+| `moves` | `dance`: the crowd stops, faces the camera and dances on one 120 bpm beat under confetti; `wave`: the crowd stops and waves. Each lasts 8 s with 0.6 s ramps | optional, at most 256 |
+| `night` | night palette: dark sky, stars, the moon, glowing eyes, fireflies | optional boolean; absent follows the phone's own dark mode |
+| `chrome` | keys: from `t`, show (`on: true`) or hide the app's top and tab bars over the scene. Zooming out is a key at a `t` every phone reaches together | optional, at most 64; absent means hidden (seamless) |
+| `stamp` | write the frame number `k` (the `t = k / 60` grid) into the bottom 8 rows: 32 cells across the surface, most significant bit first, white for 1 and black for 0, for the phone streamer to read and crop | optional boolean, default false |
+| `layout_generation`, `rect_from_frame`, `previous_rect` | as the renderer's: frames before `rect_from_frame` (on the renderer's 1/30 s grid) use `previous_rect` | optional |
+| `time_of_day`, `weather`, `budget` | the renderer's; accepted and ignored | |
+
+A scene replaces the previous one whole. Unknown fields are ignored.
+
+**The phone's part of the image.** A phone's surface is `w x h` pixels (720 x 1280
+portrait). It shows whole-image pixels `[x0, x0 + w) x [y0, y0 + h)` where
+`full_h = round(h / rect.h)`, `full_w = round(full_h * image_aspect)`,
+`x0 = round(rect.x * full_w)`, `y0 = round(rect.y * full_h)` (the renderer's tile
+geometry at the surface's height). For N phones side by side, `image_aspect` is
+`N * 720 / 1280` and phone k's rect is `{x: k/N, y: 0, w: 1/N, h: 1}`. Pixels beyond the
+image are black. The whole image must fit the GPU's framebuffers (32768 pixels a side on
+a T4, 45 phones wide).
+
+**Seams.** Every phone draws the whole image into a framebuffer of the whole image's
+size, scissored to its own part, so the GPU rasterizes the same window coordinates on
+every phone. `scripts/phone/scene-test.sh` measures it on the T4 (see "The seam test").
+
+### `action`
+
+```json
+{"type": "action", "name": "dance", "t": 64.0}
+```
+
+`name` is one of a fixed set, and nothing else is taken:
+
+| name | effect |
+|---|---|
+| `scene`, `info` | the scene tab, or the info tab: device model, Android version, the GLES renderer, vendor and version of the app's context, frames per second, uptime, the place (below), the benchmark result, and the attribution lines |
+| `rotate` | portrait to landscape or back (the surface becomes 1280 x 720). A phone turned the other way from its rect has left the wall: it draws the whole image on its own, at its own aspect, until it turns back |
+| `dark`, `light` | night or day on this phone, over the scene's `night` |
+| `dance`, `wave` | a move on this phone from `t` (default: the current frame's). For moves every phone shows together, put them in the scene's `moves` |
+| `benchmark` | draws the scene offscreen at 2,400, 9,600 and 38,400 robots, 30 frames each, and reports milliseconds per frame (in `status` and on the info tab) |
+| `restart` | the app exits and starts again in a new process |
+
+The same actions arrive by intent, for adb:
+`am start -a dev.fcvm.robotpark.ACTION --es name dance [--ef t 64.0]`.
+
+### `place`
+
+```json
+{"type": "place", "vm": "phone-3", "slot": "3", "host": "example-host", "gpu": "Tesla T4",
+ "region": "us-east-1", "restored_in_ms": 5400}
+```
+
+Where the phone runs, for the info tab. Each field optional, a string or number,
+printable ASCII, at most 64 characters.
+
+### `clock`
+
+`{"type": "clock", "unix_ms": 1761100012345}`: the sender's time now. The app keeps
+the difference to its own clock and adds it from then on. The reply carries
+`offset_ms`.
+
+### `status`
+
+`{"type": "status"}` answers with the app's state:
+
+```json
+{"ok": true, "t": 41.5, "fps": 60.0, "frames": 2490, "frame_ms": 16.6,
+ "renderer": "Android Emulator OpenGL ES Translator (Tesla T4/PCIe/SSE2)",
+ "vendor": "Google (NVIDIA Corporation)", "gl_version": "OpenGL ES 3.1 (OpenGL ES 3.2 NVIDIA 580.196.07)",
+ "surface": [720, 1280], "samples": 4, "context_generation": 1, "screen": "scene",
+ "night": false, "robots": 2400, "benchmark": null, "uptime_ms": 41000,
+ "device": "Google sdk_gphone64_x86_64", "android": "15 (API 35)", "place": {}}
+```
+
+`context_generation` counts EGL contexts the app has created: it goes up when the app
+rebuilds after `EGL_CONTEXT_LOST`. `last_error` is present when something failed
+(the control socket could not bind, EGL could not start).
+
+### `capture`
+
+```json
+{"type": "capture", "name": "left-12", "t": 12.0, "rect": {"x": 0, "y": 0, "w": 0.5, "h": 1},
+ "image_aspect": 1.125, "w": 720, "h": 1280}
+```
+
+Draws one frame offscreen, with the current scene's inputs but this `t`, `rect`,
+`image_aspect` and size, through the same path as the screen, and writes it as raw RGBA,
+top row first, to the app's external files directory. The reply names the file (`path`,
+for `adb pull`), the geometry (`x0`, `y0`, `full_w`, `full_h`) and an FNV-1a 64 hash of
+the bytes (`fnv64`). `name` is 1 to 40 of `a-z`, `0-9` and `-`. This is the seam test's
+instrument; the agent does not need it.
+
+### `freeze` and `drop_context` (tests)
+
+`{"type": "freeze", "t": 12.0}` draws that `t` on screen until `{"type": "freeze", "t": null}`.
+`{"type": "drop_context"}` tears down the app's EGL display and context and builds them
+again, the path an `EGL_CONTEXT_LOST` takes; the reply carries the new `context_generation`.
+
+### Surface loss and the GPU
+
+The app renders on its own thread with its own EGL context, which lives on a 1 x 1
+pbuffer, so the context survives losing the window: `surfaceDestroyed` only drops the
+window surface, and a new surface is drawn on at once. `EGL_CONTEXT_LOST` from any EGL
+call tears down the display, the context and every GL object, and builds them again;
+the scene has no state to lose. Before a restart the app releases EGL first.
+
+### The seam test
+
+`make phone-test` (scripts/phone/run.sh, then `scripts/phone/scene-test.sh`) installs the
+app on the phone, sets a two-phone scene, and for three times (robots walking; a sign
+crossing the middle under two lights; the crowd dancing under confetti) captures the whole
+image (1440 x 1280) and its two halves (720 x 1280 each). `scripts/phone/seam.py` compares
+every pixel of each half with the whole image at the same whole-image position, and a
+redraw of one half with the first. It allows up to 9 pixels a tile 1 level apart (a residual
+seen once in 5 runs, one pixel in a light's glow) and fails on anything more; the result
+names the exact count.

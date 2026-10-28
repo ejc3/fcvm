@@ -770,7 +770,29 @@ Vulkan path is measured on the T4.
   counters, no random numbers that are not hashed from ids and `t`. Every phone runs the same
   GPU and driver. A seam test, like the renderer's, renders adjacent rectangles and the whole
   image at one `t` and compares the shared edges.
-- **Cost.** About 1,500 lines of Java and GLSL and the seam test, two PRs.
+- **Built** as Robot Park (`fleet/phone-app`, Kotlin and GLES 3, built with Gradle in a
+  container; its control socket and scene fields are "Phone app" in `fleet/PROTOCOL.md`).
+  Every robot's pose, every particle and sign is computed on the GPU from `t` and the robot's
+  table entry. Measured on a T4 through the emulator (720 x 1280, 4x MSAA): 60 fps with 2,400
+  robots, shadows, particles and a sign; the in-app benchmark draws a frame in 4.2 to 5.7 ms
+  at 2,400 robots, 6.8 to 7.8 ms at 9,600 and 23.1 to 23.6 ms at 38,400.
+- **How the tiles stay seamless.** A phone draws the whole image into a framebuffer of the
+  whole image's size, scissored to its own part, so the GPU rasterizes the same window
+  coordinates on every phone. Moving the viewport instead (the obvious off-axis approach) left
+  10 to 116 pixels in 921,600 a level or two apart at a seam, because the GPU's attribute
+  interpolation rounds differently at other window positions, even with vertices snapped to a
+  subpixel grid. Blended particles are drawn unscissored (scissored, a few glow pixels blended
+  1 level differently), and no two particles start at one point (a leaper's coincident
+  sparkles made the same frame come out two ways from run to run). `scripts/phone/seam.py`
+  allows up to 9 pixels a tile 1 level apart for one residual it has seen once in 5 runs, a
+  pixel in a light's glow.
+- **The emulator crashes when a guest GL client exits during composition.** Emulator 37.2.12
+  logs `Failed to make display surface context current: 12290` (EGL_BAD_ACCESS) as a guest
+  process with a GLES connection exits, then calls GL with no context and dies. Seen three
+  times: after `screencap`, after the app was killed for a reinstall, and after a restart
+  that exited without releasing EGL. The app now releases EGL before it exits for a restart (5
+  of 5 restarts survived), and `make phone-test` installs onto a freshly booted phone. The
+  emulator built from source (stack PR 2) is where to fix it.
 - **Branding.** The robot may be reproduced or modified under CC BY 3.0 with Google's
   attribution line ("The Android robot is reproduced or modified from work created and shared
   by Google and used according to terms described in the Creative Commons 3.0 Attribution
@@ -857,8 +879,9 @@ adb and the emulator console listen only inside the container.
 3. Snapshots of a running phone: fc-agent's park and unpark hooks for GPU holders that are
    not CUDA processes, `--gpu-warm` of a running phone, and a test that a clone's app renders
    on the clone's GPU; restore-to-first-app-frame measured, with the VM's size and hugepages.
-4. The app's scene: the Android-themed scene, deterministic by rectangle, its info tab, the
-   action intents and surface-loss handling; the seam test.
+4. The app's scene (Robot Park, `fleet/phone-app`): the Android-themed scene, deterministic
+   by rectangle, its info tab, the action intents and socket, surface-loss handling; the seam
+   test in `make phone-test`.
 5. The phone streamer: screen capture, NVENC, FCVF frames stamped with `t`.
 6. Fleet: phone slots in the agent and coordinator (`--phones`), the phone scene fields,
    `claim_phone` and its actions, phone restore timings in the state.

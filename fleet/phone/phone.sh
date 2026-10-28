@@ -7,6 +7,13 @@
 #   phone.sh boot            cold boot; prints boot_completed_ms
 #   phone.sh renderer        prints the GLES renderer SurfaceFlinger composes with
 #   phone.sh probe secs apk  installs and starts the probe app, prints its log lines
+#   phone.sh app apk         installs and starts Robot Park (fleet/phone-app), forwards
+#                            127.0.0.1:7070 in this container to its control socket, and waits
+#                            for its first frame; prints its renderer line
+#   phone.sh ctl json        one request on the app's control socket; prints the reply line
+#   phone.sh pull path dest  copies a file off the phone
+#   phone.sh shot dest.png   a screenshot of the phone's screen
+#   phone.sh applog          the app's log lines so far
 #   phone.sh stop
 set -euo pipefail
 export ANDROID_SDK_ROOT=/sdk ANDROID_HOME=/sdk ANDROID_AVD_HOME=/root/.android/avd
@@ -16,6 +23,7 @@ export ANDROID_SDK_ROOT=/sdk ANDROID_HOME=/sdk ANDROID_AVD_HOME=/root/.android/a
 export ANDROID_EGL_ON_EGL=1
 ADB=/sdk/platform-tools/adb
 EMU=/sdk/emulator/emulator
+CTL_PORT=7070
 AVD=$ANDROID_AVD_HOME/phone.avd
 ms() { date +%s%3N; }
 
@@ -79,11 +87,45 @@ probe)
   sleep "${2:-5}"
   "$ADB" logcat -d -s PHONEPROBE:I | tr -d '\r' | grep PHONEPROBE
   ;;
+app)
+  # a fresh install: another build host signs with another debug key
+  "$ADB" uninstall dev.fcvm.robotpark > /dev/null 2>&1 || true
+  "$ADB" install "${2:?usage: phone.sh app apk}" > /dev/null
+  # the app hides the system bars; without this Android covers the scene with a one-time hint
+  "$ADB" shell settings put secure immersive_mode_confirmations confirmed
+  "$ADB" logcat -c
+  "$ADB" shell am start -W -n dev.fcvm.robotpark/.MainActivity | tr -d '\r' | grep -E '^(Status|TotalTime)'
+  "$ADB" forward tcp:"$CTL_PORT" localabstract:dev.fcvm.robotpark > /dev/null
+  for _ in $(seq 1 100); do
+    line=$("$ADB" logcat -d -s ROBOTPARK:I | tr -d '\r' | grep -m1 'fps=' || true)
+    [ -n "$line" ] && break
+    sleep 0.2
+  done
+  [ -n "$line" ] || { echo "Robot Park drew no frame in 20 s:"; "$ADB" logcat -d | tr -d '\r' | grep -E 'ROBOTPARK|AndroidRuntime|FATAL' | tail -30; exit 1; }
+  "$ADB" logcat -d -s ROBOTPARK:I | tr -d '\r' | grep -m1 -o 'renderer=.*'
+  ;;
+ctl)
+  # The control protocol is one JSON line each way (fleet/PROTOCOL.md, "Phone app").
+  exec 3<> "/dev/tcp/127.0.0.1/$CTL_PORT"
+  printf '%s\n' "${2:?usage: phone.sh ctl json}" >&3
+  IFS= read -r -t "${CTL_TIMEOUT:-60}" reply <&3 || { echo "no reply from the app" >&2; exit 1; }
+  exec 3>&-
+  echo "$reply"
+  ;;
+pull)
+  "$ADB" pull "${2:?usage: phone.sh pull path dest}" "${3:?usage: phone.sh pull path dest}" > /dev/null
+  ;;
+shot)
+  "$ADB" exec-out screencap -p > "${2:?usage: phone.sh shot dest.png}"
+  ;;
+applog)
+  "$ADB" logcat -d -s ROBOTPARK:I | tr -d '\r' | grep ROBOTPARK
+  ;;
 stop)
   "$ADB" emu kill > /dev/null 2>&1 || true
   ;;
 *)
-  echo "usage: phone.sh boot|renderer|probe secs apk|stop" >&2
+  echo "usage: phone.sh boot|renderer|probe secs apk|app apk|ctl json|pull path dest|shot dest.png|applog|stop" >&2
   exit 2
   ;;
 esac
