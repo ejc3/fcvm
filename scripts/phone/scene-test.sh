@@ -162,5 +162,10 @@ for _ in $(seq 1 30); do
   s=$(status 2>/dev/null) || continue
   [ -n "$(field .uptime_ms "$s")" ] && [ "$(field .uptime_ms "$s")" -lt "$u0" ] && [ "$(field '.fps > 0' "$s")" = true ] && break
 done
-[ -n "$s" ] && [ "$(field .uptime_ms "$s")" -lt "$u0" ] && ok "action restart: a new process drawing at $(field .fps "$s") fps" || bad "action restart: $s"
+n=$(drawn)
+if [ -n "$s" ] && [ "$(field .uptime_ms "$s")" -lt "$u0" ] && [ "$n" -ge 60 ]; then
+  ok "action restart: a new process drew $n frames in 2 s"
+else
+  bad "action restart: $n frames in 2 s after it; status $s"
+fi
 exit $fail

@@ -197,6 +197,7 @@ class SceneRenderer(private val assets: AssetManager) {
     fun drawOffscreen(fs: FrameState, tile: Tile, robotCount: Int): ByteArray {
         render(fs, tile, robotCount)
         if (capW != tile.w || capH != tile.h) {
+            capW = 0; capH = 0
             if (capColor != 0) GLES30.glDeleteRenderbuffers(1, intArrayOf(capColor), 0)
             if (capFbo == 0) capFbo = genFbo()
             capColor = genRenderbuffer()
@@ -366,6 +367,8 @@ class SceneRenderer(private val assets: AssetManager) {
     /** The multisampled whole image and the single-sampled one it resolves into. */
     private fun ensureTargets(w: Int, h: Int) {
         if (w == msaaW && h == msaaH && msaaFbo != 0) return
+        // forget the old size first: if an allocation below fails, the next frame rebuilds
+        msaaW = 0; msaaH = 0
         if (msaaColor != 0) GLES30.glDeleteRenderbuffers(3, intArrayOf(msaaColor, msaaDepth, resolveColor), 0)
         if (msaaFbo == 0) { msaaFbo = genFbo(); resolveFbo = genFbo() }
         msaaColor = genRenderbuffer(); msaaDepth = genRenderbuffer(); resolveColor = genRenderbuffer()

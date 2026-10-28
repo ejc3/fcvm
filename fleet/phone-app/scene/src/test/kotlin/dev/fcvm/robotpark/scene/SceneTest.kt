@@ -215,6 +215,26 @@ class SceneTest {
         assertEquals("the loop takes a task in one place", take, loop.lastIndexOf("tasks.removeFirstOrNull()"))
     }
 
+    /**
+     * A framebuffer's cached size is cleared before its storage is replaced and set only once
+     * the framebuffer is complete: a failed allocation (out of GPU memory for a large image)
+     * must not leave a size that makes the next frame at that size skip the rebuild and draw
+     * into incomplete attachments.
+     */
+    @Test fun framebufferSizesArePublishedOnlyAfterTheirAllocationSucceeds() {
+        val src = appSource("SceneRenderer.kt")
+        for ((fn, v) in listOf("private fun ensureTargets(" to "msaaW", "fun drawOffscreen(" to "capW")) {
+            val start = src.indexOf(fn)
+            val body = src.substring(start, src.indexOf("\n    }\n", start))
+            val clear = body.indexOf("$v = 0")
+            val alloc = body.indexOf("RenderbufferStorage")
+            val check = body.indexOf("checkFbo(")
+            val publish = body.indexOf("$v = ", check)
+            assertTrue("$fn clears $v before replacing storage", clear in 0 until alloc)
+            assertTrue("$fn sets $v after checkFbo", check > alloc && publish > check)
+        }
+    }
+
     /** Every program the app links compiles as GLSL ES 3.00 (glslangValidator, in the build container). */
     @Test fun shadersCompile() {
         val dir = File(System.getProperty("shaderDir") ?: error("shaderDir is not set"))

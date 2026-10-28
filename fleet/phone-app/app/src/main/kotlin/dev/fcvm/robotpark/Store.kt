@@ -1,6 +1,5 @@
 package dev.fcvm.robotpark
 
-import android.os.SystemClock
 import dev.fcvm.robotpark.scene.Crowd
 import dev.fcvm.robotpark.scene.FrameState
 import dev.fcvm.robotpark.scene.Move
@@ -40,7 +39,8 @@ object Store {
     @Volatile var screen = "scene"
     @Volatile var lastError: String? = null
 
-    val startedElapsedMs = SystemClock.elapsedRealtime()
+    /** When this process started (not when this object was first used). */
+    val startedElapsedMs = android.os.Process.getStartElapsedRealtime()
 
     fun effectiveScene(): SceneInput {
         val s = scene
