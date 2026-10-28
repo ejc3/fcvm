@@ -247,6 +247,23 @@ class SceneTest {
     }
 
     /**
+     * Every EGL setup step after the context exists (the pbuffer, making it current, building
+     * the renderer) tears the context down when it fails, so the next pass builds it again;
+     * a context left with no renderer drew nothing until the app restarted.
+     */
+    @Test fun aContextWhoseSetupFailsIsTornDown() {
+        val src = appSource("GlThread.kt")
+        val body = src.substring(src.indexOf("private fun ensureContext()"), src.indexOf("private fun rebind("))
+        val created = body.indexOf("eglCreateContext(")
+        val tryAt = body.indexOf("try {", created)
+        val catchAt = body.indexOf("catch (e: RuntimeException)", tryAt)
+        assertTrue("the setup after eglCreateContext runs in a try", created >= 0 && tryAt > created)
+        assertTrue("a failed setup step tears the context down", catchAt > tryAt && body.indexOf("teardown(", catchAt) > catchAt)
+        assertTrue("the pbuffer is checked", body.contains("check(pbuffer != EGL14.EGL_NO_SURFACE)"))
+        assertTrue("making it current is checked", body.contains("check(EGL14.eglMakeCurrent(dpy, pbuffer, pbuffer, ctx))"))
+    }
+
+    /**
      * A queued task (a capture, a context drop, the benchmark) leaves the queue only once a
      * context is current, so a context that cannot be made current delays it instead of
      * dropping it (a dropped benchmark left benchmarkRunning set for good).

@@ -99,8 +99,8 @@ class GlThread(private val context: Context) : Thread("robotpark-gl") {
     fun dropContext(): Map<String, Any?> = run(30) {
         renderer?.release()
         teardown("asked to drop the context")
-        ensureContext()
-        PhoneApp.ok("context_generation" to Store.contextGeneration)
+        if (ensureContext()) PhoneApp.ok("context_generation" to Store.contextGeneration)
+        else mapOf("error" to "the context could not be built again: ${Store.lastError}")
     }
 
     /** Draws the scene offscreen at rising robot counts and reports the time per frame. */
@@ -229,11 +229,22 @@ class GlThread(private val context: Context) : Thread("robotpark-gl") {
         cfg = configs[0]
         ctx = EGL14.eglCreateContext(dpy, cfg, EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE), 0)
         if (ctx == EGL14.EGL_NO_CONTEXT) { Store.lastError = "eglCreateContext failed: 0x${Integer.toHexString(EGL14.eglGetError())}"; return false }
-        pbuffer = EGL14.eglCreatePbufferSurface(dpy, cfg, intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0)
-        if (!EGL14.eglMakeCurrent(dpy, pbuffer, pbuffer, ctx)) { eglFailed("eglMakeCurrent(pbuffer)"); return false }
-        val r = SceneRenderer(context.assets)
-        r.init()
-        renderer = r
+        // Any step from here failing leaves a context with no renderer: tear it down so the next
+        // pass (after the loop's back-off) builds it again.
+        try {
+            pbuffer = EGL14.eglCreatePbufferSurface(dpy, cfg, intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0)
+            check(pbuffer != EGL14.EGL_NO_SURFACE) { "eglCreatePbufferSurface failed: 0x${Integer.toHexString(EGL14.eglGetError())}" }
+            check(EGL14.eglMakeCurrent(dpy, pbuffer, pbuffer, ctx)) { "eglMakeCurrent(pbuffer) failed: 0x${Integer.toHexString(EGL14.eglGetError())}" }
+            val r = SceneRenderer(context.assets)
+            r.init()
+            renderer = r
+        } catch (e: RuntimeException) {
+            Log.e(TAG, "EGL setup failed", e)
+            Store.lastError = "EGL setup: ${e.message}"
+            teardown("EGL setup failed")
+            return false
+        }
+        val r = renderer!!
         Store.renderer = GLES30.glGetString(GLES30.GL_RENDERER) ?: ""
         Store.vendor = GLES30.glGetString(GLES30.GL_VENDOR) ?: ""
         Store.glVersion = GLES30.glGetString(GLES30.GL_VERSION) ?: ""
