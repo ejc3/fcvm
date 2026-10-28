@@ -9,14 +9,35 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
+/// How a supervised aggregator is run.
+#[derive(Debug, Clone, Default)]
+pub struct Supervision {
+    /// Extra environment for the child (the broadcast's ingest URL).
+    pub env: Vec<(String, String)>,
+    /// Run the child only while there is a layout: one that goes away stops it, and the
+    /// next one starts it again (the broadcast, which pushes while it runs).
+    pub only_with_layout: bool,
+}
+
 /// Keep `argv` (an `fcvm fleet aggregate ...` command; `--listen <listen>` is added)
 /// running and feed it every layout from `layouts`. `on_ready` runs each time a started
 /// aggregator answers `/healthz`.
 pub async fn supervise(
     argv: Vec<String>,
     listen: String,
+    layouts: watch::Receiver<Option<Layout>>,
+    on_ready: impl Fn() + Send + 'static,
+) {
+    supervise_with(argv, listen, layouts, on_ready, Supervision::default()).await
+}
+
+/// [`supervise`] with [`Supervision`] settings.
+pub async fn supervise_with(
+    argv: Vec<String>,
+    listen: String,
     mut layouts: watch::Receiver<Option<Layout>>,
     on_ready: impl Fn() + Send + 'static,
+    how: Supervision,
 ) {
     let http = reqwest::Client::builder()
         .no_proxy()
@@ -26,10 +47,17 @@ pub async fn supervise(
     let token = uuid::Uuid::new_v4().simple().to_string();
     let mut backoff = Duration::from_secs(1);
     loop {
+        if how.only_with_layout {
+            // Wait for a layout; the sender gone means the coordinator is stopping.
+            if layouts.wait_for(|l| l.is_some()).await.is_err() {
+                return;
+            }
+        }
         let started = Instant::now();
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..])
             .args(["--listen", &listen])
+            .envs(how.env.iter().map(|(k, v)| (k, v)))
             .env(super::LAYOUT_TOKEN_ENV, &token)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
@@ -62,6 +90,7 @@ pub async fn supervise(
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let mut stopped = false;
         if ready {
             on_ready();
             layouts.mark_changed();
@@ -77,6 +106,12 @@ pub async fn supervise(
                             return;
                         }
                         let layout = layouts.borrow_and_update().clone();
+                        if layout.is_none() && how.only_with_layout {
+                            tracing::info!("no layout: stopping the aggregator");
+                            let _ = child.kill().await;
+                            stopped = true;
+                            break;
+                        }
                         if let Some(l) = layout {
                             if let Err(e) = http.post(format!("{base}/layout")).bearer_auth(&token).json(&l).send().await.and_then(|r| r.error_for_status()) {
                                 tracing::warn!(error = %e, "layout not posted to the aggregator");
@@ -87,6 +122,10 @@ pub async fn supervise(
             }
         } else {
             let _ = child.kill().await;
+        }
+        if stopped {
+            backoff = Duration::from_secs(1);
+            continue;
         }
         if started.elapsed() >= Duration::from_secs(60) {
             backoff = Duration::from_secs(1);
@@ -107,7 +146,9 @@ pub fn connect_addr(listen: &str) -> String {
     }
 }
 
-fn arm_pdeathsig(command: &mut std::process::Command) {
+/// Kill the child when this process dies (SIGTERM), with the parent rechecked after the
+/// fork, so no hop of the teardown chain outlives its parent.
+pub(crate) fn arm_pdeathsig(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
     let parent = std::process::id() as libc::pid_t;
     // SAFETY: two async-signal-safe calls in the forked child; no allocation.

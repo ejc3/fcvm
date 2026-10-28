@@ -10,6 +10,7 @@
 pub mod agents;
 pub mod authority;
 pub mod aws;
+pub mod broadcast;
 pub mod cert;
 pub mod dns;
 pub mod ec2;
@@ -114,6 +115,8 @@ pub struct Outputs {
     pub ec2: watch::Sender<Vec<AssignSlot>>,
     /// The EC2 half's aggregator layout.
     pub ec2_layout: watch::Sender<Option<Layout>>,
+    /// The broadcast aggregator's layout: the whole image, or `None` when nothing shows.
+    pub broadcast_layout: watch::Sender<Option<Layout>>,
     /// The fleet's power state (`awake`, `asleep`, `waking`).
     pub power: watch::Sender<String>,
     /// The shared scene, for the EC2 tiles' renderers.
@@ -314,6 +317,12 @@ impl Actor {
         self.out.ec2_layout.send_if_modified(|cur| {
             let changed = *cur != ec2_layout;
             *cur = ec2_layout.clone();
+            changed
+        });
+        let broadcast_layout = broadcast::layout(&self.state);
+        self.out.broadcast_layout.send_if_modified(|cur| {
+            let changed = *cur != broadcast_layout;
+            *cur = broadcast_layout.clone();
             changed
         });
         let power = self.state.fleet.power.state.clone();
@@ -681,6 +690,7 @@ pub struct Handle {
     pub cmds: mpsc::Sender<Cmd>,
     pub snapshot: watch::Receiver<Arc<Snapshot>>,
     pub ec2_layout: watch::Receiver<Option<Layout>>,
+    pub broadcast_layout: watch::Receiver<Option<Layout>>,
 }
 
 impl Handle {
@@ -786,6 +796,7 @@ pub fn start(
     }));
     let (ec2_tx, ec2_rx) = watch::channel(Vec::new());
     let (ec2_layout_tx, ec2_layout_rx) = watch::channel(None);
+    let (broadcast_layout_tx, broadcast_layout_rx) = watch::channel(None);
     let (power_tx, power_rx) = watch::channel(state.fleet.power.state.clone());
     let (scene_tx, scene_rx) = watch::channel(None);
     let (budget_tx, budget_rx) = watch::channel(state.fleet.budget.body());
@@ -798,6 +809,7 @@ pub fn start(
             snapshot: snap_tx,
             ec2: ec2_tx,
             ec2_layout: ec2_layout_tx,
+            broadcast_layout: broadcast_layout_tx,
             power: power_tx,
             scene: scene_tx,
             budget: budget_tx,
@@ -815,6 +827,7 @@ pub fn start(
         cmds,
         snapshot: snap_rx,
         ec2_layout: ec2_layout_rx,
+        broadcast_layout: broadcast_layout_rx,
     };
     let tick = handle.clone();
     tokio::spawn(async move {
@@ -1125,6 +1138,41 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             listen.clone(),
             handle.ec2_layout.clone(),
             || {},
+        ));
+    }
+    if let Some(listen) = &args.broadcast_listen {
+        let json = match (&args.broadcast_secret, &args.broadcast_file) {
+            (Some(secret), _) => secrets::Secrets::new(&secrets_region()?)?
+                .get(secret)
+                .await
+                .with_context(|| format!("reading the broadcast secret {secret}"))?,
+            (None, Some(path)) => std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?,
+            (None, None) => {
+                bail!("--broadcast-listen needs --broadcast-secret or --broadcast-file")
+            }
+        };
+        let b = broadcast::BroadcastSecret::parse(&json)?;
+        let mut argv = vec![
+            std::env::current_exe()
+                .context("locating this fcvm binary")?
+                .to_string_lossy()
+                .into_owned(),
+            "fleet".into(),
+            "aggregate".into(),
+        ];
+        argv.extend(broadcast::DEFAULT_ARGS.iter().map(|s| s.to_string()));
+        argv.extend(args.broadcast_args.iter().cloned());
+        argv.extend(["--push-url-env".into(), broadcast::PUSH_URL_ENV.into()]);
+        tokio::spawn(crate::fleet::aggregate::child::supervise_with(
+            argv,
+            listen.clone(),
+            handle.broadcast_layout.clone(),
+            || {},
+            crate::fleet::aggregate::child::Supervision {
+                env: vec![(broadcast::PUSH_URL_ENV.into(), b.ingest_url)],
+                only_with_layout: true,
+            },
         ));
     }
     for cmd in args.agent_cmds {

@@ -520,7 +520,19 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--dns-zone fcvm.dev] [--dns-token-secret <secret> [--dns-zone-id <id>]]
                  [--dns-subzone <subzone> --dns-subzone-ns <ns>,... --dns-listen <addr:port> [--dns-rate-limit 200]]
                  [--tls-secret <secret>] [--secrets-region <region>]
+                 [--broadcast-listen <addr:port> (--broadcast-secret <secret> | --broadcast-file <path>)
+                  [--broadcast-arg <arg>]...]
 ```
+
+- `--broadcast-listen` runs the broadcast (docs/fleet/ARCHITECTURE.md, "Broadcast mode"): an
+  aggregator child (this address is its layout and stats listener) whose layout is the
+  whole image, every placed tile read directly at its published IPv6 name. It runs while a
+  tile is placed and is stopped while none is (asleep), and pushes to the ingest URL of
+  `--broadcast-secret` (a Secrets Manager secret, read in `--secrets-region`) or
+  `--broadcast-file`: JSON `{"ingest_url": "rtmps://<endpoint>:443/app/<stream key>"}`. The
+  coordinator does not start when it cannot read it. Its arguments are `--image-height 720
+  --tile-query q=std --maxrate-kbps 4500 --crf 21 --preset veryfast`, then any
+  `--broadcast-arg`.
 
 - `--state-bucket` (also `FLEET_STATE_BUCKET`, `FLEET_STATE_KEY`) keeps the state as one S3
   object instead of a file: read at start, rewritten whole (one PUT, atomic; the bucket
@@ -1091,6 +1103,28 @@ processes; the host needs the `ffmpeg` CLI with libx264.
   for its renderers (`tls.json`, `{"cert", "key"}`, PEM; see the agent's `--tls-secret`):
   it is read again every 2 s and a new version is used for the connections that follow;
   a version that does not load is logged and the previous one kept.
+
+### Pushing to a live ingest (the broadcast)
+
+`--push-url-env <VAR>` also pushes the stream to the URL in that environment variable
+(`rtmps://<endpoint>:443/app/<stream key>`; the variable keeps the key off the aggregator's
+command line). The aggregator writes FLV to an `ffmpeg` child that copies it there: an
+`onMetaData` tag naming the size first (so the copy probes nothing), the video, and a silent
+AAC-LC track (48 kHz mono, a frame every 1024 samples up to each video frame's time; IVS
+serves a stream without audio about 3.4 s later). A child that exits is started again after
+1 s, doubling to 30 s. The push starts at a keyframe, and after frames are lost (the pusher fell
+behind) waits for the next one. Each frame's FLV timestamp is its scene time in milliseconds
+after the first pushed frame, so a skipped slot is a gap. Each frame's access unit carries,
+before its first slice, an SEI message of type 5 (user data unregistered) with UUID
+`6a0e3c5d-9b41-4f2e-8d77-1c52f30ab619` and the JSON payload
+
+```json
+{"t": 1234.533333, "e": 1761134400000}
+```
+
+`t` the frame's scene time (seconds) and `e` the scene epoch (unix milliseconds), so the
+frame's wall time is `e + 1000 t`. A player reads it as the frame is shown (the IVS web
+player's `MetadataEventType.SEI`).
 
 ## Renderer
 

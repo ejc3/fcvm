@@ -22,6 +22,7 @@ pub mod child;
 pub mod codec;
 pub mod compose;
 pub mod frame;
+pub mod push;
 mod tile;
 pub mod tls;
 
@@ -942,7 +943,9 @@ pub fn public_router(shared: Arc<Shared>) -> Router {
 
 pub async fn cmd(args: FleetAggregateArgs) -> Result<()> {
     let codec: Arc<dyn Codec> = match args.codec {
-        FleetAggregateCodec::Ffmpeg => Arc::new(codec::Ffmpeg { bin: args.ffmpeg }),
+        FleetAggregateCodec::Ffmpeg => Arc::new(codec::Ffmpeg {
+            bin: args.ffmpeg.clone(),
+        }),
         FleetAggregateCodec::Raw => Arc::new(codec::Raw),
     };
     let opts = Options {
@@ -991,6 +994,18 @@ pub async fn cmd(args: FleetAggregateArgs) -> Result<()> {
         }
     }
     let cancel = CancellationToken::new();
+    if let Some(var) = &args.push_url_env {
+        let url = std::env::var(var)
+            .ok()
+            .filter(|u| !u.is_empty())
+            .with_context(|| format!("--push-url-env names {var}, which is not set"))?;
+        tokio::spawn(push::run(
+            shared.clone(),
+            args.ffmpeg.clone(),
+            url,
+            cancel.clone(),
+        ));
+    }
     tokio::spawn(run(shared.clone(), codec, opts, cancel.clone()));
     let listener = tokio::net::TcpListener::bind(&args.listen)
         .await
