@@ -5688,6 +5688,8 @@ async fn a_closed_seat_is_kept_for_its_ticket_then_freed_without_promoting_anyon
     // A reload is a new connection, admitted afresh.
     let mut reload = Viewer::connect(&c.url).await;
     assert_eq!(reload.message("admission").await["locked"], false);
+}
+
 /// A tile lent to a visitor ("Your own GPU") draws that visitor's private camera over the
 /// whole image: the broadcast keeps its rectangle black instead of streaming it.
 #[tokio::test]
