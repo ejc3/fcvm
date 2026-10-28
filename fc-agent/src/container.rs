@@ -564,6 +564,39 @@ fn get_filesystem_size_bytes(path: &str) -> Option<u64> {
         .filter(|&b: &u64| b > 0)
 }
 
+/// Grow a btrfs root filesystem to fill its disk, which the host extends for
+/// `--rootfs-size`, and return whether the root is btrfs. An ext4 root is grown on the
+/// host. Every image mode needs it: the container's writable layer is on the root.
+/// A failed resize is a warning; the VM still runs on the smaller filesystem.
+pub fn grow_btrfs_root() -> bool {
+    let root_is_btrfs = std::process::Command::new("findmnt")
+        .args(["-n", "-o", "FSTYPE", "/"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "btrfs")
+        .unwrap_or(false);
+    if !root_is_btrfs {
+        return false;
+    }
+    match std::process::Command::new("btrfs")
+        .args(["filesystem", "resize", "max", "/"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            eprintln!("[fc-agent] root filesystem is btrfs, resized to fill disk");
+        }
+        Ok(output) => {
+            eprintln!(
+                "[fc-agent] WARNING: btrfs resize failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: btrfs resize command failed: {}", e);
+        }
+    }
+    true
+}
+
 /// Set up btrfs storage if the kernel supports it.
 /// Creates a sparse loopback btrfs filesystem sized to the root disk capacity
 /// and configures podman to use it.
@@ -588,32 +621,8 @@ pub fn setup_btrfs_storage_if_available(
         return Ok(());
     }
 
-    // If root filesystem is natively btrfs, resize to fill disk and skip loopback.
-    // The host may have expanded the sparse file for --rootfs-size.
-    let root_is_btrfs = std::process::Command::new("findmnt")
-        .args(["-n", "-o", "FSTYPE", "/"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "btrfs")
-        .unwrap_or(false);
-
-    if root_is_btrfs {
-        match std::process::Command::new("btrfs")
-            .args(["filesystem", "resize", "max", "/"])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                eprintln!("[fc-agent] root filesystem is btrfs, resized to fill disk");
-            }
-            Ok(output) => {
-                eprintln!(
-                    "[fc-agent] WARNING: btrfs resize failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-            }
-            Err(e) => {
-                eprintln!("[fc-agent] WARNING: btrfs resize command failed: {}", e);
-            }
-        }
+    // A native btrfs root is grown to fill its disk and holds the storage itself.
+    if grow_btrfs_root() {
         let storage_dir = "/var/lib/containers/storage";
         let _ = std::fs::create_dir_all(storage_dir);
         write_btrfs_storage_conf(

@@ -127,6 +127,71 @@ async fn run_on_the_store(user: &str, suffix: &str) -> Result<()> {
     checked
 }
 
+/// Overlay mode on a btrfs root grows the root filesystem to `--rootfs-size`. The host
+/// extends the root disk; on a btrfs root the guest grows the filesystem into it, and
+/// overlay mode must do that too, because the container's writable layer lives on the
+/// root filesystem.
+#[tokio::test]
+async fn test_localhost_overlay_mode_grows_a_btrfs_root() -> Result<()> {
+    let suffix = "localhost-overlay-btrfs-grow";
+    let image_name = image_name_for_suffix(suffix);
+    build_marker_image(&image_name, suffix).await?;
+
+    let (vm_name, _, _, _) = common::unique_names(suffix);
+    let args = [
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--kernel-profile",
+        "btrfs",
+        "--image-mode",
+        "overlay",
+        "--rootfs-size",
+        "30G",
+        &image_name,
+    ];
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&args).await.context("spawning fcvm")?;
+
+    let checked = async {
+        common::poll_health_by_pid(fcvm_pid, 180)
+            .await
+            .context("VM failed to become healthy")?;
+        let root = common::exec_in_vm(
+            fcvm_pid,
+            &["findmnt -n -o FSTYPE / && df -B1 --output=avail / | tail -1"],
+        )
+        .await
+        .context("reading the root filesystem")?;
+        let mut lines = root.split_whitespace();
+        let (fstype, avail) = (lines.next().unwrap_or(""), lines.next().unwrap_or(""));
+        let avail: u64 = avail
+            .parse()
+            .with_context(|| format!("parsing df output {root:?}"))?;
+        println!(
+            "  root: {fstype}, {:.1} GiB available",
+            avail as f64 / (1u64 << 30) as f64
+        );
+        anyhow::ensure!(
+            fstype == "btrfs",
+            "the btrfs profile's root should be btrfs, got {fstype:?}"
+        );
+        // --rootfs-size is the free space asked for; allow 5% for filesystem overhead.
+        let wanted = 30u64 << 30;
+        anyhow::ensure!(
+            avail >= wanted / 100 * 95,
+            "the root filesystem has {:.1} GiB available, where --rootfs-size asked for 30 GiB",
+            avail as f64 / (1u64 << 30) as f64
+        );
+        Ok(())
+    }
+    .await;
+
+    common::kill_process(fcvm_pid).await;
+    let _ = child.wait().await;
+    checked
+}
+
 /// Test with archive mode (podman load at boot)
 #[tokio::test]
 async fn test_localhost_archive_mode() -> Result<()> {

@@ -309,6 +309,9 @@ pub async fn run() -> Result<()> {
     // instead of reformatting it (guarded by the provisioned marker).
     match plan.image_mode.as_deref() {
         Some("overlay") => {
+            // The image store is its own device; the root still holds the container's
+            // writable layer, so a btrfs root is grown to its disk.
+            container::grow_btrfs_root();
             eprintln!("[fc-agent] skipping btrfs loopback setup (image_mode=overlay)");
         }
         _ => {
