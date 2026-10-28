@@ -397,9 +397,12 @@ async fn park_steps(done: &mut Done) -> Result<Parked> {
     let hook = container_gpu_hook().await?;
     let mut release_ms = 0.0;
     if let Some(hook) = &hook {
+        // Recorded before the release runs: a hook that released the GPU and then failed
+        // or timed out still gets its retake when the park is undone. A retake of a GPU
+        // that was never released does nothing.
+        done.released_by_hook = Some(hook.clone());
         let release_started = Instant::now();
         let out = run_gpu_hook(hook, "release").await?;
-        done.released_by_hook = Some(hook.clone());
         release_ms = release_started.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
             "[fc-agent] gpu: the container's hook released the GPU in {release_ms:.1} ms: {}",
@@ -669,6 +672,11 @@ mod tests {
         assert!(
             at(park, "run_gpu_hook(hook, \"release\")")
                 < at(park, "nvidia_device_holders(Path::new(\"/proc\"), &except)")
+        );
+        // The retake is registered for the undo before the release runs, so a release
+        // that failed after the hook let go of the GPU is still retaken.
+        assert!(
+            at(park, "done.released_by_hook = Some(") < at(park, "run_gpu_hook(hook, \"release\")")
         );
         let unpark = &code[code.find("pub async fn unpark(").unwrap()..];
         let unlock = at(unpark, "action(\"unlock\", pid)");
