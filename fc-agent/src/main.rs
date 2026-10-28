@@ -94,9 +94,17 @@ async fn main() {
 
     // Warm GPU snapshot one-shots, invoked by the host around a `snapshot create
     // --gpu-warm` (gpu_park.rs). Failure is the exit status, so the host stops.
+    // They run podman (the container's GPU hook) as the container's user, whose
+    // context the agent set up and recorded.
     let gpu_result = match one_shot.as_deref() {
-        Some("--gpu-park") => Some(gpu_park::park().await.map(|_| ())),
-        Some("--gpu-unpark") => Some(gpu_park::unpark_source().await),
+        Some("--gpu-park") => Some(match container::restore_podman_cmd_prefix() {
+            Ok(()) => gpu_park::park().await.map(|_| ()),
+            Err(e) => Err(e),
+        }),
+        Some("--gpu-unpark") => Some(match container::restore_podman_cmd_prefix() {
+            Ok(()) => gpu_park::unpark_source().await,
+            Err(e) => Err(e),
+        }),
         _ => None,
     };
     if let Some(result) = gpu_result {
@@ -209,5 +217,23 @@ mod tests {
             "[fc-agent] Error: mounting extra disks: Failed to mount /dev/vdb at /data: mount: \
              wrong fs type, bad superblock."
         );
+    }
+
+    /// The GPU one-shots run podman as the container's user: they take the agent's
+    /// command prefix before parking or unparking. Without it a VM run with a nonzero
+    /// --user looked for its container in root's store, found no GPU hook, and the park
+    /// failed on the emulator still holding the GPU.
+    #[test]
+    fn the_gpu_one_shots_take_the_agents_podman_prefix_first() {
+        let source = include_str!("main.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        for one_shot in ["gpu_park::park()", "gpu_park::unpark_source()"] {
+            let call = code.find(one_shot).expect(one_shot);
+            let arm = code[..call].rfind("Some(\"--gpu-").unwrap();
+            assert!(
+                code[arm..call].contains("container::restore_podman_cmd_prefix()"),
+                "{one_shot} runs without the agent's podman command prefix"
+            );
+        }
     }
 }

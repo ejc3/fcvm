@@ -322,7 +322,7 @@ help:
 	@echo "  setup-gpu          Build the gpu profile kernel and NVIDIA driver image"
 	@echo "  setup-phone        Build the phone profile (gpu + KVM) kernel, Firecracker and driver image"
 	@echo "  phone-emulator     Build the Android Emulator from source for the phone (about 25 min once)"
-	@echo "  phone-test         An Android Emulator in a phone VM renders on the GPU (GPU=<pci address>)"
+	@echo "  phone-test         A phone VM renders on the GPU and moves to GPU2 by warm snapshot (GPU=, GPU2=)"
 	@echo "  gpu-residue-test   GPU memory residue between VMs (GPU=<pci address>)"
 	@echo "  gpu-routed-test    A routed GPU VM and its restore hold their IPv6 address (GPU=<pci address>)"
 	@echo "  setup-passt        Build and install the pinned upstream pasta/passt"
@@ -912,18 +912,19 @@ setup-phone: build setup-btrfs
 phone-emulator:
 	./scripts/phone/emulator.sh
 
-# A phone VM renders on its GPU (scripts/phone/run.sh): KVM works in the restored VM, an
-# Android Emulator built from source boots with -gpu host, SurfaceFlinger and an app render
-# on the GPU, and the running phone releases the GPU and takes it up again. Fetches the
-# pinned SDK first (scripts/phone/sdk.sh), which needs ACCEPT_ANDROID_SDK_LICENSE=1, and
-# builds the emulator.
+# A phone VM renders on its GPU and survives a warm snapshot onto a second GPU
+# (scripts/phone/run.sh): KVM works in the restored VM, an Android Emulator built from source
+# boots with -gpu host, SurfaceFlinger and an app render on the GPU, the running phone
+# releases the GPU and takes it up again, and a clone of its warm snapshot runs the app on
+# GPU2. Fetches the pinned SDK first (scripts/phone/sdk.sh), which needs
+# ACCEPT_ANDROID_SDK_LICENSE=1, and builds the emulator.
 phone-test: private SHELL := $(TARGET_LEASE_SHELL)
 phone-test: $(if $(strip $(GPU)),setup-phone phone-emulator)
-	@test -n "$(GPU)" || { echo "usage: make phone-test GPU=<pci address> ACCEPT_ANDROID_SDK_LICENSE=1" >&2; exit 2; }
+	@test -n "$(GPU)" && test -n "$(GPU2)" || { echo "usage: make phone-test GPU=<pci address> GPU2=<another pci address> ACCEPT_ANDROID_SDK_LICENSE=1" >&2; exit 2; }
 	./scripts/phone/test-sdk-lock.sh
 	./scripts/phone/test-gpu-hook.sh
 	ACCEPT_ANDROID_SDK_LICENSE="$(ACCEPT_ANDROID_SDK_LICENSE)" ./scripts/phone/sdk.sh
-	FCVM=./target/release/fcvm ./scripts/phone/run.sh "$(GPU)"
+	FCVM=./target/release/fcvm ./scripts/phone/run.sh "$(GPU)" "$(GPU2)"
 
 # A routed GPU VM, and one restored from its snapshot at another address, hold the
 # --ipv6-address they were given on eth0 and reach the internet over IPv6
