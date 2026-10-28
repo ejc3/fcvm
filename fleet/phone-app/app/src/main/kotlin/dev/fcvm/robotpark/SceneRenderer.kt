@@ -336,6 +336,7 @@ class SceneRenderer(private val assets: AssetManager) {
         GLES30.glUniform1f(p.u("u_walkT"), fs.walkT)
         GLES30.glUniform1f(p.u("u_dance"), fs.dance)
         GLES30.glUniform1f(p.u("u_wave"), fs.wave)
+        GLES30.glUniform1f(p.u("u_still"), fs.still)
         GLES30.glUniform1f(p.u("u_beat"), fs.beat)
         GLES30.glUniform1f(p.u("u_danceAge"), fs.danceAge)
         GLES30.glUniform1f(p.u("u_night"), fs.night)

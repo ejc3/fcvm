@@ -59,7 +59,7 @@ Pose robotPose(vec4 a, vec4 b) {
             if (u < 0.07) { float s = u / 0.07; y = 0.55 * 4.0 * s * (1.0 - s); }
         }
     }
-    float still = max(u_dance, u_wave);
+    float still = u_still;
     float walkW = 1.0 - still;
     P.root = vec3(wrapX(x), 0.0, a.y);
     float sw = sin(stepPh);
@@ -99,8 +99,9 @@ Pose robotPose(vec4 a, vec4 b) {
         P.armRaiseR = mix(P.armRaiseR, style < 1.0 ? 2.7 - 0.35 * s1 : 1.6 - 0.9 * s1, d);
         P.armSwingL = mix(P.armSwingL, style > 1.5 ? -1.2 * s1 : 0.0, d);
         P.armSwingR = mix(P.armSwingR, style > 1.5 ? 1.2 * s1 : 0.0, d);
-        P.legL = mix(P.legL, 0.4 * max(s1, 0.0), d);
-        P.legR = mix(P.legR, 0.4 * max(-s1, 0.0), d);
+        // legs kick to the beat when the crowd stands; they keep walking when it dances as it goes
+        P.legL = mix(P.legL, 0.4 * max(s1, 0.0), d * still);
+        P.legR = mix(P.legR, 0.4 * max(-s1, 0.0), d * still);
         P.headTilt = mix(P.headTilt, 0.3 * s1, d);
     }
     float w = u_wave;
@@ -109,7 +110,7 @@ Pose robotPose(vec4 a, vec4 b) {
         P.armSwingR = mix(P.armSwingR, -0.25, w);
         P.armRaiseL = mix(P.armRaiseL, 0.1, w);
         P.armSwingL = mix(P.armSwingL, 0.0, w);
-        P.legL = mix(P.legL, 0.0, w); P.legR = mix(P.legR, 0.0, w);
+        P.legL = mix(P.legL, 0.0, w * still); P.legR = mix(P.legR, 0.0, w * still);
         P.headTilt = mix(P.headTilt, -0.2, w);
     }
     P.yaw = mix(yaw, twist, still);

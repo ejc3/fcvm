@@ -39,7 +39,7 @@ void main() {
         float hops = floor(1500.0 + 600.0 * seed);
         float u = fract(hops * (u_walkT / PERIOD) + seed);
         float air = 4.0 * u * (1.0 - u);
-        float still = max(u_dance, u_wave);
+        float still = u_still;
         float bounce = 0.35 * air * (1.0 - still) + u_dance * 0.22 * abs(sin(u_beat * PI + seed * 2.0));
         p.y *= mix(mix(0.82, 1.1, air), 1.0, still);
         pos = vec3(wrapX(x), bounce, pos.z);

@@ -58,7 +58,7 @@ void main() {
         float dir = i_a.z < 0.0 ? -1.0 : 1.0;
         float len = abs(i_a.z) * LOOP_X / cyc;
         vec3 land = vec3(wrapX(i_a.x + dir * k * len), 0.05, i_a.y);
-        if (age > 1.1 || u_dance > 0.5) show = false;
+        if (age > 1.1 || u_still > 0.5) show = false;
         float ang = idx / 10.0 * TAU + seed * 0.6;
         vec3 vel = vec3(cos(ang) * 2.4, 2.6 + 1.6 * ex, sin(ang) * 1.4);
         // Each sparkle starts on a ring along its own direction. Started from one point, a

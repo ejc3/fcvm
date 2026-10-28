@@ -20,6 +20,8 @@ class FrameState(
     val walkT: Float,
     val dance: Float,
     val wave: Float,
+    /** 0..1: how far the scene's moves have stopped the crowd (the phone's own moves do not). */
+    val still: Float,
     val beat: Float,
     val danceAge: Float,
     val night: Float,
@@ -46,7 +48,7 @@ class FrameState(
     fun bits(): IntArray {
         val all = ArrayList<Float>()
         for (a in listOf(viewProj, invViewProj, lightViewProj, eye, camRight, camUp, sunDir, sunColor, skyColor, groundColor, fogColor, horizonColor, zenithColor, spread, lightPos, lightColor)) all.addAll(a.toList())
-        all.addAll(listOf(tw, walkT, dance, wave, beat, danceAge, night, lightCount.toFloat(), if (chrome) 1f else 0f, frameIndex.toFloat()))
+        all.addAll(listOf(tw, walkT, dance, wave, still, beat, danceAge, night, lightCount.toFloat(), if (chrome) 1f else 0f, frameIndex.toFloat()))
         for (s in signs) { all.add(s.x); all.add(s.z); all.addAll(s.carrier.toList()); all.add(s.text.hashCode().toFloat()) }
         return IntArray(all.size) { all[it].toRawBits() }
     }
@@ -55,6 +57,8 @@ class FrameState(
         const val FPS = 60
         const val MOVE_SECS = 8.0
         const val MOVE_RAMP = 0.6
+        /** A dance's confetti falls until this long after it starts (a piece starts up to 2.5 s late and lasts 8 s; particle.vert). */
+        const val CONFETTI_SECS = 10.5
         const val SIGN_SECS = 45.0
         const val MAX_SIGNS = 3
         const val MAX_LIGHTS = 16
@@ -67,8 +71,8 @@ class FrameState(
         fun frameIndexAt(unixMs: Long, epochUnixMs: Long): Long = Math.floorDiv((unixMs - epochUnixMs) * FPS, 1000L)
 
         fun compute(scene: SceneInput, t: Double, surfaceAspect: Double, nightDefault: Boolean): FrameState {
-            require(t >= scene.walkOffsetFrom) {
-                "t=$t is before t=${scene.walkOffsetFrom}, where this phone's own older moves were pruned; it cannot be drawn exactly"
+            require(t >= scene.historyFrom) {
+                "t=$t is before t=${scene.historyFrom}, where this phone's own older moves were pruned; it cannot be drawn exactly"
             }
             val aspect = scene.imageAspect ?: surfaceAspect
             val cam = CameraPath.at(scene.camera, t)
@@ -82,14 +86,18 @@ class FrameState(
             val night = scene.night ?: nightDefault
             val sun = if (night) Vec3(0.45, 0.62, -0.35).normalized() else Vec3(-0.52, 0.72, 0.42).normalized()
 
-            // Moves: each lasts MOVE_SECS with smooth ramps; walking stands still under any of them.
+            // Moves: each lasts MOVE_SECS with smooth ramps. The scene's moves stop the walk (every
+            // phone shows them together); the phone's own set the pose only, so dropping old ones
+            // never moves the crowd.
             val all = merge(scene.moves.map { it.t })
-            val dances = merge(scene.moves.filter { it.kind == MoveKind.DANCE }.map { it.t })
-            val waves = merge(scene.moves.filter { it.kind == MoveKind.WAVE }.map { it.t })
-            val walk = t - frozen(all, t) - scene.walkOffset
+            val posed = scene.moves + scene.localMoves
+            val dances = merge(posed.filter { it.kind == MoveKind.DANCE }.map { it.t })
+            val waves = merge(posed.filter { it.kind == MoveKind.WAVE }.map { it.t })
+            val walk = t - frozen(all, t)
             val danceStart = dances.lastOrNull { it.first <= t && t < it.second }?.first
                 ?: dances.lastOrNull { it.first <= t }?.first
-            val danceAge = if (danceStart == null) 1.0e4 else StrictMath.min(1.0e4, t - danceStart)
+            // past its confetti, a dance leaves nothing in the frame: the same age as no dance at all
+            val danceAge = if (danceStart == null || t - danceStart >= CONFETTI_SECS) 1.0e4 else t - danceStart
 
             // Lights: the newest MAX_LIGHTS that have appeared, fading in over 1.5 s.
             val lights = scene.lights.filter { it.t <= t }.sortedBy { it.t }.takeLast(MAX_LIGHTS)
@@ -131,6 +139,7 @@ class FrameState(
                 walkT = Time.wrap(walk, Crowd.PERIOD).toFloat(),
                 dance = weight(dances, t).toFloat(),
                 wave = weight(waves, t).toFloat(),
+                still = weight(all, t).toFloat(),
                 beat = Time.wrap(danceAge * 2.0, 64.0).toFloat(),
                 danceAge = danceAge.toFloat(),
                 night = if (night) 1f else 0f,
@@ -155,27 +164,26 @@ class FrameState(
 
         /**
          * Keeps the phone's own moves (`local`) to `max`: drops the oldest only as whole merged
-         * windows that ended before `now` and hold no scene move, and returns the walking time
-         * they froze, which the caller adds to [SceneInput.walkOffset] so the walking clock
-         * does not jump, and the end of the last window dropped ([SceneInput.walkOffsetFrom]:
-         * frames before it cannot be drawn exactly any more). A window still running or shared
-         * with a scene move is kept, so the list can stay longer than `max` until it ends.
+         * windows (with the scene's moves) that ended before `now`, so no frame from `now` on
+         * changes, and returns the end of the last window dropped ([SceneInput.historyFrom]:
+         * frames before it cannot be drawn exactly any more). A window still running is kept,
+         * so the list can stay longer than `max` until it ends.
          */
-        fun pruneMoves(local: List<Move>, scene: List<Move>, now: Double, max: Int): Triple<List<Move>, Double, Double> {
+        fun pruneMoves(local: List<Move>, scene: List<Move>, now: Double, max: Int): Pair<List<Move>, Double> {
             val sorted = local.sortedBy { it.t }
-            if (sorted.size <= max) return Triple(sorted, 0.0, Double.NEGATIVE_INFINITY)
+            if (sorted.size <= max) return sorted to Double.NEGATIVE_INFINITY
             val windows = merge((sorted + scene).map { it.t })
             var from = 0
-            var gained = 0.0
             var until = Double.NEGATIVE_INFINITY
             while (sorted.size - from > max) {
                 val w = windows.first { sorted[from].t >= it.first && sorted[from].t < it.second }
-                if (w.second > now || scene.any { it.t >= w.first && it.t < w.second }) break
-                gained += frozen(listOf(w), w.second)
-                until = w.second
+                // a window is over when its moves are, and its confetti has fallen
+                val over = StrictMath.max(w.second, w.first + CONFETTI_SECS)
+                if (over > now) break
+                until = StrictMath.max(until, over)
                 while (from < sorted.size && sorted[from].t < w.second) from++
             }
-            return Triple(sorted.subList(from, sorted.size), gained, until)
+            return sorted.subList(from, sorted.size) to until
         }
 
         /** Disjoint [start, end) windows covering moves that start at `starts`. */

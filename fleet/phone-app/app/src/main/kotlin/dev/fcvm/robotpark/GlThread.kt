@@ -83,7 +83,7 @@ class GlThread(private val context: Context) : Thread("robotpark-gl") {
         val r = renderer ?: return@run mapOf("error" to "no GL context")
         val scene = Store.effectiveScene().copy(rect = c.rect, imageAspect = c.imageAspect, previousRect = null, rectFromFrame = null)
         val tile = Tile.of(c.rect, c.imageAspect, c.w, c.h)
-        if (c.t < scene.walkOffsetFrom) return@run mapOf("error" to "t: before t=${scene.walkOffsetFrom}, where this phone's own older moves were pruned")
+        if (c.t < scene.historyFrom) return@run mapOf("error" to "t: before t=${scene.historyFrom}, where this phone's own older moves were pruned")
         val fs = FrameState.compute(scene, c.t, c.w.toDouble() / c.h, Store.systemNight)
         val pixels = r.drawOffscreen(fs, tile, Store.robots)
         val dir = context.getExternalFilesDir(null) ?: context.filesDir

@@ -104,25 +104,55 @@ class SceneTest {
         assertEquals(1.0, FrameState.weight(w, 16.0), 0.0)
     }
 
-    /** Pruning the phone's own old moves keeps the walking clock where it was (no jump). */
-    @Test fun pruningOldMovesKeepsTheWalkingClock() {
+    /**
+     * Pruning the phone's own old moves leaves every frame from the end of the pruned windows
+     * on bit-identical, and refuses frames before it.
+     */
+    @Test fun pruningLocalMovesKeepsLaterFramesAndRefusesEarlierOnes() {
+        val bare = scene.copy(moves = emptyList())
         val moves = (0 until 100).map { Move(10.0 + 20.0 * it, if (it % 2 == 0) MoveKind.DANCE else MoveKind.WAVE) }
-        val now = 2010.0
-        val full = scene.copy(moves = moves)
-        val (kept, offset) = FrameState.pruneMoves(moves, emptyList(), now, 64)
-        assertEquals(64, kept.size)
-        val pruned = scene.copy(moves = kept, walkOffset = offset)
-        for (dt in listOf(0.0, 3.0, 9.5, 30.0)) {
-            assertEquals("walking clock at t=${now + dt}", frame(full, now + dt).walkT, frame(pruned, now + dt).walkT, 1e-3f)
+        var pruned = LocalMoves(bare.epochUnixMs)
+        var kept = LocalMoves(bare.epochUnixMs)
+        for (m in moves) { pruned = pruned.add(m, bare, 2010.0); kept = kept.add(m, bare, 2010.0, max = 1000) }
+        assertEquals(64, pruned.moves.size)
+        for (t in listOf(pruned.from, 2010.0, 2013.0, 2040.5)) {
+            assertArrayEquals("t=$t", frame(kept.applyTo(bare, null), t).bits(), frame(pruned.applyTo(bare, null), t).bits())
         }
-        // a frame from before the pruned windows ended cannot be drawn exactly, so it is refused
-        val (_, _, until) = FrameState.pruneMoves(moves, emptyList(), now, 64)
-        val dated = pruned.copy(walkOffsetFrom = until)
-        assertEquals(frame(full, now).walkT, frame(dated, now).walkT, 1e-3f)
-        try { frame(dated, 5.0); fail("drew t=5 after the moves before it were pruned") } catch (e: IllegalArgumentException) { /* refused */ }
-        // a window still running, or shared with a scene move, is not pruned
+        try { frame(pruned.applyTo(bare, null), 5.0); fail("drew t=5 after the moves before it were pruned") } catch (e: IllegalArgumentException) { /* refused */ }
+        // a window still running is kept
         assertEquals(66, FrameState.pruneMoves(moves.take(66), emptyList(), 15.0, 64).first.size)
-        assertEquals(66, FrameState.pruneMoves(moves.take(66), listOf(Move(12.0, MoveKind.DANCE)), now, 64).first.size)
+    }
+
+    /** The phone's own moves set the pose and never the walk; the scene's moves stop it. */
+    @Test fun onlyTheScenesMovesStopTheCrowd() {
+        val bare = scene.copy(moves = emptyList())
+        val danced = LocalMoves(bare.epochUnixMs).add(Move(100.0, MoveKind.DANCE), bare, 100.0).applyTo(bare, null)
+        assertEquals(frame(bare, 104.0).walkT, frame(danced, 104.0).walkT)
+        assertEquals(1f, frame(danced, 104.0).dance)
+        assertEquals(0f, frame(danced, 104.0).still)
+        val stopped = bare.copy(moves = listOf(Move(100.0, MoveKind.DANCE)))
+        assertEquals(1f, frame(stopped, 104.0).still)
+        assertTrue(frame(stopped, 104.0).walkT < frame(bare, 104.0).walkT)
+    }
+
+    /**
+     * Pruning the phone's own moves changes no frame after the pruned ones ended, whatever scene
+     * arrives later: here a scene that adds a move over a pruned window (the case that counted
+     * that window's walking time twice when local moves froze the walk).
+     */
+    @Test fun prunedLocalMovesChangeNoLaterFrame() {
+        val bare = scene.copy(moves = emptyList())
+        val moves = (0 until 65).map { Move(10.0 + 20.0 * it, MoveKind.DANCE) }
+        var local = LocalMoves(bare.epochUnixMs)
+        var kept = LocalMoves(bare.epochUnixMs)
+        for (m in moves) { local = local.add(m, bare, 2000.0); kept = kept.add(m, bare, 2000.0, max = 1000) }
+        assertEquals("one was pruned", 64, local.moves.size)
+        val later = bare.copy(moves = listOf(Move(10.0, MoveKind.WAVE)))
+        val full = kept.applyTo(later, later.night)
+        val pruned = local.applyTo(later, later.night)
+        for (t in listOf(1300.0, 1999.0, 2000.0, 2030.5)) {
+            assertEquals("walking clock at t=$t", frame(full, t).walkT, frame(pruned, t).walkT)
+        }
     }
 
     /** A scene with a new epoch restarts t, so the phone's own moves (in the old clock) are cleared. */
@@ -133,9 +163,10 @@ class SceneTest {
         assertTrue("some were pruned", local.from > 1.7e9)
         val s = local.applyTo(scene, scene.night)
         assertEquals(scene.moves, s.moves)
+        assertEquals(emptyList<Move>(), s.localMoves)
         assertEquals(12.0, frame(s, 12.0).t, 0.0) // draws: the old clock's boundary does not apply
         // the same epoch keeps them
-        assertEquals(64, local.applyTo(before, null).moves.size)
+        assertEquals(64, local.applyTo(before, null).localMoves.size)
     }
 
     /** An action timed before the pruned history is refused: its window may already be counted. */
@@ -144,10 +175,9 @@ class SceneTest {
         var local = LocalMoves(bare.epochUnixMs)
         for (i in 0 until 65) local = local.add(Move(10.0 + 20.0 * i, MoveKind.DANCE), bare, 2000.0)
         assertTrue("the first move was pruned", local.from > 10.0)
-        val offset = local.walkOffset
         try {
             local = local.add(Move(10.0, MoveKind.DANCE), bare, 2000.0)
-            fail("took a move at t=10 behind the pruned history (offset ${local.walkOffset}, was $offset)")
+            fail("took a move at t=10 behind the pruned history (now ${local.moves.size} moves)")
         } catch (e: IllegalArgumentException) { /* refused */ }
     }
 

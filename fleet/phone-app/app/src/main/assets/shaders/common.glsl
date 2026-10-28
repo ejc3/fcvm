@@ -12,9 +12,10 @@ uniform vec3 u_eye;
 uniform vec3 u_camRight;
 uniform vec3 u_camUp;
 uniform float u_tw;        // scene time mod PERIOD
-uniform float u_walkT;     // walking time mod PERIOD; stands still while the crowd dances or waves
+uniform float u_walkT;     // walking time mod PERIOD; stands still under the scene's moves
 uniform float u_dance;     // 0..1
 uniform float u_wave;      // 0..1
+uniform float u_still;     // 0..1: the scene's moves stop the crowd (the phone's own moves do not)
 uniform float u_beat;      // beats since the dance started
 uniform float u_danceAge;  // seconds since the dance started
 uniform float u_night;     // 0 day, 1 night
