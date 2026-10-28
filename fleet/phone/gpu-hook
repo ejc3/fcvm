@@ -14,11 +14,13 @@
 # No emulator running is not an error: there is nothing to let go of. Each call's output is
 # also appended to /tmp/gpu-hook.log.
 set -euo pipefail
-exec > >(tee -a /tmp/gpu-hook.log) 2>&1
-ADB=/sdk/platform-tools/adb
+# The test (scripts/phone/test-gpu-hook.sh) points these at stubs.
+ADB=${GPU_HOOK_ADB:-/sdk/platform-tools/adb}
+STATE=${GPU_HOOK_STATE:-/tmp}
+exec > >(tee -a "$STATE/gpu-hook.log") 2>&1
 ms() { date +%s%3N; }
 console() { timeout 30 "$ADB" emu "$@" | tr -d '\r'; }
-running() { [ -f /tmp/emulator.pid ] && kill -0 "$(cat /tmp/emulator.pid)" 2> /dev/null; }
+running() { [ -f "$STATE/emulator.pid" ] && kill -0 "$(cat "$STATE/emulator.pid")" 2> /dev/null; }
 
 case "${1:-}" in
 release)
@@ -29,7 +31,14 @@ release)
   ;;
 retake)
   running || { echo "no emulator running"; exit 0; }
-  [ "$(console gpu status | head -1)" = released ] || { echo "the emulator holds the GPU"; exit 0; }
+  # Only an answer of "held" means there is nothing to take up again; a console that
+  # does not answer is an error, or a released phone would stay paused.
+  status=$(console gpu status) || { echo "the emulator's console did not answer 'gpu status'"; exit 1; }
+  case "$(head -1 <<< "$status")" in
+  released) ;;
+  held) echo "the emulator holds the GPU"; exit 0 ;;
+  *) echo "unexpected 'gpu status' answer: $status"; exit 1 ;;
+  esac
   t0=$(ms)
   out=$(console gpu retake)
   echo "$out"

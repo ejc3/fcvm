@@ -921,6 +921,7 @@ phone-test: private SHELL := $(TARGET_LEASE_SHELL)
 phone-test: $(if $(strip $(GPU)),setup-phone phone-emulator)
 	@test -n "$(GPU)" || { echo "usage: make phone-test GPU=<pci address> ACCEPT_ANDROID_SDK_LICENSE=1" >&2; exit 2; }
 	./scripts/phone/test-sdk-lock.sh
+	./scripts/phone/test-gpu-hook.sh
 	ACCEPT_ANDROID_SDK_LICENSE="$(ACCEPT_ANDROID_SDK_LICENSE)" ./scripts/phone/sdk.sh
 	FCVM=./target/release/fcvm ./scripts/phone/run.sh "$(GPU)"
 
