@@ -1934,5 +1934,5 @@ crossing the middle under two lights; the crowd dancing under confetti) captures
 image (1440 x 1280) and its two halves (720 x 1280 each). `scripts/phone/seam.py` compares
 every pixel of each half with the whole image at the same whole-image position, and a
 redraw of one half with the first. It allows up to 9 pixels a tile 1 level apart (a residual
-seen in 3 of 9 runs, the same pixel in a light's glow) and fails on anything more; the result
+seen in 3 of 10 runs, the same pixel in a light's glow) and fails on anything more; the result
 names the exact count.
