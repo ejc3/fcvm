@@ -123,6 +123,18 @@ class SceneTest {
         assertEquals(66, FrameState.pruneMoves(moves.take(66), emptyList(), 15.0, 64).first.size)
     }
 
+    /** A dance late in a window merged with other moves keeps its confetti through pruning. */
+    @Test fun pruningWaitsForTheConfettiOfADanceLateInAWindow() {
+        val withWave = scene.copy(moves = listOf(Move(0.0, MoveKind.WAVE)))
+        val local = listOf(Move(7.0, MoveKind.DANCE)) + (0 until 64).map { Move(100.0 + 20.0 * it, MoveKind.WAVE) }
+        var pruned = LocalMoves(withWave.epochUnixMs)
+        var kept = LocalMoves(withWave.epochUnixMs)
+        for (m in local) { pruned = pruned.add(m, withWave, 16.0); kept = kept.add(m, withWave, 16.0, max = 1000) }
+        for (t in listOf(16.0, 17.0)) {
+            assertArrayEquals("t=$t", frame(kept.applyTo(withWave, null), t).bits(), frame(pruned.applyTo(withWave, null), t).bits())
+        }
+    }
+
     /** The phone's own moves set the pose and never the walk; the scene's moves stop it. */
     @Test fun onlyTheScenesMovesStopTheCrowd() {
         val bare = scene.copy(moves = emptyList())

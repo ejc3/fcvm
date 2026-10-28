@@ -173,12 +173,16 @@ class FrameState(
             val sorted = local.sortedBy { it.t }
             if (sorted.size <= max) return sorted to Double.NEGATIVE_INFINITY
             val windows = merge((sorted + scene).map { it.t })
+            // a dance's confetti lasts CONFETTI_SECS from the start of its dance window, which can
+            // start later than the window of all moves it is merged into
+            val dances = merge((sorted + scene).filter { it.kind == MoveKind.DANCE }.map { it.t })
             var from = 0
             var until = Double.NEGATIVE_INFINITY
             while (sorted.size - from > max) {
                 val w = windows.first { sorted[from].t >= it.first && sorted[from].t < it.second }
-                // a window is over when its moves are, and its confetti has fallen
-                val over = StrictMath.max(w.second, w.first + CONFETTI_SECS)
+                // a window is over when its moves are, and the confetti of its dances has fallen
+                var over = w.second
+                for (d in dances) if (d.first >= w.first && d.first < w.second) over = StrictMath.max(over, d.first + CONFETTI_SECS)
                 if (over > now) break
                 until = StrictMath.max(until, over)
                 while (from < sorted.size && sorted[from].t < w.second) from++
