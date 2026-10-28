@@ -703,9 +703,54 @@ B is the design. Its largest part is the memory pin, so the phone VM's size and 
 are measured in the same PR as the hooks.
 
 The emulator is built from source for this, forked like Firecracker: `ejc3/` forks of the
-emulator (`external/qemu`, its `emu-37-2-release` branch) and of gfxstream. The SDK's
-license forbids modifying its emulator (below), and a source build also leaves out the
-SwiftShader libraries the spike masks.
+emulator (`external/qemu`) and of gfxstream. The SDK's 37.2 emulator was built from an
+`emu-37-2-release` branch that AOSP does not publish; the public branches are `emu-main-dev`
+(a manifest of 76 projects) and `emu-36-1-release`, so the fork starts from `emu-main-dev`.
+The SDK's license forbids modifying its emulator (below), and a source build also leaves
+out the SwiftShader libraries the spike masks.
+
+#### Detaching the renderer, measured (2026-10-28)
+
+Measured in the phone container on a g4dn.metal (T4, driver 580.196.07) with
+`fleet/phone/gpurelease.c`, which takes up the GPU through EGL and through Vulkan, tears
+each down, and counts the process's `/dev/nvidia*` descriptors and mappings:
+
+| step | descriptors | mappings |
+|---|---|---|
+| EGL context current, drawn on the T4 | 11 | 21 |
+| after `eglTerminate` and `eglReleaseThread` | 10 | 6 |
+| after `dlclose` of libEGL | 0 | 0 |
+| Vulkan device created on the T4 | 20 | 58 |
+| after `vkDestroyDevice` and `vkDestroyInstance` | 0 | 0 |
+
+A second round in the same process takes the GPU up again through both. So a process can
+let go of the GPU without exiting, as detach needs: Vulkan on destroy, EGL only once its
+libraries are unloaded.
+
+The emulator's other GPU mode was ruled out for detach. With `-feature GuestUsesAngle` the
+guest's GLES runs as ANGLE on Vulkan (`ANGLE (NVIDIA, Vulkan 1.3.0 (NVIDIA Tesla T4))`,
+60 fps), so the guest's GPU objects are Vulkan objects on the host, saved with the
+`VulkanSnapshots` feature. Of two quickboot loads in that mode the first resumed the app
+on the T4 and the second killed the emulator (`pRenderPassBegin->framebuffer ... not found
+in mFbInfo`, a framebuffer the snapshot did not restore). The default GLES translator path
+loaded eight of eight times (three loads in the source VM, five in clones on other T4s). The
+phone stays on the translator path.
+
+The change in gfxstream, from its own entry points (`host/RendererImpl.cpp`,
+`host/FrameBuffer.cpp`, `host/gl/glestranslator/EGL/EglGlobalInfo.cpp`):
+
+- **detach:** pause the guest; `RendererImpl::pauseAllPreSave`; `RendererImpl::save` into
+  memory; `RendererImpl::stop` and `FrameBuffer::finalize`; then what nothing tears down
+  today: the `EglGlobalInfo` singleton (a static never freed) and its display, with
+  `eglTerminate`, the EGL and GLES libraries closed (the library cache gains a close, since
+  only unloading them releases the GPU), and the Vulkan emulation's device and instance.
+  The detach fails, and the renderer is brought back, unless the process then holds no
+  `/dev/nvidia*` descriptor or mapping.
+- **attach:** load the libraries, `RendererImpl::initialize` on the GPU now present,
+  `RendererImpl::load` from memory, `RendererImpl::resumeAll`, resume the guest.
+
+Both are emulator console commands (`gpu detach`, `gpu attach`), which fc-agent's park and
+unpark call through the hook (stack PR 3).
 
 ### The app: an Android-themed scene
 
@@ -802,12 +847,13 @@ adb and the emulator console listen only inside the container.
 
 ### Stack of PRs
 
-1. The phone profile (this PR): the Firecracker fork's nested state, the guest kernel with
-   KVM, the phone container (emulator with `-gpu host` and EGL-on-EGL), the probe app, and
-   `make phone-test`.
-2. The emulator from source: forks of the emulator and gfxstream, built with the AOSP system
-   image into the phone image; `gpu detach` and `gpu attach` on a running phone, tested by
-   detaching, attaching and checking the app's renderer and frames.
+1. Merged (#1400): the phone profile: the Firecracker fork's nested state, the guest kernel
+   with KVM, the phone container (emulator with `-gpu host` and EGL-on-EGL), the probe app,
+   and `make phone-test`. Then this design's "Detaching the renderer, measured".
+2. The emulator from source: forks of the emulator and gfxstream from `emu-main-dev`, built
+   with the AOSP system image into the phone image; `gpu detach` and `gpu attach` on a
+   running phone, tested by detaching (no `/dev/nvidia*` descriptor or mapping left in the
+   emulator), attaching, and checking the app's renderer and frames.
 3. Snapshots of a running phone: fc-agent's park and unpark hooks for GPU holders that are
    not CUDA processes, `--gpu-warm` of a running phone, and a test that a clone's app renders
    on the clone's GPU; restore-to-first-app-frame measured, with the VM's size and hugepages.
