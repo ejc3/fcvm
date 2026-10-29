@@ -326,7 +326,7 @@ export function phonesPlan(inp: PhonesPlanInput): DrawPlan {
     if (box === null || base === null || !isLive(t)) continue;
     const height = streamHeightFor(box.h * dpr, box.w / box.h);
     bps += streamBitrate(t.rect, phones.image_aspect, height);
-    direct.push({ id: `d:${t.id}`, url: frameSocketUrl(base, height, "std", admit), baseUrl: base, height, box });
+    direct.push({ id: `d:${t.id}`, url: frameSocketUrl(base, height, "std"), baseUrl: base, height, box, admit });
   }
   const tiles: DrawTile[] = phones.tiles.map((t) => ({
     id: t.id,

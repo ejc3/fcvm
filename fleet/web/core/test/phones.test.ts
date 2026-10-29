@@ -272,7 +272,11 @@ describe("the draw plan", () => {
     } as ClientState;
     const plan = phonesView(input(admitted)).plan;
     expect(plan.direct).toHaveLength(2);
-    for (const d of plan.direct) expect(new URL(d.url!).searchParams.get("admit")).toBe("v1.9999999999.v-1.mac");
+    for (const d of plan.direct) {
+      expect(d.admit).toBe("v1.9999999999.v-1.mac");
+      // the token is the socket's first message, never in the URL
+      expect(new URL(d.url!).searchParams.get("admit")).toBeNull();
+    }
   });
 
   it("waits for the address family, as the wall does", () => {
