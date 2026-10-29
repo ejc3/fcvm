@@ -55,6 +55,9 @@ function fakeGl(): WebGL2RenderingContext {
 
 let posted: MirrorOut[] = [];
 let current: ((m: MirrorIn) => void) | null = null;
+/** Each worker's stats timer, cleared after its test so no worker outlives it. */
+const realSetInterval = globalThis.setInterval;
+const timers: ReturnType<typeof setInterval>[] = [];
 let scope: { postMessage: (m: MirrorOut) => void; onmessage: ((e: { data: MirrorIn }) => void) | null };
 
 /** A fresh worker module in a fresh scope; `gl` false is a browser without WebGL2. */
@@ -64,6 +67,11 @@ async function worker(gl = true): Promise<(m: MirrorIn) => void> {
   scope = { postMessage: (m) => posted.push(m), onmessage: null };
   vi.stubGlobal("self", scope);
   vi.stubGlobal("WebSocket", FakeSocket);
+  vi.stubGlobal("setInterval", (f: () => void, ms: number) => {
+    const t = realSetInterval(f, ms);
+    timers.push(t);
+    return t;
+  });
   await import("../../app/_wall/mirror/mirror.worker.ts");
   const send = (m: MirrorIn) => scope.onmessage!({ data: m });
   send({ type: "canvas", canvas: { getContext: () => (gl ? fakeGl() : null) } as unknown as OffscreenCanvas });
@@ -105,6 +113,7 @@ describe("the mirror worker", () => {
     // a worker left with a connection would keep decoding into the next test's scope
     current?.({ type: "close" });
     current = null;
+    for (const t of timers.splice(0)) clearInterval(t);
     vi.unstubAllGlobals();
   });
 
@@ -185,6 +194,15 @@ describe("the mirror worker", () => {
     expect(closes()).toEqual([{ type: "closed", code: 4000, reason: "the phone's copy of its commands overflowed: join again" }]);
     expect(ws.closed).toBe(true);
     z.close();
+  });
+
+  it("leaves no earlier test's worker posting after its test", async () => {
+    // a fresh scope with no worker in it: the earlier workers' 500 ms stats timers must be gone
+    posted = [];
+    scope = { postMessage: (m) => posted.push(m), onmessage: null };
+    vi.stubGlobal("self", scope);
+    await new Promise((r) => setTimeout(r, 600));
+    expect(posted).toEqual([]);
   });
 
   it("reads raw deflate from a streamer built before zstd", async () => {
