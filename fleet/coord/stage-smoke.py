@@ -126,18 +126,42 @@ def frame_host(url):
     return parsed.hostname
 
 
-def prove_frame(tile):
-    """A DNS record alone is insufficient: require a binary renderer packet over IPv4/TLS."""
+def prove_frame(tile, admit=None):
+    """A DNS record alone is insufficient: require a binary renderer packet over IPv4/TLS.
+    With admission on, the direct token goes as the first message (never in the URL)."""
     url = tile["frame_url_v4"]
     frame_host(url)
     connection = Socket(url + "?h=180")  # No Access credentials are ever sent to a renderer.
     try:
+        if admit is not None:
+            connection.send({"admit": admit})
         deadline = time.monotonic() + 40
         while time.monotonic() < deadline:
             opcode, payload = connection.message(deadline)
             if opcode == 2 and payload:
                 return
         raise TimeoutError("renderer sent no binary frames")
+    finally:
+        connection.close()
+
+
+def prove_refused(tile):
+    """With admission on, a socket that sends no direct token gets no frame: the renderer
+    closes it (1008) once its 5 s wait for the token ends."""
+    url = tile["frame_url_v4"]
+    frame_host(url)
+    connection = Socket(url + "?h=180")
+    try:
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                opcode, payload = connection.message(deadline)
+            except RuntimeError:  # closed
+                return
+            except TimeoutError:
+                raise AssertionError("a socket without a direct token was left open")
+            if opcode == 2:
+                raise AssertionError("a renderer streamed to a socket without a direct token")
     finally:
         connection.close()
 
@@ -299,25 +323,40 @@ def main():
         raise AssertionError("the CI token reached the agents-only endpoint")
     connection = Socket(api.replace("https://", "wss://", 1) + "/live", headers)
     try:
+        # The first message on /live: a page's seat ticket (none here).
+        connection.send({"type": "seat", "ticket": None})
         deadline = time.monotonic() + 720
         interval, next_relaunch = relaunch_interval_seconds(), 0.0
-        state = {}
+        state, admission = {}, {}
+        def take(message):
+            nonlocal state, admission
+            if message.get("type") == "snapshot":
+                state = message["state"]
+            elif message.get("type") == "admission":
+                admission = message
         def until(predicate):
-            nonlocal state
             while time.monotonic() < deadline:
                 if predicate(state):
                     return state
                 opcode, payload = connection.message(deadline)
                 if opcode != 1:
                     continue
-                message = json.loads(payload)
-                if message.get("type") == "snapshot":
-                    state = message["state"]
+                take(json.loads(payload))
             raise TimeoutError("staging did not reach the required state")
+        def direct():
+            """The direct token, when the coordinator gates direct streams (else None)."""
+            if admission.get("capacity") is None:
+                return None
+            token = (admission.get("direct") or {}).get("value")
+            if not token:
+                raise AssertionError("the smoke connection was given no direct token")
+            return token
         for half in ("fcvm", "ec2"):
             until(lambda s: ready(s, half))
             old = dict(ready(state, half))
-            prove_frame(old)
+            if direct() is not None:
+                prove_refused(old)
+            prove_frame(old, direct())
             delay = next_relaunch - time.monotonic()
             if delay > 0:
                 time.sleep(delay)
@@ -329,8 +368,7 @@ def main():
                 if opcode != 1:
                     continue
                 message = json.loads(payload)
-                if message.get("type") == "snapshot":
-                    state = message["state"]
+                take(message)
                 if message.get("type") == "receipt" and message.get("id") == intent:
                     if message.get("outcome") != "committed":
                         raise AssertionError("staging refused the relaunch")
@@ -343,9 +381,10 @@ def main():
             fresh(old, new)
             # Before anything else looks the names up: each resolver's first query.
             slowest = prove_resolves(new)
-            prove_frame(new)
+            prove_frame(new, direct())
             print(json.dumps({"half": half, "freshLaunchNames": True, "freshNamesResolved": True,
-                              "resolveMsMax": round(slowest * 1000), "ipv4RendererFrames": True}), flush=True)
+                              "resolveMsMax": round(slowest * 1000), "ipv4RendererFrames": True,
+                              "directAdmission": direct() is not None}), flush=True)
     finally:
         connection.close()
 

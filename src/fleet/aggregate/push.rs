@@ -367,6 +367,15 @@ pub fn ffmpeg_args(url: &str) -> Vec<String> {
 /// ingest stalled, ffmpeg stopped reading, and nothing else would notice.
 pub const WRITE_STALL: Duration = Duration::from_secs(5);
 
+/// Aborts its task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Push the aggregator's output to `url` until `cancel`.
 pub async fn run(shared: Arc<Shared>, ffmpeg: String, url: String, cancel: CancellationToken) {
     let mut backoff = Duration::from_secs(1);
@@ -387,12 +396,37 @@ pub async fn run(shared: Arc<Shared>, ffmpeg: String, url: String, cancel: Cance
     }
 }
 
+/// `line` with the ingest URL and its stream key (the URL's last path segment) taken out:
+/// ffmpeg names its output in errors, and the key is what lets anyone publish to the channel.
+pub fn redact_ingest(line: &str, url: &str) -> String {
+    let mut out = line.replace(url, "<ingest url>");
+    if let Some(key) = url.rsplit('/').next().filter(|k| k.len() >= 8) {
+        out = out.replace(key, "<stream key>");
+    }
+    out
+}
+
+/// Each line ffmpeg writes to stderr, redacted, to `log`, until the stream ends.
+pub async fn relay_stderr<R: tokio::io::AsyncRead + Unpin>(
+    stderr: R,
+    url: &str,
+    mut log: impl FnMut(String),
+) {
+    use tokio::io::AsyncBufReadExt;
+    let mut lines = tokio::io::BufReader::new(stderr).lines();
+    while let Ok(Some(l)) = lines.next_line().await {
+        log(redact_ingest(&l, url));
+    }
+}
+
 async fn once(shared: &Shared, ffmpeg: &str, url: &str, cancel: &CancellationToken) -> Result<()> {
     let mut cmd = tokio::process::Command::new(ffmpeg);
+    // stderr is relayed through `redact_ingest`: ffmpeg's errors name the ingest URL, stream
+    // key included, and an inherited stderr would put it in the coordinator's log.
     cmd.args(ffmpeg_args(url))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     // kill_on_drop cannot run when the aggregator itself is killed (the supervisor's stop is
     // a SIGKILL), and an ffmpeg blocked on a stalled ingest does not exit when its stdin
@@ -400,6 +434,16 @@ async fn once(shared: &Shared, ffmpeg: &str, url: &str, cancel: &CancellationTok
     super::child::arm_pdeathsig(cmd.as_std_mut());
     let mut child = cmd.spawn().with_context(|| format!("starting {ffmpeg}"))?;
     let mut stdin = child.stdin.take().context("ffmpeg stdin")?;
+    let stderr = child.stderr.take().context("ffmpeg stderr")?;
+    let relay_url = url.to_string();
+    let _relay = AbortOnDrop(tokio::spawn(async move {
+        relay_stderr(
+            stderr,
+            &relay_url,
+            |l| tracing::warn!(ffmpeg = %l, "broadcast push"),
+        )
+        .await
+    }));
     let mut rx = shared.out.subscribe();
     let mut line = Timeline::default();
     let mut pushed = 0u64;
@@ -454,6 +498,39 @@ async fn once(shared: &Shared, ffmpeg: &str, url: &str, cancel: &CancellationTok
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ffmpeg's errors name its output; the log gets neither the URL nor the stream key.
+    #[tokio::test]
+    async fn ffmpeg_stderr_reaches_the_log_without_the_ingest_url() {
+        let url = "rtmps://ingest.example:443/app/sk_us-east-1_SECRETKEY123";
+        let stderr: &[u8] = b"[flv @ 0x1] Failed to connect\nrtmps://ingest.example:443/app/sk_us-east-1_SECRETKEY123: I/O error\nopening app/sk_us-east-1_SECRETKEY123 failed\n";
+        let mut got = Vec::new();
+        relay_stderr(stderr, url, |l| got.push(l)).await;
+        assert_eq!(got.len(), 3);
+        assert!(
+            got.iter()
+                .all(|l| !l.contains("SECRETKEY123") && !l.contains("ingest.example")),
+            "{got:?}"
+        );
+        assert_eq!(got[1], "<ingest url>: I/O error");
+        // And the push pipes ffmpeg's stderr through it rather than inheriting it: the body
+        // of `once` alone, whitespace removed, so this test's own text cannot match.
+        let src = include_str!("push.rs");
+        let start = src.find("async fn once(").unwrap();
+        let body: String = src[start..start + src[start..].find("\n}\n").unwrap()]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            body.contains(".stderr(Stdio::piped())"),
+            "stderr is not piped"
+        );
+        assert!(!body.contains("Stdio::inherit()"), "stderr is inherited");
+        assert!(
+            body.contains("relay_stderr(stderr,&relay_url,"),
+            "ffmpeg's stderr is not relayed"
+        );
+    }
 
     #[test]
     fn rbsp_escaping_round_trips_and_breaks_start_codes() {
