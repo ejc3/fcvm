@@ -1000,6 +1000,213 @@ runs phones on the last N GPUs of its inventory and names them in its hello. The
 coordinator lays them out in their own image (a row of up to six, then rows of equal length)
 and the page shows it with `?mode=phones`.
 
+### The GPU mirror
+
+Status: **built**, joining at the app's start; the join snapshot is the next PR (point 3). The owner, 2026-10-29: "when
+you take over a phone, you can have this mirror gpu mode and streaming video mode and both
+shown with bandwidth of each", and "can we have the server gpu mode that can serve as that
+mirror to prevent blocking calls?"
+
+The viewer holding a phone picks one of three views in the take-over panel:
+
+| view | what reaches the viewer | what the panel shows beside it |
+|---|---|---|
+| Video | today's NVENC H.264 frames (`GET /frames`) | Mbit/s over the last second, MB since take-over, fps |
+| GPU mirror | the guest's GL command stream (`GET /mirror`), drawn by the viewer's WebGL2 | the same three, and the blocking calls per second the phone's T4 answered |
+| Both | both streams, side by side | each stream's own readout |
+
+**The T4 stays the phone's GPU.** It renders, answers every call that waits for a reply
+(`glGen*`, `glGet*`, `glReadPixels`, `glFinish`, fences, `rcCompose`, `rcMakeCurrent` and the
+rest of renderControl's) and composes the screen, exactly as with no mirror. The browser only
+replays: it decodes the same stream and never replies, so no guest call ever waits on the
+network. The blocking-call counter is what the server GPU saves the phone: each would be a
+round trip to the viewer if the viewer's GPU were the phone's GPU.
+
+In GPU-mirror-only mode the page closes that phone's video stream, so the readout is the
+mirror's whole cost; the T4 keeps rendering (it answers the calls, and every other viewer
+of the wall still gets the phone's video).
+
+```
+guest app / SurfaceFlinger / HWC (GLES 3.0, renderControl)
+  -> goldfish pipe -> gfxstream render thread: ReadBuffer::getData  --tap-->  bounded ring (32 MiB)
+                      decoders -> translator -> T4 (answers, draws, composes)       |
+                      ChannelStream::commitBuffer (reply) --tap (first 256 B)--> ring
+                                                                                     | sender thread
+  phone streamer  <- Unix socket /tmp/gfxstream-mirror.sock (one consumer) ----------+
+    GET /mirror: admitted for the holder's token only; raw deflate (Z_SYNC_FLUSH per message)
+    bounded queue (8 MiB): a viewer behind it is dropped and joins again
+  -> wss -> page: DecompressionStream("deflate-raw") -> tap records -> per-channel packets
+            -> decoder (emugen table) -> one WebGL2 context, a virtual context per guest context
+            -> the posted color buffer drawn to the mirror's canvas
+```
+
+**1. What is copied.** Every render channel's guest-to-host bytes in the order they arrived,
+and the start of every reply, tagged with the channel. That is the GLES 2/3 stream, the
+renderControl stream (contexts, window surfaces, color buffers and their CPU uploads, posts,
+and HWC's `rcCompose`, which is how this image composes the screen) and, unused, any GLES 1
+or Vulkan packets. The copy is taken where the render thread reads (`ReadBuffer::getData`), not
+where it decodes, so the order across channels is causal: a channel that waited on another's
+fence did so through a reply, and the reply is copied after the bytes that preceded it on the
+other channel. Replies are needed because the server, not the guest, makes object names
+(`glGenTextures`, `glCreateProgram`, `rcCreateColorBuffer`, `rcCreateContext`, uniform
+locations): the mirror reads each name from the reply instead of making its own, so it never
+depends on two threads' names coming out in the same order. A reply past 256 bytes (a
+readback, a read map) is cut to its first 256 bytes; the mirror needs none of its data, and
+the counter still counts it. DMA uploads (`rcUpdateColorBufferDMA`) would carry a guest address, not
+the bytes; the tap does not follow it. The captures below hold none (this image creates its
+color buffers with `rcCreateColorBufferDMA`, which carries no pixels, and uploads none by
+DMA), and the mirror counts any it meets.
+
+**Vulkan.** WebGL2 cannot replay Vulkan, so the whole screen must be GL. It already is: HWUI
+runs on Skia GL in this image (`dumpsys gfxinfo` reports `Pipeline=Skia (OpenGL)`; "Releasing
+and retaking the GPU", above), and `gpu release` refuses while a guest holds a Vulkan instance,
+which the phone never does. Phones mode needs no `debug.hwui.renderer` change, so forcing GL
+costs the phone nothing. The captures below hold no GLES 1 or Vulkan packet; the mirror counts
+any it meets as skipped.
+
+**2. The browser renderer: a TypeScript decoder from gfxstream's own specs.** Two options
+were weighed:
+
+| | gfxstream's host GLES decoder and translator in WebAssembly | a TypeScript decoder generated from the emugen specs |
+|---|---|---|
+| code to port or write | 41,600 lines of translator, 79,400 in `host/gl`, 13,500 of `common/base`, plus `frame_buffer.cpp` (5,300) and its threads, EGL and dlopen of the host libraries | a 150-line generator and a table of 513 calls (439 GLES 2/3, 74 renderControl); an executor for the calls this image sends |
+| contexts | WebGL2 has no share groups: a translator that dispatches to one WebGL2 context still needs a virtual-context layer under its dispatch | the same virtual-context layer, at the guest's API, where the state is the guest's own |
+| names | the translator makes names; replay needs its namespace patched to take the server's | names come from the replies |
+| fidelity risk | the same decode and composition code as the server | a reimplementation of the translator's GLES-on-GLES mapping, which for GLES 3.0 on WebGL2 is mostly 1:1 |
+| join snapshot | gfxstream's own `onLoad` | a loader of the same `onSave` stream (point 3) |
+| download | several MB of WebAssembly | tens of KB of script |
+
+Chosen: the TypeScript decoder. `fleet/web/scripts/gen-mirror-table.ts` reads
+`codegen/gles2` and `codegen/renderControl` (copied into `fleet/web/core/mirror/spec`) and
+writes the wire layout of every call. Against gfxstream's generated decoders
+(`host/gl/gles2_dec/gles2_dec.cpp`, `host/renderControl_dec/renderControl_dec.cpp`, parsed for
+each case's parameter widths and buffers), all 513 layouts match; the generator first got 18
+wrong (an attrib block given twice, and a DMA pointer's length that travels as the pointer's
+own count) and the comparison found each. The fidelity question is answered by the pixel test
+(point 6).
+
+**Caps.** WebGL2 is GLES 3.0. `GFXSTREAM_MAX_GLES_VERSION=3.0` (ejc3/gfxstream#4) caps what
+gfxstream offers the guest through the path its Intel workaround already uses; `phone.sh serve`
+sets it, SurfaceFlinger then reports `OpenGL ES 3.0 (OpenGL ES 3.2 NVIDIA 580.196.07)`, and the
+guest sends no 3.1 call or `#version 310 es` shader. The guest reads it at boot, so the warm
+snapshot carries it. Extensions beyond WebGL2's are the remaining divergence; the executor
+counts every call it does not draw. In the captures the only ones are queries it need not
+draw (`rcGetGLString`, `rcChooseConfig` and the like) and `glGetProgramBinary`: Skia saves
+program binaries, and a process that later loads one (`glProgramBinary`) sends the mirror no
+source to compile. Hiding binary formats from the guest is a follow-up; no capture so far
+loads one.
+
+The cap costs the T4 path nothing measurable. Two boots at each setting, alternating, on one
+g4dn.metal (1-minute load 1.3 to 3.0):
+
+| | GLES 3.1 (uncapped) | GLES 3.0 (capped) |
+|---|---|---|
+| Robot Park's GPU benchmark, ms a frame at 2,400 / 9,600 / 38,400 robots (median of 6) | 4.05 / 7.08 / 23.57 | 4.09 / 6.93 / 23.55 |
+| Robot Park's fps (10 s of samples each boot) | 58.1 to 60.2 | 56.8 to 60.8 |
+| Settings scrolled, HWUI GPU time p50 / p90 (`dumpsys gfxinfo`) | 12 / 17 to 18 ms | 12 to 13 / 17 to 18 ms |
+
+**3. Joining a phone that has been running for hours.** The mirror needs the state every
+later command builds on: every live context, texture, buffer, program, framebuffer, EGL image
+and color buffer. gfxstream already serializes exactly that for quickboot and for `gpu
+release`: `FrameBuffer::onSave` and the translator's `ShareGroup`/`GLEScontext` `onSave`,
+after `pauseAllPreSave` stops every render thread at a read boundary. The join reuses it: a
+console command (`gpu mirror-join`) pauses, saves into memory, starts the tap while the threads
+are still paused (so the snapshot and the copied stream meet exactly, with each thread's
+unconsumed bytes in the snapshot's `ReadBuffer`), and resumes. The page loads the snapshot
+into its WebGL2 state with a TypeScript loader of the same format, then replays the stream.
+The pause is the save alone, without the release's teardown, which is not measured yet
+(`gpu release` measures 425 to 590 ms with its teardown).
+
+Until the loader lands (its own PR in the stack), a mirror joins at the next start of the app:
+the panel's GPU-mirror view sends `restart_app` once the stream is open, the app's channels
+open after the copy started (the tap marks them), and the mirror draws every surface whose
+color buffer it saw made. The surfaces of processes older than the join (SystemUI, the
+launcher) are not drawn and are counted.
+
+**4. Backpressure, compression, GPU moves.**
+
+- The tap never blocks a render thread: a copy into the ring is a `memcpy` under a mutex held
+  for that copy; a full ring stops the copy with an `OVERFLOW` record, and the consumer starts
+  it again. The sender thread alone waits on the socket.
+- The streamer's queue toward the viewer is bounded (8 MiB). A viewer behind it is closed with
+  1013 ("join again"), and the page rejoins; rejoins are limited to one every 10 s, and a
+  mirror that cannot keep up falls back to video.
+- The wire is one raw deflate stream per connection, each message flushed to a byte boundary,
+  so the page's single `DecompressionStream("deflate-raw")` gives back every byte as it
+  arrives. The bandwidth shown is the WebSocket messages' bytes. Level 1 shrinks the
+  measured streams 3.4 to 5.2 times.
+- `gpu release` (a warm snapshot of the phone) ends every render thread (CLOSE records) and
+  the GPU hook stops the streamer, so the mirror ends; after `gpu retake` the page rejoins. A
+  VM restore (the phone returned, `reboot_phone`) ends the borrow or relaunches the phone, and
+  the page rejoins the relaunched one.
+
+**5. Transport and admission.** `GET /mirror` on the phone streamer, beside `/frames`, on the
+same listeners. The first message is `{"admit": "<direct token>"}`, as for `/frames`, and the
+URL carries none. It opens only when the coordinator's keys made the token and the token
+names the viewer holding the phone: the coordinator puts the holder in the phone's scene
+(`mirror_viewer`), the agent passes it to the streamer, and the streamer closes an open mirror
+when the holder changes. No keys, no holder or another viewer's token: closed with 1008. One
+mirror per phone at a time (the tap has one consumer).
+
+**6. Test plan.**
+
+| what | test |
+|---|---|
+| the tap: off copies nothing; data, replies, lifetimes; an older channel starts at a packet boundary; overflow | `host/mirror_tap_unittest.cpp` (the fork), ASan, UBSan and TSan |
+| the wire table is what emugen's specs give | `scripts/gen-mirror-table.ts --check`, run by the web tests |
+| record and packet framing, parameter decoding | `core/test/mirror.test.ts` |
+| the meter's rolling second and totals | `core/test/mirror.test.ts` |
+| admission: holder only, keys required, expiry, forgery; the holder kept from the app; deflate round trip | `fleet/phone/streamer/test_host.cpp` |
+| the holder reaches the streamer's scene | `tests/test_fleet_agent.rs` |
+| replay: a Robot Park stream captured on a gpubox, with the T4's stamped frames, replayed in headless Chrome on WebGL2; each mirror frame compared with the T4 frame of the same stamp | `e2e/mirror.spec.ts` (`playwright.mirror.config.ts`; threshold below) |
+| the panel: three views, video closed in mirror-only, the readouts, the mirror drawing with WebGL2 | `e2e/phones.spec.ts` against the mock coordinator, whose phones serve a synthetic `/mirror` (`mock/mirror.ts`) |
+
+The replay test captures both streams with `GET /mirror` and `GET /frames` exactly as the page
+receives them, while `adb screencap` takes the phone's own screenshots (lossless, the screen
+HWC composed). Each screenshot carries Robot Park's stamp, its frame number; the mirror frame
+of the same number is compared with it, the stamp band left out. Headless Chrome draws WebGL2
+with SwiftShader on the CPU, about a second a Robot Park frame here, so the harness rasterizes
+only the frames near each screenshot: Robot Park draws every frame whole, and between
+screenshots the harness skips draws, clears and blits and replays every other call
+(`GlMirror.skipDraws`, which the page never sets).
+
+#### Measured
+
+On a g4dn.metal (T4, driver 580.196.07), the emulator built with ejc3/gfxstream#4, the AOSP
+image, a 6 GiB phone VM with a 2 GiB phone, Robot Park at 720 x 1280; both streams captured at
+once by a client on the host, as the page receives them (`scripts/phone/mirror-capture.sh`:
+the streamer's `/frames` at `q=std` and `/mirror` with a token for the scene's holder). The mirror
+joined with an app restart 1 s in. 1-minute load 1.3 to 2.0 on 96 cores.
+
+| | Video (NVENC H.264) | GPU mirror (deflated command stream) |
+|---|---|---|
+| Robot Park's scene, 30 s | 19.2 Mbit/s, 28.7 fps | 1.74 Mbit/s (7.6 Mbit/s before deflate); 269 blocking calls a second answered by the T4 |
+| Settings, a fresh process after the join, scrolled once a second, 22 s | 8.7 Mbit/s, 16.0 fps (a still screen sends less) | 3.38 Mbit/s (11.6 before deflate); 288 blocking calls a second |
+
+The guest posts a composed frame about 59 times a second for Robot Park (`rcCompose`, 1,177
+in 20 s), so the mirror can draw at the phone's own rate where the video carries 30. Of the
+Robot Park stream, 87 percent is the app's own channel, and most of that is uniforms
+(`glUniform3fv` 9.6 MB of 19.4 MB in 20 s). The phone's blocking calls are mostly fences:
+`rcCreateSyncKHR` once per app frame (eglSwapBuffers' native fence), and HWC's
+`rcCreateSyncKHR`, `rcDestroySyncKHR` and `rcCompose` per composed frame. An independent
+count on the decoder side (`docs/fleet/phone-gpu-remoting.md`) measured 0.90 MB/s from the
+app, 240 replies a second for the whole system, and matched `strace` in the guest to the
+byte (26,191,079 bytes and 1,739 replies over 29 s).
+
+**Pixel match.** The capture in `fleet/web/e2e/fixtures/mirror/robotpark` (6.5 s, the mirror
+joined by an app restart 1 s in) replayed in headless Chrome, against the T4's screenshots of
+the same stamp, the stamp band left out: frames 315 and 470 (of the capture this one was cut
+from) each differ from the T4's in 0.41 percent of pixels by more than 16 levels, by 0.25 levels
+on average, at 44.5 dB PSNR. No call failed in WebGL2. The test's bar is 1 percent and 38 dB.
+With `glBlendFunc` ignored (the particles' and the glow's blending
+drawn opaque) the test fails: 4.1 percent of pixels more than 16 levels off, 17.8 dB.
+
+**Freshness.** With both views open the panel reads Robot Park's stamp from the mirror's frame
+and the video's newest frame and shows the mirror's lead. The command stream leaves the phone
+when the app submits a frame, before the T4 draws it, where the video waits for the draw, the
+screen capture (36 ms p50) and the encode (14 ms to the socket). Not measured yet on a
+viewer's machine.
+
 ### Invariants (each becomes a test)
 
 1. A phone renders on its VM's GPU: SurfaceFlinger's renderer and the app's both name the
@@ -1011,6 +1218,10 @@ and the page shows it with `?mode=phones`.
 4. After a restore the app draws on the clone's GPU within the restore deadline.
 5. The same `t` and rectangle give the same pixels on every phone (the seam test).
 6. Nothing a viewer sends reaches a phone except scene fields and the enumerated actions.
+7. Only the viewer holding a phone receives its GPU mirror, and the mirror never answers a
+   call (`test_host.cpp`'s admission checks; the decoder has no reply path).
+8. The mirror never makes the phone wait: a render thread's copy is bounded by its own bytes,
+   and a full ring or a slow viewer ends the copy, never the phone's work (`mirror_tap_unittest.cpp`).
 
 ### Failure states
 
@@ -1073,6 +1284,11 @@ and the page shows it with `?mode=phones`.
    `claim_phone` and its actions, phone restore timings in the state.
 7. Web: `?mode=phones`, the zoom out, the bezels, the take-over panel.
 8. ejc3/aws: the host AMI with the phone image and assets.
+9. The GPU mirror ("The GPU mirror", above): the gfxstream tap and the GLES cap
+   (ejc3/gfxstream#4); the browser's decoder and WebGL2 replay with the replay test; the
+   streamer's `GET /mirror` and its admission; the take-over panel's three views and their
+   readouts; the emulator pin. Then the join snapshot, and hiding program binaries from the
+   guest.
 
 ## Invariants (each becomes a test)
 
