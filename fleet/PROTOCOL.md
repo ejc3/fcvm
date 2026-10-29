@@ -50,12 +50,15 @@ key when intents need a `verify` first (`null` when they do not).
 Second on every connection, then again every 5 minutes with fresh tokens, and to a late
 viewer whenever `seat_free` changes (docs/fleet/ARCHITECTURE.md, "Broadcast mode"). A
 connection admitted while fewer than `capacity` seats are held gets a `seat` ticket and a
-`direct` token, which every frame URL it opens carries as `admit=<value>`; one admitted
+`direct` token, which every frame socket it opens sends as its first message
+(`{"admit": "<value>"}`, renderer `GET /frames`); one admitted
 with every seat held is late: `locked`, `seat` and `direct` null, `reason` the sentence the
 page shows, and `seat_free` true once a new connection would be seated (the page offers a
-reload; a late connection is never promoted). A page that reconnects passes its ticket as
-`GET /live?seat=<ticket>` and keeps its seat if the ticket's connection closed less than 60 s
-before. `broadcast` is the playback URL (signed for a private channel, bound to the page's
+reload; a late connection is never promoted). A page sends `{"type": "seat", "ticket":
+"<ticket>"}` (`null` without one) as its first message, so one that reconnects keeps its seat
+if the ticket's connection closed less than 60 s before. The coordinator waits up to 2 s for
+that first message; any other first message is admitted without a ticket and handled as
+usual. A ticket is never read from the URL, which proxies and access logs keep. `broadcast` is the playback URL (signed for a private channel, bound to the page's
 `Origin` and valid for an hour), null without a broadcast or, on a private channel, for a
 connection that sent no `Origin`; `capacity` is null when every viewer is seated (no broadcast).
 `claim_gpu` from a late connection is refused unrecorded (`version: 0`).
@@ -660,7 +663,9 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
 The wildcard certificate (`*.<zone>`, `<zone>` and, with `--dns-subzone`, `*.<subzone>`)
 lives in one Secrets Manager secret,
 a JSON object: `cert` (PEM full chain), `key` (PEM private key), `domains`, `not_after` and
-`issued_at` (RFC 3339 UTC) and `issuer` (fleet/tools/issue-cert.sh writes the first one).
+`issued_at` (RFC 3339 UTC), `issuer` (fleet/tools/issue-cert.sh writes the first one) and
+`scene_token`, the renderers' scene token (renderer, "Access"), which the coordinator adds at
+startup when the secret has none and every renewal and issue-cert.sh keep.
 Twice a day the coordinator reads it; within 30 days of `not_after` (or when it is missing
 or does not cover every one of those names) it orders a new certificate from Let's Encrypt
 (`--acme-directory` for another CA), answers DNS-01 with TXT records at
@@ -978,7 +983,8 @@ none is placed). For each slot the agent reconciles:
 
 The scene shared by every renderer, sent after the hello and whenever it changes. The
 agent posts `scene` plus the slot's `rect` to each running renderer as
-`POST http://<publish ip>:<port>/scene`, with the body
+`POST http://<publish ip>:<port>/scene`, with the scene token as the bearer token
+(renderer, "Access"), and the body
 `{"epoch_unix_ms", "rect", "layout_generation", "rect_from_frame", "previous_rect",
 "image_aspect", "camera", "time_of_day", "words", "lights", "weather"}` (`weather` only when
 the scene has weather keys: renderer `POST /scene`, "Weather"). The
@@ -1105,7 +1111,9 @@ wildcard certificate to every renderer in the renderer's TLS interface (its PROT
 instance role, writes its `cert` and `key` as `tls.json` (a JSON object with those two
 fields, mode 0600, replaced by rename) into `--tls-dir`, maps that directory read-only into
 each VM at `/run/fleet-tls` with `TLS_CERT_FILE=/run/fleet-tls/tls.json` and
-`TLS_PORT=443`, and reads the secret again every hour. A renewal is a new file renamed into
+`TLS_PORT=443`, and reads the secret again every hour. The file also carries the secret's
+`scene_token` (renderer, "Access"), which the agent sends with its own scene and budget
+posts. A renewal is a new file renamed into
 place; the renderer checks its file every 2 s and loads a new version for the connections
 that follow (the mapped directory's attribute cache is 1 s), so a renewal needs no
 restart.
@@ -1196,9 +1204,11 @@ processes; the host needs the `ffmpeg` CLI with libx264.
 - The region's size is its share of a whole image `--image-height` tall (default 1080):
   the fcvm half of a 1920 x 1080 image is 960 x 1080. `?h=` is accepted and ignored.
 - `admit_keys` in a layout (the coordinator's admission keys, hex): the public
-  listener's `/frames` then needs `admit=<direct token>` made with one of them (`403`
-  otherwise), and the aggregator's own tile subscriptions carry a token it makes with the
-  first. The agent passes its scene's keys; the coordinator its own.
+  listener's `/frames` then needs a first message `{"admit": "<direct token>"}` made with
+  one of them within 5 s (the socket is closed with 1008 otherwise; before its first layout
+  it answers `503`; it takes no message over 4 KiB), and the aggregator's own tile
+  subscriptions send a token it makes with the first. The coordinator's poster sends one
+  the same way. The agent passes its scene's keys; the coordinator its own.
 - `POST /layout`: `{"epoch_unix_ms","image_aspect","region":{x,y,w,h},
   "tiles":[{"id","rect","url"}],"generation","from_frame"}` (`generation` and `from_frame`
   default to 0: the layout generation of the tiles' rects and its frame; the agent sends
@@ -1255,6 +1265,29 @@ WebSocket) for host-local clients, and, given a certificate, on `:443` with
 TLS for browsers (HTTPS and WSS, the same routes; see "TLS"). Source:
 `fleet/renderer/`.
 
+### Access
+
+Its addresses are public (a slot's IPv6, a tile's DNS name), so a renderer that runs for
+the fleet checks who sets its scene and who streams it. It runs for the fleet when
+`SCENE_TOKEN_FILE` (a file holding the token: a tile instance) or `TLS_CERT_FILE` (the
+certificate JSON, whose `scene_token` field is the token: a VM on a host agent) is set.
+
+- `POST /scene` and `POST /budget` need `Authorization: Bearer <scene token>`: `401`
+  without it, `503` while no token can be read. The file is read again whenever it changes
+  (a new inode, size or modification time), and a removed file authorizes nothing.
+- `GET /frames` is `503` until the first scene: that scene says whether streams need a
+  direct token (`admit_keys`), and a stream opened before it would keep its frames after.
+- The scene token is the `scene_token` field of the certificate secret ("Certificate"
+  under the coordinator), so it reaches each renderer the way its certificate does. The
+  coordinator adds one when the secret has none (32 random bytes, hex; two coordinators
+  adding one at once agree, since both write with a request token derived from the version
+  they read and the service stores only the first), keeps it through every renewal, and
+  every hour puts its own back into a version that lost it; the host agents and tile
+  instances read it with the certificate. To rotate it, store a new one, then restart the
+  coordinator and relaunch the tiles and hosts: a tile reads its token once, at boot.
+
+A renderer with neither variable set (a local run) takes any scene and streams at once.
+
 ### Coordinates and time
 
 - **World units are kilometres.** A position is `[x, altitude, z]`: `x` and
@@ -1302,6 +1335,7 @@ grants. The body is at most 1 MiB.
  "lights": [{"pos": [-36, 1.75, -61], "color": [1.0, 0.45, 0.15], "t": 30.0}]}
 ```
 
+`Authorization: Bearer <scene token>` is required on a fleet renderer ("Access").
 `admit_keys` (optional): the coordinator's admission keys, hex, newest first, at
 most 4 (see `GET /frames`). The coordinator sends them only when it runs a
 broadcast; they never appear in a browser's snapshot.
@@ -1454,12 +1488,14 @@ the field. A change of the weather a hold draws starts a new hold.
 ### `GET /frames?h=<height>&q=<quality>` (WebSocket)
 
 `h` is 16 to 2160. `q` is optional: `hi`, `std` (the default) or `lo`; see
-"Stream quality". Once a scene has brought `admit_keys`, the request also needs
-`admit=<direct token>` (the coordinator's `admission` message) made with one of
-them and not expired; anything else is `403` before the upgrade. The renderer
-keeps the newest keys and the ones before them (at most 4), so a token made just
-before a new key still opens a stream; a scene without `admit_keys` turns the
-check off. The token is checked when the stream opens, not while it runs. The tile's size follows from `h` and the rect; see
+"Stream quality". A fleet renderer answers `503` before its first scene ("Access").
+Once a scene has brought `admit_keys`, the client's first message must be
+`{"admit": "<direct token>"}` (the coordinator's `admission` message), made with one of
+them and not expired, within 5 s; anything else closes the socket with 1008 before a
+frame is sent. The URL never carries the token, so no proxy or access log holds one. The
+renderer keeps the newest keys and the ones before them (at most 4), so a token made just
+before a new key still opens a stream; a scene without `admit_keys` turns the check off.
+The token is checked when the stream opens, not while it runs. The tile's size follows from `h` and the rect; see
 "Tile geometry". The first message is text:
 
 ```json
@@ -1850,7 +1886,8 @@ itself.
 - **The file** is a JSON object in the format of the fleet's wildcard secret
   (`fleet/tools/issue-cert.sh` on `fleet-deploy` documents it): `cert`, the
   leaf certificate followed by its intermediates, PEM; `key`, the leaf's
-  private key, PEM. Other fields are ignored. The host hands it to the VM
+  private key, PEM; `scene_token`, the scene token ("Access"). Other fields
+  are ignored. The host hands it to the VM
   (for fcvm: `--map <dir>:/run/fleet-tls:ro --env TLS_CERT_FILE=/run/fleet-tls/tls.json`).
 - **Reload:** the file is checked every 2 s. A new version of it (renamed into
   place, or rewritten: a new inode, size or modification time) is loaded and
@@ -1886,7 +1923,8 @@ compared pixel for pixel with the same frame drawn whole
 - Kernels are SASS for `sm_75` only (no PTX), so CUDA compiles nothing at
   start. Other GPU generations need a build with their `GENCODE`.
 - Environment: `PORT` (8080), `FPS` (30), `BUDGET` (250000), `ADAPT` (1), `MARGIN` (16), `ENC_BPP` (0.8),
-  `ACCUMULATE` (1), `TLS_CERT_FILE` (unset: no TLS listener), `TLS_PORT` (443). `FIT_SCALE`
+  `ACCUMULATE` (1), `TLS_CERT_FILE` (unset: no TLS listener), `TLS_PORT` (443),
+  `SCENE_TOKEN_FILE` (unset: the token, if any, is `TLS_CERT_FILE`'s; see "Access"). `FIT_SCALE`
   (1) scales the reported `budget_fit`, to test a grid of unequal GPUs; never set it in production.
 
 ## Phone app

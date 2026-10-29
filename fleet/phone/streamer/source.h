@@ -44,6 +44,8 @@ class PhoneSource : public FrameSource {
   bool next_frame(int still_h, std::vector<uint8_t>* rgba, int* w, int* h, std::string* tile_json) override;
   std::string health_json() override;
   bool admits(const std::string& token) override;
+  bool requires_admit() override;
+  bool has_scene() override;
   // The app link (a thread of its own): passes the scene and the host's clock to the app.
   void app_link();
 

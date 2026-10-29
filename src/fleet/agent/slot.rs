@@ -59,6 +59,9 @@ pub struct AgentCfg {
     pub quarantine_after: u32,
     /// Phones mode: what a phone slot runs (`None`: this host runs no phones).
     pub phone: Option<super::vm::PhoneCfg>,
+    /// The bearer token of its scene and budget posts (fleet/PROTOCOL.md, "Access"), from the
+    /// certificate secret its renderers read it from too.
+    pub scene_token: crate::fleet::coord::scene_token::SceneToken,
 }
 
 impl AgentCfg {
@@ -255,8 +258,9 @@ impl SlotCtx {
 
     async fn post_scene(&self, body: &RendererScene) -> Result<(), String> {
         let r = self
-            .http
-            .post(self.health_url("/scene"))
+            .cfg
+            .scene_token
+            .authorize(self.http.post(self.health_url("/scene")))
             .timeout(Duration::from_secs(5))
             .json(body)
             .send()
@@ -270,8 +274,9 @@ impl SlotCtx {
 
     async fn post_budget(&self, body: &BudgetBody) -> Result<(), String> {
         let r = self
-            .http
-            .post(self.health_url("/budget"))
+            .cfg
+            .scene_token
+            .authorize(self.http.post(self.health_url("/budget")))
             .timeout(Duration::from_secs(5))
             .json(body)
             .send()

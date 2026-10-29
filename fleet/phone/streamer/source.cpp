@@ -133,6 +133,16 @@ bool PhoneSource::admits(const std::string& token) {
   return admit_.admits(token, (int64_t)time(nullptr));
 }
 
+bool PhoneSource::requires_admit() {
+  std::lock_guard<std::mutex> l(mu_);
+  return !admit_.keys.empty();
+}
+
+bool PhoneSource::has_scene() {
+  std::lock_guard<std::mutex> l(mu_);
+  return scene_version_ > 0;
+}
+
 bool PhoneSource::post_budget(const std::string& body, std::string* err) {
   // The wall's budget controller posts every tile; a phone draws at its display's rate
   // whatever the budget, so a well-formed budget is accepted and changes nothing.

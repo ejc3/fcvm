@@ -18,7 +18,7 @@ use super::Handle;
 use crate::fleet::now_ms;
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{ConnectInfo, Query, State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -173,7 +173,6 @@ async fn live(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Query(query): Query<std::collections::HashMap<String, String>>,
     State(app): State<App>,
 ) -> Response {
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
@@ -184,7 +183,6 @@ async fn live(
     }
     let client = client_address(&headers, peer, app.cfg.trust_cf_connecting_ip);
     let page = Page {
-        seat: query.get("seat").cloned(),
         origin: origin.map(|o| o.trim_end_matches('/').to_string()),
     };
     ws.max_message_size(MAX_CLIENT_MESSAGE)
@@ -227,11 +225,14 @@ fn unrecorded_refusal(id: String, reason: &str) -> ServerMsg {
 
 /// What the page said about itself when it connected.
 struct Page {
-    /// The seat ticket it kept from an earlier connection.
-    seat: Option<String>,
     /// Its origin, which a playback token is bound to.
     origin: Option<String>,
 }
+
+/// How long a connection waits for its first message, which may hold a seat ticket, before
+/// it is admitted without one. The page sends one at once, so only a client that sends
+/// nothing waits this long.
+pub const SEAT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Why a late viewer's `claim_gpu` or `claim_phone` is refused: a private GPU is a direct
 /// stream too, and a borrowed phone is shown from its direct stream.
@@ -272,11 +273,26 @@ async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
             .await;
         return;
     }
-    // Then how it receives the image. A seat is held from here until the connection ends.
+    // Then how it receives the image. A seat ticket comes in the first message; any other
+    // first message is handled below like the ones after it.
+    let mut pending: Option<Message> = None;
+    let seat = match tokio::time::timeout(SEAT_WAIT, stream.next()).await {
+        Ok(Some(Ok(Message::Text(t)))) => match serde_json::from_str::<ClientMsg>(&t) {
+            Ok(ClientMsg::Seat { ticket }) => ticket,
+            _ => {
+                pending = Some(Message::Text(t));
+                None
+            }
+        },
+        Ok(Some(Ok(m))) => {
+            pending = Some(m);
+            None
+        }
+        _ => None,
+    };
+    // A seat is held from here until the connection ends.
     let gate = app.cfg.gate.clone();
-    let admitted = gate
-        .seats
-        .admit(page.seat.as_deref(), std::time::Instant::now());
+    let admitted = gate.seats.admit(seat.as_deref(), std::time::Instant::now());
     let late = admitted == Admitted::Late;
     let admission = gate.message(
         &admitted,
@@ -374,7 +390,14 @@ async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
     // The one `word` this viewer has at the text check, if any.
     let checking: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    while let Some(Ok(msg)) = stream.next().await {
+    loop {
+        let msg = match pending.take() {
+            Some(m) => m,
+            None => match stream.next().await {
+                Some(Ok(m)) => m,
+                _ => break,
+            },
+        };
         let body = match msg {
             Message::Text(t) => t.to_string(),
             Message::Close(_) => break,
@@ -399,6 +422,8 @@ async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
                 server_unix_ms: now_ms(),
                 client_unix_ms,
             }),
+            // Only a first message carries a seat ticket.
+            Ok(ClientMsg::Seat { .. }) => None,
             Ok(ClientMsg::Visibility { visible }) => {
                 app.handle
                     .send(Event::Visibility {

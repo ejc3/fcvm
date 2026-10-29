@@ -267,8 +267,8 @@ first frame needs no compile), encodes H.264 with NVENC, and serves:
   watching and scales down for smaller ones, and encodes only the heights with a
   subscriber. The browser decodes with WebCodecs.
 - `POST /scene`: the camera path, the clock offset and its rectangle (from the coordinator,
-  through the agent, never from a browser), so a camera move is ordered like any other
-  action.
+  through the agent, never from a browser, and only with the scene token), so a camera move
+  is ordered like any other action.
 - `GET /health`: frames per second, the heights being encoded, GPU name and memory, the
   `t` of its latest frame, and the GPU's temperature, power draw and utilization.
 
@@ -386,7 +386,7 @@ browser: IVS web player; the overlay drawn from the state in effect at the shown
 - **A seat** is taken by a `/live` connection admitted while fewer than N are held. The
   admission message gives it a direct token (below) and a seat ticket. The seat is held while
   the connection is open and for 60 s after it closes, so a page that reconnects with its
-  ticket (`/live?seat=<ticket>`) keeps it. A hidden tab keeps its seat while its socket is
+  ticket (its first `/live` message) keeps it. A hidden tab keeps its seat while its socket is
   open.
 - **Every viewer has a broadcast toggle.** A seated viewer may switch to the broadcast and
   back; switching does not give up the seat.
@@ -400,8 +400,9 @@ browser: IVS web player; the overlay drawn from the state in effect at the shown
   middle of a session would swap its picture for the direct tiles while it watched, and two
   late viewers would race for one seat; a reload makes the order the order of connections.
 
-**Enforcement is server side.** A renderer's or aggregator's `GET /frames` needs an `admit`
-token once it holds an admission key: `v1.<expiry, unix s>.<viewer>.<mac>`, the mac an
+**Enforcement is server side.** A renderer's or aggregator's `GET /frames` needs a direct
+token as the socket's first message once it holds an admission key (never in the URL, which
+proxies and access logs keep): `v1.<expiry, unix s>.<viewer>.<mac>`, the mac an
 HMAC-SHA256 of the first three fields with a 32-byte key the coordinator makes at start (it sends
 keys only when it runs a broadcast, so a fleet without one checks nothing). The
 key reaches renderers in the scene the agent posts (the coordinator posts the EC2 tiles'
@@ -409,12 +410,14 @@ scenes) and aggregators in their layout, and never appears in a snapshot. A rend
 accepts the current key and the one before it, so a new key does not cut off a viewer between
 two token refreshes. Tokens last 10 minutes and each seated connection gets a fresh one every
 5 minutes; a token is checked when a stream opens, not while it runs. A late viewer that
-flips its page into direct mode opens sockets that are refused with 403, because nothing it
-holds is a token. The coordinator mints tokens for the streams it reads itself (the EC2
+flips its page into direct mode opens sockets that are closed with 1008 before a frame,
+because nothing it holds is a token. A fleet renderer streams nothing before its first scene,
+which is what says whether it needs a token. The coordinator mints tokens for the streams it reads itself (the EC2
 aggregator, the broadcast, the poster), and an agent's aggregator mints its own from the
-key. A known limit: `POST /scene` answers anyone who can reach a renderer and forges a JSON
-content type, so a determined client can replace the key. That is the scene's own exposure,
-not the broadcast's, and is tracked separately.
+key. Only a holder of the scene token can replace the key: a fleet renderer takes
+`POST /scene` and `/budget` only with it as the bearer token (fleet/PROTOCOL.md, renderer
+"Access"). The token is a field of the certificate secret, so the host agents and tile
+instances read it with the certificate, and the coordinator adds it when the secret has none.
 
 **Past about 5,000 viewers the coordinator needs more.** A broadcast viewer still holds a
 `/live` socket for state, intents and its tokens, and the coordinator holds about 5,000 of
@@ -1082,8 +1085,9 @@ and the page shows it with `?mode=phones`.
 7. An agent that loses its coordinator, and a coordinator that loses an agent, leave no VM
    running that nothing supervises.
 8. A connection admitted while every seat is held never receives a direct token, and a
-   renderer or aggregator that holds an admission key streams to no request without a valid
-   one.
+   renderer or aggregator that holds an admission key streams to no client without a valid
+   one. A fleet renderer takes a scene only from a holder of the scene token, and streams
+   nothing before its first scene.
 9. The broadcast overlay draws the state in effect at the shown frame's `t`, never a later
    one.
 

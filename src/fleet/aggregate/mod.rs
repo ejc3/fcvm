@@ -859,11 +859,12 @@ async fn frames_route(ws: WebSocketUpgrade, State(app): State<Arc<Shared>>) -> i
     ws.on_upgrade(move |socket| viewer(socket, app))
 }
 
-/// The public listener's `/frames`: with admission keys in the layout, only a request with a
-/// direct token made with one of them (`admit=`) gets the stream; anything else gets 403.
+/// The public listener's `/frames`: with admission keys in the layout, only a client whose
+/// first message carries a direct token made with one of them (`{"admit": "<token>"}`, within
+/// [`ADMIT_WAIT`]) gets the stream; anything else is closed with 1008. A token in the URL
+/// would land in proxy and access logs, so the URL carries none.
 async fn admitted_frames_route(
     ws: WebSocketUpgrade,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
     State(app): State<Arc<Shared>>,
 ) -> axum::response::Response {
     // Before its first layout it cannot tell whether streams need a token: it serves none
@@ -871,18 +872,52 @@ async fn admitted_frames_route(
     let Some(keys) = app.layout.borrow().as_ref().map(|l| l.admit_keys.clone()) else {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "no layout yet").into_response();
     };
-    if !admitted(&keys, q.get("admit").map(String::as_str)) {
-        return (
-            axum::http::StatusCode::FORBIDDEN,
-            "a direct token is required",
-        )
-            .into_response();
-    }
-    ws.on_upgrade(move |socket| viewer(socket, app))
+    // Nothing a viewer sends is larger than a height request, so an unadmitted client cannot
+    // make it buffer more than this.
+    ws.max_message_size(MAX_VIEWER_MESSAGE)
+        .on_upgrade(move |mut socket| async move {
+            if !keys.is_empty() {
+                let first = tokio::time::timeout(ADMIT_WAIT, socket.recv()).await;
+                let token = match first {
+                    Ok(Some(Ok(Message::Text(t)))) => admit_message(&t),
+                    _ => None,
+                };
+                if !admitted(&keys, token.as_deref()) {
+                    let _ = socket
+                        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                            code: 1008,
+                            reason: "a direct token is required".into(),
+                        })))
+                        .await;
+                    return;
+                }
+            }
+            viewer(socket, app).await
+        })
         .into_response()
 }
 
-/// Whether a request with `token` may stream, under the layout's admission keys (hex).
+/// How long a stream that needs a direct token waits for the client's first message.
+pub const ADMIT_WAIT: Duration = Duration::from_secs(5);
+
+/// The largest message the public listener takes from a viewer.
+pub const MAX_VIEWER_MESSAGE: usize = 4096;
+
+/// The first message that admits a client to a stream: `{"admit": "<token>"}`.
+pub fn admit_first_message(token: &str) -> String {
+    serde_json::json!({ "admit": token }).to_string()
+}
+
+/// The direct token in a client's first message, if it is one.
+pub fn admit_message(text: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()?
+        .get("admit")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Whether a client with `token` may stream, under the layout's admission keys (hex).
 pub fn admitted(keys_hex: &[String], token: Option<&str>) -> bool {
     use crate::fleet::coord::admission::{direct_token_valid, AdmitKey};
     if keys_hex.is_empty() {

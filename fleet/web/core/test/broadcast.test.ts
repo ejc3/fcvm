@@ -15,7 +15,9 @@ import {
   type HistoryEntry,
 } from "../broadcast.ts";
 import { serverNow } from "../clock.ts";
-import { frameSocketUrl, sameStreamAtAnyHeight } from "../net.ts";
+import { readFileSync } from "node:fs";
+import { admitMessage, frameSocketUrl, sameStreamAtAnyHeight } from "../net.ts";
+import { seatMessage } from "../protocol.ts";
 import type { Admission, FleetState } from "../protocol.ts";
 import { initialState, reduce, type ClientState } from "../store.ts";
 import { wallView } from "../view.ts";
@@ -181,20 +183,39 @@ describe("the page in broadcast mode", () => {
     const seated = withSnapshots(admission(), [fleet()]);
     const v = view({ ...seated, ui: { ...seated.ui, mode: "direct" } });
     expect(v.plan.direct.length).toBeGreaterThan(0);
-    for (const d of v.plan.direct) expect(d.url).toContain("admit=v1.9999999999.v-1.mac");
+    for (const d of v.plan.direct) {
+      expect(d.admit).toBe("v1.9999999999.v-1.mac");
+      expect(d.url).not.toContain("admit");
+    }
     expect(v.broadcast).toBeNull();
     expect(v.play!.broadcast).toMatchObject({ on: false, disabled: false });
   });
 });
 
 describe("frame URLs and the direct token", () => {
-  it("carries the token, and a renewed one is still the same stream", () => {
-    const a = frameSocketUrl("wss://slot-1.example/frames", 270, "std", "tok-1");
-    expect(a).toBe("wss://slot-1.example/frames?h=270&admit=tok-1");
-    const b = frameSocketUrl(a, 360, "std", "tok-2");
-    expect(b).toBe("wss://slot-1.example/frames?h=360&admit=tok-2");
-    expect(sameStreamAtAnyHeight(a, b)).toBe(true);
-    expect(frameSocketUrl("wss://x/frames", 180)).toBe("wss://x/frames?h=180");
+  it("keeps the token out of the URL and sends it as the first message", () => {
+    const a = frameSocketUrl("wss://slot-1.example/frames", 270, "std");
+    expect(a).toBe("wss://slot-1.example/frames?h=270");
+    expect(sameStreamAtAnyHeight(a, frameSocketUrl(a, 360, "std"))).toBe(true);
+    expect(JSON.parse(admitMessage("tok-1"))).toEqual({ admit: "tok-1" });
+  });
+
+  it("has every socket send its token before anything else", () => {
+    // The app glue opens the sockets; a renderer or coordinator reads only the first message.
+    const worker = readFileSync(new URL("../../app/_wall/frames.worker.ts", import.meta.url), "utf8");
+    const open = worker.slice(worker.indexOf("ws.onopen = () => {"));
+    expect(open.indexOf("ws.send(admitMessage(this.admit))")).toBeGreaterThan(0);
+    expect(open.indexOf("ws.send(admitMessage(this.admit))")).toBeLessThan(open.indexOf("this.syncHeight()"));
+    const client = readFileSync(new URL("../../app/_wall/wall-client.ts", import.meta.url), "utf8");
+    const live = client.slice(client.indexOf("const ws = new WebSocket(this.url);"));
+    expect(live.indexOf("ws.send(seatMessage(savedSeat()))")).toBeGreaterThan(0);
+    expect(live.indexOf("ws.send(seatMessage(savedSeat()))")).toBeLessThan(live.indexOf("ws.send(", live.indexOf("seatMessage") + 1));
+    expect(client).not.toContain("seat=");
+  });
+
+  it("sends the seat ticket as the first /live message", () => {
+    expect(JSON.parse(seatMessage("t-1"))).toEqual({ type: "seat", ticket: "t-1" });
+    expect(JSON.parse(seatMessage(null))).toEqual({ type: "seat", ticket: null });
   });
 });
 

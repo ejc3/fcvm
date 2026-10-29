@@ -19,6 +19,7 @@ import {
   NOTICE_MS,
   reconnectDelayMs,
   reduce,
+  seatMessage,
   shouldPing,
   type ClientEvent,
   type ClientState,
@@ -54,11 +55,6 @@ function saveSeat(seat: string | null): void {
   }
 }
 
-/** The /live URL with the seat ticket this tab holds, if any. */
-export function liveUrlWithSeat(url: string, seat: string | null): string {
-  if (seat === null) return url;
-  return `${url}${url.includes("?") ? "&" : "?"}seat=${encodeURIComponent(seat)}`;
-}
 
 function newId(): string {
   return crypto.randomUUID();
@@ -213,7 +209,7 @@ export class WallClient {
         tried[family]++;
         let ws: WebSocket;
         try {
-          ws = new WebSocket(frameSocketUrl(url, STREAM_HEIGHTS[0]!, "std", this.state.admission?.direct?.value ?? null));
+          ws = new WebSocket(frameSocketUrl(url, STREAM_HEIGHTS[0]!, "std"));
         } catch {
           failed[family]++;
           continue;
@@ -266,11 +262,12 @@ export class WallClient {
   private connect(): void {
     if (this.stopped) return;
     this.dispatch({ type: "socket", status: "connecting", at: now() });
-    const ws = new WebSocket(liveUrlWithSeat(this.url, savedSeat()));
+    const ws = new WebSocket(this.url);
     this.ws = ws;
     ws.onopen = () => {
       this.attempt = 0;
       this.dispatch({ type: "socket", status: "open", at: now() });
+      ws.send(seatMessage(savedSeat()));
       ws.send(JSON.stringify({ type: "visibility", visible: this.visible }));
       for (const intent of intentsToResend(this.state)) ws.send(JSON.stringify(intent));
       this.ping();

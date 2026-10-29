@@ -67,13 +67,40 @@ impl Secrets {
 
     /// The secret's current string.
     pub async fn get(&self, id: &str) -> Result<String> {
+        Ok(self.get_version(id).await?.0)
+    }
+
+    /// The secret's current string and its version id.
+    pub async fn get_version(&self, id: &str) -> Result<(String, Option<String>)> {
         let v = self
             .call("GetSecretValue", serde_json::json!({ "SecretId": id }))
             .await?;
-        v.get("SecretString")
+        let text = v
+            .get("SecretString")
             .and_then(|s| s.as_str())
             .map(str::to_string)
-            .with_context(|| format!("secret {id} has no string value"))
+            .with_context(|| format!("secret {id} has no string value"))?;
+        let version = v
+            .get("VersionId")
+            .and_then(|s| s.as_str())
+            .map(str::to_string);
+        Ok((text, version))
+    }
+
+    /// Store a new current version with this `ClientRequestToken` (32 to 64 characters). The
+    /// service refuses a second request with the same token and a different value, so writers
+    /// that derive the token from the version they read cannot both replace that version.
+    pub async fn put_with_token(&self, id: &str, value: &str, token: &str) -> Result<()> {
+        self.call(
+            "PutSecretValue",
+            serde_json::json!({
+                "SecretId": id,
+                "SecretString": value,
+                "ClientRequestToken": token,
+            }),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Store a new current version of the secret. The API requires a `ClientRequestToken`

@@ -290,6 +290,16 @@ bool Pipeline::admits(const std::string& token) {
   return keys.empty() || admit_token_valid(keys, token, (int64_t)time(nullptr));
 }
 
+bool Pipeline::requires_admit() {
+  std::lock_guard<std::mutex> l(mu_);
+  return !admit_keys_.empty();
+}
+
+bool Pipeline::has_scene() {
+  std::lock_guard<std::mutex> l(mu_);
+  return scene_version_ > 0;
+}
+
 bool Pipeline::post_budget(const std::string& body, std::string* err) {
   double b, t;
   try {

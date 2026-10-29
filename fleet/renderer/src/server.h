@@ -2,6 +2,7 @@
 // GET /still, GET /raw. Plain on one port; with a TlsFront, also HTTPS/WSS
 // on another.
 #pragma once
+#include "access.h"
 #include <atomic>
 #include <memory>
 #include <string>
@@ -25,11 +26,17 @@ class FrameSource {
   virtual std::string health_json() = 0;
   // Whether a GET /frames with this direct token may stream.
   virtual bool admits(const std::string& token) = 0;
+  // Whether a stream must show a direct token before it is served (a scene brought keys).
+  virtual bool requires_admit() = 0;
+  // Whether any scene has been posted (a fleet renderer streams nothing before one).
+  virtual bool has_scene() = 0;
 };
 
 class Server {
  public:
   explicit Server(FrameSource& p) : p_(p) {}
+  // A fleet renderer (access.h): scene posts need the token, streams wait for a scene.
+  void set_scene_token(SceneToken* t) { token_ = t; }
   // Binds and listens; returns false with a message. Then serve() accepts forever.
   bool listen(int port, std::string* err);
   bool listen_tls(int port, TlsFront* tls, std::string* err);
@@ -43,5 +50,7 @@ class Server {
   FrameSource& p_;
   int lfd_ = -1, tfd_ = -1;
   TlsFront* tls_ = nullptr;
+  SceneToken* token_ = nullptr;
+  bool fleet() const { return token_ && token_->configured(); }
   std::atomic<unsigned long long> refused_{0};  // connections refused for want of a thread (both accept loops)
 };

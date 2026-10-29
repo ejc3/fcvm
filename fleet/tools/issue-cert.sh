@@ -19,6 +19,8 @@
 #   not_after  expiry, RFC 3339 UTC
 #   issued_at  RFC 3339 UTC
 #   issuer     the issuing CA's subject
+#   scene_token  the renderers' scene token (fleet/PROTOCOL.md, "Access"): kept from the
+#              secret's current version; the coordinator adds one when there is none
 set -euo pipefail
 ZONE=${ZONE:-fcvm.dev}
 SECRET=${SECRET:-fcvm-fleet/tls-wildcard}
@@ -39,9 +41,17 @@ CLOUDFLARE_PROPAGATION_TIMEOUT=300 lego --accept-tos --email "$ACME_EMAIL" --ser
 unset CLOUDFLARE_DNS_API_TOKEN
 
 crt="$W/certificates/_.$ZONE.crt"; key="$W/certificates/_.$ZONE.key"
-python3 - "$crt" "$key" "$W/secret.json" <<'PY'
+# The current version, for its scene token. Only a secret that does not exist yet (a first
+# issuance) has none: any other failure stops here, since storing a certificate without the
+# token would leave every renderer refusing the coordinator's scenes.
+if ! ( umask 077; aws --region "$SECRET_REGION" secretsmanager get-secret-value --secret-id "$SECRET" \
+    --query SecretString --output text > "$W/current.json" 2> "$W/current.err" ); then
+  grep -q ResourceNotFoundException "$W/current.err" || { cat "$W/current.err" >&2; echo "cannot read $SECRET; not storing a certificate without its scene token" >&2; exit 1; }
+  : > "$W/current.json"
+fi
+python3 - "$crt" "$key" "$W/secret.json" "$W/current.json" <<'PY'
 import json, subprocess, sys, datetime
-crt, key, out = sys.argv[1:4]
+crt, key, out, current = sys.argv[1:5]
 def x509(*args):
     return subprocess.run(["openssl", "x509", "-noout", *args], input=open(crt, "rb").read(), capture_output=True, check=True).stdout.decode().strip()
 end = x509("-enddate").split("=", 1)[1]
@@ -55,6 +65,12 @@ doc = {
     "issued_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "issuer": x509("-issuer").split("=", 1)[1].strip(),
 }
+try:
+    token = json.load(open(current)).get("scene_token")
+except (ValueError, AttributeError):
+    token = None
+if token:
+    doc["scene_token"] = token
 fd = open(out, "w"); json.dump(doc, fd); fd.close()
 print("domains", doc["domains"], "not_after", doc["not_after"], "issuer", doc["issuer"])
 PY

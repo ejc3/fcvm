@@ -40,6 +40,9 @@ pub struct Plan {
     pub epoch_unix_ms: u64,
     /// Aggregator frame WebSockets, reachable from the coordinator.
     pub sources: Vec<String>,
+    /// A direct token each source is sent as its first message, when the aggregators hold
+    /// admission keys (never in the URL).
+    pub admit: Option<String>,
 }
 
 /// One encoded still.
@@ -158,10 +161,23 @@ impl StillEncoder {
 }
 
 /// The first decoded picture of one aggregator stream at or after scene time `at`.
-async fn grab(url: &str, codec: &dyn Codec, at: f64) -> Result<(Header, Picture)> {
+async fn grab(
+    url: &str,
+    admit: Option<&str>,
+    codec: &dyn Codec,
+    at: f64,
+) -> Result<(Header, Picture)> {
     let (mut ws, _) = tokio_tungstenite::connect_async(url)
         .await
         .with_context(|| format!("connecting to {url}"))?;
+    if let Some(token) = admit {
+        use futures_util::SinkExt;
+        ws.send(Message::Text(
+            crate::fleet::aggregate::admit_first_message(token).into(),
+        ))
+        .await
+        .with_context(|| format!("admitting to {url}"))?;
+    }
     let mut header: Option<Header> = None;
     let mut dec: Option<DecoderIo> = None;
     let mut want_key = true;
@@ -200,8 +216,14 @@ async fn grab(url: &str, codec: &dyn Codec, at: f64) -> Result<(Header, Picture)
 }
 
 /// Grab every source at `at` and place them in one picture of the whole image.
-pub async fn compose(sources: &[String], codec: &dyn Codec, at: f64) -> Result<Picture> {
-    let grabs = futures_util::future::join_all(sources.iter().map(|u| grab(u, codec, at))).await;
+pub async fn compose(
+    sources: &[String],
+    admit: Option<&str>,
+    codec: &dyn Codec,
+    at: f64,
+) -> Result<Picture> {
+    let grabs =
+        futures_util::future::join_all(sources.iter().map(|u| grab(u, admit, codec, at))).await;
     let mut parts = Vec::new();
     for (u, g) in sources.iter().zip(grabs) {
         match g {
@@ -264,7 +286,7 @@ pub async fn run(
         let budget = Duration::from_secs_f64((plan.hold_until_t - now_t).max(0.0) + 0.5);
         let started = now_ms();
         let r = tokio::time::timeout(budget, async {
-            let pic = compose(&plan.sources, codec.as_ref(), at).await?;
+            let pic = compose(&plan.sources, plan.admit.as_deref(), codec.as_ref(), at).await?;
             let (content_type, bytes) = encoder.encode(&pic).await?;
             anyhow::Ok((pic, content_type, bytes))
         })

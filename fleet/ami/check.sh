@@ -150,6 +150,63 @@ enable=$(grep -E '^ *systemctl enable ' fleet/ami/tile/build.sh)
 grep -qw 'fcvm-fleet-nginx.service' <<<"$enable" || no "tile/build.sh does not enable fcvm-fleet-nginx.service"
 grep -qE '(^| )nginx\.service' <<<"$enable" && no "tile/build.sh enables the distribution's nginx.service, which waits for network-online.target"
 
+# The tile's scene token (fleet/PROTOCOL.md, "Access"): fetch-cert.py writes the secret's
+# scene_token to its own directory, mode 0600, and fails on a secret without one; the
+# renderer's unit mounts that directory, not the key's, and names the file.
+ct=$(mktemp -d)
+mkdir -p "$ct/boto3"
+cat > "$ct/boto3/__init__.py" <<'PY'
+import json, os
+class _C:
+    def get_secret_value(self, SecretId):
+        return {"SecretString": os.environ["FAKE_SECRET"]}
+def client(*a, **k):
+    return _C()
+PY
+run_fetch() { FAKE_SECRET=$1 PYTHONPATH="$ct" FLEET_TLS_DIR="$ct/tls" FLEET_SCENE_DIR="$ct/scene" python3 -I -c 'import runpy, sys; sys.path.insert(0, sys.argv[1]); runpy.run_path(sys.argv[2], run_name="__main__")' "$ct" fleet/ami/tile/fetch-cert.py 2>/dev/null; }
+run_fetch '{"cert":"C","key":"K","scene_token":"s-1"}' && [ "$(cat "$ct/scene/token" 2>/dev/null)" = s-1 ] &&
+  [ "$(stat -c %a "$ct/scene/token")" = 600 ] && [ "$(cat "$ct/tls/key.pem")" = K ] ||
+  no "fetch-cert.py does not write the scene token beside the certificate"
+rm -rf "$ct/scene"
+run_fetch '{"cert":"C","key":"K"}' && no "fetch-cert.py succeeds on a secret without a scene token"
+rm -rf "$ct"
+unit=fleet/ami/tile/fcvm-fleet-renderer.service
+grep -q -- '-v /etc/fcvm-fleet/scene:/run/fleet-scene:ro -e SCENE_TOKEN_FILE=/run/fleet-scene/token' "$unit" ||
+  no "the renderer unit does not give the renderer its scene token"
+grep -q '/etc/fcvm-fleet/tls' <<<"$(grep '^ExecStart=' "$unit")" && no "the renderer unit mounts the certificate's key"
+
+# issue-cert.sh keeps the secret's scene token, and stores nothing when it cannot read the
+# secret (a certificate without the token would leave every renderer refusing scenes). Fakes
+# of aws and lego on PATH; openssl makes the certificate lego would.
+ic=$(mktemp -d)
+mkdir -p "$ic/bin"
+cat > "$ic/bin/lego" <<'SH'
+#!/bin/bash
+while [ $# -gt 0 ]; do [ "$1" = --path ] && p=$2; shift; done
+mkdir -p "$p/certificates"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 -subj /CN=example.test \
+  -addext "subjectAltName=DNS:*.example.test,DNS:example.test" \
+  -keyout "$p/certificates/_.example.test.key" -out "$p/certificates/_.example.test.crt" 2>/dev/null
+SH
+cat > "$ic/bin/aws" <<'SH'
+#!/bin/bash
+case "$*" in
+  *cloudflare-dns-token*) echo token ;;
+  *get-secret-value*) case "$FAKE_READ" in ok) echo '{"cert":"old","key":"old","scene_token":"s-keep"}' ;; missing) echo "An error occurred (ResourceNotFoundException)" >&2; exit 254 ;; *) echo "An error occurred (AccessDeniedException)" >&2; exit 254 ;; esac ;;
+  *put-secret-value*) for a in "$@"; do case "$a" in file://*) cp "${a#file://}" "$FAKE_OUT" ;; esac; done; echo v-1 ;;
+esac
+SH
+chmod +x "$ic/bin/lego" "$ic/bin/aws"
+issue() { FAKE_READ=$1 FAKE_OUT="$ic/stored.json" PATH="$ic/bin:$PATH" ZONE=example.test bash fleet/tools/issue-cert.sh >/dev/null 2>&1; }
+issue ok && [ "$(jq -r .scene_token "$ic/stored.json" 2>/dev/null)" = s-keep ] ||
+  no "issue-cert.sh does not keep the secret's scene token"
+rm -f "$ic/stored.json"
+issue denied && no "issue-cert.sh stores a certificate when it cannot read the secret"
+[ -e "$ic/stored.json" ] && no "issue-cert.sh stored a certificate without reading the secret"
+issue missing && [ "$(jq -r 'has("scene_token")' "$ic/stored.json" 2>/dev/null)" = false ] ||
+  no "issue-cert.sh does not store a first certificate"
+rm -rf "$ic"
+
 # store-pack.py packs the store into parts and store.sh restores them all at once, each
 # part decompressed and extracted while the others are (one zstd stream decompresses on one
 # core), then the directories, then the staging copy. Both ways (staged and direct) the

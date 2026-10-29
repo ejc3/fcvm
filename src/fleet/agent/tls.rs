@@ -7,7 +7,11 @@
 //! renamed into place; the renderer checks the file every 2 s and loads a new version for
 //! the connections that follow, so a renewal reaches every renderer without a restart. The
 //! key is never logged.
+//!
+//! The file also carries the secret's `scene_token` (fleet/PROTOCOL.md, "Access"), which the
+//! renderer requires on `POST /scene` and `/budget`, and which the agent sends with its own.
 
+use crate::fleet::coord::scene_token::SceneToken;
 use crate::fleet::coord::secrets::Secrets;
 use anyhow::{Context, Result};
 use std::io::Write;
@@ -48,8 +52,13 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Fetch the secret and write the file when it differs from what is there. Returns
-/// whether it changed.
-pub async fn refresh(secrets: &Secrets, secret: &str, dir: &Path) -> Result<bool> {
+/// whether it changed. The secret's scene token goes into the file and into `token`.
+pub async fn refresh(
+    secrets: &Secrets,
+    secret: &str,
+    dir: &Path,
+    token: &SceneToken,
+) -> Result<bool> {
     let v: serde_json::Value = serde_json::from_str(&secrets.get(secret).await?)
         .with_context(|| format!("secret {secret} is not JSON"))?;
     let field = |k: &str| {
@@ -58,8 +67,15 @@ pub async fn refresh(secrets: &Secrets, secret: &str, dir: &Path) -> Result<bool
             .map(str::to_string)
             .with_context(|| format!("secret {secret} has no {k}"))
     };
-    let body =
-        serde_json::to_vec(&serde_json::json!({"cert": field("cert")?, "key": field("key")?}))?;
+    let mut doc = serde_json::json!({"cert": field("cert")?, "key": field("key")?});
+    let scene = v
+        .get("scene_token")
+        .and_then(|x| x.as_str())
+        .filter(|t| !t.is_empty());
+    if let Some(t) = scene {
+        doc["scene_token"] = t.into();
+    }
+    let body = serde_json::to_vec(&doc)?;
     std::fs::create_dir_all(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     let path = dir.join(FILE);
@@ -67,13 +83,17 @@ pub async fn refresh(secrets: &Secrets, secret: &str, dir: &Path) -> Result<bool
     if changed {
         write_private(&path, &body)?;
     }
+    // Only once the file holds it, so the agent never sends a token its renderers lack.
+    if scene.is_some() {
+        token.set(scene.map(str::to_string));
+    }
     Ok(changed)
 }
 
 /// Keep the files current, hourly.
-pub async fn run(secrets: Secrets, secret: String, dir: std::path::PathBuf) {
+pub async fn run(secrets: Secrets, secret: String, dir: std::path::PathBuf, token: SceneToken) {
     loop {
-        match refresh(&secrets, &secret, &dir).await {
+        match refresh(&secrets, &secret, &dir, &token).await {
             Ok(true) => tracing::info!(dir = %dir.display(), "renderer certificate updated"),
             Ok(false) => {}
             Err(e) => {

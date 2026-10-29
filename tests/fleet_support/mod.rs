@@ -100,17 +100,43 @@ async fn health(State(r): State<Renderer>) -> Result<Json<serde_json::Value>, St
     Ok(Json(h))
 }
 
-async fn scene(State(r): State<Renderer>, Json(body): Json<serde_json::Value>) -> StatusCode {
+/// Like a fleet renderer with a scene token: with `port-<port>.token` beside the marker, a
+/// scene or budget post needs `Authorization: Bearer <its contents>`.
+fn authorized(r: &Renderer, headers: &axum::http::HeaderMap) -> bool {
+    let Ok(token) = std::fs::read_to_string(r.marker.with_extension("token")) else {
+        return true;
+    };
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        == Some(format!("Bearer {}", token.trim()).as_str())
+}
+
+async fn scene(
+    State(r): State<Renderer>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> StatusCode {
     if !r.marker.exists() {
         return StatusCode::SERVICE_UNAVAILABLE;
+    }
+    if !authorized(&r, &headers) {
+        return StatusCode::UNAUTHORIZED;
     }
     r.scenes.lock().unwrap().push(body);
     StatusCode::OK
 }
 
-async fn budget(State(r): State<Renderer>, Json(body): Json<serde_json::Value>) -> StatusCode {
+async fn budget(
+    State(r): State<Renderer>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> StatusCode {
     if !r.marker.exists() {
         return StatusCode::SERVICE_UNAVAILABLE;
+    }
+    if !authorized(&r, &headers) {
+        return StatusCode::UNAUTHORIZED;
     }
     r.budgets.lock().unwrap().push(body);
     StatusCode::OK

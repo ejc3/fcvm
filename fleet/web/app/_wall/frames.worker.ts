@@ -30,6 +30,7 @@ import {
   parseFrame,
   parseStreamHeader,
   reconnectDelayMs,
+  admitMessage,
   sameStreamAtAnyHeight,
   releaseBefore,
   SAME_T_EPS,
@@ -98,11 +99,15 @@ class TileStream {
   /** When each recent frame arrived, was decoded and was first drawn in step (core/lag.ts). */
   readonly log = new FrameLog();
 
-  constructor(id: string, baseUrl: string, url: string, height: number) {
+  /** The direct token the next socket sends first (the newest the page was given). */
+  admit: string | null;
+
+  constructor(id: string, baseUrl: string, url: string, height: number, admit: string | null) {
     this.id = id;
     this.baseUrl = baseUrl;
     this.url = url;
     this.height = height;
+    this.admit = admit;
     this.ctl = newStream(height);
     this.open();
   }
@@ -123,6 +128,8 @@ class TileStream {
     this.ctl = { ...newStream(this.height), wanted: this.height };
     ws.onopen = () => {
       if (this.ws !== ws) return;
+      // The token first: a renderer that needs one reads it before anything else.
+      if (this.admit !== null) ws.send(admitMessage(this.admit));
       this.ctl = streamOpened(this.ctl, true);
       this.syncHeight();
     };
@@ -144,10 +151,12 @@ class TileStream {
     ws.onerror = () => {};
   }
 
-  setHeight(height: number, url: string): void {
+  setHeight(height: number, url: string, admit: string | null): void {
     const reopen = !sameStreamAtAnyHeight(this.url, url);
     this.height = height;
     this.url = url;
+    // A renewed token is for the next socket; the open one was admitted when it opened.
+    this.admit = admit;
     if (reopen) {
       this.reopen();
       return;
@@ -431,8 +440,8 @@ function syncStreams(): void {
   for (const [key, src] of wanted) {
     if (src.url === null || src.baseUrl === null) continue;
     const st = streams.get(key);
-    if (!st) streams.set(key, new TileStream(src.id, src.baseUrl, src.url, src.height));
-    else st.setHeight(src.height, src.url);
+    if (!st) streams.set(key, new TileStream(src.id, src.baseUrl, src.url, src.height, src.admit));
+    else st.setHeight(src.height, src.url, src.admit);
   }
   for (const [key, st] of streams) {
     const w = wanted.get(key);

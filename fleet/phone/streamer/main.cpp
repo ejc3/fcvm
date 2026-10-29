@@ -1,8 +1,9 @@
 // phone-streamer: serves a phone's screen as the renderer's frame stream (PROTOCOL.md,
 // "Phone streamer"). Environment: PORT (8080), FPS (30), EMU_GRPC (the emulator's gRPC
 // controller, 127.0.0.1:8554), PHONE_GO_FILE (stream nothing until it exists),
-// PHONE_APP_PORT (7070, the app's control socket on this container's loopback), TLS_CERT_FILE
-// and TLS_PORT (443) as for the renderer.
+// PHONE_APP_PORT (7070, the app's control socket on this container's loopback), TLS_CERT_FILE,
+// TLS_PORT (443) and SCENE_TOKEN_FILE as for the renderer (its PROTOCOL.md "Access": with a
+// token file, scene posts need the token and streams wait for the first scene).
 //
 //   phone-streamer [serve]          serve
 //   phone-streamer fail <message>   serve /health only, reporting the phone failed with
@@ -41,7 +42,10 @@ int main(int argc, char** argv) {
   TlsFront tls;
   // The plain listener, and the TLS one when a certificate is configured: a source that failed
   // to start serves its /health on both, as a running one does.
+  SceneToken scene_token;
+  scene_token.configure_from_env();
   auto listen = [&](Server& s) {
+    if (scene_token.configured()) s.set_scene_token(&scene_token);
     if (!s.listen(port, &err)) {
       fprintf(stderr, "phone-streamer: %s\n", err.c_str());
       return false;

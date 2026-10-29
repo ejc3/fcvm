@@ -526,6 +526,8 @@ export class MockCoordinator {
       } else if (m["type"] === "visibility") {
         client.visible = m["visible"] === true;
         this.markDirty();
+      } else if (m["type"] === "seat") {
+        // The mock seats every page; the ticket is not checked.
       } else if (m["type"] === "verify") {
         const ok = this.sitekey === null || m["token"] === "mock-pass";
         if (ok) client.verified = true;

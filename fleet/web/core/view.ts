@@ -1047,6 +1047,8 @@ export interface DrawSource {
   height: number;
   /** Where it is drawn, or null: keep streaming, do not draw. */
   box: Box | null;
+  /** The direct token its socket sends first (net.ts `admitMessage`), or null: none. */
+  admit: string | null;
 }
 
 /** What the drawer adds to the mosaic while a VM is opened. */
@@ -1622,7 +1624,7 @@ export function wallView(input: WallInput): WallView {
     const base = streamUrl(t, family)!;
     // Zoomed, the opened VM is drawn on its own over the mosaic (plan.zoom.source), so its entry here keeps streaming undrawn.
     const box = own ? null : zoom ? (zoomed?.id === t.id ? null : zoomBox(t.id)) : placedPlan.get(t.id)?.box ?? null;
-    return { id: `d:${t.id}`, url: frameSocketUrl(base, height, q, admit), baseUrl: base, height, box };
+    return { id: `d:${t.id}`, url: frameSocketUrl(base, height, q), baseUrl: base, height, box, admit };
   });
   // Aggregated: each region is one big tile; it asks for the height it covers on the wall. Only the
   // aggregates with a URL in this viewer's family stream.
@@ -1634,13 +1636,13 @@ export function wallView(input: WallInput): WallView {
       const base = streamUrl(g, family)!;
       const zb = zoom ? rectOnScreen(zoom.layout.image, g.rect, input.dpr) : null;
       const drawn = own ? null : zoom ? (zb && zArea && boxesMeet(zb, zArea) ? zb : null) : box;
-      return { id: `a:${g.id}`, url: frameSocketUrl(base, height, "std", admit), baseUrl: base, height, box: drawn };
+      return { id: `a:${g.id}`, url: frameSocketUrl(base, height, "std"), baseUrl: base, height, box: drawn, admit };
     });
   let focusSource: DrawSource | null = null;
   const claimUrl = s.own.claim ? streamUrl(s.own.claim, family) : null;
   if (own && own.placed && s.own.claim && claimUrl) {
     const c = s.own.claim;
-    focusSource = { id: `o:${c.id}`, url: frameSocketUrl(claimUrl, own.placed.streamHeight, "std", admit), baseUrl: claimUrl, height: own.placed.streamHeight, box: own.placed.box };
+    focusSource = { id: `o:${c.id}`, url: frameSocketUrl(claimUrl, own.placed.streamHeight, "std"), baseUrl: claimUrl, height: own.placed.streamHeight, box: own.placed.box, admit };
   }
   let zoomDraw: ZoomDraw | null = null;
   if (zoom) {

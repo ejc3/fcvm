@@ -4,6 +4,8 @@
 #include <math.h>
 #include <string.h>
 
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -27,7 +29,25 @@ PhoneScene parsed(const std::string& body) {
 }
 }  // namespace
 
+// A source file next to this one, whole ("" when unreadable, which fails the checks).
+static std::string source_text(const std::string& name) {
+  std::string me = __FILE__;
+  std::ifstream f(me.substr(0, me.find_last_of('/') + 1) + name);
+  std::stringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
+}
+
 int main() {
+  // A phone's streams are public like a renderer's: its server checks the scene token and
+  // waits for the first scene when one is configured (renderer PROTOCOL.md, "Access").
+  {
+    std::string m = source_text("main.cpp");
+    size_t conf = m.find("scene_token.configure_from_env();"), set = m.find("s.set_scene_token(&scene_token)");
+    size_t listen = m.find("s.listen(port, &err)");
+    CHECK(conf != std::string::npos && set != std::string::npos && listen != std::string::npos && conf < set && set < listen,
+          "the phone streamer configures the scene token before it listens");
+  }
   const int W = 720, H = 1280;
   {  // the app's stamp reads back, on a portrait and a landscape surface
     for (int rot = 0; rot < 2; rot++) {

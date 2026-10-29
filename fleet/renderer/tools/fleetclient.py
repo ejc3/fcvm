@@ -126,8 +126,12 @@ def frames(host, port, h, count=None, until_t=None, timeout=30.0, q=None):
 
 
 def post_scene(host, port, scene, timeout=10.0, tls=None):
+    headers = {"Content-Type": "application/json"}
+    # A fleet renderer takes a scene only with its scene token (fleet/PROTOCOL.md, "Access").
+    if os.environ.get("SCENE_TOKEN"):
+        headers["Authorization"] = "Bearer " + os.environ["SCENE_TOKEN"]
     req = urllib.request.Request(url(host, port, "/scene", tls), data=json.dumps(scene).encode(),
-                                 headers={"Content-Type": "application/json"}, method="POST")
+                                 headers=headers, method="POST")
     with urlopen(req, timeout, tls) as r:
         return json.loads(r.read())
 
