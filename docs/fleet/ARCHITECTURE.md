@@ -824,6 +824,14 @@ Built as above, with what the measurement left out:
   on Skia GL here (`debug.hwui.renderer=skiagl`), and the phone has none.
 - **Snapshots while released.** The emulator's own snapshot save and load refuse with an
   error naming `gpu retake`.
+- **A retake without Vulkan stays released.** The new frame buffer creates a Vulkan instance,
+  and when that fails gfxstream carries on without Vulkan. The saved render threads still
+  hold Vulkan thread state, and loading them aborted the emulator ("VkDecoderGlobalState not
+  initialized"). That is how the static TLS exhaustion below ended a phone; any other reason
+  for `vkCreateInstance` to fail would end it the same way. A retake whose frame buffer has no
+  Vulkan when the released one had it now tears it down, stays released with the saved state,
+  and says so (ejc3/gfxstream#6); `make phone-test` checks it by moving the ICD manifest away
+  for one retake.
 
 On the phone above, in its VM: `gpu release` takes 400 to 590 ms and leaves the emulator
 with 0 of its 80 `/dev/nvidia*` descriptors, 0 of its 291 mappings and none of the NVIDIA,
