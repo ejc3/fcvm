@@ -9,6 +9,14 @@
 //! coordinator says a stored state holds it (`quarantine_stored`): a coordinator that
 //! crashed before writing it would otherwise assign the GPU again. Reconnects back off from
 //! 1 s to 30 s.
+//!
+//! No step may wait on the network without a deadline: a flow that stops delivering (the
+//! staging hosts' path to the Cloudflare edge, 2026-10-29) would otherwise hold the host
+//! with no VM for minutes. Each resolved address gets `connect_timeout` for its TCP
+//! connection, the TLS and WebSocket handshake gets `handshake_timeout`, and a connection
+//! from which nothing arrives for `silence` (the agent pings every third of it, and the
+//! coordinator answers every ping) is dropped and dialed again: the new connection's hello
+//! gets the host its assignment again.
 
 use super::{serve, Agent};
 use anyhow::{Context, Result};
@@ -27,6 +35,29 @@ pub struct DialCfg {
     pub headers: Vec<(String, String)>,
     pub backoff_min: Duration,
     pub backoff_max: Duration,
+    /// For each resolved address's TCP connection.
+    pub connect_timeout: Duration,
+    /// For the TLS and WebSocket handshake on a connected address.
+    pub handshake_timeout: Duration,
+    /// A connection that delivers nothing for this long is dropped and dialed again.
+    pub silence: Duration,
+}
+
+impl DialCfg {
+    /// The deadlines the agent runs with: a TCP connection to the Cloudflare edge is
+    /// established in milliseconds (one SYN retransmit fits in 3 s), and a ping every 5 s
+    /// answered in under a second leaves 15 s of silence for a dead flow.
+    pub fn new(url: String, headers: Vec<(String, String)>) -> DialCfg {
+        DialCfg {
+            url,
+            headers,
+            backoff_min: Duration::from_secs(1),
+            backoff_max: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(3),
+            handshake_timeout: Duration::from_secs(10),
+            silence: Duration::from_secs(15),
+        }
+    }
 }
 
 /// What a new connection is told first: the hello, then the latest state messages.
@@ -112,7 +143,7 @@ impl Replay {
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn connect(cfg: &DialCfg) -> Result<Ws> {
+fn request(cfg: &DialCfg) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
     let mut req = cfg.url.as_str().into_client_request()?;
     for (k, v) in &cfg.headers {
         req.headers_mut().insert(
@@ -120,10 +151,71 @@ async fn connect(cfg: &DialCfg) -> Result<Ws> {
             v.parse().context("a header value that is not ASCII")?,
         );
     }
-    let (ws, _) = tokio_tungstenite::connect_async(req)
+    Ok(req)
+}
+
+/// Resolve the URL's host and try each address in turn, each within the deadlines; the
+/// first that completes the handshake is the connection. `tokio_tungstenite::connect_async`
+/// tries the addresses with no deadline, so one that drops SYNs costs the kernel's 127 s.
+async fn connect(cfg: &DialCfg) -> Result<Ws> {
+    let req = request(cfg)?;
+    let uri = req.uri().clone();
+    let host = uri
+        .host()
+        .context("the coordinator URL names no host")?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("wss") {
+            443
+        } else {
+            80
+        });
+    let addrs: Vec<std::net::SocketAddr> = tokio::time::timeout(
+        cfg.handshake_timeout,
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await
+    .with_context(|| format!("resolving {host} took over {:?}", cfg.handshake_timeout))?
+    .with_context(|| format!("resolving {host}"))?
+    .collect();
+    let mut errors = Vec::new();
+    for addr in addrs {
+        let tcp =
+            match tokio::time::timeout(cfg.connect_timeout, tokio::net::TcpStream::connect(addr))
+                .await
+            {
+                Ok(Ok(tcp)) => tcp,
+                Ok(Err(e)) => {
+                    errors.push(format!("{addr}: {e}"));
+                    continue;
+                }
+                Err(_) => {
+                    errors.push(format!(
+                        "{addr}: no TCP connection in {:?}",
+                        cfg.connect_timeout
+                    ));
+                    continue;
+                }
+            };
+        let _ = tcp.set_nodelay(true);
+        match tokio::time::timeout(
+            cfg.handshake_timeout,
+            tokio_tungstenite::client_async_tls(request(cfg)?, tcp),
+        )
         .await
-        .with_context(|| format!("dialing {}", cfg.url))?;
-    Ok(ws)
+        {
+            Ok(Ok((ws, _))) => return Ok(ws),
+            Ok(Err(e)) => errors.push(format!("{addr}: {e}")),
+            Err(_) => errors.push(format!(
+                "{addr}: no WebSocket handshake in {:?}",
+                cfg.handshake_timeout
+            )),
+        }
+    }
+    anyhow::bail!("dialing {}: {}", cfg.url, errors.join("; "))
 }
 
 pub async fn run(agent: Agent, cfg: DialCfg) -> Result<()> {
@@ -181,6 +273,9 @@ pub async fn run(agent: Agent, cfg: DialCfg) -> Result<()> {
         let connected = Instant::now();
         let (mut sink, mut stream) = ws.split();
         let mut ok = true;
+        let mut heard = Instant::now();
+        let mut ping = tokio::time::interval(cfg.silence / 3);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         for l in replay.lines() {
             if sink.send(Message::Text(l.into())).await.is_err() {
                 ok = false;
@@ -189,8 +284,17 @@ pub async fn run(agent: Agent, cfg: DialCfg) -> Result<()> {
         }
         while ok {
             tokio::select! {
+                _ = ping.tick() => {
+                    if heard.elapsed() >= cfg.silence {
+                        tracing::warn!(silent = ?heard.elapsed(), "the coordinator sent nothing; dialing again");
+                        ok = false;
+                    } else if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        ok = false;
+                    }
+                }
                 m = stream.next() => match m {
                     Some(Ok(Message::Text(t))) => {
+                        heard = Instant::now();
                         replay.coordinator_frame(t.as_str());
                         let mut line = t.as_bytes().to_vec();
                         line.push(b'\n');
@@ -199,7 +303,8 @@ pub async fn run(agent: Agent, cfg: DialCfg) -> Result<()> {
                         }
                     }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => ok = false,
-                    _ => {}
+                    // A pong, or the coordinator's own ping: the flow delivers.
+                    Some(Ok(_)) => heard = Instant::now(),
                 },
                 l = lines.recv() => match l {
                     Some(l) => {

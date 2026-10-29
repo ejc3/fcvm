@@ -660,6 +660,42 @@ async fn pings_get_the_server_clock_and_garbage_gets_an_error() {
     assert!(a.other.iter().any(|m| m["type"] == "error"));
 }
 
+/// The agent drops a connection that delivers nothing for 15 s and pings it every 5 s, so
+/// the coordinator's agent socket must answer a ping while it has nothing else to send.
+#[tokio::test]
+async fn the_agent_socket_answers_pings() {
+    let c = coordinator_with(Opts::default()).await;
+    let url = c.url.replace("/live", "/agent");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let hello = AgentMsg::Hello {
+        host: "gpu-a".into(),
+        arch: "x86_64".into(),
+        gpus: vec![],
+        capacity: 0,
+        store_ready_at: None,
+        boot: Default::default(),
+        phones: vec![],
+    };
+    ws.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
+        .await
+        .unwrap();
+    ws.send(Message::Ping(b"are you there".to_vec().into()))
+        .await
+        .unwrap();
+    let pong = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Pong(p))) => return p,
+                Some(Ok(_)) => continue,
+                other => panic!("the agent socket ended: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("a pong within 5 s");
+    assert_eq!(&pong[..], b"are you there");
+}
+
 /// The coordinator's side of an agent connection, with the test playing the agent.
 struct FakeAgent {
     to_coord: tokio::sync::mpsc::UnboundedSender<AgentMsg>,

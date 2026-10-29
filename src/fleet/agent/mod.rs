@@ -356,12 +356,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
     }
     dial::run(
         agent,
-        dial::DialCfg {
-            url,
-            headers,
-            backoff_min: Duration::from_secs(1),
-            backoff_max: Duration::from_secs(30),
-        },
+        dial::DialCfg::new(url, headers),
     )
     .await
 }

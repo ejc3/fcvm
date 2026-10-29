@@ -1454,10 +1454,12 @@ async fn a_dialing_agent_reconnects_and_replays_its_state_without_restarting_vms
     let task = tokio::spawn(dial(
         agent,
         DialCfg {
-            url,
-            headers: vec![("CF-Access-Client-Id".into(), "id-for-tests".into())],
             backoff_min: Duration::from_millis(50),
             backoff_max: Duration::from_millis(200),
+            ..DialCfg::new(
+                url,
+                vec![("CF-Access-Client-Id".into(), "id-for-tests".into())],
+            )
         },
     ));
     let seen_header = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -2227,4 +2229,118 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
         ]
     );
     c.close().await;
+}
+
+fn dial_agent(f: &Fake) -> Agent {
+    Agent {
+        host: "gpu-host".into(),
+        gpus: gpus(1),
+        phones: vec![],
+        capacity: 1,
+        base_port: f.base,
+        cfg: cfg(&f.fcvm),
+        spot_notice_url: None,
+        spot_poll: Duration::from_millis(50),
+        aggregate: None,
+        store_ready_file: None,
+        boot: Default::default(),
+    }
+}
+
+fn quick_dial(url: String) -> fcvm::fleet::agent::dial::DialCfg {
+    fcvm::fleet::agent::dial::DialCfg {
+        backoff_min: Duration::from_millis(50),
+        backoff_max: Duration::from_millis(200),
+        connect_timeout: Duration::from_millis(300),
+        handshake_timeout: Duration::from_millis(300),
+        silence: Duration::from_millis(600),
+        ..fcvm::fleet::agent::dial::DialCfg::new(url, vec![])
+    }
+}
+
+/// A connection that stops delivering after the hello (staging 2026-10-29 16:22:56: the
+/// hello reached the coordinator, its assignment reached the agent 231 s later, and the
+/// host ran no VM meanwhile) is dropped once it has been silent for `silence`, and the
+/// agent dials again: the new connection's hello gets it its assignment again.
+#[tokio::test]
+async fn a_coordinator_connection_that_goes_silent_is_dialed_again() {
+    let f = fake(1, &[]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/agent", listener.local_addr().unwrap());
+    let task = tokio::spawn(fcvm::fleet::agent::dial::run(
+        dial_agent(&f),
+        quick_dial(url),
+    ));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let mut first = accept_agent(&listener, &seen).await;
+    assert!(matches!(
+        next_agent_msg(&mut first).await,
+        AgentMsg::Hello { .. }
+    ));
+    // `first` is held and never read again: the agent's pings get no pong.
+    let t0 = std::time::Instant::now();
+    let mut second = tokio::time::timeout(Duration::from_secs(5), accept_agent(&listener, &seen))
+        .await
+        .expect("the agent dials again after the connection went silent");
+    assert!(
+        t0.elapsed() >= Duration::from_millis(500),
+        "dropped before it was silent for `silence`: {:?}",
+        t0.elapsed()
+    );
+    assert!(matches!(
+        next_agent_msg(&mut second).await,
+        AgentMsg::Hello { .. }
+    ));
+    drop(first);
+    task.abort();
+}
+
+/// A coordinator that answers pings keeps the connection: silence is measured from the
+/// last frame, a pong included.
+#[tokio::test]
+async fn a_coordinator_connection_that_answers_pings_is_kept() {
+    use futures_util::StreamExt;
+    let f = fake(1, &[]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/agent", listener.local_addr().unwrap());
+    let task = tokio::spawn(fcvm::fleet::agent::dial::run(
+        dial_agent(&f),
+        quick_dial(url),
+    ));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let mut ws = accept_agent(&listener, &seen).await;
+    // Reading answers each ping (tungstenite replies on the next read).
+    let reader = tokio::spawn(async move { while let Some(Ok(_)) = ws.next().await {} });
+    let again = tokio::time::timeout(Duration::from_secs(3), listener.accept()).await;
+    assert!(
+        again.is_err(),
+        "the agent dialed again while its pings were answered"
+    );
+    task.abort();
+    reader.abort();
+}
+
+/// A dial whose TCP connection is accepted but whose handshake never gets an answer is
+/// given up after `handshake_timeout`, and dialed again. `connect_async` had no deadline:
+/// staging's 15:16 host spent 254 s (two 127 s SYN timeouts) before its hello.
+#[tokio::test]
+async fn a_dial_whose_handshake_gets_no_answer_is_tried_again() {
+    let f = fake(1, &[]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/agent", listener.local_addr().unwrap());
+    let task = tokio::spawn(fcvm::fleet::agent::dial::run(
+        dial_agent(&f),
+        quick_dial(url),
+    ));
+    let (mute, _) = listener.accept().await.unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let mut ws = tokio::time::timeout(Duration::from_secs(5), accept_agent(&listener, &seen))
+        .await
+        .expect("the agent gave up on the mute connection and dialed again");
+    assert!(matches!(
+        next_agent_msg(&mut ws).await,
+        AgentMsg::Hello { .. }
+    ));
+    drop(mute);
+    task.abort();
 }
