@@ -316,6 +316,8 @@ export function phonesPlan(inp: PhonesPlanInput): DrawPlan {
   const { state: s, phones, layout, dpr } = inp;
   const boxOf = new Map(layout.phones.map((p) => [p.id, p.box]));
   const family = s.net.family;
+  // phone streams take the direct seat's token as the wall's do (the streamer checks it)
+  const admit = s.admission?.direct?.value ?? null;
   let bps = 0;
   const direct: DrawSource[] = [];
   for (const t of phones.tiles) {
@@ -324,7 +326,7 @@ export function phonesPlan(inp: PhonesPlanInput): DrawPlan {
     if (box === null || base === null || !isLive(t)) continue;
     const height = streamHeightFor(box.h * dpr, box.w / box.h);
     bps += streamBitrate(t.rect, phones.image_aspect, height);
-    direct.push({ id: `d:${t.id}`, url: frameSocketUrl(base, height), baseUrl: base, height, box });
+    direct.push({ id: `d:${t.id}`, url: frameSocketUrl(base, height, "std", admit), baseUrl: base, height, box });
   }
   const tiles: DrawTile[] = phones.tiles.map((t) => ({
     id: t.id,

@@ -264,6 +264,17 @@ describe("the draw plan", () => {
     expect(plan.tiles.map((x) => [x.id, x.dark])).toEqual([["phone:1", false], ["phone:2", true], ["phone:3", false]]);
   });
 
+  it("opens each phone stream with the direct seat's admission token, as the wall does", () => {
+    const st = stateWith(phonesOf(2));
+    const admitted = {
+      ...st,
+      admission: { seat: "ticket-1", locked: false, reason: null, direct: { value: "v1.9999999999.v-1.mac", expires_at: 9_999_999_999_000 }, broadcast: null, seat_free: false, capacity: 500 },
+    } as ClientState;
+    const plan = phonesView(input(admitted)).plan;
+    expect(plan.direct).toHaveLength(2);
+    for (const d of plan.direct) expect(new URL(d.url!).searchParams.get("admit")).toBe("v1.9999999999.v-1.mac");
+  });
+
   it("waits for the address family, as the wall does", () => {
     let s = reduce(initialState(), { type: "socket", status: "open", at: EPOCH });
     s = reduce(s, { type: "message", text: snapshotText(1, { ...fleet(), phones: phonesOf(2) }), at: EPOCH });
