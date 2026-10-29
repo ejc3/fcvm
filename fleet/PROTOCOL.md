@@ -2142,13 +2142,16 @@ the clone's GPU.
   the token and the token names the scene's `mirror_viewer`, and is closed with 1008 otherwise
   (no keys, nobody holds the phone, another viewer's token, an expired one). It relays the
   emulator's command-stream tap (gfxstream `host/mirror_tap.h`, on the container's Unix
-  socket `MIRROR_SOCKET`, `/tmp/gfxstream-mirror.sock`): every render channel's guest-to-host
-  bytes and the first 4096 bytes of every reply, as the tap's records, in binary messages of one raw
-  deflate stream (each message ends at a `Z_SYNC_FLUSH`, so `DecompressionStream("deflate-raw")`
-  gives back every byte so far). The page never answers; the phone's GPU answers every call.
-  It closes with 1000 when the scene names another holder or none, 1011 when the tap cannot
-  be reached or ends, and 1013 when the viewer falls 8 MiB behind ("join again") or a mirror
-  is already open (the tap has one consumer).
+  socket `MIRROR_SOCKET`, `/tmp/gfxstream-mirror.sock`), started with a join (`J`): the
+  phone's state at the start as `JOIN` records (every color buffer's pixels, then the color
+  buffer posted last), then every render channel's guest-to-host bytes and the first 4096 bytes
+  of every reply, as the tap's records, in binary messages of one raw deflate stream (each
+  message ends at a `Z_SYNC_FLUSH`, so `DecompressionStream("deflate-raw")` gives back every
+  byte so far). The `JOIN` records travel in messages of their own. The page never answers;
+  the phone's GPU answers every call. It closes with 1000 when the scene names another holder
+  or none, 1011 when the tap cannot be reached or ends or the join's messages pass 256 MiB
+  queued, and 1013 when the viewer falls 8 MiB behind on the live records ("join again") or a
+  mirror is already open (the tap has one consumer).
 - `POST /budget`: accepted when well formed and ignored (the wall's budget controller posts
   every tile; a phone draws at its display's rate).
 - `GET /still`: the screen as last copied, JPEG.

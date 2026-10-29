@@ -7,6 +7,11 @@
 //
 // The fixture is e2e/fixtures/mirror/<name>: tap.gz (the tap stream) and shot-*.png;
 // MIRROR_FIXTURE names another directory.
+//
+// The second test joins a phone that has been running since boot, on its home screen: the
+// stream starts with the join snapshot (JOIN records: every color buffer's pixels and the
+// screen posted last), and the mirror's first frame, drawn from it before any live record, is
+// compared with the phone's screenshot. Fixture e2e/fixtures/mirror/home (MIRROR_JOIN_FIXTURE).
 
 import { readdirSync, readFileSync } from "node:fs";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -20,6 +25,7 @@ import type { ReplayResult } from "./mirror/replay-entry.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const fixture = process.env.MIRROR_FIXTURE ?? join(here, "fixtures/mirror/robotpark");
+const joinFixture = process.env.MIRROR_JOIN_FIXTURE ?? join(here, "fixtures/mirror/home");
 
 /**
  * The bar a mirror frame clears against the T4's frame of the same stamp. Two GPUs rasterize
@@ -90,4 +96,39 @@ test("a captured Robot Park stream replayed on WebGL2 matches the phone's own fr
     expect(m.over16, `frame ${m.k}: share of pixels more than 16 levels off`).toBeLessThanOrEqual(MAX_OVER16);
     expect(m.psnr, `frame ${m.k}: PSNR`).toBeGreaterThanOrEqual(MIN_PSNR);
   }
+});
+
+test("a stream that joins a running phone draws the phone's screen from the join snapshot at once", async ({ page }) => {
+  const tap = gunzipSync(readFileSync(join(joinFixture, "tap.gz")));
+  await page.route("http://mirror.test/**", (route) => {
+    const name = new URL(route.request().url()).pathname.slice(1);
+    const body = name === "tap" ? tap : readFileSync(join(joinFixture, name));
+    return route.fulfill({ body, contentType: name === "tap" ? "application/octet-stream" : "image/png" });
+  });
+  await page.route("http://mirror.test/", (route) => route.fulfill({ body: "<!doctype html><canvas id=c width=720 height=1280></canvas>", contentType: "text/html" }));
+  await page.goto("http://mirror.test/");
+  await page.addScriptTag({ content: bundle });
+  const r = await page.evaluate(async () => {
+    const img = new Image();
+    img.src = "http://mirror.test/shot-0.png";
+    await img.decode();
+    const c = document.createElement("canvas");
+    c.width = img.width;
+    c.height = img.height;
+    const g = c.getContext("2d")!;
+    g.drawImage(img, 0, 0);
+    const px = g.getImageData(0, 0, c.width, c.height).data;
+    const tapBytes = new Uint8Array(await (await fetch("http://mirror.test/tap")).arrayBuffer());
+    const t0 = performance.now();
+    const out = window.mirrorReplay.replayJoin(document.getElementById("c") as HTMLCanvasElement, tapBytes, { k: 0, w: c.width, h: c.height, px });
+    return { ...out, replayMs: Math.round(performance.now() - t0) };
+  });
+  console.log(JSON.stringify(r));
+  expect(r.failed, "no call failed in WebGL2").toEqual({});
+  expect(r.join?.ok, "the stream began with a whole join snapshot").toBe(true);
+  expect(r.join?.colorBuffers).toBeGreaterThan(0);
+  expect(r.firstFromJoin, "the first frame was drawn from the snapshot, before any live record").toBe(true);
+  expect(r.match, "a first frame of the screenshot's size").not.toBeNull();
+  expect(r.match!.over16, "share of pixels more than 16 levels off").toBeLessThanOrEqual(MAX_OVER16);
+  expect(r.match!.psnr, "PSNR").toBeGreaterThanOrEqual(MIN_PSNR);
 });
