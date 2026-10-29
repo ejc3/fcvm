@@ -12,6 +12,7 @@ import {
   parseServerMsg,
   ProtocolError,
   receiptApplied,
+  type Admission,
   type CameraKey,
   type Claim,
   type FleetState,
@@ -217,6 +218,8 @@ export interface ClientState {
   /** Recent GPU readings per tile, oldest first. */
   gpuHistory: Record<string, GpuSample[]>;
   shownLayout: ShownLayout | null;
+  /** How this connection receives the image, from the coordinator's admission message. */
+  admission: Admission | null;
   ui: UiState;
 }
 
@@ -283,6 +286,7 @@ export function initialState(): ClientState {
     net: { family: null, probeMs: null, via: null },
     gpuHistory: {},
     shownLayout: null,
+    admission: null,
     ui: {
       mode: "aggregated",
       shownMode: "aggregated",
@@ -452,6 +456,10 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
             own,
             turnstile: { ...s.turnstile, sitekey: msg.turnstile, verified: false, verifying: false, error: null },
           };
+        }
+        case "admission": {
+          const { type: _type, ...admission } = msg;
+          return { ...s, admission };
         }
         case "verified":
           return {

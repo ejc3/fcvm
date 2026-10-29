@@ -249,6 +249,13 @@ pub struct FleetCoordArgs {
     #[arg(long, requires = "broadcast_listen")]
     pub broadcast_file: Option<std::path::PathBuf>,
 
+    /// With a broadcast, how many viewers hold a seat (direct or aggregated streams); a
+    /// viewer that connects while every seat is held watches the broadcast only. 500 is the
+    /// measured capacity of the wall as deployed (fleet/renderer/README.md, "Viewers per
+    /// renderer"). Without a broadcast every viewer is seated.
+    #[arg(long, env = "FLEET_DIRECT_CAPACITY", default_value_t = 500)]
+    pub direct_capacity: usize,
+
     /// Extra argument for the broadcast aggregator, after its defaults
     /// (fleet/PROTOCOL.md, "Broadcast"). Repeatable.
     #[arg(long = "broadcast-arg", allow_hyphen_values = true)]

@@ -417,6 +417,36 @@ export interface ClaimMsg {
   claim: Claim;
 }
 
+/** A credential and when it stops working (unix ms). */
+export interface Token {
+  value: string;
+  expires_at: number;
+}
+
+/**
+ * How this connection receives the image (PROTOCOL.md, "admission"): a seat (direct streams,
+ * and the broadcast if the viewer switches) or, for a viewer that came when every seat was
+ * held, the broadcast alone.
+ */
+export interface Admission {
+  /** The seat ticket, to present as /live?seat= after a reconnect; null when late. */
+  seat: string | null;
+  /** The broadcast is forced on. */
+  locked: boolean;
+  reason: string | null;
+  /** The token every frame URL carries as admit=; null when late. */
+  direct: Token | null;
+  /** The broadcast's playback URL; null when the fleet runs none. */
+  broadcast: Token | null;
+  /** A late viewer: a new connection would get a seat now. */
+  seat_free: boolean;
+  capacity: number | null;
+}
+
+export interface AdmissionMsg extends Admission {
+  type: "admission";
+}
+
 export interface ReceiptMsg {
   type: "receipt";
   id: string;
@@ -437,7 +467,7 @@ export interface ErrorMsg {
   reason: string;
 }
 
-export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg | HelloMsg | VerifiedMsg | ClaimMsg;
+export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg | HelloMsg | VerifiedMsg | ClaimMsg | AdmissionMsg;
 
 export const DEFAULT_IMAGE_ASPECT = 16 / 9;
 
@@ -813,6 +843,31 @@ function parseClaim(v: Obj): Claim {
   };
 }
 
+function parseToken(v: Obj, key: string, w: string): Token | null {
+  const t = v[key];
+  if (t === null || t === undefined) return null;
+  if (!isObj(t)) throw new ProtocolError(`${w}.${key} is not an object`);
+  return { value: str(t, "value", `${w}.${key}`), expires_at: num(t, "expires_at", `${w}.${key}`) };
+}
+
+function parseAdmission(v: Obj): AdmissionMsg {
+  const w = "admission";
+  const capacity = v["capacity"];
+  if (capacity !== null && capacity !== undefined && !(typeof capacity === "number" && Number.isFinite(capacity))) {
+    throw new ProtocolError("admission.capacity is not a number");
+  }
+  return {
+    type: "admission",
+    seat: strOrNull(v, "seat", w),
+    locked: v["locked"] === true,
+    reason: strOrNull(v, "reason", w),
+    direct: parseToken(v, "direct", w),
+    broadcast: parseToken(v, "broadcast", w),
+    seat_free: v["seat_free"] === true,
+    capacity: typeof capacity === "number" ? capacity : null,
+  };
+}
+
 /** Parse one text message from /live. Throws ProtocolError on anything malformed. */
 export function parseServerMsg(text: string): ServerMsg {
   let v: unknown;
@@ -831,6 +886,8 @@ export function parseServerMsg(text: string): ServerMsg {
       return { type: "verified", ok: v["ok"] === true, reason: strOrNull(v, "reason", "verified") };
     case "claim":
       return { type: "claim", claim: parseClaim(obj(v, "claim", "claim")) };
+    case "admission":
+      return parseAdmission(v);
     case "receipt": {
       const r: ReceiptMsg = {
         type: "receipt",

@@ -67,6 +67,39 @@ pub enum ServerMsg {
     Claim { claim: ClaimMsg },
     /// A message the coordinator could not read; nothing was applied.
     Error { reason: String },
+    /// How this connection receives the image (docs/fleet/ARCHITECTURE.md, "Broadcast
+    /// mode"): after the hello, again with fresh tokens before they expire, and to a late
+    /// viewer whenever a seat frees or fills.
+    Admission(Admission),
+}
+
+/// A connection's admission: a seat (direct streams, and the broadcast if the viewer
+/// switches to it) or the broadcast alone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Admission {
+    /// The seat ticket, to present again as `/live?seat=<ticket>` after a reconnect; null
+    /// for a late viewer.
+    pub seat: Option<String>,
+    /// The broadcast is forced on: every seat was held when this connection arrived.
+    pub locked: bool,
+    /// Why it is locked, for the page to show beside the disabled toggle.
+    pub reason: Option<String>,
+    /// The direct token every frame URL carries as `admit=`; null for a late viewer.
+    pub direct: Option<Token>,
+    /// The broadcast's playback URL (with its token); null when the fleet runs no broadcast.
+    pub broadcast: Option<Token>,
+    /// For a late viewer: a new connection would get a seat now (the page offers a reload).
+    pub seat_free: bool,
+    /// Seats in all; null when every viewer is seated.
+    pub capacity: Option<usize>,
+}
+
+/// A credential and when it stops working (unix ms).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Token {
+    /// The token itself, or for the broadcast the playback URL that carries it.
+    pub value: String,
+    pub expires_at: u64,
 }
 
 /// A viewer's own GPU as its viewer sees it.

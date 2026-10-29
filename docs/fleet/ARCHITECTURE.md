@@ -482,13 +482,13 @@ GPU", per-tile stats and the stream choice; the broadcast toggle is the only str
 ### Staging access
 
 The channel is private (authorization required): IVS refuses a playback request without a
-token signed by the channel's playback key pair. The coordinator holds the private key (in the
-broadcast secret) and gives each `/live` connection a playback URL with a token in its
-admission message: an ES384 JWT with `aws:channel-arn`, `aws:access-control-allow-origin` set
-to the page's origin, and a 1-hour expiry, refreshed every 30 minutes. On staging `/live` is
-reached only through Cloudflare Access, so only Access-authenticated viewers ever get a
-token; the playback URL alone returns 403. A public launch keeps the tokens, with `/live`
-open.
+token signed by the channel's playback key pair. The coordinator holds the private key (in
+the broadcast secret) and gives each `/live` connection a playback URL with a token in its
+admission message: an ES384 JWT with `aws:channel-arn`, `aws:access-control-allow-origin`
+set to the page's origin, and a 1-hour expiry, renewed with the direct token every 5
+minutes. On staging `/live` is reached only through Cloudflare Access, so only
+Access-authenticated viewers ever get a token; the playback URL alone returns 403. A public
+launch keeps the tokens, with `/live` open.
 
 ### Failure behavior
 

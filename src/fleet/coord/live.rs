@@ -10,6 +10,7 @@
 //! else the peer address), which the per-client limits are keyed by. With a Turnstile
 //! secret configured, a connection's intents are refused until it has passed `verify`.
 
+use super::admission::{Admitted, Gate};
 use super::poster::Poster;
 use super::text_check::{check_text, TextChecker};
 use super::turnstile::Verifier;
@@ -17,7 +18,7 @@ use super::Handle;
 use crate::fleet::now_ms;
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, Query, State, WebSocketUpgrade};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -47,6 +48,8 @@ pub struct LiveConfig {
     /// Key clients by `CF-Connecting-IP` (only behind Cloudflare, which sets it).
     pub trust_cf_connecting_ip: bool,
     pub poster: Arc<Poster>,
+    /// Who gets direct streams and who the broadcast, and their tokens.
+    pub gate: Arc<Gate>,
 }
 
 #[derive(Clone)]
@@ -170,6 +173,7 @@ async fn live(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
     State(app): State<App>,
 ) -> Response {
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
@@ -179,8 +183,12 @@ async fn live(
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
     let client = client_address(&headers, peer, app.cfg.trust_cf_connecting_ip);
+    let page = Page {
+        seat: query.get("seat").cloned(),
+        origin: origin.map(|o| o.trim_end_matches('/').to_string()),
+    };
     ws.max_message_size(MAX_CLIENT_MESSAGE)
-        .on_upgrade(move |socket| viewer(socket, app, client))
+        .on_upgrade(move |socket| viewer(socket, app, client, page))
         .into_response()
 }
 
@@ -217,7 +225,18 @@ fn unrecorded_refusal(id: String, reason: &str) -> ServerMsg {
     }
 }
 
-async fn viewer(socket: WebSocket, app: App, client: String) {
+/// What the page said about itself when it connected.
+struct Page {
+    /// The seat ticket it kept from an earlier connection.
+    seat: Option<String>,
+    /// Its origin, which a playback token is bound to.
+    origin: Option<String>,
+}
+
+/// Why a late viewer's `claim_gpu` is refused: a private GPU is a direct stream too.
+pub const LATE_CLAIM: &str = "direct streams are full, so this page watches the broadcast";
+
+async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
     let viewer = format!("v-{}", app.next_viewer.fetch_add(1, Ordering::Relaxed));
     app.handle
         .send(Event::ViewerJoined {
@@ -252,7 +271,70 @@ async fn viewer(socket: WebSocket, app: App, client: String) {
             .await;
         return;
     }
+    // Then how it receives the image. A seat is held from here until the connection ends.
+    let gate = app.cfg.gate.clone();
+    let admitted = gate
+        .seats
+        .admit(page.seat.as_deref(), std::time::Instant::now());
+    let late = admitted == Admitted::Late;
+    let admission = gate.message(
+        &admitted,
+        &viewer,
+        page.origin.as_deref(),
+        now_ms(),
+        std::time::Instant::now(),
+    );
+    let release = |gate: &Gate| {
+        if let Admitted::Seat { ticket } = &admitted {
+            gate.seats.release(ticket, std::time::Instant::now());
+        }
+    };
+    if sink
+        .send(Message::Text(
+            text(&ServerMsg::Admission(admission.clone())).into(),
+        ))
+        .await
+        .is_err()
+    {
+        release(&gate);
+        app.handle
+            .send(Event::ViewerLeft {
+                at: 0,
+                viewer: viewer.clone(),
+            })
+            .await;
+        return;
+    }
     let (direct, mut direct_rx) = mpsc::channel::<ServerMsg>(DIRECT_QUEUE);
+    // Fresh tokens before the old ones expire, and a late viewer told when a seat frees.
+    let renew = {
+        let gate = gate.clone();
+        let admitted = admitted.clone();
+        let viewer = viewer.clone();
+        let origin = page.origin.clone();
+        let direct = direct.clone();
+        tokio::spawn(async move {
+            let mut last = admission;
+            let mut sent_at = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(gate.tick).await;
+                let now = std::time::Instant::now();
+                let free_changed = late && gate.seats.free(now) != last.seat_free;
+                if !free_changed && now.duration_since(sent_at) < super::admission::DIRECT_REFRESH {
+                    continue;
+                }
+                last = gate.message(&admitted, &viewer, origin.as_deref(), now_ms(), now);
+                sent_at = now;
+                if direct
+                    .send(ServerMsg::Admission(last.clone()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+    };
     let mut snapshots = app.handle.snapshot.clone();
     let writer = tokio::spawn(async move {
         let mut sent: Option<u64> = None;
@@ -345,6 +427,8 @@ async fn viewer(socket: WebSocket, app: App, client: String) {
                     })
                 } else if !verified.load(Ordering::SeqCst) {
                     Some(unrecorded_refusal(id, "verify first"))
+                } else if late && name == "claim_gpu" {
+                    Some(unrecorded_refusal(id, LATE_CLAIM))
                 } else if name == "word" {
                     let app = app.clone();
                     let viewer = viewer.clone();
@@ -393,7 +477,9 @@ async fn viewer(socket: WebSocket, app: App, client: String) {
     for t in tasks {
         t.abort();
     }
+    renew.abort();
     writer.abort();
+    release(&gate);
     app.handle
         .send(Event::ViewerLeft {
             at: 0,

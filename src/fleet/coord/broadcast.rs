@@ -46,9 +46,37 @@ pub const WHOLE: Rect = Rect {
 pub struct BroadcastSecret {
     /// `rtmps://<ingest endpoint>:443/app/<stream key>`.
     pub ingest_url: String,
+    /// The channel's playback URL (`https://<...>.m3u8`).
+    #[serde(default)]
+    pub playback_url: Option<String>,
+    /// A private channel's ARN and its playback key pair's private key (PKCS#8 PEM, P-384):
+    /// every viewer's playback URL is then signed. Without them the URL is given as it is.
+    #[serde(default)]
+    pub channel_arn: Option<String>,
+    #[serde(default)]
+    pub playback_key_pem: Option<String>,
 }
 
 impl BroadcastSecret {
+    /// How viewers play it: signed when the secret has the channel's key, open otherwise.
+    pub fn playback(&self) -> Result<Option<super::admission::Playback>> {
+        use super::admission::{Playback, PlaybackSigner};
+        let Some(url) = &self.playback_url else {
+            return Ok(None);
+        };
+        Ok(Some(match (&self.channel_arn, &self.playback_key_pem) {
+            (Some(arn), Some(pem)) => Playback::Signed(Box::new(PlaybackSigner::new(
+                arn.clone(),
+                url.clone(),
+                pem,
+            )?)),
+            (None, None) => Playback::Open(url.clone()),
+            _ => anyhow::bail!(
+                "the broadcast secret needs both channel_arn and playback_key_pem, or neither"
+            ),
+        }))
+    }
+
     pub fn parse(json: &str) -> Result<Self> {
         let s: BroadcastSecret =
             serde_json::from_str(json).context("the broadcast secret is not the expected JSON")?;
