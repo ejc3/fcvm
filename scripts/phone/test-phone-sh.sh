@@ -147,7 +147,7 @@ with open(sys.argv[2], "a") as log:
 ctl=$!
 for _ in $(seq 1 50); do (exec 3<> "/dev/tcp/127.0.0.1/$port") 2> /dev/null && break; sleep 0.1; done
 act() { PHONE_CTL_PORT=$port PHONE_RUN="$dir" "$phone" action "$1" > /dev/null 2> "$dir/act.err"; }
-for a in switch_screen switch_screen rotate dark_mode dark_mode dance wave gpu_benchmark restart_app; do
+for a in switch_screen switch_screen rotate dark_mode dark_mode dance wave gpu_benchmark restart_app dark_mode restart_app dark_mode; do
   act "$a" || bad "action $a failed: $(cat "$dir/act.err")"
 done
 want='{"type":"action","name":"info"}
@@ -158,11 +158,14 @@ want='{"type":"action","name":"info"}
 {"type":"action","name":"dance"}
 {"type":"action","name":"wave"}
 {"type":"action","name":"benchmark"}
-{"type":"action","name":"restart"}'
+{"type":"action","name":"restart"}
+{"type":"action","name":"dark"}
+{"type":"action","name":"restart"}
+{"type":"action","name":"dark"}'
 [ "$(cat "$dir/ctl.log")" = "$want" ] && ok "each action sends its one request to the app" || bad "the app was sent: $(cat "$dir/ctl.log")"
 for a in reboot_phone shell "rotate; id" ""; do
   if act "$a"; then bad "action '$a' was accepted"; else rc=$?; [ "$rc" = 2 ] && ok "action '$a' is refused" || bad "action '$a' exited $rc"; fi
 done
-[ "$(wc -l < "$dir/ctl.log")" = 9 ] && ok "a refused action sends the app nothing" || bad "a refused action reached the app"
+[ "$(wc -l < "$dir/ctl.log")" = 12 ] && ok "a refused action sends the app nothing" || bad "a refused action reached the app"
 kill "$ctl" 2> /dev/null || true
 exit $fail

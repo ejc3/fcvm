@@ -234,7 +234,8 @@ action)
   dark_mode) app_action "$(toggle night light dark)" ;;
   dance|wave) app_action "$2" ;;
   gpu_benchmark) app_action benchmark ;;
-  restart_app) app_action restart; rm -f "$RUN/screen" ;;
+  # a restarted app shows its scene in its own light or dark again
+  restart_app) app_action restart; rm -f "$RUN/screen" "$RUN/night" ;;
   *)
     echo "phone.sh: unknown action '${2:-}'" >&2
     exit 2
