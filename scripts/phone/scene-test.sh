@@ -9,7 +9,9 @@
 #   3. surface loss: the app keeps drawing after its surface is destroyed and created again
 #      (home, then back), and after its EGL context is torn down and built again (the
 #      EGL_CONTEXT_LOST path), and the rebuilt context draws the same pixels as before;
-#   4. the fixed actions, by socket and by intent, and nothing else: an unknown action is refused.
+#   4. the fixed actions, by socket and by intent, and nothing else: an unknown action is refused;
+#   5. a GPU release and retake (the GPU hook, what a warm snapshot runs) keeps the app drawing:
+#      the retake restores its GL state, every vertex array's index buffer included.
 # Screenshots and the stitched seam images go to OUT/shots and OUT/seam.
 #
 #   scene-test.sh FCVM PID APK_IN_CONTAINER OUT GPU_NAME
@@ -167,5 +169,16 @@ if [ -n "$s" ] && [ "$(field .uptime_ms "$s")" -lt "$u0" ] && [ "$n" -ge 60 ]; t
   ok "action restart: a new process drew $n frames in 2 s"
 else
   bad "action restart: $n frames in 2 s after it; status $s"
+fi
+
+# 5. The retake restores the app's GL state through the emulator's snapshot path; the app
+# draws from several vertex arrays, each with its own index buffer.
+if r=$(X /usr/local/bin/gpu-hook release 2>&1) && r=$(X /usr/local/bin/gpu-hook retake 2>&1); then
+  sleep 2
+  n=$(drawn)
+  [ "${n:-0}" -ge 60 ] && ok "after a GPU release and retake it drew $n frames in 2 s" \
+    || bad "after a GPU release and retake it drew ${n:-no} frames in 2 s: $(X sh -c 'tail -3 /tmp/emulator.log' 2>&1)"
+else
+  bad "the GPU hook failed: $r"
 fi
 exit $fail
