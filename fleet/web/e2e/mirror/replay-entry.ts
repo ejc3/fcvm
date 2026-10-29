@@ -141,11 +141,10 @@ export function replay(canvas: HTMLCanvasElement, tap: Uint8Array, refs: Ref[]):
   };
   const rr = new RecordReader();
   for (const rec of rr.push(tap)) {
-    if (m.skipDraws && anchor) {
-      const next = pendingKs()[0];
-      if (next === undefined) break;
-      if (dueUs(next) - rec.timeUs < 200_000) m.skipDraws = false;
-    }
+    const next = pendingKs()[0];
+    // every screenshot compared or given up: the rest of the stream draws nothing compared
+    if (next === undefined) break;
+    if (m.skipDraws && anchor && dueUs(next) - rec.timeUs < 200_000) m.skipDraws = false;
     m.feed(rec);
   }
   return {
