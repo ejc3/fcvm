@@ -126,9 +126,19 @@ fn request_token(version: &str) -> String {
 /// restarting the coordinator and relaunching the tiles and hosts (fleet/PROTOCOL.md,
 /// "Access").
 pub async fn keep(secrets: Secrets, secret: String, token: SceneToken) {
+    keep_every(secrets, secret, token, std::time::Duration::from_secs(3600)).await
+}
+
+/// [`keep`] at another interval (tests).
+pub async fn keep_every(
+    secrets: Secrets,
+    secret: String,
+    token: SceneToken,
+    every: std::time::Duration,
+) {
     let Some(held) = token.get() else { return };
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        tokio::time::sleep(every).await;
         match ensure_with(&secrets, &secret, Some(&held)).await {
             Ok(t) if t == held => {}
             Ok(_) => tracing::warn!(

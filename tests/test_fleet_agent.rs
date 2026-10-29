@@ -1706,6 +1706,68 @@ async fn two_coordinators_adding_a_scene_token_at_once_agree() {
     );
 }
 
+/// The coordinator keeps its scene token: a secret version that lost the token gets it back,
+/// and a different token in the secret is not taken up (running tiles read theirs once, at
+/// boot, so switching would cut them off).
+#[tokio::test]
+async fn the_coordinator_keeps_its_scene_token() {
+    use fcvm::fleet::coord::scene_token::{self, SceneToken};
+    use fcvm::fleet::coord::secrets::Secrets;
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let stored = std::sync::Arc::new(std::sync::Mutex::new(
+        serde_json::json!({"cert": "C", "key": "K"}).to_string(),
+    ));
+    let s2 = stored.clone();
+    let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap, body: String| {
+        let s2 = s2.clone();
+        async move {
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            match headers["x-amz-target"].to_str().unwrap() {
+                "secretsmanager.GetSecretValue" => axum::Json(
+                    serde_json::json!({"SecretString": s2.lock().unwrap().clone(), "VersionId": "v"}),
+                ),
+                "secretsmanager.PutSecretValue" => {
+                    *s2.lock().unwrap() = v["SecretString"].as_str().unwrap().to_string();
+                    axum::Json(serde_json::json!({"VersionId": v["ClientRequestToken"]}))
+                }
+                other => panic!("unexpected call {other}"),
+            }
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let held = SceneToken::new(Some("held-1".into()));
+    tokio::spawn(scene_token::keep_every(
+        Secrets::with_endpoint("us-east-2", &base).unwrap(),
+        "fcvm-fleet/tls-wildcard".into(),
+        held.clone(),
+        std::time::Duration::from_millis(20),
+    ));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while scene_token::from_secret(&stored.lock().unwrap()).as_deref() != Some("held-1") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the token was not put back"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    *stored.lock().unwrap() =
+        serde_json::json!({"cert": "C", "key": "K", "scene_token": "rotated"}).to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        held.get().as_deref(),
+        Some("held-1"),
+        "switched to a rotated token"
+    );
+    assert_eq!(
+        scene_token::from_secret(&stored.lock().unwrap()).as_deref(),
+        Some("rotated"),
+        "overwrote a token in the secret"
+    );
+}
+
 /// The renderers' certificate in the renderer's TLS interface: `tls.json` with `cert` and
 /// `key` from the secret (mode 0600), left alone while the secret is unchanged, replaced by
 /// a new file after a renewal; each VM gets the directory read-only, `TLS_CERT_FILE` and
