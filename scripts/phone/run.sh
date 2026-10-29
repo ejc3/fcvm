@@ -34,8 +34,8 @@
 # kvm_intel loaded with nested=1, the system image, adb and probe app from
 # scripts/phone/aosp.sh, the emulator from scripts/phone/emulator.sh and Robot Park from
 # scripts/phone/app.sh.
-set -euo pipefail
 SRC=$(cd "$(dirname "$0")/../.." && pwd)
+. "$SRC/scripts/phone/checks.sh"
 IMAGE=localhost/fcvm-phone:$(make -s -C "$SRC/fleet/phone" image-id)
 if [ "${1:-}" = --image ]; then echo "$IMAGE"; exit 0; fi
 GPU=${1:?usage: run.sh <gpu pci address> <second gpu pci address>}
@@ -56,9 +56,6 @@ TAG=phone-test-$$-warm
 LOGS=$(mktemp -d)
 mkdir -p "$LOGS/out"
 make -s -C "$SRC/fleet/phone" image IMAGE="$IMAGE" > "$LOGS/build.log" 2>&1 || { cat "$LOGS/build.log"; exit 1; }
-fail=0
-ok() { echo "ok   $*"; }
-bad() { echo "FAIL $*"; fail=1; }
 runner=""
 clone=""
 snapshot_dir=""
@@ -102,14 +99,8 @@ gpu_name=$(X /usr/bin/nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | h
 rc=0; probe=$(timeout 30 "$F" exec --pid "$pid" -- /usr/local/bin/kvmprobe 2>&1) || rc=$?
 [ "$probe" = "kvm ok" ] && ok "KVM runs a VM inside the restored phone VM" || bad "KVM in the restored VM: exit $rc, '${probe}'"
 
-# The lowest of the app's fps samples over the next 4 seconds on VM $1 ("" when it logged none).
-lowest_fps() {
-  "$F" exec --pid "$1" -- /usr/local/bin/phone.sh draws 4 2>&1 | grep -o 'fps=[0-9.]*' | cut -d= -f2 | sort -n | head -1
-}
-at_least_30() { python3 -c 'import sys; sys.exit(0 if sys.argv[1] and float(sys.argv[1]) >= 30 else 1)' "${1:-}"; }
-
 in_place_release_and_retake() {
-  local out holds fps
+  local out holds
   if out=$(X /usr/local/bin/gpu-hook release 2>&1); then
     holds=$(X /usr/local/bin/phone.sh holds 2>&1 || true)
     [ "$holds" = "fds=0 mappings=0" ] && ok "the running phone released the GPU ($(grep -o 'released_ms=[0-9]*' <<< "$out")): $holds" \
@@ -122,13 +113,11 @@ in_place_release_and_retake() {
   else
     bad "the phone did not retake the GPU: $out"
   fi
-  fps=$(lowest_fps "$pid")
-  at_least_30 "$fps" && ok "the app draws after the retake: lowest fps sample $fps" \
-    || bad "the app does not draw 30 fps after the retake: lowest '${fps:-none}'"
+  check_draws "$pid" "after the retake"
 }
 
 warm_snapshot_onto_the_second_gpu() {
-  local source_uuid fps cpid click ack first clone_uuid holds renderer
+  local source_uuid cpid click ack first clone_uuid holds renderer
   source_uuid=$(X /usr/bin/nvidia-smi --query-gpu=uuid --format=csv,noheader 2>&1 | head -1)
   local started=$(date +%s%3N)
   if ! "$F" snapshot create --pid "$pid" --tag "$TAG" --gpu-warm > "$LOGS/snapshot.log" 2>&1; then
@@ -137,9 +126,7 @@ warm_snapshot_onto_the_second_gpu() {
   fi
   snapshot_dir=$(grep -a -o -E "/[^ \",]*/snapshots/$TAG" "$LOGS/snapshot.log" | head -1)
   ok "a warm snapshot of the running phone in $(( $(date +%s%3N) - started )) ms"
-  fps=$(lowest_fps "$pid")
-  at_least_30 "$fps" && ok "the source phone draws after the snapshot: lowest fps sample $fps" \
-    || bad "the source phone does not draw 30 fps after the snapshot: lowest '${fps:-none}'"
+  check_draws "$pid" "on the source phone after the snapshot"
   click=$(date +%s%3N)
   "$F" snapshot run --snapshot "$TAG" --gpu "$GPU2" --name "$NAME-clone" > "$LOGS/clone.log" 2>&1 < /dev/null &
   clone=$!
@@ -168,9 +155,7 @@ warm_snapshot_onto_the_second_gpu() {
   [[ "$holds" =~ ^fds=[1-9] ]] && ok "the clone's emulator holds its GPU: $holds" || bad "the clone's emulator does not hold its GPU: $holds"
   renderer=$("$F" exec --pid "$cpid" -- /usr/local/bin/phone.sh renderer 2>&1 || true)
   [[ "$renderer" == *"$gpu_name"* ]] && ok "the clone's SurfaceFlinger: $renderer" || bad "the clone's SurfaceFlinger does not render on '$gpu_name': $renderer"
-  fps=$(lowest_fps "$cpid")
-  at_least_30 "$fps" && ok "the app draws on the clone's GPU: lowest fps sample $fps" \
-    || bad "the app does not draw 30 fps on the clone's GPU: lowest '${fps:-none}'"
+  check_draws "$cpid" "on the clone's GPU"
   "$F" exec --pid "$cpid" -- /usr/local/bin/phone.sh stop > /dev/null 2>&1 || true
 }
 
