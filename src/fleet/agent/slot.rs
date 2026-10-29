@@ -10,7 +10,8 @@
 use super::inventory::{holders, vfio_node};
 use super::vm::{wait_restored, Vm, VmSpec};
 use fleet_core::protocol::{
-    boot_id, AgentMsg, BudgetBody, HealthReport, RendererScene, SharedScene, SlotReport,
+    boot_id, AgentMsg, AssignPhone, BudgetBody, HealthReport, RendererScene, SharedScene,
+    SlotReport,
 };
 use fleet_core::scene::Keyframe;
 use fleet_core::tiling::Rect;
@@ -56,6 +57,8 @@ pub struct AgentCfg {
     pub scrub_timeout: Duration,
     /// Consecutive failed relaunches after which a GPU is quarantined.
     pub quarantine_after: u32,
+    /// Phones mode: what a phone slot runs (`None`: this host runs no phones).
+    pub phone: Option<super::vm::PhoneCfg>,
     /// The bearer token of its scene and budget posts (fleet/PROTOCOL.md, "Access"), from the
     /// certificate secret its renderers read it from too.
     pub scene_token: crate::fleet::coord::scene_token::SceneToken,
@@ -101,6 +104,9 @@ pub struct Desired {
     pub layout_generation: u64,
     pub rect_from_frame: i64,
     pub previous_rect: Option<Rect>,
+    /// A phone: its rectangle of the phones' image is `rect`, and the take-over actions to
+    /// carry out come with it.
+    pub phone: Option<AssignPhone>,
 }
 
 /// The whole image, which a private session draws.
@@ -136,6 +142,8 @@ struct Running {
     /// The renderer's `boot_id` in the last `/health` read. A different one means the
     /// renderer restarted inside the VM and lost its scene.
     boot: Option<String>,
+    /// A phone: the last take-over action carried out (its `seq`).
+    actions_done: u64,
 }
 
 enum Failure {
@@ -285,18 +293,39 @@ impl SlotCtx {
 /// read just before the scene was posted? A reply with `ready: false` has not. A renderer
 /// without a frame counter has drawn once its reply carries a scene time `t`.
 pub fn has_frame(health: &serde_json::Value, baseline: Option<u64>) -> bool {
+    has_frame_of(health, baseline, false)
+}
+
+/// `has_frame` for a renderer or, with `phone`, a phone streamer, whose frames are the app's
+/// stamped scene (`phone.scene_frames`) and, while the phones are zoomed out or the phone is
+/// taken over, its screen with the app's bars (`phone.screen_frames`). Either is the app: the
+/// streamer sends nothing until the app renders on the VM's GPU, so a boot screen is never one.
+pub fn has_frame_of(health: &serde_json::Value, baseline: Option<u64>, phone: bool) -> bool {
     if health.get("ready").and_then(|r| r.as_bool()) == Some(false) {
         return false;
     }
-    match (health.get("frame").and_then(|f| f.as_u64()), baseline) {
+    match (frame_counter_of(health, phone), baseline) {
         (Some(f), Some(b)) => f > b,
         (Some(_), None) => false,
         (None, _) => health.get("t").is_some_and(|t| t.is_number()),
     }
 }
 
-fn frame_counter(health: &serde_json::Value) -> Option<u64> {
-    health.get("frame").and_then(|f| f.as_u64())
+fn frame_counter_of(health: &serde_json::Value, phone: bool) -> Option<u64> {
+    if phone {
+        let scene = health
+            .pointer("/phone/scene_frames")
+            .and_then(|f| f.as_u64());
+        let screen = health
+            .pointer("/phone/screen_frames")
+            .and_then(|f| f.as_u64());
+        match (scene, screen) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+        }
+    } else {
+        health.get("frame").and_then(|f| f.as_u64())
+    }
 }
 
 /// The body to post for what the slot should draw, marking the scene read: its tile of
@@ -307,6 +336,14 @@ fn renderer_body(
 ) -> Option<RendererScene> {
     let s = scene.borrow_and_update();
     let s = s.as_ref()?;
+    // A phone draws its rectangle of the phones' image, on the wall's clock.
+    if let Some(p) = &want.phone {
+        return want.rect.map(|r| RendererScene {
+            image_aspect: p.image_aspect,
+            chrome: p.chrome.clone(),
+            ..s.for_renderer(r)
+        });
+    }
     match &want.private_camera {
         Some(camera) => Some(RendererScene {
             camera: camera.clone(),
@@ -544,6 +581,9 @@ async fn post_if_changed(
     budget: &mut watch::Receiver<Option<BudgetBody>>,
 ) {
     let want = desired.borrow().clone();
+    if let Some(p) = &want.phone {
+        run_phone_actions(ctx, r, p).await;
+    }
     let body = renderer_body(scene, &want);
     if let Some(body) = body.filter(|b| Some(b) != r.posted.as_ref()) {
         match ctx.post_scene(&body).await {
@@ -556,7 +596,11 @@ async fn post_if_changed(
     }
     // The grid budget is for wall tiles; a renderer drawing the whole image (a claimed
     // GPU) chooses its own.
-    if r.posted.is_none() || want.rect.is_none() || want.private_camera.is_some() {
+    if r.posted.is_none()
+        || want.rect.is_none()
+        || want.private_camera.is_some()
+        || want.phone.is_some()
+    {
         return;
     }
     let Some(b) = *budget.borrow_and_update() else {
@@ -570,6 +614,42 @@ async fn post_if_changed(
         Err(e) => tracing::warn!(slot = %ctx.id, error = %e, "budget not posted"),
     }
 }
+
+/// Carry out the phone's take-over actions of this launch not yet carried out, oldest first,
+/// each once. A failed one is logged and not tried again.
+async fn run_phone_actions(ctx: &SlotCtx, r: &mut Running, p: &AssignPhone) {
+    for a in &p.actions {
+        if a.seq <= r.actions_done || a.generation != r.generation {
+            continue;
+        }
+        r.actions_done = a.seq;
+        let Some(argv) = super::vm::phone_action_argv(r.vm.pid, a.action) else {
+            continue;
+        };
+        let run = tokio::process::Command::new(&ctx.cfg.fcvm)
+            .args(&argv)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(PHONE_ACTION_TIMEOUT, run).await {
+            Ok(Ok(o)) if o.status.success() => {
+                tracing::info!(slot = %ctx.id, action = a.action.as_str(), seq = a.seq, "phone action done")
+            }
+            Ok(Ok(o)) => {
+                tracing::warn!(slot = %ctx.id, action = a.action.as_str(), status = %o.status, out = %tail(&o.stderr), "phone action failed")
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(slot = %ctx.id, action = a.action.as_str(), error = %e, "phone action did not start")
+            }
+            Err(_) => {
+                tracing::warn!(slot = %ctx.id, action = a.action.as_str(), "phone action timed out")
+            }
+        }
+    }
+}
+
+/// How long one take-over action may run in the phone (`restart_app` waits for the app).
+const PHONE_ACTION_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn ms(d: Duration) -> u64 {
     d.as_millis() as u64
@@ -621,17 +701,50 @@ async fn relaunch(
     timings.insert("teardown_ms".to_string(), ms(t0.elapsed()));
 
     ctx.report("restoring", generation, &timings, None, None);
-    let spec = VmSpec::for_slot(
-        ctx.cfg.fcvm.clone(),
-        ctx.vm_name(),
-        ctx.sbdf.clone(),
-        &ctx.cfg.publish_ip,
-        ctx.port,
-        ctx.tls_port,
-        ctx.cfg.ipv6_prefix.as_ref().zip(ctx.ipv6),
-        &ctx.cfg.extra_args,
-        ctx.cfg.image.clone(),
-    );
+    let phone = desired.borrow().phone.is_some();
+    let spec = match (&ctx.cfg.phone, phone) {
+        (Some(p), true) => match &p.snapshot {
+            Some(tag) => VmSpec::for_phone_clone(
+                ctx.cfg.fcvm.clone(),
+                ctx.vm_name(),
+                ctx.sbdf.clone(),
+                &ctx.cfg.publish_ip,
+                ctx.port,
+                ctx.tls_port,
+                ctx.cfg.ipv6_prefix.as_ref().zip(ctx.ipv6),
+                &ctx.cfg.extra_args,
+                tag,
+            ),
+            None => VmSpec::for_phone(
+                ctx.cfg.fcvm.clone(),
+                ctx.vm_name(),
+                ctx.sbdf.clone(),
+                &ctx.cfg.publish_ip,
+                ctx.port,
+                ctx.tls_port,
+                ctx.cfg.ipv6_prefix.as_ref().zip(ctx.ipv6),
+                &ctx.cfg.extra_args,
+                p,
+            ),
+        },
+        (None, true) => {
+            return Err(Failure::Failed {
+                error: "assigned a phone, but this agent runs none (--phones)".into(),
+                attach: false,
+            })
+        }
+        (_, false) => VmSpec::for_slot(
+            ctx.cfg.fcvm.clone(),
+            ctx.vm_name(),
+            ctx.sbdf.clone(),
+            &ctx.cfg.publish_ip,
+            ctx.port,
+            ctx.tls_port,
+            ctx.cfg.ipv6_prefix.as_ref().zip(ctx.ipv6),
+            &ctx.cfg.extra_args,
+            ctx.cfg.image.clone(),
+        ),
+    };
     let mut vm = Vm::spawn(&spec, &ctx.id).map_err(|e| Failure::Failed {
         error: format!("{e:#}"),
         attach: false,
@@ -699,16 +812,16 @@ async fn relaunch(
                     }
                     posted = Some(body);
                     // Frames counted from here were drawn with this scene.
-                    baseline = frame_counter(&h);
+                    baseline = frame_counter_of(&h, phone);
                     continue;
                 }
                 if baseline.is_none() {
-                    baseline = frame_counter(&h);
+                    baseline = frame_counter_of(&h, phone);
                     if baseline.is_some() {
                         continue;
                     }
                 }
-                if has_frame(&h, baseline) {
+                if has_frame_of(&h, baseline, phone) {
                     let startup = |k: &str| h.pointer(&format!("/startup_ms/{k}")).and_then(|v| v.as_f64()).filter(|v| *v >= 0.0);
                     if let Some(v) = startup("gpu_ready") {
                         timings.insert("renderer_gpu_ready_ms".into(), v as u64);
@@ -741,6 +854,7 @@ async fn relaunch(
         posted,
         budget_posted: None,
         boot,
+        actions_done: 0,
     });
     Ok(())
 }
@@ -800,6 +914,20 @@ mod tests {
         assert!(has_frame(&json!({"fps": 30, "t": 12.5}), None));
         assert!(!has_frame(&json!({"fps": 0, "t": null}), None));
         assert!(!has_frame(&json!({"fps": 0}), None));
+    }
+
+    #[test]
+    fn a_phone_zoomed_out_at_its_start_has_a_frame_from_its_screen() {
+        use serde_json::json;
+        // Zoomed out, the app shows its bars over the stamp: only screen frames move.
+        let h = json!({"ready": true, "t": 3.0, "frame": 90, "phone": {"scene_frames": 0, "screen_frames": 12}});
+        assert!(has_frame_of(&h, Some(0), true));
+        let h = json!({"ready": true, "phone": {"scene_frames": 4, "screen_frames": 0}});
+        assert!(has_frame_of(&h, Some(0), true));
+        let h = json!({"ready": true, "phone": {"scene_frames": 0, "screen_frames": 0}});
+        assert!(!has_frame_of(&h, Some(0), true));
+        let h = json!({"ready": false, "phone": {"scene_frames": 0, "screen_frames": 12}});
+        assert!(!has_frame_of(&h, Some(0), true));
     }
 
     #[test]

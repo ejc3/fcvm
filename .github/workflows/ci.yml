@@ -256,6 +256,13 @@ jobs:
             c69278340ab1d5559c7d7bf0edf615dc33ddbba7
           git -C "$hdr" checkout -q FETCH_HEAD
           make -C fleet/renderer test-host NVCH="$hdr/include"
+          # The phone streamer's host tests (stamp, colour conversion, geometry, frame
+          # selection, the app's requests, scene checks), with the renderer's code.
+          make -C fleet/phone/streamer test-host
+      - name: Phone container script tests (phone.sh serve, the GPU hook)
+        run: |
+          bash scripts/phone/test-phone-sh.sh
+          bash scripts/phone/test-gpu-hook.sh
 
   # Plans which self-hosted jobs this run needs.
   #

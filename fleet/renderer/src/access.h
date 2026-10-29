@@ -16,6 +16,9 @@ class SceneToken {
  public:
   // `json`: the file is the certificate JSON (field scene_token), else it holds the token.
   void configure(const std::string& path, bool json);
+  // From the environment: SCENE_TOKEN_FILE (the token), else TLS_CERT_FILE (the certificate
+  // JSON's scene_token); neither leaves it unconfigured.
+  void configure_from_env();
   // Whether this renderer runs for the fleet (a token file is named).
   bool configured() const { return !path_.empty(); }
   // The token now, read again whenever the file changed (a new inode, size or

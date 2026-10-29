@@ -26,6 +26,7 @@
 #include "proto.h"
 #include "render.h"
 #include "scene.h"
+#include "server.h"
 #include "subscriber.h"
 
 struct Options {
@@ -46,7 +47,7 @@ struct Options {
   double fit_scale = 1.0;
 };
 
-class Pipeline {
+class Pipeline : public FrameSource {
  public:
   explicit Pipeline(const Options& o);
   ~Pipeline();
@@ -55,30 +56,28 @@ class Pipeline {
   void run();  // the render thread; returns only on a fatal error
   void stop();
 
-  std::shared_ptr<Subscriber> subscribe(int h, int q);
-  void unsubscribe(const std::shared_ptr<Subscriber>& s);
-  void wake();
-  bool post_scene(const std::string& body, std::string* err);
+  std::shared_ptr<Subscriber> subscribe(int h, int q) override;
+  void unsubscribe(const std::shared_ptr<Subscriber>& s) override;
+  void wake() override;
+  bool post_scene(const std::string& body, std::string* err) override;
   // Whether a GET /frames with this direct token may stream (admit.h): always while no
   // scene has brought admission keys.
-  bool admits(const std::string& token);
-  // Whether a stream must show a direct token before it is served (a scene brought keys).
-  bool requires_admit();
-  // Whether any scene has been posted.
-  bool has_scene();
+  bool admits(const std::string& token) override;
+  bool requires_admit() override;
+  bool has_scene() override;
   // POST /budget: {"budget": B, "t": T}, B pixel-samples per frame from the
   // first slot at or after scene time T.
-  bool post_budget(const std::string& body, std::string* err);
+  bool post_budget(const std::string& body, std::string* err) override;
   // Debug: the unencoded tile of the frame at time t (a future frame slot), as
   // a binary PPM. Waits for that frame; false if this renderer skipped it.
-  bool raw_frame(double t, std::string* ppm, std::string* tile_json);
+  bool raw_frame(double t, std::string* ppm, std::string* tile_json) override;
   // The next frame drawn, unencoded (RGBA, w x h), for GET /still. While
   // nothing streams, the renderer then draws every slot as for a stream of
   // tile height `still_h` (the `h` of GET /frames) for STILL_HOLD_S, so a hold
   // converges between requests; the frame returned is drawn that way. While a stream runs, the frame is
   // the stream's.
-  bool next_frame(int still_h, std::vector<uint8_t>* rgba, int* w, int* h, std::string* tile_json);
-  std::string health_json();
+  bool next_frame(int still_h, std::vector<uint8_t>* rgba, int* w, int* h, std::string* tile_json) override;
+  std::string health_json() override;
   bool ready() const { return ready_; }
   std::string fatal() const;
 

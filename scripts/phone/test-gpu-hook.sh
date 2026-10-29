@@ -45,4 +45,50 @@ fi
 
 printf 'what\r\n' > "$dir/status"
 if run; then bad "a retake succeeded on an unexpected status: $(cat "$dir/out")"; else ok "an unexpected status fails"; fi
+
+# The phone streamer holds a CUDA context: a release stops it and holds it stopped (the
+# phone.sh serve loop waits on the hold file), a retake lets it start again.
+mkdir -p "$dir/bin"
+printf '#!/bin/bash\nwhile :; do sleep 0.05; done\n' > "$dir/bin/phone-streamer"
+chmod +x "$dir/bin/phone-streamer"
+"$dir/bin/phone-streamer" &
+streamer=$!
+printf 'released_ms=5\r\nOK\r\n' > "$dir/release"
+GPU_HOOK_ADB="$dir/adb" GPU_HOOK_STATE="$dir" "$hook" release > "$dir/out" 2>&1 || bad "the release failed: $(cat "$dir/out")"
+if ! kill -0 "$streamer" 2> /dev/null && [ -e "$dir/streamer.hold" ]; then
+  ok "a release stops the streamer and holds it"
+else
+  bad "the streamer still runs, or is not held, after the release"
+  kill "$streamer" 2> /dev/null || true
+fi
+wait "$streamer" 2> /dev/null || true
+printf 'released\r\nOK\r\n' > "$dir/status"
+if run && [ ! -e "$dir/streamer.hold" ]; then ok "a retake lets the streamer start again"; else bad "the streamer is still held after the retake: $(cat "$dir/out")"; fi
+
+# phone.sh's loop checks the hold and starts the streamer under streamer.lock. A release that
+# comes while the loop holds it (it has seen no hold and is starting a streamer) waits for
+# it, and stops the streamer the loop names in streamer.pid.
+rm -f "$dir/streamer.hold" "$dir/streamer.pid"
+(
+  exec 8> "$dir/streamer.lock"
+  flock 8
+  echo locked > "$dir/loop"
+  sleep 0.5   # the release runs now
+  "$dir/bin/phone-streamer" 8>&- &
+  echo $! > "$dir/streamer.pid"
+  flock -u 8
+  wait
+) &
+loop=$!
+until [ -e "$dir/loop" ]; do sleep 0.01; done
+GPU_HOOK_ADB="$dir/adb" GPU_HOOK_STATE="$dir" "$hook" release > "$dir/out" 2>&1 || bad "the release failed: $(cat "$dir/out")"
+until [ -s "$dir/streamer.pid" ]; do sleep 0.01; done
+s=$(cat "$dir/streamer.pid")
+if ! kill -0 "$s" 2> /dev/null && [ -e "$dir/streamer.hold" ]; then
+  ok "a release during the loop's start stops the streamer it started"
+else
+  bad "a streamer the loop started during the release still runs"
+  kill "$s" 2> /dev/null
+fi
+wait "$loop" 2> /dev/null || true
 exit $fail

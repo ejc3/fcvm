@@ -1,6 +1,7 @@
 #include "access.h"
 
 #include <fcntl.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #include "json.h"
@@ -11,6 +12,13 @@ void SceneToken::configure(const std::string& path, bool json) {
   json_ = json;
   have_st_ = false;
   token_.clear();
+}
+
+void SceneToken::configure_from_env() {
+  const char* token_file = getenv("SCENE_TOKEN_FILE");
+  const char* cert_json = getenv("TLS_CERT_FILE");
+  if (token_file && *token_file) configure(token_file, false);
+  else if (cert_json && *cert_json) configure(cert_json, true);
 }
 
 std::string SceneToken::current() {

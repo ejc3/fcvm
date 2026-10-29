@@ -688,6 +688,7 @@ impl FakeAgent {
                 capacity: gpus,
                 store_ready_at: None,
                 boot: Default::default(),
+                phones: vec![],
             })
             .unwrap();
         FakeAgent {
@@ -1791,6 +1792,7 @@ async fn an_ec2_renderer_restarted_on_its_instance_gets_its_scene_again() {
         previous_rect: None,
         standby: false,
         warm: false,
+        phone: None,
     };
     let (_assign, assign) = tokio::sync::watch::channel(vec![tile]);
     let (_scene, scene) = tokio::sync::watch::channel(Some(SharedScene::new(
@@ -1911,6 +1913,7 @@ async fn an_ec2_tile_is_reported_running_only_after_its_renderer_has_its_scene()
         previous_rect: None,
         standby: false,
         warm: false,
+        phone: None,
     };
     let (_assign, assign) = tokio::sync::watch::channel(vec![tile]);
     let (_scene, scene) = tokio::sync::watch::channel(Some(SharedScene::new(
@@ -2019,6 +2022,7 @@ async fn a_running_ec2_tile_reports_its_region_as_its_place_and_not_its_instance
         previous_rect: None,
         standby: false,
         warm: false,
+        phone: None,
     };
     let (_assign, assign) = tokio::sync::watch::channel(vec![tile]);
     let (_scene, scene) = tokio::sync::watch::channel(Some(SharedScene::new(
@@ -5596,6 +5600,7 @@ async fn a_wake_resumes_tiles_a_race_launches_them_and_a_sleep_releases_them() {
         previous_rect: None,
         standby: false,
         warm: false,
+        phone: None,
     };
     let (assign, assign_rx) = tokio::sync::watch::channel(vec![slot(1)]);
     let (_scene, scene_rx) = tokio::sync::watch::channel(None);
@@ -5814,6 +5819,11 @@ async fn a_viewer_past_the_direct_capacity_gets_the_broadcast_and_no_direct_toke
     // A GPU of its own is a direct stream too.
     late.intent("own", "claim_gpu", json!({})).await;
     let r = late.receipt("own").await;
+    assert_eq!(r["outcome"], "refused");
+    assert_eq!(r["reason"], live::LATE_CLAIM);
+    // So is a borrowed phone.
+    late.intent("phone", "claim_phone", json!({})).await;
+    let r = late.receipt("phone").await;
     assert_eq!(r["outcome"], "refused");
     assert_eq!(r["reason"], live::LATE_CLAIM);
     // No later admission ever gives it a token.

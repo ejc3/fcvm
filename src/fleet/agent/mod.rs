@@ -26,6 +26,8 @@ use tokio::task::JoinHandle;
 pub struct Agent {
     pub host: String,
     pub gpus: Vec<Gpu>,
+    /// Phones mode: the GPUs this host runs phones on (after `gpus` in the inventory).
+    pub phones: Vec<Gpu>,
     pub capacity: usize,
     pub base_port: u16,
     pub cfg: AgentCfg,
@@ -166,9 +168,34 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             .trim()
             .to_string(),
     };
-    let gpus = match &args.gpus {
+    let mut gpus = match &args.gpus {
         Some(spec) => inventory::parse_gpus(spec)?,
         None => inventory::vfio_gpus(&args.sysfs_root)?,
+    };
+    // Phones mode: the last --phones GPUs run phones, the rest the wall.
+    anyhow::ensure!(
+        args.phones <= gpus.len(),
+        "--phones {} but this host has {} GPUs",
+        args.phones,
+        gpus.len()
+    );
+    let phones = gpus.split_off(gpus.len() - args.phones);
+    let phone = match (
+        &args.phone_image,
+        &args.phone_aosp,
+        &args.phone_emulator,
+        &args.phone_apk,
+    ) {
+        (Some(image), Some(aosp), Some(emulator), Some(apk)) if args.phones > 0 => {
+            Some(vm::PhoneCfg {
+                image: image.clone(),
+                aosp: aosp.clone(),
+                emulator: emulator.clone(),
+                apk: apk.clone(),
+                snapshot: args.phone_snapshot.clone(),
+            })
+        }
+        _ => None,
     };
     if gpus.is_empty() {
         tracing::warn!("no NVIDIA GPU is bound to vfio-pci; this host will run no slot");
@@ -229,6 +256,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
         host,
         capacity: args.capacity.unwrap_or(gpus.len()),
         gpus,
+        phones,
         base_port: args.base_port,
         cfg: AgentCfg {
             fcvm,
@@ -253,6 +281,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             scrub: args.scrub,
             scrub_timeout: Duration::from_secs(120),
             quarantine_after: 3,
+            phone,
         },
         spot_notice_url: args.spot_notice_url,
         spot_poll: Duration::from_secs(5),
@@ -350,7 +379,9 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let mut ports = HashMap::new();
-    for (i, g) in agent.gpus.iter().enumerate() {
+    // Ports and addresses by inventory index, the wall's GPUs first, then the phones'.
+    let all: Vec<Gpu> = agent.gpus.iter().chain(&agent.phones).cloned().collect();
+    for (i, g) in all.iter().enumerate() {
         let port = u16::try_from(i)
             .ok()
             .and_then(|i| agent.base_port.checked_add(i))
@@ -382,6 +413,7 @@ where
         capacity: agent.capacity,
         store_ready_at: agent.store_ready_file.as_deref().and_then(mtime_ms),
         boot: agent.boot.clone(),
+        phones: agent.phones.clone(),
     })
     .ok();
     let http = reqwest::Client::builder()
@@ -421,8 +453,7 @@ where
     });
     let mut region: Option<fleet_core::tiling::Rect> = None;
     let mut placed: Vec<AssignSlot> = Vec::new();
-    let gpu_locks: HashMap<String, Arc<Mutex<()>>> = agent
-        .gpus
+    let gpu_locks: HashMap<String, Arc<Mutex<()>>> = all
         .iter()
         .map(|g| (g.sbdf.clone(), Arc::new(Mutex::new(()))))
         .collect();
@@ -453,7 +484,12 @@ where
                 region: r,
             } => {
                 region = r;
-                placed = list.iter().filter(|a| a.rect.is_some()).cloned().collect();
+                // The aggregator joins the wall's tiles; a phone's rect is of the phones' image.
+                placed = list
+                    .iter()
+                    .filter(|a| a.rect.is_some() && a.phone.is_none())
+                    .cloned()
+                    .collect();
                 assign(
                     &list,
                     &mut slots,
@@ -567,6 +603,7 @@ fn assign(
             layout_generation: a.layout_generation,
             rect_from_frame: a.rect_from_frame,
             previous_rect: a.previous_rect,
+            phone: a.phone.clone(),
         };
         if let Some(h) = slots.get(&a.id) {
             h.desired.send_if_modified(|d| {
@@ -580,6 +617,7 @@ fn assign(
                     layout_generation: want.layout_generation,
                     rect_from_frame: want.rect_from_frame,
                     previous_rect: want.previous_rect,
+                    phone: want.phone.clone(),
                 };
                 let changed = *d != next;
                 *d = next;

@@ -84,6 +84,7 @@ fn cfg(fcvm: &Path) -> AgentCfg {
         scrub: false,
         scrub_timeout: Duration::from_secs(10),
         quarantine_after: 3,
+        phone: None,
         scene_token: Default::default(),
     }
 }
@@ -109,6 +110,7 @@ impl Coord {
         let agent = Agent {
             host: "gpu-host".into(),
             gpus: gpus(n),
+            phones: vec![],
             capacity: n,
             base_port: f.base,
             cfg,
@@ -147,6 +149,7 @@ impl Coord {
                     previous_rect: None,
                     standby: false,
                     warm: false,
+                    phone: None,
                 })
                 .collect(),
             region: None,
@@ -531,6 +534,7 @@ async fn the_grid_budget_is_posted_to_wall_tiles_after_every_scene() {
             previous_rect: None,
             standby: false,
             warm: false,
+            phone: None,
         }],
         region: None,
     });
@@ -589,6 +593,7 @@ async fn a_private_session_draws_the_whole_image_with_its_own_camera() {
                     previous_rect: None,
                     standby: false,
                     warm: false,
+                    phone: None,
                 }],
                 region: None,
             }
@@ -762,6 +767,7 @@ async fn killing_the_agent_takes_its_vms_with_it() {
                     previous_rect: None,
                     standby: false,
                     warm: false,
+                    phone: None,
                 },
                 AssignSlot {
                     id: "slot-2".into(),
@@ -774,6 +780,7 @@ async fn killing_the_agent_takes_its_vms_with_it() {
                     previous_rect: None,
                     standby: false,
                     warm: false,
+                    phone: None,
                 },
             ],
             region: None,
@@ -890,6 +897,7 @@ async fn a_rect_change_right_after_running_is_posted() {
             previous_rect: None,
             standby: false,
             warm: false,
+            phone: None,
         }],
         region: None,
     };
@@ -996,6 +1004,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
     let agent = Agent {
         host: "gpu-host".into(),
         gpus: gpus(2),
+        phones: vec![],
         capacity: 2,
         base_port: f.base,
         cfg: cfg(&f.fcvm),
@@ -1049,6 +1058,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                     previous_rect: None,
                     standby: false,
                     warm: false,
+                    phone: None,
                 },
                 AssignSlot {
                     id: "slot-2".into(),
@@ -1061,6 +1071,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                     previous_rect: None,
                     standby: false,
                     warm: false,
+                    phone: None,
                 },
             ],
             region: Some(region),
@@ -1159,6 +1170,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                 previous_rect: None,
                 standby: false,
                 warm: false,
+                phone: None,
             }],
             region: Some(wider),
         })
@@ -1210,6 +1222,7 @@ fn standby_slot(generation: u64, standby: bool, rect: Option<Rect>) -> CoordMsg 
             previous_rect: None,
             standby,
             warm: false,
+            phone: None,
         }],
         region: None,
     }
@@ -1352,6 +1365,7 @@ async fn the_hello_reports_when_the_store_was_ready() {
     let agent = Agent {
         host: "gpu-host".into(),
         gpus: gpus(1),
+        phones: vec![],
         capacity: 1,
         base_port: f.base,
         cfg: cfg(&f.fcvm),
@@ -1427,6 +1441,7 @@ async fn a_dialing_agent_reconnects_and_replays_its_state_without_restarting_vms
     let agent = Agent {
         host: "gpu-host".into(),
         gpus: gpus(1),
+        phones: vec![],
         capacity: 1,
         base_port: f.base,
         cfg: cfg(&f.fcvm),
@@ -1466,6 +1481,7 @@ async fn a_dialing_agent_reconnects_and_replays_its_state_without_restarting_vms
                 previous_rect: None,
                 standby: false,
                 warm: false,
+                phone: None,
             }],
             region: None,
         },
@@ -1804,6 +1820,7 @@ async fn the_renderer_gets_the_layout_generation_with_its_rect() {
             previous_rect: Some(before),
             standby: false,
             warm: false,
+            phone: None,
         }],
         region: None,
     });
@@ -1918,6 +1935,7 @@ async fn a_warming_slot_draws_the_whole_image_then_takes_its_place() {
             previous_rect: None,
             standby: false,
             warm,
+            phone: None,
         }],
         region: None,
     };
@@ -1972,4 +1990,165 @@ fn boot_times_come_from_uptime_the_agent_and_the_store_ready_file() {
         boot_times(None, 1_000_000, 999_000, Some("")),
         [("agent_started_at".to_string(), 999_000)].into()
     );
+}
+
+/// Phones mode: the hello names the phone GPUs apart from the wall's; a phone slot runs the
+/// phone VM (phone profile, the SDK, the app and the AVD root mapped, nothing that names the
+/// slot), posts its rectangle of the phones' image, and carries out each take-over action
+/// of its launch once, in order, with `phone.sh action <name>` in the container.
+#[tokio::test]
+async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
+    use fcvm::fleet::agent::vm::PhoneCfg;
+    use fleet_core::phone::{PhoneAction, PhoneActionReq};
+    use fleet_core::protocol::AssignPhone;
+    let f = fake(2, &[]);
+    let mut c_cfg = cfg(&f.fcvm);
+    c_cfg.phone = Some(PhoneCfg {
+        image: "localhost/fcvm-phone:test".into(),
+        aosp: PathBuf::from("/store/aosp"),
+        emulator: PathBuf::from("/store/emulator"),
+        apk: PathBuf::from("/store/aosp/phone-work/app-1.apk"),
+        snapshot: None,
+    });
+    let (coord_side, agent_side) = tokio::io::duplex(1 << 20);
+    let (agent_in, agent_out) = tokio::io::split(agent_side);
+    let (coord_in, coord_out) = tokio::io::split(coord_side);
+    let all = gpus(2);
+    let agent = Agent {
+        host: "gpu-host".into(),
+        gpus: vec![all[0].clone()],
+        phones: vec![all[1].clone()],
+        capacity: 1,
+        base_port: f.base,
+        cfg: c_cfg,
+        spot_notice_url: None,
+        spot_poll: Duration::from_millis(50),
+        aggregate: None,
+        store_ready_file: None,
+        boot: Default::default(),
+    };
+    let task = tokio::spawn(serve(agent, agent_in, agent_out));
+    let (to_agent, _w) = spawn_writer::<CoordMsg, _>(coord_out, "agent");
+    let mut c = Coord {
+        to_agent,
+        from_agent: LineReader::new(coord_in, "agent"),
+        agent: Some(task),
+        seen: Vec::new(),
+    };
+    match c.next().await {
+        AgentMsg::Hello { gpus, phones, .. } => {
+            assert_eq!(gpus, vec![all[0].clone()]);
+            assert_eq!(phones, vec![all[1].clone()]);
+        }
+        m => panic!("expected the hello, got {m:?}"),
+    }
+    let phone = |generation: u64, actions: Vec<PhoneActionReq>| CoordMsg::Assign {
+        slots: vec![AssignSlot {
+            id: "phone-1".into(),
+            sbdf: all[1].sbdf.clone(),
+            generation,
+            rect: Some(Rect {
+                x: 0.5,
+                y: 0.0,
+                w: 0.5,
+                h: 1.0,
+            }),
+            private_camera: None,
+            layout_generation: 0,
+            rect_from_frame: 0,
+            previous_rect: None,
+            standby: false,
+            warm: false,
+            phone: Some(AssignPhone {
+                image_aspect: 1.14,
+                actions,
+                chrome: vec![fleet_core::phone::ChromeKey { t: 12.0, on: true }],
+            }),
+        }],
+        region: None,
+    };
+    c.send(scene());
+    c.send(phone(1, vec![]));
+    c.until(&["phone-1"], "running", 1).await;
+    let args = std::fs::read_to_string(f.dir.path().join("args-fleet-phone-1")).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    let has = |pair: [&str; 2]| args.windows(2).any(|w| w == pair);
+    assert!(has(["--kernel-profile", "phone"]), "{args:?}");
+    assert!(has(["--gpu", "0000:02:00.0"]), "{args:?}");
+    assert!(has(["--map", "/store/aosp:/android:ro"]), "{args:?}");
+    assert!(
+        has(["--map", "/store/aosp/phone-work:/work:ro"]),
+        "{args:?}"
+    );
+    assert!(has(["--env", "PHONE_APK=/work/app-1.apk"]), "{args:?}");
+    assert!(args.contains(&"--privileged"));
+    assert_eq!(
+        args[args.len() - 3..],
+        [
+            "localhost/fcvm-phone:test",
+            "/usr/local/bin/phone.sh",
+            "serve"
+        ]
+    );
+    assert_eq!(
+        args.iter().filter(|a| a.contains("phone-1")).count(),
+        1,
+        "only the VM's name names the slot: {args:?}"
+    );
+    // The phone's GPU is the second of the inventory: its own port.
+    let body = f.scenes[1].lock().unwrap().last().unwrap().clone();
+    assert_eq!(body["rect"]["x"], 0.5);
+    assert_eq!(body["image_aspect"], 1.14);
+    assert_eq!(
+        body["chrome"],
+        serde_json::json!([{"t": 12.0, "on": true}]),
+        "the phones' zoom reaches the phone in its scene"
+    );
+    assert!(
+        f.budgets[1].lock().unwrap().is_empty(),
+        "a phone gets no wall budget"
+    );
+
+    let req = |seq: u64, action: PhoneAction, generation: u64| PhoneActionReq {
+        seq,
+        action,
+        at: 0,
+        generation,
+    };
+    let acts = vec![
+        req(1, PhoneAction::Rotate, 1),
+        req(2, PhoneAction::RebootPhone, 1),
+        req(3, PhoneAction::Dance, 1),
+        req(4, PhoneAction::Wave, 0), // an earlier launch's: never carried out
+    ];
+    c.send(phone(1, acts.clone()));
+    let execs = || -> Vec<String> {
+        std::fs::read_to_string(f.dir.path().join("events.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.starts_with("exec "))
+            .map(|l| {
+                l.split_whitespace()
+                    .skip(2)
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while execs().len() < 2 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The same actions again (a re-sent assignment) are not carried out twice.
+    c.send(phone(1, acts));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        execs(),
+        vec![
+            "/usr/local/bin/phone.sh action rotate",
+            "/usr/local/bin/phone.sh action dance"
+        ]
+    );
+    c.close().await;
 }

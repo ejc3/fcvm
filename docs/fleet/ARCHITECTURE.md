@@ -951,9 +951,8 @@ Vulkan path is measured on the T4.
 ### Getting the screen to the page
 
 The page's frame protocol stays: FCVF frames of H.264 over a WebSocket, each stamped with
-its `t`. A phone streamer in the container reads the emulator's screen (its gRPC screen
-stream or the shared-memory video bridge it writes with `-share-vid`, whichever measures
-faster), encodes with NVENC on the same GPU (the driver image already carries
+its `t`. A phone streamer in the container reads the emulator's screen from its gRPC
+screen stream (`streamScreenshot`), encodes with NVENC on the same GPU (the driver image already carries
 `libnvidia-encode`), and serves the renderer's `/frames` route with its encoder and socket
 code. The app writes the `t` it drew into a strip of pixels at the edge of its surface, which
 the streamer reads and crops, so each frame carries the exact `t` it shows and the page's
@@ -961,17 +960,45 @@ seam sync works unchanged. In seamless mode the app is full screen (system bars 
 the page shows the scene rectangle; zooming out is a scene field that tells every phone to
 show its interface from a stated `t`, so all phones change together.
 
+The shared-memory bridge (`-share-vid`) was tried first and dropped: after a cold boot it
+carried black frames (the emulator fills it from a readback worker that the gfxstream
+display never fed), and the emulator crashed reading it back after a snapshot load or a GPU
+retake. The gRPC stream composes the same screen the emulator window shows.
+
+Measured on a g4dn.metal (T4, driver 580.196.07, the emulator built from source), Robot Park
+full screen at 720x1280, from the streamer's own `/health` counters:
+
+| step | p50 | p90 |
+|---|---|---|
+| app draw (its stamped `t`) to the frame reaching the streamer | 36.3 ms | 36.6 ms |
+| frame reaching the streamer to its FCVF frame sent | 14.0 ms | 15.0 ms |
+| of which the NVENC encode | 4.6 ms | 4.7 ms |
+
+The stream carries 30 scene frames a second (the app draws 60; the streamer sends the even
+`k`), 83.6 KB a frame at `q=std` and 29.3 KB at `q=lo`. A cold phone VM answered `/health`
+23 s after the run, Android booted at 34.6 s, and the first stamped scene frame was sent at
+61 s.
+
 ### Taking over
 
-`claim_phone` borrows a phone with `claim_gpu`'s rules (one per viewer, a cooldown, a cap on
-phones lent at once, refused to a broadcast-only viewer). The take-over panel sends one of a
-fixed set of actions, which the coordinator validates as an enum and the agent passes to a
-controller in the phone container that maps each to one fixed command: the info tab or the
-scene tab, rotate (`adb emu rotate`), dark mode (`cmd uimode night`), robots wave or dance
-(an intent to the app), a GPU benchmark run inside the app, restart the app
-(`am force-stop`, then start), and reboot the phone, which restores the phone VM from its
-snapshot and shows the restore time. The controller takes nothing but the action's name;
-adb and the emulator console listen only inside the container.
+`claim_phone` borrows a phone with `claim_gpu`'s rules (one per client, a cooldown, a cap on
+phones lent at once, refused to a broadcast-only viewer). Unlike a GPU, a borrowed phone keeps
+its place on the wall and its stream; when it comes back (after `phone_claim_secs`, on
+`release_phone`, or when its viewer leaves) it is restored from its snapshot, so the next
+viewer finds it as every phone starts. The take-over panel sends one of a fixed set of
+actions (`phone_action`), which the coordinator validates as an enum and hands to the agent
+in the phone's assignment; the agent runs `phone.sh action <name>` in the phone container,
+which sends Robot Park the one control request the name maps to (PROTOCOL.md, "Phones
+mode"): the info tab or the scene tab, rotate, dark or light, the robots dance or wave, the
+app's GPU benchmark, restart the app. Reboot the phone is the coordinator's: it relaunches the
+phone's VM (a clone of its warm snapshot, flow B) and the page shows the restore time. The
+controller takes nothing but the action's name; adb, the emulator console and the app's
+control socket listen only inside the container.
+
+Phones are their own slots (`phone-<n>`), never wall tiles: an agent run with `--phones N`
+runs phones on the last N GPUs of its inventory and names them in its hello. The
+coordinator lays them out in their own image (a row of up to six, then rows of equal length)
+and the page shows it with `?mode=phones`.
 
 ### Invariants (each becomes a test)
 

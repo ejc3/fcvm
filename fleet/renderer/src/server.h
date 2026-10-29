@@ -4,14 +4,37 @@
 #pragma once
 #include "access.h"
 #include <atomic>
+#include <memory>
 #include <string>
+#include <vector>
 
-#include "pipeline.h"
+#include "subscriber.h"
 #include "tls.h"
+
+// What the server serves: the renderer's Pipeline, or the phone streamer
+// (fleet/phone/streamer), which reads an emulator's screen instead of drawing.
+class FrameSource {
+ public:
+  virtual ~FrameSource() = default;
+  virtual std::shared_ptr<Subscriber> subscribe(int h, int q) = 0;
+  virtual void unsubscribe(const std::shared_ptr<Subscriber>& s) = 0;
+  virtual void wake() = 0;
+  virtual bool post_scene(const std::string& body, std::string* err) = 0;
+  virtual bool post_budget(const std::string& body, std::string* err) = 0;
+  virtual bool raw_frame(double t, std::string* ppm, std::string* tile_json) = 0;
+  virtual bool next_frame(int still_h, std::vector<uint8_t>* rgba, int* w, int* h, std::string* tile_json) = 0;
+  virtual std::string health_json() = 0;
+  // Whether a GET /frames with this direct token may stream.
+  virtual bool admits(const std::string& token) = 0;
+  // Whether a stream must show a direct token before it is served (a scene brought keys).
+  virtual bool requires_admit() = 0;
+  // Whether any scene has been posted (a fleet renderer streams nothing before one).
+  virtual bool has_scene() = 0;
+};
 
 class Server {
  public:
-  explicit Server(Pipeline& p) : p_(p) {}
+  explicit Server(FrameSource& p) : p_(p) {}
   // A fleet renderer (access.h): scene posts need the token, streams wait for a scene.
   void set_scene_token(SceneToken* t) { token_ = t; }
   // Binds and listens; returns false with a message. Then serve() accepts forever.
@@ -24,7 +47,7 @@ class Server {
   void accept_loop(int lfd, bool tls);
   void handle(Conn& c);
   void websocket(Conn& c, int h, int q, const std::string& key);
-  Pipeline& p_;
+  FrameSource& p_;
   int lfd_ = -1, tfd_ = -1;
   TlsFront* tls_ = nullptr;
   SceneToken* token_ = nullptr;
