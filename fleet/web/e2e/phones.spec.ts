@@ -238,6 +238,16 @@ test("on a phone screen the phones fit and an opened phone has a bottom sheet un
   expect(open.label!.y + open.label!.h).toBeLessThanOrEqual(sheet.y + 1);
   expect(sheet.x).toBe(0);
   expect(sheet.width).toBe(390);
+  // A refusal while the sheet is open is read above it, not under it.
+  await page.getByTestId("phone-take").click();
+  await expect(page.getByTestId("phone-borrow")).toHaveAttribute("data-kind", "yours");
+  await page.evaluate(() => window.__phones!.client.send("claim_phone", { phone: "phone-1" }));
+  const notice = page.getByTestId("phone-notice");
+  await expect(notice).toHaveText("one phone per client at a time");
+  const nb = (await notice.boundingBox())!;
+  const top = await page.evaluate(([x, y]) => document.elementFromPoint(x!, y!)?.closest("[data-testid]")?.getAttribute("data-testid"), [nb.x + nb.width / 2, nb.y + nb.height / 2]);
+  expect(top).toBe("phone-notice");
+  await page.getByTestId("phone-give-back").click();
   await page.getByTestId("phone-back").click();
   await expect(panel).toHaveCount(0);
   await page.context().close();

@@ -25,7 +25,8 @@
 .phones-banner, .phones-empty, .phones-notice { position: fixed; z-index: 4; left: 50%; transform: translateX(-50%); width: max-content; max-width: min(560px, 92vw); padding: 10px 14px; border-radius: 10px; background: var(--panel); border: 1px solid var(--line); font-size: 15px; }
 .phones-banner { top: 76px; }
 .phones-empty { top: 40%; font-size: 17px; }
-.phones-notice { bottom: 24px; border-color: var(--refused); color: var(--refused); }
+/* Above an opened phone's panel (z-index 5), which on a narrow screen covers the bottom. */
+.phones-notice { bottom: 24px; z-index: 6; border-color: var(--refused); color: var(--refused); }
 
 /* ---- one phone opened ---------------------------------------------------------------- */
 
