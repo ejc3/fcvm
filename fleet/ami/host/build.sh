@@ -193,6 +193,12 @@ bake)
   cloud-init clean --logs --seed
   truncate -s 0 /etc/machine-id
   rm -f /var/lib/fleet-ami/env
+  # Every boot empties /tmp (systemd-tmpfiles-setup, `D /tmp`), and the store waits for it
+  # (nss-lookup.target after systemd-resolved after tmpfiles-setup), on a root volume whose
+  # blocks come from S3 on first read. The 67d383ea image kept the gpu kernel's build tree
+  # there (/tmp/kernel-build-gpu-*, 210,696 files): 40.7 s of every boot, against 1.7 s for
+  # the same pass over the 7f5fb7e6 image's volume. Empty both here, where it costs nothing.
+  find /tmp /var/tmp -mindepth 1 -delete
   sync
   ;;
 *) echo "unknown phase $PHASE"; exit 2 ;;
