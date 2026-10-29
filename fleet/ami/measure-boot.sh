@@ -104,6 +104,9 @@ if [ "$KIND" = host ]; then
   ssm "for u in fcvm-fleet-vfio fcvm-fleet-store; do echo \$u \$(date -d \"\$(systemctl show -p ActiveEnterTimestamp --value \$u.service)\" +%s%3N); done; journalctl -u fcvm-fleet-store -o cat --no-pager | grep 'fcvm-fleet-store:'" | while read -r u t rest; do
     case "$u" in fcvm-fleet-store:) echo "on-instance: $u $t $rest" ;; *) [ -z "$t" ] || echo "$u active $(( t - t0 )) ms after the request" ;; esac
   done
+  # Where the boot went before the store could start: the chain systemd waited through,
+  # the slowest units, and the root volume's read counters (as for a tile, above).
+  ssm "systemd-analyze 2>&1 | head -1 | sed 's/^/analyze: /'; systemd-analyze critical-chain fcvm-fleet-store.service --no-pager 2>&1 | sed 's/^/chain: /'; systemd-analyze blame --no-pager 2>&1 | head -12 | sed 's/^/blame: /'; d=\$(lsblk -no PKNAME \$(findmnt -no SOURCE /)); awk '{printf \"disk: reads=%d mib=%d busy_ms=%d\\n\", \$1, \$3/2048, \$4}' /sys/block/\$d/stat" | sed 's/^/on-instance: /'
   # AWS-RunShellScript runs `sh` (dash on Ubuntu: no pipefail), so keep warm.sh's status
   # by hand and end with it. warm.log is fcvm's output: log lines and JSON records. The
   # restored record is printed whole (ack_ms, guest_phases). A snapshot miss also ends in

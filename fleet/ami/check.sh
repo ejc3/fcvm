@@ -408,5 +408,15 @@ assert all(a[1] < b[0] for a, b in zip(ends, ends[1:])), "ranges not merged"
 PY
 rm -rf "$rd"
 
+# The host bake must leave /tmp and /var/tmp empty: every boot empties /tmp before the
+# store starts, on a root volume read from S3 block by block, and a kernel build tree left
+# there cost 40.7 s of every boot (issue 1437). The step runs after everything else in the
+# bake, right before the final sync.
+bake=$(sed -n '/^bake)/,/^  ;;/p' fleet/ami/host/build.sh)
+empty_at=$(grep -n '^  find /tmp /var/tmp -mindepth 1 -delete$' <<<"$bake" | head -1 | cut -d: -f1)
+sync_at=$(grep -n '^  sync$' <<<"$bake" | tail -1 | cut -d: -f1)
+[ -n "$empty_at" ] && [ -n "$sync_at" ] && [ $((sync_at - empty_at)) = 1 ] ||
+  no "host bake does not empty /tmp and /var/tmp right before its final sync"
+
 [ "$fail" = 0 ] && echo "fleet/ami checks: ok"
 exit "$fail"
