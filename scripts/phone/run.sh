@@ -7,7 +7,7 @@
 #      a restored guest keeps its nested virtualization state only with the phone profile's
 #      Firecracker (KVM_GET/SET_NESTED_STATE; with the gpu profile's commit the guest's
 #      kvm_intel oopses in kvm_spurious_fault and the probe dies);
-#   2. Android boots (sys.boot_completed) with -gpu host, and the system asks for no bug
+#   2. Android boots (sys.boot_completed) with -gpu host, and the phone takes no bug
 #      report (one, which a failing device such as UWB triggers, takes a core for ~30 s);
 #   3. SurfaceFlinger composes with GLES on that GPU: its renderer names the GPU nvidia-smi
 #      reports in the VM;
@@ -23,7 +23,9 @@
 #      it, the emulator holds it open, and the app draws 30 frames a second there. Prints the
 #      time from the restore command to the phone's first frame on the clone's GPU.
 #   7. Robot Park (fleet/phone-app), last, on the source phone: seams, surface loss and
-#      actions (scripts/phone/scene-test.sh).
+#      actions (scripts/phone/scene-test.sh); and the phone took no bug report during
+#      the whole run (phone.sh turns UWB off, whose service otherwise asks for one a minute
+#      or two after boot).
 #
 #   FCVM=./target/release/fcvm scripts/phone/run.sh <gpu pci address> <second gpu pci address>
 # PHONE_PROFILE names another kernel profile to run the same checks on (default phone).
@@ -74,7 +76,13 @@ stop_runner() {
     snapshot_dir=""
   fi
 }
-trap stop_runner EXIT
+# A run that ends before its last check keeps the source phone's logs.
+finished=0
+on_exit() {
+  [ "$finished" = 1 ] || [ -z "${pid:-}" ] || keep_phone_logs "$pid" early-exit
+  stop_runner
+}
+trap on_exit EXIT
 trap 'exit 130' INT TERM
 t0=$(date +%s%3N)
 "$F" podman run --name "$NAME" --kernel-profile "${PHONE_PROFILE:-phone}" --gpu "$GPU" --privileged --cpu 6 --mem 6144 \
@@ -167,18 +175,24 @@ if boot=$(timeout 400 "$F" exec --pid "$pid" -- /usr/local/bin/phone.sh boot 2>&
   echo "$out" > "$LOGS/probe.log"
   app_renderer=$(grep -m1 -o 'renderer=.* vendor=' <<< "$out" || true)
   [[ "$app_renderer" == *"$gpu_name"* ]] && ok "the app's GLES context: $app_renderer" || bad "the app's renderer does not name '$gpu_name': ${app_renderer:-none} (log $LOGS/probe.log)"
-  fps=$(grep -o 'fps=[0-9.]*' <<< "$out" | tail -8 | cut -d= -f2 | sort -n | head -1)
-  python3 -c 'import sys; sys.exit(0 if sys.argv[1] and float(sys.argv[1]) >= 30 else 1)' "${fps:-}" \
+  fps=$(lowest_fps_in "$out" 8)
+  at_least_30 "$fps" \
     && ok "the app draws: lowest of its last 8 fps samples $fps" || bad "the app does not draw 30 fps: lowest '${fps:-none}' (log $LOGS/probe.log)"
   reports=$(X /usr/local/bin/phone.sh bugreports 2>&1 || true)
-  [ "$reports" = 0 ] && ok "the system asked for no bug report" || bad "the system asked for a bug report: '$reports' (a device failed at boot; logcat -b events)"
+  [ "$reports" = 0 ] && ok "the phone took no bug report" || bad "the phone took $reports bug report(s) (a device failed at boot; dumpstate.last_id)"
   in_place_release_and_retake
   warm_snapshot_onto_the_second_gpu
-  "$(dirname "$0")/scene-test.sh" "$F" "$pid" "/work/$(basename "$APP")" "$LOGS/out" "$gpu_name" || fail=1
+  "$(dirname "$0")/scene-test.sh" "$F" "$pid" "/work/$(basename "$APP")" "$LOGS/out" "$gpu_name" || { fail=1; keep_phone_logs "$pid" scene-test; }
+  # The UWB service asked for its bug report a minute or two after boot, after the check
+  # above: count again once every check has run.
+  reports=$(X /usr/local/bin/phone.sh bugreports 2>&1 || true)
+  [ "$reports" = 0 ] && ok "the phone took no bug report during the run" \
+    || { bad "the phone took $reports bug report(s) during the run (dumpstate.last_id; logcat)"; keep_phone_logs "$pid" bugreport; }
 else
   bad "Android did not boot: $boot"
   X sh -c 'grep -aE "ERROR|FATAL" /tmp/emulator.log | head -20' || true
 fi
+finished=1
 X /usr/local/bin/phone.sh stop > /dev/null 2>&1 || true
 stop_runner
 echo "logs: $LOGS"
