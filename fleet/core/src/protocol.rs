@@ -333,6 +333,11 @@ pub struct SharedScene {
     pub time_of_day: f64,
     pub words: Vec<Word>,
     pub lights: Vec<Light>,
+    /// The coordinator's admission keys (hex), newest first: a renderer that holds any
+    /// refuses `GET /frames` without a direct token made with one of them (PROTOCOL.md,
+    /// "admission"). Empty: no check. Never in a browser's snapshot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admit_keys: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub weather: Vec<WeatherKey>,
 }
@@ -346,6 +351,7 @@ impl SharedScene {
             time_of_day: scene.time_of_day,
             words: scene.words.clone(),
             lights: scene.lights.clone(),
+            admit_keys: Vec::new(),
             weather: scene.weather.clone(),
         }
     }
@@ -362,6 +368,7 @@ impl SharedScene {
             time_of_day: self.time_of_day,
             words: self.words.clone(),
             lights: self.lights.clone(),
+            admit_keys: self.admit_keys.clone(),
             weather: self.weather.clone(),
         }
     }
@@ -417,6 +424,9 @@ pub struct RendererScene {
     pub time_of_day: f64,
     pub words: Vec<Word>,
     pub lights: Vec<Light>,
+    /// The admission keys (see [`SharedScene::admit_keys`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admit_keys: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub weather: Vec<WeatherKey>,
 }

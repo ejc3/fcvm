@@ -488,6 +488,7 @@ where
                     .iter()
                     .max_by_key(|a| a.layout_generation)
                     .map_or(0, |a| a.rect_from_frame),
+                admit_keys: scene.admit_keys.clone(),
             }),
             _ => None,
         };

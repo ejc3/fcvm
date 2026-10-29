@@ -54,6 +54,9 @@ struct Scene {
   long long layout_generation = -1, rect_from_frame = -1;
   bool has_previous_rect = false;
   Rect previous_rect;
+  // The coordinator's admission keys (raw, newest first): with any, GET /frames needs a
+  // direct token made with one (admit.h). Empty: no check.
+  std::vector<std::string> admit_keys;
 };
 
 // Throws std::runtime_error with a message naming the bad field.

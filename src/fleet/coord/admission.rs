@@ -59,6 +59,11 @@ impl AdmitKey {
         hex::encode(self.0)
     }
 
+    pub fn from_hex(h: &str) -> Option<Self> {
+        let b = hex::decode(h).ok()?;
+        Some(AdmitKey(b.try_into().ok()?))
+    }
+
     fn mac(&self, signed: &str) -> String {
         let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &self.0);
         b64url(ring::hmac::sign(&key, signed.as_bytes()).as_ref())

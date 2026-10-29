@@ -214,6 +214,7 @@ async fn tiles_are_joined_at_one_t_without_their_margins() {
             .collect(),
         generation: 1,
         from_frame: 0,
+        admit_keys: Vec::new(),
     });
     let cancel = CancellationToken::new();
     let opts = Options {
@@ -379,6 +380,7 @@ async fn a_region_with_no_tiles_streams_black() {
         }],
         generation: 1,
         from_frame: 0,
+        admit_keys: Vec::new(),
     });
     let cancel = CancellationToken::new();
     let opts = Options {
@@ -467,6 +469,7 @@ async fn a_new_generation_replaces_the_old_composite_all_at_once() {
             .collect(),
         generation,
         from_frame,
+        admit_keys: Vec::new(),
     };
     let shared = Shared::new();
     // Slot a draws the whole region until frame F, then the top half (its renderer sends a
@@ -640,6 +643,7 @@ async fn a_re_tile_of_streaming_tiles_skips_no_slot() {
         ],
         generation: 1,
         from_frame: 0,
+        admit_keys: Vec::new(),
     });
     let cancel = CancellationToken::new();
     let opts = Options {
@@ -671,6 +675,7 @@ async fn a_re_tile_of_streaming_tiles_skips_no_slot() {
         ],
         generation: 2,
         from_frame: f,
+        admit_keys: Vec::new(),
     });
     let k_of = |t: f64| (t * FPS as f64).round() as i64;
     let mut last_old = None;
@@ -757,6 +762,7 @@ async fn the_public_listener_serves_frames_with_tls_and_no_control_routes() {
         }],
         generation: 1,
         from_frame: 0,
+        admit_keys: Vec::new(),
     });
     let cancel = CancellationToken::new();
     let opts = Options {
@@ -898,6 +904,7 @@ async fn a_supervised_aggregator_that_needs_a_layout_stops_without_one() {
         tiles: vec![],
         generation: 0,
         from_frame: 0,
+        admit_keys: Vec::new(),
     };
     tx.send(Some(layout.clone())).unwrap();
     until(true).await;
@@ -1032,4 +1039,216 @@ fn every_fcvm_this_file_spawns_dies_with_the_test() {
         );
     }
     assert!(found > 0, "the check found no spawn to look at");
+}
+
+/// With the coordinator's admission keys in its layout, the aggregator's public `/frames`
+/// streams only to a request with a direct token made with one of them, and its own tile
+/// subscriptions carry such a token (the renderers check it too).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_admission_keys_frames_need_a_direct_token_and_tiles_get_one() {
+    use fcvm::fleet::aggregate::public_router;
+    use fcvm::fleet::coord::admission::{direct_token_valid, AdmitKey};
+    let key = AdmitKey([9; 32]);
+    let epoch = now_ms() - 5_000;
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let tile = FakeTile {
+        header: Header {
+            codec: "raw".into(),
+            width: 64,
+            height: 36,
+            full_width: 64,
+            full_height: 36,
+            x0: 0,
+            y0: 0,
+            fps: FPS,
+            crop: Crop::default(),
+        },
+        id_u: 50,
+        epoch,
+        queries: queries.clone(),
+        from_k: i64::MIN,
+        switch: None,
+        lag_ms: 0.0,
+    };
+    let url = start_tile(tile).await;
+    let whole = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+    let shared = Shared::new();
+    shared.set_layout(Layout {
+        epoch_unix_ms: epoch,
+        image_aspect: 16.0 / 9.0,
+        region: whole,
+        tiles: vec![TileSpec {
+            id: "slot-1".into(),
+            rect: whole,
+            url: Some(url),
+        }],
+        generation: 0,
+        from_frame: 0,
+        admit_keys: vec![key.hex()],
+    });
+    let cancel = CancellationToken::new();
+    let opts = Options {
+        image_height: 36,
+        ..Options::default()
+    };
+    tokio::spawn(run(shared.clone(), Arc::new(Raw), opts, cancel.clone()));
+    // The tile was asked with a token the key validates.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let asked = loop {
+        if let Some(q) = queries.lock().unwrap().first().cloned() {
+            break q;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tile was never subscribed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let token = asked
+        .get("admit")
+        .expect("the subscription carries a token");
+    assert!(direct_token_valid(
+        std::slice::from_ref(&key),
+        token,
+        now_ms() / 1000
+    ));
+    // The public listener: refused without a token or with a forged one, served with one.
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, public_router(shared)).await.unwrap() });
+    let refused = |r: Result<_, tokio_tungstenite::tungstenite::Error>| match r {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => resp.status() == 403,
+        _ => false,
+    };
+    assert!(refused(
+        tokio_tungstenite::connect_async(format!("ws://{addr}/frames")).await
+    ));
+    let forged = AdmitKey([1; 32]).direct_token("v-9", now_ms() / 1000 + 600);
+    assert!(refused(
+        tokio_tungstenite::connect_async(format!("ws://{addr}/frames?admit={forged}")).await
+    ));
+    let good = key.direct_token("v-1", now_ms() / 1000 + 600);
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/frames?admit={good}"))
+        .await
+        .expect("a seated viewer's token opens the stream");
+    assert!(matches!(next_msg(&mut ws).await, Message::Text(_)));
+    cancel.cancel();
+}
+
+/// A tile that drops its stream is subscribed again with a fresh token, not the one made when
+/// the layout arrived: a token expires after 10 minutes, and a tile that drops after that
+/// would be refused for as long as the layout stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_tile_reconnect_carries_a_token_made_for_it() {
+    use fcvm::fleet::coord::admission::AdmitKey;
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let s2 = seen.clone();
+    async fn drop_at_once(
+        ws: WebSocketUpgrade,
+        Query(q): Query<HashMap<String, String>>,
+        State(seen): State<Arc<Mutex<Vec<String>>>>,
+    ) -> impl IntoResponse {
+        seen.lock()
+            .unwrap()
+            .push(q.get("admit").cloned().unwrap_or_default());
+        ws.on_upgrade(|s| async move { drop(s) })
+    }
+    let app = Router::new()
+        .route("/frames", get(drop_at_once))
+        .with_state(s2);
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let whole = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+    let shared = Shared::new();
+    shared.set_layout(Layout {
+        epoch_unix_ms: now_ms(),
+        image_aspect: 16.0 / 9.0,
+        region: whole,
+        tiles: vec![TileSpec {
+            id: "slot-1".into(),
+            rect: whole,
+            url: Some(format!("ws://{a}/frames")),
+        }],
+        generation: 0,
+        from_frame: 0,
+        admit_keys: vec![AdmitKey([4; 32]).hex()],
+    });
+    let cancel = CancellationToken::new();
+    tokio::spawn(run(
+        shared.clone(),
+        Arc::new(Raw),
+        Options {
+            image_height: 36,
+            ..Options::default()
+        },
+        cancel.clone(),
+    ));
+    // Reconnects come every 250 ms; tokens name their expiry to the second, so 2.5 s of
+    // reconnects made at their own moment hold more than one.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    cancel.cancel();
+    let seen = seen.lock().unwrap().clone();
+    assert!(seen.len() >= 4, "{} subscriptions", seen.len());
+    assert!(
+        seen.iter().all(|t| !t.is_empty()),
+        "a subscription without a token"
+    );
+    let distinct: std::collections::BTreeSet<&String> = seen.iter().collect();
+    assert!(
+        distinct.len() >= 2,
+        "every reconnect reused the first token"
+    );
+}
+
+/// Before its first layout an aggregator does not know whether streams need a token, so its
+/// public listener serves none: a socket opened then would keep its frames after a layout
+/// with keys arrives. A layout without keys serves anyone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_public_listener_serves_nothing_before_the_first_layout() {
+    use fcvm::fleet::aggregate::public_router;
+    let shared = Shared::new();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let app = shared.clone();
+    tokio::spawn(async move { axum::serve(l, public_router(app)).await.unwrap() });
+    let refused = |r: Result<_, tokio_tungstenite::tungstenite::Error>| match r {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            resp.status().is_client_error() || resp.status().is_server_error()
+        }
+        _ => false,
+    };
+    assert!(refused(
+        tokio_tungstenite::connect_async(format!("ws://{addr}/frames")).await
+    ));
+    let whole = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+    shared.set_layout(Layout {
+        epoch_unix_ms: now_ms(),
+        image_aspect: 16.0 / 9.0,
+        region: whole,
+        tiles: vec![],
+        generation: 0,
+        from_frame: 0,
+        admit_keys: Vec::new(),
+    });
+    assert!(
+        tokio_tungstenite::connect_async(format!("ws://{addr}/frames"))
+            .await
+            .is_ok()
+    );
 }

@@ -13,20 +13,27 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
+/// `keys`: the layout's admission keys; each attempt subscribes with a token made for it, so a
+/// tile that drops after the first token expired is not refused.
 pub(crate) async fn read(
     tile: usize,
-    url: String,
+    base: String,
+    keys: Vec<String>,
     codec: Arc<dyn Codec>,
     fps: u32,
     events: mpsc::Sender<TileEvent>,
     cancel: CancellationToken,
 ) {
     while !cancel.is_cancelled() {
+        let url = match super::own_token(&keys) {
+            Some(token) => format!("{base}&admit={token}"),
+            None => base.clone(),
+        };
         tokio::select! {
             _ = cancel.cancelled() => return,
             r = stream(tile, &url, codec.as_ref(), fps, &events) => {
                 if let Err(e) = r {
-                    tracing::debug!(%url, error = %format!("{e:#}"), "tile stream ended");
+                    tracing::debug!(url = %base, error = %format!("{e:#}"), "tile stream ended");
                 }
             }
         }

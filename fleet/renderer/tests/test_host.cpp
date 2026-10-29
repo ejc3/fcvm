@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "../src/admit.h"
 #include "../src/budget.h"
 #include "../src/params.h"
 #include "../src/font_sdf.h"
@@ -119,6 +120,44 @@ static void check_autopilot_lap() {
 }
 
 int main() {
+  // --- direct-stream admission (fleet/PROTOCOL.md "admission"; the same vector is in
+  // src/fleet/coord/admission.rs: key 07 x 32, viewer v-3, expiry 1000)
+  {
+    const std::string key(32, '\x07');
+    const std::string tok = "v1.1000.v-3.77RQqtaEAwJ9OBEoNeX1QubmZTlMfZcYJtIdWkCSW7Q";
+    CHECK(admit_token_valid({key}, tok, 999) && admit_token_valid({key}, tok, 1000), "the coordinator's token opens a stream");
+    CHECK(!admit_token_valid({key}, tok, 1001), "an expired token");
+    CHECK(!admit_token_valid({std::string(32, '\x08')}, tok, 999), "another key's token");
+    CHECK(admit_token_valid({std::string(32, '\x08'), key}, tok, 999), "the previous key still opens a stream");
+    for (const char* bad : {"", "v1", "v1.1000.v-3", "v2.1000.v-3.77RQqtaEAwJ9OBEoNeX1QubmZTlMfZcYJtIdWkCSW7Q",
+                            "v1.9999.v-3.77RQqtaEAwJ9OBEoNeX1QubmZTlMfZcYJtIdWkCSW7Q", "v1..v-3.x", "v1.1000..x"})
+      CHECK(!admit_token_valid({key}, bad, 0), "refused: %s", bad);
+    CHECK(admit_key_from_hex(std::string(64, '7')).size() == 32, "hex key");
+    bool threw = false;
+    try { admit_key_from_hex("zz"); } catch (const std::exception&) { threw = true; }
+    CHECK(threw, "a bad hex key is refused");
+    auto held = admit_keys_after({"a", "b"}, {"c"});
+    CHECK(held.size() == 3 && held[0] == "c" && held[1] == "a", "a new key keeps the old ones after it");
+    CHECK(admit_keys_after({"a", "b", "c", "d"}, {"e"}).size() == 4, "at most 4 keys");
+    // A scene carries them as hex; a scene without them carries none.
+    std::string with = std::string(kContractExample);
+    with.insert(with.rfind('}'), ", \"admit_keys\": [\"" + std::string(64, '7') + "\"]");
+    CHECK(parse_scene(with).admit_keys.size() == 1 && parse_scene(kContractExample).admit_keys.empty(), "admit_keys in a scene");
+  }
+  // GET /frames asks the pipeline before it upgrades (server.cpp, which needs the pipeline and
+  // so is not built here).
+  {
+    auto src = source_lines("../src/server.cpp");
+    long frames = -1, admits = -1, upgrade = -1;
+    for (size_t i = 0; i < src.size(); i++) {
+      if (frames < 0 && src[i].find("path == \"/frames\" && method == \"GET\"") != std::string::npos) frames = (long)i;
+      if (frames >= 0 && admits < 0 && src[i].find("p_.admits(query_str(query, \"admit\"") != std::string::npos) admits = (long)i;
+      if (frames >= 0 && upgrade < 0 && src[i].find("return websocket(") != std::string::npos) upgrade = (long)i;
+    }
+    CHECK(frames >= 0 && admits > frames && upgrade > admits, "/frames checks the direct token before it upgrades (%ld %ld %ld)",
+          frames, admits, upgrade);
+  }
+
   check_autopilot_lap();
   // --- WebSocket handshake (RFC 6455 section 1.3 example)
   CHECK(ws_accept("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "got %s",
