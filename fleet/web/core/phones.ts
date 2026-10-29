@@ -159,6 +159,19 @@ export function layoutPhones(inp: PhoneLayoutInput): PhoneLayout {
     const box: Box = { x: bezel.x + b.pad.left, y: bezel.y + b.pad.top, w: b.sw, h: b.sh };
     return { box, bezel, pad: b.pad, u: f };
   };
+  /**
+   * Where a phone sits in the seamless view: its part of the picture, or, for a turned phone
+   * (its stream's orientation is not its rect's), its whole screen fitted inside that part and
+   * centred, since a turned phone draws its whole screen.
+   */
+  const seamlessBox = (id: string, rect: Box | null): Box | null => {
+    const a = inp.aspects?.[id];
+    if (rect === null || rect.h <= 0 || a === undefined || !(a > 0) || !Number.isFinite(a)) return rect;
+    if (rect.w / rect.h > 1 === a > 1) return rect;
+    const h = Math.min(rect.h, rect.w / a);
+    const w = h * a;
+    return { x: rect.x + (rect.w - w) / 2, y: rect.y + (rect.h - h) / 2, w, h };
+  };
   const place = (id: string, apart: Box | null, stitched: Box | null, label: Box | null): PhoneBox => {
     if (apart === null) return { id, box: null, bezel: null, pad: NO_PAD, radius: 0, bezelOpacity: 0, label: null };
     // A body that grows from the screen's own edge: its pad follows the box it surrounds.
@@ -212,7 +225,7 @@ export function layoutPhones(inp: PhoneLayoutInput): PhoneLayout {
       };
       const fit = fitBody(t.id, cell);
       const label: Box = { x: cell.x, y: cell.y + cell.h + 6, w: cell.w, h: labelH - 6 };
-      return place(t.id, fit.box, rectOnScreen(fitted, t.rect, dpr), label);
+      return place(t.id, fit.box, seamlessBox(t.id, rectOnScreen(fitted, t.rect, dpr)), label);
     }),
   };
 }

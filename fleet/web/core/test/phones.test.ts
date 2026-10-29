@@ -203,6 +203,21 @@ describe("layout", () => {
     expect(overlap(bodies[0]!, bodies[1]!)).toBe(false);
   });
 
+  it("keeps a turned phone's aspect in the seamless view, inside its part of the picture", () => {
+    const p = phonesOf(2);
+    const seamless = layoutOf(p, 0, {});
+    const L = layoutOf(p, 0, { aspects: { "phone:1": 16 / 9 } });
+    const turned = L.phones[0]!.box!;
+    const rect = seamless.phones[0]!.box!;
+    expect(turned.w / turned.h).toBeCloseTo(16 / 9, 6);
+    expect(turned.x).toBeGreaterThanOrEqual(rect.x - 1e-6);
+    expect(turned.x + turned.w).toBeLessThanOrEqual(rect.x + rect.w + 1e-6);
+    expect(turned.y).toBeGreaterThanOrEqual(rect.y - 1e-6);
+    expect(turned.y + turned.h).toBeLessThanOrEqual(rect.y + rect.h + 1e-6);
+    // the upright one keeps its stitched rect
+    expect(L.phones[1]!.box).toEqual(seamless.phones[1]!.box);
+  });
+
   it("runs the zoom over the wall's zoom time", () => {
     expect(zoomProgressAt(0, 1, 1000, 1000)).toBe(0);
     expect(zoomProgressAt(0, 1, 1000, 1000 + ZOOM_MS / 2)).toBeCloseTo(0.5, 9);
