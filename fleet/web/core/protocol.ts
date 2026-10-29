@@ -64,8 +64,12 @@ export interface Tile {
   /** Where the tile runs, worded for a viewer (`EC2 in us-east-1`); null until the slot reports it. */
   place: string | null;
   last_relaunch: LastRelaunch | null;
-  /** Lent to a visitor as their own GPU until this time; it sits out races meanwhile. */
-  borrowed: { until: number } | null;
+  /**
+   * Lent to a visitor as their own GPU until this time; it sits out races meanwhile. A phone
+   * also names the borrow: its `session` (what `phone_action` and `release_phone` pass back as
+   * `claim`), the `viewer` holding it and when it was taken.
+   */
+  borrowed: { until: number; session?: string; viewer?: string; since?: number } | null;
 }
 
 export interface CameraKey {
@@ -344,6 +348,25 @@ export interface Layout {
 /** Renderer frames per second: frame k is drawn at t = k / FRAME_RATE. */
 export const FRAME_RATE = 30;
 
+/**
+ * Phones mode (PROTOCOL.md, "Phones mode"): phones laid out in an image of their own, never
+ * part of the wall. A phone is a Tile, with the borrow named in `borrowed`.
+ */
+export interface Phones {
+  /** Width over height of the phones' image: one row of up to six phones, then rows of equal length. */
+  image_aspect: number;
+  /** How long a borrow lasts, seconds. */
+  claim_secs: number;
+  borrow: Borrow;
+  /** The take-over actions the coordinator accepts, by name. */
+  actions: string[];
+  /** Zoomed out for every viewer: the phones show their app's own interface, apart in bezels. */
+  zoomed_out: boolean;
+  /** Unix ms at which the current zoom state took effect, or null before the first change. */
+  zoom_at: number | null;
+  tiles: Tile[];
+}
+
 export interface FleetState {
   layout: Layout;
   tiles: Tile[];
@@ -367,6 +390,8 @@ export interface FleetState {
   viewers: { count: number; active: number };
   actions: Action[];
   aggregates: Aggregate[];
+  /** Null when the fleet runs no phones. */
+  phones: Phones | null;
 }
 
 export interface SnapshotMsg {
@@ -472,7 +497,7 @@ export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg | HelloMs
 export const DEFAULT_IMAGE_ASPECT = 16 / 9;
 
 /** The intents the page sends, by the coordinator's names (PROTOCOL.md, "Intents"). */
-export const INTENT_NAMES = ["relaunch", "restart_now", "nudge", "word", "light", "claim_gpu", "claim_camera", "claim_autopilot", "release_gpu"] as const;
+export const INTENT_NAMES = ["relaunch", "restart_now", "nudge", "word", "light", "claim_gpu", "claim_camera", "claim_autopilot", "release_gpu", "claim_phone", "release_phone", "phone_action", "phones_zoom"] as const;
 export type IntentName = (typeof INTENT_NAMES)[number];
 
 export interface IntentMsg {
@@ -621,7 +646,42 @@ function parseTile(v: unknown, i: number): Tile {
     host: strOrNull(v, "host", where),
     place: strOrNull(v, "place", where),
     last_relaunch: parseLastRelaunch(v["last_relaunch"], `${where}.last_relaunch`),
-    borrowed: isObj(v["borrowed"]) ? { until: num(v["borrowed"], "until", `${where}.borrowed`) } : null,
+    borrowed: isObj(v["borrowed"]) ? parseBorrowed(v["borrowed"], `${where}.borrowed`) : null,
+  };
+}
+
+function parseBorrowed(b: Obj, where: string): NonNullable<Tile["borrowed"]> {
+  const out: NonNullable<Tile["borrowed"]> = { until: num(b, "until", where) };
+  const session = strOrNull(b, "session", where);
+  if (session !== null) out.session = session;
+  const viewer = strOrNull(b, "viewer", where);
+  if (viewer !== null) out.viewer = viewer;
+  const since = numOrNull(b, "since", where);
+  if (since !== null) out.since = since;
+  return out;
+}
+
+function parsePhones(v: unknown): Phones | null {
+  if (v === null || v === undefined) return null;
+  if (!isObj(v)) throw new ProtocolError("phones is not an object");
+  const w = "phones";
+  const aspect = num(v, "image_aspect", w);
+  if (aspect <= 0) throw new ProtocolError("phones.image_aspect is not positive");
+  const b = obj(v, "borrow", w);
+  const tiles = arr(v, "tiles", w).map((t, i) => parseTile(t, i));
+  const ids = new Set<string>();
+  for (const t of tiles) {
+    if (ids.has(t.id)) throw new ProtocolError(`phone ${t.id} appears twice`);
+    ids.add(t.id);
+  }
+  return {
+    image_aspect: aspect,
+    claim_secs: num(v, "claim_secs", w),
+    borrow: { cap: num(b, "cap", `${w}.borrow`), lent: num(b, "lent", `${w}.borrow`), next_return_at: numOrNull(b, "next_return_at", `${w}.borrow`) },
+    actions: arr(v, "actions", w).filter((x): x is string => typeof x === "string"),
+    zoomed_out: v["zoomed_out"] === true,
+    zoom_at: numOrNull(v, "zoom_at", w),
+    tiles,
   };
 }
 
@@ -819,6 +879,7 @@ function parseState(o: Obj): FleetState {
         tiles: arr(a, "tiles", where).filter((x): x is string => typeof x === "string"),
       };
     }),
+    phones: parsePhones(o["phones"]),
   };
 }
 

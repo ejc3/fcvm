@@ -27,6 +27,7 @@ beforeAll(async () => {
     borrowCap: 1, claimSecs: 1, holdSecs: 600, travelSecs: 0.5, turnstileSitekey: null,
     sleepAfterSecs: 0, wakeMs: 800, mediaDir: MEDIA,
     refusedWords: ["forbidden"], checkMs: 20, epochUnixMs, renderers,
+    phones: { count: 3, cap: 2, claimSecs: 2, cooldownSecs: 1, restoreMs: 150, zoomGapMs: 300 },
   });
   await coord.listen();
 });
@@ -704,6 +705,139 @@ describe("mock race, second design review", () => {
   });
 });
 
+describe("mock phones", () => {
+  type PhonesState = { zoomed_out: boolean; zoom_at: number | null; borrow: { cap: number; lent: number }; tiles: { id: string; slot: string; phase: string; borrowed: { session: string; viewer: string } | null; last_relaunch: { by: string; first_frame_at: number | null } }[] };
+  const phonesNow = () => (coord.fleetState() as unknown as { phones: PhonesState }).phones;
+  let seq = 0;
+  /** Send an intent and wait for its receipt. */
+  async function send(c: Awaited<ReturnType<typeof live>>, name: string, args: Record<string, unknown> = {}) {
+    const id = `ph-${++seq}`;
+    c.ws.send(JSON.stringify({ type: "intent", id, name, args }));
+    return (await c.next((m) => m["type"] === "receipt" && m["id"] === id)) as { outcome: string; reason?: string };
+  }
+  const settle = async () => {
+    await admin("/mock/phones", { release_all: true, zoomed_out: false });
+    await until(() => phonesNow().tiles.every((t) => t.phase === "running"));
+  };
+
+  it("lays the phones out as one row, with a stream each", async () => {
+    await settle();
+    const p = phonesNow();
+    expect(p.tiles.map((t) => t.id)).toEqual(["phone:1", "phone:2", "phone:3"]);
+    expect(coord.fleetState().tiles.some((t) => t.id.startsWith("phone"))).toBe(false);
+    const st = coord.fleetState() as unknown as { phones: { image_aspect: number; actions: string[]; tiles: { rect: unknown }[] } };
+    expect(st.phones.image_aspect).toBeCloseTo((3 * 720) / 1280, 9);
+    expect(st.phones.tiles[1]!.rect).toEqual({ x: 1 / 3, y: 0, w: 1 / 3, h: 1 });
+    expect(st.phones.actions).toHaveLength(8);
+  });
+
+  it("lends a phone to one viewer at a time, up to the cap, and refuses with the coordinator's reasons", async () => {
+    await settle();
+    const a = await live();
+    const b = await live();
+    const c = await live();
+    expect(await send(a, "claim_phone", { phone: "phone-2" })).toMatchObject({ outcome: "committed" });
+    const held = phonesNow().tiles[1]!.borrowed!;
+    expect(held.session).toMatch(/^phone-claim-\d+$/);
+    expect(await send(a, "claim_phone")).toMatchObject({ outcome: "refused", reason: "one phone per client at a time" });
+    expect(await send(b, "claim_phone", { phone: "phone-2" })).toMatchObject({ outcome: "refused", reason: "phone-2 is lent to another viewer" });
+    expect(await send(b, "claim_phone", { phone: "phone-9" })).toMatchObject({ outcome: "refused", reason: 'no phone "phone-9"' });
+    // Without a name, the lowest-numbered free phone.
+    expect(await send(b, "claim_phone")).toMatchObject({ outcome: "committed" });
+    expect(phonesNow().tiles[0]!.borrowed).not.toBeNull();
+    expect(await send(c, "claim_phone")).toMatchObject({ outcome: "refused", reason: expect.stringMatching(/^2 of 2 phones are already lent; the next comes back in \d+ s$/) });
+    for (const x of [a, b, c]) x.ws.close();
+  });
+
+  it("takes only the enumerated actions, from the holder, one a second", async () => {
+    await settle();
+    const a = await live();
+    const b = await live();
+    expect(await send(a, "phone_action", { action: "rotate" })).toMatchObject({ outcome: "refused", reason: "phone actions need a phone of your own (claim_phone)" });
+    await send(a, "claim_phone", { phone: "phone-1" });
+    const session = phonesNow().tiles[0]!.borrowed!.session;
+    for (const bad of [{ action: "rm -rf" }, {}, { action: 3 }]) {
+      expect(await send(a, "phone_action", { ...bad, claim: session })).toMatchObject({
+        outcome: "refused",
+        reason: "args.action must be one of switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, reboot_phone",
+      });
+    }
+    expect(await send(a, "phone_action", { action: "rotate", claim: "phone-claim-0" })).toMatchObject({ outcome: "refused", reason: '"phone-claim-0" is not this viewer\'s phone' });
+    expect(await send(b, "phone_action", { action: "rotate", claim: session })).toMatchObject({ outcome: "refused" });
+    expect(await send(a, "phone_action", { action: "rotate", claim: session })).toMatchObject({ outcome: "committed" });
+    expect(await send(a, "phone_action", { action: "wave", claim: session })).toMatchObject({ outcome: "refused", reason: expect.stringMatching(/^one action a second; wait \d+ ms$/) });
+    await sleep(1050);
+    expect(await send(a, "phone_action", { action: "wave" })).toMatchObject({ outcome: "committed" });
+    const recorded = (await (await fetch(`http://localhost:${coord.port}/mock/phone-actions`)).json()) as { actions: { action: string; phone: string; session: string }[] };
+    expect(recorded.actions.map((x) => [x.action, x.phone, x.session])).toEqual([["rotate", "phone-1", session], ["wave", "phone-1", session]]);
+    a.ws.close();
+    b.ws.close();
+  });
+
+  it("reboots a borrowed phone: unavailable, then running with a new restore", async () => {
+    await settle();
+    const a = await live();
+    await send(a, "claim_phone", { phone: "phone-3" });
+    const session = phonesNow().tiles[2]!.borrowed!.session;
+    expect(await send(a, "phone_action", { action: "reboot_phone", claim: session })).toMatchObject({ outcome: "committed" });
+    expect(phonesNow().tiles[2]).toMatchObject({ phase: "restoring", last_relaunch: { by: `reboot:${session}`, first_frame_at: null } });
+    await until(() => phonesNow().tiles[2]!.phase === "running");
+    expect(phonesNow().tiles[2]!.last_relaunch.first_frame_at).not.toBeNull();
+    expect(phonesNow().tiles[2]!.borrowed!.session).toBe(session);
+    a.ws.close();
+  });
+
+  it("takes a phone back when it is released, when the viewer leaves and when the time is up, and makes the viewer wait to borrow again", async () => {
+    await settle();
+    const a = await live();
+    await send(a, "claim_phone", { phone: "phone-1" });
+    const session = phonesNow().tiles[0]!.borrowed!.session;
+    expect(await send(a, "release_phone", { claim: "other" })).toMatchObject({ outcome: "refused" });
+    expect(await send(a, "release_phone", { claim: session })).toMatchObject({ outcome: "committed" });
+    expect(phonesNow().tiles[0]).toMatchObject({ borrowed: null, last_relaunch: { by: `return:${session}` } });
+    expect(await send(a, "release_phone")).toMatchObject({ outcome: "refused", reason: "this viewer holds no phone" });
+    expect(await send(a, "claim_phone", { phone: "phone-2" })).toMatchObject({ outcome: "refused", reason: expect.stringMatching(/^your last phone was returned \d+ s ago; borrow again in \d+ s$/) });
+    await until(() => phonesNow().tiles[0]!.phase === "running");
+    // A viewer that leaves gives its phone back.
+    const b = await live();
+    await sleep(1100);
+    await send(b, "claim_phone", { phone: "phone-2" });
+    const s2 = phonesNow().tiles[1]!.borrowed!.session;
+    b.ws.close();
+    await until(() => phonesNow().tiles[1]!.borrowed === null);
+    expect(phonesNow().tiles[1]!.last_relaunch.by).toBe(`return:${s2}`);
+    // The borrow ends after claimSecs (2 s here).
+    await until(() => phonesNow().tiles.every((t) => t.phase === "running"));
+    const c = await live();
+    await send(c, "claim_phone", { phone: "phone-3" });
+    await until(() => phonesNow().tiles[2]!.borrowed === null, 4000);
+    c.ws.close();
+    a.ws.close();
+  });
+
+  it("shares the zoom: one viewer's phones_zoom is every viewer's, at most one a gap per viewer", async () => {
+    await settle();
+    const a = await live();
+    const b = await live();
+    expect(phonesNow().zoomed_out).toBe(false);
+    expect(await send(a, "phones_zoom", { out: "yes" })).toMatchObject({ outcome: "refused", reason: "args.out must be true or false" });
+    expect(await send(a, "phones_zoom", { out: true })).toMatchObject({ outcome: "committed" });
+    expect(phonesNow().zoomed_out).toBe(true);
+    const at = phonesNow().zoom_at;
+    expect(at).not.toBeNull();
+    expect(await send(a, "phones_zoom", { out: false })).toMatchObject({ outcome: "refused", reason: expect.stringMatching(/^one zoom every 0\.3 s; wait \d+ ms$/) });
+    expect(phonesNow().zoomed_out).toBe(true);
+    // Another viewer is not held by the first one's gap, and asking for the state it is in changes nothing.
+    expect(await send(b, "phones_zoom", { out: true })).toMatchObject({ outcome: "committed" });
+    expect(phonesNow().zoom_at).toBe(at);
+    await sleep(320);
+    expect(await send(a, "phones_zoom", { out: false })).toMatchObject({ outcome: "committed" });
+    expect(phonesNow().zoomed_out).toBe(false);
+    a.ws.close();
+    b.ws.close();
+  });
+});
+
 describe("the mock speaks the coordinator's snapshot shapes", () => {
   // The coordinator's own states (#1146, core/test/fixtures/coordinator.json): every
   // field the mock sends must be one the coordinator sends, at the same path.
@@ -713,6 +847,12 @@ describe("the mock speaks the coordinator's snapshot shapes", () => {
    * or with GPU readings), so listed by hand with the line that documents it.
    */
   const DOCUMENTED: Record<string, string> = {
+    "phones.tiles[].borrowed": '"borrowed": {"session", "viewer", "since", "until"}',
+    "phones.tiles[].gpu_stats": "as a wall tile's",
+    "phones.tiles[].last_relaunch.phases": "as a wall tile's",
+    "actions[].args.out": "phones_zoom's argument, in the activity log",
+    "phones.zoomed_out": "phones_zoom: the zoom every viewer shares",
+    "phones.zoom_at": "phones_zoom: when the current zoom state took effect",
     "tiles[].borrowed.until": '"borrowed": {"session", "viewer", "since", "until"}',
     "tiles[].gpu_stats": '"gpu_stats": { ... }, the agent\'s readings',
     "fleet.power.hosts[]": '"hosts": [{"host": "i-...", "phases": [{"phase", "at"}]}]',

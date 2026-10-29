@@ -40,6 +40,7 @@ import {
   type ZoomStep,
 } from "../../core/index.ts";
 import { canDecodeH264, WallClient } from "./wall-client.ts";
+import { boxOf, sameBox, useMedia } from "./hooks.ts";
 import { FocusPanel } from "./FocusPanel.tsx";
 import { OwnGpu } from "./OwnGpu.tsx";
 import { HalfClockView, Overlays, WakeCard } from "./Overlays.tsx";
@@ -85,30 +86,6 @@ function downlink(): number | null {
   if (typeof navigator === "undefined") return null;
   const c = (navigator as unknown as { connection?: { downlink?: unknown } }).connection;
   return typeof c?.downlink === "number" && c.downlink > 0 ? c.downlink : null;
-}
-
-function boxOf(el: Element | null): Box | null {
-  if (!el) return null;
-  const r = el.getBoundingClientRect();
-  if (r.width <= 0 || r.height <= 0) return null;
-  return { x: r.left, y: r.top, w: r.width, h: r.height };
-}
-
-function sameBox(a: Box | null, b: Box | null): boolean {
-  if (a === null || b === null) return a === b;
-  return a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h;
-}
-
-function useMedia(query: string): boolean {
-  const subscribe = useCallback(
-    (fn: () => void) => {
-      const m = window.matchMedia(query);
-      m.addEventListener("change", fn);
-      return () => m.removeEventListener("change", fn);
-    },
-    [query],
-  );
-  return useSyncExternalStore(subscribe, () => window.matchMedia(query).matches, () => false);
 }
 
 declare global {

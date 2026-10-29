@@ -650,7 +650,6 @@ function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMs
   if (direct && hasAgg && sug.mode === "aggregated") streamsNote += `. ${sug.reason}`;
   if (s.ui.mode !== s.ui.shownMode) streamsNote = `switching. ${streamsNote}`;
 
-  const ts = s.turnstile;
   return {
     title: "Direct the scene",
     close: "Close",
@@ -668,13 +667,19 @@ function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMs
     streams: { label: "See every VM's own stream", on: direct, note: streamsNote, disabled: !hasAgg || watchesBroadcast(s) },
     broadcast: broadcastToggle(s),
     stats: { label: "Show stream stats", on: s.ui.stats, family: familyLine(s.net) },
-    verify: {
-      needed: ts.sitekey !== null && !ts.verified,
-      title: "One check first",
-      text: ts.verifying ? "Checking" : "One check before your first action, so the fleet stays for people.",
-      error: ts.error ?? "",
-    },
+    verify: verifyView(s),
     disabled: !online,
+  };
+}
+
+/** The one check before a first action: whether it is needed, and what it says. */
+export function verifyView(s: ClientState): PlayView["verify"] {
+  const ts = s.turnstile;
+  return {
+    needed: ts.sitekey !== null && !ts.verified,
+    title: "One check first",
+    text: ts.verifying ? "Checking" : "One check before your first action, so the fleet stays for people.",
+    error: ts.error ?? "",
   };
 }
 
@@ -819,7 +824,7 @@ function sparkline(samples: readonly GpuSample[], key: "temp_c" | "power_w" | "u
   return vals.map((v, i) => `${((i / (vals.length - 1)) * 100).toFixed(1)},${(22 - ((v - lo) / span) * 20).toFixed(1)}`).join(" ");
 }
 
-function timelineOf(phases: Record<string, number>): { steps: TimelineStep[]; total: number } {
+export function timelineOf(phases: Record<string, number>): { steps: TimelineStep[]; total: number } {
   const parts = relaunchParts(phases);
   const total = parts.reduce((a, [, , ms]) => a + ms, 0);
   let at = 0;

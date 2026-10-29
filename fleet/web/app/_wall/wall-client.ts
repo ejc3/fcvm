@@ -24,9 +24,11 @@ import {
   type ClientState,
   type DrawPlan,
   type Family,
+  type FleetState,
   type IntentName,
   type HistoryEntry,
   type ShownFrame,
+  type Tile,
   type UiState,
 } from "../../core/index.ts";
 import type { BenchStats, CaptureResult, DrawSettings, FromWorker, ToWorker, TraceEntry } from "./worker-msgs.ts";
@@ -94,9 +96,12 @@ export class WallClient {
   shown: ShownFrame | null = null;
   /** The snapshot the overlay drew for that frame, kept while the picture is frozen. */
   pinned: HistoryEntry | null = null;
+  /** The tiles whose renderers the address-family probe tries: the wall's, or the phones' in phones mode. */
+  private probeTiles: (st: FleetState) => readonly Tile[];
 
-  constructor(url: string) {
+  constructor(url: string, probeTiles: (st: FleetState) => readonly Tile[] = (st) => st.tiles) {
     this.url = url;
+    this.probeTiles = probeTiles;
   }
 
   // ---- store ------------------------------------------------------------------
@@ -153,7 +158,7 @@ export class WallClient {
    * FAMILY_PROBE_ATTEMPTS of them the page settles on IPv4.
    */
   private probeFamily(s: ClientState): void {
-    const { urls, v4Urls, v4Only, v6Only } = familyProbeTargets(s.accepted!.tiles);
+    const { urls, v4Urls, v4Only, v6Only } = familyProbeTargets(this.probeTiles(s.accepted!));
     if (v4Only || v6Only) {
       this.probe = [];
       this.dispatch({ type: "family", family: v4Only ? "v4" : "v6", probeMs: null, via: "one-family" });

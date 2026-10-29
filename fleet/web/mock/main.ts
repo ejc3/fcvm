@@ -21,6 +21,12 @@
 //   FLEET_MOCK_SLEEP_AFTER_S with no visible viewer this long the fleet scales to zero (60; 0: never)
 //   FLEET_MOCK_WAKE_MS       how long a wake takes, first instance to every tile rendering (120000)
 //   FLEET_MOCK_MEDIA_DIR     where the generated recording is kept (node_modules/.cache/fleet-mock-media)
+//   FLEET_MOCK_PHONES        phones for phones mode (0: none, and no `phones` in the snapshot)
+//   FLEET_MOCK_PHONE_CAP     phones lent at once at most (2)
+//   FLEET_MOCK_PHONE_CLAIM_S how long a borrowed phone lasts (120)
+//   FLEET_MOCK_PHONE_COOLDOWN_S  after a phone comes back, its viewer waits this long to borrow again (60)
+//   FLEET_MOCK_PHONE_RESTORE_MS  a phone's restore after a reboot or a return (2000)
+//   FLEET_MOCK_PHONE_ZOOM_GAP_MS a viewer's zoom is refused sooner than this after its last (2000)
 //   FLEET_MOCK_FPS           frames per second, a divisor of 30 (30): frames land on t = k/30 as the renderer's do
 //   FLEET_MOCK_THREADS       render threads (12)
 //   FLEET_MOCK_MAX_HEIGHT    tallest stream it will encode (1080)
@@ -98,6 +104,18 @@ export async function startMock() {
     sleepAfterSecs: int("FLEET_MOCK_SLEEP_AFTER_S", 60),
     wakeMs: int("FLEET_MOCK_WAKE_MS", 120_000),
     mediaDir,
+    ...(int("FLEET_MOCK_PHONES", 0) > 0
+      ? {
+          phones: {
+            count: int("FLEET_MOCK_PHONES", 0),
+            cap: int("FLEET_MOCK_PHONE_CAP", 2),
+            claimSecs: int("FLEET_MOCK_PHONE_CLAIM_S", 120),
+            cooldownSecs: int("FLEET_MOCK_PHONE_COOLDOWN_S", 60),
+            restoreMs: int("FLEET_MOCK_PHONE_RESTORE_MS", 2000),
+            zoomGapMs: int("FLEET_MOCK_PHONE_ZOOM_GAP_MS", 2000),
+          },
+        }
+      : {}),
     refusedWords: env("FLEET_MOCK_REFUSED", "forbidden").split(",").filter(Boolean),
     checkMs: 250,
     epochUnixMs,

@@ -1,0 +1,52 @@
+/* Phones mode. The canvas draws the pictures (the same .frames layer as the wall); this sheet
+   styles what sits over it: the header, the phone bodies, the hit areas, the labels and the
+   panel of an opened phone. Colours and controls come from wall.css. */
+
+.phones-page { position: fixed; inset: 0; z-index: 1; display: flex; flex-direction: column; pointer-events: none; }
+.phones-top { display: flex; align-items: center; justify-content: space-between; gap: 12px 24px; padding: 14px 24px; min-height: 72px; background-image: linear-gradient(rgba(0, 0, 0, 0.72), rgba(0, 0, 0, 0)); }
+.phones-top .btn { pointer-events: auto; background: rgba(11, 13, 16, 0.55); }
+/* The room the phones are laid out in, measured by the page. */
+.phones-stage { flex: 1; min-height: 0; margin: 0 24px 24px; }
+
+.phones-layer { position: fixed; inset: 0; z-index: 2; pointer-events: none; }
+.phones-layer > * { position: absolute; }
+
+/* The body is a ring around the screen: its border is the pad, so the picture shows through the middle. */
+.phone-body { border-style: solid; border-color: #12151a; box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.16), 0 22px 48px rgba(0, 0, 0, 0.55); pointer-events: none; }
+.phone-body::before { content: ""; position: absolute; left: 50%; top: calc(var(--pt) * -0.5 - 2px); width: 26%; height: 4px; margin-left: -13%; border-radius: 2px; background: #2c323b; }
+.phone-body::after { content: ""; position: absolute; left: calc(50% + 17%); top: calc(var(--pt) * -0.5 - 3px); width: 6px; height: 6px; border-radius: 50%; background: #1d2128; box-shadow: inset 0 0 0 1px #343b46; }
+
+.phone-hit { padding: 0; border: 0; background: transparent; cursor: pointer; pointer-events: auto; border-radius: 4px; }
+.phone-hit:focus-visible { outline: 2px solid var(--fcvm); outline-offset: 2px; }
+
+.phone-label { display: flex; align-items: flex-start; justify-content: center; pointer-events: none; }
+.phone-label span { padding: 2px 9px; border-radius: 6px; background: var(--plate); font: 500 14px var(--mono); color: var(--text); white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+
+.phones-banner, .phones-empty, .phones-notice { position: fixed; z-index: 4; left: 50%; transform: translateX(-50%); width: max-content; max-width: min(560px, 92vw); padding: 10px 14px; border-radius: 10px; background: var(--panel); border: 1px solid var(--line); font-size: 15px; }
+.phones-banner { top: 76px; }
+.phones-empty { top: 40%; font-size: 17px; }
+/* Above an opened phone's panel (z-index 5), which on a narrow screen covers the bottom. */
+.phones-notice { bottom: 24px; z-index: 6; border-color: var(--refused); color: var(--refused); }
+
+/* ---- one phone opened ---------------------------------------------------------------- */
+
+.phone-sheet { position: fixed; z-index: 5; top: 72px; right: 16px; bottom: 16px; width: 380px; max-width: calc(100vw - 32px); display: flex; flex-direction: column; border-radius: 14px; background: rgba(13, 16, 20, 0.86); border: 1px solid rgba(255, 255, 255, 0.09); backdrop-filter: blur(16px) saturate(1.2); -webkit-backdrop-filter: blur(16px) saturate(1.2); box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45); }
+.phone-sheet-head { display: flex; padding: 10px 10px 4px; }
+.phone-sheet-body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 8px; padding: 4px 10px 10px; }
+.phone-sheet .card { background: rgba(255, 255, 255, 0.035); border-color: rgba(255, 255, 255, 0.08); padding: 10px 12px; gap: 8px; }
+.phone-sheet .card h1 { font: 600 22px var(--mono); color: var(--fcvm); }
+.phone-sheet .card .state { font-size: 15px; color: var(--muted); text-align: right; }
+.phone-sheet .card dl { gap: 3px 14px; }
+.phone-sheet .card .total { font: 600 22px var(--mono); color: var(--fcvm); }
+.phone-sheet .actions-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.phone-sheet .actions-grid .btn { justify-content: center; padding: 0 8px; }
+
+/* Narrow screens: the phone on top, the panel a bottom sheet under it (its top is set inline). */
+.phone-sheet.narrow { top: auto; left: 0; right: 0; bottom: 0; width: auto; max-width: none; border-radius: 16px 16px 0 0; border-bottom: 0; padding-bottom: env(safe-area-inset-bottom); }
+.phones-page .phones-top .brand h1 { font-size: 24px; }
+@media (max-width: 700px) {
+  .phones-top { padding: 10px 16px; min-height: 56px; }
+  .phones-page .phones-top .brand h1 { font-size: 20px; }
+  .phones-stage { margin: 0 8px 8px; }
+  .phone-label span { font-size: 12px; padding: 1px 4px; }
+}
