@@ -12,7 +12,7 @@ use fcvm::fleet::aggregate::compose::Picture;
 use fcvm::fleet::aggregate::frame::{Crop, Frame, Header};
 use fcvm::fleet::aggregate::{router, run, Layout, Options, Shared, TileSpec};
 use fleet_core::tiling::Rect;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1047,7 +1047,7 @@ fn every_fcvm_this_file_spawns_dies_with_the_test() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn with_admission_keys_frames_need_a_direct_token_and_tiles_get_one() {
     use fcvm::fleet::aggregate::public_router;
-    use fcvm::fleet::coord::admission::{direct_token_valid, AdmitKey};
+    use fcvm::fleet::coord::admission::AdmitKey;
     let key = AdmitKey([9; 32]);
     let epoch = now_ms() - 5_000;
     let queries = Arc::new(Mutex::new(Vec::new()));
@@ -1097,7 +1097,8 @@ async fn with_admission_keys_frames_need_a_direct_token_and_tiles_get_one() {
         ..Options::default()
     };
     tokio::spawn(run(shared.clone(), Arc::new(Raw), opts, cancel.clone()));
-    // The tile was asked with a token the key validates.
+    // The tile was subscribed, with no token in its URL (its token is the first message:
+    // `each_tile_reconnect_carries_a_token_made_for_it`).
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let asked = loop {
         if let Some(q) = queries.lock().unwrap().first().cloned() {
@@ -1109,33 +1110,45 @@ async fn with_admission_keys_frames_need_a_direct_token_and_tiles_get_one() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    let token = asked
-        .get("admit")
-        .expect("the subscription carries a token");
-    assert!(direct_token_valid(
-        std::slice::from_ref(&key),
-        token,
-        now_ms() / 1000
-    ));
-    // The public listener: refused without a token or with a forged one, served with one.
+    assert!(
+        !asked.contains_key("admit"),
+        "a token in the URL: {asked:?}"
+    );
+    // The public listener: closed with 1008 without a first message that carries a token
+    // made with the key, served with one. A token in the URL is not read.
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(l, public_router(shared)).await.unwrap() });
-    let refused = |r: Result<_, tokio_tungstenite::tungstenite::Error>| match r {
-        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => resp.status() == 403,
-        _ => false,
-    };
-    assert!(refused(
-        tokio_tungstenite::connect_async(format!("ws://{addr}/frames")).await
-    ));
-    let forged = AdmitKey([1; 32]).direct_token("v-9", now_ms() / 1000 + 600);
-    assert!(refused(
-        tokio_tungstenite::connect_async(format!("ws://{addr}/frames?admit={forged}")).await
-    ));
     let good = key.direct_token("v-1", now_ms() / 1000 + 600);
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/frames?admit={good}"))
+    let forged = AdmitKey([1; 32]).direct_token("v-9", now_ms() / 1000 + 600);
+    let first =
+        |token: Option<String>| token.map(|t| fcvm::fleet::aggregate::admit_first_message(&t));
+    for (url, msg) in [
+        (format!("ws://{addr}/frames"), None),
+        (format!("ws://{addr}/frames?admit={good}"), None),
+        (format!("ws://{addr}/frames"), first(Some(forged.clone()))),
+        (
+            format!("ws://{addr}/frames"),
+            Some(r#"{"h":540}"#.to_string()),
+        ),
+    ] {
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        if let Some(m) = &msg {
+            ws.send(Message::Text(m.clone().into())).await.unwrap();
+        }
+        match tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
+            Ok(Some(Ok(Message::Close(Some(f))))) => {
+                assert_eq!(u16::from(f.code), 1008, "{url} {msg:?}")
+            }
+            other => panic!("{url} {msg:?}: not closed with 1008: {other:?}"),
+        }
+    }
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/frames"))
         .await
-        .expect("a seated viewer's token opens the stream");
+        .unwrap();
+    ws.send(Message::Text(first(Some(good)).unwrap().into()))
+        .await
+        .unwrap();
     assert!(matches!(next_msg(&mut ws).await, Message::Text(_)));
     cancel.cancel();
 }
@@ -1153,10 +1166,17 @@ async fn each_tile_reconnect_carries_a_token_made_for_it() {
         Query(q): Query<HashMap<String, String>>,
         State(seen): State<Arc<Mutex<Vec<String>>>>,
     ) -> impl IntoResponse {
-        seen.lock()
-            .unwrap()
-            .push(q.get("admit").cloned().unwrap_or_default());
-        ws.on_upgrade(|s| async move { drop(s) })
+        assert!(!q.contains_key("admit"), "a token in the URL");
+        // The token is the subscription's first message.
+        ws.on_upgrade(move |mut s| async move {
+            let first = match s.recv().await {
+                Some(Ok(AxMessage::Text(t))) => {
+                    fcvm::fleet::aggregate::admit_message(&t).unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+            seen.lock().unwrap().push(first);
+        })
     }
     let app = Router::new()
         .route("/frames", get(drop_at_once))
@@ -1203,6 +1223,15 @@ async fn each_tile_reconnect_carries_a_token_made_for_it() {
     assert!(
         seen.iter().all(|t| !t.is_empty()),
         "a subscription without a token"
+    );
+    assert!(
+        seen.iter()
+            .all(|t| fcvm::fleet::coord::admission::direct_token_valid(
+                &[AdmitKey([4; 32])],
+                t,
+                now_ms() / 1000
+            )),
+        "a token the key does not validate"
     );
     let distinct: std::collections::BTreeSet<&String> = seen.iter().collect();
     assert!(

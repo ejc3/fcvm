@@ -77,6 +77,8 @@ pub struct AwsEc2 {
     /// Per region, the subnets (one per AZ) a launch tries in order, and the security group
     /// the tile's interface gets there. A region without subnets launches in the template's.
     pub networks: BTreeMap<String, Network>,
+    /// Sent as the bearer token of every scene and budget post (fleet/PROTOCOL.md, "Access").
+    pub scene_token: super::scene_token::SceneToken,
     chain: CredentialChain,
     http: reqwest::Client,
 }
@@ -399,6 +401,7 @@ impl AwsEc2 {
             throttle_attempts: 8,
             fleet: "stage".into(),
             networks: BTreeMap::new(),
+            scene_token: Default::default(),
             chain: CredentialChain::new()?,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
@@ -1039,7 +1042,12 @@ impl Ec2Driver for AwsEc2 {
         body: &RendererScene,
     ) -> Result<()> {
         let (client, url) = self.renderer(tile, launched, "/scene")?;
-        let r = client.post(&url).json(body).send().await?;
+        let r = self
+            .scene_token
+            .authorize(client.post(&url))
+            .json(body)
+            .send()
+            .await?;
         if !r.status().is_success() {
             bail!("POST {url} answered {}", r.status());
         }
@@ -1048,7 +1056,12 @@ impl Ec2Driver for AwsEc2 {
 
     async fn post_budget(&self, tile: &str, launched: &Launched, body: &BudgetBody) -> Result<()> {
         let (client, url) = self.renderer(tile, launched, "/budget")?;
-        let r = client.post(&url).json(body).send().await?;
+        let r = self
+            .scene_token
+            .authorize(client.post(&url))
+            .json(body)
+            .send()
+            .await?;
         if !r.status().is_success() {
             bail!("POST {url} answered {}", r.status());
         }

@@ -1,5 +1,7 @@
 // Host-side tests: no GPU needed. Scene contract parsing, camera interpolation
 // and holds, tile geometry, wire formats.
+#include <unistd.h>
+
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -8,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "../src/access.h"
 #include "../src/admit.h"
 #include "../src/budget.h"
 #include "../src/params.h"
@@ -144,18 +147,72 @@ int main() {
     with.insert(with.rfind('}'), ", \"admit_keys\": [\"" + std::string(64, '7') + "\"]");
     CHECK(parse_scene(with).admit_keys.size() == 1 && parse_scene(kContractExample).admit_keys.empty(), "admit_keys in a scene");
   }
-  // GET /frames asks the pipeline before it upgrades (server.cpp, which needs the pipeline and
-  // so is not built here).
+  // --- access (access.h, fleet/PROTOCOL.md "Access")
+  {
+    CHECK(scene_access(false, "", "") == 0, "a renderer outside the fleet takes any scene");
+    CHECK(scene_access(true, "", "Bearer x") == 503, "a fleet renderer without its token takes none");
+    CHECK(scene_access(true, "tok-1", "") == 401, "no Authorization header");
+    CHECK(scene_access(true, "tok-1", "Bearer tok-2") == 401, "another token");
+    CHECK(scene_access(true, "tok-1", "Bearer tok-1x") == 401, "a longer token");
+    CHECK(scene_access(true, "tok-1", "Basic tok-1") == 401, "another scheme");
+    CHECK(scene_access(true, "tok-1", "Bearer ") == 401, "an empty bearer");
+    CHECK(scene_access(true, "tok-1", "Bearer tok-1") == 0, "the token");
+    CHECK(frames_access(true, false) == 503 && frames_access(true, true) == 0 && frames_access(false, false) == 0,
+          "a fleet renderer streams nothing before its first scene");
+    std::string tok;
+    CHECK(admit_message("{\"admit\":\"v1.1.v-1.x\"}", &tok) && tok == "v1.1.v-1.x", "a first message's token");
+    CHECK(!admit_message("{\"h\":540}", &tok) && !admit_message("not json", &tok) && !admit_message("{\"admit\":5}", &tok),
+          "not an admit message");
+    CHECK(scene_token_from_text("{\"cert\":\"c\",\"key\":\"k\",\"scene_token\":\"s-1\"}", true) == "s-1" &&
+              scene_token_from_text("{\"cert\":\"c\",\"key\":\"k\"}", true).empty() &&
+              scene_token_from_text("  s-2\n", false) == "s-2" && scene_token_from_text("{", true).empty(),
+          "the token from the certificate JSON or its own file");
+    // The file is read again when it changes, and a removed file authorizes nothing.
+    char dir[] = "/tmp/fleet-access-XXXXXX";
+    CHECK(mkdtemp(dir) != nullptr, "temp dir");
+    std::string path = std::string(dir) + "/tls.json";
+    SceneToken st;
+    st.configure(path, true);
+    CHECK(st.configured() && st.current().empty(), "configured, no file yet");
+    { std::ofstream(path) << "{\"cert\":\"c\",\"key\":\"k\",\"scene_token\":\"s-1\"}"; }
+    CHECK(st.current() == "s-1", "loaded");
+    std::string tmp = path + ".new";
+    { std::ofstream(tmp) << "{\"cert\":\"c\",\"key\":\"k\",\"scene_token\":\"s-22\"}"; }
+    CHECK(rename(tmp.c_str(), path.c_str()) == 0, "rename");
+    CHECK(st.current() == "s-22", "a replaced file is read again");
+    unlink(path.c_str());
+    CHECK(st.current().empty(), "a removed file authorizes nothing");
+    rmdir(dir);
+    SceneToken none;
+    CHECK(!none.configured(), "no token file: not a fleet renderer");
+  }
+  // server.cpp needs the pipeline and so is not built here: where it asks these.
   {
     auto src = source_lines("../src/server.cpp");
-    long frames = -1, admits = -1, upgrade = -1;
-    for (size_t i = 0; i < src.size(); i++) {
-      if (frames < 0 && src[i].find("path == \"/frames\" && method == \"GET\"") != std::string::npos) frames = (long)i;
-      if (frames >= 0 && admits < 0 && src[i].find("p_.admits(query_str(query, \"admit\"") != std::string::npos) admits = (long)i;
-      if (frames >= 0 && upgrade < 0 && src[i].find("return websocket(") != std::string::npos) upgrade = (long)i;
-    }
-    CHECK(frames >= 0 && admits > frames && upgrade > admits, "/frames checks the direct token before it upgrades (%ld %ld %ld)",
-          frames, admits, upgrade);
+    auto find_from = [&](long from, const std::string& needle) -> long {
+      for (size_t i = from < 0 ? 0 : (size_t)from; i < src.size(); i++)
+        if (src[i].find(needle) != std::string::npos) return (long)i;
+      return -1;
+    };
+    long scene = find_from(0, "path == \"/scene\" || path == \"/budget\"");
+    long access = find_from(scene, "scene_access(fleet()");
+    long body = find_from(scene, "c.read(tmp, sizeof tmp)");
+    long post = find_from(scene, "p_.post_scene(body");
+    CHECK(scene >= 0 && access > scene && body > access && post > access,
+          "POST /scene and /budget check the scene token before they read or apply a body (%ld %ld %ld %ld)", scene, access, body, post);
+    long frames = find_from(0, "path == \"/frames\" && method == \"GET\"");
+    long gate = find_from(frames, "frames_access(fleet(), p_.has_scene())");
+    long upgrade = find_from(frames, "return websocket(");
+    CHECK(frames >= 0 && gate > frames && upgrade > gate, "/frames waits for the first scene before it upgrades (%ld %ld %ld)", frames,
+          gate, upgrade);
+    CHECK(find_from(0, "\"admit\"") < 0, "no direct token is read from the URL");
+    long ws = find_from(0, "void Server::websocket(");
+    long needs = find_from(ws, "p_.requires_admit()");
+    long first = find_from(needs, "admit_message(first, &token) || !p_.admits(token)");
+    long sub = find_from(ws, "p_.subscribe(h, q)");
+    CHECK(ws >= 0 && needs > ws && first > needs && sub > first,
+          "a stream that needs a direct token reads it from the first message before it subscribes (%ld %ld %ld %ld)", ws, needs, first,
+          sub);
   }
 
   check_autopilot_lap();

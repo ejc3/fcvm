@@ -32,6 +32,12 @@ pub enum ClientMsg {
     Visibility {
         visible: bool,
     },
+    /// The seat ticket a page kept from an earlier connection, as its first message (a URL
+    /// would carry it into proxy and access logs). Later ones are ignored.
+    Seat {
+        #[serde(default)]
+        ticket: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

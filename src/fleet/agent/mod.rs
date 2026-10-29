@@ -175,6 +175,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
     }
     // The renderers' certificate: fetched once before any VM starts, then kept current.
     let mut fcvm_args = args.fcvm_args.clone();
+    let scene_token = crate::fleet::coord::scene_token::SceneToken::default();
     if let Some(secret) = &args.tls_secret {
         let region = match &args.secret_region {
             Some(r) => r.clone(),
@@ -183,9 +184,14 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
                 .context("reading the instance's region (or pass --secret-region)")?,
         };
         let secrets = crate::fleet::coord::secrets::Secrets::new(&region)?;
-        tls::refresh(&secrets, secret, &args.tls_dir).await?;
+        tls::refresh(&secrets, secret, &args.tls_dir, &scene_token).await?;
         fcvm_args.extend(tls::vm_args(&args.tls_dir));
-        tokio::spawn(tls::run(secrets, secret.clone(), args.tls_dir.clone()));
+        tokio::spawn(tls::run(
+            secrets,
+            secret.clone(),
+            args.tls_dir.clone(),
+            scene_token.clone(),
+        ));
     }
     let ipv6_prefix = match (&args.ipv6_prefix, args.ipv6_prefix_from_imds) {
         (Some(p), _) => Some(addr::Prefix::parse(p)?),
@@ -238,6 +244,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             sysfs_root: args.sysfs_root,
             start_timeout: Duration::from_secs(args.start_timeout_secs),
             stop_grace: Duration::from_secs(30),
+            scene_token,
             gpu_free_timeout: Duration::from_secs(30),
             health_interval: Duration::from_secs(1),
             backoff_min: Duration::from_secs(1),

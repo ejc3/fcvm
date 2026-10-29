@@ -267,6 +267,17 @@ int main(int argc, char** argv) {
   Pipeline p(o);
   p.set_process_start(start);
   Server s(p);
+  // A fleet renderer's scene token (access.h): its own file on a tile instance, else beside
+  // the certificate.
+  SceneToken scene_token;
+  const char* token_file = getenv("SCENE_TOKEN_FILE");
+  const char* cert_json = getenv("TLS_CERT_FILE");
+  if (token_file && *token_file) scene_token.configure(token_file, false);
+  else if (cert_json && *cert_json) scene_token.configure(cert_json, true);
+  if (scene_token.configured()) {
+    s.set_scene_token(&scene_token);
+    fprintf(stderr, "fleet-renderer: fleet mode, scene token %s\n", scene_token.current().empty() ? "not loaded yet" : "loaded");
+  }
   std::string err;
   if (!s.listen(o.port, &err)) {
     fprintf(stderr, "fleet-renderer: %s\n", err.c_str());

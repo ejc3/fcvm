@@ -20,6 +20,7 @@ pub mod ecs;
 pub mod hosts;
 pub mod live;
 pub mod poster;
+pub mod scene_token;
 pub mod secrets;
 pub mod sigv4;
 pub mod store;
@@ -1021,6 +1022,17 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             None => (State::new(config, now_ms()), None),
         },
     };
+    // The renderers' scene token, from the certificate secret (fleet/PROTOCOL.md, "Access").
+    let scene_token = match &args.tls_secret {
+        Some(secret) => {
+            let secrets = secrets::Secrets::new(&secrets_region()?)?;
+            let t = scene_token::ensure(&secrets, secret).await?;
+            let held = scene_token::SceneToken::new(Some(t));
+            tokio::spawn(scene_token::follow(secrets, secret.clone(), held.clone()));
+            held
+        }
+        None => scene_token::SceneToken::default(),
+    };
     let ec2: Option<Arc<dyn ec2::Ec2Driver>> = match args.ec2 {
         FleetEc2::None => None,
         FleetEc2::Fake => Some(Arc::new(ec2::FakeEc2::new(
@@ -1038,6 +1050,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             d.pool_max = args.ec2_pool;
             d.pool_template = args.ec2_pool_template.clone();
             d.networks = ec2_aws::networks(&args.ec2_subnets, &args.ec2_security_group)?;
+            d.scene_token = scene_token.clone();
             Some(Arc::new(d))
         }
     };
@@ -1134,6 +1147,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         if let Some(d) = &args.acme_directory {
             renewal.directory = d.clone();
         }
+        renewal.scene_token = scene_token.get();
         tokio::spawn(cert::run(
             renewal,
             secrets::Secrets::new(&secrets_region()?)?,
@@ -1157,8 +1171,13 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             use crate::fleet::agent::tls;
             let dir = args.ec2_aggregate_tls_dir.clone();
             let secrets = secrets::Secrets::new(&secrets_region()?)?;
-            tls::refresh(&secrets, secret, &dir).await?;
-            tokio::spawn(tls::run(secrets, secret.clone(), dir.clone()));
+            tls::refresh(&secrets, secret, &dir, &scene_token::SceneToken::default()).await?;
+            tokio::spawn(tls::run(
+                secrets,
+                secret.clone(),
+                dir.clone(),
+                Default::default(),
+            ));
             argv.extend([
                 "--tls-file".into(),
                 dir.join(tls::FILE).to_string_lossy().into_owned(),

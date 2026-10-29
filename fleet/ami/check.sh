@@ -150,6 +150,31 @@ enable=$(grep -E '^ *systemctl enable ' fleet/ami/tile/build.sh)
 grep -qw 'fcvm-fleet-nginx.service' <<<"$enable" || no "tile/build.sh does not enable fcvm-fleet-nginx.service"
 grep -qE '(^| )nginx\.service' <<<"$enable" && no "tile/build.sh enables the distribution's nginx.service, which waits for network-online.target"
 
+# The tile's scene token (fleet/PROTOCOL.md, "Access"): fetch-cert.py writes the secret's
+# scene_token to its own directory, mode 0600, and fails on a secret without one; the
+# renderer's unit mounts that directory, not the key's, and names the file.
+ct=$(mktemp -d)
+mkdir -p "$ct/boto3"
+cat > "$ct/boto3/__init__.py" <<'PY'
+import json, os
+class _C:
+    def get_secret_value(self, SecretId):
+        return {"SecretString": os.environ["FAKE_SECRET"]}
+def client(*a, **k):
+    return _C()
+PY
+run_fetch() { FAKE_SECRET=$1 PYTHONPATH="$ct" FLEET_TLS_DIR="$ct/tls" FLEET_SCENE_DIR="$ct/scene" python3 -I -c 'import runpy, sys; sys.path.insert(0, sys.argv[1]); runpy.run_path(sys.argv[2], run_name="__main__")' "$ct" fleet/ami/tile/fetch-cert.py 2>/dev/null; }
+run_fetch '{"cert":"C","key":"K","scene_token":"s-1"}' && [ "$(cat "$ct/scene/token" 2>/dev/null)" = s-1 ] &&
+  [ "$(stat -c %a "$ct/scene/token")" = 600 ] && [ "$(cat "$ct/tls/key.pem")" = K ] ||
+  no "fetch-cert.py does not write the scene token beside the certificate"
+rm -rf "$ct/scene"
+run_fetch '{"cert":"C","key":"K"}' && no "fetch-cert.py succeeds on a secret without a scene token"
+rm -rf "$ct"
+unit=fleet/ami/tile/fcvm-fleet-renderer.service
+grep -q -- '-v /etc/fcvm-fleet/scene:/run/fleet-scene:ro -e SCENE_TOKEN_FILE=/run/fleet-scene/token' "$unit" ||
+  no "the renderer unit does not give the renderer its scene token"
+grep -q '/etc/fcvm-fleet/tls' <<<"$(grep '^ExecStart=' "$unit")" && no "the renderer unit mounts the certificate's key"
+
 # store-pack.py packs the store into parts and store.sh restores them all at once, each
 # part decompressed and extracted while the others are (one zstd stream decompresses on one
 # core), then the directories, then the staging copy. Both ways (staged and direct) the

@@ -13,8 +13,9 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
-/// `keys`: the layout's admission keys; each attempt subscribes with a token made for it, so a
-/// tile that drops after the first token expired is not refused.
+/// `keys`: the layout's admission keys; each attempt subscribes with a token made for it (its
+/// first message, fleet/PROTOCOL.md "Access"), so a tile that drops after the first token
+/// expired is not refused.
 pub(crate) async fn read(
     tile: usize,
     base: String,
@@ -25,13 +26,10 @@ pub(crate) async fn read(
     cancel: CancellationToken,
 ) {
     while !cancel.is_cancelled() {
-        let url = match super::own_token(&keys) {
-            Some(token) => format!("{base}&admit={token}"),
-            None => base.clone(),
-        };
+        let admit = super::own_token(&keys);
         tokio::select! {
             _ = cancel.cancelled() => return,
-            r = stream(tile, &url, codec.as_ref(), fps, &events) => {
+            r = stream(tile, &base, admit.as_deref(), codec.as_ref(), fps, &events) => {
                 if let Err(e) = r {
                     tracing::debug!(url = %base, error = %format!("{e:#}"), "tile stream ended");
                 }
@@ -50,11 +48,17 @@ pub(crate) async fn read(
 async fn stream(
     tile: usize,
     url: &str,
+    admit: Option<&str>,
     codec: &dyn Codec,
     fps: u32,
     events: &mpsc::Sender<TileEvent>,
 ) -> anyhow::Result<()> {
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await?;
+    if let Some(token) = admit {
+        use futures_util::SinkExt;
+        ws.send(Message::Text(super::admit_first_message(token).into()))
+            .await?;
+    }
     let mut header: Option<Arc<Header>> = None;
     // The decoder's input and output, held apart so one can be fed while the other drains.
     let mut dec_in: Option<mpsc::Sender<(f64, Vec<u8>)>> = None;
@@ -189,7 +193,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(256);
         tokio::spawn(async move {
             let codec = Narrow::new(vec![]);
-            stream(0, &url, &codec, 30, &tx).await
+            stream(0, &url, None, &codec, 30, &tx).await
         });
         let mut frames = 0;
         tokio::time::timeout(Duration::from_secs(10), async {

@@ -10,6 +10,9 @@ Description=fcvm fleet tile: the renderer on the instance's one GPU (HTTP on 127
 # The renderer takes two threads per frame stream, so podman's default pids limit (2048)
 # refused threads from about the 1,020th viewer (fleet/renderer/README.md, "Viewers per
 # renderer"); --pids-limit gives it room for 16,000 streams, past what the CPU serves.
+# The scene token (fleet/PROTOCOL.md, "Access") is /etc/fcvm-fleet/scene/token, which
+# fcvm-fleet-tls.service writes; the renderer reads it again whenever it changes, so it may
+# start first and refuses scenes until then.
 DefaultDependencies=no
 After=local-fs.target systemd-tmpfiles-setup.service nvidia-persistenced.service
 Wants=nvidia-persistenced.service
@@ -22,7 +25,8 @@ Before=shutdown.target
 # device", a 2 s restart on every boot measured 2026-10-28). Wait for it, at most 10 s.
 ExecStartPre=/bin/sh -c 'for _ in $(seq 100); do [ -e /dev/nvidia-uvm-tools ] && exit 0; sleep 0.1; done; exit 1'
 ExecStartPre=-/usr/bin/podman --cgroup-manager=cgroupfs rm -f renderer
-ExecStart=/usr/bin/podman --cgroup-manager=cgroupfs run --rm --name renderer --network host --device nvidia.com/gpu=all --pids-limit=32768 -e PORT=8080 localhost/fcvm-renderer:fleet
+ExecStartPre=/usr/bin/install -d -m 0700 /etc/fcvm-fleet/scene
+ExecStart=/usr/bin/podman --cgroup-manager=cgroupfs run --rm --name renderer --network host --device nvidia.com/gpu=all --pids-limit=32768 -e PORT=8080 -v /etc/fcvm-fleet/scene:/run/fleet-scene:ro -e SCENE_TOKEN_FILE=/run/fleet-scene/token localhost/fcvm-renderer:fleet
 ExecStop=/usr/bin/podman --cgroup-manager=cgroupfs stop -t 5 renderer
 Restart=always
 RestartSec=2

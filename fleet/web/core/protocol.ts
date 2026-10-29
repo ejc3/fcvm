@@ -429,12 +429,12 @@ export interface Token {
  * held, the broadcast alone.
  */
 export interface Admission {
-  /** The seat ticket, to present as /live?seat= after a reconnect; null when late. */
+  /** The seat ticket, sent as the first /live message after a reconnect; null when late. */
   seat: string | null;
   /** The broadcast is forced on. */
   locked: boolean;
   reason: string | null;
-  /** The token every frame URL carries as admit=; null when late. */
+  /** The token every frame socket sends as its first message; null when late. */
   direct: Token | null;
   /** The broadcast's playback URL; null when the fleet runs none. */
   broadcast: Token | null;
@@ -499,7 +499,22 @@ export interface VisibilityMsg {
   visible: boolean;
 }
 
-export type ClientMsg = IntentMsg | PingMsg | VerifyMsg | VisibilityMsg;
+/** The first message on /live: the seat ticket this tab kept, if any. */
+export interface SeatMsg {
+  type: "seat";
+  ticket: string | null;
+}
+
+export type ClientMsg = IntentMsg | PingMsg | VerifyMsg | VisibilityMsg | SeatMsg;
+
+/**
+ * The first message on /live, with the seat ticket this tab holds, if any. A URL would carry
+ * the ticket into proxy and access logs.
+ */
+export function seatMessage(seat: string | null): string {
+  const m: SeatMsg = { type: "seat", ticket: seat };
+  return JSON.stringify(m);
+}
 
 /** Outcomes a receipt can carry that mean the intent took effect. */
 export function receiptApplied(r: ReceiptMsg): boolean {

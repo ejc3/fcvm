@@ -62,6 +62,10 @@ class Pipeline {
   // Whether a GET /frames with this direct token may stream (admit.h): always while no
   // scene has brought admission keys.
   bool admits(const std::string& token);
+  // Whether a stream must show a direct token before it is served (a scene brought keys).
+  bool requires_admit();
+  // Whether any scene has been posted.
+  bool has_scene();
   // POST /budget: {"budget": B, "t": T}, B pixel-samples per frame from the
   // first slot at or after scene time T.
   bool post_budget(const std::string& body, std::string* err);

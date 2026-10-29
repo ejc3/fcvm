@@ -12,7 +12,7 @@ CXXFLAGS := -O2 -std=c++17 -Wall -Wextra -Wno-unused-parameter -I$(CUDA)/include
 NVFLAGS := -O3 -std=c++17 --use_fast_math $(GENCODE) -Xcompiler -Wall
 LDLIBS := -L$(CUDA)/lib64/stubs -lcuda -lssl -lcrypto -ldl -lpthread
 
-CORE := json scene proto subscriber admit
+CORE := json scene proto subscriber admit access
 HOST := $(CORE) nvenc gpustats pipeline server jpeg tls
 CORE_O := $(addprefix $(OUT)/,$(addsuffix .o,$(CORE)))
 HOST_O := $(addprefix $(OUT)/,$(addsuffix .o,$(HOST)))
@@ -38,7 +38,7 @@ $(OUT)/fleet-renderer-test: tests/test_gpu.cpp tests/check.h $(CORE_O) $(OUT)/nv
 # Host-only tests need no CUDA: g++ and the NVENC header.
 $(OUT)/test-host: tests/test_host.cpp tests/check.h src/*.cpp src/*.h
 	@mkdir -p $(OUT)
-	$(CXX) -O1 -std=c++17 -Wall -I$(NVCH) -o $@ tests/test_host.cpp src/json.cpp src/scene.cpp src/admit.cpp src/proto.cpp src/subscriber.cpp src/nvenc.cpp src/jpeg.cpp src/tls.cpp -lssl -lcrypto -ldl -lpthread
+	$(CXX) -O1 -std=c++17 -Wall -I$(NVCH) -o $@ tests/test_host.cpp src/json.cpp src/scene.cpp src/admit.cpp src/access.cpp src/proto.cpp src/subscriber.cpp src/nvenc.cpp src/jpeg.cpp src/tls.cpp -lssl -lcrypto -ldl -lpthread
 
 # The synthetic viewer (tools/viewerload.cpp); test-host runs its self-test.
 $(OUT)/viewerload: tools/viewerload.cpp

@@ -42,6 +42,7 @@ IMG=localhost/fcvm-renderer:fleet
 # network-online.target, is disabled.
 install_units() {
   install -d /usr/local/lib/fcvm-fleet /etc/fcvm-fleet/tls
+  install -d -m 0700 /etc/fcvm-fleet/scene
   install -m 0755 "$HERE/fetch-cert.py" "$HERE/first-frame.sh" "$HERE/resident.py" /usr/local/lib/fcvm-fleet/
   # The prefetch is a static binary: it is the first thing a boot runs from the root volume,
   # and an interpreter or a dynamic loader would fetch tens of files of its own first.
@@ -162,7 +163,7 @@ bake)
     exit 1
   fi
   $APT clean
-  rm -f /etc/fcvm-fleet/tls/*.pem /var/log/fcvm-fleet-first-frame.log /var/run/cdi/nvidia.yaml
+  rm -f /etc/fcvm-fleet/tls/*.pem /etc/fcvm-fleet/scene/token /var/log/fcvm-fleet-first-frame.log /var/run/cdi/nvidia.yaml
   cloud-init clean --logs --seed
   truncate -s 0 /etc/machine-id
   rm -f /var/lib/fleet-ami/env

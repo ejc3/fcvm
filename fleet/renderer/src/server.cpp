@@ -65,6 +65,32 @@ int query_int(const std::string& q, const std::string& k, int def) {
 }
 }  // namespace
 
+// One masked client frame of at most 64 KiB: its opcode and unmasked payload.
+static bool read_ws_message(Conn& c, int* op, std::string* pl) {
+  uint8_t b2[2];
+  if (!c.read_exact(b2, 2)) return false;
+  *op = b2[0] & 0x0f;
+  bool masked = b2[1] & 0x80;
+  uint64_t n = b2[1] & 0x7f;
+  if (n == 126) {
+    uint8_t e[2];
+    if (!c.read_exact(e, 2)) return false;
+    n = (uint64_t)e[0] << 8 | e[1];
+  } else if (n == 127) {
+    uint8_t e[8];
+    if (!c.read_exact(e, 8)) return false;
+    n = 0;
+    for (int i = 0; i < 8; i++) n = n << 8 | e[i];
+  }
+  if (n > 65536 || !masked) return false;  // clients must mask; control messages are small
+  uint8_t mk[4];
+  if (!c.read_exact(mk, 4)) return false;
+  pl->assign(n, '\0');
+  if (n && !c.read_exact(&(*pl)[0], n)) return false;
+  for (size_t i = 0; i < n; i++) (*pl)[i] ^= mk[i & 3];
+  return true;
+}
+
 int Server::open_listener(int port, std::string* err) {
   signal(SIGPIPE, SIG_IGN);
   int fd = socket(AF_INET6, SOCK_STREAM, 0);
@@ -190,6 +216,10 @@ void Server::handle(Conn& c) {
   }
   if (path == "/scene" || path == "/budget") {
     if (method != "POST") return respond(c, 405, "Method Not Allowed", "{\"error\":\"POST only\"}");
+    // A fleet renderer takes a scene or a budget only from a holder of the scene token.
+    int denied = scene_access(fleet(), fleet() ? token_->current() : std::string(), hdr["authorization"]);
+    if (denied == 503) return respond(c, 503, "Service Unavailable", "{\"error\":\"no scene token loaded\"}");
+    if (denied) return respond(c, 401, "Unauthorized", "{\"error\":\"the scene token is required\"}");
     // A JSON content type forces a CORS preflight, which this server never
     // grants, so a page in a browser cannot change the scene or the budget.
     if (lower(hdr["content-type"]).find("application/json") != 0)
@@ -246,9 +276,10 @@ void Server::handle(Conn& c) {
   if (path == "/frames" && method == "GET") {
     if (lower(hdr["upgrade"]) != "websocket" || hdr["sec-websocket-key"].empty())
       return respond(c, 426, "Upgrade Required", "{\"error\":\"WebSocket upgrade required\"}");
-    // With the coordinator's admission keys, only a seated viewer's direct token opens a stream.
-    if (!p_.admits(query_str(query, "admit", "")))
-      return respond(c, 403, "Forbidden", "{\"error\":\"a direct token is required\"}");
+    // A fleet renderer streams nothing before its first scene says whether streams need a
+    // direct token: a stream opened before would keep its frames after keys arrive.
+    if (frames_access(fleet(), p_.has_scene()))
+      return respond(c, 503, "Service Unavailable", "{\"error\":\"no scene yet\"}");
     int h = query_int(query, "h", 0);
     if (h < 16 || h > 2160) return respond(c, 400, "Bad Request", "{\"error\":\"h must be 16..2160\"}");
     std::string qs = query_str(query, "q", "std");
@@ -263,6 +294,19 @@ void Server::websocket(Conn& c, int h, int q, const std::string& key) {
   std::string resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " +
                      ws_accept(key) + "\r\n\r\n";
   if (!c.write_all(resp.data(), resp.size())) return;
+  // With the coordinator's admission keys, only a client whose first message carries a seated
+  // viewer's direct token gets the stream (the URL carries none, so no log holds one).
+  if (p_.requires_admit()) {
+    c.set_read_timeout_ms(ADMIT_WAIT_MS);
+    int op = 0;
+    std::string first, token;
+    if (!read_ws_message(c, &op, &first) || op != 1 || !admit_message(first, &token) || !p_.admits(token)) {
+      static const char kReason[] = "\x03\xf0" "a direct token is required";  // 1008, policy violation
+      std::string close = ws_frame(8, kReason, sizeof kReason - 1);
+      c.write_all(close.data(), close.size());
+      return;
+    }
+  }
   c.set_read_timeout_ms(0);
   c.set_option(SOL_SOCKET, SO_SNDBUF, 1 << 20);
   auto sub = p_.subscribe(h, q);
@@ -295,27 +339,9 @@ void Server::websocket(Conn& c, int h, int q, const std::string& key) {
   }
   // reader: control messages from the client
   while (true) {
-    uint8_t b2[2];
-    if (!c.read_exact(b2, 2)) break;
-    int op = b2[0] & 0x0f;
-    bool masked = b2[1] & 0x80;
-    uint64_t n = b2[1] & 0x7f;
-    if (n == 126) {
-      uint8_t e[2];
-      if (!c.read_exact(e, 2)) break;
-      n = (uint64_t)e[0] << 8 | e[1];
-    } else if (n == 127) {
-      uint8_t e[8];
-      if (!c.read_exact(e, 8)) break;
-      n = 0;
-      for (int i = 0; i < 8; i++) n = n << 8 | e[i];
-    }
-    if (n > 65536 || !masked) break;  // clients must mask; control messages are small
-    uint8_t mk[4];
-    if (!c.read_exact(mk, 4)) break;
-    std::string pl(n, '\0');
-    if (n && !c.read_exact(&pl[0], n)) break;
-    for (size_t i = 0; i < n; i++) pl[i] ^= mk[i & 3];
+    int op = 0;
+    std::string pl;
+    if (!read_ws_message(c, &op, &pl)) break;
     if (op == 8) {  // close
       sub->push(std::make_shared<const std::string>(ws_frame(8, pl.data(), std::min<size_t>(pl.size(), 2))));
       break;

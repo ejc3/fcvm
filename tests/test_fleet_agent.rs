@@ -84,6 +84,7 @@ fn cfg(fcvm: &Path) -> AgentCfg {
         scrub: false,
         scrub_timeout: Duration::from_secs(10),
         quarantine_after: 3,
+        scene_token: Default::default(),
     }
 }
 
@@ -448,6 +449,32 @@ async fn a_renderer_restarted_in_its_vm_gets_its_scene_again() {
         .count();
     assert_eq!(starts, 1, "a renderer restart is not a relaunch");
     c.close().await;
+}
+
+/// A fleet renderer takes a scene or a budget only with the scene token as the bearer
+/// token, and the agent sends the one it read from the certificate secret.
+#[tokio::test]
+async fn scene_and_budget_posts_carry_the_scene_token() {
+    let f = fake(1, &[]);
+    // The fake renderer on this port requires the token (fleet/PROTOCOL.md, "Access").
+    std::fs::write(
+        f.dir.path().join(format!("port-{}.token", f.base)),
+        "tok-1\n",
+    )
+    .unwrap();
+    let mut cfg = cfg(&f.fcvm);
+    cfg.scene_token = fcvm::fleet::coord::scene_token::SceneToken::new(Some("tok-1".into()));
+    let mut c = Coord::start(&f, 1, cfg);
+    c.next().await;
+    c.send(scene());
+    c.assign(&[("slot-1", 0, 1, rect(0.0))]);
+    c.until(&["slot-1"], "running", 1).await;
+    wait_len(&f.scenes[0], 1, "the scene was refused").await;
+    c.send(CoordMsg::Budget(fleet_core::protocol::BudgetBody {
+        budget: 500_000,
+        t: 11.2,
+    }));
+    wait_len(&f.budgets[0], 1, "the budget was refused").await;
 }
 
 /// The grid budget reaches a wall tile's renderer, again after every scene post (a new
@@ -1514,6 +1541,62 @@ async fn a_stored_secret_version_carries_a_fresh_client_request_token() {
     assert_ne!(t[0], t[1], "each version needs its own token");
 }
 
+/// The coordinator adds a scene token to a certificate secret that has none, keeping every
+/// other field, and uses the one stored; a secret that has one is left alone.
+#[tokio::test]
+async fn the_coordinator_adds_a_scene_token_to_the_secret_once() {
+    use fcvm::fleet::coord::scene_token;
+    use fcvm::fleet::coord::secrets::Secrets;
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let stored = std::sync::Arc::new(std::sync::Mutex::new(
+        serde_json::json!({"cert": "CHAIN-1", "key": "KEY-1", "domains": ["*.fcvm.example"]})
+            .to_string(),
+    ));
+    let puts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (s2, p2) = (stored.clone(), puts.clone());
+    let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap, body: String| {
+        let (s2, p2) = (s2.clone(), p2.clone());
+        async move {
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            match headers["x-amz-target"].to_str().unwrap() {
+                "secretsmanager.GetSecretValue" => {
+                    axum::Json(serde_json::json!({"SecretString": s2.lock().unwrap().clone()}))
+                }
+                "secretsmanager.PutSecretValue" => {
+                    p2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    *s2.lock().unwrap() = v["SecretString"].as_str().unwrap().to_string();
+                    axum::Json(serde_json::json!({"VersionId": v["ClientRequestToken"]}))
+                }
+                other => panic!("unexpected call {other}"),
+            }
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let secrets = Secrets::with_endpoint("us-east-2", &base).unwrap();
+    let t = scene_token::ensure(&secrets, "fcvm-fleet/tls-wildcard")
+        .await
+        .unwrap();
+    assert_eq!(t.len(), 64, "32 random bytes, hex");
+    let doc: serde_json::Value = serde_json::from_str(&stored.lock().unwrap()).unwrap();
+    assert_eq!(doc["scene_token"], t.as_str());
+    assert_eq!(doc["cert"], "CHAIN-1");
+    assert_eq!(doc["domains"][0], "*.fcvm.example");
+    assert_eq!(
+        scene_token::ensure(&secrets, "fcvm-fleet/tls-wildcard")
+            .await
+            .unwrap(),
+        t
+    );
+    assert_eq!(
+        puts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "stored once"
+    );
+}
+
 /// The renderers' certificate in the renderer's TLS interface: `tls.json` with `cert` and
 /// `key` from the secret (mode 0600), left alone while the secret is unchanged, replaced by
 /// a new file after a renewal; each VM gets the directory read-only, `TLS_CERT_FILE` and
@@ -1543,9 +1626,12 @@ async fn the_agent_writes_the_certificate_for_its_renderers() {
     let secrets = Secrets::with_endpoint("us-east-2", &base).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let tls_dir = dir.path().join("tls");
-    assert!(tls::refresh(&secrets, "fcvm-fleet/tls-wildcard", &tls_dir)
-        .await
-        .unwrap());
+    let token = fcvm::fleet::coord::scene_token::SceneToken::default();
+    assert!(
+        tls::refresh(&secrets, "fcvm-fleet/tls-wildcard", &tls_dir, &token)
+            .await
+            .unwrap()
+    );
     let file = tls_dir.join("tls.json");
     let read = |p: &std::path::Path| -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap()
@@ -1560,16 +1646,37 @@ async fn the_agent_writes_the_certificate_for_its_renderers() {
     );
     use std::os::unix::fs::MetadataExt;
     let inode = std::fs::metadata(&file).unwrap().ino();
-    assert!(!tls::refresh(&secrets, "fcvm-fleet/tls-wildcard", &tls_dir)
-        .await
-        .unwrap());
+    assert!(
+        !tls::refresh(&secrets, "fcvm-fleet/tls-wildcard", &tls_dir, &token)
+            .await
+            .unwrap()
+    );
     doc.lock().unwrap()["key"] = serde_json::json!("KEY-2");
-    assert!(tls::refresh(&secrets, "fcvm-fleet/tls-wildcard", &tls_dir)
-        .await
-        .unwrap());
+    assert!(
+        tls::refresh(&secrets, "fcvm-fleet/tls-wildcard", &tls_dir, &token)
+            .await
+            .unwrap()
+    );
     assert_eq!(read(&file)["key"], "KEY-2");
     // A renewal is a new file renamed into place: the renderer notices the new inode.
     assert_ne!(std::fs::metadata(&file).unwrap().ino(), inode);
+    assert_eq!(
+        token.get(),
+        None,
+        "a secret without a scene token gives none"
+    );
+    // The scene token goes to the renderers in the same file, and to the agent's own posts.
+    doc.lock().unwrap()["scene_token"] = serde_json::json!("SCENE-1");
+    assert!(
+        tls::refresh(&secrets, "fcvm-fleet/tls-wildcard", &tls_dir, &token)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        read(&file),
+        serde_json::json!({"cert": "CHAIN-1", "key": "KEY-2", "scene_token": "SCENE-1"})
+    );
+    assert_eq!(token.get().as_deref(), Some("SCENE-1"));
     assert_eq!(
         tls::vm_args(&tls_dir),
         vec![

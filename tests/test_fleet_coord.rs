@@ -161,6 +161,28 @@ impl Viewer {
 
     /// Connect as a client behind Cloudflare at `ip` (the `CF-Connecting-IP` header).
     async fn connect_from(url: &str, ip: Option<&str>) -> Viewer {
+        Viewer::connect_as(url, ip, None).await
+    }
+
+    /// Connect as a page that kept `ticket` from an earlier connection.
+    async fn connect_with_seat(url: &str, ticket: &str) -> Viewer {
+        Viewer::connect_as(url, None, Some(ticket)).await
+    }
+
+    /// Connect sending nothing first: admitted once `SEAT_WAIT` has passed, or at its first
+    /// message.
+    async fn connect_silent(url: &str) -> Viewer {
+        Viewer::connect_raw(url, None).await
+    }
+
+    /// As the page does: the seat message first (with a kept ticket, or none).
+    async fn connect_as(url: &str, ip: Option<&str>, ticket: Option<&str>) -> Viewer {
+        let mut v = Viewer::connect_raw(url, ip).await;
+        v.send(json!({"type": "seat", "ticket": ticket})).await;
+        v
+    }
+
+    async fn connect_raw(url: &str, ip: Option<&str>) -> Viewer {
         let mut req = url.into_client_request().unwrap();
         if let Some(ip) = ip {
             req.headers_mut()
@@ -4314,13 +4336,21 @@ async fn the_aws_tile_driver_launches_waits_and_terminates() {
         )
         .route(
             "/scene",
-            axum::routing::post(move |axum::Json(b): axum::Json<Value>| {
-                let s2 = s2.clone();
-                async move {
-                    s2.lock().unwrap().push(b);
-                    "ok"
-                }
-            }),
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, axum::Json(b): axum::Json<Value>| {
+                    let s2 = s2.clone();
+                    async move {
+                        // A fleet renderer takes a scene only with the scene token.
+                        if headers.get("authorization").and_then(|v| v.to_str().ok())
+                            != Some("Bearer tok-ec2")
+                        {
+                            return axum::http::StatusCode::UNAUTHORIZED;
+                        }
+                        s2.lock().unwrap().push(b);
+                        axum::http::StatusCode::OK
+                    }
+                },
+            ),
         );
     let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let rport = rl.local_addr().unwrap().port();
@@ -4341,6 +4371,7 @@ async fn the_aws_tile_driver_launches_waits_and_terminates() {
         d.health_port = rport;
         d.poll = Duration::from_millis(20);
         d.ready_timeout = Duration::from_secs(5);
+        d.scene_token = fcvm::fleet::coord::scene_token::SceneToken::new(Some("tok-ec2".into()));
         let _ = api;
         d
     };
@@ -5720,7 +5751,11 @@ async fn a_closed_seat_is_kept_for_its_ticket_then_freed_without_promoting_anyon
     let mut other = Viewer::connect(&c.url).await;
     assert_eq!(other.message("admission").await["locked"], true);
     drop(other);
-    let mut back = Viewer::connect(&format!("{}?seat={ticket}", c.url)).await;
+    // A ticket in the URL is not read (a URL lands in access logs): the page is late.
+    let mut by_url = Viewer::connect(&format!("{}?seat={ticket}", c.url)).await;
+    assert_eq!(by_url.message("admission").await["locked"], true);
+    drop(by_url);
+    let mut back = Viewer::connect_with_seat(&c.url, &ticket).await;
     let a = back.message("admission").await;
     assert_eq!(a["locked"], false);
     assert_eq!(a["seat"], ticket.as_str());
@@ -5736,6 +5771,29 @@ async fn a_closed_seat_is_kept_for_its_ticket_then_freed_without_promoting_anyon
     // A reload is a new connection, admitted afresh.
     let mut reload = Viewer::connect(&c.url).await;
     assert_eq!(reload.message("admission").await["locked"], false);
+}
+
+/// A client whose first message is not a seat message is admitted without a ticket at once,
+/// and that message is handled like any other; one that sends nothing is admitted after
+/// `SEAT_WAIT`.
+#[tokio::test]
+async fn a_first_message_that_is_not_a_seat_is_still_handled() {
+    let gate = test_gate(2, Duration::from_millis(600));
+    let c = coordinator_with(Opts {
+        gate: Some(gate.clone()),
+        ..Opts::default()
+    })
+    .await;
+    let mut v = Viewer::connect_silent(&c.url).await;
+    v.send(json!({"type": "ping", "client_unix_ms": 7.0})).await;
+    let started = std::time::Instant::now();
+    assert_eq!(v.message("admission").await["locked"], false);
+    assert!(started.elapsed() < fcvm::fleet::coord::live::SEAT_WAIT);
+    assert_eq!(v.message("clock").await["client_unix_ms"], 7.0);
+    let mut quiet = Viewer::connect_silent(&c.url).await;
+    let started = std::time::Instant::now();
+    assert_eq!(quiet.message("admission").await["locked"], false);
+    assert!(started.elapsed() >= fcvm::fleet::coord::live::SEAT_WAIT - Duration::from_millis(100));
 }
 
 /// A tile lent to a visitor ("Your own GPU") draws that visitor's private camera over the

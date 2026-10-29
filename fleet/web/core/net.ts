@@ -6,16 +6,21 @@ export function reconnectDelayMs(attempt: number): number {
 }
 
 /** A frame socket URL: frame_url with h set, and q when it is not the default. */
-export function frameSocketUrl(frameUrl: string, height: number, quality: "hi" | "std" | "lo" = "std", admit: string | null = null): string {
+export function frameSocketUrl(frameUrl: string, height: number, quality: "hi" | "std" | "lo" = "std"): string {
   const [base, query = ""] = frameUrl.split("?", 2) as [string, string?];
-  const kept = query
-    .split("&")
-    .filter((p) => p !== "" && !p.startsWith("h=") && !p.startsWith("q=") && !p.startsWith("admit="));
+  const kept = query.split("&").filter((p) => p !== "" && !p.startsWith("h=") && !p.startsWith("q="));
   kept.push(`h=${Math.round(height)}`);
   if (quality !== "std") kept.push(`q=${quality}`);
-  // The coordinator's direct token (PROTOCOL.md, "admission"), checked when the stream opens.
-  if (admit !== null) kept.push(`admit=${encodeURIComponent(admit)}`);
   return `${base}?${kept.join("&")}`;
+}
+
+/**
+ * A frame socket's first message when the page holds a direct token (PROTOCOL.md, "Access"):
+ * the renderer checks it before it streams. It is never in the URL, which proxies and access
+ * logs keep.
+ */
+export function admitMessage(token: string): string {
+  return JSON.stringify({ admit: token });
 }
 
 /**
@@ -24,11 +29,9 @@ export function frameSocketUrl(frameUrl: string, height: number, quality: "hi" |
  * (q, and any the frame URL carries) at connection time only.
  */
 export function sameStreamAtAnyHeight(a: string, b: string): boolean {
-  // The direct token too: it is checked only when a socket opens, so a renewed one does not
-  // reopen a stream that is already running.
   const strip = (u: string): string => {
     const [base, query = ""] = u.split("?", 2) as [string, string?];
-    return `${base}?${query.split("&").filter((p) => p !== "" && !p.startsWith("h=") && !p.startsWith("admit=")).join("&")}`;
+    return `${base}?${query.split("&").filter((p) => p !== "" && !p.startsWith("h=")).join("&")}`;
   };
   return strip(a) === strip(b);
 }
