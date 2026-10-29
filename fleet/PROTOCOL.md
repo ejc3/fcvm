@@ -1973,3 +1973,79 @@ every pixel of each half with the whole image at the same whole-image position, 
 redraw of one half with the first. It allows up to 9 pixels a tile 1 level apart (a residual
 seen in 3 of 10 runs, the same pixel in a light's glow) and fails on anything more; the result
 names the exact count.
+
+## Phone streamer
+
+The program in the phone container (`fleet/phone/streamer/`) that serves a phone's screen
+with the renderer's routes and frame format, so the page draws a phone like a renderer's
+tile. It reads the screen from the emulator's gRPC controller (`emulator -grpc 8554`, on the
+container's loopback): one `streamScreenshot` call with format RGBA8888 returns every new
+frame the emulator composes, top row first. It converts each to NV12 on the CPU and encodes
+it with NVENC on the VM's GPU with the renderer's encoder: the same H.264, quality table,
+keyframe rules and `bitstream_restriction`.
+
+`phone.sh serve` starts the streamer before the phone, so `/health` answers while Android
+boots, and lets it stream (the file `PHONE_GO_FILE`) only once SurfaceFlinger and Robot Park
+both render on the VM's GPU. A phone that does not is never streamed: the streamer is
+replaced by one that reports the failure (`ready` false, `error`) and streams nothing. The
+GPU hook (`fleet/phone/gpu-hook`) stops the streamer before it releases the phone's GPU for a
+warm snapshot and lets `serve` start it again after the retake, so a clone's streamer runs on
+the clone's GPU.
+
+### Routes
+
+- `GET /frames?h=&q=` (WebSocket): the renderer's protocol. `h` is accepted and changes
+  nothing: a phone sends its screen at the screen's size, and the header says it.
+- `POST /scene`: the renderer's checks for `epoch_unix_ms` (required), `rect`,
+  `image_aspect`, `layout_generation`, `rect_from_frame` and `previous_rect`; `400` names a
+  refused field. The streamer passes the body to Robot Park as its `scene` request with
+  `"stamp": true` (PROTOCOL "Phone app"), again whenever a new one is posted, and sends it
+  the host's `clock` every 2 s, over the app's control socket (127.0.0.1:7070 in the
+  container, `PHONE_APP_PORT`), reconnecting when it closes.
+- `POST /budget`: accepted when well formed and ignored (the wall's budget controller posts
+  every tile; a phone draws at its display's rate).
+- `GET /still`: the screen as last copied, JPEG.
+- `GET /health`: the renderer's first six keys (`fps`, `heights`, `streams`, `gpu`, `t`,
+  `frame`), `boot_id`, `ready`, `error` when failed, `startup_ms` (`first_capture`,
+  `first_frame_sent`, from the process start), and `phone`:
+
+```json
+{"picture":"scene","screen":[720,1280],"copies":890,"scene_frames":294,"screen_frames":171,
+ "torn":0,"implausible":0,"odd":290,"repeats":135,"verified":true,"shm_error":null,
+ "app_connects":1,"app_error":null,
+ "draw_to_capture_ms":{"p50":24.0,"p90":30.1,"n":300},
+ "capture_to_sent_ms":{"p50":8.5,"p90":9.2,"n":300},"encode_ms":{"p50":5.1,"p90":5.2,"n":300}}
+```
+
+`draw_to_capture_ms` is the emulator's copy time minus the scene time of the frame number
+the stamp names; `capture_to_sent_ms` is from that copy to the frame queued on every stream.
+Each is over the last 300 frames.
+
+### Which copies become frames
+
+Robot Park stamps each frame with its number `k` (`t = k / 60`) in the bottom 8 rows
+(PROTOCOL "Phone app", `stamp`). The streamer reads the band's middle row at the middle
+pixel of each of the 32 cells: a cell is 1 when red, green and blue are all at least 160, 0
+when all are at most 96, and anything else is no stamp. The stamp has no checksum, so a
+number counts only when its `t` lies within 5 s of the copy's time on the scene clock; a
+screen whose bottom happens to show 32 black or white cells is not a frame of the scene.
+
+| one screen copy | what the streamer does |
+|---|---|
+| the emulator finished another frame while it was copied (`frameNumber` moved) | torn: dropped |
+| a stamp read and plausible, `k` even | a scene frame, sent once per `k`, stamped `t = k / 60` (the wall's 1/30 s grid) |
+| a stamp read and plausible, `k` odd | dropped: the app draws at 60 Hz, the wall at 30 |
+| no stamp (the app's bars over the band, another screen) | the screen: sent at most once per 1/30 s, stamped with the slot of its copy time |
+
+A frame always carries the whole screen. A scene frame's header places it the way the app
+places its part of the image (the renderer's tile geometry at the surface's height:
+`full_height = round(H / rect.h)`, `full_width = round(full_height * image_aspect)`,
+`x0 = round(rect.x * full_width)`, `y0 = round(rect.y * full_height)`), with the rect the app
+drew that frame with: `previous_rect` for a frame before `rect_from_frame` (`floor(k / 2)` on
+the 1/30 s grid), `rect` from it. `crop.bottom` 8 cuts the stamp off. A screen frame has no
+crop and is an image of its own (`x0`, `y0` 0, the full size the screen's). The header adds
+`"phone": {"picture": "scene" | "screen"}`, and a new header (and a keyframe) starts each
+change between them. With no new copy the last picture is sent again once a second, and at
+once to a new stream.
+
+Measured numbers are in `docs/fleet/ARCHITECTURE.md`, "Getting the screen to the page".

@@ -5,7 +5,8 @@
 # snapshot (release) and when it brings them up again in the source VM or in a clone
 # (retake); `make phone-test` also runs it directly.
 #
-#   gpu-hook release   'gpu release': the emulator pauses the phone, keeps its GPU state in
+#   gpu-hook release   stops the phone streamer (phone.sh serve starts it again after the
+#                      retake), then 'gpu release': the emulator pauses the phone, keeps its GPU state in
 #                      memory and unloads the graphics driver, so it holds no /dev/nvidia*
 #                      descriptor or mapping; prints released_ms
 #   gpu-hook retake    'gpu retake': the emulator loads the driver, restores the state onto
@@ -25,21 +26,45 @@ ms() { date +%s%3N; }
 console() { timeout 30 "$ADB" emu "$@" | tr -d '\r'; }
 running() { [ -f "$STATE/emulator.pid" ] && kill -0 "$(cat "$STATE/emulator.pid")" 2> /dev/null; }
 
+# A process that is running: a zombie (exited, not yet reaped, which happens to an orphan in
+# a container whose first process reaps nothing) is not.
+alive() { local st; st=$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f1) && [ -n "$st" ] && [ "$st" != Z ]; }
+any_alive() { local p; for p in $(pgrep -x "$1"); do alive "$p" && return 0; done; return 1; }
+# The phone streamer (phone.sh serve) holds a CUDA context on the GPU: stop it before the
+# release, and keep phone.sh's loop from starting it again until the retake. The loop checks
+# the hold file and starts the streamer under streamer.lock, so taking the lock here means a
+# streamer is either not started yet (and will see the hold) or started and named in
+# streamer.pid (and is stopped here).
+hold_streamer() {
+  local pid
+  exec 8> "$STATE/streamer.lock"
+  flock 8
+  touch "$STATE/streamer.hold"
+  pid=$(cat "$STATE/streamer.pid" 2> /dev/null || true)
+  if [ -n "$pid" ]; then kill "$pid" 2> /dev/null || true; fi
+  pkill -x phone-streamer 2> /dev/null || true
+  while { [ -n "$pid" ] && alive "$pid"; } || any_alive phone-streamer; do sleep 0.05; done
+  flock -u 8
+  exec 8>&-
+}
+free_streamer() { rm -f "$STATE/streamer.hold"; }
+
 case "${1:-}" in
 release)
+  hold_streamer
   running || { echo "no emulator running"; exit 0; }
   out=$(console gpu release)
   echo "$out"
   grep -q '^released_ms=' <<< "$out"
   ;;
 retake)
-  running || { echo "no emulator running"; exit 0; }
+  running || { echo "no emulator running"; free_streamer; exit 0; }
   # Only an answer of "held" means there is nothing to take up again; a console that
   # does not answer is an error, or a released phone would stay paused.
   status=$(console gpu status) || { echo "the emulator's console did not answer 'gpu status'"; exit 1; }
   case "$(head -1 <<< "$status")" in
   released) ;;
-  held) echo "the emulator holds the GPU"; exit 0 ;;
+  held) echo "the emulator holds the GPU"; free_streamer; exit 0 ;;
   *) echo "unexpected 'gpu status' answer: $status"; exit 1 ;;
   esac
   t0=$(ms)
@@ -51,6 +76,7 @@ retake)
     if [ "$(console gpu frame | head -1)" = posted ]; then
       now=$(ms)
       echo "first_frame_ms=$(( now - t0 )) first_frame_at_ms=$now"
+      free_streamer
       exit 0
     fi
     sleep 0.02

@@ -27,7 +27,8 @@
 #
 #   FCVM=./target/release/fcvm scripts/phone/run.sh <gpu pci address> <second gpu pci address>
 # PHONE_PROFILE names another kernel profile to run the same checks on (default phone).
-# `run.sh --image` prints the image tag it builds: fleet/phone's contents name it, so
+# `run.sh --image` prints the image tag it builds: fleet/phone's contents and the renderer
+# code its streamer builds with name it (fleet/phone/Makefile), so
 # concurrent runs from checkouts with other sources never replace each other's image.
 # Needs two GPUs on vfio-pci, the phone profile set up (make setup-phone), the host's
 # kvm_intel loaded with nested=1, the system image, adb and probe app from
@@ -35,7 +36,7 @@
 # scripts/phone/app.sh.
 set -euo pipefail
 SRC=$(cd "$(dirname "$0")/../.." && pwd)
-IMAGE=localhost/fcvm-phone:$(cd "$SRC/fleet/phone" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
+IMAGE=localhost/fcvm-phone:$(make -s -C "$SRC/fleet/phone" image-id)
 if [ "${1:-}" = --image ]; then echo "$IMAGE"; exit 0; fi
 GPU=${1:?usage: run.sh <gpu pci address> <second gpu pci address>}
 GPU2=${2:?usage: run.sh <gpu pci address> <second gpu pci address>}
@@ -54,7 +55,7 @@ TAG=phone-test-$$-warm
 [ "$(cat /sys/module/kvm_intel/parameters/nested 2>/dev/null)" = Y ] || { echo "run.sh: the host's kvm_intel needs nested=1" >&2; exit 2; }
 LOGS=$(mktemp -d)
 mkdir -p "$LOGS/out"
-podman build -q -t "$IMAGE" "$SRC/fleet/phone" > "$LOGS/build.log" 2>&1 || { cat "$LOGS/build.log"; exit 1; }
+make -s -C "$SRC/fleet/phone" image IMAGE="$IMAGE" > "$LOGS/build.log" 2>&1 || { cat "$LOGS/build.log"; exit 1; }
 fail=0
 ok() { echo "ok   $*"; }
 bad() { echo "FAIL $*"; fail=1; }
