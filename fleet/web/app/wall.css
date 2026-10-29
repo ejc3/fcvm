@@ -357,6 +357,10 @@ a.icon-btn { text-decoration: none; }
 /* ---- asleep and waking ------------------------------------------------------------ */
 
 .reel { position: absolute; pointer-events: none; }
+/* The broadcast: one video of the whole wall where the image goes; clicks pass to the stage (lights). */
+.broadcast { position: absolute; pointer-events: none; background: #000; }
+.broadcast video { width: 100%; height: 100%; object-fit: contain; display: block; }
+.broadcast-note { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); margin: 0; padding: 8px 14px; border-radius: 6px; background: rgba(0, 0, 0, 0.6); color: #fff; font-size: 14px; }
 .reel video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0; transition: opacity 400ms ease-out; }
 .reel video.on { opacity: 1; }
 .reel.leaving video { opacity: 0; transition: opacity 700ms ease-in-out; }

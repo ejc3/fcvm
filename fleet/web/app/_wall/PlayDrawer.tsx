@@ -160,6 +160,23 @@ function PlaySections({ client, view, word, setWord }: { client: WallClient; vie
           {p.light.label}
         </button>
       </section>
+      {p.broadcast ? (
+        <section>
+          <button
+            type="button"
+            className="btn switch-btn"
+            role="switch"
+            aria-checked={p.broadcast.on}
+            disabled={p.broadcast.disabled}
+            data-testid="broadcast-switch"
+            onClick={() => client.ui({ mode: p.broadcast!.on ? "aggregated" : "broadcast" })}
+          >
+            <span className="switch" aria-hidden="true" />
+            {p.broadcast.label}
+          </button>
+          <p className="note" data-testid="broadcast-note">{p.broadcast.note}</p>
+        </section>
+      ) : null}
       <section>
         <button
           type="button"

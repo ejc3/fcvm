@@ -13,5 +13,6 @@ export * from "./mode.ts";
 export * from "./store.ts";
 export * from "./race.ts";
 export * from "./reel.ts";
+export * from "./broadcast.ts";
 export * from "./view.ts";
 export * as fmt from "./format.ts";

@@ -475,9 +475,10 @@ wall time.
 Scene inputs that go through the coordinator stay: words (the text check is unchanged),
 lights (placed with the camera of the frame shown), camera votes, and "restart now" under its
 global cooldown. Each appears in the video when the composite catches up, about one broadcast
-latency later, and the page marks it pending until the frame shown is past the snapshot that
-holds it. Gone in broadcast mode: clicking a tile to relaunch it, the detail view, "Your own
+latency after the coordinator accepts it (the drawer's status line says so at once).
+Gone in broadcast mode: clicking a tile to relaunch it, the detail view, "Your own
 GPU", per-tile stats and the stream choice; the broadcast toggle is the only stream control.
+`?broadcast=1` on the page's URL asks for the broadcast when the coordinator offers one.
 
 ### Staging access
 
