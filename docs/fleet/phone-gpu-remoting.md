@@ -20,8 +20,8 @@ Two designs are compared:
 
 Ten scripted workloads, each a 60 s window after a launch, on the fleet's phone stack (AOSP
 `android-15.0.0_r36`, the emulator built from source, gfxstream on a T4). The table is the
-first pass ("as shipped"). A second pass differs from the first by at most 12% on bytes, 7% on
-round trips a second and 4% on round trips per frame; compression ratios differ by up to 38%
+first pass ("as shipped"). A second pass differs from the first by less than 12% on bytes, 8%
+on round trips a second and 5% on round trips per frame; compression ratios differ by up to 39%
 with what the dump caught.
 
 | workload | stream (Mbit/s) | after zstd -3 | video at CRF 23 | round trips/s | main frames/s | round trips per main frame | frames/s at 20 / 50 / 100 ms RTT |
@@ -40,8 +40,8 @@ with what the dump caught.
 - *stream*: everything the guest sent to the host decoder, all threads and processes. *after
   zstd -3*: that rate divided by the ratio zstd -3 reached on a dump of up to 10 s of the
   same window, each render thread's stream compressed on its own. The first pass capped a
-  dump at 512 MiB, which held 3.7 to 5.1 s of Firefox and SuperTuxKart; the second pass's cap
-  was 1.5 GB. Each table gives its sample's size.
+  dump at 512 MiB, and Firefox's and SuperTuxKart's dumps reached the cap; the second pass's
+  cap was 1.5 GB. Each table gives its sample's size.
 - *video at CRF 23*: the same 60 s of screen, captured from the emulator at 30 fps (the
   newest frame at each tick; the streamer's NVENC stream is 30 fps too) and encoded with x264
   (preset medium, High profile, CRF 23, keyframe every 2 s). The configured CBR is 20 Mbit/s
