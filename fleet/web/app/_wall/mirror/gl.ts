@@ -26,6 +26,7 @@ const GL_UNIFORM_BUFFER = 0x8a11;
 const GL_PRIMITIVE_RESTART_FIXED_INDEX = 0x8d69;
 const CAPS = [0x0be2, 0x0b44, 0x0b71, 0x0bd0, 0x8037, 0x809e, 0x80a0, 0x0c11, 0x0b90, 0x8c89];
 const TEXTURE_UNITS = 16;
+const RASTER = /^gl(Draw|Clear$|ClearBuffer|BlitFramebuffer)/;
 
 /** What the mirror has drawn, for the panel's readout and the tests. */
 export interface MirrorStats {
@@ -153,6 +154,13 @@ export class GlMirror {
   readonly postRate = new RateMeter();
   /** Called with each color buffer posted to the screen (after it is drawn to the canvas). */
   onPost: ((cb: ColorBuffer, timeUs: number) => void) | null = null;
+  /**
+   * The replay test's fast-forward: every call but those that rasterize (draws, clears, blits).
+   * Only for a stream whose frames are each drawn whole, as Robot Park's are; the page never sets it.
+   */
+  skipDraws = false;
+  /** The phone's time of the record being fed (tap microseconds). */
+  timeUs = 0;
 
   private readonly channels = new Map<number, Channel>();
   private readonly contexts = new Map<number, Ctx>();
@@ -175,6 +183,7 @@ export class GlMirror {
   /** One tap record. */
   feed(r: TapRecord): void {
     this.stats.records++;
+    this.timeUs = r.timeUs;
     if (r.type === RECORD.hello) {
       for (const id of u32s(r.payload.subarray(4))) this.channel(id, false);
       return;
@@ -249,6 +258,7 @@ export class GlMirror {
     const onReply = this.replyHandlers.get(d.name);
     if (d.replies) c.waiting.push({ call: d, then: onReply ? (reply) => onReply(c, d.args, reply) : null });
     const h = this.handlers.get(d.name);
+    if (this.skipDraws && RASTER.test(d.name)) return;
     if (h) this.guard(d.name, () => h(c, d.args, d));
     else if (!onReply) this.skip(d.name);
   }
@@ -498,17 +508,7 @@ export class GlMirror {
     });
     // the surface draws straight into its color buffer: nothing to copy on a flush
     for (const f of ["rcFlushWindowColorBuffer", "rcFlushWindowColorBufferAsync", "rcFlushWindowColorBufferAsyncWithFrameNumber"]) this.on(f, () => {});
-    const newColorBuffer = (handle: number, w: number, h: number) => {
-      const tex = gl.createTexture()!;
-      this.withTexture(tex, () => {
-        gl.texStorage2D(GL_TEXTURE_2D, 1, 0x8058, Math.max(1, w), Math.max(1, h));
-        gl.texParameteri(GL_TEXTURE_2D, 0x2801, 0x2601);
-        gl.texParameteri(GL_TEXTURE_2D, 0x2800, 0x2601);
-        gl.texParameteri(GL_TEXTURE_2D, 0x2802, 0x812f);
-        gl.texParameteri(GL_TEXTURE_2D, 0x2803, 0x812f);
-      });
-      this.colorBuffers.set(handle, { handle, tex, w, h, refs: 1 });
-    };
+    const newColorBuffer = (handle: number, w: number, h: number) => void this.newColorBuffer(handle, w, h);
     this.onReply("rcCreateColorBuffer", (_c, a, r) => newColorBuffer(new DataView(r.buffer, r.byteOffset).getUint32(0, true), n(a[0]), n(a[1])));
     this.onReply("rcCreateColorBufferDMA", (_c, a, r) => newColorBuffer(new DataView(r.buffer, r.byteOffset).getUint32(0, true), n(a[0]), n(a[1])));
     this.on("rcCreateColorBufferWithHandle", (_c, a) => newColorBuffer(n(a[3]), n(a[0]), n(a[1])));
@@ -1021,6 +1021,21 @@ export class GlMirror {
       if (!this.handlers.has(f)) this.on(f, () => {});
   }
 
+  private newColorBuffer(handle: number, w: number, h: number): ColorBuffer {
+    const gl = this.gl;
+    const tex = gl.createTexture()!;
+    this.withTexture(tex, () => {
+      gl.texStorage2D(GL_TEXTURE_2D, 1, 0x8058, Math.max(1, w), Math.max(1, h));
+      gl.texParameteri(GL_TEXTURE_2D, 0x2801, 0x2601);
+      gl.texParameteri(GL_TEXTURE_2D, 0x2800, 0x2601);
+      gl.texParameteri(GL_TEXTURE_2D, 0x2802, 0x812f);
+      gl.texParameteri(GL_TEXTURE_2D, 0x2803, 0x812f);
+    });
+    const cb = { handle, tex, w, h, refs: 1 };
+    this.colorBuffers.set(handle, cb);
+    return cb;
+  }
+
   private stencil(ctx: Ctx, kind: "Func" | "Op" | "Mask", face: number, v: number[]): void {
     const gl = this.gl;
     for (const f of face === 0x0408 ? [0x0404, 0x0405] : [face]) {
@@ -1194,10 +1209,22 @@ void main() { o = mode == 1 ? color : texture(src, t) * color.a; }`;
     const version = v.getUint32(0, true);
     let at = 4;
     if (version >= 2) at += 4; // displayId
-    const target = this.colorBuffers.get(v.getUint32(at, true));
+    const handle = v.getUint32(at, true);
     const layers = v.getUint32(at + 4, true);
     at += 8;
-    if (!target) return;
+    let target = this.colorBuffers.get(handle);
+    if (!target) {
+      // HWC's own targets are made at boot, before the copy started: one the size of the layers'
+      // union stands in for it
+      let w = 0;
+      let h = 0;
+      for (let i = 0, o = at; i < layers && o + 56 <= buf.length; i++, o += 56) {
+        w = Math.max(w, v.getInt32(o + 16, true));
+        h = Math.max(h, v.getInt32(o + 20, true));
+      }
+      if (w <= 0 || h <= 0) return;
+      target = this.newColorBuffer(handle, w, h);
+    }
     const q = this.quad();
     const fbo = gl.createFramebuffer()!;
     this.ownState();
@@ -1268,6 +1295,6 @@ void main() { o = mode == 1 ? color : texture(src, t) * color.a; }`;
     gl.drawArrays(0x0005, 0, 4);
     this.stats.posts++;
     this.postRate.add(this.nowMs(), 1);
-    this.onPost?.(cb, 0);
+    this.onPost?.(cb, this.timeUs);
   }
 }

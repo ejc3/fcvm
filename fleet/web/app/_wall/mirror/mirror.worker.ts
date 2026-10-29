@@ -22,6 +22,21 @@ let tapBytes = 0;
 let joined = false;
 let timer: ReturnType<typeof setInterval> | null = null;
 let pixel: number[] | null = null;
+let stampAt: { k: number; at: number } | null = null;
+
+/** The app's frame number in one row of the stamp band (fleet/phone/streamer/stamp.cpp), or null. */
+function stampOf(row: Uint8Array, w: number): number | null {
+  let v = 0;
+  for (let i = 0; i < 32; i++) {
+    const x = Math.floor((Math.floor((i * w) / 32) + Math.floor(((i + 1) * w) / 32)) / 2) * 4;
+    const lo = Math.min(row[x]!, row[x + 1]!, row[x + 2]!);
+    const hi = Math.max(row[x]!, row[x + 1]!, row[x + 2]!);
+    if (lo >= 160) v = v * 2 + 1;
+    else if (hi <= 96) v = v * 2;
+    else return null;
+  }
+  return v === 0 || v === 0xffffffff ? null : v;
+}
 
 function fresh(): void {
   if (!gl) return;
@@ -31,12 +46,20 @@ function fresh(): void {
   tapBytes = 0;
   joined = false;
   pixel = null;
+  stampAt = null;
   // the canvas is preserved between posts, so its centre can be read after one
   mirror.onPost = () => {
     if (!gl || (mirror!.stats.posts % 15 !== 1)) return;
     const px = new Uint8Array(4);
     gl.readPixels(gl.drawingBufferWidth >> 1, gl.drawingBufferHeight >> 1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
     pixel = Array.from(px);
+    // Robot Park's stamp (its frame number) in the bottom band: the scene time the mirror shows,
+    // against the video's, says which is fresher
+    const w = gl.drawingBufferWidth;
+    const row = new Uint8Array(w * 4);
+    gl.readPixels(0, 3, w, 1, gl.RGBA, gl.UNSIGNED_BYTE, row);
+    const k = stampOf(row, w);
+    if (k !== null) stampAt = { k, at: now() };
   };
 }
 
@@ -70,6 +93,7 @@ function stats(): void {
     overflowed: mirror.stats.overflowed,
     open: ws !== null && ws.readyState === WebSocket.OPEN,
     pixel,
+    stamp: stampAt,
   });
 }
 

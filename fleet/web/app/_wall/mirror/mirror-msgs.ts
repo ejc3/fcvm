@@ -29,6 +29,8 @@ export interface MirrorStatsMsg {
   open: boolean;
   /** The centre pixel of the last frame posted (RGBA), so a test can see what the mirror drew. */
   pixel: number[] | null;
+  /** The last stamp read from a posted frame (Robot Park's frame number k, scene time k/60 s), and when (local ms). */
+  stamp: { k: number; at: number } | null;
 }
 
 export type MirrorOut =
