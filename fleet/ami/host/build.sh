@@ -6,7 +6,10 @@
 #                    the caller reboots the instance afterwards
 #   build.sh build   fcvm at $FCVM_COMMIT (make build, make setup-gpu), the renderer image,
 #                    one GPU VM to first frame (warms the image export and snapshot cache),
-#                    and the renderer image's export at /mnt/fcvm-btrfs/renderer.oci.tar.zst
+#                    and the renderer image's export at /mnt/fcvm-btrfs/renderer.oci.tar.zst;
+#                    then the phones: the phone profile, the emulator and system image built
+#                    from source, Robot Park, the phone image, and the warm snapshot of a
+#                    running phone every phone of a host is a clone of (warm-phone.sh)
 #   build.sh bake    packs the store into /var/lib/fcvm-fleet/store/ (store-pack.py) and cleans up
 #                    for imaging
 #
@@ -40,7 +43,7 @@ prep)
   $APT update
   $APT install -y build-essential git jq qemu-utils busybox-static pkg-config libssl-dev clang make \
     podman skopeo uidmap slirp4netns fuse3 passt btrfs-progs bc bison flex libelf-dev libseccomp-dev \
-    curl zstd ffmpeg python3-pil python3-boto3 strace
+    curl zstd ffmpeg python3-pil python3-boto3 strace openjdk-17-jdk-headless
   # AGENTS.md "Fresh Bare-Metal Box Quickstart", steps 1, 1b, 1c and 4, made persistent.
   usermod -aG kvm "$U"
   loginctl enable-linger "$U"
@@ -64,11 +67,14 @@ X
   # never loaded, vfio-pci loaded early; fcvm-fleet-vfio.service binds every NVIDIA function.
   echo 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT intel_iommu=on iommu=pt"' > /etc/default/grub.d/90-fcvm-fleet-iommu.cfg
   printf 'blacklist nouveau\noptions nouveau modeset=0\nsoftdep nouveau pre: vfio-pci\n' > /etc/modprobe.d/fcvm-fleet-vfio.conf
+  # Phones run an Android Emulator on KVM inside their VMs: nested virtualization on (the
+  # kernel's default since 4.20, set here so a host never depends on it).
+  echo 'options kvm_intel nested=1' > /etc/modprobe.d/fcvm-fleet-nested.conf
   echo vfio-pci > /etc/modules-load.d/vfio-pci.conf
   update-initramfs -u
   update-grub
   install -d /usr/local/lib/fcvm-fleet /var/lib/fcvm-fleet /etc/fcvm-fleet
-  install -m 0755 "$HERE/bind-vfio.sh" "$HERE/store.sh" "$HERE/s3-cat.py" "$HERE/prefetch.sh" "$HERE/warm-root.sh" /usr/local/lib/fcvm-fleet/
+  install -m 0755 "$HERE/bind-vfio.sh" "$HERE/store.sh" "$HERE/s3-cat.py" "$HERE/prefetch.sh" "$HERE/warm-root.sh" "$HERE/warm-phone.sh" /usr/local/lib/fcvm-fleet/
   install -m 0644 "$HERE/fcvm-fleet-vfio.service" "$HERE/fcvm-fleet-store.service" "$HERE/fcvm-fleet-agent.service" \
     "$HERE/fcvm-fleet-prefetch.service" /etc/systemd/system/
   systemctl daemon-reload
@@ -128,17 +134,33 @@ build)
   # One GPU VM as root, launched as the agent launches a slot: the pre-start snapshot the
   # agent's restores hit, and the list of root volume files the prefetch reads at boot.
   bash "$HERE/warm-root.sh" "$G0" /etc/fcvm-fleet/prefetch.list
+  # Phones (docs/fleet/ARCHITECTURE.md, "Phones mode"): the phone profile, the emulator and the
+  # system image built from source, and Robot Park. Robot Park builds against the SDK's API 35
+  # platform (scripts/phone/sdk.sh): the SDK is used here to build the app and is left out of
+  # the store (bake), so nothing of Google's SDK is on a host.
+  as_user "cd $SRC && make setup-phone && make phone-emulator && ./scripts/phone/aosp.sh"
+  as_user "cd $SRC && ACCEPT_ANDROID_SDK_LICENSE=1 ./scripts/phone/sdk.sh && ./scripts/phone/app.sh"
+  as_user "cd $SRC && make -C fleet/phone image TAG=fleet"
+  as_user "podman save --format oci-archive localhost/fcvm-phone:fleet -o /mnt/fcvm-btrfs/phone.oci.tar"
+  podman load -q -i /mnt/fcvm-btrfs/phone.oci.tar
+  rm -f /mnt/fcvm-btrfs/phone.oci.tar
+  G1=
+  for d in /sys/bus/pci/drivers/vfio-pci/[0-9a-f][0-9a-f][0-9a-f][0-9a-f]:*; do [ "${d##*/}" = "$G0" ] || { G1=${d##*/}; break; }; done
+  bash "$HERE/warm-phone.sh" "$G0" "$G1" "$(as_user "cd $SRC && ./scripts/phone/aosp.sh --root-path")" \
+    "$(as_user "cd $SRC && ./scripts/phone/emulator.sh --path")" "$(as_user "cd $SRC && ./scripts/phone/app.sh --apk-path")" \
+    /etc/fcvm-fleet/phone.env
   zstd -q -T0 -f --rm /mnt/fcvm-btrfs/renderer.oci.tar -o /mnt/fcvm-btrfs/renderer.oci.tar.zst
   sha256sum /mnt/fcvm-btrfs/renderer.oci.tar.zst | tee "$S/renderer.sha256"
   as_user "podman image inspect localhost/fcvm-renderer:fleet --format '{{.Id}}'" | tee "$S/renderer.id"
   ;;
 bake)
   pkill -TERM -x fcvm || true; sleep 2
-  install -m 0755 "$HERE/warm.sh" "$HERE/store.sh" "$HERE/s3-cat.py" "$HERE/prefetch.sh" "$HERE/warm-root.sh" /usr/local/lib/fcvm-fleet/
-  install -m 0644 "$HERE/fcvm-fleet-prefetch.service" /etc/systemd/system/
+  install -m 0755 "$HERE/warm.sh" "$HERE/store.sh" "$HERE/s3-cat.py" "$HERE/prefetch.sh" "$HERE/warm-root.sh" "$HERE/warm-phone.sh" /usr/local/lib/fcvm-fleet/
+  install -m 0644 "$HERE/fcvm-fleet-prefetch.service" "$HERE/fcvm-fleet-agent.service" /etc/systemd/system/
   systemctl daemon-reload
   systemctl enable fcvm-fleet-prefetch.service
   [ -s /etc/fcvm-fleet/prefetch.list ] || { echo "no /etc/fcvm-fleet/prefetch.list: run the build phase (warm-root.sh)"; exit 1; }
+  [ -s /etc/fcvm-fleet/phone.env ] || { echo "no /etc/fcvm-fleet/phone.env: run the build phase (warm-phone.sh)"; exit 1; }
   # Where the store's parts are fetched at boot (<prefix><part>.tar.zst); they are uploaded
   # there after bake (fleet/ami/README.md).
   if [ -n "${STORE_S3_PREFIX:-}" ]; then
@@ -156,7 +178,8 @@ bake)
   rm -rf /var/lib/fcvm-fleet/store
   python3 "$HERE/store-pack.py" /mnt/fcvm-btrfs /var/lib/fcvm-fleet/store "${STORE_PARTS:-16}" \
       --exclude=./vm-disks --exclude=./state --exclude=./cache --exclude='./cargo-target*' \
-      --exclude=./renderer.oci.tar --exclude=./renderer.oci.tar.zst --exclude='./*.lock'
+      --exclude=./renderer.oci.tar --exclude=./renderer.oci.tar.zst --exclude='./*.lock' \
+      --exclude=./android-sdk --exclude='./android-emulator/*/src' --exclude='./android-aosp/*/.downloads'
   ls -la /var/lib/fcvm-fleet/store
   # Each part goes to S3 in one presigned PUT, which S3 refuses above 5 GiB; a host whose
   # S3 restore fails falls back to the AMI's copy, which took 1006 s against 78 s (2026-10-24).

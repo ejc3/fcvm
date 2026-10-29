@@ -16,9 +16,14 @@ ConditionPathExists=/etc/fcvm-fleet/agent.env
 # (--ipv6-prefix-from-imds), which needs root, and the agent refuses a prefix otherwise.
 # The renderer image is in root's podman store and fcvm's config in /root/.config/fcvm
 # (build.sh puts both there).
+#
+# /etc/fcvm-fleet/phone.env (written at build by warm-phone.sh) holds the phones' arguments
+# (PHONE_AGENT_ARGS: the phone image, the AOSP build, the emulator, the app and the warm
+# snapshot); the host's own arguments choose how many GPUs run phones (--phones N).
 [Service]
 EnvironmentFile=/etc/fcvm-fleet/agent.env
-ExecStart=/usr/local/bin/fcvm fleet agent $FLEET_AGENT_ARGS
+EnvironmentFile=-/etc/fcvm-fleet/phone.env
+ExecStart=/usr/local/bin/fcvm fleet agent $FLEET_AGENT_ARGS $PHONE_AGENT_ARGS
 LimitMEMLOCK=infinity
 LimitNOFILE=65536
 Restart=on-failure
