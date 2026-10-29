@@ -1140,8 +1140,7 @@ launcher) are not drawn and are counted.
   as it arrives. Browsers have no zstd `DecompressionStream`, so the page's worker runs zstd's
   own decoder (1.5.7's single-file decoder, built for wasm32 with no libc by
   `fleet/web/scripts/build-zstd-wasm.sh`: 59 KB, 22 KB gzipped) in a fixed workspace that
-  refuses a larger window. A stream that does not begin with zstd's magic number is raw
-  deflate from a phone image built before this, and is read with `DecompressionStream`. The
+  refuses a larger window. The
   bandwidth shown is the WebSocket messages' bytes; the readout also says the encoding, how
   many times smaller than the commands the wire is, and the share of a core the worker spends
   decoding.
@@ -1174,7 +1173,7 @@ mirror per phone at a time (the tap has one consumer).
 | the meter's rolling second and totals | `core/test/mirror.test.ts` |
 | admission: holder only, keys required, expiry, forgery; the holder kept from the app; zstd round trip within a 1 MiB window | `fleet/phone/streamer/test_host.cpp` |
 | the page's zstd decoder: each flushed message whole, a larger window and a non-zstd stream refused, built from the tree's sources | `core/test/zstd.test.ts` |
-| the worker: a retired connection's bytes never reach the next, the 16 MiB bound, `OVERFLOW`, no WebGL2, an older streamer's deflate | `core/test/mirror-worker.test.ts` |
+| the worker: a retired connection's bytes never reach the next, the 16 MiB bound, `OVERFLOW`, no WebGL2 | `core/test/mirror-worker.test.ts` |
 | the holder reaches the streamer's scene | `tests/test_fleet_agent.rs` |
 | replay: a Robot Park stream captured on a gpubox, with the T4's stamped frames, replayed in headless Chrome on WebGL2; each mirror frame compared with the T4 frame of the same stamp | `e2e/mirror.spec.ts` (`playwright.mirror.config.ts`; threshold below) |
 | the panel: three views, video closed in mirror-only, the readouts, the mirror drawing with WebGL2 | `e2e/phones.spec.ts` against the mock coordinator, whose phones serve a synthetic `/mirror` (`mock/mirror.ts`) |

@@ -1,10 +1,9 @@
 // The GPU mirror's worker (app/_wall/mirror/mirror.worker.ts) in a stand-in worker scope: a
 // fake WebSocket the test drives and a recording stand-in for WebGL2. What a connection the
 // worker retired does after it was retired, the bound on bytes received and not yet decoded,
-// an OVERFLOW record, a browser without WebGL2, and a stream from a streamer that sends raw
-// deflate.
+// an OVERFLOW record, and a browser without WebGL2.
 
-import { constants, createZstdCompress, deflateRawSync, type ZstdCompress } from "node:zlib";
+import { constants, createZstdCompress, type ZstdCompress } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { encodeCall, encodeRecord, RECORD } from "../mirror/wire.ts";
 import type { MirrorIn, MirrorOut } from "../../app/_wall/mirror/mirror-msgs.ts";
@@ -203,17 +202,5 @@ describe("the mirror worker", () => {
     vi.stubGlobal("self", scope);
     await new Promise((r) => setTimeout(r, 600));
     expect(posted).toEqual([]);
-  });
-
-  it("reads raw deflate from a streamer built before zstd", async () => {
-    const send = await worker();
-    send({ type: "open", url: "wss://phone/mirror", admit: "t" });
-    const ws = FakeSocket.all[0]!;
-    ws.message(new Uint8Array(deflateRawSync(opening(), { finishFlush: constants.Z_SYNC_FLUSH })));
-    await settle();
-    expect(joins()).toBe(1);
-    const stats = posted.filter((m) => m.type === "stats");
-    expect(closes()).toEqual([]);
-    expect(stats.every((s) => s.type !== "stats" || s.codec !== "zstd")).toBe(true);
   });
 });

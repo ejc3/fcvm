@@ -2146,9 +2146,8 @@ the clone's GPU.
   bytes and the first 4096 bytes of every reply, as the tap's records, in binary messages of one
   zstd stream (level 3, a window of at most 1 MiB; each message ends at a `ZSTD_e_flush`, so a
   streaming decoder gives back every byte so far). The page decodes it with zstd's own decoder
-  built for WebAssembly and refuses a larger window; a stream whose first bytes are not zstd's
-  magic number is raw deflate from a phone image built before this, read with
-  `DecompressionStream("deflate-raw")`. The page never answers; the phone's GPU answers every call.
+  built for WebAssembly and refuses a larger window. The page never answers; the phone's GPU
+  answers every call.
   It closes with 1000 when the scene names another holder or none, 1011 when the tap cannot
   be reached or ends, and 1013 when the viewer falls 8 MiB behind ("join again") or a mirror
   is already open (the tap has one consumer).

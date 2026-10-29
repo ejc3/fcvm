@@ -23,14 +23,6 @@ let pendingBytes = 0;
 /** A viewer that receives faster than it replays drops the stream past this, and joins again. */
 const MAX_PENDING_BYTES = 16 << 20;
 let reader = new RecordReader();
-/**
- * The stream's encoding, from its first message: zstd (the streamer's), or raw deflate from a
- * phone image built before the streamer sent zstd. A raw deflate stream cannot begin with
- * zstd's magic number (its first block would be a stored one whose length and complement
- * disagree), so the first four bytes tell them apart.
- */
-let codec: "zstd" | "deflate-raw" | null = null;
-let inflate: WritableStreamDefaultWriter<Uint8Array> | null = null;
 let zstd: Promise<ZstdStream> | null = null;
 /** zstd messages waiting for the decoder, in order. */
 let queue: Uint8Array[] = [];
@@ -115,8 +107,7 @@ function stats(): void {
     wireBps: wire.perSecond(t),
     wireBytes: wire.total,
     tapBytes,
-    codec,
-    decodeMsPerSec: codec === "zstd" ? decodeMs.perSecond(t) : null,
+    decodeMsPerSec: decodeMs.perSecond(t),
     repliesPerSec: mirror.replyRate.perSecond(t),
     fps: mirror.postRate.perSecond(t),
     posts: mirror.stats.posts,
@@ -142,33 +133,10 @@ function close(): void {
     ws.close();
     ws = null;
   }
-  void inflate?.abort().catch(() => {});
-  inflate = null;
   zstd = null;
   queue = [];
   draining = false;
-  codec = null;
   pendingBytes = 0;
-}
-
-const ZSTD_MAGIC = [0x28, 0xb5, 0x2f, 0xfd];
-
-/** A raw deflate stream: one DecompressionStream, each message flushed to a byte boundary. */
-function openInflate(gen: number): WritableStreamDefaultWriter<Uint8Array> {
-  const ds = new DecompressionStream("deflate-raw");
-  const writer = ds.writable.getWriter() as WritableStreamDefaultWriter<Uint8Array>;
-  void (async () => {
-    const r = ds.readable.getReader();
-    for (;;) {
-      const { value, done } = await r.read();
-      if (done || gen !== generation) break;
-      feed(value);
-    }
-  })().catch((e: unknown) => {
-    // a retired connection's inflater fails as it is aborted: not this connection's news
-    if (gen === generation) retire(`inflate: ${String(e)}`);
-  });
-  return writer;
 }
 
 /**
@@ -217,24 +185,10 @@ function open(url: string, admit: string): void {
       retire("the mirror fell behind in this browser: join again");
       return;
     }
-    const m = new Uint8Array(e.data);
-    if (codec === null) {
-      codec = m.length >= 4 && ZSTD_MAGIC.every((b, i) => m[i] === b) ? "zstd" : "deflate-raw";
-      if (codec === "zstd") zstd = ZstdStream.create();
-      else inflate = openInflate(gen);
-    }
+    zstd ??= ZstdStream.create();
     pendingBytes += n;
-    if (codec === "zstd") {
-      queue.push(m);
-      void drain(gen);
-      return;
-    }
-    inflate!.write(m).then(
-      () => {
-        if (gen === generation) pendingBytes -= n;
-      },
-      () => {},
-    );
+    queue.push(new Uint8Array(e.data));
+    void drain(gen);
   };
   s.onclose = (e) => {
     if (gen !== generation) return;

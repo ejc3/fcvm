@@ -16,10 +16,8 @@ export interface MirrorStatsMsg {
   wireBytes: number;
   /** Bytes of the tap stream after decoding. */
   tapBytes: number;
-  /** The stream's encoding (null before its first message). */
-  codec: "zstd" | "deflate-raw" | null;
-  /** Milliseconds a second spent decoding zstd (null when not zstd). */
-  decodeMsPerSec: number | null;
+  /** Milliseconds a second spent decoding the wire (zstd). */
+  decodeMsPerSec: number;
   /** Blocking calls the phone's GPU answered per second (each a round trip the viewer did not make). */
   repliesPerSec: number;
   /** Frames posted to the screen per second. */

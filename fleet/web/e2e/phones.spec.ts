@@ -199,7 +199,7 @@ test("a phone taken over shows its video, its GPU mirror or both, each with its 
   expect(st.posts).toBeGreaterThan(10);
   expect(st.skipped + st.failed).toBe(0);
   expect(st.fps).toBeGreaterThan(15);
-  expect(st.codec).toBe("zstd");
+  expect(st.decodeMsPerSec).toBeGreaterThan(0);
   // joining the copy restarts the app (until the join snapshot lands), once
   await expect.poll(async () => (await phoneActions()).map((a) => a.action)).toEqual(["restart_app"]);
 
