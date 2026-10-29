@@ -76,13 +76,8 @@ stop_runner() {
     snapshot_dir=""
   fi
 }
-# A run that ends before its last check keeps the source phone's logs.
 finished=0
-on_exit() {
-  [ "$finished" = 1 ] || [ -z "${pid:-}" ] || keep_phone_logs "$pid" early-exit
-  stop_runner
-}
-trap on_exit EXIT
+trap 'finish_run stop_runner' EXIT
 trap 'exit 130' INT TERM
 t0=$(date +%s%3N)
 "$F" podman run --name "$NAME" --kernel-profile "${PHONE_PROFILE:-phone}" --gpu "$GPU" --privileged --cpu 6 --mem 6144 \

@@ -43,11 +43,22 @@ check_draws() {
   local out rc=0 fps
   out=$("$F" exec --pid "$1" -- /usr/local/bin/phone.sh draws 4 2>&1) || rc=$?
   fps=$(lowest_fps_in "$out")
-  if at_least_30 "$fps"; then
+  # samples read before adb failed are not a pass
+  if [ "$rc" = 0 ] && at_least_30 "$fps"; then
     ok "the app draws $2: lowest fps sample $fps"
     return
   fi
   bad "the app does not draw 30 fps $2: lowest '${fps:-none}'; phone.sh draws exit $rc, its last lines: $(tail -3 <<< "$out" | tr '\n' ' ')"
   kept=$((kept + 1))
   keep_phone_logs "$1" "draws-$kept"
+}
+# The run's EXIT handler: a run that ends before its last check keeps the source phone's logs
+# ($pid; finished=1 at the end), then $1 stops the VMs.
+# Keeping the logs is part of an || list, where set -e does not apply, so the VMs are stopped
+# whatever it does (a full disk included).
+finish_run() {
+  if [ "${finished:-0}" != 1 ] && [ -n "${pid:-}" ]; then
+    keep_phone_logs "$pid" early-exit || echo "     could not keep the phone's logs in ${LOGS:-?}/out/early-exit"
+  fi
+  "$1"
 }

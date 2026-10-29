@@ -25,6 +25,7 @@ case "$*" in
       frames) printf 'I PHONEPROBE: fps=60.1 instances=25600\nI PHONEPROBE: fps=59.7 instances=25600\n' ;;
       slow) printf 'I PHONEPROBE: fps=12.0 instances=25600\n' ;;
       offline) echo "error: device offline" >&2; exit 1 ;;
+      partial) printf 'I PHONEPROBE: fps=60.1 instances=25600\n'; echo "error: device offline" >&2; exit 1 ;;
     esac ;;
   "sh -c "*) printf '%s\n' "$3" > "$LOGS/collect-script" ;;
   dmesg) echo "[    1.0] kernel log" ;;
@@ -66,6 +67,19 @@ c=$dir/logs-offline/collect-script
   && grep -q 'guest load' "$dir/logs-offline/out/draws-1/guest.txt" && grep -qE '^[0-9.]+ [0-9.]+ [0-9.]+ ' "$dir/logs-offline/out/draws-1/host.txt" \
   && pass "a failed frame check keeps the emulator, GPU-hook, logcat and kernel logs, and the guest's and host's load" || miss "the logs were not kept: $(cat "$dir/out" "$c")"
 [ ! -e "$dir/logs-frames/collect-script" ] && pass "a passing check keeps no logs" || miss "a passing check collected logs"
+
+# frames read before adb failed are not a pass: the read itself has to succeed
+script partial 'check_draws 7 "after the retake"'
+grep -q "^FAIL the app does not draw 30 fps after the retake: lowest '60.1'; phone.sh draws exit 1" "$dir/out" \
+  && pass "a frame read that fails after printing samples fails the check" || miss "a frame read that failed after its samples: $(cat "$dir/out")"
+
+# The run's EXIT handler stops the VMs even when keeping the phone's logs fails (a full disk).
+script frames 'pid=7 finished=0
+LOGS=$(mktemp -u)/no/such/dir; mkdir() { return 1; }
+stop_runner() { echo CLEANUP-RAN; }
+trap "finish_run stop_runner" EXIT
+exit 2'
+grep -q CLEANUP-RAN "$dir/out" && pass "the VMs are stopped when the logs cannot be kept" || miss "a failed log keep skipped the cleanup: $(cat "$dir/out")"
 
 # Any other failing command ends the run with a FAIL line naming it, also inside a function
 # and a command substitution, as `snapshot_dir=$(grep ... | head -1)` would.
