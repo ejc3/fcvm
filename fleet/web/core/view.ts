@@ -1718,7 +1718,8 @@ export function wallView(input: WallInput): WallView {
       broadcast && s.admission?.broadcast
         ? {
             url: s.admission.broadcast.value,
-            paused: s.ui.paused,
+            // The page's Pause, and a tab hidden long enough to close its streams.
+            paused: s.ui.paused || s.ui.suspended,
             latency:
               input.broadcastLatencyMs === undefined || input.broadcastLatencyMs === null
                 ? "broadcast, waiting for its first frame"

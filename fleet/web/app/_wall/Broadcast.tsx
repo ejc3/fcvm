@@ -6,7 +6,7 @@
 // the frame on screen and draws the overlay for that moment (core/broadcast.ts).
 
 import { useEffect, useRef, useState } from "react";
-import { FrameMatcher, type ShownFrame } from "../../core/index.ts";
+import { FrameMatcher, memoUntilFailure, type ShownFrame } from "../../core/index.ts";
 
 /** The IVS web player, pinned. */
 export const IVS_PLAYER_URL = "https://player.live-video.net/1.57.0/amazon-ivs-player.min.js";
@@ -37,23 +37,26 @@ declare global {
   }
 }
 
-let loading: Promise<IvsGlobal> | null = null;
-
-function loadPlayer(): Promise<IvsGlobal> {
-  if (window.IVSPlayer) return Promise.resolve(window.IVSPlayer);
-  loading ??= new Promise((resolve, reject) => {
-    const s = document.createElement("script");
-    s.src = IVS_PLAYER_URL;
-    s.async = true;
-    s.onload = () => (window.IVSPlayer ? resolve(window.IVSPlayer) : reject(new Error("no IVSPlayer")));
-    s.onerror = () => {
-      loading = null;
-      reject(new Error("the IVS player did not load"));
-    };
-    document.head.appendChild(s);
-  });
-  return loading;
-}
+/** The IVS player script, loaded once; a failed load (no IVSPlayer, a network error) is tried again. */
+const loadPlayer = memoUntilFailure(
+  () =>
+    new Promise<IvsGlobal>((resolve, reject) => {
+      if (window.IVSPlayer) return resolve(window.IVSPlayer);
+      const s = document.createElement("script");
+      s.src = IVS_PLAYER_URL;
+      s.async = true;
+      s.onload = () => {
+        s.remove();
+        if (window.IVSPlayer) resolve(window.IVSPlayer);
+        else reject(new Error("no IVSPlayer"));
+      };
+      s.onerror = () => {
+        s.remove();
+        reject(new Error("the IVS player did not load"));
+      };
+      document.head.appendChild(s);
+    }),
+);
 
 /** The frame time an SEI carries: {"t": scene seconds, "e": scene epoch ms}. */
 function seiFrame(data: unknown): { t: number; e: number } | null {

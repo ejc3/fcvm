@@ -82,7 +82,9 @@ export function broadcastShown(
   const entry = kept || pinned === null ? snapshotAt(s.history, wall) : pinned;
   const now = localNow - (serverNow(s.clock, localNow) - wall);
   if (entry === null) return { state: s, now, entry: null };
-  const st = entry.state;
+  // The picture's overlays are the frame's, but whether the fleet is awake is the live
+  // state's: a sleeping fleet sends no frame that could bring its sleep to the overlay.
+  const st = s.accepted ? { ...entry.state, fleet: { ...entry.state.fleet, power: s.accepted.fleet.power } } : entry.state;
   return {
     state: {
       ...s,
@@ -142,6 +144,21 @@ function trim<V>(m: Map<number, V>): void {
  */
 export function inputScene(s: ClientState, pinned: HistoryEntry | null): FleetState | null {
   return watchesBroadcast(s) && pinned !== null ? pinned.state : s.accepted;
+}
+
+/**
+ * `f`, run once and its result kept, unless it fails: the next call runs it again (a player
+ * script that loaded without defining its global, a network error).
+ */
+export function memoUntilFailure<T>(f: () => Promise<T>): () => Promise<T> {
+  let kept: Promise<T> | null = null;
+  return () => {
+    kept ??= f().catch((e: unknown) => {
+      kept = null;
+      throw e;
+    });
+    return kept;
+  };
 }
 
 /** The broadcast switch in the drawer. */
