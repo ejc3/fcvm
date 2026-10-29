@@ -42,6 +42,8 @@ export interface MirrorStats {
   /** Packets on channels whose state predates the copy, which the mirror cannot draw. */
   unknownChannelPackets: number;
   overflowed: boolean;
+  /** Color buffers the host destroyed (FREE records) that the mirror let go of. */
+  freed: number;
 }
 
 interface ShareGroup {
@@ -74,7 +76,6 @@ export interface ColorBuffer {
   tex: WebGLTexture;
   w: number;
   h: number;
-  refs: number;
 }
 
 /** One guest context: its share group, its stand-ins for vertex array 0 and its framebuffers, and its state. */
@@ -180,6 +181,7 @@ export class GlMirror {
     failed: {},
     unknownChannelPackets: 0,
     overflowed: false,
+    freed: 0,
   };
   /** Replies the phone's GPU sent per second: the round trips the server answered. */
   readonly replyRate = new RateMeter();
@@ -250,6 +252,10 @@ export class GlMirror {
     }
     if (r.type === RECORD.overflow) {
       this.stats.overflowed = true;
+      return;
+    }
+    if (r.type === RECORD.free) {
+      this.freeColorBuffer(r.aux);
       return;
     }
     const c = this.channel(r.channel, false);
@@ -591,19 +597,10 @@ export class GlMirror {
     this.onReply("rcCreateColorBuffer", (_c, a, r) => newColorBuffer(new DataView(r.buffer, r.byteOffset).getUint32(0, true), n(a[0]), n(a[1])));
     this.onReply("rcCreateColorBufferDMA", (_c, a, r) => newColorBuffer(new DataView(r.buffer, r.byteOffset).getUint32(0, true), n(a[0]), n(a[1])));
     this.on("rcCreateColorBufferWithHandle", (_c, a) => newColorBuffer(n(a[3]), n(a[0]), n(a[1])));
-    const open: Handler = (_c, a) => {
-      const cb = this.colorBuffers.get(n(a[0]));
-      if (cb) cb.refs++;
-    };
-    this.on("rcOpenColorBuffer", open);
-    this.on("rcOpenColorBuffer2", open);
-    this.on("rcCloseColorBuffer", (_c, a) => {
-      const cb = this.colorBuffers.get(n(a[0]));
-      if (cb && --cb.refs <= 0) {
-        gl.deleteTexture(cb.tex);
-        this.colorBuffers.delete(cb.handle);
-      }
-    });
+    // A color buffer lives until the host destroys it (a FREE record): the guest's open and
+    // close calls are only part of its count (the refcount pipe and process cleanup are the
+    // rest), and the host may keep a closed one for a second in case it is opened again.
+    for (const f of ["rcOpenColorBuffer", "rcOpenColorBuffer2", "rcCloseColorBuffer"]) this.on(f, () => {});
     this.on("rcUpdateColorBuffer", (_c, a) => {
       const cb = this.colorBuffers.get(n(a[0]));
       if (!cb) return;
@@ -1116,9 +1113,29 @@ export class GlMirror {
       gl.texParameteri(GL_TEXTURE_2D, 0x2802, 0x812f);
       gl.texParameteri(GL_TEXTURE_2D, 0x2803, 0x812f);
     });
-    const cb = { handle, tex, w, h, refs: 1 };
+    const cb = { handle, tex, w, h };
     this.colorBuffers.set(handle, cb);
     return cb;
+  }
+
+  /**
+   * The host destroyed color buffer `handle`: its handle names nothing now. Its texture goes
+   * too, unless a guest texture name, renderbuffer or window surface still draws with it (an
+   * EGLImage outlives the buffer it was made from); glDeleteTextures then deletes it with the
+   * name.
+   */
+  private freeColorBuffer(handle: number): void {
+    const cb = this.colorBuffers.get(handle);
+    if (!cb) return;
+    this.colorBuffers.delete(handle);
+    this.stats.freed++;
+    const shares = new Set([...this.contexts.values()].map((c) => c.share));
+    for (const share of shares) {
+      for (const t of share.textures.values()) if (t === cb.tex) return;
+      for (const r of share.renderbuffers.values()) if (r === cb) return;
+    }
+    for (const s of this.surfaces.values()) if (s.cb === cb) return;
+    this.gl.deleteTexture(cb.tex);
   }
 
   private stencil(ctx: Ctx, kind: "Func" | "Op" | "Mask", face: number, v: number[]): void {

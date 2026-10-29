@@ -40,13 +40,14 @@ function fakeGl(): { gl: WebGL2RenderingContext; calls: Call[] } {
 const u32 = (...xs: number[]) => new Uint8Array(new Uint32Array(xs).buffer);
 
 /** A stream on channels the copy saw open, fed to a fresh mirror. */
-function play(steps: ([number, string, (number | bigint | Uint8Array)[]] | [number, "reply", number[]])[]) {
+function play(steps: ([number, string, (number | bigint | Uint8Array)[]] | [number, "reply" | "free", number[]])[]) {
   const { gl, calls } = fakeGl();
   const m = new GlMirror(gl, () => 0);
   const recs: Uint8Array[] = [encodeRecord(RECORD.hello, 0, u32(0), 1)];
-  for (const ch of new Set(steps.map((s) => s[0]))) recs.push(encodeRecord(RECORD.open, ch, new Uint8Array(0)));
+  for (const ch of new Set(steps.filter((s) => s[1] !== "free").map((s) => s[0]))) recs.push(encodeRecord(RECORD.open, ch, new Uint8Array(0)));
   for (const [ch, name, args] of steps) {
-    if (name === "reply") recs.push(encodeRecord(RECORD.reply, ch, u32(...(args as number[])), 4 * args.length));
+    if (name === "free") recs.push(encodeRecord(RECORD.free, 0, new Uint8Array(0), args[0] as number));
+    else if (name === "reply") recs.push(encodeRecord(RECORD.reply, ch, u32(...(args as number[])), 4 * args.length));
     else recs.push(encodeRecord(RECORD.data, ch, encodeCall(name, args as (number | bigint | Uint8Array)[])));
   }
   const bytes = new Uint8Array(recs.reduce((a, r) => a + r.length, 0));
@@ -116,6 +117,62 @@ describe("the mirror's context switch", () => {
     const textures = calls.filter((c) => c.name === "createTexture").map((c) => c.ret);
     expect(textures.length).toBeGreaterThanOrEqual(2);
     expect(lastBefore(calls, "bindTexture", "clear", 0x0de1)?.args[1]).toBe(textures[0]);
+  });
+});
+
+describe("color buffers the host destroys", () => {
+  const made = (calls: Call[]) => calls.filter((c) => c.name === "createTexture").map((c) => c.ret);
+  const deleted = (calls: Call[]) => calls.filter((c) => c.name === "deleteTexture").map((c) => c.args[0]);
+
+  it("lets go of a color buffer when the host frees it, not when the guest closes it", () => {
+    const { m, calls } = play([
+      ...contexts(),
+      [1, "rcCreateColorBuffer", [16, 16, 0x1908]],
+      [1, "reply", [9]],
+      // the refcount pipe still holds it: the host keeps it, and so does the mirror
+      [1, "rcCloseColorBuffer", [9]],
+      [1, "rcFBPost", [9]],
+    ]);
+    expect(deleted(calls)).toEqual([]);
+    expect(m.stats.posts).toBe(1);
+    const freed = play([
+      ...contexts(),
+      [1, "rcCreateColorBuffer", [16, 16, 0x1908]],
+      [1, "reply", [9]],
+      [0, "free", [9]],
+      [1, "rcFBPost", [9]],
+    ]);
+    expect(deleted(freed.calls)).toEqual([made(freed.calls)[0]]);
+    expect(freed.m.stats.freed).toBe(1);
+    // the handle names nothing now
+    expect(freed.m.stats.posts).toBe(0);
+  });
+
+  it("keeps a freed color buffer's texture while a guest texture draws with it, until that texture is deleted", () => {
+    const { m, calls } = play([
+      ...contexts(),
+      [1, "rcCreateColorBuffer", [16, 16, 0x1908]],
+      [1, "reply", [9]],
+      [1, "glGenTextures", [1, 4]],
+      [1, "reply", [5]],
+      [1, "glBindTexture", [0x0de1, 5]],
+      [1, "rcBindTexture", [9]],
+      [0, "free", [9]],
+    ]);
+    expect(m.stats.freed).toBe(1);
+    expect(deleted(calls)).toEqual([]);
+    const after = play([
+      ...contexts(),
+      [1, "rcCreateColorBuffer", [16, 16, 0x1908]],
+      [1, "reply", [9]],
+      [1, "glGenTextures", [1, 4]],
+      [1, "reply", [5]],
+      [1, "glBindTexture", [0x0de1, 5]],
+      [1, "rcBindTexture", [9]],
+      [0, "free", [9]],
+      [1, "glDeleteTextures", [1, u32(5)]],
+    ]);
+    expect(deleted(after.calls)).toContain(made(after.calls)[0]);
   });
 });
 

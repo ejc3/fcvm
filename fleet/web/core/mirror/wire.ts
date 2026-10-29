@@ -4,7 +4,7 @@
 
 import { GLES2, GLES2_BASE, RENDER_CONTROL, RENDER_CONTROL_BASE, type WireCall } from "./table.ts";
 
-export const RECORD = { hello: 1, open: 2, close: 3, data: 4, reply: 5, overflow: 6 } as const;
+export const RECORD = { hello: 1, open: 2, close: 3, data: 4, reply: 5, overflow: 6, free: 7 } as const;
 export const HEADER_BYTES = 24;
 export const PROTOCOL_VERSION = 1;
 
