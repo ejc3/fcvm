@@ -948,15 +948,33 @@ Vulkan path is measured on the T4.
 ### Getting the screen to the page
 
 The page's frame protocol stays: FCVF frames of H.264 over a WebSocket, each stamped with
-its `t`. A phone streamer in the container reads the emulator's screen (its gRPC screen
-stream or the shared-memory video bridge it writes with `-share-vid`, whichever measures
-faster), encodes with NVENC on the same GPU (the driver image already carries
+its `t`. A phone streamer in the container reads the emulator's screen from its gRPC
+screen stream (`streamScreenshot`), encodes with NVENC on the same GPU (the driver image already carries
 `libnvidia-encode`), and serves the renderer's `/frames` route with its encoder and socket
 code. The app writes the `t` it drew into a strip of pixels at the edge of its surface, which
 the streamer reads and crops, so each frame carries the exact `t` it shows and the page's
 seam sync works unchanged. In seamless mode the app is full screen (system bars hidden) and
 the page shows the scene rectangle; zooming out is a scene field that tells every phone to
 show its interface from a stated `t`, so all phones change together.
+
+The shared-memory bridge (`-share-vid`) was tried first and dropped: after a cold boot it
+carried black frames (the emulator fills it from a readback worker that the gfxstream
+display never fed), and the emulator crashed reading it back after a snapshot load or a GPU
+retake. The gRPC stream composes the same screen the emulator window shows.
+
+Measured on a g4dn.metal (T4, driver 580.196.07, the emulator built from source), Robot Park
+full screen at 720x1280, from the streamer's own `/health` counters:
+
+| step | p50 | p90 |
+|---|---|---|
+| app draw (its stamped `t`) to the frame reaching the streamer | 36.3 ms | 36.6 ms |
+| frame reaching the streamer to its FCVF frame sent | 14.0 ms | 15.0 ms |
+| of which the NVENC encode | 4.6 ms | 4.7 ms |
+
+The stream carries 30 scene frames a second (the app draws 60; the streamer sends the even
+`k`), 83.6 KB a frame at `q=std` and 29.3 KB at `q=lo`. A cold phone VM answered `/health`
+23 s after the run, Android booted at 34.6 s, and the first stamped scene frame was sent at
+61 s.
 
 ### Taking over
 

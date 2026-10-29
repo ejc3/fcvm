@@ -45,4 +45,23 @@ fi
 
 printf 'what\r\n' > "$dir/status"
 if run; then bad "a retake succeeded on an unexpected status: $(cat "$dir/out")"; else ok "an unexpected status fails"; fi
+
+# The phone streamer holds a CUDA context: a release stops it and holds it stopped (the
+# phone.sh serve loop waits on the hold file), a retake lets it start again.
+mkdir -p "$dir/bin"
+printf '#!/bin/bash\nwhile :; do sleep 0.05; done\n' > "$dir/bin/phone-streamer"
+chmod +x "$dir/bin/phone-streamer"
+"$dir/bin/phone-streamer" &
+streamer=$!
+printf 'released_ms=5\r\nOK\r\n' > "$dir/release"
+GPU_HOOK_ADB="$dir/adb" GPU_HOOK_STATE="$dir" "$hook" release > "$dir/out" 2>&1 || bad "the release failed: $(cat "$dir/out")"
+if ! kill -0 "$streamer" 2> /dev/null && [ -e "$dir/streamer.hold" ]; then
+  ok "a release stops the streamer and holds it"
+else
+  bad "the streamer still runs, or is not held, after the release"
+  kill "$streamer" 2> /dev/null || true
+fi
+wait "$streamer" 2> /dev/null || true
+printf 'released\r\nOK\r\n' > "$dir/status"
+if run && [ ! -e "$dir/streamer.hold" ]; then ok "a retake lets the streamer start again"; else bad "the streamer is still held after the retake: $(cat "$dir/out")"; fi
 exit $fail
