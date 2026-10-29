@@ -114,23 +114,43 @@ start_app() {
   [[ "$line" == *"$2"* ]] || { echo "Robot Park does not render on $2: $line"; return 1; }
 }
 # The streamer, restarted whenever it exits, unless the GPU hook holds it (while the phone's
-# GPU is released for a warm snapshot, nothing in the container may hold the GPU).
+# GPU is released for a warm snapshot, nothing in the container may hold the GPU). The hold
+# check and the start happen under streamer.lock, which the hook takes to set the hold, so
+# the hook either sees the streamer's pid in streamer.pid or the loop sees the hold.
 streamer_loop() {
+  local pid
+  exec 8> "$RUN/streamer.lock"
   while :; do
-    while [ -e "$RUN/streamer.hold" ]; do sleep 0.1; done
-    "$STREAMER" serve || true
+    flock 8
+    if [ -e "$RUN/streamer.hold" ]; then
+      flock -u 8
+      sleep 0.1
+      continue
+    fi
+    "$STREAMER" serve 8>&- &
+    pid=$!
+    echo "$pid" > "$RUN/streamer.pid"
+    flock -u 8
+    wait "$pid" || true
     sleep 0.2
   done
 }
+# A process that is running: a zombie (exited, not yet reaped, which happens to an orphan in
+# a container whose first process reaps nothing) is not.
+alive() { local st; st=$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f1) && [ -n "$st" ] && [ "$st" != Z ]; }
+any_alive() { local p; for p in $(pgrep -x "$1"); do alive "$p" && return 0; done; return 1; }
 loop_pid=""
 stop_streamer() {
   [ -n "$loop_pid" ] || return 0
   kill "$loop_pid" 2>/dev/null || true
   wait "$loop_pid" 2>/dev/null || true
   loop_pid=""
+  local pid
+  pid=$(cat "$RUN/streamer.pid" 2>/dev/null || true)
+  if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
   pkill -x "$(basename "$STREAMER")" 2>/dev/null || true
   # its listeners are closed before failure mode binds them
-  while pgrep -x "$(basename "$STREAMER")" > /dev/null; do sleep 0.05; done
+  while { [ -n "$pid" ] && alive "$pid"; } || any_alive "$(basename "$STREAMER")"; do sleep 0.05; done
 }
 # The emulator this serve started, stopped: a phone reported failed holds no GPU.
 stop_emulator() {
@@ -152,7 +172,7 @@ fail() {
 case "${1:-}" in
 serve)
   t0=$(ms)
-  rm -f "$PHONE_GO_FILE" "$RUN/streamer.hold" "$RUN/emulator.pid"
+  rm -f "$PHONE_GO_FILE" "$RUN/streamer.hold" "$RUN/emulator.pid" "$RUN/streamer.pid"
   streamer_loop &
   loop_pid=$!
   trap stop_streamer EXIT

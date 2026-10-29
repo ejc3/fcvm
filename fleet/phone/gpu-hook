@@ -26,12 +26,26 @@ ms() { date +%s%3N; }
 console() { timeout 30 "$ADB" emu "$@" | tr -d '\r'; }
 running() { [ -f "$STATE/emulator.pid" ] && kill -0 "$(cat "$STATE/emulator.pid")" 2> /dev/null; }
 
+# A process that is running: a zombie (exited, not yet reaped, which happens to an orphan in
+# a container whose first process reaps nothing) is not.
+alive() { local st; st=$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f1) && [ -n "$st" ] && [ "$st" != Z ]; }
+any_alive() { local p; for p in $(pgrep -x "$1"); do alive "$p" && return 0; done; return 1; }
 # The phone streamer (phone.sh serve) holds a CUDA context on the GPU: stop it before the
-# release, and keep phone.sh's loop from starting it again until the retake.
+# release, and keep phone.sh's loop from starting it again until the retake. The loop checks
+# the hold file and starts the streamer under streamer.lock, so taking the lock here means a
+# streamer is either not started yet (and will see the hold) or started and named in
+# streamer.pid (and is stopped here).
 hold_streamer() {
+  local pid
+  exec 8> "$STATE/streamer.lock"
+  flock 8
   touch "$STATE/streamer.hold"
+  pid=$(cat "$STATE/streamer.pid" 2> /dev/null || true)
+  if [ -n "$pid" ]; then kill "$pid" 2> /dev/null || true; fi
   pkill -x phone-streamer 2> /dev/null || true
-  while pgrep -x phone-streamer > /dev/null; do sleep 0.05; done
+  while { [ -n "$pid" ] && alive "$pid"; } || any_alive phone-streamer; do sleep 0.05; done
+  flock -u 8
+  exec 8>&-
 }
 free_streamer() { rm -f "$STATE/streamer.hold"; }
 

@@ -79,6 +79,11 @@ EOF
     export PATH="$D/bin:$PATH" FAKE_DIR="$D" HOME="$D"
     export PHONE_ADB="$D/bin/adb" EMU_DIR="$D/bin" PHONE_STREAMER="$D/bin/phone-streamer" PHONE_KVM=/dev/null
     export PHONE_RUN="$D/run" PHONE_GO_FILE="$D/go" PHONE_AVD_HOME="$D/avd" PHONE_APK=/work/robotpark.apk BOOT_TIMEOUT=5
+    # FAKE_LOCK_SECS: the GPU hook holds streamer.lock for that long as serve starts
+    if [ -n "${FAKE_LOCK_SECS:-}" ]; then
+      ( exec 9> "$D/run/streamer.lock"; flock 9; echo "lock taken" >> "$D/log"; sleep "$FAKE_LOCK_SECS"; echo "lock released" >> "$D/log" ) &
+      until grep -q "lock taken" "$D/log" 2> /dev/null; do sleep 0.01; done
+    fi
     # a phone that started runs until its emulator exits: end it once it streams
     ( for _ in $(seq 1 100); do [ -e "$D/streaming" ] && { kill "$(cat "$D/run/emulator.pid")"; exit; }; sleep 0.05; done ) &
     timeout 20 "$phone" serve > "$D/out" 2>&1
@@ -104,6 +109,9 @@ has "$D" "SurfaceFlinger checked with the go file present" && bad "SurfaceFlinge
   || ok "streaming is allowed only after SurfaceFlinger's check"
 before "$D" "-grpc 8554" "streamer streaming" && before "$D" "logcat -d -s ROBOTPARK:I" "streamer streaming" \
   && ok "the emulator serves its screen and the app drew before streaming" || bad "streaming began before the app: $(cat "$D/log")"
+D=$(FAKE_LOCK_SECS=0.5 serve)
+before "$D" "lock released" "streamer serve" && ok "the streamer starts only under streamer.lock, which the GPU hook takes" \
+  || bad "the streamer started while the GPU hook held streamer.lock: $(cat "$D/log")"
 D=$(FAKE_NO_GPU=1 serve)
 has "$D" "streamer fail: nvidia-smi names no GPU" && ok "a failed GPU query reports through the failure mode" \
   || bad "a failed GPU query: $(cat "$D/log" "$D/out")"
