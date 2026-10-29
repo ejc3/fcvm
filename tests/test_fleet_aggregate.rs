@@ -1210,3 +1210,45 @@ async fn each_tile_reconnect_carries_a_token_made_for_it() {
         "every reconnect reused the first token"
     );
 }
+
+/// Before its first layout an aggregator does not know whether streams need a token, so its
+/// public listener serves none: a socket opened then would keep its frames after a layout
+/// with keys arrives. A layout without keys serves anyone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_public_listener_serves_nothing_before_the_first_layout() {
+    use fcvm::fleet::aggregate::public_router;
+    let shared = Shared::new();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let app = shared.clone();
+    tokio::spawn(async move { axum::serve(l, public_router(app)).await.unwrap() });
+    let refused = |r: Result<_, tokio_tungstenite::tungstenite::Error>| match r {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            resp.status().is_client_error() || resp.status().is_server_error()
+        }
+        _ => false,
+    };
+    assert!(refused(
+        tokio_tungstenite::connect_async(format!("ws://{addr}/frames")).await
+    ));
+    let whole = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+    shared.set_layout(Layout {
+        epoch_unix_ms: now_ms(),
+        image_aspect: 16.0 / 9.0,
+        region: whole,
+        tiles: vec![],
+        generation: 0,
+        from_frame: 0,
+        admit_keys: Vec::new(),
+    });
+    assert!(
+        tokio_tungstenite::connect_async(format!("ws://{addr}/frames"))
+            .await
+            .is_ok()
+    );
+}

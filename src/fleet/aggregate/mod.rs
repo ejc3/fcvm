@@ -866,12 +866,11 @@ async fn admitted_frames_route(
     axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
     State(app): State<Arc<Shared>>,
 ) -> axum::response::Response {
-    let keys = app
-        .layout
-        .borrow()
-        .as_ref()
-        .map(|l| l.admit_keys.clone())
-        .unwrap_or_default();
+    // Before its first layout it cannot tell whether streams need a token: it serves none
+    // (a socket opened now would keep its frames after a layout with keys arrives).
+    let Some(keys) = app.layout.borrow().as_ref().map(|l| l.admit_keys.clone()) else {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "no layout yet").into_response();
+    };
     if !admitted(&keys, q.get("admit").map(String::as_str)) {
         return (
             axum::http::StatusCode::FORBIDDEN,
