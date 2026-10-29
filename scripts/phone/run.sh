@@ -108,11 +108,16 @@ rc=0; probe=$(timeout 30 "$F" exec --pid "$pid" -- /usr/local/bin/kvmprobe 2>&1)
 [ "$probe" = "kvm ok" ] && ok "KVM runs a VM inside the restored phone VM" || bad "KVM in the restored VM: exit $rc, '${probe}'"
 
 in_place_release_and_retake() {
-  local out holds
+  local out holds tls
   if out=$(X /usr/local/bin/gpu-hook release 2>&1); then
     holds=$(X /usr/local/bin/phone.sh holds 2>&1 || true)
     [ "$holds" = "fds=0 mappings=0" ] && ok "the running phone released the GPU ($(grep -o 'released_ms=[0-9]*' <<< "$out")): $holds" \
       || bad "the emulator still holds the GPU after the release: $holds"
+    # the driver's TLS library stays loaded through the release (phone.sh preloads it), so
+    # the retakes never run glibc's static TLS out
+    tls=$(X sh -c 'grep -c libnvidia-tls /proc/$(pgrep -f qemu-system-x86_64 | head -1)/maps' 2>&1 || true)
+    [[ "$tls" =~ ^[1-9] ]] && ok "the released emulator keeps the driver's TLS library loaded" \
+      || bad "the released emulator unloaded libnvidia-tls ($tls mappings): each retake takes static TLS again"
   else
     bad "the phone did not release the GPU: $out"
   fi

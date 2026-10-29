@@ -53,6 +53,7 @@ EOF
   cat > "$D/bin/emulator" <<'EOF'
 #!/bin/bash
 echo "emulator $*" >> "$FAKE_DIR/log"
+echo "emulator preloads ${LD_PRELOAD:-nothing}" >> "$FAKE_DIR/log"
 trap 'exit 0' TERM
 # a stand-in nobody stopped ends with the test's directory
 while [ -d "$FAKE_DIR" ]; do sleep 0.05; done
@@ -85,6 +86,8 @@ EOF
     export PATH="$D/bin:$PATH" FAKE_DIR="$D" HOME="$D"
     export PHONE_ADB="$D/bin/adb" EMU_DIR="$D/bin" PHONE_STREAMER="$D/bin/phone-streamer" PHONE_KVM=/dev/null
     export PHONE_RUN="$D/run" PHONE_GO_FILE="$D/go" PHONE_AVD_HOME="$D/avd" PHONE_APK=/work/robotpark.apk BOOT_TIMEOUT=5
+    mkdir -p "$D/nvidia"; [ -n "${FAKE_NO_TLS:-}" ] || : > "$D/nvidia/libnvidia-tls.so.580.1"
+    export PHONE_NVIDIA_LIB_DIR="$D/nvidia"
     # FAKE_LOCK_SECS: the GPU hook holds streamer.lock for that long as serve starts
     if [ -n "${FAKE_LOCK_SECS:-}" ]; then
       ( exec 9> "$D/run/streamer.lock"; flock 9; echo "lock taken" >> "$D/log"; sleep "$FAKE_LOCK_SECS"; echo "lock released" >> "$D/log" ) &
@@ -155,6 +158,8 @@ boot() {
   (
     export PATH="$D/bin:$PATH" FAKE_DIR="$D" HOME="$D"
     export PHONE_ADB="$D/bin/adb" EMU_DIR="$D/bin" PHONE_RUN="$D/run" PHONE_AVD_HOME="$D/avd" BOOT_TIMEOUT=5
+    mkdir -p "$D/nvidia"; [ -n "${FAKE_NO_TLS:-}" ] || : > "$D/nvidia/libnvidia-tls.so.580.1"
+    export PHONE_NVIDIA_LIB_DIR="$D/nvidia"
     timeout 20 "$phone" boot > "$D/out" 2>&1
     echo "exit $?" >> "$D/log"
     kill "$(cat "$D/run/emulator.pid")" 2> /dev/null
@@ -164,6 +169,18 @@ boot() {
 D=$(boot)
 has "$D" "exit 0" && before "$D" "adb shell getprop sys.boot_completed" "adb shell cmd uwb disable-uwb" && grep -q '^boot_completed_ms=' "$D/out" \
   && ok "boot turns UWB off once booted" || bad "boot did not turn UWB off: $(cat "$D/log" "$D/out")"
+# The emulator preloads the driver's TLS library, so 28 releases and retakes do not use up
+# glibc's static TLS; without it the phone is reported failed.
+D=$(serve)
+has "$D" "emulator preloads $D/nvidia/libnvidia-tls.so.580.1" && ok "serve's emulator preloads the driver's TLS library" \
+  || bad "serve's emulator does not preload libnvidia-tls: $(grep preloads "$D/log")"
+D=$(FAKE_NO_TLS=1 serve)
+has "$D" "streamer fail: no libnvidia-tls" && ok "a phone with no libnvidia-tls is reported failed" || bad "no libnvidia-tls: $(cat "$D/log" "$D/out")"
+D=$(boot)
+has "$D" "emulator preloads $D/nvidia/libnvidia-tls.so.580.1" && ok "boot's emulator preloads the driver's TLS library" \
+  || bad "boot's emulator does not preload libnvidia-tls: $(grep preloads "$D/log")"
+D=$(FAKE_NO_TLS=1 boot)
+has "$D" "exit 1" && grep -q "no libnvidia-tls" "$D/out" && ok "boot fails with no libnvidia-tls" || bad "boot with no libnvidia-tls: $(cat "$D/log" "$D/out")"
 D=$(FAKE_UWB_FAILS=1 boot)
 has "$D" "exit 1" && grep -q "could not turn UWB off" "$D/out" && ok "boot fails when UWB cannot be turned off" \
   || bad "boot with UWB on: $(cat "$D/log" "$D/out")"

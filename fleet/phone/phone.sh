@@ -87,6 +87,19 @@ use_system_egl() {
 }
 
 gpu_name() { nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1; }
+# The NVIDIA driver's thread-local storage library, which the emulator preloads. Every gpu
+# retake loads the driver's libraries again, and a library loaded at run time takes its
+# initial-exec TLS from glibc's small static TLS surplus, which an unload gives back only when
+# it was the last block handed out: on five phones the 29th retake could not load the Vulkan
+# driver ("libnvidia-tls.so...: cannot allocate memory in static TLS block"), and the
+# emulator aborted. Preloaded, its TLS is in the startup block, and a release never unloads it.
+nvidia_tls() {
+  local f
+  for f in "${PHONE_NVIDIA_LIB_DIR:-/usr/lib/x86_64-linux-gnu}"/libnvidia-tls.so.*; do
+    if [ -e "$f" ]; then echo "$f"; return 0; fi
+  done
+  return 0
+}
 # UWB off, once the phone has booted. The image declares UWB, so its service turns UWB on at
 # boot, but -feature -Uwb gives the phone no UWB HAL: each attempt waits 20 s for the HAL,
 # the service retries every 10 s, and a later failure asks for a bug report ("UWB Bugreport:
@@ -195,8 +208,10 @@ serve)
   # this socket while a mirror is open, and offers the guest no more than GLES 3.0, which is
   # what the viewer's WebGL2 can replay. The guest reads its version at boot, so the warm
   # snapshot every phone is a clone of carries the cap.
+  tls=$(nvidia_tls)
+  [ -n "$tls" ] || fail "no libnvidia-tls among the GPU driver's libraries"
   start_emulator() {
-    GFXSTREAM_MIRROR_SOCKET=${MIRROR_SOCKET:-/tmp/gfxstream-mirror.sock} GFXSTREAM_MAX_GLES_VERSION=${PHONE_MAX_GLES:-3.0} \
+    LD_PRELOAD=$tls GFXSTREAM_MIRROR_SOCKET=${MIRROR_SOCKET:-/tmp/gfxstream-mirror.sock} GFXSTREAM_MAX_GLES_VERSION=${PHONE_MAX_GLES:-3.0} \
     setsid "$EMU" -avd phone -no-window -no-audio -no-boot-anim -gpu host -accel on -grpc 8554 \
       -no-snapshot-save -feature -Uwb -verbose "$@" > "$RUN/emulator.log" 2>&1 < /dev/null &
     echo $! > "$RUN/emulator.pid"
@@ -267,7 +282,9 @@ boot)
   # system_server take a full bug report (dumpstate at 100% of a core for about 30 s, the
   # app's frames dropping under 30 a second). Without the device the UWB service still
   # tries: uwb_off stops it.
-  setsid "$EMU" -avd phone -no-window -no-audio -no-boot-anim -gpu host -accel on \
+  tls=$(nvidia_tls)
+  [ -n "$tls" ] || { echo "no libnvidia-tls among the GPU driver's libraries"; exit 1; }
+  LD_PRELOAD=$tls setsid "$EMU" -avd phone -no-window -no-audio -no-boot-anim -gpu host -accel on \
     -no-snapshot-load -feature -Uwb -verbose > "$RUN/emulator.log" 2>&1 < /dev/null &
   echo $! > "$RUN/emulator.pid"
   timeout "${BOOT_TIMEOUT:-300}" "$ADB" wait-for-device
