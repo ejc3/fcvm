@@ -1,0 +1,20 @@
+# Build container for Robot Park (fleet/phone-app): a JDK, Gradle at a pinned version and
+# checksum, and glslangValidator for the shader check. The Android SDK is not in the image: the
+# app's build mounts the one scripts/phone/sdk.sh fetched (read-only, at /sdk), and the scene's
+# tests need none. Dependencies resolve from Google's and Maven Central's repositories,
+# checked against gradle/verification-metadata.xml. `make -C fleet/phone-app` builds it.
+FROM docker.io/library/ubuntu:24.04
+RUN apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+      openjdk-17-jdk-headless curl ca-certificates unzip glslang-tools \
+    && rm -rf /var/lib/apt/lists/*
+ARG GRADLE_VERSION=8.10.2
+ARG GRADLE_SHA256=31c55713e40233a8303827ceb42ca48a47267a0ad4bab9177123121e71524c26
+RUN curl -fsSL -o /tmp/gradle.zip "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" \
+ && echo "${GRADLE_SHA256}  /tmp/gradle.zip" | sha256sum -c - \
+ && unzip -q /tmp/gradle.zip -d /opt && rm /tmp/gradle.zip \
+ && ln -s "/opt/gradle-${GRADLE_VERSION}/bin/gradle" /usr/local/bin/gradle
+# The debug signing key lives with the caches, so rebuilds on one host sign alike.
+ENV GRADLE_USER_HOME=/gradle-home \
+    ANDROID_USER_HOME=/gradle-home/android \
+    GRADLE_OPTS="-Dorg.gradle.daemon=false -Dorg.gradle.welcome=never"
+WORKDIR /src

@@ -66,14 +66,22 @@ export function watchesBroadcast(s: ClientState): boolean {
 /**
  * What the overlay draws in broadcast mode: the state that was current at the frame on screen,
  * and a local "now" whose coordinator time is that frame's, so clocks tick with the picture.
- * Before the first frame is presented it is the live state.
+ * Before the first frame is presented it is the live state. `pinned` is the entry drawn last:
+ * a picture frozen longer than HISTORY_MS (paused, stalled) keeps it after the history has
+ * moved past its frame. `entry` is the one drawn now, for the caller to pin.
  */
-export function broadcastShown(s: ClientState, frame: ShownFrame | null, localNow: number): { state: ClientState; now: number } {
-  if (frame === null || s.history.length === 0) return { state: s, now: localNow };
+export function broadcastShown(
+  s: ClientState,
+  frame: ShownFrame | null,
+  localNow: number,
+  pinned: HistoryEntry | null = null,
+): { state: ClientState; now: number; entry: HistoryEntry | null } {
+  if (frame === null || (s.history.length === 0 && pinned === null)) return { state: s, now: localNow, entry: null };
   const wall = frameWallMs(frame, localNow);
-  const entry = snapshotAt(s.history, wall);
+  const kept = s.history.some((x) => x.at <= wall);
+  const entry = kept || pinned === null ? snapshotAt(s.history, wall) : pinned;
   const now = localNow - (serverNow(s.clock, localNow) - wall);
-  if (entry === null) return { state: s, now };
+  if (entry === null) return { state: s, now, entry: null };
   const st = entry.state;
   return {
     state: {
@@ -83,7 +91,57 @@ export function broadcastShown(s: ClientState, frame: ShownFrame | null, localNo
       shownLayout: { gen: st.layout.generation, tiles: st.tiles, aggregates: st.aggregates },
     },
     now,
+    entry,
   };
+}
+
+/**
+ * Pairs each presented frame with its SEI, by media time (ms), whichever arrives first: the
+ * IVS player can raise a frame's SEI just after the frame is presented.
+ */
+export class FrameMatcher {
+  /** SEIs and presentations kept waiting for their other half (a few seconds at 30 fps). */
+  static readonly PENDING_KEPT = 120;
+  private seis = new Map<number, { t: number; e: number }>();
+  private shown = new Map<number, number>();
+
+  /** An SEI for the frame at `ms`; returns the frame it completes, if that was presented first. */
+  sei(ms: number, f: { t: number; e: number }): ShownFrame[] {
+    const at = this.shown.get(ms);
+    if (at !== undefined) {
+      this.shown.delete(ms);
+      return [{ ...f, at }];
+    }
+    this.seis.set(ms, f);
+    trim(this.seis);
+    return [];
+  }
+
+  /** The frame at `ms` was presented at local time `at`; returns it when its SEI is known. */
+  presented(ms: number, at: number): ShownFrame | null {
+    const f = this.seis.get(ms);
+    if (f) return { ...f, at };
+    this.shown.set(ms, at);
+    trim(this.shown);
+    return null;
+  }
+
+  pendingCount(): number {
+    return this.shown.size;
+  }
+}
+
+function trim<V>(m: Map<number, V>): void {
+  while (m.size > FrameMatcher.PENDING_KEPT) m.delete(m.keys().next().value!);
+}
+
+/**
+ * The state an input on the picture is placed with (a light: the camera and image of the
+ * frame the viewer clicked on). In broadcast mode, once a frame is shown, that frame's
+ * snapshot; otherwise the live one.
+ */
+export function inputScene(s: ClientState, pinned: HistoryEntry | null): FleetState | null {
+  return watchesBroadcast(s) && pinned !== null ? pinned.state : s.accepted;
 }
 
 /** The broadcast switch in the drawer. */

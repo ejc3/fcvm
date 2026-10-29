@@ -404,6 +404,43 @@ async fn test_user_snapshot_from_clone_uses_parent() -> Result<()> {
         anyhow::bail!("User snapshot from clone failed: {}", stderr);
     }
     println!("  ✓ User snapshot created: {}", snapshot2_name);
+    // On a btrfs store each snapshot directory is a subvolume, and a diff is staged as a
+    // subvolume snapshot of its parent's, which costs one commit where a reflink of the
+    // parent's memory file costs one reference per extent.
+    let snapshot1_dir = snapshot_dir().join(&snapshot1_name);
+    let on_btrfs = nix::sys::statfs::statfs(&snapshot1_dir)
+        .map(|fs| fs.filesystem_type() == nix::sys::statfs::BTRFS_SUPER_MAGIC)
+        .unwrap_or(false);
+    if on_btrfs {
+        assert!(
+            fcvm::storage::disk::is_btrfs_subvolume(&snapshot1_dir),
+            "the first snapshot's directory {} is not a btrfs subvolume",
+            snapshot1_dir.display()
+        );
+        assert!(
+            stderr.contains("staged as a subvolume snapshot of the parent"),
+            "the diff was not staged from the parent's subvolume:\n{stderr}"
+        );
+        // The clone's disk directory is a subvolume snapshot of the first snapshot's disk/, so the
+        // second snapshot takes its disks with one subvolume snapshot instead of a reflink.
+        assert!(
+            stderr.contains("snapshotted the VM's disk subvolume"),
+            "the clone's disks were not taken as a subvolume snapshot:\n{stderr}"
+        );
+        let snapshot2_dir = snapshot_dir().join(&snapshot2_name);
+        assert!(
+            fcvm::storage::disk::is_btrfs_subvolume(&snapshot2_dir),
+            "the diff snapshot's directory is not a btrfs subvolume"
+        );
+        // The staging snapshot holds an empty placeholder where the parent's disk subvolume
+        // was; the diff's own disks must be a subvolume again, or its clones reflink them.
+        assert!(
+            fcvm::storage::disk::is_btrfs_subvolume(
+                &snapshot2_dir.join(fcvm::storage::snapshot::SNAPSHOT_DISK_SUBDIR)
+            ),
+            "the diff snapshot's disk directory is not a btrfs subvolume"
+        );
+    }
     // What the merge did, for the log of this run.
     if let Some(line) = stderr
         .lines()
@@ -475,6 +512,23 @@ async fn test_user_snapshot_from_clone_uses_parent() -> Result<()> {
         created_diff,
         "User snapshot from clone should be Diff (stderr: {})",
         stderr
+    );
+
+    // Deleting a snapshot that is a subvolume holding a subvolume removes both.
+    let deleted = tokio::process::Command::new(&fcvm_path)
+        .args(["snapshots", "delete", "--force", &snapshot2_name])
+        .output()
+        .await
+        .context("running snapshots delete")?;
+    assert!(
+        deleted.status.success(),
+        "snapshots delete failed: {}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    assert!(
+        !snapshot2_dir.exists(),
+        "snapshots delete left {}",
+        snapshot2_dir.display()
     );
 
     println!("\n✅ USER SNAPSHOT FROM CLONE TEST PASSED!");

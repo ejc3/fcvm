@@ -936,6 +936,111 @@ async fn a_supervised_aggregator_that_needs_a_layout_stops_without_one() {
         .unwrap();
 }
 
+/// The test's own fcvm dies with the test (SIGKILL on the parent's death, the parent rechecked
+/// after the fork), as tests/common/mod.rs::set_test_pdeathsig does for the VM tests.
+fn arm_test_pdeathsig(cmd: &mut tokio::process::Command) {
+    let parent = std::process::id() as libc::pid_t;
+    // SAFETY: two async-signal-safe calls in the forked child; nothing allocated.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+}
+
+/// The push's ffmpeg dies with its aggregator (PR_SET_PDEATHSIG), whatever ffmpeg is
+/// doing: a SIGKILL to the aggregator (the supervisor's stop) leaves no ingest child behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_push_child_dies_with_its_aggregator() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("ffmpeg.pid");
+    let fake = dir.path().join("ffmpeg");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho $$ > {}\nexec sleep 600\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_fcvm"));
+    cmd.args([
+        "fleet",
+        "aggregate",
+        "--codec",
+        "raw",
+        "--image-height",
+        "36",
+    ])
+    .args(["--listen", &format!("127.0.0.1:{port}")])
+    .arg("--ffmpeg")
+    .arg(&fake)
+    .args(["--push-url-env", "TEST_PUSH_URL"])
+    .env("TEST_PUSH_URL", "rtmps://ingest.example/app/k")
+    .kill_on_drop(true);
+    arm_test_pdeathsig(&mut cmd);
+    let mut agg = cmd.spawn().unwrap();
+    let pid = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(s) = std::fs::read_to_string(&pid_file) {
+                if let Ok(p) = s.trim().parse::<i32>() {
+                    return p;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the push started its ffmpeg");
+    let alive = |p: i32| unsafe { libc::kill(p, 0) } == 0;
+    assert!(alive(pid));
+    agg.start_kill().unwrap();
+    agg.wait().await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while alive(pid) {
+        // A zombie still answers kill(0) until its new parent reaps it; its state says.
+        let state = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        if state.split_whitespace().nth(2) == Some("Z") {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            panic!("the push's ffmpeg outlived its aggregator");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Every fcvm this file starts by hand dies with the test process (PR_SET_PDEATHSIG), as the
+/// repository's per-hop teardown rule asks: nextest's SIGKILL skips kill_on_drop.
+#[test]
+fn every_fcvm_this_file_spawns_dies_with_the_test() {
+    let src = include_str!("test_fleet_aggregate.rs");
+    let needle = concat!("Command::new(env!(\"CARGO_BIN_", "EXE_fcvm\"))");
+    let mut found = 0;
+    for (i, _) in src.match_indices(needle) {
+        found += 1;
+        let after: String = src[i..].lines().take(16).collect::<Vec<_>>().join("\n");
+        assert!(
+            after.contains("arm_test_pdeathsig"),
+            "a spawn without a parent-death signal:\n{after}"
+        );
+    }
+    assert!(found > 0, "the check found no spawn to look at");
+}
+
 /// With the coordinator's admission keys in its layout, the aggregator's public `/frames`
 /// streams only to a request with a direct token made with one of them, and its own tile
 /// subscriptions carry such a token (the renderers check it too).

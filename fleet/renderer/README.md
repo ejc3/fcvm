@@ -50,12 +50,21 @@ scene is at golden hour (sun about 7 degrees up):
   ground-fixed noise and its second octave rotated, so the 14 km tile does not
   repeat visibly from high up: two octaves for the body,
   two finer ones eroding the edges (billows on top, wisps below), flat bases,
-  denser cores rising higher. The march takes coarse steps through empty air
-  and steps of 2% of the distance (120 to 800 m) inside clouds, so edges stay
-  sharp at any distance; lit by a three-step light march toward the sun with
-  three scattering orders, a strong forward lobe (silver lining) and a back
-  lobe, a powder term and sky ambient that darkens toward the base. They drift
-  with the wind and cast shadows on the ground.
+  denser cores rising higher, and a soft fringe where the eroded edge thins
+  out. The march takes coarse steps through empty air and steps of 2% of the
+  distance (120 to 800 m) inside clouds, from a jittered start; lit by a
+  four-step light march toward the sun with four scattering orders, each a
+  dual-lobe Henyey-Greenstein phase (a strong forward lobe for the silver
+  lining, a weak back lobe), the later orders reaching deeper so the inside of
+  a cloud keeps a gradient; a powder term on rims facing the sun; sky light
+  through the cloud above each point (two samples straight up), which darkens
+  the underside of every lump against its top. They drift with the wind and
+  cast shadows on the ground.
+- **Weather** (the scene's `weather` keys, PROTOCOL.md "Weather"): cloud
+  cover, towering cumulus (the cells of strongest coverage grow to 9.6 km),
+  crepuscular rays (haze below the cloud base lit by the sun only through the
+  gaps, 12 jittered steps over the first 40 km) and the snow line, eased
+  between keys.
 - **Light transport**: per sample a soft sun shadow (a random point of the
   sun's disc), cloud shadow (from the first 8 km of the sun ray's crossing of
   the cloud layer, letting 14% through as diffuse light), and one bounce of
@@ -156,6 +165,79 @@ python3 tools/seam_metric.py out.png 4 2              # seam ratio at every tile
 `tools/viewerload.cpp` (C++ and OpenSSL, built with the `g++` line in
 "Viewers per renderer") opens many frame streams as the page does and reports
 each stream's frame rate, frame delay, and frames dropped for a slow reader.
+
+## Fluffier clouds and weather (round 15, 2026-10-27)
+
+Why the clouds read flat on the staging wall (the owner's phone video, and
+the same frames at 1024 samples): every lump was a hard surface lit in flat
+patches. Density reached its full 60 per km at a third of the remapped noise,
+so a ray became opaque inside one fine step and was lit at one point; the sun's
+optical depth there jumped from 0 to over 5 within about 80 m, and with three
+scattering orders that fell off quickly the shading was either lit or one
+flat shade; the powder term used the local density, which is 60 per km
+everywhere inside, so it changed nothing; sky light depended on the height in
+the layer, not on the cloud above the point; and where the coarse march's
+back-up stopped at the layer's entry every pixel started its fine steps at
+the same distance, so flat bases showed steps. Not the denoiser: the held
+1024-sample reference shows the same patches, and a tighter luminance stop
+for the sky (0.4 of `DENOISE_SIGMA_L`) changed nothing visible, so it is not
+in this change.
+
+What changed (`src/render.cu`): density is `sat(4 d)^2` (a fringe instead of
+a step); four scattering orders, each deeper (`b` x 0.35) with a dual-lobe
+phase computed once per ray; a fourth light step (1.46 km toward the sun);
+powder from the sun's optical depth, faded out toward the sun; sky light
+through two samples of the cloud above each lit point; a jittered start for
+the fine steps. The scene gains `weather` (cover, towers, rays, snow line).
+
+Measured on one g4dn.metal (spot, nothing else on it: no other VM, the busiest
+process at 0.3% CPU before the run), each run in an fcvm VM on its own T4.
+`fleet-renderer quality` for the staging wall, a 4 x 4 grid of 640 x 360
+tiles (`h=360`) at 420,448 pixel-samples, 24 frames of history, against the
+same pose held to 1024 samples; flights built from the director's viewpoints
+(a 7 s hold, then the flight). Before is main at `2e2181cf`, after this
+change, each pair on the same GPU. rmse: 8-bit RGB over the whole image.
+
+| view (scene time) | rmse before -> after | slowest tile, render ms |
+|---|---|---|
+| high-lakes -> peak-seam (t 16 of 32) | 3.95 -> 3.83 | 14.8 -> 15.5 |
+| peak-seam -> sunset-ridge (t 13.5 of 27) | 4.55 -> 4.83 | 13.0 -> 13.6 |
+| dawn-valley -> peak-close (t 16 of 32) | 5.00 -> 5.56 | 13.8 -> 14.1 |
+| under the layer near sunset-ridge, looking up (t 15) | 4.75 -> 4.32 | 15.7 -> 16.4 |
+| from the coast, time 0.33 (t 15) | 5.85 -> 4.19 | 16.2 -> 19.5 |
+
+With weather (after only, slowest tile): towers 1 on the first flight 18.4 ms,
+towers 1 from the coast 19.9, rays 1 toward a low sun 17.9 and 18.9, snow line
+0.6 km on the third flight 13.7, cover 0.15 on the first flight 14.0. Every
+case stays under the controller's 23.3 ms target at 1 sample per pixel. Without
+longer fine steps in a towering layer (x 1.6) the coast's towers took 25.5 ms
+and ran out of fine steps before crossing the deeper clouds.
+
+`fleet-renderer bench` (the built-in golden-hour scene, moving camera, 420,448
+pixel-samples), render ms per view:
+
+| view | before | after |
+|---|---|---|
+| wall-like tile, 360 x 360 (2 samples per pixel) | 12.05 | 14.86 |
+| whole image 1280 x 720 (stride 4) | 36.99 | 42.27 |
+| whole image 1920 x 1080 (stride 4) | 67.93 | 76.65 |
+
+Computing the four orders' phase once per ray instead of at every fine step
+took the 720p view from 45.0 to 42.2 ms; one sky-light sample instead of two
+and a three-step light march saved nothing measurable.
+
+`shots/clouds-before-after-r15.jpg`: cloud crops of the third flight, the
+coast and under the layer, before (left) and after (right), moving frames as
+the wall draws them. `shots/weather-r15.jpg`: the first flight with the
+default weather, towers 1 and cover 0.15; the third flight with the snow line
+at 0.6 km; rays toward a low sun; towers from the coast.
+
+The seam test passes on two T4s with the same hashes (87 checks); its new
+check draws a weather sequence easing from the defaults to towers, cover
+0.62, rays and a 0.8 km snow line, moving with history and as a hold in
+different batches, and requires every tile to match the whole image and the
+weather to change more than a quarter of the pixels. Its moving-flight check
+reads rmse 5.95 and grain 3.95 (6.10 and 4.45 before).
 
 ## Viewers per renderer (round 14, 2026-10-27)
 

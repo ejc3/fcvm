@@ -38,6 +38,7 @@ async function cycle(n) {
   // time e + 1000 t (its SEI, matched by media time). SEI events can arrive just after
   // the frame they name, so a frame is matched up to 0.5 s later.
   const pend = [];
+  let callback = 0;
   const onFrame = (_now, md) => {
     r.startup.frame_ms ??= performance.now() - t0;
     pend.push([Math.round(md.mediaTime * 1000), performance.timeOrigin + md.expectedDisplayTime, performance.now()]);
@@ -46,9 +47,9 @@ async function cycle(n) {
       const w = byTs.get(mt);
       if (w !== undefined) r.frame_latency.push([performance.now() - t0, Math.round(shown - w)]);
     }
-    video.requestVideoFrameCallback(onFrame);
+    callback = video.requestVideoFrameCallback(onFrame);
   };
-  video.requestVideoFrameCallback(onFrame);
+  callback = video.requestVideoFrameCallback(onFrame);
   p.load(url);
   p.play();
   const end = performance.now() + secs * 1000;
@@ -59,6 +60,8 @@ async function cycle(n) {
     const qq = p.getQuality();
     r.rendition = qq ? `${qq.name} ${qq.width}x${qq.height} ${qq.bitrate}` : null;
   }
+  // The <video> outlives the cycle: its callback must not.
+  video.cancelVideoFrameCallback(callback);
   p.delete();
   await report(r);
 }

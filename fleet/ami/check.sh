@@ -13,7 +13,7 @@ if command -v shellcheck >/dev/null; then
 else
   no "shellcheck is not installed"
 fi
-python3 -m py_compile fleet/ami/host/s3-cat.py fleet/ami/host/store-pack.py fleet/ami/tile/fetch-cert.py || no "py_compile"
+python3 -m py_compile fleet/ami/host/s3-cat.py fleet/ami/host/store-pack.py fleet/ami/tile/fetch-cert.py fleet/ami/tile/resident.py || no "py_compile"
 
 # `build-ami.sh start` must clear the phase's markers before it launches the phase:
 # `wait` reads <phase>.done / <phase>.failed, and a builder from a BASE_AMI (or a
@@ -233,6 +233,18 @@ grep -qx 'DefaultDependencies=no' fleet/ami/host/fcvm-fleet-prefetch.service &&
   no "fcvm-fleet-prefetch.service must start once local file systems are up (DefaultDependencies=no)"
 sed -n '/^prep)/,/;;/p' fleet/ami/host/build.sh | grep -qE '^  systemctl enable .*fcvm-fleet-prefetch\.service' ||
   no "host/build.sh prep does not enable fcvm-fleet-prefetch.service"
+# warm-root.sh lists the prefetch from a launch that restores the snapshot (what a woken
+# host's slots run), not from the first launch, which also boots and exports the image.
+wr=fleet/ami/host/warm-root.sh
+first=$(grep -n '^launch ||' "$wr" | head -1 | cut -d: -f1)
+traced=$(grep -n '^launch trace ||' "$wr" | head -1 | cut -d: -f1)
+# fcvm logs the hit at info and its default filter is warn: the launches set RUST_LOG.
+# A hit is logged before the load, and a failed load falls back to a cold boot: the traced
+# launch's own log must hold the hit and no miss.
+[ -n "$first" ] && [ -n "$traced" ] && [ "$first" -lt "$traced" ] &&
+  grep -qF "grep -q 'Pre-start snapshot hit' \"\$LOG.trace\" && ! grep -q 'Snapshot miss' \"\$LOG.trace\"" "$wr" &&
+  grep -qE 'RUST_LOG=[^ ]*info[^ ]* +"\$\{trace\[@\]\}"|RUST_LOG=info' "$wr" ||
+  no "warm-root.sh must list the prefetch from a second, traced launch that hits the first one's snapshot"
 # prefetch.sh reads every listed file in 1 MiB pieces (a file of 2 MiB and one byte is three
 # pieces) and skips a listed file the image lacks.
 pf=$(mktemp -d)
@@ -244,6 +256,100 @@ out=$(PATH="$pf/bin:$PATH" bash fleet/ami/host/prefetch.sh "$pf/list" 2>&1) || n
 [ "$(sort "$pf/dd.log" 2>/dev/null | grep -c "if=$pf/a ")" = 3 ] || no "prefetch.sh did not read 3 pieces of a 2 MiB + 1 byte file: $(cat "$pf/dd.log" 2>/dev/null)"
 grep -q missing "$pf/dd.log" 2>/dev/null && no "prefetch.sh read a file that does not exist"
 rm -rf "$pf"
+
+# The tile reads its first boot's root volume pieces early (issue: a tile launched from the
+# AMI spent 35 s in systemd-modules-load and 14 s starting the container, each block fetched
+# from S3 on its first read, 2026-10-27). The unit must run in the first transaction, beside
+# the units that need the pieces: ordered after nothing (a unit ordered after anything, or
+# after sysinit.target by default dependencies, starts after cloud-init's network stage or
+# the modules load it was meant to precede), and nothing waits for it (a hint).
+tu=fleet/ami/tile/fcvm-fleet-prefetch.service
+unit=$(sed -n '/^\[Unit\]/,/^\[/p' "$tu")
+grep -qx 'DefaultDependencies=no' <<<"$unit" && ! grep -qE '^(After|Requires|Wants|BindsTo|Requisite|PartOf)=' <<<"$unit" ||
+  no "fcvm-fleet-prefetch.service (tile) must have DefaultDependencies=no and be ordered after nothing, to run beside systemd-modules-load"
+grep -qx 'WantedBy=sysinit.target' "$tu" || no "fcvm-fleet-prefetch.service (tile) must be wanted by sysinit.target, in the first transaction"
+grep -qx 'ConditionPathExists=/etc/fcvm-fleet/prefetch.list' "$tu" || no "fcvm-fleet-prefetch.service (tile) must be conditioned on its list"
+grep -qE '^ExecStart=/usr/local/lib/fcvm-fleet/prefetch /etc/fcvm-fleet/prefetch\.list( |$)' "$tu" ||
+  no "fcvm-fleet-prefetch.service (tile) must run the static prefetch binary on /etc/fcvm-fleet/prefetch.list"
+grep -lE 'fcvm-fleet-prefetch' fleet/ami/tile/*.service | grep -qv 'fcvm-fleet-prefetch.service' &&
+  no "a tile unit refers to fcvm-fleet-prefetch.service: nothing may wait for the prefetch"
+grep -qE '^ *systemctl enable .*fcvm-fleet-prefetch\.service' fleet/ami/tile/build.sh || no "tile/build.sh does not enable fcvm-fleet-prefetch.service"
+grep -qE 'gcc .*-static .*-o /usr/local/lib/fcvm-fleet/prefetch .*prefetch\.c' fleet/ami/tile/build.sh ||
+  no "tile/build.sh does not build the static prefetch binary"
+# The renderer must wait for the device node the CDI spec lists before podman starts it.
+rn=$(grep -n 'nvidia-uvm-tools' fleet/ami/tile/fcvm-fleet-renderer.service | grep ExecStartPre | head -1 | cut -d: -f1)
+rs=$(grep -n '^ExecStart=/usr/bin/podman' fleet/ami/tile/fcvm-fleet-renderer.service | head -1 | cut -d: -f1)
+[ -n "$rn" ] && [ -n "$rs" ] && [ "$rn" -lt "$rs" ] ||
+  no "fcvm-fleet-renderer.service does not wait for /dev/nvidia-uvm-tools before starting the container"
+# bake refuses an image without a list unless the first image of a lineage says so; trace
+# refuses a boot that already prefetched (its page cache would keep every old piece).
+bake=$(sed -n '/^bake)/,/;;/p' fleet/ami/tile/build.sh)
+grep -qF '[ ! -s /etc/fcvm-fleet/prefetch.list ] && [ "${NO_PREFETCH_LIST:-}" != 1 ]' <<<"$bake" ||
+  no "tile/build.sh bake does not refuse an image without a prefetch list"
+trace=$(sed -n '/^trace)/,/;;/p' fleet/ami/tile/build.sh)
+grep -qF '[ ! -e /run/fcvm-fleet-prefetched ]' <<<"$trace" &&
+  grep -qF "ExecStartPost=/bin/sh -c ': > /run/fcvm-fleet-prefetched'" fleet/ami/tile/fcvm-fleet-prefetch.service &&
+  ! grep -q 'ActiveEnterTimestampMonotonic' <<<"$trace" &&
+  grep -qF '/resident.py" /etc/fcvm-fleet/prefetch.list' <<<"$trace" ||
+  no "tile/build.sh trace does not list a boot that did not prefetch with resident.py"
+# prefetch.c reads exactly the listed pieces (a piece longer than the chunk in several reads,
+# a missing file skipped and counted), under the root prefix it is given.
+pt=$(mktemp -d)
+if gcc -O2 -Wall -Wextra -Werror -static -pthread -o "$pt/prefetch" fleet/ami/tile/prefetch.c 2>"$pt/gcc.log"; then
+  mkdir -p "$pt/root/d"
+  head -c $((2 * 1048576 + 1)) /dev/zero > "$pt/root/d/a"
+  printf '/d/a\t0\t%s\n/d/a\t1048576\t5\n/d/missing\t0\t7\n' $((2 * 1048576 + 1)) > "$pt/list"
+  out=$("$pt/prefetch" "$pt/list" 3 1048576 "$pt/root" 2>&1)
+  # 2 MiB + 1 byte in 3 pieces, then 5 bytes more of the same file, then a file that is not there.
+  grep -qF "read $((2 * 1048576 + 1 + 5)) of $((2 * 1048576 + 1 + 5 + 7)) listed bytes" <<<"$out" && grep -qF 'in 5 pieces' <<<"$out" && grep -qF '(1 files not opened)' <<<"$out" ||
+    no "prefetch.c did not read the listed pieces: $out"
+  [ "$("$pt/prefetch" "$pt/none" 2>&1 | head -1)" = "fcvm-fleet-prefetch: no $pt/none" ] || no "prefetch.c does not skip a missing list"
+else
+  no "prefetch.c does not compile statically: $(cat "$pt/gcc.log")"
+fi
+rm -rf "$pt"
+# resident.py lists the pages of a file that the page cache holds, as merged byte ranges, and
+# leaves out a file a boot wrote (modified after the boot began) and the paths it is told to skip.
+# /var/tmp is disk backed; a tmpfs keeps every page, so nothing would be dropped.
+rd=$(mktemp -d -p /var/tmp)
+python3 - "$rd" <<'PY' || no "resident.py fixture setup failed"
+import os, sys
+d = sys.argv[1]
+os.makedirs(d + "/skipme")
+os.makedirs(d + "/usr/lib/modules/k")
+for name, in_cache in (("old", True), ("skipme/old", True), ("new", True), ("usr/lib/modules/k/m.ko", True)):
+    p = f"{d}/{name}"
+    with open(p, "wb") as f:
+        f.write(os.urandom(10 * 4096))
+    os.sync()
+    fd = os.open(p, os.O_RDONLY)
+    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    os.pread(fd, 4096, 3 * 4096)      # page 3
+    os.pread(fd, 4096, 7 * 4096)      # page 7
+    os.pread(fd, 4096, 8 * 4096)      # page 8, adjacent to 7
+    os.close(fd)
+    if name != "new":
+        os.utime(p, (1577836800, 1577836800))   # long before this boot
+PY
+python3 fleet/ami/tile/resident.py "$rd/list" "$rd" /skipme/ 2>/dev/null
+# Pages 3, 7 and 8 are read, and a read may bring neighbours in with it (readahead): the
+# ranges must hold those pages, be merged, and name only the old file outside the skip.
+python3 - "$rd/list" <<'PY' || no "resident.py did not list the pages a read left in the cache for the old file only: $(cat "$rd/list")"
+import sys
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1])]
+assert rows and {r[0] for r in rows} == {"/old", "/usr/lib/modules/k/m.ko"}, rows
+# the modules, which a boot waits for first, lead the list; the pieces of a file follow in order
+assert rows[0][0] == "/usr/lib/modules/k/m.ko" and rows[-1][0] == "/old", rows
+cover = set()
+for _, off, ln in (r for r in rows if r[0] == "/old"):
+    off, ln = int(off), int(ln)
+    assert off % 4096 == 0 and ln % 4096 == 0 and ln > 0
+    cover.update(range(off // 4096, (off + ln) // 4096))
+assert {3, 7, 8} <= cover, rows
+ends = sorted((int(o), int(o) + int(l)) for n, o, l in rows if n == "/old")
+assert all(a[1] < b[0] for a, b in zip(ends, ends[1:])), "ranges not merged"
+PY
+rm -rf "$rd"
 
 [ "$fail" = 0 ] && echo "fleet/ami checks: ok"
 exit "$fail"

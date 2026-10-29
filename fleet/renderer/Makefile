@@ -50,7 +50,7 @@ test-host: $(OUT)/test-host $(OUT)/viewerload
 	$(OUT)/viewerload --self-test
 
 image:
-	podman build --squash-all -t $(IMAGE) -f Containerfile .
+	podman build --squash-all --build-context core-tests=../core/tests -t $(IMAGE) -f Containerfile .
 
 clean:
 	rm -rf $(OUT)

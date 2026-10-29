@@ -1,13 +1,13 @@
 //! The poster frame: the latest converged still of the whole image, served at
 //! `/poster.jpg` for link previews and the page's first paint.
 //!
-//! Once per camera hold, after the picture has had [`CONVERGE_SECS`] to settle, the
+//! Once per camera stop, after the picture has had [`CONVERGE_SECS`] to settle, the
 //! coordinator subscribes to every aggregator (each fcvm host's band and the EC2 half),
 //! decodes the first frame at or after that scene time, places each region at its spot in
-//! the whole image and encodes one JPEG. Frames between the capture time and the end of
-//! the hold all show the same still camera, so the regions agree even though they are not
-//! taken at exactly one `t`. A hold whose capture does not finish before the flight starts
-//! keeps the previous poster.
+//! the whole image and encodes one JPEG. Every aggregator draws the same frame times, so
+//! the regions are one frame; the camera moves slowly at a stop, so a region that skipped
+//! that frame and gave the next one is off by one frame of a slow move. A stop whose
+//! capture does not finish before the flight starts keeps the previous poster.
 
 use super::Handle;
 use crate::fleet::aggregate::codec::{Codec, DecoderIo};
@@ -22,17 +22,17 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
 
-/// Scene seconds into a hold before its frames count as converged (holds last
-/// `fleet_core::director::HOLD_SECS`).
+/// Scene seconds into a stop before its frames count as settled (stops last 9 s or more,
+/// `fleet_core::director::Viewpoint::stay_secs`).
 pub const CONVERGE_SECS: f64 = 5.5;
 /// Subscribe this long before the capture time, so the join's keyframe and the frames
 /// after it are decoded by then.
 const LEAD_SECS: f64 = 1.5;
 
-/// What the coordinator says about the current hold.
+/// What the coordinator says about the current stop.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
-    /// Identifies the hold: the director's step and arrival time.
+    /// Identifies the stop: the director's step and arrival time.
     pub step: u64,
     pub arrive_t: f64,
     pub hold_until_t: f64,
@@ -230,7 +230,7 @@ pub async fn compose(sources: &[String], codec: &dyn Codec, at: f64) -> Result<P
     Ok(canvas)
 }
 
-/// Take one poster per hold, for as long as the coordinator runs.
+/// Take one poster per stop, for as long as the coordinator runs.
 pub async fn run(
     handle: Handle,
     poster: Arc<Poster>,
@@ -291,7 +291,7 @@ pub async fn run(
                 tracing::warn!(viewpoint = %plan.viewpoint, error = %format!("{e:#}"), "poster not taken")
             }
             Err(_) => {
-                tracing::warn!(viewpoint = %plan.viewpoint, "poster not taken before the hold ended")
+                tracing::warn!(viewpoint = %plan.viewpoint, "poster not taken before the stop ended")
             }
         }
     }

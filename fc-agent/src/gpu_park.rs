@@ -24,6 +24,13 @@
 //! The NVIDIA kernel modules stay loaded across the park: unloading them would
 //! change nothing a clone needs, and the container's device nodes keep their
 //! numbers.
+//!
+//! A process that holds the GPU through a graphics API rather than CUDA (an Android
+//! Emulator's renderer) cannot be checkpointed. Its container names a hook in the
+//! [`GPU_HOOK_LABEL`] image label: park runs it with `release` first, and the hook
+//! lets go of the GPU (no `/dev/nvidia*` descriptor or mapping left) while its
+//! process keeps running; unpark runs it with `retake` once the GPUs are up and the
+//! CUDA processes are restored.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -47,6 +54,15 @@ const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long nvidia-persistenced may take to exit after SIGTERM.
 const PERSISTENCED_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The image label naming the container's GPU hook: an executable in the container
+/// that `release` makes let go of the GPU and `retake` makes take it up again.
+pub const GPU_HOOK_LABEL: &str = "dev.fcvm.gpu-hook";
+/// One hook call. The emulator's release and retake each measure under a second on a
+/// T4; the rest is the margin a cold page cache and a busy guest need.
+const GPU_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
+/// The container fc-agent runs.
+const CONTAINER: &str = "fcvm-container";
+
 /// What a park did, so it can be undone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Parked {
@@ -56,6 +72,9 @@ pub struct Parked {
     pub uuids: Vec<String>,
     /// The guest PCI addresses the GPUs were removed from.
     pub addresses: Vec<String>,
+    /// The container's GPU hook, which released the GPU and must retake it.
+    #[serde(default)]
+    pub hook: Option<String>,
 }
 
 impl Parked {
@@ -161,6 +180,54 @@ fn describe_holders(holders: &BTreeMap<u32, Vec<String>>) -> String {
         .join("; ")
 }
 
+fn podman(args: &[&str]) -> tokio::process::Command {
+    let mut argv: Vec<String> = crate::container::podman_cmd_prefix().to_vec();
+    argv.push("podman".to_string());
+    argv.extend(args.iter().map(|a| a.to_string()));
+    let mut command = tokio::process::Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    command
+}
+
+/// The GPU hook the running container's image names in [`GPU_HOOK_LABEL`], if any.
+/// No container running means no hook; a container podman cannot inspect is an error,
+/// since a hook that is not run leaves its process holding the GPU.
+async fn container_gpu_hook() -> Result<Option<String>> {
+    let mut exists = podman(&["container", "exists", CONTAINER]);
+    exists.kill_on_drop(true);
+    let status = tokio::time::timeout(GPU_HOOK_TIMEOUT, exists.status())
+        .await
+        .map_err(|_| anyhow::anyhow!("podman container exists did not finish"))?
+        .context("starting podman container exists")?;
+    if status.code() == Some(1) {
+        return Ok(None);
+    }
+    let format = format!("{{{{index .Config.Labels \"{GPU_HOOK_LABEL}\"}}}}");
+    let label = gpu::run_checked(
+        &format!("podman inspect {CONTAINER}"),
+        podman(&["inspect", "--format", &format, CONTAINER]),
+        GPU_HOOK_TIMEOUT,
+    )
+    .await?;
+    Ok(parse_hook_label(&label))
+}
+
+/// `podman inspect`'s rendering of the label: empty or `<no value>` when unset.
+fn parse_hook_label(rendered: &str) -> Option<String> {
+    let hook = rendered.trim();
+    (!hook.is_empty() && hook != "<no value>").then(|| hook.to_string())
+}
+
+/// Runs `hook action` in the container and returns what it printed.
+async fn run_gpu_hook(hook: &str, action: &str) -> Result<String> {
+    gpu::run_checked(
+        &format!("the container's GPU hook ({hook} {action})"),
+        podman(&["exec", CONTAINER, hook, action]),
+        GPU_HOOK_TIMEOUT,
+    )
+    .await
+}
+
 fn cuda_checkpoint(args: &[String]) -> tokio::process::Command {
     let root = Path::new(gpu::DRIVER_ROOT);
     let mut command = tokio::process::Command::new(root.join("usr/bin/cuda-checkpoint"));
@@ -240,6 +307,7 @@ fn remove_function(sysfs: &Path, address: &str) -> Result<()> {
 /// Steps of a park that succeeded, undone in reverse when a later one fails.
 #[derive(Default)]
 struct Done {
+    released_by_hook: Option<String>,
     locked: Vec<u32>,
     checkpointed: Vec<u32>,
     persistenced_stopped: bool,
@@ -266,6 +334,11 @@ async fn undo(done: &Done) -> Vec<String> {
     }
     for &pid in done.locked.iter().rev() {
         if let Err(e) = run_cuda_checkpoint(&action("unlock", pid)).await {
+            errors.push(format!("{e:#}"));
+        }
+    }
+    if let Some(hook) = &done.released_by_hook {
+        if let Err(e) = run_gpu_hook(hook, "retake").await {
             errors.push(format!("{e:#}"));
         }
     }
@@ -316,6 +389,24 @@ async fn park_steps(done: &mut Done) -> Result<Parked> {
             "the guest bus has {} NVIDIA GPU(s) and nvidia-smi -L lists {} UUID(s)",
             gpus.len(),
             uuids.len()
+        );
+    }
+
+    // A process holding the GPU outside CUDA lets go of it through its container's
+    // hook first; whatever still holds a device afterwards must be a CUDA process.
+    let hook = container_gpu_hook().await?;
+    let mut release_ms = 0.0;
+    if let Some(hook) = &hook {
+        // Recorded before the release runs: a hook that released the GPU and then failed
+        // or timed out still gets its retake when the park is undone. A retake of a GPU
+        // that was never released does nothing.
+        done.released_by_hook = Some(hook.clone());
+        let release_started = Instant::now();
+        let out = run_gpu_hook(hook, "release").await?;
+        release_ms = release_started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[fc-agent] gpu: the container's hook released the GPU in {release_ms:.1} ms: {}",
+            out.trim()
         );
     }
 
@@ -392,11 +483,12 @@ async fn park_steps(done: &mut Done) -> Result<Parked> {
         pids,
         uuids,
         addresses,
+        hook,
     };
     parked.store(Path::new(PARKED_RECORD))?;
     eprintln!(
-        "[fc-agent] gpu: parked {} GPU(s) ({}), {} process(es) {:?}: lock_ms={lock_ms:.1} \
-         checkpoint_ms={checkpoint_ms:.1} total_ms={:.1}",
+        "[fc-agent] gpu: parked {} GPU(s) ({}), {} process(es) {:?}: hook_release_ms={release_ms:.1} \
+         lock_ms={lock_ms:.1} checkpoint_ms={checkpoint_ms:.1} total_ms={:.1}",
         parked.uuids.len(),
         parked.uuids.join(", "),
         parked.pids.len(),
@@ -438,11 +530,23 @@ pub async fn unpark(parked: &Parked, announced: &[String]) -> Result<gpu::Attach
             .await
             .with_context(|| format!("unlocking parked process {pid}"))?;
     }
+    let mut retake_ms = 0.0;
+    if let Some(hook) = &parked.hook {
+        let retake_started = Instant::now();
+        let out = run_gpu_hook(hook, "retake")
+            .await
+            .context("the container's GPU hook could not take the GPU up again")?;
+        retake_ms = retake_started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[fc-agent] gpu: the container's hook retook the GPU in {retake_ms:.1} ms: {}",
+            out.trim()
+        );
+    }
     let record = PathBuf::from(PARKED_RECORD);
     std::fs::remove_file(&record).with_context(|| format!("removing {}", record.display()))?;
     eprintln!(
         "[fc-agent] gpu: unparked {} process(es) onto {} GPU(s){}: bring_up_ms={up_ms:.1} \
-         cuda_restore_ms={restore_ms:.1} total_ms={:.1}",
+         cuda_restore_ms={restore_ms:.1} hook_retake_ms={retake_ms:.1} total_ms={:.1}",
         parked.pids.len(),
         up.report.gpus,
         if map.is_some() { " (other GPUs)" } else { "" },
@@ -526,9 +630,59 @@ mod tests {
             pids: vec![42, 43],
             uuids: vec!["GPU-1".to_string()],
             addresses: vec!["0000:00:06.0".to_string()],
+            hook: Some("/usr/local/bin/gpu-hook".to_string()),
         };
         parked.store(&path).unwrap();
         assert_eq!(Parked::load(&path).unwrap(), Some(parked));
+    }
+
+    /// A record written before the hook existed loads as parked without one.
+    #[test]
+    fn a_record_without_a_hook_loads_with_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parked.json");
+        std::fs::write(
+            &path,
+            r#"{"pids":[7],"uuids":["GPU-1"],"addresses":["0000:00:06.0"]}"#,
+        )
+        .unwrap();
+        assert_eq!(Parked::load(&path).unwrap().unwrap().hook, None);
+    }
+
+    #[test]
+    fn an_unset_hook_label_is_no_hook() {
+        assert_eq!(parse_hook_label("\n"), None);
+        assert_eq!(parse_hook_label("<no value>\n"), None);
+        assert_eq!(
+            parse_hook_label("/usr/local/bin/gpu-hook\n").as_deref(),
+            Some("/usr/local/bin/gpu-hook")
+        );
+    }
+
+    /// The hook releases the GPU before any holder is read or checkpointed (a process
+    /// it releases must not be taken for a CUDA process), and retakes it only once the
+    /// CUDA processes are restored and unlocked, before the record goes.
+    #[test]
+    fn the_hook_releases_before_the_holders_are_read_and_retakes_after_the_unlock() {
+        let source = include_str!("gpu_park.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let park = &code[code.find("async fn park_steps(").unwrap()..];
+        let at =
+            |body: &str, needle: &str| body.find(needle).unwrap_or_else(|| panic!("no {needle}"));
+        assert!(
+            at(park, "run_gpu_hook(hook, \"release\")")
+                < at(park, "nvidia_device_holders(Path::new(\"/proc\"), &except)")
+        );
+        // The retake is registered for the undo before the release runs, so a release
+        // that failed after the hook let go of the GPU is still retaken.
+        assert!(
+            at(park, "done.released_by_hook = Some(") < at(park, "run_gpu_hook(hook, \"release\")")
+        );
+        let unpark = &code[code.find("pub async fn unpark(").unwrap()..];
+        let unlock = at(unpark, "action(\"unlock\", pid)");
+        let retake = at(unpark, "run_gpu_hook(hook, \"retake\")");
+        let record = at(unpark, "remove_file(&record)");
+        assert!(unlock < retake && retake < record);
     }
 
     /// The park order is fixed: every process is locked before any is

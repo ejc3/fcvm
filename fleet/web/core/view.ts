@@ -33,7 +33,7 @@ import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type Aggregate, type 
 import { KIND_TAG, NOT_AWAKE_NOTE, raceOnImage, ratioText, runningRace, scoreView, type RaceOnImage, type ScoreView } from "./race.ts";
 import { sceneUnixMs } from "./scene.ts";
 import { reelView, type ReelMeta, type ReelView } from "./reel.ts";
-import type { ClientState, FrameStats, GpuSample, Notice, StreamMode, TileFrameStats } from "./store.ts";
+import { ownAutopilot, type ClientState, type FrameStats, type GpuSample, type Notice, type StreamMode, type TileFrameStats } from "./store.ts";
 import { sceneAgeMs } from "./lag.ts";
 
 export const SITE = "fcvm.dev";
@@ -940,6 +940,29 @@ export interface OwnView {
   gpu: string;
   steps: TimelineStep[];
   placed: { box: Box; streamHeight: number } | null;
+  /** The autopilot control, or null before a claim arrives and after it ends. */
+  autopilot: OwnAutopilot | null;
+}
+
+/** The pause and play control of the viewer's own camera. */
+export interface OwnAutopilot {
+  on: boolean;
+  /** The button's text and accessible name: what pressing it does. */
+  button: string;
+  /** The state shown next to it. */
+  state: string;
+  /** The key that toggles it. */
+  key: string;
+}
+
+/** Toggles the autopilot on the viewer's own GPU. */
+export const AUTOPILOT_KEY = " ";
+
+function ownAutopilotView(on: boolean | null): OwnAutopilot | null {
+  if (on === null) return null;
+  return on
+    ? { on, button: "Pause", state: "Autopilot", key: "Space" }
+    : { on, button: "Play", state: "Paused", key: "Space" };
 }
 
 export interface OwnButton {
@@ -977,6 +1000,7 @@ function ownView(s: ClientState, st: FleetState, srvNow: number, input: WallInpu
     return { box: b, streamHeight: Math.min(NATIVE_TILE_HEIGHT, streamHeightFor(b.h * input.dpr, st.image_aspect)) };
   })() : null;
   const left = c?.expires_at != null ? c.expires_at - srvNow : null;
+  const autopilot = ownAutopilot(s);
   const status = ended
     ? c?.ended ?? "Your minute is up. The GPU went back to the pool."
     : first === null
@@ -994,11 +1018,15 @@ function ownView(s: ClientState, st: FleetState, srvNow: number, input: WallInpu
     countdown: ended ? "" : left === null ? fmt.countdown(OWN_GPU_SECONDS * 1000) : fmt.countdown(left),
     ended,
     back: "Back to the wall",
-    help: "Drag to turn the camera, scroll to move closer. Arrow keys and plus or minus work too.",
+    help:
+      autopilot === true
+        ? "Flying on autopilot. Drag, scroll, an arrow key or plus or minus takes the camera; Space pauses."
+        : "Drag to turn the camera, scroll to move closer. Arrow keys and plus or minus work too; Space flies again.",
     latency: s.lastInputLatencyMs === null ? "move the camera to measure input to pixels" : `input to pixels: ${fmt.millis(s.lastInputLatencyMs)}`,
     gpu: c?.gpu ?? "",
     steps: c ? timelineOf(c.phases).steps : [],
     placed,
+    autopilot: ended ? null : ownAutopilotView(autopilot),
   };
 }
 
@@ -1319,7 +1347,7 @@ export interface WallView {
   /** What the streams cost, for the stats switch. */
   bandwidth: string;
   /** Broadcast mode: the player's URL (with its token) and the latency line; null otherwise. */
-  broadcast: { url: string; latency: string } | null;
+  broadcast: { url: string; latency: string; paused: boolean } | null;
   /** The stream stats' line on the wall's rate and the renderer holding it back (wallRateLine). */
   wallRate: string;
 }
@@ -1642,6 +1670,9 @@ export function wallView(input: WallInput): WallView {
   };
 
   const play = playView(s, st, srvNow, pend, plan, input, online);
+  // The live picture is whole: every stream has a frame at one t, or in broadcast mode the
+  // player has presented one (the canvas streams nothing then).
+  const pictureWhole = broadcast ? input.broadcastLatencyMs !== undefined && input.broadcastLatencyMs !== null : imageWhole(plan, s.frames);
   const returning = stillReturning(st, s.ui.returning, srvNow);
   const latestNudge = [...s.notices].reverse().find((n) => n.intent === "nudge")?.id ?? null;
   return {
@@ -1663,7 +1694,7 @@ export function wallView(input: WallInput): WallView {
           meta: input.media.meta,
           power: st.fleet.power.state,
           reelOn: s.ui.reelOn,
-          allLive: imageWhole(plan, s.frames),
+          allLive: pictureWhole,
           reducedMotion: input.reducedMotion ?? false,
           saveData: input.saveData ?? false,
         })
@@ -1674,7 +1705,7 @@ export function wallView(input: WallInput): WallView {
     ownButton: broadcast ? null : ownButton(st, srvNow, online, s.own.requestId !== null || (s.own.claim !== null && s.own.claim.phase !== "ended")),
     ownRefusal: s.own.refused === null ? null : { text: `No GPU is free right now: ${s.own.refused}. Try again in a minute.`, dismiss: "OK" },
     viewers: fmt.count(st.viewers.active, "person watching", "people watching"),
-    live: st.fleet.power.state === "awake" && imageWhole(plan, s.frames),
+    live: st.fleet.power.state === "awake" && pictureWhole,
     spec: specLine(st, s, planLayout?.image ?? null, input.dpr),
     lastRace: lastRaceLine(st),
     race: covered ? null : raceOnImage(st, srvNow, layout?.image ?? null, layout?.split ?? 0.5),
@@ -1687,6 +1718,7 @@ export function wallView(input: WallInput): WallView {
       broadcast && s.admission?.broadcast
         ? {
             url: s.admission.broadcast.value,
+            paused: s.ui.paused,
             latency:
               input.broadcastLatencyMs === undefined || input.broadcastLatencyMs === null
                 ? "broadcast, waiting for its first frame"

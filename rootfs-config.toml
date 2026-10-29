@@ -350,6 +350,43 @@ toolkit_sha256 = "14dc22489851d4f1a6d1bbfdfb51524c8f110091738570cddaddc09778a63a
 cuda_checkpoint_url = "https://raw.githubusercontent.com/NVIDIA/cuda-checkpoint/00d5cce84c628088d6caa203fc4af40c1538b6f7/bin/x86_64_Linux/cuda-checkpoint"
 cuda_checkpoint_sha256 = "707fa7f54136824d6c1d6dd724b9b1717610f831033c00d06da474de363a06db"
 
+# Phone guest (x86_64): the gpu profile plus KVM, for an Android Emulator in the
+# guest that renders on the passed-through GPU (docs/fleet/ARCHITECTURE.md,
+# "Phones mode"). Its own profile, so the wall's gpu VMs keep their kernel and
+# snapshots. The emulator is QEMU with KVM, so the guest runs a nested VM; the
+# Firecracker fork saves the guest's nested virtualization state
+# (KVM_GET_NESTED_STATE) in a snapshot, without which a restored guest that had
+# kvm_intel loaded (it executes VMXON at load) faults on its next VMX
+# instruction. The host's kvm_intel needs nested=1.
+[kernel_profiles.phone.amd64]
+description = "GPU passthrough guest kernel with KVM for an Android Emulator (x86_64)"
+kernel_version = "6.18.50"
+kernel_repo = "ejc3/fcvm"
+build_inputs = [
+    "kernel/phone-x86.conf",
+    "kernel/patches-gpu-x86/*.patch",
+]
+kernel_config = "kernel/phone-x86.conf"
+patches_dir = "kernel/patches-gpu-x86"
+base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
+# The fork's VFIO branch with the nested state in snapshots merged (ejc3/firecracker#23).
+firecracker_repo = "ejc3/firecracker"
+firecracker_branch = "agent/vfio-uffd-populate"
+firecracker_commit = "69894de0188292bf3afc0a5d7f8900a80ca74d56"
+firecracker_args = "--enable-pci"
+boot_args = "net.ifnames=0"
+
+[kernel_profiles.phone.amd64.nvidia]
+module_type = "proprietary"
+driver_version = "580.196.07"
+driver_url = "https://us.download.nvidia.com/tesla/580.196.07/NVIDIA-Linux-x86_64-580.196.07.run"
+driver_sha256 = "0aab0518db53cf73c412dc7f32bbc850ca95e839d8923d0de4bff42c1c9169ce"
+toolkit_version = "1.20.1"
+toolkit_url = "https://github.com/NVIDIA/nvidia-container-toolkit/releases/download/v1.20.1/nvidia-container-toolkit_1.20.1_deb_amd64.tar.gz"
+toolkit_sha256 = "14dc22489851d4f1a6d1bbfdfb51524c8f110091738570cddaddc09778a63ad9"
+cuda_checkpoint_url = "https://raw.githubusercontent.com/NVIDIA/cuda-checkpoint/00d5cce84c628088d6caa203fc4af40c1538b6f7/bin/x86_64_Linux/cuda-checkpoint"
+cuda_checkpoint_sha256 = "707fa7f54136824d6c1d6dd724b9b1717610f831033c00d06da474de363a06db"
+
 # arm64 nested profile (ARM64 NV2 with custom kernel and firecracker)
 [kernel_profiles.nested.arm64]
 description = "Nested virtualization support for running VMs inside VMs"

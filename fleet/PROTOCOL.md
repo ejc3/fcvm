@@ -55,8 +55,9 @@ with every seat held is late: `locked`, `seat` and `direct` null, `reason` the s
 page shows, and `seat_free` true once a new connection would be seated (the page offers a
 reload; a late connection is never promoted). A page that reconnects passes its ticket as
 `GET /live?seat=<ticket>` and keeps its seat if the ticket's connection closed less than 60 s
-before. `broadcast` is the playback URL (signed for a private channel, valid for an hour),
-null without a broadcast; `capacity` is null when every viewer is seated (no broadcast).
+before. `broadcast` is the playback URL (signed for a private channel, bound to the page's
+`Origin` and valid for an hour), null without a broadcast or, on a private channel, for a
+connection that sent no `Origin`; `capacity` is null when every viewer is seated (no broadcast).
 `claim_gpu` from a late connection is refused unrecorded (`version: 0`).
 
 ```json
@@ -96,17 +97,20 @@ The answer to a `verify`.
  "frame_url": "ws://<host>:<port>/frames", "token": "<secret>",
  "clicked_at": 1761134400000, "first_frame_at": 1761134405400, "expires_at": 1761134465400,
  "gpu": "Tesla T4", "phases": {"teardown_ms": 310, "restore_ms": 4300, "gpu_ms": 3100, "total_ms": 5400},
- "camera": [{"t": 812.0, "pos": [...], "look": [...], "fov_deg": 60, "intent": "<id>"}], "ended": null}}
+ "camera": [{"t": 812.0, "pos": [...], "look": [...], "fov_deg": 60, "intent": "<id>"}],
+ "autopilot": true, "ended": null}}
 ```
 
 Sent only to the connection whose `claim_gpu` committed, whenever the claim changes:
 first with `phase: "restoring"` (no frame URL yet), then `running` once the private VM
 has drawn its first frame (its `frame_url`, `first_frame_at - clicked_at` the click to
-first frame, `phases` the agent's timings of the restore), again when `claim_camera`
-moves its camera, and a last time with `phase: "ended"` and `ended` saying why
+first frame, `phases` the agent's timings of the restore), again whenever its camera
+keyframes change (`claim_camera`, `claim_autopilot`, and the autopilot's next keyframes
+about every 8 s while it flies), and a last time with `phase: "ended"` and `ended` saying why
 (`expired`, or `released`: `release_gpu`, the viewer leaving, or the GPU leaving the
 fleet). The frame URL and the token appear in no snapshot. `tile` is the wall tile it
-borrowed, null for a standby GPU.
+borrowed, null for a standby GPU. `autopilot` is true while the camera flies the
+autopilot's loop (below) and false once the viewer has paused it or taken the camera.
 
 ```json
 {"type": "clock", "server_unix_ms": 1761134400123, "client_unix_ms": 1761134400100.5}
@@ -149,7 +153,8 @@ Intents:
 | `light` | `{"pos": [x, y, z], "color": [r, g, b]}` | one per client per second; each client keeps its latest 3 (its oldest goes); `color` components are clamped to [0, 1], then scaled so they add up to at most 2; the scene keeps the latest 32 |
 | `claim_gpu` | `{}` | a GPU of your own for 60 s (below) |
 | `release_gpu` | `{"claim": "claim-3"}` (or `{}`) | ends your claim early; a `claim` that is not yours is refused |
-| `claim_camera` | `{"drag": {"yaw_deg", "pitch_deg", "dive"}}` | turns and moves your claimed GPU's camera (only yours; refused without a claim), easing over 0.3 s; the keyframe it eases to gets `"intent": <id>`. Yaw within 360, pitch within 180, dive within 50 |
+| `claim_camera` | `{"drag": {"yaw_deg", "pitch_deg", "dive"}}` | turns and moves your claimed GPU's camera (only yours; refused without a claim), easing over 0.3 s; the keyframe it eases to gets `"intent": <id>`. Yaw within 360, pitch within 180, dive within 50. On a camera flying its autopilot it also stops the autopilot: the camera eases to rest along its path over 0.5 s while it turns by the drag |
+| `claim_autopilot` | `{"on": false}` or `{"on": true}` | stops your claimed GPU's autopilot (the camera comes to rest along its path over 1 s, on a keyframe with `"intent": <id>`, and stays there) or starts it again (the camera flies from where it is to the nearest point of the loop in 2 to 8 s, that keyframe carrying the intent, and on around it). Refused without a claim; the state it already has commits and changes nothing |
 
 There is no intent to move the wall's camera, set its time of day, relaunch every tile
 on a viewer's schedule, or change the race cadence: the director and the owner's
@@ -158,9 +163,14 @@ configuration own those. Two names differ from what the page (#1143) assumed:
 - The race button's intent is `restart_now`, the owner's name for it in the second
   design review, not `relaunch_all`. The race it starts is still reported as the
   snapshot's `relaunch_all`.
-- There is no `time_of_day` intent. Each hold's viewpoint sets the time of day (the
-  low-sun holds are viewpoints), so a viewer's setting would undo the director's next
-  hold or be undone by it within seconds.
+- There is no `time_of_day` intent. The directed camera's day cycle sets the time of day
+  (below), so a viewer's setting would be undone within a flight.
+- There is no weather intent either. The director sets the scene's `weather` keys per
+  stop (`weather_of_step` in `fleet/core/src/director.rs`): cover from a six-stop cycle,
+  towering cumulus every fifth stop in daylight, crepuscular rays when the sun is low, and
+  a snow line between 0.7 and 2.3 km over 36 stops. The current stop's weather holds from
+  its arrival; once the next stop is decided its weather is published at its arrival, and
+  the renderer eases into it over the flight.
 
 **Clients and limits.** Every limit counts per client address, not per connection: the
 `CF-Connecting-IP` header when the coordinator runs with `--trust-cf-connecting-ip`
@@ -174,24 +184,41 @@ default 60 s) during which `restart_now` is refused for everyone; `restart_now` 
 starts one at once and the schedule restarts from it. Tiles on a draining host and GPUs
 lent to a visitor sit the race out.
 
-**The directed camera.** The coordinator flies the wall's camera along a path generated
-from `--camera-seed`: holds of 7 s at named viewpoints (low sun, a high leg showing the
-horizon's curve, the main peak and the clock in the sky framed across the fcvm/EC2 seam at
-image centre), joined by flights. The order loops and is the same for the same seed.
+**The directed camera.** The coordinator flies the wall's camera along a program generated
+from `--camera-seed`, and the camera never stands still. At each stop (a named viewpoint:
+the main peak and the clock in the sky framed across the fcvm/EC2 seam at image centre,
+valleys and ridgelines, the lakes, the plains, above and up through the cloud layer, high
+above the horizon's curve) it makes a slow move for the stop's stay of 9 to 12 s (an orbit,
+a push-in, a crane, a pan or a tracking drift), then flies to the next stop in one of four
+styles: a banking glide, an arc over the cloud deck, a dive through the cloud layer into a
+stop below it, or a skim low over the ground. A leg over 45 km low down always goes over
+the deck. Each leg starts with the velocity the previous one ended with and keeps 250 m
+above the ground and water; keyframes are one second apart and no two in a row are equal,
+so the renderer's spline ("Camera interpolation and holds" below) never holds. The time of
+day follows a cycle of 18 stops (late afternoon, golden hour, sunset, dusk, dawn, then the
+day, about every 8 minutes): each stop has its own, and the time moves on to the next
+stop's only while the camera flies, a step per coordinator tick. No stop is at night; the
+night passes in the middle of the one flight from the last dusk stop to the first dawn
+stop. The offered stops are never among the last six visited; they are the stops visited
+longest ago, shuffled a little by a draw from the seed, the step and the stop being left,
+with any stop that would repeat a run of four stops among the last 48 put last. With no
+votes the next stop is the first offered. The same seed gives the same program, and it does
+not repeat in a short loop.
 
-Viewers pick the stops by vote, and the vote is always open: it is for the first hold not
-yet decided. Two seconds before a hold ends the open vote closes and decides the next hold:
-the offered viewpoint with the most `nudge` votes, of tied ones the one picked first (a
-client that picks the same viewpoint again keeps its first time), and with no votes the
-default (the next in the order). The winning nudge's id is stamped on that hold's keyframes
-(`camera[].intent`). The decision is when the camera commits: the next hold's keyframes are
-published then, so every renderer has the flight before it starts, and a decided hold is
-not replaced. In the same step the vote for the hold after it opens, offering the
-viewpoints that follow it in the order, so a pick made while the camera finishes a hold or
-flies counts for the hold after the one it is heading to; votes are not cleared when the
-camera arrives. A viewer's pick therefore always counts, and the camera reaches it at the
-target's `arrive_at` when it wins. Ties going to the earlier pick mean one viewer cannot
-overturn another's pick within its vote; two viewers who agree outvote one.
+Viewers pick the stops by vote, and the vote is always open: it is for the first stop not
+yet decided. Two seconds before a stop's stay ends the open vote closes and decides the
+next stop: the offered viewpoint with the most `nudge` votes, of tied ones the one picked
+first (a client that picks the same viewpoint again keeps its first time), and with no
+votes the default (the first offered). The winning nudge's id is stamped on that stop's
+keyframes (`camera[].intent`). The decision is when the camera commits: the flight and the
+next stop's keyframes are appended then and are never changed afterwards (the path is only
+trimmed from the front, keeping 4 s before the current stop), so every renderer has the
+flight before it starts and no renderer sees the path move under it. In the same step the
+vote for the stop after it opens, so a pick made while the camera finishes a stop or flies
+counts for the stop after the one it is heading to; votes are not cleared when the camera
+arrives. A viewer's pick therefore always counts, and the camera reaches it at the target's
+`arrive_at` when it wins. Ties going to the earlier pick mean one viewer cannot overturn
+another's pick within its vote; two viewers who agree outvote one.
 
 **Viewer text** (`word`). Before the event is applied the coordinator asks Claude Haiku on
 Amazon Bedrock whether the text may be shown publicly, read together with every word now
@@ -229,7 +256,14 @@ running its current generation (not relaunching, not still racing). The tile kee
 place in the layout, its `phase` becomes `borrowed` and its frame URL is withheld; its
 host's aggregator draws it black. The agent tears the tile's VM down and restores a
 private VM on that GPU drawing the whole image with the session's own camera, which only
-its viewer can move (`claim_camera`). The coordinator times the click to that VM's first frame and
+its viewer can move (`claim_camera`, `claim_autopilot`). The camera waits at the start of
+the autopilot's loop and flies it from 0.5 s after the first frame: a 56 s loop
+(`fleet/core/src/autopilot.rs`) low over the lake west of the main peak, up the ridge
+face, along the peak's flank, up through the cloud layer to 7 km, over the top, down
+through the clouds, low over the water and hills to the south, and back onto the lake. Its
+keyframes come a second apart and reach at least 8 s ahead (16 s after each batch). It
+flies until the viewer pauses it or drags, scrolls or presses a camera key, and does not
+start again on its own. The coordinator times the click to that VM's first frame and
 sends the viewer, alone, `claim` messages. After 60 s (`claim_secs`), on `release_gpu`, or
 when the viewer disconnects, the private VM is destroyed and the tile's VM restores back
 into the wall, timed like any relaunch (`last_relaunch.by` is `return:<session>`). Refused:
@@ -395,10 +429,11 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   reclaimed mid-race are `dropped`, borrowed ones `sitting_out`.
 - `nudges` is the directed camera: `targets` are the viewpoints the open vote is among,
   the ones `nudge` may name now (`id`), each with a label, its votes and `arrive_at`, when
-  the camera gets there if it wins; `holding` (and `holding_label`) is the viewpoint held
-  now (null while flying) and `next_hold_at` when the camera leaves it; `next` (and `next_label`) is the next hold
-  once decided, `arrive_next_at` when the camera gets there. While `next` is null the open
-  vote decides it; otherwise it decides the hold after `next`. `leading` is the target that
+  the camera gets there if it wins; `holding` (and `holding_label`) is the stop the camera
+  is at now, moving slowly through it (null while flying), and `next_hold_at` when the
+  camera leaves it; `next` (and `next_label`) is the next stop once decided,
+  `arrive_next_at` when the camera gets there. While `next` is null the open vote decides
+  it; otherwise it decides the stop after `next`. `leading` is the target that
   wins if the vote closed now (the default when nobody voted); `opened_at` and
   `closes_at` bound the open vote.
 - `fleet.power` is whether the GPU capacity is up, when the coordinator launches the GPU
@@ -475,12 +510,13 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
 ### `GET /poster.jpg`
 
 The latest converged still of the whole image, for link previews and the page's first
-paint. Once per camera hold, 5.5 s into it, the coordinator subscribes to every aggregator
-(each host's band and the EC2 half), decodes the first frame at or after that scene time,
+paint. Once per camera stop, 5.5 s into it, the coordinator subscribes to every aggregator
+(each host's band and the EC2 half), decodes the first frame at or after that scene time
+(every aggregator draws the same frame times, so the regions are one frame),
 places each region in the whole image and encodes one JPEG (through the `ffmpeg` CLI).
 Served with `Cache-Control: public, max-age=10` and `Access-Control-Allow-Origin: *` (the
-page reads it from its own origin); `404` with `no-store` until the first poster exists. A hold whose capture does not finish before the flight keeps the previous
-poster, and so does a hold while a race runs or any placed tile is starting or
+page reads it from its own origin); `404` with `no-store` until the first poster exists. A stop whose capture does not finish before the flight keeps the previous
+poster, and so does a stop while a race runs or any placed tile is starting or
 relaunching (its region would be black; claimed GPUs and dark tiles do not count). Borrowed tiles are black in it, as on the wall.
 
 ### Running it
@@ -856,7 +892,8 @@ The scene shared by every renderer, sent after the hello and whenever it changes
 agent posts `scene` plus the slot's `rect` to each running renderer as
 `POST http://<publish ip>:<port>/scene`, with the body
 `{"epoch_unix_ms", "rect", "layout_generation", "rect_from_frame", "previous_rect",
-"image_aspect", "camera", "time_of_day", "words", "lights"}`. The
+"image_aspect", "camera", "time_of_day", "words", "lights", "weather"}` (`weather` only when
+the scene has weather keys: renderer `POST /scene`, "Weather"). The
 coordinator posts the same body to each EC2 tile's renderer
 (`POST https://ec2-<n>.<zone>/scene`). A tile is reported `running` only after its
 renderer has taken the scene: a viewer streams a running tile at once, and a renderer
@@ -1190,6 +1227,7 @@ broadcast; they never appear in a browser's snapshot.
 | `time_of_day` | sun position: 0.25 sunrise, 0.5 noon, 0.75 sunset (the built-in scene uses 0.245, golden hour) | 0 to 1 |
 | `words` | viewer text: `{"text", "t", "text_style"}` (see "Words, the clock and lights") | optional; may be empty |
 | `lights` | viewer lights | optional; may be empty; `color` components 0 to 64 |
+| `weather` | weather keys: `{"t", "cover", "towers", "rays", "snow_line_km"}` (see "Weather") | optional; at most 64; absent, null or empty means the defaults throughout |
 | `budget` | pixel-samples per frame for every tile (see "Budget") | optional; 10,000 to 50,000,000; absent means the renderer's `BUDGET` |
 | `layout_generation` | the coordinator's layout this rect belongs to (see "Layout generations") | optional; a non-negative integer or null |
 | `rect_from_frame` | the first frame (scene time x 30) drawn with `rect` | optional; a non-negative integer or null |
@@ -1250,7 +1288,8 @@ for that: at least 0.5 s after the last post arrives.
   it starts or ends).
 - Next to a hold the tangent is zero, so motion eases out of and into holds.
 - To let the image converge, include holds: two equal keyframes a few seconds
-  apart.
+  apart. The coordinator's directed camera includes none: its path never stands still,
+  and its moving frames rely on the reprojected history (below).
 
 #### Words, the clock and lights
 
@@ -1303,6 +1342,26 @@ screen.
 
 - A **light** appears at its `t` as a glowing sphere (35 m) of its `color`, and
   lights the terrain within 3 km. At most 32.
+
+#### Weather (addition, round 14)
+
+`weather` is a list of keys. A frame draws the weather at its layer's time:
+the frame's `t`, or the hold's start while the camera holds (so a hold keeps
+one weather and converges). Between two keys each field eases from one to the
+next (smoothstep of the fraction of the span); before the first key and after
+the last the nearest key holds. With no keys every field has its default,
+which is the sky through round 13.
+
+| field | meaning | accepted |
+|-------|---------|----------|
+| `t` | scene time of the key | a finite number; keys are sorted by `t` on arrival |
+| `cover` | cloud cover: 0 a clear sky, 0.5 the default, 1 nearly overcast (it moves the coverage threshold of the cloud field) | optional; 0 to 1; default 0.5 |
+| `towers` | 0 fair-weather cumulus with tops at 5.6 km (the default), 1 towering cumulus whose densest cores reach 9.6 km | optional; 0 to 1; default 0 |
+| `rays` | crepuscular rays: haze below the cloud base, densest near the ground, lit by the sun only where the clouds let it through, so the gaps throw beams and the clouds' shadows lie across the air; strongest looking toward a low sun. 0 draws no haze and costs nothing | optional; 0 to 1; default 0 |
+| `snow_line_km` | altitude where snow starts on flatter ground (steeper slopes need more height); 1.6 is the default, 0.5 a winter landscape, 2.6 only the peaks | optional; 0 to 4; default 1.6 |
+
+A field outside its range, or a key without `t`, is refused with `400` naming
+the field. A change of the weather a hold draws starts a new hold.
 
 ### `GET /frames?h=<height>&q=<quality>` (WebSocket)
 
@@ -1741,3 +1800,176 @@ compared pixel for pixel with the same frame drawn whole
 - Environment: `PORT` (8080), `FPS` (30), `BUDGET` (250000), `ADAPT` (1), `MARGIN` (16), `ENC_BPP` (0.8),
   `ACCUMULATE` (1), `TLS_CERT_FILE` (unset: no TLS listener), `TLS_PORT` (443). `FIT_SCALE`
   (1) scales the reported `budget_fit`, to test a grid of unequal GPUs; never set it in production.
+
+## Phone app
+
+Robot Park (`fleet/phone-app`) is the app every phone of phones mode runs
+(docs/fleet/ARCHITECTURE.md, "Phones mode"). It draws its rectangle of one
+Android-themed scene, the same way a renderer draws its tile of the wall, and takes
+its scene, its place and a fixed set of actions from the phone container over a
+local socket. Source of truth for the messages: `fleet/phone-app/scene/src/main/kotlin/dev/fcvm/robotpark/scene/Protocol.kt`.
+
+### Transport
+
+The app listens on an abstract-namespace Unix socket, `dev.fcvm.robotpark`, inside
+Android. It needs no network permission, and nothing outside the emulator can reach it.
+The phone container forwards a TCP port on its own loopback to it:
+
+```
+adb forward tcp:7070 localabstract:dev.fcvm.robotpark
+```
+
+`fleet/phone/phone.sh app <apk>` installs the app, starts it and sets up that forward;
+`phone.sh ctl '<json>'` sends one request and prints the reply. Only processes in the
+phone container (the agent's controller) reach port 7070; a viewer never does.
+
+Each request is one JSON object on one line (UTF-8, at most 1 MiB), with a `type`.
+Each gets exactly one reply line, in order: `{"ok": true, ...}` or
+`{"error": "<what is wrong>"}` naming the field, as the renderer's `POST /scene` does.
+A connection may carry any number of requests; several connections may be open.
+
+### Scene time
+
+`t` is the renderer's: seconds since `epoch_unix_ms` on the phone's clock. A phone
+draws on the grid `t = k / 60` (`k = floor((now_unix_ms - epoch_unix_ms) * 60 / 1000)`),
+so phones that agree on the clock draw the same `t` at the same moment. The Android
+emulator takes its clock from the VM's at boot; `clock` (below) corrects it.
+
+Every pixel is a function of `t`, the scene and the rect: every robot's position, pose
+and colour, every particle and sign are computed from `t` and its index, with no frame
+counter and no state carried from frame to frame. A phone restored from a snapshot,
+restarted, or given its scene late draws the right frame at once.
+
+### `scene`
+
+The renderer's `POST /scene` body with `"type": "scene"`, plus the phone's fields.
+
+```json
+{"type": "scene", "epoch_unix_ms": 1761100000000,
+ "rect": {"x": 0.5, "y": 0.0, "w": 0.5, "h": 1.0}, "image_aspect": 1.125,
+ "camera": [{"t": 0.0, "pos": [0, 8, 30], "look": [0, 1.6, -4], "fov_deg": 40}],
+ "words": [{"text": "HELLO PHONES", "t": 20.0}],
+ "lights": [{"pos": [-2, 1.6, 6], "color": [1.0, 0.45, 0.15], "t": 0.0}],
+ "moves": [{"t": 60.0, "move": "dance"}],
+ "night": false, "chrome": [{"t": 90.0, "on": true}], "stamp": false}
+```
+
+| field | meaning | accepted |
+|---|---|---|
+| `epoch_unix_ms`, `rect`, `image_aspect` | as the renderer's | as the renderer's: `rect` inside the unit square, `w`, `h` at least 1/256; `image_aspect` 0.1 to 10 |
+| `camera` | keyframes, with the renderer's interpolation and holds; **units are metres of the park** (x across, y up, z toward the camera; robots walk along x between z = -46 and 16, about 1 m tall) | optional, at most 4096; empty means the park's own slow sway from (0, 8, 30) toward (0, 1.6, -4), fov 40 |
+| `words` | a word appears on a sign a robot carries across the whole image, left to right, over 45 s | optional, at most 256; the renderer's text rule (printable ASCII, 28 characters); the 3 newest show |
+| `lights` | a glowing orb at `pos` (metres) that lights what is near it, fading in over 1.5 s | optional, at most 32; the 16 newest show; `color` 0 to 64 |
+| `moves` | `dance`: the crowd stops, faces the camera and dances on one 120 bpm beat under confetti; `wave`: the crowd stops and waves. Each lasts 8 s with 0.6 s ramps | optional, at most 256 |
+| `night` | night palette: dark sky, stars, the moon, glowing eyes, fireflies | optional boolean; absent follows the phone's own dark mode |
+| `chrome` | keys: from `t`, show (`on: true`) or hide the app's top and tab bars over the scene. Zooming out is a key at a `t` every phone reaches together | optional, at most 64; absent means hidden (seamless) |
+| `stamp` | write the frame number `k` (the `t = k / 60` grid) into the bottom 8 rows: 32 cells across the surface, most significant bit first, white for 1 and black for 0, for the phone streamer to read and crop | optional boolean, default false |
+| `layout_generation`, `rect_from_frame`, `previous_rect` | as the renderer's: frames before `rect_from_frame` (on the renderer's 1/30 s grid) use `previous_rect` | optional |
+| `time_of_day`, `weather`, `budget` | the renderer's; accepted and ignored | |
+
+A scene replaces the previous one whole. Unknown fields are ignored.
+
+**The phone's part of the image.** A phone's surface is `w x h` pixels (720 x 1280
+portrait). It shows whole-image pixels `[x0, x0 + w) x [y0, y0 + h)` where
+`full_h = round(h / rect.h)`, `full_w = round(full_h * image_aspect)`,
+`x0 = round(rect.x * full_w)`, `y0 = round(rect.y * full_h)` (the renderer's tile
+geometry at the surface's height). For N phones side by side, `image_aspect` is
+`N * 720 / 1280` and phone k's rect is `{x: k/N, y: 0, w: 1/N, h: 1}`. Pixels beyond the
+image are black. The whole image must fit the GPU's framebuffers (32768 pixels a side on
+a T4, 45 phones wide).
+
+**Seams.** Every phone draws the whole image into a framebuffer of the whole image's
+size, scissored to its own part, so the GPU rasterizes the same window coordinates on
+every phone. `scripts/phone/scene-test.sh` measures it on the T4 (see "The seam test").
+
+### `action`
+
+```json
+{"type": "action", "name": "dance", "t": 64.0}
+```
+
+`name` is one of a fixed set, and nothing else is taken:
+
+| name | effect |
+|---|---|
+| `scene`, `info` | the scene tab, or the info tab: device model, Android version, the GLES renderer, vendor and version of the app's context, frames per second, uptime, the place (below), the benchmark result, and the attribution lines |
+| `rotate` | portrait to landscape or back (the surface becomes 1280 x 720). A phone turned the other way from its rect has left the wall: it draws the whole image on its own, at its own aspect, until it turns back |
+| `dark`, `light` | night or day on this phone, over the scene's `night` |
+| `dance`, `wave` | a move on this phone from `t` (default: the current frame's): the crowd dances or waves as it walks. Only the scene's `moves` stop the crowd, and those every phone shows together. The phone keeps its last 64; once older ones are dropped, `capture`, `freeze` and `dance` or `wave` refuse a `t` before the end of the last dropped one (its confetti included) |
+| `benchmark` | draws the scene offscreen at 2,400, 9,600 and 38,400 robots, 30 frames each, and reports milliseconds per frame (in `status` and on the info tab) |
+| `restart` | the app exits and starts again in a new process |
+
+The same actions arrive by intent, for adb:
+`am start -a dev.fcvm.robotpark.ACTION --es name dance [--ef t 64.0]`.
+
+### `place`
+
+```json
+{"type": "place", "vm": "phone-3", "slot": "3", "host": "example-host", "gpu": "Tesla T4",
+ "region": "us-east-1", "restored_in_ms": 5400}
+```
+
+Where the phone runs, for the info tab. Each field optional, a string or number,
+printable ASCII, at most 64 characters.
+
+### `clock`
+
+`{"type": "clock", "unix_ms": 1761100012345}`: the sender's time now. The app keeps
+the difference to its own clock and adds it from then on. The reply carries
+`offset_ms`.
+
+### `status`
+
+`{"type": "status"}` answers with the app's state:
+
+```json
+{"ok": true, "t": 41.5, "fps": 60.0, "frames": 2490, "frame_ms": 16.6,
+ "renderer": "Android Emulator OpenGL ES Translator (Tesla T4/PCIe/SSE2)",
+ "vendor": "Google (NVIDIA Corporation)", "gl_version": "OpenGL ES 3.1 (OpenGL ES 3.2 NVIDIA 580.196.07)",
+ "surface": [720, 1280], "samples": 4, "context_generation": 1, "screen": "scene",
+ "night": false, "robots": 2400, "benchmark": null, "uptime_ms": 41000,
+ "device": "Google sdk_gphone64_x86_64", "android": "15 (API 35)", "place": {}}
+```
+
+`context_generation` counts EGL contexts the app has created: it goes up when the app
+rebuilds after `EGL_CONTEXT_LOST`. `last_error` is present when something failed
+(the control socket could not bind, EGL could not start).
+
+### `capture`
+
+```json
+{"type": "capture", "name": "left-12", "t": 12.0, "rect": {"x": 0, "y": 0, "w": 0.5, "h": 1},
+ "image_aspect": 1.125, "w": 720, "h": 1280}
+```
+
+Draws one frame offscreen, with the current scene's inputs but this `t`, `rect`,
+`image_aspect` and size, through the same path as the screen, and writes it as raw RGBA,
+top row first, to the app's external files directory. The reply names the file (`path`,
+for `adb pull`), the geometry (`x0`, `y0`, `full_w`, `full_h`) and an FNV-1a 64 hash of
+the bytes (`fnv64`). `name` is 1 to 40 of `a-z`, `0-9` and `-`. This is the seam test's
+instrument; the agent does not need it.
+
+### `freeze` and `drop_context` (tests)
+
+`{"type": "freeze", "t": 12.0}` draws that `t` on screen until `{"type": "freeze", "t": null}`.
+`{"type": "drop_context"}` tears down the app's EGL display and context and builds them
+again, the path an `EGL_CONTEXT_LOST` takes; the reply carries the new `context_generation`.
+
+### Surface loss and the GPU
+
+The app renders on its own thread with its own EGL context, which lives on a 1 x 1
+pbuffer, so the context survives losing the window: `surfaceDestroyed` only drops the
+window surface, and a new surface is drawn on at once. `EGL_CONTEXT_LOST` from any EGL
+call tears down the display, the context and every GL object, and builds them again;
+the scene has no state to lose. Before a restart the app releases EGL first.
+
+### The seam test
+
+`make phone-test` (scripts/phone/run.sh, then `scripts/phone/scene-test.sh`) installs the
+app on the phone, sets a two-phone scene, and for three times (robots walking; a sign
+crossing the middle under two lights; the crowd dancing under confetti) captures the whole
+image (1440 x 1280) and its two halves (720 x 1280 each). `scripts/phone/seam.py` compares
+every pixel of each half with the whole image at the same whole-image position, and a
+redraw of one half with the first. It allows up to 9 pixels a tile 1 level apart (a residual
+seen in 3 of 10 runs, the same pixel in a light's glow) and fails on anything more; the result
+names the exact count.

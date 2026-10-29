@@ -10,7 +10,13 @@
 #                    the host AMI runs) and checks one start to first frame
 #   build.sh units   installs the units and scripts again (a revision of an existing tile
 #                    AMI, launched from it with BASE_AMI)
-#   build.sh bake    cleans up for imaging
+#   build.sh trace   writes /etc/fcvm-fleet/prefetch.list: the pieces of the root volume that
+#                    the boot of this instance read (resident.py, run after its first frame).
+#                    Run it on a tile launched from the AMI being revised (BASE_AMI), whose
+#                    boot did not prefetch; fcvm-fleet-prefetch.service reads the list early
+#                    in every later boot
+#   build.sh bake    cleans up for imaging; refuses an image without a prefetch list unless
+#                    NO_PREFETCH_LIST=1 says this is the first image of a lineage
 set -euo pipefail
 PHASE=$1
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -36,7 +42,10 @@ IMG=localhost/fcvm-renderer:fleet
 # network-online.target, is disabled.
 install_units() {
   install -d /usr/local/lib/fcvm-fleet /etc/fcvm-fleet/tls
-  install -m 0755 "$HERE/fetch-cert.py" "$HERE/first-frame.sh" /usr/local/lib/fcvm-fleet/
+  install -m 0755 "$HERE/fetch-cert.py" "$HERE/first-frame.sh" "$HERE/resident.py" /usr/local/lib/fcvm-fleet/
+  # The prefetch is a static binary: it is the first thing a boot runs from the root volume,
+  # and an interpreter or a dynamic loader would fetch tens of files of its own first.
+  gcc -O2 -Wall -static -pthread -o /usr/local/lib/fcvm-fleet/prefetch "$HERE/prefetch.c"
   install -m 0644 "$HERE"/*.service /etc/systemd/system/
   install -m 0644 "$HERE/nginx-renderer.conf" /etc/nginx/sites-available/renderer
   rm -f /etc/nginx/sites-enabled/default
@@ -45,7 +54,7 @@ install_units() {
   systemctl disable --now nginx.service
   systemctl mask nginx.service
   systemctl daemon-reload
-  systemctl enable nvidia-persistenced.service fcvm-fleet-tls.service fcvm-fleet-renderer.service fcvm-fleet-first-frame.service fcvm-fleet-nginx.service
+  systemctl enable fcvm-fleet-prefetch.service nvidia-persistenced.service fcvm-fleet-tls.service fcvm-fleet-renderer.service fcvm-fleet-first-frame.service fcvm-fleet-nginx.service
 }
 
 case "$PHASE" in
@@ -135,7 +144,23 @@ units)
   # this phase and bake).
   install_units
   ;;
+trace)
+  # The page cache of an instance that has served its first frame holds what its boot read
+  # from the root volume. A boot that prefetched holds the old list's pieces as well, which
+  # would keep every piece on the list whether or not a boot still reads it.
+  [ -s /var/log/fcvm-fleet-first-frame.log ] || { echo "trace: this boot has not served a first frame"; exit 1; }
+  [ ! -e /run/fcvm-fleet-prefetched ] ||
+    { echo "trace: this boot ran fcvm-fleet-prefetch.service; launch from an image whose boot reads on its own, or remove the list and reboot first"; exit 1; }
+  install -d /etc/fcvm-fleet
+  python3 "$HERE/resident.py" /etc/fcvm-fleet/prefetch.list.new /
+  mv /etc/fcvm-fleet/prefetch.list.new /etc/fcvm-fleet/prefetch.list
+  sed -n '1,3p;$p' /etc/fcvm-fleet/prefetch.list | cut -c1-200
+  ;;
 bake)
+  if [ ! -s /etc/fcvm-fleet/prefetch.list ] && [ "${NO_PREFETCH_LIST:-}" != 1 ]; then
+    echo "no /etc/fcvm-fleet/prefetch.list: run the trace phase on a tile launched from this lineage's image, or set NO_PREFETCH_LIST=1 for its first image"
+    exit 1
+  fi
   $APT clean
   rm -f /etc/fcvm-fleet/tls/*.pem /var/log/fcvm-fleet-first-frame.log /var/run/cdi/nvidia.yaml
   cloud-init clean --logs --seed

@@ -140,6 +140,28 @@ Scene parse_scene(const std::string& body) {
     if (ks.size() > 4) throw std::runtime_error("'admit_keys' has more than 4 keys");
     for (const Json& k : ks) s.admit_keys.push_back(admit_key_from_hex(k.string("admit_keys[]")));
   }
+  if (j.has("weather") && j.at("weather").type != Json::Null) {
+    const auto& ws = j.at("weather").array("weather");
+    if (ws.size() > 64) throw std::runtime_error("'weather' has more than 64 keys");
+    for (const Json& w : ws) {
+      WeatherKey k;
+      k.t = w.at("t").number("weather[].t");
+      if (!std::isfinite(k.t)) throw std::runtime_error("'weather[].t' must be finite");
+      auto field = [&](const char* name, double hi, double* out) {
+        if (!w.has(name) || w.at(name).type == Json::Null) return;
+        double v = w.at(name).number(std::string("weather[].") + name);
+        if (!(v >= 0 && v <= hi))
+          throw std::runtime_error(std::string("'weather[].") + name + "' must be in 0.." + (hi == 1 ? "1" : "4"));
+        *out = v;
+      };
+      field("cover", 1, &k.cover);
+      field("towers", 1, &k.towers);
+      field("rays", 1, &k.rays);
+      field("snow_line_km", 4, &k.snow_line_km);
+      s.weather.push_back(k);
+    }
+    std::stable_sort(s.weather.begin(), s.weather.end(), [](const WeatherKey& a, const WeatherKey& b) { return a.t < b.t; });
+  }
   if (j.has("budget")) {
     s.budget = j.at("budget").number("budget");
     if (!(s.budget >= 1e4 && s.budget <= 5e7)) throw std::runtime_error("'budget' must be in 10000..50000000");
@@ -734,6 +756,27 @@ static void text_layout(const Scene& s, FrameParams& p, double st, double t, dou
   g.style = GTEXT_LANDMARK;
 }
 
+WeatherKey weather_at(const std::vector<WeatherKey>& k, double t) {
+  if (k.empty()) return WeatherKey{};
+  if (t <= k.front().t) return k.front();
+  for (size_t i = 0; i + 1 < k.size(); i++) {
+    const WeatherKey &a = k[i], &b = k[i + 1];
+    if (t > b.t) continue;
+    double span = b.t - a.t;
+    double f = span > 0 ? (t - a.t) / span : 1.0;
+    f = f * f * (3.0 - 2.0 * f);
+    auto L = [f](double x, double y) { return x + (y - x) * f; };
+    WeatherKey w;
+    w.t = t;
+    w.cover = L(a.cover, b.cover);
+    w.towers = L(a.towers, b.towers);
+    w.rays = L(a.rays, b.rays);
+    w.snow_line_km = L(a.snow_line_km, b.snow_line_km);
+    return w;
+  }
+  return k.back();
+}
+
 FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* hold_key, bool* held) {
   FrameParams p;
   memset(&p, 0, sizeof p);
@@ -758,6 +801,12 @@ FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* ho
   double wx = std::fmod(layer_t * 0.010, (double)CLOUD_TILE_KM), wz = std::fmod(layer_t * 0.0035, (double)CLOUD_TILE_KM);
   p.wind = v2((float)wx, (float)wz);
   p.wave_t = (float)std::fmod(layer_t * 0.6, (double)NOISE_N);
+  // The weather of the accumulated layer (a hold keeps its start's).
+  WeatherKey wk = weather_at(s.weather, layer_t);
+  p.cloud_cover = (float)wk.cover;
+  p.cloud_top = (float)(5.6 + 4.0 * wk.towers);
+  p.rays = (float)wk.rays;
+  p.snow_line = (float)wk.snow_line_km;
 
   // Lights lit in the accumulated layer: every light whose t has passed.
   uint64_t key = 0x5EED;
@@ -780,6 +829,10 @@ FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* ho
     for (int i = 0; i < 3; i++) { key = mix64(key, dbits(pose.pos[i])); key = mix64(key, dbits(pose.look[i])); }
     key = mix64(key, dbits(pose.fov_deg));
     key = mix64(key, dbits(s.time_of_day));
+    key = mix64(key, dbits(wk.cover));
+    key = mix64(key, dbits(wk.towers));
+    key = mix64(key, dbits(wk.rays));
+    key = mix64(key, dbits(wk.snow_line_km));
     key = mix64(key, (uint64_t)tile.full_w << 32 | (uint32_t)tile.full_h);
     key = mix64(key, (uint64_t)p.n_lights);
     // landmark letters shade the terrain in the accumulated samples: a new

@@ -2116,9 +2116,10 @@ async fn shutdown_waits_for_a_state_write_already_in_flight() {
         "the write is still running"
     );
     handle.shutdown().await;
-    assert_eq!(
-        written.lock().unwrap().len(),
-        1,
+    // The queued write has finished. The directed camera moves the time of day every tick
+    // while it flies, so the state may have changed since and shutdown writes it after.
+    assert!(
+        !written.lock().unwrap().is_empty(),
         "shutdown returned before the queued write finished"
     );
     tokio::time::timeout(Duration::from_secs(5), actor)
@@ -4428,7 +4429,7 @@ async fn the_aws_tile_driver_launches_waits_and_terminates() {
 /// A DNS query for `name` and `qtype` to `server` over UDP (or TCP): the rcode, whether AA
 /// is set, and the addresses of the answer.
 async fn ask_dns(
-    server: std::net::SocketAddr,
+    server: fcvm::fleet::coord::authority::Served,
     name: &str,
     qtype: u16,
     tcp: bool,
@@ -4443,7 +4444,7 @@ async fn ask_dns(
     q.extend_from_slice(&qtype.to_be_bytes());
     q.extend_from_slice(&[0, 1]);
     let m = if tcp {
-        let mut s = tokio::net::TcpStream::connect(server).await.unwrap();
+        let mut s = tokio::net::TcpStream::connect(server.tcp).await.unwrap();
         s.write_all(&(q.len() as u16).to_be_bytes()).await.unwrap();
         s.write_all(&q).await.unwrap();
         let len = s.read_u16().await.unwrap() as usize;
@@ -4452,7 +4453,7 @@ async fn ask_dns(
         m
     } else {
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        sock.send_to(&q, server).await.unwrap();
+        sock.send_to(&q, server.udp).await.unwrap();
         let mut buf = [0u8; 1500];
         let (n, _) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
             .await
@@ -4503,7 +4504,7 @@ fn subzone_names() -> (
 /// answers from, and an agent with one slot.
 async fn subzone_fixture() -> (
     Handle,
-    std::net::SocketAddr,
+    fcvm::fleet::coord::authority::Served,
     tokio::sync::watch::Receiver<Arc<fcvm::fleet::coord::authority::Zone>>,
     FakeAgent,
 ) {
@@ -4515,7 +4516,7 @@ async fn subzone_fixture_with(
     ec2: Option<Arc<dyn ec2::Ec2Driver>>,
 ) -> (
     Handle,
-    std::net::SocketAddr,
+    fcvm::fleet::coord::authority::Served,
     tokio::sync::watch::Receiver<Arc<fcvm::fleet::coord::authority::Zone>>,
     FakeAgent,
 ) {
@@ -4554,6 +4555,54 @@ fn report_slot(agent: &FakeAgent, generation: u64, v6: Option<&str>, v4: Option<
             ..Default::default()
         }))
         .unwrap();
+}
+
+/// `Authority::serve` on port 0 used to take the port the kernel gave the UDP socket and
+/// bind TCP to that number. UDP and TCP have separate port spaces, so the TCP bind failed
+/// ("binding TCP 127.0.0.1:<port>") whenever any other socket on the host held that TCP
+/// port. The kernel picks each protocol's port itself now. It returns the same number for
+/// both about once in the ephemeral range's size (28,232 here), so in 16 serves at least one
+/// pair differs; with TCP's port copied from UDP's, every pair is equal.
+#[tokio::test]
+async fn dns_port_zero_is_asked_of_the_kernel_once_per_protocol() {
+    use fcvm::fleet::coord::authority::Authority;
+    let (names, rx) = subzone_names();
+    let mut served = Vec::new();
+    for _ in 0..16 {
+        let a = Authority {
+            cfg: names.cfg.clone(),
+            zone: rx.clone(),
+        };
+        served.push(a.serve("127.0.0.1:0".parse().unwrap(), 1000).await.unwrap());
+    }
+    assert!(
+        served.iter().any(|s| s.udp.port() != s.tcp.port()),
+        "TCP's port was copied from UDP's in all {} serves: {served:?}",
+        served.len()
+    );
+}
+
+/// `serve` binds TCP to `listen` itself. Rebuilding the address from its IP and a port
+/// drops the scope id of a link-local IPv6 address (`fe80::1%eth0`): UDP binds, TCP fails with
+/// EINVAL, and the coordinator does not start. A runtime test needs an interface with a
+/// link-local address, which a CI host may not have, so this pins the source.
+#[test]
+fn dns_serve_binds_tcp_to_the_listen_address_as_given() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/fleet/coord/authority.rs"
+    ))
+    .unwrap();
+    let from = src.find("pub async fn serve").expect("serve");
+    let body = &src[from..from + src[from..].find("\n    }\n").expect("end of serve")];
+    assert!(
+        body.contains("TcpListener::bind(listen)"),
+        "serve must bind TCP to `listen`:\n{body}"
+    );
+    assert!(
+        !body.contains("SocketAddr::new"),
+        "serve must not rebuild an address from its IP: the scope id is lost:\n{body}"
+    );
 }
 
 /// The first snapshot whose tile shows both frame URLs other than `not`; the zone the DNS
@@ -5687,6 +5736,50 @@ async fn a_closed_seat_is_kept_for_its_ticket_then_freed_without_promoting_anyon
     // A reload is a new connection, admitted afresh.
     let mut reload = Viewer::connect(&c.url).await;
     assert_eq!(reload.message("admission").await["locked"], false);
+}
+
+/// A tile lent to a visitor ("Your own GPU") draws that visitor's private camera over the
+/// whole image: the broadcast keeps its rectangle black instead of streaming it.
+#[tokio::test]
+async fn the_broadcast_never_streams_a_borrowed_tile() {
+    let (url, handle) = coordinator(allow_all()).await;
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 2);
+    agent.assign().await;
+    agent.report("slot-1", "running", 1);
+    agent.report("slot-2", "running", 1);
+    let mut a = Viewer::connect_from(&url, Some("198.51.100.1")).await;
+    a.until(|s| s["tiles"][1]["phase"] == "running").await;
+    a.intent("c1", "claim_gpu", json!({})).await;
+    assert_eq!(a.receipt("c1").await["outcome"], "committed");
+    loop {
+        if agent.assign().await[1].private_camera.is_some() {
+            break;
+        }
+    }
+    // The private VM is up and has its frames.
+    agent.report("slot-2", "running", 2);
+    a.message_where("claim", |m| m["claim"]["phase"] == "running")
+        .await;
+    let mut layouts = handle.broadcast_layout.clone();
+    let l = tokio::time::timeout(
+        Duration::from_secs(10),
+        layouts.wait_for(|l| {
+            l.as_ref()
+                .is_some_and(|l| l.tiles.iter().any(|t| t.id == "slot-1" && t.url.is_some()))
+        }),
+    )
+    .await
+    .expect("a broadcast layout")
+    .unwrap()
+    .clone()
+    .unwrap();
+    for t in &l.tiles {
+        assert!(
+            t.id != "slot-2" || t.url.is_none(),
+            "the broadcast streams the borrowed tile: {:?}",
+            t.url
+        );
+    }
 }
 
 /// The coordinator's admission keys reach every renderer through the scene the agents post,

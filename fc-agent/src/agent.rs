@@ -309,6 +309,9 @@ pub async fn run() -> Result<()> {
     // instead of reformatting it (guarded by the provisioned marker).
     match plan.image_mode.as_deref() {
         Some("overlay") => {
+            // The image store is its own device; the root still holds the container's
+            // writable layer, so a btrfs root is grown to its disk.
+            container::grow_btrfs_root();
             eprintln!("[fc-agent] skipping btrfs loopback setup (image_mode=overlay)");
         }
         _ => {
@@ -702,11 +705,17 @@ pub async fn run() -> Result<()> {
     mounts::unmount_paths(&mounted_pmem_paths, "pmem device");
     mounts::unmount_disks(&mounted_disk_paths);
     if let Some("overlay") = plan.image_mode.as_deref() {
-        // A run with a user binds the store over its device, and the bind comes off first.
-        let mut store_paths = vec![container::IMAGE_STORE_PATH.to_string()];
-        if user_info.is_some() {
-            store_paths.push(container::IMAGE_STORE_RAW_PATH.to_string());
-        }
+        // A run with a user binds the store over its device and a layer list over the
+        // store's own; the binds come off first, the last one made first.
+        let store_paths = if user_info.is_some() {
+            vec![
+                container::image_store_layers_path(),
+                container::IMAGE_STORE_PATH.to_string(),
+                container::IMAGE_STORE_RAW_PATH.to_string(),
+            ]
+        } else {
+            vec![container::IMAGE_STORE_PATH.to_string()]
+        };
         mounts::unmount_paths(&store_paths, "image store");
     }
 

@@ -2,7 +2,7 @@
 //! (newline-delimited JSON), and the body the agent posts to each renderer's `/scene`.
 //! `fleet/PROTOCOL.md` documents them.
 
-use crate::scene::{Keyframe, Light, Scene, Word};
+use crate::scene::{Keyframe, Light, Scene, WeatherKey, Word};
 use crate::state::{Gpu, TextCheck};
 use crate::tiling::Rect;
 use serde::{Deserialize, Serialize};
@@ -126,6 +126,9 @@ pub struct ClaimMsg {
     /// The agent's timings of the private VM's restore.
     pub phases: BTreeMap<String, u64>,
     pub camera: Vec<crate::scene::Keyframe>,
+    /// The camera flies the autopilot's loop (`claim_autopilot`); false once the viewer
+    /// paused it or took the camera.
+    pub autopilot: bool,
     /// Why it ended: `expired` (its time ran out) or `released` (`release_gpu`, or the GPU
     /// left the fleet); null while it lasts.
     pub ended: Option<String>,
@@ -335,6 +338,8 @@ pub struct SharedScene {
     /// "admission"). Empty: no check. Never in a browser's snapshot.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub admit_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weather: Vec<WeatherKey>,
 }
 
 impl SharedScene {
@@ -347,6 +352,7 @@ impl SharedScene {
             words: scene.words.clone(),
             lights: scene.lights.clone(),
             admit_keys: Vec::new(),
+            weather: scene.weather.clone(),
         }
     }
 
@@ -363,6 +369,7 @@ impl SharedScene {
             words: self.words.clone(),
             lights: self.lights.clone(),
             admit_keys: self.admit_keys.clone(),
+            weather: self.weather.clone(),
         }
     }
 }
@@ -420,6 +427,8 @@ pub struct RendererScene {
     /// The admission keys (see [`SharedScene::admit_keys`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub admit_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weather: Vec<WeatherKey>,
 }
 
 #[cfg(test)]
