@@ -21,8 +21,10 @@ RUN git clone -q https://github.com/FFmpeg/nv-codec-headers.git /opt/nv-codec-he
 COPY --from=renderer src /src/renderer/src
 COPY --from=renderer tests/check.h /src/renderer/tests/check.h
 COPY streamer /src/phone/streamer
+# test-host reads main.cpp beside it by a path relative to where it was compiled, so it runs
+# from the streamer's directory.
 RUN make -C /src/phone/streamer -j"$(nproc)" RSRC=/src/renderer/src RTESTS=/src/renderer/tests all \
-    && /src/phone/streamer/build/test-host
+    && cd /src/phone/streamer && build/test-host
 
 FROM docker.io/library/ubuntu:24.04
 # The emulator's own libraries cover most of what it loads; these are the system ones it
