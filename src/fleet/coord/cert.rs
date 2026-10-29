@@ -237,9 +237,8 @@ pub async fn issue(r: &Renewal, cf: &mut Cloudflare) -> Result<CertDoc> {
     result
 }
 
-/// A renewed document with the scene token: the one the secret has (a token rotated by hand
-/// stays rotated), else the one the coordinator added at startup (a secret that could not be
-/// read or parsed).
+/// A renewed document with the scene token: the one the secret has as the new version is
+/// stored, else the one the coordinator holds (a secret that could not be read or parsed).
 pub fn with_scene_token(mut doc: CertDoc, r: &Renewal, current: Option<&str>) -> CertDoc {
     doc.scene_token = current
         .and_then(super::scene_token::from_secret)
@@ -262,10 +261,13 @@ pub async fn run(r: Renewal, secrets: Secrets, mut cf: Cloudflare) {
         if due {
             tracing::info!(zone = %r.zone, extra = ?r.extra, "renewing the wildcard certificate");
             wait = r.retry_after;
-            match issue(&r, &mut cf)
-                .await
-                .map(|d| with_scene_token(d, &r, current.as_deref().ok()))
-            {
+            let issued = issue(&r, &mut cf).await;
+            // The token as stored now, not when the renewal began: issuance takes minutes.
+            let fresh = match &issued {
+                Ok(_) => secrets.get(&r.secret).await.ok(),
+                Err(_) => None,
+            };
+            match issued.map(|d| with_scene_token(d, &r, fresh.as_deref())) {
                 Ok(doc) => match secrets
                     .put(
                         &r.secret,
@@ -327,6 +329,22 @@ mod tests {
         let stored: serde_json::Value =
             serde_json::to_value(with_scene_token(pem, &r, None)).unwrap();
         assert_eq!(stored["scene_token"], "held", "stored in the new version");
+    }
+
+    /// A renewal takes the token from the secret as read after issuance, which takes minutes:
+    /// the read before it could restore a token replaced meanwhile.
+    #[test]
+    fn a_renewal_reads_the_token_after_issuance() {
+        let src = include_str!("cert.rs");
+        let body = &src[src.find("pub async fn run(").unwrap()..];
+        let issue = body.find("issue(&r, &mut cf).await").unwrap();
+        let read = body
+            .find("secrets.get(&r.secret).await.ok()")
+            .expect("a read of the secret for the token");
+        let keep = body
+            .find("with_scene_token(d, &r, fresh.as_deref())")
+            .unwrap();
+        assert!(issue < read && read < keep, "{issue} {read} {keep}");
     }
 
     fn doc_from_pem_for_tests() -> CertDoc {

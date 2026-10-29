@@ -1118,8 +1118,9 @@ processes; the host needs the `ffmpeg` CLI with libx264.
 - `admit_keys` in a layout (the coordinator's admission keys, hex): the public
   listener's `/frames` then needs a first message `{"admit": "<direct token>"}` made with
   one of them within 5 s (the socket is closed with 1008 otherwise; before its first layout
-  it answers `503`), and the aggregator's own tile subscriptions send a token it makes with
-  the first. The agent passes its scene's keys; the coordinator its own.
+  it answers `503`; it takes no message over 4 KiB), and the aggregator's own tile
+  subscriptions send a token it makes with the first. The coordinator's poster sends one
+  the same way. The agent passes its scene's keys; the coordinator its own.
 - `POST /layout`: `{"epoch_unix_ms","image_aspect","region":{x,y,w,h},
   "tiles":[{"id","rect","url"}],"generation","from_frame"}` (`generation` and `from_frame`
   default to 0: the layout generation of the tiles' rects and its frame; the agent sends
@@ -1190,9 +1191,12 @@ certificate JSON, whose `scene_token` field is the token: a VM on a host agent) 
   direct token (`admit_keys`), and a stream opened before it would keep its frames after.
 - The scene token is the `scene_token` field of the certificate secret ("Certificate"
   under the coordinator), so it reaches each renderer the way its certificate does. The
-  coordinator adds one when the secret has none (32 random bytes, hex), keeps it through
-  every renewal, and follows a token rotated by hand within an hour; the host agents and
-  tile instances read it with the certificate.
+  coordinator adds one when the secret has none (32 random bytes, hex; two coordinators
+  adding one at once agree, since both write with a request token derived from the version
+  they read and the service stores only the first), keeps it through every renewal, and
+  every hour puts its own back into a version that lost it; the host agents and tile
+  instances read it with the certificate. To rotate it, store a new one, then restart the
+  coordinator and relaunch the tiles and hosts: a tile reads its token once, at boot.
 
 A renderer with neither variable set (a local run) takes any scene and streams at once.
 

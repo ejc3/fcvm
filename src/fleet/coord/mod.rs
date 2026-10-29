@@ -467,21 +467,17 @@ impl Actor {
                     sources.push(u);
                 }
                 // The poster reads the aggregators' public streams: with admission keys, as
-                // a holder of a direct token.
-                if let Some(key) = self
+                // a holder of a direct token, sent as each stream's first message.
+                let admit = self
                     .admit_keys
                     .first()
                     .and_then(|h| admission::AdmitKey::from_hex(h))
-                {
-                    let token = key.direct_token(
-                        "poster",
-                        crate::fleet::now_ms() / 1000 + admission::DIRECT_TOKEN_SECS,
-                    );
-                    for u in &mut sources {
-                        let sep = if u.contains('?') { '&' } else { '?' };
-                        u.push_str(&format!("{sep}admit={token}"));
-                    }
-                }
+                    .map(|key| {
+                        key.direct_token(
+                            "poster",
+                            crate::fleet::now_ms() / 1000 + admission::DIRECT_TOKEN_SECS,
+                        )
+                    });
                 let plan = poster::Plan {
                     step: d.step,
                     arrive_t: d.arrive_t,
@@ -491,6 +487,7 @@ impl Actor {
                         .to_string(),
                     epoch_unix_ms: f.scene.epoch_unix_ms,
                     sources,
+                    admit,
                 };
                 let _ = reply.send(Some(plan));
             }
@@ -1028,7 +1025,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             let secrets = secrets::Secrets::new(&secrets_region()?)?;
             let t = scene_token::ensure(&secrets, secret).await?;
             let held = scene_token::SceneToken::new(Some(t));
-            tokio::spawn(scene_token::follow(secrets, secret.clone(), held.clone()));
+            tokio::spawn(scene_token::keep(secrets, secret.clone(), held.clone()));
             held
         }
         None => scene_token::SceneToken::default(),

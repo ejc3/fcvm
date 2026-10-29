@@ -41,9 +41,14 @@ CLOUDFLARE_PROPAGATION_TIMEOUT=300 lego --accept-tos --email "$ACME_EMAIL" --ser
 unset CLOUDFLARE_DNS_API_TOKEN
 
 crt="$W/certificates/_.$ZONE.crt"; key="$W/certificates/_.$ZONE.key"
-# The current version, for its scene token: a first issuance has none.
-( umask 077; aws --region "$SECRET_REGION" secretsmanager get-secret-value --secret-id "$SECRET" \
-    --query SecretString --output text > "$W/current.json" 2>/dev/null || : > "$W/current.json" )
+# The current version, for its scene token. Only a secret that does not exist yet (a first
+# issuance) has none: any other failure stops here, since storing a certificate without the
+# token would leave every renderer refusing the coordinator's scenes.
+if ! ( umask 077; aws --region "$SECRET_REGION" secretsmanager get-secret-value --secret-id "$SECRET" \
+    --query SecretString --output text > "$W/current.json" 2> "$W/current.err" ); then
+  grep -q ResourceNotFoundException "$W/current.err" || { cat "$W/current.err" >&2; echo "cannot read $SECRET; not storing a certificate without its scene token" >&2; exit 1; }
+  : > "$W/current.json"
+fi
 python3 - "$crt" "$key" "$W/secret.json" "$W/current.json" <<'PY'
 import json, subprocess, sys, datetime
 crt, key, out, current = sys.argv[1:5]

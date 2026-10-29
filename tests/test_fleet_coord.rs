@@ -1014,6 +1014,109 @@ async fn fake_aggregate(epoch: u64, x0: u32, yuv: [u8; 3]) -> String {
     url
 }
 
+/// The poster reads an aggregator that holds admission keys as a holder of a direct token,
+/// sent as each stream's first message: the URL carries none, and without the token the
+/// region is missing.
+#[tokio::test]
+async fn the_poster_sends_its_token_as_the_first_message() {
+    use fcvm::fleet::coord::admission::{direct_token_valid, AdmitKey};
+    let key = AdmitKey([6; 32]);
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/frames", l.local_addr().unwrap());
+    let k2 = key.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = l.accept().await else {
+                return;
+            };
+            let key = k2.clone();
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else {
+                    return;
+                };
+                let first = tokio::time::timeout(Duration::from_millis(500), ws.next()).await;
+                let ok = match first {
+                    Ok(Some(Ok(Message::Text(t)))) => fcvm::fleet::aggregate::admit_message(&t)
+                        .is_some_and(|tok| {
+                            direct_token_valid(std::slice::from_ref(&key), &tok, now_ms() / 1000)
+                        }),
+                    _ => false,
+                };
+                if !ok {
+                    let _ = ws.close(None).await;
+                    return;
+                }
+                let h = json!({"codec": "raw", "width": 4, "height": 2, "full_width": 4,
+                    "full_height": 2, "x0": 0, "y0": 0, "fps": 30});
+                if ws.send(Message::Text(h.to_string().into())).await.is_err() {
+                    return;
+                }
+                let f = Frame {
+                    key: true,
+                    width: 4,
+                    height: 2,
+                    t: 1.0,
+                    number: 30,
+                    au: vec![80; 24],
+                };
+                let _ = ws.send(Message::Binary(f.encode().into())).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            });
+        }
+    });
+    let token = key.direct_token("poster", now_ms() / 1000 + 600);
+    assert!(
+        poster::compose(std::slice::from_ref(&url), Some(&token), &Raw, 1.0)
+            .await
+            .is_ok(),
+        "the poster with its token"
+    );
+    assert!(
+        poster::compose(std::slice::from_ref(&url), None, &Raw, 1.0)
+            .await
+            .is_err(),
+        "a poster without a token got a frame"
+    );
+    // The plan carries the token beside the URLs, not in them.
+    let config = Config {
+        max_tiles: 1,
+        fcvm_tiles: 1,
+        ..Config::default()
+    };
+    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None, None);
+    handle.set_admit_keys(vec![key.hex()]).await;
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 1);
+    agent.assign().await;
+    agent
+        .to_coord
+        .send(AgentMsg::Aggregate {
+            frame_url: "ws://gpu-host.example:20200/frames".into(),
+            ipv6: None,
+            ipv4: None,
+            v4_port: None,
+        })
+        .unwrap();
+    agent.report("slot-1", "running", 1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let plan = loop {
+        if let Some(p) = handle.poster_plan().await.filter(|p| !p.sources.is_empty()) {
+            break p;
+        }
+        assert!(std::time::Instant::now() < deadline, "no plan");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(
+        plan.sources.iter().all(|u| !u.contains("admit")),
+        "{:?}",
+        plan.sources
+    );
+    assert!(direct_token_valid(
+        std::slice::from_ref(&key),
+        plan.admit.as_deref().expect("a token"),
+        now_ms() / 1000
+    ));
+}
+
 /// At a camera hold the coordinator takes the whole image from every aggregator (a host's
 /// band and the EC2 half), places each region and serves it at `/poster.jpg`, briefly
 /// cacheable. Before the first hold has converged there is no poster.

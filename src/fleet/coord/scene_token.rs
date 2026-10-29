@@ -62,12 +62,18 @@ pub fn from_secret(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The secret's token, after adding one when it has none. The secret is read again after the
-/// write and its token returned, so two coordinators adding one at once agree on the version
-/// that was stored last.
+/// The secret's token, after adding one when it has none. Two coordinators that add one at
+/// once agree: each writes with a request token derived from the version it read, so the
+/// service stores only the first write of that version and refuses the other, which then
+/// reads the stored token.
 pub async fn ensure(secrets: &Secrets, secret: &str) -> Result<String> {
-    let text = secrets
-        .get(secret)
+    ensure_with(secrets, secret, None).await
+}
+
+/// As [`ensure`], adding `token` (a new one when None) when the secret has none.
+async fn ensure_with(secrets: &Secrets, secret: &str, token: Option<&str>) -> Result<String> {
+    let (text, version) = secrets
+        .get_version(secret)
         .await
         .with_context(|| format!("reading {secret}"))?;
     if let Some(t) = from_secret(&text) {
@@ -78,30 +84,58 @@ pub async fn ensure(secrets: &Secrets, secret: &str) -> Result<String> {
     let obj = doc
         .as_object_mut()
         .with_context(|| format!("secret {secret} is not a JSON object"))?;
-    obj.insert("scene_token".into(), generate().into());
-    secrets
-        .put(secret, &doc.to_string())
-        .await
-        .with_context(|| format!("storing a scene token in {secret}"))?;
-    tracing::info!(secret, "added a scene token to the certificate secret");
-    from_secret(&secrets.get(secret).await?)
-        .with_context(|| format!("secret {secret} has no scene token after it was stored"))
+    obj.insert(
+        "scene_token".into(),
+        token.map(str::to_string).unwrap_or_else(generate).into(),
+    );
+    let request = request_token(version.as_deref().unwrap_or(""));
+    let put = secrets
+        .put_with_token(secret, &doc.to_string(), &request)
+        .await;
+    // Refused because another writer stored this version's successor first: its token stands.
+    let stored = from_secret(&secrets.get(secret).await?);
+    match (put, stored) {
+        (_, Some(t)) => {
+            tracing::info!(secret, "the certificate secret has a scene token");
+            Ok(t)
+        }
+        (Err(e), None) => Err(e).with_context(|| format!("storing a scene token in {secret}")),
+        (Ok(()), None) => {
+            anyhow::bail!("secret {secret} has no scene token after it was stored")
+        }
+    }
 }
 
-/// Follow the secret's token hourly, so a token rotated by hand reaches this client without a
-/// restart. A secret that cannot be read keeps the token held.
-pub async fn follow(secrets: Secrets, secret: String, token: SceneToken) {
+/// The `ClientRequestToken` of the write that adds a token to `version`: the same for every
+/// writer that read that version.
+fn request_token(version: &str) -> String {
+    let d = ring::digest::digest(
+        &ring::digest::SHA256,
+        format!("fcvm-fleet scene token for {version}").as_bytes(),
+    );
+    d.as_ref()[..24]
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect()
+}
+
+/// Keep the token in the secret, hourly: a version without one (a certificate stored by a
+/// tool that dropped it) gets this coordinator's token back, so the renderers that read the
+/// secret keep taking its scenes. A different token in the secret is not followed: running
+/// tiles read theirs once at boot, so switching would cut them off. Rotating the token means
+/// restarting the coordinator and relaunching the tiles and hosts (fleet/PROTOCOL.md,
+/// "Access").
+pub async fn keep(secrets: Secrets, secret: String, token: SceneToken) {
+    let Some(held) = token.get() else { return };
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-        match secrets.get(&secret).await {
-            Ok(text) => {
-                if let Some(t) = from_secret(&text) {
-                    token.set(Some(t));
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "the scene token was not refreshed")
-            }
+        match ensure_with(&secrets, &secret, Some(&held)).await {
+            Ok(t) if t == held => {}
+            Ok(_) => tracing::warn!(
+                secret,
+                "the certificate secret holds another scene token; restart the coordinator and relaunch the tiles to rotate it"
+            ),
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "the scene token was not checked"),
         }
     }
 }

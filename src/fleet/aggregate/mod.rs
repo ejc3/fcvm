@@ -872,30 +872,36 @@ async fn admitted_frames_route(
     let Some(keys) = app.layout.borrow().as_ref().map(|l| l.admit_keys.clone()) else {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "no layout yet").into_response();
     };
-    ws.on_upgrade(move |mut socket| async move {
-        if !keys.is_empty() {
-            let first = tokio::time::timeout(ADMIT_WAIT, socket.recv()).await;
-            let token = match first {
-                Ok(Some(Ok(Message::Text(t)))) => admit_message(&t),
-                _ => None,
-            };
-            if !admitted(&keys, token.as_deref()) {
-                let _ = socket
-                    .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                        code: 1008,
-                        reason: "a direct token is required".into(),
-                    })))
-                    .await;
-                return;
+    // Nothing a viewer sends is larger than a height request, so an unadmitted client cannot
+    // make it buffer more than this.
+    ws.max_message_size(MAX_VIEWER_MESSAGE)
+        .on_upgrade(move |mut socket| async move {
+            if !keys.is_empty() {
+                let first = tokio::time::timeout(ADMIT_WAIT, socket.recv()).await;
+                let token = match first {
+                    Ok(Some(Ok(Message::Text(t)))) => admit_message(&t),
+                    _ => None,
+                };
+                if !admitted(&keys, token.as_deref()) {
+                    let _ = socket
+                        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                            code: 1008,
+                            reason: "a direct token is required".into(),
+                        })))
+                        .await;
+                    return;
+                }
             }
-        }
-        viewer(socket, app).await
-    })
-    .into_response()
+            viewer(socket, app).await
+        })
+        .into_response()
 }
 
 /// How long a stream that needs a direct token waits for the client's first message.
 pub const ADMIT_WAIT: Duration = Duration::from_secs(5);
+
+/// The largest message the public listener takes from a viewer.
+pub const MAX_VIEWER_MESSAGE: usize = 4096;
 
 /// The first message that admits a client to a stream: `{"admit": "<token>"}`.
 pub fn admit_first_message(token: &str) -> String {

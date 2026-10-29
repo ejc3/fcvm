@@ -1597,6 +1597,99 @@ async fn the_coordinator_adds_a_scene_token_to_the_secret_once() {
     );
 }
 
+/// Two coordinators that add a token to the same tokenless secret at once agree on one: the
+/// fake keeps the service's rule that a request token already used for another value is
+/// refused, holds both reads until each has read the tokenless version, and lands the second
+/// write after the first writer has read its own back.
+#[tokio::test]
+async fn two_coordinators_adding_a_scene_token_at_once_agree() {
+    use fcvm::fleet::coord::scene_token;
+    use fcvm::fleet::coord::secrets::Secrets;
+    use std::sync::{Arc, Mutex};
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    #[derive(Default)]
+    struct Store {
+        value: String,
+        version: String,
+        by_token: std::collections::HashMap<String, String>,
+        gets: usize,
+        puts: usize,
+    }
+    let store = Arc::new(Mutex::new(Store {
+        value: serde_json::json!({"cert": "C", "key": "K"}).to_string(),
+        version: "v-0".into(),
+        ..Default::default()
+    }));
+    let first_reads = Arc::new(tokio::sync::Barrier::new(2));
+    let (s2, b2) = (store.clone(), first_reads.clone());
+    let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap, body: String| {
+        let (s2, b2) = (s2.clone(), b2.clone());
+        async move {
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            match headers["x-amz-target"].to_str().unwrap() {
+                "secretsmanager.GetSecretValue" => {
+                    let (n, value, version) = {
+                        let mut s = s2.lock().unwrap();
+                        s.gets += 1;
+                        (s.gets, s.value.clone(), s.version.clone())
+                    };
+                    if n <= 2 {
+                        b2.wait().await;
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(serde_json::json!({"SecretString": value, "VersionId": version})),
+                    )
+                }
+                "secretsmanager.PutSecretValue" => {
+                    let token = v["ClientRequestToken"].as_str().unwrap().to_string();
+                    let value = v["SecretString"].as_str().unwrap().to_string();
+                    // The second write lands after the first writer has read its own back.
+                    let n = {
+                        let mut s = s2.lock().unwrap();
+                        s.puts += 1;
+                        s.puts
+                    };
+                    if n == 2 {
+                        while s2.lock().unwrap().gets < 3 {
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        }
+                    }
+                    let mut s = s2.lock().unwrap();
+                    if s.by_token.get(&token).is_some_and(|old| *old != value) {
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            axum::Json(serde_json::json!({"__type": "ResourceExistsException", "Message": "a version with this token exists"})),
+                        );
+                    }
+                    s.by_token.insert(token.clone(), value.clone());
+                    s.value = value;
+                    s.version = token.clone();
+                    (axum::http::StatusCode::OK, axum::Json(serde_json::json!({"VersionId": token})))
+                }
+                other => panic!("unexpected call {other}"),
+            }
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let a = Secrets::with_endpoint("us-east-2", &base).unwrap();
+    let b = Secrets::with_endpoint("us-east-2", &base).unwrap();
+    let (ta, tb) = tokio::join!(
+        scene_token::ensure(&a, "fcvm-fleet/tls-wildcard"),
+        scene_token::ensure(&b, "fcvm-fleet/tls-wildcard")
+    );
+    let (ta, tb) = (ta.unwrap(), tb.unwrap());
+    assert_eq!(ta, tb, "the coordinators hold different tokens");
+    let stored = store.lock().unwrap().value.clone();
+    assert_eq!(
+        scene_token::from_secret(&stored).as_deref(),
+        Some(ta.as_str())
+    );
+}
+
 /// The renderers' certificate in the renderer's TLS interface: `tls.json` with `cert` and
 /// `key` from the secret (mode 0600), left alone while the secret is unchanged, replaced by
 /// a new file after a renewal; each VM gets the directory read-only, `TLS_CERT_FILE` and

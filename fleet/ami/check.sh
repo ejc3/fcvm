@@ -175,6 +175,38 @@ grep -q -- '-v /etc/fcvm-fleet/scene:/run/fleet-scene:ro -e SCENE_TOKEN_FILE=/ru
   no "the renderer unit does not give the renderer its scene token"
 grep -q '/etc/fcvm-fleet/tls' <<<"$(grep '^ExecStart=' "$unit")" && no "the renderer unit mounts the certificate's key"
 
+# issue-cert.sh keeps the secret's scene token, and stores nothing when it cannot read the
+# secret (a certificate without the token would leave every renderer refusing scenes). Fakes
+# of aws and lego on PATH; openssl makes the certificate lego would.
+ic=$(mktemp -d)
+mkdir -p "$ic/bin"
+cat > "$ic/bin/lego" <<'SH'
+#!/bin/bash
+while [ $# -gt 0 ]; do [ "$1" = --path ] && p=$2; shift; done
+mkdir -p "$p/certificates"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 -subj /CN=example.test \
+  -addext "subjectAltName=DNS:*.example.test,DNS:example.test" \
+  -keyout "$p/certificates/_.example.test.key" -out "$p/certificates/_.example.test.crt" 2>/dev/null
+SH
+cat > "$ic/bin/aws" <<'SH'
+#!/bin/bash
+case "$*" in
+  *cloudflare-dns-token*) echo token ;;
+  *get-secret-value*) case "$FAKE_READ" in ok) echo '{"cert":"old","key":"old","scene_token":"s-keep"}' ;; missing) echo "An error occurred (ResourceNotFoundException)" >&2; exit 254 ;; *) echo "An error occurred (AccessDeniedException)" >&2; exit 254 ;; esac ;;
+  *put-secret-value*) for a in "$@"; do case "$a" in file://*) cp "${a#file://}" "$FAKE_OUT" ;; esac; done; echo v-1 ;;
+esac
+SH
+chmod +x "$ic/bin/lego" "$ic/bin/aws"
+issue() { FAKE_READ=$1 FAKE_OUT="$ic/stored.json" PATH="$ic/bin:$PATH" ZONE=example.test bash fleet/tools/issue-cert.sh >/dev/null 2>&1; }
+issue ok && [ "$(jq -r .scene_token "$ic/stored.json" 2>/dev/null)" = s-keep ] ||
+  no "issue-cert.sh does not keep the secret's scene token"
+rm -f "$ic/stored.json"
+issue denied && no "issue-cert.sh stores a certificate when it cannot read the secret"
+[ -e "$ic/stored.json" ] && no "issue-cert.sh stored a certificate without reading the secret"
+issue missing && [ "$(jq -r 'has("scene_token")' "$ic/stored.json" 2>/dev/null)" = false ] ||
+  no "issue-cert.sh does not store a first certificate"
+rm -rf "$ic"
+
 # store-pack.py packs the store into parts and store.sh restores them all at once, each
 # part decompressed and extracted while the others are (one zstd stream decompresses on one
 # core), then the directories, then the staging copy. Both ways (staged and direct) the
