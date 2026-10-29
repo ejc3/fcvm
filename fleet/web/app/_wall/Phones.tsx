@@ -53,6 +53,16 @@ function Verify({ client, view }: { client: WallClient; view: PhonesView }) {
   );
 }
 
+/**
+ * How far the mirror's scene time runs ahead of the video's, from Robot Park's stamp in each:
+ * both extrapolated to one moment at their 1 s of scene time a second. Null without both.
+ */
+function leadOf(m: MirrorStatsMsg | null, videoT: number | null, videoAt: number | null): number | null {
+  if (!m?.stamp || videoT === null || videoAt === null) return null;
+  const t = Math.max(m.stamp.at, videoAt);
+  return (m.stamp.k / 60 + (t - m.stamp.at) / 1000 - (videoT + (t - videoAt) / 1000)) * 1000;
+}
+
 const at = (b: Box): CSSProperties => ({ left: b.x, top: b.y, width: b.w, height: b.h });
 
 function Bezel({ card }: { card: PhoneCard }) {
@@ -350,6 +360,7 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
             fps: mirrorStats?.fps ?? 0,
             repliesPerSec: mirrorStats?.repliesPerSec ?? 0,
             note: mirrorNote,
+            leadMs: leadOf(mirrorStats, videoStats?.newestT ?? null, state.frames?.at ?? null),
           } satisfies StreamReadout)
         : null,
   };

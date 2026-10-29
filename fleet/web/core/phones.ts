@@ -405,6 +405,8 @@ export interface StreamReadout {
   repliesPerSec?: number;
   /** Why the stream is not drawing, when it is not. */
   note?: string | null;
+  /** With both views: how far the mirror's scene time is ahead of the video's (ms; negative behind). */
+  leadMs?: number | null;
 }
 
 export interface ReadoutRow {
@@ -446,7 +448,10 @@ export function readoutRows(view: TakeoverView, video: StreamReadout | null, mir
       value: readoutValue(mirror),
       detail:
         mirror && !mirror.note && mirror.repliesPerSec !== undefined
-          ? `${Math.round(mirror.repliesPerSec)} blocking calls a second answered by the phone's GPU, none sent to this browser`
+          ? `${Math.round(mirror.repliesPerSec)} blocking calls a second answered by the phone's GPU, none sent to this browser` +
+            (mirror.leadMs !== undefined && mirror.leadMs !== null
+              ? `. ${Math.abs(Math.round(mirror.leadMs))} ms ${mirror.leadMs >= 0 ? "ahead of" : "behind"} the video`
+              : "")
           : null,
     });
   return rows;
