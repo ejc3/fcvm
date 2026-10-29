@@ -176,8 +176,13 @@ fi
 if r=$(X /usr/local/bin/gpu-hook release 2>&1) && r=$(X /usr/local/bin/gpu-hook retake 2>&1); then
   sleep 2
   n=$(drawn)
-  [ "${n:-0}" -ge 60 ] && ok "after a GPU release and retake it drew $n frames in 2 s" \
-    || bad "after a GPU release and retake it drew ${n:-no} frames in 2 s: $(X sh -c 'tail -3 /tmp/emulator.log' 2>&1)"
+  if [ "${n:-0}" -ge 60 ]; then
+    ok "after a GPU release and retake it drew $n frames in 2 s"
+  else
+    # whether the app comes back says a stall from a stuck app
+    sleep 5
+    bad "after a GPU release and retake it drew ${n:-no} frames in 2 s, and $(drawn) in 2 s from 9 s after the retake ($r)"
+  fi
 else
   bad "the GPU hook failed: $r"
 fi

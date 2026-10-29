@@ -1,7 +1,7 @@
 #!/bin/bash
-# fleet/phone/phone.sh against a stub adb: `bugreports` counts the bug reports in the events
-# log, prints 0 for a log with none, and fails when adb cannot read the log, so run.sh's
-# check cannot pass on a phone it could not ask. Then `serve` with stand-ins for adb, the
+# fleet/phone/phone.sh against a stub adb: `bugreports` prints how many bug reports dumpstate
+# took since boot, 0 before the first, and fails when adb cannot ask, so run.sh's check
+# cannot pass on a phone it could not ask. Then `serve` with stand-ins for adb, the
 # emulator, the streamer and nvidia-smi: a phone is streamed only once SurfaceFlinger and
 # the app render on the VM's GPU, and every way a start fails ends in the streamer's
 # failure mode, after the serving streamer has let go of its ports.
@@ -10,11 +10,11 @@ set -euo pipefail
 phone=$(cd "$(dirname "$0")/../../fleet/phone" && pwd)/phone.sh
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"' EXIT
-# The stub prints $dir/events for `logcat -d -b events`, and fails when it is absent.
+# The stub prints $dir/last_id for `shell getprop dumpstate.last_id`, and fails when it is absent.
 cat > "$dir/adb" <<STUB
 #!/bin/bash
-[ -f "$dir/events" ] || exit 1
-cat "$dir/events"
+[ -f "$dir/last_id" ] || exit 1
+cat "$dir/last_id"
 STUB
 chmod +x "$dir/adb"
 fail=0
@@ -22,12 +22,12 @@ ok() { echo "ok   $*"; }
 bad() { echo "FAIL $*"; fail=1; }
 count() { PHONE_ADB="$dir/adb" "$phone" bugreports 2> /dev/null; }
 
-printf 'I am_proc_start: [0,1,2000,com.android.shell,broadcast,{com.android.shell/com.android.shell.BugreportRequestedReceiver}]\r\n' > "$dir/events"
-out=$(count) && [ "$out" = 1 ] && ok "a requested bug report counts 1" || bad "a requested bug report counted '$out'"
-printf 'I am_proc_start: [0,1,10111,com.android.inputmethod.latin,service]\r\n' > "$dir/events"
-out=$(count) && [ "$out" = 0 ] && ok "a log without one counts 0" || bad "a log without a bug report counted '$out'"
-rm -f "$dir/events"
-if out=$(count); then bad "bugreports succeeded when adb could not read the log: '$out'"; else ok "bugreports fails when adb cannot read the log"; fi
+printf '1\r\n' > "$dir/last_id"
+out=$(count) && [ "$out" = 1 ] && ok "a bug report taken counts 1" || bad "a bug report taken counted '$out'"
+printf '\r\n' > "$dir/last_id"
+out=$(count) && [ "$out" = 0 ] && ok "a phone that took none counts 0" || bad "a phone with no bug report counted '$out'"
+rm -f "$dir/last_id"
+if out=$(count); then bad "bugreports succeeded when adb could not ask: '$out'"; else ok "bugreports fails when adb cannot ask"; fi
 # One run of `phone.sh serve` in a fresh directory. Stand-ins log to $D/log; FAKE_* steer
 # them. Prints the directory.
 serve() {
@@ -40,6 +40,7 @@ D=$FAKE_DIR
 echo "adb $*" >> "$D/log"
 case "$*" in
   "shell getprop sys.boot_completed") echo 1 ;;
+  "shell cmd uwb disable-uwb") [ -z "${FAKE_UWB_FAILS:-}" ] || exit 1 ;;
   "shell dumpsys SurfaceFlinger")
     [ -e "$D/go" ] && echo "SurfaceFlinger checked with the go file present" >> "$D/log"
     echo "GLES: Google (NVIDIA Corporation), Android Emulator OpenGL ES Translator (${FAKE_RENDERER:-Tesla T4/PCIe/SSE2}), OpenGL ES 3.1" ;;
@@ -52,6 +53,7 @@ EOF
   cat > "$D/bin/emulator" <<'EOF'
 #!/bin/bash
 echo "emulator $*" >> "$FAKE_DIR/log"
+echo "emulator preloads ${LD_PRELOAD:-nothing}" >> "$FAKE_DIR/log"
 trap 'exit 0' TERM
 # a stand-in nobody stopped ends with the test's directory
 while [ -d "$FAKE_DIR" ]; do sleep 0.05; done
@@ -84,6 +86,8 @@ EOF
     export PATH="$D/bin:$PATH" FAKE_DIR="$D" HOME="$D"
     export PHONE_ADB="$D/bin/adb" EMU_DIR="$D/bin" PHONE_STREAMER="$D/bin/phone-streamer" PHONE_KVM=/dev/null
     export PHONE_RUN="$D/run" PHONE_GO_FILE="$D/go" PHONE_AVD_HOME="$D/avd" PHONE_APK=/work/robotpark.apk BOOT_TIMEOUT=5
+    mkdir -p "$D/nvidia"; [ -n "${FAKE_NO_TLS:-}" ] || : > "$D/nvidia/libnvidia-tls.so.580.1"
+    export PHONE_NVIDIA_LIB_DIR="$D/nvidia"
     # FAKE_LOCK_SECS: the GPU hook holds streamer.lock for that long as serve starts
     if [ -n "${FAKE_LOCK_SECS:-}" ]; then
       ( exec 9> "$D/run/streamer.lock"; flock 9; echo "lock taken" >> "$D/log"; sleep "$FAKE_LOCK_SECS"; echo "lock released" >> "$D/log" ) &
@@ -135,6 +139,51 @@ has "$D" "streamer fail: the app did not start: am start" && ok "an app that doe
   || bad "an app that does not start: $(cat "$D/log" "$D/out")"
 has "$D" "streamer streaming" && bad "a phone without its app was streamed" || ok "a phone without its app is never streamed"
 stopped "$D" && ok "the emulator of a phone whose app did not start is stopped" || bad "the emulator of a phone whose app did not start still runs"
+# UWB: the image's UWB service, given no HAL by -feature -Uwb, asks for a bug report a minute or
+# two after boot unless UWB is turned off; serve and boot turn it off once booted, before the
+# app, and a phone that cannot is reported failed.
+D=$(serve)
+before "$D" "adb shell getprop sys.boot_completed" "adb shell cmd uwb disable-uwb" && before "$D" "adb shell cmd uwb disable-uwb" "adb shell am start" \
+  && ok "serve turns UWB off once booted, before the app starts" || bad "serve did not turn UWB off between boot and the app: $(cat "$D/log")"
+D=$(FAKE_UWB_FAILS=1 serve)
+has "$D" "streamer fail: could not turn UWB off" && ok "a phone whose UWB cannot be turned off is reported failed" \
+  || bad "a phone whose UWB stayed on: $(cat "$D/log" "$D/out")"
+has "$D" "streamer streaming" && bad "a phone with UWB on was streamed" || ok "a phone with UWB on is never streamed"
+# `phone.sh boot` (run.sh's phone) with the same stand-ins: prints the exit status last.
+boot() {
+  local D
+  D=$(mktemp -d "$dir/boot.XXXXXX")
+  mkdir -p "$D/bin" "$D/run"
+  cp "$dir"/serve.*/bin/adb "$dir"/serve.*/bin/emulator "$dir"/serve.*/bin/mountpoint "$dir"/serve.*/bin/mount "$D/bin/" 2> /dev/null || true
+  (
+    export PATH="$D/bin:$PATH" FAKE_DIR="$D" HOME="$D"
+    export PHONE_ADB="$D/bin/adb" EMU_DIR="$D/bin" PHONE_RUN="$D/run" PHONE_AVD_HOME="$D/avd" BOOT_TIMEOUT=5
+    mkdir -p "$D/nvidia"; [ -n "${FAKE_NO_TLS:-}" ] || : > "$D/nvidia/libnvidia-tls.so.580.1"
+    export PHONE_NVIDIA_LIB_DIR="$D/nvidia"
+    timeout 20 "$phone" boot > "$D/out" 2>&1
+    echo "exit $?" >> "$D/log"
+    kill "$(cat "$D/run/emulator.pid")" 2> /dev/null
+  )
+  echo "$D"
+}
+D=$(boot)
+has "$D" "exit 0" && before "$D" "adb shell getprop sys.boot_completed" "adb shell cmd uwb disable-uwb" && grep -q '^boot_completed_ms=' "$D/out" \
+  && ok "boot turns UWB off once booted" || bad "boot did not turn UWB off: $(cat "$D/log" "$D/out")"
+# The emulator preloads the driver's TLS library, so 28 releases and retakes do not use up
+# glibc's static TLS; without it the phone is reported failed.
+D=$(serve)
+has "$D" "emulator preloads $D/nvidia/libnvidia-tls.so.580.1" && ok "serve's emulator preloads the driver's TLS library" \
+  || bad "serve's emulator does not preload libnvidia-tls: $(grep preloads "$D/log")"
+D=$(FAKE_NO_TLS=1 serve)
+has "$D" "streamer fail: no libnvidia-tls" && ok "a phone with no libnvidia-tls is reported failed" || bad "no libnvidia-tls: $(cat "$D/log" "$D/out")"
+D=$(boot)
+has "$D" "emulator preloads $D/nvidia/libnvidia-tls.so.580.1" && ok "boot's emulator preloads the driver's TLS library" \
+  || bad "boot's emulator does not preload libnvidia-tls: $(grep preloads "$D/log")"
+D=$(FAKE_NO_TLS=1 boot)
+has "$D" "exit 1" && grep -q "no libnvidia-tls" "$D/out" && ok "boot fails with no libnvidia-tls" || bad "boot with no libnvidia-tls: $(cat "$D/log" "$D/out")"
+D=$(FAKE_UWB_FAILS=1 boot)
+has "$D" "exit 1" && grep -q "could not turn UWB off" "$D/out" && ok "boot fails when UWB cannot be turned off" \
+  || bad "boot with UWB on: $(cat "$D/log" "$D/out")"
 # `action`: each name sends its one request to the app's control socket (a stand-in that
 # records what it is sent); switch_screen and dark_mode toggle; any other name is refused.
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')

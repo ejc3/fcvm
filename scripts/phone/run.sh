@@ -7,7 +7,7 @@
 #      a restored guest keeps its nested virtualization state only with the phone profile's
 #      Firecracker (KVM_GET/SET_NESTED_STATE; with the gpu profile's commit the guest's
 #      kvm_intel oopses in kvm_spurious_fault and the probe dies);
-#   2. Android boots (sys.boot_completed) with -gpu host, and the system asks for no bug
+#   2. Android boots (sys.boot_completed) with -gpu host, and the phone takes no bug
 #      report (one, which a failing device such as UWB triggers, takes a core for ~30 s);
 #   3. SurfaceFlinger composes with GLES on that GPU: its renderer names the GPU nvidia-smi
 #      reports in the VM;
@@ -23,7 +23,9 @@
 #      it, the emulator holds it open, and the app draws 30 frames a second there. Prints the
 #      time from the restore command to the phone's first frame on the clone's GPU.
 #   7. Robot Park (fleet/phone-app), last, on the source phone: seams, surface loss and
-#      actions (scripts/phone/scene-test.sh).
+#      actions (scripts/phone/scene-test.sh); and the phone took no bug report during
+#      the whole run (phone.sh turns UWB off, whose service otherwise asks for one a minute
+#      or two after boot).
 #
 #   FCVM=./target/release/fcvm scripts/phone/run.sh <gpu pci address> <second gpu pci address>
 # PHONE_PROFILE names another kernel profile to run the same checks on (default phone).
@@ -34,8 +36,8 @@
 # kvm_intel loaded with nested=1, the system image, adb and probe app from
 # scripts/phone/aosp.sh, the emulator from scripts/phone/emulator.sh and Robot Park from
 # scripts/phone/app.sh.
-set -euo pipefail
 SRC=$(cd "$(dirname "$0")/../.." && pwd)
+. "$SRC/scripts/phone/checks.sh"
 IMAGE=localhost/fcvm-phone:$(make -s -C "$SRC/fleet/phone" image-id)
 if [ "${1:-}" = --image ]; then echo "$IMAGE"; exit 0; fi
 GPU=${1:?usage: run.sh <gpu pci address> <second gpu pci address>}
@@ -56,9 +58,6 @@ TAG=phone-test-$$-warm
 LOGS=$(mktemp -d)
 mkdir -p "$LOGS/out"
 make -s -C "$SRC/fleet/phone" image IMAGE="$IMAGE" > "$LOGS/build.log" 2>&1 || { cat "$LOGS/build.log"; exit 1; }
-fail=0
-ok() { echo "ok   $*"; }
-bad() { echo "FAIL $*"; fail=1; }
 runner=""
 clone=""
 snapshot_dir=""
@@ -77,7 +76,8 @@ stop_runner() {
     snapshot_dir=""
   fi
 }
-trap stop_runner EXIT
+finished=0
+trap 'finish_run stop_runner' EXIT
 trap 'exit 130' INT TERM
 t0=$(date +%s%3N)
 "$F" podman run --name "$NAME" --kernel-profile "${PHONE_PROFILE:-phone}" --gpu "$GPU" --privileged --cpu 6 --mem 6144 \
@@ -102,18 +102,17 @@ gpu_name=$(X /usr/bin/nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | h
 rc=0; probe=$(timeout 30 "$F" exec --pid "$pid" -- /usr/local/bin/kvmprobe 2>&1) || rc=$?
 [ "$probe" = "kvm ok" ] && ok "KVM runs a VM inside the restored phone VM" || bad "KVM in the restored VM: exit $rc, '${probe}'"
 
-# The lowest of the app's fps samples over the next 4 seconds on VM $1 ("" when it logged none).
-lowest_fps() {
-  "$F" exec --pid "$1" -- /usr/local/bin/phone.sh draws 4 2>&1 | grep -o 'fps=[0-9.]*' | cut -d= -f2 | sort -n | head -1
-}
-at_least_30() { python3 -c 'import sys; sys.exit(0 if sys.argv[1] and float(sys.argv[1]) >= 30 else 1)' "${1:-}"; }
-
 in_place_release_and_retake() {
-  local out holds fps
+  local out holds tls
   if out=$(X /usr/local/bin/gpu-hook release 2>&1); then
     holds=$(X /usr/local/bin/phone.sh holds 2>&1 || true)
     [ "$holds" = "fds=0 mappings=0" ] && ok "the running phone released the GPU ($(grep -o 'released_ms=[0-9]*' <<< "$out")): $holds" \
       || bad "the emulator still holds the GPU after the release: $holds"
+    # the driver's TLS library stays loaded through the release (phone.sh preloads it), so
+    # the retakes never run glibc's static TLS out
+    tls=$(X sh -c 'grep -c libnvidia-tls /proc/$(pgrep -f qemu-system-x86_64 | head -1)/maps' 2>&1 || true)
+    [[ "$tls" =~ ^[1-9] ]] && ok "the released emulator keeps the driver's TLS library loaded" \
+      || bad "the released emulator unloaded libnvidia-tls ($tls mappings): each retake takes static TLS again"
   else
     bad "the phone did not release the GPU: $out"
   fi
@@ -122,13 +121,11 @@ in_place_release_and_retake() {
   else
     bad "the phone did not retake the GPU: $out"
   fi
-  fps=$(lowest_fps "$pid")
-  at_least_30 "$fps" && ok "the app draws after the retake: lowest fps sample $fps" \
-    || bad "the app does not draw 30 fps after the retake: lowest '${fps:-none}'"
+  check_draws "$pid" "after the retake"
 }
 
 warm_snapshot_onto_the_second_gpu() {
-  local source_uuid fps cpid click ack first clone_uuid holds renderer
+  local source_uuid cpid click ack first clone_uuid holds renderer
   source_uuid=$(X /usr/bin/nvidia-smi --query-gpu=uuid --format=csv,noheader 2>&1 | head -1)
   local started=$(date +%s%3N)
   if ! "$F" snapshot create --pid "$pid" --tag "$TAG" --gpu-warm > "$LOGS/snapshot.log" 2>&1; then
@@ -137,9 +134,7 @@ warm_snapshot_onto_the_second_gpu() {
   fi
   snapshot_dir=$(grep -a -o -E "/[^ \",]*/snapshots/$TAG" "$LOGS/snapshot.log" | head -1)
   ok "a warm snapshot of the running phone in $(( $(date +%s%3N) - started )) ms"
-  fps=$(lowest_fps "$pid")
-  at_least_30 "$fps" && ok "the source phone draws after the snapshot: lowest fps sample $fps" \
-    || bad "the source phone does not draw 30 fps after the snapshot: lowest '${fps:-none}'"
+  check_draws "$pid" "on the source phone after the snapshot"
   click=$(date +%s%3N)
   "$F" snapshot run --snapshot "$TAG" --gpu "$GPU2" --name "$NAME-clone" > "$LOGS/clone.log" 2>&1 < /dev/null &
   clone=$!
@@ -168,9 +163,7 @@ warm_snapshot_onto_the_second_gpu() {
   [[ "$holds" =~ ^fds=[1-9] ]] && ok "the clone's emulator holds its GPU: $holds" || bad "the clone's emulator does not hold its GPU: $holds"
   renderer=$("$F" exec --pid "$cpid" -- /usr/local/bin/phone.sh renderer 2>&1 || true)
   [[ "$renderer" == *"$gpu_name"* ]] && ok "the clone's SurfaceFlinger: $renderer" || bad "the clone's SurfaceFlinger does not render on '$gpu_name': $renderer"
-  fps=$(lowest_fps "$cpid")
-  at_least_30 "$fps" && ok "the app draws on the clone's GPU: lowest fps sample $fps" \
-    || bad "the app does not draw 30 fps on the clone's GPU: lowest '${fps:-none}'"
+  check_draws "$cpid" "on the clone's GPU"
   "$F" exec --pid "$cpid" -- /usr/local/bin/phone.sh stop > /dev/null 2>&1 || true
 }
 
@@ -182,18 +175,24 @@ if boot=$(timeout 400 "$F" exec --pid "$pid" -- /usr/local/bin/phone.sh boot 2>&
   echo "$out" > "$LOGS/probe.log"
   app_renderer=$(grep -m1 -o 'renderer=.* vendor=' <<< "$out" || true)
   [[ "$app_renderer" == *"$gpu_name"* ]] && ok "the app's GLES context: $app_renderer" || bad "the app's renderer does not name '$gpu_name': ${app_renderer:-none} (log $LOGS/probe.log)"
-  fps=$(grep -o 'fps=[0-9.]*' <<< "$out" | tail -8 | cut -d= -f2 | sort -n | head -1)
-  python3 -c 'import sys; sys.exit(0 if sys.argv[1] and float(sys.argv[1]) >= 30 else 1)' "${fps:-}" \
+  fps=$(lowest_fps_in "$out" 8)
+  at_least_30 "$fps" \
     && ok "the app draws: lowest of its last 8 fps samples $fps" || bad "the app does not draw 30 fps: lowest '${fps:-none}' (log $LOGS/probe.log)"
   reports=$(X /usr/local/bin/phone.sh bugreports 2>&1 || true)
-  [ "$reports" = 0 ] && ok "the system asked for no bug report" || bad "the system asked for a bug report: '$reports' (a device failed at boot; logcat -b events)"
+  [ "$reports" = 0 ] && ok "the phone took no bug report" || bad "the phone took $reports bug report(s) (a device failed at boot; dumpstate.last_id)"
   in_place_release_and_retake
   warm_snapshot_onto_the_second_gpu
-  "$(dirname "$0")/scene-test.sh" "$F" "$pid" "/work/$(basename "$APP")" "$LOGS/out" "$gpu_name" || fail=1
+  "$(dirname "$0")/scene-test.sh" "$F" "$pid" "/work/$(basename "$APP")" "$LOGS/out" "$gpu_name" || { fail=1; keep_phone_logs "$pid" scene-test; }
+  # The UWB service asked for its bug report a minute or two after boot, after the check
+  # above: count again once every check has run.
+  reports=$(X /usr/local/bin/phone.sh bugreports 2>&1 || true)
+  [ "$reports" = 0 ] && ok "the phone took no bug report during the run" \
+    || { bad "the phone took $reports bug report(s) during the run (dumpstate.last_id; logcat)"; keep_phone_logs "$pid" bugreport; }
 else
   bad "Android did not boot: $boot"
   X sh -c 'grep -aE "ERROR|FATAL" /tmp/emulator.log | head -20' || true
 fi
+finished=1
 X /usr/local/bin/phone.sh stop > /dev/null 2>&1 || true
 stop_runner
 echo "logs: $LOGS"

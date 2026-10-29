@@ -876,8 +876,19 @@ difference from the SDK's image needed a change: this image's `advancedFeatures.
 the guest's UWB stack reports a device error at boot (`am_wtf UwbServiceCore: Error device
 status received`), on which system_server takes a full bug report; dumpstate then holds a
 core for about 30 s, and the app's lowest fps sample after the warm snapshot read 27.9 and
-24.0 in two runs. `phone.sh` starts the emulator with `-feature -Uwb`, and `make
-phone-test` fails when the system has asked for a bug report.
+24.0 in two runs. `phone.sh` starts the emulator with `-feature -Uwb`, which takes the UWB
+HAL away but not the UWB service: it still turns UWB on at boot, waits 20 s for the HAL,
+retries every 10 s, and a later failure asks for the same bug report ("UWB Bugreport: error
+enabling UWB"), about 50 s after boot (dumpstate 30 to 37 s). So `phone.sh` also turns UWB off
+(`cmd uwb disable-uwb`) once booted, and `make phone-test` fails when the phone has taken a
+bug report (`dumpstate.last_id`) at any point in the run.
+
+The emulator also preloads the NVIDIA driver's `libnvidia-tls`. Every `gpu retake` loads the
+driver's libraries again, and a library loaded at run time takes its initial-exec TLS from
+glibc's static TLS surplus, which an unload gives back only when it was the last block handed
+out: on five phones, releases and retakes back to back, the 29th retake could not load the
+Vulkan driver ("cannot allocate memory in static TLS block") and the emulator aborted.
+Preloaded, four phones ran 60 each with no failure.
 
 `make phone-test` passes on the AOSP image, and the two images measure alike. Four
 runs of each, alternating, on one g4dn.metal (T4, driver 580.196.07, 6 GiB phone VM, 2 GiB

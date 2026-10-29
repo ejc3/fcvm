@@ -10,7 +10,7 @@
 #   phone.sh probe secs apk  installs and starts the probe app, prints its log lines
 #   phone.sh draws secs      the probe app's log lines over the next secs seconds
 #   phone.sh holds           the emulator's /dev/nvidia* descriptors and mappings
-#   phone.sh bugreports      how many bug reports the system has asked for since boot
+#   phone.sh bugreports      how many bug reports the phone has taken since boot
 #   phone.sh app apk         installs and starts Robot Park (fleet/phone-app), forwards
 #                            127.0.0.1:7070 in this container to its control socket, and waits
 #                            for its first frame; prints its renderer line
@@ -87,6 +87,25 @@ use_system_egl() {
 }
 
 gpu_name() { nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1; }
+# The NVIDIA driver's thread-local storage library, which the emulator preloads. Every gpu
+# retake loads the driver's libraries again, and a library loaded at run time takes its
+# initial-exec TLS from glibc's small static TLS surplus, which an unload gives back only when
+# it was the last block handed out: on five phones the 29th retake could not load the Vulkan
+# driver ("libnvidia-tls.so...: cannot allocate memory in static TLS block"), and the
+# emulator aborted. Preloaded, its TLS is in the startup block, and a release never unloads it.
+nvidia_tls() {
+  local f
+  for f in "${PHONE_NVIDIA_LIB_DIR:-/usr/lib/x86_64-linux-gnu}"/libnvidia-tls.so.*; do
+    if [ -e "$f" ]; then echo "$f"; return 0; fi
+  done
+  return 0
+}
+# UWB off, once the phone has booted. The image declares UWB, so its service turns UWB on at
+# boot, but -feature -Uwb gives the phone no UWB HAL: each attempt waits 20 s for the HAL,
+# the service retries every 10 s, and a later failure asks for a bug report ("UWB Bugreport:
+# error enabling UWB"). dumpstate then takes the phone's CPU for about 30 s, a minute or two
+# after boot, and the app's frames drop with it. Off, the service stops trying.
+uwb_off() { "$ADB" shell cmd uwb disable-uwb > /dev/null 2>&1; }
 # SurfaceFlinger composes with GLES on the GPU named $1.
 renderer_on_gpu() {
   local r
@@ -189,8 +208,10 @@ serve)
   # this socket while a mirror is open, and offers the guest no more than GLES 3.0, which is
   # what the viewer's WebGL2 can replay. The guest reads its version at boot, so the warm
   # snapshot every phone is a clone of carries the cap.
+  tls=$(nvidia_tls)
+  [ -n "$tls" ] || fail "no libnvidia-tls among the GPU driver's libraries"
   start_emulator() {
-    GFXSTREAM_MIRROR_SOCKET=${MIRROR_SOCKET:-/tmp/gfxstream-mirror.sock} GFXSTREAM_MAX_GLES_VERSION=${PHONE_MAX_GLES:-3.0} \
+    LD_PRELOAD=$tls GFXSTREAM_MIRROR_SOCKET=${MIRROR_SOCKET:-/tmp/gfxstream-mirror.sock} GFXSTREAM_MAX_GLES_VERSION=${PHONE_MAX_GLES:-3.0} \
     setsid "$EMU" -avd phone -no-window -no-audio -no-boot-anim -gpu host -accel on -grpc 8554 \
       -no-snapshot-save -feature -Uwb -verbose "$@" > "$RUN/emulator.log" 2>&1 < /dev/null &
     echo $! > "$RUN/emulator.pid"
@@ -206,6 +227,7 @@ serve)
   }
   start_emulator -no-snapshot-load
   wait_booted
+  uwb_off || fail "could not turn UWB off (cmd uwb disable-uwb)"
   echo "phone.sh: booted in $(( $(ms) - t0 )) ms"
   why=$(renderer_on_gpu "$gpu") || fail "$why"
   why=$(start_app "$PHONE_APK" "$gpu") || fail "the app did not start: $why"
@@ -258,16 +280,20 @@ boot)
   # -feature -Uwb: the AOSP image turns UWB on (its advancedFeatures.ini), and without an
   # emulated UWB peer the guest's UWB stack reports a device error at boot, which makes
   # system_server take a full bug report (dumpstate at 100% of a core for about 30 s, the
-  # app's frames dropping under 30 a second).
-  setsid "$EMU" -avd phone -no-window -no-audio -no-boot-anim -gpu host -accel on \
-    -no-snapshot-load -feature -Uwb -verbose > /tmp/emulator.log 2>&1 < /dev/null &
-  echo $! > /tmp/emulator.pid
+  # app's frames dropping under 30 a second). Without the device the UWB service still
+  # tries: uwb_off stops it.
+  tls=$(nvidia_tls)
+  [ -n "$tls" ] || { echo "no libnvidia-tls among the GPU driver's libraries"; exit 1; }
+  LD_PRELOAD=$tls setsid "$EMU" -avd phone -no-window -no-audio -no-boot-anim -gpu host -accel on \
+    -no-snapshot-load -feature -Uwb -verbose > "$RUN/emulator.log" 2>&1 < /dev/null &
+  echo $! > "$RUN/emulator.pid"
   timeout "${BOOT_TIMEOUT:-300}" "$ADB" wait-for-device
   until [ "$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; do
-    kill -0 "$(cat /tmp/emulator.pid)" 2>/dev/null || { echo "the emulator exited:"; grep -aE 'ERROR|FATAL' /tmp/emulator.log | head -20; exit 1; }
+    kill -0 "$(cat "$RUN/emulator.pid")" 2>/dev/null || { echo "the emulator exited:"; grep -aE 'ERROR|FATAL' "$RUN/emulator.log" | head -20; exit 1; }
     [ $(( $(ms) - t0 )) -lt $(( ${BOOT_TIMEOUT:-300} * 1000 )) ] || { echo "no boot_completed within ${BOOT_TIMEOUT:-300} s"; exit 1; }
     sleep 0.2
   done
+  uwb_off || { echo "could not turn UWB off (cmd uwb disable-uwb)"; exit 1; }
   echo "boot_completed_ms=$(( $(ms) - t0 ))"
   ;;
 renderer)
@@ -291,9 +317,12 @@ holds)
   echo "fds=$(find /proc/"$q"/fd -lname '/dev/nvidia*' 2> /dev/null | wc -l) mappings=$(grep -c /dev/nvidia /proc/"$q"/maps || true)"
   ;;
 bugreports)
-  # A log that cannot be read fails; a log with no bug report prints 0.
-  log=$("$ADB" logcat -d -b events) || { echo "phone.sh: adb could not read the events log" >&2; exit 1; }
-  tr -d '\r' <<< "$log" | grep -c 'BugreportRequestedReceiver' || true
+  # dumpstate numbers each bug report it takes since boot (dumpstate.last_id, unset before the
+  # first), however it was asked for. The events log shows the shell app starting for one,
+  # which it does not when the app is already running. A phone adb cannot ask fails.
+  id=$("$ADB" shell getprop dumpstate.last_id) || { echo "phone.sh: adb could not read dumpstate.last_id" >&2; exit 1; }
+  id=$(tr -d '\r' <<< "$id")
+  echo "${id:-0}"
   ;;
 app)
   # a fresh install: another build host signs with another debug key
