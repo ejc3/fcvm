@@ -2101,14 +2101,16 @@ the clone's GPU.
 
 ```json
 {"picture":"scene","screen":[720,1280],"copies":890,"scene_frames":294,"screen_frames":171,
- "torn":0,"implausible":0,"odd":290,"repeats":135,"verified":true,"shm_error":null,
+ "implausible":0,"odd":290,"repeats":135,"verified":true,"screen_error":null,"screen_connects":1,
  "app_connects":1,"app_error":null,
- "draw_to_capture_ms":{"p50":24.0,"p90":30.1,"n":300},
- "capture_to_sent_ms":{"p50":8.5,"p90":9.2,"n":300},"encode_ms":{"p50":5.1,"p90":5.2,"n":300}}
+ "draw_to_capture_ms":{"p50":36.3,"p90":36.6,"n":300},
+ "capture_to_sent_ms":{"p50":14.0,"p90":15.0,"n":300},"encode_ms":{"p50":4.6,"p90":4.7,"n":300}}
 ```
 
-`draw_to_capture_ms` is the emulator's copy time minus the scene time of the frame number
-the stamp names; `capture_to_sent_ms` is from that copy to the frame queued on every stream.
+`draw_to_capture_ms` is the time a screen image reached the streamer minus the scene time of
+the frame number the stamp names; `capture_to_sent_ms` is from then to the frame queued on
+every stream. `screen_error` is the last failure of the emulator's screen stream and
+`screen_connects` how many times it was opened.
 Each is over the last 300 frames.
 
 ### Which copies become frames
@@ -2120,9 +2122,8 @@ when all are at most 96, and anything else is no stamp. The stamp has no checksu
 number counts only when its `t` lies within 5 s of the copy's time on the scene clock; a
 screen whose bottom happens to show 32 black or white cells is not a frame of the scene.
 
-| one screen copy | what the streamer does |
+| one screen image (the gRPC stream delivers whole images) | what the streamer does |
 |---|---|
-| the emulator finished another frame while it was copied (`frameNumber` moved) | torn: dropped |
 | a stamp read and plausible, `k` even | a scene frame, sent once per `k`, stamped `t = k / 60` (the wall's 1/30 s grid) |
 | a stamp read and plausible, `k` odd | dropped: the app draws at 60 Hz, the wall at 30 |
 | no stamp (the app's bars over the band, another screen) | the screen: sent at most once per 1/30 s, stamped with the slot of its copy time |

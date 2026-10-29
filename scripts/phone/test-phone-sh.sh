@@ -60,8 +60,8 @@ EOF
 #!/bin/bash
 D=$FAKE_DIR
 if [ "$1" = fail ]; then echo "streamer fail: $2" >> "$D/log"; exit 0; fi
-echo "streamer serve" >> "$D/log"
 trap 'sleep 0.3; echo "streamer serve exited" >> "$D/log"; exit 0' TERM
+echo "streamer serve" >> "$D/log"
 while :; do
   [ -e "$PHONE_GO_FILE" ] && [ ! -e "$D/streaming" ] && { touch "$D/streaming"; echo "streamer streaming" >> "$D/log"; }
   sleep 0.05
@@ -69,7 +69,12 @@ done
 EOF
   cat > "$D/bin/nvidia-smi" <<'EOF'
 #!/bin/bash
-[ -n "${FAKE_NO_GPU:-}" ] && exit 3
+# a failed GPU query comes once the streamer serves (its TERM trap set), so the check that
+# failure mode waits for it to exit has a serving streamer to wait for
+if [ -n "${FAKE_NO_GPU:-}" ]; then
+  for _ in $(seq 1 500); do grep -q "streamer serve" "$FAKE_DIR/log" 2> /dev/null && break; sleep 0.01; done
+  exit 3
+fi
 echo "Tesla T4"
 EOF
   printf '#!/bin/sh\nexit 0\n' > "$D/bin/mountpoint"
