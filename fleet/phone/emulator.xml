@@ -2,8 +2,8 @@
 <!-- The Android Emulator's sources for the phone (scripts/phone/emulator.sh): AOSP's
      emu-main-dev with every project pinned to a commit, and external/qemu and
      hardware/google/gfxstream from the ejc3 forks that add the console's gpu release and
-     gpu retake. `repo manifest -r` of a synced tree, with those two projects moved
-     and the Linux toolchain projects added. -->
+     gpu retake, and gfxstream's mirror tap and GLES cap (the GPU mirror). `repo manifest -r`
+     of a synced tree, with those two projects moved and the Linux toolchain projects added. -->
 <manifest>
   <remote name="aosp" fetch="https://android.googlesource.com/"/>
   <remote name="github" fetch="https://github.com/"/>
@@ -59,7 +59,7 @@
   <project name="platform/external/wpa_supplicant_8" path="external/wpa_supplicant_8" revision="db64ab725acee6991a7ee9746d960731cca0b563"/>
   <project name="platform/external/zlib" path="external/zlib" revision="5a4f1701693dff36e495d13dd14b70e15abe0d01"/>
   <project name="platform/hardware/google/aemu" path="hardware/google/aemu" revision="6f34f9788fd595e597f191bece8fdaceed00d20a" groups="pdk"/>
-  <project name="ejc3/gfxstream" path="hardware/google/gfxstream" remote="github" revision="5b1155cd59132a5e838a9e615975d72bf2579294"/>
+  <project name="ejc3/gfxstream" path="hardware/google/gfxstream" remote="github" revision="795078822582db4a96451a4bb9d83d9a35264a1f"/>
   <project name="platform/prebuilts/android-emulator-build/archive" path="prebuilts/android-emulator-build/archive" revision="9b0bdade8b09267282fb901d21219ab6af013c60" clone-depth="1"/>
   <project name="platform/prebuilts/android-emulator-build/common" path="prebuilts/android-emulator-build/common" revision="1ebd9720117e7e3c495a1e1c43e069f1727d60d5" clone-depth="1"/>
   <project name="platform/prebuilts/android-emulator-build/mesa" path="prebuilts/android-emulator-build/mesa" revision="be7c00f399b415511d73308f0af0c0310512aced" clone-depth="1"/>

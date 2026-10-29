@@ -238,6 +238,15 @@ int main() {
     CHECK(!mirror_admits(a.keys, "v-4", tok, 999), "another viewer's token does not");
     CHECK(!mirror_admits(a.keys, "", tok, 999), "nobody holds the phone: no mirror");
     CHECK(!mirror_admits({}, "v-3", tok, 999), "no keys: no mirror, unlike /frames");
+    // A fleet with no broadcast sends no admit_keys (every /frames stream is open) but still
+    // sends the mirror its own keys.
+    PhoneScene open_fleet = parsed("{\"epoch_unix_ms\":1000,\"mirror_keys\":[\"" + key + "\"],\"mirror_viewer\":\"v-3\"}");
+    AdmitKeys frames, mk;
+    frames.on_scene(open_fleet);
+    mk.on_mirror_keys(open_fleet);
+    CHECK(frames.keys.empty() && frames.admits("", 999), "mirror_keys leave /frames open");
+    CHECK(mirror_admits(mk.keys, open_fleet.mirror_viewer, tok, 999), "and admit the holder to the mirror");
+    CHECK(!Json::parse(app_scene_line(open_fleet)).has("mirror_keys"), "the app is not sent them");
     CHECK(!mirror_admits(a.keys, "v-3", tok, 1001), "an expired token");
     std::string forged = tok;
     forged[forged.size() - 2] = forged[forged.size() - 2] == 'A' ? 'B' : 'A';
@@ -279,6 +288,34 @@ int main() {
     CHECK(z.in_bytes == all.size() && z.out_bytes < z.in_bytes / 4, "counted, and repetitive input shrinks: %llu of %llu",
           (unsigned long long)z.out_bytes, (unsigned long long)z.in_bytes);
     inflateEnd(&in);
+  }
+  {  // The mirror stream's teardown (source.cpp, PhoneSource::mirror), pinned at the source: no
+     // host test can make a viewer that stops reading, or post a scene between the token check
+     // and the stream's start.
+    std::string src = source_text("source.cpp");
+    size_t body = src.find("void PhoneSource::mirror(");
+    CHECK(body != std::string::npos, "source.cpp has PhoneSource::mirror");
+    std::string m = src.substr(body, src.find("\nbool PhoneSource::has_scene()", body) - body);
+    // the close frame is the writer's last message, and a writer still blocked after a bounded
+    // wait is freed by shutting the socket, all before the writer is joined
+    size_t queued = m.find("q.push_back(close_frame(code, reason));");
+    size_t bounded = m.find("wait_for(l, std::chrono::seconds(2)");
+    size_t freed = m.find("c.shutdown_both();", bounded);
+    size_t joined = m.rfind("writer.join();");
+    CHECK(queued != std::string::npos && bounded != std::string::npos && freed != std::string::npos &&
+              queued < bounded && bounded < freed && freed < joined,
+          "teardown: close frame queued, bounded wait, shutdown, then join");
+    // the holder is checked again with the generation, under one lock, before the stream starts
+    size_t gen = m.find("holder_gen = mirror_holder_gen_;");
+    size_t again = m.find("scene_.mirror_viewer == viewer", gen);
+    size_t refused = m.find("if (!still_holder)");
+    size_t opened = m.find("std::unique_lock<std::mutex> one(mirror_mu_");
+    CHECK(gen != std::string::npos && again != std::string::npos && refused != std::string::npos && again < refused &&
+              refused < opened,
+          "the holder is checked again with its generation before the stream starts");
+    // no thread is made with a bare std::thread constructor, which throws at a thread limit
+    CHECK(m.find("std::thread writer([") == std::string::npos && m.find("start_thread(") != std::string::npos,
+          "the stream's threads start with start_thread");
   }
   {  // percentiles
     Samples s;

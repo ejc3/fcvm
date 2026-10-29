@@ -48,7 +48,8 @@
 .phone-sheet .readouts dt { font-size: 12px; opacity: 0.7; }
 .phone-sheet .readouts dd { margin: 0; font-variant-numeric: tabular-nums; }
 .phone-sheet .readouts dd.detail { font-size: 12px; opacity: 0.8; }
-.phone-mirror { z-index: 2; border-radius: 4px; background: #06080b; }
+.phone-mirror { z-index: 2; border-radius: 4px; background: #06080b; overflow: hidden; }
+.phone-mirror canvas { display: block; width: 100%; height: 100%; }
 
 /* Narrow screens: the phone on top, the panel a bottom sheet under it (its top is set inline). */
 .phone-sheet.narrow { top: auto; left: 0; right: 0; bottom: 0; width: auto; max-width: none; border-radius: 16px 16px 0 0; border-bottom: 0; padding-bottom: env(safe-area-inset-bottom); }

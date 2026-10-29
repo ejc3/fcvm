@@ -960,8 +960,10 @@ none is placed). For each slot the agent reconciles:
   `/work`, the phone image running `phone.sh serve`; that names neither the slot nor the
   GPU, so every phone restores from one pre-start snapshot, and the AMI's warm snapshot is
   taken of a phone launched this way. Its scene is the shared scene with `rect`, its
-  rectangle of the phones' image, `image_aspect`, and `mirror_viewer` when a viewer holds the
-  phone (the only viewer the streamer's GPU mirror opens for, below); it gets no budget; its first frame is
+  rectangle of the phones' image, `image_aspect`, `mirror_viewer` when a viewer holds the
+  phone (the only viewer the streamer's GPU mirror opens for), and the scene's `mirror_keys`
+  (the coordinator's key for the mirror's tokens, sent with or without a broadcast; no other
+  slot gets them); it gets no budget; its first frame is
   the streamer's first frame of the app, a stamped scene frame or, zoomed out, a frame of its
   screen (`phone.scene_frames` plus `phone.screen_frames`; the streamer sends nothing before
   the app renders on the GPU). Each action of the
@@ -2128,19 +2130,20 @@ the clone's GPU.
   token one of them made.
 - `POST /scene`: the renderer's checks for `epoch_unix_ms` (required), `rect`,
   `image_aspect`, `layout_generation`, `rect_from_frame`, `previous_rect`, `admit_keys` and
-  `mirror_viewer` (at most 128 characters); `400` names a refused field. The streamer passes the
-  body without `admit_keys` and `mirror_viewer` to Robot
+  `mirror_viewer` (at most 128 characters) and `mirror_keys` (as `admit_keys`, but for the
+  mirror alone); `400` names a refused field. The streamer passes the body without
+  `admit_keys`, `mirror_keys` and `mirror_viewer` to Robot
   Park as its `scene` request with `"stamp": true` (PROTOCOL "Phone app"), again whenever a new one is posted, and sends it
   the host's `clock` every 2 s, over the app's control socket (127.0.0.1:7070 in the
   container, `PHONE_APP_PORT`), reconnecting when it closes.
 - `GET /mirror` (WebSocket): the GPU mirror (docs/fleet/ARCHITECTURE.md, "The GPU mirror"),
   for the viewer holding the phone only. The first message is `{"admit": "<direct token>"}` as
-  for `/frames`; the stream opens when the scene brought `admit_keys`, one of them made the
-  token, and the token names the scene's `mirror_viewer`, and is closed with 1008 otherwise
+  for `/frames`; the stream opens when one of the scene's `mirror_keys` or `admit_keys` made
+  the token and the token names the scene's `mirror_viewer`, and is closed with 1008 otherwise
   (no keys, nobody holds the phone, another viewer's token, an expired one). It relays the
   emulator's command-stream tap (gfxstream `host/mirror_tap.h`, on the container's Unix
   socket `MIRROR_SOCKET`, `/tmp/gfxstream-mirror.sock`): every render channel's guest-to-host
-  bytes and the start of every reply, as the tap's records, in binary messages of one raw
+  bytes and the first 4096 bytes of every reply, as the tap's records, in binary messages of one raw
   deflate stream (each message ends at a `Z_SYNC_FLUSH`, so `DecompressionStream("deflate-raw")`
   gives back every byte so far). The page never answers; the phone's GPU answers every call.
   It closes with 1000 when the scene names another holder or none, 1011 when the tap cannot

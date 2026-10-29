@@ -45,6 +45,8 @@ export interface MirrorStats {
 }
 
 interface ShareGroup {
+  /** Tells share groups apart in the state shadow: one name in two groups is two objects. */
+  id: number;
   textures: Map<number, WebGLTexture>;
   buffers: Map<number, WebGLBuffer>;
   renderbuffers: Map<number, WebGLRenderbuffer | ColorBuffer>;
@@ -93,6 +95,8 @@ interface Ctx {
   boundTex: Map<string, number>;
   activeUnit: number;
   program: number;
+  /** The guest's vertex array bound now (0: the context's own stand-in). */
+  vao: number;
   arrayBuffer: number;
   scratch: Map<number, WebGLBuffer>;
 }
@@ -106,8 +110,8 @@ interface Setting {
 /** A guest context's settable state, as the guest last set it. */
 class Shadow {
   readonly settings = new Map<string, Setting>();
-  set(key: string, value: unknown[], apply: () => void): void {
-    this.settings.set(key, { value: JSON.stringify(value), apply });
+  set(key: string, value: string, apply: () => void): void {
+    this.settings.set(key, { value, apply });
   }
 }
 
@@ -128,6 +132,35 @@ const u32s = (b: Uint8Array) => new Uint32Array(b.buffer.slice(b.byteOffset, b.b
 const num = (a: Arg | undefined) => (typeof a === "number" ? a : typeof a === "bigint" ? Number(a) : 0);
 const bytes = (a: Arg | undefined) => (a instanceof Uint8Array ? a : new Uint8Array(0));
 const text = (b: Uint8Array) => new TextDecoder().decode(b[b.length - 1] === 0 ? b.subarray(0, b.length - 1) : b);
+
+/**
+ * A composition layer's HWC transform as the affine map of its quad's corner q (0..1, x right,
+ * y with the display's top at 0) to the texture coordinate it samples, before the crop:
+ * [m00, m01, m10, m11, ox, oy], coord = (m00 q.x + m01 q.y + ox, m10 q.x + m11 q.y + oy).
+ * gfxstream's TextureDraw draws each transform from a vertex table (host/gl/texture_draw.cpp,
+ * kVertices); these are the same eight maps. FLIP_H 1, FLIP_V 2, ROT_90 4, ROT_180 3,
+ * ROT_270 7, FLIP_H_ROT_90 5, FLIP_V_ROT_90 6; anything else draws untransformed, as there.
+ */
+export function layerTransform(t: number): [number, number, number, number, number, number] {
+  switch (t) {
+    case 4:
+      return [0, -1, 1, 0, 1, 0]; // (1 - y, x)
+    case 3:
+      return [-1, 0, 0, -1, 1, 1]; // (1 - x, 1 - y)
+    case 7:
+      return [0, 1, -1, 0, 0, 1]; // (y, 1 - x)
+    case 1:
+      return [-1, 0, 0, 1, 1, 0]; // (1 - x, y)
+    case 2:
+      return [1, 0, 0, -1, 0, 1]; // (x, 1 - y)
+    case 5:
+      return [0, 1, 1, 0, 0, 0]; // (y, x)
+    case 6:
+      return [0, -1, -1, 0, 1, 1]; // (1 - y, 1 - x)
+    default:
+      return [1, 0, 0, 1, 0, 0];
+  }
+}
 
 /** A guest shader in GLSL ES that WebGL2 compiles: external samplers become 2D samplers. */
 export function webglShaderSource(src: string): string {
@@ -168,9 +201,28 @@ export class GlMirror {
   private readonly surfaces = new Map<number, Surface>();
   private readonly images = new Map<number, WebGLTexture>();
   private current: Ctx | null = null;
+  /**
+   * The mirror's own drawing (composition, posts, uploads) changed GL state behind the
+   * contexts' shadows: the next context to draw puts all of its state back, and every other
+   * setting a context ever made back to its default.
+   */
+  private dirty = false;
+  /** Every setting key any context has made, for the defaults a dirty switch restores. */
+  private readonly allKeys = new Set<string>();
+  private nextShareId = 1;
   private readonly handlers = new Map<string, Handler>();
   private readonly replyHandlers = new Map<string, ReplyHandler>();
-  private blit: { prog: WebGLProgram; vao: WebGLVertexArrayObject; uSrc: WebGLUniformLocation | null; uRect: WebGLUniformLocation | null; uUv: WebGLUniformLocation | null; uColor: WebGLUniformLocation | null; uMode: WebGLUniformLocation | null } | null = null;
+  private blit: {
+    prog: WebGLProgram;
+    vao: WebGLVertexArrayObject;
+    uSrc: WebGLUniformLocation | null;
+    uRect: WebGLUniformLocation | null;
+    uUv: WebGLUniformLocation | null;
+    uColor: WebGLUniformLocation | null;
+    uMode: WebGLUniformLocation | null;
+    uXm: WebGLUniformLocation | null;
+    uXo: WebGLUniformLocation | null;
+  } | null = null;
   private readonly nowMs: () => number;
   private readonly gl: GL;
 
@@ -270,20 +322,29 @@ export class GlMirror {
   // ---- contexts ------------------------------------------------------------------------
 
   private newShare(): ShareGroup {
-    return { textures: new Map(), buffers: new Map(), renderbuffers: new Map(), samplers: new Map(), shaders: new Map(), programs: new Map() };
+    return {
+      id: this.nextShareId++,
+      textures: new Map(),
+      buffers: new Map(),
+      renderbuffers: new Map(),
+      samplers: new Map(),
+      shaders: new Map(),
+      programs: new Map(),
+    };
   }
 
   /** Puts `ctx`'s state into WebGL2: every setting that differs from what is there now. */
   private makeCurrent(ctx: Ctx): void {
-    if (this.current === ctx) return;
-    const prev = this.current;
+    if (this.current === ctx && !this.dirty) return;
+    // after the mirror's own drawing nothing in GL is any context's: compare with nothing
+    const prev = this.dirty ? null : this.current;
     this.current = ctx;
+    this.dirty = false;
     const gl = this.gl;
     const next = ctx.shadow.settings;
-    // settings the previous context had and this one never set go back to their defaults
-    if (prev) {
-      for (const [k] of prev.shadow.settings) if (!next.has(k)) this.defaultOf(k)?.();
-    }
+    // settings this context never made go back to their defaults: those the previous context
+    // made, or with no previous context to trust, every one any context made
+    for (const k of prev ? prev.shadow.settings.keys() : this.allKeys) if (!next.has(k)) this.defaultOf(k)?.();
     let unit: Setting | undefined;
     for (const [k, s] of next) {
       if (k === "activeTexture") {
@@ -294,7 +355,7 @@ export class GlMirror {
       s.apply();
     }
     // per-context objects that WebGL2 holds globally
-    gl.bindVertexArray(this.vaoOf(ctx, num(JSON.parse(next.get("vao")?.value ?? "[0]")[0])));
+    gl.bindVertexArray(this.vaoOf(ctx, ctx.vao));
     gl.bindFramebuffer(GL_DRAW_FRAMEBUFFER, this.fboOf(ctx, ctx.boundFbo.draw, true));
     gl.bindFramebuffer(GL_READ_FRAMEBUFFER, this.fboOf(ctx, ctx.boundFbo.read, false));
     if (unit) unit.apply();
@@ -435,8 +496,25 @@ export class GlMirror {
       const k = key(a, ctx);
       const run = () => apply(a, ctx);
       run();
-      ctx.shadow.set(k, a.map((x) => (x instanceof Uint8Array ? Array.from(x) : typeof x === "bigint" ? x.toString() : x)), run);
+      this.shadowSet(ctx, k, name, a, run);
     });
+  }
+
+  /**
+   * Keeps a setting in the context's shadow. Its value names the call and the share group as
+   * well as the arguments: glEnable(BLEND) and glDisable(BLEND) are one key with two values,
+   * and buffer 1 of two share groups is two buffers.
+   */
+  private shadowSet(ctx: Ctx, key: string, call: string, args: readonly (Arg | number)[], apply: () => void): void {
+    const v = args.map((x) => (x instanceof Uint8Array ? Array.from(x) : typeof x === "bigint" ? x.toString() : x));
+    ctx.shadow.set(key, `${call}${JSON.stringify(v)}@${ctx.share.id}`, apply);
+    this.allKeys.add(key);
+  }
+
+  /** For the tests: the state shadow's key and value set (key -> value) of a context. */
+  shadowOf(handle: number): Map<string, string> | null {
+    const c = this.contexts.get(handle);
+    return c ? new Map([...c.shadow.settings].map(([k, s]) => [k, s.value])) : null;
   }
 
   private install(): void {
@@ -463,6 +541,7 @@ export class GlMirror {
         boundTex: new Map(),
         activeUnit: 0,
         program: 0,
+        vao: 0,
         arrayBuffer: 0,
         scratch: new Map(),
       });
@@ -479,7 +558,7 @@ export class GlMirror {
         ctx.draw = this.surfaces.get(n(a[1])) ?? null;
         ctx.read = this.surfaces.get(n(a[2])) ?? null;
         // a context made current again on another surface rebinds its framebuffer 0
-        if (this.current === ctx) this.current = null;
+        if (this.current === ctx) this.dirty = true;
       }
     };
     this.on("rcMakeCurrent", makeCurrent);
@@ -777,17 +856,23 @@ export class GlMirror {
       prev(c, a, call);
       const ctx = c.ctx!;
       const unit = ctx.activeUnit;
-      const t = this.tex(ctx, n(a[1]));
+      const name = n(a[1]);
       const target = this.target(n(a[0]));
-      ctx.shadow.set(`tex:${unit}:${target}`, [unit, target, n(a[1])], () => {
+      // the name's object is looked up when the binding is put back: an EGL image or a color
+      // buffer may have replaced it since (rcBindTexture, glEGLImageTargetTexture2DOES)
+      this.shadowSet(ctx, `tex:${unit}:${target}`, "glBindTexture", [unit, target, name], () => {
         gl.activeTexture(GL_TEXTURE0 + unit);
-        gl.bindTexture(target, t);
+        gl.bindTexture(target, this.tex(ctx, name));
         gl.activeTexture(GL_TEXTURE0 + ctx.activeUnit);
       });
     })(this.handlers.get("glBindTexture")!));
     this.setting("glBindSampler", (a) => `sampler:${n(a[0])}`, (a, ctx) => gl.bindSampler(n(a[0]), ctx.share.samplers.get(n(a[1])) ?? null));
-    this.setting("glBindVertexArray", () => "vao", (a, ctx) => gl.bindVertexArray(this.vaoOf(ctx, n(a[0]))));
-    this.setting("glBindVertexArrayOES", () => "vao", (a, ctx) => gl.bindVertexArray(this.vaoOf(ctx, n(a[0]))));
+    // the vertex array is put back by makeCurrent from the context's own record
+    for (const f of ["glBindVertexArray", "glBindVertexArrayOES"])
+      this.on(f, (c, a) => {
+        c.ctx!.vao = n(a[0]);
+        gl.bindVertexArray(this.vaoOf(c.ctx!, n(a[0])));
+      });
     this.on("glBindFramebuffer", (c, a) => {
       const ctx = c.ctx!;
       const t = n(a[0]);
@@ -1046,7 +1131,7 @@ export class GlMirror {
             ? gl.stencilOpSeparate(f, v[0]!, v[1]!, v[2]!)
             : gl.stencilMaskSeparate(f, v[0]!);
       run();
-      ctx.shadow.set(`stencil${kind}:${f}`, v, run);
+      this.shadowSet(ctx, `stencil${kind}:${f}`, `stencil${kind}`, v, run);
     }
   }
 
@@ -1127,7 +1212,7 @@ export class GlMirror {
       gl.texSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, 0x1908, 0x1401, px);
     }
     // the guest's unpack state is put back on the next context switch
-    this.current = null;
+    this.dirty = true;
   }
 
   private withTexture(t: WebGLTexture, f: () => void): void {
@@ -1136,18 +1221,18 @@ export class GlMirror {
     gl.bindTexture(GL_TEXTURE_2D, t);
     f();
     gl.bindTexture(GL_TEXTURE_2D, null);
-    this.current = null;
+    this.dirty = true;
   }
 
   private withFbo(f: WebGLFramebuffer, g: () => void): void {
     this.gl.bindFramebuffer(GL_FRAMEBUFFER, f);
     g();
-    this.current = null;
+    this.dirty = true;
   }
 
   private restoreRbo(): void {
     this.gl.bindRenderbuffer(GL_RENDERBUFFER, null);
-    this.current = null;
+    this.dirty = true;
   }
 
   // ---- composition and posts -------------------------------------------------------------
@@ -1156,11 +1241,12 @@ export class GlMirror {
     if (this.blit) return this.blit;
     const gl = this.gl;
     const vs = `#version 300 es
-in vec2 p; uniform vec4 rect; uniform vec4 uv; out vec2 t;
-void main() { vec2 q = p * 0.5 + 0.5; t = uv.xy + q * uv.zw; gl_Position = vec4(rect.xy + q * rect.zw, 0.0, 1.0) * vec4(2.0, 2.0, 1.0, 1.0) - vec4(1.0, 1.0, 0.0, 0.0); }`;
+in vec2 p; uniform vec4 rect; uniform vec4 uv; uniform mat2 xm; uniform vec2 xo; out vec2 t;
+void main() { vec2 q = p * 0.5 + 0.5; t = uv.xy + (xm * q + xo) * uv.zw; gl_Position = vec4(rect.xy + q * rect.zw, 0.0, 1.0) * vec4(2.0, 2.0, 1.0, 1.0) - vec4(1.0, 1.0, 0.0, 0.0); }`;
     const fs = `#version 300 es
 precision highp float; in vec2 t; uniform sampler2D src; uniform vec4 color; uniform int mode; out vec4 o;
 void main() { o = mode == 1 ? color : texture(src, t) * color.a; }`;
+    // mode 1: a solid colour, already multiplied by the layer's alpha; else the texture times it
     const sh = (type: number, src: string) => {
       const s = gl.createShader(type)!;
       gl.shaderSource(s, src);
@@ -1187,6 +1273,8 @@ void main() { o = mode == 1 ? color : texture(src, t) * color.a; }`;
       uUv: gl.getUniformLocation(prog, "uv"),
       uColor: gl.getUniformLocation(prog, "color"),
       uMode: gl.getUniformLocation(prog, "mode"),
+      uXm: gl.getUniformLocation(prog, "xm"),
+      uXo: gl.getUniformLocation(prog, "xo"),
     };
     return this.blit;
   }
@@ -1199,7 +1287,7 @@ void main() { o = mode == 1 ? color : texture(src, t) * color.a; }`;
     gl.bindSampler(0, null);
     gl.activeTexture(GL_TEXTURE0);
     gl.pixelStorei(0x0cf5, 4);
-    this.current = null;
+    this.dirty = true;
   }
 
   /** HWC's host composition (rcCompose): each layer drawn into the target color buffer. */
@@ -1245,21 +1333,29 @@ void main() { o = mode == 1 ? color : texture(src, t) * color.a; }`;
       const blend = v.getInt32(at + 40, true);
       const alpha = v.getFloat32(at + 44, true);
       const color = [0, 1, 2, 3].map((k) => v.getUint8(at + 48 + k) / 255) as [number, number, number, number];
-      // premultiplied (2) and coverage (3) blending; none (1) replaces
-      if (blend === 1) gl.blendFunc(1, 0);
-      else if (blend === 3) gl.blendFuncSeparate(0x0302, 0x0303, 1, 0x0303);
-      else gl.blendFunc(1, 0x0303);
+      const transform = v.getInt32(at + 52, true);
+      // As gfxstream's TextureDraw::drawLayer: device layers and solid colours only, blending
+      // none (1) or premultiplied (2); anything else the phone's composer skips too.
+      if ((mode !== 2 && mode !== 3) || (blend !== 1 && blend !== 2)) continue;
+      if (mode === 2 && !cb) continue;
+      if (blend === 1) gl.disable(0x0be2);
+      else {
+        gl.enable(0x0be2);
+        gl.blendFunc(1, 0x0303);
+      }
       gl.uniform4f(q.uRect, l / target.w, t / target.h, (r - l) / target.w, (b - t) / target.h);
+      const [m00, m01, m10, m11, ox, oy] = layerTransform(transform);
+      // column-major: xm * q = (m00 q.x + m01 q.y, m10 q.x + m11 q.y)
+      gl.uniformMatrix2fv(q.uXm, false, [m00, m10, m01, m11]);
+      gl.uniform2f(q.uXo, ox, oy);
       if (mode === 3) {
         gl.uniform1i(q.uMode, 1);
-        gl.uniform4f(q.uColor, color[0], color[1], color[2], color[3] * alpha);
-      } else if (cb) {
+        gl.uniform4f(q.uColor, color[0] * alpha, color[1] * alpha, color[2] * alpha, color[3] * alpha);
+      } else {
         gl.uniform1i(q.uMode, 0);
         gl.uniform4f(q.uColor, 1, 1, 1, alpha);
-        gl.uniform4f(q.uUv, cl / cb.w, ct / cb.h, (cr - cl) / cb.w, (cbm - ct) / cb.h);
-        gl.bindTexture(GL_TEXTURE_2D, cb.tex);
-      } else {
-        continue;
+        gl.uniform4f(q.uUv, cl / cb!.w, ct / cb!.h, (cr - cl) / cb!.w, (cbm - ct) / cb!.h);
+        gl.bindTexture(GL_TEXTURE_2D, cb!.tex);
       }
       gl.drawArrays(0x0005, 0, 4);
     }
@@ -1291,6 +1387,8 @@ void main() { o = mode == 1 ? color : texture(src, t) * color.a; }`;
     gl.uniform4f(q.uColor, 1, 1, 1, 1);
     gl.uniform4f(q.uRect, 0, 0, 1, 1);
     gl.uniform4f(q.uUv, 0, 0, 1, 1);
+    gl.uniformMatrix2fv(q.uXm, false, [1, 0, 0, 1]);
+    gl.uniform2f(q.uXo, 0, 0);
     gl.bindTexture(GL_TEXTURE_2D, cb.tex);
     gl.drawArrays(0x0005, 0, 4);
     this.stats.posts++;

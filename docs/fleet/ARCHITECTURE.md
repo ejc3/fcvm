@@ -1050,9 +1050,12 @@ fence did so through a reply, and the reply is copied after the bytes that prece
 other channel. Replies are needed because the server, not the guest, makes object names
 (`glGenTextures`, `glCreateProgram`, `rcCreateColorBuffer`, `rcCreateContext`, uniform
 locations): the mirror reads each name from the reply instead of making its own, so it never
-depends on two threads' names coming out in the same order. A reply past 256 bytes (a
-readback, a read map) is cut to its first 256 bytes; the mirror needs none of its data, and
-the counter still counts it. DMA uploads (`rcUpdateColorBufferDMA`) would carry a guest address, not
+depends on two threads' names coming out in the same order. A reply past 4096 bytes (a
+readback, a read map) is cut to its first 4096 bytes, which every reply that returns names
+fits in; the mirror needs none of a readback's data, and the counter still counts it. The tap
+hooks the pipe transport's `ChannelStream`, the transport this image uses; a render thread on
+address space graphics (`RingStream`) sends the mirror its calls but not its replies, so a
+phone on that transport is not mirrored. DMA uploads (`rcUpdateColorBufferDMA`) would carry a guest address, not
 the bytes; the tap does not follow it. The captures below hold none (this image creates its
 color buffers with `rcCreateColorBufferDMA`, which carries no pixels, and uploads none by
 DMA), and the mirror counts any it meets.
@@ -1129,8 +1132,9 @@ launcher) are not drawn and are counted.
   for that copy; a full ring stops the copy with an `OVERFLOW` record, and the consumer starts
   it again. The sender thread alone waits on the socket.
 - The streamer's queue toward the viewer is bounded (8 MiB). A viewer behind it is closed with
-  1013 ("join again"), and the page rejoins; rejoins are limited to one every 10 s, and a
-  mirror that cannot keep up falls back to video.
+  1013 ("join again"), and the page rejoins, at most once every 10 s. The page bounds its own
+  side too: 16 MiB handed to the inflater and not yet decoded ends the stream the same way, as
+  does an `OVERFLOW` record from the tap (the stream then has a gap).
 - The wire is one raw deflate stream per connection, each message flushed to a byte boundary,
   so the page's single `DecompressionStream("deflate-raw")` gives back every byte as it
   arrives. The bandwidth shown is the WebSocket messages' bytes. Level 1 shrinks the
@@ -1144,8 +1148,10 @@ launcher) are not drawn and are counted.
 same listeners. The first message is `{"admit": "<direct token>"}`, as for `/frames`, and the
 URL carries none. It opens only when the coordinator's keys made the token and the token
 names the viewer holding the phone: the coordinator puts the holder in the phone's scene
-(`mirror_viewer`), the agent passes it to the streamer, and the streamer closes an open mirror
-when the holder changes. No keys, no holder or another viewer's token: closed with 1008. One
+(`mirror_viewer`) and its key in `mirror_keys`, which it sends with or without a broadcast
+(without one, `admit_keys` is empty and direct streams stay open, but the mirror is still the
+holder's alone); the agent passes both to the phone's streamer, and the streamer ends an open
+mirror, its writer included, when the holder changes. No keys, no holder or another viewer's token: closed with 1008. One
 mirror per phone at a time (the tap has one consumer).
 
 **6. Test plan.**
@@ -1192,6 +1198,14 @@ Robot Park stream, 87 percent is the app's own channel, and most of that is unif
 count on the decoder side (`docs/fleet/phone-gpu-remoting.md`) measured 0.90 MB/s from the
 app, 240 replies a second for the whole system, and matched `strace` in the guest to the
 byte (26,191,079 bytes and 1,739 replies over 29 s).
+
+The mirror is not always the cheaper stream. The same measurement over ten workloads
+(ejc3/fcvm#1438) found UI at 0.1 to 1.3 Mbit/s of compressed commands against 0.47 to 4.3
+Mbit/s of video, but Firefox at 15 to 240 Mbit/s (it unmaps whole buffer ranges, about 1 MB
+each, 105 to 117 MB/s raw) and SuperTuxKart at 168 Mbit/s (client-side vertex arrays) against
+1 to 2.7 Mbit/s of video, and VLC's video does not pass through GL at all (the host decodes
+it), so a mirror of it shows no picture. The panel's readouts show which it is for the phone
+in front of the viewer; an app like those two belongs in the video view.
 
 **Pixel match.** The capture in `fleet/web/e2e/fixtures/mirror/robotpark` (6.5 s, the mirror
 joined by an app restart 1 s in) replayed in headless Chrome, against the T4's screenshots of

@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { megabytes, mbits, RateMeter } from "../meter.ts";
@@ -140,5 +141,18 @@ describe("the take-over panel's meter", () => {
     expect(mbits(25_000_000)).toBe("200");
     expect(megabytes(12_345_678)).toBe("12.3 MB");
     expect(megabytes(2_500_000_000)).toBe("2.50 GB");
+  });
+});
+
+describe("the phones page's mirror canvas", () => {
+  // Pinned at the source: no test runs the page under React's Strict Mode, which runs a mount
+  // twice, and a canvas can be transferred to a worker only once.
+  it("is made by each mount and removed with it, never a rendered canvas transferred again", () => {
+    const src = readFileSync(`${root}app/_wall/Phones.tsx`, "utf8");
+    const effect = src.slice(src.indexOf("const mirrorHostRef"), src.indexOf("const m = view.mirror;"));
+    expect(effect).toContain('document.createElement("canvas")');
+    expect(effect).toContain("c.transferControlToOffscreen()");
+    expect(effect).toContain("c.remove()");
+    expect(src).not.toMatch(/<canvas[^>]*ref=\{mirror/);
   });
 });

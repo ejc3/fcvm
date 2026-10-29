@@ -55,6 +55,8 @@ pub enum Cmd {
     /// The admission keys (hex, newest first) renderers and aggregators check direct
     /// tokens with; empty turns the check off.
     AdmitKeys(Vec<String>),
+    /// The keys phone streamers check GPU mirror tokens with (hex, newest first).
+    MirrorKeys(Vec<String>),
     /// Apply an event; its `at` is replaced with the actor's clock. Replies with the
     /// receipt for an intent.
     Apply {
@@ -148,6 +150,8 @@ pub struct Actor {
     ec2_aggregate_local: Option<String>,
     /// The admission keys every scene and layout carries (empty: no check).
     admit_keys: Vec<String>,
+    /// The GPU mirror's keys, in every scene for the phones (see `SharedScene::mirror_keys`).
+    mirror_keys: Vec<String>,
     out: Outputs,
     agents: HashMap<u64, AgentConn>,
     last_at: u64,
@@ -157,6 +161,19 @@ pub struct Actor {
     /// the report's id, and the state version that holds the report.
     unacked: Vec<(String, String, Option<String>, u64)>,
     clock: Box<dyn Fn() -> u64 + Send>,
+}
+
+/// The keys the coordinator hands out at start: the direct-stream keys (only with a broadcast,
+/// whose seats they enforce) and the GPU mirror's (always: the mirror is the holder's alone).
+pub fn admission_keys(broadcast: bool, key_hex: String) -> (Vec<String>, Vec<String>) {
+    (
+        if broadcast {
+            vec![key_hex.clone()]
+        } else {
+            Vec::new()
+        },
+        vec![key_hex],
+    )
 }
 
 pub fn snapshot_of(state: &State) -> Arc<Snapshot> {
@@ -175,6 +192,7 @@ impl Actor {
         let mut actor = Actor {
             ec2_aggregate_local: None,
             admit_keys: Vec::new(),
+            mirror_keys: Vec::new(),
             stored: state.version,
             published: state.version,
             state,
@@ -270,6 +288,7 @@ impl Actor {
         let regions = host_regions(&self.state);
         let mut scene = shared_scene(&self.state);
         scene.admit_keys = self.admit_keys.clone();
+        scene.mirror_keys = self.mirror_keys.clone();
         self.out.scene.send_if_modified(|cur| {
             let changed = cur.as_ref() != Some(&scene);
             *cur = Some(scene.clone());
@@ -434,6 +453,10 @@ impl Actor {
             }
             Cmd::AdmitKeys(keys) => {
                 self.admit_keys = keys;
+                self.dispatch_agents();
+            }
+            Cmd::MirrorKeys(keys) => {
+                self.mirror_keys = keys;
                 self.dispatch_agents();
             }
             Cmd::PosterPlan { reply } => {
@@ -773,6 +796,11 @@ impl Handle {
     /// Have renderers and aggregators check direct tokens made with these keys.
     pub async fn set_admit_keys(&self, keys: Vec<String>) {
         let _ = self.cmds.send(Cmd::AdmitKeys(keys)).await;
+    }
+
+    /// Have phone streamers check GPU mirror tokens made with these keys.
+    pub async fn set_mirror_keys(&self, keys: Vec<String>) {
+        let _ = self.cmds.send(Cmd::MirrorKeys(keys)).await;
     }
 
     pub async fn poster_plan(&self) -> Option<poster::Plan> {
@@ -1281,10 +1309,11 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         encoder,
     ));
     // With a broadcast, direct streams are for seated viewers only: renderers and aggregators
-    // check the direct token made with this key. Without one, nothing is checked.
-    if gate.seats.capacity().is_some() {
-        handle.set_admit_keys(vec![gate.key.hex()]).await;
-    }
+    // check the direct token made with this key. Without one, nothing is checked. The GPU
+    // mirror is checked either way: only a phone's holder receives it.
+    let (admit, mirror) = admission_keys(gate.seats.capacity().is_some(), gate.key.hex());
+    handle.set_admit_keys(admit).await;
+    handle.set_mirror_keys(mirror).await;
     let cfg = live::LiveConfig {
         checker,
         allowed_origins: args.allowed_origins,

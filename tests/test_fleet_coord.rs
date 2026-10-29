@@ -5953,6 +5953,57 @@ async fn the_broadcast_never_streams_a_borrowed_tile() {
     }
 }
 
+/// The GPU mirror's key is handed out with or without a broadcast, and reaches the agents'
+/// scenes (which give it to phones only) but no browser; direct streams stay unchecked
+/// without a broadcast.
+#[tokio::test]
+async fn mirror_keys_reach_phones_with_or_without_a_broadcast() {
+    use fcvm::fleet::coord::admission_keys;
+    let key = "cd".repeat(32);
+    assert_eq!(
+        admission_keys(false, key.clone()),
+        (vec![], vec![key.clone()])
+    );
+    assert_eq!(
+        admission_keys(true, key.clone()),
+        (vec![key.clone()], vec![key.clone()])
+    );
+    let config = Config {
+        max_tiles: 1,
+        fcvm_tiles: 1,
+        ..Config::default()
+    };
+    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None, None);
+    let (admit, mirror) = admission_keys(false, key.clone());
+    handle.set_admit_keys(admit).await;
+    handle.set_mirror_keys(mirror).await;
+    let mut a = FakeAgent::connect(&handle, "gpu-a", 1);
+    let scene = loop {
+        if let CoordMsg::Scene(s) = a.next().await {
+            if !s.mirror_keys.is_empty() {
+                break s;
+            }
+        }
+    };
+    assert_eq!(scene.mirror_keys, vec![key.clone()]);
+    assert!(
+        scene.admit_keys.is_empty(),
+        "no broadcast: direct streams stay open"
+    );
+    let body = scene.for_renderer(fleet_core::tiling::Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    });
+    assert!(
+        body.mirror_keys.is_empty(),
+        "a renderer's body never carries them"
+    );
+    let text = handle.snapshot.borrow().text.clone();
+    assert!(!text.contains(&key), "a snapshot carries the mirror's key");
+}
+
 /// The coordinator's admission keys reach every renderer through the scene the agents post,
 /// and the broadcast aggregator through its layout, and never appear in a snapshot.
 #[tokio::test]

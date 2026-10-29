@@ -31,10 +31,17 @@ export interface MirrorStatsMsg {
   pixel: number[] | null;
   /** The last stamp read from a posted frame (Robot Park's frame number k, scene time k/60 s), and when (local ms). */
   stamp: { k: number; at: number } | null;
+  /** The mirror's picture (the screen it last drew), for the page's layout of a turned phone. */
+  width: number;
+  height: number;
 }
 
 export type MirrorOut =
   | MirrorStatsMsg
   /** The tap's HELLO arrived: the copy runs, and the app can be restarted into it. */
   | { type: "joined" }
-  | { type: "closed"; code: number; reason: string };
+  | { type: "closed"; code: number; reason: string }
+  /** The canvas has WebGL2: the mirror can open. */
+  | { type: "ready" }
+  /** It has not: the page keeps the video. */
+  | { type: "unavailable"; reason: string };
