@@ -51,6 +51,19 @@ export function frameWallMs(f: ShownFrame, localNow: number): number {
   return f.e + 1000 * f.t + Math.min(Math.max(localNow - f.at, 0), SHOWN_ADVANCE_MAX_MS);
 }
 
+/**
+ * The presented frame, if it belongs to the fleet's current waking: none while the fleet is
+ * not awake, and none from before it last woke. Everything the broadcast drives (the overlay's
+ * delay, the recording leaving, the LIVE badge) then waits for a frame of this waking, and
+ * the wake progress runs on live time.
+ */
+export function currentFrame(s: ClientState, frame: ShownFrame | null): ShownFrame | null {
+  const power = s.accepted?.fleet.power;
+  if (frame === null || power === undefined || power.state !== "awake") return null;
+  if (power.woke_at !== null && frame.e + 1000 * frame.t < power.woke_at) return null;
+  return frame;
+}
+
 /** How far the picture is behind the coordinator, ms. */
 export function broadcastLatencyMs(f: ShownFrame, clock: ClockState, localNow: number): number {
   return serverNow(clock, localNow) - frameWallMs(f, localNow);
@@ -82,7 +95,9 @@ export function broadcastShown(
   const entry = kept || pinned === null ? snapshotAt(s.history, wall) : pinned;
   const now = localNow - (serverNow(s.clock, localNow) - wall);
   if (entry === null) return { state: s, now, entry: null };
-  const st = entry.state;
+  // The picture's overlays are the frame's, but whether the fleet is awake is the live
+  // state's: a sleeping fleet sends no frame that could bring its sleep to the overlay.
+  const st = s.accepted ? { ...entry.state, fleet: { ...entry.state.fleet, power: s.accepted.fleet.power } } : entry.state;
   return {
     state: {
       ...s,
@@ -142,6 +157,21 @@ function trim<V>(m: Map<number, V>): void {
  */
 export function inputScene(s: ClientState, pinned: HistoryEntry | null): FleetState | null {
   return watchesBroadcast(s) && pinned !== null ? pinned.state : s.accepted;
+}
+
+/**
+ * `f`, run once and its result kept, unless it fails: the next call runs it again (a player
+ * script that loaded without defining its global, a network error).
+ */
+export function memoUntilFailure<T>(f: () => Promise<T>): () => Promise<T> {
+  let kept: Promise<T> | null = null;
+  return () => {
+    kept ??= f().catch((e: unknown) => {
+      kept = null;
+      throw e;
+    });
+    return kept;
+  };
 }
 
 /** The broadcast switch in the drawer. */

@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   addHistory,
   FrameMatcher,
+  currentFrame,
   inputScene,
+  memoUntilFailure,
   broadcastShown,
   broadcastToggle,
   frameWallMs,
@@ -277,5 +279,63 @@ describe("input placed on the broadcast", () => {
     expect(inputScene(late, null)).toBe(late.accepted);
     const seated = withSnapshots(admission(), [live]);
     expect(inputScene(seated, pinned)).toBe(seated.accepted);
+  });
+});
+
+describe("the broadcast's lifecycle", () => {
+  it("follows the live power state while the picture shows an older frame", () => {
+    const awake = fleet();
+    const asleep = fleet(2, 2, { fleet: { ...awake.fleet, power: { ...awake.fleet.power, state: "asleep" } } });
+    let s = withSnapshots(admission(LATE), [awake]);
+    const frame = { t: (serverNow(s.clock, EPOCH) - EPOCH) / 1000, e: EPOCH, at: EPOCH };
+    // The page pins what it drew for the last frame; no later frame comes once the fleet sleeps.
+    const pinned = broadcastShown(s, frame, EPOCH).entry;
+    s = reduce(s, { type: "message", text: snapshotText(2, asleep), at: EPOCH + 62_000 });
+    const shown = broadcastShown({ ...s, ui: { ...s.ui, reelOn: true } }, frame, EPOCH + 62_000, pinned);
+    expect(shown.state.accepted!.fleet.power.state).toBe("asleep");
+    const v = wallView({ state: shown.state, now: shown.now, dpr: 1, mosaicArea: { x: 0, y: 0, w: 1600, h: 930 }, canDecode: true, phone: false, media: { base: "/media", meta: null }, broadcastLatencyMs: 1800 });
+    expect(v.sleep).not.toBeNull();
+    expect(v.reel?.show).toBe(true);
+    expect(v.live).toBe(false);
+  });
+
+  it("pauses the player while the tab's streams are suspended", () => {
+    const late = withSnapshots(admission(LATE), [fleet()]);
+    expect(view({ ...late, ui: { ...late.ui, suspended: true } }).broadcast?.paused).toBe(true);
+  });
+
+  it("loads the player again after a failed load", async () => {
+    let calls = 0;
+    const load = memoUntilFailure(async () => {
+      calls++;
+      if (calls === 1) throw new Error("no IVSPlayer");
+      return "player";
+    });
+    await expect(load()).rejects.toThrow("no IVSPlayer");
+    await expect(load()).resolves.toBe("player");
+    await expect(load()).resolves.toBe("player");
+    expect(calls).toBe(2);
+  });
+});
+
+describe("a frame from before the fleet slept", () => {
+  function wokeAt(at: number, state: "awake" | "waking"): FleetState {
+    const st = fleet();
+    return { ...st, fleet: { ...st.fleet, power: { ...st.fleet.power, state, woke_at: at } } };
+  }
+  const old = { t: 10, e: EPOCH, at: EPOCH };
+
+  it("is no frame once the fleet has slept and woken: the recording stays until a new one", () => {
+    const s = withSnapshots(admission(LATE), [wokeAt(EPOCH + 60_000, "awake")]);
+    expect(currentFrame(s, old)).toBeNull();
+    const fresh = { t: 70, e: EPOCH, at: EPOCH + 70_000 };
+    expect(currentFrame(s, fresh)).toEqual(fresh);
+  });
+
+  it("is no frame while the fleet wakes, so the wake clock runs on live time", () => {
+    const s = withSnapshots(admission(LATE), [wokeAt(EPOCH + 60_000, "waking")]);
+    expect(currentFrame(s, old)).toBeNull();
+    const shown = broadcastShown(s, currentFrame(s, old), EPOCH + 65_000);
+    expect(shown.now).toBe(EPOCH + 65_000);
   });
 });
