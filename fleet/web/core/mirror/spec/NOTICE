@@ -1,0 +1,8 @@
+These six files are copied unchanged from gfxstream (codegen/gles2 and codegen/renderControl),
+at commit 5b1155cd59132a5e838a9e615975d72bf2579294 of ejc3/gfxstream, a fork of
+https://android.googlesource.com/platform/hardware/google/gfxstream. They are the emugen
+specs gfxstream generates its GLES 2/3 and renderControl encoders and decoders from.
+scripts/gen-mirror-table.ts reads them to write ../table.ts.
+
+Copyright The Android Open Source Project. Licensed under the Apache License, Version 2.0:
+http://www.apache.org/licenses/LICENSE-2.0
