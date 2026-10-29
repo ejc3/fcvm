@@ -4,7 +4,60 @@
 
 import { GLES2, GLES2_BASE, RENDER_CONTROL, RENDER_CONTROL_BASE, type WireCall } from "./table.ts";
 
-export const RECORD = { hello: 1, open: 2, close: 3, data: 4, reply: 5, overflow: 6 } as const;
+export const RECORD = { hello: 1, open: 2, close: 3, data: 4, reply: 5, overflow: 6, join: 7 } as const;
+
+/**
+ * The parts of a join snapshot (JOIN records, their kind in aux): the renderer's state when the
+ * copy started, between the HELLO and the first live record. mirror_tap.h has the layout.
+ */
+export const JOIN_PART = { begin: 1, colorBuffer: 2, end: 3 } as const;
+
+export interface JoinColorBuffer {
+  handle: number;
+  width: number;
+  height: number;
+  /** gfxstream's GfxstreamFormat of the color buffer; the pixels are RGBA8 whatever it is. */
+  format: number;
+  refcount: number;
+  opened: boolean;
+  /** width * height * 4 bytes, rows from GL's row 0 (the order a texture upload takes). */
+  pixels: Uint8Array;
+}
+
+/** A COLOR_BUFFER part, or null when its size does not match its header. */
+export function joinColorBuffer(p: Uint8Array): JoinColorBuffer | null {
+  if (p.length < 24) return null;
+  const v = new DataView(p.buffer, p.byteOffset, p.byteLength);
+  const width = v.getUint32(4, true);
+  const height = v.getUint32(8, true);
+  if (p.length - 24 !== width * height * 4) return null;
+  return {
+    handle: v.getUint32(0, true),
+    width,
+    height,
+    format: v.getUint32(12, true),
+    refcount: v.getUint32(16, true),
+    opened: (v.getUint32(20, true) & 1) === 1,
+    pixels: p.subarray(24),
+  };
+}
+
+export interface JoinEnd {
+  /** 0: the snapshot is whole; else the join failed and the state is incomplete. */
+  status: number;
+  /** How long the phone's render threads were paused for the snapshot, in microseconds. */
+  pauseUs: number;
+  /** The color buffer the phone posted last (its screen), 0 for none. */
+  lastPosted: number;
+  /** Color buffers the phone could not read back. */
+  skipped: number;
+}
+
+export function joinEnd(p: Uint8Array): JoinEnd | null {
+  if (p.length < 16) return null;
+  const v = new DataView(p.buffer, p.byteOffset, p.byteLength);
+  return { status: v.getUint32(0, true), pauseUs: v.getUint32(4, true), lastPosted: v.getUint32(8, true), skipped: v.getUint32(12, true) };
+}
 export const HEADER_BYTES = 24;
 export const PROTOCOL_VERSION = 1;
 

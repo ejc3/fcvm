@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import { GlMirror, layerTransform } from "../../app/_wall/mirror/gl.ts";
-import { encodeCall, encodeRecord, RECORD, RecordReader } from "../mirror/wire.ts";
+import { encodeCall, encodeRecord, JOIN_PART, RECORD, RecordReader } from "../mirror/wire.ts";
 
 type Call = { name: string; args: unknown[]; ret?: unknown };
 
@@ -171,5 +171,67 @@ describe("composition layers", () => {
       [1, "rcCompose", [buf.length, buf]],
     ]);
     expect(calls.filter((c) => c.name === "drawArrays")).toHaveLength(2); // one layer, then the post
+  });
+});
+
+describe("the join snapshot", () => {
+  /** A stream that starts with a join: HELLO, BEGIN, color buffers, END, then live records. */
+  const joined = (parts: Uint8Array[], live: Uint8Array[] = []) => {
+    const { gl, calls } = fakeGl();
+    const m = new GlMirror(gl, () => 0);
+    const recs = [encodeRecord(RECORD.hello, 0, u32(1, 3), 1), encodeRecord(RECORD.join, 0, u32(1), JOIN_PART.begin), ...parts, ...live];
+    const bytes = new Uint8Array(recs.reduce((a, r) => a + r.length, 0));
+    let at = 0;
+    for (const r of recs) {
+      bytes.set(r, at);
+      at += r.length;
+    }
+    for (const r of new RecordReader().push(bytes)) m.feed(r);
+    return { m, calls };
+  };
+  const colorBuffer = (handle: number, w: number, h: number, fill: number, refcount = 1) =>
+    encodeRecord(RECORD.join, 0, new Uint8Array([...u32(handle, w, h, 1, refcount, 1), ...new Uint8Array(w * h * 4).fill(fill)]), JOIN_PART.colorBuffer);
+  const end = (status: number, pauseUs: number, lastPosted: number) => encodeRecord(RECORD.join, 0, u32(status, pauseUs, lastPosted, 0), JOIN_PART.end);
+
+  it("makes every color buffer with its pixels and draws the screen the phone posted last", () => {
+    const { m, calls } = joined([colorBuffer(4, 2, 2, 0x11), colorBuffer(9, 4, 2, 0x22), end(0, 61_000, 9)]);
+    expect(m.stats.failed).toEqual({});
+    expect(m.stats.join).toEqual({ colorBuffers: 2, bytes: 16 + 32, malformed: 0, ok: true, pauseUs: 61_000, skipped: 0 });
+    const uploads = calls.filter((c) => c.name === "texSubImage2D");
+    expect(uploads.map((c) => [c.args[4], c.args[5], (c.args[8] as Uint8Array)[0]])).toEqual([
+      [2, 2, 0x11],
+      [4, 2, 0x22],
+    ]);
+    // the post: the screen drawn at once, at the posted buffer's size
+    expect(m.stats.posts).toBe(1);
+    expect(calls.filter((c) => c.name === "drawArrays")).toHaveLength(1);
+  });
+
+  it("composes a layer the snapshot made, as a live color buffer", () => {
+    const layer = new DataView(new ArrayBuffer(56));
+    layer.setUint32(0, 4, true);
+    layer.setInt32(4, 2, true); // device
+    layer.setInt32(16, 2, true);
+    layer.setInt32(20, 2, true);
+    layer.setFloat32(32, 2, true);
+    layer.setFloat32(36, 2, true);
+    layer.setInt32(40, 1, true); // no blending
+    layer.setFloat32(44, 1, true);
+    const buf = new Uint8Array([...u32(1, 9, 1), ...new Uint8Array(layer.buffer)]);
+    // channel 3 is older than the copy: renderControl still decodes on it
+    const live = [encodeRecord(RECORD.data, 3, encodeCall("rcCompose", [buf.length, buf]))];
+    const { m, calls } = joined([colorBuffer(4, 2, 2, 0x11), colorBuffer(9, 2, 2, 0), end(0, 1, 9)], live);
+    expect(m.stats.failed).toEqual({});
+    // the END's post, then the compose's layer and its post
+    expect(m.stats.posts).toBe(2);
+    expect(calls.filter((c) => c.name === "drawArrays")).toHaveLength(3);
+  });
+
+  it("draws nothing from a snapshot that failed or does not match its header", () => {
+    const bad = encodeRecord(RECORD.join, 0, new Uint8Array([...u32(4, 2, 2, 1, 1, 1), 0, 0]), JOIN_PART.colorBuffer);
+    const { m } = joined([bad, colorBuffer(9, 2, 2, 0), end(1, 0, 9)]);
+    expect(m.stats.join?.malformed).toBe(1);
+    expect(m.stats.join?.ok).toBe(false);
+    expect(m.stats.posts).toBe(0);
   });
 });

@@ -5,7 +5,7 @@
 
 import { admitMessage } from "../../../core/net.ts";
 import { RateMeter } from "../../../core/meter.ts";
-import { RECORD, RecordReader } from "../../../core/mirror/wire.ts";
+import { JOIN_PART, RECORD, RecordReader } from "../../../core/mirror/wire.ts";
 import { GlMirror } from "./gl.ts";
 import type { MirrorIn, MirrorOut } from "./mirror-msgs.ts";
 
@@ -21,6 +21,13 @@ let generation = 0;
 let pendingBytes = 0;
 /** A viewer that receives faster than it replays drops the stream past this, and joins again. */
 const MAX_PENDING_BYTES = 16 << 20;
+/**
+ * Until the join snapshot has been fed (every color buffer's pixels, tens of MB deflated), the
+ * bound is this one: the streamer queues the snapshot apart from its live bound too.
+ */
+const MAX_JOIN_PENDING_BYTES = 256 << 20;
+/** The join snapshot has been fed (its END), or the stream has none: the live bound applies. */
+let joinDone = false;
 let reader = new RecordReader();
 let inflate: WritableStreamDefaultWriter<Uint8Array> | null = null;
 const wire = new RateMeter();
@@ -51,6 +58,7 @@ function fresh(): void {
   wire.reset();
   tapBytes = 0;
   joined = false;
+  joinDone = false;
   pixel = null;
   stampAt = null;
   // the canvas is preserved between posts, so its centre can be read after one
@@ -77,6 +85,7 @@ function feed(bytes: Uint8Array): void {
       post({ type: "joined" });
     }
     mirror?.feed(r);
+    if (r.type !== RECORD.hello && (r.type !== RECORD.join || r.aux === JOIN_PART.end)) joinDone = true;
     // the phone's ring filled: the copy stopped and the stream has a gap; join again
     if (r.type === RECORD.overflow && ws) {
       retire("the phone's copy of its commands overflowed: join again");
@@ -108,6 +117,7 @@ function stats(): void {
     failed: Object.values(mirror.stats.failed).reduce((a, b) => a + b, 0),
     unknownChannelPackets: mirror.stats.unknownChannelPackets,
     overflowed: mirror.stats.overflowed,
+    join: mirror.stats.join,
     open: ws !== null && ws.readyState === WebSocket.OPEN,
     pixel,
     stamp: stampAt,
@@ -157,7 +167,7 @@ function open(url: string, admit: string): void {
     if (gen !== generation || !(e.data instanceof ArrayBuffer)) return;
     wire.add(now(), e.data.byteLength);
     const n = e.data.byteLength;
-    if (pendingBytes + n > MAX_PENDING_BYTES) {
+    if (pendingBytes + n > (joinDone ? MAX_PENDING_BYTES : MAX_JOIN_PENDING_BYTES)) {
       retire("the mirror fell behind in this browser: join again");
       return;
     }

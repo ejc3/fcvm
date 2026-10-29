@@ -289,6 +289,39 @@ int main() {
           (unsigned long long)z.out_bytes, (unsigned long long)z.in_bytes);
     inflateEnd(&in);
   }
+  {  // the tap's records followed across reads: the join's bytes (JOIN records, the state the
+     // viewer joins at) told from the live stream's, which alone the 8 MiB bound counts
+    auto rec = [](uint32_t type, size_t len) {
+      std::string r(24 + len, (char)type);
+      uint32_t h[3] = {type, 1, (uint32_t)len};
+      memcpy(&r[0], h, sizeof h);
+      return r;
+    };
+    std::string stream = rec(1, 8) + rec(7, 4) + rec(7, 70000) + rec(7, 16) + rec(4, 100) + rec(5, 12) + rec(4, 3);
+    const size_t join = (24 + 4) + (24 + 70000) + (24 + 16);
+    for (size_t chunk : {stream.size(), (size_t)4096, (size_t)24, (size_t)7, (size_t)1}) {
+      TapCursor c;
+      std::vector<std::pair<bool, size_t>> runs;
+      size_t joined = 0, live = 0;
+      bool order_ok = true, seen_live_after_join = false;
+      for (size_t at = 0; at < stream.size(); at += chunk) {
+        c.split((const uint8_t*)stream.data() + at, std::min(chunk, stream.size() - at), &runs);
+        for (auto& [j, n] : runs) {
+          (j ? joined : live) += n;
+          if (!j && joined > 0 && joined >= join - 9) seen_live_after_join = true;
+          if (j && seen_live_after_join) order_ok = false;
+        }
+      }
+      CHECK(joined + live == stream.size(), "chunk %zu: every byte counted once", chunk);
+      // a header's bytes that arrive before its type count as live: at most 3 per JOIN record
+      CHECK(joined <= join && joined + 9 >= join, "chunk %zu: %zu of the %zu join bytes", chunk, joined, join);
+      CHECK(order_ok, "chunk %zu: no join bytes after the live stream began", chunk);
+      if (chunk >= 24) CHECK(joined == join, "chunk %zu: whole headers, exact: %zu of %zu", chunk, joined, join);
+    }
+    CHECK(std::string(MIRROR_START_COMMAND) == "J", "a viewer opens with a join");
+    std::string src = source_text("source.cpp");
+    CHECK(src.find("::send(fd, MIRROR_START_COMMAND, 1") != std::string::npos, "the stream starts the tap with it");
+  }
   {  // The mirror stream's teardown (source.cpp, PhoneSource::mirror), pinned at the source: no
      // host test can make a viewer that stops reading, or post a scene between the token check
      // and the stream's start.

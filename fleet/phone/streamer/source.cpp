@@ -185,7 +185,8 @@ void PhoneSource::mirror(Conn& c, const std::string& token) {
   sockaddr_un a{};
   a.sun_family = AF_UNIX;
   snprintf(a.sun_path, sizeof a.sun_path, "%s", opt_.mirror_socket.c_str());
-  if (fd < 0 || connect(fd, (sockaddr*)&a, sizeof a) != 0 || ::send(fd, "S", 1, MSG_NOSIGNAL) != 1) {
+  if (fd < 0 || connect(fd, (sockaddr*)&a, sizeof a) != 0 ||
+      ::send(fd, MIRROR_START_COMMAND, 1, MSG_NOSIGNAL) != 1) {
     std::string e = std::string("the emulator's command stream: ") + strerror(errno);
     if (fd >= 0) close(fd);
     {
@@ -205,8 +206,9 @@ void PhoneSource::mirror(Conn& c, const std::string& token) {
   // the tap, deflates and queues, and ends the stream when the queue passes its bound.
   std::mutex qmu;
   std::condition_variable qcv;
-  std::deque<std::string> q;
-  size_t queued = 0;
+  // each message, and whether it carries the join snapshot (queued apart from the live bound)
+  std::deque<std::pair<std::string, bool>> q;
+  size_t queued = 0, queued_join = 0;
   std::atomic<bool> done{false};
   bool writer_finished = false;  // under qmu
   std::string close_msg;          // under qmu: the close frame, the writer's last message
@@ -220,9 +222,9 @@ void PhoneSource::mirror(Conn& c, const std::string& token) {
             std::unique_lock<std::mutex> l(qmu);
             qcv.wait(l, [&] { return done.load() || !q.empty() || !close_msg.empty(); });
             if (!q.empty()) {
-              m = std::move(q.front());
+              m = std::move(q.front().first);
+              (q.front().second ? queued_join : queued) -= m.size();
               q.pop_front();
-              queued -= m.size();
             } else if (!close_msg.empty()) {
               // the close frame is kept apart from the data: only it is sent whoever holds the phone
               m = std::move(close_msg);
@@ -266,6 +268,8 @@ void PhoneSource::mirror(Conn& c, const std::string& token) {
     return;
   }
   MirrorDeflate z;
+  TapCursor cursor;
+  std::vector<std::pair<bool, size_t>> runs;
   std::string reason;
   uint16_t code = 1000;
   std::vector<uint8_t> buf(1 << 18);
@@ -285,29 +289,47 @@ void PhoneSource::mirror(Conn& c, const std::string& token) {
       reason = "the emulator's command stream ended";
       break;
     }
-    std::string out;
-    if (!z.push(buf.data(), (size_t)n, &out)) {
-      code = 1011;
-      reason = "deflate failed";
-      break;
-    }
-    std::string frame = ws_frame(2, out.data(), out.size());
-    bool behind = false;
-    {
-      std::lock_guard<std::mutex> l(qmu);
-      if (queued + frame.size() > MIRROR_MAX_QUEUED_BYTES) {
-        behind = true;
-      } else {
-        queued += frame.size();
-        q.push_back(std::move(frame));
+    // the join's bytes and the live stream's go in messages of their own, each under its bound
+    cursor.split(buf.data(), (size_t)n, &runs);
+    size_t at = 0, wire = 0;
+    bool behind = false, too_big = false, failed = false;
+    for (const auto& [join, len] : runs) {
+      std::string out;
+      if (!z.push(buf.data() + at, len, &out)) {
+        failed = true;
+        break;
       }
+      at += len;
+      wire += out.size();
+      std::string frame = ws_frame(2, out.data(), out.size());
+      std::lock_guard<std::mutex> l(qmu);
+      if (join && queued_join + frame.size() > MIRROR_MAX_JOIN_QUEUED_BYTES) {
+        too_big = true;
+        break;
+      }
+      if (!join && queued + frame.size() > MIRROR_MAX_QUEUED_BYTES) {
+        behind = true;
+        break;
+      }
+      (join ? queued_join : queued) += frame.size();
+      q.emplace_back(std::move(frame), join);
     }
     qcv.notify_all();
     {
       std::lock_guard<std::mutex> l(hmu_);
       mirror_tap_bytes_ += (uint64_t)n;
-      mirror_wire_bytes_ += out.size();
+      mirror_wire_bytes_ += wire;
       if (behind) mirror_behind_++;
+    }
+    if (failed) {
+      code = 1011;
+      reason = "deflate failed";
+      break;
+    }
+    if (too_big) {
+      code = 1011;
+      reason = "the phone's state at the join is too large to send";
+      break;
     }
     if (behind) {
       code = 1013;
@@ -321,7 +343,7 @@ void PhoneSource::mirror(Conn& c, const std::string& token) {
     // close frame is the writer's last message.
     std::unique_lock<std::mutex> l(qmu);
     q.clear();
-    queued = 0;
+    queued = queued_join = 0;
     close_msg = close_frame(code, reason);
     done.store(true);
     qcv.notify_all();

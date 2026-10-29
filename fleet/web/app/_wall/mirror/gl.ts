@@ -8,7 +8,7 @@
 // that drew (`Shadow`). A guest context's default framebuffer is its draw surface's
 // framebuffer, and its vertex array 0 is a vertex array of its own.
 
-import { decodeCall, PacketSplitter, RECORD, type Arg, type Call, type TapRecord } from "../../../core/mirror/wire.ts";
+import { decodeCall, JOIN_PART, joinColorBuffer, joinEnd, PacketSplitter, RECORD, type Arg, type Call, type TapRecord } from "../../../core/mirror/wire.ts";
 import { RateMeter } from "../../../core/meter.ts";
 
 type GL = WebGL2RenderingContext;
@@ -42,6 +42,20 @@ export interface MirrorStats {
   /** Packets on channels whose state predates the copy, which the mirror cannot draw. */
   unknownChannelPackets: number;
   overflowed: boolean;
+  /** The join snapshot the stream began with (JOIN records), or null for a stream without one. */
+  join: JoinStats | null;
+}
+
+export interface JoinStats {
+  colorBuffers: number;
+  /** Pixel bytes the snapshot carried. */
+  bytes: number;
+  /** Parts the mirror could not read (a size that does not match its header). */
+  malformed: number;
+  /** From the END part: whether the snapshot is whole, the phone's pause for it, and the color buffers it could not read. */
+  ok: boolean | null;
+  pauseUs: number | null;
+  skipped: number | null;
 }
 
 interface ShareGroup {
@@ -180,6 +194,7 @@ export class GlMirror {
     failed: {},
     unknownChannelPackets: 0,
     overflowed: false,
+    join: null,
   };
   /** Replies the phone's GPU sent per second: the round trips the server answered. */
   readonly replyRate = new RateMeter();
@@ -252,6 +267,10 @@ export class GlMirror {
       this.stats.overflowed = true;
       return;
     }
+    if (r.type === RECORD.join) {
+      this.join(r);
+      return;
+    }
     const c = this.channel(r.channel, false);
     if (r.type === RECORD.reply) {
       this.stats.replies++;
@@ -272,6 +291,39 @@ export class GlMirror {
       return;
     }
     for (const p of packets) this.packet(c, p);
+  }
+
+  /**
+   * One part of the join snapshot: the phone's state when the copy started. Its color buffers
+   * (every layer the composer can draw, and the screen) are made here with their pixels, and
+   * the screen is drawn at its END, so a phone that draws nothing new is shown at once.
+   */
+  private join(r: TapRecord): void {
+    const j = (this.stats.join ??= { colorBuffers: 0, bytes: 0, malformed: 0, ok: null, pauseUs: null, skipped: null });
+    if (r.aux === JOIN_PART.colorBuffer) {
+      const p = joinColorBuffer(r.payload);
+      if (!p) {
+        j.malformed++;
+        return;
+      }
+      const old = this.colorBuffers.get(p.handle);
+      if (old) this.gl.deleteTexture(old.tex);
+      const cb = this.newColorBuffer(p.handle, p.width, p.height);
+      cb.refs = p.refcount;
+      this.withTexture(cb.tex, () => this.upload(0, 0, p.width, p.height, 0x1908, 0x1401, p.pixels));
+      j.colorBuffers++;
+      j.bytes += p.pixels.length;
+    } else if (r.aux === JOIN_PART.end) {
+      const e = joinEnd(r.payload);
+      if (!e) {
+        j.malformed++;
+        return;
+      }
+      j.ok = e.status === 0;
+      j.pauseUs = e.pauseUs;
+      j.skipped = e.skipped;
+      if (j.ok && e.lastPosted) this.post(e.lastPosted);
+    }
   }
 
   private channel(id: number, known: boolean): Channel {
@@ -1366,7 +1418,7 @@ void main() { o = mode == 1 ? color : texture(src, t) * color.a; }`;
   }
 
   /** The screen: the posted color buffer, drawn to the canvas. */
-  private post(handle: number, _call: Call): void {
+  private post(handle: number, _call?: Call): void {
     const cb = this.colorBuffers.get(handle);
     if (!cb) return;
     const gl = this.gl;
