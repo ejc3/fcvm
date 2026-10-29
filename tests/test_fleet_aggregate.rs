@@ -1139,3 +1139,74 @@ async fn with_admission_keys_frames_need_a_direct_token_and_tiles_get_one() {
     assert!(matches!(next_msg(&mut ws).await, Message::Text(_)));
     cancel.cancel();
 }
+
+/// A tile that drops its stream is subscribed again with a fresh token, not the one made when
+/// the layout arrived: a token expires after 10 minutes, and a tile that drops after that
+/// would be refused for as long as the layout stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_tile_reconnect_carries_a_token_made_for_it() {
+    use fcvm::fleet::coord::admission::AdmitKey;
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let s2 = seen.clone();
+    async fn drop_at_once(
+        ws: WebSocketUpgrade,
+        Query(q): Query<HashMap<String, String>>,
+        State(seen): State<Arc<Mutex<Vec<String>>>>,
+    ) -> impl IntoResponse {
+        seen.lock()
+            .unwrap()
+            .push(q.get("admit").cloned().unwrap_or_default());
+        ws.on_upgrade(|s| async move { drop(s) })
+    }
+    let app = Router::new()
+        .route("/frames", get(drop_at_once))
+        .with_state(s2);
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let whole = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+    let shared = Shared::new();
+    shared.set_layout(Layout {
+        epoch_unix_ms: now_ms(),
+        image_aspect: 16.0 / 9.0,
+        region: whole,
+        tiles: vec![TileSpec {
+            id: "slot-1".into(),
+            rect: whole,
+            url: Some(format!("ws://{a}/frames")),
+        }],
+        generation: 0,
+        from_frame: 0,
+        admit_keys: vec![AdmitKey([4; 32]).hex()],
+    });
+    let cancel = CancellationToken::new();
+    tokio::spawn(run(
+        shared.clone(),
+        Arc::new(Raw),
+        Options {
+            image_height: 36,
+            ..Options::default()
+        },
+        cancel.clone(),
+    ));
+    // Reconnects come every 250 ms; tokens name their expiry to the second, so 2.5 s of
+    // reconnects made at their own moment hold more than one.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    cancel.cancel();
+    let seen = seen.lock().unwrap().clone();
+    assert!(seen.len() >= 4, "{} subscriptions", seen.len());
+    assert!(
+        seen.iter().all(|t| !t.is_empty()),
+        "a subscription without a token"
+    );
+    let distinct: std::collections::BTreeSet<&String> = seen.iter().collect();
+    assert!(
+        distinct.len() >= 2,
+        "every reconnect reused the first token"
+    );
+}

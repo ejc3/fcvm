@@ -585,13 +585,10 @@ async fn pipeline(
                 full.push('&');
                 full.push_str(&opts.tile_query);
             }
-            if let Some(token) = own_token(&layout.admit_keys) {
-                full.push_str("&admit=");
-                full.push_str(&token);
-            }
             tokio::spawn(tile::read(
                 i,
                 full,
+                layout.admit_keys.clone(),
                 codec.clone(),
                 opts.fps,
                 ev_tx.clone(),
@@ -900,7 +897,7 @@ pub fn admitted(keys_hex: &[String], token: Option<&str>) -> bool {
 }
 
 /// A direct token for this aggregator's own tile subscriptions, made with the newest key.
-fn own_token(keys_hex: &[String]) -> Option<String> {
+pub(crate) fn own_token(keys_hex: &[String]) -> Option<String> {
     use crate::fleet::coord::admission::{AdmitKey, DIRECT_TOKEN_SECS};
     let key = AdmitKey::from_hex(keys_hex.first()?)?;
     Some(key.direct_token("aggregator", now_ms() / 1000 + DIRECT_TOKEN_SECS))
