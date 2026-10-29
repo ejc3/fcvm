@@ -5,7 +5,7 @@ export type MirrorIn =
   /** Open the phone streamer's GET /mirror with the viewer's direct token. */
   | { type: "open"; url: string; admit: string }
   | { type: "close" }
-  /** The replay test: a captured tap stream, as the streamer's socket gives it before deflate. */
+  /** The replay test: a captured tap stream, as the streamer's socket gives it before compression. */
   | { type: "replay"; bytes: ArrayBuffer };
 
 export interface MirrorStatsMsg {
@@ -14,8 +14,12 @@ export interface MirrorStatsMsg {
   /** WebSocket message bytes per second over the last second, and in all since the stream opened. */
   wireBps: number;
   wireBytes: number;
-  /** Bytes of the tap stream after inflating. */
+  /** Bytes of the tap stream after decoding. */
   tapBytes: number;
+  /** The stream's encoding (null before its first message). */
+  codec: "zstd" | "deflate-raw" | null;
+  /** Milliseconds a second spent decoding zstd (null when not zstd). */
+  decodeMsPerSec: number | null;
   /** Blocking calls the phone's GPU answered per second (each a round trip the viewer did not make). */
   repliesPerSec: number;
   /** Frames posted to the screen per second. */

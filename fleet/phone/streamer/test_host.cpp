@@ -4,7 +4,7 @@
 #include <math.h>
 #include <string.h>
 
-#include <zlib.h>
+#include <zstd.h>
 
 #include <fstream>
 #include <sstream>
@@ -258,36 +258,34 @@ int main() {
     CHECK(!phone_scene_parse("{\"epoch_unix_ms\":1,\"mirror_viewer\":" + std::string("\"") + std::string(129, 'v') + "\"}", &bad, &err),
           "a holder id over 128 characters");
   }
-  {  // the mirror's deflate: one raw stream, each push a whole message the page inflates as it
-     // arrives, the concatenation of everything pushed
-    MirrorDeflate z;
-    CHECK(z.ok(), "deflateInit2");
-    z_stream in{};
-    CHECK(inflateInit2(&in, -15) == Z_OK, "inflateInit2");
+  {  // the mirror's zstd: one stream, each push a whole message the page decodes as it arrives
+     // (a flushed block), the concatenation of everything pushed; its window fits the page's
+     // decoder (1 MiB)
+    MirrorZstd z;
+    CHECK(z.ok(), "ZSTD_createCCtx");
+    ZSTD_DStream* d = ZSTD_createDStream();
+    CHECK(d && !ZSTD_isError(ZSTD_DCtx_setParameter(d, ZSTD_d_windowLogMax, 20)), "ZSTD_createDStream");
     std::string all, got;
     for (int i = 0; i < 50; i++) {
       std::string chunk;
-      for (int k = 0; k < 1000 + 37 * i; k++) chunk += (char)((k * 7 + i) % 61);
+      for (int k = 0; k < 1000 + 37 * i + (i == 40 ? (3 << 20) : 0); k++) chunk += (char)((k * 7 + i) % 61 + (k >> 12));
       all += chunk;
       std::string msg;
       CHECK(z.push((const uint8_t*)chunk.data(), chunk.size(), &msg), "push %d", i);
-      CHECK(msg.size() >= 4 && msg.compare(msg.size() - 4, 4, std::string("\x00\x00\xff\xff", 4)) == 0,
-            "message %d ends at a sync flush", i);
-      in.next_in = (Bytef*)msg.data();
-      in.avail_in = (uInt)msg.size();
+      ZSTD_inBuffer in{msg.data(), msg.size(), 0};
       unsigned char out[1 << 16];
+      ZSTD_outBuffer o;
       do {
-        in.next_out = out;
-        in.avail_out = sizeof out;
-        int rc = inflate(&in, Z_SYNC_FLUSH);
-        CHECK(rc == Z_OK || rc == Z_BUF_ERROR, "inflate %d", rc);
-        got.append((const char*)out, sizeof out - in.avail_out);
-      } while (in.avail_out == 0);
+        o = {out, sizeof out, 0};
+        size_t rc = ZSTD_decompressStream(d, &o, &in);
+        CHECK(!ZSTD_isError(rc), "decompress: %s", ZSTD_getErrorName(rc));
+        got.append((const char*)out, o.pos);
+      } while (o.pos == o.size || in.pos < in.size);
       CHECK(got == all, "after message %d the page has everything pushed", i);
     }
     CHECK(z.in_bytes == all.size() && z.out_bytes < z.in_bytes / 4, "counted, and repetitive input shrinks: %llu of %llu",
           (unsigned long long)z.out_bytes, (unsigned long long)z.in_bytes);
-    inflateEnd(&in);
+    ZSTD_freeDStream(d);
   }
   {  // The mirror stream's teardown (source.cpp, PhoneSource::mirror), pinned at the source: no
      // host test can make a viewer that stops reading, or post a scene between the token check

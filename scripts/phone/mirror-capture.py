@@ -6,16 +6,47 @@
 
 Posts a scene naming a test viewer as the phone's holder, with an admission key made for the
 run, opens both streams with that viewer's direct token, and writes:
-  <prefix>.tap   the mirror's tap stream, inflated (e2e/mirror.spec.ts replays it)
+  <prefix>.tap   the mirror's tap stream, decoded (e2e/mirror.spec.ts replays it)
   <prefix>.json  each stream's wire bytes, frames and replies per second, and the totals
 """
-import base64, hashlib, hmac, json, os, socket, struct, sys, threading, time, zlib
+import base64, ctypes, ctypes.util, hashlib, hmac, json, os, socket, struct, sys, threading, time
 
 addr, secs, prefix = sys.argv[1], float(sys.argv[2]), sys.argv[3]
 host, port = addr.rsplit(":", 1)
 port = int(port)
 KEY = os.urandom(32)
 VIEWER = "v-capture"
+
+
+class Zstd:
+    """One zstd stream decoded message by message, through the system's libzstd."""
+
+    class Buf(ctypes.Structure):
+        _fields_ = [("p", ctypes.c_void_p), ("size", ctypes.c_size_t), ("pos", ctypes.c_size_t)]
+
+    def __init__(self):
+        self.z = ctypes.CDLL(ctypes.util.find_library("zstd") or "libzstd.so.1")
+        self.z.ZSTD_createDStream.restype = ctypes.c_void_p
+        self.z.ZSTD_decompressStream.restype = ctypes.c_size_t
+        self.z.ZSTD_decompressStream.argtypes = [ctypes.c_void_p, ctypes.POINTER(self.Buf), ctypes.POINTER(self.Buf)]
+        self.z.ZSTD_isError.argtypes = [ctypes.c_size_t]
+        self.z.ZSTD_getErrorName.restype = ctypes.c_char_p
+        self.z.ZSTD_getErrorName.argtypes = [ctypes.c_size_t]
+        self.d = self.z.ZSTD_createDStream()
+        self.out = ctypes.create_string_buffer(1 << 20)
+
+    def decompress(self, msg):
+        src = ctypes.create_string_buffer(msg, len(msg))
+        i = self.Buf(ctypes.cast(src, ctypes.c_void_p), len(msg), 0)
+        got = []
+        while True:
+            o = self.Buf(ctypes.cast(self.out, ctypes.c_void_p), len(self.out), 0)
+            r = self.z.ZSTD_decompressStream(self.d, ctypes.byref(o), ctypes.byref(i))
+            if self.z.ZSTD_isError(r):
+                raise RuntimeError("zstd: " + self.z.ZSTD_getErrorName(r).decode())
+            got.append(self.out.raw[:o.pos])
+            if o.pos < o.size and i.pos == i.size:
+                return b"".join(got)
 
 
 def token():
@@ -120,7 +151,7 @@ def mirror():
     if "--no-mirror" in sys.argv:
         return
     s, rest = ws_open("/mirror")
-    z = zlib.decompressobj(-15)
+    z = Zstd()
     tap = open(prefix + ".tap", "wb")
     pending = b""
     for op, pl in ws_frames(s, rest, end):
@@ -166,6 +197,6 @@ for k in ("video", "mirror"):
 out["video_fps"] = totals["video"]["frames"] / el
 out["mirror_replies_per_s"] = totals["mirror"]["replies"] / el
 if totals["mirror"]["tap_bytes"]:
-    out["mirror_deflate_ratio"] = totals["mirror"]["tap_bytes"] / max(1, totals["mirror"]["wire_bytes"])
+    out["mirror_ratio"] = totals["mirror"]["tap_bytes"] / max(1, totals["mirror"]["wire_bytes"])
 json.dump(out, open(prefix + ".json", "w"), indent=1)
 print(json.dumps({k: v for k, v in out.items() if k != "per_second"}, indent=1))
