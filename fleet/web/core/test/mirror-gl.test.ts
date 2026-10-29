@@ -176,6 +176,50 @@ describe("color buffers the host destroys", () => {
   });
 });
 
+describe("color buffers the host destroys, shared and reused", () => {
+  const deleted = (calls: Call[]) => calls.filter((c) => c.name === "deleteTexture").map((c) => c.args[0]);
+  const made = (calls: Call[]) => calls.filter((c) => c.name === "createTexture").map((c) => c.ret);
+  const bound = (name: number): ([number, string, number[]] | [number, "reply", number[]])[] => [
+    [1, "glBindTexture", [0x0de1, name]],
+    [1, "rcBindTexture", [9]],
+  ];
+
+  it("keeps a freed buffer's texture until the last guest texture drawing with it is deleted", () => {
+    const steps: ([number, string, (number | Uint8Array)[]] | [number, "reply" | "free", number[]])[] = [
+      ...contexts(),
+      [1, "rcCreateColorBuffer", [16, 16, 0x1908]],
+      [1, "reply", [9]],
+      [1, "glGenTextures", [2, 4]],
+      [1, "reply", [5, 6]],
+      ...bound(5),
+      ...bound(6),
+      [0, "free", [9]],
+      [1, "glDeleteTextures", [1, u32(5)]],
+    ];
+    const one = play(steps);
+    expect(deleted(one.calls)).not.toContain(made(one.calls)[0]);
+    const both = play([...steps, [1, "glDeleteTextures", [1, u32(6)]]]);
+    expect(deleted(both.calls)).toContain(made(both.calls)[0]);
+  });
+
+  it("does not free a buffer the guest made again with the same handle before the old one's FREE arrived", () => {
+    // The tap copies a call's bytes before the host runs it, and the host frees the old
+    // buffer with that handle while it runs the create: the old buffer's FREE follows the
+    // replacement's create on the wire.
+    const { m, calls } = play([
+      ...contexts(),
+      [1, "rcCreateColorBufferWithHandle", [16, 16, 0x1908, 9]],
+      [1, "rcCreateColorBufferWithHandle", [32, 32, 0x1908, 9]],
+      [0, "free", [9]],
+      [1, "rcFBPost", [9]],
+    ]);
+    expect(m.stats.posts).toBe(1);
+    // the old buffer's texture went, the replacement's stays
+    expect(deleted(calls)).toEqual([made(calls)[0]]);
+    expect(deleted(calls)).not.toContain(made(calls)[1]);
+  });
+});
+
 describe("composition layers", () => {
   // gfxstream's host/gl/texture_draw.cpp kVertices: for each transform, the texture coordinate
   // at the quad's corners (+1,-1), (+1,+1), (-1,+1), (-1,-1)
