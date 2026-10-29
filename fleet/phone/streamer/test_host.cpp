@@ -313,6 +313,10 @@ int main() {
     CHECK(gen != std::string::npos && again != std::string::npos && refused != std::string::npos && again < refused &&
               refused < opened,
           "the holder is checked again with its generation before the stream starts");
+    // after a holder change the writer skips what is queued but stays for the close frame, so
+    // the old holder's page reads why ("the phone went back") instead of a dropped connection
+    CHECK(m.find("if (!last && !holds()) continue;") != std::string::npos,
+          "a revoked stream's writer still sends its close frame");
     // no thread is made with a bare std::thread constructor, which throws at a thread limit
     CHECK(m.find("std::thread writer([") == std::string::npos && m.find("start_thread(") != std::string::npos,
           "the stream's threads start with start_thread");

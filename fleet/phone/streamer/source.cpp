@@ -226,7 +226,8 @@ void PhoneSource::mirror(Conn& c, const std::string& token) {
             last = done.load();
           }
           // a stream whose holder changed sends nothing more but its close
-          if ((!last && !holds()) || !c.write_all(m.data(), m.size())) break;
+          if (!last && !holds()) continue;
+          if (!c.write_all(m.data(), m.size())) break;
         }
         std::lock_guard<std::mutex> l(qmu);
         writer_finished = true;
