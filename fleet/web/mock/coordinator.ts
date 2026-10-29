@@ -1464,6 +1464,7 @@ export class MockCoordinator {
       case "/mock/fault":
         body((b) => {
           if (typeof b["skew"] === "number" && typeof b["tile"] === "string") this.opts.renderers.setSkew(b["tile"], b["skew"]);
+          if (b["mirror_overflow"] === true) this.opts.renderers.setMirrorOverflow();
           if (typeof b["fail"] === "string") {
             const t = this.tiles.find((x) => x.id === b["fail"]);
             if (!t || !t.slot) throw new Error(`no tile with a GPU ${String(b["fail"])}`);

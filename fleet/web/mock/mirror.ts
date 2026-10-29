@@ -54,8 +54,11 @@ function frame(k: number): Uint8Array[] {
   ];
 }
 
-/** Serves one mirror stream on `ws` until it closes. */
-export function serveMockMirror(ws: WebSocket, capturePath: string | undefined): void {
+/**
+ * Serves one mirror stream on `ws` until it closes. With `overflow`, the synthetic stream sends
+ * an OVERFLOW record after ten frames and nothing after it, as a tap whose ring filled.
+ */
+export function serveMockMirror(ws: WebSocket, capturePath: string | undefined, overflow = false): void {
   // one zstd stream (level 3, 1 MiB window), flushed after each batch; the page decodes it as
   // one stream, so where its messages split does not matter
   const z = zlib.createZstdCompress({
@@ -102,7 +105,14 @@ export function serveMockMirror(ws: WebSocket, capturePath: string | undefined):
     }
     send(opening());
     let k = 0;
-    timer = setInterval(() => send(frame(k++)), 1000 / 30);
+    timer = setInterval(() => {
+      if (overflow && k === 10) {
+        send([encodeRecord(RECORD.overflow, 1, new Uint8Array(0), 1 << 20)]);
+        if (timer) clearInterval(timer);
+        return;
+      }
+      send(frame(k++));
+    }, 1000 / 30);
   });
   ws.on("close", () => {
     if (timer) clearInterval(timer);
