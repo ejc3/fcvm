@@ -8,12 +8,22 @@
 //   phone-streamer [serve]          serve
 //   phone-streamer fail <message>   serve /health only, reporting the phone failed with
 //                                   <message> (the phone's start found no GPU renderer)
+//   phone-streamer capture <secs> <file>
+//                                   write the screen as raw NV12 frames at FPS for <secs>
+//                                   (the newest frame at each tick, repeated while the screen
+//                                   does not change); prints the frames written and the
+//                                   screen updates received. For encoding offline.
 #include <stdio.h>
 #include <stdlib.h>
+
+#include <chrono>
+#include <vector>
 
 #include <string>
 #include <thread>
 
+#include "nv12.h"
+#include "screen.h"
 #include "server.h"
 #include "source.h"
 #include "tls.h"
@@ -23,8 +33,58 @@ static double envd(const char* k, double def) {
   return v && *v ? atof(v) : def;
 }
 
+static int capture(int argc, char** argv) {
+  if (argc < 4) {
+    fprintf(stderr, "usage: phone-streamer capture <secs> <file>\n");
+    return 2;
+  }
+  double secs = atof(argv[2]);
+  int fps = (int)envd("FPS", 30);
+  const char* target = getenv("EMU_GRPC") ? getenv("EMU_GRPC") : "127.0.0.1:8554";
+  FILE* out = fopen(argv[3], "wb");
+  if (!out) {
+    perror(argv[3]);
+    return 1;
+  }
+  ScreenStream screen(target);
+  screen.start();
+  ScreenFrame f;
+  uint64_t seq = 0;
+  if (!screen.next(0, 10000, &f)) {
+    fprintf(stderr, "phone-streamer: no screen frame in 10 s: %s\n", screen.error().c_str());
+    return 1;
+  }
+  seq = f.seq;
+  uint64_t first_seq = f.seq;
+  std::vector<uint8_t> nv12((size_t)f.width * f.height * 3 / 2);
+  int w = f.width, h = f.height;
+  auto t0 = std::chrono::steady_clock::now();
+  long frames = (long)(secs * fps);
+  for (long i = 0; i < frames; i++) {
+    auto tick = t0 + std::chrono::microseconds((long long)(i * 1e6 / fps));
+    auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(tick - std::chrono::steady_clock::now()).count();
+    ScreenFrame n;
+    if (screen.next(seq, wait_ms > 0 ? (int)wait_ms : 0, &n) && n.width == w && n.height == h) {
+      f = std::move(n);
+      seq = f.seq;
+    }
+    std::this_thread::sleep_until(tick);
+    rgba_to_nv12(f.rgba.data(), (size_t)w * 4, w, h, nv12.data(), (size_t)w);
+    if (fwrite(nv12.data(), 1, nv12.size(), out) != nv12.size()) {
+      perror("write");
+      return 1;
+    }
+  }
+  fclose(out);
+  double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  printf("{\"frames\":%ld,\"fps\":%d,\"width\":%d,\"height\":%d,\"screen_updates\":%llu,\"seconds\":%.3f}\n", frames,
+         fps, w, h, (unsigned long long)(seq - first_seq + 1), el);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   std::string cmd = argc > 1 ? argv[1] : "serve";
+  if (cmd == "capture") return capture(argc, argv);
   StreamerOptions o;
   if (cmd == "fail") {
     o.fail = argc > 2 ? argv[2] : "the phone failed";

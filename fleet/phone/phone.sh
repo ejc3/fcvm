@@ -254,8 +254,10 @@ boot)
   # emulated UWB peer the guest's UWB stack reports a device error at boot, which makes
   # system_server take a full bug report (dumpstate at 100% of a core for about 30 s, the
   # app's frames dropping under 30 a second).
+  # PHONE_EMU_ARGS: more emulator options, split on spaces (a measurement's -grpc or -prop).
+  # shellcheck disable=SC2086
   setsid "$EMU" -avd phone -no-window -no-audio -no-boot-anim -gpu host -accel on \
-    -no-snapshot-load -feature -Uwb -verbose > /tmp/emulator.log 2>&1 < /dev/null &
+    -no-snapshot-load -feature -Uwb -verbose ${PHONE_EMU_ARGS:-} > /tmp/emulator.log 2>&1 < /dev/null &
   echo $! > /tmp/emulator.pid
   timeout "${BOOT_TIMEOUT:-300}" "$ADB" wait-for-device
   until [ "$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; do
