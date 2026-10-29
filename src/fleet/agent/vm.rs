@@ -778,6 +778,70 @@ mod tests {
         assert_eq!(shape(&words), shape(&slot.args()), "warm-root.sh: {line}");
     }
 
+    /// fleet/ami/host/warm-phone.sh takes the warm snapshot every phone is a clone of, of a
+    /// phone launched as the agent launches a phone slot that boots cold: the same flags in
+    /// the same order, the same guest ports and maps, the agent's certificate, `phone.sh serve`.
+    /// A phone launched otherwise would have another pre-start snapshot key, and its warm
+    /// snapshot another environment than the agent's own cold phones.
+    #[test]
+    fn the_ami_warm_phone_is_launched_as_a_phone_slot_is() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fleet/ami/host/warm-phone.sh");
+        let script = std::fs::read_to_string(path).unwrap();
+        let mut joined = script.replace("\\\n", " ");
+        for (name, value) in script.lines().filter_map(|l| l.split_once('=')) {
+            if name.chars().all(|c| c.is_ascii_uppercase() || c == '_') && !value.contains('$') {
+                joined = joined
+                    .replace(&format!("\"${name}\""), value)
+                    .replace(&format!("${name}"), value);
+            }
+        }
+        let line = joined
+            .lines()
+            .find(|l| l.contains("fcvm podman run"))
+            .expect("warm-phone.sh runs fcvm podman run");
+        let words: Vec<String> = line[line.find("podman run").unwrap()..]
+            .split_whitespace()
+            .take_while(|w| !w.starts_with('>'))
+            .map(str::to_string)
+            .collect();
+        // a map's host side and the app's file name are this host's; the rest must match
+        let normal = |w: &[String]| -> Vec<String> {
+            shape(w)
+                .into_iter()
+                .map(|x| match x.split_once(':') {
+                    Some((host, guest)) if host.contains('/') || host.contains('$') => {
+                        format!("<host>:{guest}")
+                    }
+                    _ if x.starts_with("PHONE_APK=") => "PHONE_APK=<app>".into(),
+                    _ => x,
+                })
+                .collect()
+        };
+        let prefix = super::super::addr::Prefix::parse("2001:db8:1:2:3::/80").unwrap();
+        let phone = VmSpec::for_phone(
+            "fcvm".into(),
+            "fleet-phone-3".into(),
+            "0000:18:00.0".into(),
+            "0.0.0.0",
+            20103,
+            Some(20203),
+            Some((&prefix, "2001:db8:1:2:3::5".parse().unwrap())),
+            &super::super::tls::vm_args(std::path::Path::new(super::super::tls::HOST_DIR)),
+            &PhoneCfg {
+                image: "localhost/fcvm-phone:fleet".into(),
+                aosp: "/mnt/fcvm-btrfs/android-aosp/x".into(),
+                emulator: "/mnt/fcvm-btrfs/android-emulator/y/emulator".into(),
+                apk: "/mnt/fcvm-btrfs/android-aosp/x/phone-work/robotpark-z.apk".into(),
+                snapshot: None,
+            },
+        );
+        assert_eq!(
+            normal(&words),
+            normal(&phone.args()),
+            "warm-phone.sh: {line}"
+        );
+    }
+
     #[test]
     fn spec_builds_the_documented_command() {
         let s = VmSpec {
