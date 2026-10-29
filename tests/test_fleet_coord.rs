@@ -6054,3 +6054,70 @@ async fn admission_keys_reach_renderers_and_layouts_but_no_browser() {
     assert!(!text.is_empty());
     assert!(!text.contains(&key), "a snapshot carries an admission key");
 }
+
+/// A GPU host's hello that arrives during a wake gets its assignment at once, with every
+/// GPU placed and none on standby: while the fleet is still waking, and after the EC2 half
+/// alone made it awake (staging 2026-10-29: awake at 16:21:35, the host's hello at
+/// 16:22:56). The agent starts no VM before its assignment, so an assignment held here is
+/// time a viewer sees black tiles.
+#[tokio::test]
+async fn a_hello_during_a_wake_gets_its_assignment_at_once() {
+    use fleet_core::protocol::SlotReport;
+    for ec2_awake in [false, true] {
+        let config = Config {
+            power_managed: true,
+            idle_scale_down_secs: 1,
+            ec2_max: 2,
+            fcvm_tiles: 8,
+            light_interval_ms: 0,
+            ..Config::default()
+        };
+        let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None, None);
+        // A state starts awake: sleep with no visible page, then wake on one.
+        let mut v = page_viewer(&handle).await;
+        v.send(json!({"type": "visibility", "visible": false}))
+            .await;
+        v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+        v.send(json!({"type": "visibility", "visible": true})).await;
+        v.until(|s| s["fleet"]["power"]["state"] == "waking").await;
+        if ec2_awake {
+            for id in ["ec2-1", "ec2-2"] {
+                handle
+                    .send(Event::Ec2 {
+                        at: 0,
+                        report: SlotReport {
+                            id: id.into(),
+                            phase: "running".into(),
+                            generation: 1,
+                            vm: Some(format!("i-{id}")),
+                            frame_url: Some(format!("wss://{id}.example/frames")),
+                            timings: Default::default(),
+                            error: None,
+                            retry_in_ms: None,
+                            ipv6: None,
+                            ipv4: None,
+                            v4_port: None,
+                            place: None,
+                        },
+                    })
+                    .await;
+            }
+            v.until(|s| s["fleet"]["power"]["state"] == "awake").await;
+        }
+        let t0 = Instant::now();
+        let mut agent = FakeAgent::connect(&handle, "gpu-a", 8);
+        let slots = tokio::time::timeout(Duration::from_secs(1), agent.assign())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("no assignment 1 s after the hello (EC2 awake: {ec2_awake})")
+            });
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        assert_eq!(slots.len(), 8, "EC2 awake: {ec2_awake}");
+        for s in &slots {
+            assert!(
+                s.rect.is_some() && !s.standby && !s.warm,
+                "EC2 awake: {ec2_awake}: {s:?}"
+            );
+        }
+    }
+}

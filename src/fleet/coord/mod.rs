@@ -311,6 +311,20 @@ impl Actor {
                 conn.last_scene = Some(scene.clone());
             }
             if conn.last_assign.as_ref() != Some(&mine) {
+                // Every assignment a host is sent, so a host that starts nothing after one
+                // is told apart from one that was never sent it (issue 1437).
+                let placed = mine.0.iter().filter(|a| a.rect.is_some()).count();
+                let standby = mine.0.iter().filter(|a| a.standby).count();
+                let warm = mine.0.iter().filter(|a| a.warm).count();
+                tracing::info!(
+                    host = %conn.host,
+                    slots = mine.0.len(),
+                    placed,
+                    standby,
+                    warm,
+                    first = conn.last_assign.is_none(),
+                    "assignment sent"
+                );
                 let _ = conn.tx.send(CoordMsg::Assign {
                     slots: mine.0.clone(),
                     region: mine.1,
@@ -582,6 +596,7 @@ impl Actor {
                     self.agents.remove(&c);
                 }
                 let host = host.clone();
+                tracing::info!(%host, conn, "agent hello");
                 self.agents.insert(
                     conn,
                     AgentConn {
