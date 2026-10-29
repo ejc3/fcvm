@@ -51,6 +51,19 @@ export function frameWallMs(f: ShownFrame, localNow: number): number {
   return f.e + 1000 * f.t + Math.min(Math.max(localNow - f.at, 0), SHOWN_ADVANCE_MAX_MS);
 }
 
+/**
+ * The presented frame, if it belongs to the fleet's current waking: none while the fleet is
+ * not awake, and none from before it last woke. Everything the broadcast drives (the overlay's
+ * delay, the recording leaving, the LIVE badge) then waits for a frame of this waking, and
+ * the wake progress runs on live time.
+ */
+export function currentFrame(s: ClientState, frame: ShownFrame | null): ShownFrame | null {
+  const power = s.accepted?.fleet.power;
+  if (frame === null || power === undefined || power.state !== "awake") return null;
+  if (power.woke_at !== null && frame.e + 1000 * frame.t < power.woke_at) return null;
+  return frame;
+}
+
 /** How far the picture is behind the coordinator, ms. */
 export function broadcastLatencyMs(f: ShownFrame, clock: ClockState, localNow: number): number {
   return serverNow(clock, localNow) - frameWallMs(f, localNow);

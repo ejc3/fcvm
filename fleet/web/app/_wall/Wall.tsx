@@ -28,6 +28,7 @@ import {
   serverNow,
   broadcastLatencyMs,
   broadcastShown,
+  currentFrame,
   inputScene,
   watchesBroadcast,
   HUD_BAND,
@@ -405,7 +406,8 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
     client.shown = null;
     client.pinned = null;
   }
-  const shownFrame = inBroadcast ? client.shown : null;
+  // Only a frame of the fleet's current waking: one from before it slept drives nothing.
+  const shownFrame = inBroadcast ? currentFrame(state, client.shown) : null;
   const shown = inBroadcast ? broadcastShown(state, shownFrame, now || 0, client.pinned) : { state, now: now || 0, entry: null };
   if (inBroadcast) client.pinned = shown.entry;
   const latencyMs = shownFrame ? broadcastLatencyMs(shownFrame, state.clock, now || 0) : null;

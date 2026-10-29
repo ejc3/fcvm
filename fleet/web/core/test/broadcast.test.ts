@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   addHistory,
   FrameMatcher,
+  currentFrame,
   inputScene,
   memoUntilFailure,
   broadcastShown,
@@ -314,5 +315,27 @@ describe("the broadcast's lifecycle", () => {
     await expect(load()).resolves.toBe("player");
     await expect(load()).resolves.toBe("player");
     expect(calls).toBe(2);
+  });
+});
+
+describe("a frame from before the fleet slept", () => {
+  function wokeAt(at: number, state: "awake" | "waking"): FleetState {
+    const st = fleet();
+    return { ...st, fleet: { ...st.fleet, power: { ...st.fleet.power, state, woke_at: at } } };
+  }
+  const old = { t: 10, e: EPOCH, at: EPOCH };
+
+  it("is no frame once the fleet has slept and woken: the recording stays until a new one", () => {
+    const s = withSnapshots(admission(LATE), [wokeAt(EPOCH + 60_000, "awake")]);
+    expect(currentFrame(s, old)).toBeNull();
+    const fresh = { t: 70, e: EPOCH, at: EPOCH + 70_000 };
+    expect(currentFrame(s, fresh)).toEqual(fresh);
+  });
+
+  it("is no frame while the fleet wakes, so the wake clock runs on live time", () => {
+    const s = withSnapshots(admission(LATE), [wokeAt(EPOCH + 60_000, "waking")]);
+    expect(currentFrame(s, old)).toBeNull();
+    const shown = broadcastShown(s, currentFrame(s, old), EPOCH + 65_000);
+    expect(shown.now).toBe(EPOCH + 65_000);
   });
 });
