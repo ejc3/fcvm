@@ -160,7 +160,8 @@ describe("color buffers the host destroys", () => {
       [0, "free", [9]],
     ]);
     expect(m.stats.freed).toBe(1);
-    expect(deleted(calls)).toEqual([]);
+    // the buffer's texture stays (name 5's own, which rcBindTexture replaced, goes)
+    expect(deleted(calls)).not.toContain(made(calls)[0]);
     const after = play([
       ...contexts(),
       [1, "rcCreateColorBuffer", [16, 16, 0x1908]],
@@ -221,6 +222,43 @@ describe("color buffers the host destroys, shared and reused", () => {
     const gone = play([...steps, [1, "rcDestroyClientImage", [77]]]);
     expect(deleted(gone.calls)).toContain(made(gone.calls)[0]);
   });
+
+  // Every owner that can outlive a FREE, and every way it lets go: the texture stays until
+  // the last one does, then goes.
+  type Step = [number, string, (number | Uint8Array)[]] | [number, "reply" | "free", number[]];
+  const two: Step[] = [
+    ...contexts(),
+    [1, "rcCreateColorBuffer", [16, 16, 0x1908]],
+    [1, "reply", [9]],
+    [1, "rcCreateColorBuffer", [16, 16, 0x1908]],
+    [1, "reply", [10]],
+  ];
+  const owners: { owner: string; hold: Step[]; lets: Record<string, Step[]> }[] = [
+    {
+      owner: "a window surface",
+      hold: [[1, "rcCreateWindowSurface", [1, 16, 16]], [1, "reply", [3]], [1, "rcSetWindowColorBuffer", [3, 9]]],
+      lets: { "is destroyed": [[1, "rcDestroyWindowSurface", [3]]], "takes another buffer": [[1, "rcSetWindowColorBuffer", [3, 10]]] },
+    },
+    {
+      owner: "a renderbuffer",
+      hold: [[1, "glGenRenderbuffers", [1, 4]], [1, "reply", [6]], [1, "glBindRenderbuffer", [0x8d41, 6]], [1, "rcBindRenderbuffer", [9]]],
+      lets: { "is deleted": [[1, "glDeleteRenderbuffers", [1, u32(6)]]], "takes another buffer": [[1, "rcBindRenderbuffer", [10]]] },
+    },
+    {
+      owner: "a guest texture name",
+      hold: [[1, "glGenTextures", [1, 4]], [1, "reply", [5]], ...bound(5)],
+      lets: { "is deleted": [[1, "glDeleteTextures", [1, u32(5)]]], "takes another buffer": [[1, "rcBindTexture", [10]]] },
+    },
+  ];
+  for (const { owner, hold, lets } of owners)
+    for (const [how, release] of Object.entries(lets))
+      it(`keeps a freed buffer's texture while ${owner} draws with it, and lets it go when it ${how}`, () => {
+        const held = play([...two, ...hold, [0, "free", [9]]]);
+        expect(deleted(held.calls), "deleted while held").not.toContain(made(held.calls)[0]);
+        const after = play([...two, ...hold, [0, "free", [9]], ...release]);
+        expect(deleted(after.calls), "kept after the last owner let go").toContain(made(after.calls)[0]);
+        expect(deleted(after.calls), "the other buffer's texture").not.toContain(made(after.calls)[1]);
+      });
 
   it("does not free a buffer the guest made again with the same handle before the old one's FREE arrived", () => {
     // The tap copies a call's bytes before the host runs it, and the host frees the old

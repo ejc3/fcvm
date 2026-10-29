@@ -582,16 +582,25 @@ export class GlMirror {
       this.restoreRbo();
       this.surfaces.set(handle, { fbo, depth, w, h, cb: null });
     });
-    this.on("rcDestroyWindowSurface", (_c, a) => this.surfaces.delete(n(a[0])));
+    this.on("rcDestroyWindowSurface", (_c, a) => {
+      const s = this.surfaces.get(n(a[0]));
+      if (!s) return;
+      this.surfaces.delete(n(a[0]));
+      gl.deleteFramebuffer(s.fbo);
+      gl.deleteRenderbuffer(s.depth);
+      this.release(s.cb?.tex);
+    });
     this.on("rcSetWindowColorBuffer", (_c, a) => {
       const s = this.surfaces.get(n(a[0]));
       const cb = this.colorBuffers.get(n(a[1]));
       if (!s || !cb) return;
+      const old = s.cb;
       s.cb = cb;
       this.withFbo(s.fbo, () => {
         gl.framebufferTexture2D(GL_FRAMEBUFFER, 0x8ce0, GL_TEXTURE_2D, cb.tex, 0);
         if (s.w === cb.w && s.h === cb.h) gl.framebufferRenderbuffer(GL_FRAMEBUFFER, 0x821a, GL_RENDERBUFFER, s.depth);
       });
+      if (old !== cb) this.release(old?.tex);
     });
     // the surface draws straight into its color buffer: nothing to copy on a flush
     for (const f of ["rcFlushWindowColorBuffer", "rcFlushWindowColorBufferAsync", "rcFlushWindowColorBufferAsyncWithFrameNumber"]) this.on(f, () => {});
@@ -627,7 +636,9 @@ export class GlMirror {
       for (const t of [GL_TEXTURE_2D, GL_TEXTURE_EXTERNAL_OES]) {
         const name = ctx.boundTex.get(`${unit}:${t}`);
         if (name) {
+          const old = ctx.share.textures.get(name);
           ctx.share.textures.set(name, cb.tex);
+          if (old !== cb.tex) this.release(old);
           this.makeCurrent(ctx);
           gl.bindTexture(GL_TEXTURE_2D, cb.tex);
         }
@@ -636,7 +647,11 @@ export class GlMirror {
     this.on("rcBindRenderbuffer", (c, a) => {
       const ctx = c.ctx;
       const cb = this.colorBuffers.get(n(a[0]));
-      if (ctx && cb && ctx.boundRbo) ctx.share.renderbuffers.set(ctx.boundRbo, cb);
+      if (!ctx || !cb || !ctx.boundRbo) return;
+      const old = ctx.share.renderbuffers.get(ctx.boundRbo);
+      ctx.share.renderbuffers.set(ctx.boundRbo, cb);
+      if (old instanceof WebGLRenderbuffer) gl.deleteRenderbuffer(old);
+      else if (old !== cb) this.release(old?.tex);
     });
     this.onReply("rcCreateClientImage", (c, a, r) => {
       const ctx = this.contexts.get(n(a[0])) ?? c.ctx;
@@ -647,7 +662,7 @@ export class GlMirror {
       const t = this.images.get(n(a[0]));
       this.images.delete(n(a[0]));
       // the image may have been the last thing drawing with a freed buffer's texture
-      if (t && !this.texInUse(t)) gl.deleteTexture(t);
+      this.release(t);
     });
     this.on("rcFBPost", (_c, a, call) => this.post(n(a[0]), call));
     const compose = (post: boolean): Handler => (_c, a, call) => this.compose(bytes(a[1]), post, call);
@@ -722,7 +737,7 @@ export class GlMirror {
       ctx.share.textures.delete(id);
       // a texture that names a color buffer is the color buffer's, which outlives it, and
       // another name may draw with it too
-      if (t && !this.texInUse(t)) gl.deleteTexture(t);
+      this.release(t);
     });
     del("glDeleteBuffers", (ctx, id) => {
       gl.deleteBuffer(ctx.share.buffers.get(id) ?? null);
@@ -730,8 +745,9 @@ export class GlMirror {
     });
     del("glDeleteRenderbuffers", (ctx, id) => {
       const r = ctx.share.renderbuffers.get(id);
-      if (r instanceof WebGLRenderbuffer) gl.deleteRenderbuffer(r);
       ctx.share.renderbuffers.delete(id);
+      if (r instanceof WebGLRenderbuffer) gl.deleteRenderbuffer(r);
+      else this.release(r?.tex);
     });
     del("glDeleteFramebuffers", (ctx, id) => {
       gl.deleteFramebuffer(ctx.fbos.get(id) ?? null);
@@ -1147,7 +1163,15 @@ export class GlMirror {
     if (!cb) return;
     this.colorBuffers.delete(handle);
     this.stats.freed++;
-    if (!this.texInUse(cb.tex)) this.gl.deleteTexture(cb.tex);
+    this.release(cb.tex);
+  }
+
+  /**
+   * One owner of `t` let go of it: a FREE, a deleted texture name, renderbuffer, window surface
+   * or client image, or one of those given another buffer. The texture goes with its last owner.
+   */
+  private release(t: WebGLTexture | null | undefined): void {
+    if (t && !this.texInUse(t)) this.gl.deleteTexture(t);
   }
 
   /** A FREE record: the host destroyed the buffer, unless this FREE is a replaced buffer's. */
