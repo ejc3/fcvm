@@ -84,6 +84,29 @@ class ProbeTests(unittest.TestCase):
             smoke.prove_frame(self.tile())
         self.assertEqual(calls, [((self.tile()["frame_url_v4"] + "?h=180",), {})])
 
+    def test_a_direct_token_is_the_first_renderer_message_not_a_url_or_header(self):
+        calls, sent = [], []
+        class Renderer:
+            def __init__(self, *args, **kwargs): calls.append((args, kwargs))
+            def send(self, message): sent.append(message)
+            def message(self, deadline):
+                if sent != [{"admit": "synthetic-direct-token"}]:
+                    raise AssertionError("renderer received no admission before its frame")
+                return 2, b"synthetic frame"
+            def close(self): pass
+        with patch.object(smoke, "Socket", Renderer):
+            smoke.prove_frame(self.tile(), "synthetic-direct-token")
+        self.assertEqual(calls, [((self.tile()["frame_url_v4"] + "?h=180",), {})])
+
+    def test_broadcast_only_or_malformed_admission_cannot_pass_direct_frame_proof(self):
+        for admission in ({"locked": True, "direct": None},
+                          {"locked": False, "direct": None},
+                          {"locked": False, "direct": {"value": ""}},
+                          {"locked": False, "direct": {"value": 123}},
+                          {"direct": {"value": "synthetic-direct-token"}}):
+            with self.subTest(admission=admission), self.assertRaises(AssertionError):
+                smoke.admission_token(admission)
+
     def test_renderer_handshake_requests_a_valid_frame_height(self):
         class Transport:
             closed = False
@@ -139,6 +162,12 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(requests[1].get_header("Cf-access-client-secret"), "synthetic-secret")
 
     def test_a_fast_fcvm_restore_does_not_trip_the_shared_relaunch_limit(self):
+        self.run_relaunch_probe(admitted=False)
+
+    def test_the_probe_keeps_admission_and_renewal_in_both_receive_loops(self):
+        self.run_relaunch_probe(admitted=True)
+
+    def run_relaunch_probe(self, admitted):
         clock = [100.0]
         sent = []
         def tile(half, generation):
@@ -149,11 +178,16 @@ class ProbeTests(unittest.TestCase):
         class Viewer:
             def __init__(self, *args):
                 self.state = {"tiles": [tile("fcvm", 1), tile("ec2", 1)]}
-                self.queue = [{"type": "snapshot", "state": copy.deepcopy(self.state)}]
+                self.queue = ([{"type": "admission", "locked": False,
+                                "direct": {"value": "synthetic-initial"}}] if admitted else [])
+                self.queue.append({"type": "snapshot", "state": copy.deepcopy(self.state)})
                 self.last = None
             def send(self, message):
                 sent.append(clock[0])
                 allowed = self.last is None or clock[0] - self.last >= 2.0
+                if admitted:
+                    self.queue.append({"type": "admission", "locked": False,
+                                       "direct": {"value": "synthetic-renewed"}})
                 self.queue.append({"type": "receipt", "id": message["id"],
                                    "outcome": "committed" if allowed else "refused"})
                 if allowed:
@@ -174,12 +208,15 @@ class ProbeTests(unittest.TestCase):
         env = {"STAGING_API_URL": "https://api.example.test", "STAGING_ORIGIN": "https://stage.example.test",
                "CF_ACCESS_CLIENT_ID": "synthetic-id", "CF_ACCESS_CLIENT_SECRET": "synthetic-secret"}
         with patch.dict(os.environ, env), patch.object(smoke, "Socket", Viewer), patch.object(smoke, "get", get), \
-                patch.object(smoke, "prove_frame"), patch.object(smoke, "prove_resolves", return_value=0.05), \
+                patch.object(smoke, "prove_frame") as frames, patch.object(smoke, "prove_resolves", return_value=0.05), \
                 patch.object(smoke.time, "monotonic", lambda: clock[0]), \
                 patch.object(smoke.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay)):
             smoke.main()
         self.assertEqual(len(sent), 2)
         self.assertGreaterEqual(sent[1] - sent[0], 2.0)
+        self.assertEqual([c.args[1] if len(c.args) > 1 else None for c in frames.call_args_list],
+                         ["synthetic-initial", "synthetic-renewed", "synthetic-renewed", "synthetic-renewed"]
+                         if admitted else [None] * 4)
 
 
 class ResolveTests(unittest.TestCase):

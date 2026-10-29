@@ -392,7 +392,9 @@ async fn once(shared: &Shared, ffmpeg: &str, url: &str, cancel: &CancellationTok
     cmd.args(ffmpeg_args(url))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        // ffmpeg includes the ingest URL (and stream key) in output errors. The
+        // pusher logs its exit status and retry without forwarding those errors.
+        .stderr(Stdio::null())
         .kill_on_drop(true);
     // kill_on_drop cannot run when the aggregator itself is killed (the supervisor's stop is
     // a SIGKILL), and an ffmpeg blocked on a stalled ingest does not exit when its stdin
@@ -651,6 +653,75 @@ mod tests {
         assert_eq!(
             a.last().map(String::as_str),
             Some("rtmps://ingest.example/app/k")
+        );
+    }
+
+    #[test]
+    fn a_failed_ingest_keeps_the_stream_key_out_of_logs() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "FCVM_TEST_PUSHER_STDERR";
+        const URL: &str = "rtmps://ingest.example/app/test-stream-key";
+        if let Some(ffmpeg) = std::env::var_os(CHILD) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let error = rt.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    once(
+                        &Shared::new(),
+                        ffmpeg.to_str().unwrap(),
+                        URL,
+                        &CancellationToken::new(),
+                    ),
+                )
+                .await
+                .expect("the failed ingest exits")
+                .unwrap_err()
+            });
+            eprintln!("pusher diagnostic: {error:#}");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ffmpeg = dir.path().join("ffmpeg");
+        std::fs::write(
+            &ffmpeg,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\nprintf 'Error opening output %s\\n' \"$@\" >&2\nexit 23\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A separate test process captures inherited stderr without redirecting
+        // this process's descriptors while other tests run.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "fleet::aggregate::push::tests::a_failed_ingest_keeps_the_stream_key_out_of_logs",
+                "--nocapture",
+            ])
+            .env(CHILD, &ffmpeg)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let args = std::fs::read_to_string(ffmpeg.with_extension("args")).unwrap();
+        assert_eq!(
+            args.lines().last(),
+            Some(URL),
+            "the real pusher ran the child"
+        );
+        let logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            logs.contains("ffmpeg exited"),
+            "generic failure stays visible"
+        );
+        assert!(
+            !logs.contains("test-stream-key"),
+            "the stream key was logged"
         );
     }
 

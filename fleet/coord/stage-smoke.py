@@ -126,12 +126,23 @@ def frame_host(url):
     return parsed.hostname
 
 
-def prove_frame(tile):
+def admission_token(message):
+    """Frame proof needs a direct seat, never the broadcast-only fallback."""
+    direct = message.get("direct")
+    if (message.get("locked") is not False or not isinstance(direct, dict)
+            or not isinstance(direct.get("value"), str) or not direct["value"]):
+        raise AssertionError("staging did not admit the probe to direct streams")
+    return direct["value"]
+
+
+def prove_frame(tile, token=None):
     """A DNS record alone is insufficient: require a binary renderer packet over IPv4/TLS."""
     url = tile["frame_url_v4"]
     frame_host(url)
     connection = Socket(url + "?h=180")  # No Access credentials are ever sent to a renderer.
     try:
+        if token is not None:
+            connection.send({"admit": token})  # First message, never a URL or an HTTP header.
         deadline = time.monotonic() + 40
         while time.monotonic() < deadline:
             opcode, payload = connection.message(deadline)
@@ -301,23 +312,29 @@ def main():
     try:
         deadline = time.monotonic() + 720
         interval, next_relaunch = relaunch_interval_seconds(), 0.0
-        state = {}
+        state, direct = {}, None
+        def receive():
+            nonlocal state, direct
+            opcode, payload = connection.message(deadline)
+            if opcode != 1:
+                return {}
+            message = json.loads(payload)
+            if message.get("type") == "snapshot":
+                state = message["state"]
+            elif message.get("type") == "admission":
+                direct = admission_token(message)
+            return message
+
         def until(predicate):
-            nonlocal state
             while time.monotonic() < deadline:
                 if predicate(state):
                     return state
-                opcode, payload = connection.message(deadline)
-                if opcode != 1:
-                    continue
-                message = json.loads(payload)
-                if message.get("type") == "snapshot":
-                    state = message["state"]
+                receive()
             raise TimeoutError("staging did not reach the required state")
         for half in ("fcvm", "ec2"):
             until(lambda s: ready(s, half))
             old = dict(ready(state, half))
-            prove_frame(old)
+            prove_frame(old, direct)
             delay = next_relaunch - time.monotonic()
             if delay > 0:
                 time.sleep(delay)
@@ -325,12 +342,7 @@ def main():
             connection.send({"type": "intent", "id": intent, "name": "relaunch", "args": {"tile": old["id"]}})
             # A refused intent must fail explicitly, rather than wait for an unrelated scheduled race.
             while True:
-                opcode, payload = connection.message(deadline)
-                if opcode != 1:
-                    continue
-                message = json.loads(payload)
-                if message.get("type") == "snapshot":
-                    state = message["state"]
+                message = receive()
                 if message.get("type") == "receipt" and message.get("id") == intent:
                     if message.get("outcome") != "committed":
                         raise AssertionError("staging refused the relaunch")
@@ -343,7 +355,7 @@ def main():
             fresh(old, new)
             # Before anything else looks the names up: each resolver's first query.
             slowest = prove_resolves(new)
-            prove_frame(new)
+            prove_frame(new, direct)
             print(json.dumps({"half": half, "freshLaunchNames": True, "freshNamesResolved": True,
                               "resolveMsMax": round(slowest * 1000), "ipv4RendererFrames": True}), flush=True)
     finally:
