@@ -513,13 +513,23 @@ mod tests {
             "{got:?}"
         );
         assert_eq!(got[1], "<ingest url>: I/O error");
-        // And the push pipes ffmpeg's stderr through it rather than inheriting it.
+        // And the push pipes ffmpeg's stderr through it rather than inheriting it: the body
+        // of `once` alone, whitespace removed, so this test's own text cannot match.
         let src = include_str!("push.rs");
-        let once = &src[src.find("async fn once(").unwrap()..];
+        let start = src.find("async fn once(").unwrap();
+        let body: String = src[start..start + src[start..].find("\n}\n").unwrap()]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
         assert!(
-            once.contains(".stderr(Stdio::piped())") && !once[..2000].contains("Stdio::inherit()")
+            body.contains(".stderr(Stdio::piped())"),
+            "stderr is not piped"
         );
-        assert!(once.contains("relay_stderr(stderr, &relay_url"));
+        assert!(!body.contains("Stdio::inherit()"), "stderr is inherited");
+        assert!(
+            body.contains("relay_stderr(stderr,&relay_url,"),
+            "ffmpeg's stderr is not relayed"
+        );
     }
 
     #[test]
