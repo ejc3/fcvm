@@ -209,24 +209,32 @@ void PhoneSource::mirror(Conn& c, const std::string& token) {
   size_t queued = 0;
   std::atomic<bool> done{false};
   bool writer_finished = false;  // under qmu
+  std::string close_msg;          // under qmu: the close frame, the writer's last message
   std::thread writer, reader;
   bool started = start_thread(
       [&] {
         while (true) {
           std::string m;
-          bool last;
+          bool last = false;
           {
             std::unique_lock<std::mutex> l(qmu);
-            qcv.wait(l, [&] { return done.load() || !q.empty(); });
-            if (q.empty()) break;
-            m = std::move(q.front());
-            q.pop_front();
-            queued -= m.size();
-            // once done, the queue holds only the close frame
-            last = done.load();
+            qcv.wait(l, [&] { return done.load() || !q.empty() || !close_msg.empty(); });
+            if (!q.empty()) {
+              m = std::move(q.front());
+              q.pop_front();
+              queued -= m.size();
+            } else if (!close_msg.empty()) {
+              // the close frame is kept apart from the data: only it is sent whoever holds the phone
+              m = std::move(close_msg);
+              close_msg.clear();
+              last = true;
+            } else {
+              break;
+            }
           }
           // a stream whose holder changed sends nothing more but its close
-          if ((!last && !holds()) || !c.write_all(m.data(), m.size())) break;
+          if (!last && !holds()) continue;
+          if (!c.write_all(m.data(), m.size()) || last) break;
         }
         std::lock_guard<std::mutex> l(qmu);
         writer_finished = true;
@@ -314,7 +322,7 @@ void PhoneSource::mirror(Conn& c, const std::string& token) {
     std::unique_lock<std::mutex> l(qmu);
     q.clear();
     queued = 0;
-    q.push_back(close_frame(code, reason));
+    close_msg = close_frame(code, reason);
     done.store(true);
     qcv.notify_all();
     // A viewer that stopped reading leaves the writer blocked in a write: after 2 s the socket
