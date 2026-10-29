@@ -29,12 +29,23 @@ ms() { date +%s%3N; }
 health() { curl -fsS -m 2 "http://127.0.0.1:$1/health" 2>/dev/null; }
 install -d -m 0700 "$TLS_DIR"
 python3 - "$TLS_DIR/tls.json" <<'PY' || { echo "warm-phone: cannot write the certificate"; exit 1; }
-import json, os, sys, boto3
+import json, os, secrets, sys, boto3
 doc = json.loads(boto3.client("secretsmanager", region_name=os.environ.get("FLEET_SECRET_REGION", "us-east-2"))
                  .get_secret_value(SecretId=os.environ.get("FLEET_TLS_SECRET", "fcvm-fleet/tls-wildcard"))["SecretString"])
+out = {"cert": doc["cert"], "key": doc["key"]}
+# A scene token for this build only, never the fleet's: the streamer holds the token it read,
+# and the warm snapshot (memory included) goes into the AMI and the store. A fleet host's
+# agent writes the real one into this file (src/fleet/agent/tls.rs), and the streamer reads
+# the file again when it changes, so a restored phone takes the agent's token. Its header
+# goes to a file of its own, so the token is never on a command line.
+token = secrets.token_urlsafe(32)
+out["scene_token"] = token
 fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w") as f:
-    json.dump({"cert": doc["cert"], "key": doc["key"]}, f)
+    json.dump(out, f)
+fd = os.open(os.path.join(os.path.dirname(sys.argv[1]), "scene-auth"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write("Authorization: Bearer %s\n" % token)
 PY
 T=$(curl -fsS -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 60" http://169.254.169.254/latest/api/token)
 M=$(curl -fsS -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/mac)
@@ -84,7 +95,7 @@ posted=0 ok=0
 for _ in $(seq 1 600); do
   h=$(health 20095 || true)
   if [ -n "$h" ] && [ $posted = 0 ]; then
-    curl -fsS -m 2 -H 'Content-Type: application/json' -d "{\"epoch_unix_ms\":$(( $(ms) - 1000 )),\"rect\":{\"x\":0,\"y\":0,\"w\":1,\"h\":1},\"image_aspect\":0.5625}" \
+    curl -fsS -m 2 -H @"$TLS_DIR/scene-auth" -H 'Content-Type: application/json' -d "{\"epoch_unix_ms\":$(( $(ms) - 1000 )),\"rect\":{\"x\":0,\"y\":0,\"w\":1,\"h\":1},\"image_aspect\":0.5625}" \
       http://127.0.0.1:20095/scene > /dev/null && posted=1
   fi
   [ "$(jq -r '.phone.scene_frames // 0' <<< "${h:-{\}}" 2>/dev/null)" -gt 0 ] 2>/dev/null && { ok=1; break; }
