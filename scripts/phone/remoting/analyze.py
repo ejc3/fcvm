@@ -39,6 +39,7 @@ TEX = re.compile(r"^(gles1:)?gl(Compressed)?Tex(Sub)?Image[23]D(OES)?$")
 BUF = re.compile(r"^(gles1:)?gl(BufferData|BufferDataSyncAEMU|BufferSubData|UnmapBuffer\w*AEMU|FlushMappedBufferRange\w*AEMU)$")
 CLIENT_ARRAYS = re.compile(r"^(gles1:)?gl(\w*PointerData\w*|Draw\w*Data(Null)?AEMU|DrawElementsData)$")
 CB_UPLOAD = re.compile(r"^rcUpdateColorBuffer$")
+SHADER = re.compile(r"^(gles1:)?gl(ShaderString|ShaderSource|ShaderBinary|ProgramBinary(OES)?|CreateShaderProgramv(AEMU)?)$")
 SWAP = {"rcFlushWindowColorBuffer", "rcFlushWindowColorBufferAsync", "rcFlushWindowColorBufferAsyncWithFrameNumber"}
 COMPOSE = {"rcCompose", "rcComposeAsync", "rcComposeWithoutPost", "rcComposeAsyncWithoutPost"}
 
@@ -108,6 +109,8 @@ def agg(ls, puids=None):
             cat["client_arrays"] += b
         elif CB_UPLOAD.match(n):
             cat["colorbuffer_upload"] += b
+        elif SHADER.match(n):
+            cat["shader"] += b
         if n in SWAP:
             cat["swaps"] += c
         if n in COMPOSE:
@@ -145,10 +148,10 @@ def summarize(lines, w):
     bytes_top = sorted(ops.items(), key=lambda kv: -kv[1][1])[:8]
     # startup: from the launch to the end of the second holding the first frame, and to the window
     first = overlapping(lines, t_launch, t_first + 1)
-    st_all, *_ = agg(first)
+    st_all, _, _, st_cat = agg(first)
     st_app, *_ = agg(first, new) if new else (st_all,)
     settle = overlapping(lines, t_launch, t0)
-    se_all, *_ = agg(settle)
+    se_all, _, _, se_cat = agg(settle)
     se_app, *_ = agg(settle, new) if new else (se_all,)
     gfx = open(os.path.join(RUN, f"{w}.gfxinfo.txt")).read() if os.path.exists(os.path.join(RUN, f"{w}.gfxinfo.txt")) else ""
     g = re.search(r"Total frames rendered: (\d+)", gfx)
@@ -165,8 +168,28 @@ def summarize(lines, w):
         if os.path.exists(p):
             extra[k] = json.load(open(p))
     hw = open(os.path.join(RUN, f"{w}.hwui.txt")).read().split("\n") if os.path.exists(os.path.join(RUN, f"{w}.hwui.txt")) else []
+    # The thread whose frames are the app's content: of the app's threads that swap, the one
+    # sending the most bytes; with none (video), the composer's frames.
+    app_threads = {k: v for k, v in threads.items() if (not new) or k[0] in new}
+    swapping = {k: v for k, v in app_threads.items() if v.get("swaps")}
+    if swapping:
+        mk, mv = max(swapping.items(), key=lambda kv: kv[1]["read"])
+        main = {"kind": "app", "frames_ps": mv["swaps"] / secs, "replies_ps": mv["replies"] / secs,
+                "replies_per_frame": mv["replies"] / mv["swaps"], "read_Bps": mv["read"] / secs}
+    else:
+        mk, mv = max(threads.items(), key=lambda kv: kv[1].get("composes", 0))
+        main = {"kind": "composer", "frames_ps": mv.get("composes", 0) / secs, "replies_ps": mv["replies"] / secs,
+                "replies_per_frame": mv["replies"] / mv["composes"] if mv.get("composes") else None,
+                "read_Bps": mv["read"] / secs}
+    ck, cv = max(threads.items(), key=lambda kv: kv[1].get("composes", 0))
+    composer = {"frames_ps": cv.get("composes", 0) / secs, "replies_ps": cv["replies"] / secs,
+                "replies_per_frame": cv["replies"] / cv["composes"] if cv.get("composes") else None}
+    app_replies = sum(v["replies"] for v in app_threads.values())
+    main["app_replies_per_frame"] = app_replies / (main["frames_ps"] * secs) if main["frames_ps"] else None
     s = {
         "workload": w,
+        "main": main,
+        "composer": composer,
         "seconds": secs,
         "hwui_prop": hw[0] if hw else "",
         "pipeline": pipe.group(1).strip() if pipe else None,
@@ -181,6 +204,7 @@ def summarize(lines, w):
             "buffer_upload_Bps": cat["buffer_upload"] / secs,
             "client_arrays_Bps": cat["client_arrays"] / secs,
             "colorbuffer_upload_Bps": cat["colorbuffer_upload"] / secs,
+            "shader_Bps": cat["shader"] / secs,
             "colorbuffer_dma_calls_ps": cat["colorbuffer_dma_calls"] / secs,
             "replies_ps": a["replies"] / secs,
             "reply_Bps": a["reply_bytes"] / secs,
@@ -213,6 +237,8 @@ def summarize(lines, w):
             "to_window_all_bytes": se_all["read"],
             "to_window_app_bytes": se_app["read"],
             "to_window_s": (t0 - t_launch) / 1000,
+            "to_first_frame_categories": {k: st_cat[k] for k in ("shader", "texture_upload", "buffer_upload", "client_arrays", "colorbuffer_upload")},
+            "to_window_categories": {k: se_cat[k] for k in ("shader", "texture_upload", "buffer_upload", "client_arrays", "colorbuffer_upload")},
         },
         "capture": cap,
         **extra,
@@ -237,7 +263,7 @@ def main():
         al, ap = s["all"], s["app"]
         print(f"{w:16} {s['pipeline'] or s['hwui_prop']:<16} in {al['read_Bps']/1e6:7.2f} MB/s (gl {al['gles_Bps']/1e6:.2f} rc {al['rc_Bps']/1e6:.2f} vk {al['vk_Bps']/1e6:.2f})"
               f" tex {al['texture_upload_Bps']/1e6:.2f} buf {al['buffer_upload_Bps']/1e6:.2f} replies {al['replies_ps']:.0f}/s out {al['reply_Bps']/1e3:.1f} kB/s"
-              f" | app fps {ap['frames_ps']:.1f} rt/frame {ap['replies_per_frame'] or 0:.1f}")
+              f" | main fps {s['main']['frames_ps']:.1f} rt/frame {s['main']['replies_per_frame'] or 0:.1f} (app {s['main']['app_replies_per_frame'] or 0:.1f}) composer rt/frame {s['composer']['replies_per_frame'] or 0:.1f}")
 
 
 main()

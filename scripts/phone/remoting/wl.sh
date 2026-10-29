@@ -22,11 +22,14 @@ until_end() { while [ "$(ms)" -lt "$END" ]; do "$@"; done; }
 
 # Each workload: pkg (for gfxinfo), launch (prints am start output), and a step for the window.
 WORKLOADS="robotpark launcher settings shade firefox_article firefox_images wikipedia maps vlc game"
-URL_ARTICLE=https://en.wikipedia.org/wiki/Android_\(operating_system\)
+URL_ARTICLE=https://en.wikipedia.org/wiki/Android_%28operating_system%29
 URL_IMAGES=https://commons.wikimedia.org/wiki/Commons:Featured_pictures/Animals/Mammals
 WIKI_ARTICLE=https://en.wikipedia.org/wiki/Moon
 
-am_view() { S am start -W -a android.intent.action.VIEW -d "$1" ${2:+-t "$2"} -n "$3"; }
+am_view() { # url, type, component or package
+  if [[ "$3" == */* ]]; then S am start -W -a android.intent.action.VIEW -d "$1" ${2:+-t "$2"} -n "$3"
+  else S am start -W -a android.intent.action.VIEW -d "$1" ${2:+-t "$2"} "$3"; fi
+}
 scroll_page() { # ten flings down, ten up
   local i
   for i in 1 2 3 4 5 6 7 8 9 10; do swipe 360 1000 360 350 300; sleep 0.6; [ "$(ms)" -lt "$END" ] || return; done
@@ -43,7 +46,7 @@ pkg_of() {
   wikipedia) echo org.wikipedia ;;
   maps) echo app.organicmaps ;;
   vlc) echo org.videolan.vlc ;;
-  game) echo "${GAME_PKG:-org.supertuxkart.stk}" ;;
+  game) echo org.supertuxkart.stk ;;
   esac
 }
 
@@ -57,10 +60,24 @@ launch() {
   shade) key HOME; echo "Status: ok (no launch)" ;;
   firefox_article) am_view "$URL_ARTICLE" "" org.mozilla.fennec_fdroid/org.mozilla.fenix.IntentReceiverActivity ;;
   firefox_images) am_view "$URL_IMAGES" "" org.mozilla.fennec_fdroid/org.mozilla.fenix.IntentReceiverActivity ;;
-  wikipedia) am_view "$WIKI_ARTICLE" "" org.wikipedia/.main.MainActivity ;;
-  maps) am_view "geo:43.7347,7.4206?z=16" "" app.organicmaps/.SplashActivity ;;
-  vlc) am_view file:///sdcard/Movies/bbb720.mp4 video/mp4 org.videolan.vlc/.gui.video.VideoPlayerActivity ;;
-  game) S am start -W -n "${GAME_ACTIVITY:?GAME_ACTIVITY}" ;;
+  wikipedia) am_view "$WIKI_ARTICLE" "" org.wikipedia ;;
+  maps) am_view "geo:39.7285,-121.8375?z=15" "" app.organicmaps ;;
+  vlc) S am start -W -a android.intent.action.VIEW -d file:///sdcard/Movies/bbb720.mp4 -t video/mp4 --ez from_start true -n org.videolan.vlc/.gui.video.VideoPlayerActivity ;;
+  game) S am start -W -n org.supertuxkart.stk/.SuperTuxKartActivity ;;
+  esac
+}
+
+# after the launch's settle time: what each app needs before its window
+post_launch() {
+  case "$1" in
+  maps) tap 663 895; sleep 1 ;;   # close the place card the geo intent opens
+  game)                           # SuperTuxKart (landscape 1280x720): a Novice race on Nessie's Pond
+    tap 408 470; sleep 3          # Singleplayer
+    tap 1203 590; sleep 3         # Tux, continue
+    tap 185 215; sleep 1          # Novice
+    tap 215 505; sleep 3          # Normal Race
+    tap 729 427; sleep 2          # Nessie's Pond
+    tap 1068 620; sleep 20 ;;     # Start Race: load and countdown
   esac
 }
 
@@ -81,12 +98,11 @@ step() {
     swipe 360 2 360 900 300; sleep 1       # quick settings
     swipe 360 1250 360 100 250; sleep 1 ;; # collapse
   firefox_*|wikipedia) scroll_page ;;
-  maps)
+  maps)                                    # pan four ways, zoom in twice and out twice (buttons)
     swipe 200 640 520 640 400; sleep 0.8; swipe 360 400 360 900 400; sleep 0.8
     swipe 520 640 200 640 400; sleep 0.8; swipe 360 900 360 400 400; sleep 0.8
-    tap 360 640; sleep 0.08; tap 360 640; sleep 1.2                 # double tap: zoom in
-    S am start -a android.intent.action.VIEW -d "geo:43.7347,7.4206?z=15" app.organicmaps > /dev/null; sleep 1.2 ;;
-  game) sleep 1 ;;
+    tap 656 384; sleep 1; tap 656 384; sleep 1; tap 656 496; sleep 1; tap 656 496; sleep 1 ;;
+  game) swipe 205 512 100 512 1500; sleep 0.3; swipe 205 512 310 512 1500; sleep 0.3 ;;  # steer left, right
   esac
 }
 
@@ -106,7 +122,7 @@ run)
   total=$(grep -o 'TotalTime: [0-9]*' <<< "$out" | grep -o '[0-9]*' || true)
   mark launch_done "\"total_time_ms\":${total:-null},\"status\":\"$(grep -m1 -o 'Status: [a-z]*' <<< "$out" | cut -d' ' -f2)\""
   sleep "${SETTLE:-15}"
-  [ "$W" = game ] && [ -n "${GAME_START:-}" ] && { eval "$GAME_START"; }
+  post_launch "$W"
   S dumpsys gfxinfo "$PKG" reset > /dev/null
   # the steady window: capture the screen, dump 10 s of the stream from 20 s in
   "$STREAMER" capture "$STEADY" "$OUT/$W.nv12" > "$OUT/$W.capture.json" 2> "$OUT/$W.capture.err" &

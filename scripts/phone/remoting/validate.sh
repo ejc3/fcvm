@@ -18,7 +18,7 @@ pid=$(S pidof dev.fcvm.robotpark)
 S rm -f /data/local/tmp/st.txt
 S kill -STOP "$pid"; mark stopped "\"pid\":$pid"
 sleep 3
-S "nohup strace -f -qq -y -s 0 -e trace=read,write,readv,writev -e signal=none -o /data/local/tmp/st.txt -p $pid > /dev/null 2>&1 &"
+S "nohup strace -f -qq -ttt -y -s 0 -e trace=read,write,readv,writev -e signal=none -o /data/local/tmp/st.txt -p $pid > /dev/null 2>&1 &"
 sleep 3
 mark cont; S kill -CONT "$pid"
 sleep "$SECS"
@@ -26,6 +26,11 @@ S kill -STOP "$pid"; mark stopped_again
 sleep 3
 S pkill -INT strace; sleep 3
 S kill -CONT "$pid"; mark resumed
+# the guest clock against ours: our time before and after one guest date
+for i in 1 2 3 4 5; do
+  a=$(ms); g=$(S date +%s%N); b=$(ms)
+  printf '{"ev":"clock%s","t_ms":%s,"before":%s,"after":%s,"guest_ns":%s}\n' "$i" "$b" "$a" "$b" "$g" >> "$M"
+done
 S cat /proc/"$pid"/status | grep -E '^(Name|Threads)'
 "$ADB" pull /data/local/tmp/st.txt "$OUT/validate.strace.txt" > /dev/null
 wc -l "$OUT/validate.strace.txt"
