@@ -272,6 +272,49 @@
       "name": "phones_zoom",
       "type": "intent",
       "viewer": "v3"
+    },
+    {
+      "at": 56000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20101/frames",
+        "generation": 2,
+        "id": "phone-1",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-phone-1"
+      },
+      "type": "agent"
+    },
+    {
+      "args": {},
+      "at": 56500,
+      "client": "198.51.100.22",
+      "id": "r1",
+      "name": "claim_phone",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "args": {
+        "claim": "phone-claim-9"
+      },
+      "at": 57000,
+      "client": "198.51.100.22",
+      "id": "r2",
+      "name": "release_phone",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "args": {},
+      "at": 57500,
+      "client": "198.51.100.22",
+      "id": "r3",
+      "name": "release_phone",
+      "type": "intent",
+      "viewer": "v3"
     }
   ],
   "expect": [
@@ -444,6 +487,30 @@
       "checks": {
         "/receipts/z5/reason": "args.out must be true or false"
       }
+    },
+    {
+      "after": 25,
+      "checks": {
+        "/receipts/r1/outcome": "committed",
+        "/view/phones/tiles/0/borrowed/viewer": "v3"
+      }
+    },
+    {
+      "after": 26,
+      "checks": {
+        "/receipts/r2/outcome": "refused",
+        "/receipts/r2/reason": "\"phone-claim-9\" is not this viewer's phone"
+      }
+    },
+    {
+      "after": 27,
+      "checks": {
+        "/assign/h1/1/generation": 3,
+        "/receipts/r3/outcome": "committed",
+        "/view/phones/tiles/0/borrowed": null,
+        "/view/phones/tiles/0/last_relaunch/by": "return:phone-claim-3"
+      },
+      "note": "giving a phone back restores it"
     }
   ],
   "final_view": {
@@ -596,6 +663,35 @@
         "outcome": "refused",
         "summary": "args.out must be true or false",
         "viewer": "v3"
+      },
+      {
+        "args": {},
+        "at": 56500,
+        "id": "r1",
+        "name": "claim_phone",
+        "outcome": "committed",
+        "summary": "phone-claim-3 on phone-1",
+        "viewer": "v3"
+      },
+      {
+        "args": {
+          "claim": "phone-claim-9"
+        },
+        "at": 57000,
+        "id": "r2",
+        "name": "release_phone",
+        "outcome": "refused",
+        "summary": "\"phone-claim-9\" is not this viewer's phone",
+        "viewer": "v3"
+      },
+      {
+        "args": {},
+        "at": 57500,
+        "id": "r3",
+        "name": "release_phone",
+        "outcome": "committed",
+        "summary": "release phone",
+        "viewer": "v3"
       }
     ],
     "aggregates": [
@@ -737,7 +833,7 @@
           "fps": null,
           "frame_url": "ws://h1:20101/frames",
           "frame_url_v4": null,
-          "generation": 2,
+          "generation": 3,
           "gpu": {
             "name": "Tesla T4",
             "sbdf": "0000:02:00.0"
@@ -747,8 +843,8 @@
           "host": "h1",
           "id": "phone:1",
           "last_relaunch": {
-            "by": "return:phone-claim-2",
-            "clicked_at": 52000,
+            "by": "return:phone-claim-3",
+            "clicked_at": 57500,
             "first_frame_at": null,
             "phases": {}
           },
