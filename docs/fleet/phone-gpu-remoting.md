@@ -10,10 +10,10 @@ phone streams at the 20 Mbit/s cap.
 
 Two designs are compared:
 
-- **Phone as the only renderer.** Every point where the guest waits for the host (a call
-  with output, a sync object it creates, a readback) becomes a network round trip.
-- **Mirror.** The T4 keeps rendering and answers every round trip. The phone receives a
-  copy of the command stream and replays it, so only one-way bandwidth matters.
+- **Phone as the only renderer.** Every point where the guest waits for the host (a call with
+  output, a sync object it creates, a readback) becomes a network round trip.
+- **Mirror.** The T4 keeps rendering and answers every round trip. The phone receives a copy
+  of the command stream and replays it, so only one-way bandwidth matters.
 
 ## Result
 
@@ -36,17 +36,18 @@ caught.
 | VLC 720p | 0.04 | 0.00 | 0.60 | 72 | 24.0 | 3.0 | 16.7 / 6.7 / 3.3 |
 | SuperTuxKart | 1,156 | 168 | 1.02 | 253 | 83.3 | 1.0 | 16.7 / 6.7 / 3.3 |
 
-- *stream*: everything the guest sent to the host decoder, all threads and processes.
-  *after zstd -3*: that rate divided by the ratio zstd -3 reached on a 10 s dump of the same
-  window, each render thread's stream compressed on its own.
-- *video at CRF 23*: the same 60 s of screen, captured from the emulator and encoded with
-  x264 (preset medium, High profile, CRF 23, keyframe every 2 s). The configured CBR is
-  20 Mbit/s for every workload.
+- *stream*: everything the guest sent to the host decoder, all threads and processes. *after
+  zstd -3*: that rate divided by the ratio zstd -3 reached on a 10 s dump of the same window,
+  each render thread's stream compressed on its own.
+- *video at CRF 23*: the same 60 s of screen, captured from the emulator at 30 fps (the
+  newest frame at each tick; the streamer's NVENC stream is 30 fps too) and encoded with x264
+  (preset medium, High profile, CRF 23, keyframe every 2 s). The configured CBR is 20 Mbit/s
+  for every workload.
 - *main frames/s*: the frames the app's main rendering thread swapped (VLC: the frames the
   composer composed, as the video never reaches the app's GL).
 - *frames/s at RTT*: the most frames a second the main thread and the composer could each
-  reach if every round trip cost one RTT and nothing else in a frame took time, the lower
-  of the two: `min(frames/s, 1 / (round trips per frame x RTT))`. The composer makes 3 round
+  reach if every round trip cost one RTT and nothing else in a frame took time, the lower of
+  the two: `min(frames/s, 1 / (round trips per frame x RTT))`. The composer makes 3 round
   trips per composed frame in every workload, so no workload can pass 16.7, 6.7 and 3.3.
 
 **Phone as the only renderer does not work.** Every frame waits on the host on two threads. The
@@ -106,8 +107,8 @@ decoder, length, bytes), for the compression measurement.
 Not on the channel, so not counted:
 
 - Vulkan host-visible memory, which the guest writes directly through its mapping.
-- The payloads of `rcUpdateColorBufferDMA` and `rcReadColorBufferDMA`, which use the
-  goldfish DMA region (no workload made either call).
+- The payloads of `rcUpdateColorBufferDMA` and `rcReadColorBufferDMA`, which use the goldfish
+  DMA region (no workload made either call).
 - Video decoded by the emulator's codec (`c2.goldfish.h264.decoder`, which VLC uses), whose
   frames reach host color buffers through the media pipe.
 
@@ -186,10 +187,12 @@ be restarted without root, so neither is reported.
 Each workload is one run of `wl.sh run <workload>`. It force-stops the app, goes home, launches
 it with `am start -W` (whose TotalTime is the time to the first frame), waits 15 s, and then
 repeats the same `adb shell input` steps until 60 s have passed. During the window the screen
-is captured from the emulator's gRPC screen stream at 30 fps (raw NV12, encoded afterwards),
-and the stream is dumped for the 10 s from 20 s in. Rates are over the whole seconds inside the
-window: 59 to 64, as the last step may run past 60 s. F-Droid APKs were checked against the
-SHA-256 in F-Droid's index.
+is read from the emulator's gRPC screen stream, which delivers every frame the display posts
+(the *display updates/s* row, up to 60). The capture writes the newest of them every 1/30 s as
+raw NV12, the streamer's NVENC frame rate, and x264 encodes those 30 fps afterward. The stream
+is dumped for the 10 s from 20 s in. Rates are over the whole seconds inside the window: 59 to
+64, as the last step may run past 60 s. F-Droid APKs were checked against the SHA-256 in
+F-Droid's index.
 
 | workload | app | in the 60 s window |
 |---|---|---|
@@ -239,9 +242,9 @@ mapped-buffer writes (`glUnmapBufferAEMU`, `glFlushMappedBufferRangeAEMU`).
 | startup: bytes to first frame (MB) | 4.51 | 1.26 |
 | startup: bytes in the 16 s before the window (MB) | 18.2 | 16.8 |
 |   of which shaders / textures / buffers (MB) | 0.08 / 2.03 / 2.03 | 0.08 / 1.11 / 2.04 |
-| screen updates/s (captured) | 58.7 | 58.5 |
+| display updates/s (the emulator's screen stream; the capture is 30 fps) | 58.7 | 58.5 |
 | video, configured NVENC CBR (Mbit/s) | 20.0 | 20.0 |
-| video, x264 CRF 23 of the captured screen (Mbit/s) | 3.68 | 3.67 |
+| video, x264 CRF 23 of the 30 fps capture (Mbit/s) | 3.68 | 3.67 |
 | command stream after zstd -3 / lz4 (Mbit/s) | 0.46 / 1.3 | 0.46 / 1.3 |
 |   ratio zstd -3 / lz4, on a sample of (MB) | 15.8 / 5.6, 8.7 | 15.6 / 5.6, 8.5 |
 | frames/s if each round trip costs 20 ms: main thread, composer | 50.0, 16.7 | 50.0, 16.7 |
@@ -270,9 +273,9 @@ mapped-buffer writes (`glUnmapBufferAEMU`, `glFlushMappedBufferRangeAEMU`).
 | startup: bytes to first frame (MB) | 1.22 | 0.33 |
 | startup: bytes in the 15 s before the window (MB) | 3.8 | 1.6 |
 |   of which shaders / textures / buffers (MB) | 0.03 / 1.16 / 1.76 | 0.03 / 1.12 / 0.27 |
-| screen updates/s (captured) | 28.5 | 28.5 |
+| display updates/s (the emulator's screen stream; the capture is 30 fps) | 28.5 | 28.5 |
 | video, configured NVENC CBR (Mbit/s) | 20.0 | 20.0 |
-| video, x264 CRF 23 of the captured screen (Mbit/s) | 0.54 | 0.53 |
+| video, x264 CRF 23 of the 30 fps capture (Mbit/s) | 0.54 | 0.53 |
 | command stream after zstd -3 / lz4 (Mbit/s) | 0.11 / 0.43 | 0.11 / 0.38 |
 |   ratio zstd -3 / lz4, on a sample of (MB) | 22.6 / 6.0, 3.6 | 23.0 / 6.4, 3.5 |
 | frames/s if each round trip costs 20 ms: main thread, composer | 15.1, 15.8 | 15.1, 16.0 |
@@ -301,9 +304,9 @@ mapped-buffer writes (`glUnmapBufferAEMU`, `glFlushMappedBufferRangeAEMU`).
 | startup: bytes to first frame (MB) | 1.50 | 0.83 |
 | startup: bytes in the 16 s before the window (MB) | 2.5 | 2.5 |
 |   of which shaders / textures / buffers (MB) | 0.01 / 1.22 / 0.98 | 0.01 / 0.50 / 1.59 |
-| screen updates/s (captured) | 46.6 | 46.3 |
+| display updates/s (the emulator's screen stream; the capture is 30 fps) | 46.6 | 46.3 |
 | video, configured NVENC CBR (Mbit/s) | 20.0 | 20.0 |
-| video, x264 CRF 23 of the captured screen (Mbit/s) | 1.36 | 1.42 |
+| video, x264 CRF 23 of the 30 fps capture (Mbit/s) | 1.36 | 1.42 |
 | command stream after zstd -3 / lz4 (Mbit/s) | 0.75 / 3.7 | 0.74 / 3.7 |
 |   ratio zstd -3 / lz4, on a sample of (MB) | 19.7 / 4.0, 16.7 | 19.8 / 4.0, 16.8 |
 | frames/s if each round trip costs 20 ms: main thread, composer | 10.9, 16.7 | 10.9, 16.7 |
@@ -332,9 +335,9 @@ mapped-buffer writes (`glUnmapBufferAEMU`, `glFlushMappedBufferRangeAEMU`).
 | startup: bytes to first frame (MB) | 0.00 | 0.00 |
 | startup: bytes in the 15 s before the window (MB) | 1.0 | 0.14 |
 |   of which shaders / textures / buffers (MB) | 0.01 / 0.30 / 0.52 | 0.00 / 0.06 / 0.03 |
-| screen updates/s (captured) | 44.1 | 44.1 |
+| display updates/s (the emulator's screen stream; the capture is 30 fps) | 44.1 | 44.1 |
 | video, configured NVENC CBR (Mbit/s) | 20.0 | 20.0 |
-| video, x264 CRF 23 of the captured screen (Mbit/s) | 0.47 | 0.47 |
+| video, x264 CRF 23 of the 30 fps capture (Mbit/s) | 0.47 | 0.47 |
 | command stream after zstd -3 / lz4 (Mbit/s) | 0.91 / 3.9 | 0.92 / 3.9 |
 |   ratio zstd -3 / lz4, on a sample of (MB) | 18.6 / 4.3, 21.6 | 18.1 / 4.3, 21.4 |
 | frames/s if each round trip costs 20 ms: main thread, composer | 12.7, 16.7 | 12.5, 16.7 |
@@ -363,9 +366,9 @@ mapped-buffer writes (`glUnmapBufferAEMU`, `glFlushMappedBufferRangeAEMU`).
 | startup: bytes to first frame (MB) | 3.88 | 0.50 |
 | startup: bytes in the 16 s before the window (MB) | 3.9 | 3.9 |
 |   of which shaders / textures / buffers (MB) | 0.02 / 0.35 / 3.32 | 0.02 / 0.33 / 3.32 |
-| screen updates/s (captured) | 42.1 | 40.9 |
+| display updates/s (the emulator's screen stream; the capture is 30 fps) | 42.1 | 40.9 |
 | video, configured NVENC CBR (Mbit/s) | 20.0 | 20.0 |
-| video, x264 CRF 23 of the captured screen (Mbit/s) | 2.27 | 2.29 |
+| video, x264 CRF 23 of the 30 fps capture (Mbit/s) | 2.27 | 2.29 |
 | command stream after zstd -3 / lz4 (Mbit/s) | 22.4 / 45.6 | 15.5 / 31.4 |
 |   ratio zstd -3 / lz4, on a sample of (MB) | 41.8 / 20.5, 537 | 57.8 / 28.5, 796 |
 | frames/s if each round trip costs 20 ms: main thread, composer | 3.2, 16.7 | 3.2, 16.7 |
@@ -394,9 +397,9 @@ mapped-buffer writes (`glUnmapBufferAEMU`, `glFlushMappedBufferRangeAEMU`).
 | startup: bytes to first frame (MB) | 1.48 | 4.74 |
 | startup: bytes in the 16 s before the window (MB) | 127 | 144 |
 |   of which shaders / textures / buffers (MB) | 0.24 / 1.23 / 125 | 0.26 / 1.21 / 142 |
-| screen updates/s (captured) | 52.5 | 50.5 |
+| display updates/s (the emulator's screen stream; the capture is 30 fps) | 52.5 | 50.5 |
 | video, configured NVENC CBR (Mbit/s) | 20.0 | 20.0 |
-| video, x264 CRF 23 of the captured screen (Mbit/s) | 2.67 | 2.57 |
+| video, x264 CRF 23 of the 30 fps capture (Mbit/s) | 2.67 | 2.57 |
 | command stream after zstd -3 / lz4 (Mbit/s) | 240 / 519 | 223 / 487 |
 |   ratio zstd -3 / lz4, on a sample of (MB) | 3.5 / 1.6, 537 | 3.7 / 1.7, 672 |
 | frames/s if each round trip costs 20 ms: main thread, composer | 3.8, 16.7 | 3.8, 16.7 |
@@ -425,9 +428,9 @@ mapped-buffer writes (`glUnmapBufferAEMU`, `glFlushMappedBufferRangeAEMU`).
 | startup: bytes to first frame (MB) | 2.34 | 2.10 |
 | startup: bytes in the 16 s before the window (MB) | 3.1 | 3.1 |
 |   of which shaders / textures / buffers (MB) | 0.02 / 1.65 / 0.73 | 0.03 / 1.66 / 0.71 |
-| screen updates/s (captured) | 23.3 | 22.6 |
+| display updates/s (the emulator's screen stream; the capture is 30 fps) | 23.3 | 22.6 |
 | video, configured NVENC CBR (Mbit/s) | 20.0 | 20.0 |
-| video, x264 CRF 23 of the captured screen (Mbit/s) | 4.27 | 3.98 |
+| video, x264 CRF 23 of the 30 fps capture (Mbit/s) | 4.27 | 3.98 |
 | command stream after zstd -3 / lz4 (Mbit/s) | 0.89 / 2.4 | 1.3 / 3.5 |
 |   ratio zstd -3 / lz4, on a sample of (MB) | 13.8 / 5.2, 6.4 | 10.4 / 3.9, 4.0 |
 | frames/s if each round trip costs 20 ms: main thread, composer | 0.17, 16.7 | 0.17, 16.7 |
@@ -456,9 +459,9 @@ mapped-buffer writes (`glUnmapBufferAEMU`, `glFlushMappedBufferRangeAEMU`).
 | startup: bytes to first frame (MB) | 0.67 | 0.67 |
 | startup: bytes in the 17 s before the window (MB) | 98.6 | 103 |
 |   of which shaders / textures / buffers (MB) | 0.09 / 10.96 / 62.20 | 0.09 / 10.93 / 63.61 |
-| screen updates/s (captured) | 55.2 | 55.0 |
+| display updates/s (the emulator's screen stream; the capture is 30 fps) | 55.2 | 55.0 |
 | video, configured NVENC CBR (Mbit/s) | 20.0 | 20.0 |
-| video, x264 CRF 23 of the captured screen (Mbit/s) | 1.57 | 1.56 |
+| video, x264 CRF 23 of the 30 fps capture (Mbit/s) | 1.57 | 1.56 |
 | command stream after zstd -3 / lz4 (Mbit/s) | 1.9 / 6.3 | 1.8 / 5.8 |
 |   ratio zstd -3 / lz4, on a sample of (MB) | 17.5 / 5.3, 22.4 | 16.9 / 5.2, 22.5 |
 | frames/s if each round trip costs 20 ms: main thread, composer | 29.0, 16.7 | 30.3, 16.7 |
@@ -487,9 +490,9 @@ mapped-buffer writes (`glUnmapBufferAEMU`, `glFlushMappedBufferRangeAEMU`).
 | startup: bytes to first frame (MB) | 0.58 | 0.54 |
 | startup: bytes in the 16 s before the window (MB) | 0.90 | 0.81 |
 |   of which shaders / textures / buffers (MB) | 0.00 / 0.22 / 0.27 | 0.00 / 0.22 / 0.24 |
-| screen updates/s (captured) | 24.0 | 24.0 |
+| display updates/s (the emulator's screen stream; the capture is 30 fps) | 24.0 | 24.0 |
 | video, configured NVENC CBR (Mbit/s) | 20.0 | 20.0 |
-| video, x264 CRF 23 of the captured screen (Mbit/s) | 0.60 | 0.61 |
+| video, x264 CRF 23 of the 30 fps capture (Mbit/s) | 0.60 | 0.61 |
 | command stream after zstd -3 / lz4 (Mbit/s) | 0.00 / 0.01 | 0.00 / 0.01 |
 |   ratio zstd -3 / lz4, on a sample of (MB) | 10.2 / 5.7, 0.06 | 10.0 / 5.7, 0.06 |
 | frames/s if each round trip costs 20 ms: main thread, composer | 16.7, 16.7 | 16.7, 16.7 |
@@ -518,9 +521,9 @@ mapped-buffer writes (`glUnmapBufferAEMU`, `glFlushMappedBufferRangeAEMU`).
 | startup: bytes to first frame (MB) | 4.11 | 3.98 |
 | startup: bytes in the 48 s before the window (MB) | 4,405 | 4,241 |
 |   of which shaders / textures / buffers (MB) | 0.04 / 87.34 / 0.18 | 0.04 / 87.33 / 0.17 |
-| screen updates/s (captured) | 56.3 | 55.3 |
+| display updates/s (the emulator's screen stream; the capture is 30 fps) | 56.3 | 55.3 |
 | video, configured NVENC CBR (Mbit/s) | 20.0 | 20.0 |
-| video, x264 CRF 23 of the captured screen (Mbit/s) | 1.02 | 1.01 |
+| video, x264 CRF 23 of the 30 fps capture (Mbit/s) | 1.02 | 1.01 |
 | command stream after zstd -3 / lz4 (Mbit/s) | 168 / 634 | 164 / 615 |
 |   ratio zstd -3 / lz4, on a sample of (MB) | 6.9 / 1.8, 537 | 6.8 / 1.8, 630 |
 | frames/s if each round trip costs 20 ms: main thread, composer | 50.0, 16.7 | 50.0, 16.7 |
