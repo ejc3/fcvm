@@ -103,8 +103,10 @@ class ProbeTests(unittest.TestCase):
             def close(self): pass
         class Closes:
             def __init__(self, *args): pass
-            def message(self, deadline): raise RuntimeError("WebSocket closed")
+            def message(self, deadline): raise smoke.WebSocketClosed("WebSocket closed")
             def close(self): pass
+        class Malformed(Closes):
+            def message(self, deadline): raise RuntimeError("masked server frame")
         class Open:
             def __init__(self, *args): pass
             def message(self, deadline): raise TimeoutError("WebSocket response timeout")
@@ -114,6 +116,8 @@ class ProbeTests(unittest.TestCase):
         with patch.object(smoke, "Socket", Open), self.assertRaises(AssertionError):
             smoke.prove_refused(self.tile())
         with patch.object(smoke, "Socket", Closes):
+            smoke.prove_refused(self.tile())
+        with patch.object(smoke, "Socket", Malformed), self.assertRaises(RuntimeError):
             smoke.prove_refused(self.tile())
 
     def test_renderer_handshake_requests_a_valid_frame_height(self):
@@ -191,8 +195,7 @@ class ProbeTests(unittest.TestCase):
             def __init__(self, *args):
                 self.state = {"tiles": [tile("fcvm", 1), tile("ec2", 1)]}
                 self.queue = [{"type": "snapshot", "state": copy.deepcopy(self.state)}]
-                if admission is not None:
-                    self.queue.insert(0, admission)
+                self.queue.insert(0, admission or {"type": "admission", "capacity": None})
                 self.last = None
             def send(self, message):
                 if message.get("type") == "seat":
@@ -284,6 +287,146 @@ class FailureTests(unittest.TestCase):
                 self.assertTrue(len(args) == 1 and isinstance(args[0], ast.Constant)
                                 and isinstance(args[0].value, str),
                                 f"line {node.lineno}: a raise whose message is not a string literal")
+
+
+class ReconnectTests(unittest.TestCase):
+    def run_probe(self, at, *, failures=1, wire="eof", advance=0):
+        clock, connections, intents, frames, seats, deadlines = [100.0], [], [], [], [], []
+        closed = [0]
+        def tile(half, generation=1):
+            name = f"{half}-{generation}"
+            return {"id": half + ":1", "half": half, "slot": half + "-1", "generation": generation,
+                    "phase": "running", "frame_url": f"wss://{name}.fcvm.dev/frames",
+                    "frame_url_v4": f"wss://{name}-v4.fcvm.dev/frames"}
+        state = {"tiles": [tile("fcvm"), tile("ec2")]}
+        if at == "cold":
+            state["tiles"][0]["phase"] = "starting"
+        real_socket = smoke.Socket
+        class Transport:
+            def __init__(self):
+                self.pending = {"eof": b"", "close": b"\x88\x02\x03\xe8",
+                                "protocol": b"\x82\x81"}[wire]
+            def recv(self, count):
+                result, self.pending = self.pending[:count], self.pending[count:]
+                return result
+            def settimeout(self, timeout): pass
+        def fail_connection(deadline):
+            connection = real_socket.__new__(real_socket)
+            connection.s = Transport()
+            return connection.message(deadline)
+        class Viewer:
+            def __init__(self, *args):
+                self.number, self.closed = len(connections), False
+                connections.append(self)
+                admission = {"type": "admission", "seat": "synthetic-seat", "locked": False,
+                             "capacity": 500, "direct": {"value": f"token-{self.number}"}}
+                snapshot = {"type": "snapshot", "state": copy.deepcopy(state)}
+                # After a reconnect the snapshot deliberately precedes the fresh token.
+                self.queue = [admission, snapshot] if self.number == 0 else [snapshot, admission]
+                if at == "cold" and closed[0] < failures:
+                    self.queue.append(None)
+            def send(self, message):
+                if message["type"] == "seat":
+                    self.first = message
+                    seats.append(message["ticket"])
+                    return
+                if not hasattr(self, "first"):
+                    raise AssertionError("an intent preceded the seat message")
+                intents.append(message)
+                half = message["args"]["tile"].split(":")[0]
+                state["tiles"] = [tile(t["half"], 2 if t["half"] == half else t["generation"])
+                                  for t in state["tiles"]]
+                if at == "receipt":
+                    self.queue.append(None)
+                    return
+                self.queue.append({"type": "receipt", "id": message["id"], "outcome": "committed"})
+                self.queue.append(None if at == "ec2_fresh" and half == "ec2"
+                                  else {"type": "snapshot", "state": copy.deepcopy(state)})
+            def message(self, deadline):
+                deadlines.append(deadline)
+                clock[0] += 0.1
+                message = self.queue.pop(0)
+                if message is None:
+                    closed[0] += 1
+                    clock[0] += advance
+                    if closed[0] >= failures:
+                        state["tiles"][0]["phase"] = "running"
+                    return fail_connection(deadline)
+                return 1, json.dumps(message).encode()
+            def close(self): self.closed = True
+        def get(url, headers=None):
+            return ((403 if url.endswith("/agent") else 200), {}, b"") if headers else (
+                302, {"Location": "https://login.cloudflareaccess.com/login"}, b"")
+        def prove(tile, admit=None):
+            if at == "renderer":
+                fail_connection(clock[0] + 40)
+            frames.append((tile["half"], tile["generation"], admit))
+        env = {"STAGING_API_URL": "https://api.example.test", "STAGING_ORIGIN": "https://stage.example.test",
+               "CF_ACCESS_CLIENT_ID": "synthetic-id", "CF_ACCESS_CLIENT_SECRET": "synthetic-secret"}
+        output, error = io.StringIO(), None
+        with patch.dict(os.environ, env), patch.object(smoke, "Socket", Viewer), patch.object(smoke, "get", get), \
+                patch.object(smoke, "prove_frame", prove), patch.object(smoke, "prove_refused"), \
+                patch.object(smoke, "prove_resolves", return_value=0.05), \
+                patch.object(smoke.time, "monotonic", lambda: clock[0]), \
+                patch.object(smoke.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay)), \
+                contextlib.redirect_stdout(output):
+            try:
+                smoke.main()
+            except Exception as caught:
+                error = caught
+        return dict(error=error, connections=connections, intents=intents, frames=frames,
+                    seats=seats, deadlines=deadlines, output=output.getvalue())
+
+    def test_cold_readiness_eof_reuses_the_seat_and_waits_for_a_new_token(self):
+        result = self.run_probe("cold")
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["seats"], [None, "synthetic-seat"])
+        self.assertEqual([token for _, _, token in result["frames"]], ["token-1"] * 4)
+        self.assertEqual([i["args"]["tile"] for i in result["intents"]], ["fcvm:1", "ec2:1"])
+        self.assertTrue(all(c.closed for c in result["connections"]))
+
+    def test_ec2_postreceipt_close_resumes_freshness_wait_without_replaying_intents(self):
+        result = self.run_probe("ec2_fresh", wire="close")
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["seats"], [None, "synthetic-seat"])
+        self.assertEqual(result["frames"], [("fcvm", 1, "token-0"), ("fcvm", 2, "token-0"),
+                                            ("ec2", 1, "token-0"), ("ec2", 2, "token-1")])
+        self.assertEqual([i["args"]["tile"] for i in result["intents"]], ["fcvm:1", "ec2:1"])
+        self.assertEqual(len({i["id"] for i in result["intents"]}), 2)
+        self.assertTrue(all(c.closed for c in result["connections"]))
+
+    def test_readiness_closures_exhaust_three_total_reconnects(self):
+        result = self.run_probe("cold", failures=4)
+        self.assertIsInstance(result["error"], RuntimeError)
+        self.assertEqual(len(result["connections"]), 4)
+        self.assertEqual(result["intents"], [])
+        self.assertEqual([json.loads(line) for line in result["output"].splitlines()],
+                         [{"reconnect": 1}, {"reconnect": 2}, {"reconnect": 3}])
+        self.assertTrue(all(c.closed for c in result["connections"]))
+
+    def test_reconnects_keep_the_original_deadline(self):
+        result = self.run_probe("cold", failures=4, advance=300)
+        self.assertIsInstance(result["error"], TimeoutError)
+        self.assertEqual(len(result["connections"]), 3)
+        self.assertEqual(set(result["deadlines"]), {820.0})
+
+    def test_malformed_coordinator_frames_are_not_retried(self):
+        result = self.run_probe("cold", wire="protocol")
+        self.assertIsInstance(result["error"], RuntimeError)
+        self.assertEqual(str(result["error"]), "masked server frame")
+        self.assertEqual(len(result["connections"]), 1)
+
+    def test_a_close_before_the_receipt_fails_without_replaying_the_intent(self):
+        result = self.run_probe("receipt")
+        self.assertIsInstance(result["error"], RuntimeError)
+        self.assertEqual(len(result["connections"]), 1)
+        self.assertEqual(len(result["intents"]), 1)
+
+    def test_a_renderer_close_is_not_a_coordinator_reconnect(self):
+        result = self.run_probe("renderer")
+        self.assertIsInstance(result["error"], RuntimeError)
+        self.assertEqual(len(result["connections"]), 1)
+        self.assertEqual(result["intents"], [])
 
 
 class ResolveTests(unittest.TestCase):

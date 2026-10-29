@@ -33,7 +33,9 @@ function fakeGl(): { gl: WebGL2RenderingContext; calls: Call[] } {
   return { gl, calls };
 }
 
-(globalThis as Record<string, unknown>).WebGLRenderbuffer ??= class {};
+(globalThis as Record<string, unknown>).WebGLRenderbuffer ??= class {
+  readonly stand_in = true;
+};
 
 const u32 = (...xs: number[]) => new Uint8Array(new Uint32Array(xs).buffer);
 

@@ -62,6 +62,10 @@ def ipv4(host, port):
     raise RuntimeError("no reachable public IPv4 endpoint")
 
 
+class WebSocketClosed(RuntimeError):
+    """The peer closed the connection, distinct from a malformed WebSocket message."""
+
+
 class Socket:
     def __init__(self, url, headers=None):
         parsed = urllib.parse.urlsplit(url)
@@ -101,7 +105,7 @@ class Socket:
             except socket.timeout:
                 continue
             if not part:
-                raise RuntimeError("WebSocket closed")
+                raise WebSocketClosed("WebSocket closed")
             buf += part
         return buf
 
@@ -128,7 +132,7 @@ class Socket:
                 raise RuntimeError("oversized WebSocket message")
             payload = self.exact(n, deadline)
             if opcode == 8:
-                raise RuntimeError("WebSocket closed")
+                raise WebSocketClosed("WebSocket closed")
             if opcode == 9:
                 self.send(payload, 10)
                 continue
@@ -187,7 +191,7 @@ def prove_refused(tile):
         while True:
             try:
                 opcode, payload = connection.message(deadline)
-            except RuntimeError:  # closed
+            except WebSocketClosed:
                 return
             except TimeoutError:
                 raise AssertionError("a socket without a direct token was left open")
@@ -362,17 +366,32 @@ def main():
         deadline = time.monotonic() + 720
         interval, next_relaunch = relaunch_interval_seconds(), 0.0
         state, admission = {}, {}
+        seat, reconnects = None, 0
         def take(message):
-            nonlocal state, admission
+            nonlocal state, admission, seat
             if message.get("type") == "snapshot":
                 state = message["state"]
             elif message.get("type") == "admission":
                 admission = message
+                seat = message.get("seat")
         def until(predicate):
+            nonlocal connection, state, admission, reconnects
             while time.monotonic() < deadline:
-                if predicate(state):
+                if admission and predicate(state):
                     return state
-                opcode, payload = connection.message(deadline)
+                try:
+                    opcode, payload = connection.message(deadline)
+                except WebSocketClosed:
+                    if reconnects >= 3 or time.monotonic() >= deadline:
+                        raise
+                    # A readiness wait can resume; an intent awaiting its receipt cannot.
+                    connection.close()
+                    state, admission = {}, {}
+                    reconnects += 1
+                    connection = Socket(api.replace("https://", "wss://", 1) + "/live", headers)
+                    connection.send({"type": "seat", "ticket": seat})
+                    print(json.dumps({"reconnect": reconnects}), flush=True)
+                    continue
                 if opcode != 1:
                     continue
                 take(json.loads(payload))

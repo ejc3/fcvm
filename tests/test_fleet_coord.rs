@@ -660,6 +660,42 @@ async fn pings_get_the_server_clock_and_garbage_gets_an_error() {
     assert!(a.other.iter().any(|m| m["type"] == "error"));
 }
 
+/// The agent drops a connection that delivers nothing for 15 s and pings it every 5 s, so
+/// the coordinator's agent socket must answer a ping while it has nothing else to send.
+#[tokio::test]
+async fn the_agent_socket_answers_pings() {
+    let c = coordinator_with(Opts::default()).await;
+    let url = c.url.replace("/live", "/agent");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let hello = AgentMsg::Hello {
+        host: "gpu-a".into(),
+        arch: "x86_64".into(),
+        gpus: vec![],
+        capacity: 0,
+        store_ready_at: None,
+        boot: Default::default(),
+        phones: vec![],
+    };
+    ws.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
+        .await
+        .unwrap();
+    ws.send(Message::Ping(b"are you there".to_vec().into()))
+        .await
+        .unwrap();
+    let pong = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Pong(p))) => return p,
+                Some(Ok(_)) => continue,
+                other => panic!("the agent socket ended: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("a pong within 5 s");
+    assert_eq!(&pong[..], b"are you there");
+}
+
 /// The coordinator's side of an agent connection, with the test playing the agent.
 struct FakeAgent {
     to_coord: tokio::sync::mpsc::UnboundedSender<AgentMsg>,
@@ -6053,4 +6089,71 @@ async fn admission_keys_reach_renderers_and_layouts_but_no_browser() {
     let text = handle.snapshot.borrow().text.clone();
     assert!(!text.is_empty());
     assert!(!text.contains(&key), "a snapshot carries an admission key");
+}
+
+/// A GPU host's hello that arrives during a wake gets its assignment at once, with every
+/// GPU placed and none on standby: while the fleet is still waking, and after the EC2 half
+/// alone made it awake, before any GPU host's hello (the order of issue 1437's wake). The
+/// agent starts no VM before its assignment, so an assignment held here is
+/// time a viewer sees black tiles.
+#[tokio::test]
+async fn a_hello_during_a_wake_gets_its_assignment_at_once() {
+    use fleet_core::protocol::SlotReport;
+    for ec2_awake in [false, true] {
+        let config = Config {
+            power_managed: true,
+            idle_scale_down_secs: 1,
+            ec2_max: 2,
+            fcvm_tiles: 8,
+            light_interval_ms: 0,
+            ..Config::default()
+        };
+        let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None, None);
+        // A state starts awake: sleep with no visible page, then wake on one.
+        let mut v = page_viewer(&handle).await;
+        v.send(json!({"type": "visibility", "visible": false}))
+            .await;
+        v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+        v.send(json!({"type": "visibility", "visible": true})).await;
+        v.until(|s| s["fleet"]["power"]["state"] == "waking").await;
+        if ec2_awake {
+            for id in ["ec2-1", "ec2-2"] {
+                handle
+                    .send(Event::Ec2 {
+                        at: 0,
+                        report: SlotReport {
+                            id: id.into(),
+                            phase: "running".into(),
+                            generation: 1,
+                            vm: Some(format!("i-{id}")),
+                            frame_url: Some(format!("wss://{id}.example/frames")),
+                            timings: Default::default(),
+                            error: None,
+                            retry_in_ms: None,
+                            ipv6: None,
+                            ipv4: None,
+                            v4_port: None,
+                            place: None,
+                        },
+                    })
+                    .await;
+            }
+            v.until(|s| s["fleet"]["power"]["state"] == "awake").await;
+        }
+        let t0 = Instant::now();
+        let mut agent = FakeAgent::connect(&handle, "gpu-a", 8);
+        let slots = tokio::time::timeout(Duration::from_secs(1), agent.assign())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("no assignment 1 s after the hello (EC2 awake: {ec2_awake})")
+            });
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        assert_eq!(slots.len(), 8, "EC2 awake: {ec2_awake}");
+        for s in &slots {
+            assert!(
+                s.rect.is_some() && !s.standby && !s.warm,
+                "EC2 awake: {ec2_awake}: {s:?}"
+            );
+        }
+    }
 }
