@@ -15,7 +15,9 @@
 #      names the GPU and it reports at least 30 frames a second;
 #   5. the running phone lets go of the GPU (the container's GPU hook, `gpu release` on the
 #      emulator's console): the emulator then holds no /dev/nvidia* descriptor or mapping;
-#      and takes it up again (`gpu retake`): the app draws 30 frames a second again;
+#      and takes it up again (`gpu retake`): the app draws 30 frames a second again. A retake
+#      that cannot create a Vulkan instance (the ICD manifest moved away) fails and leaves the
+#      phone running released, and the next retake takes the GPU up;
 #   6. a warm snapshot of the running phone (`fcvm snapshot create --gpu-warm`, whose park
 #      runs the hook) is taken and the source phone keeps drawing; a clone restored from it
 #      with the second GPU (`fcvm snapshot run --gpu`) runs the same phone on that GPU:
@@ -124,6 +126,35 @@ in_place_release_and_retake() {
   check_draws "$pid" "after the retake"
 }
 
+# A retake whose Vulkan instance cannot be created leaves the phone released, not dead: the
+# loader finds no driver while the ICD manifest is moved away, as it found none in a retake
+# that aborted the emulator (gfxstream then loaded render threads that need Vulkan). With the
+# manifest back, a second retake takes the GPU up and the app draws.
+retake_without_vulkan() {
+  local out holds icd=/usr/share/vulkan/icd.d/nvidia_icd.json
+  if ! out=$(X /usr/local/bin/gpu-hook release 2>&1); then
+    bad "the phone did not release the GPU: $out"
+    return
+  fi
+  X mv "$icd" "$icd.away"
+  if out=$(X /usr/local/bin/gpu-hook retake 2>&1); then
+    bad "a retake with no Vulkan driver succeeded: $out"
+  else
+    [[ "$out" == *"Vulkan did not come back"* ]] && ok "a retake with no Vulkan driver fails and says why" \
+      || bad "a retake with no Vulkan driver failed for another reason: $out"
+  fi
+  X mv "$icd.away" "$icd"
+  holds=$(X /usr/local/bin/phone.sh holds 2>&1 || true)
+  [ "$holds" = "fds=0 mappings=0" ] && ok "the phone is still running, released: $holds" \
+    || { bad "after the failed retake the phone is not running released: $holds"; keep_phone_logs "$pid" retake-without-vulkan; }
+  if out=$(X /usr/local/bin/gpu-hook retake 2>&1); then
+    ok "the next retake took the GPU up: $(grep -o -E '(retaken|first_frame)_ms=[0-9]*' <<< "$out" | paste -sd' ')"
+  else
+    bad "the next retake failed too: $out"
+  fi
+  check_draws "$pid" "after a retake without Vulkan and one with it"
+}
+
 warm_snapshot_onto_the_second_gpu() {
   local source_uuid cpid click ack first clone_uuid holds renderer
   source_uuid=$(X /usr/bin/nvidia-smi --query-gpu=uuid --format=csv,noheader 2>&1 | head -1)
@@ -181,6 +212,7 @@ if boot=$(timeout 400 "$F" exec --pid "$pid" -- /usr/local/bin/phone.sh boot 2>&
   reports=$(X /usr/local/bin/phone.sh bugreports 2>&1 || true)
   [ "$reports" = 0 ] && ok "the phone took no bug report" || bad "the phone took $reports bug report(s) (a device failed at boot; dumpstate.last_id)"
   in_place_release_and_retake
+  retake_without_vulkan
   warm_snapshot_onto_the_second_gpu
   "$(dirname "$0")/scene-test.sh" "$F" "$pid" "/work/$(basename "$APP")" "$LOGS/out" "$gpu_name" || { fail=1; keep_phone_logs "$pid" scene-test; }
   # The UWB service asked for its bug report a minute or two after boot, after the check

@@ -824,6 +824,14 @@ Built as above, with what the measurement left out:
   on Skia GL here (`debug.hwui.renderer=skiagl`), and the phone has none.
 - **Snapshots while released.** The emulator's own snapshot save and load refuse with an
   error naming `gpu retake`.
+- **A retake without Vulkan stays released.** The new frame buffer creates a Vulkan instance,
+  and when that fails gfxstream carries on without Vulkan. The saved render threads still
+  hold Vulkan thread state, and loading them aborted the emulator ("VkDecoderGlobalState not
+  initialized"). That is how the static TLS exhaustion below ended a phone; any other reason
+  for `vkCreateInstance` to fail would end it the same way. A retake whose frame buffer has no
+  Vulkan when the released one had it now tears it down, stays released with the saved state,
+  and says so (ejc3/gfxstream#6); `make phone-test` checks it by moving the ICD manifest away
+  for one retake.
 
 On the phone above, in its VM: `gpu release` takes 400 to 590 ms and leaves the emulator
 with 0 of its 80 `/dev/nvidia*` descriptors, 0 of its 291 mappings and none of the NVIDIA,
@@ -1064,9 +1072,8 @@ locations): the mirror reads each name from the reply instead of making its own,
 depends on two threads' names coming out in the same order. A reply past 4096 bytes (a
 readback, a read map) is cut to its first 4096 bytes, which every reply that returns names
 fits in; the mirror needs none of a readback's data, and the counter still counts it. The tap
-hooks the pipe transport's `ChannelStream`, the transport this image uses; a render thread on
-address space graphics (`RingStream`) sends the mirror its calls but not its replies, so a
-phone on that transport is not mirrored. DMA uploads (`rcUpdateColorBufferDMA`) would carry a guest address, not
+copies replies in both transports' `commitBuffer`: the pipe's `ChannelStream`, which this image
+uses, and address space graphics' `RingStream`. DMA uploads (`rcUpdateColorBufferDMA`) would carry a guest address, not
 the bytes; the tap does not follow it. The captures below hold none (this image creates its
 color buffers with `rcCreateColorBufferDMA`, which carries no pixels, and uploads none by
 DMA), and the mirror counts any it meets.
@@ -1105,10 +1112,18 @@ sets it, SurfaceFlinger then reports `OpenGL ES 3.0 (OpenGL ES 3.2 NVIDIA 580.19
 guest sends no 3.1 call or `#version 310 es` shader. The guest reads it at boot, so the warm
 snapshot carries it. Extensions beyond WebGL2's are the remaining divergence; the executor
 counts every call it does not draw. In the captures the only ones are queries it need not
-draw (`rcGetGLString`, `rcChooseConfig` and the like) and `glGetProgramBinary`: Skia saves
-program binaries, and a process that later loads one (`glProgramBinary`) sends the mirror no
-source to compile. Hiding binary formats from the guest is a follow-up; no capture so far
-loads one.
+draw (`rcGetGLString`, `rcChooseConfig` and the like). Program binaries are hidden from a guest
+the tap can mirror (`GFXSTREAM_MIRROR_SOCKET` set): `GL_NUM_PROGRAM_BINARY_FORMATS` is 0, so
+Skia keeps its shader sources instead of saving binaries, and no process loads a program with
+`glProgramBinary`, which would send the mirror no source to compile.
+
+**Color buffers.** A color buffer lives in the mirror until the host destroys it: the tap
+sends a `FREE` record (type 7, its handle in `aux`) from each place gfxstream's `FrameBuffer`
+erases one, whichever way its last reference went (`rcCloseColorBuffer`, the guest's refcount
+pipe, the cleanup of a process that ended). The guest's own open and close calls are only part
+of the count, and the host keeps a closed buffer for a second in case it is opened again, so
+the mirror ignores them. A freed buffer's texture stays while a guest texture, renderbuffer or
+window surface still draws with it.
 
 The cap costs the T4 path nothing measurable. Two boots at each setting, alternating, on one
 g4dn.metal (1-minute load 1.3 to 3.0):
@@ -1323,8 +1338,8 @@ viewer's machine.
 9. The GPU mirror ("The GPU mirror", above): the gfxstream tap and the GLES cap
    (ejc3/gfxstream#4); the browser's decoder and WebGL2 replay with the replay test; the
    streamer's `GET /mirror` and its admission; the take-over panel's three views and their
-   readouts; the emulator pin. Then the join snapshot, and hiding program binaries from the
-   guest.
+   readouts; the emulator pin. Then FREE records, replies on ring streams and no program
+   binaries for a mirrorable guest (ejc3/gfxstream#5), and the join snapshot.
 
 ## Invariants (each becomes a test)
 
