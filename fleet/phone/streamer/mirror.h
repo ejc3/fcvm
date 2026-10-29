@@ -1,10 +1,10 @@
 // The GPU mirror's route (fleet/PROTOCOL.md, "Phone streamer", GET /mirror): the emulator's
 // command-stream tap (gfxstream's mirror_tap.h, a Unix socket in this container) relayed to
-// the one viewer holding the phone, deflated. Host-only code, tested in test_host.cpp.
+// the one viewer holding the phone, compressed with zstd. Host-only code, tested in test_host.cpp.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
-#include <zlib.h>
+#include <zstd.h>
 
 #include <string>
 #include <vector>
@@ -18,23 +18,22 @@ std::string admit_token_viewer(const std::string& token);
 bool mirror_admits(const std::vector<std::string>& keys, const std::string& mirror_viewer, const std::string& token,
                    int64_t now_s);
 
-// One raw deflate stream for a connection: each push returns the bytes of one WebSocket
-// message, ending at a byte boundary (Z_SYNC_FLUSH), so the page's one DecompressionStream
-// ("deflate-raw") gives back everything pushed so far.
-class MirrorDeflate {
+// One zstd stream for a connection (level 3, a 1 MiB window, the most the page's decoder
+// takes): each push returns the bytes of one WebSocket message, ending at a block boundary
+// (ZSTD_e_flush), so the page's streaming decoder gives back everything pushed so far.
+class MirrorZstd {
  public:
-  explicit MirrorDeflate(int level = 1);
-  ~MirrorDeflate();
-  MirrorDeflate(const MirrorDeflate&) = delete;
-  MirrorDeflate& operator=(const MirrorDeflate&) = delete;
-  bool ok() const { return ok_; }
-  // Appends the compressed bytes of `n` input bytes to *out; false on a zlib error.
+  MirrorZstd();
+  ~MirrorZstd();
+  MirrorZstd(const MirrorZstd&) = delete;
+  MirrorZstd& operator=(const MirrorZstd&) = delete;
+  bool ok() const { return z_ != nullptr; }
+  // Appends the compressed bytes of `n` input bytes to *out; false on a zstd error.
   bool push(const uint8_t* p, size_t n, std::string* out);
   uint64_t in_bytes = 0, out_bytes = 0;
 
  private:
-  z_stream z_{};
-  bool ok_ = false;
+  ZSTD_CCtx* z_ = nullptr;
 };
 
 // A mirror stream's queue toward its viewer: bounded in bytes. A viewer this far behind is

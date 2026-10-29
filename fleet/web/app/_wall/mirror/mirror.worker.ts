@@ -8,6 +8,7 @@ import { RateMeter } from "../../../core/meter.ts";
 import { RECORD, RecordReader } from "../../../core/mirror/wire.ts";
 import { GlMirror } from "./gl.ts";
 import type { MirrorIn, MirrorOut } from "./mirror-msgs.ts";
+import { ZstdStream } from "./zstd.ts";
 
 const now = () => performance.timeOrigin + performance.now();
 const post = (m: MirrorOut) => (self as unknown as DedicatedWorkerGlobalScope).postMessage(m);
@@ -17,12 +18,17 @@ let mirror: GlMirror | null = null;
 let ws: WebSocket | null = null;
 /** Bumped by every open and close: a retired connection's late callbacks are ignored. */
 let generation = 0;
-/** Compressed bytes handed to the inflater and not yet taken out of it, at most MAX_PENDING_BYTES. */
+/** Compressed bytes received and not yet decoded, at most MAX_PENDING_BYTES. */
 let pendingBytes = 0;
 /** A viewer that receives faster than it replays drops the stream past this, and joins again. */
 const MAX_PENDING_BYTES = 16 << 20;
 let reader = new RecordReader();
-let inflate: WritableStreamDefaultWriter<Uint8Array> | null = null;
+let zstd: Promise<ZstdStream> | null = null;
+/** zstd messages waiting for the decoder, in order. */
+let queue: Uint8Array[] = [];
+let draining = false;
+/** Milliseconds spent decoding zstd, as a rate: the share of a core the wire costs this browser. */
+const decodeMs = new RateMeter();
 const wire = new RateMeter();
 let tapBytes = 0;
 let joined = false;
@@ -50,6 +56,7 @@ function fresh(): void {
   reader = new RecordReader();
   wire.reset();
   tapBytes = 0;
+  decodeMs.reset();
   joined = false;
   pixel = null;
   stampAt = null;
@@ -100,6 +107,7 @@ function stats(): void {
     wireBps: wire.perSecond(t),
     wireBytes: wire.total,
     tapBytes,
+    decodeMsPerSec: decodeMs.perSecond(t),
     repliesPerSec: mirror.replyRate.perSecond(t),
     fps: mirror.postRate.perSecond(t),
     posts: mirror.stats.posts,
@@ -125,30 +133,46 @@ function close(): void {
     ws.close();
     ws = null;
   }
-  void inflate?.abort().catch(() => {});
-  inflate = null;
+  zstd = null;
+  queue = [];
+  draining = false;
   pendingBytes = 0;
+}
+
+/**
+ * Decodes the queued zstd messages in order and replays them, yielding to the event loop
+ * every 50 ms so that messages arriving meanwhile are counted against MAX_PENDING_BYTES.
+ */
+async function drain(gen: number): Promise<void> {
+  if (draining) return;
+  draining = true;
+  try {
+    const z = await zstd!;
+    let slice = performance.now();
+    while (gen === generation && queue.length > 0) {
+      const m = queue.shift()!;
+      const t0 = performance.now();
+      const bytes = z.push(m);
+      const t1 = performance.now();
+      decodeMs.add(now(), t1 - t0);
+      pendingBytes -= m.length;
+      feed(bytes);
+      if (performance.now() - slice > 50) {
+        await new Promise((r) => setTimeout(r, 0));
+        slice = performance.now();
+      }
+    }
+  } catch (e: unknown) {
+    if (gen === generation) retire(`zstd: ${String(e)}`);
+  } finally {
+    if (gen === generation) draining = false;
+  }
 }
 
 function open(url: string, admit: string): void {
   close();
   fresh();
   const gen = generation;
-  // one raw deflate stream for the connection: each message is flushed to a byte boundary
-  const ds = new DecompressionStream("deflate-raw");
-  const writer = ds.writable.getWriter() as WritableStreamDefaultWriter<Uint8Array>;
-  inflate = writer;
-  void (async () => {
-    const r = ds.readable.getReader();
-    for (;;) {
-      const { value, done } = await r.read();
-      if (done || gen !== generation) break;
-      feed(value);
-    }
-  })().catch((e: unknown) => {
-    // a retired connection's inflater fails as it is aborted: not this connection's news
-    if (gen === generation) retire(`inflate: ${String(e)}`);
-  });
   const s = new WebSocket(url);
   s.binaryType = "arraybuffer";
   ws = s;
@@ -161,13 +185,10 @@ function open(url: string, admit: string): void {
       retire("the mirror fell behind in this browser: join again");
       return;
     }
+    zstd ??= ZstdStream.create();
     pendingBytes += n;
-    writer.write(new Uint8Array(e.data)).then(
-      () => {
-        if (gen === generation) pendingBytes -= n;
-      },
-      () => {},
-    );
+    queue.push(new Uint8Array(e.data));
+    void drain(gen);
   };
   s.onclose = (e) => {
     if (gen !== generation) return;

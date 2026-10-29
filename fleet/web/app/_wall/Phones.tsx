@@ -367,6 +367,9 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
             repliesPerSec: mirrorStats?.repliesPerSec ?? 0,
             note: mirrorNote,
             leadMs: leadOf(mirrorStats, videoStats?.newestT ?? null, state.frames?.at ?? null),
+            codec: mirrorStats ? "zstd" : null,
+            ratio: mirrorStats && mirrorStats.wireBytes > 0 ? mirrorStats.tapBytes / mirrorStats.wireBytes : null,
+            decodeMsPerSec: mirrorStats?.decodeMsPerSec ?? null,
           } satisfies StreamReadout)
         : null,
   };

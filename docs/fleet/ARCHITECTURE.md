@@ -1044,9 +1044,9 @@ guest app / SurfaceFlinger / HWC (GLES 3.0, renderControl)
                       ChannelStream::commitBuffer (reply) --tap (first 256 B)--> ring
                                                                                      | sender thread
   phone streamer  <- Unix socket /tmp/gfxstream-mirror.sock (one consumer) ----------+
-    GET /mirror: admitted for the holder's token only; raw deflate (Z_SYNC_FLUSH per message)
+    GET /mirror: admitted for the holder's token only; zstd -3, 1 MiB window (ZSTD_e_flush per message)
     bounded queue (8 MiB): a viewer behind it is dropped and joins again
-  -> wss -> page: DecompressionStream("deflate-raw") -> tap records -> per-channel packets
+  -> wss -> page worker: zstd's decoder in WebAssembly -> tap records -> per-channel packets
             -> decoder (emugen table) -> one WebGL2 context, a virtual context per guest context
             -> the posted color buffer drawn to the mirror's canvas
 ```
@@ -1144,12 +1144,21 @@ launcher) are not drawn and are counted.
   it again. The sender thread alone waits on the socket.
 - The streamer's queue toward the viewer is bounded (8 MiB). A viewer behind it is closed with
   1013 ("join again"), and the page rejoins, at most once every 10 s. The page bounds its own
-  side too: 16 MiB handed to the inflater and not yet decoded ends the stream the same way, as
-  does an `OVERFLOW` record from the tap (the stream then has a gap).
-- The wire is one raw deflate stream per connection, each message flushed to a byte boundary,
-  so the page's single `DecompressionStream("deflate-raw")` gives back every byte as it
-  arrives. The bandwidth shown is the WebSocket messages' bytes. Level 1 shrinks the
-  measured streams 3.4 to 5.2 times.
+  side too: 16 MiB received and not yet decoded ends the stream the same way, as does an
+  `OVERFLOW` record from the tap (the stream then has a gap).
+- The wire is one zstd stream per connection (level 3, a 1 MiB window), each message flushed
+  to a block boundary (`ZSTD_e_flush`), so the page's streaming decoder gives back every byte
+  as it arrives. Browsers have no zstd `DecompressionStream`, so the page's worker runs zstd's
+  own decoder (1.5.7's single-file decoder, built for wasm32 with no libc by
+  `fleet/web/scripts/build-zstd-wasm.sh`: 59 KB, 22 KB gzipped) in a fixed workspace that
+  refuses a larger window. The
+  bandwidth shown is the WebSocket messages' bytes; the readout also says the encoding, how
+  many times smaller than the commands the wire is, and the share of a core the worker spends
+  decoding.
+- On the committed Robot Park capture (8.27 MB of tap records), cut where the phone's clock
+  passes 16 ms as the streamer's reads would cut it: deflate level 1 sends 2.19 MB (3.8 times
+  smaller), zstd -3 1.51 MB (5.5 times). Splitting the stream by channel before compressing
+  gives nothing here (1.53 MB): a tap record is already a long run of one channel's bytes.
 - `gpu release` (a warm snapshot of the phone) ends every render thread (CLOSE records) and
   the GPU hook stops the streamer, so the mirror ends; after `gpu retake` the page rejoins. A
   VM restore (the phone returned, `reboot_phone`) ends the borrow or relaunches the phone, and
@@ -1173,7 +1182,9 @@ mirror per phone at a time (the tap has one consumer).
 | the wire table is what emugen's specs give | `scripts/gen-mirror-table.ts --check`, run by the web tests |
 | record and packet framing, parameter decoding | `core/test/mirror.test.ts` |
 | the meter's rolling second and totals | `core/test/mirror.test.ts` |
-| admission: holder only, keys required, expiry, forgery; the holder kept from the app; deflate round trip | `fleet/phone/streamer/test_host.cpp` |
+| admission: holder only, keys required, expiry, forgery; the holder kept from the app; zstd round trip within a 1 MiB window | `fleet/phone/streamer/test_host.cpp` |
+| the page's zstd decoder: each flushed message whole, a larger window and a non-zstd stream refused, built from the tree's sources | `core/test/zstd.test.ts` |
+| the worker: a retired connection's bytes never reach the next, the 16 MiB bound, `OVERFLOW`, no WebGL2 | `core/test/mirror-worker.test.ts` |
 | the holder reaches the streamer's scene | `tests/test_fleet_agent.rs` |
 | replay: a Robot Park stream captured on a gpubox, with the T4's stamped frames, replayed in headless Chrome on WebGL2; each mirror frame compared with the T4 frame of the same stamp | `e2e/mirror.spec.ts` (`playwright.mirror.config.ts`; threshold below) |
 | the panel: three views, video closed in mirror-only, the readouts, the mirror drawing with WebGL2 | `e2e/phones.spec.ts` against the mock coordinator, whose phones serve a synthetic `/mirror` (`mock/mirror.ts`) |

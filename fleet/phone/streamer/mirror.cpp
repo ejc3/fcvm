@@ -17,28 +17,29 @@ bool mirror_admits(const std::vector<std::string>& keys, const std::string& mirr
   return admit_token_viewer(token) == mirror_viewer;
 }
 
-MirrorDeflate::MirrorDeflate(int level) {
-  // -15: raw deflate, no zlib header, the format DecompressionStream("deflate-raw") reads
-  ok_ = deflateInit2(&z_, level, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) == Z_OK;
+MirrorZstd::MirrorZstd() {
+  z_ = ZSTD_createCCtx();
+  if (z_ && (ZSTD_isError(ZSTD_CCtx_setParameter(z_, ZSTD_c_compressionLevel, 3)) ||
+             ZSTD_isError(ZSTD_CCtx_setParameter(z_, ZSTD_c_windowLog, 20)))) {
+    ZSTD_freeCCtx(z_);
+    z_ = nullptr;
+  }
 }
 
-MirrorDeflate::~MirrorDeflate() {
-  if (ok_) deflateEnd(&z_);
-}
+MirrorZstd::~MirrorZstd() { ZSTD_freeCCtx(z_); }
 
-bool MirrorDeflate::push(const uint8_t* p, size_t n, std::string* out) {
-  if (!ok_) return false;
-  z_.next_in = const_cast<Bytef*>(p);
-  z_.avail_in = (uInt)n;
+bool MirrorZstd::push(const uint8_t* p, size_t n, std::string* out) {
+  if (!z_) return false;
+  ZSTD_inBuffer in{p, n, 0};
   unsigned char buf[1 << 16];
   size_t before = out->size();
+  size_t left;
   do {
-    z_.next_out = buf;
-    z_.avail_out = sizeof buf;
-    int rc = deflate(&z_, Z_SYNC_FLUSH);
-    if (rc != Z_OK && rc != Z_BUF_ERROR) return false;
-    out->append((const char*)buf, sizeof buf - z_.avail_out);
-  } while (z_.avail_out == 0 || z_.avail_in > 0);
+    ZSTD_outBuffer o{buf, sizeof buf, 0};
+    left = ZSTD_compressStream2(z_, &o, &in, ZSTD_e_flush);
+    if (ZSTD_isError(left)) return false;
+    out->append((const char*)buf, o.pos);
+  } while (left != 0);
   in_bytes += n;
   out_bytes += out->size() - before;
   return true;

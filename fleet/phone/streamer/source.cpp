@@ -202,7 +202,7 @@ void PhoneSource::mirror(Conn& c, const std::string& token) {
   }
   c.set_option(SOL_SOCKET, SO_SNDBUF, 1 << 20);
   // The writer sends the queue; the client reader notices the viewer leave; this thread reads
-  // the tap, deflates and queues, and ends the stream when the queue passes its bound.
+  // the tap, compresses and queues, and ends the stream when the queue passes its bound.
   std::mutex qmu;
   std::condition_variable qcv;
   std::deque<std::string> q;
@@ -265,7 +265,7 @@ void PhoneSource::mirror(Conn& c, const std::string& token) {
     mirror_error_ = "no thread for the mirror stream";
     return;
   }
-  MirrorDeflate z;
+  MirrorZstd z;
   std::string reason;
   uint16_t code = 1000;
   std::vector<uint8_t> buf(1 << 18);
@@ -288,7 +288,7 @@ void PhoneSource::mirror(Conn& c, const std::string& token) {
     std::string out;
     if (!z.push(buf.data(), (size_t)n, &out)) {
       code = 1011;
-      reason = "deflate failed";
+      reason = "compression failed";
       break;
     }
     std::string frame = ws_frame(2, out.data(), out.size());

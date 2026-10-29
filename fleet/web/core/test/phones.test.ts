@@ -360,6 +360,24 @@ describe("the panel of an opened phone", () => {
     expect(Object.keys(ACTION_LABELS)).toEqual(ACTIONS);
   });
 
+  it("offers a browser without WebGL2 the video only, and says why", () => {
+    const ph = phonesOf(2);
+    ph.tiles[0] = { ...ph.tiles[0]!, borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-1" } };
+    const why = "This browser has no WebGL2, so it can show the video only.";
+    const p = phonesView(input(stateWith(ph), { openId: "phone:1", takeover: "video", mirrorUnavailable: why })).panel!;
+    if (p.borrow.kind !== "yours") throw new Error(p.borrow.kind);
+    expect(p.borrow.views.map((v) => [v.name, v.pressed, v.disabled])).toEqual([
+      ["video", true, false],
+      ["mirror", false, true],
+      ["both", false, true],
+    ]);
+    expect(p.borrow.viewsNote).toBe(why);
+    const able = phonesView(input(stateWith(ph), { openId: "phone:1", takeover: "video" })).panel!;
+    if (able.borrow.kind !== "yours") throw new Error(able.borrow.kind);
+    expect(able.borrow.views.every((v) => !v.disabled)).toBe(true);
+    expect(able.borrow.viewsNote).toBeNull();
+  });
+
   it("recognises the holder by either spelling of the viewer id", () => {
     const ph = phonesOf(1);
     ph.tiles[0] = { ...ph.tiles[0]!, borrowed: { until: EPOCH + 60_000, session: "s", viewer: "viewer:v-1" } };

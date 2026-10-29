@@ -112,7 +112,9 @@ export class MockRenderers {
       // a phone's GPU mirror (mock/mirror.ts)
       const mm = /^\/frames\/([A-Za-z0-9_-]+)\/mirror$/.exec(url.pathname);
       if (mm && this.tiles.has(mm[1]!)) {
-        this.wss.handleUpgrade(req, socket, head, (ws) => serveMockMirror(ws, process.env.FLEET_MOCK_MIRROR_TAP || undefined));
+        const overflow = this.overflowNextMirror;
+        this.overflowNextMirror = false;
+        this.wss.handleUpgrade(req, socket, head, (ws) => serveMockMirror(ws, process.env.FLEET_MOCK_MIRROR_TAP || undefined, overflow));
         return;
       }
       const m = /^\/frames\/([A-Za-z0-9_-]+)$/.exec(url.pathname);
@@ -226,6 +228,12 @@ export class MockRenderers {
   setSilent(silent: boolean): void {
     this.silent = silent;
     if (silent) for (const s of [...this.subs]) s.ws.close(1001, "silent");
+  }
+
+  /** The next GPU mirror stream sends an OVERFLOW record after a few frames, as a tap whose ring filled. */
+  private overflowNextMirror = false;
+  setMirrorOverflow(): void {
+    this.overflowNextMirror = true;
   }
 
   setSkew(id: string, seconds: number): void {

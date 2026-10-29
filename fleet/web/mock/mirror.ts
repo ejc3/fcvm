@@ -1,5 +1,5 @@
 // The mock phone streamer's GET /mirror (fleet/PROTOCOL.md, "Phone streamer"): a tap stream
-// (gfxstream's mirror_tap.h records) deflated as the streamer deflates it. With
+// (gfxstream's mirror_tap.h records) compressed as the streamer compresses it. With
 // FLEET_MOCK_MIRROR_TAP naming a captured stream it plays that capture at the pace it was
 // recorded; otherwise it makes one: a window surface cleared to a colour that steps every
 // frame, posted 30 times a second, with the reply a guest waits for on each flush.
@@ -54,18 +54,23 @@ function frame(k: number): Uint8Array[] {
   ];
 }
 
-/** Serves one mirror stream on `ws` until it closes. */
-export function serveMockMirror(ws: WebSocket, capturePath: string | undefined): void {
-  // one raw deflate stream, flushed after each batch; the page inflates it as one stream, so
-  // where its messages split does not matter
-  const z = zlib.createDeflateRaw({ level: 1 });
+/**
+ * Serves one mirror stream on `ws` until it closes. With `overflow`, the synthetic stream sends
+ * an OVERFLOW record after ten frames and nothing after it, as a tap whose ring filled.
+ */
+export function serveMockMirror(ws: WebSocket, capturePath: string | undefined, overflow = false): void {
+  // one zstd stream (level 3, 1 MiB window), flushed after each batch; the page decodes it as
+  // one stream, so where its messages split does not matter
+  const z = zlib.createZstdCompress({
+    params: { [zlib.constants.ZSTD_c_compressionLevel]: 3, [zlib.constants.ZSTD_c_windowLog]: 20 },
+  });
   z.on("data", (out: Buffer) => {
     if (ws.readyState === ws.OPEN) ws.send(out);
   });
   const send = (parts: Uint8Array[]) => {
     if (ws.readyState !== ws.OPEN) return;
     z.write(Buffer.concat(parts));
-    z.flush(zlib.constants.Z_SYNC_FLUSH);
+    z.flush(zlib.constants.ZSTD_e_flush);
   };
   let timer: NodeJS.Timeout | null = null;
   let admitted = false;
@@ -100,7 +105,14 @@ export function serveMockMirror(ws: WebSocket, capturePath: string | undefined):
     }
     send(opening());
     let k = 0;
-    timer = setInterval(() => send(frame(k++)), 1000 / 30);
+    timer = setInterval(() => {
+      if (overflow && k === 10) {
+        send([encodeRecord(RECORD.overflow, 1, new Uint8Array(0), 1 << 20)]);
+        if (timer) clearInterval(timer);
+        return;
+      }
+      send(frame(k++));
+    }, 1000 / 30);
   });
   ws.on("close", () => {
     if (timer) clearInterval(timer);

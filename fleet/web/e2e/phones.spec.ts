@@ -191,12 +191,15 @@ test("a phone taken over shows its video, its GPU mirror or both, each with its 
   await expect(page.getByTestId("phone-readout-video")).toHaveCount(0);
   await expect(page.getByTestId("phone-readout-mirror")).toContainText(/\d Mbit\/s · \d+\.\d MB · \d+ fps/, { timeout: 15_000 });
   await expect(page.getByTestId("phone-readout-mirror")).toContainText(/[1-9]\d* blocking calls a second answered by the phone's GPU/);
+  // the wire is zstd, decoded in the worker, and the panel says what it costs
+  await expect(page.getByTestId("phone-readout-mirror")).toContainText(/zstd, \d+\.\dx smaller than the commands, decoded in \d+\.\d% of a core/);
   // the mock phone clears to a colour of its frame number: the mirror drew it with WebGL2
   await expect.poll(async () => (await page.evaluate(() => window.__phones!.mirror()))?.pixel?.[2] ?? 0, { timeout: 15_000 }).toBe(200);
   const st = (await page.evaluate(() => window.__phones!.mirror()))!;
   expect(st.posts).toBeGreaterThan(10);
   expect(st.skipped + st.failed).toBe(0);
   expect(st.fps).toBeGreaterThan(15);
+  expect(st.decodeMsPerSec).toBeGreaterThan(0);
   // joining the copy restarts the app (until the join snapshot lands), once
   await expect.poll(async () => (await phoneActions()).map((a) => a.action)).toEqual(["restart_app"]);
 
@@ -218,6 +221,22 @@ test("a phone taken over shows its video, its GPU mirror or both, each with its 
 
   await page.getByTestId("phone-give-back").click();
   await expect(page.getByTestId("phone-mirror")).toBeHidden();
+});
+
+test("a mirror whose phone's copy overflowed says so and joins again", async ({ page }) => {
+  await openPhones(page);
+  await page.getByTestId("phone-hit-phone:2").click();
+  await page.getByTestId("phone-take").click();
+  await expect(page.getByTestId("phone-borrow")).toHaveAttribute("data-kind", "yours");
+  // the next mirror stream's tap overflows after ten frames (mock/mirror.ts)
+  await admin("/mock/fault", { mirror_overflow: true });
+  await page.getByTestId("phone-view-mirror").click();
+  await expect(page.getByTestId("phone-readout-mirror")).toContainText("overflowed: join again", { timeout: 15_000 });
+  // the page joins again (one rejoin every 10 s at most), restarts the app into the new copy, and draws
+  await expect.poll(async () => (await phoneActions()).map((a) => a.action), { timeout: 20_000 }).toEqual(["restart_app", "restart_app"]);
+  await expect(page.getByTestId("phone-readout-mirror")).toContainText(/\d Mbit\/s · \d+\.\d MB · \d+ fps/, { timeout: 15_000 });
+  await expect.poll(async () => (await page.evaluate(() => window.__phones!.mirror()))?.posts ?? 0, { timeout: 15_000 }).toBeGreaterThan(10);
+  await page.getByTestId("phone-give-back").click();
 });
 
 test("Reboot phone restores the phone: the panel says Restoring, the stream returns, and the restore time updates", async ({ page }) => {

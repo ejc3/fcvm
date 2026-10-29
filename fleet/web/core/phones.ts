@@ -407,6 +407,11 @@ export interface StreamReadout {
   note?: string | null;
   /** With both views: how far the mirror's scene time is ahead of the video's (ms; negative behind). */
   leadMs?: number | null;
+  /** The mirror's: the commands' bytes over the wire's, and the wire's encoding. */
+  ratio?: number | null;
+  codec?: string | null;
+  /** The mirror's: milliseconds a second this browser spends decoding the wire (zstd only). */
+  decodeMsPerSec?: number | null;
 }
 
 export interface ReadoutRow {
@@ -451,6 +456,10 @@ export function readoutRows(view: TakeoverView, video: StreamReadout | null, mir
       detail:
         mirror && !mirror.note && mirror.repliesPerSec !== undefined
           ? `${Math.round(mirror.repliesPerSec)} blocking calls a second answered by the phone's GPU, none sent to this browser` +
+            (mirror.codec && mirror.ratio ? `. ${mirror.codec}, ${mirror.ratio.toFixed(1)}x smaller than the commands` : "") +
+            (mirror.decodeMsPerSec !== undefined && mirror.decodeMsPerSec !== null
+              ? `, decoded in ${(mirror.decodeMsPerSec / 10).toFixed(1)}% of a core`
+              : "") +
             (mirror.leadMs !== undefined && mirror.leadMs !== null
               ? `. ${Math.abs(Math.round(mirror.leadMs))} ms ${mirror.leadMs >= 0 ? "ahead of" : "behind"} the video`
               : "")
