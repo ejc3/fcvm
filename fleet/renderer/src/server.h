@@ -30,7 +30,16 @@ class FrameSource {
   virtual bool requires_admit() = 0;
   // Whether any scene has been posted (a fleet renderer streams nothing before one).
   virtual bool has_scene() = 0;
+  // GET /mirror, the phone streamer's GPU mirror (fleet/PROTOCOL.md, "Phone streamer"): a
+  // source that serves it says whether a first message's token opens it, and runs an opened
+  // stream on the connection until it ends. The renderer serves none.
+  virtual bool serves_mirror() { return false; }
+  virtual bool mirror_admits(const std::string& token) { return false; }
+  virtual void mirror(Conn& c, const std::string& token) {}
 };
+
+// One masked client frame of at most 64 KiB: its opcode and unmasked payload.
+bool read_ws_message(Conn& c, int* op, std::string* pl);
 
 class Server {
  public:

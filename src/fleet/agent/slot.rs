@@ -341,6 +341,7 @@ fn renderer_body(
         return want.rect.map(|r| RendererScene {
             image_aspect: p.image_aspect,
             chrome: p.chrome.clone(),
+            mirror_viewer: p.mirror_viewer.clone(),
             ..s.for_renderer(r)
         });
     }

@@ -25,6 +25,9 @@ struct PhoneScene {
   bool has_previous = false;
   Rect4 previous;                     // drawn before rect_from_frame
   std::vector<std::string> admit_keys;  // raw, from the scene's admit_keys (admit.h)
+  // The viewer holding the phone (the coordinator's mirror_viewer): only that viewer's direct
+  // token opens GET /mirror. Empty: nobody holds it, and the mirror is closed.
+  std::string mirror_viewer;
   std::string body;
 };
 // Parses and checks a scene body; false with the field named in *err.

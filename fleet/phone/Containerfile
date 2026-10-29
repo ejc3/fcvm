@@ -12,7 +12,7 @@ RUN gcc -O2 -static -Wall -Wextra -Werror -o /kvmprobe /src/kvmprobe.c
 # The phone streamer (streamer/), built with the renderer's server, encoder and wire code
 # from the `renderer` build context (fleet/renderer), which fleet/phone/Makefile passes.
 FROM docker.io/nvidia/cuda:12.8.1-devel-ubuntu24.04 AS streamer
-RUN apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates make libssl-dev \
+RUN apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates make libssl-dev zlib1g-dev \
       pkg-config libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc \
     && rm -rf /var/lib/apt/lists/*
 # NVENC API header (MIT), pinned as the renderer pins it: n12.2.72.0

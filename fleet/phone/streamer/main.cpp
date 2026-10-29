@@ -1,7 +1,8 @@
 // phone-streamer: serves a phone's screen as the renderer's frame stream (PROTOCOL.md,
 // "Phone streamer"). Environment: PORT (8080), FPS (30), EMU_GRPC (the emulator's gRPC
 // controller, 127.0.0.1:8554), PHONE_GO_FILE (stream nothing until it exists),
-// PHONE_APP_PORT (7070, the app's control socket on this container's loopback), TLS_CERT_FILE,
+// PHONE_APP_PORT (7070, the app's control socket on this container's loopback), MIRROR_SOCKET
+// (the emulator's command-stream tap, /tmp/gfxstream-mirror.sock), TLS_CERT_FILE,
 // TLS_PORT (443) and SCENE_TOKEN_FILE as for the renderer (its PROTOCOL.md "Access": with a
 // token file, scene posts need the token and streams wait for the first scene).
 //
@@ -37,6 +38,7 @@ int main(int argc, char** argv) {
   if (const char* s = getenv("EMU_GRPC")) o.screen_target = s;
   if (const char* s = getenv("PHONE_GO_FILE")) o.go_file = s;
   o.app_port = (int)envd("PHONE_APP_PORT", 7070);
+  if (const char* s = getenv("MIRROR_SOCKET")) o.mirror_socket = s;
   PhoneSource p(o);
   std::string err;
   TlsFront tls;
@@ -64,7 +66,7 @@ int main(int argc, char** argv) {
   };
   if (o.fail.empty() && !p.init(&err)) {
     fprintf(stderr, "phone-streamer: GPU: %s\n", err.c_str());
-    PhoneSource failed(StreamerOptions{o.screen_target, o.fps, "GPU: " + err, "", o.app_port});
+    PhoneSource failed(StreamerOptions{o.screen_target, o.fps, "GPU: " + err, "", o.app_port, o.mirror_socket});
     Server s(failed);
     if (!listen(s)) return 1;
     s.serve();

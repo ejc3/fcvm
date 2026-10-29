@@ -65,8 +65,7 @@ int query_int(const std::string& q, const std::string& k, int def) {
 }
 }  // namespace
 
-// One masked client frame of at most 64 KiB: its opcode and unmasked payload.
-static bool read_ws_message(Conn& c, int* op, std::string* pl) {
+bool read_ws_message(Conn& c, int* op, std::string* pl) {
   uint8_t b2[2];
   if (!c.read_exact(b2, 2)) return false;
   *op = b2[0] & 0x0f;
@@ -271,6 +270,27 @@ void Server::handle(Conn& c) {
              jpg.size(), tile.c_str());
     std::string out = std::string(hd) + (method == "HEAD" ? std::string() : jpg);
     c.write_all(out.data(), out.size());
+    return;
+  }
+  if (path == "/mirror" && method == "GET" && p_.serves_mirror()) {
+    if (lower(hdr["upgrade"]) != "websocket" || hdr["sec-websocket-key"].empty())
+      return respond(c, 426, "Upgrade Required", "{\"error\":\"WebSocket upgrade required\"}");
+    std::string resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " +
+                       ws_accept(hdr["sec-websocket-key"]) + "\r\n\r\n";
+    if (!c.write_all(resp.data(), resp.size())) return;
+    // As for /frames, the token is the first message, never in the URL; here it must also
+    // name the viewer holding the phone.
+    c.set_read_timeout_ms(ADMIT_WAIT_MS);
+    int op = 0;
+    std::string first, token;
+    if (!read_ws_message(c, &op, &first) || op != 1 || !admit_message(first, &token) || !p_.mirror_admits(token)) {
+      static const char kReason[] = "\x03\xf0" "the token of the viewer holding this phone is required";  // 1008
+      std::string close = ws_frame(8, kReason, sizeof kReason - 1);
+      c.write_all(close.data(), close.size());
+      return;
+    }
+    c.set_read_timeout_ms(0);
+    p_.mirror(c, token);
     return;
   }
   if (path == "/frames" && method == "GET") {

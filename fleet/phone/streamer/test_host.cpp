@@ -4,6 +4,8 @@
 #include <math.h>
 #include <string.h>
 
+#include <zlib.h>
+
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -12,6 +14,7 @@
 #include "check.h"
 #include "json.h"
 #include "logic.h"
+#include "mirror.h"
 #include "nv12.h"
 #include "stamp.h"
 
@@ -218,6 +221,64 @@ int main() {
     sc = parsed("{\"epoch_unix_ms\":990000}");
     CHECK(g.admit(false, 0, 1000040, sc, &t) && fabs(t - 10.0333333) < 1e-6, "after the new scene, t %f", t);
     CHECK(!g.admit(false, 0, 1000050, sc, &t), "and its slots are still once each");
+  }
+  {  // the GPU mirror's admission: only the token of the viewer the scene names as holding the
+     // phone (the coordinator's test vector above: viewer v-3), never without keys or a holder
+    const std::string tok = "v1.1000.v-3.77RQqtaEAwJ9OBEoNeX1QubmZTlMfZcYJtIdWkCSW7Q";
+    const std::string key = "0707070707070707070707070707070707070707070707070707070707070707";
+    CHECK(admit_token_viewer(tok) == "v-3", "the viewer a token names: %s", admit_token_viewer(tok).c_str());
+    CHECK(admit_token_viewer("v1.1000.v.x.y.mac") == "v.x.y" && admit_token_viewer("v1.1000mac").empty() &&
+              admit_token_viewer("v2.1.v.m").empty(),
+          "the viewer is between the expiry and the mac");
+    PhoneScene held = parsed("{\"epoch_unix_ms\":1000,\"admit_keys\":[\"" + key + "\"],\"mirror_viewer\":\"v-3\"}");
+    AdmitKeys a;
+    a.on_scene(held);
+    CHECK(held.mirror_viewer == "v-3", "the scene names the holder");
+    CHECK(mirror_admits(a.keys, held.mirror_viewer, tok, 999), "the holder's token opens the mirror");
+    CHECK(!mirror_admits(a.keys, "v-4", tok, 999), "another viewer's token does not");
+    CHECK(!mirror_admits(a.keys, "", tok, 999), "nobody holds the phone: no mirror");
+    CHECK(!mirror_admits({}, "v-3", tok, 999), "no keys: no mirror, unlike /frames");
+    CHECK(!mirror_admits(a.keys, "v-3", tok, 1001), "an expired token");
+    std::string forged = tok;
+    forged[forged.size() - 2] = forged[forged.size() - 2] == 'A' ? 'B' : 'A';
+    CHECK(!mirror_admits(a.keys, "v-3", forged, 999), "a token another key made");
+    Json j = Json::parse(app_scene_line(held));
+    CHECK(!j.has("mirror_viewer"), "the app is not sent the holder: %s", app_scene_line(held).c_str());
+    std::string err;
+    PhoneScene bad;
+    CHECK(!phone_scene_parse("{\"epoch_unix_ms\":1,\"mirror_viewer\":" + std::string("\"") + std::string(129, 'v') + "\"}", &bad, &err),
+          "a holder id over 128 characters");
+  }
+  {  // the mirror's deflate: one raw stream, each push a whole message the page inflates as it
+     // arrives, the concatenation of everything pushed
+    MirrorDeflate z;
+    CHECK(z.ok(), "deflateInit2");
+    z_stream in{};
+    CHECK(inflateInit2(&in, -15) == Z_OK, "inflateInit2");
+    std::string all, got;
+    for (int i = 0; i < 50; i++) {
+      std::string chunk;
+      for (int k = 0; k < 1000 + 37 * i; k++) chunk += (char)((k * 7 + i) % 61);
+      all += chunk;
+      std::string msg;
+      CHECK(z.push((const uint8_t*)chunk.data(), chunk.size(), &msg), "push %d", i);
+      CHECK(msg.size() >= 4 && msg.compare(msg.size() - 4, 4, std::string("\x00\x00\xff\xff", 4)) == 0,
+            "message %d ends at a sync flush", i);
+      in.next_in = (Bytef*)msg.data();
+      in.avail_in = (uInt)msg.size();
+      unsigned char out[1 << 16];
+      do {
+        in.next_out = out;
+        in.avail_out = sizeof out;
+        int rc = inflate(&in, Z_SYNC_FLUSH);
+        CHECK(rc == Z_OK || rc == Z_BUF_ERROR, "inflate %d", rc);
+        got.append((const char*)out, sizeof out - in.avail_out);
+      } while (in.avail_out == 0);
+      CHECK(got == all, "after message %d the page has everything pushed", i);
+    }
+    CHECK(z.in_bytes == all.size() && z.out_bytes < z.in_bytes / 4, "counted, and repetitive input shrinks: %llu of %llu",
+          (unsigned long long)z.out_bytes, (unsigned long long)z.in_bytes);
+    inflateEnd(&in);
   }
   {  // percentiles
     Samples s;

@@ -5,7 +5,7 @@
     "phone_claim_cooldown_secs": 60,
     "phone_claim_secs": 30
   },
-  "description": "Phones mode: an agent's phone GPUs become phone-<n>, laid out in their own image and never on the wall. claim_phone borrows one (one per client, a cap, a cooldown); phone_action accepts only the enumerated actions from the phone's viewer, at most one a second, and hands them to the agent with the phone's assignment; reboot_phone, the end of a borrow and a viewer leaving each restore the phone's VM, timed from the click to its first frame. phones_zoom zooms every viewer's phones out or in together, one change every 2 s per client.",
+  "description": "Phones mode: an agent's phone GPUs become phone-<n>, laid out in their own image and never on the wall. claim_phone borrows one (one per client, a cap, a cooldown); phone_action accepts only the enumerated actions from the phone's viewer, at most one a second, and hands them to the agent with the phone's assignment, which names the viewer holding the phone (mirror_viewer, the only viewer the phone's GPU mirror opens for); reboot_phone, the end of a borrow and a viewer leaving each restore the phone's VM, timed from the click to its first frame. phones_zoom zooms every viewer's phones out or in together, one change every 2 s per client.",
   "events": [
     {
       "at": 1000,
@@ -344,7 +344,9 @@
     {
       "after": 5,
       "checks": {
+        "/assign/h1/1/phone/mirror_viewer": null,
         "/assign/h1/2/generation": 1,
+        "/assign/h1/2/phone/mirror_viewer": "v1",
         "/receipts/c1/outcome": "committed",
         "/view/phones/tiles/1/borrowed/session": "phone-claim-1",
         "/view/phones/tiles/1/borrowed/until": 35000,
@@ -403,6 +405,7 @@
       "after": 13,
       "checks": {
         "/assign/h1/2/generation": 3,
+        "/assign/h1/2/phone/mirror_viewer": null,
         "/view/phones/borrow/lent": 0,
         "/view/phones/tiles/1/borrowed": null,
         "/view/phones/tiles/1/last_relaunch/by": "return:phone-claim-1"
