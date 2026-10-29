@@ -255,6 +255,9 @@ pub enum AgentMsg {
         /// `kernel_started_at`, `store_started_at`, `store_mounted_at`, `agent_started_at`.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         boot: BTreeMap<String, u64>,
+        /// The GPUs the host runs phones on (phones mode), apart from `gpus`, the wall's.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        phones: Vec<Gpu>,
     },
     Slot(SlotReport),
     Health(HealthReport),
@@ -321,6 +324,23 @@ pub struct AssignSlot {
     /// camera (not part of the host's band), then take `rect` when it is placed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub warm: bool,
+    /// A phone (phones mode): the slot runs a phone VM, and `rect` is its rectangle of the
+    /// phones' image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phone: Option<AssignPhone>,
+}
+
+/// What a phone slot's assignment adds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssignPhone {
+    /// The phones' image's width / height.
+    pub image_aspect: f64,
+    /// The take-over actions to carry out, each once by `seq`, oldest first.
+    #[serde(default)]
+    pub actions: Vec<crate::phone::PhoneActionReq>,
+    /// The phones' zoom keys (`chrome` in the phone's scene).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chrome: Vec<crate::phone::ChromeKey>,
 }
 
 /// The scene shared by every renderer; the agent adds each slot's rect to make the
@@ -370,6 +390,7 @@ impl SharedScene {
             lights: self.lights.clone(),
             admit_keys: self.admit_keys.clone(),
             weather: self.weather.clone(),
+            chrome: Vec::new(),
         }
     }
 }
@@ -429,6 +450,10 @@ pub struct RendererScene {
     pub admit_keys: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub weather: Vec<WeatherKey>,
+    /// A phone's app bars shown or hidden from a scene time (phones mode; Robot Park's
+    /// `chrome`). Never sent to a renderer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chrome: Vec<crate::phone::ChromeKey>,
 }
 
 #[cfg(test)]
@@ -480,6 +505,7 @@ mod tests {
                 previous_rect: None,
                 standby: false,
                 warm: false,
+                phone: None,
             }],
             region: None,
         };

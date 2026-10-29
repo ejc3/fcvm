@@ -40,7 +40,7 @@ ADB=${PHONE_ADB:-/android/platform-tools/adb}
 # the console's gpu release and gpu retake.
 EMU_DIR=${EMU_DIR:-/emu}
 EMU=$EMU_DIR/emulator
-CTL_PORT=7070
+CTL_PORT=${PHONE_CTL_PORT:-7070}
 # serve's programs and files (scripts/phone/test-phone-sh.sh points them at stand-ins)
 STREAMER=${PHONE_STREAMER:-/usr/local/bin/phone-streamer}
 KVM=${PHONE_KVM:-/dev/kvm}
@@ -213,6 +213,35 @@ serve)
   grep -aE 'ERROR|FATAL' "$RUN/emulator.log" | tail -20 >&2
   exit 1
   ;;
+action)
+  # The take-over actions (fleet/PROTOCOL.md, "Phones mode"): each name maps to one fixed
+  # request on Robot Park's control socket, and nothing a viewer sends reaches the phone but
+  # the name. Which screen shows and whether the phone is dark are this container's to
+  # remember: the actions are toggles.
+  app_action() {
+    local reply
+    reply=$("$0" ctl "{\"type\":\"action\",\"name\":\"$1\"}") || { echo "phone.sh: the app did not answer" >&2; exit 1; }
+    case "$reply" in *'"error"'*) echo "phone.sh: the app refused $1: $reply" >&2; exit 1 ;; esac
+  }
+  toggle() { # file, first value, second value: prints the value after this toggle
+    local now
+    now=$(cat "$RUN/$1" 2>/dev/null || echo "$2")
+    if [ "$now" = "$2" ]; then echo "$3" > "$RUN/$1"; echo "$3"; else echo "$2" > "$RUN/$1"; echo "$2"; fi
+  }
+  case "${2:-}" in
+  switch_screen) app_action "$(toggle screen scene info)" ;;
+  rotate) app_action rotate ;;
+  dark_mode) app_action "$(toggle night light dark)" ;;
+  dance|wave) app_action "$2" ;;
+  gpu_benchmark) app_action benchmark ;;
+  restart_app) app_action restart; rm -f "$RUN/screen" ;;
+  *)
+    echo "phone.sh: unknown action '${2:-}'" >&2
+    exit 2
+    ;;
+  esac
+  echo "ok ${2}"
+  ;;
 boot)
   make_avd
   use_system_egl
@@ -296,7 +325,7 @@ stop)
   "$ADB" emu kill > /dev/null 2>&1 || true
   ;;
 *)
-  echo "usage: phone.sh serve|boot|renderer|probe secs apk|draws secs|holds|bugreports|app apk|ctl json|pull path dest|shot dest.png|applog|stop" >&2
+  echo "usage: phone.sh serve|action NAME|boot|renderer|probe secs apk|draws secs|holds|bugreports|app apk|ctl json|pull path dest|shot dest.png|applog|stop" >&2
   exit 2
   ;;
 esac

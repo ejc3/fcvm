@@ -130,4 +130,39 @@ has "$D" "streamer fail: the app did not start: am start" && ok "an app that doe
   || bad "an app that does not start: $(cat "$D/log" "$D/out")"
 has "$D" "streamer streaming" && bad "a phone without its app was streamed" || ok "a phone without its app is never streamed"
 stopped "$D" && ok "the emulator of a phone whose app did not start is stopped" || bad "the emulator of a phone whose app did not start still runs"
+# `action`: each name sends its one request to the app's control socket (a stand-in that
+# records what it is sent); switch_screen and dark_mode toggle; any other name is refused.
+port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+python3 -c '
+import socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(16)
+with open(sys.argv[2], "a") as log:
+    while True:
+        c, _ = s.accept(); f = c.makefile("rw")
+        for line in f:
+            log.write(line); log.flush(); f.write("{\"ok\": true}\n"); f.flush()
+        c.close()
+' "$port" "$dir/ctl.log" &
+ctl=$!
+for _ in $(seq 1 50); do (exec 3<> "/dev/tcp/127.0.0.1/$port") 2> /dev/null && break; sleep 0.1; done
+act() { PHONE_CTL_PORT=$port PHONE_RUN="$dir" "$phone" action "$1" > /dev/null 2> "$dir/act.err"; }
+for a in switch_screen switch_screen rotate dark_mode dark_mode dance wave gpu_benchmark restart_app; do
+  act "$a" || bad "action $a failed: $(cat "$dir/act.err")"
+done
+want='{"type":"action","name":"info"}
+{"type":"action","name":"scene"}
+{"type":"action","name":"rotate"}
+{"type":"action","name":"dark"}
+{"type":"action","name":"light"}
+{"type":"action","name":"dance"}
+{"type":"action","name":"wave"}
+{"type":"action","name":"benchmark"}
+{"type":"action","name":"restart"}'
+[ "$(cat "$dir/ctl.log")" = "$want" ] && ok "each action sends its one request to the app" || bad "the app was sent: $(cat "$dir/ctl.log")"
+for a in reboot_phone shell "rotate; id" ""; do
+  if act "$a"; then bad "action '$a' was accepted"; else rc=$?; [ "$rc" = 2 ] && ok "action '$a' is refused" || bad "action '$a' exited $rc"; fi
+done
+[ "$(wc -l < "$dir/ctl.log")" = 9 ] && ok "a refused action sends the app nothing" || bad "a refused action reached the app"
+kill "$ctl" 2> /dev/null || true
 exit $fail

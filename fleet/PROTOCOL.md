@@ -155,6 +155,10 @@ Intents:
 | `release_gpu` | `{"claim": "claim-3"}` (or `{}`) | ends your claim early; a `claim` that is not yours is refused |
 | `claim_camera` | `{"drag": {"yaw_deg", "pitch_deg", "dive"}}` | turns and moves your claimed GPU's camera (only yours; refused without a claim), easing over 0.3 s; the keyframe it eases to gets `"intent": <id>`. Yaw within 360, pitch within 180, dive within 50. On a camera flying its autopilot it also stops the autopilot: the camera eases to rest along its path over 0.5 s while it turns by the drag |
 | `claim_autopilot` | `{"on": false}` or `{"on": true}` | stops your claimed GPU's autopilot (the camera comes to rest along its path over 1 s, on a keyframe with `"intent": <id>`, and stays there) or starts it again (the camera flies from where it is to the nearest point of the loop in 2 to 8 s, that keyframe carrying the intent, and on around it). Refused without a claim; the state it already has commits and changes nothing |
+| `claim_phone` | `{"phone": "phone-2"}` (or `{}`: any free phone) | borrows a phone for 120 s (`phone_claim_secs`); see "Phones mode" below |
+| `release_phone` | `{"claim": "phone-claim-3"}` (or `{}`) | gives your phone back early; it is restored from its snapshot for the next viewer |
+| `phone_action` | `{"action": "rotate", "claim": "phone-claim-3"}` (`claim` optional) | one of the fixed take-over actions on your borrowed phone; see "Phones mode" |
+| `phones_zoom` | `{"out": true}` or `{"out": false}` | zooms every viewer's phones out (each phone shows its app's bars) or back in; one change every 2 s per client; see "Phones mode" |
 
 There is no intent to move the wall's camera, set its time of day, relaunch every tile
 on a viewer's schedule, or change the race cadence: the director and the owner's
@@ -720,6 +724,71 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
 - SIGTERM or SIGINT stops the coordinator after it has written the last state to
   `--state-file`; its agents' commands then end, and their VMs with them.
 
+### Phones mode
+
+`?mode=phones` on the page shows the phones instead of the wall (design:
+`docs/fleet/ARCHITECTURE.md`, "Phones mode"). An agent started with `--phones N` runs phones
+on the last N GPUs of its inventory and names them in its hello (`phones`, below); the
+coordinator makes one phone per GPU, `phone-<n>`, apart from the wall's slots. A phone is
+never a wall tile, never in a race, never given the wall's budget.
+
+The snapshot's `state.phones` is absent with no phones, else:
+
+```json
+{"image_aspect": 1.125, "claim_secs": 120,
+ "borrow": {"cap": 1, "lent": 1, "next_return_at": 1761134525000},
+ "actions": ["switch_screen", "rotate", "dark_mode", "dance", "wave", "gpu_benchmark", "restart_app", "reboot_phone"],
+ "zoomed_out": false, "zoom_at": 1761134400000,
+ "tiles": [{"id": "phone:1", "slot": "phone-1", "rect": {"x": 0, "y": 0, "w": 0.5, "h": 1}, "phase": "running",
+            "frame_url": "wss://...", "borrowed": {"session": "phone-claim-3", "viewer": "v-12", "since": ..., "until": ...},
+            "last_relaunch": {"clicked_at": ..., "by": "reboot:phone-claim-3", "first_frame_at": ..., "phases": {...}}, ...}]}
+```
+
+`tiles` are wall tiles' fields (`TileView`) laid out in the phones' own image: one row of up
+to six, then rows of equal length, each phone `config.phone_aspect` wide for 1 high (Robot
+Park's surface, 720 x 1280). `image_aspect` is that image's. A borrowed phone keeps its
+place and its stream (`borrowed` names its viewer). `last_relaunch` times the phone's last
+restore from the click (or the wake) to the app's first stamped frame, as for a wall tile.
+
+**Zooming out** (`phones_zoom`) is shared by every viewer, like the wall's scene. The
+coordinator adds a key to every phone's scene (`chrome`: `{"t", "on"}`, a scene time 1 s
+ahead, the newest 16), so every phone shows or hides its app's top and tab bars at the same
+`t` (PROTOCOL "Phone app"); `zoomed_out` and `zoom_at` say which and since when, and the page
+draws each phone in a phone body while zoomed out. A zoom already in effect commits and
+changes nothing; a client changes it at most once every 2 s (`one zoom every 2 s; wait 1000
+ms`); a fleet with no phones refuses it.
+
+**Borrowing** (`claim_phone`): one phone per client address, at most `cap` lent at once
+(`max_phones_lent`, default 2 or half the phones, the smaller), and after a phone comes back
+its client waits `phone_claim_cooldown_secs` (60) to borrow again. A named phone must be
+running its current launch and not lent; without a name the lowest-numbered such phone is
+taken. Refusals name the rule: `one phone per client at a time`, `1 of 1 phones are already
+lent; the next comes back in 28 s`, `your last phone was returned 1 s ago; borrow again in
+59 s`, `phone-2 is lent to another viewer`, `phone-2 is not running`, `no phone can be lent
+now: none is running and free`. The borrow ends after `phone_claim_secs`, on `release_phone`,
+or when its viewer leaves; the phone is then restored from its snapshot
+(`last_relaunch.by` `return:<session>`), so the next viewer finds it as every phone starts.
+
+**Actions** (`phone_action`): only the viewer holding the phone, at most one a second, and
+only these names; anything else is refused (`args.action must be one of ...`) and nothing
+reaches the phone:
+
+| action | what the phone does | Robot Park's action (PROTOCOL "Phone app") |
+|---|---|---|
+| `switch_screen` | the app shows its other screen: the scene, or its info screen | `info`, then `scene` |
+| `rotate` | portrait to landscape or back; a turned phone draws the whole image on its own | `rotate` |
+| `dark_mode` | night or day on this phone | `dark`, then `light` |
+| `dance`, `wave` | the robots dance, or wave, on this phone | `dance`, `wave` |
+| `gpu_benchmark` | the app's GPU benchmark; the result is on its info screen | `benchmark` |
+| `restart_app` | the app exits and starts again | `restart` |
+| `reboot_phone` | the phone's VM is restored from its snapshot (`last_relaunch.by` `reboot:<session>`) | none |
+
+The coordinator hands every action but `reboot_phone` to the phone's agent in the phone's
+assignment (`phone.actions` below) for 30 s, numbered (`seq`) and tagged with the launch
+they are for; the agent carries out each once with `phone.sh action <name>` in the phone's
+container, which sends the app the one request its name maps to (`switch_screen` and
+`dark_mode` remember which they sent last, so each is a toggle).
+
 ## Agent
 
 `fcvm fleet agent` runs on a GPU host, one per host. It speaks newline-delimited JSON:
@@ -758,7 +827,9 @@ host's boot reached each step, Unix milliseconds on the host's clock: `kernel_st
 (now less `/proc/uptime`), `agent_started_at`, and every `*_at` number in the store-ready
 file, which the store unit writes as a JSON object (`store_started_at`, `store_mounted_at`).
 The coordinator keeps the times that fall inside the current wake in the wake's host record
-(`power.hosts` in the state object) and logs them. `gpus` are the NVIDIA display functions bound to `vfio-pci`, in address
+(`power.hosts` in the state object) and logs them. `phones` (optional, phones mode) are the
+GPUs the host runs phones on (`--phones N`: the last N of its inventory), apart from
+`gpus`; the coordinator makes one phone per address not among `gpus`. `gpus` are the NVIDIA display functions bound to `vfio-pci`, in address
 order; `capacity` is how many VMs the host runs at once (default: one per GPU). The
 coordinator makes one slot per GPU and ignores a repeated address. The first hello binds the
 connection to `host`, and a later hello on the same connection must name the same host. A
@@ -874,6 +945,21 @@ none is placed). For each slot the agent reconciles:
   `rect` set, `previous_rect` the whole image) post its rectangle; the renderer keeps drawing
   the whole image until `rect_from_frame`, so it opens the new encoders ahead of the switch.
   No relaunch.
+- `phone: {"image_aspect": 1.125, "actions": [{"seq": 7, "action": "rotate", "at": ..., "generation": 2}], "chrome": [{"t": 812.0, "on": true}]}`
+  (phones mode): the slot is a phone. With `--phone-snapshot` its VM is a clone of that warm
+  snapshot of a running phone (flow B: `fcvm snapshot run --snapshot <tag> --gpu <sbdf>` with
+  the slot's ports, routed address and the host's certificate map; the phone's GPU hook
+  retakes the clone's GPU). Without it the phone boots cold: `fcvm podman run
+  --kernel-profile phone --gpu <sbdf> --privileged --cpu 6 --mem 6144 --portable-volumes`,
+  `--phone-aosp` mapped at `/android`, `--phone-emulator` at `/emu`, the app's directory at
+  `/work`, the phone image running `phone.sh serve`; that names neither the slot nor the
+  GPU, so every phone restores from one pre-start snapshot, and the AMI's warm snapshot is
+  taken of a phone launched this way. Its scene is the shared scene with `rect`, its
+  rectangle of the phones' image, and `image_aspect`; it gets no budget; its first frame is
+  the streamer's first stamped scene frame (`phone.scene_frames`). Each action of the
+  running launch with a `seq` above the last carried out is carried out once, in order
+  (`fcvm exec --pid <vm> -- /usr/local/bin/phone.sh action <name>`); `reboot_phone` never
+  appears (the coordinator relaunches the phone). The aggregator's layout leaves phones out.
 - a slot no longer listed: tear its VM down.
 - a VM that exits on its own: report `failed`, relaunch after 1 s, doubling to 30 s; the
   backoff resets once a VM has run for 60 s.

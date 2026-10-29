@@ -67,10 +67,35 @@ pub struct Config {
     /// published names (`Slot::published`), not the URL its agent reported.
     #[serde(default)]
     pub names_published: bool,
+    /// Phones mode: a borrowed phone returns after this long, and the same client address
+    /// waits `phone_claim_cooldown_secs` after it to borrow again.
+    #[serde(default = "two_minutes")]
+    pub phone_claim_secs: u64,
+    #[serde(default = "one_minute")]
+    pub phone_claim_cooldown_secs: u64,
+    /// Phones that may be lent at once. `None`: 2 or half the phones (rounded up), whichever
+    /// is smaller.
+    #[serde(default)]
+    pub max_phones_lent: Option<usize>,
+    /// Width / height of one phone's scene (its screen less what the app draws around it):
+    /// the phones' image is laid out in these.
+    #[serde(default = "phone_aspect")]
+    pub phone_aspect: f64,
 }
 
 fn ten_minutes() -> u64 {
     600
+}
+fn two_minutes() -> u64 {
+    120
+}
+fn one_minute() -> u64 {
+    60
+}
+/// Robot Park's surface, 720 x 1280: the app places its part of the image by the surface's
+/// height (PROTOCOL.md, "Phone app").
+pub fn phone_aspect() -> f64 {
+    720.0 / 1280.0
 }
 
 /// One GPU host's way back up while the fleet wakes, by its EC2 instance id.
@@ -136,6 +161,11 @@ impl Config {
     pub fn borrow_cap(&self, n: usize) -> usize {
         self.max_borrowed.unwrap_or_else(|| 2.min(n.div_ceil(10)))
     }
+
+    /// How many of `n` phones may be lent at once.
+    pub fn phone_lend_cap(&self, n: usize) -> usize {
+        self.max_phones_lent.unwrap_or_else(|| 2.min(n.div_ceil(2)))
+    }
 }
 
 impl Default for Config {
@@ -163,6 +193,10 @@ impl Default for Config {
             power_managed: false,
             idle_scale_down_secs: 600,
             names_published: false,
+            phone_claim_secs: 120,
+            phone_claim_cooldown_secs: 60,
+            max_phones_lent: None,
+            phone_aspect: phone_aspect(),
         }
     }
 }
@@ -300,6 +334,9 @@ pub struct Slot {
     /// A viewer's private session on this (standby) GPU.
     #[serde(default)]
     pub claim: Option<Claim>,
+    /// A phone's own state (`Fleet::phones` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phone: Option<crate::phone::PhoneSlot>,
 }
 
 /// A viewer's own GPU: a standby slot restored for them with their own scene.
@@ -569,6 +606,19 @@ pub struct Fleet {
     /// The EC2 half's aggregator's published DNS names (`EC2_AGGREGATE_ID`).
     #[serde(default)]
     pub ec2_aggregate_published: Option<Published>,
+    /// Phones mode: the phones (`phone-<n>`), apart from the wall's slots.
+    #[serde(default)]
+    pub phones: BTreeMap<u32, Slot>,
+    #[serde(default)]
+    pub phone_claim_count: u64,
+    #[serde(default)]
+    pub last_phone_claim_end: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub phone_action_seq: u64,
+    #[serde(default)]
+    pub phones_zoom: crate::phone::PhonesZoom,
+    #[serde(default)]
+    pub last_phones_zoom_at: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -623,6 +673,12 @@ impl State {
                 power: Power::default(),
                 budget: Default::default(),
                 ec2_aggregate_published: None,
+                phones: BTreeMap::new(),
+                phone_claim_count: 0,
+                last_phone_claim_end: BTreeMap::new(),
+                phone_action_seq: 0,
+                phones_zoom: Default::default(),
+                last_phones_zoom_at: BTreeMap::new(),
             },
             config,
             receipts: BTreeMap::new(),
@@ -638,6 +694,7 @@ impl State {
         let f = &mut self.fleet;
         f.hosts.clear();
         f.slots.clear();
+        f.phones.clear();
         f.ec2.clear();
         f.n = 0;
         f.fcvm_dark.clear();
@@ -748,6 +805,14 @@ pub fn slot_number(id: &str) -> Option<u32> {
 
 pub fn ec2_number(id: &str) -> Option<u32> {
     id.strip_prefix("ec2-")?.parse().ok()
+}
+
+pub fn phone_name(n: u32) -> String {
+    format!("phone-{n}")
+}
+
+pub fn phone_number(id: &str) -> Option<u32> {
+    id.strip_prefix("phone-")?.parse().ok()
 }
 
 #[cfg(test)]

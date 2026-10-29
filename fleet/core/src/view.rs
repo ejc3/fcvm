@@ -1,7 +1,7 @@
 //! What the coordinator sends out, derived from the state: the browser snapshot, each
 //! host's slot assignment, the EC2 driver's assignment and the shared scene.
 
-use crate::protocol::{AssignSlot, SharedScene};
+use crate::protocol::{AssignPhone, AssignSlot, SharedScene};
 use crate::scene::Scene;
 use crate::state::*;
 use crate::tiling::{Half, Rect};
@@ -385,6 +385,33 @@ pub struct View {
     pub counters: CountersView,
     pub viewers: ViewersView,
     pub actions: Vec<Action>,
+    /// Phones mode (`?mode=phones`): the phones and their own image. The wall above never
+    /// includes a phone. Absent with no phones.
+    #[serde(skip_serializing_if = "PhonesView::is_empty")]
+    pub phones: PhonesView,
+}
+
+impl PhonesView {
+    pub fn is_empty(&self) -> bool {
+        self.tiles.is_empty()
+    }
+}
+
+/// The phones, laid out in their own image, row-major (`phone:<k>`, 1-based).
+#[derive(Debug, Clone, Serialize)]
+pub struct PhonesView {
+    pub image_aspect: f64,
+    pub tiles: Vec<TileView>,
+    /// Phones lent to viewers: at most `cap` at once.
+    pub borrow: BorrowView,
+    /// How long a borrowed phone stays with its viewer.
+    pub claim_secs: u64,
+    /// The take-over actions a borrowed phone accepts (`phone_action`).
+    pub actions: Vec<&'static str>,
+    /// Shared by every viewer (`phones_zoom`): the phones show their app's bars and the page
+    /// draws each in a phone body; since when.
+    pub zoomed_out: bool,
+    pub zoom_at: Option<u64>,
 }
 
 fn tile_phase(s: &Slot) -> String {
@@ -649,6 +676,72 @@ pub fn view(state: &State) -> View {
         },
 
         actions: f.actions.iter().cloned().collect(),
+        phones: phones_view(state),
+    }
+}
+
+/// Each phone's place in the phones' image, by phone number, and the image's aspect.
+pub fn phone_places(state: &State) -> (BTreeMap<u32, (usize, Rect)>, f64) {
+    let (rects, aspect) = crate::phone::layout(state.fleet.phones.len(), state.config.phone_aspect);
+    let places = state
+        .fleet
+        .phones
+        .keys()
+        .zip(rects)
+        .enumerate()
+        .map(|(i, (n, r))| (*n, (i, r)))
+        .collect();
+    (places, aspect)
+}
+
+fn phones_view(state: &State) -> PhonesView {
+    let f = &state.fleet;
+    let (places, image_aspect) = phone_places(state);
+    let tiles = places
+        .iter()
+        .map(|(n, (i, rect))| {
+            let s = &f.phones[n];
+            let mut t = tile(
+                state,
+                format!("phone:{}", i + 1),
+                Half::Fcvm,
+                *rect,
+                Some(s),
+            );
+            t.borrowed = s
+                .phone
+                .as_ref()
+                .and_then(|p| p.claim.as_ref())
+                .map(|c| BorrowedView {
+                    session: c.session.clone(),
+                    viewer: c.viewer.clone(),
+                    since: c.claimed_at,
+                    until: c.expires_at,
+                });
+            t
+        })
+        .collect();
+    let lent: Vec<u64> = f
+        .phones
+        .values()
+        .filter_map(|s| s.phone.as_ref()?.claim.as_ref())
+        .map(|c| c.expires_at)
+        .collect();
+    PhonesView {
+        image_aspect,
+        tiles,
+        borrow: BorrowView {
+            cap: state.config.phone_lend_cap(f.phones.len()),
+            lent: lent.len(),
+            next_return_at: lent.iter().copied().min(),
+        },
+        claim_secs: state.config.phone_claim_secs,
+        actions: crate::phone::PhoneAction::ALL
+            .iter()
+            .map(|a| a.as_str())
+            .collect(),
+        zoomed_out: f.phones_zoom.out,
+        zoom_at: f.phones_zoom.at,
     }
 }
 
@@ -859,6 +952,47 @@ pub fn host_assignments(state: &State) -> BTreeMap<String, Vec<AssignSlot>> {
                 previous_rect: moved_from(state, s),
                 standby: in_standby(state, s),
                 warm: is_warming(state, s),
+                phone: None,
+            });
+        }
+    }
+    // The phones: each draws its rectangle of the phones' image, and carries out the
+    // actions of its current launch.
+    let (places, image_aspect) = phone_places(state);
+    for (n, s) in &state.fleet.phones {
+        let (Some(host), Some(gpu)) = (&s.host, &s.gpu) else {
+            continue;
+        };
+        if crate::apply::is_quarantined(&state.fleet, s) {
+            continue;
+        }
+        if let Some(list) = out.get_mut(host) {
+            list.push(AssignSlot {
+                id: s.id.clone(),
+                sbdf: gpu.sbdf.clone(),
+                generation: s.generation,
+                rect: places.get(n).map(|(_, r)| *r),
+                private_camera: None,
+                layout_generation: 0,
+                rect_from_frame: 0,
+                previous_rect: None,
+                standby: false,
+                warm: false,
+                phone: Some(AssignPhone {
+                    image_aspect,
+                    chrome: state.fleet.phones_zoom.keys.clone(),
+                    actions: s
+                        .phone
+                        .as_ref()
+                        .map(|p| {
+                            p.actions
+                                .iter()
+                                .filter(|a| a.generation == s.generation)
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                }),
             });
         }
     }
@@ -892,6 +1026,7 @@ pub fn ec2_assignment(state: &State) -> Vec<AssignSlot> {
             previous_rect: moved_from(state, s),
             standby: false,
             warm: false,
+            phone: None,
         })
         .collect()
 }

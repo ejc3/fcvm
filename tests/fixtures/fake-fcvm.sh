@@ -12,6 +12,8 @@
 #   FAKE_FAIL_START     exit with status 1 before the restored record; "gpu" names the GPU
 #                       in the error, anything else does not
 #   FAKE_SCRUB_EXIT     exit status of `gpu scrub <sbdf>` (default 0)
+#
+# `exec --pid <pid> -- <command...>` logs `exec <pid> <command...>` and exits 0.
 set -u
 dir="${FAKE_FCVM_DIR:?}"
 log="$dir/events.log"
@@ -21,6 +23,10 @@ if [ "${1:-}" = gpu ] && [ "${2:-}" = scrub ]; then
         echo "[fake fcvm] scrub of $3 left memory nonzero" >&2
     fi
     exit "${FAKE_SCRUB_EXIT:-0}"
+fi
+if [ "${1:-}" = exec ]; then
+    echo "exec $3 ${*:5} $(date +%s%N)" >> "$log"
+    exit 0
 fi
 argv=("$@")
 name=""

@@ -233,7 +233,8 @@ struct Page {
     origin: Option<String>,
 }
 
-/// Why a late viewer's `claim_gpu` is refused: a private GPU is a direct stream too.
+/// Why a late viewer's `claim_gpu` or `claim_phone` is refused: a private GPU is a direct
+/// stream too, and a borrowed phone is shown from its direct stream.
 pub const LATE_CLAIM: &str = "direct streams are full, so this page watches the broadcast";
 
 async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
@@ -427,7 +428,7 @@ async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
                     })
                 } else if !verified.load(Ordering::SeqCst) {
                     Some(unrecorded_refusal(id, "verify first"))
-                } else if late && name == "claim_gpu" {
+                } else if late && (name == "claim_gpu" || name == "claim_phone") {
                     Some(unrecorded_refusal(id, LATE_CLAIM))
                 } else if name == "word" {
                     let app = app.clone();

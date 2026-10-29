@@ -21,11 +21,17 @@ use tokio::sync::watch;
 pub struct VmSpec {
     pub fcvm: PathBuf,
     pub name: String,
+    /// The kernel profile: `gpu` for a renderer, `phone` for a phone.
+    pub profile: String,
     pub sbdf: String,
     /// `<ip>:<port>:8080`
     pub publish: String,
     pub extra_args: Vec<String>,
     pub image: String,
+    /// The container's command, after the image (none: the image's own).
+    pub command: Vec<String>,
+    /// Restore a clone of this snapshot (`fcvm snapshot run`) instead of `podman run`.
+    pub clone_of: Option<String>,
 }
 
 impl VmSpec {
@@ -58,21 +64,157 @@ impl VmSpec {
         VmSpec {
             fcvm,
             name,
+            profile: "gpu".into(),
             sbdf,
             publish: format!("{publish_ip}:{port}:8080"),
             extra_args,
             image,
+            command: Vec::new(),
+            clone_of: None,
+        }
+    }
+
+    /// A phone slot's VM: the slot's networking as for a renderer, the phone profile (KVM
+    /// inside, the Firecracker that keeps nested state across a snapshot), and the phone
+    /// container running `phone.sh serve` with the AOSP build, the emulator and the app
+    /// mapped (portable volumes, so a warm snapshot of it restores on any host with the
+    /// same files). Nothing in it names the slot or the GPU, so every phone restores from
+    /// one pre-start snapshot, and fleet/ami/host/warm-phone.sh launches the phone its warm
+    /// snapshot is taken of the same way.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_phone(
+        fcvm: PathBuf,
+        name: String,
+        sbdf: String,
+        publish_ip: &str,
+        port: u16,
+        tls_port: Option<u16>,
+        ipv6: Option<(&super::addr::Prefix, std::net::Ipv6Addr)>,
+        extra: &[String],
+        phone: &PhoneCfg,
+    ) -> VmSpec {
+        let apk = phone
+            .apk
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let work = phone
+            .apk
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".into());
+        let mut own: Vec<String> = vec![
+            "--privileged".into(),
+            "--cpu".into(),
+            PHONE_CPUS.into(),
+            "--mem".into(),
+            PHONE_MEM_MIB.into(),
+            "--portable-volumes".into(),
+            "--map".into(),
+            format!("{}:/android:ro", phone.aosp.display()),
+            "--map".into(),
+            format!("{}:/emu:ro", phone.emulator.display()),
+            "--map".into(),
+            format!("{work}:/work:ro"),
+            "--env".into(),
+            format!("PHONE_APK=/work/{apk}"),
+        ];
+        own.extend(extra.iter().cloned());
+        let mut spec = VmSpec::for_slot(
+            fcvm,
+            name,
+            sbdf,
+            publish_ip,
+            port,
+            tls_port,
+            ipv6,
+            &own,
+            phone.image.clone(),
+        );
+        spec.profile = "phone".into();
+        spec.command = vec!["/usr/local/bin/phone.sh".into(), "serve".into()];
+        spec
+    }
+
+    /// A phone slot's VM as a clone of the warm snapshot of a running phone (flow B):
+    /// `fcvm snapshot run` onto this slot's GPU, with its own ports, address and this host's
+    /// certificate directory (the read-only maps of `extra`); the rest is the snapshot's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_phone_clone(
+        fcvm: PathBuf,
+        name: String,
+        sbdf: String,
+        publish_ip: &str,
+        port: u16,
+        tls_port: Option<u16>,
+        ipv6: Option<(&super::addr::Prefix, std::net::Ipv6Addr)>,
+        extra: &[String],
+        snapshot: &str,
+    ) -> VmSpec {
+        let mut extra_args = Vec::new();
+        if let Some((p, a)) = ipv6 {
+            extra_args.extend([
+                "--ipv6-prefix".into(),
+                p.to_string(),
+                "--ipv6-address".into(),
+                a.to_string(),
+            ]);
+        }
+        if let Some(p) = tls_port {
+            extra_args.push("--publish".into());
+            extra_args.push(format!("{publish_ip}:{p}:443"));
+        }
+        // a clone takes this host's read-only maps (the certificate); everything else, the
+        // environment included, is the snapshot's
+        let mut it = extra.iter();
+        while let Some(a) = it.next() {
+            if a == "--map" {
+                if let Some(m) = it.next().filter(|m| m.ends_with(":ro")) {
+                    extra_args.push("--map".into());
+                    extra_args.push(m.clone());
+                }
+            }
+        }
+        VmSpec {
+            fcvm,
+            name,
+            profile: "phone".into(),
+            sbdf,
+            publish: format!("{publish_ip}:{port}:8080"),
+            extra_args,
+            image: String::new(),
+            command: Vec::new(),
+            clone_of: Some(snapshot.to_string()),
         }
     }
 
     pub fn args(&self) -> Vec<String> {
+        if let Some(snapshot) = &self.clone_of {
+            let mut a: Vec<String> = [
+                "snapshot",
+                "run",
+                "--snapshot",
+                snapshot,
+                "--name",
+                &self.name,
+                "--gpu",
+                &self.sbdf,
+                "--publish",
+                &self.publish,
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            a.extend(self.extra_args.iter().cloned());
+            return a;
+        }
         let mut a: Vec<String> = [
             "podman",
             "run",
             "--name",
             &self.name,
             "--kernel-profile",
-            "gpu",
+            &self.profile,
             "--gpu",
             &self.sbdf,
             "--publish",
@@ -83,8 +225,57 @@ impl VmSpec {
         .collect();
         a.extend(self.extra_args.iter().cloned());
         a.push(self.image.clone());
+        a.extend(self.command.iter().cloned());
         a
     }
+}
+
+/// A phone VM's size: the spike's (docs/fleet/ARCHITECTURE.md, "The phone"), a 6 GiB VM for a
+/// 2 GiB phone with 4 cores, which keeps the VFIO pin at restore short.
+pub const PHONE_CPUS: &str = "6";
+pub const PHONE_MEM_MIB: &str = "6144";
+
+/// What a phone slot runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhoneCfg {
+    pub image: String,
+    /// scripts/phone/aosp.sh --root-path: the system image and adb, at /android
+    pub aosp: PathBuf,
+    /// scripts/phone/emulator.sh --path: the emulator, at /emu
+    pub emulator: PathBuf,
+    /// Robot Park (scripts/phone/app.sh); its directory at /work
+    pub apk: PathBuf,
+    /// The warm snapshot of a running phone every phone is a clone of (flow B); none: each
+    /// phone boots cold
+    pub snapshot: Option<String>,
+}
+
+/// The command that carries out a take-over action in a running phone: `phone.sh action
+/// <name>` in its container, through `fcvm exec`. Each action is one of the enumerated
+/// names, never text from a viewer. `None` for `reboot_phone`, which the coordinator turns
+/// into a relaunch of the VM.
+pub fn phone_action_argv(
+    vm_pid: u32,
+    action: fleet_core::phone::PhoneAction,
+) -> Option<Vec<String>> {
+    use fleet_core::phone::PhoneAction;
+    if action == PhoneAction::RebootPhone {
+        return None;
+    }
+    Some(
+        [
+            "exec",
+            "--pid",
+            &vm_pid.to_string(),
+            "--",
+            "/usr/local/bin/phone.sh",
+            "action",
+            action.as_str(),
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+    )
 }
 
 /// What fcvm's `restored` record says about the restore.
@@ -282,6 +473,172 @@ fn arm_pdeathsig(command: &mut std::process::Command) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_phone_action_maps_to_its_fixed_command_and_reboot_to_none() {
+        use fleet_core::phone::PhoneAction;
+        // The container's controller must handle every name the agent sends.
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fleet/phone/phone.sh"),
+        )
+        .unwrap();
+        let controller = script
+            .split("\naction)\n")
+            .nth(1)
+            .and_then(|s| s.split("\n  ;;\n").next())
+            .expect("phone.sh has an action command");
+        for a in PhoneAction::ALL {
+            match super::phone_action_argv(42, a) {
+                None => assert_eq!(a, PhoneAction::RebootPhone),
+                Some(argv) => {
+                    assert_eq!(
+                        argv,
+                        [
+                            "exec",
+                            "--pid",
+                            "42",
+                            "--",
+                            "/usr/local/bin/phone.sh",
+                            "action",
+                            a.as_str()
+                        ]
+                    );
+                    assert!(
+                        controller.lines().any(|l| l
+                            .trim_start()
+                            .split(')')
+                            .next()
+                            .is_some_and(|labels| labels.split('|').any(|x| x == a.as_str()))),
+                        "phone.sh action has no case for {}",
+                        a.as_str()
+                    );
+                }
+            }
+        }
+    }
+
+    fn phone() -> super::PhoneCfg {
+        super::PhoneCfg {
+            image: "localhost/fcvm-phone:fleet".into(),
+            aosp: "/store/android-aosp/abc".into(),
+            emulator: "/store/android-emulator/def/emulator".into(),
+            apk: "/store/android-aosp/abc/phone-work/robotpark-1.apk".into(),
+            snapshot: None,
+        }
+    }
+    const TLS: [&str; 4] = [
+        "--map",
+        "/etc/fleet-tls:/run/fleet-tls:ro",
+        "--env",
+        "TLS_CERT_FILE=/run/fleet-tls/tls.json",
+    ];
+
+    #[test]
+    fn every_phone_slot_launches_the_same_vm_but_for_its_name_gpu_and_ports() {
+        let tls: Vec<String> = TLS.iter().map(|s| s.to_string()).collect();
+        let spec = |name: &str, sbdf: &str, port: u16| {
+            super::VmSpec::for_phone(
+                "/usr/local/bin/fcvm".into(),
+                name.into(),
+                sbdf.into(),
+                "127.0.0.1",
+                port,
+                Some(port + 100),
+                None,
+                &tls,
+                &phone(),
+            )
+            .args()
+        };
+        // fcvm keys the pre-start snapshot on everything but these, so one snapshot serves
+        // every phone slot of every host
+        let keyed = |a: Vec<String>| {
+            let mut out = Vec::new();
+            let mut it = a.into_iter();
+            while let Some(x) = it.next() {
+                if x == "--name" || x == "--gpu" || x == "--publish" {
+                    it.next();
+                    continue;
+                }
+                out.push(x);
+            }
+            out
+        };
+        let a = spec("fleet-phone-1", "0000:02:00.0", 20101);
+        let b = spec("fleet-phone-3", "0000:04:00.0", 20103);
+        assert_ne!(a, b);
+        assert_eq!(keyed(a.clone()), keyed(b));
+        let has = |pair: [&str; 2]| a.windows(2).any(|w| w == pair);
+        assert!(has(["--kernel-profile", "phone"]), "{a:?}");
+        assert!(
+            has(["--map", "/store/android-aosp/abc:/android:ro"]),
+            "{a:?}"
+        );
+        assert!(
+            has(["--map", "/store/android-emulator/def/emulator:/emu:ro"]),
+            "{a:?}"
+        );
+        assert!(
+            has(["--map", "/store/android-aosp/abc/phone-work:/work:ro"]),
+            "{a:?}"
+        );
+        assert!(has(["--env", "PHONE_APK=/work/robotpark-1.apk"]), "{a:?}");
+        assert!(
+            a.contains(&"--portable-volumes".to_string())
+                && a.contains(&"--privileged".to_string())
+        );
+        assert_eq!(
+            a[a.len() - 3..],
+            [
+                "localhost/fcvm-phone:fleet",
+                "/usr/local/bin/phone.sh",
+                "serve"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_phone_clone_restores_the_warm_snapshot_with_its_own_gpu_ports_address_and_certificate() {
+        let tls: Vec<String> = TLS.iter().map(|s| s.to_string()).collect();
+        let prefix = crate::fleet::agent::addr::Prefix::parse("2001:db8:1:2::/64").unwrap();
+        let addr: std::net::Ipv6Addr = "2001:db8:1:2::5".parse().unwrap();
+        let a = super::VmSpec::for_phone_clone(
+            "/usr/local/bin/fcvm".into(),
+            "fleet-phone-2".into(),
+            "0000:03:00.0".into(),
+            "127.0.0.1",
+            20102,
+            Some(20202),
+            Some((&prefix, addr)),
+            &tls,
+            "phone-warm",
+        )
+        .args();
+        let p = prefix.to_string();
+        assert_eq!(
+            a,
+            [
+                "snapshot",
+                "run",
+                "--snapshot",
+                "phone-warm",
+                "--name",
+                "fleet-phone-2",
+                "--gpu",
+                "0000:03:00.0",
+                "--publish",
+                "127.0.0.1:20102:8080",
+                "--ipv6-prefix",
+                p.as_str(),
+                "--ipv6-address",
+                "2001:db8:1:2::5",
+                "--publish",
+                "127.0.0.1:20202:443",
+                "--map",
+                "/etc/fleet-tls:/run/fleet-tls:ro",
+            ]
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -322,6 +679,9 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let spec = VmSpec {
+            command: Vec::new(),
+            clone_of: None,
+            profile: "gpu".into(),
             fcvm: script,
             name: "fleet-slot-1".into(),
             sbdf: "0000:02:00.0".into(),
@@ -421,6 +781,9 @@ mod tests {
     #[test]
     fn spec_builds_the_documented_command() {
         let s = VmSpec {
+            command: Vec::new(),
+            clone_of: None,
+            profile: "gpu".into(),
             fcvm: "fcvm".into(),
             name: "fleet-slot-2".into(),
             sbdf: "0000:02:00.0".into(),

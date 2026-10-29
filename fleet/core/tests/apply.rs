@@ -23,6 +23,7 @@ fn hello(at: u64, host: &str, gpus: usize) -> Event {
             capacity: 8,
             store_ready_at: None,
             boot: Default::default(),
+            phones: vec![],
         },
     }
 }
@@ -304,6 +305,7 @@ fn a_host_that_comes_up_after_the_fleet_is_awake_still_records_its_wake() {
                 ("agent_started_at".to_string(), 99000),
             ]
             .into(),
+            phones: vec![],
         },
     }];
     later.push(running(240000, "h1", "slot-1"));

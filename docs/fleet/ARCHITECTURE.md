@@ -978,15 +978,24 @@ The stream carries 30 scene frames a second (the app draws 60; the streamer send
 
 ### Taking over
 
-`claim_phone` borrows a phone with `claim_gpu`'s rules (one per viewer, a cooldown, a cap on
-phones lent at once, refused to a broadcast-only viewer). The take-over panel sends one of a
-fixed set of actions, which the coordinator validates as an enum and the agent passes to a
-controller in the phone container that maps each to one fixed command: the info tab or the
-scene tab, rotate (`adb emu rotate`), dark mode (`cmd uimode night`), robots wave or dance
-(an intent to the app), a GPU benchmark run inside the app, restart the app
-(`am force-stop`, then start), and reboot the phone, which restores the phone VM from its
-snapshot and shows the restore time. The controller takes nothing but the action's name;
-adb and the emulator console listen only inside the container.
+`claim_phone` borrows a phone with `claim_gpu`'s rules (one per client, a cooldown, a cap on
+phones lent at once, refused to a broadcast-only viewer). Unlike a GPU, a borrowed phone keeps
+its place on the wall and its stream; when it comes back (after `phone_claim_secs`, on
+`release_phone`, or when its viewer leaves) it is restored from its snapshot, so the next
+viewer finds it as every phone starts. The take-over panel sends one of a fixed set of
+actions (`phone_action`), which the coordinator validates as an enum and hands to the agent
+in the phone's assignment; the agent runs `phone.sh action <name>` in the phone container,
+which sends Robot Park the one control request the name maps to (PROTOCOL.md, "Phones
+mode"): the info tab or the scene tab, rotate, dark or light, the robots dance or wave, the
+app's GPU benchmark, restart the app. Reboot the phone is the coordinator's: it relaunches the
+phone's VM (a clone of its warm snapshot, flow B) and the page shows the restore time. The
+controller takes nothing but the action's name; adb, the emulator console and the app's
+control socket listen only inside the container.
+
+Phones are their own slots (`phone-<n>`), never wall tiles: an agent run with `--phones N`
+runs phones on the last N GPUs of its inventory and names them in its hello. The
+coordinator lays them out in their own image (a row of up to six, then rows of equal length)
+and the page shows it with `?mode=phones`.
 
 ### Invariants (each becomes a test)
 

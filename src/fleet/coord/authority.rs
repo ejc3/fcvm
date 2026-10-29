@@ -135,6 +135,7 @@ pub fn zone_of(state: &State, apex: &str) -> Zone {
         .slots
         .values()
         .chain(f.ec2.values())
+        .chain(f.phones.values())
         .filter_map(|s| s.published.as_ref());
     let aggregators = f
         .hosts

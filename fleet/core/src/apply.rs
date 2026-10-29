@@ -238,6 +238,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 .slots
                 .values_mut()
                 .chain(f.ec2.values_mut())
+                .chain(f.phones.values_mut())
                 .find(|s| s.id == *slot)
             {
                 // Only for the launch the slot is on: a slower write for an earlier launch
@@ -279,6 +280,16 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             for n in mine {
                 release(&mut state.fleet, n, at);
             }
+            let phones: Vec<u32> = state
+                .fleet
+                .phones
+                .iter()
+                .filter(|(_, s)| phone_claim(s).is_some_and(|c| c.viewer == *viewer))
+                .map(|(n, _)| *n)
+                .collect();
+            for n in phones {
+                release_phone(&mut state.fleet, n, at);
+            }
             None
         }
         Event::Tick { .. } => {
@@ -299,10 +310,12 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     capacity,
                     store_ready_at,
                     boot,
+                    phones,
                 } => {
                     // The connection names the host; a hello naming another is ignored.
                     if named == host {
                         hello(&mut state.fleet, host, arch, gpus, *capacity, at);
+                        phone_hello(&mut state.fleet, host, gpus, phones, at);
                         let p = &mut state.fleet.power;
                         if wake_open(p) {
                             let woke = p.woke_at;
@@ -326,6 +339,8 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 AgentMsg::Slot(r) => {
                     if let Some(n) = slot_number(&r.id) {
                         observe_slot(&mut state.fleet, Half::Fcvm, n, Some(host), r, at);
+                    } else if let Some(n) = phone_number(&r.id) {
+                        observe_phone(&mut state.fleet, n, host, r, at);
                     }
                 }
                 AgentMsg::Health(h) => health(&mut state.fleet, Some(host), h),
@@ -385,6 +400,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             let f = &mut state.fleet;
             f.hosts.remove(host);
             f.slots.retain(|_, s| s.host.as_deref() != Some(host));
+            f.phones.retain(|_, s| s.host.as_deref() != Some(host));
             // A host the coordinator scaled away is not a reclaimed one.
             if f.power.state != "asleep" || f.reclaimed.contains_key(host) {
                 f.reclaimed.entry(host.clone()).or_insert((at, None)).1 = Some(at);
@@ -743,6 +759,15 @@ fn intent_effect(
             Ok("light".into())
         }
         Intent::ClaimGpu => claim(state, c),
+        Intent::ClaimPhone { phone } => claim_phone(state, c, phone.as_deref()),
+        Intent::ReleasePhone { claim } => {
+            let n = own_phone(&state.fleet, c.viewer).ok_or("this viewer holds no phone")?;
+            check_phone_claim(&state.fleet, n, claim.as_deref())?;
+            release_phone(&mut state.fleet, n, at);
+            Ok("release phone".into())
+        }
+        Intent::PhoneAction { claim, action } => phone_action(state, c, claim.as_deref(), *action),
+        Intent::PhonesZoom { out } => phones_zoom(state, c, *out),
         Intent::ReleaseGpu { claim } => {
             let n = own_claim(&state.fleet, c.viewer).ok_or("this viewer holds no GPU")?;
             let session = &state.fleet.slots[&n].claim.as_ref().unwrap().session;
@@ -1126,6 +1151,23 @@ fn tick(state: &mut State, at: u64) {
     for n in expired {
         release(f, n, at);
     }
+    // Borrowed phones come back; actions the agents have had time to carry out are dropped.
+    let expired: Vec<u32> = f
+        .phones
+        .iter()
+        .filter(|(_, s)| phone_claim(s).is_some_and(|c| at >= c.expires_at))
+        .map(|(n, _)| *n)
+        .collect();
+    for n in expired {
+        release_phone(f, n, at);
+    }
+    for s in f.phones.values_mut() {
+        if let Some(p) = s.phone.as_mut() {
+            p.actions.retain(|a| {
+                at < a.at + crate::phone::ACTION_KEEP_MS && a.generation == s.generation
+            });
+        }
+    }
     // A reclaimed host is listed for a minute after it is gone.
     let hosts = f.hosts.clone();
     f.reclaimed.retain(|h, (_, gone)| {
@@ -1139,6 +1181,11 @@ fn tick(state: &mut State, at: u64) {
     keep(
         &mut f.last_claim_end,
         state.config.claim_cooldown_secs * 1000,
+    );
+    keep(&mut f.last_phones_zoom_at, crate::phone::ZOOM_INTERVAL_MS);
+    keep(
+        &mut f.last_phone_claim_end,
+        state.config.phone_claim_cooldown_secs * 1000,
     );
     // Restores per minute are kept for the last hour (this minute and the 59 before).
     let minute = at / 60_000;
@@ -1228,7 +1275,59 @@ fn new_slot(id: String, half: Half, host: Option<String>, gpu: Option<Gpu>, at: 
         published: None,
         last_relaunch: None,
         claim: None,
+        phone: None,
     }
+}
+
+/// What a slot report says about the slot's launch, for a wall slot, an EC2 tile or a phone.
+fn note_report(slot: &mut Slot, r: &SlotReport, at: u64) {
+    slot.observed.phase = r.phase.clone();
+    slot.observed.generation = r.generation;
+    slot.observed.vm = r.vm.clone();
+    slot.observed.frame_url = r.frame_url.clone();
+    slot.observed.timings = r.timings.clone();
+    slot.observed.error = r.error.clone();
+    slot.observed.retry_at = r.retry_in_ms.map(|ms| at + ms);
+    slot.observed.ipv6 = r.ipv6.clone();
+    slot.observed.ipv4 = r.ipv4.clone();
+    slot.observed.v4_port = r.v4_port;
+    if r.place.is_some() {
+        slot.observed.place = r.place.clone();
+    }
+}
+
+/// A report that is not `running` clears the renderer's readings (false); a `running` one
+/// ends the timing of the launch it reports (true).
+fn note_running(slot: &mut Slot, r: &SlotReport, at: u64) -> bool {
+    if r.phase != "running" {
+        slot.observed.fps = None;
+        slot.observed.gpu_stats = None;
+        slot.observed.budget_fit = None;
+        slot.observed.render_ms_max = None;
+        slot.observed.frame_t = None;
+        return false;
+    }
+    match slot.last_relaunch.as_mut() {
+        Some(rl) => {
+            if rl.generation == r.generation && rl.first_frame_at.is_none() {
+                rl.first_frame_at = Some(at);
+                rl.phases = r.timings.clone();
+            }
+        }
+        // A slot that came up at a wake was never relaunched by anyone, so nothing timed
+        // it: its launch (or resume) is the last one, timed by the slot's own report.
+        None => {
+            let took = r.timings.get("total_ms").copied().unwrap_or(0);
+            slot.last_relaunch = Some(Relaunch {
+                generation: r.generation,
+                clicked_at: at.saturating_sub(took),
+                by: "wake".into(),
+                first_frame_at: Some(at),
+                phases: r.timings.clone(),
+            });
+        }
+    }
+    true
 }
 
 fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotReport, at: u64) {
@@ -1254,19 +1353,7 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
     if half == Half::Fcvm && r.generation > slot.generation {
         slot.generation = r.generation;
     }
-    slot.observed.phase = r.phase.clone();
-    slot.observed.generation = r.generation;
-    slot.observed.vm = r.vm.clone();
-    slot.observed.frame_url = r.frame_url.clone();
-    slot.observed.timings = r.timings.clone();
-    slot.observed.error = r.error.clone();
-    slot.observed.retry_at = r.retry_in_ms.map(|ms| at + ms);
-    slot.observed.ipv6 = r.ipv6.clone();
-    slot.observed.ipv4 = r.ipv4.clone();
-    slot.observed.v4_port = r.v4_port;
-    if r.place.is_some() {
-        slot.observed.place = r.place.clone();
-    }
+    note_report(slot, r, at);
     if r.phase == "waiting_capacity" {
         let id = slot.id.clone();
         let since = at.saturating_sub(r.timings.get("capacity_wait_ms").copied().unwrap_or(0));
@@ -1289,33 +1376,8 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
     }) else {
         return;
     };
-    if r.phase != "running" {
-        slot.observed.fps = None;
-        slot.observed.gpu_stats = None;
-        slot.observed.budget_fit = None;
-        slot.observed.render_ms_max = None;
-        slot.observed.frame_t = None;
+    if !note_running(slot, r, at) {
         return;
-    }
-    match slot.last_relaunch.as_mut() {
-        Some(rl) => {
-            if rl.generation == r.generation && rl.first_frame_at.is_none() {
-                rl.first_frame_at = Some(at);
-                rl.phases = r.timings.clone();
-            }
-        }
-        // A slot that came up at a wake was never relaunched by anyone, so nothing timed
-        // it: its launch (or resume) is the last one, timed by the slot's own report.
-        None => {
-            let took = r.timings.get("total_ms").copied().unwrap_or(0);
-            slot.last_relaunch = Some(Relaunch {
-                generation: r.generation,
-                clicked_at: at.saturating_sub(took),
-                by: "wake".into(),
-                first_frame_at: Some(at),
-                phases: r.timings.clone(),
-            });
-        }
     }
     let scene_now = f.scene.t_at(at);
     if let Some(c) = slot.claim.as_mut() {
@@ -1373,6 +1435,9 @@ fn finish_half(h: &mut HalfRace, started_at: u64, last: Option<String>, at: u64)
 
 fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport) {
     let slot = match host {
+        Some(_) if h.id.starts_with("phone-") => {
+            phone_number(&h.id).and_then(|n| f.phones.get_mut(&n))
+        }
         Some(_) => slot_number(&h.id).and_then(|n| f.slots.get_mut(&n)),
         None => ec2_number(&h.id).and_then(|n| f.ec2.get_mut(&n)),
     };
@@ -1649,4 +1714,241 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
         }
     }
     drop_missing_from_races(f, at);
+}
+
+// ---------------------------------------------------------------------------
+// Phones mode
+// ---------------------------------------------------------------------------
+
+fn phone_claim(s: &Slot) -> Option<&crate::phone::PhoneClaim> {
+    s.phone.as_ref().and_then(|p| p.claim.as_ref())
+}
+
+/// The phones of a host's hello: one per phone GPU (not one of its wall GPUs, and an
+/// address once), the host's others removed.
+fn phone_hello(f: &mut Fleet, host: &str, gpus: &[Gpu], phones: &[Gpu], at: u64) {
+    let mut seen: std::collections::BTreeSet<&str> = gpus.iter().map(|g| g.sbdf.as_str()).collect();
+    let phones: Vec<&Gpu> = phones.iter().filter(|g| seen.insert(&g.sbdf)).collect();
+    f.phones.retain(|_, s| {
+        s.host.as_deref() != Some(host)
+            || phones
+                .iter()
+                .any(|g| Some(&g.sbdf) == s.gpu.as_ref().map(|x| &x.sbdf))
+    });
+    for g in phones {
+        let exists = f
+            .phones
+            .values()
+            .any(|s| s.host.as_deref() == Some(host) && s.gpu.as_ref() == Some(g));
+        if exists {
+            continue;
+        }
+        let n = (1..).find(|n| !f.phones.contains_key(n)).unwrap();
+        let mut s = new_slot(
+            phone_name(n),
+            Half::Fcvm,
+            Some(host.to_string()),
+            Some(g.clone()),
+            at,
+        );
+        s.phone = Some(Default::default());
+        f.phones.insert(n, s);
+    }
+}
+
+fn observe_phone(f: &mut Fleet, n: u32, host: &str, r: &SlotReport, at: u64) {
+    let Some(slot) = f.phones.get_mut(&n) else {
+        return;
+    };
+    if slot.host.as_deref() != Some(host) {
+        return;
+    }
+    if r.phase == "running" && slot.observed.phase != "running" {
+        count_restore(&mut f.counters, at);
+    }
+    if r.generation > slot.generation {
+        slot.generation = r.generation;
+    }
+    note_report(slot, r, at);
+    note_running(slot, r, at);
+}
+
+fn own_phone(f: &Fleet, viewer: &str) -> Option<u32> {
+    f.phones
+        .iter()
+        .find(|(_, s)| phone_claim(s).is_some_and(|c| c.viewer == viewer))
+        .map(|(n, _)| *n)
+}
+
+fn check_phone_claim(f: &Fleet, n: u32, claim: Option<&str>) -> Result<(), String> {
+    let session = &phone_claim(&f.phones[&n]).unwrap().session;
+    match claim {
+        Some(k) if k != session => Err(format!("{k:?} is not this viewer's phone")),
+        _ => Ok(()),
+    }
+}
+
+/// Phones a viewer may borrow: placed on a host that is not draining, on a GPU not in
+/// quarantine, running its current launch, not lent.
+fn phone_free(f: &Fleet, s: &Slot) -> Result<(), String> {
+    if phone_claim(s).is_some() {
+        return Err(format!("{} is lent to another viewer", s.id));
+    }
+    if host_draining(&f.hosts, s) || is_quarantined(f, s) {
+        return Err(format!("{} is leaving the fleet", s.id));
+    }
+    if s.observed.phase != "running" || s.observed.generation < s.generation {
+        return Err(format!("{} is not running", s.id));
+    }
+    Ok(())
+}
+
+fn claim_phone(state: &mut State, c: &Ctx, want: Option<&str>) -> Result<String, String> {
+    let at = c.at;
+    let cfg = &state.config;
+    let f = &mut state.fleet;
+    if f.phones
+        .values()
+        .any(|s| phone_claim(s).is_some_and(|k| k.client == c.client))
+    {
+        return Err("one phone per client at a time".into());
+    }
+    if let Some(end) = f.last_phone_claim_end.get(c.client) {
+        let free_at = end + cfg.phone_claim_cooldown_secs * 1000;
+        if at < free_at {
+            return Err(format!(
+                "your last phone was returned {} s ago; borrow again in {} s",
+                (at - end) / 1000,
+                (free_at - at).div_ceil(1000)
+            ));
+        }
+    }
+    let lent: Vec<u64> = f
+        .phones
+        .values()
+        .filter_map(phone_claim)
+        .map(|k| k.expires_at)
+        .collect();
+    let cap = cfg.phone_lend_cap(f.phones.len());
+    if lent.len() >= cap {
+        let back = lent
+            .iter()
+            .min()
+            .map_or(0, |t| t.saturating_sub(at).div_ceil(1000));
+        return Err(format!(
+            "{} of {cap} phones are already lent; the next comes back in {back} s",
+            lent.len()
+        ));
+    }
+    let n = match want {
+        Some(id) => {
+            let n = phone_number(id)
+                .filter(|n| f.phones.contains_key(n))
+                .ok_or_else(|| format!("no phone {id:?}"))?;
+            phone_free(f, &f.phones[&n])?;
+            n
+        }
+        None => *f
+            .phones
+            .iter()
+            .find(|(_, s)| phone_free(f, s).is_ok())
+            .map(|(n, _)| n)
+            .ok_or("no phone can be lent now: none is running and free")?,
+    };
+    f.phone_claim_count += 1;
+    let session = format!("phone-claim-{}", f.phone_claim_count);
+    let slot = f.phones.get_mut(&n).unwrap();
+    slot.phone.get_or_insert_with(Default::default).claim = Some(crate::phone::PhoneClaim {
+        session: session.clone(),
+        viewer: c.viewer.to_string(),
+        client: c.client.to_string(),
+        claimed_at: at,
+        expires_at: at + cfg.phone_claim_secs * 1000,
+        last_action_at: None,
+    });
+    Ok(format!("{session} on {}", slot.id))
+}
+
+/// Give a phone back: it is restored from its snapshot, so the next viewer finds it as
+/// every phone starts (not rotated, not dark, the app on its scene).
+fn release_phone(f: &mut Fleet, n: u32, at: u64) {
+    let Some(slot) = f.phones.get_mut(&n) else {
+        return;
+    };
+    let Some(claim) = slot.phone.as_mut().and_then(|p| p.claim.take()) else {
+        return;
+    };
+    bump(slot, &format!("return:{}", claim.session), at);
+    f.last_phone_claim_end.insert(claim.client, at);
+}
+
+fn phone_action(
+    state: &mut State,
+    c: &Ctx,
+    claim: Option<&str>,
+    action: crate::phone::PhoneAction,
+) -> Result<String, String> {
+    let at = c.at;
+    let f = &mut state.fleet;
+    let n = own_phone(f, c.viewer).ok_or("phone actions need a phone of your own (claim_phone)")?;
+    check_phone_claim(f, n, claim)?;
+    let slot = f.phones.get_mut(&n).unwrap();
+    let p = slot.phone.as_mut().unwrap();
+    let k = p.claim.as_mut().unwrap();
+    if let Some(last) = k.last_action_at {
+        let next = last + crate::phone::ACTION_INTERVAL_MS;
+        if at < next {
+            return Err(format!("one action a second; wait {} ms", next - at));
+        }
+    }
+    k.last_action_at = Some(at);
+    let session = k.session.clone();
+    if action == crate::phone::PhoneAction::RebootPhone {
+        // A reboot restores the phone's VM, timed like any relaunch.
+        bump(slot, &format!("reboot:{session}"), at);
+        return Ok(format!("reboot {}", slot.id));
+    }
+    f.phone_action_seq += 1;
+    p.actions.push(crate::phone::PhoneActionReq {
+        seq: f.phone_action_seq,
+        action,
+        at,
+        generation: slot.generation,
+    });
+    Ok(format!("{} on {}", action.as_str(), slot.id))
+}
+
+/// The shared zoom: a chrome key every phone draws from a scene time a little ahead, so all
+/// change together. A zoom already in effect commits and changes nothing.
+fn phones_zoom(state: &mut State, c: &Ctx, out: bool) -> Result<String, String> {
+    let at = c.at;
+    let f = &mut state.fleet;
+    if f.phones.is_empty() {
+        return Err("this fleet runs no phones".into());
+    }
+    if f.phones_zoom.out == out {
+        return Ok(if out {
+            "already zoomed out"
+        } else {
+            "already zoomed in"
+        }
+        .into());
+    }
+    if let Some(last) = f.last_phones_zoom_at.get(c.client) {
+        let next = last + crate::phone::ZOOM_INTERVAL_MS;
+        if at < next {
+            return Err(format!("one zoom every 2 s; wait {} ms", next - at));
+        }
+    }
+    f.last_phones_zoom_at.insert(c.client.to_string(), at);
+    let t = f.scene.t_at(at) + crate::phone::ZOOM_LEAD_SECS;
+    let z = &mut f.phones_zoom;
+    z.out = out;
+    z.at = Some(at);
+    z.keys.push(crate::phone::ChromeKey { t, on: out });
+    let n = z.keys.len();
+    if n > crate::phone::ZOOM_KEYS {
+        z.keys.drain(..n - crate::phone::ZOOM_KEYS);
+    }
+    Ok(if out { "zoom out" } else { "zoom in" }.into())
 }
