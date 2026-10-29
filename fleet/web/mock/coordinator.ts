@@ -165,8 +165,21 @@ interface ClaimRuntime {
   expires_at: number | null;
   phases: Record<string, number>;
   camera: CameraKey[];
+  /** The camera flies the mock's autopilot loop (see `flyMock`); false once the viewer has it. */
+  autopilot: boolean;
+  /** Scene t at which the loop's phase is 0 while it flies. */
+  flightT0: number | null;
+  /** Extends the flight's keys while it flies. */
+  flightTimer: NodeJS.Timeout | null;
   ended: string | null;
   timer: NodeJS.Timeout | null;
+}
+
+/** The mock's autopilot: a 16 s loop of pans and a zoom over the test pattern. */
+const MOCK_LOOP_S = 16;
+function mockFlight(phase: number): { x: number; y: number; zoom: number } {
+  const a = (2 * Math.PI * phase) / MOCK_LOOP_S;
+  return { x: 0.35 * Math.sin(a), y: 0.12 * Math.sin(2 * a), zoom: 1.35 + 0.35 * Math.sin(a + 1) };
 }
 
 interface Race {
@@ -662,9 +675,25 @@ export class MockCoordinator {
         this.endClaim(cl, "You gave the GPU back.");
         return this.committed(c, `release ${cl.tile.slot}`);
       }
+      case "claim_autopilot": {
+        const cl = client.claim;
+        if (!cl || cl.phase === "ended") return this.refuse(c, "claim_autopilot needs a GPU of your own (claim_gpu)");
+        if (typeof args["on"] !== "boolean") return this.refuse(c, "args.on must be true or false");
+        if (args["on"] === cl.autopilot) return this.committed(c, `autopilot already ${cl.autopilot ? "on" : "off"}`);
+        if (args["on"]) {
+          cl.autopilot = true;
+          if (cl.phase === "running") this.flyMock(cl, this.sceneNow() + 1);
+        } else {
+          this.stopMockFlight(cl, this.sceneNow());
+        }
+        this.pushClaim(cl);
+        return this.committed(c, `autopilot ${cl.autopilot ? "on" : "off"}`);
+      }
       case "claim_camera": {
         const cl = client.claim;
         if (!cl || cl.phase !== "running") return this.refuse(c, "you have no GPU streaming");
+        // A drag takes the camera from the autopilot where it is.
+        if (cl.autopilot) this.stopMockFlight(cl, this.sceneNow());
         const drag = args["drag"] as Record<string, unknown> | undefined;
         const num = (k: string) => (typeof drag?.[k] === "number" ? (drag[k] as number) : 0);
         const yaw = num("yaw_deg");
@@ -1162,9 +1191,47 @@ export class MockCoordinator {
         gpu: "Tesla T4",
         phases: cl.phases,
         camera: cl.camera,
+        autopilot: cl.autopilot,
         ended: cl.ended,
       },
     };
+  }
+
+  /**
+   * Fly the mock autopilot from scene t `start` (where the loop's phase is chosen so the
+   * camera continues from where it is held), keys every half second, 8 s ahead.
+   */
+  private flyMock(cl: ClaimRuntime, start: number): void {
+    const t = this.sceneNow();
+    const here = cameraAt(cl.camera, t);
+    if (cl.flightT0 === null) {
+      cl.flightT0 = start;
+      const kept = cl.camera.filter((k) => k.t < t).slice(-2);
+      const p = mockFlight(0);
+      cl.camera = [...kept, { t, x: here["x"] ?? 0, y: here["y"] ?? 0, zoom: here["zoom"] ?? 1 }, { t: start, ...p }];
+    }
+    const t0 = cl.flightT0;
+    const last = cl.camera[cl.camera.length - 1]!.t;
+    for (let k = Math.floor((last - t0) / 0.5) + 1; t0 + k * 0.5 <= t + 8; k++) cl.camera.push({ t: t0 + k * 0.5, ...mockFlight(k * 0.5) });
+    cl.camera = cl.camera.filter((k) => k.t >= t - 3);
+    if (cl.flightTimer) clearTimeout(cl.flightTimer);
+    cl.flightTimer = this.later(2000, () => {
+      cl.flightTimer = null;
+      if (cl.autopilot && cl.phase === "running") {
+        this.flyMock(cl, start);
+        this.pushClaim(cl);
+      }
+    });
+  }
+
+  /** Stop the mock autopilot: the camera holds where it is at scene t `t`. */
+  private stopMockFlight(cl: ClaimRuntime, t: number): void {
+    cl.autopilot = false;
+    cl.flightT0 = null;
+    if (cl.flightTimer) clearTimeout(cl.flightTimer);
+    cl.flightTimer = null;
+    const here = cameraAt(cl.camera, t);
+    cl.camera = [...cl.camera.filter((k) => k.t < t).slice(-2), { t, x: here["x"] ?? 0, y: here["y"] ?? 0, zoom: here["zoom"] ?? 1 }];
   }
 
   private pushClaim(cl: ClaimRuntime): void {
@@ -1183,7 +1250,10 @@ export class MockCoordinator {
       first_frame_at: null,
       expires_at: null,
       phases: {},
-      camera: [{ t, x: 0, y: 0, zoom: 1 }],
+      camera: [{ t, ...mockFlight(0) }],
+      autopilot: true,
+      flightT0: null,
+      flightTimer: null,
       ended: null,
       timer: null,
     };
@@ -1217,6 +1287,7 @@ export class MockCoordinator {
       if (tile.borrowed?.claim === cl) tile.borrowed.until = cl.expires_at;
       this.opts.renderers.setAvailable(cl.id, true);
       this.markDirty();
+      if (cl.autopilot) this.flyMock(cl, this.sceneNow() + 0.5);
       this.pushClaim(cl);
       cl.timer = this.later(this.opts.claimSecs * 1000, () => this.endClaim(cl, "Your minute is up. The GPU went back to the pool."));
     });
@@ -1231,6 +1302,8 @@ export class MockCoordinator {
     }
     cl.phase = "ended";
     cl.ended = why;
+    if (cl.flightTimer) clearTimeout(cl.flightTimer);
+    cl.flightTimer = null;
     this.opts.renderers.removeTile(cl.id);
     // The GPU comes back to the wall: its tile restores like any restart.
     const tile = cl.tile;

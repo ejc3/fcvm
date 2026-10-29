@@ -30,7 +30,9 @@ tw=$(now); id=""
 for az in ${AZS:-a b c d f}; do
   subnet=$(A ec2 describe-subnets --filters Name=tag:Name,Values="fcvm-fleet-${REGION}${az}" --query 'Subnets[0].SubnetId' --output text)
   t0=$(now)
-  id=$(A ec2 run-instances --image-id "$AMI" --instance-type $type "${market[@]}" \
+  # VOLUME=Throughput=1000,Iops=4000 (gp3 settings of the root volume) measures a tile with another EBS volume.
+  vol=(); [ -n "${VOLUME:-}" ] && vol=(--block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeType=gp3,VolumeSize=32,DeleteOnTermination=true,${VOLUME}}")
+  id=$(A ec2 run-instances --image-id "$AMI" --instance-type $type "${market[@]}" "${vol[@]}" \
     --network-interfaces "DeviceIndex=0,SubnetId=$subnet,Groups=$sg,AssociatePublicIpAddress=true,$net,DeleteOnTermination=true" \
     --iam-instance-profile Name=$profile \
     --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled \
@@ -83,6 +85,15 @@ ssm "k=\$(( \$(date +%s%3N) - \$(awk '{printf \"%d\", \$1*1000}' /proc/uptime) )
     *) [ -n "$b" ] && [ "$b" -gt 0 ] 2>/dev/null && echo "$a started $(( ${d:-0} - t0 )) ms, active ($c) $(( b - t0 )) ms after the request" || echo "$a $b $c" ;;
   esac
 done
+if [ "$KIND" = tile ]; then
+  # Where the boot went, read after the first frame so it adds nothing to the time above:
+  # systemd's own accounting (kernel, userspace, the chain to the first-frame unit, the
+  # slowest units), cloud-init's stages, the renderer unit's journal in monotonic time (the
+  # image inspect and the container start), and the root volume's read counters (reads, MiB,
+  # milliseconds the device was busy: every block of a volume made from an AMI is fetched
+  # from S3 on its first read).
+  ssm "systemd-analyze 2>&1 | head -1 | sed 's/^/analyze: /'; systemd-analyze critical-chain fcvm-fleet-first-frame.service --no-pager 2>&1 | sed 's/^/chain: /'; systemd-analyze blame --no-pager 2>&1 | head -12 | sed 's/^/blame: /'; cloud-init analyze show 2>&1 | grep -E 'Starting stage|Finished stage|running modules' | sed 's/^ *//; s/^/cloud-init: /'; journalctl -u fcvm-fleet-renderer -o short-monotonic --no-pager 2>&1 | head -12 | sed 's/^/renderer: /'; d=\$(lsblk -no PKNAME \$(findmnt -no SOURCE /)); awk '{printf \"disk: reads=%d mib=%d busy_ms=%d\\n\", \$1, \$3/2048, \$4}' /sys/block/\$d/stat" | sed 's/^/on-instance: /'
+fi
 if [ "$KIND" = host ]; then
   # Ready for the agent: the GPUs on vfio-pci and the store restored from the AMI's archive.
   while :; do

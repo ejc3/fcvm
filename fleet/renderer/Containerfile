@@ -11,6 +11,9 @@ WORKDIR /src
 COPY Makefile ./
 COPY src ./src
 COPY tests ./tests
+# test-host checks the own-GPU autopilot's lap (fleet/core/tests), at the path it reads
+# relative to tests/test_host.cpp
+COPY --from=core-tests autopilot_lap.json /core/tests/autopilot_lap.json
 RUN make -j"$(nproc)" all && ./build/test-host
 
 FROM docker.io/library/ubuntu:24.04

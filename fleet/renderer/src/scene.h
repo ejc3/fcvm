@@ -25,6 +25,15 @@ struct SceneLight {
   double color[3];
   double t;
 };
+// The weather at scene time t (PROTOCOL.md, "Weather"): between two keys it
+// eases from one to the next, before the first and after the last it holds.
+struct WeatherKey {
+  double t = 0;
+  double cover = 0.5;          // cloud cover: 0 clear, 0.5 the default sky, 1 nearly overcast
+  double towers = 0;           // 0 fair-weather cumulus (tops 5.6 km), 1 towering cumulus (tops 9.6 km)
+  double rays = 0;             // crepuscular rays: haze lit by the sun through the gaps between clouds
+  double snow_line_km = 1.6;   // altitude where snow starts on flatter ground
+};
 struct Rect {
   double x = 0, y = 0, w = 1, h = 1;
 };
@@ -37,6 +46,7 @@ struct Scene {
   double time_of_day = 0.35;
   std::vector<SceneWord> words;    // sorted by t
   std::vector<SceneLight> lights;  // sorted by t
+  std::vector<WeatherKey> weather; // sorted by t; empty: WeatherKey's defaults
   double loop_s = 0;  // > 0 only for the built-in demo scene: t wraps
   double budget = 0;  // pixel-samples per frame for every tile; 0: the renderer's BUDGET
   // Layout generations: draw previous_rect for frames before rect_from_frame
@@ -74,6 +84,8 @@ CamPose camera_at(const std::vector<Keyframe>& kf, double t);
 // water as frame t draws them: frame t's reference, accumulated to many
 // samples (fleet-renderer quality, the GPU test's quality check).
 Scene held_reference(const Scene& s, double t);
+// The weather at scene time t (eased between keys).
+WeatherKey weather_at(const std::vector<WeatherKey>& keys, double t);
 // Scene time that drives the camera and animation (wraps for the demo loop).
 double scene_time(const Scene& s, double t);
 // The tile height that gives a whole image full_h pixels tall for rect r (the

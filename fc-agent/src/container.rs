@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::OnceLock;
 use tokio::{
@@ -17,10 +18,20 @@ pub const IMAGE_STORE_PATH: &str = "/mnt/image-store";
 /// [`IMAGE_STORE_PATH`]. It is in /run, a tmpfs, so no map of the guest's /mnt can make
 /// its mount point impossible to create.
 pub const IMAGE_STORE_RAW_PATH: &str = "/run/fcvm-image-store-raw";
+/// The store's layer list as a run with a user shows it, each layer carrying the id
+/// mapping the store is shown through. It is bound over the store's own list.
+pub const IMAGE_STORE_LAYERS_COPY: &str = "/run/fcvm-image-store-layers.json";
+/// Where podman reads a store's layer list, relative to the store.
+const STORE_LAYER_LIST: &str = "overlay-layers/layers.json";
 
-/// The container user's ids, which the overlay store is shown with. Rootless podman
-/// keeps its storage with container uid and gid 0 as the user's own ids, and container
-/// ids 1 to `sub_count` as the user's subordinate ids from `sub_start`.
+/// The layer list podman reads from the image store.
+pub fn image_store_layers_path() -> String {
+    format!("{IMAGE_STORE_PATH}/{STORE_LAYER_LIST}")
+}
+
+/// The container user's ids, which the overlay store is shown with. Rootless podman's
+/// user namespace has the user's own id as its id 0 and the user's subordinate ids from
+/// `sub_start` as its ids 1 to `sub_count`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreUser {
     pub uid: u32,
@@ -58,30 +69,150 @@ impl StoreOwner {
     }
 }
 
-impl StoreUser {
-    /// The `X-mount.idmap` option (util-linux 2.39) that shows a store `owner` wrote as
-    /// this user's, or None when the store already holds this user's ids.
-    fn idmap_option(&self, owner: StoreOwner) -> Option<String> {
-        if owner.uid == self.uid
-            && owner.gid == self.gid
-            && owner.sub_start == self.sub_start
-            && owner.sub_gid_start == self.sub_gid_start
-        {
-            return None;
+/// One range of an id mapping: `size` ids from `container` show as ids from `host`.
+/// The field names are the ones containers/storage writes into a layer's `uidmap` and
+/// `gidmap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+struct IdRange {
+    #[serde(rename = "container_id")]
+    container: u64,
+    #[serde(rename = "host_id")]
+    host: u64,
+    size: u64,
+}
+
+/// The mapping rootless podman's `--userns=keep-id` gives a container, from container ids
+/// to ids in the user's namespace, in podman's order (`GetKeepIDMapping` in podman's
+/// pkg/util): container ids below the user's id are namespace ids from 1, the user's id
+/// is the user (namespace id 0), and the ones above it are themselves. `count` is the
+/// user's subordinate range, which podman reads from /etc/subuid or /etc/subgid.
+fn keep_id_map(id: u64, count: u64) -> Vec<IdRange> {
+    let mut map = Vec::new();
+    if count > 0 {
+        map.push(IdRange {
+            container: 0,
+            host: 1,
+            size: id.min(count),
+        });
+    }
+    map.push(IdRange {
+        container: id,
+        host: 0,
+        size: 1,
+    });
+    if count > id {
+        map.push(IdRange {
+            container: id + 1,
+            host: id + 1,
+            size: count - id,
+        });
+    }
+    map
+}
+
+/// The `X-mount.idmap` ranges (on-disk id, guest id, count) that show a store's files as
+/// a keep-id container of `user` sees them. `keep_id` takes container ids to namespace
+/// ids. Namespace id 0 is the guest id `user`, and namespace id k >= 1 is `sub_start` +
+/// k - 1. On disk, container id 0 is `owner` and container id c >= 1 is `owner_sub` +
+/// c - 1. Each range is split where it meets container id 0 or namespace id 0, the two
+/// ids the formulas treat apart.
+fn store_idmap(
+    keep_id: &[IdRange],
+    user: u64,
+    sub_start: u64,
+    owner: u64,
+    owner_sub: u64,
+) -> Vec<(u64, u64, u64)> {
+    let on_disk = |c: u64| if c == 0 { owner } else { owner_sub + c - 1 };
+    let in_guest = |k: u64| if k == 0 { user } else { sub_start + k - 1 };
+    let mut ranges = Vec::new();
+    for range in keep_id {
+        let (mut c, mut k, mut left) = (range.container, range.host, range.size);
+        while left > 0 {
+            let n = if c == 0 || k == 0 { 1 } else { left };
+            ranges.push((on_disk(c), in_guest(k), n));
+            c += n;
+            k += n;
+            left -= n;
         }
-        Some(format!(
-            "X-mount.idmap=u:{ou}:{uid}:1 u:{os}:{sub}:{n} g:{og}:{gid}:1 g:{ogs}:{subg}:{ng}",
-            ou = owner.uid,
-            og = owner.gid,
-            os = owner.sub_start,
-            ogs = owner.sub_gid_start,
-            uid = self.uid,
-            gid = self.gid,
-            sub = self.sub_start,
-            n = self.sub_count,
-            subg = self.sub_gid_start,
-            ng = self.sub_gid_count
-        ))
+    }
+    ranges
+}
+
+impl StoreUser {
+    /// The uid and gid mappings a keep-id container of this user gets, as container
+    /// ids to ids in the user's namespace.
+    fn keep_id_maps(&self) -> (Vec<IdRange>, Vec<IdRange>) {
+        (
+            keep_id_map(self.uid.into(), self.sub_count),
+            keep_id_map(self.gid.into(), self.sub_gid_count),
+        )
+    }
+
+    /// The `X-mount.idmap` option (util-linux 2.39) that shows a store `owner` wrote
+    /// with the ownership a keep-id container of this user gives its files. That is the
+    /// ownership podman would otherwise give the container's layer by copying every file
+    /// of the image into it to change its owner.
+    fn idmap_option(&self, owner: StoreOwner) -> String {
+        let (uids, gids) = self.keep_id_maps();
+        let uid_ranges = store_idmap(
+            &uids,
+            self.uid.into(),
+            self.sub_start,
+            owner.uid.into(),
+            owner.sub_start,
+        );
+        let gid_ranges = store_idmap(
+            &gids,
+            self.gid.into(),
+            self.sub_gid_start,
+            owner.gid.into(),
+            owner.sub_gid_start,
+        );
+        let entries = uid_ranges
+            .iter()
+            .map(|(disk, guest, n)| format!("u:{disk}:{guest}:{n}"))
+            .chain(
+                gid_ranges
+                    .iter()
+                    .map(|(disk, guest, n)| format!("g:{disk}:{guest}:{n}")),
+            );
+        format!("X-mount.idmap={}", entries.collect::<Vec<_>>().join(" "))
+    }
+
+    /// The store's layer list `layers_json` with this user's keep-id mappings as every
+    /// layer's `uidmap` and `gidmap`. containers/storage compares a container's mapping
+    /// with its image's top layer's, and copies the whole image into the container's
+    /// layer to change its owners when they differ; with the store shown through
+    /// [`Self::idmap_option`], its files already have the ownership that mapping wants.
+    /// A layer that already carries a mapping is refused: the id-mapped mount assumes
+    /// the store holds plain container ids.
+    fn layers_with_keep_id(&self, layers_json: &str) -> Result<String> {
+        let (uids, gids) = self.keep_id_maps();
+        let mut layers: Vec<serde_json::Map<String, serde_json::Value>> =
+            serde_json::from_str(layers_json).context("parsing the store's layers.json")?;
+        for layer in &mut layers {
+            for key in ["uidmap", "gidmap"] {
+                if layer
+                    .get(key)
+                    .and_then(|map| map.as_array())
+                    .is_some_and(|map| !map.is_empty())
+                {
+                    anyhow::bail!(
+                        "layer {} in the image store already has a {key}; a run with a \
+                         user needs a store whose layers carry no mapping, so rebuild the \
+                         image's overlay storage image",
+                        layer
+                            .get("id")
+                            .and_then(|id| id.as_str())
+                            .unwrap_or("(no id)")
+                    );
+                }
+            }
+            layer.insert("uidmap".to_string(), serde_json::to_value(&uids)?);
+            layer.insert("gidmap".to_string(), serde_json::to_value(&gids)?);
+        }
+        Ok(serde_json::to_string(&layers)?)
     }
 }
 
@@ -92,10 +223,11 @@ impl StoreUser {
 /// finds the image there without needing `podman load`. The mounts go into `record`.
 ///
 /// With a user, the device is mounted at [`IMAGE_STORE_RAW_PATH`] and bound at
-/// [`IMAGE_STORE_PATH`] through an id-mapped mount that shows the store's files as
-/// `store_user`'s, the ownership rootless podman's own `podman load` would have given
-/// them. That covers a store root podman built and one rootless podman built as another
-/// uid; a store that already holds the user's ids is bound as it is.
+/// [`IMAGE_STORE_PATH`] through an id-mapped mount that shows the store's files with the
+/// ownership the container's `--userns=keep-id` gives them, and a copy of the store's
+/// layer list that records that mapping on every layer is bound over the store's own.
+/// Rootless podman then runs the container on the store's layers as they are. That
+/// covers a store root podman built and one rootless podman built as any uid.
 pub fn mount_overlay_image(
     device: &str,
     image_name: &str,
@@ -129,11 +261,7 @@ pub fn mount_overlay_image(
         let meta = std::fs::metadata(format!("{IMAGE_STORE_RAW_PATH}/overlay-images"))
             .context("reading who owns the overlay storage image")?;
         let owner = StoreOwner::of(&meta, &user);
-        let idmap = user.idmap_option(owner);
-        let options = match &idmap {
-            Some(idmap) => format!("ro,{idmap}"),
-            None => "ro".to_string(),
-        };
+        let options = format!("ro,{}", user.idmap_option(owner));
         let output = std::process::Command::new("mount")
             .args(["--bind", "-o", &options, IMAGE_STORE_RAW_PATH, mount_path])
             .output()
@@ -142,15 +270,22 @@ pub fn mount_overlay_image(
             format!("binding the image store at {mount_path} with options {options}")
         })?;
         record.record(format!("image store bind of {device}"), mount_path)?;
+
+        let layers = std::fs::read_to_string(format!("{IMAGE_STORE_RAW_PATH}/{STORE_LAYER_LIST}"))
+            .context("reading the image store's layers.json")?;
+        let layers_path = image_store_layers_path();
+        write_readable(IMAGE_STORE_LAYERS_COPY, &user.layers_with_keep_id(&layers)?)?;
+        let output = std::process::Command::new("mount")
+            .args(["--bind", "-o", "ro", IMAGE_STORE_LAYERS_COPY, &layers_path])
+            .output()
+            .context("running mount for the image store's layer list")?;
+        mount_succeeded(&output)
+            .with_context(|| format!("binding {IMAGE_STORE_LAYERS_COPY} over {layers_path}"))?;
+        record.record(format!("image store layer list of {device}"), &layers_path)?;
         eprintln!(
-            "[fc-agent] image store owned by uid {} on disk, {} for uid {}",
-            owner.uid,
-            if idmap.is_some() {
-                "shown through an id-mapped mount"
-            } else {
-                "bound as it is"
-            },
-            user.uid
+            "[fc-agent] image store owned by uid {} on disk, shown through an id-mapped \
+             mount as a keep-id container of uid {} sees it",
+            owner.uid, user.uid
         );
     }
 
@@ -227,6 +362,20 @@ pub fn mount_overlay_image(
 
     // Fallback: return expected name (downstream will fail with clear error if wrong)
     Ok(image_name.to_string())
+}
+
+/// Write `contents` to `path` with mode 0644 whatever the umask. The layer list copy
+/// belongs to root, which the user's namespace does not map, so rootless podman reads it
+/// through its "other" permission bits.
+fn write_readable(path: &str, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let mut file = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
+    // The mode given at creation is masked by the umask, so it is set after.
+    file.set_permissions(std::fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("setting the mode of {path}"))?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("writing {path}"))
 }
 
 /// Whether a mount(8) run succeeded; a failure carries its stderr.
@@ -331,9 +480,45 @@ fn write_containers_conf(conf_path: &str) {
 /// Empty when running as root (no user mapping).
 static PODMAN_CMD_PREFIX: OnceLock<Vec<String>> = OnceLock::new();
 
-/// Store the command prefix for use by exec and other podman commands.
+/// Where [`set_podman_cmd_prefix`] leaves the prefix for one-shot `fc-agent` processes
+/// (`--gpu-park`, `--gpu-unpark`), which run apart from the agent and need the same
+/// container user context. On /run, which is guest memory, so a restored clone keeps it.
+pub const PODMAN_CMD_PREFIX_RECORD: &str = "/run/fcvm-podman-cmd-prefix.json";
+
+/// Store the command prefix for use by exec and other podman commands, and record it
+/// at [`PODMAN_CMD_PREFIX_RECORD`] for the one-shot processes.
 pub fn set_podman_cmd_prefix(prefix: Vec<String>) {
+    if let Err(e) = store_podman_cmd_prefix(Path::new(PODMAN_CMD_PREFIX_RECORD), &prefix) {
+        eprintln!("[fc-agent] WARNING: recording the podman command prefix failed: {e:#}");
+    }
     let _ = PODMAN_CMD_PREFIX.set(prefix);
+}
+
+fn store_podman_cmd_prefix(path: &Path, prefix: &[String]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec(prefix)?)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))
+}
+
+fn load_podman_cmd_prefix(path: &Path) -> Result<Vec<String>> {
+    let bytes = std::fs::read(path).with_context(|| {
+        format!(
+            "reading {} (the agent writes it once the container user is set up)",
+            path.display()
+        )
+    })?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// In a one-shot process: take the agent's command prefix from
+/// [`PODMAN_CMD_PREFIX_RECORD`], so podman commands run as the container's user. A
+/// missing record is an error, since assuming root would look in another user's
+/// container store.
+pub fn restore_podman_cmd_prefix() -> Result<()> {
+    let prefix = load_podman_cmd_prefix(Path::new(PODMAN_CMD_PREFIX_RECORD))?;
+    let _ = PODMAN_CMD_PREFIX.set(prefix);
+    Ok(())
 }
 
 /// Get the command prefix (empty vec if running as root).
@@ -379,6 +564,39 @@ fn get_filesystem_size_bytes(path: &str) -> Option<u64> {
         .filter(|&b: &u64| b > 0)
 }
 
+/// Grow a btrfs root filesystem to fill its disk, which the host extends for
+/// `--rootfs-size`, and return whether the root is btrfs. An ext4 root is grown on the
+/// host. Every image mode needs it: the container's writable layer is on the root.
+/// A failed resize is a warning; the VM still runs on the smaller filesystem.
+pub fn grow_btrfs_root() -> bool {
+    let root_is_btrfs = std::process::Command::new("findmnt")
+        .args(["-n", "-o", "FSTYPE", "/"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "btrfs")
+        .unwrap_or(false);
+    if !root_is_btrfs {
+        return false;
+    }
+    match std::process::Command::new("btrfs")
+        .args(["filesystem", "resize", "max", "/"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            eprintln!("[fc-agent] root filesystem is btrfs, resized to fill disk");
+        }
+        Ok(output) => {
+            eprintln!(
+                "[fc-agent] WARNING: btrfs resize failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: btrfs resize command failed: {}", e);
+        }
+    }
+    true
+}
+
 /// Set up btrfs storage if the kernel supports it.
 /// Creates a sparse loopback btrfs filesystem sized to the root disk capacity
 /// and configures podman to use it.
@@ -403,32 +621,8 @@ pub fn setup_btrfs_storage_if_available(
         return Ok(());
     }
 
-    // If root filesystem is natively btrfs, resize to fill disk and skip loopback.
-    // The host may have expanded the sparse file for --rootfs-size.
-    let root_is_btrfs = std::process::Command::new("findmnt")
-        .args(["-n", "-o", "FSTYPE", "/"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "btrfs")
-        .unwrap_or(false);
-
-    if root_is_btrfs {
-        match std::process::Command::new("btrfs")
-            .args(["filesystem", "resize", "max", "/"])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                eprintln!("[fc-agent] root filesystem is btrfs, resized to fill disk");
-            }
-            Ok(output) => {
-                eprintln!(
-                    "[fc-agent] WARNING: btrfs resize failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-            }
-            Err(e) => {
-                eprintln!("[fc-agent] WARNING: btrfs resize command failed: {}", e);
-            }
-        }
+    // A native btrfs root is grown to fill its disk and holds the storage itself.
+    if grow_btrfs_root() {
         let storage_dir = "/var/lib/containers/storage";
         let _ = std::fs::create_dir_all(storage_dir);
         write_btrfs_storage_conf(
@@ -2106,14 +2300,61 @@ pub async fn run_async(
 
 #[cfg(test)]
 mod tests {
+    /// A one-shot process recovers the agent's prefix, and a missing record is an error
+    /// rather than an empty (root) prefix.
+    #[test]
+    fn podman_cmd_prefix_record_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefix.json");
+        assert!(load_podman_cmd_prefix(&path).is_err());
+        let prefix = run_as_user_prefix("example-user", "/run/user/1000");
+        store_podman_cmd_prefix(&path, &prefix).unwrap();
+        assert_eq!(load_podman_cmd_prefix(&path).unwrap(), prefix);
+        store_podman_cmd_prefix(&path, &[]).unwrap();
+        assert!(load_podman_cmd_prefix(&path).unwrap().is_empty());
+    }
+
     use super::*;
 
-    /// A store's owner shows as the user and its subordinate ids as the user's,
-    /// the mapping rootless podman stores with: root podman wrote container ids
-    /// (0, and 1 up), rootless podman on the host wrote its builder's uid and the
-    /// host's subuid range, and a store holding the user's ids needs no mapping.
+    /// podman's `--userns=keep-id` mapping, as `GetKeepIDMapping` in podman 4.9 builds
+    /// it: ids below the user's are namespace ids from 1, the user's id is namespace id
+    /// 0, and ids above it up to the subordinate count are themselves.
     #[test]
-    fn store_user_maps_the_store_owner_to_the_user_and_its_range_to_the_users() {
+    fn keep_id_map_is_podmans() {
+        let range = |container, host, size| IdRange {
+            container,
+            host,
+            size,
+        };
+        assert_eq!(
+            keep_id_map(1001, 65536),
+            [
+                range(0, 1, 1001),
+                range(1001, 0, 1),
+                range(1002, 1002, 64535)
+            ]
+        );
+        // Id 0 (a --user with group 0): podman 4.9.3 still emits its first range, with
+        // size 0, as `min(gid, maxGID)`, so the layer's map carries it too. (crun then
+        // refuses that map: "writing file /proc/<pid>/gid_map: Invalid argument".)
+        assert_eq!(
+            keep_id_map(0, 65536),
+            [range(0, 1, 0), range(0, 0, 1), range(1, 1, 65536)]
+        );
+        // An id beyond the subordinate range has nothing above it.
+        assert_eq!(
+            keep_id_map(70000, 65536),
+            [range(0, 1, 65536), range(70000, 0, 1)]
+        );
+    }
+
+    /// A store's files show with the ownership a keep-id container of the user gives
+    /// them: container root as the user's first subordinate id, the user's own id as the
+    /// user, and the ids around it shifted as keep-id shifts them. Root podman wrote
+    /// container ids (0, and 1 up); rootless podman on the host wrote its builder's uid
+    /// and the host's subordinate ranges, which are also the user's.
+    #[test]
+    fn store_user_shows_the_store_as_a_keep_id_container_sees_it() {
         let user = StoreUser {
             uid: 1001,
             gid: 100,
@@ -2129,11 +2370,10 @@ mod tests {
             sub_gid_start: 1,
         };
         assert_eq!(
-            user.idmap_option(root_built).as_deref(),
-            Some("X-mount.idmap=u:0:1001:1 u:1:100000:65536 g:0:100:1 g:1:200000:65536")
+            user.idmap_option(root_built),
+            "X-mount.idmap=u:0:100000:1 u:1:100001:1000 u:1001:1001:1 u:1002:101001:64535 \
+             g:0:200000:1 g:1:200001:99 g:100:100:1 g:101:200100:65436"
         );
-        // Rootless podman as another uid wrote the host's ranges, which are also the
-        // user's, so only the owner moves; the gid range stays the gid range.
         let built_by_another_uid = StoreOwner {
             uid: 2000,
             gid: 100,
@@ -2141,16 +2381,59 @@ mod tests {
             sub_gid_start: 200000,
         };
         assert_eq!(
-            user.idmap_option(built_by_another_uid).as_deref(),
-            Some("X-mount.idmap=u:2000:1001:1 u:100000:100000:65536 g:100:100:1 g:200000:200000:65536")
+            user.idmap_option(built_by_another_uid),
+            "X-mount.idmap=u:2000:100000:1 u:100000:100001:1000 u:101000:1001:1 \
+             u:101001:101001:64535 g:100:200000:1 g:200000:200001:99 g:200099:100:1 \
+             g:200100:200100:65436"
         );
-        let built_by_the_user = StoreOwner {
-            uid: 1001,
-            gid: 100,
+    }
+
+    /// Every layer of the store's list carries the keep-id mappings, in the field names
+    /// and order containers/storage reads and compares, and everything else in the list
+    /// is kept. A layer that already has a mapping is refused.
+    #[test]
+    fn layers_carry_the_keep_id_mappings() {
+        let user = StoreUser {
+            uid: 1000,
+            gid: 1000,
             sub_start: 100000,
-            sub_gid_start: 200000,
+            sub_count: 65536,
+            sub_gid_start: 100000,
+            sub_gid_count: 65536,
         };
-        assert_eq!(user.idmap_option(built_by_the_user), None);
+        let layers = r#"[{"id":"a","created":"x"},{"id":"b","parent":"a"}]"#;
+        let mapped: serde_json::Value =
+            serde_json::from_str(&user.layers_with_keep_id(layers).unwrap()).unwrap();
+        let keep_id = serde_json::json!([
+            {"container_id": 0, "host_id": 1, "size": 1000},
+            {"container_id": 1000, "host_id": 0, "size": 1},
+            {"container_id": 1001, "host_id": 1001, "size": 64536},
+        ]);
+        assert_eq!(
+            mapped,
+            serde_json::json!([
+                {"id": "a", "created": "x", "uidmap": keep_id, "gidmap": keep_id},
+                {"id": "b", "parent": "a", "uidmap": keep_id, "gidmap": keep_id},
+            ])
+        );
+        let mapped_already = r#"[{"id":"a","uidmap":[{"container_id":0,"host_id":1,"size":1}]}]"#;
+        let error = user.layers_with_keep_id(mapped_already).unwrap_err();
+        assert!(format!("{error:#}").contains("layer a"), "{error:#}");
+    }
+
+    /// The layer list copy is readable by every user even under a umask of 077: root
+    /// owns it, and the user's namespace does not map root.
+    #[test]
+    fn the_layer_list_copy_is_world_readable_whatever_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layers.json");
+        // SAFETY: umask only sets this process's file mode creation mask; nextest runs
+        // each test in a process of its own.
+        unsafe { libc::umask(0o077) };
+        write_readable(path.to_str().unwrap(), "[]").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "mode {mode:o}");
     }
 
     /// The guest's /etc/subgid takes the host's gid range when the plan carries one,

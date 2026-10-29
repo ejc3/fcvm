@@ -110,7 +110,7 @@ describe("intents and receipts", () => {
 
 describe("input to pixels", () => {
   const claim = (camera: Record<string, unknown>[]) =>
-    JSON.stringify({ type: "claim", claim: { id: "claim-1", tile: "fcvm:4", phase: "running", frame_url: "ws://example-host:2/frames/claim-1", clicked_at: EPOCH, first_frame_at: EPOCH + 2900, expires_at: EPOCH + 62_900, gpu: "Tesla T4", phases: {}, camera, ended: null } });
+    JSON.stringify({ type: "claim", claim: { id: "claim-1", tile: "fcvm:4", phase: "running", frame_url: "ws://example-host:2/frames/claim-1", clicked_at: EPOCH, first_frame_at: EPOCH + 2900, expires_at: EPOCH + 62_900, gpu: "Tesla T4", phases: {}, camera, autopilot: true, ended: null } });
 
   it("measures from the input on the viewer's own GPU to the first draw at the camera key's t", () => {
     let s = feed(initialState(), snapshotText(1, fleet()));
@@ -136,7 +136,7 @@ describe("asking for a GPU while the wall is paused", () => {
 });
 
 describe("a GPU request dismissed before its claim arrives", () => {
-  const claimMsg = (phase: string) => JSON.stringify({ type: "claim", claim: { id: "claim-1", tile: "fcvm:4", phase, frame_url: null, clicked_at: EPOCH, first_frame_at: null, expires_at: null, gpu: "Tesla T4", phases: {}, camera: [], ended: phase === "ended" ? "released" : null } });
+  const claimMsg = (phase: string) => JSON.stringify({ type: "claim", claim: { id: "claim-1", tile: "fcvm:4", phase, frame_url: null, clicked_at: EPOCH, first_frame_at: null, expires_at: null, gpu: "Tesla T4", phases: {}, camera: [], autopilot: true, ended: phase === "ended" ? "released" : null } });
 
   it("releases the claim that arrives afterwards, once, and keeps the panel closed", () => {
     let s = feed(initialState(), snapshotText(1, fleet()));
@@ -165,7 +165,7 @@ describe("a GPU request dismissed before its claim arrives", () => {
 });
 
 describe("a viewer's own GPU across a reconnect", () => {
-  const running = JSON.stringify({ type: "claim", claim: { id: "claim-1", tile: "fcvm:4", phase: "running", frame_url: "ws://example-host:2/frames/claim-1", clicked_at: EPOCH, first_frame_at: EPOCH + 2900, expires_at: EPOCH + 62_900, gpu: "Tesla T4", phases: {}, camera: [], ended: null } });
+  const running = JSON.stringify({ type: "claim", claim: { id: "claim-1", tile: "fcvm:4", phase: "running", frame_url: "ws://example-host:2/frames/claim-1", clicked_at: EPOCH, first_frame_at: EPOCH + 2900, expires_at: EPOCH + 62_900, gpu: "Tesla T4", phases: {}, camera: [], autopilot: true, ended: null } });
 
   it("ends the claim when a new connection says hello: the coordinator ended it when the old one closed (PROTOCOL.md)", () => {
     let s = feed(initialState(), snapshotText(1, fleet()));

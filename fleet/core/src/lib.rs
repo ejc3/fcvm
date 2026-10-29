@@ -7,6 +7,7 @@
 //! (`tests/vectors/*.json`) and compare the states.
 
 pub mod apply;
+pub mod autopilot;
 pub mod budget;
 pub mod director;
 pub mod event;
@@ -14,6 +15,7 @@ pub mod history;
 pub mod protocol;
 pub mod scene;
 pub mod state;
+pub mod terrain;
 pub mod tiling;
 pub mod view;
 

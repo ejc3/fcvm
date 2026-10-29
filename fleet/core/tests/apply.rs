@@ -606,9 +606,9 @@ fn a_resumed_coordinator_does_not_count_a_decided_vote_again() {
     // A state stored before the stop vote stayed open: after a decision it kept the decided
     // round's offer and votes until the camera arrived, and the new code no longer clears them
     // on arrival, so the camera would fly to the stop it was at.
-    let mut state = apply(State::new(Config::default(), 0), &Event::Tick { at: 5000 });
+    let mut state = apply(State::new(Config::default(), 0), &Event::Tick { at: 8000 });
     let d = &mut state.fleet.director;
-    let n = d.next.expect("decided at 5 s");
+    let n = d.next.expect("decided at 8 s");
     d.offer.insert(0, n);
     d.offer.truncate(3);
     d.votes.insert(
@@ -619,7 +619,7 @@ fn a_resumed_coordinator_does_not_count_a_decided_vote_again() {
             at: 0,
         },
     );
-    let mut state = state.resumed(Config::default(), 6000);
+    let mut state = state.resumed(Config::default(), 9000);
     let arrive = state.fleet.director.arrive_next_at().unwrap();
     state = apply(
         state,
@@ -640,4 +640,127 @@ fn a_resumed_coordinator_does_not_count_a_decided_vote_again() {
         Some(n),
         "the camera would fly to where it is"
     );
+}
+
+/// The wall's camera as every renderer draws it from the scenes the coordinator published,
+/// a tick a second for `secs` with camera seed `seed`: the union of the keyframes, in order,
+/// and each stop the camera arrived at (scene time, viewpoint).
+fn published_camera(seed: u64, secs: u64) -> (fleet_core::scene::Scene, Vec<(f64, usize)>) {
+    let mut state = State::new(config_with(serde_json::json!({ "camera_seed": seed })), 0);
+    let mut all: Vec<fleet_core::scene::Keyframe> = Vec::new();
+    let mut stops = vec![(0.0, state.fleet.director.current)];
+    for s in 1..=secs {
+        let step = state.fleet.director.step;
+        state = apply(state, &Event::Tick { at: s * 1000 });
+        let d = &state.fleet.director;
+        if d.step != step {
+            stops.push((d.arrive_t, d.current));
+        }
+        for k in &state.fleet.scene.camera {
+            if all.last().is_none_or(|l| k.t > l.t) {
+                all.push(k.clone());
+            }
+        }
+    }
+    let mut scene = state.fleet.scene.clone();
+    scene.camera = all;
+    (scene, stops)
+}
+
+fn dist(p: [f64; 3], q: [f64; 3]) -> f64 {
+    ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt()
+}
+
+#[test]
+fn the_wall_camera_never_stands_still() {
+    // Sampled every 0.1 s as the renderer interpolates the path: the camera may slow but
+    // must not stop (moving under 5 m/s and turning under 0.2 degrees a second) for half a
+    // second. The hold-based director stood still for 7 s at every viewpoint.
+    let (scene, _) = published_camera(1, 900);
+    let (mut still, mut longest, mut at) = (0.0f64, 0.0f64, 0.0);
+    let mut t = 2.0;
+    while t < 880.0 {
+        let (a, b) = (scene.camera_at(t), scene.camera_at(t + 0.1));
+        let speed = dist(a.pos, b.pos) / 0.1;
+        let (va, vb) = (
+            [
+                a.look[0] - a.pos[0],
+                a.look[1] - a.pos[1],
+                a.look[2] - a.pos[2],
+            ],
+            [
+                b.look[0] - b.pos[0],
+                b.look[1] - b.pos[1],
+                b.look[2] - b.pos[2],
+            ],
+        );
+        let cos = (va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2])
+            / (dist(va, [0.0; 3]) * dist(vb, [0.0; 3]));
+        let turn = cos.clamp(-1.0, 1.0).acos().to_degrees() / 0.1;
+        if speed < 0.005 && turn < 0.2 {
+            still += 0.1;
+            if still > longest {
+                longest = still;
+                at = t;
+            }
+        } else {
+            still = 0.0;
+        }
+        t += 0.1;
+    }
+    assert!(
+        longest < 0.5,
+        "the camera stood still for {longest:.1} s, until t={at:.1}"
+    );
+}
+
+#[test]
+fn the_wall_camera_velocity_is_continuous_at_every_keyframe() {
+    // Where a flight meets a stop (and everywhere else) the velocity just before a keyframe
+    // equals the velocity just after it, to 0.5% of the speed there.
+    let (scene, _) = published_camera(2, 900);
+    let h = 1e-5;
+    let vel = |t0: f64, t1: f64| {
+        let (a, b) = (scene.camera_at(t0).pos, scene.camera_at(t1).pos);
+        [
+            (b[0] - a[0]) / (t1 - t0),
+            (b[1] - a[1]) / (t1 - t0),
+            (b[2] - a[2]) / (t1 - t0),
+        ]
+    };
+    let ks: Vec<f64> = scene.camera.iter().map(|k| k.t).collect();
+    for &t in &ks[2..ks.len() - 2] {
+        let (before, after) = (vel(t - 2.0 * h, t - h), vel(t + h, t + 2.0 * h));
+        let speed = dist(before, [0.0; 3]).max(dist(after, [0.0; 3])).max(0.02);
+        let jump = dist(before, after) / speed;
+        assert!(
+            jump < 0.005,
+            "a velocity jump of {:.1}% at t={t}",
+            jump * 100.0
+        );
+    }
+}
+
+#[test]
+fn the_wall_program_does_not_repeat_within_ten_minutes() {
+    // The hold-based director flew one permutation of its eight viewpoints in a loop, so
+    // the same stops came round in the same order every two and a half minutes.
+    for seed in 1..=16 {
+        let (_, stops) = published_camera(seed, 1800);
+        for i in 0..stops.len() {
+            for j in i + 1..stops.len() {
+                if stops[j].0 - stops[i].0 > 600.0 || j + 4 > stops.len() {
+                    continue;
+                }
+                let run = |k: usize| stops[k..k + 4].iter().map(|s| s.1).collect::<Vec<_>>();
+                assert_ne!(
+                    run(i),
+                    run(j),
+                    "seed {seed}: the stops from t={} come round again at t={}",
+                    stops[i].0,
+                    stops[j].0
+                );
+            }
+        }
+    }
 }

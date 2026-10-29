@@ -87,6 +87,9 @@ impl std::fmt::Display for SnapshotKind {
 /// kernel flushes nothing but the disks (reflinks, so already clean) to take it.
 pub const SNAPSHOT_DISK_SUBDIR: &str = "disk";
 
+/// The memory file's name in a snapshot's directory.
+pub const SNAPSHOT_MEMORY_FILE: &str = "memory.bin";
+
 /// Where a snapshot directory keeps its disks.
 pub fn snapshot_disk_dir(snapshot_dir: &Path) -> PathBuf {
     snapshot_dir.join(SNAPSHOT_DISK_SUBDIR)
@@ -482,7 +485,7 @@ impl SnapshotManager {
                 .with_context(|| format!("locking snapshot '{}' for deletion", name))?;
 
         if snapshot_dir.exists() {
-            fs::remove_dir_all(&snapshot_dir)
+            crate::storage::disk::remove_snapshot_dir(&snapshot_dir)
                 .await
                 .context("removing snapshot directory")?;
 
@@ -527,7 +530,7 @@ impl SnapshotManager {
             return Ok(false);
         }
 
-        fs::remove_dir_all(&snapshot_dir)
+        crate::storage::disk::remove_snapshot_dir(&snapshot_dir)
             .await
             .context("removing invalid snapshot generation")?;
         info!(snapshot = name, "snapshot generation deleted");

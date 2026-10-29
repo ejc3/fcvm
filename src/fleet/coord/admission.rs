@@ -328,6 +328,9 @@ impl Gate {
                 value: url.clone(),
                 expires_at: u64::MAX,
             }),
+            // A signed token is bound to the page's origin: a connection that names none (not a
+            // browser) gets none, rather than a token any origin could play.
+            Some(Playback::Signed(_)) if origin.is_none() => None,
             Some(Playback::Signed(s)) => {
                 let exp = now_s + PLAYBACK_TOKEN_SECS;
                 match s.url(origin, exp) {
@@ -565,6 +568,31 @@ mod tests {
         public
             .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig)
             .expect("the signature verifies");
+    }
+
+    /// A private channel's token is bound to the page's origin; a connection that names no
+    /// origin (not a browser) gets no playback URL rather than one any origin could use.
+    #[test]
+    fn a_connection_without_an_origin_gets_no_signed_playback() {
+        let gate = Gate {
+            seats: Seats::new(Some(1)),
+            key: AdmitKey([1; 32]),
+            playback: Some(Playback::Signed(Box::new(
+                PlaybackSigner::new(
+                    "arn:aws:ivs:us-east-1:000000000000:channel/example".into(),
+                    "https://playback.example/x.m3u8".into(),
+                    &test_key_pem(),
+                )
+                .unwrap(),
+            ))),
+            tick: Duration::from_secs(10),
+        };
+        let seat = Admitted::Seat { ticket: "t".into() };
+        let now = Instant::now();
+        let with = gate.message(&seat, "v-1", Some("https://stage.example"), 1_000_000, now);
+        assert!(with.broadcast.is_some());
+        let without = gate.message(&seat, "v-1", None, 1_000_000, now);
+        assert!(without.broadcast.is_none(), "an unbound playback token");
     }
 
     #[test]

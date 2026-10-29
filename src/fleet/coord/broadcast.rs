@@ -124,13 +124,14 @@ pub fn layout(state: &State) -> Option<Layout> {
 }
 
 /// One tile read directly: its published IPv6 name, which reaches the VM without a proxy
-/// (the IPv4 name of an fcvm tile goes through Cloudflare).
+/// (the IPv4 name of an fcvm tile goes through Cloudflare). A tile lent to a visitor is
+/// black: its GPU draws that visitor's private camera over the whole image.
 fn tile(state: &State, s: &fleet_core::state::Slot) -> Option<TileSpec> {
     let (v6, v4) = fleet_core::view::frame_urls(state, s);
     Some(TileSpec {
         id: s.id.clone(),
         rect: s.rect?,
-        url: v6.or(v4),
+        url: if s.claim.is_some() { None } else { v6.or(v4) },
     })
 }
 

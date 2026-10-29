@@ -1,0 +1,174 @@
+#!/bin/bash
+# Two aosp.sh runs on one directory must not install or build at the same time: they share
+# the downloads, the unpack directory, the installed pieces and the probe build. Two runs on
+# different directories hold different locks, so they must share nothing: their probe
+# builds must be in different directories. And a run's probe app must stay its own until it
+# is installed: two checkouts with different probe sources build in turn, and the app the
+# first would install must still be the first's. Checkouts with different pins must not
+# share a directory, where one would replace a piece the other is using, and checkouts whose
+# phone container differs must not share an image tag.
+# A stub curl records how many runs are inside it at once, holds each call for 2 s
+# and then fails, which stops that run; with the lock the second run waits for the first to
+# exit, so at most one is ever inside. Stub javac, java and keytool satisfy the tool check.
+# The test fails unless both runs reached curl, so a run that stopped earlier cannot read as
+# serialized.
+#   scripts/phone/test-aosp-lock.sh
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+dir=$(mktemp -d)
+trap 'rm -rf "$dir"' EXIT
+mkdir -p "$dir/bin" "$dir/aosp"
+cat > "$dir/bin/curl" <<STUB
+#!/bin/bash
+exec 8>>"$dir/count.lock"
+flock 8
+n=\$(( \$(cat "$dir/active" 2>/dev/null || echo 0) + 1 ))
+echo \$n > "$dir/active"
+[ \$n -le \$(cat "$dir/max" 2>/dev/null || echo 0) ] || echo \$n > "$dir/max"
+echo call >> "$dir/calls"
+flock -u 8
+sleep 2
+flock 8
+echo \$(( \$(cat "$dir/active") - 1 )) > "$dir/active"
+exit 1
+STUB
+printf '#!/bin/sh\nexit 0\n' > "$dir/bin/javac"
+cp "$dir/bin/javac" "$dir/bin/keytool"
+cp "$dir/bin/javac" "$dir/bin/java"
+chmod +x "$dir/bin/curl" "$dir/bin/javac" "$dir/bin/keytool" "$dir/bin/java"
+# took_turns script var: two runs of script on one directory (var names it) at once.
+# sdk.sh, which fetches what Robot Park compiles against, installs under the same kind of lock.
+took_turns() {
+  local script=$1 var=$2 a b calls max
+  rm -f "$dir/calls" "$dir/max" "$dir/active"
+  mkdir -p "$dir/$script.d"
+  for n in 1 2; do
+    env PATH="$dir/bin:$PATH" ACCEPT_ANDROID_SDK_LICENSE=1 "$var=$dir/$script.d" "$here/$script" > "$dir/out.$n" 2>&1 &
+    eval "p$n=\$!"
+  done
+  wait "$p1" "$p2" || true
+  calls=$(wc -l < "$dir/calls" 2>/dev/null || echo 0)
+  max=$(cat "$dir/max" 2>/dev/null || echo 0)
+  if [ "$calls" -lt 2 ]; then
+    echo "FAIL: only $calls of the two $script runs reached the download"
+    cat "$dir/out.1" "$dir/out.2"
+    exit 1
+  fi
+  if [ "$max" -ne 1 ]; then
+    echo "FAIL: $max $script runs were installing into one directory at the same time"
+    exit 1
+  fi
+  echo "ok   two $script runs on one directory took turns ($calls downloads, at most $max at once)"
+}
+took_turns aosp.sh ANDROID_AOSP
+took_turns sdk.sh ANDROID_SDK
+
+
+# The pins as "sha256 destination" lines, read from aosp.sh's PINS.
+pins_of() {
+  sed -n 's/^\(PINS="\)\{0,1\}\$R[^ ]* \([0-9a-f]\{64\}\) [^ ]* \([^"]*\)"\{0,1\}$/\2 \3/p' "$1"
+}
+# Install every piece into directory $1 as if fetched (the recorded SHA-256 matches its pin).
+installed() {
+  pins_of "$here/aosp.sh" | while read -r sha dest; do
+    mkdir -p "$1/$dest"; echo "$sha" > "$1/$dest/.fcvm-sha256"; echo >> "$dir/pins"
+  done
+}
+
+# Two directories side by side, each with every piece already installed, so each run goes
+# straight to the probe build. The stub javac records where it was asked to build, then
+# fails, which stops that run.
+for s in a b; do installed "$dir/$s"; done
+pins=$(wc -l < "$dir/pins")
+[ "$pins" -eq 4 ] || { echo "FAIL: read $pins pins from aosp.sh, expected 2 for each of two directories"; exit 1; }
+printf '#!/bin/bash
+while [ $# -gt 0 ]; do [ "$1" = -d ] && echo "$2" >> "%s/javac-out"; shift; done
+exit 1
+' "$dir" > "$dir/bin/javac"
+for s in a b; do PATH="$dir/bin:$PATH" ANDROID_AOSP="$dir/$s" "$here/aosp.sh" > "$dir/out.$s" 2>&1 || true; done
+builds=$( (sort -u "$dir/javac-out" 2>/dev/null || true) | wc -l)
+if [ "$(wc -l < "$dir/javac-out" 2>/dev/null || echo 0)" -ne 2 ]; then
+  echo "FAIL: the two directories' runs did not both reach the probe build"; cat "$dir/out.a" "$dir/out.b"; exit 1
+fi
+if [ "$builds" -ne 2 ]; then
+  echo "FAIL: two directories built the probe app in one directory: $(sort -u "$dir/javac-out")"; exit 1
+fi
+echo "ok   two directories build the probe app in two directories"
+
+# Two checkouts on one directory whose probe sources differ (B's manifest carries a marker).
+# Stub build tools put the manifest they were given into the app, so the app shows whose it
+# is. A builds, then B; the app A's run would install (the path its aosp.sh printed, which
+# run.sh asks for with --probe-path) must still hold A's manifest.
+shared=$dir/shared
+installed "$shared"
+t=$shared/tools
+mkdir -p "$t/bin" "$t/framework"
+: > "$t/android.jar"
+cat > "$t/bin/aapt2" <<'STUB'
+#!/bin/bash
+while [ $# -gt 0 ]; do
+  case "$1" in -o) out=$2 ;; --manifest) manifest=$2 ;; esac
+  shift
+done
+python3 -I -c 'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1],"w"); z.write(sys.argv[2],"AndroidManifest.xml"); z.close()' "$out" "$manifest"
+STUB
+printf '#!/bin/bash\ncp "$3" "$4"\n' > "$t/bin/zipalign"
+chmod +x "$t/bin/aapt2" "$t/bin/zipalign"
+# java runs d8 (--output gets the dex) and apksigner (--out gets the signed app).
+cat > "$dir/bin/java" <<'STUB'
+#!/bin/bash
+case " $* " in
+*" com.android.tools.r8.D8 "*) while [ $# -gt 0 ]; do [ "$1" = --output ] && touch "$2/classes.dex"; shift; done ;;
+*" com.android.apksigner.ApkSignerTool "*) while [ $# -gt 1 ]; do [ "$1" = --out ] && out=$2; shift; done; cp "$1" "$out" ;;
+esac
+STUB
+chmod +x "$dir/bin/java"
+printf '#!/bin/sh\nexit 0\n' > "$dir/bin/javac"
+printf '#!/bin/bash\nwhile [ $# -gt 0 ]; do [ "$1" = -keystore ] && touch "$2"; shift; done\n' > "$dir/bin/keytool"
+root=$(cd "$here/../.." && pwd)
+for c in A B; do
+  mkdir -p "$dir/$c/scripts" "$dir/$c/fleet/phone"
+  cp -r "$root/scripts/phone" "$dir/$c/scripts/"
+  cp -r "$root/fleet/phone/probe" "$root/fleet/phone/aosp.xml" "$dir/$c/fleet/phone/"
+done
+echo "<!-- checkout B -->" >> "$dir/B/fleet/phone/probe/AndroidManifest.xml"
+for c in A B; do
+  PATH="$dir/bin:$PATH" ANDROID_AOSP="$shared" "$dir/$c/scripts/phone/aosp.sh" > "$dir/out.$c" 2>&1 \
+    || { echo "FAIL: checkout $c's aosp.sh failed:"; cat "$dir/out.$c"; exit 1; }
+done
+apk_a=$(sed -n 's/.*probe app \(.*\)$/\1/p' "$dir/out.A" | tail -1)
+if ! python3 -I -c 'import sys,zipfile; sys.exit(0 if zipfile.ZipFile(sys.argv[1]).read("AndroidManifest.xml") == open(sys.argv[2],"rb").read() else 1)' \
+    "$apk_a" "$dir/A/fleet/phone/probe/AndroidManifest.xml" 2>/dev/null; then
+  echo "FAIL: checkout A's probe app at $apk_a was replaced by another checkout's build"; exit 1
+fi
+asked=$(ANDROID_AOSP="$shared" "$dir/A/scripts/phone/aosp.sh" --probe-path 2>/dev/null || true)
+[ "$asked" = "$apk_a" ] || { echo "FAIL: aosp.sh --probe-path names '$asked', not the app it built ($apk_a)"; exit 1; }
+echo "ok   a checkout's probe app stays its own when another checkout builds"
+
+# The default directory follows the pins: the same pins share it, other pins do not.
+same=$(env -u ANDROID_AOSP "$dir/B/scripts/phone/aosp.sh" --root-path 2>/dev/null || true)
+[ -n "$same" ] && [ "$same" = "$(env -u ANDROID_AOSP "$dir/A/scripts/phone/aosp.sh" --root-path 2>/dev/null || true)" ] \
+  || { echo "FAIL: two checkouts with the same pins use different directories"; exit 1; }
+sed -i 's# x86_64 system-images/# x86_64-other system-images/#' "$dir/B/scripts/phone/aosp.sh"
+other=$(env -u ANDROID_AOSP "$dir/B/scripts/phone/aosp.sh" --root-path 2>/dev/null || true)
+[ "$other" != "$same" ] || { echo "FAIL: a checkout with other pins uses the same directory ($same)"; exit 1; }
+echo "ok   checkouts with other pins use another directory"
+
+# The pins name the build of the recipe and manifest beside them: a checkout whose manifest
+# differs refuses to fetch the pinned archives, which another recipe built.
+echo "<!-- checkout A -->" >> "$dir/A/fleet/phone/aosp.xml"
+rc=0; out=$(PATH="$dir/bin:$PATH" ANDROID_AOSP="$shared" "$dir/A/scripts/phone/aosp.sh" 2>&1) || rc=$?
+[ "$rc" = 2 ] && grep -q "make phone-system-image" <<< "$out" \
+  || { echo "FAIL: a checkout whose manifest differs from the pinned build's ran (exit $rc): $out"; exit 1; }
+echo "ok   a checkout whose recipe differs from the pinned build refuses it"
+
+# The phone image's tag follows fleet/phone: the same sources share it, other sources do not.
+for c in A B; do mkdir -p "$dir/$c/fleet/phone" && cp -r "$root/fleet/phone/." "$dir/$c/fleet/phone/"; done
+tag_a=$("$dir/A/scripts/phone/run.sh" --image 2>/dev/null || true)
+tag_b=$("$dir/B/scripts/phone/run.sh" --image 2>/dev/null || true)
+case "$tag_a" in localhost/*:*) ;; *) echo "FAIL: run.sh --image names no tagged local image: '$tag_a'"; exit 1 ;; esac
+[ "$tag_a" = "$tag_b" ] || { echo "FAIL: two checkouts with the same phone container use different tags"; exit 1; }
+echo "# checkout B" >> "$dir/B/fleet/phone/phone.sh"
+tag_b=$("$dir/B/scripts/phone/run.sh" --image 2>/dev/null || true)
+[ "$tag_b" != "$tag_a" ] || { echo "FAIL: two checkouts with different phone containers share the tag $tag_a"; exit 1; }
+echo "ok   checkouts with other phone containers use another image tag"

@@ -39,7 +39,7 @@ fn is_snapshot_disk_subvolume(dir: &Path) -> bool {
 /// would get a disk it cannot open for writing and a directory it cannot
 /// remove at teardown; it reflinks the disk instead, which makes a copy it
 /// owns. Root can write and remove anything.
-fn can_own_subvolume_snapshot_of(base_dir: &Path) -> bool {
+pub fn can_own_subvolume_snapshot_of(base_dir: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     let euid = nix::unistd::geteuid().as_raw();
     euid == 0
@@ -76,11 +76,256 @@ pub async fn create_dir_or_subvolume(path: &Path) -> Result<()> {
     info!(
         path = %path.display(),
         %reason,
-        "not a btrfs subvolume; created as a directory (clones of it reflink the disk)"
+        "not a btrfs subvolume; created as a directory (copies of it reflink its files)"
     );
     fs::create_dir_all(path)
         .await
         .with_context(|| format!("creating {}", path.display()))
+}
+
+/// Remove a snapshot directory. A snapshot directory that is a btrfs subvolume (and its
+/// `disk/` subvolume) is deleted as a subvolume, which detaches it at once and leaves the
+/// cleaner thread to drop its extent references in the background: unlinking a memory file
+/// written by in-place diffs drops one reference per extent first, 52 to 93 s for one with
+/// 11.8 million extents. Anything else, or a subvolume this process may not delete (an
+/// unprivileged caller without user_subvol_rm_allowed), is removed file by file.
+pub async fn remove_snapshot_dir(dir: &Path) -> std::io::Result<()> {
+    if is_btrfs_subvolume(dir) {
+        let disk = dir.join(crate::storage::snapshot::SNAPSHOT_DISK_SUBDIR);
+        let disk_gone = !is_btrfs_subvolume(&disk) || delete_subvolume(&disk).await;
+        if disk_gone && delete_subvolume(dir).await && !dir.exists() {
+            return Ok(());
+        }
+    }
+    match fs::remove_dir_all(dir).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// Remove a snapshot create's leftover staging directory, and fail if it is still there: a
+/// subvolume snapshot made onto an existing directory lands inside it, and a subvolume
+/// cannot be created over one, so a leftover would be silently reused.
+pub async fn clear_staging(staging: &Path) -> Result<()> {
+    clear_staging_with(staging, remove_snapshot_dir(staging).await)
+}
+
+/// `clear_staging` after its removal returned `removed`.
+fn clear_staging_with(staging: &Path, removed: std::io::Result<()>) -> Result<()> {
+    if staging.exists() {
+        let reason = match removed {
+            Err(error) => error.to_string(),
+            Ok(()) => "it is still there after its removal".to_string(),
+        };
+        bail!(
+            "could not remove the leftover staging directory {}: {reason}",
+            staging.display()
+        );
+    }
+    Ok(())
+}
+
+/// Wait for btrfs to free the space of subvolumes deleted on the filesystem holding `path`
+/// (`btrfs subvolume sync`, bounded): a deleted subvolume's space comes back on the cleaner
+/// thread after the delete returns, so a free-space check right after one can read low.
+pub async fn wait_for_deleted_subvolumes(path: &Path) {
+    let sync = tokio::process::Command::new("btrfs")
+        .args(["subvolume", "sync"])
+        .arg(path)
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(std::time::Duration::from_secs(120), sync).await {
+        Ok(Ok(output)) if output.status.success() => {}
+        Ok(Ok(output)) => debug!(path = %path.display(),
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(), "btrfs subvolume sync refused"),
+        Ok(Err(error)) => debug!(path = %path.display(), %error, "btrfs tool unavailable"),
+        Err(_) => warn!(path = %path.display(), "btrfs subvolume sync did not finish in 120 s"),
+    }
+}
+
+/// `btrfs subvolume delete`, without waiting for the cleaner. Whether it succeeded.
+async fn delete_subvolume(path: &Path) -> bool {
+    let output = tokio::process::Command::new("btrfs")
+        .args(["subvolume", "delete"])
+        .arg(path)
+        .output()
+        .await;
+    match output {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            debug!(path = %path.display(), stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "btrfs subvolume delete refused; removing file by file");
+            false
+        }
+        Err(error) => {
+            debug!(path = %path.display(), %error, "btrfs tool unavailable; removing file by file");
+            false
+        }
+    }
+}
+
+/// Take a snapshot's disk directory `dest` as a subvolume snapshot of the VM's disk directory `src`,
+/// rename the root disk `root_name` to `disk.raw`, and keep only `disk.raw` and `keep`. Returns false,
+/// leaving no `dest`, when `src` is not a subvolume this process may snapshot or the snapshot fails;
+/// the caller then reflinks the disks. A restored clone's disk directory is a subvolume snapshot of
+/// its snapshot's `disk/`, so this costs one transaction commit where a reflink of a 154 GB root disk
+/// of 860,177 extents measured 9 to 11 s, 14.5 s with the VM paused in one www snapshot.
+pub async fn snapshot_disk_subvolume(
+    src: &Path,
+    dest: &Path,
+    root_name: &std::ffi::OsStr,
+    keep: &[String],
+) -> Result<bool> {
+    if !is_btrfs_subvolume(src) || !can_own_subvolume_snapshot_of(src) {
+        return Ok(false);
+    }
+    if dest.exists() {
+        bail!(
+            "{} exists; a subvolume snapshot would land inside it",
+            dest.display()
+        );
+    }
+    let output = tokio::process::Command::new("btrfs")
+        .args(["subvolume", "snapshot"])
+        .arg(src)
+        .arg(dest)
+        .output()
+        .await;
+    let refused = match output {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+        Err(error) => Some(format!("btrfs tool unavailable: {error}")),
+    };
+    if let Some(reason) = refused {
+        info!(src = %src.display(), %reason,
+            "could not snapshot the VM's disk subvolume; reflinking the disks instead");
+        clear_staging(dest).await?;
+        return Ok(false);
+    }
+    let disk = std::ffi::OsStr::new("disk.raw");
+    let kept = async {
+        if root_name != disk {
+            fs::rename(dest.join(root_name), dest.join(disk))
+                .await
+                .context("naming the snapshot's root disk")?;
+        }
+        let mut entries = fs::read_dir(dest).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            if name == disk || keep.iter().any(|k| std::ffi::OsStr::new(k) == name) {
+                continue;
+            }
+            let path = entry.path();
+            if entry.file_type().await?.is_dir() {
+                remove_snapshot_dir(&path).await?;
+            } else {
+                fs::remove_file(&path).await?;
+            }
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    if let Err(error) = kept {
+        warn!(dest = %dest.display(), error = %format!("{error:#}"),
+            "could not keep only the disks in the snapshot's disk subvolume; reflinking instead");
+        clear_staging(dest).await?;
+        return Ok(false);
+    }
+    // An extra disk the snapshot records but the VM's disk directory does not hold would make
+    // every clone's restore fail; the reflink path reports it now instead.
+    let missing = missing_disks(dest, keep);
+    if !missing.is_empty() {
+        info!(dest = %dest.display(), missing = ?missing,
+            "the VM's disk subvolume lacks disks the snapshot records; reflinking instead");
+        clear_staging(dest).await?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// The disks a snapshot's disk directory `dir` must hold that it does not: `disk.raw` and `keep`.
+fn missing_disks(dir: &Path, keep: &[String]) -> Vec<String> {
+    std::iter::once("disk.raw")
+        .chain(keep.iter().map(String::as_str))
+        .filter(|name| !dir.join(name).is_file())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Stage a diff snapshot's directory as a subvolume snapshot of its parent's, keeping only
+/// the parent's memory file, which the diff is then written into. A subvolume snapshot costs
+/// one transaction commit whatever the memory file's extent count, where a reflink of the
+/// file costs one reference per extent: 133 s for a memory file of 11.8 million extents
+/// written by eight in-place diffs. Returns false, leaving no `staging`, when the parent's
+/// directory is not a subvolume this process may snapshot or the snapshot fails; the caller
+/// then reflinks the memory file. A failed staging that cannot be removed is an error, since
+/// the reflink path would otherwise create its directory over the parent's leftover files.
+///
+/// The parent's other files (its config, vmstate, recorded working set, locks) are removed
+/// from the staging directory, and so is its `disk/`, which a subvolume snapshot shows as an
+/// empty placeholder directory when it is a subvolume of its own.
+pub async fn stage_from_parent_subvolume(parent: &Path, staging: &Path) -> Result<bool> {
+    if !is_btrfs_subvolume(parent) || !can_own_subvolume_snapshot_of(parent) {
+        return Ok(false);
+    }
+    if staging.exists() {
+        bail!(
+            "{} exists; a subvolume snapshot would land inside it",
+            staging.display()
+        );
+    }
+    let started = std::time::Instant::now();
+    let output = tokio::process::Command::new("btrfs")
+        .args(["subvolume", "snapshot"])
+        .arg(parent)
+        .arg(staging)
+        .output()
+        .await;
+    let refused = match output {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+        Err(error) => Some(format!("btrfs tool unavailable: {error}")),
+    };
+    if let Some(reason) = refused {
+        info!(parent = %parent.display(), %reason,
+            "could not snapshot the parent's subvolume; reflinking its memory file instead");
+        clear_staging(staging).await?;
+        return Ok(false);
+    }
+    let snapshot_ms = started.elapsed().as_millis() as u64;
+    if let Err(error) = keep_only_memory_file(staging).await {
+        warn!(staging = %staging.display(), %error,
+            "could not clear the parent's other files from the staged snapshot; reflinking instead");
+        clear_staging(staging).await?;
+        return Ok(false);
+    }
+    debug!(parent = %parent.display(), staging = %staging.display(), snapshot_ms,
+        "staged the snapshot as a subvolume snapshot of its parent");
+    Ok(true)
+}
+
+/// Remove everything in `dir` but the memory file: files, directories, and the empty
+/// placeholder a nested subvolume leaves in a subvolume snapshot.
+async fn keep_only_memory_file(dir: &Path) -> Result<()> {
+    let mut entries = fs::read_dir(dir)
+        .await
+        .with_context(|| format!("reading {}", dir.display()))?;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_name() == crate::storage::snapshot::SNAPSHOT_MEMORY_FILE {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type().await?.is_dir() {
+            fs::remove_dir_all(&path)
+                .await
+                .with_context(|| format!("removing {}", path.display()))?;
+        } else {
+            fs::remove_file(&path)
+                .await
+                .with_context(|| format!("removing {}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Configuration for a VM disk
@@ -543,4 +788,109 @@ pub fn parse_size(s: &str) -> Result<u64> {
 
     num.checked_mul(multiplier)
         .with_context(|| format!("size overflow: {} * {}", num, multiplier))
+}
+
+#[cfg(test)]
+mod snapshot_dir_tests {
+    use super::*;
+
+    /// A leftover staging directory that cannot be removed fails the create: a subvolume
+    /// snapshot made onto it would land inside it. The removal's failure is given to the
+    /// check, since root removes files from a read-only directory.
+    #[tokio::test]
+    async fn an_unremovable_leftover_staging_directory_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("snap.creating");
+        std::fs::create_dir_all(staging.join("disk")).unwrap();
+        let refused = std::io::Error::from_raw_os_error(libc::EPERM);
+        let error = clear_staging_with(&staging, Err(refused))
+            .expect_err("an unremovable leftover must fail the create");
+        assert!(
+            error.to_string().contains("leftover staging directory"),
+            "{error}"
+        );
+        clear_staging_with(&staging, Ok(())).expect_err("a leftover still present must fail");
+        clear_staging(&staging).await.unwrap();
+        assert!(!staging.exists());
+        clear_staging(&staging).await.unwrap();
+    }
+
+    /// A snapshot's disk directory must hold disk.raw and every extra disk it records.
+    #[test]
+    fn a_missing_extra_disk_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("disk.raw"), b"disk").unwrap();
+        std::fs::write(dir.path().join("data.raw"), b"data").unwrap();
+        let keep = ["data.raw".to_string(), "gone.raw".to_string()];
+        assert_eq!(missing_disks(dir.path(), &keep), ["gone.raw"]);
+        std::fs::remove_file(dir.path().join("disk.raw")).unwrap();
+        assert_eq!(missing_disks(dir.path(), &keep[..1]), ["disk.raw"]);
+    }
+
+    /// A disk directory that is not a subvolume is not snapshotted; the caller reflinks.
+    #[tokio::test]
+    async fn a_plain_disk_directory_is_not_snapshotted() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("disks");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("rootfs.raw"), b"disk").unwrap();
+        let dest = dir.path().join("snap").join("disk");
+        let taken = snapshot_disk_subvolume(&src, &dest, std::ffi::OsStr::new("rootfs.raw"), &[])
+            .await
+            .unwrap();
+        assert!(!taken);
+        assert!(!dest.exists());
+    }
+
+    /// A staged snapshot keeps the parent's memory file and nothing else of its directory.
+    #[tokio::test]
+    async fn staging_keeps_only_the_memory_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path();
+        std::fs::write(staged.join("memory.bin"), b"memory").unwrap();
+        std::fs::write(staged.join("config.json"), b"{}").unwrap();
+        std::fs::write(staged.join("memory.bin.working-set"), b"set").unwrap();
+        std::fs::create_dir(staged.join("disk")).unwrap();
+        std::fs::write(staged.join("disk").join("disk.raw"), b"disk").unwrap();
+        std::fs::create_dir(staged.join("empty-placeholder")).unwrap();
+        keep_only_memory_file(staged).await.unwrap();
+        let mut left: Vec<String> = std::fs::read_dir(staged)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["memory.bin"]);
+        assert_eq!(std::fs::read(staged.join("memory.bin")).unwrap(), b"memory");
+    }
+
+    /// A parent directory that is not a subvolume stages nothing, and the caller reflinks.
+    #[tokio::test]
+    async fn a_plain_parent_directory_is_not_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("memory.bin"), b"memory").unwrap();
+        let staging = dir.path().join("parent.creating");
+        assert!(!stage_from_parent_subvolume(&parent, &staging)
+            .await
+            .unwrap());
+        assert!(
+            !staging.exists(),
+            "a refused staging left {}",
+            staging.display()
+        );
+    }
+
+    /// A plain snapshot directory is removed file by file, and a missing one is not an error.
+    #[tokio::test]
+    async fn a_plain_snapshot_directory_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("snap");
+        std::fs::create_dir_all(snapshot.join("disk")).unwrap();
+        std::fs::write(snapshot.join("memory.bin"), b"memory").unwrap();
+        std::fs::write(snapshot.join("disk").join("disk.raw"), b"disk").unwrap();
+        remove_snapshot_dir(&snapshot).await.unwrap();
+        assert!(!snapshot.exists());
+        remove_snapshot_dir(&snapshot).await.unwrap();
+    }
 }

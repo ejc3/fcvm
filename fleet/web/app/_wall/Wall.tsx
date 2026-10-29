@@ -42,7 +42,7 @@ import { canDecodeH264, WallClient } from "./wall-client.ts";
 import { FocusPanel } from "./FocusPanel.tsx";
 import { OwnGpu } from "./OwnGpu.tsx";
 import { HalfClockView, Overlays, WakeCard } from "./Overlays.tsx";
-import { PlayDrawer, VerifyBox } from "./PlayDrawer.tsx";
+import { PlayDrawer, VerifyBox, type DrawerPanel } from "./PlayDrawer.tsx";
 import { Reel } from "./Reel.tsx";
 import { Broadcast } from "./Broadcast.tsx";
 import type { DrawSettings } from "./worker-msgs.ts";
@@ -182,6 +182,25 @@ function MenuIcon() {
   );
 }
 
+const GITHUB_LABEL = "fcvm on GitHub";
+
+function GithubIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z" />
+    </svg>
+  );
+}
+
+/** The repository link; the address is the one the isolation panel links to. */
+function GithubLink({ href, label }: { href: string; label: string }) {
+  return (
+    <a className="icon-btn" href={href} target="_blank" rel="noopener noreferrer" aria-label={label} title={label} data-testid="github-link">
+      <GithubIcon />
+    </a>
+  );
+}
+
 function RestartIcon() {
   return (
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -217,8 +236,12 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   const [areas, setAreas] = useState<Areas>({ mosaic: null, own: null });
   const [avoid, setAvoid] = useState<Box[]>([]);
   const [labelSize, setLabelSize] = useState<{ w: number; h: number } | undefined>(undefined);
-  /** The drawer section to show when it opens (the isolation link), or null for its top. */
-  const [drawerSection, setDrawerSection] = useState<string | null>(null);
+  /** Which panel the drawer shows: the controls, About, or how a square is isolated. */
+  const [drawerPanel, setDrawerPanel] = useState<DrawerPanel>("play");
+  /** The word being typed; it outlives panel switches. */
+  const [wordDraft, setWordDraft] = useState("");
+  /** The button that opened the drawer; closing it returns focus there. */
+  const drawerOpener = useRef<HTMLElement | null>(null);
   const phone = useMedia("(max-width: 700px)");
   const reducedMotion = useMedia("(prefers-reduced-motion: reduce)");
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -621,7 +644,8 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   );
   const closeDrawer = useCallback(() => {
     client.ui({ drawer: false });
-    requestAnimationFrame(() => playButtonRef.current?.focus());
+    const opener = drawerOpener.current;
+    requestAnimationFrame(() => (opener?.isConnected ? opener : playButtonRef.current)?.focus());
   }, [client]);
   const getOwnGpu = (from: HTMLElement) => {
     returnFocus.current = from;
@@ -761,10 +785,23 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
     </div>
   ) : null;
 
-  const openDrawer = (section: string | null) => {
-    setDrawerSection(section);
+  // A header button opens its own panel; pressing the one whose panel is open closes it, and
+  // pressing another swaps the panel in place.
+  const drawerOn = state.ui.drawer;
+  const openDrawer = (panel: DrawerPanel, from: HTMLElement) => {
+    if (drawerOn && drawerPanel === panel) {
+      closeDrawer();
+      return;
+    }
+    drawerOpener.current = from;
+    setDrawerPanel(panel);
     client.ui({ drawer: true, lightMode: false });
   };
+  const playOpen = drawerOn && drawerPanel === "play";
+  // However the drawer closed, the next plain open is the controls.
+  useEffect(() => {
+    if (!drawerOn) setDrawerPanel("play");
+  }, [drawerOn]);
 
   const needsVerifyPrompt = view.play?.verify.needed && state.turnstile.queued.length > 0 && !state.ui.drawer;
 
@@ -823,9 +860,12 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
         <div className="phone" data-version={view.version} style={covered ? { visibility: "hidden" } : undefined}>
           <header>
             {brand}
-            <button type="button" className="icon-btn" aria-label="About this page" data-testid="menu" onClick={() => openDrawer("about")}>
-              <MenuIcon />
-            </button>
+            <div className="header-icons">
+              <GithubLink href={view.isolation.link.href} label={GITHUB_LABEL} />
+              <button type="button" className="icon-btn" aria-label="About this page" title="About this page" aria-expanded={drawerOn && drawerPanel === "about"} data-testid="menu" onClick={(e) => openDrawer("about", e.currentTarget)}>
+                <MenuIcon />
+              </button>
+            </div>
           </header>
           {stage}
           {view.race && view.race.clocks.length > 0 ? (
@@ -846,7 +886,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
             {view.rotateHint}
           </p>
           {view.play ? (
-            <button type="button" className="link play-link" data-testid="phone-play" aria-expanded={view.playButton.open} onClick={() => openDrawer(null)}>
+            <button type="button" className="link play-link" data-testid="phone-play" aria-expanded={playOpen} onClick={(e) => openDrawer("play", e.currentTarget)}>
               {view.playButton.phoneLabel}
             </button>
           ) : null}
@@ -875,11 +915,8 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
                   ref={playButtonRef}
                   type="button"
                   className="btn"
-                  aria-expanded={view.playButton.open}
-                  onClick={() => {
-                    setDrawerSection(null);
-                    client.ui({ drawer: !view.playButton.open, lightMode: false });
-                  }}
+                  aria-expanded={playOpen}
+                  onClick={(e) => openDrawer("play", e.currentTarget)}
                   data-testid="play"
                 >
                   {view.playButton.label}
@@ -893,10 +930,11 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
                   {view.ownButton.disabled ? <span className="note" data-testid="own-note">{view.ownButton.note}</span> : null}
                 </span>
               ) : null}
-              <button type="button" className="icon-btn" aria-label={view.isolation.open} title={view.isolation.open} onClick={() => openDrawer("isolation")} data-testid="isolation-link">
+              <button type="button" className="icon-btn" aria-label={view.isolation.open} title={view.isolation.open} aria-expanded={drawerOn && drawerPanel === "isolation"} onClick={(e) => openDrawer("isolation", e.currentTarget)} data-testid="isolation-link">
                 <InfoIcon />
               </button>
-              <button type="button" className="icon-btn" aria-label="About this page" title="About this page" onClick={() => openDrawer("about")} data-testid="menu">
+              <GithubLink href={view.isolation.link.href} label={GITHUB_LABEL} />
+              <button type="button" className="icon-btn" aria-label="About this page" title="About this page" aria-expanded={drawerOn && drawerPanel === "about"} onClick={(e) => openDrawer("about", e.currentTarget)} data-testid="menu">
                 <MenuIcon />
               </button>
             </div>
@@ -921,7 +959,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
       ) : null}
       <Overlays view={view} phone={phone} />
       {keyGrid}
-      {state.ui.drawer && view.play && !covered ? <PlayDrawer client={client} view={view} onClose={closeDrawer} section={drawerSection} /> : null}
+      {state.ui.drawer && view.play && !covered ? <PlayDrawer client={client} view={view} onClose={closeDrawer} panel={drawerPanel} isolationInAbout={phone} word={wordDraft} setWord={setWordDraft} /> : null}
       {needsVerifyPrompt ? (
         <div className="verify-pop" role="dialog" aria-label={view.play!.verify.title}>
           <VerifyBox client={client} view={view} />
