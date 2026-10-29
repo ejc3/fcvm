@@ -72,6 +72,13 @@ pub enum Note {
         host: String,
         steps: BTreeMap<String, u64>,
     },
+    /// A wall slot left `pending` during a wake: its agent got the assignment and started
+    /// the VM (`phase` is the first one reported, usually `restoring`).
+    Started {
+        id: String,
+        phase: String,
+        since_wake_ms: u64,
+    },
     /// A slot or tile reported running a new generation.
     Running {
         id: String,
@@ -139,6 +146,22 @@ pub fn notes(before: &Marks, after: &State, at: u64) -> Vec<Note> {
         }
     }
     let f = &after.fleet;
+    if let (Some(woke), true) = (p.woke_at, fleet_core::apply::wake_open(p)) {
+        for s in f.slots.values() {
+            let o = &s.observed;
+            let was_pending = before
+                .slots
+                .get(&s.id)
+                .is_none_or(|(ph, _)| ph == "pending");
+            if was_pending && o.phase != "pending" && o.phase != "running" {
+                out.push(Note::Started {
+                    id: s.id.clone(),
+                    phase: o.phase.clone(),
+                    since_wake_ms: at.saturating_sub(woke),
+                });
+            }
+        }
+    }
     for s in f.slots.values().chain(f.ec2.values()) {
         let o = &s.observed;
         if o.phase != "running" {
@@ -186,6 +209,11 @@ pub fn log(notes: &[Note]) {
                     .join(" ");
                 tracing::info!(%host, %steps, "wake: host boot, ms since the wake began (host clock)")
             }
+            Note::Started {
+                id,
+                phase,
+                since_wake_ms,
+            } => tracing::info!(tile = %id, %phase, since_wake_ms, "wake: tile started"),
             Note::Running {
                 id,
                 generation,
@@ -323,6 +351,22 @@ mod tests {
                     .into(),
                 },
             ]
+        );
+        // The agent starting the slot's VM is a step of its own: a host whose slots stay
+        // pending after its hello never started them (issue 1437).
+        let (s, n) = step(
+            s,
+            serde_json::json!({"type": "agent", "at": 231000, "host": "h1", "msg": {
+            "type": "slot", "id": "slot-1", "phase": "restoring", "generation": 1, "vm": "fleet-slot-1",
+            "frame_url": "ws://h1:1/frames", "timings": {}}}),
+        );
+        assert_eq!(
+            n,
+            vec![Note::Started {
+                id: "slot-1".into(),
+                phase: "restoring".into(),
+                since_wake_ms: 131000
+            }]
         );
         let (_, n) = step(
             s,
