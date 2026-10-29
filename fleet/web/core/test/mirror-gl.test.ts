@@ -202,6 +202,26 @@ describe("color buffers the host destroys, shared and reused", () => {
     expect(deleted(both.calls)).toContain(made(both.calls)[0]);
   });
 
+  it("keeps a freed buffer's texture while a client image made from it lives, and lets it go with the image", () => {
+    const steps: ([number, string, (number | Uint8Array)[]] | [number, "reply" | "free", number[]])[] = [
+      ...contexts(),
+      [1, "rcCreateColorBuffer", [16, 16, 0x1908]],
+      [1, "reply", [9]],
+      [1, "glGenTextures", [1, 4]],
+      [1, "reply", [5]],
+      ...bound(5),
+      // an EGLImage of texture 5, then the name goes and the host frees the buffer
+      [1, "rcCreateClientImage", [1, 0x30b1, 5]],
+      [1, "reply", [77]],
+      [1, "glDeleteTextures", [1, u32(5)]],
+      [0, "free", [9]],
+    ];
+    const live = play(steps);
+    expect(deleted(live.calls)).not.toContain(made(live.calls)[0]);
+    const gone = play([...steps, [1, "rcDestroyClientImage", [77]]]);
+    expect(deleted(gone.calls)).toContain(made(gone.calls)[0]);
+  });
+
   it("does not free a buffer the guest made again with the same handle before the old one's FREE arrived", () => {
     // The tap copies a call's bytes before the host runs it, and the host frees the old
     // buffer with that handle while it runs the create: the old buffer's FREE follows the

@@ -643,7 +643,12 @@ export class GlMirror {
       const t = ctx?.share.textures.get(n(a[2]));
       if (t) this.images.set(new DataView(r.buffer, r.byteOffset).getUint32(0, true), t);
     });
-    this.on("rcDestroyClientImage", (_c, a) => this.images.delete(n(a[0])));
+    this.on("rcDestroyClientImage", (_c, a) => {
+      const t = this.images.get(n(a[0]));
+      this.images.delete(n(a[0]));
+      // the image may have been the last thing drawing with a freed buffer's texture
+      if (t && !this.texInUse(t)) gl.deleteTexture(t);
+    });
     this.on("rcFBPost", (_c, a, call) => this.post(n(a[0]), call));
     const compose = (post: boolean): Handler => (_c, a, call) => this.compose(bytes(a[1]), post, call);
     this.on("rcCompose", compose(true));
@@ -1156,9 +1161,10 @@ export class GlMirror {
     this.freeColorBuffer(handle);
   }
 
-  /** Whether a live color buffer, a guest texture name, a renderbuffer or a window surface still draws with `t`. */
+  /** Whether a live color buffer, a client image, a guest texture name, a renderbuffer or a window surface still draws with `t`. */
   private texInUse(t: WebGLTexture): boolean {
     for (const cb of this.colorBuffers.values()) if (cb.tex === t) return true;
+    for (const x of this.images.values()) if (x === t) return true;
     for (const share of new Set([...this.contexts.values()].map((c) => c.share))) {
       for (const x of share.textures.values()) if (x === t) return true;
       for (const r of share.renderbuffers.values()) if (!(r instanceof WebGLRenderbuffer) && r.tex === t) return true;
