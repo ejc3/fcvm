@@ -370,6 +370,11 @@ pub struct SharedScene {
     pub admit_keys: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub weather: Vec<WeatherKey>,
+    /// The keys a phone streamer checks GPU mirror tokens with (hex, newest first), sent whether
+    /// or not `admit_keys` turns on the check of direct streams. The agent passes them to
+    /// phones only. Never in a browser's snapshot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirror_keys: Vec<String>,
 }
 
 impl SharedScene {
@@ -383,6 +388,7 @@ impl SharedScene {
             lights: scene.lights.clone(),
             admit_keys: Vec::new(),
             weather: scene.weather.clone(),
+            mirror_keys: Vec::new(),
         }
     }
 
@@ -402,6 +408,7 @@ impl SharedScene {
             weather: self.weather.clone(),
             chrome: Vec::new(),
             mirror_viewer: None,
+            mirror_keys: Vec::new(),
         }
     }
 }
@@ -469,6 +476,10 @@ pub struct RendererScene {
     /// mirror (phones mode). Never sent to a renderer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mirror_viewer: Option<String>,
+    /// The mirror's keys (see [`SharedScene::mirror_keys`]): a phone's only. Never sent to a
+    /// renderer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirror_keys: Vec<String>,
 }
 
 #[cfg(test)]

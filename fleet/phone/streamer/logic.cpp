@@ -73,6 +73,14 @@ bool phone_scene_parse(const std::string& body, PhoneScene* out, std::string* er
       }
       for (const Json& k : ks) s.admit_keys.push_back(admit_key_from_hex(k.string("admit_keys[]")));
     }
+    if (present("mirror_keys")) {
+      const auto& ks = j.at("mirror_keys").array("mirror_keys");
+      if (ks.size() > 4) {
+        *err = "mirror_keys: more than 4 keys";
+        return false;
+      }
+      for (const Json& k : ks) s.mirror_keys.push_back(admit_key_from_hex(k.string("mirror_keys[]")));
+    }
     if (present("mirror_viewer")) {
       s.mirror_viewer = j.at("mirror_viewer").string("mirror_viewer");
       if (s.mirror_viewer.size() > 128) {
@@ -136,6 +144,7 @@ std::string app_scene_line(const PhoneScene& s) {
   Json j = Json::parse(s.body);
   j.obj.erase("admit_keys");
   j.obj.erase("mirror_viewer");
+  j.obj.erase("mirror_keys");
   j.obj.erase("type");
   j.obj.erase("stamp");
   std::string rest;
@@ -145,6 +154,13 @@ std::string app_scene_line(const PhoneScene& s) {
 
 void AdmitKeys::on_scene(const PhoneScene& s) {
   keys = s.admit_keys.empty() ? std::vector<std::string>{} : admit_keys_after(keys, s.admit_keys);
+}
+
+void AdmitKeys::on_mirror_keys(const PhoneScene& s) {
+  std::vector<std::string> fresh = s.mirror_keys;
+  for (const std::string& k : s.admit_keys)
+    if (std::find(fresh.begin(), fresh.end(), k) == fresh.end()) fresh.push_back(k);
+  keys = fresh.empty() ? std::vector<std::string>{} : admit_keys_after(keys, fresh);
 }
 
 bool AdmitKeys::admits(const std::string& token, int64_t now_s) const {

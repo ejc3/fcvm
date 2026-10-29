@@ -22,6 +22,7 @@
 #include "json.h"
 #include "nv12.h"
 #include "proto.h"
+#include "threads.h"
 
 namespace {
 double unix_ms() {
@@ -125,8 +126,11 @@ bool PhoneSource::post_scene(const std::string& body, std::string* err) {
   PhoneScene s;
   if (!phone_scene_parse(body, &s, err)) return false;
   std::lock_guard<std::mutex> l(mu_);
+  // a new holder (or none) retires every open mirror stream at once, writer included
+  if (s.mirror_viewer != scene_.mirror_viewer) mirror_holder_gen_++;
   scene_ = s;
   admit_.on_scene(s);
+  mirror_admit_.on_mirror_keys(s);
   scene_version_++;
   cv_.notify_all();
   return true;
@@ -144,17 +148,28 @@ bool PhoneSource::requires_admit() {
 
 bool PhoneSource::mirror_admits(const std::string& token) {
   std::lock_guard<std::mutex> l(mu_);
-  return ::mirror_admits(admit_.keys, scene_.mirror_viewer, token, (int64_t)time(nullptr));
+  return ::mirror_admits(mirror_admit_.keys, scene_.mirror_viewer, token, (int64_t)time(nullptr));
 }
 
 void PhoneSource::mirror(Conn& c, const std::string& token) {
   const std::string viewer = admit_token_viewer(token);
-  auto close_with = [&](uint16_t code, const std::string& why) {
+  uint64_t holder_gen;
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    holder_gen = mirror_holder_gen_;
+  }
+  // Still this stream's holder: checked before each message is queued and before each is sent.
+  auto holds = [&] { return mirror_holder_gen_.load() == holder_gen; };
+  auto close_frame = [](uint16_t code, const std::string& why) {
     std::string pl;
     pl += (char)(code >> 8);
     pl += (char)(code & 0xff);
     pl += why.substr(0, 120);
-    std::string f = ws_frame(8, pl.data(), pl.size());
+    return ws_frame(8, pl.data(), pl.size());
+  };
+  // before the writer starts: the only writer
+  auto close_with = [&](uint16_t code, const std::string& why) {
+    std::string f = close_frame(code, why);
     c.write_all(f.data(), f.size());
   };
   // The tap has one consumer: a second stream waits for the first to end, which it does once
@@ -188,43 +203,64 @@ void PhoneSource::mirror(Conn& c, const std::string& token) {
   std::deque<std::string> q;
   size_t queued = 0;
   std::atomic<bool> done{false};
-  std::thread writer([&] {
-    while (true) {
-      std::string m;
-      {
-        std::unique_lock<std::mutex> l(qmu);
-        qcv.wait(l, [&] { return done.load() || !q.empty(); });
-        if (q.empty()) break;
-        m = std::move(q.front());
-        q.pop_front();
-        queued -= m.size();
-      }
-      if (!c.write_all(m.data(), m.size())) {
-        done.store(true);
-        break;
-      }
-    }
-  });
-  std::thread reader([&] {
-    int op = 0;
-    std::string pl;
-    while (!done.load() && read_ws_message(c, &op, &pl) && op != 8) {
-    }
+  bool writer_finished = false;  // under qmu
+  std::thread writer, reader;
+  bool started = start_thread(
+      [&] {
+        while (true) {
+          std::string m;
+          bool last;
+          {
+            std::unique_lock<std::mutex> l(qmu);
+            qcv.wait(l, [&] { return done.load() || !q.empty(); });
+            if (q.empty()) break;
+            m = std::move(q.front());
+            q.pop_front();
+            queued -= m.size();
+            // once done, the queue holds only the close frame
+            last = done.load();
+          }
+          // a stream whose holder changed sends nothing more but its close
+          if ((!last && !holds()) || !c.write_all(m.data(), m.size())) break;
+        }
+        std::lock_guard<std::mutex> l(qmu);
+        writer_finished = true;
+        qcv.notify_all();
+      },
+      &writer);
+  if (started) {
+    started = start_thread(
+        [&] {
+          int op = 0;
+          std::string pl;
+          while (!done.load() && read_ws_message(c, &op, &pl) && op != 8) {
+          }
+          done.store(true);
+          qcv.notify_all();
+        },
+        &reader);
+  }
+  if (!started) {
+    // no thread for the stream (a pids or thread limit): refuse this one, keep the rest
     done.store(true);
     qcv.notify_all();
-  });
+    c.shutdown_both();
+    if (writer.joinable()) writer.join();
+    close(fd);
+    std::lock_guard<std::mutex> l(hmu_);
+    mirror_open_ = false;
+    mirror_error_ = "no thread for the mirror stream";
+    return;
+  }
   MirrorDeflate z;
   std::string reason;
   uint16_t code = 1000;
   std::vector<uint8_t> buf(1 << 18);
   while (!done.load()) {
-    {
-      std::lock_guard<std::mutex> l(mu_);
-      if (scene_.mirror_viewer != viewer) {
-        code = 1000;
-        reason = "the phone went back";
-        break;
-      }
+    if (!holds()) {
+      code = 1000;
+      reason = "the phone went back";
+      break;
     }
     pollfd p{fd, POLLIN, 0};
     int pr = poll(&p, 1, 200);
@@ -268,15 +304,19 @@ void PhoneSource::mirror(Conn& c, const std::string& token) {
   }
   close(fd);  // the tap stops copying when its consumer goes
   {
-    // what is queued is dropped: a viewer that fell behind joins again from the start
-    std::lock_guard<std::mutex> l(qmu);
+    // What is queued is dropped (a viewer that fell behind joins again from the start) and the
+    // close frame is the writer's last message.
+    std::unique_lock<std::mutex> l(qmu);
     q.clear();
     queued = 0;
+    q.push_back(close_frame(code, reason));
     done.store(true);
+    qcv.notify_all();
+    // A viewer that stopped reading leaves the writer blocked in a write: after 2 s the socket
+    // is shut down, which ends the write.
+    if (!qcv.wait_for(l, std::chrono::seconds(2), [&] { return writer_finished; })) c.shutdown_both();
   }
-  qcv.notify_all();
   writer.join();
-  close_with(code, reason);
   c.shutdown_both();
   reader.join();
   std::lock_guard<std::mutex> l(hmu_);

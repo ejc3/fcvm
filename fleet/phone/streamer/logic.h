@@ -28,6 +28,9 @@ struct PhoneScene {
   // The viewer holding the phone (the coordinator's mirror_viewer): only that viewer's direct
   // token opens GET /mirror. Empty: nobody holds it, and the mirror is closed.
   std::string mirror_viewer;
+  // The coordinator's keys for the mirror's tokens alone (raw, from mirror_keys), sent to phones
+  // whether or not admit_keys turns on the check of /frames.
+  std::vector<std::string> mirror_keys;
   std::string body;
 };
 // Parses and checks a scene body; false with the field named in *err.
@@ -38,6 +41,8 @@ bool phone_scene_parse(const std::string& body, PhoneScene* out, std::string* er
 struct AdmitKeys {
   std::vector<std::string> keys;
   void on_scene(const PhoneScene& s);
+  // The mirror's keys: the scene's mirror_keys and its admit_keys, kept as on_scene keeps them.
+  void on_mirror_keys(const PhoneScene& s);
   bool admits(const std::string& token, int64_t now_s) const;
 };
 

@@ -151,11 +151,12 @@ function PanelView({
               </div>
               <div className="view-switch" role="group" aria-label="View" data-testid="phone-views">
                 {b.views.map((v) => (
-                  <button key={v.name} type="button" className="btn" aria-pressed={v.pressed} onClick={() => onView(v.name)} data-testid={`phone-view-${v.name}`}>
+                  <button key={v.name} type="button" className="btn" aria-pressed={v.pressed} disabled={v.disabled} onClick={() => onView(v.name)} data-testid={`phone-view-${v.name}`}>
                     {v.label}
                   </button>
                 ))}
               </div>
+              {b.viewsNote ? <p className="note">{b.viewsNote}</p> : null}
               <dl className="readouts" data-testid="phone-readouts">
                 {b.readouts.map((r) => (
                   <div key={r.name} data-testid={`phone-readout-${r.name}`}>
@@ -325,11 +326,14 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
 
   // ---- the take-over views and their readouts (docs/fleet/ARCHITECTURE.md, "The GPU mirror") ----
 
-  const [takeover, setTakeover] = useState<TakeoverView>("video");
+  const [takeoverWanted, setTakeover] = useState<TakeoverView>("video");
   const [mirrorStats, setMirrorStats] = useState<MirrorStatsMsg | null>(null);
   const mirrorStatsRef = useRef<MirrorStatsMsg | null>(null);
   mirrorStatsRef.current = mirrorStats;
   const [mirrorNote, setMirrorNote] = useState<string | null>(null);
+  // whether this browser's canvas has WebGL2: without it the mirror cannot open and the video stays
+  const [mirrorGl, setMirrorGl] = useState<"unknown" | "ready" | "unavailable">("unknown");
+  const takeover: TakeoverView = mirrorGl === "unavailable" ? "video" : takeoverWanted;
   const held = state.accepted?.phones?.tiles.find((t) => t.borrowed?.session !== undefined && sameViewer(t.borrowed.viewer ?? null, state.you)) ?? null;
   const heldSession = held?.borrowed?.session ?? null;
   const videoMeter = useRef({ meter: new RateMeter(), last: null as number | null, session: null as string | null });
@@ -364,36 +368,86 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
           } satisfies StreamReadout)
         : null,
   };
+  // with the mirror alone there is no video to say what shape the screen is: the mirror says
+  const mirrorShape = held && takeover === "mirror" && mirrorStats && mirrorStats.width > 0 ? { id: held.id, w: mirrorStats.width, h: mirrorStats.height } : null;
 
   const view = useMemo(
-    () => phonesView({ state, now: now || 0, dpr, stage, progress, narrow, reducedMotion, openId, canDecode, takeover, readouts }),
+    () =>
+      phonesView({
+        state,
+        now: now || 0,
+        dpr,
+        stage,
+        progress,
+        narrow,
+        reducedMotion,
+        openId,
+        canDecode,
+        takeover,
+        readouts,
+        mirrorShape,
+        mirrorUnavailable: mirrorGl === "unavailable" ? "This browser has no WebGL2, so it can show the video only." : null,
+      }),
     // readouts change with now and the worker's reports
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [state, now, dpr, stage, progress, narrow, reducedMotion, openId, canDecode, takeover, mirrorStats, mirrorNote],
+    [state, now, dpr, stage, progress, narrow, reducedMotion, openId, canDecode, takeover, mirrorStats, mirrorNote, mirrorGl],
   );
   viewRef.current = view;
 
-  // The mirror's worker draws on its own canvas, handed over once.
-  const mirrorCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  // The mirror's worker draws on a canvas of its own. A canvas can be handed to a worker only once,
+  // so each mount makes a new one (React runs a mount twice in development). Its messages are
+  // handled from the start, so a WebGL2 failure is known before the mirror is asked for.
+  const mirrorHostRef = useRef<HTMLDivElement | null>(null);
   const mirrorWorker = useRef<Worker | null>(null);
-  const joinedFor = useRef<string | null>(null);
+  const onMirror = useRef<(x: MirrorOut) => void>(() => {});
   useEffect(() => {
-    const c = mirrorCanvasRef.current;
-    if (!c || mirrorWorker.current) return;
+    const host = mirrorHostRef.current;
+    if (!host) return;
+    const c = document.createElement("canvas");
+    c.width = 720;
+    c.height = 1280;
+    c.setAttribute("aria-label", "The GPU mirror: this phone drawn by your browser from its GL commands");
+    host.appendChild(c);
     const w = new Worker(new URL("./mirror/mirror.worker.ts", import.meta.url), { type: "module" });
     mirrorWorker.current = w;
+    w.onmessage = (e: MessageEvent<MirrorOut>) => onMirror.current(e.data);
     const off = c.transferControlToOffscreen();
     w.postMessage({ type: "canvas", canvas: off } satisfies MirrorIn, [off]);
     return () => {
       w.terminate();
       mirrorWorker.current = null;
+      c.remove();
     };
   }, []);
   const m = view.mirror;
-  // without a direct token (a fleet with no admission keys) the streamer refuses the mirror, and the page says why
-  const mirrorKey = m && m.url ? `${m.url} ${m.admit ?? ""} ${m.session}` : null;
+  // The stream is the borrow's, not the token's: a renewed token is used by the next open,
+  // and never reopens a stream that runs.
+  const mirrorKey = m && m.url && mirrorGl === "ready" ? `${m.url} ${m.session}` : null;
+  const admitRef = useRef<string>("");
+  admitRef.current = m?.admit ?? "";
+  const joinedFor = useRef<string | null>(null);
   const [retry, setRetry] = useState(0);
   useEffect(() => {
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    onMirror.current = (x) => {
+      if (x.type === "ready") setMirrorGl("ready");
+      else if (x.type === "unavailable") setMirrorGl("unavailable");
+      else if (mirrorKey === null) return;
+      else if (x.type === "stats") setMirrorStats(x);
+      else if (x.type === "joined") {
+        setMirrorNote(null);
+        // Until the join snapshot lands the mirror starts with the app: restart it into the copy,
+        // once per borrow and stream.
+        if (joinedFor.current !== `${mirrorKey} ${retry}`) {
+          joinedFor.current = `${mirrorKey} ${retry}`;
+          client.act("phone_action", { action: "restart_app", claim: m!.session });
+        }
+      } else if (x.type === "closed") {
+        setMirrorNote(x.reason ? `closed: ${x.reason}` : "closed");
+        // one rejoin every 10 s at most
+        retryTimer ??= setTimeout(() => setRetry((r) => r + 1), 10_000);
+      }
+    };
     const w = mirrorWorker.current;
     if (!w) return;
     if (mirrorKey === null || !m) {
@@ -402,25 +456,8 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
       return;
     }
     setMirrorNote("joining");
-    let retryTimer: ReturnType<typeof setTimeout> | null = null;
-    w.onmessage = (e: MessageEvent<MirrorOut>) => {
-      const x = e.data;
-      if (x.type === "stats") setMirrorStats(x);
-      else if (x.type === "joined") {
-        setMirrorNote(null);
-        // Until the join snapshot lands the mirror starts with the app: restart it into the copy,
-        // once per borrow and stream.
-        if (joinedFor.current !== mirrorKey + retry) {
-          joinedFor.current = mirrorKey + retry;
-          client.act("phone_action", { action: "restart_app", claim: m.session });
-        }
-      } else if (x.type === "closed") {
-        setMirrorNote(x.reason ? `closed: ${x.reason}` : "closed");
-        // one rejoin every 10 s at most
-        retryTimer = setTimeout(() => setRetry((r) => r + 1), 10_000);
-      }
-    };
-    w.postMessage({ type: "open", url: m.url!, admit: m.admit ?? "" } satisfies MirrorIn);
+    // without a direct token (a fleet with no admission keys) the streamer refuses the mirror, and the page says why
+    w.postMessage({ type: "open", url: m.url!, admit: admitRef.current } satisfies MirrorIn);
     return () => {
       if (retryTimer) clearTimeout(retryTimer);
     };
@@ -548,15 +585,7 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
           ) : null,
         )}
       </div>
-      <canvas
-        ref={mirrorCanvasRef}
-        className="phone-mirror"
-        width={720}
-        height={1280}
-        aria-label="The GPU mirror: this phone drawn by your browser from its GL commands"
-        data-testid="phone-mirror"
-        style={m ? { position: "fixed", ...at(m.box) } : { display: "none" }}
-      />
+      <div ref={mirrorHostRef} className="phone-mirror" data-testid="phone-mirror" style={m ? { position: "fixed", ...at(m.box) } : { display: "none" }} />
       {view.panel ? (
         <PanelView panel={view.panel} narrow={narrow} top={sheetTop} client={client} slot={openedSlot} onBack={close} backRef={backRef} onView={setTakeover} />
       ) : null}

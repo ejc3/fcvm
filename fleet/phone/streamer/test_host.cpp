@@ -238,6 +238,15 @@ int main() {
     CHECK(!mirror_admits(a.keys, "v-4", tok, 999), "another viewer's token does not");
     CHECK(!mirror_admits(a.keys, "", tok, 999), "nobody holds the phone: no mirror");
     CHECK(!mirror_admits({}, "v-3", tok, 999), "no keys: no mirror, unlike /frames");
+    // A fleet with no broadcast sends no admit_keys (every /frames stream is open) but still
+    // sends the mirror its own keys.
+    PhoneScene open_fleet = parsed("{\"epoch_unix_ms\":1000,\"mirror_keys\":[\"" + key + "\"],\"mirror_viewer\":\"v-3\"}");
+    AdmitKeys frames, mk;
+    frames.on_scene(open_fleet);
+    mk.on_mirror_keys(open_fleet);
+    CHECK(frames.keys.empty() && frames.admits("", 999), "mirror_keys leave /frames open");
+    CHECK(mirror_admits(mk.keys, open_fleet.mirror_viewer, tok, 999), "and admit the holder to the mirror");
+    CHECK(!Json::parse(app_scene_line(open_fleet)).has("mirror_keys"), "the app is not sent them");
     CHECK(!mirror_admits(a.keys, "v-3", tok, 1001), "an expired token");
     std::string forged = tok;
     forged[forged.size() - 2] = forged[forged.size() - 2] == 'A' ? 'B' : 'A';

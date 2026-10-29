@@ -2130,7 +2130,11 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
         }],
         region: None,
     };
-    c.send(scene());
+    // the coordinator's scene with the mirror's keys, which the agent passes to phones
+    c.send(CoordMsg::Scene(SharedScene {
+        mirror_keys: vec!["ef".repeat(32)],
+        ..SharedScene::new(&Scene::new(1_000), 32.0 / 9.0)
+    }));
     c.send(phone(1, vec![]));
     c.until(&["phone-1"], "running", 1).await;
     let args = std::fs::read_to_string(f.dir.path().join("args-fleet-phone-1")).unwrap();
@@ -2170,6 +2174,11 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
     assert_eq!(
         body["mirror_viewer"], "v-7",
         "the phone's holder reaches its streamer, which opens the GPU mirror for that viewer only"
+    );
+    assert_eq!(
+        body["mirror_keys"],
+        serde_json::json!(["ef".repeat(32)]),
+        "and the keys its token is checked with"
     );
     assert!(
         f.budgets[1].lock().unwrap().is_empty(),

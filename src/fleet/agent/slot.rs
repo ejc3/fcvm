@@ -342,6 +342,7 @@ fn renderer_body(
             image_aspect: p.image_aspect,
             chrome: p.chrome.clone(),
             mirror_viewer: p.mirror_viewer.clone(),
+            mirror_keys: s.mirror_keys.clone(),
             ..s.for_renderer(r)
         });
     }

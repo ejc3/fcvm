@@ -4,6 +4,7 @@
 #pragma once
 #include <stdint.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <map>
 #include <memory>
@@ -115,5 +116,9 @@ class PhoneSource : public FrameSource {
   bool mirror_open_ = false;
   std::string mirror_error_;
   std::mutex mirror_mu_;  // one mirror stream at a time: the tap has one consumer
+  // Bumped (under mu_) by a scene naming another holder, or none: an open stream of the old
+  // holder sees it before queueing or sending anything more.
+  std::atomic<uint64_t> mirror_holder_gen_{0};
+  AdmitKeys mirror_admit_;  // under mu_: the keys the mirror's tokens are checked with
   const std::string boot_id_;
 };

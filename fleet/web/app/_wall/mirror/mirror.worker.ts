@@ -15,6 +15,12 @@ const post = (m: MirrorOut) => (self as unknown as DedicatedWorkerGlobalScope).p
 let gl: WebGL2RenderingContext | null = null;
 let mirror: GlMirror | null = null;
 let ws: WebSocket | null = null;
+/** Bumped by every open and close: a retired connection's late callbacks are ignored. */
+let generation = 0;
+/** Compressed bytes handed to the inflater and not yet taken out of it, at most MAX_PENDING_BYTES. */
+let pendingBytes = 0;
+/** A viewer that receives faster than it replays drops the stream past this, and joins again. */
+const MAX_PENDING_BYTES = 16 << 20;
 let reader = new RecordReader();
 let inflate: WritableStreamDefaultWriter<Uint8Array> | null = null;
 const wire = new RateMeter();
@@ -71,7 +77,18 @@ function feed(bytes: Uint8Array): void {
       post({ type: "joined" });
     }
     mirror?.feed(r);
+    // the phone's ring filled: the copy stopped and the stream has a gap; join again
+    if (r.type === RECORD.overflow && ws) {
+      retire("the phone's copy of its commands overflowed: join again");
+      return;
+    }
   }
+}
+
+/** Ends the open connection (if any) as the worker's own decision, and says why. */
+function retire(reason: string): void {
+  close();
+  post({ type: "closed", code: 4000, reason });
 }
 
 function stats(): void {
@@ -94,43 +111,66 @@ function stats(): void {
     open: ws !== null && ws.readyState === WebSocket.OPEN,
     pixel,
     stamp: stampAt,
+    width: gl?.drawingBufferWidth ?? 0,
+    height: gl?.drawingBufferHeight ?? 0,
   });
 }
 
 function close(): void {
+  generation++;
   if (ws) {
     ws.onclose = null;
+    ws.onmessage = null;
+    ws.onopen = null;
     ws.close();
     ws = null;
   }
-  void inflate?.close().catch(() => {});
+  void inflate?.abort().catch(() => {});
   inflate = null;
+  pendingBytes = 0;
 }
 
 function open(url: string, admit: string): void {
   close();
   fresh();
+  const gen = generation;
   // one raw deflate stream for the connection: each message is flushed to a byte boundary
   const ds = new DecompressionStream("deflate-raw");
-  inflate = ds.writable.getWriter() as WritableStreamDefaultWriter<Uint8Array>;
+  const writer = ds.writable.getWriter() as WritableStreamDefaultWriter<Uint8Array>;
+  inflate = writer;
   void (async () => {
     const r = ds.readable.getReader();
     for (;;) {
       const { value, done } = await r.read();
-      if (done) break;
+      if (done || gen !== generation) break;
       feed(value);
     }
-  })().catch((e: unknown) => post({ type: "closed", code: 0, reason: `inflate: ${String(e)}` }));
+  })().catch((e: unknown) => {
+    // a retired connection's inflater fails as it is aborted: not this connection's news
+    if (gen === generation) retire(`inflate: ${String(e)}`);
+  });
   const s = new WebSocket(url);
   s.binaryType = "arraybuffer";
   ws = s;
   s.onopen = () => s.send(admitMessage(admit));
   s.onmessage = (e) => {
-    if (!(e.data instanceof ArrayBuffer)) return;
+    if (gen !== generation || !(e.data instanceof ArrayBuffer)) return;
     wire.add(now(), e.data.byteLength);
-    void inflate?.write(new Uint8Array(e.data));
+    const n = e.data.byteLength;
+    if (pendingBytes + n > MAX_PENDING_BYTES) {
+      retire("the mirror fell behind in this browser: join again");
+      return;
+    }
+    pendingBytes += n;
+    writer.write(new Uint8Array(e.data)).then(
+      () => {
+        if (gen === generation) pendingBytes -= n;
+      },
+      () => {},
+    );
   };
   s.onclose = (e) => {
+    if (gen !== generation) return;
     ws = null;
     post({ type: "closed", code: e.code, reason: e.reason });
   };
@@ -140,7 +180,7 @@ self.onmessage = (e: MessageEvent<MirrorIn>) => {
   const m = e.data;
   if (m.type === "canvas") {
     gl = m.canvas.getContext("webgl2", { antialias: false, alpha: false, preserveDrawingBuffer: true }) as WebGL2RenderingContext | null;
-    if (!gl) post({ type: "closed", code: 0, reason: "this browser has no WebGL2" });
+    post(gl ? { type: "ready" } : { type: "unavailable", reason: "this browser has no WebGL2" });
     timer ??= setInterval(stats, 500);
   } else if (m.type === "open") {
     if (gl) open(m.url, m.admit);

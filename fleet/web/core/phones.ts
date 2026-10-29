@@ -425,7 +425,9 @@ export type PhoneBorrowView =
       countdown: string;
       actions: { name: string; label: string; disabled: boolean }[];
       giveBack: string;
-      views: { name: TakeoverView; label: string; pressed: boolean }[];
+      views: { name: TakeoverView; label: string; pressed: boolean; disabled: boolean }[];
+      /** Why only the video can be shown here, when that is so. */
+      viewsNote: string | null;
       readouts: ReadoutRow[];
     }
   | { kind: "lent"; text: string };
@@ -489,6 +491,10 @@ export interface PhonesInput {
   /** How this viewer sees the phone it holds. */
   takeover?: TakeoverView;
   readouts?: { video: StreamReadout | null; mirror: StreamReadout | null };
+  /** The mirror's picture size, for the phone shown by the mirror alone (a turned phone). */
+  mirrorShape?: { id: string; w: number; h: number } | null;
+  /** Why this browser cannot show the mirror (no WebGL2), or null. */
+  mirrorUnavailable?: string | null;
 }
 
 /** Where the GPU mirror draws, and the stream it draws: for the phone this viewer holds and has opened. */
@@ -579,6 +585,8 @@ export function phonesView(inp: PhonesInput): PhonesView {
     const fs = s.frames?.tiles[`d:${t.id}`];
     if (fs && fs.width > 0 && fs.height > 0 && fs.newestT !== null) aspects[t.id] = Math.round((fs.width / fs.height) * 1000) / 1000;
   }
+  const ms = inp.mirrorShape;
+  if (ms && ms.w > 0 && ms.h > 0) aspects[ms.id] = Math.round((ms.w / ms.h) * 1000) / 1000;
   // The phone this viewer holds, opened with the GPU mirror in view: side by side with its video
   // ("both"), or in the video's place ("mirror").
   const takeover = inp.takeover ?? "video";
@@ -639,7 +647,10 @@ export function phonesView(inp: PhonesInput): PhonesView {
     zoom,
     layout,
     cards,
-    panel: openTile === null ? null : panelOf(s, phones, openTile, srvNow, online, takeover, inp.readouts ?? { video: null, mirror: null }),
+    panel:
+      openTile === null
+        ? null
+        : panelOf(s, phones, openTile, srvNow, online, takeover, inp.readouts ?? { video: null, mirror: null }, inp.mirrorUnavailable ?? null),
     plan: layout
       ? phonesPlan({ state: s, phones, layout, dpr: inp.dpr, reducedMotion: inp.reducedMotion, noVideo: mirrorView === "mirror" ? heldTile!.id : null })
       : BLANK_PLAN(s, inp.dpr),
@@ -655,6 +666,7 @@ function panelOf(
   online: boolean,
   takeover: TakeoverView,
   readouts: { video: StreamReadout | null; mirror: StreamReadout | null },
+  mirrorUnavailable: string | null,
 ): PhonePanel {
   const lr = t.last_relaunch;
   const { steps, total } = lr ? timelineOf(lr.phases) : { steps: [], total: 0 };
@@ -673,7 +685,8 @@ function panelOf(
       countdown: `Back in ${left} s`,
       actions: phones.actions.map((name) => ({ name, label: ACTION_LABELS[name] ?? name.replace(/_/g, " "), disabled: !online || !running })),
       giveBack: "Give it back",
-      views: TAKEOVER_VIEWS.map((v) => ({ ...v, pressed: v.name === takeover })),
+      views: TAKEOVER_VIEWS.map((v) => ({ ...v, pressed: v.name === takeover, disabled: mirrorUnavailable !== null && v.name !== "video" })),
+      viewsNote: mirrorUnavailable,
       readouts: readoutRows(takeover, readouts.video, readouts.mirror),
     };
   } else if (b !== null) {
