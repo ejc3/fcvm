@@ -134,16 +134,23 @@ stopped "$D" && ok "the emulator of a phone whose app did not start is stopped" 
 # records what it is sent); switch_screen and dark_mode toggle; any other name is refused.
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
 python3 -c '
-import socket, sys
+import os, socket, sys
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(16)
 with open(sys.argv[2], "a") as log:
     while True:
         c, _ = s.accept(); f = c.makefile("rw")
         for line in f:
-            log.write(line); log.flush(); f.write("{\"ok\": true}\n"); f.flush()
+            log.write(line); log.flush()
+            # a reply the test set ($dir/reply, used once), else ok
+            try:
+                with open(sys.argv[3]) as r: reply = r.read()
+                os.remove(sys.argv[3])
+            except FileNotFoundError:
+                reply = "{\"ok\": true}\n"
+            f.write(reply); f.flush()
         c.close()
-' "$port" "$dir/ctl.log" &
+' "$port" "$dir/ctl.log" "$dir/reply" &
 ctl=$!
 for _ in $(seq 1 50); do (exec 3<> "/dev/tcp/127.0.0.1/$port") 2> /dev/null && break; sleep 0.1; done
 act() { PHONE_CTL_PORT=$port PHONE_RUN="$dir" "$phone" action "$1" > /dev/null 2> "$dir/act.err"; }
@@ -167,5 +174,14 @@ for a in reboot_phone shell "rotate; id" ""; do
   if act "$a"; then bad "action '$a' was accepted"; else rc=$?; [ "$rc" = 2 ] && ok "action '$a' is refused" || bad "action '$a' exited $rc"; fi
 done
 [ "$(wc -l < "$dir/ctl.log")" = 12 ] && ok "a refused action sends the app nothing" || bad "a refused action reached the app"
+# A reply that is not a JSON object without "error" fails the action, and a refused toggle
+# leaves the cached state as it was, so the next one asks for the same change again.
+printf 'not json\n' > "$dir/reply"
+if act rotate; then bad "an action the app answered with 'not json' succeeded"; else ok "an action whose reply is not JSON fails"; fi
+printf '{"error":"the app is not on screen"}\n' > "$dir/reply"
+if act switch_screen; then bad "a refused switch_screen succeeded"; else ok "a refused toggle fails"; fi
+act switch_screen || bad "switch_screen failed: $(cat "$dir/act.err")"
+[ "$(tail -2 "$dir/ctl.log")" = '{"type":"action","name":"info"}
+{"type":"action","name":"info"}' ] && ok "a refused toggle is asked for again, not undone" || bad "after a refused switch_screen the app was sent: $(tail -2 "$dir/ctl.log")"
 kill "$ctl" 2> /dev/null || true
 exit $fail

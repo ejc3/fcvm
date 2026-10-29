@@ -956,7 +956,9 @@ none is placed). For each slot the agent reconciles:
   GPU, so every phone restores from one pre-start snapshot, and the AMI's warm snapshot is
   taken of a phone launched this way. Its scene is the shared scene with `rect`, its
   rectangle of the phones' image, and `image_aspect`; it gets no budget; its first frame is
-  the streamer's first stamped scene frame (`phone.scene_frames`). Each action of the
+  the streamer's first frame of the app, a stamped scene frame or, zoomed out, a frame of its
+  screen (`phone.scene_frames` plus `phone.screen_frames`; the streamer sends nothing before
+  the app renders on the GPU). Each action of the
   running launch with a `seq` above the last carried out is carried out once, in order
   (`fcvm exec --pid <vm> -- /usr/local/bin/phone.sh action <name>`); `reboot_phone` never
   appears (the coordinator relaunches the phone). The aggregator's layout leaves phones out.

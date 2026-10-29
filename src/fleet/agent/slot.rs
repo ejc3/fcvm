@@ -291,8 +291,10 @@ pub fn has_frame(health: &serde_json::Value, baseline: Option<u64>) -> bool {
     has_frame_of(health, baseline, false)
 }
 
-/// `has_frame` for a renderer or, with `phone`, a phone streamer, whose first frame is its
-/// first frame of the app's stamped scene (`phone.scene_frames`), not a boot screen.
+/// `has_frame` for a renderer or, with `phone`, a phone streamer, whose frames are the app's
+/// stamped scene (`phone.scene_frames`) and, while the phones are zoomed out or the phone is
+/// taken over, its screen with the app's bars (`phone.screen_frames`). Either is the app: the
+/// streamer sends nothing until the app renders on the VM's GPU, so a boot screen is never one.
 pub fn has_frame_of(health: &serde_json::Value, baseline: Option<u64>, phone: bool) -> bool {
     if health.get("ready").and_then(|r| r.as_bool()) == Some(false) {
         return false;
@@ -306,9 +308,16 @@ pub fn has_frame_of(health: &serde_json::Value, baseline: Option<u64>, phone: bo
 
 fn frame_counter_of(health: &serde_json::Value, phone: bool) -> Option<u64> {
     if phone {
-        health
+        let scene = health
             .pointer("/phone/scene_frames")
-            .and_then(|f| f.as_u64())
+            .and_then(|f| f.as_u64());
+        let screen = health
+            .pointer("/phone/screen_frames")
+            .and_then(|f| f.as_u64());
+        match (scene, screen) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+        }
     } else {
         health.get("frame").and_then(|f| f.as_u64())
     }
@@ -900,6 +909,20 @@ mod tests {
         assert!(has_frame(&json!({"fps": 30, "t": 12.5}), None));
         assert!(!has_frame(&json!({"fps": 0, "t": null}), None));
         assert!(!has_frame(&json!({"fps": 0}), None));
+    }
+
+    #[test]
+    fn a_phone_zoomed_out_at_its_start_has_a_frame_from_its_screen() {
+        use serde_json::json;
+        // Zoomed out, the app shows its bars over the stamp: only screen frames move.
+        let h = json!({"ready": true, "t": 3.0, "frame": 90, "phone": {"scene_frames": 0, "screen_frames": 12}});
+        assert!(has_frame_of(&h, Some(0), true));
+        let h = json!({"ready": true, "phone": {"scene_frames": 4, "screen_frames": 0}});
+        assert!(has_frame_of(&h, Some(0), true));
+        let h = json!({"ready": true, "phone": {"scene_frames": 0, "screen_frames": 0}});
+        assert!(!has_frame_of(&h, Some(0), true));
+        let h = json!({"ready": false, "phone": {"scene_frames": 0, "screen_frames": 12}});
+        assert!(!has_frame_of(&h, Some(0), true));
     }
 
     #[test]
