@@ -5,6 +5,7 @@ import contextlib
 import fnmatch
 import io
 import copy
+import errno
 import json
 import os
 import socket
@@ -269,7 +270,7 @@ class FailureTests(unittest.TestCase):
 
     def test_an_os_error_prints_its_errno_name_and_foreign_text_prints_nothing(self):
         def reset():
-            raise ConnectionResetError(104, "Connection reset by peer from 192.0.2.7")
+            raise ConnectionResetError(errno.ECONNRESET, "Connection reset by peer from 192.0.2.7")
         self.assertEqual(self.failed(reset)["error"], "ECONNRESET")
         def foreign():
             raise RuntimeError("wss://secret-host.example/frames?token=abc")
