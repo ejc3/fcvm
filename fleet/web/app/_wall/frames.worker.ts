@@ -1032,6 +1032,7 @@ function report(): void {
       behind: show?.kind === "behind",
       decodeMs: s.decodeMs.length > 0 ? pct(s.decodeMs, 0.5) : null,
       lag: s.log.summary(),
+      bytes: s.bytes,
     };
   }
   const stats: FrameStats = {

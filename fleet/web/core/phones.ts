@@ -14,7 +14,8 @@ import {
 } from "./layout.ts";
 import { streamBitrate } from "./bandwidth.ts";
 import * as fmt from "./format.ts";
-import { frameSocketUrl, streamUrl } from "./net.ts";
+import { frameSocketUrl, mirrorSocketUrl, streamUrl } from "./net.ts";
+import { megabytes, mbits } from "./meter.ts";
 import { sameViewer, type Phones, type Tile } from "./protocol.ts";
 import { serverNow } from "./clock.ts";
 import type { ClientState, Notice } from "./store.ts";
@@ -305,6 +306,8 @@ export interface PhonesPlanInput {
   layout: PhoneLayout;
   dpr: number;
   reducedMotion: boolean;
+  /** A phone whose video this viewer does not receive (its holder chose the GPU mirror alone). */
+  noVideo?: string | null;
 }
 
 /**
@@ -323,7 +326,7 @@ export function phonesPlan(inp: PhonesPlanInput): DrawPlan {
   for (const t of phones.tiles) {
     const box = boxOf.get(t.id) ?? null;
     const base = streamUrl(t, family);
-    if (box === null || base === null || !isLive(t)) continue;
+    if (box === null || base === null || !isLive(t) || t.id === inp.noVideo) continue;
     const height = streamHeightFor(box.h * dpr, box.w / box.h);
     bps += streamBitrate(t.rect, phones.image_aspect, height);
     direct.push({ id: `d:${t.id}`, url: frameSocketUrl(base, height, "std"), baseUrl: base, height, box, admit });
@@ -378,10 +381,76 @@ export interface PhoneCard {
   lent: boolean;
 }
 
+/**
+ * How the viewer holding a phone sees it (docs/fleet/ARCHITECTURE.md, "The GPU mirror"): the
+ * phone's video, the GPU mirror (the phone's GL commands drawn by this browser's WebGL2, while
+ * the phone's GPU answers every call), or both side by side. With the mirror alone the page
+ * does not receive the phone's video.
+ */
+export type TakeoverView = "video" | "mirror" | "both";
+export const TAKEOVER_VIEWS: readonly { name: TakeoverView; label: string }[] = [
+  { name: "video", label: "Video" },
+  { name: "mirror", label: "GPU mirror" },
+  { name: "both", label: "Both" },
+];
+
+/** One stream's cost and pace as the panel prints it (core/meter.ts measures them). */
+export interface StreamReadout {
+  /** Wire bytes per second over the last second. */
+  bps: number;
+  /** Wire bytes since the take-over. */
+  total: number;
+  fps: number;
+  /** The mirror's: blocking calls per second the phone's GPU answered. */
+  repliesPerSec?: number;
+  /** Why the stream is not drawing, when it is not. */
+  note?: string | null;
+}
+
+export interface ReadoutRow {
+  name: string;
+  label: string;
+  value: string;
+  /** The round trips the phone's GPU answered: what it saves the phone. */
+  detail: string | null;
+}
+
 export type PhoneBorrowView =
   | { kind: "free"; button: { label: string; disabled: boolean }; note: string }
-  | { kind: "yours"; session: string; countdown: string; actions: { name: string; label: string; disabled: boolean }[]; giveBack: string }
+  | {
+      kind: "yours";
+      session: string;
+      countdown: string;
+      actions: { name: string; label: string; disabled: boolean }[];
+      giveBack: string;
+      views: { name: TakeoverView; label: string; pressed: boolean }[];
+      readouts: ReadoutRow[];
+    }
   | { kind: "lent"; text: string };
+
+/** The readout of one stream: "1.42 Mbit/s · 12.3 MB · 30 fps". */
+export function readoutValue(r: StreamReadout | null): string {
+  if (r === null) return "off";
+  if (r.note) return r.note;
+  return `${mbits(r.bps)} Mbit/s · ${megabytes(r.total)} · ${Math.round(r.fps)} fps`;
+}
+
+/** The streams a holder receives in a view, with their readouts. */
+export function readoutRows(view: TakeoverView, video: StreamReadout | null, mirror: StreamReadout | null): ReadoutRow[] {
+  const rows: ReadoutRow[] = [];
+  if (view !== "mirror") rows.push({ name: "video", label: "Video", value: readoutValue(video), detail: null });
+  if (view !== "video")
+    rows.push({
+      name: "mirror",
+      label: "GPU mirror",
+      value: readoutValue(mirror),
+      detail:
+        mirror && !mirror.note && mirror.repliesPerSec !== undefined
+          ? `${Math.round(mirror.repliesPerSec)} blocking calls a second answered by the phone's GPU, none sent to this browser`
+          : null,
+    });
+  return rows;
+}
 
 export interface PhonePanel {
   id: string;
@@ -412,6 +481,19 @@ export interface PhonesInput {
   /** The phone this viewer has opened. */
   openId: string | null;
   canDecode: boolean;
+  /** How this viewer sees the phone it holds. */
+  takeover?: TakeoverView;
+  readouts?: { video: StreamReadout | null; mirror: StreamReadout | null };
+}
+
+/** Where the GPU mirror draws, and the stream it draws: for the phone this viewer holds and has opened. */
+export interface MirrorPlacement {
+  tileId: string;
+  box: Box;
+  url: string | null;
+  admit: string | null;
+  /** The holder's session, for the app restart that joins the mirror. */
+  session: string;
 }
 
 export interface PhonesView {
@@ -429,6 +511,7 @@ export interface PhonesView {
   /** A refusal the viewer should read. */
   notice: string | null;
   plan: DrawPlan;
+  mirror: MirrorPlacement | null;
 }
 
 const BLANK_PLAN = (s: ClientState, dpr: number): DrawPlan => ({
@@ -480,6 +563,7 @@ export function phonesView(inp: PhonesInput): PhonesView {
       cards: [],
       panel: null,
       plan: BLANK_PLAN(s, inp.dpr),
+      mirror: null,
     };
   }
   const open = inp.openId !== null && phones.tiles.some((t) => t.id === inp.openId) ? inp.openId : null;
@@ -490,9 +574,16 @@ export function phonesView(inp: PhonesInput): PhonesView {
     const fs = s.frames?.tiles[`d:${t.id}`];
     if (fs && fs.width > 0 && fs.height > 0 && fs.newestT !== null) aspects[t.id] = Math.round((fs.width / fs.height) * 1000) / 1000;
   }
+  // The phone this viewer holds, opened with the GPU mirror in view: side by side with its video
+  // ("both"), or in the video's place ("mirror").
+  const takeover = inp.takeover ?? "video";
+  const heldTile = open === null ? null : (phones.tiles.find((t) => t.id === open && t.borrowed !== null && sameViewer(t.borrowed.viewer ?? null, s.you)) ?? null);
+  const mirrorView = heldTile !== null && heldTile.borrowed?.session !== undefined && takeover !== "video" ? takeover : null;
+  const opened = open !== null && stage ? openedArea(stage, inp.narrow) : null;
+  const split = mirrorView === "both" && opened !== null;
   const layout = stage
     ? layoutPhones({
-        area: open !== null ? openedArea(stage, inp.narrow) : stage,
+        area: opened !== null ? (split ? { ...opened, w: Math.floor(opened.w / 2) } : opened) : stage,
         imageAspect: phones.image_aspect,
         tiles: phones.tiles,
         progress: inp.progress,
@@ -524,6 +615,18 @@ export function phonesView(inp: PhonesInput): PhonesView {
     };
   });
   const openTile = open === null ? null : phones.tiles.find((t) => t.id === open)!;
+  let mirror: MirrorPlacement | null = null;
+  const heldBox = heldTile ? placed.get(heldTile.id)?.box : undefined;
+  if (mirrorView !== null && heldTile !== null && heldBox && opened !== null) {
+    const base = streamUrl(heldTile, s.net.family);
+    mirror = {
+      tileId: heldTile.id,
+      box: split ? { ...heldBox, x: heldBox.x + Math.floor(opened.w / 2) } : heldBox,
+      url: base === null ? null : mirrorSocketUrl(base),
+      admit: s.admission?.direct?.value ?? null,
+      session: heldTile.borrowed!.session!,
+    };
+  }
   return {
     ...common,
     empty: null,
@@ -531,12 +634,23 @@ export function phonesView(inp: PhonesInput): PhonesView {
     zoom,
     layout,
     cards,
-    panel: openTile === null ? null : panelOf(s, phones, openTile, srvNow, online),
-    plan: layout ? phonesPlan({ state: s, phones, layout, dpr: inp.dpr, reducedMotion: inp.reducedMotion }) : BLANK_PLAN(s, inp.dpr),
+    panel: openTile === null ? null : panelOf(s, phones, openTile, srvNow, online, takeover, inp.readouts ?? { video: null, mirror: null }),
+    plan: layout
+      ? phonesPlan({ state: s, phones, layout, dpr: inp.dpr, reducedMotion: inp.reducedMotion, noVideo: mirrorView === "mirror" ? heldTile!.id : null })
+      : BLANK_PLAN(s, inp.dpr),
+    mirror,
   };
 }
 
-function panelOf(s: ClientState, phones: Phones, t: Tile, srvNow: number, online: boolean): PhonePanel {
+function panelOf(
+  s: ClientState,
+  phones: Phones,
+  t: Tile,
+  srvNow: number,
+  online: boolean,
+  takeover: TakeoverView,
+  readouts: { video: StreamReadout | null; mirror: StreamReadout | null },
+): PhonePanel {
   const lr = t.last_relaunch;
   const { steps, total } = lr ? timelineOf(lr.phases) : { steps: [], total: 0 };
   const running = t.phase === "running";
@@ -554,6 +668,8 @@ function panelOf(s: ClientState, phones: Phones, t: Tile, srvNow: number, online
       countdown: `Back in ${left} s`,
       actions: phones.actions.map((name) => ({ name, label: ACTION_LABELS[name] ?? name.replace(/_/g, " "), disabled: !online || !running })),
       giveBack: "Give it back",
+      views: TAKEOVER_VIEWS.map((v) => ({ ...v, pressed: v.name === takeover })),
+      readouts: readoutRows(takeover, readouts.video, readouts.mirror),
     };
   } else if (b !== null) {
     borrow = { kind: "lent", text: `Borrowed by another viewer until ${fmt.utcClock(b.until)} UTC` };

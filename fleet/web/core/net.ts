@@ -14,6 +14,12 @@ export function frameSocketUrl(frameUrl: string, height: number, quality: "hi" |
   return `${base}?${kept.join("&")}`;
 }
 
+/** The GPU mirror's socket on a phone streamer (fleet/PROTOCOL.md, "Phone streamer", GET /mirror). */
+export function mirrorSocketUrl(frameUrl: string): string {
+  const base = frameUrl.split("?", 1)[0]!;
+  return base.replace(/\/frames$/, "") + "/mirror";
+}
+
 /**
  * A frame socket's first message when the page holds a direct token (PROTOCOL.md, "Access"):
  * the renderer checks it before it streams. It is never in the URL, which proxies and access
