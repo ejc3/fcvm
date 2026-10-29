@@ -2143,9 +2143,12 @@ the clone's GPU.
   (no keys, nobody holds the phone, another viewer's token, an expired one). It relays the
   emulator's command-stream tap (gfxstream `host/mirror_tap.h`, on the container's Unix
   socket `MIRROR_SOCKET`, `/tmp/gfxstream-mirror.sock`): every render channel's guest-to-host
-  bytes and the first 4096 bytes of every reply, as the tap's records, in binary messages of one raw
-  deflate stream (each message ends at a `Z_SYNC_FLUSH`, so `DecompressionStream("deflate-raw")`
-  gives back every byte so far). The page never answers; the phone's GPU answers every call.
+  bytes and the first 4096 bytes of every reply, as the tap's records, in binary messages of one
+  zstd stream (level 3, a window of at most 1 MiB; each message ends at a `ZSTD_e_flush`, so a
+  streaming decoder gives back every byte so far). The page decodes it with zstd's own decoder
+  built for WebAssembly and refuses a larger window; a stream whose first bytes are not zstd's
+  magic number is raw deflate from a phone image built before this, read with
+  `DecompressionStream("deflate-raw")`. The page never answers; the phone's GPU answers every call.
   It closes with 1000 when the scene names another holder or none, 1011 when the tap cannot
   be reached or ends, and 1013 when the viewer falls 8 MiB behind ("join again") or a mirror
   is already open (the tap has one consumer).
@@ -2166,7 +2169,7 @@ the clone's GPU.
 
 and `mirror`: `{"open": false, "opened": 3, "behind": 0, "tap_bytes": 51234567, "wire_bytes": 9876543,
 "error": null}`, the streams opened, the ones closed for falling behind, the tap's bytes and the
-deflated bytes sent, and the tap's last failure.
+compressed bytes sent, and the tap's last failure.
 
 `draw_to_capture_ms` is the time a screen image reached the streamer minus the scene time of
 the frame number the stamp names; `capture_to_sent_ms` is from then to the frame queued on
