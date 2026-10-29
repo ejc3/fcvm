@@ -154,9 +154,13 @@ bool PhoneSource::mirror_admits(const std::string& token) {
 void PhoneSource::mirror(Conn& c, const std::string& token) {
   const std::string viewer = admit_token_viewer(token);
   uint64_t holder_gen;
+  bool still_holder;
   {
+    // the holder may have changed since the token was checked: check again, with the
+    // generation, under one lock
     std::lock_guard<std::mutex> l(mu_);
     holder_gen = mirror_holder_gen_;
+    still_holder = !viewer.empty() && scene_.mirror_viewer == viewer;
   }
   // Still this stream's holder: checked before each message is queued and before each is sent.
   auto holds = [&] { return mirror_holder_gen_.load() == holder_gen; };
@@ -174,6 +178,7 @@ void PhoneSource::mirror(Conn& c, const std::string& token) {
   };
   // The tap has one consumer: a second stream waits for the first to end, which it does once
   // its viewer no longer holds the phone or goes away.
+  if (!still_holder) return close_with(1008, "the token of the viewer holding this phone is required");
   std::unique_lock<std::mutex> one(mirror_mu_, std::try_to_lock);
   if (!one.owns_lock()) return close_with(1013, "the mirror is open in another window");
   int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);

@@ -94,6 +94,7 @@ function PanelView({
   onBack,
   backRef,
   onView,
+  onAction,
 }: {
   panel: PhonePanel;
   narrow: boolean;
@@ -103,6 +104,7 @@ function PanelView({
   onBack: () => void;
   backRef: React.RefObject<HTMLButtonElement | null>;
   onView: (v: TakeoverView) => void;
+  onAction: (action: string, claim: string) => void;
 }) {
   const b = panel.borrow;
   return (
@@ -168,7 +170,7 @@ function PanelView({
               </dl>
               <div className="actions-grid" role="group" aria-label="Actions">
                 {b.actions.map((a) => (
-                  <button key={a.name} type="button" className="btn" disabled={a.disabled} onClick={() => client.act("phone_action", { action: a.name, claim: b.session })} data-testid={`phone-action-${a.name}`}>
+                  <button key={a.name} type="button" className="btn" disabled={a.disabled} onClick={() => onAction(a.name, b.session)} data-testid={`phone-action-${a.name}`}>
                     {a.label}
                   </button>
                 ))}
@@ -427,6 +429,20 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
   admitRef.current = m?.admit ?? "";
   const joinedFor = useRef<string | null>(null);
   const [retry, setRetry] = useState(0);
+  // The coordinator takes one action a second from a phone's holder: the page spaces its own,
+  // so the restart that joins the mirror is not refused after a click or a quick reopen.
+  const nextActionAt = useRef(0);
+  const actPhone = useMemo(
+    () => (action: string, claim: string) => {
+      const t = localNow();
+      const at = Math.max(t, nextActionAt.current);
+      nextActionAt.current = at + 1100;
+      const send = () => client.act("phone_action", { action, claim });
+      if (at > t) setTimeout(send, at - t);
+      else send();
+    },
+    [client],
+  );
   useEffect(() => {
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     onMirror.current = (x) => {
@@ -440,7 +456,7 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
         // once per borrow and stream.
         if (joinedFor.current !== `${mirrorKey} ${retry}`) {
           joinedFor.current = `${mirrorKey} ${retry}`;
-          client.act("phone_action", { action: "restart_app", claim: m!.session });
+          actPhone("restart_app", m!.session);
         }
       } else if (x.type === "closed") {
         setMirrorNote(x.reason ? `closed: ${x.reason}` : "closed");
@@ -453,6 +469,8 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
     if (mirrorKey === null || !m) {
       w.postMessage({ type: "close" } satisfies MirrorIn);
       setMirrorStats(null);
+      // a stream opened again starts a fresh replay, which joins with the app's next start
+      joinedFor.current = null;
       return;
     }
     setMirrorNote("joining");
@@ -463,7 +481,7 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
     };
     // m is read through mirrorKey
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mirrorKey, retry, client]);
+  }, [mirrorKey, retry, client, actPhone]);
 
   // The frame worker gets the canvas once, then plans.
   useEffect(() => {
@@ -587,7 +605,7 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
       </div>
       <div ref={mirrorHostRef} className="phone-mirror" data-testid="phone-mirror" style={m ? { position: "fixed", ...at(m.box) } : { display: "none" }} />
       {view.panel ? (
-        <PanelView panel={view.panel} narrow={narrow} top={sheetTop} client={client} slot={openedSlot} onBack={close} backRef={backRef} onView={setTakeover} />
+        <PanelView panel={view.panel} narrow={narrow} top={sheetTop} client={client} slot={openedSlot} onBack={close} backRef={backRef} onView={setTakeover} onAction={actPhone} />
       ) : null}
       {needsVerifyPrompt ? (
         <div className="verify-pop" role="dialog" aria-label={view.verify.title}>

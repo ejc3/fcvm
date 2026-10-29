@@ -210,6 +210,12 @@ test("a phone taken over shows its video, its GPU mirror or both, each with its 
   expect(v.mirror!.box.x).toBeGreaterThanOrEqual(video.x + video.w);
   expect(v.mirror!.box.w).toBe(video.w);
 
+  // Video, then the mirror again: a fresh replay, so the app is restarted into it again
+  await page.getByTestId("phone-view-video").click();
+  await expect(page.getByTestId("phone-mirror")).toBeHidden();
+  await page.getByTestId("phone-view-mirror").click();
+  await expect.poll(async () => (await phoneActions()).map((a) => a.action), { timeout: 15_000 }).toEqual(["restart_app", "restart_app"]);
+
   await page.getByTestId("phone-give-back").click();
   await expect(page.getByTestId("phone-mirror")).toBeHidden();
 });
