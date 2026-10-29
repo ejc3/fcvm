@@ -108,6 +108,25 @@ int main() {
                             "\"rect_from_frame\":300}");
     CHECK(phone_geometry(true, 10, W, H, nop).x0 == 720, "without previous_rect the rect holds throughout");
   }
+  {  // the app's whole-image fallback (SceneInput.viewAt): a turned phone, or no image_aspect
+    PhoneScene sc = parsed("{\"epoch_unix_ms\":1000,\"rect\":{\"x\":0.5,\"y\":0,\"w\":0.5,\"h\":1},\"image_aspect\":1.125}");
+    PhoneGeo g = phone_geometry(true, 10, H, W, sc);  // 1280x720: the phone turned
+    CHECK(g.full_w == 1280 && g.full_h == 720 && g.x0 == 0 && g.y0 == 0, "a turned phone is the whole image: %dx%d at %d,%d",
+          g.full_w, g.full_h, g.x0, g.y0);
+    PhoneScene noa = parsed("{\"epoch_unix_ms\":1000,\"rect\":{\"x\":0.5,\"y\":0,\"w\":0.5,\"h\":1}}");
+    g = phone_geometry(true, 10, W, H, noa);
+    CHECK(g.full_w == 720 && g.full_h == 1280 && g.x0 == 0, "no image_aspect: the whole image, %dx%d at %d", g.full_w, g.full_h,
+          g.x0);
+    g = phone_geometry(true, 10, W, H, sc);  // upright: the assigned rect
+    CHECK(g.full_w == 1440 && g.x0 == 720, "an upright phone keeps its rect: %d at %d", g.full_w, g.x0);
+  }
+  {  // the app's replies, read as JSON
+    CHECK(app_reply_error("{\"ok\":true}") == "", "an ok reply");
+    CHECK(app_reply_error("{\"ok\":true,\"last\":{\"error\":null}}") == "", "an ok reply with an \"error\" key below the top");
+    CHECK(app_reply_error("{\"error\":\"name: one of scene, info\"}") == "name: one of scene, info", "an error reply");
+    CHECK(app_reply_error("not json").find("not JSON") == 0, "a line that is not JSON");
+    CHECK(app_reply_error("[1]").find("not a JSON object") == 0, "a reply that is not an object");
+  }
   {  // scenes refused, each naming its field
     PhoneScene sc;
     std::string err;

@@ -102,6 +102,19 @@ std::string app_clock_line(double unix_ms) {
   return b;
 }
 
+std::string app_reply_error(const std::string& line) {
+  Json j;
+  try {
+    j = Json::parse(line);
+  } catch (const std::exception& e) {
+    return std::string("not JSON: ") + line.substr(0, 200);
+  }
+  if (j.type != Json::Object) return "not a JSON object: " + line.substr(0, 200);
+  if (!j.has("error")) return "";
+  const Json& e = j.at("error");
+  return e.type == Json::String ? e.str : line.substr(0, 300);
+}
+
 bool stamp_plausible(uint32_t k, double capture_unix_ms, const PhoneScene& sc) {
   if (!sc.set) return false;
   double t = (double)k / STAMP_FPS;
@@ -120,11 +133,19 @@ PhoneGeo phone_geometry(bool scene, uint32_t k, int screen_w, int screen_h, cons
     return g;
   }
   bool before = sc.rect_from_frame >= 0 && (long long)(k / 2) < sc.rect_from_frame;
-  const Rect4& r = before && sc.has_previous ? sc.previous : sc.rect;
+  Rect4 r = before && sc.has_previous ? sc.previous : sc.rect;
   g.crop_bottom = STAMP_ROWS;
   g.layout_generation = sc.layout_generation;
+  // The app's own choice (SceneInput.viewAt in fleet/phone-app): with no image_aspect, or a
+  // rect whose orientation is not the surface's (a turned phone), it draws the whole image
+  // at the surface's aspect.
+  double surface = (double)screen_w / screen_h;
+  double aspect = sc.image_aspect;
+  if (aspect <= 0 || ((r.w * aspect / r.h) > 1) != (surface > 1)) {
+    r = Rect4{0, 0, 1, 1};
+    aspect = surface;
+  }
   g.full_h = (int)lround(screen_h / r.h);
-  double aspect = sc.image_aspect > 0 ? sc.image_aspect : (double)screen_w / r.w / g.full_h;
   g.full_w = (int)lround(g.full_h * aspect);
   g.x0 = (int)lround(r.x * g.full_w);
   g.y0 = (int)lround(r.y * g.full_h);

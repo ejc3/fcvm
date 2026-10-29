@@ -33,6 +33,10 @@ bool phone_scene_parse(const std::string& body, PhoneScene* out, std::string* er
 std::string app_scene_line(const PhoneScene& s);
 // The app's `clock` request: the host's time now.
 std::string app_clock_line(double unix_ms);
+// What one reply line from the app's control socket says went wrong: "" for a JSON object
+// with no "error" member, the error's text for one with it, and a description of the line
+// for anything else (not JSON, not an object).
+std::string app_reply_error(const std::string& line);
 
 // A stamp read from a copy is the app's frame number only when it names a time near the
 // copy's: the stamp has no checksum, so an interface that happens to show 32 black or white

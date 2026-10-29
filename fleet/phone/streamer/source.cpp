@@ -187,7 +187,7 @@ void PhoneSource::app_link() {
     }
     // the replies: one line each; an error is kept for /health
     char buf[4096];
-    ssize_t n;
+    ssize_t n = -1;
     while (ok && (n = recv(fd, buf, sizeof buf, MSG_DONTWAIT)) != 0) {
       if (n < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) ok = false;
@@ -199,12 +199,16 @@ void PhoneSource::app_link() {
     while ((nl = inbox.find('\n')) != std::string::npos) {
       std::string line = inbox.substr(0, nl);
       inbox.erase(0, nl + 1);
-      if (line.find("\"error\"") != std::string::npos) {
-        fprintf(stderr, "phone-streamer: the app refused a request: %s\n", line.c_str());
+      std::string e = app_reply_error(line);
+      if (!e.empty()) {
+        fprintf(stderr, "phone-streamer: the app refused a request: %s\n", e.c_str());
         std::lock_guard<std::mutex> l(hmu_);
-        app_error_ = line.substr(0, 300);
+        app_error_ = e.substr(0, 300);
       }
     }
+    // a reply line is short: an app that sends this much without a newline is not speaking
+    // the protocol, and the link starts again
+    if (inbox.size() > 65536) ok = false;
     if (!ok || n == 0) {
       close(fd);
       fd = -1;
