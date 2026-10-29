@@ -17,6 +17,36 @@ const [vw, vh] = (process.env.FLEET_E2E_VIEW ?? "1024x640").split("x").map(Numbe
 const viewport = { width: vw, height: vh };
 process.env.FLEET_E2E_COORD_PORT = String(PORTS.coord);
 
+/** The mock fleet and the page, started for the tests. phones.config.ts adds phones to the mock. */
+export const mockServer = {
+  command: "node scripts/dev-mock.ts --prod",
+  url: `http://localhost:${PORTS.web}/`,
+  reuseExistingServer: false,
+  timeout: 60_000,
+  env: {
+    FLEET_WEB_PORT: String(PORTS.web),
+    FLEET_MOCK_COORD_PORT: String(PORTS.coord),
+    FLEET_MOCK_RENDER_PORT: String(PORTS.render),
+    FLEET_MOCK_FCVM_MS: "3000",
+    FLEET_MOCK_EC2_MS: "12000",
+    FLEET_MOCK_FCVM_GPUS: "8",
+    FLEET_MOCK_EC2_GPUS: "7",
+    FLEET_MOCK_GPUS_PER_HOST: "4",
+    // Races only when a test starts one; no cooldown or capacity wait unless a test asks.
+    FLEET_MOCK_RACE_EVERY_S: "0",
+    FLEET_MOCK_COOLDOWN_S: "0",
+    FLEET_MOCK_WAIT_PERCENT: "0",
+    FLEET_MOCK_BORROW_CAP: "1",
+    FLEET_MOCK_CLAIM_S: "8",
+    FLEET_MOCK_HOLD_S: "600",
+    // The fleet sleeps only when a test puts it to sleep; a wake takes 6 s.
+    FLEET_MOCK_SLEEP_AFTER_S: "0",
+    FLEET_MOCK_WAKE_MS: "6000",
+    FLEET_MOCK_FPS: process.env.FLEET_MOCK_FPS ?? "15",
+    FLEET_MOCK_THREADS: process.env.FLEET_MOCK_THREADS ?? "12",
+  },
+};
+
 export default defineConfig({
   testDir: "e2e",
   testMatch: "*.spec.ts",
@@ -34,7 +64,7 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      testIgnore: /screenshots\.spec\.ts/,
+      testIgnore: /(screenshots|phones)\.spec\.ts/,
       use: { ...devices["Desktop Chrome"], viewport, deviceScaleFactor: 1 },
     },
     // WebKit (Playwright's Linux build, not Apple's Safari) runs the tests tagged
@@ -42,7 +72,7 @@ export default defineConfig({
     {
       name: "webkit",
       grep: /@engines/,
-      testIgnore: /screenshots\.spec\.ts/,
+      testIgnore: /(screenshots|phones)\.spec\.ts/,
       dependencies: ["chromium"],
       use: { ...devices["Desktop Safari"], viewport, deviceScaleFactor: 1 },
     },
@@ -54,32 +84,5 @@ export default defineConfig({
       use: { ...devices["Desktop Chrome"], viewport, deviceScaleFactor: 1 },
     },
   ],
-  webServer: {
-    command: "node scripts/dev-mock.ts --prod",
-    url: `http://localhost:${PORTS.web}/`,
-    reuseExistingServer: false,
-    timeout: 60_000,
-    env: {
-      FLEET_WEB_PORT: String(PORTS.web),
-      FLEET_MOCK_COORD_PORT: String(PORTS.coord),
-      FLEET_MOCK_RENDER_PORT: String(PORTS.render),
-      FLEET_MOCK_FCVM_MS: "3000",
-      FLEET_MOCK_EC2_MS: "12000",
-      FLEET_MOCK_FCVM_GPUS: "8",
-      FLEET_MOCK_EC2_GPUS: "7",
-      FLEET_MOCK_GPUS_PER_HOST: "4",
-      // Races only when a test starts one; no cooldown or capacity wait unless a test asks.
-      FLEET_MOCK_RACE_EVERY_S: "0",
-      FLEET_MOCK_COOLDOWN_S: "0",
-      FLEET_MOCK_WAIT_PERCENT: "0",
-      FLEET_MOCK_BORROW_CAP: "1",
-      FLEET_MOCK_CLAIM_S: "8",
-      FLEET_MOCK_HOLD_S: "600",
-      // The fleet sleeps only when a test puts it to sleep; a wake takes 6 s.
-      FLEET_MOCK_SLEEP_AFTER_S: "0",
-      FLEET_MOCK_WAKE_MS: "6000",
-      FLEET_MOCK_FPS: process.env.FLEET_MOCK_FPS ?? "15",
-      FLEET_MOCK_THREADS: process.env.FLEET_MOCK_THREADS ?? "12",
-    },
-  },
+  webServer: mockServer,
 });

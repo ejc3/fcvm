@@ -15,4 +15,5 @@ export * from "./race.ts";
 export * from "./reel.ts";
 export * from "./broadcast.ts";
 export * from "./view.ts";
+export * from "./phones.ts";
 export * as fmt from "./format.ts";

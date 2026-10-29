@@ -62,6 +62,7 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
     viewers: { count: 2, active: 2 },
     actions: [],
     aggregates: [],
+    phones: null,
     ...over,
   };
 }

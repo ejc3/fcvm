@@ -17,6 +17,7 @@ import { cameraAt, poseAt, projectPoint, sceneT, type Vec3 } from "../core/scene
 import type { MockRenderers } from "./renderer.ts";
 import type { PatternScene } from "./pattern.ts";
 import { mockLayout } from "./layout.ts";
+import { MockPhones, type MockPhonesOptions } from "./phones.ts";
 
 export interface CoordinatorOptions {
   port: number;
@@ -54,6 +55,8 @@ export interface CoordinatorOptions {
   mediaDir?: string;
   /** Words the fake text check refuses. */
   refusedWords: string[];
+  /** Phones (phones mode): none unless set. */
+  phones?: MockPhonesOptions;
   /** Delay of the fake text check. */
   checkMs: number;
   epochUnixMs: number;
@@ -285,6 +288,7 @@ export class MockCoordinator {
   private mediaMissing = false;
   /** Races already added to the scoreboard. */
   private recorded = new WeakSet<Race>();
+  private phones: MockPhones | null = null;
 
   constructor(opts: CoordinatorOptions) {
     this.opts = opts;
@@ -297,6 +301,19 @@ export class MockCoordinator {
     this.ec2Count = opts.ec2Gpus;
     this.applyLayout(null);
     const start = this.now();
+    if (opts.phones && opts.phones.count > 0) {
+      this.phones = new MockPhones(
+        opts.phones,
+        {
+          now: () => this.now(),
+          later: (ms, fn) => this.later(ms, fn),
+          markDirty: () => this.markDirty(),
+          scene: () => this.patternScene(),
+          renderers: opts.renderers,
+        },
+        start,
+      );
+    }
     this.nextRaceAt = opts.raceEverySecs > 0 ? start + opts.firstRaceSecs * 1000 : null;
     this.nudge = { holding: "planet", nextHoldAt: start + (opts.holdSecs + opts.travelSecs) * 1000, openedAt: start, votes: new Map() };
     const t0 = sceneT(opts.epochUnixMs, start);
@@ -465,6 +482,7 @@ export class MockCoordinator {
         frame_url: this.aggregateUp(a) ? this.opts.renderers.frameUrl(this.streamId(a.id)) : null,
         frame_url_v4: this.aggregateUp(a) ? this.opts.renderers.frameUrlV4(this.streamId(a.id)) : null,
       })),
+      ...(this.phones ? { phones: this.phones.state() } : {}),
     };
   }
 
@@ -522,6 +540,7 @@ export class MockCoordinator {
     ws.on("close", () => {
       this.clients.delete(client);
       if (client.claim && client.claim.phase !== "ended") this.endClaim(client.claim, "The viewer left.");
+      this.phones?.left(client.viewer);
       this.markDirty();
     });
     ws.on("error", () => {});
@@ -719,8 +738,10 @@ export class MockCoordinator {
         this.pushClaim(cl);
         return this.committed(c, "claim camera");
       }
-      default:
-        return this.refuse(c, `unknown intent "${name}"`);
+      default: {
+        const phone = this.phones?.apply<Receipt>(c.viewer, name, args, { refuse: (r) => this.refuse(c, r), committed: (s) => this.committed(c, s) });
+        return phone ?? this.refuse(c, `unknown intent "${name}"`);
+      }
     }
   }
 
@@ -1419,11 +1440,25 @@ export class MockCoordinator {
       json(200, { id: url.searchParams.get("id"), count: this.appliedCount(url.searchParams.get("id") ?? "") });
       return;
     }
+    if (req.method === "GET" && url.pathname === "/mock/phone-actions") {
+      json(200, { actions: this.phones?.actions ?? [] });
+      return;
+    }
     if (req.method !== "POST") {
       res.writeHead(404).end();
       return;
     }
     switch (url.pathname) {
+      case "/mock/phones":
+        body((b) => {
+          if (!this.phones) throw new Error("the mock runs no phones (FLEET_MOCK_PHONES)");
+          this.phones.reset({
+            ...(typeof b["zoomed_out"] === "boolean" ? { zoomed_out: b["zoomed_out"] } : {}),
+            ...(b["release_all"] === true ? { release_all: true } : {}),
+          });
+          return { ok: true };
+        });
+        return;
       case "/mock/fault":
         body((b) => {
           if (typeof b["skew"] === "number" && typeof b["tile"] === "string") this.opts.renderers.setSkew(b["tile"], b["skew"]);
@@ -1533,6 +1568,7 @@ export class MockCoordinator {
     if (this.flushTimer) clearTimeout(this.flushTimer);
     for (const t of this.timers) clearTimeout(t);
     for (const r of this.tiles) if (r.timer) clearTimeout(r.timer);
+    this.phones?.close();
     for (const c of this.clients) c.ws.terminate();
     this.wss.close();
     await new Promise<void>((r) => this.server.close(() => r()));

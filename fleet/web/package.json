@@ -14,7 +14,7 @@
     "lint": "oxlint",
     "typecheck": "tsc --noEmit -p core/tsconfig.json && tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
-    "test:e2e": "playwright test",
+    "test:e2e": "playwright test && playwright test -c playwright.phones.config.ts",
     "measure": "node scripts/measure.ts",
     "cf:build": "opennextjs-cloudflare build",
     "cf:deploy": "opennextjs-cloudflare deploy"

@@ -43,6 +43,7 @@ app/       Next.js (App Router). Draws view models and sends actions:
            _wall/OwnGpu.tsx         a viewer's own GPU, full screen
            _wall/FocusPanel.tsx     one VM opened
            _wall/Turnstile.tsx      the check before a viewer's first action
+           _wall/Phones.tsx         phones mode (?mode=phones): the phones' own image, bezels, an opened phone
            _wall/frames.worker.ts   frame sockets, WebCodecs decoders, one OffscreenCanvas
            _wall/wall-client.ts     the coordinator socket and the store
            wall.css                 the surface's own stylesheet (no component library)
@@ -72,7 +73,8 @@ pnpm install
 pnpm dev:mock         # the page on the mock fleet, next dev
 pnpm build && pnpm start:mock    # the same with a production build
 pnpm lint && pnpm typecheck && pnpm test     # 141 unit tests (vitest)
-pnpm build && pnpm test:e2e                  # 39 browser tests (Playwright)
+pnpm build && pnpm test:e2e                  # the wall's browser tests, then phones mode's (Playwright)
+pnpm build && pnpm exec playwright test -c playwright.phones.config.ts   # phones mode only, against a mock with four phones
 FLEET_SCREENSHOT_DIR=$PWD/docs/screenshots pnpm test:e2e   # also rewrites the pictures
 pnpm build && pnpm measure [16 50 100]       # decode and draw cost
 ```
@@ -86,6 +88,12 @@ spot capacity. fcvm restarts take 2.6 to 3.4 s (teardown, a restore holding a 0.
 reset, renderer start, first frame) and EC2 35 to 70 s (launch, then boot to first
 frame), shaped like the measured ones.
 In production the page reads the coordinator's URL from `FLEET_COORD_URL` per request.
+
+`/?mode=phones` shows the phones instead of the wall (PROTOCOL.md, "Phones mode"). The mock has
+none unless `FLEET_MOCK_PHONES=<n>` is set (`pnpm dev:mock` with it, or the phones suite's
+config); the other `FLEET_MOCK_PHONE_*` knobs are listed at the top of `mock/main.ts`. The zoom
+between the seamless picture and the phones apart in bezels is the fleet's (`phones_zoom`), so
+every viewer sees it move; the phone a viewer has opened is that viewer's own.
 
 ## How the page works
 
