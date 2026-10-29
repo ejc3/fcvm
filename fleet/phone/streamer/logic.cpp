@@ -73,6 +73,13 @@ bool phone_scene_parse(const std::string& body, PhoneScene* out, std::string* er
       }
       for (const Json& k : ks) s.admit_keys.push_back(admit_key_from_hex(k.string("admit_keys[]")));
     }
+    if (present("mirror_viewer")) {
+      s.mirror_viewer = j.at("mirror_viewer").string("mirror_viewer");
+      if (s.mirror_viewer.size() > 128) {
+        *err = "mirror_viewer: a viewer id of at most 128 characters";
+        return false;
+      }
+    }
     if (present("previous_rect")) {
       if (s.rect_from_frame < 0) {
         *err = "previous_rect: needs rect_from_frame";
@@ -128,6 +135,7 @@ std::string app_scene_line(const PhoneScene& s) {
   // admission keys, which are the streamer's and not the app's
   Json j = Json::parse(s.body);
   j.obj.erase("admit_keys");
+  j.obj.erase("mirror_viewer");
   j.obj.erase("type");
   j.obj.erase("stamp");
   std::string rest;

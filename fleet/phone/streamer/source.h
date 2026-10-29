@@ -13,6 +13,7 @@
 
 #include "gpustats.h"
 #include "logic.h"
+#include "mirror.h"
 #include "nvenc.h"
 #include "server.h"
 #include "screen.h"
@@ -26,6 +27,7 @@ struct StreamerOptions {
   // phone renders on the VM's GPU); empty: stream at once.
   std::string go_file;
   int app_port = 7070;  // the app's control socket, forwarded to this container's loopback
+  std::string mirror_socket = MIRROR_DEFAULT_SOCKET;  // the emulator's command-stream tap
 };
 
 class PhoneSource : public FrameSource {
@@ -48,6 +50,10 @@ class PhoneSource : public FrameSource {
   bool has_scene() override;
   // The app link (a thread of its own): passes the scene and the host's clock to the app.
   void app_link();
+  // GET /mirror: the GPU mirror for the viewer holding the phone (mirror.h).
+  bool serves_mirror() override { return true; }
+  bool mirror_admits(const std::string& token) override;
+  void mirror(Conn& c, const std::string& token) override;
 
  private:
   struct Enc {
@@ -103,5 +109,11 @@ class PhoneSource : public FrameSource {
   uint64_t app_connects_ = 0;  // connections to the app's control socket
   std::string app_error_;      // the app's last refusal
   bool verified_ = false;  // PHONE_GO_FILE seen: the phone renders on the GPU
+  // the mirror, under hmu_: streams opened, the one open now, bytes from the tap and on the
+  // wire, streams dropped for falling behind, the tap's last failure
+  uint64_t mirror_opened_ = 0, mirror_behind_ = 0, mirror_tap_bytes_ = 0, mirror_wire_bytes_ = 0;
+  bool mirror_open_ = false;
+  std::string mirror_error_;
+  std::mutex mirror_mu_;  // one mirror stream at a time: the tap has one consumer
   const std::string boot_id_;
 };

@@ -950,7 +950,7 @@ none is placed). For each slot the agent reconciles:
   `rect` set, `previous_rect` the whole image) post its rectangle; the renderer keeps drawing
   the whole image until `rect_from_frame`, so it opens the new encoders ahead of the switch.
   No relaunch.
-- `phone: {"image_aspect": 1.125, "actions": [{"seq": 7, "action": "rotate", "at": ..., "generation": 2}], "chrome": [{"t": 812.0, "on": true}]}`
+- `phone: {"image_aspect": 1.125, "actions": [{"seq": 7, "action": "rotate", "at": ..., "generation": 2}], "chrome": [{"t": 812.0, "on": true}], "mirror_viewer": "v-12"}`
   (phones mode): the slot is a phone. With `--phone-snapshot` its VM is a clone of that warm
   snapshot of a running phone (flow B: `fcvm snapshot run --snapshot <tag> --gpu <sbdf>` with
   the slot's ports, routed address and the host's certificate map; the phone's GPU hook
@@ -960,7 +960,8 @@ none is placed). For each slot the agent reconciles:
   `/work`, the phone image running `phone.sh serve`; that names neither the slot nor the
   GPU, so every phone restores from one pre-start snapshot, and the AMI's warm snapshot is
   taken of a phone launched this way. Its scene is the shared scene with `rect`, its
-  rectangle of the phones' image, and `image_aspect`; it gets no budget; its first frame is
+  rectangle of the phones' image, `image_aspect`, and `mirror_viewer` when a viewer holds the
+  phone (the only viewer the streamer's GPU mirror opens for, below); it gets no budget; its first frame is
   the streamer's first frame of the app, a stamped scene frame or, zoomed out, a frame of its
   screen (`phone.scene_frames` plus `phone.screen_frames`; the streamer sends nothing before
   the app renders on the GPU). Each action of the
@@ -2125,11 +2126,25 @@ the clone's GPU.
   is checked as the renderer checks it: once a scene brought `admit_keys`, a stream needs a
   token one of them made.
 - `POST /scene`: the renderer's checks for `epoch_unix_ms` (required), `rect`,
-  `image_aspect`, `layout_generation`, `rect_from_frame`, `previous_rect` and `admit_keys`;
-  `400` names a refused field. The streamer passes the body without `admit_keys` to Robot
+  `image_aspect`, `layout_generation`, `rect_from_frame`, `previous_rect`, `admit_keys` and
+  `mirror_viewer` (at most 128 characters); `400` names a refused field. The streamer passes the
+  body without `admit_keys` and `mirror_viewer` to Robot
   Park as its `scene` request with `"stamp": true` (PROTOCOL "Phone app"), again whenever a new one is posted, and sends it
   the host's `clock` every 2 s, over the app's control socket (127.0.0.1:7070 in the
   container, `PHONE_APP_PORT`), reconnecting when it closes.
+- `GET /mirror` (WebSocket): the GPU mirror (docs/fleet/ARCHITECTURE.md, "The GPU mirror"),
+  for the viewer holding the phone only. The first message is `{"admit": "<direct token>"}` as
+  for `/frames`; the stream opens when the scene brought `admit_keys`, one of them made the
+  token, and the token names the scene's `mirror_viewer`, and is closed with 1008 otherwise
+  (no keys, nobody holds the phone, another viewer's token, an expired one). It relays the
+  emulator's command-stream tap (gfxstream `host/mirror_tap.h`, on the container's Unix
+  socket `MIRROR_SOCKET`, `/tmp/gfxstream-mirror.sock`): every render channel's guest-to-host
+  bytes and the start of every reply, as the tap's records, in binary messages of one raw
+  deflate stream (each message ends at a `Z_SYNC_FLUSH`, so `DecompressionStream("deflate-raw")`
+  gives back every byte so far). The page never answers; the phone's GPU answers every call.
+  It closes with 1000 when the scene names another holder or none, 1011 when the tap cannot
+  be reached or ends, and 1013 when the viewer falls 8 MiB behind ("join again") or a mirror
+  is already open (the tap has one consumer).
 - `POST /budget`: accepted when well formed and ignored (the wall's budget controller posts
   every tile; a phone draws at its display's rate).
 - `GET /still`: the screen as last copied, JPEG.
@@ -2144,6 +2159,10 @@ the clone's GPU.
  "draw_to_capture_ms":{"p50":36.3,"p90":36.6,"n":300},
  "capture_to_sent_ms":{"p50":14.0,"p90":15.0,"n":300},"encode_ms":{"p50":4.6,"p90":4.7,"n":300}}
 ```
+
+and `mirror`: `{"open": false, "opened": 3, "behind": 0, "tap_bytes": 51234567, "wire_bytes": 9876543,
+"error": null}`, the streams opened, the ones closed for falling behind, the tap's bytes and the
+deflated bytes sent, and the tap's last failure.
 
 `draw_to_capture_ms` is the time a screen image reached the streamer minus the scene time of
 the frame number the stamp names; `capture_to_sent_ms` is from then to the frame queued on

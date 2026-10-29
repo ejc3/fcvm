@@ -981,6 +981,11 @@ pub fn host_assignments(state: &State) -> BTreeMap<String, Vec<AssignSlot>> {
                 phone: Some(AssignPhone {
                     image_aspect,
                     chrome: state.fleet.phones_zoom.keys.clone(),
+                    mirror_viewer: s
+                        .phone
+                        .as_ref()
+                        .and_then(|p| p.claim.as_ref())
+                        .map(|c| c.viewer.clone()),
                     actions: s
                         .phone
                         .as_ref()

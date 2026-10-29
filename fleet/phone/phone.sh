@@ -184,8 +184,13 @@ serve)
   use_system_egl || fail "could not mask the emulator's software EGL"
   "$ADB" start-server > /dev/null 2>&1 || true
   # -grpc: the emulator's controller on this container's loopback, whose screen stream the
-  # streamer reads. -feature -Uwb: as boot.
+  # streamer reads. -feature -Uwb: as boot. The GPU mirror (fleet/PROTOCOL.md, "Phone
+  # streamer", GET /mirror): gfxstream copies the guest's command stream to the streamer on
+  # this socket while a mirror is open, and offers the guest no more than GLES 3.0, which is
+  # what the viewer's WebGL2 can replay. The guest reads its version at boot, so the warm
+  # snapshot every phone is a clone of carries the cap.
   start_emulator() {
+    GFXSTREAM_MIRROR_SOCKET=${MIRROR_SOCKET:-/tmp/gfxstream-mirror.sock} GFXSTREAM_MAX_GLES_VERSION=${PHONE_MAX_GLES:-3.0} \
     setsid "$EMU" -avd phone -no-window -no-audio -no-boot-anim -gpu host -accel on -grpc 8554 \
       -no-snapshot-save -feature -Uwb -verbose "$@" > "$RUN/emulator.log" 2>&1 < /dev/null &
     echo $! > "$RUN/emulator.pid"

@@ -2125,6 +2125,7 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
                 image_aspect: 1.14,
                 actions,
                 chrome: vec![fleet_core::phone::ChromeKey { t: 12.0, on: true }],
+                mirror_viewer: Some("v-7".into()),
             }),
         }],
         region: None,
@@ -2165,6 +2166,10 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
         body["chrome"],
         serde_json::json!([{"t": 12.0, "on": true}]),
         "the phones' zoom reaches the phone in its scene"
+    );
+    assert_eq!(
+        body["mirror_viewer"], "v-7",
+        "the phone's holder reaches its streamer, which opens the GPU mirror for that viewer only"
     );
     assert!(
         f.budgets[1].lock().unwrap().is_empty(),

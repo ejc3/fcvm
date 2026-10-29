@@ -7,8 +7,8 @@ RTESTS ?= ../../renderer/tests
 OUT ?= build
 
 CXXFLAGS := -O2 -std=c++17 -Wall -Wextra -Wno-unused-parameter -I. -I$(RSRC) -I$(CUDA)/include -I$(NVCH)
-LDLIBS := -L$(CUDA)/lib64/stubs -lcuda -lssl -lcrypto -ldl -lpthread $(shell pkg-config --libs grpc++ protobuf 2>/dev/null)
-HOST_SRC := stamp.cpp nv12.cpp logic.cpp $(RSRC)/json.cpp $(RSRC)/proto.cpp $(RSRC)/admit.cpp $(RSRC)/access.cpp
+LDLIBS := -L$(CUDA)/lib64/stubs -lcuda -lssl -lcrypto -ldl -lpthread -lz $(shell pkg-config --libs grpc++ protobuf 2>/dev/null)
+HOST_SRC := stamp.cpp nv12.cpp logic.cpp mirror.cpp $(RSRC)/json.cpp $(RSRC)/proto.cpp $(RSRC)/admit.cpp $(RSRC)/access.cpp
 ALL_SRC := $(HOST_SRC) $(OUT)/screen.pb.cc $(OUT)/screen.grpc.pb.cc screen.cpp source.cpp main.cpp $(RSRC)/subscriber.cpp $(RSRC)/nvenc.cpp $(RSRC)/server.cpp $(RSRC)/jpeg.cpp \
 	$(RSRC)/tls.cpp $(RSRC)/gpustats.cpp
 
@@ -28,7 +28,7 @@ $(OUT)/phone-streamer: $(ALL_SRC) *.h $(RSRC)/*.h
 # Host-only tests need no CUDA or emulator.
 $(OUT)/test-host: test_host.cpp $(HOST_SRC) *.h
 	@mkdir -p $(OUT)
-	$(CXX) -O1 -std=c++17 -Wall -Wextra -Wno-unused-parameter -I. -I$(RSRC) -I$(RTESTS) -o $@ test_host.cpp $(HOST_SRC) -lssl -lcrypto
+	$(CXX) -O1 -std=c++17 -Wall -Wextra -Wno-unused-parameter -I. -I$(RSRC) -I$(RTESTS) -o $@ test_host.cpp $(HOST_SRC) -lssl -lcrypto -lz
 
 test-host: $(OUT)/test-host
 	$(OUT)/test-host

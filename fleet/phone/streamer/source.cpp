@@ -5,7 +5,9 @@
 #include <cerrno>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -13,6 +15,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <atomic>
+#include <deque>
 #include <thread>
 
 #include "json.h"
@@ -136,6 +140,147 @@ bool PhoneSource::admits(const std::string& token) {
 bool PhoneSource::requires_admit() {
   std::lock_guard<std::mutex> l(mu_);
   return !admit_.keys.empty();
+}
+
+bool PhoneSource::mirror_admits(const std::string& token) {
+  std::lock_guard<std::mutex> l(mu_);
+  return ::mirror_admits(admit_.keys, scene_.mirror_viewer, token, (int64_t)time(nullptr));
+}
+
+void PhoneSource::mirror(Conn& c, const std::string& token) {
+  const std::string viewer = admit_token_viewer(token);
+  auto close_with = [&](uint16_t code, const std::string& why) {
+    std::string pl;
+    pl += (char)(code >> 8);
+    pl += (char)(code & 0xff);
+    pl += why.substr(0, 120);
+    std::string f = ws_frame(8, pl.data(), pl.size());
+    c.write_all(f.data(), f.size());
+  };
+  // The tap has one consumer: a second stream waits for the first to end, which it does once
+  // its viewer no longer holds the phone or goes away.
+  std::unique_lock<std::mutex> one(mirror_mu_, std::try_to_lock);
+  if (!one.owns_lock()) return close_with(1013, "the mirror is open in another window");
+  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  sockaddr_un a{};
+  a.sun_family = AF_UNIX;
+  snprintf(a.sun_path, sizeof a.sun_path, "%s", opt_.mirror_socket.c_str());
+  if (fd < 0 || connect(fd, (sockaddr*)&a, sizeof a) != 0 || ::send(fd, "S", 1, MSG_NOSIGNAL) != 1) {
+    std::string e = std::string("the emulator's command stream: ") + strerror(errno);
+    if (fd >= 0) close(fd);
+    {
+      std::lock_guard<std::mutex> l(hmu_);
+      mirror_error_ = e;
+    }
+    return close_with(1011, e);
+  }
+  {
+    std::lock_guard<std::mutex> l(hmu_);
+    mirror_opened_++;
+    mirror_open_ = true;
+    mirror_error_.clear();
+  }
+  c.set_option(SOL_SOCKET, SO_SNDBUF, 1 << 20);
+  // The writer sends the queue; the client reader notices the viewer leave; this thread reads
+  // the tap, deflates and queues, and ends the stream when the queue passes its bound.
+  std::mutex qmu;
+  std::condition_variable qcv;
+  std::deque<std::string> q;
+  size_t queued = 0;
+  std::atomic<bool> done{false};
+  std::thread writer([&] {
+    while (true) {
+      std::string m;
+      {
+        std::unique_lock<std::mutex> l(qmu);
+        qcv.wait(l, [&] { return done.load() || !q.empty(); });
+        if (q.empty()) break;
+        m = std::move(q.front());
+        q.pop_front();
+        queued -= m.size();
+      }
+      if (!c.write_all(m.data(), m.size())) {
+        done.store(true);
+        break;
+      }
+    }
+  });
+  std::thread reader([&] {
+    int op = 0;
+    std::string pl;
+    while (!done.load() && read_ws_message(c, &op, &pl) && op != 8) {
+    }
+    done.store(true);
+    qcv.notify_all();
+  });
+  MirrorDeflate z;
+  std::string reason;
+  uint16_t code = 1000;
+  std::vector<uint8_t> buf(1 << 18);
+  while (!done.load()) {
+    {
+      std::lock_guard<std::mutex> l(mu_);
+      if (scene_.mirror_viewer != viewer) {
+        code = 1000;
+        reason = "the phone went back";
+        break;
+      }
+    }
+    pollfd p{fd, POLLIN, 0};
+    int pr = poll(&p, 1, 200);
+    if (pr == 0) continue;
+    ssize_t n = pr > 0 ? ::recv(fd, buf.data(), buf.size(), 0) : -1;
+    if (n <= 0) {
+      if (n < 0 && errno == EINTR) continue;
+      code = 1011;
+      reason = "the emulator's command stream ended";
+      break;
+    }
+    std::string out;
+    if (!z.push(buf.data(), (size_t)n, &out)) {
+      code = 1011;
+      reason = "deflate failed";
+      break;
+    }
+    std::string frame = ws_frame(2, out.data(), out.size());
+    bool behind = false;
+    {
+      std::lock_guard<std::mutex> l(qmu);
+      if (queued + frame.size() > MIRROR_MAX_QUEUED_BYTES) {
+        behind = true;
+      } else {
+        queued += frame.size();
+        q.push_back(std::move(frame));
+      }
+    }
+    qcv.notify_all();
+    {
+      std::lock_guard<std::mutex> l(hmu_);
+      mirror_tap_bytes_ += (uint64_t)n;
+      mirror_wire_bytes_ += out.size();
+      if (behind) mirror_behind_++;
+    }
+    if (behind) {
+      code = 1013;
+      reason = "the mirror fell behind: join again";
+      break;
+    }
+  }
+  close(fd);  // the tap stops copying when its consumer goes
+  {
+    // what is queued is dropped: a viewer that fell behind joins again from the start
+    std::lock_guard<std::mutex> l(qmu);
+    q.clear();
+    queued = 0;
+    done.store(true);
+  }
+  qcv.notify_all();
+  writer.join();
+  close_with(code, reason);
+  c.shutdown_both();
+  reader.join();
+  std::lock_guard<std::mutex> l(hmu_);
+  mirror_open_ = false;
 }
 
 bool PhoneSource::has_scene() {
@@ -461,5 +606,12 @@ std::string PhoneSource::health_json() {
            (unsigned long long)app_connects_,
            app_error_.empty() ? "null" : ("\"" + json_escape(app_error_) + "\"").c_str(), draw_to_capture_.json().c_str(),
            capture_to_sent_.json().c_str(), encode_ms_.json().c_str());
-  return b;
+  std::string h = b;
+  char m[512];
+  snprintf(m, sizeof m,
+           ",\"mirror\":{\"open\":%s,\"opened\":%llu,\"behind\":%llu,\"tap_bytes\":%llu,\"wire_bytes\":%llu,\"error\":%s}}",
+           mirror_open_ ? "true" : "false", (unsigned long long)mirror_opened_, (unsigned long long)mirror_behind_,
+           (unsigned long long)mirror_tap_bytes_, (unsigned long long)mirror_wire_bytes_,
+           mirror_error_.empty() ? "null" : ("\"" + json_escape(mirror_error_) + "\"").c_str());
+  return h.substr(0, h.size() - 1) + m;
 }

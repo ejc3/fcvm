@@ -347,6 +347,10 @@ pub struct AssignPhone {
     /// The phones' zoom keys (`chrome` in the phone's scene).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chrome: Vec<crate::phone::ChromeKey>,
+    /// The viewer holding the phone (`mirror_viewer` in the phone's scene): the phone streamer
+    /// opens its GPU mirror only for a direct token naming this viewer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_viewer: Option<String>,
 }
 
 /// The scene shared by every renderer; the agent adds each slot's rect to make the
@@ -397,6 +401,7 @@ impl SharedScene {
             admit_keys: self.admit_keys.clone(),
             weather: self.weather.clone(),
             chrome: Vec::new(),
+            mirror_viewer: None,
         }
     }
 }
@@ -460,6 +465,10 @@ pub struct RendererScene {
     /// `chrome`). Never sent to a renderer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chrome: Vec<crate::phone::ChromeKey>,
+    /// The viewer holding a phone, whose direct token alone opens the phone streamer's GPU
+    /// mirror (phones mode). Never sent to a renderer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_viewer: Option<String>,
 }
 
 #[cfg(test)]
