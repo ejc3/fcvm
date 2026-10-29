@@ -84,6 +84,38 @@ class ProbeTests(unittest.TestCase):
             smoke.prove_frame(self.tile())
         self.assertEqual(calls, [((self.tile()["frame_url_v4"] + "?h=180",), {})])
 
+    def test_with_admission_the_token_is_the_first_message_never_the_url(self):
+        calls, sent = [], []
+        class Renderer:
+            def __init__(self, *args, **kwargs): calls.append((args, kwargs))
+            def send(self, payload, opcode=1): sent.append(payload)
+            def message(self, deadline): return 2, b"synthetic frame"
+            def close(self): pass
+        with patch.object(smoke, "Socket", Renderer):
+            smoke.prove_frame(self.tile(), "v1.9.v-1.mac")
+        self.assertEqual(calls, [((self.tile()["frame_url_v4"] + "?h=180",), {})])
+        self.assertEqual(sent, [{"admit": "v1.9.v-1.mac"}])
+
+    def test_a_socket_without_a_token_must_be_closed_without_frames(self):
+        class Streams:
+            def __init__(self, *args): pass
+            def message(self, deadline): return 2, b"frame"
+            def close(self): pass
+        class Closes:
+            def __init__(self, *args): pass
+            def message(self, deadline): raise RuntimeError("WebSocket closed")
+            def close(self): pass
+        class Open:
+            def __init__(self, *args): pass
+            def message(self, deadline): raise TimeoutError("WebSocket response timeout")
+            def close(self): pass
+        with patch.object(smoke, "Socket", Streams), self.assertRaises(AssertionError):
+            smoke.prove_refused(self.tile())
+        with patch.object(smoke, "Socket", Open), self.assertRaises(AssertionError):
+            smoke.prove_refused(self.tile())
+        with patch.object(smoke, "Socket", Closes):
+            smoke.prove_refused(self.tile())
+
     def test_renderer_handshake_requests_a_valid_frame_height(self):
         class Transport:
             closed = False
@@ -139,8 +171,17 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(requests[1].get_header("Cf-access-client-secret"), "synthetic-secret")
 
     def test_a_fast_fcvm_restore_does_not_trip_the_shared_relaunch_limit(self):
+        self.run_smoke(admission=None)
+
+    def test_with_admission_frames_are_probed_with_the_token_and_refused_without(self):
+        frames, refused = self.run_smoke(admission={"type": "admission", "capacity": 500,
+                                                    "direct": {"value": "v1.9.v-1.mac", "expires_at": 9}})
+        self.assertEqual([a for _, a in frames], ["v1.9.v-1.mac"] * 4)
+        self.assertEqual(len(refused), 2)
+
+    def run_smoke(self, admission):
         clock = [100.0]
-        sent = []
+        sent, seats, frames, refused = [], [], [], []
         def tile(half, generation):
             label = half + ("-old" if generation == 1 else "-new")
             return {"id": half + ":1", "slot": half + "-1", "half": half, "phase": "running",
@@ -150,8 +191,13 @@ class ProbeTests(unittest.TestCase):
             def __init__(self, *args):
                 self.state = {"tiles": [tile("fcvm", 1), tile("ec2", 1)]}
                 self.queue = [{"type": "snapshot", "state": copy.deepcopy(self.state)}]
+                if admission is not None:
+                    self.queue.insert(0, admission)
                 self.last = None
             def send(self, message):
+                if message.get("type") == "seat":
+                    seats.append(len(sent))
+                    return
                 sent.append(clock[0])
                 allowed = self.last is None or clock[0] - self.last >= 2.0
                 self.queue.append({"type": "receipt", "id": message["id"],
@@ -174,12 +220,19 @@ class ProbeTests(unittest.TestCase):
         env = {"STAGING_API_URL": "https://api.example.test", "STAGING_ORIGIN": "https://stage.example.test",
                "CF_ACCESS_CLIENT_ID": "synthetic-id", "CF_ACCESS_CLIENT_SECRET": "synthetic-secret"}
         with patch.dict(os.environ, env), patch.object(smoke, "Socket", Viewer), patch.object(smoke, "get", get), \
-                patch.object(smoke, "prove_frame"), patch.object(smoke, "prove_resolves", return_value=0.05), \
+                patch.object(smoke, "prove_frame", lambda t, a=None: frames.append((t, a))), \
+                patch.object(smoke, "prove_refused", lambda t: refused.append(t)), \
+                patch.object(smoke, "prove_resolves", return_value=0.05), \
                 patch.object(smoke.time, "monotonic", lambda: clock[0]), \
                 patch.object(smoke.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay)):
             smoke.main()
         self.assertEqual(len(sent), 2)
         self.assertGreaterEqual(sent[1] - sent[0], 2.0)
+        self.assertEqual(seats, [0], "the seat message is the first on /live")
+        if admission is None:
+            self.assertEqual([a for _, a in frames], [None] * 4)
+            self.assertEqual(refused, [])
+        return frames, refused
 
 
 class ResolveTests(unittest.TestCase):

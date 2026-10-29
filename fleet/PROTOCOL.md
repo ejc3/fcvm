@@ -1234,7 +1234,8 @@ processes; the host needs the `ffmpeg` CLI with libx264.
 
 `--push-url-env <VAR>` also pushes the stream to the URL in that environment variable
 (`rtmps://<endpoint>:443/app/<stream key>`; the variable keeps the key off the aggregator's
-command line). The aggregator writes FLV to an `ffmpeg` child that copies it there: an
+command line, and the child's stderr reaches the log with the URL and the stream key taken
+out). The aggregator writes FLV to an `ffmpeg` child that copies it there: an
 `onMetaData` tag naming the size first (so the copy probes nothing), the video, and a silent
 AAC-LC track (48 kHz mono, a frame every 1024 samples up to each video frame's time; IVS
 serves a stream without audio about 3.4 s later). A child that exits is started again after
