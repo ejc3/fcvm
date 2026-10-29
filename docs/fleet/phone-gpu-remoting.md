@@ -6,7 +6,8 @@ and WebGL2) instead of on the VM's Tesla T4, and the guest's GL command stream w
 network. Today the T4 renders and the viewer gets video: the phone's screen in NVENC H.264 at
 720x1280 and 30 fps, CBR at 0.8 bits per pixel capped at 20 Mbit/s
 (`fleet/renderer/src/nvenc.cpp`). 0.8 bits per pixel of this screen is 22.1 Mbit/s, so the
-phone streams at the 20 Mbit/s cap.
+phone's configured rate is the 20 Mbit/s cap. The encoder's actual output was not measured
+here.
 
 Two designs are compared:
 
@@ -19,9 +20,9 @@ Two designs are compared:
 
 Ten scripted workloads, each a 60 s window after a launch, on the fleet's phone stack (AOSP
 `android-15.0.0_r36`, the emulator built from source, gfxstream on a T4). The table is the
-first pass ("as shipped"). A second pass agrees within 11% on bytes, 8% on round trips a second
-and 5% on round trips per frame; compression ratios vary by up to 28% with what the 10 s dump
-caught.
+first pass ("as shipped"). A second pass differs from the first by at most 12% on bytes, 7% on
+round trips a second and 4% on round trips per frame; compression ratios differ by up to 38%
+with what the dump caught.
 
 | workload | stream (Mbit/s) | after zstd -3 | video at CRF 23 | round trips/s | main frames/s | round trips per main frame | frames/s at 20 / 50 / 100 ms RTT |
 |---|---|---|---|---|---|---|---|
@@ -37,8 +38,10 @@ caught.
 | SuperTuxKart | 1,156 | 168 | 1.02 | 253 | 83.3 | 1.0 | 16.7 / 6.7 / 3.3 |
 
 - *stream*: everything the guest sent to the host decoder, all threads and processes. *after
-  zstd -3*: that rate divided by the ratio zstd -3 reached on a 10 s dump of the same window,
-  each render thread's stream compressed on its own.
+  zstd -3*: that rate divided by the ratio zstd -3 reached on a dump of up to 10 s of the
+  same window, each render thread's stream compressed on its own. The first pass capped a
+  dump at 512 MiB, which held 3.7 to 5.1 s of Firefox and SuperTuxKart; the second pass's cap
+  was 1.5 GB. Each table gives its sample's size.
 - *video at CRF 23*: the same 60 s of screen, captured from the emulator at 30 fps (the
   newest frame at each tick; the streamer's NVENC stream is 30 fps too) and encoded with x264
   (preset medium, High profile, CRF 23, keyframe every 2 s). The configured CBR is 20 Mbit/s
@@ -48,35 +51,39 @@ caught.
 - *frames/s at RTT*: the most frames a second the main thread and the composer could each
   reach if every round trip cost one RTT and nothing else in a frame took time, the lower of
   the two: `min(frames/s, 1 / (round trips per frame x RTT))`. The composer makes 3 round
-  trips per composed frame in every workload, so no workload can pass 16.7, 6.7 and 3.3.
+  trips per composed frame in every workload (3.1 to 3.2 for the launcher), so no workload
+  can pass 16.7, 6.7 and 3.3.
 
-**Phone as the only renderer does not work.** Every frame waits on the host on two threads. The
-app's eglSwapBuffers creates a native fence with `rcCreateSyncKHR`, a call with output: one
-round trip, which is the whole of Robot Park's and SuperTuxKart's per-frame cost. The composer
-makes three per composed frame (`rcCreateSyncKHR`, `rcDestroySyncKHR`, `rcCompose`) in every
-workload. That alone caps the screen at 16.7 updates a second at 20 ms of RTT, 6.7 at 50 ms and
-3.3 at 100 ms. The apps add more: 3 to 5 round trips per frame for HWUI's list scrolling (most
-of them `glBufferDataSyncAEMU`, a buffer allocation the guest waits for), 13 to 16 for Firefox,
-and 302 for the Wikipedia app, whose WebView asks the host for `glGetError` and `glGetIntegerv`
-6,300 to 6,500 times a second. Bringing any of this under a frame would take changes on the
-guest side (answer state queries from shadowed state, create fences and sync objects with
-guest-allocated handles and no reply), not just moving the decoder.
+**Phone as the only renderer does not work.** An app's frame waits on the host on two threads,
+the app's and the composer's; VLC's decoded video waits only on the composer's. The app's
+eglSwapBuffers creates a native fence with `rcCreateSyncKHR`, a call with output: one round
+trip, which is the whole of Robot Park's and SuperTuxKart's per-frame cost. The composer makes
+three per composed frame (`rcCreateSyncKHR`, `rcDestroySyncKHR`, `rcCompose`; 3.1 to 3.2 for
+the launcher) in every workload. That alone caps the screen at 16.7 updates a second at 20 ms
+of RTT, 6.7 at 50 ms and 3.3 at 100 ms. The apps add more: 3 to 5 round trips per frame for
+HWUI's list scrolling (most of them `glBufferDataSyncAEMU`, a buffer allocation the guest waits
+for), 13 to 16 for Firefox, and 302 for the Wikipedia app, whose WebView asks the host for
+`glGetError` and `glGetIntegerv` 6,300 to 6,500 times a second. Bringing any of this under a
+frame would take changes on the guest side (answer state queries from shadowed state, create
+fences and sync objects with guest-allocated handles and no reply), not just moving the
+decoder.
 
-**The mirror works for UI and loses badly for the browser and the game.** With the T4 answering
-every round trip the phone only needs the stream. Robot Park, the launcher, Settings, the shade
-and the Wikipedia app send 0.3 to 2.1 MB/s, and zstd brings that to 0.1 to 1.3 Mbit/s, far
-below the 20 Mbit/s CBR. Against a CRF 23 encode of the same screen it is lower for four of the
-five (Robot Park 0.46 against 3.7 Mbit/s, the Wikipedia app 0.89 against 4.3) and twice the
-video for the shade (0.91 against 0.47). Organic Maps is at parity (1.9 against 1.6 Mbit/s).
-Firefox and SuperTuxKart send 100 to 145 MB/s, nearly all uploads that a GL stream must carry
-and a video does not: Firefox's GeckoView maps buffers, and the guest encoder ships the whole
-mapped range on every unmap (`glUnmapBufferAEMU`, 100 to 110 a second of about 1 MB each);
-SuperTuxKart draws from client-side vertex arrays, resent on every draw
-(`glVertexAttribPointerData`, `glDrawElementsData`). Compressed, that is 15 to 240 Mbit/s: 7 to
-165 times the video at CRF 23, and from just under the 20 Mbit/s CBR (the article) to twelve
-times it (the image page). A mirror would also have to carry decoded video (VLC's frames are
-decoded on the host and never cross the GL stream) and, for Vulkan, the host-visible memory the
-guest writes directly (below).
+**A mirror's stream is smaller than the video for UI, and far larger for the browser and the
+game.** With the T4 answering every round trip the phone only needs the stream. These are
+bandwidths only: replaying the stream on a phone was not measured. Robot Park, the launcher,
+Settings, the shade and the Wikipedia app send 0.3 to 2.1 MB/s, and zstd brings that to 0.1 to
+1.3 Mbit/s, far below the 20 Mbit/s CBR. Against a CRF 23 encode of the same screen it is lower
+for four of the five (Robot Park 0.46 against 3.7 Mbit/s, the Wikipedia app 0.89 against 4.3)
+and twice the video for the shade (0.91 against 0.47). Organic Maps is at parity (1.9 against
+1.6 Mbit/s). Firefox and SuperTuxKart send 100 to 145 MB/s, nearly all uploads that a GL stream
+must carry and a video does not: Firefox's GeckoView maps buffers, and the guest encoder ships
+the whole mapped range on every unmap (`glUnmapBufferAEMU`, 100 to 110 a second of about 1 MB
+each); SuperTuxKart draws from client-side vertex arrays, resent on every draw
+(`glVertexAttribPointerData`, `glDrawElementsData`). Compressed, that is 15 to 240 Mbit/s, 7 to
+165 times the video at CRF 23. Against the 20 Mbit/s CBR the article is about level (22 Mbit/s
+in the first pass, 15 in the repeat), and the image page is 11 to 12 times it. A mirror would
+also have to carry decoded video (VLC's frames are decoded on the host and never cross the GL
+stream) and, for Vulkan, the host-visible memory the guest writes directly (below).
 
 ## Method
 
@@ -108,7 +115,8 @@ Not on the channel, so not counted:
 
 - Vulkan host-visible memory, which the guest writes directly through its mapping.
 - The payloads of `rcUpdateColorBufferDMA` and `rcReadColorBufferDMA`, which use the goldfish
-  DMA region (no workload made either call).
+  DMA region. No workload called the first. The second was called 13 and 12 times in the two
+  passes, boot included, and its payload is not counted.
 - Video decoded by the emulator's codec (`c2.goldfish.h264.decoder`, which VLC uses), whose
   frames reach host color buffers through the media pipe.
 
@@ -177,10 +185,11 @@ time, and the launcher and Settings (restarted by their runs) drew with `Pipelin
 
 On Vulkan HWUI makes more blocking calls per frame, not fewer: `vkGetFenceStatus`,
 `vkResetCommandPool`, `vkResetFences`, `vkCreateSemaphore` and `vkQueueWaitIdle` all wait for
-the host. Its stream is smaller only because the vertex and uniform data it writes to
-host-visible memory is not in the stream (above), and a WebGL2 renderer could not take it. The
-Wikipedia app on Vulkan drew 7 frames a second and reported no pipeline, and SystemUI could not
-be restarted without root, so neither is reported.
+the host. Its stream is smaller partly because the vertex and uniform data it writes to
+host-visible memory is not in the stream (above); how much that memory carries was not
+measured. A WebGL2 renderer could not take this stream in any case. The Wikipedia app on Vulkan
+drew 7 frames a second and reported no pipeline, and SystemUI could not be restarted without
+root, so neither is reported.
 
 ### Workloads
 
@@ -328,7 +337,7 @@ mapped-buffer writes (`glUnmapBufferAEMU`, `glFlushMappedBufferRangeAEMU`).
 | top round trips (/s) | `glBufferDataSyncAEMU` 125, `rcCreateSyncKHR` 94, `rcDestroySyncKHR` 44, `rcCompose` 44 | `glBufferDataSyncAEMU` 124, `rcCreateSyncKHR` 94, `rcDestroySyncKHR` 44, `rcCompose` 44 |
 | main rendering thread: frames/s | 44.0 | 43.9 |
 | main thread round trips per frame | 3.9 | 4.0 |
-| all app threads' round trips per main frame | 7.4 | 7.4 |
+| all app threads' round trips per main frame | 7.4 (all processes: the app was already running) | 7.4 (all processes: the app was already running) |
 | composer: composed frames/s, round trips per frame | 44.3, 3.0 | 44.1, 3.0 |
 | fence signals to the guest (/s) | 94 | 94 |
 | startup: `am start` TotalTime (ms) | - | - |
