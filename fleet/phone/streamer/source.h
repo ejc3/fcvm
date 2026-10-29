@@ -43,8 +43,7 @@ class PhoneSource : public FrameSource {
   bool raw_frame(double t, std::string* ppm, std::string* tile_json) override { return false; }
   bool next_frame(int still_h, std::vector<uint8_t>* rgba, int* w, int* h, std::string* tile_json) override;
   std::string health_json() override;
-  // A phone streams to every client: a phone's scene carries no admission keys (admit.h).
-  bool admits(const std::string&) override { return true; }
+  bool admits(const std::string& token) override;
   // The app link (a thread of its own): passes the scene and the host's clock to the app.
   void app_link();
 
@@ -72,6 +71,7 @@ class PhoneSource : public FrameSource {
   std::mutex mu_;
   std::condition_variable cv_;
   PhoneScene scene_;  // under mu_
+  AdmitKeys admit_;   // under mu_
   uint64_t scene_version_ = 0;  // under mu_: bumped by every post
   std::vector<std::shared_ptr<Subscriber>> subs_;  // under mu_
   int next_id_ = 1;

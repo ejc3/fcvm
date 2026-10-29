@@ -2083,11 +2083,13 @@ the clone's GPU.
 ### Routes
 
 - `GET /frames?h=&q=` (WebSocket): the renderer's protocol. `h` is accepted and changes
-  nothing: a phone sends its screen at the screen's size, and the header says it.
+  nothing: a phone sends its screen at the screen's size, and the header says it. `admit`
+  is checked as the renderer checks it: once a scene brought `admit_keys`, a stream needs a
+  token one of them made.
 - `POST /scene`: the renderer's checks for `epoch_unix_ms` (required), `rect`,
-  `image_aspect`, `layout_generation`, `rect_from_frame` and `previous_rect`; `400` names a
-  refused field. The streamer passes the body to Robot Park as its `scene` request with
-  `"stamp": true` (PROTOCOL "Phone app"), again whenever a new one is posted, and sends it
+  `image_aspect`, `layout_generation`, `rect_from_frame`, `previous_rect` and `admit_keys`;
+  `400` names a refused field. The streamer passes the body without `admit_keys` to Robot
+  Park as its `scene` request with `"stamp": true` (PROTOCOL "Phone app"), again whenever a new one is posted, and sends it
   the host's `clock` every 2 s, over the app's control socket (127.0.0.1:7070 in the
   container, `PHONE_APP_PORT`), reconnecting when it closes.
 - `POST /budget`: accepted when well formed and ignored (the wall's budget controller posts

@@ -122,9 +122,15 @@ bool PhoneSource::post_scene(const std::string& body, std::string* err) {
   if (!phone_scene_parse(body, &s, err)) return false;
   std::lock_guard<std::mutex> l(mu_);
   scene_ = s;
+  admit_.on_scene(s);
   scene_version_++;
   cv_.notify_all();
   return true;
+}
+
+bool PhoneSource::admits(const std::string& token) {
+  std::lock_guard<std::mutex> l(mu_);
+  return admit_.admits(token, (int64_t)time(nullptr));
 }
 
 bool PhoneSource::post_budget(const std::string& body, std::string* err) {

@@ -184,4 +184,8 @@ act switch_screen || bad "switch_screen failed: $(cat "$dir/act.err")"
 [ "$(tail -2 "$dir/ctl.log")" = '{"type":"action","name":"info"}
 {"type":"action","name":"info"}' ] && ok "a refused toggle is asked for again, not undone" || bad "after a refused switch_screen the app was sent: $(tail -2 "$dir/ctl.log")"
 kill "$ctl" 2> /dev/null || true
+# The streamer's Makefile runs protoc once for its generated sources, however parallel the
+# build (a dry run names each command it would run).
+n=$(make -C "$(dirname "$phone")/streamer" -n -j4 OUT="$dir/pb" "$dir/pb/screen.pb.cc" "$dir/pb/screen.grpc.pb.cc" 2> /dev/null | grep -c '^protoc' || true)
+[ "$n" = 1 ] && ok "a parallel streamer build runs protoc once" || bad "a parallel streamer build runs protoc $n times"
 exit $fail
