@@ -235,6 +235,57 @@ class ProbeTests(unittest.TestCase):
         return frames, refused
 
 
+class FailureTests(unittest.TestCase):
+    """A failed smoke prints the step it was on and fixed error text (issue 1437: a run
+    printed only `RuntimeError`, which every WebSocket failure of either socket raises)."""
+
+    def failed(self, raise_in_message):
+        class Viewer:
+            def __init__(self, *args): pass
+            def send(self, message): pass
+            def message(self, deadline): raise_in_message()
+            def close(self): pass
+        def get(url, headers=None):
+            if not headers:
+                return 302, {"Location": "https://login.cloudflareaccess.com/login"}, b""
+            return (403 if url.endswith("/agent") else 200), {}, b""
+        env = {"STAGING_API_URL": "https://api.example.test", "STAGING_ORIGIN": "https://stage.example.test",
+               "CF_ACCESS_CLIENT_ID": "synthetic-id", "CF_ACCESS_CLIENT_SECRET": "synthetic-secret"}
+        out = io.StringIO()
+        with patch.dict(os.environ, env), patch.object(smoke, "Socket", Viewer), patch.object(smoke, "get", get), \
+                contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            smoke.run()
+        return json.loads(out.getvalue().strip().splitlines()[-1])
+
+    def test_a_closed_live_socket_names_its_step_and_message(self):
+        def closed():
+            raise RuntimeError("WebSocket closed")
+        r = self.failed(closed)
+        self.assertEqual(r, {"status": "failed", "step": "/live: wait for an fcvm tile to run",
+                             "errorType": "RuntimeError", "error": "WebSocket closed"})
+
+    def test_an_os_error_prints_its_errno_name_and_foreign_text_prints_nothing(self):
+        def reset():
+            raise ConnectionResetError(104, "Connection reset by peer from 192.0.2.7")
+        self.assertEqual(self.failed(reset)["error"], "ECONNRESET")
+        def foreign():
+            raise RuntimeError("wss://secret-host.example/frames?token=abc")
+        r = self.failed(foreign)
+        self.assertIsNone(r["error"])
+        self.assertEqual(r["errorType"], "RuntimeError")
+
+    def test_every_raise_in_the_smoke_carries_a_literal_message(self):
+        import ast
+        tree = ast.parse((HERE / "stage-smoke.py").read_text())
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)
+                    and getattr(node.exc.func, "id", None) != "SystemExit"):
+                args = node.exc.args
+                self.assertTrue(len(args) == 1 and isinstance(args[0], ast.Constant)
+                                and isinstance(args[0].value, str),
+                                f"line {node.lineno}: a raise whose message is not a string literal")
+
+
 class ResolveTests(unittest.TestCase):
     """The public-resolver check against a resolver on loopback that answers as it is told."""
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Prove Access, fresh launch names that resolve at once, and renderer frames over IPv4 on staging."""
+import ast
 import base64
+import errno
 import hashlib
 import ipaddress
 import json
@@ -15,6 +17,35 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
+
+
+# The step the smoke is on, printed when it fails: fixed text naming the socket and the half.
+STEP = "start"
+
+
+def step(name):
+    global STEP
+    STEP = name
+
+
+def own_messages():
+    """The literal messages of this file's own raise statements: the only error text a
+    failure prints, so the log never carries a URL, a host name or a token."""
+    tree = ast.parse(Path(__file__).read_text())
+    return {node.exc.args[0].value for node in ast.walk(tree)
+            if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call) and node.exc.args
+            and isinstance(node.exc.args[0], ast.Constant) and isinstance(node.exc.args[0].value, str)}
+
+
+def describe(error):
+    """Fixed text for an exception: one of this file's own messages, or an OS error's errno
+    name; None for anything else (its text could name an endpoint)."""
+    message = str(error)
+    if message in own_messages():
+        return message
+    if isinstance(error, OSError) and error.errno in errno.errorcode:
+        return errno.errorcode[error.errno]
+    return None
 
 
 def ipv4(host, port):
@@ -310,6 +341,7 @@ def main():
     api, origin = os.environ["STAGING_API_URL"].rstrip("/"), os.environ["STAGING_ORIGIN"].rstrip("/")
     headers = {"CF-Access-Client-Id": os.environ["CF_ACCESS_CLIENT_ID"],
                "CF-Access-Client-Secret": os.environ["CF_ACCESS_CLIENT_SECRET"], "Origin": origin}
+    step("Access check")
     for url in (api + "/healthz", origin + "/"):
         code, response_headers, _ = get(url)
         location = urllib.parse.urlsplit(response_headers.get("Location", ""))
@@ -318,9 +350,11 @@ def main():
         code, _, _ = get(url, headers)
         if code != 200:
             raise AssertionError("authenticated staging request failed")
+    step("agents-only endpoint check")
     code, _, _ = get(api + "/agent", headers)
     if code not in (401, 403, 302):
         raise AssertionError("the CI token reached the agents-only endpoint")
+    step("/live connect")
     connection = Socket(api.replace("https://", "wss://", 1) + "/live", headers)
     try:
         # The first message on /live: a page's seat ticket (none here).
@@ -352,14 +386,18 @@ def main():
                 raise AssertionError("the smoke connection was given no direct token")
             return token
         for half in ("fcvm", "ec2"):
+            step(f"/live: wait for an {half} tile to run")
             until(lambda s: ready(s, half))
             old = dict(ready(state, half))
             if direct() is not None:
+                step(f"renderer socket: {half} tile refuses a socket without a token")
                 prove_refused(old)
+            step(f"renderer socket: {half} tile frames")
             prove_frame(old, direct())
             delay = next_relaunch - time.monotonic()
             if delay > 0:
                 time.sleep(delay)
+            step(f"/live: {half} relaunch receipt")
             intent = str(uuid.uuid4())
             connection.send({"type": "intent", "id": intent, "name": "relaunch", "args": {"tile": old["id"]}})
             # A refused intent must fail explicitly, rather than wait for an unrelated scheduled race.
@@ -376,11 +414,15 @@ def main():
                     # the intent, so varying network latency cannot shorten it.
                     next_relaunch = time.monotonic() + interval
                     break
+            step(f"/live: wait for the relaunched {half} tile to run")
             until(lambda s: ready(s, half, slot=old["slot"], after=old["generation"]))
             new = ready(state, half, slot=old["slot"], after=old["generation"])
+            step(f"/live: relaunched {half} tile has fresh names")
             fresh(old, new)
             # Before anything else looks the names up: each resolver's first query.
+            step(f"public resolvers: relaunched {half} tile names")
             slowest = prove_resolves(new)
+            step(f"renderer socket: relaunched {half} tile frames")
             prove_frame(new, direct())
             print(json.dumps({"half": half, "freshLaunchNames": True, "freshNamesResolved": True,
                               "resolveMsMax": round(slowest * 1000), "ipv4RendererFrames": True,
@@ -389,9 +431,14 @@ def main():
         connection.close()
 
 
-if __name__ == "__main__":
+def run():
     try:
         main()
     except Exception as error:
-        print(json.dumps({"status": "failed", "errorType": type(error).__name__}))
+        print(json.dumps({"status": "failed", "step": STEP, "errorType": type(error).__name__,
+                          "error": describe(error)}))
         raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    run()
