@@ -63,6 +63,8 @@ export interface TileFrameStats {
   decodeMs: number | null;
   /** Where its frames' age goes on the page (core/lag.ts), or null before a frame arrives. */
   lag: LagStats | null;
+  /** Frame message bytes received since the stream was first opened (the take-over panel's video readout). */
+  bytes?: number;
 }
 
 export interface FrameStats {

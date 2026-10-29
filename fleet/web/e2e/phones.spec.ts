@@ -170,6 +170,50 @@ test("taking a phone over gives the eight fixed actions; Rotate reaches the phon
   await expect.poll(async () => (await mockPhones()).tiles[2]!.borrowed).toBeNull();
 });
 
+test("a phone taken over shows its video, its GPU mirror or both, each with its bandwidth; the mirror alone closes the video", async ({ page }) => {
+  await openPhones(page);
+  await page.getByTestId("phone-hit-phone:2").click();
+  await page.getByTestId("phone-take").click();
+  await expect(page.getByTestId("phone-borrow")).toHaveAttribute("data-kind", "yours");
+  const views = page.getByTestId("phone-views").getByRole("button");
+  expect(await views.allTextContents()).toEqual(["Video", "GPU mirror", "Both"]);
+  await expect(page.getByTestId("phone-view-video")).toHaveAttribute("aria-pressed", "true");
+  // Video: its readout only, and the phone's stream in the plan.
+  await expect(page.getByTestId("phone-readout-video")).toContainText(/\d Mbit\/s · \d+\.\d MB · \d+ fps/);
+  await expect(page.getByTestId("phone-readout-mirror")).toHaveCount(0);
+  await expect(page.getByTestId("phone-mirror")).toBeHidden();
+
+  // GPU mirror alone: the page stops receiving the phone's video, draws the mirror in its place,
+  // and reads out the mirror's bandwidth and the calls the phone's GPU answered.
+  await page.getByTestId("phone-view-mirror").click();
+  await expect(page.getByTestId("phone-mirror")).toBeVisible();
+  await expect.poll(async () => (await view(page)).plan.direct.map((d) => d.id)).not.toContain("d:phone:2");
+  await expect(page.getByTestId("phone-readout-video")).toHaveCount(0);
+  await expect(page.getByTestId("phone-readout-mirror")).toContainText(/\d Mbit\/s · \d+\.\d MB · \d+ fps/, { timeout: 15_000 });
+  await expect(page.getByTestId("phone-readout-mirror")).toContainText(/[1-9]\d* blocking calls a second answered by the phone's GPU/);
+  // the mock phone clears to a colour of its frame number: the mirror drew it with WebGL2
+  await expect.poll(async () => (await page.evaluate(() => window.__phones!.mirror()))?.pixel?.[2] ?? 0, { timeout: 15_000 }).toBe(200);
+  const st = (await page.evaluate(() => window.__phones!.mirror()))!;
+  expect(st.posts).toBeGreaterThan(10);
+  expect(st.skipped + st.failed).toBe(0);
+  expect(st.fps).toBeGreaterThan(15);
+  // joining the copy restarts the app (until the join snapshot lands), once
+  await expect.poll(async () => (await phoneActions()).map((a) => a.action)).toEqual(["restart_app"]);
+
+  // Both: the video back beside the mirror, each with its readout.
+  await page.getByTestId("phone-view-both").click();
+  await expect.poll(async () => (await view(page)).plan.direct.map((d) => d.id)).toContain("d:phone:2");
+  await expect(page.getByTestId("phone-readout-video")).toContainText(/Mbit\/s/);
+  await expect(page.getByTestId("phone-readout-mirror")).toContainText(/Mbit\/s/);
+  const v = await view(page);
+  const video = v.layout!.phones.find((p) => p.id === "phone:2")!.box!;
+  expect(v.mirror!.box.x).toBeGreaterThanOrEqual(video.x + video.w);
+  expect(v.mirror!.box.w).toBe(video.w);
+
+  await page.getByTestId("phone-give-back").click();
+  await expect(page.getByTestId("phone-mirror")).toBeHidden();
+});
+
 test("Reboot phone restores the phone: the panel says Restoring, the stream returns, and the restore time updates", async ({ page }) => {
   await openPhones(page);
   await page.getByTestId("phone-hit-phone:1").click();

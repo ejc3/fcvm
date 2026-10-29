@@ -6,7 +6,22 @@
 // stage, forwards input as actions and draws the view model core/phones.ts computes.
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
-import { HIDDEN_PAUSE_MS, SITE, streamsSuspended, zoomProgressAt, phonesView, type Box, type PhoneCard, type PhonePanel, type PhonesView } from "../../core/index.ts";
+import {
+  HIDDEN_PAUSE_MS,
+  SITE,
+  streamsSuspended,
+  zoomProgressAt,
+  phonesView,
+  sameViewer,
+  type Box,
+  type PhoneCard,
+  type PhonePanel,
+  type PhonesView,
+  type StreamReadout,
+  type TakeoverView,
+} from "../../core/index.ts";
+import { RateMeter } from "../../core/meter.ts";
+import type { MirrorIn, MirrorOut, MirrorStatsMsg } from "./mirror/mirror-msgs.ts";
 import { canDecodeH264, WallClient } from "./wall-client.ts";
 import { TurnstileWidget } from "./Turnstile.tsx";
 import { Timeline } from "./FocusPanel.tsx";
@@ -18,7 +33,7 @@ const localNow = () => performance.timeOrigin + performance.now();
 declare global {
   interface Window {
     /** With ?debug=1 the phones page exposes the same hook as the wall, with its own view. */
-    __phones?: { client: WallClient; view: () => PhonesView };
+    __phones?: { client: WallClient; view: () => PhonesView; mirror: () => MirrorStatsMsg | null };
   }
 }
 
@@ -36,6 +51,16 @@ function Verify({ client, view }: { client: WallClient; view: PhonesView }) {
       ) : null}
     </div>
   );
+}
+
+/**
+ * How far the mirror's scene time runs ahead of the video's, from Robot Park's stamp in each:
+ * both extrapolated to one moment at their 1 s of scene time a second. Null without both.
+ */
+function leadOf(m: MirrorStatsMsg | null, videoT: number | null, videoAt: number | null): number | null {
+  if (!m?.stamp || videoT === null || videoAt === null) return null;
+  const t = Math.max(m.stamp.at, videoAt);
+  return (m.stamp.k / 60 + (t - m.stamp.at) / 1000 - (videoT + (t - videoAt) / 1000)) * 1000;
 }
 
 const at = (b: Box): CSSProperties => ({ left: b.x, top: b.y, width: b.w, height: b.h });
@@ -68,6 +93,7 @@ function PanelView({
   slot,
   onBack,
   backRef,
+  onView,
 }: {
   panel: PhonePanel;
   narrow: boolean;
@@ -76,6 +102,7 @@ function PanelView({
   slot: string | null;
   onBack: () => void;
   backRef: React.RefObject<HTMLButtonElement | null>;
+  onView: (v: TakeoverView) => void;
 }) {
   const b = panel.borrow;
   return (
@@ -122,6 +149,22 @@ function PanelView({
                   {b.countdown}
                 </span>
               </div>
+              <div className="view-switch" role="group" aria-label="View" data-testid="phone-views">
+                {b.views.map((v) => (
+                  <button key={v.name} type="button" className="btn" aria-pressed={v.pressed} onClick={() => onView(v.name)} data-testid={`phone-view-${v.name}`}>
+                    {v.label}
+                  </button>
+                ))}
+              </div>
+              <dl className="readouts" data-testid="phone-readouts">
+                {b.readouts.map((r) => (
+                  <div key={r.name} data-testid={`phone-readout-${r.name}`}>
+                    <dt>{r.label}</dt>
+                    <dd>{r.value}</dd>
+                    {r.detail ? <dd className="detail">{r.detail}</dd> : null}
+                  </div>
+                ))}
+              </dl>
               <div className="actions-grid" role="group" aria-label="Actions">
                 {b.actions.map((a) => (
                   <button key={a.name} type="button" className="btn" disabled={a.disabled} onClick={() => client.act("phone_action", { action: a.name, claim: b.session })} data-testid={`phone-action-${a.name}`}>
@@ -280,11 +323,110 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
     return () => cancelAnimationFrame(id);
   }, [hasPhones, target, reducedMotion]);
 
+  // ---- the take-over views and their readouts (docs/fleet/ARCHITECTURE.md, "The GPU mirror") ----
+
+  const [takeover, setTakeover] = useState<TakeoverView>("video");
+  const [mirrorStats, setMirrorStats] = useState<MirrorStatsMsg | null>(null);
+  const mirrorStatsRef = useRef<MirrorStatsMsg | null>(null);
+  mirrorStatsRef.current = mirrorStats;
+  const [mirrorNote, setMirrorNote] = useState<string | null>(null);
+  const held = state.accepted?.phones?.tiles.find((t) => t.borrowed?.session !== undefined && sameViewer(t.borrowed.viewer ?? null, state.you)) ?? null;
+  const heldSession = held?.borrowed?.session ?? null;
+  const videoMeter = useRef({ meter: new RateMeter(), last: null as number | null, session: null as string | null });
+  const videoStats = held ? state.frames?.tiles[`d:${held.id}`] : undefined;
+  const vm = videoMeter.current;
+  if (vm.session !== heldSession) {
+    vm.meter.reset();
+    vm.last = null;
+    vm.session = heldSession;
+  }
+  if (videoStats?.bytes !== undefined && state.frames) {
+    if (vm.last !== null && videoStats.bytes >= vm.last) vm.meter.add(state.frames.at, videoStats.bytes - vm.last);
+    vm.last = videoStats.bytes;
+  }
+  useEffect(() => {
+    if (heldSession === null) setTakeover("video");
+  }, [heldSession]);
+  const readouts = {
+    video:
+      held && takeover !== "mirror"
+        ? ({ bps: vm.meter.perSecond(localNow()), total: vm.meter.total, fps: videoStats?.fps ?? 0 } satisfies StreamReadout)
+        : null,
+    mirror:
+      held && takeover !== "video"
+        ? ({
+            bps: mirrorStats?.wireBps ?? 0,
+            total: mirrorStats?.wireBytes ?? 0,
+            fps: mirrorStats?.fps ?? 0,
+            repliesPerSec: mirrorStats?.repliesPerSec ?? 0,
+            note: mirrorNote,
+            leadMs: leadOf(mirrorStats, videoStats?.newestT ?? null, state.frames?.at ?? null),
+          } satisfies StreamReadout)
+        : null,
+  };
+
   const view = useMemo(
-    () => phonesView({ state, now: now || 0, dpr, stage, progress, narrow, reducedMotion, openId, canDecode }),
-    [state, now, dpr, stage, progress, narrow, reducedMotion, openId, canDecode],
+    () => phonesView({ state, now: now || 0, dpr, stage, progress, narrow, reducedMotion, openId, canDecode, takeover, readouts }),
+    // readouts change with now and the worker's reports
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [state, now, dpr, stage, progress, narrow, reducedMotion, openId, canDecode, takeover, mirrorStats, mirrorNote],
   );
   viewRef.current = view;
+
+  // The mirror's worker draws on its own canvas, handed over once.
+  const mirrorCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const mirrorWorker = useRef<Worker | null>(null);
+  const joinedFor = useRef<string | null>(null);
+  useEffect(() => {
+    const c = mirrorCanvasRef.current;
+    if (!c || mirrorWorker.current) return;
+    const w = new Worker(new URL("./mirror/mirror.worker.ts", import.meta.url), { type: "module" });
+    mirrorWorker.current = w;
+    const off = c.transferControlToOffscreen();
+    w.postMessage({ type: "canvas", canvas: off } satisfies MirrorIn, [off]);
+    return () => {
+      w.terminate();
+      mirrorWorker.current = null;
+    };
+  }, []);
+  const m = view.mirror;
+  // without a direct token (a fleet with no admission keys) the streamer refuses the mirror, and the page says why
+  const mirrorKey = m && m.url ? `${m.url} ${m.admit ?? ""} ${m.session}` : null;
+  const [retry, setRetry] = useState(0);
+  useEffect(() => {
+    const w = mirrorWorker.current;
+    if (!w) return;
+    if (mirrorKey === null || !m) {
+      w.postMessage({ type: "close" } satisfies MirrorIn);
+      setMirrorStats(null);
+      return;
+    }
+    setMirrorNote("joining");
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    w.onmessage = (e: MessageEvent<MirrorOut>) => {
+      const x = e.data;
+      if (x.type === "stats") setMirrorStats(x);
+      else if (x.type === "joined") {
+        setMirrorNote(null);
+        // Until the join snapshot lands the mirror starts with the app: restart it into the copy,
+        // once per borrow and stream.
+        if (joinedFor.current !== mirrorKey + retry) {
+          joinedFor.current = mirrorKey + retry;
+          client.act("phone_action", { action: "restart_app", claim: m.session });
+        }
+      } else if (x.type === "closed") {
+        setMirrorNote(x.reason ? `closed: ${x.reason}` : "closed");
+        // one rejoin every 10 s at most
+        retryTimer = setTimeout(() => setRetry((r) => r + 1), 10_000);
+      }
+    };
+    w.postMessage({ type: "open", url: m.url!, admit: m.admit ?? "" } satisfies MirrorIn);
+    return () => {
+      if (retryTimer) clearTimeout(retryTimer);
+    };
+    // m is read through mirrorKey
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mirrorKey, retry, client]);
 
   // The frame worker gets the canvas once, then plans.
   useEffect(() => {
@@ -302,7 +444,7 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
   // Test hook, only with ?debug=1.
   useEffect(() => {
     if (new URLSearchParams(window.location.search).get("debug") === "1") {
-      window.__phones = { client, view: () => viewRef.current! };
+      window.__phones = { client, view: () => viewRef.current!, mirror: () => mirrorStatsRef.current };
     }
   }, [client]);
 
@@ -406,7 +548,18 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
           ) : null,
         )}
       </div>
-      {view.panel ? <PanelView panel={view.panel} narrow={narrow} top={sheetTop} client={client} slot={openedSlot} onBack={close} backRef={backRef} /> : null}
+      <canvas
+        ref={mirrorCanvasRef}
+        className="phone-mirror"
+        width={720}
+        height={1280}
+        aria-label="The GPU mirror: this phone drawn by your browser from its GL commands"
+        data-testid="phone-mirror"
+        style={m ? { position: "fixed", ...at(m.box) } : { display: "none" }}
+      />
+      {view.panel ? (
+        <PanelView panel={view.panel} narrow={narrow} top={sheetTop} client={client} slot={openedSlot} onBack={close} backRef={backRef} onView={setTakeover} />
+      ) : null}
       {needsVerifyPrompt ? (
         <div className="verify-pop" role="dialog" aria-label={view.verify.title}>
           <Verify client={client} view={view} />

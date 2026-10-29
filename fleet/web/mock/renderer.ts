@@ -9,6 +9,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { buildFrame } from "../core/frame.ts";
 import { deliveredGeometry, tileGeometry, type TileGeometry } from "../core/layout.ts";
 import type { Rect } from "../core/protocol.ts";
+import { serveMockMirror } from "./mirror.ts";
 import { Encoder, FFMPEG } from "./encoder.ts";
 import type { PatternScene } from "./pattern.ts";
 import { RenderPool } from "./render-pool.ts";
@@ -108,6 +109,12 @@ export class MockRenderers {
     this.wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
     this.server.on("upgrade", (req, socket, head) => {
       const url = new URL(req.url ?? "/", "http://mock");
+      // a phone's GPU mirror (mock/mirror.ts)
+      const mm = /^\/frames\/([A-Za-z0-9_-]+)\/mirror$/.exec(url.pathname);
+      if (mm && this.tiles.has(mm[1]!)) {
+        this.wss.handleUpgrade(req, socket, head, (ws) => serveMockMirror(ws, process.env.FLEET_MOCK_MIRROR_TAP || undefined));
+        return;
+      }
       const m = /^\/frames\/([A-Za-z0-9_-]+)$/.exec(url.pathname);
       const tile = m ? this.tiles.get(m[1]!) : undefined;
       if (!m || !tile) {
