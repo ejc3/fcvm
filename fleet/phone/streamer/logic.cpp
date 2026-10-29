@@ -7,6 +7,7 @@
 #include <climits>
 #include <vector>
 
+#include "admit.h"
 #include "json.h"
 
 namespace {
@@ -64,6 +65,14 @@ bool phone_scene_parse(const std::string& body, PhoneScene* out, std::string* er
     auto present = [&](const char* k) { return j.has(k) && j.at(k).type != Json::Null; };
     if (present("layout_generation") && !frame_no(j, "layout_generation", &s.layout_generation, err)) return false;
     if (present("rect_from_frame") && !frame_no(j, "rect_from_frame", &s.rect_from_frame, err)) return false;
+    if (present("admit_keys")) {
+      const auto& ks = j.at("admit_keys").array("admit_keys");
+      if (ks.size() > 4) {
+        *err = "admit_keys: more than 4 keys";
+        return false;
+      }
+      for (const Json& k : ks) s.admit_keys.push_back(admit_key_from_hex(k.string("admit_keys[]")));
+    }
     if (present("previous_rect")) {
       if (s.rect_from_frame < 0) {
         *err = "previous_rect: needs rect_from_frame";
@@ -82,18 +91,56 @@ bool phone_scene_parse(const std::string& body, PhoneScene* out, std::string* er
   return true;
 }
 
+namespace {
+void dump(const Json& j, std::string* out) {
+  char b[40];
+  switch (j.type) {
+    case Json::Null: *out += "null"; break;
+    case Json::Bool: *out += j.b ? "true" : "false"; break;
+    case Json::Number: snprintf(b, sizeof b, "%.17g", j.num); *out += b; break;
+    case Json::String: *out += "\"" + json_escape(j.str) + "\""; break;
+    case Json::Array:
+      *out += "[";
+      for (size_t i = 0; i < j.arr.size(); i++) {
+        if (i) *out += ",";
+        dump(j.arr[i], out);
+      }
+      *out += "]";
+      break;
+    case Json::Object: {
+      *out += "{";
+      bool first = true;
+      for (const auto& kv : j.obj) {
+        if (!first) *out += ",";
+        first = false;
+        *out += "\"" + json_escape(kv.first) + "\":";
+        dump(kv.second, out);
+      }
+      *out += "}";
+      break;
+    }
+  }
+}
+}  // namespace
+
 std::string app_scene_line(const PhoneScene& s) {
-  // a parsed scene is an object: add the two fields after its brace (a later "type" or
-  // "stamp" in the body is not the streamer's; JSON readers keep the last of a repeated key,
-  // so these go first and a body's own would win: the agent sends neither)
-  size_t open = s.body.find('{');
-  std::string rest = s.body.substr(open + 1);
-  size_t first = rest.find_first_not_of(" \t\r\n");
-  bool empty = first != std::string::npos && rest[first] == '}';
-  std::string line = "{\"type\":\"scene\",\"stamp\":true" + std::string(empty ? "" : ",") + rest;
-  for (char& c : line)
-    if (c == '\n' || c == '\r') c = ' ';  // one request is one line
-  return line + "\n";
+  // the scene as posted, with the request's type and the stamp asked for, and without the
+  // admission keys, which are the streamer's and not the app's
+  Json j = Json::parse(s.body);
+  j.obj.erase("admit_keys");
+  j.obj.erase("type");
+  j.obj.erase("stamp");
+  std::string rest;
+  dump(j, &rest);
+  return "{\"type\":\"scene\",\"stamp\":true" + std::string(rest.size() > 2 ? "," : "") + rest.substr(1) + "\n";
+}
+
+void AdmitKeys::on_scene(const PhoneScene& s) {
+  keys = s.admit_keys.empty() ? std::vector<std::string>{} : admit_keys_after(keys, s.admit_keys);
+}
+
+bool AdmitKeys::admits(const std::string& token, int64_t now_s) const {
+  return keys.empty() || admit_token_valid(keys, token, now_s);
 }
 
 std::string app_clock_line(double unix_ms) {

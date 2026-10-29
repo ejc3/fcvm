@@ -586,6 +586,36 @@ pub struct FleetAgentArgs {
     /// sysfs root for the GPU inventory and VFIO group lookup (tests)
     #[arg(long, default_value = "/sys", hide = true)]
     pub sysfs_root: std::path::PathBuf,
+
+    /// Phones mode: run Android phones on the last N GPUs of the inventory instead of
+    /// renderers (needs --phone-image, --phone-aosp, --phone-emulator and --phone-apk)
+    #[arg(long, default_value_t = 0, requires_all = ["phone_image", "phone_aosp", "phone_emulator", "phone_apk"])]
+    pub phones: usize,
+
+    /// The phone container image (fleet/phone)
+    #[arg(long)]
+    pub phone_image: Option<String>,
+
+    /// The Android system image and tools built from AOSP source (scripts/phone/aosp.sh
+    /// --root-path), mapped read-only at /android
+    #[arg(long)]
+    pub phone_aosp: Option<std::path::PathBuf>,
+
+    /// The emulator built from source (scripts/phone/emulator.sh --path), mapped read-only
+    /// at /emu
+    #[arg(long)]
+    pub phone_emulator: Option<std::path::PathBuf>,
+
+    /// The app every phone runs (Robot Park, scripts/phone/app.sh); its directory is mapped
+    /// read-only at /work
+    #[arg(long)]
+    pub phone_apk: Option<std::path::PathBuf>,
+
+    /// A warm snapshot of a running phone (`fcvm snapshot create --gpu-warm` of a phone
+    /// launched as this agent launches one): each phone is a clone of it on its own GPU
+    /// (flow B, about 6 s to the app's first frame) instead of a cold boot
+    #[arg(long)]
+    pub phone_snapshot: Option<String>,
 }
 
 // ============================================================================

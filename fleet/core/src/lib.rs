@@ -12,6 +12,7 @@ pub mod budget;
 pub mod director;
 pub mod event;
 pub mod history;
+pub mod phone;
 pub mod protocol;
 pub mod scene;
 pub mod state;

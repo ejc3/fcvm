@@ -161,6 +161,34 @@ pub enum Intent {
     ClaimAutopilot {
         on: bool,
     },
+    /// Borrow a phone (phones mode): `phone` names one (`phone-2`), or none takes any free one.
+    ClaimPhone {
+        phone: Option<String>,
+    },
+    /// Give the viewer's phone back; `claim`, when given, must name its session.
+    ReleasePhone {
+        claim: Option<String>,
+    },
+    /// Zoom every viewer's phones out (each phone shows its app's bars) or back in.
+    PhonesZoom {
+        out: bool,
+    },
+    /// One of the fixed take-over actions, on the viewer's borrowed phone.
+    PhoneAction {
+        claim: Option<String>,
+        action: crate::phone::PhoneAction,
+    },
+}
+
+fn opt_str(args: &serde_json::Value, key: &str, what: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => Ok(Some(
+            v.as_str()
+                .ok_or_else(|| format!("args.{key} must be {what}"))?
+                .to_string(),
+        )),
+    }
 }
 
 fn num(args: &serde_json::Value, key: &str) -> Result<f64, String> {
@@ -315,6 +343,35 @@ impl Intent {
                     .and_then(|v| v.as_bool())
                     .ok_or("args.on must be true or false")?,
             }),
+            "claim_phone" => Ok(Intent::ClaimPhone {
+                phone: opt_str(args, "phone", "a phone id")?,
+            }),
+            "phones_zoom" => Ok(Intent::PhonesZoom {
+                out: args
+                    .get("out")
+                    .and_then(|v| v.as_bool())
+                    .ok_or("args.out must be true or false")?,
+            }),
+            "release_phone" => Ok(Intent::ReleasePhone {
+                claim: opt_str(args, "claim", "a claim id")?,
+            }),
+            "phone_action" => {
+                // Fail closed: only the enumerated names, never anything passed through.
+                let action = args
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .and_then(crate::phone::PhoneAction::parse)
+                    .ok_or_else(|| {
+                        format!(
+                            "args.action must be one of {}",
+                            crate::phone::PhoneAction::NAMES
+                        )
+                    })?;
+                Ok(Intent::PhoneAction {
+                    claim: opt_str(args, "claim", "a claim id")?,
+                    action,
+                })
+            }
             other => Err(format!("unknown intent {other:?}")),
         }
     }

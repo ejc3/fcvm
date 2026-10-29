@@ -33,7 +33,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
       libxcomposite1 libxcursor1 libxi6 libxtst6 libxdamage1 libxrandr2 libasound2t64 libdbus-1-3 \
       libbsd0 libgbm1 libdrm2 libxext6 libxfixes3 libxrender1 libfontconfig1 libfreetype6 libsm6 \
       libice6 libxcb1 libxkbcommon0 libxkbcommon-x11-0 libnspr4 libexpat1 libuuid1 \
-      iproute2 procps util-linux ca-certificates libssl3t64 libgrpc++1.51t64 libprotobuf32t64 \
+      iproute2 procps util-linux jq ca-certificates libssl3t64 libgrpc++1.51t64 libprotobuf32t64 \
     && rm -rf /var/lib/apt/lists/*
 # glvnd and the Vulkan loader find NVIDIA's libraries (mounted by the CDI spec) through these.
 RUN mkdir -p /usr/share/glvnd/egl_vendor.d /usr/share/vulkan/icd.d \

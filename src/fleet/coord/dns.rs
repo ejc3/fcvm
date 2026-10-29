@@ -39,14 +39,19 @@ pub struct Fact {
 /// (generation 0) for as long as it has the same addresses.
 pub fn facts(state: &State) -> Vec<Fact> {
     let f = &state.fleet;
-    let units = f.slots.values().chain(f.ec2.values()).map(|s| Fact {
-        id: s.id.clone(),
-        generation: s.observed.generation,
-        ipv6: s.observed.ipv6.clone(),
-        ipv4: s.observed.ipv4.clone(),
-        v4_port: s.observed.v4_port,
-        published: s.published.clone(),
-    });
+    let units = f
+        .slots
+        .values()
+        .chain(f.ec2.values())
+        .chain(f.phones.values())
+        .map(|s| Fact {
+            id: s.id.clone(),
+            generation: s.observed.generation,
+            ipv6: s.observed.ipv6.clone(),
+            ipv4: s.observed.ipv4.clone(),
+            v4_port: s.observed.v4_port,
+            published: s.published.clone(),
+        });
     let aggregators = f.hosts.values().filter_map(|h| {
         Some(Fact {
             id: fleet_core::state::aggregate_id(&h.name)?,

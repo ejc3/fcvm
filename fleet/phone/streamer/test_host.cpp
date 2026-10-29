@@ -156,6 +156,25 @@ int main() {
     j = Json::parse(app_clock_line(1761100012345.0));
     CHECK(j.at("type").str == "clock" && j.at("unix_ms").num == 1761100012345.0, "%s", app_clock_line(1761100012345.0).c_str());
   }
+  {  // direct-stream admission, as the renderer: the coordinator's test vector (key 07 x 32,
+     // viewer v-3, expiry 1000), and every client while no scene brought keys
+    const std::string tok = "v1.1000.v-3.77RQqtaEAwJ9OBEoNeX1QubmZTlMfZcYJtIdWkCSW7Q";
+    AdmitKeys a;
+    CHECK(a.admits("", 999), "no keys: every client");
+    PhoneScene sc = parsed("{\"epoch_unix_ms\":1000,\"admit_keys\":[\"0707070707070707070707070707070707070707070707070707070707070707\"]}");
+    a.on_scene(sc);
+    CHECK(a.admits(tok, 999), "the coordinator's token opens a phone stream");
+    CHECK(!a.admits("", 999) && !a.admits(tok, 1001), "no token, or an expired one, opens none");
+    a.on_scene(parsed("{\"epoch_unix_ms\":1000}"));
+    CHECK(a.admits("", 999), "a scene without keys opens every stream again");
+    std::string err;
+    PhoneScene bad;
+    CHECK(!phone_scene_parse("{\"epoch_unix_ms\":1,\"admit_keys\":[\"xx\"]}", &bad, &err), "a key that is not 64 hex digits");
+    // the keys are the streamer's: the app is not sent them
+    Json j = Json::parse(app_scene_line(sc));
+    CHECK(!j.has("admit_keys") && j.at("epoch_unix_ms").num == 1000 && j.at("type").str == "scene", "%s",
+          app_scene_line(sc).c_str());
+  }
   {  // the gate: the wall's grid of the app's frames, each once; the screen at most fps a second
     PhoneScene sc = parsed("{\"epoch_unix_ms\":1000}");
     FrameGate g(30);

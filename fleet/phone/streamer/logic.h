@@ -6,6 +6,7 @@
 
 #include <deque>
 #include <string>
+#include <vector>
 
 #include "stamp.h"
 
@@ -23,10 +24,19 @@ struct PhoneScene {
   long long rect_from_frame = -1;     // the first frame (scene time x 30) drawn with `rect`
   bool has_previous = false;
   Rect4 previous;                     // drawn before rect_from_frame
+  std::vector<std::string> admit_keys;  // raw, from the scene's admit_keys (admit.h)
   std::string body;
 };
 // Parses and checks a scene body; false with the field named in *err.
 bool phone_scene_parse(const std::string& body, PhoneScene* out, std::string* err);
+
+// Direct-stream admission, as the renderer does it (Pipeline::admits): the keys the scenes
+// brought (admit_keys_after), and with none a stream for every client.
+struct AdmitKeys {
+  std::vector<std::string> keys;
+  void on_scene(const PhoneScene& s);
+  bool admits(const std::string& token, int64_t now_s) const;
+};
 
 // The app's control request for a scene (PROTOCOL.md, "Phone app"): the body as posted,
 // with `"type": "scene"` and `"stamp": true` added, as one line.

@@ -130,4 +130,62 @@ has "$D" "streamer fail: the app did not start: am start" && ok "an app that doe
   || bad "an app that does not start: $(cat "$D/log" "$D/out")"
 has "$D" "streamer streaming" && bad "a phone without its app was streamed" || ok "a phone without its app is never streamed"
 stopped "$D" && ok "the emulator of a phone whose app did not start is stopped" || bad "the emulator of a phone whose app did not start still runs"
+# `action`: each name sends its one request to the app's control socket (a stand-in that
+# records what it is sent); switch_screen and dark_mode toggle; any other name is refused.
+port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+python3 -c '
+import os, socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(16)
+with open(sys.argv[2], "a") as log:
+    while True:
+        c, _ = s.accept(); f = c.makefile("rw")
+        for line in f:
+            log.write(line); log.flush()
+            # a reply the test set ($dir/reply, used once), else ok
+            try:
+                with open(sys.argv[3]) as r: reply = r.read()
+                os.remove(sys.argv[3])
+            except FileNotFoundError:
+                reply = "{\"ok\": true}\n"
+            f.write(reply); f.flush()
+        c.close()
+' "$port" "$dir/ctl.log" "$dir/reply" &
+ctl=$!
+for _ in $(seq 1 50); do (exec 3<> "/dev/tcp/127.0.0.1/$port") 2> /dev/null && break; sleep 0.1; done
+act() { PHONE_CTL_PORT=$port PHONE_RUN="$dir" "$phone" action "$1" > /dev/null 2> "$dir/act.err"; }
+for a in switch_screen switch_screen rotate dark_mode dark_mode dance wave gpu_benchmark restart_app dark_mode restart_app dark_mode; do
+  act "$a" || bad "action $a failed: $(cat "$dir/act.err")"
+done
+want='{"type":"action","name":"info"}
+{"type":"action","name":"scene"}
+{"type":"action","name":"rotate"}
+{"type":"action","name":"dark"}
+{"type":"action","name":"light"}
+{"type":"action","name":"dance"}
+{"type":"action","name":"wave"}
+{"type":"action","name":"benchmark"}
+{"type":"action","name":"restart"}
+{"type":"action","name":"dark"}
+{"type":"action","name":"restart"}
+{"type":"action","name":"dark"}'
+[ "$(cat "$dir/ctl.log")" = "$want" ] && ok "each action sends its one request to the app" || bad "the app was sent: $(cat "$dir/ctl.log")"
+for a in reboot_phone shell "rotate; id" ""; do
+  if act "$a"; then bad "action '$a' was accepted"; else rc=$?; [ "$rc" = 2 ] && ok "action '$a' is refused" || bad "action '$a' exited $rc"; fi
+done
+[ "$(wc -l < "$dir/ctl.log")" = 12 ] && ok "a refused action sends the app nothing" || bad "a refused action reached the app"
+# A reply that is not a JSON object without "error" fails the action, and a refused toggle
+# leaves the cached state as it was, so the next one asks for the same change again.
+printf 'not json\n' > "$dir/reply"
+if act rotate; then bad "an action the app answered with 'not json' succeeded"; else ok "an action whose reply is not JSON fails"; fi
+printf '{"error":"the app is not on screen"}\n' > "$dir/reply"
+if act switch_screen; then bad "a refused switch_screen succeeded"; else ok "a refused toggle fails"; fi
+act switch_screen || bad "switch_screen failed: $(cat "$dir/act.err")"
+[ "$(tail -2 "$dir/ctl.log")" = '{"type":"action","name":"info"}
+{"type":"action","name":"info"}' ] && ok "a refused toggle is asked for again, not undone" || bad "after a refused switch_screen the app was sent: $(tail -2 "$dir/ctl.log")"
+kill "$ctl" 2> /dev/null || true
+# The streamer's Makefile runs protoc once for its generated sources, however parallel the
+# build (a dry run names each command it would run).
+n=$(make -C "$(dirname "$phone")/streamer" -n -j4 OUT="$dir/pb" "$dir/pb/screen.pb.cc" "$dir/pb/screen.grpc.pb.cc" 2> /dev/null | grep -c '^protoc' || true)
+[ "$n" = 1 ] && ok "a parallel streamer build runs protoc once" || bad "a parallel streamer build runs protoc $n times"
 exit $fail
