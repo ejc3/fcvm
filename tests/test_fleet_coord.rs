@@ -6057,8 +6057,8 @@ async fn admission_keys_reach_renderers_and_layouts_but_no_browser() {
 
 /// A GPU host's hello that arrives during a wake gets its assignment at once, with every
 /// GPU placed and none on standby: while the fleet is still waking, and after the EC2 half
-/// alone made it awake (staging 2026-10-29: awake at 16:21:35, the host's hello at
-/// 16:22:56). The agent starts no VM before its assignment, so an assignment held here is
+/// alone made it awake, before any GPU host's hello (the order of issue 1437's wake). The
+/// agent starts no VM before its assignment, so an assignment held here is
 /// time a viewer sees black tiles.
 #[tokio::test]
 async fn a_hello_during_a_wake_gets_its_assignment_at_once() {
