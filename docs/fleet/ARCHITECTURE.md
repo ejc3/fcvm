@@ -43,7 +43,9 @@ recording:
 - **The time, rendered.** A clock in the world shows the current UTC time to the second,
   rendered by the GPUs from `t`, continuous across tile seams.
 - **Input to pixels, measured.** After a camera drag the page shows the time from the
-  viewer's input to the first frame that reflects it.
+  viewer's input to the first frame that reflects it. In a burst of drags that is the
+  last drag whose camera key reached the page: the page hears its claim every 200 ms,
+  and a drag replaces the keys of the drags before it.
 - **A stats switch.** It overlays each tile with frames per second, frame age (when the
   page drew the frame minus its `t`, against a clock the page syncs with the coordinator,
   with when the frame arrived and when it was decoded), the GPU's

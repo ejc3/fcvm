@@ -44,11 +44,7 @@ export interface Notice {
 export interface CameraWatch {
   id: string;
   inputAt: number;
-  /** The latest camera key t the page held when it sent the intent. */
-  keysBefore: number | null;
-  /** The version its receipt named, once the receipt arrives. */
-  receiptVersion: number | null;
-  /** Scene t from which frames show the move, once known. */
+  /** Scene t from which frames show the move: its own key's, once the page has seen it. */
   tEff: number | null;
 }
 
@@ -322,16 +318,6 @@ function settle(pending: PendingIntent[], version: number): PendingIntent[] {
   return pending.filter((p) => p.receipt === null || p.receipt.version > version);
 }
 
-/** The camera keys a viewer's own camera intents land in: its own GPU's. */
-function ownKeys(s: ClientState): CameraKey[] | null {
-  return s.own.claim?.camera ?? null;
-}
-
-function latestKeyT(keys: readonly CameraKey[] | null): number | null {
-  if (!keys || keys.length === 0) return null;
-  return Math.max(...keys.map((k) => k.t));
-}
-
 function appendGpu(history: Record<string, GpuSample[]>, st: FleetState, at: number): Record<string, GpuSample[]> {
   let out = history;
   for (const t of st.tiles) {
@@ -347,16 +333,25 @@ function appendGpu(history: Record<string, GpuSample[]>, st: FleetState, at: num
 }
 
 /**
- * When a camera intent's move shows: the key the coordinator tagged with the
- * intent's id, or, untagged, the first key newer than any the page held when it
- * sent the intent, once the receipt's version is accepted.
+ * When a camera intent's move shows: the key the coordinator tagged with the intent's id.
+ * The page hears its claim every 200 ms (live.rs `tell_claim`) and a drag drops every key
+ * after the moment it is applied, so in a fast burst only the last drag's key reaches the
+ * page. A watch whose key the page never saw is dropped once a later one finds its key: its
+ * move was replaced, and no other key says when it showed (a later autopilot key times it
+ * seconds late, the 11.6 s staging read on 2026-10-30).
  */
-function resolveWatch(w: CameraWatch, keys: readonly CameraKey[] | null, version: number): CameraWatch {
-  if (w.tEff !== null || !keys) return w;
-  for (const k of keys) if (k.intent === w.id) return { ...w, tEff: k.t };
-  if (w.receiptVersion === null || version < w.receiptVersion) return w;
-  const newer = keys.filter((k) => w.keysBefore === null || k.t > w.keysBefore).map((k) => k.t);
-  return newer.length === 0 ? w : { ...w, tEff: Math.min(...newer) };
+function resolveWatches(watches: readonly CameraWatch[], keys: readonly CameraKey[] | null): CameraWatch[] {
+  if (!keys) return [...watches];
+  const resolved = watches.map((w) => {
+    if (w.tEff !== null) return w;
+    const k = keys.find((k) => k.intent === w.id);
+    return k ? { ...w, tEff: k.t } : w;
+  });
+  let last = -1;
+  resolved.forEach((w, i) => {
+    if (w.tEff !== null) last = i;
+  });
+  return resolved.filter((w, i) => w.tEff !== null || i > last);
 }
 
 export function reduce(s: ClientState, e: ClientEvent): ClientState {
@@ -376,7 +371,7 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
         e.intent.name === "claim_camera"
           ? [
               ...s.cameraWatches,
-              { id: e.intent.id, inputAt: e.at, keysBefore: latestKeyT(ownKeys(s)), receiptVersion: null, tEff: null },
+              { id: e.intent.id, inputAt: e.at, tEff: null },
             ].slice(-WATCHES_KEPT)
           : s.cameraWatches;
       // Pressing pause or play, or taking the camera with a drag, shows at once.
@@ -484,13 +479,12 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
           if (s.own.claim !== null && s.own.claim.id !== msg.claim.id) return s;
           const agreed = s.own.autopilot !== null && msg.claim.autopilot === s.own.autopilot.on;
           const own = { ...s.own, requestId: null, claim: msg.claim, autopilot: agreed ? null : s.own.autopilot };
-          const cameraWatches = s.cameraWatches.map((w) => resolveWatch(w, msg.claim.camera, s.version));
+          const cameraWatches = resolveWatches(s.cameraWatches, msg.claim.camera);
           return { ...s, own, cameraWatches };
         }
         case "snapshot": {
           if (msg.version <= s.version) return s; // older or repeated: dropped
           const accepted = msg.state;
-          const cameraWatches = s.cameraWatches.map((w) => resolveWatch(w, ownKeys(s), msg.version));
           // The same generation (or the first): overlays follow it at once. A newer one
           // waits until the frame drawer has swapped to it.
           const shownLayout =
@@ -507,7 +501,6 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
             shownLayout,
             version: msg.version,
             pending: settle(s.pending, msg.version),
-            cameraWatches,
             gpuHistory: appendGpu(s.gpuHistory, accepted, e.at),
             history,
           };
@@ -541,11 +534,7 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
               ].slice(-NOTICES_KEPT);
             }
           }
-          const cameraWatches = applied
-            ? s.cameraWatches.map((w) =>
-                w.id === msg.id ? resolveWatch({ ...w, receiptVersion: msg.version }, ownKeys(s), s.version) : w,
-              )
-            : s.cameraWatches.filter((w) => w.id !== msg.id);
+          const cameraWatches = applied ? s.cameraWatches : s.cameraWatches.filter((w) => w.id !== msg.id);
           let own = s.own;
           if (s.own.requestId === msg.id) {
             // Applied: the claim message (which can come before or after this) ends the request.

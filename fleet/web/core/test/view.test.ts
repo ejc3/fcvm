@@ -20,6 +20,7 @@ import {
   familyLine,
   pointerTile,
   relaunchParts,
+  timelineOf,
   sourceIdFor,
   wallView,
   type WallInput,
@@ -889,6 +890,15 @@ describe("restart timings", () => {
       ["first frame", 250],
     ]);
     expect(relaunchParts({ launch_ms: 9000, capacity_wait_ms: 20_000 }).map(([k]) => k)).toEqual(["capacity_wait_ms", "launch_ms"]);
+  });
+
+  // The renderer's own startup times are counted from its process start, inside
+  // "renderer started" and "first frame": as parts they were counted twice, and the
+  // timeline read 0.8 s longer than the restart (staging, 2026-10-30).
+  it("leaves the renderer's own startup times out of the parts, so the parts add up to the total", () => {
+    const phases = { ack_ms: 1964, container_ms: 273, first_frame_ms: 594, gpu_ms: 1010, renderer_first_frame_ms: 556, renderer_gpu_ready_ms: 255, restore_ms: 2133, teardown_ms: 4842, total_ms: 7847 };
+    expect(relaunchParts(phases).map(([k]) => k)).toEqual(["teardown_ms", "restore_ms", "gpu_ms", "container_ms", "first_frame_ms"]);
+    expect(Math.abs(timelineOf(phases).total - phases.total_ms)).toBeLessThanOrEqual(5);
   });
 });
 

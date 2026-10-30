@@ -78,7 +78,9 @@ const PHASE_TEXT: Record<string, string> = {
  * The parts of a restart, in the order they run, with the label each gets. The
  * coordinator reports `<part>_ms`; `restore_ms` contains `gpu_ms`, so the
  * timeline shows the restore without the GPU and the GPU after it. `total_ms`
- * and `ack_ms` are sums or other clocks and are not parts.
+ * and `ack_ms` are sums or other clocks, and the renderer's own startup times
+ * are counted from its process start, inside `container_ms` and `first_frame_ms`:
+ * none of them is a part.
  */
 const PART_ORDER: [string, string][] = [
   ["capacity_wait_ms", "waited for spot capacity"],
@@ -90,7 +92,7 @@ const PART_ORDER: [string, string][] = [
   ["container_ms", "renderer started"],
   ["first_frame_ms", "first frame"],
 ];
-const NOT_PARTS = new Set(["total_ms", "ack_ms"]);
+const NOT_PARTS = new Set(["total_ms", "ack_ms", "renderer_gpu_ready_ms", "renderer_first_frame_ms"]);
 
 /** The parts of a restart's timings, in order, as [key, label, ms]. */
 export function relaunchParts(phases: Record<string, number>): [string, string, number][] {
