@@ -316,6 +316,12 @@ the twelve heights. In Direct mode the page then keeps the streams within 80 Mbi
 renderer's rate: while the sum is over, the smallest tile still at the default quality
 asks for `q=lo` (small tiles lose least on screen), and once every tile is at `lo` the
 tallest stream steps down one height. `?budget=<Mbit/s>` sets another budget for trying it.
+The budget follows the link (`core/linkbudget.ts`): after 10 s of direct streams arriving on
+time it steps up to 160, then 320 Mbit/s, and when frames queue (the median tile's arrival
+time 150 ms over its own lowest) or a quarter of the tiles fall behind, two reports in a row
+step it back down and hold that rung off for 60 s, doubling to 10 minutes. A 3460 x 1946
+wall of 16 tiles needs 135 Mbit/s at std and 43 at lo, so on a link that carries it the
+wall streams std after about 10 s. A browser that asks to save data keeps 80 Mbit/s.
 The page models `lo` as half the default rate and floor, and `hi` as double; the renderer
 has not documented its figures yet. With a tile
 opened, the tiles still on screen around it keep their wall height at `q=lo` (they are
