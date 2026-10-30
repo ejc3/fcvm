@@ -2,7 +2,9 @@
 // separately, must agree pixel for pixel when stitched by whole-image
 // coordinates. Then the encoder's SPS must say frames are never reordered.
 // Run in the container: fleet-renderer-test.
+#include <algorithm>
 #include <cmath>
+#include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -19,6 +21,12 @@
 // reprojection of the sky; 6.10 and 4.45 with the a-trous denoiser and the sky's history clamp.
 #define RMSE_MAX 9.0
 #define GRAIN_MAX 5.5
+// Section 10b's bounds: speckle, % of pixels. Measured on a T4 at the default
+// h (270): cloud deck 1.46 before the cloud bit (2026-10-30), 0.64 after
+// (the 1024-sample hold reads 0.91: the cloud's own fine edges); snow and rock
+// 0.48 with the denoiser's normal stop at ^64, 0.31 at ^8 (the hold 0.21).
+#define SPECKLE_CLOUDS 1.0
+#define SPECKLE_SNOW 0.40
 
 static Scene test_scene() {
   Scene s = default_scene();
@@ -417,6 +425,94 @@ int main(int argc, char** argv) {
     fprintf(stderr, "moving flight against a 1024-sample hold: rmse %.2f, grain %.2f\n", rmse, grain);
     CHECK(grain < GRAIN_MAX, "moving frame's grain against the reference: %.2f (< %.1f)", grain, GRAIN_MAX);
     CHECK(rmse < RMSE_MAX, "moving frame's error against the reference: rmse %.2f (< %.1f)", rmse, RMSE_MAX);
+  }
+
+  // 10b. Speckle while the camera moves: single pixels far from all their
+  // neighbours, which a viewer sees as dithered dots and which H.264 turns
+  // into blotches. Counted as the share of pixels whose luminance is more
+  // than 12 (8-bit) from the median of their 3 x 3 neighbourhood, in a
+  // moving frame at 1 sample per pixel with 12 frames of history, against the
+  // same pose held to 1024 samples. A sunset cloud deck seen from above (the
+  // first hit flips between a cloud and the ground behind it at every cloud
+  // edge) and snow and rock under a low sun (detail normals turn sharply
+  // between neighbours). Bounds: SPECKLE_* (top of this file).
+  {
+    const char* name[] = {"cloud deck", "snow and rock"};
+    const Keyframe cam[2][2] = {{{0, {-58, 7, -79}, {-76, 5.2, -93}, 62}, {11, {-62, 7, -81}, {-82, 5.2, -93}, 62}},
+                                {{0, {-47, 2.6, -101}, {-56, 2.75, -114.75}, 55}, {10, {-50, 2.6, -100}, {-56, 2.75, -114.75}, 55}}};
+    const double tod[2] = {0.78, 0.79}, bound[2] = {SPECKLE_CLOUDS, SPECKLE_SNOW};
+    for (int c = 0; c < 2; c++) {
+      Scene f = s;
+      f.words.clear();
+      f.lights.clear();
+      f.time_of_day = tod[c];
+      f.camera = {cam[c][0], cam[c][1]};
+      if (c == 1) f.weather = {WeatherKey{0, 0.5, 0, 0, 1.2}};
+      const long kq = 150;
+      std::vector<std::pair<double, int>> seq;
+      for (int k = 11; k >= 0; k--) seq.push_back({(kq - k) / 30.0, 1});
+      r.set_text_overlay(false);
+      r.set_quality(0);
+      Img mv = draw(r, f, Rect{0, 0, 1, 1}, 2 * h, seq, true);
+      Scene held = held_reference(f, kq / 30.0);
+      std::vector<std::pair<double, int>> hold;
+      for (int n = 0; n < 16; n++) hold.push_back({kq / 30.0, 64});
+      Img ref = draw(r, held, Rect{0, 0, 1, 1}, 2 * h, hold, true);
+      r.set_text_overlay(true);
+      r.set_quality(-1);
+      auto speckle = [](const Img& im) {
+        int W = im.tile.w, H = im.tile.h;
+        std::vector<float> l((size_t)W * H);
+        for (int p = 0; p < W * H; p++)
+          l[p] = 0.2126f * im.rgba[4 * p] + 0.7152f * im.rgba[4 * p + 1] + 0.0722f * im.rgba[4 * p + 2];
+        long n = 0, out = 0;
+        for (int y = 1; y < H - 1; y++)
+          for (int x = 1; x < W - 1; x++) {
+            float v[9];
+            for (int k = 0; k < 9; k++) v[k] = l[(size_t)(y + k / 3 - 1) * W + x + k % 3 - 1];
+            std::nth_element(v, v + 4, v + 9);
+            out += std::fabs(l[(size_t)y * W + x] - v[4]) > 12.0f;
+            n++;
+          }
+        return 100.0 * out / n;
+      };
+      double sm = speckle(mv), sr = speckle(ref);
+      fprintf(stderr, "%s, moving at 1 sample per pixel: speckle %.3f%% of pixels (the 1024-sample hold: %.3f%%)\n", name[c], sm, sr);
+      CHECK(sm < bound[c], "%s: speckle %.3f%% (< %.2f%%)", name[c], sm, bound[c]);
+    }
+  }
+
+  // 11. A stream taller than the drawn frame (an opened tile asks 720 while
+  // its frame is drawn at a wall height) is interpolated, not magnified into
+  // squares. The whole image drawn at 2h and scaled to a stream 2.5 times as
+  // tall: with nearest-pixel scaling every change of the luma along a row
+  // falls between two stream pixels that read different drawn pixels; with
+  // interpolation the change spreads over the pixels between (about 1 in
+  // 2.5 pairs straddles a drawn pixel's edge).
+  {
+    Scene f = s;
+    f.words.clear();
+    Tile src = tile_geometry(Rect{0, 0, 1, 1}, f.image_aspect, 2 * h);
+    r.reset_history();
+    r.render(f, src, tm, false, 1);
+    int sh = 5 * h;
+    Tile dst = tile_geometry(Rect{0, 0, 1, 1}, f.image_aspect, sh);
+    size_t pitch = 0;
+    void* nv = r.alloc_nv12(dst.w, dst.h, &pitch);
+    r.to_nv12(nv, pitch, dst.w, dst.h, 0, 0, dst.full_h);
+    std::vector<uint8_t> y((size_t)dst.w * dst.h);
+    cudaMemcpy2D(y.data(), dst.w, nv, pitch, dst.w, dst.h, cudaMemcpyDeviceToHost);
+    r.free_dev(nv);
+    double sc = (double)src.full_h / dst.full_h, at_edge = 0, all = 0;
+    for (int j = 0; j < dst.h; j++)
+      for (int i = 0; i + 1 < dst.w; i++) {
+        double dv = std::abs((int)y[(size_t)j * dst.w + i + 1] - (int)y[(size_t)j * dst.w + i]);
+        all += dv;
+        if (std::floor(i * sc + 0.5 * sc) != std::floor((i + 1) * sc + 0.5 * sc)) at_edge += dv;
+      }
+    double share = all > 0 ? at_edge / all : 1.0;
+    fprintf(stderr, "stream at %.2fx the drawn height: %.2f of the luma's change along rows is at drawn pixels' edges\n", 1 / sc, share);
+    CHECK(share < 0.6, "a taller stream is interpolated: %.2f of the change at drawn pixels' edges (< 0.6)", share);
   }
 
   // 7. The encoder's SPS, in the sequence header and in a keyframe, carries a VUI

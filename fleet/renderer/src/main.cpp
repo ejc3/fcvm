@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -24,7 +25,7 @@ static void usage() {
           "usage: fleet-renderer [serve]                      serve on $PORT (8080)\n"
           "       fleet-renderer still OUT.ppm [--t T] [--h H] [--scene FILE] [--spp N] [--frames N | --seq N] [--checker 0|2|4] [--hq 0|1]\n"
           "       fleet-renderer bench [--h H]... [--frames N]   time render + encode per height\n"
-          "       fleet-renderer quality OUTDIR --t T [--scene FILE] [--h H] [--cols C --rows R] [--frames N] [--ref N] [--tile I]\n"
+          "       fleet-renderer quality OUTDIR --t T [--scene FILE] [--h H] [--cols C --rows R] [--frames N] [--ref N] [--tile I] [--encode SH]\n"
           "                                                     a moving frame of a C x R grid against a held reference: RMSE, render ms\n"
           "       fleet-renderer test [H]                       the seam test (whole image vs 2x2 tiles)\n"
           "       fleet-renderer startup [H]                    ms from process start to GPU ready, first frame, first encode\n"
@@ -108,7 +109,7 @@ static int cmd_quality(int argc, char** argv) {
   if (argc < 3) { usage(); return 2; }
   std::string out = argv[2];
   double t = 0;
-  int h = 360, frames = 24, ref = 1024, cols = 4, rows = 4, only = -1;
+  int h = 360, frames = 24, ref = 1024, cols = 4, rows = 4, only = -1, enc_h = 0;
   Scene sc = default_scene();
   for (int i = 3; i + 1 < argc; i += 2) {
     std::string k = argv[i];
@@ -119,6 +120,7 @@ static int cmd_quality(int argc, char** argv) {
     else if (k == "--cols") cols = atoi(argv[i + 1]);
     else if (k == "--rows") rows = atoi(argv[i + 1]);
     else if (k == "--tile") only = atoi(argv[i + 1]);
+    else if (k == "--encode") enc_h = atoi(argv[i + 1]);
     else if (k == "--scene") sc = parse_scene(read_file(argv[i + 1]));
     else { usage(); return 2; }
   }
@@ -153,15 +155,80 @@ static int cmd_quality(int argc, char** argv) {
     Tile tl = tile_geometry(rc, sc.image_aspect, h);
     r.reset_history();
     r.set_quality(-1);
+    // --encode SH: every moving frame also goes through the stream path at
+    // height SH (the tile plus its overlap, scaled from the drawn frame as a
+    // stream is) into one H.264 file per quality, OUTDIR/tile<I>-<q>.h264
+    struct QEnc {
+      H264Encoder enc;
+      void* nv = nullptr;
+      size_t pitch = 0;
+      FILE* fp = nullptr;
+      size_t bytes = 0;
+    };
+    std::vector<std::unique_ptr<QEnc>> encs;
+    Tile eg{};
+    int el = 0, er = 0, et = 0, eb = 0;
+    if (enc_h > 0) {
+      eg = tile_geometry(rc, sc.image_aspect, enc_h);
+      int M = (int)envd("MARGIN", 16);
+      el = std::min(M, eg.x0); er = std::max(0, std::min(M, eg.full_w - (eg.x0 + eg.w)));
+      et = std::min(M, eg.y0); eb = std::max(0, std::min(M, eg.full_h - (eg.y0 + eg.h)));
+      auto even = [M](int* a, int* c) {
+        if ((*a + *c) & 1) {
+          if (*c > 0 && *c < M) (*c)--;
+          else if (*a > 0) (*a)--;
+          else (*c)--;
+        }
+      };
+      even(&el, &er);
+      even(&et, &eb);
+      for (int q = 0; q < 3; q++) {
+        auto e = std::make_unique<QEnc>();
+        int ew = eg.w + el + er, eh = eg.h + et + eb;
+        e->nv = r.alloc_nv12(ew, eh, &e->pitch);
+        if (!e->enc.open(r.cu_context(), e->nv, e->pitch, ew, eh, 30, q, &err)) { fprintf(stderr, "encoder: %s\n", err.c_str()); return 1; }
+        std::string path = out + "/tile" + std::to_string(ti) + "-" + quality_name(q) + ".h264";
+        e->fp = fopen(path.c_str(), "wb");
+        if (!e->fp) throw std::runtime_error("cannot write " + path);
+        encs.push_back(std::move(e));
+      }
+    }
     std::vector<double> ms;
     for (int f = frames - 1; f >= 0; f--) {
       r.render(s, tl, (k - f) / 30.0, true);
       if (f < frames - 8) ms.push_back(r.stats().render_ms);
+      for (size_t q = 0; q < encs.size(); q++) {
+        QEnc& e = *encs[q];
+        r.to_nv12(e.nv, e.pitch, e.enc.width(), e.enc.height(), eg.x0 - el, eg.y0 - et, eg.full_h);
+        std::vector<uint8_t> au;
+        bool key = false;
+        if (!e.enc.encode(f == frames - 1, &au, &key, &err)) { fprintf(stderr, "encode: %s\n", err.c_str()); return 1; }
+        fwrite(au.data(), 1, au.size(), e.fp);
+        // the rate over the second half of the sequence, after the VBV settles
+        if (f < frames / 2) e.bytes += au.size();
+      }
+    }
+    for (size_t q = 0; q < encs.size(); q++) {
+      QEnc& e = *encs[q];
+      fclose(e.fp);
+      fprintf(stderr, "tile %d %s: %dx%d crop l%d t%d r%d b%d, target %u bit/s, used %.0f bit/s\n", ti, quality_name((int)q),
+              e.enc.width(), e.enc.height(), el, et, er, eb, e.enc.bitrate(), e.bytes * 8.0 * 30.0 / std::max(1, frames / 2));
+      r.free_dev(e.nv);
     }
     int spp = r.stats().spp;
     bool hq = r.stats().hq;
     std::vector<uint8_t> a, b;
     r.download_rgba(&a);
+    if (enc_h > 0) {  // the samples each pixel's moving output resolved (history included), capped at 255
+      std::vector<float> hd;
+      r.download_hdr(&hd);
+      std::string path = out + "/tile" + std::to_string(ti) + "-samples.pgm";
+      FILE* fp = fopen(path.c_str(), "wb");
+      if (!fp) throw std::runtime_error("cannot write " + path);
+      fprintf(fp, "P5\n%d %d\n255\n", tl.w, tl.h);
+      for (size_t p = 0; p < (size_t)tl.w * tl.h; p++) fputc((int)std::min(255.0f, std::max(0.0f, hd[4 * p + 3])), fp);
+      fclose(fp);
+    }
     if (ref <= 0) b = a;  // timing only
     // the reference: the same pose and scene time, held, on the same path
     Scene rs = hs;
