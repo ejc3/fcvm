@@ -388,6 +388,10 @@ async fn apply_restore_epoch(
     restore_hook: Option<&str>,
     gpus: &[String],
 ) {
+    // A snapshot of a running VM was taken with the agent's console held quiet
+    // (`--prepare-snapshot-network`), and this clone inherits that hold. Release it
+    // first, so every line of this restore reaches the console.
+    crate::console::release_source_snapshot_hold();
     // Test-only hold between the watcher's read of the restore document and the
     // restore sequence: a guest that stalls here, as one paging its memory in from a
     // cold file does, must still step its clock to the host's (issue 1375).

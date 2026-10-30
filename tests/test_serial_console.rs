@@ -212,3 +212,146 @@ async fn test_serial_console_after_restore() -> Result<()> {
     println!("✅ SERIAL CONSOLE TEST PASSED!");
     Ok(())
 }
+
+/// Poll `log` until a line satisfies `found`, or `limit` passes.
+async fn wait_for_log_line(
+    log: &std::path::Path,
+    limit: Duration,
+    found: impl Fn(&str) -> bool,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(log) {
+            if contents.lines().any(&found) {
+                return true;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The source snapshot boundary holds the agent's console quiet from the prepare to
+/// the resume, and a clone of a snapshot taken under the hold has a live console.
+///
+/// A snapshot of a running VM (a startup snapshot, `fcvm snapshot create`) is paused
+/// right after `--prepare-snapshot-network`, and the agent logs into that window: the
+/// prepared gate refuses the restore watcher's metadata fetches and the first five
+/// refusals are logged. Two startup snapshots taken with those lines on the console
+/// restored with dead consoles (CI runs 41036024614 on arm64, seven restores of
+/// one snapshot; 41018542774 on x64). The pre-start snapshot was already protected by
+/// the cache handshake's quiesce (#708).
+///
+/// The test runs the boundary's one-shots by hand, without a pause, and writes a
+/// line into the agent's own stderr pipe in between, so the line takes the path the
+/// hold governs (the agent's console writer).
+///
+/// RED BEFORE THE FIX: the held line reached the console while the boundary was
+/// prepared.
+#[tokio::test]
+async fn the_snapshot_boundary_holds_the_agent_console_until_the_resume() -> Result<()> {
+    let (vm_name, clone_name, snap_tag, _) = common::unique_names("uart-hold");
+    let held = format!("UART-HELD-{}", std::process::id());
+
+    let (mut child, pid, log) = common::spawn_fcvm_with_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "rootless",
+            common::TEST_IMAGE,
+        ],
+        &vm_name,
+    )
+    .await
+    .context("spawning the source VM")?;
+
+    let on_console =
+        |marker: String| move |line: &str| line.contains("firecracker:") && line.contains(&marker);
+    let outcome = async {
+        common::poll_health_by_pid(pid, 300).await?;
+        common::exec_in_vm(pid, &["/usr/local/bin/fc-agent --prepare-snapshot-network"])
+            .await
+            .context("preparing the snapshot boundary")?;
+        let written = common::exec_in_vm(
+            pid,
+            &[&format!(
+                "P=$(pgrep -o -x fc-agent) && echo {held} > /proc/$P/fd/2"
+            )],
+        )
+        .await;
+        let leaked = match written {
+            Ok(_) => {
+                wait_for_log_line(&log, Duration::from_secs(3), on_console(held.clone())).await
+            }
+            Err(e) => {
+                let _ =
+                    common::exec_in_vm(pid, &["/usr/local/bin/fc-agent --resume-snapshot-network"])
+                        .await;
+                return Err(e.context("writing into the agent's stderr"));
+            }
+        };
+        common::exec_in_vm(pid, &["/usr/local/bin/fc-agent --resume-snapshot-network"])
+            .await
+            .context("resuming the snapshot boundary")?;
+        let released =
+            wait_for_log_line(&log, Duration::from_secs(10), on_console(held.clone())).await;
+
+        // A clone inherits the hold its snapshot was taken under and must release it.
+        common::create_snapshot_by_pid(pid, &snap_tag).await?;
+        let (mut clone, clone_pid, clone_log) = common::spawn_fcvm_with_log_path(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snap_tag,
+                "--name",
+                &clone_name,
+            ],
+            &clone_name,
+        )
+        .await
+        .context("restoring the clone")?;
+        let clone_console = async {
+            common::poll_health_by_pid(clone_pid, 120).await?;
+            anyhow::Ok(
+                wait_for_log_line(&clone_log, Duration::from_secs(30), |l| {
+                    l.contains("firecracker:") && l.contains("[fc-agent] handling restore")
+                })
+                .await,
+            )
+        }
+        .await;
+        common::kill_process(clone_pid).await;
+        let _ = clone.wait().await;
+        anyhow::Ok((leaked, released, clone_console?, clone_log))
+    }
+    .await;
+
+    common::kill_process(pid).await;
+    let _ = child.wait().await;
+    let _ = common::delete_snapshot(&snap_tag).await;
+
+    let (leaked, released, clone_console, clone_log) = outcome?;
+    assert!(
+        !leaked,
+        "a line the agent wrote while the boundary was prepared reached the console; a pause \
+         there can capture the UART mid-transmit; log at {}",
+        log.display()
+    );
+    assert!(
+        released,
+        "the held line never reached the console after the resume; log at {}",
+        log.display()
+    );
+    assert!(
+        clone_console,
+        "the clone's restore lines never reached its console; log at {}",
+        clone_log.display()
+    );
+    Ok(())
+}
