@@ -182,8 +182,9 @@ occlusion (`src/render.cu`):
   pixels, with notches, that moved from frame to frame. Now, where the first
   hits of the pixel and its 8 neighbours lie on both sides of the word's
   distance, the ground is marched up to the word at four fixed points of the
-  pixel, and the word shows through the share of them that meet no ground (a
-  cloud in front still hides it by the pixel's own first hit). Every input is a
+  pixel, and the word shows through the share of them that meet no ground. A
+  pixel whose own first hit is a cloud in front of the word hides it, as
+  before (its cloud bit, from round 16, is checked before the ground). Every input is a
   whole-image pixel and the frame's camera, so tiles still match.
 - **The outline.** The glow was added to what lay behind, falling off over 0.05
   em at up to 0.63 of the type's light: a bright rim hugging each letter, which
@@ -193,9 +194,9 @@ occlusion (`src/render.cu`):
 Measured on a T4 (the seam test's new check 10c): a lockup word behind a ridge
 in one tile of a 4 x 4 wall at h=432, 1 sample per pixel with history, the
 camera all but still, drawn with and without the word. Pixels whose word effect
-changed by more than 40 between two consecutive frames: 80 on main, 43 here
+changed by more than 40 between two consecutive frames: 80 on main, 35 here
 (bound 60). The rim, the mean effect 1 to 2 pixels outside the letters over dark
-ground and sky less the mean 4 to 8 pixels out: 8.19 on main, 3.34 here (bound
+ground and sky less the mean 4 to 8 pixels out: 8.19 on main, 3.33 here (bound
 6.0).
 
 The march costs frame time on a tile where terrain cuts a word, and nothing

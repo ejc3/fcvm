@@ -28,7 +28,7 @@
 #define SPECKLE_CLOUDS 1.0
 #define SPECKLE_SNOW 0.40
 // Section 10c's bounds. Measured on a T4: main (93c33125) 80 pixels flickering and a rim of
-// 8.19; with the four-point cut and the glow toward the letters' color, 43 and 3.34.
+// 8.19; with the four-point cut and the glow toward the letters' color, 35 and 3.33.
 #define TEXT_FLICKER_MAX 60
 #define TEXT_RIM_MAX 6.0
 

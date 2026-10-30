@@ -1246,10 +1246,13 @@ __device__ V3 g_ttr[MAX_TEXTS], g_tins[MAX_TEXTS], g_tsun[MAX_TEXTS];
 __device__ __forceinline__ V3 ray_dir(const GCam& c, float px, float py);
 struct Occ {
   float d[9];  // first-hit distances, 1e9 where nothing is hit or only cloud over the sky
+  bool cloud;  // the pixel's own first hit is a cloud (CLOUD_BIT)
   int X, Y;    // the pixel, whole-image
   float pix;
 };
 __device__ float occ_vis(const Occ& o, float t) {
+  // a cloud in front of the overlay hides it, whatever the ground does
+  if (o.cloud && o.d[4] < t) return 0.0f;
   int n = 0;
   for (int k = 0; k < 9; k++) n += o.d[k] >= t;
   if (n == 9) return 1.0f;
@@ -1263,10 +1266,8 @@ __device__ float occ_vis(const Occ& o, float t) {
     cov += th >= 0.0f ? 0.0f : 0.25f;
     ground = ground || th >= 0.0f;
   }
-  // no ground in front at the four points: what hides the pixel, if anything,
-  // is a cloud, and its own first hit says so (the neighbours' ground is theirs)
-  if (!ground) return o.d[4] >= t ? 1.0f : 0.0f;
-  return cov;
+  // no ground in front at the four points: the neighbours' ground is theirs
+  return ground ? cov : 1.0f;
 }
 
 __device__ __forceinline__ V3 text_mid(const GText& g) {
@@ -1961,7 +1962,7 @@ __global__ void k_dn_atrous(float4* out, const float4* in, const float4* guide, 
 // are in (fast motion, a fresh renderer), the denoiser's output (k_dn_*); then
 // the overlays, tone mapping and dither.
 __global__ void k_finish(uint8_t* rgba, float4* hdr, const float4* resolved, const float2* aux, const float4* rg,
-                         const float4* dn) {
+                         const float4* dn, const float4* cur_g) {
   int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y * blockDim.y + threadIdx.y;
   if (i >= cP.ow || j >= cP.oh) return;
   int X = cP.ox0 + i, Y = cP.oy0 + j;
@@ -1980,6 +1981,7 @@ __global__ void k_finish(uint8_t* rgba, float4* hdr, const float4* resolved, con
   }
   Occ occ;  // clouds in the sky do not hide words; the image's edge repeats
   occ.X = X; occ.Y = Y; occ.pix = pix;
+  occ.cloud = cloud_bit(cur_g[(Y - cP.ey0) * cP.ew + (X - cP.ex0)].w);
   for (int k = 0; k < 9; k++) {
     int xx = min(max(X + k % 3 - 1, 0), cP.full_w - 1), yy = min(max(Y + k / 3 - 1, 0), cP.full_h - 1);
     float2 na = aux[(yy - cP.ey0) * cP.ew + (xx - cP.ex0)];
@@ -2473,7 +2475,7 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
   }
   k_finish<<<dim3((ow_ + 7) / 8, (oh_ + 7) / 8), bs, 0, st>>>((uint8_t*)rgba_, (float4*)hdr_, (const float4*)display_,
                                                               (const float2*)ring_aux_[ri], (const float4*)display_g_,
-                                                              (const float4*)dn_[DENOISE_PASSES & 1]);
+                                                              (const float4*)dn_[DENOISE_PASSES & 1], (const float4*)ring_g_[ri]);
   CK(cudaGetLastError());
   CK(cudaEventRecord((cudaEvent_t)ev1_, st));
   CK(cudaEventSynchronize((cudaEvent_t)ev1_));
