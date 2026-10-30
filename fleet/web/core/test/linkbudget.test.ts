@@ -47,6 +47,30 @@ describe("LinkBudget", () => {
     expect(run(b, 5 * UP_AFTER_MS, 5 * UP_AFTER_MS + 500, () => 80, 0.5)).toBe(LINK_RUNGS_BPS[0]);
   });
 
+  it("starts a tile's lowest arrival again when its scene clock changes", () => {
+    // A renderer streams its default scene before the coordinator's, whose epoch moves
+    // every arrival time (local time minus scene time) by the epoch.
+    const b = new LinkBudget();
+    for (let at = 0; at < 2000; at += 500) b.observe(report(at, 40));
+    const epoch = 1_760_000_000_000;
+    expect(run(b, 2000, 2000 + UP_AFTER_MS + 500, () => epoch + 80)).toBe(LINK_RUNGS_BPS[1]);
+  });
+
+  it("does not count a stretch with no streams reporting as on time, or join late reports across it", () => {
+    const b = new LinkBudget();
+    const empty = (at: number) => b.observe({ at, direct: true, arriveMs: {}, behindShare: null });
+    b.observe(report(0, 80));
+    for (let at = 500; at < 60_000; at += 500) empty(at);
+    expect(b.observe(report(60_000, 80))).toBe(LINK_RUNGS_BPS[0]);
+    expect(run(b, 60_500, 60_000 + UP_AFTER_MS - 500, () => 80)).toBe(LINK_RUNGS_BPS[0]);
+    expect(run(b, 60_000 + UP_AFTER_MS, 60_000 + UP_AFTER_MS, () => 80)).toBe(LINK_RUNGS_BPS[1]);
+    // one late report, an outage, one late report: not two in a row
+    const t = 60_000 + UP_AFTER_MS + 500;
+    b.observe(report(t, 480));
+    empty(t + 500);
+    expect(b.observe(report(t + 1000, 480))).toBe(LINK_RUNGS_BPS[1]);
+  });
+
   it("learns nothing outside direct mode", () => {
     const b = new LinkBudget();
     for (let at = 0; at <= 3 * UP_AFTER_MS; at += 500) b.observe(report(at, 80, 0, false));

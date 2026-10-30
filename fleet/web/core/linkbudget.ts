@@ -22,6 +22,12 @@ export const HOLD_MAX_MS = 600_000;
 /** Queueing over a tile's lowest arrival time that counts as on time, and as late. */
 export const ON_TIME_MS = 60;
 export const LATE_MS = 150;
+/**
+ * An arrival time this far from a tile's lowest is a new scene clock (a renderer that
+ * streamed its default scene before the coordinator's moves every arrival time by the
+ * scene's epoch), not queueing: the lowest starts again.
+ */
+export const CLOCK_JUMP_MS = 5_000;
 /** Share of drawn tiles behind the common time that counts as on time, and as late. */
 export const BEHIND_OK = 0.1;
 export const BEHIND_LATE = 0.25;
@@ -58,11 +64,17 @@ export class LinkBudget {
     }
     const queued: number[] = [];
     for (const [id, a] of Object.entries(r.arriveMs)) {
-      const low = Math.min(this.lowest.get(id) ?? a, a);
+      const prev = this.lowest.get(id);
+      const low = prev === undefined || Math.abs(a - prev) > CLOCK_JUMP_MS ? a : Math.min(prev, a);
       this.lowest.set(id, low);
       queued.push(a - low);
     }
-    if (queued.length === 0) return this.budgetBps;
+    if (queued.length === 0) {
+      // no stream reporting (a suspended tab, a reconnect): no evidence either way
+      this.onTimeSince = null;
+      this.late = 0;
+      return this.budgetBps;
+    }
     queued.sort((a, b) => a - b);
     const q = queued[Math.floor(queued.length / 2)]!;
     const behind = r.behindShare ?? 0;
