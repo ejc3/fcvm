@@ -40,6 +40,13 @@
 //! The gate guarantees the UART STAYS idle until the guard is dropped, no matter
 //! which other task logs concurrently.
 //!
+//! A snapshot of a running VM (a startup snapshot, `fcvm snapshot create`) takes the
+//! same hold through the boundary's one-shots: `--prepare-snapshot-network` asks the
+//! agent over [`SOURCE_GATE_SOCKET`] to quiesce and keep the hold, and
+//! `--resume-snapshot-network` (on the source) or the restore watcher (on a clone,
+//! which inherits the hold in the snapshot) releases it. The gate is a count, so this
+//! hold and the cache handshake's can overlap.
+//!
 //! Scope: this covers fc-agent's OWN console writes — the only userspace console
 //! writer at the cache-ready point in this rootfs (no getty on ttyS0; journald
 //! console forwarding is not enabled; systemd is idle between boot and the
@@ -52,7 +59,7 @@
 use std::collections::VecDeque;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -99,8 +106,12 @@ pub struct ConsoleShared {
     disposed: AtomicU64,
     /// Bytes dropped since the last recovery summary.
     dropped: AtomicU64,
-    /// While true, the writer thread must not write to the console.
-    gate: AtomicBool,
+    /// How many quiesce guards are held. While it is above zero the writer thread
+    /// must not write to the console. A count, not a flag, because two holds can
+    /// overlap: a pre-start snapshot's handshake guard is still held when the host
+    /// runs the source boundary's `--prepare-snapshot-network`, and the first of the
+    /// two to drop must not reopen the console under the other.
+    gate: AtomicUsize,
     /// Held around every console `write()`; `quiesce` locks it once after
     /// setting `gate` so no console write is in flight or can start afterwards.
     write_lock: Mutex<()>,
@@ -116,7 +127,7 @@ pub struct QuiesceGuard {
 impl Drop for QuiesceGuard {
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
-            state.gate.store(false, Ordering::SeqCst);
+            state.gate.fetch_sub(1, Ordering::SeqCst);
             // Writer notices within POLL_TICK_MS and flushes its pending buffer.
         }
     }
@@ -205,7 +216,7 @@ fn setup(console_fd: OwnedFd) -> nix::Result<Arc<ConsoleShared>> {
         enqueued: AtomicU64::new(0),
         disposed: AtomicU64::new(0),
         dropped: AtomicU64::new(0),
-        gate: AtomicBool::new(false),
+        gate: AtomicUsize::new(0),
         write_lock: Mutex::new(()),
     });
 
@@ -227,7 +238,7 @@ fn writer_loop(state: Arc<ConsoleShared>) {
     loop {
         // Poll: always watch the pipe; watch the console for writability only
         // when there is something to flush and the gate is open.
-        let want_write = !pending.is_empty() && !state.gate.load(Ordering::SeqCst);
+        let want_write = !pending.is_empty() && state.gate.load(Ordering::SeqCst) == 0;
         {
             let mut fds = [
                 PollFd::new(state.pipe_rd.as_fd(), PollFlags::POLLIN),
@@ -279,7 +290,7 @@ fn writer_loop(state: Arc<ConsoleShared>) {
             let _guard = state.write_lock.lock().unwrap_or_else(|e| e.into_inner());
             // Checked under the lock: after quiesce() sets the gate and cycles
             // this lock, no write can start here.
-            if !state.gate.load(Ordering::SeqCst) {
+            if state.gate.load(Ordering::SeqCst) == 0 {
                 while !pending.is_empty() {
                     let (head, _) = pending.as_slices();
                     match write(state.console_fd.as_fd(), head) {
@@ -387,8 +398,13 @@ impl ConsoleShared {
         // Phase 1 (politeness): let already-logged lines reach the console so
         // the quiesce announcement lands before the host pauses the VM. Purely
         // cosmetic for safety — phases 2+3 provide the guarantee.
+        // Skipped while another hold is in place: that hold already drained the UART
+        // and keeps its pending bytes back, so the flush could only wait out the
+        // bound. The pre-start snapshot's handshake hold is in place when the host
+        // runs the boundary's prepare, so without this every pre-start snapshot
+        // would wait the full bound here.
         let deadline = Instant::now() + phase_timeout;
-        while !self.flushed() {
+        while self.gate.load(Ordering::SeqCst) == 0 && !self.flushed() {
             if Instant::now() >= deadline {
                 break;
             }
@@ -400,7 +416,7 @@ impl ConsoleShared {
         // later write attempt re-checks the flag under the same lock. From
         // here, ZERO new bytes can enter the UART regardless of which task
         // logs concurrently — logs accumulate in the writer's pending buffer.
-        self.gate.store(true, Ordering::SeqCst);
+        self.gate.fetch_add(1, Ordering::SeqCst);
         drop(self.write_lock.lock().unwrap_or_else(|e| e.into_inner()));
         let guard = QuiesceGuard {
             state: Some(self.clone()),
@@ -429,8 +445,7 @@ impl ConsoleShared {
             drop(guard);
             eprintln!(
                 "[fc-agent] WARNING: console did not drain before snapshot quiesce; \
-                 aborting the cache-ready handshake so no snapshot can capture the \
-                 UART mid-transmit"
+                 refusing the snapshot so it cannot capture the UART mid-transmit"
             );
             return Err(QuiesceError);
         }
@@ -459,6 +474,203 @@ pub fn quiesce_for_snapshot() -> Result<QuiesceGuard, QuiesceError> {
         Some(state) => state.quiesce(),
         None => Ok(QuiesceGuard { state: None }),
     }
+}
+
+/// Where the source snapshot boundary asks the running agent to hold its console
+/// quiet (see [`request_source_quiesce`]).
+pub const SOURCE_GATE_SOCKET: &str = "/run/fc-agent-console-gate.sock";
+
+const SOURCE_QUIESCE_REQUEST: &str = "quiesce";
+const SOURCE_RELEASE_REQUEST: &str = "release";
+
+/// Bound on one hold of the source boundary's gate. The host pauses the VM right
+/// after `--prepare-snapshot-network` returns and releases the hold from
+/// `--resume-snapshot-network`, and a restored clone releases it when it sees its
+/// restore epoch; this only ends a hold whose host never came back, so the agent's
+/// log lines are delayed, not lost for good. A hold the bound ends while the VM is
+/// still running ahead of the pause reopens the window the hold exists to close,
+/// so it is far above any prepare-to-pause gap: the host's pause call times out
+/// after 30 s.
+const SOURCE_HOLD_CAP: Duration = Duration::from_secs(600);
+
+/// How long a one-shot waits for the agent's answer: both quiesce phases at their
+/// bound, with room to spare.
+const SOURCE_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The console hold the source snapshot boundary took, with the generation that
+/// lets the cap's timer release only the hold it was started for.
+struct SourceHold {
+    generation: u64,
+    _guard: QuiesceGuard,
+}
+
+static SOURCE_HOLD: Mutex<Option<SourceHold>> = Mutex::new(None);
+static SOURCE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Quiesce the console and keep it quiet until [`release_source_hold`]. A second
+/// hold replaces the first only after the new one holds the gate, so the console
+/// never reopens in between.
+fn take_source_hold() -> Result<u64, QuiesceError> {
+    let guard = quiesce_for_snapshot()?;
+    let generation = SOURCE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let previous = SOURCE_HOLD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(SourceHold {
+            generation,
+            _guard: guard,
+        });
+    drop(previous);
+    Ok(generation)
+}
+
+/// Drop the source boundary's hold, if there is one (and, with `only`, only if it
+/// is that generation). Returns whether a hold was dropped.
+fn release_source_hold(only: Option<u64>) -> bool {
+    let mut slot = SOURCE_HOLD.lock().unwrap_or_else(|e| e.into_inner());
+    let matches = match (&*slot, only) {
+        (Some(hold), Some(generation)) => hold.generation == generation,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    let taken = if matches { slot.take() } else { None };
+    drop(slot);
+    taken.is_some()
+}
+
+/// Release the console hold the source boundary took before a snapshot, from a
+/// restored clone. The snapshot holds the gate closed, so a clone of it would
+/// otherwise keep its console quiet until the cap.
+pub fn release_source_snapshot_hold() {
+    if release_source_hold(None) {
+        eprintln!("[fc-agent] console reopened after restore (held since the snapshot boundary)");
+    }
+}
+
+/// Answer one request on [`SOURCE_GATE_SOCKET`].
+fn answer_source_request(request: &str) -> String {
+    match request {
+        SOURCE_QUIESCE_REQUEST => match take_source_hold() {
+            Ok(generation) => {
+                let spawned = std::thread::Builder::new()
+                    .name("console-hold-cap".into())
+                    .spawn(move || {
+                        std::thread::sleep(SOURCE_HOLD_CAP);
+                        if release_source_hold(Some(generation)) {
+                            eprintln!(
+                                "[fc-agent] WARNING: console reopened after {}s: the host \
+                                 never resumed or restored after the snapshot boundary",
+                                SOURCE_HOLD_CAP.as_secs()
+                            );
+                        }
+                    });
+                if spawned.is_err() {
+                    // Without the cap a lost resume would keep the console quiet
+                    // for good. Refuse the hold, so the host takes no snapshot.
+                    release_source_hold(Some(generation));
+                    return "err cannot start the hold's cap timer\n".to_string();
+                }
+                "ok\n".to_string()
+            }
+            Err(error) => format!("err {error}\n"),
+        },
+        SOURCE_RELEASE_REQUEST => {
+            release_source_hold(None);
+            "ok\n".to_string()
+        }
+        other => format!("err unknown request {other:?}\n"),
+    }
+}
+
+/// Listen on [`SOURCE_GATE_SOCKET`] for the snapshot boundary's one-shots.
+pub fn spawn_source_gate_listener() -> anyhow::Result<()> {
+    spawn_source_gate_listener_at(std::path::Path::new(SOURCE_GATE_SOCKET))
+}
+
+fn spawn_source_gate_listener_at(path: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::io::{BufRead, Read, Write};
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("removing a stale {path:?}")),
+    }
+    let listener = std::os::unix::net::UnixListener::bind(path)
+        .with_context(|| format!("binding the console gate socket {path:?}"))?;
+    // A plain thread: the quiesce sleeps in 1 ms steps for up to two phase bounds,
+    // and requests come one per snapshot.
+    std::thread::Builder::new()
+        .name("console-gate".into())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        eprintln!("[fc-agent] WARNING: console gate socket failed: {e}");
+                        std::thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                };
+                let _ = stream.set_read_timeout(Some(SOURCE_REQUEST_TIMEOUT));
+                let mut line = String::new();
+                let mut reader = std::io::BufReader::new(&stream).take(64);
+                let request = match reader.read_line(&mut line) {
+                    Ok(_) => line.trim().to_string(),
+                    Err(_) => continue,
+                };
+                let answer = answer_source_request(&request);
+                let _ = stream.write_all(answer.as_bytes());
+            }
+        })
+        .context("starting the console gate listener")?;
+    Ok(())
+}
+
+/// Send one request to the agent's console gate and return its answer.
+fn source_request_at(path: &std::path::Path, request: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::io::{Read, Write};
+    let mut stream = std::os::unix::net::UnixStream::connect(path)
+        .with_context(|| format!("connecting to the agent's console gate {path:?}"))?;
+    stream.set_read_timeout(Some(SOURCE_REQUEST_TIMEOUT))?;
+    stream.set_write_timeout(Some(SOURCE_REQUEST_TIMEOUT))?;
+    stream.write_all(format!("{request}\n").as_bytes())?;
+    let mut answer = String::new();
+    stream
+        .take(256)
+        .read_to_string(&mut answer)
+        .with_context(|| format!("reading the agent's answer to {request:?}"))?;
+    match answer.trim() {
+        "ok" => Ok(()),
+        other => anyhow::bail!("the agent refused {request:?}: {other:?}"),
+    }
+}
+
+/// From `--prepare-snapshot-network`: ask the running agent to hold its console
+/// quiet across the pause the host makes next.
+///
+/// A snapshot that captures the 8250 mid-transmit gives every restore of it a dead
+/// serial console (`quiesce_for_snapshot`). The pre-start snapshot is guarded by the
+/// cache handshake; every snapshot of a running VM (a startup snapshot, `fcvm
+/// snapshot create`) is paused right after this boundary, and the agent logs into
+/// that window: the prepared gate refuses the restore watcher's metadata fetches,
+/// and the first five refusals are logged. `Err` means the UART was not proven idle
+/// and nothing is held: the prepare fails and the host takes no snapshot.
+pub async fn request_source_quiesce() -> anyhow::Result<()> {
+    run_source_request(SOURCE_QUIESCE_REQUEST).await
+}
+
+/// From `--resume-snapshot-network`: the pause is over, release the hold.
+pub async fn request_source_release() -> anyhow::Result<()> {
+    run_source_request(SOURCE_RELEASE_REQUEST).await
+}
+
+async fn run_source_request(request: &'static str) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        source_request_at(std::path::Path::new(SOURCE_GATE_SOCKET), request)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("console gate request task failed: {e}"))?
 }
 
 #[cfg(test)]
@@ -638,7 +850,7 @@ mod tests {
         // The failed quiesce must not leave the console gated: the handshake
         // is aborted, the VM continues cold, and logging must keep flowing.
         assert!(
-            !state.gate.load(Ordering::SeqCst),
+            state.gate.load(Ordering::SeqCst) == 0,
             "failed quiesce must release the gate before returning"
         );
 
@@ -702,6 +914,121 @@ mod tests {
             text.chars().rev().take(200).collect::<String>()
         );
         assert!(text.contains("bytes of log output while the console was stalled"));
+    }
+
+    /// The pre-start handshake's guard is still held when the host runs the source
+    /// boundary's prepare, so two holds overlap. The first to drop must not reopen
+    /// the console under the other.
+    #[test]
+    fn overlapping_holds_keep_the_console_gated_until_the_last_drops() {
+        let (console_wr, mut console_rd) = fake_console();
+        let state = setup(console_wr).unwrap();
+        let mut seen: Vec<u8> = Vec::new();
+
+        let first = state
+            .quiesce()
+            .expect("first quiesce drains a pipe console");
+        let second = state
+            .quiesce()
+            .expect("second quiesce drains a pipe console");
+        drop(first);
+
+        write_pipe(&state, b"held-line\n");
+        assert!(
+            wait_until(
+                || state.pipe_backlog() == 0
+                    && state.enqueued.load(Ordering::SeqCst)
+                        > state.disposed.load(Ordering::SeqCst),
+                Duration::from_secs(5)
+            ),
+            "the writer must take the line into its pending buffer"
+        );
+        // Several writer ticks: a reopened gate would have flushed by now.
+        std::thread::sleep(Duration::from_millis(3 * POLL_TICK_MS as u64));
+        drain_console(&mut console_rd, &mut seen);
+        assert!(
+            seen.is_empty(),
+            "the console reopened while a hold was still held: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+
+        drop(second);
+        assert!(
+            wait_until(
+                || {
+                    drain_console(&mut console_rd, &mut seen);
+                    seen.as_slice() == b"held-line\n"
+                },
+                Duration::from_secs(5)
+            ),
+            "dropping the last hold must flush, got {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+    }
+
+    /// The source boundary's requests over the agent's console gate socket: a
+    /// quiesce takes the hold and answers ok, a release drops it, a stale cap timer
+    /// cannot drop a newer hold, and an unknown request is refused.
+    #[test]
+    fn the_console_gate_socket_takes_and_releases_the_source_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console-gate.sock");
+        spawn_source_gate_listener_at(&path).unwrap();
+        let held = || SOURCE_HOLD.lock().unwrap().is_some();
+
+        source_request_at(&path, SOURCE_QUIESCE_REQUEST).expect("quiesce is answered ok");
+        assert!(held(), "a quiesce must leave the hold in place");
+        source_request_at(&path, SOURCE_RELEASE_REQUEST).expect("release is answered ok");
+        assert!(!held(), "a release must drop the hold");
+
+        let older = take_source_hold().unwrap();
+        let newer = take_source_hold().unwrap();
+        assert!(
+            !release_source_hold(Some(older)),
+            "the cap timer of a replaced hold must not drop the newer one"
+        );
+        assert!(held());
+        assert!(release_source_hold(Some(newer)));
+        assert!(!held());
+
+        let refused = source_request_at(&path, "bogus").unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("refused"),
+            "an unknown request must be refused: {refused:#}"
+        );
+    }
+
+    /// A second hold taken while one is in place returns at once: the first hold
+    /// drained the UART and keeps its pending bytes back, so the flush phase could
+    /// only wait out its bound.
+    #[test]
+    fn a_hold_taken_under_another_does_not_wait_for_the_held_bytes() {
+        let (console_wr, _console_rd) = fake_console();
+        let state = setup(console_wr).unwrap();
+        let first = state
+            .quiesce()
+            .expect("first quiesce drains a pipe console");
+        write_pipe(&state, b"held-line\n");
+        assert!(
+            wait_until(
+                || state.pipe_backlog() == 0
+                    && state.enqueued.load(Ordering::SeqCst)
+                        > state.disposed.load(Ordering::SeqCst),
+                Duration::from_secs(5)
+            ),
+            "the writer must take the line into its pending buffer"
+        );
+        let started = Instant::now();
+        let second = state
+            .quiesce_with_timeout(Duration::from_secs(3))
+            .expect("second quiesce drains a pipe console");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the second hold waited {:?} for bytes the first one holds back",
+            started.elapsed()
+        );
+        drop(second);
+        drop(first);
     }
 
     #[test]

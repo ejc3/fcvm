@@ -133,6 +133,8 @@ pub async fn run() -> Result<()> {
     // How the host's resume of a snapshotted source asks for the output to reconnect.
     output::spawn_reconnect_listener(output.clone())
         .context("starting the output reconnect listener")?;
+    // How the host's snapshot boundary holds the console quiet across its pause.
+    crate::console::spawn_source_gate_listener().context("starting the console gate listener")?;
 
     // Pending until the cache handshake proves this is a cold start or the
     // restore watcher completes every restore phase. The state owns the only

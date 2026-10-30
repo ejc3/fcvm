@@ -1869,9 +1869,15 @@ pub async fn prepare_snapshot_network() -> Result<()> {
         &FileManifestStore::default(),
     )
     .await?;
+    // Last, so nothing the agent logs about the boundary is still in the UART when
+    // the host pauses the VM. A failure here fails the prepare, and the host's
+    // recovery reopens the network gate.
+    crate::console::request_source_quiesce()
+        .await
+        .context("holding the console quiet for the snapshot pause")?;
     eprintln!(
         "[fc-agent] snapshot network boundary prepared: gate=closed link=UNTOUCHED \
-         external_socket_cookies={captured}"
+         console=held external_socket_cookies={captured}"
     );
     Ok(())
 }
@@ -1911,6 +1917,11 @@ pub fn resume_host_time(args: &[String]) -> Option<&str> {
 pub async fn resume_source_network(host_time: Option<&str>) -> Result<()> {
     let started = std::time::Instant::now();
     let _transaction_lock = acquire_boundary_lock()?;
+    // The pause is over (or never happened, after a failed prepare). A failure only
+    // leaves the agent's lines held until the hold's cap.
+    if let Err(error) = crate::console::request_source_release().await {
+        eprintln!("[fc-agent] WARNING: {error:#}; the agent's console stays held until its cap");
+    }
     let chronyd_offline = match host_time {
         Some(_) => match chronyc(&["offline"]).await {
             Ok(()) => true,
@@ -2967,6 +2978,78 @@ mod tests {
                 .lines()
                 .any(|call| call.contains("FCVM_SNAPSHOT_IN") && call.contains("-p udp")),
             "the snapshot side gates UDP ingress:\n{calls}"
+        );
+    }
+
+    /// The body of `fn <name>(` in `source`, up to its closing brace.
+    fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} is gone"));
+        let len = source[start..]
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{signature} has no closing brace"));
+        &source[start..start + len]
+    }
+
+    /// A snapshot of a running VM is paused right after the prepare returns, so the
+    /// prepare holds the agent's console quiet after its last step, and only a
+    /// prepare that holds it succeeds (CI run 41036024614: a startup snapshot taken
+    /// while the agent logged the gate's refusals restored with a dead console).
+    #[test]
+    fn the_prepare_holds_the_console_quiet_after_its_last_step() {
+        let body = function_body(
+            include_str!("snapshot_network.rs"),
+            "pub async fn prepare_snapshot_network(",
+        );
+        let prepared = body
+            .find("prepare_with(")
+            .expect("the prepare no longer closes the gate");
+        let held = body
+            .find("crate::console::request_source_quiesce()")
+            .expect("the prepare no longer holds the console quiet for the pause");
+        assert!(prepared < held, "prepared={prepared} held={held}");
+        assert!(
+            body[held..]
+                .contains(".context(\"holding the console quiet for the snapshot pause\")?"),
+            "a console that cannot be held quiet must fail the prepare:\n{body}"
+        );
+    }
+
+    /// The source's resume releases the hold before anything that can fail.
+    #[test]
+    fn the_source_resume_releases_the_console_first() {
+        let body = function_body(
+            include_str!("snapshot_network.rs"),
+            "pub async fn resume_source_network(",
+        );
+        let released = body
+            .find("crate::console::request_source_release()")
+            .expect("the source's resume no longer releases the console");
+        let reopened = body
+            .find("reopen_with(&gate)")
+            .expect("the resume reopens the gate");
+        assert!(
+            released < reopened,
+            "released={released} reopened={reopened}"
+        );
+    }
+
+    /// A clone inherits the hold its snapshot was taken under and releases it before
+    /// the restore sequence logs anything, and the agent serves the requests.
+    #[test]
+    fn a_restored_clone_releases_the_inherited_console_hold_first() {
+        let body = function_body(include_str!("mmds.rs"), "async fn apply_restore_epoch(");
+        let released = body
+            .find("crate::console::release_source_snapshot_hold()")
+            .expect("the restore no longer releases the console hold it inherits");
+        let begun = body
+            .find("signals.restore_status.begin()")
+            .expect("the restore begins its generation");
+        assert!(released < begun, "released={released} begun={begun}");
+        assert!(
+            include_str!("agent.rs").contains("crate::console::spawn_source_gate_listener()"),
+            "the agent no longer listens for the boundary's console requests"
         );
     }
 
