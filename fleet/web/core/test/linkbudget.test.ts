@@ -3,8 +3,8 @@ import { HOLD_MS, LINK_RUNGS_BPS, LinkBudget, UP_AFTER_MS } from "../linkbudget.
 import { BANDWIDTH_BUDGET_BPS, fitBandwidth } from "../bandwidth.ts";
 import { streamHeightFor, tileAspectOf } from "../layout.ts";
 
-const tiles = (arrive: number) => Object.fromEntries(Array.from({ length: 16 }, (_, k) => [`t${k}`, arrive + k]));
-const report = (at: number, arrive: number, behindShare = 0, direct = true) => ({ at, direct, arriveMs: tiles(arrive), behindShare });
+const tiles = (arrive: number, fps = 30) => Object.fromEntries(Array.from({ length: 16 }, (_, k) => [`t${k}`, { arriveMs: arrive + k, fps }]));
+const report = (at: number, arrive: number, behindShare = 0, direct = true, fps = 30) => ({ at, direct, tiles: tiles(arrive, fps), behindShare });
 
 // Reports every 500 ms, as the drawer sends them; returns the budget after the last.
 function run(b: LinkBudget, from: number, to: number, arrive: (at: number) => number, behind = 0): number {
@@ -58,7 +58,7 @@ describe("LinkBudget", () => {
 
   it("does not count a stretch with no streams reporting as on time, or join late reports across it", () => {
     const b = new LinkBudget();
-    const empty = (at: number) => b.observe({ at, direct: true, arriveMs: {}, behindShare: null });
+    const empty = (at: number) => b.observe({ at, direct: true, tiles: {}, behindShare: null });
     b.observe(report(0, 80));
     for (let at = 500; at < 60_000; at += 500) empty(at);
     expect(b.observe(report(60_000, 80))).toBe(LINK_RUNGS_BPS[0]);
@@ -69,6 +69,14 @@ describe("LinkBudget", () => {
     b.observe(report(t, 480));
     empty(t + 500);
     expect(b.observe(report(t + 1000, 480))).toBe(LINK_RUNGS_BPS[1]);
+  });
+
+  it("does not count stalled streams, whose last arrival times stay on file, as on time", () => {
+    const b = new LinkBudget();
+    b.observe(report(0, 80));
+    // every tile stalls together: no frames, the held p50s unchanged, none behind the others
+    for (let at = 500; at <= 3 * UP_AFTER_MS; at += 500) b.observe(report(at, 80, 0, true, 0));
+    expect(b.budgetBps).toBe(LINK_RUNGS_BPS[0]);
   });
 
   it("learns nothing outside direct mode", () => {

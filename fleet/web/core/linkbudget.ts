@@ -28,6 +28,8 @@ export const LATE_MS = 150;
  * scene's epoch), not queueing: the lowest starts again.
  */
 export const CLOCK_JUMP_MS = 5_000;
+/** A tile decoding fewer frames per second than this is not delivering. */
+export const MIN_FPS = 5;
 /** Share of drawn tiles behind the common time that counts as on time, and as late. */
 export const BEHIND_OK = 0.1;
 export const BEHIND_LATE = 0.25;
@@ -37,8 +39,12 @@ export interface LinkReport {
   at: number;
   /** The direct streams are what the page shows; any other mode says nothing about the link. */
   direct: boolean;
-  /** Per tile, the p50 of local arrival time minus scene time, ms (lag.ts). */
-  arriveMs: Record<string, number>;
+  /**
+   * Per tile: the p50 of local arrival time minus scene time, ms (lag.ts), and the frames
+   * per second it decoded lately. A tile under MIN_FPS is not delivering, and its p50 is of
+   * frames that arrived before it stalled, so it is no evidence.
+   */
+  tiles: Record<string, { arriveMs: number; fps: number }>;
   /** Drawn tiles behind the common time over drawn tiles, or null when none is drawn. */
   behindShare: number | null;
 }
@@ -63,14 +69,16 @@ export class LinkBudget {
       return this.budgetBps;
     }
     const queued: number[] = [];
-    for (const [id, a] of Object.entries(r.arriveMs)) {
+    for (const [id, t] of Object.entries(r.tiles)) {
+      if (!(t.fps >= MIN_FPS)) continue;
+      const a = t.arriveMs;
       const prev = this.lowest.get(id);
       const low = prev === undefined || Math.abs(a - prev) > CLOCK_JUMP_MS ? a : Math.min(prev, a);
       this.lowest.set(id, low);
       queued.push(a - low);
     }
     if (queued.length === 0) {
-      // no stream reporting (a suspended tab, a reconnect): no evidence either way
+      // no stream delivering (a suspended tab, a reconnect, a stall): no evidence either way
       this.onTimeSince = null;
       this.late = 0;
       return this.budgetBps;

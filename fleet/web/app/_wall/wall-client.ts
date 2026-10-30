@@ -360,12 +360,12 @@ export class WallClient {
           if (this.lateSamples.length > 20) this.lateSamples.shift();
           if (this.lateSamples.length >= 10) this.lateShare = this.lateSamples.reduce((a, b) => a + b, 0) / this.lateSamples.length;
         }
-        const arriveMs: Record<string, number> = {};
-        for (const [id, t] of Object.entries(m.stats.tiles)) if (t.connected && t.lag) arriveMs[id] = t.lag.arrive;
+        const tiles: Record<string, { arriveMs: number; fps: number }> = {};
+        for (const [id, t] of Object.entries(m.stats.tiles)) if (t.connected && t.lag) tiles[id] = { arriveMs: t.lag.arrive, fps: t.fps };
         this.linkBudgetBps = this.link.observe({
           at: m.stats.at,
           direct: this.state.ui.shownMode === "direct",
-          arriveMs,
+          tiles,
           behindShare: m.bench.tilesDrawn > 0 ? m.bench.tilesBehind / m.bench.tilesDrawn : null,
         });
         this.dispatch({ type: "frame-stats", stats: m.stats });
