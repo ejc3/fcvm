@@ -1274,19 +1274,20 @@ impl NetworkManager for RoutedNetwork {
         //     Host-side BPF programs intercept connect() syscalls and inject
         //     client certs for proxy auth. Without this relay, the VM's direct
         //     connections bypass these hooks and get rejected (407).
-        if let Some(proxy) = std::env::var("HTTPS_PROXY")
-            .ok()
-            .or_else(|| std::env::var("https_proxy").ok())
-        {
-            match tcp_proxy::parse_proxy_addr(&proxy) {
-                Ok(proxy_addr) => {
-                    let handle = tcp_proxy::start_proxy_relay(&ns_name, GUEST_GATEWAY, proxy_addr)
-                        .await
-                        .context("starting proxy relay")?;
+        //     The guest's URL names the relay and keeps the proxy's credentials.
+        let mut guest_proxy = None;
+        if let Some(proxy) = tcp_proxy::host_proxy_from_env() {
+            match tcp_proxy::plan_proxy_relay(&proxy, GUEST_GATEWAY) {
+                Ok(plan) => {
+                    let handle =
+                        tcp_proxy::start_proxy_relay(&ns_name, GUEST_GATEWAY, plan.upstream)
+                            .await
+                            .context("starting proxy relay")?;
                     self.proxy_handles.push(handle);
+                    guest_proxy = Some(plan.guest_url);
                 }
                 Err(e) => {
-                    warn!(proxy = %proxy, error = %e, "failed to parse proxy address, skipping relay");
+                    warn!(error = %format!("{e:#}"), "cannot relay the host's proxy; the guest gets none");
                 }
             }
         }
@@ -1317,19 +1318,9 @@ impl NetworkManager for RoutedNetwork {
             // The namespace kernel then forwards to the veth → host.
             host_ipv6: Some(ROUTED_GATEWAY_IPV6.to_string()),
             dns_search: None,
-            // Override proxy to use the gateway relay (TCP proxy on host side
-            // goes through BPF hooks for client cert injection).
-            http_proxy: if std::env::var("HTTPS_PROXY").is_ok()
-                || std::env::var("https_proxy").is_ok()
-            {
-                Some(format!(
-                    "http://{}:{}",
-                    GUEST_GATEWAY,
-                    super::tcp_proxy::PROXY_RELAY_PORT
-                ))
-            } else {
-                None
-            },
+            // The gateway relay (step 16), whose host side goes through the host's
+            // connect() hooks.
+            http_proxy: guest_proxy,
             namespace_name: self.namespace_id.clone(),
         })
     }

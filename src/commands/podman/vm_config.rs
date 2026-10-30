@@ -739,6 +739,77 @@ fn host_ntp_servers() -> Vec<String> {
     addrs
 }
 
+/// The `(http_proxy, https_proxy)` URLs a guest is given: the network's proxy, or else
+/// the host's proxy variables (`env`), with the host name resolved to an address and a
+/// loopback address made one the guest can reach (`reachable_from_guest`).
+fn guest_proxies(
+    network_config: &crate::network::NetworkConfig,
+    network_mode: crate::firecracker::FcNetworkMode,
+    env: impl Fn(&str) -> Option<String>,
+) -> (Option<String>, Option<String>) {
+    let reachable = |url: String| reachable_from_guest(url, network_config, network_mode);
+    let http_proxy = network_config
+        .http_proxy
+        .clone()
+        .or_else(|| env("http_proxy"))
+        .or_else(|| env("HTTP_PROXY"))
+        .and_then(|url| resolve_proxy_url(&url))
+        .map(reachable);
+    let https_proxy = network_config
+        .http_proxy
+        .clone()
+        .or_else(|| env("https_proxy"))
+        .or_else(|| env("HTTPS_PROXY"))
+        .or_else(|| env("http_proxy"))
+        .or_else(|| env("HTTP_PROXY"))
+        .and_then(|url| resolve_proxy_url(&url))
+        .map(reachable);
+    (http_proxy, https_proxy)
+}
+
+/// A proxy URL whose host is the host's loopback names the guest's own loopback inside
+/// the guest. A rootless guest reaches the host's loopback at its gateway, because pasta
+/// translates the gateway address to the host's loopback (its `--map-host-loopback`
+/// default, which fcvm leaves on), so 127.0.0.1 becomes the IPv4 gateway and ::1 the
+/// IPv6 one. The other modes have no such path, and another loopback address (pasta
+/// translates to 127.0.0.1 only) has none in any mode: those URLs are passed on as they
+/// are, with a warning that the guest cannot use them.
+fn reachable_from_guest(
+    url: String,
+    network_config: &crate::network::NetworkConfig,
+    network_mode: crate::firecracker::FcNetworkMode,
+) -> String {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    let Ok(mut parsed) = Url::parse(&url) else {
+        return url;
+    };
+    let rootless = matches!(network_mode, crate::firecracker::FcNetworkMode::Rootless);
+    let gateway = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) if ip == Ipv4Addr::LOCALHOST && rootless => {
+            network_config.host_ip.clone()
+        }
+        Some(url::Host::Ipv6(ip)) if ip == Ipv6Addr::LOCALHOST && rootless => network_config
+            .host_ipv6
+            .as_ref()
+            .map(|gateway| format!("[{gateway}]")),
+        Some(url::Host::Ipv4(ip)) if ip.is_loopback() => None,
+        Some(url::Host::Ipv6(ip)) if ip.is_loopback() => None,
+        _ => return url,
+    };
+    match gateway {
+        Some(gateway) if parsed.set_host(Some(&gateway)).is_ok() => parsed.to_string(),
+        _ => {
+            warn!(
+                proxy_host = ?parsed.host_str(),
+                network = ?network_mode,
+                "the host's proxy is on a loopback address this guest cannot reach; the guest \
+                 gets the URL unchanged and its connections through it will fail"
+            );
+            url
+        }
+    }
+}
+
 /// Build the boot-plan JSON (the `latest` object served to fc-agent).
 ///
 /// Used by both transports: MMDS (`hv.publish_boot_plan`) and vsock
@@ -817,22 +888,10 @@ pub(super) fn build_boot_plan_json(
         .collect();
 
     // Resolve proxy URLs — runtime behavior, not part of cache key.
-    // Use network-provided proxy, or fall back to environment variables.
-    // Resolve hostname to IP since VMs reach external addresses via pasta gateway.
-    let http_proxy = network_config
-        .http_proxy
-        .clone()
-        .or_else(|| std::env::var("http_proxy").ok())
-        .or_else(|| std::env::var("HTTP_PROXY").ok())
-        .and_then(|url| resolve_proxy_url(&url));
-    let https_proxy = network_config
-        .http_proxy
-        .clone()
-        .or_else(|| std::env::var("https_proxy").ok())
-        .or_else(|| std::env::var("HTTPS_PROXY").ok())
-        .or_else(|| std::env::var("http_proxy").ok())
-        .or_else(|| std::env::var("HTTP_PROXY").ok())
-        .and_then(|url| resolve_proxy_url(&url));
+    let (http_proxy, https_proxy) =
+        guest_proxies(network_config, launch_config.network_mode, |name: &str| {
+            std::env::var(name).ok()
+        });
     let no_proxy = std::env::var("no_proxy")
         .or_else(|_| std::env::var("NO_PROXY"))
         .ok();
@@ -1895,6 +1954,50 @@ async fn run_vm_setup_inner(
 
 #[cfg(test)]
 mod tests {
+    /// A proxy the host reaches on its loopback address is, inside a guest, the guest's
+    /// own loopback, so every pull through it failed with "proxyconnect tcp: dial tcp
+    /// 127.0.0.1:<port>: connection refused" (#1461). A rootless guest reaches the host's
+    /// loopback at its gateway: pasta maps the gateway there (its map-host-loopback
+    /// default). The URL keeps its scheme, credentials and port.
+    #[test]
+    fn a_rootless_guest_reaches_a_loopback_proxy_at_its_gateway() {
+        use super::guest_proxies;
+        use crate::firecracker::FcNetworkMode;
+        let rootless = crate::network::NetworkConfig {
+            host_ip: Some("10.0.2.2".to_string()),
+            ..Default::default()
+        };
+        let no_env = |_: &str| None;
+        for (proxy, expected) in [
+            (
+                "http://user:secret@127.0.0.1:3128",
+                "http://user:secret@10.0.2.2:3128/",
+            ),
+            ("http://localhost:3128/", "http://10.0.2.2:3128/"),
+            ("127.0.0.1:8080", "http://10.0.2.2:8080/"),
+        ] {
+            let network = crate::network::NetworkConfig {
+                http_proxy: Some(proxy.to_string()),
+                ..rootless.clone()
+            };
+            let (http, https) = guest_proxies(&network, FcNetworkMode::Rootless, no_env);
+            assert_eq!(http.as_deref(), Some(expected), "{proxy}");
+            assert_eq!(https.as_deref(), Some(expected), "{proxy}");
+        }
+        // From the host's variables when the network names none.
+        let env = |name: &str| (name == "HTTPS_PROXY").then(|| "http://127.0.0.1:3128".to_string());
+        let (http, https) = guest_proxies(&rootless, FcNetworkMode::Rootless, env);
+        assert_eq!(http, None);
+        assert_eq!(https.as_deref(), Some("http://10.0.2.2:3128/"));
+        // A proxy elsewhere is left alone.
+        let remote = crate::network::NetworkConfig {
+            http_proxy: Some("http://192.0.2.7:3128".to_string()),
+            ..rootless.clone()
+        };
+        let (_, https) = guest_proxies(&remote, FcNetworkMode::Rootless, no_env);
+        assert_eq!(https.as_deref(), Some("http://192.0.2.7:3128/"));
+    }
+
     /// The driver image is the last drive: after two --disk drives, one --disk-dir and
     /// the image disk it is drive 4, /dev/vdf, and no earlier drive changes name.
     #[test]

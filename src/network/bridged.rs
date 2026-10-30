@@ -158,6 +158,61 @@ fn require_distinct_host_ports(mappings: &[PortMapping]) -> Result<()> {
     Ok(())
 }
 
+/// A host proxy variable, lowercase first.
+fn env_proxy(lower: &str, upper: &str) -> Option<String> {
+    [lower, upper]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+}
+
+/// Where a bridged VM's relay for the host's proxy listens, and what it relays.
+#[derive(Debug, PartialEq)]
+struct BridgedProxyRelay {
+    bind_ip: String,
+    plan: super::tcp_proxy::ProxyRelayPlan,
+}
+
+/// The relay a bridged VM needs for the host's proxy (`http`, `https`: the host's
+/// variables), or None when the guest reaches the proxy as it is.
+///
+/// The guest reaches the host side of its veth (`host_ip`) at its gateway: a fresh
+/// boot's gateway is that address, and a clone's namespace DNATs every guest-to-gateway
+/// connection to it (`setup_in_namespace_nat`, step 9). So the relay listens on
+/// `host_ip`, outside the namespace, and the guest's URL names `guest_gateway`.
+///
+/// The network's proxy URL is given to the guest for both schemes, so a relay is set up
+/// only when both schemes use the one proxy. Separate HTTP and HTTPS proxies keep their
+/// own selections, and a loopback one among them stays unreachable, with a warning.
+fn bridged_proxy_relay(
+    http: Option<&str>,
+    https: Option<&str>,
+    host_ip: &str,
+    guest_gateway: &str,
+) -> Option<BridgedProxyRelay> {
+    let proxy = https.or(http)?;
+    if http.or(https) != Some(proxy) {
+        warn!(
+            "the host has separate HTTP and HTTPS proxies; a bridged guest gets them as they \
+             are, and one on loopback is unreachable from it"
+        );
+        return None;
+    }
+    let plan = match super::tcp_proxy::plan_proxy_relay(proxy, guest_gateway) {
+        Ok(plan) => plan,
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), "cannot relay the host's proxy");
+            return None;
+        }
+    };
+    plan.upstream
+        .iter()
+        .all(|address| address.ip().is_loopback())
+        .then(|| BridgedProxyRelay {
+            bind_ip: host_ip.to_string(),
+            plan,
+        })
+}
+
 /// Bridged networking using network namespace isolation with veth pairs
 ///
 /// This mode requires sudo/root for network namespace and iptables setup.
@@ -200,6 +255,8 @@ pub struct BridgedNetwork {
     is_clone: bool,
     /// For clones: the veth IP inside the namespace (used for port forwarding)
     veth_inner_ip: Option<String>,
+    /// The relay for a host proxy on loopback, which the guest cannot reach itself.
+    proxy_relay: Option<super::tcp_proxy::Relay>,
 }
 
 impl BridgedNetwork {
@@ -225,6 +282,7 @@ impl BridgedNetwork {
             port_mapping_rules: Vec::new(),
             is_clone: false,
             veth_inner_ip: None,
+            proxy_relay: None,
         }
     }
 
@@ -657,6 +715,30 @@ impl NetworkManager for BridgedNetwork {
             }
         }
 
+        // A proxy on the host's loopback is the guest's own loopback inside the guest;
+        // relay it (`bridged_proxy_relay`).
+        let mut guest_proxy = None;
+        let relay = bridged_proxy_relay(
+            env_proxy("http_proxy", "HTTP_PROXY").as_deref(),
+            env_proxy("https_proxy", "HTTPS_PROXY").as_deref(),
+            &host_ip,
+            guest_gateway_ip.as_deref().unwrap_or(&host_ip),
+        );
+        if let Some(relay) = relay {
+            match super::tcp_proxy::start_host_proxy_relay(&relay.bind_ip, relay.plan.upstream)
+                .await
+            {
+                Ok(handle) => {
+                    self.proxy_relay = Some(handle);
+                    guest_proxy = Some(relay.plan.guest_url);
+                }
+                Err(e) => {
+                    let _ = self.cleanup().await;
+                    return Err(e).context("starting the relay for the host's proxy");
+                }
+            }
+        }
+
         // Generate MAC address
         let guest_mac = generate_mac();
 
@@ -681,7 +763,7 @@ impl NetworkManager for BridgedNetwork {
             guest_ipv6: None, // Bridged mode doesn't support IPv6 yet
             host_ipv6: None,
             dns_search: None,
-            http_proxy: None,
+            http_proxy: guest_proxy,
             namespace_name: None,
         })
     }
@@ -689,6 +771,11 @@ impl NetworkManager for BridgedNetwork {
     async fn cleanup(&mut self) -> Result<()> {
         info!(vm_id = %self.vm_id, "cleaning up network namespace and resources");
         let mut errors = Vec::new();
+
+        // Step 0: stop the proxy relay, whose listener holds an address of the veth.
+        if let Some(relay) = self.proxy_relay.take() {
+            super::tcp_proxy::stop_relays([relay]).await;
+        }
 
         // Step 1: Cleanup port mapping rules (if any)
         if !self.port_mapping_rules.is_empty() {
@@ -813,6 +900,49 @@ impl NetworkManager for BridgedNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guest reaches the host side of its veth at its gateway: a fresh boot's gateway
+    /// is that address, and a clone's namespace DNATs every guest-to-gateway TCP
+    /// connection to it (veth.rs, setup_in_namespace_nat step 9). So the relay listens
+    /// there, outside the namespace, for both; a listener on br0 in a clone's namespace
+    /// is never reached.
+    #[test]
+    fn a_bridged_relay_listens_where_the_guests_gateway_leads() {
+        let proxy = Some("http://user:secret@127.0.0.1:3128");
+        for (is_clone, gateway) in [(false, "10.0.0.1"), (true, "172.30.0.1")] {
+            let relay = bridged_proxy_relay(None, proxy, "10.0.0.1", gateway)
+                .expect("a loopback proxy is relayed");
+            assert_eq!(relay.bind_ip, "10.0.0.1", "clone={is_clone}");
+            assert_eq!(
+                relay.plan.guest_url,
+                format!(
+                    "http://user:secret@{gateway}:{}/",
+                    super::super::tcp_proxy::PROXY_RELAY_PORT
+                )
+            );
+        }
+    }
+
+    /// The network's proxy URL is given to the guest for both schemes, so it is set only
+    /// when both schemes use the one relayed proxy. Separate HTTP and HTTPS proxies keep
+    /// their own selections (and a loopback one stays unreachable, with a warning).
+    #[test]
+    fn a_bridged_relay_keeps_separate_http_and_https_proxies() {
+        let relay = bridged_proxy_relay(
+            Some("http://192.0.2.7:80"),
+            Some("http://127.0.0.1:3128"),
+            "10.0.0.1",
+            "10.0.0.1",
+        );
+        assert_eq!(relay, None);
+        assert!(bridged_proxy_relay(
+            Some("http://127.0.0.1:3128"),
+            Some("http://127.0.0.1:3128"),
+            "10.0.0.1",
+            "10.0.0.1",
+        )
+        .is_some());
+    }
 
     /// A rule or route that cleanup could not remove keeps its record, and the veth and
     /// namespace that keep its address this VM's are not deleted (or forgotten) after it.
