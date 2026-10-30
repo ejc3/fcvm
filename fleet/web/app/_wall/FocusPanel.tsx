@@ -6,7 +6,7 @@
 // details, restart timeline and live GPU readings. The sheet starts open (over the
 // picture's right side on a wide screen, under the picture on a phone) and folds away.
 
-import { useEffect, useRef, type CSSProperties } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import type { Direction, FocusView, TimelineStep } from "../../core/index.ts";
 
 const BLUES = ["#BFE3FF", "#7CC4FF", "#3E95D6", "#2A6FA3", "#1B4A6E", "#123552"];
@@ -60,7 +60,7 @@ export function FocusPanel({
   onSheet: (open: boolean) => void;
   onClose: () => void;
   onRestart: () => void;
-  /** A click on the picture: the page opens the tile under it, if it is another. */
+  /** A click on the picture: the page opens the tile under it if it is another, and zooms out otherwise. */
   onPick: (x: number, y: number) => void;
   /** An arrow key: the page opens the neighbouring tile that way. */
   onMove: (dir: Direction) => void;
@@ -97,12 +97,19 @@ export function FocusPanel({
   const accent = { ["--accent" as string]: focus.accent } as CSSProperties;
   const ec2 = focus.id.startsWith("ec2");
   const box = focus.placed?.box ?? null;
+  // Over the opened VM a click zooms out, so the cursor says so; over the dimmed tiles a click opens one.
+  const [overOpened, setOverOpened] = useState(false);
   const summary = focus.rows.find((r) => r.term === "Up for");
   return (
     <div className={`zoom${phone ? " phone-zoom" : ""}`} role="dialog" aria-modal="true" aria-labelledby="focus-title" data-testid="focus" style={accent}>
       <div
-        className="zoom-hit"
+        className={`zoom-hit${overOpened ? " out" : ""}`}
         data-testid="zoom-hit"
+        onPointerMove={(e) => {
+          const inside = box !== null && e.clientX >= box.x && e.clientX < box.x + box.w && e.clientY >= box.y && e.clientY < box.y + box.h;
+          if (inside !== overOpened) setOverOpened(inside);
+        }}
+        onPointerLeave={() => setOverOpened(false)}
         onPointerDown={(e) => {
           down.current = { x: e.clientX, y: e.clientY };
         }}

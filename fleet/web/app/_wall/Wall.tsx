@@ -598,7 +598,8 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
     setRestoreAfterZoom(false);
     restoreFocus();
   }, [restoreAfterZoom, zoomGone]);
-  // Opened, a click on a dimmed tile around it, or an arrow key, opens that tile instead.
+  // Opened, a click on a dimmed tile around it, or an arrow key, opens that tile instead; a click on the
+  // opened VM itself, or where no tile is, zooms back out.
   const pickZoomed = useCallback(
     (x: number, y: number) => {
       const v = viewRef.current;
@@ -608,8 +609,9 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
       const p = screenToImage(L.image, x, y);
       const t = p ? tileAt(st.accepted.tiles, p.u, p.v) : null;
       if (t && t.id !== st.ui.focusId) client.ui({ focusId: t.id });
+      else closeTile();
     },
-    [client],
+    [client, closeTile],
   );
   const moveZoomed = useCallback(
     (dir: Direction) => {
