@@ -13,6 +13,7 @@ import {
   STREAM_HEIGHTS,
   initialState,
   intentsToResend,
+  LinkBudget,
   makeIntent,
   needsVerify,
   nextPingDelay,
@@ -78,6 +79,9 @@ export class WallClient {
   /** Share of drawn tiles behind the common t, over the last ten seconds of direct mode. */
   lateShare: number | null = null;
   private lateSamples: number[] = [];
+  /** The direct streams' budget from what this link carries (core/linkbudget.ts). */
+  private readonly link = new LinkBudget();
+  linkBudgetBps: number = this.link.budgetBps;
   private traceWaiters = new Map<number, (e: TraceEntry[]) => void>();
   /** The canvas has painted the poster or a frame. */
   painted = false;
@@ -356,6 +360,14 @@ export class WallClient {
           if (this.lateSamples.length > 20) this.lateSamples.shift();
           if (this.lateSamples.length >= 10) this.lateShare = this.lateSamples.reduce((a, b) => a + b, 0) / this.lateSamples.length;
         }
+        const arriveMs: Record<string, number> = {};
+        for (const [id, t] of Object.entries(m.stats.tiles)) if (t.connected && t.lag) arriveMs[id] = t.lag.arrive;
+        this.linkBudgetBps = this.link.observe({
+          at: m.stats.at,
+          direct: this.state.ui.shownMode === "direct",
+          arriveMs,
+          behindShare: m.bench.tilesDrawn > 0 ? m.bench.tilesBehind / m.bench.tilesDrawn : null,
+        });
         this.dispatch({ type: "frame-stats", stats: m.stats });
       } else if (m.type === "camera-drawn") {
         this.dispatch({ type: "camera-drawn", id: m.id, drawnAt: m.drawnAt });

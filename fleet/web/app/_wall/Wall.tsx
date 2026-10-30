@@ -407,7 +407,8 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
         lateShare: client.lateShare,
         avoid,
         labelSize,
-        budgetBps: budgetParam(),
+        // ?budget= fixes it; a browser asking to save data keeps the page's fixed budget
+        budgetBps: budgetParam() ?? (saveData() ? undefined : client.linkBudgetBps),
         poster,
         media: { base: mediaUrl, meta: reelMeta },
         saveData: saveData(),
