@@ -139,7 +139,7 @@ async fn run() -> Result<()> {
     // Handle errors
     if let Err(e) = &result {
         error!("Error: {:#}", e);
-        std::process::exit(1);
+        std::process::exit(commands::podman::process_exit_status(e));
     }
 
     result

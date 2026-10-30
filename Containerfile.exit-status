@@ -1,0 +1,3 @@
+# alpine under a localhost/ name, so fcvm exports it to an image disk and the guest
+# needs no registry access. Used by the exit-status tests in tests/test_podman_snapshot.rs.
+FROM ecr-public.aws.com/docker/library/alpine:latest
