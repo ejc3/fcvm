@@ -145,6 +145,31 @@ pub fn owner_dir() -> Result<PathBuf> {
     owner_dir_in(&crate::paths::data_dir())
 }
 
+/// The inode of the initial user namespace (`PROC_USER_INIT_INO`, linux/proc_ns.h).
+const INITIAL_USER_NAMESPACE: u64 = 0xEFFF_FFFD;
+
+/// The inode of this process's user namespace, or None when /proc does not say.
+fn current_user_namespace() -> Option<u64> {
+    std::fs::metadata("/proc/self/ns/user")
+        .ok()
+        .map(|ns| ns.ino())
+}
+
+/// The name of this process's owner directory under `reclaim/`: the euid in the initial
+/// user namespace, and the euid with the namespace in any other. A container's root is
+/// uid 0 of its own user namespace, not the host's root, and when the two share a store
+/// (CI runners keep /mnt/fcvm-btrfs between jobs) the host root's `reclaim/0` shows in
+/// the container as owned by the overflow uid, which `owner_dir_in` refuses. Records are
+/// only meaningful in the namespaces that made them, so each user namespace keeps its own.
+fn owner_dir_name(euid: u32, user_namespace: Option<u64>) -> String {
+    match user_namespace {
+        Some(namespace) if namespace != INITIAL_USER_NAMESPACE => {
+            format!("{euid}-userns{namespace}")
+        }
+        _ => euid.to_string(),
+    }
+}
+
 /// [`owner_dir`] under an explicit data directory.
 pub fn owner_dir_in(data_dir: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(data_dir)
@@ -161,7 +186,7 @@ pub fn owner_dir_in(data_dir: &Path) -> Result<PathBuf> {
         }
     }
     let euid = nix::unistd::geteuid().as_raw();
-    let mine = shared.join(euid.to_string());
+    let mine = shared.join(owner_dir_name(euid, current_user_namespace()));
     match std::fs::DirBuilder::new().mode(0o700).create(&mine) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -1299,6 +1324,81 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
         let error = owner_dir_in(root.path()).unwrap_err().to_string();
         assert!(error.contains("no one else can write"), "{error}");
+    }
+
+    /// The initial user namespace keeps the directory name it had; any other carries the
+    /// namespace.
+    #[test]
+    fn the_owner_directory_name_carries_a_user_namespace_other_than_the_initial_one() {
+        assert_eq!(owner_dir_name(0, Some(INITIAL_USER_NAMESPACE)), "0");
+        assert_eq!(owner_dir_name(1000, None), "1000");
+        assert_eq!(owner_dir_name(0, Some(4026532301)), "0-userns4026532301");
+    }
+
+    /// Set in the child of `a_namespaced_root_has_an_owner_directory_of_its_own`: the
+    /// data directory it makes its owner directory in.
+    #[cfg(feature = "privileged-tests")]
+    const NAMESPACED_ROOT_CHILD: &str = "FCVM_RECLAIM_NAMESPACED_ROOT_DATA_DIR";
+
+    /// A container's root is uid 0 of a user namespace, not the host's root, and both use
+    /// one store when the store is shared (CI runners keep /mnt/fcvm-btrfs between jobs).
+    /// The host's root made `reclaim/0`; in the container that directory shows as owned by
+    /// the overflow uid, and every launch and `fcvm setup` there failed with "refusing owner
+    /// records in .../reclaim/0 ... (found uid 65534, mode 700)". Each must get a directory
+    /// of its own. The child runs this test again as root of a new user namespace whose
+    /// root is an unprivileged host uid (`setpriv` + `unshare -r`).
+    #[cfg(feature = "privileged-tests")]
+    #[test]
+    fn a_namespaced_root_has_an_owner_directory_of_its_own() {
+        if let Some(data_dir) = std::env::var_os(NAMESPACED_ROOT_CHILD) {
+            let mine = owner_dir_in(Path::new(&data_dir)).expect("owner directory");
+            Owner::begin_in(&mine, "namespaced-root").expect("an owner in it");
+            println!("OWNER_DIR={}", mine.display());
+            return;
+        }
+        assert!(
+            nix::unistd::geteuid().is_root(),
+            "privileged-tests run as root"
+        );
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let host_root = owner_dir_in(root.path()).unwrap();
+        // The child runs as nobody, who may not be able to reach this build's binary.
+        let exe = root.path().join("test-binary");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = std::process::Command::new("setpriv")
+            .args([
+                "--reuid=65534",
+                "--regid=65534",
+                "--clear-groups",
+                "unshare",
+                "-U",
+                "-r",
+            ])
+            .arg(&exe)
+            .args([
+                "--exact",
+                "reclaim::tests::a_namespaced_root_has_an_owner_directory_of_its_own",
+                "--nocapture",
+            ])
+            .env(NAMESPACED_ROOT_CHILD, root.path())
+            .output()
+            .expect("spawning the namespaced child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "the namespaced root could not use the shared store: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let theirs = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("OWNER_DIR="))
+            .expect("the child names its owner directory");
+        assert_ne!(Path::new(theirs), host_root, "one directory for two roots");
+        // The host's root still uses its own directory.
+        assert_eq!(owner_dir_in(root.path()).unwrap(), host_root);
     }
 
     /// A helper that writes an owner's resources inherits its lock, so a pass leaves them
