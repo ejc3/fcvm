@@ -177,6 +177,18 @@ async fn wait_for_short_lived_vm_within(
     vm_name: &str,
     limit: Duration,
 ) -> Result<()> {
+    let status = short_lived_vm_status(child, vm_name, limit).await?;
+    anyhow::ensure!(status.success(), "fcvm for {vm_name} exited with {status}");
+    Ok(())
+}
+
+/// The exit status of a short-lived VM's fcvm, with `wait_for_short_lived_vm_within`'s
+/// limit and kill.
+async fn short_lived_vm_status(
+    child: &mut tokio::process::Child,
+    vm_name: &str,
+    limit: Duration,
+) -> Result<std::process::ExitStatus> {
     let status = match tokio::time::timeout(limit, child.wait()).await {
         Ok(waited) => waited.context("waiting for fcvm")?,
         Err(_) => {
@@ -189,8 +201,7 @@ async fn wait_for_short_lived_vm_within(
             );
         }
     };
-    anyhow::ensure!(status.success(), "fcvm for {vm_name} exited with {status}");
-    Ok(())
+    Ok(status)
 }
 
 /// `fcvm ls --pid` lists a stale record whose PID was reused alongside the live one.
@@ -406,6 +417,93 @@ async fn test_podman_snapshot_hit_restores_fast() -> Result<()> {
     }
 
     println!("Test passed");
+    Ok(())
+}
+
+/// `fcvm podman run` fails when its container fails, on a snapshot hit as on the miss
+/// that created the snapshot. The restore path read the status the guest reports on the
+/// status channel only for a TTY run, so a hit of a container that exited 7 exited 0.
+/// Every `--gpu` run restores (the miss converges on the hit), so every one did.
+///
+/// The container sleeps before it exits so that its exit reaches the host after the
+/// restored guest has resumed, not during the restore.
+#[tokio::test]
+async fn test_podman_snapshot_hit_forwards_container_exit_code() -> Result<()> {
+    if snapshot_disabled_by_env() {
+        println!("Skipping test: FCVM_NO_SNAPSHOT is set");
+        return Ok(());
+    }
+    // The command is part of the snapshot key, so a unique one makes the first run a miss.
+    let unique = format!(
+        "exit-code-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let cmd = format!("echo {unique}; sleep 3; exit 7");
+    let before = list_snapshot_entries();
+
+    let (miss_name, _, _, _) = common::unique_names("exit-code-miss");
+    let (mut miss, miss_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &miss_name,
+        "--network",
+        "rootless",
+        common::ALPINE_IMAGE,
+        "sh",
+        "-c",
+        &cmd,
+    ])
+    .await?;
+    let vm_id = vm_id_of(miss_pid).await?;
+    let miss_status =
+        short_lived_vm_status(&mut miss, &miss_name, Duration::from_secs(120)).await?;
+    assert!(
+        !miss_status.success(),
+        "fcvm exited with {miss_status} on the miss for a container that exited 7"
+    );
+    assert!(
+        wait_for_snapshot_entry_from(&snapshot_dir(), &before, &vm_id, 10)
+            .await
+            .is_some(),
+        "the miss created no snapshot, so the second run cannot be a hit"
+    );
+
+    let (hit_name, _, _, _) = common::unique_names("exit-code-hit");
+    let (mut hit, _, hit_log) = common::spawn_fcvm_with_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &hit_name,
+            "--network",
+            "rootless",
+            common::ALPINE_IMAGE,
+            "sh",
+            "-c",
+            &cmd,
+        ],
+        &hit_name,
+    )
+    .await?;
+    let hit_status = short_lived_vm_status(&mut hit, &hit_name, Duration::from_secs(120)).await?;
+    let log = std::fs::read_to_string(&hit_log)
+        .with_context(|| format!("reading {}", hit_log.display()))?;
+    assert!(
+        log.contains("snapshot hit! Restoring"),
+        "the second run did not restore a snapshot; its log is {}",
+        hit_log.display()
+    );
+    assert_eq!(
+        hit_status.code(),
+        Some(7),
+        "fcvm exited with {hit_status} on a snapshot hit for a container that exited 7; \
+         its log is {}",
+        hit_log.display()
+    );
     Ok(())
 }
 

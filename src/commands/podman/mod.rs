@@ -2376,20 +2376,26 @@ async fn join_tty_session(
 /// Firecracker exits, but the listener task may not have processed it yet when the VM
 /// exit is observed — wait on the exit-seen flag for a bounded window (the listener
 /// itself stays alive to catch a racing reboot signal, so we can't join it).
-async fn read_container_exit_code(ctx: &mut VmContext) -> Option<i32> {
+///
+/// Shared by both VM run loops (podman run and snapshot restore): the listener writes
+/// `container-exit` under `data_dir` in both.
+pub(crate) async fn read_container_exit_code(
+    container_exit_seen: &std::sync::atomic::AtomicBool,
+    data_dir: &Path,
+) -> Option<i32> {
     use std::sync::atomic::Ordering;
     // wait_for_reboot_decision's drain handshake already proved the listener
     // processed everything the guest sent; the short wait here is only a backstop
     // for the listener-stuck case where the drain timed out.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while !ctx.container_exit_seen.load(Ordering::Acquire) {
+    while !container_exit_seen.load(Ordering::Acquire) {
         if tokio::time::Instant::now() >= deadline {
             warn!("no container exit notification after VM exit");
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    let exit_file = ctx.data_dir.join("container-exit");
+    let exit_file = data_dir.join("container-exit");
     std::fs::read_to_string(&exit_file)
         .ok()
         .and_then(|s| s.trim().parse::<i32>().ok())
@@ -2730,7 +2736,8 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                     info!(container_exit_code = ?exit_code, "TTY container exit code");
                     exit_code
                 } else {
-                    let exit_code = read_container_exit_code(ctx).await;
+                    let exit_code =
+                        read_container_exit_code(&ctx.container_exit_seen, &ctx.data_dir).await;
                     info!(container_exit_code = ?exit_code, "container exit code");
                     exit_code
                 };
