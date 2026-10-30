@@ -354,11 +354,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             field("client_secret")?,
         ));
     }
-    dial::run(
-        agent,
-        dial::DialCfg::new(url, headers),
-    )
-    .await
+    dial::run(agent, dial::DialCfg::new(url, headers)).await
 }
 
 struct SlotHandle {
