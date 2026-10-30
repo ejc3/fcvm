@@ -2268,10 +2268,16 @@ fn apt_transport(
             "no host CA bundle found; apt fetches the archive over http:// through the proxy, \
              which a proxy that only tunnels refuses"
         );
-        let env = ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"]
-            .into_iter()
-            .map(|name| (name.to_string(), tunnel.to_string()))
-            .collect();
+        let plain = http_proxy.or(https_proxy).unwrap_or(tunnel);
+        let env = [
+            ("http_proxy", plain),
+            ("HTTP_PROXY", plain),
+            ("https_proxy", tunnel),
+            ("HTTPS_PROXY", tunnel),
+        ]
+        .into_iter()
+        .map(|(name, proxy)| (name.to_string(), proxy.to_string()))
+        .collect();
         return AptTransport {
             env,
             ..Default::default()
@@ -2798,6 +2804,35 @@ mod tests {
                 vec![(ca.clone(), "/run/fcvm-host-ca.crt".to_string())]
             );
         }
+    }
+
+    /// Without a CA bundle apt keeps the http:// sources, so each scheme keeps the proxy
+    /// it had before: its own variable, else the other one.
+    #[test]
+    fn apt_transport_without_a_ca_bundle_keeps_each_schemes_proxy() {
+        let env = |pairs: [(&str, &str); 4]| {
+            pairs
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .to_vec()
+        };
+        let t = apt_transport(Some("http://plain:8080"), Some("http://tunnel:3128"), None);
+        assert_eq!(
+            t,
+            AptTransport {
+                env: env([
+                    ("http_proxy", "http://plain:8080"),
+                    ("HTTP_PROXY", "http://plain:8080"),
+                    ("https_proxy", "http://tunnel:3128"),
+                    ("HTTPS_PROXY", "http://tunnel:3128"),
+                ]),
+                ..Default::default()
+            }
+        );
+        let t = apt_transport(None, Some("http://tunnel:3128"), None);
+        assert!(
+            t.env.iter().all(|(_, value)| value == "http://tunnel:3128") && t.env.len() == 4,
+            "{t:?}"
+        );
     }
 
     /// With no proxy the container gets nothing: apt reaches the archive directly.
