@@ -204,10 +204,13 @@ fn bridged_proxy_relay(
             return None;
         }
     };
-    plan.upstream.ip().is_loopback().then(|| BridgedProxyRelay {
-        bind_ip: host_ip.to_string(),
-        plan,
-    })
+    plan.upstream
+        .iter()
+        .all(|address| address.ip().is_loopback())
+        .then(|| BridgedProxyRelay {
+            bind_ip: host_ip.to_string(),
+            plan,
+        })
 }
 
 /// Bridged networking using network namespace isolation with veth pairs

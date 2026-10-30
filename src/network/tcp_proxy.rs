@@ -408,7 +408,7 @@ pub async fn start_localhost_forwards(
 pub async fn start_proxy_relay(
     ns_name: &str,
     gateway_ip: &str,
-    proxy_addr: SocketAddr,
+    upstream: Vec<SocketAddr>,
 ) -> Result<Relay> {
     let bind_addr: SocketAddr = format!("{}:{}", gateway_ip, PROXY_RELAY_PORT)
         .parse()
@@ -424,22 +424,31 @@ pub async fn start_proxy_relay(
         .context("binding proxy relay listener in namespace")?;
 
     info!(
-        proxy = %proxy_addr,
+        proxy = ?upstream,
         bind = %bind_addr,
         "reverse proxy relay via TCP proxy"
     );
 
-    let relay = spawn_relay_loop(
+    Ok(proxy_relay(listener, upstream))
+}
+
+/// Relay each connection on `listener` to the host's proxy, trying its addresses in the
+/// order they resolved (a `localhost` proxy can resolve to ::1 first and listen only on
+/// 127.0.0.1).
+fn proxy_relay(listener: tokio::net::TcpListener, upstream: Vec<SocketAddr>) -> Relay {
+    let upstream: Arc<[SocketAddr]> = upstream.into();
+    spawn_relay_loop(
         listener,
-        move || async move {
-            tokio::net::TcpStream::connect(proxy_addr)
-                .await
-                .context("connecting to proxy")
+        move || {
+            let upstream = Arc::clone(&upstream);
+            async move {
+                tokio::net::TcpStream::connect(&upstream[..])
+                    .await
+                    .context("connecting to proxy")
+            }
         },
         "proxy",
-    );
-
-    Ok(relay)
+    )
 }
 
 /// The host's proxy, from its variables: the HTTPS proxy first, else the HTTP one.
@@ -454,7 +463,8 @@ pub fn host_proxy_from_env() -> Option<String> {
 /// proxy itself, and the URL keeps the proxy's credentials.
 #[derive(Debug, PartialEq)]
 pub struct ProxyRelayPlan {
-    pub upstream: SocketAddr,
+    /// Every address the proxy's host resolved to, in order; never empty.
+    pub upstream: Vec<SocketAddr>,
     pub guest_url: String,
 }
 
@@ -480,7 +490,7 @@ pub fn plan_proxy_relay(proxy: &str, relay_ip: &str) -> Result<ProxyRelayPlan> {
 /// address to connect to. Hostnames are resolved. The credentials are not part of the
 /// address, and no error repeats them.
 pub fn parse_proxy_addr(proxy: &str) -> Result<SocketAddr> {
-    resolve_proxy(&proxy_url(proxy)?)
+    Ok(resolve_proxy(&proxy_url(proxy)?)?[0])
 }
 
 fn proxy_url(proxy: &str) -> Result<url::Url> {
@@ -493,7 +503,8 @@ fn proxy_url(proxy: &str) -> Result<url::Url> {
     url::Url::parse(&normalized).map_err(|e| anyhow::anyhow!("the proxy URL does not parse: {e}"))
 }
 
-fn resolve_proxy(url: &url::Url) -> Result<SocketAddr> {
+/// Every address the proxy's host resolves to, in order; an error when there is none.
+fn resolve_proxy(url: &url::Url) -> Result<Vec<SocketAddr>> {
     use std::net::ToSocketAddrs;
     let host = url
         .host_str()
@@ -503,16 +514,20 @@ fn resolve_proxy(url: &url::Url) -> Result<SocketAddr> {
     let port = url
         .port_or_known_default()
         .context("the proxy URL has no port")?;
-    (host, port)
+    let addresses: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
         .with_context(|| format!("resolving proxy address {host}:{port}"))?
-        .next()
-        .with_context(|| format!("no addresses resolved for proxy {host}:{port}"))
+        .collect();
+    anyhow::ensure!(
+        !addresses.is_empty(),
+        "no addresses resolved for proxy {host}:{port}"
+    );
+    Ok(addresses)
 }
 
 /// Start a relay for the host's proxy that listens on `bind_ip` in fcvm's own network
 /// namespace, where the guest reaches it through its veth, and connects to `proxy_addr`.
-pub async fn start_host_proxy_relay(bind_ip: &str, proxy_addr: SocketAddr) -> Result<Relay> {
+pub async fn start_host_proxy_relay(bind_ip: &str, upstream: Vec<SocketAddr>) -> Result<Relay> {
     let bind_addr: SocketAddr = format!("{bind_ip}:{PROXY_RELAY_PORT}")
         .parse()
         .with_context(|| {
@@ -521,16 +536,8 @@ pub async fn start_host_proxy_relay(bind_ip: &str, proxy_addr: SocketAddr) -> Re
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("binding proxy relay listener on {bind_addr}"))?;
-    info!(proxy = %proxy_addr, bind = %bind_addr, "proxy relay on the host");
-    Ok(spawn_relay_loop(
-        listener,
-        move || async move {
-            tokio::net::TcpStream::connect(proxy_addr)
-                .await
-                .context("connecting to proxy")
-        },
-        "proxy",
-    ))
+    info!(proxy = ?upstream, bind = %bind_addr, "proxy relay on the host");
+    Ok(proxy_relay(listener, upstream))
 }
 
 #[cfg(test)]
@@ -618,7 +625,7 @@ mod tests {
     #[test]
     fn a_relay_url_keeps_the_proxys_credentials() {
         let plan = plan_proxy_relay("http://user:secret@127.0.0.1:3128/", "10.0.2.1").unwrap();
-        assert_eq!(plan.upstream.to_string(), "127.0.0.1:3128");
+        assert_eq!(plan.upstream, vec!["127.0.0.1:3128".parse().unwrap()]);
         assert_eq!(
             plan.guest_url,
             format!("http://user:secret@10.0.2.1:{PROXY_RELAY_PORT}/")
@@ -630,11 +637,40 @@ mod tests {
         );
     }
 
+    /// A proxy's host can resolve to several addresses (`localhost` to ::1 and then
+    /// 127.0.0.1 on some hosts) while the proxy listens on one. The relay tries them in
+    /// order instead of keeping the first.
+    #[tokio::test]
+    async fn a_proxy_relay_tries_every_address_of_its_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let refused = {
+            let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            gone.local_addr().unwrap()
+        };
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = proxy.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = listener.local_addr().unwrap();
+        let relay = proxy_relay(listener, vec![refused, live]);
+
+        let mut client = tokio::net::TcpStream::connect(relay_addr).await.unwrap();
+        client.write_all(b"CONNECT").await.unwrap();
+        let (mut upstream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), proxy.accept())
+                .await
+                .expect("the relay never reached the proxy at its second address")
+                .unwrap();
+        let mut got = [0u8; 7];
+        upstream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"CONNECT");
+        stop_relays([relay]).await;
+    }
+
     /// The relay passes bytes through, so a TLS proxy stays TLS for the guest.
     #[test]
     fn a_relay_url_keeps_the_proxys_scheme() {
         let plan = plan_proxy_relay("https://127.0.0.1:3128", "10.0.2.1").unwrap();
-        assert_eq!(plan.upstream.to_string(), "127.0.0.1:3128");
+        assert_eq!(plan.upstream, vec!["127.0.0.1:3128".parse().unwrap()]);
         assert_eq!(
             plan.guest_url,
             format!("https://10.0.2.1:{PROXY_RELAY_PORT}/")
