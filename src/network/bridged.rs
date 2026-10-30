@@ -200,6 +200,8 @@ pub struct BridgedNetwork {
     is_clone: bool,
     /// For clones: the veth IP inside the namespace (used for port forwarding)
     veth_inner_ip: Option<String>,
+    /// The relay for a host proxy on loopback, which the guest cannot reach itself.
+    proxy_relay: Option<super::tcp_proxy::Relay>,
 }
 
 impl BridgedNetwork {
@@ -225,6 +227,7 @@ impl BridgedNetwork {
             port_mapping_rules: Vec::new(),
             is_clone: false,
             veth_inner_ip: None,
+            proxy_relay: None,
         }
     }
 
@@ -657,6 +660,40 @@ impl NetworkManager for BridgedNetwork {
             }
         }
 
+        // A proxy on the host's loopback is the guest's own loopback inside the guest.
+        // Relay it from the guest's gateway: on the host side of the veth for a fresh
+        // boot, inside the namespace on br0 for a clone, whose guest kept the gateway
+        // (and the relay URL) of the VM it was snapshotted from. A proxy elsewhere is
+        // reached through the NAT as it is.
+        let mut guest_proxy = None;
+        if let Some(proxy) = super::tcp_proxy::host_proxy_from_env() {
+            let relay_ip = guest_gateway_ip.clone().unwrap_or_else(|| host_ip.clone());
+            match super::tcp_proxy::plan_proxy_relay(&proxy, &relay_ip) {
+                Ok(plan) if plan.upstream.ip().is_loopback() => {
+                    let started = if self.is_clone {
+                        super::tcp_proxy::start_proxy_relay(&namespace_id, &relay_ip, plan.upstream)
+                            .await
+                    } else {
+                        super::tcp_proxy::start_host_proxy_relay(&relay_ip, plan.upstream).await
+                    };
+                    match started {
+                        Ok(relay) => {
+                            self.proxy_relay = Some(relay);
+                            guest_proxy = Some(plan.guest_url);
+                        }
+                        Err(e) => {
+                            let _ = self.cleanup().await;
+                            return Err(e).context("starting the relay for the host's proxy");
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(error = %format!("{e:#}"), "cannot relay the host's proxy");
+                }
+            }
+        }
+
         // Generate MAC address
         let guest_mac = generate_mac();
 
@@ -681,7 +718,7 @@ impl NetworkManager for BridgedNetwork {
             guest_ipv6: None, // Bridged mode doesn't support IPv6 yet
             host_ipv6: None,
             dns_search: None,
-            http_proxy: None,
+            http_proxy: guest_proxy,
             namespace_name: None,
         })
     }
@@ -689,6 +726,11 @@ impl NetworkManager for BridgedNetwork {
     async fn cleanup(&mut self) -> Result<()> {
         info!(vm_id = %self.vm_id, "cleaning up network namespace and resources");
         let mut errors = Vec::new();
+
+        // Step 0: stop the proxy relay, whose listener holds an address of the veth.
+        if let Some(relay) = self.proxy_relay.take() {
+            super::tcp_proxy::stop_relays([relay]).await;
+        }
 
         // Step 1: Cleanup port mapping rules (if any)
         if !self.port_mapping_rules.is_empty() {
