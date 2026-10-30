@@ -2370,6 +2370,42 @@ async fn join_tty_session(
     }
 }
 
+/// A container that ran to its end with a non-zero code. fcvm exits with that code
+/// (`process_exit_status`), as `podman run` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerExited(pub i32);
+
+impl std::fmt::Display for ContainerExited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "container exited with code {}", self.0)
+    }
+}
+
+impl std::error::Error for ContainerExited {}
+
+/// How every run that waited for its VM to exit reports the container: `fcvm podman run`
+/// on a cold boot, a restored VM (a snapshot hit, or a miss that converges on the
+/// restore), and a disk-only clone. `code` is what the guest reported on the status
+/// channel or the TTY session; `None` means it reported nothing (boot failure, fc-agent
+/// crash, a guest that powered off on its own), which is a failure, not a success.
+pub(crate) fn container_exit_status(code: Option<i32>) -> Result<()> {
+    match code {
+        Some(0) => Ok(()),
+        Some(code) => Err(ContainerExited(code).into()),
+        None => bail!("VM exited without reporting a container exit code"),
+    }
+}
+
+/// The exit status fcvm ends with for `error`: the container's own code for a
+/// [`ContainerExited`] (1 when the code does not fit an exit status, so a failure can
+/// never read as 0), and 1 for any other failure.
+pub fn process_exit_status(error: &anyhow::Error) -> i32 {
+    match error.downcast_ref::<ContainerExited>() {
+        Some(ContainerExited(code)) if (1..=255).contains(code) => *code,
+        _ => 1,
+    }
+}
+
 /// Read the container exit code recorded by the status listener after VM exit.
 ///
 /// The exit notification stays buffered in the host-side unix socket even after
@@ -2741,13 +2777,13 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                     info!(container_exit_code = ?exit_code, "container exit code");
                     exit_code
                 };
-                let Some(code) = exit_code else {
-                    // No exit code means the guest never reported the container's
-                    // result (boot failure, fc-agent crash, or lost vsock
-                    // notification). Fail instead of silently reporting success.
-                    bail!("VM exited without reporting a container exit code");
-                };
-                return Ok(Some(code));
+                // No exit code means the guest never reported the container's result.
+                // The library's VmHandle reads the code itself, so only that case is
+                // decided here.
+                if exit_code.is_none() {
+                    container_exit_status(None)?;
+                }
+                return Ok(exit_code);
             }
             // Handle cache creation requests from fc-agent
             Some(cache_request) = async {
@@ -3327,14 +3363,11 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         return super::snapshot::cmd_snapshot_run(snapshot_args).await;
     }
 
-    // Propagate a missing exit code as an error and a non-zero exit code as a failure
-    if let Some(code) = result? {
-        if code != 0 {
-            bail!("container exited with code {}", code);
-        }
+    // None here is a cancelled run; the loop already failed a VM that exited unreported.
+    match result? {
+        Some(code) => container_exit_status(Some(code)),
+        None => Ok(()),
     }
-
-    Ok(())
 }
 
 /// CLI entrypoint for `fcvm podman prepare`.
@@ -6069,6 +6102,86 @@ mod poweroff_deadline_tests {
         assert!(
             rearm > relaunch && rearm - relaunch < 200,
             "rearm is not at the relaunch site"
+        );
+    }
+}
+
+#[cfg(test)]
+mod container_exit_status_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_container_is_fcvms_exit_status() {
+        assert!(container_exit_status(Some(0)).is_ok());
+
+        let failed = container_exit_status(Some(7)).unwrap_err();
+        assert_eq!(
+            failed.downcast_ref::<ContainerExited>(),
+            Some(&ContainerExited(7))
+        );
+        assert_eq!(format!("{failed:#}"), "container exited with code 7");
+        assert_eq!(process_exit_status(&failed), 7);
+        let wrapped = failed.context("running the clone");
+        assert_eq!(process_exit_status(&wrapped), 7, "context hid the code");
+
+        // A code that does not fit an exit status must still fail: 256 would read as 0.
+        for code in [256, 512, -1] {
+            let error = container_exit_status(Some(code)).unwrap_err();
+            assert_eq!(process_exit_status(&error), 1, "code {code}");
+        }
+
+        let unreported = container_exit_status(None).unwrap_err();
+        assert!(
+            format!("{unreported:#}").contains("without reporting a container exit code"),
+            "{unreported:#}"
+        );
+        assert_eq!(process_exit_status(&unreported), 1);
+        assert_eq!(process_exit_status(&anyhow::anyhow!("anything else")), 1);
+    }
+
+    /// Every run that waits for its VM to exit reports the container through
+    /// `container_exit_status`, and fcvm exits with `process_exit_status`. The loops need a
+    /// VM to drive, so the wiring is pinned by source; tests/test_podman_snapshot.rs runs
+    /// the cold and restore paths.
+    #[test]
+    fn every_run_reports_its_container_through_one_rule() {
+        fn body<'a>(source: &'a str, start: &str) -> &'a str {
+            let from = source.find(start).unwrap_or_else(|| panic!("no {start:?}"));
+            let rest = &source[from..];
+            &rest[..rest.find("\n}\n").expect("unterminated fn")]
+        }
+        let podman = include_str!("mod.rs");
+        let snapshot = include_str!("../snapshot.rs");
+        for (name, body) in [
+            (
+                "cmd_podman_run",
+                body(podman, "pub async fn cmd_podman_run("),
+            ),
+            (
+                "cmd_snapshot_run_inner",
+                body(snapshot, "async fn cmd_snapshot_run_inner("),
+            ),
+            (
+                "cmd_snapshot_run_disk_only",
+                body(snapshot, "async fn cmd_snapshot_run_disk_only("),
+            ),
+        ] {
+            assert!(
+                body.contains("container_exit_status("),
+                "{name} does not report through container_exit_status"
+            );
+            assert!(
+                !body.contains("process::exit") && !body.contains("container exited with code"),
+                "{name} reports the container by its own rule"
+            );
+        }
+        assert!(
+            body(podman, "pub async fn run_vm_loop").contains("container_exit_status(None)"),
+            "run_vm_loop does not fail an unreported exit through container_exit_status"
+        );
+        assert!(
+            include_str!("../../main.rs").contains("process_exit_status(e)"),
+            "main does not exit with the container's code"
         );
     }
 }

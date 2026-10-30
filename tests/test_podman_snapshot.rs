@@ -420,10 +420,92 @@ async fn test_podman_snapshot_hit_restores_fast() -> Result<()> {
     Ok(())
 }
 
-/// `fcvm podman run` fails when its container fails, on a snapshot hit as on the miss
-/// that created the snapshot. The restore path read the status the guest reports on the
-/// status channel only for a TTY run, so a hit of a container that exited 7 exited 0.
-/// Every `--gpu` run restores (the miss converges on the hit), so every one did.
+/// A plain alpine image under a `localhost/` name: the guest boots it from an exported
+/// image disk, so the exit-status tests need no registry access from the guest.
+const EXIT_STATUS_IMAGE: &str = "localhost/fcvm-exit-status";
+
+/// A container command no snapshot holds yet: the command is part of the snapshot key,
+/// so its first run is a miss and its second a hit.
+fn unique_container_cmd(tag: &str, rest: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("echo {tag}-{nanos}; {rest}")
+}
+
+/// Starts `fcvm podman run --network rootless EXIT_STATUS_IMAGE sh -c cmd`, returning the
+/// child, its pid and its debug log.
+async fn spawn_exit_status_run(
+    name: &str,
+    cmd: &str,
+) -> Result<(tokio::process::Child, u32, PathBuf)> {
+    common::spawn_fcvm_with_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            name,
+            "--network",
+            "rootless",
+            EXIT_STATUS_IMAGE,
+            "sh",
+            "-c",
+            cmd,
+        ],
+        name,
+    )
+    .await
+}
+
+/// Runs `cmd` twice, a miss and then a hit, and returns each run's exit status and log.
+/// `while_running` gets each run's fcvm pid once its VM is up, and its result is ignored
+/// (it may end the VM). Fails unless the miss created a snapshot and the hit restored one.
+async fn run_miss_then_hit<F, Fut>(
+    tag: &str,
+    cmd: &str,
+    while_running: F,
+) -> Result<[(std::process::ExitStatus, PathBuf); 2]>
+where
+    F: Fn(u32) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    common::ensure_nested_container(EXIT_STATUS_IMAGE, "Containerfile.exit-status").await?;
+    let before = list_snapshot_entries();
+
+    let (miss_name, _, _, _) = common::unique_names(&format!("{tag}-miss"));
+    let (mut miss, miss_pid, miss_log) = spawn_exit_status_run(&miss_name, cmd).await?;
+    let vm_id = vm_id_of(miss_pid).await?;
+    while_running(miss_pid).await;
+    let miss_status =
+        short_lived_vm_status(&mut miss, &miss_name, Duration::from_secs(120)).await?;
+    anyhow::ensure!(
+        wait_for_snapshot_entry_from(&snapshot_dir(), &before, &vm_id, 10)
+            .await
+            .is_some(),
+        "the miss created no snapshot, so the second run cannot be a hit; its log is {}",
+        miss_log.display()
+    );
+
+    let (hit_name, _, _, _) = common::unique_names(&format!("{tag}-hit"));
+    let (mut hit, hit_pid, hit_log) = spawn_exit_status_run(&hit_name, cmd).await?;
+    while_running(hit_pid).await;
+    let hit_status = short_lived_vm_status(&mut hit, &hit_name, Duration::from_secs(120)).await?;
+    let log = std::fs::read_to_string(&hit_log)
+        .with_context(|| format!("reading {}", hit_log.display()))?;
+    anyhow::ensure!(
+        log.contains("snapshot hit! Restoring"),
+        "the second run did not restore a snapshot; its log is {}",
+        hit_log.display()
+    );
+    Ok([(miss_status, miss_log), (hit_status, hit_log)])
+}
+
+/// `fcvm podman run` exits with the container's own exit code, on the miss and on the
+/// hit alike. The restore path read the status the guest reports on the status channel
+/// only for a TTY run, so a hit of a container that exited 7 exited 0; and the cold path
+/// exited 1 where the restore path exited with the code. Every `--gpu` run restores (the
+/// miss converges on the hit), so every failing one exited 0.
 ///
 /// The container sleeps before it exits so that its exit reaches the host after the
 /// restored guest has resumed, not during the restore.
@@ -433,77 +515,52 @@ async fn test_podman_snapshot_hit_forwards_container_exit_code() -> Result<()> {
         println!("Skipping test: FCVM_NO_SNAPSHOT is set");
         return Ok(());
     }
-    // The command is part of the snapshot key, so a unique one makes the first run a miss.
-    let unique = format!(
-        "exit-code-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let cmd = format!("echo {unique}; sleep 3; exit 7");
-    let before = list_snapshot_entries();
+    let cmd = unique_container_cmd("exit-code", "sleep 3; exit 7");
+    let runs = run_miss_then_hit("exit-code", &cmd, |_| async {}).await?;
+    for ((status, log), run) in runs.iter().zip(["miss", "hit"]) {
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "fcvm exited with {status} on the {run} for a container that exited 7; its log is {}",
+            log.display()
+        );
+    }
+    Ok(())
+}
 
-    let (miss_name, _, _, _) = common::unique_names("exit-code-miss");
-    let (mut miss, miss_pid) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
-        &miss_name,
-        "--network",
-        "rootless",
-        common::ALPINE_IMAGE,
-        "sh",
-        "-c",
-        &cmd,
-    ])
-    .await?;
-    let vm_id = vm_id_of(miss_pid).await?;
-    let miss_status =
-        short_lived_vm_status(&mut miss, &miss_name, Duration::from_secs(120)).await?;
-    assert!(
-        !miss_status.success(),
-        "fcvm exited with {miss_status} on the miss for a container that exited 7"
-    );
-    assert!(
-        wait_for_snapshot_entry_from(&snapshot_dir(), &before, &vm_id, 10)
+/// A VM that ends without its guest reporting the container's exit code fails, on the hit
+/// as on the miss. The guest powers off at once (`-ff` skips every process), so fc-agent
+/// never sends the code; the restore path reported that as success.
+#[tokio::test]
+async fn test_podman_snapshot_hit_fails_a_vm_that_reports_no_exit_code() -> Result<()> {
+    if snapshot_disabled_by_env() {
+        println!("Skipping test: FCVM_NO_SNAPSHOT is set");
+        return Ok(());
+    }
+    // fc-agent stops the guest the same way: poweroff on arm64, reboot on x86_64.
+    let stop = if cfg!(target_arch = "aarch64") {
+        "/usr/sbin/poweroff"
+    } else {
+        "/usr/sbin/reboot"
+    };
+    let cmd = unique_container_cmd("no-exit-code", "sleep 600");
+    let runs = run_miss_then_hit("no-exit-code", &cmd, |pid| async move {
+        common::poll_health_by_pid(pid, 120)
             .await
-            .is_some(),
-        "the miss created no snapshot, so the second run cannot be a hit"
-    );
-
-    let (hit_name, _, _, _) = common::unique_names("exit-code-hit");
-    let (mut hit, _, hit_log) = common::spawn_fcvm_with_log_path(
-        &[
-            "podman",
-            "run",
-            "--name",
-            &hit_name,
-            "--network",
-            "rootless",
-            common::ALPINE_IMAGE,
-            "sh",
-            "-c",
-            &cmd,
-        ],
-        &hit_name,
-    )
+            .expect("the VM never became healthy");
+        // The exec ends with the guest, so its result says nothing.
+        let _ = common::exec_in_vm(pid, &[stop, "-ff"]).await;
+    })
     .await?;
-    let hit_status = short_lived_vm_status(&mut hit, &hit_name, Duration::from_secs(120)).await?;
-    let log = std::fs::read_to_string(&hit_log)
-        .with_context(|| format!("reading {}", hit_log.display()))?;
-    assert!(
-        log.contains("snapshot hit! Restoring"),
-        "the second run did not restore a snapshot; its log is {}",
-        hit_log.display()
-    );
-    assert_eq!(
-        hit_status.code(),
-        Some(7),
-        "fcvm exited with {hit_status} on a snapshot hit for a container that exited 7; \
-         its log is {}",
-        hit_log.display()
-    );
+    for ((status, log), run) in runs.iter().zip(["miss", "hit"]) {
+        let text = std::fs::read_to_string(log)?;
+        assert!(
+            !status.success() && text.contains("VM exited without reporting a container exit code"),
+            "fcvm exited with {status} on the {run} for a guest that powered off without \
+             reporting its container; its log is {}",
+            log.display()
+        );
+    }
     Ok(())
 }
 

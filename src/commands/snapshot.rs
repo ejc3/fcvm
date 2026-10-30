@@ -3433,8 +3433,10 @@ async fn cmd_snapshot_run_inner(
         },
     };
 
-    // Track container exit code (from TTY mode)
-    let mut container_exit_code: Option<i32> = None;
+    // Set when the VMM exited on its own: the container exit code the guest reported, or
+    // None when it reported none. Left None when fcvm stopped the VM (a signal, a memory
+    // server's death, an interrupted startup snapshot).
+    let mut vm_exit: Option<Option<i32>> = None;
     // Set when the VMM died on its own instead of fcvm stopping it — the authoritative
     // failure signal a caller sees for a clone whose memory could not be served.
     let mut clone_failure: Option<String> = None;
@@ -3518,7 +3520,7 @@ async fn cmd_snapshot_run_inner(
         while clone_failure.is_none() && lifecycle_ready_result.is_ok() && !lifecycle_cancelled {
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    container_exit_code = None;
+                    vm_exit = None;
                     break;
                 }
                 // The container has exited and the guest has not powered off in time. Kill the
@@ -3567,7 +3569,7 @@ async fn cmd_snapshot_run_inner(
                          clone was killed rather than left frozen with no error.",
                         serve_pid.unwrap_or(0)
                     ));
-                    container_exit_code = None;
+                    vm_exit = None;
                     break;
                 }
                 status = vm_manager.wait() => {
@@ -3751,17 +3753,20 @@ async fn cmd_snapshot_run_inner(
                     // the "exit:" the guest sent on the status channel, which the status
                     // listener wrote to `container-exit` (the drain handshake above proved it
                     // has handled everything the guest sent).
-                    if let Some(handle) = tty_handle.take() {
-                        container_exit_code = handle.join().ok().and_then(|r| r.ok());
-                        info!(container_exit_code = ?container_exit_code, "TTY container exit code");
+                    let container_exit_code = if let Some(handle) = tty_handle.take() {
+                        let code = handle.join().ok().and_then(|r| r.ok());
+                        info!(container_exit_code = ?code, "TTY container exit code");
+                        code
                     } else {
-                        container_exit_code = super::podman::read_container_exit_code(
+                        let code = super::podman::read_container_exit_code(
                             &container_exit_seen,
                             &data_dir,
                         )
                         .await;
-                        info!(container_exit_code = ?container_exit_code, "container exit code");
-                    }
+                        info!(container_exit_code = ?code, "container exit code");
+                        code
+                    };
+                    vm_exit = Some(container_exit_code);
                     break;
                 }
                 // Handle startup snapshot creation when health becomes healthy. The
@@ -3816,7 +3821,7 @@ async fn cmd_snapshot_run_inner(
                                 ) => {
                                     match outcome {
                                         SnapshotOutcome::Interrupted => {
-                                            container_exit_code = None;
+                                            vm_exit = None;
                                             break;
                                         }
                                         SnapshotOutcome::Existing => {
@@ -3851,7 +3856,7 @@ async fn cmd_snapshot_run_inner(
                                 }
                                 _ = cancel.cancelled() => {
                                     info!(snapshot_key = %startup_key, "Startup snapshot aborted by shutdown signal");
-                                    container_exit_code = None;
+                                    vm_exit = None;
                                     break;
                                 }
                             }
@@ -3956,14 +3961,11 @@ async fn cmd_snapshot_run_inner(
         bail!("clone '{}' FAILED: {}", vm_name, reason);
     }
 
-    // Return error if container exited with non-zero code
-    if let Some(code) = container_exit_code {
-        if code != 0 {
-            std::process::exit(code);
-        }
+    // A VM that exited on its own reports its container the way a cold boot does.
+    match vm_exit {
+        Some(container_exit_code) => super::podman::container_exit_status(container_exit_code),
+        None => Ok(()),
     }
-
-    Ok(())
 }
 
 /// What a VMM exit means for the clone's report. A guest reboot is orderly, and so is a VMM that
@@ -4447,12 +4449,11 @@ async fn cmd_snapshot_run_disk_only(
     let result = super::podman::run_vm_loop(&mut ctx, cancel).await;
     super::podman::cleanup_vm_context(ctx).await;
 
-    if let Some(code) = result? {
-        if code != 0 {
-            bail!("clone container exited with code {}", code);
-        }
+    // None here is a cancelled run; the loop already failed a VM that exited unreported.
+    match result? {
+        Some(code) => super::podman::container_exit_status(Some(code)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// List running snapshot servers
