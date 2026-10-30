@@ -124,6 +124,32 @@ describe("input to pixels", () => {
     expect(s.lastInputLatencyMs).toBe(183);
     expect(cameraTargets(s)).toEqual([]);
   });
+
+  // The coordinator tells the page its claim every 200 ms (live.rs `tell_claim`), and a drag
+  // drops every key after the moment it is applied, so in a burst of drags 50 ms apart the
+  // page sees only the last drag's key. The first drag of the burst took the camera from the
+  // autopilot, whose keys reached 16 s ahead. It must not be timed to a key of the autopilot
+  // that later flies past where its old path ended: that reads seconds for a move drawn at once.
+  it("does not time a drag whose key a later drag replaced to an autopilot key seconds later", () => {
+    let s = feed(initialState(), snapshotText(1, fleet()));
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("own", "claim_gpu"), at: EPOCH });
+    // Autopilot on: its path runs to t = 26.
+    s = feed(s, claim([{ t: 10, x: 0 }, { t: 18, x: 1 }, { t: 26, x: 2 }]));
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("a", "claim_camera", { drag: { yaw_deg: 9, pitch_deg: 0, dive: 0 } }), at: EPOCH + 100 });
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("b", "claim_camera", { drag: { yaw_deg: 9, pitch_deg: 0, dive: 0 } }), at: EPOCH + 150 });
+    s = feed(s, JSON.stringify({ type: "receipt", id: "a", outcome: "applied", version: 2 }));
+    s = feed(s, JSON.stringify({ type: "receipt", id: "b", outcome: "applied", version: 3 }));
+    s = feed(s, snapshotText(3, fleet()));
+    // The one claim message the page gets after both: a's key (t 10.6) is gone.
+    s = feed(s, claim([{ t: 10, x: 0 }, { t: 10.15, x: 0.1 }, { t: 10.45, x: 0.2, intent: "b" }]));
+    expect(cameraTargets(s)).toEqual([{ id: "b", tEff: 10.45 }]);
+    s = reduce(s, { type: "camera-drawn", id: "b", drawnAt: EPOCH + 650 });
+    expect(s.lastInputLatencyMs).toBe(500);
+    // Space: the autopilot flies again, its keys running past the old path's end.
+    s = feed(s, claim([{ t: 15, x: 0.2 }, { t: 23, x: 1 }, { t: 27, x: 2 }, { t: 31, x: 3 }]));
+    expect(cameraTargets(s)).toEqual([]);
+    expect(s.lastInputLatencyMs).toBe(500);
+  });
 });
 
 describe("asking for a GPU while the wall is paused", () => {
