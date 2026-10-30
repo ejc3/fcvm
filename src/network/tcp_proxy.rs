@@ -462,10 +462,8 @@ pub struct ProxyRelayPlan {
 pub fn plan_proxy_relay(proxy: &str, relay_ip: &str) -> Result<ProxyRelayPlan> {
     let url = proxy_url(proxy)?;
     let upstream = resolve_proxy(&url)?;
+    // The relay passes bytes through, so the guest speaks the proxy's own scheme.
     let mut guest = url;
-    guest
-        .set_scheme("http")
-        .map_err(|()| anyhow::anyhow!("the proxy URL's scheme cannot be http"))?;
     guest
         .set_host(Some(relay_ip))
         .with_context(|| format!("relay address {relay_ip} is not a URL host"))?;
@@ -629,6 +627,17 @@ mod tests {
         assert_eq!(
             plan.guest_url,
             format!("http://172.30.0.1:{PROXY_RELAY_PORT}/")
+        );
+    }
+
+    /// The relay passes bytes through, so a TLS proxy stays TLS for the guest.
+    #[test]
+    fn a_relay_url_keeps_the_proxys_scheme() {
+        let plan = plan_proxy_relay("https://127.0.0.1:3128", "10.0.2.1").unwrap();
+        assert_eq!(plan.upstream.to_string(), "127.0.0.1:3128");
+        assert_eq!(
+            plan.guest_url,
+            format!("https://10.0.2.1:{PROXY_RELAY_PORT}/")
         );
     }
 
