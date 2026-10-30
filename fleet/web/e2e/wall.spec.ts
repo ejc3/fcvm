@@ -451,7 +451,22 @@ test("an opened VM zooms to fill the screen at its detail height, with the tiles
   await page.mouse.click(pick!.x, pick!.y);
   await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().ui.focusId)).toBe(pick!.id);
   await expect(page.locator("#focus-title")).not.toHaveText("fcvm VM 3");
-  await page.getByRole("button", { name: "Back to the wall" }).click();
+  // Over the opened VM the cursor is a zoom-out glass and a click zooms back out; over a dimmed tile it zooms in.
+  const hit = page.getByTestId("zoom-hit");
+  // The new box once the zoom has settled: two reads 300 ms apart agree.
+  let opened = await page.evaluate(() => window.__fleet!.view().plan.zoom!.box!);
+  await expect.poll(async () => {
+    const prev = opened;
+    await page.waitForTimeout(300);
+    opened = await page.evaluate(() => window.__fleet!.view().plan.zoom!.box!);
+    return JSON.stringify(opened) === JSON.stringify(prev);
+  }).toBe(true);
+  await page.mouse.move(pick!.x - 3, pick!.y - 3);
+  await page.mouse.move(opened.x + opened.w / 2, opened.y + opened.h / 2);
+  await expect.poll(() => hit.evaluate((el) => getComputedStyle(el).cursor)).toBe("zoom-out");
+  await page.mouse.move(opened.x - 12, opened.y + opened.h / 2);
+  await expect.poll(() => hit.evaluate((el) => getComputedStyle(el).cursor)).toBe("zoom-in");
+  await page.mouse.click(opened.x + opened.w / 2, opened.y + opened.h / 2);
   await expect(page.getByTestId("focus")).toHaveCount(0);
   await expect.poll(() => page.evaluate(() => window.__fleet!.view().zoom)).toBeNull();
 });

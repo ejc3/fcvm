@@ -232,10 +232,11 @@ a.icon-btn { text-decoration: none; }
 /* ---- one VM opened ------------------------------------------------------------- */
 
 /* The canvas draws the zoomed image and the dim (plan.zoom); this layer only sits over it.
-   Clicks fall through to .zoom-hit, which opens the tile under them. */
+   Clicks fall through to .zoom-hit, which opens the dimmed tile under them or, over the opened VM (.out), zooms out. */
 .zoom { position: fixed; inset: 0; z-index: 5; pointer-events: none; animation: zoom-in 260ms ease-out both; }
 .zoom > * { pointer-events: auto; }
 .zoom-hit { position: absolute; inset: 0; cursor: zoom-in; touch-action: pan-y; }
+.zoom-hit.out { cursor: zoom-out; }
 .zoom-ring { position: absolute; pointer-events: none !important; box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent), 0 18px 60px rgba(0, 0, 0, 0.55); border-radius: 2px; }
 .zoom-ring .tag { position: absolute; left: 10px; bottom: 10px; font: 14px var(--mono); color: var(--text); }
 .zoom-bar { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; padding: 12px 24px 22px; pointer-events: none !important; background-image: linear-gradient(rgba(0, 0, 0, 0.7), rgba(0, 0, 0, 0)); }
