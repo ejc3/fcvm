@@ -2218,6 +2218,90 @@ async fn create_layer2_setup_initrd(
     Ok(initrd_path)
 }
 
+/// How the package-download container reaches the Ubuntu archive: environment, read-only
+/// bind mounts (host path, container path), and shell run before the download script.
+/// None of it is part of the download script, so the rootfs hash does not depend on the
+/// host's proxy.
+#[derive(Debug, Default, PartialEq)]
+struct AptTransport {
+    env: Vec<(String, String)>,
+    mounts: Vec<(PathBuf, String)>,
+    prelude: String,
+}
+
+/// The host's CA bundle, for apt to verify the archive over HTTPS: the ubuntu image has
+/// no ca-certificates.
+fn host_ca_bundle() -> Option<PathBuf> {
+    [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+}
+
+/// Where the container sees the host's CA bundle.
+const CONTAINER_CA_BUNDLE: &str = "/run/fcvm-host-ca.crt";
+
+/// How apt reaches the archive through the host's proxy, if one is set.
+///
+/// The archive's sources are http:// URLs, and apt sends a plain-HTTP request to a proxy
+/// as an absolute-form GET, which a proxy that only tunnels refuses (405 Method Not
+/// Allowed). Every forward proxy tunnels (CONNECT), so apt fetches the archive over
+/// HTTPS through the proxy (`https_proxy`, else `http_proxy`) and verifies it against the
+/// host's CA bundle. The packages are the same bytes either way: apt checks them against
+/// the archive's signed index.
+///
+/// Without a CA bundle apt cannot verify HTTPS, so it keeps the http:// sources and uses
+/// the proxy for both schemes, as before.
+fn apt_transport(
+    http_proxy: Option<&str>,
+    https_proxy: Option<&str>,
+    ca_bundle: Option<PathBuf>,
+) -> AptTransport {
+    let Some(tunnel) = https_proxy.or(http_proxy) else {
+        return AptTransport::default();
+    };
+    let Some(ca_bundle) = ca_bundle else {
+        warn!(
+            "no host CA bundle found; apt fetches the archive over http:// through the proxy, \
+             which a proxy that only tunnels refuses"
+        );
+        let plain = http_proxy.or(https_proxy).unwrap_or(tunnel);
+        let env = [
+            ("http_proxy", plain),
+            ("HTTP_PROXY", plain),
+            ("https_proxy", tunnel),
+            ("HTTPS_PROXY", tunnel),
+        ]
+        .into_iter()
+        .map(|(name, proxy)| (name.to_string(), proxy.to_string()))
+        .collect();
+        return AptTransport {
+            env,
+            ..Default::default()
+        };
+    };
+    // The download script writes 99proxy from $http_proxy when it is set; this file
+    // sorts after it, so its https proxy is the one apt uses.
+    let prelude = format!(
+        "sed -i 's#http://#https://#g' /etc/apt/sources.list.d/*.sources\n\
+         cat > /etc/apt/apt.conf.d/99zz-fcvm-transport <<'FCVM_APT_TRANSPORT'\n\
+         Acquire::https::Proxy \"{tunnel}\";\n\
+         Acquire::https::CaInfo \"{CONTAINER_CA_BUNDLE}\";\n\
+         FCVM_APT_TRANSPORT\n"
+    );
+    AptTransport {
+        env: vec![
+            ("https_proxy".to_string(), tunnel.to_string()),
+            ("HTTPS_PROXY".to_string(), tunnel.to_string()),
+        ],
+        mounts: vec![(ca_bundle, CONTAINER_CA_BUNDLE.to_string())],
+        prelude,
+    }
+}
+
 /// Download all required .deb packages on the host
 ///
 /// Returns the path to the packages directory (not an ISO).
@@ -2272,42 +2356,36 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
     // Use the same script that's included in the hash
     let download_script = generate_download_script(plan);
 
-    // Build podman args, including proxy env vars if set
+    let transport = apt_transport(
+        std::env::var("http_proxy")
+            .or_else(|_| std::env::var("HTTP_PROXY"))
+            .ok()
+            .as_deref(),
+        std::env::var("https_proxy")
+            .or_else(|_| std::env::var("HTTPS_PROXY"))
+            .ok()
+            .as_deref(),
+        host_ca_bundle(),
+    );
     let mut podman_args = vec![
         "run".to_string(),
         "--rm".to_string(),
         "--cgroups=disabled".to_string(),
         "--network=host".to_string(),
     ];
-
-    // Pass through proxy environment variables, normalizing case.
-    // For each protocol, check lowercase then uppercase. If neither is set,
-    // fall back to the other protocol's value (e.g., HTTPS_PROXY → http_proxy)
-    // since apt repos use http:// URLs but the env may only have HTTPS_PROXY.
-    let http_val = std::env::var("http_proxy")
-        .or_else(|_| std::env::var("HTTP_PROXY"))
-        .ok();
-    let https_val = std::env::var("https_proxy")
-        .or_else(|_| std::env::var("HTTPS_PROXY"))
-        .ok();
-    let http_final = http_val.as_deref().or(https_val.as_deref());
-    let https_final = https_val.as_deref().or(http_val.as_deref());
-    if let Some(val) = http_final {
-        podman_args.extend(["-e".to_string(), format!("http_proxy={}", val)]);
-        podman_args.extend(["-e".to_string(), format!("HTTP_PROXY={}", val)]);
+    for (name, value) in &transport.env {
+        podman_args.extend(["-e".to_string(), format!("{name}={value}")]);
     }
-    if let Some(val) = https_final {
-        podman_args.extend(["-e".to_string(), format!("https_proxy={}", val)]);
-        podman_args.extend(["-e".to_string(), format!("HTTPS_PROXY={}", val)]);
+    for (host, guest) in &transport.mounts {
+        podman_args.extend(["-v".to_string(), format!("{}:{guest}:ro", host.display())]);
     }
-
     podman_args.extend([
         "-v".to_string(),
         format!("{}:/packages", download_dir.display()),
         container_image.clone(),
         "bash".to_string(),
         "-c".to_string(),
-        download_script.clone(),
+        format!("{}{download_script}", transport.prelude),
     ]);
 
     let output = Command::new("podman")
@@ -2685,6 +2763,86 @@ fn path_to_str(path: &Path) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A proxy that only tunnels (CONNECT) answers a plain-HTTP request with 405, so a
+    /// proxy given as HTTPS_PROXY alone must not be handed to apt for the archive's
+    /// http:// URLs: apt fetches the archive over HTTPS through it, verified against the
+    /// host's CA bundle.
+    #[test]
+    fn apt_reaches_the_archive_over_https_through_a_proxy() {
+        let ca = PathBuf::from("/host/ca.crt");
+        for (http, https) in [
+            (None, Some("http://proxy:3128")),
+            (Some("http://proxy:3128"), None),
+            (Some("http://plain:8080"), Some("http://proxy:3128")),
+        ] {
+            let t = apt_transport(http, https, Some(ca.clone()));
+            let tunnel = https.or(http).unwrap();
+            assert!(
+                !t.env
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("http_proxy")),
+                "apt would send plain-HTTP requests to a proxy: {t:?}"
+            );
+            assert!(
+                t.prelude
+                    .contains("sed -i 's#http://#https://#g' /etc/apt/sources.list.d/*.sources"),
+                "the archive stays on http://: {t:?}"
+            );
+            assert!(
+                t.prelude
+                    .contains(&format!("Acquire::https::Proxy \"{tunnel}\";")),
+                "apt does not tunnel through {tunnel}: {t:?}"
+            );
+            assert!(
+                t.prelude
+                    .contains("Acquire::https::CaInfo \"/run/fcvm-host-ca.crt\";"),
+                "{t:?}"
+            );
+            assert_eq!(
+                t.mounts,
+                vec![(ca.clone(), "/run/fcvm-host-ca.crt".to_string())]
+            );
+        }
+    }
+
+    /// Without a CA bundle apt keeps the http:// sources, so each scheme keeps the proxy
+    /// it had before: its own variable, else the other one.
+    #[test]
+    fn apt_transport_without_a_ca_bundle_keeps_each_schemes_proxy() {
+        let env = |pairs: [(&str, &str); 4]| {
+            pairs
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .to_vec()
+        };
+        let t = apt_transport(Some("http://plain:8080"), Some("http://tunnel:3128"), None);
+        assert_eq!(
+            t,
+            AptTransport {
+                env: env([
+                    ("http_proxy", "http://plain:8080"),
+                    ("HTTP_PROXY", "http://plain:8080"),
+                    ("https_proxy", "http://tunnel:3128"),
+                    ("HTTPS_PROXY", "http://tunnel:3128"),
+                ]),
+                ..Default::default()
+            }
+        );
+        let t = apt_transport(None, Some("http://tunnel:3128"), None);
+        assert!(
+            t.env.iter().all(|(_, value)| value == "http://tunnel:3128") && t.env.len() == 4,
+            "{t:?}"
+        );
+    }
+
+    /// With no proxy the container gets nothing: apt reaches the archive directly.
+    #[test]
+    fn apt_transport_without_a_proxy_changes_nothing() {
+        assert_eq!(
+            apt_transport(None, None, Some(PathBuf::from("/host/ca.crt"))),
+            AptTransport::default()
+        );
+    }
 
     /// The bash functions of the generated download script, by name: from the
     /// `name() {` line to the next line that is a bare `}`.
