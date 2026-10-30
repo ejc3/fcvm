@@ -44,19 +44,26 @@ fn run_in_namespace<T>(ns_path: &str, f: impl FnOnce() -> std::io::Result<T>) ->
 
 /// Connect a TCP stream inside a network namespace.
 ///
-/// Spawns a blocking thread that enters the namespace via `setns(2)`, connects,
-/// then restores the original namespace. The returned stream works from any namespace.
+/// A socket belongs to the namespace it was made in, so only making it needs the
+/// namespace: a blocking thread enters it via `setns(2)`, makes the socket and restores
+/// its own namespace. The connect then runs on the runtime, where dropping the future
+/// abandons it. A blocking connect could not be abandoned, and the runtime waits for its
+/// blocking threads when the process exits: a dial of a guest that had just been killed
+/// kept fcvm alive for 4.4 to 5.1 s after its teardown had finished, until the dial gave
+/// up (the fleet agent's `teardown_ms`, 2026-10-30).
 async fn connect_in_namespace(ns_name: &str, addr: SocketAddr) -> Result<tokio::net::TcpStream> {
     let ns_path = format!("/var/run/netns/{}", ns_name);
 
-    let std_stream = tokio::task::spawn_blocking(move || {
-        run_in_namespace(&ns_path, || std::net::TcpStream::connect(addr))
+    let socket = tokio::task::spawn_blocking(move || {
+        run_in_namespace(&ns_path, || match addr {
+            SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
+            SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
+        })
     })
     .await
     .context("spawn_blocking panicked")??;
 
-    std_stream.set_nonblocking(true)?;
-    Ok(tokio::net::TcpStream::from_std(std_stream)?)
+    Ok(socket.connect(addr).await?)
 }
 
 /// Bind a TCP listener inside a network namespace.
@@ -194,8 +201,8 @@ where
 /// has dropped its client and upstream streams, so a client is disconnected instead of
 /// staying attached to a VM that is gone.
 ///
-/// A dial of the guest that is still in progress is not waited for. It runs on the
-/// blocking pool (`connect_in_namespace`), ends by itself, and its socket closes then.
+/// A dial of the guest that is still in progress is a connection task's future
+/// (`connect_in_namespace`), so it ends with the task and its socket closes.
 pub async fn stop_relays(relays: impl IntoIterator<Item = Relay>) {
     let mut relays: Vec<Relay> = relays.into_iter().collect();
     for relay in &relays {
@@ -1083,6 +1090,78 @@ mod tests {
         // Cleanup (namespace deleted by TestNetns::drop)
         echo_handle.abort();
         println!("test_connect_in_namespace PASSED");
+        Ok(())
+    }
+
+    /// A dial of the guest that is still in progress does not hold the process when it exits.
+    ///
+    /// fcvm's `main` drops its runtime on the way out, and a runtime's drop waits for its
+    /// blocking threads. The dial target here is a listener in the namespace whose accept
+    /// queue is full, so the kernel drops every SYN and a connect waits for its SYN
+    /// retries (over two minutes), as a dial of a guest killed under it does. The runtime
+    /// must be gone at once.
+    #[cfg(feature = "privileged-tests")]
+    #[test]
+    fn a_dial_in_progress_does_not_hold_the_runtime_when_it_is_dropped() -> Result<()> {
+        use std::os::fd::AsRawFd;
+        let setup = tokio::runtime::Runtime::new()?;
+        let ns = setup.block_on(TestNetns::create(format!(
+            "test-dial-{}",
+            std::process::id()
+        )))?;
+        drop(setup);
+        let ns_path = format!("/var/run/netns/{}", ns.name);
+        let listener = run_in_namespace(&ns_path, || {
+            let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+            // SAFETY: listen(2) on a socket this test owns; backlog 0 keeps one queued
+            // connection at most.
+            if unsafe { libc::listen(l.as_raw_fd(), 0) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(l)
+        })?;
+        let target = listener.local_addr()?;
+        // Fill the accept queue until a connect gets no answer.
+        let mut queued = Vec::new();
+        let full = run_in_namespace(&ns_path, || {
+            for _ in 0..8 {
+                match std::net::TcpStream::connect_timeout(
+                    &target,
+                    std::time::Duration::from_millis(500),
+                ) {
+                    Ok(s) => queued.push(s),
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Ok(true),
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(false)
+        })?;
+        anyhow::ensure!(full, "the accept queue never filled, so no dial would wait");
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let ns_name = ns.name.clone();
+        let dial = rt.spawn(async move { connect_in_namespace(&ns_name, target).await });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        anyhow::ensure!(
+            !dial.is_finished(),
+            "the dial ended before the runtime was dropped"
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        std::thread::spawn(move || {
+            drop(rt);
+            let _ = tx.send(());
+        });
+        let dropped = rx.recv_timeout(std::time::Duration::from_secs(3));
+        assert!(
+            dropped.is_ok(),
+            "the runtime was still waiting for a dial of a guest that does not answer {:?} after it was dropped",
+            started.elapsed()
+        );
+        drop(queued);
+        drop(listener);
         Ok(())
     }
 
