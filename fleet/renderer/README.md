@@ -144,7 +144,12 @@ FILE] [--h H] [--cols C --rows R]` draws a moving frame of a C x R grid, each
 tile in a fresh renderer with its history, against the same pose held to 1024
 samples, and prints each tile's samples per pixel, render ms and RMSE
 (`BUDGET`, `MARGIN` as for `serve`); it writes the stitched frame and
-reference as PPM.
+reference as PPM. With `--encode SH` every moving frame also goes through the
+stream path at height SH, as `serve` sends it (the tile plus its overlap, scaled
+from the drawn frame), into `tile<I>-lo.h264`, `-std` and `-hi`, and the log
+gives each stream's crop and the bit rate it used over the second half of the
+frames; `tile<I>-samples.pgm` holds the samples each pixel resolved, history
+included (capped at 255).
 
 Tools (Python 3 standard library, plus Pillow and the `ffmpeg` CLI for
 decoding):
@@ -165,6 +170,83 @@ python3 tools/seam_metric.py out.png 4 2              # seam ratio at every tile
 `tools/viewerload.cpp` (C++ and OpenSSL, built with the `g++` line in
 "Viewers per renderer") opens many frame streams as the page does and reports
 each stream's frame rate, frame delay, and frames dropped for a slow reader.
+
+## Speckle at cloud and shading edges (round 16, 2026-10-30)
+
+The owner's staging screenshots (a 3460 x 1946 wall of 16 tiles) showed
+single-pixel speckle along cloud edges and along shading edges on snow and
+rock, which the encoder turned into blotches, and a flat, smeared look.
+Measured which stage makes them, on one g4dn.metal from the fleet host AMI
+(spot, no other job on it), each run in an fcvm VM on its own T4:
+`fleet-renderer quality --h 432 --cols 4 --rows 4 --frames 48 --encode 432`
+(the height that wall asks, the staging budget of 420,448 pixel-samples, so 1
+sample per pixel), each tile's moving frame against the same pose held to 1024
+samples, and the same frames through NVENC at lo, std and hi, decoded with
+ffmpeg. Speckle: the share of pixels more than 12 (8-bit luminance) from the
+median of their 3 x 3 neighbourhood.
+
+- **The speckle is the renderer's.** Golden-hour clouds over terrain: 0.93%
+  of the unencoded frame's pixels against 0.15% in the reference. Encoding
+  does not add it (lo 0.67%, std 0.80%, hi 0.88%); it blurs part of it into
+  blotches. 74% of the speckle was in the 7.5% of pixels that resolved fewer
+  than 8 frames of history (`tile<I>-samples.pgm`), where the speckle rate was
+  9.2% against 0.26% elsewhere.
+- **Two filters skipped exactly those pixels.** Where a cloud covers a pixel
+  over land, its first hit is the cloud at its transmittance-weighted depth,
+  which one sample places hundreds of metres differently from its neighbours
+  and from the frame before, and at the cloud's edge the first hit flips
+  between the cloud and the ground. The reprojection's 4% distance rule
+  dropped those pixels' history, and the denoiser's tangent-plane stop (a
+  footprint of metres) gave them no neighbours. On terrain, the denoiser's
+  normal stop (cosine to the 64th) cut its weights at every turn of the
+  detail normals, so shading edges on rock and snow kept their raw samples.
+- **The flat look is the page's bandwidth rule.** At 3460 x 1946 each tile is
+  486 device pixels tall and asks `h=432`; 16 tiles at std need 135 Mbit/s,
+  over the page's 80 Mbit/s budget, so every tile streams at lo (0.25 bits per
+  pixel, 2.7 Mbit/s). Not changed here.
+
+What changed (`src/render.cu`): a pixel whose first hit is a cloud carries a
+bit in its packed normal. The denoiser treats it like the sky (one surface,
+stopped only by luminance). Reprojection does not hold it, or an earlier
+frame's cloud texel, to the 4% distance rule, and clamps that history to this
+frame's 3 x 3 colors of the same hit kind, as it already did for the sky. The
+denoiser's normal stop is the cosine to the 8th. A stream taller than the
+drawn frame is scaled up bilinearly: the area filter's box, narrower than a
+drawn pixel, picked one drawn pixel per stream pixel and magnified the frame
+into squares (an opened tile asking 720 while its frame is drawn at a wall
+height).
+
+| scene (t 5 of the flight) | speckle, unencoded, before -> after (reference) | PSNR / SSIM against the reference, before -> after | decoded lo against the unencoded frame |
+|---|---|---|---|
+| golden-hour clouds over terrain, from 7 km (time 0.78) | 0.925% -> 0.193% (0.154%) | 32.88 / 0.949 -> 33.86 / 0.961 | 37.19 -> 38.73 dB |
+| sunset cloud deck from 6.3 km (time 0.792) | 0.835% -> 0.126% (0.085%) | 34.00 / 0.953 -> 35.97 / 0.968 | 36.95 -> 39.04 dB |
+| snow and rock under a low sun (time 0.79) | 0.213% -> 0.128% (0.105%) | 39.79 / 0.962 -> 40.02 / 0.967 | 39.28 -> 39.86 dB |
+
+Decoded at lo, the speckle went from 0.67% to 0.12% (clouds), 0.66% to 0.08%
+(cloud deck) and 0.14% to 0.09% (snow), at the same rate (2.7 to 2.8 Mbit/s
+per tile): a cleaner frame also costs the encoder less.
+Render time is unchanged: one VM at a time on one GPU, two runs each, the
+mean of the 16 tiles' mean frame was 17.84 and 17.90 ms before, 17.90 and
+17.89 after (clouds), 10.22 and 10.26 against 10.29 and 10.31 (snow), 15.98
+and 16.02 against 16.02 and 16.05 (cloud deck). No frame of delay is added.
+
+Variants measured on the same frames, 24 frames each (speckle, clouds /
+snow; this change 0.19% / 0.13%): the cloud bit in the denoiser only 0.60% /
+0.21%; the normal stop at ^8 only 0.87% / 0.13%; with the rest, the normal
+stop at ^4 0.19% / 0.13%, the luminance stop at 3 or 6 standard deviations
+0.20% / 0.14% and 0.20% / 0.13%; the tangent-plane stop at 2 footprints only
+0.86% / 0.20%.
+
+`shots/speckle-before-after-r16.jpg`: crops of the three scenes decoded at
+lo, reference, before and after.
+
+The seam test passes on a T4 (90 checks). Its new checks: speckle in a
+moving frame of a cloud deck (1.46% before, 0.64% after, bound 1.0%) and of
+snow and rock (0.48%, 0.31%, bound 0.40%), and the share of the luma's change
+along rows that falls at drawn pixels' edges in a stream 2.5 times taller
+than its frame (0.70 nearest, 0.44 bilinear, bound 0.6); the three fail on
+main's renderer. Its moving-flight check reads rmse 5.93 and grain 3.60
+(5.95 and 3.95 before).
 
 ## Fluffier clouds and weather (round 15, 2026-10-27)
 

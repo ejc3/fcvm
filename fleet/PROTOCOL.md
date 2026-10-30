@@ -1597,7 +1597,10 @@ Then binary messages, each one access unit:
   rectangle). The header says the actual sizes; the client scales.
 - The renderer draws once per frame at the largest height any subscriber
   wants, scales it down (area filter) for the smaller ones, and encodes each
-  (height, quality) pair that has subscribers, once.
+  (height, quality) pair that has subscribers, once. A stream taller than the
+  drawn frame (below) is scaled up bilinearly between pixel centres (round
+  16; the area filter's box, narrower than a drawn pixel, picked one drawn
+  pixel per stream pixel and magnified the frame into squares).
 
 #### Stream quality (addition, round 4)
 
@@ -1815,6 +1818,15 @@ rect is then the sample-weighted average of
   the eye crosses the sky faster than reprojection through the sky's distance
   follows, and before this it left a trail of itself up to 7 frames long
   behind the camera.
+- Round 16: a pixel whose first hit is a cloud (over land or water too), and
+  an earlier frame's texel whose first hit was one, are not held to the 4%
+  distance rule; that frame's color is clamped like the sky's, to this frame's
+  colors over the 3 x 3 pixels around it of the same hit kind. One sample's
+  cloud distance varies by more than 4% between frames, and at a cloud's edge
+  the first hit flips between the cloud and the ground behind it, so the rule
+  dropped the history of the noisiest pixels: on golden-hour clouds seen from
+  7 km over terrain, 74% of the single-pixel speckle was in the 7.5% of pixels
+  left with fewer than 8 frames.
 
 This is computed for the rect plus the stream overlap (16 pixels) plus 16
 pixels on each side (the denoiser's reach), together with an albedo guide (the
@@ -1828,11 +1840,14 @@ an edge-aware a-trous wavelet (Dammertz et al. 2010) of four 3 x 3 passes at
 steps 1, 2, 4 and 8 pixels, and multiplied back. A neighbour's weight falls
 with its distance off this pixel's tangent plane (against the pixel's
 footprint at its hit distance), with the angle between the normals (cosine to
-the 64th) and with the luminance difference over 4 standard deviations of the
+the 8th; the 64th until round 16, which stopped the filter at every turn of
+the terrain's detail normals and left a speckle along shading edges on rock
+and snow) and with the luminance difference over 4 standard deviations of the
 local noise (the variance of the luminance over the 3 x 3 pixels on the same
 surface, carried through the passes as in SVGF, Schied et al. 2017); it is
-zero across hit kinds, and the sky with the clouds over it is one surface that
-only the luminance stops.
+zero across hit kinds, and the sky and every pixel whose first hit is a cloud
+(over the sky, land or water; round 16) are one surface that only the
+luminance stops.
 
 Every input of that rule is a whole-image pixel, a frame time or the scene, and
 every pixel it can read lies inside the drawing renderer's guard band (the

@@ -1151,6 +1151,7 @@ struct Hit {
   V3 nrm;      // the first hit's normal (toward the eye where a cloud or the sky is what shows)
   float dist;  // primary distance, 1e9 for sky
   float id;    // 0 sky, 1 land, 2 water (what lies behind any cloud)
+  bool cloud = false;  // a cloud is most of what the pixel shows (CLOUD_BIT of its packed normal)
 };
 
 // One thread: how much of the sun the camera sees (terrain, then clouds).
@@ -1214,6 +1215,7 @@ __device__ Hit trace(V3 o, V3 d, float pix, Rng& rng) {
   if (c.T < (hres.id == 0.0f ? 0.5f : 0.2f)) {
     hres.dist = c.depth;
     hres.nrm = -d;
+    hres.cloud = true;
   }
   // crepuscular rays, in front of the cloud or ground they reach
   if (cP.rays > 0.0f) {
@@ -1497,6 +1499,14 @@ __device__ __forceinline__ float pack_nrm(V3 n) {
   uint32_t a = (uint32_t)__float2int_rn(sat(x * 0.5f + 0.5f) * 32767.0f), b = (uint32_t)__float2int_rn(sat(z * 0.5f + 0.5f) * 32767.0f);
   return __uint_as_float(a | (b << 15));
 }
+// A hit's packed normal for the guide buffers, with CLOUD_BIT set where a
+// cloud covers the pixel (bit 30: the normal takes bits 0 to 29, k_resolve's
+// guide puts water in bit 31).
+#define CLOUD_BIT 0x40000000u
+__device__ __forceinline__ float pack_hit_nrm(const Hit& h) {
+  return __uint_as_float(__float_as_uint(pack_nrm(h.nrm)) | (h.cloud ? CLOUD_BIT : 0u));
+}
+__device__ __forceinline__ bool cloud_bit(float packed) { return (__float_as_uint(packed) & CLOUD_BIT) != 0u; }
 __device__ __forceinline__ V3 unpack_nrm(float f) {
   uint32_t u = __float_as_uint(f);
   float x = (u & 32767u) * (2.0f / 32767.0f) - 1.0f, z = ((u >> 15) & 32767u) * (2.0f / 32767.0f) - 1.0f;
@@ -1533,7 +1543,7 @@ __global__ void k_moving(float4* ring, float2* ring_aux, float4* ring_g) {
     if (!isfinite(hh.L.x + hh.L.y + hh.L.z)) { atomicAdd(&g_bad, 1u); hh.L = v3(0.0f); }
     sum += hh.L;
     asum += hh.alb;
-    if (s == 0) { depth = hh.dist; id = hh.id; nrm = pack_nrm(hh.nrm); }
+    if (s == 0) { depth = hh.dist; id = hh.id; nrm = pack_hit_nrm(hh); }
   }
   sum = sum / (float)cP.spp;
   asum = asum / (float)cP.spp;
@@ -1570,7 +1580,7 @@ __global__ void k_hold(float4* hold_sum, float2* hold_aux, float4* hold_g, float
     ga.x += hh.alb.x; ga.y += hh.alb.y; ga.z += hh.alb.z;
     if (k == 0) {
       aux = make_float2(hh.dist, hh.id);
-      ga.w = pack_nrm(hh.nrm);
+      ga.w = pack_hit_nrm(hh);
     }
   }
   hold_sum[idx] = acc;
@@ -1708,16 +1718,24 @@ __global__ void k_resolve(float4* resolved, float4* resolved_g, float4* guide, c
     wtot = c0.w;
     // The sky: a cloud moves across it at its own speed, which reprojection
     // through the sky's (infinite) distance does not follow, so history is
-    // clamped to the colors of this frame's 3 x 3 neighbourhood.
-    bool clamp = id == 0.0f;
+    // clamped to the colors of this frame's 3 x 3 neighbourhood (those of the
+    // same hit kind). A cloud over land or water is clamped the same way, and
+    // its history is not held to the 4% distance rule: one sample's cloud
+    // depth jitters by more than that, and at a cloud's edge the first hit
+    // flips between the cloud and the ground behind it from frame to frame,
+    // so the rule threw away the history of exactly the pixels that are
+    // noisiest (on golden-hour clouds over terrain, 74% of the single-pixel
+    // speckle was in the 7.5% of pixels that kept fewer than 8 frames).
+    bool cloudy = cloud_bit(g0.w);
+    bool clamp = id == 0.0f || cloudy;
     V3 lo = v3(1e30f), hi = v3(-1e30f);
-    if (clamp) {
+    {
       for (int dy = -1; dy <= 1; dy++)
         for (int dx = -1; dx <= 1; dx++) {
           int xx = X + dx - cP.ex0, yy = Y + dy - cP.ey0;  // inside the drawn region (it ends at the image's edges)
           if (xx < 0 || yy < 0 || xx >= cP.ew || yy >= cP.eh) continue;
           int e = yy * cP.ew + xx;
-          if (cur_aux[e].y != 0.0f) continue;
+          if (cur_aux[e].y != id) continue;
           float4 v = cur[e];
           lo = v3(fminf(lo.x, v.x), fminf(lo.y, v.y), fminf(lo.z, v.z));
           hi = v3(fmaxf(hi.x, v.x), fmaxf(hi.y, v.y), fmaxf(hi.z, v.z));
@@ -1739,6 +1757,7 @@ __global__ void k_resolve(float4* resolved, float4* resolved_g, float4* guide, c
       float fx = qx - ix, fy = qy - iy;
       V3 hc = v3(0.0f), ha = v3(0.0f);
       float ws = 0.0f, wn = 1e9f;
+      bool hc_cloud = false;
       for (int b = 0; b < 4; b++) {
         int xx = min(ix + (b & 1), cP.full_w - 1), yy = min(iy + (b >> 1), cP.full_h - 1);
         float w = ((b & 1) ? fx : 1.0f - fx) * ((b >> 1) ? fy : 1.0f - fy);
@@ -1749,16 +1768,18 @@ __global__ void k_resolve(float4* resolved, float4* resolved_g, float4* guide, c
         // in the sky (clear, or a cloud over it) any texel of the same kind
         // counts: a cloud's edge blends with the sky beside it instead of
         // dropping its history
-        if (id != 0.0f && depth < 1e8f && fabsf(a.x - expect) > 0.04f * expect + 0.002f) continue;
-        float4 hv = hist.c[h][e];
         float4 hg = hist.g[h][e];
+        bool hcloud = cloud_bit(hg.w);
+        if (id != 0.0f && depth < 1e8f && !cloudy && !hcloud && fabsf(a.x - expect) > 0.04f * expect + 0.002f) continue;
+        hc_cloud = hc_cloud || hcloud;
+        float4 hv = hist.c[h][e];
         hc += v3(hv.x, hv.y, hv.z) * w;
         ha += v3(hg.x, hg.y, hg.z) * w;
         ws += w;
         wn = fminf(wn, hv.w);
       }
       if (ws < 0.3f) continue;
-      if (clamp) {
+      if ((clamp || hc_cloud) && lo.x <= hi.x) {
         V3 m = hc / ws;
         hc = v3(clampf(m.x, lo.x, hi.x), clampf(m.y, lo.y, hi.y), clampf(m.z, lo.z, hi.z)) * ws;
       }
@@ -1773,9 +1794,10 @@ __global__ void k_resolve(float4* resolved, float4* resolved_g, float4* guide, c
   resolved[idx] = make_float4(color.x, color.y, color.z, fminf(wtot, (float)HOLD_MAX_SAMPLES));
   resolved_g[idx] = make_float4(alb.x, alb.y, alb.z, 0.0f);
   // the denoiser's guide: the first hit relative to the eye (0 for the sky
-  // and the clouds over it), its packed normal, bit 31 set on water
+  // and for any cloud covering the pixel), its packed normal, bit 31 set on
+  // water
   float2 a0 = cur_aux[eidx];
-  V3 P = (a0.y != 0.0f && a0.x < 1e8f) ? d0 * a0.x : v3(0.0f);
+  V3 P = (a0.y != 0.0f && a0.x < 1e8f && !cloud_bit(g0.w)) ? d0 * a0.x : v3(0.0f);
   float n = __uint_as_float(__float_as_uint(g0.w) | (a0.y == 2.0f ? 0x80000000u : 0u));
   guide[idx] = make_float4(P.x, P.y, P.z, n);
 }
@@ -1793,8 +1815,10 @@ __global__ void k_resolve(float4* resolved, float4* resolved_g, float4* guide, c
 
 // The geometric part of a neighbour's weight from two pixels' guides (k_resolve):
 // hit kind, distance off this pixel's tangent plane (against the pixel
-// footprint at that distance), normal. The sky and the clouds over it (P = 0)
-// are one surface, which only the luminance stops.
+// footprint at that distance), normal. The sky and the clouds (P = 0) are one
+// surface, which only the luminance stops: a cloud's depth from one sample
+// varies by hundreds of metres between neighbours, against a footprint of
+// metres, so a cloud over land held to its tangent plane was never filtered.
 struct DnG {
   V3 P, N;
   float t;
@@ -1817,7 +1841,11 @@ __device__ __forceinline__ float dn_geo(const DnG& p, float4 g, float dpx) {
   float pd = fabsf((g.x - p.P.x) * p.N.x + (g.y - p.P.y) * p.N.y + (g.z - p.P.z) * p.N.z);
   V3 qn = unpack_nrm(__uint_as_float(__float_as_uint(g.w) & 0x7FFFFFFFu));
   float nn = fmaxf(dot(qn, p.N), 0.0f);
-  nn *= nn; nn *= nn; nn *= nn; nn *= nn; nn *= nn; nn *= nn;  // ^64
+  // ^8: the shading normal carries the terrain's detail normals, which turn by
+  // tens of degrees from pixel to pixel on rock and snow; ^64 stopped the
+  // filter at every such turn and left the samples there unfiltered, a
+  // speckle along every shading edge
+  nn *= nn; nn *= nn; nn *= nn;
   return __expf(-pd / (DENOISE_SIGMA_P * foot + 1e-6f)) * nn;
 }
 __device__ __forceinline__ V3 dn_demod(V3 c, float4 g) {
@@ -1919,7 +1947,7 @@ __global__ void k_finish(uint8_t* rgba, float4* hdr, const float4* resolved, con
     color += Es * (0.5f * __expf(-ang * (1.0f / 0.012f)) + 0.06f * __expf(-ang * (1.0f / 0.07f)) +
                    0.01f * __expf(-ang * (1.0f / 0.35f)));
   }
-  hdr[idx] = make_float4(color.x, color.y, color.z, 1.0f);
+  hdr[idx] = make_float4(color.x, color.y, color.z, c.w);  // w: the samples resolved into the pixel (`quality --encode`)
   // tone map: ACES (fitted RRT + ODT), a warm/cool split, a light vignette in
   // whole-image coordinates, sRGB, dither by whole-image pixel
   V3 t = color * cP.exposure;
@@ -1960,6 +1988,17 @@ __device__ V3 area_sample(const uint8_t* src, int sw, int sh, float x0, float y0
   return acc / fmaxf(wsum, 1e-6f);
 }
 
+// The source at (x, y) in pixel-centre coordinates (pixel i's centre is i),
+// bilinear, edge pixels repeated.
+__device__ V3 bilinear_sample(const uint8_t* src, int sw, int sh, float x, float y) {
+  x = clampf(x, 0.0f, sw - 1.0f); y = clampf(y, 0.0f, sh - 1.0f);
+  int ix = min((int)floorf(x), sw - 1), iy = min((int)floorf(y), sh - 1);
+  int jx = min(ix + 1, sw - 1), jy = min(iy + 1, sh - 1);
+  float fx = x - ix, fy = y - iy;
+  auto px = [&](int xx, int yy) { const uint8_t* p = src + 4 * (yy * sw + xx); return v3(p[0], p[1], p[2]); };
+  return mix(mix(px(ix, iy), px(jx, iy), fx), mix(px(ix, jy), px(jx, jy), fx), fy);
+}
+
 __global__ void k_nv12(const uint8_t* src, int sw, int sh, uint8_t* dst, size_t pitch, int dw, int dh, float fx0, float fy0,
                        float sc) {
   int bx = blockIdx.x * blockDim.x + threadIdx.x, by = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1969,10 +2008,17 @@ __global__ void k_nv12(const uint8_t* src, int sw, int sh, uint8_t* dst, size_t 
     int x = 2 * bx + (k & 1), y = 2 * by + (k >> 1);
     // the source box of this pixel, clamped into the source (edge pixels repeat)
     float x0 = fx0 + x * sc, y0 = fy0 + y * sc;
-    float x1 = x0 + sc, y1 = y0 + sc;
-    x0 = clampf(x0, 0.0f, sw - 1.0f); y0 = clampf(y0, 0.0f, sh - 1.0f);
-    x1 = clampf(x1, x0 + 0.5f, (float)sw); y1 = clampf(y1, y0 + 0.5f, (float)sh);
-    rgb4[k] = area_sample(src, sw, sh, x0, y0, x1, y1);
+    if (sc < 1.0f) {
+      // a stream taller than the drawn frame: interpolate between source
+      // pixel centres (a box narrower than a source pixel picks one of them,
+      // which magnified the frame into hard squares)
+      rgb4[k] = bilinear_sample(src, sw, sh, x0 + 0.5f * sc - 0.5f, y0 + 0.5f * sc - 0.5f);
+    } else {
+      float x1 = x0 + sc, y1 = y0 + sc;
+      x0 = clampf(x0, 0.0f, sw - 1.0f); y0 = clampf(y0, 0.0f, sh - 1.0f);
+      x1 = clampf(x1, x0 + 0.5f, (float)sw); y1 = clampf(y1, y0 + 0.5f, (float)sh);
+      rgb4[k] = area_sample(src, sw, sh, x0, y0, x1, y1);
+    }
     // BT.709, limited range
     float Yv = 16.0f + (0.2126f * rgb4[k].x + 0.7152f * rgb4[k].y + 0.0722f * rgb4[k].z) * (219.0f / 255.0f);
     dst[y * pitch + x] = (uint8_t)clampf(Yv + 0.5f, 0.0f, 255.0f);
