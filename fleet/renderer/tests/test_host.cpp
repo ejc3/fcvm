@@ -1020,5 +1020,24 @@ int main() {
     }
   }
   tlscheck::run();
+  {
+    // A cloud in front of a word hides it, also where a ridge's edge crosses the pixel:
+    // occ_vis (render.cu) must reject the pixel's own cloud before it probes the ground,
+    // whose coverage knows nothing of clouds. (A GPU scene with a cloud exactly in front of
+    // a word at a ridge's edge is not one the seam test can place; this pins the order.)
+    bool in = false, cloud_first = false, probed = false;
+    for (auto& l : source_lines("../src/render.cu")) {
+      if (l.find("__device__ float occ_vis(") != std::string::npos) in = true;
+      else if (in && l.rfind("}", 0) == 0) break;
+      if (!in) continue;
+      if (l.find("if (o.cloud && o.d[4] < t) return 0.0f;") != std::string::npos && !probed) cloud_first = true;
+      if (l.find("march_terrain(") != std::string::npos) probed = true;
+    }
+    CHECK(in && probed && cloud_first, "occ_vis hides a word behind the pixel's own cloud before probing the ground");
+    bool passed = false;
+    for (auto& l : source_lines("../src/render.cu"))
+      passed = passed || l.find("occ.cloud = cloud_bit(cur_g[") != std::string::npos;
+    CHECK(passed, "k_finish gives occ_vis the pixel's cloud bit");
+  }
   DONE();
 }
