@@ -331,9 +331,10 @@ fn cache_temps(key: &str) -> Vec<PathBuf> {
 /// Every temporary a record of the fcvm process `pid` lists, in this user's owner
 /// directory.
 fn recorded_temps(pid: u32) -> Vec<PathBuf> {
-    let dir = fcvm::paths::data_dir()
-        .join("reclaim")
-        .join(nix::unistd::geteuid().as_raw().to_string());
+    // The directory fcvm itself uses: its name depends on the user namespace.
+    let Ok(dir) = fcvm::reclaim::owner_dir() else {
+        return Vec::new();
+    };
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -361,9 +362,10 @@ fn recorded_temps(pid: u32) -> Vec<PathBuf> {
 
 /// The lock files of the records the fcvm process `pid` wrote.
 fn record_locks(pid: u32) -> Vec<PathBuf> {
-    let dir = fcvm::paths::data_dir()
-        .join("reclaim")
-        .join(nix::unistd::geteuid().as_raw().to_string());
+    // The directory fcvm itself uses: its name depends on the user namespace.
+    let Ok(dir) = fcvm::reclaim::owner_dir() else {
+        return Vec::new();
+    };
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
