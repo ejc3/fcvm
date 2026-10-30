@@ -3747,12 +3747,20 @@ async fn cmd_snapshot_run_inner(
                     // exiting 0 as if nothing happened.
                     clone_failure =
                         clone_failure_after_vmm_exit(&status, guest_rebooted, watchdog_killed);
-                    // If in TTY mode, get exit code from TTY handle
+                    // A TTY run's exit code comes from the TTY session; any other run's from
+                    // the "exit:" the guest sent on the status channel, which the status
+                    // listener wrote to `container-exit` (the drain handshake above proved it
+                    // has handled everything the guest sent).
                     if let Some(handle) = tty_handle.take() {
                         container_exit_code = handle.join().ok().and_then(|r| r.ok());
                         info!(container_exit_code = ?container_exit_code, "TTY container exit code");
                     } else {
-                        container_exit_code = None;
+                        container_exit_code = super::podman::read_container_exit_code(
+                            &container_exit_seen,
+                            &data_dir,
+                        )
+                        .await;
+                        info!(container_exit_code = ?container_exit_code, "container exit code");
                     }
                     break;
                 }
