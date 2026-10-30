@@ -27,6 +27,10 @@
 // 0.48 with the denoiser's normal stop at ^64, 0.31 at ^8 (the hold 0.21).
 #define SPECKLE_CLOUDS 1.0
 #define SPECKLE_SNOW 0.40
+// Section 10c's bounds. Measured on a T4: main (93c33125) 80 pixels flickering and a rim of
+// 8.19; with the four-point cut and the glow toward the letters' color, 43 and 3.34.
+#define TEXT_FLICKER_MAX 60
+#define TEXT_RIM_MAX 6.0
 
 static Scene test_scene() {
   Scene s = default_scene();
@@ -480,6 +484,79 @@ int main(int argc, char** argv) {
       fprintf(stderr, "%s, moving at 1 sample per pixel: speckle %.3f%% of pixels (the 1024-sample hold: %.3f%%)\n", name[c], sm, sr);
       CHECK(sm < bound[c], "%s: speckle %.3f%% (< %.2f%%)", name[c], sm, bound[c]);
     }
+  }
+
+  // 10c. A lockup word where a ridge cuts it, at the wall's scale (one tile of
+  // a 4 x 4 wall at h=432), 1 sample per pixel with history, the camera all
+  // but still. Drawn with and without the word; the word's effect is the
+  // luminance difference. (a) The cut stays put: pixels whose effect changes
+  // by more than 40 between two consecutive frames (one jittered sample per
+  // pixel decided the cut, and it moved every frame). (b) No bright rim: the
+  // mean effect 1 to 2 pixels outside the letters, over dark ground and sky,
+  // less the mean 4 to 8 pixels out (a glow added with a 0.05 em falloff drew
+  // a rim hugging each letter, kept by the encoder as a hard outline).
+  {
+    Scene f = s;
+    f.lights.clear();
+    f.time_of_day = 0.77;
+    f.camera = {{0, {-55.0, 2.0, -113.0}, {-57.5, 2.3, -115.5}, 60}, {10, {-54.999, 2.0, -113.0}, {-57.5, 2.3, -115.5}, 60}};
+    f.words = {{"Northern lights", 0.0, TEXT_STYLE_LOCKUP}};
+    Scene nw = f;
+    nw.words.clear();
+    const Rect cell{0.25, 0, 0.25, 0.25};
+    auto lum_of = [&](const Scene& sc, long k) {
+      std::vector<std::pair<double, int>> seq;
+      for (int j = 11; j >= 0; j--) seq.push_back({(k - j) / 30.0, 1});
+      Img im = draw(r, sc, cell, 432, seq, true);
+      std::vector<float> l(im.rgba.size() / 4);
+      for (size_t p = 0; p < l.size(); p++) l[p] = 0.2126f * im.rgba[4 * p] + 0.7152f * im.rgba[4 * p + 1] + 0.0722f * im.rgba[4 * p + 2];
+      return std::make_pair(l, im.tile);
+    };
+    auto [on_a, tl] = lum_of(f, 150);
+    auto on_b = lum_of(f, 151).first;
+    auto off_a = lum_of(nw, 150).first;
+    auto off_b = lum_of(nw, 151).first;
+    int W = tl.w, H = tl.h;
+    long word = 0, flick = 0;
+    std::vector<float> fx;
+    for (int p = 0; p < W * H; p++) {
+      float ea = on_a[p] - off_a[p], eb = on_b[p] - off_b[p];
+      if (std::fabs(ea) <= 4.0f && std::fabs(eb) <= 4.0f) continue;
+      word++;
+      flick += std::fabs(ea - eb) > 40.0f;
+      fx.push_back(on_a[p]);
+    }
+    std::sort(fx.begin(), fx.end());
+    float fill_lum = fx.empty() ? 1e9f : 0.9f * fx[fx.size() * 95 / 100];
+    std::vector<uint8_t> fill(W * H), d1, d2, d4, d8;
+    for (int p = 0; p < W * H; p++) fill[p] = on_a[p] > fill_lum;
+    auto dilate = [&](const std::vector<uint8_t>& m, int n) {
+      std::vector<uint8_t> a = m, b(m.size());
+      for (int it = 0; it < n; it++) {
+        for (int y = 0; y < H; y++)
+          for (int x = 0; x < W; x++) {
+            int p = y * W + x;
+            b[p] = a[p] || (x > 0 && a[p - 1]) || (x + 1 < W && a[p + 1]) || (y > 0 && a[p - W]) || (y + 1 < H && a[p + W]);
+          }
+        a.swap(b);
+      }
+      return a;
+    };
+    d1 = dilate(fill, 1); d2 = dilate(fill, 2); d4 = dilate(fill, 4); d8 = dilate(fill, 8);
+    double near = 0, far = 0;
+    long nn = 0, nf = 0;
+    for (int p = 0; p < W * H; p++) {
+      if (off_a[p] >= 120.0f) continue;
+      float e = on_a[p] - off_a[p];
+      if (d2[p] && !d1[p]) { near += e; nn++; }
+      if (d8[p] && !d4[p]) { far += e; nf++; }
+    }
+    double rim = (nn ? near / nn : 0) - (nf ? far / nf : 0);
+    fprintf(stderr, "a word behind a ridge: %ld word pixels, %ld flicker between frames; rim %.2f (%.2f near, %.2f far, %ld and %ld pixels)\n",
+            word, flick, rim, nn ? near / nn : 0, nf ? far / nf : 0, nn, nf);
+    CHECK(word > 20000 && nn > 500 && nf > 1000, "the word is drawn over dark ground (%ld pixels; rings %ld, %ld)", word, nn, nf);
+    CHECK(flick <= TEXT_FLICKER_MAX, "the word's cut: %ld pixels flicker between frames (<= %d)", flick, TEXT_FLICKER_MAX);
+    CHECK(rim < TEXT_RIM_MAX, "the word's glow: a rim %.2f brighter than its outer glow (< %.1f)", rim, TEXT_RIM_MAX);
   }
 
   // 11. A stream taller than the drawn frame (an opened tile asks 720 while

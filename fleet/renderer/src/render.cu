@@ -1235,6 +1235,40 @@ __device__ Hit trace(V3 o, V3 d, float pix, Rng& rng) {
 // and every tile computes the same.
 __device__ V3 g_ttr[MAX_TEXTS], g_tins[MAX_TEXTS], g_tsun[MAX_TEXTS];
 
+// What hides a word or a light at a pixel. A pixel's first hit comes from one
+// jittered sample, so testing only its own made the edge where terrain cuts a
+// word a stair of whole pixels that changed from frame to frame. Where the
+// first hits of the pixel and its 8 neighbours all lie on one side of the
+// word's distance t, that side decides. Where they straddle it, the ground is
+// marched up to t at four fixed points of the pixel, and the word is seen
+// through the share of them that meet no ground: the same on every frame and
+// every tile.
+__device__ __forceinline__ V3 ray_dir(const GCam& c, float px, float py);
+struct Occ {
+  float d[9];  // first-hit distances, 1e9 where nothing is hit or only cloud over the sky
+  int X, Y;    // the pixel, whole-image
+  float pix;
+};
+__device__ float occ_vis(const Occ& o, float t) {
+  int n = 0;
+  for (int k = 0; k < 9; k++) n += o.d[k] >= t;
+  if (n == 9) return 1.0f;
+  if (n == 0) return 0.0f;
+  const float ox[4] = {0.25f, 0.75f, 0.25f, 0.75f}, oy[4] = {0.25f, 0.25f, 0.75f, 0.75f};
+  float cov = 0.0f;
+  bool ground = false;
+  for (int k = 0; k < 4; k++) {
+    float th = march_terrain(cP.cam.pos, ray_dir(cP.cam, o.X + ox[k], o.Y + oy[k]), 0.0f, t, 260, 9,
+                             fmaxf(0.6f * o.pix, 0.0002f));
+    cov += th >= 0.0f ? 0.0f : 0.25f;
+    ground = ground || th >= 0.0f;
+  }
+  // no ground in front at the four points: what hides the pixel, if anything,
+  // is a cloud, and its own first hit says so (the neighbours' ground is theirs)
+  if (!ground) return o.d[4] >= t ? 1.0f : 0.0f;
+  return cov;
+}
+
 __device__ __forceinline__ V3 text_mid(const GText& g) {
   return g.center + g.right * (0.5f * g.width * g.height) + g.up * ((0.5f * (g.ylo + g.yhi)) * g.height);
 }
@@ -1258,13 +1292,15 @@ __device__ bool text_plane(const GText& g, V3 o, V3 d, float* tp, float* x, floa
 // plane facing the camera, attenuated and scattered by the haze in front of
 // it, over a soft wide shade that keeps it readable over bright cloud. The
 // clock is not occluded: it is drawn over whatever the pixel shows.
-__device__ V3 draw_type(const GText& g, int gi, V3 o, V3 d, V3 base, float pix, float depth) {
+__device__ V3 draw_type(const GText& g, int gi, V3 o, V3 d, V3 base, float pix, const Occ& occ) {
   float tp, x, y;
   if (!text_plane(g, o, d, &tp, &x, &y)) return base;
   if (x < -0.6f || x > g.width + 0.6f || y < -0.6f || y > 1.4f) return base;
-  if (g.occlude && depth < tp) return base;
   float dist = sdf_dist(g, x, y);
   if (dist >= SDF_SPREAD - 1e-3f) return base;
+  float vis = g.occlude ? occ_vis(occ, tp) : 1.0f;
+  if (vis <= 0.0f) return base;
+  V3 base0 = base;
   float fw = fmaxf(pix * tp / g.height, 1e-5f);  // a pixel in em
   float cov = sat(0.5f - dist / fw);
   V3 tr = g_ttr[gi], ins = g_tins[gi];
@@ -1280,11 +1316,16 @@ __device__ V3 draw_type(const GText& g, int gi, V3 o, V3 d, V3 base, float pix, 
   // near white at any time of day
   V3 Le = g.color * (1.0f / cP.exposure);
   // its light scattered by the haze around the letters (none for the clock:
-  // it is near, and a glow would cost it contrast)
-  float glow = g.occlude ? __expf(-out * (1.0f / 0.05f)) * (0.03f + 0.6f * haze) : 0.0f;
+  // it is near, and a glow would cost it contrast), drawn toward the letters'
+  // own color so it never lights a pixel past them, over about 0.12 em. Added
+  // to what lay behind, with a falloff of 0.05 em and up to 0.63 of the type's
+  // light, it drew a bright rim hugging each letter, which the encoder kept as
+  // a hard outline.
+  float glow = g.occlude ? __expf(-out * (1.0f / 0.12f)) * (0.03f + 0.25f * haze) : 0.0f;
   V3 L = ins + Le * tr;
   base = mix(base, L, cov * g.alpha);
-  return base + Le * tr * (glow * g.alpha * (1.0f - cov));
+  base = mix(base, L, sat(glow * g.alpha * (1.0f - cov)));
+  return mix(base0, base, vis);
 }
 
 #define SMOKE_WRITE 2.2f   // em written per second
@@ -1304,7 +1345,7 @@ __device__ __forceinline__ float hash01(uint32_t h) {
 // its optical depth along the ray is closed form; it is lit by the sun with
 // the clouds' scattering (several orders, through its own depth toward the
 // sun) and by the sky.
-__device__ V3 draw_smoke(const GText& g, int gi, V3 o, V3 d, V3 base, float depth) {
+__device__ V3 draw_smoke(const GText& g, int gi, V3 o, V3 d, V3 base, const Occ& occ) {
   V3 n = cross(g.right, g.up);
   float em = g.height;
   V3 oc = o - g.center;
@@ -1316,7 +1357,8 @@ __device__ V3 draw_smoke(const GText& g, int gi, V3 o, V3 d, V3 base, float dept
   float px = ol.x + dl.x * t0, py = ol.y + dl.y * t0;
   float wx = SMOKE_WIND_X * g.age + 0.6f, wy = SMOKE_WIND_Y * g.age + 0.6f;
   if (px < -0.6f || px > g.width + wx || py < -0.6f || py > 1.2f + wy) return base;
-  if (g.occlude && depth < t0) return base;
+  float vis = g.occlude ? occ_vis(occ, t0) : 1.0f;
+  if (vis <= 0.0f) return base;
   V3 dn = normalize(dl);
   float c = dot(d, cP.sun_dir);
   V3 Esun = g_tsun[gi];
@@ -1362,19 +1404,19 @@ __device__ V3 draw_smoke(const GText& g, int gi, V3 o, V3 d, V3 base, float dept
   float T = __expf(-tau * g.alpha);
   V3 Ls = Lw * ((1.0f - T) / tau);
   V3 tr = g_ttr[gi], ins = g_tins[gi];
-  return base * T + ins * (1.0f - T) + Ls * tr;
+  return mix(base, base * T + ins * (1.0f - T) + Ls * tr, vis);
 }
 
 // Landmark: the word as big solid letters standing on a ridge, extruded,
 // lit by the sun (shadowed by terrain and clouds) and the sky, hidden by
 // nearer terrain, behind the haze; at dusk a soft warm light along the edges
 // of the faces. They cast their shadows on the terrain (landmark_vis).
-__device__ V3 draw_landmark(const GText& g, int gi, V3 o, V3 d, V3 base, float pix, float depth) {
+__device__ V3 draw_landmark(const GText& g, int gi, V3 o, V3 d, V3 base, float pix, const Occ& occ) {
   V3 ol, dl;
   landmark_ray(g, o, d, &ol, &dl);
   float ta, tb;
   if (!landmark_box(g, ol, dl, &ta, &tb)) return base;
-  if (g.occlude && depth < ta) return base;
+  if (g.occlude && occ_vis(occ, ta) <= 0.0f) return base;
   float t = ta, mind = 1e9f, tmin = ta;
   bool hit = false;
   for (int it = 0; it < 64 && t < tb; it++) {
@@ -1387,7 +1429,8 @@ __device__ V3 draw_landmark(const GText& g, int gi, V3 o, V3 d, V3 base, float p
   float fw = fmaxf(pix * tmin / g.height, 1e-5f);
   float cov = hit ? 1.0f : sat(1.0f - mind / fw);
   if (cov <= 0.0f) return base;
-  if (g.occlude && depth < tmin) return base;
+  float vis = g.occlude ? occ_vis(occ, tmin) : 1.0f;
+  if (vis <= 0.0f) return base;
   V3 q = ol + dl * tmin;
   const float h = 0.01f;
   V3 gl = v3(landmark_sdf(g, q + v3(h, 0, 0)) - landmark_sdf(g, q - v3(h, 0, 0)),
@@ -1404,7 +1447,7 @@ __device__ V3 draw_landmark(const GText& g, int gi, V3 o, V3 d, V3 base, float p
   float dusk = 1.0f - smoothstepf(0.03f, 0.3f, cP.sun_dir.y);
   float d2 = sdf_dist(g, q.x, q.y);
   if (fabsf(q.z) > 0.5f * LANDMARK_DEPTH - 0.02f) L = L + g.color * (dusk * __expf(fminf(d2, 0.0f) * (1.0f / 0.035f)));
-  return mix(base, g_tins[gi] + L * g_ttr[gi], cov * g.alpha);
+  return mix(base, g_tins[gi] + L * g_ttr[gi], cov * g.alpha * vis);
 }
 
 __global__ void k_textlight() {
@@ -1425,15 +1468,15 @@ __global__ void k_textlight() {
 // on every GPU. A word is hidden where the pixel's first hit (`depth`, from
 // the frame's or the hold's first sample) is nearer than it is; the clock
 // never is.
-__device__ V3 overlay(V3 o, V3 d, V3 base, float pix, float depth) {
+__device__ V3 overlay(V3 o, V3 d, V3 base, float pix, const Occ& occ) {
   // the words first, the clock (text 0) last, over everything
   for (int k = 1; cP.text_overlay && k <= cP.n_text; k++) {
     int i = k % cP.n_text;
     const GText& g = cP.text[i];
     if (g.alpha <= 0.0f || g.len == 0) continue;
-    if (g.style == GTEXT_TYPE) base = draw_type(g, i, o, d, base, pix, depth);
-    else if (g.style == GTEXT_SMOKE) base = draw_smoke(g, i, o, d, base, depth);
-    else if (g.style == GTEXT_LANDMARK) base = draw_landmark(g, i, o, d, base, pix, depth);
+    if (g.style == GTEXT_TYPE) base = draw_type(g, i, o, d, base, pix, occ);
+    else if (g.style == GTEXT_SMOKE) base = draw_smoke(g, i, o, d, base, occ);
+    else if (g.style == GTEXT_LANDMARK) base = draw_landmark(g, i, o, d, base, pix, occ);
   }
   for (int i = 0; i < cP.n_lights; i++) {
     const GLight& l = cP.lights[i];
@@ -1447,9 +1490,10 @@ __device__ V3 overlay(V3 o, V3 d, V3 base, float pix, float depth) {
     float cov = sat((r - dd) / fw + 0.5f);
     float glow = __expf(-dd / (r * 3.0f)) * 0.6f + __expf(-dd / (r * 20.0f)) * 0.12f;
     if (cov < 1e-3f && glow < 1e-3f) continue;
-    if (depth < tc) continue;
+    float vis = occ_vis(occ, tc);
+    if (vis <= 0.0f) continue;
     V3 c = l.color * (14.0f * l.alpha * __expf(-tc * 0.018f));
-    base = mix(base, c, cov * l.alpha) + c * glow;
+    base = mix(base, c, cov * l.alpha * vis) + c * (glow * vis);
   }
   return base;
 }
@@ -1926,8 +1970,6 @@ __global__ void k_finish(uint8_t* rgba, float4* hdr, const float4* resolved, con
   float pix = 2.0f * cam.tan_half / cP.full_h;
   V3 d0 = ray_dir(cam, X + 0.5f, Y + 0.5f);
   float4 c = resolved[(Y - cP.ry0) * cP.rw + (X - cP.rx0)];
-  float2 ca = aux[(Y - cP.ey0) * cP.ew + (X - cP.ex0)];
-  float depth = ca.x;
   V3 color = v3(c.x, c.y, c.z);
   // where few samples are in, the denoiser's output (remodulated by the albedo guide)
   float strength = sat((DENOISE_HI - c.w) / (DENOISE_HI - DENOISE_LO));
@@ -1936,7 +1978,14 @@ __global__ void k_finish(uint8_t* rgba, float4* hdr, const float4* resolved, con
     float4 g = rg[(Y - cP.ry0) * cP.rw + (X - cP.rx0)];
     color = mix(color, v3(e.x, e.y, e.z) * v3(fmaxf(g.x, 0.02f), fmaxf(g.y, 0.02f), fmaxf(g.z, 0.02f)), strength);
   }
-  color = overlay(cam.pos, d0, color, pix, ca.y == 0.0f ? 1e9f : depth);  // clouds in the sky do not hide words
+  Occ occ;  // clouds in the sky do not hide words; the image's edge repeats
+  occ.X = X; occ.Y = Y; occ.pix = pix;
+  for (int k = 0; k < 9; k++) {
+    int xx = min(max(X + k % 3 - 1, 0), cP.full_w - 1), yy = min(max(Y + k / 3 - 1, 0), cP.full_h - 1);
+    float2 na = aux[(yy - cP.ey0) * cP.ew + (xx - cP.ex0)];
+    occ.d[k] = na.y == 0.0f ? 1e9f : na.x;
+  }
+  color = overlay(cam.pos, d0, color, pix, occ);
   // sun glare: the sun's disc spread by the eye and lens, scaled by how much
   // of the sun the camera sees (one value per frame), so it is the same on
   // every tile and tile edges match

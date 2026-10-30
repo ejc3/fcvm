@@ -171,6 +171,43 @@ python3 tools/seam_metric.py out.png 4 2              # seam ratio at every tile
 "Viewers per renderer") opens many frame streams as the page does and reports
 each stream's frame rate, frame delay, and frames dropped for a slow reader.
 
+## The word's edges (round 17, 2026-10-30)
+
+The owner's staging screenshot showed the lockup word with a hard light outline,
+broken where a ridge cuts it. Two causes in `draw_type` and the overlay's
+occlusion (`src/render.cu`):
+
+- **The cut.** A word was hidden where the pixel's first hit was nearer than it,
+  and that hit came from one jittered sample: the edge was a stair of whole
+  pixels, with notches, that moved from frame to frame. Now, where the first
+  hits of the pixel and its 8 neighbours lie on both sides of the word's
+  distance, the ground is marched up to the word at four fixed points of the
+  pixel, and the word shows through the share of them that meet no ground (a
+  cloud in front still hides it by the pixel's own first hit). Every input is a
+  whole-image pixel and the frame's camera, so tiles still match.
+- **The outline.** The glow was added to what lay behind, falling off over 0.05
+  em at up to 0.63 of the type's light: a bright rim hugging each letter, which
+  the encoder kept as a hard outline. It is now drawn toward the letters' own
+  color, so it never lights a pixel past them, over 0.12 em at up to 0.28.
+
+Measured on a T4 (the seam test's new check 10c): a lockup word behind a ridge
+in one tile of a 4 x 4 wall at h=432, 1 sample per pixel with history, the
+camera all but still, drawn with and without the word. Pixels whose word effect
+changed by more than 40 between two consecutive frames: 80 on main, 43 here
+(bound 60). The rim, the mean effect 1 to 2 pixels outside the letters over dark
+ground and sky less the mean 4 to 8 pixels out: 8.19 on main, 3.34 here (bound
+6.0).
+
+The march costs frame time on a tile where terrain cuts a word, and nothing
+elsewhere: that tile, `still --seq 30`, mean of frames 20 to 29, one VM at a
+time, two runs each: 8.63 and 8.75 ms on main, 11.07 and 11.12 ms here. Starting
+the march at 0.9 of the nearest neighbour's hit, or 64 steps instead of 260,
+saved 0.4 and 1.7 ms but left 53 and 67 pixels flickering. With the old glow, a
+tent filter over the neighbours' first hits instead of the march cost nothing
+and left 69 of main's 80.
+
+`shots/text-cut-glow-r17.jpg`: before and after, unencoded.
+
 ## Speckle at cloud and shading edges (round 16, 2026-10-30)
 
 The owner's staging screenshots (a 3460 x 1946 wall of 16 tiles) showed
