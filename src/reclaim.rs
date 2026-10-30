@@ -131,6 +131,10 @@ struct Record {
     /// The kernel's boot id when the record was written. Kernel objects of another boot
     /// are gone.
     boot_id: String,
+    /// The inode of the user namespace the record was written in; None in a record
+    /// written before this field, all of which were written in the initial one.
+    #[serde(default)]
+    user_namespace: Option<u64>,
     resources: Vec<Resource>,
 }
 
@@ -155,18 +159,36 @@ fn current_user_namespace() -> Option<u64> {
         .map(|ns| ns.ino())
 }
 
+/// The host uid `euid` maps to in this process's user namespace, from its
+/// `/proc/self/uid_map` (`map`): lines of `inside outside count`.
+fn host_uid_of(map: &str, euid: u32) -> Option<u32> {
+    map.lines().find_map(|line| {
+        let mut fields = line.split_whitespace().map(|f| f.parse::<u64>().ok());
+        let (inside, outside, count) = (fields.next()??, fields.next()??, fields.next()??);
+        let euid = u64::from(euid);
+        (inside <= euid && euid < inside + count)
+            .then(|| u32::try_from(outside + (euid - inside)).ok())
+            .flatten()
+    })
+}
+
 /// The name of this process's owner directory under `reclaim/`: the euid in the initial
-/// user namespace, and the euid with the namespace in any other. A container's root is
-/// uid 0 of its own user namespace, not the host's root, and when the two share a store
-/// (CI runners keep /mnt/fcvm-btrfs between jobs) the host root's `reclaim/0` shows in
-/// the container as owned by the overflow uid, which `owner_dir_in` refuses. Records are
-/// only meaningful in the namespaces that made them, so each user namespace keeps its own.
-fn owner_dir_name(euid: u32, user_namespace: Option<u64>) -> String {
-    match user_namespace {
-        Some(namespace) if namespace != INITIAL_USER_NAMESPACE => {
-            format!("{euid}-userns{namespace}")
-        }
-        _ => euid.to_string(),
+/// user namespace, and in any other the euid with the host uid it maps to
+/// (`<euid>-host<uid>`, or `<euid>-userns<inode>` when the map does not say).
+///
+/// A container's root is uid 0 of its own user namespace, not the host's root, and when
+/// the two share a store (CI runners keep /mnt/fcvm-btrfs between jobs) the host root's
+/// `reclaim/0` shows in the container as owned by the overflow uid, which `owner_dir_in`
+/// refuses. Naming by the mapping rather than by the namespace keeps a replaced
+/// container's records reachable to the next container with the same mapping, so the
+/// files they name are reclaimed; the kernel objects they name were the old namespace's,
+/// and `reclaim_abandoned_in` leaves those alone.
+fn owner_dir_name(euid: u32, user_namespace: Option<u64>, host_uid: Option<u32>) -> String {
+    match (user_namespace, host_uid) {
+        (None, _) => euid.to_string(),
+        (Some(namespace), _) if namespace == INITIAL_USER_NAMESPACE => euid.to_string(),
+        (Some(_), Some(host)) => format!("{euid}-host{host}"),
+        (Some(namespace), None) => format!("{euid}-userns{namespace}"),
     }
 }
 
@@ -186,7 +208,10 @@ pub fn owner_dir_in(data_dir: &Path) -> Result<PathBuf> {
         }
     }
     let euid = nix::unistd::geteuid().as_raw();
-    let mine = shared.join(owner_dir_name(euid, current_user_namespace()));
+    let host_uid = std::fs::read_to_string("/proc/self/uid_map")
+        .ok()
+        .and_then(|map| host_uid_of(&map, euid));
+    let mine = shared.join(owner_dir_name(euid, current_user_namespace(), host_uid));
     match std::fs::DirBuilder::new().mode(0o700).create(&mine) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -384,6 +409,7 @@ fn write_record(dir: &OwnerDir, id: &str, resources: &[Resource]) -> Result<()> 
     let record = Record {
         pid: std::process::id(),
         boot_id: boot_id(),
+        user_namespace: current_user_namespace(),
         resources: resources.to_vec(),
     };
     let temp = record_temp_name(id);
@@ -696,7 +722,8 @@ pub(crate) enum Undo {
 const IN_USE: &str = "in use: ";
 
 /// Undo `resources` newest first, returning the ones that stay. `same_boot` is false for
-/// a record written before the last reboot, whose kernel objects are gone.
+/// a record written before the last reboot, whose kernel objects are gone, or in another
+/// user namespace, whose kernel objects are not this process's to name.
 ///
 /// A kernel object's name can be another VM's once the object is deleted, so its record
 /// is rewritten without it (`persist`) before it is deleted: a kill in between leaks the
@@ -731,7 +758,7 @@ async fn undo_all(
             continue;
         }
         if !same_boot {
-            debug!(owner = %id, %resource, "recorded before the last boot; gone with it");
+            debug!(owner = %id, %resource, "recorded before the last boot or in another user namespace; left alone");
             continue;
         }
         if let Some(why) = &hold_kernel {
@@ -1001,7 +1028,12 @@ pub async fn reclaim_abandoned_in(path: &Path) -> Reclaimed {
             }
         };
         let total = record.resources.len();
-        let same_boot = record.boot_id == boot_id();
+        // Kernel objects are this process's to undo only when they were made in this
+        // boot and in this user namespace's view of the host (a replaced container's
+        // records share this directory; their objects went with it).
+        let same_namespace = record.user_namespace.unwrap_or(INITIAL_USER_NAMESPACE)
+            == current_user_namespace().unwrap_or(INITIAL_USER_NAMESPACE);
+        let same_boot = record.boot_id == boot_id() && same_namespace;
         let remaining = undo_all(&id, record.resources, same_boot, |list| {
             write_record(dir, &id, list)
         })
@@ -1330,9 +1362,26 @@ mod tests {
     /// namespace.
     #[test]
     fn the_owner_directory_name_carries_a_user_namespace_other_than_the_initial_one() {
-        assert_eq!(owner_dir_name(0, Some(INITIAL_USER_NAMESPACE)), "0");
-        assert_eq!(owner_dir_name(1000, None), "1000");
-        assert_eq!(owner_dir_name(0, Some(4026532301)), "0-userns4026532301");
+        assert_eq!(
+            owner_dir_name(0, Some(INITIAL_USER_NAMESPACE), Some(0)),
+            "0"
+        );
+        assert_eq!(owner_dir_name(1000, None, None), "1000");
+        assert_eq!(
+            owner_dir_name(0, Some(4026532301), Some(1000)),
+            "0-host1000"
+        );
+        assert_eq!(
+            owner_dir_name(0, Some(4026532301), None),
+            "0-userns4026532301"
+        );
+        assert_eq!(
+            host_uid_of("         0       1000          1\n", 0),
+            Some(1000)
+        );
+        assert_eq!(host_uid_of("0 1000 1\n1 100000 65536\n", 5), Some(100004));
+        assert_eq!(host_uid_of("0 1000 1\n", 7), None);
+        assert_eq!(host_uid_of("0 0 4294967295\n", 1000), Some(1000));
     }
 
     /// Set in the child of `a_namespaced_root_has_an_owner_directory_of_its_own`: the
@@ -1367,36 +1416,42 @@ mod tests {
         let exe = root.path().join("test-binary");
         std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let output = std::process::Command::new("setpriv")
-            .args([
-                "--reuid=65534",
-                "--regid=65534",
-                "--clear-groups",
-                "unshare",
-                "-U",
-                "-r",
-            ])
-            .arg(&exe)
-            .args([
-                "--exact",
-                "reclaim::tests::a_namespaced_root_has_an_owner_directory_of_its_own",
-                "--nocapture",
-            ])
-            .env(NAMESPACED_ROOT_CHILD, root.path())
-            .output()
-            .expect("spawning the namespaced child");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "the namespaced root could not use the shared store: {}\n{stdout}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
+        let child = || {
+            let output = std::process::Command::new("setpriv")
+                .args(["--reuid=65534", "--regid=65534", "--clear-groups"])
+                .args(["unshare", "-U", "-r"])
+                .arg(&exe)
+                .args([
+                    "--exact",
+                    "reclaim::tests::a_namespaced_root_has_an_owner_directory_of_its_own",
+                    "--nocapture",
+                ])
+                .env(NAMESPACED_ROOT_CHILD, root.path())
+                .output()
+                .expect("spawning the namespaced child");
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            assert!(
+                output.status.success(),
+                "the namespaced root could not use the shared store: {}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            PathBuf::from(
+                stdout
+                    .lines()
+                    .find_map(|line| line.strip_prefix("OWNER_DIR="))
+                    .expect("the child names its owner directory"),
+            )
+        };
+        let theirs = child();
+        assert_ne!(theirs, host_root, "one directory for two roots");
+        // A container replaced by another with the same uid mapping (a new user namespace)
+        // finds the records its predecessor left, so what they name on disk is reclaimed.
+        assert_eq!(
+            child(),
+            theirs,
+            "a new user namespace with the same mapping lost its predecessor's records"
         );
-        let theirs = stdout
-            .lines()
-            .find_map(|line| line.strip_prefix("OWNER_DIR="))
-            .expect("the child names its owner directory");
-        assert_ne!(Path::new(theirs), host_root, "one directory for two roots");
         // The host's root still uses its own directory.
         assert_eq!(owner_dir_in(root.path()).unwrap(), host_root);
     }
@@ -1470,6 +1525,7 @@ mod tests {
         let record = Record {
             pid: 1,
             boot_id: "a-boot-before-this-one".into(),
+            user_namespace: current_user_namespace(),
             resources: vec![
                 // Its undo cannot run, so a pass that acted on it would keep it.
                 Resource::Rule {
@@ -1494,6 +1550,44 @@ mod tests {
         );
         assert!(!temp.exists());
         assert!(files_in(&dir).is_empty());
+    }
+
+    /// Kernel objects are named in the namespaces of the process that made them. A
+    /// record another user namespace wrote (a container since replaced, sharing this
+    /// store) names objects that are gone or are another VM's now, so a pass leaves them
+    /// alone and still undoes the record's files.
+    #[tokio::test]
+    async fn kernel_objects_recorded_in_another_user_namespace_are_left_alone() {
+        let (root, dir) = test_dir();
+        let temp = root.path().join("other-namespace.tmp");
+        std::fs::write(&temp, b"x").unwrap();
+        let record = Record {
+            pid: 1,
+            boot_id: boot_id(),
+            user_namespace: Some(current_user_namespace().unwrap() + 1),
+            resources: vec![
+                // Its undo cannot run, so a pass that acted on it would keep it.
+                Resource::Rule {
+                    program: "/nonexistent/iptables".into(),
+                    args: vec!["-A".into(), "FORWARD".into()],
+                },
+                Resource::Temp { path: temp.clone() },
+            ],
+        };
+        std::fs::write(
+            record_path(&dir, "vm-other-namespace"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reclaim_abandoned_in(&dir).await,
+            Reclaimed {
+                owners: 1,
+                resources: 2,
+                remaining: 0
+            }
+        );
+        assert!(!temp.exists());
     }
 
     fn rule(program: &str, chain: &str) -> Resource {
@@ -1617,6 +1711,7 @@ mod tests {
         let record = Record {
             pid: 1,
             boot_id: boot_id(),
+            user_namespace: current_user_namespace(),
             resources: vec![Resource::Temp {
                 path: victim.clone(),
             }],
