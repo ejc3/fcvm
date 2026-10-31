@@ -236,6 +236,10 @@ jobs:
         run: python3 -B fleet/coord/test_release.py
       - name: Fleet image IP-options guard tests
         run: python3 -B fleet/ami/test_ip_options.py
+      - name: Bounded image factory and request-priority tests
+        run: |
+          python3 -B fleet/ami/test_pipeline.py
+          python3 -B fleet/ami/test_request.py
       - name: Operator script tests (fleet/tools)
         run: make -C fleet/tools test
       # Robot Park's scene model, control protocol and shader check (fleet/phone-app), in

@@ -3761,6 +3761,8 @@ struct FakeEc2Api {
     throttle_runs: Arc<std::sync::atomic::AtomicU32>,
     /// How long a RunInstances answer takes.
     run_delay: Duration,
+    /// An unpromoted latest version has a different host type from the default.
+    unpublished_template: bool,
     calls: Arc<std::sync::Mutex<Vec<Ec2Call>>>,
 }
 
@@ -3845,7 +3847,10 @@ async fn fake_ec2_api(api: FakeEc2Api) -> String {
                     "TerminateInstances" => (StatusCode::OK, "<TerminateInstancesResponse/>".into()),
                     // An instant EC2 Fleet: spot is refused per pool where the region has no spot
                     // capacity (a 200 with an errorSet, as EC2 answers it); on demand launches.
-                    "DescribeLaunchTemplateVersions" => (StatusCode::OK, "<DescribeLaunchTemplateVersionsResponse><launchTemplateVersionSet><item><launchTemplateData><instanceType>g4dn.metal</instanceType></launchTemplateData></item></launchTemplateVersionSet></DescribeLaunchTemplateVersionsResponse>".into()),
+                    "DescribeLaunchTemplateVersions" => {
+                        let ty = if api.unpublished_template && params["LaunchTemplateVersion.1"] != "$Default" { "g4dn.xlarge" } else { "g4dn.metal" };
+                        (StatusCode::OK, format!("<DescribeLaunchTemplateVersionsResponse><launchTemplateVersionSet><item><launchTemplateData><instanceType>{ty}</instanceType></launchTemplateData></item></launchTemplateVersionSet></DescribeLaunchTemplateVersionsResponse>"))
+                    }
                     // IAM's FleetTypesOnly checks ec2:InstanceType on the fleet's instances, and
                     // CreateFleet supplies that key only from the request's overrides: an override
                     // that names no host type is refused as a whole, as EC2 answers it.
@@ -3886,6 +3891,7 @@ async fn the_aws_host_driver_launches_through_an_instant_fleet() {
     std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
     std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
     let api = FakeEc2Api {
+        unpublished_template: true,
         tagged: [(
             "us-east-1".to_string(),
             vec!["i-0123456789abcdef0".to_string()],
@@ -3924,6 +3930,7 @@ async fn the_aws_host_driver_launches_through_an_instant_fleet() {
         .collect();
     assert_eq!(reads.len(), 1, "{calls:?}");
     assert_eq!(reads[0].1["LaunchTemplateName"], "fcvm-fleet-host-x86_64");
+    assert_eq!(reads[0].1["LaunchTemplateVersion.1"], "$Default");
     let (region, p) = calls
         .iter()
         .find(|(_, p)| p["Action"] == "CreateFleet")
@@ -3935,6 +3942,10 @@ async fn the_aws_host_driver_launches_through_an_instant_fleet() {
     );
     assert_eq!(p["ClientToken"], "token-spot");
     assert_eq!(p["Type"], "instant");
+    assert_eq!(
+        p["LaunchTemplateConfigs.1.LaunchTemplateSpecification.Version"],
+        "$Default"
+    );
     assert_eq!(
         p["LaunchTemplateConfigs.1.LaunchTemplateSpecification.LaunchTemplateName"],
         "fcvm-fleet-host-x86_64"
@@ -4536,7 +4547,7 @@ async fn the_aws_tile_driver_launches_waits_and_terminates() {
         assert_eq!(calls[0].0, "us-east-1", "the first region is tried first");
         let (region, p) = &calls[1];
         assert_eq!(region, "us-west-2");
-        assert_eq!(p["LaunchTemplate.Version"], "$Latest");
+        assert_eq!(p["LaunchTemplate.Version"], "$Default");
         assert_eq!(p["TagSpecification.1.Tag.1.Key"], "Purpose");
         assert_eq!(p["TagSpecification.1.Tag.1.Value"], "fcvm-fleet-tile");
         assert_eq!(p["TagSpecification.1.Tag.2.Value"], "ec2-1");
@@ -5123,6 +5134,8 @@ struct PoolEc2 {
     next: u32,
     /// The pool template's current image.
     image: String,
+    /// Creating a candidate version must not change launches or invalidate the default pool.
+    candidate_image: Option<String>,
     cancelled: Vec<String>,
     /// Instances terminated while their spot request was not cancelled.
     uncancelled_terminates: Vec<String>,
@@ -5191,7 +5204,7 @@ async fn pool_ec2_api(api: Arc<std::sync::Mutex<PoolEc2>>) -> String {
                         "tile-spot" => Some(format!("sir-once-{}", a.next)),
                         _ => None,
                     };
-                    let img = a.image.clone();
+                    let img = if p["LaunchTemplate.Version"] == "$Default" { a.image.clone() } else { a.candidate_image.clone().unwrap_or_else(|| a.image.clone()) };
                     a.instances.insert(id.clone(), ("running".into(), tags, img, sir));
                     ok(format!("<RunInstancesResponse><instancesSet><item><instanceId>{id}</instanceId></item></instancesSet></RunInstancesResponse>"))
                 }
@@ -5224,7 +5237,7 @@ async fn pool_ec2_api(api: Arc<std::sync::Mutex<PoolEc2>>) -> String {
                 }
                 "DescribeLaunchTemplateVersions" => ok(format!(
                     "<DescribeLaunchTemplateVersionsResponse><launchTemplateVersionSet><item><launchTemplateData><imageId>{}</imageId></launchTemplateData></item></launchTemplateVersionSet></DescribeLaunchTemplateVersionsResponse>",
-                    a.image
+                    if p["LaunchTemplateVersion.1"] == "$Default" { &a.image } else { a.candidate_image.as_ref().unwrap_or(&a.image) }
                 )),
                 "StartInstances" => {
                     let id = p["InstanceId.1"].clone();
@@ -5330,6 +5343,51 @@ fn state_of(
     let a = api.lock().unwrap();
     let (st, tags, _, _) = &a.instances[id];
     (st.clone(), tags.clone())
+}
+
+/// A newer candidate template is inert until its version becomes the validated default.
+#[tokio::test]
+async fn an_unpromoted_template_does_not_launch_or_evict_the_default_tile_pool() {
+    use fcvm::fleet::coord::ec2::Ec2Driver;
+    let (d, api) = pool_driver(2).await;
+    let first = d.launch("ec2-1").await.unwrap();
+    d.release(&first.instance).await.unwrap();
+    let current = api.lock().unwrap().image.clone();
+    api.lock().unwrap().candidate_image = Some("ami-22222222222222222".into());
+    let resumed = d
+        .resume("ec2-2")
+        .await
+        .expect("the default image remains current");
+    assert_eq!(resumed.instance, first.instance);
+    let second = d.launch("ec2-3").await.unwrap();
+    {
+        let a = api.lock().unwrap();
+        let id = second.instance.split_once('/').unwrap().1;
+        assert_eq!(
+            a.instances[id].2, current,
+            "cold launch uses the validated default"
+        );
+        assert!(
+            a.cancelled.is_empty(),
+            "publishing a candidate does not evict the pool"
+        );
+    }
+    d.release(&resumed.instance).await.unwrap();
+    let promoted = "ami-33333333333333333";
+    api.lock().unwrap().image = promoted.into();
+    assert!(
+        d.resume("ec2-4").await.is_none(),
+        "the previous default is retired before resume"
+    );
+    assert_eq!(state_of(&api, &resumed.instance).0, "terminated");
+    let replacement = d.launch("ec2-4").await.unwrap();
+    assert_ne!(replacement.instance, resumed.instance);
+    let a = api.lock().unwrap();
+    let id = replacement.instance.split_once('/').unwrap().1;
+    assert_eq!(
+        a.instances[id].2, promoted,
+        "the replacement launches the new default"
+    );
 }
 
 /// A tile whose FleetPool tag fails while the fleet sleeps is terminated, not left running

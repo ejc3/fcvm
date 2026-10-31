@@ -1,0 +1,58 @@
+name: Fleet image build request
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: '17 2 * * 1'
+  workflow_dispatch:
+    inputs:
+      priority:
+        description: 'Critical fixes start immediately; routine changes batch'
+        type: choice
+        default: normal
+        options: [normal, critical]
+
+permissions:
+  contents: read
+
+# Requests are short. AWS serializes builds and can preempt a routine build for
+# a critical fix after cleaning its exact builders; no long GitHub queue hides it.
+jobs:
+  request:
+    if: >-
+      github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' &&
+      (github.event_name != 'workflow_run' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: fleet-ami-publish
+    permissions:
+      contents: read
+      pull-requests: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the request boundary without AWS credentials
+        run: python3 -B fleet/ami/test_request.py
+      - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+          role-session-name: fleet-image-${{ github.run_id }}
+          mask-aws-account-id: true
+      - name: Request the immutable main image build
+        env:
+          SOURCE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          REQUEST_PRIORITY: ${{ github.event_name == 'workflow_run' && 'auto' || (github.event_name == 'workflow_dispatch' && inputs.priority || 'normal') }}
+          GH_TOKEN: ${{ github.token }}
+          AMI_PIPELINE_DISPATCH: ${{ secrets.AMI_PIPELINE_DISPATCH }}
+        run: python3 -B fleet/ami/request.py --sha "$SOURCE_SHA" --priority "$REQUEST_PRIORITY"

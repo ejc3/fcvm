@@ -592,7 +592,7 @@ impl AwsEc2 {
         self.call_ok(region, &params).await.map(|_| ())
     }
 
-    /// The image the pool template launches now; a pooled instance of another image is stale.
+    /// The validated default image; a candidate latest version does not invalidate the pool.
     async fn pool_image(&self) -> Result<String> {
         let template = self.pool_template.as_deref().context("no pool template")?;
         let xml = self
@@ -601,7 +601,7 @@ impl AwsEc2 {
                 &[
                     ("Action", "DescribeLaunchTemplateVersions".into()),
                     ("LaunchTemplateName", template.into()),
-                    ("LaunchTemplateVersion.1", "$Latest".into()),
+                    ("LaunchTemplateVersion.1", "$Default".into()),
                 ],
             )
             .await?;
@@ -816,7 +816,7 @@ impl AwsEc2 {
         let mut params: Vec<(&str, String)> = vec![
             ("Action", "RunInstances".into()),
             ("LaunchTemplate.LaunchTemplateName", template.into()),
-            ("LaunchTemplate.Version", "$Latest".into()),
+            ("LaunchTemplate.Version", "$Default".into()),
             ("MinCount", "1".into()),
             ("MaxCount", "1".into()),
             ("ClientToken", uuid::Uuid::new_v4().to_string()),
