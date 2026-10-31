@@ -558,6 +558,8 @@ describe("mock race, second design review", () => {
     const back = await live();
     expect(await back.next((m) => m["type"] === "hello")).toBeTruthy();
     back.ws.close();
+    // The next test records viewer counts; wait for server-side removal first.
+    await until(() => coord.fleetState().viewers.count === 0);
   });
 
   it("counts every connection, and only visible tabs as active viewers", async () => {
