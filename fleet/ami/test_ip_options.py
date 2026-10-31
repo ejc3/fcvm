@@ -163,7 +163,7 @@ else: sys.exit(91)
             self.assertTrue(value.startswith("ResourceType=" + kind + ","))
             self.assertIn("{Key=GuardHelperSHA256,Value=" + HELPER_SHA + "}", value)
 
-    def remote_proof(self, *, family="host", corrupt=False, healthy=True, enabled=True, missing=None, nft_change=None):
+    def remote_proof(self, *, family="host", corrupt=False, healthy=True, enabled=True, missing=None, nft_change=None, unit_change=None):
         """Execute the actual transmitted verifier; every subprocess and helper path is fake."""
         source = (AMI / "build-ami.sh").read_text()
         match = re.search(r"(?ms)^# BEGIN IMAGE GUARD PROOF\n(.*?)^# END IMAGE GUARD PROOF$", source)
@@ -175,6 +175,14 @@ else: sys.exit(91)
         with tempfile.TemporaryDirectory() as temporary:
             helper = Path(temporary) / "installed-helper"
             helper.write_bytes((AMI / "common/cve-2026-98432-mitigation.py").read_bytes() + (b"\n" if corrupt else b""))
+            unit = Path(temporary) / GUARD
+            definition = next(node.value for node in ast.parse(helper.read_text()).body if isinstance(node, ast.Assign)
+                              and any(isinstance(target, ast.Name) and target.id == "UNIT" for target in node.targets))
+            unit_text = ast.literal_eval(definition)
+            if unit_change == "simple": unit_text = unit_text.replace("Type=oneshot", "Type=simple")
+            if unit_change == "condition": unit_text = unit_text.replace("[Unit]\n", "[Unit]\nConditionPathExists=/never\n")
+            if unit_change == "post-command": unit_text = unit_text.replace("[Service]\n", "[Service]\nExecStartPost=/bin/true\n")
+            unit.write_text(unit_text)
             loaded = ({"fcvm-fleet-agent.service", "fcvm-fleet-store.service"} if family == "host" else
                       {"fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service"} if family == "tile" else
                       {"fcvm-fleet-agent.service"})
@@ -186,6 +194,18 @@ else: sys.exit(91)
                                        "inet_output": True, "bridge_prerouting": True})
                 if args == ["systemctl", "is-enabled", GUARD]:
                     return "enabled\n" if enabled else "disabled\n"
+                if args[:3] == ["systemctl", "show", GUARD] and "--property=ExecStart" in args:
+                    command = f"{{ path={helper} ; argv[]={helper} --load ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }}"
+                    settings = {"ExecStart": command, "DropInPaths": "", "FragmentPath": "/etc/systemd/system/" + GUARD,
+                                "Type": "oneshot", "RemainAfterExit": "yes", "DefaultDependencies": "no", "NeedDaemonReload": "no"}
+                    if unit_change == "noop": settings["ExecStart"] = "{ path=/bin/true ; argv[]=/bin/true ; ignore_errors=no ; pid=0 }"
+                    if unit_change == "dropin": settings["DropInPaths"] = "/etc/systemd/system/" + GUARD + ".d/override.conf"
+                    if unit_change == "fragment": settings["FragmentPath"] = "/run/systemd/system/" + GUARD
+                    if unit_change == "simple": settings["Type"] = "simple"
+                    if unit_change == "ignore-error": settings["ExecStart"] = command.replace("ignore_errors=no", "ignore_errors=yes")
+                    if unit_change == "extra-command": settings["ExecStart"] = command + " ; { path=/bin/true ; argv[]=/bin/true ; ignore_errors=no ; pid=0 }"
+                    if unit_change == "pending-reload": settings["NeedDaemonReload"] = "yes"
+                    return "\n".join(key + "=" + value for key, value in settings.items())
                 if args[:4] == ["nft", "-j", "list", "table"]:
                     # Actual nft 1.0.9 JSON: IPv4 payload access makes the explicit
                     # nfproto/ether-type clauses redundant, so nft omits those.
@@ -218,10 +238,10 @@ else: sys.exit(91)
                 raise AssertionError("unexpected verifier command")
 
             def path(value):
-                self.assertEqual(value, "/usr/local/sbin/cve-2026-98432-mitigation")
-                return helper
+                self.assertIn(value, ("/usr/local/sbin/cve-2026-98432-mitigation", "/etc/systemd/system/" + GUARD))
+                return helper if value.startswith("/usr/local/sbin/") else unit
 
-            namespace = {"hashlib": hashlib, "json": json, "Path": path,
+            namespace = {"ast": ast, "hashlib": hashlib, "json": json, "re": re, "Path": path,
                          "sys": SimpleNamespace(argv=["-", HELPER_SHA]),
                          "subprocess": SimpleNamespace(check_output=output, DEVNULL=-3)}
             exec(compile(tree, "remote-image-guard-proof", "exec"), namespace)
@@ -249,6 +269,11 @@ else: sys.exit(91)
             for change in ("udp", "wrong-ihl", "restrictive-port", "all-tcp", "no-ipv4", "priority", "policy", "extra-rule"):
                 with self.subTest(family=family, hook=hook, change=change), self.assertRaises(SystemExit):
                     self.remote_proof(nft_change=(family, hook, change))
+
+    def test_remote_verifier_requires_canonical_effective_boot_guard(self):
+        for change in ("noop", "dropin", "fragment", "simple", "ignore-error", "extra-command", "condition", "post-command", "pending-reload"):
+            with self.subTest(change=change), self.assertRaises(SystemExit):
+                self.remote_proof(unit_change=change)
 
 
 if __name__ == "__main__":

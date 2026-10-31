@@ -128,9 +128,11 @@ image)
   [[ "$guard_sha" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid guard digest" >&2; exit 1; }
   ssm_sh "$2" "python3 - '$guard_sha' <<'FLEET_GUARD_PROOF'
 # BEGIN IMAGE GUARD PROOF
+import ast
 import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -144,7 +146,13 @@ def output(arguments):
 guard = Path('/usr/local/sbin/cve-2026-98432-mitigation')
 service = 'cve-2026-98432-mitigation.service'
 need(guard.is_file() and not guard.is_symlink(), 'installed guard is missing or unsafe')
-need(hashlib.sha256(guard.read_bytes()).hexdigest() == sys.argv[1], 'installed guard digest differs')
+implementation = guard.read_bytes()
+need(hashlib.sha256(implementation).hexdigest() == sys.argv[1], 'installed guard digest differs')
+units = [ast.literal_eval(node.value) for node in ast.parse(implementation).body if isinstance(node, ast.Assign)
+         and any(isinstance(target, ast.Name) and target.id == 'UNIT' for target in node.targets)]
+fragment = Path('/etc/systemd/system/' + service)
+need(len(units) == 1 and isinstance(units[0], str) and fragment.is_file() and not fragment.is_symlink()
+     and fragment.read_bytes() == units[0].encode(), 'guard boot unit differs from verified implementation')
 proof = json.loads(output([str(guard), '--check']))
 need(proof.get('status') == 'PASS' and all(proof.get(key) is True for key in
      ('inet_prerouting', 'inet_output', 'bridge_prerouting')), 'runtime guard check failed')
@@ -170,6 +178,14 @@ for family, hooks in (('inet', ('prerouting', 'output')), ('bridge', ('preroutin
         actual = [entry for entry in matching[0]['expr'] if set(entry) != {'counter'}]
         need(actual == expected, 'guard packet predicates differ')
 need(output(['systemctl', 'is-enabled', service]).strip() == 'enabled', 'guard boot unit is not enabled')
+settings = dict(line.split('=', 1) for line in output(['systemctl', 'show', service,
+    '--property=ExecStart', '--property=DropInPaths', '--property=FragmentPath',
+    '--property=NeedDaemonReload']).splitlines() if '=' in line)
+need(all(settings.get(key) == value for key, value in (('DropInPaths', ''),
+     ('FragmentPath', '/etc/systemd/system/' + service), ('NeedDaemonReload', 'no'))), 'guard boot unit is overridden')
+command = r'\{ path=' + re.escape(str(guard)) + r' ; argv\[\]=' + re.escape(str(guard))
+need(re.fullmatch(command + r' --load ; ignore_errors=no ; [^{}]* \}', settings.get('ExecStart', '')),
+     'guard boot command differs')
 selected = ()
 for units in (('fcvm-fleet-agent.service', 'fcvm-fleet-store.service'),
               ('fcvm-fleet-renderer.service', 'fcvm-fleet-nginx.service')):
