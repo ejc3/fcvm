@@ -721,6 +721,65 @@ class PipelineTests(unittest.TestCase):
 
 
 class GuestTests(unittest.TestCase):
+    def ordering_commands(self, states, started=20):
+        reads = []
+        current = [0]
+        def command(arguments, timeout=120):
+            if "--property=ActiveState" in arguments:
+                reads.append(arguments)
+                state = states[min(len(reads) - 1, len(states) - 1)]
+                current[0] = min(len(reads) - 1, len(states) - 1)
+                return state + "\n" + state
+            if arguments[:2] == ["systemctl", "is-active"]:
+                return "active" if arguments[2] == guest.GUARD else states[current[0]]
+            if "--property=ActiveEnterTimestampMonotonic" in arguments:
+                return "10"
+            if "--property=ExecMainStartTimestampMonotonic" in arguments:
+                return str(started)
+            raise AssertionError(arguments)
+        return command, reads
+
+    def test_boot_ordering_waits_for_restoring_consumers_before_proving_timestamps(self):
+        for kind in ("host", "tile"):
+            with self.subTest(kind=kind):
+                command, reads = self.ordering_commands(["activating", "active"])
+                with patch.object(guest, "command", side_effect=command), \
+                     patch.object(guest.time, "sleep") as sleep:
+                    try:
+                        guest.ordering(kind)
+                    except RuntimeError as error:
+                        self.fail(str(error))
+                self.assertEqual(len(reads), 2)
+                sleep.assert_called_once()
+                if kind == "host":
+                    self.assertIn("fcvm-fleet-vfio.service", reads[0])
+                    self.assertIn("fcvm-fleet-store.service", reads[0])
+
+    def test_boot_readiness_rejects_failed_units_and_still_checks_guard_ordering(self):
+        for states, started, message in ((["failed"], 20, "failed during boot"),
+                                          (["active"], 5, "started before the guard")):
+            with self.subTest(message=message):
+                command, _ = self.ordering_commands(states, started)
+                with patch.object(guest, "command", side_effect=command), \
+                     patch.object(guest.time, "sleep") as sleep:
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        guest.ordering("host")
+                sleep.assert_not_called()
+
+    def test_boot_readiness_stops_at_its_fixed_bound(self):
+        command, reads = self.ordering_commands(["activating"])
+        now = [0]
+        def sleep(seconds):
+            self.assertLessEqual(seconds, 1)
+            now[0] += 900
+        with patch.object(guest, "command", side_effect=command), \
+             patch.object(guest.time, "monotonic", side_effect=lambda: now[0]), \
+             patch.object(guest.time, "sleep", side_effect=sleep):
+            with self.assertRaisesRegex(RuntimeError, "did not become active"):
+                guest.ordering("host")
+        self.assertEqual(now[0], 1800)
+        self.assertEqual(len(reads), 2)
+
     def test_single_put_checks_the_server_checksum_even_when_metadata_claims_success(self):
         class S3:
             def __init__(self, corrupt):

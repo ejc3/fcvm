@@ -325,6 +325,20 @@ def tls_proof(port, document):
 def ordering(kind):
     names = ("fcvm-fleet-store.service",) if kind == "host" else (
         "fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service")
+    ready = ("fcvm-fleet-vfio.service", *names) if kind == "host" else names
+    deadline = time.monotonic() + 1800
+    while True:
+        remaining = deadline - time.monotonic()
+        need(remaining > 0, "required image services did not become active")
+        states = command(["systemctl", "show", *ready, "--property=ActiveState", "--value"],
+                         timeout=min(10, remaining)).split()
+        need(len(states) == len(ready), "required image service states are missing")
+        need("failed" not in states, "required image service failed during boot")
+        if all(state == "active" for state in states):
+            break
+        remaining = deadline - time.monotonic()
+        need(remaining > 0, "required image services did not become active")
+        time.sleep(min(1, remaining))
     at = int(command(["systemctl", "show", GUARD, "--property=ActiveEnterTimestampMonotonic", "--value"]))
     need(at > 0 and command(["systemctl", "is-active", GUARD]) == "active", "guard did not start at boot")
     for name in names:
