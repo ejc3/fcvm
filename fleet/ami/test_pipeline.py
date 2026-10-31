@@ -298,6 +298,64 @@ class PipelineTests(unittest.TestCase):
                 if pipeline.GUEST in text:
                     self.assertIn(pipeline.GUEST_PYTHON + " " + pipeline.GUEST, text)
 
+    def test_reused_tile_traces_a_boot_without_the_inherited_prefetch_profile(self):
+        events = []
+        invoke, send = self.broker.invoke, self.worker.send_command
+        def broker(**arguments):
+            value = json.loads(arguments["Payload"])
+            events.append((value["action"], value.get("slot"), None))
+            return invoke(**arguments)
+        def command(**arguments):
+            slot = next(name for name, value in self.broker.slots.items()
+                        if value["instance_id"] == arguments["InstanceIds"][0])
+            events.append(("command", slot, arguments["Parameters"]["commands"][0]))
+            return send(**arguments)
+        with patch.object(self.broker, "invoke", side_effect=broker), \
+             patch.object(self.worker, "send_command", side_effect=command):
+            self.run_driver()
+        recipe = (HERE / "tile/build.sh").read_text()
+        unit = (HERE / "tile/fcvm-fleet-prefetch.service").read_text()
+        self.assertIn("ConditionPathExists=/etc/fcvm-fleet/prefetch.list", unit)
+        self.assertIn("ExecStartPost=/bin/sh -c ': > /run/fcvm-fleet-prefetched'", unit)
+        self.assertIn("systemctl enable fcvm-fleet-prefetch.service", recipe)
+        trace = recipe.split("\ntrace)\n", 1)[1].split("\n  ;;", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "etc/fcvm-fleet"; config.mkdir(parents=True)
+            profile = config / "prefetch.list"; profile.write_text("inherited profile\n")
+            marker = root / "prefetched"; marker.touch()
+            framed = root / "first-frame.log"; framed.write_text("ready\n")
+            (root / "resident.py").write_text("from pathlib import Path\nimport sys\n"
+                "Path(sys.argv[1]).write_text('fresh profile\\n')\n")
+            prepared = rebooted = False
+            for action, slot, text in events:
+                if slot != "tile-build":
+                    continue
+                if action == "command":
+                    if "/tile/build.sh prep" in text:
+                        prepared = True
+                    for line in text.splitlines():
+                        if line == "rm -f /etc/fcvm-fleet/prefetch.list":
+                            self.assertTrue(prepared)
+                            subprocess.run(["bash", "-c", line.replace("/etc/fcvm-fleet/prefetch.list", str(profile))],
+                                check=True, capture_output=True)
+                if action == "reboot" and prepared:
+                    # /run is fresh after the actual prep reboot. The unchanged
+                    # unit runs only if its inherited profile still exists.
+                    marker.unlink()
+                    if profile.exists():
+                        marker.touch()
+                    rebooted = True
+                    break
+            self.assertTrue(rebooted)
+            actual = trace.replace("/etc/fcvm-fleet", str(config)).replace(
+                "/run/fcvm-fleet-prefetched", str(marker)).replace("/var/log/fcvm-fleet-first-frame.log", str(framed))
+            result = subprocess.run(["bash", "-c", "set -eu\n" + actual],
+                env={"PATH": "/usr/bin:/bin", "HERE": str(root)}, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(profile.read_text(), "fresh profile\n")
+            self.assertFalse(marker.exists())
+
     def test_actual_source_install_discards_deleted_recipe_files_without_following_a_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

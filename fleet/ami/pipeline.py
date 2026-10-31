@@ -366,6 +366,8 @@ class Pipeline:
             "  if [ \"$(systemctl show \"$unit\" --property=LoadState --value 2>/dev/null)\" = loaded ]; then\n"
             "    systemctl stop \"$unit\"\n  fi\ndone")
         self.phase(slot, "tile", "prep")
+        # The tracing boot must read on its own; trace replaces the old profile.
+        self.shell(slot, "rm -f /etc/fcvm-fleet/prefetch.list")
         self.reboot(slot)
         url = self.worker.client("s3", self.config["asset_region"]).generate_presigned_url("get_object",
             Params={"Bucket": self.config["bucket"], "Key": self.prefix + "renderer.oci.tar.zst",
