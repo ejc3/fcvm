@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline image-recipe checks; all package, service and guard actions are fakes."""
 import ast
+import copy
 import hashlib
 import json
 import os
@@ -162,7 +163,7 @@ else: sys.exit(91)
             self.assertTrue(value.startswith("ResourceType=" + kind + ","))
             self.assertIn("{Key=GuardHelperSHA256,Value=" + HELPER_SHA + "}", value)
 
-    def remote_proof(self, *, family="host", corrupt=False, healthy=True, enabled=True, missing=None):
+    def remote_proof(self, *, family="host", corrupt=False, healthy=True, enabled=True, missing=None, nft_change=None):
         """Execute the actual transmitted verifier; every subprocess and helper path is fake."""
         source = (AMI / "build-ami.sh").read_text()
         match = re.search(r"(?ms)^# BEGIN IMAGE GUARD PROOF\n(.*?)^# END IMAGE GUARD PROOF$", source)
@@ -185,6 +186,30 @@ else: sys.exit(91)
                                        "inet_output": True, "bridge_prerouting": True})
                 if args == ["systemctl", "is-enabled", GUARD]:
                     return "enabled\n" if enabled else "disabled\n"
+                if args[:4] == ["nft", "-j", "list", "table"]:
+                    # Actual nft 1.0.9 JSON: IPv4 payload access makes the explicit
+                    # nfproto/ether-type clauses redundant, so nft omits those.
+                    nft_family = args[4]
+                    hooks = ("prerouting", "output") if nft_family == "inet" else ("prerouting",)
+                    left = {"meta": {"key": "l4proto"}} if nft_family == "inet" else {"payload": {"protocol": "ip", "field": "protocol"}}
+                    canonical = [{"match": {"op": "==", "left": left, "right": "tcp"}},
+                                 {"match": {"op": ">", "left": {"payload": {"protocol": "ip", "field": "hdrlength"}}, "right": 5}},
+                                 {"counter": {"packets": 7, "bytes": 308}}, {"drop": None}]
+                    entries = [{"table": {"family": nft_family, "name": "cve_2026_98432", "handle": 20}}]
+                    for hook in hooks:
+                        change = nft_change[2] if nft_change and nft_change[:2] == (nft_family, hook) else None
+                        expressions = copy.deepcopy(canonical)
+                        if change == "udp": expressions[0]["match"]["right"] = "udp"
+                        if change == "wrong-ihl": expressions[1]["match"]["right"] = 6
+                        if change == "restrictive-port": expressions.insert(2, {"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": 443}})
+                        if change == "all-tcp": expressions.pop(1)
+                        if change == "no-ipv4": expressions[1]["match"]["left"]["payload"]["protocol"] = "ip6"
+                        entries.append({"chain": {"family": nft_family, "table": "cve_2026_98432", "name": hook,
+                            "type": "filter", "hook": hook, "prio": -300 if change == "priority" else -310,
+                            "policy": "drop" if change == "policy" else "accept"}})
+                        entries.append({"rule": {"family": nft_family, "table": "cve_2026_98432", "chain": hook, "expr": expressions}})
+                        if change == "extra-rule": entries.append(copy.deepcopy(entries[-1]))
+                    return json.dumps({"nftables": entries})
                 if args[:2] == ["systemctl", "show"] and "--property=LoadState" in args:
                     return "loaded\n" if args[2] in loaded else "not-found\n"
                 if args[:2] == ["systemctl", "show"]:
@@ -218,6 +243,12 @@ else: sys.exit(91)
         for key in ("Requires", "After"):
             with self.subTest(key=key), self.assertRaises(SystemExit):
                 self.remote_proof(missing=key)
+
+    def test_remote_verifier_rejects_ineffective_or_overbroad_packet_guards(self):
+        for family, hook in (("inet", "prerouting"), ("inet", "output"), ("bridge", "prerouting")):
+            for change in ("udp", "wrong-ihl", "restrictive-port", "all-tcp", "no-ipv4", "priority", "policy", "extra-rule"):
+                with self.subTest(family=family, hook=hook, change=change), self.assertRaises(SystemExit):
+                    self.remote_proof(nft_change=(family, hook, change))
 
 
 if __name__ == "__main__":

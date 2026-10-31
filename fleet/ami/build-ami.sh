@@ -148,6 +148,27 @@ need(hashlib.sha256(guard.read_bytes()).hexdigest() == sys.argv[1], 'installed g
 proof = json.loads(output([str(guard), '--check']))
 need(proof.get('status') == 'PASS' and all(proof.get(key) is True for key in
      ('inet_prerouting', 'inet_output', 'bridge_prerouting')), 'runtime guard check failed')
+for family, hooks in (('inet', ('prerouting', 'output')), ('bridge', ('prerouting',))):
+    items = json.loads(output(['nft', '-j', 'list', 'table', family, 'cve_2026_98432']))['nftables']
+    chains = [item['chain'] for item in items if 'chain' in item]
+    rules = [item['rule'] for item in items if 'rule' in item]
+    need(len(chains) == len(rules) == len(hooks), 'unexpected guard chains or rules')
+    protocol = {'meta': {'key': 'l4proto'}} if family == 'inet' else {'payload': {'protocol': 'ip', 'field': 'protocol'}}
+    expected = [{'match': {'op': '==', 'left': protocol, 'right': 'tcp'}},
+                {'match': {'op': '>', 'left': {'payload': {'protocol': 'ip', 'field': 'hdrlength'}}, 'right': 5}},
+                {'drop': None}]
+    for hook in hooks:
+        definition = next((chain for chain in chains if chain.get('name') == hook), {})
+        need(all(definition.get(key) == value for key, value in
+             (('family', family), ('table', 'cve_2026_98432'), ('type', 'filter'),
+              ('hook', hook), ('prio', -310), ('policy', 'accept'))), 'guard hook is ineffective')
+        matching = [rule for rule in rules if rule.get('chain') == hook]
+        need(len(matching) == 1 and matching[0].get('family') == family
+             and matching[0].get('table') == 'cve_2026_98432', 'guard rule is missing or ambiguous')
+        # nft omits redundant family matches: the IPv4 payload itself scopes this
+        # rule to IPv4. Counters may change, but no additional restriction is valid.
+        actual = [entry for entry in matching[0]['expr'] if set(entry) != {'counter'}]
+        need(actual == expected, 'guard packet predicates differ')
 need(output(['systemctl', 'is-enabled', service]).strip() == 'enabled', 'guard boot unit is not enabled')
 selected = ()
 for units in (('fcvm-fleet-agent.service', 'fcvm-fleet-store.service'),
