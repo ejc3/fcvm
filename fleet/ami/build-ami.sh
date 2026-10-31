@@ -121,9 +121,53 @@ reboot)
   echo "no new boot on $2" >&2; exit 1
   ;;
 image)
+  # Publish only the guard actually installed on this builder, checked against
+  # this recipe's bundled implementation. SSM failure exits before CreateImage.
+  guard_sha=$(sha256sum "$HERE/common/cve-2026-98432-mitigation.py")
+  guard_sha=${guard_sha%% *}
+  [[ "$guard_sha" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid guard digest" >&2; exit 1; }
+  ssm_sh "$2" "python3 - '$guard_sha' <<'FLEET_GUARD_PROOF'
+# BEGIN IMAGE GUARD PROOF
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+def need(value, message):
+    if not value:
+        raise SystemExit(message)
+
+def output(arguments):
+    return subprocess.check_output(arguments, text=True, stderr=subprocess.DEVNULL, timeout=60)
+
+guard = Path('/usr/local/sbin/cve-2026-98432-mitigation')
+service = 'cve-2026-98432-mitigation.service'
+need(guard.is_file() and not guard.is_symlink(), 'installed guard is missing or unsafe')
+need(hashlib.sha256(guard.read_bytes()).hexdigest() == sys.argv[1], 'installed guard digest differs')
+proof = json.loads(output([str(guard), '--check']))
+need(proof.get('status') == 'PASS' and all(proof.get(key) is True for key in
+     ('inet_prerouting', 'inet_output', 'bridge_prerouting')), 'runtime guard check failed')
+need(output(['systemctl', 'is-enabled', service]).strip() == 'enabled', 'guard boot unit is not enabled')
+selected = ()
+for units in (('fcvm-fleet-agent.service', 'fcvm-fleet-store.service'),
+              ('fcvm-fleet-renderer.service', 'fcvm-fleet-nginx.service')):
+    states = [output(['systemctl', 'show', unit, '--property=LoadState', '--value']).strip() for unit in units]
+    if 'loaded' in states:
+        need(all(state == 'loaded' for state in states) and not selected, 'incomplete or ambiguous fleet services')
+        selected = units
+need(selected, 'no fleet services installed')
+for unit in selected:
+    settings = dict(line.split('=', 1) for line in output([
+        'systemctl', 'show', unit, '--property=Requires', '--property=After']).splitlines() if '=' in line)
+    need(all(service in settings.get(key, '').split() for key in ('Requires', 'After')),
+         'fleet service lacks mandatory guard ordering')
+print('fleet image guard publication proof passed')
+# END IMAGE GUARD PROOF
+FLEET_GUARD_PROOF"
   ami=$(A ec2 create-image --instance-id "$2" --name "$3" --description "fcvm fleet: $3" \
-    --tag-specifications "ResourceType=image,Tags=[{Key=Name,Value=$3},{Key=Purpose,Value=fcvm-fleet}]" \
-      "ResourceType=snapshot,Tags=[{Key=Name,Value=$3},{Key=Purpose,Value=fcvm-fleet}]" \
+    --tag-specifications "ResourceType=image,Tags=[{Key=Name,Value=$3},{Key=Purpose,Value=fcvm-fleet},{Key=GuardHelperSHA256,Value=$guard_sha}]" \
+      "ResourceType=snapshot,Tags=[{Key=Name,Value=$3},{Key=Purpose,Value=fcvm-fleet},{Key=GuardHelperSHA256,Value=$guard_sha}]" \
     --query ImageId --output text)
   echo "$ami"
   for _ in $(seq 1 120); do
