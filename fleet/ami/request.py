@@ -11,9 +11,6 @@ import subprocess
 import tempfile
 import urllib.request
 
-SOURCE_PATHS = ("Cargo.toml", "Cargo.lock", "build.rs", "Makefile", "rootfs-config.toml",
-                "src", "fc-agent", "fleet", "kernel", "scripts", "assets",
-                "fuse-pipe", "exec-proto", "failpoint")
 CRITICAL_LABELS = {"critical", "security:critical", "priority:critical", "priority:p0", "p0"}
 STATUSES = {"queued", "building", "preempting", "awaiting-publish", "promoted",
             "failed", "superseded", "disabled"}
@@ -26,7 +23,7 @@ def need(condition, message):
 
 def tree_digest(sha, run=subprocess.check_output):
     need(re.fullmatch(r"[0-9a-f]{40}", sha), "Expected an immutable source commit")
-    records = run(["git", "ls-tree", "-rz", sha, "--", *SOURCE_PATHS], timeout=30)
+    records = run(["git", "ls-tree", "-rz", sha, "--"], timeout=30)
     need(records, "Source tree has no image inputs")
     return hashlib.sha256(b"fcvm-fleet-ami-source-v1\0" + records).hexdigest()
 

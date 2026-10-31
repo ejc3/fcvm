@@ -12,6 +12,9 @@ import unittest
 spec = importlib.util.spec_from_file_location("image_request", Path(__file__).with_name("request.py"))
 request = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(request)
+pipeline_spec = importlib.util.spec_from_file_location("image_pipeline", Path(__file__).with_name("pipeline.py"))
+pipeline = importlib.util.module_from_spec(pipeline_spec)
+pipeline_spec.loader.exec_module(pipeline)
 
 
 class RequestTests(unittest.TestCase):
@@ -31,14 +34,13 @@ class RequestTests(unittest.TestCase):
             calls.append(arguments)
             return b"100644 blob " + b"b" * 40 + b"\tCargo.lock\0"
         self.assertEqual(request.tree_digest("a" * 40, git), request.tree_digest("c" * 40, git))
-        self.assertEqual(calls[0][:4], ["git", "ls-tree", "-rz", "a" * 40])
-        self.assertIn("rootfs-config.toml", calls[0])
+        self.assertEqual(calls[0], ["git", "ls-tree", "-rz", "a" * 40, "--"])
 
     def test_untrusted_source_cannot_become_a_git_option(self):
         with self.assertRaises(ValueError):
             request.tree_digest("--upload-pack=bad", lambda *a, **k: self.fail("Git must not run"))
 
-    def test_local_dependency_fixes_change_the_real_git_fingerprint(self):
+    def test_all_tracked_inputs_change_the_real_git_fingerprint_and_executor_agrees(self):
         with tempfile.TemporaryDirectory(prefix="fcvm-image-inputs-") as directory:
             root = Path(directory)
 
@@ -52,24 +54,34 @@ class RequestTests(unittest.TestCase):
                 git("add", ".")
                 git("commit", "-qm", "fixture")
                 sha = git("rev-parse", "HEAD").decode().strip()
-                return request.tree_digest(sha,
+                digest = request.tree_digest(sha,
                     lambda command, **kwargs: subprocess.check_output(command, cwd=directory, **kwargs))
+                self.assertEqual(pipeline.input_digest(root, sha)[0], digest)
+                return digest
 
             git("init", "-q")
             (root / "Cargo.toml").write_text("[package]\nname='fixture'\nversion='0.1.0'\n")
-            for dependency in ("fuse-pipe", "exec-proto", "failpoint"):
-                (root / dependency).mkdir()
-                (root / dependency / "lib.rs").write_text("pub const VERSION: u8 = 1;\n")
+            inputs = (".cargo/config.toml", "rust-toolchain.toml", "build-wrapper", "README.md",
+                      "fuse-pipe/lib.rs", "exec-proto/lib.rs", "failpoint/lib.rs")
+            for name in inputs:
+                path = root / name
+                path.parent.mkdir(exist_ok=True, parents=True)
+                path.write_text("fixture version 1\n")
             baseline = snapshot()
-            (root / "README.md").write_text("Documentation only.\n")
-            self.assertEqual(snapshot(), baseline)
-            for dependency in ("fuse-pipe", "exec-proto", "failpoint"):
-                with self.subTest(dependency=dependency):
-                    (root / dependency / "lib.rs").write_text("pub const VERSION: u8 = 2;\n")
+            for name in inputs:
+                with self.subTest(path=name):
+                    (root / name).write_text("fixture version 2\n")
                     changed = snapshot()
-                    self.assertNotEqual(changed, baseline,
-                        "Compiled local dependency changes must request a new image")
+                    self.assertNotEqual(changed, baseline, "Every tracked file belongs to the image fingerprint")
                     baseline = changed
+            before = git("rev-parse", "HEAD").decode().strip()
+            git("commit", "--allow-empty", "-qm", "same tree")
+            after = git("rev-parse", "HEAD").decode().strip()
+            self.assertNotEqual(after, before)
+            digest = request.tree_digest(after,
+                lambda command, **kwargs: subprocess.check_output(command, cwd=directory, **kwargs))
+            self.assertEqual(digest, baseline)
+            self.assertEqual(pipeline.input_digest(root, after)[0], baseline)
 
     def test_routine_identical_inputs_share_weekly_refresh(self):
         day = dt.datetime(2026, 10, 31, tzinfo=dt.timezone.utc)

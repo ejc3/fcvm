@@ -24,9 +24,6 @@ ROOT = Path(__file__).resolve().parents[2]
 REMOTE = "/opt/fcvm-image-source"
 GUEST = REMOTE + "/fleet/ami/pipeline_guest.py"
 GUEST_PYTHON = "/opt/fcvm-image-sdk/bin/python"
-SOURCE_PATHS = ("Cargo.toml", "Cargo.lock", "build.rs", "Makefile", "rootfs-config.toml",
-                "src", "fc-agent", "fleet", "kernel", "scripts", "assets",
-                "fuse-pipe", "exec-proto", "failpoint")
 
 
 def require(value, message):
@@ -39,13 +36,13 @@ def canonical(value):
 
 
 def input_digest(root, commit):
-    """Hash immutable source, including recipe, kernels, renderer and phone inputs."""
+    """Hash the complete immutable tracked tree used by the image build."""
     actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
     require(re.fullmatch(r"[0-9a-f]{40}", commit) and actual == commit,
             "checkout does not match the broker's source revision")
     dirty = subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=normal"], cwd=root)
     require(not dirty, "image publication requires an unchanged checkout")
-    records = subprocess.check_output(["git", "ls-tree", "-rz", commit, "--", *SOURCE_PATHS], cwd=root)
+    records = subprocess.check_output(["git", "ls-tree", "-rz", commit, "--"], cwd=root)
     require(records, "image source inputs are absent")
     digest = hashlib.sha256(b"fcvm-fleet-ami-source-v1\0" + records).hexdigest()
     archive = subprocess.check_output(["git", "archive", "--format=tar", commit], cwd=root)
