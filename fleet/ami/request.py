@@ -12,7 +12,8 @@ import tempfile
 import urllib.request
 
 SOURCE_PATHS = ("Cargo.toml", "Cargo.lock", "build.rs", "Makefile", "rootfs-config.toml",
-                "src", "fc-agent", "fleet", "kernel", "scripts", "assets")
+                "src", "fc-agent", "fleet", "kernel", "scripts", "assets",
+                "fuse-pipe", "exec-proto", "failpoint")
 CRITICAL_LABELS = {"critical", "security:critical", "priority:critical", "priority:p0", "p0"}
 STATUSES = {"queued", "building", "preempting", "awaiting-publish", "promoted",
             "failed", "superseded", "disabled"}

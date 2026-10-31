@@ -25,7 +25,8 @@ REMOTE = "/opt/fcvm-image-source"
 GUEST = REMOTE + "/fleet/ami/pipeline_guest.py"
 GUEST_PYTHON = "/opt/fcvm-image-sdk/bin/python"
 SOURCE_PATHS = ("Cargo.toml", "Cargo.lock", "build.rs", "Makefile", "rootfs-config.toml",
-                "src", "fc-agent", "fleet", "kernel", "scripts", "assets")
+                "src", "fc-agent", "fleet", "kernel", "scripts", "assets",
+                "fuse-pipe", "exec-proto", "failpoint")
 
 
 def require(value, message):
@@ -99,8 +100,10 @@ class Pipeline:
         # The fixed broker has reserved concurrency one. Serialize both parallel
         # validators through the complete invocation, including its response body.
         self.call_lock = threading.Lock()
+        self.cancelled = threading.Event()
 
-    def remaining(self):
+    def remaining(self, *, cleanup=False):
+        require(cleanup or not self.cancelled.is_set(), "a parallel validator failed")
         seconds = int(self.deadline - self.clock())
         require(seconds > 0, "the image build reached its fixed deadline")
         return seconds
@@ -121,6 +124,8 @@ class Pipeline:
             retry_until = min(retry_until, self.deadline)
         with self.call_lock:
             while True:
+                require(action in {"cleanup", "status"} or not self.cancelled.is_set(),
+                        "a parallel validator failed")
                 try:
                     reply = self.broker.invoke(FunctionName=self.config["broker_arn"],
                         InvocationType="RequestResponse", Payload=canonical(request))
@@ -139,13 +144,13 @@ class Pipeline:
                         raise
                     self.sleep(min(0.5, retry_until - self.clock()))
 
-    def wait(self, predicate):
+    def wait(self, predicate, *, cleanup=False):
         while True:
-            self.remaining()
+            self.remaining(cleanup=cleanup)
             value = predicate()
             if value:
                 return value
-            self.sleep(min(10, self.remaining()))
+            self.sleep(min(10, self.remaining(cleanup=cleanup)))
 
     def shell(self, slot, command, *, json_result=False):
         """Submit once. An uncertain send never replays a phase or launches a replacement."""
@@ -190,7 +195,7 @@ class Pipeline:
             '  test "$(stat -c %u ' + REMOTE + ')" = 0',
             "  rm -rf -- " + REMOTE,
             "fi",
-            "install -d -m 0700 " + REMOTE,
+            "install -d -m 0755 " + REMOTE,
             'tar -xf "$t" --no-same-owner -C ' + REMOTE,
         ])
         self.shell(slot, command)
@@ -387,7 +392,7 @@ class Pipeline:
             require(all(values[slot].get("instance_id") == instance for slot, instance in self.instances.items()),
                     "broker slot ownership changed during cleanup")
             return all(value.get("state") == "terminated" for value in values.values())
-        self.wait(gone)
+        self.wait(gone, cleanup=True)
 
     def verify(self, kind, renderer):
         slot = kind + "-verify"
@@ -453,12 +458,19 @@ class Pipeline:
             tile = self.build_tile(renderer)
             require(host.get("image_id") != tile.get("image_id"), "host and tile images are not distinct")
             self.cleanup()
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                results = {kind: executor.submit(self.verify, kind, renderer) for kind in ("host", "tile")}
+            def validate(kind):
                 try:
-                    validation = {kind: future.result() for kind, future in results.items()}
+                    return self.verify(kind, renderer)
                 except BaseException:
-                    self.call("cleanup")
+                    self.cancelled.set()
+                    raise
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                results = {executor.submit(validate, kind): kind for kind in ("host", "tile")}
+                try:
+                    validation = {results[future]: future.result() for future in concurrent.futures.as_completed(results)}
+                except BaseException:
+                    self.cancelled.set()
+                    self.cleanup()
                     raise
             status = self.call("status")
             require(status.get("candidates") == {"host": host["image_id"], "tile": tile["image_id"]},
@@ -481,7 +493,7 @@ class Pipeline:
             if started:
                 # This also handles the deadline: the broker and its independent reaper
                 # enforce termination if CodeBuild or this process disappears.
-                self.call("cleanup")
+                self.cleanup()
 
 
 def main():

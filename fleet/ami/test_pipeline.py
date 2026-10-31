@@ -335,6 +335,39 @@ class PipelineTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual((external / "preserve.txt").read_text(), "not the factory source")
 
+    def test_actual_installed_recipe_is_readable_but_not_writable_by_the_build_user(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            root.chmod(0o755)  # The second identity must reach the fixture's source root.
+            target, binary, archive = root / "source", root / "bin", root / "archive.tar"
+            binary.mkdir()
+            stream = io.BytesIO()
+            with tarfile.open(fileobj=stream, mode="w") as bundle:
+                value = b'test ! -w "$(dirname "$0")" && test ! -w "$0" && printf "recipe-readable\\n"\n'
+                entry = tarfile.TarInfo("warm.sh"); entry.size = len(value); entry.mode = 0o644
+                bundle.addfile(entry, io.BytesIO(value))
+            archive.write_bytes(stream.getvalue())
+            curl = binary / "curl"
+            curl.write_text("#!/usr/bin/python3\nimport shutil,sys\nshutil.copyfile("
+                + repr(str(archive)) + ",sys.argv[sys.argv.index('-o')+1])\n")
+            curl.chmod(0o700)
+            self.driver.archive = archive.read_bytes()
+            self.driver.input_sha = "3" * 64
+            self.driver.deadline = 9100
+            commands = []
+            with patch.object(self.driver, "shell", side_effect=lambda slot, text, **kwargs: commands.append(text)):
+                self.driver.install("host-build")
+            actual = commands[0].replace(pipeline.REMOTE, str(target))
+            subprocess.run(["bash", "-c", "set -eu\n" + actual], check=True,
+                env={"PATH": str(binary) + ":/usr/bin:/bin"}, capture_output=True)
+            # SSM installs as root; a distinct Unix identity models the recipe's
+            # sudo -u ubuntu warm-up without running any build or cloud command.
+            result = subprocess.run(["sudo", "-n", "-u", "nobody", "--", "env", "-i",
+                "PATH=/usr/bin:/bin", "bash", str(target / "warm.sh")], cwd="/",
+                env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "recipe-readable\n")
+
     def test_uncertain_ssm_send_is_not_replayed_and_always_cleans_up(self):
         self.worker.uncertain = True
         with self.assertRaises(TimeoutError):
@@ -400,6 +433,74 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(results, [{"ok": True}, {"ok": True}])
         self.assertEqual(broker.overlaps, 0)
         self.assertEqual(broker.count, 2)
+
+    def test_failed_validator_cancels_a_waiting_peer_and_fences_a_late_launch(self):
+        for peer in ("waiting", "late-launch"):
+            with self.subTest(peer=peer):
+                self.setUp()
+                waiting, cleaned = threading.Event(), threading.Event()
+                invoke = self.broker.invoke
+
+                def observed(**arguments):
+                    request = json.loads(arguments["Payload"])
+                    response = invoke(**arguments)
+                    if request["action"] == "cleanup" and waiting.is_set():
+                        cleaned.set()
+                    return response
+
+                def verify(kind, renderer):
+                    if kind == "host":
+                        self.assertTrue(waiting.wait(timeout=5), "the second validator never started")
+                        raise RuntimeError("candidate validation failed")
+                    waiting.set()
+                    if peer == "late-launch":
+                        self.assertTrue(cleaned.wait(timeout=5), "failure did not trigger cleanup")
+                        self.driver.launch("tile-verify")
+                    else:
+                        self.driver.wait(lambda: False)
+
+                def sleep(seconds):
+                    if threading.current_thread() is not threading.main_thread():
+                        self.assertTrue(cleaned.wait(timeout=5), "failure did not trigger cleanup")
+                    self.advance(seconds)
+
+                with patch.object(self.broker, "invoke", side_effect=observed), \
+                     patch.object(self.driver, "verify", side_effect=verify), \
+                     patch.object(self.driver, "sleep", side_effect=sleep):
+                    with self.assertRaises(RuntimeError):
+                        self.run_driver()
+                self.assertLess(self.now, 200, "a failed peer waited out the paid build deadline")
+                self.assertEqual([call["slot"] for call in self.broker.calls if call["action"] == "launch"],
+                    ["host-build", "tile-build"], "a validator launched after failure cleanup")
+                self.assertTrue(all(value["state"] == "terminated" for value in self.broker.slots.values()))
+                self.no_manifest()
+
+    def test_cancelled_cleanup_still_waits_for_actual_termination_with_the_same_deadline(self):
+        self.driver.deadline = self.broker.deadline
+        with patch.object(self.driver, "install"):
+            self.driver.launch("host-build")
+        self.driver.cancelled = threading.Event()
+        self.driver.cancelled.set()
+        invoke = self.broker.invoke
+        polls = []
+
+        def delayed(**arguments):
+            request = json.loads(arguments["Payload"])
+            if request["action"] == "status":
+                polls.append(request)
+                if len(polls) >= 2:
+                    self.broker.slots["host-build"]["state"] = "terminated"
+            response = invoke(**arguments)
+            if request["action"] == "cleanup":
+                self.broker.slots["host-build"]["state"] = "shutting-down"
+            return response
+
+        with patch.object(self.broker, "invoke", side_effect=delayed):
+            self.driver.cleanup()
+        self.assertEqual(len(polls), 2)
+        self.assertEqual(self.broker.slots["host-build"]["state"], "terminated")
+        self.assertEqual(self.driver.deadline, self.broker.deadline)
+        self.assertLess(self.now, self.driver.deadline)
 
     def test_only_definite_lambda_throttling_retries_within_the_fixed_limit(self):
         class Throttled(Exception):

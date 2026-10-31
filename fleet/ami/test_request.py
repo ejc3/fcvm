@@ -4,6 +4,8 @@ import datetime as dt
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import tempfile
 from types import SimpleNamespace
 import unittest
 
@@ -35,6 +37,39 @@ class RequestTests(unittest.TestCase):
     def test_untrusted_source_cannot_become_a_git_option(self):
         with self.assertRaises(ValueError):
             request.tree_digest("--upload-pack=bad", lambda *a, **k: self.fail("Git must not run"))
+
+    def test_local_dependency_fixes_change_the_real_git_fingerprint(self):
+        with tempfile.TemporaryDirectory(prefix="fcvm-image-inputs-") as directory:
+            root = Path(directory)
+
+            def git(*arguments):
+                return subprocess.check_output(["git", "-C", directory,
+                    "-c", "user.name=fixture", "-c", "user.email=fixture",
+                    "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *arguments],
+                    stderr=subprocess.DEVNULL)
+
+            def snapshot():
+                git("add", ".")
+                git("commit", "-qm", "fixture")
+                sha = git("rev-parse", "HEAD").decode().strip()
+                return request.tree_digest(sha,
+                    lambda command, **kwargs: subprocess.check_output(command, cwd=directory, **kwargs))
+
+            git("init", "-q")
+            (root / "Cargo.toml").write_text("[package]\nname='fixture'\nversion='0.1.0'\n")
+            for dependency in ("fuse-pipe", "exec-proto", "failpoint"):
+                (root / dependency).mkdir()
+                (root / dependency / "lib.rs").write_text("pub const VERSION: u8 = 1;\n")
+            baseline = snapshot()
+            (root / "README.md").write_text("Documentation only.\n")
+            self.assertEqual(snapshot(), baseline)
+            for dependency in ("fuse-pipe", "exec-proto", "failpoint"):
+                with self.subTest(dependency=dependency):
+                    (root / dependency / "lib.rs").write_text("pub const VERSION: u8 = 2;\n")
+                    changed = snapshot()
+                    self.assertNotEqual(changed, baseline,
+                        "Compiled local dependency changes must request a new image")
+                    baseline = changed
 
     def test_routine_identical_inputs_share_weekly_refresh(self):
         day = dt.datetime(2026, 10, 31, tzinfo=dt.timezone.utc)
