@@ -645,7 +645,7 @@ pub struct AwsHosts {
     pub fleet: String,
     /// Per-region API base; default `https://ec2.<region>.amazonaws.com`.
     pub endpoints: BTreeMap<String, String>,
-    /// Each template's instance type, as its latest version says, and when it was read.
+    /// Each template's instance type, as its validated default says, and when it was read.
     types: Mutex<HashMap<(String, String), (String, Instant)>>,
     chain: CredentialChain,
     http: reqwest::Client,
@@ -744,7 +744,7 @@ impl AwsHosts {
         ))
     }
 
-    /// The instance type of `template`'s latest version in `region`, read at most once per
+    /// The instance type of `template`'s validated default in `region`, read at most once per
     /// `TEMPLATE_TYPE_TTL`.
     async fn template_type(&self, region: &str, template: &str) -> Result<String> {
         let key = (region.to_string(), template.to_string());
@@ -759,7 +759,7 @@ impl AwsHosts {
                 &[
                     p("Action", "DescribeLaunchTemplateVersions"),
                     p("LaunchTemplateName", template),
-                    p("LaunchTemplateVersion.1", "$Latest"),
+                    p("LaunchTemplateVersion.1", "$Default"),
                 ],
             )
             .await
@@ -839,7 +839,7 @@ pub fn create_fleet_params(
         ));
         v.push(p(
             format!("{c}.LaunchTemplateSpecification.Version"),
-            "$Latest",
+            "$Default",
         ));
         for (j, s) in subnets.iter().enumerate() {
             v.push(p(format!("{c}.Overrides.{}.SubnetId", j + 1), s.as_str()));

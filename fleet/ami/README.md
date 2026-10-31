@@ -3,6 +3,44 @@
 The fleet's two machine images, built in the fcvm-fleet account (us-east-1) by
 `build-ami.sh`, and `fleet/tools/gpubox.sh`, which leases a GPU host for one agent's work.
 
+## Continuous image factory
+
+`Fleet image build request` accepts only successful CI commits on this repository's
+protected `main`, a weekly refresh, or a manual main dispatch. Normal requests batch
+for six hours and at most one routine build starts per UTC day. A merged pull request
+labelled `critical`, `security:critical`, `priority:critical`, `priority:p0`, or `p0`,
+or a manual `critical` request, bypasses the batch delay. Critical requests may
+preempt a routine build after its exact builders have been terminated.
+
+GitHub's short-lived role can only request work and read its status. The AWS factory
+owns the build: one job, a 150-minute deadline, at most one GPU host and one tile
+running together, and four deterministic instance slots across build and fresh-image
+validation. It does not retry uncertain launches or replace failed builders. An
+independent expiry reaper handles a lost or cancelled job. The compute envelope is
+bounded separately from EBS, snapshot storage and transfer charges.
+
+The factory uses isolated build/test certificates and its own instance profile.
+Production images and warm caches that may contain production TLS material are not
+CI build inputs. A pair publishes only after real GPU frames, a restored phone,
+certificate rotation, the exact firewall/boot-unit proofs, and cold boot, reboot and
+stop/start checks. Both images must use the same renderer. Working artifacts are
+private and temporary; the publisher copies the version-pinned validated store into
+the Fleet's existing asset bucket before activating the pair.
+
+The coordinator consumes `$Default`, so creating a candidate version cannot deploy
+it. The fixed publisher changes only the four template image fields and their
+defaults under the Terraform backend lock, retaining the previous pair. Terraform
+reads the versioned release pointer and rejects a saved plan if it changed after
+planning; it still owns every other template field. Critical publication retires
+only the old-image Fleet instances, so streams may briefly reconnect. Routine
+publication leaves active machines running and applies on later starts or idle
+recycling. No administration or Next.js machine is restarted by the factory.
+
+An accepted request is not a published release. Check the request's AWS status and
+the release manifest for validation and promotion results. Infrastructure, the
+main-only GitHub environment and the bootstrap enable sequence are owned by
+[`ejc3/aws`](https://github.com/ejc3/aws); no Terraform credentials belong in CI.
+
 ## A GPU box for testing: `fleet/tools/gpubox.sh`
 
 One g4dn.metal from the newest GPU host AMI: eight T4 on vfio-pci, fcvm built with the gpu
@@ -75,8 +113,8 @@ first frame in 19.5 s, and at 500 MiB/s and 3000 IOPS in 24.9 s, against 32.0 to
 `measure-boot.sh` takes `VOLUME=Throughput=...,Iops=...` for this.
 
 `bash fleet/ami/check.sh` runs the offline checks of these recipes (shellcheck, `bash -n`,
-the phase-marker and tile-readiness contracts); CI does not run it, so run it before
-changing a recipe.
+the phase-marker, security, factory and tile-readiness contracts). CI runs the Python
+factory/security tests; run the complete recipe check before changing a recipe.
 
 The wildcard certificate in `fcvm-fleet/tls-wildcard` is issued by
 `fleet/tools/issue-cert.sh`, whose header documents the secret's format.

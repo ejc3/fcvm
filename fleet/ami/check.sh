@@ -15,6 +15,8 @@ else
 fi
 python3 -m py_compile fleet/ami/common/cve-2026-98432-mitigation.py fleet/ami/host/s3-cat.py fleet/ami/host/store-pack.py fleet/ami/tile/fetch-cert.py fleet/ami/tile/resident.py || no "py_compile"
 python3 -B fleet/ami/test_ip_options.py || no "fleet image IP-options guard tests"
+python3 -B fleet/ami/test_pipeline.py || no "fleet image pipeline tests"
+python3 -B fleet/ami/test_request.py || no "fleet image request tests"
 
 # `build-ami.sh start` must clear the phase's markers before it launches the phase:
 # `wait` reads <phase>.done / <phase>.failed, and a builder from a BASE_AMI (or a
