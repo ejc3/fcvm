@@ -38,6 +38,7 @@ as_user() {
 
 case "$PHASE" in
 prep)
+  bash "$HERE/../common/install-ip-options.sh"
   # The AMI's kernel must not move under the store and the NVIDIA-free host: no unattended upgrades.
   systemctl disable --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer || true
   $APT update
@@ -154,6 +155,7 @@ build)
   as_user "podman image inspect localhost/fcvm-renderer:fleet --format '{{.Id}}'" | tee "$S/renderer.id"
   ;;
 bake)
+  bash "$HERE/../common/install-ip-options.sh"
   pkill -TERM -x fcvm || true; sleep 2
   install -m 0755 "$HERE/warm.sh" "$HERE/store.sh" "$HERE/s3-cat.py" "$HERE/prefetch.sh" "$HERE/warm-root.sh" "$HERE/warm-phone.sh" /usr/local/lib/fcvm-fleet/
   install -m 0644 "$HERE/fcvm-fleet-prefetch.service" "$HERE/fcvm-fleet-agent.service" /etc/systemd/system/

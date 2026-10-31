@@ -6,14 +6,15 @@ set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 2
 fail=0
 no() { echo "FAIL: $*"; fail=1; }
-scripts=(fleet/ami/*.sh fleet/ami/host/*.sh fleet/ami/tile/*.sh fleet/tools/gpubox.sh fleet/tools/issue-cert.sh)
+scripts=(fleet/ami/*.sh fleet/ami/common/*.sh fleet/ami/host/*.sh fleet/ami/tile/*.sh fleet/tools/gpubox.sh fleet/tools/issue-cert.sh)
 for f in "${scripts[@]}"; do bash -n "$f" || no "bash -n $f"; done
 if command -v shellcheck >/dev/null; then
   shellcheck -S warning "${scripts[@]}" || no "shellcheck -S warning"
 else
   no "shellcheck is not installed"
 fi
-python3 -m py_compile fleet/ami/host/s3-cat.py fleet/ami/host/store-pack.py fleet/ami/tile/fetch-cert.py fleet/ami/tile/resident.py || no "py_compile"
+python3 -m py_compile fleet/ami/common/cve-2026-98432-mitigation.py fleet/ami/host/s3-cat.py fleet/ami/host/store-pack.py fleet/ami/tile/fetch-cert.py fleet/ami/tile/resident.py || no "py_compile"
+python3 -B fleet/ami/test_ip_options.py || no "fleet image IP-options guard tests"
 
 # `build-ami.sh start` must clear the phase's markers before it launches the phase:
 # `wait` reads <phase>.done / <phase>.failed, and a builder from a BASE_AMI (or a

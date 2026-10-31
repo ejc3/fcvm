@@ -7,8 +7,9 @@
 [Unit]
 Description=fcvm fleet: fcvm store on the local NVMe, restored from S3 or the AMI's copy
 DefaultDependencies=no
+Requires=cve-2026-98432-mitigation.service
 Wants=systemd-networkd-wait-online.service
-After=local-fs.target systemd-networkd-wait-online.service nss-lookup.target
+After=cve-2026-98432-mitigation.service local-fs.target systemd-networkd-wait-online.service nss-lookup.target
 Before=shutdown.target
 Conflicts=shutdown.target
 ConditionPathExists=/var/lib/fcvm-fleet/store/parts

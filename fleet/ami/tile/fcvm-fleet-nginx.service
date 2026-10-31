@@ -5,8 +5,8 @@ Description=fcvm fleet tile: nginx, TLS on 443 in front of the renderer
 # (build.sh disables nginx.service). It needs the certificate and nothing else: it listens on
 # the wildcard address.
 DefaultDependencies=no
-Requires=fcvm-fleet-tls.service
-After=fcvm-fleet-tls.service local-fs.target systemd-tmpfiles-setup.service
+Requires=cve-2026-98432-mitigation.service fcvm-fleet-tls.service
+After=cve-2026-98432-mitigation.service fcvm-fleet-tls.service local-fs.target systemd-tmpfiles-setup.service
 Conflicts=shutdown.target
 Before=shutdown.target
 

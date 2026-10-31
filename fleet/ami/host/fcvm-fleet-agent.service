@@ -6,8 +6,8 @@
 # fcvm-fleet/agent-access-token). The arguments are fleet/PROTOCOL.md, "Agent", "Running it".
 [Unit]
 Description=fcvm fleet agent: one GPU VM per slot this host owns
-Requires=fcvm-fleet-vfio.service fcvm-fleet-store.service
-After=fcvm-fleet-vfio.service fcvm-fleet-store.service network-online.target
+Requires=cve-2026-98432-mitigation.service fcvm-fleet-vfio.service fcvm-fleet-store.service
+After=cve-2026-98432-mitigation.service fcvm-fleet-vfio.service fcvm-fleet-store.service network-online.target
 Wants=network-online.target
 ConditionPathExists=/etc/fcvm-fleet/agent.env
 
