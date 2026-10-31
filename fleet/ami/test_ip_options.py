@@ -156,6 +156,11 @@ else: sys.exit(91)
         proof = next(index for index, args in enumerate(calls) if args[:2] == ["ssm", "send-command"])
         create = next(index for index, args in enumerate(calls) if args[:2] == ["ec2", "create-image"])
         self.assertLess(proof, create)
+        command = json.loads(calls[proof][calls[proof].index("--parameters") + 1])["commands"][0]
+        for kind, names in (("host", ("fcvm-fleet-agent.service", "fcvm-fleet-store.service")),
+                            ("tile", ("fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service"))):
+            for name in names:
+                self.assertIn(name + "=" + hashlib.sha256((AMI / kind / name).read_bytes()).hexdigest(), command)
         tags = calls[create][calls[create].index("--tag-specifications") + 1:]
         specifications = [value for value in tags if value.startswith("ResourceType=")]
         self.assertEqual(len(specifications), 2)
@@ -163,7 +168,7 @@ else: sys.exit(91)
             self.assertTrue(value.startswith("ResourceType=" + kind + ","))
             self.assertIn("{Key=GuardHelperSHA256,Value=" + HELPER_SHA + "}", value)
 
-    def remote_proof(self, *, family="host", corrupt=False, healthy=True, enabled=True, missing=None, nft_change=None, unit_change=None):
+    def remote_proof(self, *, family="host", corrupt=False, healthy=True, enabled=True, missing=None, nft_change=None, unit_change=None, consumer_change=None):
         """Execute the actual transmitted verifier; every subprocess and helper path is fake."""
         source = (AMI / "build-ami.sh").read_text()
         match = re.search(r"(?ms)^# BEGIN IMAGE GUARD PROOF\n(.*?)^# END IMAGE GUARD PROOF$", source)
@@ -183,6 +188,25 @@ else: sys.exit(91)
             if unit_change == "condition": unit_text = unit_text.replace("[Unit]\n", "[Unit]\nConditionPathExists=/never\n")
             if unit_change == "post-command": unit_text = unit_text.replace("[Service]\n", "[Service]\nExecStartPost=/bin/true\n")
             unit.write_text(unit_text)
+            consumers = {name: AMI / kind / name for kind, names in (
+                ("host", ("fcvm-fleet-agent.service", "fcvm-fleet-store.service")),
+                ("tile", ("fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service"))) for name in names}
+            files = {"/etc/systemd/system/" + GUARD: unit}
+            for name, source in consumers.items():
+                fragment = Path(temporary) / name
+                fragment.write_bytes(source.read_bytes())
+                files["/etc/systemd/system/" + name] = fragment
+            dropins = {}
+            if consumer_change:
+                name, change = consumer_change
+                if change == "fragment": files["/etc/systemd/system/" + name].write_text("[Service]\nExecStart=/bin/true\n")
+                if change in ("command-dropin", "guard-only", "unknown-dropin"):
+                    filename = "override.conf" if change == "unknown-dropin" else "10-ip-options-guard.conf"
+                    canonical = "/etc/systemd/system/" + name + ".d/" + filename
+                    dropin = Path(temporary) / (name + ".conf")
+                    dropin.write_text("[Service]\nExecStartPre=/usr/sbin/nft delete table inet cve_2026_98432\n" if change == "command-dropin" else "[Unit]\nRequires=" + GUARD + "\nAfter=" + GUARD + "\n")
+                    files[canonical] = dropin
+                    dropins[name] = canonical
             loaded = ({"fcvm-fleet-agent.service", "fcvm-fleet-store.service"} if family == "host" else
                       {"fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service"} if family == "tile" else
                       {"fcvm-fleet-agent.service"})
@@ -233,16 +257,19 @@ else: sys.exit(91)
                 if args[:2] == ["systemctl", "show"] and "--property=LoadState" in args:
                     return "loaded\n" if args[2] in loaded else "not-found\n"
                 if args[:2] == ["systemctl", "show"]:
-                    return "\n".join(key + "=" + ("unrelated.service" if key == missing else GUARD)
-                                     for key in ("Requires", "After"))
+                    name = args[2]
+                    settings = {key: "unrelated.service" if key == missing else GUARD for key in ("Requires", "After")}
+                    settings.update({"FragmentPath": "/etc/systemd/system/" + name,
+                                     "DropInPaths": dropins.get(name, ""), "NeedDaemonReload": "yes" if consumer_change == (name, "pending-reload") else "no"})
+                    return "\n".join(key + "=" + value for key, value in settings.items() if "--property=" + key in args)
                 raise AssertionError("unexpected verifier command")
 
             def path(value):
-                self.assertIn(value, ("/usr/local/sbin/cve-2026-98432-mitigation", "/etc/systemd/system/" + GUARD))
-                return helper if value.startswith("/usr/local/sbin/") else unit
+                self.assertTrue(value == "/usr/local/sbin/cve-2026-98432-mitigation" or value in files)
+                return helper if value.startswith("/usr/local/sbin/") else files[value]
 
             namespace = {"ast": ast, "hashlib": hashlib, "json": json, "re": re, "Path": path,
-                         "sys": SimpleNamespace(argv=["-", HELPER_SHA]),
+                         "sys": SimpleNamespace(argv=["-", HELPER_SHA] + [name + "=" + hashlib.sha256(source.read_bytes()).hexdigest() for name, source in consumers.items()]),
                          "subprocess": SimpleNamespace(check_output=output, DEVNULL=-3)}
             exec(compile(tree, "remote-image-guard-proof", "exec"), namespace)
         return calls
@@ -274,6 +301,21 @@ else: sys.exit(91)
         for change in ("noop", "dropin", "fragment", "simple", "ignore-error", "extra-command", "condition", "post-command", "pending-reload"):
             with self.subTest(change=change), self.assertRaises(SystemExit):
                 self.remote_proof(unit_change=change)
+
+    def test_remote_verifier_rejects_consumer_commands_or_untrusted_configuration(self):
+        for family, names in (("host", ("fcvm-fleet-agent.service", "fcvm-fleet-store.service")),
+                              ("tile", ("fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service"))):
+            for name in names:
+                for change in ("command-dropin", "unknown-dropin", "fragment", "pending-reload"):
+                    with self.subTest(unit=name, change=change), self.assertRaises(SystemExit):
+                        self.remote_proof(family=family, consumer_change=(name, change))
+
+    def test_remote_verifier_accepts_only_the_exact_known_guard_dependency_dropin(self):
+        for family, names in (("host", ("fcvm-fleet-agent.service", "fcvm-fleet-store.service")),
+                              ("tile", ("fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service"))):
+            for name in names:
+                with self.subTest(unit=name):
+                    self.assertTrue(self.remote_proof(family=family, consumer_change=(name, "guard-only")))
 
 
 if __name__ == "__main__":
