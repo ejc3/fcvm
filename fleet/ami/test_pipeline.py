@@ -752,7 +752,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(requests, ["credentials", "credentials"])
         self.assertEqual(len(sessions), 2)
 
-    def test_dirty_checkout_fails_and_docs_do_not_change_the_source_tree_fingerprint(self):
+    def test_dirty_checkout_fails_and_all_tracked_source_changes_are_fingerprinted(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             def git(*args):
@@ -771,7 +771,7 @@ class PipelineTests(unittest.TestCase):
             git("commit", "-qam", "docs")
             second = git("rev-parse", "HEAD")
             digest, archive = pipeline.input_digest(root, second)
-            self.assertEqual(digest, original)
+            self.assertNotEqual(digest, original)
             self.assertNotEqual(archive, original_archive)
             (root / "Cargo.toml").write_text("package = 'changed'\n")
             git("commit", "-qam", "input")
