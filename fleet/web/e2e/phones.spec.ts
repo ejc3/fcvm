@@ -195,6 +195,7 @@ test("a phone taken over shows its video, its GPU mirror or both, each with its 
   await expect(page.getByTestId("phone-readout-mirror")).toContainText(/zstd, \d+\.\dx smaller than the commands, decoded in \d+\.\d% of a core/);
   // the mock phone clears to a colour of its frame number: the mirror drew it with WebGL2
   await expect.poll(async () => (await page.evaluate(() => window.__phones!.mirror()))?.pixel?.[2] ?? 0, { timeout: 15_000 }).toBe(200);
+  await expect.poll(async () => (await page.evaluate(() => window.__phones!.mirror()))?.posts ?? 0, { timeout: 15_000 }).toBeGreaterThan(10);
   const st = (await page.evaluate(() => window.__phones!.mirror()))!;
   expect(st.posts).toBeGreaterThan(10);
   expect(st.skipped + st.failed).toBe(0);

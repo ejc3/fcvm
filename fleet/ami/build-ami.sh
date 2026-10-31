@@ -121,9 +121,114 @@ reboot)
   echo "no new boot on $2" >&2; exit 1
   ;;
 image)
+  # Publish only the guard actually installed on this builder, checked against
+  # this recipe's bundled implementation. SSM failure exits before CreateImage.
+  guard_sha=$(sha256sum "$HERE/common/cve-2026-98432-mitigation.py")
+  guard_sha=${guard_sha%% *}
+  [[ "$guard_sha" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid guard digest" >&2; exit 1; }
+  unit_hashes=""
+  for unit_file in "$HERE/host/fcvm-fleet-agent.service" "$HERE/host/fcvm-fleet-store.service" \
+                   "$HERE/tile/fcvm-fleet-renderer.service" "$HERE/tile/fcvm-fleet-nginx.service"; do
+    unit_sha=$(sha256sum "$unit_file"); unit_sha=${unit_sha%% *}
+    [[ "$unit_sha" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid unit digest" >&2; exit 1; }
+    unit_hashes+=" ${unit_file##*/}=$unit_sha"
+  done
+  ssm_sh "$2" "python3 - '$guard_sha' $unit_hashes <<'FLEET_GUARD_PROOF'
+# BEGIN IMAGE GUARD PROOF
+import ast
+import hashlib
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+def need(value, message):
+    if not value:
+        raise SystemExit(message)
+
+def output(arguments):
+    return subprocess.check_output(arguments, text=True, stderr=subprocess.DEVNULL, timeout=60)
+
+def configuration(unit, expected_sha, allow_guard_dropin=False):
+    settings = dict(line.split('=', 1) for line in output(['systemctl', 'show', unit,
+        '--property=ExecStart', '--property=DropInPaths', '--property=FragmentPath',
+        '--property=NeedDaemonReload', '--property=Requires', '--property=After']).splitlines() if '=' in line)
+    canonical = '/etc/systemd/system/' + unit
+    need(settings.get('FragmentPath') == canonical and settings.get('NeedDaemonReload') == 'no',
+         'fleet unit fragment is overridden or stale')
+    fragment = Path(canonical)
+    need(fragment.is_file() and not fragment.is_symlink()
+         and hashlib.sha256(fragment.read_bytes()).hexdigest() == expected_sha, 'fleet unit differs from verified recipe')
+    dropins = settings.get('DropInPaths', '').split()
+    if dropins:
+        name = canonical + '.d/10-ip-options-guard.conf'
+        need(allow_guard_dropin and dropins == [name], 'untrusted fleet unit drop-in')
+        overlay = Path(name)
+        need(overlay.is_file() and not overlay.is_symlink()
+             and overlay.read_bytes() == ('[Unit]\nRequires=' + service + '\nAfter=' + service + '\n').encode(),
+             'fleet unit drop-in changes more than guard dependencies')
+    return settings
+
+guard = Path('/usr/local/sbin/cve-2026-98432-mitigation')
+service = 'cve-2026-98432-mitigation.service'
+sources = dict(value.split('=', 1) for value in sys.argv[2:])
+need(set(sources) == {'fcvm-fleet-agent.service', 'fcvm-fleet-store.service',
+                      'fcvm-fleet-renderer.service', 'fcvm-fleet-nginx.service'}
+     and all(re.fullmatch('[0-9a-f]{64}', value) for value in sources.values()), 'recipe unit digests are missing')
+need(guard.is_file() and not guard.is_symlink(), 'installed guard is missing or unsafe')
+implementation = guard.read_bytes()
+need(hashlib.sha256(implementation).hexdigest() == sys.argv[1], 'installed guard digest differs')
+units = [ast.literal_eval(node.value) for node in ast.parse(implementation).body if isinstance(node, ast.Assign)
+         and any(isinstance(target, ast.Name) and target.id == 'UNIT' for target in node.targets)]
+need(len(units) == 1 and isinstance(units[0], str), 'verified helper has no canonical boot unit')
+proof = json.loads(output([str(guard), '--check']))
+need(proof.get('status') == 'PASS' and all(proof.get(key) is True for key in
+     ('inet_prerouting', 'inet_output', 'bridge_prerouting')), 'runtime guard check failed')
+for family, hooks in (('inet', ('prerouting', 'output')), ('bridge', ('prerouting',))):
+    items = json.loads(output(['nft', '-j', 'list', 'table', family, 'cve_2026_98432']))['nftables']
+    chains = [item['chain'] for item in items if 'chain' in item]
+    rules = [item['rule'] for item in items if 'rule' in item]
+    need(len(chains) == len(rules) == len(hooks), 'unexpected guard chains or rules')
+    protocol = {'meta': {'key': 'l4proto'}} if family == 'inet' else {'payload': {'protocol': 'ip', 'field': 'protocol'}}
+    expected = [{'match': {'op': '==', 'left': protocol, 'right': 'tcp'}},
+                {'match': {'op': '>', 'left': {'payload': {'protocol': 'ip', 'field': 'hdrlength'}}, 'right': 5}},
+                {'drop': None}]
+    for hook in hooks:
+        definition = next((chain for chain in chains if chain.get('name') == hook), {})
+        need(all(definition.get(key) == value for key, value in
+             (('family', family), ('table', 'cve_2026_98432'), ('type', 'filter'),
+              ('hook', hook), ('prio', -310), ('policy', 'accept'))), 'guard hook is ineffective')
+        matching = [rule for rule in rules if rule.get('chain') == hook]
+        need(len(matching) == 1 and matching[0].get('family') == family
+             and matching[0].get('table') == 'cve_2026_98432', 'guard rule is missing or ambiguous')
+        # nft omits redundant family matches: the IPv4 payload itself scopes this
+        # rule to IPv4. Counters may change, but no additional restriction is valid.
+        actual = [entry for entry in matching[0]['expr'] if set(entry) != {'counter'}]
+        need(actual == expected, 'guard packet predicates differ')
+need(output(['systemctl', 'is-enabled', service]).strip() == 'enabled', 'guard boot unit is not enabled')
+settings = configuration(service, hashlib.sha256(units[0].encode()).hexdigest())
+command = r'\{ path=' + re.escape(str(guard)) + r' ; argv\[\]=' + re.escape(str(guard))
+need(re.fullmatch(command + r' --load ; ignore_errors=no ; [^{}]* \}', settings.get('ExecStart', '')),
+     'guard boot command differs')
+selected = ()
+for units in (('fcvm-fleet-agent.service', 'fcvm-fleet-store.service'),
+              ('fcvm-fleet-renderer.service', 'fcvm-fleet-nginx.service')):
+    states = [output(['systemctl', 'show', unit, '--property=LoadState', '--value']).strip() for unit in units]
+    if 'loaded' in states:
+        need(all(state == 'loaded' for state in states) and not selected, 'incomplete or ambiguous fleet services')
+        selected = units
+need(selected, 'no fleet services installed')
+for unit in selected:
+    settings = configuration(unit, sources[unit], allow_guard_dropin=True)
+    need(all(service in settings.get(key, '').split() for key in ('Requires', 'After')),
+         'fleet service lacks mandatory guard ordering')
+print('fleet image guard publication proof passed')
+# END IMAGE GUARD PROOF
+FLEET_GUARD_PROOF"
   ami=$(A ec2 create-image --instance-id "$2" --name "$3" --description "fcvm fleet: $3" \
-    --tag-specifications "ResourceType=image,Tags=[{Key=Name,Value=$3},{Key=Purpose,Value=fcvm-fleet}]" \
-      "ResourceType=snapshot,Tags=[{Key=Name,Value=$3},{Key=Purpose,Value=fcvm-fleet}]" \
+    --tag-specifications "ResourceType=image,Tags=[{Key=Name,Value=$3},{Key=Purpose,Value=fcvm-fleet},{Key=GuardHelperSHA256,Value=$guard_sha}]" \
+      "ResourceType=snapshot,Tags=[{Key=Name,Value=$3},{Key=Purpose,Value=fcvm-fleet},{Key=GuardHelperSHA256,Value=$guard_sha}]" \
     --query ImageId --output text)
   echo "$ami"
   for _ in $(seq 1 120); do

@@ -41,6 +41,7 @@ IMG=localhost/fcvm-renderer:fleet
 # fcvm-fleet-nginx.service and the distribution's nginx.service, ordered after
 # network-online.target, is disabled.
 install_units() {
+  bash "$HERE/../common/install-ip-options.sh"
   install -d /usr/local/lib/fcvm-fleet /etc/fcvm-fleet/tls
   install -d -m 0700 /etc/fcvm-fleet/scene
   install -m 0755 "$HERE/fetch-cert.py" "$HERE/first-frame.sh" "$HERE/resident.py" /usr/local/lib/fcvm-fleet/

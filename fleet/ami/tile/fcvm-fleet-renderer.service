@@ -14,7 +14,8 @@ Description=fcvm fleet tile: the renderer on the instance's one GPU (HTTP on 127
 # fcvm-fleet-tls.service writes; the renderer reads it again whenever it changes, so it may
 # start first and refuses scenes until then.
 DefaultDependencies=no
-After=local-fs.target systemd-tmpfiles-setup.service nvidia-persistenced.service
+Requires=cve-2026-98432-mitigation.service
+After=cve-2026-98432-mitigation.service local-fs.target systemd-tmpfiles-setup.service nvidia-persistenced.service
 Wants=nvidia-persistenced.service
 Conflicts=shutdown.target
 Before=shutdown.target
