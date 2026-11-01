@@ -23,12 +23,13 @@ let pendingBytes = 0;
 /** A viewer that receives faster than it replays drops the stream past this, and joins again. */
 const MAX_PENDING_BYTES = 16 << 20;
 /**
- * Until the join snapshot has been fed (every color buffer's pixels, tens of MB deflated), the
- * bound is this one: the streamer queues the snapshot apart from its live bound too.
+ * While a join snapshot is being fed (its BEGIN decoded, its END not yet: every color buffer's
+ * pixels and the GL state, tens of MB compressed) the bound is this one: the streamer queues
+ * the snapshot apart from its live bound too.
  */
 const MAX_JOIN_PENDING_BYTES = 256 << 20;
-/** The join snapshot has been fed (its END), or the stream has none: the live bound applies. */
-let joinDone = false;
+/** A join snapshot's BEGIN has been fed and its END has not. */
+let joining = false;
 let reader = new RecordReader();
 let zstd: Promise<ZstdStream> | null = null;
 /** zstd messages waiting for the decoder, in order. */
@@ -65,7 +66,7 @@ function fresh(): void {
   tapBytes = 0;
   decodeMs.reset();
   joined = false;
-  joinDone = false;
+  joining = false;
   pixel = null;
   stampAt = null;
   // the canvas is preserved between posts, so its centre can be read after one
@@ -92,7 +93,8 @@ function feed(bytes: Uint8Array): void {
       post({ type: "joined" });
     }
     mirror?.feed(r);
-    if (r.type !== RECORD.hello && (r.type !== RECORD.join || r.aux === JOIN_PART.end)) joinDone = true;
+    if (r.type === RECORD.join) joining = r.aux !== JOIN_PART.end;
+    else if (r.type !== RECORD.hello) joining = false;
     // the phone's ring filled: the copy stopped and the stream has a gap; join again
     if (r.type === RECORD.overflow && ws) {
       retire("the phone's copy of its commands overflowed: join again");
@@ -191,7 +193,7 @@ function open(url: string, admit: string): void {
     if (gen !== generation || !(e.data instanceof ArrayBuffer)) return;
     wire.add(now(), e.data.byteLength);
     const n = e.data.byteLength;
-    if (pendingBytes + n > (joinDone ? MAX_PENDING_BYTES : MAX_JOIN_PENDING_BYTES)) {
+    if (pendingBytes + n > (joining ? MAX_JOIN_PENDING_BYTES : MAX_PENDING_BYTES)) {
       retire("the mirror fell behind in this browser: join again");
       return;
     }

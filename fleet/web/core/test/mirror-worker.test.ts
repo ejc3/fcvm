@@ -5,7 +5,7 @@
 
 import { constants, createZstdCompress, type ZstdCompress } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { encodeCall, encodeRecord, RECORD } from "../mirror/wire.ts";
+import { encodeCall, encodeRecord, JOIN_PART, RECORD } from "../mirror/wire.ts";
 import type { MirrorIn, MirrorOut } from "../../app/_wall/mirror/mirror-msgs.ts";
 
 class FakeSocket {
@@ -180,6 +180,21 @@ describe("the mirror worker", () => {
     for (let i = 0; i < 17; i++) ws.message(m);
     expect(closes()).toEqual([{ type: "closed", code: 4000, reason: "the mirror fell behind in this browser: join again" }]);
     expect(ws.closed).toBe(true);
+    z.close();
+  });
+
+  it("lets a join snapshot past the 16 MiB bound while it is fed, up to its own bound", async () => {
+    const send = await worker();
+    send({ type: "open", url: "wss://phone/mirror", admit: "t" });
+    const ws = FakeSocket.all[0]!;
+    const { z, msg } = streamer();
+    ws.message(await msg(Buffer.concat([opening(), encodeRecord(RECORD.join, 0, new Uint8Array(new Uint32Array([1]).buffer), JOIN_PART.begin)])));
+    await settle();
+    const noise = new Uint8Array(1 << 20).map(() => Math.floor(Math.random() * 256));
+    const m = await msg(noise);
+    for (let i = 0; i < 17; i++) ws.message(m);
+    expect(closes()).toEqual([]);
+    expect(ws.closed).toBe(false);
     z.close();
   });
 
