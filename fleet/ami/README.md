@@ -19,6 +19,12 @@ validation. It does not retry uncertain launches or replace failed builders. An
 independent expiry reaper handles a lost or cancelled job. The compute envelope is
 bounded separately from EBS, snapshot storage and transfer charges.
 
+After a definite phase failure, the factory attempts to save at most the final 1 MiB
+of its log under the exact builder prefix at `diagnostics/<kind>-<phase>.log` in
+private, versioned, encrypted staging storage with seven-day retention. SSM and CI
+receive only archive metadata; cleanup still runs and the original phase error is
+preserved. An unreachable builder or uncertain command delivery may leave no archive.
+
 The factory uses isolated build/test certificates and its own instance profile.
 Production images and warm caches that may contain production TLS material are not
 CI build inputs. A pair publishes only after real GPU frames, a restored phone,

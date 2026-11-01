@@ -31,6 +31,10 @@ def require(value, message):
         raise RuntimeError(message)
 
 
+class BuilderCommandFailed(RuntimeError):
+    """An assigned builder returned a terminal command failure."""
+
+
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
@@ -166,10 +170,12 @@ class Pipeline:
 
         def complete():
             invocation = self.call("command_status", slot, command_id)
-            if invocation["status"] in {"Pending", "InProgress", "Delayed"}:
+            if invocation["status"] in {"Pending", "InProgress", "Delayed", "Cancelling"}:
                 return None
-            require(invocation["status"] == "Success" and invocation.get("response_code") == 0,
-                    "the isolated builder command failed")
+            if invocation.get("response_code") == -1:
+                raise TimeoutError("the isolated builder command delivery is uncertain")
+            if invocation["status"] != "Success" or invocation.get("response_code") != 0:
+                raise BuilderCommandFailed("the isolated builder command failed")
             output = invocation.get("standard_output", "")
             require(len(output.encode()) <= 24000, "builder receipt is too large")
             return {"output": output}
@@ -249,8 +255,22 @@ class Pipeline:
 
     def phase(self, slot, kind, phase):
         path = f"{REMOTE}/fleet/ami/{kind}/build.sh"
-        # Logs remain on the isolated builder. SSM and CI receive only exit status.
-        self.shell(slot, "bash " + shlex.join([path, phase]) + " > /var/log/fleet-image-phase.log 2>&1")
+        # Raw logs stay private. Archive a bounded tail before cleanup deletes the root.
+        try:
+            self.shell(slot, "bash " + shlex.join([path, phase]) + " > /var/log/fleet-image-phase.log 2>&1")
+        except BuilderCommandFailed:
+            try:
+                receipt = self.guest(slot, "export-diagnostics", self.config["bucket"], self.builder_prefixes[slot],
+                                     self.config["asset_region"], kind, phase)
+                require(re.fullmatch(r"[0-9a-f]{64}", receipt.get("sha256", ""))
+                        and type(receipt.get("size")) is int and 0 < receipt["size"] <= 1024 * 1024
+                        and isinstance(receipt.get("version_id"), str) and 0 < len(receipt["version_id"]) <= 1024
+                        and receipt["version_id"] != "null", "invalid private diagnostics receipt")
+                print(json.dumps({"phaseDiagnostics": {"kind": kind, "phase": phase,
+                    **{key: receipt[key] for key in ("sha256", "size", "version_id")}}}), flush=True)
+            except Exception:
+                print(json.dumps({"phaseDiagnostics": {"kind": kind, "phase": phase, "archived": False}}), flush=True)
+            raise
 
     def security_update(self, slot):
         # Only disposable factory instances. Upgrade before the NVIDIA module is

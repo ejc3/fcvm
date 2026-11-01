@@ -2,10 +2,13 @@
 """Offline broker/SSM failure tests. No AWS SDK, credentials or paid instances."""
 import hashlib
 import concurrent.futures
+import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import pwd
 import socket
 import struct
 import subprocess
@@ -198,7 +201,8 @@ class Worker:
             slot = next(name for name, value in self.broker.slots.items() if value["instance_id"] == instance)
             command = arguments["Parameters"]["commands"][0]
             value = None
-            status = "Failed" if self.fail_phase and "/build.sh" in command else "Success"
+            status = "Failed" if self.fail_phase and "/build.sh" in command and \
+                (self.fail_phase is True or self.fail_phase in command) else "Success"
             if pipeline.GUEST in command:
                 import shlex
                 args = shlex.split(command.splitlines()[-1])
@@ -214,6 +218,9 @@ class Worker:
                 elif action == "export-store":
                     names = [*(f"part-{index:02d}.tar.zst" for index in range(16)), "dirs.tar.zst", "parts", "sha256.json"]
                     value = {"objects": {name: {"sha256": "7" * 64, "version_id": "store-" + name, "size": 10} for name in names}}
+                elif action == "export-diagnostics":
+                    value = {"sha256": "8" * 64, "version_id": "diagnostics-v1", "size": 123,
+                        "unexpected_log": "private-log-canary"}
                 elif action == "renderer":
                     value = {"image_id": "sha256:" + "5" * 64 if self.bad_renderer else IMAGE}
                 elif action == "verify":
@@ -435,6 +442,68 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(self.broker.slots["host-build"]["state"], "terminated")
         self.no_manifest()
 
+    def test_build_user_can_open_only_its_private_warm_log_under_the_actual_preamble(self):
+        source = (HERE / "host/build.sh").read_text()
+        preamble, _ = source.split('\ncase "$PHASE" in\n', 1)
+        warm = [line.strip() for line in source.splitlines()
+                if line.strip().startswith('install -o "$U"') and line.endswith('"$L/warm.log"')]
+        self.assertEqual(len(warm), 1)
+        user = pwd.getpwuid(os.getuid()) if os.getuid() != 0 else pwd.getpwnam("nobody")
+        other = pwd.getpwnam("nobody" if user.pw_name != "nobody" else "daemon")
+        # The privileged child touches only its own temporary directory. It runs
+        # the actual preamble and warm-file install, never a recipe phase.
+        fixture = r'''
+import json, os, pathlib, stat, subprocess, sys, tempfile
+value = json.load(sys.stdin)
+uid, gid, other_uid, other_gid = (value[key] for key in ("uid", "gid", "other_uid", "other_gid"))
+assert os.geteuid() == 0 and uid != 0 and other_uid not in (0, uid)
+with tempfile.TemporaryDirectory(prefix="fleet-warm-log-permissions-") as directory:
+    root = pathlib.Path(directory)
+    root.chmod(0o755)
+    state, logs = root / "state", root / "logs"
+    state.mkdir(mode=0o700)
+    environment = state / "env"
+    environment.write_text("ROOT_ONLY=fixture\n")
+    environment.chmod(0o600)
+    preamble = "\n".join(line for line in value["preamble"].splitlines() if not line.lstrip().startswith("#"))
+    assert preamble.count("/var/lib/fleet-ami") == preamble.count("/var/log/fleet-ami") == 1
+    assert preamble.count("U=ubuntu;") == 1
+    preamble = preamble.replace("/var/lib/fleet-ami", str(state)).replace("/var/log/fleet-ami", str(logs))
+    preamble = preamble.replace("U=ubuntu;", "U=" + value["user"] + ";")
+    # The CI identity's primary group need not have the same name as its user.
+    preamble = preamble.replace('-g "$U"', '-g ' + str(gid))
+    warm = value["warm"].replace('-g "$U"', '-g ' + str(gid))
+    script = root / "fixture.sh"
+    script.write_text("umask 077\n" + preamble + "\n" + warm + "\nexit 0\n")
+    result = subprocess.run(["bash", str(script), "build"], env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    warm_path, root_log = logs / "warm.log", logs / "build.log"
+    def child(code, selected_uid=uid, selected_gid=gid):
+        return subprocess.run([sys.executable, "-I", "-c", code], user=selected_uid, group=selected_gid,
+            extra_groups=[], cwd="/", env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=10)
+    # First reproduce the real failure: the recipe's unprivileged user must open
+    # the warm log, rather than only satisfying a mode-string assertion.
+    opened = child("open(" + repr(str(warm_path)) + ", 'ab').write(b'warm fixture\\n')")
+    assert opened.returncode == 0, opened.stderr
+    denied = "import os\nfor path in " + repr([str(root_log), str(environment)]) + ":\n" + \
+        " try: open(path, 'rb')\n except PermissionError: pass\n else: raise AssertionError('root file readable')\n" + \
+        "try: os.listdir(" + repr(str(logs)) + ")\nexcept PermissionError: pass\nelse: raise AssertionError('root logs listable')\n"
+    private = child(denied)
+    assert private.returncode == 0, private.stderr
+    unrelated = child("open(" + repr(str(warm_path)) + ", 'ab')", other_uid, other_gid)
+    assert unrelated.returncode != 0 and "PermissionError" in unrelated.stderr
+    assert stat.S_IMODE(logs.stat().st_mode) == 0o710 and logs.stat().st_uid == 0 and logs.stat().st_gid == gid
+    assert stat.S_IMODE(warm_path.stat().st_mode) == 0o600 and warm_path.stat().st_uid == uid
+    assert stat.S_IMODE(state.stat().st_mode) == 0o700 and stat.S_IMODE(environment.stat().st_mode) == 0o600
+print("warm-log-permissions-pass")
+'''
+        result = subprocess.run(["sudo", "-n", "--", sys.executable, "-I", "-c", fixture],
+            input=json.dumps({"preamble": preamble, "warm": warm[0], "user": user.pw_name,
+                "uid": user.pw_uid, "gid": user.pw_gid, "other_uid": other.pw_uid, "other_gid": other.pw_gid}),
+            cwd="/", env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), "warm-log-permissions-pass")
+
     def test_parallel_validators_serialize_the_single_concurrency_broker(self):
         boundary = threading.Event()
         entered = threading.Event()
@@ -617,6 +686,96 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn("secret", str(error.exception))
         self.assertEqual(sum(call["action"] == "launch" for call in self.broker.calls), 1)
         self.no_manifest()
+
+    def test_failed_phase_archives_metadata_before_cleanup_without_repeating_the_phase(self):
+        self.worker.fail_phase = "host/build.sh build"
+        original = self.driver.guest
+        def guest_call(slot, action, *arguments):
+            if action == "export-diagnostics":
+                self.assertEqual(self.broker.slots[slot]["state"], "running")
+                self.assertEqual(arguments, (CONFIG["bucket"], self.driver.builder_prefixes[slot],
+                    CONFIG["asset_region"], "host", "build"))
+            return original(slot, action, *arguments)
+        output = io.StringIO()
+        with patch.object(self.driver, "guest", side_effect=guest_call), contextlib.redirect_stdout(output):
+            with self.assertRaisesRegex(RuntimeError, "isolated builder command failed"):
+                self.run_driver()
+        commands = [item["Parameters"]["commands"][0] for item in self.worker.commands]
+        self.assertEqual(sum("host/build.sh build" in text for text in commands), 1)
+        self.assertEqual(sum("export-diagnostics" in text for text in commands), 1)
+        row = json.loads(output.getvalue())["phaseDiagnostics"]
+        self.assertEqual(row, {"kind": "host", "phase": "build", "sha256": "8" * 64,
+            "version_id": "diagnostics-v1", "size": 123})
+        self.assertNotIn("private-log-canary", output.getvalue())
+        self.assertTrue(all(value["state"] == "terminated" for value in self.broker.slots.values()))
+        self.no_manifest()
+
+    def test_diagnostics_failure_preserves_the_original_phase_exception(self):
+        error = getattr(pipeline, "BuilderCommandFailed", RuntimeError)("the isolated builder command failed")
+        self.driver.builder_prefixes["host-build"] = "builders/arn:aws:ec2:us-east-1:111111111111:instance/i-" + "a" * 17 + "/"
+        output = io.StringIO()
+        with patch.object(self.driver, "shell", side_effect=error), \
+             patch.object(self.driver, "guest", side_effect=RuntimeError("private-error-canary")) as export, \
+             contextlib.redirect_stdout(output):
+            with self.assertRaises(RuntimeError) as caught:
+                self.driver.phase("host-build", "host", "build")
+        self.assertIs(caught.exception, error)
+        self.assertNotIn("private-error-canary", output.getvalue())
+        self.assertEqual(json.loads(output.getvalue())["phaseDiagnostics"]["archived"], False)
+        self.assertEqual(export.call_count, 1)
+
+    def test_successful_or_uncertain_phase_never_exports_diagnostics(self):
+        for error in (None, TimeoutError("unknown command delivery")):
+            with self.subTest(uncertain=error is not None), patch.object(self.driver, "shell", side_effect=error), \
+                 patch.object(self.driver, "guest") as export:
+                if error:
+                    with self.assertRaises(TimeoutError):
+                        self.driver.phase("host-build", "host", "build")
+                else:
+                    self.driver.phase("host-build", "host", "build")
+                export.assert_not_called()
+
+    def test_actual_ssm_cancellation_statuses_never_resubmit_or_archive_an_uncertain_phase(self):
+        for statuses, succeeds in (([("Cancelling", -1), ("Success", 0)], True),
+                                   ([("Cancelled", -1)], False)):
+            with self.subTest(statuses=statuses):
+                self.setUp()
+                instance = "i-" + "a" * 17
+                self.broker.slots["host-build"] = {"instance_id": instance, "state": "running", "boot": 1}
+                self.driver.instances["host-build"] = instance
+                self.driver.builder_prefixes["host-build"] = "builders/arn:aws:ec2:us-east-1:111111111111:instance/" + instance + "/"
+                self.driver.deadline = 9100
+                pending, polls = list(statuses), []
+                original = self.broker.invoke
+                def invoke(**arguments):
+                    request = json.loads(arguments["Payload"])
+                    response = original(**arguments)
+                    if request["action"] == "command_status":
+                        polls.append(request["command_id"])
+                        value = json.loads(response["Payload"].read())
+                        if pending:
+                            value["status"], value["response_code"] = pending.pop(0)
+                        response["Payload"] = io.BytesIO(json.dumps(value).encode())
+                    return response
+                output, error = io.StringIO(), None
+                with patch.object(self.broker, "invoke", side_effect=invoke), contextlib.redirect_stdout(output):
+                    try:
+                        self.driver.phase("host-build", "host", "build")
+                    except Exception as caught:
+                        error = caught
+                if succeeds:
+                    self.assertIsNone(error)
+                    self.assertEqual(self.now, 110)
+                else:
+                    self.assertIsInstance(error, TimeoutError)
+                    self.assertEqual(self.now, 100)
+                self.assertEqual(len(self.worker.commands), 1)
+                self.assertIn("host/build.sh build", self.worker.commands[0]["Parameters"]["commands"][0])
+                self.assertEqual(len(polls), len(statuses))
+                self.assertEqual(len(set(polls)), 1)
+                self.assertFalse(any(call["action"] == "launch" for call in self.broker.calls))
+                self.assertEqual(self.driver.deadline, 9100)
+                self.assertEqual(output.getvalue(), "")
 
     def test_every_security_or_runtime_failure_prevents_pair_publication(self):
         for proof in ("guard", "frames", "tls_rotation", "sanitized", "phone_clone"):
@@ -875,13 +1034,15 @@ class GuestTests(unittest.TestCase):
                 self.size = len(data)
                 self.checksum = pipeline.base64.b64encode(bytes.fromhex(self.sha)).decode()
                 self.assertions = (arguments["ContentLength"] == self.size,
-                    arguments["ChecksumAlgorithm"] == "SHA256", arguments["ChecksumSHA256"] == self.checksum)
+                    arguments["ChecksumAlgorithm"] == "SHA256", arguments["ChecksumSHA256"] == self.checksum,
+                    arguments["ServerSideEncryption"] == "AES256")
                 return {"VersionId": "immutable-v1"}
 
             def head_object(self, **arguments):
                 assert arguments["VersionId"] == "immutable-v1" and arguments["ChecksumMode"] == "ENABLED"
                 return {"VersionId": "immutable-v1", "Metadata": {"sha256": self.sha},
-                    "ContentLength": self.size, "ChecksumSHA256": "lying-server-checksum" if self.corrupt else self.checksum}
+                    "ContentLength": self.size, "ServerSideEncryption": "AES256",
+                    "ChecksumSHA256": "lying-server-checksum" if self.corrupt else self.checksum}
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "part.tar.zst"
@@ -891,6 +1052,70 @@ class GuestTests(unittest.TestCase):
             self.assertTrue(all(good.assertions))
             with self.assertRaisesRegex(RuntimeError, "server checksum"):
                 guest.upload(S3(True), "bucket", "key", path)
+            original_head = good.head_object
+            def wrong_encryption(**arguments):
+                return {**original_head(**arguments), "ServerSideEncryption": "aws:kms"}
+            with patch.object(good, "head_object", side_effect=wrong_encryption):
+                with self.assertRaisesRegex(RuntimeError, "encryption"):
+                    guest.upload(good, "bucket", "key", path)
+
+    def test_private_diagnostics_export_reads_only_the_fixed_bounded_tail(self):
+        prefix = "builders/arn:aws:ec2:us-east-1:111111111111:instance/i-" + "a" * 17 + "/"
+        class S3:
+            def put_object(self, **arguments):
+                self.arguments = arguments
+                self.data = arguments["Body"].read()
+                self.digest = hashlib.sha256(self.data).hexdigest()
+                self.checksum = pipeline.base64.b64encode(bytes.fromhex(self.digest)).decode()
+                return {"VersionId": "private-diagnostics-v1"}
+            def head_object(self, **arguments):
+                self.head = arguments
+                return {"VersionId": "private-diagnostics-v1", "Metadata": {"sha256": self.digest},
+                    "ContentLength": len(self.data), "ChecksumSHA256": self.checksum, "ServerSideEncryption": "AES256"}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "phase.log"
+            data = b"older-private-log\n" + b"tail-private-canary\n" * 60000
+            path.write_bytes(data)
+            original_fstat = guest.os.fstat
+            def root_file(descriptor):
+                value = original_fstat(descriptor)
+                return SimpleNamespace(st_mode=value.st_mode, st_uid=0, st_size=value.st_size)
+            client, output = S3(), io.StringIO()
+            self.assertEqual(guest.DIAGNOSTIC_LOG, Path("/var/log/fleet-image-phase.log"))
+            with patch.object(guest, "DIAGNOSTIC_LOG", path), patch.object(guest.os, "fstat", side_effect=root_file), \
+                 patch.object(guest, "bucket_client", return_value=client) as selected, contextlib.redirect_stdout(output):
+                receipt = guest.export_diagnostics("example-images", prefix, "us-east-2", "host", "build")
+            selected.assert_called_once_with("example-images", prefix, "us-east-2")
+            self.assertEqual(client.data, data[-1024 * 1024:])
+            self.assertEqual(client.arguments["Key"], prefix + "diagnostics/host-build.log")
+            self.assertEqual(client.arguments["ServerSideEncryption"], "AES256")
+            self.assertEqual(client.arguments["ChecksumSHA256"], client.checksum)
+            self.assertEqual(client.head["VersionId"], "private-diagnostics-v1")
+            self.assertEqual(receipt, {"sha256": client.digest, "size": 1024 * 1024, "version_id": "private-diagnostics-v1"})
+            self.assertEqual(output.getvalue(), "")
+            self.assertFalse(Path(client.arguments["Body"].name).exists())
+
+    def test_diagnostics_rejects_nonregular_symlink_and_untrusted_destinations(self):
+        prefix = "builders/arn:aws:ec2:us-east-1:111111111111:instance/i-" + "a" * 17 + "/"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "other.log"; target.write_text("must never be uploaded")
+            link = root / "phase.log"; link.symlink_to(target)
+            fifo = root / "fifo"; guest.os.mkfifo(fifo)
+            for source in (link, fifo):
+                with self.subTest(source=source.name), patch.object(guest, "DIAGNOSTIC_LOG", source), \
+                     patch.object(guest, "bucket_client"), patch.object(guest, "upload") as upload:
+                    with self.assertRaises((OSError, RuntimeError)):
+                        guest.export_diagnostics("example-images", prefix, "us-east-2", "host", "build")
+                    upload.assert_not_called()
+        with patch.object(guest, "bucket_client") as client:
+            for kind, phase in (("host", "../private"), ("tile", "build"), ("unknown", "prep")):
+                with self.assertRaises(RuntimeError):
+                    guest.export_diagnostics("example-images", prefix, "us-east-2", kind, phase)
+            client.assert_not_called()
+        with patch.dict(sys.modules, {"boto3": SimpleNamespace(client=lambda *args, **kwargs: self.fail("invalid destination reached SDK"))}):
+            with self.assertRaises(RuntimeError):
+                guest.export_diagnostics("example-images", "arbitrary/path/", "us-east-2", "host", "build")
 
     def test_store_requires_manifest_and_exact_seventeen_archives(self):
         with tempfile.TemporaryDirectory() as directory:

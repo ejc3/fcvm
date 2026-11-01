@@ -18,7 +18,10 @@
 set -euo pipefail
 PHASE=$1
 HERE=$(cd "$(dirname "$0")" && pwd)
-S=/var/lib/fleet-ami; L=/var/log/fleet-ami; mkdir -p "$S" "$L"
+U=ubuntu; UH=/home/$U; SRC=$UH/fcvm
+S=/var/lib/fleet-ami; L=/var/log/fleet-ami
+install -d -m 0700 "$S"
+install -d -o root -g "$U" -m 0710 "$L"
 [ -f "$S/env" ] && . "$S/env"
 exec > >(tee -a "$L/$PHASE.log") 2>&1
 # EXIT, not ERR: an ERR trap does not fire for a failure inside a function under set -e.
@@ -28,7 +31,6 @@ rm -f "$S/$PHASE.done" "$S/$PHASE.failed"
 echo "== $PHASE start $(date -u +%FT%TZ)"
 export DEBIAN_FRONTEND=noninteractive
 APT="apt-get -o DPkg::Lock::Timeout=600"
-U=ubuntu; UH=/home/$U; SRC=$UH/fcvm
 # Rootless podman needs the user's systemd instance and runtime directory (lingering, set in prep).
 as_user() {
   local uid; uid=$(id -u "$U")
@@ -121,7 +123,7 @@ build)
   # image into the store and leaves the pre-start snapshot that later starts restore from.
   G0=
   for d in /sys/bus/pci/drivers/vfio-pci/[0-9a-f][0-9a-f][0-9a-f][0-9a-f]:*; do G0=${d##*/}; break; done
-  install -o "$U" -g "$U" -m 0644 /dev/null "$L/warm.log"
+  install -o "$U" -g "$U" -m 0600 /dev/null "$L/warm.log"
   # Snapshots restored from a BASE_AMI's store are keyed by its fcvm and boot arguments, so a
   # revision would carry them unused and grow the archive: start the snapshot cache empty.
   rm -rf /mnt/fcvm-btrfs/snapshots/*
