@@ -76,8 +76,12 @@ class Worker:
                 self.session = boto3.Session(aws_access_key_id=creds["AccessKeyId"],
                     aws_secret_access_key=creds["SecretAccessKey"],
                     aws_session_token=creds["SessionToken"], region_name=self.region)
+            client_options, config_options = {}, {}
+            if name == "s3":
+                client_options["endpoint_url"] = f"https://s3.{region or self.region}.amazonaws.com"
+                config_options = {"signature_version": "s3v4", "s3": {"addressing_style": "virtual"}}
             return self.session.client(name, region_name=region or self.region, config=Config(retries={"total_max_attempts": 1},
-                connect_timeout=10, read_timeout=60))
+                connect_timeout=10, read_timeout=60, **config_options), **client_options)
 
 
 class Pipeline:

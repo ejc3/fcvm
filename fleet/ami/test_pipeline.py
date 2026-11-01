@@ -752,6 +752,32 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(requests, ["credentials", "credentials"])
         self.assertEqual(len(sessions), 2)
 
+    def test_worker_s3_downloads_use_the_requested_regional_sigv4_endpoint(self):
+        prefix = "runs/" + hashlib.sha256(CONFIG["build_id"].encode()).hexdigest() + "/"
+        def issue(action):
+            self.assertEqual(action, "credentials")
+            return {"asset_prefix": prefix, "credentials": {"AccessKeyId": "test", "SecretAccessKey": "test",
+                "SessionToken": "test", "Expiration": 3700}}
+        def client(name, **kwargs):
+            return name, kwargs
+        with patch.dict(sys.modules, {"boto3": SimpleNamespace(Session=lambda **kwargs: SimpleNamespace(client=client)),
+            "botocore.config": SimpleNamespace(Config=lambda **kwargs: kwargs)}):
+            worker = pipeline.Worker(issue, "us-east-1", CONFIG["build_id"], clock=lambda: 100)
+            for region in (None, "us-east-2"):
+                with self.subTest(region=region):
+                    name, options = worker.client("s3", region)
+                    selected = region or "us-east-1"
+                    self.assertEqual(name, "s3")
+                    self.assertEqual(options, {"region_name": selected,
+                        "endpoint_url": f"https://s3.{selected}.amazonaws.com", "config": {
+                            "retries": {"total_max_attempts": 1}, "connect_timeout": 10, "read_timeout": 60,
+                            "signature_version": "s3v4", "s3": {"addressing_style": "virtual"}}})
+            for service in ("ssm", "secretsmanager"):
+                with self.subTest(service=service):
+                    self.assertEqual(worker.client(service, "us-east-2"), (service, {
+                        "region_name": "us-east-2", "config": {"retries": {"total_max_attempts": 1},
+                            "connect_timeout": 10, "read_timeout": 60}}))
+
     def test_dirty_checkout_fails_and_all_tracked_source_changes_are_fingerprinted(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
