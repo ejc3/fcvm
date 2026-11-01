@@ -18,6 +18,7 @@ import secrets
 import signal
 import socket
 import ssl
+import stat
 import struct
 import subprocess
 import sys
@@ -30,6 +31,8 @@ import urllib.request
 AMI = Path(__file__).resolve().parent
 TLS = Path("/run/fcvm-fleet/tls")
 GUARD = "cve-2026-98432-mitigation.service"
+DIAGNOSTIC_LOG = Path("/var/log/fleet-image-phase.log")
+DIAGNOSTIC_LIMIT = 1024 * 1024
 
 
 def need(value, message):
@@ -121,14 +124,33 @@ def upload(client, bucket, key, path):
     # and cannot be compared with the digest of the original file.
     with path.open("rb") as stream:
         response = client.put_object(Bucket=bucket, Key=key, Body=stream, ContentLength=size,
-            Metadata={"sha256": digest}, ChecksumAlgorithm="SHA256", ChecksumSHA256=checksum)
+            Metadata={"sha256": digest}, ServerSideEncryption="AES256", ChecksumAlgorithm="SHA256", ChecksumSHA256=checksum)
     version = response.get("VersionId")
     need(isinstance(version, str) and version not in {"", "null"}, "artifact bucket versioning is not active")
     metadata = client.head_object(Bucket=bucket, Key=key, VersionId=version, ChecksumMode="ENABLED")
     need(metadata.get("Metadata", {}).get("sha256") == digest, "uploaded artifact digest changed")
     need(metadata.get("ChecksumSHA256") == checksum and metadata.get("ContentLength") == size
-         and metadata.get("VersionId") == version, "uploaded artifact server checksum or version differs")
+         and metadata.get("VersionId") == version and metadata.get("ServerSideEncryption") == "AES256",
+         "uploaded artifact server checksum, encryption or version differs")
     return {"sha256": digest, "size": metadata["ContentLength"], "version_id": version}
+
+
+def export_diagnostics(bucket, prefix, region, kind, phase):
+    need(kind in {"host", "tile"} and phase in ({"prep", "build", "bake"} if kind == "host"
+         else {"prep", "image", "trace", "bake"}), "invalid diagnostics phase")
+    client = bucket_client(bucket, prefix, region)
+    descriptor = os.open(DIAGNOSTIC_LOG, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        metadata = os.fstat(descriptor)
+        need(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == 0, "unsafe phase diagnostics file")
+        os.lseek(descriptor, max(0, metadata.st_size - DIAGNOSTIC_LIMIT), os.SEEK_SET)
+        data = os.read(descriptor, DIAGNOSTIC_LIMIT)
+    finally:
+        os.close(descriptor)
+    with tempfile.NamedTemporaryFile(prefix="fleet-phase-diagnostics-", dir="/var/tmp") as archive:
+        archive.write(data)
+        archive.flush()
+        return upload(client, bucket, prefix + f"diagnostics/{kind}-{phase}.log", Path(archive.name))
 
 
 def export_renderer(bucket, prefix, region):
@@ -424,7 +446,7 @@ def verify(kind, expected_image, build_arn, test_arn, region):
 
 def main():
     actions = {"boot": boot, "renderer": renderer, "export-renderer": export_renderer,
-        "export-store": export_store, "tile-tls": tile_tls, "tile-ready": tile_ready,
+        "export-store": export_store, "export-diagnostics": export_diagnostics, "tile-tls": tile_tls, "tile-ready": tile_ready,
         "seal": seal, "verify": verify}
     try:
         need(len(sys.argv) >= 2 and sys.argv[1] in actions, "unknown image operation")

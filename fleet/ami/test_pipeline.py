@@ -2,6 +2,7 @@
 """Offline broker/SSM failure tests. No AWS SDK, credentials or paid instances."""
 import hashlib
 import concurrent.futures
+import contextlib
 import importlib.util
 import io
 import json
@@ -198,7 +199,8 @@ class Worker:
             slot = next(name for name, value in self.broker.slots.items() if value["instance_id"] == instance)
             command = arguments["Parameters"]["commands"][0]
             value = None
-            status = "Failed" if self.fail_phase and "/build.sh" in command else "Success"
+            status = "Failed" if self.fail_phase and "/build.sh" in command and \
+                (self.fail_phase is True or self.fail_phase in command) else "Success"
             if pipeline.GUEST in command:
                 import shlex
                 args = shlex.split(command.splitlines()[-1])
@@ -214,6 +216,9 @@ class Worker:
                 elif action == "export-store":
                     names = [*(f"part-{index:02d}.tar.zst" for index in range(16)), "dirs.tar.zst", "parts", "sha256.json"]
                     value = {"objects": {name: {"sha256": "7" * 64, "version_id": "store-" + name, "size": 10} for name in names}}
+                elif action == "export-diagnostics":
+                    value = {"sha256": "8" * 64, "version_id": "diagnostics-v1", "size": 123,
+                        "unexpected_log": "private-log-canary"}
                 elif action == "renderer":
                     value = {"image_id": "sha256:" + "5" * 64 if self.bad_renderer else IMAGE}
                 elif action == "verify":
@@ -618,6 +623,54 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(sum(call["action"] == "launch" for call in self.broker.calls), 1)
         self.no_manifest()
 
+    def test_failed_phase_archives_metadata_before_cleanup_without_repeating_the_phase(self):
+        self.worker.fail_phase = "host/build.sh build"
+        original = self.driver.guest
+        def guest_call(slot, action, *arguments):
+            if action == "export-diagnostics":
+                self.assertEqual(self.broker.slots[slot]["state"], "running")
+                self.assertEqual(arguments, (CONFIG["bucket"], self.driver.builder_prefixes[slot],
+                    CONFIG["asset_region"], "host", "build"))
+            return original(slot, action, *arguments)
+        output = io.StringIO()
+        with patch.object(self.driver, "guest", side_effect=guest_call), contextlib.redirect_stdout(output):
+            with self.assertRaisesRegex(RuntimeError, "isolated builder command failed"):
+                self.run_driver()
+        commands = [item["Parameters"]["commands"][0] for item in self.worker.commands]
+        self.assertEqual(sum("host/build.sh build" in text for text in commands), 1)
+        self.assertEqual(sum("export-diagnostics" in text for text in commands), 1)
+        row = json.loads(output.getvalue())["phaseDiagnostics"]
+        self.assertEqual(row, {"kind": "host", "phase": "build", "sha256": "8" * 64,
+            "version_id": "diagnostics-v1", "size": 123})
+        self.assertNotIn("private-log-canary", output.getvalue())
+        self.assertTrue(all(value["state"] == "terminated" for value in self.broker.slots.values()))
+        self.no_manifest()
+
+    def test_diagnostics_failure_preserves_the_original_phase_exception(self):
+        error = getattr(pipeline, "BuilderCommandFailed", RuntimeError)("the isolated builder command failed")
+        self.driver.builder_prefixes["host-build"] = "builders/arn:aws:ec2:us-east-1:111111111111:instance/i-" + "a" * 17 + "/"
+        output = io.StringIO()
+        with patch.object(self.driver, "shell", side_effect=error), \
+             patch.object(self.driver, "guest", side_effect=RuntimeError("private-error-canary")) as export, \
+             contextlib.redirect_stdout(output):
+            with self.assertRaises(RuntimeError) as caught:
+                self.driver.phase("host-build", "host", "build")
+        self.assertIs(caught.exception, error)
+        self.assertNotIn("private-error-canary", output.getvalue())
+        self.assertEqual(json.loads(output.getvalue())["phaseDiagnostics"]["archived"], False)
+        self.assertEqual(export.call_count, 1)
+
+    def test_successful_or_uncertain_phase_never_exports_diagnostics(self):
+        for error in (None, TimeoutError("unknown command delivery")):
+            with self.subTest(uncertain=error is not None), patch.object(self.driver, "shell", side_effect=error), \
+                 patch.object(self.driver, "guest") as export:
+                if error:
+                    with self.assertRaises(TimeoutError):
+                        self.driver.phase("host-build", "host", "build")
+                else:
+                    self.driver.phase("host-build", "host", "build")
+                export.assert_not_called()
+
     def test_every_security_or_runtime_failure_prevents_pair_publication(self):
         for proof in ("guard", "frames", "tls_rotation", "sanitized", "phone_clone"):
             with self.subTest(proof=proof):
@@ -875,13 +928,15 @@ class GuestTests(unittest.TestCase):
                 self.size = len(data)
                 self.checksum = pipeline.base64.b64encode(bytes.fromhex(self.sha)).decode()
                 self.assertions = (arguments["ContentLength"] == self.size,
-                    arguments["ChecksumAlgorithm"] == "SHA256", arguments["ChecksumSHA256"] == self.checksum)
+                    arguments["ChecksumAlgorithm"] == "SHA256", arguments["ChecksumSHA256"] == self.checksum,
+                    arguments["ServerSideEncryption"] == "AES256")
                 return {"VersionId": "immutable-v1"}
 
             def head_object(self, **arguments):
                 assert arguments["VersionId"] == "immutable-v1" and arguments["ChecksumMode"] == "ENABLED"
                 return {"VersionId": "immutable-v1", "Metadata": {"sha256": self.sha},
-                    "ContentLength": self.size, "ChecksumSHA256": "lying-server-checksum" if self.corrupt else self.checksum}
+                    "ContentLength": self.size, "ServerSideEncryption": "AES256",
+                    "ChecksumSHA256": "lying-server-checksum" if self.corrupt else self.checksum}
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "part.tar.zst"
@@ -891,6 +946,70 @@ class GuestTests(unittest.TestCase):
             self.assertTrue(all(good.assertions))
             with self.assertRaisesRegex(RuntimeError, "server checksum"):
                 guest.upload(S3(True), "bucket", "key", path)
+            original_head = good.head_object
+            def wrong_encryption(**arguments):
+                return {**original_head(**arguments), "ServerSideEncryption": "aws:kms"}
+            with patch.object(good, "head_object", side_effect=wrong_encryption):
+                with self.assertRaisesRegex(RuntimeError, "encryption"):
+                    guest.upload(good, "bucket", "key", path)
+
+    def test_private_diagnostics_export_reads_only_the_fixed_bounded_tail(self):
+        prefix = "builders/arn:aws:ec2:us-east-1:111111111111:instance/i-" + "a" * 17 + "/"
+        class S3:
+            def put_object(self, **arguments):
+                self.arguments = arguments
+                self.data = arguments["Body"].read()
+                self.digest = hashlib.sha256(self.data).hexdigest()
+                self.checksum = pipeline.base64.b64encode(bytes.fromhex(self.digest)).decode()
+                return {"VersionId": "private-diagnostics-v1"}
+            def head_object(self, **arguments):
+                self.head = arguments
+                return {"VersionId": "private-diagnostics-v1", "Metadata": {"sha256": self.digest},
+                    "ContentLength": len(self.data), "ChecksumSHA256": self.checksum, "ServerSideEncryption": "AES256"}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "phase.log"
+            data = b"older-private-log\n" + b"tail-private-canary\n" * 60000
+            path.write_bytes(data)
+            original_fstat = guest.os.fstat
+            def root_file(descriptor):
+                value = original_fstat(descriptor)
+                return SimpleNamespace(st_mode=value.st_mode, st_uid=0, st_size=value.st_size)
+            client, output = S3(), io.StringIO()
+            self.assertEqual(guest.DIAGNOSTIC_LOG, Path("/var/log/fleet-image-phase.log"))
+            with patch.object(guest, "DIAGNOSTIC_LOG", path), patch.object(guest.os, "fstat", side_effect=root_file), \
+                 patch.object(guest, "bucket_client", return_value=client) as selected, contextlib.redirect_stdout(output):
+                receipt = guest.export_diagnostics("example-images", prefix, "us-east-2", "host", "build")
+            selected.assert_called_once_with("example-images", prefix, "us-east-2")
+            self.assertEqual(client.data, data[-1024 * 1024:])
+            self.assertEqual(client.arguments["Key"], prefix + "diagnostics/host-build.log")
+            self.assertEqual(client.arguments["ServerSideEncryption"], "AES256")
+            self.assertEqual(client.arguments["ChecksumSHA256"], client.checksum)
+            self.assertEqual(client.head["VersionId"], "private-diagnostics-v1")
+            self.assertEqual(receipt, {"sha256": client.digest, "size": 1024 * 1024, "version_id": "private-diagnostics-v1"})
+            self.assertEqual(output.getvalue(), "")
+            self.assertFalse(Path(client.arguments["Body"].name).exists())
+
+    def test_diagnostics_rejects_nonregular_symlink_and_untrusted_destinations(self):
+        prefix = "builders/arn:aws:ec2:us-east-1:111111111111:instance/i-" + "a" * 17 + "/"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "other.log"; target.write_text("must never be uploaded")
+            link = root / "phase.log"; link.symlink_to(target)
+            fifo = root / "fifo"; guest.os.mkfifo(fifo)
+            for source in (link, fifo):
+                with self.subTest(source=source.name), patch.object(guest, "DIAGNOSTIC_LOG", source), \
+                     patch.object(guest, "bucket_client"), patch.object(guest, "upload") as upload:
+                    with self.assertRaises((OSError, RuntimeError)):
+                        guest.export_diagnostics("example-images", prefix, "us-east-2", "host", "build")
+                    upload.assert_not_called()
+        with patch.object(guest, "bucket_client") as client:
+            for kind, phase in (("host", "../private"), ("tile", "build"), ("unknown", "prep")):
+                with self.assertRaises(RuntimeError):
+                    guest.export_diagnostics("example-images", prefix, "us-east-2", kind, phase)
+            client.assert_not_called()
+        with patch.dict(sys.modules, {"boto3": SimpleNamespace(client=lambda *args, **kwargs: self.fail("invalid destination reached SDK"))}):
+            with self.assertRaises(RuntimeError):
+                guest.export_diagnostics("example-images", "arbitrary/path/", "us-east-2", "host", "build")
 
     def test_store_requires_manifest_and_exact_seventeen_archives(self):
         with tempfile.TemporaryDirectory() as directory:
