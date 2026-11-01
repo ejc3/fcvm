@@ -8,15 +8,20 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
 import {
   HIDDEN_PAUSE_MS,
+  mirrorLeadMs,
+  sceneStamp,
+  serverNow,
   SITE,
   streamsSuspended,
   zoomProgressAt,
   phonesView,
   sameViewer,
   type Box,
+  type MirrorPicture,
   type PhoneCard,
   type PhonePanel,
   type PhonesView,
+  type SceneClock,
   type StreamReadout,
   type TakeoverView,
 } from "../../core/index.ts";
@@ -51,16 +56,6 @@ function Verify({ client, view }: { client: WallClient; view: PhonesView }) {
       ) : null}
     </div>
   );
-}
-
-/**
- * How far the mirror's scene time runs ahead of the video's, from Robot Park's stamp in each:
- * both extrapolated to one moment at their 1 s of scene time a second. Null without both.
- */
-function leadOf(m: MirrorStatsMsg | null, videoT: number | null, videoAt: number | null): number | null {
-  if (!m?.stamp || videoT === null || videoAt === null) return null;
-  const t = Math.max(m.stamp.at, videoAt);
-  return (m.stamp.k / 60 + (t - m.stamp.at) / 1000 - (videoT + (t - videoAt) / 1000)) * 1000;
 }
 
 const at = (b: Box): CSSProperties => ({ left: b.x, top: b.y, width: b.w, height: b.h });
@@ -353,6 +348,10 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
   useEffect(() => {
     if (heldSession === null) setTakeover("video");
   }, [heldSession]);
+  // the scene clock, to tell Robot Park's stamp from a screen that only reads as one; a stamp's age
+  // is judged at the mirror's report that carries it
+  const epoch = state.accepted?.scene.epoch_unix_ms ?? null;
+  const sceneClock: SceneClock = { now: mirrorStats?.at ?? localNow(), sceneAt: (local) => (epoch === null ? null : serverNow(state.clock, local) - epoch) };
   const readouts = {
     video:
       held && takeover !== "mirror"
@@ -366,15 +365,17 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
             fps: mirrorStats?.fps ?? 0,
             repliesPerSec: mirrorStats?.repliesPerSec ?? 0,
             note: mirrorNote,
-            leadMs: leadOf(mirrorStats, videoStats?.newestT ?? null, state.frames?.at ?? null),
+            leadMs: mirrorLeadMs(mirrorStats?.stamp ?? null, videoStats?.newestT ?? null, state.frames?.at ?? null, sceneClock),
             codec: mirrorStats ? "zstd" : null,
             ratio: mirrorStats && mirrorStats.wireBytes > 0 ? mirrorStats.tapBytes / mirrorStats.wireBytes : null,
             decodeMsPerSec: mirrorStats?.decodeMsPerSec ?? null,
           } satisfies StreamReadout)
         : null,
   };
-  // with the mirror alone there is no video to say what shape the screen is: the mirror says
-  const mirrorShape = held && takeover === "mirror" && mirrorStats && mirrorStats.width > 0 ? { id: held.id, w: mirrorStats.width, h: mirrorStats.height } : null;
+  const mirrorPicture: MirrorPicture | null =
+    held && takeover !== "video" && mirrorStats && mirrorStats.width > 0
+      ? { id: held.id, w: mirrorStats.width, h: mirrorStats.height, banded: sceneStamp(mirrorStats.stamp, sceneClock) !== null }
+      : null;
 
   const view = useMemo(
     () =>
@@ -390,7 +391,7 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
         canDecode,
         takeover,
         readouts,
-        mirrorShape,
+        mirrorPicture,
         mirrorUnavailable: mirrorGl === "unavailable" ? "This browser has no WebGL2, so it can show the video only." : null,
       }),
     // readouts change with now and the worker's reports
@@ -606,7 +607,7 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
           ) : null,
         )}
       </div>
-      <div ref={mirrorHostRef} className="phone-mirror" data-testid="phone-mirror" style={m ? { position: "fixed", ...at(m.box) } : { display: "none" }} />
+      <div ref={mirrorHostRef} className="phone-mirror" data-testid="phone-mirror" style={m ? ({ position: "fixed", ...at(m.box), "--mirror-h": `${m.canvasHeight}px` } as CSSProperties) : { display: "none" }} />
       {view.panel ? (
         <PanelView panel={view.panel} narrow={narrow} top={sheetTop} client={client} slot={openedSlot} onBack={close} backRef={backRef} onView={setTakeover} onAction={actPhone} />
       ) : null}

@@ -1257,8 +1257,15 @@ drawn opaque) the test fails: 4.1 percent of pixels more than 16 levels off, 17.
 **Freshness.** With both views open the panel reads Robot Park's stamp from the mirror's frame
 and the video's newest frame and shows the mirror's lead. The command stream leaves the phone
 when the app submits a frame, before the T4 draws it, where the video waits for the draw, the
-screen capture (36 ms p50) and the encode (14 ms to the socket). Not measured yet on a
-viewer's machine.
+screen capture (36 ms p50) and the encode (14 ms to the socket). On staging (2026-11-01,
+Chrome on a Mac, 70 to 75 ms from the coordinator) the mirror ran 15 to 43 ms ahead of the
+video in 11 of 12 readings over two take-overs, and 98 ms behind once.
+
+The stamp has no checksum, so the panel takes the mirror's reading as a stamp only when it was
+read in the last second and names a `t` within 5 s of the scene clock, the streamer's own rule
+(`stamp_plausible`): Settings' bottom rows read as a frame number about 1.26 million s off. The
+streamer crops the 8 stamp rows from the video; the mirror draws the whole surface, so while its
+picture carries the stamp its canvas is 8 rows taller than its box and the box clips the band.
 
 ### Invariants (each becomes a test)
 
