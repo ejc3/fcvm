@@ -483,6 +483,67 @@ fn a_side_with_no_live_gpu_still_holds_its_half_as_dark_tiles() {
     assert!(view(&s).layout.generation > generation);
 }
 
+/// A host in phones mode gives its last GPUs to phones, which are not wall tiles. The fcvm
+/// side's configured places do not count them: `--fcvm-tiles 8` on a host with 8 GPUs, 2 of
+/// them phones, gives the side 6 places, all rendering, and no dark place that no GPU will
+/// ever fill.
+#[test]
+fn phone_gpus_take_no_place_on_the_wall() {
+    let config = config_with(serde_json::json!({"ec2_max": 8, "fcvm_tiles": 8}));
+    let mut s = State::new(config, 0);
+    let fcvm = |s: &State| -> Vec<(String, String)> {
+        view(s)
+            .tiles
+            .iter()
+            .filter(|t| t.half == Half::Fcvm)
+            .map(|t| (t.id.clone(), t.phase.clone()))
+            .collect()
+    };
+    s = apply(
+        s,
+        &events(serde_json::json!([{"type": "tick", "at": 500}]))[0],
+    );
+    let before = fcvm(&s);
+    assert_eq!(before.len(), 8, "before the host's hello: {before:?}");
+    assert!(before.iter().all(|(_, p)| p == "waiting_capacity"));
+    let gpu = |i: usize| Gpu {
+        sbdf: format!("0000:{:02x}:00.0", i + 1),
+        name: "Tesla T4".into(),
+    };
+    s = apply(
+        s,
+        &Event::Agent {
+            at: 1000,
+            host: "h1".into(),
+            msg: AgentMsg::Hello {
+                host: "h1".into(),
+                arch: "x86_64".into(),
+                gpus: (0..6).map(gpu).collect(),
+                capacity: 8,
+                store_ready_at: None,
+                boot: Default::default(),
+                phones: (6..8).map(gpu).collect(),
+            },
+        },
+    );
+    for k in 1..=6 {
+        s = apply(
+            s,
+            &running(1000 + k as u64 * 100, "h1", &format!("slot-{k}")),
+        );
+    }
+    assert_eq!(s.fleet.phones.len(), 2);
+    let after = fcvm(&s);
+    assert_eq!(
+        after,
+        (1..=6)
+            .map(|k| (format!("fcvm:{k}"), "running".to_string()))
+            .collect::<Vec<_>>(),
+        "the wall's fcvm side is its 6 wall GPUs"
+    );
+    check_layout(&s);
+}
+
 /// An EC2 tile without an instance holds its place but has no renderer to report a fit, so
 /// it does not hold back the grid budget of the tiles that render.
 #[test]

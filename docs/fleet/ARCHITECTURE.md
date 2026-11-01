@@ -334,7 +334,10 @@ one per live fcvm GPU when there are more) and the EC2 side `--ec2-tiles`; each 
 as its share of the places (8 and 8 give two halves, fcvm 100 and EC2 12 give the fcvm side
 100/112 of the width). A place with no live renderer keeps its rectangle and is drawn dark
 with its phase: an EC2 tile waiting for spot capacity or for its new instance in a race, an
-fcvm place whose host has not connected or was reclaimed. Sizing the sides by the live GPUs
+fcvm place whose host has not connected or was reclaimed. A GPU a connected host runs a
+phone on is not a wall place, so it comes off `--fcvm-tiles`: one host of 8 GPUs with
+`--phones 2` gives the fcvm side six places, not eight with two that no GPU will fill
+(before that host's hello the side still holds eight). Sizing the sides by the live GPUs
 re-tiled the wall in the middle of every race, when the EC2 instances are replaced, so the
 dark tiles the race counts up vanished. A capacity wait is kept out of the EC2 side's race
 time. With no places on either side (asleep) there is no tile. A change of capacity re-tiles without a hitch: the

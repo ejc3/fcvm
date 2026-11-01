@@ -1553,8 +1553,9 @@ fn drop_missing_from_races(f: &mut Fleet, at: u64) {
 ///   its place. fcvm slots beyond `max_tiles` are standby.
 /// - EC2 tiles wanted: `min(ec2_max, max_tiles)`; `ec2-1..ec2-D` exist, higher ones are
 ///   dropped (the driver terminates their instances). Each has a place, instance or not.
-/// - fcvm places: `max(min(fcvm_tiles, max_tiles), fcvm GPUs)`. The GPUs are grouped into
-///   one band per host and the places left over are one dark band below them.
+/// - fcvm places: `max(min(fcvm_tiles, max_tiles) - phone GPUs, fcvm GPUs)`, where phone
+///   GPUs are those connected hosts run phones on. The GPUs are grouped into one band per
+///   host and the places left over are one dark band below them.
 /// - Asleep, neither side has a place.
 fn retile(f: &mut Fleet, c: &Config, at: u64) {
     // Asleep, nothing is placed: the fcvm side's GPUs go to standby (their VMs stop) as the
@@ -1614,12 +1615,16 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
     // Each side is as wide as its share of the configured places, so a tile going dark (a
     // race replacing the EC2 instances, a capacity wait, a host not yet connected or
     // reclaimed) re-tiles nothing. Every EC2 tile has its place, with an instance or not;
-    // the fcvm side has `fcvm_tiles` places, or one per live GPU when there are more.
+    // the fcvm side has `fcvm_tiles` places less the GPUs connected hosts run phones on
+    // (never wall tiles), or one per live GPU when there are more.
     let ec2_places: Vec<u32> = f.ec2.keys().copied().take(c.max_tiles).collect();
     let fcvm_places = if asleep {
         0
     } else {
-        c.fcvm_tiles.min(c.max_tiles).max(active.len())
+        c.fcvm_tiles
+            .min(c.max_tiles)
+            .saturating_sub(f.phones.len())
+            .max(active.len())
     };
     f.n = active.len();
     f.ec2_n = ec2_places.len();

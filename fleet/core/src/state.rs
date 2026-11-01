@@ -19,7 +19,8 @@ pub struct Config {
     /// The most EC2 tiles the coordinator asks for. 0 runs the EC2 half dark.
     pub ec2_max: usize,
     /// Places on the fcvm side: with fewer live fcvm GPUs the rest are dark tiles, with
-    /// more the side has one place per GPU. 0: one place per live fcvm GPU.
+    /// more the side has one place per GPU. 0: one place per live fcvm GPU. GPUs that
+    /// connected hosts run phones on are not wall places and come off this count.
     #[serde(default)]
     pub fcvm_tiles: usize,
     /// Minimum milliseconds between two words from one viewer.

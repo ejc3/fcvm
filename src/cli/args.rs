@@ -195,7 +195,8 @@ pub struct FleetCoordArgs {
     pub max_tiles: usize,
 
     /// Places on the fcvm side (at most --max-tiles): with fewer live fcvm GPUs the rest are
-    /// dark tiles, with more the side has one place per GPU. With --ec2-tiles it sizes the
+    /// dark tiles, with more the side has one place per GPU. GPUs that connected hosts run
+    /// phones on (the agent's --phones) come off this count. With --ec2-tiles it sizes the
     /// two sides.
     #[arg(long, default_value_t = 8)]
     pub fcvm_tiles: usize,
