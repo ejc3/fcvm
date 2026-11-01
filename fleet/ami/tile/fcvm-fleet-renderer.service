@@ -25,6 +25,8 @@ Before=shutdown.target
 # is up; on a boot that prefetches its files podman reached it first ("failed to stat CDI host
 # device", a 2 s restart on every boot measured 2026-10-28). Wait for it, at most 10 s.
 ExecStartPre=/bin/sh -c 'for _ in $(seq 100); do [ -e /dev/nvidia-uvm-tools ] && exit 0; sleep 0.1; done; exit 1'
+# UVM device numbers and persistence-daemon mounts can change across boots.
+ExecStartPre=/usr/bin/nvidia-ctk cdi generate --device-name-strategy=index --disable-hook=apply-cuda-memory-limits --output=/etc/cdi/nvidia.yaml
 ExecStartPre=-/usr/bin/podman --cgroup-manager=cgroupfs rm -f renderer
 ExecStartPre=/usr/bin/install -d -m 0700 /etc/fcvm-fleet/scene
 ExecStart=/usr/bin/podman --cgroup-manager=cgroupfs run --rm --name renderer --network host --device nvidia.com/gpu=all --pids-limit=32768 -e PORT=8080 -v /etc/fcvm-fleet/scene:/run/fleet-scene:ro -e SCENE_TOKEN_FILE=/run/fleet-scene/token localhost/fcvm-renderer:fleet

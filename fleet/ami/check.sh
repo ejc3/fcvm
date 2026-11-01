@@ -37,6 +37,16 @@ jq -e "$ready" <<<'{"ready":true,"frame":12,"gpu":{}}' >/dev/null || no "readine
 image=$(sed -n '/^image)/,/;;/p' fleet/ami/tile/build.sh)
 grep -qF "| jq -e '$ready' >/dev/null || { echo \"renderer not ready after 300 s\"" <<<"$image" ||
   no "tile image phase does not fail when the renderer is not ready after the wait"
+# Exercise the emitted projection: a failed GPU must retain its reason and startup
+# counters in the private phase archive, without dumping unrelated health fields.
+projection=$(sed -n "s/.*| jq -c '\([^']*\)'$/\1/p" <<<"$image")
+failed_health='{"ready":false,"frame":0,"gpu":{},"error":"GPU init failed: cudaSetDevice(0): initialization error","startup_ms":{"gpu_ready":0,"first_frame_drawn":0,"first_frame_sent":0},"unrelated_sentinel":"omit"}'
+diagnostic=$(jq -c "$projection" <<<"$failed_health") &&
+  jq -e '.ready == false and .frame == 0 and .gpu == {} and
+    .error == "GPU init failed: cudaSetDevice(0): initialization error" and
+    .startup_ms == {gpu_ready:0,first_frame_drawn:0,first_frame_sent:0} and
+    keys == ["error","frame","gpu","ready","startup_ms"]' <<<"$diagnostic" >/dev/null ||
+  no "tile image health projection drops the GPU failure diagnostic or includes unrelated fields"
 
 # gpubox passes its lease script to `aws ec2 run-instances --user-data` as the script
 # itself: the CLI base64-encodes user data, so a pre-encoded script reaches cloud-init as

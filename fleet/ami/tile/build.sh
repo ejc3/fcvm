@@ -101,11 +101,12 @@ ExecStopPost=/bin/rm -rf /var/run/nvidia-persistenced
 [Install]
 WantedBy=multi-user.target
 X
-  # One CDI spec, made here, the same on every g4dn.xlarge: devices by index, and without
+  # Seed the current CDI spec: devices by index, and without
   # the apply-cuda-memory-limits hook, which names the builder's GPU by UUID (another
   # instance's GPU then fails cudaSetDevice) and limits nothing on a whole T4. The
-  # toolkit's refresh units, started by udev when the module loads, would regenerate it
-  # during boot (24 s, measured); masked.
+  # UVM device numbers and persistence-daemon mounts can change after reboot; the renderer
+  # regenerates it after its device wait. Mask the toolkit's unordered refresh so that
+  # generation uses these same index and disabled-hook options.
   systemctl mask nvidia-cdi-refresh.path nvidia-cdi-refresh.service
   rm -f /var/run/cdi/nvidia.yaml
   # The spec lists the device nodes present now; /dev/nvidia-modeset can be left from a
@@ -136,7 +137,7 @@ image)
     curl -fsS -m 2 http://127.0.0.1:8080/health 2>/dev/null | jq -e '.ready == true and .frame > 0' >/dev/null 2>&1 && break
     sleep 1
   done
-  curl -fsS -m 2 http://127.0.0.1:8080/health | jq -c '{ready, frame, gpu}'
+  curl -fsS -m 2 http://127.0.0.1:8080/health | jq -c '{ready, frame, gpu, error, startup_ms}'
   # /health answers 200 whatever the renderer's state: the body decides.
   curl -fsS -m 2 http://127.0.0.1:8080/health | jq -e '.ready == true and .frame > 0' >/dev/null || { echo "renderer not ready after 300 s"; exit 1; }
   systemctl stop fcvm-fleet-renderer.service

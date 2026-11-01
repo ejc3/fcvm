@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import shlex
 import socket
 import struct
 import subprocess
@@ -986,6 +987,50 @@ print("warm-log-permissions-pass")
 
 
 class GuestTests(unittest.TestCase):
+    def test_actual_renderer_prestart_refreshes_stale_cdi_on_every_boot(self):
+        unit = (HERE / 'tile/fcvm-fleet-renderer.service').read_text()
+        commands = [line.split('=', 1)[1].lstrip('-') for line in unit.splitlines()
+                    if line.startswith('ExecStartPre=') or line.startswith('ExecStart=')]
+        with tempfile.TemporaryDirectory(prefix='renderer-cdi-') as directory:
+            root = Path(directory)
+            device, current, cdi, events = [root / name for name in ('uvm-tools', 'major', 'cdi.json', 'events')]
+            device.touch()
+            cdi.write_text(json.dumps({'major': 509}))
+            vendor = root / 'vendor'
+            vendor.write_text('#!' + sys.executable + ' -I\n' + r'''
+import json, os, pathlib, sys
+root = pathlib.Path(os.environ['FIXTURE_ROOT'])
+args = sys.argv[1:]
+major = int((root / 'major').read_text())
+if args[0] == 'cdi':
+    assert args == ['cdi', 'generate', '--device-name-strategy=index',
+        '--disable-hook=apply-cuda-memory-limits', '--output=' + str(root / 'cdi.json')]
+    assert (root / 'uvm-tools').exists()
+    (root / 'cdi.json').write_text(json.dumps({'major': major}))
+    with (root / 'events').open('a') as stream: stream.write('generate:' + str(major) + '\n')
+elif 'run' in args:
+    assert '--device' in args and args[args.index('--device') + 1] == 'nvidia.com/gpu=all'
+    if json.loads((root / 'cdi.json').read_text())['major'] != major:
+        sys.exit('stale CDI: baked UVM major differs from current device')
+    with (root / 'events').open('a') as stream: stream.write('run:' + str(major) + '\n')
+else:
+    assert args == ['--cgroup-manager=cgroupfs', 'rm', '-f', 'renderer']
+''')
+            vendor.chmod(0o700)
+            for major in (234, 235):
+                current.write_text(str(major))
+                for command in commands:
+                    actual = command.replace('/dev/nvidia-uvm-tools', str(device)).replace(
+                        '/etc/cdi/nvidia.yaml', str(cdi)).replace('/etc/fcvm-fleet/scene', str(root / 'scene'))
+                    actual = actual.replace('/usr/bin/nvidia-ctk', str(vendor)).replace('/usr/bin/podman', str(vendor))
+                    self.assertNotIn('/dev/nvidia', actual)
+                    self.assertNotIn('/etc/', actual)
+                    result = subprocess.run(shlex.split(actual), env={'PATH': '/usr/bin:/bin', 'FIXTURE_ROOT': str(root)},
+                        capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(json.loads(cdi.read_text())['major'], major)
+            self.assertEqual(events.read_text().splitlines(), ['generate:234', 'run:234', 'generate:235', 'run:235'])
+
     def test_renderer_identity_normalizes_only_documented_sha256_formats(self):
         # Podman 4.9.3's image-inspect .Id is bare hex; .Digest is a different identity.
         digest = "a3" * 32
