@@ -445,7 +445,7 @@ class Pipeline:
     def await_ready(self):
         initial = self.call("status")
         self.deadline = initial["deadline_unix"]
-        require(self.clock() < self.deadline <= self.clock() + 9000,
+        require(self.clock() < self.deadline <= self.clock() + 240 * 60,
                 "broker deadline is not bounded by the CodeBuild lease")
         require(initial.get("build_id") == self.build_id, "broker build identity differs")
         require(initial.get("source_commit") == self.config["source_commit"], "broker source revision differs")

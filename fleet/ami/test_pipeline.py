@@ -854,14 +854,36 @@ print("warm-log-permissions-pass")
         self.assertFalse(self.broker.slots)
 
     def test_source_and_deadline_are_broker_bound_before_any_launch(self):
-        for name, value in (("source", "f" * 40), ("deadline", 9101), ("deadline", 100), ("input_sha", "bad")):
+        for name, value in (("source", "f" * 40), ("deadline", 14501), ("deadline", 100), ("input_sha", "bad")):
             with self.subTest(name=name, value=value):
                 self.setUp()
                 setattr(self.broker, name, value)
                 with self.assertRaises(RuntimeError):
                     self.run_driver()
                 self.assertFalse(any(call["action"] == "launch" for call in self.broker.calls))
+                self.assertFalse(self.worker.regions)
+                self.assertFalse(self.worker.objects)
                 self.no_manifest()
+
+    def test_total_lease_accepts_240_minutes_without_extending_individual_commands(self):
+        for seconds in (150 * 60 + 1, 240 * 60):
+            with self.subTest(seconds=seconds):
+                self.setUp()
+                deadline = self.now + seconds
+                self.broker.deadline = deadline
+                self.broker.ready_after = 1
+                try:
+                    result = self.run_driver()
+                except RuntimeError as error:
+                    self.fail(f"valid {seconds}-second total lease was refused: {error}")
+                self.assertEqual(result["deadline_unix"], deadline)
+                self.assertEqual(self.driver.deadline, deadline)
+                self.assertEqual(set(self.broker.slots), set(pipeline.SLOTS))
+                self.assertTrue(all(value["state"] == "terminated" for value in self.broker.slots.values()))
+                timeouts = [int(command["Parameters"]["executionTimeout"][0]) for command in self.worker.commands]
+                self.assertTrue(timeouts)
+                self.assertEqual(max(timeouts), 9000)
+                self.assertTrue(all(0 < timeout <= 9000 for timeout in timeouts))
 
     def test_unchanged_boot_identity_cannot_count_as_resume_validation(self):
         self.worker.stale_boots = True
