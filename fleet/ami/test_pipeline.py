@@ -986,6 +986,69 @@ print("warm-log-permissions-pass")
 
 
 class GuestTests(unittest.TestCase):
+    def test_renderer_identity_normalizes_only_documented_sha256_formats(self):
+        # Podman 4.9.3's image-inspect .Id is bare hex; .Digest is a different identity.
+        digest = "a3" * 32
+        for value in (digest, "sha256:" + digest):
+            with self.subTest(value=value), patch.object(guest, "command", return_value=value) as inspect:
+                try:
+                    actual = guest.renderer()
+                except RuntimeError as error:
+                    self.fail("documented image ID rejected: " + str(error))
+                self.assertEqual(actual, {"image_id": "sha256:" + digest})
+                inspect.assert_called_once_with(["podman", "image", "inspect", "localhost/fcvm-renderer:fleet",
+                                                 "--format", "{{.Id}}"])
+        for value in ("", digest[:-1], digest + "a", digest.upper(), "g" * 64,
+                      "sha256:sha256:" + digest, "sha512:" + digest, digest + "\n" + digest):
+            with self.subTest(invalid=value), patch.object(guest, "command", return_value=value):
+                with self.assertRaisesRegex(RuntimeError, "renderer image has no digest"):
+                    guest.renderer()
+
+    def test_renderer_export_binds_upload_receipt_to_canonical_image_identity(self):
+        prefix = "builders/arn:aws:ec2:us-east-1:111111111111:instance/i-" + "a" * 17 + "/"
+        data, image = b"private renderer archive fixture", "c4" * 32
+        calls = []
+        class S3:
+            def put_object(self, **arguments):
+                calls.append("put")
+                self.data = arguments["Body"].read()
+                self.arguments = arguments
+                return {"VersionId": "renderer-version-one"}
+
+            def head_object(self, **arguments):
+                calls.append("head")
+                self.head_arguments = arguments
+                digest = hashlib.sha256(self.data).hexdigest()
+                return {"VersionId": "renderer-version-one", "Metadata": {"sha256": digest},
+                        "ContentLength": len(self.data), "ServerSideEncryption": "AES256",
+                        "ChecksumSHA256": pipeline.base64.b64encode(bytes.fromhex(digest)).decode()}
+
+        def inspect(arguments):
+            self.assertEqual(calls, ["put", "head"])
+            calls.append("inspect")
+            self.assertEqual(arguments[-1], "{{.Id}}")
+            return image
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "renderer.oci.tar.zst"
+            path.write_bytes(data)
+            client = S3()
+            with patch.object(guest, "Path", return_value=path), \
+                 patch.object(guest, "bucket_client", return_value=client) as selected, \
+                 patch.object(guest, "command", side_effect=inspect):
+                try:
+                    result = guest.export_renderer("example-images", prefix, "us-east-2")
+                except RuntimeError as error:
+                    self.fail("uploaded renderer identity rejected: " + str(error))
+            selected.assert_called_once_with("example-images", prefix, "us-east-2")
+            self.assertEqual(calls, ["put", "head", "inspect"])
+            self.assertEqual(client.data, data)
+            self.assertEqual(client.arguments["Key"], prefix + "renderer.oci.tar.zst")
+            self.assertEqual(client.head_arguments, {"Bucket": "example-images", "Key": prefix + "renderer.oci.tar.zst",
+                                                   "VersionId": "renderer-version-one", "ChecksumMode": "ENABLED"})
+            self.assertEqual(result, {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
+                                      "version_id": "renderer-version-one", "image_id": "sha256:" + image})
+
     def ordering_commands(self, states, started=20):
         reads = []
         current = [0]
