@@ -369,8 +369,8 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
 ```
 
 - `tiles` lists one tile per configured place, the fcvm side then the EC2 side: `fleet.n`
-  fcvm tiles and `fleet.ec2_n` EC2 tiles. The fcvm side has `--fcvm-tiles` places, or one
-  per live fcvm GPU (GPUs on hosts that are not draining, at most `max_tiles`) when there
+  fcvm tiles and `fleet.ec2_n` EC2 tiles. The fcvm side has `--fcvm-tiles` places less the
+  GPUs connected hosts run phones on (`phones` in their hello), or one per live fcvm GPU (GPUs on hosts that are not draining, at most `max_tiles`) when there
   are more of those; the EC2 side has `--ec2-tiles` places (at most `max_tiles`), one per
   EC2 tile, with an instance or not. Asleep, both sides have none. Each side is as wide as
   its share of the places (`layout.fcvm`, `layout.ec2`: 8 and 8 give each side half the
@@ -571,7 +571,8 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   is no state; a refused read (403, which S3 also answers for a missing object to a caller
   without `s3:ListBucket`) stops the coordinator rather than start it empty.
 - `--fcvm-tiles` (default 8, at most `--max-tiles`) is the fcvm side's places: with fewer
-  live fcvm GPUs the rest are dark tiles, with more the side has one place per GPU. It and
+  live fcvm GPUs the rest are dark tiles, with more the side has one place per GPU. GPUs
+  that connected hosts run phones on come off it. It and
   the EC2 side's `--ec2-tiles` size the two sides (see `tiles` above).
 - `--ec2 aws` runs `--ec2-tiles` EC2 tiles, whatever the fcvm side has. Each is one
   instance from the tile launch template (one-time spot), tagged `Purpose=fcvm-fleet-tile`,
