@@ -6,7 +6,9 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import pwd
 import socket
 import struct
 import subprocess
@@ -439,6 +441,68 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(sum(call["action"] == "launch" for call in self.broker.calls), 1)
         self.assertEqual(self.broker.slots["host-build"]["state"], "terminated")
         self.no_manifest()
+
+    def test_build_user_can_open_only_its_private_warm_log_under_the_actual_preamble(self):
+        source = (HERE / "host/build.sh").read_text()
+        preamble, _ = source.split('\ncase "$PHASE" in\n', 1)
+        warm = [line.strip() for line in source.splitlines()
+                if line.strip().startswith('install -o "$U"') and line.endswith('"$L/warm.log"')]
+        self.assertEqual(len(warm), 1)
+        user = pwd.getpwuid(os.getuid()) if os.getuid() != 0 else pwd.getpwnam("nobody")
+        other = pwd.getpwnam("nobody" if user.pw_name != "nobody" else "daemon")
+        # The privileged child touches only its own temporary directory. It runs
+        # the actual preamble and warm-file install, never a recipe phase.
+        fixture = r'''
+import json, os, pathlib, stat, subprocess, sys, tempfile
+value = json.load(sys.stdin)
+uid, gid, other_uid, other_gid = (value[key] for key in ("uid", "gid", "other_uid", "other_gid"))
+assert os.geteuid() == 0 and uid != 0 and other_uid not in (0, uid)
+with tempfile.TemporaryDirectory(prefix="fleet-warm-log-permissions-") as directory:
+    root = pathlib.Path(directory)
+    root.chmod(0o755)
+    state, logs = root / "state", root / "logs"
+    state.mkdir(mode=0o700)
+    environment = state / "env"
+    environment.write_text("ROOT_ONLY=fixture\n")
+    environment.chmod(0o600)
+    preamble = "\n".join(line for line in value["preamble"].splitlines() if not line.lstrip().startswith("#"))
+    assert preamble.count("/var/lib/fleet-ami") == preamble.count("/var/log/fleet-ami") == 1
+    assert preamble.count("U=ubuntu;") == 1
+    preamble = preamble.replace("/var/lib/fleet-ami", str(state)).replace("/var/log/fleet-ami", str(logs))
+    preamble = preamble.replace("U=ubuntu;", "U=" + value["user"] + ";")
+    # The CI identity's primary group need not have the same name as its user.
+    preamble = preamble.replace('-g "$U"', '-g ' + str(gid))
+    warm = value["warm"].replace('-g "$U"', '-g ' + str(gid))
+    script = root / "fixture.sh"
+    script.write_text("umask 077\n" + preamble + "\n" + warm + "\nexit 0\n")
+    result = subprocess.run(["bash", str(script), "build"], env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    warm_path, root_log = logs / "warm.log", logs / "build.log"
+    def child(code, selected_uid=uid, selected_gid=gid):
+        return subprocess.run([sys.executable, "-I", "-c", code], user=selected_uid, group=selected_gid,
+            extra_groups=[], cwd="/", env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=10)
+    # First reproduce the real failure: the recipe's unprivileged user must open
+    # the warm log, rather than only satisfying a mode-string assertion.
+    opened = child("open(" + repr(str(warm_path)) + ", 'ab').write(b'warm fixture\\n')")
+    assert opened.returncode == 0, opened.stderr
+    denied = "import os\nfor path in " + repr([str(root_log), str(environment)]) + ":\n" + \
+        " try: open(path, 'rb')\n except PermissionError: pass\n else: raise AssertionError('root file readable')\n" + \
+        "try: os.listdir(" + repr(str(logs)) + ")\nexcept PermissionError: pass\nelse: raise AssertionError('root logs listable')\n"
+    private = child(denied)
+    assert private.returncode == 0, private.stderr
+    unrelated = child("open(" + repr(str(warm_path)) + ", 'ab')", other_uid, other_gid)
+    assert unrelated.returncode != 0 and "PermissionError" in unrelated.stderr
+    assert stat.S_IMODE(logs.stat().st_mode) == 0o710 and logs.stat().st_uid == 0 and logs.stat().st_gid == gid
+    assert stat.S_IMODE(warm_path.stat().st_mode) == 0o600 and warm_path.stat().st_uid == uid
+    assert stat.S_IMODE(state.stat().st_mode) == 0o700 and stat.S_IMODE(environment.stat().st_mode) == 0o600
+print("warm-log-permissions-pass")
+'''
+        result = subprocess.run(["sudo", "-n", "--", sys.executable, "-I", "-c", fixture],
+            input=json.dumps({"preamble": preamble, "warm": warm[0], "user": user.pw_name,
+                "uid": user.pw_uid, "gid": user.pw_gid, "other_uid": other.pw_uid, "other_gid": other.pw_gid}),
+            cwd="/", env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), "warm-log-permissions-pass")
 
     def test_parallel_validators_serialize_the_single_concurrency_broker(self):
         boundary = threading.Event()
