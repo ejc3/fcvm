@@ -71,8 +71,9 @@ function fresh(): void {
     const w = gl.drawingBufferWidth;
     const row = new Uint8Array(w * 4);
     gl.readPixels(0, 3, w, 1, gl.RGBA, gl.UNSIGNED_BYTE, row);
+    // the last reading, so a frame with no band (another screen) says so
     const k = stampOf(row, w);
-    if (k !== null) stampAt = { k, at: now() };
+    stampAt = k === null ? null : { k, at: now() };
   };
 }
 

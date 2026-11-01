@@ -9,7 +9,7 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSPro
 import {
   HIDDEN_PAUSE_MS,
   mirrorLeadMs,
-  sceneStamp,
+  mirrorBanded,
   serverNow,
   SITE,
   streamsSuspended,
@@ -374,7 +374,7 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
   };
   const mirrorPicture: MirrorPicture | null =
     held && takeover !== "video" && mirrorStats && mirrorStats.width > 0
-      ? { id: held.id, w: mirrorStats.width, h: mirrorStats.height, banded: sceneStamp(mirrorStats.stamp, sceneClock) !== null }
+      ? { id: held.id, w: mirrorStats.width, h: mirrorStats.height, banded: mirrorBanded(mirrorStats.stamp, sceneClock.sceneAt) }
       : null;
 
   const view = useMemo(

@@ -6,6 +6,7 @@ import {
   ACTION_LABELS,
   BEZEL,
   layoutPhones,
+  mirrorBanded,
   mirrorLeadMs,
   openedArea,
   PANEL_W,
@@ -439,7 +440,14 @@ describe("the GPU mirror's lead over the video", () => {
     expect(mirrorLeadMs({ k: 60_000 + 4 * 60, at: 5_000_000 }, 1000, 5_000_000, clock(5_000_100))).toBeCloseTo(4000, 6);
   });
 
-  it("is not shown from a stamp the mirror read more than a second ago (the band is gone)", () => {
+  it("keeps a picture banded however old its reading: a still or slow mirror still shows that frame", () => {
+    const { sceneAt } = clock(0);
+    expect(mirrorBanded({ k: 60_000, at: 5_000_000 }, sceneAt)).toBe(true);
+    expect(mirrorBanded({ k: 2_001_000_000, at: 5_000_000 }, sceneAt)).toBe(false);
+    expect(mirrorBanded(null, sceneAt)).toBe(false);
+  });
+
+  it("is not shown from a stamp the mirror read more than a second ago", () => {
     expect(mirrorLeadMs({ k: 60_000, at: 5_000_000 }, 1001.5, 5_001_500, clock(5_001_500))).toBeNull();
   });
 });

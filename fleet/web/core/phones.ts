@@ -439,15 +439,24 @@ export interface SceneClock {
 }
 
 /**
- * The mirror's last stamp, when it is one: read in the last second, and naming a scene time
- * within 5 s of the scene clock when it was read. A screen with no band (Settings) can read as
- * a number, and a reading from before the band went away describes a screen no longer shown.
+ * The mirror's last stamp, when it is one: read within `maxAgeMs` (a second, for the lead), and
+ * naming a scene time within 5 s of the scene clock when it was read. A screen with no band
+ * (Settings) can read as a number.
  */
-export function sceneStamp(stamp: MirrorStamp | null, clock: SceneClock): MirrorStamp | null {
-  if (!stamp || clock.now - stamp.at > STAMP_FRESH_MS) return null;
+export function sceneStamp(stamp: MirrorStamp | null, clock: SceneClock, maxAgeMs = STAMP_FRESH_MS): MirrorStamp | null {
+  if (!stamp || clock.now - stamp.at > maxAgeMs) return null;
   const scene = clock.sceneAt(stamp.at);
   if (scene === null) return null;
   return Math.abs((stamp.k * 1000) / STAMP_FPS - scene) <= STAMP_PLAUSIBLE_MS ? stamp : null;
+}
+
+/**
+ * Whether the picture the mirror shows carries the stamp band: its last reading found a stamp
+ * on the scene clock, however long ago (the mirror reads every 15 posts, and a still picture
+ * posts nothing). Unlike the lead, this does not age: the canvas still holds that frame.
+ */
+export function mirrorBanded(stamp: MirrorStamp | null, sceneAt: SceneClock["sceneAt"]): boolean {
+  return stamp !== null && sceneStamp(stamp, { now: stamp.at, sceneAt }, Infinity) !== null;
 }
 
 /**

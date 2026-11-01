@@ -31,7 +31,10 @@ export interface MirrorStatsMsg {
   open: boolean;
   /** The centre pixel of the last frame posted (RGBA), so a test can see what the mirror drew. */
   pixel: number[] | null;
-  /** The last stamp read from a posted frame (Robot Park's frame number k, scene time k/60 s), and when (local ms). */
+  /**
+   * The stamp the last reading of a posted frame found (Robot Park's frame number k, scene time
+   * k/60 s), and when (local ms); null when that frame had none. Read every 15 posts.
+   */
   stamp: { k: number; at: number } | null;
   /** The mirror's picture (the screen it last drew), for the page's layout of a turned phone. */
   width: number;

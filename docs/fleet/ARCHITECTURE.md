@@ -1261,11 +1261,12 @@ screen capture (36 ms p50) and the encode (14 ms to the socket). On staging (202
 Chrome on a Mac, 70 to 75 ms from the coordinator) the mirror ran 15 to 43 ms ahead of the
 video in 11 of 12 readings over two take-overs, and 98 ms behind once.
 
-The stamp has no checksum, so the panel takes the mirror's reading as a stamp only when it was
-read in the last second and names a `t` within 5 s of the scene clock, the streamer's own rule
+The stamp has no checksum, so the page takes the mirror's reading (every 15 posts) as a stamp
+only when it names a `t` within 5 s of the scene clock, the streamer's own rule
 (`stamp_plausible`): Settings' bottom rows read as a frame number about 1.26 million s off. The
-streamer crops the 8 stamp rows from the video; the mirror draws the whole surface, so while its
-picture carries the stamp its canvas is 8 rows taller than its box and the box clips the band.
+lead also needs a reading from the last second. The streamer crops the 8 stamp rows from the
+video; the mirror draws the whole surface, so while its last reading found a stamp its canvas is
+8 rows taller than its box and the box clips the band.
 
 ### Invariants (each becomes a test)
 
