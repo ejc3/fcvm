@@ -13,7 +13,7 @@ or a manual `critical` request, bypasses the batch delay. Critical requests may
 preempt a routine build after its exact builders have been terminated.
 
 GitHub's short-lived role can only request work and read its status. The AWS factory
-owns the build: one job, a 150-minute deadline, at most one GPU host and one tile
+owns the build: one job, a 240-minute deadline, at most one GPU host and one tile
 running together, and four deterministic instance slots across build and fresh-image
 validation. It does not retry uncertain launches or replace failed builders. An
 independent expiry reaper handles a lost or cancelled job. The compute envelope is
