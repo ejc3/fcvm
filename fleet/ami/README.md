@@ -33,6 +33,11 @@ stop/start checks. Both images must use the same renderer. Working artifacts are
 private and temporary; the publisher copies the version-pinned validated store into
 the Fleet's existing asset bucket before activating the pair.
 
+The executor saves the complete validation manifest before requesting final cleanup.
+It can finish while EC2 reports `shutting-down`; the publisher waits for all four
+actual termination receipts before promotion. This metadata wait uses the separate
+publication lease and cannot authorize new compute or commands after 240 minutes.
+
 The coordinator consumes `$Default`, so creating a candidate version cannot deploy
 it. The fixed publisher changes only the four template image fields and their
 defaults under the Terraform backend lock, retaining the previous pair. Terraform
