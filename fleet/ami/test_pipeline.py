@@ -735,6 +735,48 @@ print("warm-log-permissions-pass")
                     self.driver.phase("host-build", "host", "build")
                 export.assert_not_called()
 
+    def test_actual_ssm_cancellation_statuses_never_resubmit_or_archive_an_uncertain_phase(self):
+        for statuses, succeeds in (([("Cancelling", -1), ("Success", 0)], True),
+                                   ([("Cancelled", -1)], False)):
+            with self.subTest(statuses=statuses):
+                self.setUp()
+                instance = "i-" + "a" * 17
+                self.broker.slots["host-build"] = {"instance_id": instance, "state": "running", "boot": 1}
+                self.driver.instances["host-build"] = instance
+                self.driver.builder_prefixes["host-build"] = "builders/arn:aws:ec2:us-east-1:111111111111:instance/" + instance + "/"
+                self.driver.deadline = 9100
+                pending, polls = list(statuses), []
+                original = self.broker.invoke
+                def invoke(**arguments):
+                    request = json.loads(arguments["Payload"])
+                    response = original(**arguments)
+                    if request["action"] == "command_status":
+                        polls.append(request["command_id"])
+                        value = json.loads(response["Payload"].read())
+                        if pending:
+                            value["status"], value["response_code"] = pending.pop(0)
+                        response["Payload"] = io.BytesIO(json.dumps(value).encode())
+                    return response
+                output, error = io.StringIO(), None
+                with patch.object(self.broker, "invoke", side_effect=invoke), contextlib.redirect_stdout(output):
+                    try:
+                        self.driver.phase("host-build", "host", "build")
+                    except Exception as caught:
+                        error = caught
+                if succeeds:
+                    self.assertIsNone(error)
+                    self.assertEqual(self.now, 110)
+                else:
+                    self.assertIsInstance(error, TimeoutError)
+                    self.assertEqual(self.now, 100)
+                self.assertEqual(len(self.worker.commands), 1)
+                self.assertIn("host/build.sh build", self.worker.commands[0]["Parameters"]["commands"][0])
+                self.assertEqual(len(polls), len(statuses))
+                self.assertEqual(len(set(polls)), 1)
+                self.assertFalse(any(call["action"] == "launch" for call in self.broker.calls))
+                self.assertEqual(self.driver.deadline, 9100)
+                self.assertEqual(output.getvalue(), "")
+
     def test_every_security_or_runtime_failure_prevents_pair_publication(self):
         for proof in ("guard", "frames", "tls_rotation", "sanitized", "phone_clone"):
             with self.subTest(proof=proof):

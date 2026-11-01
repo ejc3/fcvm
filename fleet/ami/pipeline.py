@@ -170,8 +170,10 @@ class Pipeline:
 
         def complete():
             invocation = self.call("command_status", slot, command_id)
-            if invocation["status"] in {"Pending", "InProgress", "Delayed"}:
+            if invocation["status"] in {"Pending", "InProgress", "Delayed", "Cancelling"}:
                 return None
+            if invocation.get("response_code") == -1:
+                raise TimeoutError("the isolated builder command delivery is uncertain")
             if invocation["status"] != "Success" or invocation.get("response_code") != 0:
                 raise BuilderCommandFailed("the isolated builder command failed")
             output = invocation.get("standard_output", "")
