@@ -406,8 +406,10 @@ class Pipeline:
         self.guest(slot, "seal", "tile")
         return self.seal(slot)
 
-    def cleanup(self):
+    def cleanup(self, *, wait=True):
         self.call("cleanup")
+        if not wait:
+            return
         def gone():
             values = self.call("status").get("slots", {})
             require(set(values) <= set(SLOTS), "broker returned unknown slots")
@@ -506,17 +508,18 @@ class Pipeline:
                 "images": {kind: {"image_id": image["image_id"], "renderer_sha256": renderer["sha256"],
                     "renderer_image_id": renderer["image_id"], "validation": validation[kind]}
                     for kind, image in (("host", host), ("tile", tile))}}
-            # No result exists until cleanup succeeds. A failed run cannot be promoted.
-            self.cleanup()
+            # Preserve completed validation before EC2's final shutdown transition.
+            # The publisher independently requires every actual termination receipt.
             self.remaining()
             self.worker.client("s3", self.config["asset_region"]).put_object(Bucket=self.config["bucket"],
                 Key=self.prefix + "manifest.json", Body=canonical(manifest), ContentType="application/json", IfNoneMatch="*")
+            self.cleanup(wait=False)
             return manifest
         finally:
             if started:
                 # This also handles the deadline: the broker and its independent reaper
                 # enforce termination if CodeBuild or this process disappears.
-                self.cleanup()
+                self.cleanup(wait=False)
 
 
 def main():
