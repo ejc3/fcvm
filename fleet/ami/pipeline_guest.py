@@ -101,9 +101,9 @@ def cert_hash(cert):
 
 
 def renderer():
-    value = command(["podman", "image", "inspect", "localhost/fcvm-renderer:fleet", "--format", "{{.Id}}"])
-    need(re.fullmatch(r"sha256:[0-9a-f]{64}", value), "renderer image has no digest")
-    return {"image_id": value}
+    value = command(["podman", "image", "inspect", "localhost/fcvm-renderer:fleet", "--format", "{{.Id}}"]).removeprefix("sha256:")
+    need(re.fullmatch(r"[0-9a-f]{64}", value), "renderer image has no digest")
+    return {"image_id": "sha256:" + value}
 
 
 def bucket_client(bucket, prefix, region):
