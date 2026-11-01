@@ -6,6 +6,8 @@ import {
   ACTION_LABELS,
   BEZEL,
   layoutPhones,
+  mirrorBanded,
+  mirrorLeadMs,
   openedArea,
   PANEL_W,
   phoneLabel,
@@ -415,5 +417,65 @@ describe("refusals", () => {
   });
   it("ignores other intents and applied receipts", () => {
     expect(phoneNotice([n("relaunch", "no"), n("phone_action", null, "applied")])).toBeNull();
+  });
+});
+
+describe("the GPU mirror's lead over the video", () => {
+  // The scene clock at a local time: scene t 1000 s at local 5,000,000 ms.
+  const clock = (now: number) => ({ now, sceneAt: (local: number) => 1_000_000 + (local - 5_000_000) });
+
+  it("is the difference of the two stamps' scene times at one moment", () => {
+    // the mirror read k = 60,000 (t = 1000.000 s) at local 5,000,000; the video's newest frame
+    // is t = 999.970 s, received at the same moment
+    expect(mirrorLeadMs({ k: 60_000, at: 5_000_000 }, 999.97, 5_000_000, clock(5_000_100))).toBeCloseTo(30, 6);
+    expect(mirrorLeadMs({ k: 60_000, at: 5_000_000 }, 1000.05, 5_000_000, clock(5_000_100))).toBeCloseTo(-50, 6);
+  });
+
+  it("is not shown for a stamp off the scene clock: a screen with no band can read as a number", () => {
+    // Settings on staging read as k = 2,001,000,000 (t = 33,350,000 s) while the video was at
+    // t = 1000 s, and the panel said "1261669218 ms ahead of the video"
+    expect(mirrorLeadMs({ k: 2_001_000_000, at: 5_000_000 }, 1000, 5_000_000, clock(5_000_100))).toBeNull();
+    // the streamer's rule (logic.cpp, stamp_plausible): within 5 s of the scene clock
+    expect(mirrorLeadMs({ k: 60_000 + 6 * 60, at: 5_000_000 }, 1000, 5_000_000, clock(5_000_100))).toBeNull();
+    expect(mirrorLeadMs({ k: 60_000 + 4 * 60, at: 5_000_000 }, 1000, 5_000_000, clock(5_000_100))).toBeCloseTo(4000, 6);
+  });
+
+  it("keeps a picture banded however old its reading: a still or slow mirror still shows that frame", () => {
+    const { sceneAt } = clock(0);
+    expect(mirrorBanded({ k: 60_000, at: 5_000_000 }, sceneAt)).toBe(true);
+    expect(mirrorBanded({ k: 2_001_000_000, at: 5_000_000 }, sceneAt)).toBe(false);
+    expect(mirrorBanded(null, sceneAt)).toBe(false);
+  });
+
+  it("is not shown from a stamp the mirror read more than a second ago", () => {
+    expect(mirrorLeadMs({ k: 60_000, at: 5_000_000 }, 1001.5, 5_001_500, clock(5_001_500))).toBeNull();
+  });
+});
+
+describe("where the GPU mirror draws", () => {
+  const held = () => {
+    const ph = phonesOf(2);
+    ph.tiles[0] = { ...ph.tiles[0]!, borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-1" } };
+    return stateWith(ph);
+  };
+
+  it("leaves Robot Park's stamp band below its box, as the video does", () => {
+    // The streamer crops the bottom 8 rows (the stamp) from the video; the mirror draws the whole
+    // 720x1280 surface, so its canvas is 1280/1272 of the box tall and the box clips the band.
+    for (const takeover of ["both", "mirror"] as const) {
+      const v = phonesView(input(held(), { openId: "phone:1", takeover, mirrorPicture: { id: "phone:1", w: 720, h: 1280, banded: true } }));
+      const m = v.mirror!;
+      expect(m.canvasHeight, takeover).toBeCloseTo((m.box.h * 1280) / 1272, 6);
+    }
+    // the mirror alone shapes the box: the picture without the band, as the video's
+    const m = phonesView(input(held(), { openId: "phone:1", takeover: "mirror", mirrorPicture: { id: "phone:1", w: 720, h: 1280, banded: true } })).mirror!;
+    expect(m.box.w / m.box.h).toBeCloseTo(720 / 1272, 2);
+  });
+
+  it("draws a screen with no band (Settings, an app's own interface) whole, in its box", () => {
+    const v = phonesView(input(held(), { openId: "phone:1", takeover: "mirror", mirrorPicture: { id: "phone:1", w: 720, h: 1280, banded: false } }));
+    const m = v.mirror!;
+    expect(m.canvasHeight).toBe(m.box.h);
+    expect(m.box.w / m.box.h).toBeCloseTo(720 / 1280, 2);
   });
 });

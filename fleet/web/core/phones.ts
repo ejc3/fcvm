@@ -414,6 +414,70 @@ export interface StreamReadout {
   decodeMsPerSec?: number | null;
 }
 
+/** A stamp the mirror read from a posted frame: Robot Park's frame number k (scene time k/60 s), and when (local Unix ms). */
+export interface MirrorStamp {
+  k: number;
+  at: number;
+}
+
+/**
+ * Robot Park's stamp (PROTOCOL.md, "Phone app", `stamp`): its frame number in the bottom 8 rows
+ * of its surface, at 60 a scene second. The streamer crops those rows from the video
+ * (fleet/phone/streamer/logic.cpp, `crop_bottom`).
+ */
+export const STAMP_ROWS = 8;
+const STAMP_FPS = 60;
+/** The streamer's rule for a stamp, which has no checksum: its t within 5 s of the scene clock (`stamp_plausible`). */
+const STAMP_PLAUSIBLE_MS = 5000;
+/** The mirror reads its stamp every 15 frames it posts (4 a second at 60 fps): an older reading is not the screen it shows. */
+const STAMP_FRESH_MS = 1000;
+
+/** When a stamp's age is judged (local Unix ms: the mirror's report), and the scene time (ms) at a local time, or null before the scene is known. */
+export interface SceneClock {
+  now: number;
+  sceneAt: (localMs: number) => number | null;
+}
+
+/**
+ * The mirror's last stamp, when it is one: read within `maxAgeMs` (a second, for the lead), and
+ * naming a scene time within 5 s of the scene clock when it was read. A screen with no band
+ * (Settings) can read as a number.
+ */
+export function sceneStamp(stamp: MirrorStamp | null, clock: SceneClock, maxAgeMs = STAMP_FRESH_MS): MirrorStamp | null {
+  if (!stamp || clock.now - stamp.at > maxAgeMs) return null;
+  const scene = clock.sceneAt(stamp.at);
+  if (scene === null) return null;
+  return Math.abs((stamp.k * 1000) / STAMP_FPS - scene) <= STAMP_PLAUSIBLE_MS ? stamp : null;
+}
+
+/**
+ * Whether the picture the mirror shows carries the stamp band: its last reading found a stamp
+ * on the scene clock, however long ago (the mirror reads every 15 posts, and a still picture
+ * posts nothing). Unlike the lead, this does not age: the canvas still holds that frame.
+ */
+export function mirrorBanded(stamp: MirrorStamp | null, sceneAt: SceneClock["sceneAt"]): boolean {
+  return stamp !== null && sceneStamp(stamp, { now: stamp.at, sceneAt }, Infinity) !== null;
+}
+
+/**
+ * How far the mirror's scene time runs ahead of the video's, from Robot Park's stamp in each:
+ * both extrapolated to one moment at their 1 s of scene time a second. Null without both.
+ */
+export function mirrorLeadMs(stamp: MirrorStamp | null, videoT: number | null, videoAt: number | null, clock: SceneClock): number | null {
+  const st = sceneStamp(stamp, clock);
+  if (!st || videoT === null || videoAt === null) return null;
+  const t = Math.max(st.at, videoAt);
+  return ((st.k / STAMP_FPS) + (t - st.at) / 1000 - (videoT + (t - videoAt) / 1000)) * 1000;
+}
+
+/** The picture the mirror last drew (its whole surface) and whether it carries the stamp band. */
+export interface MirrorPicture {
+  id: string;
+  w: number;
+  h: number;
+  banded: boolean;
+}
+
 export interface ReadoutRow {
   name: string;
   label: string;
@@ -500,8 +564,11 @@ export interface PhonesInput {
   /** How this viewer sees the phone it holds. */
   takeover?: TakeoverView;
   readouts?: { video: StreamReadout | null; mirror: StreamReadout | null };
-  /** The mirror's picture size, for the phone shown by the mirror alone (a turned phone). */
-  mirrorShape?: { id: string; w: number; h: number } | null;
+  /**
+   * The mirror's picture, while the holder has it in view: it shapes the phone shown by the
+   * mirror alone (a turned phone), and a banded one is drawn with the band below the box.
+   */
+  mirrorPicture?: MirrorPicture | null;
   /** Why this browser cannot show the mirror (no WebGL2), or null. */
   mirrorUnavailable?: string | null;
 }
@@ -514,6 +581,11 @@ export interface MirrorPlacement {
   admit: string | null;
   /** The holder's session, for the app restart that joins the mirror. */
   session: string;
+  /**
+   * The canvas's height in CSS px, from the box's top: taller than the box by the stamp band
+   * when the picture carries one, so the box clips it as the streamer crops it from the video.
+   */
+  canvasHeight: number;
 }
 
 export interface PhonesView {
@@ -594,11 +666,13 @@ export function phonesView(inp: PhonesInput): PhonesView {
     const fs = s.frames?.tiles[`d:${t.id}`];
     if (fs && fs.width > 0 && fs.height > 0 && fs.newestT !== null) aspects[t.id] = Math.round((fs.width / fs.height) * 1000) / 1000;
   }
-  const ms = inp.mirrorShape;
-  if (ms && ms.w > 0 && ms.h > 0) aspects[ms.id] = Math.round((ms.w / ms.h) * 1000) / 1000;
   // The phone this viewer holds, opened with the GPU mirror in view: side by side with its video
   // ("both"), or in the video's place ("mirror").
   const takeover = inp.takeover ?? "video";
+  const mp = inp.mirrorPicture ?? null;
+  const shown = (p: MirrorPicture) => p.h - (p.banded ? STAMP_ROWS : 0);
+  // with the mirror alone there is no video to say what shape the screen is: the mirror says
+  if (takeover === "mirror" && mp && mp.w > 0 && shown(mp) > 0) aspects[mp.id] = Math.round((mp.w / shown(mp)) * 1000) / 1000;
   const heldTile = open === null ? null : (phones.tiles.find((t) => t.id === open && t.borrowed !== null && sameViewer(t.borrowed.viewer ?? null, s.you)) ?? null);
   const mirrorView = heldTile !== null && heldTile.borrowed?.session !== undefined && takeover !== "video" ? takeover : null;
   const opened = open !== null && stage ? openedArea(stage, inp.narrow) : null;
@@ -641,9 +715,11 @@ export function phonesView(inp: PhonesInput): PhonesView {
   const heldBox = heldTile ? placed.get(heldTile.id)?.box : undefined;
   if (mirrorView !== null && heldTile !== null && heldBox && opened !== null) {
     const base = streamUrl(heldTile, s.net.family);
+    const pic = mp && mp.id === heldTile.id && mp.banded && shown(mp) > 0 ? mp : null;
     mirror = {
       tileId: heldTile.id,
       box: split ? { ...heldBox, x: heldBox.x + Math.floor(opened.w / 2) } : heldBox,
+      canvasHeight: pic ? (heldBox.h * pic.h) / shown(pic) : heldBox.h,
       url: base === null ? null : mirrorSocketUrl(base),
       admit: s.admission?.direct?.value ?? null,
       session: heldTile.borrowed!.session!,

@@ -6,7 +6,7 @@
 import { constants, createZstdCompress, type ZstdCompress } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { encodeCall, encodeRecord, RECORD } from "../mirror/wire.ts";
-import type { MirrorIn, MirrorOut } from "../../app/_wall/mirror/mirror-msgs.ts";
+import type { MirrorIn, MirrorOut, MirrorStatsMsg } from "../../app/_wall/mirror/mirror-msgs.ts";
 
 class FakeSocket {
   static all: FakeSocket[] = [];
@@ -36,12 +36,21 @@ class FakeSocket {
 }
 (FakeSocket as unknown as { OPEN: number }).OPEN = 1;
 
+/** What the stand-in's readPixels returns for the stamp row: Robot Park's stamp for k, or a row with none. */
+let stampRow: number | null = null;
+
 function fakeGl(): WebGL2RenderingContext {
   let n = 0;
   return new Proxy(
     {},
     {
       get(_t, prop: string) {
+        if (prop === "readPixels")
+          return (_x: number, y: number, w: number, _h: number, _f: number, _t: number, out: Uint8Array) => {
+            if (y !== 3 || stampRow === null) return;
+            // 32 cells across the row, most significant bit first, white for 1 (stamp.h)
+            for (let x = 0; x < w; x++) out.fill((stampRow >>> (31 - Math.floor((x * 32) / w))) & 1 ? 255 : 0, x * 4, x * 4 + 4);
+          };
         if (prop === "canvas") return { width: 720, height: 1280 };
         if (prop === "drawingBufferWidth") return 720;
         if (prop === "drawingBufferHeight") return 1280;
@@ -192,6 +201,32 @@ describe("the mirror worker", () => {
     await settle();
     expect(closes()).toEqual([{ type: "closed", code: 4000, reason: "the phone's copy of its commands overflowed: join again" }]);
     expect(ws.closed).toBe(true);
+    z.close();
+  });
+
+  it("reports no stamp once a posted frame has no band: the stamp is the last reading, not the last one found", async () => {
+    const send = await worker();
+    send({ type: "open", url: "wss://phone/mirror", admit: "t" });
+    const ws = FakeSocket.all[0]!;
+    const { z, msg } = streamer();
+    const call = (name: string, args: number[]) => encodeRecord(RECORD.data, 1, encodeCall(name, args));
+    const reply = new Uint8Array(new Uint32Array([9]).buffer);
+    // the worker reads the stamp at the 1st post and every 15th after it
+    const posts = (n: number) => Buffer.concat(Array.from({ length: n }, () => call("rcFBPost", [9])));
+    stampRow = 60_000;
+    ws.message(await msg(Buffer.concat([opening(), call("rcCreateColorBuffer", [720, 1280, 0x1908]), encodeRecord(RECORD.reply, 1, reply, 4), posts(1)])));
+    await settle();
+    const last = () => (posted.filter((m) => m.type === "stats") as MirrorStatsMsg[]).at(-1);
+    await vi.waitFor(() => expect(last()?.stamp?.k).toBe(60_000), { timeout: 2000 });
+    // Settings: the next reading finds no stamp
+    stampRow = null;
+    ws.message(await msg(posts(15)));
+    await settle();
+    const after = posted.length;
+    await vi.waitFor(() => expect(posted.length).toBeGreaterThan(after), { timeout: 2000 });
+    expect(last()!.posts).toBe(16);
+    expect(last()!.stamp).toBeNull();
+    stampRow = null;
     z.close();
   });
 
