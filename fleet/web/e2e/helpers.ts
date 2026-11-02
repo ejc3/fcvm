@@ -88,6 +88,19 @@ export interface SeamReport {
 }
 
 /**
+ * A capture of a draw in which nothing was part-way through a fade (`fade@` in `shown`): a
+ * tile that has just appeared is drawn blended with what is under it for the fade-in's
+ * 280 ms, so its pixels are not the picture at T (#1348). Captures again until one is clear.
+ */
+export async function settledCapture(page: Page, points: { x: number; y: number }[]): Promise<CaptureResult> {
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    const res = (await page.evaluate((p) => window.__fleet!.client.capture(p), points)) as CaptureResult;
+    if (!Object.values(res.shown).some((s) => s.startsWith("fade@")) || Date.now() > deadline) return res;
+  }
+}
+
+/**
  * Read back pixels on both sides of every boundary between two drawn tiles, in
  * one draw, and compare them with the pattern at that draw's t.
  */
@@ -132,7 +145,7 @@ export async function seamReport(page: Page): Promise<SeamReport> {
       }
     }
   }
-  const res = (await page.evaluate((p) => window.__fleet!.client.capture(p), pts.map(({ x, y }) => ({ x, y })))) as CaptureResult;
+  const res = await settledCapture(page, pts.map(({ x, y }) => ({ x, y })));
   const f = frameCtx(res.T!, (await mockState()).pattern);
   const uv = (x: number, y: number) => ({ u: (x - v.image.x) / v.image.w, v: (y - v.image.y) / v.image.h });
   // Smooth sample pairs: expected and observed colour on each side.
@@ -226,7 +239,7 @@ export async function focusError(page: Page, tileId: string): Promise<{ err: num
       const onImage = x > v.image.x && x < v.image.x + v.image.w && y > v.image.y && y < v.image.y + v.image.h;
       if (off && onImage) pts.push({ x, y });
     }
-  const res = (await page.evaluate((p) => window.__fleet!.client.capture(p), pts)) as CaptureResult;
+  const res = await settledCapture(page, pts);
   const f = frameCtx(res.T!, (await mockState()).pattern);
   const samples = pts.map((p, k) => {
     const inside = k < inner;

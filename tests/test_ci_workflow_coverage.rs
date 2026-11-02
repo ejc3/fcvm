@@ -367,6 +367,47 @@ fn fleet_web_changes_run_the_fleet_web_job() {
     }
 }
 
+/// A failing browser test leaves its Playwright trace (`trace: "retain-on-failure"` in
+/// fleet/web/playwright.config.ts writes it under `test-results/`), and the job uploads it.
+/// Without the upload the trace dies with the runner: #1348's seam failure on tile ec2:7
+/// recurred on main (run 41359033435) and its trace was gone.
+#[test]
+fn fleet_web_uploads_the_playwright_traces_of_a_failed_run() {
+    let ci = parse_workflow("ci.yml");
+    let steps = workflow_job(&ci, "fleet-web")["steps"]
+        .as_sequence()
+        .expect("`fleet-web` has no steps");
+    let browser = steps
+        .iter()
+        .position(|s| s.get("run").and_then(Value::as_str) == Some("pnpm test:e2e"))
+        .expect("`fleet-web` no longer runs `pnpm test:e2e`");
+    let upload = steps
+        .iter()
+        .position(|s| {
+            s.get("uses")
+                .and_then(Value::as_str)
+                .is_some_and(|u| u.starts_with("actions/upload-artifact@"))
+                && s["with"]["path"]
+                    .as_str()
+                    .is_some_and(|p| p.lines().any(|l| l.trim() == "fleet/web/test-results"))
+        })
+        .expect("`fleet-web` uploads no fleet/web/test-results, so a failed run's trace is lost");
+    assert!(upload > browser, "the upload runs before the browser tests");
+    let cond = steps[upload]["if"].as_str().unwrap_or("");
+    assert!(
+        cond.contains("failure()") || cond.contains("always()"),
+        "the upload runs only on success ({cond:?}): a failed run is the one whose trace matters"
+    );
+    let config = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fleet/web/playwright.config.ts"),
+    )
+    .expect("cannot read fleet/web/playwright.config.ts");
+    assert!(
+        config.contains(r#"trace: "retain-on-failure""#),
+        "playwright.config.ts no longer keeps a failed test's trace"
+    );
+}
+
 #[test]
 fn gating_jobs_live_in_the_pull_request_workflow() {
     let ci = parse_workflow("ci.yml");

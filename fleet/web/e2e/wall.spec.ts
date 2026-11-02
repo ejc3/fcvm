@@ -114,6 +114,32 @@ test("every control stays on screen from just above the phone breakpoint up", as
   }
 });
 
+// #1348: the seam check failed twice on ec2:7, the widest tile and the last to arrive, with
+// every tile reported `sync@T`. A tile that has just appeared is drawn fading in over 280 ms,
+// so its pixels are part black; a capture in that window must say so, or a check reads half a
+// picture as a seam. Captures every draw from the relaunch on, so the first draw with the
+// tile's new frame is always among them.
+test("a capture while a tile fades back in says so, not that it shows the picture at T", async ({ page }) => {
+  await openWall(page, 15);
+  await page.evaluate(() => window.__fleet!.client.send("relaunch", { tile: "fcvm:1" }));
+  const first = await page.evaluate(async () => {
+    const c = window.__fleet!.client;
+    const end = performance.now() + 30_000;
+    let wentDark = false;
+    while (performance.now() < end) {
+      const r = await c.capture([]);
+      const tile = r.shown["fcvm:1"] ?? "";
+      if (tile === "dark") wentDark = true;
+      const src = r.shown["d:fcvm:1"] ?? "";
+      // back: the tile is no longer dark and its stream shows a frame
+      if (wentDark && tile !== "dark" && /(^|@)(sync|behind)@/.test(src)) return { tile, src };
+    }
+    return null;
+  });
+  expect(first, "fcvm:1 went dark and came back within 30 s").not.toBeNull();
+  expect(first!.src.startsWith("fade@") || first!.tile.startsWith("fade@"), JSON.stringify(first)).toBe(true);
+});
+
 test("no seam: pixels on both sides of every boundary match the picture at the drawn t", { tag: "@engines" }, async ({ page }) => {
   await openWall(page, 15);
   const r = await seamReport(page);

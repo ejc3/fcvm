@@ -840,6 +840,9 @@ function draw(): void {
   ctx.imageSmoothingQuality = "high";
   const at = now();
   let missing = 0;
+  // What this draw put on the canvas part-way through a fade: a capture says so, since its
+  // pixels are blended with what is under them, not the picture at T.
+  const fading = new Set<string>();
   for (const src of shown) {
     if (!src.box) continue;
     const st = streamOf(src);
@@ -862,6 +865,7 @@ function draw(): void {
     if (fade < 1) {
       fillEmpty(src.box);
       dirty = true;
+      fading.add(src.id);
     }
     ctx.globalAlpha = fade;
     // Only the inner rectangle shows: the whole frame is drawn scaled so its
@@ -922,6 +926,7 @@ function draw(): void {
       }
       drawDark(t, left);
       dirty = true;
+      fading.add(t.id);
     }
   }
   if (plan.zoom) drawZoomDim(plan.zoom);
@@ -956,6 +961,7 @@ function draw(): void {
     const shownBy: Record<string, string> = {};
     for (const [id, sh] of choice.show) shownBy[id] = sh.kind === "sync" || sh.kind === "behind" ? `${sh.kind}@${sh.t}` : sh.kind;
     for (const t of plan.tiles) if (t.dark) shownBy[t.id] = "dark";
+    for (const id of fading) shownBy[id] = `fade@${shownBy[id] ?? ""}`;
     answerCaptures(choice.T, shownBy);
   }
 

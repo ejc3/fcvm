@@ -51,7 +51,7 @@ test("shows the four phones seamless: one picture, every phone drawn at the comm
     (bs) => window.__phones!.client.capture(bs.map((b) => ({ x: b.x + b.w / 2, y: b.y + b.h / 2 }))),
     boxes,
   );
-  for (let i = 1; i <= PHONES; i++) expect(shot.shown[`d:phone:${i}`], `phone ${i}`).toMatch(/^sync@/);
+  for (let i = 1; i <= PHONES; i++) expect(shot.shown[`d:phone:${i}`], `phone ${i}`).toMatch(/^(fade@)?sync@/);
   expect(shot.pixels.some((px) => px[0] + px[1] + px[2] > 60)).toBe(true);
 });
 
