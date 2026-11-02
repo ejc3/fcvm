@@ -3,12 +3,16 @@
 #include <cmath>
 #include <cstdio>
 
-void Subscriber::push(std::shared_ptr<const std::string> m, Kind kind) {
-  double at = now();
-  std::lock_guard<std::mutex> l(mu);
+void Subscriber::push_locked(std::shared_ptr<const std::string> m, Kind kind, double at) {
   queued += m->size();
   q.push_back({std::move(m), kind, at});
   cv.notify_one();
+}
+
+void Subscriber::push(std::shared_ptr<const std::string> m, Kind kind) {
+  double at = now();
+  std::lock_guard<std::mutex> l(mu);
+  push_locked(std::move(m), kind, at);
 }
 
 void Subscriber::close() {
@@ -18,6 +22,7 @@ void Subscriber::close() {
 }
 
 void Subscriber::restart_header() {
+  std::lock_guard<std::mutex> l(mu);
   cur_h = 0;
   need_key = true;
 }
@@ -40,57 +45,61 @@ std::deque<Subscriber::Item>::iterator Subscriber::oldest_frame_locked() {
   return q.end();
 }
 
-void Subscriber::take_writer_drop() {
-  bool dropped;
-  {
-    std::lock_guard<std::mutex> l(mu);
-    dropped = writer_dropped;
+void Subscriber::offer_header(int ekey, const std::shared_ptr<const std::string>& hdr) {
+  double t = now();
+  std::lock_guard<std::mutex> l(mu);
+  if (writer_dropped) {
+    // the writer dropped the queue (header included): send the header again, and
+    // the next delta frame says DROPPED so the caller asks for a keyframe
     writer_dropped = false;
-  }
-  if (dropped) {
+    cur_h = 0;
     need_key = true;
-    cur_h = 0;  // the dropped queue may have held the current header: send it again
     report_drop = true;
   }
-}
-
-void Subscriber::offer_header(int ekey, const std::shared_ptr<const std::string>& hdr) {
-  take_writer_drop();
   if (cur_h == ekey) return;
-  push(hdr, HEADER);
+  push_locked(hdr, HEADER, t);
   cur_h = ekey;
   need_key = true;
 }
 
 Subscriber::Offer Subscriber::offer_frame(const std::shared_ptr<const std::string>& msg, bool key) {
-  take_writer_drop();
+  // One critical section: a drop by the writer is seen here or happens after the
+  // frame is queued (and then takes it too), never in between.
+  double t = now();
+  std::lock_guard<std::mutex> l(mu);
+  if (writer_dropped) {
+    // dropped since offer_header, so perhaps with the header: nothing goes out until
+    // the next offer_header queues it again
+    writer_dropped = false;
+    cur_h = 0;
+    need_key = true;
+    report_drop = false;
+    return DROPPED;
+  }
   if (report_drop && !key) {
     report_drop = false;
-    return DROPPED;  // the writer dropped the queue: the caller asks for a keyframe
+    return DROPPED;
   }
   report_drop = false;
   if (need_key && !key) return SKIPPED;
-  {
-    double t = now();
-    std::lock_guard<std::mutex> l(mu);
-    auto old = oldest_frame_locked();
-    bool stale = old != q.end() && t - old->at_ms > SUB_MAX_AGE_MS;
-    if (stale || q.size() > SUB_MAX_QUEUED_MSGS || queued > SUB_MAX_QUEUED_BYTES) {
-      drop_locked();
-      need_key = true;
-      cur_h = 0;  // the cleared queue may have held the current header: send it again
-      return DROPPED;
-    }
+  auto old = oldest_frame_locked();
+  bool stale = old != q.end() && t - old->at_ms > SUB_MAX_AGE_MS;
+  if (stale || q.size() > SUB_MAX_QUEUED_MSGS || queued > SUB_MAX_QUEUED_BYTES) {
+    drop_locked();
+    need_key = true;
+    cur_h = 0;  // the cleared queue may have held the current header: send it again
+    return DROPPED;
   }
   need_key = false;
-  push(msg, FRAME);
+  push_locked(msg, FRAME, t);
   return SENT;
 }
 
 std::shared_ptr<const std::string> Subscriber::pop_locked() {
+  double t = now();
   while (!q.empty()) {
     auto old = oldest_frame_locked();
-    if (old != q.end() && now() - old->at_ms > SUB_MAX_AGE_MS) {
+    if (old != q.end() && t - old->at_ms > SUB_MAX_AGE_MS) {
       // A frame this old is not live any more, and neither is what follows it
       // up to the next keyframe: drop to it, and the render thread asks for one.
       drop_locked();

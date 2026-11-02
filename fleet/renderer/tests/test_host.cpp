@@ -1032,6 +1032,35 @@ int main() {
     auto k = s.try_pop();
     CHECK(h && k && *h == "hdr" && *k == "key", "the header goes out again before the keyframe");
   }
+  // --- a writer that drops the queue while a frame is being offered: the frame
+  // is not queued on top of what was dropped (its references are gone), the
+  // offer says DROPPED, and the caller asks for a keyframe (Codex, #1481)
+  {
+    double t = 0;
+    bool writer_now = false;
+    Subscriber s;
+    s.now = [&] {
+      if (writer_now) {  // the writer runs at this moment, inside the offer
+        writer_now = false;
+        s.try_pop();
+      }
+      return t;
+    };
+    auto msg = [](const char* m) { return std::make_shared<const std::string>(m); };
+    s.offer_header(720, msg("hdr"));
+    CHECK(s.offer_frame(msg("key"), true) == Subscriber::SENT, "the keyframe is queued");
+    s.try_pop();
+    s.try_pop();
+    CHECK(s.offer_frame(msg("d1"), false) == Subscriber::SENT, "a delta frame is queued");
+    t = 201;  // the writer stalled past the bound
+    s.offer_header(720, msg("hdr"));
+    writer_now = true;
+    Subscriber::Offer o = s.offer_frame(msg("d2"), false);
+    std::string left;
+    while (auto m = s.try_pop()) left += *m + " ";
+    CHECK(o == Subscriber::DROPPED && left.find("d2") == std::string::npos,
+          "a delta offered while the writer drops the queue is not sent (offer %d, sent: %s)", (int)o, left.c_str());
+  }
   // --- a slow subscriber whose queue is cleared still gets the stream header
   {
     auto msg = [](const char* m) { return std::make_shared<const std::string>(m); };

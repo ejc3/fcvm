@@ -50,7 +50,7 @@ struct Subscriber {
   // writer dropped it since the render thread last looked
   unsigned long long drops = 0;
   bool writer_dropped = false;
-  // render-thread state
+  // render-thread state, under mu (the writer's drops change what it means)
   int cur_h = 0;  // encoder key the header was sent for (0: header pending)
   bool need_key = true;
   bool report_drop = false;  // the writer dropped the queue: the next delta frame says DROPPED
@@ -92,8 +92,7 @@ struct Subscriber {
   void drop_locked();
   // under mu: the first queued frame, or q.end()
   std::deque<Item>::iterator oldest_frame_locked();
-  // render thread: take a drop the writer made
-  void take_writer_drop();
+  void push_locked(std::shared_ptr<const std::string> m, Kind kind, double at);
   std::shared_ptr<const std::string> pop_locked();
 };
 
