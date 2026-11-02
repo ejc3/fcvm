@@ -34,6 +34,8 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      # request.py reads main's CI runs to skip a revision main moved past or one still in CI
+      actions: read
       id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

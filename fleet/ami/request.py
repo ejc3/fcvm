@@ -21,6 +21,10 @@ def need(condition, message):
         raise ValueError(message)
 
 
+class Refused(ValueError):
+    """The factory refused the request and said why (its message is a fixed string)."""
+
+
 def tree_digest(sha, run=subprocess.check_output):
     need(re.fullmatch(r"[0-9a-f]{40}", sha), "Expected an immutable source commit")
     records = run(["git", "ls-tree", "-rz", sha, "--"], timeout=30)
@@ -38,16 +42,40 @@ def priority_for_prs(prs):
     return "normal"
 
 
-def associated_priority(sha, token):
-    # A failed label lookup must not silently delay a critical security fix.
+def github_json(path, token):
     request = urllib.request.Request(
-        "https://api.github.com/repos/ejc3/fcvm/commits/" + sha + "/pulls?per_page=100",
+        "https://api.github.com/repos/ejc3/fcvm/" + path,
         headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
                  "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "fcvm-image-request"})
     with urllib.request.urlopen(request, timeout=20) as response:
         body = response.read(1024 * 1024 + 1)
-        need(len(body) <= 1024 * 1024, "Associated pull requests response is too large")
-    return priority_for_prs(json.loads(body))
+        need(len(body) <= 1024 * 1024, "GitHub response is too large")
+    return json.loads(body)
+
+
+def associated_priority(sha, token, fetch=github_json):
+    # A failed label lookup must not silently delay a critical security fix.
+    return priority_for_prs(fetch("commits/" + sha + "/pulls?per_page=100", token))
+
+
+def not_requestable(sha, token, fetch=github_json):
+    """Why this revision cannot enter the factory now, or None. The factory takes only the
+    current main revision with successful CI. A CI run that completes after the next merge
+    asks for a revision main has moved past, and the weekly schedule can fire while main's
+    newest CI is still running; in both cases the newer revision's own CI completion asks
+    for its image, so this request is not needed."""
+    head = fetch("git/ref/heads/main", token).get("object", {}).get("sha")
+    need(isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head), "Invalid main revision")
+    if head != sha:
+        return "main has moved on to " + head + ", whose CI completion requests its image"
+    runs = fetch("actions/workflows/ci.yml/runs?branch=main&head_sha=" + sha + "&per_page=20", token)
+    runs = runs.get("workflow_runs")
+    need(isinstance(runs, list), "Invalid CI runs")
+    if any(r.get("conclusion") == "success" for r in runs):
+        return None
+    if any(r.get("status") in ("queued", "in_progress", "waiting", "pending", "requested") for r in runs):
+        return "main CI for " + sha + " is still running; its completion requests this image"
+    return None
 
 
 def request_digest(content, priority, run_id, now):
@@ -81,6 +109,10 @@ def invoke(function, payload, run=subprocess.run):
         need(transport.get("StatusCode") == 200 and not transport.get("FunctionError"), "Image request failed")
         need(target.stat().st_size <= 65536, "Image response is too large")
         response = json.loads(target.read_text())
+    if isinstance(response, dict) and response.get("status") == "refused":
+        message = response.get("message")
+        need(isinstance(message, str) and len(message) <= 200, "Invalid image request refusal")
+        raise Refused("The image factory refused the request: " + message)
     need(isinstance(response, dict) and response.get("status") in STATUSES, "Invalid image request status")
     need(response.get("request_id") == payload["input_sha256"], "Image request identity changed")
     need(response.get("input_sha256") == payload["input_sha256"], "Image inputs changed")
@@ -98,6 +130,14 @@ def main():
     args = parser.parse_args()
     need(os.environ.get("GITHUB_REPOSITORY") == "ejc3/fcvm", "Unexpected repository")
     need(re.fullmatch(r"[0-9a-f]{40}", args.sha), "Invalid source commit")
+    skip = not_requestable(args.sha, os.environ["GH_TOKEN"])
+    if skip:
+        print(json.dumps({"requested_source_sha": args.sha, "skipped": skip}, sort_keys=True))
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            with open(summary, "a") as stream:
+                stream.write("Fleet image request skipped: " + skip + ".\n")
+        return
     priority = associated_priority(args.sha, os.environ["GH_TOKEN"]) if args.priority == "auto" else args.priority
     source = tree_digest(args.sha)
     key = request_digest(source, priority, os.environ["GITHUB_RUN_ID"], dt.datetime.now(dt.timezone.utc))
