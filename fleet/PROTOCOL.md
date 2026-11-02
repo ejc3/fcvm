@@ -491,9 +491,9 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
 - A GPU whose reset, scrub or attach fails is quarantined by its agent (Agent: `quarantine`):
   it leaves the tiling and the agent's assignment, `failures` lists it as `gpu_quarantined`,
   and it stays out (also when its agent reconnects or the coordinator restarts with its state
-  file) until an operator releases it with `POST /quarantine/release`, or until its host
-  leaves while the fleet sleeps (scaled away: the instance is gone, and a wake runs on a new
-  one).
+  file) until an operator releases it with `POST /quarantine/release`, or until its instance
+  is gone: a wake's listing of every region's GPU hosts no longer has it and its agent is not
+  connected.
 - `borrow`: at most `cap` wall tiles are lent at once, `lent` are now, and the next comes
   back at `next_return_at`.
 - A tile whose VM did not come back carries `failure` (`kind: "relaunch_failed"`, the

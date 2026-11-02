@@ -828,15 +828,15 @@ fn the_wall_program_does_not_repeat_within_ten_minutes() {
     }
 }
 
-/// A GPU that fails on a host is quarantined for that host's life: a reconnect of the same
-/// host does not assign it again (no retry), and the failure stays listed. When the fleet
-/// sleeps and the coordinator scales the host away, the instance and its GPU are gone; the
-/// next wake runs on a new instance. The entry goes with the host, or every dead GPU any
-/// spot host ever had stays in the state and in every viewer's `failures` for good
-/// (staging, 2026-11-01: a GPU dead from boot on one instance was still listed with the
-/// fleet asleep and no host).
+/// A GPU that fails on a host is quarantined for that host's instance: a reconnect of the
+/// same host does not assign it again (no retry), also after the fleet sleeps, since a
+/// disconnected agent's instance may still run. Once a wake's complete listing of the GPU
+/// hosts no longer has the instance, it is terminated and the entry goes, or every dead GPU
+/// any spot host ever had stays in the state and in every viewer's `failures` for good
+/// (staging, 2026-11-01: a GPU dead from boot was still listed with the fleet asleep and no
+/// host). A listing that missed a region proves nothing.
 #[test]
-fn a_quarantined_gpu_holds_for_its_host_and_goes_with_a_host_scaled_away() {
+fn a_quarantined_gpu_holds_for_its_instance_and_goes_with_it() {
     let config = config_with(serde_json::json!({
         "power_managed": true, "idle_scale_down_secs": 60, "ec2_max": 0, "fcvm_tiles": 2
     }));
@@ -850,6 +850,17 @@ fn a_quarantined_gpu_holds_for_its_host_and_goes_with_a_host_scaled_away() {
             error: "VFIO error: Device does not provide MSIx irq".into(),
             report: Some("r1".into()),
         },
+    };
+    let gone = |at: u64| Event::AgentGone {
+        at,
+        host: "h1".into(),
+    };
+    let listing = |at: u64, ids: &[&str], complete: bool| {
+        events(serde_json::json!([{
+            "type": "scale_instances", "at": at, "complete": complete,
+            "instances": ids.iter().map(|i| serde_json::json!({"id": i, "lifecycle": "InService"})).collect::<Vec<_>>(),
+        }]))
+        .remove(0)
     };
     for e in events(serde_json::json!([
         {"type": "viewer_joined", "at": 1000, "viewer": "v1", "client": "192.0.2.70"},
@@ -872,24 +883,19 @@ fn a_quarantined_gpu_holds_for_its_host_and_goes_with_a_host_scaled_away() {
             .filter(|f| serde_json::to_value(f).unwrap()["kind"] == "gpu_quarantined")
             .count()
     };
-    assert_eq!(gpus(&s), vec!["0000:01:00.0".to_string()]);
+    let only_first = vec!["0000:01:00.0".to_string()];
+    assert_eq!(gpus(&s), only_first);
     assert_eq!(listed(&s), 1);
-    // The same host's agent reconnects while awake: the GPU is still out, not retried.
-    s = apply(
-        s,
-        &Event::AgentGone {
-            at: 3000,
-            host: "h1".into(),
-        },
-    );
+    // The agent reconnects while awake: the GPU stays out, not retried.
+    s = apply(s, &gone(3000));
     s = apply(s, &hello(4000, "h1", 2));
     assert_eq!(
         gpus(&s),
-        vec!["0000:01:00.0".to_string()],
+        only_first,
         "a reconnect retried the quarantined GPU"
     );
-    assert_eq!(listed(&s), 1);
-    // The viewer leaves, the fleet sleeps, the coordinator scales the host away.
+    // The fleet sleeps and the agent disconnects, but the instance may still run: it
+    // reconnects with the GPU still out.
     for e in events(serde_json::json!([
         {"type": "viewer_left", "at": 5000, "viewer": "v1"},
         {"type": "tick", "at": 70_000},
@@ -897,17 +903,37 @@ fn a_quarantined_gpu_holds_for_its_host_and_goes_with_a_host_scaled_away() {
         s = apply(s, &e);
     }
     assert_eq!(s.fleet.power.state, "asleep");
-    s = apply(
-        s,
-        &Event::AgentGone {
-            at: 71_000,
-            host: "h1".into(),
-        },
+    s = apply(s, &gone(71_000));
+    assert_eq!(
+        listed(&s),
+        1,
+        "a disconnect while asleep dropped the quarantine"
     );
+    s = apply(s, &hello(72_000, "h1", 2));
+    assert_eq!(
+        gpus(&s),
+        only_first,
+        "the same instance's reconnect retried the quarantined GPU"
+    );
+    s = apply(s, &gone(73_000));
+    // A listing that missed a region proves nothing; a complete one without h1 does.
+    s = apply(s, &listing(80_000, &["h2"], false));
+    assert_eq!(
+        listed(&s),
+        1,
+        "an incomplete listing dropped the quarantine"
+    );
+    s = apply(s, &listing(81_000, &["h1"], true));
+    assert_eq!(
+        listed(&s),
+        1,
+        "a listing that has the instance dropped its quarantine"
+    );
+    s = apply(s, &listing(82_000, &["h2"], true));
     assert_eq!(
         listed(&s),
         0,
-        "a host scaled away still lists its quarantined GPU"
+        "a terminated instance still lists its quarantined GPU"
     );
     assert!(s.fleet.quarantined.is_empty());
 }

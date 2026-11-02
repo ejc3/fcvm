@@ -225,7 +225,7 @@ pub enum FailureView {
         since: u64,
     },
     /// A GPU out of rotation after a failed reset, scrub or attach, until an operator
-    /// releases it or its host is scaled away.
+    /// releases it or its instance is gone.
     GpuQuarantined {
         host: String,
         sbdf: String,
