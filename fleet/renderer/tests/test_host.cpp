@@ -846,7 +846,7 @@ int main() {
       CHECK(open.q.size() == 1, "an open stream does not get the same encoder's header twice");
       open.restart_header();
       open.offer_header(8, hdr_b);
-      CHECK(open.q.size() == 2 && *open.q.back() == "generation null" && open.need_key,
+      CHECK(open.q.size() == 2 && *open.q.back().m == "generation null" && open.need_key,
             "a restarted stream gets the new header and waits for a keyframe");
     }
     // a word on screen is found behind words scheduled later
@@ -973,13 +973,101 @@ int main() {
     CHECK(starts == 2 && raw == 0, "server.cpp starts its per-connection threads with start_thread (%d) and no other way (%d)",
           starts, raw);
   }
+  // --- #1478: a viewer whose writer stalls for 2 s gets no frame older than
+  // 200 ms afterwards. A live view must not replay seconds-old frames: the
+  // queue is dropped to the next keyframe and the stream resumes live.
+  {
+    double now = 0;  // ms
+    Subscriber s;
+    s.now = [&] { return now; };
+    auto frame = [&](bool key) { return std::make_shared<const std::string>((key ? "K" : "f") + std::to_string((long long)now)); };
+    bool want_idr = true;
+    s.offer_header(720, std::make_shared<const std::string>("hdr"));
+    double worst = 0;
+    int delivered = 0;
+    auto drain = [&] {
+      while (auto m = s.try_pop()) {
+        if ((*m)[0] != 'f' && (*m)[0] != 'K') continue;
+        double age = now - std::stod(m->substr(1));
+        worst = std::max(worst, age);
+        delivered++;
+      }
+    };
+    // 30 fps; the writer stalls from 100 ms to 2100 ms, then keeps up
+    for (int i = 0; now < 3000; i++, now = i * (1000.0 / 30)) {
+      bool key = want_idr || i % 60 == 0;
+      want_idr = false;
+      s.offer_header(720, std::make_shared<const std::string>("hdr"));
+      if (s.offer_frame(frame(key), key) == Subscriber::DROPPED) want_idr = true;
+      if (now < 100 || now >= 2100) drain();
+    }
+    CHECK(delivered > 20, "the stream resumed after the stall (%d frames delivered)", delivered);
+    // the bound the live view needs, independent of the queue's constant
+    const double live_ms = 200;
+    CHECK(worst <= live_ms, "no frame reaches the viewer older than %.0f ms after a 2 s stall (oldest %.0f ms)", live_ms,
+          worst);
+  }
+  // --- the writer drops frames that waited too long even when no new frame is
+  // offered (a still picture): the render thread hears of it at its next offer,
+  // asks for a keyframe, and the header goes out again before it
+  {
+    double now = 0;
+    Subscriber s;
+    s.now = [&] { return now; };
+    auto msg = [](const char* m) { return std::make_shared<const std::string>(m); };
+    s.offer_header(720, msg("hdr"));
+    CHECK(s.offer_frame(msg("key"), true) == Subscriber::SENT, "the first keyframe is queued");
+    s.offer_frame(msg("delta"), false);
+    s.push(msg("pong"));
+    now = 500;
+    auto first = s.try_pop();
+    CHECK(first && *first == "pong", "a control frame is kept, the stale frames and header are not (%s)", first ? first->c_str() : "none");
+    CHECK(!s.try_pop(), "nothing else is left");
+    std::string v = viewers_json({std::shared_ptr<Subscriber>(&s, [](Subscriber*) {})});
+    CHECK(v.find("\"drops\":1") != std::string::npos, "/health counts the drop per viewer (%s)", v.c_str());
+    s.offer_header(720, msg("hdr"));
+    CHECK(s.offer_frame(msg("delta"), false) == Subscriber::DROPPED, "the next delta frame reports the drop, so the caller asks for a keyframe");
+    CHECK(s.offer_frame(msg("key"), true) == Subscriber::SENT, "the keyframe goes out");
+    auto h = s.try_pop();
+    auto k = s.try_pop();
+    CHECK(h && k && *h == "hdr" && *k == "key", "the header goes out again before the keyframe");
+  }
+  // --- a writer that drops the queue while a frame is being offered: the frame
+  // is not queued on top of what was dropped (its references are gone), the
+  // offer says DROPPED, and the caller asks for a keyframe (Codex, #1481)
+  {
+    double t = 0;
+    bool writer_now = false;
+    Subscriber s;
+    s.now = [&] {
+      if (writer_now) {  // the writer runs at this moment, inside the offer
+        writer_now = false;
+        s.try_pop();
+      }
+      return t;
+    };
+    auto msg = [](const char* m) { return std::make_shared<const std::string>(m); };
+    s.offer_header(720, msg("hdr"));
+    CHECK(s.offer_frame(msg("key"), true) == Subscriber::SENT, "the keyframe is queued");
+    s.try_pop();
+    s.try_pop();
+    CHECK(s.offer_frame(msg("d1"), false) == Subscriber::SENT, "a delta frame is queued");
+    t = 201;  // the writer stalled past the bound
+    s.offer_header(720, msg("hdr"));
+    writer_now = true;
+    Subscriber::Offer o = s.offer_frame(msg("d2"), false);
+    std::string left;
+    while (auto m = s.try_pop()) left += *m + " ";
+    CHECK(o == Subscriber::DROPPED && left.find("d2") == std::string::npos,
+          "a delta offered while the writer drops the queue is not sent (offer %d, sent: %s)", (int)o, left.c_str());
+  }
   // --- a slow subscriber whose queue is cleared still gets the stream header
   {
     auto msg = [](const char* m) { return std::make_shared<const std::string>(m); };
     Subscriber s;
     s.offer_header(1080, msg("hdr-1080"));
     CHECK(s.offer_frame(msg("key"), true) == Subscriber::SENT, "the first keyframe goes out");
-    for (int i = 0; i <= SUB_MAX_QUEUED_MSGS; i++) s.push(msg("frame"));  // the reader stalls
+    for (int i = 0; i <= SUB_MAX_QUEUED_MSGS; i++) s.push(msg("frame"), Subscriber::FRAME);  // the reader stalls
     s.offer_header(720, msg("hdr-720"));  // its height changes: a new header is queued
     CHECK(s.offer_frame(msg("key"), true) == Subscriber::DROPPED, "an overflowing queue is dropped");
     // the next frame: the header for the current key, then the recovery keyframe
@@ -987,8 +1075,8 @@ int main() {
     CHECK(s.offer_frame(msg("key"), false) == Subscriber::SKIPPED, "a delta frame waits for the keyframe");
     CHECK(s.offer_frame(msg("key"), true) == Subscriber::SENT, "the recovery keyframe goes out");
     std::string order;
-    for (auto& m : s.q) order += *m + " ";
-    CHECK(s.q.size() == 2 && *s.q[0] == "hdr-720" && *s.q[1] == "key",
+    for (auto& m : s.q) order += *m.m + " ";
+    CHECK(s.q.size() == 2 && *s.q[0].m == "hdr-720" && *s.q[1].m == "key",
           "after a dropped queue the header is sent again before the keyframe (queue: %s)", order.c_str());
   }
   {
