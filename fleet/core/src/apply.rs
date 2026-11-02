@@ -401,6 +401,14 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             f.hosts.remove(host);
             f.slots.retain(|_, s| s.host.as_deref() != Some(host));
             f.phones.retain(|_, s| s.host.as_deref() != Some(host));
+            // A host that leaves while the fleet sleeps was scaled away: its instance, and
+            // with it any GPU quarantined there, is gone, and a wake runs on a new one. A
+            // host that leaves while awake may come back, and its GPUs stay quarantined.
+            if f.power.state == "asleep" {
+                f.quarantined.retain(|_, q| q.host != *host);
+                let mine = format!("{host}/");
+                f.released_reports.retain(|k, _| !k.starts_with(&mine));
+            }
             // A host the coordinator scaled away is not a reclaimed one.
             if f.power.state != "asleep" || f.reclaimed.contains_key(host) {
                 f.reclaimed.entry(host.clone()).or_insert((at, None)).1 = Some(at);
@@ -581,7 +589,7 @@ pub fn is_quarantined(f: &Fleet, s: &Slot) -> bool {
 }
 
 /// Take a GPU out of rotation: its slot leaves the tiling (and any race and claim), and
-/// stays out until an operator releases it.
+/// stays out until an operator releases it or its host leaves while the fleet sleeps.
 fn quarantine(f: &mut Fleet, host: &str, sbdf: &str, error: &str, report: Option<String>, at: u64) {
     let key = gpu_key(host, sbdf);
     if f.quarantined.contains_key(&key) {
