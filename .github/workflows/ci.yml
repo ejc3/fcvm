@@ -187,6 +187,16 @@ jobs:
         run: pnpm build
       - name: Browser tests
         run: pnpm test:e2e
+      # A failed browser test keeps its Playwright trace under test-results (trace:
+      # "retain-on-failure"); without this it dies with the runner (#1348).
+      - name: Upload Playwright traces
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: fleet-web-test-results
+          path: fleet/web/test-results
+          if-no-files-found: ignore
+          retention-days: 14
       # The staging deploy ships this Worker; it must serve the page, not only build.
       - name: Build the Worker
         run: pnpm cf:build

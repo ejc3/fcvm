@@ -25,7 +25,10 @@ export interface CaptureResult {
   req: number;
   /** The common t drawn in the captured frame. */
   T: number | null;
-  /** Per tile: what was drawn (sync at T, behind, waiting, dark). */
+  /**
+   * Per source and tile: what was drawn (sync at T, behind, waiting, dark), prefixed `fade@`
+   * while it fades in (its pixels are part blended with what is under them).
+   */
   shown: Record<string, string>;
   /** RGBA at each requested point. */
   pixels: [number, number, number, number][];
