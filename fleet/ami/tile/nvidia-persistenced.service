@@ -1,0 +1,24 @@
+[Unit]
+Description=NVIDIA Persistence Daemon (keeps the GPU initialised between clients)
+DefaultDependencies=no
+After=systemd-modules-load.service systemd-udev-trigger.service
+Before=fcvm-fleet-renderer.service shutdown.target
+Conflicts=shutdown.target
+# Its first start runs right after systemd-modules-load inserts the driver, and nvidia-modprobe
+# failed there on every boot (exit 1, 6 ms in, before the kernel module had initialised), which
+# left the renderer waiting 10 s for /dev/nvidia-uvm-tools. A retry a moment later succeeds.
+StartLimitIntervalSec=30
+StartLimitBurst=20
+
+[Service]
+Type=forking
+# /dev/nvidia-uvm and /dev/nvidia-uvm-tools exist only once something asks for them, and
+# the CDI spec lists them: create them before anything starts a container.
+ExecStartPre=/usr/bin/nvidia-modprobe -u -c=0
+ExecStart=/usr/bin/nvidia-persistenced --user root
+ExecStopPost=/bin/rm -rf /var/run/nvidia-persistenced
+Restart=on-failure
+RestartSec=200ms
+
+[Install]
+WantedBy=multi-user.target
