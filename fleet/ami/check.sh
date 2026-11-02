@@ -353,6 +353,18 @@ rs=$(grep -n '^ExecStart=/usr/bin/podman' fleet/ami/tile/fcvm-fleet-renderer.ser
   no "fcvm-fleet-renderer.service does not wait for /dev/nvidia-uvm-tools before starting the container"
 # bake refuses an image without a list unless the first image of a lineage says so; trace
 # refuses a boot that already prefetched (its page cache would keep every old piece).
+# nvidia-persistenced runs as soon as the driver's modules are inserted, and its first
+# nvidia-modprobe failed on every boot (2026-11-02, the e32ad48d and 38d63412 tile images:
+# exit 1 6 ms after systemd-modules-load finished, before the kernel module had initialised).
+# Nothing started it again until the renderer's start had waited 10 s for /dev/nvidia-uvm-tools
+# and failed, which cost a cold tile 13 s. It retries on its own, and it is a unit file that a
+# revision (`build.sh units`) installs too.
+pu=fleet/ami/tile/nvidia-persistenced.service
+[ -f "$pu" ] || no "the tile's nvidia-persistenced.service is not a unit file that install_units installs"
+grep -qx 'Restart=on-failure' "$pu" 2>/dev/null || no "nvidia-persistenced.service (tile) must retry a failed start (Restart=on-failure)"
+grep -qE '^RestartSec=[0-9.]+(ms)?$' "$pu" 2>/dev/null || no "nvidia-persistenced.service (tile) must name its retry delay"
+grep -q 'cat > /etc/systemd/system/nvidia-persistenced.service' fleet/ami/tile/build.sh &&
+  no "tile/build.sh writes its own nvidia-persistenced.service, which a revision would not install"
 bake=$(sed -n '/^bake)/,/;;/p' fleet/ami/tile/build.sh)
 grep -qF '[ ! -s /etc/fcvm-fleet/prefetch.list ] && [ "${NO_PREFETCH_LIST:-}" != 1 ]' <<<"$bake" ||
   no "tile/build.sh bake does not refuse an image without a prefetch list"

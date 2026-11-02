@@ -82,25 +82,7 @@ prep)
   $APT install -y "${debs[@]}"
   rm -rf "$d"
   modprobe nvidia
-  cat > /etc/systemd/system/nvidia-persistenced.service <<'X'
-[Unit]
-Description=NVIDIA Persistence Daemon (keeps the GPU initialised between clients)
-DefaultDependencies=no
-After=systemd-modules-load.service systemd-udev-trigger.service
-Before=fcvm-fleet-renderer.service shutdown.target
-Conflicts=shutdown.target
-
-[Service]
-Type=forking
-# /dev/nvidia-uvm and /dev/nvidia-uvm-tools exist only once something asks for them, and
-# the CDI spec lists them: create them before anything starts a container.
-ExecStartPre=/usr/bin/nvidia-modprobe -u -c=0
-ExecStart=/usr/bin/nvidia-persistenced --user root
-ExecStopPost=/bin/rm -rf /var/run/nvidia-persistenced
-
-[Install]
-WantedBy=multi-user.target
-X
+  # nvidia-persistenced.service is one of this directory's units (install_units).
   # Seed the current CDI spec: devices by index, and without
   # the apply-cuda-memory-limits hook, which names the builder's GPU by UUID (another
   # instance's GPU then fails cudaSetDevice) and limits nothing on a whole T4. The
