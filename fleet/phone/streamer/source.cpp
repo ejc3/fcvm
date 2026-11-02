@@ -625,10 +625,13 @@ void PhoneSource::run() {
 std::string PhoneSource::health_json() {
   GpuSample gs = gpu_.latest();
   std::vector<std::pair<int, int>> streams;
+  std::vector<std::shared_ptr<Subscriber>> subs;
   {
     std::lock_guard<std::mutex> l(mu_);
     for (auto& s : subs_) streams.push_back({s->want_h.load(), s->want_q.load()});
+    subs = subs_;
   }
+  std::string viewers = viewers_json(subs);
   std::lock_guard<std::mutex> l(hmu_);
   auto num = [](double v) { return v < 0 ? std::string("null") : std::to_string(v); };
   std::string sj = "[";
@@ -666,5 +669,6 @@ std::string PhoneSource::health_json() {
            mirror_open_ ? "true" : "false", (unsigned long long)mirror_opened_, (unsigned long long)mirror_behind_,
            (unsigned long long)mirror_tap_bytes_, (unsigned long long)mirror_wire_bytes_,
            mirror_error_.empty() ? "null" : ("\"" + json_escape(mirror_error_) + "\"").c_str());
-  return h.substr(0, h.size() - 1) + m;
+  std::string tail = m;
+  return h.substr(0, h.size() - 1) + tail.substr(0, tail.size() - 1) + ",\"viewers\":" + viewers + "}";
 }

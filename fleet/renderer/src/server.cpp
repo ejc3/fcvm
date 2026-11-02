@@ -329,20 +329,16 @@ void Server::websocket(Conn& c, int h, int q, const std::string& key) {
   }
   c.set_read_timeout_ms(0);
   c.set_option(SOL_SOCKET, SO_SNDBUF, 1 << 20);
+  // Keep at most 64 KiB written and not yet sent in the kernel (about 26 ms at 20
+  // Mbit/s): what a stalled link backs up waits in the subscriber's queue, which
+  // drops it by age, not in the socket, where it would be sent however old (#1478).
+  c.set_option(IPPROTO_TCP, TCP_NOTSENT_LOWAT, 64 << 10);
   auto sub = p_.subscribe(h, q);
   // writer: drains the subscriber's queue
   std::thread writer;
   bool started = start_thread([&c, sub] {
-    while (true) {
-      std::shared_ptr<const std::string> m;
-      {
-        std::unique_lock<std::mutex> l(sub->mu);
-        sub->cv.wait(l, [&] { return sub->closed || !sub->q.empty(); });
-        if (sub->q.empty()) break;
-        m = sub->q.front();
-        sub->q.pop_front();
-        sub->queued -= m->size();
-      }
+    // pop() leaves out frames that waited past SUB_MAX_AGE_MS (#1478)
+    while (auto m = sub->pop()) {
       if (!c.write_all(m->data(), m->size())) {
         sub->close();
         break;

@@ -1590,8 +1590,13 @@ Then binary messages, each one access unit:
   time; the controller's 70% target keeps tiles clear of that.
 - The client may send text `{"h": <height>}`. The renderer then sends a new
   text header and continues from a keyframe at the new size.
-- A subscriber that falls more than 90 messages or 16 MiB behind has its queue
-  dropped and resumes at the next keyframe (which the renderer then forces).
+- A subscriber whose oldest queued frame waited more than 200 ms, or that falls
+  more than 90 messages or 16 MiB behind, has its queued frames dropped and
+  resumes at the next keyframe (which the renderer then forces): a stalled link
+  costs a keyframe, not seconds of old frames replayed afterwards. The socket
+  holds at most 64 KiB not yet sent (`TCP_NOTSENT_LOWAT`), so what a stall backs
+  up waits in that queue. 200 ms is 6 frames at 30 fps; a frame of 80 KB takes
+  about 30 ms to send at 20 Mbit/s, so a reader that keeps up holds one or two.
 - **Minimum size:** NVENC's H.264 encoder on a T4 takes nothing narrower than
   145 px or shorter than 49 px. When the requested height gives a smaller
   tile, the tile is drawn at the smallest larger even height that fits (a
@@ -1650,7 +1655,10 @@ initialized), `error` (only when the renderer has failed), `render_ms` and
 `encode_ms` of the last frame, `streams` (each height and quality being
 encoded), `spp` (samples per pixel drawn in it), `checkerboard` (see below),
 `hold`/`hold_samples` (see below), `slots_missed` (frame slots skipped while a
-subscriber was connected, since start), and `startup_ms`, milliseconds from the
+subscriber was connected, since start), `viewers` (one per frame stream: its
+height `h`, messages `queued`, the age `oldest_ms` of its oldest queued frame,
+and `drops`, the times its queue was dropped to the next keyframe), and
+`startup_ms`, milliseconds from the
 process start (read from `/proc/self/stat`) to CUDA being ready, the first
 frame drawn and the first frame sent to a subscriber (`-1` until it happens).
 `boot_id` is 32 hex digits drawn at random when the process starts: a client

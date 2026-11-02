@@ -838,10 +838,13 @@ std::string Pipeline::health_json() {
   GpuSample g = gpu_.latest();
   long long gcur, gnext, gk;
   bool gpend;
+  std::vector<std::shared_ptr<Subscriber>> subs;
   {
     std::lock_guard<std::mutex> l(mu_);  // never held together with hmu_
     gcur = lay_.cur; gnext = lay_.next; gk = lay_.k; gpend = lay_.pending;
+    subs = subs_;
   }
+  std::string viewers = viewers_json(subs);
   std::lock_guard<std::mutex> l(hmu_);
   std::ostringstream o;
   o.precision(6);
@@ -868,7 +871,8 @@ std::string Pipeline::health_json() {
   if (!fatal_.empty()) o << ",\"error\":\"" << json_escape(fatal_) << "\"";
   o << ",\"render_ms\":" << std::round(rstats_.render_ms * 10) / 10 << ",\"encode_ms\":" << std::round(encode_ms_ * 10) / 10
     << ",\"spp\":" << rstats_.spp << ",\"checkerboard\":" << rstats_.half << ",\"hold\":" << (rstats_.hold ? "true" : "false")
-    << ",\"hold_samples\":" << rstats_.hold_samples << ",\"slots_missed\":" << slots_missed_;
+    << ",\"hold_samples\":" << rstats_.hold_samples << ",\"slots_missed\":" << slots_missed_
+    << ",\"viewers\":" << viewers;
   {
     // the last 2 s of frames: whole frame (render, encode, send) and its parts
     auto now = std::chrono::steady_clock::now();
