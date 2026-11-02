@@ -827,3 +827,84 @@ fn the_wall_program_does_not_repeat_within_ten_minutes() {
         }
     }
 }
+
+/// A GPU that fails on a host is quarantined for that host's instance: a reconnect of the
+/// same host does not assign it again (no retry), also after the fleet sleeps, since a
+/// disconnected agent's instance may still run. While its host is not connected the GPU is
+/// not listed in `failures`: staging, 2026-11-01, a GPU dead from boot on a host terminated
+/// at sleep was still listed to every viewer with the fleet asleep and no host.
+#[test]
+fn a_quarantined_gpu_holds_for_its_instance_and_is_listed_while_its_host_is_connected() {
+    let config = config_with(serde_json::json!({
+        "power_managed": true, "idle_scale_down_secs": 60, "ec2_max": 0, "fcvm_tiles": 2
+    }));
+    let mut s = State::new(config, 0);
+    let quarantine = |at: u64| Event::Agent {
+        at,
+        host: "h1".into(),
+        msg: AgentMsg::Quarantine {
+            slot: "slot-2".into(),
+            sbdf: "0000:02:00.0".into(),
+            error: "VFIO error: Device does not provide MSIx irq".into(),
+            report: Some("r1".into()),
+        },
+    };
+    let gone = |at: u64| Event::AgentGone {
+        at,
+        host: "h1".into(),
+    };
+    for e in events(serde_json::json!([
+        {"type": "viewer_joined", "at": 1000, "viewer": "v1", "client": "192.0.2.70"},
+    ])) {
+        s = apply(s, &e);
+    }
+    s = apply(s, &hello(2000, "h1", 2));
+    s = apply(s, &running(2100, "h1", "slot-1"));
+    s = apply(s, &quarantine(2200));
+    let gpus = |s: &State| -> Vec<String> {
+        host_assignments(s)
+            .get("h1")
+            .map(|v| v.iter().map(|a| a.sbdf.clone()).collect())
+            .unwrap_or_default()
+    };
+    let listed = |s: &State| {
+        view(s)
+            .failures
+            .iter()
+            .filter(|f| serde_json::to_value(f).unwrap()["kind"] == "gpu_quarantined")
+            .count()
+    };
+    let only_first = vec!["0000:01:00.0".to_string()];
+    assert_eq!(gpus(&s), only_first);
+    assert_eq!(listed(&s), 1);
+    // The agent reconnects while awake: the GPU stays out, not retried.
+    s = apply(s, &gone(3000));
+    s = apply(s, &hello(4000, "h1", 2));
+    assert_eq!(
+        gpus(&s),
+        only_first,
+        "a reconnect retried the quarantined GPU"
+    );
+    // The fleet sleeps and the agent disconnects.
+    for e in events(serde_json::json!([
+        {"type": "viewer_left", "at": 5000, "viewer": "v1"},
+        {"type": "tick", "at": 70_000},
+    ])) {
+        s = apply(s, &e);
+    }
+    assert_eq!(s.fleet.power.state, "asleep");
+    s = apply(s, &gone(71_000));
+    assert_eq!(
+        listed(&s),
+        0,
+        "a GPU of a host that is gone is listed to viewers"
+    );
+    // The instance was not terminated after all and reconnects: still out, listed again.
+    s = apply(s, &hello(72_000, "h1", 2));
+    assert_eq!(
+        gpus(&s),
+        only_first,
+        "the same instance's reconnect retried the quarantined GPU"
+    );
+    assert_eq!(listed(&s), 1);
+}
