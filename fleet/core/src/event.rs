@@ -86,9 +86,6 @@ pub enum Event {
     ScaleInstances {
         at: u64,
         instances: Vec<ScaleInstance>,
-        /// Every region was listed, so an instance missing from `instances` is gone.
-        #[serde(default)]
-        complete: bool,
     },
     /// A launch's or an aggregator's DNS names were minted; the coordinator's subzone
     /// answers them from the state this event is applied to.

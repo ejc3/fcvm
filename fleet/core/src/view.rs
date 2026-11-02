@@ -225,7 +225,7 @@ pub enum FailureView {
         since: u64,
     },
     /// A GPU out of rotation after a failed reset, scrub or attach, until an operator
-    /// releases it or its instance is gone.
+    /// releases it.
     GpuQuarantined {
         host: String,
         sbdf: String,
@@ -913,12 +913,21 @@ fn failures(state: &State) -> Vec<FailureView> {
                 since: *since,
             }),
     );
-    out.extend(f.quarantined.values().map(|q| FailureView::GpuQuarantined {
-        host: q.host.clone(),
-        sbdf: q.sbdf.clone(),
-        error: hide_account_ids(&q.error),
-        since: q.since,
-    }));
+    // A quarantined GPU is listed while its host is connected. The entry outlives a host
+    // that is gone (an agent can reconnect from a running instance, and nothing here can
+    // tell a terminated instance from a disconnected one), but a viewer is not shown a GPU
+    // of an instance that is no longer in the fleet.
+    out.extend(
+        f.quarantined
+            .values()
+            .filter(|q| f.hosts.contains_key(&q.host))
+            .map(|q| FailureView::GpuQuarantined {
+                host: q.host.clone(),
+                sbdf: q.sbdf.clone(),
+                error: hide_account_ids(&q.error),
+                since: q.since,
+            }),
+    );
     out
 }
 

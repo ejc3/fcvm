@@ -412,7 +412,6 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                 .send(Event::ScaleInstances {
                     at: 0,
                     instances: report,
-                    complete: listed.iter().all(Option::is_some),
                 })
                 .await;
         }

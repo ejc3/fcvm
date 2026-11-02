@@ -253,31 +253,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             }
             None
         }
-        Event::ScaleInstances {
-            instances,
-            complete,
-            ..
-        } => {
-            // A host's quarantined GPUs go with its instance: once a complete listing has no
-            // such instance and its agent is not connected, it is terminated, and no agent can
-            // bring that GPU back. A disconnected agent alone proves nothing (the instance may
-            // still run and reconnect), nor does a listing that missed a region.
-            if *complete {
-                let f = &mut state.fleet;
-                let gone =
-                    |h: &str| !f.hosts.contains_key(h) && !instances.iter().any(|i| i.id == h);
-                let hosts: Vec<String> = f
-                    .quarantined
-                    .values()
-                    .map(|q| q.host.clone())
-                    .filter(|h| gone(h))
-                    .collect();
-                for h in hosts {
-                    f.quarantined.retain(|_, q| q.host != h);
-                    let mine = format!("{h}/");
-                    f.released_reports.retain(|k, _| !k.starts_with(&mine));
-                }
-            }
+        Event::ScaleInstances { instances, .. } => {
             let p = &mut state.fleet.power;
             if wake_open(p) {
                 for i in instances {
@@ -605,7 +581,7 @@ pub fn is_quarantined(f: &Fleet, s: &Slot) -> bool {
 }
 
 /// Take a GPU out of rotation: its slot leaves the tiling (and any race and claim), and
-/// stays out until an operator releases it or its instance is gone (`ScaleInstances`).
+/// stays out until an operator releases it.
 fn quarantine(f: &mut Fleet, host: &str, sbdf: &str, error: &str, report: Option<String>, at: u64) {
     let key = gpu_key(host, sbdf);
     if f.quarantined.contains_key(&key) {

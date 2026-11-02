@@ -489,11 +489,10 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   re-tile waits on a VM that is still starting. With no tile on the wall (a cold start, a
   wake) every GPU joins at once.
 - A GPU whose reset, scrub or attach fails is quarantined by its agent (Agent: `quarantine`):
-  it leaves the tiling and the agent's assignment, `failures` lists it as `gpu_quarantined`,
+  it leaves the tiling and the agent's assignment, `failures` lists it as `gpu_quarantined`
+  while its host is connected,
   and it stays out (also when its agent reconnects or the coordinator restarts with its state
-  file) until an operator releases it with `POST /quarantine/release`, or until its instance
-  is gone: a wake's listing of every region's GPU hosts no longer has it and its agent is not
-  connected.
+  file) until an operator releases it with `POST /quarantine/release`.
 - `borrow`: at most `cap` wall tiles are lent at once, `lent` are now, and the next comes
   back at `next_return_at`.
 - A tile whose VM did not come back carries `failure` (`kind: "relaunch_failed"`, the
