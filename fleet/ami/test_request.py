@@ -94,13 +94,15 @@ class RequestTests(unittest.TestCase):
         self.assertNotEqual(request.request_digest("a" * 64, "critical", "1", day),
                             request.request_digest("a" * 64, "critical", "2", day))
 
-    def invoke(self, status="queued", wrong_source=False, wrong_input=False, function_error=False):
+    def invoke(self, status="queued", wrong_source=False, wrong_input=False, function_error=False, message=None):
         payload = {"action": "request", "source_sha": "a" * 40, "input_sha256": "b" * 64, "priority": "normal"}
         def aws(arguments, **kwargs):
             self.assertEqual(arguments[:3], ["aws", "lambda", "invoke"])
             self.assertNotIn("--debug", arguments)
             body = {"status": status, "request_id": "b" * 64, "input_sha256": ("c" if wrong_input else "b") * 64,
                     "source_sha": "c" * 40 if wrong_source else "a" * 40}
+            if message is not None:
+                body = {"status": status, "message": message}
             Path(arguments[-1]).write_text(json.dumps(body))
             return SimpleNamespace(stdout=json.dumps({"StatusCode": 200, **({"FunctionError": "Unhandled"} if function_error else {})}))
         return request.invoke("arn:aws:lambda:us-west-1:123456789012:function:fleet-images:request", payload, aws)
@@ -122,6 +124,36 @@ class RequestTests(unittest.TestCase):
         for kwargs in ({"wrong_input": True}, {"function_error": True}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 self.invoke(**kwargs)
+
+    def test_a_refusal_fails_with_the_factory_reason(self):
+        # 2026-11-02: two runs failed with "Invalid image request status", which hid the reason
+        with self.assertRaises(request.Refused) as caught:
+            self.invoke("refused", message="only the current main revision can enter the factory")
+        self.assertIn("only the current main revision can enter the factory", str(caught.exception))
+
+    def github(self, head, runs):
+        def fetch(path, token):
+            if path == "git/ref/heads/main":
+                return {"object": {"sha": head}}
+            self.assertTrue(path.startswith("actions/workflows/ci.yml/runs?branch=main&head_sha="))
+            return {"workflow_runs": runs}
+        return fetch
+
+    def test_a_revision_main_moved_past_is_skipped_not_failed(self):
+        # a CI run that completes after the next merge (2add2b84 behind 38d63412, run 41378535279)
+        reason = request.not_requestable("a" * 40, "t", self.github("b" * 40, []))
+        self.assertIn("main has moved on", reason)
+
+    def test_the_schedule_skips_a_head_whose_ci_still_runs(self):
+        # the weekly schedule at 02:24 fired on 38d63412 while its CI ran (run 41377552783)
+        reason = request.not_requestable("a" * 40, "t", self.github("a" * 40, [{"status": "in_progress", "conclusion": None}]))
+        self.assertIn("still running", reason)
+
+    def test_the_head_with_successful_ci_is_requested(self):
+        for runs in ([{"status": "completed", "conclusion": "success"}], [],
+                     [{"status": "completed", "conclusion": "failure"}]):
+            with self.subTest(runs=runs):
+                self.assertIsNone(request.not_requestable("a" * 40, "t", self.github("a" * 40, runs)))
 
     def test_ordinary_ci_cannot_invoke_the_build_alias(self):
         with self.assertRaises(ValueError):
