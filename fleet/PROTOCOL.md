@@ -1643,15 +1643,20 @@ pixel in both, drawn identically.
 
 ```json
 {"fps":30.0,"heights":[240],"streams":[{"h":240,"q":"std"}],
- "gpu":{"name":"Tesla T4","temp_c":38,"power_w":64.2,"util_pct":70,"mem_used_mb":648.3},
+ "gpu":{"name":"Tesla T4","temp_c":38,"power_w":64.2,"util_pct":70,"mem_used_mb":648.3,
+        "clock_mhz":1590,"app_clock_mhz":1590,"max_clock_mhz":1590},
  "t":1234.5,"frame":5678,"boot_id":"9f0c2a6e41d84b7c8e2f5a1b3c4d6e7f",
  "ready":true,"render_ms":13.0,"encode_ms":0.5,"spp":3,"checkerboard":1,"hold":false,"hold_samples":0,"slots_missed":0,
  "startup_ms":{"gpu_ready":1515,"first_frame_drawn":1845,"first_frame_sent":1899}}
 ```
 
 The first six keys are the contract. GPU numbers come from NVML, sampled once
-a second; a value NVML does not give is `null`. The rest: `ready` (the GPU is
-initialized), `error` (only when the renderer has failed), `render_ms` and
+a second; a value NVML does not give is `null`. `clock_mhz` is the graphics clock
+when sampled, `app_clock_mhz` the application clock (the clock a busy GPU runs its
+kernels at) and `max_clock_mhz` the board's maximum. The VM's agent and the EC2
+tile set the application clock to the maximum at start: a T4's default is 585 MHz,
+and the renderer, idle between frames, ran at it (renderer README, "GPU clocks").
+The rest: `ready` (the GPU is initialized), `error` (only when the renderer has failed), `render_ms` and
 `encode_ms` of the last frame, `streams` (each height and quality being
 encoded), `spp` (samples per pixel drawn in it), `checkerboard` (see below),
 `hold`/`hold_samples` (see below), `slots_missed` (frame slots skipped while a

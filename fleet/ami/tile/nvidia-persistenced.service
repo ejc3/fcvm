@@ -16,6 +16,11 @@ Type=forking
 # the CDI spec lists them: create them before anything starts a container.
 ExecStartPre=/usr/bin/nvidia-modprobe -u -c=0
 ExecStart=/usr/bin/nvidia-persistenced --user root
+# The GPU's application clocks (what a busy GPU runs its kernels at) to the board's maximum:
+# a T4 defaults to 585 MHz against 1590, and the renderer, idle between frames, ran its frames
+# at 585 (fleet/renderer/README.md, "GPU clocks"). A board without them fails the set and
+# keeps its default; that is logged and does not fail the unit.
+ExecStartPost=-/bin/sh -c 'nvidia-smi --query-gpu=index,clocks.max.memory,clocks.max.graphics --format=csv,noheader,nounits | while IFS=", " read -r i m g; do nvidia-smi -i "$i" -ac "$m,$g"; done'
 ExecStopPost=/bin/rm -rf /var/run/nvidia-persistenced
 Restart=on-failure
 RestartSec=200ms

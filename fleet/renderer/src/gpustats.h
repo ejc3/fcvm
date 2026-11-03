@@ -1,4 +1,4 @@
-// GPU name, temperature, power, utilisation and memory through NVML, loaded at
+// GPU name, temperature, power, utilisation, memory and clocks through NVML, loaded at
 // run time from libnvidia-ml.so.1 (provided by CDI). Sampled once a second.
 #pragma once
 #include <atomic>
@@ -9,6 +9,8 @@
 struct GpuSample {
   std::string name;
   double temp_c = -1, power_w = -1, util_pct = -1, mem_used_mb = -1, mem_total_mb = -1;
+  // graphics clocks, MHz: now, the application clock (what a busy GPU runs at) and the board's maximum
+  double clock_mhz = -1, app_clock_mhz = -1, max_clock_mhz = -1;
   bool ok = false;
   std::string error;
 };

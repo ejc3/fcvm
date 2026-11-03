@@ -19,7 +19,12 @@ struct Nvml {
   nvmlReturn_t (*power)(nvmlDevice_t, unsigned int*);
   nvmlReturn_t (*util)(nvmlDevice_t, nvmlUtilization_t*);
   nvmlReturn_t (*mem)(nvmlDevice_t, nvmlMemory_t*);
+  // optional: an NVML without them leaves the clocks null
+  nvmlReturn_t (*clock)(nvmlDevice_t, int, unsigned int*);
+  nvmlReturn_t (*app_clock)(nvmlDevice_t, int, unsigned int*);
+  nvmlReturn_t (*max_clock)(nvmlDevice_t, int, unsigned int*);
 };
+constexpr int NVML_CLOCK_GRAPHICS = 0;
 }  // namespace
 
 void GpuStats::start(const std::string& pci_bus_id) {
@@ -54,6 +59,9 @@ void GpuStats::run() {
   n.power = (nvmlReturn_t(*)(nvmlDevice_t, unsigned int*))dlsym(lib, "nvmlDeviceGetPowerUsage");
   n.util = (nvmlReturn_t(*)(nvmlDevice_t, nvmlUtilization_t*))dlsym(lib, "nvmlDeviceGetUtilizationRates");
   n.mem = (nvmlReturn_t(*)(nvmlDevice_t, nvmlMemory_t*))dlsym(lib, "nvmlDeviceGetMemoryInfo");
+  n.clock = (nvmlReturn_t(*)(nvmlDevice_t, int, unsigned int*))dlsym(lib, "nvmlDeviceGetClockInfo");
+  n.app_clock = (nvmlReturn_t(*)(nvmlDevice_t, int, unsigned int*))dlsym(lib, "nvmlDeviceGetApplicationsClock");
+  n.max_clock = (nvmlReturn_t(*)(nvmlDevice_t, int, unsigned int*))dlsym(lib, "nvmlDeviceGetMaxClockInfo");
   if (!n.init || !n.by_index || !n.name || !n.temp || !n.power || !n.util || !n.mem) { fail("NVML lacks a needed symbol"); return; }
   if (n.init() != 0) { fail("nvmlInit failed"); return; }
   nvmlDevice_t dev = nullptr;
@@ -73,6 +81,9 @@ void GpuStats::run() {
     if (n.util(dev, &u) == 0) s.util_pct = u.gpu;
     nvmlMemory_t m{};
     if (n.mem(dev, &m) == 0) { s.mem_used_mb = m.used / 1048576.0; s.mem_total_mb = m.total / 1048576.0; }
+    if (n.clock && n.clock(dev, NVML_CLOCK_GRAPHICS, &v) == 0) s.clock_mhz = v;
+    if (n.app_clock && n.app_clock(dev, NVML_CLOCK_GRAPHICS, &v) == 0) s.app_clock_mhz = v;
+    if (n.max_clock && n.max_clock(dev, NVML_CLOCK_GRAPHICS, &v) == 0) s.max_clock_mhz = v;
     s.ok = true;
     {
       std::lock_guard<std::mutex> l(mu_);
