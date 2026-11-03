@@ -335,6 +335,11 @@ action)
     app_action "$next"
     echo "$next" > "$RUN/$1"
   }
+  # While the viewer's GPU mirror is open, a window must be drawn by a process that started
+  # after the mirror's copy did (docs/fleet/ARCHITECTURE.md, "The GPU mirror", point 3): an
+  # app that comes to the front starts again instead, since the mirror may have joined while
+  # the other one was in front.
+  mirror_open() { http_get "$STREAMER_PORT" /health 2> /dev/null | jq -e '.mirror.open == true' > /dev/null 2>&1; }
   # Which app is in front, Robot Park or the browser: an action for Robot Park brings it to
   # the front first.
   front() { cat "$RUN/front" 2> /dev/null || echo app; }
@@ -343,12 +348,9 @@ action)
     "$ADB" shell am start -W -n dev.fcvm.robotpark/.MainActivity 2>&1 | tr -d '\r' | grep -q '^Status: ok' \
       || { echo "phone.sh: Robot Park did not come to the front" >&2; exit 1; }
     echo app > "$RUN/front"
+    if mirror_open; then app_action restart; rm -f "$RUN/screen" "$RUN/night"; fi
   }
   has_browser() { "$ADB" shell pm path "$BROWSER_PKG" 2> /dev/null | grep -q '^package:' || { echo "phone.sh: this phone has no browser" >&2; exit 1; }; }
-  # While the viewer's GPU mirror is open, a window must be drawn by a process that started
-  # after the mirror's copy did (docs/fleet/ARCHITECTURE.md, "The GPU mirror", point 3): the
-  # browser starts again instead of coming to the front.
-  mirror_open() { http_get "$STREAMER_PORT" /health 2> /dev/null | jq -e '.mirror.open == true' > /dev/null 2>&1; }
   restart_browser() { open_page > "$RUN/why" || { echo "phone.sh: $(cat "$RUN/why")" >&2; exit 1; }; }
   case "${2:-}" in
   switch_screen) to_app; toggle screen scene info ;;

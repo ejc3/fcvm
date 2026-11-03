@@ -797,7 +797,8 @@ assignment (`phone.actions` below) for 30 s, numbered (`seq`) and tagged with th
 they are for; the agent carries out each once with `phone.sh action <name>` in the phone's
 container, which sends the app the one request its name maps to (`switch_screen` and
 `dark_mode` remember which they sent last, so each is a toggle). An action for Robot Park
-brings it to the front first when the browser is there. `open_browser` and `open_app` use
+brings it to the front first when the browser is there, and starts it again while the holder's
+GPU mirror is open. `open_browser` and `open_app` use
 adb in the container and send the app nothing.
 
 ## Agent

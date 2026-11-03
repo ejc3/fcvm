@@ -301,6 +301,15 @@ touch "$B/mirror"
 bact open_browser || bad "open_browser with the mirror open failed: $(cat "$dir/act.err")"
 adb_has "shell am force-stop org.cromite.cromite" && adb_has "android.intent.action.VIEW" && ! adb_has "keycombination" \
   && ok "with the GPU mirror open, open_browser starts the browser again" || bad "open_browser with the mirror open ran: $(cat "$B/adb.log")"
+# back from the browser with the mirror open, Robot Park starts again: its process may predate
+# the mirror's copy (the mirror joined while the browser was in front)
+bact open_app || bad "open_app with the mirror open failed: $(cat "$dir/act.err")"
+adb_has "shell am start -W -n dev.fcvm.robotpark/.MainActivity" && [ "$(cat "$dir/ctl.log")" = '{"type":"action","name":"restart"}' ] \
+  && ok "with the GPU mirror open, Robot Park back from the browser starts again" || bad "open_app with the mirror open ran: $(cat "$B/adb.log" "$dir/ctl.log")"
+bact open_browser > /dev/null || true; bact dance || bad "dance with the mirror open failed: $(cat "$dir/act.err")"
+[ "$(cat "$dir/ctl.log")" = '{"type":"action","name":"restart"}
+{"type":"action","name":"dance"}' ] && ok "an action for Robot Park with the mirror open restarts it, then sends the action" \
+  || bad "dance with the browser in front and the mirror open sent: $(cat "$dir/ctl.log")"
 # serve with a browser: it opens www.nvidia.com before Robot Park starts in front of it, and a
 # browser that shows no NVIDIA page fails the phone.
 D=$(PHONE_BROWSER_APK=/work/cromite.apk PHONE_DEVTOOLS_PORT=$hport serve)

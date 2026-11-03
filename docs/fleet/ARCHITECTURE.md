@@ -1355,8 +1355,9 @@ listens beyond the host's loopback. `--forward-localhost 3128` is in the phone's
 **With the GPU mirror.** The mirror draws only windows of processes that started after its copy
 did (point 3 above), so while the holder's mirror is open (`/health`'s `mirror.open` on the
 streamer) `open_browser` starts the browser again on the page instead of bringing the old
-process to the front, and the mirror's own join (`restart_app` once the stream opens) restarts
-the browser when it is in front. The browser's command stream, captured as the page receives it
+process to the front, Robot Park back from the browser starts again too (the mirror may have
+joined while the browser was in front), and the mirror's own join (`restart_app` once the
+stream opens) restarts whichever app is in front. The browser's command stream, captured as the page receives it
 while the browser started on the page and then scrolled it ten times (40 s, the same gpubox):
 
 | | Video (NVENC H.264) | GPU mirror (zstd) | the mirror before compression | blocking calls a second |
