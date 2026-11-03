@@ -360,7 +360,7 @@ class ReportContent(unittest.TestCase):
                 counts = re.findall(r"\b0 (?:of|failures in|in) (?:the [\w-]+ arm[\u2019']s )?(\d[\d,]*)", text)
                 self.assertTrue(counts, f"a corpus zero-failure count without its attempts: {text[:160]!r}")
                 self.assertEqual(set(counts), {"230"}, f"attempt counts {counts} in: {text[:160]!r}")
-        self.assertGreaterEqual(checked, 2, "the tile and the sample-gate bullet were not both checked")
+        self.assertGreaterEqual(checked, 1, "no zero-failure count was checked; the sample-gate bullet states one")
 
     @staticmethod
     def campaign_runs():
@@ -374,13 +374,8 @@ class ReportContent(unittest.TestCase):
                        if p.split("/")[1].startswith("reqbench-20261022-corpus-")
                        and p.count("/") == 2 and p.endswith("/analysis.json")})
 
-    # Corpus runs of earlier campaigns the page lists under Earlier runs.
-    EARLIER_CORPUS_RUNS = (
-        "reqbench-20260830-171007-corpus",
-        "reqbench-20260902-023115-corpus-c2",
-        "reqbench-20260902-025115-corpus-c4",
-        "reqbench-20260902-031115-corpus-c8",
-    )
+    # Corpus runs of earlier campaigns the page cites; it cites none now.
+    EARLIER_CORPUS_RUNS = ()
 
     # The Firecracker branch rootfs-config.toml selects at each fcvm source
     # revision a cited run records (cell.source_revision). Derived with
@@ -417,11 +412,11 @@ class ReportContent(unittest.TestCase):
 
         Each subsection names exactly the branches its runs used, and no other
         part of the page names a branch. The 2026-10-22 campaign's runs belong
-        to "2026-10-22 runs", every other cited run to "Earlier runs"."""
+        to "2026-10-22 runs", every other cited run to "Earlier runs", and a
+        subsection with no cited run is absent."""
         fc = section(self.page, "firecracker")
         parts = re.split(r"<h3>([^<]+)</h3>", fc)
         subsections = {parts[i].strip(): parts[i + 1] for i in range(1, len(parts), 2)}
-        self.assertEqual(sorted(subsections), ["2026-10-22 runs", "Earlier runs"])
         branches = set(self.FIRECRACKER_BRANCH.values())
         expected = {"2026-10-22 runs": set(), "Earlier runs": set()}
         runs = sorted(set(re.findall(r"results/(reqbench-[A-Za-z0-9-]+)", self.page)))
@@ -433,6 +428,9 @@ class ReportContent(unittest.TestCase):
                           f"{run}: add the Firecracker pin at {revision}")
             where = "2026-10-22 runs" if run.startswith("reqbench-20261022-") else "Earlier runs"
             expected[where].add(self.FIRECRACKER_BRANCH[revision])
+        # A subsection exists exactly when the page cites runs that belong to it.
+        expected = {where: want for where, want in expected.items() if want}
+        self.assertEqual(sorted(subsections), sorted(expected))
         for where, want in expected.items():
             named = {b for b in branches if re.search(rf"\b{re.escape(b)}\b(?![\w.-])", subsections[where])}
             self.assertEqual(named, want, f"{where} must name exactly the branch its runs used")
