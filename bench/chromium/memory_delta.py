@@ -2,7 +2,10 @@
 """Per-request memory of an fcvm clone, the shared memory server amortized, against a warm host container.
 
 Reads one memory phase's raw `samples.jsonl` (corpus_mem.py, `make
-bench-chromium-corpus-extra PHASES=memory`), rebuilds its cells with
+bench-chromium-corpus-extra PHASES=memory`), refuses unless it and
+`summary.json` have the sha256 and size the phase's `complete.json` records
+(so every raw field read here, not only those summary.json repeats, is the
+record's), rebuilds its cells with
 corpus_mem.cell_values, and refuses unless the rebuilt cells and the fits
 corpus_mem.summarize_memory_fits computes from them equal the `cells` and
 `fits` of the `summary.json` beside it. Then, at each N and as N grows:
@@ -13,14 +16,6 @@ corpus_mem.summarize_memory_fits computes from them equal the `cells` and
   PSS (secondary)
       clone      (memory server's PSS + the N clones' PSS) / N
       container  (the N containers' PSS) / N
-  host free memory (cross-check)
-      clone      (memory server's cgroup at the pre sample + fall in host
-                  MemFree from the cell's pre sample to its steady samples) / N
-      container  (fall in host MemFree) / N
-  host available memory (cross-check): the same with MemAvailable
-
-The memory server is started before the first cell, so the host's MemFree
-already holds it at every pre sample; its cgroup is the only record of it.
 
 Each figure is a mean over the 14 page blocks (a repetition renders one page
 at every N, on both sides), so the clone and container values of a block are
@@ -52,7 +47,7 @@ import corpus_mem
 RESAMPLES = 5000
 CLONE = "fcvm-clone"
 CONTAINER = "host-container"
-BASES = ("resident", "pss", "host_free", "host_available")
+BASES = ("resident", "pss")
 
 
 def load_cells(directory):
@@ -104,30 +99,18 @@ def check_against_summary(directory, cells, summary):
 def per_cell(cell):
     """MiB totals of one cell on each basis, the shared server added on the clone side."""
     values = corpus_mem.cell_values(cell)
-    free_fall = (cell["pre"]["mem_free_kb"]
-                 - statistics.median(s["mem_free_kb"] for s in cell["steady"])) / 1024
-    available_fall = (cell["pre"]["mem_available_kb"]
-                      - statistics.median(s["mem_available_kb"] for s in cell["steady"])) / 1024
-    out = {"resident": values["cgroup_mib"], "pss": values["pss_mib"],
-           "host_free": free_fall, "host_available": available_fall}
+    out = {"resident": values["cgroup_mib"], "pss": values["pss_mib"]}
     if cell["side"] == CLONE:
         out["serve_cgroup"] = values["serve_cgroup_mib"]
         out["serve_pss"] = values["serve_pss_mib"]
         out["resident_with_serve"] = values["cgroup_mib"] + values["serve_cgroup_mib"]
         out["pss_with_serve"] = values["pss_mib"] + values["serve_pss_mib"]
-        # The fall in MemFree already holds whatever the server grew during the
-        # cell, so it adds the server as the pre sample found it.
-        out["host_free_with_serve"] = free_fall + cell["pre"]["serve_cgroup_kb"] / 1024
         # memory.stat `file`: page cache charged to the clones' cgroups.
         out["page_cache"] = statistics.median(
             s["clone_file_kb"] for s in cell["steady"]) / 1024
-        out["host_available_with_serve"] = (available_fall
-                                            + cell["pre"]["serve_cgroup_kb"] / 1024)
     else:
         out["resident_with_serve"] = out["resident"]
         out["pss_with_serve"] = out["pss"]
-        out["host_free_with_serve"] = out["host_free"]
-        out["host_available_with_serve"] = out["host_available"]
     return out
 
 
@@ -160,12 +143,9 @@ def statistics_for(blocks, ns):
             out[(basis, n, "container")] = container
             out[(basis, n, "delta")] = clone - container
         slopes = {}
-        # MemFree and MemAvailable falls already hold the server's growth during
-        # a cell; the cgroup and PSS totals get it from the server's sample.
-        slope_key = basis if basis.startswith("host_") else key
         for side in (CLONE, CONTAINER):
             xs = [n for b in blocks for n in ns]
-            ys = [b[side][n][slope_key] for b in blocks for n in ns]
+            ys = [b[side][n][key] for b in blocks for n in ns]
             slope, _intercept = corpus_mem.slope_intercept(xs, ys)
             slopes[side] = slope
         out[(basis, "limit", "clone")] = slopes[CLONE]
@@ -188,9 +168,25 @@ def statistics_for(blocks, ns):
     return out
 
 
+def check_completion(directory, run_id):
+    """samples.jsonl and summary.json must be the bytes the phase sealed."""
+    with open(os.path.join(directory, "complete.json")) as handle:
+        complete = json.load(handle)
+    if complete.get("run_id") != run_id:
+        raise SystemExit(f"{directory}: complete.json names another run")
+    sealed = {a["path"]: a for a in complete["artifacts"]}
+    for name in ("samples.jsonl", "summary.json"):
+        with open(os.path.join(directory, name), "rb") as handle:
+            data = handle.read()
+        if (name not in sealed or sealed[name]["size"] != len(data)
+                or sealed[name]["sha256"] != hashlib.sha256(data).hexdigest()):
+            raise SystemExit(f"{directory}: {name} is not the file complete.json sealed")
+
+
 def analyze(directory):
     with open(os.path.join(directory, "summary.json")) as handle:
         summary = json.load(handle)
+    check_completion(directory, summary["run_id"])
     cells = load_cells(directory)
     seed = check_against_summary(directory, cells, summary)
     ns = sorted({n for _side, n, _rep in cells})
@@ -230,11 +226,6 @@ def analyze(directory):
         "bases": {
             "resident": "cgroup memory.current; clone side adds the memory server's cgroup",
             "pss": "PSS over the same process sets; clone side adds the memory server's PSS",
-            "host_free": "fall in host MemFree from the cell's pre sample to the median of "
-                         "its steady samples; clone side adds the memory server's cgroup "
-                         "at the pre sample",
-            "host_available": "the same with host MemAvailable, which leaves out what the "
-                              "kernel counts as reclaimable",
         },
         "serve_mean_mib": {
             basis: rounded(observed[("serve", basis)], draws[("serve", basis)])
