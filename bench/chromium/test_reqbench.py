@@ -8370,6 +8370,8 @@ class DocLint(unittest.TestCase):
         verified record (reqbench-20260830-171007-corpus)", ...] != []
         (61 findings: 11 in report/README.md, 50 in the HTML).
         """
+        import html as html_mod
+
         self.maxDiff = None
         values, runs = self._verified_values()
         self.assertTrue(values, "no DNS-verified record to draw figures from")
@@ -8380,9 +8382,22 @@ class DocLint(unittest.TestCase):
             self.assertTrue(tables, f"{name}: no ladder or headline table; the lint is vacuous")
             for header, rows in tables:
                 for row in rows:
+                    # The verified figures this row quotes, in ms.
+                    quoted = [value * scale for cell in row[1:]
+                              for _, value, scale, decimals in self._figures_in(cell)
+                              if any(abs(round(v / scale, decimals) - value) < 1e-9
+                                     for v in values)]
                     for cell in row[1:]:
-                        for raw, value, scale, decimals in self._figures_in(cell):
+                        plain = html_mod.unescape(re.sub(r"<[^>]+>", " ", cell))
+                        figures = self._figures_in(cell)
+                        for raw, value, scale, decimals in figures:
                             checked[name] = checked.get(name, 0) + 1
+                            # A speedup ("1.86\u00d7") is a Cloudflare published wall
+                            # time over a verified median the same row quotes.
+                            if f"{raw}\u00d7" in plain and any(
+                                    abs(round(p / q, decimals) - value) < 1e-9
+                                    for p in self.CLOUDFLARE_WALL_MS for q in quoted if q):
+                                continue
                             if not any(abs(round(v / scale, decimals) - value) < 1e-9
                                        for v in values):
                                 bad.append(f"{name}: table {header[:40]!r} quotes "
@@ -8599,6 +8614,10 @@ class DocLint(unittest.TestCase):
     # cell for cell by test_report_kitesurf.PUBLISHED.
     KITESURF_WALL = ("1,148", "1148", "637")
 
+    # Cloudflare's published wall times in ms, screenshot and HTML, for Kitesurf
+    # and its warm Chromium (blog.cloudflare.com/kitesurf).
+    CLOUDFLARE_WALL_MS = (1148, 820, 637, 472)
+
     INTERVAL = re.compile(r"\[\s*\d[\d,]*(?:\.\d+)?\s*(?:,|-|–|—)\s*\d[\d,]*(?:\.\d+)?\s*\]")
     ENDPOINT_VERDICT = re.compile(
         r"(?i)whole interval below|interval included|interval containing|"
@@ -8788,8 +8807,8 @@ class DocLint(unittest.TestCase):
 
         The rule: no unit of the report docs may claim agreement, or call a
         comparison a cross-check, in the same breath as interval containment.
-        Both figures must still appear, so the pair is stated rather than
-        dropped.
+        A doc that still cites the 2026-09-02 ladder must state both figures,
+        so the pair is stated rather than dropped.
 
         Observed on that tree: AssertionError: Lists differ:
         ["report/README.md: claims run-to-run agreement ('agree') from interval
@@ -8804,10 +8823,13 @@ class DocLint(unittest.TestCase):
             r"interval contain(?:s|ing)?|intervals? overlap")
         bad = []
         for name in self.REPORT_DOCS:
-            text = self._plain(self._read(name))
-            for figure in ("770.3", "712.6"):
-                self.assertIn(figure, text,
-                              f"{name}: no longer names the {figure} ms 2 vCPU cell")
+            raw = self._read(name)
+            text = self._plain(raw)
+            # A doc that still cites the 2026-09-02 ladder must still state both cells.
+            if "reqbench-20260902-" in raw:
+                for figure in ("770.3", "712.6"):
+                    self.assertIn(figure, text,
+                                  f"{name}: no longer names the {figure} ms 2 vCPU cell")
             for unit in self._doc_units(name):
                 plain = self._plain(unit)
                 claim = agreement.search(plain)
