@@ -551,17 +551,21 @@ int main() {
       int g = (int)std::ceil(GUARD_FRAC * t.full_h) + 2 + DENOISE_R + 16;
       return (double)(t.w + 2 * g) * (t.h + 2 * g);
     };
-    // run the frame clock for `secs`: each frame takes ns_px * drawn pixels,
-    // and a frame longer than a slot skips the slots it overran
+    // At the lowest budget a frame draws a stride-4 checkerboard with one
+    // sample, so its samples are a quarter of its drawn pixels whatever the height.
+    auto floor_samples = [&](int h) { return px(h) / 4; };
+    // run the frame clock for `secs`: each frame takes ns_px * drawn pixels
+    // (nine tenths of it the trace), and a frame longer than a slot skips the
+    // slots it overran
     struct Run { long long frames = 0, skipped = 0, skipped_late = 0; int last_h = 0; };
     auto run = [&](HeightGuard& g, std::vector<int> asked, double ns_px, double t0, double secs) {
       Run o;
       double t = t0;
       while (t < t0 + secs) {
-        int h = g.choose(asked, px, t);
+        int h = g.choose(asked, px, floor_samples, t);
         double ms = ns_px * 1e-6 * px(h);
         long long slots = std::max(1LL, (long long)std::ceil(ms / fslot - 1e-9));
-        g.observe(t, h, ms);
+        g.observe(t, h, {ms, 0.9 * ms, 0, floor_samples(h)});
         o.frames++;
         o.skipped += slots - 1;
         if (t >= t0 + 1.5) o.skipped_late += slots - 1;
@@ -614,8 +618,9 @@ int main() {
     sixty.slot_ms = 1000.0 / 60;
     double t60 = 0;
     for (int i = 0; i < 200; i++, t60 += 1.0 / 30) {  // 20 ms at 720 skips every other 60 fps slot
-      int h = sixty.choose({432, 720}, px, t60);
-      sixty.observe(t60, h, h == 720 ? 20.0 : 20.0 * px(432) / px(720));
+      int h = sixty.choose({432, 720}, px, floor_samples, t60);
+      double ms = h == 720 ? 20.0 : 20.0 * px(432) / px(720);
+      sixty.observe(t60, h, {ms, 0.9 * ms, 0, floor_samples(h)});
     }
     CHECK(sixty.drawn() == 432, "a 60 fps renderer leaves a 20 ms height (drew %d)", sixty.drawn());
     {
@@ -629,7 +634,69 @@ int main() {
     Run solo = run(one, {720}, 33.0, 0, 5);
     CHECK(solo.last_h == 720, "one height asked: drawn (%d)", solo.last_h);
     // and nothing asked is 0
-    CHECK(one.choose({}, px, 10) == 0, "nothing asked");
+    CHECK(one.choose({}, px, floor_samples, 10) == 0, "nothing asked");
+    // Staging, 2026-11-03: the broadcast's aggregator asks every tile for 180
+    // and a viewer asks 432, at the grid budget of 176,777. A frame here costs
+    // 45 ns per sample traced, 2.7 us per 1,000 drawn pixels for the rest of the
+    // render and 1.5 ms of encodes (a T4 at full clocks, a terrain tile: 6.2 ms
+    // render, 5.9 ms trace at 180; 12 ms, 10.8 ms at 432). At 180 the budget
+    // draws 2 samples a pixel, at 432 a stride-2 checkerboard: about the same
+    // samples, so 432 costs about what 180 does. Predicted from the drawn pixels
+    // alone, 432 looked 4.4 times as costly and the tile stayed at 180.
+    {
+      const double budget = 176777;
+      auto samples = [&](int h) { return samples_for(budget, px(h)); };
+      auto cost = [&](int h) {
+        HeightGuard::Cost c;
+        c.samples = samples(h);
+        c.trace_ms = 45e-6 * c.samples;
+        c.render_ms = c.trace_ms + 2.7e-6 * px(h);
+        c.enc_ms = 1.5;
+        return c;
+      };
+      HeightGuard both;
+      long long skipped = 0;
+      int last = 0;
+      double t = 0;
+      for (int pass = 0; pass < 2; pass++) {
+        // the aggregator first, alone for 20 s; then the viewer as well
+        std::vector<int> asked = pass == 0 ? std::vector<int>{180} : std::vector<int>{180, 432};
+        for (double end = t + (pass == 0 ? 20 : 30); t < end;) {
+          int h = both.choose(asked, px, samples, t);
+          HeightGuard::Cost c = cost(h);
+          long long slots = std::max(1LL, (long long)std::ceil(c.frame_ms() / fslot - 1e-9));
+          both.observe(t, h, c);
+          if (pass == 1) skipped += slots - 1;
+          last = h;
+          t += slots * fslot / 1000.0;
+        }
+      }
+      CHECK(last == 432 && skipped == 0, "a tile asked 180 and 432 at one budget draws 432 (drew %d, %lld skipped; %.1f ms at 432)",
+            last, skipped, cost(432).frame_ms());
+      // and a budget at which 432 really costs more than the slot affords keeps
+      // 180: one sample on every pixel at 432 (4 a pixel at 180)
+      const double big = px(432);
+      auto samples2 = [&](int h) { return samples_for(big, px(h)); };
+      HeightGuard heavy;
+      int last2 = 0;
+      double t2 = 0;
+      for (int pass = 0; pass < 2; pass++) {
+        std::vector<int> asked = pass == 0 ? std::vector<int>{180} : std::vector<int>{180, 432};
+        for (double end = t2 + 20; t2 < end;) {
+          int h = heavy.choose(asked, px, samples2, t2);
+          HeightGuard::Cost c;
+          c.samples = samples2(h);
+          c.trace_ms = 45e-6 * c.samples;
+          c.render_ms = c.trace_ms + 2.7e-6 * px(h);
+          c.enc_ms = 1.5;
+          heavy.observe(t2, h, c);
+          last2 = h;
+          t2 += std::max(1.0, std::ceil(c.frame_ms() / fslot - 1e-9)) * fslot / 1000.0;
+        }
+      }
+      CHECK(last2 == 180, "at a budget of 1 sample a pixel at 432 (%.1f ms there) the tile keeps 180 (drew %d)",
+            45e-6 * samples_for(big, px(432)) + 2.7e-6 * px(432) + 1.5, last2);
+    }
   }
   {
     // The windowed fit: a camera path whose cost per sample swings 2x every

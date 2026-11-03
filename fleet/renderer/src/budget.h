@@ -187,12 +187,22 @@ struct CostModel {
 // 15 fps, the wall at 19 fps). So a tile draws at the tallest asked height whose
 // frame fits its slot, and a taller stream is scaled up from it.
 //
-// A frame's time is taken to grow with its drawn pixels (at the stride-4 floor
-// every per-pixel pass and the samples do), so a taller height is predicted
-// from the frames at the height drawn now. That overestimates a tile whose
-// budget gives it more than the floor, which only keeps it lower.
+// A taller height is predicted from the frames at the height drawn now, part by
+// part: the trace (the samples) grows with the samples the budget draws at that
+// height (samples_for: the same budget at more pixels is the same samples, until a
+// checkerboard stride rounds it up), the rest of the render (the per-pixel passes)
+// with the drawn pixels, and the encodes stay as they are (every asked stream is
+// encoded whatever height is drawn). Predicting the whole frame from the pixels,
+// as before, held a tile asked for 180 (the broadcast's aggregator) and 432 (a
+// viewer) at 180 at the same budget: on staging, 2026-11-03, 8 of 14 tiles drew
+// 180 for a 432 or 540 view, which the page scaled up 2.4 to 3 times.
 class HeightGuard {
  public:
+  // One frame: its render, the part of it that traced `samples` samples, and its encodes.
+  struct Cost {
+    double render_ms = 0, trace_ms = 0, enc_ms = 0, samples = 0;
+    double frame_ms() const { return render_ms + enc_ms; }
+  };
   double slot_ms = 1000.0 / 30;
   double over_frac = 0.85;   // frames whose 90th percentile passes this share of a slot: the height is too tall
   double fit_frac = 0.70;    // a step down goes to the tallest height predicted within this share
@@ -204,17 +214,18 @@ class HeightGuard {
   double backoff_s = 60.0;   // a height that overran is not drawn again for this long
   size_t min_frames = 15;
 
-  // One frame drawn at height h took frame_ms (render and encode).
-  void observe(double now_s, int h, double frame_ms) {
+  // One frame drawn at height h, and what it cost.
+  void observe(double now_s, int h, const Cost& c) {
     if (h != drawn_ || now_s - since_ < settle_s) return;
-    frames_.push_back({now_s, frame_ms});
+    frames_.push_back({now_s, c});
     prune(now_s);
   }
 
   // The height to draw for the asked heights (ascending, distinct); px(h) is
-  // the pixels a frame at h draws. 0 when nothing is asked.
-  template <class Px>
-  int choose(const std::vector<int>& asked, Px px, double now_s) {
+  // the pixels a frame at h draws and samples(h) the samples it traces at the
+  // budget in force. 0 when nothing is asked.
+  template <class Px, class Samples>
+  int choose(const std::vector<int>& asked, Px px, Samples samples, double now_s) {
     if (asked.empty()) return 0;
     prune(now_s);
     auto in = [&](int h) { return std::find(asked.begin(), asked.end(), h) != asked.end(); };
@@ -226,12 +237,20 @@ class HeightGuard {
     // once three frames span the window
     bool enough = frames_.size() >= min_frames ||
                   (frames_.size() >= 3 && now_s - frames_.front().first >= window_s);
-    double p90 = enough ? pct90() : -1;
+    double p90 = enough ? pct90([](const Cost& c) { return c.frame_ms(); }) : -1;
+    // a frame at h predicted from each frame drawn now: its 90th percentile
+    auto predicted = [&](int h) {
+      double pr = px(h) / px(drawn_), sh = samples(h);
+      return pct90([&](const Cost& c) {
+        double tr = c.samples > 0 ? c.trace_ms * sh / c.samples : c.trace_ms * pr;
+        return c.enc_ms + (c.render_ms - c.trace_ms) * pr + tr;
+      });
+    };
     // the tallest asked height under `below` predicted within frac of a slot
     auto fitting = [&](int below, double frac) {
       int best = 0;
       for (int h : asked)
-        if (h < below && !banned(h) && p90 >= 0 && p90 * px(h) / px(drawn_) <= frac * slot_ms) best = h;
+        if (h < below && !banned(h) && p90 >= 0 && predicted(h) <= frac * slot_ms) best = h;
       return best;
     };
     if (drawn_ == 0 || !in(drawn_)) {
@@ -269,15 +288,16 @@ class HeightGuard {
                                 (frames_.size() > min_frames && frames_.front().first < now_s - window_s)))
       frames_.pop_front();
   }
-  double pct90() const {
+  template <class F>
+  double pct90(F of) const {
     std::vector<double> v;
-    for (auto& f : frames_) v.push_back(f.second);
+    for (auto& f : frames_) v.push_back(of(f.second));
     size_t n = std::min(v.size() - 1, (size_t)(0.9 * v.size()));
     std::nth_element(v.begin(), v.begin() + n, v.end());
     return v[n];
   }
   int drawn_ = 0;
   double since_ = -1e18;
-  std::deque<std::pair<double, double>> frames_;
+  std::deque<std::pair<double, Cost>> frames_;
   std::map<int, double> banned_;
 };

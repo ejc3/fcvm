@@ -1676,9 +1676,10 @@ scales that frame to the taller streams: an opened 16:9 tile asks 720 against
 the wall's 432, and on terrain a 720 frame overran its slot at the lowest
 budget, which held the whole wall to that tile's rate. A height whose frames'
 90th percentile passes 85% of a slot is left for the tallest height predicted
-(frame time in proportion to drawn pixels) within 70%, and not drawn again for
-60 s; a taller height is taken after 10 s at one height when predicted within
-65%.
+within 70%, and not drawn again for 60 s; a taller height is taken after 10 s at
+one height when predicted within 65%. A height is predicted from the frames drawn
+now: the trace in proportion to the samples the budget draws at that height, the
+rest of the render in proportion to the drawn pixels, and the encodes as they are.
 `layout_generation` is the layout in force (null without one), and
 `layout_pending` (`{"generation", "from_frame"}`, present only while one is
 waiting) the next.

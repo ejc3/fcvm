@@ -216,6 +216,43 @@ The grid controller then raises the budget toward its target of 70% of a slot
 for the slowest tile, so the slowest tile's render time, which is the wall's,
 moves from what the slow clock made it toward that target (23.3 ms), at most.
 
+## The height a tile draws, at the grid budget (round 18, 2026-11-03)
+
+On the same staging wall, 8 of 14 tiles drew at 180 (`drawn_h`) for a 432 or 540
+stream, and the page scaled them up 2.4 to 3 times: stair-stepped edges and
+smeared texture across the lower half of the wall. The broadcast's aggregator
+subscribes every tile at 180, and `HeightGuard` (budget.h) predicted a taller
+height's frame from the frame drawn now in proportion to the drawn pixels: 4.4
+times as costly at 432. At the grid budget the samples hardly change with the
+height (176,777 is 2 samples a pixel at 180 and a stride-2 checkerboard at 432),
+so the frame does not either. A terrain tile asked 180 and 432, on a T4 at full
+clocks: 180 took 6.2 ms to render (5.9 ms of it the trace), 432 took 8.5 to 12.2
+ms, and the guard kept 180, predicting 28 ms.
+
+A height is now predicted part by part from the frames drawn now: the trace in
+proportion to the samples the budget draws at that height (`samples_for`), the
+rest of the render in proportion to the drawn pixels, the encodes as they are.
+The same tile then draws 432 (8.4 to 12.0 ms render, frame p99 10.8 to 15.4 ms
+over 12 s), and so does a sky tile asked both (7.1 ms at 585 MHz). A heavy
+terrain pose whose 432 frames passed the overrun threshold still stepped down to
+180, as before.
+
+What the owner's view gains, by `quality --h 432 --cols 4 --rows 4 --encode 432`
+(and `--h 180 --encode 432` for 180 scaled up) on three staging poses, the moving
+frame decoded at `std` against the same pose held to 1024 samples, FLIP (lower is
+closer):
+
+| drawn | heavy terrain | snow and lakes | snow and meadow |
+|---|---|---|---|
+| 180 scaled to 432 (staging's lower half) | 0.0989 | 0.0496 | 0.0699 |
+| 432, stride 2 (staging's upper half, budget 176,777) | 0.1026 | 0.0601 | 0.0518 |
+| 432, every pixel (budget 250,000) | 0.0815 | 0.0402 | 0.0462 |
+| 432, 2 samples a pixel (budget 1,000,000) | 0.0736 | 0.0372 | 0.0441 |
+
+Rendering every pixel needs the clocks of the section above; two samples a pixel
+took 33 to 45 ms on the slowest tile and does not fit a slot.
+`shots/wall-clean-r18.jpg`: crops of the reference and the first three rows.
+
 ## The word's edges (round 17, 2026-10-30)
 
 The owner's staging screenshot showed the lockup word with a hard light outline,
