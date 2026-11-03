@@ -24,12 +24,15 @@ already holds it at every pre sample; its cgroup is the only record of it.
 
 Each figure is a mean over the 14 page blocks (a repetition renders one page
 at every N, on both sides), so the clone and container values of a block are
-paired. The limit as N grows is the difference of the least-squares slopes,
-which is where (server + intercept) / N goes to zero. Break-even is the N at
-which server / N equals that slope difference. Intervals are a percentile
-bootstrap that resamples whole page blocks for both sides together (5000
-resamples), widened to include the estimate, and rounded no finer than their
-uncertainty: corpus_mem's method for its fits.
+paired. The memory server grows a little with N, so the clone side's slope is
+fitted to the clone totals with the server included. The limit as N grows is
+the difference of the two sides' least-squares slopes, where every intercept /
+N goes to zero. Break-even is the N at which the server's fixed part (the
+intercept of the server's own fit over N) / N equals that slope difference.
+Intervals are a percentile bootstrap over whole page blocks, as corpus_mem's
+fits are, but with both sides resampled together so a difference is paired
+(5000 resamples), widened to include the estimate and rounded no finer than
+their uncertainty as corpus_mem rounds.
 
 Usage: python3 memory_delta.py <memory dir> [<memory dir> ...] > out.json
 """
@@ -157,22 +160,29 @@ def statistics_for(blocks, ns):
             out[(basis, n, "container")] = container
             out[(basis, n, "delta")] = clone - container
         slopes = {}
+        # MemFree and MemAvailable falls already hold the server's growth during
+        # a cell; the cgroup and PSS totals get it from the server's sample.
+        slope_key = basis if basis.startswith("host_") else key
         for side in (CLONE, CONTAINER):
             xs = [n for b in blocks for n in ns]
-            ys = [b[side][n][basis] for b in blocks for n in ns]
+            ys = [b[side][n][slope_key] for b in blocks for n in ns]
             slope, _intercept = corpus_mem.slope_intercept(xs, ys)
             slopes[side] = slope
         out[(basis, "limit", "clone")] = slopes[CLONE]
         out[(basis, "limit", "container")] = slopes[CONTAINER]
         out[(basis, "limit", "delta")] = slopes[CLONE] - slopes[CONTAINER]
-    serve_cgroup = statistics.mean(b[CLONE][n]["serve_cgroup"] for b in blocks for n in ns)
-    serve_pss = statistics.mean(b[CLONE][n]["serve_pss"] for b in blocks for n in ns)
-    out[("serve", "resident")] = serve_cgroup
-    out[("serve", "pss")] = serve_pss
+    xs = [n for b in blocks for n in ns]
+    for basis, field in (("resident", "serve_cgroup"), ("pss", "serve_pss")):
+        out[("serve", basis)] = statistics.mean(b[CLONE][n][field] for b in blocks for n in ns)
+        slope, intercept = corpus_mem.slope_intercept(
+            xs, [b[CLONE][n][field] for b in blocks for n in ns])
+        out[("serve_fixed", basis)] = intercept
+        out[("serve_per_clone", basis)] = slope
     for n in ns:
         out[("clone_page_cache", n)] = statistics.mean(
             b[CLONE][n]["page_cache"] / n for b in blocks)
-    for basis, serve in (("resident", serve_cgroup), ("pss", serve_pss)):
+    for basis in ("resident", "pss"):
+        serve = out[("serve_fixed", basis)]
         gap = out[(basis, "limit", "delta")]
         out[("break_even", basis)] = serve / gap if gap > 0 else math.inf
     return out
@@ -213,7 +223,8 @@ def analyze(directory):
         "page_blocks": len(reps),
         "ns": ns,
         "statistic": "mean over page blocks of per-instance MiB; limit is the "
-                     "difference of least-squares slopes over N",
+                     "difference of least-squares slopes over N, the clone side's "
+                     "fitted with the memory server included",
         "uncertainty": {"method": "page-block bootstrap, both sides resampled together",
                         "resamples": RESAMPLES, "confidence": 0.95},
         "bases": {
@@ -226,9 +237,14 @@ def analyze(directory):
                               "kernel counts as reclaimable",
         },
         "serve_mean_mib": {
-            "resident": rounded(observed[("serve", "resident")], draws[("serve", "resident")]),
-            "pss": rounded(observed[("serve", "pss")], draws[("serve", "pss")]),
-        },
+            basis: rounded(observed[("serve", basis)], draws[("serve", basis)])
+            for basis in ("resident", "pss")},
+        "serve_fit_mib": {
+            basis: {"fixed": rounded(observed[("serve_fixed", basis)],
+                                     draws[("serve_fixed", basis)]),
+                    "per_clone": rounded(observed[("serve_per_clone", basis)],
+                                         draws[("serve_per_clone", basis)])}
+            for basis in ("resident", "pss")},
     }
     for basis in BASES:
         table = {}
@@ -239,7 +255,8 @@ def analyze(directory):
             }
         result[basis] = table
     result["clone_page_cache_mib_per_clone"] = {
-        "field": "memory.stat file of the clones' cgroups (clone_file_kb), per clone",
+        "field": "memory.stat file of the clones' cgroups (clone_file_kb, page cache "
+                 "and shmem), per clone",
         **{str(n): rounded(observed[("clone_page_cache", n)],
                            draws[("clone_page_cache", n)]) for n in ns},
     }
@@ -247,7 +264,8 @@ def analyze(directory):
     for basis in ("resident", "pss"):
         key = ("break_even", basis)
         finite = [d for d in draws[key] if math.isfinite(d)]
-        entry = {"definition": "memory server / (clone slope - container slope)",
+        entry = {"definition": "memory server's fitted fixed part / (clone slope with "
+                               "the server - container slope)",
                  "resamples_with_no_positive_gap": len(draws[key]) - len(finite)}
         if math.isfinite(observed[key]) and len(finite) == len(draws[key]):
             entry.update(rounded(observed[key], draws[key]))

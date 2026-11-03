@@ -12,7 +12,7 @@
    32,
    48
   ],
-  "statistic": "mean over page blocks of per-instance MiB; limit is the difference of least-squares slopes over N",
+  "statistic": "mean over page blocks of per-instance MiB; limit is the difference of least-squares slopes over N, the clone side's fitted with the memory server included",
   "uncertainty": {
    "method": "page-block bootstrap, both sides resampled together",
    "resamples": 5000,
@@ -50,6 +50,64 @@
      10.462168666294643,
      10.836641322544644
     ]
+   }
+  },
+  "serve_fit_mib": {
+   "resident": {
+    "fixed": {
+     "estimate": 800.8,
+     "ci95": [
+      800.2,
+      801.5
+     ],
+     "rounding": 0.1,
+     "unrounded": 800.8091015752116,
+     "unrounded_ci95": [
+      800.2227468076608,
+      801.464544866421
+     ]
+    },
+    "per_clone": {
+     "estimate": 1.88,
+     "ci95": [
+      1.8,
+      1.95
+     ],
+     "rounding": 0.01,
+     "unrounded": 1.878374272901074,
+     "unrounded_ci95": [
+      1.8031191844797427,
+      1.9466749524589162
+     ]
+    }
+   },
+   "pss": {
+    "fixed": {
+     "estimate": 11.5,
+     "ci95": [
+      11.1,
+      11.9
+     ],
+     "rounding": 0.1,
+     "unrounded": 11.533682230121725,
+     "unrounded_ci95": [
+      11.192701738570438,
+      11.800021717830003
+     ]
+    },
+    "per_clone": {
+     "estimate": -0.04,
+     "ci95": [
+      -0.06,
+      -0.03
+     ],
+     "rounding": 0.01,
+     "unrounded": -0.04115864945823503,
+     "unrounded_ci95": [
+      -0.051663698096481706,
+      -0.030448101725207455
+     ]
+    }
    }
   },
   "resident": {
@@ -266,10 +324,10 @@
       410.0
      ],
      "rounding": 10.0,
-     "unrounded": 337.8655392925785,
+     "unrounded": 339.7439135654796,
      "unrounded_ci95": [
-      285.78824912560634,
-      401.2884855717895
+      287.67175823674694,
+      403.2061059467031
      ]
     },
     "container": {
@@ -292,10 +350,10 @@
       130.0
      ],
      "rounding": 10.0,
-     "unrounded": 95.85830953630918,
+     "unrounded": 97.73668380921029,
      "unrounded_ci95": [
-      71.94997377653212,
-      123.53619886870646
+      73.81026999426706,
+      125.45693871410894
      ]
     }
    }
@@ -514,10 +572,10 @@
       290.0
      ],
      "rounding": 10.0,
-     "unrounded": 236.3029425062731,
+     "unrounded": 236.2617838568149,
      "unrounded_ci95": [
-      193.27459172684246,
-      288.00417048674313
+      193.23297331512381,
+      287.965997738998
      ]
     },
     "container": {
@@ -540,10 +598,10 @@
       40.0
      ],
      "rounding": 10.0,
-     "unrounded": 17.119578417682703,
+     "unrounded": 17.078419768224506,
      "unrounded_ci95": [
-      -1.256246154765307,
-      37.50419375180343
+      -1.307698179742153,
+      37.45443480988489
      ]
     }
    }
@@ -1045,7 +1103,7 @@
    }
   },
   "clone_page_cache_mib_per_clone": {
-   "field": "memory.stat file of the clones' cgroups (clone_file_kb), per clone",
+   "field": "memory.stat file of the clones' cgroups (clone_file_kb, page cache and shmem), per clone",
    "2": {
     "estimate": 76.0,
     "ci95": [
@@ -1114,24 +1172,24 @@
   },
   "break_even_n": {
    "resident": {
-    "definition": "memory server / (clone slope - container slope)",
+    "definition": "memory server's fitted fixed part / (clone slope with the server - container slope)",
     "resamples_with_no_positive_gap": 0,
-    "estimate": 9.0,
+    "estimate": 8.0,
     "ci95": [
      6.0,
-     12.0
+     11.0
     ],
     "rounding": 1.0,
-    "unrounded": 8.769512421271111,
+    "unrounded": 8.193536657520058,
     "unrounded_ci95": [
-     6.810983719080063,
-     11.672265545327983
+     6.381926925232871,
+     10.851202937697146
     ]
    },
    "pss": {
-    "definition": "memory server / (clone slope - container slope)",
-    "resamples_with_no_positive_gap": 182,
-    "estimate": 0.6227442406289246,
+    "definition": "memory server's fitted fixed part / (clone slope with the server - container slope)",
+    "resamples_with_no_positive_gap": 183,
+    "estimate": 0.6753366170083768,
     "ci95": null,
     "note": "the slope gap is not positive in every resample, so no interval"
    }
@@ -1150,7 +1208,7 @@
    32,
    48
   ],
-  "statistic": "mean over page blocks of per-instance MiB; limit is the difference of least-squares slopes over N",
+  "statistic": "mean over page blocks of per-instance MiB; limit is the difference of least-squares slopes over N, the clone side's fitted with the memory server included",
   "uncertainty": {
    "method": "page-block bootstrap, both sides resampled together",
    "resamples": 5000,
@@ -1188,6 +1246,64 @@
      10.207698102678572,
      10.618918805803572
     ]
+   }
+  },
+  "serve_fit_mib": {
+   "resident": {
+    "fixed": {
+     "estimate": 806.2,
+     "ci95": [
+      805.4,
+      806.9
+     ],
+     "rounding": 0.1,
+     "unrounded": 806.1620097484644,
+     "unrounded_ci95": [
+      805.4860377422498,
+      806.859473792342
+     ]
+    },
+    "per_clone": {
+     "estimate": 1.88,
+     "ci95": [
+      1.81,
+      1.95
+     ],
+     "rounding": 0.01,
+     "unrounded": 1.881877488279979,
+     "unrounded_ci95": [
+      1.811484121166841,
+      1.9472456281905914
+     ]
+    }
+   },
+   "pss": {
+    "fixed": {
+     "estimate": 11.3,
+     "ci95": [
+      10.9,
+      11.6
+     ],
+     "rounding": 0.1,
+     "unrounded": 11.256381699288664,
+     "unrounded_ci95": [
+      10.92684595199272,
+      11.526443235159617
+     ]
+    },
+    "per_clone": {
+     "estimate": -0.04,
+     "ci95": [
+      -0.05,
+      -0.02
+     ],
+     "rounding": 0.01,
+     "unrounded": -0.03936878803922266,
+     "unrounded_ci95": [
+      -0.04960776570174579,
+      -0.028646482647027793
+     ]
+    }
    }
   },
   "resident": {
@@ -1398,16 +1514,16 @@
    },
    "limit": {
     "clone": {
-     "estimate": 320.0,
+     "estimate": 330.0,
      "ci95": [
-      260.0,
-      390.0
+      270.0,
+      400.0
      ],
      "rounding": 10.0,
-     "unrounded": 323.19157507487085,
+     "unrounded": 325.07345256315085,
      "unrounded_ci95": [
-      268.8030501013426,
-      389.6431587018138
+      270.62333841767634,
+      391.5602703895159
      ]
     },
     "container": {
@@ -1430,10 +1546,10 @@
       120.0
      ],
      "rounding": 10.0,
-     "unrounded": 81.9209233838574,
+     "unrounded": 83.8028008721374,
      "unrounded_ci95": [
-      54.847827857501976,
-      113.23263945053505
+      56.69682490866774,
+      115.14535382236984
      ]
     }
    }
@@ -1652,10 +1768,10 @@
       290.0
      ],
      "rounding": 10.0,
-     "unrounded": 234.42184044055585,
+     "unrounded": 234.3824716525166,
      "unrounded_ci95": [
-      188.56764351633447,
-      289.5538587243091
+      188.52188476403603,
+      289.52364014347165
      ]
     },
     "container": {
@@ -1678,10 +1794,10 @@
       50.0
      ],
      "rounding": 10.0,
-     "unrounded": 15.687875466512793,
+     "unrounded": 15.648506678473552,
      "unrounded_ci95": [
-      -6.171769774933785,
-      40.70193921383062
+      -6.218832927769636,
+      40.658494676117606
      ]
     }
    }
@@ -2183,7 +2299,7 @@
    }
   },
   "clone_page_cache_mib_per_clone": {
-   "field": "memory.stat file of the clones' cgroups (clone_file_kb), per clone",
+   "field": "memory.stat file of the clones' cgroups (clone_file_kb, page cache and shmem), per clone",
    "2": {
     "estimate": 64.0,
     "ci95": [
@@ -2252,24 +2368,24 @@
   },
   "break_even_n": {
    "resident": {
-    "definition": "memory server / (clone slope - container slope)",
+    "definition": "memory server's fitted fixed part / (clone slope with the server - container slope)",
     "resamples_with_no_positive_gap": 0,
     "estimate": 10.0,
     "ci95": [
      7.0,
-     16.0
+     15.0
     ],
     "rounding": 1.0,
-    "unrounded": 10.327737744551797,
+    "unrounded": 9.619750191625107,
     "unrounded_ci95": [
-     7.4782156939630005,
-     15.40461013536317
+     7.00005179929756,
+     14.22585241430846
     ]
    },
    "pss": {
-    "definition": "memory server / (clone slope - container slope)",
-    "resamples_with_no_positive_gap": 440,
-    "estimate": 0.6643196151769148,
+    "definition": "memory server's fitted fixed part / (clone slope with the server - container slope)",
+    "resamples_with_no_positive_gap": 442,
+    "estimate": 0.7193262546114514,
     "ci95": null,
     "note": "the slope gap is not positive in every resample, so no interval"
    }
