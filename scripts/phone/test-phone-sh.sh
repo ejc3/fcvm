@@ -282,7 +282,7 @@ adb_has() { grep -qF -- "$1" "$B/adb.log"; }
 if bact open_browser; then bad "open_browser succeeded on a phone without the browser"; else ok "a phone without the browser refuses open_browser"; fi
 touch "$B/installed"
 bact open_browser || bad "open_browser failed: $(cat "$dir/act.err")"
-adb_has "shell am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER org.cromite.cromite" && adb_has "shell input keycombination 113 46" \
+adb_has "shell am start -W -n org.cromite.cromite/org.chromium.chrome.browser.ChromeTabbedActivity" && adb_has "shell input keycombination 113 46" \
   && ! adb_has "force-stop" && grep -q "shown_ms=123" "$B/out" && [ "$(cat "$B/front")" = browser ] \
   && ok "open_browser brings the loaded page to the front and reloads it" || bad "open_browser ran: $(cat "$B/adb.log" "$B/out")"
 bact dance || bad "dance after open_browser failed: $(cat "$dir/act.err")"

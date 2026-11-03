@@ -365,9 +365,11 @@ action)
     if mirror_open; then
       restart_browser
     else
-      # the page loaded when the phone started comes to the front at once, and loads again
-      # (Ctrl+R) while it shows
-      out=$("$ADB" shell am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER "$BROWSER_PKG" 2>&1 | tr -d '\r')
+      # the page loaded when the phone started comes to the front, and loads again (Ctrl+R)
+      # while it shows. The activity is named, not launched as from the home screen: a launch
+      # from the home screen after a while away (and a clone's clock has moved on) opens a new
+      # tab page instead of the tab.
+      out=$("$ADB" shell am start -W -n "$BROWSER_PKG/org.chromium.chrome.browser.ChromeTabbedActivity" 2>&1 | tr -d '\r')
       grep -q '^Status: ok' <<< "$out" || { echo "phone.sh: the browser did not come to the front: $out" >&2; exit 1; }
       echo browser > "$RUN/front"
       sed -n 's/^TotalTime: */shown_ms=/p' <<< "$out" > "$RUN/shown"

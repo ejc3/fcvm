@@ -181,12 +181,19 @@ browser_in_front() {
     || bad "the browser is not in front $2: $top"
   title=$("$F" exec --pid "$1" -- /usr/local/bin/phone.sh page 20 2>&1) && ok "the browser shows '$title' $2" \
     || bad "the browser shows no NVIDIA page $2: $title"
-  # NVIDIA's green (#76b900) is on screen: the page is drawn, not only loaded
-  green=$("$F" exec --pid "$1" -- sh -c '/android/platform-tools/adb exec-out screencap' 2> /dev/null | python3 -c '
+  # NVIDIA's green (#76b900) is on screen within 10 s: the page is drawn, not only loaded (the
+  # action reloads it, so the first screenshots can catch it between documents)
+  local t0 i
+  t0=$(date +%s%3N)
+  for i in $(seq 1 20); do
+    green=$("$F" exec --pid "$1" -- sh -c '/android/platform-tools/adb exec-out screencap' 2> /dev/null | python3 -c '
 import sys
 d = sys.stdin.buffer.read()[16:]
 print(sum(1 for i in range(0, len(d) - 3, 4) if abs(d[i] - 0x76) < 24 and abs(d[i + 1] - 0xb9) < 24 and d[i + 2] < 40))' || echo 0)
-  [ "${green:-0}" -ge 400 ] && ok "the page is drawn $2: $green pixels of NVIDIA green" || bad "the page is not drawn $2: $green pixels of NVIDIA green"
+    [ "${green:-0}" -ge 400 ] && break
+    [ $(( $(date +%s%3N) - t0 )) -lt 10000 ] || break
+  done
+  [ "${green:-0}" -ge 400 ] && ok "the page is drawn $2: $green pixels of NVIDIA green" || bad "the page is not drawn $2 within 10 s: $green pixels of NVIDIA green"
 }
 # The proxy the phone reaches at the container's 127.0.0.1:3128 (through the VM's
 # --forward-localhost) tunnels to www.nvidia.com and refuses a name off its list.
@@ -264,8 +271,9 @@ if boot=$(timeout 400 "$F" exec --pid "$pid" -- /usr/local/bin/phone.sh boot 2>&
     bad "the browser did not open www.nvidia.com: $title"
   fi
   proxy_boundary
-  # the probe app in front again, for the draw checks
+  # the probe app in front again, drawing before the release checks start
   X sh -c '/android/platform-tools/adb shell am start -W -n dev.fcvm.probe/.MainActivity' > /dev/null 2>&1 || true
+  check_draws "$pid" "with the browser behind it"
   in_place_release_and_retake
   retake_without_vulkan
   warm_snapshot_onto_the_second_gpu
