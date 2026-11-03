@@ -5,7 +5,8 @@ Reads one memory phase's raw `samples.jsonl` (corpus_mem.py, `make
 bench-chromium-corpus-extra PHASES=memory`), refuses unless it and
 `summary.json` have the sha256 and size the phase's `complete.json` records
 (so every raw field read here, not only those summary.json repeats, is the
-record's), rebuilds its cells with
+record's) and the campaign's `campaign-complete.json` seals that
+`complete.json` with no `WITHDRAWN` marker beside either, rebuilds its cells with
 corpus_mem.cell_values, and refuses unless the rebuilt cells and the fits
 corpus_mem.summarize_memory_fits computes from them equal the `cells` and
 `fits` of the `summary.json` beside it. Then, at each N and as N grows:
@@ -34,6 +35,7 @@ Usage: python3 memory_delta.py <memory dir> [<memory dir> ...] > out.json
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
@@ -169,9 +171,27 @@ def statistics_for(blocks, ns):
 
 
 def check_completion(directory, run_id):
-    """samples.jsonl and summary.json must be the bytes the phase sealed."""
-    with open(os.path.join(directory, "complete.json")) as handle:
-        complete = json.load(handle)
+    """The campaign must be complete and not withdrawn, and samples.jsonl and
+    summary.json must be the bytes the phase sealed."""
+    campaign = os.path.dirname(os.path.abspath(directory))
+    for where in (campaign, directory):
+        if os.path.lexists(os.path.join(where, "WITHDRAWN")):
+            raise SystemExit(f"{where}: withdrawn")
+    complete_path = os.path.join(directory, "complete.json")
+    with open(complete_path, "rb") as handle:
+        complete_bytes = handle.read()
+    try:
+        with open(os.path.join(campaign, "campaign-complete.json")) as handle:
+            campaign_complete = json.load(handle)
+    except FileNotFoundError:
+        raise SystemExit(f"{campaign}: no campaign-complete.json, so the campaign is not complete")
+    sealed_phase = campaign_complete.get("memory_complete") or {}
+    if (campaign_complete.get("run_id") != run_id
+            or sealed_phase.get("path") != os.path.join(os.path.basename(directory), "complete.json")
+            or sealed_phase.get("size") != len(complete_bytes)
+            or sealed_phase.get("sha256") != hashlib.sha256(complete_bytes).hexdigest()):
+        raise SystemExit(f"{campaign}: campaign-complete.json does not seal this memory phase")
+    complete = json.loads(complete_bytes)
     if complete.get("run_id") != run_id:
         raise SystemExit(f"{directory}: complete.json names another run")
     sealed = {a["path"]: a for a in complete["artifacts"]}
@@ -272,8 +292,23 @@ def main(argv):
     if len(argv) < 2:
         print(__doc__, file=sys.stderr)
         return 2
-    json.dump([analyze(d.rstrip("/")) for d in argv[1:]], sys.stdout, indent=1)
-    sys.stdout.write("\n")
+    # A withdrawal marker writer takes an exclusive flock on the run directory
+    # (AGENTS.md); holding a shared one from the first marker read through the
+    # write keeps a withdrawal from landing in between.
+    directories = [d.rstrip("/") for d in argv[1:]]
+    locks = []
+    try:
+        for directory in directories:
+            fd = os.open(os.path.dirname(os.path.abspath(directory)),
+                         os.O_RDONLY | os.O_DIRECTORY)
+            locks.append(fd)
+            fcntl.flock(fd, fcntl.LOCK_SH)
+        json.dump([analyze(d) for d in directories], sys.stdout, indent=1)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    finally:
+        for fd in locks:
+            os.close(fd)
     return 0
 
 
