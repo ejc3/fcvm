@@ -1307,16 +1307,23 @@ command-line file"); a start from the warm snapshot shows none.
 **In the warm snapshot.** `phone.sh serve` opens the browser on the page before it starts
 Robot Park, and waits until its DevTools list (`chrome_devtools_remote`, read over adb inside
 the container) names an NVIDIA page; a browser that does not get there fails the phone. So
-`open_browser` is an activity coming to the front (`am start` of the launcher activity), then
-Ctrl+R. On a gpubox (g4dn.metal, T4), on a running phone:
+`open_browser` is the browser's activity coming to the front (`am start -n` of
+`ChromeTabbedActivity`; launched as from the home screen after time away, and a clone's clock
+has moved on since the snapshot, it opens a new tab page instead), then Ctrl+R. On a gpubox
+(g4dn.metal, T4), rootless phone VMs, the page cache warm:
 
-| step | measured |
-|---|---|
-| `am start -W` of the browser behind Robot Park, `TotalTime` | 136 to 599 ms |
-| the whole action through `fcvm exec`, as the agent runs it | 473 to 971 ms |
-| the reload, navigation start to first contentful paint (page cache warm) | 524 ms |
-| a new tab of the page through the proxy, first contentful paint | 1364 ms (first byte 903 ms) |
-| `restart_app` with the browser in front (closes its tabs, starts it on the page) | 846 to 1145 ms |
+| | the browser in front (`am start -W` `TotalTime`) | the action through `fcvm exec`, as the agent runs it | the reload, navigation start to first contentful paint |
+|---|---|---|---|
+| a clone of the warm snapshot, the first time | 2653 to 3495 ms | 3311 to 3831 ms | 748 ms |
+| the same clone, again | 70 to 263 ms | 379 ms | 1556 ms |
+| the phone that was never snapshotted | 136 to 599 ms | 473 to 971 ms | 524 ms |
+| `restart_app` with the browser in front (its tabs closed, started on the page) | | 846 to 1145 ms | |
+
+The first time is gfxstream restoring the browser's GL state: after a snapshot load it restores
+a share group when one of its contexts is first made current (`ShareGroup::postLoadRestore`),
+and the browser's first frame waits for it (HWUI reports one frame of 2672 ms). The source
+phone pays it too, once, after its own warm snapshot (3138 ms). Restoring the share groups
+before a viewer asks is tracked in #1492.
 
 **Network.** A phone VM is routed over IPv6 only (`--network routed`: no IPv4 leaves the
 VM), and www.nvidia.com has no AAAA record (a CNAME to Akamai's edgekey with A records only),
