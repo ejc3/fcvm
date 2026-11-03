@@ -522,25 +522,8 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     if (nowc < still_until_) render_h = encode_geometry(*sc, still_h_).h;
     else if (nowc < warm_until_) render_h = encode_geometry(*sc, warm_h_).h;
   }
-  // Draw at the tallest stream height whose frame fits a slot, and scale it to
-  // the taller streams (HeightGuard, budget.h): one slow tile holds the whole
-  // wall to its rate.
-  int drawn_h = 0;
-  if (!encs_.empty()) {
-    std::vector<int> asked;
-    for (auto& [ekey, e] : encs_)
-      if (asked.empty() || asked.back() != ekey / 4) asked.push_back(ekey / 4);
-    auto px_at = [&](int h) {
-      return r_.drawn_pixels(tile_geometry(sc->rect, sc->image_aspect, encode_geometry(*sc, h).h));
-    };
-    drawn_h = height_guard_.choose(asked, px_at, mono_s());
-    render_h = encode_geometry(*sc, drawn_h).h;
-    warm_h_ = drawn_h;  // a later scene warms at the height last streamed
-  }
-  Tile rt = tile_geometry(sc->rect, sc->image_aspect, render_h);
-  double px = r_.drawn_pixels(rt);
-  // The budget for this slot: a posted schedule first (the same on every tile
-  // of a grid), then the scene's, then a whole-image renderer's own, then the
+  // The budget for a slot: a posted schedule first (the same on every tile of
+  // a grid), then the scene's, then a whole-image renderer's own, then the
   // default.
   bool whole = sc->rect.x == 0 && sc->rect.y == 0 && sc->rect.w == 1 && sc->rect.h == 1;
   auto budget_at = [&](long long kk, const char** src) {
@@ -553,6 +536,27 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     else if (opt_.adapt && whole) { b = budget_; *src = "local"; }
     return b;
   };
+  // Draw at the tallest stream height whose frame fits a slot, and scale it to
+  // the taller streams (HeightGuard, budget.h): one slow tile holds the whole
+  // wall to its rate.
+  int drawn_h = 0;
+  if (!encs_.empty()) {
+    std::vector<int> asked;
+    for (auto& [ekey, e] : encs_)
+      if (asked.empty() || asked.back() != ekey / 4) asked.push_back(ekey / 4);
+    auto px_at = [&](int h) {
+      return r_.drawn_pixels(tile_geometry(sc->rect, sc->image_aspect, encode_geometry(*sc, h).h));
+    };
+    // the samples a frame at h traces at this slot's budget
+    const char* bsrc;
+    double b_now = budget_at(std::llround(t * opt_.fps), &bsrc);
+    auto samples_at = [&](int h) { return samples_for(b_now, px_at(h)); };
+    drawn_h = height_guard_.choose(asked, px_at, samples_at, mono_s());
+    render_h = encode_geometry(*sc, drawn_h).h;
+    warm_h_ = drawn_h;  // a later scene warms at the height last streamed
+  }
+  Tile rt = tile_geometry(sc->rect, sc->image_aspect, render_h);
+  double px = r_.drawn_pixels(rt);
   const char* source;
   long long k0 = std::llround(t * opt_.fps);
   // A stream's first frames. A moving frame averages the 7 frames before it,
@@ -786,7 +790,11 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     }
     for (auto& e : left) retire(e);
   }
-  if (!prime && drawn_h > 0) height_guard_.observe(mono_s(), drawn_h, r_.stats().render_ms + enc_ms);
+  if (!prime && drawn_h > 0) {
+    const RenderStats& rs = r_.stats();
+    double samples = rs.spp > 0 ? px / rs.half * rs.spp : 0;
+    height_guard_.observe(mono_s(), drawn_h, {rs.render_ms, rs.trace_ms, enc_ms, samples});
+  }
   std::lock_guard<std::mutex> l(hmu_);
   last_t_ = t;
   frame_ = frame_no;
