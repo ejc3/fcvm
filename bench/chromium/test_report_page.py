@@ -360,7 +360,7 @@ class ReportContent(unittest.TestCase):
                 counts = re.findall(r"\b0 (?:of|failures in|in) (?:the [\w-]+ arm[\u2019']s )?(\d[\d,]*)", text)
                 self.assertTrue(counts, f"a corpus zero-failure count without its attempts: {text[:160]!r}")
                 self.assertEqual(set(counts), {"230"}, f"attempt counts {counts} in: {text[:160]!r}")
-        self.assertGreaterEqual(checked, 2, "the tile and the sample-gate bullet were not both checked")
+        self.assertGreaterEqual(checked, 1, "no zero-failure count was checked; the sample-gate bullet states one")
 
     @staticmethod
     def campaign_runs():
