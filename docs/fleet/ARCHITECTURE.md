@@ -1368,7 +1368,7 @@ replayed on WebGL2 in headless Chrome, draws the toolbar and the page, but the w
 (`glDrawElements: Must have element array buffer bound`): Chromium's GPU process uses one buffer
 both as `ARRAY_BUFFER` and as `ELEMENT_ARRAY_BUFFER`, which GLES allows and WebGL2 forbids, so
 the mirror's bind of it as an index buffer is refused. The decoder needs a separate WebGL buffer
-for each role, its contents kept in step. Tracked in ejc3/fcvm#ISSUE; the video view is
+for each role, its contents kept in step. Tracked in #1485; the video view is
 correct.
 
 ### Invariants (each becomes a test)
@@ -1459,6 +1459,9 @@ correct.
    streamer's `GET /mirror` and its admission; the take-over panel's three views and their
    readouts; the emulator pin. Then FREE records, replies on ring streams and no program
    binaries for a mirrorable guest (ejc3/gfxstream#5), and the join snapshot.
+10. The browser ("The browser", above): Cromite on www.nvidia.com in the warm snapshot, the
+    `open_browser` and `open_app` actions, the phone web proxy, and `make phone-test`'s checks.
+    Then the mirror's drawing of it (#1485).
 
 ## Invariants (each becomes a test)
 

@@ -279,13 +279,13 @@ pub fn check_browser_apk(p: &PhoneCfg) -> anyhow::Result<()> {
 /// The command that carries out a take-over action in a running phone: `phone.sh action
 /// <name>` in its container, through `fcvm exec`. Each action is one of the enumerated
 /// names, never text from a viewer. `None` for `reboot_phone`, which the coordinator turns
-/// into a relaunch of the VM.
+/// into a relaunch of the VM, and for an action this build does not know.
 pub fn phone_action_argv(
     vm_pid: u32,
     action: fleet_core::phone::PhoneAction,
 ) -> Option<Vec<String>> {
     use fleet_core::phone::PhoneAction;
-    if action == PhoneAction::RebootPhone {
+    if matches!(action, PhoneAction::RebootPhone | PhoneAction::Unknown) {
         return None;
     }
     Some(
@@ -512,6 +512,7 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split("\n  ;;\n").next())
             .expect("phone.sh has an action command");
+        assert_eq!(super::phone_action_argv(42, PhoneAction::Unknown), None);
         for a in PhoneAction::ALL {
             match super::phone_action_argv(42, a) {
                 None => assert_eq!(a, PhoneAction::RebootPhone),

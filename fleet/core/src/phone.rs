@@ -32,6 +32,11 @@ pub enum PhoneAction {
     OpenApp,
     /// Restore the phone's VM from its snapshot.
     RebootPhone,
+    /// An action this build does not know, from a newer coordinator: carried out as nothing,
+    /// so the rest of the assignment it came in still reaches the agent. Never in `ALL`, so
+    /// never accepted from a viewer.
+    #[serde(other)]
+    Unknown,
 }
 
 impl PhoneAction {
@@ -61,6 +66,7 @@ impl PhoneAction {
             PhoneAction::OpenBrowser => "open_browser",
             PhoneAction::OpenApp => "open_app",
             PhoneAction::RebootPhone => "reboot_phone",
+            PhoneAction::Unknown => "unknown",
         }
     }
 
@@ -183,9 +189,22 @@ mod tests {
             "reboot",
             "dark_mode;id",
             "am start",
+            "unknown",
         ] {
             assert_eq!(PhoneAction::parse(bad), None, "{bad:?}");
         }
+        assert!(!PhoneAction::ALL.contains(&PhoneAction::Unknown));
+    }
+
+    /// A coordinator newer than the agent sends it an action it has no name for: the request
+    /// still parses (as `Unknown`), so the assignment around it is not skipped.
+    #[test]
+    fn an_action_from_a_newer_coordinator_parses_as_unknown() {
+        let req: PhoneActionReq = serde_json::from_value(serde_json::json!({
+            "seq": 4, "action": "take_a_selfie", "at": 1, "generation": 2
+        }))
+        .unwrap();
+        assert_eq!(req.action, PhoneAction::Unknown);
     }
 
     #[test]
