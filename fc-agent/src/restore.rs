@@ -168,6 +168,7 @@ pub struct RestorePhases {
     /// [`crate::snapshot_network::RestoreNetworkReport`].
     pub tcp_verify_ms: f64,
     pub tcp_reassert_ms: f64,
+    pub tcp_barrier_ms: f64,
     pub tcp_destroy_ms: f64,
     pub tcp_reopen_ms: f64,
     /// Milliseconds opening the gate's egress half after the socket retirement.
@@ -193,6 +194,8 @@ pub struct RestorePhases {
     pub tcp_gate_ingress_read_ms: f64,
     pub tcp_gate_ingress_commit_ms: f64,
     pub neighbor_ms: f64,
+    /// The inherited neighbours' flush and the pins that follow it.
+    pub neighbour_pin_ms: f64,
     pub nfs_ms: f64,
     pub exec_wait_ms: f64,
     pub egress_wait_ms: f64,
@@ -219,6 +222,7 @@ impl RestorePhases {
         self.tcp_verified = boundary.verified_armed;
         self.tcp_verify_ms = boundary.verify_ms;
         self.tcp_reassert_ms = boundary.reassert_ms;
+        self.tcp_barrier_ms = boundary.barrier_ms;
         self.tcp_destroy_ms = boundary.destroy_ms;
         self.tcp_reopen_ms = boundary.reopen_ms;
         self.tcp_egress_open_ms = boundary.egress_open_ms;
@@ -356,6 +360,7 @@ pub async fn handle_clone_restore(
     // deletes those entries mid-resolution and left one INCOMPLETE for a
     // second (2 of 1700 routed restores with an early client). Pinned by
     // `inherited_neighbours_are_flushed_before_the_new_ipv6_is_announced`.
+    let neighbour_pin_started = std::time::Instant::now();
     network::flush_stale_neighbours().await;
     network::pin_namespace_neighbour().await;
     // A routed clone's IPv6 gateway is pinned too, before the swap below: a
@@ -365,6 +370,7 @@ pub async fn handle_clone_restore(
     if clone_ipv6.is_some() {
         network::pin_routed_gateway_neighbour().await;
     }
+    phases.neighbour_pin_ms = elapsed_ms(neighbour_pin_started);
 
     // Reconfigure IPv6, then announce it: before any network traffic can use
     // the old address. The link is UP throughout (the boundary no longer takes

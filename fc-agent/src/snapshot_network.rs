@@ -1182,6 +1182,9 @@ pub struct RestoreNetworkReport {
     /// Milliseconds re-asserting close/link-down/barrier; zero on the
     /// verified fast path.
     pub reassert_ms: f64,
+    /// Milliseconds the receive barrier took (one RCU grace period); also
+    /// counted in `reassert_ms` when the gate was reinstalled.
+    pub barrier_ms: f64,
     /// Milliseconds loading the manifest and retiring its sockets.
     pub destroy_ms: f64,
     /// Milliseconds removing the gate's egress half, after the receive barrier
@@ -1749,9 +1752,11 @@ async fn restore_boundary_with<
     // destroyed, and the barrier below drains what was already in flight.
     // Downing the link would purge this clone's routes and neighbours, and the
     // boundary no longer captures routes to put them back.
+    let barrier_started = std::time::Instant::now();
     receive_barrier
         .synchronize()
         .context("waiting for restored packet receive processing to quiesce")?;
+    let barrier_ms = barrier_started.elapsed().as_secs_f64() * 1000.0;
     let reassert_ms = if verified_armed {
         0.0
     } else {
@@ -1825,6 +1830,7 @@ async fn restore_boundary_with<
         verified_armed,
         verify_ms,
         reassert_ms,
+        barrier_ms,
         destroy_ms,
         egress_open_ms,
         hook_ms: 0.0,
