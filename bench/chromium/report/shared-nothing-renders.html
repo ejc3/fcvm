@@ -325,14 +325,80 @@ dl.parts dd.v { grid-area: v; text-align: right; font-variant-numeric: tabular-n
 <header class="site-header"><nav class="crumbs" aria-label="Breadcrumb"><a href="https://github.com/ejc3/fcvm">ejc3/fcvm</a><span class="sep">/</span><a href="./">docs</a><span class="sep">/</span><span aria-current="page">Chromium render benchmark</span></nav><a class="btn" href="https://github.com/ejc3/fcvm/tree/main/bench/chromium">Harness and records</a></header>
 <main>
 <article class="markdown-body">
-<h1>One microVM per page: Chromium on Firecracker snapshots</h1>
-<p class="lede">In August Cloudflare introduced <a href="https://blog.cloudflare.com/kitesurf/">Kitesurf</a>, a browser for agents that runs on Workers, one V8 isolate per navigation, and uses native Rust compiled directly to WebAssembly where possible. Their starting point is that Chromium is too heavy: it uses &#8220;so much memory and compute that providing every agent with its own instance is prohibitively expensive&#8221;. This page looks at the other answer: keep unmodified Chromium and give each request its own microVM, restored from a snapshot in which Chromium is already booted and warm, with the memory server recording which pages clones touch and mapping them into the next one. On Cloudflare&#8217;s 14-URL corpus it measures how long a request takes, how much host CPU it uses, how much memory clones held at once take, and which request rates one host kept up with.</p>
+<h1>Chromium in a microVM per request: a 618.6 ms median screenshot on Cloudflare&#8217;s corpus</h1>
+<p class="lede">Each request restores its own Firecracker microVM from a snapshot in which unmodified Chromium is already booted and warm, renders one page, and is discarded. On Cloudflare&#8217;s 14-URL corpus the fastest run measured (4 guest vCPUs, UFFD copy mode, working-set prefetch on, 50 ms target poll; run c4f-copy) returns a screenshot in a median of 618.6 ms and the page&#8217;s HTML in 591.3 ms. The VM resumes 76.7 ms after launch in that run. In the minor-mode runs on another golden it resumes at about 59 ms, and with 5 ms polling Chromium lists its page target at 267.0 ms (runs c4e and c4e-p5). Cloudflare publishes 1,148 ms and 820 ms for <a href="https://blog.cloudflare.com/kitesurf/">Kitesurf</a>, its browser engine in Rust compiled to WebAssembly on Workers, and 637 ms and 472 ms for its warm Chromium (Browser Run). The VM uses more host CPU per request than either, and more memory than Kitesurf. Cloudflare&#8217;s figures are medians of five runs against the live sites, on hardware its post does not state; fcvm&#8217;s are 202 requests against a replay of the same pages, restore included (Setup, The same corpus).</p>
+<p class="src">Host: AWS c8g.metal-48xl (Neoverse-V2, 192 vCPUs), Ubuntu 24.04.5 LTS, kernel 7.0.0-1013-aws (<code>host</code>, <code>host_<wbr>kernel_<wbr>release</code> in each run&#8217;s <code>reqbench.<wbr>jsonl</code> meta line). Guest: 1024 MiB, Linux 6.18.50, Chromium 155.0.8059.79 (<code>browser_<wbr>version</code>). Firecracker: a fork at commit <code>8819f112</code>, which no run record names (Firecracker builds). fcvm source per run: <code>fcvm_<wbr>sha256</code> and Software under Setup.</p>
 <div class="verdict">
-  <div><span class="num">683.4 to 715.5 ms</span><span class="lbl">request median at 4 guest vCPUs, from launching the VM to the screenshot returned: lowest and highest of 7 runs on 5 goldens, 202 requests each over the 14 corpus URLs</span></div>
-  <div><span class="num">2,165 to 2,398 ms</span><span class="lbl">host CPU per screenshot request at 4 vCPUs, mean, every process of the clone and the memory server&#8217;s share, restore included; Cloudflare publishes 1,173 ms for its warm Chromium and 380 ms for Kitesurf</span></div>
-  <div><span class="num">35% longer</span><span class="lbl">request median with working-set prefetch off than on, same golden, 2 goldens at 4 vCPUs</span></div>
-  <div><span class="num">0 failures</span><span class="lbl">in each of the 15 corpus runs: 0 of 230 attempts in every arm (202 measured, 28 warmup), exact 95% interval 0 to 1.59% per arm</span></div>
+  <div><span class="num">618.6 ms</span><span class="lbl">screenshot request median, launch of the VM to the screenshot returned, run c4f-copy (202 requests over the 14 corpus URLs; 95% interval of the median 554.3 to 674.1 ms); Kitesurf 1,148 ms, Cloudflare&#8217;s warm Chromium 637 ms</span></div>
+  <div><span class="num">2,344 ms</span><span class="lbl">host CPU per screenshot request, mean, run c4f-copy (<code>cdp-fast</code> arm): every process of the clone and the memory server&#8217;s share, restore included; Kitesurf 380 ms, Cloudflare&#8217;s warm Chromium 1,173 ms</span></div>
+  <div><span class="num">0 failures</span><span class="lbl">in each of the 15 corpus runs: 0 of 230 attempts in every arm (202 measured, 28 warmup), exact (Clopper-Pearson) 95% interval 0 to 1.59% per arm</span></div>
 </div>
+<figure class="chart" aria-labelledby="c-lead">
+<figcaption id="c-lead"><span class="ct">Request median: fcvm against Cloudflare&#8217;s published figures</span><span class="cs">Blue: fcvm, run c4f-copy. Green: Cloudflare&#8217;s published medians for Kitesurf and its warm Chromium. Same 14-URL corpus on different machines, networks and timers (The same corpus); the bars place the published figures beside fcvm&#8217;s, they do not rank the systems.</span></figcaption>
+<ul class="legend"><li><span class="sw s1"></span>fcvm, a microVM per request</li><li><span class="sw s3"></span>Cloudflare, published</li></ul>
+<div class="rows">
+<div class="grp"><span class="gl">Screenshot</span>
+<div class="r" title="fcvm, run c4f-copy: screenshot median 618.6 ms"><span class="l">fcvm</span><span class="t" style="--w:35.35%;--end:35.35%"><span class="b s1"></span><span class="v">618.6 ms</span></span></div>
+<div class="r" title="Cloudflare's warm Chromium, published: 637 ms"><span class="l">CF Chromium</span><span class="t" style="--w:36.40%;--end:36.40%"><span class="b s3"></span><span class="v">637 ms</span></span></div>
+<div class="r" title="Kitesurf, published: 1,148 ms"><span class="l">Kitesurf</span><span class="t" style="--w:65.60%;--end:65.60%"><span class="b s3"></span><span class="v">1,148 ms</span></span></div>
+</div>
+<div class="grp"><span class="gl">HTML extraction</span>
+<div class="r" title="fcvm, run c4f-copy: HTML median 591.3 ms"><span class="l">fcvm</span><span class="t" style="--w:33.79%;--end:33.79%"><span class="b s1"></span><span class="v">591.3 ms</span></span></div>
+<div class="r" title="Cloudflare's warm Chromium, published: 472 ms"><span class="l">CF Chromium</span><span class="t" style="--w:26.97%;--end:26.97%"><span class="b s3"></span><span class="v">472 ms</span></span></div>
+<div class="r" title="Kitesurf, published: 820 ms"><span class="l">Kitesurf</span><span class="t" style="--w:46.86%;--end:46.86%"><span class="b s3"></span><span class="v">820 ms</span></span></div>
+</div>
+</div>
+<p class="src">fcvm: <code>arms.cdp.blocking_ms</code> and <code>arms.html-fast.blocking_ms</code> in <code>results/reqbench-20261022-corpus-c4f-copy/analysis.json</code>. Cloudflare: its published table, quoted cell for cell under The same corpus.</p>
+</figure>
+<figure class="chart" aria-labelledby="c-start">
+<figcaption id="c-start"><span class="ct">From launch to a screenshot, median request at 4 vCPUs</span><span class="cs">Time from launching the VM to each event, 4 vCPUs, UFFD minor mode. The restore marks are from run c4e; the page target and the screenshot are from run c4e-p5, the same golden polled every 5 ms, which places the page target to within 5 ms.</span></figcaption>
+<ul class="legend"><li><span class="sw s2"></span>restore</li><li><span class="sw s1"></span>render</li></ul>
+<div class="rows">
+<div class="grp"><span class="gl">Restore</span>
+<div class="r" title="Port accepts: median 51.0 ms after launch, run c4e"><span class="l">Port accepts</span><span class="t" style="--w:4.86%;--end:4.86%"><span class="b s2"></span><span class="v">51.0 ms</span></span></div>
+<div class="r" title="Snapshot loaded: median 58.6 ms after launch, run c4e"><span class="l">Snapshot loaded</span><span class="t" style="--w:5.58%;--end:5.58%"><span class="b s2"></span><span class="v">58.6 ms</span></span></div>
+<div class="r" title="VM resumed: median 59.0 ms after launch, run c4e"><span class="l">VM resumed</span><span class="t" style="--w:5.62%;--end:5.62%"><span class="b s2"></span><span class="v">59.0 ms</span></span></div>
+<div class="r" title="Page target listed: median 267.0 ms after launch, run c4e-p5"><span class="l">Page target</span><span class="t" style="--w:25.43%;--end:25.43%"><span class="b s2"></span><span class="v">267.0 ms</span></span></div>
+</div>
+<div class="grp"><span class="gl">Render</span>
+<div class="r" title="Screenshot returned: request median 660.6 ms, run c4e-p5"><span class="l">Screenshot</span><span class="t" style="--w:62.91%;--end:62.91%"><span class="b s1"></span><span class="v">660.6 ms</span></span></div>
+</div>
+</div>
+<p class="src">Records: <code>results/reqbench-20261022-corpus-c4e/reqbench.jsonl</code> (<code>spawn_to_port_ms</code>, <code>restore_marks</code>) and <code>results/reqbench-20261022-corpus-c4e-p5/reqbench.jsonl</code> (<code>render.resolve_polls</code>, <code>blocking_ms</code>); When a restored clone becomes reachable has both runs in full.</p>
+</figure>
+<figure class="chart" aria-labelledby="c-climb">
+<figcaption id="c-climb"><span class="ct">The configurations measured, screenshot request median</span><span class="cs">Bar and label: the median of the fastest run at that configuration. Whisker: that run&#8217;s 95% interval of the median; the intervals overlap, so the bars do not order the configurations. Run medians at 50 ms polling in minor mode spread 777.0 to 805.3 ms over 2 runs at 2 vCPUs, 683.4 to 715.5 ms over 7 at 4 and 671.6 to 704.6 ms over 2 at 8; the other two configurations are one run each. Every run: working-set prefetch on. Copy mode was not run with 5 ms polling.</span></figcaption>
+<div class="rows">
+<div class="grp"><span class="gl">Minor mode, 50 ms target poll</span>
+<div class="r" title="2 guest vCPUs, minor mode, 50 ms poll: run c2b, median 777.0 ms, 95% interval 634.2 to 835.5 ms; 2 runs, medians 777.0 to 805.3 ms"><span class="l">2 vCPUs</span><span class="t" style="--w:59.77%;--lo:48.78%;--hi:64.27%;--end:64.27%"><span class="b s1"></span><span class="wh"></span><span class="v">777.0 ms</span></span></div>
+<div class="r" title="4 guest vCPUs, minor mode, 50 ms poll: run c4c, median 683.4 ms, 95% interval 600.3 to 717.2 ms; 7 runs, medians 683.4 to 715.5 ms"><span class="l">4 vCPUs</span><span class="t" style="--w:52.57%;--lo:46.18%;--hi:55.17%;--end:55.17%"><span class="b s1"></span><span class="wh"></span><span class="v">683.4 ms</span></span></div>
+<div class="r" title="8 guest vCPUs, minor mode, 50 ms poll: run c8b, median 671.6 ms, 95% interval 632.0 to 755.4 ms; 2 runs, medians 671.6 to 704.6 ms"><span class="l">8 vCPUs</span><span class="t" style="--w:51.66%;--lo:48.62%;--hi:58.11%;--end:58.11%"><span class="b s1"></span><span class="wh"></span><span class="v">671.6 ms</span></span></div>
+</div>
+<div class="grp"><span class="gl">Minor mode, 5 ms target poll</span>
+<div class="r" title="4 guest vCPUs, minor mode, 5 ms poll: run c4e-p5, median 660.6 ms, 95% interval 556.3 to 698.6 ms"><span class="l">4 vCPUs</span><span class="t" style="--w:50.82%;--lo:42.79%;--hi:53.74%;--end:53.74%"><span class="b s1"></span><span class="wh"></span><span class="v">660.6 ms</span></span></div>
+</div>
+<div class="grp"><span class="gl">Copy mode, 50 ms target poll</span>
+<div class="r" title="4 guest vCPUs, copy mode, 50 ms poll: run c4f-copy, median 618.6 ms, 95% interval 554.3 to 674.1 ms"><span class="l">4 vCPUs</span><span class="t" style="--w:47.58%;--lo:42.64%;--hi:51.85%;--end:51.85%"><span class="b s1"></span><span class="wh"></span><span class="v">618.6 ms</span></span></div>
+</div>
+</div>
+<p class="src">Medians and intervals from Guest vCPU count, The poll interval and Copy mode against minor mode; each is <code>arms.cdp.blocking_ms</code> (<code>median</code>, <code>lo</code>, <code>hi</code>) in the run&#8217;s <code>analysis.json</code>.</p>
+</figure>
+<p class="tbl-title">Results, run c4f-copy</p>
+<ul>
+<li><strong>Screenshot, request median:</strong> 618.6 ms, against 1,148 ms for Kitesurf and 637 ms for Cloudflare&#8217;s warm Chromium (637 ms lies inside fcvm&#8217;s interval of 554.3 to 674.1 ms).</li>
+<li><strong>Launch to VM resumed:</strong> 76.7 ms in run c4f-copy, about 59 ms in runs c4e and c4e-p5; <strong>to Chromium&#8217;s page target listed:</strong> 267.0 ms with 5 ms polling (run c4e-p5).</li>
+</ul>
+<p class="tbl-title">Where Cloudflare is ahead</p>
+<ul>
+<li><strong>HTML extraction, request median:</strong> 591.3 ms, against 472 ms for Cloudflare&#8217;s warm Chromium (Kitesurf 820 ms).</li>
+<li><strong>Host CPU per screenshot request, mean:</strong> 2,344 ms, against 380 ms for Kitesurf and 1,173 ms for Cloudflare&#8217;s warm Chromium.</li>
+<li><strong>Memory per added clone, screenshot</strong> (separate memory phase, 4 vCPUs, 2 to 48 clones held at once): 240 MiB on PSS (95% interval 190 to 290), 340 MiB (280 to 410) on the cgroup basis, against 57.8 MiB for Kitesurf and 271.0 MiB for Cloudflare&#8217;s Chromium, basis not stated.</li>
+</ul>
+<p class="tbl-title">What limits it now (run c4e, minor mode, 50 ms polling)</p>
+<ul>
+<li><strong>Guest restore work:</strong> before Chromium answers, fcvm&#8217;s agent in the guest retires the network connections the snapshot captured and reopens the clone: a median of 279.4 ms on the guest&#8217;s clock at 4 vCPUs (run c4e), 140.3 ms of it retiring sockets. It grows with the guest&#8217;s vCPU count (What one request does).</li>
+<li><strong>Navigate:</strong> Page.navigate to the load event is the largest part of a request, 527.8 ms of the 914.2 ms mean in run c4e, most of it on the slowest news sites.</li>
+</ul>
 <nav class="toc" aria-label="Contents"><strong>On this page</strong><ol><li><a href="#setup">Setup</a></li><li><a href="#answers">Two answers to one question</a></li><li><a href="#cloudflare">The same corpus</a></li><li><a href="#request">What one request does</a></li><li><a href="#sharing">One snapshot, many clones</a></li><li><a href="#amortize">CPU, memory and throughput</a></li><li><a href="#vcpu">Guest vCPU count</a></li><li><a href="#sites">Per-site latency</a></li><li><a href="#host">Host Chromium without a VM</a></li><li><a href="#earlier">Earlier runs</a></li><li><a href="#limits">Limits</a></li><li><a href="#method">Method and gates</a></li><li><a href="#firecracker">Firecracker builds</a></li><li><a href="#records">Records</a></li></ol></nav>
 <h2 id="setup">Setup</h2>
 <div class="table-wrap"><table class="kv">
