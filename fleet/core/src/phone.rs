@@ -24,14 +24,23 @@ pub enum PhoneAction {
     Wave,
     /// A GPU benchmark inside the app.
     GpuBenchmark,
-    /// Stop the app and start it again.
+    /// Stop the app in front (Robot Park or the browser) and start it again.
     RestartApp,
+    /// The phone's web browser in front, on https://www.nvidia.com/ (reloaded).
+    OpenBrowser,
+    /// Robot Park in front again.
+    OpenApp,
     /// Restore the phone's VM from its snapshot.
     RebootPhone,
+    /// An action this build does not know, from a newer coordinator: carried out as nothing,
+    /// so the rest of the assignment it came in still reaches the agent. Never in `ALL`, so
+    /// never accepted from a viewer.
+    #[serde(other)]
+    Unknown,
 }
 
 impl PhoneAction {
-    pub const ALL: [PhoneAction; 8] = [
+    pub const ALL: [PhoneAction; 10] = [
         PhoneAction::SwitchScreen,
         PhoneAction::Rotate,
         PhoneAction::DarkMode,
@@ -39,10 +48,11 @@ impl PhoneAction {
         PhoneAction::Wave,
         PhoneAction::GpuBenchmark,
         PhoneAction::RestartApp,
+        PhoneAction::OpenBrowser,
+        PhoneAction::OpenApp,
         PhoneAction::RebootPhone,
     ];
-    pub const NAMES: &'static str =
-        "switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, reboot_phone";
+    pub const NAMES: &'static str = "switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, open_browser, open_app, reboot_phone";
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -53,7 +63,10 @@ impl PhoneAction {
             PhoneAction::Wave => "wave",
             PhoneAction::GpuBenchmark => "gpu_benchmark",
             PhoneAction::RestartApp => "restart_app",
+            PhoneAction::OpenBrowser => "open_browser",
+            PhoneAction::OpenApp => "open_app",
             PhoneAction::RebootPhone => "reboot_phone",
+            PhoneAction::Unknown => "unknown",
         }
     }
 
@@ -176,9 +189,22 @@ mod tests {
             "reboot",
             "dark_mode;id",
             "am start",
+            "unknown",
         ] {
             assert_eq!(PhoneAction::parse(bad), None, "{bad:?}");
         }
+        assert!(!PhoneAction::ALL.contains(&PhoneAction::Unknown));
+    }
+
+    /// A coordinator newer than the agent sends it an action it has no name for: the request
+    /// still parses (as `Unknown`), so the assignment around it is not skipped.
+    #[test]
+    fn an_action_from_a_newer_coordinator_parses_as_unknown() {
+        let req: PhoneActionReq = serde_json::from_value(serde_json::json!({
+            "seq": 4, "action": "take_a_selfie", "at": 1, "generation": 2
+        }))
+        .unwrap();
+        assert_eq!(req.action, PhoneAction::Unknown);
     }
 
     #[test]

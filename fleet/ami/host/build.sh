@@ -8,7 +8,7 @@
 #                    one GPU VM to first frame (warms the image export and snapshot cache),
 #                    and the renderer image's export at /mnt/fcvm-btrfs/renderer.oci.tar.zst;
 #                    then the phones: the phone profile, the emulator and system image built
-#                    from source, Robot Park, the phone image, and the warm snapshot of a
+#                    from source, Robot Park, the web browser, the phone image, and the warm snapshot of a
 #                    running phone every phone of a host is a clone of (warm-phone.sh)
 #   build.sh bake    packs the store into /var/lib/fcvm-fleet/store/ (store-pack.py) and cleans up
 #                    for imaging
@@ -143,6 +143,8 @@ build)
   # the store (bake), so nothing of Google's SDK is on a host.
   as_user "cd $SRC && make setup-phone && make phone-emulator && ./scripts/phone/aosp.sh"
   as_user "cd $SRC && ACCEPT_ANDROID_SDK_LICENSE=1 ./scripts/phone/sdk.sh && ./scripts/phone/app.sh"
+  # the phones' web browser (scripts/phone/browser.sh: a pinned release, checked by SHA-256)
+  as_user "cd $SRC && ./scripts/phone/browser.sh"
   as_user "cd $SRC && make -C fleet/phone image TAG=fleet"
   as_user "podman save --format oci-archive localhost/fcvm-phone:fleet -o /mnt/fcvm-btrfs/phone.oci.tar"
   podman load -q -i /mnt/fcvm-btrfs/phone.oci.tar
@@ -151,7 +153,7 @@ build)
   for d in /sys/bus/pci/drivers/vfio-pci/[0-9a-f][0-9a-f][0-9a-f][0-9a-f]:*; do [ "${d##*/}" = "$G0" ] || { G1=${d##*/}; break; }; done
   bash "$HERE/warm-phone.sh" "$G0" "$G1" "$(as_user "cd $SRC && ./scripts/phone/aosp.sh --root-path")" \
     "$(as_user "cd $SRC && ./scripts/phone/emulator.sh --path")" "$(as_user "cd $SRC && ./scripts/phone/app.sh --apk-path")" \
-    /etc/fcvm-fleet/phone.env
+    /etc/fcvm-fleet/phone.env "$(as_user "cd $SRC && ./scripts/phone/browser.sh --apk-path")"
   zstd -q -T0 -f --rm /mnt/fcvm-btrfs/renderer.oci.tar -o /mnt/fcvm-btrfs/renderer.oci.tar.zst
   sha256sum /mnt/fcvm-btrfs/renderer.oci.tar.zst | tee "$S/renderer.sha256"
   as_user "podman image inspect localhost/fcvm-renderer:fleet --format '{{.Id}}'" | tee "$S/renderer.id"

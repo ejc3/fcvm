@@ -1271,6 +1271,114 @@ lead also needs a reading from the last second. The streamer crops the 8 stamp r
 video; the mirror draws the whole surface, so while its last reading found a stamp its canvas is
 8 rows taller than its box and the box clips the band.
 
+### The browser
+
+The owner, 2026-11-03: "I want an option to switch to chromium or a web browser on the phone
+so you see it's actually the phone", and then: "load nvidia home page in the phone's mobile
+browser as one of the actions you can take".
+
+The take-over panel's **Open nvidia.com** (`open_browser`) brings the phone's web browser to
+the front on https://www.nvidia.com/ and loads the page again while it shows; **Robot Park**
+(`open_app`) brings the app back. An action for Robot Park (rotate, dance and the rest) brings
+it to the front first, and `restart_app` restarts whichever of the two is in front. When the
+borrow ends the phone is restored from its snapshot as before, so the next viewer finds Robot
+Park in front and the browser behind it on the page the warm snapshot holds (its cookies and
+cache are the snapshot's, the same on every phone).
+
+**Which browser.** Cromite 153.0.8010.37, the x86_64 phone build of a Chromium fork
+(github.com/uazo/cromite), run as released. `scripts/phone/browser.sh` fetches it and checks
+its SHA-256 into the AOSP directory's `phone-work/`, beside Robot Park, so the phone container
+installs it from `/work`; the host image's build runs it. Chromium itself was tried first:
+
+| build | on the phone (T4, gfxstream, GLES 3.0 cap) |
+|---|---|
+| Chromium snapshots `Android`, `Android_Arm64` | arm only; the AOSP image has no ARM translation |
+| Chromium snapshot `AndroidDesktop_x64` r1734151 (159.0.8142.0), the project's only x86_64 Android build | its GPU process brings up Skia Graphite on Dawn over Vulkan, which fails (`Requested feature FeatureName::TextureCompressionETC2 is not supported`); with Vulkan and Graphite turned off the GPU process does not start, and the browser aborts (`GPU process isn't usable. Goodbye.`) |
+| Cromite 153.0.8010.37 x64, Vulkan features off | GLES on the T4 (`EGL_emulation`, ES 3.0), the page draws, `gpu release` and `gpu retake` work with it running |
+| the same, Vulkan left on | it creates a guest Vulkan instance, and `gpu release` refuses (`the guest has 1 Vulkan instance(s)`), so no warm snapshot could be taken |
+
+Building Chromium for x86_64 phones from source would take the place of Cromite; it was not
+done here. The browser reads its flags from `/data/local/tmp/chrome-command-line`, which a
+userdebug image allows: `--disable-fre`, `--no-first-run`, `--no-default-browser-check`,
+`--proxy-server=http://10.0.2.2:3128` and `--disable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE`.
+Cromite shows a toast for a flags file at each start ("Cromite is loading flags from a
+command-line file"); a start from the warm snapshot shows none.
+
+**In the warm snapshot.** `phone.sh serve` opens the browser on the page before it starts
+Robot Park, and waits until its DevTools list (`chrome_devtools_remote`, read over adb inside
+the container) names an NVIDIA page; a browser that does not get there fails the phone. So
+`open_browser` is the browser's activity coming to the front (`am start -n` of
+`ChromeTabbedActivity`; launched as from the home screen after time away, and a clone's clock
+has moved on since the snapshot, it opens a new tab page instead), then Ctrl+R. On a gpubox
+(g4dn.metal, T4), rootless phone VMs, the page cache warm:
+
+| | the browser in front (`am start -W` `TotalTime`) | the action through `fcvm exec`, as the agent runs it | the reload, navigation start to first contentful paint |
+|---|---|---|---|
+| a clone of the warm snapshot, the first time | 2653 to 3495 ms | 3311 to 3831 ms | 748 ms |
+| the same clone, again | 70 to 263 ms | 379 ms | 1556 ms |
+| the phone that was never snapshotted | 136 to 599 ms | 473 to 971 ms | 524 ms |
+| `restart_app` with the browser in front (its tabs closed, started on the page) | | 846 to 1145 ms | |
+
+The first time is gfxstream restoring the browser's GL state: after a snapshot load it restores
+a share group when one of its contexts is first made current (`ShareGroup::postLoadRestore`),
+and the browser's first frame waits for it (HWUI reports one frame of 2672 ms). The source
+phone pays it too, once, after its own warm snapshot (3138 ms). Restoring the share groups
+before a viewer asks is tracked in #1492.
+
+**Network.** A phone VM is routed over IPv6 only (`--network routed`: no IPv4 leaves the
+VM), and www.nvidia.com has no AAAA record (a CNAME to Akamai's edgekey with A records only),
+so the phone cannot reach the page by itself. The browser's only way out is the phone web
+proxy (`src/fleet/agent/webproxy.rs`), which the agent serves on the host's 127.0.0.1:3128:
+
+```
+Cromite (--proxy-server=http://10.0.2.2:3128)
+  -> the emulator's user network: 10.0.2.2 is the container's loopback
+  -> fc-agent's --forward-localhost 3128 listener in the guest
+  -> fcvm's relay in the VM's namespace, to the host's 127.0.0.1:3128
+  -> the phone web proxy: CONNECT <name>:443 for a name under nvidia.com only
+  -> the site, over the host's own IPv4 or IPv6
+```
+
+The proxy answers `CONNECT` and nothing else, for `nvidia.com` and its subdomains on port 443,
+and connects only to a global unicast address the name resolves to (not loopback, a private or
+link-local network, or the metadata service). Everything else gets 403 and the connection is
+closed. The browser speaks TLS to the site through the tunnel, so the proxy sees names and byte
+counts. The page's first screen loads from www, images, webassets and brand-assets.cne.ngc
+under nvidia.com; the third-party hosts it asks for (`cdn.cookielaw.org`,
+`geolocation.onetrust.com`, `assets.adobedtm.com`) and the browser's own (`uazo.github.io`,
+`raw.githubusercontent.com` for its filter lists) are refused, and the page draws without them.
+What this opens: from a phone VM, HTTPS to names under nvidia.com. A phone VM still has no IPv4
+route, Android's own traffic goes nowhere new, wall VMs do not forward the port, and nothing
+listens beyond the host's loopback. `--forward-localhost 3128` is in the phone's launch
+(`VmSpec::for_phone`, `warm-phone.sh`), so the warm snapshot carries it to every clone.
+
+**With the GPU mirror.** The mirror draws only windows of processes that started after its copy
+did (point 3 above), so while the holder's mirror is open (`/health`'s `mirror.open` on the
+streamer) `open_browser` starts the browser again on the page instead of bringing the old
+process to the front, Robot Park back from the browser starts again too (the mirror may have
+joined while the browser was in front), and the mirror's own join (`restart_app` once the
+stream opens) restarts whichever app is in front. The browser's command stream, captured as the page receives it
+while the browser started on the page and then scrolled it ten times (40 s, the same gpubox):
+
+| | Video (NVENC H.264) | GPU mirror (zstd) | the mirror before compression | blocking calls a second |
+|---|---|---|---|---|
+| GPU rasterization (Chromium's default) | 2.73 Mbit/s, 16.0 fps | 0.67 Mbit/s | 8.5 Mbit/s | 410 |
+| `--disable-gpu-rasterization` | 3.00 Mbit/s, 17.7 fps | 1.96 Mbit/s | 78 Mbit/s | 468 |
+
+Rasterized on the GPU, tiles are drawn with GL calls and the mirror stays below the video; on the
+CPU they are uploaded as textures. Firefox's 15 to 240 Mbit/s (`docs/fleet/phone-gpu-remoting.md`)
+comes from GeckoView resending whole mapped buffers; Chromium's GPU process does not. The phone
+keeps GPU rasterization.
+
+The mirror does not yet draw the browser right. A captured start of the browser on the page,
+replayed on WebGL2 in headless Chrome, draws the toolbar and the page, but the web content sits
+48 pixels low, one panel is drawn where the phone shows none, and 151 draws fail in WebGL2
+(`glDrawElements: Must have element array buffer bound`): Chromium's GPU process uses one buffer
+both as `ARRAY_BUFFER` and as `ELEMENT_ARRAY_BUFFER`, which GLES allows and WebGL2 forbids, so
+the mirror's bind of it as an index buffer is refused. The decoder needs a separate WebGL buffer
+for each role, its contents kept in step. Tracked in #1485; the video view is
+correct.
+
 ### Invariants (each becomes a test)
 
 1. A phone renders on its VM's GPU: SurfaceFlinger's renderer and the app's both name the
@@ -1286,6 +1394,10 @@ video; the mirror draws the whole surface, so while its last reading found a sta
    call (`test_host.cpp`'s admission checks; the decoder has no reply path).
 8. The mirror never makes the phone wait: a render thread's copy is bounded by its own bytes,
    and a full ring or a slow viewer ends the copy, never the phone's work (`mirror_tap_unittest.cpp`).
+9. A phone's browser reaches only names under nvidia.com, over HTTPS, through the phone web
+   proxy (`webproxy.rs`'s tests; `make phone-test` checks a name off the list is refused), and
+   a guest Vulkan instance never blocks the warm snapshot (`make phone-test` releases the GPU
+   with the browser running).
 
 ### Failure states
 
@@ -1297,6 +1409,8 @@ video; the mirror draws the whole surface, so while its last reading found a sta
 | attach fails in a clone | the clone fails closed, as a failed GPU attach does, and the slot is relaunched with backoff |
 | the emulator exits | the container exits, the VM reports it, and the agent relaunches the slot |
 | the app stops drawing | the streamer's frame age passes its deadline and the tile is drawn dim, then failed |
+| the browser shows no NVIDIA page at the warm phone's start | the phone is reported failed, and the warm snapshot is not taken |
+| the phone web proxy is not running (the agent stopped) | the browser shows its connection error; the rest of the phone is unchanged |
 
 ### Licensing
 
@@ -1353,6 +1467,9 @@ video; the mirror draws the whole surface, so while its last reading found a sta
    streamer's `GET /mirror` and its admission; the take-over panel's three views and their
    readouts; the emulator pin. Then FREE records, replies on ring streams and no program
    binaries for a mirrorable guest (ejc3/gfxstream#5), and the join snapshot.
+10. The browser ("The browser", above): Cromite on www.nvidia.com in the warm snapshot, the
+    `open_browser` and `open_app` actions, the phone web proxy, and `make phone-test`'s checks.
+    Then the mirror's drawing of it (#1485).
 
 ## Invariants (each becomes a test)
 

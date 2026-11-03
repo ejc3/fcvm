@@ -635,7 +635,8 @@ async fn run_phone_actions(ctx: &SlotCtx, r: &mut Running, p: &AssignPhone) {
             .output();
         match tokio::time::timeout(PHONE_ACTION_TIMEOUT, run).await {
             Ok(Ok(o)) if o.status.success() => {
-                tracing::info!(slot = %ctx.id, action = a.action.as_str(), seq = a.seq, "phone action done")
+                // the action's own line: open_browser's says how long the browser took to show
+                tracing::info!(slot = %ctx.id, action = a.action.as_str(), seq = a.seq, out = %tail(&o.stdout), "phone action done")
             }
             Ok(Ok(o)) => {
                 tracing::warn!(slot = %ctx.id, action = a.action.as_str(), status = %o.status, out = %tail(&o.stderr), "phone action failed")

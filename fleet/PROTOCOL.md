@@ -744,7 +744,7 @@ The snapshot's `state.phones` is absent with no phones, else:
 ```json
 {"image_aspect": 1.125, "claim_secs": 120,
  "borrow": {"cap": 1, "lent": 1, "next_return_at": 1761134525000},
- "actions": ["switch_screen", "rotate", "dark_mode", "dance", "wave", "gpu_benchmark", "restart_app", "reboot_phone"],
+ "actions": ["switch_screen", "rotate", "dark_mode", "dance", "wave", "gpu_benchmark", "restart_app", "open_browser", "open_app", "reboot_phone"],
  "zoomed_out": false, "zoom_at": 1761134400000,
  "tiles": [{"id": "phone:1", "slot": "phone-1", "rect": {"x": 0, "y": 0, "w": 0.5, "h": 1}, "phase": "running",
             "frame_url": "wss://...", "borrowed": {"session": "phone-claim-3", "viewer": "v-12", "since": ..., "until": ...},
@@ -787,14 +787,19 @@ reaches the phone:
 | `dark_mode` | night or day on this phone | `dark`, then `light` |
 | `dance`, `wave` | the robots dance, or wave, on this phone | `dance`, `wave` |
 | `gpu_benchmark` | the app's GPU benchmark; the result is on its info screen | `benchmark` |
-| `restart_app` | the app exits and starts again | `restart` |
+| `restart_app` | the app in front exits and starts again (Robot Park, or the browser on www.nvidia.com) | `restart`, or none for the browser |
+| `open_browser` | the phone's web browser comes to the front on https://www.nvidia.com/ and loads it again; while the holder's GPU mirror is open, the browser starts again instead (ARCHITECTURE.md, "The browser") | none |
+| `open_app` | Robot Park comes to the front | none |
 | `reboot_phone` | the phone's VM is restored from its snapshot (`last_relaunch.by` `reboot:<session>`) | none |
 
 The coordinator hands every action but `reboot_phone` to the phone's agent in the phone's
 assignment (`phone.actions` below) for 30 s, numbered (`seq`) and tagged with the launch
 they are for; the agent carries out each once with `phone.sh action <name>` in the phone's
 container, which sends the app the one request its name maps to (`switch_screen` and
-`dark_mode` remember which they sent last, so each is a toggle).
+`dark_mode` remember which they sent last, so each is a toggle). An action for Robot Park
+brings it to the front first when the browser is there, and starts it again while the holder's
+GPU mirror is open. `open_browser` and `open_app` use
+adb in the container and send the app nothing.
 
 ## Agent
 

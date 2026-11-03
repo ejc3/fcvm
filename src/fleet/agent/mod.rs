@@ -8,6 +8,7 @@ pub mod slot;
 pub mod spot;
 pub mod tls;
 pub mod vm;
+pub mod webproxy;
 
 use crate::cli::FleetAgentArgs;
 use crate::fleet::aggregate::{Layout, TileSpec};
@@ -193,10 +194,18 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
                 emulator: emulator.clone(),
                 apk: apk.clone(),
                 snapshot: args.phone_snapshot.clone(),
+                browser_apk: args.phone_browser_apk.clone(),
             })
         }
         _ => None,
     };
+    // The phones' browser reaches the web only through this proxy (webproxy.rs): it runs as
+    // long as the agent does, and a phone VM forwards its port to it.
+    if let Some(p) = phone.as_ref().filter(|p| p.browser_apk.is_some()) {
+        vm::check_browser_apk(p)?;
+        let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, webproxy::PORT));
+        drop(webproxy::spawn(addr).await?);
+    }
     if gpus.is_empty() {
         tracing::warn!("no NVIDIA GPU is bound to vfio-pci; this host will run no slot");
     }

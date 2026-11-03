@@ -8,7 +8,7 @@ import type { Rect } from "../core/protocol.ts";
 import type { MockRenderers } from "./renderer.ts";
 import type { PatternScene } from "./pattern.ts";
 
-export const PHONE_ACTION_NAMES = ["switch_screen", "rotate", "dark_mode", "dance", "wave", "gpu_benchmark", "restart_app", "reboot_phone"] as const;
+export const PHONE_ACTION_NAMES = ["switch_screen", "rotate", "dark_mode", "dance", "wave", "gpu_benchmark", "restart_app", "open_browser", "open_app", "reboot_phone"] as const;
 type PhoneAction = (typeof PHONE_ACTION_NAMES)[number];
 
 /** One action a second per borrowed phone. */

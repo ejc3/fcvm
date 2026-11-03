@@ -14,6 +14,9 @@
 #   phone.sh app apk         installs and starts Robot Park (fleet/phone-app), forwards
 #                            127.0.0.1:7070 in this container to its control socket, and waits
 #                            for its first frame; prints its renderer line
+#   phone.sh browser apk     installs the web browser and opens www.nvidia.com in it, through
+#                            the phone web proxy; waits for the page's title; prints it
+#   phone.sh page [secs]     the NVIDIA page's title once the browser shows it
 #   phone.sh ctl json        one request on the app's control socket; prints the reply line
 #   phone.sh pull path dest  copies a file off the phone
 #   phone.sh shot dest.png   a screenshot of the phone's screen
@@ -23,7 +26,8 @@
 # A fleet phone slot runs the container's default command instead:
 #
 #   phone.sh serve           the phone streamer (fleet/phone/streamer) on :8080, and :443 with
-#                            TLS_CERT_FILE, then a cold boot and Robot Park ($PHONE_APK); the
+#                            TLS_CERT_FILE, then a cold boot, the browser on www.nvidia.com
+#                            ($PHONE_BROWSER_APK, when set) and Robot Park ($PHONE_APK); the
 #                            streamer streams once SurfaceFlinger and the app render on the
 #                            VM's GPU. Exits when the emulator does. A fleet slot runs it once,
 #                            for the warm snapshot every phone is a clone of (flow B).
@@ -41,6 +45,17 @@ ADB=${PHONE_ADB:-/android/platform-tools/adb}
 EMU_DIR=${EMU_DIR:-/emu}
 EMU=$EMU_DIR/emulator
 CTL_PORT=${PHONE_CTL_PORT:-7070}
+# The web browser (docs/fleet/ARCHITECTURE.md, "The browser"): Cromite, a Chromium build for
+# x86_64 phones (scripts/phone/browser.sh), on the NVIDIA home page. Its only way out is the
+# phone web proxy on the host (src/fleet/agent/webproxy.rs), which the VM forwards to this
+# container's loopback and the emulator to the phone's 10.0.2.2. Vulkan off: a guest Vulkan
+# instance makes `gpu release` refuse, so no warm snapshot could be taken, and the mirror
+# replays GL only.
+BROWSER_PKG=org.cromite.cromite
+BROWSER_URL=https://www.nvidia.com/
+BROWSER_FLAGS="--disable-fre --no-first-run --no-default-browser-check --proxy-server=http://10.0.2.2:${PHONE_WEB_PROXY_PORT:-3128} --disable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE"
+DEVTOOLS_PORT=${PHONE_DEVTOOLS_PORT:-9222}
+STREAMER_PORT=${PHONE_STREAMER_PORT:-8080}
 # serve's programs and files (scripts/phone/test-phone-sh.sh points them at stand-ins)
 STREAMER=${PHONE_STREAMER:-/usr/local/bin/phone-streamer}
 KVM=${PHONE_KVM:-/dev/kvm}
@@ -131,6 +146,62 @@ start_app() {
   done
   [ -n "$line" ] || { echo "Robot Park drew no frame in 20 s"; return 1; }
   [[ "$line" == *"$2"* ]] || { echo "Robot Park does not render on $2: $line"; return 1; }
+}
+# One GET on a loopback HTTP port of this container; prints the body of a 200. The response
+# is read to its Content-Length: the browser's DevTools server answers HTTP/1.1 only and keeps
+# the connection open after it.
+http_get() { # port path
+  local line len=""
+  exec 3<> "/dev/tcp/127.0.0.1/$1" || return 1
+  printf 'GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' "$2" >&3
+  IFS= read -r -t 5 line <&3 && [[ "$line" == "HTTP/1."?" 200"* ]] || { exec 3>&-; return 1; }
+  while IFS= read -r -t 5 line <&3; do
+    line=${line%$'\r'}
+    [ -n "$line" ] || break
+    case "${line,,}" in content-length:*) len=${line#*:}; len=${len// /} ;; esac
+  done
+  if [ -n "$len" ]; then timeout 5 head -c "$len" <&3; else timeout 5 cat <&3; fi
+  exec 3>&-
+}
+# The browser's DevTools targets (its remote debugging socket, forwarded into this container).
+browser_pages() {
+  "$ADB" forward tcp:"$DEVTOOLS_PORT" localabstract:chrome_devtools_remote > /dev/null 2>&1 || return 1
+  http_get "$DEVTOOLS_PORT" /json/list | jq -c '[.[] | select(.type == "page")]'
+}
+# The browser is on www.nvidia.com and the page has a title: prints it.
+browser_title() {
+  browser_pages 2> /dev/null | jq -er --arg u "$BROWSER_URL" '[.[] | select((.url | startswith($u)) and (.title | test("NVIDIA")))][0].title' 2> /dev/null
+}
+# The page's title within $1 seconds, or a failure naming what the browser shows.
+wait_browser_page() {
+  local t
+  for _ in $(seq 1 $(( ${1:-60} * 5 ))); do
+    t=$(browser_title) && { echo "$t"; return 0; }
+    sleep 0.2
+  done
+  echo "the browser shows no NVIDIA page: $(browser_pages 2> /dev/null | jq -c '[.[] | {url, title}]' 2> /dev/null)"
+  return 1
+}
+# The browser installed with its command line, open on www.nvidia.com; prints its title.
+start_browser() {
+  "$ADB" install -r -g "$1" > /dev/null 2>&1 || { echo "adb could not install $1"; return 1; }
+  # a userdebug image reads Chromium's command line from this file
+  "$ADB" shell "echo '_ $BROWSER_FLAGS' > /data/local/tmp/chrome-command-line" || { echo "could not write the browser's command line"; return 1; }
+  open_page || return 1
+  wait_browser_page "${PHONE_BROWSER_WAIT:-60}"
+}
+# The browser started on www.nvidia.com in a tab of its own: the other tabs are closed first,
+# so a restart does not add one.
+open_page() {
+  local out id
+  for id in $(browser_pages 2> /dev/null | jq -r '.[].id' 2> /dev/null); do
+    http_get "$DEVTOOLS_PORT" "/json/close/$id" > /dev/null 2>&1 || true
+  done
+  "$ADB" shell am force-stop "$BROWSER_PKG" > /dev/null 2>&1 || true
+  out=$("$ADB" shell am start -W -a android.intent.action.VIEW -d "$BROWSER_URL" "$BROWSER_PKG" 2>&1 | tr -d '\r') || true
+  grep -q '^Status: ok' <<< "$out" || { echo "am start of the browser: $(grep -m2 -E 'Error|Status' <<< "$out" | tr '\n' ' ')"; return 1; }
+  echo browser > "$RUN/front"
+  sed -n 's/^TotalTime: */shown_ms=/p' <<< "$out" > "$RUN/shown"
 }
 # The streamer, restarted whenever it exits, unless the GPU hook holds it (while the phone's
 # GPU is released for a warm snapshot, nothing in the container may hold the GPU). The hold
@@ -230,7 +301,14 @@ serve)
   uwb_off || fail "could not turn UWB off (cmd uwb disable-uwb)"
   echo "phone.sh: booted in $(( $(ms) - t0 )) ms"
   why=$(renderer_on_gpu "$gpu") || fail "$why"
+  # the browser first, then Robot Park in front of it: every clone of the warm snapshot has
+  # the page loaded, and showing it is an activity coming to the front
+  if [ -n "${PHONE_BROWSER_APK:-}" ]; then
+    why=$(start_browser "$PHONE_BROWSER_APK") || fail "the browser did not start: $why"
+    echo "phone.sh: the browser shows '$why'"
+  fi
   why=$(start_app "$PHONE_APK" "$gpu") || fail "the app did not start: $why"
+  echo app > "$RUN/front"
   # the phone renders on its GPU: the streamer may stream it
   touch "$PHONE_GO_FILE"
   echo "phone.sh: streaming $(( $(ms) - t0 )) ms after the container started"
@@ -257,14 +335,52 @@ action)
     app_action "$next"
     echo "$next" > "$RUN/$1"
   }
+  # While the viewer's GPU mirror is open, a window must be drawn by a process that started
+  # after the mirror's copy did (docs/fleet/ARCHITECTURE.md, "The GPU mirror", point 3): an
+  # app that comes to the front starts again instead, since the mirror may have joined while
+  # the other one was in front.
+  mirror_open() { http_get "$STREAMER_PORT" /health 2> /dev/null | jq -e '.mirror.open == true' > /dev/null 2>&1; }
+  # Which app is in front, Robot Park or the browser: an action for Robot Park brings it to
+  # the front first.
+  front() { cat "$RUN/front" 2> /dev/null || echo app; }
+  to_app() {
+    [ "$(front)" = browser ] || return 0
+    "$ADB" shell am start -W -n dev.fcvm.robotpark/.MainActivity 2>&1 | tr -d '\r' | grep -q '^Status: ok' \
+      || { echo "phone.sh: Robot Park did not come to the front" >&2; exit 1; }
+    echo app > "$RUN/front"
+    if mirror_open; then app_action restart; rm -f "$RUN/screen" "$RUN/night"; fi
+  }
+  has_browser() { "$ADB" shell pm path "$BROWSER_PKG" 2> /dev/null | grep -q '^package:' || { echo "phone.sh: this phone has no browser" >&2; exit 1; }; }
+  restart_browser() { open_page > "$RUN/why" || { echo "phone.sh: $(cat "$RUN/why")" >&2; exit 1; }; }
   case "${2:-}" in
-  switch_screen) toggle screen scene info ;;
-  rotate) app_action rotate ;;
-  dark_mode) toggle night light dark ;;
-  dance|wave) app_action "$2" ;;
-  gpu_benchmark) app_action benchmark ;;
-  # a restarted app shows its scene in its own light or dark again
-  restart_app) app_action restart; rm -f "$RUN/screen" "$RUN/night" ;;
+  switch_screen) to_app; toggle screen scene info ;;
+  rotate) to_app; app_action rotate ;;
+  dark_mode) to_app; toggle night light dark ;;
+  dance|wave) to_app; app_action "$2" ;;
+  gpu_benchmark) to_app; app_action benchmark ;;
+  # the app in front exits and starts again; a restarted Robot Park shows its scene in its own
+  # light or dark again
+  restart_app)
+    if [ "$(front)" = browser ]; then restart_browser; else app_action restart; rm -f "$RUN/screen" "$RUN/night"; fi ;;
+  open_browser)
+    has_browser
+    if mirror_open; then
+      restart_browser
+    else
+      # the page loaded when the phone started comes to the front, and loads again (Ctrl+R)
+      # while it shows. The activity is named, not launched as from the home screen: a launch
+      # from the home screen after a while away (and a clone's clock has moved on) opens a new
+      # tab page instead of the tab.
+      out=$("$ADB" shell am start -W -n "$BROWSER_PKG/org.chromium.chrome.browser.ChromeTabbedActivity" 2>&1 | tr -d '\r')
+      grep -q '^Status: ok' <<< "$out" || { echo "phone.sh: the browser did not come to the front: $out" >&2; exit 1; }
+      echo browser > "$RUN/front"
+      sed -n 's/^TotalTime: */shown_ms=/p' <<< "$out" > "$RUN/shown"
+      "$ADB" shell input keycombination 113 46 > /dev/null 2>&1 || { echo "phone.sh: the page was not reloaded" >&2; exit 1; }
+    fi
+    echo "ok open_browser $(cat "$RUN/shown" 2> /dev/null)"
+    exit 0
+    ;;
+  open_app) to_app ;;
   *)
     echo "phone.sh: unknown action '${2:-}'" >&2
     exit 2
@@ -332,6 +448,7 @@ app)
   "$ADB" shell settings put secure immersive_mode_confirmations confirmed
   "$ADB" logcat -c
   "$ADB" shell am start -W -n dev.fcvm.robotpark/.MainActivity | tr -d '\r' | grep -E '^(Status|TotalTime)'
+  echo app > "$RUN/front"
   "$ADB" forward tcp:"$CTL_PORT" localabstract:dev.fcvm.robotpark > /dev/null
   for _ in $(seq 1 100); do
     line=$("$ADB" logcat -d -s ROBOTPARK:I | tr -d '\r' | grep -m1 'fps=' || true)
@@ -340,6 +457,13 @@ app)
   done
   [ -n "$line" ] || { echo "Robot Park drew no frame in 20 s:"; "$ADB" logcat -d | tr -d '\r' | grep -E 'ROBOTPARK|AndroidRuntime|FATAL' | tail -30; exit 1; }
   "$ADB" logcat -d -s ROBOTPARK:I | tr -d '\r' | grep -m1 -o 'renderer=.*'
+  ;;
+browser)
+  start_browser "${2:?usage: phone.sh browser apk}"
+  ;;
+page)
+  # the title of the NVIDIA page the browser shows, or a failure naming what it shows
+  wait_browser_page "${2:-10}"
   ;;
 ctl)
   # The control protocol is one JSON line each way (fleet/PROTOCOL.md, "Phone app").
@@ -362,7 +486,7 @@ stop)
   "$ADB" emu kill > /dev/null 2>&1 || true
   ;;
 *)
-  echo "usage: phone.sh serve|action NAME|boot|renderer|probe secs apk|draws secs|holds|bugreports|app apk|ctl json|pull path dest|shot dest.png|applog|stop" >&2
+  echo "usage: phone.sh serve|action NAME|boot|renderer|probe secs apk|draws secs|holds|bugreports|app apk|browser apk|page [secs]|ctl json|pull path dest|shot dest.png|applog|stop" >&2
   exit 2
   ;;
 esac

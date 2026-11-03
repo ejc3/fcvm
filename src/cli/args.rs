@@ -60,6 +60,8 @@ pub enum FleetCommand {
     Agent(Box<FleetAgentArgs>),
     /// Join a region's tile streams into one stream (POST /layout, GET /frames)
     Aggregate(Box<FleetAggregateArgs>),
+    /// Serve the phones' web proxy: HTTPS CONNECT to the browser's allowed names only
+    PhoneWebProxy(FleetPhoneWebProxyArgs),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -617,6 +619,22 @@ pub struct FleetAgentArgs {
     /// (flow B, about 6 s to the app's first frame) instead of a cold boot
     #[arg(long)]
     pub phone_snapshot: Option<String>,
+
+    /// The phones' web browser (scripts/phone/browser.sh --apk-path), in the directory of
+    /// --phone-apk: each phone has it open on www.nvidia.com behind Robot Park, its only way
+    /// out the phone web proxy this agent serves on the host's loopback
+    /// (docs/fleet/ARCHITECTURE.md, "The browser")
+    #[arg(long, requires = "phone_apk")]
+    pub phone_browser_apk: Option<std::path::PathBuf>,
+}
+
+/// `fcvm fleet phone-web-proxy`: the phones' web proxy on its own (a warm phone's bake and
+/// `make phone-test` run it; an agent with phones runs it itself)
+#[derive(Args, Debug)]
+pub struct FleetPhoneWebProxyArgs {
+    /// Address to listen on; phones reach it through `--forward-localhost`
+    #[arg(long, default_value = "127.0.0.1:3128")]
+    pub listen: std::net::SocketAddr,
 }
 
 // ============================================================================

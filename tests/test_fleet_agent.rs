@@ -2073,6 +2073,7 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
         emulator: PathBuf::from("/store/emulator"),
         apk: PathBuf::from("/store/aosp/phone-work/app-1.apk"),
         snapshot: None,
+        browser_apk: None,
     });
     let (coord_side, agent_side) = tokio::io::duplex(1 << 20);
     let (agent_in, agent_out) = tokio::io::split(agent_side);
