@@ -365,6 +365,10 @@ grep -qx 'Restart=on-failure' "$pu" 2>/dev/null || no "nvidia-persistenced.servi
 grep -qE '^RestartSec=[0-9.]+(ms)?$' "$pu" 2>/dev/null || no "nvidia-persistenced.service (tile) must name its retry delay"
 grep -q 'cat > /etc/systemd/system/nvidia-persistenced.service' fleet/ami/tile/build.sh &&
   no "tile/build.sh writes its own nvidia-persistenced.service, which a revision would not install"
+# The tile's GPU runs a busy kernel at its maximum clock, not a T4's 585 MHz default
+# (fleet/renderer/README.md, "GPU clocks"); the VM's agent does the same (fc-agent/src/gpu.rs).
+grep -qF "ExecStartPost=-/bin/sh -c 'nvidia-smi --query-gpu=index,clocks.max.memory,clocks.max.graphics --format=csv,noheader,nounits | while IFS=\", \" read -r i m g; do nvidia-smi -i \"\$i\" -ac \"\$m,\$g\"; done'" "$pu" ||
+  no "nvidia-persistenced.service (tile) does not set the GPU's application clocks to its maximum"
 bake=$(sed -n '/^bake)/,/;;/p' fleet/ami/tile/build.sh)
 grep -qF '[ ! -s /etc/fcvm-fleet/prefetch.list ] && [ "${NO_PREFETCH_LIST:-}" != 1 ]' <<<"$bake" ||
   no "tile/build.sh bake does not refuse an image without a prefetch list"

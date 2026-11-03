@@ -581,6 +581,8 @@ pub struct AttachSteps {
     pub smi_ms: f64,
     /// `nvidia-ctk cdi generate`.
     pub cdi_ms: f64,
+    /// Setting each GPU's application clocks to its maximum ([`set_max_application_clocks`]).
+    pub clocks_ms: f64,
 }
 
 /// Times one attach step and logs it, so a slow attach names the slow step in
@@ -665,17 +667,23 @@ pub async fn bring_up(announced: &[String], cdi: bool) -> Result<BroughtUp> {
     let parallel = scrub_parallelism(mem_available_kib()?, announced.len());
     steps.scrub_ms = scrub_gpus(scrub_command(driver_root, parallel), announced.len()).await?;
 
-    // Both only read the GPUs the daemon has initialised, so they run together.
-    // The spec is generated after the daemon starts so it mounts its socket.
-    let ((smi_ms, listed), (cdi_ms, spec)) = tokio::join!(timed(list_gpus(driver_root)), async {
-        if cdi {
-            timed(generate_cdi_spec(driver_root)).await
-        } else {
-            (0.0, Ok(()))
-        }
-    });
+    // The list and the spec only read the GPUs the daemon has initialised, and
+    // the clocks change no state they read, so the three run together. The spec
+    // is generated after the daemon starts so it mounts its socket.
+    let ((smi_ms, listed), (cdi_ms, spec), (clocks_ms, ())) = tokio::join!(
+        timed(list_gpus(driver_root)),
+        async {
+            if cdi {
+                timed(generate_cdi_spec(driver_root)).await
+            } else {
+                (0.0, Ok(()))
+            }
+        },
+        timed(set_max_application_clocks(driver_root))
+    );
     steps.smi_ms = smi_ms;
     steps.cdi_ms = cdi_ms;
+    steps.clocks_ms = clocks_ms;
     eprintln!("[fc-agent] gpu: step=nvidia-smi elapsed_ms={smi_ms:.3}");
     eprintln!("[fc-agent] gpu: step=cdi elapsed_ms={cdi_ms:.3}");
     let listed = listed?;
@@ -731,6 +739,96 @@ async fn list_gpus(driver_root: &Path) -> Result<String> {
         Ok(text) => Ok(text),
         Err(error) => bail!("{error:#}\nkernel log:\n{}", nvrm_log_tail().await),
     }
+}
+
+/// Set every GPU's application clocks (the clocks a busy GPU runs its kernels at)
+/// to the highest its board allows.
+///
+/// A T4's default application clock is 585 MHz against a 1590 MHz maximum, and a
+/// load that leaves the GPU idle between bursts stays at it: a wall renderer, which
+/// draws one frame per 33 ms slot and is idle for the rest, ran its frames at
+/// 585 MHz, about 2.7 times slower than the same frames drawn back to back
+/// (fleet/renderer/README.md, "GPU clocks"). Setting them needs root, which the
+/// container does not have. A board that has no application clocks reports none
+/// and is left alone, and a failure is logged and does not fail the attach: the GPU
+/// works at its default clocks.
+pub(crate) async fn set_max_application_clocks(driver_root: &Path) {
+    let smi = || {
+        let mut command = tokio::process::Command::new(driver_root.join("usr/bin/nvidia-smi"));
+        command.env("LD_LIBRARY_PATH", library_dir(driver_root));
+        command
+    };
+    let mut query = smi();
+    query.args(MAX_CLOCKS_QUERY);
+    let maxima = match run_checked("nvidia-smi --query-gpu=clocks.max", query, SMI_TIMEOUT).await {
+        Ok(text) => parse_max_clocks(&text),
+        Err(error) => {
+            eprintln!("[fc-agent] gpu: WARNING the GPUs' maximum clocks could not be read, so their application clocks stay at the default: {error:#}");
+            return;
+        }
+    };
+    for clocks in maxima {
+        let Some((memory, graphics)) = clocks.max else {
+            eprintln!(
+                "[fc-agent] gpu: GPU {} reports no maximum application clocks; left at its default",
+                clocks.index
+            );
+            continue;
+        };
+        let mut set = smi();
+        set.args(application_clocks_args(clocks.index, memory, graphics));
+        match run_checked("nvidia-smi -ac", set, SMI_TIMEOUT).await {
+            Ok(_) => eprintln!(
+                "[fc-agent] gpu: GPU {} application clocks set to memory {memory} MHz, graphics {graphics} MHz",
+                clocks.index
+            ),
+            Err(error) => eprintln!(
+                "[fc-agent] gpu: WARNING GPU {} application clocks stay at the default: {error:#}",
+                clocks.index
+            ),
+        }
+    }
+}
+
+/// The `nvidia-smi` query for each GPU's index and maximum memory and graphics clocks.
+pub const MAX_CLOCKS_QUERY: [&str; 2] = [
+    "--query-gpu=index,clocks.max.memory,clocks.max.graphics",
+    "--format=csv,noheader,nounits",
+];
+
+/// One GPU's line of [`MAX_CLOCKS_QUERY`]: its index, and its maximum memory and
+/// graphics clocks in MHz when the board reports both.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaxClocks {
+    pub index: u32,
+    pub max: Option<(u32, u32)>,
+}
+
+/// Parse [`MAX_CLOCKS_QUERY`]'s output (`0, 5001, 1590`; a board without the clocks
+/// prints `[N/A]` or `[Not Supported]` in their place).
+pub fn parse_max_clocks(text: &str) -> Vec<MaxClocks> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split(',').map(str::trim);
+            let index = fields.next()?.parse().ok()?;
+            let memory = fields.next().and_then(|v| v.parse().ok());
+            let graphics = fields.next().and_then(|v| v.parse().ok());
+            Some(MaxClocks {
+                index,
+                max: memory.zip(graphics),
+            })
+        })
+        .collect()
+}
+
+/// `nvidia-smi` arguments that set GPU `index`'s application clocks.
+pub fn application_clocks_args(index: u32, memory: u32, graphics: u32) -> Vec<String> {
+    vec![
+        "-i".to_string(),
+        index.to_string(),
+        "-ac".to_string(),
+        format!("{memory},{graphics}"),
+    ]
 }
 
 /// Write the CDI spec with `nvidia-ctk cdi generate` from the image.
@@ -966,6 +1064,66 @@ mod tests {
                 "scrub_gpus(scrub_command(driver_root, parallel), announced.len()).await?"
             ),
             "a failed scrub must fail the attach"
+        );
+    }
+
+    /// Every bring-up sets the GPUs' application clocks to their maximum, once the
+    /// daemon has initialised them and before the attach returns (the container
+    /// starts after it). Without it a T4 drew a wall renderer's paced frames at its
+    /// 585 MHz default (fleet/renderer/README.md, "GPU clocks").
+    #[test]
+    fn bring_up_sets_the_application_clocks_before_it_returns() {
+        let body = attach_devices_body();
+        let daemon = body
+            .find("start_persistenced(driver_root)")
+            .expect("no nvidia-persistenced");
+        let clocks = body
+            .find("set_max_application_clocks(driver_root)")
+            .expect("bring_up does not set the GPUs' application clocks");
+        let joined = body[clocks..]
+            .find(");")
+            .map(|end| clocks + end)
+            .expect("the clocks are not awaited");
+        let ok = body.find("Ok(BroughtUp {").expect("no result");
+        assert!(
+            daemon < clocks && joined < ok,
+            "the clocks ({clocks}) must be set after nvidia-persistenced ({daemon}) and \
+             awaited before bring_up returns ({ok})"
+        );
+    }
+
+    /// The query's lines become one setting per GPU; a board without application
+    /// clocks reports none and gets no setting.
+    #[test]
+    fn max_clocks_parse_into_one_setting_per_gpu() {
+        let parsed = parse_max_clocks("0, 5001, 1590\n1, [N/A], [N/A]\n2, 9501, 1980\n\n");
+        assert_eq!(
+            parsed,
+            vec![
+                MaxClocks {
+                    index: 0,
+                    max: Some((5001, 1590))
+                },
+                MaxClocks {
+                    index: 1,
+                    max: None
+                },
+                MaxClocks {
+                    index: 2,
+                    max: Some((9501, 1980))
+                },
+            ]
+        );
+        assert_eq!(
+            application_clocks_args(0, 5001, 1590),
+            ["-i", "0", "-ac", "5001,1590"]
+        );
+        assert_eq!(
+            MAX_CLOCKS_QUERY,
+            [
+                "--query-gpu=index,clocks.max.memory,clocks.max.graphics",
+                "--format=csv,noheader,nounits"
+            ]
         );
     }
 

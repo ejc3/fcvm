@@ -171,6 +171,51 @@ python3 tools/seam_metric.py out.png 4 2              # seam ratio at every tile
 "Viewers per renderer") opens many frame streams as the page does and reports
 each stream's frame rate, frame delay, and frames dropped for a slow reader.
 
+## GPU clocks (round 18, 2026-11-03)
+
+The owner, on the staging wall at full screen: "The rendering is still too dirty
+on the non phone version." What the page was showing (Chrome on the owner's Mac,
+3456 x 1944 device pixels, direct streams, 14 tiles): every renderer drew at the
+grid budget of 176,777 pixel-samples, so the tiles drawn at 432 and 360 drew a
+stride-2 checkerboard (half the pixels a frame), 8 of 14 tiles drew at 180 for a
+432 or 540 stream (`drawn_h`), and every GPU reported 23% to 44% utilisation.
+
+A T4's application clock (the clock a busy GPU runs its kernels at) defaults to
+585 MHz against a 1590 MHz maximum. A GPU that is busy most of the time boosts
+past it; a renderer, which draws one frame per 33 ms slot and idles for the rest,
+does not. Measured on one g4dn.metal (on demand, nothing else on it), each arm in
+its own fcvm VM on its own T4, the renderer serving one 432 stream at 30 fps at
+budget 176,777, on poses saved from the staging wall, `nvidia-smi` sampled six
+times over 12 s in the VM:
+
+| tile | application clock | SM clock | render ms | GPU busy |
+|---|---|---|---|---|
+| sky (upper middle) | 585 (default) | 585 in 6 of 6 | 7.1 | 21% to 26% |
+| sky (upper middle) | 1590 | 1590 in 6 of 6 | 3.2 to 3.3 | 10% to 13% |
+| terrain (lower right) | 585 (default) | 1050 to 1575 | 11.5 to 15.4 | 32% to 39% |
+| terrain (lower right) | 1590 | 1590 in 6 of 6 | 8.5 to 12.2 | 26% to 36% |
+| heavy terrain (frames of 22 ms) | 585 (default) | 1245 to 1575 | 22.3 to 23.7 | 59% to 69% |
+| heavy terrain (frames of 22 ms) | 1590 | 1470 to 1590 | 22.2 to 23.8 | 61% to 87% |
+
+The default costs a tile in proportion to how idle it is, and the grid budget
+then holds it there: a tile's fit (`budget_fit`) is computed from frames drawn at
+the slow clock, the slowest fit sets every tile's budget, and a lower budget
+leaves the GPU idler. The same frames drawn back to back (`quality`, `still
+--seq`) boost, which is why earlier rounds' render times did not show it.
+
+The VM's agent now sets each GPU's application clocks to the board's maximum when
+it brings the GPUs up (`set_max_application_clocks`, fc-agent/src/gpu.rs), and the
+EC2 tile does the same after `nvidia-persistenced` starts
+(`fleet/ami/tile/nvidia-persistenced.service`). Setting them needs root, which the
+container does not have. `/health` reports `clock_mhz`, `app_clock_mhz` and
+`max_clock_mhz` under `gpu`, so a renderer left at the default shows it.
+
+Latency: at a fixed budget a tile that idles most of its slot renders 1.3 to 2.2
+times faster (the table), and a busy one no faster.
+The grid controller then raises the budget toward its target of 70% of a slot
+for the slowest tile, so the slowest tile's render time, which is the wall's,
+moves from what the slow clock made it toward that target (23.3 ms), at most.
+
 ## The word's edges (round 17, 2026-10-30)
 
 The owner's staging screenshot showed the lockup word with a hard light outline,

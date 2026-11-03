@@ -923,6 +923,7 @@ mod tests {
             scrub_ms: long,
             smi_ms: long,
             cdi_ms: long,
+            clocks_ms: long,
         });
         let telemetry = phases.to_frame_json();
         let frame =
@@ -1067,6 +1068,7 @@ mod tests {
             "nodes_ms",
             "smi_ms",
             "cdi_ms",
+            "clocks_ms",
         ] {
             assert!(steps.get(step).is_some(), "{step} missing from {frame}");
         }
