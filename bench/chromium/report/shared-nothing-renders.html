@@ -826,7 +826,7 @@ dl.parts dd.v { grid-area: v; text-align: right; font-variant-numeric: tabular-n
 <pre><code>make bench-chromium-corpus ARMS=cdp,cdp-fast,html-fast,noop,noop-fast CPU=4</code></pre>
 <p>Each vCPU count and page size needs its own golden. The targets and knobs for every phase, including the memory phase (<code>make bench-chromium-corpus-extra</code>) and the throughput run (<code>MEASURE=scale</code>), are in <a href="https://github.com/ejc3/fcvm/blob/main/bench/chromium/AGENTS.md">bench/chromium/AGENTS.md</a>.</p>
 <h2 id="firecracker">Firecracker builds</h2>
-<p>fcvm drives a fork, <a href="https://github.com/ejc3/firecracker">ejc3/firecracker</a>, at the commit <code>rootfs-config.toml</code> pins; every serial run records the binary it restored on and its sha256 (<code>cell.<wbr>firecracker</code> in <code>analysis.json</code>); no record names the commit itself.</p>
+<p>fcvm drives a fork, <a href="https://github.com/ejc3/firecracker">ejc3/firecracker</a>, at the commit <code>rootfs-config.toml</code> pins; every serial run records the binary it restored on, its sha256 and the pinned commit, which the harness ties to the binary (<code>cell.<wbr>firecracker.<wbr>commit</code> and <code>commit_<wbr>matches_<wbr>binary</code> in <code>analysis.json</code>).</p>
 <h3>2026-10-22 runs</h3>
 <p><a href="https://github.com/ejc3/firecracker/tree/agent/uffd-minor-v1.17.0-discard-dirty">Branch agent/uffd-minor-v1.17.0-discard-dirty</a> at <code>8819f112</code>, committed 2026-10-08: upstream&#8217;s release v1.17.0 (<code>95f868c8e3</code>, 2026-09-04) plus 19 commits, built as <code>firecracker-<wbr>default-<wbr>0834213edfce.bin</code>, sha256 <code>955e505483cb&#8230;</code> in every run (<code>cell.<wbr>firecracker.<wbr>sha256</code>).</p>
 <ul>
