@@ -6392,7 +6392,8 @@ async fn a_panicking_clone_handler_returns_its_slot() -> Result<()> {
 /// The boundary that makes a snapshot cloneable needs two things: no NEW socket
 /// may appear while the cookie dump runs, and packets already in receive
 /// processing must drain first. The NEW-flow gate delivers the first and the
-/// AF_PACKET barrier the second; both are reversible and destroy nothing.
+/// receive barrier (one RCU grace period) the second; both are reversible and
+/// destroy nothing.
 ///
 /// A `link.down()` used to sit between them, preventing sockets the gate already
 /// rejected and purging the device's routes and neighbours to do it. Everything
