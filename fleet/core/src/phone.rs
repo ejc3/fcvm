@@ -24,14 +24,18 @@ pub enum PhoneAction {
     Wave,
     /// A GPU benchmark inside the app.
     GpuBenchmark,
-    /// Stop the app and start it again.
+    /// Stop the app in front (Robot Park or the browser) and start it again.
     RestartApp,
+    /// The phone's web browser in front, on https://www.nvidia.com/ (reloaded).
+    OpenBrowser,
+    /// Robot Park in front again.
+    OpenApp,
     /// Restore the phone's VM from its snapshot.
     RebootPhone,
 }
 
 impl PhoneAction {
-    pub const ALL: [PhoneAction; 8] = [
+    pub const ALL: [PhoneAction; 10] = [
         PhoneAction::SwitchScreen,
         PhoneAction::Rotate,
         PhoneAction::DarkMode,
@@ -39,10 +43,11 @@ impl PhoneAction {
         PhoneAction::Wave,
         PhoneAction::GpuBenchmark,
         PhoneAction::RestartApp,
+        PhoneAction::OpenBrowser,
+        PhoneAction::OpenApp,
         PhoneAction::RebootPhone,
     ];
-    pub const NAMES: &'static str =
-        "switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, reboot_phone";
+    pub const NAMES: &'static str = "switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, open_browser, open_app, reboot_phone";
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -53,6 +58,8 @@ impl PhoneAction {
             PhoneAction::Wave => "wave",
             PhoneAction::GpuBenchmark => "gpu_benchmark",
             PhoneAction::RestartApp => "restart_app",
+            PhoneAction::OpenBrowser => "open_browser",
+            PhoneAction::OpenApp => "open_app",
             PhoneAction::RebootPhone => "reboot_phone",
         }
     }

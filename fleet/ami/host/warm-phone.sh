@@ -3,7 +3,11 @@
 # "Phones mode"). Run as root after build.sh has built the phone's pieces and loaded the
 # phone image into root's podman store:
 #
-#   warm-phone.sh <gpu> <second gpu> <aosp root> <emulator dir> <app apk> <env file>
+#   warm-phone.sh <gpu> <second gpu> <aosp root> <emulator dir> <app apk> <env file> <browser apk>
+#
+# The phones' web proxy (fcvm fleet phone-web-proxy, src/fleet/agent/webproxy.rs) runs while
+# the phone boots, so its browser opens www.nvidia.com before the snapshot is taken; on a fleet
+# host the agent serves it.
 #
 # 1. Launches one phone on <gpu> exactly as the agent launches a phone slot that boots cold
 #    (src/fleet/agent/vm.rs VmSpec::for_phone; `the_ami_warm_phone_is_launched_as_a_phone_
@@ -14,17 +18,20 @@
 #    GPU hook releases the emulator's GPU and stops the streamer, and retakes both after.
 # 3. Restores one clone of it on <second gpu> as the agent does (`fcvm snapshot run`), posts
 #    it a scene, and waits for the streamer's first stamped scene frame: the snapshot works
-#    before it is baked. Prints the click to that frame.
+#    before it is baked. Prints the click to that frame. Then the clone's browser comes to the
+#    front and shows the NVIDIA page.
 # 4. Writes <env file>: the agent's phone arguments (PHONE_AGENT_ARGS), which
 #    fcvm-fleet-agent.service adds to the host's own (ejc3/aws adds `--phones N`).
 set -uo pipefail
-G=$1; G2=$2; AOSP=$3; EMU=$4; APK=$5; ENVF=$6
+G=$1; G2=$2; AOSP=$3; EMU=$4; APK=$5; ENVF=$6; BROWSER=$7
 IMG=localhost/fcvm-phone:fleet
 TAG=phone-warm
 LOG=/var/log/fcvm-fleet-warm-phone.log
 TLS_DIR=/run/fcvm-fleet/tls
 WORK=$(dirname "$APK")
 APKN=$(basename "$APK")
+BRN=$(basename "$BROWSER")
+[ "$(dirname "$BROWSER")" = "$WORK" ] && [ -f "$BROWSER" ] || { echo "warm-phone: the browser $BROWSER is not beside the app in $WORK"; exit 1; }
 ms() { date +%s%3N; }
 health() { curl -fsS -m 2 "http://127.0.0.1:$1/health" 2>/dev/null; }
 install -d -m 0700 "$TLS_DIR"
@@ -53,9 +60,12 @@ P=$(curl -fsS -H "X-aws-ec2-metadata-token: $T" "http://169.254.169.254/latest/m
 [ -n "$P" ] || { echo "warm-phone: this instance has no IPv6 prefix"; exit 1; }
 addr() { python3 -c 'import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1], strict=False).network_address + int(sys.argv[2]))' "$P" "$1"; }
 A=$(addr 2); A2=$(addr 3)
-cleanup() { pkill -TERM -x fcvm 2>/dev/null; wait 2>/dev/null; rm -rf "$TLS_DIR"; }
+cleanup() { pkill -TERM -x fcvm 2>/dev/null; kill "${wpx:-}" 2>/dev/null; wait 2>/dev/null; rm -rf "$TLS_DIR"; }
 trap cleanup EXIT
 : > "$LOG"
+
+fcvm fleet phone-web-proxy --listen 127.0.0.1:3128 >> "$LOG" 2>&1 &
+wpx=$!
 
 # 1. the phone, launched as a phone slot is
 t0=$(ms)
@@ -63,7 +73,7 @@ RUST_LOG=info setsid \
   fcvm podman run --name warm-phone --kernel-profile phone --gpu "$G" --publish 127.0.0.1:20097:8080 \
   --network routed --ipv6-prefix "$P" --ipv6-address "$A" --publish 127.0.0.1:20096:443 \
   --privileged --cpu 6 --mem 6144 --portable-volumes --map "$AOSP":/android:ro --map "$EMU":/emu:ro \
-  --map "$WORK":/work:ro --env PHONE_APK=/work/"$APKN" \
+  --map "$WORK":/work:ro --env PHONE_APK=/work/"$APKN" --forward-localhost 3128 --env PHONE_BROWSER_APK=/work/"$BRN" \
   --map "$TLS_DIR":/run/fleet-tls:ro --env TLS_CERT_FILE=/run/fleet-tls/tls.json --env TLS_PORT=443 \
   "$IMG" /usr/local/bin/phone.sh serve >> "$LOG" 2>&1 < /dev/null &
 wp=$!
@@ -103,10 +113,17 @@ for _ in $(seq 1 600); do
   sleep 0.1
 done
 echo "warm-phone: clone ok=$ok click_to_first_scene_frame_ms=$(( $(ms) - click )) gpu=$G2"
+# the browser the snapshot carries comes to the front in the clone and shows the page
+if [ $ok = 1 ]; then
+  cpid=$(fcvm ls --json | jq -r '.[] | select(.name == "warm-phone-clone") | .pid' | head -1)
+  out=$(fcvm exec --pid "$cpid" -- /usr/local/bin/phone.sh action open_browser 2>&1) \
+    && title=$(fcvm exec --pid "$cpid" -- /usr/local/bin/phone.sh page 20 2>&1) \
+    && echo "warm-phone: clone browser $out: '$title'" || { echo "warm-phone: the clone's browser: $out ${title:-}"; ok=0; }
+fi
 kill -TERM $cp; wait $cp
 [ $ok = 1 ] || { tail -30 "$LOG"; exit 1; }
 
 # 4. the agent's phone arguments
-printf 'PHONE_AGENT_ARGS="--phone-image %s --phone-aosp %s --phone-emulator %s --phone-apk %s --phone-snapshot %s"\n' \
-  "$IMG" "$AOSP" "$EMU" "$APK" "$TAG" > "$ENVF"
+printf 'PHONE_AGENT_ARGS="--phone-image %s --phone-aosp %s --phone-emulator %s --phone-apk %s --phone-snapshot %s --phone-browser-apk %s"\n' \
+  "$IMG" "$AOSP" "$EMU" "$APK" "$TAG" "$BROWSER" > "$ENVF"
 cat "$ENVF"

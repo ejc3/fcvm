@@ -20,6 +20,10 @@ pub async fn cmd_fleet(args: FleetArgs) -> Result<()> {
         FleetCommand::Coord(a) => coord::run(*a).await,
         FleetCommand::Agent(a) => agent::run(*a).await,
         FleetCommand::Aggregate(a) => aggregate::cmd(*a).await,
+        FleetCommand::PhoneWebProxy(a) => {
+            agent::webproxy::spawn(a.listen).await?.await?;
+            Ok(())
+        }
     }
 }
 

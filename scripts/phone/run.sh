@@ -24,7 +24,11 @@
 #      nvidia-smi names a different GPU than the source's, SurfaceFlinger's renderer names
 #      it, the emulator holds it open, and the app draws 30 frames a second there. Prints the
 #      time from the restore command to the phone's first frame on the clone's GPU.
-#   7. Robot Park (fleet/phone-app), last, on the source phone: seams, surface loss and
+#   7. the web browser (scripts/phone/browser.sh) runs through all of it: it opens
+#      www.nvidia.com through the phone web proxy before the release checks, which a guest
+#      Vulkan instance would refuse; the proxy refuses a name off its list; and on the clone,
+#      `phone.sh action open_browser` brings the page to the front and draws it.
+#   8. Robot Park (fleet/phone-app), last, on the source phone: seams, surface loss and
 #      actions (scripts/phone/scene-test.sh); and the phone took no bug report during
 #      the whole run (phone.sh turns UWB off, whose service otherwise asks for one a minute
 #      or two after boot).
@@ -49,6 +53,7 @@ F=${FCVM:-./target/release/fcvm}
 AOSP=$("$(dirname "$0")/aosp.sh" --root-path)
 APK=$(ANDROID_AOSP="$AOSP" "$(dirname "$0")/aosp.sh" --probe-path)
 APP=$("$(dirname "$0")/app.sh" --apk-path)
+BROWSER=$("$(dirname "$0")/browser.sh" --apk-path)
 WORK=$(dirname "$APK")
 EMU=$("$(dirname "$0")/emulator.sh" --path)
 NAME=phone-test-$$
@@ -56,6 +61,7 @@ TAG=phone-test-$$-warm
 [ -f "$APK" ] || { echo "run.sh: run scripts/phone/aosp.sh first" >&2; exit 2; }
 [ -x "$EMU/emulator" ] || { echo "run.sh: run scripts/phone/emulator.sh first" >&2; exit 2; }
 [ -f "$APP" ] && [ "$(dirname "$APP")" = "$WORK" ] || { echo "run.sh: run scripts/phone/app.sh first" >&2; exit 2; }
+[ -f "$BROWSER" ] && [ "$(dirname "$BROWSER")" = "$WORK" ] || { echo "run.sh: run scripts/phone/browser.sh first" >&2; exit 2; }
 [ "$(cat /sys/module/kvm_intel/parameters/nested 2>/dev/null)" = Y ] || { echo "run.sh: the host's kvm_intel needs nested=1" >&2; exit 2; }
 LOGS=$(mktemp -d)
 mkdir -p "$LOGS/out"
@@ -63,15 +69,17 @@ make -s -C "$SRC/fleet/phone" image IMAGE="$IMAGE" > "$LOGS/build.log" 2>&1 || {
 runner=""
 clone=""
 snapshot_dir=""
+web_proxy=""
 stop_runner() {
   local r
-  for r in "$clone" "$runner"; do
+  for r in "$clone" "$runner" "$web_proxy"; do
     [ -n "$r" ] || continue
     kill -TERM "$r" 2>/dev/null || true
     wait "$r" 2>/dev/null || true
   done
   runner=""
   clone=""
+  web_proxy=""
   # The warm snapshot is this run's alone (its tag names the run).
   if [ -n "$snapshot_dir" ]; then
     rm -rf "$snapshot_dir" "$snapshot_dir.lock"
@@ -81,9 +89,14 @@ stop_runner() {
 finished=0
 trap 'finish_run stop_runner' EXIT
 trap 'exit 130' INT TERM
+# The phone web proxy, as an agent with phones serves it: the browser's only way out.
+"$F" fleet phone-web-proxy --listen 127.0.0.1:3128 > "$LOGS/web-proxy.log" 2>&1 &
+web_proxy=$!
+for _ in $(seq 1 50); do (exec 3<> /dev/tcp/127.0.0.1/3128) 2> /dev/null && break; kill -0 "$web_proxy" 2> /dev/null || break; sleep 0.1; done
+kill -0 "$web_proxy" 2> /dev/null || { echo "run.sh: the phone web proxy did not start: $(cat "$LOGS/web-proxy.log")" >&2; exit 2; }
 t0=$(date +%s%3N)
 "$F" podman run --name "$NAME" --kernel-profile "${PHONE_PROFILE:-phone}" --gpu "$GPU" --privileged --cpu 6 --mem 6144 \
-  --portable-volumes --map "$AOSP:/android:ro" --map "$WORK:/work:ro" --map "$EMU:/emu:ro" --map "$LOGS/out:/out" \
+  --portable-volumes --map "$AOSP:/android:ro" --map "$WORK:/work:ro" --map "$EMU:/emu:ro" --map "$LOGS/out:/out" --forward-localhost 3128 \
   "$IMAGE" > "$LOGS/vm.log" 2>&1 < /dev/null &
 runner=$!
 pid=""
@@ -155,6 +168,36 @@ retake_without_vulkan() {
   check_draws "$pid" "after a retake without Vulkan and one with it"
 }
 
+# VM $1's phone shows the browser in front on the NVIDIA page, after `phone.sh action
+# open_browser`; $2 says where. Prints how long the browser took to come to the front.
+browser_in_front() {
+  local out top title green
+  if ! out=$("$F" exec --pid "$1" -- /usr/local/bin/phone.sh action open_browser 2>&1); then
+    bad "open_browser failed $2: $out"
+    return
+  fi
+  top=$("$F" exec --pid "$1" -- sh -c '/android/platform-tools/adb shell dumpsys activity activities | grep -m1 topResumedActivity' 2>&1 || true)
+  [[ "$top" == *org.cromite.cromite/* ]] && ok "the browser is in front $2 ($(grep -o 'shown_ms=[0-9]*' <<< "$out"))" \
+    || bad "the browser is not in front $2: $top"
+  title=$("$F" exec --pid "$1" -- /usr/local/bin/phone.sh page 20 2>&1) && ok "the browser shows '$title' $2" \
+    || bad "the browser shows no NVIDIA page $2: $title"
+  # NVIDIA's green (#76b900) is on screen: the page is drawn, not only loaded
+  green=$("$F" exec --pid "$1" -- sh -c '/android/platform-tools/adb exec-out screencap' 2> /dev/null | python3 -c '
+import sys
+d = sys.stdin.buffer.read()[16:]
+print(sum(1 for i in range(0, len(d) - 3, 4) if abs(d[i] - 0x76) < 24 and abs(d[i + 1] - 0xb9) < 24 and d[i + 2] < 40))' || echo 0)
+  [ "${green:-0}" -ge 400 ] && ok "the page is drawn $2: $green pixels of NVIDIA green" || bad "the page is not drawn $2: $green pixels of NVIDIA green"
+}
+# The proxy the phone reaches at the container's 127.0.0.1:3128 (through the VM's
+# --forward-localhost) tunnels to www.nvidia.com and refuses a name off its list.
+proxy_boundary() {
+  local a b
+  a=$(X bash -c 'exec 3<> /dev/tcp/127.0.0.1/3128; printf "CONNECT www.nvidia.com:443 HTTP/1.1\r\nHost: www.nvidia.com\r\n\r\n" >&3; IFS= read -r -t 15 l <&3; echo "$l"' 2>&1 | tr -d '\r' || true)
+  b=$(X bash -c 'exec 3<> /dev/tcp/127.0.0.1/3128; printf "CONNECT example.org:443 HTTP/1.1\r\nHost: example.org\r\n\r\n" >&3; IFS= read -r -t 15 l <&3; echo "$l"' 2>&1 | tr -d '\r' || true)
+  [[ "$a" == "HTTP/1.1 200"* ]] && ok "the phone web proxy tunnels to www.nvidia.com" || bad "the phone web proxy did not tunnel to www.nvidia.com: '$a'"
+  [[ "$b" == "HTTP/1.1 403"* ]] && ok "the phone web proxy refuses a name off its list" || bad "the phone web proxy answered '$b' for example.org"
+}
+
 warm_snapshot_onto_the_second_gpu() {
   local source_uuid cpid click ack first clone_uuid holds renderer
   source_uuid=$(X /usr/bin/nvidia-smi --query-gpu=uuid --format=csv,noheader 2>&1 | head -1)
@@ -195,6 +238,8 @@ warm_snapshot_onto_the_second_gpu() {
   renderer=$("$F" exec --pid "$cpid" -- /usr/local/bin/phone.sh renderer 2>&1 || true)
   [[ "$renderer" == *"$gpu_name"* ]] && ok "the clone's SurfaceFlinger: $renderer" || bad "the clone's SurfaceFlinger does not render on '$gpu_name': $renderer"
   check_draws "$cpid" "on the clone's GPU"
+  # the browser, started before the snapshot, comes to the front in the clone
+  browser_in_front "$cpid" "on the clone"
   "$F" exec --pid "$cpid" -- /usr/local/bin/phone.sh stop > /dev/null 2>&1 || true
 }
 
@@ -211,6 +256,16 @@ if boot=$(timeout 400 "$F" exec --pid "$pid" -- /usr/local/bin/phone.sh boot 2>&
     && ok "the app draws: lowest of its last 8 fps samples $fps" || bad "the app does not draw 30 fps: lowest '${fps:-none}' (log $LOGS/probe.log)"
   reports=$(X /usr/local/bin/phone.sh bugreports 2>&1 || true)
   [ "$reports" = 0 ] && ok "the phone took no bug report" || bad "the phone took $reports bug report(s) (a device failed at boot; dumpstate.last_id)"
+  # the browser runs from here on: the releases, the warm snapshot and the clone below all
+  # carry it, and a release refuses while a guest holds a Vulkan instance
+  if title=$(timeout 120 "$F" exec --pid "$pid" -- /usr/local/bin/phone.sh browser "/work/$(basename "$BROWSER")" 2>&1); then
+    ok "the browser opened www.nvidia.com through the phone web proxy: '$title'"
+  else
+    bad "the browser did not open www.nvidia.com: $title"
+  fi
+  proxy_boundary
+  # the probe app in front again, for the draw checks
+  X sh -c '/android/platform-tools/adb shell am start -W -n dev.fcvm.probe/.MainActivity' > /dev/null 2>&1 || true
   in_place_release_and_retake
   retake_without_vulkan
   warm_snapshot_onto_the_second_gpu

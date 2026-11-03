@@ -929,7 +929,8 @@ phone-system-image:
 # (scripts/phone/aosp.sh), builds the emulator, and builds Robot Park (scripts/phone/app.sh)
 # against the SDK's API 35 platform (scripts/phone/sdk.sh, which needs
 # ACCEPT_ANDROID_SDK_LICENSE=1), which then draws seamless tiles, survives surface loss and
-# takes its actions (scripts/phone/scene-test.sh).
+# takes its actions (scripts/phone/scene-test.sh). The web browser (scripts/phone/browser.sh)
+# opens www.nvidia.com through the phone web proxy and comes to the front in the clone.
 phone-test: private SHELL := $(TARGET_LEASE_SHELL)
 phone-test: $(if $(strip $(GPU)),setup-phone phone-emulator)
 	@test -n "$(GPU)" && test -n "$(GPU2)" || { echo "usage: make phone-test GPU=<pci address> GPU2=<another pci address> ACCEPT_ANDROID_SDK_LICENSE=1" >&2; exit 2; }
@@ -940,6 +941,7 @@ phone-test: $(if $(strip $(GPU)),setup-phone phone-emulator)
 	./scripts/phone/aosp.sh
 	ACCEPT_ANDROID_SDK_LICENSE="$(ACCEPT_ANDROID_SDK_LICENSE)" ./scripts/phone/sdk.sh
 	./scripts/phone/app.sh > /dev/null
+	./scripts/phone/browser.sh > /dev/null
 	FCVM=./target/release/fcvm ./scripts/phone/run.sh "$(GPU)" "$(GPU2)"
 
 # Robot Park's scene tests and shader check (fleet/phone-app), in its build container; no SDK.

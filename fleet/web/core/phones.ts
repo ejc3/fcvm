@@ -280,6 +280,8 @@ export const ACTION_LABELS: Record<string, string> = {
   wave: "Wave",
   gpu_benchmark: "GPU benchmark",
   restart_app: "Restart app",
+  open_browser: "Open nvidia.com",
+  open_app: "Robot Park",
   reboot_phone: "Reboot phone",
 };
 

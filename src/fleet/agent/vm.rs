@@ -119,6 +119,16 @@ impl VmSpec {
             "--env".into(),
             format!("PHONE_APK=/work/{apk}"),
         ];
+        // The browser (webproxy.rs): its APK beside the app's, and the proxy's port forwarded
+        // to the host's loopback, where the agent serves it.
+        if let Some(b) = phone.browser_apk.as_ref().and_then(|b| b.file_name()) {
+            own.extend([
+                "--forward-localhost".into(),
+                super::webproxy::PORT.to_string(),
+                "--env".into(),
+                format!("PHONE_BROWSER_APK=/work/{}", b.to_string_lossy()),
+            ]);
+        }
         own.extend(extra.iter().cloned());
         let mut spec = VmSpec::for_slot(
             fcvm,
@@ -248,6 +258,22 @@ pub struct PhoneCfg {
     /// The warm snapshot of a running phone every phone is a clone of (flow B); none: each
     /// phone boots cold
     pub snapshot: Option<String>,
+    /// The phones' web browser (scripts/phone/browser.sh), in `apk`'s directory; none: the
+    /// phones have no browser
+    pub browser_apk: Option<PathBuf>,
+}
+
+/// The browser's APK is mapped with the app's directory (/work), so it must be in it.
+pub fn check_browser_apk(p: &PhoneCfg) -> anyhow::Result<()> {
+    if let Some(b) = &p.browser_apk {
+        anyhow::ensure!(
+            b.parent() == p.apk.parent() && b.file_name().is_some(),
+            "--phone-browser-apk {} is not in the directory of --phone-apk {}",
+            b.display(),
+            p.apk.display()
+        );
+    }
+    Ok(())
 }
 
 /// The command that carries out a take-over action in a running phone: `phone.sh action
@@ -523,6 +549,7 @@ mod tests {
             emulator: "/store/android-emulator/def/emulator".into(),
             apk: "/store/android-aosp/abc/phone-work/robotpark-1.apk".into(),
             snapshot: None,
+            browser_apk: Some("/store/android-aosp/abc/phone-work/cromite-1-x64.apk".into()),
         }
     }
     const TLS: [&str; 4] = [
@@ -582,6 +609,13 @@ mod tests {
             "{a:?}"
         );
         assert!(has(["--env", "PHONE_APK=/work/robotpark-1.apk"]), "{a:?}");
+        // the browser beside the app, and its only way out the agent's web proxy
+        assert!(
+            has(["--env", "PHONE_BROWSER_APK=/work/cromite-1-x64.apk"]),
+            "{a:?}"
+        );
+        assert!(has(["--forward-localhost", "3128"]), "{a:?}");
+        assert_eq!(super::super::webproxy::PORT, 3128);
         assert!(
             a.contains(&"--portable-volumes".to_string())
                 && a.contains(&"--privileged".to_string())
@@ -593,6 +627,33 @@ mod tests {
                 "/usr/local/bin/phone.sh",
                 "serve"
             ]
+        );
+    }
+
+    #[test]
+    fn a_browser_outside_the_apps_directory_is_refused_and_no_browser_forwards_nothing() {
+        let mut p = phone();
+        assert!(super::check_browser_apk(&p).is_ok());
+        p.browser_apk = Some("/elsewhere/cromite.apk".into());
+        assert!(super::check_browser_apk(&p).is_err());
+        p.browser_apk = None;
+        assert!(super::check_browser_apk(&p).is_ok());
+        let a = super::VmSpec::for_phone(
+            "fcvm".into(),
+            "fleet-phone-1".into(),
+            "0000:02:00.0".into(),
+            "127.0.0.1",
+            20101,
+            None,
+            None,
+            &[],
+            &p,
+        )
+        .args();
+        assert!(
+            !a.iter()
+                .any(|w| w == "--forward-localhost" || w.starts_with("PHONE_BROWSER_APK=")),
+            "{a:?}"
         );
     }
 
@@ -813,6 +874,9 @@ mod tests {
                         format!("<host>:{guest}")
                     }
                     _ if x.starts_with("PHONE_APK=") => "PHONE_APK=<app>".into(),
+                    _ if x.starts_with("PHONE_BROWSER_APK=") => {
+                        "PHONE_BROWSER_APK=<browser>".into()
+                    }
                     _ => x,
                 })
                 .collect()
@@ -833,6 +897,7 @@ mod tests {
                 emulator: "/mnt/fcvm-btrfs/android-emulator/y/emulator".into(),
                 apk: "/mnt/fcvm-btrfs/android-aosp/x/phone-work/robotpark-z.apk".into(),
                 snapshot: None,
+                browser_apk: Some("/mnt/fcvm-btrfs/android-aosp/x/phone-work/cromite-z.apk".into()),
             },
         );
         assert_eq!(

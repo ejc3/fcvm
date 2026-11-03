@@ -23,7 +23,7 @@ import { INTENT_NAMES, parseServerMsg, type Phones, type Tile } from "../protoco
 import { initialState, reduce, type ClientState, type Notice } from "../store.ts";
 import { EPOCH, fleet, snapshotText } from "./fixtures.ts";
 
-const ACTIONS = ["switch_screen", "rotate", "dark_mode", "dance", "wave", "gpu_benchmark", "restart_app", "reboot_phone"];
+const ACTIONS = ["switch_screen", "rotate", "dark_mode", "dance", "wave", "gpu_benchmark", "restart_app", "open_browser", "open_app", "reboot_phone"];
 
 /** `n` phones in the coordinator's layout: one row up to six, then rows of equal length. */
 function phonesOf(n: number, over: Partial<Phones> = {}): Phones {
@@ -348,14 +348,14 @@ describe("the panel of an opened phone", () => {
     expect(p.restoreNow).toBe("now: restoring the snapshot");
   });
 
-  it("gives the holder the eight actions, the countdown and the way back", () => {
+  it("gives the holder the ten actions, the countdown and the way back", () => {
     const ph = phonesOf(2);
     ph.tiles[0] = { ...ph.tiles[0]!, borrowed: { until: EPOCH + 30_000 + 87_400, session: "phone-claim-3", viewer: "v-1", since: EPOCH } };
     const p = panelOf(ph);
     if (p.borrow.kind !== "yours") throw new Error(p.borrow.kind);
     expect(p.borrow.session).toBe("phone-claim-3");
     expect(p.borrow.countdown).toBe("Back in 88 s");
-    expect(p.borrow.actions.map((a) => a.label)).toEqual(["Switch screen", "Rotate", "Dark mode", "Dance", "Wave", "GPU benchmark", "Restart app", "Reboot phone"]);
+    expect(p.borrow.actions.map((a) => a.label)).toEqual(["Switch screen", "Rotate", "Dark mode", "Dance", "Wave", "GPU benchmark", "Restart app", "Open nvidia.com", "Robot Park", "Reboot phone"]);
     expect(p.borrow.actions.map((a) => a.name)).toEqual(ACTIONS);
     expect(p.borrow.actions.every((a) => !a.disabled)).toBe(true);
     expect(p.borrow.giveBack).toBe("Give it back");

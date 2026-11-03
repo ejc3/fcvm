@@ -730,7 +730,7 @@ describe("mock phones", () => {
     const st = coord.fleetState() as unknown as { phones: { image_aspect: number; actions: string[]; tiles: { rect: unknown }[] } };
     expect(st.phones.image_aspect).toBeCloseTo((3 * 720) / 1280, 9);
     expect(st.phones.tiles[1]!.rect).toEqual({ x: 1 / 3, y: 0, w: 1 / 3, h: 1 });
-    expect(st.phones.actions).toHaveLength(8);
+    expect(st.phones.actions).toHaveLength(10);
   });
 
   it("lends a phone to one viewer at a time, up to the cap, and refuses with the coordinator's reasons", async () => {
@@ -761,7 +761,7 @@ describe("mock phones", () => {
     for (const bad of [{ action: "rm -rf" }, {}, { action: 3 }]) {
       expect(await send(a, "phone_action", { ...bad, claim: session })).toMatchObject({
         outcome: "refused",
-        reason: "args.action must be one of switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, reboot_phone",
+        reason: "args.action must be one of switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, open_browser, open_app, reboot_phone",
       });
     }
     expect(await send(a, "phone_action", { action: "rotate", claim: "phone-claim-0" })).toMatchObject({ outcome: "refused", reason: '"phone-claim-0" is not this viewer\'s phone' });

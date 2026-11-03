@@ -237,6 +237,82 @@ if act switch_screen; then bad "a refused switch_screen succeeded"; else ok "a r
 act switch_screen || bad "switch_screen failed: $(cat "$dir/act.err")"
 [ "$(tail -2 "$dir/ctl.log")" = '{"type":"action","name":"info"}
 {"type":"action","name":"info"}' ] && ok "a refused toggle is asked for again, not undone" || bad "after a refused switch_screen the app was sent: $(tail -2 "$dir/ctl.log")"
+# The browser's actions, with a stub adb and a stand-in for the streamer's /health and the
+# browser's DevTools list: open_browser brings the loaded page to the front and reloads it, or
+# starts the browser again while the viewer's GPU mirror is open; an action for Robot Park
+# brings it back to the front first; restart_app restarts whichever is in front; a phone
+# without the browser refuses open_browser.
+B=$dir/browser
+mkdir -p "$B"
+cat > "$B/adb" <<STUB
+#!/bin/bash
+echo "adb \$*" >> "$B/adb.log"
+case "\$*" in
+  "shell pm path org.cromite.cromite") [ -e "$B/installed" ] && echo "package:/data/app/base.apk" ;;
+  "shell am start"*) printf 'Status: ok\r\nTotalTime: 123\r\n' ;;
+esac
+exit 0
+STUB
+chmod +x "$B/adb"
+hport=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+python3 -c '
+import http.server, json, os, sys
+d = sys.argv[2]
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_GET(self):
+        if self.path == "/health":
+            body = {"mirror": {"open": os.path.exists(d + "/mirror")}}
+        elif self.path == "/json/list":
+            body = [{"id": "7", "type": "page", "url": "https://www.nvidia.com/en-us/", "title": "NVIDIA"}]
+        elif self.path.startswith("/json/close/"):
+            open(d + "/closed", "a").write(self.path + "\n"); body = "Target is closing"
+        else:
+            self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers(); return
+        b = json.dumps(body).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def log_message(self, *a): pass
+http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+' "$hport" "$B" &
+http=$!
+for _ in $(seq 1 50); do (exec 3<> "/dev/tcp/127.0.0.1/$hport") 2> /dev/null && break; sleep 0.1; done
+bact() { : > "$B/adb.log"; : > "$dir/ctl.log"; PHONE_ADB="$B/adb" PHONE_CTL_PORT=$port PHONE_RUN="$B" PHONE_STREAMER_PORT=$hport PHONE_DEVTOOLS_PORT=$hport \
+  "$phone" action "$1" > "$B/out" 2> "$dir/act.err"; }
+adb_has() { grep -qF -- "$1" "$B/adb.log"; }
+if bact open_browser; then bad "open_browser succeeded on a phone without the browser"; else ok "a phone without the browser refuses open_browser"; fi
+touch "$B/installed"
+bact open_browser || bad "open_browser failed: $(cat "$dir/act.err")"
+adb_has "shell am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER org.cromite.cromite" && adb_has "shell input keycombination 113 46" \
+  && ! adb_has "force-stop" && grep -q "shown_ms=123" "$B/out" && [ "$(cat "$B/front")" = browser ] \
+  && ok "open_browser brings the loaded page to the front and reloads it" || bad "open_browser ran: $(cat "$B/adb.log" "$B/out")"
+bact dance || bad "dance after open_browser failed: $(cat "$dir/act.err")"
+adb_has "shell am start -W -n dev.fcvm.robotpark/.MainActivity" && [ "$(cat "$dir/ctl.log")" = '{"type":"action","name":"dance"}' ] && [ "$(cat "$B/front")" = app ] \
+  && ok "an action for Robot Park brings it to the front first" || bad "dance with the browser in front ran: $(cat "$B/adb.log" "$dir/ctl.log")"
+bact dance || bad "dance failed: $(cat "$dir/act.err")"
+[ -s "$B/adb.log" ] && bad "dance with Robot Park in front ran adb: $(cat "$B/adb.log")" || ok "with Robot Park in front its actions run no adb"
+bact open_browser || bad "open_browser failed: $(cat "$dir/act.err")"; bact restart_app || bad "restart_app with the browser in front failed: $(cat "$dir/act.err")"
+adb_has "shell am force-stop org.cromite.cromite" && adb_has "shell am start -W -a android.intent.action.VIEW -d https://www.nvidia.com/ org.cromite.cromite" \
+  && [ ! -s "$dir/ctl.log" ] && grep -q "/json/close/7" "$B/closed" \
+  && ok "restart_app restarts the browser in front, in one tab, and not Robot Park" || bad "restart_app with the browser in front ran: $(cat "$B/adb.log" "$dir/ctl.log")"
+bact open_app || bad "open_app failed: $(cat "$dir/act.err")"
+adb_has "shell am start -W -n dev.fcvm.robotpark/.MainActivity" && [ ! -s "$dir/ctl.log" ] && [ "$(cat "$B/front")" = app ] \
+  && ok "open_app brings Robot Park to the front" || bad "open_app ran: $(cat "$B/adb.log" "$dir/ctl.log")"
+touch "$B/mirror"
+bact open_browser || bad "open_browser with the mirror open failed: $(cat "$dir/act.err")"
+adb_has "shell am force-stop org.cromite.cromite" && adb_has "android.intent.action.VIEW" && ! adb_has "keycombination" \
+  && ok "with the GPU mirror open, open_browser starts the browser again" || bad "open_browser with the mirror open ran: $(cat "$B/adb.log")"
+# serve with a browser: it opens www.nvidia.com before Robot Park starts in front of it, and a
+# browser that shows no NVIDIA page fails the phone.
+D=$(PHONE_BROWSER_APK=/work/cromite.apk PHONE_DEVTOOLS_PORT=$hport serve)
+has "$D" "streamer streaming" && before "$D" "adb install -r -g /work/cromite.apk" "adb install /work/robotpark.apk" \
+  && before "$D" "android.intent.action.VIEW -d https://www.nvidia.com/ org.cromite.cromite" "dev.fcvm.robotpark/.MainActivity" \
+  && [ "$(cat "$D/run/front")" = app ] && ok "serve opens the browser on www.nvidia.com, then Robot Park in front" \
+  || bad "serve with a browser: $(cat "$D/log" "$D/out")"
+closed=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+D=$(PHONE_BROWSER_APK=/work/cromite.apk PHONE_DEVTOOLS_PORT=$closed PHONE_BROWSER_WAIT=1 serve)
+has "$D" "streamer fail: the browser did not start: the browser shows no NVIDIA page" && ! has "$D" "streamer streaming" \
+  && ok "a browser that shows no NVIDIA page fails the phone" || bad "a browser with no page: $(cat "$D/log" "$D/out")"
+kill "$http" 2> /dev/null || true
 kill "$ctl" 2> /dev/null || true
 # The streamer's Makefile runs protoc once for its generated sources, however parallel the
 # build (a dry run names each command it would run).

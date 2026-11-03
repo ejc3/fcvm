@@ -150,7 +150,7 @@ test("opening a phone shows its restore time and details beside it, other phones
   await expect(page.getByTestId("phone-hit-phone:2")).toBeFocused();
 });
 
-test("taking a phone over gives the eight fixed actions; Rotate reaches the phone, and a bad name is refused", async ({ page }) => {
+test("taking a phone over gives the ten fixed actions; Rotate reaches the phone, and a bad name is refused", async ({ page }) => {
   await openPhones(page);
   await page.getByTestId("phone-hit-phone:3").click();
   await expect(page.getByTestId("phone-borrow")).toHaveAttribute("data-kind", "free");
@@ -158,14 +158,31 @@ test("taking a phone over gives the eight fixed actions; Rotate reaches the phon
   await expect(page.getByTestId("phone-borrow")).toHaveAttribute("data-kind", "yours");
   await expect(page.getByTestId("phone-countdown")).toHaveText(/^Back in \d+ s$/);
   const labels = await page.getByTestId("phone-borrow").getByRole("group", { name: "Actions" }).getByRole("button").allTextContents();
-  expect(labels).toEqual(["Switch screen", "Rotate", "Dark mode", "Dance", "Wave", "GPU benchmark", "Restart app", "Reboot phone"]);
+  expect(labels).toEqual(["Switch screen", "Rotate", "Dark mode", "Dance", "Wave", "GPU benchmark", "Restart app", "Open nvidia.com", "Robot Park", "Reboot phone"]);
   const session = (await mockPhones()).tiles[2]!.borrowed!.session;
   await page.getByTestId("phone-action-rotate").click();
   await expect.poll(async () => (await phoneActions()).map((a) => [a.action, a.phone, a.session])).toEqual([["rotate", "phone-3", session]]);
   // Only the enumerated names get through, whatever the page sends.
   await page.evaluate(() => window.__phones!.client.send("phone_action", { action: "adb shell rm -rf /" }));
-  await expect(page.getByTestId("phone-notice")).toHaveText("args.action must be one of switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, reboot_phone");
+  await expect(page.getByTestId("phone-notice")).toHaveText("args.action must be one of switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, open_browser, open_app, reboot_phone");
   expect(await phoneActions()).toHaveLength(1);
+  await page.getByTestId("phone-give-back").click();
+  await expect.poll(async () => (await mockPhones()).tiles[2]!.borrowed).toBeNull();
+});
+
+test("Open nvidia.com and Robot Park reach the phone taken over, in order, as their own actions", async ({ page }) => {
+  await openPhones(page);
+  await page.getByTestId("phone-hit-phone:3").click();
+  await page.getByTestId("phone-take").click();
+  await expect(page.getByTestId("phone-borrow")).toHaveAttribute("data-kind", "yours");
+  const session = (await mockPhones()).tiles[2]!.borrowed!.session;
+  await expect(page.getByTestId("phone-action-open_browser")).toHaveText("Open nvidia.com");
+  await page.getByTestId("phone-action-open_browser").click();
+  await expect.poll(async () => (await phoneActions()).map((a) => [a.action, a.phone, a.session])).toEqual([["open_browser", "phone-3", session]]);
+  // the coordinator takes one action a second from a holder
+  await page.waitForTimeout(1100);
+  await page.getByTestId("phone-action-open_app").click();
+  await expect.poll(async () => (await phoneActions()).map((a) => a.action)).toEqual(["open_browser", "open_app"]);
   await page.getByTestId("phone-give-back").click();
   await expect.poll(async () => (await mockPhones()).tiles[2]!.borrowed).toBeNull();
 });
