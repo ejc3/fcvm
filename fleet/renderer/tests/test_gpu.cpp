@@ -170,6 +170,37 @@ int main(int argc, char** argv) {
   }
   r.set_checkerboard(-1);
 
+  // 4b. A checkerboard frame traces only its drawn pixels: the trace of a stride-2
+  // frame takes about half a full frame's, stride 4 about a quarter. Launched over
+  // every pixel, a warp ran its drawn lanes and idled the rest, and the stride
+  // saved little: staging, 2026-11-04, terrain tiles at stride 4 traced 122k
+  // samples in 20 to 22 ms, which held the grid budget at its lowest rung.
+  {
+    Scene ts = s;
+    ts.rect = Rect{0, 0, 1, 1};
+    Tile tl = tile_geometry(ts.rect, ts.image_aspect, 540);
+    auto trace = [&](int stride) {
+      r.set_checkerboard(stride);
+      r.reset_history();
+      std::vector<double> v;
+      const long k0 = 37 * 30;
+      for (int k = 0; k < 24; k++) {
+        r.render(ts, tl, (k0 + k) / 30.0, true, 1);
+        if (k >= 8) v.push_back(r.stats().trace_ms);
+      }
+      std::sort(v.begin(), v.end());
+      return v[v.size() / 2];
+    };
+    trace(1);  // clocks up
+    double t1 = trace(1), t2 = trace(2), t4 = trace(4);
+    r.set_checkerboard(-1);
+    fprintf(stderr, "checkerboard trace at 540: stride 1 %.2f ms, stride 2 %.2f (%.2f), stride 4 %.2f (%.2f)\n", t1, t2,
+            t2 / t1, t4, t4 / t1);
+    CHECK(t2 < 0.70 * t1 && t4 < 0.45 * t1,
+          "a checkerboard frame traces only its pixels: median trace %.2f ms at stride 1, %.2f at 2 (%.2f), %.2f at 4 (%.2f)",
+          t1, t2, t2 / t1, t4, t4 / t1);
+  }
+
   // 5. Controls: the comparison can fail. A tile drawn one pixel to the right
   // but placed where the true tile goes, and another t.
   Img off = draw(r, s, Rect{0.5 + 1.0 / whole.tile.full_w, 0.5, 0.5, 0.5}, h, {{tm, 2}}, false);

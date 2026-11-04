@@ -16,6 +16,7 @@
 #define SDF_WITH_ATLAS
 #include "font_sdf.h"
 #include "budget.h"
+#include "checker.h"
 #include "render.h"
 #include "world.h"
 
@@ -1525,12 +1526,7 @@ __device__ __forceinline__ float srgb(float x) {
   return x <= 0.0031308f ? 12.92f * x : 1.055f * powf(x, 1.0f / 2.4f) - 0.055f;
 }
 
-__device__ __forceinline__ bool draws_here(uint32_t X, uint32_t Y) {
-  if (cP.half <= 1) return true;
-  if (cP.half == 2) return ((X + Y + (uint32_t)cP.parity) & 1u) == 0u;
-  const uint32_t order[4] = {0u, 3u, 1u, 2u};
-  return ((X & 1u) + 2u * (Y & 1u)) == order[cP.parity & 3];
-}
+__device__ __forceinline__ bool draws_here(uint32_t X, uint32_t Y) { return checker_draws(X, Y, cP.half, cP.parity); }
 
 // A unit normal in one float: octahedral, 15 bits per axis (so the bits are
 // never a NaN and survive any copy).
@@ -1563,20 +1559,30 @@ __device__ __forceinline__ V3 unpack_nrm(float f) {
   return normalize(v3(x, y, z));
 }
 
-// Draw this frame's samples over the drawn region (tile plus guard band) into
-// the ring entry for the frame: the mean of `spp` samples seeded by (pixel,
-// frame seed, s), the first sample's hit distance and kind.
-__global__ void k_moving(float4* ring, float2* ring_aux, float4* ring_g) {
+// The drawn region's pixels a checkerboard frame does not draw: the ring
+// entry for "no samples" (hit kind -1), which k_fill fills from neighbours.
+__global__ void k_moving_skip(float4* ring, float2* ring_aux, float4* ring_g) {
   int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y * blockDim.y + threadIdx.y;
   if (i >= cP.ew || j >= cP.eh) return;
+  if (draws_here((uint32_t)(cP.ex0 + i), (uint32_t)(cP.ey0 + j))) return;
+  int idx = j * cP.ew + i;
+  ring[idx] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  ring_aux[idx] = make_float2(0.0f, -1.0f);
+  ring_g[idx] = make_float4(1.0f, 1.0f, 1.0f, 0.0f);
+}
+
+// Draw this frame's samples over the drawn region (tile plus guard band) into
+// the ring entry for the frame: the mean of `spp` samples seeded by (pixel,
+// frame seed, s), the first sample's hit distance and kind. On a checkerboard
+// frame a thread runs only for each drawn pixel (checker_pixel); k_moving_skip
+// writes the rest.
+__global__ void k_moving(float4* ring, float2* ring_aux, float4* ring_g) {
+  int i, j;
+  if (!checker_pixel(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y, cP.ex0, cP.ey0, cP.ew,
+                     cP.eh, cP.half, cP.parity, &i, &j))
+    return;
   uint32_t X = (uint32_t)(cP.ex0 + i), Y = (uint32_t)(cP.ey0 + j);
   int idx = j * cP.ew + i;
-  if (!draws_here(X, Y)) {  // another part of the checkerboard
-    ring[idx] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    ring_aux[idx] = make_float2(0.0f, -1.0f);
-    ring_g[idx] = make_float4(1.0f, 1.0f, 1.0f, 0.0f);
-    return;
-  }
   const GCam& cam = cP.cam;
   float pix = 2.0f * cam.tan_half / cP.full_h;
   V3 sum = v3(0.0f), asum = v3(0.0f);
@@ -2449,7 +2455,12 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
     k_hold<<<dim3((ew_ + 7) / 8, (eh_ + 7) / 8), bs, 0, st>>>((float4*)hold_sum_, (float2*)hold_aux_, (float4*)hold_g_,
                                                                (float4*)ring_[ri], (float2*)ring_aux_[ri], (float4*)ring_g_[ri]);
   } else if (!held) {
-    k_moving<<<dim3((ew_ + 7) / 8, (eh_ + 7) / 8), bs, 0, st>>>((float4*)ring_[ri], (float2*)ring_aux_[ri], (float4*)ring_g_[ri]);
+    // a thread per drawn pixel (checker.h)
+    int mw = checker_threads_w(ew_, stride), mh = checker_threads_h(eh_, stride);
+    if (stride > 1)
+      k_moving_skip<<<dim3((ew_ + 7) / 8, (eh_ + 7) / 8), bs, 0, st>>>((float4*)ring_[ri], (float2*)ring_aux_[ri],
+                                                                         (float4*)ring_g_[ri]);
+    k_moving<<<dim3((mw + 7) / 8, (mh + 7) / 8), bs, 0, st>>>((float4*)ring_[ri], (float2*)ring_aux_[ri], (float4*)ring_g_[ri]);
   }
   CK(cudaGetLastError());
   CK(cudaEventRecord((cudaEvent_t)evt1_, st));
