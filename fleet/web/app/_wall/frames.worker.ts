@@ -373,8 +373,10 @@ let painted = false;
 let switchStarted: number | null = null;
 const SWITCH_HOLD_LIMIT_MS = 4000;
 let settings: DrawSettings = { background: "#000000", dimAlpha: 0.5, fadeInMs: 280 };
-/** Broadcast mode: the opened VM's stream whose frame is drawn in its box, as last told to the page. */
-let zoomDrawnKey: string | null = null;
+/** Broadcast mode: the opened VM's stream whose frame is drawn, and the box drawn in, as last told to the page. */
+let zoomDrawn: { key: string; box: Box } | null = null;
+const sameDrawn = (a: { key: string; box: Box } | null, b: { key: string; box: Box } | null) =>
+  a === b || (a !== null && b !== null && a.key === b.key && a.box.x === b.box.x && a.box.y === b.box.y && a.box.w === b.box.w && a.box.h === b.box.h);
 const streams = new Map<string, TileStream>();
 let prevT: number | null = null;
 let lastChoice: SyncChoice = { T: null, show: new Map() };
@@ -549,9 +551,9 @@ function applyPlan(p: DrawPlan): void {
   plan = p;
   // The opened VM's frame told to the page is no longer what this plan draws there (closed, or another VM).
   const zoomKey = p.zoom?.overBroadcast && p.zoom.source ? keyOf(p.zoom.source) : null;
-  if (zoomDrawnKey !== null && zoomKey !== zoomDrawnKey) {
-    zoomDrawnKey = null;
-    post({ type: "zoom-drawn", key: null });
+  if (zoomDrawn !== null && zoomKey !== zoomDrawn.key) {
+    zoomDrawn = null;
+    post({ type: "zoom-drawn", drawn: null });
   }
   // Taken at once (nothing on screen yet, or suspended): the page's overlays follow now.
   if (genChanged) post({ type: "gen-shown", gen: plan.gen });
@@ -942,13 +944,14 @@ function draw(): void {
     }
   }
   if (plan.zoom) drawZoomDim(plan.zoom);
-  // Broadcast mode: tell the page once the opened VM's own frame is in its box.
+  // Broadcast mode: tell the page once the opened VM's own frame is in its box, and where this draw
+  // put it (the plan drawn, which during a re-tile's hold is not yet the page's newest).
   const zs = plan.zoom?.overBroadcast ? plan.zoom.source : null;
   const zsShow = zs ? choice.show.get(zs.id) : undefined;
-  const zsDrawn = zs !== null && zs.box !== null && shownT(zsShow) !== null && streamOf(zs)?.frameAt(shownT(zsShow)!) != null ? keyOf(zs) : null;
-  if (zsDrawn !== zoomDrawnKey) {
-    zoomDrawnKey = zsDrawn;
-    post({ type: "zoom-drawn", key: zsDrawn });
+  const zsDrawn = zs !== null && zs.box !== null && shownT(zsShow) !== null && streamOf(zs)?.frameAt(shownT(zsShow)!) != null ? { key: keyOf(zs), box: zs.box } : null;
+  if (!sameDrawn(zsDrawn, zoomDrawn)) {
+    zoomDrawn = zsDrawn;
+    post({ type: "zoom-drawn", drawn: zsDrawn });
   }
   for (const src of shown) {
     const st = streamOf(src);

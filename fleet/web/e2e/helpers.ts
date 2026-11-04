@@ -62,7 +62,7 @@ export async function fleetNow(): Promise<FleetNow> {
 }
 
 export interface FleetNow {
-  tiles: { id: string; phase: string; borrowed: { until: number } | null; last_relaunch: { first_frame_at: number | null; phases: Record<string, number> } | null }[];
+  tiles: { id: string; phase: string; borrowed: { until: number } | null; last_relaunch: { clicked_at: number; first_frame_at: number | null; phases: Record<string, number> } | null }[];
   relaunch_all: { started_at: number; by: string; fcvm_done_at: number | null; ec2_done_at: number | null; ec2_capacity_wait_ms: number } | null;
   scoreboard: { fcvm: { last_ms: number; median_ms: number } | null; ec2: { last_ms: number; median_ms: number; last_capacity_wait_ms: number } | null };
   nudges: { holding: string | null };

@@ -32,6 +32,7 @@ import {
   type ShownFrame,
   type Tile,
   type UiState,
+  type Box,
 } from "../../core/index.ts";
 import type { BenchStats, CaptureResult, DrawSettings, FromWorker, ToWorker, TraceEntry } from "./worker-msgs.ts";
 
@@ -89,10 +90,10 @@ export class WallClient {
   painted = false;
   private paintedListeners = new Set<() => void>();
   /**
-   * Broadcast mode: the opened VM's own stream drawn in its box (source id and base URL), and
-   * when the page heard so (performance.now()); null when none is.
+   * Broadcast mode: the opened VM's own stream drawn (source id and base URL), the box the canvas
+   * drew it in, and when the page heard so (performance.now()); null when none is.
    */
-  zoomDrawn: { key: string; at: number } | null = null;
+  zoomDrawn: { key: string; box: Box; at: number } | null = null;
   private zoomDrawnListeners = new Set<() => void>();
   /** The family probe's sockets while it runs; it settles once per page load. */
   private probe: WebSocket[] | null = null;
@@ -395,7 +396,7 @@ export class WallClient {
       } else if (m.type === "gen-shown") {
         this.dispatch({ type: "gen-shown", gen: m.gen });
       } else if (m.type === "zoom-drawn") {
-        this.zoomDrawn = m.key === null ? null : { key: m.key, at: performance.now() };
+        this.zoomDrawn = m.drawn === null ? null : { ...m.drawn, at: this.zoomDrawn?.key === m.drawn.key ? this.zoomDrawn.at : performance.now() };
         for (const fn of this.zoomDrawnListeners) fn();
       } else if (m.type === "painted") {
         this.painted = true;

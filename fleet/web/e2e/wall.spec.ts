@@ -413,8 +413,17 @@ test("an opened VM zooms to fill the screen at its detail height, with the tiles
   await openWall(page, 15);
   // The timeline below is the coordinator's measure of this VM's last restart: restart it here, so
   // the test does not rely on an earlier one having done so.
+  const lastRestart = async () => (await fleetNow()).tiles.find((x) => x.id === "fcvm:3")!.last_relaunch;
+  const before = (await lastRestart())?.clicked_at ?? null;
   await page.evaluate(() => window.__fleet!.client.send("relaunch", { tile: "fcvm:3" }));
-  await expect.poll(async () => (await fleetNow()).tiles.find((x) => x.id === "fcvm:3")!.last_relaunch?.first_frame_at ?? null, { timeout: 30_000 }).not.toBeNull();
+  // This restart, not an earlier one: a new click time, then its first frame.
+  await expect
+    .poll(async () => {
+      const lr = await lastRestart();
+      return lr !== null && lr.clicked_at !== before && lr.first_frame_at !== null;
+    }, { timeout: 30_000 })
+    .toBe(true);
+  await expect.poll(() => page.evaluate(() => window.__fleet!.view().tiles.find((x) => x.id === "fcvm:3")!.dark), { timeout: 10_000 }).toBe(false);
   await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBeGreaterThanOrEqual(15);
   const t = await tileBox(page, "fcvm:3");
   await page.mouse.click(t.x + t.w / 2, t.y + t.h / 2);
@@ -1105,11 +1114,31 @@ test("broadcast mode: a click on a tile zooms the broadcast at once, then shows 
     await expect.poll(async () => (await focusError(page, "fcvm:3")).shown, { timeout: 5_000 }).toMatch(/^sync@/);
     const fe = await focusError(page, "fcvm:3");
     expect(fe.err).toBeLessThan(TILE_ERR_MAX);
+    // The canvas is clipped to the box the worker reports drawing the frame in.
+    const clip = await page.evaluate(() => {
+      const b = (window.__fleet!.client.zoomDrawn as { box?: { x: number; y: number; w: number; h: number } } | null)?.box;
+      const style = (document.querySelector("[data-testid=frames]") as HTMLElement).style.clipPath;
+      return { b, style };
+    });
+    expect(clip.b).toBeDefined();
+    const vpw = page.viewportSize()!;
+    // inset(top right bottom left), which the browser writes back in its shortest form.
+    const v = [...clip.style.matchAll(/(-?[\d.]+)px/g)].map((m) => Number(m[1]));
+    const [top, right, bottom, left] = [v[0], v[1] ?? v[0], v[2] ?? v[0], v[3] ?? v[1] ?? v[0]];
+    const b = clip.b!;
+    expect([top, right, bottom, left].map((x) => Math.round(x!))).toEqual(
+      [b.y, vpw.width - b.x - b.w, vpw.height - b.y - b.h, b.x].map((x) => Math.round(Math.max(0, x))),
+    );
+    // Paused, the screen and the canvas hold one frame: what the screen shows in the box is the canvas.
+    await page.evaluate(() => window.__fleet!.client.ui({ paused: true }));
+    await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().ui.paused)).toBe(true);
+    await page.waitForTimeout(300);
     const box2 = (await zoomBox(page))!;
     const pts = inside(box2, page.viewportSize()!.width);
     const [shot, drawn] = await Promise.all([screenPixels(page, pts), page.evaluate((p) => window.__fleet!.client.capture(p), pts)]);
     shot.forEach((p, i) => expect(near(p, drawn.pixels[i]!.slice(0, 3), 24), `point ${i}: screen ${p} against the canvas ${drawn.pixels[i]}`).toBe(true));
     await expect(page.getByTestId("focus-stream")).toHaveText(/^\d+p · \d+ fps · (native size|shown at \d+%)$/);
+    await page.evaluate(() => window.__fleet!.client.ui({ paused: false }));
     console.log(`broadcast zoom: click to zoom ${zoomMs} ms, renderers open to own frame ${ownMs} ms`);
 
     // Escape: the zoom closes and so does the stream.

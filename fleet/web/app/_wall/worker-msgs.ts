@@ -1,7 +1,7 @@
 // Messages between the page and the frame worker. The worker owns the frame
 // sockets, the decoders and the canvas; the page owns everything else.
 
-import type { DrawPlan, FrameStats, StreamMode } from "../../core/index.ts";
+import type { Box, DrawPlan, FrameStats, StreamMode } from "../../core/index.ts";
 
 export interface DrawSettings {
   /** Page background under the image (mosaic: black; an opened tile: the panel colour). */
@@ -81,6 +81,7 @@ export type FromWorker =
   | { type: "gen-shown"; gen: number }
   /**
    * Broadcast mode: the opened VM's own stream (`key`: its source id and base URL) has drawn a
-   * frame in its box, so the page can show the canvas there; null when no such frame is drawn.
+   * frame in `box` (CSS pixels), so the page can show the canvas there; null when no such frame is
+   * drawn. Sent again when the box drawn moves (the zoom's steps, a re-tile the worker swaps to).
    */
-  | { type: "zoom-drawn"; key: string | null };
+  | { type: "zoom-drawn"; drawn: { key: string; box: Box } | null };

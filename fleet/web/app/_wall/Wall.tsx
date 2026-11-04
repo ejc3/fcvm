@@ -209,8 +209,8 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   const [now, setNow] = useState(0);
   const [canDecode, setCanDecode] = useState(true);
   const [painted, setPainted] = useState(false);
-  // Broadcast mode: the opened VM's own stream drawn in its box (worker-msgs.ts "zoom-drawn").
-  const [zoomDrawn, setZoomDrawn] = useState<string | null>(null);
+  // Broadcast mode: the opened VM's own stream drawn, and the box drawn in (worker-msgs.ts "zoom-drawn").
+  const [zoomDrawn, setZoomDrawn] = useState<{ key: string; box: Box } | null>(null);
   // The recording's metadata: null until read, or when it is missing.
   const [reelMeta, setReelMeta] = useState<ReelMeta | null>(null);
   const [dpr, setDpr] = useState(1);
@@ -289,7 +289,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
     client.start();
     void canDecodeH264().then(setCanDecode);
     const off = client.onPainted(() => setPainted(true));
-    const offZoom = client.onZoomDrawn(() => setZoomDrawn(client.zoomDrawn?.key ?? null));
+    const offZoom = client.onZoomDrawn(() => setZoomDrawn(client.zoomDrawn));
     return () => {
       clearInterval(id);
       off();
@@ -696,11 +696,12 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
     };
   }
   const zs = pz?.source ?? null;
-  const canvasOverBroadcast = view.broadcast !== null && zs !== null && zs.box !== null && zoomDrawn === `${zs.id} ${zs.baseUrl ?? ""}`;
+  const canvasOverBroadcast = view.broadcast !== null && zs !== null && zs.box !== null && zoomDrawn !== null && zoomDrawn.key === `${zs.id} ${zs.baseUrl ?? ""}`;
   let canvasStyle: React.CSSProperties | undefined;
   if (view.broadcast !== null) {
-    if (canvasOverBroadcast && zs?.box) {
-      const b = zs.box;
+    if (canvasOverBroadcast && zoomDrawn) {
+      // Clipped to where the canvas drew the frame, which can trail the plan by a step.
+      const b = zoomDrawn.box;
       const clip = [b.y, viewport.w - b.x - b.w, viewport.h - b.y - b.h, b.x].map((v) => `${Math.max(0, v)}px`).join(" ");
       canvasStyle = { zIndex: 2, clipPath: `inset(${clip})` };
     } else canvasStyle = { visibility: "hidden" };
