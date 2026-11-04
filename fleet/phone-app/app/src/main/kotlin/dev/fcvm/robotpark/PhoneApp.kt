@@ -69,6 +69,7 @@ class PhoneApp : Application() {
             "samples" to Store.samples,
             "context_generation" to Store.contextGeneration,
             "screen" to Store.screen,
+            "held" to Store.scene.held,
             "night" to (Store.effectiveScene().night ?: Store.systemNight),
             "robots" to Store.robots,
             "benchmark" to (Store.benchmark ?: if (Store.benchmarkRunning) mapOf("running" to true) else null),

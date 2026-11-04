@@ -46,6 +46,81 @@ class SceneTest {
         for (t in listOf(0.0, 13.0, 44.0)) assertArrayEquals(frame(scene, t).bits(), frame(left, t).bits())
     }
 
+    /**
+     * The scene a fleet sends six phones side by side: the wall's camera (its keyframes are in
+     * kilometres of the wall's terrain, and Robot Park reads them as metres of the park, so it
+     * looks away from every robot), phone 6's rect, and `held` when a viewer holds the phone.
+     */
+    private fun fleetScene(held: Boolean?) = Protocol.parseScene(
+        Json.parse(
+            """{"epoch_unix_ms": 1761100000000, "rect": {"x": 0.8333333333333334, "y": 0.0, "w": 0.16666666666666666, "h": 1.0},
+               "image_aspect": 3.375,
+               "camera": [{"t": 0, "pos": [-47.0, 2.6, -101.0], "look": [-56.0, 2.75, -114.75], "fov_deg": 55}]""" +
+                (if (held == null) "" else ""","held": $held""") + "}",
+        ) as Map<String, Any?>,
+    )
+
+    /**
+     * The height in pixels of every walker and hopper (leapers spend half their time in the air)
+     * standing wholly on a w x h screen at t, by robot index, from their positions as pose.glsl
+     * computes them with no moves in the scene.
+     */
+    private fun robotsOnScreen(s: SceneInput, t: Double, w: Int, h: Int): Map<Int, Double> {
+        val (rect, aspect) = s.viewAt(t, w, h)
+        val tile = Tile.of(rect, aspect, w, h)
+        val vp = FrameState.compute(s.copy(imageAspect = aspect), t, w.toDouble() / h, nightDefault = false).viewProj
+        fun px(x: Double, y: Double, z: Double): Pair<Double, Double>? {
+            val cw = vp[3] * x + vp[7] * y + vp[11] * z + vp[15]
+            if (cw <= 0) return null
+            val nx = (vp[0] * x + vp[4] * y + vp[8] * z + vp[12]) / cw
+            val ny = (vp[1] * x + vp[5] * y + vp[9] * z + vp[13]) / cw
+            return ((nx + 1) / 2 * tile.fullW - tile.x0) to ((1 - ny) / 2 * tile.fullH - tile.y0)
+        }
+        fun on(p: Pair<Double, Double>?) = p != null && p.first in 0.0..w.toDouble() && p.second in 0.0..h.toDouble()
+        val walk = Time.wrap(t, Crowd.PERIOD)
+        val out = HashMap<Int, Double>()
+        for (i in 0 until Crowd.ROBOTS) {
+            val r = Crowd.robot(i)
+            if (r[6].toInt() == Crowd.KIND_LEAPER) continue
+            var x = r[0] + r[2] * (Crowd.LOOP_X / Crowd.PERIOD) * walk
+            x -= Crowd.LOOP_X * StrictMath.floor(x / Crowd.LOOP_X + 0.5)
+            val feet = px(x, 0.0, r[1].toDouble())
+            val head = px(x, 0.95 * r[5], r[1].toDouble())
+            if (on(feet) && on(head)) out[i] = feet!!.second - head!!.second
+        }
+        return out
+    }
+
+    /**
+     * A held phone follows its own robot up close, with the crowd behind it, whatever its slice
+     * of the shared image shows, in portrait and turned: the take-over actions that move the
+     * robots (dance, wave) must be seen on the phone the viewer holds. Its slice of the fleet's
+     * scene shows no robot at all. Two phones held side by side follow two robots.
+     */
+    @Test fun aHeldPhoneFollowsItsOwnRobotUpClose() {
+        val subject = Crowd.subject(fleetScene(true).rect)
+        val times = (0 until 240).map { it * 5.0 } + listOf(3600.25, 86400.5, 1.0e7 + 0.5)
+        for (t in times) {
+            assertEquals("t=$t: the slice of the fleet's scene shows robots", emptyMap<Int, Double>(), robotsOnScreen(fleetScene(null), t, 720, 1280))
+            for ((w, h, minPx) in listOf(Triple(720, 1280, 250.0), Triple(1280, 720, 140.0))) {
+                val on = robotsOnScreen(fleetScene(true), t, w, h)
+                val own = on[subject] ?: 0.0
+                assertTrue("t=$t ${w}x$h: the phone's own robot is $own px tall", own >= minPx)
+                assertTrue("t=$t ${w}x$h: ${on.size} robots on the screen", on.size >= 20)
+            }
+        }
+        val next = fleetScene(true).copy(rect = Rect(4.0 / 6, 0.0, 1.0 / 6, 1.0))
+        assertNotEquals(subject, Crowd.subject(next.rect))
+    }
+
+    /** Given back (`held` false or absent), the phone draws its slice of the shared image again. */
+    @Test fun aPhoneGivenBackDrawsItsSliceAgain() {
+        for (s in listOf(fleetScene(false), fleetScene(null))) {
+            assertEquals(Rect(0.8333333333333334, 0.0, 0.16666666666666666, 1.0) to 3.375, s.viewAt(5.0, 720, 1280))
+            assertArrayEquals(frame(fleetScene(null), 5.0).bits(), frame(s, 5.0).bits())
+        }
+    }
+
     /** A frame drawn at a large t (hours after the epoch) still animates smoothly on floats. */
     @Test fun wrappedClocksStaySmall() {
         val f = frame(scene, 1.0e7 + 0.5)

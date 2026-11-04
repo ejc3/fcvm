@@ -140,16 +140,20 @@ void dump(const Json& j, std::string* out) {
 
 std::string app_scene_line(const PhoneScene& s) {
   // the scene as posted, with the request's type and the stamp asked for, and without the
-  // admission keys, which are the streamer's and not the app's
+  // admission keys, which are the streamer's and not the app's. The app is not told who holds
+  // the phone, only that someone does (`held`), from the scene's holder alone.
   Json j = Json::parse(s.body);
   j.obj.erase("admit_keys");
   j.obj.erase("mirror_viewer");
   j.obj.erase("mirror_keys");
   j.obj.erase("type");
   j.obj.erase("stamp");
+  j.obj.erase("held");
   std::string rest;
   dump(j, &rest);
-  return "{\"type\":\"scene\",\"stamp\":true" + std::string(rest.size() > 2 ? "," : "") + rest.substr(1) + "\n";
+  std::string head = "{\"type\":\"scene\",\"stamp\":true";
+  if (!s.mirror_viewer.empty()) head += ",\"held\":true";
+  return head + std::string(rest.size() > 2 ? "," : "") + rest.substr(1) + "\n";
 }
 
 void AdmitKeys::on_scene(const PhoneScene& s) {

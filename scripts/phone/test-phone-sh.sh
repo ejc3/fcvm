@@ -185,7 +185,9 @@ D=$(FAKE_UWB_FAILS=1 boot)
 has "$D" "exit 1" && grep -q "could not turn UWB off" "$D/out" && ok "boot fails when UWB cannot be turned off" \
   || bad "boot with UWB on: $(cat "$D/log" "$D/out")"
 # `action`: each name sends its one request to the app's control socket (a stand-in that
-# records what it is sent); switch_screen and dark_mode toggle; any other name is refused.
+# records what it is sent), and an action whose effect is drawn in the scene (rotate,
+# dark_mode, dance, wave) shows the scene tab first, so the viewer sees it; switch_screen and
+# dark_mode toggle; any other name is refused.
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
 python3 -c '
 import os, socket, sys
@@ -216,23 +218,32 @@ act() { PHONE_CTL_PORT=$port PHONE_RUN="$dir" "$phone" action "$1" > /dev/null 2
 for a in switch_screen switch_screen rotate dark_mode dark_mode dance wave gpu_benchmark restart_app dark_mode restart_app dark_mode; do
   act "$a" || bad "action $a failed: $(cat "$dir/act.err")"
 done
-want='{"type":"action","name":"info"}
-{"type":"action","name":"scene"}
-{"type":"action","name":"rotate"}
-{"type":"action","name":"dark"}
-{"type":"action","name":"light"}
-{"type":"action","name":"dance"}
-{"type":"action","name":"wave"}
-{"type":"action","name":"benchmark"}
-{"type":"action","name":"restart"}
-{"type":"action","name":"dark"}
-{"type":"action","name":"restart"}
-{"type":"action","name":"dark"}'
-[ "$(cat "$dir/ctl.log")" = "$want" ] && ok "each action sends its one request to the app" || bad "the app was sent: $(cat "$dir/ctl.log")"
+S='{"type":"action","name":"scene"}'
+want="{\"type\":\"action\",\"name\":\"info\"}
+$S
+$S
+{\"type\":\"action\",\"name\":\"rotate\"}
+$S
+{\"type\":\"action\",\"name\":\"dark\"}
+$S
+{\"type\":\"action\",\"name\":\"light\"}
+$S
+{\"type\":\"action\",\"name\":\"dance\"}
+$S
+{\"type\":\"action\",\"name\":\"wave\"}
+{\"type\":\"action\",\"name\":\"benchmark\"}
+{\"type\":\"action\",\"name\":\"restart\"}
+$S
+{\"type\":\"action\",\"name\":\"dark\"}
+{\"type\":\"action\",\"name\":\"restart\"}
+$S
+{\"type\":\"action\",\"name\":\"dark\"}"
+[ "$(cat "$dir/ctl.log")" = "$want" ] && ok "each action sends its one request to the app, the scene tab first for those drawn in the scene" \
+  || bad "the app was sent: $(cat "$dir/ctl.log")"
 for a in reboot_phone shell "rotate; id" ""; do
   if act "$a"; then bad "action '$a' was accepted"; else rc=$?; [ "$rc" = 2 ] && ok "action '$a' is refused" || bad "action '$a' exited $rc"; fi
 done
-[ "$(wc -l < "$dir/ctl.log")" = 12 ] && ok "a refused action sends the app nothing" || bad "a refused action reached the app"
+[ "$(wc -l < "$dir/ctl.log")" = 19 ] && ok "a refused action sends the app nothing" || bad "a refused action reached the app"
 # A reply that is not a JSON object without "error" fails the action, and a refused toggle
 # leaves the cached state as it was, so the next one asks for the same change again.
 printf 'not json\n' > "$dir/reply"
@@ -310,7 +321,8 @@ adb_has "shell am start -W -n org.cromite.cromite/org.chromium.chrome.browser.Ch
   && ! adb_has "force-stop" && grep -q "shown_ms=123" "$B/out" && [ "$(cat "$B/front")" = browser ] \
   && ok "open_browser brings the loaded page to the front and reloads it" || bad "open_browser ran: $(cat "$B/adb.log" "$B/out")"
 bact dance || bad "dance after open_browser failed: $(cat "$dir/act.err")"
-adb_has "shell am start -W -n dev.fcvm.robotpark/.MainActivity" && [ "$(cat "$dir/ctl.log")" = '{"type":"action","name":"dance"}' ] && [ "$(cat "$B/front")" = app ] \
+adb_has "shell am start -W -n dev.fcvm.robotpark/.MainActivity" && [ "$(cat "$dir/ctl.log")" = '{"type":"action","name":"scene"}
+{"type":"action","name":"dance"}' ] && [ "$(cat "$B/front")" = app ] \
   && ok "an action for Robot Park brings it to the front first" || bad "dance with the browser in front ran: $(cat "$B/adb.log" "$dir/ctl.log")"
 bact dance || bad "dance failed: $(cat "$dir/act.err")"
 [ -s "$B/adb.log" ] && bad "dance with Robot Park in front ran adb: $(cat "$B/adb.log")" || ok "with Robot Park in front its actions run no adb"
@@ -319,8 +331,8 @@ adb_has "shell am force-stop org.cromite.cromite" && adb_has "shell am start -W 
   && [ ! -s "$dir/ctl.log" ] && grep -q "/json/close/7" "$B/closed" \
   && ok "restart_app restarts the browser in front, in one tab, and not Robot Park" || bad "restart_app with the browser in front ran: $(cat "$B/adb.log" "$dir/ctl.log")"
 bact open_app || bad "open_app failed: $(cat "$dir/act.err")"
-adb_has "shell am start -W -n dev.fcvm.robotpark/.MainActivity" && [ ! -s "$dir/ctl.log" ] && [ "$(cat "$B/front")" = app ] \
-  && ok "open_app brings Robot Park to the front" || bad "open_app ran: $(cat "$B/adb.log" "$dir/ctl.log")"
+adb_has "shell am start -W -n dev.fcvm.robotpark/.MainActivity" && [ "$(cat "$dir/ctl.log")" = '{"type":"action","name":"scene"}' ] && [ "$(cat "$B/front")" = app ] \
+  && ok "open_app brings Robot Park to the front on its scene tab" || bad "open_app ran: $(cat "$B/adb.log" "$dir/ctl.log")"
 touch "$B/mirror"
 bact open_browser || bad "open_browser with the mirror open failed: $(cat "$dir/act.err")"
 adb_has "shell am force-stop org.cromite.cromite" && adb_has "android.intent.action.VIEW" && ! adb_has "keycombination" \
@@ -328,10 +340,12 @@ adb_has "shell am force-stop org.cromite.cromite" && adb_has "android.intent.act
 # back from the browser with the mirror open, Robot Park starts again: its process may predate
 # the mirror's copy (the mirror joined while the browser was in front)
 bact open_app || bad "open_app with the mirror open failed: $(cat "$dir/act.err")"
-adb_has "shell am start -W -n dev.fcvm.robotpark/.MainActivity" && [ "$(cat "$dir/ctl.log")" = '{"type":"action","name":"restart"}' ] \
+adb_has "shell am start -W -n dev.fcvm.robotpark/.MainActivity" && [ "$(cat "$dir/ctl.log")" = '{"type":"action","name":"restart"}
+{"type":"action","name":"scene"}' ] \
   && ok "with the GPU mirror open, Robot Park back from the browser starts again" || bad "open_app with the mirror open ran: $(cat "$B/adb.log" "$dir/ctl.log")"
 bact open_browser > /dev/null || true; bact dance || bad "dance with the mirror open failed: $(cat "$dir/act.err")"
 [ "$(cat "$dir/ctl.log")" = '{"type":"action","name":"restart"}
+{"type":"action","name":"scene"}
 {"type":"action","name":"dance"}' ] && ok "an action for Robot Park with the mirror open restarts it, then sends the action" \
   || bad "dance with the browser in front and the mirror open sent: $(cat "$dir/ctl.log")"
 # `tap x y`: the point, fractions of the screen as it is turned now, goes to `input tap` at the

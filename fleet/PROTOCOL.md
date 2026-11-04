@@ -791,13 +791,13 @@ before it reaches the assignment, which an agent without that name would skip wh
 | action | what the phone does | Robot Park's action (PROTOCOL "Phone app") |
 |---|---|---|
 | `switch_screen` | the app shows its other screen: the scene, or its info screen | `info`, then `scene` |
-| `rotate` | portrait to landscape or back; a turned phone draws the whole image on its own | `rotate` |
-| `dark_mode` | night or day on this phone | `dark`, then `light` |
-| `dance`, `wave` | the robots dance, or wave, on this phone | `dance`, `wave` |
+| `rotate` | portrait to landscape or back; a turned phone draws the whole image on its own | `scene`, then `rotate` |
+| `dark_mode` | night or day on this phone | `scene`, then `dark` or `light` |
+| `dance`, `wave` | the robots dance, or wave, on this phone | `scene`, then `dance` or `wave` |
 | `gpu_benchmark` | the app's GPU benchmark; the result is on its info screen | `benchmark` |
 | `restart_app` | the app in front exits and starts again (Robot Park, or the browser on www.nvidia.com) | `restart`, or none for the browser |
 | `open_browser` | the phone's web browser comes to the front on https://www.nvidia.com/ and loads it again; while the holder's GPU mirror is open, the browser starts again instead (ARCHITECTURE.md, "The browser") | none |
-| `open_app` | Robot Park comes to the front | none |
+| `open_app` | Robot Park comes to the front, on its scene tab; the page offers it only while the browser is in front (with Robot Park there it changes nothing) | `scene` |
 | `reboot_phone` | the phone's VM is restored from its snapshot (`last_relaunch.by` `reboot:<session>`) | none |
 | `tap` | a touch at `x`, `y` on the screen, while Robot Park is in front | none: adb's `input tap` |
 
@@ -820,13 +820,15 @@ The coordinator hands every action but `reboot_phone` to the phone's agent in th
 assignment (`phone.actions` below) for 30 s, numbered (`seq`) and tagged with the launch
 they are for; the agent carries out each once with `phone.sh action <name>` in the phone's
 container (`phone.sh action tap <x> <y>`, the point as two decimals with four places), which
-sends the app the one request its name maps to (`switch_screen` asks the app which screen
+sends the app the requests its name maps to (`switch_screen` asks the app which screen
 it shows, since a tap on its tabs changes that too, and sends the other; `dark_mode`
 remembers which it sent last; so each is a toggle). The agent drops a tap it reaches 3 s
 into a batch of actions, behind a slow one. An action for Robot Park
 brings it to the front first when the browser is there, and starts it again while the holder's
-GPU mirror is open. `open_browser` and `open_app` use
-adb in the container and send the app nothing. `tap` asks Robot Park its surface size
+GPU mirror is open. An action whose effect is drawn in the scene (`rotate`, `dark_mode`,
+`dance`, `wave`) and `open_app` then show the scene tab, so the effect is not behind the info
+screen. `open_browser` uses adb in the container and sends the app nothing; `open_app` uses
+adb and sends the app `scene`. `tap` asks Robot Park its surface size
 (`status`, which turns with the screen), maps the point to that pixel and runs `input tap`;
 it fails, and nothing reaches the phone, when the container's own record says the browser is
 in front.
@@ -2069,6 +2071,7 @@ The renderer's `POST /scene` body with `"type": "scene"`, plus the phone's field
 | `night` | night palette: dark sky, stars, the moon, glowing eyes, fireflies | optional boolean; absent follows the phone's own dark mode |
 | `chrome` | keys: from `t`, show (`on: true`) or hide the app's top and tab bars over the scene. Zooming out is a key at a `t` every phone reaches together | optional, at most 64; absent means hidden (seamless) |
 | `stamp` | write the frame number `k` (the `t = k / 60` grid) into the bottom 8 rows: 32 cells across the surface, most significant bit first, white for 1 and black for 0, for the phone streamer to read and crop | optional boolean, default false |
+| `held` | a viewer holds this phone (the phone streamer sets it while the scene names a holder): the phone draws the whole image on its own, at its own aspect, with the held camera instead of `camera`, 5.5 m in front of the phone's own robot and following it along the lawn, until a scene without it arrives. The robot is a grown walker near the front of the lawn, the k-th of them for the phone in column k of `rect` | optional boolean, default false |
 | `layout_generation`, `rect_from_frame`, `previous_rect` | as the renderer's: frames before `rect_from_frame` (on the renderer's 1/30 s grid) use `previous_rect` | optional |
 | `time_of_day`, `weather`, `budget` | the renderer's; accepted and ignored | |
 
@@ -2135,7 +2138,7 @@ the difference to its own clock and adds it from then on. The reply carries
 {"ok": true, "t": 41.5, "fps": 60.0, "frames": 2490, "frame_ms": 16.6,
  "renderer": "Android Emulator OpenGL ES Translator (Tesla T4/PCIe/SSE2)",
  "vendor": "Google (NVIDIA Corporation)", "gl_version": "OpenGL ES 3.1 (OpenGL ES 3.2 NVIDIA 580.196.07)",
- "surface": [720, 1280], "samples": 4, "context_generation": 1, "screen": "scene",
+ "surface": [720, 1280], "samples": 4, "context_generation": 1, "screen": "scene", "held": false,
  "night": false, "robots": 2400, "benchmark": null, "uptime_ms": 41000,
  "device": "Google sdk_gphone64_x86_64", "android": "15 (API 35)", "place": {}}
 ```
@@ -2212,7 +2215,8 @@ the clone's GPU.
   `mirror_viewer` (at most 128 characters) and `mirror_keys` (as `admit_keys`, but for the
   mirror alone); `400` names a refused field. The streamer passes the body without
   `admit_keys`, `mirror_keys` and `mirror_viewer` to Robot
-  Park as its `scene` request with `"stamp": true` (PROTOCOL "Phone app"), again whenever a new one is posted, and sends it
+  Park as its `scene` request with `"stamp": true` (PROTOCOL "Phone app"), and `"held": true`
+  while `mirror_viewer` names a holder (a `held` in the posted body is dropped), again whenever a new one is posted, and sends it
   the host's `clock` every 2 s, over the app's control socket (127.0.0.1:7070 in the
   container, `PHONE_APP_PORT`), reconnecting when it closes.
 - `GET /mirror` (WebSocket): the GPU mirror (docs/fleet/ARCHITECTURE.md, "The GPU mirror"),

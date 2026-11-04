@@ -377,6 +377,10 @@ action)
     echo app > "$RUN/front"
     if mirror_open; then restart_app; fi
   }
+  # An action whose effect is drawn in the scene (rotate, dark_mode, dance, wave) and open_app
+  # show Robot Park's scene tab first, so the viewer watching the phone sees it: from the info
+  # tab or the browser alike. The app shows its scene tab again when it already shows it.
+  to_scene() { to_app; app_action scene; echo scene > "$RUN/screen"; }
   has_browser() { "$ADB" shell pm path "$BROWSER_PKG" 2> /dev/null | grep -q '^package:' || { echo "phone.sh: this phone has no browser" >&2; exit 1; }; }
   # A tap's point, two fractions of the screen with four places as the agent writes them
   # (0.2500 0.9375), and the screen's size in its current orientation (Robot Park's surface,
@@ -393,9 +397,9 @@ action)
   restart_browser() { open_page > "$RUN/why" || { echo "phone.sh: $(cat "$RUN/why")" >&2; exit 1; }; }
   case "${2:-}" in
   switch_screen) to_app; switch_screen ;;
-  rotate) to_app; app_action rotate ;;
-  dark_mode) to_app; toggle night light dark ;;
-  dance|wave) to_app; app_action "$2" ;;
+  rotate) to_scene; app_action rotate ;;
+  dark_mode) to_scene; toggle night light dark ;;
+  dance|wave) to_scene; app_action "$2" ;;
   gpu_benchmark) to_app; app_action benchmark ;;
   # the app in front exits and starts again; a restarted Robot Park shows its scene in its own
   # light or dark again
@@ -419,7 +423,7 @@ action)
     echo "ok open_browser $(cat "$RUN/shown" 2> /dev/null)"
     exit 0
     ;;
-  open_app) to_app ;;
+  open_app) to_scene ;;
   # A touch on the screen, for Robot Park only: the browser in front takes none. The point is
   # mapped to the screen's pixels as it is turned now (input tap's coordinates are the
   # display's, which turn with it).
