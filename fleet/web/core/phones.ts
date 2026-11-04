@@ -770,7 +770,8 @@ function panelOf(
       kind: "yours",
       session: b.session,
       countdown: `Back in ${left} s`,
-      actions: phones.actions.map((name) => ({ name, label: ACTION_LABELS[name] ?? name.replace(/_/g, " "), disabled: !online || !running })),
+      // the phone's own list (its host may run an image without the browser), else the fleet's
+      actions: (t.actions ?? phones.actions).map((name) => ({ name, label: ACTION_LABELS[name] ?? name.replace(/_/g, " "), disabled: !online || !running })),
       giveBack: "Give it back",
       views: TAKEOVER_VIEWS.map((v) => ({ ...v, pressed: v.name === takeover, disabled: mirrorUnavailable !== null && v.name !== "video" })),
       viewsNote: mirrorUnavailable,

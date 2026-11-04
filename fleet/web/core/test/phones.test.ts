@@ -362,6 +362,16 @@ describe("the panel of an opened phone", () => {
     expect(Object.keys(ACTION_LABELS)).toEqual(ACTIONS);
   });
 
+  it("offers only the phone's own actions: a phone on an older host shows no browser", () => {
+    const ph = phonesOf(2);
+    const old = ACTIONS.filter((a) => a !== "open_browser" && a !== "open_app");
+    ph.tiles[0] = { ...ph.tiles[0]!, actions: old, borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-1" } };
+    const p = panelOf(ph);
+    if (p.borrow.kind !== "yours") throw new Error(p.borrow.kind);
+    expect(p.borrow.actions.map((a) => a.name)).toEqual(old);
+    expect(p.borrow.actions.map((a) => a.label)).not.toContain("Open nvidia.com");
+  });
+
   it("offers a browser without WebGL2 the video only, and says why", () => {
     const ph = phonesOf(2);
     ph.tiles[0] = { ...ph.tiles[0]!, borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-1" } };

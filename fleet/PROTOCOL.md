@@ -779,7 +779,11 @@ or when its viewer leaves; the phone is then restored from its snapshot
 
 **Actions** (`phone_action`): only the viewer holding the phone, at most one a second, and
 only these names; anything else is refused (`args.action must be one of ...`) and nothing
-reaches the phone:
+reaches the phone. A phone also offers only what its host's agent carries out: the hello's
+`phone_actions`, or, from an agent whose hello has none, every action but `open_browser` and
+`open_app` (`reboot_phone` is always offered). Each phone tile lists its own (`actions`), and
+an action its host does not carry out is refused (`phone-1's host does not support
+open_browser`) before it reaches the assignment, which an older agent would skip whole:
 
 | action | what the phone does | Robot Park's action (PROTOCOL "Phone app") |
 |---|---|---|
@@ -842,7 +846,9 @@ file, which the store unit writes as a JSON object (`store_started_at`, `store_m
 The coordinator keeps the times that fall inside the current wake in the wake's host record
 (`power.hosts` in the state object) and logs them. `phones` (optional, phones mode) are the
 GPUs the host runs phones on (`--phones N`: the last N of its inventory), apart from
-`gpus`; the coordinator makes one phone per address not among `gpus`. `gpus` are the NVIDIA display functions bound to `vfio-pci`, in address
+`gpus`; the coordinator makes one phone per address not among `gpus`. `phone_actions`
+(optional, phones mode) names the take-over actions the host's phones carry out (an agent
+whose phones have no browser leaves out `open_browser` and `open_app`). `gpus` are the NVIDIA display functions bound to `vfio-pci`, in address
 order; `capacity` is how many VMs the host runs at once (default: one per GPU). The
 coordinator makes one slot per GPU and ignores a repeated address. The first hello binds the
 connection to `host`, and a later hello on the same connection must name the same host. A

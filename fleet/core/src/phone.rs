@@ -70,6 +70,36 @@ impl PhoneAction {
         }
     }
 
+    /// What a host's agent carries out when its hello lists no `phone_actions`: an agent
+    /// from before `open_browser`, which would skip a whole assignment line that named an
+    /// action it does not know.
+    pub const BASE: [PhoneAction; 8] = [
+        PhoneAction::SwitchScreen,
+        PhoneAction::Rotate,
+        PhoneAction::DarkMode,
+        PhoneAction::Dance,
+        PhoneAction::Wave,
+        PhoneAction::GpuBenchmark,
+        PhoneAction::RestartApp,
+        PhoneAction::RebootPhone,
+    ];
+
+    /// The actions a phone offers, in `ALL`'s order, given its host's hello: the listed ones
+    /// (names this build does not know are dropped), or `BASE` when the hello lists none.
+    /// `reboot_phone` is the coordinator's own (a relaunch of the VM) and always offered.
+    pub fn offered(listed: Option<&[String]>) -> Vec<PhoneAction> {
+        PhoneAction::ALL
+            .into_iter()
+            .filter(|a| {
+                *a == PhoneAction::RebootPhone
+                    || match listed {
+                        Some(l) => l.iter().any(|n| n == a.as_str()),
+                        None => PhoneAction::BASE.contains(a),
+                    }
+            })
+            .collect()
+    }
+
     /// The action of exactly this name; `None` for anything else.
     pub fn parse(name: &str) -> Option<PhoneAction> {
         PhoneAction::ALL.into_iter().find(|a| a.as_str() == name)

@@ -832,6 +832,16 @@
       "image_aspect": 1.125,
       "tiles": [
         {
+          "actions": [
+            "switch_screen",
+            "rotate",
+            "dark_mode",
+            "dance",
+            "wave",
+            "gpu_benchmark",
+            "restart_app",
+            "reboot_phone"
+          ],
           "borrowed": null,
           "error": null,
           "failure": null,
@@ -866,6 +876,16 @@
           "vm": "fleet-phone-1"
         },
         {
+          "actions": [
+            "switch_screen",
+            "rotate",
+            "dark_mode",
+            "dance",
+            "wave",
+            "gpu_benchmark",
+            "restart_app",
+            "reboot_phone"
+          ],
           "borrowed": null,
           "error": null,
           "failure": null,

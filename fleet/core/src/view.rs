@@ -43,6 +43,10 @@ pub struct TileView {
     pub last_relaunch: Option<RelaunchView>,
     /// While the tile's GPU is lent to a visitor's private session.
     pub borrowed: Option<BorrowedView>,
+    /// A phone's take-over actions: what its host carries out (`apply::phone_offers`).
+    /// Absent for a wall tile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actions: Option<Vec<&'static str>>,
 }
 
 /// The current layout generation: from frame `from_frame` (scene time `from_t`) every
@@ -453,6 +457,7 @@ fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) 
             failure: None,
             last_relaunch: None,
             borrowed: None,
+            actions: None,
         },
         Some(s) => TileView {
             id,
@@ -491,6 +496,7 @@ fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) 
                 phases: r.phases.clone(),
             }),
             borrowed: lent,
+            actions: None,
             failure: (s.observed.phase == "failed" && s.observed.generation >= s.generation).then(
                 || TileFailure {
                     kind: "relaunch_failed".into(),
@@ -718,6 +724,12 @@ fn phones_view(state: &State) -> PhonesView {
                     since: c.claimed_at,
                     until: c.expires_at,
                 });
+            t.actions = Some(
+                crate::apply::phone_offers(f, *n)
+                    .iter()
+                    .map(|a| a.as_str())
+                    .collect(),
+            );
             t
         })
         .collect();

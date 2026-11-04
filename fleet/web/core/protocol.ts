@@ -70,6 +70,11 @@ export interface Tile {
    * `claim`), the `viewer` holding it and when it was taken.
    */
   borrowed: { until: number; session?: string; viewer?: string; since?: number } | null;
+  /**
+   * A phone's take-over actions: what its host carries out (an older host's phones offer no
+   * browser). Absent for a wall tile, and from a coordinator that predates the field.
+   */
+  actions?: string[];
 }
 
 export interface CameraKey {
@@ -662,6 +667,7 @@ function parseTile(v: unknown, i: number): Tile {
     place: strOrNull(v, "place", where),
     last_relaunch: parseLastRelaunch(v["last_relaunch"], `${where}.last_relaunch`),
     borrowed: isObj(v["borrowed"]) ? parseBorrowed(v["borrowed"], `${where}.borrowed`) : null,
+    ...(Array.isArray(v["actions"]) ? { actions: v["actions"].filter((x): x is string => typeof x === "string") } : {}),
   };
 }
 

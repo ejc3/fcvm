@@ -155,6 +155,7 @@ export class MockPhones {
         place: null,
         last_relaunch: p.lastRelaunch,
         borrowed: p.borrow && { session: p.borrow.session, viewer: p.borrow.viewer, since: p.borrow.since, until: p.borrow.until },
+        actions: [...PHONE_ACTION_NAMES],
       })),
     };
   }
