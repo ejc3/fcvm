@@ -70,6 +70,16 @@ impl PhoneAction {
         }
     }
 
+    /// The actions a phone offers, in `ALL`'s order: those its host's hello lists (names
+    /// this build does not know are dropped), and `reboot_phone`, the coordinator's own (a
+    /// relaunch of the VM), always.
+    pub fn offered(listed: &[String]) -> Vec<PhoneAction> {
+        PhoneAction::ALL
+            .into_iter()
+            .filter(|a| *a == PhoneAction::RebootPhone || listed.iter().any(|n| n == a.as_str()))
+            .collect()
+    }
+
     /// The action of exactly this name; `None` for anything else.
     pub fn parse(name: &str) -> Option<PhoneAction> {
         PhoneAction::ALL.into_iter().find(|a| a.as_str() == name)

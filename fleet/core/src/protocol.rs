@@ -264,6 +264,10 @@ pub enum AgentMsg {
         /// The GPUs the host runs phones on (phones mode), apart from `gpus`, the wall's.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         phones: Vec<Gpu>,
+        /// The take-over actions the host's phones carry out (phones mode); a phone offers
+        /// nothing else but `reboot_phone`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        phone_actions: Vec<String>,
     },
     Slot(SlotReport),
     Health(HealthReport),

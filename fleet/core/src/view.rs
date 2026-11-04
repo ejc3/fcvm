@@ -43,6 +43,10 @@ pub struct TileView {
     pub last_relaunch: Option<RelaunchView>,
     /// While the tile's GPU is lent to a visitor's private session.
     pub borrowed: Option<BorrowedView>,
+    /// A phone's take-over actions: what its host carries out (`apply::phone_offers`).
+    /// Absent for a wall tile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actions: Option<Vec<&'static str>>,
 }
 
 /// The current layout generation: from frame `from_frame` (scene time `from_t`) every
@@ -406,8 +410,6 @@ pub struct PhonesView {
     pub borrow: BorrowView,
     /// How long a borrowed phone stays with its viewer.
     pub claim_secs: u64,
-    /// The take-over actions a borrowed phone accepts (`phone_action`).
-    pub actions: Vec<&'static str>,
     /// Shared by every viewer (`phones_zoom`): the phones show their app's bars and the page
     /// draws each in a phone body; since when.
     pub zoomed_out: bool,
@@ -453,6 +455,7 @@ fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) 
             failure: None,
             last_relaunch: None,
             borrowed: None,
+            actions: None,
         },
         Some(s) => TileView {
             id,
@@ -491,6 +494,7 @@ fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) 
                 phases: r.phases.clone(),
             }),
             borrowed: lent,
+            actions: None,
             failure: (s.observed.phase == "failed" && s.observed.generation >= s.generation).then(
                 || TileFailure {
                     kind: "relaunch_failed".into(),
@@ -718,6 +722,12 @@ fn phones_view(state: &State) -> PhonesView {
                     since: c.claimed_at,
                     until: c.expires_at,
                 });
+            t.actions = Some(
+                crate::apply::phone_offers(f, *n)
+                    .iter()
+                    .map(|a| a.as_str())
+                    .collect(),
+            );
             t
         })
         .collect();
@@ -736,10 +746,6 @@ fn phones_view(state: &State) -> PhonesView {
             next_return_at: lent.iter().copied().min(),
         },
         claim_secs: state.config.phone_claim_secs,
-        actions: crate::phone::PhoneAction::ALL
-            .iter()
-            .map(|a| a.as_str())
-            .collect(),
         zoomed_out: f.phones_zoom.out,
         zoom_at: f.phones_zoom.at,
     }
@@ -999,9 +1005,14 @@ pub fn host_assignments(state: &State) -> BTreeMap<String, Vec<AssignSlot>> {
                         .phone
                         .as_ref()
                         .map(|p| {
+                            // only what the host lists now: an agent skips the whole line
+                            // that names an action it does not know
+                            let offers = crate::apply::phone_offers(&state.fleet, *n);
                             p.actions
                                 .iter()
-                                .filter(|a| a.generation == s.generation)
+                                .filter(|a| {
+                                    a.generation == s.generation && offers.contains(&a.action)
+                                })
                                 .cloned()
                                 .collect()
                         })

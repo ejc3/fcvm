@@ -133,7 +133,6 @@ export class MockPhones {
       image_aspect: this.aspect,
       claim_secs: this.opts.claimSecs,
       borrow: { cap: this.opts.cap, lent: lent.length, next_return_at: lent.length === 0 ? null : Math.min(...lent.map((p) => p.borrow!.until)) },
-      actions: [...PHONE_ACTION_NAMES],
       zoomed_out: this.zoomedOut,
       zoom_at: this.zoomAt,
       tiles: this.phones.map((p) => ({
@@ -155,6 +154,7 @@ export class MockPhones {
         place: null,
         last_relaunch: p.lastRelaunch,
         borrowed: p.borrow && { session: p.borrow.session, viewer: p.borrow.viewer, since: p.borrow.since, until: p.borrow.until },
+        actions: [...PHONE_ACTION_NAMES],
       })),
     };
   }

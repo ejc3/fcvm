@@ -20,6 +20,17 @@
           }
         ],
         "host": "h1",
+        "phone_actions": [
+          "switch_screen",
+          "rotate",
+          "dark_mode",
+          "dance",
+          "wave",
+          "gpu_benchmark",
+          "restart_app",
+          "open_browser",
+          "open_app"
+        ],
         "phones": [
           {
             "name": "Tesla T4",
@@ -811,18 +822,6 @@
       ]
     },
     "phones": {
-      "actions": [
-        "switch_screen",
-        "rotate",
-        "dark_mode",
-        "dance",
-        "wave",
-        "gpu_benchmark",
-        "restart_app",
-        "open_browser",
-        "open_app",
-        "reboot_phone"
-      ],
       "borrow": {
         "cap": 1,
         "lent": 0,
@@ -832,6 +831,18 @@
       "image_aspect": 1.125,
       "tiles": [
         {
+          "actions": [
+            "switch_screen",
+            "rotate",
+            "dark_mode",
+            "dance",
+            "wave",
+            "gpu_benchmark",
+            "restart_app",
+            "open_browser",
+            "open_app",
+            "reboot_phone"
+          ],
           "borrowed": null,
           "error": null,
           "failure": null,
@@ -866,6 +877,18 @@
           "vm": "fleet-phone-1"
         },
         {
+          "actions": [
+            "switch_screen",
+            "rotate",
+            "dark_mode",
+            "dance",
+            "wave",
+            "gpu_benchmark",
+            "restart_app",
+            "open_browser",
+            "open_app",
+            "reboot_phone"
+          ],
           "borrowed": null,
           "error": null,
           "failure": null,

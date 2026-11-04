@@ -414,6 +414,7 @@ where
         store_ready_at: agent.store_ready_file.as_deref().and_then(mtime_ms),
         boot: agent.boot.clone(),
         phones: agent.phones.clone(),
+        phone_actions: vm::phone_actions(agent.cfg.phone.as_ref()),
     })
     .ok();
     let http = reqwest::Client::builder()

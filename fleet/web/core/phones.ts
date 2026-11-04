@@ -16,7 +16,7 @@ import { streamBitrate } from "./bandwidth.ts";
 import * as fmt from "./format.ts";
 import { frameSocketUrl, mirrorSocketUrl, streamUrl } from "./net.ts";
 import { megabytes, mbits } from "./meter.ts";
-import { sameViewer, type Phones, type Tile } from "./protocol.ts";
+import { sameViewer, type PhoneTile, type Phones, type Tile } from "./protocol.ts";
 import { serverNow } from "./clock.ts";
 import type { ClientState, Notice } from "./store.ts";
 import {
@@ -748,7 +748,7 @@ export function phonesView(inp: PhonesInput): PhonesView {
 function panelOf(
   s: ClientState,
   phones: Phones,
-  t: Tile,
+  t: PhoneTile,
   srvNow: number,
   online: boolean,
   takeover: TakeoverView,
@@ -770,7 +770,8 @@ function panelOf(
       kind: "yours",
       session: b.session,
       countdown: `Back in ${left} s`,
-      actions: phones.actions.map((name) => ({ name, label: ACTION_LABELS[name] ?? name.replace(/_/g, " "), disabled: !online || !running })),
+      // the phone's own list: what its host carries out
+      actions: t.actions.map((name) => ({ name, label: ACTION_LABELS[name] ?? name.replace(/_/g, " "), disabled: !online || !running })),
       giveBack: "Give it back",
       views: TAKEOVER_VIEWS.map((v) => ({ ...v, pressed: v.name === takeover, disabled: mirrorUnavailable !== null && v.name !== "video" })),
       viewsNote: mirrorUnavailable,

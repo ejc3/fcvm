@@ -311,10 +311,14 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     store_ready_at,
                     boot,
                     phones,
+                    phone_actions,
                 } => {
                     // The connection names the host; a hello naming another is ignored.
                     if named == host {
                         hello(&mut state.fleet, host, arch, gpus, *capacity, at);
+                        if let Some(h) = state.fleet.hosts.get_mut(host) {
+                            h.phone_actions = phone_actions.clone();
+                        }
                         phone_hello(&mut state.fleet, host, gpus, phones, at);
                         let p = &mut state.fleet.power;
                         if wake_open(p) {
@@ -1250,6 +1254,7 @@ fn hello(f: &mut Fleet, host: &str, arch: &str, gpus: &[Gpu], capacity: usize, a
             aggregate_ipv4: None,
             aggregate_v4_port: None,
             aggregate_published: None,
+            phone_actions: Vec::new(),
         },
     );
     f.reclaimed.remove(host);
@@ -1887,6 +1892,18 @@ fn release_phone(f: &mut Fleet, n: u32, at: u64) {
     f.last_phone_claim_end.insert(claim.client, at);
 }
 
+/// The take-over actions phone `n` offers: those its host's hello listed.
+pub fn phone_offers(f: &Fleet, n: u32) -> Vec<crate::phone::PhoneAction> {
+    let listed = f
+        .phones
+        .get(&n)
+        .and_then(|s| s.host.as_ref())
+        .and_then(|h| f.hosts.get(h))
+        .map(|h| h.phone_actions.as_slice())
+        .unwrap_or_default();
+    crate::phone::PhoneAction::offered(listed)
+}
+
 fn phone_action(
     state: &mut State,
     c: &Ctx,
@@ -1897,6 +1914,15 @@ fn phone_action(
     let f = &mut state.fleet;
     let n = own_phone(f, c.viewer).ok_or("phone actions need a phone of your own (claim_phone)")?;
     check_phone_claim(f, n, claim)?;
+    // Only what the phone's host carries out: an agent skips the whole assignment line that
+    // names an action it does not know.
+    if !phone_offers(f, n).contains(&action) {
+        return Err(format!(
+            "{}'s host does not support {}",
+            f.phones[&n].id,
+            action.as_str()
+        ));
+    }
     let slot = f.phones.get_mut(&n).unwrap();
     let p = slot.phone.as_mut().unwrap();
     let k = p.claim.as_mut().unwrap();

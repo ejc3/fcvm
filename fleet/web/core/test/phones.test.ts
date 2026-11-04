@@ -19,7 +19,7 @@ import {
   type PhoneLayout,
   type PhonesInput,
 } from "../phones.ts";
-import { INTENT_NAMES, parseServerMsg, type Phones, type Tile } from "../protocol.ts";
+import { INTENT_NAMES, parseServerMsg, type PhoneTile, type Phones, type Tile } from "../protocol.ts";
 import { initialState, reduce, type ClientState, type Notice } from "../store.ts";
 import { EPOCH, fleet, snapshotText } from "./fixtures.ts";
 
@@ -30,7 +30,7 @@ function phonesOf(n: number, over: Partial<Phones> = {}): Phones {
   const cols = n <= 6 ? n : Math.ceil(n / 2);
   const rows = Math.ceil(n / cols);
   const proto = fleet(1, 1).tiles[0]!;
-  const tiles: Tile[] = [];
+  const tiles: PhoneTile[] = [];
   for (let i = 0; i < n; i++) {
     tiles.push({
       ...structuredClone(proto),
@@ -43,13 +43,13 @@ function phonesOf(n: number, over: Partial<Phones> = {}): Phones {
       frame_url: `ws://example-host:1/frames/phone-${i + 1}`,
       frame_url_v4: `ws://example-host-v4:1/frames/phone-${i + 1}`,
       last_relaunch: { clicked_at: EPOCH, first_frame_at: EPOCH + 22_300, phases: { restore_ms: 4600, total_ms: 22_300 } },
+      actions: ACTIONS,
     });
   }
   return {
     image_aspect: (cols * 720) / (rows * 1280),
     claim_secs: 120,
     borrow: { cap: 2, lent: 0, next_return_at: null },
-    actions: ACTIONS,
     zoomed_out: false,
     zoom_at: null,
     tiles,
@@ -93,7 +93,7 @@ describe("phones in the snapshot", () => {
     const p = m.state.phones!;
     expect(p.image_aspect).toBe(1.125);
     expect(p.claim_secs).toBe(30);
-    expect(p.actions).toEqual(ACTIONS);
+    expect(p.tiles.map((t) => t.actions)).toEqual([ACTIONS, ACTIONS]);
     expect(p.borrow).toEqual({ cap: 1, lent: 0, next_return_at: null });
     expect(p.tiles.map((t) => [t.id, t.slot, t.phase])).toEqual([["phone:1", "phone-1", "relaunching"], ["phone:2", "phone-2", "running"]]);
     expect(p.tiles[1]!.last_relaunch).toEqual({ clicked_at: 40_000, first_frame_at: 50_000, phases: { restore_ms: 4600, total_ms: 22_500 } });
@@ -360,6 +360,16 @@ describe("the panel of an opened phone", () => {
     expect(p.borrow.actions.every((a) => !a.disabled)).toBe(true);
     expect(p.borrow.giveBack).toBe("Give it back");
     expect(Object.keys(ACTION_LABELS)).toEqual(ACTIONS);
+  });
+
+  it("offers only the phone's own actions: a phone on an older host shows no browser", () => {
+    const ph = phonesOf(2);
+    const old = ACTIONS.filter((a) => a !== "open_browser" && a !== "open_app");
+    ph.tiles[0] = { ...ph.tiles[0]!, actions: old, borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-1" } };
+    const p = panelOf(ph);
+    if (p.borrow.kind !== "yours") throw new Error(p.borrow.kind);
+    expect(p.borrow.actions.map((a) => a.name)).toEqual(old);
+    expect(p.borrow.actions.map((a) => a.label)).not.toContain("Open nvidia.com");
   });
 
   it("offers a browser without WebGL2 the video only, and says why", () => {

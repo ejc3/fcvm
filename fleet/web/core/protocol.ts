@@ -72,6 +72,11 @@ export interface Tile {
   borrowed: { until: number; session?: string; viewer?: string; since?: number } | null;
 }
 
+/** A phone: a Tile with the take-over actions it accepts (those its host carries out). */
+export interface PhoneTile extends Tile {
+  actions: string[];
+}
+
 export interface CameraKey {
   /** Scene seconds since scene.epoch_unix_ms. */
   t: number;
@@ -358,13 +363,11 @@ export interface Phones {
   /** How long a borrow lasts, seconds. */
   claim_secs: number;
   borrow: Borrow;
-  /** The take-over actions the coordinator accepts, by name. */
-  actions: string[];
   /** Zoomed out for every viewer: the phones show their app's own interface, apart in bezels. */
   zoomed_out: boolean;
   /** Unix ms at which the current zoom state took effect, or null before the first change. */
   zoom_at: number | null;
-  tiles: Tile[];
+  tiles: PhoneTile[];
 }
 
 export interface FleetState {
@@ -683,7 +686,10 @@ function parsePhones(v: unknown): Phones | null {
   const aspect = num(v, "image_aspect", w);
   if (aspect <= 0) throw new ProtocolError("phones.image_aspect is not positive");
   const b = obj(v, "borrow", w);
-  const tiles = arr(v, "tiles", w).map((t, i) => parseTile(t, i));
+  const tiles: PhoneTile[] = arr(v, "tiles", w).map((t, i) => ({
+    ...parseTile(t, i),
+    actions: arr(t as Obj, "actions", `${w}.tiles[${i}]`).filter((x): x is string => typeof x === "string"),
+  }));
   const ids = new Set<string>();
   for (const t of tiles) {
     if (ids.has(t.id)) throw new ProtocolError(`phone ${t.id} appears twice`);
@@ -693,7 +699,6 @@ function parsePhones(v: unknown): Phones | null {
     image_aspect: aspect,
     claim_secs: num(v, "claim_secs", w),
     borrow: { cap: num(b, "cap", `${w}.borrow`), lent: num(b, "lent", `${w}.borrow`), next_return_at: numOrNull(b, "next_return_at", `${w}.borrow`) },
-    actions: arr(v, "actions", w).filter((x): x is string => typeof x === "string"),
     zoomed_out: v["zoomed_out"] === true,
     zoom_at: numOrNull(v, "zoom_at", w),
     tiles,
