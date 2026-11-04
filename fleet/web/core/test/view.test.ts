@@ -233,6 +233,9 @@ describe("failure states", () => {
     // The fault message is read as JSON: an escaped quote in it, and space after the colon.
     const quoted = 'fcvm exited; fcvm said: Error: 400 - { "fault_message" : "Load snapshot error: VFIO error: device \\"gpu0\\" lost its BAR"}';
     expect(outOfRotationLine({ ...st, failures: [q("0000:0a:00.0", quoted)] })).toBe('1 fcvm GPU out of rotation: 0000:0a:00.0, VFIO error: device "gpu0" lost its BAR');
+    // fcvm's output before the API error can be long: the fault message is found wherever it is.
+    const long = vfio.replace("fcvm said: ", `fcvm said: ${"INFO fcvm: a line of the VM's log {not json}\n".repeat(400)}`);
+    expect(outOfRotationLine({ ...st, failures: [q("0000:0a:00.0", long)] })).toBe("1 fcvm GPU out of rotation: 0000:0a:00.0, VFIO error: Device does not provide MSIx irq");
     expect(outOfRotationLine({ ...st, failures: [q("0000:0a:00.0", vfio), q("0000:0b:00.0", "scrub of 0000:0b:00.0 failed (1): bad ECC; fcvm said: x")] })).toBe(
       "2 fcvm GPUs out of rotation: 0000:0a:00.0, VFIO error: Device does not provide MSIx irq; 0000:0b:00.0, scrub of 0000:0b:00.0 failed (1): bad ECC",
     );

@@ -1467,17 +1467,19 @@ export function specLine(st: FleetState, s: ClientState, image: Box | null, dpr:
 
 /**
  * The `fault_message` of the first JSON object in `text` that has one as a string (Firecracker's
- * API error body inside fcvm's output), parsed as JSON; null when none parses.
+ * API error body inside fcvm's output), parsed as JSON; null when none parses. Each candidate is
+ * the object around a `"fault_message"` key, so the scan is linear in the text per key found.
  */
 function faultMessage(text: string): string | null {
-  const t = text.slice(0, 8_192);
-  for (let i = t.indexOf("{"); i !== -1; i = t.indexOf("{", i + 1)) {
+  for (let k = text.indexOf('"fault_message"'); k !== -1; k = text.indexOf('"fault_message"', k + 1)) {
+    const i = text.lastIndexOf("{", k);
+    if (i === -1) continue;
     // The object that opens at i ends at its matching brace, strings skipped.
     let depth = 0;
     let inString = false;
     let end = -1;
-    for (let j = i; j < t.length && end === -1; j++) {
-      const c = t[j];
+    for (let j = i; j < text.length && end === -1; j++) {
+      const c = text[j];
       if (inString) {
         if (c === "\\") j++;
         else if (c === '"') inString = false;
@@ -1487,11 +1489,11 @@ function faultMessage(text: string): string | null {
     }
     if (end === -1) continue;
     try {
-      const v: unknown = JSON.parse(t.slice(i, end + 1));
+      const v: unknown = JSON.parse(text.slice(i, end + 1));
       const m = typeof v === "object" && v !== null ? (v as Record<string, unknown>)["fault_message"] : undefined;
       if (typeof m === "string") return m;
     } catch {
-      // Not JSON: look at the next brace.
+      // Not JSON: look at the next key.
     }
   }
   return null;
