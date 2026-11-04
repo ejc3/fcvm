@@ -2065,7 +2065,11 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
     use fcvm::fleet::agent::vm::PhoneCfg;
     use fleet_core::phone::{PhoneAction, PhoneActionReq};
     use fleet_core::protocol::AssignPhone;
-    let f = fake(2, &[]);
+    // rotate takes 3.2 s: a tap behind it in the same batch is past TAP_KEEP_MS
+    let f = fake(
+        2,
+        &[("FAKE_SLOW_ACTION", "rotate"), ("FAKE_SLOW_SECS", "3.2")],
+    );
     let mut c_cfg = cfg(&f.fcvm);
     c_cfg.phone = Some(PhoneCfg {
         image: "localhost/fcvm-phone:test".into(),
@@ -2195,15 +2199,17 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
         generation,
         point: None,
     };
+    let tap = |seq: u64, x: f64, y: f64| PhoneActionReq {
+        point: Some(fleet_core::phone::TapPoint { x, y }),
+        ..req(seq, PhoneAction::Tap, 1)
+    };
     let acts = vec![
-        req(1, PhoneAction::Rotate, 1),
-        req(2, PhoneAction::RebootPhone, 1),
-        req(3, PhoneAction::Dance, 1),
-        req(4, PhoneAction::Wave, 0), // an earlier launch's: never carried out
-        PhoneActionReq {
-            point: Some(fleet_core::phone::TapPoint { x: 0.25, y: 0.9375 }),
-            ..req(5, PhoneAction::Tap, 1)
-        },
+        tap(1, 0.25, 0.9375),
+        req(2, PhoneAction::Rotate, 1),
+        req(3, PhoneAction::RebootPhone, 1),
+        req(4, PhoneAction::Dance, 1),
+        req(5, PhoneAction::Wave, 0), // an earlier launch's: never carried out
+        tap(6, 0.5, 0.5),             // reached 3.2 s into the batch: dropped
     ];
     c.send(phone(1, acts.clone()));
     let execs = || -> Vec<String> {
@@ -2234,19 +2240,20 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
     assert_eq!(
         actions(),
         vec![
+            "/usr/local/bin/phone.sh action tap 0.2500 0.9375",
             "/usr/local/bin/phone.sh action rotate",
-            "/usr/local/bin/phone.sh action dance",
-            "/usr/local/bin/phone.sh action tap 0.2500 0.9375"
+            "/usr/local/bin/phone.sh action dance"
         ]
     );
     // Robot Park was told where it runs, once, for its info tab
     let places: Vec<String> = execs()
         .into_iter()
-        .filter(|e| e.contains(" ctl "))
+        .filter(|e| e.contains(" place "))
         .collect();
     assert_eq!(places.len(), 1, "{places:?}");
     let req: serde_json::Value =
-        serde_json::from_str(places[0].trim_start_matches("/usr/local/bin/phone.sh ctl ")).unwrap();
+        serde_json::from_str(places[0].trim_start_matches("/usr/local/bin/phone.sh place "))
+            .unwrap();
     assert_eq!(
         (&req["type"], &req["vm"], &req["slot"]),
         (

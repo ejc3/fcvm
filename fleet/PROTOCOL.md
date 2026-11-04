@@ -820,8 +820,10 @@ The coordinator hands every action but `reboot_phone` to the phone's agent in th
 assignment (`phone.actions` below) for 30 s, numbered (`seq`) and tagged with the launch
 they are for; the agent carries out each once with `phone.sh action <name>` in the phone's
 container (`phone.sh action tap <x> <y>`, the point as two decimals with four places), which
-sends the app the one request its name maps to (`switch_screen` and
-`dark_mode` remember which they sent last, so each is a toggle). An action for Robot Park
+sends the app the one request its name maps to (`switch_screen` asks the app which screen
+it shows, since a tap on its tabs changes that too, and sends the other; `dark_mode`
+remembers which it sent last; so each is a toggle). The agent drops a tap it reaches 3 s
+into a batch of actions, behind a slow one. An action for Robot Park
 brings it to the front first when the browser is there, and starts it again while the holder's
 GPU mirror is open. `open_browser` and `open_app` use
 adb in the container and send the app nothing. `tap` asks Robot Park its surface size
@@ -2108,9 +2110,10 @@ The same actions arrive by intent, for adb:
 
 Where the phone runs, for the info tab. Each field optional, a string or number,
 printable ASCII, at most 64 characters. A fleet agent sends it once each launch of a phone
-slot runs (`phone.sh ctl`): `vm`, `slot`, `region` (the slot's `place`, `EC2 in <region>`)
-and `restored_in_ms` (the launch to the app's first frame), and never `host`, since every
-viewer of the phone reads the info tab.
+slot runs, with `phone.sh place`, which keeps it and sends it again whenever `phone.sh`
+restarts the app (the app keeps it in memory only): `vm`, `slot`, `region` (the slot's
+`place`, `EC2 in <region>`) and `restored_in_ms` (the launch to the app's first frame), and
+never `host`, since every viewer of the phone reads the info tab.
 
 ### `clock`
 

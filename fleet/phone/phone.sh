@@ -18,6 +18,8 @@
 #                            the phone web proxy; waits for the page's title; prints it
 #   phone.sh page [secs]     the NVIDIA page's title once the browser shows it
 #   phone.sh ctl json        one request on the app's control socket; prints the reply line
+#   phone.sh place json      the app's `place` request, kept in the container and sent again
+#                            after each restart of the app
 #   phone.sh pull path dest  copies a file off the phone
 #   phone.sh shot dest.png   a screenshot of the phone's screen
 #   phone.sh applog          the app's log lines so far
@@ -340,6 +342,31 @@ action)
   # app that comes to the front starts again instead, since the mirror may have joined while
   # the other one was in front.
   mirror_open() { http_get "$STREAMER_PORT" /health 2> /dev/null | jq -e '.mirror.open == true' > /dev/null 2>&1; }
+  status() { CTL_TIMEOUT=${1:-5} "$0" ctl '{"type":"status"}' 2> /dev/null; }
+  # Robot Park restarts in a new process, which has forgotten the place it was told: the place
+  # the agent last sent ($RUN/place) goes to the new process once it answers, which it shows
+  # by an uptime no longer than the old one's (10 s at most, then it is sent anyway).
+  restart_app() {
+    local u0 u
+    u0=$(status | jq -r '.uptime_ms // empty' 2> /dev/null || true)
+    app_action restart
+    rm -f "$RUN/screen" "$RUN/night"
+    [ -s "$RUN/place" ] || return 0
+    for _ in $(seq 1 50); do
+      sleep 0.2
+      u=$(status 2 | jq -r '.uptime_ms // empty' 2> /dev/null || true)
+      [[ "$u" =~ ^[0-9]+$ && "$u0" =~ ^[0-9]+$ && "$u" -le "$u0" ]] && break
+    done
+    "$0" ctl "$(cat "$RUN/place")" > /dev/null 2>&1 || echo "phone.sh: the restarted app was not told its place" >&2
+  }
+  # Which screen Robot Park shows: a tap on its tabs changes it as switch_screen does, so the
+  # app is asked; the last one sent is used only when its status names none.
+  switch_screen() {
+    local s
+    s=$(status | jq -r '.screen // empty' 2> /dev/null || true)
+    [ -n "$s" ] || s=$(cat "$RUN/screen" 2> /dev/null || echo scene)
+    if [ "$s" = info ]; then app_action scene; echo scene > "$RUN/screen"; else app_action info; echo info > "$RUN/screen"; fi
+  }
   # Which app is in front, Robot Park or the browser: an action for Robot Park brings it to
   # the front first.
   front() { cat "$RUN/front" 2> /dev/null || echo app; }
@@ -348,7 +375,7 @@ action)
     "$ADB" shell am start -W -n dev.fcvm.robotpark/.MainActivity 2>&1 | tr -d '\r' | grep -q '^Status: ok' \
       || { echo "phone.sh: Robot Park did not come to the front" >&2; exit 1; }
     echo app > "$RUN/front"
-    if mirror_open; then app_action restart; rm -f "$RUN/screen" "$RUN/night"; fi
+    if mirror_open; then restart_app; fi
   }
   has_browser() { "$ADB" shell pm path "$BROWSER_PKG" 2> /dev/null | grep -q '^package:' || { echo "phone.sh: this phone has no browser" >&2; exit 1; }; }
   # A tap's point, two fractions of the screen with four places as the agent writes them
@@ -365,7 +392,7 @@ action)
   }
   restart_browser() { open_page > "$RUN/why" || { echo "phone.sh: $(cat "$RUN/why")" >&2; exit 1; }; }
   case "${2:-}" in
-  switch_screen) to_app; toggle screen scene info ;;
+  switch_screen) to_app; switch_screen ;;
   rotate) to_app; app_action rotate ;;
   dark_mode) to_app; toggle night light dark ;;
   dance|wave) to_app; app_action "$2" ;;
@@ -373,7 +400,7 @@ action)
   # the app in front exits and starts again; a restarted Robot Park shows its scene in its own
   # light or dark again
   restart_app)
-    if [ "$(front)" = browser ]; then restart_browser; else app_action restart; rm -f "$RUN/screen" "$RUN/night"; fi ;;
+    if [ "$(front)" = browser ]; then restart_browser; else restart_app; fi ;;
   open_browser)
     has_browser
     if mirror_open; then
@@ -398,7 +425,7 @@ action)
   # display's, which turn with it).
   tap)
     [ "$(front)" = app ] || { echo "phone.sh: taps reach the phone only in Robot Park; the browser is in front" >&2; exit 1; }
-    st=$(CTL_TIMEOUT=5 "$0" ctl '{"type":"status"}' 2> /dev/null) || { echo "phone.sh: the app did not answer" >&2; exit 1; }
+    st=$(status) || { echo "phone.sh: the app did not answer" >&2; exit 1; }
     size=$(jq -r 'if (.surface | type) == "array" then "\(.surface[0]) \(.surface[1])" else "" end' <<< "$st" 2> /dev/null || true)
     # shellcheck disable=SC2086 # two numbers
     px=$(tap_px "${3:-}" "${4:-}" $size) || exit $?
@@ -499,6 +526,11 @@ ctl)
   exec 3>&-
   echo "$reply"
   ;;
+place)
+  # kept for restart_app, then sent; the app checks its fields
+  printf '%s\n' "${2:?usage: phone.sh place json}" > "$RUN/place.tmp" && mv "$RUN/place.tmp" "$RUN/place"
+  exec "$0" ctl "$2"
+  ;;
 pull)
   "$ADB" pull "${2:?usage: phone.sh pull path dest}" "${3:?usage: phone.sh pull path dest}" > /dev/null
   ;;
@@ -512,7 +544,7 @@ stop)
   "$ADB" emu kill > /dev/null 2>&1 || true
   ;;
 *)
-  echo "usage: phone.sh serve|action NAME [x y]|boot|renderer|probe secs apk|draws secs|holds|bugreports|app apk|browser apk|page [secs]|ctl json|pull path dest|shot dest.png|applog|stop" >&2
+  echo "usage: phone.sh serve|action NAME [x y]|boot|renderer|probe secs apk|draws secs|holds|bugreports|app apk|browser apk|page [secs]|ctl json|place json|pull path dest|shot dest.png|applog|stop" >&2
   exit 2
   ;;
 esac

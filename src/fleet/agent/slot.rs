@@ -618,13 +618,21 @@ async fn post_if_changed(
 }
 
 /// Carry out the phone's take-over actions of this launch not yet carried out, oldest first,
-/// each once. A failed one is logged and not tried again.
+/// each once. A failed one is logged and not tried again. A tap reached after the batch has run
+/// for `TAP_KEEP_MS` (behind a slow action) is dropped, as the coordinator drops one it kept
+/// that long: it would land on a screen the viewer no longer sees.
 async fn run_phone_actions(ctx: &SlotCtx, r: &mut Running, p: &AssignPhone) {
+    let batch = Instant::now();
+    let tap_keep = Duration::from_millis(fleet_core::phone::TAP_KEEP_MS);
     for a in &p.actions {
         if a.seq <= r.actions_done || a.generation != r.generation {
             continue;
         }
         r.actions_done = a.seq;
+        if a.action == fleet_core::phone::PhoneAction::Tap && batch.elapsed() >= tap_keep {
+            tracing::debug!(slot = %ctx.id, seq = a.seq, "a tap waited past its time behind slower actions; dropped");
+            continue;
+        }
         let Some(argv) = super::vm::phone_action_argv(r.vm.pid, a.action, a.point) else {
             continue;
         };

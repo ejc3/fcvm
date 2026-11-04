@@ -333,9 +333,10 @@ pub fn phone_action_argv(
 }
 
 /// The command that tells a running phone's Robot Park where it runs, for its info tab
-/// (PROTOCOL.md, "Phone app", `place`): `phone.sh ctl` with the VM, the slot, the place a
-/// viewer may see (`EC2 in <region>`, never the host's own name) and the restore's time,
-/// from the launch to the app's first frame.
+/// (PROTOCOL.md, "Phone app", `place`): `phone.sh place`, which keeps it and sends it again
+/// after each restart of the app, with the VM, the slot, the place a viewer may see
+/// (`EC2 in <region>`, never the host's own name) and the restore's time, from the launch to
+/// the app's first frame.
 pub fn phone_place_argv(
     vm_pid: u32,
     vm: &str,
@@ -356,7 +357,7 @@ pub fn phone_place_argv(
         &vm_pid.to_string(),
         "--",
         "/usr/local/bin/phone.sh",
-        "ctl",
+        "place",
         &req.to_string(),
     ]
     .iter()
@@ -715,7 +716,7 @@ mod tests {
                 "42",
                 "--",
                 "/usr/local/bin/phone.sh",
-                "ctl"
+                "place"
             ]
         );
         let req: serde_json::Value = serde_json::from_str(&argv[6]).unwrap();
