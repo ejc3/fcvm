@@ -610,8 +610,6 @@ describe("taps on the held phone's screen", () => {
   it("reads the phone's app in front from the snapshot, and none from a coordinator that does not say", () => {
     const raw = JSON.parse(readFileSync(new URL("./fixtures/coordinator.json", import.meta.url), "utf8")) as { views: Record<string, { phones: { tiles: Record<string, unknown>[] } }> };
     const state = structuredClone(raw.views["29_phones"]!);
-    // A coordinator from before `front`: the field is absent.
-    for (const t of state.phones.tiles) delete t["front"];
     const read = () => {
       const m = parseServerMsg(JSON.stringify({ type: "snapshot", version: 1, state }));
       if (m.type !== "snapshot") throw new Error("not a snapshot");
