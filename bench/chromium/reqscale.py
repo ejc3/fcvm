@@ -238,6 +238,25 @@ def guarded_command(cgroup_path: str, argv: Iterable[str], parent_pid: Optional[
     return guard_prefix(cgroup_path, parent_pid) + command
 
 
+def host_provenance(quiet: dict) -> dict:
+    """The provenance's host record; reqscale_analyze accepts exactly these keys."""
+    facts = reqbench.host_facts()
+    return {
+        # The instance type and CPU, not the host name: records are
+        # published, and a host name names one machine on one network.
+        "instance_type": facts["instance_type"],
+        "cpu_model": facts["cpu_model"],
+        # The boot, hashed as every serial run's meta line hashes it, so a
+        # campaign can show its throughput run shared a boot with the rest.
+        "host_boot_sha256": reqbench.host_identity()["host_boot_sha256"],
+        "kernel": platform.release(),
+        "machine": platform.machine(),
+        "python": platform.python_version(),
+        "cpu_count": os.cpu_count(),
+        "quiet_gate": quiet,
+    }
+
+
 def supervised_command(
     cgroup_path: str, argv: Iterable[str], parent_pid: Optional[int] = None,
 ) -> list[str]:
@@ -2734,20 +2753,7 @@ def collect_provenance(args, schedule: dict, snapshot: dict) -> dict:
             "mode": "shared",
             "held_from_identity_read_through_terminal_verification": True,
         },
-        "host": {
-            # The instance type and CPU, not the host name: records are
-            # published, and a host name names one machine on one network.
-            "instance_type": reqbench.host_facts()["instance_type"],
-            "cpu_model": reqbench.host_facts()["cpu_model"],
-            # The boot, hashed as every serial run's meta line hashes it, so a
-            # campaign can show its throughput run shared a boot with the rest.
-            "host_boot_sha256": reqbench.host_identity()["host_boot_sha256"],
-            "kernel": platform.release(),
-            "machine": platform.machine(),
-            "python": platform.python_version(),
-            "cpu_count": os.cpu_count(),
-            "quiet_gate": quiet,
-        },
+        "host": host_provenance(quiet),
         "fault_trace": {
             "enabled": bool(args.trace_faults),
             "bpftrace_version": (
@@ -3183,6 +3189,15 @@ class NativeChromiumControl:
             "--remote-allow-origins=*",
             "--ignore-certificate-errors",
             "--disable-gpu",
+            # Without it the GPU process tries SwANGLE, fails and exits several
+            # times while the browser starts, and the warmup page created
+            # meanwhile can have its widget messages rejected and never produce
+            # a frame (8 of 100 starts timed out at the warmup screenshot).
+            # The control had no WebGL before this flag either: the GPU process
+            # that would provide it never initialises (a page's getContext
+            # returns null with and without the flag). entry.sh's note against
+            # this flag is about the guest Chromium, which has WebGL.
+            "--disable-software-rasterizer",
             "--disable-dev-shm-usage",
             "--window-size=1280,800",
             "--hide-scrollbars",

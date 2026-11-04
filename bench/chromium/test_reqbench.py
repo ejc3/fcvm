@@ -724,6 +724,348 @@ class ReapDiskPathGuard(unittest.TestCase):
             self.assertEqual(reaped, [state])
             self.assertFalse(os.path.lexists(state))
 
+    def test_a_tree_another_launch_is_removing_is_still_reaped(self):
+        """Every fcvm launch reclaims the runtime directory of a SIGKILLed fcvm
+        whose owner lock nobody holds (src/reclaim.rs), so under concurrent
+        clones the next launch can remove entries of this clone's directory
+        while the fast teardown's rmtree walks it.
+
+        RED BEFORE THE FIX: rmtree's ENOENT on an entry the reclaim had removed
+        was recorded as a disk error, the reap returned before the state file,
+        and SurvivedTeardown failed the request. One scale run at 8 vCPUs
+        failed 183 of 7,560 requests that way, at every rate.
+        """
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as root:
+            vm_id = "vm-77777777777777777777777777777777"
+            state = os.path.join(root, f"{vm_id}.json")
+            with open(state, "w") as f:
+                json.dump({"vm_id": vm_id}, f)
+            with open(f"{state}.lock", "w"):
+                pass
+            vm_dir = os.path.join(root, "vm-disks", vm_id)
+            os.makedirs(os.path.join(vm_dir, "disks"))
+            for name in ("disks/rootfs.raw", "container-ready", "vsock.sock"):
+                with open(os.path.join(vm_dir, name), "w"):
+                    pass
+            real_unlink = os.unlink
+
+            def raced_unlink(path, *, dir_fd=None):
+                # The reclaim removes the entry first; the walk's own unlink
+                # then finds it gone.
+                real_unlink(path, dir_fd=dir_fd)
+                real_unlink(path, dir_fd=dir_fd)
+
+            out: dict = {}
+            with mock.patch.object(os, "unlink", raced_unlink):
+                reaped = reqbench.reap_disk(out, root, state, vm_dir)
+            self.assertNotIn("disk_errors", out)
+            self.assertEqual(reaped, [vm_dir, state, f"{state}.lock"])
+            for p in (vm_dir, state, f"{state}.lock"):
+                self.assertFalse(os.path.lexists(p), p)
+
+    def _owned_clone(self, root, vm_id):
+        state = os.path.join(root, f"{vm_id}.json")
+        with open(state, "w") as f:
+            json.dump({"vm_id": vm_id, "pid": 4242, "pid_start_time": 99}, f)
+        with open(f"{state}.lock", "w"):
+            pass
+        vm_dir = os.path.join(root, "vm-disks", vm_id)
+        os.makedirs(os.path.join(vm_dir, "disks"))
+        return state, vm_dir
+
+    def test_a_state_another_launch_is_retiring_is_still_reaped(self):
+        """Every fcvm launch runs cleanup_stale_state (src/state/manager.rs),
+        which takes a dead owner's state lock without waiting and deletes its
+        state, temp and lock while holding it. The fast teardown's identity
+        check met that lock held.
+
+        RED BEFORE THE FIX: the non-blocking flock failed with EAGAIN, the reap
+        recorded "refusing to remove without exact state identity: [Errno 11]
+        Resource temporarily unavailable" and SurvivedTeardown failed the
+        request (scale runs at 2 and 8 vCPUs, one request each)."""
+        import fcntl
+        import threading
+        with tempfile.TemporaryDirectory() as root:
+            vm_id = "vm-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            state, vm_dir = self._owned_clone(root, vm_id)
+            held = os.open(f"{state}.lock", os.O_RDWR)
+            fcntl.flock(held, fcntl.LOCK_EX)
+
+            def retire():
+                time.sleep(0.2)
+                os.remove(state)
+                os.remove(f"{state}.lock")
+                fcntl.flock(held, fcntl.LOCK_UN)
+                os.close(held)
+
+            t = threading.Thread(target=retire)
+            t.start()
+            out: dict = {}
+            try:
+                reaped = reqbench.reap_disk(out, root, state, vm_dir, (4242, 99))
+            finally:
+                t.join()
+            self.assertNotIn("disk_errors", out)
+            self.assertEqual(reaped, [vm_dir])
+            for p in (vm_dir, state, f"{state}.lock"):
+                self.assertFalse(os.path.lexists(p), p)
+
+    def test_a_state_already_retired_is_still_reaped(self):
+        """The same cleanup can finish before the reap opens the lock."""
+        with tempfile.TemporaryDirectory() as root:
+            vm_id = "vm-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            state, vm_dir = self._owned_clone(root, vm_id)
+            os.remove(state)
+            os.remove(f"{state}.lock")
+            out: dict = {}
+            reaped = reqbench.reap_disk(out, root, state, vm_dir, (4242, 99))
+            self.assertNotIn("disk_errors", out)
+            self.assertEqual(reaped, [vm_dir])
+            self.assertFalse(os.path.lexists(vm_dir))
+
+    def test_a_lock_held_past_the_wait_is_still_refused(self):
+        """A holder that does not let go is not a retirement."""
+        import fcntl
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as root:
+            vm_id = "vm-cccccccccccccccccccccccccccccccc"
+            state, vm_dir = self._owned_clone(root, vm_id)
+            held = os.open(f"{state}.lock", os.O_RDWR)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            try:
+                out: dict = {}
+                with mock.patch.object(reqbench, "STATE_LOCK_WAIT_S", 0.1):
+                    reaped = reqbench.reap_disk(out, root, state, vm_dir, (4242, 99))
+            finally:
+                os.close(held)
+            self.assertEqual(reaped, [])
+            self.assertIn("exact state identity", " ".join(out["disk_errors"]))
+            self.assertTrue(os.path.isdir(vm_dir))
+            self.assertTrue(os.path.exists(state))
+
+    def test_a_lock_another_launch_recreated_is_not_left_behind(self):
+        """cleanup_stale_state opens, creating if needed, the lock of every state
+        file in a listing it took earlier, and removes it while holding it once it
+        finds the state gone. After a complete reap that lock can exist again for
+        a moment.
+
+        RED BEFORE THE FIX: the absence check saw it and SurvivedTeardown failed
+        the request with left=['.../vm-<id>.json.lock'] errors=[] (one request
+        of a scale probe at 2 vCPUs)."""
+        import fcntl
+        import threading
+        with tempfile.TemporaryDirectory() as root:
+            vm_id = "vm-dddddddddddddddddddddddddddddddd"
+            state = os.path.join(root, f"{vm_id}.json")
+            lock = f"{state}.lock"
+            vm_dir = os.path.join(root, "vm-disks", vm_id)
+            # An fcvm stand-in whose one child dies with it (pdeathsig), so the
+            # kill is complete and the reap runs.
+            ready = os.path.join(root, "child-ready")
+            p = subprocess.Popen(["bash", "-c",
+                                  "python3 -c 'import ctypes,signal,time; "
+                                  "ctypes.CDLL(\"libc.so.6\").prctl(1, signal.SIGKILL); "
+                                  f"open(\"{ready}\", \"w\").close(); "
+                                  "time.sleep(600)' & wait"])
+            deadline = time.monotonic() + 10
+            while not os.path.exists(ready) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            # The scanner's lock: created once the reap has removed the clone's
+            # own state and lock, held, and removed before it lets go.
+            from unittest import mock
+            real_reap = reqbench.reap_disk
+            threads = []
+
+            def reap_then_scan(*a, **k):
+                reaped = real_reap(*a, **k)
+                held = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+                fcntl.flock(held, fcntl.LOCK_EX)
+
+                def scanner():
+                    time.sleep(0.3)
+                    os.remove(lock)
+                    fcntl.flock(held, fcntl.LOCK_UN)
+                    os.close(held)
+
+                threads.append(threading.Thread(target=scanner))
+                threads[-1].start()
+                return reaped
+
+            try:
+                with mock.patch.object(reqbench, "reap_disk", reap_then_scan):
+                    out = reqbench.teardown_fast(p.pid, root, state, vm_dir, 5.0,
+                                                 verify_disk_cleanup=True)
+            finally:
+                for t in threads:
+                    t.join()
+                p.kill()
+                p.wait()
+            self.assertTrue(out["disk_cleanup_verified"], out)
+            self.assertFalse(os.path.lexists(lock))
+
+    def test_a_lock_beside_no_state_is_removed_once_free(self):
+        """A lock left beside an absent state and directory, with nobody holding
+        it, is removed by the absence check, as cleanup_stale_state would."""
+        with tempfile.TemporaryDirectory() as root:
+            state = os.path.join(root, "vm-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json")
+            with open(f"{state}.lock", "w"):
+                pass
+            self.assertEqual(reqbench.left_on_disk(state, ""), [])
+            self.assertFalse(os.path.lexists(f"{state}.lock"))
+
+    def test_a_state_that_is_not_an_object_is_refused_and_unlocked(self):
+        """RED BEFORE THE FIX: valid JSON that is not an object raised
+        AttributeError out of reap_disk with the state lock still held, past the
+        refusal record."""
+        import fcntl
+        with tempfile.TemporaryDirectory() as root:
+            vm_id = "vm-efefefefefefefefefefefefefefefef"
+            state, vm_dir = self._owned_clone(root, vm_id)
+            with open(state, "w") as f:
+                json.dump([4242, 99], f)
+            out: dict = {}
+            reaped = reqbench.reap_disk(out, root, state, vm_dir, (4242, 99))
+            self.assertEqual(reaped, [])
+            self.assertIn("exact state identity", " ".join(out["disk_errors"]))
+            self.assertTrue(os.path.isdir(vm_dir))
+            probe = os.open(f"{state}.lock", os.O_RDWR)
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
+
+    @staticmethod
+    def _waiting_signal(event):
+        """A patch for fcntl.flock that sets event the first time the calling
+        thread tries a non-blocking exclusive lock: the reap is then waiting."""
+        import fcntl
+        import threading
+        real = fcntl.flock
+        caller = threading.get_ident()
+
+        def flock(fd, op):
+            if threading.get_ident() == caller and op == fcntl.LOCK_EX | fcntl.LOCK_NB:
+                try:
+                    return real(fd, op)
+                except BlockingIOError:
+                    event.set()
+                    raise
+            return real(fd, op)
+        return flock
+
+    def test_a_lock_replaced_by_a_second_scanner_is_waited_for_too(self):
+        """Scanner A holds the lock, unlinks it and lets go; scanner B, from an
+        earlier listing, has meanwhile created and holds a new one. The settle
+        must wait on B's lock as well."""
+        import fcntl
+        import threading
+        with tempfile.TemporaryDirectory() as root:
+            state = os.path.join(root, "vm-abababababababababababababababab.json")
+            lock = f"{state}.lock"
+            a = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(a, fcntl.LOCK_EX)
+            b_ready = threading.Event()
+            waiting = threading.Event()
+
+            def scanners():
+                # Replace the lock only once the settle is waiting on A.
+                self.assertTrue(waiting.wait(10))
+                os.remove(lock)
+                b = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+                fcntl.flock(b, fcntl.LOCK_EX)
+                b_ready.set()
+                fcntl.flock(a, fcntl.LOCK_UN)
+                os.close(a)
+                time.sleep(0.3)
+                os.remove(lock)
+                fcntl.flock(b, fcntl.LOCK_UN)
+                os.close(b)
+
+            from unittest import mock
+            t = threading.Thread(target=scanners)
+            t.start()
+            try:
+                with mock.patch.object(reqbench.fcntl, "flock", self._waiting_signal(waiting)):
+                    left = reqbench.left_on_disk(state, "")
+            finally:
+                waiting.set()
+                t.join()
+            self.assertTrue(b_ready.is_set())
+            self.assertEqual(left, [])
+
+    def test_the_normal_teardown_counts_the_wait_for_a_scanner_lock(self):
+        """teardown_total_ms was set before the absence check, so a wait there
+        for another launch's lock fell outside the published total."""
+        import fcntl
+        import threading
+        with tempfile.TemporaryDirectory() as d:
+            vm_id = "vm-cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+            state = os.path.join(d, "state", f"{vm_id}.json")
+            os.makedirs(os.path.dirname(state))
+            lock = f"{state}.lock"
+            held = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            waiting = threading.Event()
+
+            def scanner():
+                # Hold the lock for 0.5 s after the check starts waiting on it.
+                waiting.wait(10)
+                time.sleep(0.5)
+                os.remove(lock)
+                fcntl.flock(held, fcntl.LOCK_UN)
+                os.close(held)
+
+            from unittest import mock
+            p = spawn_pdeathsig_parent(["sleep", "300"])
+            wait_for_child(p.pid)
+            t = threading.Thread(target=scanner)
+            t.start()
+            try:
+                with mock.patch.object(reqbench.fcntl, "flock", self._waiting_signal(waiting)):
+                    out = reqbench.teardown_normal(
+                        p, p.pid, 5.0, d, state, os.path.join(d, "vm-disks", vm_id),
+                        verify_disk_cleanup=True)
+            finally:
+                waiting.set()
+                t.join()
+                kill_tree(p)
+            self.assertTrue(out["disk_cleanup_verified"], out)
+            # The wait begins after reap_wall_ms is taken, so it is the part of
+            # the total beyond the process reap.
+            self.assertGreaterEqual(out["teardown_total_ms"] - out["reap_wall_ms"], 500.0, out)
+
+    def test_a_lock_beside_a_state_is_never_removed(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = os.path.join(root, "vm-ffffffffffffffffffffffffffffffff.json")
+            for p in (state, f"{state}.lock"):
+                with open(p, "w"):
+                    pass
+            self.assertEqual(reqbench.left_on_disk(state, ""), [state, f"{state}.lock"])
+
+    def test_a_real_removal_error_is_still_recorded(self):
+        """Only a missing entry is someone else's removal; EACCES stays an error."""
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as root:
+            vm_id = "vm-99999999999999999999999999999999"
+            state = os.path.join(root, f"{vm_id}.json")
+            with open(state, "w") as f:
+                json.dump({"vm_id": vm_id}, f)
+            vm_dir = os.path.join(root, "vm-disks", vm_id)
+            os.makedirs(vm_dir)
+            with open(os.path.join(vm_dir, "f"), "w"):
+                pass
+
+            def denied(path, *, dir_fd=None):
+                raise PermissionError(13, "Permission denied", path)
+
+            out: dict = {}
+            with mock.patch.object(os, "unlink", denied):
+                reaped = reqbench.reap_disk(out, root, state, vm_dir)
+            self.assertEqual(reaped, [])
+            self.assertIn("disk_errors", out)
+            self.assertTrue(os.path.lexists(state))
+
     def test_a_real_per_vm_dir_is_still_reaped(self):
         """The guard must not disarm the ordinary reap."""
         with tempfile.TemporaryDirectory() as root:
@@ -1164,6 +1506,49 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
             self.assertEqual(
                 rec["firecracker_process_faults_ready_to_artifact"],
                 {"pid": 7, "minor_faults": 3, "major_faults": 0})
+
+
+class ScaleClonesStayInTheirBackendCgroup(unittest.TestCase):
+    """`--no-swap` moves Firecracker into /fcvm.slice/fcvm-<pid>.scope, out of
+    the backend cgroup reqscale's guard placed the clone in.
+
+    RED BEFORE THE FIX: every clone a scale run started passed `--no-swap`. In
+    one run at 8 vCPUs all 7,560 clones logged the move, and reqscale's
+    membership check failed 3 requests ("firecracker-def pid ... is outside run
+    cgroup ...: /fcvm.slice/fcvm-<pid>.scope") whose sample came after it.
+    """
+
+    def argv(self, **extra):
+        from unittest import mock
+        seen = []
+
+        def spawn(cmd, log, env):
+            seen.append(list(cmd))
+            raise RuntimeError("stop after the spawn")
+
+        with tempfile.TemporaryDirectory() as d:
+            args = argparse.Namespace(
+                fcvm="/bin/false", out_dir=d, url="http://x/", format="jpeg", quality=80,
+                snapshot_tag="", serve_pid=1, rust_log="off", timeout=1.0,
+                teardown_timeout=1.0, cdp_port=1, state_dir=d, data_root=d, ws_url="",
+                run_id="t", **extra)
+            with mock.patch.object(reqbench, "spawn_clone_process", spawn):
+                try:
+                    reqbench.run_cdp_request(args, 0, fast=True)
+                except RuntimeError:
+                    pass
+        self.assertEqual(len(seen), 1, seen)
+        return seen[0]
+
+    def test_a_guarded_scale_clone_does_not_ask_to_leave_its_cgroup(self):
+        argv = self.argv(spawn_prefix=["/guard", "--"])
+        self.assertEqual(argv[:3], ["/guard", "--", "/bin/false"])
+        self.assertNotIn("--no-swap", argv)
+
+    def test_a_serial_clone_keeps_no_swap(self):
+        argv = self.argv()
+        self.assertEqual(argv[0], "/bin/false")
+        self.assertIn("--no-swap", argv)
 
 
 class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):

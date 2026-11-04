@@ -2187,6 +2187,121 @@ def safe_vm_data_dir(data_root: str, state_path: str, data_dir: str) -> str:
     return real
 
 
+# How long the reap waits for another fcvm's cleanup_stale_state to let go of a
+# clone's state lock. It holds the lock only while it reads one state file and
+# unlinks three, so a holder past this is not that cleanup.
+STATE_LOCK_WAIT_S = 5.0
+
+
+def _lock_state_for_reap(lock_path: str, state_path: str):
+    """The state lock's fd, held exclusively, or None when the state is retired.
+
+    Raises OSError when the lock is missing beside a state that exists, or is
+    still held after STATE_LOCK_WAIT_S."""
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        if os.path.lexists(state_path):
+            raise
+        return None
+    try:
+        locked = _flock_until(fd, time.monotonic() + STATE_LOCK_WAIT_S)
+    except OSError:
+        os.close(fd)
+        raise
+    if not locked:
+        os.close(fd)
+        raise BlockingIOError(errno.EAGAIN, "state lock still held after the wait", lock_path)
+    return fd
+
+
+def _read_state_nofollow(state_path: str):
+    """The state file's JSON, read without following a symlink, or None when it
+    is gone (retired while the reap waited for its lock)."""
+    try:
+        state_fd = os.open(state_path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(state_fd).st_mode):
+            raise RuntimeError("state path is not a regular file")
+        with os.fdopen(state_fd) as state_file:
+            state_fd = -1
+            state = json.load(state_file)
+        if not isinstance(state, dict):
+            raise RuntimeError(f"state is a JSON {type(state).__name__}, not an object")
+        return state
+    finally:
+        if state_fd >= 0:
+            os.close(state_fd)
+
+
+def left_on_disk(state_path: str, data_dir: str) -> list:
+    """Which of a clone's state file, its lock and its runtime directory exist.
+
+    Every fcvm launch runs cleanup_stale_state, which opens, creating if needed,
+    the lock of each state file in a listing it took earlier, and removes the
+    lock while holding it once it finds the state gone. So a lock can exist for
+    a moment after a complete reap. A lock beside an absent state and directory
+    is waited for (STATE_LOCK_WAIT_S) and removed if it is still there with the
+    state still absent, as that cleanup would."""
+    lock = f"{state_path}.lock" if state_path else ""
+    paths = [p for p in (state_path, lock, data_dir) if p]
+    left = [p for p in paths if os.path.lexists(p)]
+    if lock and left == [lock]:
+        _settle_orphan_lock(lock, state_path)
+        left = [p for p in paths if os.path.lexists(p)]
+    return left
+
+
+def _settle_orphan_lock(lock: str, state_path: str) -> None:
+    """Wait for, then remove, a lock left beside an absent state. Another
+    scanner can unlink the lock this waits on and create a new one, so a lock
+    that turns out to be replaced is waited on again, until STATE_LOCK_WAIT_S."""
+    deadline = time.monotonic() + STATE_LOCK_WAIT_S
+    while True:
+        try:
+            fd = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return
+        try:
+            if not _flock_until(fd, deadline) or os.path.lexists(state_path):
+                return
+            try:
+                on_disk = os.lstat(lock)
+            except FileNotFoundError:
+                return
+            held = os.fstat(fd)
+            if (on_disk.st_dev, on_disk.st_ino) == (held.st_dev, held.st_ino):
+                try:
+                    os.remove(lock)
+                except FileNotFoundError:
+                    pass
+                return
+        finally:
+            os.close(fd)
+        if time.monotonic() >= deadline:
+            return
+
+
+def _flock_until(fd: int, deadline: float) -> bool:
+    """Take fd's lock exclusively, polling until deadline; False if still held."""
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+
+
+def _ignore_missing(function, path, exc):
+    """rmtree onexc: an entry another process removed first is not an error."""
+    if not isinstance(exc, FileNotFoundError):
+        raise exc
+
+
 def reap_disk(
     out: dict,
     data_root: str,
@@ -2209,26 +2324,28 @@ def reap_disk(
         # the exact (PID, procfs starttime) captured immediately after Popen.
         # A fresh null-PID record may identify this spawn for diagnostics, but it
         # is not enough authority to remove its disk.
+        #
+        # Every fcvm launch runs cleanup_stale_state (src/state/manager.rs): it
+        # takes a dead owner's lock without waiting and deletes the state, its
+        # temp and the lock while holding it. A lock held briefly is that
+        # retirement, so the reap waits for it, and a state that is gone once
+        # the lock is free (or before) was retired: no PID is left that could
+        # name somebody else, and the disk is this clone's by its vm_id.
         lock_path = f"{state_path}.lock" if state_path else ""
         try:
-            state_lock = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
-            fcntl.flock(state_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            state_fd = os.open(state_path, os.O_RDONLY | os.O_NOFOLLOW)
-            try:
-                if not stat.S_ISREG(os.fstat(state_fd).st_mode):
-                    raise RuntimeError("state path is not a regular file")
-                with os.fdopen(state_fd) as state_file:
-                    state_fd = -1
-                    persisted = json.load(state_file)
-            finally:
-                if state_fd >= 0:
-                    os.close(state_fd)
-            actual_owner = (persisted.get("pid"), persisted.get("pid_start_time"))
-            if actual_owner != expected_owner:
-                raise RuntimeError(
-                    f"state owner is {actual_owner}, expected exact owner "
-                    f"{expected_owner}"
-                )
+            if not state_path:
+                raise RuntimeError("no state path")
+            state_lock = _lock_state_for_reap(lock_path, state_path)
+            persisted = None
+            if state_lock is not None:
+                persisted = _read_state_nofollow(state_path)
+            if persisted is not None:
+                actual_owner = (persisted.get("pid"), persisted.get("pid_start_time"))
+                if actual_owner != expected_owner:
+                    raise RuntimeError(
+                        f"state owner is {actual_owner}, expected exact owner "
+                        f"{expected_owner}"
+                    )
         except (OSError, ValueError, RuntimeError) as error:
             if state_lock is not None:
                 try:
@@ -2260,7 +2377,12 @@ def reap_disk(
     # durable pointer to the still-allocated clone rather than orphaning it.
     if data_dir and os.path.isdir(data_dir):
         try:
-            shutil.rmtree(data_dir)
+            # Every fcvm launch reclaims the runtime directory of a SIGKILLed
+            # fcvm whose owner lock nobody holds (src/reclaim.rs), so under
+            # concurrent clones another launch can remove entries of this tree
+            # while the walk is in it. An entry already gone is that removal,
+            # not a failure; anything else still raises.
+            shutil.rmtree(data_dir, onexc=_ignore_missing)
             reaped.append(data_dir)
         except OSError as e:
             out.setdefault("disk_errors", []).append(f"{data_dir}: {e}")
@@ -2700,8 +2822,7 @@ def teardown_fast(
     # leaves behind can never be swept (`cleanup_stale_state` bails on a null
     # pid). `disk_reap_ms` is also a published per-arm median, computed over
     # records that included failed reaps.
-    left = [p for p in (state_path, f"{state_path}.lock" if state_path else "", data_dir)
-            if p and os.path.lexists(p)]
+    left = left_on_disk(state_path, data_dir)
     out["disk_cleanup_verified"] = not left and not out.get("disk_errors")
     out["teardown_total_ms"] = (time.monotonic() - t_kill) * 1000
     if left or out.get("disk_errors"):
@@ -2858,17 +2979,11 @@ def teardown_normal(
             out,
         )
 
-    expected = [
-        p
-        for p in (
-            state_path,
-            f"{state_path}.lock" if state_path else "",
-            data_dir,
-        )
-        if p
-    ]
-    left = [p for p in expected if os.path.lexists(p)]
+    left = left_on_disk(state_path, data_dir)
     out["disk_cleanup_verified"] = not left
+    # The check can wait for another launch's lock (left_on_disk), so the
+    # teardown ends after it.
+    out["teardown_total_ms"] = (time.monotonic() - t0) * 1000
     if left:
         out["disk_cleanup_left"] = left
         t_disk = time.monotonic()
@@ -2881,7 +2996,7 @@ def teardown_normal(
             out, data_root, state_path, data_dir, expected_owner
         )
         out["disk_reap_ms"] = (time.monotonic() - t_disk) * 1000
-        still_left = [p for p in expected if os.path.lexists(p)]
+        still_left = left_on_disk(state_path, data_dir)
         out["disk_reap_failed"] = still_left
         out["teardown_total_ms"] = (time.monotonic() - t0) * 1000
         raise SurvivedTeardown(
@@ -3936,11 +4051,7 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
     # reqscale places each clone in its backend's cgroup through a guard that
     # execs fcvm (same pid), so the FILE and UFFD cgroups account their own
     # clones. Without the prefix every clone ran in the driver's cgroup.
-    cmd = list(getattr(args, "spawn_prefix", ())) + [
-        args.fcvm, "snapshot", "run",
-    ] + clone_backend_args(args) + [
-        "--name", name, "--no-dirty-tracking", "--no-swap",
-    ]
+    cmd = clone_run_cmd(args, name)
     env = dict(os.environ, RUST_LOG=args.rust_log)
     # Watch registered BEFORE the spawn: a watch created afterwards can miss the
     # state file's creation and then block waiting for an event already past.
@@ -4164,6 +4275,22 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
 
 
 
+def clone_run_cmd(args, name: str) -> list:
+    """The `fcvm snapshot run` command line of one clone.
+
+    reqscale puts each clone in its backend's cgroup through a guard that execs
+    fcvm (`spawn_prefix`), and accounts and checks the clone's processes there.
+    `--no-swap` moves Firecracker into /fcvm.slice/fcvm-<pid>.scope
+    (`disable_cgroup_swap`), out of that cgroup, so a reqscale clone does not
+    pass it: in one scale run all 7,560 clones logged the move, and reqscale's
+    membership check failed 3 requests that sampled Firecracker after it.
+    """
+    prefix = list(getattr(args, "spawn_prefix", ()))
+    return prefix + [args.fcvm, "snapshot", "run"] + clone_backend_args(args) + [
+        "--name", name, "--no-dirty-tracking",
+    ] + ([] if prefix else ["--no-swap"])
+
+
 def clone_backend_args(args) -> list:
     """UFFD serve-backed vs FILE-backed restore, as CLI args.
 
@@ -4206,9 +4333,7 @@ def run_noop_request(args, rep: int, fast: bool = False) -> dict:
     name = f"rb-{args.run_id}-{rep}-{'noopfast' if fast else 'noop'}"
     log = os.path.join(args.out_dir, f"{name}.log")
     rec: dict = {"arm": "noop-fast" if fast else "noop", "rep": rep, "name": name}
-    cmd = [args.fcvm, "snapshot", "run"] + clone_backend_args(args) + [
-        "--name", name, "--no-dirty-tracking", "--no-swap",
-    ]
+    cmd = clone_run_cmd(args, name)
     env = dict(os.environ, RUST_LOG=args.rust_log)
     watch = DirWatch(args.state_dir)
     t_spawn = time.monotonic()
@@ -4346,9 +4471,7 @@ def run_exec_request(args, rep: int) -> dict:
         "--format", args.format,
         "--quality", str(args.quality),
     ])
-    cmd = [args.fcvm, "snapshot", "run"] + clone_backend_args(args) + [
-        "--name", name, "--no-dirty-tracking", "--no-swap", "--exec", driver,
-    ]
+    cmd = clone_run_cmd(args, name) + ["--exec", driver]
     env = dict(os.environ, RUST_LOG=args.rust_log)
     rec: dict = {"arm": "exec", "rep": rep, "name": name, "timed_out": False}
     t0 = time.monotonic()
@@ -4640,8 +4763,7 @@ def run_exec_request(args, rep: int) -> dict:
         raise error
     close_pidfds([parent_fd, *fds])
 
-    expected = [state_path, f"{state_path}.lock", data_dir]
-    left = [path for path in expected if path and os.path.lexists(path)]
+    left = left_on_disk(state_path, data_dir)
     teardown["disk_cleanup_verified"] = not left
     if left:
         teardown["disk_cleanup_left"] = left
@@ -4652,7 +4774,7 @@ def run_exec_request(args, rep: int) -> dict:
             data_dir,
             (proc.pid, fcvm_start_time),
         )
-        still_left = [path for path in expected if path and os.path.lexists(path)]
+        still_left = left_on_disk(state_path, data_dir)
         teardown["disk_reap_failed"] = still_left
         teardown["disk_cleanup_verified"] = not still_left and not rec.get("disk_errors")
         if (

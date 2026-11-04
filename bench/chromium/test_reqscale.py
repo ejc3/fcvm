@@ -1700,14 +1700,12 @@ class CompleteAnalyzerFixture(unittest.TestCase):
                 "mode": "shared",
                 "held_from_identity_read_through_terminal_verification": True,
             },
-            "host": {
-                "instance_type": "c8g.metal-48xl", "cpu_model": "Neoverse-V2", "kernel": "fixture", "machine": "aarch64",
-                "python": "3.13", "cpu_count": 64,
-                "quiet_gate": {
-                    "loadavg1": 0.1, "loadavg1_limit": 2.0,
-                    "vm_process_count": 0, "vm_processes": [],
-                },
-            },
+            # What reqscale writes, so the analyzer is tested on the harness's
+            # own host record, not on a copy of what the analyzer expects.
+            "host": reqscale.host_provenance({
+                "loadavg1": 0.1, "loadavg1_limit": 2.0,
+                "vm_process_count": 0, "vm_processes": [],
+            }),
             "host_control": {
                 "interval_seconds": 10.0,
                 "chromium_path": "/usr/bin/chromium",
@@ -2024,6 +2022,24 @@ class CompleteAnalyzerFixture(unittest.TestCase):
             report = reqscale_analyze.markdown_report(analysis)
             self.assertIn("Firecracker VMAs", report)
             self.assertIn("0.8", report)
+
+    def test_a_host_record_from_before_the_boot_hash_is_still_analyzed(self):
+        """Runs recorded before #1511 carry no host_boot_sha256 and stay
+        analyzable; a malformed boot hash is still refused."""
+        with tempfile.TemporaryDirectory() as d:
+            self.build_run(d)
+            with open(os.path.join(d, "provenance.json")) as f:
+                provenance = json.load(f)
+            with open(os.path.join(d, "schedule.json")) as f:
+                schedule = json.load(f)
+        reqscale_analyze._validate_provenance(provenance, schedule)
+        old = json.loads(json.dumps(provenance))
+        del old["host"]["host_boot_sha256"]
+        reqscale_analyze._validate_provenance(old, schedule)
+        bad = json.loads(json.dumps(provenance))
+        bad["host"]["host_boot_sha256"] = "not-a-hash"
+        with self.assertRaisesRegex(reqscale_analyze.AnalysisInvalid, "host_boot_sha256"):
+            reqscale_analyze._validate_provenance(bad, schedule)
 
 
 class AnalyzerReportsAFailedRate(unittest.TestCase):
@@ -3659,6 +3675,22 @@ class SpawnedArgv(unittest.TestCase):
             control = reqscale.NativeChromiumControl(args, mock.Mock(), "/sys/fs/cgroup/x/c", d)
             argv = self._capture(control.start)
         self.assertIn("--host-resolver-rules=MAP * 127.0.0.1", argv)
+
+    def test_the_control_chromium_starts_no_software_gpu_process(self):
+        """Red on the parent: with --disable-gpu alone the control's GPU process
+        tries SwANGLE, fails and exits several times while the browser starts,
+        and a page created meanwhile can have its widget messages rejected and
+        never produce a frame. Started 100 times with the warmup screenshot
+        taken as soon as CDP was ready, 8 timed out ("host control Chromium
+        warmup failed: ... TimeoutError ... stage screenshot", which refused a
+        whole scale run); with --disable-software-rasterizer, 0 of 400."""
+        with tempfile.TemporaryDirectory() as d:
+            args = SimpleNamespace(control_chromium="/c", control_resolve_all_to="",
+                                   control_tmp_root=d, run_id="r")
+            control = reqscale.NativeChromiumControl(args, mock.Mock(), "/sys/fs/cgroup/x/c", d)
+            argv = self._capture(control.start)
+        self.assertIn("--disable-gpu", argv)
+        self.assertIn("--disable-software-rasterizer", argv)
 
 
 if __name__ == "__main__":
