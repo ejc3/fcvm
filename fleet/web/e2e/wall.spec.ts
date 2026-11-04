@@ -411,6 +411,11 @@ test("keyboard: the tile grid takes focus, arrows move the outline, Enter opens,
 
 test("an opened VM zooms to fill the screen at its detail height, with the tiles around it dimmed, its timeline and live GPU readings", async ({ page }) => {
   await openWall(page, 15);
+  // The timeline below is the coordinator's measure of this VM's last restart: restart it here, so
+  // the test does not rely on an earlier one having done so.
+  await page.evaluate(() => window.__fleet!.client.send("relaunch", { tile: "fcvm:3" }));
+  await expect.poll(async () => (await fleetNow()).tiles.find((x) => x.id === "fcvm:3")!.last_relaunch?.first_frame_at ?? null, { timeout: 30_000 }).not.toBeNull();
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBeGreaterThanOrEqual(15);
   const t = await tileBox(page, "fcvm:3");
   await page.mouse.click(t.x + t.w / 2, t.y + t.h / 2);
   await expect(page.getByTestId("focus")).toBeVisible();
@@ -440,7 +445,7 @@ test("an opened VM zooms to fill the screen at its detail height, with the tiles
   await expect(page.getByTestId("readings")).toContainText("Temperature");
   await expect(page.getByTestId("readings")).toContainText(/\d+ °C/);
   await expect(page.getByTestId("readings")).toContainText(/\d+ W/);
-  // The restart before this test left a timeline measured by the coordinator.
+  // The restart above left a timeline measured by the coordinator.
   await expect(page.getByTestId("timeline")).toContainText("GPU reset and driver loaded");
   await expect(page.getByTestId("timeline-total")).toHaveText(/^\d\.\d s$/);
   await page.waitForTimeout(1000);
