@@ -47,6 +47,8 @@ interface Phone {
   lastRelaunch: { clicked_at: number; by: string; first_frame_at: number | null; phases: Record<string, number> };
   borrow: Borrow | null;
   timer: NodeJS.Timeout | null;
+  /** The actions its host's agent lists in its hello; the coordinator refuses any other. */
+  offers: PhoneAction[];
 }
 
 /** What the phones need of the coordinator that holds them. */
@@ -117,6 +119,7 @@ export class MockPhones {
         },
         borrow: null,
         timer: null,
+        offers: [...PHONE_ACTION_NAMES],
       });
       host.renderers.setTile(`phone-${n}`, rect, () => [], () => ({ ...host.scene(), image_aspect: g.aspect }));
       host.renderers.setAvailable(`phone-${n}`, true);
@@ -154,7 +157,7 @@ export class MockPhones {
         place: null,
         last_relaunch: p.lastRelaunch,
         borrowed: p.borrow && { session: p.borrow.session, viewer: p.borrow.viewer, since: p.borrow.since, until: p.borrow.until },
-        actions: [...PHONE_ACTION_NAMES],
+        actions: [...p.offers],
       })),
     };
   }
@@ -222,6 +225,7 @@ export class MockPhones {
         if (!p) return h.refuse("phone actions need a phone of your own (claim_phone)");
         const b = p.borrow!;
         if (typeof claim === "string" && claim !== b.session) return h.refuse(`"${claim}" is not this viewer's phone`);
+        if (!p.offers.includes(action)) return h.refuse(`${p.slot}'s host does not support ${action}`);
         if (b.lastActionAt !== null && now < b.lastActionAt + ACTION_INTERVAL_MS) return h.refuse(`one action a second; wait ${b.lastActionAt + ACTION_INTERVAL_MS - now} ms`);
         b.lastActionAt = now;
         if (action === "reboot_phone") {
@@ -291,6 +295,16 @@ export class MockPhones {
   }
 
   /** Tests: put the phones back as a fresh viewer finds them. */
+  /** What one phone's host lists in its hello (an older host lists less). */
+  setOffers(slot: string, offers: readonly string[]): void {
+    const p = this.phones.find((x) => x.slot === slot);
+    if (!p) throw new Error(`no phone ${slot}`);
+    const bad = offers.filter((a) => !PHONE_ACTION_NAMES.some((n) => n === a));
+    if (bad.length) throw new Error(`not phone actions: ${bad.join(", ")}`);
+    p.offers = PHONE_ACTION_NAMES.filter((n) => offers.includes(n));
+    this.host.markDirty();
+  }
+
   reset(over: { zoomed_out?: boolean; release_all?: boolean }): void {
     if (typeof over.zoomed_out === "boolean" && over.zoomed_out !== this.zoomedOut) {
       this.zoomedOut = over.zoomed_out;
@@ -305,6 +319,7 @@ export class MockPhones {
     this.lastEnd.clear();
     this.lastZoom.clear();
     this.actions.length = 0;
+    for (const p of this.phones) p.offers = [...PHONE_ACTION_NAMES];
     this.host.markDirty();
   }
 
