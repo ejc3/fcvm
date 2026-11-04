@@ -214,6 +214,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   const [viewport, setViewport] = useState({ w: 0, h: 0 });
   const [areas, setAreas] = useState<Areas>({ mosaic: null, own: null });
   const [avoid, setAvoid] = useState<Box[]>([]);
+  const [hud, setHud] = useState<Box[]>([]);
   const [labelSize, setLabelSize] = useState<{ w: number; h: number } | undefined>(undefined);
   /** Which panel the drawer shows: the controls, About, or how a square is isolated. */
   const [drawerPanel, setDrawerPanel] = useState<DrawerPanel>("play");
@@ -407,6 +408,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
         downlinkMbps: downlink(),
         lateShare: client.lateShare,
         avoid,
+        hud,
         labelSize,
         // ?budget= fixes it; a browser asking to save data keeps the page's fixed budget
         budgetBps: budgetParam() ?? (saveData() ? undefined : client.linkBudgetBps),
@@ -414,7 +416,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
         media: { base: mediaUrl, meta: reelMeta },
         saveData: saveData(),
       }),
-    [shown.state, shown.now, latencyMs, dpr, areas, zoom, zoomArea, zoomInsets, canDecode, phone, reducedMotion, client, avoid, labelSize, poster, ownOpen, mediaUrl, reelMeta],
+    [shown.state, shown.now, latencyMs, dpr, areas, zoom, zoomArea, zoomInsets, canDecode, phone, reducedMotion, client, avoid, hud, labelSize, poster, ownOpen, mediaUrl, reelMeta],
   );
   viewRef.current = view;
 
@@ -431,6 +433,8 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   useLayoutEffect(() => {
     const boxes = [...document.querySelectorAll("[data-avoid]")].map((el) => boxOf(el)).filter((b): b is Box => b !== null);
     if (JSON.stringify(boxes) !== JSON.stringify(avoid)) setAvoid(boxes);
+    const controls = [...document.querySelectorAll("[data-hud-box]")].map((el) => boxOf(el)).filter((b): b is Box => b !== null);
+    if (JSON.stringify(controls) !== JSON.stringify(hud)) setHud(controls);
     const label = boxOf(document.querySelector(".hover-label"));
     if (label && (!labelSize || Math.abs(label.w - labelSize.w) > 1 || Math.abs(label.h - labelSize.h) > 1)) setLabelSize({ w: label.w, h: label.h });
   });
@@ -792,7 +796,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
 
   const brand = (
     <div className="masthead">
-      <div className="brand">
+      <div className="brand" data-hud-box="">
         <span className="site">{view.site}</span>
         <h1>{view.title}</h1>
         {view.live ? (
@@ -828,6 +832,11 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
         </span>
       ) : null}
       {!racing ? next : null}
+      {view.outOfRotation ? (
+        <span className="out-of-rotation" data-testid="out-of-rotation">
+          {view.outOfRotation}
+        </span>
+      ) : null}
       {view.spec ? (
         <span className="spec" data-testid="spec">
           {view.spec}
@@ -887,7 +896,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
           {stage}
           <header className="hud-top" data-hud="">
             {brand}
-            <div className="actions fades">
+            <div className="actions fades" data-hud-box="">
               {view.viewers ? <span className="viewers" data-testid="viewers">{view.viewers}</span> : null}
               <button
                 type="button"
@@ -930,7 +939,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
             </div>
           </header>
           <footer className="hud-bottom" data-hud="">
-            <div className="strip">
+            <div className="strip" data-hud-box="">
               <div className="fades">{restart}</div>
               {info}
             </div>

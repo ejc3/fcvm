@@ -326,6 +326,9 @@ export interface FleetFailure {
   kind: string;
   host: string | null;
   since: number | null;
+  /** `gpu_quarantined`: the GPU's PCI address and the error that took it out. */
+  sbdf: string | null;
+  error: string | null;
 }
 
 export interface Action {
@@ -890,7 +893,13 @@ function parseState(o: Obj): FleetState {
     failures: arr(o, "failures", "state").map((f, i) => {
       const where = `failures[${i}]`;
       if (!isObj(f)) throw new ProtocolError(`${where} is not an object`);
-      return { kind: str(f, "kind", where), host: strOrNull(f, "host", where), since: numOrNull(f, "since", where) };
+      return {
+        kind: str(f, "kind", where),
+        host: strOrNull(f, "host", where),
+        since: numOrNull(f, "since", where),
+        sbdf: strOrNull(f, "sbdf", where),
+        error: strOrNull(f, "error", where),
+      };
     }),
     scene: parseScene(obj(o, "scene", "state")),
     relaunch_all: parseRelaunchAll(o["relaunch_all"]),

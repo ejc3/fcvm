@@ -14,6 +14,8 @@ import {
   REDUCED_MOTION_DARK_FADE_MS,
   needsVerify,
   placeLabel,
+  clearBand,
+  outOfRotationLine,
   ZOOM_DIM_FAR,
   ZOOM_DIM_NEAR,
   zoomInsetsFor,
@@ -207,14 +209,59 @@ describe("failure states", () => {
     expect(v.banners.find((b) => b.kind === "reclaimed")).toBeUndefined();
     // The coordinator takes a reclaimed host's tiles out in the same event and keeps the reason in `failures`.
     const text = "AWS reclaimed an fcvm host. The image is re-tiled onto the GPUs left.";
-    v = view(stateWith({ ...st, failures: [{ kind: "host_reclaimed", host: "example-host", since: EPOCH }] }), EPOCH);
+    v = view(stateWith({ ...st, failures: [{ kind: "host_reclaimed", host: "example-host", since: EPOCH, sbdf: null, error: null }] }), EPOCH);
     expect(v.banners.find((b) => b.kind === "reclaimed")!.text).toBe(text);
     // Or only the host marked draining.
     v = view(stateWith({ ...st, fleet: { ...st.fleet, hosts: [{ name: "example-host", draining: true }] } }), EPOCH);
     expect(v.banners.find((b) => b.kind === "reclaimed")!.text).toBe(text);
     // Two reported hosts, one of them also draining: counted once each.
-    v = view(stateWith({ ...st, failures: [{ kind: "host_reclaimed", host: "a", since: EPOCH }, { kind: "host_reclaimed", host: "b", since: EPOCH }, { kind: "coordinator_degraded", host: null, since: EPOCH }], fleet: { ...st.fleet, hosts: [{ name: "a", draining: true }] } }), EPOCH);
+    v = view(stateWith({ ...st, failures: [{ kind: "host_reclaimed", host: "a", since: EPOCH, sbdf: null, error: null }, { kind: "host_reclaimed", host: "b", since: EPOCH, sbdf: null, error: null }, { kind: "coordinator_degraded", host: null, since: EPOCH, sbdf: null, error: null }], fleet: { ...st.fleet, hosts: [{ name: "a", draining: true }] } }), EPOCH);
     expect(v.banners.find((b) => b.kind === "reclaimed")!.text).toBe("AWS reclaimed 2 fcvm hosts. The image is re-tiled onto the GPUs left.");
+  });
+
+  it("names each quarantined GPU and why in the strip, and nothing when none is out", () => {
+    const st = fleet(2, 2);
+    expect(view(stateWith(st), EPOCH).outOfRotation).toBe("");
+    // A restore that failed to attach the GPU, in the shape the agent reports it.
+    const vfio =
+      "fcvm exited (exit status: 1) before the renderer's first frame; fcvm said: ERROR fcvm: Error: loading snapshot: Firecracker API error: 400 Bad Request - " +
+      '{"fault_message":"Load snapshot error: Failed to restore from snapshot: Failed to attach a passthrough device on restore: Attaching the passthrough device failed: VFIO error: Device does not provide MSIx irq"}';
+    const q = (sbdf: string, error: string) => ({ kind: "gpu_quarantined", host: "example-host", since: EPOCH, sbdf, error });
+    const v = view(stateWith({ ...st, failures: [q("0000:0a:00.0", vfio)] }), EPOCH);
+    expect(v.outOfRotation).toBe("1 fcvm GPU out of rotation: 0000:0a:00.0, VFIO error: Device does not provide MSIx irq");
+    // Without a fault message the agent's own text, before fcvm's output, is the reason.
+    // The fault message is read as JSON: an escaped quote in it, and space after the colon.
+    const quoted = 'fcvm exited; fcvm said: Error: 400 - { "fault_message" : "Load snapshot error: VFIO error: device \\"gpu0\\" lost its BAR"}';
+    expect(outOfRotationLine({ ...st, failures: [q("0000:0a:00.0", quoted)] })).toBe('1 fcvm GPU out of rotation: 0000:0a:00.0, VFIO error: device "gpu0" lost its BAR');
+    // fcvm's output before the API error can be long: the fault message is found wherever it is.
+    const long = vfio.replace("fcvm said: ", `fcvm said: ${"INFO fcvm: a line of the VM's log {not json}\n".repeat(400)}`);
+    expect(outOfRotationLine({ ...st, failures: [q("0000:0a:00.0", long)] })).toBe("1 fcvm GPU out of rotation: 0000:0a:00.0, VFIO error: Device does not provide MSIx irq");
+    expect(outOfRotationLine({ ...st, failures: [q("0000:0a:00.0", vfio), q("0000:0b:00.0", "scrub of 0000:0b:00.0 failed (1): bad ECC; fcvm said: x")] })).toBe(
+      "2 fcvm GPUs out of rotation: 0000:0a:00.0, VFIO error: Device does not provide MSIx irq; 0000:0b:00.0, scrub of 0000:0b:00.0 failed (1): bad ECC",
+    );
+  });
+
+  it("puts a dark tile's glyph and phase in the band the controls over the image leave clear", () => {
+    const tile = { x: 0, y: 700, w: 400, h: 230 };
+    // The bottom strip covers the tile's lower part: the band above it is clear.
+    expect(clearBand(tile, [{ x: 20, y: 820, w: 1560, h: 100 }])).toEqual({ x: 0, y: 700, w: 400, h: 120 });
+    // A box beside the tile covers none of it.
+    expect(clearBand(tile, [{ x: 500, y: 600, w: 100, h: 400 }])).toEqual(tile);
+    // A box across the middle leaves the taller of the two bands.
+    expect(clearBand(tile, [{ x: 0, y: 760, w: 400, h: 20 }])).toEqual({ x: 0, y: 780, w: 400, h: 150 });
+    expect(clearBand(tile, [{ x: 0, y: 650, w: 400, h: 400 }])).toBeNull();
+
+    const st = fleet(2, 2);
+    const t = st.tiles.find((x) => x.id === "fcvm:3")!;
+    t.phase = "failed";
+    t.failure = { kind: "relaunch_failed", message: "GPU did not come back", retry_at: null };
+    const dark = (over: Partial<WallInput>) => view(stateWith(st), EPOCH, over).tiles.find((x) => x.id === "fcvm:3")!;
+    const box = dark({}).box!;
+    const strip = { x: 24, y: box.y + box.h / 2, w: 1552, h: 900 };
+    expect(dark({}).content).toEqual(box);
+    expect(dark({ hud: [strip] }).content).toEqual({ ...box, h: box.h / 2 });
+    // On a phone the strip sits under the image, so nothing is taken off.
+    expect(dark({ hud: [strip], phone: true }).content).toEqual(box);
   });
 
   it("draws the race on the picture: a clock per half, a clock per dark tile, and each relit tile's time", () => {
@@ -736,6 +783,17 @@ describe("seams and hover", () => {
       expect(lines(dark("ec2:2", "launching"))).toEqual(["waiting for the instance to launch", "waiting for the instance to launch", "no launch recorded"]);
       expect(lines(dark("fcvm:1", "waiting_capacity"))[0]).toBe("waiting for a free GPU");
       expect(lines(dark("fcvm:1", "relaunching"))[0]).toBe("waiting for the VM to restore");
+      // An fcvm place with no GPU behind it says so once, not "waiting for a free GPU" twice.
+      const empty = label("fcvm:1", (t) => {
+        t.phase = "waiting_capacity";
+        t.slot = null;
+        t.gpu = null;
+        t.place = null;
+        t.last_relaunch = null;
+        t.frame_url = null;
+        t.frame_url_v4 = null;
+      });
+      expect(lines(empty)).toEqual(["no GPU in this place", "waiting for a GPU to join", "no VM has run here"]);
     });
   });
 

@@ -25,7 +25,7 @@ export function ModeSwitch({ current }: { current: Mode }) {
     </a>
   );
   return (
-    <nav className="mode-switch" aria-label="View">
+    <nav className="mode-switch" aria-label="View" data-hud-box="">
       {item("wall", "Wall")}
       {item("phones", "Phones")}
     </nav>

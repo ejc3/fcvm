@@ -20,7 +20,8 @@ pub struct Config {
     pub ec2_max: usize,
     /// Places on the fcvm side: with fewer live fcvm GPUs the rest are dark tiles, with
     /// more the side has one place per GPU. 0: one place per live fcvm GPU. GPUs that
-    /// connected hosts run phones on are not wall places and come off this count.
+    /// connected hosts run phones on are not wall places and come off this count, and so do
+    /// quarantined wall GPUs of connected hosts.
     #[serde(default)]
     pub fcvm_tiles: usize,
     /// Minimum milliseconds between two words from one viewer.
