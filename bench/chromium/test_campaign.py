@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -2358,30 +2359,42 @@ class ReplayAddressByNetworkMode(unittest.TestCase):
                 else:
                     self.assertIn("ACCEPTED", out.stdout, out.stderr)
 
-    def test_a_replay_device_another_campaign_serves_on_is_not_removed(self):
+    def test_a_replay_device_another_campaign_holds_is_not_removed(self):
         """Red before the fix: replay_dev_up deleted any fcvmreplay0 it found,
-        including the one a running campaign's replay server is bound to."""
+        including one a running campaign had just created. The campaign now
+        holds REPLAY_LOCK for its lifetime: a second one refuses while it is
+        held, and with the lock free a device left behind is replaced."""
         body = re.search(r"(replay_dev_up\(\) \{\n.*?\n\})\n", campaign(), re.S)
         self.assertIsNotNone(body, "replay_dev_up is gone")
         with tempfile.TemporaryDirectory() as tmp:
             calls = os.path.join(tmp, "calls")
+            lock = os.path.join(tmp, "replay.lock")
             for name, script in (
                 ("sudo", '#!/bin/bash\n[ "$1" = -n ] && shift\nexec "$@"\n'),
                 ("ip", f'#!/bin/bash\necho "ip $*" >> {calls}\nexit 0\n'),
-                ("ss", '#!/bin/bash\necho "UNCONN 0 0 192.168.53.2:53 0.0.0.0:* users:((python3,pid=4242,fd=3))"\n'),
             ):
                 path = os.path.join(tmp, name)
                 with open(path, "w") as handle:
                     handle.write(script)
                 os.chmod(path, 0o755)
-            wiring = replay_wiring("bridged")
-            script = (f"set -uo pipefail\nsay() {{ :; }}\nREPLAY_DEV_CREATED=no\n{body.group(1)}\n"
-                      "replay_dev_up; echo rc=$?\n")
-            out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30,
-                                 env={**os.environ, **wiring, "PATH": f"{tmp}:{os.environ['PATH']}"})
-            self.assertIn("rc=1", out.stdout, out.stderr)
-            self.assertIn("another campaign is running", out.stderr)
-            self.assertNotIn("ip link del", read_if_exists(calls), "a live replay's device was removed")
+            env = {**os.environ, **replay_wiring("bridged"), "REPLAY_LOCK": lock,
+                   "PATH": f"{tmp}:{os.environ['PATH']}"}
+            script = (f"set -uo pipefail\nsay() {{ :; }}\nREPLAY_DEV_CREATED=no\n"
+                      f"REPLAY_LOCK=\"$REPLAY_LOCK\"\n{body.group(1)}\nreplay_dev_up; echo rc=$?\n")
+            # One process from the lock to the kill: `flock lock sleep` would
+            # leave its sleep child holding the descriptor after the kill.
+            holder = subprocess.Popen(["sh", "-c", f"exec 9>>'{lock}'; flock 9; exec sleep 30"])
+            self.addCleanup(holder.kill)
+            time.sleep(0.5)
+            held = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30, env=env)
+            self.assertIn("rc=1", held.stdout, held.stderr)
+            self.assertIn("another campaign holds", held.stderr)
+            self.assertNotIn("ip link del", read_if_exists(calls), "a live campaign's device was removed")
+            holder.kill()
+            holder.wait()
+            free = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30, env=env)
+            self.assertIn("rc=0", free.stdout, free.stderr)
+            self.assertIn("ip link del fcvmreplay0", read_if_exists(calls), "a device left behind was not replaced")
 
     def test_every_root_phase_runs_fcvm_under_sudo_in_the_mode(self):
         """A bridged or routed fcvm needs root, and reqbench runs it as root only

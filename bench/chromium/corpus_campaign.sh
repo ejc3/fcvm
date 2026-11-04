@@ -824,20 +824,22 @@ stop_corpus_serve() {
 }
 
 # The device that holds REPLAY_IP for a bridged or routed guest. It is this
-# campaign's for as long as the campaign runs: the name is fixed, two
-# campaigns cannot run at once (the quiet gate, and the replay's ports), and a
-# device of this name found at start is left by a campaign that died without
-# its exit trap, so it is replaced. Removed by cleanup.
+# campaign's for as long as the campaign runs: the campaign holds REPLAY_LOCK
+# from before it looks at the device until it exits (the kernel drops the lock
+# with the process), so a second root-mode campaign refuses instead of taking
+# the device over, and a device found while the lock is free was left by a
+# campaign that died without its exit trap and is replaced. Removed by cleanup.
 REPLAY_DEV_CREATED=no
+REPLAY_LOCK="${REPLAY_LOCK:-/run/lock/fcvm-corpus-replay.lock}"
 replay_dev_up() {
     [ -n "$REPLAY_DEV" ] || return 0
+    exec {REPLAY_LOCK_FD}>>"$REPLAY_LOCK" \
+        || { echo "BLOCKED: cannot open the replay device lock $REPLAY_LOCK" >&2; return 1; }
+    if ! flock -n "$REPLAY_LOCK_FD"; then
+        echo "BLOCKED: another campaign holds $REPLAY_LOCK and owns $REPLAY_DEV" >&2
+        return 1
+    fi
     if ip link show "$REPLAY_DEV" >/dev/null 2>&1; then
-        # A replay still bound to the address belongs to a campaign that is
-        # running; only a device nothing listens on was left behind.
-        if sudo -n ss -Hlnu "sport = :53" 2>/dev/null | awk -v a="$REPLAY_BIND_URL:53" '$4 == a {f=1} END {exit !f}'; then
-            echo "BLOCKED: $REPLAY_DEV holds $REPLAY_IP and a replay server is bound to it; another campaign is running" >&2
-            return 1
-        fi
         say "removing $REPLAY_DEV, left by a campaign that did not finish"
         sudo ip link del "$REPLAY_DEV" || { echo "BLOCKED: cannot remove the stale $REPLAY_DEV" >&2; return 1; }
     fi
