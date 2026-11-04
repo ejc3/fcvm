@@ -621,11 +621,16 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     const RenderStats& rs = r_.stats();
     std::lock_guard<std::mutex> l(hmu_);
     // a model belongs to one drawn size: a new size starts it again
-    if (std::fabs(px - fit_px_) > 0.01 * px) { cost_ = CostModel(); cost_.hq_prior = HQ_COST_PRIOR; fit_px_ = px; budget_ = opt_.budget; }
+    // a new drawn size scales the model's fixed part (CostModel::rescale)
+    if (std::fabs(px - fit_px_) > 0.01 * px) {
+      if (fit_px_ > 0) cost_.rescale(px / fit_px_);
+      fit_px_ = px;
+    }
     double now = mono_s();
     if (rs.spp > 0) cost_.observe(rs.hq, px / rs.half * rs.spp, rs.trace_ms, rs.render_ms, now);
-    fit_ = cost_.fit(px, HQ_SPP, 1000.0 / opt_.fps, now) * fit_scale_;
-    fit_now_ = cost_.fit_now(px, HQ_SPP, 1000.0 / opt_.fps) * fit_scale_;
+    // reported as the largest budget whose samples fit (budget_for_samples)
+    fit_ = reported_fit(cost_.fit(px, HQ_SPP, 1000.0 / opt_.fps, now) * fit_scale_, px);
+    fit_now_ = reported_fit(cost_.fit_now(px, HQ_SPP, 1000.0 / opt_.fps) * fit_scale_, px);
     used_budget_ = budget;
     budget_source_ = source;
     // a whole-image renderer alone follows its own fit, on the ladder (the

@@ -539,6 +539,48 @@ int main() {
     CHECK(std::fabs(4.0 + f2 * 3e-5 - 0.7 * fslot) < 0.05, "predicted frame at the target");
   }
   {
+    // The fit a renderer reports is a budget whose samples it can draw. Staging,
+    // 2026-11-04 (direct streams, budget 250,000): a 432-line tile of 550,896
+    // drawn pixels drew a stride-2 checkerboard (275,448 samples, render 12.5 ms,
+    // trace 10.4 ms) and fitted 359,222 samples. Reported as a budget of 359,222,
+    // the grid controller's next raise (the rung under fit / 1.15, 297,302) put
+    // every pixel at one sample, 550,896 samples, 1.53 times the fit.
+    {
+      const double px = 550896, fit = 359222;
+      double rep = reported_fit(fit, px);
+      double up = ladder_floor(rep / 1.15);
+      CHECK(samples_for(up, px) <= fit && samples_for(rep, px) <= fit,
+            "a reported fit never leads to a budget drawing more than the fit (reported %.0f, raise to %.0f draws %.0f of %.0f)",
+            rep, up, samples_for(up, px), fit);
+      CHECK(samples_for(rep, px) == px / 2, "and it keeps the stride the tile affords (%.0f)", samples_for(rep, px));
+      // a tile that affords every pixel reports up to the edge of one sample a pixel
+      double rich = reported_fit(1.2 * px, px);
+      CHECK(samples_for(rich, px) == px && rich > 1.4 * px, "a tile fitting 1.2 px reports %.0f (draws %.0f)", rich,
+            samples_for(rich, px));
+      // and every budget under a reported fit draws no more than the fit
+      bool under = true;
+      for (double f = 0.1 * px; f < 70 * px; f *= 1.07) {
+        double r = reported_fit(f, px);
+        for (double b = 0.05 * px; b <= r; b *= 1.05) under = under && samples_for(b, px) <= std::max(f, px / 4);
+      }
+      CHECK(under, "no budget at or under a reported fit draws more than the fit");
+    }
+    // A drawn-size change keeps the cost model (and so the fit) and scales its
+    // fixed part: started again, a tile moved by its height guard between 270 and
+    // 540 reported no fit for 60 s at a time (staging, 2026-11-04: two of 14 tiles
+    // at 0), and the grid controller does not raise while any tile has none.
+    {
+      CostModel m;
+      for (int f = 0; f < 30 * 90; f++) m.observe(false, 275448, 10.4, 12.5, f / 30.0);
+      double before = m.fit(550896, HQ_SPP, 1000.0 / 30, 90.0);
+      m.rescale(4.0);
+      double after = m.fit(550896 * 4, HQ_SPP, 1000.0 / 30, 90.0);
+      CHECK(before > 0 && after > 0 && after < before, "the fit stays known across a size change (%.0f, then %.0f)", before,
+            after);
+      bool reset = false;
+      for (auto& l : source_lines("../src/pipeline.cpp")) reset = reset || l.find("cost_ = CostModel()") != std::string::npos;
+      CHECK(!reset, "the pipeline keeps its cost model when the drawn size changes");
+    }
     // The checkerboard's threads (checker.h): each drawn pixel of a region has
     // exactly one thread and no other pixel has one, for every stride, slot,
     // region origin parity and odd or even size.

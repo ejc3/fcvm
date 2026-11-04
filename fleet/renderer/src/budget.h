@@ -74,6 +74,28 @@ inline double samples_for(double b, double px) {
   return px / st * spp;
 }
 
+// The largest budget whose frame draws no more than `fit` samples on `px` drawn
+// pixels (samples_for). A frame's samples are a step function of its budget:
+// under 0.3 px a quarter of the pixels draw, under 0.5 px half, and from there
+// every pixel draws round(b / px) samples, so a budget just past 0.5 px draws
+// twice what one just under it does. A renderer reports its fit as this budget,
+// so a controller that takes the reported fit as a budget never posts one whose
+// samples the tile cannot draw in time: a 432-line staging tile (550,896 drawn
+// pixels) fitting 359,222 samples reported 359,222, and the rung under it / 1.15
+// (297,302) drew 550,896 samples (2026-11-04).
+inline double budget_for_samples(double fit, double px) {
+  if (fit <= 0 || px <= 0) return fit;
+  for (int k = 64; k >= 1; k--)
+    if (k * px <= fit) return k == 64 ? fit : (k + 0.5) * px * 0.999;
+  if (0.5 * px <= fit) return 0.5 * px * 0.999;
+  if (0.25 * px <= fit) return 0.3 * px * 0.999;
+  return fit;  // not even the floor fits: the fit itself, under every rung that draws
+}
+
+// What a renderer reports as `budget_fit`: its cost model's fit, in samples,
+// as the largest budget whose frame draws that many samples or fewer.
+inline double reported_fit(double fit_samples, double px) { return budget_for_samples(fit_samples, px); }
+
 // The ladder a controller rounds a fit down to: 250,000 x 2^(n/4) for
 // n = -8 .. 40 (62,500 to 256,000,000), so budgets change in steps of 19%.
 inline double ladder_floor(double fit) {
@@ -151,6 +173,18 @@ struct CostModel {
       w_fast = q(a);
       w_hq = q(b);
     }
+  }
+  // The drawn size changed by `px_ratio` (new / old): the fixed part of a frame
+  // (the per-pixel passes) scales with it, the cost per sample does not. Keeping
+  // the window keeps the fit known: started again at every size change, a tile
+  // whose height guard moved it between two heights reported no fit for 60 s at
+  // a time, and a controller never raises while a tile has none.
+  void rescale(double px_ratio) {
+    if (!(px_ratio > 0)) return;
+    if (fixed_ms >= 0) fixed_ms *= px_ratio;
+    for (Obs& o : obs) o.fixed *= px_ratio;
+    w_at = -1e18;  // percentiles again at the next frame
+    if (w_fixed >= 0) w_fixed *= px_ratio;
   }
   bool ready(double now_s) const { return first_t >= 0 && now_s - first_t >= ready_s && w_fixed >= 0; }
   static double fit_from(double fixed, double cfast, double chq, double prior, double px, double hq_spp, double slot_ms,

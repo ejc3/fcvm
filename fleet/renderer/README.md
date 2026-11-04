@@ -171,6 +171,45 @@ python3 tools/seam_metric.py out.png 4 2              # seam ratio at every tile
 "Viewers per renderer") opens many frame streams as the page does and reports
 each stream's frame rate, frame delay, and frames dropped for a slow reader.
 
+## The grid budget at the owner's view (round 20, 2026-11-04)
+
+With rounds 18 and 19 deployed, the staging wall in direct mode at 3456 x 1944 held at a
+budget of 250,000 (`/health`, 16:55 to 16:58 UTC): the 432- and 540-line tiles drew a
+stride-2 checkerboard, two of the 540-line tiles drew at 270, and the busiest GPU was about
+half busy. Every tile's fit then, as `budget_fit` in samples:
+
+| tiles | drawn pixels | fit (samples) | every pixel at one sample |
+|---|---|---|---|
+| ec2 432 lines, heaviest (ec2-5) | 550,896 | 359,222 | 550,896 |
+| fcvm 540 lines, heaviest (slot-6) | 645,018 | 383,753 | 645,018 |
+| ec2 and fcvm, sky (ec2-1, slot-1) | | 733,255 to 980,851 | |
+| fcvm 540 lines at 270 (slot-3, slot-4) | | 0 (no fit) | |
+
+What held the budget:
+
+- **The heavy tiles cannot draw every pixel in time.** One sample on every pixel of the
+  heaviest 432-line tile is 1.53 times its fit, of the heaviest 540-line tile 1.68 times. A
+  frame's samples step with its budget: a budget just over half a sample per drawn pixel puts
+  every pixel at one sample, twice the samples of one just under it, so there is no budget
+  between stride 2 and stride 1 for those tiles. 250,000 is the most they afford.
+- **Two tiles had no fit.** Their height guard moved them between 270 and 540, and the cost
+  model started again at each size change, so they reported 0 for 60 s at a time, and the
+  grid controller does not raise while a tile has no fit.
+- **A raise would have overloaded the heavy tiles.** The fit was reported in samples and the
+  controller treats it as a budget: with every fit known, the rung under 359,222 / 1.15 is
+  297,302, which draws 550,896 samples on ec2-5.
+
+Now a renderer reports its fit as the largest budget whose frame draws no more than the fit's
+samples (`budget_for_samples`, budget.h): ec2-5 reports 275,172, which keeps the grid at
+250,000 here and lets it rise in a view where every tile affords one sample a pixel (a tile
+fitting 1.2 times its pixels reports up to 1.5 times them). A drawn-size change keeps the cost
+model and scales its fixed part (`CostModel::rescale`), so a tile the height guard moves keeps
+a fit.
+
+Every tile at one sample a pixel at this view needs the trace of a heavy terrain tile 1.5 to
+1.7 times faster: these tiles traced at 38 to 46 ns a sample in the frames read, and their fits
+(the 95th percentile over 180 s) imply about 60.
+
 ## The checkerboard (round 19, 2026-11-04)
 
 With the GPU clocks and the height guard of round 18 deployed, the staging wall at dusk

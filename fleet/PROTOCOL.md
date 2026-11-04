@@ -1775,13 +1775,19 @@ so the fit holds over what the camera has shown in that time instead of
 following the latest frames (round 10: on the coordinator's directed camera
 the latest frames' fit swung 2x and the grid budget changed 9 times in 2
 minutes). It is 0 until the window spans 60 s (a controller leaves it out);
-the model starts again when the drawn size changes. `budget_fit_now` is the
-same fit from the latest frames (smoothed over about five), for diagnosis. It is the largest budget whose predicted frame takes 70% of a
-slot, on the fast path below `HQ_SPP` samples per drawn pixel or on the
+when the drawn size changes the model is kept and its fixed part scaled by the
+pixels (a model started again left a tile whose height guard moved it between
+two heights with no fit for 60 s at a time). `budget_fit_now` is the
+same fit from the latest frames (smoothed over about five), for diagnosis. The model gives the most samples a
+frame can draw in 70% of a slot, on the fast path below `HQ_SPP` samples per drawn pixel or on the
 high-quality path from it; until a renderer has drawn a high-quality frame it
 assumes that path costs `HQ_COST_PRIOR` (1.0) times the fast one per sample.
-So a tile that cannot afford the high-quality path reports a fit just under
-`HQ_SPP` samples per pixel.
+So a tile that cannot afford the high-quality path fits just under
+`HQ_SPP` samples per pixel. The fit is reported as the largest budget whose frame
+draws no more than those samples (`budget_for_samples`): a frame's samples step with
+its budget (a quarter of the pixels under 0.3 per drawn pixel, half under 0.5, then
+every pixel at round(budget / pixels) samples), so a budget just over half a sample a
+pixel draws twice the samples of one just under it.
 
 One controller sets one budget for all tiles of a grid. Every 2 s it reads
 every tile's `budget_fit`, takes the smallest (the slowest tile governs) and
