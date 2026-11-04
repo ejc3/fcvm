@@ -562,9 +562,10 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   P-384 private key>"}` (`playback_url` optional; the last two together, for a private
   channel, or neither). The coordinator does not start when it cannot read it. With a
   broadcast, `--direct-capacity` (also `FLEET_DIRECT_CAPACITY`, default 500) seats that many
-  viewers; the rest watch the broadcast (`admission` above). Its arguments are `--image-height 720
-  --tile-query q=std --maxrate-kbps 4500 --crf 21 --preset veryfast`, then any
-  `--broadcast-arg`.
+  viewers; the rest watch the broadcast (`admission` above). Its arguments are `--image-height 1080
+  --tile-query q=std --maxrate-kbps 7500 --crf 18 --preset veryfast` on a machine with 4 CPUs
+  or more and `--image-height 720 --tile-query q=std --maxrate-kbps 4500 --crf 21 --preset
+  veryfast` on a smaller one, then any `--broadcast-arg`.
 
 - `--state-bucket` (also `FLEET_STATE_BUCKET`, `FLEET_STATE_KEY`) keeps the state as one S3
   object instead of a file: read at start, rewritten whole (one PUT, atomic; the bucket

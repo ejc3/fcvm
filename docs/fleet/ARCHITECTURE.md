@@ -374,10 +374,10 @@ renderers (every placed tile, at the broadcast's height)
    |  FCVF frames over wss, the published IPv6 names
    v
 broadcast aggregator (`fcvm fleet aggregate --push-url-env`), a child of the coordinator
-   |  one 1280x720 H.264 stream at 30 fps, every frame's SEI carrying its scene t
+   |  one 1920x1080 H.264 stream at 30 fps (1280x720 on a task under 4 CPUs), every frame's SEI carrying its scene t
    |  FLV, copied by an ffmpeg child over RTMPS
    v
-Amazon IVS low-latency channel, standard type: 720p, 480p, 360p and 160p renditions
+Amazon IVS low-latency channel, standard type: the 1080p source, 720p, 480p, 360p and 160p renditions
    |  HLS from IVS's CDN; a private channel, so every request carries a playback token
    v
 browser: IVS web player; the overlay drawn from the state in effect at the shown frame's t
@@ -440,13 +440,41 @@ encodes one small extra stream for it (`q=std`) and one decoder thread keeps up 
 region aggregator's stream is a near-lossless region a whole image tall, which one decoder
 thread does not keep up with (a 1280x720 renderer stream at `q=hi` fell 3 s behind on a
 g4dn.2xlarge). The aggregator waits for every tile at each slot as a region aggregator does,
-draws a tile with nothing to send black, and encodes the image once: 1280x720, libx264
-`veryfast`, zero-latency, High profile, no B-frames, a keyframe every 2 s, CRF 21 capped at
-4.5 Mbit/s. IVS's standard channel transcodes it into the 720p, 480p, 360p and 160p
-renditions players switch between, so the fleet encodes one stream, not a ladder. 720 lines,
-not 1080: a 1080p rendition costs IVS's Full HD rate per viewer-hour (twice HD), and the
-encode about twice the CPU. The aggregator runs only while a tile is placed: asleep, it is
-stopped and nothing is pushed, and every viewer sees the wake reel.
+draws a tile with nothing to send black, and encodes the image once: 1920x1080, libx264
+`veryfast`, zero-latency, High profile, no B-frames, a keyframe every 2 s, CRF 18 capped at
+7.5 Mbit/s (under the standard channel's 8.5 Mbit/s input limit). IVS's standard channel
+passes a 1080p input through as its top rendition and transcodes the 720p (2.4 Mbit/s),
+480p, 360p and 160p renditions players switch between, so the fleet encodes one stream, not a
+ladder. On a machine with fewer than 4 CPUs (`coord::broadcast::default_args`) the image is
+1280x720 at CRF 21 capped at 4.5 Mbit/s, which IVS does not pass through: its top rendition
+is then a 720p transcode at 2.4 Mbit/s. The aggregator runs only while a tile is placed:
+asleep, it is stopped and nothing is pushed, and every viewer sees the wake reel.
+
+1080 lines, measured 2026-11-03 (the owner, at full screen on a 3456 x 1944 display, watching
+the 720p broadcast: "still too dirty"). Three poses saved from the staging wall, every tile's
+`q=std` stream at the broadcast's tile height (`fleet-renderer quality --h 432 --encode 270`
+or `--encode 180`, 90 frames) composed as the aggregator composes them, encoded with its
+command line, decoded (`fleet/tools/broadcast-quality.py`), scaled bilinearly to 3072 x 1728 as a page scales it, and compared
+with the same pose held to 1024 samples at 432 lines a tile. FLIP, lower is closer:
+
+| broadcast | heavy terrain | snow and lakes | snow and meadow |
+|---|---|---|---|
+| 720 lines, 4.5 Mbit/s, as IVS's 2.4 Mbit/s 720p rendition (before; approximated with libx264) | 0.0944 | 0.0552 | 0.0853 |
+| 720 lines, 4.5 Mbit/s, as encoded | 0.0890 | 0.0531 | 0.0795 |
+| 1080 lines, CRF 21, 6 Mbit/s | 0.0821 | 0.0482 | 0.0680 |
+| 1080 lines, CRF 18, 7.5 Mbit/s (7.4 to 7.8 Mbit/s used after the first second) | 0.0799 | 0.0462 | 0.0637 |
+| the 1080-line composite itself, before the encode | 0.0671 | 0.0392 | 0.0506 |
+
+What it costs. The encode and the 16 tile decodes, `taskset` on one c8g.8xlarge (Graviton4,
+nothing else on it), per frame: 720 lines 14.9 ms encode and 24.1 ms decodes (39 ms), 1080
+lines 33.9 and 42.4 ms (76 ms), 1.96 times as much. The 2 vCPU coordinator task ran at 69% to
+71% of its CPU (maximum 77%) with the 720-line broadcast (CloudWatch `CPUUtilization`,
+2026-11-03), so 1080 lines need about 2.7 cores: the task grows to 4 vCPU and 8 GB (ejc3/aws),
+about $58 a month more on ARM64 Fargate in us-east-2 ($0.158 an hour against $0.079). IVS: the
+channel's input price is unchanged ($2.00 an hour live, standard), and a viewer on the 1080p
+rendition is billed at Full HD, $0.144 a viewer-hour against HD's $0.072 (North America, first
+10,000 hours a month, 2026-11-03); a viewer whose player picks 720p or lower is billed as
+before. Each renderer encodes its broadcast stream at 270 lines instead of 180.
 
 The aggregator writes FLV itself, so each frame's timestamp is its scene time (a skipped
 slot is a gap, never a drift). It opens the stream with an `onMetaData` tag naming the size,
@@ -458,10 +486,10 @@ child copies it to `rtmps://<ingest>:443/app/<key>`. A child that exits is start
 keyframe. The ingest URL comes from the broadcast secret through the environment, so the
 only command line holding it is that ffmpeg's, inside the coordinator's task.
 
-The coordinator task grows from 0.5 vCPU and 1 GB to 2 vCPU and 4 GB (ARM64 Fargate). The
-composite above took 1.7 cores on the measurement box's Xeon (encode 0.9, decode of one
-1280x720 source 0.5, composing and the copy the rest); 16 small tile streams decode
-the same pixels.
+The coordinator task grows from 0.5 vCPU and 1 GB to 4 vCPU and 8 GB (ARM64 Fargate). The
+720-line composite took 1.7 cores on the first measurement box's Xeon (encode 0.9, decode of
+one 1280x720 source 0.5, composing and the copy the rest); 16 small tile streams decode the
+same pixels. The 1080-line composite takes about twice that (above).
 
 ### The overlay follows the frame shown
 
