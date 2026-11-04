@@ -3,6 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import { GlMirror, layerTransform } from "../../app/_wall/mirror/gl.ts";
+import { setUniform } from "../../app/_wall/mirror/gl-join.ts";
 import { encodeCall, encodeRecord, JOIN_PART, RECORD, RecordReader } from "../mirror/wire.ts";
 import { channelBlob, GL, glState, textureBlob } from "./gles-writer.ts";
 
@@ -687,6 +688,29 @@ describe("live state the shadow keeps", () => {
   const UNIFORM = 0x8a11;
   const clears = (calls: Call[]) => calls.map((c, i) => (c.name === "clear" ? i : -1)).filter((i) => i >= 0);
 
+  it("writes nothing for a glCopyBufferSubData outside its source, as GLES refuses it", () => {
+    const { m, calls } = play([
+      ...contexts(),
+      [1, "glGenBuffers", [2, 8]],
+      [1, "reply", [5, 6]],
+      [1, "glGenVertexArrays", [1, 4]],
+      [1, "reply", [3]],
+      [1, "glBindVertexArray", [3]],
+      [1, "glBindBuffer", [0x8892, 5]],
+      [1, "glBufferData", [0x8892, 4, new Uint8Array([1, 2, 3, 4]), 0x88e4]],
+      [1, "glBindBuffer", [0x8893, 5]],
+      [1, "glBindBuffer", [0x8892, 6]],
+      [1, "glBufferData", [0x8892, 1, new Uint8Array([9]), 0x88e4]],
+      [1, "glBindBuffer", [0x8f36, 6]],
+      [1, "glBindBuffer", [0x8f37, 5]],
+      // one byte from offset 1 of a one-byte buffer: outside it
+      [1, "glCopyBufferSubData", [0x8f36, 0x8f37, 1, 1, 1]],
+    ]);
+    expect(m.stats.failed).toEqual({});
+    // no copy, readback or write for it, in either of buffer 5's WebGL2 buffers
+    expect(calls.filter((c) => ["copyBufferSubData", "getBufferSubData", "bufferSubData"].includes(c.name))).toEqual([]);
+  });
+
   it("writes a glCopyBufferSubData into the buffer's element copy too, which a vertex array holds without binding it again", () => {
     const { m, calls } = play([
       ...contexts(),
@@ -801,5 +825,14 @@ describe("live state the shadow keeps", () => {
       else if (c.name === "bindTexture" && unit === 0 && c.args[0] === 0x0de1) onUnit0 = c.args[1];
     }
     expect(onUnit0).toBeNull();
+  });
+});
+
+describe("a saved uniform", () => {
+  it("sets every element of a sampler array, not only the first", () => {
+    const { gl, calls } = fakeGl();
+    expect(setUniform(gl, { loc: 1 } as unknown as WebGLUniformLocation, 0x8b5e, new Uint8Array(new Int32Array([0, 1, 2, 3]).buffer))).toBe(true);
+    const c = calls.find((x) => x.name === "uniform1iv");
+    expect(Array.from(c?.args[1] as Int32Array)).toEqual([0, 1, 2, 3]);
   });
 });

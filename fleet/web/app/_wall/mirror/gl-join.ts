@@ -285,13 +285,14 @@ const SAMPLER_TYPES: ReadonlySet<number> = new Set([
 ]);
 
 /** Sets one saved uniform value on the program in use; false for a type WebGL2 has no setter for. */
-function setUniform(gl: GL, loc: WebGLUniformLocation | null, type: number, value: Uint8Array): boolean {
+export function setUniform(gl: GL, loc: WebGLUniformLocation | null, type: number, value: Uint8Array): boolean {
   const copy = value.slice();
   const f = new Float32Array(copy.buffer, 0, copy.byteLength >> 2);
   const i = new Int32Array(copy.buffer, 0, copy.byteLength >> 2);
   const u = new Uint32Array(copy.buffer, 0, copy.byteLength >> 2);
+  // a sampler array keeps every element's unit
   if (SAMPLER_TYPES.has(type)) {
-    gl.uniform1iv(loc, i.subarray(0, 1));
+    gl.uniform1iv(loc, i);
     return true;
   }
   switch (type) {

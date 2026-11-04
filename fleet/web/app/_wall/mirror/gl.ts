@@ -105,6 +105,8 @@ export interface GuestBuffer {
   /** Which of the two holds the guest's bytes now; null before the first write. */
   fresh: "other" | "element" | "both" | null;
   usage: number;
+  /** Its size in bytes from its last glBufferData (or the join), for the copies GLES refuses. */
+  size?: number;
 }
 
 type BufferType = "other" | "element";
@@ -698,13 +700,14 @@ export class GlMirror {
    * WebGL2 buffer of the other type (bound to COPY_WRITE_BUFFER). `whole` says the write gave the
    * buffer all its bytes (glBufferData).
    */
-  private wroteBuffer(target: number, whole: boolean, again: (target: number) => void, usage?: number): void {
+  private wroteBuffer(target: number, whole: boolean, again: (target: number) => void, usage?: number, size?: number): void {
     const gl = this.gl;
     const binding = BUFFER_BINDING.get(target);
     const b = binding === undefined ? null : (gl.getParameter(binding) as WebGLBuffer | null);
     const gb = b ? this.bufferOwner.get(b) : undefined;
     if (!b || !gb) return;
     if (usage !== undefined) gb.usage = usage;
+    if (size !== undefined) gb.size = size;
     const type: BufferType = gb.element === b ? "element" : "other";
     const twin = gb[type === "element" ? "other" : "element"];
     if (!twin) {
@@ -743,6 +746,10 @@ export class GlMirror {
       gl.copyBufferSubData(readTarget, writeTarget, readOffset, writeOffset, size);
       return;
     }
+    // a range outside either buffer: GLES refuses the copy and writes nothing, so neither does
+    // the mirror (a readback of it would come back zeros and land in the other copy)
+    const outside = (gb: GuestBuffer, offset: number) => gb.size !== undefined && (offset < 0 || size < 0 || offset + size > gb.size);
+    if (outside(src, readOffset) || outside(dst, writeOffset)) return;
     const read = gl.getParameter(GL_COPY_READ_BUFFER) as WebGLBuffer | null;
     const write = gl.getParameter(GL_COPY_WRITE_BUFFER) as WebGLBuffer | null;
     let bytes: Uint8Array | null = null;
@@ -782,6 +789,7 @@ export class GlMirror {
     gl.bufferData(target, data, usage);
     const gb = share.buffers.get(name)!;
     gb.usage = usage;
+    gb.size = data.byteLength;
     gb.fresh = target === GL_ELEMENT_ARRAY_BUFFER ? "element" : "other";
     gl.bindBuffer(target, null);
     if (scratch) {
@@ -1272,7 +1280,7 @@ export class GlMirror {
         const d = a[2];
         const write = (t: number) => (d instanceof Uint8Array && d.length ? gl.bufferData(t, d, n(a[3])) : gl.bufferData(t, n(a[1]), n(a[3])));
         write(n(a[0]));
-        this.wroteBuffer(n(a[0]), true, write, n(a[3]));
+        this.wroteBuffer(n(a[0]), true, write, n(a[3]), n(a[1]));
       });
     const subData = (target: number, offset: number, d: Uint8Array) => {
       gl.bufferSubData(target, offset, d);
