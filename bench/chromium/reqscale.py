@@ -3193,6 +3193,10 @@ class NativeChromiumControl:
             # times while the browser starts, and the warmup page created
             # meanwhile can have its widget messages rejected and never produce
             # a frame (8 of 100 starts timed out at the warmup screenshot).
+            # The control had no WebGL before this flag either: the GPU process
+            # that would provide it never initialises (a page's getContext
+            # returns null with and without the flag). entry.sh's note against
+            # this flag is about the guest Chromium, which has WebGL.
             "--disable-software-rasterizer",
             "--disable-dev-shm-usage",
             "--window-size=1280,800",
