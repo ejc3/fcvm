@@ -120,8 +120,11 @@ export function HalfClockView({ c, style }: { c: HalfClock; style?: CSSPropertie
   );
 }
 
-/** Asleep or waking, in one lower third: on the image, or under it on an upright phone. */
-export function WakeCard({ sleep, style }: { sleep: SleepView; style?: CSSProperties }) {
+/**
+ * Asleep or waking, in one lower third: on the image, or under it on an upright phone (and in
+ * phones mode). Asleep, its Wake button sends `wake`.
+ */
+export function WakeCard({ sleep, style, onWake }: { sleep: SleepView; style?: CSSProperties; onWake: () => void }) {
   return (
     <div className={`lower-third ${sleep.state}${style ? " on-image" : ""}`} data-testid="sleep-card" style={style} role="status">
       <span className="title">
@@ -133,6 +136,11 @@ export function WakeCard({ sleep, style }: { sleep: SleepView; style?: CSSProper
         ) : null}
       </span>
       {sleep.state === "asleep" ? <span className="line">{sleep.line}</span> : null}
+      {sleep.wake ? (
+        <button type="button" className="btn primary wake" disabled={sleep.wake.disabled} onClick={onWake} data-testid="wake">
+          {sleep.wake.label}
+        </button>
+      ) : null}
       {sleep.steps.length > 0 ? (
         <ol className="dots" data-testid="wake-steps">
           {sleep.steps.map((st) => (
@@ -148,7 +156,7 @@ export function WakeCard({ sleep, style }: { sleep: SleepView; style?: CSSProper
   );
 }
 
-export function Overlays({ view, phone }: { view: WallView; phone: boolean }) {
+export function Overlays({ view, phone, onWake }: { view: WallView; phone: boolean; onWake: () => void }) {
   const L = view.layout;
   const showMosaic = L !== null && view.focus === null && view.own === null;
   const img = L?.image;
@@ -261,7 +269,7 @@ export function Overlays({ view, phone }: { view: WallView; phone: boolean }) {
           ) : null}
         </>
       ) : null}
-      {view.sleep && img && !phone ? <WakeCard sleep={view.sleep} style={{ left: img.x + img.w / 2, top: img.y + img.h * 0.74 }} /> : null}
+      {view.sleep && img && !phone ? <WakeCard sleep={view.sleep} style={{ left: img.x + img.w / 2, top: img.y + img.h * 0.74 }} onWake={onWake} /> : null}
       {view.banners.length > 0 ? (
         <div className="banners" role="status">
           {view.banners.map((b) => (

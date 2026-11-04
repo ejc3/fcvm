@@ -208,14 +208,14 @@ describe("frame URLs and the direct token", () => {
     expect(open.indexOf("ws.send(admitMessage(this.admit))")).toBeLessThan(open.indexOf("this.syncHeight()"));
     const client = readFileSync(new URL("../../app/_wall/wall-client.ts", import.meta.url), "utf8");
     const live = client.slice(client.indexOf("const ws = new WebSocket(this.url);"));
-    expect(live.indexOf("ws.send(seatMessage(savedSeat()))")).toBeGreaterThan(0);
-    expect(live.indexOf("ws.send(seatMessage(savedSeat()))")).toBeLessThan(live.indexOf("ws.send(", live.indexOf("seatMessage") + 1));
+    expect(live.indexOf("ws.send(seatMessage(savedSeat(), this.opened))")).toBeGreaterThan(0);
+    expect(live.indexOf("ws.send(seatMessage(savedSeat(), this.opened))")).toBeLessThan(live.indexOf("ws.send(", live.indexOf("seatMessage") + 1));
     expect(client).not.toContain("seat=");
   });
 
-  it("sends the seat ticket as the first /live message", () => {
-    expect(JSON.parse(seatMessage("t-1"))).toEqual({ type: "seat", ticket: "t-1" });
-    expect(JSON.parse(seatMessage(null))).toEqual({ type: "seat", ticket: null });
+  it("sends the seat ticket as the first /live message, and whether the page connected before", () => {
+    expect(JSON.parse(seatMessage("t-1", false))).toEqual({ type: "seat", ticket: "t-1", returning: false });
+    expect(JSON.parse(seatMessage(null, true))).toEqual({ type: "seat", ticket: null, returning: true });
   });
 });
 

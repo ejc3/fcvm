@@ -23,11 +23,13 @@ import {
   COLORS,
   phaseText,
   REDUCED_MOTION_DARK_FADE_MS,
+  sleepView,
   timelineOf,
   verifyView,
   type DrawPlan,
   type DrawSource,
   type DrawTile,
+  type SleepView,
   type TimelineStep,
 } from "./view.ts";
 
@@ -659,6 +661,8 @@ export interface PhonesView {
   plan: DrawPlan;
   mirror: MirrorPlacement | null;
   taps: TapView | null;
+  /** Asleep or waking, with the Wake button while asleep (the wall's card). */
+  sleep: SleepView | null;
 }
 
 const BLANK_PLAN = (s: ClientState, dpr: number): DrawPlan => ({
@@ -692,6 +696,7 @@ export function phonesView(inp: PhonesInput): PhonesView {
     online,
     verify: verifyView(s),
     notice: phoneNotice(s.notices),
+    sleep: s.accepted === null ? null : sleepView(s.accepted, srvNow, online, s.pending.some((p) => p.intent.name === "wake")),
   };
   const zoomOut = phones?.zoomed_out === true;
   const zoom = { label: zoomOut ? "Zoom in" : "Zoom out", out: zoomOut, disabled: !online || phones === null };

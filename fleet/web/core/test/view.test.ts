@@ -922,6 +922,12 @@ describe("the activity feed", () => {
     const byViewer = view(msg(stateWith(fleet(2, 2, { actions, relaunch_all: { ...race, by: "viewer:v-7" } })), { type: "hello", viewer: "v-4" }), EPOCH + 5000);
     expect(byViewer.feed.map((t) => t.text)).toEqual(["you dropped a light", "viewer 7 restarted every GPU", "you restarted fcvm VM 3"]);
   });
+
+  it("says who woke the GPUs", () => {
+    const actions = [{ at: EPOCH + 1, viewer: "v-7", id: "w", name: "wake", args: {}, summary: "wake", outcome: "committed" }];
+    const s = msg(stateWith(fleet(2, 2, { actions })), { type: "hello", viewer: "v-4" });
+    expect(view(s, EPOCH + 1000).feed.map((t) => t.text)).toEqual(["viewer 7 woke the GPUs"]);
+  });
 });
 
 describe("hover label placement", () => {
@@ -1004,7 +1010,7 @@ describe("counters and isolation", () => {
 });
 
 describe("asleep and waking", () => {
-  const power = (p: Partial<Power>): Power => ({ state: "awake", asleep_since: null, woke_at: null, hosts: [], last_wake: null, wakes: [], ...p });
+  const power = (p: Partial<Power>): Power => ({ state: "awake", asleep_since: null, woke_at: null, last_arrival_at: null, sleep_without_arrival_at: null, hosts: [], last_wake: null, wakes: [], ...p });
   // As the coordinator: asleep, nothing is placed; waking, tiles arrive as their GPUs join.
   const sleeping = (p: Partial<Power>, over: Partial<FleetState> = {}) => {
     const st = fleet(2, 2, over);
@@ -1015,6 +1021,19 @@ describe("asleep and waking", () => {
     }
     return st;
   };
+
+  it("asleep: the Wake button waits for the connection and for a wake already sent", () => {
+    const st = sleeping({ state: "asleep", asleep_since: EPOCH - 600_000 });
+    const open = stateWith(st);
+    expect(view(open, EPOCH).sleep!.wake).toEqual({ label: "Wake", disabled: false });
+    const offline = reduce(open, { type: "socket", status: "closed", at: EPOCH });
+    expect(view(offline, EPOCH).sleep!.wake).toEqual({ label: "Wake", disabled: true });
+    const sent = reduce(open, { type: "intent-sent", intent: makeIntent("w1", "wake", {}), at: EPOCH });
+    expect(view(sent, EPOCH).sleep!.wake).toEqual({ label: "Wake", disabled: true });
+    // Waking: no button, the phases instead.
+    const waking = sleeping({ state: "waking", woke_at: EPOCH - 5000 });
+    expect(view(stateWith(waking), EPOCH).sleep!.wake).toBeNull();
+  });
 
   it("formats dates and minutes the way the page shows them", () => {
     expect(fmt.utcDate(Date.UTC(2026, 9, 22, 23, 14, 59))).toBe("22 Oct 2026, 23:14 UTC");
@@ -1029,11 +1048,13 @@ describe("asleep and waking", () => {
       { scoreboard: SCORES, relaunch_all: race(Date.UTC(2026, 9, 22, 23, 14), { fcvm_done_at: 1, ec2_done_at: 2 }) },
     );
     const v = view(stateWith(st), EPOCH);
-    expect(v.sleep).toEqual({ state: "asleep", title: "Asleep.", line: "The GPUs wake when someone watches.", clock: "", steps: [] });
+    // A page that sees the fleet asleep is connected and visible: nobody new arrived for an
+    // hour. Its Wake button sends `wake`.
+    expect(v.sleep).toEqual({ state: "asleep", title: "Asleep.", line: "The GPUs start when you press Wake.", clock: "", steps: [], wake: { label: "Wake", disabled: false } });
     // With wakes measured: how many GPUs, and the median wake.
     const wakes = [81_000, 98_000, 120_000].map((ms, i) => ({ started_at: i * 1e6, awake_at: i * 1e6 + ms, gpus: 16 }));
     const st2 = sleeping({ state: "asleep", asleep_since: EPOCH - 600_000, wakes, last_wake: wakes[2]! });
-    expect(view(stateWith(st2), EPOCH).sleep!.line).toBe("16 GPUs wake in about 1:38 when you stay.");
+    expect(view(stateWith(st2), EPOCH).sleep!.line).toBe("16 GPUs wake in about 1:38 once you press Wake.");
     expect(v.tiles.every((t) => !t.dark)).toBe(true);
     expect(v.plan.tiles.every((t) => !t.dark)).toBe(true);
     expect(v.plan.posterFull).toBe(true);
@@ -1067,7 +1088,7 @@ describe("asleep and waking", () => {
       ["tiles rendering", "waiting", ""],
     ]);
     // No progress bar: nothing on the card that is not a reported phase.
-    expect(Object.keys(v.sleep!)).toEqual(["state", "title", "line", "clock", "steps"]);
+    expect(Object.keys(v.sleep!)).toEqual(["state", "title", "line", "clock", "steps", "wake"]);
   });
 
   it("reads a fleet that does not scale to zero as awake, and shows the last wake once, as measured", () => {
@@ -1204,11 +1225,11 @@ describe("re-tiling: each side as wide as the GPUs it has", () => {
     }
     // Waking, a side not placed yet is still coming: no "empty" label (it would sit on the recording's badge).
     const waking = fleetSplit(0, 6, 1);
-    waking.fleet.power = { state: "waking", asleep_since: null, woke_at: EPOCH - 5000, hosts: [{ host: "h1", phases: [{ phase: "instance_pending", at: EPOCH - 5000 }] }], last_wake: null, wakes: [] };
+    waking.fleet.power = { state: "waking", asleep_since: null, woke_at: EPOCH - 5000, last_arrival_at: null, sleep_without_arrival_at: null, hosts: [{ host: "h1", phases: [{ phase: "instance_pending", at: EPOCH - 5000 }] }], last_wake: null, wakes: [] };
     expect(view(stateWith(waking), EPOCH).labels.empty).toBeNull();
     // And with nothing placed (asleep), the halves stay even.
     const asleep = fleetSplit(0, 0, 1);
-    asleep.fleet.power = { state: "asleep", asleep_since: EPOCH - 5000, woke_at: null, hosts: [], last_wake: null, wakes: [] };
+    asleep.fleet.power = { state: "asleep", asleep_since: EPOCH - 5000, woke_at: null, last_arrival_at: null, sleep_without_arrival_at: null, hosts: [], last_wake: null, wakes: [] };
     const av = view(stateWith(asleep), EPOCH);
     expect(av.layout!.split).toBe(0.5);
     expect(av.labels.empty).toBeNull();

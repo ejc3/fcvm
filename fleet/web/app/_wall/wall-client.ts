@@ -66,6 +66,8 @@ export class WallClient {
   private listeners = new Set<() => void>();
   private ws: WebSocket | null = null;
   private attempt = 0;
+  /** A socket of this page has opened before: the next one is a reconnect, not a new viewer. */
+  private opened = false;
   private stopped = false;
   private pingTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -271,7 +273,8 @@ export class WallClient {
     ws.onopen = () => {
       this.attempt = 0;
       this.dispatch({ type: "socket", status: "open", at: now() });
-      ws.send(seatMessage(savedSeat()));
+      ws.send(seatMessage(savedSeat(), this.opened));
+      this.opened = true;
       ws.send(JSON.stringify({ type: "visibility", visible: this.visible }));
       for (const intent of intentsToResend(this.state)) ws.send(JSON.stringify(intent));
       this.ping();

@@ -424,6 +424,8 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
     if (sleeping && !client.getState().ui.reelOn) client.ui({ reelOn: true });
   }, [client, sleeping]);
   const reelDone = useCallback(() => client.ui({ reelOn: false }), [client]);
+  // The Wake button: an arrival, which wakes a fleet that slept with nobody new arriving.
+  const wake = useCallback(() => void client.act("wake"), [client]);
 
   // After each draw of the page, measure what the next view model places around.
   useLayoutEffect(() => {
@@ -861,7 +863,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
               ))}
             </div>
           ) : null}
-          {view.sleep ? <WakeCard sleep={view.sleep} /> : null}
+          {view.sleep ? <WakeCard sleep={view.sleep} onWake={wake} /> : null}
           {view.race?.end ? (
             <p className="end-line" data-testid="end-card">
               {view.race.end}
@@ -945,7 +947,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
           {view.hint}
         </div>
       ) : null}
-      <Overlays view={view} phone={phone} />
+      <Overlays view={view} phone={phone} onWake={wake} />
       {keyGrid}
       {state.ui.drawer && view.play && !covered ? <PlayDrawer client={client} view={view} onClose={closeDrawer} panel={drawerPanel} isolationInAbout={phone} word={wordDraft} setWord={setWordDraft} /> : null}
       {needsVerifyPrompt ? (
