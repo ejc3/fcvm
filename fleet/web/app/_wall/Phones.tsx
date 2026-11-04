@@ -146,7 +146,7 @@ function PanelView({
           ) : b.kind === "yours" ? (
             <>
               <div className="head">
-                <h2 id="borrow-h">It is yours</h2>
+                <h2 id="borrow-h">Your phone</h2>
                 <span className="total" data-testid="phone-countdown">
                   {b.countdown}
                 </span>

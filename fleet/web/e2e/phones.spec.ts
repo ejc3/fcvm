@@ -182,7 +182,7 @@ test("taking a phone over gives the ten fixed actions; Rotate reaches the phone,
   await expect(page.getByTestId("phone-borrow")).toHaveAttribute("data-kind", "free");
   await page.getByTestId("phone-take").click();
   await expect(page.getByTestId("phone-borrow")).toHaveAttribute("data-kind", "yours");
-  await expect(page.getByTestId("phone-countdown")).toHaveText(/^Back in \d+ s$/);
+  await expect(page.getByTestId("phone-countdown")).toHaveText(/^Returns in \d+ s$/);
   const labels = await page.getByTestId("phone-borrow").getByRole("group", { name: "Actions" }).getByRole("button").allTextContents();
   expect(labels).toEqual(["Switch screen", "Rotate", "Dark mode", "Dance", "Wave", "GPU benchmark", "Restart app", "Open nvidia.com", "Robot Park", "Reboot phone"]);
   const session = (await mockPhones()).tiles[2]!.borrowed!.session;
