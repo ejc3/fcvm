@@ -86,7 +86,8 @@ fi
 # bridged trial the no-render arm's median was 307 ms after a -fast request and
 # 185 ms after a normal teardown. Rootless clones' state dies with them.
 if [ -n "$FCVM_SUDO" ]; then
-    case ",$ARMS," in
+    # Spaces dropped first: reqbench.py strips them from each arm name.
+    case ",${ARMS//[[:space:]]/}," in
         *-fast,*) echo "BLOCKED: ARMS=$ARMS has a -fast arm, whose teardown in $NETMODE mode leaves host state the next request's launch reclaims; use cdp, html and noop" >&2; exit 2 ;;
     esac
 fi
@@ -131,6 +132,10 @@ MEASURE="${MEASURE:-reqbench}"
 case "$MEASURE" in
     reqbench) ;;
     scale)
+        # The scale run's host control renders through the replay on
+        # 127.0.0.1, where a root mode's replay does not listen.
+        [ "$NETMODE" = rootless ] \
+            || { echo "BLOCKED: MEASURE=scale runs rootless only (NETMODE=$NETMODE)" >&2; exit 2; }
         [ "${ENGINE:-chromium}" = chromium ] \
             || { echo "BLOCKED: MEASURE=scale drives Chromium only (ENGINE=$ENGINE)" >&2; exit 2; }
         [ "$BACKEND" = uffd ] \
@@ -827,6 +832,12 @@ REPLAY_DEV_CREATED=no
 replay_dev_up() {
     [ -n "$REPLAY_DEV" ] || return 0
     if ip link show "$REPLAY_DEV" >/dev/null 2>&1; then
+        # A replay still bound to the address belongs to a campaign that is
+        # running; only a device nothing listens on was left behind.
+        if sudo -n ss -Hlnu "sport = :53" 2>/dev/null | awk -v a="$REPLAY_BIND_URL:53" '$4 == a {f=1} END {exit !f}'; then
+            echo "BLOCKED: $REPLAY_DEV holds $REPLAY_IP and a replay server is bound to it; another campaign is running" >&2
+            return 1
+        fi
         say "removing $REPLAY_DEV, left by a campaign that did not finish"
         sudo ip link del "$REPLAY_DEV" || { echo "BLOCKED: cannot remove the stale $REPLAY_DEV" >&2; return 1; }
     fi

@@ -244,6 +244,49 @@ class DeadClients(TlsFixture, unittest.TestCase):
             self.assertEqual(idle.recv(1), b"", "the server never closed the idle connection")
             self.assertLess(time.monotonic() - t0, 4)
 
+    def test_a_connection_whose_thread_has_not_started_is_still_released(self):
+        """Red before the fix: a connection was registered for end_reads by its
+        own handler thread, so one accepted just before shutdown whose thread
+        had not yet run was missed, and the join waited for its 30 s idle limit."""
+        from pathlib import Path
+
+        exact, noquery, redirects = corpus_serve.load_indexes(Path(self._corpus(self._tmp())))
+
+        class H(corpus_serve.Handler):
+            pass
+
+        H.exact, H.noquery, H.redirects = exact, noquery, redirects
+        H.misses, H.access_log = [], None
+        started = threading.Event()
+
+        class Late(corpus_serve.ReplayServer):
+            def process_request_thread(self, request, client_address):
+                started.wait(10)
+                super().process_request_thread(request, client_address)
+
+        server = Late(("127.0.0.1", 0), H)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        idle = socket.create_connection(("127.0.0.1", server.server_port))
+        self.addCleanup(idle.close)
+        time.sleep(0.3)  # accepted; its handler thread is held before it runs
+        done = threading.Event()
+
+        def stop():
+            server.shutdown()
+            server.end_reads()
+            started.set()
+            server.server_close()
+            done.set()
+
+        threading.Thread(target=stop, daemon=True).start()
+        self.assertTrue(done.wait(5), "a connection accepted before shutdown held the join")
+
+    def _tmp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return tmp.name
+
     def test_the_shipped_idle_limit_outlasts_the_stall_gate(self):
         self.assertGreaterEqual(corpus_serve.Handler.timeout, 15.0)
 

@@ -663,6 +663,12 @@ class ReplayServer(http.server.ThreadingHTTPServer):
 
     def process_request(self, request, client_address):
         self._submitted[id(request)] = time.monotonic()
+        # Registered here, in the accept loop, before the handler thread
+        # starts: shutdown() returns only once this loop has, so every
+        # connection end_reads must see is in _open by then, including one
+        # whose thread has not run yet.
+        with self._open_lock:
+            self._open.add(request)
         super().process_request(request, client_address)
 
     def process_request_thread(self, request, client_address):
@@ -671,8 +677,6 @@ class ReplayServer(http.server.ThreadingHTTPServer):
             self.stats.thread_started((time.monotonic() - submitted) * 1000)
         else:
             self.stats.thread_started(0.0)
-        with self._open_lock:
-            self._open.add(request)
         try:
             if self.handshake_in_handler:
                 h0 = time.monotonic()

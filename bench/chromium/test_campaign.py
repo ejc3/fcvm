@@ -2326,9 +2326,12 @@ class ReplayAddressByNetworkMode(unittest.TestCase):
         head = head[head.index('NETMODE="${NETMODE:-rootless}"'):]
         for mode, arms, refused in (("bridged", "cdp,cdp-fast,noop", True),
                                     ("routed", "cdp,html-fast,noop", True),
+                                    # reqbench.py strips the spaces and runs cdp-fast
+                                    ("bridged", "cdp-fast ,noop", True),
+                                    ("routed", "cdp, noop-fast", True),
                                     ("bridged", "cdp,html,noop", False),
                                     ("rootless", "cdp,cdp-fast,noop", False)):
-            script = f"set -euo pipefail\nENGINE=chromium\nNETMODE={mode}\nARMS={arms}\n{head}\necho ACCEPTED\n"
+            script = f"set -euo pipefail\nENGINE=chromium\nNETMODE={mode}\nARMS='{arms}'\n{head}\necho ACCEPTED\n"
             out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
             with self.subTest(mode=mode, arms=arms):
                 if refused:
@@ -2336,6 +2339,49 @@ class ReplayAddressByNetworkMode(unittest.TestCase):
                     self.assertIn("-fast arm", out.stderr)
                 else:
                     self.assertIn("ACCEPTED", out.stdout, out.stderr)
+
+    def test_the_scale_run_is_refused_in_a_root_mode(self):
+        """Red before the fix: MEASURE=scale was accepted with NETMODE=bridged and
+        failed only after the golden and the diag, because the scale run's host
+        control renders through the replay on 127.0.0.1."""
+        text = campaign()
+        block = re.search(r'(MEASURE="\$\{MEASURE:-reqbench\}"\ncase "\$MEASURE" in\n.*?\nesac)', text, re.S)
+        self.assertIsNotNone(block, "the MEASURE block is gone")
+        for mode, refused in (("bridged", True), ("routed", True), ("rootless", False)):
+            script = (f"set -euo pipefail\nNETMODE={mode}\nENGINE=chromium\nBACKEND=uffd\n"
+                      f"MEASURE=scale\n{block.group(1)}\necho ACCEPTED\n")
+            out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+            with self.subTest(mode=mode):
+                if refused:
+                    self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+                    self.assertIn("rootless only", out.stderr)
+                else:
+                    self.assertIn("ACCEPTED", out.stdout, out.stderr)
+
+    def test_a_replay_device_another_campaign_serves_on_is_not_removed(self):
+        """Red before the fix: replay_dev_up deleted any fcvmreplay0 it found,
+        including the one a running campaign's replay server is bound to."""
+        body = re.search(r"(replay_dev_up\(\) \{\n.*?\n\})\n", campaign(), re.S)
+        self.assertIsNotNone(body, "replay_dev_up is gone")
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = os.path.join(tmp, "calls")
+            for name, script in (
+                ("sudo", '#!/bin/bash\n[ "$1" = -n ] && shift\nexec "$@"\n'),
+                ("ip", f'#!/bin/bash\necho "ip $*" >> {calls}\nexit 0\n'),
+                ("ss", '#!/bin/bash\necho "UNCONN 0 0 192.168.53.2:53 0.0.0.0:* users:((python3,pid=4242,fd=3))"\n'),
+            ):
+                path = os.path.join(tmp, name)
+                with open(path, "w") as handle:
+                    handle.write(script)
+                os.chmod(path, 0o755)
+            wiring = replay_wiring("bridged")
+            script = (f"set -uo pipefail\nsay() {{ :; }}\nREPLAY_DEV_CREATED=no\n{body.group(1)}\n"
+                      "replay_dev_up; echo rc=$?\n")
+            out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30,
+                                 env={**os.environ, **wiring, "PATH": f"{tmp}:{os.environ['PATH']}"})
+            self.assertIn("rc=1", out.stdout, out.stderr)
+            self.assertIn("another campaign is running", out.stderr)
+            self.assertNotIn("ip link del", read_if_exists(calls), "a live replay's device was removed")
 
     def test_every_root_phase_runs_fcvm_under_sudo_in_the_mode(self):
         """A bridged or routed fcvm needs root, and reqbench runs it as root only
