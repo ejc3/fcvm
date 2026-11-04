@@ -180,6 +180,8 @@ export interface WallInput {
   lateShare?: number | null;
   /** Boxes the hover label must not cover, measured by the page. */
   avoid?: Box[];
+  /** The controls drawn over the image (the top row, the bottom strip), measured by the page. */
+  hud?: Box[];
   /** The hover label's measured size. */
   labelSize?: { w: number; h: number };
   /** The direct streams' bandwidth budget, bits per second (BANDWIDTH_BUDGET_BPS when absent). */
@@ -220,6 +222,11 @@ export interface TileView {
   accent: string;
   /** Drawn dark, with its glyph and phase over it. */
   dark: boolean;
+  /**
+   * Where a dark tile's glyph and phase go: the tallest band of its box that no control
+   * drawn over the image covers (clearBand), or null when the controls cover all of it.
+   */
+  content: Box | null;
   /** Hatched: EC2 waiting for spot capacity. */
   hatch: boolean;
   glyph: Glyph;
@@ -288,6 +295,11 @@ function waitingFor(t: Tile): string {
 export function hoverLabel(t: Tile, name: string, rms: number | null): HoverLabel {
   const up = t.phase === "running";
   const wait = `waiting for ${waitingFor(t)}`;
+  // An fcvm place with no GPU behind it: the side keeps it for a GPU that has not joined
+  // (a host still connecting, a GPU warming after an operator released it).
+  if (t.half === "fcvm" && t.slot === null && !up) {
+    return { id: name, kind: KIND_TAG[t.half], gpu: "no GPU in this place", host: "waiting for a GPU to join", last: "no VM has run here" };
+  }
   return {
     id: name,
     kind: KIND_TAG[t.half],
@@ -388,6 +400,7 @@ function tileView(
     box,
     accent,
     dark,
+    content: dark ? box : null,
     hatch: dark && glyph.kind === "capacity",
     glyph,
     phase: phaseLine,
@@ -1140,6 +1153,23 @@ function overlaps(a: Box, b: Box): boolean {
 }
 
 /**
+ * The tallest full-width band of `box` that none of `cover` overlaps, or null when they
+ * cover all of it: a dark tile under the bottom strip (or the top row of controls) puts
+ * its glyph and phase there, never behind a control.
+ */
+export function clearBand(box: Box, cover: readonly Box[]): Box | null {
+  let free: [number, number][] = [[box.y, box.y + box.h]];
+  for (const c of cover) {
+    if (!overlaps(c, box)) continue;
+    free = free.flatMap(([a, b]): [number, number][] =>
+      c.y >= b || c.y + c.h <= a ? [[a, b]] : ([[a, Math.max(a, c.y)], [Math.min(b, c.y + c.h), b]] as [number, number][]).filter(([x, y]) => y > x),
+    );
+  }
+  const best = free.reduce<[number, number] | null>((m, iv) => (m === null || iv[1] - iv[0] > m[1] - m[0] ? iv : m), null);
+  return best === null ? null : { x: box.x, y: best[0], w: box.w, h: best[1] - best[0] };
+}
+
+/**
  * Where the hover label goes: the first of above, below, beside and inside the
  * tile that stays inside the area and covers none of the boxes to avoid.
  * Failing all, the same places pushed past what they hit, then the one covering
@@ -1345,6 +1375,8 @@ export interface WallView {
   spec: string;
   /** The last race in one line, or "". */
   lastRace: string;
+  /** The fcvm GPUs out of rotation, each with its address and why (outOfRotationLine), or "". */
+  outOfRotation: string;
   /** The race drawn on the image: a clock per half while it runs, then the result. */
   race: RaceOnImage | null;
   plan: DrawPlan;
@@ -1431,6 +1463,30 @@ export function specLine(st: FleetState, s: ClientState, image: Box | null, dpr:
   if (fps.length > 0) parts.push(`${Math.round(fps[Math.floor(fps.length / 2)]!)} fps`);
   parts.push("path traced");
   return parts.join(" · ");
+}
+
+/**
+ * Why a quarantined GPU is out, in a short phrase: the innermost clause of Firecracker's
+ * fault message when the error carries one ("VFIO error: Device does not provide MSIx
+ * irq"), else the agent's own text before fcvm's output.
+ */
+export function quarantineReason(error: string | null): string {
+  if (!error) return "no reason given";
+  const fault = /"fault_message":"([^"]*)"/.exec(error)?.[1];
+  const text = fault ? fault.split(": ").slice(-2).join(": ") : error.split("; fcvm said: ")[0]!;
+  const max = 120;
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
+
+/**
+ * The fcvm GPUs that are out of rotation (`gpu_quarantined`), for the strip: the wall is
+ * tiled onto the GPUs left, so this line is where a lost GPU and its reason show. "" when none.
+ */
+export function outOfRotationLine(st: FleetState): string {
+  const q = st.failures.filter((f) => f.kind === "gpu_quarantined");
+  if (q.length === 0) return "";
+  const each = q.map((f) => `${f.sbdf ?? "a GPU"}, ${quarantineReason(f.error)}`).join("; ");
+  return `${q.length === 1 ? "1 fcvm GPU" : `${q.length} fcvm GPUs`} out of rotation: ${each}`;
 }
 
 /**
@@ -1551,6 +1607,7 @@ export function wallView(input: WallInput): WallView {
       live: false,
       spec: "",
       lastRace: "",
+      outOfRotation: "",
       race: null,
       plan: { ...emptyPlan, image },
       seams: { visible: false, segments: [], lineWidth: 1 / input.dpr, outline: null, label: null },
@@ -1572,9 +1629,12 @@ export function wallView(input: WallInput): WallView {
   const placedById = new Map<string, PlacedTile>(layout?.tiles.map((p) => [p.id, p]) ?? []);
   const placedPlan = new Map<string, PlacedTile>(planLayout?.tiles.map((p) => [p.id, p]) ?? []);
   // Asleep or waking, a tile that is not rendering yet shows the poster, not a dark square.
-  const asleepFix = (tv: TileView) => (sleep && tv.dark ? { ...tv, dark: false, hatch: false } : tv);
-  const tiles = shownTiles.map((t) => asleepFix(tileView(t, s, st, placedById.get(t.id)?.box ?? null, srvNow, pend)));
-  const planViews = shownTiles === st.tiles ? tiles : st.tiles.map((t) => asleepFix(tileView(t, s, st, placedPlan.get(t.id)?.box ?? null, srvNow, pend)));
+  // A dark tile's glyph and phase sit in the part of it the controls over the image leave clear.
+  const hud = input.phone ? [] : input.hud ?? [];
+  const finish = (tv: TileView) =>
+    sleep && tv.dark ? { ...tv, dark: false, hatch: false, content: null } : tv.content ? { ...tv, content: clearBand(tv.content, hud) } : tv;
+  const tiles = shownTiles.map((t) => finish(tileView(t, s, st, placedById.get(t.id)?.box ?? null, srvNow, pend)));
+  const planViews = shownTiles === st.tiles ? tiles : st.tiles.map((t) => finish(tileView(t, s, st, placedPlan.get(t.id)?.box ?? null, srvNow, pend)));
   // Broadcast mode: one video of the whole wall; no VM opens, no GPU of one's own, no streams.
   const broadcast = watchesBroadcast(s);
   const admit = s.admission?.direct?.value ?? null;
@@ -1717,6 +1777,7 @@ export function wallView(input: WallInput): WallView {
     live: st.fleet.power.state === "awake" && pictureWhole,
     spec: specLine(st, s, planLayout?.image ?? null, input.dpr),
     lastRace: lastRaceLine(st),
+    outOfRotation: outOfRotationLine(st),
     race: covered ? null : raceOnImage(st, srvNow, layout?.image ?? null, layout?.split ?? 0.5),
     plan,
     seams: seamView(s, covered ? null : layout, tiles, input, returning),

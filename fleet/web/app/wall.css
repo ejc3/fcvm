@@ -87,6 +87,7 @@ a.icon-btn { text-decoration: none; }
 .strip .fades { flex: none; }
 .info { display: flex; align-items: baseline; gap: 6px 22px; flex-wrap: wrap; min-width: 0; font-size: 15px; text-shadow: 0 1px 6px rgba(0, 0, 0, 0.9); }
 .last-race { color: var(--text); font-weight: 500; }
+.out-of-rotation { color: var(--refused); }
 .next { color: var(--text); font-family: var(--mono); }
 .next .label { color: var(--muted); font-family: var(--sans); }
 .next .value { font-variant-numeric: tabular-nums; }
@@ -157,7 +158,9 @@ a.icon-btn { text-decoration: none; }
 .side-tag.fcvm b { color: var(--fcvm); }
 .side-tag.ec2 b { color: var(--ec2); }
 .empty-side { position: absolute; font-size: 14px; color: var(--muted); }
-.dark-tile { position: absolute; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; overflow: hidden; text-align: center; color: var(--accent); }
+.dark-tile { position: absolute; overflow: hidden; text-align: center; color: var(--accent); }
+/* The glyph and phase, in the band of the tile the controls over the image leave clear. */
+.dark-tile .content { position: absolute; left: 0; right: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; }
 .dark-tile.hatched { background: var(--hatch); }
 .dark-tile.failed { color: var(--refused); }
 .dark-tile.borrowed { color: var(--fcvm-soft); animation: fade-in 1200ms ease-out; }

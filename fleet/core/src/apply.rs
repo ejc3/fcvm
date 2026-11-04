@@ -1567,9 +1567,11 @@ fn drop_missing_from_races(f: &mut Fleet, at: u64) {
 ///   its place. fcvm slots beyond `max_tiles` are standby.
 /// - EC2 tiles wanted: `min(ec2_max, max_tiles)`; `ec2-1..ec2-D` exist, higher ones are
 ///   dropped (the driver terminates their instances). Each has a place, instance or not.
-/// - fcvm places: `max(min(fcvm_tiles, max_tiles) - phone GPUs, fcvm GPUs)`, where phone
-///   GPUs are those connected hosts run phones on. The GPUs are grouped into one band per
-///   host and the places left over are one dark band below them.
+/// - fcvm places: `max(min(fcvm_tiles, max_tiles) - phone GPUs - quarantined GPUs, fcvm
+///   GPUs)`, where phone GPUs are those connected hosts run phones on and quarantined GPUs
+///   are wall GPUs of connected hosts out of rotation: no GPU can fill either's place. The
+///   GPUs are grouped into one band per host and the places left over are one dark band
+///   below them.
 /// - Asleep, neither side has a place.
 fn retile(f: &mut Fleet, c: &Config, at: u64) {
     // Asleep, nothing is placed: the fcvm side's GPUs go to standby (their VMs stop) as the
@@ -1630,14 +1632,23 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
     // race replacing the EC2 instances, a capacity wait, a host not yet connected or
     // reclaimed) re-tiles nothing. Every EC2 tile has its place, with an instance or not;
     // the fcvm side has `fcvm_tiles` places less the GPUs connected hosts run phones on
-    // (never wall tiles), or one per live GPU when there are more.
+    // (never wall tiles) and less the wall GPUs of connected hosts that are quarantined (out
+    // until an operator releases them), or one per live GPU when there are more. A place
+    // kept for either would stay dark for as long as its host runs.
     let ec2_places: Vec<u32> = f.ec2.keys().copied().take(c.max_tiles).collect();
+    let quarantined = f
+        .slots
+        .values()
+        .filter(|s| is_quarantined(f, s) && !host_draining(&f.hosts, s))
+        .filter(|s| s.host.as_ref().is_some_and(|h| f.hosts.contains_key(h)))
+        .count();
     let fcvm_places = if asleep {
         0
     } else {
         c.fcvm_tiles
             .min(c.max_tiles)
             .saturating_sub(f.phones.len())
+            .saturating_sub(quarantined)
             .max(active.len())
     };
     f.n = active.len();

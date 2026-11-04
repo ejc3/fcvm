@@ -66,8 +66,10 @@ export function GlyphMark({ g, size }: { g: Glyph; size: number }) {
 
 function DarkTile({ t }: { t: TileView }) {
   const b = t.box!;
-  const big = b.h >= 64 && b.w >= 110;
-  const size = Math.max(14, Math.min(34, b.h / (t.clock ? 5 : 3.2)));
+  // The glyph and phase go in the band of the tile no control over the image covers.
+  const c = t.content;
+  const big = c !== null && c.h >= 64 && c.w >= 110;
+  const size = c === null ? 0 : Math.max(14, Math.min(34, c.h / (t.clock ? 5 : 3.2)));
   return (
     <div
       className={`dark-tile${t.hatch ? " hatched" : ""} ${t.glyph.kind}`}
@@ -75,17 +77,21 @@ function DarkTile({ t }: { t: TileView }) {
       data-kind={t.glyph.kind}
       style={{ ...accent(t.accent), left: b.x, top: b.y, width: b.w, height: b.h }}
     >
-      {t.clock && big ? (
-        <span className="clock" data-testid={`clock-${t.id}`} style={{ fontSize: `clamp(18px, ${Math.round(b.h / 5)}px, 56px)` }}>
-          {t.clock}
-        </span>
-      ) : null}
-      <GlyphMark g={t.glyph} size={size} />
-      {big ? (
-        <span className="phase plate" data-testid={`phase-${t.id}`}>
-          {t.phase}
-          {t.detail ? <span className="detail">{t.detail}</span> : null}
-        </span>
+      {c !== null && c.h >= size + 4 ? (
+        <div className="content" style={{ top: c.y - b.y, height: c.h }}>
+          {t.clock && big ? (
+            <span className="clock" data-testid={`clock-${t.id}`} style={{ fontSize: `clamp(18px, ${Math.round(c.h / 5)}px, 56px)` }}>
+              {t.clock}
+            </span>
+          ) : null}
+          <GlyphMark g={t.glyph} size={size} />
+          {big ? (
+            <span className="phase plate" data-testid={`phase-${t.id}`}>
+              {t.phase}
+              {t.detail ? <span className="detail">{t.detail}</span> : null}
+            </span>
+          ) : null}
+        </div>
       ) : null}
     </div>
   );

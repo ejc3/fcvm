@@ -257,7 +257,10 @@ export class MockCoordinator {
   private ec2Count = 0;
   /** Which tiling, and the frame (on t = k/30) its rectangles start at. */
   private layout = { generation: 1, from_frame: 0 };
-  private failures: { kind: "host_reclaimed"; host: string; since: number; retiling: boolean }[] = [];
+  private failures: (
+    | { kind: "host_reclaimed"; host: string; since: number; retiling: boolean }
+    | { kind: "gpu_quarantined"; host: string; sbdf: string; error: string; since: number }
+  )[] = [];
   private actions: { at: number; viewer: string; id: string; name: string; args: Record<string, unknown>; summary: string; outcome: string }[] = [];
   private offlineUntil = 0;
   private sitekey: string | null;
@@ -453,7 +456,8 @@ export class MockCoordinator {
         scrubs: this.scrubsTotal,
         scrub_failures: 0,
       },
-      failures: this.failures.filter((f) => f.since > now - RECLAIM_KEPT_MS),
+      // A reclaimed host is listed for a minute; a quarantined GPU while its host is here.
+      failures: this.failures.filter((f) => f.kind === "gpu_quarantined" || f.since > now - RECLAIM_KEPT_MS),
       next_race_at: this.nextRaceAt,
       cooldown_until: this.cooldownUntil !== null && this.cooldownUntil > now ? this.cooldownUntil : null,
       scoreboard: this.scoreboard(),
@@ -1350,6 +1354,20 @@ export class MockCoordinator {
     this.markDirty();
   }
 
+  /**
+   * As the coordinator does for an agent's `quarantine`: the GPU leaves the tiling and the
+   * fcvm side's places (no GPU can fill its place), and `failures` names it and why.
+   */
+  private quarantine(tile: TileRuntime, error: string): void {
+    const slot = Number(/(\d+)$/.exec(tile.slot!)?.[1] ?? "0");
+    const host = this.hostOf(slot);
+    if (tile.timer) clearTimeout(tile.timer);
+    tile.timer = null;
+    this.failures = [...this.failures, { kind: "gpu_quarantined", host, sbdf: tile.gpu!.sbdf, error, since: this.now() }];
+    this.fcvmSlots = this.fcvmSlots.filter((k) => k !== slot);
+    this.retile();
+  }
+
   private reclaim(hostName: string): boolean {
     const host = this.hosts.find((h) => h.name === hostName);
     if (!host) return false;
@@ -1478,6 +1496,11 @@ export class MockCoordinator {
             this.fail(t, typeof b["message"] === "string" ? b["message"] : "the VM did not come back", typeof b["retry_ms"] === "number" ? b["retry_ms"] : 15000);
           }
           if (typeof b["reclaim"] === "string" && !this.reclaim(b["reclaim"])) throw new Error(`no host ${b["reclaim"]}`);
+          if (typeof b["quarantine"] === "string") {
+            const t = this.tiles.find((x) => x.id === b["quarantine"]);
+            if (!t || !t.slot) throw new Error(`no tile with a GPU ${String(b["quarantine"])}`);
+            this.quarantine(t, typeof b["error"] === "string" ? b["error"] : "the GPU did not reset");
+          }
           if (typeof b["replace_host"] === "string") this.replaceHost(b["replace_host"]);
           if (typeof b["fcvm_gpus"] === "number" || typeof b["ec2_gpus"] === "number") {
             this.setGpus(typeof b["fcvm_gpus"] === "number" ? b["fcvm_gpus"] : this.fcvmSlots.length, typeof b["ec2_gpus"] === "number" ? b["ec2_gpus"] : this.ec2Count);
