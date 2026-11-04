@@ -30,6 +30,22 @@
 # live internet. dnsmasq is stopped here for the socket, not for that.
 # scripts/probe-pasta-dns-gateway.sh asks the pinned pasta binary which server
 # answers, with the flag and without it, in a few seconds and without a VM.
+#
+# NETMODE=bridged and NETMODE=routed have no pasta and so no gateway that maps
+# onto the host's loopback. Their guests reach the replay by routing to an
+# address the host owns: the campaign assigns REPLAY_IP to a dummy device
+# (REPLAY_DEV) for its lifetime, binds all three listeners to it, and bakes it
+# into the golden as the resolver. A bridged guest's packets to it leave
+# through its gateway (a fresh boot's host veth, a clone's in-namespace NAT
+# and then the host veth) and are delivered locally; a routed guest has no
+# IPv4 path off its namespace, so its replay address is IPv6, answered as
+# AAAA, and reached over the namespace's IPv6 route to the host. Both modes
+# need root, so fcvm runs under sudo (SUDO=sudo, handed to reqbench).
+#
+#   mode      REPLAY_IP      listeners bind   resolver record
+#   rootless  10.0.2.2       127.0.0.1        A
+#   bridged   192.168.53.2   192.168.53.2     A
+#   routed    fd53::2        fd53::2          AAAA
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,12 +56,40 @@ case "$ENGINE" in chromium|webkit) ;; *) echo "unknown ENGINE '$ENGINE'" >&2; ex
 # refused by the seal anyway (different image digest), but the failure would
 # come minutes in rather than at naming time.
 if [ "$ENGINE" = webkit ]; then TAG="${TAG:-cb-req-corpus-webkit}"; else TAG="${TAG:-cb-req-corpus}"; fi
+NETMODE="${NETMODE:-rootless}"
+case "$NETMODE" in
+    rootless) REPLAY_IP=10.0.2.2; REPLAY_BIND=127.0.0.1; REPLAY_DEV=""; FCVM_SUDO="" ;;
+    bridged) REPLAY_IP=192.168.53.2; REPLAY_BIND=$REPLAY_IP; REPLAY_DEV=fcvmreplay0; FCVM_SUDO=sudo ;;
+    routed) REPLAY_IP=fd53::2; REPLAY_BIND=$REPLAY_IP; REPLAY_DEV=fcvmreplay0; FCVM_SUDO=sudo ;;
+    *) echo "BLOCKED: NETMODE must be rootless, bridged or routed (got '$NETMODE')" >&2; exit 2 ;;
+esac
+# The record type the replay answers with REPLAY_IP (corpus_serve answer_record)
+# and what the brackets count; the other type is answered empty.
+case "$REPLAY_IP" in *:*) REPLAY_QTYPE=28; REPLAY_RR=AAAA ;; *) REPLAY_QTYPE=1; REPLAY_RR=A ;; esac
+# The forms the tools name the bind address in: curl --resolve and ss want an
+# IPv6 address bracketed.
+case "$REPLAY_BIND" in *:*) REPLAY_BIND_URL="[$REPLAY_BIND]" ;; *) REPLAY_BIND_URL=$REPLAY_BIND ;; esac
+export NETMODE
+
 # cdp-fast is CDP WebSocket prewiring; WebKit's driver has no WebSocket, so its
 # default drops that arm rather than recording 202 guaranteed failures.
 if [ "${ENGINE:-chromium}" = webkit ]; then
     ARMS="${ARMS:-cdp,noop}"
+elif [ -n "$FCVM_SUDO" ]; then
+    ARMS="${ARMS:-cdp,noop}"
 else
     ARMS="${ARMS:-cdp,cdp-fast,noop}"
+fi
+# A -fast arm ends its clone with one SIGKILL. In a root mode that leaves the
+# clone's host-side network (iptables rules, veth, namespace) for the next fcvm
+# launch to reclaim, so the next request pays for this one's teardown: on a
+# bridged trial the no-render arm's median was 307 ms after a -fast request and
+# 185 ms after a normal teardown. Rootless clones' state dies with them.
+if [ -n "$FCVM_SUDO" ]; then
+    # Spaces dropped first: reqbench.py strips them from each arm name.
+    case ",${ARMS//[[:space:]]/}," in
+        *-fast,*) echo "BLOCKED: ARMS=$ARMS has a -fast arm, whose teardown in $NETMODE mode leaves host state the next request's launch reclaims; use cdp, html and noop" >&2; exit 2 ;;
+    esac
 fi
 REPS="${REPS:-202}"
 WARMUP="${WARMUP:-28}"          # two full 14-URL cycles; the harness fails closed below this
@@ -88,6 +132,10 @@ MEASURE="${MEASURE:-reqbench}"
 case "$MEASURE" in
     reqbench) ;;
     scale)
+        # The scale run's host control renders through the replay on
+        # 127.0.0.1, where a root mode's replay does not listen.
+        [ "$NETMODE" = rootless ] \
+            || { echo "BLOCKED: MEASURE=scale runs rootless only (NETMODE=$NETMODE)" >&2; exit 2; }
         [ "${ENGINE:-chromium}" = chromium ] \
             || { echo "BLOCKED: MEASURE=scale drives Chromium only (ENGINE=$ENGINE)" >&2; exit 2; }
         [ "$BACKEND" = uffd ] \
@@ -305,10 +353,10 @@ verify_replay_answered_the_guest() {
         >>"$RESULTS/replay-queries.log" \
         || { echo "FAILED: verify ($stage): cannot record this bracket in $RESULTS/replay-queries.log" >&2; return 1; }
     if [ -n "$missing" ]; then
-        echo "FAILED: verify ($stage): this campaign's replay server logged no A answer of 10.0.2.2 for $missing after row $since, so the clone's answers for those names did not come from it" >&2
+        echo "FAILED: verify ($stage): this campaign's replay server logged no $REPLAY_RR answer of $REPLAY_IP for $missing after row $since, so the clone's answers for those names did not come from it" >&2
         return 1
     fi
-    say "verify ($stage): replay answered $queries A queries covering every corpus host"
+    say "verify ($stage): replay answered $queries $REPLAY_RR queries covering every corpus host"
 }
 
 replay_log_rows() {
@@ -331,8 +379,9 @@ replay_qnames_since() {
     # cache while only its AAAA reached this server. A row jq cannot parse
     # fails the pipeline, and so the bracket.
     tail -n +"$(($2 + 1))" "$1" \
-        | jq -r 'select((.qname | type) == "string" and .qtype == 1 and .answer == "10.0.2.2")
-                 | .qname' 2>/dev/null
+        | jq -r --argjson qtype "$REPLAY_QTYPE" --arg answer "$REPLAY_IP" \
+            'select((.qname | type) == "string" and .qtype == $qtype and .answer == $answer)
+             | .qname' 2>/dev/null
 }
 
 run_verify() {
@@ -361,8 +410,8 @@ run_verify() {
     # bash keeps errexit off, so an unchecked cp that failed would leave the
     # jq below validating whatever copy was already there.
     rm -f "$RESULTS/verify-dns.json" "$copy"
-    if ! VERIFY_DNS_HOSTS="$CORPUS_HOSTS" VERIFY_DNS_ANSWER=10.0.2.2 VERIFY_DNS_URLS="$URLS" \
-        TAG="$TAG" ENGINE="$ENGINE" RESULTS="$RESULTS" \
+    if ! VERIFY_DNS_HOSTS="$CORPUS_HOSTS" VERIFY_DNS_ANSWER="$REPLAY_IP" VERIFY_DNS_URLS="$URLS" \
+        TAG="$TAG" ENGINE="$ENGINE" RESULTS="$RESULTS" NETMODE="$NETMODE" SUDO="$FCVM_SUDO" \
         make -C "$REPO" "$(engine_target verify)" 2>&1 | tee "$LOGDIR/verify-$stage.log"; then
         echo "FAILED: verify ($stage) did not pass; see $LOGDIR/verify-$stage.log" >&2
         if [ -f "$RESULTS/verify-dns.json" ]; then cp "$RESULTS/verify-dns.json" "$copy"; fi
@@ -381,12 +430,12 @@ run_verify() {
     # (proxies_disabled): fc-agent injects the host's HTTP_PROXY/HTTPS_PROXY
     # into the exec, and a probe that honoured them would have fetched the
     # live site with the replay resolver never consulted.
-    jq -e --arg hosts "$CORPUS_HOSTS" --arg urls "$URLS" '
+    jq -e --arg hosts "$CORPUS_HOSTS" --arg urls "$URLS" --arg replay "$REPLAY_IP" '
         . as $e
-        | .passed == true and .dns_server == "10.0.2.2" and .proxies_disabled == true
+        | .passed == true and .dns_server == $replay and .proxies_disabled == true
         and all($hosts | split(",")[]; . as $h | $e.hosts[$h].ok == true)
         and all($urls | split(",")[]; . as $u | $e.urls[$u].ok == true)' "$copy" >/dev/null \
-        || { echo "FAILED: verify ($stage): $copy does not record passed=true through 10.0.2.2 with proxies disabled for every corpus host and URL" >&2; return 1; }
+        || { echo "FAILED: verify ($stage): $copy does not record passed=true through $REPLAY_IP with proxies disabled for every corpus host and URL" >&2; return 1; }
     verify_replay_answered_the_guest "$stage" "$since_row" || return 1
 }
 
@@ -397,7 +446,7 @@ run_diag() {
     # must resolve, every load event must land inside DIAG_MAX_LOAD_MS. The
     # sub-make must exit 0 AND the summary it leaves must say passed=true:
     # a stale summary from an earlier campaign is removed at start.
-    local out="$RESULTS/diag/summary.json" expect=10.0.2.2
+    local out="$RESULTS/diag/summary.json" expect=$REPLAY_IP
     # Only Chromium's render carries a network trace; reqbench refuses an
     # IP expectation it cannot enforce, so the WebKit diag is asked for
     # load events and render success alone, and the verify brackets hold
@@ -416,7 +465,7 @@ run_diag() {
     say "diag: one traced render per corpus URL on restored clones of $TAG, replay off (limit ${DIAG_MAX_LOAD_MS} ms, expect ${expect:-<no trace>})"
     if ! DIAG_URLS="$URLS" DIAG_EXPECT_IPS="$expect" DIAG_MAX_LOAD_MS="$DIAG_MAX_LOAD_MS" \
         TAG="$TAG" ENGINE="$ENGINE" RESULTS="$RESULTS" BACKEND="$BACKEND" \
-        UFFD_MODE="$UFFD_MODE" UFFD_PREFETCH=off \
+        NETMODE="$NETMODE" SUDO="$FCVM_SUDO" UFFD_MODE="$UFFD_MODE" UFFD_PREFETCH=off \
         make -C "$REPO" "$(engine_target diag)" 2>&1 | tee "$LOGDIR/diag.log"; then
         echo "FAILED: diag did not pass; see $LOGDIR/diag.log and $out" >&2
         return 1
@@ -443,7 +492,7 @@ dns_owner_sample() {
     # (below), which the evidence records as unclean.
     local listing owner state load1
     listing=$(sudo -n ss -lnup 'sport = :53' 2>/dev/null) || return 1
-    owner=$(awk '$4 == "127.0.0.1:53" && match($0, /pid=[0-9]+/) { print substr($0, RSTART + 4, RLENGTH - 4); exit }' <<<"$listing")
+    owner=$(awk -v local="$REPLAY_BIND_URL:53" '$4 == local && match($0, /pid=[0-9]+/) { print substr($0, RSTART + 4, RLENGTH - 4); exit }' <<<"$listing")
     state=$(systemctl is-active dnsmasq 2>/dev/null) || state="${state:-unknown}"
     load1=$(cut -d' ' -f1 "$LOADAVG_FILE" 2>/dev/null) || return 1
     case "$load1" in
@@ -463,7 +512,13 @@ dns_owner_sampler() {
 start_dns_sampler() {
     : >"$RESULTS/dns-owner.log"
     SAMPLER_ALIVE_AT_STOP=""
-    dns_owner_sampler "$RESULTS/dns-owner.log" &
+    # The sampler subshell drops the replay device lock it would inherit: a
+    # sampler left running by a campaign killed with SIGKILL must not keep the
+    # lock and block every later campaign.
+    (
+        [ -z "${REPLAY_LOCK_FD:-}" ] || exec {REPLAY_LOCK_FD}>&-
+        dns_owner_sampler "$RESULTS/dns-owner.log"
+    ) &
     SAMPLER_PID=$!
 }
 
@@ -548,7 +603,7 @@ write_dns_evidence() {
         load_max=${load_stats##* }
     fi
     if [ "$samples" -eq 0 ]; then
-        verdict=unclean; reason="${reason:-no 127.0.0.1:53 owner samples were taken}"
+        verdict=unclean; reason="${reason:-no $REPLAY_BIND_URL:53 owner samples were taken}"
     elif [ -n "$first_mismatch" ]; then
         verdict=unclean; reason="${reason:-a sample did not name corpus_serve $SERVE_PID with dnsmasq inactive}"
     elif [ "$sampler_alive" != true ]; then
@@ -774,12 +829,49 @@ stop_corpus_serve() {
     fi
 }
 
+# The device that holds REPLAY_IP for a bridged or routed guest. It is this
+# campaign's for as long as the campaign runs: the campaign holds REPLAY_LOCK
+# from before it looks at the device until it exits (the kernel drops the lock
+# with the process), so a second root-mode campaign refuses instead of taking
+# the device over, and a device found while the lock is free was left by a
+# campaign that died without its exit trap and is replaced. Removed by cleanup.
+REPLAY_DEV_CREATED=no
+REPLAY_LOCK="${REPLAY_LOCK:-/run/lock/fcvm-corpus-replay.lock}"
+replay_dev_up() {
+    [ -n "$REPLAY_DEV" ] || return 0
+    exec {REPLAY_LOCK_FD}>>"$REPLAY_LOCK" \
+        || { echo "BLOCKED: cannot open the replay device lock $REPLAY_LOCK" >&2; return 1; }
+    if ! flock -n "$REPLAY_LOCK_FD"; then
+        echo "BLOCKED: another campaign holds $REPLAY_LOCK and owns $REPLAY_DEV" >&2
+        return 1
+    fi
+    if ip link show "$REPLAY_DEV" >/dev/null 2>&1; then
+        say "removing $REPLAY_DEV, left by a campaign that did not finish"
+        sudo ip link del "$REPLAY_DEV" || { echo "BLOCKED: cannot remove the stale $REPLAY_DEV" >&2; return 1; }
+    fi
+    sudo ip link add "$REPLAY_DEV" type dummy || { echo "BLOCKED: cannot create $REPLAY_DEV" >&2; return 1; }
+    REPLAY_DEV_CREATED=yes
+    case "$REPLAY_IP" in
+        # nodad: the address is usable at once, not after duplicate detection.
+        *:*) sudo ip -6 addr add "$REPLAY_IP/128" dev "$REPLAY_DEV" nodad ;;
+        *) sudo ip addr add "$REPLAY_IP/32" dev "$REPLAY_DEV" ;;
+    esac || { echo "BLOCKED: cannot assign $REPLAY_IP to $REPLAY_DEV" >&2; return 1; }
+    sudo ip link set "$REPLAY_DEV" up || { echo "BLOCKED: cannot bring $REPLAY_DEV up" >&2; return 1; }
+    say "replay address $REPLAY_IP on $REPLAY_DEV for $NETMODE guests"
+}
+replay_dev_down() {
+    [ "$REPLAY_DEV_CREATED" = yes ] || return 0
+    sudo ip link del "$REPLAY_DEV" || { echo "WARNING: could not remove $REPLAY_DEV" >&2; return 1; }
+    REPLAY_DEV_CREATED=no
+}
+
 cleanup() {
     set +e
     # The sampler is a background subshell of this script; nothing else reaps
     # it when the campaign dies mid-run.
     stop_dns_sampler
     stop_corpus_serve
+    replay_dev_down
     if [ "$DNSMASQ_WAS_ACTIVE" = yes ] && ! systemctl is-active --quiet dnsmasq; then
         say "restarting dnsmasq"
         # Retry and REPORT. corpus_serve can still be releasing :53 as this runs
@@ -806,11 +898,12 @@ cleanup() {
 trap cleanup EXIT
 
 if [ "$DNSMASQ_WAS_ACTIVE" = yes ]; then
-    say "stopping dnsmasq so corpus_serve can own 127.0.0.1:53"
+    say "stopping dnsmasq so corpus_serve can own $REPLAY_BIND_URL:53"
     sudo systemctl stop dnsmasq
 fi
+replay_dev_up || exit 3
 
-say "starting corpus_serve (DNS 127.0.0.1:53 answering 10.0.2.2; HTTP 80; HTTPS 443)"
+say "starting corpus_serve (DNS $REPLAY_BIND_URL:53 answering $REPLAY_RR $REPLAY_IP; HTTP 80; HTTPS 443 on $REPLAY_BIND)"
 # The PID comes from THIS invocation, via a pidfile the wrapper shell writes
 # from $! of the server it started. `pgrep -f corpus_serve.py` would match any
 # campaign's server, so a concurrent run's cleanup could kill this one's and
@@ -831,12 +924,12 @@ rm -f "$SERVE_PIDFILE" "$SERVE_STATUS_FILE"
 # --dns-log / --access-log: the server's per-query DNS log and HTTP access
 # log, kept with the run; dns-evidence.json records their sha256.
 # $7 is CORPUS_SERVE_ARGS, word-split on purpose: listener options for an
-# experiment (--backlog N, --tls-handshake-in-handler), none by default.
+# experiment (--backlog N, --tls-handshake-in-accept), none by default.
 # --listen-log is a measurement of the listeners, not evidence.
-sudo -b sh -c 'python3 "$2" --root "$3" --port 80 --tls-port 443 --dns-addr 127.0.0.1 --dns-port 53 --answer-ip 10.0.2.2 --dns-log "$4" --access-log "$5" --listen-log "$8" $7 & pid=$!; echo "$pid" > "$1"; wait "$pid"; rc=$?; echo "$rc" > "$6.tmp" && mv "$6.tmp" "$6"' \
+sudo -b sh -c 'python3 "$2" --root "$3" --port 80 --tls-port 443 --http-addr "$9" --dns-addr "$9" --dns-port 53 --answer-ip "${10}" --dns-log "$4" --access-log "$5" --listen-log "$8" $7 & pid=$!; echo "$pid" > "$1"; wait "$pid"; rc=$?; echo "$rc" > "$6.tmp" && mv "$6.tmp" "$6"' \
     _ "$SERVE_PIDFILE" "$REPO/bench/chromium/corpus_serve.py" "$REPO/bench/chromium/corpus-live" \
     "$RESULTS/corpus-dns.log" "$RESULTS/corpus-access.log" "$SERVE_STATUS_FILE" "${CORPUS_SERVE_ARGS:-}" \
-    "$RESULTS/corpus-listen.log" \
+    "$RESULTS/corpus-listen.log" "$REPLAY_BIND" "$REPLAY_IP" \
     > "$LOGDIR/corpus_serve.log" 2>&1
 # `[ -s f ] && break` would be the last command in the body, so on the first
 # iteration (pidfile not written yet) it returns 1 and `set -e` kills the whole
@@ -868,16 +961,16 @@ grep -q "loaded [1-9]" "$LOGDIR/corpus_serve.log" || {
 answer=""
 code=""
 for _ in $(seq 1 100); do
-    answer=$(dig +short +time=2 +tries=1 @127.0.0.1 blog.cloudflare.com A 2>/dev/null | head -1 || true)
+    answer=$(dig +short +time=2 +tries=1 @"$REPLAY_BIND" blog.cloudflare.com "$REPLAY_RR" 2>/dev/null | head -1 || true)
     code=$(curl -sk --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 5 \
-           --resolve 'blog.cloudflare.com:443:127.0.0.1' https://blog.cloudflare.com/ 2>/dev/null || true)
-    if [ "$answer" = "10.0.2.2" ] && [ "$code" = "200" ]; then break; fi
+           --resolve "blog.cloudflare.com:443:$REPLAY_BIND_URL" https://blog.cloudflare.com/ 2>/dev/null || true)
+    if [ "$answer" = "$REPLAY_IP" ] && [ "$code" = "200" ]; then break; fi
     sudo kill -0 "$SERVE_PID" 2>/dev/null || { echo "BLOCKED: corpus_serve died during startup" >&2; cat "$LOGDIR/corpus_serve.log" >&2; exit 3; }
     sleep 0.2
 done
-[ "$answer" = "10.0.2.2" ] || { echo "BLOCKED: wildcard DNS answered '$answer', expected 10.0.2.2" >&2; exit 3; }
+[ "$answer" = "$REPLAY_IP" ] || { echo "BLOCKED: wildcard DNS answered '$answer', expected $REPLAY_RR $REPLAY_IP" >&2; exit 3; }
 [ "$code" = "200" ] || { echo "BLOCKED: HTTPS replay returned '$code' for blog.cloudflare.com" >&2; exit 3; }
-say "replay server up: DNS -> 10.0.2.2, HTTPS 200"
+say "replay server up: DNS $REPLAY_RR -> $REPLAY_IP, HTTPS 200"
 
 # Probe EVERY corpus member, not just the one used to detect startup. A corpus
 # holding only blog.cloudflare.com passed the check above, and the other 13 URLs
@@ -893,7 +986,7 @@ checked=0
 for url in $(printf '%s\n' "$URLS" | tr ',' ' '); do
     host=$(printf '%s' "$url" | sed -E 's#^https?://([^/]+).*#\1#')
     ucode=$(curl -sk --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 10 \
-            --resolve "$host:443:127.0.0.1" "$url" 2>/dev/null || true)
+            --resolve "$host:443:$REPLAY_BIND_URL" "$url" 2>/dev/null || true)
     case "$ucode" in
     200 | 30[1278]) ;;
     *) missing="$missing\n  $ucode  $url" ;;
@@ -919,8 +1012,9 @@ say "fcvm binary $FCVM_BIN sha256=$FCVM_SHA (recorded per run in cell.fcvm_sha25
 PHASE="${PHASE:-all}"
 CORPUS_HOSTS=$(corpus_hosts)
 if [ "$PHASE" = all ]; then
-    say "golden $TAG (GUEST_DNS=10.0.2.2 baked into resolv.conf at boot)"
-    GUEST_DNS=10.0.2.2 TAG="$TAG" ENGINE="$ENGINE" RESULTS="$RESULTS" \
+    say "golden $TAG ($NETMODE, GUEST_DNS=$REPLAY_IP baked into resolv.conf at boot)"
+    GUEST_DNS="$REPLAY_IP" TAG="$TAG" ENGINE="$ENGINE" RESULTS="$RESULTS" \
+        NETMODE="$NETMODE" SUDO="$FCVM_SUDO" \
         make -C "$REPO" "$(engine_target golden)" 2>&1 | tee "$LOGDIR/golden.log"
     run_verify pre || campaign_fail "verify (pre) failed on the new golden"
 else
@@ -1004,6 +1098,7 @@ else
     TAG="$TAG" URL="$URLS" BACKEND="$BACKEND" UFFD_MODE="$UFFD_MODE" \
         UFFD_PREFETCH="$UFFD_PREFETCH" ARMS="$ARMS" REPS="$REPS" WARMUP="$WARMUP" \
         STALL_MAX_MS="$STALL_MAX_MS" RESULTS="$RESULTS" ENGINE="$ENGINE" \
+        NETMODE="$NETMODE" SUDO="$FCVM_SUDO" \
         make -C "$REPO" "$(engine_target run)" 2>&1 | tee "$LOGDIR/run.log" || run_rc=$?
     stop_dns_sampler
 fi

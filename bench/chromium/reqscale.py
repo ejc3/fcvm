@@ -2739,6 +2739,9 @@ def collect_provenance(args, schedule: dict, snapshot: dict) -> dict:
             # published, and a host name names one machine on one network.
             "instance_type": reqbench.host_facts()["instance_type"],
             "cpu_model": reqbench.host_facts()["cpu_model"],
+            # The boot, hashed as every serial run's meta line hashes it, so a
+            # campaign can show its throughput run shared a boot with the rest.
+            "host_boot_sha256": reqbench.host_identity()["host_boot_sha256"],
             "kernel": platform.release(),
             "machine": platform.machine(),
             "python": platform.python_version(),

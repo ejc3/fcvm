@@ -25,12 +25,41 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 MAKEFILE = os.path.join(REPO, "Makefile")
 CAMPAIGN = os.path.join(HERE, "corpus_campaign.sh")
+
+
+def replay_wiring(netmode):
+    """The replay variables the shipped NETMODE block derives for one mode.
+
+    The block is lifted out of the script and run, so these are the script's
+    own values, not a copy of them."""
+    with open(CAMPAIGN) as handle:
+        text = handle.read()
+    block = re.search(r'^(NETMODE="\$\{NETMODE:-rootless\}"\n.*?^export NETMODE)$',
+                      text, re.S | re.M)
+    if block is None:
+        raise AssertionError("the NETMODE block is gone from corpus_campaign.sh")
+    names = ("NETMODE", "REPLAY_IP", "REPLAY_BIND", "REPLAY_BIND_URL", "REPLAY_DEV",
+             "REPLAY_QTYPE", "REPLAY_RR", "FCVM_SUDO")
+    script = (f"set -euo pipefail\nNETMODE={netmode}\n{block.group(1)}\n"
+              + "".join(f'printf "%s=%s\\n" {n} "${n}"\n' for n in names))
+    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                         timeout=30, check=True).stdout
+    return dict(line.split("=", 1) for line in out.splitlines())
+
+
+# The fragments the tests below lift out of the script run outside it, so the
+# replay variables its NETMODE block sets are handed to them through the
+# environment, as the rootless default derives them. REPLAY_DEV_CREATED is the
+# script's initial value.
+os.environ.update(replay_wiring("rootless"))
+os.environ["REPLAY_DEV_CREATED"] = "no"
 
 
 def makefile() -> str:
@@ -234,7 +263,7 @@ class PartialCorpus(unittest.TestCase):
         below is what exposed that, which is why it exists.
         """
         probe = probe.replace(
-            '--resolve "$host:443:127.0.0.1"',
+            '--resolve "$host:443:$REPLAY_BIND_URL"',
             f'--connect-to "$host:80:127.0.0.1:{port}"')
         return probe.replace("https://", "http://").replace("curl -sk", "curl -s")
 
@@ -359,7 +388,7 @@ class LocalProbesIgnoreProxies(unittest.TestCase):
     DEAD_PROXY = "http://127.0.0.1:9"
     READINESS = re.compile(
         r'(answer=""\ncode=""\nfor _ in \$\(seq 1 100\); do\n.*?\ndone\n'
-        r'\[ "\$answer" = "10\.0\.2\.2" \][^\n]*\n\[ "\$code" = "200" \][^\n]*\n)', re.S)
+        r'\[ "\$answer" = "\$REPLAY_IP" \][^\n]*\n\[ "\$code" = "200" \][^\n]*\n)', re.S)
 
     def _env(self) -> dict:
         env = {k: v for k, v in os.environ.items()
@@ -419,7 +448,7 @@ class LocalProbesIgnoreProxies(unittest.TestCase):
         self.assertIsNotNone(block, "the replay readiness probe is gone")
         port = self._stub("/")
         probe = (block.group(1)
-                 .replace("--resolve 'blog.cloudflare.com:443:127.0.0.1' "
+                 .replace('--resolve "blog.cloudflare.com:443:$REPLAY_BIND_URL" '
                           "https://blog.cloudflare.com/",
                           f"--connect-to 'blog.cloudflare.com:80:127.0.0.1:{port}' "
                           "http://blog.cloudflare.com/")
@@ -478,7 +507,7 @@ class DnsBrackets(unittest.TestCase):
     HELPERS = re.compile(
         r"(engine_target\(\) \{\n.*?\ncampaign_fail\(\) \{\n.*?\n\}\n)", re.S)
     GOLDEN = re.compile(
-        r"(GUEST_DNS=10\.0\.2\.2[^\n]*\\\n[^\n]*engine_target golden\)[^\n]*)")
+        r'(GUEST_DNS="\$REPLAY_IP"[^\n]*\\\n[^\n]*\\\n[^\n]*engine_target golden\)[^\n]*)')
     URL_LINE = re.compile(r'^URLS="([^"]+)"$', re.M)
 
     # MAKE_DNS_QNAMES: the names the clone this sub-make stands for resolved,
@@ -1217,7 +1246,7 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
     def test_the_replay_server_is_started_with_a_listen_log_and_the_caller_s_listener_options(self):
         """#1159: the campaign keeps the replay's listener measurements beside
         its other logs, and CORPUS_SERVE_ARGS reaches the server's command line
-        word-split, so --backlog N and --tls-handshake-in-handler are two words.
+        word-split, so --backlog N and --tls-handshake-in-accept are two words.
 
         RED BEFORE THE CHANGE: the launch passed neither.
         """
@@ -2234,6 +2263,174 @@ while True:
         self.assertIn("--access-log", inner)
         self.assertIn('"$RESULTS/corpus-dns.log"', args)
         self.assertIn('"$RESULTS/corpus-access.log"', args)
+
+
+class ReplayAddressByNetworkMode(unittest.TestCase):
+    """Bridged and routed guests have no pasta gateway onto the host's loopback.
+
+    Red before the fix: the script had no NETMODE block, so replay_wiring
+    raised "the NETMODE block is gone", and every bridged or routed golden
+    baked 10.0.2.2, an address nothing on the host answered for those guests.
+    """
+
+    def test_each_mode_names_a_replay_address_its_guest_can_route_to(self):
+        self.assertEqual(
+            replay_wiring("rootless"),
+            {"NETMODE": "rootless", "REPLAY_IP": "10.0.2.2", "REPLAY_BIND": "127.0.0.1",
+             "REPLAY_BIND_URL": "127.0.0.1", "REPLAY_DEV": "", "REPLAY_QTYPE": "1",
+             "REPLAY_RR": "A", "FCVM_SUDO": ""})
+        self.assertEqual(
+            replay_wiring("bridged"),
+            {"NETMODE": "bridged", "REPLAY_IP": "192.168.53.2", "REPLAY_BIND": "192.168.53.2",
+             "REPLAY_BIND_URL": "192.168.53.2", "REPLAY_DEV": "fcvmreplay0",
+             "REPLAY_QTYPE": "1", "REPLAY_RR": "A", "FCVM_SUDO": "sudo"})
+        self.assertEqual(
+            replay_wiring("routed"),
+            {"NETMODE": "routed", "REPLAY_IP": "fd53::2", "REPLAY_BIND": "fd53::2",
+             "REPLAY_BIND_URL": "[fd53::2]", "REPLAY_DEV": "fcvmreplay0",
+             "REPLAY_QTYPE": "28", "REPLAY_RR": "AAAA", "FCVM_SUDO": "sudo"})
+
+    def test_an_unknown_mode_is_refused(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            replay_wiring("pasta")
+
+    def test_a_routed_bracket_counts_aaaa_answers_and_not_a_rows(self):
+        body = re.search(r"(replay_qnames_since\(\) \{\n.*?\n\})\n", campaign(), re.S)
+        self.assertIsNotNone(body, "replay_qnames_since is gone")
+        rows = [
+            {"qname": "example.com", "qtype": 28, "answer": "fd53::2"},
+            {"qname": "a.test", "qtype": 1, "answer": ""},
+            {"qname": "b.test", "qtype": 1, "answer": "fd53::2"},
+            {"qname": "c.test", "qtype": 28, "answer": "10.0.2.2"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "corpus-dns.log")
+            with open(log, "w") as handle:
+                handle.writelines(json.dumps(r) + "\n" for r in rows)
+            wiring = replay_wiring("routed")
+            script = (f"set -euo pipefail\n{body.group(1)}\n"
+                      f'replay_qnames_since "{log}" 0\n')
+            out = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                                 env={**os.environ, **wiring}, timeout=30, check=True).stdout
+        self.assertEqual(out.split(), ["example.com"])
+
+    def test_a_root_mode_refuses_a_fast_teardown_arm(self):
+        """A -fast arm SIGKILLs its clone, and in bridged or routed mode the
+        next fcvm launch then reclaims that clone's host-side network, so one
+        request's teardown lands in the next request's time (trial: no-render
+        median 307 ms after a -fast request, 185 ms after a normal teardown).
+
+        Red before the fix: the campaign accepted ARMS=cdp,cdp-fast,noop in
+        bridged mode and went on to build a golden."""
+        text = campaign()
+        head = text[:text.index('REPS="${REPS:-202}"')]
+        head = head[head.index('NETMODE="${NETMODE:-rootless}"'):]
+        for mode, arms, refused in (("bridged", "cdp,cdp-fast,noop", True),
+                                    ("routed", "cdp,html-fast,noop", True),
+                                    # reqbench.py strips the spaces and runs cdp-fast
+                                    ("bridged", "cdp-fast ,noop", True),
+                                    ("routed", "cdp, noop-fast", True),
+                                    ("bridged", "cdp,html,noop", False),
+                                    ("rootless", "cdp,cdp-fast,noop", False)):
+            script = f"set -euo pipefail\nENGINE=chromium\nNETMODE={mode}\nARMS='{arms}'\n{head}\necho ACCEPTED\n"
+            out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+            with self.subTest(mode=mode, arms=arms):
+                if refused:
+                    self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+                    self.assertIn("-fast arm", out.stderr)
+                else:
+                    self.assertIn("ACCEPTED", out.stdout, out.stderr)
+
+    def test_the_scale_run_is_refused_in_a_root_mode(self):
+        """Red before the fix: MEASURE=scale was accepted with NETMODE=bridged and
+        failed only after the golden and the diag, because the scale run's host
+        control renders through the replay on 127.0.0.1."""
+        text = campaign()
+        block = re.search(r'(MEASURE="\$\{MEASURE:-reqbench\}"\ncase "\$MEASURE" in\n.*?\nesac)', text, re.S)
+        self.assertIsNotNone(block, "the MEASURE block is gone")
+        for mode, refused in (("bridged", True), ("routed", True), ("rootless", False)):
+            script = (f"set -euo pipefail\nNETMODE={mode}\nENGINE=chromium\nBACKEND=uffd\n"
+                      f"MEASURE=scale\n{block.group(1)}\necho ACCEPTED\n")
+            out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+            with self.subTest(mode=mode):
+                if refused:
+                    self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+                    self.assertIn("rootless only", out.stderr)
+                else:
+                    self.assertIn("ACCEPTED", out.stdout, out.stderr)
+
+    def test_a_replay_device_another_campaign_holds_is_not_removed(self):
+        """Red before the fix: replay_dev_up deleted any fcvmreplay0 it found,
+        including one a running campaign had just created. The campaign now
+        holds REPLAY_LOCK for its lifetime: a second one refuses while it is
+        held, and with the lock free a device left behind is replaced."""
+        body = re.search(r"(replay_dev_up\(\) \{\n.*?\n\})\n", campaign(), re.S)
+        self.assertIsNotNone(body, "replay_dev_up is gone")
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = os.path.join(tmp, "calls")
+            lock = os.path.join(tmp, "replay.lock")
+            for name, script in (
+                ("sudo", '#!/bin/bash\n[ "$1" = -n ] && shift\nexec "$@"\n'),
+                ("ip", f'#!/bin/bash\necho "ip $*" >> {calls}\nexit 0\n'),
+            ):
+                path = os.path.join(tmp, name)
+                with open(path, "w") as handle:
+                    handle.write(script)
+                os.chmod(path, 0o755)
+            env = {**os.environ, **replay_wiring("bridged"), "REPLAY_LOCK": lock,
+                   "PATH": f"{tmp}:{os.environ['PATH']}"}
+            script = (f"set -uo pipefail\nsay() {{ :; }}\nREPLAY_DEV_CREATED=no\n"
+                      f"REPLAY_LOCK=\"$REPLAY_LOCK\"\n{body.group(1)}\nreplay_dev_up; echo rc=$?\n")
+            # One process from the lock to the kill: `flock lock sleep` would
+            # leave its sleep child holding the descriptor after the kill.
+            holder = subprocess.Popen(["sh", "-c", f"exec 9>>'{lock}'; flock 9; echo held; exec sleep 30"],
+                                      stdout=subprocess.PIPE, text=True)
+            self.addCleanup(holder.kill)
+            self.assertEqual(holder.stdout.readline().strip(), "held", "the holder never took the lock")
+            held = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30, env=env)
+            self.assertIn("rc=1", held.stdout, held.stderr)
+            self.assertIn("another campaign holds", held.stderr)
+            self.assertNotIn("ip link del", read_if_exists(calls), "a live campaign's device was removed")
+            holder.kill()
+            holder.wait()
+            free = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30, env=env)
+            self.assertIn("rc=0", free.stdout, free.stderr)
+            self.assertIn("ip link del fcvmreplay0", read_if_exists(calls), "a device left behind was not replaced")
+
+    def test_the_dns_sampler_does_not_hold_the_replay_device_lock(self):
+        """Red before the fix: the sampler subshell inherited REPLAY_LOCK_FD, so
+        a sampler left running by a SIGKILLed campaign kept the lock and every
+        later root-mode campaign refused to start."""
+        text = campaign()
+        # The shipped loop and starter; one sample that always succeeds, so the
+        # sampler stays alive to be inspected.
+        funcs = "dns_owner_sample() { :; }\n" + "".join(
+            re.search(rf"({name}\(\) \{{\n.*?\n\}})\n", text, re.S).group(1) + "\n"
+            for name in ("dns_owner_sampler", "start_dns_sampler"))
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = os.path.join(tmp, "replay.lock")
+            results = os.path.join(tmp, "results")
+            os.makedirs(results)
+            script = (f"set -uo pipefail\nRESULTS={results}\nDNS_SAMPLE_INTERVAL=30\nREPLAY_BIND_URL=127.0.0.1\n"
+                      f"SAMPLER_PID=\nSAMPLER_ALIVE_AT_STOP=\n{funcs}"
+                      f"exec {{REPLAY_LOCK_FD}}>>'{lock}'\nflock -n $REPLAY_LOCK_FD\nstart_dns_sampler >/dev/null 2>&1\n"
+                      "sleep 0.5\n[ -d /proc/$SAMPLER_PID ] && echo alive\n"
+                      "fds=$(ls -l /proc/$SAMPLER_PID/fd/) || { echo LS-FAILED; exit 1; }\n"
+                      "grep -c 'replay.lock' <<<\"$fds\"\npkill -P $SAMPLER_PID; kill $SAMPLER_PID\n")
+            out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+            lines = out.stdout.strip().splitlines()
+            self.assertIn("alive", lines, "the sampler did not stay up; the check is vacuous" + out.stderr)
+            self.assertNotIn("LS-FAILED", lines, "the sampler's descriptors could not be listed")
+            self.assertEqual(lines[-1], "0", "the sampler holds the replay device lock" + out.stderr)
+
+    def test_every_root_phase_runs_fcvm_under_sudo_in_the_mode(self):
+        """A bridged or routed fcvm needs root, and reqbench runs it as root only
+        through SUDO; every sub-make that drives a clone must carry both."""
+        text = campaign()
+        for phase in ("golden", "verify", "diag", "run"):
+            call = re.search(r'NETMODE="\$NETMODE" SUDO="\$FCVM_SUDO"[^\n]*\\\n'
+                             r'(?:[^\n]*\\\n)*[^\n]*engine_target ' + phase + r'\)', text)
+            self.assertIsNotNone(call, f"the {phase} sub-make does not carry NETMODE and SUDO")
 
 
 class DiagPhase(unittest.TestCase):

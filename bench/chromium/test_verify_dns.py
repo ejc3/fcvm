@@ -74,7 +74,7 @@ PY
         "--vm cat /etc/resolv.conf") printf '%b' "$STUB_RESOLV_VM"; exit "${STUB_RESOLV_RC:-0}" ;;
         "-c cat /etc/resolv.conf") printf '%b' "$STUB_RESOLV_CONTAINER"; exit "${STUB_RESOLV_RC:-0}" ;;
         "-c python3 /opt/bench/"*) exit 0 ;;
-        "-c python3 -c "*gethostbyname*) echo "$STUB_ANSWER" ;;
+        "-c python3 -c "*getaddrinfo*) echo "$STUB_ANSWER" ;;
         "-c python3 -c "*urllib*)
             # $1=python3 $2=-c $3=<probe text> $4=<url>. With STUB_RUN_URL_PROBE
             # the shipped probe text runs for real, under the proxy variables
@@ -347,7 +347,7 @@ class VerifyDnsHop(unittest.TestCase):
                           "HOP D never read the container's resolv.conf")
             for host in HOSTS.split(","):
                 self.assertTrue(
-                    any("gethostbyname" in line and line.endswith(" " + host)
+                    any("getaddrinfo" in line and line.endswith(" " + host)
                         for line in execs),
                     f"HOP D never resolved {host} inside the container:\n"
                     + "\n".join(execs))
@@ -392,7 +392,7 @@ class VerifyDnsHop(unittest.TestCase):
             evidence = self._evidence(env)
             self.assertIs(evidence["passed"], False)
             self.assertIsNone(evidence["dns_server"])
-            self.assertNotIn("gethostbyname", read_if_exists(env["STUB_EXEC_LOG"]),
+            self.assertNotIn("getaddrinfo", read_if_exists(env["STUB_EXEC_LOG"]),
                              "HOP D resolved hosts with no resolver to hold them to")
 
     def test_no_hosts_records_the_resolver_and_passes(self):
@@ -492,6 +492,56 @@ class VerifyDnsHop(unittest.TestCase):
                 "a blocked hop wrote evidence for checks it never ran")
             self.assertEqual(os.listdir(state_dir), [],
                              "a blocked HOP D skipped the clone teardown")
+
+
+class ResolverProbe(unittest.TestCase):
+    """HOP D's in-container resolver probe, the shipped text run for real.
+
+    A routed guest's replay answers AAAA with an IPv6 address and leaves A
+    empty. Red before the fix: the probe was socket.gethostbyname, which asks
+    for IPv4 only, so a name with an AAAA answer alone raised gaierror and
+    every routed bracket failed; and a resolver answering both families
+    passed on the A record alone.
+    """
+
+    def _probe(self):
+        import re
+        with open(SH) as handle:
+            text = handle.read()
+        match = re.search(r"python3 -c \\\n\s*'(import socket,sys;[^']*)'", text)
+        self.assertIsNotNone(match, "HOP D's resolver probe is gone from reqbench.sh")
+        return match.group(1)
+
+    def _run(self, addresses):
+        prelude = (
+            "import socket\n"
+            f"ADDRS = {addresses!r}\n"
+            "def fake(host, port, family=0, type=0, proto=0, flags=0):\n"
+            "    out = []\n"
+            "    for a in ADDRS:\n"
+            "        fam = socket.AF_INET6 if ':' in a else socket.AF_INET\n"
+            "        sa = (a, 0, 0, 0) if fam == socket.AF_INET6 else (a, 0)\n"
+            "        if family in (0, fam): out.append((fam, socket.SOCK_STREAM, 6, '', sa))\n"
+            "    if not out: raise socket.gaierror(-5, 'No address associated with hostname')\n"
+            "    return out\n"
+            "socket.getaddrinfo = fake\n"
+            "socket.gethostbyname = lambda h: fake(h, None, socket.AF_INET)[0][4][0]\n"
+        )
+        return subprocess.run([sys.executable, "-c", prelude + self._probe(), "example.com"],
+                              capture_output=True, text=True, timeout=30)
+
+    def test_an_aaaa_only_answer_is_printed(self):
+        result = self._run(["fd53::2"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "fd53::2")
+
+    def test_an_a_answer_is_printed_as_before(self):
+        result = self._run(["10.0.2.2"])
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "10.0.2.2"))
+
+    def test_both_families_are_printed_so_a_second_address_fails_the_bracket(self):
+        result = self._run(["10.0.2.2", "fd53::2"])
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "10.0.2.2,fd53::2"))
 
 
 class GoldenGuestDns(unittest.TestCase):
