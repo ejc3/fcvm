@@ -216,6 +216,7 @@ fn forgetting_a_rate_limit_keeps_the_version() {
             at: 2,
             viewer: "v".into(),
             client: Some("192.0.2.7".into()),
+            returning: false,
         },
     );
     s = apply(
@@ -1182,4 +1183,42 @@ fn taps_reach_only_the_holders_phone_with_robot_park_in_front() {
         .map(|a| a.action.as_str())
         .collect();
     assert_eq!(left, vec!["wave"]);
+}
+
+/// A borrowed phone holds the fleet awake past `sleep_without_new_viewer_secs`, as a claimed
+/// wall GPU does; once the loan ends the fleet sleeps at once, with its viewer still there.
+#[test]
+fn a_borrowed_phone_holds_the_fleet_awake_past_the_arrival_limit() {
+    let mut s = State::new(
+        config_with(serde_json::json!({
+            "power_managed": true, "sleep_without_new_viewer_secs": 100,
+            "phone_claim_secs": 120, "max_tiles": 1
+        })),
+        0,
+    );
+    for e in events(serde_json::json!([
+        {"type": "agent", "at": 1000, "host": "h1", "msg": {"type": "hello", "host": "h1", "arch": "x86_64",
+            "gpus": [{"sbdf": "0000:01:00.0", "name": "Tesla T4"}], "capacity": 2,
+            "phones": [{"sbdf": "0000:02:00.0", "name": "Tesla T4"}], "phone_actions": ["rotate"]}},
+        {"type": "agent", "at": 2000, "host": "h1", "msg": {"type": "slot", "id": "slot-1", "phase": "running",
+            "generation": 1, "vm": "fleet-slot-1", "frame_url": "ws://h1:20001/frames", "timings": {}}},
+        {"type": "agent", "at": 2000, "host": "h1", "msg": {"type": "slot", "id": "phone-1", "phase": "running",
+            "generation": 1, "vm": "fleet-phone-1", "frame_url": "ws://h1:20101/frames", "timings": {}}},
+        {"type": "viewer_joined", "at": 2500, "viewer": "v1", "client": "198.51.100.20"},
+        {"type": "intent", "at": 90_000, "id": "c1", "name": "claim_phone", "viewer": "v1",
+            "client": "198.51.100.20", "args": {"phone": "phone-1"}},
+    ])) {
+        s = apply(s, &e);
+    }
+    assert_eq!(
+        s.receipts["c1"].outcome,
+        fleet_core::state::Outcome::Committed
+    );
+    // The limit ran out at 102.5 s; the loan lasts until 210 s.
+    s = apply(s, &Event::Tick { at: 150_000 });
+    assert_eq!(s.fleet.power.state, "awake", "the loan holds it");
+    s = apply(s, &Event::Tick { at: 210_000 });
+    assert_eq!(s.fleet.power.state, "asleep", "the loan ended");
+    assert_eq!(s.fleet.power.asleep_since, Some(210_000));
+    assert_eq!(view(&s).viewers.active, 1);
 }

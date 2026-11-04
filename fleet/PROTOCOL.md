@@ -55,8 +55,11 @@ connection admitted while fewer than `capacity` seats are held gets a `seat` tic
 with every seat held is late: `locked`, `seat` and `direct` null, `reason` the sentence the
 page shows, and `seat_free` true once a new connection would be seated (the page offers a
 reload; a late connection is never promoted). A page sends `{"type": "seat", "ticket":
-"<ticket>"}` (`null` without one) as its first message, so one that reconnects keeps its seat
-if the ticket's connection closed less than 60 s before. The coordinator waits up to 2 s for
+"<ticket>", "returning": false}` (`null` without one) as its first message, so one that reconnects keeps its seat
+if the ticket's connection closed less than 60 s before. `returning` is true when the page
+had a connection open before (a reconnect, also of a late page, which keeps no ticket). A
+first message with a ticket or `returning` true is a reconnect, not an arrival
+(`fleet.power`); the viewer joins once the first message is read. The coordinator waits up to 2 s for
 that first message; any other first message is admitted without a ticket and handled as
 usual. A ticket is never read from the URL, which proxies and access logs keep. `broadcast` is the playback URL (signed for a private channel, bound to the page's
 `Origin` and valid for an hour), null without a broadcast or, on a private channel, for a
@@ -162,6 +165,7 @@ Intents:
 | `release_phone` | `{"claim": "phone-claim-3"}` (or `{}`) | gives your phone back early; it is restored from its snapshot for the next viewer |
 | `phone_action` | `{"action": "rotate", "claim": "phone-claim-3"}` (`claim` optional), or `{"action": "tap", "x": 0.25, "y": 0.9}` | one of the fixed take-over actions on your borrowed phone, or a tap on its screen while Robot Park is in front; see "Phones mode" |
 | `phones_zoom` | `{"out": true}` or `{"out": false}` | zooms every viewer's phones out (each phone shows its app's bars) or back in; one change every 2 s per client; see "Phones mode" |
+| `wake` | `{}` | an arrival (`fleet.power`): wakes a sleeping fleet and starts `--sleep-without-new-viewer` again; the page's Wake button sends it. Refused when the fleet does not sleep |
 
 There is no intent to move the wall's camera, set its time of day, relaunch every tile
 on a viewer's schedule, or change the race cadence: the director and the owner's
@@ -322,6 +326,7 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   "fleet": {"hosts": [{"name", "arch", "gpus": [{"sbdf", "name"}], "draining"}], "gpus": 8, "fcvm_gpus": 8,
             "ec2_instances": 0, "n": 8, "max_tiles": 100, "standby": ["slot-9"], "standby_ready": 1,
             "power": {"state": "waking", "idle_since": null, "asleep_since": null, "woke_at": 1761134400000,
+                      "last_arrival_at": 1761134400000, "sleep_without_arrival_at": 1761138000000,
                       "hosts": [{"host": "i-0123456789abcdef0",
                                  "phases": [{"phase": "instance_pending", "at": 1761134401000},
                                             {"phase": "booted", "at": 1761134446000},
@@ -446,15 +451,31 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
 - `fleet.power` is whether the GPU capacity is up, when the coordinator launches the GPU
   hosts (`--host-template`), or with `--sleep-when-idle` on hosts it does not launch (a
   fixed host, a test box); without either it stays `awake`. After
-  `--idle-scale-down` seconds (default 600) with no active viewer (`viewers.active`), and
-  never while a claim is active or a race is running, the fleet goes `asleep`
-  (`asleep_since`): every GPU host is terminated, nothing is placed (every fcvm
+  `--idle-scale-down` seconds (default 600) with no active viewer (`viewers.active`), or
+  after `--sleep-without-new-viewer` seconds (default 3600, 0 never) with no arrival, even
+  while viewers stay connected and visible, and never while a claim (a wall GPU or a phone)
+  is active or a race is running, the fleet goes `asleep` (`asleep_since`). A claim or race
+  that outlasts either limit holds the fleet awake until it ends, and it sleeps then. An
+  arrival is a new viewer connection (one whose first message carries no seat ticket and
+  not `returning`, see `admission`) or a connected page's `wake` intent. A page that
+  reconnects after a network blip or reloads in the same tab sends its ticket and is not an
+  arrival; neither is a page turning visible again. A reconnect after the ticket's 60 s
+  grace still carries the ticket, so it is not an arrival either. A tab whose storage is
+  blocked or that was late (no ticket) reconnects as `returning`, but after a reload it
+  cannot be told from a new viewer and counts as one. `last_arrival_at` is the last arrival
+  and `sleep_without_arrival_at` when the limit runs out (null without power management or
+  with the limit off). A coordinator that starts with no arrival on record counts from its
+  start, and a restart keeps the stored one, since the pages that reconnect to it are not
+  arrivals. Asleep: every GPU host is terminated, nothing is placed (every fcvm
   GPU still connected goes to standby, so its VM stops; the EC2 half's instances are
   terminated), no race is scheduled (`next_race_at` null) and
   `restart_now` is refused. Hosts that leave then are not reclaimed. When an active viewer
-  arrives it is `waking` from `woke_at`, the moment the wake began: every host region gets
-  `--awake-capacity` hosts again (default 1) and the EC2 half launches its `--ec2-tiles`
-  tiles. `hosts` lists each GPU host by EC2 instance id with the phases it has reached, in
+  is there and the last arrival is within the limit (a new viewer arrived, a page sent
+  `wake`, or a hidden page turned visible again before the limit ran out) it is `waking`
+  from `woke_at`, the moment the wake began: every host region gets `--awake-capacity` hosts
+  again (default 1) and the EC2 half launches its `--ec2-tiles` tiles. Connected pages alone
+  never wake a fleet whose limit has run out: the page shows the sleep card with a Wake
+  button, which sends `wake`. `hosts` lists each GPU host by EC2 instance id with the phases it has reached, in
   order: `instance_pending` and `booted` from EC2 (pending, then running),
   `store_ready` when the host marked its store mounted (the agent's hello reports it; the
   phase is absent when the host does not mark it), `agent_connected` when its agent says
@@ -539,7 +560,8 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--trust-cf-connecting-ip] [--turnstile-secret <secret> --turnstile-site-key <key>]
                  [--admin-listen <addr:port>] [--ffmpeg ffmpeg]
                  [--host-template <region>:<template>... --host-subnet <region>:<subnet id>...]
-                 [--awake-capacity 1] [--host-on-demand-max 8] [--idle-scale-down 600] [--history-idle 60]
+                 [--awake-capacity 1] [--host-on-demand-max 8] [--idle-scale-down 600]
+                 [--sleep-without-new-viewer 3600] [--history-idle 60]
                  [--state-bucket <bucket> [--state-key state.json] [--state-region <region>]]
                  [--ec2 aws --ec2-tiles 8 --ec2-regions <r1,r2,...> [--ec2-template fcvm-fleet-tile-x86_64]
                   [--ec2-on-demand-template <name>] [--fleet-name stage]

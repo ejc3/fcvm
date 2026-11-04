@@ -21,6 +21,7 @@ fn joined(at: u64, viewer: &str) -> Event {
         at,
         viewer: viewer.into(),
         client: Some(format!("198.51.100.{}", viewer.len())),
+        returning: false,
     }
 }
 
@@ -228,6 +229,7 @@ fn a_system_word_never_pushes_a_viewer_word_out_of_the_sky() {
                 at: 1_000,
                 viewer: format!("viewer-{i}"),
                 client: Some(format!("198.51.100.{}", i + 1)),
+                returning: false,
             },
         );
     }

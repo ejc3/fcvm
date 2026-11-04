@@ -240,13 +240,6 @@ pub const LATE_CLAIM: &str = "direct streams are full, so this page watches the 
 
 async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
     let viewer = format!("v-{}", app.next_viewer.fetch_add(1, Ordering::Relaxed));
-    app.handle
-        .send(Event::ViewerJoined {
-            at: 0,
-            viewer: viewer.clone(),
-            client: Some(client.clone()),
-        })
-        .await;
     let (mut sink, mut stream) = socket.split();
     // Tell the viewer who it is before anything else, so it can find its own actions.
     if sink
@@ -265,31 +258,39 @@ async fn viewer(socket: WebSocket, app: App, client: String, page: Page) {
         .await
         .is_err()
     {
-        app.handle
-            .send(Event::ViewerLeft {
-                at: 0,
-                viewer: viewer.clone(),
-            })
-            .await;
         return;
     }
     // Then how it receives the image. A seat ticket comes in the first message; any other
     // first message is handled below like the ones after it.
     let mut pending: Option<Message> = None;
-    let seat = match tokio::time::timeout(SEAT_WAIT, stream.next()).await {
+    let (seat, returning) = match tokio::time::timeout(SEAT_WAIT, stream.next()).await {
         Ok(Some(Ok(Message::Text(t)))) => match serde_json::from_str::<ClientMsg>(&t) {
-            Ok(ClientMsg::Seat { ticket }) => ticket,
+            Ok(ClientMsg::Seat { ticket, returning }) => {
+                let returning = returning || ticket.is_some();
+                (ticket, returning)
+            }
             _ => {
                 pending = Some(Message::Text(t));
-                None
+                (None, false)
             }
         },
         Ok(Some(Ok(m))) => {
             pending = Some(m);
-            None
+            (None, false)
         }
-        _ => None,
+        _ => (None, false),
     };
+    // A page that kept a ticket, or says it connected before, is reconnecting: it joins
+    // without counting as an arrival (PROTOCOL.md, `fleet.power`). Nothing it sends is
+    // applied before this.
+    app.handle
+        .send(Event::ViewerJoined {
+            at: 0,
+            viewer: viewer.clone(),
+            client: Some(client.clone()),
+            returning,
+        })
+        .await;
     // A seat is held from here until the connection ends.
     let gate = app.cfg.gate.clone();
     let admitted = gate.seats.admit(seat.as_deref(), std::time::Instant::now());

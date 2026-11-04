@@ -371,7 +371,9 @@
         "asleep_since": 70000,
         "hosts": [],
         "idle_since": 9000,
+        "last_arrival_at": 8000,
         "last_wake": null,
+        "sleep_without_arrival_at": 3608000,
         "state": "asleep",
         "wakes": [],
         "woke_at": null

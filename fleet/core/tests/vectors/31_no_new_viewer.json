@@ -1,0 +1,816 @@
+{
+  "config": {
+    "claim_secs": 120,
+    "idle_scale_down_secs": 60,
+    "max_tiles": 2,
+    "power_managed": true,
+    "restart_cooldown_secs": 1,
+    "sleep_without_new_viewer_secs": 1000
+  },
+  "description": "With power management, the fleet also sleeps once no viewer has arrived for sleep_without_new_viewer_secs, even while viewers stay connected and visible. An arrival is a new viewer connection or a connected page's wake intent; a page that rejoins as returning (it kept a seat ticket, or said it connected before) is not one, and neither is a page turning visible again. Asleep with the limit run out, connected pages do not wake the fleet; a wake intent does, and so does a new viewer, each starting the limit again. A claim or a race in progress holds the fleet awake past the limit; it sleeps as soon as the hold ends.",
+  "events": [
+    {
+      "at": 1000,
+      "host": "h1",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 8,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:02:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:03:00.0"
+          }
+        ],
+        "host": "h1",
+        "type": "hello"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20001/frames",
+        "generation": 1,
+        "id": "slot-1",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-1"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20002/frames",
+        "generation": 1,
+        "id": "slot-2",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-2"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20003/frames",
+        "generation": 1,
+        "id": "slot-3",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-3"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 5000,
+      "client": "198.51.100.31",
+      "type": "viewer_joined",
+      "viewer": "v1"
+    },
+    {
+      "at": 600000,
+      "client": "198.51.100.32",
+      "returning": true,
+      "type": "viewer_joined",
+      "viewer": "v2"
+    },
+    {
+      "at": 1004999,
+      "type": "tick"
+    },
+    {
+      "at": 1005000,
+      "type": "tick"
+    },
+    {
+      "at": 1010000,
+      "type": "visibility",
+      "viewer": "v2",
+      "visible": false
+    },
+    {
+      "at": 1020000,
+      "type": "visibility",
+      "viewer": "v2",
+      "visible": true
+    },
+    {
+      "at": 1030000,
+      "client": "198.51.100.33",
+      "returning": true,
+      "type": "viewer_joined",
+      "viewer": "v3"
+    },
+    {
+      "args": {},
+      "at": 1040000,
+      "client": "198.51.100.31",
+      "id": "w1",
+      "name": "wake",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "at": 1041000,
+      "type": "tick"
+    },
+    {
+      "args": {},
+      "at": 2000000,
+      "client": "198.51.100.31",
+      "id": "c1",
+      "name": "claim_gpu",
+      "secret": "token-a",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "at": 2040000,
+      "type": "tick"
+    },
+    {
+      "at": 2119999,
+      "type": "tick"
+    },
+    {
+      "at": 2120000,
+      "type": "tick"
+    },
+    {
+      "at": 2200000,
+      "client": "198.51.100.34",
+      "type": "viewer_joined",
+      "viewer": "v4"
+    },
+    {
+      "at": 2201000,
+      "type": "tick"
+    },
+    {
+      "args": {},
+      "at": 3190000,
+      "client": "198.51.100.34",
+      "id": "r1",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v4"
+    },
+    {
+      "at": 3200000,
+      "type": "tick"
+    },
+    {
+      "at": 3205000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20001/frames",
+        "generation": 2,
+        "id": "slot-1",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-1"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 3205000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20002/frames",
+        "generation": 2,
+        "id": "slot-2",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-2"
+      },
+      "type": "agent"
+    }
+  ],
+  "expect": [
+    {
+      "after": 3,
+      "checks": {
+        "/view/fleet/power/last_arrival_at": 0,
+        "/view/fleet/power/sleep_without_arrival_at": 1000000,
+        "/view/fleet/power/state": "awake"
+      },
+      "note": "a new state counts from the coordinator's start"
+    },
+    {
+      "after": 4,
+      "checks": {
+        "/view/fleet/power/last_arrival_at": 5000,
+        "/view/fleet/power/sleep_without_arrival_at": 1005000
+      },
+      "note": "a new viewer is an arrival"
+    },
+    {
+      "after": 5,
+      "checks": {
+        "/view/fleet/power/last_arrival_at": 5000,
+        "/view/viewers/active": 2
+      },
+      "note": "a returning page is not"
+    },
+    {
+      "after": 6,
+      "checks": {
+        "/view/fleet/power/state": "awake"
+      }
+    },
+    {
+      "after": 7,
+      "checks": {
+        "/view/fleet/power/asleep_since": 1005000,
+        "/view/fleet/power/state": "asleep",
+        "/view/tiles": [],
+        "/view/viewers/active": 2
+      },
+      "note": "asleep with two active viewers"
+    },
+    {
+      "after": 9,
+      "checks": {
+        "/view/fleet/power/state": "asleep"
+      },
+      "note": "a page turning visible again is not an arrival"
+    },
+    {
+      "after": 10,
+      "checks": {
+        "/view/fleet/power/last_arrival_at": 5000,
+        "/view/fleet/power/state": "asleep"
+      }
+    },
+    {
+      "after": 11,
+      "checks": {
+        "/receipts/w1/outcome": "committed",
+        "/view/fleet/power/last_arrival_at": 1040000,
+        "/view/fleet/power/sleep_without_arrival_at": 2040000,
+        "/view/fleet/power/state": "waking",
+        "/view/fleet/power/woke_at": 1040000
+      },
+      "note": "an explicit wake from a connected page"
+    },
+    {
+      "after": 12,
+      "checks": {
+        "/view/fleet/power/state": "awake"
+      }
+    },
+    {
+      "after": 14,
+      "checks": {
+        "/view/claims/0/slot": "slot-3",
+        "/view/fleet/power/state": "awake"
+      },
+      "note": "the claim holds it past the limit"
+    },
+    {
+      "after": 15,
+      "checks": {
+        "/view/fleet/power/state": "awake"
+      }
+    },
+    {
+      "after": 16,
+      "checks": {
+        "/view/claims": [],
+        "/view/fleet/power/asleep_since": 2120000,
+        "/view/fleet/power/state": "asleep"
+      },
+      "note": "the claim ended: asleep at once"
+    },
+    {
+      "after": 17,
+      "checks": {
+        "/view/fleet/power/last_arrival_at": 2200000,
+        "/view/fleet/power/sleep_without_arrival_at": 3200000,
+        "/view/fleet/power/state": "waking"
+      },
+      "note": "a new viewer wakes it"
+    },
+    {
+      "after": 18,
+      "checks": {
+        "/view/fleet/power/state": "awake"
+      }
+    },
+    {
+      "after": 20,
+      "checks": {
+        "/view/fleet/power/state": "awake",
+        "/view/relaunch_all/fcvm_done_at": null
+      },
+      "note": "the race holds it past the limit"
+    },
+    {
+      "after": 22,
+      "checks": {
+        "/view/fleet/power/asleep_since": 3205000,
+        "/view/fleet/power/state": "asleep"
+      },
+      "note": "the race ended: asleep at once"
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "args": {},
+        "at": 1040000,
+        "id": "w1",
+        "name": "wake",
+        "outcome": "committed",
+        "summary": "wake",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 2000000,
+        "id": "c1",
+        "name": "claim_gpu",
+        "outcome": "committed",
+        "summary": "claim-1 on slot-3",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 3190000,
+        "id": "r1",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 1",
+        "viewer": "v4"
+      }
+    ],
+    "aggregates": [],
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "budget": null,
+    "budget_from_t": null,
+    "claims": [],
+    "cooldown_until": 3191000,
+    "counters": {
+      "restores": 3,
+      "restores_last_hour": 3,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
+    "failures": [],
+    "fleet": {
+      "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
+      "fcvm_gpus": 3,
+      "gpus": 3,
+      "hosts": [
+        {
+          "arch": "x86_64",
+          "draining": false,
+          "gpus": [
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:01:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:02:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:03:00.0"
+            }
+          ],
+          "name": "h1"
+        }
+      ],
+      "max_tiles": 2,
+      "n": 0,
+      "power": {
+        "asleep_since": 3205000,
+        "hosts": [],
+        "idle_since": null,
+        "last_arrival_at": 2200000,
+        "last_wake": {
+          "awake_at": 2201000,
+          "gpus": 2,
+          "ms": 1000,
+          "started_at": 2200000
+        },
+        "sleep_without_arrival_at": 3200000,
+        "state": "asleep",
+        "wakes": [
+          {
+            "awake_at": 1041000,
+            "gpus": 2,
+            "ms": 1000,
+            "started_at": 1040000
+          },
+          {
+            "awake_at": 2201000,
+            "gpus": 2,
+            "ms": 1000,
+            "started_at": 2200000
+          }
+        ],
+        "woke_at": null
+      },
+      "standby": [
+        "slot-1",
+        "slot-2",
+        "slot-3"
+      ],
+      "standby_ready": 0,
+      "warming": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": null,
+      "from_frame": 96195,
+      "from_t": 3206.5,
+      "generation": 6
+    },
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": null,
+      "closes_at": 2298999,
+      "holding": "cloud-climb",
+      "holding_label": "Up through the clouds",
+      "leading": "lake-skim",
+      "next": null,
+      "next_hold_at": 2300999,
+      "next_label": null,
+      "opened_at": 3200000,
+      "targets": [
+        {
+          "arrive_at": 2322999,
+          "id": "lake-skim",
+          "label": "Low over the western lakes",
+          "votes": 0
+        },
+        {
+          "arrive_at": 2317999,
+          "id": "peak-lake",
+          "label": "The peak over the lake",
+          "votes": 0
+        },
+        {
+          "arrive_at": 2322999,
+          "id": "western-sea",
+          "label": "Over the western sea",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [
+      {
+        "by": "viewer:v4",
+        "ec2": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 0,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "fcvm": {
+          "capacity_wait_ms": 0,
+          "done_at": 3205000,
+          "dropped": 0,
+          "last": "slot-2",
+          "sitting_out": [],
+          "tiles": {
+            "slot-1": {
+              "capacity_wait_ms": 0,
+              "first_frame_at": 3205000,
+              "generation": 2,
+              "phases": {},
+              "tile": "fcvm:1",
+              "waiting_since": null
+            },
+            "slot-2": {
+              "capacity_wait_ms": 0,
+              "first_frame_at": 3205000,
+              "generation": 2,
+              "phases": {},
+              "tile": "fcvm:2",
+              "waiting_since": null
+            }
+          },
+          "time_ms": 15000
+        },
+        "id": 1,
+        "started_at": 3190000
+      }
+    ],
+    "relaunch_all": {
+      "by": "viewer:v4",
+      "ec2_capacity_wait_ms": 0,
+      "ec2_done_at": 3190000,
+      "ec2_gpus": 0,
+      "ec2_ms": null,
+      "ec2_pending": 0,
+      "ec2_waiting_since": null,
+      "fcvm_done_at": 3205000,
+      "fcvm_gpus": 2,
+      "fcvm_ms": 15000,
+      "fcvm_pending": 0,
+      "race": 1,
+      "started_at": 3190000
+    },
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 69.755754,
+          "look": [
+            -51.984731,
+            3.56027,
+            -141.301082
+          ],
+          "pos": [
+            -43.535272,
+            2.5,
+            -127.891815
+          ],
+          "t": 2285.999
+        },
+        {
+          "fov_deg": 67.58343,
+          "look": [
+            -56.042314,
+            3.818563,
+            -136.517086
+          ],
+          "pos": [
+            -44.575009,
+            2.485131,
+            -124.365684
+          ],
+          "t": 2286.999
+        },
+        {
+          "fov_deg": 65.094051,
+          "look": [
+            -58.798889,
+            4.057956,
+            -131.843876
+          ],
+          "pos": [
+            -45.024786,
+            2.487302,
+            -121.213461
+          ],
+          "t": 2287.999
+        },
+        {
+          "fov_deg": 62.944129,
+          "look": [
+            -60.274593,
+            4.347895,
+            -128.274595
+          ],
+          "pos": [
+            -45.068707,
+            2.610368,
+            -118.90644
+          ],
+          "t": 2288.999
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -60.699843,
+            4.6,
+            -126.860866
+          ],
+          "pos": [
+            -45.0,
+            2.8,
+            -118.0
+          ],
+          "t": 2289.999
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -60.973075,
+            4.6,
+            -126.358281
+          ],
+          "pos": [
+            -45.0,
+            3.018182,
+            -118.0
+          ],
+          "t": 2290.999
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -61.230225,
+            4.6,
+            -125.84728
+          ],
+          "pos": [
+            -45.0,
+            3.236364,
+            -118.0
+          ],
+          "t": 2291.999
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -61.471031,
+            4.6,
+            -125.328378
+          ],
+          "pos": [
+            -45.0,
+            3.454545,
+            -118.0
+          ],
+          "t": 2292.999
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -61.695253,
+            4.6,
+            -124.802097
+          ],
+          "pos": [
+            -45.0,
+            3.672727,
+            -118.0
+          ],
+          "t": 2293.999
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -61.902664,
+            4.6,
+            -124.268966
+          ],
+          "pos": [
+            -45.0,
+            3.890909,
+            -118.0
+          ],
+          "t": 2294.999
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -62.093056,
+            4.6,
+            -123.729523
+          ],
+          "pos": [
+            -45.0,
+            4.109091,
+            -118.0
+          ],
+          "t": 2295.999
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -62.266236,
+            4.6,
+            -123.184311
+          ],
+          "pos": [
+            -45.0,
+            4.327273,
+            -118.0
+          ],
+          "t": 2296.999
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -62.422031,
+            4.6,
+            -122.633879
+          ],
+          "pos": [
+            -45.0,
+            4.545455,
+            -118.0
+          ],
+          "t": 2297.999
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -62.560283,
+            4.6,
+            -122.078781
+          ],
+          "pos": [
+            -45.0,
+            4.763636,
+            -118.0
+          ],
+          "t": 2298.999
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -62.680854,
+            4.6,
+            -121.519576
+          ],
+          "pos": [
+            -45.0,
+            4.981818,
+            -118.0
+          ],
+          "t": 2299.999
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -62.783621,
+            4.6,
+            -120.956827
+          ],
+          "pos": [
+            -45.0,
+            5.2,
+            -118.0
+          ],
+          "t": 2300.999
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -62.877451,
+            4.6,
+            -120.392495
+          ],
+          "pos": [
+            -45.0,
+            5.418182,
+            -118.0
+          ],
+          "t": 2301.999
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.265,
+      "weather": [
+        {
+          "cover": 0.55,
+          "rays": 1.0,
+          "snow_line_km": 1.7736,
+          "t": 2289.999,
+          "towers": 0.0
+        }
+      ],
+      "words": []
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": {
+        "last_capacity_wait_ms": 0,
+        "last_ms": 15000,
+        "last_race": 1,
+        "measured_on": 2,
+        "median_ms": 15000,
+        "races": 1
+      }
+    },
+    "tiles": [],
+    "viewers": {
+      "active": 4,
+      "count": 4
+    }
+  }
+}

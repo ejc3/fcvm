@@ -129,6 +129,7 @@ async fn shutdown_at_final_version(
             at: 0,
             viewer: "v-final".into(),
             client: None,
+            returning: false,
         })
         .await;
     assert!(join.is_none(), "a join carries no receipt");
@@ -2942,6 +2943,11 @@ fn host_config(
 
 /// Serves the page for `handle` and connects one viewer to it.
 async fn page_viewer(handle: &Handle) -> Viewer {
+    Viewer::connect(&page_url(handle).await).await
+}
+
+/// A `/live` listener on `handle` with the page's settings, by its URL.
+async fn page_url(handle: &Handle) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/live", listener.local_addr().unwrap());
     let cfg = live::LiveConfig {
@@ -2955,7 +2961,67 @@ async fn page_viewer(handle: &Handle) -> Viewer {
     };
     let h = handle.clone();
     tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
-    Viewer::connect(&url).await
+    url
+}
+
+/// Connected pages alone do not keep the fleet awake: with no new viewer for
+/// `sleep_without_new_viewer_secs` it sleeps under them. A page that reconnects with its
+/// seat ticket, or says it is returning, joins without waking it; a connected page's `wake`
+/// wakes it and starts the limit again, and so does a new page.
+#[tokio::test]
+async fn connected_pages_with_no_new_viewer_let_the_fleet_sleep() {
+    let config = Config {
+        power_managed: true,
+        idle_scale_down_secs: 600,
+        sleep_without_new_viewer_secs: 1,
+        ..Config::default()
+    };
+    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None, None);
+    let url = page_url(&handle).await;
+    let mut v = Viewer::connect(&url).await;
+    let ticket = v.message("admission").await["seat"]
+        .as_str()
+        .expect("a seat ticket")
+        .to_string();
+    let joined = v.until(|s| s["viewers"]["active"] == 1).await;
+    let arrived = joined["fleet"]["power"]["last_arrival_at"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        joined["fleet"]["power"]["sleep_without_arrival_at"],
+        arrived + 1000
+    );
+    let asleep = v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    assert_eq!(
+        asleep["viewers"]["active"], 1,
+        "asleep under a visible page"
+    );
+    // The same page back with its ticket: joined, still asleep, no arrival.
+    let _back = Viewer::connect_with_seat(&url, &ticket).await;
+    let s = v.until(|s| s["viewers"]["active"] == 2).await;
+    assert_eq!(s["fleet"]["power"]["state"], "asleep", "{s}");
+    assert_eq!(s["fleet"]["power"]["last_arrival_at"], arrived);
+    // A page with no ticket that says it connected before: the same.
+    let mut returning = Viewer::connect_raw(&url, None).await;
+    returning
+        .send(json!({"type": "seat", "ticket": null, "returning": true}))
+        .await;
+    let s = v.until(|s| s["viewers"]["active"] == 3).await;
+    assert_eq!(s["fleet"]["power"]["state"], "asleep", "{s}");
+    assert_eq!(s["fleet"]["power"]["last_arrival_at"], arrived);
+    // The Wake button: an arrival, and the fleet wakes.
+    v.intent("w1", "wake", json!({})).await;
+    assert_eq!(v.receipt("w1").await["outcome"], "committed");
+    let s = v.until(|s| s["fleet"]["power"]["state"] != "asleep").await;
+    let woke = s["fleet"]["power"]["last_arrival_at"].as_u64().unwrap();
+    assert!(woke > arrived, "{s}");
+    assert_eq!(s["fleet"]["power"]["woke_at"].as_u64(), Some(woke));
+    // Asleep again after the limit; a new page wakes it.
+    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    let _new = Viewer::connect(&url).await;
+    let s = v.until(|s| s["fleet"]["power"]["state"] != "asleep").await;
+    assert_eq!(s["viewers"]["active"], 4, "{s}");
+    assert!(s["fleet"]["power"]["last_arrival_at"].as_u64().unwrap() > woke);
 }
 
 /// Waits until `cond` holds for `fake`, or fails with its calls.

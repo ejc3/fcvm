@@ -365,6 +365,11 @@ pub struct PowerView {
     /// The last completed wake, and the last 20.
     pub last_wake: Option<Wake>,
     pub wakes: Vec<Wake>,
+    /// The last arrival: a new viewer connection or a connected page's `wake`.
+    pub last_arrival_at: Option<u64>,
+    /// When the fleet sleeps if no viewer arrives before then (past while asleep); null
+    /// when the fleet does not sleep or `--sleep-without-new-viewer` is 0.
+    pub sleep_without_arrival_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -641,7 +646,7 @@ pub fn view(state: &State) -> View {
                 .iter()
                 .map(|n| crate::state::slot_name(*n))
                 .collect(),
-            power: power_view(&f.power),
+            power: power_view(&f.power, &state.config),
         },
         scene: f.scene.clone(),
         image_aspect: c.image_aspect,
@@ -789,8 +794,10 @@ fn score<'a>(halves: impl DoubleEndedIterator<Item = (u64, &'a HalfRace)>) -> Op
     })
 }
 
-fn power_view(p: &Power) -> PowerView {
+fn power_view(p: &Power, c: &crate::state::Config) -> PowerView {
     PowerView {
+        last_arrival_at: p.last_arrival_at,
+        sleep_without_arrival_at: no_arrival_deadline(p, c),
         state: p.state.clone(),
         idle_since: p.idle_since,
         asleep_since: p.asleep_since,
@@ -820,6 +827,16 @@ fn power_view(p: &Power) -> PowerView {
         last_wake: p.wakes.back().cloned(),
         wakes: p.wakes.iter().cloned().collect(),
     }
+}
+
+/// When the fleet sleeps without a new viewer: the last arrival plus
+/// `sleep_without_new_viewer_secs`, with power management and the limit on.
+pub fn no_arrival_deadline(p: &Power, c: &crate::state::Config) -> Option<u64> {
+    if !c.power_managed || c.sleep_without_new_viewer_secs == 0 {
+        return None;
+    }
+    p.last_arrival_at
+        .map(|t| t + c.sleep_without_new_viewer_secs * 1000)
 }
 
 fn relaunch_all(r: &Race) -> RelaunchAllView {
