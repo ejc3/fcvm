@@ -2415,10 +2415,12 @@ class ReplayAddressByNetworkMode(unittest.TestCase):
                       f"SAMPLER_PID=\nSAMPLER_ALIVE_AT_STOP=\n{funcs}"
                       f"exec {{REPLAY_LOCK_FD}}>>'{lock}'\nflock -n $REPLAY_LOCK_FD\nstart_dns_sampler >/dev/null 2>&1\n"
                       "sleep 0.5\n[ -d /proc/$SAMPLER_PID ] && echo alive\n"
-                      "ls -l /proc/$SAMPLER_PID/fd/ | grep -c 'replay.lock'\npkill -P $SAMPLER_PID; kill $SAMPLER_PID\n")
+                      "fds=$(ls -l /proc/$SAMPLER_PID/fd/) || { echo LS-FAILED; exit 1; }\n"
+                      "grep -c 'replay.lock' <<<\"$fds\"\npkill -P $SAMPLER_PID; kill $SAMPLER_PID\n")
             out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
             lines = out.stdout.strip().splitlines()
             self.assertIn("alive", lines, "the sampler did not stay up; the check is vacuous" + out.stderr)
+            self.assertNotIn("LS-FAILED", lines, "the sampler's descriptors could not be listed")
             self.assertEqual(lines[-1], "0", "the sampler holds the replay device lock" + out.stderr)
 
     def test_every_root_phase_runs_fcvm_under_sudo_in_the_mode(self):
