@@ -1242,11 +1242,11 @@ mod tests {
 
     /// The MACs `create_veth_pair` sets survive udev's handling of the add event.
     ///
-    /// RED BEFORE THE FIX: with no address set, systemd-udevd's
-    /// MACAddressPolicy=persistent rewrote the host end's MAC once it processed the
-    /// event. udev's exec queue is held while the pair is created, so the rewrite
-    /// lands after the first read instead of racing it, then released and settled.
-    /// Where no udev runs, the same check holds trivially: nothing rewrites a MAC.
+    /// RED BEFORE THE FIX: with no address set, the device carried a kernel-random
+    /// MAC, which systemd-udevd's MACAddressPolicy=persistent then rewrote, so it
+    /// never matched the MAC the caller expected. udev is let finish (`udevadm
+    /// settle`) before the check, so a rewrite it would make has landed. Where no
+    /// udev runs, the same check holds: nothing rewrites a MAC.
     #[tokio::test]
     async fn test_veth_macs_survive_udev() {
         let ns_name = "fcvm-test-veth-mac";
@@ -1259,21 +1259,8 @@ mod tests {
             NamespaceCreation::Created
         );
 
-        let udev = std::path::Path::new("/run/udev/control").exists();
-        let queue = |action: &'static str| async move {
-            let status = Command::new("udevadm")
-                .args(["control", action])
-                .status()
-                .await
-                .unwrap();
-            assert!(status.success(), "udevadm control {action}");
-        };
-        if udev {
-            queue("--stop-exec-queue").await;
-        }
         let created = create_veth_pair(host_veth, guest_veth, ns_name).await;
-        if udev {
-            queue("--start-exec-queue").await;
+        if std::path::Path::new("/run/udev/control").exists() {
             let status = Command::new("udevadm")
                 .args(["settle", "--timeout=30"])
                 .status()
