@@ -1058,8 +1058,8 @@ whatever it showed before. Two things hid the effect:
   wall's terrain (eye at z = -60 to -140 looking further down -z) that Robot Park reads as
   metres of the park, whose robots walk between z = -46 and 16. Every one of the wall's stops
   looks away from every robot, so the phones show lawn, trees and hills, and a phone that
-  danced showed only its "Dance!" banner (`aHeldPhoneFollowsItsOwnRobotUpClose` asserts that
-  slice holds no robot). A slice of a park camera would still leave the robots at a phone's
+  danced showed no change at all: Robot Park shows no banner for dance or wave
+  (`aHeldPhoneFollowsItsOwnRobotUpClose` asserts that slice holds no robot). A slice of a park camera would still leave the robots at a phone's
   edge small or outside it.
 - *The info tab in front.* The info screen covers the scene, so dance, wave and night were
   behind it.
@@ -1083,12 +1083,20 @@ Then each action shows its effect on the screen:
 | Switch screen | the other tab | the same |
 | Rotate | turned, but no robot in the turned view either; on the info tab the info turns | the scene tab, turned, its robot followed |
 | Dark mode | the night sky; behind the info tab only the banner and the info's colours | the scene tab first, then night or day |
-| Dance, Wave | the banner over an empty lawn, or the info tab | the scene tab first; the robot in front and the crowd dance or wave |
+| Dance, Wave | nothing: no robot on the lawn, or the info tab in front | the scene tab first; the robot in front and the crowd dance or wave |
 | GPU benchmark | the banner, the screen held while it runs, the result banner | the same |
 | Restart app | the app starts again | the same |
 | Open nvidia.com | the browser in front, the page loaded again | the same |
 | Robot Park | nothing when Robot Park was already in front | the scene tab; the page offers it only while the browser is in front |
 | Reboot phone | the panel says Restoring, the phone restores | the same |
+
+Measured on a g4dn.metal (2026-11-04), phone 6 of a six-phone scene with the wall's camera,
+held, on the info tab before each Robot Park action, recording the streamer's `/still` every
+130 ms or so: from the start of `phone.sh action` (as the agent runs it, through `fcvm exec`)
+to the first frame that differs from the one before by more than the scene's own motion, 145 to
+180 ms for the actions inside Robot Park, 280 to 290 ms for the two that bring it from the
+browser, 422 ms for Open nvidia.com and 720 ms for Restart app. On the current host image, dance
+and wave from the info tab changed no frame in 3 s.
 
 Dance and wave were already this phone's own moves (`dance`, `wave`, PROTOCOL.md "Phone
 app"); only the coordinator's scene moves stop the crowd on every phone together.
