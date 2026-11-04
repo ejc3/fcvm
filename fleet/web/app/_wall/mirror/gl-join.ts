@@ -273,6 +273,8 @@ function isCompressed(f: number): boolean {
 
 /** Texture parameters WebGL2 takes, as ints. Swizzles are left out: they are the host's emulation of LUMINANCE and ALPHA, which WebGL2 has. */
 const TEX_INT_PARAMS: ReadonlySet<number> = new Set([0x2801, 0x2800, 0x2802, 0x2803, 0x8072, 0x813c, 0x813d, 0x884c, 0x884d]);
+/** TEXTURE_SWIZZLE_R..A, which WebGL2 has not. */
+const TEX_SWIZZLES: ReadonlySet<number> = new Set([0x8e42, 0x8e43, 0x8e44, 0x8e45]);
 /** MIN_LOD and MAX_LOD, saved as ints. */
 const TEX_FLOAT_PARAMS: ReadonlySet<number> = new Set([0x813a, 0x813b]);
 
@@ -364,6 +366,33 @@ function setUniform(gl: GL, loc: WebGLUniformLocation | null, type: number, valu
     default:
       return false;
   }
+}
+
+/** A glVertexAttrib{1,2,3,4}f value as the four GLES holds: y and z 0 and w 1 where not given. */
+export function constantAttrib(v: readonly number[]): [number, number, number, number] {
+  return [v[0] ?? 0, v[1] ?? 0, v[2] ?? 0, v[3] ?? 1];
+}
+
+/**
+ * The phone's uniform block bindings (host block index to binding) on the browser's program,
+ * whose blocks `names` lists in WebGL2's order. The snapshot names no block (ProgramData::onSave
+ * saves only index and binding, collectUniformBlockInfo), and two drivers may number one
+ * program's blocks differently, so an index maps to a block only when nothing else is possible:
+ * one block on both sides. Bindings that are all one value need no map when both sides have the
+ * same number of blocks. Anything else applies no binding.
+ */
+export function mapUniformBlocks(
+  saved: ReadonlyMap<number, number>,
+  names: readonly string[],
+): { bindings: [number, number][]; known: Map<number, string>; unmapped: number } {
+  if (saved.size === 0) return { bindings: [], known: new Map(), unmapped: 0 };
+  if (saved.size === 1 && names.length === 1 && saved.has(0)) return { bindings: [[0, saved.get(0)!]], known: new Map([[0, names[0]!]]), unmapped: 0 };
+  const values = new Set(saved.values());
+  if (values.size === 1 && saved.size === names.length) {
+    const b = [...values][0]!;
+    return { bindings: names.map((_, i) => [i, b]), known: new Map(), unmapped: 0 };
+  }
+  return { bindings: [], known: new Map(), unmapped: saved.size };
 }
 
 // ---- the loader ----
@@ -614,6 +643,8 @@ class Loader {
       for (const [k, v] of params) {
         if (TEX_INT_PARAMS.has(k)) gl.texParameteri(target, k, v);
         else if (TEX_FLOAT_PARAMS.has(k)) gl.texParameterf(target, k, v);
+        else if (TEX_SWIZZLES.has(k)) this.skip("texture swizzle parameter");
+        else this.skip(`texture parameter ${hex(k)}`);
       }
     } finally {
       gl.bindTexture(target, null);
@@ -731,14 +762,15 @@ class Loader {
       if (!setUniform(gl, loc, u.type, u.value)) this.skip(`uniform type ${hex(u.type)}`);
     }
     gl.useProgram(null);
-    // Block indices are the host driver's. WebGL2's driver is assumed to number the blocks the
-    // same way, which holds when both order them by name or by declaration.
+    // Block indices are each driver's own: the browser's blocks by name, mapped where the
+    // snapshot allows (mapUniformBlocks). A host index named here is one a later live
+    // glUniformBlockBinding can use; the guest's glGetUniformBlockIndex replies add the rest.
     const blocks = Number(gl.getProgramParameter(prog, GL_ACTIVE_UNIFORM_BLOCKS)) || 0;
-    for (let i = 0; i < blocks; i++) program.blocks.set(i, gl.getActiveUniformBlockName(prog, i) ?? "");
-    for (const [index, binding] of p.uniformBlockBindings) {
-      if (index < blocks) gl.uniformBlockBinding(prog, index, binding);
-      else this.skip("uniform block binding past the program's blocks");
-    }
+    const names = Array.from({ length: blocks }, (_, i) => gl.getActiveUniformBlockName(prog, i) ?? "");
+    const m = mapUniformBlocks(p.uniformBlockBindings, names);
+    for (const [hostIndex, name] of m.known) program.blocks.set(hostIndex, name);
+    for (const [index, binding] of m.bindings) gl.uniformBlockBinding(prog, index, binding);
+    if (m.unmapped) this.skip("uniform block binding the snapshot does not name the block of", m.unmapped);
   }
 
   // ---- contexts ----
@@ -806,16 +838,18 @@ class Loader {
     const sc = s.scissor ?? whole;
     if (sc) this.set(ctx, "glScissor", sc.x, sc.y, sc.width, sc.height);
 
+    // indexed bindings first: glBindBufferBase and glBindBufferRange set the generic binding too,
+    // which the generic ones then put back, a saved 0 included
     const b = s.buffers;
-    this.set(ctx, "glBindBuffer", GL_ARRAY_BUFFER, b.array);
-    for (const [target, name] of [[0x8f36, b.copyRead], [0x8f37, b.copyWrite], [0x88eb, b.pixelPack], [GL_PIXEL_UNPACK_BUFFER, b.pixelUnpack], [GL_UNIFORM_BUFFER, b.uniform], [GL_TRANSFORM_FEEDBACK_BUFFER, b.transformFeedback]] as const)
-      if (name) this.set(ctx, "glBindBuffer", target, name);
-    const gles31 = [b.atomicCounter, b.dispatchIndirect, b.drawIndirect, b.shaderStorage, b.textureBuffer].filter(Boolean).length;
-    if (gles31) this.skip("GLES 3.1 buffer binding", gles31);
     this.indexed(ctx, GL_UNIFORM_BUFFER, s.indexed.uniform);
     this.indexed(ctx, GL_TRANSFORM_FEEDBACK_BUFFER, s.indexed.transformFeedback);
     const indexed31 = [...s.indexed.atomicCounter, ...s.indexed.shaderStorage].filter((x) => x.buffer).length;
     if (indexed31) this.skip("GLES 3.1 indexed buffer binding", indexed31);
+    this.set(ctx, "glBindBuffer", GL_ARRAY_BUFFER, b.array);
+    for (const [target, name] of [[0x8f36, b.copyRead], [0x8f37, b.copyWrite], [0x88eb, b.pixelPack], [GL_PIXEL_UNPACK_BUFFER, b.pixelUnpack], [GL_UNIFORM_BUFFER, b.uniform], [GL_TRANSFORM_FEEDBACK_BUFFER, b.transformFeedback]] as const)
+      if (name || target === GL_UNIFORM_BUFFER || target === GL_TRANSFORM_FEEDBACK_BUFFER) this.set(ctx, "glBindBuffer", target, name);
+    const gles31 = [b.atomicCounter, b.dispatchIndirect, b.drawIndirect, b.shaderStorage, b.textureBuffer].filter(Boolean).length;
+    if (gles31) this.skip("GLES 3.1 buffer binding", gles31);
 
     s.textureUnits.forEach((unit, u) =>
       unit.textures.forEach((name, k) => {
@@ -837,15 +871,16 @@ class Loader {
     this.set(ctx, "glBindFramebuffer", GL_READ_FRAMEBUFFER, s.readFramebuffer);
     if (s.renderbuffer) this.set(ctx, "glBindRenderbuffer", GL_RENDERBUFFER, s.renderbuffer);
 
-    // Constant attribute values: the translator keeps them in the bound vertex array; WebGL2,
-    // like gl.ts's glVertexAttrib* handlers, holds them once for every context.
+    // Constant attribute values: the translator keeps them in the bound vertex array, with the
+    // one to four values the glVertexAttrib call gave; GLES fills the rest from (0, 0, 0, 1).
+    // They go through the handler, so they are this context's settings and a switch puts them back.
     const bound = s.vaos.get(s.boundVao);
     bound?.attribs.forEach((a, i) => {
-      if (a.attribType !== 2 || a.value.length !== 4) return;
+      if (a.attribType !== 2 || a.value.length < 1 || a.value.length > 4) return;
       if (a.isInt) this.skip("integer constant attribute");
-      else gl.vertexAttrib4fv(i, a.value);
+      else this.set(ctx, "glVertexAttrib4f", i, ...constantAttrib(a.value));
     });
-    if (v2.attribute0Changed) gl.vertexAttrib4fv(0, v2.attribute0);
+    if (v2.attribute0Changed) this.set(ctx, "glVertexAttrib4f", 0, ...v2.attribute0);
   }
 
   private indexed(ctx: Ctx, target: number, bindings: BufferBinding[]): void {

@@ -98,6 +98,7 @@ test("a captured Robot Park stream replayed on WebGL2 matches the phone's own fr
   console.log(JSON.stringify({ ...r, stamped: `${r.stamped.length} frames, ${r.stamped[0]}..${r.stamped[r.stamped.length - 1]}` }));
   expect(r.refs.length, "the screenshots carry Robot Park's stamp").toBe(shots.length);
   expect(r.failed, "no call failed in WebGL2").toEqual({});
+  expect(r.glErrors, `no WebGL error after any record; first: ${r.firstGlErrors.join("; ")}`).toEqual({});
   expect(r.posts).toBeGreaterThan(30);
   expect(r.missing, "every screenshot's frame was posted by the mirror").toEqual([]);
   for (const m of r.matches) {
@@ -133,6 +134,7 @@ test("a stream that joins a running phone draws the phone's screen from the join
   });
   console.log(JSON.stringify(r));
   expect(r.failed, "no call failed in WebGL2").toEqual({});
+  expect(r.glErrors, `no WebGL error after any record; first: ${r.firstGlErrors.join("; ")}`).toEqual({});
   expect(r.join?.ok, "the stream began with a whole join snapshot").toBe(true);
   expect(r.join?.colorBuffers).toBeGreaterThan(0);
   expect(r.firstFromJoin, "the first frame was drawn from the snapshot, before any live record").toBe(true);
@@ -184,6 +186,7 @@ test("a stream that joins a phone running a browser keeps drawing it from the jo
   );
   console.log(JSON.stringify(r));
   expect(r.failed, "no call failed in WebGL2").toEqual({});
+  expect(r.glErrors, `no WebGL error after any record; first: ${r.firstGlErrors.join("; ")}`).toEqual({});
   expect(r.join?.ok, "the stream began with a whole join snapshot").toBe(true);
   expect(r.join?.gl, "the join carried GL state").toBeTruthy();
   expect(r.join!.gl!.error, "the join's GL state loaded").toBeNull();

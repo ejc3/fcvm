@@ -128,12 +128,12 @@ function framebufferData(w: W, f: Fbo): void {
 }
 
 // GLEScontext::onSave (gles_context.cpp), the part written only once initialized
-function glesContextInitialized(w: W, o: { vaos: [number, Vao][]; boundVao: number; texUnits: number[][]; gles1?: boolean }): void {
+function glesContextInitialized(w: W, o: { vaos: [number, Vao][]; boundVao: number; texUnits: number[][]; gles1?: boolean; generic?: number[] }): void {
   w.be32(1); // m_activeTexture
   w.be32(o.vaos.length);
   for (const [name, v] of o.vaos) vaoState(w.be32(name), v);
   w.be32(o.boundVao);
-  for (let i = 0; i < 11; i++) w.be32(20 + i); // copyRead .. textureBuffer
+  for (let i = 0; i < 11; i++) w.be32(o.generic?.[i] ?? 20 + i); // copyRead .. textureBuffer
   bindings(w, [{}, { buffer: 1, offset: 16, size: 64, base: true }, {}, {}]);
   bindings(w, [{ buffer: 1, size: 256 }, {}]);
   bindings(w, [{}]);
@@ -196,12 +196,13 @@ function shaderParser(w: W, type: number, src: string, programs: number[]): void
 }
 
 // ProgramData::onSave (program_data.cpp)
-function programData(w: W, vs: string, fs: string): void {
+function programData(w: W, vs: string, fs: string, blocks: [number, number][] = [[0, 2]]): void {
   w.byte(1).be32(1);
   w.be32(1).string("a_pos").be32(0);
   w.be32(2).string("a_pos").be32(0).string("a_uv").be32(1);
   w.be32(1).be32(3).be32(1).byte(false).be32(GL.FLOAT_VEC4).be32(16).write(new Uint8Array(new Float32Array([1, 0.5, 0.25, 1]).buffer)).string("u_color");
-  w.be32(1).be32(0).be32(2);
+  w.be32(blocks.length);
+  for (const [index, binding] of blocks) w.be32(index).be32(binding);
   w.be32(1).string("v_out").be32(GL.SEPARATE_ATTRIBS);
   w.be32(10).string(vs).be32(11).string(fs).be32(0).string("");
   w.string("").string("linked").be16(0);
@@ -210,7 +211,7 @@ function programData(w: W, vs: string, fs: string): void {
 }
 
 // ShareGroup::onSave (share_group.cpp): ten namespaces in NamedObjectType order
-function shareGroup7(w: W, vs: string, fs: string): void {
+function shareGroup7(w: W, vs: string, fs: string, blocks?: [number, number][]): void {
   nameSpace(w, []);
   nameSpace(w, [[1, (w) => w.be32(3).be32(8).be32(GL.STATIC_DRAW).write(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8])).byte(true)]]);
   nameSpace(w, [
@@ -222,7 +223,7 @@ function shareGroup7(w: W, vs: string, fs: string): void {
   nameSpace(w, []);
   nameSpace(w, [
     [10, (w) => shaderParser(w, GL.VERTEX_SHADER, vs, [12])],
-    [12, (w) => programData(w, vs, fs)],
+    [12, (w) => programData(w, vs, fs, blocks)],
     [11, (w) => shaderParser(w, GL.FRAGMENT_SHADER, fs, [12])],
   ]);
   nameSpace(w, [[6, (w) => w.be32(6).be32(1).be32(GL.MIN_FILTER).be32(GL.NEAREST).be32(1).be32(GL.MIN_LOD).float(0.5)]]);
@@ -247,7 +248,20 @@ export const VS = "#version 300 es\n// café ✓ \u{1f600}\nin vec3 a_pos; void 
 export const FS = "#version 300 es\nprecision mediump float; uniform vec4 u_color; out vec4 o; void main() { o = u_color; }";
 
 /** FrameBuffer::Impl::onSave (frame_buffer.cpp) for one scene, with overrides for corruption tests. */
-export function glState(o: { version?: number; api3?: number; magic?: number; element?: number } = {}): Uint8Array {
+export function glState(
+  o: {
+    version?: number;
+    api3?: number;
+    magic?: number;
+    element?: number;
+    /** Context 0x11's generic buffer bindings, copyRead .. textureBuffer (default 20 .. 30). */
+    generic?: number[];
+    /** Context 0x11's constant value of attribute 1 in vertex array 9 (default [1, 2, 3, 4]). */
+    attrib1?: number[];
+    /** Program 12's uniform block bindings, host index to binding (default [[0, 2]]). */
+    blocks?: [number, number][];
+  } = {},
+): Uint8Array {
   const w = new W();
   w.be32(o.version ?? 6);
   // eglSaveAllImages: GlobalNameSpace::onSave, then the EGL images
@@ -269,7 +283,7 @@ export function glState(o: { version?: number; api3?: number; magic?: number; el
         element: o.element ?? 1,
         attribs: new Map<number, Pointer>([
           [0, { size: 3, stride: 12, enabled: true, attribType: 1, buffer: 1, offset: 8 }],
-          [1, { attribType: 2, values: [1, 2, 3, 4], bindingIndex: 1 }],
+          [1, { attribType: 2, values: o.attrib1 ?? [1, 2, 3, 4], bindingIndex: 1 }],
           [2, { size: 2, type: GL.UNSIGNED_BYTE, enabled: true, data: new Uint8Array([7, 8, 9]), bindingIndex: 2 }],
         ]),
         bindings: Array.from({ length: 16 }, (_, i) => (i === 0 ? { buffer: 1, offset: 8, stride: 12 } : i === 3 ? { divisor: 2 } : {})),
@@ -277,6 +291,7 @@ export function glState(o: { version?: number; api3?: number; magic?: number; el
     ],
     boundVao: 9,
     texUnits: [[2], [5]],
+    generic: o.generic,
   });
   nameSpace(w, [[4, (w) => framebufferData(w, {
     name: 4,
@@ -286,7 +301,7 @@ export function glState(o: { version?: number; api3?: number; magic?: number; el
   })]]);
   v2Tail(w, { program: 12, samplers: [[1, 6]], tf: [[0, [{}, { buffer: 1, size: 64, base: true }, {}, {}]]] });
   w.be32(33).be64(7);
-  shareGroup7(w, VS, FS);
+  shareGroup7(w, VS, FS, o.blocks);
 
   // C: GLES1, initialized, alone in share group 9
   w.be32(0x33).be32(1);
