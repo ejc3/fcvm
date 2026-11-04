@@ -366,6 +366,7 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
             fps: mirrorStats?.fps ?? 0,
             repliesPerSec: mirrorStats?.repliesPerSec ?? 0,
             note: mirrorNote,
+            partial: !held.actions.includes("restart_app"),
             leadMs: mirrorLeadMs(mirrorStats?.stamp ?? null, videoStats?.newestT ?? null, state.frames?.at ?? null, sceneClock),
             codec: mirrorStats ? "zstd" : null,
             ratio: mirrorStats && mirrorStats.wireBytes > 0 ? mirrorStats.tapBytes / mirrorStats.wireBytes : null,
@@ -433,6 +434,9 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
   const admitRef = useRef<string>("");
   admitRef.current = m?.admit ?? "";
   const joinedFor = useRef<string | null>(null);
+  // the restart below is a phone action, so it goes only to a phone whose host lists it
+  const canRestartRef = useRef(false);
+  canRestartRef.current = held?.actions.includes("restart_app") ?? false;
   const [retry, setRetry] = useState(0);
   // The coordinator takes one action a second from a phone's holder: the page spaces its own,
   // so the restart that joins the mirror is not refused after a click or a quick reopen.
@@ -458,8 +462,9 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
       else if (x.type === "joined") {
         setMirrorNote(null);
         // Until the join snapshot lands the mirror starts with the app: restart it into the copy,
-        // once per borrow and stream.
-        if (joinedFor.current !== `${mirrorKey} ${retry}`) {
+        // once per borrow and stream. A host that does not list restart_app gets no restart, and
+        // the mirror draws only what the app creates from then on (the readout says so).
+        if (canRestartRef.current && joinedFor.current !== `${mirrorKey} ${retry}`) {
           joinedFor.current = `${mirrorKey} ${retry}`;
           actPhone("restart_app", m!.session);
         }

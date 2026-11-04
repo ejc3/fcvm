@@ -407,6 +407,8 @@ export interface StreamReadout {
   repliesPerSec?: number;
   /** Why the stream is not drawing, when it is not. */
   note?: string | null;
+  /** The mirror's: joined without restarting the app (its host does not list restart_app), so it draws only what the app creates after the join. */
+  partial?: boolean;
   /** With both views: how far the mirror's scene time is ahead of the video's (ms; negative behind). */
   leadMs?: number | null;
   /** The mirror's: the commands' bytes over the wire's, and the wire's encoding. */
@@ -528,7 +530,8 @@ export function readoutRows(view: TakeoverView, video: StreamReadout | null, mir
               : "") +
             (mirror.leadMs !== undefined && mirror.leadMs !== null
               ? `. ${Math.abs(Math.round(mirror.leadMs))} ms ${mirror.leadMs >= 0 ? "ahead of" : "behind"} the video`
-              : "")
+              : "") +
+            (mirror.partial ? ". Draws only what the app creates from now on, so it can stay blank (Video shows the phone): this phone's host does not support restarting the app" : "")
           : null,
     });
   return rows;

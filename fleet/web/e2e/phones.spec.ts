@@ -265,6 +265,30 @@ test("a phone taken over shows its video, its GPU mirror or both, each with its 
   await expect(page.getByTestId("phone-mirror")).toBeHidden();
 });
 
+test("on a host that lists only Reboot phone, the panel offers only that and the mirror joins without restarting the app", async ({ page }) => {
+  // an empty list: the coordinator still offers Reboot phone
+  await admin("/mock/fault", { phone_offers: { "phone-2": [] } });
+  await openPhones(page);
+  await page.getByTestId("phone-hit-phone:2").click();
+  await page.getByTestId("phone-take").click();
+  await expect(page.getByTestId("phone-borrow")).toHaveAttribute("data-kind", "yours");
+  const labels = await page.getByTestId("phone-borrow").getByRole("group", { name: "Actions" }).getByRole("button").allTextContents();
+  expect(labels).toEqual(["Reboot phone"]);
+  // the coordinator refuses an action the host does not list
+  await page.evaluate(() => window.__phones!.client.send("phone_action", { action: "rotate" }));
+  await expect(page.getByTestId("phone-notice")).toHaveText("phone-2's host does not support rotate");
+  // the mirror still opens and draws, sends no restart, and its readout says what it draws
+  await page.getByTestId("phone-view-mirror").click();
+  await expect(page.getByTestId("phone-readout-mirror")).toContainText(/\d Mbit\/s · \d+\.\d MB · \d+ fps/, { timeout: 15_000 });
+  await expect.poll(async () => (await page.evaluate(() => window.__phones!.mirror()))?.posts ?? 0, { timeout: 15_000 }).toBeGreaterThan(10);
+  // past the one-action-a-second spacing, no restart was sent: the refusal of rotate is still the newest notice
+  await page.waitForTimeout(1500);
+  await expect(page.getByTestId("phone-notice")).toHaveText("phone-2's host does not support rotate");
+  expect(await phoneActions()).toEqual([]);
+  await expect(page.getByTestId("phone-readout-mirror")).toContainText("Draws only what the app creates from now on, so it can stay blank (Video shows the phone): this phone's host does not support restarting the app");
+  await page.getByTestId("phone-give-back").click();
+});
+
 test("a mirror whose phone's copy overflowed says so and joins again", async ({ page }) => {
   await openPhones(page);
   await page.getByTestId("phone-hit-phone:2").click();

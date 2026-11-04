@@ -1465,6 +1465,13 @@ export class MockCoordinator {
         body((b) => {
           if (typeof b["skew"] === "number" && typeof b["tile"] === "string") this.opts.renderers.setSkew(b["tile"], b["skew"]);
           if (b["mirror_overflow"] === true) this.opts.renderers.setMirrorOverflow();
+          if (typeof b["phone_offers"] === "object" && b["phone_offers"] !== null) {
+            if (!this.phones) throw new Error("the mock runs no phones (FLEET_MOCK_PHONES)");
+            for (const [slot, offers] of Object.entries(b["phone_offers"] as Record<string, unknown>)) {
+              if (!Array.isArray(offers) || offers.some((a) => typeof a !== "string")) throw new Error(`phone_offers.${slot} must be a list of action names`);
+              this.phones.setOffers(slot, offers as string[]);
+            }
+          }
           if (typeof b["fail"] === "string") {
             const t = this.tiles.find((x) => x.id === b["fail"]);
             if (!t || !t.slot) throw new Error(`no tile with a GPU ${String(b["fail"])}`);
