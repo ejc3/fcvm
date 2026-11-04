@@ -1605,6 +1605,13 @@ cmd_run() {
         log "run: applying publication gates"
         apply_publication_gates || rc=$?
     fi
+    # A root mode wrote the run's records as root (reqbench.py and reqanalyze
+    # run under SUDO), some with mode 0600, and everything after this phase
+    # reads them as the invoking user: the campaign binds its DNS evidence to
+    # analysis.json's run_id, and campaign_summary and the import read the rest.
+    if [ -n "$SUDO" ]; then
+        $SUDO chown -R "$(id -u):$(id -g)" "$RESULTS" || rc=1
+    fi
     log "run: results in $RESULTS (backend=$BACKEND, gated run exit $rc)"
     return $rc
 }
