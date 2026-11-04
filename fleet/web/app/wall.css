@@ -60,6 +60,13 @@ h1, h2, h3, p { margin: 0; }
 .brand h1 { font-size: 24px; font-weight: 600; line-height: 1.15; letter-spacing: -0.01em; }
 .live-badge { display: inline-flex; align-items: center; gap: 6px; padding: 1px 8px; border-radius: 4px; font: 600 14px var(--mono); letter-spacing: 0.08em; color: #ffd0d0; background: rgba(180, 20, 20, 0.55); text-shadow: none; }
 .live-badge .dot { width: 8px; height: 8px; border-radius: 4px; background: #ff5a5a; box-shadow: 0 0 8px #ff5a5a; }
+.masthead { flex: 1 0 auto; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; min-width: 0; }
+.masthead .brand { flex: 0 0 auto; }
+.mode-switch { display: inline-flex; gap: 2px; padding: 2px; border-radius: 8px; border: 1px solid var(--control); background: rgba(11, 13, 16, 0.55); text-shadow: none; pointer-events: auto; }
+.mode-link { min-height: 32px; display: inline-flex; align-items: center; padding: 0 12px; border-radius: 6px; font: 500 14px var(--sans); color: var(--muted); text-decoration: none; }
+.mode-link:hover { color: var(--text); }
+.mode-link[aria-current="page"] { color: var(--text); background: rgba(255, 255, 255, 0.12); }
+.phone > .mode-switch { align-self: flex-start; margin: 0 16px; }
 /* Between the phone breakpoint and a wide window the title and the controls do not fit one
    row: the controls wrap under it, right-aligned, rather than run off the screen. */
 .hud-top { flex-wrap: wrap; }

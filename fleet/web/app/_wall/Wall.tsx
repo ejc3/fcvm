@@ -39,6 +39,7 @@ import {
   type WallView,
   type ZoomStep,
 } from "../../core/index.ts";
+import { ModeSwitch } from "./ModeSwitch.tsx";
 import { canDecodeH264, WallClient } from "./wall-client.ts";
 import { boxOf, sameBox, useMedia } from "./hooks.ts";
 import { FocusPanel } from "./FocusPanel.tsx";
@@ -788,15 +789,18 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   const needsVerifyPrompt = view.play?.verify.needed && state.turnstile.queued.length > 0 && !state.ui.drawer;
 
   const brand = (
-    <div className="brand">
-      <span className="site">{view.site}</span>
-      <h1>{view.title}</h1>
-      {view.live ? (
-        <span className="live-badge" data-testid="live">
-          <span className="dot" aria-hidden="true" />
-          LIVE
-        </span>
-      ) : null}
+    <div className="masthead">
+      <div className="brand">
+        <span className="site">{view.site}</span>
+        <h1>{view.title}</h1>
+        {view.live ? (
+          <span className="live-badge" data-testid="live">
+            <span className="dot" aria-hidden="true" />
+            LIVE
+          </span>
+        ) : null}
+      </div>
+      {phone ? null : <ModeSwitch current="wall" />}
     </div>
   );
 
@@ -864,6 +868,8 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
             </p>
           ) : null}
           {info}
+          {/* The title's line has no room on a phone and the image stays at the top, so the switch sits under the image. */}
+          <ModeSwitch current="wall" />
           <p className="rotate-hint" data-testid="rotate-hint">
             {view.rotateHint}
           </p>

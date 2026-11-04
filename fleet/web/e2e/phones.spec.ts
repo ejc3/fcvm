@@ -69,6 +69,30 @@ test("the wall at / has no phones in it", async ({ page }) => {
   await page.waitForFunction(() => window.__fleet !== undefined);
 });
 
+test("both headers carry the Wall / Phones switch: each view is one click from the other, and the query is kept", async ({ page, browser }) => {
+  await openPhones(page);
+  await expect(page.getByTestId("mode-phones")).toHaveAttribute("aria-current", "page");
+  await expect(page.getByTestId("mode-wall")).toHaveAttribute("href", "/?debug=1");
+  await page.getByTestId("mode-wall").click();
+  await page.waitForFunction(() => window.__fleet !== undefined);
+  await expect(page).toHaveURL(/\/\?debug=1$/);
+  await expect(page.getByTestId("mode-wall")).toHaveAttribute("aria-current", "page");
+  await expect(page.getByTestId("mode-phones")).toBeInViewport();
+  await page.getByTestId("mode-phones").click();
+  await page.waitForFunction(() => window.__phones !== undefined);
+  await expect(page).toHaveURL(/\/\?debug=1&mode=phones$/);
+  await expect(page.getByTestId("phones")).toBeVisible();
+  // On a phone-sized screen the switch is on screen in both views too.
+  const small = await (await browser.newContext({ viewport: { width: 390, height: 844 } })).newPage();
+  await small.goto("/?debug=1");
+  await small.waitForFunction(() => window.__fleet !== undefined);
+  await expect(small.getByTestId("mode-phones")).toBeInViewport();
+  await small.getByTestId("mode-phones").click();
+  await small.waitForFunction(() => window.__phones !== undefined);
+  await expect(small.getByTestId("mode-wall")).toBeInViewport();
+  await small.context().close();
+});
+
 test("Zoom out moves the phones apart into bezels, each labelled with its restore, and Zoom in puts them back", async ({ page }) => {
   await openPhones(page);
   await page.getByTestId("phones-zoom").click();

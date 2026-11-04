@@ -29,6 +29,7 @@ import { RateMeter } from "../../core/meter.ts";
 import type { MirrorIn, MirrorOut, MirrorStatsMsg } from "./mirror/mirror-msgs.ts";
 import { canDecodeH264, WallClient } from "./wall-client.ts";
 import { TurnstileWidget } from "./Turnstile.tsx";
+import { ModeSwitch } from "./ModeSwitch.tsx";
 import { Timeline } from "./FocusPanel.tsx";
 import { boxOf, sameBox, useMedia } from "./hooks.ts";
 import "./phones.css";
@@ -547,9 +548,12 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
       <canvas ref={canvasRef} className={`frames${painted ? " painted" : ""}`} aria-hidden="true" />
       <main className="phones-page" data-testid="phones" data-progress={view.layout?.eased.toFixed(3) ?? ""}>
         <header className="phones-top">
-          <div className="brand">
-            <span className="site">{SITE}</span>
-            <h1>{view.title}</h1>
+          <div className="masthead">
+            <div className="brand">
+              <span className="site">{SITE}</span>
+              <h1>{view.title}</h1>
+            </div>
+            <ModeSwitch current="phones" />
           </div>
           {!panelOpen ? (
             <button
