@@ -171,6 +171,33 @@ python3 tools/seam_metric.py out.png 4 2              # seam ratio at every tile
 "Viewers per renderer") opens many frame streams as the page does and reports
 each stream's frame rate, frame delay, and frames dropped for a slow reader.
 
+## The checkerboard (round 19, 2026-11-04)
+
+With the GPU clocks and the height guard of round 18 deployed, the staging wall at dusk
+(terrain under most tiles) sat at the lowest budget rung, 74,325 pixel-samples: every tile
+at 360 to 540 lines drew a stride-4 checkerboard. Heavy tiles still took 20 to 25 ms a frame
+there, tracing about 122,000 samples in 20 to 22 ms (`/health`, 2026-11-04 06:10 UTC), so
+their fits held the grid at that rung.
+
+The trace kernel ran one thread per drawn-region pixel and returned at once on the pixels a
+checkerboard frame does not draw (`draws_here`). Stride 2 skips every other pixel of a row
+and stride 4 three of every four, so every warp still had drawn lanes and took as long as
+they did: a stride-4 frame traced a quarter of the samples in two thirds of the time. A
+frame now launches one thread per drawn pixel (`checker_pixel`, `src/checker.h`) and writes
+the skipped pixels' empty entries in a separate kernel (`k_moving_skip`). Each pixel's
+samples are the same, so every frame is too: the seam test's hashes are unchanged.
+
+Measured on a T4 in an fcvm VM (one g4dn.metal, nothing else on it):
+
+| | stride 1 | stride 2 | stride 4 |
+|---|---|---|---|
+| median trace at 540, main | 19.0 to 19.3 ms | 15.0 to 15.2 (0.78 to 0.80 of stride 1) | 12.0 to 12.1 (0.62 to 0.63) |
+| the same, this round | 19.1 to 19.2 ms | 11.1 (0.58) | 6.4 to 6.5 (0.34) |
+
+A heavy staging pose served at 30 fps on one 432 stream: at budget 74,325 (stride 4) render
+19.7 to 20.8 ms on main and 8.4 to 9.4 ms here, `budget_fit_now` 158,888 against 389,511; at
+176,777 (stride 2) 22.7 to 24.2 ms against 14.2 to 15.7 ms.
+
 ## GPU clocks (round 18, 2026-11-03)
 
 The owner, on the staging wall at full screen: "The rendering is still too dirty

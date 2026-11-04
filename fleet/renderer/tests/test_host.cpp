@@ -13,6 +13,7 @@
 #include "../src/access.h"
 #include "../src/admit.h"
 #include "../src/budget.h"
+#include "../src/checker.h"
 #include "../src/params.h"
 #include "../src/font_sdf.h"
 #include "../src/jpeg.h"
@@ -538,6 +539,35 @@ int main() {
     CHECK(std::fabs(4.0 + f2 * 3e-5 - 0.7 * fslot) < 0.05, "predicted frame at the target");
   }
   {
+    // The checkerboard's threads (checker.h): each drawn pixel of a region has
+    // exactly one thread and no other pixel has one, for every stride, slot,
+    // region origin parity and odd or even size.
+    for (int half : {1, 2, 4})
+      for (int parity = 0; parity < 4; parity++)
+        for (int ex0 : {0, 1, 6, 7})
+          for (int ey0 : {0, 1, 4, 9})
+            for (int ew : {1, 5, 8})
+              for (int eh : {1, 4, 7}) {
+                std::vector<int> hits(ew * eh, 0);
+                int tw = checker_threads_w(ew, half), th = checker_threads_h(eh, half);
+                for (int tj = 0; tj < th + 1; tj++)
+                  for (int ti = 0; ti < tw + 1; ti++) {
+                    int i, j;
+                    if (!checker_pixel(ti, tj, ex0, ey0, ew, eh, half, parity, &i, &j)) continue;
+                    if (i >= 0 && j >= 0 && i < ew && j < eh) hits[j * ew + i]++;
+                    else hits[0] += 100;  // a thread outside the region
+                  }
+                bool ok = true;
+                for (int j = 0; j < eh; j++)
+                  for (int i = 0; i < ew; i++)
+                    ok = ok && hits[j * ew + i] == (checker_draws(ex0 + i, ey0 + j, half, parity) ? 1 : 0);
+                if (!ok) {
+                  CHECK(false, "checker threads: half %d parity %d origin %d,%d size %dx%d", half, parity, ex0, ey0, ew, eh);
+                  goto checker_done;
+                }
+              }
+    CHECK(true, "every drawn checkerboard pixel has exactly one thread");
+  checker_done:;
     // The height a tile draws (HeightGuard). Staging, 2026-10-27: one viewer
     // opened a 16:9 terrain tile, which asked its renderer for 720 against the
     // wall's 432. Its frames took 36 ms (render 29 ms and two encodes) at the
