@@ -185,6 +185,8 @@ pub struct RestorePhases {
     /// verification read and UDP rule (one `iptables` spawn each), and for
     /// each half of the gate the nf_tables read of its rules and the one
     /// commit that removes it in both families.
+    /// The gate was verified and the UDP rule added over nfnetlink.
+    pub tcp_gate_netlink: bool,
     pub tcp_gate_verify_ipv4_ms: f64,
     pub tcp_gate_verify_ipv6_ms: f64,
     pub tcp_gate_udp_ipv4_ms: f64,
@@ -231,6 +233,7 @@ impl RestorePhases {
         self.tcp_already_gone = boundary.tally.already_gone;
         self.tcp_destroy_datagrams = boundary.tally.datagrams;
         let gate = boundary.gate;
+        self.tcp_gate_netlink = gate.netlink;
         self.tcp_gate_verify_ipv4_ms = gate.verify_ipv4_ms;
         self.tcp_gate_verify_ipv6_ms = gate.verify_ipv6_ms;
         self.tcp_gate_udp_ipv4_ms = gate.udp_ipv4_ms;

@@ -18,6 +18,10 @@ pub async fn run() -> Result<()> {
     // block a thread on a full tty buffer. See fc-agent/src/console.rs.
     crate::console::init();
 
+    // What iptables writes for the snapshot gate, learned off the boot path so
+    // a restore can verify the gate and gate UDP without starting a process.
+    crate::snapshot_network::learn_gate_template_in_background();
+
     // Periodic guest vitals. A plain OS thread, not a tokio task: a wedged
     // procfs read must not be able to starve the runtime that serves execs.
     // The `[fcvm-vitals]` prefix routes these to the per-VM debug file and NOT
