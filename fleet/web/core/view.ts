@@ -1395,6 +1395,8 @@ export interface WallView {
   rotateHint: string;
   /** The live image is whole and the fleet awake. */
   live: boolean;
+  /** How this viewer's picture arrives (broadcast, direct or combined streams), shown beside the Wall / Phones switch; null before the first state. */
+  streamMode: StreamModeView | null;
   /** "2560×1440 · 15 × NVIDIA T4 · 30 fps · path traced", or "". */
   spec: string;
   /** The last race in one line, or "". */
@@ -1415,6 +1417,35 @@ export interface WallView {
   broadcast: { url: string; latency: string; paused: boolean } | null;
   /** The stream stats' line on the wall's rate and the renderer holding it back (wallRateLine). */
   wallRate: string;
+}
+
+export interface StreamModeView {
+  label: string;
+  /** What it means and where it changes, for the title and the accessible name. */
+  detail: string;
+}
+
+/**
+ * The label beside the Wall / Phones switch: a saved broadcast choice is otherwise invisible until a tile is opened.
+ * Outside the broadcast it names the mode the worker draws (`shownMode`), which keeps the old streams until
+ * every new one is ready, and says when a switch to `planned` is pending. Before the first draw it names `planned`.
+ */
+export function streamModeView(s: ClientState, broadcast: boolean, planned: DrawPlan["mode"]): StreamModeView {
+  if (broadcast) {
+    return s.admission?.locked
+      ? { label: "Broadcast", detail: "Direct streams are full, so this is the broadcast, a few seconds behind the fleet" }
+      : { label: "Broadcast", detail: "The broadcast, a few seconds behind the fleet. Direct the scene switches it off" };
+  }
+  const name = (m: DrawPlan["mode"]) => (m === "aggregated" ? "combined streams" : "direct streams");
+  const drawn: DrawPlan["mode"] = s.frames === null ? planned : s.ui.shownMode === "aggregated" ? "aggregated" : "direct";
+  const what =
+    drawn === "aggregated"
+      ? "One stream per host, each joining its VMs' frames. Direct the scene switches streams"
+      : "Every VM's own stream. Direct the scene switches streams";
+  return {
+    label: drawn === "aggregated" ? "Combined streams" : "Direct streams",
+    detail: drawn === planned ? what : `Switching to ${name(planned)} once each one is ready. ${what}`,
+  };
 }
 
 /**
@@ -1663,6 +1694,7 @@ export function wallView(input: WallInput): WallView {
       ownRefusal: null,
       viewers: "",
       live: false,
+      streamMode: null,
       spec: "",
       lastRace: "",
       outOfRotation: "",
@@ -1841,6 +1873,7 @@ export function wallView(input: WallInput): WallView {
     ownRefusal: s.own.refused === null ? null : { text: `No GPU is free right now: ${s.own.refused}. Try again in a minute.`, dismiss: "OK" },
     viewers: fmt.count(st.viewers.active, "person watching", "people watching"),
     live: st.fleet.power.state === "awake" && pictureWhole,
+    streamMode: streamModeView(s, broadcast, plan.mode),
     spec: specLine(st, s, planLayout?.image ?? null, input.dpr),
     lastRace: lastRaceLine(st),
     outOfRotation: outOfRotationLine(st),

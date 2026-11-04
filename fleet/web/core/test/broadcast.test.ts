@@ -20,7 +20,7 @@ import { admitMessage, frameSocketUrl, sameStreamAtAnyHeight } from "../net.ts";
 import { seatMessage } from "../protocol.ts";
 import type { Admission, FleetState } from "../protocol.ts";
 import { initialState, reduce, type ClientState } from "../store.ts";
-import { wallView } from "../view.ts";
+import { streamModeView, wallView } from "../view.ts";
 import { EPOCH, fleet, snapshotText } from "./fixtures.ts";
 
 const PLAYBACK = "https://playback.example/channel.m3u8?token=jwt";
@@ -389,5 +389,26 @@ describe("a frame from before the fleet slept", () => {
     expect(currentFrame(s, old)).toBeNull();
     const shown = broadcastShown(s, currentFrame(s, old), EPOCH + 65_000);
     expect(shown.now).toBe(EPOCH + 65_000);
+  });
+});
+
+describe("the stream mode beside Wall / Phones", () => {
+  const base = (): ClientState => initialState();
+  // Only whether the worker has reported a draw matters here.
+  const drawn = {} as NonNullable<ClientState["frames"]>;
+  it("names the mode the worker draws, and says when a switch to the other is pending", () => {
+    const s = base();
+    s.frames = drawn;
+    s.ui = { ...s.ui, mode: "direct", shownMode: "aggregated" };
+    const v = streamModeView(s, false, "direct");
+    expect(v.label).toBe("Combined streams");
+    expect(v.detail).toMatch(/^Switching to direct streams/);
+    s.ui = { ...s.ui, shownMode: "direct" };
+    expect(streamModeView(s, false, "direct").label).toBe("Direct streams");
+  });
+  it("before the worker has drawn anything, names the planned mode", () => {
+    const s = base();
+    s.frames = null;
+    expect(streamModeView(s, false, "direct").label).toBe("Direct streams");
   });
 });

@@ -66,6 +66,9 @@ h1, h2, h3, p { margin: 0; }
 .mode-link { min-height: 32px; display: inline-flex; align-items: center; padding: 0 12px; border-radius: 6px; font: 500 14px var(--sans); color: var(--muted); text-decoration: none; }
 .mode-link:hover { color: var(--text); }
 .mode-link[aria-current="page"] { color: var(--text); background: rgba(255, 255, 255, 0.12); }
+.stream-mode { min-height: 32px; display: inline-flex; align-items: center; margin-left: 4px; padding: 0 10px; border: 0; border-left: 1px solid var(--control); border-radius: 0 6px 6px 0; background: none; font: 500 14px var(--sans); color: var(--muted); }
+button.stream-mode { cursor: pointer; }
+button.stream-mode:hover { color: var(--text); }
 .phone > .mode-switch { align-self: flex-start; margin: 0 16px; }
 /* Between the phone breakpoint and a wide window the title and the controls do not fit one
    row: the controls wrap under it, right-aligned, rather than run off the screen. */
