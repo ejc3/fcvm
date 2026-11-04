@@ -54,6 +54,8 @@ export interface TileFrameStats {
   newestT: number | null;
   width: number;
   height: number;
+  /** The decoded picture's height before the stream's crop (`height` is after it): a phone's whole screen. */
+  fullHeight?: number;
   /** Shown dimmed: behind the common time. */
   behind: boolean;
   decodeMs: number | null;

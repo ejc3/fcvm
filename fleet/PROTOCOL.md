@@ -160,7 +160,7 @@ Intents:
 | `claim_autopilot` | `{"on": false}` or `{"on": true}` | stops your claimed GPU's autopilot (the camera comes to rest along its path over 1 s, on a keyframe with `"intent": <id>`, and stays there) or starts it again (the camera flies from where it is to the nearest point of the loop in 2 to 8 s, that keyframe carrying the intent, and on around it). Refused without a claim; the state it already has commits and changes nothing |
 | `claim_phone` | `{"phone": "phone-2"}` (or `{}`: any free phone) | borrows a phone for 120 s (`phone_claim_secs`); see "Phones mode" below |
 | `release_phone` | `{"claim": "phone-claim-3"}` (or `{}`) | gives your phone back early; it is restored from its snapshot for the next viewer |
-| `phone_action` | `{"action": "rotate", "claim": "phone-claim-3"}` (`claim` optional) | one of the fixed take-over actions on your borrowed phone; see "Phones mode" |
+| `phone_action` | `{"action": "rotate", "claim": "phone-claim-3"}` (`claim` optional), or `{"action": "tap", "x": 0.25, "y": 0.9}` | one of the fixed take-over actions on your borrowed phone, or a tap on its screen while Robot Park is in front; see "Phones mode" |
 | `phones_zoom` | `{"out": true}` or `{"out": false}` | zooms every viewer's phones out (each phone shows its app's bars) or back in; one change every 2 s per client; see "Phones mode" |
 
 There is no intent to move the wall's camera, set its time of day, relaunch every tile
@@ -747,7 +747,8 @@ The snapshot's `state.phones` is absent with no phones, else:
  "borrow": {"cap": 1, "lent": 1, "next_return_at": 1761134525000},
  "zoomed_out": false, "zoom_at": 1761134400000,
  "tiles": [{"id": "phone:1", "slot": "phone-1", "rect": {"x": 0, "y": 0, "w": 0.5, "h": 1}, "phase": "running",
-            "actions": ["switch_screen", "rotate", "dark_mode", "dance", "wave", "gpu_benchmark", "restart_app", "open_browser", "open_app", "reboot_phone"],
+            "actions": ["switch_screen", "rotate", "dark_mode", "dance", "wave", "gpu_benchmark", "restart_app", "open_browser", "open_app", "reboot_phone", "tap"],
+            "front": "app",
             "frame_url": "wss://...", "borrowed": {"session": "phone-claim-3", "viewer": "v-12", "since": ..., "until": ...},
             "last_relaunch": {"clicked_at": ..., "by": "reboot:phone-claim-3", "first_frame_at": ..., "phases": {...}}, ...}]}
 ```
@@ -755,7 +756,9 @@ The snapshot's `state.phones` is absent with no phones, else:
 `tiles` are wall tiles' fields (`TileView`) laid out in the phones' own image: one row of up
 to six, then rows of equal length, each phone `config.phone_aspect` wide for 1 high (Robot
 Park's surface, 720 x 1280). `image_aspect` is that image's. A borrowed phone keeps its
-place and its stream (`borrowed` names its viewer). `last_relaunch` times the phone's last
+place and its stream (`borrowed` names its viewer). `front` is the app in front, `app`
+(Robot Park) or `browser`, as the actions the coordinator accepted for the phone's current
+launch leave it (below). `last_relaunch` times the phone's last
 restore from the click (or the wake) to the app's first stamped frame, as for a wall tile.
 
 **Zooming out** (`phones_zoom`) is shared by every viewer, like the wall's scene. The
@@ -777,7 +780,8 @@ now: none is running and free`. The borrow ends after `phone_claim_secs`, on `re
 or when its viewer leaves; the phone is then restored from its snapshot
 (`last_relaunch.by` `return:<session>`), so the next viewer finds it as every phone starts.
 
-**Actions** (`phone_action`): only the viewer holding the phone, at most one a second, and
+**Actions** (`phone_action`): only the viewer holding the phone, at most one a second (taps
+have their own limit, below), and
 only these names; anything else is refused (`args.action must be one of ...`) and nothing
 reaches the phone. A phone also offers only what its host's agent lists in its hello (`phone_actions`), and
 `reboot_phone`, which is the coordinator's own. Each phone tile lists its own (`actions`), and
@@ -795,15 +799,37 @@ before it reaches the assignment, which an agent without that name would skip wh
 | `open_browser` | the phone's web browser comes to the front on https://www.nvidia.com/ and loads it again; while the holder's GPU mirror is open, the browser starts again instead (ARCHITECTURE.md, "The browser") | none |
 | `open_app` | Robot Park comes to the front | none |
 | `reboot_phone` | the phone's VM is restored from its snapshot (`last_relaunch.by` `reboot:<session>`) | none |
+| `tap` | a touch at `x`, `y` on the screen, while Robot Park is in front | none: adb's `input tap` |
+
+**Taps** (`tap`) are the one action with arguments: `x` and `y`, fractions of the phone's
+screen in its current orientation from its top left corner, each a finite number in [0, 1]
+(`args.x must be between 0 and 1`, `args.y must be a number`); no other action takes them
+(`args.x is only for tap`). A tap is refused unless the phone is running its current launch
+(`phone-1 is not running`) with Robot Park in front (`taps reach the phone only in Robot Park;
+phone-1 shows the browser`), and comes at most once every 200 ms from a holder (`one tap every
+200 ms; wait 40 ms`), a limit of its own: taps and the other actions do not hold each other
+back. `front` follows the accepted actions: `open_browser` puts the browser in front, every
+action for Robot Park (`switch_screen` to `gpu_benchmark`, `open_app`) puts Robot Park there,
+`restart_app` and `tap` change nothing, and every relaunch, a reboot or a return included,
+starts the phone with Robot Park in front. A tap stays in the assignment for 3 s, not 30: one
+that reaches the phone later would land on a screen the viewer no longer sees. The page sends
+a tap for a click on the held phone's screen (its video or its GPU mirror), only on a phone
+whose `actions` list `tap`.
 
 The coordinator hands every action but `reboot_phone` to the phone's agent in the phone's
 assignment (`phone.actions` below) for 30 s, numbered (`seq`) and tagged with the launch
 they are for; the agent carries out each once with `phone.sh action <name>` in the phone's
-container, which sends the app the one request its name maps to (`switch_screen` and
-`dark_mode` remember which they sent last, so each is a toggle). An action for Robot Park
+container (`phone.sh action tap <x> <y>`, the point as two decimals with four places), which
+sends the app the one request its name maps to (`switch_screen` asks the app which screen
+it shows, since a tap on its tabs changes that too, and sends the other; `dark_mode`
+remembers which it sent last; so each is a toggle). The agent drops a tap it reaches 3 s
+into a batch of actions, behind a slow one. An action for Robot Park
 brings it to the front first when the browser is there, and starts it again while the holder's
 GPU mirror is open. `open_browser` and `open_app` use
-adb in the container and send the app nothing.
+adb in the container and send the app nothing. `tap` asks Robot Park its surface size
+(`status`, which turns with the screen), maps the point to that pixel and runs `input tap`;
+it fails, and nothing reaches the phone, when the container's own record says the browser is
+in front.
 
 ## Agent
 
@@ -847,7 +873,8 @@ The coordinator keeps the times that fall inside the current wake in the wake's 
 GPUs the host runs phones on (`--phones N`: the last N of its inventory), apart from
 `gpus`; the coordinator makes one phone per address not among `gpus`. `phone_actions`
 (optional, phones mode) names the take-over actions the host's phones carry out (an agent
-whose phones have no browser leaves out `open_browser` and `open_app`). `gpus` are the NVIDIA display functions bound to `vfio-pci`, in address
+whose phones have no browser leaves out `open_browser` and `open_app`; an agent that knows `tap`
+lists it, and an older one does not). `gpus` are the NVIDIA display functions bound to `vfio-pci`, in address
 order; `capacity` is how many VMs the host runs at once (default: one per GPU). The
 coordinator makes one slot per GPU and ignores a repeated address. The first hello binds the
 connection to `host`, and a later hello on the same connection must name the same host. A
@@ -963,7 +990,7 @@ none is placed). For each slot the agent reconciles:
   `rect` set, `previous_rect` the whole image) post its rectangle; the renderer keeps drawing
   the whole image until `rect_from_frame`, so it opens the new encoders ahead of the switch.
   No relaunch.
-- `phone: {"image_aspect": 1.125, "actions": [{"seq": 7, "action": "rotate", "at": ..., "generation": 2}], "chrome": [{"t": 812.0, "on": true}], "mirror_viewer": "v-12"}`
+- `phone: {"image_aspect": 1.125, "actions": [{"seq": 7, "action": "rotate", "at": ..., "generation": 2}, {"seq": 8, "action": "tap", "at": ..., "generation": 2, "point": {"x": 0.25, "y": 0.9}}], "chrome": [{"t": 812.0, "on": true}], "mirror_viewer": "v-12"}`
   (phones mode): the slot is a phone. With `--phone-snapshot` its VM is a clone of that warm
   snapshot of a running phone (flow B: `fcvm snapshot run --snapshot <tag> --gpu <sbdf>` with
   the slot's ports, routed address and the host's certificate map; the phone's GPU hook
@@ -2082,7 +2109,11 @@ The same actions arrive by intent, for adb:
 ```
 
 Where the phone runs, for the info tab. Each field optional, a string or number,
-printable ASCII, at most 64 characters.
+printable ASCII, at most 64 characters. A fleet agent sends it once each launch of a phone
+slot runs, with `phone.sh place`, which keeps it and sends it again whenever `phone.sh`
+restarts the app (the app keeps it in memory only): `vm`, `slot`, `region` (the slot's
+`place`, `EC2 in <region>`) and `restored_in_ms` (the launch to the app's first frame), and
+never `host`, since every viewer of the phone reads the info tab.
 
 ### `clock`
 

@@ -379,7 +379,7 @@
       "checks": {
         "/assign/h1/2/phone/actions/1": null,
         "/receipts/c3/outcome": "refused",
-        "/receipts/c3/reason": "args.action must be one of switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, open_browser, open_app, reboot_phone"
+        "/receipts/c3/reason": "args.action must be one of switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, open_browser, open_app, reboot_phone, tap"
       },
       "note": "no free-form input reaches a phone"
     },
@@ -559,7 +559,7 @@
         "id": "c3",
         "name": "phone_action",
         "outcome": "refused",
-        "summary": "args.action must be one of switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, open_browser, open_app, reboot_phone",
+        "summary": "args.action must be one of switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, open_browser, open_app, reboot_phone, tap",
         "viewer": "v1"
       },
       {
@@ -849,6 +849,7 @@
           "fps": null,
           "frame_url": "ws://h1:20101/frames",
           "frame_url_v4": null,
+          "front": "app",
           "generation": 3,
           "gpu": {
             "name": "Tesla T4",
@@ -895,6 +896,7 @@
           "fps": null,
           "frame_url": "ws://h1:20102/frames",
           "frame_url_v4": null,
+          "front": "app",
           "generation": 3,
           "gpu": {
             "name": "Tesla T4",

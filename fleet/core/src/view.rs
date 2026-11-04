@@ -47,6 +47,11 @@ pub struct TileView {
     /// Absent for a wall tile.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actions: Option<Vec<&'static str>>,
+    /// A phone's app in front, `app` (Robot Park) or `browser`, as the actions the coordinator
+    /// accepted for its current launch leave it (`PhoneSlot::front`): taps reach a phone only
+    /// while it is `app`. Absent for a wall tile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub front: Option<&'static str>,
 }
 
 /// The current layout generation: from frame `from_frame` (scene time `from_t`) every
@@ -456,6 +461,7 @@ fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) 
             last_relaunch: None,
             borrowed: None,
             actions: None,
+            front: None,
         },
         Some(s) => TileView {
             id,
@@ -495,6 +501,7 @@ fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) 
             }),
             borrowed: lent,
             actions: None,
+            front: None,
             failure: (s.observed.phase == "failed" && s.observed.generation >= s.generation).then(
                 || TileFailure {
                     kind: "relaunch_failed".into(),
@@ -727,6 +734,12 @@ fn phones_view(state: &State) -> PhonesView {
                     .iter()
                     .map(|a| a.as_str())
                     .collect(),
+            );
+            t.front = Some(
+                s.phone
+                    .as_ref()
+                    .map_or(crate::phone::Front::App, |p| p.front(s.generation))
+                    .as_str(),
             );
             t
         })

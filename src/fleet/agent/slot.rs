@@ -618,14 +618,22 @@ async fn post_if_changed(
 }
 
 /// Carry out the phone's take-over actions of this launch not yet carried out, oldest first,
-/// each once. A failed one is logged and not tried again.
+/// each once. A failed one is logged and not tried again. A tap reached after the batch has run
+/// for `TAP_KEEP_MS` (behind a slow action) is dropped, as the coordinator drops one it kept
+/// that long: it would land on a screen the viewer no longer sees.
 async fn run_phone_actions(ctx: &SlotCtx, r: &mut Running, p: &AssignPhone) {
+    let batch = Instant::now();
+    let tap_keep = Duration::from_millis(fleet_core::phone::TAP_KEEP_MS);
     for a in &p.actions {
         if a.seq <= r.actions_done || a.generation != r.generation {
             continue;
         }
         r.actions_done = a.seq;
-        let Some(argv) = super::vm::phone_action_argv(r.vm.pid, a.action) else {
+        if a.action == fleet_core::phone::PhoneAction::Tap && batch.elapsed() >= tap_keep {
+            tracing::debug!(slot = %ctx.id, seq = a.seq, "a tap waited past its time behind slower actions; dropped");
+            continue;
+        }
+        let Some(argv) = super::vm::phone_action_argv(r.vm.pid, a.action, a.point) else {
             continue;
         };
         let run = tokio::process::Command::new(&ctx.cfg.fcvm)
@@ -634,6 +642,10 @@ async fn run_phone_actions(ctx: &SlotCtx, r: &mut Running, p: &AssignPhone) {
             .kill_on_drop(true)
             .output();
         match tokio::time::timeout(PHONE_ACTION_TIMEOUT, run).await {
+            // taps come up to five a second: their successes are not worth a line each
+            Ok(Ok(o)) if o.status.success() && a.action == fleet_core::phone::PhoneAction::Tap => {
+                tracing::debug!(slot = %ctx.id, seq = a.seq, out = %tail(&o.stdout), "phone tap done")
+            }
             Ok(Ok(o)) if o.status.success() => {
                 // the action's own line: open_browser's says how long the browser took to show
                 tracing::info!(slot = %ctx.id, action = a.action.as_str(), seq = a.seq, out = %tail(&o.stdout), "phone action done")
@@ -850,6 +862,37 @@ async fn relaunch(
     timings.insert("first_frame_ms".into(), ms(first_frame - health_at));
     timings.insert("total_ms".into(), ms(t0.elapsed()));
     ctx.report("running", generation, &timings, None, None);
+    if phone {
+        // Robot Park's info tab shows where it runs; a phone restored from the warm snapshot
+        // has only the snapshot's empty place. Its failure costs the tab a card, nothing more.
+        let argv = super::vm::phone_place_argv(
+            vm.pid,
+            &ctx.vm_name(),
+            &ctx.id,
+            ctx.cfg.place.as_deref(),
+            timings.get("total_ms").copied(),
+        );
+        let (fcvm, id) = (ctx.cfg.fcvm.clone(), ctx.id.clone());
+        tokio::spawn(async move {
+            let run = tokio::process::Command::new(&fcvm)
+                .args(&argv)
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output();
+            match tokio::time::timeout(PHONE_ACTION_TIMEOUT, run).await {
+                Ok(Ok(o)) if o.status.success() => {
+                    tracing::debug!(slot = %id, "the phone was told its place")
+                }
+                Ok(Ok(o)) => {
+                    tracing::warn!(slot = %id, status = %o.status, out = %tail(&o.stderr), "the phone was not told its place")
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(slot = %id, error = %e, "the phone was not told its place")
+                }
+                Err(_) => tracing::warn!(slot = %id, "telling the phone its place timed out"),
+            }
+        });
+    }
     *running = Some(Running {
         vm,
         generation,

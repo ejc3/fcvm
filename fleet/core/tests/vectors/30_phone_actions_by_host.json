@@ -480,6 +480,7 @@
           "fps": null,
           "frame_url": "ws://old:20101/frames",
           "frame_url_v4": null,
+          "front": "app",
           "generation": 2,
           "gpu": {
             "name": "Tesla T4",
@@ -522,6 +523,7 @@
           "fps": null,
           "frame_url": "ws://new:20101/frames",
           "frame_url_v4": null,
+          "front": "app",
           "generation": 2,
           "gpu": {
             "name": "Tesla T4",

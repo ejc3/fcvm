@@ -1,8 +1,8 @@
 //! Phones mode: Android phones on GPU hosts (`docs/fleet/ARCHITECTURE.md`, "Phones mode").
 //! Each phone is a slot of `Fleet::phones` (`phone-<n>`), apart from the wall's slots: the
 //! wall's layout, races, budget and claims never see one. A viewer borrows a phone with
-//! `claim_phone` and sends it the fixed actions below; nothing else a viewer sends reaches
-//! a phone.
+//! `claim_phone` and sends it the fixed actions below, and taps on its screen while Robot
+//! Park is in front; nothing else a viewer sends reaches a phone.
 
 use crate::tiling::Rect;
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,9 @@ pub enum PhoneAction {
     OpenApp,
     /// Restore the phone's VM from its snapshot.
     RebootPhone,
+    /// A touch at a point of the phone's screen (`x`, `y` of the request), while Robot Park
+    /// is in front.
+    Tap,
     /// An action this build does not know, from a newer coordinator: carried out as nothing,
     /// so the rest of the assignment it came in still reaches the agent. Never in `ALL`, so
     /// never accepted from a viewer.
@@ -40,7 +43,7 @@ pub enum PhoneAction {
 }
 
 impl PhoneAction {
-    pub const ALL: [PhoneAction; 10] = [
+    pub const ALL: [PhoneAction; 11] = [
         PhoneAction::SwitchScreen,
         PhoneAction::Rotate,
         PhoneAction::DarkMode,
@@ -51,8 +54,9 @@ impl PhoneAction {
         PhoneAction::OpenBrowser,
         PhoneAction::OpenApp,
         PhoneAction::RebootPhone,
+        PhoneAction::Tap,
     ];
-    pub const NAMES: &'static str = "switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, open_browser, open_app, reboot_phone";
+    pub const NAMES: &'static str = "switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, open_browser, open_app, reboot_phone, tap";
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -66,6 +70,7 @@ impl PhoneAction {
             PhoneAction::OpenBrowser => "open_browser",
             PhoneAction::OpenApp => "open_app",
             PhoneAction::RebootPhone => "reboot_phone",
+            PhoneAction::Tap => "tap",
             PhoneAction::Unknown => "unknown",
         }
     }
@@ -84,16 +89,92 @@ impl PhoneAction {
     pub fn parse(name: &str) -> Option<PhoneAction> {
         PhoneAction::ALL.into_iter().find(|a| a.as_str() == name)
     }
+
+    /// Which app the action leaves in front: Robot Park for every action for it (the phone
+    /// brings it to the front first), the browser for `open_browser`; `None` for those that
+    /// leave the app in front as it was.
+    pub fn front_after(self) -> Option<Front> {
+        match self {
+            PhoneAction::OpenBrowser => Some(Front::Browser),
+            PhoneAction::SwitchScreen
+            | PhoneAction::Rotate
+            | PhoneAction::DarkMode
+            | PhoneAction::Dance
+            | PhoneAction::Wave
+            | PhoneAction::GpuBenchmark
+            | PhoneAction::OpenApp => Some(Front::App),
+            PhoneAction::RestartApp
+            | PhoneAction::RebootPhone
+            | PhoneAction::Tap
+            | PhoneAction::Unknown => None,
+        }
+    }
+}
+
+/// The app in front on a phone: Robot Park, or the web browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Front {
+    App,
+    Browser,
+}
+
+impl Front {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Front::App => "app",
+            Front::Browser => "browser",
+        }
+    }
+}
+
+/// A tap's point: fractions of the phone's screen in its current orientation, from its top
+/// left corner. Each is finite and in [0, 1] (`TapPoint::new`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TapPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+impl TapPoint {
+    pub fn new(x: f64, y: f64) -> Result<TapPoint, String> {
+        for (k, v) in [("x", x), ("y", y)] {
+            if !v.is_finite() {
+                return Err(format!("args.{k} must be finite"));
+            }
+            if !(0.0..=1.0).contains(&v) {
+                return Err(format!("args.{k} must be between 0 and 1"));
+            }
+        }
+        Ok(TapPoint { x, y })
+    }
 }
 
 /// What a phone has that a wall slot does not.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct PhoneSlot {
     pub claim: Option<PhoneClaim>,
-    /// Actions for the agent to carry out, newest last, kept for `ACTION_KEEP_MS`; the agent
-    /// carries out each `seq` once.
+    /// Actions for the agent to carry out, newest last, kept for `ACTION_KEEP_MS` (a tap for
+    /// `TAP_KEEP_MS`); the agent carries out each `seq` once.
     #[serde(default)]
     pub actions: Vec<PhoneActionReq>,
+    /// The launch `open_browser` was last accepted for, with no action for Robot Park after
+    /// it: while that is the phone's current launch, the browser is in front. A relaunch
+    /// restores the phone with Robot Park in front, so a new generation ends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_generation: Option<u64>,
+}
+
+impl PhoneSlot {
+    /// The app in front on the phone's launch `generation`, as the actions accepted for it
+    /// leave it.
+    pub fn front(&self, generation: u64) -> Front {
+        if self.browser_generation == Some(generation) {
+            Front::Browser
+        } else {
+            Front::App
+        }
+    }
 }
 
 /// A viewer's borrowed phone.
@@ -107,6 +188,9 @@ pub struct PhoneClaim {
     /// The last action it sent, for the rate limit.
     #[serde(default)]
     pub last_action_at: Option<u64>,
+    /// The last tap it sent: taps have a rate limit of their own (`TAP_INTERVAL_MS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tap_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,6 +201,9 @@ pub struct PhoneActionReq {
     pub at: u64,
     /// The phone's generation it is for: a relaunched phone drops the actions of the one before.
     pub generation: u64,
+    /// A tap's point; absent for every other action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point: Option<TapPoint>,
 }
 
 /// Every phone shows its app's top and tab bars from scene time `t` (`on`) or hides them
@@ -147,8 +234,15 @@ pub const ZOOM_INTERVAL_MS: u64 = 2_000;
 /// How long an action stays in the assignment (an agent that reconnects within it still
 /// carries it out).
 pub const ACTION_KEEP_MS: u64 = 30_000;
-/// The least time between two actions of one borrowed phone.
+/// The least time between two actions of one borrowed phone (taps apart).
 pub const ACTION_INTERVAL_MS: u64 = 1_000;
+/// The least time between two taps on one borrowed phone. The agent carries out one tap at a
+/// time, and one took 113 to 214 ms on a g4dn.metal (`fcvm exec` about 120 ms of it, adb's
+/// `input tap` about 40), so at one every 200 ms the phone keeps up with its holder.
+pub const TAP_INTERVAL_MS: u64 = 200;
+/// How long a tap stays in the assignment: a touch that reaches the phone later than this
+/// would land on a screen the viewer no longer sees, so it is dropped instead.
+pub const TAP_KEEP_MS: u64 = 3_000;
 
 /// Rows and columns for `n` phones: one row of up to six, then rows of equal length.
 pub fn grid(n: usize) -> (usize, usize) {

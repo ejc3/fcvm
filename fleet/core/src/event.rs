@@ -173,10 +173,12 @@ pub enum Intent {
     PhonesZoom {
         out: bool,
     },
-    /// One of the fixed take-over actions, on the viewer's borrowed phone.
+    /// One of the fixed take-over actions, on the viewer's borrowed phone; `point` for a tap
+    /// and only for one.
     PhoneAction {
         claim: Option<String>,
         action: crate::phone::PhoneAction,
+        point: Option<crate::phone::TapPoint>,
     },
 }
 
@@ -367,9 +369,24 @@ impl Intent {
                             crate::phone::PhoneAction::NAMES
                         )
                     })?;
+                // a tap's point, fractions of the screen; no other action takes one
+                let point = if action == crate::phone::PhoneAction::Tap {
+                    Some(crate::phone::TapPoint::new(
+                        num(args, "x")?,
+                        num(args, "y")?,
+                    )?)
+                } else {
+                    for k in ["x", "y"] {
+                        if args.get(k).is_some() {
+                            return Err(format!("args.{k} is only for tap"));
+                        }
+                    }
+                    None
+                };
                 Ok(Intent::PhoneAction {
                     claim: opt_str(args, "claim", "a claim id")?,
                     action,
+                    point,
                 })
             }
             other => Err(format!("unknown intent {other:?}")),

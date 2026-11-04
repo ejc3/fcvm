@@ -12,7 +12,9 @@ const bezels = (page: Page) => page.getByTestId("phone-bezel");
 
 type MockPhones = { zoomed_out: boolean; tiles: { id: string; phase: string; borrowed: { session: string; viewer: string } | null; last_relaunch: { by: string; first_frame_at: number | null } }[] };
 const mockPhones = async () => ((await mockState()).state as unknown as { phones: MockPhones }).phones;
-const phoneActions = async () => ((await (await fetch(`${COORD}/mock/phone-actions`)).json()) as { actions: { action: string; phone: string; session: string }[] }).actions;
+const phoneActions = async () =>
+  ((await (await fetch(`${COORD}/mock/phone-actions`)).json()) as { actions: { action: string; phone: string; session: string; x?: number; y?: number }[] }).actions;
+const taps = async () => (await phoneActions()).filter((a) => a.action === "tap");
 
 /** Open the phones page and wait until every phone draws at the common t. */
 async function openPhones(page: Page, synced = PHONES): Promise<void> {
@@ -188,7 +190,7 @@ test("taking a phone over gives the ten fixed actions; Rotate reaches the phone,
   await expect.poll(async () => (await phoneActions()).map((a) => [a.action, a.phone, a.session])).toEqual([["rotate", "phone-3", session]]);
   // Only the enumerated names get through, whatever the page sends.
   await page.evaluate(() => window.__phones!.client.send("phone_action", { action: "adb shell rm -rf /" }));
-  await expect(page.getByTestId("phone-notice")).toHaveText("args.action must be one of switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, open_browser, open_app, reboot_phone");
+  await expect(page.getByTestId("phone-notice")).toHaveText("args.action must be one of switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, open_browser, open_app, reboot_phone, tap");
   expect(await phoneActions()).toHaveLength(1);
   await page.getByTestId("phone-give-back").click();
   await expect.poll(async () => (await mockPhones()).tiles[2]!.borrowed).toBeNull();
@@ -286,6 +288,93 @@ test("on a host that lists only Reboot phone, the panel offers only that and the
   await expect(page.getByTestId("phone-notice")).toHaveText("phone-2's host does not support rotate");
   expect(await phoneActions()).toEqual([]);
   await expect(page.getByTestId("phone-readout-mirror")).toContainText("Draws only what the app creates from now on, so it can stay blank (Video shows the phone): this phone's host does not support restarting the app");
+  await page.getByTestId("phone-give-back").click();
+});
+
+/** Take phone `n` over and wait until it is this viewer's. */
+async function takeOver(page: Page, n: number): Promise<void> {
+  await page.getByTestId(`phone-hit-phone:${n}`).click();
+  await page.getByTestId("phone-take").click();
+  await expect(page.getByTestId("phone-borrow")).toHaveAttribute("data-kind", "yours");
+}
+const tapTarget = async (page: Page, name: "video" | "mirror") => (await view(page)).taps?.targets.find((t) => t.name === name) ?? null;
+
+test("a click on the held phone's screen is a tap there, in the video and in the GPU mirror; a click on the bezel sends nothing", async ({ page }) => {
+  await openPhones(page);
+  await takeOver(page, 3);
+  const session = (await mockPhones()).tiles[2]!.borrowed!.session;
+  await expect(page.getByTestId("phone-tap-video")).toBeVisible();
+  expect(await page.getByTestId("phone-tap-video").evaluate((el) => getComputedStyle(el).cursor)).toBe("pointer");
+  const t = (await tapTarget(page, "video"))!;
+  const card = (await view(page)).cards.find((c) => c.id === "phone:3")!;
+  // the target is the drawn screen, inside the bezel
+  expect(t.box).toEqual(card.box);
+  await page.mouse.click(t.box.x + 0.25 * t.box.w, t.box.y + 0.6 * t.box.h);
+  await expect.poll(async () => (await taps()).length).toBe(1);
+  const [first] = await taps();
+  expect([first!.phone, first!.session]).toEqual(["phone-3", session]);
+  expect(first!.x).toBeCloseTo(0.25, 2);
+  expect(first!.y).toBeCloseTo(0.6 * t.yScale, 2);
+  // the bezel: inside the body, outside the screen
+  const b = card.bezel!;
+  await page.mouse.click(b.x + card.pad.left / 2, b.y + b.h / 2);
+  await page.mouse.click(b.x + b.w / 2, b.y + card.pad.top / 2);
+  await page.waitForTimeout(400);
+  expect(await taps()).toHaveLength(1);
+  await expect(page.getByTestId("phone-notice")).toHaveCount(0);
+  // the GPU mirror beside the video takes taps the same way
+  await page.getByTestId("phone-view-both").click();
+  await expect(page.getByTestId("phone-tap-mirror")).toBeVisible();
+  const m = (await tapTarget(page, "mirror"))!;
+  expect(m.box).toEqual((await view(page)).mirror!.box);
+  await page.mouse.click(m.box.x + 0.75 * m.box.w, m.box.y + 0.1 * m.box.h);
+  await expect.poll(async () => (await taps()).length).toBe(2);
+  const second = (await taps())[1]!;
+  expect(second.x).toBeCloseTo(0.75, 2);
+  expect(second.y).toBeCloseTo(0.1 * m.yScale, 2);
+  await expect(page.getByTestId("phone-notice")).toHaveCount(0);
+  await page.getByTestId("phone-give-back").click();
+  await expect(page.getByTestId("phone-tap-video")).toHaveCount(0);
+});
+
+test("on a host that does not list tap the screen takes no taps: a click sends nothing and shows no refusal", async ({ page }) => {
+  await admin("/mock/fault", { phone_offers: { "phone-2": ["switch_screen", "rotate", "dance", "restart_app", "reboot_phone"] } });
+  await openPhones(page);
+  await takeOver(page, 2);
+  await expect(page.getByTestId("phone-tap-video")).toHaveCount(0);
+  await expect(page.getByTestId("phone-tap-note")).toHaveCount(0);
+  const box = (await view(page)).cards.find((c) => c.id === "phone:2")!.box!;
+  await page.mouse.click(box.x + box.w / 2, box.y + box.h / 2);
+  await page.waitForTimeout(400);
+  expect(await phoneActions()).toEqual([]);
+  await expect(page.getByTestId("phone-notice")).toHaveCount(0);
+  const labels = await page.getByTestId("phone-borrow").getByRole("group", { name: "Actions" }).getByRole("button").allTextContents();
+  expect(labels).toEqual(["Switch screen", "Rotate", "Dance", "Restart app", "Reboot phone"]);
+  await page.getByTestId("phone-give-back").click();
+});
+
+test("with the browser in front the screen takes no taps, and a line under it says taps reach the phone only in Robot Park", async ({ page }) => {
+  await openPhones(page);
+  await takeOver(page, 4);
+  await expect(page.getByTestId("phone-tap-video")).toBeVisible();
+  await page.getByTestId("phone-action-open_browser").click();
+  await expect(page.getByTestId("phone-tap-note")).toHaveText("Taps reach the phone only in Robot Park.");
+  await expect(page.getByTestId("phone-tap-video")).toHaveCount(0);
+  const note = (await page.getByTestId("phone-tap-note").boundingBox())!;
+  const box = (await view(page)).cards.find((c) => c.id === "phone:4")!;
+  expect(note.y).toBeGreaterThanOrEqual(box.bezel!.y + box.bezel!.h);
+  await page.mouse.click(box.box!.x + box.box!.w / 2, box.box!.y + box.box!.h / 2);
+  await page.waitForTimeout(400);
+  expect((await phoneActions()).map((a) => a.action)).toEqual(["open_browser"]);
+  await expect(page.getByTestId("phone-notice")).toHaveCount(0);
+  // Robot Park back in front: the screen takes taps again
+  await page.waitForTimeout(1100);
+  await page.getByTestId("phone-action-open_app").click();
+  await expect(page.getByTestId("phone-tap-note")).toHaveCount(0);
+  await expect(page.getByTestId("phone-tap-video")).toBeVisible();
+  const t = (await tapTarget(page, "video"))!;
+  await page.mouse.click(t.box.x + t.box.w / 2, t.box.y + t.box.h / 2);
+  await expect.poll(async () => (await phoneActions()).map((a) => a.action)).toEqual(["open_browser", "open_app", "tap"]);
   await page.getByTestId("phone-give-back").click();
 });
 

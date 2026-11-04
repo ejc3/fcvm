@@ -16,6 +16,9 @@ import {
   zoomProgressAt,
   phonesView,
   sameViewer,
+  tapPoint,
+  TAP,
+  TAP_INTERVAL_MS,
   type Box,
   type MirrorPicture,
   type PhoneCard,
@@ -24,6 +27,7 @@ import {
   type SceneClock,
   type StreamReadout,
   type TakeoverView,
+  type TapTarget,
 } from "../../core/index.ts";
 import { RateMeter } from "../../core/meter.ts";
 import type { MirrorIn, MirrorOut, MirrorStatsMsg } from "./mirror/mirror-msgs.ts";
@@ -513,6 +517,22 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
     }
   }, [client]);
 
+  // ---- taps on the held phone's screen ----------------------------------------------
+
+  // The coordinator takes one tap every TAP_INTERVAL_MS from a holder: a quicker click is
+  // dropped here rather than refused there, which would put its refusal on screen.
+  const nextTapAt = useRef(0);
+  const onTap = (target: TapTarget, e: React.MouseEvent<HTMLDivElement>) => {
+    const taps = viewRef.current?.taps;
+    if (!taps) return;
+    const p = tapPoint(target, e.clientX, e.clientY);
+    if (p === null) return;
+    const t = localNow();
+    if (t < nextTapAt.current) return;
+    nextTapAt.current = t + TAP_INTERVAL_MS + 10;
+    client.act("phone_action", { action: TAP, x: p.x, y: p.y, claim: taps.session });
+  };
+
   // ---- opening a phone -------------------------------------------------------------
 
   const panelOpen = view.panel !== null;
@@ -612,11 +632,22 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
           c.labelBox && c.bezelOpacity > 0.001 ? (
             <div key={c.id} className="phone-label" style={{ ...at(c.labelBox), opacity: c.bezelOpacity }} data-testid={`phone-label-${c.id}`}>
               <span>{c.label}</span>
+              {view.taps?.tileId === c.id && view.taps.note ? (
+                <span className="tap-note" data-testid="phone-tap-note">
+                  {view.taps.note}
+                </span>
+              ) : null}
             </div>
           ) : null,
         )}
       </div>
       <div ref={mirrorHostRef} className="phone-mirror" data-testid="phone-mirror" style={m ? ({ position: "fixed", ...at(m.box), "--mirror-h": `${m.canvasHeight}px` } as CSSProperties) : { display: "none" }} />
+      {/* above the video and the mirror: a click on the screen is a tap on the phone */}
+      <div className="phone-taps">
+        {view.taps?.targets.map((t) => (
+          <div key={t.name} className="phone-tap" style={at(t.box)} aria-hidden="true" data-testid={`phone-tap-${t.name}`} onClick={(e) => onTap(t, e)} />
+        ))}
+      </div>
       {view.panel ? (
         <PanelView panel={view.panel} narrow={narrow} top={sheetTop} client={client} slot={openedSlot} onBack={close} backRef={backRef} onView={setTakeover} onAction={actPhone} />
       ) : null}

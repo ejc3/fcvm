@@ -75,6 +75,12 @@ export interface Tile {
 /** A phone: a Tile with the take-over actions it accepts (those its host carries out). */
 export interface PhoneTile extends Tile {
   actions: string[];
+  /**
+   * The app in front, as the actions the coordinator accepted for the phone's current launch
+   * leave it: Robot Park (`app`) or the web browser. Taps reach a phone only while it is `app`.
+   * Null from a coordinator that does not say.
+   */
+  front: "app" | "browser" | null;
 }
 
 export interface CameraKey {
@@ -689,6 +695,7 @@ function parsePhones(v: unknown): Phones | null {
   const tiles: PhoneTile[] = arr(v, "tiles", w).map((t, i) => ({
     ...parseTile(t, i),
     actions: arr(t as Obj, "actions", `${w}.tiles[${i}]`).filter((x): x is string => typeof x === "string"),
+    front: (t as Obj)["front"] === "app" || (t as Obj)["front"] === "browser" ? ((t as Obj)["front"] as "app" | "browser") : null,
   }));
   const ids = new Set<string>();
   for (const t of tiles) {
