@@ -352,6 +352,15 @@ advertisements. The verify brackets, the diag's address expectation and
 and count AAAA answers for an IPv6 replay. The memory, host-control and scale
 phases stay rootless.
 
+In a root mode the campaign refuses the `-fast` arms and defaults to `cdp,noop`. A
+`-fast` arm ends its clone with one SIGKILL, which in these modes leaves the clone's
+host-side network (iptables rules, veth, namespace) for the next fcvm launch to
+reclaim, so the next request pays for it. On a bridged trial the no-render arm's
+median was 307 ms after a `-fast` request and 185 ms after a normal teardown. Use
+`ARMS=cdp,html,noop`. The no-render arm's spread in these modes (sd 66 ms after a
+normal teardown, against 1.1 ms rootless) takes more requests for the drift gate's
+interval to resolve its ±10 ms margin; the report's runs use `REPS=402`.
+
 ## Seven methodology defects — do not reintroduce
 
 1. **Matched accounting basis.** Sum memory over the SAME process set for every

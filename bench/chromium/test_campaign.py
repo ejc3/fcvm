@@ -2313,6 +2313,30 @@ class ReplayAddressByNetworkMode(unittest.TestCase):
                                  env={**os.environ, **wiring}, timeout=30, check=True).stdout
         self.assertEqual(out.split(), ["example.com"])
 
+    def test_a_root_mode_refuses_a_fast_teardown_arm(self):
+        """A -fast arm SIGKILLs its clone, and in bridged or routed mode the
+        next fcvm launch then reclaims that clone's host-side network, so one
+        request's teardown lands in the next request's time (trial: no-render
+        median 307 ms after a -fast request, 185 ms after a normal teardown).
+
+        Red before the fix: the campaign accepted ARMS=cdp,cdp-fast,noop in
+        bridged mode and went on to build a golden."""
+        text = campaign()
+        head = text[:text.index('REPS="${REPS:-202}"')]
+        head = head[head.index('NETMODE="${NETMODE:-rootless}"'):]
+        for mode, arms, refused in (("bridged", "cdp,cdp-fast,noop", True),
+                                    ("routed", "cdp,html-fast,noop", True),
+                                    ("bridged", "cdp,html,noop", False),
+                                    ("rootless", "cdp,cdp-fast,noop", False)):
+            script = f"set -euo pipefail\nENGINE=chromium\nNETMODE={mode}\nARMS={arms}\n{head}\necho ACCEPTED\n"
+            out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+            with self.subTest(mode=mode, arms=arms):
+                if refused:
+                    self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+                    self.assertIn("-fast arm", out.stderr)
+                else:
+                    self.assertIn("ACCEPTED", out.stdout, out.stderr)
+
     def test_every_root_phase_runs_fcvm_under_sudo_in_the_mode(self):
         """A bridged or routed fcvm needs root, and reqbench runs it as root only
         through SUDO; every sub-make that drives a clone must carry both."""

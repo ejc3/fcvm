@@ -70,12 +70,25 @@ case "$REPLAY_IP" in *:*) REPLAY_QTYPE=28; REPLAY_RR=AAAA ;; *) REPLAY_QTYPE=1; 
 # IPv6 address bracketed.
 case "$REPLAY_BIND" in *:*) REPLAY_BIND_URL="[$REPLAY_BIND]" ;; *) REPLAY_BIND_URL=$REPLAY_BIND ;; esac
 export NETMODE
+
 # cdp-fast is CDP WebSocket prewiring; WebKit's driver has no WebSocket, so its
 # default drops that arm rather than recording 202 guaranteed failures.
 if [ "${ENGINE:-chromium}" = webkit ]; then
     ARMS="${ARMS:-cdp,noop}"
+elif [ -n "$FCVM_SUDO" ]; then
+    ARMS="${ARMS:-cdp,noop}"
 else
     ARMS="${ARMS:-cdp,cdp-fast,noop}"
+fi
+# A -fast arm ends its clone with one SIGKILL. In a root mode that leaves the
+# clone's host-side network (iptables rules, veth, namespace) for the next fcvm
+# launch to reclaim, so the next request pays for this one's teardown: on a
+# bridged trial the no-render arm's median was 307 ms after a -fast request and
+# 185 ms after a normal teardown. Rootless clones' state dies with them.
+if [ -n "$FCVM_SUDO" ]; then
+    case ",$ARMS," in
+        *-fast,*) echo "BLOCKED: ARMS=$ARMS has a -fast arm, whose teardown in $NETMODE mode leaves host state the next request's launch reclaims; use cdp, html and noop" >&2; exit 2 ;;
+    esac
 fi
 REPS="${REPS:-202}"
 WARMUP="${WARMUP:-28}"          # two full 14-URL cycles; the harness fails closed below this
