@@ -301,7 +301,8 @@ export class MockPhones {
     if (!p) throw new Error(`no phone ${slot}`);
     const bad = offers.filter((a) => !PHONE_ACTION_NAMES.some((n) => n === a));
     if (bad.length) throw new Error(`not phone actions: ${bad.join(", ")}`);
-    p.offers = PHONE_ACTION_NAMES.filter((n) => offers.includes(n));
+    // as the coordinator does (PhoneAction::offered), Reboot phone is offered whatever the host lists
+    p.offers = PHONE_ACTION_NAMES.filter((n) => n === "reboot_phone" || offers.includes(n));
     this.host.markDirty();
   }
 

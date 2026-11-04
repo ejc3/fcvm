@@ -266,7 +266,8 @@ test("a phone taken over shows its video, its GPU mirror or both, each with its 
 });
 
 test("on a host that lists only Reboot phone, the panel offers only that and the mirror joins without restarting the app", async ({ page }) => {
-  await admin("/mock/fault", { phone_offers: { "phone-2": ["reboot_phone"] } });
+  // an empty list: the coordinator still offers Reboot phone
+  await admin("/mock/fault", { phone_offers: { "phone-2": [] } });
   await openPhones(page);
   await page.getByTestId("phone-hit-phone:2").click();
   await page.getByTestId("phone-take").click();
@@ -284,7 +285,7 @@ test("on a host that lists only Reboot phone, the panel offers only that and the
   await page.waitForTimeout(1500);
   await expect(page.getByTestId("phone-notice")).toHaveText("phone-2's host does not support rotate");
   expect(await phoneActions()).toEqual([]);
-  await expect(page.getByTestId("phone-readout-mirror")).toContainText("Draws only what the app creates from now on: this phone's host does not support restarting the app");
+  await expect(page.getByTestId("phone-readout-mirror")).toContainText("Draws only what the app creates from now on, so it can stay blank (Video shows the phone): this phone's host does not support restarting the app");
   await page.getByTestId("phone-give-back").click();
 });
 

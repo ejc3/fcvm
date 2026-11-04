@@ -531,7 +531,7 @@ export function readoutRows(view: TakeoverView, video: StreamReadout | null, mir
             (mirror.leadMs !== undefined && mirror.leadMs !== null
               ? `. ${Math.abs(Math.round(mirror.leadMs))} ms ${mirror.leadMs >= 0 ? "ahead of" : "behind"} the video`
               : "") +
-            (mirror.partial ? ". Draws only what the app creates from now on: this phone's host does not support restarting the app" : "")
+            (mirror.partial ? ". Draws only what the app creates from now on, so it can stay blank (Video shows the phone): this phone's host does not support restarting the app" : "")
           : null,
     });
   return rows;
