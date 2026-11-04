@@ -935,6 +935,25 @@ class ReapDiskPathGuard(unittest.TestCase):
             finally:
                 os.close(probe)
 
+    @staticmethod
+    def _waiting_signal(event):
+        """A patch for fcntl.flock that sets event the first time the calling
+        thread tries a non-blocking exclusive lock: the reap is then waiting."""
+        import fcntl
+        import threading
+        real = fcntl.flock
+        caller = threading.get_ident()
+
+        def flock(fd, op):
+            if threading.get_ident() == caller and op == fcntl.LOCK_EX | fcntl.LOCK_NB:
+                try:
+                    return real(fd, op)
+                except BlockingIOError:
+                    event.set()
+                    raise
+            return real(fd, op)
+        return flock
+
     def test_a_lock_replaced_by_a_second_scanner_is_waited_for_too(self):
         """Scanner A holds the lock, unlinks it and lets go; scanner B, from an
         earlier listing, has meanwhile created and holds a new one. The settle
@@ -947,9 +966,11 @@ class ReapDiskPathGuard(unittest.TestCase):
             a = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
             fcntl.flock(a, fcntl.LOCK_EX)
             b_ready = threading.Event()
+            waiting = threading.Event()
 
             def scanners():
-                time.sleep(0.2)
+                # Replace the lock only once the settle is waiting on A.
+                self.assertTrue(waiting.wait(10))
                 os.remove(lock)
                 b = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
                 fcntl.flock(b, fcntl.LOCK_EX)
@@ -961,11 +982,14 @@ class ReapDiskPathGuard(unittest.TestCase):
                 fcntl.flock(b, fcntl.LOCK_UN)
                 os.close(b)
 
+            from unittest import mock
             t = threading.Thread(target=scanners)
             t.start()
             try:
-                left = reqbench.left_on_disk(state, "")
+                with mock.patch.object(reqbench.fcntl, "flock", self._waiting_signal(waiting)):
+                    left = reqbench.left_on_disk(state, "")
             finally:
+                waiting.set()
                 t.join()
             self.assertTrue(b_ready.is_set())
             self.assertEqual(left, [])
@@ -982,26 +1006,32 @@ class ReapDiskPathGuard(unittest.TestCase):
             lock = f"{state}.lock"
             held = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
             fcntl.flock(held, fcntl.LOCK_EX)
+            waiting = threading.Event()
 
             def scanner():
+                # Hold the lock for 0.5 s after the check starts waiting on it.
+                waiting.wait(10)
                 time.sleep(0.5)
                 os.remove(lock)
                 fcntl.flock(held, fcntl.LOCK_UN)
                 os.close(held)
 
+            from unittest import mock
             p = spawn_pdeathsig_parent(["sleep", "300"])
             wait_for_child(p.pid)
             t = threading.Thread(target=scanner)
             t.start()
             try:
-                out = reqbench.teardown_normal(
-                    p, p.pid, 5.0, d, state, os.path.join(d, "vm-disks", vm_id),
-                    verify_disk_cleanup=True)
+                with mock.patch.object(reqbench.fcntl, "flock", self._waiting_signal(waiting)):
+                    out = reqbench.teardown_normal(
+                        p, p.pid, 5.0, d, state, os.path.join(d, "vm-disks", vm_id),
+                        verify_disk_cleanup=True)
             finally:
+                waiting.set()
                 t.join()
                 kill_tree(p)
             self.assertTrue(out["disk_cleanup_verified"], out)
-            self.assertGreaterEqual(out["teardown_total_ms"], 400.0, out)
+            self.assertGreaterEqual(out["teardown_total_ms"], 500.0, out)
 
     def test_a_lock_beside_a_state_is_never_removed(self):
         with tempfile.TemporaryDirectory() as root:
