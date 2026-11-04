@@ -1054,7 +1054,7 @@ and the page shows it with `?mode=phones`.
 
 ### The GPU mirror
 
-Status: **built**, joining at the app's start; the join snapshot is the next PR (point 3). The owner, 2026-10-29: "when
+Status: **built**; a viewer joins at a snapshot of the phone's color buffers (point 3), and the GL state at the join is the next PR. The owner, 2026-10-29: "when
 you take over a phone, you can have this mirror gpu mode and streaming video mode and both
 shown with bandwidth of each", and "can we have the server gpu mode that can serve as that
 mirror to prevent blocking calls?"
@@ -1169,21 +1169,52 @@ g4dn.metal (1-minute load 1.3 to 3.0):
 
 **3. Joining a phone that has been running for hours.** The mirror needs the state every
 later command builds on: every live context, texture, buffer, program, framebuffer, EGL image
-and color buffer. gfxstream already serializes exactly that for quickboot and for `gpu
-release`: `FrameBuffer::onSave` and the translator's `ShareGroup`/`GLEScontext` `onSave`,
-after `pauseAllPreSave` stops every render thread at a read boundary. The join reuses it: a
-console command (`gpu mirror-join`) pauses, saves into memory, starts the tap while the threads
-are still paused (so the snapshot and the copied stream meet exactly, with each thread's
-unconsumed bytes in the snapshot's `ReadBuffer`), and resumes. The page loads the snapshot
-into its WebGL2 state with a TypeScript loader of the same format, then replays the stream.
-The pause is the save alone, without the release's teardown, which is not measured yet
-(`gpu release` measures 425 to 590 ms with its teardown).
+and color buffer. The streamer starts the tap with `J` instead of `S`, and gfxstream's join
+handler (`RendererImpl::saveMirrorJoin`, ejc3/gfxstream `fcvm/mirror-join`) does what `gpu
+release` does up to its save and stops there: it pauses every render thread at a read boundary,
+starts the copy while they are paused (so each channel's first copied bytes are the ones its
+paused thread had not consumed yet, where the snapshot leaves off), saves, and resumes. The
+saved state reaches the page as `JOIN` records between the HELLO and the first live record,
+outside the tap's ring (which does not bound them):
 
-Until the loader lands (its own PR in the stack), a mirror joins at the next start of the app:
-the panel's GPU-mirror view sends `restart_app` once the stream is open, the app's channels
-open after the copy started (the tap marks them), and the mirror draws every surface whose
-color buffer it saw made. The surfaces of processes older than the join (SystemUI, the
-launcher) are not drawn and are counted.
+| part | what it holds |
+|---|---|
+| BEGIN | the format's version |
+| COLOR_BUFFER | one color buffer: handle, size, format, and its pixels read back as RGBA8 |
+| GL_STATE, TEXTURE, CHANNEL | the translator's state as `FrameBuffer::onSave` writes it for quickboot, the textures that save writes, and each paused channel's saved thread state (its current context and surfaces) |
+| END | whether the snapshot is whole, the pause, and the color buffer posted last |
+
+The page makes every color buffer with its pixels and draws the one posted last at END, so the
+screen is right at once and every layer the composer draws (status bar, wallpaper, launcher)
+is right in the next composition. The GL parts are read by the next PR in the stack; until
+then the panel still restarts the app, so the app's own surfaces redraw live, and the
+surfaces of older processes stay as they were at the join. The streamer queues the `JOIN`
+records under a bound of their own (256 MiB) apart from the live 8 MiB, and the page bounds
+what it has not decoded at 256 MiB while a join is being fed. A join refuses (and the copy
+starts as for `S`) while the emulator holds the render threads paused for its own snapshot or
+a GPU release, and with address space graphics.
+
+Measured on a g4dn.metal (T4), the AOSP phone in its 6 GiB VM, eight joins in one session
+(`scripts/phone/mirror-capture.sh`, a client on the host): six on the home screen (three of them after a `restart_app` that left the home screen in front),
+two with the browser on www.nvidia.com in front.
+
+| | home screen | browser in front |
+|---|---|---|
+| color buffers | 46 to 49 | 53 to 55 |
+| render threads paused (the phone's cost) | 201 to 468 ms, median 238 ms over all eight | 218 and 400 ms |
+| join before compression (pixels 46 to 68 MB, GL state 105 to 185 MB) | 151 to 194 MB | 244 and 253 MB |
+| join on the wire (zstd) | 12.7 to 16.5 MB | 10.1 and 11.3 MB |
+| END at the client, from the stream's open | 0.52 to 1.14 s | 0.79 and 1.00 s |
+
+SurfaceFlinger ran after every join (the capture checks it). The page decodes and draws a
+49-buffer join in about 160 ms in headless Chrome (SwiftShader). The first gpubox run, before the
+join left the guest's reads alone, lost SurfaceFlinger after its first join: a paused channel's
+host-to-guest queue failed every guest read, which ended the guest processes' connections.
+
+**Pixel match at the join.** `e2e/fixtures/mirror/home` holds one of those joins, cut to the posted
+color buffer and 400 live records: the mirror's first frame, drawn from the snapshot before any
+live record, against the phone's screenshot: 0.07 percent of pixels more than 16 levels off,
+47.6 dB. Without the loader the mirror draws nothing (99.9 percent off).
 
 **4. Backpressure, compression, GPU moves.**
 
@@ -1234,6 +1265,10 @@ mirror per phone at a time (the tap has one consumer).
 | the page's zstd decoder: each flushed message whole, a larger window and a non-zstd stream refused, built from the tree's sources | `core/test/zstd.test.ts` |
 | the worker: a retired connection's bytes never reach the next, the 16 MiB bound, `OVERFLOW`, no WebGL2 | `core/test/mirror-worker.test.ts` |
 | the holder reaches the streamer's scene | `tests/test_fleet_agent.rs` |
+| the join: JOIN parts after HELLO and ahead of what render threads copied meanwhile; no handler, a refusal, a failure | `host/mirror_tap_unittest.cpp` (the fork) |
+| the join's bytes told from the live stream's, each under its own bound | `fleet/phone/streamer/test_host.cpp`, `core/test/mirror-worker.test.ts` |
+| a join's color buffers made with their pixels, the screen drawn at END | `core/test/mirror-gl.test.ts`; `e2e/mirror.spec.ts` against the phone's screenshot (above) |
+| the phone keeps composing after a join | `scripts/phone/mirror-capture.sh` checks SurfaceFlinger after its join |
 | replay: a Robot Park stream captured on a gpubox, with the T4's stamped frames, replayed in headless Chrome on WebGL2; each mirror frame compared with the T4 frame of the same stamp | `e2e/mirror.spec.ts` (`playwright.mirror.config.ts`; threshold below) |
 | the panel: three views, video closed in mirror-only, the readouts, the mirror drawing with WebGL2 | `e2e/phones.spec.ts` against the mock coordinator, whose phones serve a synthetic `/mirror` (`mock/mirror.ts`) |
 
