@@ -290,6 +290,12 @@ def contrast(a, b):
 HEX = re.compile(r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})(?![0-9a-fA-F])")
 
 
+# The corpus campaigns the page quotes, by the date in their run names, and the
+# Firecracker builds subsection that describes each one's runs.
+CAMPAIGN_SUBSECTION = {"20261022": "2026-10-22 runs", "20261104": "2026-11-04 runs"}
+CAMPAIGN_PREFIXES = tuple(f"reqbench-{date}-corpus-" for date in CAMPAIGN_SUBSECTION)
+
+
 class ReportContent(unittest.TestCase):
     """What the page states about its sources, checked against those sources."""
 
@@ -364,14 +370,15 @@ class ReportContent(unittest.TestCase):
 
     @staticmethod
     def campaign_runs():
-        """Every committed run of the 2026-10-22 corpus campaign (git ls-files)."""
+        """Every committed run of the 2026-10-22 and 2026-11-04 corpus campaigns
+        (git ls-files)."""
         import subprocess
         out = subprocess.run(["git", "ls-files", "--", "results"], cwd=HERE,
                              capture_output=True, text=True, check=True).stdout
         # A serial run's analysis.json sits at the top of its directory; the
         # scale run's is one level down, in its scale-* directory.
         return sorted({p.split("/")[1] for p in out.split()
-                       if p.split("/")[1].startswith("reqbench-20261022-corpus-")
+                       if p.split("/")[1].startswith(CAMPAIGN_PREFIXES)
                        and p.count("/") == 2 and p.endswith("/analysis.json")})
 
     # Corpus runs of earlier campaigns the page cites; it cites none now.
@@ -401,6 +408,7 @@ class ReportContent(unittest.TestCase):
         "c5352b1bfc70ed0574c8d1ed583f7198f04de2a0": "agent/uffd-minor-v1.17.0-discard-dirty",
         "fcbeec9ef767b0ffc8dbc52528f7648c28fdf22a": "agent/uffd-minor-v1.17.0-discard-dirty",
         "873d12c3e81fd4af272e3ed9091abad372b00d3d": "agent/uffd-minor-v1.17.0-discard-dirty",
+        "0142e05e1d85613587a45c1fc3d1f26d1847cf9c": "agent/uffd-minor-v1.17.0-drive-overrides",
     }
 
     def test_each_cited_run_is_attributed_to_the_firecracker_it_ran(self):
@@ -418,7 +426,8 @@ class ReportContent(unittest.TestCase):
         parts = re.split(r"<h3>([^<]+)</h3>", fc)
         subsections = {parts[i].strip(): parts[i + 1] for i in range(1, len(parts), 2)}
         branches = set(self.FIRECRACKER_BRANCH.values())
-        expected = {"2026-10-22 runs": set(), "Earlier runs": set()}
+        expected = {name: set() for name in CAMPAIGN_SUBSECTION.values()}
+        expected["Earlier runs"] = set()
         runs = sorted(set(re.findall(r"results/(reqbench-[A-Za-z0-9-]+)", self.page)))
         self.assertTrue(runs, "the page cites no reqbench run; the check is vacuous")
         for run in runs:
@@ -426,7 +435,7 @@ class ReportContent(unittest.TestCase):
                 revision = json.load(f)["cell"]["source_revision"]
             self.assertIn(revision, self.FIRECRACKER_BRANCH,
                           f"{run}: add the Firecracker pin at {revision}")
-            where = "2026-10-22 runs" if run.startswith("reqbench-20261022-") else "Earlier runs"
+            where = CAMPAIGN_SUBSECTION.get(run[len("reqbench-"):len("reqbench-") + 8], "Earlier runs")
             expected[where].add(self.FIRECRACKER_BRANCH[revision])
         # A subsection exists exactly when the page cites runs that belong to it.
         expected = {where: want for where, want in expected.items() if want}
@@ -443,15 +452,16 @@ class ReportContent(unittest.TestCase):
             self.assertEqual(linked, expected[where], f"{where} links a branch its runs did not use")
         self.assertEqual(re.findall(r"github\.com/ejc3/firecracker/tree/([^\"'#?]+)", rest), [],
                          "a Firecracker branch link outside Firecracker builds")
-        # Each 2026-10-22 run records the commit and the binary; the section names both.
+        # Each campaign run records the commit and the binary; its section names both.
         for run in runs:
-            if not run.startswith("reqbench-20261022-"):
+            where = CAMPAIGN_SUBSECTION.get(run[len("reqbench-"):len("reqbench-") + 8])
+            if where is None:
                 continue
             with open(os.path.join(HERE, "results", run, "reqbench.jsonl")) as f:
                 firecracker = json.loads(f.readline())["firecracker"]
             self.assertTrue(firecracker["commit_matches_binary"], run)
-            self.assertIn(firecracker["commit"][:8], subsections["2026-10-22 runs"], run)
-            self.assertIn(firecracker["sha256"][:12], subsections["2026-10-22 runs"], run)
+            self.assertIn(firecracker["commit"][:8], subsections[where], run)
+            self.assertIn(firecracker["sha256"][:12], subsections[where], run)
 
     def figure(self, label):
         """The HTML of the <figure> whose caption has id=label."""
@@ -476,7 +486,7 @@ class ReportContent(unittest.TestCase):
         AGENTS.md: every figure traceable to a raw record, cited next to it.
         Each figure computed from per-request records names a committed
         2026-10-22 record and the fields it read."""
-        run = r"results/<wbr>reqbench-20261022-corpus-[a-z0-9-]+/<wbr>reqbench\.<wbr>jsonl|results/reqbench-20261022-corpus-[a-z0-9-]+/reqbench\.jsonl"
+        run = r"results/<wbr>reqbench-2026(?:1022|1104)-corpus-[a-z0-9-]+/<wbr>reqbench\.<wbr>jsonl|results/reqbench-2026(?:1022|1104)-corpus-[a-z0-9-]+/reqbench\.jsonl"
         want = {
             "d-split": ["blocking_ms", "spawn_to_port_ms", "render.stages", "teardown_total_ms"],
             "c-marks": ["spawn_to_port_ms", "restore_marks", "resolve_polls"],
@@ -486,7 +496,7 @@ class ReportContent(unittest.TestCase):
             src = re.findall(r'<p class="src">(.*?)</p>', self.figure(label), re.S)
             self.assertEqual(len(src), 1, f"#{label} carries one source line")
             text = src[0].replace("<wbr>", "")
-            named = re.findall(r"results/(reqbench-20261022-corpus-[a-z0-9-]+)/reqbench\.jsonl", text)
+            named = re.findall(r"results/(reqbench-2026(?:1022|1104)-corpus-[a-z0-9-]+)/reqbench\.jsonl", text)
             self.assertTrue(named, f"#{label}'s source line names no per-request record")
             self.assertLessEqual(set(named), campaign, f"#{label} names a record that is not committed")
             for needle in needles:
