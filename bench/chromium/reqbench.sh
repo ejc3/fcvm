@@ -1552,7 +1552,7 @@ cmd_run() {
         --data-root "$DATA_ROOT" --state-dir "$STATE_DIR" \
         --network-mode "$NETMODE" --cpu "$CPU" --memory-mib "$MEM" \
         --run-id "$RUNID" --arms "${ARMS:-exec,cdp,cdp-fast,noop}" \
-        --engine "$ENGINE" --resolve-poll-ms "${RESOLVE_POLL_MS:-50}" \
+        --engine "$ENGINE" --resolve-poll-ms "${RESOLVE_POLL_MS:-5}" \
         "${prewire_args[@]}" &
     local driver_bg=$!
     track "$driver_bg"

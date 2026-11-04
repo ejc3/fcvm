@@ -145,8 +145,9 @@ Chromium from the host with no exec, the request path a service would actually r
   measures anything.
 - **Each request's timing includes the wait for a page target and the CDP
   connection.** `cdpdrive.py` records the target wait (`resolve_ms`: it polls
-  `/json/list` every 50 ms until the restored guest's Chromium lists a page
-  target, so up to one 50 ms step of it is poll granularity and the rest is
+  `/json/list` every 5 ms (`RESOLVE_POLL_MS=`; 50 ms before 2026-11) until the
+  restored guest's Chromium lists a page target, so up to one poll step of it is
+  poll granularity and the rest is
   time the guest was not yet serving a target), TCP connect (`tcp_ms`,
   successor of the obsolete `port_wait_ms`, whose old numbers measured a
   state-discovery boundary, not the network), WebSocket upgrade

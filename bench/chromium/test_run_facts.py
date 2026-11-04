@@ -552,7 +552,7 @@ class RunMetaFacts(unittest.TestCase):
                 meta, facts = self.meta(prefetch)
                 self.assertEqual(meta["uffd_prefetch"], word)
                 self.assertEqual(meta["host"], facts)
-                self.assertEqual(meta["resolve_poll_ms"], 50.0)
+                self.assertEqual(meta["resolve_poll_ms"], 5.0)
                 self.assertFalse(meta["hugepages"])
                 for field in ("browser_version", "firecracker"):
                     self.assertIn(field, meta)

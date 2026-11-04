@@ -3898,7 +3898,9 @@ def _drive_clone(args, rep, op, endpoint, deadline, fcvm_pid, rec):
             idle_wait_ms=0.0,
             out_prefix="",
             ws_url=ws_url,
-            connect_retries=200,
+            # 2000 polls at the 5 ms default is the 10 s of polling 200 gave at
+            # 50 ms; the deadline above still bounds the whole wait.
+            connect_retries=2000,
             nav_timing=True,
             print_target=False,
             # This Namespace is an explicit, CLOSED field list, so every flag
@@ -3910,7 +3912,7 @@ def _drive_clone(args, rep, op, endpoint, deadline, fcvm_pid, rec):
             op=op,
             # getattr: failure-path fixtures drive this function with
             # bare Namespaces that predate the knob.
-            resolve_poll_ms=getattr(args, "resolve_poll_ms", 50.0),
+            resolve_poll_ms=getattr(args, "resolve_poll_ms", 5.0),
             render_module=os.path.join(HERE, "render.py"),
         )
         result = cdpdrive.drive(drive_args)
@@ -4810,9 +4812,9 @@ def main_with_resources(resources: ExitStack) -> int:
     p.add_argument("--timeout", type=float, default=120.0)
     p.add_argument("--teardown-timeout", type=float, default=60.0)
     p.add_argument("--rust-log", default="fcvm=debug")
-    p.add_argument("--resolve-poll-ms", type=float, default=50.0,
+    p.add_argument("--resolve-poll-ms", type=float, default=5.0,
                    help="sleep between the CDP arms' /json/list polls for the page "
-                        "target (cdpdrive's 50 ms by default); recorded in meta")
+                        "target (5 ms by default; cdpdrive alone polls every 50 ms); recorded in meta")
     p.add_argument("--run-id", default="",
                    help="32-hex invocation identity (generated when omitted)")
     args = p.parse_args()

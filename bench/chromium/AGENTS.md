@@ -55,7 +55,7 @@ ladder rung's vCPU count (`cpuN`, `CPU_BUDGET=vm-matched`); the default is
 place of the screenshot before it is sampled (default `screenshot`). The host
 containers always render with the image's `render.py`, a screenshot and the
 DOM; `summary.json`'s meta records both as `render_op` and `container_render`.
-`RESOLVE_POLL_MS=` (run only, default 50) is the sleep between the CDP arms'
+`RESOLVE_POLL_MS=` (run only, default 5; 50 before 2026-11) is the sleep between the CDP arms'
 `/json/list` polls for the page target; the run's meta records it as
 `resolve_poll_ms`, and runs with different values are separate cells.
 
