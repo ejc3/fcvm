@@ -1,6 +1,7 @@
 // The mock fleet's phones (PROTOCOL.md, "Phones mode"): phone slots with a stream each, the
 // borrow rules the coordinator applies (one phone per viewer, a cap, a cooldown, a fixed set
-// of actions, one a second) and the zoom every viewer shares. The coordinator keys the
+// of actions, one a second, and taps five a second while Robot Park is in front) and the zoom
+// every viewer shares. The coordinator keys the
 // one-per-client and cooldown rules by client address; the mock keys them by connection, so one
 // machine can play several viewers.
 
@@ -8,11 +9,15 @@ import type { Rect } from "../core/protocol.ts";
 import type { MockRenderers } from "./renderer.ts";
 import type { PatternScene } from "./pattern.ts";
 
-export const PHONE_ACTION_NAMES = ["switch_screen", "rotate", "dark_mode", "dance", "wave", "gpu_benchmark", "restart_app", "open_browser", "open_app", "reboot_phone"] as const;
+export const PHONE_ACTION_NAMES = ["switch_screen", "rotate", "dark_mode", "dance", "wave", "gpu_benchmark", "restart_app", "open_browser", "open_app", "reboot_phone", "tap"] as const;
 type PhoneAction = (typeof PHONE_ACTION_NAMES)[number];
 
-/** One action a second per borrowed phone. */
+/** One action a second per borrowed phone, taps apart. */
 const ACTION_INTERVAL_MS = 1000;
+/** One tap every 200 ms (fleet/core/src/phone.rs, TAP_INTERVAL_MS). */
+const TAP_INTERVAL_MS = 200;
+/** The actions that leave Robot Park in front (the phone brings it there first), and the one that puts the browser there. */
+const FOR_THE_APP: readonly PhoneAction[] = ["switch_screen", "rotate", "dark_mode", "dance", "wave", "gpu_benchmark", "open_app"];
 
 export interface MockPhonesOptions {
   count: number;
@@ -34,6 +39,7 @@ interface Borrow {
   since: number;
   until: number;
   lastActionAt: number | null;
+  lastTapAt: number | null;
   timer: NodeJS.Timeout;
 }
 
@@ -49,6 +55,8 @@ interface Phone {
   timer: NodeJS.Timeout | null;
   /** The actions its host's agent lists in its hello; the coordinator refuses any other. */
   offers: PhoneAction[];
+  /** The app in front: the browser after open_browser, until an action for Robot Park or a relaunch. */
+  front: "app" | "browser";
 }
 
 /** What the phones need of the coordinator that holds them. */
@@ -73,6 +81,9 @@ export interface RecordedPhoneAction {
   session: string;
   phone: string;
   action: PhoneAction;
+  /** A tap's point. */
+  x?: number;
+  y?: number;
 }
 
 /** The phones' image: one row of up to six, then rows of equal length. */
@@ -120,6 +131,7 @@ export class MockPhones {
         borrow: null,
         timer: null,
         offers: [...PHONE_ACTION_NAMES],
+        front: "app",
       });
       host.renderers.setTile(`phone-${n}`, rect, () => [], () => ({ ...host.scene(), image_aspect: g.aspect }));
       host.renderers.setAvailable(`phone-${n}`, true);
@@ -158,6 +170,7 @@ export class MockPhones {
         last_relaunch: p.lastRelaunch,
         borrowed: p.borrow && { session: p.borrow.session, viewer: p.borrow.viewer, since: p.borrow.since, until: p.borrow.until },
         actions: [...p.offers],
+        front: p.front,
       })),
     };
   }
@@ -204,7 +217,7 @@ export class MockPhones {
         const session = `phone-claim-${++this.claims}`;
         const target = phone;
         const timer = later(this.opts.claimSecs * 1000, () => this.release(target, "return"));
-        phone.borrow = { session, viewer, since: now, until: now + this.opts.claimSecs * 1000, lastActionAt: null, timer };
+        phone.borrow = { session, viewer, since: now, until: now + this.opts.claimSecs * 1000, lastActionAt: null, lastTapAt: null, timer };
         return h.committed(`${session} on ${phone.slot}`);
       }
       case "release_phone": {
@@ -225,13 +238,36 @@ export class MockPhones {
         if (!p) return h.refuse("phone actions need a phone of your own (claim_phone)");
         const b = p.borrow!;
         if (typeof claim === "string" && claim !== b.session) return h.refuse(`"${claim}" is not this viewer's phone`);
+        // a tap's point, two numbers in [0, 1]; no other action takes one
+        let point: { x: number; y: number } | null = null;
+        if (action === "tap") {
+          for (const k of ["x", "y"] as const) {
+            const v = args[k];
+            if (typeof v !== "number") return h.refuse(`args.${k} must be a number`);
+            if (!Number.isFinite(v)) return h.refuse(`args.${k} must be finite`);
+            if (v < 0 || v > 1) return h.refuse(`args.${k} must be between 0 and 1`);
+          }
+          point = { x: args["x"] as number, y: args["y"] as number };
+        } else {
+          for (const k of ["x", "y"]) if (args[k] !== undefined) return h.refuse(`args.${k} is only for tap`);
+        }
         if (!p.offers.includes(action)) return h.refuse(`${p.slot}'s host does not support ${action}`);
+        if (point) {
+          if (p.phase !== "running") return h.refuse(`${p.slot} is not running`);
+          if (p.front === "browser") return h.refuse(`taps reach the phone only in Robot Park; ${p.slot} shows the browser`);
+          if (b.lastTapAt !== null && now < b.lastTapAt + TAP_INTERVAL_MS) return h.refuse(`one tap every ${TAP_INTERVAL_MS} ms; wait ${b.lastTapAt + TAP_INTERVAL_MS - now} ms`);
+          b.lastTapAt = now;
+          this.actions.push({ at: now, viewer, session: b.session, phone: p.slot, action, x: point.x, y: point.y });
+          return h.committed(`tap at ${point.x.toFixed(3)}, ${point.y.toFixed(3)} on ${p.slot}`);
+        }
         if (b.lastActionAt !== null && now < b.lastActionAt + ACTION_INTERVAL_MS) return h.refuse(`one action a second; wait ${b.lastActionAt + ACTION_INTERVAL_MS - now} ms`);
         b.lastActionAt = now;
         if (action === "reboot_phone") {
           this.relaunch(p, `reboot:${b.session}`);
           return h.committed(`reboot ${p.slot}`);
         }
+        if (action === "open_browser") p.front = "browser";
+        else if (FOR_THE_APP.includes(action)) p.front = "app";
         this.actions.push({ at: now, viewer, session: b.session, phone: p.slot, action });
         return h.committed(`${action} on ${p.slot}`);
       }
@@ -271,6 +307,8 @@ export class MockPhones {
     const h = this.host;
     if (p.timer) clearTimeout(p.timer);
     p.generation += 1;
+    // a phone is restored with Robot Park in front
+    p.front = "app";
     const gen = p.generation;
     const clicked = h.now();
     p.phase = "restoring";
@@ -320,7 +358,10 @@ export class MockPhones {
     this.lastEnd.clear();
     this.lastZoom.clear();
     this.actions.length = 0;
-    for (const p of this.phones) p.offers = [...PHONE_ACTION_NAMES];
+    for (const p of this.phones) {
+      p.offers = [...PHONE_ACTION_NAMES];
+      p.front = "app";
+    }
     this.host.markDirty();
   }
 

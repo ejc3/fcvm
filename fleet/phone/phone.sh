@@ -351,6 +351,18 @@ action)
     if mirror_open; then app_action restart; rm -f "$RUN/screen" "$RUN/night"; fi
   }
   has_browser() { "$ADB" shell pm path "$BROWSER_PKG" 2> /dev/null | grep -q '^package:' || { echo "phone.sh: this phone has no browser" >&2; exit 1; }; }
+  # A tap's point, two fractions of the screen with four places as the agent writes them
+  # (0.2500 0.9375), and the screen's size in its current orientation (Robot Park's surface,
+  # which fills the screen: 720 x 1280, or 1280 x 720 turned): prints the pixel, never past
+  # the last row or column. Anything else is refused.
+  tap_px() { # x y w h
+    local x=${1:-} y=${2:-} w=${3:-} h=${4:-} px py
+    [[ "$x" =~ ^(0\.[0-9]{4}|1\.0000)$ && "$y" =~ ^(0\.[0-9]{4}|1\.0000)$ ]] \
+      || { echo "phone.sh: a tap's point is two fractions in [0, 1] with four places, not '$x' '$y'" >&2; return 2; }
+    [[ "$w" =~ ^[1-9][0-9]{0,4}$ && "$h" =~ ^[1-9][0-9]{0,4}$ ]] || { echo "phone.sh: Robot Park reports no screen size ('$w' x '$h')" >&2; return 1; }
+    px=$(( 10#${x/./} * w / 10000 )); py=$(( 10#${y/./} * h / 10000 ))
+    echo "$(( px < w ? px : w - 1 )) $(( py < h ? py : h - 1 ))"
+  }
   restart_browser() { open_page > "$RUN/why" || { echo "phone.sh: $(cat "$RUN/why")" >&2; exit 1; }; }
   case "${2:-}" in
   switch_screen) to_app; toggle screen scene info ;;
@@ -381,6 +393,20 @@ action)
     exit 0
     ;;
   open_app) to_app ;;
+  # A touch on the screen, for Robot Park only: the browser in front takes none. The point is
+  # mapped to the screen's pixels as it is turned now (input tap's coordinates are the
+  # display's, which turn with it).
+  tap)
+    [ "$(front)" = app ] || { echo "phone.sh: taps reach the phone only in Robot Park; the browser is in front" >&2; exit 1; }
+    st=$(CTL_TIMEOUT=5 "$0" ctl '{"type":"status"}' 2> /dev/null) || { echo "phone.sh: the app did not answer" >&2; exit 1; }
+    size=$(jq -r 'if (.surface | type) == "array" then "\(.surface[0]) \(.surface[1])" else "" end' <<< "$st" 2> /dev/null || true)
+    # shellcheck disable=SC2086 # two numbers
+    px=$(tap_px "${3:-}" "${4:-}" $size) || exit $?
+    # shellcheck disable=SC2086
+    "$ADB" shell input tap $px > /dev/null 2>&1 || { echo "phone.sh: input tap $px failed" >&2; exit 1; }
+    echo "ok tap $px"
+    exit 0
+    ;;
   *)
     echo "phone.sh: unknown action '${2:-}'" >&2
     exit 2
@@ -486,7 +512,7 @@ stop)
   "$ADB" emu kill > /dev/null 2>&1 || true
   ;;
 *)
-  echo "usage: phone.sh serve|action NAME|boot|renderer|probe secs apk|draws secs|holds|bugreports|app apk|browser apk|page [secs]|ctl json|pull path dest|shot dest.png|applog|stop" >&2
+  echo "usage: phone.sh serve|action NAME [x y]|boot|renderer|probe secs apk|draws secs|holds|bugreports|app apk|browser apk|page [secs]|ctl json|pull path dest|shot dest.png|applog|stop" >&2
   exit 2
   ;;
 esac

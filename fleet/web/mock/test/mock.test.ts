@@ -708,7 +708,7 @@ describe("mock race, second design review", () => {
 });
 
 describe("mock phones", () => {
-  type PhonesState = { zoomed_out: boolean; zoom_at: number | null; borrow: { cap: number; lent: number }; tiles: { id: string; slot: string; phase: string; borrowed: { session: string; viewer: string } | null; last_relaunch: { by: string; first_frame_at: number | null } }[] };
+  type PhonesState = { zoomed_out: boolean; zoom_at: number | null; borrow: { cap: number; lent: number }; tiles: { id: string; slot: string; phase: string; borrowed: { session: string; viewer: string } | null; front: string; last_relaunch: { by: string; first_frame_at: number | null } }[] };
   const phonesNow = () => (coord.fleetState() as unknown as { phones: PhonesState }).phones;
   let seq = 0;
   /** Send an intent and wait for its receipt. */
@@ -730,7 +730,7 @@ describe("mock phones", () => {
     const st = coord.fleetState() as unknown as { phones: { image_aspect: number; tiles: { rect: unknown; actions: string[] }[] } };
     expect(st.phones.image_aspect).toBeCloseTo((3 * 720) / 1280, 9);
     expect(st.phones.tiles[1]!.rect).toEqual({ x: 1 / 3, y: 0, w: 1 / 3, h: 1 });
-    expect(st.phones.tiles.every((t) => t.actions.length === 10)).toBe(true);
+    expect(st.phones.tiles.every((t) => t.actions.length === 11)).toBe(true);
   });
 
   it("lends a phone to one viewer at a time, up to the cap, and refuses with the coordinator's reasons", async () => {
@@ -761,7 +761,7 @@ describe("mock phones", () => {
     for (const bad of [{ action: "rm -rf" }, {}, { action: 3 }]) {
       expect(await send(a, "phone_action", { ...bad, claim: session })).toMatchObject({
         outcome: "refused",
-        reason: "args.action must be one of switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, open_browser, open_app, reboot_phone",
+        reason: "args.action must be one of switch_screen, rotate, dark_mode, dance, wave, gpu_benchmark, restart_app, open_browser, open_app, reboot_phone, tap",
       });
     }
     expect(await send(a, "phone_action", { action: "rotate", claim: "phone-claim-0" })).toMatchObject({ outcome: "refused", reason: '"phone-claim-0" is not this viewer\'s phone' });
@@ -774,6 +774,37 @@ describe("mock phones", () => {
     expect(recorded.actions.map((x) => [x.action, x.phone, x.session])).toEqual([["rotate", "phone-1", session], ["wave", "phone-1", session]]);
     a.ws.close();
     b.ws.close();
+  });
+
+  it("takes taps from the holder at a point in [0, 1], five a second apart from the actions, with Robot Park in front", async () => {
+    await settle();
+    const a = await live();
+    await send(a, "claim_phone", { phone: "phone-1" });
+    const session = phonesNow().tiles[0]!.borrowed!.session;
+    expect(phonesNow().tiles[0]!.front).toBe("app");
+    for (const [bad, reason] of [
+      [{ x: 0.5 }, "args.y must be a number"],
+      [{ x: -0.1, y: 0.5 }, "args.x must be between 0 and 1"],
+      [{ x: 0.5, y: "0.5" }, "args.y must be a number"],
+    ] as const) {
+      expect(await send(a, "phone_action", { action: "tap", claim: session, ...bad })).toMatchObject({ outcome: "refused", reason });
+    }
+    expect(await send(a, "phone_action", { action: "dance", x: 0.5, y: 0.5 })).toMatchObject({ outcome: "refused", reason: "args.x is only for tap" });
+    expect(await send(a, "phone_action", { action: "tap", x: 0.25, y: 0.75, claim: session })).toMatchObject({ outcome: "committed" });
+    expect(await send(a, "phone_action", { action: "tap", x: 0.25, y: 0.75 })).toMatchObject({ outcome: "refused", reason: expect.stringMatching(/^one tap every 200 ms; wait \d+ ms$/) });
+    // a tap does not hold back an action
+    expect(await send(a, "phone_action", { action: "open_browser" })).toMatchObject({ outcome: "committed" });
+    expect(phonesNow().tiles[0]!.front).toBe("browser");
+    await sleep(210);
+    expect(await send(a, "phone_action", { action: "tap", x: 0.5, y: 0.5 })).toMatchObject({ outcome: "refused", reason: "taps reach the phone only in Robot Park; phone-1 shows the browser" });
+    await sleep(1000);
+    expect(await send(a, "phone_action", { action: "open_app" })).toMatchObject({ outcome: "committed" });
+    expect(phonesNow().tiles[0]!.front).toBe("app");
+    expect(await send(a, "phone_action", { action: "tap", x: 1, y: 0 })).toMatchObject({ outcome: "committed" });
+    const recorded = (await (await fetch(`http://localhost:${coord.port}/mock/phone-actions`)).json()) as { actions: { action: string; x?: number; y?: number }[] };
+    expect(recorded.actions.map((x) => [x.action, x.x, x.y])).toEqual([["tap", 0.25, 0.75], ["open_browser", undefined, undefined], ["open_app", undefined, undefined], ["tap", 1, 0]]);
+    expect(await send(a, "release_phone")).toMatchObject({ outcome: "committed" });
+    a.ws.close();
   });
 
   it("reboots a borrowed phone: unavailable, then running with a new restore", async () => {
@@ -853,6 +884,9 @@ describe("the mock speaks the coordinator's snapshot shapes", () => {
     "phones.tiles[].gpu_stats": "as a wall tile's",
     "phones.tiles[].last_relaunch.phases": "as a wall tile's",
     "actions[].args.out": "phones_zoom's argument, in the activity log",
+    "actions[].args.x": "phone_action tap's point, in the activity log",
+    "actions[].args.y": "the same",
+    "phones.tiles[].front": '"front": "app" or "browser", the app in front',
     "phones.zoomed_out": "phones_zoom: the zoom every viewer shares",
     "phones.zoom_at": "phones_zoom: when the current zoom state took effect",
     "tiles[].borrowed.until": '"borrowed": {"session", "viewer", "since", "until"}',

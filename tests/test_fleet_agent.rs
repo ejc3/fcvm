@@ -2193,12 +2193,17 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
         action,
         at: 0,
         generation,
+        point: None,
     };
     let acts = vec![
         req(1, PhoneAction::Rotate, 1),
         req(2, PhoneAction::RebootPhone, 1),
         req(3, PhoneAction::Dance, 1),
         req(4, PhoneAction::Wave, 0), // an earlier launch's: never carried out
+        PhoneActionReq {
+            point: Some(fleet_core::phone::TapPoint { x: 0.25, y: 0.9375 }),
+            ..req(5, PhoneAction::Tap, 1)
+        },
     ];
     c.send(phone(1, acts.clone()));
     let execs = || -> Vec<String> {
@@ -2207,26 +2212,31 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
             .lines()
             .filter(|l| l.starts_with("exec "))
             .map(|l| {
-                l.split_whitespace()
-                    .skip(2)
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .join(" ")
+                // the fake logs the arguments after the pid and a timestamp after them
+                let w: Vec<&str> = l.split_whitespace().skip(2).collect();
+                w[..w.len() - 1].join(" ")
             })
             .collect()
     };
+    let actions = || -> Vec<String> {
+        execs()
+            .into_iter()
+            .filter(|e| e.contains(" action "))
+            .collect()
+    };
     let deadline = Instant::now() + Duration::from_secs(20);
-    while execs().len() < 2 && Instant::now() < deadline {
+    while actions().len() < 3 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     // The same actions again (a re-sent assignment) are not carried out twice.
     c.send(phone(1, acts));
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
-        execs(),
+        actions(),
         vec![
             "/usr/local/bin/phone.sh action rotate",
-            "/usr/local/bin/phone.sh action dance"
+            "/usr/local/bin/phone.sh action dance",
+            "/usr/local/bin/phone.sh action tap 0.2500 0.9375"
         ]
     );
     c.close().await;

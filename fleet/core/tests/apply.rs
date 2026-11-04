@@ -911,3 +911,275 @@ fn a_quarantined_gpu_holds_for_its_instance_and_is_listed_while_its_host_is_conn
     );
     assert_eq!(listed(&s), 1);
 }
+
+/// Taps (`phone_action` `tap`, PROTOCOL.md "Phones mode"): only from the phone's holder, only
+/// at a point of two finite fractions in [0, 1], only on a phone whose host lists `tap`, only
+/// with Robot Park in front, at most one every TAP_INTERVAL_MS, apart from the one-a-second
+/// limit of every other action. An accepted tap reaches the assignment with its point and
+/// leaves it after TAP_KEEP_MS.
+#[test]
+fn taps_reach_only_the_holders_phone_with_robot_park_in_front() {
+    use fleet_core::phone::{PhoneAction, TapPoint, TAP_INTERVAL_MS, TAP_KEEP_MS};
+    use fleet_core::state::Outcome;
+    let all: Vec<&str> = PhoneAction::ALL
+        .iter()
+        .map(|a| a.as_str())
+        .filter(|a| *a != "reboot_phone")
+        .collect();
+    let no_tap: Vec<&str> = all.iter().copied().filter(|a| *a != "tap").collect();
+    let hello = |host: &str, sbdf: &str, actions: &[&str]| {
+        serde_json::json!({"type": "agent", "at": 1000, "host": host, "msg": {"type": "hello", "host": host, "arch": "x86_64",
+            "gpus": [{"sbdf": "0000:01:00.0", "name": "Tesla T4"}], "capacity": 2,
+            "phones": [{"sbdf": sbdf, "name": "Tesla T4"}], "phone_actions": actions}})
+    };
+    let running = |host: &str, id: &str| {
+        serde_json::json!({"type": "agent", "at": 2000, "host": host, "msg": {"type": "slot", "id": id, "phase": "running",
+            "generation": 1, "vm": format!("fleet-{id}"), "frame_url": format!("ws://{host}:20101/frames"), "timings": {}}})
+    };
+    let mut s = State::new(
+        config_with(serde_json::json!({"max_phones_lent": 2, "max_tiles": 2})),
+        0,
+    );
+    for e in events(serde_json::json!([
+        hello("new", "0000:02:00.0", &all), hello("old", "0000:03:00.0", &no_tap),
+        running("new", "phone-1"), running("old", "phone-2"),
+        {"type": "viewer_joined", "at": 2500, "viewer": "v1", "client": "198.51.100.20"},
+        {"type": "viewer_joined", "at": 2500, "viewer": "v2", "client": "198.51.100.21"},
+        {"type": "intent", "at": 3000, "id": "c1", "name": "claim_phone", "viewer": "v1", "client": "198.51.100.20", "args": {"phone": "phone-1"}},
+        {"type": "intent", "at": 3000, "id": "c2", "name": "claim_phone", "viewer": "v2", "client": "198.51.100.21", "args": {"phone": "phone-2"}},
+    ])) {
+        s = apply(s, &e);
+    }
+    assert_eq!(s.fleet.phones[&1].id, "phone-1");
+    let mut at = 4000;
+    let mut n = 0;
+    // one intent; its receipt's reason, or None when it committed
+    let mut send =
+        |s: State, viewer: &str, args: serde_json::Value, at: u64| -> (State, Option<String>) {
+            n += 1;
+            let id = format!("t{n}");
+            let client = if viewer == "v1" {
+                "198.51.100.20"
+            } else {
+                "198.51.100.21"
+            };
+            let e = events(
+                serde_json::json!([{"type": "intent", "at": at, "id": id, "name": "phone_action",
+            "viewer": viewer, "client": client, "args": args}]),
+            );
+            let s = apply(s, &e[0]);
+            let r = s.receipts[&id].clone();
+            (
+                s,
+                if r.outcome == Outcome::Committed {
+                    None
+                } else {
+                    Some(r.reason.unwrap_or_default())
+                },
+            )
+        };
+    let points = |s: &State, n: u32| -> Vec<(f64, f64)> {
+        s.fleet.phones[&n]
+            .phone
+            .as_ref()
+            .unwrap()
+            .actions
+            .iter()
+            .filter_map(|a| a.point.map(|p| (p.x, p.y)))
+            .collect()
+    };
+    let tap = |x: serde_json::Value, y: serde_json::Value| serde_json::json!({"action": "tap", "x": x, "y": y});
+
+    // the holder taps its phone: the point reaches the assignment
+    let (t, r) = send(s, "v1", tap(0.25.into(), 0.9375.into()), at);
+    s = t;
+    assert_eq!(r, None);
+    assert_eq!(points(&s, 1), vec![(0.25, 0.9375)]);
+    let assign = serde_json::to_value(host_assignments(&s)).unwrap();
+    assert!(
+        assign.to_string().contains(r#""action":"tap""#)
+            && assign
+                .to_string()
+                .contains(r#""point":{"x":0.25,"y":0.9375}"#),
+        "{assign}"
+    );
+
+    // the points a tap takes: two finite numbers in [0, 1], nothing else
+    for (x, y, why) in [
+        (
+            serde_json::json!(-0.01),
+            serde_json::json!(0.5),
+            "args.x must be between 0 and 1",
+        ),
+        (
+            serde_json::json!(0.5),
+            serde_json::json!(1.0001),
+            "args.y must be between 0 and 1",
+        ),
+        (
+            serde_json::json!("Infinity"),
+            serde_json::json!(0.5),
+            "args.x must be a number",
+        ),
+        (
+            serde_json::json!(0.5),
+            serde_json::json!(null),
+            "args.y must be a number",
+        ),
+        (
+            serde_json::json!(0.5),
+            serde_json::json!("NaN"),
+            "args.y must be a number",
+        ),
+    ] {
+        at += TAP_INTERVAL_MS;
+        let (t, r) = send(s, "v1", tap(x.clone(), y.clone()), at);
+        s = t;
+        assert_eq!(r.as_deref(), Some(why), "{x} {y}");
+    }
+    let (t, r) = send(s, "v1", serde_json::json!({"action": "tap", "x": 0.5}), at);
+    s = t;
+    assert_eq!(r.as_deref(), Some("args.y must be a number"));
+    // JSON has no non-finite number; the parse refuses one built in memory all the same
+    assert_eq!(
+        TapPoint::new(f64::NAN, 0.5),
+        Err("args.x must be finite".into())
+    );
+    assert_eq!(
+        TapPoint::new(0.5, f64::INFINITY),
+        Err("args.y must be finite".into())
+    );
+    // a point is for a tap only
+    let (t, r) = send(
+        s,
+        "v1",
+        serde_json::json!({"action": "dance", "x": 0.5, "y": 0.5}),
+        at,
+    );
+    s = t;
+    assert_eq!(r.as_deref(), Some("args.x is only for tap"));
+    assert_eq!(points(&s, 1).len(), 1, "a refused tap reaches nothing");
+
+    // only from the holder: v2 holds phone-2, whose host does not list tap
+    at += TAP_INTERVAL_MS;
+    let (t, r) = send(s, "v2", tap(0.5.into(), 0.5.into()), at);
+    s = t;
+    assert_eq!(r.as_deref(), Some("phone-2's host does not support tap"));
+    assert!(points(&s, 2).is_empty());
+    let e = events(
+        serde_json::json!([{"type": "viewer_joined", "at": at, "viewer": "v3", "client": "198.51.100.22"}]),
+    );
+    s = apply(s, &e[0]);
+    let (t, r) = send(s, "v3", tap(0.5.into(), 0.5.into()), at);
+    s = t;
+    assert_eq!(
+        r.as_deref(),
+        Some("phone actions need a phone of your own (claim_phone)")
+    );
+
+    // the tap rate limit, apart from the actions'
+    at += TAP_INTERVAL_MS;
+    let (t, r) = send(s, "v1", tap(0.1.into(), 0.1.into()), at);
+    s = t;
+    assert_eq!(r, None);
+    let (t, r) = send(
+        s,
+        "v1",
+        tap(0.2.into(), 0.2.into()),
+        at + TAP_INTERVAL_MS - 1,
+    );
+    s = t;
+    assert_eq!(
+        r,
+        Some(format!("one tap every {TAP_INTERVAL_MS} ms; wait 1 ms"))
+    );
+    let (t, r) = send(
+        s,
+        "v1",
+        serde_json::json!({"action": "dance"}),
+        at + TAP_INTERVAL_MS - 1,
+    );
+    s = t;
+    assert_eq!(r, None, "a tap does not hold back an action");
+    let (t, r) = send(s, "v1", tap(0.2.into(), 0.2.into()), at + TAP_INTERVAL_MS);
+    s = t;
+    assert_eq!(r, None, "nor an action a tap");
+    at += TAP_INTERVAL_MS;
+
+    // the browser in front takes no taps; Robot Park back in front does
+    at += 1000;
+    let (t, r) = send(s, "v1", serde_json::json!({"action": "open_browser"}), at);
+    s = t;
+    assert_eq!(r, None);
+    assert_eq!(view(&s).phones.tiles[0].front, Some("browser"));
+    at += TAP_INTERVAL_MS;
+    let (t, r) = send(s, "v1", tap(0.5.into(), 0.5.into()), at);
+    s = t;
+    assert_eq!(
+        r.as_deref(),
+        Some("taps reach the phone only in Robot Park; phone-1 shows the browser")
+    );
+    at += 1000;
+    let (t, r) = send(s, "v1", serde_json::json!({"action": "restart_app"}), at);
+    s = t;
+    assert_eq!(r, None);
+    assert_eq!(
+        view(&s).phones.tiles[0].front,
+        Some("browser"),
+        "restart_app restarts the browser in front"
+    );
+    at += 1000;
+    let (t, r) = send(s, "v1", serde_json::json!({"action": "open_app"}), at);
+    s = t;
+    assert_eq!(r, None);
+    assert_eq!(view(&s).phones.tiles[0].front, Some("app"));
+    let (t, r) = send(s, "v1", tap(0.5.into(), 0.5.into()), at);
+    s = t;
+    assert_eq!(r, None);
+    // a reboot restores the phone with Robot Park in front
+    at += 1000;
+    let (t, _) = send(s, "v1", serde_json::json!({"action": "open_browser"}), at);
+    s = t;
+    at += 1000;
+    let (t, r) = send(s, "v1", serde_json::json!({"action": "reboot_phone"}), at);
+    s = t;
+    assert_eq!(r, None);
+    assert_eq!(view(&s).phones.tiles[0].front, Some("app"));
+    // ... and takes no tap until it runs its new launch
+    let (t, r) = send(s, "v1", tap(0.5.into(), 0.5.into()), at + TAP_INTERVAL_MS);
+    s = t;
+    assert_eq!(r.as_deref(), Some("phone-1 is not running"));
+
+    // a tap leaves the assignment after TAP_KEEP_MS, an action after ACTION_KEEP_MS
+    let e = events(
+        serde_json::json!([{"type": "agent", "at": at + 1, "host": "new", "msg": {"type": "slot", "id": "phone-1", "phase": "running",
+        "generation": 2, "vm": "fleet-phone-1", "frame_url": "ws://new:20101/frames", "timings": {}}}]),
+    );
+    s = apply(s, &e[0]);
+    at += 2000;
+    let (t, r) = send(s, "v1", tap(0.75.into(), 0.5.into()), at);
+    s = t;
+    assert_eq!(r, None);
+    let (t, r) = send(s, "v1", serde_json::json!({"action": "wave"}), at);
+    s = t;
+    assert_eq!(r, None);
+    let tick = |s: State, at: u64| {
+        apply(
+            s,
+            &events(serde_json::json!([{"type": "tick", "at": at}]))[0],
+        )
+    };
+    s = tick(s, at + TAP_KEEP_MS - 1);
+    assert_eq!(points(&s, 1), vec![(0.75, 0.5)]);
+    s = tick(s, at + TAP_KEEP_MS);
+    assert!(points(&s, 1).is_empty());
+    let left: Vec<&str> = s.fleet.phones[&1]
+        .phone
+        .as_ref()
+        .unwrap()
+        .actions
+        .iter()
+        .map(|a| a.action.as_str())
+        .collect();
+    assert_eq!(left, vec!["wave"]);
+}

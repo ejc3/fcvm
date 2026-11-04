@@ -15,6 +15,9 @@ import {
   phonesView,
   PHONE_ASPECT,
   restoreText,
+  screenYScale,
+  tapPoint,
+  TAP_BROWSER_NOTE,
   zoomProgressAt,
   type PhoneLayout,
   type PhonesInput,
@@ -44,6 +47,7 @@ function phonesOf(n: number, over: Partial<Phones> = {}): Phones {
       frame_url_v4: `ws://example-host-v4:1/frames/phone-${i + 1}`,
       last_relaunch: { clicked_at: EPOCH, first_frame_at: EPOCH + 22_300, phases: { restore_ms: 4600, total_ms: 22_300 } },
       actions: ACTIONS,
+      front: "app",
     });
   }
   return {
@@ -487,5 +491,103 @@ describe("where the GPU mirror draws", () => {
     const m = v.mirror!;
     expect(m.canvasHeight).toBe(m.box.h);
     expect(m.box.w / m.box.h).toBeCloseTo(720 / 1280, 2);
+  });
+});
+
+describe("taps on the held phone's screen", () => {
+  const WITH_TAP = [...ACTIONS, "tap"];
+  const held = (over: Partial<PhoneTile> = {}) => {
+    const ph = phonesOf(2);
+    ph.tiles[0] = { ...ph.tiles[0]!, actions: WITH_TAP, borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-1" }, ...over };
+    return stateWith(ph);
+  };
+  const viewOf = (s: ClientState, over: Partial<PhonesInput> = {}) => phonesView(input(s, { openId: "phone:1", ...over }));
+
+  it("maps a click to fractions of the screen, and a click on the bezel to nothing", () => {
+    const t = { name: "video" as const, box: { x: 100, y: 50, w: 360, h: 640 }, yScale: 1 };
+    expect(tapPoint(t, 100 + 90, 50 + 480)).toEqual({ x: 0.25, y: 0.75 });
+    expect(tapPoint(t, 100, 50)).toEqual({ x: 0, y: 0 });
+    expect(tapPoint(t, 460, 690)).toEqual({ x: 1, y: 1 });
+    for (const [x, y] of [[99, 300], [461, 300], [200, 49], [200, 691]] as const) expect(tapPoint(t, x, y), `${x},${y}`).toBeNull();
+    // four places, as the agent passes them on
+    expect(tapPoint(t, 100 + 120, 50 + 1)).toEqual({ x: 0.3333, y: 0.0016 });
+    // the drawn picture leaves out the stamp band: its bottom edge is the band's top
+    expect(tapPoint({ ...t, yScale: 1272 / 1280 }, 200, 690)!.y).toBeCloseTo(1272 / 1280, 4);
+    expect(tapPoint({ ...t, box: { ...t.box, w: 0 } }, 100, 60)).toBeNull();
+  });
+
+  it("scales a cropped picture's height into the whole screen's", () => {
+    expect(screenYScale(1272, 1280)).toBe(1272 / 1280);
+    expect(screenYScale(1280, 1280)).toBe(1);
+    expect(screenYScale(712, 720)).toBe(712 / 720);
+    // a drawer that does not say, or says nonsense: the picture is the screen
+    expect(screenYScale(1272, undefined)).toBe(1);
+    expect(screenYScale(1280, 1000)).toBe(1);
+    expect(screenYScale(0, 1280)).toBe(1);
+  });
+
+  it("puts the screen of the video, the mirror or both under the pointer while Robot Park is in front", () => {
+    const s = held();
+    const v = viewOf(s, { takeover: "video" });
+    const box = v.layout!.phones.find((p) => p.id === "phone:1")!.box!;
+    expect(v.taps).toEqual({ tileId: "phone:1", session: "s", targets: [{ name: "video", box, yScale: 1 }], note: null });
+    const both = viewOf(s, { takeover: "both", mirrorPicture: { id: "phone:1", w: 720, h: 1280, banded: true } });
+    expect(both.taps!.targets.map((t) => t.name)).toEqual(["video", "mirror"]);
+    expect(both.taps!.targets[1]!.box).toEqual(both.mirror!.box);
+    expect(both.taps!.targets[1]!.yScale).toBe(1272 / 1280);
+    const mirror = viewOf(s, { takeover: "mirror", mirrorPicture: { id: "phone:1", w: 720, h: 1280, banded: false } });
+    expect(mirror.taps!.targets).toEqual([{ name: "mirror", box: mirror.mirror!.box, yScale: 1 }]);
+  });
+
+  it("scales the video's clicks by the stream's crop", () => {
+    const s = held();
+    const frames = { at: EPOCH, tiles: { "d:phone:1": { connected: true, fps: 30, newestT: null, width: 720, height: 1272, fullHeight: 1280, behind: false, decodeMs: null, lag: null } } };
+    const v = viewOf({ ...s, frames: frames as unknown as ClientState["frames"] }, { takeover: "video" });
+    expect(v.taps!.targets[0]!.yScale).toBe(1272 / 1280);
+  });
+
+  it("takes no tap with the browser in front, and says so under the screen", () => {
+    const v = viewOf(held({ front: "browser" }));
+    expect(v.taps).toEqual({ tileId: "phone:1", session: "s", targets: [], note: TAP_BROWSER_NOTE });
+    expect(TAP_BROWSER_NOTE).toBe("Taps reach the phone only in Robot Park.");
+  });
+
+  it("takes no tap on a host that does not list it, says nothing, and never shows tap as a button", () => {
+    expect(viewOf(held({ actions: ACTIONS })).taps).toBeNull();
+    const p = viewOf(held()).panel!;
+    if (p.borrow.kind !== "yours") throw new Error(p.borrow.kind);
+    expect(p.borrow.actions.map((a) => a.name)).toEqual(ACTIONS);
+  });
+
+  it("takes no tap on a phone that is restoring, another viewer's, or not opened", () => {
+    expect(viewOf(held({ phase: "relaunching" })).taps!.targets).toEqual([]);
+    expect(viewOf(held({ phase: "relaunching" })).taps!.note).toBeNull();
+    expect(viewOf(held({ borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-9" } })).taps).toBeNull();
+    expect(phonesView(input(held(), { openId: null })).taps).toBeNull();
+  });
+
+  it("tells a viewer about to borrow that taps reach Robot Park", () => {
+    const ph = phonesOf(2);
+    ph.tiles[0] = { ...ph.tiles[0]!, actions: WITH_TAP };
+    const p = phonesView(input(stateWith(ph), { openId: "phone:1" })).panel!;
+    expect(p.borrow).toMatchObject({ kind: "free", note: "Fixed actions, and taps on the screen in Robot Park, for 2 min. 0 of 2 lent now." });
+    const q = phonesView(input(stateWith(phonesOf(2)), { openId: "phone:1" })).panel!;
+    expect(q.borrow).toMatchObject({ kind: "free", note: expect.stringMatching(/^Fixed actions only, /) });
+  });
+
+  it("reads the phone's app in front from the snapshot, and none from a coordinator that does not say", () => {
+    const raw = JSON.parse(readFileSync(new URL("./fixtures/coordinator.json", import.meta.url), "utf8")) as { views: Record<string, { phones: { tiles: Record<string, unknown>[] } }> };
+    const state = structuredClone(raw.views["29_phones"]!);
+    const read = () => {
+      const m = parseServerMsg(JSON.stringify({ type: "snapshot", version: 1, state }));
+      if (m.type !== "snapshot") throw new Error("not a snapshot");
+      return m.state.phones!.tiles.map((t) => t.front);
+    };
+    expect(read()).toEqual([null, null]);
+    state.phones.tiles[0]!["front"] = "browser";
+    state.phones.tiles[1]!["front"] = "app";
+    expect(read()).toEqual(["browser", "app"]);
+    state.phones.tiles[0]!["front"] = "settings";
+    expect(read()).toEqual([null, "app"]);
   });
 });

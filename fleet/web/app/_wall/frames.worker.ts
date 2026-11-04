@@ -88,6 +88,8 @@ class TileStream {
   decodeMs: number[] = [];
   lastW = 0;
   lastH = 0;
+  /** The decoded picture's height before its crop (a phone's whole screen, with Robot Park's stamp band). */
+  lastFullH = 0;
   /** Margins of the stream as the last header gave them. */
   crop: Crop = NO_CROP;
   /** Where the inner rectangle sits in the whole image's pixel grid (from the header). */
@@ -257,6 +259,7 @@ class TileStream {
     const grid = meta ? meta.grid : this.grid;
     this.lastW = frame.displayWidth - crop.left - crop.right;
     this.lastH = frame.displayHeight - crop.top - crop.bottom;
+    this.lastFullH = frame.displayHeight;
     this.decodedTimes.push(now());
     // While a re-tile waits, the frame on screen is kept: the old tiles are drawn from it.
     // While paused, so is the frame the frozen choice shows for this stream: a resize or a new plan redraws from it.
@@ -1035,6 +1038,7 @@ function report(): void {
       newestT: s.frames.length > 0 ? s.frames[s.frames.length - 1]!.t : null,
       width: s.lastW,
       height: s.lastH,
+      fullHeight: s.lastFullH,
       behind: show?.kind === "behind",
       decodeMs: s.decodeMs.length > 0 ? pct(s.decodeMs, 0.5) : null,
       lag: s.log.summary(),

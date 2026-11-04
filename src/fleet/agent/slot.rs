@@ -625,7 +625,7 @@ async fn run_phone_actions(ctx: &SlotCtx, r: &mut Running, p: &AssignPhone) {
             continue;
         }
         r.actions_done = a.seq;
-        let Some(argv) = super::vm::phone_action_argv(r.vm.pid, a.action) else {
+        let Some(argv) = super::vm::phone_action_argv(r.vm.pid, a.action, a.point) else {
             continue;
         };
         let run = tokio::process::Command::new(&ctx.cfg.fcvm)
@@ -634,6 +634,10 @@ async fn run_phone_actions(ctx: &SlotCtx, r: &mut Running, p: &AssignPhone) {
             .kill_on_drop(true)
             .output();
         match tokio::time::timeout(PHONE_ACTION_TIMEOUT, run).await {
+            // taps come up to five a second: their successes are not worth a line each
+            Ok(Ok(o)) if o.status.success() && a.action == fleet_core::phone::PhoneAction::Tap => {
+                tracing::debug!(slot = %ctx.id, seq = a.seq, out = %tail(&o.stdout), "phone tap done")
+            }
             Ok(Ok(o)) if o.status.success() => {
                 // the action's own line: open_browser's says how long the browser took to show
                 tracing::info!(slot = %ctx.id, action = a.action.as_str(), seq = a.seq, out = %tail(&o.stdout), "phone action done")
