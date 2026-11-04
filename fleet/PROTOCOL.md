@@ -2107,7 +2107,10 @@ The same actions arrive by intent, for adb:
 ```
 
 Where the phone runs, for the info tab. Each field optional, a string or number,
-printable ASCII, at most 64 characters.
+printable ASCII, at most 64 characters. A fleet agent sends it once each launch of a phone
+slot runs (`phone.sh ctl`): `vm`, `slot`, `region` (the slot's `place`, `EC2 in <region>`)
+and `restored_in_ms` (the launch to the app's first frame), and never `host`, since every
+viewer of the phone reads the info tab.
 
 ### `clock`
 

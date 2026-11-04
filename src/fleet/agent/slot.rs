@@ -854,6 +854,37 @@ async fn relaunch(
     timings.insert("first_frame_ms".into(), ms(first_frame - health_at));
     timings.insert("total_ms".into(), ms(t0.elapsed()));
     ctx.report("running", generation, &timings, None, None);
+    if phone {
+        // Robot Park's info tab shows where it runs; a phone restored from the warm snapshot
+        // has only the snapshot's empty place. Its failure costs the tab a card, nothing more.
+        let argv = super::vm::phone_place_argv(
+            vm.pid,
+            &ctx.vm_name(),
+            &ctx.id,
+            ctx.cfg.place.as_deref(),
+            timings.get("total_ms").copied(),
+        );
+        let (fcvm, id) = (ctx.cfg.fcvm.clone(), ctx.id.clone());
+        tokio::spawn(async move {
+            let run = tokio::process::Command::new(&fcvm)
+                .args(&argv)
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output();
+            match tokio::time::timeout(PHONE_ACTION_TIMEOUT, run).await {
+                Ok(Ok(o)) if o.status.success() => {
+                    tracing::debug!(slot = %id, "the phone was told its place")
+                }
+                Ok(Ok(o)) => {
+                    tracing::warn!(slot = %id, status = %o.status, out = %tail(&o.stderr), "the phone was not told its place")
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(slot = %id, error = %e, "the phone was not told its place")
+                }
+                Err(_) => tracing::warn!(slot = %id, "telling the phone its place timed out"),
+            }
+        });
+    }
     *running = Some(Running {
         vm,
         generation,

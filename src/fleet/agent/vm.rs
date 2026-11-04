@@ -332,6 +332,38 @@ pub fn phone_action_argv(
     Some(argv)
 }
 
+/// The command that tells a running phone's Robot Park where it runs, for its info tab
+/// (PROTOCOL.md, "Phone app", `place`): `phone.sh ctl` with the VM, the slot, the place a
+/// viewer may see (`EC2 in <region>`, never the host's own name) and the restore's time,
+/// from the launch to the app's first frame.
+pub fn phone_place_argv(
+    vm_pid: u32,
+    vm: &str,
+    slot: &str,
+    place: Option<&str>,
+    restored_in_ms: Option<u64>,
+) -> Vec<String> {
+    let mut req = serde_json::json!({"type": "place", "vm": vm, "slot": slot});
+    if let Some(p) = place {
+        req["region"] = p.into();
+    }
+    if let Some(ms) = restored_in_ms {
+        req["restored_in_ms"] = ms.into();
+    }
+    [
+        "exec",
+        "--pid",
+        &vm_pid.to_string(),
+        "--",
+        "/usr/local/bin/phone.sh",
+        "ctl",
+        &req.to_string(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 /// What fcvm's `restored` record says about the restore.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Restored {
@@ -661,6 +693,41 @@ mod tests {
                 "/usr/local/bin/phone.sh",
                 "serve"
             ]
+        );
+    }
+
+    /// Robot Park's info tab learns where it runs: the VM, the slot, the viewer-safe place and
+    /// the restore's time, as one `place` request; no host name.
+    #[test]
+    fn a_running_phone_is_told_where_it_runs() {
+        let argv = super::phone_place_argv(
+            42,
+            "fleet-phone-2",
+            "phone-2",
+            Some("EC2 in us-east-1"),
+            Some(23_400),
+        );
+        assert_eq!(
+            &argv[..6],
+            [
+                "exec",
+                "--pid",
+                "42",
+                "--",
+                "/usr/local/bin/phone.sh",
+                "ctl"
+            ]
+        );
+        let req: serde_json::Value = serde_json::from_str(&argv[6]).unwrap();
+        assert_eq!(
+            req,
+            serde_json::json!({"type": "place", "vm": "fleet-phone-2", "slot": "phone-2", "region": "EC2 in us-east-1", "restored_in_ms": 23400})
+        );
+        let bare: serde_json::Value =
+            serde_json::from_str(&super::phone_place_argv(1, "v", "s", None, None)[6]).unwrap();
+        assert_eq!(
+            bare,
+            serde_json::json!({"type": "place", "vm": "v", "slot": "s"})
         );
     }
 

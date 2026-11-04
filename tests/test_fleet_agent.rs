@@ -2239,6 +2239,23 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
             "/usr/local/bin/phone.sh action tap 0.2500 0.9375"
         ]
     );
+    // Robot Park was told where it runs, once, for its info tab
+    let places: Vec<String> = execs()
+        .into_iter()
+        .filter(|e| e.contains(" ctl "))
+        .collect();
+    assert_eq!(places.len(), 1, "{places:?}");
+    let req: serde_json::Value =
+        serde_json::from_str(places[0].trim_start_matches("/usr/local/bin/phone.sh ctl ")).unwrap();
+    assert_eq!(
+        (&req["type"], &req["vm"], &req["slot"]),
+        (
+            &serde_json::json!("place"),
+            &serde_json::json!("fleet-phone-1"),
+            &serde_json::json!("phone-1")
+        )
+    );
+    assert!(req["restored_in_ms"].is_u64(), "{req}");
     c.close().await;
 }
 
