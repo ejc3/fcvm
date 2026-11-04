@@ -2237,6 +2237,55 @@ def _read_state_nofollow(state_path: str):
             os.close(state_fd)
 
 
+def left_on_disk(state_path: str, data_dir: str) -> list:
+    """Which of a clone's state file, its lock and its runtime directory exist.
+
+    Every fcvm launch runs cleanup_stale_state, which opens, creating if needed,
+    the lock of each state file in a listing it took earlier, and removes the
+    lock while holding it once it finds the state gone. So a lock can exist for
+    a moment after a complete reap. A lock beside an absent state and directory
+    is waited for (STATE_LOCK_WAIT_S) and removed if it is still there with the
+    state still absent, as that cleanup would."""
+    lock = f"{state_path}.lock" if state_path else ""
+    paths = [p for p in (state_path, lock, data_dir) if p]
+    left = [p for p in paths if os.path.lexists(p)]
+    if lock and left == [lock]:
+        _settle_orphan_lock(lock, state_path)
+        left = [p for p in paths if os.path.lexists(p)]
+    return left
+
+
+def _settle_orphan_lock(lock: str, state_path: str) -> None:
+    try:
+        fd = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return
+    try:
+        deadline = time.monotonic() + STATE_LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return
+                time.sleep(0.01)
+        if os.path.lexists(state_path):
+            return
+        try:
+            on_disk = os.lstat(lock)
+        except FileNotFoundError:
+            return
+        held = os.fstat(fd)
+        if (on_disk.st_dev, on_disk.st_ino) == (held.st_dev, held.st_ino):
+            try:
+                os.remove(lock)
+            except FileNotFoundError:
+                pass
+    finally:
+        os.close(fd)
+
+
 def _ignore_missing(function, path, exc):
     """rmtree onexc: an entry another process removed first is not an error."""
     if not isinstance(exc, FileNotFoundError):
@@ -2763,8 +2812,7 @@ def teardown_fast(
     # leaves behind can never be swept (`cleanup_stale_state` bails on a null
     # pid). `disk_reap_ms` is also a published per-arm median, computed over
     # records that included failed reaps.
-    left = [p for p in (state_path, f"{state_path}.lock" if state_path else "", data_dir)
-            if p and os.path.lexists(p)]
+    left = left_on_disk(state_path, data_dir)
     out["disk_cleanup_verified"] = not left and not out.get("disk_errors")
     out["teardown_total_ms"] = (time.monotonic() - t_kill) * 1000
     if left or out.get("disk_errors"):
@@ -2921,16 +2969,7 @@ def teardown_normal(
             out,
         )
 
-    expected = [
-        p
-        for p in (
-            state_path,
-            f"{state_path}.lock" if state_path else "",
-            data_dir,
-        )
-        if p
-    ]
-    left = [p for p in expected if os.path.lexists(p)]
+    left = left_on_disk(state_path, data_dir)
     out["disk_cleanup_verified"] = not left
     if left:
         out["disk_cleanup_left"] = left
@@ -2944,7 +2983,7 @@ def teardown_normal(
             out, data_root, state_path, data_dir, expected_owner
         )
         out["disk_reap_ms"] = (time.monotonic() - t_disk) * 1000
-        still_left = [p for p in expected if os.path.lexists(p)]
+        still_left = left_on_disk(state_path, data_dir)
         out["disk_reap_failed"] = still_left
         out["teardown_total_ms"] = (time.monotonic() - t0) * 1000
         raise SurvivedTeardown(
@@ -4711,8 +4750,7 @@ def run_exec_request(args, rep: int) -> dict:
         raise error
     close_pidfds([parent_fd, *fds])
 
-    expected = [state_path, f"{state_path}.lock", data_dir]
-    left = [path for path in expected if path and os.path.lexists(path)]
+    left = left_on_disk(state_path, data_dir)
     teardown["disk_cleanup_verified"] = not left
     if left:
         teardown["disk_cleanup_left"] = left
@@ -4723,7 +4761,7 @@ def run_exec_request(args, rep: int) -> dict:
             data_dir,
             (proc.pid, fcvm_start_time),
         )
-        still_left = [path for path in expected if path and os.path.lexists(path)]
+        still_left = left_on_disk(state_path, data_dir)
         teardown["disk_reap_failed"] = still_left
         teardown["disk_cleanup_verified"] = not still_left and not rec.get("disk_errors")
         if (

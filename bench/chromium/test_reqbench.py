@@ -844,6 +844,84 @@ class ReapDiskPathGuard(unittest.TestCase):
             self.assertTrue(os.path.isdir(vm_dir))
             self.assertTrue(os.path.exists(state))
 
+    def test_a_lock_another_launch_recreated_is_not_left_behind(self):
+        """cleanup_stale_state opens, creating if needed, the lock of every state
+        file in a listing it took earlier, and removes it while holding it once it
+        finds the state gone. After a complete reap that lock can exist again for
+        a moment.
+
+        RED BEFORE THE FIX: the absence check saw it and SurvivedTeardown failed
+        the request with left=['.../vm-<id>.json.lock'] errors=[] (one request
+        of a scale probe at 2 vCPUs)."""
+        import fcntl
+        import threading
+        with tempfile.TemporaryDirectory() as root:
+            vm_id = "vm-dddddddddddddddddddddddddddddddd"
+            state = os.path.join(root, f"{vm_id}.json")
+            lock = f"{state}.lock"
+            vm_dir = os.path.join(root, "vm-disks", vm_id)
+            # An fcvm stand-in whose one child dies with it (pdeathsig), so the
+            # kill is complete and the reap runs.
+            ready = os.path.join(root, "child-ready")
+            p = subprocess.Popen(["bash", "-c",
+                                  "python3 -c 'import ctypes,signal,time; "
+                                  "ctypes.CDLL(\"libc.so.6\").prctl(1, signal.SIGKILL); "
+                                  f"open(\"{ready}\", \"w\").close(); "
+                                  "time.sleep(600)' & wait"])
+            deadline = time.monotonic() + 10
+            while not os.path.exists(ready) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            # The scanner's lock: created once the reap has removed the clone's
+            # own state and lock, held, and removed before it lets go.
+            from unittest import mock
+            real_reap = reqbench.reap_disk
+            threads = []
+
+            def reap_then_scan(*a, **k):
+                reaped = real_reap(*a, **k)
+                held = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+                fcntl.flock(held, fcntl.LOCK_EX)
+
+                def scanner():
+                    time.sleep(0.3)
+                    os.remove(lock)
+                    fcntl.flock(held, fcntl.LOCK_UN)
+                    os.close(held)
+
+                threads.append(threading.Thread(target=scanner))
+                threads[-1].start()
+                return reaped
+
+            try:
+                with mock.patch.object(reqbench, "reap_disk", reap_then_scan):
+                    out = reqbench.teardown_fast(p.pid, root, state, vm_dir, 5.0,
+                                                 verify_disk_cleanup=True)
+            finally:
+                for t in threads:
+                    t.join()
+                p.kill()
+                p.wait()
+            self.assertTrue(out["disk_cleanup_verified"], out)
+            self.assertFalse(os.path.lexists(lock))
+
+    def test_a_lock_beside_no_state_is_removed_once_free(self):
+        """A lock left beside an absent state and directory, with nobody holding
+        it, is removed by the absence check, as cleanup_stale_state would."""
+        with tempfile.TemporaryDirectory() as root:
+            state = os.path.join(root, "vm-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json")
+            with open(f"{state}.lock", "w"):
+                pass
+            self.assertEqual(reqbench.left_on_disk(state, ""), [])
+            self.assertFalse(os.path.lexists(f"{state}.lock"))
+
+    def test_a_lock_beside_a_state_is_never_removed(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = os.path.join(root, "vm-ffffffffffffffffffffffffffffffff.json")
+            for p in (state, f"{state}.lock"):
+                with open(p, "w"):
+                    pass
+            self.assertEqual(reqbench.left_on_disk(state, ""), [state, f"{state}.lock"])
+
     def test_a_real_removal_error_is_still_recorded(self):
         """Only a missing entry is someone else's removal; EACCES stays an error."""
         from unittest import mock
