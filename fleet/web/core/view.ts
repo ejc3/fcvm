@@ -1425,16 +1425,27 @@ export interface StreamModeView {
   detail: string;
 }
 
-/** The label beside the Wall / Phones switch: a saved broadcast choice is otherwise invisible until a tile is opened. */
-export function streamModeView(s: ClientState, broadcast: boolean, drawn: DrawPlan["mode"]): StreamModeView {
+/**
+ * The label beside the Wall / Phones switch: a saved broadcast choice is otherwise invisible until a tile is opened.
+ * Outside the broadcast it names the mode the worker draws (`shownMode`), which keeps the old streams until
+ * every new one is ready, and says when a switch to `planned` is pending. Before the first draw it names `planned`.
+ */
+export function streamModeView(s: ClientState, broadcast: boolean, planned: DrawPlan["mode"]): StreamModeView {
   if (broadcast) {
     return s.admission?.locked
       ? { label: "Broadcast", detail: "Direct streams are full, so this is the broadcast, a few seconds behind the fleet" }
       : { label: "Broadcast", detail: "The broadcast, a few seconds behind the fleet. Direct the scene switches it off" };
   }
-  return drawn === "aggregated"
-    ? { label: "Combined streams", detail: "One stream per host, each joining its VMs' frames. Direct the scene switches streams" }
-    : { label: "Direct streams", detail: "Every VM's own stream. Direct the scene switches streams" };
+  const name = (m: DrawPlan["mode"]) => (m === "aggregated" ? "combined streams" : "direct streams");
+  const drawn: DrawPlan["mode"] = s.frames === null ? planned : s.ui.shownMode === "aggregated" ? "aggregated" : "direct";
+  const what =
+    drawn === "aggregated"
+      ? "One stream per host, each joining its VMs' frames. Direct the scene switches streams"
+      : "Every VM's own stream. Direct the scene switches streams";
+  return {
+    label: drawn === "aggregated" ? "Combined streams" : "Direct streams",
+    detail: drawn === planned ? what : `Switching to ${name(planned)} once each one is ready. ${what}`,
+  };
 }
 
 /**
