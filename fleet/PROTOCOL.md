@@ -375,7 +375,9 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
 
 - `tiles` lists one tile per configured place, the fcvm side then the EC2 side: `fleet.n`
   fcvm tiles and `fleet.ec2_n` EC2 tiles. The fcvm side has `--fcvm-tiles` places less the
-  GPUs connected hosts run phones on (`phones` in their hello), or one per live fcvm GPU (GPUs on hosts that are not draining, at most `max_tiles`) when there
+  GPUs connected hosts run phones on (`phones` in their hello) and less the wall GPUs of
+  connected hosts that are quarantined (no GPU can fill either's place, so a place kept for
+  one would stay dark for as long as its host runs), or one per live fcvm GPU (GPUs on hosts that are not draining, at most `max_tiles`) when there
   are more of those; the EC2 side has `--ec2-tiles` places (at most `max_tiles`), one per
   EC2 tile, with an instance or not. Asleep, both sides have none. Each side is as wide as
   its share of the places (`layout.fcvm`, `layout.ec2`: 8 and 8 give each side half the
@@ -510,7 +512,8 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   re-tile waits on a VM that is still starting. With no tile on the wall (a cold start, a
   wake) every GPU joins at once.
 - A GPU whose reset, scrub or attach fails is quarantined by its agent (Agent: `quarantine`):
-  it leaves the tiling and the agent's assignment, `failures` lists it as `gpu_quarantined`
+  it leaves the tiling, the fcvm side's places (the side shrinks to the GPUs that serve) and
+  the agent's assignment, `failures` lists it as `gpu_quarantined`
   while its host is connected,
   and it stays out (also when its agent reconnects or the coordinator restarts with its state
   file) until an operator releases it with `POST /quarantine/release`.
@@ -596,7 +599,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   without `s3:ListBucket`) stops the coordinator rather than start it empty.
 - `--fcvm-tiles` (default 8, at most `--max-tiles`) is the fcvm side's places: with fewer
   live fcvm GPUs the rest are dark tiles, with more the side has one place per GPU. GPUs
-  that connected hosts run phones on come off it. It and
+  that connected hosts run phones on, and quarantined GPUs of connected hosts, come off it. It and
   the EC2 side's `--ec2-tiles` size the two sides (see `tiles` above).
 - `--ec2 aws` runs `--ec2-tiles` EC2 tiles, whatever the fcvm side has. Each is one
   instance from the tile launch template (one-time spot), tagged `Purpose=fcvm-fleet-tile`,

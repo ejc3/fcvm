@@ -1281,6 +1281,74 @@ test("failure states: a failed VM with its retry, a reclaimed host re-tiling, th
   await expect(page.getByTestId("restart-all")).toBeEnabled();
 });
 
+test("a quarantined GPU leaves the wall and the strip says which and why; a dark tile's phase never sits behind the controls", async ({ page, browser }) => {
+  await openWall(page, 15, "direct");
+  // The lowest fcvm tile: the one the bottom strip lies over.
+  const lowest = async (p: Page) =>
+    p.evaluate(() => {
+      const ts = window.__fleet!.view().tiles.filter((t) => t.half === "fcvm" && t.box);
+      return ts.reduce((a, b) => (b.box!.y + b.box!.h > a.box!.y + a.box!.h ? b : a)).id;
+    });
+  const id = await lowest(page);
+  await admin("/mock/fault", { fail: id, message: "GPU did not come back after reset", retry_ms: 30_000 });
+  // The phase is on screen and touches none of the controls drawn over the image.
+  const clear = async (p: Page, label: string, mustShow: boolean) => {
+    await expect(p.getByTestId(`dark-${id}`)).toHaveAttribute("data-kind", "failed");
+    await p.waitForTimeout(300);
+    const hit = await p.evaluate((tid) => {
+      const plate = document.querySelector(`[data-testid="phase-${tid}"]`);
+      if (!plate) return { shown: false, hits: [] as string[] };
+      // What is visible of the plate: clipped to its band when the band clips its content.
+      const p = plate.getBoundingClientRect();
+      const band = plate.closest(".content");
+      const b = band && getComputedStyle(band).overflow !== "visible" ? band.getBoundingClientRect() : null;
+      const r = b ? { left: Math.max(p.left, b.left), right: Math.min(p.right, b.right), top: Math.max(p.top, b.top), bottom: Math.min(p.bottom, b.bottom), width: p.width } : p;
+      const controls = [...document.querySelectorAll('[data-hud-box], [data-testid="last-race"], [data-testid="restart-all"]')];
+      const hits = controls
+        .map((el) => ({ el, c: el.getBoundingClientRect() }))
+        .filter(({ c }) => c.width > 0 && c.left < r.right && r.left < c.right && c.top < r.bottom && r.top < c.bottom)
+        .map(({ el }) => el.getAttribute("data-testid") ?? el.className);
+      return { shown: r.width > 0, hits };
+    }, id);
+    if (mustShow) expect(hit.shown, `${label}: the phase is shown`).toBe(true);
+    expect(hit.hits, `${label}: the phase overlaps`).toEqual([]);
+  };
+  for (const [w, h] of [
+    [1280, 720],
+    [1600, 900],
+    [1024, 768],
+  ] as const) {
+    await page.setViewportSize({ width: w, height: h });
+    await clear(page, `${w}x${h}`, true);
+  }
+  // A message that wraps past the clear band stays inside it.
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await admin("/mock/fault", { fail: id, message: "the VM did not come back after its GPU reset; ".repeat(8), retry_ms: 30_000 });
+  await clear(page, "a long message at 1280x720", true);
+  const ctx = await browser.newContext({ ...devices["iPhone 13"], deviceScaleFactor: 1 });
+  const phone = await ctx.newPage();
+  await openWall(phone, 3);
+  await clear(phone, "phone", false);
+  await ctx.close();
+
+  // As the coordinator does for an agent's quarantine: the GPU's place leaves the fcvm side,
+  // so no dark place waits for it, and the strip names the GPU and the reason.
+  const before = (await view(page)).tiles.filter((t) => t.half === "fcvm").length;
+  await admin("/mock/fault", {
+    quarantine: "fcvm:1",
+    error:
+      "fcvm exited (exit status: 1) before the renderer's first frame; fcvm said: ERROR fcvm: Error: loading snapshot: " +
+      '{"fault_message":"Load snapshot error: Failed to attach a passthrough device on restore: Attaching the passthrough device failed: VFIO error: Device does not provide MSIx irq"}',
+  });
+  await expect(page.getByTestId("out-of-rotation")).toHaveText(/^1 fcvm GPU out of rotation: 0000:[0-9a-f]{2}:00\.0, VFIO error: Device does not provide MSIx irq$/);
+  await expect.poll(async () => (await view(page)).tiles.filter((t) => t.half === "fcvm").length, { timeout: 15_000 }).toBe(before - 1);
+  await expect(page.locator('.dark-tile[data-kind="empty"]')).toHaveCount(0);
+  await admin("/mock/fault", { replace_host: "mock-host-1" });
+  await expect(page.getByTestId("out-of-rotation")).toHaveCount(0);
+  await expect.poll(async () => (await view(page)).tiles.filter((t) => t.half === "fcvm").length, { timeout: 15_000 }).toBe(before);
+  await expect(page.getByTestId(`dark-${id}`)).toHaveCount(0, { timeout: 45_000 });
+});
+
 test("Turnstile: the first action waits for the check, then goes through", async ({ page, browser }) => {
   await admin("/mock/turnstile", { sitekey: "example-sitekey" });
   const stub = () => {
