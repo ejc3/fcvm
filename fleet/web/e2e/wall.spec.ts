@@ -1180,12 +1180,16 @@ test("broadcast mode, a late viewer: Enter on a tile zooms the broadcast, which 
   }
 });
 
-test("beside Wall / Phones, the header says how the picture arrives, and a saved broadcast says Broadcast; the label opens the stream switches", async ({ page }) => {
+test("beside Wall / Phones, the header names the streams the picture is drawn from", async ({ page }) => {
   await openWall(page, 15);
-  const shown = await page.evaluate(() => window.__fleet!.view().plan.mode);
+  const shown = await page.evaluate(() => window.__fleet!.client.getState().ui.shownMode);
   await expect(page.getByTestId("stream-mode")).toHaveText(shown === "aggregated" ? "Combined streams" : "Direct streams");
-  await openBroadcast(page, false);
+});
+
+test("a saved broadcast says Broadcast beside Wall / Phones, and the label opens the stream switches", async ({ page }) => {
+  // Its own page: openWall's saved mode would be a second init script, run in no defined order.
   try {
+    await openBroadcast(page, false);
     await expect(page.getByTestId("stream-mode")).toHaveText("Broadcast");
     await page.getByTestId("stream-mode").click();
     await expect(page.getByTestId("broadcast-switch")).toBeVisible({ timeout: 1000 });
