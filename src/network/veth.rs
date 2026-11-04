@@ -37,23 +37,58 @@ pub fn link_exists(if_name: &str) -> bool {
         .exists()
 }
 
+/// The `ip link add` arguments for a veth pair whose two ends carry the given MACs.
+///
+/// Both MACs are set at creation. A veth the kernel gives a random MAC is
+/// rewritten by systemd-udevd's default link policy (`MACAddressPolicy=persistent`
+/// in 99-default.link) once udev handles the add event, and how long after the
+/// add that lands depends on udev's queue. With a clone's traffic already flowing,
+/// the namespace keeps the MAC it resolved first, and its frames then reach the host
+/// addressed to a MAC the host veth no longer has: the host drops them as
+/// PACKET_OTHERHOST. Seen on a bridged corpus run: the host veth sent the TLS
+/// server flight from one MAC and its FIN, 10 s later, from another; every client
+/// segment in between arrived as OTHERHOST, and the request failed with
+/// ERR_EMPTY_RESPONSE. udev leaves a MAC set by userspace alone.
+fn veth_add_args(
+    host_veth: &str,
+    guest_veth: &str,
+    host_mac: &str,
+    guest_mac: &str,
+) -> Vec<String> {
+    [
+        "link", "add", host_veth, "address", host_mac, "type", "veth", "peer", "name", guest_veth,
+        "address", guest_mac,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 /// Creates a veth pair and moves guest side into a namespace
 ///
-/// Creates a pair of virtual ethernet devices. The host side remains in the
-/// root namespace, while the guest side is moved into the VM's namespace.
-pub async fn create_veth_pair(host_veth: &str, guest_veth: &str, ns_name: &str) -> Result<()> {
+/// Creates a pair of virtual ethernet devices, each end with a MAC set at
+/// creation (see `veth_add_args`), and returns them as (host, guest). The host
+/// side remains in the root namespace, while the guest side is moved into the
+/// VM's namespace.
+pub async fn create_veth_pair(
+    host_veth: &str,
+    guest_veth: &str,
+    ns_name: &str,
+) -> Result<(String, String)> {
+    let host_mac = super::types::generate_mac();
+    let guest_mac = super::types::generate_mac();
     debug!(
         host = %host_veth,
         guest = %guest_veth,
         namespace = %ns_name,
+        host_mac = %host_mac,
+        guest_mac = %guest_mac,
         "creating veth pair"
     );
 
     // Create veth pair in root namespace
     let output = Command::new("ip")
-        .args([
-            "link", "add", host_veth, "type", "veth", "peer", "name", guest_veth,
-        ])
+        .args(veth_add_args(host_veth, guest_veth, &host_mac, &guest_mac))
         .output()
         .await
         .context("executing ip link add veth")?;
@@ -80,7 +115,7 @@ pub async fn create_veth_pair(host_veth: &str, guest_veth: &str, ns_name: &str) 
         anyhow::bail!("failed to move veth to namespace: {}", stderr);
     }
 
-    Ok(())
+    Ok((host_mac, guest_mac))
 }
 
 /// Check whether an `ip -o addr show` output line shows a fcvm-managed veth
@@ -1119,6 +1154,29 @@ mod parse_tests {
         assert_eq!(route_nexthop(""), None);
     }
 
+    /// RED BEFORE THE FIX: the pair was added with no address on either end, so
+    /// the kernel gave both random MACs and udev rewrote the host end's after the
+    /// clone had resolved it (`veth_add_args` explains the drop this caused).
+    #[test]
+    fn veth_pair_is_created_with_both_macs_set() {
+        let args = veth_add_args(
+            "veth0-vm-x",
+            "veth1-vm-x",
+            "02:00:00:00:00:01",
+            "02:00:00:00:00:02",
+        );
+        let at = |name: &str| args.iter().position(|a| a == name).unwrap();
+        assert_eq!(
+            args[at("veth0-vm-x") + 1..at("veth0-vm-x") + 3],
+            ["address", "02:00:00:00:00:01"]
+        );
+        assert_eq!(
+            args[at("veth1-vm-x") + 1..at("veth1-vm-x") + 3],
+            ["address", "02:00:00:00:00:02"]
+        );
+        assert_eq!(args[at("peer") + 1], "name");
+    }
+
     #[test]
     fn route_nexthop_is_token_exact() {
         // 10.0.1.2 must not be considered the nexthop of a route via 10.0.1.20
@@ -1180,6 +1238,66 @@ mod tests {
         // Cleanup
         delete_veth_pair(host_veth).await.unwrap();
         delete_namespace(ns_name).await.unwrap();
+    }
+
+    /// The MACs `create_veth_pair` sets survive udev's handling of the add event.
+    ///
+    /// RED BEFORE THE FIX: with no address set, systemd-udevd's
+    /// MACAddressPolicy=persistent rewrote the host end's MAC once it processed the
+    /// event. udev's exec queue is held while the pair is created, so the rewrite
+    /// lands after the first read instead of racing it, then released and settled.
+    /// Where no udev runs, the same check holds trivially: nothing rewrites a MAC.
+    #[tokio::test]
+    async fn test_veth_macs_survive_udev() {
+        let ns_name = "fcvm-test-veth-mac";
+        let host_veth = "veth-host-mac";
+        let guest_veth = "veth-ns-mac";
+        let _ = delete_veth_pair(host_veth).await;
+        let _ = delete_namespace(ns_name).await;
+        assert_eq!(
+            create_namespace(ns_name).await.unwrap(),
+            NamespaceCreation::Created
+        );
+
+        let udev = std::path::Path::new("/run/udev/control").exists();
+        let queue = |action: &'static str| async move {
+            let status = Command::new("udevadm")
+                .args(["control", action])
+                .status()
+                .await
+                .unwrap();
+            assert!(status.success(), "udevadm control {action}");
+        };
+        if udev {
+            queue("--stop-exec-queue").await;
+        }
+        let created = create_veth_pair(host_veth, guest_veth, ns_name).await;
+        if udev {
+            queue("--start-exec-queue").await;
+            let status = Command::new("udevadm")
+                .args(["settle", "--timeout=30"])
+                .status()
+                .await
+                .unwrap();
+            assert!(status.success(), "udevadm settle");
+        }
+        let (host_mac, guest_mac) = created.unwrap();
+        let host_now =
+            std::fs::read_to_string(format!("/sys/class/net/{host_veth}/address")).unwrap();
+        let guest_now = exec_in_namespace(
+            ns_name,
+            &["cat", &format!("/sys/class/net/{guest_veth}/address")],
+        )
+        .await
+        .unwrap();
+        delete_veth_pair(host_veth).await.unwrap();
+        delete_namespace(ns_name).await.unwrap();
+        assert_eq!(
+            host_now.trim(),
+            host_mac,
+            "the host veth's MAC changed after creation"
+        );
+        assert_eq!(String::from_utf8_lossy(&guest_now.stdout).trim(), guest_mac);
     }
 
     #[tokio::test]
