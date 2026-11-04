@@ -707,7 +707,7 @@ export function phonesView(inp: PhonesInput): PhonesView {
       bezelOpacity: p?.bezelOpacity ?? 0,
       labelBox: p?.label ?? null,
       dark: t.phase !== "running",
-      ariaLabel: `${phoneName(t)}, ${state}${mine(t) ? ", yours" : lentToOther ? ", borrowed" : ""}. Open its details.`,
+      ariaLabel: `${phoneName(t)}, ${state}${mine(t) ? ", your phone" : lentToOther ? ", borrowed" : ""}. Open its details.`,
       mine: mine(t),
       lent: lentToOther,
     };
