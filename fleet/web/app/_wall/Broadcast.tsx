@@ -5,7 +5,7 @@
 // presented frame (requestVideoFrameCallback) is matched to it, so the client knows the t of
 // the frame on screen and draws the overlay for that moment (core/broadcast.ts).
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { FrameMatcher, memoUntilFailure, type ShownFrame } from "../../core/index.ts";
 
 /** The IVS web player, pinned. */
@@ -72,16 +72,52 @@ function seiFrame(data: unknown): { t: number; e: number } | null {
 
 export type BroadcastStatus = "loading" | "playing" | "buffering" | "reconnecting" | "unsupported";
 
+type Css = { left: number; top: number; width: number; height: number };
+
+/**
+ * An opened VM, zoomed from the broadcast itself: the player fills `frame` (the stage the zoom
+ * fills), the whole video sits at `video` in it, scaled up so the opened VM's region fills its
+ * box, and the rest is dimmed around `hole` (that box) as the canvas dims a direct zoom: `near`
+ * at its edge, rising to `far` at the corners. All relative to `frame`.
+ */
+export interface BroadcastZoom {
+  frame: Css;
+  video: Css;
+  hole: Css | null;
+  near: number;
+  far: number;
+}
+
+/** The dim around an opened VM: a radial ramp from its box outwards, with the box itself cut out. */
+function dimStyle(z: BroadcastZoom): CSSProperties {
+  const { width: W, height: H } = z.frame;
+  const h = z.hole;
+  if (!h) return { background: `rgba(0,0,0,${z.near})` };
+  const cx = h.left + h.width / 2;
+  const cy = h.top + h.height / 2;
+  const r0 = Math.max(h.width, h.height) / 2;
+  const r1 = Math.max(r0 + 1, Math.hypot(Math.max(cx, W - cx), Math.max(cy, H - cy)));
+  const [x0, y0, x1, y1] = [h.left, h.top, h.left + h.width, h.top + h.height];
+  return {
+    background: `radial-gradient(circle ${r1}px at ${cx}px ${cy}px, rgba(0,0,0,${z.near}) ${r0}px, rgba(0,0,0,${z.far}) ${r1}px)`,
+    clipPath: `polygon(evenodd, 0 0, ${W}px 0, ${W}px ${H}px, 0 ${H}px, 0 0, ${x0}px ${y0}px, ${x1}px ${y0}px, ${x1}px ${y1}px, ${x0}px ${y1}px, ${x0}px ${y0}px)`,
+  };
+}
+
 export function Broadcast({
   url,
   paused,
   box,
+  zoom,
   onFrame,
 }: {
   url: string;
   /** The page's Pause: the picture stops (the player holds its frame). */
   paused: boolean;
-  box: { left: number; top: number; width: number; height: number };
+  /** Where the image goes, relative to the stage. */
+  box: Css;
+  /** An opened VM: the broadcast zoomed (the same player, so the zoom starts on the frame already playing). */
+  zoom: BroadcastZoom | null;
   onFrame: (f: ShownFrame) => void;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -168,9 +204,16 @@ export function Broadcast({
         : status === "unsupported"
           ? "This browser cannot play the broadcast."
           : null;
+  // Zoomed, the page around it is hidden: the player stays visible over it, clipped to the stage.
   return (
-    <div className="broadcast" style={box} data-testid="broadcast" data-status={status}>
-      <video ref={videoRef} playsInline muted autoPlay aria-label="The broadcast of the whole wall" />
+    <div
+      className={`broadcast${zoom ? " zoomed" : ""}`}
+      style={zoom ? { ...zoom.frame, visibility: "visible" } : box}
+      data-testid="broadcast"
+      data-status={status}
+    >
+      <video ref={videoRef} playsInline muted autoPlay aria-label="The broadcast of the whole wall" style={zoom ? { position: "absolute", ...zoom.video } : undefined} />
+      {zoom ? <div className="broadcast-dim" style={dimStyle(zoom)} data-testid="broadcast-dim" /> : null}
       {note ? <p className="broadcast-note" role="status">{note}</p> : null}
     </div>
   );

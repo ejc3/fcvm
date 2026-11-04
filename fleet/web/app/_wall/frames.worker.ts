@@ -373,6 +373,10 @@ let painted = false;
 let switchStarted: number | null = null;
 const SWITCH_HOLD_LIMIT_MS = 4000;
 let settings: DrawSettings = { background: "#000000", dimAlpha: 0.5, fadeInMs: 280 };
+/** Broadcast mode: the opened VM's stream whose frame is drawn, and the box drawn in, as last told to the page. */
+let zoomDrawn: { key: string; box: Box } | null = null;
+const sameDrawn = (a: { key: string; box: Box } | null, b: { key: string; box: Box } | null) =>
+  a === b || (a !== null && b !== null && a.key === b.key && a.box.x === b.box.x && a.box.y === b.box.y && a.box.w === b.box.w && a.box.h === b.box.h);
 const streams = new Map<string, TileStream>();
 let prevT: number | null = null;
 let lastChoice: SyncChoice = { T: null, show: new Map() };
@@ -545,6 +549,12 @@ function applyPlan(p: DrawPlan): void {
   }
   const genChanged = p.gen !== plan.gen;
   plan = p;
+  // The opened VM's frame told to the page is no longer what this plan draws there (closed, or another VM).
+  const zoomKey = p.zoom?.overBroadcast && p.zoom.source ? keyOf(p.zoom.source) : null;
+  if (zoomDrawn !== null && zoomKey !== zoomDrawn.key) {
+    zoomDrawn = null;
+    post({ type: "zoom-drawn", drawn: null });
+  }
   // Taken at once (nothing on screen yet, or suspended): the page's overlays follow now.
   if (genChanged) post({ type: "gen-shown", gen: plan.gen });
   loadPoster(p.poster);
@@ -799,7 +809,7 @@ function draw(): void {
     const live = shown.filter((src) => src.box !== null && src.url !== null);
     // A region that never sends a frame stops holding the rest after the switch's limit.
     const ready =
-      (choice.T !== null && live.every((src) => choice.show.get(src.id)?.kind === "sync")) || now() - resumeStarted > SWITCH_HOLD_LIMIT_MS;
+      (choice.T !== null && live.every((src) => choice.show.get(src.id)?.kind === "sync")) || now() - resumeStarted > SWITCH_HOLD_LIMIT_MS || plan.zoom?.overBroadcast === true;
     if (!ready) {
       if (held && (dirty || needsClear) && ctx && canvas) {
         ctx.drawImage(held, 0, 0, canvas.width, canvas.height);
@@ -864,7 +874,8 @@ function draw(): void {
     const [x, y, w, h] = plan.image && frame.grid && !plan.focus ? gridBox(plan.image, frame.grid, inner.sw, inner.sh, dpr) : devBox(src.box);
     if (st.appearedAt === null) st.appearedAt = at;
     if (show.kind === "sync") st.log.drawn(show.t, at);
-    const fade = Math.min(1, (at - st.appearedAt) / settings.fadeInMs);
+    // Over the broadcast the canvas is shown only once this frame is drawn: nothing to fade in over.
+    const fade = src === plan.zoom?.source && plan.zoom.overBroadcast ? 1 : Math.min(1, (at - st.appearedAt) / settings.fadeInMs);
     if (fade < 1) {
       fillEmpty(src.box);
       dirty = true;
@@ -933,6 +944,15 @@ function draw(): void {
     }
   }
   if (plan.zoom) drawZoomDim(plan.zoom);
+  // Broadcast mode: tell the page once the opened VM's own frame is in its box, and where this draw
+  // put it (the plan drawn, which during a re-tile's hold is not yet the page's newest).
+  const zs = plan.zoom?.overBroadcast ? plan.zoom.source : null;
+  const zsShow = zs ? choice.show.get(zs.id) : undefined;
+  const zsDrawn = zs !== null && zs.box !== null && shownT(zsShow) !== null && streamOf(zs)?.frameAt(shownT(zsShow)!) != null ? { key: keyOf(zs), box: zs.box } : null;
+  if (!sameDrawn(zsDrawn, zoomDrawn)) {
+    zoomDrawn = zsDrawn;
+    post({ type: "zoom-drawn", drawn: zsDrawn });
+  }
   for (const src of shown) {
     const st = streamOf(src);
     if (!st) continue;

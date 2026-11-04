@@ -135,6 +135,11 @@ export function FocusPanel({
         </button>
         <h1 id="focus-title">{focus.title}</h1>
         <span className="state" data-testid="focus-state">{focus.state}</span>
+        {focus.broadcastNote ? (
+          <span className="state" data-testid="focus-broadcast-note">
+            {focus.broadcastNote}
+          </span>
+        ) : null}
         {!phone && !sheetOpen ? (
           <button ref={detailsRef} type="button" className="btn sheet-open" aria-expanded="false" aria-controls="focus-sheet" onClick={() => fold(true)} data-testid="sheet-toggle">
             Details

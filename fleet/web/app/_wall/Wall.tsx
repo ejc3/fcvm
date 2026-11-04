@@ -35,6 +35,7 @@ import {
   LIGHT_COLORS,
   wallView,
   type Box,
+  type ClientState,
   type Direction,
   type WallView,
   type ZoomStep,
@@ -47,7 +48,7 @@ import { OwnGpu } from "./OwnGpu.tsx";
 import { HalfClockView, Overlays, WakeCard } from "./Overlays.tsx";
 import { PlayDrawer, VerifyBox, type DrawerPanel } from "./PlayDrawer.tsx";
 import { Reel } from "./Reel.tsx";
-import { Broadcast } from "./Broadcast.tsx";
+import { Broadcast, type BroadcastZoom } from "./Broadcast.tsx";
 import type { DrawSettings } from "./worker-msgs.ts";
 
 const localNow = () => performance.timeOrigin + performance.now();
@@ -208,6 +209,8 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   const [now, setNow] = useState(0);
   const [canDecode, setCanDecode] = useState(true);
   const [painted, setPainted] = useState(false);
+  // Broadcast mode: the opened VM's own stream drawn, and the box drawn in (worker-msgs.ts "zoom-drawn").
+  const [zoomDrawn, setZoomDrawn] = useState<{ key: string; box: Box } | null>(null);
   // The recording's metadata: null until read, or when it is missing.
   const [reelMeta, setReelMeta] = useState<ReelMeta | null>(null);
   const [dpr, setDpr] = useState(1);
@@ -287,9 +290,11 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
     client.start();
     void canDecodeH264().then(setCanDecode);
     const off = client.onPainted(() => setPainted(true));
+    const offZoom = client.onZoomDrawn(() => setZoomDrawn(client.zoomDrawn));
     return () => {
       clearInterval(id);
       off();
+      offZoom();
       client.stop();
     };
   }, [client]);
@@ -494,9 +499,14 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
     const L = viewRef.current?.layout;
     return L ? screenToImage(L.image, x, y) : null;
   };
+  // In broadcast mode, the tiles of the frame on screen (the layout is the frame's, as the overlay's is).
+  const tilesOnScreen = (s: ClientState) => (watchesBroadcast(s) && client.pinned ? client.pinned.state.tiles : null);
   const tileUnder = (x: number, y: number) => {
     const p = imagePoint(x, y);
-    return p ? pointerTile(client.getState(), canDecode, p.u, p.v) : null;
+    if (!p) return null;
+    const s = client.getState();
+    const shown = tilesOnScreen(s);
+    return shown ? tileAt(shown, p.u, p.v) : pointerTile(s, canDecode, p.u, p.v);
   };
 
   const onPointerDown = (e: React.PointerEvent) => {
@@ -584,8 +594,6 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   // ---- open and close ----------------------------------------------------------------
 
   const openTile = (id: string, from: HTMLElement | null) => {
-    // The broadcast is one video: no VM opens from it.
-    if (viewRef.current?.broadcast) return;
     returnFocus.current = from ?? (document.activeElement as HTMLElement | null);
     client.ui({ focusId: id, hoverId: null, pointerOverImage: false, drawer: false });
   };
@@ -615,7 +623,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
       const L = v?.zoom?.layout;
       if (!L || !st.accepted) return;
       const p = screenToImage(L.image, x, y);
-      const t = p ? tileAt(st.accepted.tiles, p.u, p.v) : null;
+      const t = p ? tileAt(tilesOnScreen(st) ?? st.accepted.tiles, p.u, p.v) : null;
       if (t && t.id !== st.ui.focusId) client.ui({ focusId: t.id });
       else closeTile();
     },
@@ -624,7 +632,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
   const moveZoomed = useCallback(
     (dir: Direction) => {
       const st = client.getState();
-      const tiles = st.accepted?.tiles ?? [];
+      const tiles = tilesOnScreen(st) ?? st.accepted?.tiles ?? [];
       const from = tiles.find((t) => t.id === st.ui.focusId);
       const to = from ? neighbour(tiles, from, dir) : null;
       if (to) client.ui({ focusId: to.id });
@@ -676,6 +684,33 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
     if (to) gridRefs.current.get(to.id)?.focus();
   };
 
+  // Broadcast mode, a VM opened: the broadcast zooms at once (the image box the zoom scales up), and
+  // the canvas shows over its box only once that VM's own stream has drawn a frame there.
+  let broadcastZoom: BroadcastZoom | null = null;
+  const pz = view.plan.zoom;
+  if (view.broadcast && pz && view.plan.image && zoomArea && areas.mosaic) {
+    const za = zoomArea;
+    const rel = (b: Box) => ({ left: b.x - za.x, top: b.y - za.y, width: b.w, height: b.h });
+    broadcastZoom = {
+      frame: { left: za.x - areas.mosaic.x, top: za.y - areas.mosaic.y, width: za.w, height: za.h },
+      video: rel(view.plan.image),
+      hole: pz.box ? rel(pz.box) : null,
+      near: pz.near,
+      far: pz.far,
+    };
+  }
+  const zs = pz?.source ?? null;
+  const canvasOverBroadcast = view.broadcast !== null && zs !== null && zs.box !== null && zoomDrawn !== null && zoomDrawn.key === `${zs.id} ${zs.baseUrl ?? ""}`;
+  let canvasStyle: React.CSSProperties | undefined;
+  if (view.broadcast !== null) {
+    if (canvasOverBroadcast && zoomDrawn) {
+      // Clipped to where the canvas drew the frame, which can trail the plan by a step.
+      const b = zoomDrawn.box;
+      const clip = [b.y, viewport.w - b.x - b.w, viewport.h - b.y - b.h, b.x].map((v) => `${Math.max(0, v)}px`).join(" ");
+      canvasStyle = { zIndex: 2, clipPath: `inset(${clip})` };
+    } else canvasStyle = { visibility: "hidden" };
+  }
+
   const score = view.score;
   const stage = (
     <div
@@ -711,6 +746,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
           url={view.broadcast.url}
           paused={view.broadcast.paused}
           box={{ left: view.plan.image.x - areas.mosaic.x, top: view.plan.image.y - areas.mosaic.y, width: view.plan.image.w, height: view.plan.image.h }}
+          zoom={broadcastZoom}
           onFrame={(f) => {
             client.shown = f;
           }}
@@ -852,7 +888,14 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
 
   return (
     <>
-      <canvas ref={canvasRef} className={`frames${painted ? " painted" : ""}`} aria-hidden="true" />
+      <canvas
+        ref={canvasRef}
+        className={`frames${painted ? " painted" : ""}`}
+        aria-hidden="true"
+        style={canvasStyle}
+        data-testid="frames"
+        data-over-broadcast={view.broadcast === null ? undefined : canvasOverBroadcast ? "zoom" : "hidden"}
+      />
       {phone ? (
         <div className="phone" data-version={view.version} style={covered ? { visibility: "hidden" } : undefined}>
           <header>

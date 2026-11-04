@@ -163,6 +163,8 @@ export default defineConfig({
   }
 },
     PORTABLE_CORE,
+    // Scripts the tests serve to the page in place of a third party's (the IVS player).
+    { files: ["e2e/fixtures/**/*.js"], env: { browser: true } },
     { files: ["core/test/**"], rules: { "no-restricted-imports": "off", "no-restricted-properties": "off", "eslint-js/no-restricted-syntax": "off", "no-restricted-globals": "off" } },
 {
   "files": [

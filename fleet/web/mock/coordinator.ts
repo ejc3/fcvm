@@ -106,6 +106,8 @@ interface Client {
   viewer: string;
   verified: boolean;
   claim: ClaimRuntime | null;
+  /** Connected while the broadcast took late viewers only: admitted to the broadcast alone. */
+  late: boolean;
 }
 
 interface Act {
@@ -267,6 +269,12 @@ export class MockCoordinator {
   private poster: { at: number; jpeg: Promise<Buffer> } | null = null;
   /** `/mock/fault {no_poster}`: answer /poster.jpg as a coordinator that has none yet. */
   private noPoster = false;
+  /**
+   * Tests: the broadcast the admission message offers (`url`, the playback URL; the page's IVS
+   * player is the test's), and whether a viewer connecting now is late. Null: no broadcast, and
+   * no admission message, as before the coordinator ran one.
+   */
+  private broadcast: { url: string; late: boolean } | null = null;
   private restoresTotal = 0;
   private scrubsTotal = 0;
   /** Unix ms of each restore in the last hour. */
@@ -509,9 +517,10 @@ export class MockCoordinator {
 
   private connect(ws: WebSocket): void {
     const k = this.nextViewer++;
-    const client: Client = { ws, visible: true, viewer: `v-${k + 1}`, verified: this.sitekey === null, claim: null };
+    const client: Client = { ws, visible: true, viewer: `v-${k + 1}`, verified: this.sitekey === null, claim: null, late: this.broadcast?.late ?? false };
     this.clients.add(client);
     this.sendTo(client, { type: "hello", viewer: client.viewer, ...(this.sitekey ? { turnstile: this.sitekey } : {}) });
+    if (this.broadcast) this.sendTo(client, this.admissionFor(client));
     // Publish now, to everyone: a change made since the last snapshot belongs to
     // the next version, so the newcomer must not get it under the current one.
     this.dirty = true;
@@ -561,6 +570,21 @@ export class MockCoordinator {
       this.markDirty();
     });
     ws.on("error", () => {});
+  }
+
+  /** The admission message (PROTOCOL.md, "admission"): a seat and a direct token, or for a late viewer the broadcast alone. */
+  private admissionFor(c: Client): Record<string, unknown> {
+    const expires = this.now() + 600_000;
+    return {
+      type: "admission",
+      seat: c.late ? null : `mock-seat-${c.viewer}`,
+      locked: c.late,
+      reason: c.late ? "Direct streams are full, so you are watching the broadcast." : null,
+      direct: c.late ? null : { value: `v1.${Math.floor(expires / 1000)}.${c.viewer}.mock`, expires_at: expires },
+      broadcast: this.broadcast ? { value: this.broadcast.url, expires_at: expires } : null,
+      seat_free: false,
+      capacity: null,
+    };
   }
 
   private sendTo(c: Client, msg: unknown): void {
@@ -1546,6 +1570,14 @@ export class MockCoordinator {
             this.wake();
           }
           return { ok: true, state: this.power.state };
+        });
+        return;
+      case "/mock/broadcast":
+        body((b) => {
+          this.broadcast = typeof b["url"] === "string" ? { url: b["url"], late: b["late"] === true } : null;
+          // Connected pages hear of it at once; each keeps the admission it connected with.
+          for (const c of this.clients) this.sendTo(c, this.admissionFor(c));
+          return { ok: true };
         });
         return;
       case "/mock/media":
