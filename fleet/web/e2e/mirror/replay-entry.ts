@@ -2,8 +2,8 @@
 // stream fed to the mirror on a WebGL2 canvas, and each posted frame whose stamp matches one of
 // the phone's own screenshots compared with it.
 
-import { GlMirror } from "../../app/_wall/mirror/gl.ts";
-import { RecordReader } from "../../core/mirror/wire.ts";
+import { GlMirror, type JoinStats } from "../../app/_wall/mirror/gl.ts";
+import { RECORD, RecordReader } from "../../core/mirror/wire.ts";
 
 /** The app's frame number in the stamp band of an RGBA image whose rows run top first (stamp.cpp). */
 export function readStamp(px: Uint8ClampedArray | Uint8Array, w: number, h: number): number | null {
@@ -159,9 +159,59 @@ export function replay(canvas: HTMLCanvasElement, tap: Uint8Array, refs: Ref[]):
   };
 }
 
+export interface JoinResult {
+  join: JoinStats | null;
+  /** Whether the first frame the mirror drew was drawn from the join snapshot, before any live record. */
+  firstFromJoin: boolean;
+  /** The first frame against the phone's screenshot, or null when the mirror drew none. */
+  match: Omit<Match, "k"> | null;
+  w: number;
+  h: number;
+  failed: Record<string, number>;
+}
+
+/**
+ * A stream that joined a running phone (its JOIN records first): the first frame the mirror
+ * draws, against the phone's screenshot taken as the stream was captured. The phone showed a
+ * screen that does not change (its home screen), so the screenshot is that frame.
+ */
+export function replayJoin(canvas: HTMLCanvasElement, tap: Uint8Array, ref: Ref): JoinResult {
+  const gl = canvas.getContext("webgl2", { antialias: false, alpha: false, preserveDrawingBuffer: true })!;
+  const m = new GlMirror(gl, () => 0);
+  let first: Uint8Array | null = null;
+  let live = false;
+  let firstFromJoin = false;
+  m.onPost = () => {
+    if (first) return;
+    const w = gl.drawingBufferWidth;
+    const h = gl.drawingBufferHeight;
+    const raw = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, raw);
+    // readPixels gives the bottom row first, as the live frames' replay above reads them
+    first = new Uint8Array(w * h * 4);
+    for (let y = 0; y < h; y++) first.set(raw.subarray((h - 1 - y) * w * 4, (h - y) * w * 4), y * w * 4);
+    firstFromJoin = !live;
+  };
+  for (const rec of new RecordReader().push(tap)) {
+    if (rec.type !== RECORD.hello && rec.type !== RECORD.join) live = true;
+    m.feed(rec);
+    if (first) break;
+  }
+  const w = gl.drawingBufferWidth;
+  const h = gl.drawingBufferHeight;
+  return {
+    join: m.stats.join,
+    firstFromJoin,
+    match: first && ref.w === w && ref.h === h ? compare(first, ref.px, w, h) : null,
+    w,
+    h,
+    failed: m.stats.failed,
+  };
+}
+
 declare global {
   interface Window {
-    mirrorReplay: { replay: typeof replay; readStamp: typeof readStamp };
+    mirrorReplay: { replay: typeof replay; replayJoin: typeof replayJoin; readStamp: typeof readStamp };
   }
 }
-window.mirrorReplay = { replay, readStamp };
+window.mirrorReplay = { replay, replayJoin, readStamp };
