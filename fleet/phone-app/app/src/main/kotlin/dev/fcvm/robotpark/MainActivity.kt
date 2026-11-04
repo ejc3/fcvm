@@ -56,7 +56,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         surface.holder.addCallback(this)
         root.addView(surface, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         info = InfoView(this)
-        info.visibility = if (Store.screen == "info") View.VISIBLE else View.GONE
+        info.visibility = View.GONE
         root.addView(info, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         topBar = bar(Gravity.TOP)
         topBar.addView(label("Robot Park", 22f, true))
@@ -81,7 +81,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         gl.onChrome = { on -> root.post { chromeFromScene = on; layoutChrome() } }
         gl.start()
         GlThread.current = gl
-        PhoneApp.ui = this
+        // published with the tab a request kept while there was no activity (PhoneApp.act)
+        synchronized(PhoneApp.uiLock) {
+            PhoneApp.ui = this
+            info.visibility = if (Store.screen == "info") View.VISIBLE else View.GONE
+        }
         theme()
         layoutChrome()
         handleIntent(intent)

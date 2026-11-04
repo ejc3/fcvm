@@ -393,13 +393,16 @@ class SceneTest {
      */
     @Test fun theScreenTabReachesAnAppWithNoActivityYet() {
         val app = appSource("PhoneApp.kt")
-        val body = app.substring(app.indexOf("val activity = ui"), app.indexOf("main.post { activity.perform(a) }"))
+        val body = app.substring(app.indexOf("val activity = synchronized(uiLock)"), app.indexOf("main.post { activity.perform(a) }"))
         assertTrue("with no activity, scene and info keep the tab and succeed",
             Regex("""Action\.SCENE, Action\.INFO -> \{ Store\.screen = a\.wire; ok\(\) \}""").containsMatchIn(body))
         assertTrue("with no activity, dark and light succeed", Regex("""Action\.DARK, Action\.LIGHT -> ok\(\)""").containsMatchIn(body))
         val ui = appSource("MainActivity.kt")
         val create = ui.substring(ui.indexOf("override fun onCreate("), ui.indexOf("override fun onNewIntent("))
-        assertTrue("a new activity shows the tab it was asked for", create.contains("""info.visibility = if (Store.screen == "info") View.VISIBLE else View.GONE"""))
+        // published under the same lock as the tab it shows, so a tab kept just before is shown
+        val publish = create.substring(create.indexOf("synchronized(PhoneApp.uiLock)"))
+        assertTrue("a new activity publishes itself with the tab it was asked for",
+            Regex("""synchronized\(PhoneApp\.uiLock\) \{\s+PhoneApp\.ui = this\s+info\.visibility = if \(Store\.screen == "info"\) View\.VISIBLE else View\.GONE""").containsMatchIn(publish))
     }
 
     /**
