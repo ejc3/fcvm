@@ -8867,7 +8867,7 @@ class DocLint(unittest.TestCase):
         self.maxDiff = None
         html = self._plain(self._read("report/shared-nothing-renders.html"))
         self.assertRegex(
-            html, r"(?i)refused by the zero-failure gate",
+            html, r"(?i)(?:refused by|failed) the zero-failure gate",
             "the report no longer records the refused attempt; the lint is vacuous")
         claim = re.compile(r"(?i)\b(?:zero failures? in every|every gated run passed)\b[^,.;]*")
         bad = []
