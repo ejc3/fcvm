@@ -329,6 +329,85 @@ class ReplayFixture:
         return self._replay(d, log)[0]
 
 
+class Ipv6Replay(ReplayFixture, unittest.TestCase):
+    """A routed guest reaches the replay over IPv6 only.
+
+    Its namespace routes no IPv4 off the host, so the campaign hands the
+    server an IPv6 replay address: DNS must answer AAAA with it and leave A
+    empty, and every listener must bind it.
+
+    Red before the fix: bind_dns("::1", 0) raised `socket.gaierror` from an
+    AF_INET socket, ReplayServer(("::1", 0)) raised the same from its
+    AF_INET listener, and serve_dns answered no AAAA query at all.
+    """
+
+    def _responder(self, answer_ip):
+        sock = corpus_serve.bind_dns("::1", 0)
+        port = sock.getsockname()[1]
+        log = corpus_serve.JsonlLog(os.path.join(self._dir, "corpus-dns.log"))
+        thread = threading.Thread(target=corpus_serve.serve_dns,
+                                  args=(sock, answer_ip, log), daemon=True)
+        thread.start()
+        self.addCleanup(log.close)
+        self.addCleanup(corpus_serve.stop_dns, sock, thread)
+        return port
+
+    def _ask(self, port, name, qtype):
+        client = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        self.addCleanup(client.close)
+        client.settimeout(5)
+        client.sendto(dns_query(name, qtype), ("::1", port))
+        reply, _ = client.recvfrom(512)
+        return reply
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._dir = tmp.name
+
+    def test_an_ipv6_answer_is_given_to_aaaa_and_a_is_left_empty(self):
+        port = self._responder("fd53::2")
+        reply = self._ask(port, "blog.cloudflare.com", QTYPE_AAAA)
+        self.assertEqual(struct.unpack(">H", reply[6:8])[0], 1, "AAAA got no answer")
+        self.assertEqual(socket.inet_ntop(socket.AF_INET6, reply[-16:]), "fd53::2")
+        # The record: name pointer, type, class, ttl, rdlength, then rdata.
+        self.assertEqual(struct.unpack(">H", reply[-26:-24])[0], QTYPE_AAAA,
+                         "the answer record is not of type AAAA")
+        reply = self._ask(port, "blog.cloudflare.com", QTYPE_A)
+        self.assertEqual(struct.unpack(">H", reply[6:8])[0], 0,
+                         "an IPv6 replay must leave A empty, or the guest tries IPv4 first")
+        rows = read_jsonl(os.path.join(self._dir, "corpus-dns.log"))
+        self.assertEqual([(r["qtype"], r["answer"]) for r in rows],
+                         [(QTYPE_AAAA, "fd53::2"), (QTYPE_A, "")])
+
+    def test_an_ipv4_answer_still_leaves_aaaa_empty(self):
+        port = self._responder("192.168.53.2")
+        reply = self._ask(port, "example.com", QTYPE_A)
+        self.assertEqual(socket.inet_ntoa(reply[-4:]), "192.168.53.2")
+        reply = self._ask(port, "example.com", QTYPE_AAAA)
+        self.assertEqual(struct.unpack(">H", reply[6:8])[0], 0)
+
+    def test_a_listener_bound_to_an_ipv6_address_serves_the_corpus(self):
+        exact, noquery, redirects = corpus_serve.load_indexes(
+            __import__("pathlib").Path(self._corpus(self._dir)))
+
+        class H(corpus_serve.Handler):
+            pass
+
+        H.exact, H.noquery, H.redirects = exact, noquery, redirects
+        H.misses = []
+        H.access_log = None
+        server = corpus_serve.ReplayServer(("::1", 0), H)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        conn = http.client.HTTPConnection("::1", server.server_port, timeout=5)
+        self.addCleanup(conn.close)
+        conn.request("GET", "/a.txt", headers={"Host": "example.test"})
+        response = conn.getresponse()
+        self.assertEqual((response.status, response.read()), (200, self.BODY))
+
+
 class AccessLog(ReplayFixture, unittest.TestCase):
     """--access-log: {ts, peer, method, host, path, status, bytes, duration_ms}.
 

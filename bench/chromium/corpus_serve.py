@@ -30,8 +30,8 @@ listeners themselves:
   --listen-log PATH  one line a second per listener that did anything, and one
                      "kernel" line a second: connections accepted and the
                      time the accept thread spent in accept() (for the TLS
-                     listener that is the whole handshake, because it runs
-                     there unless --tls-handshake-in-handler), handler thread
+                     listener with --tls-handshake-in-accept that is the
+                     whole handshake, because it then runs there), handler thread
                      start delay, requests answered and their handler time,
                      and the host's TcpExt ListenOverflows / ListenDrops
                      deltas with the listeners' accept-queue depth
@@ -40,7 +40,12 @@ Either log is evidence the campaign hashes once this process has exited, so
 the log has to be complete when it exits. SIGTERM and SIGINT run the shutdown
 sequence (stop_listeners): every listener stops accepting, the DNS responder
 ends, every handler already dequeued finishes and writes its line, the logs
-are closed, and main() returns 0. A line that cannot be written, in either
+are closed, and main() returns 0. A connection that is open but has sent no
+request (a client that died without closing it, as a bridged or routed clone
+does when its namespace goes, takes no FIN with it) has its reads ended at
+shutdown (ReplayServer.end_reads) and otherwise closes after IDLE_TIMEOUT_S, so
+it holds neither the shutdown nor a handler thread for the rest of a run.
+A line that cannot be written, in either
 log, stops the server through the same sequence (ReplayServer.fail_closed):
 the DNS responder closes its socket as well, both HTTP listeners end, and
 main() returns 1 with the reason.
@@ -49,6 +54,7 @@ main() returns 1 with the reason.
 import argparse
 import http.server
 import json
+import os
 import signal
 import socket
 import ssl
@@ -296,7 +302,18 @@ class ListenSampler(threading.Thread):
         self.sample()
 
 
+# How long a connection may wait for its request (and each read within one)
+# before its handler closes it. A clone whose network goes away with it
+# leaves the host side of its connections open with no FIN: a bridged or
+# routed clone's namespace and veth are deleted, while a rootless clone's
+# pasta closes its sockets as it exits. Every corpus page loads within the
+# stall gate's 15 s, so a live clone never waits this long between bytes.
+IDLE_TIMEOUT_S = 30.0
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
+    # Applied to the connection by StreamRequestHandler.setup.
+    timeout = IDLE_TIMEOUT_S
     exact = {}
     noquery = {}
     redirects = {}
@@ -601,18 +618,28 @@ class ReplayServer(http.server.ThreadingHTTPServer):
     daemon_threads = False
     block_on_close = True
 
-    # How long a handler thread waits for a client's hello when the handshake
-    # runs there (--tls-handshake-in-handler). The default placement has no
-    # limit: the accept thread waits for as long as the client does.
+    # How long a handler thread waits for a client's hello; the handshake runs
+    # there by default. With --tls-handshake-in-accept it runs in the accept
+    # thread with no limit, so one client that never finishes it (a clone
+    # whose namespace was deleted mid-handshake) stops every later accept.
     HANDSHAKE_TIMEOUT_S = 10.0
+    # The listen() backlog unless the caller sets one: socketserver's 5 drops
+    # connections at the corpus's open-loop rates (#1159), and a dropped SYN
+    # is retried after 1 s. The kernel caps it at net.core.somaxconn.
+    DEFAULT_BACKLOG = 1024
 
     def __init__(self, address, handler, peers=None, name="http", backlog=None,
                  handshake_in_handler=False):
         # socketserver listens with request_queue_size, 5 unless a caller says
         # otherwise; it is read by server_activate, inside the base __init__.
-        if backlog is not None:
-            self.request_queue_size = backlog
+        # The family follows the address: a routed guest reaches the replay
+        # over IPv6 only (address_family is read by the base __init__ too).
+        self.address_family = family_of(address[0])
+        self.request_queue_size = backlog if backlog is not None else self.DEFAULT_BACKLOG
         self.name = name
+        # The connections handler threads hold, for end_reads.
+        self._open = set()
+        self._open_lock = threading.Lock()
         self.stats = ListenStats(name)
         self.handshake_in_handler = handshake_in_handler
         self._submitted = {}
@@ -644,6 +671,8 @@ class ReplayServer(http.server.ThreadingHTTPServer):
             self.stats.thread_started((time.monotonic() - submitted) * 1000)
         else:
             self.stats.thread_started(0.0)
+        with self._open_lock:
+            self._open.add(request)
         try:
             if self.handshake_in_handler:
                 h0 = time.monotonic()
@@ -658,7 +687,37 @@ class ReplayServer(http.server.ThreadingHTTPServer):
                 self.stats.handshake((time.monotonic() - h0) * 1000)
             super().process_request_thread(request, client_address)
         finally:
+            with self._open_lock:
+                self._open.discard(request)
             self.stats.thread_finished()
+
+    def end_reads(self) -> None:
+        """End the reads of every connection a handler holds.
+
+        A handler waiting for a request, or for a TLS hello, then sees end of
+        file and returns; one already answering keeps its write side and
+        finishes its response and its log line. Called once the listeners have
+        stopped accepting, so the handlers server_close joins are bounded by
+        the responses in flight, not by clients that will never send. The
+        shutdown goes through a duplicate descriptor: SSLSocket.shutdown
+        drops the TLS state of a connection still being written.
+        """
+        with self._open_lock:
+            requests = list(self._open)
+        for request in requests:
+            try:
+                fd = request.fileno()
+                if fd < 0:
+                    continue
+                dup = socket.socket(fileno=os.dup(fd))
+            except OSError:
+                continue
+            try:
+                dup.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass
+            finally:
+                dup.close()
 
     def fail_closed(self, exc: BaseException, log_name: str) -> None:
         with _FAIL_CLOSED:
@@ -701,6 +760,8 @@ def stop_listeners(peers, logs=()) -> None:
     """
     for peer in peers:
         peer.shutdown()
+    for peer in peers:
+        peer.end_reads()
     for peer in peers:
         peer.server_close()  # joins the handler threads (block_on_close)
     for log in logs:
@@ -784,6 +845,11 @@ def selfsigned(tmpdir: Path):
     return crt, key
 
 
+def family_of(addr: str) -> int:
+    """AF_INET6 for an IPv6 address literal, AF_INET otherwise."""
+    return socket.AF_INET6 if ":" in addr else socket.AF_INET
+
+
 def bind_dns(addr: str, port: int) -> socket.socket:
     """Bind the responder's UDP socket; port 0 takes an ephemeral port.
 
@@ -791,14 +857,31 @@ def bind_dns(addr: str, port: int) -> socket.socket:
     (dnsmasq still holding :53) is a startup error, not a dead thread behind
     HTTP servers that keep answering.
     """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock = socket.socket(family_of(addr), socket.SOCK_DGRAM)
     sock.bind((addr, port))
     return sock
+
+
+def answer_record(answer_ip: str) -> tuple[int, int, bytes]:
+    """(qtype, rdlength, rdata) of the one record type answer_ip answers.
+
+    An IPv4 answer_ip answers A queries and leaves AAAA empty, so a client
+    falls back to IPv4; an IPv6 one answers AAAA and leaves A empty, so a
+    routed guest, which has no IPv4 path off its namespace, connects over
+    IPv6. Every other query type is answered empty either way.
+    """
+    try:
+        return 1, 4, socket.inet_pton(socket.AF_INET, answer_ip)
+    except OSError:
+        return 28, 16, socket.inet_pton(socket.AF_INET6, answer_ip)
 
 
 def serve_dns(sock: socket.socket, answer_ip: str = "127.0.0.1",
               log: JsonlLog | None = None, server: "ReplayServer | None" = None):
     """Answer every A query on `sock` with answer_ip (AAAA answered empty, forcing v4).
+
+    An IPv6 answer_ip swaps the two: AAAA queries get it and A queries are
+    answered empty (answer_record).
 
     Browser-agnostic host mapping for the replay arm: the replay container
     mounts a resolv.conf pointing here, so ANY engine (Chromium today, WebKit
@@ -822,6 +905,7 @@ def serve_dns(sock: socket.socket, answer_ip: str = "127.0.0.1",
     were still up, the bracket passed, and the truncated log was hashed as
     clean.
     """
+    answer_qtype, rdlength, rdata = answer_record(answer_ip)
     while True:
         try:
             data, peer = sock.recvfrom(512)
@@ -843,12 +927,12 @@ def serve_dns(sock: socket.socket, answer_ip: str = "127.0.0.1",
             qend = i + 1 + 4  # name + qtype/qclass
             question = qd[:qend]
             qtype = struct.unpack(">H", qd[i + 1:i + 3])[0]
-            if qtype == 1:  # A
-                answer = (b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 5, 4)
-                          + socket.inet_aton(answer_ip))
+            if qtype == answer_qtype:  # A, or AAAA for an IPv6 answer_ip
+                answer = (b"\xc0\x0c" + struct.pack(">HHIH", qtype, 1, 5, rdlength)
+                          + rdata)
                 resp = txid + flags + struct.pack(">HHHH", 1, 1, 0, 0) + question + answer
                 answered = answer_ip
-            else:  # empty NOERROR (esp. AAAA -> fall back to A)
+            else:  # empty NOERROR (AAAA -> fall back to A, or A -> AAAA)
                 resp = txid + flags + struct.pack(">HHHH", 1, 0, 0, 0) + question
                 answered = ""
         except Exception:  # noqa: BLE001 - a malformed query must not kill the server
@@ -883,9 +967,15 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--tls-port", type=int, default=443)
     ap.add_argument("--dns-addr", default="127.0.0.2")
     ap.add_argument("--dns-port", type=int, default=53)
+    # Where the HTTP and HTTPS listeners bind. The host's loopback for a
+    # rootless guest, which pasta maps the gateway onto; for a bridged or
+    # routed guest, the replay address itself, which the campaign assigns to
+    # a host device the guest's traffic is routed to.
+    ap.add_argument("--http-addr", default="127.0.0.1")
     # The address DNS answers point at. Host-side replay: 127.0.0.1. In-guest
     # replay: 10.0.2.2, the pasta gateway, which maps guest connections onto
-    # the host's loopback where this server listens.
+    # the host's loopback where this server listens; or, for a bridged or
+    # routed guest, the replay address (IPv6 for routed, answered as AAAA).
     ap.add_argument("--answer-ip", default="127.0.0.1")
     ap.add_argument("--dns-log", default=None, metavar="PATH",
                     help="append one JSON line per DNS query: "
@@ -898,11 +988,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "kernel line (accept-queue overflows and drops): see the "
                          "module docstring")
     ap.add_argument("--backlog", type=int, default=None, metavar="N",
-                    help="listen() backlog of both listeners; socketserver's default "
-                         "is 5. The kernel caps it at net.core.somaxconn")
-    ap.add_argument("--tls-handshake-in-handler", action="store_true",
-                    help="run the TLS handshake in the connection's handler thread "
-                         "instead of in the accept thread")
+                    help="listen() backlog of both listeners (default "
+                         f"{ReplayServer.DEFAULT_BACKLOG}). The kernel caps it at "
+                         "net.core.somaxconn")
+    ap.add_argument("--tls-handshake-in-accept", action="store_true",
+                    help="run the TLS handshake in the accept thread, with no time "
+                         "limit, instead of in the connection's handler thread")
     return ap
 
 
@@ -914,9 +1005,9 @@ def main():
     # the servers keep running — the failure has to happen before any thread
     # starts.
     try:
-        socket.inet_aton(args.answer_ip)
+        answer_record(args.answer_ip)
     except OSError:
-        ap.error(f"--answer-ip is not a valid IPv4 address: {args.answer_ip!r}")
+        ap.error(f"--answer-ip is not a valid IPv4 or IPv6 address: {args.answer_ip!r}")
 
     Handler.exact, Handler.noquery, Handler.redirects = load_indexes(Path(args.root))
     Handler.access_log = JsonlLog(args.access_log) if args.access_log else None
@@ -930,11 +1021,11 @@ def main():
     peers = []
     if args.backlog is not None and args.backlog < 1:
         ap.error(f"--backlog must be at least 1: {args.backlog}")
-    plain = ReplayServer(("127.0.0.1", args.port), Handler, peers, name="http",
+    plain = ReplayServer((args.http_addr, args.port), Handler, peers, name="http",
                          backlog=args.backlog)
-    tls = ReplayServer(("127.0.0.1", args.tls_port), Handler, peers, name="tls",
+    tls = ReplayServer((args.http_addr, args.tls_port), Handler, peers, name="tls",
                        backlog=args.backlog,
-                       handshake_in_handler=args.tls_handshake_in_handler)
+                       handshake_in_handler=not args.tls_handshake_in_accept)
     # The key pair lives only until it is loaded: a fixed path under /tmp was
     # shared by every server on the box, whatever user each ran as.
     with tempfile.TemporaryDirectory(prefix="corpus-replay-cert-") as tmp:
@@ -942,7 +1033,7 @@ def main():
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(str(crt), str(key))
     tls.socket = ctx.wrap_socket(tls.socket, server_side=True,
-                                 do_handshake_on_connect=not args.tls_handshake_in_handler)
+                                 do_handshake_on_connect=args.tls_handshake_in_accept)
 
     dns_thread = threading.Thread(target=serve_dns,
                                   args=(dns_sock, args.answer_ip, dns_log, plain), daemon=True)
@@ -954,7 +1045,7 @@ def main():
         listen_log = JsonlLog(args.listen_log)
         listen_log.write({
             "ts": time.time(), "listener": "start",
-            "tls_handshake": "handler" if args.tls_handshake_in_handler else "accept",
+            "tls_handshake": "accept" if args.tls_handshake_in_accept else "handler",
             "backlog": plain.request_queue_size,
             "tls_port": tls.server_port, "http_port": plain.server_port,
         })

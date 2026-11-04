@@ -495,7 +495,7 @@ def check_owner_log(run_dir, evidence, owner_bytes):
         if match["owner"] != str(serve_pid):
             raise RunError(
                 f"{run_dir}: dns-owner.log line {number} names {match['owner']} as the "
-                f"owner of 127.0.0.1:53, not corpus_serve {serve_pid}: {line!r}"
+                f"owner of the replay's DNS socket, not corpus_serve {serve_pid}: {line!r}"
             )
         if match["dnsmasq"] != "inactive":
             raise RunError(
@@ -677,6 +677,11 @@ def canonical_ip(value):
         return str(ipaddress.ip_address(value))
     except ValueError:
         return None
+
+
+def answer_qtype(value):
+    """The DNS record type an address is answered in: 1 (A) or 28 (AAAA)."""
+    return 28 if ipaddress.ip_address(value).version == 6 else 1
 
 
 def bracket_answers(run_dir, name, verify):
@@ -934,11 +939,13 @@ def check_replay_queries(run_dir, name, data, dns_data, stage_hosts, answers):
         nxt = windows[index + 1] if index + 1 < len(windows) else len(rows)
         if nxt is None or nxt > len(rows):
             nxt = len(rows)
+        # The record type that carries the address: A for an IPv4 replay, AAAA
+        # for a routed guest's IPv6 one (corpus_serve answers only that type).
         answered = [row for row in rows[since:nxt]
                     if isinstance(row, dict)
                     and isinstance(row.get("qname"), str)
-                    and row.get("qtype") == 1
-                    and canonical_ip(row.get("answer")) in answers]
+                    and canonical_ip(row.get("answer")) in answers
+                    and row.get("qtype") == answer_qtype(row.get("answer"))]
         if len(answered) < queries:
             raise RunError(
                 f"{run_dir}: {name} records {queries} answered queries for the "

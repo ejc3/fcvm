@@ -7,7 +7,10 @@ which starts when a handler thread parses the request line) stayed flat. What
 sits before that point is the kernel's accept queue (socketserver listens with
 a backlog of 5), the accept thread, which for the TLS listener also runs the
 handshake, and the handler thread's start. --listen-log records those, and
---backlog and --tls-handshake-in-handler change them.
+--backlog and --tls-handshake-in-accept change them. The server's defaults are
+a backlog of 1024 and the handshake in the handler thread, which the runs
+behind #1159 measured as the fix; the library's 5 and the accept-thread
+handshake remain available for experiments.
 
 Run: python3 -m unittest test_corpus_serve_listen -v
 """
@@ -74,10 +77,10 @@ class TlsFixture(ReplayFixture):
 class TlsHandshakePlacement(TlsFixture, unittest.TestCase):
     """A client that connects and never sends its hello.
 
-    By default the handshake runs inside accept(), in the one thread that
-    accepts, so that client holds every later connection until it gives up.
-    With --tls-handshake-in-handler the handshake runs in the connection's own
-    thread and the later connection is answered at once.
+    With --tls-handshake-in-accept the handshake runs inside accept(), in the
+    one thread that accepts, so that client holds every later connection until
+    it gives up. By default the handshake runs in the connection's own thread
+    and the later connection is answered at once.
     """
 
     def _stall_then_get(self, handshake_in_handler):
@@ -94,7 +97,7 @@ class TlsHandshakePlacement(TlsFixture, unittest.TestCase):
                 return None, time.monotonic() - t0
             return body, time.monotonic() - t0
 
-    def test_by_default_a_stalled_hello_holds_up_the_next_connection(self):
+    def test_in_the_accept_thread_a_stalled_hello_holds_up_the_next_connection(self):
         body, _ = self._stall_then_get(handshake_in_handler=False)
         self.assertIsNone(body, "the second connection was answered while the "
                                 "accept thread was inside the first one's handshake")
@@ -152,18 +155,97 @@ class Backlog(unittest.TestCase):
                     pass
         return done
 
-    def test_the_default_queue_overflows_under_a_burst(self):
-        self.assertLess(self._fill(None), 16)
+    def test_the_library_queue_overflows_under_a_burst(self):
+        self.assertLess(self._fill(5), 16)
+
+    def test_the_default_backlog_holds_the_whole_burst(self):
+        self.assertEqual(self._fill(None), 64)
 
     def test_a_larger_backlog_holds_the_whole_burst(self):
         self.assertEqual(self._fill(256), 64)
 
-    def test_the_flag_parses_and_defaults_to_the_library_value(self):
+    def test_the_flags_parse_and_default_to_the_measured_fix(self):
         parser = corpus_serve.build_parser()
         self.assertIsNone(parser.parse_args([]).backlog)
-        self.assertEqual(parser.parse_args(["--backlog", "1024"]).backlog, 1024)
-        self.assertFalse(parser.parse_args([]).tls_handshake_in_handler)
-        self.assertTrue(parser.parse_args(["--tls-handshake-in-handler"]).tls_handshake_in_handler)
+        self.assertEqual(parser.parse_args(["--backlog", "5"]).backlog, 5)
+        self.assertFalse(parser.parse_args([]).tls_handshake_in_accept)
+        self.assertTrue(parser.parse_args(["--tls-handshake-in-accept"]).tls_handshake_in_accept)
+
+
+class DeadClients(TlsFixture, unittest.TestCase):
+    """Connections whose client went away without closing them.
+
+    A bridged or routed clone's namespace and veth are deleted when it is torn
+    down, so the host side of every connection it had open gets no FIN: one it
+    opened and never used stays open with a handler thread reading it. The
+    campaign stops the replay with SIGTERM and SIGKILLs it after 5 s, and a
+    killed replay's logs are incomplete, which makes the run's DNS evidence
+    unclean. Seen on the first bridged trial: "corpus_serve did not exit;
+    escalating to SIGKILL", exit status 137.
+
+    Red before the fix: stop_listeners waited on the idle handler for as long
+    as its client held the connection (the join below timed out), and the
+    idle connection stayed open past any idle limit.
+    """
+
+    def _stop_in_background(self, server):
+        done = threading.Event()
+
+        def stop():
+            corpus_serve.stop_listeners([server])
+            done.set()
+
+        threading.Thread(target=stop, daemon=True).start()
+        return done
+
+    def test_a_connection_that_sends_nothing_does_not_hold_the_shutdown(self):
+        with tempfile.TemporaryDirectory() as d:
+            server, _ = self._replay(d)
+            idle = socket.create_connection(("127.0.0.1", server.server_port))
+            self.addCleanup(idle.close)
+            time.sleep(0.3)  # a handler thread is now reading it
+            done = self._stop_in_background(server)
+            self.assertTrue(done.wait(5), "the shutdown waited on a client that will never send")
+
+    def test_a_tls_hello_that_never_comes_does_not_hold_the_shutdown(self):
+        with tempfile.TemporaryDirectory() as d:
+            server = self._tls(d, handshake_in_handler=True)
+            idle = socket.create_connection(("127.0.0.1", server.server_port))
+            self.addCleanup(idle.close)
+            time.sleep(0.3)
+            done = self._stop_in_background(server)
+            self.assertTrue(done.wait(5), "the shutdown waited on a handshake that will never start")
+
+    def test_a_response_in_flight_still_completes_after_the_reads_end(self):
+        with tempfile.TemporaryDirectory() as d:
+            server, _ = self._replay(d)
+            conn = socket.create_connection(("127.0.0.1", server.server_port), timeout=5)
+            self.addCleanup(conn.close)
+            conn.sendall(b"GET /a.txt HTTP/1.0\r\nHost: example.test\r\n\r\n")
+            data = b""
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            server.end_reads()
+            self.assertTrue(data.startswith(b"HTTP/1.0 200"), data[:40])
+            self.assertTrue(data.endswith(self.BODY))
+
+    def test_an_idle_connection_is_closed_after_the_idle_limit(self):
+        class Quick(corpus_serve.Handler):
+            timeout = 0.5
+
+        with tempfile.TemporaryDirectory() as d:
+            server, _ = self._replay(d, handler=Quick)
+            idle = socket.create_connection(("127.0.0.1", server.server_port), timeout=5)
+            self.addCleanup(idle.close)
+            t0 = time.monotonic()
+            self.assertEqual(idle.recv(1), b"", "the server never closed the idle connection")
+            self.assertLess(time.monotonic() - t0, 4)
+
+    def test_the_shipped_idle_limit_outlasts_the_stall_gate(self):
+        self.assertGreaterEqual(corpus_serve.Handler.timeout, 15.0)
 
 
 class ListenLog(TlsFixture, unittest.TestCase):
