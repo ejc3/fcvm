@@ -5,7 +5,7 @@
 
 import { constants, createZstdCompress, type ZstdCompress } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { encodeCall, encodeRecord, RECORD } from "../mirror/wire.ts";
+import { encodeCall, encodeRecord, JOIN_PART, RECORD } from "../mirror/wire.ts";
 import type { MirrorIn, MirrorOut, MirrorStatsMsg } from "../../app/_wall/mirror/mirror-msgs.ts";
 
 class FakeSocket {
@@ -147,6 +147,33 @@ describe("the mirror worker", () => {
     z.close();
   });
 
+  it("says joined once the join's END is fed, not at the HELLO (the phone is paused until then)", async () => {
+    const send = await worker();
+    send({ type: "open", url: "wss://phone/mirror", admit: "t" });
+    const ws = FakeSocket.all[0]!;
+    const { z, msg } = streamer();
+    const u32 = (...x: number[]) => new Uint8Array(new Uint32Array(x).buffer);
+    ws.message(await msg(Buffer.concat([hello(), encodeRecord(RECORD.join, 0, u32(1), JOIN_PART.begin)])));
+    await settle();
+    expect(joins()).toBe(0);
+    ws.message(await msg(encodeRecord(RECORD.join, 0, u32(0, 1000, 0, 0, 0), JOIN_PART.end)));
+    await settle();
+    expect(joins()).toBe(1);
+    z.close();
+  });
+
+  it("says joined at a refused END (no snapshot follows), with no live record yet", async () => {
+    const send = await worker();
+    send({ type: "open", url: "wss://phone/mirror", admit: "t" });
+    const ws = FakeSocket.all[0]!;
+    const { z, msg } = streamer();
+    const u32 = (...x: number[]) => new Uint8Array(new Uint32Array(x).buffer);
+    ws.message(await msg(Buffer.concat([hello(), encodeRecord(RECORD.join, 0, u32(2, 0, 0, 0, 0), JOIN_PART.end)])));
+    await settle();
+    expect(joins()).toBe(1);
+    z.close();
+  });
+
   it("replays nothing a retired connection received, and reports nothing it says afterwards", async () => {
     const send = await worker();
     send({ type: "open", url: "wss://phone/mirror", admit: "a" });
@@ -183,12 +210,44 @@ describe("the mirror worker", () => {
     // incompressible bytes, so each message is about 1 MiB on the wire; all arrive before the
     // decoder has run once
     const { z, msg } = streamer();
+    // a live stream: past its opening records (no join), so the live bound applies
+    ws.message(await msg(Buffer.concat([opening(), encodeRecord(RECORD.data, 1, encodeCall("glFlush", []))])));
+    await settle();
     const noise = new Uint8Array(1 << 20).map(() => Math.floor(Math.random() * 256));
     const m = await msg(noise);
     expect(m.length).toBeGreaterThan(1 << 20);
     for (let i = 0; i < 17; i++) ws.message(m);
     expect(closes()).toEqual([{ type: "closed", code: 4000, reason: "the mirror fell behind in this browser: join again" }]);
     expect(ws.closed).toBe(true);
+    z.close();
+  });
+
+  it("lets a join past the 16 MiB bound before the decoder has fed its BEGIN", async () => {
+    const send = await worker();
+    send({ type: "open", url: "wss://phone/mirror", admit: "t" });
+    const ws = FakeSocket.all[0]!;
+    const { z, msg } = streamer();
+    // everything arrives before the decoder has run once: nothing is decoded yet
+    const noise = new Uint8Array(1 << 20).map(() => Math.floor(Math.random() * 256));
+    const m = await msg(noise);
+    for (let i = 0; i < 17; i++) ws.message(m);
+    expect(closes()).toEqual([]);
+    expect(ws.closed).toBe(false);
+    z.close();
+  });
+
+  it("lets a join snapshot past the 16 MiB bound while it is fed, up to its own bound", async () => {
+    const send = await worker();
+    send({ type: "open", url: "wss://phone/mirror", admit: "t" });
+    const ws = FakeSocket.all[0]!;
+    const { z, msg } = streamer();
+    ws.message(await msg(Buffer.concat([opening(), encodeRecord(RECORD.join, 0, new Uint8Array(new Uint32Array([1]).buffer), JOIN_PART.begin)])));
+    await settle();
+    const noise = new Uint8Array(1 << 20).map(() => Math.floor(Math.random() * 256));
+    const m = await msg(noise);
+    for (let i = 0; i < 17; i++) ws.message(m);
+    expect(closes()).toEqual([]);
+    expect(ws.closed).toBe(false);
     z.close();
   });
 

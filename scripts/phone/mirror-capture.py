@@ -7,7 +7,9 @@
 Posts a scene naming a test viewer as the phone's holder, with an admission key made for the
 run, opens both streams with that viewer's direct token, and writes:
   <prefix>.tap   the mirror's tap stream, decoded (e2e/mirror.spec.ts replays it)
-  <prefix>.json  each stream's wire bytes, frames and replies per second, and the totals
+  <prefix>.json  each stream's wire bytes, frames and replies per second, and the totals, and
+                 the join snapshot the mirror began with: its color buffers, its bytes before
+                 and after compression, the phone's pause for it, and when its END arrived
 """
 import base64, ctypes, ctypes.util, hashlib, hmac, json, os, socket, struct, sys, threading, time
 
@@ -124,6 +126,7 @@ end = t0 + secs
 per = {"video": {}, "mirror": {}}
 totals = {"video": {"wire_bytes": 0, "frames": 0}, "mirror": {"wire_bytes": 0, "tap_bytes": 0, "replies": 0, "data_bytes": 0, "records": 0}}
 closes = {}
+join = {"color_buffers": 0, "tap_bytes": 0, "wire_bytes": None, "end_s": None, "pause_us": None, "status": None, "skipped": None}
 
 
 def sec():
@@ -151,6 +154,7 @@ def mirror():
     if "--no-mirror" in sys.argv:
         return
     s, rest = ws_open("/mirror")
+    opened = time.time()
     z = Zstd()
     tap = open(prefix + ".tap", "wb")
     pending = b""
@@ -174,6 +178,16 @@ def mirror():
             if len(pending) < 24 + n:
                 break
             totals["mirror"]["records"] += 1
+            if typ == 8:
+                aux = struct.unpack("<I", pending[12:16])[0]
+                join["tap_bytes"] += 24 + n
+                if aux == 2:
+                    join["color_buffers"] += 1
+                if aux == 3:
+                    join["status"], join["pause_us"], _, join["skipped"] = struct.unpack("<IIII", pending[24:40])
+                    join["end_s"] = round(time.time() - opened, 3)
+                    # the wire bytes up to the message that carried the END
+                    join["wire_bytes"] = totals["mirror"]["wire_bytes"]
             if typ == 5:
                 d["replies"] += 1
                 totals["mirror"]["replies"] += 1
@@ -190,7 +204,7 @@ for t in ts:
 for t in ts:
     t.join()
 el = time.time() - t0
-out = {"seconds": el, "totals": totals, "per_second": per, "closes": closes}
+out = {"seconds": el, "totals": totals, "per_second": per, "closes": closes, "join": join}
 for k in ("video", "mirror"):
     w = totals[k]["wire_bytes"]
     out[k + "_mbit_s"] = w * 8 / 1e6 / el

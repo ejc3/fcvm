@@ -5,7 +5,7 @@
 
 import { admitMessage } from "../../../core/net.ts";
 import { RateMeter } from "../../../core/meter.ts";
-import { RECORD, RecordReader } from "../../../core/mirror/wire.ts";
+import { JOIN_PART, RECORD, RecordReader } from "../../../core/mirror/wire.ts";
 import { GlMirror } from "./gl.ts";
 import type { MirrorIn, MirrorOut } from "./mirror-msgs.ts";
 import { ZstdStream } from "./zstd.ts";
@@ -22,6 +22,18 @@ let generation = 0;
 let pendingBytes = 0;
 /** A viewer that receives faster than it replays drops the stream past this, and joins again. */
 const MAX_PENDING_BYTES = 16 << 20;
+/**
+ * Until the join snapshot has been fed (every color buffer's pixels and the GL state, tens of
+ * MB compressed) the bound is this one: the streamer queues the snapshot apart from its live
+ * bound too, and starts every stream with one.
+ */
+const MAX_JOIN_PENDING_BYTES = 256 << 20;
+/**
+ * From the open until the join's END, or the first live record of a stream with no join:
+ * while the decoder starts, nothing of the stream has been decoded yet, and it begins with
+ * the join.
+ */
+let joining = true;
 let reader = new RecordReader();
 let zstd: Promise<ZstdStream> | null = null;
 /** zstd messages waiting for the decoder, in order. */
@@ -58,6 +70,7 @@ function fresh(): void {
   tapBytes = 0;
   decodeMs.reset();
   joined = false;
+  joining = true;
   pixel = null;
   stampAt = null;
   // the canvas is preserved between posts, so its centre can be read after one
@@ -80,11 +93,17 @@ function fresh(): void {
 function feed(bytes: Uint8Array): void {
   tapBytes += bytes.length;
   for (const r of reader.push(bytes)) {
-    if (r.type === RECORD.hello && !joined) {
+    mirror?.feed(r);
+    if (r.type === RECORD.join) joining = r.aux !== JOIN_PART.end;
+    else if (r.type !== RECORD.hello) joining = false;
+    // Joined once the join has been fed (its END), or at the first live record of a stream
+    // without one. Not at the HELLO: the phone's render threads stay paused for the join until
+    // its END, and an app restarted meanwhile (the panel restarts it once joined) would end a
+    // process the paused threads still serve.
+    if (!joined && r.type !== RECORD.hello && !joining) {
       joined = true;
       post({ type: "joined" });
     }
-    mirror?.feed(r);
     // the phone's ring filled: the copy stopped and the stream has a gap; join again
     if (r.type === RECORD.overflow && ws) {
       retire("the phone's copy of its commands overflowed: join again");
@@ -117,6 +136,7 @@ function stats(): void {
     failed: Object.values(mirror.stats.failed).reduce((a, b) => a + b, 0),
     unknownChannelPackets: mirror.stats.unknownChannelPackets,
     overflowed: mirror.stats.overflowed,
+    join: mirror.stats.join,
     open: ws !== null && ws.readyState === WebSocket.OPEN,
     pixel,
     stamp: stampAt,
@@ -182,7 +202,7 @@ function open(url: string, admit: string): void {
     if (gen !== generation || !(e.data instanceof ArrayBuffer)) return;
     wire.add(now(), e.data.byteLength);
     const n = e.data.byteLength;
-    if (pendingBytes + n > MAX_PENDING_BYTES) {
+    if (pendingBytes + n > (joining ? MAX_JOIN_PENDING_BYTES : MAX_PENDING_BYTES)) {
       retire("the mirror fell behind in this browser: join again");
       return;
     }

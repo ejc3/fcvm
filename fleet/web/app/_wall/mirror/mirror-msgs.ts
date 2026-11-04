@@ -1,5 +1,7 @@
 // Messages between the phones page and the GPU mirror's worker (mirror.worker.ts).
 
+import type { JoinStats } from "./gl.ts";
+
 export type MirrorIn =
   | { type: "canvas"; canvas: OffscreenCanvas }
   /** Open the phone streamer's GET /mirror with the viewer's direct token. */
@@ -28,6 +30,8 @@ export interface MirrorStatsMsg {
   failed: number;
   unknownChannelPackets: number;
   overflowed: boolean;
+  /** The join snapshot the stream began with: the phone's state when the copy started. */
+  join: JoinStats | null;
   open: boolean;
   /** The centre pixel of the last frame posted (RGBA), so a test can see what the mirror drew. */
   pixel: number[] | null;
@@ -43,7 +47,7 @@ export interface MirrorStatsMsg {
 
 export type MirrorOut =
   | MirrorStatsMsg
-  /** The tap's HELLO arrived: the copy runs, and the app can be restarted into it. */
+  /** The join has been fed (or the stream has none and its first live record arrived): the copy runs, and the app can be restarted into it. */
   | { type: "joined" }
   | { type: "closed"; code: number; reason: string }
   /** The canvas has WebGL2: the mirror can open. */
