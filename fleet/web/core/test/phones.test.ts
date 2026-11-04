@@ -354,7 +354,7 @@ describe("the panel of an opened phone", () => {
     const p = panelOf(ph);
     if (p.borrow.kind !== "yours") throw new Error(p.borrow.kind);
     expect(p.borrow.session).toBe("phone-claim-3");
-    expect(p.borrow.countdown).toBe("Back in 88 s");
+    expect(p.borrow.countdown).toBe("Returns in 88 s");
     expect(p.borrow.actions.map((a) => a.label)).toEqual(["Switch screen", "Rotate", "Dark mode", "Dance", "Wave", "GPU benchmark", "Restart app", "Open nvidia.com", "Robot Park", "Reboot phone"]);
     expect(p.borrow.actions.map((a) => a.name)).toEqual(ACTIONS);
     expect(p.borrow.actions.every((a) => !a.disabled)).toBe(true);

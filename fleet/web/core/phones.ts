@@ -769,7 +769,7 @@ function panelOf(
     borrow = {
       kind: "yours",
       session: b.session,
-      countdown: `Back in ${left} s`,
+      countdown: `Returns in ${left} s`,
       // the phone's own list: what its host carries out
       actions: t.actions.map((name) => ({ name, label: ACTION_LABELS[name] ?? name.replace(/_/g, " "), disabled: !online || !running })),
       giveBack: "Give it back",
