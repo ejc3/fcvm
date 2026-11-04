@@ -1194,21 +1194,23 @@ what it has not decoded at 256 MiB while a join is being fed. A join refuses (an
 starts as for `S`) while the emulator holds the render threads paused for its own snapshot or
 a GPU release, and with address space graphics.
 
-Measured on a g4dn.metal (T4), the AOSP phone in its 6 GiB VM, eight joins in one session
-(`scripts/phone/mirror-capture.sh`, a client on the host): six on the home screen (three of them after a `restart_app` that left the home screen in front),
-two with the browser on www.nvidia.com in front.
+Measured on a g4dn.metal (T4), the AOSP phone in its 6 GiB VM, eight joins in one session on
+the emulator this change pins (`scripts/phone/mirror-capture.sh`, a client on the host): six on
+the home screen (three of them after a `restart_app` that left the home screen in front), two
+with the browser on www.nvidia.com in front.
 
 | | home screen | browser in front |
 |---|---|---|
-| color buffers | 46 to 49 | 53 to 55 |
-| render threads paused (the phone's cost) | 201 to 468 ms, median 238 ms over all eight | 218 and 400 ms |
-| join before compression (pixels 46 to 68 MB, GL state 105 to 185 MB) | 151 to 194 MB | 244 and 253 MB |
-| join on the wire (zstd) | 12.7 to 16.5 MB | 10.1 and 11.3 MB |
-| END at the client, from the stream's open | 0.52 to 1.14 s | 0.79 and 1.00 s |
+| color buffers | 47 to 51 | 55 and 58 |
+| render threads paused (the phone's cost) | 151 to 500 ms | 220 and 488 ms |
+| join before compression: pixels + GL state | 151 to 201 MB (46 to 53 MB + 105 to 147 MB) | 244 and 264 MB (60 and 71 MB + 183 and 193 MB) |
+| join on the wire (zstd) | 12.4 to 17.2 MB | 9.8 and 11.0 MB |
+| END at the client, from the stream's open | 0.52 to 1.19 s | 0.76 and 1.06 s |
 
-SurfaceFlinger ran after every join (the capture checks it). The page decodes and draws a
-49-buffer join in about 160 ms in headless Chrome (SwiftShader). The first gpubox run, before the
-join left the guest's reads alone, lost SurfaceFlinger after its first join: a paused channel's
+The median pause over all eight is 254 ms. Every join ended with status 0 and SurfaceFlinger
+ran after each (the capture checks both). The page decodes and draws a 49-buffer join in about
+160 ms in headless Chrome (SwiftShader). An earlier gpubox run, before the join left the
+guest's reads alone, lost SurfaceFlinger after its first join: a paused channel's
 host-to-guest queue failed every guest read, which ended the guest processes' connections.
 
 **Pixel match at the join.** `e2e/fixtures/mirror/home` holds one of those joins, cut to the posted
