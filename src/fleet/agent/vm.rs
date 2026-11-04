@@ -294,30 +294,75 @@ pub fn phone_actions(phone: Option<&PhoneCfg>) -> Vec<String> {
 
 /// The command that carries out a take-over action in a running phone: `phone.sh action
 /// <name>` in its container, through `fcvm exec`. Each action is one of the enumerated
-/// names, never text from a viewer. `None` for `reboot_phone`, which the coordinator turns
-/// into a relaunch of the VM, and for an action this build does not know.
+/// names, never text from a viewer; a tap adds its point as two decimals with four places
+/// (`0.2500 0.9375`), the only numbers that reach the phone. `None` for `reboot_phone`,
+/// which the coordinator turns into a relaunch of the VM, for a tap without its point, and
+/// for an action this build does not know.
 pub fn phone_action_argv(
     vm_pid: u32,
     action: fleet_core::phone::PhoneAction,
+    point: Option<fleet_core::phone::TapPoint>,
 ) -> Option<Vec<String>> {
     use fleet_core::phone::PhoneAction;
     if matches!(action, PhoneAction::RebootPhone | PhoneAction::Unknown) {
         return None;
     }
-    Some(
-        [
-            "exec",
-            "--pid",
-            &vm_pid.to_string(),
-            "--",
-            "/usr/local/bin/phone.sh",
-            "action",
-            action.as_str(),
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect(),
-    )
+    let mut argv: Vec<String> = [
+        "exec",
+        "--pid",
+        &vm_pid.to_string(),
+        "--",
+        "/usr/local/bin/phone.sh",
+        "action",
+        action.as_str(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    if action == PhoneAction::Tap {
+        // the coordinator checked the point; clamped again so the phone gets [0, 1] whatever
+        let p = point?;
+        for v in [p.x, p.y] {
+            if !v.is_finite() {
+                return None;
+            }
+            argv.push(format!("{:.4}", v.clamp(0.0, 1.0)));
+        }
+    }
+    Some(argv)
+}
+
+/// The command that tells a running phone's Robot Park where it runs, for its info tab
+/// (PROTOCOL.md, "Phone app", `place`): `phone.sh place`, which keeps it and sends it again
+/// after each restart of the app, with the VM, the slot, the place a viewer may see
+/// (`EC2 in <region>`, never the host's own name) and the restore's time, from the launch to
+/// the app's first frame.
+pub fn phone_place_argv(
+    vm_pid: u32,
+    vm: &str,
+    slot: &str,
+    place: Option<&str>,
+    restored_in_ms: Option<u64>,
+) -> Vec<String> {
+    let mut req = serde_json::json!({"type": "place", "vm": vm, "slot": slot});
+    if let Some(p) = place {
+        req["region"] = p.into();
+    }
+    if let Some(ms) = restored_in_ms {
+        req["restored_in_ms"] = ms.into();
+    }
+    [
+        "exec",
+        "--pid",
+        &vm_pid.to_string(),
+        "--",
+        "/usr/local/bin/phone.sh",
+        "place",
+        &req.to_string(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// What fcvm's `restored` record says about the restore.
@@ -528,23 +573,28 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split("\n  ;;\n").next())
             .expect("phone.sh has an action command");
-        assert_eq!(super::phone_action_argv(42, PhoneAction::Unknown), None);
+        assert_eq!(
+            super::phone_action_argv(42, PhoneAction::Unknown, None),
+            None
+        );
+        let point = fleet_core::phone::TapPoint { x: 0.25, y: 0.9375 };
         for a in PhoneAction::ALL {
-            match super::phone_action_argv(42, a) {
+            match super::phone_action_argv(42, a, Some(point)) {
                 None => assert_eq!(a, PhoneAction::RebootPhone),
                 Some(argv) => {
-                    assert_eq!(
-                        argv,
-                        [
-                            "exec",
-                            "--pid",
-                            "42",
-                            "--",
-                            "/usr/local/bin/phone.sh",
-                            "action",
-                            a.as_str()
-                        ]
-                    );
+                    let mut want = vec![
+                        "exec",
+                        "--pid",
+                        "42",
+                        "--",
+                        "/usr/local/bin/phone.sh",
+                        "action",
+                        a.as_str(),
+                    ];
+                    if a == PhoneAction::Tap {
+                        want.extend(["0.2500", "0.9375"]);
+                    }
+                    assert_eq!(argv, want);
                     assert!(
                         controller.lines().any(|l| l
                             .trim_start()
@@ -645,6 +695,66 @@ mod tests {
                 "serve"
             ]
         );
+    }
+
+    /// Robot Park's info tab learns where it runs: the VM, the slot, the viewer-safe place and
+    /// the restore's time, as one `place` request; no host name.
+    #[test]
+    fn a_running_phone_is_told_where_it_runs() {
+        let argv = super::phone_place_argv(
+            42,
+            "fleet-phone-2",
+            "phone-2",
+            Some("EC2 in us-east-1"),
+            Some(23_400),
+        );
+        assert_eq!(
+            &argv[..6],
+            [
+                "exec",
+                "--pid",
+                "42",
+                "--",
+                "/usr/local/bin/phone.sh",
+                "place"
+            ]
+        );
+        let req: serde_json::Value = serde_json::from_str(&argv[6]).unwrap();
+        assert_eq!(
+            req,
+            serde_json::json!({"type": "place", "vm": "fleet-phone-2", "slot": "phone-2", "region": "EC2 in us-east-1", "restored_in_ms": 23400})
+        );
+        let bare: serde_json::Value =
+            serde_json::from_str(&super::phone_place_argv(1, "v", "s", None, None)[6]).unwrap();
+        assert_eq!(
+            bare,
+            serde_json::json!({"type": "place", "vm": "v", "slot": "s"})
+        );
+    }
+
+    /// A tap reaches the phone only with its point, as two decimals in [0, 1].
+    #[test]
+    fn a_tap_carries_its_point_and_nothing_else_does() {
+        use fleet_core::phone::{PhoneAction, TapPoint};
+        assert_eq!(super::phone_action_argv(42, PhoneAction::Tap, None), None);
+        let argv = |x: f64, y: f64| {
+            super::phone_action_argv(42, PhoneAction::Tap, Some(TapPoint { x, y }))
+                .map(|a| a[7..].to_vec())
+        };
+        assert_eq!(
+            argv(0.0, 1.0),
+            Some(vec!["0.0000".to_string(), "1.0000".to_string()])
+        );
+        assert_eq!(
+            argv(1.5, -0.25),
+            Some(vec!["1.0000".to_string(), "0.0000".to_string()])
+        );
+        assert_eq!(argv(f64::NAN, 0.5), None);
+        assert_eq!(argv(0.5, f64::INFINITY), None);
+        let other =
+            super::phone_action_argv(42, PhoneAction::Dance, Some(TapPoint { x: 0.5, y: 0.5 }))
+                .unwrap();
+        assert_eq!(other.last().map(String::as_str), Some("dance"));
     }
 
     /// The hello lists what the phones carry out, so the coordinator offers a viewer nothing

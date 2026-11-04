@@ -26,6 +26,10 @@ if [ "${1:-}" = gpu ] && [ "${2:-}" = scrub ]; then
 fi
 if [ "${1:-}" = exec ]; then
     echo "exec $3 ${*:5} $(date +%s%N)" >> "$log"
+    # FAKE_SLOW_ACTION=<name>: `phone.sh action <name>` takes FAKE_SLOW_SECS (default 4)
+    if [ -n "${FAKE_SLOW_ACTION:-}" ] && [ "${*:5:3}" = "/usr/local/bin/phone.sh action ${FAKE_SLOW_ACTION}" ]; then
+        sleep "${FAKE_SLOW_SECS:-4}"
+    fi
     exit 0
 fi
 argv=("$@")

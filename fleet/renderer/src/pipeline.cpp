@@ -620,18 +620,26 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     // the cost per sample of each path, from the frames it drew)
     const RenderStats& rs = r_.stats();
     std::lock_guard<std::mutex> l(hmu_);
-    // a model belongs to one drawn size: a new size starts it again
-    if (std::fabs(px - fit_px_) > 0.01 * px) { cost_ = CostModel(); cost_.hq_prior = HQ_COST_PRIOR; fit_px_ = px; budget_ = opt_.budget; }
+    // a new drawn size scales the model's fixed part (CostModel::rescale)
+    if (std::fabs(px - fit_px_) > 0.01 * px) {
+      if (fit_px_ > 0) cost_.rescale(px / fit_px_);
+      fit_px_ = px;
+    }
     double now = mono_s();
     if (rs.spp > 0) cost_.observe(rs.hq, px / rs.half * rs.spp, rs.trace_ms, rs.render_ms, now);
-    fit_ = cost_.fit(px, HQ_SPP, 1000.0 / opt_.fps, now) * fit_scale_;
-    fit_now_ = cost_.fit_now(px, HQ_SPP, 1000.0 / opt_.fps) * fit_scale_;
+    // the fits in samples; reported as the largest budget whose samples fit
+    double fit_samples = cost_.fit(px, HQ_SPP, 1000.0 / opt_.fps, now) * fit_scale_;
+    double fit_now_samples = cost_.fit_now(px, HQ_SPP, 1000.0 / opt_.fps) * fit_scale_;
+    fit_ = reported_fit(fit_samples, px);
+    fit_now_ = reported_fit(fit_now_samples, px);
     used_budget_ = budget;
     budget_source_ = source;
     // a whole-image renderer alone follows its own fit, on the ladder (the
     // latest frames' until the window is ready)
-    double own = fit_ > 0 ? fit_ : fit_now_;
-    if (opt_.adapt && whole && own > 0) budget_ = local_budget(own, px);
+    if (opt_.adapt && whole) {
+      double b = own_budget(fit_samples, fit_now_samples, px);
+      if (b > 0) budget_ = b;
+    }
   }
   if (!prime) {
     // debug captures of this frame

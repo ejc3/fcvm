@@ -358,7 +358,7 @@ help:
 	@echo "  bench-chromium-request-all     Full chain: image, golden, verify, run"
 	@echo "  bench-chromium-request-diag    In-guest load diagnostics, one traced render per clone, serve always --uffd-prefetch off (TAG=, BACKEND=, UFFD_MODE=, DIAG_URLS=, DIAG_REPS=, DIAG_EXPECT_IPS=, DIAG_MAX_LOAD_MS=, RESULTS=)"
 	@echo "  bench-webkit-request-diag      WebKit twin of bench-chromium-request-diag (TAG=, BACKEND=, DIAG_URLS=, DIAG_REPS=, DIAG_EXPECT_IPS=, DIAG_MAX_LOAD_MS=, RESULTS=)"
-	@echo "  bench-chromium-corpus         Corpus campaign, orchestrator frozen per run (TAG=, CPU=, PHASE=)"
+	@echo "  bench-chromium-corpus         Corpus campaign, orchestrator frozen per run (TAG=, CPU=, PHASE=, NETMODE=)"
 	@echo "  bench-chromium-corpus-extra   Host-control and matched-memory corpus campaign (PHASES=, RESULTS=)"
 	@echo "  bench-stop                    Stop all bench processes, reap stray VMs, restore dnsmasq"
 	@echo "  bench-chromium-hostcdp         Host direct-CDP baseline (COMPARISON_LABEL=standalone CPU_BUDGET=unlimited; CPUS= needs CPU_BUDGET=vm-matched)"

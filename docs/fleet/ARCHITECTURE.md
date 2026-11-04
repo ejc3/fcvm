@@ -616,7 +616,8 @@ phone, let's have something more androidy."
 - **Restore time.** A phone shows "Phone restored in X s" the way a wall tile shows its
   restore, measured from the click to the app's first frame on the restored GPU.
 - **Take over.** A viewer borrows one phone like "Your own GPU" and gets a panel of fixed
-  actions; nothing typed reaches the phone.
+  actions; nothing typed reaches the phone. While Robot Park is in front, a click on the
+  phone's screen is a tap there ("Taps in Robot Park" below).
 
 ### The phone
 
@@ -1046,6 +1047,30 @@ app's GPU benchmark, restart the app. Reboot the phone is the coordinator's: it 
 phone's VM (a clone of its warm snapshot, flow B) and the page shows the restore time. The
 controller takes nothing but the action's name; adb, the emulator console and the app's
 control socket listen only inside the container.
+
+**Taps in Robot Park.** The owner, 2026-11-04, after clicking the app's Scene and Info tabs
+in a take-over panel that sent nothing: "If our simulator app is up we should let there be
+pass through". While a viewer holds a phone and Robot Park is in front, a click on the
+phone's screen in the panel (its video, or its GPU mirror, whose box maps the same way) is a
+`tap` at the click's fractions of the screen; a click on the bezel is nothing. The fixed
+actions stay as they are for everything else, and the browser in front takes no taps: the
+page says "Taps reach the phone only in Robot Park." under the screen and the coordinator
+refuses one. Which app is in front is the coordinator's record of the actions it accepted
+for the phone's current launch (`front` in the phone's tile): the container keeps its own
+record (`$RUN/front`, what `phone.sh` last brought to the front) and refuses a tap the
+coordinator let through when the two differ. The agent passes the point as two decimals, and
+`phone.sh` maps it to Robot Park's surface size, which turns with the screen, and runs adb's
+`input tap`. Taps have a rate limit of their own, one every 200 ms, and stay in the
+assignment for 3 s.
+
+Measured on a g4dn.metal with a clone of the host image's warm phone (2026-11-04, 20 of
+each): adb's `input tap` in the container took 35 to 69 ms; `phone.sh action tap` there, with
+its `status` request, 49 to 61 ms; `fcvm exec` alone 95 to 137 ms; the agent's whole command
+112 to 256 ms (median 176). The agent carries out one action at a time, so one tap every
+200 ms is what it keeps up with; at 10 a second a quick clicker would queue up to 3 s of taps
+behind it. From the start of the agent's command to the first decoded frame of
+the stream showing the tapped tab: median 284 ms, 90th percentile 325 ms (218 to 349 ms; Info
+218 to 298, Scene 283 to 349).
 
 Phones are their own slots (`phone-<n>`), never wall tiles: an agent run with `--phones N`
 runs phones on the last N GPUs of its inventory and names them in its hello. The

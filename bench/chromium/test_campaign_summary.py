@@ -153,7 +153,8 @@ def campaign_logs(stage_hosts):
 
     campaign_summary reads the bracket records back against corpus-dns.log, so
     a fixture cannot state the two independently: each bracket's window holds
-    one A answer per host that bracket names, answered with the address that
+    one A answer per host that bracket names (AAAA for an IPv6 address, as
+    corpus_serve answers a routed guest), answered with the address that
     bracket recorded, and the record counts exactly those.
     """
     dns, records, row = [], [], 0
@@ -161,8 +162,9 @@ def campaign_logs(stage_hosts):
         hosts = stage_hosts.get(stage) or {}
         for host, entry in hosts.items():
             answer = (entry or {}).get("answer") if isinstance(entry, dict) else None
+            qtype = 28 if isinstance(answer, str) and ":" in answer else 1
             dns.append(json.dumps({"ts": 1.0 + row, "peer": "10.0.2.100",
-                                   "qname": host, "qtype": 1, "answer": answer}))
+                                   "qname": host, "qtype": qtype, "answer": answer}))
         records.append(
             f"{stage} since_row={row} queries={len(hosts)} "
             f"hosts_seen={len(hosts)}/{len(hosts)} missing=none"
@@ -1339,6 +1341,41 @@ class CampaignSummary(unittest.TestCase):
                 self.assertNotEqual(rc, 0, f"{label}: indexed")
                 self.assertFalse(os.path.exists(out))
                 self.assertIn(keyword, text, label)
+
+    def test_a_routed_replay_is_read_from_its_aaaa_answers(self):
+        """A routed guest resolves the corpus to an IPv6 replay address, which
+        corpus_serve answers as AAAA and leaves A empty. The index re-derives
+        each bracket's answers from corpus-dns.log, so it must read the AAAA
+        rows; the same address under an A row is not what the server answered.
+
+        Watched red before the fix: the accepted case was refused with
+        "corpus-dns.log holds 0", since only qtype 1 rows were counted.
+        """
+        resolver = "fd53::2"
+        host = {"answer": resolver, "ok": True}
+        kwargs = dict(
+            guest_dns=resolver,
+            verify_overrides={"hosts": {"example.com": host}, "dns_server": resolver,
+                              "resolv_conf_vm": f"nameserver {resolver}\n",
+                              "resolv_conf_container": f"nameserver {resolver}\n"},
+        )
+        diag = diag_summary()
+        diag["limits"]["expect_ips"] = [resolver]
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, diag=diag, **kwargs)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
+        as_a = campaign_logs({stage: {"example.com": host} for stage in VERIFY_STAGES})
+        as_a["corpus-dns.log"] = as_a["corpus-dns.log"].replace('"qtype": 28', '"qtype": 1')
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, diag=diag, corpus_logs=as_a, **kwargs)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, "an IPv6 answer logged under an A row was indexed")
+            self.assertIn("never logged", text)
 
     def test_a_webkit_diag_carries_no_ip_expectation_and_still_needs_its_load_limit(self):
         """reqbench refuses DIAG_EXPECT_IPS on webkit (its render carries no

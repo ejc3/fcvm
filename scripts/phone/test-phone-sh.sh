@@ -195,16 +195,21 @@ with open(sys.argv[2], "a") as log:
     while True:
         c, _ = s.accept(); f = c.makefile("rw")
         for line in f:
-            log.write(line); log.flush()
-            # a reply the test set ($dir/reply, used once), else ok
+            # status requests apart: logged to status.log, answered from status-reply (used
+            # once) or with an app of no screen whose uptime is 1 ms; any other request is
+            # logged to ctl.log and answered from reply (used once), else ok
+            st = "\"type\":\"status\"" in line
+            (open(sys.argv[4], "a") if st else log).write(line)
+            log.flush()
+            path = sys.argv[5] if st else sys.argv[3]
             try:
-                with open(sys.argv[3]) as r: reply = r.read()
-                os.remove(sys.argv[3])
+                with open(path) as r: reply = r.read()
+                os.remove(path)
             except FileNotFoundError:
-                reply = "{\"ok\": true}\n"
+                reply = "{\"ok\": true, \"uptime_ms\": 1}\n" if st else "{\"ok\": true}\n"
             f.write(reply); f.flush()
         c.close()
-' "$port" "$dir/ctl.log" "$dir/reply" &
+' "$port" "$dir/ctl.log" "$dir/reply" "$dir/status.log" "$dir/status-reply" &
 ctl=$!
 for _ in $(seq 1 50); do (exec 3<> "/dev/tcp/127.0.0.1/$port") 2> /dev/null && break; sleep 0.1; done
 act() { PHONE_CTL_PORT=$port PHONE_RUN="$dir" "$phone" action "$1" > /dev/null 2> "$dir/act.err"; }
@@ -237,6 +242,25 @@ if act switch_screen; then bad "a refused switch_screen succeeded"; else ok "a r
 act switch_screen || bad "switch_screen failed: $(cat "$dir/act.err")"
 [ "$(tail -2 "$dir/ctl.log")" = '{"type":"action","name":"info"}
 {"type":"action","name":"info"}' ] && ok "a refused toggle is asked for again, not undone" || bad "after a refused switch_screen the app was sent: $(tail -2 "$dir/ctl.log")"
+# switch_screen goes by the screen the app says it shows (a tap on its tabs changes it too),
+# and the cache only when the app names none.
+: > "$dir/ctl.log"
+printf '{"ok":true,"screen":"info"}\n' > "$dir/status-reply"
+act switch_screen || bad "switch_screen failed: $(cat "$dir/act.err")"
+printf '{"ok":true,"screen":"info"}\n' > "$dir/status-reply"
+act switch_screen || bad "switch_screen failed: $(cat "$dir/act.err")"
+[ "$(cat "$dir/ctl.log")" = '{"type":"action","name":"scene"}
+{"type":"action","name":"scene"}' ] && ok "switch_screen leaves the screen the app says it shows" || bad "switch_screen with the app on info sent: $(cat "$dir/ctl.log")"
+# restart_app: the place the agent sent is kept and sent to the restarted app once it answers
+: > "$dir/ctl.log"
+PHONE_CTL_PORT=$port PHONE_RUN="$dir" "$phone" place '{"type":"place","vm":"fleet-phone-1","slot":"phone-1"}' > /dev/null 2> "$dir/act.err" \
+  || bad "place failed: $(cat "$dir/act.err")"
+printf '{"ok":true,"uptime_ms":60000}\n' > "$dir/status-reply"
+act restart_app || bad "restart_app failed: $(cat "$dir/act.err")"
+[ "$(cat "$dir/ctl.log")" = '{"type":"place","vm":"fleet-phone-1","slot":"phone-1"}
+{"type":"action","name":"restart"}
+{"type":"place","vm":"fleet-phone-1","slot":"phone-1"}' ] && ok "a restarted app is told its place again" || bad "place and restart_app sent: $(cat "$dir/ctl.log")"
+rm -f "$dir/place"
 # The browser's actions, with a stub adb and a stand-in for the streamer's /health and the
 # browser's DevTools list: open_browser brings the loaded page to the front and reloads it, or
 # starts the browser again while the viewer's GPU mirror is open; an action for Robot Park
@@ -277,7 +301,7 @@ http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_foreve
 http=$!
 for _ in $(seq 1 50); do (exec 3<> "/dev/tcp/127.0.0.1/$hport") 2> /dev/null && break; sleep 0.1; done
 bact() { : > "$B/adb.log"; : > "$dir/ctl.log"; PHONE_ADB="$B/adb" PHONE_CTL_PORT=$port PHONE_RUN="$B" PHONE_STREAMER_PORT=$hport PHONE_DEVTOOLS_PORT=$hport \
-  "$phone" action "$1" > "$B/out" 2> "$dir/act.err"; }
+  "$phone" action "$@" > "$B/out" 2> "$dir/act.err"; }
 adb_has() { grep -qF -- "$1" "$B/adb.log"; }
 if bact open_browser; then bad "open_browser succeeded on a phone without the browser"; else ok "a phone without the browser refuses open_browser"; fi
 touch "$B/installed"
@@ -310,6 +334,42 @@ bact open_browser > /dev/null || true; bact dance || bad "dance with the mirror 
 [ "$(cat "$dir/ctl.log")" = '{"type":"action","name":"restart"}
 {"type":"action","name":"dance"}' ] && ok "an action for Robot Park with the mirror open restarts it, then sends the action" \
   || bad "dance with the browser in front and the mirror open sent: $(cat "$dir/ctl.log")"
+# `tap x y`: the point, fractions of the screen as it is turned now, goes to `input tap` at the
+# pixel of Robot Park's surface (from its status), portrait or turned; nothing reaches the
+# phone while the browser is in front, or for a point that is not two fractions.
+tap() { # reply to the status request, then the point's words
+  printf '%s\n' "$1" > "$dir/status-reply"
+  : > "$dir/status.log"
+  echo app > "$B/front"
+  bact tap "${@:2}"
+}
+tap '{"ok":true,"surface":[720,1280]}' 0.5000 0.2500 || bad "a tap failed: $(cat "$dir/act.err")"
+adb_has "shell input tap 360 320" && [ "$(cat "$dir/status.log")" = '{"type":"status"}' ] && [ ! -s "$dir/ctl.log" ] \
+  && ok "a tap on an upright phone lands at its pixel" || bad "a tap on an upright phone ran: $(cat "$B/adb.log" "$dir/ctl.log")"
+tap '{"ok":true,"surface":[1280,720]}' 0.5000 0.2500 || bad "a tap on a turned phone failed: $(cat "$dir/act.err")"
+adb_has "shell input tap 640 180" && ok "a tap on a turned phone lands at the turned screen's pixel" || bad "a tap on a turned phone ran: $(cat "$B/adb.log")"
+tap '{"ok":true,"surface":[720,1280]}' 1.0000 1.0000 || bad "a tap in the corner failed: $(cat "$dir/act.err")"
+adb_has "shell input tap 719 1279" && ok "a tap at 1, 1 lands on the last pixel" || bad "a tap at 1, 1 ran: $(cat "$B/adb.log")"
+tap '{"ok":true,"surface":[720,1280]}' 0.0000 0.0000 || bad "a tap at the origin failed: $(cat "$dir/act.err")"
+adb_has "shell input tap 0 0" && ok "a tap at 0, 0 lands on the first pixel" || bad "a tap at 0, 0 ran: $(cat "$B/adb.log")"
+printf '{"ok":true,"surface":[720,1280]}\n' > "$dir/status-reply"
+: > "$dir/status.log"
+echo browser > "$B/front"
+if bact tap 0.5000 0.5000; then bad "a tap with the browser in front succeeded"; else
+  grep -q "taps reach the phone only in Robot Park" "$dir/act.err" && ! adb_has "input tap" && [ ! -s "$dir/ctl.log" ] && [ ! -s "$dir/status.log" ] \
+    && ok "with the browser in front a tap fails, saying why, and reaches nothing" || bad "a tap with the browser in front: $(cat "$dir/act.err" "$B/adb.log" "$dir/ctl.log")"
+fi
+rm -f "$dir/status-reply"
+for pt in "0.5 0.5" "1.0001 0.5000" "0.5000 -0.1000" "0.5000" "0.5000 0.5000;id" "1e-4 0.5000"; do
+  # shellcheck disable=SC2086 # the words are the test
+  if tap '{"ok":true,"surface":[720,1280]}' $pt; then bad "a tap at '$pt' was accepted"; else
+    rc=$?; [ "$rc" = 2 ] && ! adb_has "input tap" && ok "a tap at '$pt' is refused" || bad "a tap at '$pt' exited $rc: $(cat "$B/adb.log")"
+  fi
+done
+rm -f "$dir/status-reply"
+if tap '{"ok":true}' 0.5000 0.5000; then bad "a tap with no screen size succeeded"; else
+  ! adb_has "input tap" && grep -q "no screen size" "$dir/act.err" && ok "a tap with no screen size from the app fails" || bad "a tap with no size: $(cat "$dir/act.err" "$B/adb.log")"
+fi
 # serve with a browser: it opens www.nvidia.com before Robot Park starts in front of it, and a
 # browser that shows no NVIDIA page fails the phone.
 D=$(PHONE_BROWSER_APK=/work/cromite.apk PHONE_DEVTOOLS_PORT=$hport serve)

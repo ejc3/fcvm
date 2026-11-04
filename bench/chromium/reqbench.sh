@@ -601,11 +601,29 @@ cmd_golden() {
             guest_env_flags+=(--env "$guest_env_entry")
         done
     fi
+    # A root mode (SUDO set: bridged, routed) runs fcvm as root, which exports
+    # the image from root's container storage, where the rootless build never
+    # wrote. Copy it there first, and inspect it there below, so the digest and
+    # ID this golden records are the ones root's fcvm resolves.
+    if [ -n "$SUDO" ]; then
+        local user_id root_id
+        user_id=$(podman image inspect --format '{{.Id}}' "$IMAGE") \
+            || { log "golden: cannot identify benchmark image $IMAGE"; return 1; }
+        root_id=$($SUDO podman image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null) || root_id=""
+        if [ "$root_id" != "$user_id" ]; then
+            log "golden: copying $IMAGE ($user_id) into root's container storage"
+            podman save --format docker-archive "$IMAGE" | $SUDO podman load >/dev/null \
+                || { log "golden: cannot load $IMAGE into root's container storage"; return 1; }
+            root_id=$($SUDO podman image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null) || root_id=""
+            [ "$root_id" = "$user_id" ] \
+                || { log "golden: root's $IMAGE is '$root_id' after the copy, not $user_id"; return 1; }
+        fi
+    fi
     # One inspect binds the mutable tag's manifest digest and immutable image ID
     # to the same observation. fcvm performs the same atomic resolution before
     # exporting by ID; the cache-path check committed with the snapshot below
     # detects a tag replacement between these two observations and fails closed.
-    image_record=$(podman image inspect "$IMAGE") \
+    image_record=$($SUDO podman image inspect "$IMAGE") \
         || { log "golden: cannot identify benchmark image $IMAGE"; return 1; }
     image_digest=$(jq -r '.[0].Digest // "" | select(type == "string")' \
         <<<"$image_record") \
@@ -1044,8 +1062,13 @@ verify_guest_dns() {
         local host answer ok
         for host in "${hosts[@]}"; do
             [ -n "$host" ] || continue
+            # Every address the name resolves to, of either family, sorted and
+            # comma-joined: the replay answers one family (A, or AAAA for a
+            # routed guest's IPv6 replay) and leaves the other empty, so the
+            # one passing answer is exactly VERIFY_DNS_ANSWER.
             answer=$($SUDO "$FCVM" exec --pid "$cpid" -c -- python3 -c \
-                'import socket,sys;print(socket.gethostbyname(sys.argv[1]))' "$host" 2>>"$errlog") \
+                'import socket,sys;print(",".join(sorted({a[4][0] for a in socket.getaddrinfo(sys.argv[1],None,proto=socket.IPPROTO_TCP)})))' \
+                "$host" 2>>"$errlog") \
                 || answer="${answer:-}<exec rc=$?>"
             if [ "$answer" = "$VERIFY_DNS_ANSWER" ]; then
                 ok=true
@@ -1432,7 +1455,15 @@ acquire_generation_lock() {
     mkdir -p "$(dirname "$gen_lock")" 2>/dev/null || true
     touch "$gen_lock" 2>/dev/null || true
     if [ -z "${REQBENCH_GEN_LOCK_FD:-}" ]; then
-        exec {REQBENCH_GEN_LOCK_FD}<>"$gen_lock" || true
+        # The braces scope the 2>/dev/null to this open: on a bare exec it
+        # would redirect the shell's stderr for the rest of the phase.
+        { exec {REQBENCH_GEN_LOCK_FD}<>"$gen_lock"; } 2>/dev/null || true
+    fi
+    # A golden made as root (SUDO, the bridged and routed modes) leaves the
+    # lock file root's and 0644. flock needs only a descriptor, so a read-only
+    # one takes the same shared lock.
+    if [ -z "${REQBENCH_GEN_LOCK_FD:-}" ]; then
+        exec {REQBENCH_GEN_LOCK_FD}<"$gen_lock" || true
     fi
     if [ -z "${REQBENCH_GEN_LOCK_FD:-}" ]; then
         log "generation lock unavailable at $gen_lock"
@@ -1573,6 +1604,13 @@ cmd_run() {
     if [ "$rc" -eq 0 ]; then
         log "run: applying publication gates"
         apply_publication_gates || rc=$?
+    fi
+    # A root mode wrote the run's records as root (reqbench.py and reqanalyze
+    # run under SUDO), some with mode 0600, and everything after this phase
+    # reads them as the invoking user: the campaign binds its DNS evidence to
+    # analysis.json's run_id, and campaign_summary and the import read the rest.
+    if [ -n "$SUDO" ]; then
+        $SUDO chown -R "$(id -u):$(id -g)" "$RESULTS" || rc=1
     fi
     log "run: results in $RESULTS (backend=$BACKEND, gated run exit $rc)"
     return $rc
@@ -1720,7 +1758,7 @@ diag_write_summary() {
     python3 - "$RESULTS/diag" "$ENGINE" "$TAG" "$BACKEND" "$mode" "$prefetch" \
         "$DIAG_REPS" "$DIAG_EXPECT_IPS" "$DIAG_MAX_LOAD_MS" "$teardown_failures" \
         "$bundle_ok" "$generation" "$config_sha" "$bundle_sha" "$@" <<'PY'
-import json, os, sys, tempfile, time, urllib.parse, uuid
+import ipaddress, json, os, sys, tempfile, time, urllib.parse, uuid
 from collections import Counter
 
 (diag_dir, engine, tag, backend, uffd_mode, uffd_prefetch, reps_raw,
@@ -1728,7 +1766,17 @@ from collections import Counter
  config_sha256, bundle_sha256) = sys.argv[1:15]
 pairs = sys.argv[15:]
 reps = int(reps_raw)
-expect_ips = [ip for ip in expect_raw.split(",") if ip] or None
+def canonical_ip(text):
+    """An address in one spelling: CDP writes an IPv6 remote address in
+    brackets, and an IPv6 address has several textual forms. Text that is no
+    address is kept as it is, so it can only fail to match."""
+    try:
+        return str(ipaddress.ip_address(text.strip("[]")))
+    except ValueError:
+        return text
+
+
+expect_ips = [canonical_ip(ip) for ip in expect_raw.split(",") if ip] or None
 max_load_ms = int(max_load_raw) if max_load_raw else None
 teardown_failures = int(teardown_raw)
 bundle_intact = bundle_raw == "1"
@@ -1886,7 +1934,7 @@ for i in range(0, len(pairs), 2):
             if ip:
                 addressed += 1
                 remote_ips[ip] += 1
-                if expect_ips is not None and ip not in expect_ips:
+                if expect_ips is not None and canonical_ip(ip) not in expect_ips:
                     foreign.setdefault(ip, []).append(row.get("url", ""))
             elif str(row.get("url", "")).split(":", 1)[0].lower() in ("http", "https") \
                     and not row.get("from_cache") and not row.get("from_service_worker") \

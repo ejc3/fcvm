@@ -16,6 +16,9 @@ import {
   zoomProgressAt,
   phonesView,
   sameViewer,
+  tapPoint,
+  TAP,
+  TAP_INTERVAL_MS,
   type Box,
   type MirrorPicture,
   type PhoneCard,
@@ -24,6 +27,7 @@ import {
   type SceneClock,
   type StreamReadout,
   type TakeoverView,
+  type TapTarget,
 } from "../../core/index.ts";
 import { RateMeter } from "../../core/meter.ts";
 import type { MirrorIn, MirrorOut, MirrorStatsMsg } from "./mirror/mirror-msgs.ts";
@@ -366,6 +370,7 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
             fps: mirrorStats?.fps ?? 0,
             repliesPerSec: mirrorStats?.repliesPerSec ?? 0,
             note: mirrorNote,
+            partial: !held.actions.includes("restart_app"),
             leadMs: mirrorLeadMs(mirrorStats?.stamp ?? null, videoStats?.newestT ?? null, state.frames?.at ?? null, sceneClock),
             codec: mirrorStats ? "zstd" : null,
             ratio: mirrorStats && mirrorStats.wireBytes > 0 ? mirrorStats.tapBytes / mirrorStats.wireBytes : null,
@@ -433,6 +438,9 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
   const admitRef = useRef<string>("");
   admitRef.current = m?.admit ?? "";
   const joinedFor = useRef<string | null>(null);
+  // the restart below is a phone action, so it goes only to a phone whose host lists it
+  const canRestartRef = useRef(false);
+  canRestartRef.current = held?.actions.includes("restart_app") ?? false;
   const [retry, setRetry] = useState(0);
   // The coordinator takes one action a second from a phone's holder: the page spaces its own,
   // so the restart that joins the mirror is not refused after a click or a quick reopen.
@@ -458,8 +466,9 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
       else if (x.type === "joined") {
         setMirrorNote(null);
         // Until the join snapshot lands the mirror starts with the app: restart it into the copy,
-        // once per borrow and stream.
-        if (joinedFor.current !== `${mirrorKey} ${retry}`) {
+        // once per borrow and stream. A host that does not list restart_app gets no restart, and
+        // the mirror draws only what the app creates from then on (the readout says so).
+        if (canRestartRef.current && joinedFor.current !== `${mirrorKey} ${retry}`) {
           joinedFor.current = `${mirrorKey} ${retry}`;
           actPhone("restart_app", m!.session);
         }
@@ -507,6 +516,22 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
       window.__phones = { client, view: () => viewRef.current!, mirror: () => mirrorStatsRef.current };
     }
   }, [client]);
+
+  // ---- taps on the held phone's screen ----------------------------------------------
+
+  // The coordinator takes one tap every TAP_INTERVAL_MS from a holder: a quicker click is
+  // dropped here rather than refused there, which would put its refusal on screen.
+  const nextTapAt = useRef(0);
+  const onTap = (target: TapTarget, e: React.MouseEvent<HTMLDivElement>) => {
+    const taps = viewRef.current?.taps;
+    if (!taps) return;
+    const p = tapPoint(target, e.clientX, e.clientY);
+    if (p === null) return;
+    const t = localNow();
+    if (t < nextTapAt.current) return;
+    nextTapAt.current = t + TAP_INTERVAL_MS + 10;
+    client.act("phone_action", { action: TAP, x: p.x, y: p.y, claim: taps.session });
+  };
 
   // ---- opening a phone -------------------------------------------------------------
 
@@ -607,11 +632,22 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
           c.labelBox && c.bezelOpacity > 0.001 ? (
             <div key={c.id} className="phone-label" style={{ ...at(c.labelBox), opacity: c.bezelOpacity }} data-testid={`phone-label-${c.id}`}>
               <span>{c.label}</span>
+              {view.taps?.tileId === c.id && view.taps.note ? (
+                <span className="tap-note" data-testid="phone-tap-note">
+                  {view.taps.note}
+                </span>
+              ) : null}
             </div>
           ) : null,
         )}
       </div>
       <div ref={mirrorHostRef} className="phone-mirror" data-testid="phone-mirror" style={m ? ({ position: "fixed", ...at(m.box), "--mirror-h": `${m.canvasHeight}px` } as CSSProperties) : { display: "none" }} />
+      {/* above the video and the mirror: a click on the screen is a tap on the phone */}
+      <div className="phone-taps">
+        {view.taps?.targets.map((t) => (
+          <div key={t.name} className="phone-tap" style={at(t.box)} aria-hidden="true" data-testid={`phone-tap-${t.name}`} onClick={(e) => onTap(t, e)} />
+        ))}
+      </div>
       {view.panel ? (
         <PanelView panel={view.panel} narrow={narrow} top={sheetTop} client={client} slot={openedSlot} onBack={close} backRef={backRef} onView={setTakeover} onAction={actPhone} />
       ) : null}

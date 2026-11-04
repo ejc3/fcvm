@@ -2065,7 +2065,11 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
     use fcvm::fleet::agent::vm::PhoneCfg;
     use fleet_core::phone::{PhoneAction, PhoneActionReq};
     use fleet_core::protocol::AssignPhone;
-    let f = fake(2, &[]);
+    // rotate takes 3.2 s: a tap behind it in the same batch is past TAP_KEEP_MS
+    let f = fake(
+        2,
+        &[("FAKE_SLOW_ACTION", "rotate"), ("FAKE_SLOW_SECS", "3.2")],
+    );
     let mut c_cfg = cfg(&f.fcvm);
     c_cfg.phone = Some(PhoneCfg {
         image: "localhost/fcvm-phone:test".into(),
@@ -2193,12 +2197,19 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
         action,
         at: 0,
         generation,
+        point: None,
+    };
+    let tap = |seq: u64, x: f64, y: f64| PhoneActionReq {
+        point: Some(fleet_core::phone::TapPoint { x, y }),
+        ..req(seq, PhoneAction::Tap, 1)
     };
     let acts = vec![
-        req(1, PhoneAction::Rotate, 1),
-        req(2, PhoneAction::RebootPhone, 1),
-        req(3, PhoneAction::Dance, 1),
-        req(4, PhoneAction::Wave, 0), // an earlier launch's: never carried out
+        tap(1, 0.25, 0.9375),
+        req(2, PhoneAction::Rotate, 1),
+        req(3, PhoneAction::RebootPhone, 1),
+        req(4, PhoneAction::Dance, 1),
+        req(5, PhoneAction::Wave, 0), // an earlier launch's: never carried out
+        tap(6, 0.5, 0.5),             // reached 3.2 s into the batch: dropped
     ];
     c.send(phone(1, acts.clone()));
     let execs = || -> Vec<String> {
@@ -2207,28 +2218,51 @@ async fn a_phone_slot_runs_the_phone_vm_and_carries_out_each_action_once() {
             .lines()
             .filter(|l| l.starts_with("exec "))
             .map(|l| {
-                l.split_whitespace()
-                    .skip(2)
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .join(" ")
+                // the fake logs the arguments after the pid and a timestamp after them
+                let w: Vec<&str> = l.split_whitespace().skip(2).collect();
+                w[..w.len() - 1].join(" ")
             })
             .collect()
     };
+    let actions = || -> Vec<String> {
+        execs()
+            .into_iter()
+            .filter(|e| e.contains(" action "))
+            .collect()
+    };
     let deadline = Instant::now() + Duration::from_secs(20);
-    while execs().len() < 2 && Instant::now() < deadline {
+    while actions().len() < 3 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     // The same actions again (a re-sent assignment) are not carried out twice.
     c.send(phone(1, acts));
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
-        execs(),
+        actions(),
         vec![
+            "/usr/local/bin/phone.sh action tap 0.2500 0.9375",
             "/usr/local/bin/phone.sh action rotate",
             "/usr/local/bin/phone.sh action dance"
         ]
     );
+    // Robot Park was told where it runs, once, for its info tab
+    let places: Vec<String> = execs()
+        .into_iter()
+        .filter(|e| e.contains(" place "))
+        .collect();
+    assert_eq!(places.len(), 1, "{places:?}");
+    let req: serde_json::Value =
+        serde_json::from_str(places[0].trim_start_matches("/usr/local/bin/phone.sh place "))
+            .unwrap();
+    assert_eq!(
+        (&req["type"], &req["vm"], &req["slot"]),
+        (
+            &serde_json::json!("place"),
+            &serde_json::json!("fleet-phone-1"),
+            &serde_json::json!("phone-1")
+        )
+    );
+    assert!(req["restored_in_ms"].is_u64(), "{req}");
     c.close().await;
 }
 

@@ -186,7 +186,7 @@ object. A knob is checked before the generation lock and the hugepage pool
 are touched, and the webkit diag refuses `DIAG_EXPECT_IPS=` because its render
 has no trace to hold it to. The corpus campaign (`make bench-chromium-corpus`)
 runs it after the verify that follows the golden, with every corpus URL,
-`DIAG_EXPECT_IPS=10.0.2.2` on Chromium and `DIAG_MAX_LOAD_MS` defaulting to
+`DIAG_EXPECT_IPS` set to the replay address (10.0.2.2 rootless) on Chromium and `DIAG_MAX_LOAD_MS` defaulting to
 15000 (the campaign refuses a `DIAG_MAX_LOAD_MS` above `STALL_MAX_MS` before
 building anything, since the index refuses the diag that would produce),
 and refuses to measure when it fails; `DIAG_ONLY=1` stops the
@@ -323,6 +323,43 @@ easy to get wrong:
   refuses evidence naming any other run. The id comes from the records
   themselves, so it survives a re-analysis; a hash of `analysis.json` would
   not.
+
+### The corpus campaign in other network modes
+
+`make bench-chromium-corpus NETMODE=bridged` (or `routed`) measures the corpus
+through that mode's network path. Neither mode has pasta's gateway onto the
+host's loopback, so the replay cannot listen on 127.0.0.1 for them. The campaign
+assigns a replay address to a dummy device, `fcvmreplay0`, for its own lifetime
+(removed by its exit trap, replaced at start when a killed campaign left it), binds
+the replay's DNS, HTTP and HTTPS listeners to that address, and bakes it into the
+golden as the guest's resolver:
+
+| `NETMODE` | replay address | listeners bind | record answered |
+|---|---|---|---|
+| `rootless` (default) | 10.0.2.2, pasta's gateway | 127.0.0.1 | A |
+| `bridged` | 192.168.53.2 | 192.168.53.2 | A |
+| `routed` | fd53::2 | fd53::2 | AAAA (A left empty) |
+
+A bridged guest reaches the address through its gateway: a golden through the host
+side of its veth, a clone through its namespace's NAT and then the host veth. A
+routed guest has no IPv4 path off its namespace, so its replay is IPv6 and reached
+over the namespace's IPv6 route to the host. Both modes run fcvm as root
+(`SUDO=sudo` to reqbench, which copies the image into root's container storage
+before the golden). Routed mode also needs `net.ipv6.conf.all.forwarding=1` on the
+host, and `accept_ra=2` on the uplink when its default route comes from router
+advertisements. The verify brackets, the diag's address expectation and
+`campaign_summary.py` all read the address from the run (the brackets' resolver),
+and count AAAA answers for an IPv6 replay. The memory, host-control and scale
+phases stay rootless.
+
+In a root mode the campaign refuses the `-fast` arms and defaults to `cdp,noop`. A
+`-fast` arm ends its clone with one SIGKILL, which in these modes leaves the clone's
+host-side network (iptables rules, veth, namespace) for the next fcvm launch to
+reclaim, so the next request pays for it. On a bridged trial the no-render arm's
+median was 307 ms after a `-fast` request and 185 ms after a normal teardown. Use
+`ARMS=cdp,html,noop`. The no-render arm's spread in these modes (sd 66 ms after a
+normal teardown, against 1.1 ms rootless) takes more requests for the drift gate's
+interval to resolve its ±10 ms margin; the report's runs use `REPS=402`.
 
 ## Seven methodology defects — do not reintroduce
 

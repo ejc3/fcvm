@@ -285,6 +285,15 @@ export const ACTION_LABELS: Record<string, string> = {
   reboot_phone: "Reboot phone",
 };
 
+/**
+ * A touch on the phone's screen (PROTOCOL.md, "Phones mode"): sent by a click on the screen in
+ * the take-over panel, never shown as a button. The coordinator takes one every
+ * TAP_INTERVAL_MS from a holder, and only while Robot Park is in front.
+ */
+export const TAP = "tap";
+export const TAP_INTERVAL_MS = 200;
+export const TAP_BROWSER_NOTE = "Taps reach the phone only in Robot Park.";
+
 const PHONE_INTENTS = new Set(["claim_phone", "release_phone", "phone_action", "phones_zoom"]);
 
 /** The newest refusal of a phone intent still on screen, as the reason the coordinator gave. */
@@ -407,6 +416,8 @@ export interface StreamReadout {
   repliesPerSec?: number;
   /** Why the stream is not drawing, when it is not. */
   note?: string | null;
+  /** The mirror's: joined without restarting the app (its host does not list restart_app), so it draws only what the app creates after the join. */
+  partial?: boolean;
   /** With both views: how far the mirror's scene time is ahead of the video's (ms; negative behind). */
   leadMs?: number | null;
   /** The mirror's: the commands' bytes over the wire's, and the wire's encoding. */
@@ -528,7 +539,8 @@ export function readoutRows(view: TakeoverView, video: StreamReadout | null, mir
               : "") +
             (mirror.leadMs !== undefined && mirror.leadMs !== null
               ? `. ${Math.abs(Math.round(mirror.leadMs))} ms ${mirror.leadMs >= 0 ? "ahead of" : "behind"} the video`
-              : "")
+              : "") +
+            (mirror.partial ? ". Draws only what the app creates from now on, so it can stay blank (Video shows the phone): this phone's host does not support restarting the app" : "")
           : null,
     });
   return rows;
@@ -575,6 +587,46 @@ export interface PhonesInput {
   mirrorUnavailable?: string | null;
 }
 
+/**
+ * Where a click on the held phone's screen becomes a tap: the box its video or its GPU mirror
+ * is drawn in, and the drawn picture's height over the screen's (both leave out Robot Park's
+ * stamp band at the screen's bottom, so a click's height is scaled into the whole screen's).
+ */
+export interface TapTarget {
+  name: "video" | "mirror";
+  box: Box;
+  yScale: number;
+}
+
+/** Taps on the phone this viewer holds and has opened, when its host takes them. */
+export interface TapView {
+  tileId: string;
+  session: string;
+  /** Empty while the phone takes no taps (the browser in front, not running, offline). */
+  targets: TapTarget[];
+  /** One line under the screen, when there is something to say. */
+  note: string | null;
+}
+
+/** The drawn picture's height over the whole screen's: `height` after the stream's crop, `fullHeight` before it. */
+export function screenYScale(height: number, fullHeight: number | undefined): number {
+  if (!(height > 0) || fullHeight === undefined || !(fullHeight >= height)) return 1;
+  return height / fullHeight;
+}
+
+/**
+ * The tap a click at (cx, cy) CSS px sends: fractions of the phone's screen as it is turned now,
+ * four places. Null for a click outside the drawn screen (on the bezel).
+ */
+export function tapPoint(t: TapTarget, cx: number, cy: number): { x: number; y: number } | null {
+  if (!(t.box.w > 0 && t.box.h > 0)) return null;
+  const fx = (cx - t.box.x) / t.box.w;
+  const fy = (cy - t.box.y) / t.box.h;
+  if (!(fx >= 0 && fx <= 1 && fy >= 0 && fy <= 1)) return null;
+  const four = (v: number) => Math.round(Math.min(1, Math.max(0, v)) * 10_000) / 10_000;
+  return { x: four(fx), y: four(fy * Math.min(1, Math.max(0, t.yScale))) };
+}
+
 /** Where the GPU mirror draws, and the stream it draws: for the phone this viewer holds and has opened. */
 export interface MirrorPlacement {
   tileId: string;
@@ -606,6 +658,7 @@ export interface PhonesView {
   notice: string | null;
   plan: DrawPlan;
   mirror: MirrorPlacement | null;
+  taps: TapView | null;
 }
 
 const BLANK_PLAN = (s: ClientState, dpr: number): DrawPlan => ({
@@ -658,6 +711,7 @@ export function phonesView(inp: PhonesInput): PhonesView {
       panel: null,
       plan: BLANK_PLAN(s, inp.dpr),
       mirror: null,
+      taps: null,
     };
   }
   const open = inp.openId !== null && phones.tiles.some((t) => t.id === inp.openId) ? inp.openId : null;
@@ -727,6 +781,22 @@ export function phonesView(inp: PhonesInput): PhonesView {
       session: heldTile.borrowed!.session!,
     };
   }
+  // Taps: on the held phone's screen, video and mirror alike, when its host lists tap.
+  let taps: TapView | null = null;
+  if (heldTile !== null && heldTile.borrowed?.session !== undefined && heldTile.actions.includes(TAP) && heldBox) {
+    const targets: TapTarget[] = [];
+    let note: string | null = null;
+    if (heldTile.front === "browser") note = TAP_BROWSER_NOTE;
+    else if (online && heldTile.phase === "running") {
+      const fs = s.frames?.tiles[`d:${heldTile.id}`];
+      if (takeover !== "mirror") targets.push({ name: "video", box: heldBox, yScale: fs ? screenYScale(fs.height, fs.fullHeight) : 1 });
+      if (mirror !== null) {
+        const pic = mp && mp.id === heldTile.id && mp.banded && mp.h > 0 ? mp : null;
+        targets.push({ name: "mirror", box: mirror.box, yScale: pic ? shown(pic) / pic.h : 1 });
+      }
+    }
+    taps = { tileId: heldTile.id, session: heldTile.borrowed.session, targets, note };
+  }
   return {
     ...common,
     empty: null,
@@ -742,6 +812,7 @@ export function phonesView(inp: PhonesInput): PhonesView {
       ? phonesPlan({ state: s, phones, layout, dpr: inp.dpr, reducedMotion: inp.reducedMotion, noVideo: mirrorView === "mirror" ? heldTile!.id : null })
       : BLANK_PLAN(s, inp.dpr),
     mirror,
+    taps,
   };
 }
 
@@ -770,8 +841,10 @@ function panelOf(
       kind: "yours",
       session: b.session,
       countdown: `Returns in ${left} s`,
-      // the phone's own list: what its host carries out
-      actions: t.actions.map((name) => ({ name, label: ACTION_LABELS[name] ?? name.replace(/_/g, " "), disabled: !online || !running })),
+      // the phone's own list: what its host carries out (a tap is a click on the screen, not a button)
+      actions: t.actions
+        .filter((name) => name !== TAP)
+        .map((name) => ({ name, label: ACTION_LABELS[name] ?? name.replace(/_/g, " "), disabled: !online || !running })),
       giveBack: "Give it back",
       views: TAKEOVER_VIEWS.map((v) => ({ ...v, pressed: v.name === takeover, disabled: mirrorUnavailable !== null && v.name !== "video" })),
       viewsNote: mirrorUnavailable,
@@ -787,7 +860,7 @@ function panelOf(
     borrow = {
       kind: "free",
       button: { label: "Take over this phone", disabled: !online },
-      note: `Fixed actions only, for ${fmt.span(phones.claim_secs * 1000)}. ${phones.borrow.lent} of ${phones.borrow.cap} lent now.`,
+      note: `${t.actions.includes(TAP) ? "Fixed actions, and taps on the screen in Robot Park" : "Fixed actions only"}, for ${fmt.span(phones.claim_secs * 1000)}. ${phones.borrow.lent} of ${phones.borrow.cap} lent now.`,
     };
   }
   const g = t.gpu;

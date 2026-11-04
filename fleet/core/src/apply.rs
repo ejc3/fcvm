@@ -770,7 +770,11 @@ fn intent_effect(
             release_phone(&mut state.fleet, n, at);
             Ok("release phone".into())
         }
-        Intent::PhoneAction { claim, action } => phone_action(state, c, claim.as_deref(), *action),
+        Intent::PhoneAction {
+            claim,
+            action,
+            point,
+        } => phone_action(state, c, claim.as_deref(), *action, *point),
         Intent::PhonesZoom { out } => phones_zoom(state, c, *out),
         Intent::ReleaseGpu { claim } => {
             let n = own_claim(&state.fleet, c.viewer).ok_or("this viewer holds no GPU")?;
@@ -1168,7 +1172,12 @@ fn tick(state: &mut State, at: u64) {
     for s in f.phones.values_mut() {
         if let Some(p) = s.phone.as_mut() {
             p.actions.retain(|a| {
-                at < a.at + crate::phone::ACTION_KEEP_MS && a.generation == s.generation
+                let keep = if a.action == crate::phone::PhoneAction::Tap {
+                    crate::phone::TAP_KEEP_MS
+                } else {
+                    crate::phone::ACTION_KEEP_MS
+                };
+                at < a.at + keep && a.generation == s.generation
             });
         }
     }
@@ -1875,6 +1884,7 @@ fn claim_phone(state: &mut State, c: &Ctx, want: Option<&str>) -> Result<String,
         claimed_at: at,
         expires_at: at + cfg.phone_claim_secs * 1000,
         last_action_at: None,
+        last_tap_at: None,
     });
     Ok(format!("{session} on {}", slot.id))
 }
@@ -1909,7 +1919,9 @@ fn phone_action(
     c: &Ctx,
     claim: Option<&str>,
     action: crate::phone::PhoneAction,
+    point: Option<crate::phone::TapPoint>,
 ) -> Result<String, String> {
+    use crate::phone::{Front, PhoneAction};
     let at = c.at;
     let f = &mut state.fleet;
     let n = own_phone(f, c.viewer).ok_or("phone actions need a phone of your own (claim_phone)")?;
@@ -1924,29 +1936,65 @@ fn phone_action(
         ));
     }
     let slot = f.phones.get_mut(&n).unwrap();
+    let generation = slot.generation;
+    let running = slot.observed.phase == "running" && slot.observed.generation >= generation;
     let p = slot.phone.as_mut().unwrap();
+    let front = p.front(generation);
     let k = p.claim.as_mut().unwrap();
-    if let Some(last) = k.last_action_at {
-        let next = last + crate::phone::ACTION_INTERVAL_MS;
-        if at < next {
-            return Err(format!("one action a second; wait {} ms", next - at));
+    if action == PhoneAction::Tap {
+        // A touch is for the screen the viewer sees: Robot Park in front, on a running phone.
+        if !running {
+            return Err(format!("{} is not running", slot.id));
         }
+        if front == Front::Browser {
+            return Err(format!(
+                "taps reach the phone only in Robot Park; {} shows the browser",
+                slot.id
+            ));
+        }
+        if let Some(last) = k.last_tap_at {
+            let next = last + crate::phone::TAP_INTERVAL_MS;
+            if at < next {
+                return Err(format!(
+                    "one tap every {} ms; wait {} ms",
+                    crate::phone::TAP_INTERVAL_MS,
+                    next - at
+                ));
+            }
+        }
+        k.last_tap_at = Some(at);
+    } else {
+        if let Some(last) = k.last_action_at {
+            let next = last + crate::phone::ACTION_INTERVAL_MS;
+            if at < next {
+                return Err(format!("one action a second; wait {} ms", next - at));
+            }
+        }
+        k.last_action_at = Some(at);
     }
-    k.last_action_at = Some(at);
     let session = k.session.clone();
-    if action == crate::phone::PhoneAction::RebootPhone {
+    if action == PhoneAction::RebootPhone {
         // A reboot restores the phone's VM, timed like any relaunch.
         bump(slot, &format!("reboot:{session}"), at);
         return Ok(format!("reboot {}", slot.id));
+    }
+    match action.front_after() {
+        Some(Front::Browser) => p.browser_generation = Some(generation),
+        Some(Front::App) => p.browser_generation = None,
+        None => {}
     }
     f.phone_action_seq += 1;
     p.actions.push(crate::phone::PhoneActionReq {
         seq: f.phone_action_seq,
         action,
         at,
-        generation: slot.generation,
+        generation,
+        point,
     });
-    Ok(format!("{} on {}", action.as_str(), slot.id))
+    Ok(match point {
+        Some(t) => format!("tap at {:.3}, {:.3} on {}", t.x, t.y, slot.id),
+        None => format!("{} on {}", action.as_str(), slot.id),
+    })
 }
 
 /// The shared zoom: a chrome key every phone draws from a scene time a little ahead, so all

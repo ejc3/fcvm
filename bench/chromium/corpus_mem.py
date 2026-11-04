@@ -46,7 +46,7 @@ import time
 import uuid
 
 import host_resource_finalizer
-from reqbench import snapshot_generation, valid_snapshot_name
+from reqbench import host_facts, host_identity, snapshot_generation, valid_snapshot_name
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPORT = os.path.join(HERE, "report.py")
@@ -1901,6 +1901,11 @@ def main_with_resources(resources):
         len(args.urls))
     meta = {"run_id": args.run_id, "started": time.time(), "loadavg1_at_start": la,
             "host_kernel": os.uname().release, "machine": os.uname().machine,
+            # The boot and the instance type (never the host name), as every
+            # serial run's meta line records them, so a campaign can show its
+            # memory phase ran on the same boot as its serial runs.
+            "host_boot_sha256": host_identity()["host_boot_sha256"],
+            "host": host_facts(),
             "source_revision": args.source_revision,
             "runtime_bundle_sha256": args.runtime_bundle_sha256,
             "corpus_extra_runtime_bundle_sha256":
