@@ -412,7 +412,7 @@ async fn check_container_running(
         "fcvm-container".into(),
     ]);
 
-    let child = match tokio::process::Command::new(&exe)
+    let child = match health_exec_command(&exe)
         .args(&cmd_args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -458,6 +458,35 @@ async fn check_container_running(
     running == "true"
 }
 
+/// The command the health monitor runs `fcvm exec` with: killed when its
+/// handle drops (a timed-out check), and killed by the kernel when the thread
+/// that spawned it exits (`PR_SET_PDEATHSIG`). A SIGKILLed fcvm drops nothing,
+/// so without the second an exec in flight outlived its VM, reparented, and
+/// spent its whole connect retry budget (about 54 s) on a socket that would
+/// never answer (#1496). The monitor spawns from the runtime's worker threads,
+/// which live as long as the fcvm process.
+fn health_exec_command(exe: &std::path::Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(exe);
+    command.kill_on_drop(true);
+    // SAFETY: getpid() before the fork; in the child only async-signal-safe
+    // calls (prctl, getppid) run before exec.
+    let parent = unsafe { libc::getpid() };
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The parent died between the fork and the prctl: no signal will
+            // come, so leave now.
+            if libc::getppid() != parent {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+    command
+}
+
 /// Check podman healthcheck status by exec'ing into VM.
 ///
 /// Returns:
@@ -497,7 +526,7 @@ async fn check_podman_healthcheck(
         "fcvm-container".into(),
     ]);
 
-    let child = match tokio::process::Command::new(&exe)
+    let child = match health_exec_command(&exe)
         .args(&cmd_args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -585,7 +614,7 @@ async fn run_podman_healthcheck(pid: u32, username: Option<&str>, user_spec: Opt
         "fcvm-container".into(),
     ]);
 
-    let child = match tokio::process::Command::new(&exe)
+    let child = match health_exec_command(&exe)
         .args(&cmd_args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1335,6 +1364,62 @@ fn build_nsenter_curl_args(
 
 #[cfg(test)]
 mod tests {
+
+    /// A health-check exec dies with the thread that spawned it, without its
+    /// handle being dropped, as when fcvm is SIGKILLed. The handle is leaked so
+    /// `kill_on_drop` cannot be what ends it.
+    ///
+    /// RED BEFORE THE FIX (#1496): the child outlived the thread and was still
+    /// running after 5 s.
+    #[test]
+    fn a_health_exec_child_dies_with_the_thread_that_spawned_it() {
+        let pid = std::thread::spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let child = health_exec_command(std::path::Path::new("/bin/sleep"))
+                    .arg("30")
+                    .spawn()
+                    .unwrap();
+                let pid = child.id().unwrap() as libc::pid_t;
+                std::mem::forget(child);
+                pid
+            })
+        })
+        .join()
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut status = 0;
+        let reaped = loop {
+            // SAFETY: waitpid on our own child with a valid out-pointer.
+            let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if waited == pid {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        if !reaped {
+            // SAFETY: kill and reap the child this test started.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+            }
+        }
+        assert!(
+            reaped,
+            "the health exec child outlived the thread that spawned it"
+        );
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+            "status {status:#x}"
+        );
+    }
+
     use super::*;
 
     /// The container-ready file round-trips both start notifications, a missing file
