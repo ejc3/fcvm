@@ -458,12 +458,14 @@
         "asleep_since": 620200,
         "hosts": [],
         "idle_since": 500300,
+        "last_arrival_at": 500100,
         "last_wake": {
           "awake_at": 481000,
           "gpus": 4,
           "ms": 81000,
           "started_at": 400000
         },
+        "sleep_without_arrival_at": 4100100,
         "state": "asleep",
         "wakes": [
           {

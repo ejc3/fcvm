@@ -47,7 +47,7 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
       gpus: tiles.length,
       n: cols * rows,
       max_tiles: 100,
-      power: { state: "awake", asleep_since: null, woke_at: null, hosts: [], last_wake: null, wakes: [] },
+      power: { state: "awake", asleep_since: null, woke_at: null, last_arrival_at: null, sleep_without_arrival_at: null, hosts: [], last_wake: null, wakes: [] },
     },
     borrow: { cap: 2, lent: 0, next_return_at: null },
     failures: [],

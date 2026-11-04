@@ -57,6 +57,26 @@ test("shows the four phones seamless: one picture, every phone drawn at the comm
   expect(shot.pixels.some((px) => px[0] + px[1] + px[2] > 60)).toBe(true);
 });
 
+test("asleep: the wall's sleep card with its Wake button, and a click wakes the fleet", async ({ page }) => {
+  const power = async () => ((await mockState()).state as unknown as { fleet: { power: { state: string } } }).fleet.power.state;
+  await openPhones(page);
+  // Held asleep, as the coordinator holds a fleet nobody new has arrived at for an hour.
+  await admin("/mock/power", { sleep: true, hold: true });
+  try {
+    const card = page.getByTestId("sleep-card");
+    await expect(card).toContainText("Asleep.");
+    await page.waitForTimeout(500);
+    expect(await power()).toBe("asleep");
+    await card.getByTestId("wake").click();
+    await expect(card).toContainText(/WAKING (\d+ GPUs|THE GPUs)/);
+    await expect.poll(power, { timeout: 20_000 }).toBe("awake");
+    await expect(card).toHaveCount(0);
+  } finally {
+    await admin("/mock/power", { wake: true });
+    await expect.poll(power, { timeout: 20_000 }).toBe("awake");
+  }
+});
+
 test("the wall at / has no phones in it", async ({ page }) => {
   await page.goto("/?debug=1");
   await page.waitForFunction(() => window.__fleet !== undefined);

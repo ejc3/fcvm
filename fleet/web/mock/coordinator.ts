@@ -280,8 +280,13 @@ export class MockCoordinator {
   private rendering = new Set<string>();
   /** The GPUs each side had when the fleet went to sleep; they join again as the fleet wakes. */
   private slept: { fcvm: number[]; ec2: number } | null = null;
-  /** Tests: stay asleep whoever watches. */
+  /**
+   * Tests: stay asleep whoever watches, as the coordinator does once nobody new has arrived
+   * for an hour. A `wake` lifts it.
+   */
   private holdAsleep = false;
+  /** The last arrival: a page connecting for the first time (no ticket, not returning) or a `wake`. */
+  private lastArrivalAt: number | null = null;
   private idleSince: number | null = null;
   /** The schedule's next beat, kept while the fleet sleeps. */
   private sleptRaceAt: number | null = null;
@@ -427,7 +432,8 @@ export class MockCoordinator {
         n: this.tiles.length,
         max_tiles: 100,
         standby: [],
-        power: this.power,
+        // The mock does not run the hour without a new viewer by itself (tests put it to sleep).
+        power: { ...this.power, last_arrival_at: this.lastArrivalAt, sleep_without_arrival_at: null },
       },
       borrow: {
         cap: this.opts.borrowCap,
@@ -527,7 +533,12 @@ export class MockCoordinator {
         client.visible = m["visible"] === true;
         this.markDirty();
       } else if (m["type"] === "seat") {
-        // The mock seats every page; the ticket is not checked.
+        // The mock seats every page; the ticket is not checked. A page with neither a ticket
+        // nor a reconnect to report arrives.
+        if (typeof m["ticket"] !== "string" && m["returning"] !== true) {
+          this.lastArrivalAt = this.now();
+          this.markDirty();
+        }
       } else if (m["type"] === "verify") {
         const ok = this.sitekey === null || m["token"] === "mock-pass";
         if (ok) client.verified = true;
@@ -624,6 +635,13 @@ export class MockCoordinator {
         if (r.phase !== "running") return this.refuse(c, `${r.id} is not running`);
         this.relaunch(r, c.viewer, 0);
         return this.committed(c, `relaunch ${r.slot}`);
+      }
+      case "wake": {
+        // An arrival: it wakes a fleet held asleep.
+        this.lastArrivalAt = this.now();
+        this.holdAsleep = false;
+        this.wake();
+        return this.committed(c, "wake");
       }
       case "restart_now": {
         if (this.raceRunning()) return this.refuse(c, "a restart of every GPU is already running");

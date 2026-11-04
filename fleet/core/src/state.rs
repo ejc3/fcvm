@@ -64,6 +64,10 @@ pub struct Config {
     pub power_managed: bool,
     #[serde(default = "ten_minutes")]
     pub idle_scale_down_secs: u64,
+    /// With power management, the fleet also sleeps when no viewer has arrived for this
+    /// long (`Power::last_arrival_at`), even while viewers stay connected. 0: never.
+    #[serde(default = "one_hour")]
+    pub sleep_without_new_viewer_secs: u64,
     /// The coordinator writes each launch's DNS names and a tile's frame URLs are its
     /// published names (`Slot::published`), not the URL its agent reported.
     #[serde(default)]
@@ -86,6 +90,9 @@ pub struct Config {
 
 fn ten_minutes() -> u64 {
     600
+}
+fn one_hour() -> u64 {
+    3600
 }
 fn two_minutes() -> u64 {
     120
@@ -142,6 +149,10 @@ pub struct Power {
     pub woke_at: Option<u64>,
     pub hosts: BTreeMap<String, HostWake>,
     pub wakes: VecDeque<Wake>,
+    /// The last arrival: a new viewer connection (not a page reconnecting) or a connected
+    /// page's `wake`. A state that records none counts from the coordinator's start.
+    #[serde(default)]
+    pub last_arrival_at: Option<u64>,
 }
 
 impl Default for Power {
@@ -153,6 +164,7 @@ impl Default for Power {
             woke_at: None,
             hosts: BTreeMap::new(),
             wakes: VecDeque::new(),
+            last_arrival_at: None,
         }
     }
 }
@@ -193,6 +205,7 @@ impl Default for Config {
             max_borrowed: None,
             power_managed: false,
             idle_scale_down_secs: 600,
+            sleep_without_new_viewer_secs: 3600,
             names_published: false,
             phone_claim_secs: 120,
             phone_claim_cooldown_secs: 60,
@@ -675,7 +688,10 @@ impl State {
                 released_reports: BTreeMap::new(),
                 hidden: Default::default(),
                 warming: Default::default(),
-                power: Power::default(),
+                power: Power {
+                    last_arrival_at: Some(now_ms),
+                    ..Power::default()
+                },
                 budget: Default::default(),
                 ec2_aggregate_published: None,
                 phones: BTreeMap::new(),
@@ -709,6 +725,9 @@ impl State {
         f.viewers.clear();
         f.hidden.clear();
         f.degraded.clear();
+        // The hour without a new viewer runs on across a restart: the pages that reconnect
+        // to the new process are not arrivals.
+        f.power.last_arrival_at.get_or_insert(now_ms);
         // The EC2 aggregator's names were for the previous coordinator's addresses.
         f.ec2_aggregate_published = None;
         // A race interrupted by the restart cannot finish (its slots come back at
@@ -910,6 +929,24 @@ mod tests {
             resumed.fleet.hidden.is_empty(),
             "{:?}",
             resumed.fleet.hidden
+        );
+    }
+
+    #[test]
+    fn a_resumed_coordinator_keeps_the_last_arrival() {
+        // The pages that reconnect after a restart are not arrivals, so a restart must not
+        // start the hour again; a state from before arrivals were kept counts from the start.
+        let mut s = State::new(Config::default(), 1000);
+        s.fleet.power.last_arrival_at = Some(1500);
+        let resumed = s.clone().resumed(Config::default(), 9000);
+        assert_eq!(resumed.fleet.power.last_arrival_at, Some(1500));
+        s.fleet.power.last_arrival_at = None;
+        assert_eq!(
+            s.resumed(Config::default(), 9000)
+                .fleet
+                .power
+                .last_arrival_at,
+            Some(9000)
         );
     }
 }

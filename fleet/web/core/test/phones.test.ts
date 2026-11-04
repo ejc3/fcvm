@@ -249,6 +249,21 @@ describe("what a phone says about its restore", () => {
   });
 });
 
+describe("asleep", () => {
+  it("shows the wall's sleep card with its Wake button, and none while awake", () => {
+    expect(phonesView(input(stateWith(phonesOf(2)))).sleep).toBeNull();
+    const s = stateWith(phonesOf(2));
+    const st = s.accepted!;
+    const asleep = reduce(s, {
+      type: "message",
+      text: snapshotText(2, { ...st, fleet: { ...st.fleet, power: { ...st.fleet.power, state: "asleep", asleep_since: EPOCH - 1000 } } }),
+      at: EPOCH,
+    });
+    const v = phonesView(input(asleep));
+    expect(v.sleep).toMatchObject({ state: "asleep", title: "Asleep.", wake: { label: "Wake", disabled: false } });
+  });
+});
+
 describe("the draw plan", () => {
   it("streams each placed phone into its own box with no image, and draws the others dark", () => {
     const p = phonesOf(3);
@@ -583,6 +598,8 @@ describe("taps on the held phone's screen", () => {
       if (m.type !== "snapshot") throw new Error("not a snapshot");
       return m.state.phones!.tiles.map((t) => t.front);
     };
+    expect(read()).toEqual(["app", "app"]);
+    for (const t of state.phones.tiles) delete t["front"];
     expect(read()).toEqual([null, null]);
     state.phones.tiles[0]!["front"] = "browser";
     state.phones.tiles[1]!["front"] = "app";

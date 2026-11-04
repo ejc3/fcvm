@@ -391,6 +391,8 @@ a.icon-btn { text-decoration: none; }
 .lower-third .partial .mark { border-color: var(--fcvm); }
 .lower-third .done .label, .lower-third .partial .label { color: var(--text); }
 .lower-third .v { font: 500 14px var(--mono); color: var(--text); }
+/* The overlay layer lets the pointer through; the Wake button takes it. */
+.lower-third .wake { pointer-events: auto; min-width: 120px; justify-content: center; }
 .phone .lower-third { margin: 0 16px; padding: 10px 12px; gap: 8px; }
 .phone .lower-third .dots { gap: 8px 12px; }
 .phone .lower-third .dots li { min-width: 0; }

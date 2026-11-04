@@ -93,6 +93,9 @@ describe(`the coordinator's snapshot states (#1146 at ${fixture.source.commit})`
     const power = parse(fixture.views["20_power"]!).fleet.power;
     expect(power.wakes).toEqual([{ started_at: 400_000, awake_at: 481_000, gpus: 4 }]);
     expect(wakeMedianMs(power)).toBe(81_000);
+    // The last arrival and when the hour without one runs out, under the coordinator's names.
+    const arrivals = parse(fixture.views["31_no_new_viewer"]!).fleet.power;
+    expect([arrivals.last_arrival_at, arrivals.sleep_without_arrival_at]).toEqual([2_200_000, 3_200_000]);
   });
 
   it("the page sends only intents the coordinator knows", () => {

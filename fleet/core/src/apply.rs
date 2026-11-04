@@ -188,9 +188,17 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 }),
             })
         }
-        Event::ViewerJoined { viewer, client, .. } => {
+        Event::ViewerJoined {
+            viewer,
+            client,
+            returning,
+            ..
+        } => {
             let key = client_key(viewer, client.as_deref()).to_string();
             state.fleet.viewers.insert(viewer.clone(), key);
+            if !returning {
+                state.fleet.power.last_arrival_at = Some(at);
+            }
             None
         }
         Event::Visibility {
@@ -485,14 +493,18 @@ fn image_complete(f: &Fleet) -> bool {
             .all(|s| running(s) || s.observed.phase == "waiting_capacity")
 }
 
-/// Sleep after `idle_scale_down_secs` with no active viewer (never during a claim or a
-/// race), wake on an active viewer, and be awake once the image is complete.
+/// Sleep after `idle_scale_down_secs` with no active viewer, or once no viewer has arrived
+/// for `sleep_without_new_viewer_secs` (never during a claim or a race); wake on an active
+/// viewer while a viewer has arrived within that limit, and be awake once the image is
+/// complete.
 fn power_step(state: &mut State, at: u64) {
     if !state.config.power_managed {
         return;
     }
     let idle_ms = state.config.idle_scale_down_secs * 1000;
     let interval = state.config.race_interval_secs;
+    let no_arrival = crate::view::no_arrival_deadline(&state.fleet.power, &state.config)
+        .is_some_and(|t| at >= t);
     let f = &mut state.fleet;
     let active = f.viewers.keys().filter(|v| !f.hidden.contains(*v)).count();
     if active > 0 {
@@ -500,10 +512,12 @@ fn power_step(state: &mut State, at: u64) {
     } else {
         f.power.idle_since.get_or_insert(at);
     }
-    let claims = f.slots.values().any(|s| s.claim.is_some());
+    let claims = f.slots.values().any(|s| s.claim.is_some())
+        || f.phones.values().any(|s| phone_claim(s).is_some());
     let racing = race_running(f);
     if f.power.state == "asleep" {
-        if active > 0 {
+        // Connected pages do not wake it once the limit has run out: an arrival does.
+        if active > 0 && !no_arrival {
             f.power.state = "waking".into();
             f.power.woke_at = Some(at);
             f.power.asleep_since = None;
@@ -511,8 +525,8 @@ fn power_step(state: &mut State, at: u64) {
         }
         return;
     }
-    let idle = f.power.idle_since.is_some_and(|t| at >= t + idle_ms);
-    if active == 0 && idle && !claims && !racing {
+    let idle = active == 0 && f.power.idle_since.is_some_and(|t| at >= t + idle_ms);
+    if (idle || no_arrival) && !claims && !racing {
         f.power.state = "asleep".into();
         f.power.asleep_since = Some(at);
         f.power.woke_at = None;
@@ -678,6 +692,16 @@ fn intent_effect(
             f.last_relaunch_at.insert(c.client.to_string(), at);
             Ok(summary)
         }
+        Intent::Wake => {
+            if !state.config.power_managed {
+                return Err("this fleet does not sleep".into());
+            }
+            if !state.fleet.viewers.contains_key(c.viewer) {
+                return Err("only a connected page can wake the fleet".into());
+            }
+            state.fleet.power.last_arrival_at = Some(at);
+            Ok("wake".into())
+        }
         Intent::RestartNow => {
             if state.fleet.power.state == "asleep" {
                 return Err("the GPUs are asleep".into());
@@ -761,6 +785,11 @@ fn intent_effect(
                 f.light_owners.remove(0);
             }
             Ok("light".into())
+        }
+        // Asleep with pages still connected (no new viewer for the limit), a claim would hold
+        // a GPU the fleet is not running and keep nothing awake: refuse it, as restart_now.
+        Intent::ClaimGpu | Intent::ClaimPhone { .. } if state.fleet.power.state == "asleep" => {
+            Err("the GPUs are asleep".into())
         }
         Intent::ClaimGpu => claim(state, c),
         Intent::ClaimPhone { phone } => claim_phone(state, c, phone.as_deref()),

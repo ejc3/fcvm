@@ -1625,8 +1625,18 @@ the coordinator scales the GPU host groups to zero and terminates the EC2 tiles;
 coordinator stays up (about $18 a month). The first viewer to arrive wakes the fleet: the
 page shows the poster frame and "Waking up the GPUs" with a live clock and the real wake
 phases, and the measured wake time (first viewer to complete image) is recorded. The fleet
-never sleeps during a race or a "Your own GPU" session. Running cost is then about $5 an hour
+never sleeps during a race, a "Your own GPU" session or a borrowed phone. Running cost is then about $5 an hour
 while anyone watches (one g4dn.metal at current spot prices, plus EC2 tiles while they run).
+
+**Open tabs alone do not keep it awake (2026-11-04).** The owner: "If no new viewers come in
+an hour that should shut things down." Staging had stayed awake for hours on GPU hosts and
+tiles because tabs left open counted as active viewers. So the fleet also sleeps
+after an hour (`--sleep-without-new-viewer`, default 3600 s) with no arrival, even while
+viewers stay connected. An arrival is a new viewer connection or a connected page's Wake
+button (the `wake` intent); a page that reconnects or reloads presents its seat ticket and
+is not one (fleet/PROTOCOL.md, `fleet.power`). A page connected while the fleet sleeps shows
+the sleep card with a Wake button, on the wall and in phones mode. A claim or race in progress
+holds the fleet awake past the hour, and it sleeps when that ends.
 
 **The wake reel. DECIDED (2026-10-23).** While the fleet is asleep or waking, the stage plays a
 60 to 90 second screen recording of the real wall in use (real GPUs, real coordinator, real
