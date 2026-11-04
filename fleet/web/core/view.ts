@@ -809,6 +809,8 @@ export interface FocusView {
   placed: { box: Box; streamHeight: number } | null;
   /** Where it ends once zoomed (a phone's bottom sheet starts under it). */
   target: Box | null;
+  /** Broadcast mode, for a viewer without direct streams: the one line saying the picture is the broadcast's. */
+  broadcastNote: string | null;
 }
 
 /** The renderer's own resolution for one tile: what the viewer's own GPU asks for. */
@@ -866,6 +868,7 @@ function focusView(
   online: boolean,
   placed: { box: Box; streamHeight: number } | null,
   target: Box | null,
+  broadcast: "seated" | "late" | null,
 ): FocusView {
   const fs = s.frames?.tiles[`d:${t.id}`];
   const lr = t.last_relaunch;
@@ -880,8 +883,10 @@ function focusView(
         { label: "GPU busy", value: g.util_pct === null ? "--" : `${Math.round(g.util_pct)}%`, points: sparkline(history, "util_pct") },
       ]
     : [];
-  let streamTag = "no frames yet";
-  if (fs && fs.newestT !== null && placed) {
+  // In broadcast mode the broadcast is zoomed until the VM's own stream has a frame; a late viewer
+  // has no direct streams, so it keeps the broadcast's picture.
+  let streamTag = broadcast === "late" ? "the broadcast" : broadcast === "seated" ? "the broadcast, until its own stream arrives" : "no frames yet";
+  if (broadcast !== "late" && fs && fs.newestT !== null && placed) {
     const scale = (placed.box.h * input.dpr) / fs.height;
     streamTag = `${fs.height}p · ${Math.round(fs.fps)} fps · ${Math.abs(scale - 1) < 0.005 ? "native size" : `shown at ${Math.round(scale * 100)}%`}`;
   }
@@ -913,6 +918,7 @@ function focusView(
     readings,
     placed,
     target,
+    broadcastNote: broadcast === "late" ? "Direct streams are full, so this is the broadcast, scaled up." : null,
   };
 }
 
@@ -1074,6 +1080,12 @@ export interface ZoomDraw {
   /** Black over the rest of the image: `near` at the opened box's edge, rising to `far` at the stage's corners. */
   near: number;
   far: number;
+  /**
+   * Broadcast mode: the page shows the broadcast zoomed under the canvas, and the canvas only over
+   * the opened VM's box once its own stream has a frame there, so that first frame is drawn at once,
+   * with no fade.
+   */
+  overBroadcast: boolean;
 }
 
 /** A tile's own state, drawn the same way whatever stream its pixels came from. */
@@ -1534,7 +1546,7 @@ export function wallView(input: WallInput): WallView {
     banners,
     playButton: { label: "Direct the scene", open: s.ui.drawer, phoneLabel: "Direct the scene: write a word in the sky, drop a light" },
     pause: { label: s.ui.paused ? "Resume" : "Pause", on: s.ui.paused },
-    hint: watchesBroadcast(s) ? "This is the broadcast: write a word or drop a light from Direct the scene." : "Click a square to look at its VM.",
+    hint: watchesBroadcast(s) ? "This is the broadcast: click a square to look at its VM, or write a word or drop a light from Direct the scene." : "Click a square to look at its VM.",
     rotateHint: "Turn sideways for full screen",
   };
   if (!st) {
@@ -1587,10 +1599,12 @@ export function wallView(input: WallInput): WallView {
   const asleepFix = (tv: TileView) => (sleep && tv.dark ? { ...tv, dark: false, hatch: false } : tv);
   const tiles = shownTiles.map((t) => asleepFix(tileView(t, s, st, placedById.get(t.id)?.box ?? null, srvNow, pend)));
   const planViews = shownTiles === st.tiles ? tiles : st.tiles.map((t) => asleepFix(tileView(t, s, st, placedPlan.get(t.id)?.box ?? null, srvNow, pend)));
-  // Broadcast mode: one video of the whole wall; no VM opens, no GPU of one's own, no streams.
+  // Broadcast mode: one video of the whole wall; no GPU of one's own. An opened VM zooms the
+  // broadcast at once, and a viewer holding a direct token also opens that VM's own stream (and
+  // only that one); a late viewer has none, so its zoom stays on the broadcast.
   const broadcast = watchesBroadcast(s);
   const admit = s.admission?.direct?.value ?? null;
-  const focusTile = broadcast || s.ui.focusId === null ? null : st.tiles.find((t) => t.id === s.ui.focusId) ?? null;
+  const focusTile = s.ui.focusId === null ? null : st.tiles.find((t) => t.id === s.ui.focusId) ?? null;
   const own = broadcast ? null : ownView(s, st, srvNow, input);
 
   // A VM opened: the whole image zooms until that VM fills the stage, and the tiles around it
@@ -1609,7 +1623,10 @@ export function wallView(input: WallInput): WallView {
     return b && zArea && boxesMeet(b, zArea) ? b : null;
   };
   const focusPlaced = zoom?.focus && focusTile && zoom.focus.id === focusTile.id ? { box: zoom.focus.box, streamHeight: detailHeight ?? zoom.focus.streamHeight } : null;
-  const focus = focusTile ? focusView(s, tiles.find((x) => x.id === focusTile.id)!, focusTile, input, srvNow, online, focusPlaced, opening && zArea ? zoomTarget(zArea, opening.rect, st.image_aspect, insets) : null) : null;
+  const focusBroadcast = broadcast ? (admit === null ? "late" : "seated") : null;
+  const focus = focusTile
+    ? focusView(s, tiles.find((x) => x.id === focusTile.id)!, focusTile, input, srvNow, online, focusPlaced, opening && zArea ? zoomTarget(zArea, opening.rect, st.image_aspect, insets) : null, focusBroadcast)
+    : null;
   const covered = focus !== null || own !== null || zoom !== null;
 
   // Direct: each tile asks for the device pixels it covers. With the viewer's own GPU on screen
@@ -1658,24 +1675,27 @@ export function wallView(input: WallInput): WallView {
     const c = s.own.claim;
     focusSource = { id: `o:${c.id}`, url: frameSocketUrl(claimUrl, own.placed.streamHeight, "std"), baseUrl: claimUrl, height: own.placed.streamHeight, box: own.placed.box, admit };
   }
+  // Broadcast mode streams only the opened VM, and only while it is open and this viewer holds a direct token.
+  const shownDirect = broadcast ? direct.filter((d) => admit !== null && focusTile !== null && d.id === `d:${focusTile.id}`) : direct;
   let zoomDraw: ZoomDraw | null = null;
   if (zoom) {
-    const src = zoomed ? direct.find((d) => d.id === `d:${zoomed.id}`) : undefined;
+    const src = zoomed ? shownDirect.find((d) => d.id === `d:${zoomed.id}`) : undefined;
     zoomDraw = {
       box: zoomed?.box ?? null,
       source: src && zoomed ? { ...src, box: zoomed.box } : null,
       near: ZOOM_DIM_NEAR * zoom.dim,
       far: ZOOM_DIM_FAR * zoom.dim,
+      overBroadcast: broadcast,
     };
   }
   const plan: DrawPlan = {
     ...emptyPlan,
     // Aggregated only where the serving aggregates serve this viewer's family; otherwise direct.
-    // Broadcast mode streams nothing to the canvas: the video plays over it.
-    mode: aggregatedAvailable(st.aggregates, family) && s.ui.mode === "aggregated" ? "aggregated" : "direct",
-    direct: broadcast ? [] : direct,
+    // Broadcast mode streams nothing to the canvas but an opened VM's own stream: the video plays over it.
+    mode: !broadcast && aggregatedAvailable(st.aggregates, family) && s.ui.mode === "aggregated" ? "aggregated" : "direct",
+    direct: shownDirect,
     aggregated: broadcast ? [] : aggregated,
-    suspended: s.ui.suspended || broadcast,
+    suspended: s.ui.suspended || (broadcast && shownDirect.length === 0),
     focus: focusSource,
     zoom: zoomDraw,
     estimatedBps: fitted.bps,

@@ -991,6 +991,166 @@ test("a tile opened from a paused aggregated wall shows its own stream's frame a
   expect(later.err).toBeLessThan(TILE_ERR_MAX);
 });
 
+// ---- broadcast mode: an opened VM ----------------------------------------------------------
+
+const PLAYBACK_URL = "https://broadcast.example/playback.m3u8";
+
+/**
+ * The wall in broadcast mode, playing the tests' stand-in for the IVS player
+ * (fixtures/broadcast/ivs-player.js): every tile a flat colour, about 1.8 s behind. `late`: this
+ * viewer connected while the seats were full, so it holds no direct token.
+ */
+async function openBroadcast(page: Page, late: boolean): Promise<void> {
+  await admin("/mock/broadcast", { url: PLAYBACK_URL, late });
+  // The page loads the pinned player from IVS (Broadcast.tsx IVS_PLAYER_URL); the stand-in answers instead.
+  await page.route("https://player.live-video.net/**", (r) => r.fulfill({ path: "e2e/fixtures/broadcast/ivs-player.js", contentType: "text/javascript" }));
+  await page.addInitScript(() => window.localStorage.setItem("fleet-wall.mode", "broadcast"));
+  await page.goto("/?debug=1");
+  await page.waitForFunction(() => window.__fleet?.view().broadcast != null);
+  // A frame presented and matched to its SEI: the overlay follows the picture.
+  await expect(page.getByTestId("broadcast-latency")).toHaveText(/behind the fleet/, { timeout: 20_000 });
+}
+
+async function closeBroadcast(): Promise<void> {
+  await admin("/mock/broadcast", { url: null });
+}
+
+/** What the screen shows at each point (the video, the canvas, whatever is on top), read from a screenshot. */
+async function screenPixels(page: Page, points: { x: number; y: number }[]): Promise<[number, number, number][]> {
+  const png = (await page.screenshot()).toString("base64");
+  return page.evaluate(
+    async ({ png, points }) => {
+      const img = new Image();
+      img.src = `data:image/png;base64,${png}`;
+      await img.decode();
+      const c = new OffscreenCanvas(img.width, img.height);
+      const g = c.getContext("2d")!;
+      g.drawImage(img, 0, 0);
+      return points.map((p) => {
+        const d = g.getImageData(Math.floor(p.x), Math.floor(p.y), 1, 1).data;
+        return [d[0]!, d[1]!, d[2]!] as [number, number, number];
+      });
+    },
+    { png, points },
+  );
+}
+
+const colourOf = (page: Page, id: string) => page.evaluate((n) => (window as unknown as { __fakeBroadcast: { colorOf(id: string): [number, number, number] } }).__fakeBroadcast.colorOf(n), id);
+const near = (a: readonly number[], b: readonly number[], tol: number) => a.every((x, i) => Math.abs(x - b[i]!) <= tol);
+/**
+ * Points inside a box, 6 % in from its edges, above the stream tag in its bottom left corner and
+ * left of the details sheet (which covers the box's right side on a narrow screen).
+ */
+const inside = (b: { x: number; y: number; w: number; h: number }, vw: number) =>
+  [0.06, 0.5, 0.8]
+    .flatMap((fy) => [0.06, 0.3, 0.5, 0.94].map((fx) => ({ x: b.x + b.w * fx, y: b.y + b.h * fy })))
+    .filter((p) => p.x < vw - ZOOM_SHEET_W - 40);
+const zoomBox = (page: Page) => page.evaluate(() => window.__fleet!.view().plan.zoom?.box ?? null);
+
+test("broadcast mode: a click on a tile zooms the broadcast at once, then shows that VM's own stream, and Escape closes it", async ({ page }) => {
+  await openBroadcast(page, false);
+  try {
+    // The renderers accept no socket yet, so the zoom is seen on the broadcast alone first.
+    await admin("/mock/fault", { renderers_silent: true });
+    const t = await tileBox(page, "fcvm:3");
+    const clickAt = Date.now();
+    await page.mouse.click(t.x + t.w / 2, t.y + t.h / 2);
+    await expect(page.getByTestId("focus")).toBeVisible({ timeout: 1000 });
+    await expect(page.getByTestId("broadcast")).toHaveClass(/zoomed/, { timeout: 1000 });
+    const zoomMs = Date.now() - clickAt;
+    await expect.poll(() => page.evaluate(() => window.__fleet!.view().zoom?.dim ?? 0)).toBe(1);
+    await expect(page.getByTestId("frames")).toHaveAttribute("data-over-broadcast", "hidden");
+    await expect(page.getByTestId("focus-stream")).toHaveText("the broadcast, until its own stream arrives");
+    // The page asks for this VM's stream and no other.
+    expect(await page.evaluate(() => window.__fleet!.view().plan.direct.map((d) => d.id))).toEqual(["d:fcvm:3"]);
+    // The opened box shows the broadcast's picture of this tile, scaled up to fill it.
+    const box = (await zoomBox(page))!;
+    const c3 = await colourOf(page, "fcvm:3");
+    const px = await screenPixels(page, inside(box, page.viewportSize()!.width));
+    px.forEach((p, i) => expect(near(p, c3, 16), `point ${i}: ${p} against ${c3}`).toBe(true));
+    // Around it, the broadcast dimmed: a point just off the box on another tile, clear of the bar and the sheet.
+    const vp = page.viewportSize()!;
+    const candidates = [
+      { x: box.x + box.w / 4, y: box.y + box.h + 24 },
+      { x: box.x + box.w / 4, y: box.y - 24 },
+      { x: box.x - 24, y: box.y + box.h / 2 },
+    ];
+    const pick = await page.evaluate(
+      ({ pts, w }) => {
+        const L = window.__fleet!.view().zoom!.layout;
+        for (const p of pts) {
+          if (p.x < 0 || p.x > w - 420 || p.y < 80 || p.y > innerHeight - 1) continue;
+          const u = (p.x - L.image.x) / L.image.w;
+          const v = (p.y - L.image.y) / L.image.h;
+          const t = window.__fleet!.client.getState().accepted!.tiles.find((q) => u >= q.rect.x && u < q.rect.x + q.rect.w && v >= q.rect.y && v < q.rect.y + q.rect.h);
+          if (t && t.id !== "fcvm:3") return { p, id: t.id };
+        }
+        return null;
+      },
+      { pts: candidates, w: vp.width },
+    );
+    expect(pick).not.toBeNull();
+    const [around] = await screenPixels(page, [pick!.p]);
+    const neighbour = pick!.id;
+    const cn = await colourOf(page, neighbour);
+    const lum = (c: readonly number[]) => c[0]! + c[1]! + c[2]!;
+    expect(lum(around!)).toBeLessThan(lum(cn) * (1 - ZOOM_DIM_NEAR + 0.1));
+    expect(lum(around!)).toBeGreaterThan(lum(cn) * 0.05);
+
+    // Its own stream arrives: the canvas shows it in the box, over the broadcast.
+    const openAt = Date.now();
+    await admin("/mock/fault", { renderers_silent: false });
+    await expect(page.getByTestId("frames")).toHaveAttribute("data-over-broadcast", "zoom", { timeout: 20_000 });
+    const ownMs = Date.now() - openAt;
+    await expect.poll(async () => (await focusError(page, "fcvm:3")).shown, { timeout: 5_000 }).toMatch(/^sync@/);
+    const fe = await focusError(page, "fcvm:3");
+    expect(fe.err).toBeLessThan(TILE_ERR_MAX);
+    const box2 = (await zoomBox(page))!;
+    const pts = inside(box2, page.viewportSize()!.width);
+    const [shot, drawn] = await Promise.all([screenPixels(page, pts), page.evaluate((p) => window.__fleet!.client.capture(p), pts)]);
+    shot.forEach((p, i) => expect(near(p, drawn.pixels[i]!.slice(0, 3), 24), `point ${i}: screen ${p} against the canvas ${drawn.pixels[i]}`).toBe(true));
+    await expect(page.getByTestId("focus-stream")).toHaveText(/^\d+p · \d+ fps · (native size|shown at \d+%)$/);
+    console.log(`broadcast zoom: click to zoom ${zoomMs} ms, renderers open to own frame ${ownMs} ms`);
+
+    // Escape: the zoom closes and so does the stream.
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("focus")).toHaveCount(0);
+    await expect(page.getByTestId("frames")).toHaveAttribute("data-over-broadcast", "hidden");
+    expect(await page.evaluate(() => window.__fleet!.view().plan.direct)).toEqual([]);
+    await expect.poll(subscribers, { timeout: 10_000 }).toBe(0);
+  } finally {
+    await admin("/mock/fault", { renderers_silent: false });
+    await closeBroadcast();
+  }
+});
+
+test("broadcast mode, a late viewer: Enter on a tile zooms the broadcast, which stays, with a line saying so", async ({ page }) => {
+  await openBroadcast(page, true);
+  try {
+    expect((await page.evaluate(() => window.__fleet!.client.getState().admission))!.direct).toBeNull();
+    await page.locator('.key-grid button[tabindex="0"]').focus();
+    await expect(page.getByTestId("hover-outline")).toHaveAttribute("data-tile", "fcvm VM 1");
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("focus")).toBeVisible({ timeout: 1000 });
+    await expect(page.getByRole("heading", { name: "fcvm VM 1" })).toBeVisible();
+    await expect(page.getByTestId("focus-broadcast-note")).toHaveText("Direct streams are full, so this is the broadcast, scaled up.");
+    await expect(page.getByTestId("focus-stream")).toHaveText("the broadcast");
+    await expect.poll(() => page.evaluate(() => window.__fleet!.view().zoom?.dim ?? 0)).toBe(1);
+    await page.waitForTimeout(2000);
+    // No stream is opened: the box keeps the broadcast's picture of the tile.
+    expect(await page.evaluate(() => window.__fleet!.view().plan.direct)).toEqual([]);
+    expect(await subscribers()).toBe(0);
+    await expect(page.getByTestId("frames")).toHaveAttribute("data-over-broadcast", "hidden");
+    const c1 = await colourOf(page, "fcvm:1");
+    const px = await screenPixels(page, inside((await zoomBox(page))!, page.viewportSize()!.width));
+    px.forEach((p, i) => expect(near(p, c1, 16), `point ${i}: ${p} against ${c1}`).toBe(true));
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("focus")).toHaveCount(0);
+  } finally {
+    await closeBroadcast();
+  }
+});
+
 test("a paused picture survives frames arriving and a redraw: no tile goes dark", async ({ page }) => {
   await openWall(page, 15);
   await page.getByTestId("pause").click();

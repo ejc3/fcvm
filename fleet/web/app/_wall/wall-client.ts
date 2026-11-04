@@ -88,6 +88,12 @@ export class WallClient {
   /** The canvas has painted the poster or a frame. */
   painted = false;
   private paintedListeners = new Set<() => void>();
+  /**
+   * Broadcast mode: the opened VM's own stream drawn in its box (source id and base URL), and
+   * when the page heard so (performance.now()); null when none is.
+   */
+  zoomDrawn: { key: string; at: number } | null = null;
+  private zoomDrawnListeners = new Set<() => void>();
   /** The family probe's sockets while it runs; it settles once per page load. */
   private probe: WebSocket[] | null = null;
   /** Failed probes so far, and the timer for the next one. */
@@ -331,6 +337,11 @@ export class WallClient {
     this.ws.send(JSON.stringify({ type: "verify", token }));
   }
 
+  onZoomDrawn(fn: () => void): () => void {
+    this.zoomDrawnListeners.add(fn);
+    return () => this.zoomDrawnListeners.delete(fn);
+  }
+
   onPainted(fn: () => void): () => void {
     if (this.painted) fn();
     this.paintedListeners.add(fn);
@@ -383,6 +394,9 @@ export class WallClient {
         requestAnimationFrame(tick);
       } else if (m.type === "gen-shown") {
         this.dispatch({ type: "gen-shown", gen: m.gen });
+      } else if (m.type === "zoom-drawn") {
+        this.zoomDrawn = m.key === null ? null : { key: m.key, at: performance.now() };
+        for (const fn of this.zoomDrawnListeners) fn();
       } else if (m.type === "painted") {
         this.painted = true;
         for (const fn of this.paintedListeners) fn();

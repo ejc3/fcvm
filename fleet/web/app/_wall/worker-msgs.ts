@@ -78,4 +78,9 @@ export type FromWorker =
   /** The canvas shows something (the poster or a frame): the page's own poster can go. */
   | { type: "painted" }
   /** The drawer swapped to this layout generation. */
-  | { type: "gen-shown"; gen: number };
+  | { type: "gen-shown"; gen: number }
+  /**
+   * Broadcast mode: the opened VM's own stream (`key`: its source id and base URL) has drawn a
+   * frame in its box, so the page can show the canvas there; null when no such frame is drawn.
+   */
+  | { type: "zoom-drawn"; key: string | null };

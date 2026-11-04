@@ -170,13 +170,44 @@ describe("the page in broadcast mode", () => {
     }
   });
 
-  it("keeps the scene's inputs and drops the VM controls", () => {
+  it("keeps the scene's inputs", () => {
     const late = withSnapshots(admission(LATE), [fleet()]);
-    const v = view({ ...late, ui: { ...late.ui, focusId: late.accepted!.tiles[0]!.id } });
-    expect(v.focus).toBeNull();
+    const v = view(late);
     expect(v.play!.word.label).not.toBe("");
     expect(v.play!.light.label).not.toBe("");
     expect(v.play!.disabled).toBe(false);
+  });
+
+  it("opens a VM for a late viewer from the broadcast alone, and says so", () => {
+    const late = withSnapshots(admission(LATE), [fleet()]);
+    const id = late.accepted!.tiles[0]!.id;
+    const v = view({ ...late, ui: { ...late.ui, focusId: id } });
+    expect(v.focus?.id).toBe(id);
+    expect(v.focus!.broadcastNote).toContain("Direct streams are full");
+    expect(v.focus!.streamTag).toBe("the broadcast");
+    expect(v.zoom?.focus?.id).toBe(id);
+    expect(v.plan.zoom).toMatchObject({ overBroadcast: true, source: null });
+    expect(v.plan.direct).toEqual([]);
+    expect(v.plan.suspended).toBe(true);
+    expect(v.broadcast?.url).toBe(PLAYBACK);
+  });
+
+  it("opens a VM for a seated viewer over the broadcast with that VM's own stream, and only that one", () => {
+    const seated = withSnapshots(admission(), [fleet()]);
+    const ui = { ...seated.ui, mode: "broadcast" as const };
+    const closed = view({ ...seated, ui });
+    expect(closed.plan.direct).toEqual([]);
+    expect(closed.plan.suspended).toBe(true);
+    const id = seated.accepted!.tiles[0]!.id;
+    const v = view({ ...seated, ui: { ...ui, focusId: id } });
+    expect(v.broadcast?.url).toBe(PLAYBACK);
+    expect(v.plan.direct.map((d) => d.id)).toEqual([`d:${id}`]);
+    expect(v.plan.direct[0]!.admit).toBe("v1.9999999999.v-1.mac");
+    expect(v.plan.suspended).toBe(false);
+    expect(v.plan.zoom).toMatchObject({ overBroadcast: true, source: { id: `d:${id}` } });
+    expect(v.plan.zoom!.source!.box).toEqual(v.plan.zoom!.box);
+    expect(v.focus!.broadcastNote).toBeNull();
+    expect(v.focus!.streamTag).toBe("the broadcast, until its own stream arrives");
   });
 
   it("gives a seated viewer's direct streams its token", () => {
