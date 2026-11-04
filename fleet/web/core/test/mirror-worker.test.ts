@@ -183,12 +183,29 @@ describe("the mirror worker", () => {
     // incompressible bytes, so each message is about 1 MiB on the wire; all arrive before the
     // decoder has run once
     const { z, msg } = streamer();
+    // a live stream: past its opening records (no join), so the live bound applies
+    ws.message(await msg(Buffer.concat([opening(), encodeRecord(RECORD.data, 1, encodeCall("glFlush", []))])));
+    await settle();
     const noise = new Uint8Array(1 << 20).map(() => Math.floor(Math.random() * 256));
     const m = await msg(noise);
     expect(m.length).toBeGreaterThan(1 << 20);
     for (let i = 0; i < 17; i++) ws.message(m);
     expect(closes()).toEqual([{ type: "closed", code: 4000, reason: "the mirror fell behind in this browser: join again" }]);
     expect(ws.closed).toBe(true);
+    z.close();
+  });
+
+  it("lets a join past the 16 MiB bound before the decoder has fed its BEGIN", async () => {
+    const send = await worker();
+    send({ type: "open", url: "wss://phone/mirror", admit: "t" });
+    const ws = FakeSocket.all[0]!;
+    const { z, msg } = streamer();
+    // everything arrives before the decoder has run once: nothing is decoded yet
+    const noise = new Uint8Array(1 << 20).map(() => Math.floor(Math.random() * 256));
+    const m = await msg(noise);
+    for (let i = 0; i < 17; i++) ws.message(m);
+    expect(closes()).toEqual([]);
+    expect(ws.closed).toBe(false);
     z.close();
   });
 

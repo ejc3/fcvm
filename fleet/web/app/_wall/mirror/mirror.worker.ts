@@ -23,13 +23,17 @@ let pendingBytes = 0;
 /** A viewer that receives faster than it replays drops the stream past this, and joins again. */
 const MAX_PENDING_BYTES = 16 << 20;
 /**
- * While a join snapshot is being fed (its BEGIN decoded, its END not yet: every color buffer's
- * pixels and the GL state, tens of MB compressed) the bound is this one: the streamer queues
- * the snapshot apart from its live bound too.
+ * Until the join snapshot has been fed (every color buffer's pixels and the GL state, tens of
+ * MB compressed) the bound is this one: the streamer queues the snapshot apart from its live
+ * bound too, and starts every stream with one.
  */
 const MAX_JOIN_PENDING_BYTES = 256 << 20;
-/** A join snapshot's BEGIN has been fed and its END has not. */
-let joining = false;
+/**
+ * From the open until the join's END, or the first live record of a stream with no join:
+ * while the decoder starts, nothing of the stream has been decoded yet, and it begins with
+ * the join.
+ */
+let joining = true;
 let reader = new RecordReader();
 let zstd: Promise<ZstdStream> | null = null;
 /** zstd messages waiting for the decoder, in order. */
@@ -66,7 +70,7 @@ function fresh(): void {
   tapBytes = 0;
   decodeMs.reset();
   joined = false;
-  joining = false;
+  joining = true;
   pixel = null;
   stampAt = null;
   // the canvas is preserved between posts, so its centre can be read after one
