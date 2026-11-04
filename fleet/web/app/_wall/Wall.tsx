@@ -842,7 +842,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
           </span>
         ) : null}
       </div>
-      {phone ? null : <ModeSwitch current="wall" />}
+      {phone ? null : <ModeSwitch current="wall" stream={view.streamMode} onStream={view.play ? (el) => openDrawer("play", el) : undefined} />}
     </div>
   );
 
@@ -923,7 +923,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
           ) : null}
           {info}
           {/* The title's line has no room on a phone and the image stays at the top, so the switch sits under the image. */}
-          <ModeSwitch current="wall" />
+          <ModeSwitch current="wall" stream={view.streamMode} onStream={view.play ? (el) => openDrawer("play", el) : undefined} />
           <p className="rotate-hint" data-testid="rotate-hint">
             {view.rotateHint}
           </p>

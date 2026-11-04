@@ -1180,6 +1180,21 @@ test("broadcast mode, a late viewer: Enter on a tile zooms the broadcast, which 
   }
 });
 
+test("beside Wall / Phones, the header says how the picture arrives, and a saved broadcast says Broadcast; the label opens the stream switches", async ({ page }) => {
+  await openWall(page, 15);
+  const shown = await page.evaluate(() => window.__fleet!.view().plan.mode);
+  await expect(page.getByTestId("stream-mode")).toHaveText(shown === "aggregated" ? "Combined streams" : "Direct streams");
+  await openBroadcast(page, false);
+  try {
+    await expect(page.getByTestId("stream-mode")).toHaveText("Broadcast");
+    await page.getByTestId("stream-mode").click();
+    await expect(page.getByTestId("broadcast-switch")).toBeVisible({ timeout: 1000 });
+    await expect(page.getByTestId("broadcast-switch")).toHaveAttribute("aria-checked", "true");
+  } finally {
+    await closeBroadcast();
+  }
+});
+
 test("a paused picture survives frames arriving and a redraw: no tile goes dark", async ({ page }) => {
   await openWall(page, 15);
   await page.getByTestId("pause").click();

@@ -2,6 +2,7 @@
 // switch in the same place, on its own line under the title, so either view is one click from the other.
 
 import { useSyncExternalStore } from "react";
+import type { StreamModeView } from "../../core/view.ts";
 
 export type Mode = "wall" | "phones";
 
@@ -16,7 +17,11 @@ export function modeHref(mode: Mode, search: string): string {
 
 const noSubscribe = () => () => {};
 
-export function ModeSwitch({ current }: { current: Mode }) {
+/**
+ * `stream`: how the wall's picture arrives, after the two links. With `onStream` it is a button
+ * that opens the panel holding the stream switches; without one (no controls to open), plain text.
+ */
+export function ModeSwitch({ current, stream = null, onStream }: { current: Mode; stream?: StreamModeView | null; onStream?: (from: HTMLElement) => void }) {
   // The server renders the plain addresses; the client then adds the rest of its query.
   const search = useSyncExternalStore(noSubscribe, () => window.location.search, () => "");
   const item = (mode: Mode, label: string) => (
@@ -28,6 +33,15 @@ export function ModeSwitch({ current }: { current: Mode }) {
     <nav className="mode-switch" aria-label="View" data-hud-box="">
       {item("wall", "Wall")}
       {item("phones", "Phones")}
+      {stream === null ? null : onStream ? (
+        <button type="button" className="stream-mode" title={stream.detail} aria-label={`${stream.label}: ${stream.detail}`} data-testid="stream-mode" onClick={(e) => onStream(e.currentTarget)}>
+          {stream.label}
+        </button>
+      ) : (
+        <span className="stream-mode" title={stream.detail} data-testid="stream-mode">
+          {stream.label}
+        </span>
+      )}
     </nav>
   );
 }
