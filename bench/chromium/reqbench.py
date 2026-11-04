@@ -2204,19 +2204,15 @@ def _lock_state_for_reap(lock_path: str, state_path: str):
         if os.path.lexists(state_path):
             raise
         return None
-    deadline = time.monotonic() + STATE_LOCK_WAIT_S
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd
-        except BlockingIOError:
-            if time.monotonic() >= deadline:
-                os.close(fd)
-                raise
-            time.sleep(0.01)
-        except OSError:
-            os.close(fd)
-            raise
+    try:
+        locked = _flock_until(fd, time.monotonic() + STATE_LOCK_WAIT_S)
+    except OSError:
+        os.close(fd)
+        raise
+    if not locked:
+        os.close(fd)
+        raise BlockingIOError(errno.EAGAIN, "state lock still held after the wait", lock_path)
+    return fd
 
 
 def _read_state_nofollow(state_path: str):
@@ -2256,34 +2252,45 @@ def left_on_disk(state_path: str, data_dir: str) -> list:
 
 
 def _settle_orphan_lock(lock: str, state_path: str) -> None:
-    try:
-        fd = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
-    except FileNotFoundError:
-        return
-    try:
-        deadline = time.monotonic() + STATE_LOCK_WAIT_S
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    return
-                time.sleep(0.01)
-        if os.path.lexists(state_path):
-            return
+    """Wait for, then remove, a lock left beside an absent state. Another
+    scanner can unlink the lock this waits on and create a new one, so a lock
+    that turns out to be replaced is waited on again, until STATE_LOCK_WAIT_S."""
+    deadline = time.monotonic() + STATE_LOCK_WAIT_S
+    while True:
         try:
-            on_disk = os.lstat(lock)
+            fd = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
         except FileNotFoundError:
             return
-        held = os.fstat(fd)
-        if (on_disk.st_dev, on_disk.st_ino) == (held.st_dev, held.st_ino):
+        try:
+            if not _flock_until(fd, deadline) or os.path.lexists(state_path):
+                return
             try:
-                os.remove(lock)
+                on_disk = os.lstat(lock)
             except FileNotFoundError:
-                pass
-    finally:
-        os.close(fd)
+                return
+            held = os.fstat(fd)
+            if (on_disk.st_dev, on_disk.st_ino) == (held.st_dev, held.st_ino):
+                try:
+                    os.remove(lock)
+                except FileNotFoundError:
+                    pass
+                return
+        finally:
+            os.close(fd)
+        if time.monotonic() >= deadline:
+            return
+
+
+def _flock_until(fd: int, deadline: float) -> bool:
+    """Take fd's lock exclusively, polling until deadline; False if still held."""
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
 
 
 def _ignore_missing(function, path, exc):
@@ -2971,6 +2978,9 @@ def teardown_normal(
 
     left = left_on_disk(state_path, data_dir)
     out["disk_cleanup_verified"] = not left
+    # The check can wait for another launch's lock (left_on_disk), so the
+    # teardown ends after it.
+    out["teardown_total_ms"] = (time.monotonic() - t0) * 1000
     if left:
         out["disk_cleanup_left"] = left
         t_disk = time.monotonic()

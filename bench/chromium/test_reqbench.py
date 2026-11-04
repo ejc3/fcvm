@@ -914,6 +914,74 @@ class ReapDiskPathGuard(unittest.TestCase):
             self.assertEqual(reqbench.left_on_disk(state, ""), [])
             self.assertFalse(os.path.lexists(f"{state}.lock"))
 
+    def test_a_lock_replaced_by_a_second_scanner_is_waited_for_too(self):
+        """Scanner A holds the lock, unlinks it and lets go; scanner B, from an
+        earlier listing, has meanwhile created and holds a new one. The settle
+        must wait on B's lock as well."""
+        import fcntl
+        import threading
+        with tempfile.TemporaryDirectory() as root:
+            state = os.path.join(root, "vm-abababababababababababababababab.json")
+            lock = f"{state}.lock"
+            a = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(a, fcntl.LOCK_EX)
+            b_ready = threading.Event()
+
+            def scanners():
+                time.sleep(0.2)
+                os.remove(lock)
+                b = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+                fcntl.flock(b, fcntl.LOCK_EX)
+                b_ready.set()
+                fcntl.flock(a, fcntl.LOCK_UN)
+                os.close(a)
+                time.sleep(0.3)
+                os.remove(lock)
+                fcntl.flock(b, fcntl.LOCK_UN)
+                os.close(b)
+
+            t = threading.Thread(target=scanners)
+            t.start()
+            try:
+                left = reqbench.left_on_disk(state, "")
+            finally:
+                t.join()
+            self.assertTrue(b_ready.is_set())
+            self.assertEqual(left, [])
+
+    def test_the_normal_teardown_counts_the_wait_for_a_scanner_lock(self):
+        """teardown_total_ms was set before the absence check, so a wait there
+        for another launch's lock fell outside the published total."""
+        import fcntl
+        import threading
+        with tempfile.TemporaryDirectory() as d:
+            vm_id = "vm-cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+            state = os.path.join(d, "state", f"{vm_id}.json")
+            os.makedirs(os.path.dirname(state))
+            lock = f"{state}.lock"
+            held = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(held, fcntl.LOCK_EX)
+
+            def scanner():
+                time.sleep(0.5)
+                os.remove(lock)
+                fcntl.flock(held, fcntl.LOCK_UN)
+                os.close(held)
+
+            p = spawn_pdeathsig_parent(["sleep", "300"])
+            wait_for_child(p.pid)
+            t = threading.Thread(target=scanner)
+            t.start()
+            try:
+                out = reqbench.teardown_normal(
+                    p, p.pid, 5.0, d, state, os.path.join(d, "vm-disks", vm_id),
+                    verify_disk_cleanup=True)
+            finally:
+                t.join()
+                kill_tree(p)
+            self.assertTrue(out["disk_cleanup_verified"], out)
+            self.assertGreaterEqual(out["teardown_total_ms"], 400.0, out)
+
     def test_a_lock_beside_a_state_is_never_removed(self):
         with tempfile.TemporaryDirectory() as root:
             state = os.path.join(root, "vm-ffffffffffffffffffffffffffffffff.json")
