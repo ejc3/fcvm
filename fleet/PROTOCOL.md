@@ -745,9 +745,9 @@ The snapshot's `state.phones` is absent with no phones, else:
 ```json
 {"image_aspect": 1.125, "claim_secs": 120,
  "borrow": {"cap": 1, "lent": 1, "next_return_at": 1761134525000},
- "actions": ["switch_screen", "rotate", "dark_mode", "dance", "wave", "gpu_benchmark", "restart_app", "open_browser", "open_app", "reboot_phone"],
  "zoomed_out": false, "zoom_at": 1761134400000,
  "tiles": [{"id": "phone:1", "slot": "phone-1", "rect": {"x": 0, "y": 0, "w": 0.5, "h": 1}, "phase": "running",
+            "actions": ["switch_screen", "rotate", "dark_mode", "dance", "wave", "gpu_benchmark", "restart_app", "open_browser", "open_app", "reboot_phone"],
             "frame_url": "wss://...", "borrowed": {"session": "phone-claim-3", "viewer": "v-12", "since": ..., "until": ...},
             "last_relaunch": {"clicked_at": ..., "by": "reboot:phone-claim-3", "first_frame_at": ..., "phases": {...}}, ...}]}
 ```

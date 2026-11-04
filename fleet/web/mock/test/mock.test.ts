@@ -727,10 +727,10 @@ describe("mock phones", () => {
     const p = phonesNow();
     expect(p.tiles.map((t) => t.id)).toEqual(["phone:1", "phone:2", "phone:3"]);
     expect(coord.fleetState().tiles.some((t) => t.id.startsWith("phone"))).toBe(false);
-    const st = coord.fleetState() as unknown as { phones: { image_aspect: number; actions: string[]; tiles: { rect: unknown }[] } };
+    const st = coord.fleetState() as unknown as { phones: { image_aspect: number; tiles: { rect: unknown; actions: string[] }[] } };
     expect(st.phones.image_aspect).toBeCloseTo((3 * 720) / 1280, 9);
     expect(st.phones.tiles[1]!.rect).toEqual({ x: 1 / 3, y: 0, w: 1 / 3, h: 1 });
-    expect(st.phones.actions).toHaveLength(10);
+    expect(st.phones.tiles.every((t) => t.actions.length === 10)).toBe(true);
   });
 
   it("lends a phone to one viewer at a time, up to the cap, and refuses with the coordinator's reasons", async () => {

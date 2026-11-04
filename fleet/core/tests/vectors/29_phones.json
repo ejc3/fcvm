@@ -822,18 +822,6 @@
       ]
     },
     "phones": {
-      "actions": [
-        "switch_screen",
-        "rotate",
-        "dark_mode",
-        "dance",
-        "wave",
-        "gpu_benchmark",
-        "restart_app",
-        "open_browser",
-        "open_app",
-        "reboot_phone"
-      ],
       "borrow": {
         "cap": 1,
         "lent": 0,

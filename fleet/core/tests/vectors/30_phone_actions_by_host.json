@@ -162,6 +162,29 @@
       "viewer": "v2"
     },
     {
+      "at": 5000,
+      "host": "new",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 2,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          }
+        ],
+        "host": "new",
+        "phones": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:02:00.0"
+          }
+        ],
+        "type": "hello"
+      },
+      "type": "agent"
+    },
+    {
       "args": {
         "action": "reboot_phone"
       },
@@ -222,6 +245,16 @@
     },
     {
       "after": 11,
+      "checks": {
+        "/assign/new/1/phone/actions": [],
+        "/view/phones/tiles/1/actions": [
+          "reboot_phone"
+        ]
+      },
+      "note": "a queued action its host no longer lists (the agent reconnected with a shorter list) is not sent"
+    },
+    {
+      "after": 12,
       "checks": {
         "/receipts/c6/outcome": "committed"
       }
@@ -424,18 +457,6 @@
       ]
     },
     "phones": {
-      "actions": [
-        "switch_screen",
-        "rotate",
-        "dark_mode",
-        "dance",
-        "wave",
-        "gpu_benchmark",
-        "restart_app",
-        "open_browser",
-        "open_app",
-        "reboot_phone"
-      ],
       "borrow": {
         "cap": 2,
         "lent": 2,
@@ -488,15 +509,6 @@
         },
         {
           "actions": [
-            "switch_screen",
-            "rotate",
-            "dark_mode",
-            "dance",
-            "wave",
-            "gpu_benchmark",
-            "restart_app",
-            "open_browser",
-            "open_app",
             "reboot_phone"
           ],
           "borrowed": {

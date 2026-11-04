@@ -410,8 +410,6 @@ pub struct PhonesView {
     pub borrow: BorrowView,
     /// How long a borrowed phone stays with its viewer.
     pub claim_secs: u64,
-    /// The take-over actions a borrowed phone accepts (`phone_action`).
-    pub actions: Vec<&'static str>,
     /// Shared by every viewer (`phones_zoom`): the phones show their app's bars and the page
     /// draws each in a phone body; since when.
     pub zoomed_out: bool,
@@ -748,10 +746,6 @@ fn phones_view(state: &State) -> PhonesView {
             next_return_at: lent.iter().copied().min(),
         },
         claim_secs: state.config.phone_claim_secs,
-        actions: crate::phone::PhoneAction::ALL
-            .iter()
-            .map(|a| a.as_str())
-            .collect(),
         zoomed_out: f.phones_zoom.out,
         zoom_at: f.phones_zoom.at,
     }
@@ -1011,9 +1005,14 @@ pub fn host_assignments(state: &State) -> BTreeMap<String, Vec<AssignSlot>> {
                         .phone
                         .as_ref()
                         .map(|p| {
+                            // only what the host lists now: an agent skips the whole line
+                            // that names an action it does not know
+                            let offers = crate::apply::phone_offers(&state.fleet, *n);
                             p.actions
                                 .iter()
-                                .filter(|a| a.generation == s.generation)
+                                .filter(|a| {
+                                    a.generation == s.generation && offers.contains(&a.action)
+                                })
                                 .cloned()
                                 .collect()
                         })
