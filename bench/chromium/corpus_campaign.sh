@@ -512,7 +512,13 @@ dns_owner_sampler() {
 start_dns_sampler() {
     : >"$RESULTS/dns-owner.log"
     SAMPLER_ALIVE_AT_STOP=""
-    dns_owner_sampler "$RESULTS/dns-owner.log" &
+    # The sampler subshell drops the replay device lock it would inherit: a
+    # sampler left running by a campaign killed with SIGKILL must not keep the
+    # lock and block every later campaign.
+    (
+        [ -z "${REPLAY_LOCK_FD:-}" ] || exec {REPLAY_LOCK_FD}>&-
+        dns_owner_sampler "$RESULTS/dns-owner.log"
+    ) &
     SAMPLER_PID=$!
 }
 

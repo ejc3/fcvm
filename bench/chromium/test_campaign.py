@@ -2383,9 +2383,10 @@ class ReplayAddressByNetworkMode(unittest.TestCase):
                       f"REPLAY_LOCK=\"$REPLAY_LOCK\"\n{body.group(1)}\nreplay_dev_up; echo rc=$?\n")
             # One process from the lock to the kill: `flock lock sleep` would
             # leave its sleep child holding the descriptor after the kill.
-            holder = subprocess.Popen(["sh", "-c", f"exec 9>>'{lock}'; flock 9; exec sleep 30"])
+            holder = subprocess.Popen(["sh", "-c", f"exec 9>>'{lock}'; flock 9; echo held; exec sleep 30"],
+                                      stdout=subprocess.PIPE, text=True)
             self.addCleanup(holder.kill)
-            time.sleep(0.5)
+            self.assertEqual(holder.stdout.readline().strip(), "held", "the holder never took the lock")
             held = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30, env=env)
             self.assertIn("rc=1", held.stdout, held.stderr)
             self.assertIn("another campaign holds", held.stderr)
@@ -2395,6 +2396,30 @@ class ReplayAddressByNetworkMode(unittest.TestCase):
             free = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30, env=env)
             self.assertIn("rc=0", free.stdout, free.stderr)
             self.assertIn("ip link del fcvmreplay0", read_if_exists(calls), "a device left behind was not replaced")
+
+    def test_the_dns_sampler_does_not_hold_the_replay_device_lock(self):
+        """Red before the fix: the sampler subshell inherited REPLAY_LOCK_FD, so
+        a sampler left running by a SIGKILLed campaign kept the lock and every
+        later root-mode campaign refused to start."""
+        text = campaign()
+        # The shipped loop and starter; one sample that always succeeds, so the
+        # sampler stays alive to be inspected.
+        funcs = "dns_owner_sample() { :; }\n" + "".join(
+            re.search(rf"({name}\(\) \{{\n.*?\n\}})\n", text, re.S).group(1) + "\n"
+            for name in ("dns_owner_sampler", "start_dns_sampler"))
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = os.path.join(tmp, "replay.lock")
+            results = os.path.join(tmp, "results")
+            os.makedirs(results)
+            script = (f"set -uo pipefail\nRESULTS={results}\nDNS_SAMPLE_INTERVAL=30\nREPLAY_BIND_URL=127.0.0.1\n"
+                      f"SAMPLER_PID=\nSAMPLER_ALIVE_AT_STOP=\n{funcs}"
+                      f"exec {{REPLAY_LOCK_FD}}>>'{lock}'\nflock -n $REPLAY_LOCK_FD\nstart_dns_sampler >/dev/null 2>&1\n"
+                      "sleep 0.5\n[ -d /proc/$SAMPLER_PID ] && echo alive\n"
+                      "ls -l /proc/$SAMPLER_PID/fd/ | grep -c 'replay.lock'\npkill -P $SAMPLER_PID; kill $SAMPLER_PID\n")
+            out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+            lines = out.stdout.strip().splitlines()
+            self.assertIn("alive", lines, "the sampler did not stay up; the check is vacuous" + out.stderr)
+            self.assertEqual(lines[-1], "0", "the sampler holds the replay device lock" + out.stderr)
 
     def test_every_root_phase_runs_fcvm_under_sudo_in_the_mode(self):
         """A bridged or routed fcvm needs root, and reqbench runs it as root only
