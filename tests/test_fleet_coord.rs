@@ -675,7 +675,7 @@ async fn the_agent_socket_answers_pings() {
         store_ready_at: None,
         boot: Default::default(),
         phones: vec![],
-        phone_actions: None,
+        phone_actions: vec![],
     };
     ws.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
         .await
@@ -726,7 +726,7 @@ impl FakeAgent {
                 store_ready_at: None,
                 boot: Default::default(),
                 phones: vec![],
-                phone_actions: None,
+                phone_actions: vec![],
             })
             .unwrap();
         FakeAgent {

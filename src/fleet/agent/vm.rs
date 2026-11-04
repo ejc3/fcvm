@@ -277,20 +277,19 @@ pub fn check_browser_apk(p: &PhoneCfg) -> anyhow::Result<()> {
 }
 
 /// The take-over actions this agent's phones carry out, for its hello: every action of this
-/// build, less the browser's when the phones have no browser. None without phones.
-pub fn phone_actions(phone: Option<&PhoneCfg>) -> Option<Vec<String>> {
+/// build, less the browser's when the phones have no browser; none without phones.
+pub fn phone_actions(phone: Option<&PhoneCfg>) -> Vec<String> {
     use fleet_core::phone::PhoneAction;
-    let p = phone?;
-    Some(
-        PhoneAction::ALL
-            .into_iter()
-            .filter(|a| {
-                p.browser_apk.is_some()
-                    || !matches!(a, PhoneAction::OpenBrowser | PhoneAction::OpenApp)
-            })
-            .map(|a| a.as_str().to_string())
-            .collect(),
-    )
+    let Some(p) = phone else {
+        return Vec::new();
+    };
+    PhoneAction::ALL
+        .into_iter()
+        .filter(|a| {
+            p.browser_apk.is_some() || !matches!(a, PhoneAction::OpenBrowser | PhoneAction::OpenApp)
+        })
+        .map(|a| a.as_str().to_string())
+        .collect()
 }
 
 /// The command that carries out a take-over action in a running phone: `phone.sh action
@@ -653,15 +652,15 @@ mod tests {
     #[test]
     fn the_hello_lists_the_browser_actions_only_for_phones_with_a_browser() {
         use fleet_core::phone::PhoneAction;
-        assert_eq!(super::phone_actions(None), None);
+        assert!(super::phone_actions(None).is_empty());
         let all: Vec<String> = PhoneAction::ALL
             .iter()
             .map(|a| a.as_str().to_string())
             .collect();
-        assert_eq!(super::phone_actions(Some(&phone())).unwrap(), all);
+        assert_eq!(super::phone_actions(Some(&phone())), all);
         let mut p = phone();
         p.browser_apk = None;
-        let l = super::phone_actions(Some(&p)).unwrap();
+        let l = super::phone_actions(Some(&p));
         assert!(
             !l.iter().any(|a| a == "open_browser" || a == "open_app"),
             "{l:?}"

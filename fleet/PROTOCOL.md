@@ -779,11 +779,10 @@ or when its viewer leaves; the phone is then restored from its snapshot
 
 **Actions** (`phone_action`): only the viewer holding the phone, at most one a second, and
 only these names; anything else is refused (`args.action must be one of ...`) and nothing
-reaches the phone. A phone also offers only what its host's agent carries out: the hello's
-`phone_actions`, or, from an agent whose hello has none, every action but `open_browser` and
-`open_app` (`reboot_phone` is always offered). Each phone tile lists its own (`actions`), and
-an action its host does not carry out is refused (`phone-1's host does not support
-open_browser`) before it reaches the assignment, which an older agent would skip whole:
+reaches the phone. A phone also offers only what its host's agent lists in its hello (`phone_actions`), and
+`reboot_phone`, which is the coordinator's own. Each phone tile lists its own (`actions`), and
+an action its host does not list is refused (`phone-1's host does not support open_browser`)
+before it reaches the assignment, which an agent without that name would skip whole:
 
 | action | what the phone does | Robot Park's action (PROTOCOL "Phone app") |
 |---|---|---|

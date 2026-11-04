@@ -5,7 +5,7 @@
     "phone_claim_cooldown_secs": 60,
     "phone_claim_secs": 30
   },
-  "description": "Phones mode: each phone offers and accepts only the take-over actions its host's agent carries out (its hello's phone_actions; none listed: the actions from before open_browser).",
+  "description": "Phones mode: each phone offers and accepts only the take-over actions its host's agent lists in its hello (phone_actions), and reboot_phone, the coordinator's own.",
   "events": [
     {
       "at": 1000,
@@ -140,7 +140,8 @@
     },
     {
       "args": {
-        "action": "dance"
+        "action": "reboot_phone",
+        "claim": "phone-claim-1"
       },
       "at": 4100,
       "client": "198.51.100.20",
@@ -177,13 +178,6 @@
       "after": 3,
       "checks": {
         "/view/phones/tiles/0/actions": [
-          "switch_screen",
-          "rotate",
-          "dark_mode",
-          "dance",
-          "wave",
-          "gpu_benchmark",
-          "restart_app",
           "reboot_phone"
         ],
         "/view/phones/tiles/0/slot": "phone-1",
@@ -201,7 +195,7 @@
         ],
         "/view/phones/tiles/1/slot": "phone-2"
       },
-      "note": "a host whose hello lists no phone actions runs an image from before open_browser: its phones offer the actions it carries out; a name the coordinator does not know is dropped, and reboot_phone, the coordinator's own, is always offered"
+      "note": "a host whose hello lists no phone actions (an agent from before the list) has phones that offer only reboot_phone; a name the coordinator does not know is dropped"
     },
     {
       "after": 8,
@@ -215,10 +209,9 @@
     {
       "after": 9,
       "checks": {
-        "/assign/old/1/phone/actions/0/action": "dance",
         "/receipts/c4/outcome": "committed"
       },
-      "note": "the refused action did not count against the rate limit"
+      "note": "the refused action did not use the one-a-second allowance"
     },
     {
       "after": 10,
@@ -271,13 +264,14 @@
       },
       {
         "args": {
-          "action": "dance"
+          "action": "reboot_phone",
+          "claim": "phone-claim-1"
         },
         "at": 4100,
         "id": "c4",
         "name": "phone_action",
         "outcome": "committed",
-        "summary": "dance on phone-1",
+        "summary": "reboot phone-1",
         "viewer": "v1"
       },
       {
@@ -452,13 +446,6 @@
       "tiles": [
         {
           "actions": [
-            "switch_screen",
-            "rotate",
-            "dark_mode",
-            "dance",
-            "wave",
-            "gpu_benchmark",
-            "restart_app",
             "reboot_phone"
           ],
           "borrowed": {
@@ -472,7 +459,7 @@
           "fps": null,
           "frame_url": "ws://old:20101/frames",
           "frame_url_v4": null,
-          "generation": 1,
+          "generation": 2,
           "gpu": {
             "name": "Tesla T4",
             "sbdf": "0000:02:00.0"
@@ -482,12 +469,12 @@
           "host": "old",
           "id": "phone:1",
           "last_relaunch": {
-            "by": "wake",
-            "clicked_at": 2000,
-            "first_frame_at": 2000,
+            "by": "reboot:phone-claim-1",
+            "clicked_at": 4100,
+            "first_frame_at": null,
             "phases": {}
           },
-          "phase": "running",
+          "phase": "relaunching",
           "place": null,
           "previous_rect": null,
           "rect": {

@@ -20,6 +20,17 @@
           }
         ],
         "host": "h1",
+        "phone_actions": [
+          "switch_screen",
+          "rotate",
+          "dark_mode",
+          "dance",
+          "wave",
+          "gpu_benchmark",
+          "restart_app",
+          "open_browser",
+          "open_app"
+        ],
         "phones": [
           {
             "name": "Tesla T4",
@@ -840,6 +851,8 @@
             "wave",
             "gpu_benchmark",
             "restart_app",
+            "open_browser",
+            "open_app",
             "reboot_phone"
           ],
           "borrowed": null,
@@ -884,6 +897,8 @@
             "wave",
             "gpu_benchmark",
             "restart_app",
+            "open_browser",
+            "open_app",
             "reboot_phone"
           ],
           "borrowed": null,

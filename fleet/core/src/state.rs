@@ -234,10 +234,10 @@ pub struct Host {
     /// label `agg-<host>-<token>` (see [`aggregate_id`]).
     #[serde(default)]
     pub aggregate_published: Option<Published>,
-    /// The take-over actions its phones carry out, as its hello listed them (none listed:
-    /// an older agent; see `PhoneAction::offered`).
+    /// The take-over actions its phones carry out, as its hello listed them
+    /// (`PhoneAction::offered`).
     #[serde(default)]
-    pub phone_actions: Option<Vec<String>>,
+    pub phone_actions: Vec<String>,
 }
 
 /// What an agent (or the EC2 driver) last said about one slot.

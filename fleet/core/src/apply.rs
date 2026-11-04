@@ -1254,7 +1254,7 @@ fn hello(f: &mut Fleet, host: &str, arch: &str, gpus: &[Gpu], capacity: usize, a
             aggregate_ipv4: None,
             aggregate_v4_port: None,
             aggregate_published: None,
-            phone_actions: None,
+            phone_actions: Vec::new(),
         },
     );
     f.reclaimed.remove(host);
@@ -1899,7 +1899,8 @@ pub fn phone_offers(f: &Fleet, n: u32) -> Vec<crate::phone::PhoneAction> {
         .get(&n)
         .and_then(|s| s.host.as_ref())
         .and_then(|h| f.hosts.get(h))
-        .and_then(|h| h.phone_actions.as_deref());
+        .map(|h| h.phone_actions.as_slice())
+        .unwrap_or_default();
     crate::phone::PhoneAction::offered(listed)
 }
 
@@ -1913,8 +1914,8 @@ fn phone_action(
     let f = &mut state.fleet;
     let n = own_phone(f, c.viewer).ok_or("phone actions need a phone of your own (claim_phone)")?;
     check_phone_claim(f, n, claim)?;
-    // Only what the phone's host carries out: an older agent skips the whole assignment line
-    // that names an action it does not know.
+    // Only what the phone's host carries out: an agent skips the whole assignment line that
+    // names an action it does not know.
     if !phone_offers(f, n).contains(&action) {
         return Err(format!(
             "{}'s host does not support {}",
