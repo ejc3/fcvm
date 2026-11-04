@@ -2227,7 +2227,10 @@ def _read_state_nofollow(state_path: str):
             raise RuntimeError("state path is not a regular file")
         with os.fdopen(state_fd) as state_file:
             state_fd = -1
-            return json.load(state_file)
+            state = json.load(state_file)
+        if not isinstance(state, dict):
+            raise RuntimeError(f"state is a JSON {type(state).__name__}, not an object")
+        return state
     finally:
         if state_fd >= 0:
             os.close(state_fd)

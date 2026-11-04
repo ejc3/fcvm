@@ -2023,6 +2023,24 @@ class CompleteAnalyzerFixture(unittest.TestCase):
             self.assertIn("Firecracker VMAs", report)
             self.assertIn("0.8", report)
 
+    def test_a_host_record_from_before_the_boot_hash_is_still_analyzed(self):
+        """Runs recorded before #1511 carry no host_boot_sha256 and stay
+        analyzable; a malformed boot hash is still refused."""
+        with tempfile.TemporaryDirectory() as d:
+            self.build_run(d)
+            with open(os.path.join(d, "provenance.json")) as f:
+                provenance = json.load(f)
+            with open(os.path.join(d, "schedule.json")) as f:
+                schedule = json.load(f)
+        reqscale_analyze._validate_provenance(provenance, schedule)
+        old = json.loads(json.dumps(provenance))
+        del old["host"]["host_boot_sha256"]
+        reqscale_analyze._validate_provenance(old, schedule)
+        bad = json.loads(json.dumps(provenance))
+        bad["host"]["host_boot_sha256"] = "not-a-hash"
+        with self.assertRaisesRegex(reqscale_analyze.AnalysisInvalid, "host_boot_sha256"):
+            reqscale_analyze._validate_provenance(bad, schedule)
+
 
 class AnalyzerReportsAFailedRate(unittest.TestCase):
     """#1159: the analyzer reports a rate with a failed request as failed,

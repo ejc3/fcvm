@@ -1343,13 +1343,19 @@ def _validate_provenance(provenance: dict, schedule: dict) -> tuple[str, str]:
     ):
         raise AnalysisInvalid("snapshot generation lease provenance is incomplete")
     host = provenance.get("host")
-    if not isinstance(host, dict) or set(host) != {
-        "instance_type", "cpu_model", "host_boot_sha256", "kernel", "machine",
-        "python", "cpu_count", "quiet_gate",
-    }:
+    host_keys = {
+        "instance_type", "cpu_model", "kernel", "machine", "python", "cpu_count",
+        "quiet_gate",
+    }
+    # Runs recorded before #1511 carry no boot hash.
+    if not isinstance(host, dict) or set(host) not in (
+        host_keys, host_keys | {"host_boot_sha256"}
+    ):
         raise AnalysisInvalid("host provenance is incomplete")
     boot = host.get("host_boot_sha256")
-    if not isinstance(boot, str) or not re.fullmatch(r"[0-9a-f]{64}", boot):
+    if "host_boot_sha256" in host and (
+        not isinstance(boot, str) or not re.fullmatch(r"[0-9a-f]{64}", boot)
+    ):
         raise AnalysisInvalid("host provenance has an invalid host_boot_sha256")
     for field in ("kernel", "machine", "python"):
         if not isinstance(host.get(field), str) or not host[field]:

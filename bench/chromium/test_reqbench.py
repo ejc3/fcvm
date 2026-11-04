@@ -914,6 +914,27 @@ class ReapDiskPathGuard(unittest.TestCase):
             self.assertEqual(reqbench.left_on_disk(state, ""), [])
             self.assertFalse(os.path.lexists(f"{state}.lock"))
 
+    def test_a_state_that_is_not_an_object_is_refused_and_unlocked(self):
+        """RED BEFORE THE FIX: valid JSON that is not an object raised
+        AttributeError out of reap_disk with the state lock still held, past the
+        refusal record."""
+        import fcntl
+        with tempfile.TemporaryDirectory() as root:
+            vm_id = "vm-efefefefefefefefefefefefefefefef"
+            state, vm_dir = self._owned_clone(root, vm_id)
+            with open(state, "w") as f:
+                json.dump([4242, 99], f)
+            out: dict = {}
+            reaped = reqbench.reap_disk(out, root, state, vm_dir, (4242, 99))
+            self.assertEqual(reaped, [])
+            self.assertIn("exact state identity", " ".join(out["disk_errors"]))
+            self.assertTrue(os.path.isdir(vm_dir))
+            probe = os.open(f"{state}.lock", os.O_RDWR)
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
+
     def test_a_lock_replaced_by_a_second_scanner_is_waited_for_too(self):
         """Scanner A holds the lock, unlinks it and lets go; scanner B, from an
         earlier listing, has meanwhile created and holds a new one. The settle
