@@ -180,10 +180,10 @@ half busy. Every tile's fit then, as `budget_fit` in samples:
 
 | tiles | drawn pixels | fit (samples) | every pixel at one sample |
 |---|---|---|---|
-| ec2 432 lines, heaviest (ec2-5) | 550,896 | 359,222 | 550,896 |
-| fcvm 540 lines, heaviest (slot-6) | 645,018 | 383,753 | 645,018 |
-| ec2 and fcvm, sky (ec2-1, slot-1) | | 733,255 to 980,851 | |
-| fcvm 540 lines at 270 (slot-3, slot-4) | | 0 (no fit) | |
+| EC2 half, 432 lines, the heaviest tile | 550,896 | 359,222 | 550,896 |
+| fcvm half, 540 lines, the heaviest tile | 645,018 | 383,753 | 645,018 |
+| sky tiles, both halves | | 733,255 to 980,851 | |
+| two fcvm-half tiles asked 540, drawn at 270 | | 0 (no fit) | |
 
 What held the budget:
 
@@ -197,10 +197,10 @@ What held the budget:
   grid controller does not raise while a tile has no fit.
 - **A raise would have overloaded the heavy tiles.** The fit was reported in samples and the
   controller treats it as a budget: with every fit known, the rung under 359,222 / 1.15 is
-  297,302, which draws 550,896 samples on ec2-5.
+  297,302, which draws 550,896 samples on the heaviest 432-line tile.
 
 Now a renderer reports its fit as the largest budget whose frame draws no more than the fit's
-samples (`budget_for_samples`, budget.h): ec2-5 reports 275,172, which keeps the grid at
+samples (`budget_for_samples`, budget.h): that tile reports 275,172, which keeps the grid at
 250,000 here and lets it rise in a view where every tile affords one sample a pixel (a tile
 fitting 1.2 times its pixels reports up to 1.5 times them). A drawn-size change keeps the cost
 model and scales its fixed part (`CostModel::rescale`), so a tile the height guard moves keeps

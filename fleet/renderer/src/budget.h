@@ -116,6 +116,14 @@ inline double local_budget(double fit, double px) {
   return b;
 }
 
+// The budget a whole-image renderer drawing alone takes, from its fits in
+// samples (the window's, else the latest frames'): local_budget compares samples,
+// so it is given the samples, not the reported budget. 0 when neither is known.
+inline double own_budget(double fit_samples, double fit_now_samples, double px) {
+  double own = fit_samples > 0 ? fit_samples : fit_now_samples;
+  return own > 0 ? local_budget(own, px) : 0;
+}
+
 // A renderer's cost model for its fit: the fixed part of a frame (everything
 // but the samples) and the cost per sample of each path, from the frames it
 // drew. The fit is the largest budget whose predicted frame takes `frac` of a

@@ -577,6 +577,15 @@ int main() {
       double after = m.fit(550896 * 4, HQ_SPP, 1000.0 / 30, 90.0);
       CHECK(before > 0 && after > 0 && after < before, "the fit stays known across a size change (%.0f, then %.0f)", before,
             after);
+      // a whole-image renderer alone picks its rung from the fit in samples (Codex
+      // on #1515: given the reported budget, 1,000,000 pixels fitting 600,000
+      // samples took 297,302, a quarter-sample stride-2 frame, not 420,448)
+      CHECK(own_budget(600000, 0, 1e6) == 420448, "a whole-image renderer fitting 600,000 samples on 1,000,000 pixels takes 420,448 (%.0f)",
+            own_budget(600000, 0, 1e6));
+      bool own_raw = false;
+      for (auto& l : source_lines("../src/pipeline.cpp"))
+        own_raw = own_raw || l.find("own_budget(fit_samples, fit_now_samples, px)") != std::string::npos;
+      CHECK(own_raw, "the pipeline gives a whole-image renderer's rung the fits in samples");
       bool reset = false;
       for (auto& l : source_lines("../src/pipeline.cpp")) reset = reset || l.find("cost_ = CostModel()") != std::string::npos;
       CHECK(!reset, "the pipeline keeps its cost model when the drawn size changes");
