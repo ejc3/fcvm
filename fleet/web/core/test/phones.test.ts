@@ -249,6 +249,21 @@ describe("what a phone says about its restore", () => {
   });
 });
 
+describe("asleep", () => {
+  it("shows the wall's sleep card with its Wake button, and none while awake", () => {
+    expect(phonesView(input(stateWith(phonesOf(2)))).sleep).toBeNull();
+    const s = stateWith(phonesOf(2));
+    const st = s.accepted!;
+    const asleep = reduce(s, {
+      type: "message",
+      text: snapshotText(2, { ...st, fleet: { ...st.fleet, power: { ...st.fleet.power, state: "asleep", asleep_since: EPOCH - 1000 } } }),
+      at: EPOCH,
+    });
+    const v = phonesView(input(asleep));
+    expect(v.sleep).toMatchObject({ state: "asleep", title: "Asleep.", wake: { label: "Wake", disabled: false } });
+  });
+});
+
 describe("the draw plan", () => {
   it("streams each placed phone into its own box with no image, and draws the others dark", () => {
     const p = phonesOf(3);
@@ -361,9 +376,26 @@ describe("the panel of an opened phone", () => {
     expect(p.borrow.countdown).toBe("Returns in 88 s");
     expect(p.borrow.actions.map((a) => a.label)).toEqual(["Switch screen", "Rotate", "Dark mode", "Dance", "Wave", "GPU benchmark", "Restart app", "Open nvidia.com", "Robot Park", "Reboot phone"]);
     expect(p.borrow.actions.map((a) => a.name)).toEqual(ACTIONS);
-    expect(p.borrow.actions.every((a) => !a.disabled)).toBe(true);
+    expect(p.borrow.actions.filter((a) => a.disabled).map((a) => a.name)).toEqual(["open_app"]);
     expect(p.borrow.giveBack).toBe("Give it back");
     expect(Object.keys(ACTION_LABELS)).toEqual(ACTIONS);
+  });
+
+  it("offers Robot Park only while the browser is in front: with Robot Park there it would change nothing", () => {
+    const ph = phonesOf(2);
+    ph.tiles[0] = { ...ph.tiles[0]!, borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-1" } };
+    const app = panelOf(ph);
+    if (app.borrow.kind !== "yours") throw new Error(app.borrow.kind);
+    expect(app.borrow.actions.filter((a) => a.disabled).map((a) => [a.name, a.title])).toEqual([["open_app", "Robot Park is in front"]]);
+    ph.tiles[0] = { ...ph.tiles[0]!, front: "browser" };
+    const browser = panelOf(ph);
+    if (browser.borrow.kind !== "yours") throw new Error(browser.borrow.kind);
+    expect(browser.borrow.actions.every((a) => !a.disabled && a.title === undefined)).toBe(true);
+    // a coordinator that does not say which app is in front: every action stays offered
+    ph.tiles[0] = { ...ph.tiles[0]!, front: null };
+    const unknown = panelOf(ph);
+    if (unknown.borrow.kind !== "yours") throw new Error(unknown.borrow.kind);
+    expect(unknown.borrow.actions.every((a) => !a.disabled)).toBe(true);
   });
 
   it("offers only the phone's own actions: a phone on an older host shows no browser", () => {
@@ -585,6 +617,8 @@ describe("taps on the held phone's screen", () => {
       if (m.type !== "snapshot") throw new Error("not a snapshot");
       return m.state.phones!.tiles.map((t) => t.front);
     };
+    expect(read()).toEqual(["app", "app"]);
+    for (const t of state.phones.tiles) delete t["front"];
     expect(read()).toEqual([null, null]);
     state.phones.tiles[0]!["front"] = "browser";
     state.phones.tiles[1]!["front"] = "app";

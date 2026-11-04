@@ -23,11 +23,13 @@ import {
   COLORS,
   phaseText,
   REDUCED_MOTION_DARK_FADE_MS,
+  sleepView,
   timelineOf,
   verifyView,
   type DrawPlan,
   type DrawSource,
   type DrawTile,
+  type SleepView,
   type TimelineStep,
 } from "./view.ts";
 
@@ -505,7 +507,8 @@ export type PhoneBorrowView =
       kind: "yours";
       session: string;
       countdown: string;
-      actions: { name: string; label: string; disabled: boolean }[];
+      /** `title` says why an action is not offered when its reason is not that the phone is not running or the page is offline. */
+      actions: { name: string; label: string; disabled: boolean; title?: string }[];
       giveBack: string;
       views: { name: TakeoverView; label: string; pressed: boolean; disabled: boolean }[];
       /** Why only the video can be shown here, when that is so. */
@@ -659,6 +662,8 @@ export interface PhonesView {
   plan: DrawPlan;
   mirror: MirrorPlacement | null;
   taps: TapView | null;
+  /** Asleep or waking, with the Wake button while asleep (the wall's card). */
+  sleep: SleepView | null;
 }
 
 const BLANK_PLAN = (s: ClientState, dpr: number): DrawPlan => ({
@@ -692,6 +697,7 @@ export function phonesView(inp: PhonesInput): PhonesView {
     online,
     verify: verifyView(s),
     notice: phoneNotice(s.notices),
+    sleep: s.accepted === null ? null : sleepView(s.accepted, srvNow, online, s.pending.some((p) => p.intent.name === "wake")),
   };
   const zoomOut = phones?.zoomed_out === true;
   const zoom = { label: zoomOut ? "Zoom in" : "Zoom out", out: zoomOut, disabled: !online || phones === null };
@@ -841,10 +847,16 @@ function panelOf(
       kind: "yours",
       session: b.session,
       countdown: `Returns in ${left} s`,
-      // the phone's own list: what its host carries out (a tap is a click on the screen, not a button)
+      // the phone's own list: what its host carries out (a tap is a click on the screen, not a button).
+      // Robot Park (open_app) only brings Robot Park to the front: with it already there, the
+      // phone would show no change, so it is offered while the browser is in front.
       actions: t.actions
         .filter((name) => name !== TAP)
-        .map((name) => ({ name, label: ACTION_LABELS[name] ?? name.replace(/_/g, " "), disabled: !online || !running })),
+        .map((name) => {
+          const label = ACTION_LABELS[name] ?? name.replace(/_/g, " ");
+          if (name === "open_app" && t.front === "app") return { name, label, disabled: true, title: "Robot Park is in front" };
+          return { name, label, disabled: !online || !running };
+        }),
       giveBack: "Give it back",
       views: TAKEOVER_VIEWS.map((v) => ({ ...v, pressed: v.name === takeover, disabled: mirrorUnavailable !== null && v.name !== "video" })),
       viewsNote: mirrorUnavailable,

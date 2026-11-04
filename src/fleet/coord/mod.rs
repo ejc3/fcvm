@@ -271,10 +271,20 @@ impl Actor {
         set_at(&mut event, at);
         let before = self.state.version;
         let marks = wake_log::Marks::of(&self.state);
+        let was_asleep = self.state.fleet.power.state == "asleep";
         let state = std::mem::replace(&mut self.state, State::new(Config::default(), 0));
         self.state = apply(state, &event);
         self.name_launches();
         wake_log::log(&wake_log::notes(&marks, &self.state, at));
+        let f = &self.state.fleet;
+        if !was_asleep && f.power.state == "asleep" {
+            tracing::info!(
+                viewers = f.viewers.len(),
+                hidden = f.hidden.len(),
+                last_arrival_at = ?f.power.last_arrival_at,
+                "fleet asleep"
+            );
+        }
         if self.state.version != before {
             self.dispatch_agents();
         }
@@ -1013,6 +1023,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         max_borrowed: args.max_borrowed,
         power_managed: power_managed(&args),
         idle_scale_down_secs: args.idle_scale_down,
+        sleep_without_new_viewer_secs: args.sleep_without_new_viewer,
         history_idle_secs: args.history_idle,
         ..Config::default()
     };

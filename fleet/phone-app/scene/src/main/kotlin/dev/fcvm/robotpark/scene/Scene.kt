@@ -39,6 +39,12 @@ data class SceneInput(
     val stamp: Boolean = false,
     val previousRect: Rect? = null,
     val rectFromFrame: Long? = null,
+    /**
+     * A viewer holds this phone (`held`): it leaves the shared image and draws the whole image
+     * on its own, at its own aspect, with the held camera ([CameraPath.held]), until it is given
+     * back.
+     */
+    val held: Boolean = false,
     /** The phone's own dance and wave moves: they set the crowd's pose, not its walk (not on the wire). */
     val localMoves: List<Move> = emptyList(),
     /** Frames before this t are refused: the phone's own moves before it were pruned (not on the wire). */
@@ -51,12 +57,14 @@ data class SceneInput(
     }
 
     /**
-     * The rect and image aspect a `w x h` surface draws at t. A surface turned the other way
-     * from its rect (a phone rotated out of the wall) draws the whole image on its own, at its
-     * own aspect; otherwise the scene's rect, or the whole surface when no aspect was given.
+     * The rect and image aspect a `w x h` surface draws at t. A held phone, and a surface
+     * turned the other way from its rect (a phone rotated out of the wall), draw the whole
+     * image on their own, at their own aspect; otherwise the scene's rect, or the whole surface
+     * when no aspect was given.
      */
     fun viewAt(t: Double, w: Int, h: Int): Pair<Rect, Double> {
         val surface = w.toDouble() / h
+        if (held) return Rect(0.0, 0.0, 1.0, 1.0) to surface
         val aspect = imageAspect ?: return Rect(0.0, 0.0, 1.0, 1.0) to surface
         val r = rectAt(t)
         val rectAspect = r.w * aspect / r.h

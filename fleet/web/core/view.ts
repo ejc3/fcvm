@@ -513,6 +513,8 @@ export interface SleepView {
   /** Since the wake began, counting; "" while asleep. */
   clock: string;
   steps: WakeStep[];
+  /** Asleep: the button that sends `wake`, an arrival that wakes the fleet. */
+  wake: { label: string; disabled: boolean } | null;
 }
 
 /** The median of the coordinator's measured wakes (`wakes`, else `last_wake`), in ms, or null. */
@@ -523,7 +525,13 @@ export function wakeMedianMs(p: FleetState["fleet"]["power"]): number | null {
   return ms.length % 2 === 1 ? ms[m]! : (ms[m - 1]! + ms[m]!) / 2;
 }
 
-function sleepView(st: FleetState, srvNow: number): SleepView | null {
+/**
+ * Asleep or waking, for the wall and phones mode alike. A page that is connected and visible
+ * while the fleet sleeps sees it because nobody new arrived for an hour (a visible page wakes
+ * a fleet that slept for want of viewers), so the card offers the Wake button.
+ * `waking`: a `wake` this page sent has no receipt yet.
+ */
+export function sleepView(st: FleetState, srvNow: number, online: boolean, waking: boolean): SleepView | null {
   const p = st.fleet.power;
   if (p.state === "awake") return null;
   const gpus = p.last_wake?.gpus ?? p.wakes.at(-1)?.gpus ?? 0;
@@ -534,10 +542,11 @@ function sleepView(st: FleetState, srvNow: number): SleepView | null {
       title: "Asleep.",
       line:
         median === null || gpus === 0
-          ? "The GPUs wake when someone watches."
-          : `${fmt.count(gpus, "GPU", "GPUs")} wake in about ${fmt.minSec(median)} when you stay.`,
+          ? "The GPUs start when you press Wake."
+          : `${fmt.count(gpus, "GPU", "GPUs")} wake in about ${fmt.minSec(median)} once you press Wake.`,
       clock: "",
       steps: [],
+      wake: { label: "Wake", disabled: !online || waking },
     };
   }
   const start = p.woke_at ?? srvNow;
@@ -559,6 +568,7 @@ function sleepView(st: FleetState, srvNow: number): SleepView | null {
     line: "The fleet scaled to zero while nobody was watching. Each step is reported by the hosts as it completes.",
     clock: fmt.raceClock(srvNow - start),
     steps,
+    wake: null,
   };
 }
 
@@ -732,6 +742,8 @@ function actionText(a: Action, st: FleetState, you: string | null): string | nul
     }
     case "claim_gpu":
       return `${who} got ${who === "you" ? "your" : "their"} own GPU`;
+    case "wake":
+      return `${who} woke the GPUs`;
     default:
       return null;
   }
@@ -1654,7 +1666,7 @@ export function wallView(input: WallInput): WallView {
     };
   }
   const pend = pendingIntents(s);
-  const sleep = sleepView(st, srvNow);
+  const sleep = sleepView(st, srvNow, online, pend.some((i) => i.name === "wake"));
   // Two tilings while a re-tile settles: the plan is the newest generation (its
   // streams open now), and the overlays follow the one the canvas still draws.
   const shownTiles = shownTilesOf(s, input.canDecode);
@@ -1850,6 +1862,7 @@ const INTENT_LABEL: Record<string, string> = {
   relaunch: "The restart",
   light: "The light",
   nudge: "Your choice of stop",
+  wake: "The wake",
 };
 
 /** What a notice needs from the fleet: the directed camera, the server time now and at the notice. */

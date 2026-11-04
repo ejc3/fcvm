@@ -81,7 +81,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         gl.onChrome = { on -> root.post { chromeFromScene = on; layoutChrome() } }
         gl.start()
         GlThread.current = gl
-        PhoneApp.ui = this
+        // published with the tab a request kept while there was no activity (PhoneApp.act)
+        synchronized(PhoneApp.uiLock) {
+            PhoneApp.ui = this
+            info.visibility = if (Store.screen == "info") View.VISIBLE else View.GONE
+        }
         theme()
         layoutChrome()
         handleIntent(intent)

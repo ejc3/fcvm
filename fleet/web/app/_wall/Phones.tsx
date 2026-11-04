@@ -34,6 +34,7 @@ import type { MirrorIn, MirrorOut, MirrorStatsMsg } from "./mirror/mirror-msgs.t
 import { canDecodeH264, WallClient } from "./wall-client.ts";
 import { TurnstileWidget } from "./Turnstile.tsx";
 import { ModeSwitch } from "./ModeSwitch.tsx";
+import { WakeCard } from "./Overlays.tsx";
 import { Timeline } from "./FocusPanel.tsx";
 import { boxOf, sameBox, useMedia } from "./hooks.ts";
 import "./phones.css";
@@ -170,7 +171,7 @@ function PanelView({
               </dl>
               <div className="actions-grid" role="group" aria-label="Actions">
                 {b.actions.map((a) => (
-                  <button key={a.name} type="button" className="btn" disabled={a.disabled} onClick={() => onAction(a.name, b.session)} data-testid={`phone-action-${a.name}`}>
+                  <button key={a.name} type="button" className="btn" disabled={a.disabled} title={a.title} onClick={() => onAction(a.name, b.session)} data-testid={`phone-action-${a.name}`}>
                     {a.label}
                   </button>
                 ))}
@@ -599,6 +600,11 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
         <p className="phones-banner" role="status" data-testid="phones-banner">
           {view.banner}
         </p>
+      ) : null}
+      {view.sleep ? (
+        <div className="phones-sleep">
+          <WakeCard sleep={view.sleep} onWake={() => void client.act("wake")} />
+        </div>
       ) : null}
       {view.empty ? (
         <p className="phones-empty" role="status" data-testid="phones-empty">

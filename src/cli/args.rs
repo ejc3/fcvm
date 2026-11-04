@@ -348,6 +348,11 @@ pub struct FleetCoordArgs {
     #[arg(long, default_value_t = 600)]
     pub idle_scale_down: u64,
 
+    /// Seconds without a new viewer before the fleet scales down, even while pages stay
+    /// connected (a new connection, not a reconnect, or a page's Wake button). 0 turns it off.
+    #[arg(long, env = "FLEET_SLEEP_WITHOUT_NEW_VIEWER", default_value_t = 3600)]
+    pub sleep_without_new_viewer: u64,
+
     /// Seconds a viewer watches an empty sky, after the last word has left it, before the
     /// wall writes a line of GPU history itself. 0 turns it off.
     #[arg(long, env = "FLEET_HISTORY_IDLE", default_value_t = 60)]

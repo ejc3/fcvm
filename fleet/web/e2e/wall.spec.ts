@@ -1563,6 +1563,32 @@ test("asleep: the recording plays over the poster with its badge, the scores are
   await expect(page.getByTestId("restart-all")).toBeEnabled();
 });
 
+test("asleep with this page connected: the card's Wake button wakes the fleet", async ({ page }) => {
+  await openWall(page, 15);
+  // Held asleep, as the coordinator holds a fleet nobody new has arrived at for an hour.
+  await sleepNow();
+  const arrived = async () => ((await mockState()).state as unknown as { fleet: { power: { last_arrival_at: number | null } } }).fleet.power.last_arrival_at;
+  try {
+    const card = page.getByTestId("sleep-card");
+    await expect(card).toContainText("Asleep.");
+    await expect(card).toContainText("press Wake");
+    const button = card.getByTestId("wake");
+    await expect(button).toHaveText("Wake");
+    await expect(button).toBeEnabled();
+    // The connected page alone does not wake it.
+    await page.waitForTimeout(500);
+    expect(await power()).toBe("asleep");
+    const before = (await arrived())!;
+    await button.click();
+    await expect(card).toContainText(/WAKING (\d+ GPUs|THE GPUs)/);
+    await expect(page.getByTestId("wake")).toHaveCount(0);
+    expect((await arrived())!).toBeGreaterThan(before);
+    await expect.poll(power, { timeout: 20_000 }).toBe("awake");
+  } finally {
+    await wakeUp(page);
+  }
+});
+
 test("with less motion asked for, the poster stays and a button plays the recording", async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
   await openWall(page, 15);

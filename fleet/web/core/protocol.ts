@@ -197,11 +197,18 @@ export interface HostWake {
   phases: { phase: string; at: number }[];
 }
 
-/** The fleet scales to zero with no viewers and wakes when one arrives (`fleet.power`). */
+/**
+ * The fleet scales to zero with no viewers, or with no new viewer for an hour, and wakes when
+ * one arrives or a connected page asks (`fleet.power`).
+ */
 export interface Power {
   state: "asleep" | "waking" | "awake";
   asleep_since: number | null;
   woke_at: number | null;
+  /** The last arrival: a new viewer connection or a page's `wake`. */
+  last_arrival_at: number | null;
+  /** When the fleet sleeps if nobody new arrives first; null when it does not. */
+  sleep_without_arrival_at: number | null;
   hosts: HostWake[];
   /** The last completed wake: when it began, when every GPU was rendering, how many GPUs. */
   last_wake: Wake | null;
@@ -265,7 +272,7 @@ function parseRaces(v: unknown): RaceRecord[] {
 
 function parsePower(v: unknown): Power {
   // A coordinator that does not scale to zero sends nothing: always awake.
-  if (!isObj(v)) return { state: "awake", asleep_since: null, woke_at: null, hosts: [], last_wake: null, wakes: [] };
+  if (!isObj(v)) return { state: "awake", asleep_since: null, woke_at: null, last_arrival_at: null, sleep_without_arrival_at: null, hosts: [], last_wake: null, wakes: [] };
   const w = "fleet.power";
   const state = str(v, "state", w);
   if (state !== "asleep" && state !== "waking" && state !== "awake") throw new ProtocolError(`${w}.state is ${state}`);
@@ -274,6 +281,8 @@ function parsePower(v: unknown): Power {
     state,
     asleep_since: numOrNull(v, "asleep_since", w),
     woke_at: numOrNull(v, "woke_at", w),
+    last_arrival_at: numOrNull(v, "last_arrival_at", w),
+    sleep_without_arrival_at: numOrNull(v, "sleep_without_arrival_at", w),
     hosts: arr(v, "hosts", w).flatMap((h) =>
       isObj(h) && typeof h["host"] === "string"
         ? [
@@ -509,7 +518,7 @@ export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg | HelloMs
 export const DEFAULT_IMAGE_ASPECT = 16 / 9;
 
 /** The intents the page sends, by the coordinator's names (PROTOCOL.md, "Intents"). */
-export const INTENT_NAMES = ["relaunch", "restart_now", "nudge", "word", "light", "claim_gpu", "claim_camera", "claim_autopilot", "release_gpu", "claim_phone", "release_phone", "phone_action", "phones_zoom"] as const;
+export const INTENT_NAMES = ["relaunch", "restart_now", "nudge", "word", "light", "claim_gpu", "claim_camera", "claim_autopilot", "release_gpu", "claim_phone", "release_phone", "phone_action", "phones_zoom", "wake"] as const;
 export type IntentName = (typeof INTENT_NAMES)[number];
 
 export interface IntentMsg {
@@ -536,10 +545,14 @@ export interface VisibilityMsg {
   visible: boolean;
 }
 
-/** The first message on /live: the seat ticket this tab kept, if any. */
+/**
+ * The first message on /live: the seat ticket this tab kept, if any, and whether this page
+ * connected before (a reconnect is not a new viewer arriving).
+ */
 export interface SeatMsg {
   type: "seat";
   ticket: string | null;
+  returning: boolean;
 }
 
 export type ClientMsg = IntentMsg | PingMsg | VerifyMsg | VisibilityMsg | SeatMsg;
@@ -548,8 +561,8 @@ export type ClientMsg = IntentMsg | PingMsg | VerifyMsg | VisibilityMsg | SeatMs
  * The first message on /live, with the seat ticket this tab holds, if any. A URL would carry
  * the ticket into proxy and access logs.
  */
-export function seatMessage(seat: string | null): string {
-  const m: SeatMsg = { type: "seat", ticket: seat };
+export function seatMessage(seat: string | null, returning: boolean): string {
+  const m: SeatMsg = { type: "seat", ticket: seat, returning };
   return JSON.stringify(m);
 }
 

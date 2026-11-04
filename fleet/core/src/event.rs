@@ -28,11 +28,15 @@ pub enum Event {
         #[serde(default)]
         secret: Option<String>,
     },
+    /// A viewer connected. `returning`: the page had connected before (it presented a
+    /// seat ticket, or said it is reconnecting), so this is not an arrival.
     ViewerJoined {
         at: u64,
         viewer: String,
         #[serde(default)]
         client: Option<String>,
+        #[serde(default)]
+        returning: bool,
     },
     ViewerLeft {
         at: u64,
@@ -180,6 +184,8 @@ pub enum Intent {
         action: crate::phone::PhoneAction,
         point: Option<crate::phone::TapPoint>,
     },
+    /// A connected page asks for the GPUs: an arrival, which wakes a sleeping fleet.
+    Wake,
 }
 
 fn opt_str(args: &serde_json::Value, key: &str, what: &str) -> Result<Option<String>, String> {
@@ -265,6 +271,7 @@ impl Intent {
                 })
             }
             "restart_now" => Ok(Intent::RestartNow),
+            "wake" => Ok(Intent::Wake),
             "nudge" => {
                 let target = args
                     .get("target")

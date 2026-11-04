@@ -33,10 +33,14 @@ pub enum ClientMsg {
         visible: bool,
     },
     /// The seat ticket a page kept from an earlier connection, as its first message (a URL
-    /// would carry it into proxy and access logs). Later ones are ignored.
+    /// would carry it into proxy and access logs). Later ones are ignored. `returning`: the
+    /// page connected before (a reconnect, also of a page with no ticket), so the connection
+    /// is not an arrival; a ticket says the same.
     Seat {
         #[serde(default)]
         ticket: Option<String>,
+        #[serde(default)]
+        returning: bool,
     },
 }
 

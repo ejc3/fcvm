@@ -253,6 +253,11 @@ int main() {
     CHECK(!mirror_admits(a.keys, "v-3", forged, 999), "a token another key made");
     Json j = Json::parse(app_scene_line(held));
     CHECK(!j.has("mirror_viewer"), "the app is not sent the holder: %s", app_scene_line(held).c_str());
+    // but it is told that someone holds it, so it draws its held view (PROTOCOL "Phone app")
+    CHECK(j.has("held") && j.at("held").b, "a held phone's app is told it is held: %s", app_scene_line(held).c_str());
+    j = Json::parse(app_scene_line(parsed("{\"epoch_unix_ms\":1000,\"held\":true}")));
+    CHECK(!j.has("held"), "a phone nobody holds is not held, whatever the body says: %s",
+          app_scene_line(parsed("{\"epoch_unix_ms\":1000,\"held\":true}")).c_str());
     std::string err;
     PhoneScene bad;
     CHECK(!phone_scene_parse("{\"epoch_unix_ms\":1,\"mirror_viewer\":" + std::string("\"") + std::string(129, 'v') + "\"}", &bad, &err),

@@ -75,16 +75,6 @@ class FrameState(
                 "t=$t is before t=${scene.historyFrom}, where this phone's own older moves were pruned; it cannot be drawn exactly"
             }
             val aspect = scene.imageAspect ?: surfaceAspect
-            val cam = CameraPath.at(scene.camera, t)
-            val view = Mat.lookAt(cam.pos, cam.look, Vec3(0.0, 1.0, 0.0))
-            val proj = Mat.perspective(cam.fovDeg, aspect, NEAR, FAR)
-            val vp = Mat.mul(proj, view)
-            val fwd = (cam.look - cam.pos).normalized()
-            val right = fwd.cross(Vec3(0.0, 1.0, 0.0)).normalized()
-            val up = right.cross(fwd)
-
-            val night = scene.night ?: nightDefault
-            val sun = if (night) Vec3(0.45, 0.62, -0.35).normalized() else Vec3(-0.52, 0.72, 0.42).normalized()
 
             // Moves: each lasts MOVE_SECS with smooth ramps. The scene's moves stop the walk (every
             // phone shows them together); the phone's own set the pose only, so dropping old ones
@@ -94,6 +84,19 @@ class FrameState(
             val dances = merge(posed.filter { it.kind == MoveKind.DANCE }.map { it.t })
             val waves = merge(posed.filter { it.kind == MoveKind.WAVE }.map { it.t })
             val walk = t - frozen(all, t)
+
+            // a held phone follows its own robot, which walks on the same clock as the crowd
+            val cam = if (scene.held) CameraPath.held(Crowd.subject(scene.rect), Time.wrap(walk, Crowd.PERIOD), t)
+                else CameraPath.at(scene.camera, t)
+            val view = Mat.lookAt(cam.pos, cam.look, Vec3(0.0, 1.0, 0.0))
+            val proj = Mat.perspective(cam.fovDeg, aspect, NEAR, FAR)
+            val vp = Mat.mul(proj, view)
+            val fwd = (cam.look - cam.pos).normalized()
+            val right = fwd.cross(Vec3(0.0, 1.0, 0.0)).normalized()
+            val up = right.cross(fwd)
+
+            val night = scene.night ?: nightDefault
+            val sun = if (night) Vec3(0.45, 0.62, -0.35).normalized() else Vec3(-0.52, 0.72, 0.42).normalized()
             val activeDance = dances.lastOrNull { it.first <= t && t < it.second }?.first
             val danceStart = activeDance ?: dances.lastOrNull { it.first <= t }?.first
             // past its confetti, a dance leaves nothing in the frame: the same age as no dance at all

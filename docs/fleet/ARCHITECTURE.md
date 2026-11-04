@@ -1041,12 +1041,65 @@ its place on the wall and its stream; when it comes back (after `phone_claim_sec
 viewer finds it as every phone starts. The take-over panel sends one of a fixed set of
 actions (`phone_action`), which the coordinator validates as an enum and hands to the agent
 in the phone's assignment; the agent runs `phone.sh action <name>` in the phone container,
-which sends Robot Park the one control request the name maps to (PROTOCOL.md, "Phones
+which sends Robot Park the control requests the name maps to (PROTOCOL.md, "Phones
 mode"): the info tab or the scene tab, rotate, dark or light, the robots dance or wave, the
 app's GPU benchmark, restart the app. Reboot the phone is the coordinator's: it relaunches the
 phone's VM (a clone of its warm snapshot, flow B) and the page shows the restore time. The
 controller takes nothing but the action's name; adb, the emulator console and the app's
 control socket listen only inside the container.
+
+**What the held phone shows each action do.** The owner, 2026-11-04, on staging: "some of
+those things don't do anything because the scene isn't focused on them. make it so". Every
+action has to change what the viewer sees on the phone they hold, within about a second,
+whatever it showed before. Two things hid the effect:
+
+- *No robot on the phone's screen.* A phone draws its slice of the phones' image with the
+  shared camera, and the shared camera is the wall's director: keyframes in kilometres of the
+  wall's terrain (eye at z = -60 to -140 looking further down -z) that Robot Park reads as
+  metres of the park, whose robots walk between z = -46 and 16. Every one of the wall's stops
+  looks away from every robot, so the phones show lawn, trees and hills, and a phone that
+  danced showed no change at all: Robot Park shows no banner for dance or wave
+  (`aHeldPhoneFollowsItsOwnRobotUpClose` asserts that slice holds no robot). A slice of a park camera would still leave the robots at a phone's
+  edge small or outside it.
+- *The info tab in front.* The info screen covers the scene, so dance, wave and night were
+  behind it.
+
+The held view. While a viewer holds a phone, its scene carries `held` (the phone streamer
+adds it while the coordinator's scene names the holder, `mirror_viewer`), and Robot Park
+leaves the shared image as a turned phone does: it draws the whole image on its own, at its
+own aspect, with a camera 5.5 m in front of the phone's own robot, following it along the lawn
+on the crowd's walking clock (a grown walker near the front, a different one for each column
+of phones). That robot is at least 250 px tall on a 720 x 1280 screen and 140 px turned, with
+at least 20 robots on the screen behind it, at every 5 s of the crowd's 1200 s period. When
+the phone is given back its scene no longer carries `held` and it draws its slice again
+(and the return restores it from its snapshot in any case). The other phones draw their slices
+as before; the held phone's place in the seamless image shows its held view, as a turned
+phone's does.
+
+Then each action shows its effect on the screen:
+
+| action | the held phone, before | now |
+|---|---|---|
+| Switch screen | the other tab | the same |
+| Rotate | turned, but no robot in the turned view either; on the info tab the info turns | the scene tab, turned, its robot followed |
+| Dark mode | the night sky; behind the info tab only the banner and the info's colours | the scene tab first, then night or day |
+| Dance, Wave | nothing: no robot on the lawn, or the info tab in front | the scene tab first; the robot in front and the crowd dance or wave |
+| GPU benchmark | the banner, the screen held while it runs, the result banner | the same |
+| Restart app | the app starts again | the same |
+| Open nvidia.com | the browser in front, the page loaded again | the same |
+| Robot Park | nothing when Robot Park was already in front | the scene tab; the page offers it only while the browser is in front |
+| Reboot phone | the panel says Restoring, the phone restores | the same |
+
+Measured on a g4dn.metal (2026-11-04), phone 6 of a six-phone scene with the wall's camera,
+held, on the info tab before each Robot Park action, recording the streamer's `/still` every
+130 ms or so: from the start of `phone.sh action` (as the agent runs it, through `fcvm exec`)
+to the first frame that differs from the one before by more than the scene's own motion, 145 to
+180 ms for the actions inside Robot Park, 280 to 290 ms for the two that bring it from the
+browser, 422 ms for Open nvidia.com and 720 ms for Restart app. On the current host image, dance
+and wave from the info tab changed no frame in 3 s.
+
+Dance and wave were already this phone's own moves (`dance`, `wave`, PROTOCOL.md "Phone
+app"); only the coordinator's scene moves stop the crowd on every phone together.
 
 **Taps in Robot Park.** The owner, 2026-11-04, after clicking the app's Scene and Info tabs
 in a take-over panel that sent nothing: "If our simulator app is up we should let there be
@@ -1625,8 +1678,18 @@ the coordinator scales the GPU host groups to zero and terminates the EC2 tiles;
 coordinator stays up (about $18 a month). The first viewer to arrive wakes the fleet: the
 page shows the poster frame and "Waking up the GPUs" with a live clock and the real wake
 phases, and the measured wake time (first viewer to complete image) is recorded. The fleet
-never sleeps during a race or a "Your own GPU" session. Running cost is then about $5 an hour
+never sleeps during a race, a "Your own GPU" session or a borrowed phone. Running cost is then about $5 an hour
 while anyone watches (one g4dn.metal at current spot prices, plus EC2 tiles while they run).
+
+**Open tabs alone do not keep it awake (2026-11-04).** The owner: "If no new viewers come in
+an hour that should shut things down." Staging had stayed awake for hours on GPU hosts and
+tiles because tabs left open counted as active viewers. So the fleet also sleeps
+after an hour (`--sleep-without-new-viewer`, default 3600 s) with no arrival, even while
+viewers stay connected. An arrival is a new viewer connection or a connected page's Wake
+button (the `wake` intent); a page that reconnects or reloads presents its seat ticket and
+is not one (fleet/PROTOCOL.md, `fleet.power`). A page connected while the fleet sleeps shows
+the sleep card with a Wake button, on the wall and in phones mode. A claim or race in progress
+holds the fleet awake past the hour, and it sleeps when that ends.
 
 **The wake reel. DECIDED (2026-10-23).** While the fleet is asleep or waking, the stage plays a
 60 to 90 second screen recording of the real wall in use (real GPUs, real coordinator, real

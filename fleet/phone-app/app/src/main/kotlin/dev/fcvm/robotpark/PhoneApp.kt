@@ -23,6 +23,8 @@ class PhoneApp : Application() {
         private val main = Handler(Looper.getMainLooper())
         /** The activity on screen, which carries out the actions that need one. */
         @Volatile var ui: MainActivity? = null
+        /** Held to publish [ui] together with the tab it shows, and to read it for an action. */
+        val uiLock = Any()
 
         fun handle(c: Command): Map<String, Any?> = when (c) {
             is Command.SetScene -> { Store.scene = c.scene; ok() }
@@ -49,9 +51,16 @@ class PhoneApp : Application() {
                 Action.LIGHT -> Store.nightOverride = false
                 else -> {}
             }
-            val activity = ui
-            if (activity == null) {
-                return if (a == Action.DARK || a == Action.LIGHT) ok() else mapOf("error" to "the app is not on screen")
+            // Under uiLock, which MainActivity holds to publish itself and show Store.screen: a
+            // tab asked for either reaches the activity or is kept before it shows Store.screen.
+            val activity = synchronized(uiLock) {
+                // A process that answers before its activity exists (just restarted): night or
+                // day is already set above, and the tab is kept for the activity to show.
+                ui ?: return when (a) {
+                    Action.DARK, Action.LIGHT -> ok()
+                    Action.SCENE, Action.INFO -> { Store.screen = a.wire; ok() }
+                    else -> mapOf("error" to "the app is not on screen")
+                }
             }
             main.post { activity.perform(a) }
             return ok()
@@ -69,6 +78,7 @@ class PhoneApp : Application() {
             "samples" to Store.samples,
             "context_generation" to Store.contextGeneration,
             "screen" to Store.screen,
+            "held" to Store.scene.held,
             "night" to (Store.effectiveScene().night ?: Store.systemNight),
             "robots" to Store.robots,
             "benchmark" to (Store.benchmark ?: if (Store.benchmarkRunning) mapOf("running" to true) else null),

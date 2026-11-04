@@ -606,6 +606,25 @@ describe("mock race, second design review", () => {
     expect(st.counters.restores).toBe(restored + st.tiles.filter((t) => t.slot && t.half === "fcvm").length);
   });
 
+  it("held asleep with pages connected, a returning page does not wake it and a page's wake does", async () => {
+    await admin("/mock/power", { sleep: true, hold: true });
+    const power = () => coord.fleetState().fleet.power;
+    const c = await live();
+    await c.next((m) => m["type"] === "snapshot");
+    const before = power().last_arrival_at;
+    c.ws.send(JSON.stringify({ type: "seat", ticket: null, returning: true }));
+    await sleep(100);
+    expect(power().last_arrival_at).toBe(before);
+    expect(power().state).toBe("asleep");
+    c.ws.send(JSON.stringify({ type: "intent", id: "wake-1", name: "wake", args: {} }));
+    const r = await c.next((m) => m["type"] === "receipt" && m["id"] === "wake-1");
+    expect(r["outcome"]).toBe("committed");
+    expect(power().state).toBe("waking");
+    expect(power().last_arrival_at!).toBeGreaterThan(before ?? 0);
+    await until(() => power().state === "awake", 5000);
+    c.ws.close();
+  });
+
   it("serves the recording with byte ranges, and answers 404 when it is missing", async () => {
     const base = `http://localhost:${coord.port}/media`;
     const meta = (await (await fetch(`${base}/wall-reel.json`)).json()) as Record<string, unknown>;

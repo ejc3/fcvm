@@ -1,0 +1,1240 @@
+{
+  "config": {
+    "claim_secs": 120,
+    "idle_scale_down_secs": 60,
+    "max_tiles": 2,
+    "power_managed": true,
+    "restart_cooldown_secs": 1,
+    "sleep_without_new_viewer_secs": 1000
+  },
+  "description": "With power management, the fleet also sleeps once no viewer has arrived for sleep_without_new_viewer_secs, even while viewers stay connected and visible. An arrival is a new viewer connection or a connected page's wake intent; a page that rejoins as returning (it kept a seat ticket, or said it connected before) is not one, and neither is a page turning visible again. Asleep with the limit run out, connected pages do not wake the fleet; a wake intent does, and so does a new viewer, each starting the limit again. A claim or a race in progress holds the fleet awake past the limit; it sleeps as soon as the hold ends. Asleep, claim_gpu and claim_phone are refused.",
+  "events": [
+    {
+      "at": 1000,
+      "host": "h1",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 8,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:02:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:03:00.0"
+          }
+        ],
+        "host": "h1",
+        "type": "hello"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20001/frames",
+        "generation": 1,
+        "id": "slot-1",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-1"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20002/frames",
+        "generation": 1,
+        "id": "slot-2",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-2"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20003/frames",
+        "generation": 1,
+        "id": "slot-3",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-3"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 5000,
+      "client": "198.51.100.31",
+      "type": "viewer_joined",
+      "viewer": "v1"
+    },
+    {
+      "at": 600000,
+      "client": "198.51.100.32",
+      "returning": true,
+      "type": "viewer_joined",
+      "viewer": "v2"
+    },
+    {
+      "at": 1004999,
+      "type": "tick"
+    },
+    {
+      "at": 1005000,
+      "type": "tick"
+    },
+    {
+      "at": 1010000,
+      "type": "visibility",
+      "viewer": "v2",
+      "visible": false
+    },
+    {
+      "at": 1020000,
+      "type": "visibility",
+      "viewer": "v2",
+      "visible": true
+    },
+    {
+      "at": 1030000,
+      "client": "198.51.100.33",
+      "returning": true,
+      "type": "viewer_joined",
+      "viewer": "v3"
+    },
+    {
+      "args": {},
+      "at": 1040000,
+      "client": "198.51.100.31",
+      "id": "w1",
+      "name": "wake",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "at": 1041000,
+      "type": "tick"
+    },
+    {
+      "args": {},
+      "at": 2000000,
+      "client": "198.51.100.31",
+      "id": "c1",
+      "name": "claim_gpu",
+      "secret": "token-a",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "at": 2040000,
+      "type": "tick"
+    },
+    {
+      "at": 2119999,
+      "type": "tick"
+    },
+    {
+      "at": 2120000,
+      "type": "tick"
+    },
+    {
+      "at": 2200000,
+      "client": "198.51.100.34",
+      "type": "viewer_joined",
+      "viewer": "v4"
+    },
+    {
+      "at": 2201000,
+      "type": "tick"
+    },
+    {
+      "args": {},
+      "at": 3190000,
+      "client": "198.51.100.34",
+      "id": "r1",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v4"
+    },
+    {
+      "at": 3200000,
+      "type": "tick"
+    },
+    {
+      "at": 3205000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20001/frames",
+        "generation": 2,
+        "id": "slot-1",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-1"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 3205000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20002/frames",
+        "generation": 2,
+        "id": "slot-2",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-2"
+      },
+      "type": "agent"
+    },
+    {
+      "args": {},
+      "at": 3210000,
+      "client": "198.51.100.34",
+      "id": "c2",
+      "name": "claim_gpu",
+      "secret": "token-b",
+      "type": "intent",
+      "viewer": "v4"
+    },
+    {
+      "args": {},
+      "at": 3211000,
+      "type": "tick"
+    }
+  ],
+  "expect": [
+    {
+      "after": 3,
+      "checks": {
+        "/view/fleet/power/last_arrival_at": 0,
+        "/view/fleet/power/sleep_without_arrival_at": 1000000,
+        "/view/fleet/power/state": "awake"
+      },
+      "note": "a new state counts from the coordinator's start"
+    },
+    {
+      "after": 4,
+      "checks": {
+        "/view/fleet/power/last_arrival_at": 5000,
+        "/view/fleet/power/sleep_without_arrival_at": 1005000
+      },
+      "note": "a new viewer is an arrival"
+    },
+    {
+      "after": 5,
+      "checks": {
+        "/view/fleet/power/last_arrival_at": 5000,
+        "/view/viewers/active": 2
+      },
+      "note": "a returning page is not"
+    },
+    {
+      "after": 6,
+      "checks": {
+        "/view/fleet/power/state": "awake"
+      }
+    },
+    {
+      "after": 7,
+      "checks": {
+        "/view/fleet/power/asleep_since": 1005000,
+        "/view/fleet/power/state": "asleep",
+        "/view/tiles": [],
+        "/view/viewers/active": 2
+      },
+      "note": "asleep with two active viewers"
+    },
+    {
+      "after": 9,
+      "checks": {
+        "/view/fleet/power/state": "asleep"
+      },
+      "note": "a page turning visible again is not an arrival"
+    },
+    {
+      "after": 10,
+      "checks": {
+        "/view/fleet/power/last_arrival_at": 5000,
+        "/view/fleet/power/state": "asleep"
+      }
+    },
+    {
+      "after": 11,
+      "checks": {
+        "/receipts/w1/outcome": "committed",
+        "/view/fleet/power/last_arrival_at": 1040000,
+        "/view/fleet/power/sleep_without_arrival_at": 2040000,
+        "/view/fleet/power/state": "waking",
+        "/view/fleet/power/woke_at": 1040000
+      },
+      "note": "an explicit wake from a connected page"
+    },
+    {
+      "after": 12,
+      "checks": {
+        "/view/fleet/power/state": "awake"
+      }
+    },
+    {
+      "after": 14,
+      "checks": {
+        "/view/claims/0/slot": "slot-3",
+        "/view/fleet/power/state": "awake"
+      },
+      "note": "the claim holds it past the limit"
+    },
+    {
+      "after": 15,
+      "checks": {
+        "/view/fleet/power/state": "awake"
+      }
+    },
+    {
+      "after": 16,
+      "checks": {
+        "/view/claims": [],
+        "/view/fleet/power/asleep_since": 2120000,
+        "/view/fleet/power/state": "asleep"
+      },
+      "note": "the claim ended: asleep at once"
+    },
+    {
+      "after": 17,
+      "checks": {
+        "/view/fleet/power/last_arrival_at": 2200000,
+        "/view/fleet/power/sleep_without_arrival_at": 3200000,
+        "/view/fleet/power/state": "waking"
+      },
+      "note": "a new viewer wakes it"
+    },
+    {
+      "after": 18,
+      "checks": {
+        "/view/fleet/power/state": "awake"
+      }
+    },
+    {
+      "after": 20,
+      "checks": {
+        "/view/fleet/power/state": "awake",
+        "/view/relaunch_all/fcvm_done_at": null
+      },
+      "note": "the race holds it past the limit"
+    },
+    {
+      "after": 22,
+      "checks": {
+        "/view/fleet/power/asleep_since": 3205000,
+        "/view/fleet/power/state": "asleep"
+      },
+      "note": "the race ended: asleep at once"
+    },
+    {
+      "after": 23,
+      "checks": {
+        "/receipts/c2/outcome": "refused",
+        "/receipts/c2/reason": "the GPUs are asleep",
+        "/view/claims": []
+      },
+      "note": "asleep with pages connected: a claim is refused, not held while the hosts are gone"
+    },
+    {
+      "after": 24,
+      "checks": {
+        "/view/fleet/power/state": "asleep"
+      }
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "args": {},
+        "at": 1040000,
+        "id": "w1",
+        "name": "wake",
+        "outcome": "committed",
+        "summary": "wake",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 2000000,
+        "id": "c1",
+        "name": "claim_gpu",
+        "outcome": "committed",
+        "summary": "claim-1 on slot-3",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 3190000,
+        "id": "r1",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 1",
+        "viewer": "v4"
+      },
+      {
+        "args": {},
+        "at": 3210000,
+        "id": "c2",
+        "name": "claim_gpu",
+        "outcome": "refused",
+        "summary": "the GPUs are asleep",
+        "viewer": "v4"
+      }
+    ],
+    "aggregates": [],
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "budget": null,
+    "budget_from_t": null,
+    "claims": [],
+    "cooldown_until": 3191000,
+    "counters": {
+      "restores": 3,
+      "restores_last_hour": 3,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
+    "failures": [],
+    "fleet": {
+      "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
+      "fcvm_gpus": 3,
+      "gpus": 3,
+      "hosts": [
+        {
+          "arch": "x86_64",
+          "draining": false,
+          "gpus": [
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:01:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:02:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:03:00.0"
+            }
+          ],
+          "name": "h1"
+        }
+      ],
+      "max_tiles": 2,
+      "n": 0,
+      "power": {
+        "asleep_since": 3205000,
+        "hosts": [],
+        "idle_since": null,
+        "last_arrival_at": 2200000,
+        "last_wake": {
+          "awake_at": 2201000,
+          "gpus": 2,
+          "ms": 1000,
+          "started_at": 2200000
+        },
+        "sleep_without_arrival_at": 3200000,
+        "state": "asleep",
+        "wakes": [
+          {
+            "awake_at": 1041000,
+            "gpus": 2,
+            "ms": 1000,
+            "started_at": 1040000
+          },
+          {
+            "awake_at": 2201000,
+            "gpus": 2,
+            "ms": 1000,
+            "started_at": 2200000
+          }
+        ],
+        "woke_at": null
+      },
+      "standby": [
+        "slot-1",
+        "slot-2",
+        "slot-3"
+      ],
+      "standby_ready": 0,
+      "warming": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": null,
+      "from_frame": 96195,
+      "from_t": 3206.5,
+      "generation": 6
+    },
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": 3232000,
+      "closes_at": 3239000,
+      "holding": null,
+      "holding_label": null,
+      "leading": "western-sea",
+      "next": "lake-skim",
+      "next_hold_at": null,
+      "next_label": "Low over the western lakes",
+      "opened_at": 3211000,
+      "targets": [
+        {
+          "arrive_at": 3261000,
+          "id": "western-sea",
+          "label": "Over the western sea",
+          "votes": 0
+        },
+        {
+          "arrive_at": 3261000,
+          "id": "peak-lake",
+          "label": "The peak over the lake",
+          "votes": 0
+        },
+        {
+          "arrive_at": 3265000,
+          "id": "ridges",
+          "label": "Across the ridges",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [
+      {
+        "by": "viewer:v4",
+        "ec2": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 0,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "fcvm": {
+          "capacity_wait_ms": 0,
+          "done_at": 3205000,
+          "dropped": 0,
+          "last": "slot-2",
+          "sitting_out": [],
+          "tiles": {
+            "slot-1": {
+              "capacity_wait_ms": 0,
+              "first_frame_at": 3205000,
+              "generation": 2,
+              "phases": {},
+              "tile": "fcvm:1",
+              "waiting_since": null
+            },
+            "slot-2": {
+              "capacity_wait_ms": 0,
+              "first_frame_at": 3205000,
+              "generation": 2,
+              "phases": {},
+              "tile": "fcvm:2",
+              "waiting_since": null
+            }
+          },
+          "time_ms": 15000
+        },
+        "id": 1,
+        "started_at": 3190000
+      }
+    ],
+    "relaunch_all": {
+      "by": "viewer:v4",
+      "ec2_capacity_wait_ms": 0,
+      "ec2_done_at": 3190000,
+      "ec2_gpus": 0,
+      "ec2_ms": null,
+      "ec2_pending": 0,
+      "ec2_waiting_since": null,
+      "fcvm_done_at": 3205000,
+      "fcvm_gpus": 2,
+      "fcvm_ms": 15000,
+      "fcvm_pending": 0,
+      "race": 1,
+      "started_at": 3190000
+    },
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -60.699843,
+            4.6,
+            -126.860866
+          ],
+          "pos": [
+            -45.0,
+            2.8,
+            -118.0
+          ],
+          "t": 3199.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -60.973075,
+            4.6,
+            -126.358281
+          ],
+          "pos": [
+            -45.0,
+            3.018182,
+            -118.0
+          ],
+          "t": 3200.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -61.230225,
+            4.6,
+            -125.84728
+          ],
+          "pos": [
+            -45.0,
+            3.236364,
+            -118.0
+          ],
+          "t": 3201.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -61.471031,
+            4.6,
+            -125.328378
+          ],
+          "pos": [
+            -45.0,
+            3.454545,
+            -118.0
+          ],
+          "t": 3202.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -61.695253,
+            4.6,
+            -124.802097
+          ],
+          "pos": [
+            -45.0,
+            3.672727,
+            -118.0
+          ],
+          "t": 3203.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -61.902664,
+            4.6,
+            -124.268966
+          ],
+          "pos": [
+            -45.0,
+            3.890909,
+            -118.0
+          ],
+          "t": 3204.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -62.093056,
+            4.6,
+            -123.729523
+          ],
+          "pos": [
+            -45.0,
+            4.109091,
+            -118.0
+          ],
+          "t": 3205.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -62.266236,
+            4.6,
+            -123.184311
+          ],
+          "pos": [
+            -45.0,
+            4.327273,
+            -118.0
+          ],
+          "t": 3206.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -62.422031,
+            4.6,
+            -122.633879
+          ],
+          "pos": [
+            -45.0,
+            4.545455,
+            -118.0
+          ],
+          "t": 3207.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -62.560283,
+            4.6,
+            -122.078781
+          ],
+          "pos": [
+            -45.0,
+            4.763636,
+            -118.0
+          ],
+          "t": 3208.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -62.680854,
+            4.6,
+            -121.519576
+          ],
+          "pos": [
+            -45.0,
+            4.981818,
+            -118.0
+          ],
+          "t": 3209.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -62.783621,
+            4.6,
+            -120.956827
+          ],
+          "pos": [
+            -45.0,
+            5.2,
+            -118.0
+          ],
+          "t": 3210.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -62.877451,
+            4.6,
+            -120.392495
+          ],
+          "pos": [
+            -45.0,
+            5.418182,
+            -118.0
+          ],
+          "t": 3211.0
+        },
+        {
+          "fov_deg": 62.276438,
+          "look": [
+            -63.229102,
+            5.163514,
+            -119.980215
+          ],
+          "pos": [
+            -45.346752,
+            5.820114,
+            -117.922671
+          ],
+          "t": 3212.0
+        },
+        {
+          "fov_deg": 63.001352,
+          "look": [
+            -64.179733,
+            6.178581,
+            -119.030401
+          ],
+          "pos": [
+            -46.340761,
+            6.468486,
+            -117.729004
+          ],
+          "t": 3213.0
+        },
+        {
+          "fov_deg": 64.029988,
+          "look": [
+            -65.598969,
+            7.398952,
+            -117.950316
+          ],
+          "pos": [
+            -47.913096,
+            7.233429,
+            -117.471595
+          ],
+          "t": 3214.0
+        },
+        {
+          "fov_deg": 65.233385,
+          "look": [
+            -67.418394,
+            8.613551,
+            -117.052002
+          ],
+          "pos": [
+            -49.995405,
+            8.012027,
+            -117.196524
+          ],
+          "t": 3215.0
+        },
+        {
+          "fov_deg": 66.498383,
+          "look": [
+            -69.609653,
+            9.608849,
+            -116.531265
+          ],
+          "pos": [
+            -52.519915,
+            8.683477,
+            -116.943354
+          ],
+          "t": 3216.0
+        },
+        {
+          "fov_deg": 67.727613,
+          "look": [
+            -72.175919,
+            9.057544,
+            -116.461386
+          ],
+          "pos": [
+            -55.419436,
+            9.073465,
+            -116.745134
+          ],
+          "t": 3217.0
+        },
+        {
+          "fov_deg": 68.839506,
+          "look": [
+            -74.96544,
+            8.261816,
+            -116.735516
+          ],
+          "pos": [
+            -58.627358,
+            9.1,
+            -116.628395
+          ],
+          "t": 3218.0
+        },
+        {
+          "fov_deg": 69.768286,
+          "look": [
+            -77.974986,
+            8.183959,
+            -117.104605
+          ],
+          "pos": [
+            -62.07765,
+            9.1,
+            -116.613154
+          ],
+          "t": 3219.0
+        },
+        {
+          "fov_deg": 70.463973,
+          "look": [
+            -81.11436,
+            7.841871,
+            -117.563313
+          ],
+          "pos": [
+            -65.704863,
+            9.066703,
+            -116.712911
+          ],
+          "t": 3220.0
+        },
+        {
+          "fov_deg": 70.892385,
+          "look": [
+            -84.313731,
+            7.105207,
+            -118.113838
+          ],
+          "pos": [
+            -69.444128,
+            8.85825,
+            -116.934652
+          ],
+          "t": 3221.0
+        },
+        {
+          "fov_deg": 71.035135,
+          "look": [
+            -87.529841,
+            6.185673,
+            -118.753998
+          ],
+          "pos": [
+            -73.231156,
+            8.452288,
+            -117.278844
+          ],
+          "t": 3222.0
+        },
+        {
+          "fov_deg": 70.889629,
+          "look": [
+            -90.71432,
+            5.11498,
+            -119.476216
+          ],
+          "pos": [
+            -77.002239,
+            7.850096,
+            -117.739442
+          ],
+          "t": 3223.0
+        },
+        {
+          "fov_deg": 70.469074,
+          "look": [
+            -93.81953,
+            3.916162,
+            -120.267536
+          ],
+          "pos": [
+            -80.69425,
+            7.065184,
+            -118.303882
+          ],
+          "t": 3224.0
+        },
+        {
+          "fov_deg": 69.802469,
+          "look": [
+            -96.800168,
+            2.626002,
+            -121.109589
+          ],
+          "pos": [
+            -84.244642,
+            6.125191,
+            -118.953086
+          ],
+          "t": 3225.0
+        },
+        {
+          "fov_deg": 68.934611,
+          "look": [
+            -99.621773,
+            1.318087,
+            -121.969739
+          ],
+          "pos": [
+            -87.591448,
+            5.07262,
+            -119.661461
+          ],
+          "t": 3226.0
+        },
+        {
+          "fov_deg": 67.92609,
+          "look": [
+            -102.384563,
+            0.406354,
+            -122.682345
+          ],
+          "pos": [
+            -90.673282,
+            3.964423,
+            -120.396894
+          ],
+          "t": 3227.0
+        },
+        {
+          "fov_deg": 66.853297,
+          "look": [
+            -105.039652,
+            -0.01608,
+            -123.165089
+          ],
+          "pos": [
+            -93.429339,
+            2.870439,
+            -121.120762
+          ],
+          "t": 3228.0
+        },
+        {
+          "fov_deg": 65.808413,
+          "look": [
+            -107.40793,
+            -0.051862,
+            -123.410478
+          ],
+          "pos": [
+            -95.799394,
+            1.870676,
+            -121.787922
+          ],
+          "t": 3229.0
+        },
+        {
+          "fov_deg": 64.899419,
+          "look": [
+            -109.315382,
+            0.133419,
+            -123.471018
+          ],
+          "pos": [
+            -97.723801,
+            1.055208,
+            -122.346716
+          ],
+          "t": 3230.0
+        },
+        {
+          "fov_deg": 64.250091,
+          "look": [
+            -110.678112,
+            0.325563,
+            -123.463202
+          ],
+          "pos": [
+            -99.143498,
+            0.511585,
+            -122.738972
+          ],
+          "t": 3231.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -111.5,
+            0.35,
+            -123.5
+          ],
+          "pos": [
+            -100.0,
+            0.3,
+            -122.9
+          ],
+          "t": 3232.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -112.055556,
+            0.35,
+            -123.522222
+          ],
+          "pos": [
+            -100.555556,
+            0.3,
+            -122.922222
+          ],
+          "t": 3233.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -112.611111,
+            0.35,
+            -123.544444
+          ],
+          "pos": [
+            -101.111111,
+            0.3,
+            -122.944444
+          ],
+          "t": 3234.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -113.166667,
+            0.35,
+            -123.566667
+          ],
+          "pos": [
+            -101.666667,
+            0.3,
+            -122.966667
+          ],
+          "t": 3235.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -113.722222,
+            0.35,
+            -123.588889
+          ],
+          "pos": [
+            -102.222222,
+            0.3,
+            -122.988889
+          ],
+          "t": 3236.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -114.277778,
+            0.35,
+            -123.611111
+          ],
+          "pos": [
+            -102.777778,
+            0.3,
+            -123.011111
+          ],
+          "t": 3237.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -114.833333,
+            0.35,
+            -123.633333
+          ],
+          "pos": [
+            -103.333333,
+            0.3,
+            -123.033333
+          ],
+          "t": 3238.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -115.388889,
+            0.35,
+            -123.655556
+          ],
+          "pos": [
+            -103.888889,
+            0.3,
+            -123.055556
+          ],
+          "t": 3239.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -115.944444,
+            0.35,
+            -123.677778
+          ],
+          "pos": [
+            -104.444444,
+            0.3,
+            -123.077778
+          ],
+          "t": 3240.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -116.5,
+            0.35,
+            -123.7
+          ],
+          "pos": [
+            -105.0,
+            0.3,
+            -123.1
+          ],
+          "t": 3241.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -117.055556,
+            0.35,
+            -123.722222
+          ],
+          "pos": [
+            -105.555556,
+            0.3,
+            -123.122222
+          ],
+          "t": 3242.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.2666,
+      "weather": [
+        {
+          "cover": 0.55,
+          "rays": 1.0,
+          "snow_line_km": 1.7736,
+          "t": 3210.0,
+          "towers": 0.0
+        },
+        {
+          "cover": 0.5,
+          "rays": 0.0,
+          "snow_line_km": 1.9,
+          "t": 3232.0,
+          "towers": 1.0
+        }
+      ],
+      "words": []
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": {
+        "last_capacity_wait_ms": 0,
+        "last_ms": 15000,
+        "last_race": 1,
+        "measured_on": 2,
+        "median_ms": 15000,
+        "races": 1
+      }
+    },
+    "tiles": [],
+    "viewers": {
+      "active": 4,
+      "count": 4
+    }
+  }
+}
