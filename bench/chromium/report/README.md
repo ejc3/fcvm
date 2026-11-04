@@ -66,6 +66,17 @@ That leaves the corpus mix as the publishable headline. Since 2026-10-22 it is t
 Regeneration follows the same rule: anything intended for publication is a
 corpus run, not a fixture run.
 
+## The 2026-11-04 runs
+
+Four serial corpus runs of `make bench-chromium-corpus` on an AWS c8g.metal-48xl, on fcvm `0142e05e` (main after #1499, #1501 and #1503), with `ARMS=cdp,cdp-fast,html-fast,noop,noop-fast` and the default 5 ms target polling (#1495). They measure what the guest restore changes did to the request: fc-agent's restore work is 12.7 to 18.9 ms, against 203 to 374 ms on 2026-10-22. They also differ from the 2026-10-22 runs in Chromium (156.0.8078.79), Firecracker (`3057dcb7`) and the poll interval. c8 ran on a second boot of the instance type: the first was reclaimed by spot during c8, and that partial c8 is not kept. Each run is DNS-verified clean, with 0 failures in 230 attempts per arm. The replay logs are in `ejc3/fcvm-bench-records` at the same paths (`external-logs.json`). Index: `results/campaign-20261104-summary.json`.
+
+| run | configuration | fcvm source | record |
+|---|---|---|---|
+| c2 | 2 vCPU, minor, 4 KiB pages, prefetch on, 5 ms polling | `0142e05e` | `results/reqbench-20261104-corpus-c2` |
+| c4a | 4 vCPU, minor, 4 KiB pages, prefetch on, 5 ms polling | `0142e05e` | `results/reqbench-20261104-corpus-c4a` |
+| c4b | 4 vCPU, minor, 4 KiB pages, prefetch on, 5 ms polling | `0142e05e` | `results/reqbench-20261104-corpus-c4b` |
+| c8 | 8 vCPU, minor, 4 KiB pages, prefetch on, 5 ms polling | `0142e05e` | `results/reqbench-20261104-corpus-c8` |
+
 ## The 2026-10-22 campaign
 
 Every run below is a corpus run of `make bench-chromium-corpus` (or, for the memory, host-control and throughput records, `make bench-chromium-corpus-extra` and `MEASURE=scale`) on an AWS c8g.metal-48xl, with the knobs its meta line records (the serial runs' meta lines name the instance type; the other records do not all do so). Goldens are named G1, G2, ... in the order they appear; runs that share one are A/B or A/B/A comparisons. `restore-ack.jsonl` beside each run's `reqbench.jsonl` was read out of the run's clone logs by `restore_ack.py`; `logs/serve.log` is the memory server's log of the measured run. The replay server's two logs, `corpus-access.log` and `corpus-dns.log`, are kept in the separate repository `ejc3/fcvm-bench-records` at the same paths; each run's `external-logs.json` names the commit there, and `campaign_summary.py` verifies them only with `FCVM_BENCH_RECORDS` set to a checkout of it.
