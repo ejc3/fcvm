@@ -36,10 +36,14 @@ else
 fi
 i=0
 while kill -0 "$C" 2>/dev/null && [ "$i" -lt "${SHOTS:-4}" ]; do
-  X sh -c '/android/platform-tools/adb exec-out screencap -p' > "$OUT/shot-$i.png"
+  timeout 30 "$F" exec --pid "$P" -- sh -c '/android/platform-tools/adb exec-out screencap -p' > "$OUT/shot-$i.png" || echo "FAIL screenshot $i"
   i=$((i + 1))
   sleep 2
 done
 wait "$C"
 cat "$OUT/cap.out"
+# The join pauses the render threads while the guest runs; a guest read that failed meanwhile
+# ended its connection and took SurfaceFlinger with it. The phone must still compose.
+sf=$(X sh -c '/android/platform-tools/adb shell service check SurfaceFlinger' 2>&1)
+case "$sf" in *": found"*) echo "ok   SurfaceFlinger runs after the join" ;; *) echo "FAIL SurfaceFlinger after the join: $sf"; exit 1 ;; esac
 curl -s "http://$IP:$PORT/health" > "$OUT/health.json"
