@@ -1104,7 +1104,11 @@ test("a quarantined GPU leaves the wall and the strip says which and why; a dark
     const hit = await p.evaluate((tid) => {
       const plate = document.querySelector(`[data-testid="phase-${tid}"]`);
       if (!plate) return { shown: false, hits: [] as string[] };
-      const r = plate.getBoundingClientRect();
+      // What is visible of the plate: clipped to its band when the band clips its content.
+      const p = plate.getBoundingClientRect();
+      const band = plate.closest(".content");
+      const b = band && getComputedStyle(band).overflow !== "visible" ? band.getBoundingClientRect() : null;
+      const r = b ? { left: Math.max(p.left, b.left), right: Math.min(p.right, b.right), top: Math.max(p.top, b.top), bottom: Math.min(p.bottom, b.bottom), width: p.width } : p;
       const controls = [...document.querySelectorAll('[data-hud-box], [data-testid="last-race"], [data-testid="restart-all"]')];
       const hits = controls
         .map((el) => ({ el, c: el.getBoundingClientRect() }))
@@ -1123,6 +1127,10 @@ test("a quarantined GPU leaves the wall and the strip says which and why; a dark
     await page.setViewportSize({ width: w, height: h });
     await clear(page, `${w}x${h}`, true);
   }
+  // A message that wraps past the clear band stays inside it.
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await admin("/mock/fault", { fail: id, message: "the VM did not come back after its GPU reset; ".repeat(8), retry_ms: 30_000 });
+  await clear(page, "a long message at 1280x720", true);
   const ctx = await browser.newContext({ ...devices["iPhone 13"], deviceScaleFactor: 1 });
   const phone = await ctx.newPage();
   await openWall(phone, 3);

@@ -160,7 +160,7 @@ a.icon-btn { text-decoration: none; }
 .empty-side { position: absolute; font-size: 14px; color: var(--muted); }
 .dark-tile { position: absolute; overflow: hidden; text-align: center; color: var(--accent); }
 /* The glyph and phase, in the band of the tile the controls over the image leave clear. */
-.dark-tile .content { position: absolute; left: 0; right: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; }
+.dark-tile .content { position: absolute; left: 0; right: 0; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; }
 .dark-tile.hatched { background: var(--hatch); }
 .dark-tile.failed { color: var(--refused); }
 .dark-tile.borrowed { color: var(--fcvm-soft); animation: fade-in 1200ms ease-out; }
