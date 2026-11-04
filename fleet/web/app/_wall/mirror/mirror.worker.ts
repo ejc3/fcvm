@@ -102,7 +102,9 @@ function feed(bytes: Uint8Array): void {
     // process the paused threads still serve.
     if (!joined && r.type !== RECORD.hello && !joining) {
       joined = true;
-      post({ type: "joined" });
+      // with the GL state the processes older than the copy keep drawing: nothing to restart
+      const g = mirror?.stats.join?.gl;
+      post({ type: "joined", snapshot: !!g && !g.error });
     }
     // the phone's ring filled: the copy stopped and the stream has a gap; join again
     if (r.type === RECORD.overflow && ws) {

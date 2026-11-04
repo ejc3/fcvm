@@ -466,10 +466,11 @@ export function Phones({ coordUrl }: { coordUrl: string; mediaUrl: string }) {
       else if (x.type === "stats") setMirrorStats(x);
       else if (x.type === "joined") {
         setMirrorNote(null);
-        // Until the join snapshot lands the mirror starts with the app: restart it into the copy,
-        // once per borrow and stream. A host that does not list restart_app gets no restart, and
-        // the mirror draws only what the app creates from then on (the readout says so).
-        if (canRestartRef.current && joinedFor.current !== `${mirrorKey} ${retry}`) {
+        // A join with the GL state draws every process as it runs. Without one (an emulator
+        // that refused it) the mirror starts with the app: restart it into the copy, once per
+        // borrow and stream. A host that does not list restart_app gets no restart, and the
+        // mirror draws only what the app creates from then on (the readout says so).
+        if (!x.snapshot && canRestartRef.current && joinedFor.current !== `${mirrorKey} ${retry}`) {
           joinedFor.current = `${mirrorKey} ${retry}`;
           actPhone("restart_app", m!.session);
         }

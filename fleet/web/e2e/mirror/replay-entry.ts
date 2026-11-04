@@ -209,9 +209,43 @@ export function replayJoin(canvas: HTMLCanvasElement, tap: Uint8Array, ref: Ref)
   };
 }
 
+export interface LastResult {
+  join: JoinStats | null;
+  posts: number;
+  /** The last frame against the phone's screenshot, or null when the mirror drew none of its size. */
+  match: Omit<Match, "k"> | null;
+  failed: Record<string, number>;
+}
+
+/**
+ * A join stream with live records after it: the whole stream fed, and the last frame the mirror
+ * drew against the phone's screenshot of the screen it settled on.
+ */
+export function replayLast(canvas: HTMLCanvasElement, tap: Uint8Array, ref: Ref): LastResult {
+  const gl = canvas.getContext("webgl2", { antialias: false, alpha: false, preserveDrawingBuffer: true })!;
+  const m = new GlMirror(gl, () => 0);
+  const rr = new RecordReader();
+  for (let at = 0; at < tap.length; at += 1 << 20) for (const rec of rr.push(tap.subarray(at, Math.min(tap.length, at + (1 << 20))))) m.feed(rec);
+  const w = gl.drawingBufferWidth;
+  const h = gl.drawingBufferHeight;
+  let match: Omit<Match, "k"> | null = null;
+  if (m.stats.posts > 0 && ref.w === w && ref.h === h) {
+    // the canvas, not what the guest's calls after the last post left bound
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    gl.pixelStorei(gl.PACK_ALIGNMENT, 4);
+    const raw = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, raw);
+    const top = new Uint8Array(w * h * 4);
+    for (let y = 0; y < h; y++) top.set(raw.subarray((h - 1 - y) * w * 4, (h - y) * w * 4), y * w * 4);
+    match = compare(top, ref.px, w, h);
+  }
+  return { join: m.stats.join, posts: m.stats.posts, match, failed: m.stats.failed };
+}
+
 declare global {
   interface Window {
-    mirrorReplay: { replay: typeof replay; replayJoin: typeof replayJoin; readStamp: typeof readStamp };
+    mirrorReplay: { replay: typeof replay; replayJoin: typeof replayJoin; replayLast: typeof replayLast; readStamp: typeof readStamp };
   }
 }
-window.mirrorReplay = { replay, replayJoin, readStamp };
+window.mirrorReplay = { replay, replayJoin, replayLast, readStamp };

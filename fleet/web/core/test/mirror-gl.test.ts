@@ -4,6 +4,7 @@
 import { describe, expect, it } from "vitest";
 import { GlMirror, layerTransform } from "../../app/_wall/mirror/gl.ts";
 import { encodeCall, encodeRecord, JOIN_PART, RECORD, RecordReader } from "../mirror/wire.ts";
+import { channelBlob, GL, glState, textureBlob } from "./gles-writer.ts";
 
 type Call = { name: string; args: unknown[]; ret?: unknown };
 
@@ -117,6 +118,42 @@ describe("the mirror's context switch", () => {
     const textures = calls.filter((c) => c.name === "createTexture").map((c) => c.ret);
     expect(textures.length).toBeGreaterThanOrEqual(2);
     expect(lastBefore(calls, "bindTexture", "clear", 0x0de1)?.args[1]).toBe(textures[0]);
+  });
+});
+
+describe("rows and buffer types as gfxstream keeps them", () => {
+  it("draws a window surface into a framebuffer of its own and copies it into its color buffer turned over on a flush", () => {
+    const { m, calls } = play([
+      [1, "rcCreateContext", [1, 0, 3]],
+      [1, "reply", [1]],
+      [1, "rcCreateColorBuffer", [16, 8, 0x1908]],
+      [1, "reply", [9]],
+      [1, "rcCreateWindowSurface", [1, 16, 8]],
+      [1, "reply", [3]],
+      [1, "rcSetWindowColorBuffer", [3, 9]],
+      [1, "rcMakeCurrent", [1, 3, 3]],
+      [1, "reply", [1]],
+      [1, "glClear", [0x4000]],
+      [1, "rcFlushWindowColorBuffer", [3]],
+    ]);
+    expect(m.stats.failed).toEqual({});
+    const cbTex = calls.find((c) => c.name === "createTexture")?.ret;
+    // the guest's framebuffer 0 has no color buffer attached: what it draws reaches one at a flush
+    const attached = calls.slice(0, calls.findIndex((c) => c.name === "clear")).filter((c) => c.name === "framebufferTexture2D").map((c) => c.args[3]);
+    expect(attached.length).toBeGreaterThan(0);
+    expect(attached).not.toContain(cbTex);
+    const blit = calls.filter((c) => c.name === "blitFramebuffer");
+    expect(blit.map((c) => c.args.slice(0, 8))).toEqual([[0, 0, 16, 8, 0, 8, 16, 0]]);
+  });
+
+  it("binds a buffer filled as vertices to ELEMENT_ARRAY_BUFFER through a WebGL2 buffer of the element type", () => {
+    const { m, calls } = play([...contexts(), [1, "glGenBuffers", [1, 4]], [1, "reply", [5]], [1, "glBindBuffer", [0x8892, 5]], [1, "glBindBuffer", [0x8893, 5]]]);
+    expect(m.stats.failed).toEqual({});
+    const asArray = calls.filter((c) => c.name === "bindBuffer" && c.args[0] === 0x8892 && c.args[1]).at(-1)?.args[1];
+    const asElement = calls.filter((c) => c.name === "bindBuffer" && c.args[0] === 0x8893 && c.args[1]).at(-1)?.args[1];
+    expect(asArray).toBeTruthy();
+    expect(asElement).toBeTruthy();
+    expect(asElement).not.toBe(asArray);
   });
 });
 
@@ -360,7 +397,7 @@ describe("the join snapshot", () => {
   it("makes every color buffer with its pixels and draws the screen the phone posted last", () => {
     const { m, calls } = joined([colorBuffer(4, 2, 2, 0x11), colorBuffer(9, 4, 2, 0x22), end(0, 61_000, 9)]);
     expect(m.stats.failed).toEqual({});
-    expect(m.stats.join).toEqual({ colorBuffers: 2, bytes: 16 + 32, malformed: 0, ok: true, pauseUs: 61_000, skipped: 0 });
+    expect(m.stats.join).toEqual({ colorBuffers: 2, bytes: 16 + 32, malformed: 0, ok: true, pauseUs: 61_000, skipped: 0, gl: null });
     const uploads = calls.filter((c) => c.name === "texSubImage2D");
     expect(uploads.map((c) => [c.args[4], c.args[5], (c.args[8] as Uint8Array)[0]])).toEqual([
       [2, 2, 0x11],
@@ -391,12 +428,136 @@ describe("the join snapshot", () => {
     expect(calls.filter((c) => c.name === "drawArrays")).toHaveLength(3);
   });
 
-  it("draws the host's posted target turned over, also when the guest posts it again, until the mirror composes into it", () => {
+  it("draws every posted color buffer turned over, the join's and a guest repost alike (row 0 is the screen's top)", () => {
     const uvs = (calls: { name: string; args: unknown[] }[]) => calls.filter((c) => c.name === "uniform4f" && c.args[0] && (c.args[0] as { id?: number }).id === uvId(calls)).map((c) => c.args[2]);
     const post = encodeRecord(RECORD.data, 3, encodeCall("rcFBPost", [9]));
     const { calls } = joined([colorBuffer(9, 2, 2, 0), end(0, 1, 9)], [post]);
     // the post's uv uniform: y origin 1 (turned over) for the END post and the guest's repost
     expect(uvs(calls)).toEqual([1, 1]);
+  });
+
+  // The GL state parts: gles-writer.ts's scene (context 0x11 in share group 7 with texture 2,
+  // texture 5 showing color buffer 0x40, buffer 1, vertex array 9, program 12 with uniform
+  // u_color; context 0x22 sharing group 7, never made current; window surface 0x60), texture
+  // 2's pixels (host name 101), and channel 3 with context 0x11 current on surface 0x60.
+  const cat = (...bs: Uint8Array[]) => {
+    const out = new Uint8Array(bs.reduce((a, b) => a + b.length, 0));
+    let at = 0;
+    for (const b of bs) {
+      out.set(b, at);
+      at += b.length;
+    }
+    return out;
+  };
+  const glParts = (state = glState({ element: 0 })) => [
+    colorBuffer(0x40, 4, 4, 0x33),
+    encodeRecord(RECORD.join, 0, state, JOIN_PART.glState),
+    encodeRecord(RECORD.join, 0, cat(u32(101), textureBlob({ target: GL.TEXTURE_2D, w: 64, h: 32, storage: 0, maxLevel: 0 })), JOIN_PART.texture),
+    encodeRecord(RECORD.join, 0, cat(u32(3), channelBlob()), JOIN_PART.channel),
+  ];
+  const endGl = (flags = 1) => encodeRecord(RECORD.join, 0, u32(0, 1, 0x40, 0, flags), JOIN_PART.end);
+  const live = (ch: number, name: string, args: number[]) => encodeRecord(RECORD.data, ch, encodeCall(name, args));
+
+  /** WebGL2's bindings after the first `end` calls: texture per "unit:target", program, vertex array. */
+  const boundAt = (calls: Call[], end: number) => {
+    let unit = 0;
+    const tex = new Map<string, unknown>();
+    let program: unknown = null;
+    let vao: unknown = null;
+    for (const c of calls.slice(0, end)) {
+      if (c.name === "activeTexture") unit = (c.args[0] as number) - 0x84c0;
+      else if (c.name === "bindTexture") tex.set(`${unit}:${c.args[0]}`, c.args[1]);
+      else if (c.name === "useProgram") program = c.args[0];
+      else if (c.name === "bindVertexArray") vao = c.args[0];
+    }
+    return { tex, program, vao };
+  };
+  /** The scene's objects as the loader made them in WebGL2. */
+  const objects = (calls: Call[]) => {
+    const upload = calls.findIndex((c) => c.name === "texImage2D" && c.args[3] === 64 && c.args[4] === 32);
+    const pointer = calls.findIndex((c) => c.name === "vertexAttribPointer" && JSON.stringify(c.args) === JSON.stringify([0, 3, GL.FLOAT, false, 12, 8]));
+    return {
+      // the loader fills textures on unit 15
+      texture2: upload >= 0 ? boundAt(calls, upload).tex.get(`15:${GL.TEXTURE_2D}`) : undefined,
+      // the color buffer part's texture is the first the mirror made
+      colorBuffer: calls.find((c) => c.name === "createTexture")?.ret,
+      program12: calls.find((c) => c.name === "getUniformLocation" && c.args[1] === "u_color")?.args[0],
+      vao9: pointer >= 0 ? boundAt(calls, pointer).vao : undefined,
+    };
+  };
+  const drawAt = (calls: Call[], count: number) => calls.findIndex((c) => c.name === "drawArrays" && c.args[0] === 4 && c.args[2] === count);
+
+  it("draws on a channel the snapshot made current, with the program, textures and vertex array it had bound", () => {
+    const { m, calls } = joined([...glParts(), endGl()], [live(3, "glDrawArrays", [4, 0, 3]), live(3, "glUniform4f", [1, 0, 0, 0, 1])]);
+    expect(m.stats.failed).toEqual({});
+    expect(m.stats.join?.gl).toMatchObject({
+      error: null,
+      contexts: 3,
+      shareGroups: 2,
+      channels: 1,
+      surfaces: 1,
+      textures: 2,
+      programs: 1,
+      texturesWithoutPixels: 0,
+      clientVertexPointers: 1,
+      programsNotLinked: 0,
+    });
+    const o = objects(calls);
+    expect(o.texture2).toBeDefined();
+    expect(o.program12).toBeDefined();
+    expect(o.vao9).toBeDefined();
+    const draw = drawAt(calls, 3);
+    expect(draw, "the live draw on channel 3 reached WebGL2").toBeGreaterThanOrEqual(0);
+    const at = boundAt(calls, draw);
+    expect(at.program, "program 12 in use").toBe(o.program12);
+    expect(at.vao, "vertex array 9 bound").toBe(o.vao9);
+    expect(at.tex.get(`0:${GL.TEXTURE_2D}`), "texture 2 on unit 0").toBe(o.texture2);
+    expect(at.tex.get(`1:${GL.TEXTURE_2D}`), "texture 5, color buffer 0x40's, on unit 1").toBe(o.colorBuffer);
+    // the saved uniform value, set by name, and the guest's location 1 for later calls
+    const set = calls.find((c) => c.name === "uniform4fv");
+    expect(Array.from(set?.args[1] as Float32Array)).toEqual([1, 0.5, 0.25, 1]);
+    const locations = calls.filter((c) => c.name === "getUniformLocation" && c.args[1] === "u_color").map((c) => c.ret);
+    const uniform = calls.filter((c) => c.name === "uniform4f").pop();
+    expect(uniform?.args).toEqual([locations[0], 0, 0, 0, 1]);
+  });
+
+  it("gives a second context in the share group the same objects", () => {
+    const { m, calls } = joined(
+      [...glParts(), endGl()],
+      [
+        encodeRecord(RECORD.open, 5, new Uint8Array(0)),
+        live(5, "rcMakeCurrent", [0x22, 0x60, 0x60]),
+        live(5, "glActiveTexture", [0x84c0]),
+        live(5, "glBindTexture", [GL.TEXTURE_2D, 2]),
+        live(5, "glUseProgram", [12]),
+        live(5, "glDrawArrays", [4, 0, 6]),
+      ],
+    );
+    expect(m.stats.failed).toEqual({});
+    const o = objects(calls);
+    const draw = drawAt(calls, 6);
+    expect(draw, "the second context's draw reached WebGL2").toBeGreaterThanOrEqual(0);
+    const at = boundAt(calls, draw);
+    expect(at.tex.get(`0:${GL.TEXTURE_2D}`)).toBe(o.texture2);
+    expect(at.program).toBe(o.program12);
+    // vertex arrays are per context: not context 0x11's
+    expect(at.vao).not.toBe(o.vao9);
+  });
+
+  it("keeps the color buffers alone when the GL state does not parse, and the channel unknown", () => {
+    const bad = glState({ element: 0 }).subarray(0, 100);
+    const { m, calls } = joined([...glParts(bad), endGl()], [live(3, "glDrawArrays", [4, 0, 3])]);
+    expect(m.stats.join?.gl?.error).toMatch(/^GL state: /);
+    expect(m.stats.join?.gl?.contexts).toBe(0);
+    expect(m.stats.posts).toBe(1);
+    expect(drawAt(calls, 3)).toBe(-1);
+    expect(m.stats.unknownChannelPackets).toBe(1);
+  });
+
+  it("loads no GL state from an END that does not say it was sent", () => {
+    const { m, calls } = joined([...glParts(), endGl(0)], [live(3, "glDrawArrays", [4, 0, 3])]);
+    expect(m.stats.join?.gl).toBeNull();
+    expect(drawAt(calls, 3)).toBe(-1);
   });
 
   it("draws nothing from a snapshot that failed or does not match its header", () => {

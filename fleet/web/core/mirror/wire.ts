@@ -10,7 +10,7 @@ export const RECORD = { hello: 1, open: 2, close: 3, data: 4, reply: 5, overflow
  * The parts of a join snapshot (JOIN records, their kind in aux): the renderer's state when the
  * copy started, between the HELLO and the first live record. mirror_tap.h has the layout.
  */
-export const JOIN_PART = { begin: 1, colorBuffer: 2, end: 3 } as const;
+export const JOIN_PART = { begin: 1, colorBuffer: 2, end: 3, glState: 4, texture: 5, channel: 6 } as const;
 
 export interface JoinColorBuffer {
   handle: number;
@@ -51,12 +51,20 @@ export interface JoinEnd {
   lastPosted: number;
   /** Color buffers the phone could not read back. */
   skipped: number;
+  /** Bit 0: the GL state parts (GL_STATE, TEXTURE, CHANNEL) were sent. 0 for the 16-byte END of an older tap. */
+  flags: number;
 }
 
 export function joinEnd(p: Uint8Array): JoinEnd | null {
   if (p.length < 16) return null;
   const v = new DataView(p.buffer, p.byteOffset, p.byteLength);
-  return { status: v.getUint32(0, true), pauseUs: v.getUint32(4, true), lastPosted: v.getUint32(8, true), skipped: v.getUint32(12, true) };
+  return {
+    status: v.getUint32(0, true),
+    pauseUs: v.getUint32(4, true),
+    lastPosted: v.getUint32(8, true),
+    skipped: v.getUint32(12, true),
+    flags: p.length >= 20 ? v.getUint32(16, true) : 0,
+  };
 }
 export const HEADER_BYTES = 24;
 export const PROTOCOL_VERSION = 1;
