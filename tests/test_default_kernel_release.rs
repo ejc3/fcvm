@@ -149,8 +149,8 @@ fn every_guest_kernel_fragment_supports_snapshot_socket_cleanup() {
             // Enumerate and retire snapshot-time sockets by kernel cookie.
             "CONFIG_INET_DIAG=y",
             "CONFIG_INET_DIAG_DESTROY=y",
-            // AF_PACKET supplies the receive-path grace period that closes the
-            // capture boundary.
+            // AF_PACKET carries the gateway ARP probe and the IPv6
+            // announcement a restored clone sends (fc-agent's packet sender).
             "CONFIG_PACKET=y",
             // The directional NEW-flow REJECT gate that holds the boundary shut
             // while cookies are captured and retired. The guest runs both
@@ -174,6 +174,16 @@ fn every_guest_kernel_fragment_supports_snapshot_socket_cleanup() {
             assert!(
                 contents.lines().any(|line| line.trim() == option),
                 "{} is missing {option}",
+                path.display()
+            );
+        }
+        // The receive barrier waits its grace period with
+        // membarrier(MEMBARRIER_CMD_GLOBAL), which the base configs enable and
+        // nohz_full refuses; a fragment must not take either away.
+        for refused in ["# CONFIG_MEMBARRIER is not set", "CONFIG_NO_HZ_FULL=y"] {
+            assert!(
+                !contents.lines().any(|line| line.trim() == refused),
+                "{} sets {refused}: the snapshot receive barrier needs membarrier(2)",
                 path.display()
             );
         }

@@ -368,27 +368,112 @@ impl CommandRunner for SystemCommandRunner {
     }
 }
 
-struct SystemPacketReceiveBarrier;
+/// The receive barrier: one RCU grace period. `grace_period` waits it;
+/// `expedite_knob` is the kernel's `rcu_expedited` switch. Both are fields so a
+/// test can watch what the barrier does with them.
+struct SystemPacketReceiveBarrier {
+    expedite_knob: PathBuf,
+    grace_period: fn() -> Result<()>,
+}
+
+const RCU_EXPEDITED_KNOB: &str = "/sys/kernel/rcu_expedited";
+
+impl SystemPacketReceiveBarrier {
+    fn new() -> Self {
+        Self {
+            expedite_knob: PathBuf::from(RCU_EXPEDITED_KNOB),
+            grace_period: membarrier_grace_period,
+        }
+    }
+}
+
+/// One RCU grace period, waited in this thread. membarrier(2)'s
+/// MEMBARRIER_CMD_GLOBAL is `synchronize_rcu()` in the caller, the grace period
+/// `synchronize_net()` waits outside the RTNL lock: it returns once every packet
+/// already in receive processing is done, so with the NEW-flow gate installed
+/// first, no packet that began before it can still create an uncaptured TCP
+/// socket. Merely waiting or taking repeated dumps cannot prove this.
+///
+/// This used to be the release of an AF_PACKET socket (`packet_release()` calls
+/// `synchronize_net()`), and a release waits only when it is the last
+/// reference: a process forked on another thread while the socket was open held
+/// one until its exec, which then made the final release, and the barrier
+/// returned without waiting.
+fn membarrier_grace_period() -> Result<()> {
+    const MEMBARRIER_CMD_GLOBAL: libc::c_long = 1;
+    // SAFETY: membarrier(2) takes plain integer arguments.
+    let result = unsafe { libc::syscall(libc::SYS_membarrier, MEMBARRIER_CMD_GLOBAL, 0, 0) };
+    if result < 0 {
+        return Err(io::Error::last_os_error()).context(
+            "membarrier(MEMBARRIER_CMD_GLOBAL) for the receive barrier (guest kernel needs \
+             CONFIG_MEMBARRIER=y and no nohz_full)",
+        );
+    }
+    Ok(())
+}
 
 impl PacketReceiveBarrier for SystemPacketReceiveBarrier {
     fn synchronize(&self) -> Result<()> {
-        const ETH_P_ALL: u16 = 0x0003;
+        let _expedited = ExpeditedGracePeriods::begin(&self.expedite_knob);
+        (self.grace_period)()
+    }
+}
 
-        // packet_release() executes synchronize_net(), whose kernel contract is
-        // to wait until every packet already in receive processing is done.
-        // The NEW-flow gate is installed first and the link is down, so packets
-        // that begin after this grace period cannot create an uncaptured TCP
-        // socket. Merely waiting or taking repeated dumps cannot prove this.
-        // Dropping the fd invokes the packet socket release path and its
-        // synchronize_net() grace period.
-        let fd = crate::network::open_raw_socket(
-            libc::AF_PACKET,
-            libc::SOCK_RAW,
-            ETH_P_ALL.to_be() as i32,
-        )
-        .context("opening AF_PACKET receive-path barrier (guest kernel needs CONFIG_PACKET=y)")?;
-        drop(fd);
-        Ok(())
+/// The kernel's `rcu_expedited` switch held on for one barrier.
+///
+/// The guest kernel ticks at 100 Hz on arm64, and a normal grace period there
+/// took a median 30 to 41, 37 to 46 and 57 to 66 ms at 2, 4 and 8 vCPUs in
+/// restored clones on m8g.metal-24xl (0.1 to 0.2 ms expedited), on the
+/// restore's path to publication and inside the source's gated window. With the
+/// switch on, `synchronize_rcu()` waits an expedited grace period instead: the
+/// same guarantee, reached by asking each busy CPU for a quiescent state rather
+/// than waiting for ticks to report one. The switch is put back when the
+/// barrier returns, and a switch that was already on is left alone; a write to
+/// it by anyone else while the barrier waits is undone when it returns. A
+/// switch that cannot be read or written leaves the normal grace period, which
+/// is slower and just as sound.
+struct ExpeditedGracePeriods<'a> {
+    knob: &'a Path,
+}
+
+impl<'a> ExpeditedGracePeriods<'a> {
+    fn begin(knob: &'a Path) -> Option<Self> {
+        let current = match std::fs::read_to_string(knob) {
+            Ok(current) => current,
+            Err(error) => {
+                eprintln!(
+                    "[fc-agent] WARNING: cannot read {}: {error}; the receive barrier waits a \
+                     normal grace period",
+                    knob.display()
+                );
+                return None;
+            }
+        };
+        if current.trim() != "0" {
+            return None;
+        }
+        match std::fs::write(knob, "1") {
+            Ok(()) => Some(Self { knob }),
+            Err(error) => {
+                eprintln!(
+                    "[fc-agent] WARNING: cannot write {}: {error}; the receive barrier waits a \
+                     normal grace period",
+                    knob.display()
+                );
+                None
+            }
+        }
+    }
+}
+
+impl Drop for ExpeditedGracePeriods<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::write(self.knob, "0") {
+            eprintln!(
+                "[fc-agent] WARNING: cannot turn {} back off: {error}",
+                self.knob.display()
+            );
+        }
     }
 }
 
@@ -1182,6 +1267,9 @@ pub struct RestoreNetworkReport {
     /// Milliseconds re-asserting close/link-down/barrier; zero on the
     /// verified fast path.
     pub reassert_ms: f64,
+    /// Milliseconds the receive barrier took (one RCU grace period); also
+    /// counted in `reassert_ms` when the gate was reinstalled.
+    pub barrier_ms: f64,
     /// Milliseconds loading the manifest and retiring its sockets.
     pub destroy_ms: f64,
     /// Milliseconds removing the gate's egress half, after the receive barrier
@@ -1598,9 +1686,10 @@ async fn prepare_with<
     // The boundary needs exactly two things: no NEW socket may appear while the
     // cookie dump runs, and packets already in receive processing must drain
     // first. The gate delivers the first (a directional NEW-flow REJECT) and the
-    // AF_PACKET barrier the second. Both are reversible and destroy no kernel
-    // state: the gate is two iptables chains added then removed, the barrier an
-    // open/close whose release runs synchronize_net().
+    // receive barrier the second. Both are reversible and destroy no kernel
+    // state: the gate is two iptables chains added then removed, the barrier one
+    // expedited RCU grace period (`membarrier_grace_period`, with the kernel's
+    // rcu_expedited switch on for its length and put back after).
     //
     // `link.down()` used to sit between them. It prevented sockets the gate
     // already rejects, and purged the device's routes AND neighbours to do it.
@@ -1749,9 +1838,11 @@ async fn restore_boundary_with<
     // destroyed, and the barrier below drains what was already in flight.
     // Downing the link would purge this clone's routes and neighbours, and the
     // boundary no longer captures routes to put them back.
+    let barrier_started = std::time::Instant::now();
     receive_barrier
         .synchronize()
         .context("waiting for restored packet receive processing to quiesce")?;
+    let barrier_ms = barrier_started.elapsed().as_secs_f64() * 1000.0;
     let reassert_ms = if verified_armed {
         0.0
     } else {
@@ -1825,6 +1916,7 @@ async fn restore_boundary_with<
         verified_armed,
         verify_ms,
         reassert_ms,
+        barrier_ms,
         destroy_ms,
         egress_open_ms,
         hook_ms: 0.0,
@@ -1860,7 +1952,7 @@ async fn publish_with<G: FirewallGate, H: RestoreHook>(
 pub async fn prepare_snapshot_network() -> Result<()> {
     let _transaction_lock = acquire_boundary_lock()?;
     let gate = IptablesGate::new(SystemCommandRunner);
-    let receive_barrier = SystemPacketReceiveBarrier;
+    let receive_barrier = SystemPacketReceiveBarrier::new();
     let mut diagnostic = SystemSocketDiagnostic::new();
     let captured = prepare_with(
         &gate,
@@ -2338,7 +2430,7 @@ impl RestoredNetwork {
 pub async fn restore_snapshot_network() -> Result<RestoredNetwork> {
     let transaction_lock = acquire_boundary_lock()?;
     let gate = IptablesGate::new(SystemCommandRunner);
-    let receive_barrier = SystemPacketReceiveBarrier;
+    let receive_barrier = SystemPacketReceiveBarrier::new();
     let mut diagnostic = SystemSocketDiagnostic::new();
     let store = FileManifestStore::default();
     let report = restore_boundary_with(
@@ -5301,5 +5393,133 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The knob each barrier test's grace period reads, and what it read.
+    /// One pair per test: a `fn` pointer cannot capture, and tests run in
+    /// parallel threads of one binary.
+    struct KnobProbe {
+        knob: std::sync::OnceLock<PathBuf>,
+        seen: Mutex<Option<String>>,
+    }
+
+    impl KnobProbe {
+        const fn new() -> Self {
+            Self {
+                knob: std::sync::OnceLock::new(),
+                seen: Mutex::new(None),
+            }
+        }
+
+        fn observe(&self) -> Result<()> {
+            let text = std::fs::read_to_string(self.knob.get().unwrap())
+                .unwrap_or_else(|error| format!("unreadable: {error}"));
+            *self.seen.lock().unwrap() = Some(text);
+            Ok(())
+        }
+    }
+
+    /// The receive barrier's grace period is an expedited one. The guest
+    /// kernel ticks at 100 Hz, and a normal grace period behind it was the
+    /// largest step of a restore before publication and sat inside the
+    /// source's gated window (see `ExpeditedGracePeriods`). The kernel's
+    /// `rcu_expedited` switch is on while the barrier waits and back to its
+    /// old value after; the guarantee (every RCU reader that began before has
+    /// finished) is the same either way.
+    #[test]
+    fn the_receive_barrier_waits_an_expedited_grace_period() {
+        static PROBE: KnobProbe = KnobProbe::new();
+        let dir = tempfile::tempdir().unwrap();
+        let knob = dir.path().join("rcu_expedited");
+        std::fs::write(&knob, "0\n").unwrap();
+        PROBE.knob.set(knob.clone()).unwrap();
+        let barrier = SystemPacketReceiveBarrier {
+            expedite_knob: knob.clone(),
+            grace_period: || PROBE.observe(),
+        };
+        barrier.synchronize().unwrap();
+        assert_eq!(
+            PROBE.seen.lock().unwrap().as_deref().map(str::trim),
+            Some("1"),
+            "the barrier waited a normal grace period: rcu_expedited was not on while it waited"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&knob).unwrap().trim(),
+            "0",
+            "the barrier left the kernel expediting every grace period"
+        );
+    }
+
+    /// A switch someone else turned on stays on, and a kernel without the
+    /// switch still gets its barrier: expediting is an optimisation, the grace
+    /// period is the guarantee.
+    #[test]
+    fn the_receive_barrier_keeps_a_switch_already_on_and_runs_without_one() {
+        static ON: KnobProbe = KnobProbe::new();
+        let dir = tempfile::tempdir().unwrap();
+        let knob = dir.path().join("rcu_expedited");
+        std::fs::write(&knob, "1\n").unwrap();
+        ON.knob.set(knob.clone()).unwrap();
+        SystemPacketReceiveBarrier {
+            expedite_knob: knob.clone(),
+            grace_period: || ON.observe(),
+        }
+        .synchronize()
+        .unwrap();
+        assert_eq!(ON.seen.lock().unwrap().as_deref().map(str::trim), Some("1"));
+        assert_eq!(std::fs::read_to_string(&knob).unwrap().trim(), "1");
+
+        static ABSENT: KnobProbe = KnobProbe::new();
+        let missing = dir.path().join("absent");
+        ABSENT.knob.set(missing.clone()).unwrap();
+        SystemPacketReceiveBarrier {
+            expedite_knob: missing.clone(),
+            grace_period: || ABSENT.observe(),
+        }
+        .synchronize()
+        .unwrap();
+        assert!(
+            ABSENT.seen.lock().unwrap().is_some(),
+            "no grace period without the switch"
+        );
+        assert!(
+            !missing.exists(),
+            "the barrier created a knob that was not there"
+        );
+    }
+
+    /// The barrier waits its grace period in its own thread. Releasing a
+    /// descriptor waits only when it is the last reference: a process forked on
+    /// another thread while the barrier's AF_PACKET socket was open held one
+    /// until its exec, made the final release there, and the barrier returned
+    /// without waiting (the same transfer moved the packet sender's release
+    /// into `iptables -S`, 2-3 ms to 27-75 ms, #1151). `membarrier(2)`'s
+    /// MEMBARRIER_CMD_GLOBAL is `synchronize_rcu()` in the caller.
+    #[test]
+    fn the_receive_barrier_waits_in_its_own_thread_not_on_a_release() {
+        let source = include_str!("snapshot_network.rs");
+        let start = source
+            .find("impl SystemPacketReceiveBarrier {")
+            .expect("the barrier's constructor");
+        let constructor = &source[start..start + source[start..].find("\n}\n").unwrap()];
+        assert!(
+            constructor.contains("grace_period: membarrier_grace_period"),
+            "the production barrier must wait with membarrier: {constructor}"
+        );
+        let start = source
+            .find("fn membarrier_grace_period()")
+            .expect("membarrier_grace_period");
+        let body = &source[start..start + source[start..].find("\n}\n").unwrap()];
+        assert!(
+            body.contains("libc::SYS_membarrier") && body.contains("MEMBARRIER_CMD_GLOBAL"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("open_raw_socket"),
+            "the grace period must not be a descriptor release: {body}"
+        );
+        // The kernel this runs on accepts the command (it is refused under
+        // nohz_full, and without CONFIG_MEMBARRIER).
+        membarrier_grace_period().unwrap();
     }
 }

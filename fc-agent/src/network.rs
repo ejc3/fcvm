@@ -14,7 +14,7 @@ use crate::snapshot_network::SYSFS_NET_PATH;
 
 /// Open a raw kernel socket as an owned descriptor, SOCK_CLOEXEC always set.
 /// The one unsafe socket(2) call shared by this crate's raw-socket users
-/// (AF_PACKET barrier, AF_PACKET ARP probe, netlink).
+/// (AF_PACKET frame sender, netlink).
 pub(crate) fn open_raw_socket(
     domain: libc::c_int,
     socket_type: libc::c_int,
@@ -41,8 +41,8 @@ pub(crate) fn open_raw_socket(
 /// waited inside its own exec (the `iptables -S` verification after the ARP
 /// probe went from 2-3 ms to 27-75 ms). A socket that is never released costs
 /// neither. Protocol 0 registers no receive hook, so it sees no traffic; each
-/// send names its protocol in the address. The receive barrier opens and
-/// closes its own socket: its grace period is the barrier.
+/// send names its protocol in the address. The receive barrier waits its own
+/// grace period with membarrier(2) (`snapshot_network::membarrier_grace_period`).
 fn packet_sender() -> std::io::Result<std::os::fd::BorrowedFd<'static>> {
     use std::os::fd::AsFd;
     static SENDER: std::sync::OnceLock<OwnedFd> = std::sync::OnceLock::new();
