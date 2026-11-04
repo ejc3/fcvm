@@ -66,7 +66,7 @@ What the boundary needs is narrow, and both halves are non-destructive:
 | need | mechanism | reversible? |
 |------|-----------|-------------|
 | no NEW socket may appear while the cookie dump runs | directional NEW-flow REJECT gate (iptables/ip6tables) | yes: its chains and hooks added, then removed |
-| packets already in receive processing must drain | AF_PACKET open/close, whose release runs `synchronize_net()` | nothing to reverse |
+| packets already in receive processing must drain | one expedited RCU grace period, `membarrier(MEMBARRIER_CMD_GLOBAL)` in fc-agent's own thread | yes: the kernel's `rcu_expedited` switch is on for the grace period, then put back |
 | restore must destroy exactly the snapshot-time sockets | dump kernel socket **cookies** into a manifest | read-only |
 
 The dump has to happen at snapshot time and cannot move to restore: by the time
@@ -166,7 +166,7 @@ egress opens; `the_egress_gate_rejects_ntp_and_no_other_udp` pins it. The reject
 so a source VM's chronyd logs at most one failed poll per snapshot, and both the source and a
 restored clone ask chronyd for a burst (`chrony_burst`) once egress is open again.
 
-### Opening the gate costs no grace period on the restore path
+### Opening the gate costs no grace period, and the barrier an expedited one
 
 Each half of the gate opens with one nf_tables commit covering both families,
 sent by fc-agent over nfnetlink (`fc-agent/src/nftables.rs`), not with an
@@ -183,11 +183,19 @@ send-only AF_PACKET socket for its whole life. Releasing them on another thread
 is not a fix: a process forked before the release holds a reference until its
 exec closes the CLOEXEC descriptor, so that process makes the final release and
 waits the grace period inside its own exec (the `iptables -S` after the ARP
-probe went from 2-3 ms to 27-75 ms). The receive barrier is the one release
-that must stay: its grace period is the barrier.
+probe went from 2-3 ms to 27-75 ms). The same transfer is why the receive
+barrier is not a release either: a fork that takes over the release makes the
+barrier return without waiting. It calls `membarrier(MEMBARRIER_CMD_GLOBAL)`,
+which is `synchronize_rcu()` in the caller, with `/sys/kernel/rcu_expedited` on
+for its length, because a normal grace period behind the arm64 guest's 100 Hz
+tick was the largest step of a restore: `tcp_barrier_ms` median 30 to 41, 37 to
+46 and 57 to 66 ms at 2, 4 and 8 vCPUs on m8g.metal-24xl, and 0.1 to 0.2 ms
+expedited.
 `the_gate_socket_is_kept_and_never_released`,
-`frames_are_sent_through_the_socket_that_is_never_released` and
-`opening_each_half_is_one_transaction_for_both_families` pin it.
+`frames_are_sent_through_the_socket_that_is_never_released`,
+`opening_each_half_is_one_transaction_for_both_families`,
+`the_receive_barrier_waits_an_expedited_grace_period` and
+`the_receive_barrier_waits_in_its_own_thread_not_on_a_release` pin it.
 
 ### The source's clock is stepped forward before its gate reopens
 

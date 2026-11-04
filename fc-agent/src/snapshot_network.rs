@@ -422,14 +422,16 @@ impl PacketReceiveBarrier for SystemPacketReceiveBarrier {
 /// The kernel's `rcu_expedited` switch held on for one barrier.
 ///
 /// The guest kernel ticks at 100 Hz on arm64, and a normal grace period there
-/// took 26, 46 and 79 ms at 2, 4 and 8 vCPUs in restored clones (#1151), on the
+/// took a median 30 to 41, 37 to 46 and 57 to 66 ms at 2, 4 and 8 vCPUs in
+/// restored clones on m8g.metal-24xl (0.1 to 0.2 ms expedited), on the
 /// restore's path to publication and inside the source's gated window. With the
 /// switch on, `synchronize_rcu()` waits an expedited grace period instead: the
 /// same guarantee, reached by asking each busy CPU for a quiescent state rather
 /// than waiting for ticks to report one. The switch is put back when the
-/// barrier returns, and a switch that was already on is left alone. A switch
-/// that cannot be read or written leaves the normal grace period, which is
-/// slower and just as sound.
+/// barrier returns, and a switch that was already on is left alone; a write to
+/// it by anyone else while the barrier waits is undone when it returns. A
+/// switch that cannot be read or written leaves the normal grace period, which
+/// is slower and just as sound.
 struct ExpeditedGracePeriods<'a> {
     knob: &'a Path,
 }
@@ -5418,9 +5420,9 @@ mod tests {
     }
 
     /// The receive barrier's grace period is an expedited one. The guest
-    /// kernel ticks at 100 Hz, and a normal grace period behind it took 26,
-    /// 46 and 79 ms at 2, 4 and 8 vCPUs in restored clones, on the restore's
-    /// path to publication and inside the source's gated window. The kernel's
+    /// kernel ticks at 100 Hz, and a normal grace period behind it was the
+    /// largest step of a restore before publication and sat inside the
+    /// source's gated window (see `ExpeditedGracePeriods`). The kernel's
     /// `rcu_expedited` switch is on while the barrier waits and back to its
     /// old value after; the guarantee (every RCU reader that began before has
     /// finished) is the same either way.
