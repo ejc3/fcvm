@@ -35,8 +35,9 @@ else
   sleep 1
 fi
 i=0
+failed=0
 while kill -0 "$C" 2>/dev/null && [ "$i" -lt "${SHOTS:-4}" ]; do
-  timeout 30 "$F" exec --pid "$P" -- sh -c '/android/platform-tools/adb exec-out screencap -p' > "$OUT/shot-$i.png" || echo "FAIL screenshot $i"
+  timeout 30 "$F" exec --pid "$P" -- sh -c '/android/platform-tools/adb exec-out screencap -p' > "$OUT/shot-$i.png" || { echo "FAIL screenshot $i"; failed=1; }
   i=$((i + 1))
   sleep 2
 done
@@ -47,3 +48,4 @@ cat "$OUT/cap.out"
 sf=$(X sh -c '/android/platform-tools/adb shell service check SurfaceFlinger' 2>&1)
 case "$sf" in *": found"*) echo "ok   SurfaceFlinger runs after the join" ;; *) echo "FAIL SurfaceFlinger after the join: $sf"; exit 1 ;; esac
 curl -s "http://$IP:$PORT/health" > "$OUT/health.json"
+exit "$failed"

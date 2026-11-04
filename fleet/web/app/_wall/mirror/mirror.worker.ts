@@ -93,13 +93,17 @@ function fresh(): void {
 function feed(bytes: Uint8Array): void {
   tapBytes += bytes.length;
   for (const r of reader.push(bytes)) {
-    if (r.type === RECORD.hello && !joined) {
-      joined = true;
-      post({ type: "joined" });
-    }
     mirror?.feed(r);
     if (r.type === RECORD.join) joining = r.aux !== JOIN_PART.end;
     else if (r.type !== RECORD.hello) joining = false;
+    // Joined once the join has been fed (its END), or at the first live record of a stream
+    // without one. Not at the HELLO: the phone's render threads stay paused for the join until
+    // its END, and an app restarted meanwhile (the panel restarts it once joined) would end a
+    // process the paused threads still serve.
+    if (!joined && r.type !== RECORD.hello && !joining) {
+      joined = true;
+      post({ type: "joined" });
+    }
     // the phone's ring filled: the copy stopped and the stream has a gap; join again
     if (r.type === RECORD.overflow && ws) {
       retire("the phone's copy of its commands overflowed: join again");

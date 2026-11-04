@@ -90,6 +90,12 @@ export interface ColorBuffer {
   tex: WebGLTexture;
   w: number;
   h: number;
+  /**
+   * Its rows run from the screen's top: a composition target the host drew (the join's posted
+   * buffer), until the mirror composes into it. The mirror's own composition keeps GL's
+   * bottom row first.
+   */
+  topRowFirst?: boolean;
 }
 
 /** One guest context: its share group, its stand-ins for vertex array 0 and its framebuffers, and its state. */
@@ -329,11 +335,13 @@ export class GlMirror {
       j.ok = e.status === 0;
       j.pauseUs = e.pauseUs;
       j.skipped = e.skipped;
-      // The host composes its targets with the screen's top row first; the mirror's own
-      // composition (and the post that draws it) keeps GL's bottom row first. The posted
-      // buffer is the host's last target, so it is drawn turned over; the mirror's next
-      // composition overwrites it whole.
-      if (j.ok && e.lastPosted) this.post(e.lastPosted, undefined, true);
+      // The posted buffer is the host's last composition target, whose rows run from the
+      // screen's top: it is drawn turned over until the mirror composes into it.
+      const posted = j.ok && e.lastPosted ? this.colorBuffers.get(e.lastPosted) : undefined;
+      if (posted) {
+        posted.topRowFirst = true;
+        this.post(posted.handle);
+      }
     }
   }
 
@@ -1444,6 +1452,8 @@ void main() { o = mode == 1 ? color : texture(src, t) * color.a; }`;
       if (w <= 0 || h <= 0) return;
       target = this.newColorBuffer(handle, w, h);
     }
+    // the mirror draws it from here: GL's bottom row first
+    target.topRowFirst = false;
     const q = this.quad();
     const fbo = gl.createFramebuffer()!;
     this.ownState();
@@ -1497,7 +1507,7 @@ void main() { o = mode == 1 ? color : texture(src, t) * color.a; }`;
   }
 
   /** The screen: the posted color buffer, drawn to the canvas. */
-  private post(handle: number, _call?: Call, topRowFirst = false): void {
+  private post(handle: number, _call?: Call): void {
     const cb = this.colorBuffers.get(handle);
     if (!cb) return;
     const gl = this.gl;
@@ -1517,7 +1527,7 @@ void main() { o = mode == 1 ? color : texture(src, t) * color.a; }`;
     gl.uniform1i(q.uMode, 0);
     gl.uniform4f(q.uColor, 1, 1, 1, 1);
     gl.uniform4f(q.uRect, 0, 0, 1, 1);
-    gl.uniform4f(q.uUv, 0, topRowFirst ? 1 : 0, 1, topRowFirst ? -1 : 1);
+    gl.uniform4f(q.uUv, 0, cb.topRowFirst ? 1 : 0, 1, cb.topRowFirst ? -1 : 1);
     gl.uniformMatrix2fv(q.uXm, false, [1, 0, 0, 1]);
     gl.uniform2f(q.uXo, 0, 0);
     gl.bindTexture(GL_TEXTURE_2D, cb.tex);

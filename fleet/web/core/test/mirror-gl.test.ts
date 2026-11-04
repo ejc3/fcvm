@@ -333,6 +333,11 @@ describe("composition layers", () => {
   });
 });
 
+/** The id of the blit program's `uv` uniform location, from the getUniformLocation call that made it. */
+function uvId(calls: { name: string; args: unknown[]; ret?: unknown }[]): number | undefined {
+  return (calls.find((c) => c.name === "getUniformLocation" && c.args[1] === "uv")?.ret as { id?: number } | undefined)?.id;
+}
+
 describe("the join snapshot", () => {
   /** A stream that starts with a join: HELLO, BEGIN, color buffers, END, then live records. */
   const joined = (parts: Uint8Array[], live: Uint8Array[] = []) => {
@@ -384,6 +389,14 @@ describe("the join snapshot", () => {
     // the END's post, then the compose's layer and its post
     expect(m.stats.posts).toBe(2);
     expect(calls.filter((c) => c.name === "drawArrays")).toHaveLength(3);
+  });
+
+  it("draws the host's posted target turned over, also when the guest posts it again, until the mirror composes into it", () => {
+    const uvs = (calls: { name: string; args: unknown[] }[]) => calls.filter((c) => c.name === "uniform4f" && c.args[0] && (c.args[0] as { id?: number }).id === uvId(calls)).map((c) => c.args[2]);
+    const post = encodeRecord(RECORD.data, 3, encodeCall("rcFBPost", [9]));
+    const { calls } = joined([colorBuffer(9, 2, 2, 0), end(0, 1, 9)], [post]);
+    // the post's uv uniform: y origin 1 (turned over) for the END post and the guest's repost
+    expect(uvs(calls)).toEqual([1, 1]);
   });
 
   it("draws nothing from a snapshot that failed or does not match its header", () => {

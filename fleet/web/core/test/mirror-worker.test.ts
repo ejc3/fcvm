@@ -147,6 +147,21 @@ describe("the mirror worker", () => {
     z.close();
   });
 
+  it("says joined once the join's END is fed, not at the HELLO (the phone is paused until then)", async () => {
+    const send = await worker();
+    send({ type: "open", url: "wss://phone/mirror", admit: "t" });
+    const ws = FakeSocket.all[0]!;
+    const { z, msg } = streamer();
+    const u32 = (...x: number[]) => new Uint8Array(new Uint32Array(x).buffer);
+    ws.message(await msg(Buffer.concat([hello(), encodeRecord(RECORD.join, 0, u32(1), JOIN_PART.begin)])));
+    await settle();
+    expect(joins()).toBe(0);
+    ws.message(await msg(encodeRecord(RECORD.join, 0, u32(0, 1000, 0, 0, 0), JOIN_PART.end)));
+    await settle();
+    expect(joins()).toBe(1);
+    z.close();
+  });
+
   it("replays nothing a retired connection received, and reports nothing it says afterwards", async () => {
     const send = await worker();
     send({ type: "open", url: "wss://phone/mirror", admit: "a" });
