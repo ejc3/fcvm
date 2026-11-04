@@ -1466,13 +1466,45 @@ export function specLine(st: FleetState, s: ClientState, image: Box | null, dpr:
 }
 
 /**
+ * The `fault_message` of the first JSON object in `text` that has one as a string (Firecracker's
+ * API error body inside fcvm's output), parsed as JSON; null when none parses.
+ */
+function faultMessage(text: string): string | null {
+  const t = text.slice(0, 8_192);
+  for (let i = t.indexOf("{"); i !== -1; i = t.indexOf("{", i + 1)) {
+    // The object that opens at i ends at its matching brace, strings skipped.
+    let depth = 0;
+    let inString = false;
+    let end = -1;
+    for (let j = i; j < t.length && end === -1; j++) {
+      const c = t[j];
+      if (inString) {
+        if (c === "\\") j++;
+        else if (c === '"') inString = false;
+      } else if (c === '"') inString = true;
+      else if (c === "{") depth++;
+      else if (c === "}" && --depth === 0) end = j;
+    }
+    if (end === -1) continue;
+    try {
+      const v: unknown = JSON.parse(t.slice(i, end + 1));
+      const m = typeof v === "object" && v !== null ? (v as Record<string, unknown>)["fault_message"] : undefined;
+      if (typeof m === "string") return m;
+    } catch {
+      // Not JSON: look at the next brace.
+    }
+  }
+  return null;
+}
+
+/**
  * Why a quarantined GPU is out, in a short phrase: the innermost clause of Firecracker's
  * fault message when the error carries one ("VFIO error: Device does not provide MSIx
  * irq"), else the agent's own text before fcvm's output.
  */
 export function quarantineReason(error: string | null): string {
   if (!error) return "no reason given";
-  const fault = /"fault_message":"([^"]*)"/.exec(error)?.[1];
+  const fault = faultMessage(error);
   const text = fault ? fault.split(": ").slice(-2).join(": ") : error.split("; fcvm said: ")[0]!;
   const max = 120;
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;

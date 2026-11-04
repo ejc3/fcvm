@@ -222,16 +222,19 @@ describe("failure states", () => {
   it("names each quarantined GPU and why in the strip, and nothing when none is out", () => {
     const st = fleet(2, 2);
     expect(view(stateWith(st), EPOCH).outOfRotation).toBe("");
-    // The staging host's GPU of 2026-11-04, as the coordinator listed it.
+    // A restore that failed to attach the GPU, in the shape the agent reports it.
     const vfio =
       "fcvm exited (exit status: 1) before the renderer's first frame; fcvm said: ERROR fcvm: Error: loading snapshot: Firecracker API error: 400 Bad Request - " +
       '{"fault_message":"Load snapshot error: Failed to restore from snapshot: Failed to attach a passthrough device on restore: Attaching the passthrough device failed: VFIO error: Device does not provide MSIx irq"}';
     const q = (sbdf: string, error: string) => ({ kind: "gpu_quarantined", host: "example-host", since: EPOCH, sbdf, error });
-    const v = view(stateWith({ ...st, failures: [q("0000:19:00.0", vfio)] }), EPOCH);
-    expect(v.outOfRotation).toBe("1 fcvm GPU out of rotation: 0000:19:00.0, VFIO error: Device does not provide MSIx irq");
+    const v = view(stateWith({ ...st, failures: [q("0000:0a:00.0", vfio)] }), EPOCH);
+    expect(v.outOfRotation).toBe("1 fcvm GPU out of rotation: 0000:0a:00.0, VFIO error: Device does not provide MSIx irq");
     // Without a fault message the agent's own text, before fcvm's output, is the reason.
-    expect(outOfRotationLine({ ...st, failures: [q("0000:19:00.0", vfio), q("0000:1a:00.0", "scrub of 0000:1a:00.0 failed (1): bad ECC; fcvm said: x")] })).toBe(
-      "2 fcvm GPUs out of rotation: 0000:19:00.0, VFIO error: Device does not provide MSIx irq; 0000:1a:00.0, scrub of 0000:1a:00.0 failed (1): bad ECC",
+    // The fault message is read as JSON: an escaped quote in it, and space after the colon.
+    const quoted = 'fcvm exited; fcvm said: Error: 400 - { "fault_message" : "Load snapshot error: VFIO error: device \\"gpu0\\" lost its BAR"}';
+    expect(outOfRotationLine({ ...st, failures: [q("0000:0a:00.0", quoted)] })).toBe('1 fcvm GPU out of rotation: 0000:0a:00.0, VFIO error: device "gpu0" lost its BAR');
+    expect(outOfRotationLine({ ...st, failures: [q("0000:0a:00.0", vfio), q("0000:0b:00.0", "scrub of 0000:0b:00.0 failed (1): bad ECC; fcvm said: x")] })).toBe(
+      "2 fcvm GPUs out of rotation: 0000:0a:00.0, VFIO error: Device does not provide MSIx irq; 0000:0b:00.0, scrub of 0000:0b:00.0 failed (1): bad ECC",
     );
   });
 
