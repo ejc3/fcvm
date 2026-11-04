@@ -1221,4 +1221,18 @@ fn a_borrowed_phone_holds_the_fleet_awake_past_the_arrival_limit() {
     assert_eq!(s.fleet.power.state, "asleep", "the loan ended");
     assert_eq!(s.fleet.power.asleep_since, Some(210_000));
     assert_eq!(view(&s).viewers.active, 1);
+    // Asleep with the page still there: a new loan is refused, not held while hosts are gone.
+    let g = s.fleet.phones[&1].generation;
+    for e in events(serde_json::json!([
+        {"type": "agent", "at": 250_000, "host": "h1", "msg": {"type": "slot", "id": "phone-1", "phase": "running",
+            "generation": g, "vm": "fleet-phone-1", "frame_url": "ws://h1:20101/frames", "timings": {}}},
+        {"type": "intent", "at": 300_000, "id": "c2", "name": "claim_phone", "viewer": "v1",
+            "client": "198.51.100.20", "args": {"phone": "phone-1"}},
+    ])) {
+        s = apply(s, &e);
+    }
+    assert_eq!(
+        s.receipts["c2"].reason.as_deref(),
+        Some("the GPUs are asleep")
+    );
 }

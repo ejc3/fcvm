@@ -786,6 +786,11 @@ fn intent_effect(
             }
             Ok("light".into())
         }
+        // Asleep with pages still connected (no new viewer for the limit), a claim would hold
+        // a GPU the fleet is not running and keep nothing awake: refuse it, as restart_now.
+        Intent::ClaimGpu | Intent::ClaimPhone { .. } if state.fleet.power.state == "asleep" => {
+            Err("the GPUs are asleep".into())
+        }
         Intent::ClaimGpu => claim(state, c),
         Intent::ClaimPhone { phone } => claim_phone(state, c, phone.as_deref()),
         Intent::ReleasePhone { claim } => {

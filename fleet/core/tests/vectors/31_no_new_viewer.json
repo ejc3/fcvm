@@ -7,7 +7,7 @@
     "restart_cooldown_secs": 1,
     "sleep_without_new_viewer_secs": 1000
   },
-  "description": "With power management, the fleet also sleeps once no viewer has arrived for sleep_without_new_viewer_secs, even while viewers stay connected and visible. An arrival is a new viewer connection or a connected page's wake intent; a page that rejoins as returning (it kept a seat ticket, or said it connected before) is not one, and neither is a page turning visible again. Asleep with the limit run out, connected pages do not wake the fleet; a wake intent does, and so does a new viewer, each starting the limit again. A claim or a race in progress holds the fleet awake past the limit; it sleeps as soon as the hold ends.",
+  "description": "With power management, the fleet also sleeps once no viewer has arrived for sleep_without_new_viewer_secs, even while viewers stay connected and visible. An arrival is a new viewer connection or a connected page's wake intent; a page that rejoins as returning (it kept a seat ticket, or said it connected before) is not one, and neither is a page turning visible again. Asleep with the limit run out, connected pages do not wake the fleet; a wake intent does, and so does a new viewer, each starting the limit again. A claim or a race in progress holds the fleet awake past the limit; it sleeps as soon as the hold ends. Asleep, claim_gpu and claim_phone are refused.",
   "events": [
     {
       "at": 1000,
@@ -201,6 +201,21 @@
         "vm": "fleet-slot-2"
       },
       "type": "agent"
+    },
+    {
+      "args": {},
+      "at": 3210000,
+      "client": "198.51.100.34",
+      "id": "c2",
+      "name": "claim_gpu",
+      "secret": "token-b",
+      "type": "intent",
+      "viewer": "v4"
+    },
+    {
+      "args": {},
+      "at": 3211000,
+      "type": "tick"
     }
   ],
   "expect": [
@@ -329,6 +344,21 @@
         "/view/fleet/power/state": "asleep"
       },
       "note": "the race ended: asleep at once"
+    },
+    {
+      "after": 23,
+      "checks": {
+        "/receipts/c2/outcome": "refused",
+        "/receipts/c2/reason": "the GPUs are asleep",
+        "/view/claims": []
+      },
+      "note": "asleep with pages connected: a claim is refused, not held while the hosts are gone"
+    },
+    {
+      "after": 24,
+      "checks": {
+        "/view/fleet/power/state": "asleep"
+      }
     }
   ],
   "final_view": {
@@ -358,6 +388,15 @@
         "name": "restart_now",
         "outcome": "committed",
         "summary": "race 1",
+        "viewer": "v4"
+      },
+      {
+        "args": {},
+        "at": 3210000,
+        "id": "c2",
+        "name": "claim_gpu",
+        "outcome": "refused",
+        "summary": "the GPUs are asleep",
         "viewer": "v4"
       }
     ],
@@ -454,32 +493,32 @@
     },
     "next_race_at": null,
     "nudges": {
-      "arrive_next_at": null,
-      "closes_at": 2298999,
-      "holding": "cloud-climb",
-      "holding_label": "Up through the clouds",
-      "leading": "lake-skim",
-      "next": null,
-      "next_hold_at": 2300999,
-      "next_label": null,
-      "opened_at": 3200000,
+      "arrive_next_at": 3232000,
+      "closes_at": 3239000,
+      "holding": null,
+      "holding_label": null,
+      "leading": "western-sea",
+      "next": "lake-skim",
+      "next_hold_at": null,
+      "next_label": "Low over the western lakes",
+      "opened_at": 3211000,
       "targets": [
         {
-          "arrive_at": 2322999,
-          "id": "lake-skim",
-          "label": "Low over the western lakes",
+          "arrive_at": 3261000,
+          "id": "western-sea",
+          "label": "Over the western sea",
           "votes": 0
         },
         {
-          "arrive_at": 2317999,
+          "arrive_at": 3261000,
           "id": "peak-lake",
           "label": "The peak over the lake",
           "votes": 0
         },
         {
-          "arrive_at": 2322999,
-          "id": "western-sea",
-          "label": "Over the western sea",
+          "arrive_at": 3265000,
+          "id": "ridges",
+          "label": "Across the ridges",
           "votes": 0
         }
       ]
@@ -544,62 +583,6 @@
     "scene": {
       "camera": [
         {
-          "fov_deg": 69.755754,
-          "look": [
-            -51.984731,
-            3.56027,
-            -141.301082
-          ],
-          "pos": [
-            -43.535272,
-            2.5,
-            -127.891815
-          ],
-          "t": 2285.999
-        },
-        {
-          "fov_deg": 67.58343,
-          "look": [
-            -56.042314,
-            3.818563,
-            -136.517086
-          ],
-          "pos": [
-            -44.575009,
-            2.485131,
-            -124.365684
-          ],
-          "t": 2286.999
-        },
-        {
-          "fov_deg": 65.094051,
-          "look": [
-            -58.798889,
-            4.057956,
-            -131.843876
-          ],
-          "pos": [
-            -45.024786,
-            2.487302,
-            -121.213461
-          ],
-          "t": 2287.999
-        },
-        {
-          "fov_deg": 62.944129,
-          "look": [
-            -60.274593,
-            4.347895,
-            -128.274595
-          ],
-          "pos": [
-            -45.068707,
-            2.610368,
-            -118.90644
-          ],
-          "t": 2288.999
-        },
-        {
           "fov_deg": 62.0,
           "look": [
             -60.699843,
@@ -611,7 +594,7 @@
             2.8,
             -118.0
           ],
-          "t": 2289.999
+          "t": 3199.0
         },
         {
           "fov_deg": 62.0,
@@ -625,7 +608,7 @@
             3.018182,
             -118.0
           ],
-          "t": 2290.999
+          "t": 3200.0
         },
         {
           "fov_deg": 62.0,
@@ -639,7 +622,7 @@
             3.236364,
             -118.0
           ],
-          "t": 2291.999
+          "t": 3201.0
         },
         {
           "fov_deg": 62.0,
@@ -653,7 +636,7 @@
             3.454545,
             -118.0
           ],
-          "t": 2292.999
+          "t": 3202.0
         },
         {
           "fov_deg": 62.0,
@@ -667,7 +650,7 @@
             3.672727,
             -118.0
           ],
-          "t": 2293.999
+          "t": 3203.0
         },
         {
           "fov_deg": 62.0,
@@ -681,7 +664,7 @@
             3.890909,
             -118.0
           ],
-          "t": 2294.999
+          "t": 3204.0
         },
         {
           "fov_deg": 62.0,
@@ -695,7 +678,7 @@
             4.109091,
             -118.0
           ],
-          "t": 2295.999
+          "t": 3205.0
         },
         {
           "fov_deg": 62.0,
@@ -709,7 +692,7 @@
             4.327273,
             -118.0
           ],
-          "t": 2296.999
+          "t": 3206.0
         },
         {
           "fov_deg": 62.0,
@@ -723,7 +706,7 @@
             4.545455,
             -118.0
           ],
-          "t": 2297.999
+          "t": 3207.0
         },
         {
           "fov_deg": 62.0,
@@ -737,7 +720,7 @@
             4.763636,
             -118.0
           ],
-          "t": 2298.999
+          "t": 3208.0
         },
         {
           "fov_deg": 62.0,
@@ -751,7 +734,7 @@
             4.981818,
             -118.0
           ],
-          "t": 2299.999
+          "t": 3209.0
         },
         {
           "fov_deg": 62.0,
@@ -765,7 +748,7 @@
             5.2,
             -118.0
           ],
-          "t": 2300.999
+          "t": 3210.0
         },
         {
           "fov_deg": 62.0,
@@ -779,19 +762,460 @@
             5.418182,
             -118.0
           ],
-          "t": 2301.999
+          "t": 3211.0
+        },
+        {
+          "fov_deg": 62.276438,
+          "look": [
+            -63.229102,
+            5.163514,
+            -119.980215
+          ],
+          "pos": [
+            -45.346752,
+            5.820114,
+            -117.922671
+          ],
+          "t": 3212.0
+        },
+        {
+          "fov_deg": 63.001352,
+          "look": [
+            -64.179733,
+            6.178581,
+            -119.030401
+          ],
+          "pos": [
+            -46.340761,
+            6.468486,
+            -117.729004
+          ],
+          "t": 3213.0
+        },
+        {
+          "fov_deg": 64.029988,
+          "look": [
+            -65.598969,
+            7.398952,
+            -117.950316
+          ],
+          "pos": [
+            -47.913096,
+            7.233429,
+            -117.471595
+          ],
+          "t": 3214.0
+        },
+        {
+          "fov_deg": 65.233385,
+          "look": [
+            -67.418394,
+            8.613551,
+            -117.052002
+          ],
+          "pos": [
+            -49.995405,
+            8.012027,
+            -117.196524
+          ],
+          "t": 3215.0
+        },
+        {
+          "fov_deg": 66.498383,
+          "look": [
+            -69.609653,
+            9.608849,
+            -116.531265
+          ],
+          "pos": [
+            -52.519915,
+            8.683477,
+            -116.943354
+          ],
+          "t": 3216.0
+        },
+        {
+          "fov_deg": 67.727613,
+          "look": [
+            -72.175919,
+            9.057544,
+            -116.461386
+          ],
+          "pos": [
+            -55.419436,
+            9.073465,
+            -116.745134
+          ],
+          "t": 3217.0
+        },
+        {
+          "fov_deg": 68.839506,
+          "look": [
+            -74.96544,
+            8.261816,
+            -116.735516
+          ],
+          "pos": [
+            -58.627358,
+            9.1,
+            -116.628395
+          ],
+          "t": 3218.0
+        },
+        {
+          "fov_deg": 69.768286,
+          "look": [
+            -77.974986,
+            8.183959,
+            -117.104605
+          ],
+          "pos": [
+            -62.07765,
+            9.1,
+            -116.613154
+          ],
+          "t": 3219.0
+        },
+        {
+          "fov_deg": 70.463973,
+          "look": [
+            -81.11436,
+            7.841871,
+            -117.563313
+          ],
+          "pos": [
+            -65.704863,
+            9.066703,
+            -116.712911
+          ],
+          "t": 3220.0
+        },
+        {
+          "fov_deg": 70.892385,
+          "look": [
+            -84.313731,
+            7.105207,
+            -118.113838
+          ],
+          "pos": [
+            -69.444128,
+            8.85825,
+            -116.934652
+          ],
+          "t": 3221.0
+        },
+        {
+          "fov_deg": 71.035135,
+          "look": [
+            -87.529841,
+            6.185673,
+            -118.753998
+          ],
+          "pos": [
+            -73.231156,
+            8.452288,
+            -117.278844
+          ],
+          "t": 3222.0
+        },
+        {
+          "fov_deg": 70.889629,
+          "look": [
+            -90.71432,
+            5.11498,
+            -119.476216
+          ],
+          "pos": [
+            -77.002239,
+            7.850096,
+            -117.739442
+          ],
+          "t": 3223.0
+        },
+        {
+          "fov_deg": 70.469074,
+          "look": [
+            -93.81953,
+            3.916162,
+            -120.267536
+          ],
+          "pos": [
+            -80.69425,
+            7.065184,
+            -118.303882
+          ],
+          "t": 3224.0
+        },
+        {
+          "fov_deg": 69.802469,
+          "look": [
+            -96.800168,
+            2.626002,
+            -121.109589
+          ],
+          "pos": [
+            -84.244642,
+            6.125191,
+            -118.953086
+          ],
+          "t": 3225.0
+        },
+        {
+          "fov_deg": 68.934611,
+          "look": [
+            -99.621773,
+            1.318087,
+            -121.969739
+          ],
+          "pos": [
+            -87.591448,
+            5.07262,
+            -119.661461
+          ],
+          "t": 3226.0
+        },
+        {
+          "fov_deg": 67.92609,
+          "look": [
+            -102.384563,
+            0.406354,
+            -122.682345
+          ],
+          "pos": [
+            -90.673282,
+            3.964423,
+            -120.396894
+          ],
+          "t": 3227.0
+        },
+        {
+          "fov_deg": 66.853297,
+          "look": [
+            -105.039652,
+            -0.01608,
+            -123.165089
+          ],
+          "pos": [
+            -93.429339,
+            2.870439,
+            -121.120762
+          ],
+          "t": 3228.0
+        },
+        {
+          "fov_deg": 65.808413,
+          "look": [
+            -107.40793,
+            -0.051862,
+            -123.410478
+          ],
+          "pos": [
+            -95.799394,
+            1.870676,
+            -121.787922
+          ],
+          "t": 3229.0
+        },
+        {
+          "fov_deg": 64.899419,
+          "look": [
+            -109.315382,
+            0.133419,
+            -123.471018
+          ],
+          "pos": [
+            -97.723801,
+            1.055208,
+            -122.346716
+          ],
+          "t": 3230.0
+        },
+        {
+          "fov_deg": 64.250091,
+          "look": [
+            -110.678112,
+            0.325563,
+            -123.463202
+          ],
+          "pos": [
+            -99.143498,
+            0.511585,
+            -122.738972
+          ],
+          "t": 3231.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -111.5,
+            0.35,
+            -123.5
+          ],
+          "pos": [
+            -100.0,
+            0.3,
+            -122.9
+          ],
+          "t": 3232.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -112.055556,
+            0.35,
+            -123.522222
+          ],
+          "pos": [
+            -100.555556,
+            0.3,
+            -122.922222
+          ],
+          "t": 3233.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -112.611111,
+            0.35,
+            -123.544444
+          ],
+          "pos": [
+            -101.111111,
+            0.3,
+            -122.944444
+          ],
+          "t": 3234.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -113.166667,
+            0.35,
+            -123.566667
+          ],
+          "pos": [
+            -101.666667,
+            0.3,
+            -122.966667
+          ],
+          "t": 3235.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -113.722222,
+            0.35,
+            -123.588889
+          ],
+          "pos": [
+            -102.222222,
+            0.3,
+            -122.988889
+          ],
+          "t": 3236.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -114.277778,
+            0.35,
+            -123.611111
+          ],
+          "pos": [
+            -102.777778,
+            0.3,
+            -123.011111
+          ],
+          "t": 3237.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -114.833333,
+            0.35,
+            -123.633333
+          ],
+          "pos": [
+            -103.333333,
+            0.3,
+            -123.033333
+          ],
+          "t": 3238.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -115.388889,
+            0.35,
+            -123.655556
+          ],
+          "pos": [
+            -103.888889,
+            0.3,
+            -123.055556
+          ],
+          "t": 3239.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -115.944444,
+            0.35,
+            -123.677778
+          ],
+          "pos": [
+            -104.444444,
+            0.3,
+            -123.077778
+          ],
+          "t": 3240.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -116.5,
+            0.35,
+            -123.7
+          ],
+          "pos": [
+            -105.0,
+            0.3,
+            -123.1
+          ],
+          "t": 3241.0
+        },
+        {
+          "fov_deg": 64.0,
+          "look": [
+            -117.055556,
+            0.35,
+            -123.722222
+          ],
+          "pos": [
+            -105.555556,
+            0.3,
+            -123.122222
+          ],
+          "t": 3242.0
         }
       ],
       "epoch_unix_ms": 0,
       "lights": [],
-      "time_of_day": 0.265,
+      "time_of_day": 0.2666,
       "weather": [
         {
           "cover": 0.55,
           "rays": 1.0,
           "snow_line_km": 1.7736,
-          "t": 2289.999,
+          "t": 3210.0,
           "towers": 0.0
+        },
+        {
+          "cover": 0.5,
+          "rays": 0.0,
+          "snow_line_km": 1.9,
+          "t": 3232.0,
+          "towers": 1.0
         }
       ],
       "words": []

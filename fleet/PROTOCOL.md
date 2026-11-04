@@ -469,7 +469,7 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   arrivals. Asleep: every GPU host is terminated, nothing is placed (every fcvm
   GPU still connected goes to standby, so its VM stops; the EC2 half's instances are
   terminated), no race is scheduled (`next_race_at` null) and
-  `restart_now` is refused. Hosts that leave then are not reclaimed. When an active viewer
+  `restart_now`, `claim_gpu` and `claim_phone` are refused. Hosts that leave then are not reclaimed. When an active viewer
   is there and the last arrival is within the limit (a new viewer arrived, a page sent
   `wake`, or a hidden page turned visible again before the limit ran out) it is `waking`
   from `woke_at`, the moment the wake began: every host region gets `--awake-capacity` hosts
