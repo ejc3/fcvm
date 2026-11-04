@@ -764,6 +764,86 @@ class ReapDiskPathGuard(unittest.TestCase):
             for p in (vm_dir, state, f"{state}.lock"):
                 self.assertFalse(os.path.lexists(p), p)
 
+    def _owned_clone(self, root, vm_id):
+        state = os.path.join(root, f"{vm_id}.json")
+        with open(state, "w") as f:
+            json.dump({"vm_id": vm_id, "pid": 4242, "pid_start_time": 99}, f)
+        with open(f"{state}.lock", "w"):
+            pass
+        vm_dir = os.path.join(root, "vm-disks", vm_id)
+        os.makedirs(os.path.join(vm_dir, "disks"))
+        return state, vm_dir
+
+    def test_a_state_another_launch_is_retiring_is_still_reaped(self):
+        """Every fcvm launch runs cleanup_stale_state (src/state/manager.rs),
+        which takes a dead owner's state lock without waiting and deletes its
+        state, temp and lock while holding it. The fast teardown's identity
+        check met that lock held.
+
+        RED BEFORE THE FIX: the non-blocking flock failed with EAGAIN, the reap
+        recorded "refusing to remove without exact state identity: [Errno 11]
+        Resource temporarily unavailable" and SurvivedTeardown failed the
+        request (scale runs at 2 and 8 vCPUs, one request each)."""
+        import fcntl
+        import threading
+        with tempfile.TemporaryDirectory() as root:
+            vm_id = "vm-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            state, vm_dir = self._owned_clone(root, vm_id)
+            held = os.open(f"{state}.lock", os.O_RDWR)
+            fcntl.flock(held, fcntl.LOCK_EX)
+
+            def retire():
+                time.sleep(0.2)
+                os.remove(state)
+                os.remove(f"{state}.lock")
+                fcntl.flock(held, fcntl.LOCK_UN)
+                os.close(held)
+
+            t = threading.Thread(target=retire)
+            t.start()
+            out: dict = {}
+            try:
+                reaped = reqbench.reap_disk(out, root, state, vm_dir, (4242, 99))
+            finally:
+                t.join()
+            self.assertNotIn("disk_errors", out)
+            self.assertEqual(reaped, [vm_dir])
+            for p in (vm_dir, state, f"{state}.lock"):
+                self.assertFalse(os.path.lexists(p), p)
+
+    def test_a_state_already_retired_is_still_reaped(self):
+        """The same cleanup can finish before the reap opens the lock."""
+        with tempfile.TemporaryDirectory() as root:
+            vm_id = "vm-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            state, vm_dir = self._owned_clone(root, vm_id)
+            os.remove(state)
+            os.remove(f"{state}.lock")
+            out: dict = {}
+            reaped = reqbench.reap_disk(out, root, state, vm_dir, (4242, 99))
+            self.assertNotIn("disk_errors", out)
+            self.assertEqual(reaped, [vm_dir])
+            self.assertFalse(os.path.lexists(vm_dir))
+
+    def test_a_lock_held_past_the_wait_is_still_refused(self):
+        """A holder that does not let go is not a retirement."""
+        import fcntl
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as root:
+            vm_id = "vm-cccccccccccccccccccccccccccccccc"
+            state, vm_dir = self._owned_clone(root, vm_id)
+            held = os.open(f"{state}.lock", os.O_RDWR)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            try:
+                out: dict = {}
+                with mock.patch.object(reqbench, "STATE_LOCK_WAIT_S", 0.1):
+                    reaped = reqbench.reap_disk(out, root, state, vm_dir, (4242, 99))
+            finally:
+                os.close(held)
+            self.assertEqual(reaped, [])
+            self.assertIn("exact state identity", " ".join(out["disk_errors"]))
+            self.assertTrue(os.path.isdir(vm_dir))
+            self.assertTrue(os.path.exists(state))
+
     def test_a_real_removal_error_is_still_recorded(self):
         """Only a missing entry is someone else's removal; EACCES stays an error."""
         from unittest import mock

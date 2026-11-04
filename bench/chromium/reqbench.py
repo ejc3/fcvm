@@ -2187,6 +2187,56 @@ def safe_vm_data_dir(data_root: str, state_path: str, data_dir: str) -> str:
     return real
 
 
+# How long the reap waits for another fcvm's cleanup_stale_state to let go of a
+# clone's state lock. It holds the lock only while it reads one state file and
+# unlinks three, so a holder past this is not that cleanup.
+STATE_LOCK_WAIT_S = 5.0
+
+
+def _lock_state_for_reap(lock_path: str, state_path: str):
+    """The state lock's fd, held exclusively, or None when the state is retired.
+
+    Raises OSError when the lock is missing beside a state that exists, or is
+    still held after STATE_LOCK_WAIT_S."""
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        if os.path.lexists(state_path):
+            raise
+        return None
+    deadline = time.monotonic() + STATE_LOCK_WAIT_S
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                raise
+            time.sleep(0.01)
+        except OSError:
+            os.close(fd)
+            raise
+
+
+def _read_state_nofollow(state_path: str):
+    """The state file's JSON, read without following a symlink, or None when it
+    is gone (retired while the reap waited for its lock)."""
+    try:
+        state_fd = os.open(state_path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(state_fd).st_mode):
+            raise RuntimeError("state path is not a regular file")
+        with os.fdopen(state_fd) as state_file:
+            state_fd = -1
+            return json.load(state_file)
+    finally:
+        if state_fd >= 0:
+            os.close(state_fd)
+
+
 def _ignore_missing(function, path, exc):
     """rmtree onexc: an entry another process removed first is not an error."""
     if not isinstance(exc, FileNotFoundError):
@@ -2215,26 +2265,28 @@ def reap_disk(
         # the exact (PID, procfs starttime) captured immediately after Popen.
         # A fresh null-PID record may identify this spawn for diagnostics, but it
         # is not enough authority to remove its disk.
+        #
+        # Every fcvm launch runs cleanup_stale_state (src/state/manager.rs): it
+        # takes a dead owner's lock without waiting and deletes the state, its
+        # temp and the lock while holding it. A lock held briefly is that
+        # retirement, so the reap waits for it, and a state that is gone once
+        # the lock is free (or before) was retired: no PID is left that could
+        # name somebody else, and the disk is this clone's by its vm_id.
         lock_path = f"{state_path}.lock" if state_path else ""
         try:
-            state_lock = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
-            fcntl.flock(state_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            state_fd = os.open(state_path, os.O_RDONLY | os.O_NOFOLLOW)
-            try:
-                if not stat.S_ISREG(os.fstat(state_fd).st_mode):
-                    raise RuntimeError("state path is not a regular file")
-                with os.fdopen(state_fd) as state_file:
-                    state_fd = -1
-                    persisted = json.load(state_file)
-            finally:
-                if state_fd >= 0:
-                    os.close(state_fd)
-            actual_owner = (persisted.get("pid"), persisted.get("pid_start_time"))
-            if actual_owner != expected_owner:
-                raise RuntimeError(
-                    f"state owner is {actual_owner}, expected exact owner "
-                    f"{expected_owner}"
-                )
+            if not state_path:
+                raise RuntimeError("no state path")
+            state_lock = _lock_state_for_reap(lock_path, state_path)
+            persisted = None
+            if state_lock is not None:
+                persisted = _read_state_nofollow(state_path)
+            if persisted is not None:
+                actual_owner = (persisted.get("pid"), persisted.get("pid_start_time"))
+                if actual_owner != expected_owner:
+                    raise RuntimeError(
+                        f"state owner is {actual_owner}, expected exact owner "
+                        f"{expected_owner}"
+                    )
         except (OSError, ValueError, RuntimeError) as error:
             if state_lock is not None:
                 try:
