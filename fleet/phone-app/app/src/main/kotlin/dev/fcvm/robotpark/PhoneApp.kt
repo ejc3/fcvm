@@ -51,7 +51,13 @@ class PhoneApp : Application() {
             }
             val activity = ui
             if (activity == null) {
-                return if (a == Action.DARK || a == Action.LIGHT) ok() else mapOf("error" to "the app is not on screen")
+                // A process that answers before its activity exists (just restarted): night or
+                // day is already set above, and the tab is kept for the activity to show.
+                return when (a) {
+                    Action.DARK, Action.LIGHT -> ok()
+                    Action.SCENE, Action.INFO -> { Store.screen = a.wire; ok() }
+                    else -> mapOf("error" to "the app is not on screen")
+                }
             }
             main.post { activity.perform(a) }
             return ok()

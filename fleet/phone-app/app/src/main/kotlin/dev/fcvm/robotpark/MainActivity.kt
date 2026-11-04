@@ -56,7 +56,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         surface.holder.addCallback(this)
         root.addView(surface, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         info = InfoView(this)
-        info.visibility = View.GONE
+        info.visibility = if (Store.screen == "info") View.VISIBLE else View.GONE
         root.addView(info, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         topBar = bar(Gravity.TOP)
         topBar.addView(label("Robot Park", 22f, true))

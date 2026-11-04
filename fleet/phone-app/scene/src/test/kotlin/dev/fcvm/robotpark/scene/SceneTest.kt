@@ -384,6 +384,25 @@ class SceneTest {
     }
 
     /**
+     * The scene tab, and night or day, reach an app whose activity is not up yet: phone.sh sends
+     * `scene` before rotate, dark_mode, dance and wave, also right after it restarted Robot
+     * Park (back from the browser with the GPU mirror open), when the new process answers on its
+     * control socket before MainActivity exists. Refused there, the viewer's action was lost;
+     * now the tab is kept and the activity shows it when it starts. Pinned on the source, since
+     * the window needs Android.
+     */
+    @Test fun theScreenTabReachesAnAppWithNoActivityYet() {
+        val app = appSource("PhoneApp.kt")
+        val body = app.substring(app.indexOf("val activity = ui"), app.indexOf("main.post { activity.perform(a) }"))
+        assertTrue("with no activity, scene and info keep the tab and succeed",
+            Regex("""Action\.SCENE, Action\.INFO -> \{ Store\.screen = a\.wire; ok\(\) \}""").containsMatchIn(body))
+        assertTrue("with no activity, dark and light succeed", Regex("""Action\.DARK, Action\.LIGHT -> ok\(\)""").containsMatchIn(body))
+        val ui = appSource("MainActivity.kt")
+        val create = ui.substring(ui.indexOf("override fun onCreate("), ui.indexOf("override fun onNewIntent("))
+        assertTrue("a new activity shows the tab it was asked for", create.contains("""info.visibility = if (Store.screen == "info") View.VISIBLE else View.GONE"""))
+    }
+
+    /**
      * A local action's default time and the epoch its move is filed under come from one scene
      * snapshot, inside Store.addMove: computed in PhoneApp from one read and filed by addMove
      * under another, a scene arriving in between put the move in the wrong clock.

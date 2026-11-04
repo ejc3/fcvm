@@ -2100,7 +2100,7 @@ every phone. `scripts/phone/scene-test.sh` measures it on the T4 (see "The seam 
 
 | name | effect |
 |---|---|
-| `scene`, `info` | the scene tab, or the info tab: device model, Android version, the GLES renderer, vendor and version of the app's context, frames per second, uptime, the place (below), the benchmark result, and the attribution lines |
+| `scene`, `info` | the scene tab, or the info tab: device model, Android version, the GLES renderer, vendor and version of the app's context, frames per second, uptime, the place (below), the benchmark result, and the attribution lines. Sent before the app's screen is up (a process just started), the tab is kept and shown when it is |
 | `rotate` | portrait to landscape or back (the surface becomes 1280 x 720). A phone turned the other way from its rect has left the wall: it draws the whole image on its own, at its own aspect, until it turns back |
 | `dark`, `light` | night or day on this phone, over the scene's `night` |
 | `dance`, `wave` | a move on this phone from `t` (default: the current frame's): the crowd dances or waves as it walks. Only the scene's `moves` stop the crowd, and those every phone shows together. The phone keeps its last 64; once older ones are dropped, `capture`, `freeze` and `dance` or `wave` refuse a `t` before the end of the last dropped one (its confetti included) |
