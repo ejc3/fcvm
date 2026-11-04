@@ -1031,7 +1031,9 @@ class ReapDiskPathGuard(unittest.TestCase):
                 t.join()
                 kill_tree(p)
             self.assertTrue(out["disk_cleanup_verified"], out)
-            self.assertGreaterEqual(out["teardown_total_ms"], 500.0, out)
+            # The wait begins after reap_wall_ms is taken, so it is the part of
+            # the total beyond the process reap.
+            self.assertGreaterEqual(out["teardown_total_ms"] - out["reap_wall_ms"], 500.0, out)
 
     def test_a_lock_beside_a_state_is_never_removed(self):
         with tempfile.TemporaryDirectory() as root:
