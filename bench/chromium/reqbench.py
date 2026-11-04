@@ -2187,6 +2187,12 @@ def safe_vm_data_dir(data_root: str, state_path: str, data_dir: str) -> str:
     return real
 
 
+def _ignore_missing(function, path, exc):
+    """rmtree onexc: an entry another process removed first is not an error."""
+    if not isinstance(exc, FileNotFoundError):
+        raise exc
+
+
 def reap_disk(
     out: dict,
     data_root: str,
@@ -2260,7 +2266,12 @@ def reap_disk(
     # durable pointer to the still-allocated clone rather than orphaning it.
     if data_dir and os.path.isdir(data_dir):
         try:
-            shutil.rmtree(data_dir)
+            # Every fcvm launch reclaims the runtime directory of a SIGKILLed
+            # fcvm whose owner lock nobody holds (src/reclaim.rs), so under
+            # concurrent clones another launch can remove entries of this tree
+            # while the walk is in it. An entry already gone is that removal,
+            # not a failure; anything else still raises.
+            shutil.rmtree(data_dir, onexc=_ignore_missing)
             reaped.append(data_dir)
         except OSError as e:
             out.setdefault("disk_errors", []).append(f"{data_dir}: {e}")
@@ -3936,11 +3947,7 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
     # reqscale places each clone in its backend's cgroup through a guard that
     # execs fcvm (same pid), so the FILE and UFFD cgroups account their own
     # clones. Without the prefix every clone ran in the driver's cgroup.
-    cmd = list(getattr(args, "spawn_prefix", ())) + [
-        args.fcvm, "snapshot", "run",
-    ] + clone_backend_args(args) + [
-        "--name", name, "--no-dirty-tracking", "--no-swap",
-    ]
+    cmd = clone_run_cmd(args, name)
     env = dict(os.environ, RUST_LOG=args.rust_log)
     # Watch registered BEFORE the spawn: a watch created afterwards can miss the
     # state file's creation and then block waiting for an event already past.
@@ -4164,6 +4171,22 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
 
 
 
+def clone_run_cmd(args, name: str) -> list:
+    """The `fcvm snapshot run` command line of one clone.
+
+    reqscale puts each clone in its backend's cgroup through a guard that execs
+    fcvm (`spawn_prefix`), and accounts and checks the clone's processes there.
+    `--no-swap` moves Firecracker into /fcvm.slice/fcvm-<pid>.scope
+    (`disable_cgroup_swap`), out of that cgroup, so a reqscale clone does not
+    pass it: in one scale run all 7,560 clones logged the move, and reqscale's
+    membership check failed 3 requests that sampled Firecracker after it.
+    """
+    prefix = list(getattr(args, "spawn_prefix", ()))
+    return prefix + [args.fcvm, "snapshot", "run"] + clone_backend_args(args) + [
+        "--name", name, "--no-dirty-tracking",
+    ] + ([] if prefix else ["--no-swap"])
+
+
 def clone_backend_args(args) -> list:
     """UFFD serve-backed vs FILE-backed restore, as CLI args.
 
@@ -4206,9 +4229,7 @@ def run_noop_request(args, rep: int, fast: bool = False) -> dict:
     name = f"rb-{args.run_id}-{rep}-{'noopfast' if fast else 'noop'}"
     log = os.path.join(args.out_dir, f"{name}.log")
     rec: dict = {"arm": "noop-fast" if fast else "noop", "rep": rep, "name": name}
-    cmd = [args.fcvm, "snapshot", "run"] + clone_backend_args(args) + [
-        "--name", name, "--no-dirty-tracking", "--no-swap",
-    ]
+    cmd = clone_run_cmd(args, name)
     env = dict(os.environ, RUST_LOG=args.rust_log)
     watch = DirWatch(args.state_dir)
     t_spawn = time.monotonic()
@@ -4346,9 +4367,7 @@ def run_exec_request(args, rep: int) -> dict:
         "--format", args.format,
         "--quality", str(args.quality),
     ])
-    cmd = [args.fcvm, "snapshot", "run"] + clone_backend_args(args) + [
-        "--name", name, "--no-dirty-tracking", "--no-swap", "--exec", driver,
-    ]
+    cmd = clone_run_cmd(args, name) + ["--exec", driver]
     env = dict(os.environ, RUST_LOG=args.rust_log)
     rec: dict = {"arm": "exec", "rep": rep, "name": name, "timed_out": False}
     t0 = time.monotonic()

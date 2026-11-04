@@ -724,6 +724,69 @@ class ReapDiskPathGuard(unittest.TestCase):
             self.assertEqual(reaped, [state])
             self.assertFalse(os.path.lexists(state))
 
+    def test_a_tree_another_launch_is_removing_is_still_reaped(self):
+        """Every fcvm launch reclaims the runtime directory of a SIGKILLed fcvm
+        whose owner lock nobody holds (src/reclaim.rs), so under concurrent
+        clones the next launch can remove entries of this clone's directory
+        while the fast teardown's rmtree walks it.
+
+        RED BEFORE THE FIX: rmtree's ENOENT on an entry the reclaim had removed
+        was recorded as a disk error, the reap returned before the state file,
+        and SurvivedTeardown failed the request. One scale run at 8 vCPUs
+        failed 183 of 7,560 requests that way, at every rate.
+        """
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as root:
+            vm_id = "vm-77777777777777777777777777777777"
+            state = os.path.join(root, f"{vm_id}.json")
+            with open(state, "w") as f:
+                json.dump({"vm_id": vm_id}, f)
+            with open(f"{state}.lock", "w"):
+                pass
+            vm_dir = os.path.join(root, "vm-disks", vm_id)
+            os.makedirs(os.path.join(vm_dir, "disks"))
+            for name in ("disks/rootfs.raw", "container-ready", "vsock.sock"):
+                with open(os.path.join(vm_dir, name), "w"):
+                    pass
+            real_unlink = os.unlink
+
+            def raced_unlink(path, *, dir_fd=None):
+                # The reclaim removes the entry first; the walk's own unlink
+                # then finds it gone.
+                real_unlink(path, dir_fd=dir_fd)
+                real_unlink(path, dir_fd=dir_fd)
+
+            out: dict = {}
+            with mock.patch.object(os, "unlink", raced_unlink):
+                reaped = reqbench.reap_disk(out, root, state, vm_dir)
+            self.assertNotIn("disk_errors", out)
+            self.assertEqual(reaped, [vm_dir, state, f"{state}.lock"])
+            for p in (vm_dir, state, f"{state}.lock"):
+                self.assertFalse(os.path.lexists(p), p)
+
+    def test_a_real_removal_error_is_still_recorded(self):
+        """Only a missing entry is someone else's removal; EACCES stays an error."""
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as root:
+            vm_id = "vm-99999999999999999999999999999999"
+            state = os.path.join(root, f"{vm_id}.json")
+            with open(state, "w") as f:
+                json.dump({"vm_id": vm_id}, f)
+            vm_dir = os.path.join(root, "vm-disks", vm_id)
+            os.makedirs(vm_dir)
+            with open(os.path.join(vm_dir, "f"), "w"):
+                pass
+
+            def denied(path, *, dir_fd=None):
+                raise PermissionError(13, "Permission denied", path)
+
+            out: dict = {}
+            with mock.patch.object(os, "unlink", denied):
+                reaped = reqbench.reap_disk(out, root, state, vm_dir)
+            self.assertEqual(reaped, [])
+            self.assertIn("disk_errors", out)
+            self.assertTrue(os.path.lexists(state))
+
     def test_a_real_per_vm_dir_is_still_reaped(self):
         """The guard must not disarm the ordinary reap."""
         with tempfile.TemporaryDirectory() as root:
@@ -1164,6 +1227,49 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
             self.assertEqual(
                 rec["firecracker_process_faults_ready_to_artifact"],
                 {"pid": 7, "minor_faults": 3, "major_faults": 0})
+
+
+class ScaleClonesStayInTheirBackendCgroup(unittest.TestCase):
+    """`--no-swap` moves Firecracker into /fcvm.slice/fcvm-<pid>.scope, out of
+    the backend cgroup reqscale's guard placed the clone in.
+
+    RED BEFORE THE FIX: every clone a scale run started passed `--no-swap`. In
+    one run at 8 vCPUs all 7,560 clones logged the move, and reqscale's
+    membership check failed 3 requests ("firecracker-def pid ... is outside run
+    cgroup ...: /fcvm.slice/fcvm-<pid>.scope") whose sample came after it.
+    """
+
+    def argv(self, **extra):
+        from unittest import mock
+        seen = []
+
+        def spawn(cmd, log, env):
+            seen.append(list(cmd))
+            raise RuntimeError("stop after the spawn")
+
+        with tempfile.TemporaryDirectory() as d:
+            args = argparse.Namespace(
+                fcvm="/bin/false", out_dir=d, url="http://x/", format="jpeg", quality=80,
+                snapshot_tag="", serve_pid=1, rust_log="off", timeout=1.0,
+                teardown_timeout=1.0, cdp_port=1, state_dir=d, data_root=d, ws_url="",
+                run_id="t", **extra)
+            with mock.patch.object(reqbench, "spawn_clone_process", spawn):
+                try:
+                    reqbench.run_cdp_request(args, 0, fast=True)
+                except RuntimeError:
+                    pass
+        self.assertEqual(len(seen), 1, seen)
+        return seen[0]
+
+    def test_a_guarded_scale_clone_does_not_ask_to_leave_its_cgroup(self):
+        argv = self.argv(spawn_prefix=["/guard", "--"])
+        self.assertEqual(argv[:3], ["/guard", "--", "/bin/false"])
+        self.assertNotIn("--no-swap", argv)
+
+    def test_a_serial_clone_keeps_no_swap(self):
+        argv = self.argv()
+        self.assertEqual(argv[0], "/bin/false")
+        self.assertIn("--no-swap", argv)
 
 
 class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):
