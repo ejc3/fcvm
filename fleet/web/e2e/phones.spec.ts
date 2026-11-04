@@ -223,8 +223,12 @@ test("Open nvidia.com and Robot Park reach the phone taken over, in order, as th
   await expect(page.getByTestId("phone-borrow")).toHaveAttribute("data-kind", "yours");
   const session = (await mockPhones()).tiles[2]!.borrowed!.session;
   await expect(page.getByTestId("phone-action-open_browser")).toHaveText("Open nvidia.com");
+  // Robot Park is in front: its button would change nothing on the phone
+  await expect(page.getByTestId("phone-action-open_app")).toBeDisabled();
+  await expect(page.getByTestId("phone-action-open_app")).toHaveAttribute("title", "Robot Park is in front");
   await page.getByTestId("phone-action-open_browser").click();
   await expect.poll(async () => (await phoneActions()).map((a) => [a.action, a.phone, a.session])).toEqual([["open_browser", "phone-3", session]]);
+  await expect(page.getByTestId("phone-action-open_app")).toBeEnabled();
   // the coordinator takes one action a second from a holder
   await page.waitForTimeout(1100);
   await page.getByTestId("phone-action-open_app").click();

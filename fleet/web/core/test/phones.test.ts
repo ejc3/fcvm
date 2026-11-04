@@ -376,9 +376,26 @@ describe("the panel of an opened phone", () => {
     expect(p.borrow.countdown).toBe("Returns in 88 s");
     expect(p.borrow.actions.map((a) => a.label)).toEqual(["Switch screen", "Rotate", "Dark mode", "Dance", "Wave", "GPU benchmark", "Restart app", "Open nvidia.com", "Robot Park", "Reboot phone"]);
     expect(p.borrow.actions.map((a) => a.name)).toEqual(ACTIONS);
-    expect(p.borrow.actions.every((a) => !a.disabled)).toBe(true);
+    expect(p.borrow.actions.filter((a) => a.disabled).map((a) => a.name)).toEqual(["open_app"]);
     expect(p.borrow.giveBack).toBe("Give it back");
     expect(Object.keys(ACTION_LABELS)).toEqual(ACTIONS);
+  });
+
+  it("offers Robot Park only while the browser is in front: with Robot Park there it would change nothing", () => {
+    const ph = phonesOf(2);
+    ph.tiles[0] = { ...ph.tiles[0]!, borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-1" } };
+    const app = panelOf(ph);
+    if (app.borrow.kind !== "yours") throw new Error(app.borrow.kind);
+    expect(app.borrow.actions.filter((a) => a.disabled).map((a) => [a.name, a.title])).toEqual([["open_app", "Robot Park is in front"]]);
+    ph.tiles[0] = { ...ph.tiles[0]!, front: "browser" };
+    const browser = panelOf(ph);
+    if (browser.borrow.kind !== "yours") throw new Error(browser.borrow.kind);
+    expect(browser.borrow.actions.every((a) => !a.disabled && a.title === undefined)).toBe(true);
+    // a coordinator that does not say which app is in front: every action stays offered
+    ph.tiles[0] = { ...ph.tiles[0]!, front: null };
+    const unknown = panelOf(ph);
+    if (unknown.borrow.kind !== "yours") throw new Error(unknown.borrow.kind);
+    expect(unknown.borrow.actions.every((a) => !a.disabled)).toBe(true);
   });
 
   it("offers only the phone's own actions: a phone on an older host shows no browser", () => {

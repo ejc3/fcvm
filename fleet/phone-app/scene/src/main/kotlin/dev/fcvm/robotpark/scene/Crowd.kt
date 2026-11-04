@@ -94,6 +94,30 @@ object Crowd {
 
     fun robots(n: Int): FloatArray = FloatArray(n * 8).also { a -> for (i in 0 until n) robot(i).copyInto(a, i * 8) }
 
+    /**
+     * A walker's x at walking time `walkT` (mod PERIOD), as pose.glsl places it: its start plus
+     * whole laps per PERIOD, wrapped into the loop. `r` is its [robot] entry.
+     */
+    fun walkerX(r: FloatArray, walkT: Double): Double {
+        val x = r[0] + r[2] * (LOOP_X / PERIOD) * walkT
+        return x - LOOP_X * StrictMath.floor(x / LOOP_X + 0.5)
+    }
+
+    /**
+     * The robot a held phone follows: a grown walker (no hops, no leaps) near the front of the
+     * lawn, where few robots walk between it and the camera; phone k of a row (its rect's
+     * column) follows the k-th, so two phones held side by side follow two robots.
+     */
+    fun subject(rect: Rect): Int {
+        val k = StrictMath.round(rect.x / rect.w).toInt()
+        return SUBJECTS[Math.floorMod(k, SUBJECTS.size)]
+    }
+
+    private val SUBJECTS: IntArray = (0 until ROBOTS).filter {
+        val r = robot(it)
+        r[6].toInt() == KIND_WALKER && r[5] >= 1.0f && r[1] in 6f..9f && StrictMath.abs(r[2]) == 2f
+    }.toIntArray()
+
     private fun prop(a: FloatArray, at: Int, x: Double, y: Double, z: Double, yaw: Double, sx: Double, sy: Double, sz: Double, motion: Double, colA: Int, colB: Int, kind: Int, seed: Double) {
         val v = floatArrayOf(x.toFloat(), y.toFloat(), z.toFloat(), yaw.toFloat(), sx.toFloat(), sy.toFloat(), sz.toFloat(), motion.toFloat(), colA.toFloat(), colB.toFloat(), kind.toFloat(), seed.toFloat())
         v.copyInto(a, at * 12)

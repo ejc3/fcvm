@@ -143,6 +143,20 @@ object CameraPath {
             40.0,
         )
     }
+
+    /**
+     * A held phone's camera: in front of the phone's own robot ([Crowd.subject]) and following
+     * it along the lawn, so the robots a take-over action moves are on the screen and large,
+     * whatever the shared camera shows. `walkT` is the crowd's walking clock mod
+     * [Crowd.PERIOD] (FrameState.walkT); a slow sway on the scene clock keeps it alive.
+     */
+    fun held(subject: Int, walkT: Double, t: Double): Pose {
+        val r = Crowd.robot(subject)
+        val x = Crowd.walkerX(r, walkT)
+        val z = r[1].toDouble()
+        val a = 2 * StrictMath.PI * Time.wrap(t, 40.0) / 40.0
+        return Pose(Vec3(x + 0.8 * StrictMath.sin(a), 1.7, z + 5.5), Vec3(x, 0.75, z - 2.0), 45.0)
+    }
 }
 
 object Time {

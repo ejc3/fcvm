@@ -171,7 +171,7 @@ function PanelView({
               </dl>
               <div className="actions-grid" role="group" aria-label="Actions">
                 {b.actions.map((a) => (
-                  <button key={a.name} type="button" className="btn" disabled={a.disabled} onClick={() => onAction(a.name, b.session)} data-testid={`phone-action-${a.name}`}>
+                  <button key={a.name} type="button" className="btn" disabled={a.disabled} title={a.title} onClick={() => onAction(a.name, b.session)} data-testid={`phone-action-${a.name}`}>
                     {a.label}
                   </button>
                 ))}

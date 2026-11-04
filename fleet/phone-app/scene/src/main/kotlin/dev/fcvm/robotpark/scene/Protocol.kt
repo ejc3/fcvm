@@ -112,6 +112,7 @@ object Protocol {
             chrome = chrome,
             night = m["night"]?.let { it as? Boolean ?: throw ProtocolError("night: a boolean") },
             stamp = m["stamp"]?.let { it as? Boolean ?: throw ProtocolError("stamp: a boolean") } ?: false,
+            held = m["held"]?.let { it as? Boolean ?: throw ProtocolError("held: a boolean") } ?: false,
             previousRect = prev,
             rectFromFrame = from,
         )
