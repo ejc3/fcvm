@@ -191,8 +191,18 @@ for its length, because a normal grace period behind the arm64 guest's 100 Hz
 tick was the largest step of a restore: `tcp_barrier_ms` median 30 to 41, 37 to
 46 and 57 to 66 ms at 2, 4 and 8 vCPUs on m8g.metal-24xl, and 0.1 to 0.2 ms
 expedited.
+A restored clone also verifies its gate and adds its UDP rule over that socket,
+not with iptables. At boot fc-agent learns what iptables-nft writes for the gate
+(`GateTemplate`): in a network namespace of its own it runs the same
+iptables-restore input `close()` uses, reads the rules back, and keeps them only
+if a UDP rule inserted over nfnetlink then reads back in `iptables -S` exactly as
+iptables writes it. With the template, verification (`tcp_verify_ms`) went from
+5.6 to 7.6 ms to 0.3 to 0.8 ms and the UDP rule from 1.8 to 4.0 ms to 0.2 to
+0.5 ms at 2, 4 and 8 vCPUs on m8g.metal-24xl; without one, both use iptables as
+before (`tcp_gate_netlink` in the ACK says which).
 `the_gate_socket_is_kept_and_never_released`,
 `frames_are_sent_through_the_socket_that_is_never_released`,
+`a_verified_restore_gates_udp_without_starting_a_process`,
 `opening_each_half_is_one_transaction_for_both_families`,
 `the_receive_barrier_waits_an_expedited_grace_period` and
 `the_receive_barrier_waits_in_its_own_thread_not_on_a_release` pin it.

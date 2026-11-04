@@ -24,7 +24,7 @@ use anyhow::{bail, Context, Result};
 use crate::netlink::{
     append_netlink_header, decode_netlink_error, for_each_netlink_message, netlink_align,
     read_dump, NetlinkChannel, NetlinkHeader, OnInterrupt, NEXT_NETLINK_SEQUENCE, NLMSG_ERROR,
-    NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST,
+    NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_REQUEST,
 };
 
 /// `NETLINK_NETFILTER` from linux/netlink.h.
@@ -54,6 +54,10 @@ const NFTA_RULE_TABLE: u16 = 1;
 const NFTA_RULE_CHAIN: u16 = 2;
 const NFTA_RULE_HANDLE: u16 = 3;
 const NFTA_RULE_EXPRESSIONS: u16 = 4;
+const NFTA_RULE_POSITION: u16 = 6;
+const NFTA_RULE_USERDATA: u16 = 7;
+/// `NLA_F_NESTED`: the attribute holds attributes.
+const NLA_F_NESTED: u16 = 0x8000;
 const NFTA_LIST_ELEM: u16 = 1;
 const NFTA_EXPR_NAME: u16 = 1;
 const NFTA_EXPR_DATA: u16 = 2;
@@ -449,6 +453,12 @@ pub(crate) fn removal_batch(removals: &[Removal], generation: u32) -> Option<(Ve
     if messages == 0 {
         return None;
     }
+    Some(pinned_batch(body, generation))
+}
+
+/// `body` between a BEGIN pinned to `generation` and an END that asks for the
+/// acknowledgement, and the sequence numbers of the two.
+fn pinned_batch(body: Vec<u8>, generation: u32) -> (Vec<u8>, u32, u32) {
     let begin = next_sequence();
     let mut pinned = Vec::new();
     append_attribute(&mut pinned, NFNL_BATCH_GENID, &generation.to_be_bytes());
@@ -470,7 +480,159 @@ pub(crate) fn removal_batch(removals: &[Removal], generation: u32) -> Option<(Ve
         NFNL_SUBSYS_NFTABLES,
         &[],
     ));
-    Some((batch, begin, end))
+    (batch, begin, end)
+}
+
+/// A rule as nf_tables dumps it: its expression list and its user data, both
+/// as the kernel encoded them. iptables-nft writes both, and replaying them in
+/// `NFT_MSG_NEWRULE` writes the same rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuleBody {
+    pub(crate) expressions: Vec<u8>,
+    pub(crate) userdata: Option<Vec<u8>>,
+}
+
+/// Each expression of a rule as (name, data).
+type Expressions = Vec<(Vec<u8>, Vec<u8>)>;
+
+impl RuleBody {
+    /// The rule without what traffic changes in it: each expression's name and
+    /// data, with the data of iptables-nft's `counter` left out.
+    fn canonical(&self) -> Result<(Expressions, Option<&[u8]>)> {
+        let mut expressions = Vec::new();
+        for (kind, element) in attributes(&self.expressions)? {
+            if kind != NFTA_LIST_ELEM {
+                bail!("an nf_tables rule expression list holds attribute {kind}");
+            }
+            let expression = attributes(element)?;
+            let name = attribute(&expression, NFTA_EXPR_NAME)
+                .map(string_attribute)
+                .context("an nf_tables expression without a name")?
+                .to_vec();
+            let data = if name == b"counter" {
+                Vec::new()
+            } else {
+                attribute(&expression, NFTA_EXPR_DATA)
+                    .unwrap_or_default()
+                    .to_vec()
+            };
+            expressions.push((name, data));
+        }
+        Ok((expressions, self.userdata.as_deref()))
+    }
+
+    /// Whether this rule is exactly a jump to `chain` (see `rule_is_hook`).
+    pub(crate) fn is_hook(&self, chain: &str) -> Result<bool> {
+        rule_is_hook(&self.expressions, chain)
+    }
+}
+
+/// One rule of a chain, with the handle that names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChainRule {
+    pub(crate) handle: u64,
+    pub(crate) body: RuleBody,
+}
+
+/// Whether `observed` holds exactly the rules of `expected`, in order, by
+/// `RuleBody::canonical`.
+pub(crate) fn same_rules(observed: &[ChainRule], expected: &[RuleBody]) -> Result<bool> {
+    if observed.len() != expected.len() {
+        return Ok(false);
+    }
+    for (rule, wanted) in observed.iter().zip(expected) {
+        if rule.body.canonical()? != wanted.canonical()? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The rules of `chain` in `family`'s filter table, in chain order. A chain or
+/// table that does not exist holds none.
+pub(crate) fn read_rules<C: NetlinkChannel>(
+    channel: &mut C,
+    family: Family,
+    chain: &str,
+) -> Result<Vec<ChainRule>> {
+    let mut rules = Vec::new();
+    let mut request = Vec::new();
+    append_string(&mut request, NFTA_RULE_TABLE, FILTER_TABLE);
+    append_string(&mut request, NFTA_RULE_CHAIN, chain);
+    dump(
+        channel,
+        family,
+        NFT_MSG_GETRULE,
+        NFT_MSG_NEWRULE,
+        &request,
+        |body| {
+            let list = attributes(body)?;
+            if attribute(&list, NFTA_RULE_TABLE).map(string_attribute)
+                != Some(FILTER_TABLE.as_bytes())
+                || attribute(&list, NFTA_RULE_CHAIN).map(string_attribute) != Some(chain.as_bytes())
+            {
+                return Ok(());
+            }
+            let handle = attribute(&list, NFTA_RULE_HANDLE)
+                .and_then(|value| Some(u64::from_be_bytes(value.get(..8)?.try_into().ok()?)))
+                .context("an nf_tables rule without a handle")?;
+            rules.push(ChainRule {
+                handle,
+                body: RuleBody {
+                    expressions: attribute(&list, NFTA_RULE_EXPRESSIONS)
+                        .unwrap_or_default()
+                        .to_vec(),
+                    userdata: attribute(&list, NFTA_RULE_USERDATA).map(<[u8]>::to_vec),
+                },
+            });
+            Ok(())
+        },
+    )
+    .with_context(|| format!("listing the {} filter {chain} rules", family.name()))?;
+    Ok(rules)
+}
+
+/// One planned insertion: `body` into `chain`, ahead of the rule `before`.
+pub(crate) struct Insertion<'a> {
+    pub(crate) family: Family,
+    pub(crate) chain: &'static str,
+    pub(crate) before: u64,
+    pub(crate) body: &'a RuleBody,
+}
+
+/// The batch that makes every insertion, pinned to the ruleset `generation`
+/// the handles were read under, as `iptables -I <chain> <n>` would: a rule
+/// handle that has gone since fails the whole batch and nothing is inserted.
+pub(crate) fn insertion_batch(insertions: &[Insertion], generation: u32) -> (Vec<u8>, u32, u32) {
+    let mut body = Vec::new();
+    for insertion in insertions {
+        let mut attrs = Vec::new();
+        append_string(&mut attrs, NFTA_RULE_TABLE, FILTER_TABLE);
+        append_string(&mut attrs, NFTA_RULE_CHAIN, insertion.chain);
+        // A position without NLM_F_APPEND places the rule ahead of that rule.
+        append_attribute(
+            &mut attrs,
+            NFTA_RULE_POSITION,
+            &insertion.before.to_be_bytes(),
+        );
+        append_attribute(
+            &mut attrs,
+            NFTA_RULE_EXPRESSIONS | NLA_F_NESTED,
+            &insertion.body.expressions,
+        );
+        if let Some(userdata) = &insertion.body.userdata {
+            append_attribute(&mut attrs, NFTA_RULE_USERDATA, userdata);
+        }
+        body.extend(message(
+            nft_type(NFT_MSG_NEWRULE),
+            NLM_F_REQUEST | NLM_F_CREATE,
+            next_sequence(),
+            insertion.family.nfproto(),
+            0,
+            &attrs,
+        ));
+    }
+    pinned_batch(body, generation)
 }
 
 /// What became of a batch that nf_tables did not refuse outright.
@@ -543,6 +705,8 @@ pub(crate) mod model {
         Jump(&'static str),
         /// Anything else, e.g. a jump that carries a match.
         Other,
+        /// A rule exactly as written, e.g. one iptables-nft wrote.
+        Body(RuleBody),
     }
 
     #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -613,6 +777,20 @@ pub(crate) mod model {
             ];
         }
 
+        /// The armed gate in one family with each gate chain holding `input`
+        /// and `output` as written.
+        pub(crate) fn arm_with(&mut self, family: Family, input: &[RuleBody], output: &[RuleBody]) {
+            self.arm(family);
+            self.table(family.nfproto())
+                .rules
+                .retain(|(c, _, _)| *c == "INPUT" || *c == "OUTPUT");
+            for (chain, rules) in [("FCVM_SNAPSHOT_IN", input), ("FCVM_SNAPSHOT_OUT", output)] {
+                for body in rules {
+                    self.add_rule(family, chain, Rule::Body(body.clone()));
+                }
+            }
+        }
+
         /// Replace the rule with `handle` in place, keeping its handle, as
         /// `NFT_MSG_NEWRULE` with `NLM_F_REPLACE` does, and move the generation.
         pub(crate) fn replace_rule(&mut self, family: Family, handle: u64, rule: Rule) {
@@ -636,11 +814,44 @@ pub(crate) mod model {
         }
     }
 
+    /// A rule body with one expression whose data is `tag`, and iptables-nft's
+    /// counter at `packets`: two bodies with one tag differ only in what
+    /// traffic changes.
+    pub(crate) fn body(tag: u8, packets: u64) -> RuleBody {
+        let mut list = Vec::new();
+        let mut counter_data = Vec::new();
+        append_attribute(&mut counter_data, 1, &(packets * 64).to_be_bytes());
+        append_attribute(&mut counter_data, 2, &packets.to_be_bytes());
+        let mut counter = Vec::new();
+        append_string(&mut counter, NFTA_EXPR_NAME, "counter");
+        append_attribute(&mut counter, NFTA_EXPR_DATA | NLA_F_NESTED, &counter_data);
+        append_attribute(&mut list, NFTA_LIST_ELEM | NLA_F_NESTED, &counter);
+        let mut expression = Vec::new();
+        append_string(&mut expression, NFTA_EXPR_NAME, "match");
+        append_attribute(
+            &mut expression,
+            NFTA_EXPR_DATA | NLA_F_NESTED,
+            &[tag, 0, 0, 0],
+        );
+        append_attribute(&mut list, NFTA_LIST_ELEM | NLA_F_NESTED, &expression);
+        RuleBody {
+            expressions: list,
+            userdata: None,
+        }
+    }
+
     fn rule_record(family: u8, chain: &str, handle: u64, rule: &Rule, sequence: u32) -> Vec<u8> {
         let mut attrs = Vec::new();
         append_string(&mut attrs, NFTA_RULE_TABLE, FILTER_TABLE);
         append_string(&mut attrs, NFTA_RULE_CHAIN, chain);
         append_attribute(&mut attrs, NFTA_RULE_HANDLE, &handle.to_be_bytes());
+        if let Rule::Body(body) = rule {
+            append_attribute(&mut attrs, NFTA_RULE_EXPRESSIONS, &body.expressions);
+            if let Some(userdata) = &body.userdata {
+                append_attribute(&mut attrs, NFTA_RULE_USERDATA, userdata);
+            }
+            return message(nft_type(NFT_MSG_NEWRULE), 0x2, sequence, family, 0, &attrs);
+        }
         let mut list = Vec::new();
         let mut counter = Vec::new();
         append_string(&mut counter, NFTA_EXPR_NAME, "counter");
@@ -758,6 +969,7 @@ pub(crate) mod model {
                     return Ok(());
                 }
                 let mut working = (kernel.ipv4.clone(), kernel.ipv6.clone());
+                let mut next_handle = kernel.next_handle;
                 let mut applied = Vec::new();
                 let mut failure = None;
                 for (header, payload) in &messages[1..] {
@@ -803,6 +1015,43 @@ pub(crate) mod model {
                                 }
                             }
                         }
+                        NFT_MSG_NEWRULE => {
+                            let chain = name(NFTA_RULE_CHAIN);
+                            let before = attribute(&list, NFTA_RULE_POSITION)
+                                .map(|value| u64::from_be_bytes(value.try_into().unwrap()));
+                            let body = RuleBody {
+                                expressions: attribute(&list, NFTA_RULE_EXPRESSIONS)
+                                    .unwrap_or_default()
+                                    .to_vec(),
+                                userdata: attribute(&list, NFTA_RULE_USERDATA).map(<[u8]>::to_vec),
+                            };
+                            let chain_static: &'static str =
+                                match table.chains.iter().find(|c| **c == chain) {
+                                    Some(c) => c,
+                                    None => {
+                                        failure = Some(error(*header, libc::ENOENT));
+                                        break;
+                                    }
+                                };
+                            let index = match before {
+                                Some(handle) => table
+                                    .rules
+                                    .iter()
+                                    .position(|(c, h, _)| *c == chain && *h == handle),
+                                None => table.rules.iter().position(|(c, _, _)| *c == chain),
+                            };
+                            match index {
+                                Some(index) => {
+                                    next_handle += 1;
+                                    table.rules.insert(
+                                        index,
+                                        (chain_static, next_handle, Rule::Body(body)),
+                                    );
+                                    Ok(format!("{label} insert rule {chain}"))
+                                }
+                                None => Err(libc::ENOENT),
+                            }
+                        }
                         NFT_MSG_DELCHAIN => {
                             let chain = name(NFTA_CHAIN_NAME);
                             let referenced = table
@@ -836,6 +1085,7 @@ pub(crate) mod model {
                     None => {
                         kernel.ipv4 = working.0;
                         kernel.ipv6 = working.1;
+                        kernel.next_handle = next_handle;
                         kernel.commits.push(applied);
                         kernel.genid += 1;
                         let (end, _) = messages.last().unwrap();
