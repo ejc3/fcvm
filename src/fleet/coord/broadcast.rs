@@ -15,10 +15,12 @@ use serde::Deserialize;
 /// The environment variable the broadcast aggregator reads its ingest URL from.
 pub const PUSH_URL_ENV: &str = "FCVM_FLEET_BROADCAST_INGEST";
 
-/// The broadcast aggregator's settings before `--broadcast-arg`: a 720-line image (H.264
-/// High, a keyframe every 2 s, at most 4.5 Mbit/s), which IVS's standard channel transcodes
-/// into 720p, 480p, 360p and 160p renditions; tiles at their standard quality.
-pub const DEFAULT_ARGS: &[&str] = &[
+/// The broadcast aggregator's settings before `--broadcast-arg`, on a machine with fewer than
+/// [`FULL_HD_CPUS`] CPUs: a 720-line image (H.264 High, a keyframe every 2 s, at most 4.5
+/// Mbit/s), which IVS's standard channel transcodes into 720p (2.4 Mbit/s), 480p, 360p and
+/// 160p renditions; tiles at their standard quality. Measured at 1.4 of a 2 vCPU Fargate
+/// task's cores (CloudWatch, 2026-11-03, with the coordinator's own work).
+pub const DEFAULT_ARGS_HD: &[&str] = &[
     "--image-height",
     "720",
     "--tile-query",
@@ -30,6 +32,38 @@ pub const DEFAULT_ARGS: &[&str] = &[
     "--preset",
     "veryfast",
 ];
+
+/// With [`FULL_HD_CPUS`] CPUs or more: a 1080-line image at CRF 18 and at most 7.5 Mbit/s,
+/// under IVS's 8.5 Mbit/s limit for a standard channel's input. IVS passes a 1080p input
+/// through as its top rendition (a 720p input is transcoded to 2.4 Mbit/s), and adds 720p,
+/// 480p, 360p and 160p. The encode and the 16 tile decodes take 1.96 times the CPU of the
+/// 720-line set (76 against 39 ms a frame on one Graviton core), about 2.7 cores of the
+/// coordinator's task, which a 2 vCPU task does not have. Measured in
+/// docs/fleet/ARCHITECTURE.md, "The composite".
+pub const DEFAULT_ARGS_FULL_HD: &[&str] = &[
+    "--image-height",
+    "1080",
+    "--tile-query",
+    "q=std",
+    "--maxrate-kbps",
+    "7500",
+    "--crf",
+    "18",
+    "--preset",
+    "veryfast",
+];
+
+/// The CPUs from which the broadcast is 1080 lines tall.
+pub const FULL_HD_CPUS: usize = 4;
+
+/// The broadcast's default settings for a machine with `cpus` CPUs.
+pub fn default_args(cpus: usize) -> &'static [&'static str] {
+    if cpus >= FULL_HD_CPUS {
+        DEFAULT_ARGS_FULL_HD
+    } else {
+        DEFAULT_ARGS_HD
+    }
+}
 
 /// The whole image.
 pub const WHOLE: Rect = Rect {
@@ -156,7 +190,7 @@ mod tests {
     fn a_broadcast_arg_overrides_a_default() {
         use clap::Parser;
         let mut argv = vec!["fcvm", "fleet", "aggregate", "--listen", "127.0.0.1:1"];
-        argv.extend(DEFAULT_ARGS);
+        argv.extend(DEFAULT_ARGS_HD);
         argv.extend(["--crf", "23", "--image-height", "1080"]);
         let cli =
             crate::cli::Cli::try_parse_from(argv).expect("the broadcast's command line parses");
@@ -169,5 +203,42 @@ mod tests {
         assert_eq!(a.crf, 23);
         assert_eq!(a.image_height, 1080);
         assert_eq!(a.maxrate_kbps, 4500, "a default left alone stays");
+    }
+
+    /// A task with 4 CPUs broadcasts 1080 lines, a smaller one 720 (a 1080-line broadcast
+    /// takes about 2.7 cores, over a 2 vCPU task). Both sets parse, and the 1080 set stays
+    /// under IVS's 8.5 Mbit/s input limit for a standard channel.
+    #[test]
+    fn the_broadcast_is_1080_lines_from_four_cpus() {
+        use clap::Parser;
+        let parse = |cpus: usize| {
+            let mut argv = vec!["fcvm", "fleet", "aggregate", "--listen", "127.0.0.1:1"];
+            argv.extend(default_args(cpus));
+            let cli = crate::cli::Cli::try_parse_from(argv).expect("the defaults parse");
+            let crate::cli::Commands::Fleet(f) = cli.cmd else {
+                panic!("not a fleet command")
+            };
+            let crate::cli::FleetCommand::Aggregate(a) = f.cmd else {
+                panic!("not the aggregator")
+            };
+            a
+        };
+        for cpus in [1, 2, 3] {
+            let a = parse(cpus);
+            assert_eq!(
+                (a.image_height, a.maxrate_kbps, a.crf),
+                (720, 4500, 21),
+                "{cpus} CPUs"
+            );
+        }
+        for cpus in [4, 8] {
+            let a = parse(cpus);
+            assert_eq!(
+                (a.image_height, a.maxrate_kbps, a.crf),
+                (1080, 7500, 18),
+                "{cpus} CPUs"
+            );
+            assert!(a.maxrate_kbps < 8500, "over IVS's input limit");
+        }
     }
 }

@@ -1260,7 +1260,10 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             "fleet".into(),
             "aggregate".into(),
         ];
-        argv.extend(broadcast::DEFAULT_ARGS.iter().map(|s| s.to_string()));
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let defaults = broadcast::default_args(cpus);
+        tracing::info!(cpus, defaults = ?defaults, "broadcast aggregator settings");
+        argv.extend(defaults.iter().map(|s| s.to_string()));
         argv.extend(args.broadcast_args.iter().cloned());
         argv.extend(["--push-url-env".into(), broadcast::PUSH_URL_ENV.into()]);
         tokio::spawn(crate::fleet::aggregate::child::supervise_with(
