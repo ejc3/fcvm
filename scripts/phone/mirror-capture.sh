@@ -37,12 +37,14 @@ fi
 i=0
 failed=0
 while kill -0 "$C" 2>/dev/null && [ "$i" -lt "${SHOTS:-4}" ]; do
-  timeout 30 "$F" exec --pid "$P" -- sh -c '/android/platform-tools/adb exec-out screencap -p' > "$OUT/shot-$i.png" || { echo "FAIL screenshot $i"; failed=1; }
+  timeout 30 "$F" exec --pid "$P" -- sh -c '/android/platform-tools/adb exec-out screencap -p' > "$OUT/shot-$i.png" || { echo "FAIL screenshot $i"; rm -f "$OUT/shot-$i.png"; failed=1; }
   i=$((i + 1))
   sleep 2
 done
 wait "$C"
 cat "$OUT/cap.out"
+# The stream must have begun with a whole join (END status 0).
+jq -e '.join.status == 0' "$OUT/cap.json" > /dev/null || { echo "FAIL the stream began with no whole join"; failed=1; }
 # The join pauses the render threads while the guest runs; a guest read that failed meanwhile
 # ended its connection and took SurfaceFlinger with it. The phone must still compose.
 sf=$(X sh -c '/android/platform-tools/adb shell service check SurfaceFlinger' 2>&1)

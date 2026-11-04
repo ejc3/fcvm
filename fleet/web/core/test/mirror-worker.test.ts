@@ -162,6 +162,18 @@ describe("the mirror worker", () => {
     z.close();
   });
 
+  it("says joined at a refused END (no snapshot follows), with no live record yet", async () => {
+    const send = await worker();
+    send({ type: "open", url: "wss://phone/mirror", admit: "t" });
+    const ws = FakeSocket.all[0]!;
+    const { z, msg } = streamer();
+    const u32 = (...x: number[]) => new Uint8Array(new Uint32Array(x).buffer);
+    ws.message(await msg(Buffer.concat([hello(), encodeRecord(RECORD.join, 0, u32(2, 0, 0, 0, 0), JOIN_PART.end)])));
+    await settle();
+    expect(joins()).toBe(1);
+    z.close();
+  });
+
   it("replays nothing a retired connection received, and reports nothing it says afterwards", async () => {
     const send = await worker();
     send({ type: "open", url: "wss://phone/mirror", admit: "a" });

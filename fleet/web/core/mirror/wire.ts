@@ -43,7 +43,7 @@ export function joinColorBuffer(p: Uint8Array): JoinColorBuffer | null {
 }
 
 export interface JoinEnd {
-  /** 0: the snapshot is whole; else the join failed and the state is incomplete. */
+  /** 0: the snapshot is whole; 1: the join failed and the state is incomplete; 2: refused, no snapshot (only the HELLO came before it). */
   status: number;
   /** How long the phone's render threads were paused for the snapshot, in microseconds. */
   pauseUs: number;
