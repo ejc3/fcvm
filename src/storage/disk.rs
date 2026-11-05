@@ -574,10 +574,18 @@ async fn detect_filesystem_type(path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// An e2fsprogs command run in the C locale. e2fsprogs translates dumpe2fs's
+/// group headings and labels, and the parsers here read the English ones.
+fn e2fsprogs(tool: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(tool);
+    cmd.env("LC_ALL", "C");
+    cmd
+}
+
 /// Ensure ext4 filesystem has sufficient free space by expanding and resizing.
 async fn ensure_free_space_ext4(disk_path: &Path, min_free: u64) -> Result<()> {
     // Get current free space via dumpe2fs
-    let output = tokio::process::Command::new("dumpe2fs")
+    let output = e2fsprogs("dumpe2fs")
         .args(["-h", disk_path.to_string_lossy().as_ref()])
         .output()
         .await
@@ -594,6 +602,7 @@ async fn ensure_free_space_ext4(disk_path: &Path, min_free: u64) -> Result<()> {
     let block_size = parse_dumpe2fs_value(&stdout, "Block size")?;
     let free_blocks = parse_dumpe2fs_value(&stdout, "Free blocks")?;
     let free_bytes = free_blocks * block_size;
+    let before = ext4_geometry(&stdout);
 
     if free_bytes >= min_free {
         debug!(
@@ -633,7 +642,7 @@ async fn ensure_free_space_ext4(disk_path: &Path, min_free: u64) -> Result<()> {
     }
 
     // Check filesystem before resize (required by resize2fs)
-    let e2fsck_output = tokio::process::Command::new("e2fsck")
+    let e2fsck_output = e2fsprogs("e2fsck")
         .args(["-f", "-y", disk_path.to_string_lossy().as_ref()])
         .output()
         .await
@@ -649,7 +658,7 @@ async fn ensure_free_space_ext4(disk_path: &Path, min_free: u64) -> Result<()> {
     }
 
     // Resize ext4 filesystem to fill the new space
-    let output = tokio::process::Command::new("resize2fs")
+    let output = e2fsprogs("resize2fs")
         .arg(disk_path.to_string_lossy().as_ref())
         .output()
         .await
@@ -662,7 +671,298 @@ async fn ensure_free_space_ext4(disk_path: &Path, min_free: u64) -> Result<()> {
         );
     }
 
+    match before {
+        Some(before) if before.lazy_itables => {
+            mark_added_inode_tables_zeroed(disk_path, before.groups).await?
+        }
+        Some(_) => {}
+        None => warn!(
+            disk = %disk_path.display(),
+            "dumpe2fs header is ambiguous; added inode tables left to the guest"
+        ),
+    }
+
     info!(disk = %disk_path.display(), "ext4 rootfs expanded successfully");
+    Ok(())
+}
+
+/// Block group descriptor flags (ext4 `bg_flags`), as dumpe2fs names them.
+const BG_INODE_UNINIT: u32 = 0x1;
+const BG_BLOCK_UNINIT: u32 = 0x2;
+const BG_INODE_ZEROED: u32 = 0x4;
+
+/// One block group as `dumpe2fs` prints it.
+#[derive(Debug, PartialEq)]
+struct BlockGroup {
+    index: u64,
+    /// `None` when the descriptor carries a flag this code does not know, so
+    /// a rewrite of `bg_flags` could drop it.
+    flags: Option<u32>,
+    /// First and last block of the group's inode table.
+    inode_table: Option<(u64, u64)>,
+}
+
+/// The filesystem facts the inode-table marking relies on, from dumpe2fs's
+/// header.
+#[derive(Debug, PartialEq)]
+struct Ext4Geometry {
+    block_size: u64,
+    blocks: u64,
+    groups: u64,
+    /// metadata_csum or uninit_bg: only these have lazily initialised inode
+    /// tables, and only for these does dumpe2fs print group flags.
+    lazy_itables: bool,
+}
+
+/// The value of the one header line `key: value`, or `None` when the key is
+/// missing or appears more than once. dumpe2fs prints header strings such as
+/// the last mount point verbatim, so a second line with the same key is not
+/// evidence of the value.
+fn header_field<'a>(output: &'a str, key: &str) -> Option<&'a str> {
+    let mut values = output
+        .lines()
+        .filter_map(|line| line.strip_prefix(key)?.strip_prefix(':'))
+        .map(str::trim);
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+/// `None` unless every field it reads appears once and the geometry is one
+/// ext4 can have.
+fn ext4_geometry(header: &str) -> Option<Ext4Geometry> {
+    let number = |key| header_field(header, key)?.parse::<u64>().ok();
+    let block_size = number("Block size")?;
+    let blocks = number("Block count")?;
+    let first = number("First block")?;
+    let per_group = number("Blocks per group")?;
+    if !block_size.is_power_of_two() || !(1024..=65536).contains(&block_size) {
+        return None;
+    }
+    if per_group == 0 || first >= blocks {
+        return None;
+    }
+    let features = header_field(header, "Filesystem features")?;
+    let lazy_itables = features
+        .split_whitespace()
+        .any(|f| f == "metadata_csum" || f == "uninit_bg");
+    Some(Ext4Geometry {
+        block_size,
+        blocks,
+        groups: (blocks - first).div_ceil(per_group),
+        lazy_itables,
+    })
+}
+
+/// Every block group in full `dumpe2fs` output, with its flags and inode table.
+///
+/// `None` unless the output holds exactly one sequence of groups 0..`expected`,
+/// in order, each with one inode table. dumpe2fs prints header strings such as
+/// the volume name and the last mount point verbatim, so a "Group" or "Inode
+/// table at" line outside that sequence is not a descriptor.
+fn parse_block_groups(output: &str, expected: u64) -> Option<Vec<BlockGroup>> {
+    let mut groups: Vec<BlockGroup> = Vec::new();
+    for line in output.lines() {
+        if let Some(rest) = line.strip_prefix("Group ") {
+            let Some((index, rest)) = rest.split_once(':') else {
+                continue;
+            };
+            let Ok(index) = index.trim().parse::<u64>() else {
+                continue; // "Group descriptor size:" and the like
+            };
+            if index != groups.len() as u64 {
+                return None;
+            }
+            let flags = match rest.split_once('[').and_then(|(_, f)| f.split_once(']')) {
+                None => Some(0),
+                Some((names, _)) => {
+                    names
+                        .split(',')
+                        .map(str::trim)
+                        .try_fold(0, |acc, name| match name {
+                            "INODE_UNINIT" => Some(acc | BG_INODE_UNINIT),
+                            "BLOCK_UNINIT" => Some(acc | BG_BLOCK_UNINIT),
+                            "ITABLE_ZEROED" => Some(acc | BG_INODE_ZEROED),
+                            _ => None,
+                        })
+                }
+            };
+            groups.push(BlockGroup {
+                index,
+                flags,
+                inode_table: None,
+            });
+        } else if let Some(rest) = line.trim_start().strip_prefix("Inode table at ") {
+            let group = groups.last_mut()?;
+            if group.inode_table.is_some() {
+                return None;
+            }
+            let range = rest.split_whitespace().next().unwrap_or("");
+            let (a, b) = range.split_once('-').unwrap_or((range, range));
+            group.inode_table = Some((a.parse().ok()?, b.parse().ok()?));
+        }
+    }
+    if groups.len() as u64 != expected || groups.iter().any(|g| g.inode_table.is_none()) {
+        return None;
+    }
+    Some(groups)
+}
+
+/// Whether every byte of `len` bytes at `offset` in `path` is zero.
+fn range_is_zero(path: &Path, offset: u64, len: u64) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening {} to read inode tables", path.display()))?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut left = len;
+    while left > 0 {
+        let n = left.min(buf.len() as u64) as usize;
+        file.read_exact(&mut buf[..n])
+            .with_context(|| format!("reading {} at {}", path.display(), offset + len - left))?;
+        if buf[..n].iter().any(|&b| b != 0) {
+            return Ok(false);
+        }
+        left -= n as u64;
+    }
+    Ok(true)
+}
+
+/// Mark the inode tables `resize2fs` added as zeroed when their bytes are zero.
+///
+/// resize2fs leaves a new group's inode table unwritten and its descriptor
+/// without ITABLE_ZEROED, so the guest kernel's ext4lazyinit thread zeroes it
+/// after boot. A snapshot taken before that finishes hands the same unfinished
+/// work to every clone, and each clone writes the zeros into its own disk file:
+/// 16 MiB per clone in the page cache within 10 s of a restore, on a 4 vCPU
+/// Chromium golden whose resize added 16 groups (64 MiB of inode tables).
+///
+/// A new group's table usually lies in the sparse region `truncate` just
+/// added, but with flex_bg resize2fs may place it in free space of the old
+/// filesystem, which can hold the bytes of a file that was moved or deleted.
+/// So the table is read, and only an all-zero table is marked. A descriptor
+/// with a flag this code does not know is left alone. The result must pass
+/// `e2fsck -fn`.
+async fn mark_added_inode_tables_zeroed(disk_path: &Path, groups_before: u64) -> Result<()> {
+    let output = e2fsprogs("dumpe2fs")
+        .arg(disk_path.as_os_str())
+        .output()
+        .await
+        .context("running dumpe2fs")?;
+    if !output.status.success() {
+        bail!(
+            "dumpe2fs failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let dump = String::from_utf8_lossy(&output.stdout);
+    let geometry = ext4_geometry(&dump).filter(|g| g.lazy_itables);
+    let Some((geometry, groups)) =
+        geometry.and_then(|g| parse_block_groups(&dump, g.groups).map(|groups| (g, groups)))
+    else {
+        warn!(
+            disk = %disk_path.display(),
+            "dumpe2fs output is not one header and one sequence of block groups; \
+             inode tables left to the guest"
+        );
+        return Ok(());
+    };
+    let (block_size, total) = (geometry.block_size, geometry.groups);
+
+    let mut zeroed = Vec::new();
+    let mut not_zero = 0u64;
+    for group in groups.iter().filter(|g| g.index >= groups_before) {
+        let (Some(flags), Some((first, last))) = (group.flags, group.inode_table) else {
+            continue;
+        };
+        if flags & BG_INODE_ZEROED != 0 || last < first || last >= geometry.blocks {
+            continue;
+        }
+        let path = disk_path.to_path_buf();
+        let (offset, len) = (first * block_size, (last - first + 1) * block_size);
+        let zero = tokio::task::spawn_blocking(move || range_is_zero(&path, offset, len))
+            .await
+            .context("joining inode table read")??;
+        if zero {
+            zeroed.push((group.index, flags | BG_INODE_ZEROED, len));
+        } else {
+            not_zero += 1;
+        }
+    }
+    if not_zero > 0 {
+        info!(
+            disk = %disk_path.display(),
+            groups = not_zero,
+            "added inode tables hold nonzero bytes; the guest zeroes them"
+        );
+    }
+    if zeroed.is_empty() {
+        return Ok(());
+    }
+
+    let mut script = tempfile::NamedTempFile::new().context("creating debugfs script")?;
+    {
+        use std::io::Write;
+        for (index, flags, _) in &zeroed {
+            writeln!(script, "set_bg {index} flags {flags}")?;
+            writeln!(script, "set_bg {index} checksum calc")?;
+        }
+        script.flush()?;
+    }
+    let output = e2fsprogs("debugfs")
+        .arg("-w")
+        .arg("-f")
+        .arg(script.path())
+        .arg(disk_path.as_os_str())
+        .output()
+        .await
+        .context("running debugfs")?;
+    if !output.status.success() {
+        bail!(
+            "debugfs failed marking inode tables zeroed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // debugfs reports a failed command on stderr and still exits 0, so the
+    // result is checked: the filesystem must be clean and every group marked.
+    let check = e2fsprogs("e2fsck")
+        .args(["-f", "-n"])
+        .arg(disk_path.as_os_str())
+        .output()
+        .await
+        .context("running e2fsck")?;
+    if !check.status.success() {
+        bail!(
+            "e2fsck -fn exited {:?} after marking inode tables zeroed: {}",
+            check.status.code(),
+            String::from_utf8_lossy(&check.stdout)
+        );
+    }
+    let output = e2fsprogs("dumpe2fs")
+        .arg(disk_path.as_os_str())
+        .output()
+        .await
+        .context("running dumpe2fs")?;
+    let after =
+        parse_block_groups(&String::from_utf8_lossy(&output.stdout), total).unwrap_or_default();
+    for (index, _, _) in &zeroed {
+        let marked = after
+            .iter()
+            .any(|g| g.index == *index && g.flags.is_some_and(|f| f & BG_INODE_ZEROED != 0));
+        if !output.status.success() || !marked {
+            bail!(
+                "group {index} of {} is not marked ITABLE_ZEROED after debugfs: {}",
+                disk_path.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    info!(
+        disk = %disk_path.display(),
+        groups = zeroed.len(),
+        mib = zeroed.iter().map(|(_, _, len)| len).sum::<u64>() >> 20,
+        "marked added inode tables zeroed"
+    );
     Ok(())
 }
 
@@ -892,5 +1192,291 @@ mod snapshot_dir_tests {
         remove_snapshot_dir(&snapshot).await.unwrap();
         assert!(!snapshot.exists());
         remove_snapshot_dir(&snapshot).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod resize_inode_table_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn run(cmd: &mut Command) -> std::process::Output {
+        let out = cmd.env("LC_ALL", "C").output().expect("spawn");
+        assert!(
+            out.status.success(),
+            "{cmd:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    }
+
+    fn groups(path: &Path) -> Vec<BlockGroup> {
+        let out = run(Command::new("dumpe2fs").arg(path));
+        let out = String::from_utf8_lossy(&out.stdout);
+        parse_block_groups(&out, ext4_geometry(&out).unwrap().groups)
+            .expect("one complete group sequence")
+    }
+
+    fn unzeroed(path: &Path) -> Vec<u64> {
+        groups(path)
+            .iter()
+            .filter(|g| g.flags.unwrap_or(0) & BG_INODE_ZEROED == 0)
+            .map(|g| g.index)
+            .collect()
+    }
+
+    /// An ext4 image of `size` with every inode table written, 32 MiB groups.
+    fn image(dir: &Path, size: &str) -> PathBuf {
+        let path = dir.join("rootfs.raw");
+        run(Command::new("truncate").args(["-s", size]).arg(&path));
+        let mut mkfs = Command::new("mkfs.ext4");
+        mkfs.args([
+            "-q",
+            "-F",
+            "-b",
+            "4096",
+            "-g",
+            "8192",
+            "-E",
+            "lazy_itable_init=0",
+        ]);
+        run(mkfs.arg(&path));
+        assert_eq!(
+            unzeroed(&path),
+            Vec::<u64>::new(),
+            "precondition: a fully zeroed image"
+        );
+        path
+    }
+
+    fn assert_clean(path: &Path) {
+        let out = Command::new("e2fsck")
+            .args(["-f", "-n"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "e2fsck -fn: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    /// RED ON MAIN: resize2fs left every group it added without ITABLE_ZEROED,
+    /// so the guest's ext4lazyinit zeroed them after boot, and a golden
+    /// snapshotted before it finished made each clone write the zeros again
+    /// (16 of 96 groups unmarked on a 4 vCPU Chromium golden).
+    ///
+    /// The base is 16 groups, one flex group, as fcvm's 10 GiB layer2 rootfs is
+    /// a whole number of them, so the added groups' tables lie in the region
+    /// truncate made.
+    #[tokio::test]
+    async fn resize_marks_the_inode_tables_it_added_zeroed() {
+        crate::utils::ensure_sbin_on_path();
+        let dir = tempfile::tempdir().unwrap();
+        let path = image(dir.path(), "512M");
+        let before = groups(&path).len();
+
+        ensure_free_space(&path, "1G", 0).await.unwrap();
+
+        let after = groups(&path);
+        assert!(after.len() > before, "the resize added no groups");
+        assert_eq!(unzeroed(&path), Vec::<u64>::new());
+        assert_clean(&path);
+    }
+
+    /// A group whose new inode table lands on blocks that hold old bytes keeps
+    /// its descriptor as resize2fs wrote it. With flex_bg, resize2fs puts the
+    /// tables of groups that join a partly filled flex group into that flex
+    /// group's free space, and free blocks keep whatever a deleted or moved
+    /// file left there. Here the free blocks are filled with 0xff first.
+    #[tokio::test]
+    async fn an_added_inode_table_over_old_bytes_is_left_unmarked() {
+        use std::io::{Seek, SeekFrom, Write};
+        crate::utils::ensure_sbin_on_path();
+        let dir = tempfile::tempdir().unwrap();
+        let path = image(dir.path(), "64M");
+        let dump = run(Command::new("dumpe2fs").arg(&path));
+        let dump = String::from_utf8_lossy(&dump.stdout);
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        for line in dump.lines() {
+            // Only a group's own list, indented; the unindented header line
+            // of the same name holds a count, not a block.
+            let Some(ranges) = line.strip_prefix("  Free blocks: ") else {
+                continue;
+            };
+            for range in ranges.split(',').map(str::trim).filter(|r| !r.is_empty()) {
+                let (a, b) = range.split_once('-').unwrap_or((range, range));
+                let (a, b): (u64, u64) = (a.parse().unwrap(), b.parse().unwrap());
+                file.seek(SeekFrom::Start(a * 4096)).unwrap();
+                file.write_all(&vec![0xffu8; ((b - a + 1) * 4096) as usize])
+                    .unwrap();
+            }
+        }
+        drop(file);
+        assert_clean(&path); // the fill wrote only free blocks
+        let before = groups(&path).len() as u64;
+
+        ensure_free_space(&path, "256M", 0).await.unwrap();
+
+        let mut over_old_bytes = 0;
+        for group in groups(&path).iter().filter(|g| g.index >= before) {
+            let (first, last) = group.inode_table.unwrap();
+            let zero = range_is_zero(&path, first * 4096, (last - first + 1) * 4096).unwrap();
+            let marked = group.flags.unwrap() & BG_INODE_ZEROED != 0;
+            assert_eq!(
+                marked, zero,
+                "group {}: marked={marked}, table all zero={zero}",
+                group.index
+            );
+            over_old_bytes += usize::from(!zero);
+        }
+        assert!(
+            over_old_bytes > 0,
+            "no added inode table landed on old bytes, so this proves nothing"
+        );
+        assert_clean(&path);
+    }
+
+    /// A filesystem without metadata_csum or uninit_bg has no lazily
+    /// initialised inode tables, and dumpe2fs prints no group flags for it, so
+    /// the check after marking could never see the flag and refused the resize.
+    #[tokio::test]
+    async fn a_filesystem_without_descriptor_checksums_still_grows() {
+        crate::utils::ensure_sbin_on_path();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rootfs.raw");
+        run(Command::new("truncate").args(["-s", "128M"]).arg(&path));
+        run(Command::new("mkfs.ext4")
+            .args([
+                "-q",
+                "-F",
+                "-b",
+                "4096",
+                "-g",
+                "8192",
+                "-O",
+                "^metadata_csum,^uninit_bg",
+            ])
+            .arg(&path));
+        let before = groups(&path).len();
+
+        ensure_free_space(&path, "256M", 0).await.unwrap();
+
+        assert!(groups(&path).len() > before, "the resize added no groups");
+        assert_clean(&path);
+    }
+
+    /// dumpe2fs prints header strings such as the last mount point verbatim, so
+    /// a "Group" line can appear before the real descriptors. Only one
+    /// complete sequence of groups 0..n is accepted.
+    #[test]
+    fn a_group_line_outside_the_descriptor_sequence_is_refused() {
+        let real = "Group 0: (Blocks 0-8191) csum 0x1 [ITABLE_ZEROED]\n  \
+                    Inode table at 37-548 (+37)\n\
+                    Group 1: (Blocks 8192-16383) csum 0x2 [INODE_UNINIT]\n  \
+                    Inode table at 549-1060 (bg #0 + 549)\n";
+        assert_eq!(parse_block_groups(real, 2).map(|g| g.len()), Some(2));
+        let injected = format!(
+            "Last mounted on:          /x\nGroup 1: [INODE_UNINIT]\nInode table at 60000\n{real}"
+        );
+        assert_eq!(parse_block_groups(&injected, 2), None);
+        assert_eq!(parse_block_groups(real, 3), None, "a missing group");
+        let skipped = real.replace("Group 1:", "Group 2:");
+        assert_eq!(
+            parse_block_groups(&skipped, 2),
+            None,
+            "a group number out of sequence; marking writes to the group by number"
+        );
+        let doubled = real.replace(
+            "Inode table at 549",
+            "Inode table at 1-1\n  Inode table at 549",
+        );
+        assert_eq!(
+            parse_block_groups(&doubled, 2),
+            None,
+            "two tables for one group"
+        );
+    }
+
+    /// A header field that appears twice comes partly from a string dumpe2fs
+    /// printed verbatim, such as the last mount point, so it is not trusted:
+    /// a forged "Block size: 0" made every inode table read as zero bytes.
+    #[test]
+    fn a_header_field_that_appears_twice_is_refused() {
+        let header = "Last mounted on:          /\n\
+                      Block count:              131072\n\
+                      First block:              0\n\
+                      Block size:               4096\n\
+                      Blocks per group:         32768\n\
+                      Filesystem features:      has_journal extent metadata_csum\n";
+        assert_eq!(
+            ext4_geometry(header),
+            Some(Ext4Geometry {
+                block_size: 4096,
+                blocks: 131072,
+                groups: 4,
+                lazy_itables: true
+            })
+        );
+        for forged in [
+            "Block size: 0\n",
+            "Filesystem features: uninit_bg\n",
+            "Block count: 9\n",
+        ] {
+            let injected = header.replacen("/\n", &format!("/x\n{forged}"), 1);
+            assert_eq!(ext4_geometry(&injected), None, "{forged:?}");
+        }
+        let zero = header.replace(
+            "Block size:               4096",
+            "Block size:               0",
+        );
+        assert_eq!(ext4_geometry(&zero), None, "a block size ext4 cannot have");
+    }
+
+    /// e2fsprogs translates the group headings and the "Inode table at" label,
+    /// so a translated locale made the parser find nothing and mark nothing.
+    #[test]
+    fn e2fsprogs_commands_run_in_the_c_locale() {
+        let cmd = e2fsprogs("dumpe2fs");
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        assert!(
+            envs.contains(&(
+                std::ffi::OsStr::new("LC_ALL"),
+                Some(std::ffi::OsStr::new("C"))
+            )),
+            "{envs:?}"
+        );
+    }
+
+    #[test]
+    fn dumpe2fs_groups_parse_with_their_flags_and_inode_tables() {
+        let out = "Group descriptor size:    64\n\
+                   Group 0: (Blocks 0-32767) csum 0xdccc [INODE_UNINIT, ITABLE_ZEROED]\n  \
+                   Inode table at 2643-3154 (+2643)\n\
+                   Group 1: (Blocks 32768-65535) csum 0x0001\n  \
+                   Inode table at 3155-3666 (bg #0 + 3155)\n\
+                   Group 2: (Blocks 65536-98303) csum 0x0002 [INODE_UNINIT, SOMETHING_NEW]\n  \
+                   Inode table at 3667-4178 (bg #0 + 3667)\n";
+        assert_eq!(
+            parse_block_groups(out, 3).unwrap(),
+            vec![
+                BlockGroup {
+                    index: 0,
+                    flags: Some(BG_INODE_UNINIT | BG_INODE_ZEROED),
+                    inode_table: Some((2643, 3154))
+                },
+                BlockGroup {
+                    index: 1,
+                    flags: Some(0),
+                    inode_table: Some((3155, 3666))
+                },
+                BlockGroup {
+                    index: 2,
+                    flags: None,
+                    inode_table: Some((3667, 4178))
+                },
+            ]
+        );
     }
 }
