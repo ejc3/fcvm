@@ -1508,6 +1508,8 @@ fn path_classification_holds_on_both_sides_of_the_bench_arm() {
         // fcvm builds fleet/core; the rest of fleet/ is outside the matrix.
         ("fleet/core/src/protocol.rs", true, false),
         ("fleet/core/Cargo.toml", true, false),
+        ("fleet/potato/src/lib.rs", true, false),
+        ("fleet/potato/Cargo.toml", true, false),
         ("fleet/renderer/src/render.cu", false, false),
         ("fleet/renderer/Makefile", false, false),
         ("fleet/tools/gpubox.sh", false, false),

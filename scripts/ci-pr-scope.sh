@@ -167,6 +167,8 @@ while IFS= read -r f; do
     # the matrix can say nothing about it. It runs fleet-renderer, the
     # renderer's host tests; fleet/web runs fleet-web instead.
     fleet/core/*) code=true; echo "code path: $f" ;;
+    # fleet/potato is a workspace member too (the potato player); lint formats it.
+    fleet/potato/*) code=true; echo "code path: $f" ;;
     # The fleet web page is TypeScript with its own suite (fleet-web);
     # the VM matrix does not build or run it. Like bench/, it precedes
     # the docs arm so its README still routes to its check.

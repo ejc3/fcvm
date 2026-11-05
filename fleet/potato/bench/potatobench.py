@@ -376,7 +376,7 @@ async def tell(addr, msg):
     await w.drain()
     ans = await asyncio.wait_for(r.readline(), 5)
     w.close()
-    assert b'"ok"' in ans, ans
+    assert reply_ok(ans), ans
     return ans
 
 
@@ -387,7 +387,7 @@ async def send_ball(addr, ball):
     await w.drain()
     ack = await asyncio.wait_for(r.readline(), 5)
     w.close()
-    assert b'"ok"' in ack, ack
+    assert reply_ok(ack), ack
     return ms(t, now())
 
 
@@ -463,6 +463,37 @@ def proof_follows(want, hello):
             and hello["chain"] == chain_step(chain, hello["last_round"], hello["last_seq"], hello["colour"]))
 
 
+def reply_ok(line):
+    """Whether a player's answer is an `ok`: decoded, never searched for the word."""
+    try:
+        return json.loads(line).get("type") == "ok"
+    except (ValueError, AttributeError):
+        return False
+
+
+def hold_at(start, shrink, min_hold, n, seq):
+    """The hold the ball carries when caught at `seq` in a ring of `n` (fleet_potato::Ball)."""
+    h = start
+    for _ in range(seq // max(n, 1)):
+        h = max(min_hold, h - h * shrink // 1000)
+    return h
+
+
+def catch_ok(colour, counter, chain, msg):
+    """Whether a catch report is the step of the player's last verified colour, counter and
+    chain: all three, the chain replayed (fleet_potato::chain_step)."""
+    want = (colour + 1) % COLOURS
+    return (msg["colour"] == want and msg["counter"] == counter + 1
+            and msg["chain"] == chain_step(chain, msg["round"], msg["seq"], want))
+
+
+def cycle_ball(i, addr, sink):
+    """The ball of serial cycle `i`: a round of its own, so a player that saw an earlier
+    cycle's (round, seq) does not take this one for a repeat."""
+    return {"round": i + 1, "seq": 0, "ring": [addr, sink], "hold_ms": 0,
+            "shrink_permille": 0, "min_hold_ms": 0, "flight_ms": 3000, "trail": []}
+
+
 def expected_after_catch(p):
     return (p.colour + 1) % COLOURS, p.counter + 1
 
@@ -479,14 +510,13 @@ async def cmd_cycles(a):
     for i in range(a.cycles):
         p = host.players[i % len(host.players)]
         exp_colour, exp_counter = expected_after_catch(p)
-        ball = {"round": 1, "seq": 0, "ring": [p.ball_addr(), sink], "hold_ms": 0,
-                "shrink_permille": 0, "min_hold_ms": 0, "flight_ms": 3000, "trail": []}
+        ball = cycle_ball(i, p.ball_addr(), sink)
         t0 = now()
         in_ms = await send_ball(p.addr, ball)
         tc, caught = await p.expect("caught", 10)
         tt, threw = await p.expect("threw", 10)
         await host.sink.get()
-        ok_catch = caught["colour"] == exp_colour and caught["counter"] == exp_counter
+        ok_catch = catch_ok(p.colour, p.counter, p.chain, caught)
         p.colour, p.counter, p.chain = caught["colour"], caught["counter"], caught["chain"]
         s = await p.sleep()
         t_w, hello_t, hello, probe_t, probe, refusals = await p.wake(full=a.full)
@@ -612,13 +642,16 @@ class Game:
             t, msg = await p.queue.get()
             r = self.round
             if msg["type"] == "caught":
-                exp_colour, exp_counter = expected_after_catch(p)
-                ok = msg["colour"] == exp_colour and msg["counter"] == exp_counter
+                ok = catch_ok(p.colour, p.counter, p.chain, msg)
                 p.colour, p.counter, p.chain = msg["colour"], msg["counter"], msg["chain"]
                 if r and msg["round"] == r["id"]:
                     r["seq"] = msg["seq"]
+                    # the catch's own hold, from its seq: the thrower's report of the throw can
+                    # come after it, on another connection
+                    hold = hold_at(self.a.hold, self.a.shrink, self.a.min_hold, r["n"], msg["seq"])
+                    r["hold"] = hold
                     self.write({"type": "caught", "round": r["id"], "size": r["n"], "player": p.k, "seq": msg["seq"],
-                                "lap": msg["seq"] // r["n"], "hold_ms": r["hold"], "t": t, "proof_ok": ok,
+                                "lap": msg["seq"] // r["n"], "hold_ms": hold, "t": t, "proof_ok": ok,
                                 "lead": self.lead(), "awake": sum(q.phase != "asleep" for q in r["ring"])})
                     if not ok:
                         self.end(reason="colour", player=p.k, seq=msg["seq"])
@@ -627,10 +660,6 @@ class Game:
                 if r and msg["round"] == r["id"]:
                     self.write({"type": "threw", "round": r["id"], "player": p.k, "seq": msg["seq"],
                                 "wait_ms": msg["wait_ms"], "send_ms": msg["send_ms"], "attempts": msg["attempts"], "t": t})
-                    hold = self.a.hold
-                    for _ in range(msg["seq"] // r["n"]):
-                        hold = max(self.a.min_hold, hold - hold * self.a.shrink // 1000)
-                    r["hold"] = hold
                     if p.phase == "awake":
                         p.phase = "sleeping"  # one sleep per life, even if a second throw is reported
                         r["tasks"].add(asyncio.create_task(self.sleep(p)))

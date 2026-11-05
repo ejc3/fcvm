@@ -1,7 +1,9 @@
 //! The player program as host processes: the ball between two players, the report
 //! connection a wake retires, and a throw nothing accepts.
 
-use fleet_potato::{chain_from_hex, chain_hex, chain_step, Ball, Inbound, Report, DEFAULT_COLOURS};
+use fleet_potato::{
+    chain_from_hex, chain_hex, chain_step, Ball, Inbound, Reply, Report, DEFAULT_COLOURS,
+};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command};
@@ -18,30 +20,47 @@ impl Drop for Player {
     }
 }
 
-/// A port the kernel picks, released for the player to bind.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// A player on a ball port it binds itself (port 0) and reports on its first stderr line, so
+/// tests running at once never reach for the same port.
+fn player(n: u32, report: u16) -> (Player, u16) {
+    spawn(Some(n), report)
 }
 
-fn player(n: u32, ball_port: u16, report: u16) -> Player {
-    spawn(Some(n), ball_port, report)
-}
-
-fn spawn(n: Option<u32>, ball_port: u16, report: u16) -> Player {
+fn spawn(n: Option<u32>, report: u16) -> (Player, u16) {
     let mut c = Command::new(env!("CARGO_BIN_EXE_potato"));
     if let Some(n) = n {
         c.env("POTATO_PLAYER", n.to_string());
     }
-    Player(
-        c.env("POTATO_REPORT", format!("127.0.0.1:{report}"))
-            .env("POTATO_BALL_PORT", ball_port.to_string())
-            .spawn()
-            .expect("starting the player"),
-    )
+    let mut child = c
+        .env("POTATO_REPORT", format!("127.0.0.1:{report}"))
+        .env("POTATO_BALL_PORT", "0")
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("starting the player");
+    let mut line = String::new();
+    BufReader::new(child.stderr.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let port = line
+        .trim()
+        .rsplit(' ')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("no ball port in {line:?}"));
+    (Player(child), port)
+}
+
+/// Whether a player's answer is an `ok`, decoded.
+fn is_ok(answer: &str) -> bool {
+    Reply::ok(answer).is_ok()
+}
+
+/// The reason of a refusal, decoded; panics on anything else.
+fn refusal(answer: &str) -> String {
+    match serde_json::from_str::<Reply>(answer.trim()) {
+        Ok(Reply::Refused { reason }) => reason,
+        other => panic!("expected a refusal, got {other:?} from {answer:?}"),
+    }
 }
 
 /// One message on a player's ball port, and its one-line answer.
@@ -58,11 +77,10 @@ fn ask(port: u16, msg: &Inbound) -> String {
 type Latest = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, TcpStream>>>;
 
 fn report_server() -> (u16, Receiver<Report>, Receiver<TcpStream>, Latest) {
-    report_server_on(0)
+    report_server_from(TcpListener::bind("127.0.0.1:0").unwrap())
 }
 
-fn report_server_on(port: u16) -> (u16, Receiver<Report>, Receiver<TcpStream>, Latest) {
-    let l = TcpListener::bind(("127.0.0.1", port)).unwrap();
+fn report_server_from(l: TcpListener) -> (u16, Receiver<Report>, Receiver<TcpStream>, Latest) {
     let port = l.local_addr().unwrap().port();
     let (tx, rx) = channel();
     let (ctx, crx) = channel();
@@ -97,7 +115,7 @@ fn report_server_on(port: u16) -> (u16, Receiver<Report>, Receiver<TcpStream>, L
 /// once restored it is told it woke.
 fn wake(port: u16) {
     let ok = ask(port, &Inbound::Wake { round: None });
-    assert!(ok.contains("\"ok\""), "{ok}");
+    assert!(is_ok(&ok), "{ok}");
 }
 
 fn next(rx: &Receiver<Report>) -> Report {
@@ -125,7 +143,7 @@ fn send_ball(port: u16, ball: &Ball) {
     .unwrap();
     let mut ack = String::new();
     BufReader::new(c).read_line(&mut ack).unwrap();
-    assert!(ack.contains("\"ok\""), "{ack}");
+    assert!(is_ok(&ack), "{ack}");
 }
 
 fn hello_of(r: Report) -> (u32, u32, u64, String) {
@@ -143,9 +161,9 @@ fn hello_of(r: Report) -> (u32, u32, u64, String) {
 #[test]
 fn the_ball_goes_round_and_drops_when_nobody_catches() {
     let (report, reports, _conns, _latest) = report_server();
-    let (pa, pb) = (free_port(), free_port());
-    let _a = player(0, pa, report);
-    let mut b = Some(player(1, pb, report));
+    let (_a, pa) = player(0, report);
+    let (b_player, pb) = player(1, report);
+    let mut b = Some(b_player);
     let mut hellos = std::collections::BTreeMap::new();
     for _ in 0..2 {
         let (n, colour, counter, chain) = hello_of(next(&reports));
@@ -225,8 +243,7 @@ fn the_ball_goes_round_and_drops_when_nobody_catches() {
 #[test]
 fn a_retired_report_connection_comes_back_with_the_state() {
     let (report, reports, conns, _latest) = report_server();
-    let pa = free_port();
-    let _a = player(3, pa, report);
+    let (_a, pa) = player(3, report);
     let (_, colour, _, _) = hello_of(next(&reports));
     let first = conns.recv_timeout(Duration::from_secs(10)).unwrap();
     // a catch, then the throw to nobody drops
@@ -269,8 +286,7 @@ fn a_retired_report_connection_comes_back_with_the_state() {
 #[test]
 fn a_probe_answers_with_the_state() {
     let (report, reports, _conns, _latest) = report_server();
-    let pa = free_port();
-    let _a = player(4, pa, report);
+    let (_a, pa) = player(4, report);
     let (_, colour, counter, chain) = hello_of(next(&reports));
     let mut c = connect(pa);
     writeln!(c, "{}", serde_json::to_string(&Inbound::Probe).unwrap()).unwrap();
@@ -291,8 +307,7 @@ fn a_probe_answers_with_the_state() {
 #[test]
 fn an_unassigned_player_waits_for_its_number() {
     let (report, reports, _conns, _latest) = report_server();
-    let pa = free_port();
-    let _a = spawn(None, pa, report);
+    let (_a, pa) = spawn(None, report);
     let ball = Ball {
         round: 1,
         seq: 0,
@@ -304,7 +319,7 @@ fn an_unassigned_player_waits_for_its_number() {
         trail: vec![],
     };
     let refused = ask(pa, &Inbound::Ball(ball));
-    assert!(refused.contains("not assigned"), "{refused}");
+    assert!(refusal(&refused).contains("not assigned"));
     let probe: Report = serde_json::from_str(&ask(pa, &Inbound::Probe)).unwrap();
     assert!(
         matches!(probe, Report::Probe { player: None, .. }),
@@ -321,7 +336,7 @@ fn an_unassigned_player_waits_for_its_number() {
             colours: Some(5),
         },
     );
-    assert!(ok.contains("\"ok\""), "{ok}");
+    assert!(is_ok(&ok), "{ok}");
     match next(&reports) {
         Report::Hello {
             player,
@@ -343,13 +358,13 @@ fn an_unassigned_player_waits_for_its_number() {
             colours: None,
         },
     );
-    assert!(again.contains("already assigned"), "{again}");
+    assert!(refusal(&again).contains("already assigned"));
 }
 
 #[test]
 fn a_pace_shortens_the_hold_of_its_round_only() {
     let (report, reports, _conns, _latest) = report_server();
-    let (pa, sink) = (free_port(), TcpListener::bind("127.0.0.1:0").unwrap());
+    let sink = TcpListener::bind("127.0.0.1:0").unwrap();
     let sink_port = sink.local_addr().unwrap().port();
     let (balls_tx, balls) = channel::<Ball>();
     thread::spawn(move || {
@@ -365,16 +380,15 @@ fn a_pace_shortens_the_hold_of_its_round_only() {
             }
         }
     });
-    let _a = player(1, pa, report);
+    let (_a, pa) = player(1, report);
     let _ = next(&reports); // hello
-    assert!(ask(
+    assert!(is_ok(&ask(
         pa,
         &Inbound::Pace {
             round: 4,
             hold_ms: 30
         }
-    )
-    .contains("ok"));
+    )));
     let ball = |round| Ball {
         round,
         seq: 0,
@@ -418,8 +432,7 @@ fn a_pace_shortens_the_hold_of_its_round_only() {
 #[test]
 fn a_silent_connection_does_not_hold_up_the_ball() {
     let (report, reports, _conns, _latest) = report_server();
-    let pa = free_port();
-    let _a = player(2, pa, report);
+    let (_a, pa) = player(2, report);
     let _ = next(&reports); // hello
     let _silent = connect(pa);
     thread::sleep(Duration::from_millis(50));
@@ -448,8 +461,7 @@ fn a_silent_connection_does_not_hold_up_the_ball() {
 #[test]
 fn a_player_that_has_thrown_refuses_the_ball_until_it_is_woken() {
     let (report, reports, conns, _latest) = report_server();
-    let pa = free_port();
-    let _a = player(5, pa, report);
+    let (_a, pa) = player(5, report);
     let _ = next(&reports); // hello
     let first = conns.recv_timeout(Duration::from_secs(10)).unwrap();
     let ball = |seq| Ball {
@@ -472,7 +484,7 @@ fn a_player_that_has_thrown_refuses_the_ball_until_it_is_woken() {
     assert!(matches!(next(&reports), Report::Caught { seq: 0, .. }));
     assert!(matches!(next(&reports), Report::Dropped { .. }));
     let refused = ask(pa, &Inbound::Ball(ball(2)));
-    assert!(refused.contains("asleep"), "{refused}");
+    assert!(refusal(&refused).contains("asleep"));
     assert!(!accepting(pa), "a probe says it does not catch yet");
     // the report connection failing and coming back is not a wake
     first.shutdown(std::net::Shutdown::Both).unwrap();
@@ -480,7 +492,7 @@ fn a_player_that_has_thrown_refuses_the_ball_until_it_is_woken() {
         next(&reports),
         Report::Hello { connections: 2, .. }
     ));
-    assert!(ask(pa, &Inbound::Ball(ball(2))).contains("asleep"));
+    assert!(refusal(&ask(pa, &Inbound::Ball(ball(2)))).contains("asleep"));
     wake(pa);
     assert!(accepting(pa));
     send_ball(pa, &ball(2));
@@ -491,8 +503,7 @@ fn a_player_that_has_thrown_refuses_the_ball_until_it_is_woken() {
 #[test]
 fn a_ball_sent_twice_is_caught_once() {
     let (report, reports, _conns, _latest) = report_server();
-    let pa = free_port();
-    let _a = player(6, pa, report);
+    let (_a, pa) = player(6, report);
     let _ = next(&reports); // hello
     let ball = Ball {
         round: 3,
@@ -535,9 +546,8 @@ fn a_ball_sent_twice_is_caught_once() {
 #[test]
 fn a_stopped_round_abandons_the_throw_and_refuses_its_balls() {
     let (report, reports, _conns, _latest) = report_server();
-    let (pa, pb) = (free_port(), free_port());
-    let _a = player(7, pa, report);
-    let _b = player(8, pb, report);
+    let (_a, pa) = player(7, report);
+    let (_b, pb) = player(8, report);
     let _ = next(&reports);
     let _ = next(&reports);
     let ball = Ball {
@@ -552,7 +562,7 @@ fn a_stopped_round_abandons_the_throw_and_refuses_its_balls() {
     };
     send_ball(pa, &ball);
     assert!(matches!(next(&reports), Report::Caught { player: 7, .. }));
-    assert!(ask(pa, &Inbound::Stop { round: 9 }).contains("ok"));
+    assert!(is_ok(&ask(pa, &Inbound::Stop { round: 9 })));
     match next(&reports) {
         Report::Dropped {
             player,
@@ -565,7 +575,7 @@ fn a_stopped_round_abandons_the_throw_and_refuses_its_balls() {
         }
         other => panic!("expected the abandoned throw, got {other:?}"),
     }
-    wake(pa);
+    // an abandoned throw is not a throw: the player still catches, with no wake
     let refused = ask(
         pa,
         &Inbound::Ball(Ball {
@@ -573,7 +583,7 @@ fn a_stopped_round_abandons_the_throw_and_refuses_its_balls() {
             ..ball.clone()
         }),
     );
-    assert!(refused.contains("round is over"), "{refused}");
+    assert!(refusal(&refused).contains("round is over"));
     let ok = ask(
         pa,
         &Inbound::Ball(Ball {
@@ -584,7 +594,7 @@ fn a_stopped_round_abandons_the_throw_and_refuses_its_balls() {
             ..ball
         }),
     );
-    assert!(ok.contains("\"ok\""), "a later round is caught: {ok}");
+    assert!(is_ok(&ok), "a later round is caught: {ok}");
 }
 
 /// The hello a new player sends is its state when it got its number, so the report of a ball
@@ -592,17 +602,22 @@ fn a_stopped_round_abandons_the_throw_and_refuses_its_balls() {
 /// catch.
 #[test]
 fn the_first_hello_comes_before_the_first_catch() {
-    let pa = free_port();
-    let report = free_port();
-    let _a = spawn(None, pa, report);
-    assert!(ask(
+    // the report port, bound but not listening: the reporter's connections are refused
+    // until the catch has happened
+    let reserved =
+        socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    reserved
+        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+        .unwrap();
+    let report = reserved.local_addr().unwrap().as_socket().unwrap().port();
+    let (_a, pa) = spawn(None, report);
+    assert!(is_ok(&ask(
         pa,
         &Inbound::Assign {
             player: 100,
             colours: None
         }
-    )
-    .contains("ok"));
+    )));
     let ball = Ball {
         round: 1,
         seq: 0,
@@ -615,10 +630,53 @@ fn the_first_hello_comes_before_the_first_catch() {
     };
     send_ball(pa, &ball);
     // nothing listened for reports until now
-    let (_, reports, _conns, _latest) = report_server_on(report);
+    reserved.listen(16).unwrap();
+    let (_, reports, _conns, _latest) = report_server_from(reserved.into());
     match next(&reports) {
         Report::Hello { proof, .. } => assert_eq!(proof.counter, 0),
         other => panic!("the first report is {other:?}"),
     }
     assert!(matches!(next(&reports), Report::Caught { .. }));
+}
+
+/// A catcher's answer is decoded: a refusal whose reason happens to say "ok" is a refusal,
+/// and the thrower keeps trying until its flight window ends.
+#[test]
+fn a_refusal_that_says_ok_is_not_a_catch() {
+    let (report, reports, _conns, _latest) = report_server();
+    let catcher = TcpListener::bind("127.0.0.1:0").unwrap();
+    let cp = catcher.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for c in catcher.incoming() {
+            let mut c = c.unwrap();
+            let mut line = String::new();
+            BufReader::new(c.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            writeln!(c, "{{\"type\":\"refused\",\"reason\":\"ok\"}}").unwrap();
+        }
+    });
+    let (_a, pa) = player(11, report);
+    let _ = next(&reports); // hello
+    let ball = Ball {
+        round: 1,
+        seq: 0,
+        ring: vec![format!("127.0.0.1:{pa}"), format!("127.0.0.1:{cp}")],
+        hold_ms: 0,
+        shrink_permille: 0,
+        min_hold_ms: 0,
+        flight_ms: 50,
+        trail: vec![],
+    };
+    send_ball(pa, &ball);
+    assert!(matches!(next(&reports), Report::Caught { .. }));
+    match next(&reports) {
+        Report::Dropped {
+            reason, attempts, ..
+        } => {
+            assert!(attempts > 1);
+            assert!(reason.contains("refused"), "{reason}");
+        }
+        other => panic!("a refusal was taken for a catch: {other:?}"),
+    }
 }

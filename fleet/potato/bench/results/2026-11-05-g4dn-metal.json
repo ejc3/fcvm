@@ -870,8 +870,6 @@
    {
     "size": 2,
     "start_hold_ms": 2000,
-    "record_hold_ms": 1458,
-    "dropped_at_hold_ms": 1182,
     "lap": 5,
     "catches": 10,
     "reason": "dropped",
@@ -889,13 +887,14 @@
      "p50": 339.5,
      "max": 1120.2
     },
-    "awake_max": 2
+    "awake_max": 2,
+    "logged_record_hold_ms": 1458,
+    "record_hold_ms": 1313,
+    "dropped_in_lap_hold_ms": 1182
    },
    {
     "size": 4,
     "start_hold_ms": 666,
-    "record_hold_ms": 438,
-    "dropped_at_hold_ms": 395,
     "lap": 6,
     "catches": 23,
     "reason": "dropped",
@@ -913,13 +912,14 @@
      "p50": 347.1,
      "max": 1421.9
     },
-    "awake_max": 4
+    "awake_max": 4,
+    "logged_record_hold_ms": 438,
+    "record_hold_ms": 395,
+    "dropped_in_lap_hold_ms": 356
    },
    {
     "size": 8,
     "start_hold_ms": 285,
-    "record_hold_ms": 257,
-    "dropped_at_hold_ms": 232,
     "lap": 2,
     "catches": 21,
     "reason": "dropped",
@@ -937,13 +937,14 @@
      "p50": 699.0,
      "max": 1238.2
     },
-    "awake_max": 8
+    "awake_max": 8,
+    "logged_record_hold_ms": 257,
+    "record_hold_ms": 257,
+    "dropped_in_lap_hold_ms": 232
    },
    {
     "size": 16,
     "start_hold_ms": 250,
-    "record_hold_ms": null,
-    "dropped_at_hold_ms": 250,
     "lap": 0,
     "catches": 1,
     "reason": "dropped",
@@ -961,13 +962,14 @@
      "p50": 718.7,
      "max": 718.7
     },
-    "awake_max": 16
+    "awake_max": 16,
+    "logged_record_hold_ms": null,
+    "record_hold_ms": null,
+    "dropped_in_lap_hold_ms": 250
    },
    {
     "size": 32,
     "start_hold_ms": 250,
-    "record_hold_ms": 250,
-    "dropped_at_hold_ms": 203,
     "lap": 2,
     "catches": 91,
     "reason": "dropped",
@@ -985,13 +987,14 @@
      "p50": 710.2,
      "max": 2130.7
     },
-    "awake_max": 32
+    "awake_max": 32,
+    "logged_record_hold_ms": 250,
+    "record_hold_ms": 225,
+    "dropped_in_lap_hold_ms": 203
    },
    {
     "size": 64,
     "start_hold_ms": 250,
-    "record_hold_ms": 250,
-    "dropped_at_hold_ms": 203,
     "lap": 2,
     "catches": 151,
     "reason": "dropped",
@@ -1009,13 +1012,14 @@
      "p50": 681.8,
      "max": 4814.4
     },
-    "awake_max": 64
+    "awake_max": 64,
+    "logged_record_hold_ms": 250,
+    "record_hold_ms": 225,
+    "dropped_in_lap_hold_ms": 203
    },
    {
     "size": 96,
     "start_hold_ms": 250,
-    "record_hold_ms": 250,
-    "dropped_at_hold_ms": 225,
     "lap": 1,
     "catches": 128,
     "reason": "dropped",
@@ -1033,15 +1037,16 @@
      "p50": 635.3,
      "max": 3166.9
     },
-    "awake_max": 96
+    "awake_max": 96,
+    "logged_record_hold_ms": 250,
+    "record_hold_ms": 250,
+    "dropped_in_lap_hold_ms": 225
    }
   ],
   "second_run": [
    {
     "size": 2,
     "start_hold_ms": 2000,
-    "record_hold_ms": 777,
-    "dropped_at_hold_ms": 630,
     "lap": 11,
     "catches": 22,
     "reason": "dropped",
@@ -1059,13 +1064,14 @@
      "p50": 348.6,
      "max": 943.6
     },
-    "awake_max": 2
+    "awake_max": 2,
+    "logged_record_hold_ms": 777,
+    "record_hold_ms": 700,
+    "dropped_in_lap_hold_ms": 630
    },
    {
     "size": 4,
     "start_hold_ms": 666,
-    "record_hold_ms": 321,
-    "dropped_at_hold_ms": 261,
     "lap": 9,
     "catches": 37,
     "reason": "dropped",
@@ -1083,13 +1089,14 @@
      "p50": 382.7,
      "max": 2132.5
     },
-    "awake_max": 4
+    "awake_max": 4,
+    "logged_record_hold_ms": 321,
+    "record_hold_ms": 289,
+    "dropped_in_lap_hold_ms": 261
    },
    {
     "size": 8,
     "start_hold_ms": 285,
-    "record_hold_ms": 285,
-    "dropped_at_hold_ms": 232,
     "lap": 2,
     "catches": 21,
     "reason": "dropped",
@@ -1107,13 +1114,14 @@
      "p50": 661.0,
      "max": 1261.9
     },
-    "awake_max": 8
+    "awake_max": 8,
+    "logged_record_hold_ms": 285,
+    "record_hold_ms": 257,
+    "dropped_in_lap_hold_ms": 232
    },
    {
     "size": 16,
     "start_hold_ms": 250,
-    "record_hold_ms": 183,
-    "dropped_at_hold_ms": 149,
     "lap": 5,
     "catches": 81,
     "reason": "dropped",
@@ -1131,13 +1139,14 @@
      "p50": 1163.7,
      "max": 2316.6
     },
-    "awake_max": 16
+    "awake_max": 16,
+    "logged_record_hold_ms": 183,
+    "record_hold_ms": 165,
+    "dropped_in_lap_hold_ms": 149
    },
    {
     "size": 32,
     "start_hold_ms": 250,
-    "record_hold_ms": 225,
-    "dropped_at_hold_ms": 183,
     "lap": 3,
     "catches": 118,
     "reason": "dropped",
@@ -1155,13 +1164,14 @@
      "p50": 943.0,
      "max": 2168.2
     },
-    "awake_max": 32
+    "awake_max": 32,
+    "logged_record_hold_ms": 225,
+    "record_hold_ms": 203,
+    "dropped_in_lap_hold_ms": 183
    },
    {
     "size": 64,
     "start_hold_ms": 250,
-    "record_hold_ms": 250,
-    "dropped_at_hold_ms": 225,
     "lap": 1,
     "catches": 88,
     "reason": "dropped",
@@ -1179,13 +1189,14 @@
      "p50": 667.4,
      "max": 2811.9
     },
-    "awake_max": 64
+    "awake_max": 64,
+    "logged_record_hold_ms": 250,
+    "record_hold_ms": 250,
+    "dropped_in_lap_hold_ms": 225
    },
    {
     "size": 96,
     "start_hold_ms": 250,
-    "record_hold_ms": 250,
-    "dropped_at_hold_ms": 225,
     "lap": 1,
     "catches": 150,
     "reason": "dropped",
@@ -1203,15 +1214,16 @@
      "p50": 832.7,
      "max": 5868.1
     },
-    "awake_max": 96
+    "awake_max": 96,
+    "logged_record_hold_ms": 250,
+    "record_hold_ms": 250,
+    "dropped_in_lap_hold_ms": 225
    }
   ],
   "subvolumes_off": [
    {
     "size": 2,
     "start_hold_ms": 2000,
-    "record_hold_ms": 1458,
-    "dropped_at_hold_ms": 1182,
     "lap": 5,
     "catches": 10,
     "reason": "dropped",
@@ -1229,13 +1241,14 @@
      "p50": 336.9,
      "max": 1092.8
     },
-    "awake_max": 2
+    "awake_max": 2,
+    "logged_record_hold_ms": 1458,
+    "record_hold_ms": 1313,
+    "dropped_in_lap_hold_ms": 1182
    },
    {
     "size": 4,
     "start_hold_ms": 666,
-    "record_hold_ms": 486,
-    "dropped_at_hold_ms": 395,
     "lap": 5,
     "catches": 20,
     "reason": "dropped",
@@ -1253,13 +1266,14 @@
      "p50": 374.7,
      "max": 1506.0
     },
-    "awake_max": 4
+    "awake_max": 4,
+    "logged_record_hold_ms": 486,
+    "record_hold_ms": 438,
+    "dropped_in_lap_hold_ms": 395
    },
    {
     "size": 8,
     "start_hold_ms": 285,
-    "record_hold_ms": 232,
-    "dropped_at_hold_ms": 209,
     "lap": 3,
     "catches": 24,
     "reason": "dropped",
@@ -1277,13 +1291,14 @@
      "p50": 786.5,
      "max": 1274.0
     },
-    "awake_max": 8
+    "awake_max": 8,
+    "logged_record_hold_ms": 232,
+    "record_hold_ms": 232,
+    "dropped_in_lap_hold_ms": 209
    },
    {
     "size": 16,
     "start_hold_ms": 250,
-    "record_hold_ms": 225,
-    "dropped_at_hold_ms": 183,
     "lap": 3,
     "catches": 48,
     "reason": "dropped",
@@ -1301,13 +1316,14 @@
      "p50": 757.3,
      "max": 1865.8
     },
-    "awake_max": 16
+    "awake_max": 16,
+    "logged_record_hold_ms": 225,
+    "record_hold_ms": 203,
+    "dropped_in_lap_hold_ms": 183
    },
    {
     "size": 32,
     "start_hold_ms": 250,
-    "record_hold_ms": 225,
-    "dropped_at_hold_ms": 183,
     "lap": 3,
     "catches": 119,
     "reason": "dropped",
@@ -1325,13 +1341,14 @@
      "p50": 1117.3,
      "max": 3282.2
     },
-    "awake_max": 32
+    "awake_max": 32,
+    "logged_record_hold_ms": 225,
+    "record_hold_ms": 203,
+    "dropped_in_lap_hold_ms": 183
    },
    {
     "size": 64,
     "start_hold_ms": 250,
-    "record_hold_ms": 250,
-    "dropped_at_hold_ms": 203,
     "lap": 2,
     "catches": 145,
     "reason": "dropped",
@@ -1349,13 +1366,14 @@
      "p50": 780.4,
      "max": 4332.5
     },
-    "awake_max": 64
+    "awake_max": 64,
+    "logged_record_hold_ms": 250,
+    "record_hold_ms": 225,
+    "dropped_in_lap_hold_ms": 203
    },
    {
     "size": 96,
     "start_hold_ms": 250,
-    "record_hold_ms": 250,
-    "dropped_at_hold_ms": 203,
     "lap": 2,
     "catches": 211,
     "reason": "dropped",
@@ -1373,9 +1391,12 @@
      "p50": 1193.2,
      "max": 6036.7
     },
-    "awake_max": 96
+    "awake_max": 96,
+    "logged_record_hold_ms": 250,
+    "record_hold_ms": 225,
+    "dropped_in_lap_hold_ms": 203
    }
   ],
-  "notes": "first_run had a bench defect (a throw heard while a wake was finishing started no sleep) that ended size 16 at once; fixed before second_run and subvolumes_off. subvolumes_off ran with FCVM_SNAPSHOT_SUBVOLUMES=0, a switch measured and not kept."
+  "notes": "first_run had a bench defect (a throw heard while a wake was finishing started no sleep) that ended size 16 at once; fixed before second_run and subvolumes_off. subvolumes_off ran with FCVM_SNAPSHOT_SUBVOLUMES=0, a switch measured and not kept. record_hold_ms is the hold of the lap before the drop, from the start and the shrink; logged_record_hold_ms is what the first ladder_summary.py read from the per-catch log, which can be a lap behind."
  }
 }

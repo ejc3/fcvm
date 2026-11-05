@@ -412,7 +412,7 @@ impl Potato {
     pub fn agent_hello(&mut self, host: &str, players: u32, at: u64, cfg: &PotatoConfig) {
         if players == 0 {
             if self.host.as_deref() == Some(host) {
-                self.agent_gone(host, at);
+                self.agent_gone(host, at, cfg);
             }
             return;
         }
@@ -430,30 +430,28 @@ impl Potato {
         self.next_round_at = Some(at + 1000);
     }
 
-    pub fn agent_gone(&mut self, host: &str, at: u64) {
+    /// The potato host disconnected. Its round ends with what it achieved counted (the size's
+    /// rounds, what ended it, the longest round), and the ladder stays at that size, so a host
+    /// that comes back plays it again.
+    pub fn agent_gone(&mut self, host: &str, at: u64, cfg: &PotatoConfig) {
         if self.host.as_deref() != Some(host) {
             return;
         }
         if let Some(r) = &self.round {
             let seq = r.seq.unwrap_or(0);
-            let d = Drop {
+            let rung = self.rung;
+            self.drop_ball(
                 at,
-                round: r.id,
-                size: r.size,
-                reason: "host_gone".into(),
-                player: None,
-                thrower: None,
+                "host_gone",
+                None,
+                None,
                 seq,
-                lap: r.lap(seq),
-                hold_ms: r.hold_at(seq),
-                stage: "host".into(),
-                stage_ms: 0.0,
-                listening_after_ms: None,
-                sleep_stages: BTreeMap::new(),
-                wake_stages: BTreeMap::new(),
-                detail: "the host running the players disconnected".into(),
-            };
-            self.last_drop = Some(d);
+                "host",
+                0.0,
+                "the host running the players disconnected".into(),
+                cfg,
+            );
+            self.rung = rung;
         }
         self.round = None;
         self.players.clear();
@@ -794,10 +792,14 @@ impl Potato {
                     }
                 }
                 let r = self.round.as_mut().unwrap();
-                r.seq = Some(r.seq.map_or(*seq, |s| s.max(*seq)));
-                r.holder = Some(e.player);
-                r.last_catch_at = Some(at);
-                r.flight = None;
+                // a catch reported late (reports come on each player's own connection) is
+                // verified and counted, but the latest catch stays the newest one
+                if r.seq.is_none_or(|s| *seq >= s) {
+                    r.seq = Some(*seq);
+                    r.holder = Some(e.player);
+                    r.last_catch_at = Some(at);
+                    r.flight = None;
+                }
             }
             PotatoKind::Threw { round, to, .. } => {
                 // the agent puts a player to sleep once it has thrown
@@ -1370,5 +1372,48 @@ mod tests {
         g.tick(due, true, &cfg);
         assert!(g.round.is_some(), "on time by the coordinator's clock");
         assert!(g.last_drop.is_none());
+    }
+
+    /// A late report of an earlier catch is counted, but the latest catch (its holder and time,
+    /// which the deadline and the page use) stays the newest one.
+    #[test]
+    fn a_late_report_does_not_move_the_ball_back() {
+        let (mut g, cfg, mut proofs) = game(4);
+        let id = g.round.as_ref().unwrap().id;
+        let c0 = catch(&mut proofs, 0, id, 0, 1100, false);
+        let c1 = catch(&mut proofs, 1, id, 1, 1200, false);
+        let c2 = catch(&mut proofs, 2, id, 2, 1300, false);
+        g.event("h", &c0, 1100, &cfg);
+        g.event("h", &c2, 1300, &cfg);
+        g.event("h", &c1, 1350, &cfg);
+        let r = g.round.as_ref().unwrap();
+        assert_eq!(
+            (r.seq, r.holder, r.last_catch_at),
+            (Some(2), Some(2), Some(1300))
+        );
+        assert_eq!(r.verified_through, Some(2));
+    }
+
+    /// The host leaving ends its round with what it achieved counted, and the ladder stays at
+    /// that size for a host that comes back.
+    #[test]
+    fn a_host_that_leaves_keeps_its_rounds_statistics_and_its_size() {
+        let (mut g, cfg, mut proofs) = game(2);
+        let id = g.round.as_ref().unwrap().id;
+        for (seq, p) in [(0, 0), (1, 1), (2, 0)] {
+            let e = catch(&mut proofs, p, id, seq, 1100 + seq * 100, false);
+            g.event("h", &e, e.at, &cfg);
+        }
+        let rung = g.rung;
+        g.agent_gone("h", 2000, &cfg);
+        assert_eq!(g.rung, rung, "the same size next time");
+        let size2 = &g.ladder[rung];
+        assert_eq!(size2.rounds, 1);
+        assert_eq!(
+            size2.broke.as_ref().map(|d| d.reason.as_str()),
+            Some("host_gone")
+        );
+        assert_eq!(g.records.longest_round.as_ref().map(|r| r.value), Some(3.0));
+        assert!(g.round.is_none() && g.host.is_none() && g.next_round_at.is_none());
     }
 }
