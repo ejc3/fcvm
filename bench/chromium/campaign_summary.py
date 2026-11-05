@@ -86,6 +86,8 @@ import tempfile
 from contextlib import contextmanager
 from urllib.parse import urlsplit
 
+import records
+
 import reqanalyze
 
 VERIFY_STAGES = ("pre", "before-run", "after-run")
@@ -227,10 +229,25 @@ class Sources:
             self.entries.attempted_paths.append(pair)
         return display_path
 
+    def exists(self, path):
+        """A regular file at path, or a record its campaign's manifest lists."""
+        return os.path.isfile(path) or records.entry(self.display_path(path)) is not None
+
+    def read(self, path, display_path):
+        """The bytes at path, or of the moved record the manifest lists there,
+        checked against the manifest's size and sha256."""
+        try:
+            return read_bytes(path)
+        except FileNotFoundError:
+            found = records.entry(display_path)
+            if found is None:
+                raise
+            return records.read_moved(found)
+
     def read_json(self, path):
         display_path = self.protect(path)
         try:
-            data = read_bytes(path)
+            data = self.read(path, display_path)
         except OSError as error:
             raise RunError(f"{display_path}: cannot read: {error}")
         self.entries.append({
@@ -243,7 +260,7 @@ class Sources:
         """Record a file the index does not parse; returns its sha256."""
         display_path = self.protect(path)
         try:
-            data = read_bytes(path)
+            data = self.read(path, display_path)
         except OSError as error:
             raise RunError(f"{display_path}: cannot read: {error}")
         digest = hashlib.sha256(data).hexdigest()
@@ -588,7 +605,7 @@ def request_load_evidence(run_dir, analysis, arms, sources):
     """Derive per-request load from the exact reqanalyze input bytes."""
     path = os.path.join(run_dir, "reqbench.jsonl")
     display_path = sources.display_path(path)
-    if not os.path.isfile(path):
+    if not sources.exists(path):
         raise RunError(f"{run_dir}: reqbench.jsonl is missing")
     data, digest = sources.read_hashed(path)
     # The binding precedes parsing, so no value from bytes outside the
@@ -1118,7 +1135,7 @@ def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls, run_id,
         if not is_sha256(want):
             raise RunError(f"{run_dir}: dns-evidence.json has no sha256 for {name} ({field})")
         path = os.path.join(run_dir, name)
-        if os.path.isfile(path):
+        if sources.exists(path):
             data, digest = sources.read_hashed(path)
         else:
             data, digest = read_external_log(run_dir, name, want, sources)
@@ -1467,7 +1484,7 @@ def load_cell(run_dir, sources=None, replay_logs=True):
     if os.path.lexists(marker):
         raise RunError(f"{run_dir}: withdrawn: {withdrawal_reason(marker)}")
     analysis_path = os.path.join(run_dir, "analysis.json")
-    if not os.path.isfile(analysis_path):
+    if not sources.exists(analysis_path):
         raise RunError(f"{run_dir}: analysis.json is missing")
     analysis = sources.read_json(analysis_path)
     if not isinstance(analysis, dict):

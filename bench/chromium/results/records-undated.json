@@ -1,0 +1,64 @@
+{
+ "campaign": "undated",
+ "fcvm_commit": "7c62d33299e952e44f9995077ebf20b6d8d7bdd1",
+ "files": [
+  {
+   "path": "bench/chromium/results/hostcdp-509059c1700d47bb89e9854ddd54bb73/hostcdp.jsonl",
+   "sha256": "1922fe16e99f61cb02ebeb668fa5810640cdd6f4628622248b619f720a473d17",
+   "size": 234265
+  },
+  {
+   "path": "bench/chromium/results/hostcdp-bc17d3ffb64c46ab8d2ef51c0043fb9b/hostcdp.jsonl",
+   "sha256": "27677dc195c5664cb3f22fac3e5fd31b67716d054e325439d0f561848f6cfad6",
+   "size": 234491
+  },
+  {
+   "path": "bench/chromium/results/reqbench-134b408e1a3d42feb866bb4c5fed774c/analysis.json",
+   "sha256": "3c7cf3b20fca134e448462397d5bc11ed21756a04307a304a582e1d2ee12f68c",
+   "size": 2202424
+  },
+  {
+   "path": "bench/chromium/results/reqbench-182aaea3710b4d7e83ca59b08efb67b6/analysis.json",
+   "sha256": "8f1ee0b3e883238a7f58e9bac98588605404a291273465fd1a405ccad1092f8f",
+   "size": 2201762
+  },
+  {
+   "path": "bench/chromium/results/reqbench-8668475e482f4339beff6749deb815cf/analysis.json",
+   "sha256": "d6c6f134c7cb0dc2568ccc8bf8d2570b2fd21338a7ecf81cda24c0e2cf84f8a4",
+   "size": 1361316
+  },
+  {
+   "path": "bench/chromium/results/reqbench-86d0f4aca0ca486b8b1a9239792a2d7d/analysis.json",
+   "sha256": "17ac477e4bf448bf01b77afa4d9e8f90558a78d9f317e1a369f2b641f657e3bd",
+   "size": 2202217
+  },
+  {
+   "path": "bench/chromium/results/reqbench-8fbec71a1863427fa4daddc9f1f53af1/analysis.json",
+   "sha256": "604e2f539e65a180c480f339acbb17fb53fe9f6793cb6bc5622ed70c013adcb3",
+   "size": 2201083
+  },
+  {
+   "path": "bench/chromium/results/reqbench-9c23e9d7da424351a390b5c1ddfd8e1d/analysis.json",
+   "sha256": "3020d074cae2774db3a333d2eca4d60fe7a52759f0c45a5abb251adcc513db08",
+   "size": 2202033
+  },
+  {
+   "path": "bench/chromium/results/reqbench-a932b1c3379b45009dc0cb403850d0d1/analysis.json",
+   "sha256": "cbcf5cce54070051cfa55b6bf7060e355ec053c4af3b33749c763aba2d72051d",
+   "size": 203289
+  },
+  {
+   "path": "bench/chromium/results/reqbench-c61bd9e8e4764a23aca3d0ab7ca07a3a/analysis.json",
+   "sha256": "66b9eb19936f4a6723e3712ecfe046a7939e729e6204040d9fe4367505d9866f",
+   "size": 2202463
+  },
+  {
+   "path": "bench/chromium/results/reqbench-ccd7655151d94a6ea47fba8aa23f352d/analysis.json",
+   "sha256": "9fe5452388470049be23bb38f7a23a54a8cbdb0ab5ac23b3a10539f989cd2335",
+   "size": 2202547
+  }
+ ],
+ "records_commit": "078f1a3d0b0f5ad8f3e5cfb3d12f67bc47a1aa18",
+ "repository": "ejc3/fcvm-bench-records",
+ "schema": 1
+}

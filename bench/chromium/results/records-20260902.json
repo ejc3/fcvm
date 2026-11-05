@@ -1,0 +1,69 @@
+{
+ "campaign": "20260902",
+ "fcvm_commit": "7c62d33299e952e44f9995077ebf20b6d8d7bdd1",
+ "files": [
+  {
+   "path": "bench/chromium/results/reqbench-20260902-023115-corpus-c2/analysis.json",
+   "sha256": "725e8823800245817be98f04e45f73a0be29ee606b2a3e3501c72951590e17f5",
+   "size": 922430
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20260902-023115-corpus-c2/corpus-access.log",
+   "sha256": "7749b1aa70a9dff96caa285810486758dfabb7ad0114c4849b70977d2cfbd3c0",
+   "size": 3405544
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20260902-023115-corpus-c2/corpus-dns.log",
+   "sha256": "e250f3e595f942f88140e775381cda5636ccbb7885b8763e88c9cbf85e07c6bf",
+   "size": 564259
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20260902-023115-corpus-c2/reqbench.jsonl",
+   "sha256": "dcdafcdac24549247105067fa206210238051e1342290f25e7cfa98e7b23961c",
+   "size": 708780
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20260902-025115-corpus-c4/analysis.json",
+   "sha256": "7141bd06c3f6bf8c4bd80307dfb5c565590f9eb4a45aeddd16a398fca73f39b2",
+   "size": 922504
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20260902-025115-corpus-c4/corpus-access.log",
+   "sha256": "61eb0ea1f564845f8b08749146ab281d6098416f3dd316023797c48b6427e4d6",
+   "size": 3252625
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20260902-025115-corpus-c4/corpus-dns.log",
+   "sha256": "04993b58872990b87d1bf8a4fa4d06be3262e292572683afbe74c1b55025ef79",
+   "size": 599862
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20260902-025115-corpus-c4/reqbench.jsonl",
+   "sha256": "a0211c687b8960cd65bf7222a795b57872847f246381e60d7efd8036fd582b57",
+   "size": 709486
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20260902-031115-corpus-c8/analysis.json",
+   "sha256": "103244fb74e79eb6589701a1abad49f9e0d97bcff78b92b4f6b40077a9b0f67a",
+   "size": 922506
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20260902-031115-corpus-c8/corpus-access.log",
+   "sha256": "33b552a7c15ab49f54f8557257e48f00338dcf16d89b7a19ded6e0734ce1cd1f",
+   "size": 3273156
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20260902-031115-corpus-c8/corpus-dns.log",
+   "sha256": "696ea53ab5761e5510e42f6210048b3b2c39f4efabb4a1b37ad7aebf2fc13be6",
+   "size": 599781
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20260902-031115-corpus-c8/reqbench.jsonl",
+   "sha256": "91be37a66d90ad0697e90a4e4d453702b1db158a9f05d506737c5df48940369d",
+   "size": 709313
+  }
+ ],
+ "records_commit": "078f1a3d0b0f5ad8f3e5cfb3d12f67bc47a1aa18",
+ "repository": "ejc3/fcvm-bench-records",
+ "schema": 1
+}

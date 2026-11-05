@@ -21,6 +21,7 @@ PAGES_WORKFLOW = os.path.join(REPO, ".github", "workflows", "pages.yml")
 sys.path.insert(0, os.path.join(HERE, "report"))
 sys.path.insert(0, HERE)
 
+import records  # noqa: E402
 import wrap_page  # noqa: E402
 from test_report_kitesurf import PUBLISHED  # noqa: E402
 
@@ -351,8 +352,7 @@ class ReportContent(unittest.TestCase):
         # rootless runs make 230 attempts per arm, the bridged and routed 430.
         bounds = {}
         for run in campaign:
-            with open(os.path.join(HERE, "results", run, "analysis.json")) as f:
-                arms = json.load(f)["arms"]
+            arms = records.read_json(os.path.join(HERE, "results", run, "analysis.json"))["arms"]
             for name, arm in arms.items():
                 self.assertEqual(arm["failed"], 0, (run, name))
                 self.assertIn(arm["attempted"], (230, 430), (run, name))
@@ -384,13 +384,15 @@ class ReportContent(unittest.TestCase):
 
     @staticmethod
     def campaign_runs(cid):
-        """Every committed serial run of campaign cid (git ls-files): a serial
-        run's analysis.json sits at the top of its directory; a scale run's is
-        one level down, in its scale-* directory."""
+        """Every committed serial run of campaign cid (git ls-files, and the
+        records manifests for a raw record kept in ejc3/fcvm-bench-records): a
+        serial run's analysis.json sits at the top of its directory; a scale
+        run's is one level down, in its scale-* directory."""
         import subprocess
         out = subprocess.run(["git", "ls-files", "--", "results"], cwd=HERE,
                              capture_output=True, text=True, check=True).stdout
-        return sorted({p.split("/")[1] for p in out.split()
+        moved = [p[len("bench/chromium/"):] for p in records.listed("bench/chromium/results/")]
+        return sorted({p.split("/")[1] for p in out.split() + moved
                        if p.split("/")[1].startswith(f"reqbench-{cid}-")
                        and p.count("/") == 2 and p.endswith("/analysis.json")})
 
@@ -406,12 +408,12 @@ class ReportContent(unittest.TestCase):
         cid = self.campaign_id()
         fc = section(self.page, "firecracker")
         runs = sorted(set(re.findall(rf"results/(reqbench-{cid}-[a-z0-9-]+)", self.page.replace("<wbr>", ""))))
-        runs = [r for r in runs if os.path.exists(os.path.join(HERE, "results", r, "reqbench.jsonl"))]
+        runs = [r for r in runs if records.exists(os.path.join(HERE, "results", r, "reqbench.jsonl"))]
         self.assertTrue(runs, "the page cites no serial run; the check is vacuous")
         builds = set()
         for run in runs:
-            with open(os.path.join(HERE, "results", run, "reqbench.jsonl")) as f:
-                firecracker = json.loads(f.readline())["firecracker"]
+            firecracker = json.loads(records.first_line(
+                os.path.join(HERE, "results", run, "reqbench.jsonl")))["firecracker"]
             self.assertTrue(firecracker["commit_matches_binary"], run)
             builds.add((firecracker["branch"], firecracker["commit"], firecracker["sha256"]))
         self.assertEqual(len(builds), 1, f"the cited runs used {len(builds)} Firecracker builds")
@@ -434,8 +436,8 @@ class ReportContent(unittest.TestCase):
             self.page = page.replace("0 to 1.59%", "0 to X%").replace("0 to 0.85%", "0 to 1.59%").replace("0 to X%", "0 to 0.85%")
             with self.assertRaises(AssertionError):
                 self.test_the_zero_failure_count_carries_its_interval()
-            with open(os.path.join(HERE, "results", self.campaign_runs(self.campaign_id())[0], "reqbench.jsonl")) as f:
-                branch = json.loads(f.readline())["firecracker"]["branch"]
+            branch = json.loads(records.first_line(os.path.join(
+                HERE, "results", self.campaign_runs(self.campaign_id())[0], "reqbench.jsonl")))["firecracker"]["branch"]
             self.page = page.replace(branch, branch + "-old")
             with self.assertRaises(AssertionError):
                 self.test_each_cited_run_is_attributed_to_the_firecracker_it_ran()

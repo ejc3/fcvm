@@ -114,6 +114,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # A raw record kept in ejc3/fcvm-bench-records is read from the fcvm
+      # commit that last held it (bench/chromium/records.py), which the
+      # shallow checkout lacks: one depth-1 commit, 153 MiB, 18 s.
+      - name: Fetch the commits that hold the moved raw records
+        run: git fetch --no-tags --depth=1 origin $(python3 bench/chromium/records.py commits)
       - name: Run the bench harness test suite
         run: |
           python3 -m unittest discover -s bench/chromium -p 'test_*.py' -v

@@ -1,0 +1,59 @@
+{
+ "campaign": "20261026",
+ "fcvm_commit": "7c62d33299e952e44f9995077ebf20b6d8d7bdd1",
+ "files": [
+  {
+   "path": "bench/chromium/results/campaign-20261026-extras/scale-2vcpu.corpus-listen.log",
+   "sha256": "63773c2c82d5cdf40c0511163842465d9e724874f3f1882f8dded09e694d044b",
+   "size": 1110888
+  },
+  {
+   "path": "bench/chromium/results/campaign-20261026-extras/scale-8vcpu.corpus-listen.log",
+   "sha256": "fefa3b5048b7c07109919719f197417dfb17d5393942fce1ab2afd7f904776c5",
+   "size": 854660
+  },
+  {
+   "path": "bench/chromium/results/scale-ceiling-20261026/backlog-1024-a.corpus-listen.log",
+   "sha256": "aed1c588c3a4040e0611fe26810919c829652b9a90c0aabfa970c5308ecac945",
+   "size": 711677
+  },
+  {
+   "path": "bench/chromium/results/scale-ceiling-20261026/backlog-1024-b.corpus-listen.log",
+   "sha256": "6948aa50965ffc8cda57b73b11310927eba2dbb9f9abef8cda53e93789978df2",
+   "size": 863997
+  },
+  {
+   "path": "bench/chromium/results/scale-ceiling-20261026/base-c.corpus-listen.log",
+   "sha256": "457ba7eac0f08c2510c5fd397ab34f64ec15a9aec621aade9c88574ced51b154",
+   "size": 609720
+  },
+  {
+   "path": "bench/chromium/results/scale-ceiling-20261026/base-first.corpus-listen.log",
+   "sha256": "717f7c54318a37a16a676fe516ac2183b30baf6b59dce0fa3ae2a9037781f10e",
+   "size": 468912
+  },
+  {
+   "path": "bench/chromium/results/scale-ceiling-20261026/handler-2vcpu.corpus-listen.log",
+   "sha256": "63773c2c82d5cdf40c0511163842465d9e724874f3f1882f8dded09e694d044b",
+   "size": 1110888
+  },
+  {
+   "path": "bench/chromium/results/scale-ceiling-20261026/handshake-in-handler-a.corpus-listen.log",
+   "sha256": "cc921c4eb0b17481fb3921bb2afed0f37a5fdb24d88f2c83c1fc2fcb3900b4fc",
+   "size": 1194281
+  },
+  {
+   "path": "bench/chromium/results/scale-ceiling-20261026/handshake-in-handler-hi.corpus-listen.log",
+   "sha256": "11e4ea73ac9934400de690016e8db076f5d26f1d3442cc9b03b7807baf44dfdf",
+   "size": 871245
+  },
+  {
+   "path": "bench/chromium/results/scale-ceiling-20261026/static-page-a.corpus-listen.log",
+   "sha256": "ddfd2359f55a2d33bcc3394f64b4657f4a00318cdd69e7337f882fdb62329d52",
+   "size": 360686
+  }
+ ],
+ "records_commit": "078f1a3d0b0f5ad8f3e5cfb3d12f67bc47a1aa18",
+ "repository": "ejc3/fcvm-bench-records",
+ "schema": 1
+}

@@ -255,7 +255,7 @@ stays unquotable (REVIEW.md).
 
 A corpus campaign's run directory also keeps the replay server's two logs,
 `corpus-dns.log` and `corpus-access.log`, plus the campaign's own
-`replay-queries.log`, one line per verify bracket. All three are tracked
+`replay-queries.log`, one line per verify bracket. All three are kept
 because `dns-evidence.json` records their sha256 and `campaign_summary.py`
 refuses the run unless each is present and matches. Expect the server's two
 to be large: the DNS log has one line per query and the access log one line
@@ -1026,8 +1026,12 @@ the spirit of `~/src/editor-loop-bench/SUMMARY.md` (read it before writing). Mat
 7. **`REVIEW.md` is a first-class deliverable**, not an appendix: what holds, what was
    refuted, what remains unmeasured.
 
-Raw run output under `results/` is gitignored; the curated records are committed.
-`bench/chromium/.gitignore` re-includes most of them by name (`analysis.json`,
-`reqbench.jsonl`, `run.json`, `summary.json`, the DNS evidence and replay logs,
-`WITHDRAWN`), and every published figure cites one (rule 3). Uncertainty goes in
-the tables, not just the prose.
+Raw run output under `results/` is not committed. A run's summaries are (campaign
+indexes, DNS evidence, provenance, `summary.json`, `WITHDRAWN`), and every published
+figure cites a record (rule 3). Its raw files (`records.RAW`: `analysis.json`,
+`reqbench.jsonl`, `restore-ack.jsonl`, `logs/serve.log`, replay and listener logs,
+scale-run request and status files, samples) go to `ejc3/fcvm-bench-records` at the
+same path through `records.py move` and `records.py manifest`, which lists each with
+its size and sha256 in a `records-<campaign>.json` manifest in `results/`; tests and
+`campaign_summary.py` read them through it, and `test_records_cap.py` fails any
+committed record over 512 KiB. Uncertainty goes in the tables, not just the prose.

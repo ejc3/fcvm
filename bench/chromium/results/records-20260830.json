@@ -1,0 +1,29 @@
+{
+ "campaign": "20260830",
+ "fcvm_commit": "7c62d33299e952e44f9995077ebf20b6d8d7bdd1",
+ "files": [
+  {
+   "path": "bench/chromium/results/reqbench-20260830-171007-corpus/analysis.json",
+   "sha256": "8faa9762e0f68e66bfdea077d110c612c7dbdf942f480a08871020d7c5616414",
+   "size": 923017
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20260830-171007-corpus/corpus-access.log",
+   "sha256": "b205f24f5fa3508e818c3db46d79280d35dd92d7e32a07b5654ada278d41c201",
+   "size": 3400355
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20260830-171007-corpus/corpus-dns.log",
+   "sha256": "c54276e60c329e4b9f50840b90f698b9198ac0b7e188fbfc201c20399289c7f8",
+   "size": 582204
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20260830-171007-corpus/reqbench.jsonl",
+   "sha256": "47fe863070428f012df7ea685bb830cade8df81bbabf3e7dc47f2c4dfdf2ae11",
+   "size": 710921
+  }
+ ],
+ "records_commit": "078f1a3d0b0f5ad8f3e5cfb3d12f67bc47a1aa18",
+ "repository": "ejc3/fcvm-bench-records",
+ "schema": 1
+}

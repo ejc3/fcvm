@@ -1,0 +1,109 @@
+{
+ "campaign": "20261104",
+ "fcvm_commit": "7c62d33299e952e44f9995077ebf20b6d8d7bdd1",
+ "files": [
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c2/analysis.json",
+   "sha256": "ac2a6d2d0bf85f5ce2fd4da70da7161804124e70842e4c2010a0a1fd979cba44",
+   "size": 10653358
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c2/corpus-listen.log",
+   "sha256": "1e05cb7ed7df7c0415aa56720b39ea8ee71b75932e0311650582efc12a3291cd",
+   "size": 642084
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c2/logs/serve.log",
+   "sha256": "75c43fe80e47d5e4b81a0eed807a8ee7288562b27ad32559c531f226a14992d2",
+   "size": 1666807
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c2/reqbench.jsonl",
+   "sha256": "3ca11bf2b214041282a84cbaf52fcfc1298d34a17d20f302b24de223b8f9ece9",
+   "size": 6044465
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c2/restore-ack.jsonl",
+   "sha256": "818d055c42771a82d79f1ab52c7c571d95b27d724a03683dc0e70513305b5eef",
+   "size": 1267063
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c4a/analysis.json",
+   "sha256": "ab7773a84414e11186e114f6a0cc85c1d5629ed052bb53d175562ec4b1642161",
+   "size": 10652607
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c4a/corpus-listen.log",
+   "sha256": "2bdc9c7423956b40d3db573e2d98d8752dbc1ebde0719c24f4f567a215afcc40",
+   "size": 545299
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c4a/logs/serve.log",
+   "sha256": "7ee24738910868bcffb21f48885f36b9a82cd4ad5c84c948d9e3ed76ba61f86e",
+   "size": 1632142
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c4a/reqbench.jsonl",
+   "sha256": "1b5080ebb9d39326307a7626777a8050a26b40c4354db5939dfded66fe28e7a3",
+   "size": 6031335
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c4a/restore-ack.jsonl",
+   "sha256": "daaf81ff8d1b58b010783f7913e1c68fa016bcb624fa2bcb9f88fb36f8b832e6",
+   "size": 1266467
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c4b/analysis.json",
+   "sha256": "00ba9387915274c211f637769995cf0d2ede2324b71acbcba2aad0c833aad145",
+   "size": 10652609
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c4b/corpus-listen.log",
+   "sha256": "92c0892cad339e0f0ae95d664bb07705874cf1b6ced009aca86ade2b65f42779",
+   "size": 550474
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c4b/logs/serve.log",
+   "sha256": "c60fc9d81048e23442a46378ecf5555101f522a6a3e880cc15d70eb7696665f8",
+   "size": 1635956
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c4b/reqbench.jsonl",
+   "sha256": "acfc8489367e51413bcfda37a07d2257ffc8c6c272c5b7444c2d97dabd62f522",
+   "size": 6036916
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c4b/restore-ack.jsonl",
+   "sha256": "843277e68cd899b3e708c0b496a5af4f7328c439dee36f3429b906a57d2abc84",
+   "size": 1266370
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c8/analysis.json",
+   "sha256": "fbc7d7f33a3f3f7700583010928e720fd925bda3f41bf2f09b8f6e633fcd1b27",
+   "size": 10654476
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c8/corpus-listen.log",
+   "sha256": "81b1f4a4b24b457197b6f15a6c6afe900c258e815283563ac2003cff9bc19ca7",
+   "size": 541283
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c8/logs/serve.log",
+   "sha256": "f464191578ba117cec7606338d904437cbb4d87d369cef427bd5dfef2bfaaba8",
+   "size": 1626354
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c8/reqbench.jsonl",
+   "sha256": "598923f76de64f93e1d45246746f5dea6ba15bde97aeb6c1b44c68803194fe90",
+   "size": 6019829
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20261104-corpus-c8/restore-ack.jsonl",
+   "sha256": "653287e423615346b7d8415fda4aeefd786d679b6adb11993b03cbab441cedc4",
+   "size": 1266567
+  }
+ ],
+ "records_commit": "078f1a3d0b0f5ad8f3e5cfb3d12f67bc47a1aa18",
+ "repository": "ejc3/fcvm-bench-records",
+ "schema": 1
+}

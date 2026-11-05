@@ -1,0 +1,964 @@
+{
+ "campaign": "40657613",
+ "fcvm_commit": "7c62d33299e952e44f9995077ebf20b6d8d7bdd1",
+ "files": [
+  {
+   "path": "bench/chromium/results/corpusextra-40657613-hc/hostcdp-cpu2/hostcdp.jsonl",
+   "sha256": "3cfcec004c4e713a49e05b4b42f8806b50d4e71db4ce4626072fab7c09270b25",
+   "size": 393516
+  },
+  {
+   "path": "bench/chromium/results/corpusextra-40657613-hc/hostcdp-cpu4/hostcdp.jsonl",
+   "sha256": "8fe71fe969cf9622d4bb1f27a6f6df8479e919ff110ddf503711dbcfe44fe33d",
+   "size": 393471
+  },
+  {
+   "path": "bench/chromium/results/corpusextra-40657613-hc/hostcdp-cpu8/hostcdp.jsonl",
+   "sha256": "ac175c79c674345d57bb4004867385d9bc3913871021bc2bd35513e7e55c5835",
+   "size": 392799
+  },
+  {
+   "path": "bench/chromium/results/corpusextra-40657613-hc/hostcdp-free/hostcdp.jsonl",
+   "sha256": "7ae16f5afed07ce7f8f89ef1b6dd53e707fa37ac0e4ef93bc9ab7202b39c65e1",
+   "size": 393030
+  },
+  {
+   "path": "bench/chromium/results/corpusextra-40657613-m2/memory/samples.jsonl",
+   "sha256": "c31da3c8f239c294c0d8075874708cce18d915929c35b3ff564cab677d84ef6f",
+   "size": 482452
+  },
+  {
+   "path": "bench/chromium/results/corpusextra-40657613-m4/memory/samples.jsonl",
+   "sha256": "a072ecf09eeb92a249aedd1f6ddd1394928e1cc5ef21316ff0cd7026c4a343f6",
+   "size": 482602
+  },
+  {
+   "path": "bench/chromium/results/corpusextra-40657613-m4h/memory/samples.jsonl",
+   "sha256": "cf388c422acd08ef0a2bf898566c37cc2ea2f7bf9b8f62529ac98fbef5a9ec36",
+   "size": 482423
+  },
+  {
+   "path": "bench/chromium/results/corpusextra-40657613-m8/memory/samples.jsonl",
+   "sha256": "a9e1c0795edd6d5d46713696fdf3a197fe17f7ce2d78890ecfa76c954c5a8028",
+   "size": 482570
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm1-a1/analysis.json",
+   "sha256": "e1126d3e3cf0503cbf9e7a74d10e266f8f1cddc3153dd1aec353391679b0a775",
+   "size": 10655052
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm1-a1/corpus-listen.log",
+   "sha256": "24b8f165939d54311bce046671b74c711e7f83c38f5f935730419e2563481064",
+   "size": 552141
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm1-a1/logs/serve.log",
+   "sha256": "6b36cbafdce7263f69d32d4fa4b645cd8271dfc4816fce4f86cc13e070570c47",
+   "size": 1635928
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm1-a1/reqbench.jsonl",
+   "sha256": "1d0f62dc1b80c442dfe2b2081c1afce30c1f52ab8dd8a33f916149d34cc6ddcd",
+   "size": 6041762
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm1-a1/restore-ack.jsonl",
+   "sha256": "1fff6b0c445a97a8d74991438393c1be48e205795fe6b337a3f708c6d3f2492b",
+   "size": 1266477
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm1-a2/analysis.json",
+   "sha256": "7e78f3825fe67160ff2296aae253e34586cc129a737c9a64cdc6631461681b6f",
+   "size": 10654964
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm1-a2/corpus-listen.log",
+   "sha256": "07c9cb31e958158779e76fe83022300377cf4ea74689418cfb2ca3e8fb52e66e",
+   "size": 542688
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm1-a2/logs/serve.log",
+   "sha256": "f583d15a423d822e6da17963a335e40fa9b823214534586e8d19bbfe8cf1c72c",
+   "size": 1632417
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm1-a2/reqbench.jsonl",
+   "sha256": "fb8d2b045522284fbb65bb451c59501bd89e5bc8c21e210327f191bc4744c1f0",
+   "size": 6038484
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm1-a2/restore-ack.jsonl",
+   "sha256": "898e0f2b6bca134b22c3e1b16dec71cacf64353f1f3fc95471844ea64dc2c6ed",
+   "size": 1266414
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm1-b/analysis.json",
+   "sha256": "a43d482365d4c293172dd73db875cab98d24f5aca8613b9c86bb553ed9c399fa",
+   "size": 10654444
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm1-b/corpus-listen.log",
+   "sha256": "423264cd08083dd8812ca8a7fafb78eed13d297dddfc3b01558c37d0d535dbd3",
+   "size": 510181
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm1-b/logs/serve.log",
+   "sha256": "fb7642ab33e6b1ee29f69d7b0e1abf6bf92363e072b58b1aa09a5e5537406884",
+   "size": 1898547
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm1-b/reqbench.jsonl",
+   "sha256": "c162cf20baec6cf552f0c01a8fd946dc4f8eb1a4c87ab2ef101e36ca0aae5712",
+   "size": 6028361
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm1-b/restore-ack.jsonl",
+   "sha256": "cef1edc73acdafa27b5fb4de2ae4d8a3ede62509dd5c8e6c71ca6f71ac7c59d6",
+   "size": 1266291
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm2-a1/analysis.json",
+   "sha256": "b9d107104b7772e7a5932d5f5206a1caa7dee44f2d9c36bcb25199d53f84b6b1",
+   "size": 10655067
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm2-a1/corpus-listen.log",
+   "sha256": "c68a95cb9714905c30959323a3335bffd026efac169b7a6e12da082fbe69d4da",
+   "size": 544473
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm2-a1/logs/serve.log",
+   "sha256": "b39d07340e6ba6b277d06b53831eb0f8199bb37815a56ca970b16071804bd89a",
+   "size": 1633905
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm2-a1/reqbench.jsonl",
+   "sha256": "b1b7a008ec316c9c20e2616e0edbf1eb0416b723c84984d173ec63290cec2aae",
+   "size": 6035625
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm2-a1/restore-ack.jsonl",
+   "sha256": "2433ec15e657f5d505285de2cff3c3bdba215d26d178344aa77b8348c6707d3b",
+   "size": 1266469
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm2-a2/analysis.json",
+   "sha256": "0544c1be514642e8a288f5b4832a828ec4c96af1aa32f78186ebc6d32ec44053",
+   "size": 10655225
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm2-a2/corpus-listen.log",
+   "sha256": "c27606634ed07be24e4669854126c6054b5bc0e7dc31f04e649b75c6a50ca6a0",
+   "size": 553401
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm2-a2/logs/serve.log",
+   "sha256": "84bc562948247332195d00b50cf26e4a56efb0ab1aa3384dc32ddfa3cd410cd1",
+   "size": 1634344
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm2-a2/reqbench.jsonl",
+   "sha256": "3f9cfc2ee0751e7cbaab1603ee0214749b834bdda19de40e614fc1c6828c0233",
+   "size": 6034865
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm2-a2/restore-ack.jsonl",
+   "sha256": "7ae38a420b8bb17dd1794d85dc1f2323a6ba3996193475d494a55a5e83ec5a6b",
+   "size": 1266475
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm2-b/analysis.json",
+   "sha256": "bace62fc69d1feaa4858f525d41202e481afdaaa0286b39f5b45b12d870857ef",
+   "size": 10656083
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm2-b/corpus-listen.log",
+   "sha256": "16b9c4c15966da235b884bdf7de7fe4d8e0bf162bb662d9d9355c2735b023794",
+   "size": 520498
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm2-b/logs/serve.log",
+   "sha256": "b6f59fa9263c8f7d40c9931cce2569338aad8d0d822fd9ee0befbcc44ef99e99",
+   "size": 1898420
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm2-b/reqbench.jsonl",
+   "sha256": "6afc7fddedad6ef98ae3cf385af85ac2edc4e39a2aac81e6968cc1240a8e5d3f",
+   "size": 6023274
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-cm2-b/restore-ack.jsonl",
+   "sha256": "ac65b69ba67b698d07ca9f4f18545496e99f6ad3886cb36c1624c60b28326975",
+   "size": 1266180
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf1-a1/analysis.json",
+   "sha256": "85f9a2f828663e46cfb297507a08f18e3665041dfd8e5c057540ef9535ef0da3",
+   "size": 10655122
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf1-a1/corpus-listen.log",
+   "sha256": "0b528328368698aa05dc7b07f8570d3a401fd015b26d94c57e36bbb5f0c90075",
+   "size": 564330
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf1-a1/logs/serve.log",
+   "sha256": "bfe56df4a04435705927f21360f21d24ae1929b533878c2720ea35e807c91f54",
+   "size": 1636512
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf1-a1/reqbench.jsonl",
+   "sha256": "8c0cbe653b4a25535d47be15a5fe68095eea0b22e211d6a744839795bbb04e66",
+   "size": 6033464
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf1-a1/restore-ack.jsonl",
+   "sha256": "df2f16bf7b3a0fd5839d43c970318dec17f310fa5f251dae5ab3e6a308f80229",
+   "size": 1266410
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf1-a2/analysis.json",
+   "sha256": "b152f5b65f51767434f7da437a9513f50da9a9021a7239a2abd731ae395612ac",
+   "size": 10655195
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf1-a2/corpus-listen.log",
+   "sha256": "c289b77bfc860e43b255ad5186c65df7913e7e0ba2a8028a09210451d242bbe8",
+   "size": 559348
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf1-a2/logs/serve.log",
+   "sha256": "f3317c6e8faf079878dedb451825c0f5c9beac84ceeb027640b2c00c2498cdc9",
+   "size": 1636901
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf1-a2/reqbench.jsonl",
+   "sha256": "6919a93c819579207a1f216e4e68116218d8eb467af6f372cec1944e9f61cc21",
+   "size": 6038111
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf1-a2/restore-ack.jsonl",
+   "sha256": "008afb390fee06935f26c1f34725fb056b34cdd29ab02f20651e9d76e982fee2",
+   "size": 1266334
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf1-b/analysis.json",
+   "sha256": "06a39eda79b15388857b8862060eec6d55a1b46117644badddcb5f606afed0d2",
+   "size": 10654272
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf1-b/corpus-listen.log",
+   "sha256": "5a555c67f018a7e7a35fc5b41b6884a5c0980dfd77a2c6750b1e44e744b96cfe",
+   "size": 637753
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf1-b/logs/serve.log",
+   "sha256": "ff2501d0608cf445b1ec255524821daf08616ed81d971e83c59b5f1d6ab96cdc",
+   "size": 955800
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf1-b/reqbench.jsonl",
+   "sha256": "d34a4b80fa578aac8aed13d6acae1ecf07eeda35eefd29375ee9f79bcff406a1",
+   "size": 6074437
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf1-b/restore-ack.jsonl",
+   "sha256": "4143618ea36ca8480ed201b770698299e9f0d070fab213fac47c54bc57ae3c75",
+   "size": 1266789
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf2-a1/analysis.json",
+   "sha256": "08e0c3617c93763c8fe17cc1b142a052b244f591230eb7857da1b90db8b90db6",
+   "size": 10655329
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf2-a1/corpus-listen.log",
+   "sha256": "ac41a94e792a91c8dff61d3ccd794dac6b36e3126b4c3d61845301b9506c83d0",
+   "size": 561409
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf2-a1/logs/serve.log",
+   "sha256": "f9b8a88f3bfbf1c086566d857b17ea3b16c6ce85871662b8859ea89d084ba0c6",
+   "size": 1630181
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf2-a1/reqbench.jsonl",
+   "sha256": "10a11da5787a4794ebd01602cbf8377db8c45afdc01a50db3f68a5a54ade4e58",
+   "size": 6039807
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf2-a1/restore-ack.jsonl",
+   "sha256": "d72941afdfef404ddc402b46817b646d0713fee87447c8649e95a62e196d5476",
+   "size": 1266557
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf2-a2/analysis.json",
+   "sha256": "cf6553b745229ee198b25d5fd3b2ee81a3d9cde56f69b70a577776ff23550758",
+   "size": 10656491
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf2-a2/corpus-listen.log",
+   "sha256": "580d95bba3739621f60b983e70273cfdc1e6aec9adf80ff79c80b8956f7f07de",
+   "size": 557633
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf2-a2/logs/serve.log",
+   "sha256": "f059885a65a530690c0d8b8395b47622b178e06eee43309e8a32f7fd85da3716",
+   "size": 1631204
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf2-a2/reqbench.jsonl",
+   "sha256": "2870d6ff2ab59337c2c6178c3ecf69a037bcbf15c0988b77a4839b642922d8a6",
+   "size": 6036695
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf2-a2/restore-ack.jsonl",
+   "sha256": "63f802eb629afe2d3c2309b2b3dca294be14dd0e3a2311ac90dc0afe8486729b",
+   "size": 1266499
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf2-b/analysis.json",
+   "sha256": "fd0e6bc8c96ffc702727828771997c87d600c1fe864317a881587b285257e97e",
+   "size": 10654347
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf2-b/corpus-listen.log",
+   "sha256": "1983fdf49e5d2eb49a703d4f2e29e64c60df9629686882d9151199bbebfdba81",
+   "size": 711418
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf2-b/logs/serve.log",
+   "sha256": "4364a5192fc86882153fcc320b604238dd7f627299210d60527fad375a8759f2",
+   "size": 955150
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf2-b/reqbench.jsonl",
+   "sha256": "d71893e4d57bbc13cd29de5869a691403047bad3dba37aa448b58497e86a80ff",
+   "size": 6107800
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-pf2-b/restore-ack.jsonl",
+   "sha256": "a87a8cdd3baab413cfded884954232f4003037b1500731029309ec1efa8af792",
+   "size": 1267866
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-b4/analysis.json",
+   "sha256": "d014d0c44c3b6a4353e75a61a83823462d17c43d575fc701da4fc46cbcd6d4f0",
+   "size": 10788650
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-b4/corpus-listen.log",
+   "sha256": "bdd93811f3224e5290626474bcd64d5ee8cacbabce3c6ea3cc873ce5cc934327",
+   "size": 797750
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-b4/logs/serve.log",
+   "sha256": "76e3ee441cc25994de348e762d5b7afccbd5629586acfe247bb8fca860efe1c6",
+   "size": 1850233
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-b4/reqbench.jsonl",
+   "sha256": "63c29106ea6bdfbb31772d557a25079cdfaf4c24b0dec365c587549f05e80098",
+   "size": 4186111
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-b4/restore-ack.jsonl",
+   "sha256": "5bb3dce782977407e729abb087e36af850c54f68f96595be825ff4fe9e646aac",
+   "size": 1409694
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-c2/analysis.json",
+   "sha256": "658590ea28f3b573fcabdcea0bf99dc120be0ce9b547dda214c60f526c702996",
+   "size": 10655712
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-c2/corpus-listen.log",
+   "sha256": "29cf5445e0e55e1efb3ad540afea652ef591911d26827028c4299a8d4a3bb372",
+   "size": 683181
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-c2/logs/serve.log",
+   "sha256": "b5d3bb41396fecb185bd53bb6ca29f998ff9248de05fd2b5b6cda300e9910b2f",
+   "size": 1667755
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-c2/reqbench.jsonl",
+   "sha256": "fdace436d28256c0599b2d798ceed8cb2a95d94f2e80fe33a700b67a15c7d7c5",
+   "size": 6096277
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-c2/restore-ack.jsonl",
+   "sha256": "d336c49ae9c691420917684efe25e4d4b86665b85ba83889bafdb5b825d2d005",
+   "size": 1267752
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-c4/analysis.json",
+   "sha256": "d326cdfcc09404d9e70b74cac9126d0680c63209df0c9c4cfb79795961b5af65",
+   "size": 10654312
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-c4/corpus-listen.log",
+   "sha256": "078082dc2977078dd29e92760bad03d2403630dd231a42a505a595660b4b7058",
+   "size": 563223
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-c4/logs/serve.log",
+   "sha256": "f47fb7581c3b78b2b6087ea9af5e2e66eb28230f3480e8e0353aead7013d1a1b",
+   "size": 1632965
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-c4/reqbench.jsonl",
+   "sha256": "16193d32fca297e62ec4fd9762299305f1f8db4a07cb3c679fc45b434aa38409",
+   "size": 6038016
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-c4/restore-ack.jsonl",
+   "sha256": "7b4f02d6046f728e2e58377381b0c78934bb7396c26989d163124a280b40707f",
+   "size": 1266631
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-c8/analysis.json",
+   "sha256": "944376e5f139528965da2cb643607ed4beb3b662a90f04a5a3f4114fbf4f8303",
+   "size": 10654213
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-c8/corpus-listen.log",
+   "sha256": "370aeee8b2d168bc0159777d2dfaf13a086729089287aae22e9c92473f90c3db",
+   "size": 530200
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-c8/logs/serve.log",
+   "sha256": "2a98935f1627b6263d3a2a22c545c574c1d6c552b30ebef3598d4af062101e88",
+   "size": 1628196
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-c8/reqbench.jsonl",
+   "sha256": "ff5ae2fb4bba95e40a24f04d27bb725ffdd6596569f36d86825bb9af81f48b2a",
+   "size": 6024873
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-c8/restore-ack.jsonl",
+   "sha256": "34ad05db0ee1233f047a9328a421f7390c5b9213149ca447b4d93a3563810de3",
+   "size": 1266592
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-h4/analysis.json",
+   "sha256": "22fc1c2f255179edd684a45a50955b9c0d0ce70922c987c1964091942b3fd7b2",
+   "size": 10653892
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-h4/corpus-listen.log",
+   "sha256": "4065861047da6beec2f29742bb03668863209ed36c9749933029d8db6e947d09",
+   "size": 434298
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-h4/logs/serve.log",
+   "sha256": "1ccaa788396f0162d0382b70a4d108a6cebe6843be6da05ef00aabecc80b1cac",
+   "size": 1648880
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-h4/reqbench.jsonl",
+   "sha256": "9e454527ec14d2cc432da03227fdd84862d23249431891e16577403845421ce3",
+   "size": 5973027
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-h4/restore-ack.jsonl",
+   "sha256": "66677b5d701938448600fe7fe62abb181605f89a415216effebbe4da338c34f2",
+   "size": 1263224
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-r4/analysis.json",
+   "sha256": "616282083a83eee374b860bf66724cc5d5ac5fa441cc8372b35d65a5066dbea4",
+   "size": 10935884
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-r4/corpus-listen.log",
+   "sha256": "513fcf91953a69c1b686a98b5edf6d734968fd36205c5dc3e8c0530e6a5dd803",
+   "size": 787364
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-r4/logs/serve.log",
+   "sha256": "0c13a4d2e7b8513b1a35bac6f051db911d85dc7218acf67b321a56465c63823c",
+   "size": 1848511
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-r4/reqbench.jsonl",
+   "sha256": "b51b7e0bc36efa16e43e2806e0da28889c06cda047f4624075707353346c515f",
+   "size": 4328252
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-r4/restore-ack.jsonl",
+   "sha256": "2099f69dcb791e11840876bd9346357083911ad8bc650ae9f566c6b71bc4c882",
+   "size": 1413725
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-w4/analysis.json",
+   "sha256": "c753852a8e8bd9c424cfbabbf843076484d2473e92b983d50612b810f96fcec0",
+   "size": 2711291
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-w4/corpus-listen.log",
+   "sha256": "462ca25beebe229665cb7bbfb4660dd3e6b493743b51a636de0dc50aa924aa76",
+   "size": 330184
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-w4/logs/serve.log",
+   "sha256": "b1433750ce72a3ad2429405244ab7e41429fb8ea46d004ef4c3d9db7b99195d4",
+   "size": 647681
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-w4/reqbench.jsonl",
+   "sha256": "484c39e831d2ea91659e480e1fbba2806e8835ad53ec9a00632759c131535cf6",
+   "size": 1201596
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r1-w4/restore-ack.jsonl",
+   "sha256": "7ca891f6afb08b20721a09b7a85eb8a0f12d72bcc302a67fc16e0a6fa5d3f9c5",
+   "size": 503162
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-b4/analysis.json",
+   "sha256": "707724fc0b8b9da78c4457af0faa67c72180b205947418fa2a9ad33934b64e9e",
+   "size": 10788797
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-b4/corpus-listen.log",
+   "sha256": "35570d68adb647ddbaa04442f96d2ef3766214dd439085afb460a826824c8140",
+   "size": 780329
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-b4/logs/serve.log",
+   "sha256": "d037a74a05a909af6821477189ccb8489dbde027380dbb431778f024405b1c1a",
+   "size": 1851447
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-b4/reqbench.jsonl",
+   "sha256": "34d4eed736ae26d075c38233b506a3917d2ebc0deb87b19241d33a0f5a1aff5b",
+   "size": 4186086
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-b4/restore-ack.jsonl",
+   "sha256": "c5fea22904ba3bd9f4612cf3c055999cc377cf8a497679903884866b472032af",
+   "size": 1409565
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-c2/analysis.json",
+   "sha256": "9ff26bb2e56cb100548fcd4a0e07ff83f3be9583b8b439b3bc1c9774c4e6bc25",
+   "size": 10656991
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-c2/corpus-listen.log",
+   "sha256": "050d5d15d9185842424596350dfc33635f7eb7efcf8721e79db3ae3c4fff77cf",
+   "size": 655011
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-c2/logs/serve.log",
+   "sha256": "14d5a8a75945fb5c14be81ff2f5ec9dcac2f1ab0508322b56f043bd9d058cb5c",
+   "size": 1668183
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-c2/reqbench.jsonl",
+   "sha256": "5faa329216a9f3e06c8a705769eebaae68ed5cbb07a6702c40a2c7d482b2b904",
+   "size": 6073881
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-c2/restore-ack.jsonl",
+   "sha256": "57d4b4a6885c27382152aa85fdd4caccb40d44df4c6d53c743c332de90aae1f1",
+   "size": 1266952
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-c4/analysis.json",
+   "sha256": "9c5e45292d0bbc706a873ce9f7b70f86fb40234e15842b9e33660aa0d29a11d2",
+   "size": 10654227
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-c4/corpus-listen.log",
+   "sha256": "e7250c5e5fda3cc1bf6cb170ba97c60fbf5fb0f1d263f2fc6291fae62e1b781c",
+   "size": 549543
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-c4/logs/serve.log",
+   "sha256": "062957125ddb60d2e9cdd002b134de83ee136c0ae0132877f283cdf58a0ffe94",
+   "size": 1628837
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-c4/reqbench.jsonl",
+   "sha256": "9cd913143639c75585fce1a2a556e77e372a666910eacd3490248fd7b55b561a",
+   "size": 6027993
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-c4/restore-ack.jsonl",
+   "sha256": "ec947b7f9f5c44383aff31b50aff7a99bddced19e206bda13bb332221da354a9",
+   "size": 1266523
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-c8/analysis.json",
+   "sha256": "f5d6a6141c5dc49d688860f63314ec4b19425b0eeb815739269a20885deefbe8",
+   "size": 10654203
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-c8/corpus-listen.log",
+   "sha256": "4e5a0d63865814948fdcd48346e61a6e2af7af77fa14a707a69658f1ceabbe42",
+   "size": 529660
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-c8/logs/serve.log",
+   "sha256": "80dd4a16340b4852da9fde875744f2f545596e6f10491509508ab1a2eb2f9476",
+   "size": 1631999
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-c8/reqbench.jsonl",
+   "sha256": "66b38aee95ae7b5aa2efbb3747017861c2f0bb66b5df37789755ddbce5f40065",
+   "size": 6035131
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-c8/restore-ack.jsonl",
+   "sha256": "e66abd0e121237324cd84d2c95c570f28b336e0a122d6fe439062db3d15f9628",
+   "size": 1266359
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-h4/analysis.json",
+   "sha256": "45e3cb9a43e71c9f9a79222c3627cdd5f969c1986f16b032e18199c81cabd217",
+   "size": 10655609
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-h4/corpus-listen.log",
+   "sha256": "410b7cea1d8204a98e5c2165c15be69b2ccccf1bbdfce1e56ebb6cc3da155df2",
+   "size": 443393
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-h4/logs/serve.log",
+   "sha256": "3530949d496d795f65a3efbb36ccc16043abde26fd728c617d78d7db17bb0eac",
+   "size": 1652010
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-h4/reqbench.jsonl",
+   "sha256": "2f0a4f772f5fbbfffe8e8f8f142371ba8df0ecf2b8d99cb0994f1ef808f732e1",
+   "size": 5981860
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-h4/restore-ack.jsonl",
+   "sha256": "bf2b7ce9c3295cc4e46d1d04686f3be2e8475629e88d761217a2657f09a4c3f5",
+   "size": 1263134
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-r4/analysis.json",
+   "sha256": "c7bc22f275dc238b5c443a5067e339e723c31b96d0e27eb75cad81e2c83004ed",
+   "size": 10935821
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-r4/corpus-listen.log",
+   "sha256": "b67c0c5cb39e3ff1eb213eb6c6907344204b40c9378161f841c053c381a2d862",
+   "size": 765755
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-r4/logs/serve.log",
+   "sha256": "7695cb836b91be846548c7459b43959a682026fd8b655f44f2e94cf7fbadbe92",
+   "size": 1848529
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-r4/reqbench.jsonl",
+   "sha256": "b52d90f4556f7a9c153f9337c4ad482a0ebaa88bcd90b08e02f7e2a707e7b6a3",
+   "size": 4302776
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-r4/restore-ack.jsonl",
+   "sha256": "c7ef1d7802118471a14b189584f3434549c1f0aac33eb0f5db38e6765f348be0",
+   "size": 1413017
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-w4/analysis.json",
+   "sha256": "ac7663cb57f2af03a3771c398c806979d036e51cfdc4501823749ba9c0ddaae2",
+   "size": 2711395
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-w4/corpus-listen.log",
+   "sha256": "82abc967b82836f3e33731c351b097a1ac752e21847495f249a8097b3f84452d",
+   "size": 333068
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-w4/logs/serve.log",
+   "sha256": "6d95c228de8d540f89dc78447835b925f869488683b4a3a4654c0e47ed773987",
+   "size": 647501
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-w4/reqbench.jsonl",
+   "sha256": "cb34244129e22c6ec53dbe754ca04b1e3da1ccaacb66fa11253f2af1a66b0061",
+   "size": 1201549
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r2-w4/restore-ack.jsonl",
+   "sha256": "2d8e51d68f65a0d803e5cd5564eebdd4800e993ba9e6e39b1ed9cb4e5432660f",
+   "size": 503141
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-b4/analysis.json",
+   "sha256": "89744edba97eac30c9e0b069b3df06799db27a1d1a709416e972b9307c732afe",
+   "size": 10788874
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-b4/corpus-listen.log",
+   "sha256": "72de9e4cf4659701206de9ad4bafa13134f57dcf2adb6a2b46a35d9114b9bba1",
+   "size": 789759
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-b4/logs/serve.log",
+   "sha256": "ec5ca4d86d5e9f8a9990e812d7203023b0b479f6904f823be7c27e4f974fda35",
+   "size": 1851566
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-b4/reqbench.jsonl",
+   "sha256": "17975f88118f6842e40234f14d939d1456725e3dd779084a268071d5b35d4dca",
+   "size": 4185961
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-b4/restore-ack.jsonl",
+   "sha256": "ed3d4889f741f505ef65bf8db9c4119b66fe83c53cf7e749da79a0602675e6a4",
+   "size": 1409475
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-c2/analysis.json",
+   "sha256": "08aaf012f066579dc7e426fa4f97bb119ce92ef85bd35da3ab6f062ad45b950c",
+   "size": 10654226
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-c2/corpus-listen.log",
+   "sha256": "1680f145bfa2ac631be8b8412027724786327acb3351118ac4a2781d75801ea6",
+   "size": 638495
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-c2/logs/serve.log",
+   "sha256": "bd9ed47599aa5b56571d916bfb096f2f5db6d958219c56a1da26be141f4e8665",
+   "size": 1669594
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-c2/reqbench.jsonl",
+   "sha256": "51bdd14a00b6f17ddbb1ef62215f86735e0e2c7f59c0ea1de3ca3be273b14a5c",
+   "size": 6073322
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-c2/restore-ack.jsonl",
+   "sha256": "26925118db8a644fd6a93feb9c7322ec584ef3ab5d81568d615fb58b455a55ac",
+   "size": 1266717
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-c4/analysis.json",
+   "sha256": "7550d03323795967ca6652e0e16744e7a05883a671c2858ec69d3280954b21b8",
+   "size": 10654504
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-c4/corpus-listen.log",
+   "sha256": "bd1d48428f419937e5c06218bc9331973f43e02fc8e0fc33e11436bfc5e31275",
+   "size": 544358
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-c4/logs/serve.log",
+   "sha256": "7694b9b1c0e886cce912bd1624efbcb35eab4c67aec679ddc76a16b6d6cf27c1",
+   "size": 1639306
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-c4/reqbench.jsonl",
+   "sha256": "18da656e3750f75d8888be90867dfbd9835464d7963dd01009c98defaeb10c1d",
+   "size": 6034943
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-c4/restore-ack.jsonl",
+   "sha256": "cd575931903c96cfeb5aeb17af9f187e2dae9180b16402c117e1081d5865afa9",
+   "size": 1266527
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-c8/analysis.json",
+   "sha256": "bf89ad6ea1dfeb63d7cb77951b73d922ac9b635a04623a13d8e1c0bd90085c45",
+   "size": 10654532
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-c8/corpus-listen.log",
+   "sha256": "25a5e19508de3c69f68a810061440005583acab58ee775528d0b10902835e78a",
+   "size": 525575
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-c8/logs/serve.log",
+   "sha256": "8653689afcf5f07a44a87a5994d4aeb98b5a42eb47c60a63551d6cf1fb575547",
+   "size": 1627326
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-c8/reqbench.jsonl",
+   "sha256": "c3f6c957fb311803de0f34d4ccec9c3a1b8759b03a87e1e12fefb69f7afb9993",
+   "size": 6021567
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-c8/restore-ack.jsonl",
+   "sha256": "b1d0936be5efd5ae0da3fec2e698a522f2dc6b29b8b202553c591b9bd2590447",
+   "size": 1266327
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-h4/analysis.json",
+   "sha256": "d2a394cc0959b0f7c1913154f02ef9b28bfdb51613215ff57fcc059083460a22",
+   "size": 10654138
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-h4/corpus-listen.log",
+   "sha256": "10724dc16b3decf0163d39f73b108bef0ccacd5bd78992460fd0b0c0609eb045",
+   "size": 444553
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-h4/logs/serve.log",
+   "sha256": "8505fffab784b53452dd893088a15dd394b0225f118062ada25f2bf30aac850e",
+   "size": 1652015
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-h4/reqbench.jsonl",
+   "sha256": "2da1370e915a3aaf62e4973e390399b45b830e59783832cc685ffec33b42b2d3",
+   "size": 5989391
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-h4/restore-ack.jsonl",
+   "sha256": "60a5c5f72d153208e99fbd80fe8accdbb442981de0fe2e7447fb9b20228b77bc",
+   "size": 1263560
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-r4/analysis.json",
+   "sha256": "37727e57c89e74e7281f4d1b30d97fda1ff851e95c076cc06f6606233506e2e2",
+   "size": 10935642
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-r4/corpus-listen.log",
+   "sha256": "992fa633ebdcf1afe8af0dc28609b08f891c471773ccb39d0eeae665cedf143d",
+   "size": 789340
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-r4/logs/serve.log",
+   "sha256": "185f262ec802c26cf276b171e928e4573e26c98b0011616a21adfce2a6da43c3",
+   "size": 1849362
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-r4/reqbench.jsonl",
+   "sha256": "02950d9ae79ada04901bef51d1b6f1f6de50d1076f3891f68a8e99fda56d17e6",
+   "size": 4351461
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-r4/restore-ack.jsonl",
+   "sha256": "f02ef056a4a2e3d2719da0ea2dbccd344d9d9512fc2a02bff197c32452259406",
+   "size": 1413904
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-w4/analysis.json",
+   "sha256": "f23b61459a0c8a701b2feb508cfac41decde63fca4614f6cecac9a0ed5d9b412",
+   "size": 2711480
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-w4/corpus-listen.log",
+   "sha256": "c697f6670d3ffb17bb6a6d1064132fc7d0fc7aefb1a545f96271f4974324beac",
+   "size": 327648
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-w4/logs/serve.log",
+   "sha256": "7dc7c1284625dcd72c0dbe0a60780429bdd173c90182a159d208be86d23744e0",
+   "size": 646129
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-w4/reqbench.jsonl",
+   "sha256": "625cbbe4186c89f9b088ce872608e1be435ec19b8bdeea57ad0fe88e94b2063a",
+   "size": 1201006
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-r3-w4/restore-ack.jsonl",
+   "sha256": "33e63ae8f46d54ba33e4d8fe09a23713daa4e935af22bcdc3b57bb2ac575daaf",
+   "size": 503098
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-s2/scale-20261105-020322-1485768/bursts.jsonl",
+   "sha256": "875dec5da82843757b621bcf910ba136e0b11ff998442e578972b1f7177357e6",
+   "size": 499827
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-s2/scale-20261105-020322-1485768/host-control.jsonl",
+   "sha256": "f4e5186da73331b45a6157fad1faf9bd4002e45f4849d8a5dd5ffe936760e731",
+   "size": 221948
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-s2/scale-20261105-020322-1485768/host-samples.jsonl",
+   "sha256": "2a7d93a0568e70c97eb5942d0497e94b53d1dc7061d6e32227f5f343974195e8",
+   "size": 5407728
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-s2/scale-20261105-020322-1485768/requests.jsonl",
+   "sha256": "58016a21515c4830360b2ae26525e89c7bc0f50b73051fa035e539a12fad6a7d",
+   "size": 59633835
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-s2/scale-20261105-020322-1485768/schedule.json",
+   "sha256": "aea3f63d3a7f809396115294bd5532a8d021ecc14c870df7ae6c0d2146a01054",
+   "size": 1704715
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-s2/scale-20261105-020322-1485768/status.json",
+   "sha256": "06a28f25abc0d8543296f3886dd1eba430f9b8df82399c2954cd5791b6d70062",
+   "size": 10098336
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-s4/scale-20261105-014719-1111939/bursts.jsonl",
+   "sha256": "bbfe09c450e51d28d63c88a314c439b8bce5fe84b7c7040971cc5fa01b322c08",
+   "size": 505761
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-s4/scale-20261105-014719-1111939/host-control.jsonl",
+   "sha256": "d0ceebcef9d6ccc42e382bd68d6e0f58f4f864e7df581d42940b3b041c9bbb01",
+   "size": 218819
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-s4/scale-20261105-014719-1111939/host-samples.jsonl",
+   "sha256": "c05026b93561083b9fd01a08b864880435eef0b8005693e0a5dbdafe64eaf159",
+   "size": 5343548
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-s4/scale-20261105-014719-1111939/requests.jsonl",
+   "sha256": "3386b661e7f3f5fb0225498576557078b5bff862eb95eddeeca35e9b85600096",
+   "size": 59143565
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-s4/scale-20261105-014719-1111939/schedule.json",
+   "sha256": "e2cd707b28186b5eba6fd6c41eae1f99716fc8a49e1314fc81680ebd2486ac74",
+   "size": 1704715
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-s4/scale-20261105-014719-1111939/status.json",
+   "sha256": "aacdb307e6789d4e576159532e245c823c515502c19a08a1cd3ae5ce9c24e525",
+   "size": 9862985
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-s8/scale-20261104-231749-1209982/bursts.jsonl",
+   "sha256": "5f450e9554ae7932e3c6109e07ea14838bd380ade419caada3e4cf1ee84c9998",
+   "size": 503064
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-s8/scale-20261104-231749-1209982/host-control.jsonl",
+   "sha256": "7e4b54f274408fdd323376038f781196d284d295e3e79e3d5fef2c0d5f3e3840",
+   "size": 216682
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-s8/scale-20261104-231749-1209982/host-samples.jsonl",
+   "sha256": "091307086ac3fd4d2fa9bb99ac41e65d65efc7e7beeff8d1c4a96e0e35f152c6",
+   "size": 5279617
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-s8/scale-20261104-231749-1209982/requests.jsonl",
+   "sha256": "5db29d71141dc921028c46c9b0eb09dc8d733dcf79b720436d23ff0aa5ad88cf",
+   "size": 59506951
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-s8/scale-20261104-231749-1209982/schedule.json",
+   "sha256": "c97109e05f13b9e9eeca2fddbb321ca04f60b667d42cdc569ec2b09f598ce85a",
+   "size": 1704715
+  },
+  {
+   "path": "bench/chromium/results/reqbench-40657613-s8/scale-20261104-231749-1209982/status.json",
+   "sha256": "a1510e2568091929760cccf444af6603ef01e45c7c40cec762084db53f282f7c",
+   "size": 10097610
+  }
+ ],
+ "records_commit": "078f1a3d0b0f5ad8f3e5cfb3d12f67bc47a1aa18",
+ "repository": "ejc3/fcvm-bench-records",
+ "schema": 1
+}

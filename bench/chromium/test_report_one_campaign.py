@@ -31,11 +31,15 @@ Run against another page: REPORT_PAGE=path python3 -m unittest test_report_one_c
 import json
 import os
 import re
+import sys
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS = os.path.join(HERE, "results")
 REPORT = os.environ.get("REPORT_PAGE") or os.path.join(HERE, "report", "shared-nothing-renders.html")
+sys.path.insert(0, HERE)
+
+import records  # noqa: E402
 
 # Matched against the page with its <wbr> line-break hints removed: a long
 # record name carries them between its parts.
@@ -102,9 +106,8 @@ def record_identity(name):
     a scale run's provenance.json."""
     base = os.path.join(RESULTS, name)
     meta_path = os.path.join(base, "reqbench.jsonl")
-    if os.path.isfile(meta_path):
-        with open(meta_path) as handle:
-            meta = json.loads(handle.readline())
+    if records.exists(meta_path):
+        meta = json.loads(records.first_line(meta_path))
         firecracker = meta.get("firecracker") or {}
         return "serial", {
             "source_revision": meta.get("source_revision"),
