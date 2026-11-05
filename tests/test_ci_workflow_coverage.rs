@@ -2829,3 +2829,57 @@ fn store_warm_up_wait_reports_how_the_reader_ended() {
         "a reader that ended without reporting must raise a warning: {out}"
     );
 }
+
+/// A download that a later step extracts or executes must fail on an HTTP error. Without
+/// `--fail`, curl writes the server's error body to the output file and exits 0, so the
+/// failure surfaces one step later as something else: on 2026-11-05 a Host-arm64 run's
+/// Firecracker release download got a 92-byte error body from GitHub and the job died in
+/// `tar` with "gzip: stdin: not in gzip format". A curl that writes to /dev/null is reading
+/// a status code on purpose and is exempt.
+#[test]
+fn workflow_downloads_fail_on_http_errors() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let mut downloads = 0usize;
+    let mut missing = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("workflows dir must be readable") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yml") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("workflow must be readable");
+        for (i, line) in text.lines().enumerate() {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let Some(at) = words.iter().position(|w| *w == "curl") else {
+                continue;
+            };
+            let args = &words[at + 1..];
+            // -o FILE, or a short-option cluster ending in o (-sSLo FILE).
+            let output = args.iter().enumerate().find_map(|(k, a)| {
+                let is_output = *a == "-o"
+                    || *a == "--output"
+                    || (a.starts_with('-') && !a.starts_with("--") && a.ends_with('o'));
+                is_output.then(|| args.get(k + 1).copied().unwrap_or(""))
+            });
+            let Some(output) = output else { continue };
+            if output == "/dev/null" {
+                continue;
+            }
+            downloads += 1;
+            let fails = args.iter().any(|a| {
+                *a == "--fail" || (a.starts_with('-') && !a.starts_with("--") && a.contains('f'))
+            });
+            if !fails {
+                missing.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        downloads >= 6,
+        "found only {downloads} curl downloads; the scan is not reading the workflows"
+    );
+    assert!(
+        missing.is_empty(),
+        "curl downloads without --fail:\n{}",
+        missing.join("\n")
+    );
+}
