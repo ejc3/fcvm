@@ -343,20 +343,27 @@ action)
   # the other one was in front.
   mirror_open() { http_get "$STREAMER_PORT" /health 2> /dev/null | jq -e '.mirror.open == true' > /dev/null 2>&1; }
   status() { CTL_TIMEOUT=${1:-5} "$0" ctl '{"type":"status"}' 2> /dev/null; }
-  # Robot Park restarts in a new process, which has forgotten the place it was told: the place
-  # the agent last sent ($RUN/place) goes to the new process once it answers, which it shows
-  # by an uptime no longer than the old one's (10 s at most, then it is sent anyway).
+  # Robot Park restarts in a new process, which has forgotten the place it was told and starts
+  # on a default scene until the phone streamer sends it the posted one. Nothing more reaches
+  # it until it answers as a new process (an uptime no longer than the old one's) holding a
+  # scene (`scene_epoch_unix_ms` other than 0): a dance or wave sent before the scene is filed
+  # under the default scene's clock and cleared when the scene comes (#1518). 10 s at most,
+  # then the action goes on. Then the place the agent last sent ($RUN/place) goes to it.
   restart_app() {
-    local u0 u
+    local u0 st u e new=0
     u0=$(status | jq -r '.uptime_ms // empty' 2> /dev/null || true)
     app_action restart
     rm -f "$RUN/screen" "$RUN/night"
-    [ -s "$RUN/place" ] || return 0
     for _ in $(seq 1 50); do
       sleep 0.2
-      u=$(status 2 | jq -r '.uptime_ms // empty' 2> /dev/null || true)
-      [[ "$u" =~ ^[0-9]+$ && "$u0" =~ ^[0-9]+$ && "$u" -le "$u0" ]] && break
+      st=$(status 2 || true)
+      u=$(jq -r '.uptime_ms // empty' <<< "$st" 2> /dev/null || true)
+      e=$(jq -r '.scene_epoch_unix_ms // 0' <<< "$st" 2> /dev/null || true)
+      # the new process, once seen, stays seen: its scene can come after its uptime passes u0
+      [[ "$u" =~ ^[0-9]+$ && "$u0" =~ ^[0-9]+$ && "$u" -le "$u0" ]] && new=1
+      [[ $new = 1 && "$e" =~ ^[0-9]+$ && "$e" != 0 ]] && break
     done
+    [ -s "$RUN/place" ] || return 0
     "$0" ctl "$(cat "$RUN/place")" > /dev/null 2>&1 || echo "phone.sh: the restarted app was not told its place" >&2
   }
   # Which screen Robot Park shows: a tap on its tabs changes it as switch_screen does, so the
