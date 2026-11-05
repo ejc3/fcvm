@@ -11,13 +11,13 @@ use anyhow::{Context, Result};
 use std::io::Write;
 use std::net::TcpListener;
 
-/// Start a TCP server on host 127.0.0.1 that accepts one connection and replies
-/// with a greeting. Returns the bound port and the accept thread handle.
-fn spawn_host_server() -> Result<(u16, std::thread::JoinHandle<bool>)> {
-    // Start a TCP server on host 127.0.0.1 (only reachable via loopback)
-    let listener = TcpListener::bind("127.0.0.1:0")?;
+/// Start a TCP server on host loopback address `host` that accepts one connection and
+/// replies with a greeting. Returns the bound port and the accept thread handle.
+fn spawn_host_server(host: std::net::IpAddr) -> Result<(u16, std::thread::JoinHandle<bool>)> {
+    // Only reachable via loopback.
+    let listener = TcpListener::bind((host, 0))?;
     let port = listener.local_addr()?.port();
-    println!("  Host server on 127.0.0.1:{}", port);
+    println!("  Host server on {}", listener.local_addr()?);
 
     // Accept one connection in background (with timeout)
     let accept_handle = std::thread::spawn(move || -> bool {
@@ -55,7 +55,15 @@ fn spawn_host_server() -> Result<(u16, std::thread::JoinHandle<bool>)> {
 /// Run a VM with --forward-localhost that connects to localhost:port from the
 /// container, and assert the host server's greeting reaches the container.
 async fn run_forward_localhost_case(extra_args: &[&str], name_prefix: &str) -> Result<()> {
-    let (port, accept_handle) = spawn_host_server()?;
+    run_forward_localhost_case_to(std::net::Ipv4Addr::LOCALHOST.into(), extra_args, name_prefix).await
+}
+
+async fn run_forward_localhost_case_to(
+    host: std::net::IpAddr,
+    extra_args: &[&str],
+    name_prefix: &str,
+) -> Result<()> {
+    let (port, accept_handle) = spawn_host_server(host)?;
 
     let port_str = port.to_string();
     let (vm_name, _, _, _) = common::unique_names(name_prefix);
@@ -93,7 +101,7 @@ async fn run_forward_localhost_case(extra_args: &[&str], name_prefix: &str) -> R
         // forwarding regression). Unblock the accept thread with a local
         // connection so the test reports promptly instead of waiting out the
         // accept timeout.
-        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        let _ = std::net::TcpStream::connect((host, port));
         let _ = accept_handle.join();
         false
     };
@@ -119,6 +127,20 @@ async fn test_forward_localhost() -> Result<()> {
 
     println!("✅ FORWARD LOCALHOST TEST PASSED!");
     Ok(())
+}
+
+/// A host service listening on ::1 alone (as a local test database can) is reached
+/// through --forward-localhost in rootless mode: pasta maps the guest's IPv4 gateway to
+/// the host's 127.0.0.1 and its IPv6 gateway to the host's ::1, and the guest's relay
+/// tries the second when the first refuses.
+#[tokio::test]
+async fn test_forward_localhost_reaches_a_host_service_on_ipv6_loopback_only() -> Result<()> {
+    run_forward_localhost_case_to(
+        std::net::Ipv6Addr::LOCALHOST.into(),
+        &[],
+        "fwd-localhost-v6",
+    )
+    .await
 }
 
 /// Test --forward-localhost with routed networking.
