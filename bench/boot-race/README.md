@@ -23,6 +23,8 @@ t1 for every lane: a GET from the campaign host has read a complete `200` answer
 - `workload/`: the program every lane runs (std-only Rust, static). In HTTP mode it serves `GET /`; as a Lambda
   custom runtime `bootstrap` it runs the Runtime API loop, and exits after each response when
   `BOOT_RACE_EXIT_AFTER_RESPONSE=1`. Each answer carries a random id drawn at process start and the kernel boot id.
+- `box-setup.sh`: prepares a fresh parallel box (host settings, btrfs on the instance store, fcvm at a pinned commit,
+  the workload image).
 - `fcvm-prep.sh`: boots the workload in a 1 vCPU, 2 GiB VM, snapshots it, starts the memory server.
 - `prepare.py`: pushes the image, uploads the Lambda code, makes the AMI, launches the stopped and hibernated
   instances and the ECS container instance, and cleans up.
