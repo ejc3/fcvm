@@ -419,6 +419,26 @@ impl std::fmt::Display for ImplicitUffdReason {
 /// An NV2 guest always gets copy mode: MINOR maps the snapshot memfd MAP_PRIVATE, so the
 /// guest's first write to a page is the same copy-on-write that rules out the File
 /// backend.
+/// The guest IPv6 swap a routed clone needs: from the address its snapshot recorded to
+/// the one its network gave it, or none when they are the same address. The snapshot
+/// records the address with its prefix length (`fd00::100/128`) and the network gives it
+/// bare, so the two are compared as addresses. A clone whose guest keeps its address (a
+/// routed VM without `--ipv6-prefix` always holds the same one) is not reconfigured.
+fn clone_ipv6_swap(saved: Option<&str>, new: Option<&str>) -> Option<(String, String)> {
+    let (saved, new) = (saved?, new?);
+    let address = |text: &str| {
+        text.split('/')
+            .next()
+            .unwrap_or(text)
+            .parse::<std::net::Ipv6Addr>()
+            .ok()
+    };
+    match (address(saved), address(new)) {
+        (Some(a), Some(b)) if a == b => None,
+        _ => Some((saved.to_string(), new.to_string())),
+    }
+}
+
 fn uffd_backing_for(requested: UffdBacking, nv2: bool) -> UffdBacking {
     if nv2 {
         UffdBacking::Copy
@@ -2687,17 +2707,15 @@ async fn cmd_snapshot_run_inner(
         .as_any()
         .downcast_ref::<crate::network::RoutedNetwork>()
     {
-        match (&saved_network.guest_ipv6, routed_net.vm_ipv6()) {
-            (Some(old), Some(new)) if old != new => {
-                info!(
-                    old_ipv6 = %old,
-                    new_ipv6 = %new,
-                    "will reconfigure guest IPv6 after restore"
-                );
-                Some((old.clone(), new.to_string()))
-            }
-            _ => None,
+        let swap = clone_ipv6_swap(saved_network.guest_ipv6.as_deref(), routed_net.guest_ipv6());
+        if let Some((old, new)) = &swap {
+            info!(
+                old_ipv6 = %old,
+                new_ipv6 = %new,
+                "will reconfigure guest IPv6 after restore"
+            );
         }
+        swap
     } else {
         None
     };
@@ -4644,6 +4662,20 @@ async fn record_diff_parent(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_clone_that_keeps_its_guest_address_is_not_reconfigured() {
+        // Recorded with its length, given bare: the same address, so no swap.
+        assert_eq!(
+            clone_ipv6_swap(Some("fd00::100/128"), Some("fd00::100")),
+            None
+        );
+        assert_eq!(
+            clone_ipv6_swap(Some("2001:db8::5/128"), Some("2001:db8::6")),
+            Some(("2001:db8::5/128".to_string(), "2001:db8::6".to_string()))
+        );
+        assert_eq!(clone_ipv6_swap(None, Some("fd00::100")), None);
+    }
     /// `--stop` pins one VM: the wrapper hands the create the VM id it pinned before the
     /// pidfd, and the create refuses any other right after it loads the selector's VM, before
     /// it can pause anything. Without the check, a VM that took the selector's name or PID

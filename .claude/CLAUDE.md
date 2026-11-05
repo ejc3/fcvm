@@ -2544,14 +2544,22 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 
 **Routed Architecture** (`src/network/routed.rs`):
 - veth pair connects VM namespace to host with native IPv6 kernel routing (no userspace proxy)
-- Each VM gets a unique IPv6 derived from host's /64 subnet via hash of vm_id
-- Network namespace with bridge (br0) connecting TAP and veth for L2 forwarding
-- Proxy NDP on default interface makes VM IPv6 routable from network fabric
-- ip6tables MASQUERADE for AWS VPC source/dest checks (skipped when `--ipv6-prefix` is set)
+- Without `--ipv6-prefix` (the default) every routed guest holds `fd00::100`, on every host and across
+  snapshot and restore, so a snapshot carries no address of the host it was made on and a restore swaps
+  nothing. The namespace SNATs it to the VM's transit address (leased from `fdfc::/64`, held by `br0`, routed
+  from the host to the VM's veth), and the host MASQUERADEs that to its own address. Remote services see the
+  host's address, which the host's certificate lists, so a peer that binds a certificate to its address
+  accepts the clone on any host, including one whose service subnet moved after the snapshot was made. The
+  host needs no /64. Inbound connections reach the guest only through published ports
+- With `--ipv6-prefix` (also read from `FCVM_IPV6_PREFIX`) each VM gets a unique address in that prefix,
+  derived from its vm_id or given with `--ipv6-address`, made reachable from the network by proxy NDP on the
+  default interface, with no translation. A restore takes an address in the restoring host's prefix and
+  fc-agent swaps the guest to it
+- Network namespace with bridge (br0) connecting TAP and veth for L2 forwarding; the guest's IPv6 gateway is
+  `fd00::1` on br0 and the namespace routes
 - Port forwarding via built-in TCP proxy (setns + tokio relay). A mapping with a HOSTIP (`--publish '[::]:80:80'`) listens on that address, and `[::]` accepts IPv4 and IPv6 clients. A mapping without one listens on the VM's unique loopback IP (same allocation as rootless), which is allocated only when a mapping needs it
 - IPv4 stays internal to namespace (health checks only); all external traffic uses IPv6
 - Egress proxy is NOT used — IPv6 goes natively through the kernel stack
-- `--ipv6-prefix` is also read from `FCVM_IPV6_PREFIX`. On a host whose own addresses are not a routable /64, set it to the host's delegated subnet: the routed tests pass no prefix, so without it they stop at "routed mode preflight check failed" before a VM boots
 
 **Loopback IP Allocation** (`src/state/manager.rs`):
 - Sequential allocation: 127.0.0.2, 127.0.0.3, ..., 127.0.0.254, then 127.0.1.2, etc.

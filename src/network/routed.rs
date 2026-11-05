@@ -17,6 +17,18 @@ const GUEST_GATEWAY: &str = "10.0.2.1";
 /// kept equal by `routed_gateway_matches_the_guests_pinned_neighbour`).
 const ROUTED_GATEWAY_IPV6: &str = "fd00::1";
 
+/// Without `--ipv6-prefix`, every routed guest holds this address, on every host and
+/// across snapshot and restore, so a snapshot carries no address of the host it was made
+/// on. The namespace translates it to the VM's transit address and the host masquerades
+/// that to its own address, so remote services see the host and the host's certificate
+/// covers the connection.
+const ROUTED_GUEST_IPV6: &str = "fd00::100";
+
+/// The private prefix a routed VM's transit address comes from without `--ipv6-prefix`.
+/// The address is unique among live VMs (it is leased), routed from the host to the VM's
+/// veth, held by the namespace bridge, and never seen by the guest or by the network.
+const ROUTED_TRANSIT_PREFIX: &str = "fdfc::/64";
+
 /// Host loopback alias for `--forward-localhost`. fc-agent's guest-side relay
 /// connects to this address (pasta maps it to host loopback in rootless mode).
 /// In routed mode nothing owns it by default, so setup assigns it to the bridge
@@ -195,6 +207,31 @@ async fn release_address_in(
     removed
 }
 
+/// The namespace rule translating the guest's `ROUTED_GUEST_IPV6` to `transit` on the way
+/// out of the namespace. Traffic to the bridge's own prefix (the guest's gateway) stays
+/// untranslated.
+fn snat_rule(transit: &str) -> Vec<String> {
+    [
+        "ip6tables",
+        "-t",
+        "nat",
+        "-A",
+        "POSTROUTING",
+        "-s",
+        &format!("{ROUTED_GUEST_IPV6}/128"),
+        "!",
+        "-d",
+        &format!("{ROUTED_GATEWAY_IPV6}/64"),
+        "-j",
+        "SNAT",
+        "--to-source",
+        transit,
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect()
+}
+
 /// Remove `address`'s proxy NDP entry and, with `masquerade`, its MASQUERADE rule. The
 /// caller holds the address's lease. Either one already gone is not a failure.
 async fn remove_address_objects(
@@ -367,10 +404,12 @@ pub struct RoutedNetwork {
     tap_device: String,
     port_mappings: Vec<PortMapping>,
     loopback_ip: Option<String>,
-    /// Explicit routable prefix (CIDR or bare 4-group /64 shorthand).
-    /// Skips auto-detect and MASQUERADE.
+    /// Explicit routable prefix (CIDR or bare 4-group /64 shorthand): the guest holds an
+    /// address in it, reachable from the network, and no translation happens. Without
+    /// one the guest holds `ROUTED_GUEST_IPV6` and its traffic leaves as the host's.
     ipv6_prefix: Option<String>,
-    /// The VM's address (--ipv6-address), instead of one derived from `vm_id`.
+    /// The VM's address (--ipv6-address), instead of one derived from `vm_id`. Needs
+    /// `ipv6_prefix`.
     ipv6_address: Option<std::net::Ipv6Addr>,
     /// Guest localhost ports forwarded to the host's loopback (--forward-localhost).
     forward_localhost: Vec<u16>,
@@ -385,7 +424,12 @@ pub struct RoutedNetwork {
     // Network state (populated during setup)
     namespace_id: Option<String>,
     host_veth: Option<String>,
+    /// The VM's address on the host: the guest's own with `ipv6_prefix`, else its
+    /// transit address. Routed to the VM's veth and leased.
     vm_ipv6: Option<String>,
+    /// The address the guest holds: `vm_ipv6` with `ipv6_prefix`, else
+    /// `ROUTED_GUEST_IPV6`.
+    guest_ipv6: Option<String>,
     /// Held from the moment `vm_ipv6` is chosen until `cleanup` has removed everything
     /// that names it.
     address_lease: Option<AddressLease>,
@@ -411,6 +455,7 @@ impl RoutedNetwork {
             namespace_id: None,
             host_veth: None,
             vm_ipv6: None,
+            guest_ipv6: None,
             address_lease: None,
             default_iface: None,
             proxy_handles: Vec::new(),
@@ -612,16 +657,13 @@ impl RoutedNetwork {
 
         if let Some(ref prefix) = self.ipv6_prefix {
             Self::parse_ipv6_prefix(prefix)?;
-            return Ok(()); // Explicit prefix — no auto-detect or ip6tables needed
+            return Ok(()); // Explicit prefix: no translation, so no ip6tables
         }
-
-        // Must have global IPv6
-        if Self::detect_host_ipv6().is_none() {
+        if let Some(address) = self.ipv6_address {
             anyhow::bail!(
-                "routed networking requires a host with a global IPv6 address.\n\
-                 The host needs a non-deprecated /64 (or a /128 with a /64 on-link route).\n\
-                 Use --ipv6-prefix to specify a routable /64 prefix explicitly.\n\
-                 Check with: ip -6 addr show scope global"
+                "--ipv6-address {address} needs --ipv6-prefix (or FCVM_IPV6_PREFIX): without \
+                 a prefix every routed guest holds {ROUTED_GUEST_IPV6} and its traffic leaves \
+                 with the host's address"
             );
         }
 
@@ -661,98 +703,11 @@ impl RoutedNetwork {
         Ok(())
     }
 
-    /// Get the unique per-clone vm_ipv6 address.
-    pub fn vm_ipv6(&self) -> Option<&str> {
-        self.vm_ipv6.as_deref()
+    /// The address the guest holds, once `setup` has chosen it.
+    pub fn guest_ipv6(&self) -> Option<&str> {
+        self.guest_ipv6.as_deref()
     }
 
-    /// Detect host's global IPv6 address and /64 subnet for VM addressing.
-    /// Returns (host_ip, subnet_prefix) e.g. ("2600:1f1c:494:201::1", "2600:1f1c:494:201")
-    ///
-    /// Skips deprecated addresses (preferred_lft 0). Supports:
-    /// - Direct /64: host has an active address with /64 prefix length
-    /// - /128 with on-link /64 route: AWS VPC, service networks
-    ///
-    /// For hosts where auto-detect fails (e.g. only deprecated /64s), use
-    /// --ipv6-prefix to specify the routable prefix explicitly.
-    fn detect_host_ipv6() -> Option<(String, String)> {
-        let output = std::process::Command::new("ip")
-            .args(["-6", "addr", "show", "scope", "global"])
-            .output()
-            .ok()?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // First pass: look for /64 addresses (preferred over /128)
-        if let Some(result) = Self::parse_host_ipv6(&stdout, false) {
-            return Some(result);
-        }
-        // Second pass: check /128 addresses with on-link /64 routes
-        Self::parse_host_ipv6(&stdout, true)
-    }
-
-    /// Parse `ip -6 addr show` output to find a usable global IPv6 address.
-    /// When `check_onlink` is false, only returns /64 addresses.
-    /// When `check_onlink` is true, returns /128 addresses that have on-link /64 routes.
-    /// Skips deprecated, link-local, and ULA addresses.
-    fn parse_host_ipv6(output: &str, check_onlink: bool) -> Option<(String, String)> {
-        for line in output.lines() {
-            let line = line.trim();
-            if let Some(addr) = line.strip_prefix("inet6 ") {
-                if line.contains("deprecated") {
-                    continue;
-                }
-                if let Some(addr_cidr) = addr.split_whitespace().next() {
-                    if let Some((addr, prefix_len)) = addr_cidr.split_once('/') {
-                        if addr.starts_with("fe80") || addr.starts_with("fd") {
-                            continue; // Skip link-local and ULA
-                        }
-                        if let Ok(ip) = addr.parse::<std::net::Ipv6Addr>() {
-                            let segments = ip.segments();
-                            let prefix = format!(
-                                "{:x}:{:x}:{:x}:{:x}",
-                                segments[0], segments[1], segments[2], segments[3]
-                            );
-
-                            if !check_onlink && prefix_len == "64" {
-                                return Some((addr.to_string(), prefix));
-                            }
-                            if check_onlink
-                                && prefix_len == "128"
-                                && Self::has_onlink_64_route(&prefix)
-                            {
-                                info!(
-                                    addr = %addr,
-                                    prefix = %prefix,
-                                    "using /128 address with /64 on-link route"
-                                );
-                                return Some((addr.to_string(), prefix));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Check if the kernel has a /64 on-link route for the given prefix.
-    /// AWS VPC configures this via Router Advertisements.
-    fn has_onlink_64_route(prefix: &str) -> bool {
-        let route_prefix = format!("{prefix}::/64");
-        let output = std::process::Command::new("ip")
-            .args(["-6", "route", "show", &route_prefix])
-            .output();
-        match output {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                !stdout.trim().is_empty()
-            }
-            Err(_) => false,
-        }
-    }
-
-    /// Generate a deterministic IPv6 for the VM inside the delegated subnet.
-    ///
     /// The vm_id hash fills the host bits below `len`. Suffixes 0 and 1 are
     /// bumped to 2: 0 is the subnet-router anycast address and 1 is the host
     /// side of the prefix.
@@ -776,21 +731,16 @@ impl RoutedNetwork {
 #[async_trait::async_trait]
 impl NetworkManager for RoutedNetwork {
     async fn setup(&mut self) -> Result<NetworkConfig> {
-        // Resolve the IPv6 subnet: explicit --ipv6-prefix or auto-detect a /64
-        // from host interfaces.
-        let (host_ipv6, network, prefix_len) = if let Some(ref prefix) = self.ipv6_prefix {
-            let (network, len) = Self::parse_ipv6_prefix(prefix)?;
-            let host_addr = std::net::Ipv6Addr::from(network | 1).to_string();
-            info!(prefix = %prefix, "using explicit --ipv6-prefix (routable, no MASQUERADE)");
-            (host_addr, network, len)
-        } else {
-            let (host_addr, prefix) = Self::detect_host_ipv6().context(
-                "routed mode requires a global IPv6 /64 subnet. \
-                          Use --ipv6-prefix to specify one explicitly.",
-            )?;
-            let (network, len) = Self::parse_ipv6_prefix(&prefix)
-                .context("auto-detected host prefix failed to parse")?;
-            (host_addr, network, len)
+        // The prefix the VM's address on the host comes from: --ipv6-prefix, where the
+        // guest holds it, or the private transit prefix, translated to the host's
+        // address on the way out.
+        let translated = self.ipv6_prefix.is_none();
+        let (network, prefix_len) = match self.ipv6_prefix {
+            Some(ref prefix) => {
+                info!(prefix = %prefix, "using explicit --ipv6-prefix (routable, no MASQUERADE)");
+                Self::parse_ipv6_prefix(prefix)?
+            }
+            None => Self::parse_ipv6_prefix(ROUTED_TRANSIT_PREFIX)?,
         };
 
         // Choose the VM's address and lease it before anything names it. The lease
@@ -799,11 +749,8 @@ impl NetworkManager for RoutedNetwork {
         // another program), and is never taken over.
         let lease_dir = std::path::Path::new(ADDRESS_LEASE_DIR);
         let (vm_ipv6, lease) = if let Some(address) = self.ipv6_address {
-            let source = if self.ipv6_prefix.is_some() {
-                "--ipv6-prefix or FCVM_IPV6_PREFIX"
-            } else {
-                "the host's detected /64"
-            };
+            // preflight_check refused an address without a prefix.
+            let source = "--ipv6-prefix or FCVM_IPV6_PREFIX";
             check_requested_address(network, prefix_len, address, source)?;
             let lease = match lease_address(lease_dir, address, &self.vm_id)? {
                 LeaseAttempt::Leased(lease) => lease,
@@ -855,10 +802,17 @@ impl NetworkManager for RoutedNetwork {
         // Record state as soon as it's known so cleanup() can tear down a
         // partially-completed setup if a later step fails.
         self.vm_ipv6 = Some(vm_ipv6.clone());
+        let guest_ipv6 = if translated {
+            ROUTED_GUEST_IPV6.to_string()
+        } else {
+            vm_ipv6.clone()
+        };
+        self.guest_ipv6 = Some(guest_ipv6.clone());
         info!(
-            host_ipv6 = %host_ipv6,
             vm_ipv6 = %vm_ipv6,
+            guest_ipv6 = %guest_ipv6,
             prefix = %format!("{}/{}", std::net::Ipv6Addr::from(network), prefix_len),
+            translated,
             "IPv6 addresses for routed networking"
         );
 
@@ -1147,53 +1101,84 @@ impl NetworkManager for RoutedNetwork {
         )
         .await;
 
-        // 12. Add proxy NDP so the network fabric routes VM's IPv6 to this host
-        // (default_iface already detected above). Recorded first, with step 13's rule:
-        // the lease makes both this VM's until it is released.
+        // 11b. Without a prefix the guest holds ROUTED_GUEST_IPV6 and the namespace
+        //      translates it to the transit address: the bridge holds the transit
+        //      address, so the host's neighbour solicitation for it over the veth is
+        //      answered, and a reply to it is translated back to the guest before
+        //      routing. Both go away with the namespace.
+        if translated {
+            namespace::exec_in_namespace_checked(
+                &ns_name,
+                &[
+                    "ip",
+                    "-6",
+                    "addr",
+                    "add",
+                    &vm_route,
+                    "dev",
+                    BRIDGE_DEVICE,
+                    "nodad",
+                ],
+            )
+            .await
+            .context("assigning the transit address to the namespace bridge")?;
+            let rule = snat_rule(&vm_ipv6);
+            let rule: Vec<&str> = rule.iter().map(String::as_str).collect();
+            namespace::exec_in_namespace_checked(&ns_name, &rule)
+                .await
+                .context("translating the guest's address to the transit address")?;
+        }
+
+        // 12. Recorded before the proxy NDP entry and step 13's rule: the lease makes
+        //     both this VM's until it is released.
         crate::reclaim::record(
             &self.vm_id,
             crate::reclaim::Resource::RoutedAddress {
                 address: vm_ipv6.parse().context("parsing the VM's IPv6 address")?,
                 iface: default_iface.clone(),
-                masquerade: self.ipv6_prefix.is_none(),
+                masquerade: translated,
             },
         )?;
-        // Enable proxy NDP on the interface so the kernel actually responds
-        // to neighbor solicitations for our proxy entries.
-        run_host_command(
-            "enabling proxy NDP on default interface",
-            "sysctl",
-            &[
-                "-w",
-                &format!("net.ipv6.conf.{}.proxy_ndp=1", default_iface),
-            ],
-        )
-        .await;
-        if run_host_command(
-            "adding proxy NDP entry",
-            "ip",
-            &[
-                "-6",
-                "neigh",
-                "add",
-                "proxy",
-                &vm_ipv6,
-                "dev",
-                &default_iface,
-            ],
-        )
-        .await
-        {
-            info!(vm_ipv6 = %vm_ipv6, iface = %default_iface, "added proxy NDP");
+        // With a prefix, proxy NDP makes the network fabric route the guest's address
+        // to this host. A transit address never leaves the host, so it gets none.
+        if !translated {
+            // Enable proxy NDP on the interface so the kernel actually responds
+            // to neighbor solicitations for our proxy entries.
+            run_host_command(
+                "enabling proxy NDP on default interface",
+                "sysctl",
+                &[
+                    "-w",
+                    &format!("net.ipv6.conf.{}.proxy_ndp=1", default_iface),
+                ],
+            )
+            .await;
+            if run_host_command(
+                "adding proxy NDP entry",
+                "ip",
+                &[
+                    "-6",
+                    "neigh",
+                    "add",
+                    "proxy",
+                    &vm_ipv6,
+                    "dev",
+                    &default_iface,
+                ],
+            )
+            .await
+            {
+                info!(vm_ipv6 = %vm_ipv6, iface = %default_iface, "added proxy NDP");
+            }
         }
 
-        // 13. MASQUERADE outbound IPv6 traffic from the namespace.
-        //     On AWS, source/dest check drops packets with unassigned source IPs.
-        //     MASQUERADE rewrites the source to the host's IP so the VPC fabric
-        //     accepts the traffic. IPv4 is not routed externally — only IPv6.
-        //     Skipped when --ipv6-prefix is set: the prefix is directly routable
-        //     and the VM's source IP matches the cert's IP SANs.
-        if self.ipv6_prefix.is_some() {
+        // 13. MASQUERADE the transit address to the host's own address on the way out,
+        //     so the network sees the host: nothing routes the private transit prefix,
+        //     a VPC drops a source it did not assign, and a service that binds a peer
+        //     certificate to its address finds the host's address in the host's
+        //     certificate. IPv4 is not routed externally, only IPv6.
+        //     Skipped when --ipv6-prefix is set: the prefix is directly routable.
+        if !translated {
             info!(iface = %default_iface, "skipping MASQUERADE (--ipv6-prefix is routable)");
         } else if run_host_command(
             "adding IPv6 MASQUERADE rule",
@@ -1312,7 +1297,7 @@ impl NetworkManager for RoutedNetwork {
             // Include /128 prefix so fc-agent uses a host route instead of /64 on-link.
             // With /64, the VM would try NDP for other addresses in the host's subnet
             // directly on eth0, which fails (they're behind the veth + physical network).
-            guest_ipv6: Some(format!("{}/128", vm_ipv6)),
+            guest_ipv6: Some(format!("{}/128", guest_ipv6)),
             // fd00::1 is on the bridge inside the namespace. The VM uses it as IPv6 gateway.
             // NDP resolves it on the VM's local link (TAP → bridge → fd00::1 responds).
             // The namespace kernel then forwards to the veth → host.
@@ -2072,59 +2057,6 @@ mod tests {
                 addr
             );
         }
-    }
-
-    // --- parse_host_ipv6 tests (deprecated address filtering) ---
-
-    #[test]
-    fn test_parse_host_ipv6_skips_deprecated() {
-        let output = "\
-2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 9001 state UP
-    inet6 2600:1f1c:494:201::1/64 scope global deprecated dynamic noprefixroute
-       valid_lft 3552sec preferred_lft 0sec
-    inet6 2803:6084:7058:46f6::1/64 scope global dynamic noprefixroute
-       valid_lft 3552sec preferred_lft 3552sec";
-
-        let result = RoutedNetwork::parse_host_ipv6(output, false);
-        assert!(result.is_some(), "should find non-deprecated address");
-        let (addr, prefix) = result.unwrap();
-        assert_eq!(addr, "2803:6084:7058:46f6::1");
-        assert_eq!(prefix, "2803:6084:7058:46f6");
-    }
-
-    #[test]
-    fn test_parse_host_ipv6_skips_link_local_and_ula() {
-        let output = "\
-    inet6 fe80::1/64 scope global
-    inet6 fd00::1/64 scope global
-    inet6 2600:1f1c:494:201::5/64 scope global dynamic";
-
-        let result = RoutedNetwork::parse_host_ipv6(output, false);
-        assert!(result.is_some());
-        let (addr, _) = result.unwrap();
-        assert_eq!(addr, "2600:1f1c:494:201::5");
-    }
-
-    #[test]
-    fn test_parse_host_ipv6_all_deprecated_returns_none() {
-        let output = "\
-    inet6 2600:1f1c:494:201::1/64 scope global deprecated dynamic
-    inet6 2803:6084:7058:46f6::1/64 scope global deprecated dynamic";
-
-        let result = RoutedNetwork::parse_host_ipv6(output, false);
-        assert!(result.is_none(), "all deprecated should return None");
-    }
-
-    #[test]
-    fn test_parse_host_ipv6_extracts_prefix() {
-        let output = "    inet6 2600:1f1c:0494:0201::abcd/64 scope global dynamic";
-
-        let result = RoutedNetwork::parse_host_ipv6(output, false);
-        assert!(result.is_some());
-        let (addr, prefix) = result.unwrap();
-        assert_eq!(addr, "2600:1f1c:0494:0201::abcd");
-        // Prefix is normalized through Ipv6Addr parsing (leading zeros stripped)
-        assert_eq!(prefix, "2600:1f1c:494:201");
     }
 
     /// A launch takes ONE resolv.conf snapshot. Selecting the routed resolver

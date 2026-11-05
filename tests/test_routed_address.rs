@@ -1,8 +1,8 @@
 //! `--ipv6-address` and unique VM names, end to end, in routed mode.
 //!
-//! Routed mode needs root and a routable IPv6 prefix: FCVM_IPV6_PREFIX, or the /64 it
-//! detects on the host. The test learns the prefix in use from fcvm's own refusal of an
-//! address outside it, so it runs under whichever of the two the host provides.
+//! Routed mode needs root. `--ipv6-address` needs `--ipv6-prefix`; the test passes a
+//! private prefix of its own, so it runs on any host, and learns the prefix as fcvm
+//! prints it from fcvm's own refusal of an address outside it.
 
 #![cfg(all(feature = "integration-slow", feature = "privileged-tests"))]
 
@@ -12,6 +12,10 @@ use anyhow::{Context, Result};
 
 /// An address in the documentation prefix (RFC 3849), which no host routes.
 const OUTSIDE_ANY_PREFIX: &str = "2001:db8:ffff:ffff::2";
+
+/// The routed prefix every VM here takes its address from. A unique local prefix: the
+/// VMs need an address of their own, not a route to the outside.
+const PREFIX: &str = "fd5e:70a1:fc00:1::/64";
 
 /// A routed VM started with `--ipv6-address` holds that address, a second VM asking for
 /// it or for the VM's name is refused without disturbing the first, and a clone restored
@@ -33,6 +37,8 @@ async fn test_routed_vm_and_clone_take_the_given_ipv6_address() -> Result<()> {
             &format!("{base_name}-probe"),
             "--network",
             "routed",
+                "--ipv6-prefix",
+                PREFIX,
             "--ipv6-address",
             OUTSIDE_ANY_PREFIX,
             common::TEST_IMAGE,
@@ -68,6 +74,8 @@ async fn test_routed_vm_and_clone_take_the_given_ipv6_address() -> Result<()> {
                 &base_name,
                 "--network",
                 "routed",
+                "--ipv6-prefix",
+                PREFIX,
                 "--ipv6-address",
                 &base_address,
                 common::TEST_IMAGE,
@@ -103,6 +111,8 @@ async fn test_routed_vm_and_clone_take_the_given_ipv6_address() -> Result<()> {
                 &format!("{base_name}-dup"),
                 "--network",
                 "routed",
+                "--ipv6-prefix",
+                PREFIX,
                 "--ipv6-address",
                 &base_address,
                 common::TEST_IMAGE,
@@ -156,6 +166,8 @@ async fn test_routed_vm_and_clone_take_the_given_ipv6_address() -> Result<()> {
                 &serve_pid.to_string(),
                 "--name",
                 &clone_name,
+                "--ipv6-prefix",
+                PREFIX,
                 "--ipv6-address",
                 &clone_address,
             ],

@@ -977,18 +977,18 @@ pub struct RunArgs {
     /// a delegated subnet of any length up to /120 (e.g.
     /// 2803:6086:9892:947b:1feb:1cca:2:0/112), or a bare 4-group /64
     /// shorthand (e.g. 2803:6084:7058:46f6). Each VM gets a unique address
-    /// inside the subnet via NDP proxy. When set, MASQUERADE is skipped (the
-    /// prefix is directly routable). When not set, a /64 is auto-detected
-    /// from host interfaces. Also read from FCVM_IPV6_PREFIX, for a host whose
-    /// own addresses are not a routable /64: every routed run there needs it.
-    /// The other network modes ignore it, and their snapshot keys do not include it.
+    /// inside the subnet via NDP proxy, reachable from the network. Without it
+    /// every routed guest holds fd00::100, on any host and across snapshot and
+    /// restore, and its traffic leaves with the host's own address. Also read
+    /// from FCVM_IPV6_PREFIX. The other network modes ignore it, and their
+    /// snapshot keys do not include it.
     #[arg(long, env = "FCVM_IPV6_PREFIX")]
     pub ipv6_prefix: Option<String>,
 
     /// The VM's IPv6 address in routed mode, instead of one derived from its random VM
-    /// id. It must lie inside the prefix in use (--ipv6-prefix, FCVM_IPV6_PREFIX or the
-    /// detected /64) and must not be the prefix's address 0 or 1. An address another
-    /// live VM holds is refused. Only valid with --network routed. Not part of any
+    /// id. Needs --ipv6-prefix (or FCVM_IPV6_PREFIX): it must lie inside that prefix and
+    /// must not be its address 0 or 1. An address another live VM holds is refused.
+    /// Only valid with --network routed. Not part of any
     /// snapshot key: a VM restored from a snapshot takes the address it is given.
     #[arg(long, value_name = "ADDR")]
     pub ipv6_address: Option<std::net::Ipv6Addr>,
@@ -1376,8 +1376,9 @@ pub struct SnapshotRunArgs {
     pub map: Vec<String>,
 
     /// Routable IPv6 prefix to derive a routed clone's address from, in the forms
-    /// `podman run --ipv6-prefix` takes. Without it the clone's address comes from the
-    /// host's own /64, as for `podman run`. The prefix the snapshot was created under is
+    /// `podman run --ipv6-prefix` takes. Without it the clone's guest holds fd00::100
+    /// and its traffic leaves with this host's address, as for `podman run`. The prefix
+    /// the snapshot was created under is
     /// never used: on another host, or after the host's routed prefix changed, the network
     /// no longer routes it here. Also read from FCVM_IPV6_PREFIX. Other network modes
     /// ignore it.
@@ -1386,8 +1387,8 @@ pub struct SnapshotRunArgs {
 
     /// The clone's IPv6 address, for a routed snapshot only: the guest's address is
     /// swapped to it on restore, instead of one derived from the clone's random VM id.
-    /// The same rules as `podman run --ipv6-address` apply: inside the prefix in use,
-    /// not its address 0 or 1, and not held by another live VM.
+    /// The same rules as `podman run --ipv6-address` apply: it needs --ipv6-prefix, lies
+    /// inside it, is not its address 0 or 1, and is not held by another live VM.
     #[arg(long, value_name = "ADDR")]
     pub ipv6_address: Option<std::net::Ipv6Addr>,
 
