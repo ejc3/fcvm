@@ -234,15 +234,17 @@ class Sources:
         return os.path.isfile(path) or records.entry(self.display_path(path)) is not None
 
     def read(self, path, display_path):
-        """The bytes at path, or of the moved record the manifest lists there,
-        checked against the manifest's size and sha256."""
+        """The bytes at path, or of the moved record the manifest lists there.
+        A listed record is checked against the manifest's size and sha256
+        wherever its bytes come from."""
+        found = records.entry(display_path)
         try:
-            return read_bytes(path)
+            data = read_bytes(path)
         except FileNotFoundError:
-            found = records.entry(display_path)
             if found is None:
                 raise
             return records.read_moved(found)
+        return data if found is None else records.checked(found, data, display_path)
 
     def read_json(self, path):
         display_path = self.protect(path)

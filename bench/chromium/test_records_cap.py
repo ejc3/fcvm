@@ -15,6 +15,7 @@ at 59,633,835 bytes.
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -73,6 +74,40 @@ class RecordsCap(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True), \
                 self.assertRaisesRegex(records.MissingRecord, "not in this checkout"):
             records.read_moved({**found, "fcvm_commit": "f" * 40})
+
+    def test_a_listed_record_present_in_the_tree_is_held_to_the_manifest(self):
+        """RED BEFORE THE FIX (codex review of 7c62d332..90c0c93e): a file at a
+        listed path was returned from the tree unchecked, by records.read_bytes
+        and by campaign_summary's Sources, so a regenerated or edited copy was
+        read in place of the listed bytes."""
+        import campaign_summary
+        with tempfile.TemporaryDirectory() as run:
+            path = os.path.join(run, "analysis.json")
+            with open(path, "w") as handle:
+                handle.write('{"run_id": "edited"}')
+            listed = {records.repo_relative(path): {
+                "path": records.repo_relative(path), "size": 2, "sha256": "0" * 64,
+                "manifest": "results/records-test.json", "fcvm_commit": None,
+                "repository": records.RECORDS_REPOSITORY, "records_commit": "f" * 40}}
+            with mock.patch.object(records, "_manifests", return_value=listed):
+                with self.assertRaisesRegex(records.MissingRecord, "not the 2 bytes"):
+                    records.read_bytes(path)
+                with self.assertRaisesRegex(campaign_summary.RunError, "not the 2 bytes"):
+                    campaign_summary.Sources(run).read_json(path)
+
+    def test_a_run_named_through_a_directory_alias_finds_its_moved_records(self):
+        """RED BEFORE THE FIX (codex review of 7c62d332..90c0c93e): the manifest
+        key kept the alias's own path, so a run directory named through a
+        symlink had no moved records and campaign_summary called its
+        analysis.json missing."""
+        import campaign_summary
+        path = records.listed("bench/chromium/results/reqbench-40657613-r1-c8/analysis.json")[0]
+        run = os.path.dirname(os.path.join(records.REPO, path))
+        with tempfile.TemporaryDirectory() as tmp:
+            alias = os.path.join(tmp, "run")
+            os.symlink(run, alias)
+            self.assertIsNotNone(records.entry(os.path.join(alias, "analysis.json")))
+            self.assertTrue(campaign_summary.Sources(alias).exists(os.path.join(alias, "analysis.json")))
 
 
 if __name__ == "__main__":

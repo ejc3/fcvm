@@ -42,7 +42,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(os.path.dirname(HERE))
+REPO = os.path.realpath(os.path.dirname(os.path.dirname(HERE)))
 RESULTS = os.path.join(HERE, "results")
 MANIFEST_GLOB = os.path.join(RESULTS, "records-*.json")
 RECORDS_ENV = "FCVM_BENCH_RECORDS"
@@ -82,8 +82,9 @@ class MissingRecord(FileNotFoundError):
 
 
 def repo_relative(path):
-    """path as the repository-relative name the manifests use."""
-    return os.path.relpath(os.path.abspath(os.fspath(path)), REPO).replace(os.sep, "/")
+    """path as the repository-relative name the manifests use. Symlinks are
+    resolved, so a run directory named through an alias finds its records."""
+    return os.path.relpath(os.path.realpath(os.fspath(path)), REPO).replace(os.sep, "/")
 
 
 def is_raw(relative_in_run):
@@ -163,11 +164,8 @@ def _sources(found):
     return out, where
 
 
-def _read_from(found, where, git_dir, spec):
-    """found's bytes from one place, or None when that place lacks the object."""
-    data = _batch(git_dir).read(spec)
-    if data is None:
-        return None
+def checked(found, data, where):
+    """data, when it is the size and sha256 found lists; MissingRecord otherwise."""
     digest = hashlib.sha256(data).hexdigest()
     if len(data) != found["size"] or digest != found["sha256"]:
         raise MissingRecord(
@@ -176,6 +174,12 @@ def _read_from(found, where, git_dir, spec):
             f"{found['manifest']} lists"
         )
     return data
+
+
+def _read_from(found, where, git_dir, spec):
+    """found's bytes from one place, or None when that place lacks the object."""
+    data = _batch(git_dir).read(spec)
+    return None if data is None else checked(found, data, where)
 
 
 def read_moved(found):
@@ -199,11 +203,13 @@ def read_moved(found):
 
 
 def read_bytes(path):
-    """A record's bytes, from the working tree or, for a moved one, its manifest."""
+    """A record's bytes, from the working tree or, for a moved one, its manifest.
+    A listed record is held to the manifest wherever its bytes come from."""
+    found = entry(path)
     if os.path.isfile(path):
         with open(path, "rb") as handle:
-            return handle.read()
-    found = entry(path)
+            data = handle.read()
+        return data if found is None else checked(found, data, path)
     if found is None:
         raise FileNotFoundError(f"{path}: no such record in the tree or in any {MANIFEST_GLOB}")
     return read_moved(found)
