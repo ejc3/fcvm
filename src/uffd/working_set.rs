@@ -249,7 +249,7 @@ impl PageSet {
 
     /// The first-touch time of a granule in the set (0 when unknown or absent).
     #[cfg(test)]
-    fn first_touch(&self, granule: u64) -> FirstTouch {
+    pub(crate) fn first_touch(&self, granule: u64) -> FirstTouch {
         if self.contains(granule) {
             self.first[granule as usize]
         } else {
@@ -486,15 +486,20 @@ impl Iterator for RunIter<'_> {
 /// [`PageSet::by_first_touch`]). Runs of different tiers are never joined, so a run is
 /// contiguous within its tier.
 pub struct OrderedRuns {
-    tiers: Vec<PageSet>,
+    tiers: Arc<Vec<PageSet>>,
     tier: usize,
     cursor: u64,
 }
 
 impl OrderedRuns {
     pub fn new(set: &PageSet) -> Self {
+        Self::from_tiers(Arc::new(set.by_first_touch()))
+    }
+
+    /// The runs of a set already split by [`PageSet::by_first_touch`].
+    pub fn from_tiers(tiers: Arc<Vec<PageSet>>) -> Self {
         Self {
-            tiers: set.by_first_touch(),
+            tiers,
             tier: 0,
             cursor: 0,
         }
@@ -740,6 +745,21 @@ pub struct WorkingSetStore {
     key: ImageKey,
     mem_len: u64,
     known: Mutex<PageSet>,
+    /// `known` split by first-touch tier, for replay. Splitting a large set scans every
+    /// granule (about 144 ms for a dense 128 GiB guest), so it is done when the set is loaded
+    /// and on a thread of its own after the set changes, never on a clone's fault path.
+    ordered: Arc<Mutex<OrderedTiers>>,
+}
+
+/// A cached [`PageSet::by_first_touch`] of the store's union, and which change of the union
+/// it was split from.
+#[derive(Default)]
+struct OrderedTiers {
+    /// Bumped by every change of the union.
+    version: u64,
+    /// The version `tiers` was split from.
+    split_from: u64,
+    tiers: Option<Arc<Vec<PageSet>>>,
 }
 
 impl WorkingSetStore {
@@ -833,6 +853,11 @@ impl WorkingSetStore {
             lock_path,
             key,
             mem_len,
+            ordered: Arc::new(Mutex::new(OrderedTiers {
+                version: 0,
+                split_from: 0,
+                tiers: Some(Arc::new(known.by_first_touch())),
+            })),
             known: Mutex::new(known),
         })
     }
@@ -880,6 +905,48 @@ impl WorkingSetStore {
         self.known.lock().expect("working set mutex").clone()
     }
 
+    /// The set to prefetch for a clone starting now, split by first-touch tier. The split is the
+    /// cached one when it is current, which is the usual case: it was made when the set loaded
+    /// or after its last change. Otherwise it is made here.
+    pub fn to_prefetch_ordered(&self) -> Arc<Vec<PageSet>> {
+        let known = self.known.lock().expect("working set mutex");
+        let mut ordered = self.ordered.lock().expect("working set order mutex");
+        if ordered.split_from == ordered.version {
+            if let Some(tiers) = &ordered.tiers {
+                return tiers.clone();
+            }
+        }
+        let tiers = Arc::new(known.by_first_touch());
+        ordered.split_from = ordered.version;
+        ordered.tiers = Some(tiers.clone());
+        tiers
+    }
+
+    /// Split the union again on a thread of its own after it changed. A split that a later
+    /// change made stale is dropped.
+    fn resplit_after_change(&self, known: &PageSet) {
+        let version = {
+            let mut ordered = self.ordered.lock().expect("working set order mutex");
+            ordered.version += 1;
+            ordered.version
+        };
+        let set = known.clone();
+        let ordered = self.ordered.clone();
+        let spawned = std::thread::Builder::new()
+            .name("fcvm-ws-order".into())
+            .spawn(move || {
+                let tiers = Arc::new(set.by_first_touch());
+                let mut ordered = ordered.lock().expect("working set order mutex");
+                if ordered.version == version {
+                    ordered.split_from = version;
+                    ordered.tiers = Some(tiers);
+                }
+            });
+        if let Err(error) = spawned {
+            debug!(target: "uffd", %error, "the working-set order split runs on the next clone instead");
+        }
+    }
+
     /// An empty set sized for this image, for a clone to record into.
     pub fn recorder(&self) -> PageSet {
         PageSet::empty(self.mem_len)
@@ -887,10 +954,10 @@ impl WorkingSetStore {
 
     /// Add one clone's observations to the in-process union without touching the filesystem.
     fn remember(&self, observed: &PageSet) -> u64 {
-        self.known
-            .lock()
-            .expect("working set mutex")
-            .union_from(observed)
+        let mut known = self.known.lock().expect("working set mutex");
+        let added = known.union_from(observed);
+        self.resplit_after_change(&known);
+        added
     }
 
     /// Merge one clone's observations into the union and persist it if it grew.
@@ -1009,10 +1076,11 @@ impl WorkingSetStore {
 
         // Preserve everything learned even when publication fails: the current serve process
         // can still prefetch it, and a later successful merge will retry the disk union.
-        self.known
-            .lock()
-            .expect("working set mutex")
-            .union_from(&merged);
+        {
+            let mut known = self.known.lock().expect("working set mutex");
+            known.union_from(&merged);
+            self.resplit_after_change(&known);
+        }
 
         result?;
         Ok(Some(MergeOutcome {
@@ -1520,6 +1588,48 @@ mod tests {
         assert!(
             !store.merge_and_persist(&clone3).unwrap().persisted,
             "a later time changes nothing, so nothing is written"
+        );
+    }
+
+    /// A clone takes the tier split the store made when it loaded the set, not one made on its
+    /// fault path, and a change of the union is split again on another thread.
+    #[test]
+    fn the_store_keeps_its_tier_split_off_the_fault_path() {
+        let mem_len = 512 * GRANULE;
+        let image = fake_image("tiers", mem_len);
+        let store = open_store(&image, mem_len);
+        let mut clone1 = store.recorder();
+        clone1.insert_range_at(0, GRANULE, 600);
+        store.merge_and_persist(&clone1).unwrap();
+        let reopened = open_store(&image, mem_len);
+        let first = reopened.to_prefetch_ordered();
+        assert!(
+            Arc::ptr_eq(&first, &reopened.to_prefetch_ordered()),
+            "a clone split the set itself instead of taking the store's split"
+        );
+        let mut clone2 = reopened.recorder();
+        clone2.insert_range_at(100 * GRANULE, GRANULE, 1);
+        reopened.remember(&clone2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ordered = reopened.ordered.lock().unwrap();
+            if ordered.split_from == ordered.version {
+                break;
+            }
+            drop(ordered);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the union was not split again"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let runs: Vec<u64> = OrderedRuns::from_tiers(reopened.to_prefetch_ordered())
+            .map(|run| run.offset / GRANULE)
+            .collect();
+        assert_eq!(
+            runs,
+            vec![100, 0],
+            "the new split holds the change, earliest first"
         );
     }
 
