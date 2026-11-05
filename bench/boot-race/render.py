@@ -70,12 +70,32 @@ LANES = {
 }
 
 FORBIDDEN = [
-    re.compile(r"\bi-[0-9a-f]{8,17}\b"),
+    re.compile(r"\b(?:i|eni|vol|snap|sg|subnet|lt)-[0-9a-f]{8,17}\b"),
+    re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"),
+    re.compile(r"\b[0-9a-f]{32}\b"),
+    re.compile(r"lambda-url|amazonaws\.com"),
+    re.compile(r"\b[0-9a-f]{1,4}(?::[0-9a-f]{0,4}){2,7}\b", re.I),
     re.compile(r"\bami-[0-9a-f]{8,17}\b"),
     re.compile(r"\b\d{12}\b"),
     re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
     re.compile(r"arn:aws:"),
 ]
+
+
+SCRUB = [
+    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b"), "<address>"),
+    (re.compile(r"\b(?:i|eni|vol|snap|sg|subnet|lt|ami)-[0-9a-f]{8,17}\b"), "<id>"),
+    (re.compile(r"arn:aws:\S+"), "<arn>"),
+    (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"), "<id>"),
+    (re.compile(r"https?://\S+"), "<url>"),
+    (re.compile(r"\b\d{12}\b"), "<account>"),
+]
+
+
+def scrub(text):
+    for rx, sub in SCRUB:
+        text = rx.sub(sub, text)
+    return text[:200]
 
 
 def median(xs):
@@ -110,11 +130,13 @@ def build(results):
             continue
         ok = [r for r in mine if r.get("ok")]
         samples = []
+        raw = []
         seen_proc, seen_boot = set(), set()
         checks = {"new_proc": 0, "new_boot": 0, "same_proc_as_previous": 0, "init_duration": 0, "report": 0}
         for i, r in enumerate(ok, 1):
             a = r["answer"]
             s = {"i": i, "round": r["round"], "t": r["t_start_unix_ms"], "ms": round(r["ms"], 1)}
+            raw.append(r["ms"])
             if a["proc_id"] not in seen_proc:
                 checks["new_proc"] += 1
             if a["boot_id"] not in seen_boot:
@@ -132,14 +154,18 @@ def build(results):
                     checks["init_duration"] += 1
                     s["init_ms"] = float(rep["init_duration"].split()[0])
             samples.append(s)
-        ms = [s["ms"] for s in samples]
+        ms = raw
+        failed = [
+            {"round": r["round"], "t": r.get("t_attempt_unix_ms") or r.get("t_failed_unix_ms"), "error": scrub(r.get("error", ""))}
+            for r in mine if not r.get("ok")
+        ]
         lanes.append(
             {
                 "id": lid,
                 **meta,
                 "n": len(ok),
                 "failures": len(mine) - len(ok),
-                "failure_errors": sorted({r.get("error", "")[:160] for r in mine if not r.get("ok")}),
+                "failed": failed,
                 "median_ms": round(median(ms), 1) if ms else None,
                 "p95_ms": round(p95(ms), 1) if ms else None,
                 "min_ms": round(min(ms), 1) if ms else None,
@@ -149,7 +175,7 @@ def build(results):
             }
         )
     lanes.sort(key=lambda l: (l["median_ms"] is None, l["median_ms"] or 0))
-    starts = [s["t"] for l in lanes for s in l["samples"]]
+    starts = [s["t"] for l in lanes for s in l["samples"]] + [f["t"] for l in lanes for f in l["failed"] if f["t"]]
     data = {
         "setup": setup,
         "first_sample_unix_ms": min(starts) if starts else None,
