@@ -643,6 +643,10 @@ impl Actor {
                 let Some(host) = self.agents.get(&conn).map(|a| a.host.clone()) else {
                     return;
                 };
+                if let AgentMsg::Potato(e) = &msg {
+                    // the agent's stamp beside this read's, so a late report is told from a lost one
+                    tracing::debug!(target: "fcvm::fleet::potato_reports", host = %host, player = e.player, agent_at = e.at, coord_at = now_ms(), kind = ?e.kind, "potato event received");
+                }
                 let quarantined = match &msg {
                     AgentMsg::Quarantine { sbdf, report, .. } => {
                         Some((sbdf.clone(), report.clone()))

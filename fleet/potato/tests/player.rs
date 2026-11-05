@@ -499,6 +499,34 @@ fn a_player_that_has_thrown_refuses_the_ball_until_it_is_woken() {
     assert!(matches!(next(&reports), Report::Caught { seq: 2, .. }));
 }
 
+/// A round's end is followed by a sleep: a ball of the next round that reached the player
+/// between the `stop` and the snapshot's pause would be held by a VM nobody wakes for it.
+#[test]
+fn a_stopped_player_refuses_every_ball_until_it_is_woken() {
+    let (report, reports, _conns, _latest) = report_server();
+    let (_a, pa) = player(6, report);
+    let _ = next(&reports); // hello
+    let ball = |round| Ball {
+        round,
+        seq: 1,
+        ring: vec!["127.0.0.1:1".into(), format!("127.0.0.1:{pa}")],
+        hold_ms: 0,
+        shrink_permille: 0,
+        min_hold_ms: 0,
+        flight_ms: 20,
+        trail: vec![],
+    };
+    assert!(is_ok(&ask(pa, &Inbound::Stop { round: 1 })));
+    let next_round = ask(pa, &Inbound::Ball(ball(2)));
+    assert!(
+        !is_ok(&next_round),
+        "a ball of the next round, caught by a player going to sleep: {next_round}"
+    );
+    assert!(is_ok(&ask(pa, &Inbound::Wake { round: Some(2) })));
+    send_ball(pa, &ball(2));
+    assert!(matches!(next(&reports), Report::Caught { round: 2, .. }));
+}
+
 /// A thrower that missed the acknowledgement sends the same ball again; the catch counts once.
 #[test]
 fn a_ball_sent_twice_is_caught_once() {
@@ -575,7 +603,8 @@ fn a_stopped_round_abandons_the_throw_and_refuses_its_balls() {
         }
         other => panic!("expected the abandoned throw, got {other:?}"),
     }
-    // an abandoned throw is not a throw: the player still catches, with no wake
+    // a ball of the stopped round is refused as over; a later round's waits for the wake
+    // (a_stopped_player_refuses_every_ball_until_it_is_woken)
     let refused = ask(
         pa,
         &Inbound::Ball(Ball {
@@ -584,17 +613,6 @@ fn a_stopped_round_abandons_the_throw_and_refuses_its_balls() {
         }),
     );
     assert!(refusal(&refused).contains("round is over"));
-    let ok = ask(
-        pa,
-        &Inbound::Ball(Ball {
-            round: 10,
-            seq: 0,
-            hold_ms: 0,
-            flight_ms: 10,
-            ..ball
-        }),
-    );
-    assert!(is_ok(&ok), "a later round is caught: {ok}");
 }
 
 /// The hello a new player sends is its state when it got its number, so the report of a ball

@@ -1721,9 +1721,12 @@ player then draws its first colour from the guest's random pool.
    so the player's report connection fails, it connects again and says hello with the
    colour, counter and chain it woke with. Once its ball port answers (fcvm's restore opens a
    clone's inbound gate last), the agent tells it it woke, and from then on it catches. A
-   round that ends while a player holds the ball reaches that player first (`stop`): its
-   throw is abandoned and that round's balls are refused, so no snapshot holds a throw that
-   would resume in a later round.
+   round that ends reaches every awake player before its sleep (`stop`): from then on it
+   refuses every ball until it is woken, and a throw waiting for its hold is abandoned when
+   the hold ends. A hold the snapshot paused ends after the player's next wake, when it may
+   already hold the next round's ball; the agent puts it to sleep for that abandoned throw
+   only if the round being played does not need it (it holds the ball, or the ball reaches
+   it within the lead).
 5. **Verify.** The coordinator replays the step from the last values it verified: a catch's
    colour must be the last one plus one, its counter the last plus one, and its chain the
    step of the last chain. A hello after a wake must equal what the player reported at its
