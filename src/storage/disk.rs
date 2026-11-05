@@ -57,16 +57,28 @@ pub fn can_own_subvolume_snapshot_of(base_dir: &Path) -> bool {
 /// 860,177-extent disk took 9 to 11 s), so at this limit it stays near 100 ms.
 pub const REFLINK_MAX_EXTENTS: u64 = 4096;
 
+/// `FCVM_REFLINK_MAX_EXTENTS` replaces [`REFLINK_MAX_EXTENTS`] when it holds a number. `0`
+/// gives every disk that has an extent the subvolume snapshot, which is how the tests of
+/// that path reach it with a test VM's small disk.
+pub const REFLINK_MAX_EXTENTS_ENV: &str = "FCVM_REFLINK_MAX_EXTENTS";
+
+/// The extent limit in force, from the value of [`REFLINK_MAX_EXTENTS_ENV`] if any.
+fn reflink_max_extents(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(REFLINK_MAX_EXTENTS)
+}
+
 /// Whether a base disk of `extents` extents (None: not counted) is cheaper to reflink than
-/// to snapshot as a subvolume.
-fn reflink_is_cheaper(extents: Option<u64>) -> bool {
-    matches!(extents, Some(n) if n <= REFLINK_MAX_EXTENTS)
+/// to snapshot as a subvolume, at a limit of `limit` extents.
+fn reflink_is_cheaper(extents: Option<u64>, limit: u64) -> bool {
+    matches!(extents, Some(n) if n <= limit)
 }
 
 /// The extents a clone of `base_dir`'s disks would reflink: every file in it, the root disk
 /// and the extra disks, which the reflink path copies one by one. Counted up to one past
-/// [`REFLINK_MAX_EXTENTS`]; None when they cannot be counted.
-fn snapshot_disks_extents(base_dir: &Path) -> Option<u64> {
+/// `limit`; None when they cannot be counted.
+fn snapshot_disks_extents(base_dir: &Path, limit: u64) -> Option<u64> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(base_dir).ok()? {
         let entry = entry.ok()?;
@@ -74,7 +86,7 @@ fn snapshot_disks_extents(base_dir: &Path) -> Option<u64> {
             files.push(entry.path());
         }
     }
-    crate::storage::extents::extents_in_files_up_to(&files, REFLINK_MAX_EXTENTS).ok()
+    crate::storage::extents::extents_in_files_up_to(&files, limit).ok()
 }
 
 /// Create `path` as a btrfs subvolume, or as an ordinary directory where that
@@ -413,16 +425,17 @@ impl DiskManager {
         // REFLINK_MAX_EXTENTS extents is reflinked below instead. The snapshot
         // becomes this VM's disk directory, with the base disk renamed to the
         // rootfs name; the extra disks it carried are already in place.
+        let limit = reflink_max_extents(std::env::var(REFLINK_MAX_EXTENTS_ENV).ok().as_deref());
         let base_extents = self
             .base_rootfs
             .parent()
             .filter(|d| is_snapshot_disk_subvolume(d))
-            .and_then(snapshot_disks_extents);
+            .and_then(|d| snapshot_disks_extents(d, limit));
         if let Some(base_dir) = self
             .base_rootfs
             .parent()
             .filter(|d| is_snapshot_disk_subvolume(d))
-            .filter(|_| !reflink_is_cheaper(base_extents))
+            .filter(|_| !reflink_is_cheaper(base_extents, limit))
         {
             let started = std::time::Instant::now();
             match self.snapshot_base_subvolume(base_dir, &disk_path).await {
@@ -1136,21 +1149,31 @@ mod snapshot_dir_tests {
     /// one whose extents could not be counted, gets the subvolume snapshot.
     #[test]
     fn a_disk_with_few_extents_is_reflinked() {
-        assert!(reflink_is_cheaper(Some(0)));
-        assert!(reflink_is_cheaper(Some(684)));
-        assert!(reflink_is_cheaper(Some(REFLINK_MAX_EXTENTS)));
-        assert!(!reflink_is_cheaper(Some(REFLINK_MAX_EXTENTS + 1)));
-        assert!(!reflink_is_cheaper(None));
+        let limit = REFLINK_MAX_EXTENTS;
+        assert!(reflink_is_cheaper(Some(0), limit));
+        assert!(reflink_is_cheaper(Some(684), limit));
+        assert!(reflink_is_cheaper(Some(limit), limit));
+        assert!(!reflink_is_cheaper(Some(limit + 1), limit));
+        assert!(!reflink_is_cheaper(None, limit));
+        // the override: a number replaces the limit, anything else leaves it
+        assert_eq!(reflink_max_extents(None), REFLINK_MAX_EXTENTS);
+        assert_eq!(reflink_max_extents(Some("0")), 0);
+        assert_eq!(reflink_max_extents(Some(" 12\n")), 12);
+        assert_eq!(reflink_max_extents(Some("many")), REFLINK_MAX_EXTENTS);
+        assert!(!reflink_is_cheaper(
+            Some(684),
+            reflink_max_extents(Some("0"))
+        ));
         let source = include_str!("disk.rs");
         let create = &source[source.find("pub async fn create_cow_disk").unwrap()..];
         let subvolume = create.find("if let Some(base_dir) = self").unwrap();
         assert!(
-            create[subvolume..subvolume + 260].contains("!reflink_is_cheaper(base_extents)"),
+            create[subvolume..subvolume + 260].contains("!reflink_is_cheaper(base_extents, limit)"),
             "create_cow_disk takes the subvolume snapshot only for disks not cheaper to reflink"
         );
         // the count covers every disk the reflink path would copy, the extra disks too
         assert!(
-            create[..subvolume].contains(".and_then(snapshot_disks_extents)"),
+            create[..subvolume].contains(".and_then(|d| snapshot_disks_extents(d, limit))"),
             "the reflink decision counts the snapshot's extra disks as well as its root disk"
         );
     }
