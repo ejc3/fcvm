@@ -59,5 +59,11 @@ class Bookkeeping(unittest.TestCase):
         self.assertEqual(summary([0, 1, 3, 2], failed=[2], reason="colour"), 1000, "seq 3 is past a failed catch")
         self.assertEqual(summary([0, 1, 3], reason="timeout"), 1000, "seq 3 is past a missing catch")
 
+    def test_a_burst_compares_only_trials_whose_sleeps_are_its_own(self):
+        # each trial sleeps the VMs the trial before woke: with two arms, trials 0 and 1 are
+        # arm 0, 2 and 3 arm 1; trial 2 sleeps arm 0's VMs, so only 1 and 3 are compared
+        self.assertEqual([pb.burst_arm(i, 2) for i in range(5)],
+                         [(0, False), (0, True), (1, False), (1, True), (0, False)])
+
 if __name__ == "__main__":
     unittest.main()
