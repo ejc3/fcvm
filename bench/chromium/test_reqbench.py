@@ -42,6 +42,7 @@ sys.path.insert(0, HERE)
 REPO_ROOT = os.path.dirname(os.path.dirname(HERE))
 
 import campaign_summary  # noqa: E402
+import records  # noqa: E402
 import reqanalyze  # noqa: E402
 import reqbench  # noqa: E402
 from unittest import mock as _subreaper_mock  # noqa: E402
@@ -8138,6 +8139,8 @@ class DocLint(unittest.TestCase):
                               capture_output=True, text=True, check=True).stdout.strip()
         tracked = subprocess.run(["git", "ls-files"], cwd=root, capture_output=True,
                                  text=True, check=True).stdout.split()
+        # A raw record kept in ejc3/fcvm-bench-records is listed by its manifest.
+        tracked += records.listed()
         here_rel = os.path.relpath(HERE, root)
         bad = []
         for name in ("AGENTS.md", "REVIEW.md"):
@@ -8213,11 +8216,14 @@ class DocLint(unittest.TestCase):
     def _committed_results(self):
         """Basenames of the committed results entries, and the committed
         files under each, from git ls-files (a directory on disk but not
-        in git is not a record)."""
+        in git is not a record) and the manifests of the raw records kept
+        in ejc3/fcvm-bench-records."""
         out = subprocess.run(["git", "ls-files", "--", "results"], cwd=HERE,
                              capture_output=True, text=True, check=True).stdout
+        moved = [os.path.relpath(os.path.join(records.REPO, p), HERE)
+                 for p in records.listed("bench/chromium/results/")]
         files = {}
-        for path in out.split():
+        for path in out.split() + moved:
             parts = path.split("/")
             if len(parts) < 2:
                 continue
@@ -8237,10 +8243,9 @@ class DocLint(unittest.TestCase):
 
     def _cell_urls(self, run):
         path = os.path.join(self._results(), run, "analysis.json")
-        if not os.path.isfile(path):
+        if not records.exists(path):
             return None
-        with open(path) as f:
-            cell = json.load(f).get("cell") or {}
+        cell = records.read_json(path).get("cell") or {}
         return [u.strip() for u in str(cell.get("url") or "").split(",") if u.strip()]
 
     def _needs_resolver(self, run):
@@ -8411,14 +8416,13 @@ class DocLint(unittest.TestCase):
 
     def _check_committed_run(self, run, seen):
         results = self._results()
-        curated = sorted(
-            p for p in os.listdir(os.path.join(results, run))
-            if re.fullmatch(r"cpuprobe-.*-curated\.json", p)
-        ) if os.path.isdir(os.path.join(results, run)) else []
+        names = set(os.listdir(os.path.join(results, run))) if os.path.isdir(os.path.join(results, run)) else set()
+        names |= {os.path.basename(p) for p in records.listed(f"bench/chromium/results/{run}/")}
+        curated = sorted(p for p in names if re.fullmatch(r"cpuprobe-.*-curated\.json", p))
         if curated:
             for entry in curated:
-                with open(os.path.join(results, run, entry)) as f:
-                    source = os.path.basename(str(json.load(f).get("source_run") or ""))
+                record = records.read_json(os.path.join(results, run, entry))
+                source = os.path.basename(str(record.get("source_run") or ""))
                 if source in os.listdir(results) and self._is_withdrawn(source) \
                         and not self._is_withdrawn(run):
                     return [f"results/{run}/{entry}: source_run results/{source} is "
@@ -8490,8 +8494,7 @@ class DocLint(unittest.TestCase):
                 bad.append(f"{name}: results/{token} generated_from names "
                            f"results/{run}/{rel}, not committed")
                 continue
-            with open(committed, "rb") as f:
-                digest = hashlib.sha256(f.read()).hexdigest()
+            digest = hashlib.sha256(records.read_bytes(committed)).hexdigest()
             if digest != entry.get("sha256"):
                 bad.append(f"{name}: results/{token} generated_from sha256 for "
                            f"results/{run}/{rel} does not match the committed file")
@@ -8527,8 +8530,7 @@ class DocLint(unittest.TestCase):
         run's analysis.json. The means are the CPU figures (request_cpu_ms),
         which the analyzer publishes as a mean with its interval."""
         values = set()
-        with open(os.path.join(self._results(), run, "analysis.json")) as f:
-            analysis = json.load(f)
+        analysis = records.read_json(os.path.join(self._results(), run, "analysis.json"))
 
         def walk(node):
             if isinstance(node, dict):
@@ -8551,15 +8553,14 @@ class DocLint(unittest.TestCase):
         which reads them out of the clone logs) joined to reqbench.jsonl by
         record_id. A run without the file contributes nothing."""
         path = os.path.join(self._results(), run, "restore-ack.jsonl")
-        if not os.path.isfile(path):
+        if not records.exists(path):
             return set()
-        with open(path) as f:
-            acks = [json.loads(line) for line in f if line.strip()][1:]
+        acks = [json.loads(line) for line in records.read_text(path).splitlines() if line.strip()][1:]
         by_id = {a["record_id"]: a["restore_ack"] for a in acks}
-        with open(os.path.join(self._results(), run, "reqbench.jsonl")) as f:
-            records = [json.loads(line) for line in f if line.strip()][1:]
+        rows = [json.loads(line) for line in records.read_text(
+            os.path.join(self._results(), run, "reqbench.jsonl")).splitlines() if line.strip()][1:]
         samples = {}
-        for r in records:
+        for r in rows:
             if r.get("warmup") is not False or not r.get("ok"):
                 continue
             ack = by_id.get(r.get("record_id")) or {}
@@ -8586,10 +8587,9 @@ class DocLint(unittest.TestCase):
         headline = set()
         everything = set()
         path = os.path.join(self._results(), run, "analysis.json")
-        if not os.path.isfile(path):
+        if not records.exists(path):
             return headline, everything
-        with open(path) as f:
-            analysis = json.load(f)
+        analysis = records.read_json(path)
         for arm, group in (analysis.get("arms") or {}).items():
             if arm == "noop":
                 continue
@@ -8613,7 +8613,7 @@ class DocLint(unittest.TestCase):
         for run in sorted(self._committed_results()):
             if not run.startswith("reqbench-") or not self._is_withdrawn(run):
                 continue
-            if not os.path.isfile(os.path.join(self._results(), run, "analysis.json")):
+            if not records.exists(os.path.join(self._results(), run, "analysis.json")):
                 continue
             runs.append(run)
             h, e = self._blocking_values(run)
@@ -9025,16 +9025,15 @@ class DocLint(unittest.TestCase):
         out = []
         for run in self._verified_runs():
             path = os.path.join(self._results(), run, "reqbench.jsonl")
-            if not os.path.isfile(path):
+            if not records.exists(path):
                 continue
-            with open(path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    record = json.loads(line)
-                    if record.get("arm") == "cdp" and record.get("ok"):
-                        out.append((run, record.get("render", {})))
+            for line in records.read_text(path).splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                if record.get("arm") == "cdp" and record.get("ok"):
+                    out.append((run, record.get("render", {})))
         return out
 
     def test_the_measured_operation_is_the_screenshot_operation_the_records_hold(self):
@@ -9112,8 +9111,7 @@ class DocLint(unittest.TestCase):
                          "the comparator lost its HTML-extraction rows")
         wall, cpu = set(), set()
         for run in self._verified_runs():
-            with open(os.path.join(self._results(), run, "analysis.json")) as f:
-                arm = json.load(f)["arms"].get("html-fast")
+            arm = records.read_json(os.path.join(self._results(), run, "analysis.json"))["arms"].get("html-fast")
             if not arm:
                 continue
             wall.add(arm["blocking_ms"]["median"])

@@ -10,6 +10,11 @@
 # negations below can take effect.
 results/**
 !results/**/
+# A campaign's raw records (the large files below) are kept in
+# ejc3/fcvm-bench-records, each listed with its size and sha256 in
+# results/records-<campaign>.json (records.py). test_records_cap.py fails a
+# committed record over records.CAP_BYTES.
+!results/records-*.json
 !results/**/analysis.json
 # analysis_identity.inputs names these exact bytes. A published analysis without
 # its reqbench input can be read but cannot be recomputed or checked by compare.py.

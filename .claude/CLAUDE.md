@@ -1029,6 +1029,10 @@ then on "Custom firecracker not found", because a hand-rolled runner called
 - Structural pin: `MakefileBenchGraph` in bench/chromium/test_reqbench.py
   (`make test-chromium-request`) — it fails if the dependency graph or the
   no-rebuild property of the measured phases regresses.
+- Raw records (per-request logs, `analysis.json`, server logs, traces) go to
+  `ejc3/fcvm-bench-records`, listed in `results/records-<campaign>.json` by
+  `bench/chromium/records.py`; commit only summaries, since
+  `test_records_cap.py` fails any committed record over 512 KiB.
 
 ## NEVER ROUTE AROUND BUILD PROCESSES
 

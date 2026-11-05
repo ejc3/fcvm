@@ -1,0 +1,19 @@
+{
+ "campaign": "20260813",
+ "fcvm_commit": "7c62d33299e952e44f9995077ebf20b6d8d7bdd1",
+ "files": [
+  {
+   "path": "bench/chromium/results/reqbench-20260813-234548-uffd/analysis.json",
+   "sha256": "734e7c424277ceeadc3a267c04911d0deeba37f2feba58f1ce871ef836ab3b33",
+   "size": 2198959
+  },
+  {
+   "path": "bench/chromium/results/reqbench-20260813-235446-uffd/analysis.json",
+   "sha256": "2a161d9e3d1eab4ebb25ae3a894651cdfc3538db40eba6feba673299e3920174",
+   "size": 2199918
+  }
+ ],
+ "records_commit": "078f1a3d0b0f5ad8f3e5cfb3d12f67bc47a1aa18",
+ "repository": "ejc3/fcvm-bench-records",
+ "schema": 1
+}
