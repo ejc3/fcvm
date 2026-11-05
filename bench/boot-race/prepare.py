@@ -179,13 +179,14 @@ def ecs_host(cfg, s):
         time.sleep(5)
     else:
         raise SystemExit("container instance never registered")
-    race.log("container instance registered; pulling the image with one task")
-    t = ecs.run_task(cluster="boot-race", taskDefinition="boot-race-ec2", launchType="EC2", count=1)
-    arn = t["tasks"][0]["taskArn"]
+    race.log("container instance registered; pulling the image with one task through the launcher")
+    lane = race.Ecs(cfg)
+    launch, _ = lane.run({"lane": "ec2", "instance": cfg["ecs_host_instance"]})
+    arn = launch.out["task_arn"]
     try:
         cfg.setdefault("identities", {})["ecs-ec2"] = wait_answer(cfg["ecs_host_ip"])
     finally:
-        ecs.stop_task(cluster="boot-race", task=arn, reason="warm-up done")
+        lane.stop(arn)
         ecs.get_waiter("tasks_stopped").wait(cluster="boot-race", tasks=[arn])
     race.log("ECS host warm")
 
