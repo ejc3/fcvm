@@ -30,8 +30,9 @@ t1 for every lane: a GET from the campaign host has read a complete `200` answer
   instances and the ECS container instance, and cleans up.
 - `race.py`: the campaign. Each round runs every lane once; the order rotates by one lane per round. Samples are
   appended to `samples.jsonl` as they are taken, failures included.
-- `render.py`, `page.html`: build `docs/boot-race.html` from the records; `render.py` refuses data holding instance,
-  image or account ids, ARNs or IPv4 addresses.
+- `render.py`, `page.html`: build `docs/boot-race.html` from the records; `render.py` refuses page data holding instance,
+  image or account ids, ARNs or addresses. The raw samples and REPORT lines go to ejc3/fcvm-bench-records with
+  errors scrubbed; `bench/boot-race/results/records-<campaign>.json` lists them.
 
 ## Running a campaign
 
@@ -46,7 +47,10 @@ for step in image lambda ami instances ecs-host; do python3 bench/boot-race/prep
 python3 bench/boot-race/race.py --config cfg.json run --rounds 10 --first-round 0   # repeat with fresh credentials
 python3 bench/boot-race/race.py --config cfg.json reports                           # Lambda REPORT lines
 python3 bench/boot-race/prepare.py --config cfg.json cleanup
-python3 bench/boot-race/render.py $RESULTS                                          # writes docs/boot-race.html
+python3 bench/boot-race/render.py $RESULTS --records-out bench/boot-race/results/$CAMPAIGN  # page + scrubbed records
+git add bench/boot-race/results/$CAMPAIGN      # staged, never committed: records.py moves them out
+python3 bench/chromium/records.py move --campaign $CAMPAIGN --records $RECORDS bench/boot-race/results/$CAMPAIGN
+python3 bench/chromium/records.py manifest --campaign $CAMPAIGN --records $RECORDS bench/boot-race/results/$CAMPAIGN
 ```
 
 `make test-boot-race` runs the workload's and the renderer's tests.

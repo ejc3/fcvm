@@ -76,7 +76,7 @@ FORBIDDEN = [
     re.compile(r"lambda-url|amazonaws\.com"),
     re.compile(r"\b[0-9a-f]{1,4}(?::[0-9a-f]{0,4}){2,7}\b", re.I),
     re.compile(r"\bami-[0-9a-f]{8,17}\b"),
-    re.compile(r"\b\d{12}\b"),
+    re.compile(r"(?<![\w-])\d{12}(?![\w-])"),
     re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
     re.compile(r"arn:aws:"),
 ]
@@ -88,7 +88,7 @@ SCRUB = [
     (re.compile(r"arn:aws:\S+"), "<arn>"),
     (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"), "<id>"),
     (re.compile(r"https?://\S+"), "<url>"),
-    (re.compile(r"\b\d{12}\b"), "<account>"),
+    (re.compile(r"(?<![\w-])\d{12}(?![\w-])"), "<account>"),
 ]
 
 
@@ -195,8 +195,38 @@ def build(results):
     return data
 
 
-def check_public(text):
-    for rx in FORBIDDEN:
+# The campaign's raw records go to the public records repository: random per-process and per-request ids may stay,
+# addresses and resource or account ids may not.
+FORBIDDEN_IN_RECORDS = [FORBIDDEN[i] for i in (0, 3, 4, 5, 6, 7, 8)]
+
+
+def public_records(results, out):
+    """Write the campaign's samples and REPORT lines for the records repository, errors scrubbed, and check them."""
+    os.makedirs(out, exist_ok=True)
+    lines = []
+    with open(os.path.join(results, "samples.jsonl")) as f:
+        for line in f:
+            if line.strip():
+                r = json.loads(line)
+                if "error" in r:
+                    r["error"] = scrub(r["error"])
+                lines.append(json.dumps(r, sort_keys=True))
+    files = {"samples.jsonl": "\n".join(lines) + "\n"}
+    rp = os.path.join(results, "lambda-reports.json")
+    if os.path.exists(rp):
+        with open(rp) as f:
+            files["lambda-reports.json"] = json.dumps(json.load(f), indent=1, sort_keys=True) + "\n"
+    with open(os.path.join(results, "setup.json")) as f:
+        files["setup.json"] = json.dumps(json.load(f), indent=1) + "\n"
+    for name, text in files.items():
+        check_public(text, FORBIDDEN_IN_RECORDS)
+        with open(os.path.join(out, name), "w") as f:
+            f.write(text)
+    return sorted(files)
+
+
+def check_public(text, patterns=None):
+    for rx in (FORBIDDEN if patterns is None else patterns):
         m = rx.search(text)
         if m:
             raise SystemExit(f"refusing to write: the page data holds {m.group(0)!r} ({rx.pattern})")
@@ -206,7 +236,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("results")
     ap.add_argument("--out", default=os.path.join(HERE, "..", "..", "docs", "boot-race.html"))
+    ap.add_argument("--records-out", help="also write the scrubbed raw records here (bench/boot-race/results/<campaign>)")
     a = ap.parse_args()
+    if a.records_out:
+        print("records:", public_records(a.results, a.records_out), file=sys.stderr)
     data = build(a.results)
     blob = json.dumps(data, separators=(",", ":"))
     check_public(blob)

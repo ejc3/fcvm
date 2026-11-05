@@ -94,6 +94,26 @@ class Public(unittest.TestCase):
             self.assertNotIn("/*BOOT_RACE_DATA*/", html)
             self.assertIn('"fcvm-file"', html)
 
+    def test_public_records_scrub_errors_and_keep_random_ids(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+            recs = [sample("lambda-cold", 0, 1, 120.0, request_id="0b6a2c1e-1111-2222-3333-444455556666"),
+                    {"lane": "ec2-start", "round": 0, "ok": False, "t_attempt_unix_ms": 5,
+                     "error": "TimeoutError: no answer from 10.12.1.7:8080 for i-0123456789abcdef0"}]
+            write_results(d, recs, {"0b6a2c1e-1111-2222-3333-444455556666": {"init_duration": "30 ms"}})
+            names = render.public_records(d, out)
+            self.assertEqual(names, ["lambda-reports.json", "samples.jsonl", "setup.json"])
+            with open(os.path.join(out, "samples.jsonl")) as f:
+                text = f.read()
+            self.assertNotIn("10.12.1.7", text)
+            self.assertNotIn("i-0123456789abcdef0", text)
+            self.assertIn("0b6a2c1e-1111-2222-3333-444455556666", text)
+
+    def test_public_records_refuse_an_unscrubbed_field(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+            write_results(d, [sample("ec2-launch", 0, 1, 9.0, note="launched i-0123456789abcdef0")])
+            with self.assertRaises(SystemExit):
+                render.public_records(d, out)
+
 
 if __name__ == "__main__":
     unittest.main()
