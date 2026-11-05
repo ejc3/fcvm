@@ -1198,6 +1198,20 @@ pub struct SnapshotCreateArgs {
     /// state it holds.
     #[arg(long, conflicts_with = "disk_only")]
     pub gpu_warm: bool,
+
+    /// Stop the VM after the snapshot: it stays paused once its memory and disks are saved,
+    /// is never resumed, and its fcvm process is sent SIGTERM (SIGKILL after 30 s); the
+    /// command returns once that process has exited. A VM put to sleep this way does nothing
+    /// after its snapshot, so nothing it does is lost when it is restored. The VM is stopped
+    /// also when the snapshot fails, since a failed snapshot can leave it paused. Firecracker
+    /// VMs only.
+    #[arg(long, conflicts_with_all = ["disk_only", "gpu_warm"])]
+    pub stop: bool,
+
+    /// The VM `--stop` pinned (internal): the create refuses any other, so a VM that took the
+    /// selector's name or PID after the pin is never snapshotted and left paused.
+    #[arg(skip)]
+    pub expect_vm_id: Option<String>,
 }
 
 #[derive(Args, Debug)]

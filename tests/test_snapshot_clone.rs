@@ -3542,6 +3542,113 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
     }
 }
 
+/// `snapshot create --stop` puts a VM to sleep: the source is never resumed after its
+/// snapshot, its fcvm has exited when the command returns, and the snapshot restores. The
+/// oracle for "never resumed" is the source's own Firecracker log, which fcvm copies at
+/// teardown: after its last snapshot request it holds no resume request. Without `--stop`
+/// the create resumes the source, and the log holds one.
+#[tokio::test]
+async fn test_snapshot_create_stop_never_resumes_the_source() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("stop");
+    let fcvm_path = common::find_fcvm_binary()?;
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning the VM")?;
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+    let ls = tokio::process::Command::new(&fcvm_path)
+        .args(["ls", "--json"])
+        .output()
+        .await
+        .context("fcvm ls")?;
+    let vms: Vec<serde_json::Value> =
+        serde_json::from_slice(&ls.stdout).context("fcvm ls --json")?;
+    let vm_id = vms
+        .iter()
+        .find(|v| v["pid"].as_u64() == Some(u64::from(baseline_pid)))
+        .and_then(|v| v["vm_id"].as_str())
+        .context("the VM is not in fcvm ls")?
+        .to_string();
+
+    let out = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+            "--stop",
+        ])
+        .output()
+        .await
+        .context("running snapshot create --stop")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "snapshot create --stop failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The fcvm is this test's child, so it stays a zombie until the test reaps it.
+    let state = std::fs::read_to_string(format!("/proc/{baseline_pid}/stat"))
+        .ok()
+        .and_then(|st| {
+            st.rsplit_once(')')
+                .map(|(_, rest)| rest.trim_start().chars().next())
+        })
+        .flatten();
+    anyhow::ensure!(
+        matches!(state, None | Some('Z') | Some('X')),
+        "the VM's fcvm {baseline_pid} is still running (state {state:?}) after snapshot create --stop returned"
+    );
+
+    // The source's Firecracker log, copied when its fcvm tore it down.
+    let log_path = format!("/tmp/fcvm-firecracker-{vm_id}.log");
+    let log = std::fs::read_to_string(&log_path).with_context(|| format!("reading {log_path}"))?;
+    let lines: Vec<&str> = log.lines().collect();
+    let saved = lines
+        .iter()
+        .rposition(|l| l.contains("snapshot' API request took"))
+        .context("the Firecracker log has no snapshot request, so the check cannot fire")?;
+    let resumed: Vec<&&str> = lines[saved..]
+        .iter()
+        .filter(|l| l.contains("'resume vm' API request took"))
+        .collect();
+    anyhow::ensure!(
+        resumed.is_empty(),
+        "the source was resumed after its snapshot: {resumed:?}"
+    );
+
+    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &snapshot_name,
+            "--name",
+            &clone_name,
+        ],
+        &clone_name,
+    )
+    .await
+    .context("restoring the snapshot")?;
+    common::poll_health_by_pid(clone_pid, 120).await?;
+    let echoed = common::exec_in_vm(clone_pid, &["echo", "AWAKE_AGAIN"]).await;
+    common::kill_process(clone_pid).await;
+    anyhow::ensure!(
+        echoed?.contains("AWAKE_AGAIN"),
+        "the restored VM did not run a command"
+    );
+    Ok(())
+}
+
 /// `snapshot run --map HOST:GUEST` serves a directory the snapshot mapped from another host
 /// directory. The baseline maps one directory at /data; its clone, given another at the same
 /// guest path, reads the other directory's file through the mount the guest made at boot.

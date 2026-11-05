@@ -237,6 +237,9 @@ impl CloneSetupResources {
 /// Main dispatcher for snapshot commands
 pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
     match args.cmd {
+        SnapshotCommands::Create(create_args) if create_args.stop => {
+            cmd_snapshot_create_and_stop(create_args).await
+        }
         SnapshotCommands::Create(create_args) => cmd_snapshot_create(create_args).await,
         SnapshotCommands::Serve(serve_args) => cmd_snapshot_serve(serve_args).await,
         SnapshotCommands::Run(run_args) => cmd_snapshot_run(*run_args).await,
@@ -769,6 +772,97 @@ fn inherit_working_set(
     Ok((inherited.len(), inherited.bytes()))
 }
 
+/// How long `snapshot create --stop` waits for the VM's fcvm to exit after SIGTERM before
+/// it sends SIGKILL.
+const STOP_GRACE: Duration = Duration::from_secs(30);
+
+/// Sends SIGTERM to the watched process when dropped while armed: `--stop`'s source is
+/// stopped also when the create unwinds.
+struct StopOnDrop<'a> {
+    watch: &'a crate::utils::ProcessWatch,
+    armed: bool,
+}
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.watch.signal(libc::SIGTERM);
+        }
+    }
+}
+
+/// `snapshot create --stop`: the snapshot with the source left paused, then the source's
+/// fcvm stopped, also when the snapshot failed. The fcvm process is pinned with a pidfd
+/// before the snapshot, so the signals reach that process and never one that reused its PID.
+async fn cmd_snapshot_create_and_stop(args: SnapshotCreateArgs) -> Result<()> {
+    let state_manager = StateManager::new(paths::state_dir());
+    let vm_state = load_snapshot_create_target(&state_manager, &args)
+        .await
+        .context("loading VM state")?;
+    anyhow::ensure!(
+        matches!(
+            vm_state.config.hypervisor,
+            crate::hypervisor::Backend::Firecracker
+        ),
+        "--stop needs a Firecracker VM"
+    );
+    let pid = vm_state
+        .pid
+        .context("the VM's state names no fcvm process to stop")?;
+    anyhow::ensure!(
+        crate::state::owner_is_live(&vm_state),
+        "the VM's fcvm process {pid} is not running"
+    );
+    let mut watch = crate::utils::ProcessWatch::open(pid)?
+        .with_context(|| format!("the VM's fcvm process {pid} exited"))?;
+    anyhow::ensure!(
+        vm_state.pid_start_time.is_none()
+            || crate::utils::process_start_time(pid) == vm_state.pid_start_time,
+        "PID {pid} is no longer the VM's fcvm process"
+    );
+    // From here the VM may be paused, so it is stopped on every way out, a panic included
+    // (a print to a closed stdout panics while the source is still paused).
+    let guard = StopOnDrop {
+        watch: &watch,
+        armed: true,
+    };
+    let mut args = args;
+    args.expect_vm_id = Some(vm_state.vm_id.clone());
+    let created = cmd_snapshot_create(args).await;
+    let mut guard = guard;
+    guard.armed = false;
+    drop(guard);
+    let started = std::time::Instant::now();
+    if let Err(e) = watch.signal(libc::SIGTERM) {
+        if e.raw_os_error() != Some(libc::ESRCH) {
+            return created.and(Err(e).context("sending SIGTERM to the VM's fcvm"));
+        }
+    }
+    let killed = tokio::time::timeout(STOP_GRACE, watch.exited())
+        .await
+        .is_err();
+    if killed {
+        warn!(
+            pid,
+            grace_secs = STOP_GRACE.as_secs(),
+            "the VM's fcvm did not exit after SIGTERM; sending SIGKILL"
+        );
+        let _ = watch.signal(libc::SIGKILL);
+        watch.exited().await;
+    }
+    let stop_ms = started.elapsed().as_secs_f64() * 1000.0;
+    info!(
+        pid,
+        stop_ms = (stop_ms * 10.0).round() / 10.0,
+        killed,
+        "stopped the VM after its snapshot"
+    );
+    if created.is_ok() {
+        println!("VM stopped in {stop_ms:.0} ms (fcvm process {pid} exited).");
+    }
+    created
+}
+
 /// Create snapshot from running VM
 async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     use super::common::VSOCK_VOLUME_PORT_BASE;
@@ -785,6 +879,13 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     let vm_state = load_snapshot_create_target(&state_manager, &args)
         .await
         .context("loading VM state")?;
+    if let Some(pinned) = &args.expect_vm_id {
+        anyhow::ensure!(
+            &vm_state.vm_id == pinned,
+            "the selector now names VM {}, not the VM {pinned} that --stop pinned",
+            vm_state.vm_id
+        );
+    }
 
     // Fail fast: the disk-only capture path (freeze -> reflink -> unfreeze, no
     // memory dump) is dispatched below when args.disk_only is set.
@@ -1034,7 +1135,11 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                         &vsock_socket_path,
                         parent_dir.as_deref(),
                         inode_tables,
-                        super::common::SnapshotSourceDisposition::Resume,
+                        if args.stop {
+                            super::common::SnapshotSourceDisposition::LeavePaused
+                        } else {
+                            super::common::SnapshotSourceDisposition::Resume
+                        },
                     )
                 };
                 if args.gpu_warm {
@@ -1210,10 +1315,17 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             println!("    {}", snapshot_config.memory_path.display());
         }
         println!("    {}", snapshot_config.disk_path.display());
-        println!(
-            "\nOriginal VM '{}' has been resumed and is still running.",
-            vm_name
-        );
+        if args.stop {
+            println!(
+                "\nOriginal VM '{}' was left paused and is being stopped.",
+                vm_name
+            );
+        } else {
+            println!(
+                "\nOriginal VM '{}' has been resumed and is still running.",
+                vm_name
+            );
+        }
     }
 
     if let Some(published_memory) = published_memory {
@@ -4532,6 +4644,73 @@ async fn record_diff_parent(
 
 #[cfg(test)]
 mod tests {
+    /// `--stop` pins one VM: the wrapper hands the create the VM id it pinned before the
+    /// pidfd, and the create refuses any other right after it loads the selector's VM, before
+    /// it can pause anything. Without the check, a VM that took the selector's name or PID
+    /// between the two reads would be snapshotted and left paused while the wrapper stops the
+    /// first one (Codex review of the potato stack).
+    #[test]
+    fn stop_snapshots_only_the_vm_it_pinned() {
+        let source = include_str!("snapshot.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let body = |sig: &str| {
+            let b = &code[code.find(sig).unwrap()..];
+            b[..b.find("\n}\n").unwrap()].to_string()
+        };
+        let wrapper = body("async fn cmd_snapshot_create_and_stop(");
+        let pinned = wrapper
+            .find("args.expect_vm_id = Some(vm_state.vm_id.clone());")
+            .expect("the wrapper hands the create the VM it pinned");
+        assert!(pinned < wrapper.find("cmd_snapshot_create(args).await").unwrap());
+        let create = body("async fn cmd_snapshot_create(");
+        let checked = create
+            .find("if let Some(pinned) = &args.expect_vm_id {")
+            .expect("the create checks the pinned VM");
+        assert!(
+            checked < create.find("ensure_gpu_snapshot_mode(").unwrap(),
+            "before anything is done to the VM"
+        );
+    }
+
+    /// The guard sends SIGTERM when it is dropped armed, as it is when the create unwinds (a
+    /// print to a closed stdout panics while `--stop`'s source is paused), and nothing when
+    /// disarmed.
+    #[tokio::test]
+    async fn stop_on_drop_stops_the_vm_when_the_create_unwinds() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut watch = crate::utils::ProcessWatch::open(child.id())
+            .unwrap()
+            .unwrap();
+        {
+            let disarmed = super::StopOnDrop {
+                watch: &watch,
+                armed: false,
+            };
+            drop(disarmed);
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a disarmed guard sends nothing"
+        );
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = super::StopOnDrop {
+                watch: &watch,
+                armed: true,
+            };
+            panic!("stdout closed");
+        }));
+        assert!(unwound.is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(5), watch.exited())
+            .await
+            .expect("the process got SIGTERM");
+        let status = child.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+    }
+
     /// The VM's diff parent is cleared before the memory snapshot's save, and the create stops if
     /// that write fails: a create that failed after the save has consumed the dirty-page bitmap,
     /// and a diff over the old parent would miss the pages dirtied before it (CodeRabbit findings
