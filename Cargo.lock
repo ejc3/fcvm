@@ -888,6 +888,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fleet-potato"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

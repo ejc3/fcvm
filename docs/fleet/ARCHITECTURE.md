@@ -1649,6 +1649,308 @@ Two things the browser showed wrong in the mirror, both fixed in `app/_wall/mirr
     `open_browser` and `open_app` actions, the phone web proxy, and `make phone-test`'s checks.
     Then the mirror's drawing of it (#1485).
 
+## Potato mode
+
+Status: **design**, from measurements on a g4dn.metal launched from the fleet host image
+(2026-11-05). The owner, 2026-11-05: "a set of VMs, cpu only so fine, whenever they receive
+the item, they go to sleep and then wake up. State is maintained across sleep / wake by color
+or some such. If the thing that is being passed around goes fast enough or the sleep restore
+isn't fast enough / glitchy, the ball drops and the simulation restarts, sadly." Then: "It can
+go through a progression from 2 VM's and speed until they break until 96 VM's", "The ball
+physically has to pass to the next vm ... (Don't show the conductor)", and, choosing between
+a conductor that pings each VM and VMs that throw to each other, "thrower is better".
+
+### What a viewer sees
+
+- `?mode=potato` opens it; without the parameter the wall is unchanged.
+- **The ring.** Every player VM is a tile on a circle, filled with its colour. A tile is
+  bright while its VM runs, dim while it sleeps (no process exists for it), and shows a bar
+  filling while it wakes, labelled with the restore's milliseconds. The ball arcs from the
+  thrower's tile to the catcher's. Nothing on the page stands for the coordinator.
+- **The pace.** The hold (how long a player keeps the ball before it throws), the lap and the
+  ring's size, and a meter of the hold against the sleep-and-wake time it leaves a player.
+- **The ladder.** Rings of 2, 4, 8, 16, 32, 64 and 96 players. Each size reached shows its
+  record (the shortest hold that completed a lap) and what broke it. The current size and
+  pace are live. After 96 breaks, the ladder starts again at 2.
+- **The drop.** When the ball drops, a card names the player and the stage that was late,
+  with its milliseconds ("player 7 was still waking: restore 412 ms, listening 84 ms after the
+  ball's flight ended"), and the next round starts 5 s later.
+- **Records.** The fastest full sleep-and-wake hold and the longest round, kept with each
+  size's record in the coordinator's state file.
+- **Two buttons.** "Faster" shortens the current hold by a fifth; "Restart" starts the current
+  size again. Both are rate limited per client as the wall's buttons are.
+- **Zoom to a player** (a later PR of this stack). Clicking a tile zooms to it and opens a
+  direct connection to its VM, which serves its colour and catch counter live; the
+  connection drops while it sleeps.
+
+### The game
+
+A ring of N players, each a small CPU-only fcvm VM (`fleet/potato`: an alpine image holding
+one static program, 256 MiB, one vCPU, no GPU) at its own address,
+`<host prefix>::<0x1000 + player>` in fcvm's routed mode. The player program keeps three
+things in guest RAM and nowhere else: its colour (an index into a ring of 12), a catch counter
+and a hash chain over every ball it caught. Every player of a host is a clone of one snapshot
+of an unassigned player; the agent gives a new clone its number over its ball port, and the
+player then draws its first colour from the guest's random pool.
+
+1. **Catch.** The ball arrives over TCP from the previous player's VM, one JSON line:
+   `{round, seq, ring, hold_ms, shrink_permille, min_hold_ms, flight_ms, trail}`. The catcher
+   steps its colour forward one, increments its counter, extends its chain
+   (`sha256("fcvm-potato-v1" || chain || round || seq || colour)`), acknowledges the ball and
+   reports the catch with its new colour, counter and chain.
+2. **Throw.** After `hold_ms` it connects to the next address in `ring` and sends the ball
+   with its colour on the trail. Nothing relays the ball: the agent and the coordinator only
+   read reports. If the connection is refused or not answered, the thrower tries again every
+   2 ms until `flight_ms` has passed since the first try, then reports the ball dropped.
+   From the moment it throws until it is woken, a player refuses the ball: it is going to
+   sleep, and a ball it caught in the few milliseconds before the snapshot pauses it (or
+   the 1.8 s a slow btrfs commit can add) would be held by a VM that nobody wakes for it.
+   One ladder run stalled exactly that way. A catcher that gets the same ball twice (its
+   acknowledgement was lost and the thrower tried again) counts it once.
+3. **Sleep.** Once the ball has left, the agent puts the thrower to sleep with
+   `fcvm snapshot create --stop`: the VM is paused, saved, never resumed, and its fcvm
+   exits. A sleeping player holds no CPU and no memory, only its snapshot on the instance
+   store. Plain `snapshot create` resumes the VM it saved; a ball that reaches the player
+   between that resume and its teardown is caught by a VM whose state no snapshot holds,
+   and the catch is lost. The first ladder run lost one that way, and in the same window
+   another player threw a second time from the VM being stopped.
+4. **Wake.** Before the ball comes round again, the agent restores it
+   (`fcvm snapshot run --snapshot`). The restore retires the connections the snapshot held,
+   so the player's report connection fails, it connects again and says hello with the
+   colour, counter and chain it woke with. Once its ball port answers (fcvm's restore opens a
+   clone's inbound gate last), the agent tells it it woke, and from then on it catches. A
+   round that ends while a player holds the ball reaches that player first (`stop`): its
+   throw is abandoned and that round's balls are refused, so no snapshot holds a throw that
+   would resume in a later round.
+5. **Verify.** The coordinator replays the step from the last values it verified: a catch's
+   colour must be the last one plus one, its counter the last plus one, and its chain the
+   step of the last chain. A hello after a wake must equal what the player reported at its
+   last catch, or be one catch ahead of it when that catch's report is still on its way
+   (the hello names its last catch, and the step is checked from it). Any other difference
+   means a player's memory did not survive the sleep.
+6. **Pace.** Each round starts at a hold set for its size and shrinks it by a tenth every
+   lap, down to a floor, until the ball drops.
+
+The ball drops when the thrower's flight window runs out (the catcher was asleep, waking,
+or not yet accepting), when a proof does not match, when a wake fails, or when no catch is
+reported by the round's deadline (the report path is gone). A size's record is the shortest
+hold of a lap that completed; then the ring grows to the next size.
+
+**What sets the limit.** A player throws one hold after it caught and catches again N holds
+after that catch, so between its throw and its next catch it has (N - 1) holds to sleep, be
+torn down and wake: `sleep + teardown + wake <= (N - 1) x hold - margin`. A ring of 2 has
+one hold for the whole cycle; a ring of 96 has 95. Larger rings can go faster per hold, until
+the host can no longer run that many sleeps and wakes at once: at a hold of h ms, a host runs
+about `(sleep + teardown + wake) / h` of them concurrently.
+
+### Measured: one player's sleep and wake (2026-11-05)
+
+g4dn.metal (96 vCPU, instance-store btrfs), the fleet host image, fcvm at the image's
+commit (04915961; the third arm and the ladder with this stack's `snapshot create --stop`),
+Firecracker 1.17 (the default profile's fork), one session. One player at a time, 240 cycles
+in each arm, rotating over 4 players: ball in from the host, catch, throw to a host
+listener, sleep, wake. Every one of the 720 wakes returned the colour, counter and chain the
+player had before its sleep. `fleet/potato/bench/potatobench.py cycles` runs it;
+`summarize.py` prints the table; `fleet/potato/bench/results/2026-11-05-g4dn-metal.json`
+holds the summaries.
+
+| stage, ms | diff p50 | diff p99 | full p50 | full p99 |
+|---|---|---|---|---|
+| sleep: `fcvm snapshot create` | 203.8 | 1616.8 | 394.9 | 592.2 |
+| of which: close the guest's network gate, pause, save memory | 86.9 | 165.7 | 299.9 | 331.7 |
+| of which: pause (Firecracker) | 0.1 | 0.2 | 0.1 | 0.2 |
+| of which: memory save (Firecracker) | 63.5 | 141.8 | 281.4 | 308.5 |
+| of which: disk snapshot, resume, reopen the gate | 71.7 | 141.9 | 27.3 | 55.6 |
+| memory written per sleep (MiB) | 19.5 | 67.7 | 240.7 | 250.4 |
+| teardown (SIGTERM to fcvm's exit) | 108.8 | 146.7 | 107.5 | 138.8 |
+| wake: `fcvm snapshot run` to the ball port accepting | 326.1 | 383.0 | 196.3 | 294.1 |
+| of which: routed network setup | 102.9 | 133.1 | 105.4 | 132.4 |
+| of which: the clone's disk | 13.7 | 28.3 | 11.7 | 15.4 |
+| of which: Firecracker start and snapshot load | 9.4 | 17.4 | 9.2 | 21.2 |
+| of which: guest restore until fc-agent acknowledges | 194.4 | 225.5 | 63.9 | 161.0 |
+| the ball, VM to host (connect, send, acknowledgement) | 0.6 | 1.2 | 0.6 | 1.2 |
+| whole cycle, ball in to awake again | 647.6 | 2275.0 | 707.7 | 938.5 |
+
+"Diff" is fcvm's default: a restored VM tracks its dirty pages, and the next snapshot writes
+only those into a reflink of the previous memory file. "Full" restores with
+`--no-dirty-tracking`, so each snapshot writes the whole memory. The diff writes a twelfth
+of the bytes and sleeps in half the time, but its wake is 130 ms slower: the restored VM's
+first write to each page traps for KVM's dirty log, and the guest's restore path does a lot
+of first writes (fc-agent's acknowledgement came 217 ms after the resume with tracking on,
+84 ms with it off). Sleep, teardown and wake together: 639 ms p50 for diff, 702 ms for full.
+Potato uses diff; a diff written without KVM's dirty log is below, under "Cheaper sleep".
+
+The sleep the game uses is `snapshot create --stop` (below), measured as a third arm of 240
+diff cycles: sleep 256.9 ms p50 (398.6 p99), teardown 106.7 (141.3), wake 355.3 (1894.5),
+the whole cycle 728.2 (2321.6). Its log line splits the sleep: closing the guest's gate
+17.6 ms p50, pause 0.5, memory save 74.5, the disk 114.7, and the stop 106.7. That run's
+btrfs steps were slower than the first arm's (the disk step 115 ms against 72 at p50), after
+the 96-player run below had left many subvolumes to the cleaner, so the arms are not an A/B
+of `--stop`; it is in the game for correctness.
+
+**The tail is btrfs.** Five of the 240 diff cycles took 1.6 to 2.5 s, and two of the full.
+In each, one of the cycle's three btrfs subvolume snapshots waited 0.9 to 2.0 s for a
+transaction commit: the snapshot's staged copy of the previous snapshot (before the save),
+the snapshot's disk (while the VM is paused), or the clone's disk (during the wake). One ring
+at 2 players loses the ball to one such stall.
+
+### Measured: 96 players on one host
+
+The same host, 96 players booted at 8 at a time, then all put to sleep, then woken one at a
+time with the other 95 asleep (`potatobench.py memory`):
+
+| | processes | PSS of the players' process trees | host `MemAvailable` |
+|---|---|---|---|
+| before any player | 0 | 0 | 372.9 GiB |
+| 96 awake | 96 trees | 23.9 GiB | 348.7 GiB |
+| 96 asleep | 0 | 0 | 370.9 GiB |
+| 1 awake, 95 asleep (12 samples) | 1 tree | 133 to 140 MiB | 370.8 to 372.5 GiB |
+
+A sleeping player is two files on the instance store and nothing else. The awake player maps
+its memory file privately and faults in what it touches, so it holds 133 to 140 MiB of its
+256 MiB, against 255 MiB per player for one booted with `podman run`. The wake with 95
+asleep took 265 to 329 ms to the ball port accepting (12 wakes), the same as with 3 asleep.
+Sleeping 8 players at once took 650 ms p50 (1098 ms at most) instead of 204 ms, and their
+teardowns 195 ms: concurrent sleeps contend, which is the limit large rings meet.
+
+### Measured: the ladder
+
+The same host, the whole game with the bench playing the agent's part
+(`potatobench.py ladder`): 96 players booted, then each size from 2 to 96 played until the
+ball dropped, from a hold of `max(2000 / (size - 1), 250)` ms shrinking a tenth per lap, a
+100 ms flight window, and each sleeping player woken when the ball was its lead away. The
+ball went from VM to VM over the host's routes. Two runs of the same configuration in one
+session:
+
+| size | first run: record hold, ms | second run: record hold, ms | second run: dropped at, ms | second run: wake p50 / p99 in the round, ms | second run: sleep p50 / max, ms |
+|---|---|---|---|---|---|
+| 2 | 1458 | 777 | 630 | 347 / 371 | 349 / 944 |
+| 4 | 438 | 321 | 261 | 418 / 1907 | 383 / 2133 |
+| 8 | 257 | 285 | 232 | 455 / 725 | 661 / 1262 |
+| 16 | none (a bench defect, fixed) | 183 | 149 | 553 / 1277 | 1164 / 2317 |
+| 32 | 250 | 225 | 183 | 540 / 1633 | 943 / 2168 |
+| 64 | 250 | 250 | 225 | 627 / 1723 | 667 / 2812 |
+| 96 | 250 | 250 | 225 | 860 / 3439 | 833 / 5868 |
+
+The record is the shortest hold of a lap that completed; every round ended with the catcher
+still waking when the ball came. Two limits show:
+
+- **Small rings are set by the tail.** A ring of 2 has one hold for the whole cycle. The
+  second run's ring of 2 ran 11 laps down to 777 ms, about one sleep and one wake (349 ms
+  and 347 ms); the first run's dropped at 1182 ms because one sleep spent 808 ms waiting for
+  a btrfs commit before its pause.
+- **Large rings are set by the host.** From 16 players up, several players sleep and wake at
+  once, and each takes longer: sleeps of 0.7 to 1.2 s at the median and up to 5.9 s, against
+  0.26 s alone. The record stays between 183 and 250 ms whatever the size. Rings of 64 and
+  96 broke in their first or second lap at the 250 ms start, so their edge is above it.
+
+Turning btrfs subvolumes off for the cycle did not remove the tail. A build that made every
+snapshot and clone directory an ordinary directory, so that the cycle took reflinks only,
+ran 240 cycles with the sleep's setup at 1366 ms p99 and a clone's disk at 1771 ms at most,
+as with subvolumes, and its median disk steps were slower (the clone's disk 45.5 ms against
+30.8). The stall is the transaction commit, which reflinks wait on as well. That build is not
+part of this stack.
+
+### The starting pace
+
+Each size starts at `max(2000 / (size - 1), 400)` ms of hold and shrinks a tenth per lap
+(`PotatoConfig`), with a 2 ms floor and a 100 ms flight window:
+
+- A ring of 2 starts at 2000 ms, about three times the 700 ms one sleep and one wake take,
+  and reaches that edge in about ten laps (some 20 s) unless the tail ends it sooner.
+- From 8 players up the measured edge is near 180 to 285 ms, set by the host, so `2000 /
+  (size - 1)` would start below it; 400 ms starts each above its measured break and gives it
+  a few laps to find it. At 96 players a lap at 400 ms is 38 s.
+- The flight window is 100 ms: long enough for a thrower to retry a few times against a
+  catcher that is opening its port, short enough that a ball is not caught by a player
+  restored long after its turn.
+
+### Components
+
+- **The player** (`fleet/potato`): the program above, a static musl binary in an alpine image
+  (`make potato-image`). It also answers a `probe` on its ball port with its colour and
+  counter, which is how the agent learns a woken player accepts connections.
+- **The agent** (`fcvm fleet agent --potato-players N`): runs the host's players. It reads
+  every player's reports on `127.0.0.1:7071` (each VM forwards that port to the host), puts
+  a player to sleep once it has thrown, and wakes each sleeping player when the ball is
+  `lead` catches away, `lead` being the slowest of its recent wakes plus a margin, in holds.
+  A finished sleep checks the lead again. It serves a new round's first ball to its first
+  player, the only time the ball leaves anything but a player. Every report goes to the
+  coordinator with the host's timestamps and the stage timings of the sleep or wake it
+  ends. All players are clones of one snapshot of an unassigned player, so a new player is
+  a restore rather than a boot; the agent tells each its number over its ball port.
+- **The coordinator.** The game is part of `fleet_core::apply`: the agent's reports and a
+  `tick` carrying the time are events, so drops, deadlines and records replay. It sends the
+  agent a desired round (number, ring, starting hold, shrink, floor, flight window), which
+  the agent reconciles like a slot assignment. The ladder, each size's record and the
+  overall records are in the state file; a round in progress is not, and a restarted
+  coordinator starts a new round at the size it was on.
+- **The page.** A view model in `fleet/web/core` from the `/live` snapshot's `potato`
+  section, the mock coordinator's potato game, the ring, the ladder and the drop card,
+  and Playwright tests on desktop and phone layouts.
+
+### Invariants (each becomes a test)
+
+1. A woken player's hello holds the colour, counter and chain it reported at its last catch,
+   or those stepped by exactly one catch whose report is still on its way (its hello names
+   that catch's round and seq).
+2. Every catch's colour, counter and chain are the step of the last verified ones; a
+   mismatch drops the ball and names the player.
+3. A player is woken only after its previous fcvm has exited, and is never in two VMs.
+4. A player does nothing after its snapshot: the sleep leaves it paused and stops it
+   (`snapshot create --stop`; its test reads the source's Firecracker log for a resume).
+5. The ball passes only from player to player, apart from a round's first throw by the agent.
+6. A sleeping player has no process on the host.
+7. The game is replayable: the same events give the same drops, records and state.
+8. Each size's record and the overall records survive a coordinator restart.
+9. The ball drops on each of: the flight window running out, a proof mismatch, a failed wake
+   and a missed deadline.
+10. "Faster" never shortens the hold below the floor, and both buttons are rate limited.
+11. A player that has thrown refuses the ball until the agent wakes it; a repeated ball counts
+    once; a stopped round's throw is abandoned; a connection that sends nothing never holds
+    up the ball (`fleet/potato/tests/player.rs`).
+
+### Failure states
+
+| failure | what happens |
+|---|---|
+| the catcher is not accepting when the ball arrives | the thrower retries within `flight_ms`, then reports the drop; the agent reports when the catcher did start accepting |
+| a woken player's hello does not match | the ball is dropped as a proof mismatch naming the player; the coordinator takes what it reported as its state from then on |
+| `fcvm snapshot create` or `snapshot run` fails | the round ends with a failed sleep or wake naming the player; the player is booted fresh |
+| no catch reported by the deadline | the round ends as a missed deadline; the agent sleeps every awake player, so a ball still in the air drops |
+| the agent disconnects | the round ends; the agent stops every player's VM, as it stops slots |
+| the coordinator restarts | the agent's round is replaced by a new one at the same size; records stay |
+| the fleet sleeps | the host goes with it; the next host boots new players (new colours) and the ladder continues from its size |
+
+### Cheaper sleep
+
+Measured above, and each a later PR of this stack, to be measured on the ring:
+
+- **A diff without the dirty log.** A restore maps the memory file `MAP_PRIVATE`, so every
+  page the guest wrote since is an anonymous page of that mapping. Firecracker could read
+  the written set from `/proc/self/pagemap` instead of KVM's dirty log, which would keep
+  the diff's 20 MiB writes and give the wake back the 130 ms the dirty log costs.
+- **No btrfs commit in the cycle.** Reflinks instead of subvolumes did not help (above); what
+  would is keeping the commit out of the sleep's path: the snapshots of the players on a
+  filesystem of their own, or the memory written somewhere a commit does not wait on.
+- **Keep the network across a sleep.** The routed network costs 103 ms of the wake and
+  46 ms of the teardown, and a player's address never changes.
+
+### Stack of PRs
+
+1. This design, the player program and the measurement harness (`fleet/potato`).
+2. fcvm: `snapshot create --stop`, and one log line with the snapshot boundary's step times
+   (prepare, pause, save, disk, resume), which the agent reports in a drop's breakdown.
+3. Agent: `--potato-players`, the player snapshot, sleep and wake, reports.
+4. Coordinator: the game in `fleet_core::apply`, its test vectors, the agent messages and
+   the `potato` section of the snapshot (fleet/PROTOCOL.md).
+5. Web: `?mode=potato`, the mock coordinator's game, the view and the e2e tests.
+6. ejc3/aws: the host image with the player image.
+7. Cheaper sleep, above, one PR each, measured on the ring.
+8. Zoom to a player: a server in the player VM for viewers, apart from the ball's port,
+   handled only after a catch; the viewer cap set by measuring the wake with 0, 10, 100 and
+   1000 viewers reconnecting at once.
+
 ## Invariants (each becomes a test)
 
 1. At most one VM runs per slot, and at most one slot holds a GPU.

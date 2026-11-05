@@ -1,0 +1,1381 @@
+{
+ "host": "g4dn.metal (96 vCPU, instance-store btrfs), fleet host image",
+ "fcvm": "04915961 (the host image commit); --stop from this stack for diff_stop and the ladder",
+ "player": {
+  "mem_mib": 256,
+  "vcpus": 1,
+  "network": "routed"
+ },
+ "cycles": {
+  "diff": {
+   "cycles": 240,
+   "proof_ok": 240,
+   "kinds": [
+    "diff"
+   ],
+   "stages": {
+    "ball_in_ms": {
+     "n": 240,
+     "p50": 0.8,
+     "p90": 1.1,
+     "p99": 1.3,
+     "max": 1.5
+    },
+    "throw_send_ms": {
+     "n": 240,
+     "p50": 0.6,
+     "p90": 0.9,
+     "p99": 1.2,
+     "max": 9.6
+    },
+    "snapshot_ms": {
+     "n": 240,
+     "p50": 203.8,
+     "p90": 243.1,
+     "p99": 1616.8,
+     "max": 1979.4
+    },
+    "create_setup_ms": {
+     "n": 240,
+     "p50": 12.2,
+     "p90": 13.2,
+     "p99": 15.6,
+     "max": 1803.9
+    },
+    "create_boundary_to_disk_ms": {
+     "n": 240,
+     "p50": 86.9,
+     "p90": 93.7,
+     "p99": 165.7,
+     "max": 231.0
+    },
+    "vmm_pause_ms": {
+     "n": 240,
+     "p50": 0.1,
+     "p90": 0.2,
+     "p99": 0.2,
+     "max": 0.7
+    },
+    "vmm_save_ms": {
+     "n": 240,
+     "p50": 63.5,
+     "p90": 68.8,
+     "p99": 141.8,
+     "max": 202.6
+    },
+    "create_disk_and_resume_ms": {
+     "n": 240,
+     "p50": 71.7,
+     "p90": 92.9,
+     "p99": 141.9,
+     "max": 1715.3
+    },
+    "create_finish_ms": {
+     "n": 240,
+     "p50": 16.8,
+     "p90": 21.7,
+     "p99": 26.1,
+     "max": 26.5
+    },
+    "teardown_ms": {
+     "n": 240,
+     "p50": 108.8,
+     "p90": 124.3,
+     "p99": 146.7,
+     "max": 162.6
+    },
+    "restore_to_listen_ms": {
+     "n": 240,
+     "p50": 326.1,
+     "p90": 354.4,
+     "p99": 383.0,
+     "max": 1896.3
+    },
+    "restore_to_hello_ms": {
+     "n": 240,
+     "p50": 330.0,
+     "p90": 356.0,
+     "p99": 393.5,
+     "max": 1900.6
+    },
+    "wake_network_ms": {
+     "n": 240,
+     "p50": 102.9,
+     "p90": 116.1,
+     "p99": 133.1,
+     "max": 139.6
+    },
+    "wake_disk_ms": {
+     "n": 240,
+     "p50": 13.7,
+     "p90": 18.8,
+     "p99": 28.3,
+     "max": 1571.6
+    },
+    "wake_vmm_to_loaded_ms": {
+     "n": 240,
+     "p50": 9.4,
+     "p90": 13.4,
+     "p99": 17.4,
+     "max": 37.5
+    },
+    "wake_guest_to_ack_ms": {
+     "n": 240,
+     "p50": 194.4,
+     "p90": 210.0,
+     "p99": 225.5,
+     "max": 231.1
+    },
+    "cycle_ms": {
+     "n": 240,
+     "p50": 647.6,
+     "p90": 708.2,
+     "p99": 2275.0,
+     "max": 2452.3
+    }
+   },
+   "diff_written_mib": {
+    "p50": 19.5,
+    "p99": 67.7,
+    "max": 72.9
+   },
+   "arm": "snapshot create, then SIGTERM; diff snapshots (dirty tracking on)"
+  },
+  "full": {
+   "cycles": 240,
+   "proof_ok": 240,
+   "kinds": [
+    "diff"
+   ],
+   "stages": {
+    "ball_in_ms": {
+     "n": 240,
+     "p50": 0.8,
+     "p90": 1.1,
+     "p99": 1.3,
+     "max": 2.6
+    },
+    "throw_send_ms": {
+     "n": 240,
+     "p50": 0.6,
+     "p90": 0.9,
+     "p99": 1.2,
+     "max": 8.2
+    },
+    "snapshot_ms": {
+     "n": 240,
+     "p50": 394.9,
+     "p90": 413.7,
+     "p99": 592.2,
+     "max": 2235.8
+    },
+    "create_setup_ms": {
+     "n": 240,
+     "p50": 6.5,
+     "p90": 7.3,
+     "p99": 103.0,
+     "max": 1989.2
+    },
+    "create_boundary_to_disk_ms": {
+     "n": 240,
+     "p50": 299.9,
+     "p90": 314.4,
+     "p99": 331.7,
+     "max": 357.0
+    },
+    "vmm_pause_ms": {
+     "n": 240,
+     "p50": 0.1,
+     "p90": 0.2,
+     "p99": 0.2,
+     "max": 0.3
+    },
+    "vmm_save_ms": {
+     "n": 240,
+     "p50": 281.4,
+     "p90": 295.1,
+     "p99": 308.5,
+     "max": 320.9
+    },
+    "create_disk_and_resume_ms": {
+     "n": 240,
+     "p50": 27.3,
+     "p90": 34.3,
+     "p99": 55.6,
+     "max": 225.1
+    },
+    "create_finish_ms": {
+     "n": 240,
+     "p50": 48.0,
+     "p90": 50.3,
+     "p99": 52.0,
+     "max": 52.5
+    },
+    "teardown_ms": {
+     "n": 240,
+     "p50": 107.5,
+     "p90": 124.1,
+     "p99": 138.8,
+     "max": 140.5
+    },
+    "restore_to_listen_ms": {
+     "n": 240,
+     "p50": 196.3,
+     "p90": 222.9,
+     "p99": 294.1,
+     "max": 1110.0
+    },
+    "restore_to_hello_ms": {
+     "n": 240,
+     "p50": 196.7,
+     "p90": 215.6,
+     "p99": 307.1,
+     "max": 1098.0
+    },
+    "wake_network_ms": {
+     "n": 240,
+     "p50": 105.4,
+     "p90": 120.8,
+     "p99": 132.4,
+     "max": 140.2
+    },
+    "wake_disk_ms": {
+     "n": 240,
+     "p50": 11.7,
+     "p90": 13.4,
+     "p99": 15.4,
+     "max": 900.9
+    },
+    "wake_vmm_to_loaded_ms": {
+     "n": 240,
+     "p50": 9.2,
+     "p90": 13.4,
+     "p99": 21.2,
+     "max": 38.5
+    },
+    "wake_guest_to_ack_ms": {
+     "n": 240,
+     "p50": 63.9,
+     "p90": 72.6,
+     "p99": 161.0,
+     "max": 176.3
+    },
+    "cycle_ms": {
+     "n": 240,
+     "p50": 707.7,
+     "p90": 740.3,
+     "p99": 938.5,
+     "max": 2651.8
+    }
+   },
+   "diff_written_mib": {
+    "p50": 240.7,
+    "p99": 250.4,
+    "max": 251.8
+   },
+   "arm": "restored with --no-dirty-tracking: every sleep writes the whole memory"
+  },
+  "diff_stop": {
+   "cycles": 240,
+   "proof_ok": 240,
+   "kinds": [
+    "diff"
+   ],
+   "stages": {
+    "ball_in_ms": {
+     "n": 240,
+     "p50": 0.9,
+     "p90": 1.2,
+     "p99": 1.5,
+     "max": 4.0
+    },
+    "throw_send_ms": {
+     "n": 240,
+     "p50": 0.7,
+     "p90": 0.9,
+     "p99": 1.1,
+     "max": 1.3
+    },
+    "snapshot_ms": {
+     "n": 240,
+     "p50": 256.9,
+     "p90": 310.9,
+     "p99": 398.6,
+     "max": 1983.3
+    },
+    "create_setup_ms": {
+     "n": 240,
+     "p50": 14.7,
+     "p90": 15.7,
+     "p99": 17.0,
+     "max": 50.7
+    },
+    "create_boundary_to_disk_ms": {
+     "n": 240,
+     "p50": 92.9,
+     "p90": 98.6,
+     "p99": 184.8,
+     "max": 222.9
+    },
+    "vmm_pause_ms": {
+     "n": 240,
+     "p50": 0.1,
+     "p90": 0.2,
+     "p99": 0.2,
+     "max": 0.2
+    },
+    "vmm_save_ms": {
+     "n": 240,
+     "p50": 68.1,
+     "p90": 74.2,
+     "p99": 146.0,
+     "max": 168.1
+    },
+    "create_disk_and_resume_ms": {
+     "n": 240,
+     "p50": 115.1,
+     "p90": 151.5,
+     "p99": 178.7,
+     "max": 1829.2
+    },
+    "create_finish_ms": {
+     "n": 240,
+     "p50": 19.3,
+     "p90": 25.3,
+     "p99": 28.2,
+     "max": 28.8
+    },
+    "teardown_ms": {
+     "n": 240,
+     "p50": 106.7,
+     "p90": 125.2,
+     "p99": 141.3,
+     "max": 158.4
+    },
+    "restore_to_listen_ms": {
+     "n": 240,
+     "p50": 355.3,
+     "p90": 381.3,
+     "p99": 1894.5,
+     "max": 1969.5
+    },
+    "restore_to_hello_ms": {
+     "n": 240,
+     "p50": 355.8,
+     "p90": 384.4,
+     "p99": 1897.4,
+     "max": 1965.7
+    },
+    "wake_network_ms": {
+     "n": 240,
+     "p50": 103.3,
+     "p90": 115.3,
+     "p99": 129.4,
+     "max": 134.9
+    },
+    "wake_disk_ms": {
+     "n": 240,
+     "p50": 30.8,
+     "p90": 43.5,
+     "p99": 1572.2,
+     "max": 1645.7
+    },
+    "wake_vmm_to_loaded_ms": {
+     "n": 240,
+     "p50": 10.0,
+     "p90": 14.1,
+     "p99": 16.3,
+     "max": 19.2
+    },
+    "wake_guest_to_ack_ms": {
+     "n": 240,
+     "p50": 201.2,
+     "p90": 220.2,
+     "p99": 231.7,
+     "max": 271.4
+    },
+    "cycle_ms": {
+     "n": 240,
+     "p50": 728.2,
+     "p90": 810.9,
+     "p99": 2321.6,
+     "max": 2487.5
+    }
+   },
+   "diff_written_mib": {
+    "p50": 19.6,
+    "p99": 63.0,
+    "max": 71.8
+   },
+   "arm": "snapshot create --stop; diff snapshots (the sleep the game uses)"
+  },
+  "diff_stop_subvolumes_off": {
+   "cycles": 240,
+   "proof_ok": 240,
+   "kinds": [
+    "diff"
+   ],
+   "stages": {
+    "ball_in_ms": {
+     "n": 240,
+     "p50": 0.9,
+     "p90": 1.2,
+     "p99": 3.1,
+     "max": 3.4
+    },
+    "throw_send_ms": {
+     "n": 240,
+     "p50": 0.6,
+     "p90": 0.9,
+     "p99": 1.0,
+     "max": 1.2
+    },
+    "snapshot_ms": {
+     "n": 240,
+     "p50": 269.3,
+     "p90": 310.7,
+     "p99": 1607.0,
+     "max": 2129.7
+    },
+    "create_setup_ms": {
+     "n": 240,
+     "p50": 16.2,
+     "p90": 17.5,
+     "p99": 1365.9,
+     "max": 1843.0
+    },
+    "create_boundary_to_disk_ms": {
+     "n": 240,
+     "p50": 92.8,
+     "p90": 97.4,
+     "p99": 167.7,
+     "max": 183.0
+    },
+    "vmm_pause_ms": {
+     "n": 240,
+     "p50": 0.1,
+     "p90": 0.2,
+     "p99": 0.2,
+     "max": 0.2
+    },
+    "vmm_save_ms": {
+     "n": 240,
+     "p50": 67.9,
+     "p90": 72.6,
+     "p99": 143.1,
+     "max": 156.8
+    },
+    "create_disk_and_resume_ms": {
+     "n": 240,
+     "p50": 128.5,
+     "p90": 158.5,
+     "p99": 174.9,
+     "max": 187.6
+    },
+    "create_finish_ms": {
+     "n": 240,
+     "p50": 18.1,
+     "p90": 22.9,
+     "p99": 26.7,
+     "max": 27.9
+    },
+    "teardown_ms": {
+     "n": 240,
+     "p50": 108.6,
+     "p90": 127.0,
+     "p99": 142.3,
+     "max": 163.5
+    },
+    "restore_to_listen_ms": {
+     "n": 240,
+     "p50": 368.1,
+     "p90": 395.7,
+     "p99": 422.1,
+     "max": 2083.4
+    },
+    "restore_to_hello_ms": {
+     "n": 240,
+     "p50": 370.3,
+     "p90": 402.0,
+     "p99": 427.0,
+     "max": 2086.8
+    },
+    "wake_network_ms": {
+     "n": 240,
+     "p50": 103.9,
+     "p90": 115.6,
+     "p99": 134.4,
+     "max": 150.1
+    },
+    "wake_disk_ms": {
+     "n": 240,
+     "p50": 45.5,
+     "p90": 59.6,
+     "p99": 75.5,
+     "max": 1771.1
+    },
+    "wake_vmm_to_loaded_ms": {
+     "n": 240,
+     "p50": 9.8,
+     "p90": 13.5,
+     "p99": 16.5,
+     "max": 20.4
+    },
+    "wake_guest_to_ack_ms": {
+     "n": 240,
+     "p50": 202.0,
+     "p90": 217.1,
+     "p99": 228.5,
+     "max": 231.7
+    },
+    "cycle_ms": {
+     "n": 240,
+     "p50": 755.2,
+     "p90": 832.1,
+     "p99": 2419.4,
+     "max": 2691.2
+    }
+   },
+   "diff_written_mib": {
+    "p50": 19.7,
+    "p99": 63.8,
+    "max": 71.1
+   },
+   "arm": "snapshot create --stop with FCVM_SNAPSHOT_SUBVOLUMES=0 (reflinks, no subvolumes); measured and not kept"
+  }
+ },
+ "memory_96": {
+  "start": [
+   {
+    "awake_trees": 0,
+    "pss_kib": 0,
+    "rss_kib": 0,
+    "mem_available_kib": 391042860
+   }
+  ],
+  "all_awake": [
+   {
+    "awake_trees": 96,
+    "pss_kib": 25080802,
+    "rss_kib": 27311872,
+    "mem_available_kib": 365640116
+   }
+  ],
+  "all_asleep": [
+   {
+    "awake_trees": 0,
+    "pss_kib": 0,
+    "rss_kib": 0,
+    "mem_available_kib": 388913648
+   }
+  ],
+  "one_awake": [
+   {
+    "awake_trees": 1,
+    "pss_kib": 142412,
+    "rss_kib": 146500,
+    "mem_available_kib": 388848332
+   },
+   {
+    "awake_trees": 1,
+    "pss_kib": 140110,
+    "rss_kib": 144160,
+    "mem_available_kib": 388983064
+   },
+   {
+    "awake_trees": 1,
+    "pss_kib": 139934,
+    "rss_kib": 143984,
+    "mem_available_kib": 389669216
+   },
+   {
+    "awake_trees": 1,
+    "pss_kib": 142880,
+    "rss_kib": 146948,
+    "mem_available_kib": 389752032
+   },
+   {
+    "awake_trees": 1,
+    "pss_kib": 136476,
+    "rss_kib": 140576,
+    "mem_available_kib": 390306532
+   },
+   {
+    "awake_trees": 1,
+    "pss_kib": 139474,
+    "rss_kib": 143532,
+    "mem_available_kib": 390372432
+   },
+   {
+    "awake_trees": 1,
+    "pss_kib": 137759,
+    "rss_kib": 141824,
+    "mem_available_kib": 390540676
+   },
+   {
+    "awake_trees": 1,
+    "pss_kib": 143579,
+    "rss_kib": 147712,
+    "mem_available_kib": 390564616
+   },
+   {
+    "awake_trees": 1,
+    "pss_kib": 137008,
+    "rss_kib": 141056,
+    "mem_available_kib": 390579776
+   },
+   {
+    "awake_trees": 1,
+    "pss_kib": 141123,
+    "rss_kib": 145256,
+    "mem_available_kib": 390560896
+   },
+   {
+    "awake_trees": 1,
+    "pss_kib": 139580,
+    "rss_kib": 143680,
+    "mem_available_kib": 390564736
+   },
+   {
+    "awake_trees": 1,
+    "pss_kib": 137271,
+    "rss_kib": 141400,
+    "mem_available_kib": 390563916
+   }
+  ],
+  "all_asleep_again": [
+   {
+    "awake_trees": 0,
+    "pss_kib": 0,
+    "rss_kib": 0,
+    "mem_available_kib": 390929304
+   }
+  ],
+  "wakes_with_95_asleep_ms": [
+   317.146,
+   297.701,
+   289.381,
+   284.901,
+   270.259,
+   303.812,
+   264.771,
+   310.996,
+   328.723,
+   296.633,
+   282.208,
+   289.002
+  ],
+  "sleeps_8_at_once": {
+   "snapshot_ms": [
+    347.991,
+    374.519,
+    389.53,
+    400.158,
+    400.923,
+    408.33,
+    413.108,
+    423.777,
+    429.024,
+    442.117,
+    452.063,
+    455.859,
+    456.453,
+    462.164,
+    469.375,
+    470.471,
+    486.997,
+    507.581,
+    535.466,
+    537.408,
+    538.827,
+    543.24,
+    545.631,
+    553.487,
+    572.658,
+    573.298,
+    580.26,
+    580.72,
+    582.308,
+    583.624,
+    583.973,
+    584.538,
+    586.357,
+    588.949,
+    594.4,
+    595.066,
+    602.39,
+    613.205,
+    615.712,
+    615.901,
+    626.97,
+    631.608,
+    637.107,
+    637.655,
+    640.209,
+    640.429,
+    644.941,
+    648.793,
+    651.153,
+    653.927,
+    660.655,
+    665.833,
+    670.665,
+    681.464,
+    692.817,
+    696.694,
+    701.299,
+    701.535,
+    702.71,
+    703.304,
+    706.467,
+    708.122,
+    708.281,
+    728.838,
+    732.895,
+    733.082,
+    735.992,
+    736.306,
+    751.292,
+    752.368,
+    756.007,
+    762.126,
+    776.857,
+    777.233,
+    777.43,
+    777.68,
+    779.691,
+    802.335,
+    808.676,
+    810.214,
+    846.348,
+    880.49,
+    881.789,
+    912.166,
+    912.816,
+    914.413,
+    965.014,
+    985.511,
+    990.193,
+    1007.016,
+    1008.583,
+    1034.325,
+    1047.505,
+    1067.418,
+    1089.152,
+    1098.265
+   ],
+   "teardown_ms": [
+    115.576,
+    134.254,
+    143.984,
+    145.893,
+    148.489,
+    150.017,
+    153.834,
+    154.033,
+    154.914,
+    156.051,
+    157.298,
+    158.571,
+    159.237,
+    159.322,
+    163.679,
+    164.468,
+    164.932,
+    165.044,
+    167.471,
+    169.238,
+    169.611,
+    169.762,
+    171.623,
+    173.053,
+    176.561,
+    176.702,
+    176.906,
+    177.463,
+    177.951,
+    180.902,
+    181.444,
+    181.796,
+    181.873,
+    183.515,
+    183.624,
+    184.578,
+    187.593,
+    187.745,
+    188.683,
+    190.077,
+    190.405,
+    191.266,
+    191.722,
+    192.833,
+    193.166,
+    193.342,
+    193.387,
+    194.461,
+    194.552,
+    196.508,
+    196.723,
+    196.779,
+    197.687,
+    198.037,
+    198.073,
+    199.5,
+    200.142,
+    203.249,
+    204.435,
+    204.577,
+    204.795,
+    205.955,
+    206.004,
+    207.428,
+    207.874,
+    208.857,
+    210.489,
+    210.511,
+    210.734,
+    211.745,
+    211.792,
+    212.538,
+    213.124,
+    213.274,
+    213.82,
+    214.169,
+    214.194,
+    214.251,
+    214.412,
+    214.591,
+    215.321,
+    215.708,
+    216.866,
+    218.825,
+    219.313,
+    219.55,
+    221.686,
+    223.855,
+    224.838,
+    225.83,
+    231.511,
+    237.053,
+    237.066,
+    341.897,
+    483.918,
+    523.062
+   ]
+  }
+ },
+ "ladder": {
+  "command": "potatobench.py ladder --sizes 2,4,8,16,32,64,96 --budget 2000 --start-floor 250 --shrink 100 --min-hold 2 --flight 100 --margin 150",
+  "first_run": [
+   {
+    "size": 2,
+    "start_hold_ms": 2000,
+    "record_hold_ms": 1458,
+    "dropped_at_hold_ms": 1182,
+    "lap": 5,
+    "catches": 10,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "connection timed out",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 10,
+     "p50": 367.3,
+     "p99": 380.2,
+     "max": 380.2
+    },
+    "sleep_ms": {
+     "n": 10,
+     "p50": 339.5,
+     "max": 1120.2
+    },
+    "awake_max": 2
+   },
+   {
+    "size": 4,
+    "start_hold_ms": 666,
+    "record_hold_ms": 438,
+    "dropped_at_hold_ms": 395,
+    "lap": 6,
+    "catches": 23,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "connection timed out",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 21,
+     "p50": 417.6,
+     "p99": 1417.7,
+     "max": 1417.7
+    },
+    "sleep_ms": {
+     "n": 23,
+     "p50": 347.1,
+     "max": 1421.9
+    },
+    "awake_max": 4
+   },
+   {
+    "size": 8,
+    "start_hold_ms": 285,
+    "record_hold_ms": 257,
+    "dropped_at_hold_ms": 232,
+    "lap": 2,
+    "catches": 21,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "no ack: \"\"",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 19,
+     "p50": 467.6,
+     "p99": 838.3,
+     "max": 838.3
+    },
+    "sleep_ms": {
+     "n": 22,
+     "p50": 699.0,
+     "max": 1238.2
+    },
+    "awake_max": 8
+   },
+   {
+    "size": 16,
+    "start_hold_ms": 250,
+    "record_hold_ms": null,
+    "dropped_at_hold_ms": 250,
+    "lap": 0,
+    "catches": 1,
+    "reason": "dropped",
+    "catcher_phase": "awake",
+    "error": "no ack: \"{\\\"type\\\":\\\"refused\\\",\\\"reason\\\":\\\"asleep: it has t",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 0,
+     "p50": null,
+     "p99": null,
+     "max": null
+    },
+    "sleep_ms": {
+     "n": 1,
+     "p50": 718.7,
+     "max": 718.7
+    },
+    "awake_max": 16
+   },
+   {
+    "size": 32,
+    "start_hold_ms": 250,
+    "record_hold_ms": 250,
+    "dropped_at_hold_ms": 203,
+    "lap": 2,
+    "catches": 91,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "connection timed out",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 64,
+     "p50": 469.6,
+     "p99": 1638.2,
+     "max": 1638.2
+    },
+    "sleep_ms": {
+     "n": 91,
+     "p50": 710.2,
+     "max": 2130.7
+    },
+    "awake_max": 32
+   },
+   {
+    "size": 64,
+    "start_hold_ms": 250,
+    "record_hold_ms": 250,
+    "dropped_at_hold_ms": 203,
+    "lap": 2,
+    "catches": 151,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "connection timed out",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 92,
+     "p50": 467.8,
+     "p99": 2464.8,
+     "max": 2464.8
+    },
+    "sleep_ms": {
+     "n": 151,
+     "p50": 681.8,
+     "max": 4814.4
+    },
+    "awake_max": 64
+   },
+   {
+    "size": 96,
+    "start_hold_ms": 250,
+    "record_hold_ms": 250,
+    "dropped_at_hold_ms": 225,
+    "lap": 1,
+    "catches": 128,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "connection timed out",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 39,
+     "p50": 597.2,
+     "p99": 2449.1,
+     "max": 2449.1
+    },
+    "sleep_ms": {
+     "n": 128,
+     "p50": 635.3,
+     "max": 3166.9
+    },
+    "awake_max": 96
+   }
+  ],
+  "second_run": [
+   {
+    "size": 2,
+    "start_hold_ms": 2000,
+    "record_hold_ms": 777,
+    "dropped_at_hold_ms": 630,
+    "lap": 11,
+    "catches": 22,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "Connection refused (os error 111)",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 22,
+     "p50": 346.6,
+     "p99": 371.4,
+     "max": 371.4
+    },
+    "sleep_ms": {
+     "n": 22,
+     "p50": 348.6,
+     "max": 943.6
+    },
+    "awake_max": 2
+   },
+   {
+    "size": 4,
+    "start_hold_ms": 666,
+    "record_hold_ms": 321,
+    "dropped_at_hold_ms": 261,
+    "lap": 9,
+    "catches": 37,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "connection timed out",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 35,
+     "p50": 418.3,
+     "p99": 1906.5,
+     "max": 1906.5
+    },
+    "sleep_ms": {
+     "n": 37,
+     "p50": 382.7,
+     "max": 2132.5
+    },
+    "awake_max": 4
+   },
+   {
+    "size": 8,
+    "start_hold_ms": 285,
+    "record_hold_ms": 285,
+    "dropped_at_hold_ms": 232,
+    "lap": 2,
+    "catches": 21,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "no ack: \"\"",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 18,
+     "p50": 455.2,
+     "p99": 724.6,
+     "max": 724.6
+    },
+    "sleep_ms": {
+     "n": 21,
+     "p50": 661.0,
+     "max": 1261.9
+    },
+    "awake_max": 8
+   },
+   {
+    "size": 16,
+    "start_hold_ms": 250,
+    "record_hold_ms": 183,
+    "dropped_at_hold_ms": 149,
+    "lap": 5,
+    "catches": 81,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "connection timed out",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 71,
+     "p50": 552.9,
+     "p99": 1277.0,
+     "max": 1277.0
+    },
+    "sleep_ms": {
+     "n": 81,
+     "p50": 1163.7,
+     "max": 2316.6
+    },
+    "awake_max": 16
+   },
+   {
+    "size": 32,
+    "start_hold_ms": 250,
+    "record_hold_ms": 225,
+    "dropped_at_hold_ms": 183,
+    "lap": 3,
+    "catches": 118,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "connection timed out",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 93,
+     "p50": 539.7,
+     "p99": 1632.9,
+     "max": 1632.9
+    },
+    "sleep_ms": {
+     "n": 118,
+     "p50": 943.0,
+     "max": 2168.2
+    },
+    "awake_max": 32
+   },
+   {
+    "size": 64,
+    "start_hold_ms": 250,
+    "record_hold_ms": 250,
+    "dropped_at_hold_ms": 225,
+    "lap": 1,
+    "catches": 88,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "connection timed out",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 32,
+     "p50": 626.9,
+     "p99": 1723.2,
+     "max": 1723.2
+    },
+    "sleep_ms": {
+     "n": 88,
+     "p50": 667.4,
+     "max": 2811.9
+    },
+    "awake_max": 64
+   },
+   {
+    "size": 96,
+    "start_hold_ms": 250,
+    "record_hold_ms": 250,
+    "dropped_at_hold_ms": 225,
+    "lap": 1,
+    "catches": 150,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "Connection refused (os error 111)",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 64,
+     "p50": 860.4,
+     "p99": 3439.1,
+     "max": 3439.1
+    },
+    "sleep_ms": {
+     "n": 150,
+     "p50": 832.7,
+     "max": 5868.1
+    },
+    "awake_max": 96
+   }
+  ],
+  "subvolumes_off": [
+   {
+    "size": 2,
+    "start_hold_ms": 2000,
+    "record_hold_ms": 1458,
+    "dropped_at_hold_ms": 1182,
+    "lap": 5,
+    "catches": 10,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "connection timed out",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 10,
+     "p50": 350.3,
+     "p99": 366.4,
+     "max": 366.4
+    },
+    "sleep_ms": {
+     "n": 10,
+     "p50": 336.9,
+     "max": 1092.8
+    },
+    "awake_max": 2
+   },
+   {
+    "size": 4,
+    "start_hold_ms": 666,
+    "record_hold_ms": 486,
+    "dropped_at_hold_ms": 395,
+    "lap": 5,
+    "catches": 20,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "connection timed out",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 18,
+     "p50": 442.4,
+     "p99": 1563.9,
+     "max": 1563.9
+    },
+    "sleep_ms": {
+     "n": 20,
+     "p50": 374.7,
+     "max": 1506.0
+    },
+    "awake_max": 4
+   },
+   {
+    "size": 8,
+    "start_hold_ms": 285,
+    "record_hold_ms": 232,
+    "dropped_at_hold_ms": 209,
+    "lap": 3,
+    "catches": 24,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "connection timed out",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 22,
+     "p50": 453.6,
+     "p99": 791.9,
+     "max": 791.9
+    },
+    "sleep_ms": {
+     "n": 24,
+     "p50": 786.5,
+     "max": 1274.0
+    },
+    "awake_max": 8
+   },
+   {
+    "size": 16,
+    "start_hold_ms": 250,
+    "record_hold_ms": 225,
+    "dropped_at_hold_ms": 183,
+    "lap": 3,
+    "catches": 48,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "connection timed out",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 37,
+     "p50": 461.6,
+     "p99": 1496.4,
+     "max": 1496.4
+    },
+    "sleep_ms": {
+     "n": 48,
+     "p50": 757.3,
+     "max": 1865.8
+    },
+    "awake_max": 16
+   },
+   {
+    "size": 32,
+    "start_hold_ms": 250,
+    "record_hold_ms": 225,
+    "dropped_at_hold_ms": 183,
+    "lap": 3,
+    "catches": 119,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "Connection refused (os error 111)",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 94,
+     "p50": 593.8,
+     "p99": 1946.1,
+     "max": 1946.1
+    },
+    "sleep_ms": {
+     "n": 119,
+     "p50": 1117.3,
+     "max": 3282.2
+    },
+    "awake_max": 32
+   },
+   {
+    "size": 64,
+    "start_hold_ms": 250,
+    "record_hold_ms": 250,
+    "dropped_at_hold_ms": 203,
+    "lap": 2,
+    "catches": 145,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "connection timed out",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 86,
+     "p50": 546.2,
+     "p99": 2678.1,
+     "max": 2678.1
+    },
+    "sleep_ms": {
+     "n": 145,
+     "p50": 780.4,
+     "max": 4332.5
+    },
+    "awake_max": 64
+   },
+   {
+    "size": 96,
+    "start_hold_ms": 250,
+    "record_hold_ms": 250,
+    "dropped_at_hold_ms": 203,
+    "lap": 2,
+    "catches": 211,
+    "reason": "dropped",
+    "catcher_phase": "waking",
+    "error": "connection timed out",
+    "listening_after_drop_ms": null,
+    "wake_ms_after_opening": {
+     "n": 121,
+     "p50": 668.7,
+     "p99": 3535.6,
+     "max": 3823.5
+    },
+    "sleep_ms": {
+     "n": 211,
+     "p50": 1193.2,
+     "max": 6036.7
+    },
+    "awake_max": 96
+   }
+  ],
+  "notes": "first_run had a bench defect (a throw heard while a wake was finishing started no sleep) that ended size 16 at once; fixed before second_run and subvolumes_off. subvolumes_off ran with FCVM_SNAPSHOT_SUBVOLUMES=0, a switch measured and not kept."
+ }
+}
