@@ -118,6 +118,7 @@ class Renderer {
   void* fill_c_ = nullptr;  // checkerboard fill output, swapped into the ring
   void* fill_a_ = nullptr;
   void* fill_g_ = nullptr;
+  void* th_ = nullptr;     // float over the drawn region: the first sample's eye-ray march (k_march)
   void* ring_g_[TEMPORAL_WINDOW] = {};  // float4: frame's mean albedo guide + packed normal of the first sample
   void* hold_g_ = nullptr;     // float4: hold's albedo guide sum + packed normal
   void* display_g_ = nullptr;  // float4 over the resolved region: resolved albedo guide
