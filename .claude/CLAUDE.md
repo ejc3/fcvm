@@ -2822,6 +2822,15 @@ separately.
   rename. Snapshot replacement takes that lock exclusively, so it either finishes before the
   check (the old clone declines to publish) or waits until an active publication completes; it
   cannot land in between.
+- **First-touch order**: each recorded granule also keeps when it was first touched, in tenths
+  of a second after its clone's handshake (`FirstTouch`, 2 bytes per granule; the sidecar is
+  format version 2, and a version 1 file is dropped and re-recorded). Merging keeps the earlier
+  time, so the set converges on when the guest first needs each page, and a merge that only
+  makes a time earlier is published like one that adds granules. Replay and the warm-up walk the
+  set in 11 tiers (the first half second, then doubling: 1 s, 2 s, 4 s and so on, the last also
+  holding granules with no known time), ascending offset within a tier (`OrderedRuns`), so the
+  pages the restore path and the first requests touch are mapped first rather than wherever
+  their offset falls in a replay of tens of GiB.
 - **Replay**: at handshake the recorded set is coalesced into runs, mapped into that clone's
   regions, aligned to its page size, and populated in 2 MiB `UFFDIO_COPY`/`UFFDIO_CONTINUE`
   chunks. Replay starts during the snapshot load, when Firecracker hands the server its

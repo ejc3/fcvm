@@ -19,7 +19,7 @@ use std::os::fd::AsRawFd;
 use tracing::debug;
 use userfaultfd::Uffd;
 
-use super::working_set::{PageSet, RunIter};
+use super::working_set::{OrderedRuns, PageSet};
 
 /// Bytes populated per ioctl.
 ///
@@ -84,9 +84,10 @@ pub enum Stop {
 /// to the memory file, and finally merged so alignment cannot produce overlapping copies.
 ///
 /// The plan is lazy, and every recorded run is planned. The hint is untrusted cache state, so
-/// planning keeps a fixed ceiling on what it can cost: the iterator holds one pending segment
-/// and allocates nothing, and its work is one pass over the bitmap, whose length the
-/// snapshot's memory size fixes. A warmed 128 GiB guest's restore set fragments into millions
+/// planning keeps a fixed ceiling on what it can cost: it splits the set by first-touch tier
+/// once, one bitmap per tier, then holds one pending segment, and its work is a pass over each
+/// tier's bitmap, whose length the snapshot's memory size fixes. Runs come earliest tier
+/// first, so the pages a clone first needs are mapped first. A warmed 128 GiB guest's restore set fragments into millions
 /// of runs a few pages long (one clone recorded 3.7M pages in 1.6M runs), so a plan limited
 /// to a fixed number of runs leaves most of that set to demand paging.
 pub fn plan<'a>(
@@ -97,7 +98,7 @@ pub fn plan<'a>(
 ) -> Plan<'a> {
     let usable = page_size.is_power_of_two() && (4096..=CHUNK_BYTES).contains(&page_size);
     Plan {
-        runs: usable.then(|| set.runs()),
+        runs: usable.then(|| OrderedRuns::new(set)),
         regions,
         page_size,
         mem_len,
@@ -107,11 +108,11 @@ pub fn plan<'a>(
     }
 }
 
-/// The segments of one [`plan`], produced as they are asked for: runs in ascending file offset,
-/// each placed in the order the regions are listed.
+/// The segments of one [`plan`], produced as they are asked for: runs in first-touch order
+/// ([`OrderedRuns`]), each placed in the order the regions are listed.
 pub struct Plan<'a> {
     /// `None` when the clone's page size cannot be planned for. The plan is then empty.
-    runs: Option<RunIter<'a>>,
+    runs: Option<OrderedRuns>,
     regions: &'a [Region],
     page_size: usize,
     mem_len: u64,
@@ -127,7 +128,7 @@ pub struct Plan<'a> {
 impl Plan<'_> {
     /// How far into the recording planning has read, in bytes.
     fn recording_position(&self) -> Option<u64> {
-        self.runs.as_ref().map(RunIter::position)
+        self.runs.as_ref().map(OrderedRuns::position)
     }
 }
 
@@ -754,6 +755,30 @@ mod tests {
         }
         assert_eq!(planned, run_count, "every recorded run becomes a segment");
         assert_eq!(bytes, run_count * G, "and every recorded page is planned");
+    }
+
+    #[test]
+    fn plan_maps_the_earliest_touched_pages_first() {
+        // The guest first touched pages at the top of its memory, then the bottom; replay
+        // must map them in that order, not in file offset order.
+        let mem_len = 1024 * G;
+        let mut set = PageSet::empty(mem_len);
+        set.insert_range_at(0, 8 * G, 900);
+        set.insert_range_at(512 * G, 8 * G, 30);
+        set.insert_range_at(1000 * G, 8 * G, 1);
+        let regions = [Region {
+            base_host_virt_addr: 0x4000_0000,
+            file_offset: 0,
+            size: usize::try_from(mem_len).unwrap(),
+        }];
+        let order: Vec<u64> = plan(&set, &regions, PAGE, mem_len)
+            .map(|segment| segment.file_offset / G)
+            .collect();
+        assert_eq!(
+            order,
+            vec![1000, 512, 0],
+            "replay order is not first-touch order"
+        );
     }
 
     #[test]

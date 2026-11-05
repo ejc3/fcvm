@@ -2442,12 +2442,20 @@ impl VmState {
         }
     }
 
-    /// The recorder for a demand fault observed at `now`, or `None` once the recording
-    /// window has closed.
-    fn fault_recorder(&mut self, now: std::time::Instant) -> Option<&mut PageSet> {
+    /// The recorder for a demand fault observed at `now`, with the fault's first-touch time,
+    /// or `None` once the recording window has closed.
+    fn fault_recorder(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<(&mut PageSet, super::working_set::FirstTouch)> {
         match self.record_until {
             Some(deadline) if now >= deadline => None,
-            _ => self.recorded.as_mut(),
+            _ => {
+                let stamp = super::working_set::first_touch_stamp(
+                    now.saturating_duration_since(self.started),
+                );
+                self.recorded.as_mut().map(|set| (set, stamp))
+            }
         }
     }
 }
@@ -4367,8 +4375,14 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                     // hole is recorded like any other, and replay fills it with zeros. A
                     // fault parked before its REMOVE was read has been recorded already.
                     if zero != Some(ZeroReason::GivenBack) {
-                        if let Some(recorder) = state.fault_recorder(std::time::Instant::now()) {
-                            recorder.insert_range(offset_in_file as u64, page_size as u64);
+                        if let Some((recorder, stamp)) =
+                            state.fault_recorder(std::time::Instant::now())
+                        {
+                            recorder.insert_range_at(
+                                offset_in_file as u64,
+                                page_size as u64,
+                                stamp,
+                            );
                         }
                     }
 
@@ -5255,8 +5269,8 @@ mod tests {
             trace: None,
         };
         let fault_time = started + Duration::from_secs(1);
-        if let Some(recorder) = past_window.fault_recorder(fault_time) {
-            recorder.insert_range(0, 4096);
+        if let Some((recorder, stamp)) = past_window.fault_recorder(fault_time) {
+            recorder.insert_range_at(0, 4096, stamp);
         }
         assert!(
             past_window.recorded.as_ref().unwrap().is_empty(),
@@ -5278,8 +5292,8 @@ mod tests {
             started,
             trace: None,
         };
-        if let Some(recorder) = in_window.fault_recorder(fault_time) {
-            recorder.insert_range(0, 4096);
+        if let Some((recorder, stamp)) = in_window.fault_recorder(fault_time) {
+            recorder.insert_range_at(0, 4096, stamp);
         }
         assert_eq!(
             in_window.recorded.as_ref().unwrap().len(),
@@ -5324,8 +5338,8 @@ mod tests {
         // Every fault of this clone lands after its (zero-length) window.
         let mut late = clone_state(Duration::ZERO);
         for offset in [0u64, 4096, 8192] {
-            if let Some(recorder) = late.fault_recorder(fault_time) {
-                recorder.insert_range(offset, 4096);
+            if let Some((recorder, stamp)) = late.fault_recorder(fault_time) {
+                recorder.insert_range_at(offset, 4096, stamp);
             }
         }
         let persistence = WorkingSetPersistence::new(Arc::clone(&store)).unwrap();
@@ -5338,8 +5352,8 @@ mod tests {
         // The same faults inside the window are learned, proving the merge path works.
         let mut timely = clone_state(DEFAULT_PREFETCH_RECORD_WINDOW);
         for offset in [0u64, 4096, 8192] {
-            if let Some(recorder) = timely.fault_recorder(fault_time) {
-                recorder.insert_range(offset, 4096);
+            if let Some((recorder, stamp)) = timely.fault_recorder(fault_time) {
+                recorder.insert_range_at(offset, 4096, stamp);
             }
         }
         persist_observed_working_set("vm-timely", Some(persistence), timely.recorded.take());
