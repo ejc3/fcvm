@@ -547,6 +547,20 @@ replay server. Left open: the per-request Firecracker cgroup probe still fails r
 ("firecracker pid N is outside run cgroup", 62 at 2 vCPUs and 1.4 per path), and `fs.inotify.max_user_instances`
 must be raised for runs above about 4 requests per second per path (AGENTS.md).
 
+## The campaign 40657613: what the report quotes since 2026-11-05
+
+The page quotes this campaign alone (`report/README.md`, "The campaign 40657613";
+`results/campaign-40657613-summary.json`). Every earlier run in this ledger stays a record of an
+earlier build and is not quoted. `test_report_one_campaign.py` holds the page to one campaign.
+
+| item | result |
+|---|---|
+| Harness before the campaign | #1511 (bridged and routed replay reachability, explicit veth MACs) and #1513, which fixed five scale-run defects found by a first attempt of this campaign at `4bd598d6`: the fast teardown's reap raced fcvm's reclaim and stale-state cleanup (183 of 7,560 requests at 8 vCPUs), `--no-swap` moved Firecracker out of the backend cgroup (the "outside run cgroup" failures left open above), the analyzer rejected the host record #1511 added, and the host control's warmup timed out in 8 of 100 starts. That attempt's records are not imported. |
+| Serial runs | 33, each DNS-verified clean, 0 failures in 230 attempts per arm (430 in bridged and routed runs), every drift gate passed. |
+| Throughput | 2 and 4 vCPUs pass at every rate offered (1.4, 2.8, 4.2 per path); at 8 vCPUs 4.2 failed on one request, a fast-teardown reap that stopped with "Cannot call rmtree on a symbolic link", so 8 vCPUs passes to 2.8. What replaced the directory is not yet known: #1525. |
+| Memory | four phases, every fit within the harness's own cross-basis gate, including the HTML extraction phase at 4 vCPUs that the 2026-10-26 runs at 2 and 8 vCPUs could not publish. |
+| Preflight retry | r2-c2's first attempt was refused by the 1-minute load gate before any golden; its retry is the imported record. |
+
 ## Binding requirements for any future run
 
 Unchanged from the previous ledger, plus:

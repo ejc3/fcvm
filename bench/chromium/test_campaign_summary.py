@@ -3029,23 +3029,32 @@ class ReplayLogsKeptInTheRecordsRepository(unittest.TestCase):
             rc = campaign_summary.main_with(["--out", out] + list(run_dirs))
         return rc, stdout.getvalue() + stderr.getvalue()
 
-    def _move_out(self, d, run_dir, name="corpus-access.log"):
+    def _move_out(self, d, run_dir, name="corpus-access.log", encoding=None):
         """Commit run_dir/name into a records repository at the same relative
-        path, remove it from the run, and write the run's pointer."""
+        path (gzipped, with a .gz suffix, when encoding is "gzip"), remove it
+        from the run, and write the run's pointer."""
         records = os.path.join(d, "records")
         relative = os.path.join("bench", "chromium", "results", os.path.basename(run_dir), name)
         os.makedirs(os.path.dirname(os.path.join(records, relative)))
-        shutil.move(os.path.join(run_dir, name), os.path.join(records, relative))
+        log = open(os.path.join(run_dir, name), "rb").read()
+        os.remove(os.path.join(run_dir, name))
+        if encoding == "gzip":
+            import gzip
+            relative += ".gz"
+            open(os.path.join(records, relative), "wb").write(gzip.compress(log))
+        else:
+            open(os.path.join(records, relative), "wb").write(log)
         git = ["git", "-C", records, "-c", "user.name=t", "-c", "user.email=t@example.com"]
         subprocess.run(["git", "init", "-q", records], check=True)
         subprocess.run(git + ["add", "."], check=True)
         subprocess.run(git + ["commit", "-q", "-m", "logs"], check=True)
         commit = subprocess.run(git + ["rev-parse", "HEAD"], check=True,
                                 capture_output=True, text=True).stdout.strip()
-        data = open(os.path.join(records, relative), "rb").read()
-        pointer = {"schema": 1, "repository": "ejc3/fcvm-bench-records", "files": {name: {
-            "path": relative, "commit": commit,
-            "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}}}
+        entry = {"path": relative, "commit": commit,
+                 "sha256": hashlib.sha256(log).hexdigest(), "size": len(log)}
+        if encoding is not None:
+            entry["encoding"] = encoding
+        pointer = {"schema": 1, "repository": "ejc3/fcvm-bench-records", "files": {name: entry}}
         with open(os.path.join(run_dir, campaign_summary.EXTERNAL_LOGS), "w") as handle:
             json.dump(pointer, handle)
         return records, commit
@@ -3081,6 +3090,53 @@ class ReplayLogsKeptInTheRecordsRepository(unittest.TestCase):
             self.assertIn(f"ejc3/fcvm-bench-records@{commit}:bench/chromium/results/"
                           f"{os.path.basename(run_dir)}/corpus-access.log",
                           {entry["path"] for entry in index["generated_from"]})
+
+    def test_a_gzipped_log_is_read_and_checked_uncompressed(self):
+        """A scale run's access log is over the records repository's 100 MB
+        file limit, so it is stored gzipped. RED BEFORE THE FIX: the reader
+        hashed the gzip bytes and refused the run with a sha256 mismatch."""
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "reqbench-20261022-corpus-x")
+            write_run(run_dir)
+            records, _commit = self._move_out(d, run_dir, encoding="gzip")
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir], records=records)
+            self.assertEqual(rc, 0, text)
+
+    def test_a_corrupt_gzip_body_is_refused(self):
+        """RED BEFORE THE FIX: a gzip header over bad DEFLATE data raised
+        zlib.error out of the index instead of the NOT VERIFIED refusal."""
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "reqbench-20261022-corpus-x")
+            write_run(run_dir)
+            records, _commit = self._move_out(d, run_dir, encoding="gzip")
+            path = os.path.join(records, "bench", "chromium", "results",
+                                os.path.basename(run_dir), "corpus-access.log.gz")
+            data = bytearray(open(path, "rb").read())
+            data[12:20] = b"\xff" * 8  # inside the DEFLATE stream, after the header
+            open(path, "wb").write(bytes(data))
+            git = ["git", "-C", records, "-c", "user.name=t", "-c", "user.email=t@example.com"]
+            subprocess.run(git + ["commit", "-q", "-am", "corrupt"], check=True)
+            commit = subprocess.run(git + ["rev-parse", "HEAD"], check=True,
+                                    capture_output=True, text=True).stdout.strip()
+            pointer_path = os.path.join(run_dir, campaign_summary.EXTERNAL_LOGS)
+            pointer = json.load(open(pointer_path))
+            pointer["files"]["corpus-access.log"]["commit"] = commit
+            json.dump(pointer, open(pointer_path, "w"))
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir], records=records)
+            self.assertNotEqual(rc, 0, text)
+            self.assertIn("NOT VERIFIED", text)
+
+    def test_an_unknown_log_encoding_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "reqbench-20261022-corpus-x")
+            write_run(run_dir)
+            records, _commit = self._move_out(d, run_dir, encoding="zstd")
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir], records=records)
+            self.assertNotEqual(rc, 0, text)
+            self.assertIn("unknown encoding", text)
 
     def test_a_checkout_without_the_commit_is_refused(self):
         with tempfile.TemporaryDirectory() as d:

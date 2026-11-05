@@ -1,0 +1,41 @@
+r1-r4	box1	bench-chromium-corpus CORPUS_STAMP=r1-r4 TAG=cb-r1-r4 CPU=4 NETMODE=routed ARMS=cdp,html,noop REPS=402 WARMUP=28
+r1-c2	box1	bench-chromium-corpus CORPUS_STAMP=r1-c2 TAG=cb-r1-c2 CPU=2 ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+r1-b4	box1	bench-chromium-corpus CORPUS_STAMP=r1-b4 TAG=cb-r1-b4 CPU=4 NETMODE=bridged ARMS=cdp,html,noop REPS=402 WARMUP=28
+r1-c8	box1	bench-chromium-corpus CORPUS_STAMP=r1-c8 TAG=cb-r1-c8 CPU=8 ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+r1-h4	box1	bench-chromium-corpus CORPUS_STAMP=r1-h4 TAG=cb-r1-h4 CPU=4 HUGEPAGES=1 ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+r1-w4	box1	bench-chromium-corpus CORPUS_STAMP=r1-w4 TAG=cb-r1-w4 CPU=4 ENGINE=webkit ARMS=cdp,noop REPS=202 WARMUP=28
+r1-c4	box1	bench-chromium-corpus CORPUS_STAMP=r1-c4 TAG=cb-r1-c4 CPU=4 ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+cm1-a1	box1	bench-chromium-corpus CORPUS_STAMP=cm1-a1 TAG=cb-cm1 CPU=4 ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+cm1-b	box1	bench-chromium-corpus CORPUS_STAMP=cm1-b TAG=cb-cm1 CPU=4 PHASE=run UFFD_MODE=copy ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+cm1-a2	box1	bench-chromium-corpus CORPUS_STAMP=cm1-a2 TAG=cb-cm1 CPU=4 PHASE=run ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+pf1-a1	box1	bench-chromium-corpus CORPUS_STAMP=pf1-a1 TAG=cb-pf1 CPU=4 ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+pf1-b	box1	bench-chromium-corpus CORPUS_STAMP=pf1-b TAG=cb-pf1 CPU=4 PHASE=run UFFD_PREFETCH=off ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+pf1-a2	box1	bench-chromium-corpus CORPUS_STAMP=pf1-a2 TAG=cb-pf1 CPU=4 PHASE=run ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+m4	box1	bench-chromium-corpus-extra PHASES=memory TAG=cb-r1-c4 STAMP=m4 MEM_NS=2,8,16,32,48 MEM_REPS=14 MEM_SEED=20260830 MEM_OP=screenshot
+s4	box1	bench-chromium-corpus MEASURE=scale CORPUS_STAMP=s4 TAG=cb-s4 CPU=4 SCALE_RATES=1.4,2.8,4.2 SCALE_BURSTS=5 SCALE_CONTROL_CHROMIUM=/home/ubuntu/control-chromium/chrome-linux/chrome SCALE_MAX_OFFERED_ERROR_PCT=2 SCALE_MIN_DEPARTURE_RATIO=0.95 SCALE_MAX_BACKLOG=128 SCALE_MAX_LAUNCH_LAG_MS=50 SCALE_MAX_CONTROL_DRIFT_PCT=15 SCALE_SEED=20261104
+r2-h4	box2	bench-chromium-corpus CORPUS_STAMP=r2-h4 TAG=cb-r2-h4 CPU=4 HUGEPAGES=1 ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+r2-r4	box2	bench-chromium-corpus CORPUS_STAMP=r2-r4 TAG=cb-r2-r4 CPU=4 NETMODE=routed ARMS=cdp,html,noop REPS=402 WARMUP=28
+r2-c8	box2	bench-chromium-corpus CORPUS_STAMP=r2-c8 TAG=cb-r2-c8 CPU=8 ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+r2-c2	box2	bench-chromium-corpus CORPUS_STAMP=r2-c2 TAG=cb-r2-c2 CPU=2 ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+r2-c4	box2	bench-chromium-corpus CORPUS_STAMP=r2-c4 TAG=cb-r2-c4 CPU=4 ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+r2-b4	box2	bench-chromium-corpus CORPUS_STAMP=r2-b4 TAG=cb-r2-b4 CPU=4 NETMODE=bridged ARMS=cdp,html,noop REPS=402 WARMUP=28
+r2-w4	box2	bench-chromium-corpus CORPUS_STAMP=r2-w4 TAG=cb-r2-w4 CPU=4 ENGINE=webkit ARMS=cdp,noop REPS=202 WARMUP=28
+cm2-a1	box2	bench-chromium-corpus CORPUS_STAMP=cm2-a1 TAG=cb-cm2 CPU=4 ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+cm2-b	box2	bench-chromium-corpus CORPUS_STAMP=cm2-b TAG=cb-cm2 CPU=4 PHASE=run UFFD_MODE=copy ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+cm2-a2	box2	bench-chromium-corpus CORPUS_STAMP=cm2-a2 TAG=cb-cm2 CPU=4 PHASE=run ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+pf2-a1	box2	bench-chromium-corpus CORPUS_STAMP=pf2-a1 TAG=cb-pf2 CPU=4 ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+pf2-b	box2	bench-chromium-corpus CORPUS_STAMP=pf2-b TAG=cb-pf2 CPU=4 PHASE=run UFFD_PREFETCH=off ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+pf2-a2	box2	bench-chromium-corpus CORPUS_STAMP=pf2-a2 TAG=cb-pf2 CPU=4 PHASE=run ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+m2	box2	bench-chromium-corpus-extra PHASES=memory TAG=cb-r2-c2 STAMP=m2 MEM_NS=2,8,16,32,48 MEM_REPS=14 MEM_SEED=20260830 MEM_OP=screenshot
+s2	box2	bench-chromium-corpus MEASURE=scale CORPUS_STAMP=s2 TAG=cb-s2 CPU=2 SCALE_RATES=1.4,2.8,4.2 SCALE_BURSTS=5 SCALE_CONTROL_CHROMIUM=/home/ubuntu/control-chromium/chrome-linux/chrome SCALE_MAX_OFFERED_ERROR_PCT=2 SCALE_MIN_DEPARTURE_RATIO=0.95 SCALE_MAX_BACKLOG=128 SCALE_MAX_LAUNCH_LAG_MS=50 SCALE_MAX_CONTROL_DRIFT_PCT=15 SCALE_SEED=20261104
+hc	box2	bench-chromium-corpus-extra PHASES=hostcdp HOSTCDP_ARMS=free,cpu2,cpu4,cpu8 TAG=cb-r2-c4 STAMP=hc
+r3-b4	box3	bench-chromium-corpus CORPUS_STAMP=r3-b4 TAG=cb-r3-b4 CPU=4 NETMODE=bridged ARMS=cdp,html,noop REPS=402 WARMUP=28
+r3-c4	box3	bench-chromium-corpus CORPUS_STAMP=r3-c4 TAG=cb-r3-c4 CPU=4 ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+r3-h4	box3	bench-chromium-corpus CORPUS_STAMP=r3-h4 TAG=cb-r3-h4 CPU=4 HUGEPAGES=1 ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+r3-c8	box3	bench-chromium-corpus CORPUS_STAMP=r3-c8 TAG=cb-r3-c8 CPU=8 ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+r3-w4	box3	bench-chromium-corpus CORPUS_STAMP=r3-w4 TAG=cb-r3-w4 CPU=4 ENGINE=webkit ARMS=cdp,noop REPS=202 WARMUP=28
+r3-c2	box3	bench-chromium-corpus CORPUS_STAMP=r3-c2 TAG=cb-r3-c2 CPU=2 ARMS=cdp,cdp-fast,html-fast,noop,noop-fast REPS=202 WARMUP=28
+r3-r4	box3	bench-chromium-corpus CORPUS_STAMP=r3-r4 TAG=cb-r3-r4 CPU=4 NETMODE=routed ARMS=cdp,html,noop REPS=402 WARMUP=28
+m8	box3	bench-chromium-corpus-extra PHASES=memory TAG=cb-r3-c8 STAMP=m8 MEM_NS=2,8,16,32,48 MEM_REPS=14 MEM_SEED=20260830 MEM_OP=screenshot
+s8	box3	bench-chromium-corpus MEASURE=scale CORPUS_STAMP=s8 TAG=cb-s8 CPU=8 SCALE_RATES=1.4,2.8,4.2 SCALE_BURSTS=5 SCALE_CONTROL_CHROMIUM=/home/ubuntu/control-chromium/chrome-linux/chrome SCALE_MAX_OFFERED_ERROR_PCT=2 SCALE_MIN_DEPARTURE_RATIO=0.95 SCALE_MAX_BACKLOG=128 SCALE_MAX_LAUNCH_LAG_MS=50 SCALE_MAX_CONTROL_DRIFT_PCT=15 SCALE_SEED=20261104
+m4h	box3	bench-chromium-corpus-extra PHASES=memory TAG=cb-r3-c4 STAMP=m4h MEM_NS=2,8,16,32,48 MEM_REPS=14 MEM_SEED=20260830 MEM_OP=html
