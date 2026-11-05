@@ -39,6 +39,7 @@ class Stats(unittest.TestCase):
         self.assertEqual(render.p95(xs), 19)
         self.assertEqual(render.p95([5.0]), 5.0)
         self.assertEqual(render.p95(list(range(1, 101))), 95)
+        self.assertEqual(render.p99(list(range(1, 23))), 22)  # 22 samples: p99 is the slowest
 
     def test_median_of_even_count_is_the_mean_of_the_middle_two(self):
         self.assertEqual(render.median([1, 2, 3, 10]), 2.5)

@@ -37,6 +37,6 @@ cd fcvm && git checkout -q "$1"
 
 cd /mnt/fcvm-btrfs/src/fcvm
 # a new login picks up the kvm group
-sg kvm -c "source ~/.cargo/env && make build && make setup-fcvm"
+sg kvm -c ". ~/.cargo/env && make build && make setup-fcvm"
 podman build -t localhost/boot-race-workload ~/boot-race/img
 echo BOX_SETUP_DONE

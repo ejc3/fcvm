@@ -102,10 +102,18 @@ def median(xs):
     return statistics.median(xs)
 
 
-def p95(xs):
-    """Nearest-rank 95th percentile: the smallest sample at or above 95% of the samples."""
+def nearest_rank(xs, q):
+    """Nearest-rank percentile: the smallest sample at or above the fraction q of the samples."""
     s = sorted(xs)
-    return s[max(0, math.ceil(0.95 * len(s)) - 1)]
+    return s[max(0, math.ceil(q * len(s)) - 1)]
+
+
+def p95(xs):
+    return nearest_rank(xs, 0.95)
+
+
+def p99(xs):
+    return nearest_rank(xs, 0.99)
 
 
 def build(results):
@@ -168,6 +176,7 @@ def build(results):
                 "failed": failed,
                 "median_ms": round(median(ms), 1) if ms else None,
                 "p95_ms": round(p95(ms), 1) if ms else None,
+                "p99_ms": round(p99(ms), 1) if ms else None,
                 "min_ms": round(min(ms), 1) if ms else None,
                 "max_ms": round(max(ms), 1) if ms else None,
                 "checks": checks,
@@ -210,7 +219,7 @@ def main():
     with open(a.out, "w") as f:
         f.write(out)
     for l in data["lanes"]:
-        print(f"{l['id']:14} n={l['n']:3} fail={l['failures']} median={l['median_ms']} p95={l['p95_ms']}", file=sys.stderr)
+        print(f"{l['id']:14} n={l['n']:3} fail={l['failures']} median={l['median_ms']} p95={l['p95_ms']} p99={l['p99_ms']}", file=sys.stderr)
 
 
 if __name__ == "__main__":

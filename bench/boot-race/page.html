@@ -103,12 +103,12 @@
 
 <h2>Results</h2>
 <div class="scroll"><table id="summary">
-  <thead><tr><th>Lane</th><th class="num">Median</th><th class="num">p95</th>
+  <thead><tr><th>Lane</th><th class="num">Median</th><th class="num">p95</th><th class="num">p99</th>
   <th class="num">Range</th><th class="num">n</th><th class="num">Failed</th></tr></thead>
   <tbody></tbody>
 </table></div>
 <p class="muted" style="font-size:14px">Median of the successful samples; p95 is the nearest-rank 95th
-percentile. A failed sample is a run that did not answer within its deadline or whose API call was refused; it
+percentile and p99 the 99th, which with fewer than 100 samples is the slowest one. A failed sample is a run that did not answer within its deadline or whose API call was refused; it
 is counted here and left out of the times. So is a sample whose answer came from the wrong process (an identity
 check below).</p>
 <div id="failures" class="muted" style="font-size:15px"></div>
@@ -177,7 +177,7 @@ for (const l of D.lanes){
   const tr = document.createElement("tr");
   const cells = [
     `<span class="dot" style="background:${varOf(l.id)}"></span>${l.name}`,
-    fmt(l.median_ms), fmt(l.p95_ms), `${fmt(l.min_ms)} to ${fmt(l.max_ms)}`, l.n, l.failures,
+    fmt(l.median_ms), fmt(l.p95_ms), fmt(l.p99_ms), `${fmt(l.min_ms)} to ${fmt(l.max_ms)}`, l.n, l.failures,
   ];
   cells.forEach((c,i)=>{ const td=document.createElement("td"); if(i>=1) td.className="num"; td.innerHTML=c; tr.appendChild(td); });
   tb.appendChild(tr);

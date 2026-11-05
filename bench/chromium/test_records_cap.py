@@ -158,6 +158,22 @@ class RecordsCap(unittest.TestCase):
             self.assertIsNotNone(records.entry(os.path.join(alias, "analysis.json")))
             self.assertTrue(campaign_summary.Sources(alias).exists(os.path.join(alias, "analysis.json")))
 
+    def test_a_boot_race_campaign_moves_its_raw_files_and_keeps_its_summary(self):
+        """bench/boot-race runs use their own raw patterns, and their manifest goes beside them. RED BEFORE
+        THE CHANGE: run_raw_files matched the chromium patterns and listed none of a boot-race run's files."""
+        run = os.path.join(records.BOOT_RACE_RESULTS, "boot-race-test")
+        prefix = os.path.relpath(run, records.REPO) + "/"
+        names = ["samples.jsonl", "lambda-reports.json", "config.json", "fcvm-serve.log",
+                 "fcvm-logs/br-fcvm-file-0.log", "setup.json"]
+        with mock.patch.object(records, "committed_files", side_effect=lambda pre: [pre + n for n in names]):
+            raw = records.run_raw_files(run)
+        self.assertEqual(sorted(raw), sorted(prefix + n for n in names if n != "setup.json"))
+        self.assertEqual(records.results_dir([run]), records.BOOT_RACE_RESULTS)
+        self.assertEqual(records.results_dir([os.path.join(records.RESULTS, "x")]), records.RESULTS)
+        with self.assertRaises(SystemExit):
+            records.results_dir([run, os.path.join(records.RESULTS, "x")])
+
+
 
 if __name__ == "__main__":
     unittest.main()
