@@ -42,7 +42,7 @@ pub use snapshot::{
 };
 pub(crate) use vm_config::{
     build_launch_config, build_runtime_boot_args, cleanup_nfs_exports, configure_and_boot_vm,
-    setup_nfs_exports, GuestBootInputs,
+    guest_dns, setup_nfs_exports, GuestBootInputs, GuestDns,
 };
 use vm_config::{run_vm_setup, VmSetupParams};
 
@@ -878,6 +878,25 @@ pub(crate) fn parse_labels(labels: &[String]) -> std::collections::HashMap<Strin
         .collect()
 }
 
+/// The host identity address a run names with `--env HOST_IPV6=<addr>`, which
+/// fc-agent adds to the guest's lo. The last one wins, as in the boot plan's env
+/// map. A value that is not an IPv6 address names none.
+fn run_host_ipv6(env: &[String]) -> Option<std::net::Ipv6Addr> {
+    let value = env
+        .iter()
+        .rev()
+        .find_map(|entry| entry.strip_prefix("HOST_IPV6="))?;
+    match value.parse() {
+        Ok(address) => Some(address),
+        Err(_) => {
+            if !value.is_empty() {
+                warn!("HOST_IPV6={value} is not an IPv6 address; the restored guest gets none");
+            }
+            None
+        }
+    }
+}
+
 fn snapshot_restore_args(
     args: &RunArgs,
     snapshot_key: &str,
@@ -896,6 +915,9 @@ fn snapshot_restore_args(
         map: Vec::new(),
         ipv6_prefix: launch_ipv6_prefix(args),
         ipv6_address: args.ipv6_address,
+        // This run's HOST_IPV6, which the snapshot key leaves out: the restored guest
+        // takes it in place of the one its snapshot was booted with.
+        host_ipv6: run_host_ipv6(&args.env),
         // A VM with a passthrough device can not be snapshotted, so a --gpu run takes
         // no startup snapshot.
         startup_snapshot_base_key: startup_snapshot_base_key.filter(|_| args.gpu.is_empty()),
@@ -1778,6 +1800,7 @@ async fn prepare_vm_for_lifecycle(
     vm_state.config.health_check_url = args.health_check.clone();
     vm_state.config.health_check_timeout = args.health_check_timeout;
     vm_state.config.restore_hook = args.on_restore.clone();
+    vm_state.config.dns_override = args.dns.clone();
     vm_state.config.hugepages = args.hugepages;
     vm_state.config.balloon_mib = args.balloon;
     vm_state.config.balloon_free_page_reporting = args.free_page_reporting;
@@ -3657,6 +3680,44 @@ mod tests {
             key(&base, None),
             key(&base, Some("arm64.nv2".to_string())),
             "extra boot args must change the key"
+        );
+    }
+
+    /// A snapshot is portable across hosts: two runs that differ only in the host
+    /// identity address they name share its key, and a cache hit hands the restored
+    /// guest this run's address, not the one the snapshot was booted with.
+    #[test]
+    fn host_ipv6_is_given_at_restore_and_not_keyed() {
+        use std::path::Path;
+        let key = |args: &RunArgs| {
+            build_firecracker_config(
+                args,
+                "sha256:test",
+                Path::new("/kernel"),
+                Path::new("/rootfs"),
+                Path::new("/initrd"),
+                None,
+                ImageMode::Overlay,
+                None,
+                None,
+                None,
+                None,
+                GuestBootInputs::default(),
+                &[],
+            )
+            .snapshot_key()
+        };
+        let mut prepare = test_args();
+        prepare.env = vec!["HOST_IPV6=2001:db8:a::1".to_string()];
+        let mut restore = test_args();
+        restore.env = vec!["HOST_IPV6=2001:db8:b::1".to_string()];
+        assert_eq!(key(&prepare), key(&restore));
+
+        let args = snapshot_restore_args(&restore, "key", None, (None, None));
+        assert_eq!(args.host_ipv6, Some("2001:db8:b::1".parse().unwrap()));
+        assert_eq!(
+            snapshot_restore_args(&test_args(), "key", None, (None, None)).host_ipv6,
+            None
         );
     }
 

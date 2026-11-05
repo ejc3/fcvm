@@ -220,6 +220,10 @@ pub struct SnapshotMetadata {
     /// the clone is published; see `--on-restore`.
     #[serde(default)]
     pub restore_hook: Option<String>,
+    /// The source VM's `--dns`, which names the guest's resolver whatever host runs
+    /// it. Without one, a restore gives the guest the restoring host's resolvers.
+    #[serde(default)]
+    pub dns_override: Option<String>,
     /// Whether VM uses 2MB hugepage-backed memory
     #[serde(default)]
     pub hugepages: bool,
@@ -848,6 +852,7 @@ mod tests {
                 health_check_url: None,
                 health_check_timeout: 5,
                 restore_hook: None,
+                dns_override: None,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -1053,6 +1058,7 @@ mod tests {
                 health_check_url: None,
                 health_check_timeout: 5,
                 restore_hook: None,
+                dns_override: None,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -1141,6 +1147,7 @@ mod tests {
                     health_check_url: None,
                     health_check_timeout: 5,
                     restore_hook: None,
+                    dns_override: None,
                     hugepages: false,
                     extra_disks: vec![],
                     pmem_devices: vec![],
@@ -1216,6 +1223,7 @@ mod tests {
                 health_check_url: None,
                 health_check_timeout: 5,
                 restore_hook: None,
+                dns_override: None,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -1416,6 +1424,7 @@ mod tests {
                 health_check_url: None,
                 health_check_timeout: 5,
                 restore_hook: None,
+                dns_override: None,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -1572,6 +1581,7 @@ mod tests {
             health_check_url: None,
             health_check_timeout: 5,
             restore_hook: None,
+            dns_override: None,
             hugepages: false,
             extra_disks: vec![],
             pmem_devices: vec![],
