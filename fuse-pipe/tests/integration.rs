@@ -327,3 +327,90 @@ fn test_lseek_supports_negative_offsets() {
     drop(fuse);
     cleanup(&data_dir, &mount_dir);
 }
+
+/// Bytes of this process's anonymous mappings that are commit-accounted
+/// (`ac` in smaps VmFlags), the ones `fork()` checks one at a time.
+fn accounted_anonymous_bytes() -> u64 {
+    let smaps = fs::read_to_string("/proc/self/smaps").expect("read /proc/self/smaps");
+    let (mut total, mut anonymous, mut size) = (0, false, 0);
+    for line in smaps.lines() {
+        let mut fields = line.split_whitespace();
+        let first = fields.next().unwrap_or("");
+        if first.contains('-') && first.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+            // "start-end perms offset dev inode [path]": anonymous has no path.
+            anonymous = fields.nth(4).is_none();
+        } else if first == "Size:" {
+            size = fields.next().and_then(|kb| kb.parse::<u64>().ok()).unwrap() * 1024;
+        } else if first == "VmFlags:" && anonymous && fields.any(|flag| flag == "ac") {
+            total += size;
+        }
+    }
+    total
+}
+
+/// How many of fuser's reader threads (`fuser-N`) are blocked in read(2) on
+/// their FUSE fd. A reader maps its request buffer before its first read.
+fn readers_blocked_in_read() -> usize {
+    let mut blocked = 0;
+    for task in fs::read_dir("/proc/self/task").expect("read /proc/self/task") {
+        let task = task.expect("task entry").path();
+        let comm = fs::read_to_string(task.join("comm")).unwrap_or_default();
+        if !comm.starts_with("fuser-") {
+            continue;
+        }
+        let syscall = fs::read_to_string(task.join("syscall")).unwrap_or_default();
+        let number = syscall
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse::<i64>().ok());
+        if number == Some(libc::SYS_read) {
+            blocked += 1;
+        }
+    }
+    blocked
+}
+
+/// fc-agent starts a tty exec with fork(). Under vm.overcommit_memory=0,
+/// fork() refuses with ENOMEM to copy any one commit-accounted mapping larger
+/// than RAM plus swap. fuser gave each reader a 16 MiB heap buffer, adjacent
+/// buffers merge into one mapping, and 62 of the guest's 64 side by side
+/// exceed a 1 GiB guest's 1,007,956 kB MemTotal: every tty exec then failed
+/// with "cannot run "podman": Out of memory (os error 12)" (chaos fuzz, seed
+/// 1, op 8 ExecTty). The readers' buffers must not be commit-accounted.
+#[test]
+fn reader_buffers_are_not_commit_accounted() {
+    // fc-agent's default (fc-agent/src/fuse/mod.rs DEFAULT_NUM_READERS).
+    const READERS: usize = 64;
+    const BUFFER: u64 = 16 << 20;
+    common::increase_ulimit();
+
+    let before = accounted_anonymous_bytes();
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
+    let fuse = FuseMount::new(&data_dir, &mount_dir, READERS);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while readers_blocked_in_read() < READERS {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {} of {READERS} readers reached read(2) within 30 s",
+            readers_blocked_in_read()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let grew = accounted_anonymous_bytes().saturating_sub(before);
+
+    drop(fuse);
+    cleanup(&data_dir, &mount_dir);
+
+    // Each reader also has a 2 MiB accounted stack, so the readers alone
+    // account at least 128 MiB either way. Their buffers would add 1 GiB.
+    // vm.overcommit_memory=2 ignores MAP_NORESERVE; this host's value is in the message.
+    let overcommit = fs::read_to_string("/proc/sys/vm/overcommit_memory").unwrap_or_default();
+    assert!(
+        grew < READERS as u64 * BUFFER,
+        "a {READERS}-reader mount added {} MiB of commit-accounted anonymous memory \
+         (vm.overcommit_memory={}); its read buffers are accounted, which fork() checks",
+        grew >> 20,
+        overcommit.trim()
+    );
+}

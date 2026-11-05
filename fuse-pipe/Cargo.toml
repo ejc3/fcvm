@@ -39,8 +39,10 @@ tracing-log = "0.2"  # Bridge log crate to tracing
 fuse-backend-rs = { git = "https://github.com/ejc3/fuse-backend-rs.git", branch = "master", default-features = false, features = ["fusedev"] }
 
 # FUSE client (fork with clone_fd for true parallel readers + remap_file_range)
-# Based on upstream PR #636 (clone_fd for parallel processing) + remap_file_range
-fuser = { git = "https://github.com/ejc3/fuser.git", branch = "remap-file-range-on-clone-fd", features = ["abi-7-28"] }
+# Based on upstream PR #636 (clone_fd for parallel processing) + remap_file_range,
+# with each reader's 16 MiB request buffer mapped MAP_NORESERVE so it is not
+# commit-accounted (fuse-pipe/tests/integration.rs reader_buffers_are_not_commit_accounted)
+fuser = { git = "https://github.com/ejc3/fuser.git", branch = "read-buf-noreserve", features = ["abi-7-28"] }
 
 # Concurrent data structures
 dashmap = "5.5"
