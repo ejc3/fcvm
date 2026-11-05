@@ -373,11 +373,16 @@ class ReportContent(unittest.TestCase):
             if "corpus" in text:
                 for attempts, b in bounds.items():
                     self.assertIn(next(iter(b)), text, f"a corpus zero-failure count without its interval for {attempts}: {text[:160]!r}")
-                    # The first interval after a count is that count's own.
-                    after = re.search(rf"\b{attempts} attempts.*?\b0 to (\d+(?:\.\d+)?%)", text)
-                    self.assertIsNotNone(after, f"no interval follows {attempts} attempts: {text[:200]!r}")
-                    self.assertEqual(after.group(1), next(iter(b)),
-                                     f"{attempts} attempts carry another count's interval: {text[:200]!r}")
+                    # The first interval after each statement of a count is
+                    # that count's own; every statement is checked, so a second
+                    # one carrying another count's interval fails.
+                    stated = list(re.finditer(rf"\b{attempts} attempts", text))
+                    self.assertTrue(stated, f"no statement of {attempts} attempts: {text[:200]!r}")
+                    for count in stated:
+                        after = re.compile(r".*?\b0 to (\d+(?:\.\d+)?%)").match(text, count.end())
+                        self.assertIsNotNone(after, f"no interval follows {attempts} attempts: {text[count.start():][:200]!r}")
+                        self.assertEqual(after.group(1), next(iter(b)),
+                                         f"{attempts} attempts carry another count's interval: {text[count.start():][:200]!r}")
                 counts = re.findall(r"\b0 (?:of|failures in|in) (?:the [\w-]+ arm[\u2019']s )?(\d[\d,]*)", text)
                 self.assertEqual(set(counts), set(bounds), f"attempt counts {counts} in: {text[:160]!r}")
         self.assertGreaterEqual(checked, 1, "no zero-failure count was checked; the sample-gate bullet states one")
@@ -418,8 +423,14 @@ class ReportContent(unittest.TestCase):
             builds.add((firecracker["branch"], firecracker["commit"], firecracker["sha256"]))
         self.assertEqual(len(builds), 1, f"the cited runs used {len(builds)} Firecracker builds")
         branch, commit, sha = builds.pop()
-        # The branch as a whole name: a longer branch that contains it is another branch.
-        self.assertRegex(plain(fc), rf"(?<![\w./-]){re.escape(branch)}(?![\w./-])")
+        # The branch as a whole token: a longer name that contains it
+        # (`<branch>+old`, or `<branch><wbr>-old`, which plain() would split at
+        # the <wbr>) is another branch. Every token naming it must be exactly it.
+        tokens = [t.strip("()[]{}\"'\u201c\u201d\u2018\u2019").rstrip(".,;:")
+                  for t in plain(fc.replace("<wbr>", "")).split()]
+        self.assertIn(branch, tokens, "the Firecracker build section does not name the branch as a whole token")
+        self.assertEqual([t for t in tokens if branch in t and t != branch], [],
+                         "the Firecracker build section names a longer branch containing the run's")
         self.assertIn(commit[:8], fc)
         self.assertIn(sha[:12], fc)
         rest = self.page.replace(fc, "")
@@ -441,6 +452,29 @@ class ReportContent(unittest.TestCase):
             self.page = page.replace(branch, branch + "-old")
             with self.assertRaises(AssertionError):
                 self.test_each_cited_run_is_attributed_to_the_firecracker_it_ran()
+        finally:
+            self.page = page
+
+    def test_a_second_interval_or_a_spliced_branch_fails(self):
+        """RED BEFORE THE FIX (#1528): a second statement of a count carrying
+        another count's interval passed, because only the first interval after
+        the first statement was checked; and the branch with `+old`, or with
+        `<wbr>-old` (which plain() turns into a space), passed the whole-name
+        match."""
+        page = self.page
+        try:
+            unit = next(u for u in re.findall(r"<(?:li|p|td)\b[^>]*>(.*?)</(?:li|p|td)>", page, re.S)
+                        if "corpus" in plain(u) and re.search(r"\b230 attempts", plain(u))
+                        and re.search(r"\b430 attempts", plain(u)))
+            self.page = page.replace(unit, unit + " 0 failures in 230 attempts, an interval of 0 to 0.85%.", 1)
+            with self.assertRaises(AssertionError):
+                self.test_the_zero_failure_count_carries_its_interval()
+            branch = json.loads(records.first_line(os.path.join(
+                HERE, "results", self.campaign_runs(self.campaign_id())[0], "reqbench.jsonl")))["firecracker"]["branch"]
+            for spliced in (branch + "+old", branch + "<wbr>-old"):
+                self.page = page.replace(branch, spliced)
+                with self.assertRaises(AssertionError, msg=spliced):
+                    self.test_each_cited_run_is_attributed_to_the_firecracker_it_ran()
         finally:
             self.page = page
 

@@ -2397,10 +2397,11 @@ class ReplayAddressByNetworkMode(unittest.TestCase):
             self.assertIn("rc=0", free.stdout, free.stderr)
             self.assertIn("ip link del fcvmreplay0", read_if_exists(calls), "a device left behind was not replaced")
 
-    def test_the_dns_sampler_does_not_hold_the_replay_device_lock(self):
-        """Red before the fix: the sampler subshell inherited REPLAY_LOCK_FD, so
-        a sampler left running by a SIGKILLed campaign kept the lock and every
-        later root-mode campaign refused to start."""
+    def _sampler_lock_check(self, listing="ls -l"):
+        """Run the shipped sampler starter under a held replay lock, list its
+        descriptors with `listing`, and return (stdout lines, stderr, sampler
+        pid). The generated script reaps the sampler from an EXIT trap, so a
+        failed listing that exits early cannot leave it running."""
         text = campaign()
         # The shipped loop and starter; one sample that always succeeds, so the
         # sampler stays alive to be inspected.
@@ -2413,15 +2414,51 @@ class ReplayAddressByNetworkMode(unittest.TestCase):
             os.makedirs(results)
             script = (f"set -uo pipefail\nRESULTS={results}\nDNS_SAMPLE_INTERVAL=30\nREPLAY_BIND_URL=127.0.0.1\n"
                       f"SAMPLER_PID=\nSAMPLER_ALIVE_AT_STOP=\n{funcs}"
+                      "reap_sampler() { [ -n \"$SAMPLER_PID\" ] || return 0; pkill -P $SAMPLER_PID; kill $SAMPLER_PID; } 2>/dev/null\n"
+                      "trap reap_sampler EXIT\n"
                       f"exec {{REPLAY_LOCK_FD}}>>'{lock}'\nflock -n $REPLAY_LOCK_FD\nstart_dns_sampler >/dev/null 2>&1\n"
+                      "echo pid=$SAMPLER_PID\n"
                       "sleep 0.5\n[ -d /proc/$SAMPLER_PID ] && echo alive\n"
-                      "fds=$(ls -l /proc/$SAMPLER_PID/fd/) || { echo LS-FAILED; exit 1; }\n"
-                      "grep -c 'replay.lock' <<<\"$fds\"\npkill -P $SAMPLER_PID; kill $SAMPLER_PID\n")
+                      f"fds=$({listing} /proc/$SAMPLER_PID/fd/) || {{ echo LS-FAILED; exit 1; }}\n"
+                      "grep -c 'replay.lock' <<<\"$fds\"\n")
             out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
-            lines = out.stdout.strip().splitlines()
-            self.assertIn("alive", lines, "the sampler did not stay up; the check is vacuous" + out.stderr)
-            self.assertNotIn("LS-FAILED", lines, "the sampler's descriptors could not be listed")
-            self.assertEqual(lines[-1], "0", "the sampler holds the replay device lock" + out.stderr)
+        lines = out.stdout.strip().splitlines()
+        pid = next((int(line[4:]) for line in lines if line.startswith("pid=") and line[4:].isdigit()), None)
+        return lines, out.stderr, pid
+
+    @staticmethod
+    def _gone(pid, within_s=5.0):
+        """True once no process has pid (a zombie counts as gone)."""
+        deadline = time.monotonic() + within_s
+        while time.monotonic() < deadline:
+            try:
+                with open(f"/proc/{pid}/stat") as f:
+                    if f.read().rsplit(")", 1)[1].split()[0] == "Z":
+                        return True
+            except FileNotFoundError:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_the_dns_sampler_does_not_hold_the_replay_device_lock(self):
+        """Red before the fix: the sampler subshell inherited REPLAY_LOCK_FD, so
+        a sampler left running by a SIGKILLed campaign kept the lock and every
+        later root-mode campaign refused to start."""
+        lines, err, pid = self._sampler_lock_check()
+        self.assertIn("alive", lines, "the sampler did not stay up; the check is vacuous" + err)
+        self.assertNotIn("LS-FAILED", lines, "the sampler's descriptors could not be listed")
+        self.assertEqual(lines[-1], "0", "the sampler holds the replay device lock" + err)
+        self.assertTrue(self._gone(pid), f"the sampler {pid} outlived the check")
+
+    def test_the_sampler_lock_check_reaps_its_sampler_when_the_listing_fails(self):
+        """RED BEFORE THE FIX (#1512): the `exit 1` taken when the descriptor
+        listing failed skipped the kill after it, so the sampler subshell and its
+        sleep child outlived the test by up to 30 s."""
+        lines, err, pid = self._sampler_lock_check(listing="false")
+        self.assertIn("alive", lines, "the sampler did not stay up; the check is vacuous" + err)
+        self.assertIn("LS-FAILED", lines, "the listing did not fail; the check is vacuous")
+        self.assertIsNotNone(pid, lines)
+        self.assertTrue(self._gone(pid), f"the sampler {pid} outlived a failed listing")
 
     def test_every_root_phase_runs_fcvm_under_sudo_in_the_mode(self):
         """A bridged or routed fcvm needs root, and reqbench runs it as root only
