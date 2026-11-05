@@ -186,6 +186,10 @@ pub enum Intent {
     },
     /// A connected page asks for the GPUs: an arrival, which wakes a sleeping fleet.
     Wake,
+    /// Potato mode: shorten the hold the ball carries by a fifth.
+    PotatoFaster,
+    /// Potato mode: start the current size again.
+    PotatoRestart,
 }
 
 fn opt_str(args: &serde_json::Value, key: &str, what: &str) -> Result<Option<String>, String> {
@@ -355,6 +359,8 @@ impl Intent {
             "claim_phone" => Ok(Intent::ClaimPhone {
                 phone: opt_str(args, "phone", "a phone id")?,
             }),
+            "potato_faster" => Ok(Intent::PotatoFaster),
+            "potato_restart" => Ok(Intent::PotatoRestart),
             "phones_zoom" => Ok(Intent::PhonesZoom {
                 out: args
                     .get("out")

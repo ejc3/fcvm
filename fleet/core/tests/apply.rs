@@ -1239,3 +1239,50 @@ fn a_borrowed_phone_holds_the_fleet_awake_past_the_arrival_limit() {
         Some("the GPUs are asleep")
     );
 }
+
+/// Potato mode: each size's record, the ladder's position and the records are acknowledged
+/// state. They survive a coordinator restart (the state file, then `State::resumed`), and
+/// the round and the players, which went with the agent's connection, do not.
+#[test]
+fn the_potato_ladder_and_records_survive_a_coordinator_restart() {
+    let vector: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/33_potato.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let config = config_with(serde_json::json!({ "potato": vector["config"]["potato"] }));
+    let all = events(vector["events"].clone());
+    // through the proof drop (event 13): size 2 holds a record and the ladder moved to 4
+    let state = all[..14].iter().fold(State::new(config.clone(), 0), apply);
+    assert_eq!(state.fleet.potato.ladder[0].record_hold_ms, Some(2000));
+    let saved = serde_json::to_string(&state).unwrap();
+    let restored: State = serde_json::from_str(&saved).unwrap();
+    let resumed = restored.resumed(config, 20_000);
+    let p = &resumed.fleet.potato;
+    assert_eq!(p.ladder[0].record_hold_ms, Some(2000));
+    assert_eq!(
+        p.ladder[0].broke.as_ref().map(|d| d.reason.as_str()),
+        Some("proof")
+    );
+    assert_eq!(
+        p.ladder[p.rung].size, 4,
+        "the ladder resumes at the size it was on"
+    );
+    assert_eq!(p.records.longest_round.as_ref().map(|r| r.value), Some(3.0));
+    assert_eq!(
+        p.records.fastest_cycle_ms.as_ref().map(|r| r.value),
+        Some(650.0)
+    );
+    assert!(p.round.is_none() && p.players.is_empty() && p.host.is_none());
+    // a host that connects again plays the next round at that size, with the next round id
+    let hello: Event = serde_json::from_value(serde_json::json!({"type": "agent", "at": 21_000, "host": "h1", "msg": {
+        "type": "hello", "host": "h1", "arch": "x86_64", "gpus": [], "capacity": 0, "potato_players": 4}}))
+    .unwrap();
+    let tick: Event =
+        serde_json::from_value(serde_json::json!({"type": "tick", "at": 22_000})).unwrap();
+    let state = apply(apply(resumed, &hello), &tick);
+    let r = state.fleet.potato.round.as_ref().expect("a round");
+    assert_eq!((r.id, r.size), (2, 4));
+}
