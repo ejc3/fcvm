@@ -242,7 +242,7 @@ class Player:
             if msg["type"] == kind:
                 return t, msg
 
-    async def sleep(self):
+    async def sleep(self, env=None):
         """`fcvm snapshot create --stop` (POTATO_STOP=0: create, then SIGTERM to the VM's fcvm).
         Returns the stage times."""
         assert self.phase in ("awake", "sleeping"), self.phase
@@ -252,7 +252,7 @@ class Player:
         if STOP:
             args.append("--stop")
         p = await asyncio.create_subprocess_exec(
-            *args, stdin=asyncio.subprocess.DEVNULL, stdout=self.log("create"), stderr=asyncio.subprocess.STDOUT, env=ENV)
+            *args, stdin=asyncio.subprocess.DEVNULL, stdout=self.log("create"), stderr=asyncio.subprocess.STDOUT, env=env or ENV)
         rc = await p.wait()
         t1 = now()
         if rc != 0:
@@ -276,7 +276,7 @@ class Player:
         out.update(parse_firecracker(self.logpath("run")))
         return out
 
-    async def wake(self, full=False):
+    async def wake(self, full=False, env=None):
         """fcvm snapshot run; returns when the ball port answers a probe and the player said hello."""
         self.phase = "waking"
         t0 = now()
@@ -287,7 +287,7 @@ class Player:
         self.lives += 1
         self.proc = await asyncio.create_subprocess_exec(
             *args, stdin=asyncio.subprocess.DEVNULL, stdout=self.log("run"), stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True, env=ENV)
+            start_new_session=True, env=env or ENV)
         while not self.hellos.empty():
             self.hellos.get_nowait()
         probe_task = asyncio.create_task(probe_until_open(self.addr, BALL_PORT, 60))
@@ -776,6 +776,66 @@ class Game:
         # a catch after the round ended still stepped the player; the watcher recorded it
 
 
+def wake_steps(run_log):
+    """Each step of one `fcvm snapshot run`, in ms, from its own log lines."""
+    ls = lines(run_log)
+    marks = [("lock_config", "loaded snapshot configuration"), ("pre_network", "setting up routed networking"),
+             ("veth_ns", "assigned link-local to host veth"), ("ndp", "added proxy NDP"),
+             ("forward", "forwarding guest localhost ports"), ("pre_disk", "restoring on Firecracker"),
+             ("disk", "created the disk directory"), ("vmm", "VM resume completed"),
+             ("guest", "fc-agent acknowledged exact restore generation")]
+    t_prev = stamp(ls[0]) if ls and stamp(ls[0]) else None
+    out = {}
+    for name, needle in marks:
+        t, _ = first(ls, needle)
+        if t is None or t_prev is None:
+            return out
+        out[name] = ms(t_prev, t)
+        t_prev = t
+    return out
+
+
+async def cmd_burst(a):
+    """Wake K players at once while K others go to sleep, trial after trial, the arms
+    (--arm NAME=VAR=VALUE,...) interleaved trial by trial; one JSON line per wake."""
+    arms = [("base", {})]
+    for spec in a.arm:
+        name, _, kv = spec.partition("=")
+        arms.append((name, dict(x.split("=", 1) for x in kv.split(",") if x)))
+    prefix = host_prefix()
+    k = a.concurrency
+    host = Host(a.out, 2 * k, prefix)
+    await host.start()
+    rec = open(os.path.join(a.out, "burst.jsonl"), "a")
+    sem = asyncio.Semaphore(8)
+
+    async def boot(p):
+        async with sem:
+            await p.boot()
+    await asyncio.gather(*(boot(p) for p in host.players))
+    group = [host.players[:k], host.players[k:]]
+    for p in group[1]:
+        await p.sleep()
+    for i in range(a.trials):
+        name, extra = arms[i % len(arms)]
+        env = dict(ENV, **extra)
+        waking, sleeping = group[(i + 1) % 2], group[i % 2]
+
+        async def wake(p):
+            t0, hello_t, _, probe_t, _, refusals = await p.wake(env=env)
+            return p, ms(t0, max(hello_t, probe_t)), refusals
+        results = await asyncio.gather(*(wake(p) for p in waking), *(p.sleep(env=env) for p in sleeping))
+        for p, total, refusals in results[:k]:
+            row = {"trial": i, "arm": name, "player": p.k, "wake_ms": total, "refusals": refusals,
+                   **wake_steps(p.logpath("run"))}
+            rec.write(json.dumps(row) + "\n")
+        rec.flush()
+        print(f"trial {i} {name}: " + " ".join(f"{r[1]:.0f}" for r in results[:k]), flush=True)
+    for p in host.players:
+        if p.proc:
+            await p.sleep()
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -803,9 +863,14 @@ def main():
     l.add_argument("--start-floor", type=int, default=0, help="no size starts below this hold, ms")
     l.add_argument("--parallel", type=int, default=8)
     l.add_argument("out")
+    b = sub.add_parser("burst")
+    b.add_argument("--concurrency", type=int, default=4, help="wakes at once, with as many sleeps")
+    b.add_argument("--trials", type=int, default=60)
+    b.add_argument("--arm", action="append", default=[], help="NAME=VAR=VALUE,... : environment of an arm, interleaved with the base arm")
+    b.add_argument("out")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
-    asyncio.run({"cycles": cmd_cycles, "memory": cmd_memory, "ladder": cmd_ladder}[a.cmd](a))
+    asyncio.run({"cycles": cmd_cycles, "memory": cmd_memory, "ladder": cmd_ladder, "burst": cmd_burst}[a.cmd](a))
 
 
 if __name__ == "__main__":
