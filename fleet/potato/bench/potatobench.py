@@ -248,7 +248,7 @@ class Player:
         assert self.phase in ("awake", "sleeping"), self.phase
         self.phase = "sleeping"
         t0 = now()
-        args = [FCVM, "snapshot", "create", "--pid", str(self.proc.pid), "--tag", self.tag]
+        args = [(env or ENV).get("FCVM_BIN", FCVM), "snapshot", "create", "--pid", str(self.proc.pid), "--tag", self.tag]
         if STOP:
             args.append("--stop")
         p = await asyncio.create_subprocess_exec(
@@ -280,7 +280,7 @@ class Player:
         """fcvm snapshot run; returns when the ball port answers a probe and the player said hello."""
         self.phase = "waking"
         t0 = now()
-        args = [FCVM, "snapshot", "run", "--snapshot", self.tag, "--name", self.name,
+        args = [(env or ENV).get("FCVM_BIN", FCVM), "snapshot", "run", "--snapshot", self.tag, "--name", self.name,
                 "--ipv6-prefix", self.prefix, "--ipv6-address", self.addr]
         if full:
             args.append("--no-dirty-tracking")
