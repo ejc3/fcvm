@@ -210,8 +210,8 @@ pub struct Drop {
     pub at: u64,
     pub round: u64,
     pub size: u32,
-    /// `not_listening`, `proof`, `wake_failed`, `sleep_failed`, `boot_failed`, `deadline`,
-    /// `host_gone`.
+    /// `not_listening`, `proof`, `<stage>_failed` (an agent's `failed` report: `boot`,
+    /// `sleep`, `wake`, `kickoff`), `deadline`, `host_gone`.
     pub reason: String,
     /// The player at fault: the catcher nobody could reach, or the one whose proof failed.
     pub player: Option<u32>,
@@ -635,12 +635,13 @@ impl Potato {
         Some((colour, fleet_potato::chain_hex(&next)))
     }
 
-    /// An event from the potato host's agent.
-    pub fn event(&mut self, host: &str, e: &PotatoEvent, cfg: &PotatoConfig) {
+    /// An event from the potato host's agent, received at `at` on the coordinator's clock.
+    /// Every time the game keeps is the coordinator's: the deadlines are measured against its
+    /// ticks, and the host's clock (`e.at`) can differ from it.
+    pub fn event(&mut self, host: &str, e: &PotatoEvent, at: u64, cfg: &PotatoConfig) {
         if self.host.as_deref() != Some(host) {
             return;
         }
-        let at = e.at;
         let colours = self.round.as_ref().map_or(cfg.colours, |r| r.colours);
         let in_ring = self
             .round
@@ -799,6 +800,11 @@ impl Potato {
                 r.flight = None;
             }
             PotatoKind::Threw { round, to, .. } => {
+                // the agent puts a player to sleep once it has thrown
+                if let Some(p) = self.players.get_mut(&e.player) {
+                    p.phase = "sleeping".into();
+                    p.since = at;
+                }
                 if let Some(r) = self.round.as_mut().filter(|r| r.id == *round) {
                     r.flight = Some(Flight {
                         from: e.player,
@@ -1012,7 +1018,7 @@ pub struct PlayerView {
     pub player: u32,
     pub colour: u32,
     pub counter: u64,
-    /// `awake`, `asleep`, `waking`, `failed`.
+    /// `awake`, `sleeping`, `asleep`, `waking`, `failed`.
     pub phase: String,
     pub since: u64,
     pub last_sleep_ms: Option<f64>,
@@ -1129,6 +1135,7 @@ mod tests {
                         last_seq: None,
                     },
                 },
+                10,
                 &cfg,
             );
         }
@@ -1156,6 +1163,7 @@ mod tests {
                     },
                 },
             },
+            1100,
             &cfg,
         );
         // the next catch is due by the hold plus the flight plus the report slack
@@ -1196,6 +1204,7 @@ mod tests {
                         last_seq: None,
                     },
                 },
+                10,
                 &cfg,
             );
             proofs.push(proof);
@@ -1242,14 +1251,14 @@ mod tests {
         let c3 = catch(&mut proofs, 3, id, 3, 1400, false);
         let c4 = catch(&mut proofs, 0, id, 4, 1500, false);
         for e in [&c0, &c2, &c3, &c4] {
-            g.event("h", e, &cfg);
+            g.event("h", e, e.at, &cfg);
         }
         assert_eq!(
             g.round.as_ref().unwrap().best_lap_hold_ms,
             None,
             "catch 1 is not verified yet"
         );
-        g.event("h", &c1, &cfg);
+        g.event("h", &c1, c1.at, &cfg);
         assert_eq!(
             g.last_drop.as_ref().map(|d| d.reason.as_str()),
             Some("proof")
@@ -1294,6 +1303,7 @@ mod tests {
                     last_seq: Some(0),
                 },
             },
+            1100,
             &cfg,
         );
         assert!(
@@ -1302,7 +1312,7 @@ mod tests {
         );
         proofs[0] = before;
         let real = catch(&mut proofs, 0, id, 0, 1150, false);
-        g.event("h", &real, &cfg);
+        g.event("h", &real, real.at, &cfg);
         assert_eq!(
             g.last_drop.as_ref().map(|d| d.reason.as_str()),
             Some("proof")
@@ -1317,7 +1327,7 @@ mod tests {
         let id = g.round.as_ref().unwrap().id;
         for (seq, p) in [(0, 0), (1, 1), (2, 0)] {
             let e = catch(&mut proofs, p, id, seq, 1100 + seq * 100, false);
-            g.event("h", &e, &cfg);
+            g.event("h", &e, e.at, &cfg);
         }
         let start = cfg.start_hold_ms(2);
         assert_eq!(g.ladder[0].record_hold_ms, Some(start));
@@ -1334,14 +1344,31 @@ mod tests {
         let id = g.round.as_ref().unwrap().id;
         let start = cfg.start_hold_ms(2);
         let e = catch(&mut proofs, 0, id, 0, 1100, false);
-        g.event("h", &e, &cfg);
+        g.event("h", &e, e.at, &cfg);
         assert_eq!(g.faster("v", 1200, &cfg), PotatoIntent::Done);
         let paced = g.round.as_ref().unwrap().pace_ms.unwrap();
         assert!(paced < start);
         for (seq, p) in [(1, 1), (2, 0)] {
             let e = catch(&mut proofs, p, id, seq, 1300 + seq * 100, false);
-            g.event("h", &e, &cfg);
+            g.event("h", &e, e.at, &cfg);
         }
         assert_eq!(g.round.as_ref().unwrap().best_lap_hold_ms, Some(start));
+    }
+
+    /// The host's clock can be behind the coordinator's: a catch on time by the coordinator's
+    /// clock is not late because the host stamped it earlier.
+    #[test]
+    fn deadlines_run_on_the_coordinators_clock() {
+        let (mut g, cfg, mut proofs) = game(2);
+        let id = g.round.as_ref().unwrap().id;
+        let mut e = catch(&mut proofs, 0, id, 0, 0, false);
+        let received = 100_000;
+        e.at = received - 60_000; // the host's clock, a minute behind
+        g.event("h", &e, received, &cfg);
+        let r = g.round.as_ref().unwrap();
+        let due = received + r.hold_at(0) + r.flight_ms + cfg.report_slack_ms;
+        g.tick(due, true, &cfg);
+        assert!(g.round.is_some(), "on time by the coordinator's clock");
+        assert!(g.last_drop.is_none());
     }
 }

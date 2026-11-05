@@ -416,7 +416,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 }
                 AgentMsg::Potato(e) => {
                     let cfg = state.config.potato.clone();
-                    state.fleet.potato.event(host, e, &cfg);
+                    state.fleet.potato.event(host, e, at, &cfg);
                 }
             }
             None

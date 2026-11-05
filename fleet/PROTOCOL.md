@@ -884,7 +884,7 @@ The snapshot's `state.potato` is absent until a host has run players, else:
                        "sleep_stages": {"prepare_ms": 17.6, "pause_ms": 0.5, "save_ms": 74.5, "disk_ms": 114.7, "stop_ms": 106.7},
                        "wake_stages": {"restore_ms": 352.0, "ack_ms": 201.0, "listen_ms": 355.3},
                        "at": 1762317000000, "round": 7, "size": 2, "detail": "player 1 was waking when player 0 threw (1 tries in 100 ms: connection timed out)"}},
-            {"size": 4, "record_hold_ms": null, "broke": null, "rounds": 0}],
+            {"size": 4, "record_hold_ms": null, "record_at": null, "broke": null, "rounds": 0}],
  "round": {"id": 8, "size": 4, "ring": [0, 1, 2, 3], "started_at": 1762317005000, "seq": 6, "lap": 1,
            "hold_ms": 599, "start_hold_ms": 666, "min_hold_ms": 2, "flight_ms": 100, "pace_ms": null,
            "turnaround_ms": 1797, "holder": 2, "last_catch_at": 1762317009100,
@@ -905,11 +905,17 @@ The snapshot's `state.potato` is absent until a host has run players, else:
   holds, the time a player has between its throw and its next catch to sleep and wake.
   `flight` is the ball in the air (thrown by `from` to `to` at `at`), null once caught.
 - `players`: each player's colour (an index into `colours`), its catch count, and what the
-  agent is doing with it: `awake`, `asleep`, `waking` or `failed`.
+  agent is doing with it: `awake`, `sleeping` (from its throw until its snapshot is written
+  and its VM has exited), `asleep`, `waking` or `failed`.
+- `records.fastest_cycle_ms.value` is ms; `records.longest_round.value` is a count of
+  verified catches. Every time in `state.potato` (`at`, `since`, `started_at`,
+  `last_catch_at`, `flight.at`) is the coordinator's clock: it stamps an agent's report
+  when it reads it, and keeps the host's own stamp only for durations.
 - A drop's `reason` is `not_listening` (the catcher did not accept within the flight
   window; `stage` is what it was doing: `asleep`, `sleeping` or `waking`, for `stage_ms`),
   `proof` (a catch or a wake whose colour, counter or chain is not the step of the last
-  verified ones), `wake_failed`, `sleep_failed`, `boot_failed`, `kickoff_failed`,
+  verified ones), `<stage>_failed` for an agent's `failed` report (`boot_failed`,
+  `sleep_failed`, `wake_failed`, `kickoff_failed` today; a page shows any such value),
   `deadline` (no catch reported by the hold plus the flight plus 3 s) or `host_gone`.
 
 
