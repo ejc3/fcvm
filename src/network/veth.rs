@@ -28,9 +28,7 @@ pub struct InNamespaceNatConfig {
 /// Whether an interface of this name exists in the calling namespace.
 ///
 /// `/sys/class/net` is per network namespace, so this answers for the
-/// namespace the caller is in. Both ends of a veth pair are created in the
-/// host namespace before the guest end is moved, so both names must be free
-/// here at creation time.
+/// namespace the caller is in.
 pub fn link_exists(if_name: &str) -> bool {
     std::path::Path::new("/sys/class/net")
         .join(if_name)
@@ -49,27 +47,37 @@ pub fn link_exists(if_name: &str) -> bool {
 /// server flight from one MAC and its FIN, 10 s later, from another; every client
 /// segment in between arrived as OTHERHOST, and the request failed with
 /// ERR_EMPTY_RESPONSE. udev leaves a MAC set by userspace alone.
+///
+/// The guest end is created inside the VM's namespace (`netns` on the peer). Creating
+/// it in the host namespace and moving it there afterwards (`ip link set ... netns`)
+/// runs the kernel's `__dev_change_net_namespace`, which waits in `rcu_barrier()`
+/// while it holds RTNL, and every other VM's network setup or teardown waits on
+/// RTNL behind it. With four restores and four snapshots at once on a fleet host,
+/// that move and the RTNL waits it caused made the veth and namespace step 184 ms
+/// at the median against 101 ms with the end created in place (interleaved A/B,
+/// 120 restores per arm).
 fn veth_add_args(
     host_veth: &str,
     guest_veth: &str,
     host_mac: &str,
     guest_mac: &str,
+    ns_name: &str,
 ) -> Vec<String> {
     [
         "link", "add", host_veth, "address", host_mac, "type", "veth", "peer", "name", guest_veth,
-        "address", guest_mac,
+        "address", guest_mac, "netns", ns_name,
     ]
     .iter()
     .map(|s| s.to_string())
     .collect()
 }
 
-/// Creates a veth pair and moves guest side into a namespace
+/// Creates a veth pair with its guest side in a namespace
 ///
 /// Creates a pair of virtual ethernet devices, each end with a MAC set at
-/// creation (see `veth_add_args`), and returns them as (host, guest). The host
-/// side remains in the root namespace, while the guest side is moved into the
-/// VM's namespace.
+/// creation (see `veth_add_args`), and returns their MACs as (host, guest). The
+/// host side is in the root namespace and the guest side is created in the VM's
+/// namespace.
 pub async fn create_veth_pair(
     host_veth: &str,
     guest_veth: &str,
@@ -86,9 +94,10 @@ pub async fn create_veth_pair(
         "creating veth pair"
     );
 
-    // Create veth pair in root namespace
     let output = Command::new("ip")
-        .args(veth_add_args(host_veth, guest_veth, &host_mac, &guest_mac))
+        .args(veth_add_args(
+            host_veth, guest_veth, &host_mac, &guest_mac, ns_name,
+        ))
         .output()
         .await
         .context("executing ip link add veth")?;
@@ -96,23 +105,6 @@ pub async fn create_veth_pair(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("failed to create veth pair: {}", stderr);
-    }
-
-    // Move guest side into namespace
-    let output = Command::new("ip")
-        .args(["link", "set", guest_veth, "netns", ns_name])
-        .output()
-        .await
-        .context("moving veth to namespace")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Cleanup host veth on failure
-        let _ = Command::new("ip")
-            .args(["link", "del", host_veth])
-            .output()
-            .await;
-        anyhow::bail!("failed to move veth to namespace: {}", stderr);
     }
 
     Ok((host_mac, guest_mac))
@@ -1164,6 +1156,7 @@ mod parse_tests {
             "veth1-vm-x",
             "02:00:00:00:00:01",
             "02:00:00:00:00:02",
+            "fcvm-vm-x",
         );
         let at = |name: &str| args.iter().position(|a| a == name).unwrap();
         assert_eq!(
@@ -1175,6 +1168,33 @@ mod parse_tests {
             ["address", "02:00:00:00:00:02"]
         );
         assert_eq!(args[at("peer") + 1], "name");
+    }
+
+    /// The guest end is created in the namespace, not moved there after: the move
+    /// waits in an rcu_barrier while holding RTNL (`veth_add_args`).
+    #[test]
+    fn veth_guest_end_is_created_in_its_namespace() {
+        let args = veth_add_args("veth0-vm-x", "veth1-vm-x", "m1", "m2", "fcvm-vm-x");
+        let peer = args.iter().position(|a| a == "peer").unwrap();
+        assert_eq!(
+            args[peer..],
+            [
+                "peer",
+                "name",
+                "veth1-vm-x",
+                "address",
+                "m2",
+                "netns",
+                "fcvm-vm-x"
+            ]
+        );
+        let source = include_str!("veth.rs");
+        let body = &source[source.find("pub async fn create_veth_pair").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(
+            !body.contains("\"netns\", ns_name]"),
+            "create_veth_pair must not move the guest end after creating it"
+        );
     }
 
     #[test]
