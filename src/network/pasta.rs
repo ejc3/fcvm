@@ -1537,22 +1537,18 @@ impl PastaNetwork {
         // explicit): a credential change zeroes `task->pdeath_signal`, so anything that
         // switches namespaces or identity first would silently drop it.
         //
-        // pasta DOES change credentials after this exec — it setns()es into the holder's
-        // user namespace (measured CapEff 0x1ffffffffff -> 0x2014c2) — and the signal
-        // survives it. `commit_creds()` clears it only when uid/gid change or
-        // `cred_cap_issubset(old, new)` FAILS; under sudo pasta's prior creds are full root
-        // and `--runas 0:0` holds uid/gid at 0:0, so the new set is a strict SUBSET and that
-        // branch is never taken — the signal survives because pasta LOSES privilege on entry.
-        // pasta does not fork either: `--foreground` is single-threaded and its own -P
-        // pidfile reports the PID armed here. Verified with the holder held ALIVE so passt's
-        // PID watch cannot fire — armed pasta dies 2-54ms after fcvm is SIGKILLed, unarmed
-        // pasta survives 5s.
-        //
-        // PRECONDITION: this holds only while fcvm runs as ROOT. Unprivileged, entering the
-        // userns is a capability GAIN, `cred_cap_issubset` fails, the kernel zeroes the
-        // signal, and pasta silently reverts to passt's 1-second PID watch with no symptom
-        // until something leaks. Argued from the kernel rule, NOT measured — the harness
-        // that verified the above was itself root.
+        // pasta DOES change credentials after this exec: it setns()es into the holder's
+        // user namespace (measured CapEff 0x1ffffffffff -> 0x2014c2), and the signal
+        // survives it. `commit_creds()` clears it when uid/gid change or
+        // `cred_cap_issubset(old, new)` fails. Across user namespaces that check compares no
+        // capabilities: it passes when the new namespace's parent is the old one and its
+        // owner is the old euid, which holds for the holder fcvm creates, as root or not, and
+        // `--runas 0:0` keeps uid/gid at 0:0 under root. Measured as root, as an unprivileged
+        // user and as root inside rootless podman: with pasta stopped, so that passt's PID
+        // watch cannot run, killing pasta's parent killed pasta; without the pdeathsig it
+        // stayed stopped. `test_sigkill_reaps_rootless_vm_tree` checks the same thing on
+        // fcvm's own pasta in every lane it runs in. pasta does not fork either:
+        // `--foreground` is single-threaded and its own -P pidfile reports the PID armed here.
         //
         // The `getppid` re-check closes the fork/exec window: a parent that dies after
         // fork() but before the prctl above would leave the signal unarmed and pasta
