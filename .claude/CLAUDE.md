@@ -2596,9 +2596,9 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   uncompressed even on a store mounted with `compress-force`: btrfs compresses only copy-on-write data. A
   compressed memory file makes every scattered 4 KiB read decompress its whole 128 KiB extent; replaying a
   72 GiB working set took 64 to 83 s compressed and 32 s uncompressed (128 GiB www guest, 2026-11-04). It costs
-  disk: that file took 47 GiB compressed and takes 128 GiB uncompressed. A Full snapshot and a merged diff get
-  a new nodatacow file; an in-place diff keeps its parent's flag, so a chain made before this stays compressed
-  until its next Full snapshot or merge.
+  disk: that file took 47 GiB compressed and takes 128 GiB uncompressed. A Full snapshot gets a new nodatacow
+  file; a diff, in place or merged, keeps its parent's flag (so its copy of the parent can share extents), and a
+  chain made before this stays compressed until its next Full snapshot.
 - Initrd: `/mnt/fcvm-btrfs/initrd/fc-agent-{sha}.initrd` (injects fc-agent at boot)
 
 **Per-VM Disk Sizing (`--rootfs-size`):**

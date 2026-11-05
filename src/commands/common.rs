@@ -931,6 +931,23 @@ fn create_memory_file_nodatacow(path: &Path, snapshot: &str) -> Result<()> {
     Ok(())
 }
 
+/// Create the empty file a diff is merged into, with the base's nodatacow flag. btrfs shares
+/// extents only between files whose flags agree, so a copy into a file of the other kind writes
+/// every byte of the base again, which needs the base's size in free space. With the flags
+/// matched the copy shares the base's extents, and a nodatacow base gives a nodatacow (so
+/// uncompressed) merged file.
+fn create_merge_target(base: &Path, dst: &Path) -> Result<()> {
+    let base_file =
+        std::fs::File::open(base).with_context(|| format!("opening {}", base.display()))?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)
+        .with_context(|| format!("creating {}", dst.display()))?;
+    crate::storage::inode_flags::match_nodatacow(&base_file, &file);
+    Ok(())
+}
+
 /// Clone the parent's memory file to `dst` for an in-place diff snapshot, with FICLONE.
 ///
 /// Returns false, leaving no `dst`, when the snapshot has to be written as a sparse diff and
@@ -6100,9 +6117,9 @@ pub async fn create_snapshot_core(
         );
 
         // Copy base memory to temp dir as memory.bin (will merge diff into this copy). The copy
-        // is made into a nodatacow file, so the merged memory file is stored uncompressed
-        // (create_memory_file_nodatacow), whatever the base's flag.
-        if let Err(e) = create_memory_file_nodatacow(&final_memory_path, &snapshot_config.name) {
+        // takes the base's nodatacow flag, so it can share the base's extents instead of
+        // writing a second full image the space check above did not reserve.
+        if let Err(e) = create_merge_target(base_source, &final_memory_path) {
             let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
             return Err(e);
         }
@@ -9102,6 +9119,27 @@ mod tests {
         // A second call leaves an existing file alone.
         create_memory_file_nodatacow(&path, "t").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), vec![0x5Au8; 1 << 20]);
+    }
+
+    /// The file a diff is merged into takes its base's nodatacow flag, so the copy of the base
+    /// can share its extents (btrfs shares extents only between files whose flags agree).
+    #[test]
+    fn a_merge_target_takes_its_bases_nodatacow_flag() {
+        let dir = tempfile::tempdir_in(snapshot_fs_dir()).unwrap();
+        let nocow_base = dir.path().join("nocow-base.bin");
+        create_memory_file_nodatacow(&nocow_base, "t").unwrap();
+        let cow_base = dir.path().join("cow-base.bin");
+        std::fs::write(&cow_base, [1u8; 4096]).unwrap();
+        for (base, want) in [(&nocow_base, true), (&cow_base, false)] {
+            let dst = dir.path().join(format!("merge-{want}.bin"));
+            create_merge_target(base, &dst).unwrap();
+            assert_eq!(
+                crate::storage::inode_flags::is_nodatacow(&std::fs::File::open(&dst).unwrap()),
+                want,
+                "the merge target's nodatacow flag differs from its base's ({})",
+                base.display()
+            );
+        }
     }
 
     /// An in-place diff over a nodatacow parent still clones it: the empty clone takes the
