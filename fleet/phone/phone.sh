@@ -350,7 +350,7 @@ action)
   # under the default scene's clock and cleared when the scene comes (#1518). 10 s at most,
   # then the action goes on. Then the place the agent last sent ($RUN/place) goes to it.
   restart_app() {
-    local u0 st u e
+    local u0 st u e new=0
     u0=$(status | jq -r '.uptime_ms // empty' 2> /dev/null || true)
     app_action restart
     rm -f "$RUN/screen" "$RUN/night"
@@ -359,7 +359,9 @@ action)
       st=$(status 2 || true)
       u=$(jq -r '.uptime_ms // empty' <<< "$st" 2> /dev/null || true)
       e=$(jq -r '.scene_epoch_unix_ms // 0' <<< "$st" 2> /dev/null || true)
-      [[ "$u" =~ ^[0-9]+$ && "$u0" =~ ^[0-9]+$ && "$u" -le "$u0" && "$e" =~ ^[0-9]+$ && "$e" != 0 ]] && break
+      # the new process, once seen, stays seen: its scene can come after its uptime passes u0
+      [[ "$u" =~ ^[0-9]+$ && "$u0" =~ ^[0-9]+$ && "$u" -le "$u0" ]] && new=1
+      [[ $new = 1 && "$e" =~ ^[0-9]+$ && "$e" != 0 ]] && break
     done
     [ -s "$RUN/place" ] || return 0
     "$0" ctl "$(cat "$RUN/place")" > /dev/null 2>&1 || echo "phone.sh: the restarted app was not told its place" >&2
