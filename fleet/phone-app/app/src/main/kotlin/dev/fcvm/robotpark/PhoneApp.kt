@@ -78,6 +78,8 @@ class PhoneApp : Application() {
             "samples" to Store.samples,
             "context_generation" to Store.contextGeneration,
             "screen" to Store.screen,
+            // 0 until the phone streamer's scene arrives (a new process starts on the default)
+            "scene_epoch_unix_ms" to Store.scene.epochUnixMs,
             "held" to Store.scene.held,
             "night" to (Store.effectiveScene().night ?: Store.systemNight),
             "robots" to Store.robots,

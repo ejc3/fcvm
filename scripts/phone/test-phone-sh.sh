@@ -203,21 +203,25 @@ with open(sys.argv[2], "a") as log:
     while True:
         c, _ = s.accept(); f = c.makefile("rw")
         for line in f:
-            # status requests apart: logged to status.log, answered from status-reply (used
-            # once) or with an app of no screen whose uptime is 1 ms; any other request is
-            # logged to ctl.log and answered from reply (used once), else ok
+            # status requests apart: logged to status.log, answered from status-reply (its
+            # first line, used once) or with an app of no screen whose uptime is 1 ms and which
+            # holds a scene; any other request is logged to ctl.log and answered from reply
+            # (used once), else ok. Every request is also logged to all.log, in order.
             st = "\"type\":\"status\"" in line
             (open(sys.argv[4], "a") if st else log).write(line)
             log.flush()
+            open(sys.argv[6], "a").write(line)
             path = sys.argv[5] if st else sys.argv[3]
             try:
-                with open(path) as r: reply = r.read()
-                os.remove(path)
-            except FileNotFoundError:
-                reply = "{\"ok\": true, \"uptime_ms\": 1}\n" if st else "{\"ok\": true}\n"
+                with open(path) as r: lines = r.read().splitlines(True)
+                reply = lines[0]
+                if lines[1:]: open(path, "w").write("".join(lines[1:]))
+                else: os.remove(path)
+            except (FileNotFoundError, IndexError):
+                reply = "{\"ok\": true, \"uptime_ms\": 1, \"scene_epoch_unix_ms\": 1761100000000}\n" if st else "{\"ok\": true}\n"
             f.write(reply); f.flush()
         c.close()
-' "$port" "$dir/ctl.log" "$dir/reply" "$dir/status.log" "$dir/status-reply" &
+' "$port" "$dir/ctl.log" "$dir/reply" "$dir/status.log" "$dir/status-reply" "$dir/all.log" &
 ctl=$!
 for _ in $(seq 1 50); do (exec 3<> "/dev/tcp/127.0.0.1/$port") 2> /dev/null && break; sleep 0.1; done
 act() { PHONE_CTL_PORT=$port PHONE_RUN="$dir" "$phone" action "$1" > /dev/null 2> "$dir/act.err"; }
@@ -277,6 +281,17 @@ act restart_app || bad "restart_app failed: $(cat "$dir/act.err")"
 [ "$(cat "$dir/ctl.log")" = '{"type":"place","vm":"fleet-phone-1","slot":"phone-1"}
 {"type":"action","name":"restart"}
 {"type":"place","vm":"fleet-phone-1","slot":"phone-1"}' ] && ok "a restarted app is told its place again" || bad "place and restart_app sent: $(cat "$dir/ctl.log")"
+# restart_app waits until the restarted app holds the streamer's scene (a scene epoch in its
+# status) before anything else reaches it: a dance or wave filed under the default scene's clock
+# was cleared when the scene came, after the app had answered ok (#1518).
+: > "$dir/all.log"
+printf '%s\n' '{"ok":true,"uptime_ms":60000,"scene_epoch_unix_ms":1761100000000}' \
+  '{"ok":true,"uptime_ms":5,"scene_epoch_unix_ms":0}' '{"ok":true,"uptime_ms":9,"scene_epoch_unix_ms":0}' > "$dir/status-reply"
+act restart_app || bad "restart_app failed: $(cat "$dir/act.err")"
+want=$(printf '%s\n' status restart status status status place)
+got=$(sed -E 's/.*"type":"([a-z]+)".*"name":"([a-z]+)".*/\2/; s/.*"type":"([a-z]+)".*/\1/' "$dir/all.log")
+[ "$got" = "$want" ] && ok "restart_app waits for the restarted app's scene before telling it its place" \
+  || bad "restart_app with the scene late sent: $(tr '\n' ' ' <<< "$got")"
 rm -f "$dir/place"
 # The browser's actions, with a stub adb and a stand-in for the streamer's /health and the
 # browser's DevTools list: open_browser brings the loaded page to the front and reloads it, or

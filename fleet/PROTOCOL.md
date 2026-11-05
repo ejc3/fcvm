@@ -850,7 +850,8 @@ it shows, since a tap on its tabs changes that too, and sends the other; `dark_m
 remembers which it sent last; so each is a toggle). The agent drops a tap it reaches 3 s
 into a batch of actions, behind a slow one. An action for Robot Park
 brings it to the front first when the browser is there, and starts it again while the holder's
-GPU mirror is open. An action whose effect is drawn in the scene (`rotate`, `dark_mode`,
+GPU mirror is open; after starting it again (this and `restart_app`), nothing more reaches the
+app until its status shows a new process holding a scene (`scene_epoch_unix_ms`), 10 s at most. An action whose effect is drawn in the scene (`rotate`, `dark_mode`,
 `dance`, `wave`) and `open_app` then show the scene tab, so the effect is not behind the info
 screen. `open_browser` uses adb in the container and sends the app nothing; `open_app` uses
 adb and sends the app `scene`. `tap` asks Robot Park its surface size
@@ -2258,10 +2259,15 @@ the difference to its own clock and adds it from then on. The reply carries
  "renderer": "Android Emulator OpenGL ES Translator (Tesla T4/PCIe/SSE2)",
  "vendor": "Google (NVIDIA Corporation)", "gl_version": "OpenGL ES 3.1 (OpenGL ES 3.2 NVIDIA 580.196.07)",
  "surface": [720, 1280], "samples": 4, "context_generation": 1, "screen": "scene", "held": false,
+ "scene_epoch_unix_ms": 1761100000000,
  "night": false, "robots": 2400, "benchmark": null, "uptime_ms": 41000,
  "device": "Google sdk_gphone64_x86_64", "android": "15 (API 35)", "place": {}}
 ```
 
+`scene_epoch_unix_ms` is the `epoch_unix_ms` of the scene the app holds, 0 until a scene
+arrives: a process just started draws the default scene until the phone streamer sends it the
+posted one, and a dance or wave taken before then is filed under the default scene's clock
+and cleared when the scene comes. `phone.sh` waits for it after a restart (below).
 `context_generation` counts EGL contexts the app has created: it goes up when the app
 rebuilds after `EGL_CONTEXT_LOST`. `last_error` is present when something failed
 (the control socket could not bind, EGL could not start).
