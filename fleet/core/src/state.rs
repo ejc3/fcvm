@@ -12,6 +12,9 @@ use std::collections::{BTreeMap, VecDeque};
 pub struct Config {
     /// The most tiles per half the page is asked to play.
     pub max_tiles: usize,
+    /// Potato mode's game (docs/fleet/ARCHITECTURE.md, "Potato mode").
+    #[serde(default)]
+    pub potato: crate::potato::PotatoConfig,
     /// Width / height of the whole image (both halves).
     pub image_aspect: f64,
     /// Width / height the tiling aims for.
@@ -185,6 +188,7 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            potato: Default::default(),
             max_tiles: 100,
             image_aspect: 16.0 / 9.0,
             tile_aspect: 16.0 / 9.0,
@@ -638,6 +642,9 @@ pub struct Fleet {
     pub phones_zoom: crate::phone::PhonesZoom,
     #[serde(default)]
     pub last_phones_zoom_at: BTreeMap<String, u64>,
+    /// Potato mode's game.
+    #[serde(default)]
+    pub potato: crate::potato::Potato,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -701,6 +708,7 @@ impl State {
                 phone_action_seq: 0,
                 phones_zoom: Default::default(),
                 last_phones_zoom_at: BTreeMap::new(),
+                potato: Default::default(),
             },
             config,
             receipts: BTreeMap::new(),
@@ -714,6 +722,8 @@ impl State {
     /// survives the restart.
     pub fn resumed(mut self, config: Config, now_ms: u64) -> Self {
         let f = &mut self.fleet;
+        // the ladder and the records stay; the round and the players went with the agent
+        f.potato.resumed();
         f.hosts.clear();
         f.slots.clear();
         f.phones.clear();

@@ -1,0 +1,1496 @@
+{
+  "config": {
+    "potato": {
+      "budget_ms": 2000,
+      "colours": 12,
+      "faster_interval_ms": 2000,
+      "flight_ms": 100,
+      "min_hold_ms": 2,
+      "report_slack_ms": 3000,
+      "restart_after_ms": 5000,
+      "restart_interval_ms": 10000,
+      "shrink_permille": 100,
+      "sizes": [
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        96
+      ],
+      "start_floor_ms": 250
+    }
+  },
+  "description": "Potato mode (docs/fleet/ARCHITECTURE.md, \"Potato mode\"): a host with players starts the ladder at its smallest size; catches step each player's colour, counter and chain and the coordinator checks every step; a lap completed sets the size's record; a wrong colour drops the ball as a proof mismatch; a catcher still waking drops it with the late stage and its time, and the time it did start accepting; each drop moves up the ladder, which wraps to the smallest size; faster and restart are rate limited; the ladder and its records stay when the host goes.",
+  "events": [
+    {
+      "at": 1000,
+      "host": "h1",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 0,
+        "gpus": [],
+        "host": "h1",
+        "potato_players": 4,
+        "type": "hello"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 1500,
+      "host": "h1",
+      "msg": {
+        "at": 1500,
+        "chain": "0000000000000000000000000000000000000000000000000000000000000000",
+        "colour": 3,
+        "colours": 12,
+        "connections": 1,
+        "counter": 0,
+        "kind": "hello",
+        "player": 0,
+        "type": "potato"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 1500,
+      "host": "h1",
+      "msg": {
+        "at": 1500,
+        "chain": "0000000000000000000000000000000000000000000000000000000000000000",
+        "colour": 7,
+        "colours": 12,
+        "connections": 1,
+        "counter": 0,
+        "kind": "hello",
+        "player": 1,
+        "type": "potato"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 1500,
+      "host": "h1",
+      "msg": {
+        "at": 1500,
+        "chain": "0000000000000000000000000000000000000000000000000000000000000000",
+        "colour": 11,
+        "colours": 12,
+        "connections": 1,
+        "counter": 0,
+        "kind": "hello",
+        "player": 2,
+        "type": "potato"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 1500,
+      "host": "h1",
+      "msg": {
+        "at": 1500,
+        "chain": "0000000000000000000000000000000000000000000000000000000000000000",
+        "colour": 0,
+        "colours": 12,
+        "connections": 1,
+        "counter": 0,
+        "kind": "hello",
+        "player": 3,
+        "type": "potato"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "type": "tick"
+    },
+    {
+      "at": 2100,
+      "host": "h1",
+      "msg": {
+        "at": 2100,
+        "chain": "8d24bb6cd1de9241dd3a018d61a7236f90be97c1fc3d2a238aab2d96cf22439b",
+        "colour": 4,
+        "counter": 1,
+        "kind": "caught",
+        "player": 0,
+        "round": 1,
+        "seq": 0,
+        "type": "potato"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 4100,
+      "host": "h1",
+      "msg": {
+        "at": 4100,
+        "attempts": 1,
+        "kind": "threw",
+        "player": 0,
+        "round": 1,
+        "send_ms": 0.8,
+        "seq": 1,
+        "to": 1,
+        "type": "potato",
+        "wait_ms": 0.0
+      },
+      "type": "agent"
+    },
+    {
+      "at": 4101,
+      "host": "h1",
+      "msg": {
+        "at": 4101,
+        "chain": "f8175f6bb0b92b250093ae2e10a68a07a8f4bd69738baeb53e5ba9973ee476c9",
+        "colour": 8,
+        "counter": 1,
+        "kind": "caught",
+        "player": 1,
+        "round": 1,
+        "seq": 1,
+        "type": "potato"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 4400,
+      "host": "h1",
+      "msg": {
+        "at": 4400,
+        "kind": "slept",
+        "player": 0,
+        "sleep_ms": 300.0,
+        "stages": {
+          "save_ms": 64.0,
+          "stop_ms": 107.0
+        },
+        "type": "potato"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 4400,
+      "host": "h1",
+      "msg": {
+        "at": 4400,
+        "kind": "waking",
+        "player": 0,
+        "type": "potato"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 4750,
+      "host": "h1",
+      "msg": {
+        "at": 4750,
+        "kind": "woke",
+        "player": 0,
+        "stages": {
+          "listen_ms": 350.0
+        },
+        "type": "potato",
+        "wake_ms": 350.0
+      },
+      "type": "agent"
+    },
+    {
+      "at": 6101,
+      "host": "h1",
+      "msg": {
+        "at": 6101,
+        "chain": "ccf5e7c2b29c07c3d3e0bea4bfcf10944b8b444ba542831c7eefe1be17ec6487",
+        "colour": 5,
+        "counter": 2,
+        "kind": "caught",
+        "player": 0,
+        "round": 1,
+        "seq": 2,
+        "type": "potato"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 7901,
+      "host": "h1",
+      "msg": {
+        "at": 7901,
+        "chain": "cf9a323ff47da3a338e30875c9058a16776f375cd11afd66087861bb2690cfe0",
+        "colour": 10,
+        "counter": 2,
+        "kind": "caught",
+        "player": 1,
+        "round": 1,
+        "seq": 3,
+        "type": "potato"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 12000,
+      "type": "tick"
+    },
+    {
+      "at": 13000,
+      "type": "tick"
+    },
+    {
+      "at": 13100,
+      "host": "h1",
+      "msg": {
+        "at": 13100,
+        "chain": "4f5a7e0f279d7d8c6975998c3dc8dbb90fe4c45ecd8402d8e867387dcac658ca",
+        "colour": 6,
+        "counter": 3,
+        "kind": "caught",
+        "player": 0,
+        "round": 2,
+        "seq": 0,
+        "type": "potato"
+      },
+      "type": "agent"
+    },
+    {
+      "args": {},
+      "at": 13200,
+      "id": "f1",
+      "name": "potato_faster",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {},
+      "at": 14000,
+      "id": "f2",
+      "name": "potato_faster",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {},
+      "at": 14000,
+      "id": "r1",
+      "name": "potato_restart",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "at": 14200,
+      "host": "h1",
+      "msg": {
+        "at": 14200,
+        "attempts": 1,
+        "kind": "threw",
+        "player": 0,
+        "round": 2,
+        "send_ms": 0.7,
+        "seq": 1,
+        "to": 1,
+        "type": "potato",
+        "wait_ms": 0.0
+      },
+      "type": "agent"
+    },
+    {
+      "at": 14300,
+      "host": "h1",
+      "msg": {
+        "at": 14300,
+        "kind": "slept",
+        "player": 1,
+        "sleep_ms": 290.0,
+        "stages": {
+          "save_ms": 61.0
+        },
+        "type": "potato"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 14310,
+      "host": "h1",
+      "msg": {
+        "at": 14310,
+        "kind": "waking",
+        "player": 1,
+        "type": "potato"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 14400,
+      "host": "h1",
+      "msg": {
+        "at": 14400,
+        "attempts": 2,
+        "catcher_phase": "waking",
+        "catcher_phase_ms": 90.0,
+        "kind": "dropped",
+        "player": 0,
+        "reason": "connection timed out",
+        "round": 2,
+        "seq": 1,
+        "to": 1,
+        "type": "potato"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 14484,
+      "host": "h1",
+      "msg": {
+        "after_ms": 84.0,
+        "at": 14484,
+        "kind": "listening",
+        "player": 1,
+        "round": 2,
+        "seq": 1,
+        "type": "potato"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 19400,
+      "type": "tick"
+    },
+    {
+      "args": {},
+      "at": 29400,
+      "id": "r2",
+      "name": "potato_restart",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "at": 30000,
+      "host": "h1",
+      "type": "agent_gone"
+    }
+  ],
+  "expect": [
+    {
+      "after": 0,
+      "checks": {
+        "/view/potato/capacity": 4,
+        "/view/potato/next_round_at": 2000,
+        "/view/potato/round": null,
+        "/view/potato/size": 2
+      },
+      "note": "a host with players: the ladder for its size, the first round a second later"
+    },
+    {
+      "after": 4,
+      "checks": {
+        "/view/potato/players/2/colour": 11,
+        "/view/potato/players/2/phase": "awake"
+      },
+      "note": "new players are adopted as they are"
+    },
+    {
+      "after": 5,
+      "checks": {
+        "/view/potato/next_round_at": null,
+        "/view/potato/round/hold_ms": 2000,
+        "/view/potato/round/id": 1,
+        "/view/potato/round/ring": [
+          0,
+          1
+        ],
+        "/view/potato/round/size": 2,
+        "/view/potato/round/turnaround_ms": 2000
+      },
+      "note": "a round of the smallest size, at budget / (size - 1)"
+    },
+    {
+      "after": 6,
+      "checks": {
+        "/view/potato/players/0/colour": 4,
+        "/view/potato/players/0/counter": 1,
+        "/view/potato/round/holder": 0,
+        "/view/potato/round/seq": 0
+      },
+      "note": "a catch steps the colour"
+    },
+    {
+      "after": 7,
+      "checks": {
+        "/view/potato/round/flight": {
+          "at": 4100,
+          "from": 0,
+          "to": 1
+        }
+      },
+      "note": "the ball in the air"
+    },
+    {
+      "after": 10,
+      "checks": {
+        "/view/potato/players/0/last_sleep_ms": 300.0,
+        "/view/potato/players/0/phase": "waking"
+      },
+      "note": "asleep, then waking"
+    },
+    {
+      "after": 11,
+      "checks": {
+        "/view/potato/players/0/phase": "awake",
+        "/view/potato/records/fastest_cycle_ms/player": 0,
+        "/view/potato/records/fastest_cycle_ms/value": 650.0
+      },
+      "note": "awake, and the fastest sleep and wake"
+    },
+    {
+      "after": 12,
+      "checks": {
+        "/view/potato/round/best_lap_hold_ms": 2000,
+        "/view/potato/round/hold_ms": 1800,
+        "/view/potato/round/lap": 1
+      },
+      "note": "a lap completed at 2000 ms of hold; lap 1 holds 1800"
+    },
+    {
+      "after": 13,
+      "checks": {
+        "/view/potato/ladder/0/broke/reason": "proof",
+        "/view/potato/ladder/0/record_hold_ms": 2000,
+        "/view/potato/ladder/0/rounds": 1,
+        "/view/potato/last_drop/player": 1,
+        "/view/potato/last_drop/reason": "proof",
+        "/view/potato/last_drop/seq": 3,
+        "/view/potato/next_round_at": 12901,
+        "/view/potato/records/longest_round/value": 3.0,
+        "/view/potato/round": null,
+        "/view/potato/size": 4
+      },
+      "note": "a catch with the wrong colour drops the ball as a proof mismatch, keeps the size's record, and moves up the ladder"
+    },
+    {
+      "after": 14,
+      "checks": {
+        "/view/potato/round": null
+      },
+      "note": "not yet"
+    },
+    {
+      "after": 15,
+      "checks": {
+        "/view/potato/round/hold_ms": 666,
+        "/view/potato/round/id": 2,
+        "/view/potato/round/size": 4
+      },
+      "note": "the next size"
+    },
+    {
+      "after": 17,
+      "checks": {
+        "/receipts/f1/outcome": "committed",
+        "/view/potato/round/hold_ms": 533,
+        "/view/potato/round/pace_ms": 533
+      },
+      "note": "faster: a fifth off the hold"
+    },
+    {
+      "after": 18,
+      "checks": {
+        "/receipts/f2/outcome": "refused"
+      },
+      "note": "one faster per client every 2 s"
+    },
+    {
+      "after": 19,
+      "checks": {
+        "/receipts/r1/outcome": "refused",
+        "/view/potato/round/id": 2
+      },
+      "note": "no restart in a round's first 10 s"
+    },
+    {
+      "after": 23,
+      "checks": {
+        "/view/potato/ladder/1/broke/reason": "not_listening",
+        "/view/potato/ladder/1/record_hold_ms": null,
+        "/view/potato/last_drop/hold_ms": 533,
+        "/view/potato/last_drop/player": 1,
+        "/view/potato/last_drop/reason": "not_listening",
+        "/view/potato/last_drop/sleep_stages": {
+          "save_ms": 61.0
+        },
+        "/view/potato/last_drop/stage": "waking",
+        "/view/potato/last_drop/stage_ms": 90.0,
+        "/view/potato/last_drop/thrower": 0,
+        "/view/potato/size": 2
+      },
+      "note": "a catcher still waking drops the ball; the stage is the wake, with its time"
+    },
+    {
+      "after": 24,
+      "checks": {
+        "/view/potato/ladder/1/broke/listening_after_ms": 84.0,
+        "/view/potato/last_drop/listening_after_ms": 84.0
+      },
+      "note": "when the catcher did start accepting"
+    },
+    {
+      "after": 25,
+      "checks": {
+        "/view/potato/round/id": 3,
+        "/view/potato/round/size": 2
+      },
+      "note": "after 96 the ladder starts again at 2; here the host runs 4, so after 4 comes 2"
+    },
+    {
+      "after": 26,
+      "checks": {
+        "/receipts/r2/outcome": "committed",
+        "/view/potato/ladder/0/rounds": 1,
+        "/view/potato/next_round_at": 30400,
+        "/view/potato/round": null
+      },
+      "note": "a restart ends the round without a record"
+    },
+    {
+      "after": 27,
+      "checks": {
+        "/view/potato/capacity": 0,
+        "/view/potato/ladder/0/record_hold_ms": 2000,
+        "/view/potato/players": []
+      },
+      "note": "the host goes: no players, the ladder stays"
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "args": {},
+        "at": 13200,
+        "id": "f1",
+        "name": "potato_faster",
+        "outcome": "committed",
+        "summary": "faster",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 14000,
+        "id": "f2",
+        "name": "potato_faster",
+        "outcome": "refused",
+        "summary": "one faster every 2 s",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 14000,
+        "id": "r1",
+        "name": "potato_restart",
+        "outcome": "refused",
+        "summary": "the round has only just started",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 29400,
+        "id": "r2",
+        "name": "potato_restart",
+        "outcome": "committed",
+        "summary": "restart",
+        "viewer": "v2"
+      }
+    ],
+    "aggregates": [],
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "budget": null,
+    "budget_from_t": null,
+    "claims": [],
+    "cooldown_until": null,
+    "counters": {
+      "restores": 0,
+      "restores_last_hour": 0,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
+    "failures": [
+      {
+        "host": "h1",
+        "kind": "host_reclaimed",
+        "retiling": true,
+        "since": 30000
+      }
+    ],
+    "fleet": {
+      "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
+      "fcvm_gpus": 0,
+      "gpus": 0,
+      "hosts": [],
+      "max_tiles": 100,
+      "n": 0,
+      "power": {
+        "asleep_since": null,
+        "hosts": [],
+        "idle_since": null,
+        "last_arrival_at": 0,
+        "last_wake": null,
+        "sleep_without_arrival_at": null,
+        "state": "awake",
+        "wakes": [],
+        "woke_at": null
+      },
+      "standby": [],
+      "standby_ready": 0,
+      "warming": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": null,
+      "from_frame": 0,
+      "from_t": 0.0,
+      "generation": 0
+    },
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": 34000,
+      "closes_at": 42000,
+      "holding": null,
+      "holding_label": null,
+      "leading": "peak-close",
+      "next": "ridges",
+      "next_hold_at": null,
+      "next_label": "Across the ridges",
+      "opened_at": 12000,
+      "targets": [
+        {
+          "arrive_at": 61000,
+          "id": "peak-close",
+          "label": "Circling the peak",
+          "votes": 0
+        },
+        {
+          "arrive_at": 68000,
+          "id": "peak-west",
+          "label": "The peak from the west",
+          "votes": 0
+        },
+        {
+          "arrive_at": 68000,
+          "id": "lake-skim",
+          "label": "Low over the western lakes",
+          "votes": 0
+        }
+      ]
+    },
+    "potato": {
+      "capacity": 0,
+      "colours": 12,
+      "ladder": [
+        {
+          "broke": {
+            "at": 7901,
+            "detail": "caught with colour 10 where 9 was due",
+            "hold_ms": 1800,
+            "lap": 1,
+            "listening_after_ms": null,
+            "player": 1,
+            "reason": "proof",
+            "round": 1,
+            "seq": 3,
+            "size": 2,
+            "sleep_stages": {},
+            "stage": "proof",
+            "stage_ms": 0.0,
+            "thrower": null,
+            "wake_stages": {}
+          },
+          "record_at": 4101,
+          "record_hold_ms": 2000,
+          "rounds": 1,
+          "size": 2
+        },
+        {
+          "broke": {
+            "at": 14400,
+            "detail": "player 1 was waking when player 0 threw (2 tries in 100 ms: connection timed out)",
+            "hold_ms": 533,
+            "lap": 0,
+            "listening_after_ms": 84.0,
+            "player": 1,
+            "reason": "not_listening",
+            "round": 2,
+            "seq": 1,
+            "size": 4,
+            "sleep_stages": {
+              "save_ms": 61.0
+            },
+            "stage": "waking",
+            "stage_ms": 90.0,
+            "thrower": 0,
+            "wake_stages": {}
+          },
+          "record_at": null,
+          "record_hold_ms": null,
+          "rounds": 1,
+          "size": 4
+        },
+        {
+          "broke": null,
+          "record_at": null,
+          "record_hold_ms": null,
+          "rounds": 0,
+          "size": 8
+        },
+        {
+          "broke": null,
+          "record_at": null,
+          "record_hold_ms": null,
+          "rounds": 0,
+          "size": 16
+        },
+        {
+          "broke": null,
+          "record_at": null,
+          "record_hold_ms": null,
+          "rounds": 0,
+          "size": 32
+        },
+        {
+          "broke": null,
+          "record_at": null,
+          "record_hold_ms": null,
+          "rounds": 0,
+          "size": 64
+        },
+        {
+          "broke": null,
+          "record_at": null,
+          "record_hold_ms": null,
+          "rounds": 0,
+          "size": 96
+        }
+      ],
+      "last_drop": {
+        "at": 14400,
+        "detail": "player 1 was waking when player 0 threw (2 tries in 100 ms: connection timed out)",
+        "hold_ms": 533,
+        "lap": 0,
+        "listening_after_ms": 84.0,
+        "player": 1,
+        "reason": "not_listening",
+        "round": 2,
+        "seq": 1,
+        "size": 4,
+        "sleep_stages": {
+          "save_ms": 61.0
+        },
+        "stage": "waking",
+        "stage_ms": 90.0,
+        "thrower": 0,
+        "wake_stages": {}
+      },
+      "next_round_at": null,
+      "players": [],
+      "records": {
+        "fastest_cycle_ms": {
+          "at": 4750,
+          "player": 0,
+          "size": 2,
+          "value": 650.0
+        },
+        "longest_round": {
+          "at": 7901,
+          "player": null,
+          "size": 2,
+          "value": 3.0
+        }
+      },
+      "round": null,
+      "size": 2
+    },
+    "races": [],
+    "relaunch_all": null,
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -12.861588,
+            1.35,
+            -101.722203
+          ],
+          "pos": [
+            3.0,
+            0.55,
+            -90.0
+          ],
+          "t": 0.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -13.1036,
+            1.36,
+            -100.987452
+          ],
+          "pos": [
+            3.0,
+            0.56,
+            -89.6
+          ],
+          "t": 1.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -13.338549,
+            1.37,
+            -100.247706
+          ],
+          "pos": [
+            3.0,
+            0.57,
+            -89.2
+          ],
+          "t": 2.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -13.566332,
+            1.38,
+            -99.503114
+          ],
+          "pos": [
+            3.0,
+            0.58,
+            -88.8
+          ],
+          "t": 3.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -13.786847,
+            1.39,
+            -98.753828
+          ],
+          "pos": [
+            3.0,
+            0.59,
+            -88.4
+          ],
+          "t": 4.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.0,
+            1.4,
+            -98.0
+          ],
+          "pos": [
+            3.0,
+            0.6,
+            -88.0
+          ],
+          "t": 5.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.205696,
+            1.41,
+            -97.241786
+          ],
+          "pos": [
+            3.0,
+            0.61,
+            -87.6
+          ],
+          "t": 6.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.403845,
+            1.42,
+            -96.479342
+          ],
+          "pos": [
+            3.0,
+            0.62,
+            -87.2
+          ],
+          "t": 7.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.59436,
+            1.43,
+            -95.712828
+          ],
+          "pos": [
+            3.0,
+            0.63,
+            -86.8
+          ],
+          "t": 8.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.777157,
+            1.44,
+            -94.942405
+          ],
+          "pos": [
+            3.0,
+            0.64,
+            -86.4
+          ],
+          "t": 9.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.952157,
+            1.45,
+            -94.168235
+          ],
+          "pos": [
+            3.0,
+            0.65,
+            -86.0
+          ],
+          "t": 10.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -15.123232,
+            1.46,
+            -93.392246
+          ],
+          "pos": [
+            3.0,
+            0.66,
+            -85.6
+          ],
+          "t": 11.0
+        },
+        {
+          "fov_deg": 60.221383,
+          "look": [
+            -15.93824,
+            1.417335,
+            -91.939983
+          ],
+          "pos": [
+            2.826235,
+            0.674205,
+            -85.097802
+          ],
+          "t": 12.0
+        },
+        {
+          "fov_deg": 60.806858,
+          "look": [
+            -17.798539,
+            1.259131,
+            -89.206226
+          ],
+          "pos": [
+            2.319307,
+            0.69244,
+            -84.418791
+          ],
+          "t": 13.0
+        },
+        {
+          "fov_deg": 61.646649,
+          "look": [
+            -20.20021,
+            0.945295,
+            -85.672758
+          ],
+          "pos": [
+            1.501671,
+            0.704897,
+            -83.602009
+          ],
+          "t": 14.0
+        },
+        {
+          "fov_deg": 62.641957,
+          "look": [
+            -22.869039,
+            0.465493,
+            -81.738102
+          ],
+          "pos": [
+            0.396995,
+            0.699666,
+            -82.683384
+          ],
+          "t": 15.0
+        },
+        {
+          "fov_deg": 63.704961,
+          "look": [
+            -25.771821,
+            -0.05885,
+            -77.924782
+          ],
+          "pos": [
+            -0.969846,
+            0.67451,
+            -81.695735
+          ],
+          "t": 16.0
+        },
+        {
+          "fov_deg": 64.758817,
+          "look": [
+            -29.127654,
+            -0.374598,
+            -74.905372
+          ],
+          "pos": [
+            -2.572765,
+            0.643109,
+            -80.668767
+          ],
+          "t": 17.0
+        },
+        {
+          "fov_deg": 65.737658,
+          "look": [
+            -33.260817,
+            -0.394617,
+            -73.554619
+          ],
+          "pos": [
+            -4.384463,
+            0.632034,
+            -79.62907
+          ],
+          "t": 18.0
+        },
+        {
+          "fov_deg": 66.586597,
+          "look": [
+            -37.966228,
+            -0.302628,
+            -73.233281
+          ],
+          "pos": [
+            -6.376433,
+            0.637978,
+            -78.600128
+          ],
+          "t": 19.0
+        },
+        {
+          "fov_deg": 67.261724,
+          "look": [
+            -42.956263,
+            0.068052,
+            -73.075184
+          ],
+          "pos": [
+            -8.518958,
+            0.665892,
+            -77.602307
+          ],
+          "t": 20.0
+        },
+        {
+          "fov_deg": 67.730104,
+          "look": [
+            -48.143756,
+            0.970775,
+            -73.117425
+          ],
+          "pos": [
+            -10.781109,
+            0.759996,
+            -76.652865
+          ],
+          "t": 21.0
+        },
+        {
+          "fov_deg": 67.969783,
+          "look": [
+            -53.421758,
+            2.387295,
+            -73.381936
+          ],
+          "pos": [
+            -13.130747,
+            0.95548,
+            -75.765945
+          ],
+          "t": 22.0
+        },
+        {
+          "fov_deg": 67.969783,
+          "look": [
+            -58.70238,
+            3.966339,
+            -73.872482
+          ],
+          "pos": [
+            -15.534525,
+            1.271382,
+            -74.952579
+          ],
+          "t": 23.0
+        },
+        {
+          "fov_deg": 67.730104,
+          "look": [
+            -64.039659,
+            3.561424,
+            -74.579519
+          ],
+          "pos": [
+            -17.957882,
+            1.66662,
+            -74.220688
+          ],
+          "t": 24.0
+        },
+        {
+          "fov_deg": 67.261724,
+          "look": [
+            -69.241167,
+            1.838591,
+            -75.487168
+          ],
+          "pos": [
+            -20.36505,
+            1.830663,
+            -73.575078
+          ],
+          "t": 25.0
+        },
+        {
+          "fov_deg": 66.586597,
+          "look": [
+            -74.191879,
+            1.51746,
+            -76.55581
+          ],
+          "pos": [
+            -22.719048,
+            1.935999,
+            -73.017445
+          ],
+          "t": 26.0
+        },
+        {
+          "fov_deg": 65.737658,
+          "look": [
+            -78.856302,
+            1.534126,
+            -77.73277
+          ],
+          "pos": [
+            -24.981688,
+            2.039911,
+            -72.546373
+          ],
+          "t": 27.0
+        },
+        {
+          "fov_deg": 64.758817,
+          "look": [
+            -82.896008,
+            1.466684,
+            -80.85321
+          ],
+          "pos": [
+            -27.113568,
+            2.130506,
+            -72.157332
+          ],
+          "t": 28.0
+        },
+        {
+          "fov_deg": 63.704961,
+          "look": [
+            -85.36016,
+            0.760973,
+            -87.918299
+          ],
+          "pos": [
+            -29.074079,
+            2.204499,
+            -71.842682
+          ],
+          "t": 29.0
+        },
+        {
+          "fov_deg": 62.641957,
+          "look": [
+            -85.416255,
+            0.959022,
+            -97.319808
+          ],
+          "pos": [
+            -30.821399,
+            2.183617,
+            -71.591669
+          ],
+          "t": 30.0
+        },
+        {
+          "fov_deg": 61.646649,
+          "look": [
+            -82.854021,
+            2.196468,
+            -107.041988
+          ],
+          "pos": [
+            -32.312498,
+            2.237366,
+            -71.390428
+          ],
+          "t": 31.0
+        },
+        {
+          "fov_deg": 60.806858,
+          "look": [
+            -78.550373,
+            2.464257,
+            -115.214027
+          ],
+          "pos": [
+            -33.503134,
+            2.327439,
+            -71.221981
+          ],
+          "t": 32.0
+        },
+        {
+          "fov_deg": 60.221383,
+          "look": [
+            -74.295133,
+            2.380238,
+            -120.639428
+          ],
+          "pos": [
+            -34.347855,
+            2.381619,
+            -71.066239
+          ],
+          "t": 33.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -72.3,
+            2.4,
+            -122.65
+          ],
+          "pos": [
+            -34.8,
+            2.4,
+            -70.9
+          ],
+          "t": 34.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -72.54,
+            2.4,
+            -122.47
+          ],
+          "pos": [
+            -35.04,
+            2.4,
+            -70.72
+          ],
+          "t": 35.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -72.78,
+            2.4,
+            -122.29
+          ],
+          "pos": [
+            -35.28,
+            2.4,
+            -70.54
+          ],
+          "t": 36.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.02,
+            2.4,
+            -122.11
+          ],
+          "pos": [
+            -35.52,
+            2.4,
+            -70.36
+          ],
+          "t": 37.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.26,
+            2.4,
+            -121.93
+          ],
+          "pos": [
+            -35.76,
+            2.4,
+            -70.18
+          ],
+          "t": 38.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.5,
+            2.4,
+            -121.75
+          ],
+          "pos": [
+            -36.0,
+            2.4,
+            -70.0
+          ],
+          "t": 39.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.74,
+            2.4,
+            -121.57
+          ],
+          "pos": [
+            -36.24,
+            2.4,
+            -69.82
+          ],
+          "t": 40.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.98,
+            2.4,
+            -121.39
+          ],
+          "pos": [
+            -36.48,
+            2.4,
+            -69.64
+          ],
+          "t": 41.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.22,
+            2.4,
+            -121.21
+          ],
+          "pos": [
+            -36.72,
+            2.4,
+            -69.46
+          ],
+          "t": 42.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.46,
+            2.4,
+            -121.03
+          ],
+          "pos": [
+            -36.96,
+            2.4,
+            -69.28
+          ],
+          "t": 43.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.7,
+            2.4,
+            -120.85
+          ],
+          "pos": [
+            -37.2,
+            2.4,
+            -69.1
+          ],
+          "t": 44.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.94,
+            2.4,
+            -120.67
+          ],
+          "pos": [
+            -37.44,
+            2.4,
+            -68.92
+          ],
+          "t": 45.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.7198,
+      "weather": [
+        {
+          "cover": 0.5,
+          "rays": 1.0,
+          "snow_line_km": 0.7,
+          "t": 10.0,
+          "towers": 0.0
+        },
+        {
+          "cover": 0.5,
+          "rays": 1.0,
+          "snow_line_km": 0.7122,
+          "t": 34.0,
+          "towers": 0.0
+        }
+      ],
+      "words": []
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": null
+    },
+    "tiles": [],
+    "viewers": {
+      "active": 0,
+      "count": 0
+    }
+  }
+}

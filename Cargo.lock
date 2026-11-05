@@ -884,6 +884,7 @@ checksum = "645cbb3a84e60b7531617d5ae4e57f7e27308f6445f5abf653209ea76dec8dff"
 name = "fleet-core"
 version = "0.1.0"
 dependencies = [
+ "fleet-potato",
  "serde",
  "serde_json",
 ]

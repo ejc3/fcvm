@@ -303,6 +303,9 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
         Event::Tick { .. } => {
             tick(state, at);
             budget_round(&mut state.fleet, at);
+            let awake = state.fleet.power.state != "asleep";
+            let cfg = state.config.potato.clone();
+            state.fleet.potato.tick(at, awake, &cfg);
             None
         }
         Event::Ec2Health { report, .. } => {
@@ -320,10 +323,15 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     boot,
                     phones,
                     phone_actions,
-                    potato_players: _,
+                    potato_players,
                 } => {
                     // The connection names the host; a hello naming another is ignored.
                     if named == host {
+                        let cfg = state.config.potato.clone();
+                        state
+                            .fleet
+                            .potato
+                            .agent_hello(host, *potato_players, at, &cfg);
                         hello(&mut state.fleet, host, arch, gpus, *capacity, at);
                         if let Some(h) = state.fleet.hosts.get_mut(host) {
                             h.phone_actions = phone_actions.clone();
@@ -406,12 +414,15 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                         quarantine(&mut state.fleet, host, sbdf, error, report.clone(), at);
                     }
                 }
-                // The potato game reads these (docs/fleet/ARCHITECTURE.md, "Potato mode").
-                AgentMsg::Potato(_) => {}
+                AgentMsg::Potato(e) => {
+                    let cfg = state.config.potato.clone();
+                    state.fleet.potato.event(host, e, &cfg);
+                }
             }
             None
         }
         Event::AgentGone { host, .. } => {
+            state.fleet.potato.agent_gone(host, at);
             let f = &mut state.fleet;
             f.hosts.remove(host);
             f.slots.retain(|_, s| s.host.as_deref() != Some(host));
@@ -808,6 +819,20 @@ fn intent_effect(
             point,
         } => phone_action(state, c, claim.as_deref(), *action, *point),
         Intent::PhonesZoom { out } => phones_zoom(state, c, *out),
+        Intent::PotatoFaster => {
+            let cfg = state.config.potato.clone();
+            match state.fleet.potato.faster(c.client, at, &cfg) {
+                crate::potato::PotatoIntent::Done => Ok("faster".into()),
+                crate::potato::PotatoIntent::Refused(r) => Err(r),
+            }
+        }
+        Intent::PotatoRestart => {
+            let cfg = state.config.potato.clone();
+            match state.fleet.potato.restart(c.client, at, &cfg) {
+                crate::potato::PotatoIntent::Done => Ok("restart".into()),
+                crate::potato::PotatoIntent::Refused(r) => Err(r),
+            }
+        }
         Intent::ReleaseGpu { claim } => {
             let n = own_claim(&state.fleet, c.viewer).ok_or("this viewer holds no GPU")?;
             let session = &state.fleet.slots[&n].claim.as_ref().unwrap().session;

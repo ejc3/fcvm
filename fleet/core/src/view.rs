@@ -403,6 +403,10 @@ pub struct View {
     /// includes a phone. Absent with no phones.
     #[serde(skip_serializing_if = "PhonesView::is_empty")]
     pub phones: PhonesView,
+    /// Potato mode (`?mode=potato`): the ladder, the round and the players. Absent until a
+    /// host has run players.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub potato: Option<crate::potato::PotatoView>,
 }
 
 impl PhonesView {
@@ -693,6 +697,7 @@ pub fn view(state: &State) -> View {
 
         actions: f.actions.iter().cloned().collect(),
         phones: phones_view(state),
+        potato: state.fleet.potato.view(&state.config.potato),
     }
 }
 

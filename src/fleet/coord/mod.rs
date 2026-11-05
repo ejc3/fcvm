@@ -114,6 +114,8 @@ struct AgentConn {
     last_assign: Option<(Vec<AssignSlot>, Option<Rect>)>,
     last_scene: Option<SharedScene>,
     last_budget: Option<BudgetBody>,
+    /// Potato mode: the round this host was last told to play (`Some(None)`: told none).
+    last_potato: Option<Option<fleet_core::potato::PotatoRound>>,
 }
 
 /// The channels the actor publishes on.
@@ -344,6 +346,20 @@ impl Actor {
             if let Some(b) = budget.filter(|b| conn.last_budget != Some(*b)) {
                 let _ = conn.tx.send(CoordMsg::Budget(b));
                 conn.last_budget = Some(b);
+            }
+            // Potato mode: the potato host's round, and none for a host that runs players
+            // but is not the potato host.
+            let potato = (self.state.fleet.potato.host.as_deref() == Some(conn.host.as_str()))
+                .then(|| self.state.fleet.potato.order())
+                .flatten();
+            let runs_players = conn.last_potato.is_some()
+                || self.state.fleet.potato.host.as_deref() == Some(conn.host.as_str());
+            if runs_players && conn.last_potato.as_ref() != Some(&potato) {
+                tracing::info!(host = %conn.host, round = ?potato.as_ref().map(|r| r.round), "potato round sent");
+                let _ = conn.tx.send(CoordMsg::Potato {
+                    round: potato.clone(),
+                });
+                conn.last_potato = Some(potato);
             }
         }
         let f = &self.state.fleet;
@@ -615,6 +631,7 @@ impl Actor {
                         last_assign: None,
                         last_scene: None,
                         last_budget: None,
+                        last_potato: None,
                     },
                 );
                 let _ = reply.send(true);
