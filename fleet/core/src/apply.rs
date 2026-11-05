@@ -422,7 +422,8 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             None
         }
         Event::AgentGone { host, .. } => {
-            state.fleet.potato.agent_gone(host, at);
+            let cfg = state.config.potato.clone();
+            state.fleet.potato.agent_gone(host, at, &cfg);
             let f = &mut state.fleet;
             f.hosts.remove(host);
             f.slots.retain(|_, s| s.host.as_deref() != Some(host));

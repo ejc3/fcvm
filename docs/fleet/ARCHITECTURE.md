@@ -1694,10 +1694,12 @@ of an unassigned player; the agent gives a new clone its number over its ball po
 player then draws its first colour from the guest's random pool.
 
 1. **Catch.** The ball arrives over TCP from the previous player's VM, one JSON line:
-   `{round, seq, ring, hold_ms, shrink_permille, min_hold_ms, flight_ms, trail}`. The catcher
-   steps its colour forward one, increments its counter, extends its chain
-   (`sha256("fcvm-potato-v1" || chain || round || seq || colour)`), acknowledges the ball and
-   reports the catch with its new colour, counter and chain.
+   `{"type": "ball", round, seq, ring, hold_ms, shrink_permille, min_hold_ms, flight_ms,
+   trail}`. The catcher steps its colour forward one, increments its counter, extends its
+   chain (`sha256("fcvm-potato-v1" || chain || round || seq || colour)`, with `chain` the 32
+   bytes, `round` and `seq` 8-byte and `colour` 4-byte little-endian integers:
+   `fleet_potato::chain_step`), acknowledges the ball and reports the catch with its new
+   colour, counter and chain.
 2. **Throw.** After `hold_ms` it connects to the next address in `ring` and sends the ball
    with its colour on the trail. Nothing relays the ball: the agent and the coordinator only
    read reports. If the connection is refused or not answered, the thrower tries again every
@@ -1822,27 +1824,34 @@ ball dropped, from a hold of `max(2000 / (size - 1), 250)` ms shrinking a tenth 
 ball went from VM to VM over the host's routes. Two runs of the same configuration in one
 session:
 
-| size | first run: record hold, ms | second run: record hold, ms | second run: dropped at, ms | second run: wake p50 / p99 in the round, ms | second run: sleep p50 / max, ms |
+| size | first run: record hold, ms | second run: record hold, ms | second run: dropped in lap (its hold, ms) | second run: wake p50 / p99 in the round, ms | second run: sleep p50 / max, ms |
 |---|---|---|---|---|---|
-| 2 | 1458 | 777 | 630 | 347 / 371 | 349 / 944 |
-| 4 | 438 | 321 | 261 | 418 / 1907 | 383 / 2133 |
-| 8 | 257 | 285 | 232 | 455 / 725 | 661 / 1262 |
-| 16 | none (a bench defect, fixed) | 183 | 149 | 553 / 1277 | 1164 / 2317 |
-| 32 | 250 | 225 | 183 | 540 / 1633 | 943 / 2168 |
-| 64 | 250 | 250 | 225 | 627 / 1723 | 667 / 2812 |
-| 96 | 250 | 250 | 225 | 860 / 3439 | 833 / 5868 |
+| 2 | 1313 | 700 | 11 (630) | 347 / 371 | 349 / 944 |
+| 4 | 395 | 289 | 9 (261) | 418 / 1907 | 383 / 2133 |
+| 8 | 257 | 257 | 2 (232) | 455 / 725 | 661 / 1262 |
+| 16 | none (a bench defect, fixed) | 165 | 5 (149) | 553 / 1277 | 1164 / 2317 |
+| 32 | 225 | 203 | 3 (183) | 540 / 1633 | 943 / 2168 |
+| 64 | 225 | 250 | 1 (225) | 627 / 1723 | 667 / 2812 |
+| 96 | 250 | 250 | 1 (225) | 860 / 3439 | 833 / 5868 |
 
-The record is the shortest hold of a lap that completed; every round ended with the catcher
-still waking when the ball came. Two limits show:
+The record is the hold of the last lap that completed: the lap before the one the ball
+dropped in, whose hold follows from the start and the shrink. The bench logged each catch
+with the hold of the last throw it had read, which on separate report connections can be a
+lap behind, so the records are computed from the drop's lap rather than read from that log
+(`ladder_summary.py` does so now; the first draft of this table took them from the log and
+was one shrink step high in nine of its rows). Every round ended with the catcher
+not yet accepting when the ball came: still waking, except the first run's size 16, where
+the bench defect left an awake player refusing. Two limits show:
 
 - **Small rings are set by the tail.** A ring of 2 has one hold for the whole cycle. The
-  second run's ring of 2 ran 11 laps down to 777 ms, about one sleep and one wake (349 ms
-  and 347 ms); the first run's dropped at 1182 ms because one sleep spent 808 ms waiting for
-  a btrfs commit before its pause.
+  second run's ring of 2 completed 11 laps, the last at 700 ms, about one sleep and one wake
+  (349 ms and 347 ms); the first run's dropped at 1182 ms because one sleep spent 808 ms
+  waiting for a btrfs commit before its pause.
 - **Large rings are set by the host.** From 16 players up, several players sleep and wake at
   once, and each takes longer: sleeps of 0.7 to 1.2 s at the median and up to 5.9 s, against
-  0.26 s alone. The record stays between 183 and 250 ms whatever the size. Rings of 64 and
-  96 broke in their first or second lap at the 250 ms start, so their edge is above it.
+  0.26 s alone. From 8 players up the record stays between 165 and 257 ms whatever the size.
+  Rings of 64 and 96 broke in their second lap at the 250 ms start, so their edge is above
+  it.
 
 Turning btrfs subvolumes off for the cycle did not remove the tail. A build that made every
 snapshot and clone directory an ordinary directory, so that the cycle took reflinks only,
@@ -1858,7 +1867,7 @@ Each size starts at `max(2000 / (size - 1), 400)` ms of hold and shrinks a tenth
 
 - A ring of 2 starts at 2000 ms, about three times the 700 ms one sleep and one wake take,
   and reaches that edge in about ten laps (some 20 s) unless the tail ends it sooner.
-- From 8 players up the measured edge is near 180 to 285 ms, set by the host, so `2000 /
+- From 8 players up the measured edge is near 165 to 257 ms, set by the host, so `2000 /
   (size - 1)` would start below it; 400 ms starts each above its measured break and gives it
   a few laps to find it. At 96 players a lap at 400 ms is 38 s.
 - The flight window is 100 ms: long enough for a thrower to retry a few times against a

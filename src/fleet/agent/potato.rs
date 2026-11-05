@@ -213,7 +213,14 @@ async fn until_listening(addr: Ipv6Addr, deadline: Duration) -> Result<Instant> 
     let mut last = String::new();
     while Instant::now() < end {
         match ask(addr, &Inbound::Probe, Duration::from_millis(250)).await {
-            Ok(a) if a.contains("\"probe\"") => return Ok(Instant::now()),
+            Ok(a)
+                if matches!(
+                    serde_json::from_str::<Report>(a.trim()),
+                    Ok(Report::Probe { .. })
+                ) =>
+            {
+                return Ok(Instant::now())
+            }
             Ok(a) => last = a,
             Err(e) => last = format!("{e:#}"),
         }
@@ -325,6 +332,7 @@ pub async fn run(
         ops: Arc::new(FcvmOps {
             cfg: cfg.clone(),
             boot_slots: Arc::new(Semaphore::new(BOOT_PARALLEL)),
+            tasks: Default::default(),
         }),
         out,
         done: done_tx,
@@ -340,6 +348,7 @@ pub async fn run(
         wakes: VecDeque::new(),
         playing: None,
         late: None,
+        ended: None,
     };
     d.make_gold();
     loop {
@@ -356,6 +365,10 @@ pub async fn run(
         }
     }
     tracing::info!("potato mode stopping: every player's VM goes with the agent");
+    // in-flight work first (a boot waiting for a slot would start a VM after this), then the
+    // players' VMs, which stop when the driver drops them
+    d.ops.shutdown();
+    drop(d);
     Ok(())
 }
 
@@ -400,18 +413,35 @@ pub(crate) trait Ops: Send + Sync {
     fn wake(&self, n: u32, round: Option<u64>, done: mpsc::UnboundedSender<Done>);
     fn kick(&self, order: PotatoRound, done: mpsc::UnboundedSender<Done>);
     fn pace(&self, n: u32, round: u64, hold_ms: u64);
+    /// Abort every operation in flight; the agent is stopping.
+    fn shutdown(&self);
 }
 
 pub(crate) struct FcvmOps {
     cfg: Arc<PotatoCfg>,
     boot_slots: Arc<Semaphore>,
+    /// Every operation in flight, so a shutdown can abort them: an aborted task drops the VM it
+    /// holds, which sends its fcvm SIGTERM, and a boot still waiting for a slot starts nothing.
+    tasks: std::sync::Mutex<tokio::task::JoinSet<()>>,
+}
+
+impl FcvmOps {
+    fn spawn(&self, f: impl std::future::Future<Output = ()> + Send + 'static) {
+        let mut tasks = self.tasks.lock().unwrap();
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(f);
+    }
 }
 
 impl Ops for FcvmOps {
+    fn shutdown(&self) {
+        self.tasks.lock().unwrap().abort_all();
+    }
+
     /// The gold snapshot: an unassigned player, booted and put to sleep.
     fn make_gold(&self, done: mpsc::UnboundedSender<Done>) {
         let cfg = self.cfg.clone();
-        tokio::spawn(async move {
+        self.spawn(async move {
             let r = async {
                 let args = cfg.gold_args()?;
                 let gold = Vm::spawn_args(&cfg.fcvm, &args, GOLD)?;
@@ -443,7 +473,7 @@ impl Ops for FcvmOps {
     fn boot(&self, n: u32, colours: u32, done: mpsc::UnboundedSender<Done>) {
         let cfg = self.cfg.clone();
         let slots = self.boot_slots.clone();
-        tokio::spawn(async move {
+        self.spawn(async move {
             let r = async {
                 let _slot = slots.acquire().await?;
                 let addr = cfg.prefix.player_address(n)?;
@@ -459,8 +489,8 @@ impl Ops for FcvmOps {
                     Duration::from_secs(5),
                 )
                 .await?;
-                if !answer.contains("\"ok\"") {
-                    bail!("player {n} refused its number: {}", answer.trim());
+                if let Err(e) = fleet_potato::Reply::ok(&answer) {
+                    bail!("player {n} refused its number: {e}");
                 }
                 Ok(Some(vm))
             }
@@ -471,7 +501,7 @@ impl Ops for FcvmOps {
 
     fn sleep(&self, n: u32, vm: Option<Vm>, stop: Option<u64>, done: mpsc::UnboundedSender<Done>) {
         let cfg = self.cfg.clone();
-        tokio::spawn(async move {
+        self.spawn(async move {
             let started = Instant::now();
             if let (Some(round), Ok(addr)) = (stop, cfg.prefix.player_address(n)) {
                 if let Err(e) = ask(addr, &Inbound::Stop { round }, Duration::from_secs(2)).await {
@@ -512,7 +542,7 @@ impl Ops for FcvmOps {
 
     fn wake(&self, n: u32, round: Option<u64>, done: mpsc::UnboundedSender<Done>) {
         let cfg = self.cfg.clone();
-        tokio::spawn(async move {
+        self.spawn(async move {
             let started = Instant::now();
             let r = async {
                 let vm = Vm::spawn_args(
@@ -525,8 +555,8 @@ impl Ops for FcvmOps {
                 // it catches only once told it woke: a report connection can fail for other
                 // reasons, and a probe answers before the gate's last half opens
                 let answer = ask(addr, &Inbound::Wake { round }, Duration::from_secs(5)).await?;
-                if !answer.contains("\"ok\"") {
-                    bail!("player {n} refused its wake: {}", answer.trim());
+                if let Err(e) = fleet_potato::Reply::ok(&answer) {
+                    bail!("player {n} refused its wake: {e}");
                 }
                 let listening = Instant::now();
                 let mut stages = BTreeMap::new();
@@ -549,7 +579,7 @@ impl Ops for FcvmOps {
 
     fn kick(&self, o: PotatoRound, done: mpsc::UnboundedSender<Done>) {
         let cfg = self.cfg.clone();
-        tokio::spawn(async move {
+        self.spawn(async move {
             let r = async {
                 let ring = o
                     .ring
@@ -568,8 +598,8 @@ impl Ops for FcvmOps {
                 };
                 let first = cfg.prefix.player_address(o.ring[0])?;
                 let answer = ask(first, &Inbound::Ball(ball), Duration::from_secs(5)).await?;
-                if !answer.contains("\"ok\"") {
-                    bail!("the first player refused the ball: {}", answer.trim());
+                if let Err(e) = fleet_potato::Reply::ok(&answer) {
+                    bail!("the first player refused the ball: {e}");
                 }
                 Ok(())
             }
@@ -582,7 +612,7 @@ impl Ops for FcvmOps {
         let Ok(addr) = self.cfg.prefix.player_address(n) else {
             return;
         };
-        tokio::spawn(async move {
+        self.spawn(async move {
             if let Err(e) = ask(
                 addr,
                 &Inbound::Pace { round, hold_ms },
@@ -609,6 +639,9 @@ struct Driver {
     /// A dropped ball's catcher, its round and seq, and when the drop was heard, until it
     /// accepts again. Kept apart from the round, which the coordinator ends at the drop.
     late: Option<(u32, u64, u64, Instant)>,
+    /// The last round that ended: a wake or boot that finishes after it puts its player to
+    /// sleep with that round's `stop`, since it may have caught a ball of it meanwhile.
+    ended: Option<u64>,
 }
 
 impl Driver {
@@ -659,6 +692,7 @@ impl Driver {
         // in the air reaches nothing that accepts it.
         if let Some(mut p) = self.playing.take() {
             p.over = true;
+            self.ended = Some(p.order.round);
             tracing::info!(round = p.order.round, "potato round ended");
             for n in 0..self.cfg.players {
                 if self.players[n as usize].phase == Phase::Awake {
@@ -960,7 +994,7 @@ impl Driver {
                 // and one booted for a round that has ended, or that is not in this one, sleeps
                 let later = !self.within_lead().contains(&n);
                 if std::mem::take(&mut self.players[n as usize].sleep_after_wake) || later {
-                    self.sleep(n);
+                    self.sleep_after(n, self.ended);
                     self.advance();
                     return;
                 }
@@ -1043,8 +1077,9 @@ impl Driver {
                     .as_ref()
                     .is_some_and(|p| p.order.ring.contains(&n));
                 if over || !in_ring {
-                    // woken for a round that has ended: back to sleep
-                    self.sleep(n);
+                    // woken for a round that has ended: back to sleep, told the round is over
+                    // first, since it may have caught a ball of it after its wake
+                    self.sleep_after(n, self.ended);
                 } else {
                     if let Some(hold) = self.playing.as_ref().and_then(|p| p.order.pace_ms) {
                         let round = self.playing.as_ref().unwrap().order.round;
@@ -1119,6 +1154,9 @@ mod tests {
         fn pace(&self, n: u32, _: u64, hold_ms: u64) {
             self.push(format!("pace {n} {hold_ms}"));
         }
+        fn shutdown(&self) {
+            self.push("shutdown".into());
+        }
     }
 
     fn driver(players: u32) -> (Driver, Arc<Recorder>, mpsc::UnboundedReceiver<AgentMsg>) {
@@ -1149,6 +1187,7 @@ mod tests {
             wakes: VecDeque::new(),
             playing: None,
             late: None,
+            ended: None,
         };
         (d, rec, out_rx)
     }
@@ -1320,8 +1359,8 @@ mod tests {
         d.done(Done::Woke(2, Ok((None, BTreeMap::new())), 300.0));
         assert_eq!(
             rec.take(),
-            vec!["sleep 2"],
-            "a wake that finishes after the round goes back to sleep"
+            vec!["stop 1 sleep 2"],
+            "a wake that finishes after the round goes back to sleep, told the round is over: it may have caught a ball of it"
         );
     }
 
@@ -1463,5 +1502,32 @@ mod tests {
         assert_eq!(rec.take(), vec!["sleep 3"]);
         assert!(!d.playing.as_ref().unwrap().over, "round 2 goes on");
         assert!(d.late.is_none());
+    }
+
+    /// Shutdown aborts the work in flight: a boot still waiting for a slot never starts a VM
+    /// once the agent is stopping.
+    #[tokio::test]
+    async fn a_shutdown_stops_a_boot_waiting_for_its_slot() {
+        let ops = FcvmOps {
+            cfg: Arc::new(PotatoCfg {
+                fcvm: "/nonexistent/fcvm".into(),
+                image: "img".into(),
+                players: 2,
+                prefix: Prefix::parse("2001:db8::/80").unwrap(),
+                mem_mib: 256,
+            }),
+            boot_slots: Arc::new(Semaphore::new(0)),
+            tasks: Default::default(),
+        };
+        let (done, mut rx) = mpsc::unbounded_channel();
+        ops.boot(0, 12, done);
+        ops.shutdown();
+        ops.boot_slots.add_permits(1);
+        // with the task alive, the boot would now try to start fcvm and report its failure
+        let heard = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+        assert!(
+            !matches!(heard, Ok(Some(Done::Booted(..)))),
+            "a boot ran after the shutdown"
+        );
     }
 }

@@ -153,6 +153,26 @@ pub enum Inbound {
     },
 }
 
+/// A player's one-line answer to a ball, an `assign`, a `pace`, a `wake` or a `stop`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Reply {
+    Ok,
+    Refused { reason: String },
+}
+
+impl Reply {
+    /// Whether `line` is an `ok`: the line decoded, never searched for the word, so a refusal
+    /// whose reason says "ok" is a refusal.
+    pub fn ok(line: &str) -> Result<(), String> {
+        match serde_json::from_str::<Reply>(line.trim()) {
+            Ok(Reply::Ok) => Ok(()),
+            Ok(Reply::Refused { reason }) => Err(format!("refused: {reason}")),
+            Err(e) => Err(format!("not an answer ({e}): {:?}", line.trim())),
+        }
+    }
+}
+
 /// What a player tells the host agent, one JSON line each, on its report connection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -250,6 +270,14 @@ mod tests {
             chain_hex(&chain_step(&CHAIN_ZERO, 1, 2, 3)),
             "d3a0dadfb470f592b76503c24a34c46dbae84f50d6ce04ebd2974b292ea5481d"
         );
+    }
+
+    #[test]
+    fn a_reply_is_decoded_not_searched() {
+        assert_eq!(Reply::ok("{\"type\":\"ok\"}\n"), Ok(()));
+        assert!(Reply::ok("{\"type\":\"refused\",\"reason\":\"ok\"}").is_err());
+        assert!(Reply::ok("ok").is_err());
+        assert!(Reply::ok("").is_err());
     }
 
     #[test]

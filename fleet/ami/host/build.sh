@@ -137,6 +137,12 @@ build)
   # One GPU VM as root, launched as the agent launches a slot: the pre-start snapshot the
   # agent's restores hit, and the list of root volume files the prefetch reads at boot.
   bash "$HERE/warm-root.sh" "$G0" /etc/fcvm-fleet/prefetch.list
+  # Potato mode (docs/fleet/ARCHITECTURE.md, "Potato mode"): the player image, in root's store
+  # for the agent (--potato-players). The agent makes its player snapshot when it starts.
+  as_user "cd $SRC && make potato-image POTATO_IMAGE=localhost/fcvm-potato:fleet"
+  as_user "podman save --format oci-archive localhost/fcvm-potato:fleet -o /mnt/fcvm-btrfs/potato.oci.tar"
+  podman load -q -i /mnt/fcvm-btrfs/potato.oci.tar
+  rm -f /mnt/fcvm-btrfs/potato.oci.tar
   # Phones (docs/fleet/ARCHITECTURE.md, "Phones mode"): the phone profile, the emulator and the
   # system image built from source, and Robot Park. Robot Park builds against the SDK's API 35
   # platform (scripts/phone/sdk.sh): the SDK is used here to build the app and is left out of

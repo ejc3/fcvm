@@ -16,8 +16,8 @@
 //! POTATO_BALL_PORT (tests only; a VM always uses `BALL_PORT`).
 
 use fleet_potato::{
-    chain_hex, chain_step, next_colour, Ball, Chain, Inbound, Proof, Report, BALL_PORT, CHAIN_ZERO,
-    DEFAULT_COLOURS,
+    chain_hex, chain_step, next_colour, Ball, Chain, Inbound, Proof, Reply, Report, BALL_PORT,
+    CHAIN_ZERO, DEFAULT_COLOURS,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
@@ -194,11 +194,7 @@ fn throw(player: u32, ball: Ball, flight: Duration, tx: &Sender<Msg>) {
             c.set_read_timeout(Some(left))?;
             writeln!(c, "{line}")?;
             let ack = read_line(&c).unwrap_or_default();
-            if ack.contains("\"ok\"") {
-                Ok(())
-            } else {
-                Err(std::io::Error::other(format!("no ack: {:?}", ack.trim())))
-            }
+            Reply::ok(&ack).map_err(std::io::Error::other)
         })();
         match result {
             Ok(()) => {
@@ -292,6 +288,8 @@ fn main() {
     if let Some(p) = player {
         shared.assign(p, colours);
     }
+    // tests bind port 0 and read the port the kernel chose from this line
+    let port = listener.local_addr().map_or(port, |a| a.port());
     eprintln!("potato: player {player:?}, {colours} colours, ball port {port}");
     // One thread per connection: a connection that says nothing must not hold up the ball.
     for conn in listener.incoming() {
@@ -409,10 +407,15 @@ fn handle(mut conn: TcpStream, shared: &Shared) {
             let next = ball.thrown(colour);
             let flight = Duration::from_millis(ball.flight_ms);
             thread::sleep(Duration::from_millis(hold_ms).saturating_sub(caught_at.elapsed()));
+            // a throw of a round that is over is abandoned; only a throw makes the player go to
+            // sleep, so an abandoned one leaves it catching
             let over = {
                 let mut s = state.lock().unwrap();
-                s.accepting = false;
-                ball.round < s.floor
+                let over = ball.round < s.floor;
+                if !over {
+                    s.accepting = false;
+                }
+                over
             };
             if over {
                 let to = next.ring[(next.seq % next.ring.len() as u64) as usize].clone();
