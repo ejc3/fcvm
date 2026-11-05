@@ -1010,11 +1010,11 @@ class NonDumpablePss(unittest.TestCase):
 
         def run(argv, **_kwargs):
             calls.append(argv)
-            return subprocess.CompletedProcess(argv, 0, "Rss: 900 kB\nPss: 812 kB\n", "")
+            return subprocess.CompletedProcess(argv, 0, "Rss: 900 kB\nPss: 812 kB\nShared_Clean: 0 kB\nShared_Dirty: 0 kB\nPrivate_Clean: 0 kB\nPrivate_Dirty: 0 kB\n", "")
 
         with mock.patch("builtins.open", refusing_open), \
                 mock.patch.object(report.subprocess, "run", run):
-            self.assertEqual(report.pss_kb_of_pid(4242), 812)
+            self.assertEqual(report.smaps_rollup_kb(4242)["Pss"], 812)
         self.assertEqual(calls, [["sudo", "-n", "cat", "/proc/4242/smaps_rollup"]])
 
     def test_a_failed_sudo_read_still_refuses(self):
@@ -1033,7 +1033,7 @@ class NonDumpablePss(unittest.TestCase):
                                   lambda argv, **_k: subprocess.CompletedProcess(
                                       argv, 1, "", "a password is required")):
             with self.assertRaises(report.CgroupReadError):
-                report.pss_kb_of_pid(4242)
+                report.smaps_rollup_kb(4242)
 
 
 class MovingProcessSet(unittest.TestCase):
@@ -1045,15 +1045,16 @@ class MovingProcessSet(unittest.TestCase):
         with tempfile.TemporaryDirectory() as cg, \
                 mock.patch.object(report, "cgroup_procs", lambda _p: sets.pop(0) if len(sets) > 1 else sets[0]), \
                 mock.patch.object(report, "cgroup_bytes", lambda _p: 4096), \
-                mock.patch.object(report, "pss_kb_of_pid", lambda pid: 10), \
+                mock.patch.object(report, "smaps_rollup_kb", lambda pid: dict.fromkeys(report.ROLLUP_FIELDS, 10)), \
+                mock.patch.object(report, "process_comm", lambda pid: "fcvm"), \
                 mock.patch.object(report, "STABLE_READ_PAUSE_S", 0.0):
             return report.measure_complete_cgroup(cg, with_stat=False)
 
     def test_a_health_check_that_comes_and_goes_is_read_around(self):
         # before/after of attempt 1 differ (a health-check exec appeared);
         # attempt 2 is stable.
-        procs, current, pss, _stat = self.read([[1, 2, 3, 4], [1, 2, 3, 4, 5], [1, 2, 3, 4]])
-        self.assertEqual((sorted(procs), current, pss), ([1, 2, 3, 4], 4096, 40))
+        procs, current, smaps, _stat = self.read([[1, 2, 3, 4], [1, 2, 3, 4, 5], [1, 2, 3, 4]])
+        self.assertEqual((sorted(procs), current, smaps["total"]["Pss"]), ([1, 2, 3, 4], 4096, 40))
 
     def test_a_process_that_exits_mid_read_is_read_around(self):
         """RED BEFORE THE FIX: a health check that exited between the set read
@@ -1067,15 +1068,16 @@ class MovingProcessSet(unittest.TestCase):
             calls.append(pid)
             if pid == 5 and calls.count(5) == 1:
                 raise report.ProcessGone("cannot read /proc/5/smaps_rollup: [Errno 3] No such process")
-            return 10
+            return dict.fromkeys(report.ROLLUP_FIELDS, 10)
 
         with tempfile.TemporaryDirectory() as cg, \
                 mock.patch.object(report, "cgroup_procs", lambda _p: [1, 2, 5]), \
                 mock.patch.object(report, "cgroup_bytes", lambda _p: 4096), \
-                mock.patch.object(report, "pss_kb_of_pid", pss), \
+                mock.patch.object(report, "smaps_rollup_kb", pss), \
+                mock.patch.object(report, "process_comm", lambda pid: "fcvm"), \
                 mock.patch.object(report, "STABLE_READ_PAUSE_S", 0.0):
-            procs, _current, total, _stat = report.measure_complete_cgroup(cg, with_stat=False)
-        self.assertEqual(total, 30)
+            procs, _current, smaps, _stat = report.measure_complete_cgroup(cg, with_stat=False)
+        self.assertEqual(smaps["total"]["Pss"], 30)
 
     def test_an_exited_process_reads_as_gone(self):
         import builtins
@@ -1089,7 +1091,7 @@ class MovingProcessSet(unittest.TestCase):
 
         with mock.patch("builtins.open", gone):
             with self.assertRaises(report.ProcessGone):
-                report.pss_kb_of_pid(4242)
+                report.smaps_rollup_kb(4242)
 
     def test_a_zombie_holds_no_memory(self):
         """RED BEFORE THE FIX: a zombie in a clone's cgroup answered ESRCH to
@@ -1109,7 +1111,7 @@ class MovingProcessSet(unittest.TestCase):
             return real_open(path, *args, **kwargs)
 
         with mock.patch("builtins.open", zombie):
-            self.assertEqual(report.pss_kb_of_pid(4242), 0)
+            self.assertEqual(report.smaps_rollup_kb(4242), dict.fromkeys(report.ROLLUP_FIELDS, 0))
 
     def test_a_set_that_never_settles_still_refuses(self):
         import report

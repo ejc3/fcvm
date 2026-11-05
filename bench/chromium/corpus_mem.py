@@ -817,6 +817,10 @@ class FcvmSide:
         rec["serve_cgroup_kb"] = serve["clone_cgroup_kb"]
         rec["serve_pss_kb"] = serve["clone_pss_kb"]
         rec["serve_procs"] = serve["clone_procs"]
+        # In minor mode the serve's memfd is its shmem; a hole a clone fills
+        # is charged to that clone, not here.
+        for key in ("file", "shmem", "private", "shared"):
+            rec[f"serve_{key}_kb"] = serve[f"clone_{key}_kb"]
         return rec
 
 

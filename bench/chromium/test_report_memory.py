@@ -135,10 +135,10 @@ class StableProcessSet(unittest.TestCase):
     def test_process_arrival_refuses_the_sample(self):
         with mock.patch.object(report, "cgroup_procs", side_effect=([4001], [4001, 4002])), \
              mock.patch.object(report, "cgroup_bytes", return_value=4096), \
-             mock.patch.object(report, "pss_kb_of_pid", return_value=64), \
-             mock.patch.object(report, "cgroup_stat", return_value={
-                 "anon": 1, "file": 2, "kernel": 3, "sock": 4,
-             }):
+             mock.patch.object(report, "smaps_rollup_kb", return_value={"Pss": 64, "Private_Clean": 0, "Private_Dirty": 0, "Shared_Clean": 0, "Shared_Dirty": 0}), \
+             mock.patch.object(report, "process_comm", return_value="fcvm"), \
+             mock.patch.object(report, "cgroup_stat", return_value=dict.fromkeys(
+                 report.CGROUP_STAT_FIELDS, 1)):
             with self.assertRaises(report.CgroupReadError):
                 report.measure_complete_cgroup("/owned")
 
@@ -159,12 +159,15 @@ class ProcessPss(unittest.TestCase):
     def test_unreadable_smaps_refuses_the_process_set(self):
         with mock.patch("builtins.open", side_effect=PermissionError("denied")):
             with self.assertRaises(report.CgroupReadError):
-                report.pss_kb_of_pid(4001)
+                report.smaps_rollup_kb(4001)
 
     def test_malformed_smaps_refuses_the_process_set(self):
-        with mock.patch("builtins.open", mock.mock_open(read_data="Pss: nope kB\n")):
+        # Every other field is valid, so only the malformed Pss can refuse.
+        rollup = ("Pss: nope kB\nPrivate_Clean: 1 kB\nPrivate_Dirty: 2 kB\n"
+                  "Shared_Clean: 3 kB\nShared_Dirty: 4 kB\n")
+        with mock.patch("builtins.open", mock.mock_open(read_data=rollup)):
             with self.assertRaises(report.CgroupReadError):
-                report.pss_kb_of_pid(4001)
+                report.smaps_rollup_kb(4001)
 
     def test_malformed_memory_current_refuses_the_sample(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -255,7 +258,8 @@ class PodmanCgroupIdentity(unittest.TestCase):
              mock.patch.object(report, "CGROUP_ROOT", cgroup_root, create=True), \
              mock.patch.object(report, "read_meminfo", return_value={}), \
              mock.patch.object(report, "cgroup_procs", return_value=[4001]), \
-             mock.patch.object(report, "pss_kb_of_pid", return_value=64), \
+             mock.patch.object(report, "smaps_rollup_kb", return_value={"Pss": 64, "Private_Clean": 0, "Private_Dirty": 0, "Shared_Clean": 0, "Shared_Dirty": 0}), \
+             mock.patch.object(report, "process_comm", return_value="fcvm"), \
              mock.patch.object(report, "cgroup_bytes", return_value=4096), \
              contextlib.redirect_stdout(output):
             report.cmd_sample(self.args())
@@ -283,6 +287,77 @@ class PodmanCgroupIdentity(unittest.TestCase):
         self.assertEqual(rec["pool_containers"], 1)
         self.assertEqual(rec["pool_procs"], 1)
         self.assertEqual(rec["pool_pss_kb"], 64)
+
+
+class CloneMemoryBreakdown(unittest.TestCase):
+    """A clone sample says what its file pages are and how much of PSS is private.
+
+    The 4 vCPU corpus memory phase charged each added clone about 104 MiB of
+    `file` that its PSS did not show, and its samples held only `anon` and
+    `file`, so nothing in the record could say whether those pages were the
+    clone's disk page cache or memfd pages its faults had filled (`shmem`).
+    """
+
+    STAT = {
+        "anon": 300 << 20, "file": 120 << 20, "kernel": 9 << 20, "sock": 0,
+        "shmem": 100 << 20, "file_mapped": 3 << 20, "file_dirty": 1 << 20,
+        "active_file": 40 << 20, "inactive_file": 80 << 20,
+        "active_anon": 200 << 20, "inactive_anon": 100 << 20,
+    }
+
+    def sample(self, stat):
+        with tempfile.TemporaryDirectory() as root:
+            leaf = write_cgroup(os.path.join(root, "req-c-0"), [os.getpid()])
+            with open(os.path.join(leaf, "memory.current"), "w") as handle:
+                handle.write(f"{430 << 20}\n")
+            with open(os.path.join(leaf, "memory.stat"), "w") as handle:
+                handle.write("".join(f"{k} {v}\n" for k, v in stat.items()))
+            args = SimpleNamespace(cgroup_root=root, cgroup_prefix="req-c-",
+                                   podman_prefix=None, extra=None)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                report.cmd_sample(args)
+        return json.loads(output.getvalue())
+
+    def test_a_clone_sample_records_the_stat_breakdown_and_the_private_shared_split(self):
+        rec = self.sample(self.STAT)
+        for key in ("shmem", "file_mapped", "file_dirty", "active_file",
+                    "inactive_file", "active_anon", "inactive_anon"):
+            self.assertEqual(rec[f"clone_{key}_kb"], self.STAT[key] // 1024, key)
+        with open(f"/proc/{os.getpid()}/comm") as handle:
+            comm = handle.read().strip()
+        mine = rec["clone_smaps_by_comm"][comm]
+        self.assertEqual(mine["procs"], 1)
+        self.assertGreater(mine["private_dirty_kb"], 0)
+        self.assertEqual(
+            rec["clone_private_kb"], mine["private_clean_kb"] + mine["private_dirty_kb"])
+        self.assertEqual(
+            rec["clone_shared_kb"], mine["shared_clean_kb"] + mine["shared_dirty_kb"])
+
+    def test_a_process_name_that_is_not_utf8_is_still_measured(self):
+        """A process may name itself with any bytes (PR_SET_NAME). Decoding
+        /proc/<pid>/comm strictly raised UnicodeDecodeError and aborted a
+        sample whose process set was otherwise complete."""
+        child = subprocess.Popen([
+            sys.executable, "-c",
+            "import ctypes, sys, time\n"
+            "ctypes.CDLL(None).prctl(15, b'example-\\xff', 0, 0, 0)\n"
+            "print('named', flush=True); time.sleep(30)"],
+            stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "named")
+            self.assertEqual(report.process_comm(child.pid), "example-\\xff")
+        finally:
+            child.kill()
+            child.wait()
+
+    def test_a_stat_without_the_breakdown_refuses_the_sample(self):
+        stat = dict(self.STAT)
+        del stat["shmem"]
+        with self.assertRaises(SystemExit) as caught, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.sample(stat)
+        self.assertEqual(caught.exception.code, 2)
 
 
 if __name__ == "__main__":
