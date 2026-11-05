@@ -70,6 +70,7 @@ so the hash names the bytes that were parsed.
 import argparse
 import ctypes
 import fcntl
+import gzip
 import hashlib
 import ipaddress
 import json
@@ -1189,6 +1190,16 @@ def read_external_log(run_dir, name, want, sources):
             f"({shown.stderr.decode(errors='replace').strip()})"
         )
     data = shown.stdout
+    # A log over the records repository's 100 MB file limit is stored gzipped;
+    # the sha256 it is checked against is the uncompressed log's.
+    encoding = entry.get("encoding")
+    if encoding == "gzip":
+        try:
+            data = gzip.decompress(data)
+        except (OSError, EOFError) as error:
+            raise RunError(f"{run_dir}: NOT VERIFIED: {where} is not gzip data: {error}")
+    elif encoding is not None:
+        raise RunError(f"{run_dir}: NOT VERIFIED: {where} has unknown encoding {encoding!r}")
     digest = hashlib.sha256(data).hexdigest()
     sources.entries.append({"path": where, "sha256": digest})
     return data, digest
