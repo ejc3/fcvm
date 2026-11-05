@@ -124,6 +124,21 @@ pub fn unshared_bytes_up_to(file: &File, min: u64) -> std::io::Result<u64> {
     Ok(unshared)
 }
 
+/// How many extents `file` has, counted only until they pass `limit`: the exact count when it
+/// is at most `limit`, otherwise `limit + 1`. Holes are not extents.
+pub fn extents_up_to(file: &File, limit: u64) -> std::io::Result<u64> {
+    let mut extents = 0u64;
+    for_each_extent(file, |_| {
+        extents += 1;
+        if extents > limit {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })?;
+    Ok(extents)
+}
+
 /// The ranges of `file` in extents no other file shares, with touching ranges joined.
 pub fn unshared_ranges(file: &File) -> std::io::Result<Vec<std::ops::Range<u64>>> {
     let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
@@ -155,4 +170,29 @@ pub fn reports_shared_extents(file: &File) -> std::io::Result<bool> {
         }
     })?;
     Ok(shared)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Seek, SeekFrom, Write};
+
+    /// Three 4 KiB blocks with holes between them are three extents; the count stops one past
+    /// the limit. The file is made in the crate's directory, on the build's filesystem: tmpfs
+    /// does not answer FIEMAP.
+    #[test]
+    fn extents_are_counted_up_to_one_past_the_limit() {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let path = dir.path().join("three-extents");
+        let mut file = File::create(&path).unwrap();
+        for block in 0..3u64 {
+            file.seek(SeekFrom::Start(block * 64 * 1024)).unwrap();
+            file.write_all(&[0xa5; 4096]).unwrap();
+        }
+        file.sync_all().unwrap();
+        let file = File::open(&path).unwrap();
+        assert_eq!(extents_up_to(&file, 10).unwrap(), 3);
+        assert_eq!(extents_up_to(&file, 3).unwrap(), 3);
+        assert_eq!(extents_up_to(&file, 1).unwrap(), 2);
+    }
 }

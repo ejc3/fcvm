@@ -1870,7 +1870,10 @@ snapshot and clone directory an ordinary directory, so that the cycle took refli
 ran 240 cycles with the sleep's setup at 1366 ms p99 and a clone's disk at 1771 ms at most,
 as with subvolumes, and its median disk steps were slower (the clone's disk 45.5 ms against
 30.8). The stall is the transaction commit, which reflinks wait on as well. That build is not
-part of this stack.
+part of this stack. Reflinking only the wake's disk is another matter: with the snapshots
+still on subvolumes, four wakes and four sleeps at once (`potatobench.py burst`), the wake's
+disk step took 17 ms p50 and 192 ms p99 as a reflink against 193 ms and 1.8 s as a subvolume
+snapshot, and fcvm now reflinks a clone's disk of at most 4096 extents.
 
 ### The starting pace
 

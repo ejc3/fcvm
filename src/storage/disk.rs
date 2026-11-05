@@ -48,6 +48,28 @@ pub fn can_own_subvolume_snapshot_of(base_dir: &Path) -> bool {
             .unwrap_or(false)
 }
 
+/// A base disk with at most this many extents is reflinked into a clone rather than given
+/// to it as a subvolume snapshot. A subvolume snapshot commits a btrfs transaction, and
+/// holds its parent directory's lock until the commit ends: with four restores and four
+/// snapshots at once on a fleet host it took 193 ms at the median and 1.8 s at p99, against
+/// 17 ms and 192 ms for a reflink of a 684-extent disk (interleaved A/B, 120 restores per
+/// arm). A reflink costs one extent reference per extent, about 12 to 25 us each (a
+/// 860,177-extent disk took 9 to 11 s), so at this limit it stays near 100 ms.
+pub const REFLINK_MAX_EXTENTS: u64 = 4096;
+
+/// Whether a base disk of `extents` extents (None: not counted) is cheaper to reflink than
+/// to snapshot as a subvolume.
+fn reflink_is_cheaper(extents: Option<u64>) -> bool {
+    matches!(extents, Some(n) if n <= REFLINK_MAX_EXTENTS)
+}
+
+/// The extents of the disk at `path`, counted up to one past [`REFLINK_MAX_EXTENTS`]; None
+/// when they cannot be counted.
+fn base_disk_extents(path: &Path) -> Option<u64> {
+    let file = std::fs::File::open(path).ok()?;
+    crate::storage::extents::extents_up_to(&file, REFLINK_MAX_EXTENTS).ok()
+}
+
 /// Create `path` as a btrfs subvolume, or as an ordinary directory where that
 /// fails (a store that is not btrfs, or btrfs behind a FUSE map in a nested
 /// guest, whose ioctls do not pass). A snapshot's disk directory that is a
@@ -375,17 +397,21 @@ impl DiskManager {
 
         // A base in a snapshot's disk directory (a btrfs subvolume holding the
         // snapshot's disks and nothing else) is cloned with one subvolume
-        // snapshot of that directory. That costs one btrfs transaction commit
-        // whatever the disks' extent count: 20 to 60 ms on a quiet host, 0.2 to
-        // 1.0 s on a shared devserver at load 14 to 46. A reflink costs one
-        // extent reference per extent: 12 ms for a test VM's disk, 9 to 11 s
-        // for a 154 GB disk of 860,177 extents. The snapshot becomes this VM's
-        // disk directory, with the base disk renamed to the rootfs name; the
-        // extra disks it carried are already in place.
+        // snapshot of that directory when the disk has many extents. That costs
+        // one btrfs transaction commit whatever the disks' extent count: 20 to
+        // 60 ms on a quiet host, 0.2 to 1.0 s on a shared devserver at load 14
+        // to 46, 1.8 s at p99 with eight snapshots and restores at once. A
+        // reflink costs one extent reference per extent: 12 ms for a test VM's
+        // disk, 9 to 11 s for a 154 GB disk of 860,177 extents. A disk of at most
+        // REFLINK_MAX_EXTENTS extents is reflinked below instead. The snapshot
+        // becomes this VM's disk directory, with the base disk renamed to the
+        // rootfs name; the extra disks it carried are already in place.
+        let base_extents = base_disk_extents(&self.base_rootfs);
         if let Some(base_dir) = self
             .base_rootfs
             .parent()
             .filter(|d| is_snapshot_disk_subvolume(d))
+            .filter(|_| !reflink_is_cheaper(base_extents))
         {
             let started = std::time::Instant::now();
             match self.snapshot_base_subvolume(base_dir, &disk_path).await {
@@ -423,6 +449,7 @@ impl DiskManager {
             info!(
                 base = %self.base_rootfs.display(),
                 disk = %disk_path.display(),
+                extents = ?base_extents,
                 "creating instant reflink copy (btrfs CoW)"
             );
 
@@ -1093,6 +1120,26 @@ pub fn parse_size(s: &str) -> Result<u64> {
 #[cfg(test)]
 mod snapshot_dir_tests {
     use super::*;
+
+    /// A counted disk of at most REFLINK_MAX_EXTENTS extents is reflinked; a larger one, or
+    /// one whose extents could not be counted, gets the subvolume snapshot.
+    #[test]
+    fn a_disk_with_few_extents_is_reflinked() {
+        assert!(reflink_is_cheaper(Some(0)));
+        assert!(reflink_is_cheaper(Some(684)));
+        assert!(reflink_is_cheaper(Some(REFLINK_MAX_EXTENTS)));
+        assert!(!reflink_is_cheaper(Some(REFLINK_MAX_EXTENTS + 1)));
+        assert!(!reflink_is_cheaper(None));
+        let source = include_str!("disk.rs");
+        let create = &source[source.find("pub async fn create_cow_disk").unwrap()..];
+        let subvolume = create
+            .find(".filter(|d| is_snapshot_disk_subvolume(d))")
+            .unwrap();
+        assert!(
+            create[subvolume..subvolume + 120].contains("!reflink_is_cheaper(base_extents)"),
+            "create_cow_disk takes the subvolume snapshot only for a disk not cheaper to reflink"
+        );
+    }
 
     /// A leftover staging directory that cannot be removed fails the create: a subvolume
     /// snapshot made onto it would land inside it. The removal's failure is given to the
