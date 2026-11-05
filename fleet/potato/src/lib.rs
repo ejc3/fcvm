@@ -145,9 +145,10 @@ pub enum Inbound {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         round: Option<u64>,
     },
-    /// Round `round` is over: its balls are refused, and a throw of it still waiting for its
-    /// hold is abandoned. The agent sends it before it puts a player to sleep at a round's
-    /// end, so no snapshot holds a throw that would resume in a later round.
+    /// Round `round` is over, and a sleep follows: every ball is refused until a `wake`, and
+    /// a throw of the round still waiting for its hold is abandoned when the hold ends. The
+    /// agent sends it before it puts a player to sleep at a round's end. A hold the snapshot
+    /// paused ends after the next wake.
     Stop {
         round: u64,
     },

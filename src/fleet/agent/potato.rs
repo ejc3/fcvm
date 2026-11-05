@@ -383,13 +383,11 @@ async fn serve_reports(listener: tokio::net::TcpListener, tx: mpsc::UnboundedSen
             while let Ok(Some(line)) = lines.next_line().await {
                 match serde_json::from_str::<Report>(&line) {
                     Ok(report) => {
-                        if tx
-                            .send(Heard {
-                                report,
-                                at: unix_ms(),
-                            })
-                            .is_err()
-                        {
+                        let at = unix_ms();
+                        // every report as read, so a report a player sent and the agent never
+                        // read can be told from one the coordinator read late
+                        tracing::debug!(target: "fcvm::fleet::potato_reports", at, report = %line, "potato report read");
+                        if tx.send(Heard { report, at }).is_err() {
                             return;
                         }
                     }
@@ -785,6 +783,16 @@ impl Driver {
             .collect()
     }
 
+    /// Whether the round being played needs player `n` awake: it holds the ball (caught it
+    /// last and has not thrown), or the ball reaches it within the lead.
+    fn needed(&self, n: u32) -> bool {
+        let Some(p) = self.playing.as_ref().filter(|p| !p.over) else {
+            return false;
+        };
+        let holds = p.caught && p.order.ring[(p.seq % p.order.ring.len() as u64) as usize] == n;
+        holds || self.within_lead().contains(&n)
+    }
+
     fn schedule_wakes(&mut self) {
         for k in self.within_lead() {
             if self.players[k as usize].phase == Phase::Asleep {
@@ -948,9 +956,13 @@ impl Driver {
                     .as_ref()
                     .is_some_and(|pl| pl.order.round == round && !pl.over);
                 if !current {
-                    // a ball of a round that has ended (a throw it abandoned): only its
-                    // thrower, which refuses the ball now, goes to sleep
-                    if self.players.get(player as usize).map(|p| p.phase) == Some(Phase::Awake) {
+                    // a ball of a round that has ended (a throw it abandoned): its thrower
+                    // goes to sleep unless the current round needs it awake. The report comes
+                    // when the abandoned hold ends, which can be after the player's next wake,
+                    // by when it may hold the current ball or be about to catch it.
+                    if self.players.get(player as usize).map(|p| p.phase) == Some(Phase::Awake)
+                        && !self.needed(player)
+                    {
                         self.sleep(player);
                     }
                     return;
@@ -1502,6 +1514,37 @@ mod tests {
         assert_eq!(rec.take(), vec!["sleep 3"]);
         assert!(!d.playing.as_ref().unwrap().over, "round 2 goes on");
         assert!(d.late.is_none());
+    }
+
+    /// A throw abandoned when its round ended is reported when the hold ends, which can be
+    /// after the player's next wake, by when it may hold the ball of the round after. That
+    /// report must not put the holder to sleep: a sleeping holder throws nothing, and nobody
+    /// wakes the holder, so the ball of the current round is lost until its deadline.
+    #[test]
+    fn a_stale_drop_does_not_sleep_the_holder_of_the_current_ball() {
+        let (mut d, rec, _out) = asleep(4, 300.0);
+        d.order(Some(round(2, vec![0, 1, 2, 3], 1000)));
+        assert_eq!(rec.take(), vec!["wake 0", "wake 1"]);
+        d.done(Done::Woke(0, Ok((None, BTreeMap::new())), 300.0));
+        assert_eq!(rec.take(), vec!["kick 2"]);
+        // player 0 catches the first ball of round 2 and holds it
+        d.heard(caught(0, 2, 0));
+        rec.take();
+        // the hold of a round-1 ball it was paused in ends now: the throw is abandoned
+        d.heard(heard(Report::Dropped {
+            player: 0,
+            round: 1,
+            seq: 7,
+            to: addr(1),
+            attempts: 0,
+            reason: "the round is over".into(),
+        }));
+        assert_eq!(
+            rec.take(),
+            Vec::<String>::new(),
+            "player 0 holds round 2's ball and must stay awake to throw it"
+        );
+        assert_eq!(d.players[0].phase, Phase::Awake);
     }
 
     /// Shutdown aborts the work in flight: a boot still waiting for a slot never starts a VM

@@ -36,8 +36,8 @@ struct State {
     last: Option<(u64, u64)>,
     /// A hold asked for after a round started: (round, hold_ms).
     pace: Option<(u64, u64)>,
-    /// False from the moment the player throws until the agent wakes it: a player that has
-    /// thrown is going to sleep, and a ball it caught before the snapshot paused it would be
+    /// False from the moment the player throws, or is told its round is over, until the
+    /// agent wakes it: either way it is going to sleep, and a ball it caught before the snapshot paused it would be
     /// held by a sleeping VM nobody wakes for it. A ball that arrives meanwhile is refused, so
     /// the thrower's flight runs out and the ball drops, as it does for a player asleep.
     accepting: bool,
@@ -350,6 +350,9 @@ fn handle(mut conn: TcpStream, shared: &Shared) {
             {
                 let mut s = state.lock().unwrap();
                 s.floor = s.floor.max(round.saturating_add(1));
+                // a stop comes before a sleep: a ball of a later round caught now would be held
+                // by a VM nobody wakes for it, so it is refused until the wake
+                s.accepting = false;
             }
             let _ = writeln!(conn, "{{\"type\":\"ok\"}}");
         }
