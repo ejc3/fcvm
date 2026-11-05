@@ -162,7 +162,10 @@ class ProcessPss(unittest.TestCase):
                 report.smaps_rollup_kb(4001)
 
     def test_malformed_smaps_refuses_the_process_set(self):
-        with mock.patch("builtins.open", mock.mock_open(read_data="Pss: nope kB\n")):
+        # Every other field is valid, so only the malformed Pss can refuse.
+        rollup = ("Pss: nope kB\nPrivate_Clean: 1 kB\nPrivate_Dirty: 2 kB\n"
+                  "Shared_Clean: 3 kB\nShared_Dirty: 4 kB\n")
+        with mock.patch("builtins.open", mock.mock_open(read_data=rollup)):
             with self.assertRaises(report.CgroupReadError):
                 report.smaps_rollup_kb(4001)
 
@@ -330,6 +333,23 @@ class CloneMemoryBreakdown(unittest.TestCase):
             rec["clone_private_kb"], mine["private_clean_kb"] + mine["private_dirty_kb"])
         self.assertEqual(
             rec["clone_shared_kb"], mine["shared_clean_kb"] + mine["shared_dirty_kb"])
+
+    def test_a_process_name_that_is_not_utf8_is_still_measured(self):
+        """A process may name itself with any bytes (PR_SET_NAME). Decoding
+        /proc/<pid>/comm strictly raised UnicodeDecodeError and aborted a
+        sample whose process set was otherwise complete."""
+        child = subprocess.Popen([
+            sys.executable, "-c",
+            "import ctypes, sys, time\n"
+            "ctypes.CDLL(None).prctl(15, b'example-\\xff', 0, 0, 0)\n"
+            "print('named', flush=True); time.sleep(30)"],
+            stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "named")
+            self.assertEqual(report.process_comm(child.pid), "example-\\xff")
+        finally:
+            child.kill()
+            child.wait()
 
     def test_a_stat_without_the_breakdown_refuses_the_sample(self):
         stat = dict(self.STAT)

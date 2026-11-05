@@ -231,10 +231,13 @@ def smaps_rollup_kb(pid):
 
 
 def process_comm(pid):
-    """The process name a rollup is grouped under; a gone process moves the set."""
+    """The process name a rollup is grouped under; a gone process moves the set.
+
+    A process may name itself with any bytes (PR_SET_NAME), so a byte that is
+    not UTF-8 is kept as a backslash escape rather than refusing the sample."""
     path = f"/proc/{pid}/comm"
     try:
-        with open(path) as f:
+        with open(path, errors="backslashreplace") as f:
             return f.read().strip()
     except (ProcessLookupError, FileNotFoundError) as exc:
         raise ProcessGone(f"cannot read {path}: {exc}") from exc
