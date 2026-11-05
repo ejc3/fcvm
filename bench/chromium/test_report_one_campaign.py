@@ -115,6 +115,7 @@ def record_identity(name):
             "image_id": meta.get("image_id"),
             "browser_version": meta.get("browser_version"),
             "runtime_bundle_sha256": meta.get("runtime_bundle_sha256"),
+            "fcvm_sha256": meta.get("fcvm_sha256"),
         }
     runs = []
     for root, _dirs, files in os.walk(base):
@@ -126,13 +127,19 @@ def record_identity(name):
         with open(path) as handle:
             run = json.load(handle)
         host = run.get("host") or {}
-        if "source_revision" not in run:
-            continue
+        # A corpus-extra run's top-level provenance.json describes the build,
+        # not a phase on a box: it names the reqbench bundle and the fcvm
+        # binary, and no commit or boot of its own.
+        top = os.path.dirname(path) == base and name.startswith("corpusextra-")
         identities.append({
+            "top": top,
+            "path": os.path.relpath(path, RESULTS),
             "source_revision": run.get("source_revision"),
             "host_boot_sha256": run.get("host_boot_sha256") or host.get("host_boot_sha256"),
             "instance_type": host.get("instance_type"),
             "image_id": run.get("image_id"),
+            "runtime_bundle_sha256": run.get("runtime_bundle_sha256") or run.get("reqbench_runtime_bundle_sha256"),
+            "fcvm_sha256": run.get("fcvm_sha256") or run.get("fcvm"),
         })
     if not identities:
         return None, None
@@ -174,6 +181,9 @@ class OneCampaign(unittest.TestCase):
             self.assertIsNotNone(kind, f"{name}: no record names its commit and boot")
             rows = identity if kind == "extra" else [identity]
             for row in rows:
+                if row.get("top"):
+                    extras.append((name, row))
+                    continue
                 # A host-control record names its boot but not the instance
                 # type; its boot must then be one a serial record names, with
                 # that record's type (checked below).
@@ -192,13 +202,15 @@ class OneCampaign(unittest.TestCase):
                 engine = per_engine.setdefault(identity["engine"], {
                     "image_id": set(), "browser_version": set(), "runtime_bundle_sha256": set()})
                 for field in engine:
+                    # A field no record names is no evidence of one build.
+                    self.assertTrue(identity[field], f"{name}: the record does not name its {field}")
                     engine[field].add(identity[field])
             else:
                 extras.extend((name, row) for row in rows)
         serial_boots = {boot_of[n] for n in boot_of if n.startswith(f"reqbench-{cid}-")
                         and record_identity(n)[0] == "serial"}
         for name, row in extras:
-            if not row.get("instance_type"):
+            if not row.get("top") and not row.get("instance_type"):
                 self.assertIn(row["host_boot_sha256"], serial_boots,
                               f"{name}: names no instance type and a boot no serial record names")
         for field, values in seen.items():
@@ -220,9 +232,19 @@ class OneCampaign(unittest.TestCase):
             for field, values in fields.items():
                 self.assertEqual(len(values), 1, f"{engine}: {len(values)} values of {field}: {sorted(values)}")
         chromium_image = next(iter(per_engine.get("chromium", {}).get("image_id", {None})))
+        chromium_bundle = next(iter(per_engine.get("chromium", {}).get("runtime_bundle_sha256", {None})))
+        fcvm = {record_identity(n)[1]["fcvm_sha256"] for n in cited if record_identity(n)[0] == "serial"}
+        self.assertEqual(len(fcvm), 1, f"the serial records name {len(fcvm)} fcvm binaries")
+        self.assertTrue(next(iter(fcvm)), "a serial record names no fcvm binary")
         for name, row in extras:
+            # Every non-serial record names the build it ran: the Chromium
+            # image and runtime bundle of the serial runs, and their fcvm.
+            self.assertEqual(row["runtime_bundle_sha256"], chromium_bundle,
+                             f"{row['path']}: another runtime bundle")
             if row.get("image_id") is not None:
-                self.assertEqual(row["image_id"], chromium_image, f"{name}: another Chromium image build")
+                self.assertEqual(row["image_id"], chromium_image, f"{row['path']}: another Chromium image build")
+            if row.get("fcvm_sha256") is not None:
+                self.assertIn(row["fcvm_sha256"], fcvm, f"{row['path']}: another fcvm binary")
 
     def test_the_campaign_date_appears_once_in_setup_and_nowhere_else(self):
         rest, cells = without_elements(self.page, r'id="campaign-date"')
@@ -237,13 +259,67 @@ class OneCampaign(unittest.TestCase):
         start = self.page.index('<h2 id="limits">')
         end = self.page.find("<h2", start + 1)
         limits = self.page[start:end]
-        items = re.findall(r"<li>\s*<strong>(.*?)</strong>", limits, re.S)
+        items = re.findall(r"<li\b[^>]*>(.*?)</li>", limits, re.S)
         self.assertTrue(items, "the Limits section lists no item")
+        paragraphs = re.findall(r"<p\b[^>]*>(.*?)</p>", limits, re.S)
+        self.assertEqual(paragraphs, [], "Limits holds text outside its list items")
         for item in items:
-            text = plain(item).rstrip(".").replace("\u2019", "'")
+            # Every item opens with an allowed limit in bold; the rest of the
+            # item explains it.
+            lead = re.match(r"\s*<strong>(.*?)</strong>", item, re.S)
+            self.assertIsNotNone(lead, f"a Limits item without a named limit: {plain(item)[:120]!r}")
+            text = plain(lead.group(1)).rstrip(".").replace("\u2019", "'")
             self.assertIn(text, ALLOWED_LIMITS, "a Limits item that more measurement could remove")
         found = sorted({m.group(0) for m in REMOVABLE.finditer(plain(self.page))})
         self.assertEqual(found, [], "caveat language more measurement would remove")
+
+
+class TheLintCatchesWhatItClaims(unittest.TestCase):
+    """Each check fails on the defect it exists for. RED BEFORE THE FIX
+    (review of 04915961..f55f229d): a plain Limits item without a bold
+    lead, a serial record that names no browser build, and a memory record
+    of another runtime bundle all passed."""
+
+    def lint(self, page=None):
+        case = OneCampaign()
+        case.setUp()
+        if page is not None:
+            case.page = page
+        return case
+
+    def test_a_plain_limits_item_fails(self):
+        case = self.lint()
+        page = case.page.replace('<h2 id="limits">', '<h2 id="limits">', 1)
+        i = page.index('<h2 id="limits">')
+        j = page.index("</ul>", i)
+        case.page = page[:j] + "<li>More samples are needed.</li>" + page[j:]
+        with self.assertRaises(AssertionError):
+            case.test_limits_hold_only_what_measurement_cannot_remove()
+
+    def _with_identity(self, edit):
+        from unittest import mock
+        real = record_identity
+
+        def patched(name):
+            kind, identity = real(name)
+            return kind, edit(name, kind, identity)
+        return mock.patch(f"{__name__}.record_identity", patched)
+
+    def test_a_record_without_its_browser_build_fails(self):
+        def edit(name, kind, identity):
+            if kind == "serial":
+                identity = dict(identity, browser_version=None)
+            return identity
+        with self._with_identity(edit), self.assertRaises(AssertionError):
+            self.lint().test_the_cited_records_share_one_commit_boot_and_build()
+
+    def test_a_memory_record_of_another_runtime_bundle_fails(self):
+        def edit(name, kind, identity):
+            if kind == "extra" and name.endswith("-m4"):
+                identity = [dict(row, runtime_bundle_sha256="0" * 64) for row in identity]
+            return identity
+        with self._with_identity(edit), self.assertRaises(AssertionError):
+            self.lint().test_the_cited_records_share_one_commit_boot_and_build()
 
 
 if __name__ == "__main__":

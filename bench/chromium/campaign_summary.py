@@ -72,6 +72,7 @@ import ctypes
 import fcntl
 import gzip
 import hashlib
+import zlib
 import ipaddress
 import json
 import math
@@ -1196,7 +1197,7 @@ def read_external_log(run_dir, name, want, sources):
     if encoding == "gzip":
         try:
             data = gzip.decompress(data)
-        except (OSError, EOFError) as error:
+        except (OSError, EOFError, zlib.error) as error:
             raise RunError(f"{run_dir}: NOT VERIFIED: {where} is not gzip data: {error}")
     elif encoding is not None:
         raise RunError(f"{run_dir}: NOT VERIFIED: {where} has unknown encoding {encoding!r}")

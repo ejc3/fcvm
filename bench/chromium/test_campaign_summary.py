@@ -3103,6 +3103,31 @@ class ReplayLogsKeptInTheRecordsRepository(unittest.TestCase):
             rc, text = self._summarize(out, [run_dir], records=records)
             self.assertEqual(rc, 0, text)
 
+    def test_a_corrupt_gzip_body_is_refused(self):
+        """RED BEFORE THE FIX: a gzip header over bad DEFLATE data raised
+        zlib.error out of the index instead of the NOT VERIFIED refusal."""
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "reqbench-20261022-corpus-x")
+            write_run(run_dir)
+            records, _commit = self._move_out(d, run_dir, encoding="gzip")
+            path = os.path.join(records, "bench", "chromium", "results",
+                                os.path.basename(run_dir), "corpus-access.log.gz")
+            data = bytearray(open(path, "rb").read())
+            data[12:20] = b"\xff" * 8  # inside the DEFLATE stream, after the header
+            open(path, "wb").write(bytes(data))
+            git = ["git", "-C", records, "-c", "user.name=t", "-c", "user.email=t@example.com"]
+            subprocess.run(git + ["commit", "-q", "-am", "corrupt"], check=True)
+            commit = subprocess.run(git + ["rev-parse", "HEAD"], check=True,
+                                    capture_output=True, text=True).stdout.strip()
+            pointer_path = os.path.join(run_dir, campaign_summary.EXTERNAL_LOGS)
+            pointer = json.load(open(pointer_path))
+            pointer["files"]["corpus-access.log"]["commit"] = commit
+            json.dump(pointer, open(pointer_path, "w"))
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir], records=records)
+            self.assertNotEqual(rc, 0, text)
+            self.assertIn("NOT VERIFIED", text)
+
     def test_an_unknown_log_encoding_is_refused(self):
         with tempfile.TemporaryDirectory() as d:
             run_dir = os.path.join(d, "reqbench-20261022-corpus-x")

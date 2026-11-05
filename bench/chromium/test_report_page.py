@@ -373,6 +373,11 @@ class ReportContent(unittest.TestCase):
             if "corpus" in text:
                 for attempts, b in bounds.items():
                     self.assertIn(next(iter(b)), text, f"a corpus zero-failure count without its interval for {attempts}: {text[:160]!r}")
+                    # The first interval after a count is that count's own.
+                    after = re.search(rf"\b{attempts} attempts.*?\b0 to (\d+(?:\.\d+)?%)", text)
+                    self.assertIsNotNone(after, f"no interval follows {attempts} attempts: {text[:200]!r}")
+                    self.assertEqual(after.group(1), next(iter(b)),
+                                     f"{attempts} attempts carry another count's interval: {text[:200]!r}")
                 counts = re.findall(r"\b0 (?:of|failures in|in) (?:the [\w-]+ arm[\u2019']s )?(\d[\d,]*)", text)
                 self.assertEqual(set(counts), set(bounds), f"attempt counts {counts} in: {text[:160]!r}")
         self.assertGreaterEqual(checked, 1, "no zero-failure count was checked; the sample-gate bullet states one")
@@ -411,13 +416,31 @@ class ReportContent(unittest.TestCase):
             builds.add((firecracker["branch"], firecracker["commit"], firecracker["sha256"]))
         self.assertEqual(len(builds), 1, f"the cited runs used {len(builds)} Firecracker builds")
         branch, commit, sha = builds.pop()
-        self.assertIn(branch, fc)
+        # The branch as a whole name: a longer branch that contains it is another branch.
+        self.assertRegex(plain(fc), rf"(?<![\w./-]){re.escape(branch)}(?![\w./-])")
         self.assertIn(commit[:8], fc)
         self.assertIn(sha[:12], fc)
         rest = self.page.replace(fc, "")
         self.assertNotIn(branch, rest, "the Firecracker branch is named outside Firecracker build")
         self.assertEqual(re.findall(r"github\.com/ejc3/firecracker/tree/([^\"'#?]+)", rest), [],
                          "a Firecracker branch link outside Firecracker build")
+
+    def test_swapped_intervals_and_a_longer_branch_fail(self):
+        """RED BEFORE THE FIX (review of 04915961..f55f229d): swapping the
+        230 and 430 attempts' intervals, or naming the Firecracker branch
+        with a suffix, passed."""
+        page = self.page
+        try:
+            self.page = page.replace("0 to 1.59%", "0 to X%").replace("0 to 0.85%", "0 to 1.59%").replace("0 to X%", "0 to 0.85%")
+            with self.assertRaises(AssertionError):
+                self.test_the_zero_failure_count_carries_its_interval()
+            with open(os.path.join(HERE, "results", self.campaign_runs(self.campaign_id())[0], "reqbench.jsonl")) as f:
+                branch = json.loads(f.readline())["firecracker"]["branch"]
+            self.page = page.replace(branch, branch + "-old")
+            with self.assertRaises(AssertionError):
+                self.test_each_cited_run_is_attributed_to_the_firecracker_it_ran()
+        finally:
+            self.page = page
 
     def figure(self, label):
         """The HTML of the <figure> whose caption has id=label."""
