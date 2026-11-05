@@ -323,6 +323,7 @@ class Ecs:
             "address_ms": (t_ip - t0) / 1e6,
             "attempts": attempts,
             "aws_stamps_unix_ms": stamps,
+            "platform_version": t.get("platformVersion"),
             "answer": doc,
         }
 
