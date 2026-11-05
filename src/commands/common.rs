@@ -5484,6 +5484,30 @@ impl PublishedMemoryFile {
 /// back its locks, and Err on failure. A normal source is resumed regardless of
 /// success/failure after a successful pause. A disposable source remains paused on every
 /// post-pause return so it cannot mutate after its prepared startup point.
+/// How long each step of a Firecracker snapshot's boundary took, in ms: closing the guest's
+/// network gate, the pause, the memory save, the disk reflink and the resume (the
+/// hypervisor's and the guest gate's). Logged once per snapshot ("snapshot boundary
+/// timings") so a caller can tell which step a slow snapshot spent its time in.
+#[derive(Debug, Default)]
+struct SnapshotBoundaryTimes {
+    elapsed: f64,
+    prepare_ms: f64,
+    pause_ms: f64,
+    save_ms: f64,
+    disk_ms: f64,
+    resume_ms: f64,
+}
+
+impl SnapshotBoundaryTimes {
+    /// The time since the previous lap, in ms, rounded to 0.1 ms.
+    fn lap(&mut self, started: std::time::Instant) -> f64 {
+        let now = started.elapsed().as_secs_f64() * 1000.0;
+        let step = now - self.elapsed;
+        self.elapsed = now;
+        (step * 10.0).round() / 10.0
+    }
+}
+
 pub async fn create_snapshot_core(
     client: &crate::firecracker::FirecrackerClient,
     mut snapshot_config: crate::storage::snapshot::SnapshotConfig,
@@ -5681,6 +5705,8 @@ pub async fn create_snapshot_core(
     // gate closes and before the pause.
     failpoint::hit_async("snapshot.pre_pause").await;
     info!(snapshot = %snapshot_config.name, "preparing guest network and pausing VM for snapshot");
+    let boundary_started = std::time::Instant::now();
+    let mut boundary = SnapshotBoundaryTimes::default();
     if let Err(error) = run_snapshot_network_command(
         vsock_socket_path,
         &snapshot_config.vm_id,
@@ -5710,12 +5736,14 @@ pub async fn create_snapshot_core(
             guest_network_resume_result,
         );
     }
+    boundary.prepare_ms = boundary.lap(boundary_started);
     let pause_result = pause_client
         .patch_vm_state(ApiVmState {
             state: "Paused".to_string(),
         })
         .await
         .context("pausing VM for snapshot");
+    boundary.pause_ms = boundary.lap(boundary_started);
 
     // A pause API error is ambiguous: the VMM may have paused before its reply
     // failed. Attempt a hypervisor resume even on error, then reopen the guest
@@ -5863,6 +5891,7 @@ pub async fn create_snapshot_core(
     // after resume, the disk may have post-resume writes that don't match the snapshot's
     // memory state, corrupting the filesystem on restore. Reflink is O(1), so pause time is
     // unaffected.
+    boundary.save_ms = boundary.lap(boundary_started);
     let disk_copy_result = if snapshot_result.is_ok() {
         info!(snapshot = %snapshot_config.name, "copying disk (VM paused)");
         reflink_disks_to_snapshot(disk_path, &snapshot_config, &temp_snapshot_dir)
@@ -5877,6 +5906,7 @@ pub async fn create_snapshot_core(
     // bumping the persisted vsock epoch BEFORE resuming — see
     // StateManager::bump_vsock_epoch for why this ordering makes the exec-side
     // orphan detection race-free.
+    boundary.disk_ms = boundary.lap(boundary_started);
     record_vsock_reset_for_snapshot(&snapshot_config.vm_id, &snapshot_config.name).await;
 
     // Resume a normal source regardless of snapshot/disk copy result. A prepare source is
@@ -5931,6 +5961,16 @@ pub async fn create_snapshot_core(
         return Err(error);
     }
 
+    boundary.resume_ms = boundary.lap(boundary_started);
+    info!(
+        snapshot = %snapshot_config.name,
+        prepare_ms = boundary.prepare_ms,
+        pause_ms = boundary.pause_ms,
+        save_ms = boundary.save_ms,
+        disk_ms = boundary.disk_ms,
+        resume_ms = boundary.resume_ms,
+        "snapshot boundary timings"
+    );
     match source_disposition {
         SnapshotSourceDisposition::Resume => {
             info!(snapshot = %snapshot_config.name, "VM and guest network resumed, processing snapshot");

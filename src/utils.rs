@@ -222,6 +222,28 @@ impl ProcessWatch {
         self.pid
     }
 
+    /// Send `signal` to the watched process through its pidfd, so a PID reused since the
+    /// watch was opened can never receive it.
+    pub fn signal(&self, signal: libc::c_int) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: pidfd_send_signal(2) on a pidfd this watch owns, with no siginfo and no
+        // flags.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.async_fd.get_ref().as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if rc < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     /// Resolves when the watched process exits. A pidfd becomes readable on exit, so this
     /// is a real edge, not a poll.
     pub async fn exited(&mut self) {
