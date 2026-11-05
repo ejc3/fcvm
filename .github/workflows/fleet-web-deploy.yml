@@ -55,10 +55,31 @@ jobs:
       # every request answers the unauthenticated request with the same 302.
       - name: Serve the built Worker before shipping it
         run: scripts/worker-smoke.sh 24110
+      # FLEET_ACCESS_CLIENT_ID/SECRET are the Access service token the coordinator's staging
+      # application admits for this Worker (ejc3/aws fcvm-dev.tf), uploaded with the version as
+      # Worker secrets: with them the Worker forwards /live and /poster.jpg and the page needs
+      # one Access session (core/live-proxy.ts). Without them nothing is uploaded, the secrets
+      # of an earlier deploy stay, and a Worker that never had them connects the page to
+      # FLEET_COORD_URL directly.
       - name: Deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: pnpm exec wrangler deploy
+          FLEET_ACCESS_CLIENT_ID: ${{ secrets.FLEET_ACCESS_CLIENT_ID }}
+          FLEET_ACCESS_CLIENT_SECRET: ${{ secrets.FLEET_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -n "$FLEET_ACCESS_CLIENT_ID" ] && [ -n "$FLEET_ACCESS_CLIENT_SECRET" ]; then
+            secrets="$RUNNER_TEMP/fleet-worker-secrets.json"
+            trap 'rm -f "$secrets"' EXIT
+            (umask 077; jq -n '{FLEET_ACCESS_CLIENT_ID: env.FLEET_ACCESS_CLIENT_ID, FLEET_ACCESS_CLIENT_SECRET: env.FLEET_ACCESS_CLIENT_SECRET}' > "$secrets")
+            pnpm exec wrangler deploy --secrets-file "$secrets"
+          elif [ -n "$FLEET_ACCESS_CLIENT_ID$FLEET_ACCESS_CLIENT_SECRET" ]; then
+            echo "::error::only one of FLEET_ACCESS_CLIENT_ID and FLEET_ACCESS_CLIENT_SECRET is set"
+            exit 1
+          else
+            echo "no coordinator service token in this environment: deploying without one"
+            pnpm exec wrangler deploy
+          fi
       # Staging must answer an unauthenticated request with Access's login redirect. Before
       # the custom domain exists the host does not resolve, which is also closed.
       - name: Staging stays behind Access

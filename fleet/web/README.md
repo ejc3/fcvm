@@ -90,6 +90,14 @@ spot capacity. fcvm restarts take 2.6 to 3.4 s (teardown, a restore holding a 0.
 reset, renderer start, first frame) and EC2 35 to 70 s (launch, then boot to first
 frame), shaped like the measured ones.
 In production the page reads the coordinator's URL from `FLEET_COORD_URL` per request.
+On staging, Cloudflare Access gates the page host and the coordinator host as separate
+applications, and an Access session cookie belongs to one host, so a browser that has signed in
+to the page only gets Access's login redirect on its `/live` upgrade to the coordinator host.
+With the Worker secrets `FLEET_ACCESS_CLIENT_ID` and `FLEET_ACCESS_CLIENT_SECRET` (a service
+token the coordinator's application admits; the deploy uploads them from its environment) the
+Worker (`worker.ts`) forwards `/live` and `/poster.jpg`, and nothing else, to
+`FLEET_COORD_URL`'s host, and the page connects to its own origin (`core/live-proxy.ts`).
+`scripts/worker-smoke.sh` checks the forwarding against a stand-in coordinator.
 
 `/?mode=phones` shows the phones instead of the wall (PROTOCOL.md, "Phones mode"). The mock has
 none unless `FLEET_MOCK_PHONES=<n>` is set (`pnpm dev:mock` with it, or the phones suite's
