@@ -388,6 +388,109 @@ export interface Phones {
   tiles: PhoneTile[];
 }
 
+/**
+ * Potato mode (PROTOCOL.md, "Potato mode"; fleet/core/src/potato.rs, `PotatoView`): a ladder of
+ * rings of CPU-only player VMs passing a ball. Absent until a host has run players.
+ */
+export interface PotatoFlight {
+  from: number;
+  to: number;
+  /** When `from` threw (the host's Unix ms). */
+  at: number;
+}
+
+export interface PotatoRound {
+  id: number;
+  size: number;
+  /** The players, in the order the ball goes round. */
+  ring: number[];
+  started_at: number;
+  /** The latest catch, or null before the first. */
+  seq: number | null;
+  lap: number;
+  /** The hold the ball carries now, and the hold the round started at. */
+  hold_ms: number;
+  start_hold_ms: number;
+  min_hold_ms: number;
+  /** How long a thrower keeps trying a catcher that does not accept. */
+  flight_ms: number;
+  /** A viewers' cap on the hold (`potato_faster`), or null. */
+  pace_ms: number | null;
+  /** (size - 1) holds: the time a player has between its throw and its next catch. */
+  turnaround_ms: number;
+  holder: number | null;
+  last_catch_at: number | null;
+  /** The ball in the air, or null once caught. */
+  flight: PotatoFlight | null;
+  /** The shortest hold of a lap this round completed. */
+  best_lap_hold_ms: number | null;
+}
+
+export interface PotatoPlayer {
+  player: number;
+  /** An index into `colours` hues. */
+  colour: number;
+  counter: number;
+  /** `awake`, `asleep`, `waking` or `failed`. */
+  phase: string;
+  since: number;
+  last_sleep_ms: number | null;
+  last_wake_ms: number | null;
+}
+
+export interface PotatoDrop {
+  at: number;
+  round: number;
+  size: number;
+  /** `not_listening`, `proof`, `wake_failed`, `sleep_failed`, `boot_failed`, `kickoff_failed`, `deadline` or `host_gone`. */
+  reason: string;
+  player: number | null;
+  thrower: number | null;
+  seq: number;
+  lap: number;
+  hold_ms: number;
+  /** The late stage and how long the player had been in it when the ball dropped. */
+  stage: string;
+  stage_ms: number;
+  /** When the catcher did start accepting, ms after the drop. */
+  listening_after_ms: number | null;
+  sleep_stages: Record<string, number>;
+  wake_stages: Record<string, number>;
+  detail: string;
+}
+
+export interface PotatoRung {
+  size: number;
+  /** The shortest hold of a lap a round of this size completed, ever. */
+  record_hold_ms: number | null;
+  record_at: number | null;
+  /** What ended its latest round. */
+  broke: PotatoDrop | null;
+  rounds: number;
+}
+
+export interface PotatoRecord {
+  value: number;
+  size: number;
+  player: number | null;
+  at: number;
+}
+
+export interface Potato {
+  ladder: PotatoRung[];
+  /** The size being played, or the next one. */
+  size: number | null;
+  round: PotatoRound | null;
+  players: PotatoPlayer[];
+  records: { fastest_cycle_ms: PotatoRecord | null; longest_round: PotatoRecord | null };
+  last_drop: PotatoDrop | null;
+  /** When the next round starts, while none is being played. */
+  next_round_at: number | null;
+  colours: number;
+  /** The players the potato host runs; 0 while none is connected. */
+  capacity: number;
+}
+
 export interface FleetState {
   layout: Layout;
   tiles: Tile[];
@@ -413,6 +516,8 @@ export interface FleetState {
   aggregates: Aggregate[];
   /** Null when the fleet runs no phones. */
   phones: Phones | null;
+  /** Null until a host has run potato players. */
+  potato: Potato | null;
 }
 
 export interface SnapshotMsg {
@@ -518,7 +623,7 @@ export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg | HelloMs
 export const DEFAULT_IMAGE_ASPECT = 16 / 9;
 
 /** The intents the page sends, by the coordinator's names (PROTOCOL.md, "Intents"). */
-export const INTENT_NAMES = ["relaunch", "restart_now", "nudge", "word", "light", "claim_gpu", "claim_camera", "claim_autopilot", "release_gpu", "claim_phone", "release_phone", "phone_action", "phones_zoom", "wake"] as const;
+export const INTENT_NAMES = ["relaunch", "restart_now", "nudge", "word", "light", "claim_gpu", "claim_camera", "claim_autopilot", "release_gpu", "claim_phone", "release_phone", "phone_action", "phones_zoom", "wake", "potato_faster", "potato_restart"] as const;
 export type IntentName = (typeof INTENT_NAMES)[number];
 
 export interface IntentMsg {
@@ -728,6 +833,128 @@ function parsePhones(v: unknown): Phones | null {
   };
 }
 
+function msMap(v: unknown, where: string): Record<string, number> {
+  if (v === null || v === undefined) return {};
+  if (!isObj(v)) throw new ProtocolError(`${where} is not an object`);
+  const out: Record<string, number> = {};
+  for (const [k, ms] of Object.entries(v)) if (typeof ms === "number" && Number.isFinite(ms)) out[k] = ms;
+  return out;
+}
+
+function parsePotatoDrop(v: unknown, where: string): PotatoDrop | null {
+  if (v === null || v === undefined) return null;
+  if (!isObj(v)) throw new ProtocolError(`${where} is not an object`);
+  return {
+    at: num(v, "at", where),
+    round: num(v, "round", where),
+    size: num(v, "size", where),
+    reason: str(v, "reason", where),
+    player: numOrNull(v, "player", where),
+    thrower: numOrNull(v, "thrower", where),
+    seq: num(v, "seq", where),
+    lap: num(v, "lap", where),
+    hold_ms: num(v, "hold_ms", where),
+    stage: str(v, "stage", where),
+    stage_ms: num(v, "stage_ms", where),
+    listening_after_ms: numOrNull(v, "listening_after_ms", where),
+    sleep_stages: msMap(v["sleep_stages"], `${where}.sleep_stages`),
+    wake_stages: msMap(v["wake_stages"], `${where}.wake_stages`),
+    detail: strOrNull(v, "detail", where) ?? "",
+  };
+}
+
+function parsePotatoRecord(v: unknown, where: string): PotatoRecord | null {
+  if (v === null || v === undefined) return null;
+  if (!isObj(v)) throw new ProtocolError(`${where} is not an object`);
+  return { value: num(v, "value", where), size: num(v, "size", where), player: numOrNull(v, "player", where), at: num(v, "at", where) };
+}
+
+function players(o: Obj, k: string, where: string): number[] {
+  return arr(o, k, where).map((x, i) => {
+    if (typeof x !== "number" || !Number.isInteger(x) || x < 0) throw new ProtocolError(`${where}.${k}[${i}] is not a player number`);
+    return x;
+  });
+}
+
+function parsePotatoRound(v: unknown): PotatoRound | null {
+  if (v === null || v === undefined) return null;
+  const w = "potato.round";
+  if (!isObj(v)) throw new ProtocolError(`${w} is not an object`);
+  const ring = players(v, "ring", w);
+  if (new Set(ring).size !== ring.length) throw new ProtocolError(`${w}.ring names a player twice`);
+  const f = v["flight"];
+  let flight: PotatoFlight | null = null;
+  if (f !== null && f !== undefined) {
+    if (!isObj(f)) throw new ProtocolError(`${w}.flight is not an object`);
+    flight = { from: num(f, "from", `${w}.flight`), to: num(f, "to", `${w}.flight`), at: num(f, "at", `${w}.flight`) };
+  }
+  return {
+    id: num(v, "id", w),
+    size: num(v, "size", w),
+    ring,
+    started_at: num(v, "started_at", w),
+    seq: numOrNull(v, "seq", w),
+    lap: num(v, "lap", w),
+    hold_ms: num(v, "hold_ms", w),
+    start_hold_ms: num(v, "start_hold_ms", w),
+    min_hold_ms: num(v, "min_hold_ms", w),
+    flight_ms: num(v, "flight_ms", w),
+    pace_ms: numOrNull(v, "pace_ms", w),
+    turnaround_ms: num(v, "turnaround_ms", w),
+    holder: numOrNull(v, "holder", w),
+    last_catch_at: numOrNull(v, "last_catch_at", w),
+    flight,
+    best_lap_hold_ms: numOrNull(v, "best_lap_hold_ms", w),
+  };
+}
+
+function parsePotato(v: unknown): Potato | null {
+  if (v === null || v === undefined) return null;
+  const w = "potato";
+  if (!isObj(v)) throw new ProtocolError(`${w} is not an object`);
+  const colours = num(v, "colours", w);
+  if (!Number.isInteger(colours) || colours <= 0) throw new ProtocolError(`${w}.colours is not a positive whole number`);
+  const ladder: PotatoRung[] = arr(v, "ladder", w).map((r, i) => {
+    const at = `${w}.ladder[${i}]`;
+    if (!isObj(r)) throw new ProtocolError(`${at} is not an object`);
+    return {
+      size: num(r, "size", at),
+      record_hold_ms: numOrNull(r, "record_hold_ms", at),
+      record_at: numOrNull(r, "record_at", at),
+      broke: parsePotatoDrop(r["broke"], `${at}.broke`),
+      rounds: numOrNull(r, "rounds", at) ?? 0,
+    };
+  });
+  const list: PotatoPlayer[] = arr(v, "players", w).map((p, i) => {
+    const at = `${w}.players[${i}]`;
+    if (!isObj(p)) throw new ProtocolError(`${at} is not an object`);
+    return {
+      player: num(p, "player", at),
+      colour: num(p, "colour", at),
+      counter: num(p, "counter", at),
+      phase: str(p, "phase", at),
+      since: num(p, "since", at),
+      last_sleep_ms: numOrNull(p, "last_sleep_ms", at),
+      last_wake_ms: numOrNull(p, "last_wake_ms", at),
+    };
+  });
+  const rec = isObj(v["records"]) ? v["records"] : {};
+  return {
+    ladder,
+    size: numOrNull(v, "size", w),
+    round: parsePotatoRound(v["round"]),
+    players: list,
+    records: {
+      fastest_cycle_ms: parsePotatoRecord(rec["fastest_cycle_ms"], `${w}.records.fastest_cycle_ms`),
+      longest_round: parsePotatoRecord(rec["longest_round"], `${w}.records.longest_round`),
+    },
+    last_drop: parsePotatoDrop(v["last_drop"], `${w}.last_drop`),
+    next_round_at: numOrNull(v, "next_round_at", w),
+    colours,
+    capacity: numOrNull(v, "capacity", w) ?? 0,
+  };
+}
+
 /** A colour as CSS: a string as given, linear RGB 0..1 converted to sRGB hex. */
 export function cssColor(v: unknown): string {
   if (typeof v === "string") return v;
@@ -929,6 +1156,7 @@ function parseState(o: Obj): FleetState {
       };
     }),
     phones: parsePhones(o["phones"]),
+    potato: parsePotato(o["potato"]),
   };
 }
 

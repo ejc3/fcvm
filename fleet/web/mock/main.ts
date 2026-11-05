@@ -27,6 +27,14 @@
 //   FLEET_MOCK_PHONE_COOLDOWN_S  after a phone comes back, its viewer waits this long to borrow again (60)
 //   FLEET_MOCK_PHONE_RESTORE_MS  a phone's restore after a reboot or a return (2000)
 //   FLEET_MOCK_PHONE_ZOOM_GAP_MS a viewer's zoom is refused sooner than this after its last (2000)
+//   FLEET_MOCK_POTATO_PLAYERS    potato players one host runs (0: none, and no `potato` in the snapshot)
+//   FLEET_MOCK_POTATO_BUDGET_MS  a ring of n starts at this / (n - 1) ms of hold (2000)
+//   FLEET_MOCK_POTATO_FLOOR_MS   and never below this (400)
+//   FLEET_MOCK_POTATO_RESTART_MS after a drop, the next round starts this long after (5000)
+//   FLEET_MOCK_POTATO_SLEEP_MS   a player's typical sleep (350; each takes 0.88 to 1.12 of it)
+//   FLEET_MOCK_POTATO_WAKE_MS    a player's typical wake (350)
+//   FLEET_MOCK_POTATO_SLOW_WAKE_MS       the occasional slow wake (1500)
+//   FLEET_MOCK_POTATO_SLOW_WAKE_PERCENT  how often a wake is slow, in percent (5)
 //   FLEET_MOCK_FPS           frames per second, a divisor of 30 (30): frames land on t = k/30 as the renderer's do
 //   FLEET_MOCK_THREADS       render threads (12)
 //   FLEET_MOCK_MAX_HEIGHT    tallest stream it will encode (1080)
@@ -113,6 +121,20 @@ export async function startMock() {
             cooldownSecs: int("FLEET_MOCK_PHONE_COOLDOWN_S", 60),
             restoreMs: int("FLEET_MOCK_PHONE_RESTORE_MS", 2000),
             zoomGapMs: int("FLEET_MOCK_PHONE_ZOOM_GAP_MS", 2000),
+          },
+        }
+      : {}),
+    ...(int("FLEET_MOCK_POTATO_PLAYERS", 0) > 0
+      ? {
+          potato: {
+            players: int("FLEET_MOCK_POTATO_PLAYERS", 0),
+            budgetMs: int("FLEET_MOCK_POTATO_BUDGET_MS", 2000),
+            startFloorMs: int("FLEET_MOCK_POTATO_FLOOR_MS", 400),
+            restartAfterMs: int("FLEET_MOCK_POTATO_RESTART_MS", 5000),
+            sleepMs: int("FLEET_MOCK_POTATO_SLEEP_MS", 350),
+            wakeMs: int("FLEET_MOCK_POTATO_WAKE_MS", 350),
+            slowWakeMs: int("FLEET_MOCK_POTATO_SLOW_WAKE_MS", 1500),
+            slowWakeChance: int("FLEET_MOCK_POTATO_SLOW_WAKE_PERCENT", 5) / 100,
           },
         }
       : {}),

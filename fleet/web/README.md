@@ -44,6 +44,7 @@ app/       Next.js (App Router). Draws view models and sends actions:
            _wall/FocusPanel.tsx     one VM opened
            _wall/Turnstile.tsx      the check before a viewer's first action
            _wall/Phones.tsx         phones mode (?mode=phones): the phones' own image, bezels, an opened phone
+           _wall/Potato.tsx         potato mode (?mode=potato): the ring of player VMs, the ladder, drops
            _wall/frames.worker.ts   frame sockets, WebCodecs decoders, one OffscreenCanvas
            _wall/wall-client.ts     the coordinator socket and the store
            wall.css                 the surface's own stylesheet (no component library)
@@ -73,8 +74,9 @@ pnpm install
 pnpm dev:mock         # the page on the mock fleet, next dev
 pnpm build && pnpm start:mock    # the same with a production build
 pnpm lint && pnpm typecheck && pnpm test     # 141 unit tests (vitest)
-pnpm build && pnpm test:e2e                  # the wall's browser tests, then phones mode's (Playwright)
+pnpm build && pnpm test:e2e                  # the wall's browser tests, then phones mode's and potato mode's (Playwright)
 pnpm build && pnpm exec playwright test -c playwright.phones.config.ts   # phones mode only, against a mock with four phones
+pnpm build && pnpm exec playwright test -c playwright.potato.config.ts   # potato mode only, against a mock host with eight players
 FLEET_SCREENSHOT_DIR=$PWD/docs/screenshots pnpm test:e2e   # also rewrites the pictures
 pnpm build && pnpm measure [16 50 100]       # decode and draw cost
 ```
@@ -94,6 +96,14 @@ none unless `FLEET_MOCK_PHONES=<n>` is set (`pnpm dev:mock` with it, or the phon
 config); the other `FLEET_MOCK_PHONE_*` knobs are listed at the top of `mock/main.ts`. The zoom
 between the seamless picture and the phones apart in bezels is the fleet's (`phones_zoom`), so
 every viewer sees it move; the phone a viewer has opened is that viewer's own.
+
+`/?mode=potato` shows the hot potato game (PROTOCOL.md, "Potato mode"): a ring of CPU-only
+player VMs, each drawn in its colour, bright while awake, dim while asleep and with a bar while it
+wakes; the ball arcing from thrower to catcher; the hold against the time it leaves a player to
+sleep and wake; the ladder of ring sizes with each size's record and what broke it; the last drop;
+and the Faster and Restart buttons. The mock runs no game unless `FLEET_MOCK_POTATO_PLAYERS=<n>`
+is set; its sleep and wake times and starting pace are the other `FLEET_MOCK_POTATO_*` knobs at
+the top of `mock/main.ts`, and `POST /mock/potato {"size": n}` starts it over at a size.
 
 ## How the page works
 
