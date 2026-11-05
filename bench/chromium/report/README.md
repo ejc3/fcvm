@@ -69,7 +69,8 @@ One campaign of `make bench-chromium-corpus`, `make bench-chromium-corpus-extra`
 c8g.metal-48xl hosts, on-demand, 2026-11-04 to 2026-11-05, about 8 hours of runs. fcvm,
 fc-agent, the Firecracker build, the guest kernel, rootfs and initrd and both container
 images were built once on one host and copied to the other two, with matching sha256 checked
-before the first run. Each host ran on one boot. The serial runs went in three rounds, one per
+before the first run (`results/campaign-40657613-artifacts.txt`, the same list on the three
+hosts). Each host ran on one boot. The serial runs went in three rounds, one per
 host, each running every configuration once in a seeded order; each A/B/A sequence ran on one
 host and one golden; `results/campaign-40657613-plan.tsv` lists every step with its host.
 Every serial run is DNS-verified clean, with 0 failures in 230 attempts per arm (430 in bridged
