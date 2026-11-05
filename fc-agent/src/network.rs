@@ -1417,7 +1417,10 @@ fn append_ifaddr(bytes: &mut Vec<u8>, message: IfAddrMessage) {
 /// (loopback source going through an external TAP device). Instead, we spawn
 /// a TCP proxy for each port: listen on 127.0.0.1:port and [::1]:port inside
 /// the VM and forward connections to 10.0.2.2:port (the gateway). Pasta's
-/// default --map-host-loopback maps gateway traffic to the host's 127.0.0.1.
+/// default --map-host-loopback maps gateway traffic to the host's 127.0.0.1,
+/// and traffic to the IPv6 gateway (fd00::2) to the host's ::1; a connection
+/// 10.0.2.2 refuses is retried there, for a host service on ::1 alone. In
+/// routed mode fcvm's relay on 10.0.2.2 makes the same fallback itself.
 pub fn setup_localhost_forwarding(ports: &[String]) {
     for port_str in ports {
         let port: u16 = match port_str.parse() {
@@ -1490,17 +1493,31 @@ fn bind_loopback_listeners(port: u16) -> Vec<std::net::TcpListener> {
     listeners
 }
 
-/// Proxy a single TCP connection from localhost to the gateway (10.0.2.2).
+/// The gateway addresses a localhost relay dials, in order: the host's 127.0.0.1, then,
+/// when that refuses, the host's ::1 (pasta's mapping of its IPv6 gateway).
+const LOCALHOST_RELAY_TARGETS: [&str; 2] = ["10.0.2.2", "[fd00::2]"];
+
+/// Proxy a single TCP connection from localhost to the gateway.
 async fn proxy_connection(mut client: tokio::net::TcpStream, port: u16) {
-    let mut upstream = match tokio::net::TcpStream::connect(format!("10.0.2.2:{}", port)).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!(
-                "[fc-agent] WARNING: failed to connect to gateway 10.0.2.2:{}: {}",
-                port, e
-            );
-            return;
+    let mut upstream = None;
+    for target in LOCALHOST_RELAY_TARGETS {
+        match tokio::net::TcpStream::connect(format!("{target}:{port}")).await {
+            Ok(s) => {
+                upstream = Some(s);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => continue,
+            Err(e) => {
+                eprintln!("[fc-agent] WARNING: failed to connect to gateway {target}:{port}: {e}");
+                return;
+            }
         }
+    }
+    let Some(mut upstream) = upstream else {
+        eprintln!(
+            "[fc-agent] WARNING: the host refused localhost port {port} on 127.0.0.1 and ::1"
+        );
+        return;
     };
     if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
         if e.kind() != std::io::ErrorKind::ConnectionReset
