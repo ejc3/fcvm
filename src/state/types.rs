@@ -167,6 +167,10 @@ pub struct VmConfig {
     /// VM's snapshot, before the clone is published; see `--on-restore`.
     #[serde(default)]
     pub restore_hook: Option<String>,
+    /// The `--dns` this VM's guest was booted with, recorded in its snapshots so a
+    /// restore keeps it rather than giving the guest the restoring host's resolvers.
+    #[serde(default)]
+    pub dns_override: Option<String>,
     /// Which snapshot this process is serving or was cloned from
     pub snapshot_name: Option<String>,
     /// Process type: vm (podman run), serve (snapshot serve), clone (snapshot run)
@@ -346,6 +350,7 @@ impl VmState {
                 health_check_url: None,
                 health_check_timeout: 5,
                 restore_hook: None,
+                dns_override: None,
                 snapshot_name: None,
                 process_type: Some(ProcessType::Vm),
                 serve_pid: None,
