@@ -3522,6 +3522,10 @@ class ZeroBasis(unittest.TestCase):
             "clone_procs": 2,
             "clone_cgroup_kb": 1024,
             "clone_pss_kb": 512,
+            "clone_file_kb": 900,
+            "clone_shmem_kb": 880,
+            "clone_private_kb": 16,
+            "clone_shared_kb": 500,
         }
         calls = []
 

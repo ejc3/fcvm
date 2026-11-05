@@ -172,8 +172,16 @@ def process_state(pid):
         return None
 
 
-def pss_kb_of_pid(pid):
-    """PSS of one process, from its smaps_rollup.
+# The smaps_rollup fields every process read records, in kB. PSS is the
+# published basis; the private/shared split says how much of it a second
+# instance would share. A clone's firecracker maps guest memory from the
+# serve's memfd, so its untouched guest pages are shared and its written
+# ones are private.
+ROLLUP_FIELDS = ("Pss", "Private_Clean", "Private_Dirty", "Shared_Clean", "Shared_Dirty")
+
+
+def smaps_rollup_kb(pid):
+    """ROLLUP_FIELDS of one process, in kB, from its smaps_rollup.
 
     pasta makes itself non-dumpable, so its /proc files belong to root and
     the invoking user is refused even though it owns the process: the memory
@@ -204,17 +212,34 @@ def pss_kb_of_pid(pid):
         # a clone's cgroup failed 20 reads over a second). Any other exit
         # means the set is changing, and the caller reads the cgroup again.
         if process_state(pid) in ("Z", "X"):
-            return 0
+            return dict.fromkeys(ROLLUP_FIELDS, 0)
         raise ProcessGone(f"cannot read {path}: {exc}") from exc
     except OSError as exc:
         raise CgroupReadError(f"cannot read {path}: {exc}") from exc
+    out = {}
     for line in text.splitlines():
-        if line.startswith("Pss:"):
+        key, sep, value = line.partition(":")
+        if sep and key in ROLLUP_FIELDS:
             try:
-                return int(line.split()[1])
+                out[key] = int(value.split()[0])
             except (IndexError, ValueError) as exc:
                 raise CgroupReadError(f"cannot read {path}: {exc}") from exc
-    raise CgroupReadError(f"cannot read {path}: no Pss field")
+    missing = [key for key in ROLLUP_FIELDS if key not in out]
+    if missing:
+        raise CgroupReadError(f"cannot read {path}: no {', '.join(missing)} field(s)")
+    return out
+
+
+def process_comm(pid):
+    """The process name a rollup is grouped under; a gone process moves the set."""
+    path = f"/proc/{pid}/comm"
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except (ProcessLookupError, FileNotFoundError) as exc:
+        raise ProcessGone(f"cannot read {path}: {exc}") from exc
+    except OSError as exc:
+        raise CgroupReadError(f"cannot read {path}: {exc}") from exc
 
 
 # --- matched-basis memory accounting -------------------------------------
@@ -289,6 +314,16 @@ def cgroup_procs(cg_path):
     return pids
 
 
+# memory.stat fields every cgroup read records. `file` includes `shmem`, and
+# file pages charged to a clone are not necessarily mapped by it (a memfd page
+# a clone's fault filled stays charged to that clone), so `file_mapped` and
+# `shmem` separate those from the clone's own page cache.
+CGROUP_STAT_FIELDS = (
+    "anon", "file", "kernel", "sock", "shmem", "file_mapped", "file_dirty",
+    "active_file", "inactive_file", "active_anon", "inactive_anon",
+)
+
+
 def cgroup_stat(cg_path):
     """Read one complete memory.stat record."""
     path = os.path.join(cg_path, "memory.stat")
@@ -302,7 +337,7 @@ def cgroup_stat(cg_path):
                 out[k] = int(v)
     except (OSError, ValueError) as exc:
         raise CgroupReadError(f"cannot read {path}: {exc}") from exc
-    missing = sorted({"anon", "file", "kernel", "sock"} - out.keys())
+    missing = sorted(set(CGROUP_STAT_FIELDS) - out.keys())
     if missing:
         raise CgroupReadError(f"{path} has no {', '.join(missing)} field(s)")
     return out
@@ -346,7 +381,7 @@ def _measure_complete_cgroup_once(cg_path, with_stat):
             f"owned cgroup {cg_path} has no processes; zero is not a complete sample")
     current = cgroup_bytes(cg_path)
     try:
-        pss = sum(pss_kb_of_pid(pid) for pid in before)
+        smaps = smaps_totals((process_comm(pid), smaps_rollup_kb(pid)) for pid in before)
     except CgroupReadError as exc:
         if isinstance(exc, ProcessGone) or sorted(cgroup_procs(cg_path)) != sorted(before):
             raise CgroupMoved(
@@ -358,14 +393,40 @@ def _measure_complete_cgroup_once(cg_path, with_stat):
         raise CgroupMoved(
             f"process set changed in {cg_path} while it was sampled: "
             f"{sorted(before)} -> {sorted(after)}")
-    return before, current, pss, stat
+    return before, current, smaps, stat
+
+
+def smaps_totals(rollups):
+    """Sum (comm, rollup) pairs: {"total": {field: kB}, "by_comm": {comm: {...}}}.
+
+    by_comm also counts the processes under each name ("procs")."""
+    total = dict.fromkeys(ROLLUP_FIELDS, 0)
+    by_comm = {}
+    for comm, rollup in rollups:
+        entry = by_comm.setdefault(comm, dict.fromkeys(ROLLUP_FIELDS + ("procs",), 0))
+        entry["procs"] += 1
+        for key in ROLLUP_FIELDS:
+            total[key] += rollup[key]
+            entry[key] += rollup[key]
+    return {"total": total, "by_comm": by_comm}
+
+
+def merge_smaps(into, smaps):
+    for key in ROLLUP_FIELDS:
+        into["total"][key] += smaps["total"][key]
+    for comm, entry in smaps["by_comm"].items():
+        dest = into["by_comm"].setdefault(comm, dict.fromkeys(ROLLUP_FIELDS + ("procs",), 0))
+        for key, value in entry.items():
+            dest[key] += value
 
 
 def measure_cgroup_set(root, prefix):
     """Sum both bases over every leaf cgroup under `root` whose name starts
-    with `prefix`. Returns (n_leaves, cgroup_bytes, pss_kb, n_procs, stat_sums)."""
-    n = tot_cg = tot_pss = tot_procs = 0
-    stat_sums = {"anon": 0, "file": 0, "kernel": 0, "sock": 0}
+    with `prefix`. Returns (n_leaves, cgroup_bytes, smaps, n_procs, stat_sums),
+    smaps as smaps_totals returns it."""
+    n = tot_cg = tot_procs = 0
+    tot_smaps = smaps_totals(())
+    stat_sums = dict.fromkeys(CGROUP_STAT_FIELDS, 0)
     try:
         entries = sorted(os.listdir(root))
     except OSError as exc:
@@ -376,14 +437,14 @@ def measure_cgroup_set(root, prefix):
         path = os.path.join(root, name)
         if not os.path.isdir(path):
             continue
-        procs, cb, pss, st = measure_complete_cgroup(path)
+        procs, cb, smaps, st = measure_complete_cgroup(path)
         n += 1
         tot_procs += len(procs)
         tot_cg += cb
-        tot_pss += pss
+        merge_smaps(tot_smaps, smaps)
         for k in stat_sums:
-            stat_sums[k] += st.get(k, 0)
-    return n, tot_cg, tot_pss, tot_procs, stat_sums
+            stat_sums[k] += st[k]
+    return n, tot_cg, tot_smaps, tot_procs, stat_sums
 
 
 def refuse_sample(message):
@@ -434,6 +495,26 @@ def podman_container_cgroup(name):
     return path
 
 
+def smaps_record(side, smaps):
+    """The private/shared split of a process set, total and per process name."""
+    total = smaps["total"]
+    return {
+        f"{side}_private_kb": total["Private_Clean"] + total["Private_Dirty"],
+        f"{side}_shared_kb": total["Shared_Clean"] + total["Shared_Dirty"],
+        f"{side}_smaps_by_comm": {
+            comm: {
+                "procs": entry["procs"],
+                "pss_kb": entry["Pss"],
+                "private_clean_kb": entry["Private_Clean"],
+                "private_dirty_kb": entry["Private_Dirty"],
+                "shared_clean_kb": entry["Shared_Clean"],
+                "shared_dirty_kb": entry["Shared_Dirty"],
+            }
+            for comm, entry in sorted(smaps["by_comm"].items())
+        },
+    }
+
+
 def cmd_sample(args):
     rec = {"ts": time.time()}
     mi = read_meminfo()
@@ -448,16 +529,18 @@ def cmd_sample(args):
     # --- fcvm clones: EVERY process of each clone, via its own cgroup --------
     if args.cgroup_root and args.cgroup_prefix:
         try:
-            n, cg, pss, nproc, st = measure_cgroup_set(
+            n, cg, smaps, nproc, st = measure_cgroup_set(
                 args.cgroup_root, args.cgroup_prefix)
         except CgroupReadError as exc:
             refuse_sample(str(exc))
         rec["clones"] = n
         rec["clone_procs"] = nproc
         rec["clone_cgroup_kb"] = cg // 1024
-        rec["clone_pss_kb"] = pss
-        rec["clone_anon_kb"] = st["anon"] // 1024
-        rec["clone_file_kb"] = st["file"] // 1024
+        rec["clone_pss_kb"] = smaps["total"]["Pss"]
+        rec.update(smaps_record("clone", smaps))
+        for k in CGROUP_STAT_FIELDS:
+            if k not in ("kernel", "sock"):
+                rec[f"clone_{k}_kb"] = st[k] // 1024
         rec["basis"] = "cgroup+pss over full per-clone process set"
 
     # --- host-native container pool: the SAME two bases ----------------------
@@ -473,21 +556,23 @@ def cmd_sample(args):
                 f"podman ps failed with status {result.returncode}: {result.stderr.strip()}")
         names = result.stdout.split()
         names = [n for n in names if n.startswith(args.podman_prefix)]
-        tot_pss = tot_cg = tot_procs = 0
+        tot_cg = tot_procs = 0
+        tot_smaps = smaps_totals(())
         for n in names:
             path = podman_container_cgroup(n)
             try:
-                procs, cb, pss, _st = measure_complete_cgroup(
+                procs, cb, smaps, _st = measure_complete_cgroup(
                     path, with_stat=False)
             except CgroupReadError as exc:
                 refuse_sample(f"container {n}: {exc}")
             tot_procs += len(procs)
-            tot_pss += pss
+            merge_smaps(tot_smaps, smaps)
             tot_cg += cb
         rec["pool_containers"] = len(names)
         rec["pool_procs"] = tot_procs
-        rec["pool_pss_kb"] = tot_pss
+        rec["pool_pss_kb"] = tot_smaps["total"]["Pss"]
         rec["pool_cgroup_kb"] = tot_cg // 1024
+        rec.update(smaps_record("pool", tot_smaps))
 
     if args.extra:
         rec.update(json.loads("{" + args.extra + "}"))
