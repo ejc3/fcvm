@@ -113,6 +113,20 @@ class SceneTest {
         assertNotEquals(subject, Crowd.subject(next.rect))
     }
 
+    /**
+     * With no camera keyframes (a fleet agent sends phones none: the wall's are in kilometres of
+     * its terrain), every phone of a row of six shows robots, with the park's own camera.
+     */
+    @Test fun everyPhoneOfARowShowsRobotsWithTheParksOwnCamera() {
+        for (k in 0 until 6) {
+            val s = SceneInput(rect = Rect(k / 6.0, 0.0, 1.0 / 6, 1.0), imageAspect = 3.375)
+            for (t in (0 until 24).map { it * 50.0 }) {
+                val n = robotsOnScreen(s, t, 720, 1280).size
+                assertTrue("phone ${k + 1} at t=$t shows $n robots", n >= 100)
+            }
+        }
+    }
+
     /** Given back (`held` false or absent), the phone draws its slice of the shared image again. */
     @Test fun aPhoneGivenBackDrawsItsSliceAgain() {
         for (s in listOf(fleetScene(false), fleetScene(null))) {

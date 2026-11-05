@@ -336,9 +336,12 @@ fn renderer_body(
 ) -> Option<RendererScene> {
     let s = scene.borrow_and_update();
     let s = s.as_ref()?;
-    // A phone draws its rectangle of the phones' image, on the wall's clock.
+    // A phone draws its rectangle of the phones' image, on the wall's clock, with Robot Park's
+    // own camera: the shared keyframes are the wall's, in kilometres of its terrain, and frame no
+    // part of the park in any unit (`a_phone_is_given_no_wall_camera`).
     if let Some(p) = &want.phone {
         return want.rect.map(|r| RendererScene {
+            camera: Vec::new(),
             image_aspect: p.image_aspect,
             chrome: p.chrome.clone(),
             mirror_viewer: p.mirror_viewer.clone(),
@@ -908,6 +911,58 @@ async fn relaunch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A phone is given no camera: the shared scene's keyframes are the wall director's, in
+    /// kilometres of the wall's terrain (eye at z = -60 to -140 looking further down -z), and
+    /// Robot Park would read them as metres of its park, whose robots walk between z = -46 and
+    /// 16, so every phone showed lawn and trees and no robot. Kilometres converted to metres
+    /// put the eye 100 km from the park, past its 900 m far plane, so no conversion frames the
+    /// robots either. With no keyframes Robot Park uses its own camera over the park
+    /// (PROTOCOL.md "Phone app", `camera`). A wall tile keeps the shared camera.
+    #[test]
+    fn a_phone_is_given_no_wall_camera() {
+        let shared: SharedScene = serde_json::from_value(serde_json::json!({
+            "epoch_unix_ms": 1761100000000u64, "image_aspect": 3.375,
+            "camera": [{"t": 0.0, "pos": [-47.0, 2.6, -101.0], "look": [-56.0, 2.75, -114.75], "fov_deg": 55.0}],
+            "time_of_day": 0.3, "words": [{"text": "HELLO", "t": 1.0}], "lights": []
+        }))
+        .unwrap();
+        let (_tx, mut rx) = watch::channel(Some(shared.clone()));
+        let rect = Rect {
+            x: 5.0 / 6.0,
+            y: 0.0,
+            w: 1.0 / 6.0,
+            h: 1.0,
+        };
+        let wall = Desired {
+            generation: 1,
+            rect: Some(rect),
+            private_camera: None,
+            standby: false,
+            warm: false,
+            layout_generation: 0,
+            rect_from_frame: 0,
+            previous_rect: None,
+            phone: None,
+        };
+        let phone = Desired {
+            phone: Some(AssignPhone {
+                image_aspect: 3.375,
+                actions: Vec::new(),
+                chrome: Vec::new(),
+                mirror_viewer: None,
+            }),
+            ..wall.clone()
+        };
+        let p = renderer_body(&mut rx, &phone).unwrap();
+        assert!(
+            p.camera.is_empty(),
+            "a phone was given the wall's camera: {:?}",
+            p.camera
+        );
+        assert_eq!(p.words, shared.words, "a phone keeps the scene's words");
+        assert_eq!(renderer_body(&mut rx, &wall).unwrap().camera, shared.camera);
+    }
 
     #[test]
     fn only_an_error_line_or_the_reason_blames_the_gpu() {
