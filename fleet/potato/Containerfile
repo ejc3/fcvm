@@ -1,0 +1,5 @@
+# The hot potato player (fleet/potato). Build: make potato-image
+# The binary is static (musl); alpine supplies the sh and timeout fcvm's restore path expects.
+FROM docker.io/library/alpine:3.20
+COPY potato /usr/local/bin/potato
+ENTRYPOINT ["/usr/local/bin/potato"]

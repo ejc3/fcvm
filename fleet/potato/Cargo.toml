@@ -1,0 +1,17 @@
+[package]
+name = "fleet-potato"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+description = "fcvm fleet, hot potato: the player program that runs in each player VM, and the wire types it shares with the agent and coordinator"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[[bin]]
+name = "potato"
+path = "src/bin/potato.rs"

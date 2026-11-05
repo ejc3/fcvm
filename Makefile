@@ -602,6 +602,16 @@ fleet-program: cargo-target-link
 	@test -n "$(OUT)" || { echo "fleet-program needs OUT=FILE" >&2; exit 2; }
 	CARGO_TARGET_DIR=target $(CARGO) run --locked --release -q -p fleet-core --example program -- $(or $(SEED),1) $(or $(SECS),600) > $(OUT)
 
+# The hot potato player (fleet/potato): a static binary in a small image, one per player VM.
+POTATO_IMAGE ?= localhost/fcvm-potato:dev
+.PHONY: potato-image
+potato-image: private SHELL := $(TARGET_LEASE_SHELL)
+potato-image: cargo-target-link
+	CARGO_TARGET_DIR=target $(CARGO) build --locked --release -p fleet-potato --target $(MUSL_TARGET)
+	rm -rf target/potato-image && mkdir -p target/potato-image
+	cp target/$(MUSL_TARGET)/release/potato fleet/potato/Containerfile target/potato-image/
+	podman build --squash-all -t $(POTATO_IMAGE) -f target/potato-image/Containerfile target/potato-image
+
 build-fc-mock: private SHELL := $(TARGET_LEASE_SHELL)
 build-fc-mock: cargo-target-link
 	@echo "==> Building fc-mock..."
@@ -1624,7 +1634,7 @@ setup-lint-tools: cargo-target-link
 	@which cargo-deny > /dev/null || (echo "Installing cargo-deny..." && $(CARGO) install cargo-deny@$(CARGO_DENY_VERSION) --locked)
 
 lint: setup-lint-tools
-	$(CARGO) fmt -p fcvm -p fuse-pipe -p fc-agent -p failpoint -p fleet-core --check
+	$(CARGO) fmt -p fcvm -p fuse-pipe -p fc-agent -p failpoint -p fleet-core -p fleet-potato --check
 	$(MAKE) clippy
 	$(CARGO) audit
 	$(CARGO) deny check
