@@ -6,24 +6,20 @@ https://ejc3.github.io/fcvm/shared-nothing-renders.html
 The HTML is the maintained report source. `../REVIEW.md` records withdrawals
 and the status of historical evidence.
 
-## Status (2026-10-22)
+## Status
 
-- The page quotes the 2026-10-22 corpus campaign, listed under "The 2026-10-22
-  campaign" below: request latency at 2, 4 and 8 guest vCPUs with repeat runs
-  on fresh goldens, host CPU per request for the screenshot, the HTML
-  extraction and a restore alone, memory with many clones held at once,
-  open-loop throughput, working-set prefetch on and off, the poll interval,
-  copy against minor mode, and a warm host Chromium without a VM. The WebKit
-  run and a 2 MiB-page A/B/A were dropped for host time (the page's Limits).
-  Every serial run records the host's instance type, the Chromium version,
-  the Firecracker commit and binary, and the memory server's prefetch
-  setting; the memory, host-control and throughput records hold less, as the
-  page's Setup says.
-- The 2026-09-02 ladder and the 2026-08-30 run remain verified records. The
-  page lists them under "Earlier runs" and no longer quotes them; the sections
-  below on them are kept as their history.
-- The synthetic-page (fixture) runs are listed the same way. The publication
-  rule below is unchanged: they never carried a published figure.
+- The page quotes one campaign, listed under "The campaign 40657613" below,
+  and nothing else: every fcvm figure is from the records of that campaign,
+  at one fcvm commit, on three hosts of one instance type, each on one boot.
+  Earlier runs stay in `results/` as history and are not quoted; the
+  sections on them below are kept as their record.
+- `../test_report_one_campaign.py` fails the page if it cites a record of
+  another campaign, if the cited records disagree on the commit, the
+  instance type, the Firecracker binary or, per engine, the image, the
+  browser or the runtime bundle, if the records name more or fewer boots
+  than Setup states hosts, if an A/B/A spans two boots, if a date appears
+  outside Setup's campaign-date cell and Cloudflare's source lines, or if
+  Limits holds anything more measurement could remove.
 - **External publication (2026-09-26):** GitHub Pages publishes this file at the
   URL above on every merge to main that changes it (see Publishing).
 
@@ -61,12 +57,76 @@ The 348.7 ms direct-CDP figure and the fixture latency/decomposition tables
 remain optimisation evidence only. They do not appear as corpus headlines or
 support CPU, memory or network-mode comparisons against Cloudflare.
 
-That leaves the corpus mix as the publishable headline. Since 2026-11-04 the page quotes the fastest run of the 2026-11-04 runs, c8 at 478.3 ms, and the two 4 vCPU runs' request medians, 522.7 to 526.1 ms, each over 202 requests on the 14 URLs cycled uniformly, every run DNS-verified (`dns-evidence.json` verdict clean); they are listed under "The 2026-11-04 runs" below and indexed by `results/campaign-20261104-summary.json`. From 2026-10-22 to 2026-11-04 the headline was the range of the 7 default-configuration 4 vCPU runs' request medians, 683.4 to 715.5 ms, on 5 goldens; those runs are listed under "The 2026-10-22 campaign" below, indexed by `results/campaign-20261022-summary.json`, and the page still quotes them beside the new runs. The 2026-09-02 ladder's 549.4 ms at 4 vCPU and the 2026-08-30 run's 712.6 ms at 2 vCPU remain verified records of earlier builds; the page lists them under Earlier runs.
+That leaves the corpus mix as the publishable headline. The page quotes the campaign 40657613 alone: its headline is the 8 vCPU rung, the median of three runs' request medians, each run on its own golden, indexed by `results/campaign-40657613-summary.json`. The runs of 2026-08-30, 2026-09-02, 2026-10-22 and 2026-11-04 remain records of earlier builds and are not quoted.
 
 Regeneration follows the same rule: anything intended for publication is a
 corpus run, not a fixture run.
 
-## The 2026-11-04 runs
+## The campaign 40657613
+
+One campaign of `make bench-chromium-corpus`, `make bench-chromium-corpus-extra` and
+`MEASURE=scale`, from fcvm `40657613` (main after #1511 and #1513), on three AWS
+c8g.metal-48xl hosts, on-demand, 2026-11-04 to 2026-11-05, about 8 hours of runs. fcvm,
+fc-agent, the Firecracker build, the guest kernel, rootfs and initrd and both container
+images were built once on one host and copied to the other two, with matching sha256 checked
+before the first run. Each host ran on one boot. The serial runs went in three rounds, one per
+host, each running every configuration once in a seeded order; each A/B/A sequence ran on one
+host and one golden; `results/campaign-40657613-plan.tsv` lists every step with its host.
+Every serial run is DNS-verified clean, with 0 failures in 230 attempts per arm (430 in bridged
+and routed runs). One step, r2-c2, was refused at its preflight by the 1-minute load gate
+(13.97, sampled right after make's build and setup steps) before any golden or measurement; it ran again as
+`r2-c2-t2`, imported as `reqbench-40657613-r2-c2`. At 8 vCPUs and 4.2 req/s per path the
+throughput run had one failed request, a fast-teardown reap that stopped with "Cannot call
+rmtree on a symbolic link", so that rate is reported failed. The replay logs are in
+`ejc3/fcvm-bench-records` at commit `fdfd71c4`, the scale runs' access logs gzipped
+(`external-logs.json` `encoding`). Index: `results/campaign-40657613-summary.json`.
+
+| run | configuration | record |
+|---|---|---|
+| r1-r4 | Chromium, 4 vCPU, routed, minor, 4 KiB pages, prefetch on | `results/reqbench-40657613-r1-r4` |
+| r1-c2 | Chromium, 2 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-40657613-r1-c2` |
+| r1-b4 | Chromium, 4 vCPU, bridged, minor, 4 KiB pages, prefetch on | `results/reqbench-40657613-r1-b4` |
+| r1-c8 | Chromium, 8 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-40657613-r1-c8` |
+| r1-h4 | Chromium, 4 vCPU, rootless, minor, 2 MiB pages, prefetch on | `results/reqbench-40657613-r1-h4` |
+| r1-w4 | WebKit, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-40657613-r1-w4` |
+| r1-c4 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-40657613-r1-c4` |
+| cm1-a1 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on (copy against minor, A/B/A on one golden, step a1) | `results/reqbench-40657613-cm1-a1` |
+| cm1-b | Chromium, 4 vCPU, rootless, copy, 4 KiB pages, prefetch on (copy against minor, A/B/A on one golden, step b) | `results/reqbench-40657613-cm1-b` |
+| cm1-a2 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on (copy against minor, A/B/A on one golden, step a2) | `results/reqbench-40657613-cm1-a2` |
+| pf1-a1 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on (prefetch off against on, A/B/A on one golden, step a1) | `results/reqbench-40657613-pf1-a1` |
+| pf1-b | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch off (prefetch off against on, A/B/A on one golden, step b) | `results/reqbench-40657613-pf1-b` |
+| pf1-a2 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on (prefetch off against on, A/B/A on one golden, step a2) | `results/reqbench-40657613-pf1-a2` |
+| m4 | memory, screenshot, N = 2 to 48, golden cb-r1-c4 | `results/corpusextra-40657613-m4` |
+| s4 | open-loop throughput, 4 vCPU, 1.4, 2.8, 4.2 req/s per restore path | `results/reqbench-40657613-s4` |
+| r2-h4 | Chromium, 4 vCPU, rootless, minor, 2 MiB pages, prefetch on | `results/reqbench-40657613-r2-h4` |
+| r2-r4 | Chromium, 4 vCPU, routed, minor, 4 KiB pages, prefetch on | `results/reqbench-40657613-r2-r4` |
+| r2-c8 | Chromium, 8 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-40657613-r2-c8` |
+| r2-c2 | Chromium, 2 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-40657613-r2-c2` |
+| r2-c4 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-40657613-r2-c4` |
+| r2-b4 | Chromium, 4 vCPU, bridged, minor, 4 KiB pages, prefetch on | `results/reqbench-40657613-r2-b4` |
+| r2-w4 | WebKit, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-40657613-r2-w4` |
+| cm2-a1 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on (copy against minor, A/B/A on one golden, step a1) | `results/reqbench-40657613-cm2-a1` |
+| cm2-b | Chromium, 4 vCPU, rootless, copy, 4 KiB pages, prefetch on (copy against minor, A/B/A on one golden, step b) | `results/reqbench-40657613-cm2-b` |
+| cm2-a2 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on (copy against minor, A/B/A on one golden, step a2) | `results/reqbench-40657613-cm2-a2` |
+| pf2-a1 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on (prefetch off against on, A/B/A on one golden, step a1) | `results/reqbench-40657613-pf2-a1` |
+| pf2-b | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch off (prefetch off against on, A/B/A on one golden, step b) | `results/reqbench-40657613-pf2-b` |
+| pf2-a2 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on (prefetch off against on, A/B/A on one golden, step a2) | `results/reqbench-40657613-pf2-a2` |
+| m2 | memory, screenshot, N = 2 to 48, golden cb-r2-c2 | `results/corpusextra-40657613-m2` |
+| s2 | open-loop throughput, 2 vCPU, 1.4, 2.8, 4.2 req/s per restore path | `results/reqbench-40657613-s2` |
+| hc | host Chromium without a VM: no CPU limit, 2, 4 and 8 CPUs | `results/corpusextra-40657613-hc` |
+| r3-b4 | Chromium, 4 vCPU, bridged, minor, 4 KiB pages, prefetch on | `results/reqbench-40657613-r3-b4` |
+| r3-c4 | Chromium, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-40657613-r3-c4` |
+| r3-h4 | Chromium, 4 vCPU, rootless, minor, 2 MiB pages, prefetch on | `results/reqbench-40657613-r3-h4` |
+| r3-c8 | Chromium, 8 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-40657613-r3-c8` |
+| r3-w4 | WebKit, 4 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-40657613-r3-w4` |
+| r3-c2 | Chromium, 2 vCPU, rootless, minor, 4 KiB pages, prefetch on | `results/reqbench-40657613-r3-c2` |
+| r3-r4 | Chromium, 4 vCPU, routed, minor, 4 KiB pages, prefetch on | `results/reqbench-40657613-r3-r4` |
+| m8 | memory, screenshot, N = 2 to 48, golden cb-r3-c8 | `results/corpusextra-40657613-m8` |
+| s8 | open-loop throughput, 8 vCPU, 1.4, 2.8, 4.2 req/s per restore path | `results/reqbench-40657613-s8` |
+| m4h | memory, HTML extraction, N = 2 to 48, golden cb-r3-c4 | `results/corpusextra-40657613-m4h` |
+
+
+## The 2026-11-04 runs (history, not quoted)
 
 Four serial corpus runs of `make bench-chromium-corpus` on an AWS c8g.metal-48xl, on fcvm `0142e05e` (main after #1499, #1501 and #1503), with `ARMS=cdp,cdp-fast,html-fast,noop,noop-fast` and the default 5 ms target polling (#1495). fc-agent's restore work in them is 12.7 to 18.9 ms, against 203 to 374 ms on 2026-10-22. They also differ from the 2026-10-22 runs in Chromium (156.0.8078.79), Firecracker (`3057dcb7`) and the poll interval, so their request medians do not isolate what the restore changes did to the request. c8 ran on a second boot of the instance type with its own image build: the first box was terminated by a spot reclaim during c8 (EC2's state reason, not in the run records), and that partial c8 is not kept. Each run is DNS-verified clean, with 0 failures in 230 attempts per arm. The replay logs are in `ejc3/fcvm-bench-records` at the same paths (`external-logs.json`). Index: `results/campaign-20261104-summary.json`.
 
@@ -77,7 +137,7 @@ Four serial corpus runs of `make bench-chromium-corpus` on an AWS c8g.metal-48xl
 | c4b | 4 vCPU, minor, 4 KiB pages, prefetch on, 5 ms polling | `0142e05e` | `results/reqbench-20261104-corpus-c4b` |
 | c8 | 8 vCPU, minor, 4 KiB pages, prefetch on, 5 ms polling | `0142e05e` | `results/reqbench-20261104-corpus-c8` |
 
-## The 2026-10-22 campaign
+## The 2026-10-22 campaign (history, not quoted)
 
 Every run below is a corpus run of `make bench-chromium-corpus` (or, for the memory, host-control and throughput records, `make bench-chromium-corpus-extra` and `MEASURE=scale`) on an AWS c8g.metal-48xl, with the knobs its meta line records (the serial runs' meta lines name the instance type; the other records do not all do so). Goldens are named G1, G2, ... in the order they appear; runs that share one are A/B or A/B/A comparisons. `restore-ack.jsonl` beside each run's `reqbench.jsonl` was read out of the run's clone logs by `restore_ack.py`; `logs/serve.log` is the memory server's log of the measured run. The replay server's two logs, `corpus-access.log` and `corpus-dns.log`, are kept in the separate repository `ejc3/fcvm-bench-records` at the same paths; each run's `external-logs.json` names the commit there, and `campaign_summary.py` verifies them only with `FCVM_BENCH_RECORDS` set to a checkout of it.
 
