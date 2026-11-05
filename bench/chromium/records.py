@@ -78,14 +78,12 @@ RAW = (
     "scale-*/host-samples.jsonl",
     "scale-*/host-control.jsonl",
 )
-# The raw files of a bench/boot-race campaign: every sample with the workload's identities, the Lambda REPORT
-# lines, the driver's configuration (instance and resource ids) and the fcvm logs. Its setup.json stays.
+# The raw files of a bench/boot-race campaign: every sample with the workload's identities, and the Lambda REPORT
+# lines. render.py writes both with addresses and resource ids scrubbed; the driver's own configuration never
+# leaves the campaign box. Its setup.json stays.
 BOOT_RACE_RAW = (
     "samples.jsonl",
     "lambda-reports.json",
-    "config.json",
-    "*.log",
-    "fcvm-logs/*.log",
 )
 
 

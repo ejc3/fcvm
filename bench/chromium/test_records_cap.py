@@ -163,8 +163,7 @@ class RecordsCap(unittest.TestCase):
         THE CHANGE: run_raw_files matched the chromium patterns and listed none of a boot-race run's files."""
         run = os.path.join(records.BOOT_RACE_RESULTS, "boot-race-test")
         prefix = os.path.relpath(run, records.REPO) + "/"
-        names = ["samples.jsonl", "lambda-reports.json", "config.json", "fcvm-serve.log",
-                 "fcvm-logs/br-fcvm-file-0.log", "setup.json"]
+        names = ["samples.jsonl", "lambda-reports.json", "setup.json"]
         with mock.patch.object(records, "committed_files", side_effect=lambda pre: [pre + n for n in names]):
             raw = records.run_raw_files(run)
         self.assertEqual(sorted(raw), sorted(prefix + n for n in names if n != "setup.json"))
