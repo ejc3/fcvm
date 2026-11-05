@@ -83,6 +83,13 @@
 //! * **A minor-mode server undoes it.** A minor-mode server that starts on the same image
 //!   ends `create_backing_memfd` with a whole-file `POSIX_FADV_DONTNEED`, which drops what a
 //!   copy-mode warm-up loaded. Only the hint is lost.
+//!
+//! # With a pack
+//!
+//! When the snapshot has a working-set pack for the recorded set
+//! ([`super::pack`]), replay reads the pack instead of the recorded runs of the memory file,
+//! so the warm-up reads the pack: one file front to back, in requests of [`REQUEST_BYTES`].
+//! The log line's `file` field says which file was read.
 
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -151,6 +158,55 @@ fn requests_for(run: Run, floor: u64, page: u64, mem_len: u64) -> Requests {
         .unwrap_or(run_end)
         .min(mem_len);
     Requests { at: start, end }
+}
+
+/// What a warm-up reads into the page cache.
+pub(crate) enum WarmTarget {
+    /// The recorded runs of the memory file.
+    Runs(PageSet),
+    /// The snapshot's working-set pack, `len` bytes, read front to back.
+    Pack { file: File, len: u64 },
+}
+
+impl From<PageSet> for WarmTarget {
+    fn from(set: PageSet) -> Self {
+        Self::Runs(set)
+    }
+}
+
+/// Issue the requests that read the `len` bytes of a file front to back through `advise`.
+/// `stop` is read before every request, as in [`warm`].
+fn warm_sequential(
+    len: u64,
+    stop: &AtomicBool,
+    mut advise: impl FnMut(Request) -> std::io::Result<()>,
+) -> WarmStats {
+    let mut stats = WarmStats::default();
+    for request in (Requests { at: 0, end: len }) {
+        if stop.load(Ordering::Relaxed) {
+            stats.stopped_early = true;
+            break;
+        }
+        stats.requests += 1;
+        match advise(request) {
+            Ok(()) => stats.bytes += request.len,
+            Err(error) => {
+                if stats.failures == 0 {
+                    warn!(
+                        target: "uffd",
+                        offset = request.offset,
+                        len = request.len,
+                        error = %error,
+                        "page cache warm-up request was refused; clones still restore \
+                         correctly, and further refusals are only counted"
+                    );
+                }
+                stats.failures += 1;
+            }
+        }
+    }
+    stats.runs = u64::from(stats.requests > 0);
+    stats
 }
 
 /// What a warm-up did, for its one log line.
@@ -251,31 +307,32 @@ fn request_read(image: &File, request: Request) -> std::io::Result<()> {
 
 /// One warm-up from start to finish, on whatever thread calls it: read the recorded set,
 /// issue the requests, and log the one line that says what happened.
-fn warm_up_once(
+fn warm_up_once<T: Into<WarmTarget>>(
     snapshot: &str,
     trigger: &'static str,
-    recorded: impl FnOnce() -> PageSet,
+    recorded: impl FnOnce() -> T,
     mem_len: u64,
     stop: &AtomicBool,
     advise: impl FnMut(Request) -> std::io::Result<()>,
 ) {
     let started = Instant::now();
-    let recorded = recorded();
-    if recorded.is_empty() {
-        // The first clone of a fresh snapshot has recorded nothing yet.
-        info!(
-            target: "uffd",
-            snapshot = %snapshot,
-            trigger,
-            "no working set is recorded yet, so there is nothing to read into the page cache"
-        );
-        return;
-    }
-    let stats = warm(&recorded, mem_len, host_page_size(), stop, advise);
+    let (stats, file) = match recorded().into() {
+        WarmTarget::Pack { file, len } => (
+            warm_sequential(len, stop, |request| request_read(&file, request)),
+            "pack",
+        ),
+        WarmTarget::Runs(recorded) => {
+            match warm_runs(snapshot, trigger, &recorded, mem_len, stop, advise) {
+                Some(stats) => (stats, "memory"),
+                None => return,
+            }
+        }
+    };
     info!(
         target: "uffd",
         snapshot = %snapshot,
         trigger,
+        file,
         runs = stats.runs,
         pages = stats.bytes / GRANULE,
         mib = stats.bytes / (1024 * 1024),
@@ -285,6 +342,29 @@ fn warm_up_once(
         stopped_early = stats.stopped_early,
         "asked the kernel to read the recorded working set into the page cache"
     );
+}
+
+/// The warm-up of the recorded runs of the memory file, or `None` when nothing is recorded,
+/// which it logs.
+fn warm_runs(
+    snapshot: &str,
+    trigger: &'static str,
+    recorded: &PageSet,
+    mem_len: u64,
+    stop: &AtomicBool,
+    advise: impl FnMut(Request) -> std::io::Result<()>,
+) -> Option<WarmStats> {
+    if recorded.is_empty() {
+        // The first clone of a fresh snapshot has recorded nothing yet.
+        info!(
+            target: "uffd",
+            snapshot = %snapshot,
+            trigger,
+            "no working set is recorded yet, so there is nothing to read into the page cache"
+        );
+        return None;
+    }
+    Some(warm(recorded, mem_len, host_page_size(), stop, advise))
 }
 
 /// What one serve's warm-ups share: at most one runs at a time, and none starts once the
@@ -334,10 +414,10 @@ impl Warmer {
     /// The caller pays for one compare-and-swap and one thread spawn. `recorded` runs on the
     /// new thread, so copying a large guest's bitmap never delays the caller, which is the
     /// server's accept loop when the trigger is a clone admission.
-    pub(crate) fn warm_if_idle(
+    pub(crate) fn warm_if_idle<T: Into<WarmTarget>>(
         &self,
         trigger: &'static str,
-        recorded: impl FnOnce() -> PageSet + Send + 'static,
+        recorded: impl FnOnce() -> T + Send + 'static,
     ) -> bool {
         let image = Arc::clone(&self.image);
         self.warm_if_idle_with(trigger, recorded, move |request| {
@@ -346,10 +426,10 @@ impl Warmer {
     }
 
     /// [`Warmer::warm_if_idle`] with the kernel call passed in, so tests can park it.
-    fn warm_if_idle_with(
+    fn warm_if_idle_with<T: Into<WarmTarget>>(
         &self,
         trigger: &'static str,
-        recorded: impl FnOnce() -> PageSet + Send + 'static,
+        recorded: impl FnOnce() -> T + Send + 'static,
         advise: impl FnMut(Request) -> std::io::Result<()> + Send + 'static,
     ) -> bool {
         if self.shared.stop.load(Ordering::Relaxed) {
@@ -1079,6 +1159,51 @@ mod tests {
         }
     }
 
+    /// With a pack, the warm-up reads the pack file front to back in requests of
+    /// REQUEST_BYTES, not the recorded runs of the memory file, and its line says so.
+    #[test]
+    fn with_a_pack_the_warm_up_reads_the_pack_file_front_to_back() {
+        let len = 5 * REQUEST_BYTES + 4096;
+        let mut seen = Vec::new();
+        let stats = warm_sequential(len, &AtomicBool::new(false), |request| {
+            seen.push((request.offset, request.len));
+            Ok(())
+        });
+        let expected: Vec<(u64, u64)> = (0..5)
+            .map(|i| (i * REQUEST_BYTES, REQUEST_BYTES))
+            .chain([(5 * REQUEST_BYTES, 4096)])
+            .collect();
+        assert_eq!(seen, expected);
+        assert_eq!(stats.bytes, len);
+
+        let mut pack = tempfile::tempfile().unwrap();
+        write_incompressible(&mut pack, len).unwrap();
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            warm_up_once(
+                "snap",
+                "serve start",
+                move || WarmTarget::Pack { file: pack, len },
+                64 * G,
+                &AtomicBool::new(false),
+                |_| panic!("a warm-up of the pack must not ask for the memory file's runs"),
+            );
+        });
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(log.lines().count(), 1, "{log}");
+        for part in [
+            "asked the kernel to read the recorded working set into the page cache",
+            "file=\"pack\"",
+            "requests=6",
+            "failures=0",
+        ] {
+            assert!(log.contains(part), "{part} is missing from: {log}");
+        }
+    }
     /// At most one warm-up runs. A clone admitted while one is running starts nothing, and
     /// the next admission after it ended starts another.
     #[test]
@@ -1101,7 +1226,9 @@ mod tests {
         let asked = Arc::new(AtomicU64::new(0));
         let second = warmer.warm_if_idle_with(
             "clone admission",
-            || panic!("the recorded set must not be copied for a warm-up that does not start"),
+            || -> PageSet {
+                panic!("the recorded set must not be copied for a warm-up that does not start")
+            },
             {
                 let asked = Arc::clone(&asked);
                 move |_| {

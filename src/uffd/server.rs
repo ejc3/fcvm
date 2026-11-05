@@ -1027,7 +1027,8 @@ impl UffdServer {
 
         // Open the memory snapshot file (shared across all VMs)
         let mem_file = File::open(mem_file_path).context("opening memory file")?;
-        let mem_size = mem_file.metadata()?.len() as usize;
+        let served = mem_file.metadata()?;
+        let mem_size = served.len() as usize;
 
         // Mark the memory file in use before any of it is read: a server that starts for
         // another snapshot drops from the page cache every memory file nothing holds
@@ -1145,7 +1146,12 @@ impl UffdServer {
                 generation_config_path,
                 generation_lock_path,
             ) {
-                Ok(store) => Some(Arc::new(store)),
+                Ok(store) => {
+                    // The store read the snapshot's paths after the file above was opened.
+                    // A pack holds bytes, so it is replayed only if both name one image.
+                    store.bind_served_image(&served);
+                    Some(Arc::new(store))
+                }
                 Err(error) => {
                     warn!(
                         target: "uffd",
@@ -1205,10 +1211,29 @@ impl UffdServer {
 
     /// Start reading the recorded working set into the page cache, unless a warm-up is
     /// already running or this server has no warmer.
+    ///
+    /// When the snapshot has a pack of the recorded set, replay reads the pack, so the
+    /// warm-up reads it instead of the recorded runs. Loading the pack happens here, on the
+    /// warm-up's thread, which is also what makes it available to the clones' replay.
+    ///
+    /// Only replay workers copy from a pack, so a server whose replay runs on the handler
+    /// alone warms the recorded runs.
     fn warm_page_cache(&self, trigger: &'static str) {
         if let (Some(warmer), Some(store)) = (&self.warmer, &self.working_set) {
             let store = Arc::clone(store);
-            warmer.warm_if_idle(trigger, move || store.to_prefetch());
+            let replays_packs = matches!(
+                &*self.source,
+                PageSource::Copy { replay_threads, .. } if *replay_threads > 1
+            );
+            warmer.warm_if_idle(trigger, move || {
+                let pack = replays_packs.then(|| store.load_pack()).flatten();
+                let pack = pack.and_then(|pack| {
+                    let file = pack.file().try_clone().ok()?;
+                    let len = file.metadata().ok()?.len();
+                    Some(super::warmup::WarmTarget::Pack { file, len })
+                });
+                pack.unwrap_or_else(|| super::warmup::WarmTarget::Runs(store.to_prefetch()))
+            });
         }
     }
 
@@ -2690,8 +2715,12 @@ async fn replay_then_serve(
 ) -> Result<()> {
     if let Some(store) = working_set {
         let recorded = store.to_prefetch_ordered();
-        if recorded.iter().any(|tier| !tier.is_empty())
-            && replay_working_set(ctx, async_uffd, recorded, state).await? == Replay::Exited
+        // The pack of this set, if one is loaded: asked without waiting, because a clone's
+        // replay must not wait on a pack's tables. The warm-up loads it when the serve starts.
+        let pack = store.pack_for(&recorded);
+        if recorded.tiers.iter().any(|tier| !tier.is_empty())
+            && replay_working_set(ctx, async_uffd, recorded.tiers, pack, state).await?
+                == Replay::Exited
         {
             log_clone_finished(ctx, state, "clone exited during working-set replay");
             return Ok(());
@@ -2870,6 +2899,10 @@ struct ReplayWorkers {
     /// Set by the Drop backstop before it joins: a worker takes no further job and starts no
     /// further copy, so the queued jobs are discarded.
     stop: Arc<std::sync::atomic::AtomicBool>,
+    /// The pack the workers copy from, when the snapshot has one for this set, and the
+    /// threads that decompress its frames ahead of them. Stopped and joined with the workers.
+    pack: Option<Arc<super::pack::PackStream>>,
+    pack_threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl ReplayWorkers {
@@ -2891,6 +2924,7 @@ impl ReplayWorkers {
         page_size: usize,
         vm_id: &str,
         gate: &Arc<ReplayGate>,
+        pack: Option<Arc<super::pack::Pack>>,
     ) -> Result<Self> {
         use std::os::fd::AsFd;
         let (jobs, jobs_rx) =
@@ -2903,6 +2937,7 @@ impl ReplayWorkers {
             ptr: mmap.as_ptr() as usize,
             len: mmap.len(),
         };
+        let pack = pack.map(|pack| super::pack::PackStream::new(pack, count));
         let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(count);
         let join_started = |handles: Vec<std::thread::JoinHandle<()>>| {
             for handle in handles {
@@ -2926,6 +2961,7 @@ impl ReplayWorkers {
             let stop = Arc::clone(&stop);
             let gate = Arc::clone(gate);
             let vm_id = vm_id.to_string();
+            let pack = pack.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("fcvm-replay-{index}"))
                 .spawn(move || {
@@ -2935,6 +2971,7 @@ impl ReplayWorkers {
                     replay_worker(
                         &worker_uffd,
                         slice,
+                        pack.as_deref(),
                         page_size,
                         &vm_id,
                         &gate,
@@ -2957,6 +2994,11 @@ impl ReplayWorkers {
         {
             *gate.workers.lock().unwrap() = handles.iter().map(|h| h.thread().id()).collect();
         }
+        // As many read-ahead threads as copying threads: reading and decompressing a frame
+        // takes about as long as copying it out.
+        let pack_threads = pack
+            .as_ref()
+            .map_or_else(Vec::new, |pack| pack.spawn_read_ahead(count));
         Ok(Self {
             jobs: Some(jobs),
             room,
@@ -2973,7 +3015,19 @@ impl ReplayWorkers {
             requeued: 0,
             vm_gone: false,
             stop,
+            pack,
+            pack_threads,
         })
+    }
+
+    /// Stop the pack's read-ahead and join its threads; what the pack provided.
+    fn finish_pack(&mut self) -> Option<super::pack::PackStats> {
+        let pack = self.pack.as_ref()?;
+        pack.stop();
+        for handle in self.pack_threads.drain(..) {
+            let _ = handle.join();
+        }
+        Some(pack.stats())
     }
 
     /// Queue one job without waiting. `Err(Full(job))` asks the caller to wait for room;
@@ -3121,6 +3175,7 @@ impl ReplayWorkers {
             );
         }
         let stale = self.stale.len() as u64;
+        let pack = self.finish_pack();
         Ok(ReplayWorkersTally {
             dispatched: self.dispatched,
             runs: self.runs,
@@ -3128,6 +3183,7 @@ impl ReplayWorkers {
             refused: self.refused + stale,
             requeued: self.requeued,
             vm_gone: self.vm_gone,
+            pack,
         })
     }
 
@@ -3265,6 +3321,7 @@ impl Drop for ReplayWorkers {
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
+        self.finish_pack();
     }
 }
 
@@ -3274,6 +3331,7 @@ impl Drop for ReplayWorkers {
 fn replay_worker(
     uffd: &Uffd,
     slice: SnapshotSlice,
+    pack: Option<&super::pack::PackStream>,
     page_size: usize,
     vm_id: &str,
     gate: &ReplayGate,
@@ -3284,7 +3342,7 @@ fn replay_worker(
 ) {
     // SAFETY: see `SnapshotSlice`.
     let snapshot = unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) };
-    let source = prefetch::Source::Copy(snapshot);
+    let (mut scratch, mut pieces, mut frame_scratch) = (Vec::new(), Vec::new(), Vec::new());
     loop {
         let job = match jobs.lock() {
             Ok(rx) => rx.recv(),
@@ -3300,7 +3358,40 @@ fn replay_worker(
         let mut index = 0usize;
         'runs: while index < job.runs.len() {
             let run = job.runs[index];
-            let segment = run.segment();
+            // Where this run's bytes come from: the pack's decompressed frames where it holds
+            // them, the memory file elsewhere. Decided before the gate is taken, since it can
+            // wait for a frame to be decompressed, and the handler waits at the gate for the
+            // copies in flight.
+            let bytes = match pack {
+                Some(pack) => pack.bytes_for(
+                    run.file_offset,
+                    run.len,
+                    snapshot,
+                    &mut scratch,
+                    &mut pieces,
+                    &mut frame_scratch,
+                ),
+                None => super::pack::RunBytes::File,
+            };
+            let (source, segment) = match &bytes {
+                super::pack::RunBytes::File => (prefetch::Source::Copy(snapshot), run.segment()),
+                super::pack::RunBytes::Frame(frame, at) => (
+                    prefetch::Source::Copy(&frame[..]),
+                    prefetch::Segment {
+                        host_addr: run.host_addr,
+                        file_offset: *at as u64,
+                        len: run.len,
+                    },
+                ),
+                super::pack::RunBytes::Scratch => (
+                    prefetch::Source::Copy(&scratch[..]),
+                    prefetch::Segment {
+                        host_addr: run.host_addr,
+                        file_offset: 0,
+                        len: run.len,
+                    },
+                ),
+            };
             let mut done = 0usize;
             let mut refused_since: Option<std::time::Instant> = None;
             while done < run.len {
@@ -3391,6 +3482,8 @@ struct ReplayWorkersTally {
     refused: u64,
     requeued: u64,
     vm_gone: bool,
+    /// What the pack provided, when the workers copied from one.
+    pack: Option<super::pack::PackStats>,
 }
 
 /// How a working-set replay ended.
@@ -3405,6 +3498,8 @@ enum Replay {
     Finished {
         refused_segments: u64,
         filled_holes_mapped: u64,
+        /// What the working-set pack provided, when replay copied from one.
+        pack: Option<super::pack::PackStats>,
     },
 }
 
@@ -3412,6 +3507,7 @@ async fn replay_working_set(
     ctx: &VmContext<'_>,
     async_uffd: &AsyncFd<Uffd>,
     recorded: std::sync::Arc<Vec<PageSet>>,
+    pack: Option<Arc<super::pack::Pack>>,
     state: &mut VmState,
 ) -> Result<Replay> {
     // The copies of plain runs go to the worker threads when the clone has them. A pool that
@@ -3427,6 +3523,7 @@ async fn replay_working_set(
                 ctx.page_size,
                 ctx.vm_id,
                 ctx.gate,
+                pack,
             ) {
                 Ok(workers) => Some(workers),
                 Err(error) => {
@@ -3455,6 +3552,7 @@ async fn replay_working_set(
     }
     ran.refused += tally.refused;
     ran.bytes += tally.populated;
+    let pack = tally.pack.unwrap_or_default();
     info!(
         target: "uffd",
         vm_id = %ctx.vm_id,
@@ -3467,6 +3565,12 @@ async fn replay_working_set(
         worker_runs = tally.runs,
         worker_populated_mib = tally.populated / (1024 * 1024),
         worker_jobs_replanned = tally.requeued,
+        pack_used = tally.pack.is_some(),
+        pack_frames = pack.frames,
+        pack_compressed_mib = pack.compressed_bytes / (1024 * 1024),
+        pack_decompress_ms = pack.decompress_ns / 1_000_000,
+        pack_mib = pack.pack_bytes / (1024 * 1024),
+        pack_failed = pack.failed,
         filled_holes_mapped = ran.filled_holes_mapped,
         hole_skipped_mib = ran.hole_skipped / (1024 * 1024),
         hole_zero_filled_pages = ran.hole_zero_filled,
@@ -3483,6 +3587,7 @@ async fn replay_working_set(
         Replay::Finished {
             refused_segments: ran.refused,
             filled_holes_mapped: ran.filled_holes_mapped,
+            pack: tally.pack,
         }
     })
 }
@@ -6564,6 +6669,7 @@ mod tests {
             &ctx,
             &async_uffd,
             std::sync::Arc::new(recorded.by_first_touch()),
+            None,
             &mut state,
         )
         .await
@@ -6573,6 +6679,7 @@ mod tests {
             Replay::Finished {
                 refused_segments: 0,
                 filled_holes_mapped: 0,
+                pack: None,
             },
             "replay must not ask the kernel for the hole"
         );
@@ -6608,6 +6715,7 @@ mod tests {
             &ctx,
             &async_uffd,
             std::sync::Arc::new(recorded.by_first_touch()),
+            None,
             &mut state,
         )
         .await
@@ -6617,6 +6725,7 @@ mod tests {
             Replay::Finished {
                 refused_segments: 0,
                 filled_holes_mapped: 1,
+                pack: None,
             },
             "replay maps and counts the hole another clone filled, and does not ask the kernel \
              for the hole no clone filled"
@@ -6692,6 +6801,7 @@ mod tests {
             &ctx,
             &async_uffd,
             std::sync::Arc::new(recorded.by_first_touch()),
+            None,
             &mut state,
         )
         .await
@@ -6701,6 +6811,7 @@ mod tests {
             Replay::Finished {
                 refused_segments: 0,
                 filled_holes_mapped: 1,
+                pack: None,
             },
             "replay counts the filled hole it maps, not the one that is given back, and does \
              not ask the kernel for a hole no clone filled"
@@ -8064,6 +8175,7 @@ mod tests {
                 &ctx,
                 &async_uffd,
                 std::sync::Arc::new(recorded.by_first_touch()),
+                None,
                 &mut state,
             )
             .await;
@@ -9015,6 +9127,7 @@ mod tests {
                 &ctx,
                 &async_uffd,
                 std::sync::Arc::new(recorded.by_first_touch()),
+                None,
                 &mut state,
             )
             .await
@@ -9052,9 +9165,16 @@ mod tests {
         let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx();
         let mut state = clone.state();
-        let mut workers =
-            ReplayWorkers::spawn(2, async_uffd.get_ref(), mmap, PAGE, "stale-job", &gate)
-                .expect("spawning replay workers");
+        let mut workers = ReplayWorkers::spawn(
+            2,
+            async_uffd.get_ref(),
+            mmap,
+            PAGE,
+            "stale-job",
+            &gate,
+            None,
+        )
+        .expect("spawning replay workers");
         // The job names region page 3 (file page 3), planned under the current generation;
         // then a REMOVE is recorded before any worker takes it.
         let stale = ReplayJob {
@@ -9106,7 +9226,7 @@ mod tests {
         let ctx = clone.ctx_with_gate(&gate);
         let mut state = clone.state();
         let mut workers =
-            ReplayWorkers::spawn(1, async_uffd.get_ref(), mmap, PAGE, "held-job", &gate)
+            ReplayWorkers::spawn(1, async_uffd.get_ref(), mmap, PAGE, "held-job", &gate, None)
                 .expect("spawning replay workers");
         let balloon = clone.inflate(async_uffd.get_ref(), 7);
         let job = |page: usize| ReplayJob {
@@ -9215,9 +9335,16 @@ mod tests {
         let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx_with_gate(&gate);
         let mut state = clone.state();
-        let mut workers =
-            ReplayWorkers::spawn(1, async_uffd.get_ref(), mmap, PAGE, "parked-in-wait", &gate)
-                .expect("spawning replay workers");
+        let mut workers = ReplayWorkers::spawn(
+            1,
+            async_uffd.get_ref(),
+            mmap,
+            PAGE,
+            "parked-in-wait",
+            &gate,
+            None,
+        )
+        .expect("spawning replay workers");
         // Two REMOVEs with the fault between them: the drain reads the first, then the
         // fault, whose copy the kernel refuses while the second is unread, so the fault is
         // parked; then the second. Each balloon thread sleeps with its event queued.
@@ -9328,7 +9455,7 @@ mod tests {
         let ctx = clone.ctx_with_gate(&gate);
         let mut state = clone.state();
         let mut workers =
-            ReplayWorkers::spawn(1, async_uffd.get_ref(), mmap, PAGE, "long-run", &gate)
+            ReplayWorkers::spawn(1, async_uffd.get_ref(), mmap, PAGE, "long-run", &gate, None)
                 .expect("spawning replay workers");
         let balloon = clone.inflate_queued(GIVEN_BACK);
         let job = |page: usize| ReplayJob {
@@ -9419,9 +9546,16 @@ mod tests {
         let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx_with_gate(&gate);
         let mut state = clone.state();
-        let mut workers =
-            ReplayWorkers::spawn(1, async_uffd.get_ref(), mmap, PAGE, "refused-retry", &gate)
-                .expect("spawning replay workers");
+        let mut workers = ReplayWorkers::spawn(
+            1,
+            async_uffd.get_ref(),
+            mmap,
+            PAGE,
+            "refused-retry",
+            &gate,
+            None,
+        )
+        .expect("spawning replay workers");
         let balloon = clone.inflate_queued(7);
         let started = std::time::Instant::now();
         workers
@@ -9548,6 +9682,8 @@ mod tests {
                 requeued: 0,
                 vm_gone: false,
                 stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                pack: None,
+                pack_threads: Vec::new(),
             };
             let waited = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -9594,9 +9730,16 @@ mod tests {
         let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx_with_gate(&gate);
         let mut state = clone.state();
-        let mut workers =
-            ReplayWorkers::spawn(1, async_uffd.get_ref(), mmap, PAGE, "drop-discards", &gate)
-                .expect("spawning replay workers");
+        let mut workers = ReplayWorkers::spawn(
+            1,
+            async_uffd.get_ref(),
+            mmap,
+            PAGE,
+            "drop-discards",
+            &gate,
+            None,
+        )
+        .expect("spawning replay workers");
         let balloon = clone.inflate_queued(7);
         for page in 0..=ReplayWorkers::QUEUE_PER_WORKER {
             let deadline = std::time::Instant::now() + MAX_PARKED_WAIT / 2;
@@ -9914,6 +10057,7 @@ mod tests {
                 &ctx,
                 &async_uffd,
                 std::sync::Arc::new(recorded.by_first_touch()),
+                None,
                 &mut state,
             )
             .await
@@ -10363,6 +10507,7 @@ mod tests {
             &ctx,
             &async_uffd,
             std::sync::Arc::new(recorded.by_first_touch()),
+            None,
             &mut state,
         )
         .await
@@ -11020,6 +11165,168 @@ mod tests {
         clone.unmap();
     }
 
+    // -------------------------------------------------------------------------
+    // Replay from a working-set pack.
+    // -------------------------------------------------------------------------
+
+    /// A memory file of `pages` pages whose every byte depends on its offset, mapped
+    /// read-only as a COPY source with `threads` replay threads, the way a server maps one.
+    fn patterned_copy_source(dir: &Path, pages: usize, threads: usize) -> (PathBuf, PageSource) {
+        const PAGE: usize = 4096;
+        let path = dir.join("memory.bin");
+        let bytes: Vec<u8> = (0..pages * PAGE)
+            .map(|i| ((i / PAGE) as u8).wrapping_mul(31) ^ (i % 251) as u8)
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let file = File::open(&path).unwrap();
+        // SAFETY: a read-only mapping of a file this test owns and does not change.
+        let mmap = unsafe { MmapOptions::new().len(bytes.len()).map(&file) }.unwrap();
+        let source = PageSource::Copy {
+            mmap,
+            fault_around: 0,
+            replay_threads: threads,
+            holes: FileHoles::default(),
+            nv2: false,
+        };
+        (path, source)
+    }
+
+    /// Replay from a pack copies what replay from the memory file copies, page for page and
+    /// byte for byte: the recorded runs in every tier, across frames, with a recorded page
+    /// the balloon has given back stepped over and recorded holes mapped to zeros, both of
+    /// which the handler decides before a run reaches a worker. The pack's statistics show
+    /// the copies came out of its frames.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_from_a_pack_copies_what_replay_from_the_memory_file_copies() {
+        const PAGE: usize = 4096;
+        const PAGES: usize = 3000; // 11.7 MiB: the recorded set spans three frames
+        let dir = tempfile::tempdir().unwrap();
+        let (mem_path, mut source) = patterned_copy_source(dir.path(), PAGES, 4);
+        mark_holes(&mut source, &[10, 11, 2100, 2101, 2102]);
+        let mem_len = (PAGES * PAGE) as u64;
+        let mut recorded = PageSet::empty(mem_len);
+        recorded.insert_range_at(0, (1500 * PAGE) as u64, 2);
+        recorded.insert_range_at((2000 * PAGE) as u64, (900 * PAGE) as u64, 30);
+        recorded.insert_range_at((1600 * PAGE) as u64, (100 * PAGE) as u64, 0);
+
+        let key = crate::uffd::working_set::ImageKey::of(&mem_path, &[1; 32]).unwrap();
+        let reclaim = crate::reclaim::owner_dir_in(&dir.path().join("data")).unwrap();
+        crate::uffd::pack::build_for_test(&mem_path, &key, &recorded, &reclaim, 2);
+        let tiers = std::sync::Arc::new(recorded.by_first_touch());
+        let pack = crate::uffd::pack::Pack::open(
+            &crate::uffd::pack::path_for(&mem_path),
+            &key,
+            &recorded.order_digest(),
+            mem_len,
+            crate::uffd::pack::runs_of(
+                crate::uffd::working_set::OrderedRuns::from_tiers(tiers.clone()),
+                mem_len,
+            ),
+        )
+        .unwrap()
+        .expect("the pack of this set");
+        assert!(pack.frames().len() >= 3, "{} frames", pack.frames().len());
+        let pack = Arc::new(pack);
+
+        // One clone replays from the pack, one from the memory file.
+        let mut clones = Vec::new();
+        for with_pack in [true, false] {
+            let (base, uffd) =
+                missing_guest_memory(PAGES * PAGE, userfaultfd::FeatureFlags::EVENT_REMOVE);
+            let mappings = [GuestRegionUffdMapping {
+                base_host_virt_addr: base as u64,
+                size: PAGES * PAGE,
+                offset: 0,
+                page_size: PAGE,
+            }];
+            let gate = Arc::new(ReplayGate::default());
+            let ctx = VmContext {
+                vm_id: if with_pack { "from-pack" } else { "from-file" },
+                mappings: &mappings,
+                source: &source,
+                page_size: PAGE,
+                page_mask: !(PAGE - 1),
+                mem_size: PAGES * PAGE,
+                gate: &gate,
+            };
+            let mut state = BalloonedCopyClone::state();
+            remember_removed(&ctx, &mut state.removed, base + 20 * PAGE, base + 30 * PAGE);
+            remember_removed(
+                &ctx,
+                &mut state.removed,
+                base + 2500 * PAGE,
+                base + 2520 * PAGE,
+            );
+            let async_uffd = register_uffd(uffd).expect("registering the userfaultfd");
+            let outcome = replay_working_set(
+                &ctx,
+                &async_uffd,
+                tiers.clone(),
+                with_pack.then(|| Arc::clone(&pack)),
+                &mut state,
+            )
+            .await
+            .expect("replay");
+            let Replay::Finished {
+                refused_segments,
+                pack: stats,
+                ..
+            } = outcome
+            else {
+                panic!("the clone is alive");
+            };
+            assert_eq!(refused_segments, 0);
+            assert_eq!(state.fault_count, 0, "nothing faulted");
+            if with_pack {
+                let stats = stats.expect("replay from the pack reports it");
+                assert!(!stats.failed);
+                assert_eq!(stats.frames, pack.frames().len() as u64);
+                assert!(
+                    stats.pack_bytes >= (2000 * PAGE) as u64,
+                    "only {} bytes came out of the pack",
+                    stats.pack_bytes
+                );
+            } else {
+                assert_eq!(stats, None);
+            }
+            let resident = resident_pages(base, PAGES);
+            let bytes: Vec<Vec<u8>> = resident
+                .iter()
+                .map(|page| resident_bytes(base + page * PAGE))
+                .collect();
+            drop(async_uffd);
+            // SAFETY: unmapping the guest memory this test mapped.
+            unsafe { libc::munmap(base as *mut libc::c_void, PAGES * PAGE) };
+            clones.push((resident, bytes));
+        }
+        let (from_pack, from_file) = (&clones[0], &clones[1]);
+        let expected: Vec<usize> = (0..1500)
+            .chain(1600..1700)
+            .chain(2000..2900)
+            .filter(|page| !(20..30).contains(page) && !(2500..2520).contains(page))
+            .collect();
+        assert_eq!(
+            from_file.0, expected,
+            "control: replay from the memory file"
+        );
+        assert_eq!(
+            from_pack.0, from_file.0,
+            "the pack replay populated other pages"
+        );
+        for (index, page) in from_file.0.iter().enumerate() {
+            assert!(
+                from_pack.1[index] == from_file.1[index],
+                "page {page} holds other bytes after replay from the pack"
+            );
+        }
+        for hole in [10usize, 11, 2100, 2101, 2102] {
+            let index = from_pack.0.iter().position(|page| *page == hole).unwrap();
+            assert!(
+                from_pack.1[index].iter().all(|byte| *byte == 0),
+                "hole {hole}"
+            );
+        }
+    }
     /// Replay fills a recorded page that is a hole in the memory file without reading the
     /// file: an earlier clone touched it, so this one should not fault for it. On ordinary
     /// memory it maps the kernel's shared zero page there, as a read fault on the hole would,
@@ -11049,6 +11356,7 @@ mod tests {
                 &ctx,
                 &async_uffd,
                 std::sync::Arc::new(recorded.by_first_touch()),
+                None,
                 &mut state,
             )
             .await
@@ -11058,6 +11366,7 @@ mod tests {
                 Replay::Finished {
                     refused_segments: 0,
                     filled_holes_mapped: 0,
+                    pack: None,
                 },
                 "nv2={nv2}"
             );
