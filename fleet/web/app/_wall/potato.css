@@ -1,0 +1,138 @@
+/* Potato mode. A page of its own over the wall's ground: it scrolls inside itself (the body does
+   not), follows the viewer's light or dark preference, and keeps the wall's rules (text 14 px or
+   more, controls at least 44 px). Buttons and cards come from wall.css; the tokens they read are
+   redefined here for the light theme. A tile's colour is the player's state, the same in both. */
+
+.potato-page {
+  --p-bg: #0b0d10;
+  --p-ring: rgba(255, 255, 255, 0.14);
+  --p-track: #262c35;
+  --p-short: #ff9a8c;
+  --p-ball: #f5d36a;
+  --p-ball-edge: #3b2f06;
+  --p-tile-edge: rgba(255, 255, 255, 0.22);
+  --p-holder: #ffffff;
+  --p-current: rgba(124, 196, 255, 0.14);
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--p-bg);
+  color: var(--text);
+  padding: 0 24px 32px;
+}
+@media (prefers-color-scheme: light) {
+  .potato-page {
+    --bg: #ffffff;
+    --panel: #ffffff;
+    --plate: rgba(255, 255, 255, 0.9);
+    --line: #d4d9e0;
+    --text: #15191e;
+    --muted: #4a5360;
+    --dim: #56606d;
+    --control: #7a8594;
+    --fcvm: #0a64b8;
+    --refused: #b3261e;
+    --p-bg: #f3f5f8;
+    --p-ring: rgba(0, 0, 0, 0.12);
+    --p-track: #dde2e8;
+    --p-short: #b3261e;
+    --p-ball: #e0a800;
+    --p-ball-edge: #5c4500;
+    --p-tile-edge: rgba(0, 0, 0, 0.25);
+    --p-holder: #15191e;
+    --p-current: rgba(10, 100, 184, 0.1);
+    color-scheme: light;
+  }
+  .potato-page .card { border-color: var(--line); }
+  .potato-page .mode-switch { background: #ffffff; }
+  .potato-page .mode-link[aria-current="page"] { background: rgba(0, 0, 0, 0.08); }
+  .potato-page .brand { text-shadow: none; }
+  .potato-page .btn:hover:not(:disabled) { border-color: #3c4652; }
+}
+
+.potato-top { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 12px 24px; padding: 14px 0 8px; }
+.potato-page .brand h1 { font-size: 24px; }
+.potato-actions { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: flex-start; }
+.potato-action { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; max-width: 240px; }
+.potato-action .btn { min-width: 112px; justify-content: center; }
+.potato-action .note { font-size: 14px; color: var(--muted); }
+.potato-sentence { max-width: 72ch; font-size: 15px; color: var(--muted); margin-bottom: 12px; }
+.potato-banner, .potato-notice { margin: 0 0 12px; padding: 10px 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel); font-size: 15px; max-width: 72ch; }
+.potato-notice { border-color: var(--refused); color: var(--refused); }
+.potato-sleep { margin-bottom: 12px; }
+
+/* The ring on the left, the cards beside it; one column on a narrow screen. */
+.potato-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 440px); gap: 24px; align-items: start; }
+.potato-ring-wrap { min-width: 0; position: sticky; top: 8px; }
+.potato-caption { font: 500 15px var(--mono); color: var(--text); min-height: 22px; margin-bottom: 6px; }
+.potato-stage { position: relative; width: 100%; height: min(calc(100dvh - 190px), 760px); min-height: 320px; }
+/* The circle the tiles stand on. */
+.potato-track { position: absolute; border-radius: 50%; border: 2px solid var(--p-ring); pointer-events: none; }
+
+.potato-tile { position: absolute; border-radius: 22%; background: var(--c); box-shadow: inset 0 0 0 1px var(--p-tile-edge); display: flex; align-items: center; justify-content: center; transition: background-color 160ms linear; }
+.potato-tile .num { font: 600 14px var(--mono); color: #0b0d10; background: rgba(255, 255, 255, 0.82); border-radius: 4px; padding: 0 4px; line-height: 1.3; }
+/* Dim by mixing the fill into the ground, not by opacity, so the number keeps its contrast. */
+.potato-tile[data-phase="sleeping"] { background: color-mix(in srgb, var(--c) 55%, var(--p-bg)); }
+.potato-tile[data-phase="asleep"] { background: color-mix(in srgb, var(--c) 32%, var(--p-bg)); }
+.potato-tile[data-phase="absent"] { background: color-mix(in srgb, #808080 18%, var(--p-bg)); }
+.potato-tile[data-phase="waking"] { background: color-mix(in srgb, var(--c) 66%, var(--p-bg)); }
+.potato-tile[data-phase="failed"] { background: transparent; box-shadow: inset 0 0 0 3px var(--refused); }
+.potato-tile[data-holder] { box-shadow: 0 0 0 3px var(--p-holder), inset 0 0 0 1px var(--p-tile-edge); }
+.potato-tile .wake-bar { position: absolute; left: 10%; right: 10%; bottom: 10%; height: 6px; border-radius: 3px; background: rgba(0, 0, 0, 0.45); overflow: hidden; }
+.potato-tile .wake-bar > span { display: block; height: 100%; background: #ffffff; }
+.potato-line { position: absolute; transform: translateX(-50%); font: 500 14px var(--sans); color: var(--muted); white-space: nowrap; pointer-events: none; }
+.potato-line[data-phase="waking"] { color: var(--text); font-family: var(--mono); }
+.potato-line[data-phase="failed"] { color: var(--refused); }
+.potato-ball { position: absolute; border-radius: 50%; background: radial-gradient(circle at 35% 35%, #fff6cf, var(--p-ball) 60%); box-shadow: 0 0 0 2px var(--p-ball-edge), 0 4px 14px rgba(0, 0, 0, 0.35); pointer-events: none; z-index: 2; }
+.potato-ball[data-dropped="true"] { filter: grayscale(0.7); opacity: 0.8; }
+
+.potato-side { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.potato-side .card p { font-size: 15px; overflow-wrap: anywhere; }
+.potato-side .card .muted, .potato-records .muted { color: var(--muted); }
+.potato-drop { border-color: var(--refused); }
+.potato-drop h2 { color: var(--refused); }
+.potato-drop .headline { font-size: 17px; font-weight: 600; }
+.potato-drop .next { font-family: var(--mono); }
+.potato-pace .hold { font: 600 28px var(--mono); color: var(--fcvm); }
+.potato-pace .where { font-family: var(--mono); }
+.potato-pace .pace { color: var(--fcvm); }
+.potato-pace .meter { position: relative; height: 14px; border-radius: 7px; background: var(--p-track); overflow: visible; }
+.potato-pace .meter .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 7px; background: var(--fcvm); }
+.potato-pace .meter.short .fill { background: var(--p-short); }
+.potato-pace .meter .need { position: absolute; top: -4px; bottom: -4px; width: 3px; margin-left: -1px; background: var(--text); border-radius: 2px; }
+
+.potato-ladder table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 14px; }
+.potato-ladder caption { caption-side: top; text-align: left; font-size: 14px; color: var(--muted); padding-bottom: 6px; }
+.potato-ladder th, .potato-ladder td { text-align: left; vertical-align: top; padding: 6px 6px; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+/* Column heads wrap between words only. */
+.potato-ladder thead th { font-weight: 600; color: var(--muted); border-top: 0; overflow-wrap: normal; }
+.potato-ladder th:first-child { width: 16%; }
+.potato-ladder th:nth-child(2) { width: 24%; }
+.potato-ladder th:last-child { width: 21%; }
+.potato-ladder tbody th { font-family: var(--mono); }
+.potato-ladder td:nth-child(2) { font-family: var(--mono); }
+.potato-ladder tr[aria-current="true"] { background: var(--p-current); }
+.potato-ladder tr[aria-current="true"] th { color: var(--fcvm); }
+.potato-ladder tr[data-skipped] { color: var(--muted); }
+
+.potato-records dl { display: flex; flex-direction: column; gap: 8px; margin: 0; font-size: 15px; }
+.potato-records dt { color: var(--muted); }
+.potato-records dd { margin: 0; }
+.potato-records .v { font: 600 17px var(--mono); }
+
+@media (max-width: 900px) {
+  .potato-body { grid-template-columns: minmax(0, 1fr); }
+  .potato-ring-wrap { position: static; }
+  .potato-stage { height: min(100vw - 32px, 560px); min-height: 280px; }
+}
+@media (max-width: 700px) {
+  .potato-page { padding: 0 16px 24px; }
+  .potato-page .brand h1 { font-size: 20px; }
+  .potato-action { max-width: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .potato-tile { transition: none; }
+}

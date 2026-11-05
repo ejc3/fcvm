@@ -18,6 +18,7 @@ import type { MockRenderers } from "./renderer.ts";
 import type { PatternScene } from "./pattern.ts";
 import { mockLayout } from "./layout.ts";
 import { MockPhones, type MockPhonesOptions } from "./phones.ts";
+import { MockPotato, type MockPotatoOptions } from "./potato.ts";
 
 export interface CoordinatorOptions {
   port: number;
@@ -57,6 +58,8 @@ export interface CoordinatorOptions {
   refusedWords: string[];
   /** Phones (phones mode): none unless set. */
   phones?: MockPhonesOptions;
+  /** A host running potato players (potato mode): none unless set. */
+  potato?: MockPotatoOptions;
   /** Delay of the fake text check. */
   checkMs: number;
   epochUnixMs: number;
@@ -305,6 +308,7 @@ export class MockCoordinator {
   /** Races already added to the scoreboard. */
   private recorded = new WeakSet<Race>();
   private phones: MockPhones | null = null;
+  private potato: MockPotato | null = null;
 
   constructor(opts: CoordinatorOptions) {
     this.opts = opts;
@@ -329,6 +333,9 @@ export class MockCoordinator {
         },
         start,
       );
+    }
+    if (opts.potato && opts.potato.players > 0) {
+      this.potato = new MockPotato(opts.potato, { now: () => this.now(), later: (ms, fn) => this.later(ms, fn), markDirty: () => this.markDirty() });
     }
     this.nextRaceAt = opts.raceEverySecs > 0 ? start + opts.firstRaceSecs * 1000 : null;
     this.nudge = { holding: "planet", nextHoldAt: start + (opts.holdSecs + opts.travelSecs) * 1000, openedAt: start, votes: new Map() };
@@ -501,6 +508,7 @@ export class MockCoordinator {
         frame_url_v4: this.aggregateUp(a) ? this.opts.renderers.frameUrlV4(this.streamId(a.id)) : null,
       })),
       ...(this.phones ? { phones: this.phones.state() } : {}),
+      ...(this.potato ? { potato: this.potato.state() } : {}),
     };
   }
 
@@ -787,8 +795,10 @@ export class MockCoordinator {
         return this.committed(c, "claim camera");
       }
       default: {
-        const phone = this.phones?.apply<Receipt>(c.viewer, name, args, { refuse: (r) => this.refuse(c, r), committed: (s) => this.committed(c, s) });
-        return phone ?? this.refuse(c, `unknown intent "${name}"`);
+        const reply = { refuse: (r: string) => this.refuse(c, r), committed: (s: string) => this.committed(c, s) };
+        const phone = this.phones?.apply<Receipt>(c.viewer, name, args, reply);
+        const potato = phone ?? this.potato?.apply<Receipt>(c.viewer, name, reply);
+        return potato ?? this.refuse(c, `unknown intent "${name}"`);
       }
     }
   }
@@ -1521,6 +1531,17 @@ export class MockCoordinator {
           return { ok: true };
         });
         return;
+      case "/mock/potato":
+        body((b) => {
+          if (!this.potato) throw new Error("the mock runs no potato players (FLEET_MOCK_POTATO_PLAYERS)");
+          this.potato.reset({
+            ...(typeof b["size"] === "number" ? { size: b["size"] } : {}),
+            ...(typeof b["next_in_ms"] === "number" ? { next_in_ms: b["next_in_ms"] } : {}),
+            ...(typeof b["slow_wake_ms"] === "number" ? { slow_wake_ms: b["slow_wake_ms"] } : {}),
+          });
+          return { ok: true };
+        });
+        return;
       case "/mock/fault":
         body((b) => {
           if (typeof b["skew"] === "number" && typeof b["tile"] === "string") this.opts.renderers.setSkew(b["tile"], b["skew"]);
@@ -1652,6 +1673,7 @@ export class MockCoordinator {
     for (const t of this.timers) clearTimeout(t);
     for (const r of this.tiles) if (r.timer) clearTimeout(r.timer);
     this.phones?.close();
+    this.potato?.close();
     for (const c of this.clients) c.ws.terminate();
     this.wss.close();
     await new Promise<void>((r) => this.server.close(() => r()));
