@@ -1,0 +1,57 @@
+{
+  "artifact_monotonic_ns": 60777430279814,
+  "included_in_analysis": false,
+  "kind": "host-control-warmup",
+  "latency_ms": 183.020291,
+  "result": {
+    "cdp_host": "127.0.0.1:45871",
+    "format": "jpeg",
+    "height": 657,
+    "idle_timeout": 0,
+    "image_bytes": 17397,
+    "image_sha256": "ced3f543549e0925fdd7e594d00bfcaea764f50c367afb0dbd48550427d85e52",
+    "nav": {
+      "connect_ms": 8.0,
+      "dns_ms": 0.0,
+      "dom_content_loaded_end_ms": 19.200000002980232,
+      "dom_interactive_ms": 19.200000002980232,
+      "load_event_start_ms": 19.5,
+      "load_ms": 19.5,
+      "resp_ms": 0.29999999701976776,
+      "response_end_ms": 10.600000001490116,
+      "tls_ms": 8.0,
+      "ttfb_ms": 0.30000000447034836
+    },
+    "ok": true,
+    "quality": 80,
+    "resolve_attempts": 1,
+    "resolve_polls": [
+      {
+        "outcome": "page",
+        "t_ms": 68.51699599792482
+      }
+    ],
+    "stages": {
+      "connect_total_ms": 89.38773300178582,
+      "decode_ms": 0.06569200195372105,
+      "enable_ms": 13.838589999068063,
+      "idle_ms": 0.0005530018825083971,
+      "nav_timing_ms": 0.7505550020141527,
+      "navigate_command_ms": 22.28735100652557,
+      "navigate_load_event_ms": 10.319802000594791,
+      "navigate_ms": 32.60867900098674,
+      "resolve_ms": 68.52299599995604,
+      "screenshot_ms": 44.26585499459179,
+      "tcp_ms": 0.07042300421744585,
+      "total_ms": 167.1059360014624,
+      "upgrade_ms": 6.905428002937697
+    },
+    "target_id": "15E9DC2B57CE25C9A4C35FC38DA7F3B5",
+    "target_prewired": false,
+    "url": "https://example.com/",
+    "width": 1280,
+    "ws_url": "ws://127.0.0.1:45871/devtools/page/15E9DC2B57CE25C9A4C35FC38DA7F3B5"
+  },
+  "schema": "fcvm.chromium.reqscale.record.v2",
+  "started_monotonic_ns": 60777247259523
+}

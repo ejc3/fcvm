@@ -1,0 +1,786 @@
+{
+  "analysis_seed": 186944997,
+  "bootstrap_draws": 10000,
+  "capacity": {
+    "by_backend": {
+      "file": {
+        "all_declared_rates": [
+          {
+            "passed": true,
+            "target_rps": 1.4
+          },
+          {
+            "passed": true,
+            "target_rps": 2.8
+          },
+          {
+            "passed": false,
+            "target_rps": 4.2
+          }
+        ],
+        "highest_contiguous_passing_rate_per_second": 2.8
+      },
+      "uffd": {
+        "all_declared_rates": [
+          {
+            "passed": true,
+            "target_rps": 1.4
+          },
+          {
+            "passed": true,
+            "target_rps": 2.8
+          },
+          {
+            "passed": false,
+            "target_rps": 4.2
+          }
+        ],
+        "highest_contiguous_passing_rate_per_second": 2.8
+      }
+    },
+    "joint_highest_contiguous_passing_rate_per_second": 2.8
+  },
+  "cells": [
+    {
+      "artifact_latency_p95_ms": {
+        "ci95_high": 2427.7478070000006,
+        "ci95_low": 2345.166059,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 2386.3716108,
+        "seed": 186944999,
+        "unit": "burst"
+      },
+      "backend": "file",
+      "burst_verdicts": [
+        {
+          "burst_id": "b0014-r1p4",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 0
+        },
+        {
+          "burst_id": "b0012-r1p4",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 1
+        },
+        {
+          "burst_id": "b0006-r1p4",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 2
+        },
+        {
+          "burst_id": "b0008-r1p4",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 3
+        },
+        {
+          "burst_id": "b0004-r1p4",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 4
+        }
+      ],
+      "cell_id": "file:r1.4",
+      "departure_rps": {
+        "ci95_high": 1.3833333333333333,
+        "ci95_low": 1.3833333333333333,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 1.3833333333333333,
+        "seed": 186944998,
+        "unit": "burst"
+      },
+      "drain_latency_p95_ms": {
+        "ci95_high": 174.891598,
+        "ci95_low": 158.324936,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 167.7857034,
+        "seed": 186945000,
+        "unit": "burst"
+      },
+      "firecracker_process_major_faults_per_request_ready_to_artifact": {
+        "ci95_high": 0.05952380952380952,
+        "ci95_low": 0.03333333333333333,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 0.047619047619047616,
+        "seed": 186945003,
+        "unit": "burst"
+      },
+      "firecracker_process_minor_faults_per_request_ready_to_artifact": {
+        "ci95_high": 47178.44761904761,
+        "ci95_low": 46905.252380952385,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 47049.66904761905,
+        "seed": 186945002,
+        "unit": "burst"
+      },
+      "independent_bursts": 5,
+      "offered_rps": {
+        "ci95_high": 1.4,
+        "ci95_low": 1.4,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 1.4,
+        "seed": 186944997,
+        "unit": "burst"
+      },
+      "passed": true,
+      "planned_scored_requests_per_burst": 84,
+      "planned_scored_requests_total": 420,
+      "rate_failed": false,
+      "rate_failure": null,
+      "score_end_backlog": {
+        "ci95_high": 1.0,
+        "ci95_low": 1.0,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 1.0,
+        "seed": 186945001,
+        "unit": "burst"
+      },
+      "target_rps": 1.4,
+      "warmup_bursts": 1
+    },
+    {
+      "artifact_latency_p95_ms": {
+        "ci95_high": 2892.2143475999997,
+        "ci95_low": 2666.7162708,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 2776.162165,
+        "seed": 186945099,
+        "unit": "burst"
+      },
+      "backend": "uffd",
+      "burst_verdicts": [
+        {
+          "burst_id": "b0014-r1p4",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 0
+        },
+        {
+          "burst_id": "b0012-r1p4",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 1
+        },
+        {
+          "burst_id": "b0006-r1p4",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 2
+        },
+        {
+          "burst_id": "b0008-r1p4",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 3
+        },
+        {
+          "burst_id": "b0004-r1p4",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 4
+        }
+      ],
+      "cell_id": "uffd:r1.4",
+      "departure_rps": {
+        "ci95_high": 1.3833333333333333,
+        "ci95_low": 1.3833333333333333,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 1.3833333333333333,
+        "seed": 186945098,
+        "unit": "burst"
+      },
+      "drain_latency_p95_ms": {
+        "ci95_high": 175.051693,
+        "ci95_low": 159.4436002,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 167.3912042,
+        "seed": 186945100,
+        "unit": "burst"
+      },
+      "firecracker_process_major_faults_per_request_ready_to_artifact": {
+        "ci95_high": 1240.5142857142857,
+        "ci95_low": 1019.6238095238095,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 1125.8357142857142,
+        "seed": 186945103,
+        "unit": "burst"
+      },
+      "firecracker_process_minor_faults_per_request_ready_to_artifact": {
+        "ci95_high": 38293.70476190476,
+        "ci95_low": 37753.461904761905,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 38056.4880952381,
+        "seed": 186945102,
+        "unit": "burst"
+      },
+      "independent_bursts": 5,
+      "offered_rps": {
+        "ci95_high": 1.4,
+        "ci95_low": 1.4,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 1.4,
+        "seed": 186945097,
+        "unit": "burst"
+      },
+      "passed": true,
+      "planned_scored_requests_per_burst": 84,
+      "planned_scored_requests_total": 420,
+      "rate_failed": false,
+      "rate_failure": null,
+      "score_end_backlog": {
+        "ci95_high": 1.0,
+        "ci95_low": 1.0,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 1.0,
+        "seed": 186945101,
+        "unit": "burst"
+      },
+      "target_rps": 1.4,
+      "warmup_bursts": 1
+    },
+    {
+      "artifact_latency_p95_ms": {
+        "ci95_high": 2941.1435664,
+        "ci95_low": 2730.2138092,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 2826.2958282,
+        "seed": 186945199,
+        "unit": "burst"
+      },
+      "backend": "file",
+      "burst_verdicts": [
+        {
+          "burst_id": "b0016-r2p8",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 0
+        },
+        {
+          "burst_id": "b0010-r2p8",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 1
+        },
+        {
+          "burst_id": "b0015-r2p8",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 2
+        },
+        {
+          "burst_id": "b0011-r2p8",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 3
+        },
+        {
+          "burst_id": "b0003-r2p8",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 4
+        }
+      ],
+      "cell_id": "file:r2.8",
+      "departure_rps": {
+        "ci95_high": 2.7766666666666664,
+        "ci95_low": 2.7666666666666666,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 2.77,
+        "seed": 186945198,
+        "unit": "burst"
+      },
+      "drain_latency_p95_ms": {
+        "ci95_high": 195.73468440000002,
+        "ci95_low": 192.0756498,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 193.6700208,
+        "seed": 186945200,
+        "unit": "burst"
+      },
+      "firecracker_process_major_faults_per_request_ready_to_artifact": {
+        "ci95_high": 0.06785714285714287,
+        "ci95_low": 0.041666666666666664,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 0.05476190476190476,
+        "seed": 186945203,
+        "unit": "burst"
+      },
+      "firecracker_process_minor_faults_per_request_ready_to_artifact": {
+        "ci95_high": 47998.94404761904,
+        "ci95_low": 47653.66666666667,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 47834.24642857143,
+        "seed": 186945202,
+        "unit": "burst"
+      },
+      "independent_bursts": 5,
+      "offered_rps": {
+        "ci95_high": 2.8,
+        "ci95_low": 2.8,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 2.8,
+        "seed": 186945197,
+        "unit": "burst"
+      },
+      "passed": true,
+      "planned_scored_requests_per_burst": 168,
+      "planned_scored_requests_total": 840,
+      "rate_failed": false,
+      "rate_failure": null,
+      "score_end_backlog": {
+        "ci95_high": 2.0,
+        "ci95_low": 1.4,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 1.8,
+        "seed": 186945201,
+        "unit": "burst"
+      },
+      "target_rps": 2.8,
+      "warmup_bursts": 1
+    },
+    {
+      "artifact_latency_p95_ms": {
+        "ci95_high": 3256.9650054,
+        "ci95_low": 3147.3537528,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 3202.4754724,
+        "seed": 186945299,
+        "unit": "burst"
+      },
+      "backend": "uffd",
+      "burst_verdicts": [
+        {
+          "burst_id": "b0016-r2p8",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 0
+        },
+        {
+          "burst_id": "b0010-r2p8",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 1
+        },
+        {
+          "burst_id": "b0015-r2p8",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 2
+        },
+        {
+          "burst_id": "b0011-r2p8",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 3
+        },
+        {
+          "burst_id": "b0003-r2p8",
+          "gates": {
+            "backlog": true,
+            "departure": true,
+            "lag": true,
+            "offered": true,
+            "zero_failure": true
+          },
+          "offered_rps_error_pct": 0.0,
+          "passed": true,
+          "repeat": 4
+        }
+      ],
+      "cell_id": "uffd:r2.8",
+      "departure_rps": {
+        "ci95_high": 2.7666666666666666,
+        "ci95_low": 2.7666666666666666,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 2.7666666666666666,
+        "seed": 186945298,
+        "unit": "burst"
+      },
+      "drain_latency_p95_ms": {
+        "ci95_high": 189.3283322,
+        "ci95_low": 179.61041419999998,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 184.5701694,
+        "seed": 186945300,
+        "unit": "burst"
+      },
+      "firecracker_process_major_faults_per_request_ready_to_artifact": {
+        "ci95_high": 795.6154761904762,
+        "ci95_low": 770.0238095238095,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 779.547619047619,
+        "seed": 186945303,
+        "unit": "burst"
+      },
+      "firecracker_process_minor_faults_per_request_ready_to_artifact": {
+        "ci95_high": 38619.36190476191,
+        "ci95_low": 38520.51190476191,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 38563.17261904762,
+        "seed": 186945302,
+        "unit": "burst"
+      },
+      "independent_bursts": 5,
+      "offered_rps": {
+        "ci95_high": 2.8,
+        "ci95_low": 2.8,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 2.8,
+        "seed": 186945297,
+        "unit": "burst"
+      },
+      "passed": true,
+      "planned_scored_requests_per_burst": 168,
+      "planned_scored_requests_total": 840,
+      "rate_failed": false,
+      "rate_failure": null,
+      "score_end_backlog": {
+        "ci95_high": 2.0,
+        "ci95_low": 2.0,
+        "draws": 10000,
+        "method": "seeded percentile bootstrap of the burst mean",
+        "n": 5,
+        "point": 2.0,
+        "seed": 186945301,
+        "unit": "burst"
+      },
+      "target_rps": 2.8,
+      "warmup_bursts": 1
+    },
+    {
+      "artifact_latency_p95_ms": null,
+      "backend": "file",
+      "burst_verdicts": null,
+      "cell_id": "file:r4.2",
+      "departure_rps": null,
+      "drain_latency_p95_ms": null,
+      "firecracker_process_major_faults_per_request_ready_to_artifact": null,
+      "firecracker_process_minor_faults_per_request_ready_to_artifact": null,
+      "independent_bursts": 5,
+      "offered_rps": null,
+      "passed": false,
+      "planned_scored_requests_per_burst": 252,
+      "planned_scored_requests_total": 1260,
+      "rate_failed": true,
+      "rate_failure": {
+        "bursts": [
+          {
+            "artifact_missing": 0,
+            "burst_id": "b0007-r4p2",
+            "cleanup_unconfirmed": 0,
+            "failed": 1,
+            "population": "scored",
+            "undrained": 0
+          }
+        ],
+        "scored_artifact_missing": 0,
+        "scored_cleanup_unconfirmed": 0,
+        "scored_failed": 0
+      },
+      "score_end_backlog": null,
+      "target_rps": 4.2,
+      "warmup_bursts": 1
+    },
+    {
+      "artifact_latency_p95_ms": null,
+      "backend": "uffd",
+      "burst_verdicts": null,
+      "cell_id": "uffd:r4.2",
+      "departure_rps": null,
+      "drain_latency_p95_ms": null,
+      "firecracker_process_major_faults_per_request_ready_to_artifact": null,
+      "firecracker_process_minor_faults_per_request_ready_to_artifact": null,
+      "independent_bursts": 5,
+      "offered_rps": null,
+      "passed": false,
+      "planned_scored_requests_per_burst": 252,
+      "planned_scored_requests_total": 1260,
+      "rate_failed": true,
+      "rate_failure": {
+        "bursts": [
+          {
+            "artifact_missing": 0,
+            "burst_id": "b0007-r4p2",
+            "cleanup_unconfirmed": 0,
+            "failed": 1,
+            "population": "scored",
+            "undrained": 0
+          }
+        ],
+        "scored_artifact_missing": 0,
+        "scored_cleanup_unconfirmed": 0,
+        "scored_failed": 1
+      },
+      "score_end_backlog": null,
+      "target_rps": 4.2,
+      "warmup_bursts": 1
+    }
+  ],
+  "control_gate": {
+    "absolute_limit_pct": 15.0,
+    "drift_pct": 3.6207191286550278,
+    "first_half_median_ms": 67.658714,
+    "n": 139,
+    "passed": true,
+    "second_half_median_ms": 70.108446
+  },
+  "corpus": [
+    "https://example.com/",
+    "https://news.ycombinator.com/",
+    "https://developers.cloudflare.com/",
+    "https://blog.cloudflare.com/",
+    "https://en.wikipedia.org/",
+    "https://developer.mozilla.org/en-US/",
+    "https://www.elmundo.es/",
+    "https://www.rtp.pt/noticias/",
+    "https://www.theguardian.com/international",
+    "https://todomvc.com/examples/javascript-es6/dist/",
+    "https://todomvc.com/examples/react/dist/index.html",
+    "https://todomvc.com/examples/vue/dist/",
+    "https://todomvc.com/examples/angular/dist/browser/",
+    "https://todomvc.com/examples/preact/dist/"
+  ],
+  "criteria": {
+    "max_control_median_drift_pct": 15.0,
+    "max_offered_rps_error_pct": 2.0,
+    "max_p95_launch_lag_ms": 50.0,
+    "max_score_end_backlog": 128,
+    "min_departure_ratio": 0.95,
+    "require_zero_failures": true
+  },
+  "experimental_unit": "burst",
+  "failed_rates": [
+    4.2
+  ],
+  "fault_metric_scope": "Firecracker process endpoint-ready through artifact return; includes all Firecracker VMAs and is not a guest-RAM-VMA or UFFD-event count",
+  "host_sample_gate": {
+    "interval_ns": 5000000000,
+    "passed": true,
+    "periodic_samples": 278,
+    "samples": 279,
+    "terminal_sample": true
+  },
+  "provenance": {
+    "chromium_version": "Chromium 151.0.7922.34",
+    "cpu_count": 192,
+    "cpu_model": "Neoverse-V2",
+    "fcvm_sha256": "1c2e5542cf6d4724b856d869178cf56f6e0bfb85966436e2548836026953cbf5",
+    "fcvm_version": "fcvm 0.1.0",
+    "hostinfo": "provenance.json",
+    "instance_type": "c8g.metal-48xl",
+    "kernel": "7.0.0-1013-aws",
+    "machine": "aarch64",
+    "runtime_bundle_sha256": "8d0bb4ac4af241d6f3e6699b844c23362b8ae3228b205442391e4a974d3bfb39",
+    "source_dirty": false,
+    "source_revision": "4065761343c3a4a5ffe1de4e170f63e3dedae11b"
+  },
+  "publication_blocked_by": null,
+  "publishable": true,
+  "run_id": "d07cf4a782e44a87b0c7dfbdb2166deb",
+  "schedule": {
+    "ramp_seconds": 15.0,
+    "score_seconds": 60.0,
+    "scored_bursts": 5,
+    "seed": 20261104,
+    "warmup_bursts": 1
+  },
+  "schema": "fcvm.chromium.reqscale.analysis.v2",
+  "snapshot_generation_id": "c0aa5616-686f-436c-a67d-d019263b0c67",
+  "trace_perturbation_gate": {
+    "enabled": false
+  },
+  "uffd": {
+    "mode": "minor",
+    "prefetch": "on"
+  }
+}

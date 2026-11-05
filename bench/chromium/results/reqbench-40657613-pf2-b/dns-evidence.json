@@ -1,0 +1,30 @@
+{
+  "run_id": "7e2a8fd4c7c54ce3a9a9d149c1f82f6a",
+  "serve_pid": 1205640,
+  "dnsmasq_was_active_before": false,
+  "dnsmasq_active_after_restore": false,
+  "dnsmasq_state_after_restore": "inactive",
+  "sampler_alive_at_stop": true,
+  "samples": 144,
+  "sample_interval_s": 10,
+  "owner_log": "dns-owner.log",
+  "load_max_1min": 3.95,
+  "load_samples": 144,
+  "first_mismatch": null,
+  "verify_files": [
+    "verify-dns-pre.json",
+    "verify-dns-before-run.json",
+    "verify-dns-after-run.json"
+  ],
+  "verify_file_sha256": {
+    "verify-dns-pre.json": "d32e95e58ef530f0c4b6468e730f531dcab0b2d82cfe21aa49a22adab2a94de3",
+    "verify-dns-before-run.json": "fdf7a252aaf765243db4ab42c1a65c563d8f540666f01ebddacfee1c1f433cf3",
+    "verify-dns-after-run.json": "58144f476accf124b09d164c5372553ae714895956b7a68530206974a46820f6"
+  },
+  "corpus_dns_log_sha256": "6d07704a43b46d20a9893c69cca5e1610b7cae891f50ff6ace1ad82596c67df5",
+  "replay_queries_log_sha256": "7feb20b045f25019c0c5dd43619294c903e1a65640d6e465f6939eb5eacf7779",
+  "corpus_access_log_sha256": "4d4588447b70c4585865d50c3250862feb5dfb0690c6327f61790fcbb9f055b8",
+  "corpus_serve_exit_status": 0,
+  "reason": null,
+  "verdict": "clean"
+}

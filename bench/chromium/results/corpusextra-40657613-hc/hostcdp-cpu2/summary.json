@@ -1,0 +1,111 @@
+{
+ "n": 202,
+ "p50_ms": 228.4,
+ "p95_ms": 1954.0,
+ "mean_ms": 393.8,
+ "failures": 0,
+ "p50_convention": "statistics.median",
+ "loadavg1_measured": {
+  "n": 202,
+  "min": 1.26,
+  "median": 1.57,
+  "max": 2.22
+ },
+ "per_url": {
+  "https://example.com/": {
+   "n": 15,
+   "p50_ms": 81.6,
+   "p95_ms": 82.2,
+   "mean_ms": 81.7
+  },
+  "https://news.ycombinator.com/": {
+   "n": 15,
+   "p50_ms": 120.2,
+   "p95_ms": 120.4,
+   "mean_ms": 119.0
+  },
+  "https://developers.cloudflare.com/": {
+   "n": 15,
+   "p50_ms": 235.6,
+   "p95_ms": 269.1,
+   "mean_ms": 244.5
+  },
+  "https://blog.cloudflare.com/": {
+   "n": 15,
+   "p50_ms": 229.6,
+   "p95_ms": 245.8,
+   "mean_ms": 236.0
+  },
+  "https://en.wikipedia.org/": {
+   "n": 15,
+   "p50_ms": 244.7,
+   "p95_ms": 260.7,
+   "mean_ms": 244.5
+  },
+  "https://developer.mozilla.org/en-US/": {
+   "n": 15,
+   "p50_ms": 263.4,
+   "p95_ms": 272.6,
+   "mean_ms": 262.4
+  },
+  "https://www.elmundo.es/": {
+   "n": 14,
+   "p50_ms": 1983.2,
+   "p95_ms": 2077.2,
+   "mean_ms": 1982.0
+  },
+  "https://www.rtp.pt/noticias/": {
+   "n": 14,
+   "p50_ms": 1389.4,
+   "p95_ms": 1425.3,
+   "mean_ms": 1389.2
+  },
+  "https://www.theguardian.com/international": {
+   "n": 14,
+   "p50_ms": 546.5,
+   "p95_ms": 596.8,
+   "mean_ms": 541.5
+  },
+  "https://todomvc.com/examples/javascript-es6/dist/": {
+   "n": 14,
+   "p50_ms": 105.7,
+   "p95_ms": 129.1,
+   "mean_ms": 104.9
+  },
+  "https://todomvc.com/examples/react/dist/index.html": {
+   "n": 14,
+   "p50_ms": 83.0,
+   "p95_ms": 99.8,
+   "mean_ms": 87.8
+  },
+  "https://todomvc.com/examples/vue/dist/": {
+   "n": 14,
+   "p50_ms": 82.6,
+   "p95_ms": 99.4,
+   "mean_ms": 87.3
+  },
+  "https://todomvc.com/examples/angular/dist/browser/": {
+   "n": 14,
+   "p50_ms": 134.3,
+   "p95_ms": 135.1,
+   "mean_ms": 134.5
+  },
+  "https://todomvc.com/examples/preact/dist/": {
+   "n": 14,
+   "p50_ms": 81.8,
+   "p95_ms": 82.1,
+   "mean_ms": 81.8
+  }
+ },
+ "container_cpu_ms": {
+  "window_p50_ms": 418.9,
+  "window_mean_ms": 708.3,
+  "run_average_ms": {
+   "mean": 708.6,
+   "lo": 575.4,
+   "hi": 848.6,
+   "n": 202
+  },
+  "n": 202
+ }
+}
