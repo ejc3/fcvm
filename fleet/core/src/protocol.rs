@@ -272,7 +272,12 @@ pub enum AgentMsg {
         /// nothing else but `reboot_phone`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         phone_actions: Vec<String>,
+        /// The most potato players the host runs (potato mode); 0 runs none.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        potato_players: u32,
     },
+    /// Potato mode: something that happened to one of the host's players.
+    Potato(crate::potato::PotatoEvent),
     Slot(SlotReport),
     Health(HealthReport),
     /// The host got a spot interruption notice (or is otherwise going away).
@@ -444,6 +449,14 @@ pub enum CoordMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         report: Option<String>,
     },
+    /// Potato mode: the round the host's players play, or none.
+    Potato {
+        round: Option<crate::potato::PotatoRound>,
+    },
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// The body of a renderer's `POST /budget`.

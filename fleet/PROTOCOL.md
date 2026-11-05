@@ -983,6 +983,27 @@ A replay of a report whose quarantine an operator released (the coordinator keep
 released report per GPU in its state) is acknowledged and changes nothing; a new report for
 the same GPU quarantines it again.
 
+```json
+{"type": "potato", "at": 1762317009100, "player": 2, "kind": "caught", "round": 8, "seq": 6, "colour": 5, "counter": 31, "chain": "<64 hex>"}
+```
+
+Potato mode (`--potato-players N`, which the hello reports as `potato_players`): one thing
+that happened to player `player`, at `at` on the host's clock. `kind` is one of:
+
+| kind | fields | when |
+|------|--------|------|
+| `hello` | `colour`, `counter`, `chain`, `colours`, `connections`, `last_round`, `last_seq` | the player opened a report connection: once when new (`connections` 1, `counter` 0), and once after each wake. `last_round`/`last_seq` name its last catch |
+| `caught` | `round`, `seq`, `colour`, `counter`, `chain` | it caught the ball |
+| `threw` | `round`, `seq` (the ball's new seq), `to`, `attempts`, `wait_ms`, `send_ms` | the next player accepted the ball |
+| `dropped` | `round`, `seq`, `to`, `attempts`, `reason`, `catcher_phase`, `catcher_phase_ms` | nothing accepted the ball within its flight window; `catcher_phase` is what the agent was doing with `to` |
+| `slept` | `sleep_ms`, `stages` (`prepare_ms`, `pause_ms`, `save_ms`, `disk_ms`, `stop_ms`), `written_mib` | its snapshot is written and its fcvm has exited |
+| `waking` | | its restore started |
+| `woke` | `wake_ms`, `stages` (`restore_ms`, `ack_ms`, `listen_ms`) | its ball port accepts again |
+| `listening` | `round`, `seq`, `after_ms` | the catcher of a dropped ball accepted, `after_ms` after the drop |
+| `failed` | `stage` (`boot`, `sleep`, `wake`, `kickoff`), `error` | a step failed |
+
+The ball itself is never reported: the players throw it to each other.
+
 ### Coordinator to agent
 
 ```json
@@ -1120,6 +1141,18 @@ host's connection at the time; a host that reconnected first replays the report 
 answered on the new connection. With no store configured it is sent on the next tick. A
 release by the operator before the write still gets it: the stored state then holds the
 release, and the report must no longer be replayed.
+
+```json
+{"type": "potato", "round": {"round": 8, "ring": [0, 1, 2, 3], "hold_ms": 666, "shrink_permille": 100,
+ "min_hold_ms": 2, "flight_ms": 100, "colours": 12, "pace_ms": null}}
+```
+
+Potato mode, to the potato host only: the round its players play, or `{"round": null}`. The
+agent reconciles to it as to an assignment. A round it has not played starts: it boots any
+player it does not have from its player snapshot, wakes the players within reach of the ball,
+and throws the first ball to `ring[0]` once that player accepts; a round it no longer gets
+ends, and every awake player sleeps, so a ball still in the air drops. A new `pace_ms` in the
+same round goes to the awake players, whose next throws hold no longer than it.
 
 ### Grid budget
 

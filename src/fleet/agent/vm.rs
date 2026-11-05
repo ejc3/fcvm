@@ -412,15 +412,20 @@ pub struct Vm {
 
 impl Vm {
     pub fn spawn(spec: &VmSpec, slot: &str) -> Result<Vm> {
-        let mut cmd = Command::new(&spec.fcvm);
-        cmd.args(spec.args())
+        Self::spawn_args(&spec.fcvm, &spec.args(), slot)
+    }
+
+    /// `fcvm <args>` as a supervised VM process, `slot` naming it in the logs.
+    pub fn spawn_args(fcvm: &std::path::Path, args: &[String], slot: &str) -> Result<Vm> {
+        let mut cmd = Command::new(fcvm);
+        cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         arm_pdeathsig(cmd.as_std_mut());
         let mut child = cmd
             .spawn()
-            .with_context(|| format!("starting {}", spec.fcvm.display()))?;
+            .with_context(|| format!("starting {}", fcvm.display()))?;
         let pid = child.id().context("fcvm exited before its pid was read")?;
         let (tx, restored) = watch::channel(None);
         let tail = Arc::new(Mutex::new(VecDeque::new()));

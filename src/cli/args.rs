@@ -595,6 +595,20 @@ pub struct FleetAgentArgs {
     #[arg(long, default_value = "/sys", hide = true)]
     pub sysfs_root: std::path::PathBuf,
 
+    /// Potato mode: run up to N CPU-only player VMs (fleet/potato; docs/fleet/ARCHITECTURE.md,
+    /// "Potato mode"). Needs the host's IPv6 prefix (--ipv6-prefix or --ipv6-prefix-from-imds):
+    /// every player has its own address in it.
+    #[arg(long, default_value_t = 0)]
+    pub potato_players: u32,
+
+    /// The potato player image (`make potato-image`)
+    #[arg(long, default_value = "localhost/fcvm-potato:fleet")]
+    pub potato_image: String,
+
+    /// Memory of each potato player VM, in MiB
+    #[arg(long, default_value_t = 256)]
+    pub potato_mem: u32,
+
     /// Phones mode: run Android phones on the last N GPUs of the inventory instead of
     /// renderers (needs --phone-image, --phone-aosp, --phone-emulator and --phone-apk)
     #[arg(long, default_value_t = 0, requires_all = ["phone_image", "phone_aosp", "phone_emulator", "phone_apk"])]
