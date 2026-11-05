@@ -21,15 +21,19 @@ under "For you" in the report.
   instance ids, profile names, ports, emails) in anything you write to GitHub. Scan every diff and every comment before
   posting.
 - **ejc3/aws and ejc3/agents-md:** open PRs and issues only. Never merge, push to main, resolve threads or apply.
-- **Merging fcvm** (CLAUDE.md "PR flow" and the owner's merge rule): a Codex review of the head, every thread resolved,
-  then `gh pr merge N --merge` without waiting for CI. When the Codex bot is out of quota or stalls for more than 10
+- **Merging fcvm** (CLAUDE.md "PR flow" and the owner's merge rule, which overrides any text asking for green CI
+  before a merge): a Codex review of the head, every thread resolved, then `gh pr merge N --merge` without waiting for
+  CI. When the Codex bot is out of quota or stalls for more than 10
   minutes, run `codex exec -s read-only` on the exact range, and record the range, the command and the findings on the PR. If main goes red after
   your merge, fix it forward before anything else.
 - **A defect claim is closed by a test that fails without the fix** (CLAUDE.md). An issue closes only with a merged
   fix, or with evidence from current main (command, output, the commit that fixed it) that it no longer reproduces.
   Never close one by relabelling it.
 - **Machines.** Measure only on a pbox or gpubox you launched, never on this shared box. Carry each instance id, act
-  only on your own, and take each one down as soon as its results are copied back. Never touch the fleet's own hosts:
+  only on your own, and take each one down as soon as its results are copied back. The moment you launch one, append
+  a line to `$DOGFOOD_RUN_DIR/machines`: `pbox <slot> <instance id>`, or `ec2 <region> <instance id>` for a gpubox or
+  any other instance. run.sh takes down whatever is listed and still running when the session ends, so a timeout
+  cannot leave a box billing. Never touch the fleet's own hosts:
   file an ejc3/aws issue instead.
 - **Staging** (behind Cloudflare Access) deploys ship without asking. A public, ungated launch needs the owner.
 - **The Mac** (the drive-mac skill, reached as `~/.claude/local.md` says): take `mac-lease take NAME --ttl S --wait S`
@@ -49,8 +53,8 @@ under "For you" in the report.
 
 ## 0. Set up
 
-- The run folder is `/mnt/fcvm-btrfs/fcvm-dogfood/<YYYY-MM-DD>/` (Pacific date). Every screenshot, log and result goes
-  there.
+- The run folder is `$DOGFOOD_RUN_DIR` (run.sh sets it to `/mnt/fcvm-btrfs/fcvm-dogfood/<Pacific date>/<UTC start
+  time>/`; by hand, make one the same way). Every screenshot, log and result goes there.
 - Read last night's report: the latest comment on the open issue labelled `dogfood-report`, titled "Nightly dogfood".
   Create the label and the issue if they don't exist. Its "Verified through" line names the main commit to start from;
   if it is missing, start 24 hours back.
@@ -80,7 +84,7 @@ Run independent checks in parallel.
 | **fcvm CLI** (run, snapshot create, serve, clone, exec, publish) | A pbox (`pbox flavors`; `kvm-96` for `/dev/kvm`), `make build && make setup-fcvm`, then the PR's own flow by hand, rootless and bridged. | The behaviour the PR claims. Errors that are actionable. Nothing left running or mounted after teardown. |
 | **Restore speed** | The same pbox: `fleet/potato/bench/potatobench.py burst` at 4 and 8 concurrent wakes, interleaved with last night's verified commit (two builds, `FCVM_BIN`). | p50, p90 and p99 of wake time against last night. A slowdown over 5 percent at p50 or p99 is a bug, even with no PR claiming speed. |
 | **Chaos and lifecycle** | The same pbox: `make fuzz SEEDS=1,2,3,4,5,6,7,8 OPS=10` and the failpoint suites the PRs touched. | Any failure. A fuzz catch becomes a deterministic test (CLAUDE.md "A FUZZ CATCH IS A LEAD"). |
-| **Fleet staging**, wall, phones and potato | https://stage.fcvm.dev/ in its modes (`?mode=phones`, `?mode=potato`): Playwright on this box for a fresh-profile first visit (time to the first live state), and the owner's view on the Mac at 1728x996 under the lease. | The PR's change. Each tile's stride, budget and fit from `/health` in direct mode. Each take-over action's first visible change. Potato's record pace per ring size and every deadline drop. A first visit that stalls. Console errors. |
+| **Fleet staging**, wall, phones and potato | https://stage.fcvm.dev/ in its modes (`?mode=phones`, `?mode=potato`): Playwright with a fresh profile for the first visit: functional checks may run on this box, but the time to the first live state is measured only from a pbox. Then the owner's view on the Mac at 1728x996 under the lease. | The PR's change. Each tile's stride, budget and fit from `/health` in direct mode. Each take-over action's first visible change. Potato's record pace per ring size and every deadline drop. A first visit that stalls. Console errors. |
 | **GPU paths** (renderer, phones, mirror) when a PR touched them | A gpubox from the live host image (the gpubox tooling), `make phone-test` and the renderer's GPU tests, plus the potato check at 96 players when the agent or player changed. | Failures, and frame or wake times against the numbers in the PR. |
 | **Published reports** | https://ejc3.github.io/fcvm/ pages a PR touched: open them at phone and desktop widths, and run the report lints (`make test-chromium`). | Numbers matching their records, broken charts, the report rules above. |
 
