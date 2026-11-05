@@ -608,9 +608,9 @@ POTATO_IMAGE ?= localhost/fcvm-potato:dev
 potato-image: private SHELL := $(TARGET_LEASE_SHELL)
 potato-image: cargo-target-link
 	CARGO_TARGET_DIR=target $(CARGO) build --locked --release -p fleet-potato --target $(MUSL_TARGET)
-	rm -rf target/potato-image && mkdir -p target/potato-image
-	cp target/$(MUSL_TARGET)/release/potato fleet/potato/Containerfile target/potato-image/
-	podman build --squash-all -t $(POTATO_IMAGE) -f target/potato-image/Containerfile target/potato-image
+	ctx=$$(mktemp -d) && trap 'rm -rf "$$ctx"' EXIT && \
+	cp target/$(MUSL_TARGET)/release/potato fleet/potato/Containerfile "$$ctx/" && \
+	podman build --squash-all -t $(POTATO_IMAGE) -f "$$ctx/Containerfile" "$$ctx"
 
 build-fc-mock: private SHELL := $(TARGET_LEASE_SHELL)
 build-fc-mock: cargo-target-link
