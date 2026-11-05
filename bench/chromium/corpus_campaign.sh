@@ -164,6 +164,26 @@ mkdir -p "$LOGDIR"
 # Created here, not left to reqbench: the replay server's logs and the resolver
 # evidence below are written into it before any reqbench phase runs.
 mkdir -p "$RESULTS"
+# RESULTS belongs to one campaign at a time. The removal below clears what an
+# earlier campaign left, and a second campaign started on the same directory
+# while the first still runs would unlink the first one's active logs and
+# evidence before its own replay server failed to bind. So the campaign takes
+# $RESULTS/.campaign.lock exclusively, without waiting, before that removal,
+# and holds it until it exits; the kernel drops it with the process. The DNS
+# sampler drops its inherited copy (start_dns_sampler), so a sampler orphaned
+# by a SIGKILL cannot hold the directory. Sub-makes keep it: while one still
+# writes here, the directory is still in use.
+RESULTS_LOCK_FD=""
+acquire_results_lock() {
+    local lock="$RESULTS/.campaign.lock"
+    exec {RESULTS_LOCK_FD}>>"$lock" \
+        || { echo "BLOCKED: cannot open the results lock $lock" >&2; return 1; }
+    if ! flock -n "$RESULTS_LOCK_FD"; then
+        echo "BLOCKED: another campaign holds $lock and is writing to $RESULTS; pass a RESULTS of this campaign's own" >&2
+        return 1
+    fi
+}
+acquire_results_lock || exit 2
 # $RESULTS/diag is reqbench's diag phase's output directory, and its cmd_diag
 # owns it exclusively under $RESULTS/diag/.lock from before its first removal
 # to past the atomic rename that publishes its summary. The cleanup below
@@ -512,11 +532,12 @@ dns_owner_sampler() {
 start_dns_sampler() {
     : >"$RESULTS/dns-owner.log"
     SAMPLER_ALIVE_AT_STOP=""
-    # The sampler subshell drops the replay device lock it would inherit: a
-    # sampler left running by a campaign killed with SIGKILL must not keep the
-    # lock and block every later campaign.
+    # The sampler subshell drops the replay device lock and the results lock
+    # it would inherit: a sampler left running by a campaign killed with
+    # SIGKILL must not keep either and block every later campaign.
     (
         [ -z "${REPLAY_LOCK_FD:-}" ] || exec {REPLAY_LOCK_FD}>&-
+        [ -z "${RESULTS_LOCK_FD:-}" ] || exec {RESULTS_LOCK_FD}>&-
         dns_owner_sampler "$RESULTS/dns-owner.log"
     ) &
     SAMPLER_PID=$!

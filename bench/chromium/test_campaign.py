@@ -1350,9 +1350,9 @@ read -r _ < "$GO"
     class _DiagLockHolder:
         """Holds the diag output lock for the body of a `with` block."""
 
-        def __init__(self, test, results):
+        def __init__(self, test, results, lock=os.path.join("diag", ".lock")):
             self.test, self.results = test, results
-            self.lock = os.path.join(results, "diag", ".lock")
+            self.lock = os.path.join(results, lock)
 
         def __enter__(self):
             os.makedirs(os.path.dirname(self.lock), exist_ok=True)
@@ -1422,6 +1422,47 @@ read -r _ < "$GO"
             self.assertEqual(cleared.returncode, 0, cleared.stderr)
             self.assertFalse(os.path.exists(summary),
                              "the start left an earlier campaign's diag summary")
+
+    def test_a_second_campaign_on_the_same_results_refuses_at_start(self):
+        """RED BEFORE THE FIX (#1099): the only lock at start was the diag
+        lock, held around the removal alone, so a second campaign started on
+        an explicit RESULTS while the first still ran unlinked the first one's
+        evidence and active replay logs. The start now takes
+        $RESULTS/.campaign.lock without waiting, before the removal, and a
+        campaign that cannot have it refuses with everything left in place."""
+        live = ("dns-evidence.json", "corpus-dns.log", "corpus-access.log",
+                "replay-queries.log", "dns-owner.log", "reqbench.jsonl")
+        with tempfile.TemporaryDirectory() as tmp:
+            results = os.path.join(tmp, "results")
+            os.makedirs(results)
+            for name in live:
+                with open(os.path.join(results, name), "w") as handle:
+                    handle.write("the first campaign's\n")
+            with self._DiagLockHolder(self, results, lock=".campaign.lock") as holder:
+                blocked = self._run_start_cleanup(results, env={"DIAG_LOCK_WAIT": "1"})
+                self.assertEqual([n for n in live if not os.path.exists(os.path.join(results, n))], [],
+                                 "the second campaign removed the first one's evidence")
+                self.assertNotEqual(blocked.returncode, 0,
+                                    f"the second campaign started on a held RESULTS: {blocked.stdout}")
+                self.assertIn("another campaign", blocked.stderr, blocked.stderr)
+                holder.release()
+            cleared = self._run_start_cleanup(results, env={"DIAG_LOCK_WAIT": "1"})
+            self.assertEqual(cleared.returncode, 0, cleared.stderr)
+            self.assertEqual([n for n in live if os.path.exists(os.path.join(results, n))], [],
+                             "once the first campaign let go, the start left its evidence")
+
+    def test_the_results_lock_is_held_past_the_start(self):
+        """The results lock covers the whole campaign, not the removal alone:
+        after the start block a fresh open of it cannot be locked."""
+        with tempfile.TemporaryDirectory() as tmp:
+            results = os.path.join(tmp, "results")
+            os.makedirs(results)
+            done = self._run_start_cleanup(
+                results,
+                tail=f'\nif flock -x -n "{results}/.campaign.lock" -c true; '
+                     'then echo "held=no"; else echo "held=yes"; fi\n')
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertIn("held=yes", done.stdout, f"the start let the results lock go: {done.stdout}")
 
     def test_the_start_cleanup_releases_the_diag_lock(self):
         """The campaign's own diag phase takes this lock in a sub-make, from
@@ -2416,11 +2457,13 @@ class ReplayAddressByNetworkMode(unittest.TestCase):
                       f"SAMPLER_PID=\nSAMPLER_ALIVE_AT_STOP=\n{funcs}"
                       "reap_sampler() { [ -n \"$SAMPLER_PID\" ] || return 0; pkill -P $SAMPLER_PID; kill $SAMPLER_PID; } 2>/dev/null\n"
                       "trap reap_sampler EXIT\n"
-                      f"exec {{REPLAY_LOCK_FD}}>>'{lock}'\nflock -n $REPLAY_LOCK_FD\nstart_dns_sampler >/dev/null 2>&1\n"
+                      f"exec {{REPLAY_LOCK_FD}}>>'{lock}'\nflock -n $REPLAY_LOCK_FD\n"
+                      f"exec {{RESULTS_LOCK_FD}}>>'{results}/.campaign.lock'\nflock -n $RESULTS_LOCK_FD\n"
+                      "start_dns_sampler >/dev/null 2>&1\n"
                       "echo pid=$SAMPLER_PID\n"
                       "sleep 0.5\n[ -d /proc/$SAMPLER_PID ] && echo alive\n"
                       f"fds=$({listing} /proc/$SAMPLER_PID/fd/) || {{ echo LS-FAILED; exit 1; }}\n"
-                      "grep -c 'replay.lock' <<<\"$fds\"\n")
+                      "grep -c -e 'replay.lock' -e '.campaign.lock' <<<\"$fds\"\n")
             out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
         lines = out.stdout.strip().splitlines()
         pid = next((int(line[4:]) for line in lines if line.startswith("pid=") and line[4:].isdigit()), None)
@@ -2443,7 +2486,8 @@ class ReplayAddressByNetworkMode(unittest.TestCase):
     def test_the_dns_sampler_does_not_hold_the_replay_device_lock(self):
         """Red before the fix: the sampler subshell inherited REPLAY_LOCK_FD, so
         a sampler left running by a SIGKILLed campaign kept the lock and every
-        later root-mode campaign refused to start."""
+        later root-mode campaign refused to start. The same holds for the
+        results lock (#1099), which would hold the directory instead."""
         lines, err, pid = self._sampler_lock_check()
         self.assertIn("alive", lines, "the sampler did not stay up; the check is vacuous" + err)
         self.assertNotIn("LS-FAILED", lines, "the sampler's descriptors could not be listed")
