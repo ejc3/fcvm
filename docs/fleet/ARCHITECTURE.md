@@ -968,8 +968,8 @@ instances and particles. GLES 3 first (the path measured above); Vulkan once the
 Vulkan path is measured on the T4.
 
 - **One scene across the phones.** Each phone renders its rectangle of the whole image with an
-  off-axis projection, from the coordinator's scene: the shared clock `t`, camera keyframes,
-  words and the take-over actions (the renderer's `POST /scene` shape, with the phone's
+  off-axis projection, from the coordinator's scene: the shared clock `t`, words and the
+  take-over actions (the renderer's `POST /scene` shape, with the phone's
   fields added). Nothing in the scene has state: every robot's position, pose and colour is
   a function of `t` and its id, so a restored phone draws the current frame at once.
 - **Deterministic.** The same `t` and rectangle give the same pixels on every phone: no frame
@@ -1067,6 +1067,15 @@ whatever it showed before. Two things hid the effect:
   danced showed no change at all: Robot Park shows no banner for dance or wave
   (`aHeldPhoneFollowsItsOwnRobotUpClose` asserts that slice holds no robot). A slice of a park camera would still leave the robots at a phone's
   edge small or outside it.
+
+  The phones the viewer does not hold had the same lawn, and no unit conversion fixes it: in
+  metres the wall's eye is 100 km from the park, past Robot Park's 900 m far plane, so a phone
+  shows no robot either way. The agent gives a phone no camera keyframes (`renderer_body` in
+  `src/fleet/agent/slot.rs`, pinned by `a_phone_is_given_no_wall_camera`), and Robot Park draws
+  the phones' image with its own camera over the park (PROTOCOL.md "Phone app", `camera`): a
+  slow sway, the same on every phone, so the phones still stitch. Six phones side by side show
+  at least 125 robots each at every 50 s of the crowd's 1200 s period
+  (`everyPhoneOfARowShowsRobotsWithTheParksOwnCamera`).
 - *The info tab in front.* The info screen covers the scene, so dance, wave and night were
   behind it.
 

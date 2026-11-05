@@ -2183,7 +2183,7 @@ The renderer's `POST /scene` body with `"type": "scene"`, plus the phone's field
 | field | meaning | accepted |
 |---|---|---|
 | `epoch_unix_ms`, `rect`, `image_aspect` | as the renderer's | as the renderer's: `rect` inside the unit square, `w`, `h` at least 1/256; `image_aspect` 0.1 to 10 |
-| `camera` | keyframes, with the renderer's interpolation and holds; **units are metres of the park** (x across, y up, z toward the camera; robots walk along x between z = -46 and 16, about 1 m tall) | optional, at most 4096; empty means the park's own slow sway from (0, 8, 30) toward (0, 1.6, -4), fov 40 |
+| `camera` | keyframes, with the renderer's interpolation and holds; **units are metres of the park** (x across, y up, z toward the camera; robots walk along x between z = -46 and 16, about 1 m tall) | optional, at most 4096; empty means the park's own slow sway from (0, 8, 30) toward (0, 1.6, -4), fov 40. A fleet agent sends none: the shared scene's keyframes are the wall's, in kilometres of its terrain, and frame no part of the park |
 | `words` | a word appears on a sign a robot carries across the whole image, left to right, over 45 s | optional, at most 256; the renderer's text rule (printable ASCII, 28 characters); the 3 newest show |
 | `lights` | a glowing orb at `pos` (metres) that lights what is near it, fading in over 1.5 s | optional, at most 32; the 16 newest show; `color` 0 to 64 |
 | `moves` | `dance`: the crowd stops, faces the camera and dances on one 120 bpm beat under confetti; `wave`: the crowd stops and waves. Each lasts 8 s with 0.6 s ramps | optional, at most 256 |
