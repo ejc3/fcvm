@@ -7359,21 +7359,81 @@ async fn a_cache_hit_without_a_hook_runs_none() -> anyhow::Result<()> {
 }
 
 /// A snapshot keeps its disks in a `disk/` directory that is a btrfs subvolume, and
-/// a clone gets its disks as one subvolume snapshot of it: the clone's disk
-/// directory is itself a subvolume holding the disk under the rootfs name and the
-/// snapshot's extra disks, and nothing else. A reflink of the disk costs one extent
-/// reference per extent (9 to 11 s on a 154 GB disk with 860,177 extents, which is
-/// what a 128 GiB guest's root disk grows into); a subvolume snapshot costs the same
-/// whatever the extent count (20 ms measured on that disk).
+/// a clone whose disks have more than `REFLINK_MAX_EXTENTS` extents gets them as one
+/// subvolume snapshot of it: the clone's disk directory is itself a subvolume holding
+/// the disk under the rootfs name and the snapshot's extra disks, and nothing else. A
+/// reflink of the disk costs one extent reference per extent (9 to 11 s on a 154 GB
+/// disk with 860,177 extents, which is what a 128 GiB guest's root disk grows into); a
+/// subvolume snapshot costs the same whatever the extent count (20 ms measured on that
+/// disk). A test VM's disk is small, so the limit is set to 0 for this one.
 ///
 /// RED BEFORE THE FIX: the snapshot held its disk beside the memory image in an
 /// ordinary directory (inode not 256) and the clone's disk directory held a reflink.
 #[tokio::test]
 #[cfg_attr(not(feature = "privileged-tests"), ignore)]
 async fn clone_disks_are_subvolume_snapshots_of_the_snapshot_directory() -> anyhow::Result<()> {
+    // nextest runs each test in a process of its own; the fcvm processes it starts inherit this
+    std::env::set_var(fcvm::storage::disk::REFLINK_MAX_EXTENTS_ENV, "0");
+    let (snapshot_ino, extra_disk_names, disks_ino, entries, served) =
+        clone_disks_case("subvol").await?;
+    assert_eq!(
+        snapshot_ino, 256,
+        "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
+    );
+    assert_eq!(
+        disks_ino, 256,
+        "the clone's disk directory is not a subvolume snapshot (inode {disks_ino})"
+    );
+    clone_disks_hold_the_snapshots_disks(entries, extra_disk_names, &served);
+    Ok(())
+}
+
+/// A clone whose disks have at most `REFLINK_MAX_EXTENTS` extents (a test VM's do) gets
+/// them as reflinks into an ordinary directory, with no subvolume snapshot and so no
+/// btrfs commit on the restore's path; the snapshot's own disk directory is still a
+/// subvolume.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn clone_disks_with_few_extents_are_reflinks() -> anyhow::Result<()> {
+    let (snapshot_ino, extra_disk_names, disks_ino, entries, served) =
+        clone_disks_case("reflinked").await?;
+    assert_eq!(
+        snapshot_ino, 256,
+        "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
+    );
+    assert_ne!(
+        disks_ino, 256,
+        "the clone of a small disk got a subvolume snapshot, not reflinks"
+    );
+    clone_disks_hold_the_snapshots_disks(entries, extra_disk_names, &served);
+    Ok(())
+}
+
+/// The clone's disk directory holds the root disk and the snapshot's extra disks and
+/// nothing else, and the clone reads the extra disk.
+fn clone_disks_hold_the_snapshots_disks(entries: Vec<String>, extra: Vec<String>, served: &str) {
+    let mut wanted = vec!["rootfs.raw".to_string()];
+    wanted.extend(extra);
+    wanted.sort();
+    assert_eq!(
+        entries, wanted,
+        "the clone's disk directory holds other than its disks"
+    );
+    assert!(
+        served.contains("hello"),
+        "the clone cannot read the extra disk: {served}"
+    );
+}
+
+/// A VM with one extra disk, its snapshot, and a clone of it: the inode of the snapshot's
+/// disk directory, the snapshot's extra disk names, the inode of the clone's disk
+/// directory and what it holds, and what the clone read from the extra disk.
+async fn clone_disks_case(
+    prefix: &str,
+) -> anyhow::Result<(u64, Vec<String>, u64, Vec<String>, String)> {
     use std::os::unix::fs::MetadataExt;
 
-    let (vm_name, clone_name, snap_tag, _) = common::unique_names("subvol");
+    let (vm_name, clone_name, snap_tag, _) = common::unique_names(prefix);
     // A --disk-dir becomes an image in the VM's disk directory, which the snapshot
     // records as an extra disk (a --disk file stays at its host path and is not).
     let extra_dir = std::path::PathBuf::from(format!("/tmp/fcvm-{vm_name}-data"));
@@ -7455,26 +7515,7 @@ async fn clone_disks_are_subvolume_snapshots_of_the_snapshot_directory() -> anyh
     tokio::fs::remove_dir_all(&extra_dir).await.ok();
 
     let (snapshot_ino, extra_disk_names, (disks_ino, entries, served)) = outcome?;
-    assert_eq!(
-        snapshot_ino, 256,
-        "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
-    );
-    assert_eq!(
-        disks_ino, 256,
-        "the clone's disk directory is not a subvolume snapshot (inode {disks_ino})"
-    );
-    let mut wanted = vec!["rootfs.raw".to_string()];
-    wanted.extend(extra_disk_names);
-    wanted.sort();
-    assert_eq!(
-        entries, wanted,
-        "the clone's disk directory holds other than its disks"
-    );
-    assert!(
-        served.contains("hello"),
-        "the clone cannot read the extra disk: {served}"
-    );
-    Ok(())
+    Ok((snapshot_ino, extra_disk_names, disks_ino, entries, served))
 }
 
 /// Wait, up to two minutes, until the log at `path` contains `marker`.
