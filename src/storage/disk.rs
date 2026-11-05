@@ -602,15 +602,7 @@ async fn ensure_free_space_ext4(disk_path: &Path, min_free: u64) -> Result<()> {
     let block_size = parse_dumpe2fs_value(&stdout, "Block size")?;
     let free_blocks = parse_dumpe2fs_value(&stdout, "Free blocks")?;
     let free_bytes = free_blocks * block_size;
-    let groups_before = group_count(&stdout)?;
-    // Without descriptor checksums ext4 has no lazily initialised inode
-    // tables, and dumpe2fs prints no group flags to check a mark against.
-    let lazy_itables = ["metadata_csum", "uninit_bg"].iter().any(|feature| {
-        stdout
-            .lines()
-            .filter(|line| line.starts_with("Filesystem features:"))
-            .any(|line| line.split_whitespace().any(|word| word == *feature))
-    });
+    let before = ext4_geometry(&stdout);
 
     if free_bytes >= min_free {
         debug!(
@@ -679,8 +671,15 @@ async fn ensure_free_space_ext4(disk_path: &Path, min_free: u64) -> Result<()> {
         );
     }
 
-    if lazy_itables {
-        mark_added_inode_tables_zeroed(disk_path, groups_before, block_size).await?;
+    match before {
+        Some(before) if before.lazy_itables => {
+            mark_added_inode_tables_zeroed(disk_path, before.groups).await?
+        }
+        Some(_) => {}
+        None => warn!(
+            disk = %disk_path.display(),
+            "dumpe2fs header is ambiguous; added inode tables left to the guest"
+        ),
     }
 
     info!(disk = %disk_path.display(), "ext4 rootfs expanded successfully");
@@ -703,15 +702,55 @@ struct BlockGroup {
     inode_table: Option<(u64, u64)>,
 }
 
-/// Number of block groups, from `dumpe2fs -h` output.
-fn group_count(header: &str) -> Result<u64> {
-    let blocks = parse_dumpe2fs_value(header, "Block count")?;
-    let first = parse_dumpe2fs_value(header, "First block")?;
-    let per_group = parse_dumpe2fs_value(header, "Blocks per group")?;
-    if per_group == 0 || first > blocks {
-        bail!("dumpe2fs reports {blocks} blocks from {first} at {per_group} per group");
+/// The filesystem facts the inode-table marking relies on, from dumpe2fs's
+/// header.
+#[derive(Debug, PartialEq)]
+struct Ext4Geometry {
+    block_size: u64,
+    blocks: u64,
+    groups: u64,
+    /// metadata_csum or uninit_bg: only these have lazily initialised inode
+    /// tables, and only for these does dumpe2fs print group flags.
+    lazy_itables: bool,
+}
+
+/// The value of the one header line `key: value`, or `None` when the key is
+/// missing or appears more than once. dumpe2fs prints header strings such as
+/// the last mount point verbatim, so a second line with the same key is not
+/// evidence of the value.
+fn header_field<'a>(output: &'a str, key: &str) -> Option<&'a str> {
+    let mut values = output
+        .lines()
+        .filter_map(|line| line.strip_prefix(key)?.strip_prefix(':'))
+        .map(str::trim);
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+/// `None` unless every field it reads appears once and the geometry is one
+/// ext4 can have.
+fn ext4_geometry(header: &str) -> Option<Ext4Geometry> {
+    let number = |key| header_field(header, key)?.parse::<u64>().ok();
+    let block_size = number("Block size")?;
+    let blocks = number("Block count")?;
+    let first = number("First block")?;
+    let per_group = number("Blocks per group")?;
+    if !block_size.is_power_of_two() || !(1024..=65536).contains(&block_size) {
+        return None;
     }
-    Ok((blocks - first).div_ceil(per_group))
+    if per_group == 0 || first >= blocks {
+        return None;
+    }
+    let features = header_field(header, "Filesystem features")?;
+    let lazy_itables = features
+        .split_whitespace()
+        .any(|f| f == "metadata_csum" || f == "uninit_bg");
+    Some(Ext4Geometry {
+        block_size,
+        blocks,
+        groups: (blocks - first).div_ceil(per_group),
+        lazy_itables,
+    })
 }
 
 /// Every block group in full `dumpe2fs` output, with its flags and inode table.
@@ -803,11 +842,7 @@ fn range_is_zero(path: &Path, offset: u64, len: u64) -> Result<bool> {
 /// So the table is read, and only an all-zero table is marked. A descriptor
 /// with a flag this code does not know is left alone. The result must pass
 /// `e2fsck -fn`.
-async fn mark_added_inode_tables_zeroed(
-    disk_path: &Path,
-    groups_before: u64,
-    block_size: u64,
-) -> Result<()> {
+async fn mark_added_inode_tables_zeroed(disk_path: &Path, groups_before: u64) -> Result<()> {
     let output = e2fsprogs("dumpe2fs")
         .arg(disk_path.as_os_str())
         .output()
@@ -820,14 +855,18 @@ async fn mark_added_inode_tables_zeroed(
         );
     }
     let dump = String::from_utf8_lossy(&output.stdout);
-    let total = group_count(&dump)?;
-    let Some(groups) = parse_block_groups(&dump, total) else {
+    let geometry = ext4_geometry(&dump).filter(|g| g.lazy_itables);
+    let Some((geometry, groups)) =
+        geometry.and_then(|g| parse_block_groups(&dump, g.groups).map(|groups| (g, groups)))
+    else {
         warn!(
             disk = %disk_path.display(),
-            "dumpe2fs output is not one sequence of {total} block groups; inode tables left to the guest"
+            "dumpe2fs output is not one header and one sequence of block groups; \
+             inode tables left to the guest"
         );
         return Ok(());
     };
+    let (block_size, total) = (geometry.block_size, geometry.groups);
 
     let mut zeroed = Vec::new();
     let mut not_zero = 0u64;
@@ -835,7 +874,7 @@ async fn mark_added_inode_tables_zeroed(
         let (Some(flags), Some((first, last))) = (group.flags, group.inode_table) else {
             continue;
         };
-        if flags & BG_INODE_ZEROED != 0 || last < first {
+        if flags & BG_INODE_ZEROED != 0 || last < first || last >= geometry.blocks {
             continue;
         }
         let path = disk_path.to_path_buf();
@@ -1174,7 +1213,8 @@ mod resize_inode_table_tests {
     fn groups(path: &Path) -> Vec<BlockGroup> {
         let out = run(Command::new("dumpe2fs").arg(path));
         let out = String::from_utf8_lossy(&out.stdout);
-        parse_block_groups(&out, group_count(&out).unwrap()).expect("one complete group sequence")
+        parse_block_groups(&out, ext4_geometry(&out).unwrap().groups)
+            .expect("one complete group sequence")
     }
 
     fn unzeroed(path: &Path) -> Vec<u64> {
@@ -1354,6 +1394,41 @@ mod resize_inode_table_tests {
             None,
             "two tables for one group"
         );
+    }
+
+    /// A header field that appears twice comes partly from a string dumpe2fs
+    /// printed verbatim, such as the last mount point, so it is not trusted:
+    /// a forged "Block size: 0" made every inode table read as zero bytes.
+    #[test]
+    fn a_header_field_that_appears_twice_is_refused() {
+        let header = "Last mounted on:          /\n\
+                      Block count:              131072\n\
+                      First block:              0\n\
+                      Block size:               4096\n\
+                      Blocks per group:         32768\n\
+                      Filesystem features:      has_journal extent metadata_csum\n";
+        assert_eq!(
+            ext4_geometry(header),
+            Some(Ext4Geometry {
+                block_size: 4096,
+                blocks: 131072,
+                groups: 4,
+                lazy_itables: true
+            })
+        );
+        for forged in [
+            "Block size: 0\n",
+            "Filesystem features: uninit_bg\n",
+            "Block count: 9\n",
+        ] {
+            let injected = header.replacen("/\n", &format!("/x\n{forged}"), 1);
+            assert_eq!(ext4_geometry(&injected), None, "{forged:?}");
+        }
+        let zero = header.replace(
+            "Block size:               4096",
+            "Block size:               0",
+        );
+        assert_eq!(ext4_geometry(&zero), None, "a block size ext4 cannot have");
     }
 
     /// e2fsprogs translates the group headings and the "Inode table at" label,
