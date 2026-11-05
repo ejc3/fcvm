@@ -85,8 +85,8 @@ def repo_relative(path):
     """path as the repository-relative name the manifests use. The directory's
     symlinks are resolved, so a run named through an alias finds its records;
     the file's own are not, so a listed name that is a link stays listed."""
-    head, leaf = os.path.split(os.path.abspath(os.fspath(path)))
-    return os.path.relpath(os.path.join(os.path.realpath(head), leaf), REPO).replace(os.sep, "/")
+    head, leaf = os.path.split(os.fspath(path))
+    return os.path.relpath(os.path.join(os.path.realpath(head or "."), leaf), REPO).replace(os.sep, "/")
 
 
 def is_raw(relative_in_run):
@@ -243,7 +243,7 @@ def committed_files(prefix):
 
 def run_raw_files(run_dir):
     """The committed raw files of one run directory, repository-relative."""
-    prefix = repo_relative(run_dir).rstrip("/") + "/"
+    prefix = os.path.relpath(os.path.realpath(run_dir), REPO).replace(os.sep, "/") + "/"
     return [p for p in committed_files(prefix) if is_raw(p[len(prefix):])]
 
 

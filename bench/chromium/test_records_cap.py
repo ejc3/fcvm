@@ -116,6 +116,34 @@ class RecordsCap(unittest.TestCase):
                 with self.assertRaisesRegex(records.MissingRecord, "not the 2 bytes"):
                     records.read_bytes(path)
 
+    def test_a_dot_dot_after_an_alias_names_the_file_it_opens(self):
+        """RED BEFORE THE FIX (codex review of a21361f1..eddc882f): abspath
+        collapsed alias/.. before the alias was resolved, so the key named
+        another file than the one opened and a listed record was read
+        unchecked; and a run directory that is itself a symlink kept the
+        link in its prefix, so `move` and `manifest` listed nothing under it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "real", "x"))
+            os.makedirs(os.path.join(tmp, "real", "run"))
+            with open(os.path.join(tmp, "real", "run", "analysis.json"), "w") as handle:
+                handle.write('{"run_id": "edited"}')
+            os.symlink(os.path.join(tmp, "real", "x"), os.path.join(tmp, "alias"))
+            key = os.path.relpath(os.path.join(os.path.realpath(tmp), "real", "run", "analysis.json"),
+                                  records.REPO)
+            listed = {key: {
+                "path": key, "size": 2, "sha256": "0" * 64,
+                "manifest": "results/records-test.json", "fcvm_commit": None,
+                "repository": records.RECORDS_REPOSITORY, "records_commit": "f" * 40}}
+            with mock.patch.object(records, "_manifests", return_value=listed):
+                with self.assertRaisesRegex(records.MissingRecord, "not the 2 bytes"):
+                    records.read_bytes(os.path.join(tmp, "alias", "..", "run", "analysis.json"))
+            os.symlink(os.path.join(tmp, "real", "run"), os.path.join(tmp, "run-link"))
+            real = os.path.relpath(os.path.join(os.path.realpath(tmp), "real", "run"), records.REPO)
+            with mock.patch.object(records, "committed_files",
+                                   side_effect=lambda prefix: [prefix + "analysis.json"]):
+                self.assertEqual(records.run_raw_files(os.path.join(tmp, "run-link")),
+                                 [real + "/analysis.json"])
+
     def test_a_run_named_through_a_directory_alias_finds_its_moved_records(self):
         """RED BEFORE THE FIX (codex review of 7c62d332..90c0c93e): the manifest
         key kept the alias's own path, so a run directory named through a
