@@ -795,9 +795,20 @@ def wake_steps(run_log):
     return out
 
 
+def burst_arm(trial, arms):
+    """The arm of a burst trial, and whether its wakes are compared: arms rotate every two
+    trials, and only the second trial's sleeps belong to VMs its own arm woke."""
+    return (trial // 2) % arms, trial % 2 == 1
+
+
 async def cmd_burst(a):
     """Wake K players at once while K others go to sleep, trial after trial, the arms
-    (--arm NAME=VAR=VALUE,...) interleaved trial by trial; one JSON line per wake."""
+    (--arm NAME=VAR=VALUE,...) interleaved in blocks of two trials; one JSON line per wake.
+
+    The VMs a trial puts to sleep were woken by the trial before, and each runs its own
+    teardown with the build and environment it was started with. The first trial of a
+    block sleeps the previous arm's VMs, so only the second trial's wakes are compared
+    (`settled`: true); both are written."""
     arms = [("base", {})]
     for spec in a.arm:
         name, _, kv = spec.partition("=")
@@ -817,7 +828,8 @@ async def cmd_burst(a):
     for p in group[1]:
         await p.sleep()
     for i in range(a.trials):
-        name, extra = arms[i % len(arms)]
+        arm, settled = burst_arm(i, len(arms))
+        name, extra = arms[arm]
         env = dict(ENV, **extra)
         waking, sleeping = group[(i + 1) % 2], group[i % 2]
 
@@ -826,7 +838,7 @@ async def cmd_burst(a):
             return p, ms(t0, max(hello_t, probe_t)), refusals
         results = await asyncio.gather(*(wake(p) for p in waking), *(p.sleep(env=env) for p in sleeping))
         for p, total, refusals in results[:k]:
-            row = {"trial": i, "arm": name, "player": p.k, "wake_ms": total, "refusals": refusals,
+            row = {"trial": i, "arm": name, "settled": settled, "player": p.k, "wake_ms": total, "refusals": refusals,
                    **wake_steps(p.logpath("run"))}
             rec.write(json.dumps(row) + "\n")
         rec.flush()
