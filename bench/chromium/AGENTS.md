@@ -140,6 +140,10 @@ compared against a 2-vCPU VM arm is two variables, not one.
 `RESULTS=` is an ownership claim, not a resume directory. `hostcdp.sh` creates
 its final component atomically and refuses an existing directory before writing
 anything, so a failed rerun cannot leave old `summary.json` beside new records.
+`corpus_campaign.sh` accepts an existing `RESULTS` and clears the evidence an
+earlier campaign left there, but only after taking `$RESULTS/.campaign.lock`
+without waiting; it holds that lock until it exits, so a second campaign on the
+same directory refuses at start instead of removing the first one's evidence.
 
 `bench-chromium-request-diag` (and its `bench-webkit-request-diag` twin)
 answers what holds a page's load event inside a restored clone, on the
