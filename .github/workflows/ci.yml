@@ -216,7 +216,7 @@ jobs:
       - name: Download actionlint (checksum-pinned)
         run: |
           set -euo pipefail
-          curl -sSLo /tmp/actionlint.tgz \
+          curl --fail --silent --show-error --location --retry 10 --retry-connrefused -o /tmp/actionlint.tgz \
             https://github.com/rhysd/actionlint/releases/download/v1.7.10/actionlint_1.7.10_linux_amd64.tar.gz
           echo "f4c76b71db5755a713e6055cbb0857ed07e103e028bda117817660ebadb4386f  /tmp/actionlint.tgz" | sha256sum -c -
           tar -C /tmp -xzf /tmp/actionlint.tgz actionlint
@@ -636,7 +636,7 @@ jobs:
         run: |
           ARCH=$(uname -m)
           FC_VERSION="1.14.0"
-          curl -L -o /tmp/firecracker.tgz \
+          curl --fail --location --retry 10 --retry-connrefused -o /tmp/firecracker.tgz \
             "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-${ARCH}.tgz"
           sudo tar -xzf /tmp/firecracker.tgz -C /usr/local/bin --strip-components=1 \
             "release-v${FC_VERSION}-${ARCH}/firecracker-v${FC_VERSION}-${ARCH}" \
@@ -917,7 +917,7 @@ jobs:
         run: |
           ARCH=$(uname -m)
           FC_VERSION="1.14.0"
-          curl -L -o /tmp/firecracker.tgz \
+          curl --fail --location --retry 10 --retry-connrefused -o /tmp/firecracker.tgz \
             "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-${ARCH}.tgz"
           sudo tar -xzf /tmp/firecracker.tgz -C /usr/local/bin --strip-components=1 \
             "release-v${FC_VERSION}-${ARCH}/firecracker-v${FC_VERSION}-${ARCH}" \

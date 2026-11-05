@@ -68,7 +68,7 @@ jobs:
         run: |
           ARCH=$(uname -m)
           FC_VERSION="1.14.0"
-          curl -L -o /tmp/firecracker.tgz \
+          curl --fail --location --retry 10 --retry-connrefused -o /tmp/firecracker.tgz \
             "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-${ARCH}.tgz"
           sudo tar -xzf /tmp/firecracker.tgz -C /usr/local/bin --strip-components=1 \
             "release-v${FC_VERSION}-${ARCH}/firecracker-v${FC_VERSION}-${ARCH}" \
@@ -167,7 +167,7 @@ jobs:
         run: |
           ARCH=$(uname -m)
           FC_VERSION="1.14.0"
-          curl -L -o /tmp/firecracker.tgz \
+          curl --fail --location --retry 10 --retry-connrefused -o /tmp/firecracker.tgz \
             "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-${ARCH}.tgz"
           sudo tar -xzf /tmp/firecracker.tgz -C /usr/local/bin --strip-components=1 \
             "release-v${FC_VERSION}-${ARCH}/firecracker-v${FC_VERSION}-${ARCH}" \
