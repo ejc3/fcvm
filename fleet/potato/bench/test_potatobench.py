@@ -1,6 +1,9 @@
 """Unit tests for potatobench.py's bookkeeping: python3 -m unittest fleet/potato/bench/test_potatobench.py"""
+import json
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,6 +34,24 @@ class Bookkeeping(unittest.TestCase):
         self.assertFalse(pb.reply_ok(b'{"type":"refused","reason":"ok"}'))
         self.assertFalse(pb.reply_ok(b"ok"))
 
+
+    def test_a_round_that_ends_without_a_drop_keeps_its_record(self):
+        # a ring of 2 at 1000 ms: catches 0 to 2 close lap 0, catches 0 to 3 close lap 1 (900 ms)
+        def summary(seqs, **done):
+            rows = [{"type": "caught", "round": 1, "size": 2, "seq": s, "proof_ok": True} for s in seqs]
+            rows.append({"type": "size_done", "size": 2, "start_hold_ms": 1000, **done})
+            with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+                f.write("".join(json.dumps(r) + "\n" for r in rows))
+            try:
+                out = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ladder_summary.py"), f.name],
+                                     check=True, capture_output=True, text=True).stdout
+            finally:
+                os.unlink(f.name)
+            return json.loads(out)["record_hold_ms"]
+        self.assertEqual(summary([0, 1, 2], reason="timeout"), 1000)
+        self.assertEqual(summary([0, 1, 2, 3], reason="timeout"), 900)
+        self.assertIsNone(summary([0], reason="timeout"), "no lap completed")
+        self.assertEqual(summary([0, 1, 2, 3], reason="dropped", lap=2), 900, "a drop names its lap")
 
 if __name__ == "__main__":
     unittest.main()

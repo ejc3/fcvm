@@ -884,8 +884,12 @@ impl Potato {
             PotatoKind::Woke { wake_ms, stages } => {
                 let size = self.round.as_ref().map(|r| r.size);
                 if let Some(p) = self.players.get_mut(&e.player) {
-                    p.phase = "awake".into();
-                    p.since = at;
+                    // a player that caught and threw before its wake was reported done is
+                    // put to sleep by the agent once the wake is: it stays `sleeping`
+                    if p.phase != "sleeping" {
+                        p.phase = "awake".into();
+                        p.since = at;
+                    }
                     p.last_wake_ms = Some(*wake_ms);
                     p.wake_stages = stages.clone();
                     if let (Some(sleep), Some(size), true) = (p.last_sleep_ms, size, in_ring) {
@@ -1415,5 +1419,38 @@ mod tests {
         );
         assert_eq!(g.records.longest_round.as_ref().map(|r| r.value), Some(3.0));
         assert!(g.round.is_none() && g.host.is_none() && g.next_round_at.is_none());
+    }
+
+    /// A player can accept, catch and throw before the agent reports its wake done; the agent
+    /// then sleeps it as soon as the wake is. The late `woke` must not show it awake.
+    #[test]
+    fn a_throw_before_the_wake_is_reported_keeps_the_player_sleeping() {
+        let (mut g, cfg, mut proofs) = game(2);
+        let id = g.round.as_ref().unwrap().id;
+        let ev = |at, kind| PotatoEvent {
+            at,
+            player: 1,
+            kind,
+        };
+        g.event("h", &ev(1050, PotatoKind::Waking {}), 1050, &cfg);
+        let c = catch(&mut proofs, 1, id, 1, 1100, false);
+        g.event("h", &c, c.at, &cfg);
+        let threw = PotatoKind::Threw {
+            round: id,
+            seq: 2,
+            to: 0,
+            attempts: 1,
+            wait_ms: 900.0,
+            send_ms: 1.0,
+        };
+        g.event("h", &ev(2000, threw), 2000, &cfg);
+        let woke = PotatoKind::Woke {
+            wake_ms: 320.0,
+            stages: BTreeMap::new(),
+        };
+        g.event("h", &ev(2010, woke), 2010, &cfg);
+        let p = &g.players[&1];
+        assert_eq!((p.phase.as_str(), p.since), ("sleeping", 2000));
+        assert_eq!(p.last_wake_ms, Some(320.0));
     }
 }
