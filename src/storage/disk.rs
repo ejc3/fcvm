@@ -1300,7 +1300,9 @@ mod resize_inode_table_tests {
         let dump = String::from_utf8_lossy(&dump.stdout);
         let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         for line in dump.lines() {
-            let Some(ranges) = line.trim_start().strip_prefix("Free blocks: ") else {
+            // Only a group's own list, indented; the unindented header line
+            // of the same name holds a count, not a block.
+            let Some(ranges) = line.strip_prefix("  Free blocks: ") else {
                 continue;
             };
             for range in ranges.split(',').map(str::trim).filter(|r| !r.is_empty()) {
@@ -1312,6 +1314,7 @@ mod resize_inode_table_tests {
             }
         }
         drop(file);
+        assert_clean(&path); // the fill wrote only free blocks
         let before = groups(&path).len() as u64;
 
         ensure_free_space(&path, "256M", 0).await.unwrap();
