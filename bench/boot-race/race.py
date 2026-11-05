@@ -257,11 +257,55 @@ class Ec2:
 
 
 # ------------------------------------------------------------------ ECS lanes
+class Launch:
+    """One RunTask through boot-race-launcher, the only caller of RunTask (its code fixes the network).
+
+    The launcher returns its wall-clock times just before and just after RunTask. A sample's t0 is the launcher's
+    `before`; the probe's success is placed on the same wall clock by anchoring the monotonic clock at the invoke.
+    The invoke's own cost is recorded beside the sample, not in it."""
+
+    def __init__(self, invoked):
+        self.invoke_wall_ms, self.invoke_mono_ns, self.out = invoked
+        self.before_ms = self.out["before_unix_ms"]
+        self.after_ms = self.out["after_unix_ms"]
+
+    def wall_ms(self, mono_ns):
+        return self.invoke_wall_ms + (mono_ns - self.invoke_mono_ns) / 1e6
+
+    def timing(self, t1_mono_ns, returned_mono_ns):
+        return {
+            "t_start_unix_ms": int(self.before_ms),
+            "ms": self.wall_ms(t1_mono_ns) - self.before_ms,
+            "runtask_ms": self.after_ms - self.before_ms,
+            "invoke_to_runtask_ms": self.before_ms - self.invoke_wall_ms,
+            "runtask_to_return_ms": self.wall_ms(returned_mono_ns) - self.after_ms,
+        }
+
+
 class Ecs:
     def __init__(self, cfg):
         self.cfg = cfg
         s = session()
         self.ecs = s.client("ecs")
+        self.lam = s.client("lambda")
+
+    def invoke(self, payload):
+        r = self.lam.invoke(FunctionName="boot-race-launcher", Payload=json.dumps(payload).encode())
+        body = json.loads(r["Payload"].read() or b"null")
+        if r.get("FunctionError"):
+            raise RuntimeError(f"launcher error: {body}")
+        return body
+
+    def run(self, payload):
+        wall, mono = time.time_ns() / 1e6, time.monotonic_ns()
+        out = self.invoke({"action": "run", **payload})
+        returned = time.monotonic_ns()
+        if out.get("failures") or not out.get("task_arn"):
+            raise RuntimeError(f"RunTask failures: {out.get('failures')}")
+        return Launch((wall, mono, out)), returned
+
+    def stop(self, arn):
+        self.invoke({"action": "stop", "task": arn})
 
     def describe(self, arn):
         return self.ecs.describe_tasks(cluster="boot-race", tasks=[arn])["tasks"][0]
@@ -275,29 +319,12 @@ class Ecs:
         raise TimeoutError("task did not stop")
 
     async def fargate_sample(self):
-        t0 = time.monotonic_ns()
-        start_ms = now_ms()
-        r = self.ecs.run_task(
-            cluster="boot-race",
-            taskDefinition="boot-race-fargate",
-            launchType="FARGATE",
-            count=1,
-            networkConfiguration={
-                "awsvpcConfiguration": {
-                    "subnets": [self.cfg["subnet"]],
-                    "securityGroups": [self.cfg["security_group"]],
-                    "assignPublicIp": "ENABLED",
-                }
-            },
-        )
-        if r.get("failures"):
-            raise RuntimeError(f"RunTask failures: {r['failures']}")
-        t_api = time.monotonic_ns()
-        arn = r["tasks"][0]["taskArn"]
+        launch, returned = await asyncio.to_thread(self.run, {"lane": "fargate"})
+        arn = launch.out["task_arn"]
         try:
             ip = None
             while ip is None:
-                if time.monotonic_ns() - t0 > 300e9:
+                if time.monotonic_ns() - launch.invoke_mono_ns > 300e9:
                     raise TimeoutError("no task address in 300 s")
                 t = self.describe(arn)
                 for a in t.get("attachments", []):
@@ -310,17 +337,15 @@ class Ecs:
             t1, doc, attempts = await probe(ip, 8080, 0.02, 300)
             t = self.describe(arn)
         finally:
-            self.ecs.stop_task(cluster="boot-race", task=arn, reason="boot-race sample taken")
+            await asyncio.to_thread(self.stop, arn)
         stamps = {
             k: int(t[k].timestamp() * 1000)
             for k in ("createdAt", "pullStartedAt", "pullStoppedAt", "startedAt")
             if k in t
         }
         return {
-            "t_start_unix_ms": start_ms,
-            "ms": (t1 - t0) / 1e6,
-            "api_ms": (t_api - t0) / 1e6,
-            "address_ms": (t_ip - t0) / 1e6,
+            **launch.timing(t1, returned),
+            "address_ms": launch.wall_ms(t_ip) - launch.before_ms,
             "attempts": attempts,
             "aws_stamps_unix_ms": stamps,
             "platform_version": t.get("platformVersion"),
@@ -330,28 +355,16 @@ class Ecs:
     async def ec2_sample(self, host_ip):
         if port_answers(host_ip, 8080):
             raise RuntimeError("the container instance already answers on 8080 before RunTask")
-        t0 = time.monotonic_ns()
-        start_ms = now_ms()
-        r = self.ecs.run_task(
-            cluster="boot-race", taskDefinition="boot-race-ec2", launchType="EC2", count=1,
-            placementConstraints=[{"type": "memberOf", "expression": f"ec2InstanceId == {self.cfg['ecs_host_instance']}"}],
+        launch, returned = await asyncio.to_thread(
+            self.run, {"lane": "ec2", "instance": self.cfg["ecs_host_instance"]}
         )
-        if r.get("failures"):
-            raise RuntimeError(f"RunTask failures: {r['failures']}")
-        t_api = time.monotonic_ns()
-        arn = r["tasks"][0]["taskArn"]
+        arn = launch.out["task_arn"]
         try:
             t1, doc, attempts = await probe(host_ip, 8080, 0.005, 120)
         finally:
-            self.ecs.stop_task(cluster="boot-race", task=arn, reason="boot-race sample taken")
+            await asyncio.to_thread(self.stop, arn)
             await asyncio.to_thread(self.wait_stopped, arn)
-        return {
-            "t_start_unix_ms": start_ms,
-            "ms": (t1 - t0) / 1e6,
-            "api_ms": (t_api - t0) / 1e6,
-            "attempts": attempts,
-            "answer": doc,
-        }
+        return {**launch.timing(t1, returned), "attempts": attempts, "answer": doc}
 
 
 # ------------------------------------------------------------------ Lambda lanes

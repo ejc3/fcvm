@@ -44,6 +44,19 @@ class Identity(unittest.TestCase):
         self.assertIsNone(race.check_identity("lambda-cold", A, A, {}))
 
 
+class LaunchTiming(unittest.TestCase):
+    def test_t0_is_the_launchers_moment_before_runtask_not_the_invoke(self):
+        # invoked at wall 1000.0 ms (monotonic 0); RunTask asked at 1040 and answered at 1090;
+        # the invoke returned 120 ms after it was sent; the workload answered 5000 ms after the invoke
+        launch = race.Launch((1000.0, 0, {"before_unix_ms": 1040.0, "after_unix_ms": 1090.0}))
+        t = launch.timing(5_000_000_000, 120_000_000)
+        self.assertEqual(t["ms"], 4960.0)
+        self.assertEqual(t["invoke_to_runtask_ms"], 40.0)
+        self.assertEqual(t["runtask_ms"], 50.0)
+        self.assertEqual(t["runtask_to_return_ms"], 30.0)
+        self.assertEqual(t["t_start_unix_ms"], 1040)
+
+
 class Probe(unittest.TestCase):
     def test_answer_is_timed_at_its_last_byte_not_at_connection_close(self):
         async def main():

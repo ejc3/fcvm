@@ -11,12 +11,16 @@ snapshot restores and for the AWS ways of starting the same workload, in one int
 | `ec2-launch` | `RunInstances` | c8g.medium from an AMI holding the workload |
 | `ec2-start` | `StartInstances` | the same AMI, stopped |
 | `ec2-hibernate` | `StartInstances` | the same AMI, stopped with `Hibernate=true` |
-| `ecs-fargate` | `RunTask` (FARGATE) | 1 vCPU, 2 GiB, ARM64 |
-| `ecs-ec2` | `RunTask` (EC2) | one warm container instance, image cached, host network |
+| `ecs-fargate` | `RunTask` (FARGATE), read inside boot-race-launcher | 1 vCPU, 2 GiB, ARM64, no public IP |
+| `ecs-ec2` | `RunTask` (EC2), read inside boot-race-launcher | one warm container instance, image cached, host network |
 | `lambda-cold` | HTTPS GET to the function URL | the runtime exits after every response |
 | `lambda-warm` | HTTPS GET to the function URL | the runtime keeps running |
 
 t1 for every lane: a GET from the campaign host has read a complete `200` answer.
+
+The ECS lanes start through boot-race-launcher (ejc3/aws `boot-race/launcher.py`), the only caller of RunTask, which
+fixes the cluster, the task definitions and the Fargate network. It returns its wall-clock time just before and just
+after RunTask; t0 is the time before, and the invoke's own cost is recorded beside each sample.
 
 ## Files
 
@@ -42,7 +46,7 @@ The AWS resources and the `boot-race-driver` role are in ejc3/aws `boot-race.tf`
 ```bash
 make build-boot-race-workload                      # copy the binary to the box, podman build workload/Containerfile
 bench/boot-race/fcvm-prep.sh ./target/release/fcvm $RESULTS   # prints serve_pid
-# cfg.json: results, fcvm_bin, fcvm_snapshot, fcvm_serve_pid, workload_bin, workload_unit, subnet, security_group
+# cfg.json: results, fcvm_bin, fcvm_snapshot, fcvm_serve_pid, workload_bin, workload_unit
 for step in image lambda ami instances ecs-host; do python3 bench/boot-race/prepare.py --config cfg.json $step; done
 python3 bench/boot-race/race.py --config cfg.json run --rounds 10 --first-round 0   # repeat with fresh credentials
 python3 bench/boot-race/race.py --config cfg.json reports                           # Lambda REPORT lines
