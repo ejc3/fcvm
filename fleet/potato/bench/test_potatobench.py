@@ -37,9 +37,12 @@ class Bookkeeping(unittest.TestCase):
 
     def test_a_round_that_ends_without_a_drop_keeps_its_record(self):
         # a ring of 2 at 1000 ms: catches 0 to 2 close lap 0, catches 0 to 3 close lap 1 (900 ms)
-        def summary(seqs, **done):
-            rows = [{"type": "caught", "round": 1, "size": 2, "seq": s, "proof_ok": True} for s in seqs]
+        def summary(seqs, after=(), failed=(), **done):
+            def c(s):
+                return {"type": "caught", "round": 1, "size": 2, "seq": s, "proof_ok": s not in failed}
+            rows = [c(s) for s in seqs]
             rows.append({"type": "size_done", "size": 2, "start_hold_ms": 1000, **done})
+            rows += [c(s) for s in after]
             with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
                 f.write("".join(json.dumps(r) + "\n" for r in rows))
             try:
@@ -52,6 +55,9 @@ class Bookkeeping(unittest.TestCase):
         self.assertEqual(summary([0, 1, 2, 3], reason="timeout"), 900)
         self.assertIsNone(summary([0], reason="timeout"), "no lap completed")
         self.assertEqual(summary([0, 1, 2, 3], reason="dropped", lap=2), 900, "a drop names its lap")
+        self.assertEqual(summary([0, 1, 2], after=[3], reason="timeout"), 1000, "a catch after the round ended")
+        self.assertEqual(summary([0, 1, 3, 2], failed=[2], reason="colour"), 1000, "seq 3 is past a failed catch")
+        self.assertEqual(summary([0, 1, 3], reason="timeout"), 1000, "seq 3 is past a missing catch")
 
 if __name__ == "__main__":
     unittest.main()

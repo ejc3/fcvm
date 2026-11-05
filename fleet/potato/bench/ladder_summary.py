@@ -17,11 +17,16 @@ from potatobench import hold_at  # noqa: E402
 
 
 def ended_in_lap(d, caught):
-    """The lap the round ended in: the drop's own, else the one after the last verified catch."""
+    """The lap the round ended in: the drop's own, else the lap after the catches verified
+    without a gap from seq 0 (as the coordinator counts laps). `caught` holds only the catches
+    logged before the round's `size_done`, not those of its cleanup."""
     if d.get("lap") is not None:
         return d["lap"]
-    seqs = [c["seq"] for c in caught if c.get("proof_ok", True)]
-    return (max(seqs) + 1) // d["size"] if seqs else None
+    ok = {c["seq"]: c.get("proof_ok", True) for c in caught}
+    through = 0
+    while ok.get(through):
+        through += 1
+    return through // d["size"] if through else None
 
 
 def record_hold(d, caught, shrink, min_hold):
@@ -39,15 +44,16 @@ def main():
     shrink = int(sys.argv[2]) if len(sys.argv) > 2 else 100
     min_hold = int(sys.argv[3]) if len(sys.argv) > 3 else 2
     rows = [json.loads(l) for l in open(sys.argv[1])]
-    out = [r for r in rows if r.get("type") == "size_done"]
-    for i, d in enumerate(out, start=1):
+    out = [(j, r) for j, r in enumerate(rows) if r.get("type") == "size_done"]
+    for i, (j, d) in enumerate(out, start=1):
         caught = [r for r in rows if r.get("type") == "caught" and r.get("round") == i]
+        before = [r for r in rows[:j] if r.get("type") == "caught" and r.get("round") == i]
         woke = [r for r in rows if r.get("type") == "woke" and r.get("round") == i]
         slept = [r for r in rows if r.get("type") == "slept" and r.get("round") == i]
         n = d["size"]
-        lap = ended_in_lap(d, caught)
+        lap = ended_in_lap(d, before)
         start = d.get("start_hold_ms")
-        record = record_hold(d, caught, shrink, min_hold)
+        record = record_hold(d, before, shrink, min_hold)
         # wakes after the round's opening wake of every player
         later = woke[n:] if len(woke) > n else []
         print(json.dumps({
