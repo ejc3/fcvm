@@ -39,7 +39,8 @@ serve() {
 D=$FAKE_DIR
 echo "adb $*" >> "$D/log"
 case "$*" in
-  "shell getprop sys.boot_completed") echo 1 ;;
+  # a phone reports booted only once its emulator runs
+  "shell getprop sys.boot_completed") [ -e "$D/emulator-up" ] && echo 1 ;;
   "shell cmd uwb disable-uwb") [ -z "${FAKE_UWB_FAILS:-}" ] || exit 1 ;;
   "shell dumpsys SurfaceFlinger")
     [ -e "$D/go" ] && echo "SurfaceFlinger checked with the go file present" >> "$D/log"
@@ -52,9 +53,11 @@ exit 0
 EOF
   cat > "$D/bin/emulator" <<'EOF'
 #!/bin/bash
+trap 'exit 0' TERM
+${FAKE_EMULATOR_DELAY:+sleep "$FAKE_EMULATOR_DELAY"}
 echo "emulator $*" >> "$FAKE_DIR/log"
 echo "emulator preloads ${LD_PRELOAD:-nothing}" >> "$FAKE_DIR/log"
-trap 'exit 0' TERM
+touch "$FAKE_DIR/emulator-up"
 # a stand-in nobody stopped ends with the test's directory
 while [ -d "$FAKE_DIR" ]; do sleep 0.05; done
 EOF
@@ -114,6 +117,9 @@ D=$(serve)
 has "$D" "streamer streaming" && ok "a phone on the GPU streams" || bad "a phone on the GPU never streamed: $(cat "$D/log" "$D/out")"
 has "$D" "adb install /work/robotpark.apk" && has "$D" "-no-snapshot-load" && ok "every serve boots cold and installs the app it was given" \
   || bad "serve reused a phone or skipped the install: $(cat "$D/log")"
+D=$(FAKE_EMULATOR_DELAY=0.5 serve)
+before "$D" "-no-snapshot-load" "adb install /work/robotpark.apk" && ok "serve installs the app only once a slow emulator runs" \
+  || bad "serve went on before its emulator ran: $(cat "$D/log")"
 has "$D" "SurfaceFlinger checked with the go file present" && bad "SurfaceFlinger was checked after streaming was allowed" \
   || ok "streaming is allowed only after SurfaceFlinger's check"
 before "$D" "-grpc 8554" "streamer streaming" && before "$D" "logcat -d -s ROBOTPARK:I" "streamer streaming" \
