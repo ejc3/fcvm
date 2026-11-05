@@ -276,6 +276,43 @@ fn exit_diagnostics(pid: u32) -> String {
     )
 }
 
+/// How long the kernel may take to finish a SIGKILLed child's exit, and to stop a child that
+/// is asleep in D. In CI run 42098530199 (#1559) a host-wide stall held exits that close a
+/// TAP fd for up to 4.55 s and namespace creations for up to 6.34 s.
+const EXIT_BOUND: Duration = Duration::from_secs(30);
+
+/// SIGKILLs every tracked process when dropped, on unwinding as well as on return.
+struct KillOnDrop<const N: usize>([Tracked; N]);
+
+impl<const N: usize> Drop for KillOnDrop<N> {
+    fn drop(&mut self) {
+        for t in &self.0 {
+            t.kill_if_running();
+        }
+    }
+}
+
+/// Sample `fate(i)` for each of `N` processes until each has been seen other than `Running`
+/// at least once, or `bound` passes, and say which were. One such sample is proof that the
+/// process was sent SIGKILL, so it is kept: a later sample can read stat before PF_EXITING is
+/// set and status after the reap has cleared the pending masks, which reads as `Running`.
+fn seen_signalled<const N: usize>(
+    mut fate: impl FnMut(usize) -> Fate,
+    bound: Duration,
+) -> [bool; N] {
+    let start = std::time::Instant::now();
+    let mut seen = [false; N];
+    loop {
+        for (i, s) in seen.iter_mut().enumerate() {
+            *s |= fate(i) != Fate::Running;
+        }
+        if seen.iter().all(|s| *s) || start.elapsed() >= bound {
+            return seen;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// True iff the tracked process (if any) is still running.
 fn opt_running(t: Option<Tracked>) -> bool {
     t.is_some_and(|p| p.running())
@@ -836,13 +873,13 @@ fn test_sigkill_reaps_rootless_vm_tree() -> Result<()> {
         fc.pid, holder.pid, pasta.pid
     );
     let tree = [("firecracker", fc), ("holder", holder), ("pasta", pasta)];
-    // Every exit from here on must leave nothing behind: SIGKILL ends a stopped process too.
+    // From the first SIGSTOP on, every exit from this test, a panic included, SIGKILLs the
+    // three children through their pidfds: a stopped child whose pdeathsig is missing would
+    // otherwise stay stopped for ever, since passt's PID watch cannot run in it either.
+    let _children = KillOnDrop(tree.map(|(_, t)| t));
     let abandon = |fcvm: &mut std::process::Child| {
         let _ = fcvm.kill();
         let _ = fcvm.wait();
-        for (_, t) in &tree {
-            t.kill_if_running();
-        }
     };
 
     // Stop all three first. A stopped process runs none of its own code, so passt's PID watch
@@ -854,14 +891,15 @@ fn test_sigkill_reaps_rootless_vm_tree() -> Result<()> {
             anyhow::bail!("SIGSTOP to {} (PID {}): {}", role, t.pid, e);
         }
     }
-    let stop_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // A child asleep in D (the stall described under EXIT_BOUND) stops when it wakes.
+    let stop_deadline = std::time::Instant::now() + EXIT_BOUND;
     while !tree
         .iter()
         .all(|(_, t)| matches!(proc_sample(t.pid), Some(s) if s.start == t.start && s.state == 'T'))
     {
         if std::time::Instant::now() > stop_deadline {
             abandon(&mut fcvm);
-            anyhow::bail!("the VM tree did not reach the stopped state within 10 s");
+            anyhow::bail!("the VM tree did not reach the stopped state within {EXIT_BOUND:?}");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -880,15 +918,16 @@ fn test_sigkill_reaps_rootless_vm_tree() -> Result<()> {
     // still stopped with nothing pending and stays Running for ever, so this check does not
     // depend on how long anything takes; the bound only covers the few instructions between
     // dequeueing SIGKILL and setting PF_EXITING, where neither is visible.
-    while tree.iter().any(|(_, t)| t.fate() == Fate::Running)
-        && killed.elapsed() < Duration::from_secs(10)
-    {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    //
+    // One sample showing Dying or Dead is proof, so it is latched: a later sample can read
+    // stat before PF_EXITING is set and status after the reap has cleared the pending masks,
+    // and that mixed sample would read as Running.
+    let signalled = seen_signalled::<3>(|i| tree[i].1.fate(), Duration::from_secs(10));
     let unsignalled: Vec<String> = tree
         .iter()
-        .filter(|(_, t)| t.fate() == Fate::Running)
-        .map(|(role, t)| format!("{} (PID {})", role, t.pid))
+        .zip(signalled)
+        .filter(|(_, s)| !s)
+        .map(|((role, t), _)| format!("{} (PID {})", role, t.pid))
         .collect();
     if !unsignalled.is_empty() {
         abandon(&mut fcvm);
@@ -902,13 +941,10 @@ fn test_sigkill_reaps_rootless_vm_tree() -> Result<()> {
     );
 
     // 2. Completion. The kernel finishes each exit, and it can wait on a global lock first:
-    // closing a TAP fd takes rtnl_lock, which pasta's and Firecracker's exits both do. In CI
-    // run 42098530199 (#1559) every TAP-closing exit and namespace creation on the host waited
-    // at once; SIGKILLed Firecracker exits finished 4.55 s after the kill and namespace
-    // creations waited up to 6.34 s, all released at the same instant, while this test's 5 s
-    // limit expired on a pasta that had already been killed. EXIT_BOUND leaves headroom over
-    // that measurement and still fails on an exit the kernel never finishes.
-    const EXIT_BOUND: Duration = Duration::from_secs(30);
+    // closing a TAP fd takes rtnl_lock, which pasta's and Firecracker's exits both do. In
+    // #1559 this test's old 5 s limit expired on a pasta that had already been killed, during
+    // a stall EXIT_BOUND's comment measures. The bound still fails on an exit the kernel
+    // never finishes, and prints the kernel stack of anything still exiting after 5 s.
     const REPORT_AFTER: Duration = Duration::from_secs(5);
     let mut exited: [Option<Duration>; 3] = [None; 3];
     let mut reported = false;
@@ -1747,6 +1783,49 @@ fn a_killed_process_that_is_still_exiting_is_dying_not_running_1559() {
         fate_from_proc('S', 0, 1 << (libc::SIGTERM - 1), 0),
         Fate::Running
     );
+}
+
+/// #1559 review: a child seen dying stays counted as signalled when a later sample, taken
+/// across its reap, reads as `Running`.
+#[test]
+fn a_child_seen_dying_once_stays_signalled_1559() {
+    // Child 0 is seen dying only on the second round; child 1 is seen dying on the first
+    // round and reads Running on every sample after it.
+    let mut calls = [0usize; 2];
+    let seen = seen_signalled::<2>(
+        |i| {
+            calls[i] += 1;
+            match (i, calls[i]) {
+                (0, 1) => Fate::Running,
+                (0, _) => Fate::Dead,
+                (1, 1) => Fate::Dying,
+                _ => Fate::Running,
+            }
+        },
+        Duration::from_millis(200),
+    );
+    assert_eq!(seen, [true, true]);
+}
+
+/// #1559 review: a panic after the SIGKILL test has stopped its children must still kill
+/// them. A stopped child whose pdeathsig is missing would otherwise stay stopped for ever.
+#[test]
+fn a_panic_still_kills_a_stopped_child_1559() {
+    let child = spawn_sleep_std(1000);
+    let t = Tracked::capture(child.id()).expect("capture live child");
+    t.signal(libc::SIGSTOP).expect("SIGSTOP child");
+    let body = std::panic::catch_unwind(|| {
+        let _children = KillOnDrop([t]);
+        panic!("a test body that fails after stopping its children");
+    });
+    assert!(body.is_err());
+    let start = std::time::Instant::now();
+    while t.fate() != Fate::Dead && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let fate = t.fate();
+    t.kill_if_running();
+    assert_eq!(fate, Fate::Dead, "the stopped child outlived the panic");
 }
 
 /// Regression test for #628: a SIGKILL'd-but-unreaped child is a zombie whose `/proc/<pid>`
