@@ -25,6 +25,7 @@ fn hello(at: u64, host: &str, gpus: usize) -> Event {
             boot: Default::default(),
             phones: vec![],
             phone_actions: vec![],
+            potato_players: 0,
         },
     }
 }
@@ -309,6 +310,7 @@ fn a_host_that_comes_up_after_the_fleet_is_awake_still_records_its_wake() {
             .into(),
             phones: vec![],
             phone_actions: vec![],
+            potato_players: 0,
         },
     }];
     later.push(running(240000, "h1", "slot-1"));
@@ -527,6 +529,7 @@ fn phone_gpus_take_no_place_on_the_wall() {
                 boot: Default::default(),
                 phones: (6..8).map(gpu).collect(),
                 phone_actions: vec![],
+                potato_players: 0,
             },
         },
     );

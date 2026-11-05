@@ -320,6 +320,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     boot,
                     phones,
                     phone_actions,
+                    potato_players: _,
                 } => {
                     // The connection names the host; a hello naming another is ignored.
                     if named == host {
@@ -405,6 +406,8 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                         quarantine(&mut state.fleet, host, sbdf, error, report.clone(), at);
                     }
                 }
+                // The potato game reads these (docs/fleet/ARCHITECTURE.md, "Potato mode").
+                AgentMsg::Potato(_) => {}
             }
             None
         }

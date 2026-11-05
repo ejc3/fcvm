@@ -816,6 +816,7 @@ dependencies = [
  "exec-proto",
  "failpoint",
  "fleet-core",
+ "fleet-potato",
  "fs2",
  "fuse-pipe",
  "futures-util",

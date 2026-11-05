@@ -6,6 +6,9 @@
 use anyhow::{bail, Context, Result};
 use std::net::Ipv6Addr;
 
+/// Potato players' addresses start here in the host's prefix.
+pub const PLAYER_BASE: u128 = 0x1000;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Prefix {
     base: u128,
@@ -37,6 +40,17 @@ impl Prefix {
     /// fcvm never gives a VM.
     pub fn aggregator_address(&self) -> Ipv6Addr {
         Ipv6Addr::from(self.base | 1)
+    }
+
+    /// The address of potato player `n` (potato mode): `<prefix>::<0x1000 + n>`, clear of
+    /// the slots' addresses (the GPUs' indexes plus 2).
+    pub fn player_address(&self, n: u32) -> Result<Ipv6Addr> {
+        let host_bits = 128 - u32::from(self.len);
+        let k = u128::from(n) + PLAYER_BASE;
+        if host_bits < 128 && k >> host_bits != 0 {
+            bail!("{self} has no address for potato player {n}");
+        }
+        Ok(Ipv6Addr::from(self.base | k))
     }
 
     /// The address of the slot on the GPU at `index` in the host's inventory.
@@ -146,5 +160,20 @@ mod tests {
         assert!(small.slot_address(14).is_err(), "past the prefix");
         assert!(Prefix::parse("2001:db8::").is_err());
         assert!(Prefix::parse("2001:db8::/0").is_err());
+    }
+
+    #[test]
+    fn a_player_address_is_clear_of_the_slots() {
+        let p = Prefix::parse("2001:db8:1:2:3::/80").unwrap();
+        assert_eq!(
+            p.player_address(0).unwrap().to_string(),
+            "2001:db8:1:2:3::1000"
+        );
+        assert_eq!(
+            p.player_address(95).unwrap().to_string(),
+            "2001:db8:1:2:3::105f"
+        );
+        let small = Prefix::parse("2001:db8::/116").unwrap();
+        assert!(small.player_address(0).is_err(), "a /116 has no ::1000");
     }
 }

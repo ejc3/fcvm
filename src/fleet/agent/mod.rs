@@ -4,6 +4,7 @@
 pub mod addr;
 pub mod dial;
 pub mod inventory;
+pub mod potato;
 pub mod slot;
 pub mod spot;
 pub mod tls;
@@ -42,6 +43,8 @@ pub struct Agent {
     pub store_ready_file: Option<std::path::PathBuf>,
     /// The host's boot times, sent in every hello ([`boot_times`]).
     pub boot: BTreeMap<String, u64>,
+    /// Potato mode: the host's player VMs.
+    pub potato: Option<potato::PotatoCfg>,
 }
 
 /// The host's aggregator.
@@ -261,7 +264,23 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
         Some(p) => p,
         None => std::env::current_exe().context("locating this fcvm binary")?,
     };
+    let potato = if args.potato_players > 0 {
+        let prefix = ipv6_prefix.clone().context(
+            "--potato-players needs the host's IPv6 prefix (--ipv6-prefix or --ipv6-prefix-from-imds)",
+        )?;
+        prefix.player_address(args.potato_players - 1)?;
+        Some(potato::PotatoCfg {
+            fcvm: fcvm.clone(),
+            image: args.potato_image.clone(),
+            players: args.potato_players,
+            prefix,
+            mem_mib: args.potato_mem,
+        })
+    } else {
+        None
+    };
     let agent = Agent {
+        potato,
         host,
         capacity: args.capacity.unwrap_or(gpus.len()),
         gpus,
@@ -415,8 +434,18 @@ where
         boot: agent.boot.clone(),
         phones: agent.phones.clone(),
         phone_actions: vm::phone_actions(agent.cfg.phone.as_ref()),
+        potato_players: agent.potato.as_ref().map_or(0, |p| p.players),
     })
     .ok();
+    let (potato_tx, potato_rx) = watch::channel(None);
+    let potato_task = agent.potato.clone().map(|cfg| {
+        let out = out.clone();
+        tokio::spawn(async move {
+            if let Err(e) = potato::run(Arc::new(cfg), potato_rx, out).await {
+                tracing::error!(error = %format!("{e:#}"), "potato mode stopped");
+            }
+        })
+    });
     let http = reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -480,6 +509,9 @@ where
             }
             // The dialing connection keeps the replay (dial.rs); nothing to do here.
             CoordMsg::QuarantineStored { .. } => {}
+            CoordMsg::Potato { round } => {
+                potato_tx.send_replace(round);
+            }
             CoordMsg::Assign {
                 slots: list,
                 region: r,
@@ -544,6 +576,11 @@ where
     }
     if let Some(a) = aggregator {
         a.abort();
+    }
+    // the players' VMs stop with the driver: each Vm sends its fcvm SIGTERM when dropped
+    drop(potato_tx);
+    if let Some(t) = potato_task {
+        let _ = t.await;
     }
 
     tracing::info!(
