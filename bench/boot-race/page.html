@@ -109,13 +109,15 @@
 </table></div>
 <p class="muted" style="font-size:14px">Median of the successful samples; p95 is the nearest-rank 95th
 percentile. A failed sample is a run that did not answer within its deadline or whose API call was refused; it
-is counted here and left out of the times.</p>
+is counted here and left out of the times. So is a sample whose answer came from the wrong process (an identity
+check below).</p>
+<div id="failures" class="muted" style="font-size:15px"></div>
 
 <h2>Where each lane starts the clock</h2>
 <ul id="starts"></ul>
 
 <h2>One campaign, interleaved</h2>
-<p>Every sample by the time it started. Each round ran every lane once, one after another, and the order rotated by
+<p>Every sample by the time it started (a hollow mark is a failed attempt). Each round ran every lane once, one after another, and the order rotated by
 one lane per round, so no lane always ran first or last.</p>
 <div class="panel"><svg id="timeline" role="img" aria-label="Sample start times by lane"></svg></div>
 
@@ -157,6 +159,7 @@ const colorOf = (id) => css(COLOR[id.split("-")[0]]);
 const varOf = (id) => `var(${COLOR[id.split("-")[0]]})`;
 
 function fmt(ms){
+  if (ms === null || ms === undefined) return "none";
   if (ms < 1000) return (ms < 100 ? ms.toFixed(1) : ms.toFixed(0)) + " ms";
   return (ms/1000).toFixed(ms < 10000 ? 2 : 1) + " s";
 }
@@ -165,7 +168,7 @@ function utc(t){ return new Date(t).toISOString().slice(11,19) + " UTC"; }
 // ---------------------------------------------------------------- header line
 const first = new Date(D.first_sample_unix_ms), last = new Date(D.last_sample_unix_ms);
 document.getElementById("when").textContent =
-  `${D.lanes.reduce((a,l)=>a+l.n,0)} samples in ${D.rounds} rounds over `+
+  `${D.lanes.reduce((a,l)=>a+l.n,0)} samples (${D.lanes.reduce((a,l)=>a+l.failures,0)} failed attempts) in ${D.rounds} rounds over `+
   `${Math.round((last-first)/60000)} minutes, ${D.setup.region}. Setup and date at the bottom.`;
 
 // ---------------------------------------------------------------- summary
@@ -186,6 +189,19 @@ for (const l of D.lanes){
   li.innerHTML = `<b>${l.name}:</b> <code></code>`;
   li.querySelector("code").textContent = l.start;
   su.appendChild(li);
+}
+
+const fl = document.getElementById("failures");
+const allFailed = D.lanes.flatMap(l => l.failed.map(f => ({...f, lane: l.name})));
+if (allFailed.length === 0) fl.textContent = "No sample failed.";
+else {
+  const ul = document.createElement("ul");
+  for (const f of allFailed){
+    const li = document.createElement("li");
+    li.textContent = `${f.lane}, round ${f.round}${f.t ? ", " + utc(f.t) : ""}: ${f.error}`;
+    ul.appendChild(li);
+  }
+  fl.appendChild(ul);
 }
 
 // ---------------------------------------------------------------- setup table
@@ -220,6 +236,14 @@ for (const [lid, text] of D.setup.checks || []){
     const y = top + r*rowH + rowH/2;
     el("text",{x:0,y:y+5}).textContent = l.short;
     el("line",{x1:left,x2:W-10,y1:y,y2:y,style:"stroke:var(--line)"});
+    for (const f of l.failed){
+      if (!f.t) continue;
+      const x = left + (W-10-left)*(f.t-t0)/span;
+      const c = el("circle",{cx:x.toFixed(1),cy:y,r:4.5,style:`fill:none;stroke:${varOf(l.id)};stroke-width:1.5`});
+      const tt = document.createElementNS(ns,"title");
+      tt.textContent = `${l.short} failed attempt, round ${f.round}, started ${utc(f.t)}`;
+      c.appendChild(tt);
+    }
     for (const s of l.samples){
       const x = left + (W-10-left)*(s.t-t0)/span;
       const c = el("circle",{cx:x.toFixed(1),cy:y,r:4.5,style:`fill:${varOf(l.id)}`});
@@ -235,7 +259,7 @@ for (const [lid, text] of D.setup.checks || []){
 
 // ---------------------------------------------------------------- animation
 const host = document.getElementById("lanes");
-const rows = D.lanes.map((l) => {
+const rows = D.lanes.filter(l => l.samples.length > 0).map((l) => {
   const div = document.createElement("div"); div.className = "lane";
   div.innerHTML = `<div><div class="name"><span class="dot" style="background:${varOf(l.id)}"></span>${l.name}</div>`+
     `<div class="stat">median ${fmt(l.median_ms)} · p95 ${fmt(l.p95_ms)} · n ${l.n}</div></div>`+

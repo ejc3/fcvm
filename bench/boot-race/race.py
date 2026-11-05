@@ -79,19 +79,35 @@ async def one_get(host, port, timeout):
     try:
         writer.write(f"GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
         await writer.drain()
-        raw = await asyncio.wait_for(reader.read(-1), timeout)
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout)
+        if not head.startswith(b"HTTP/1.1 200"):
+            raise ConnectionError(head[:40])
+        length = None
+        for line in head.split(b"\r\n")[1:]:
+            k, _, v = line.partition(b":")
+            if k.strip().lower() == b"content-length":
+                length = int(v.strip())
+        if length is None:
+            raise ConnectionError("answer without Content-Length")
+        body = await asyncio.wait_for(reader.readexactly(length), timeout)
     finally:
         writer.close()
-    head, _, body = raw.partition(b"\r\n\r\n")
-    if not head.startswith(b"HTTP/1.1 200"):
-        raise ConnectionError(head[:40])
     doc = json.loads(body)
     if not doc.get("ok"):
         raise ConnectionError("answer without ok")
     return doc
 
 
-async def probe(host, port, interval, deadline_s, attempt_timeout=1.0, max_inflight=64):
+def port_answers(host, port):
+    """True when something already accepts on host:port (the endpoint is not ours to measure)."""
+    import socket
+
+    with socket.socket() as s:
+        s.settimeout(0.2)
+        return s.connect_ex((host, port)) == 0
+
+
+async def probe(host, port, interval, deadline_s, attempt_timeout=1.0, max_inflight=64, child=None):
     """Start a GET every `interval` seconds until one returns a complete 200; return (t1_ns, answer, attempts)."""
     done = asyncio.get_running_loop().create_future()
     inflight = set()
@@ -100,7 +116,8 @@ async def probe(host, port, interval, deadline_s, attempt_timeout=1.0, max_infli
     async def attempt():
         try:
             doc = await one_get(host, port, attempt_timeout)
-        except (OSError, asyncio.TimeoutError, ConnectionError, ValueError):
+        except (OSError, asyncio.TimeoutError, ConnectionError, ValueError, asyncio.IncompleteReadError,
+                asyncio.LimitOverrunError):
             return
         t1 = time.monotonic_ns()
         if not done.done():
@@ -109,6 +126,8 @@ async def probe(host, port, interval, deadline_s, attempt_timeout=1.0, max_infli
     end = time.monotonic() + deadline_s
     try:
         while not done.done():
+            if child is not None and child.poll() is not None:
+                raise RuntimeError(f"fcvm exited with {child.returncode} before the workload answered")
             if time.monotonic() > end:
                 raise TimeoutError(f"no answer from {host}:{port} in {deadline_s} s after {attempts} attempts")
             inflight = {t for t in inflight if not t.done()}
@@ -142,13 +161,17 @@ class Fcvm:
         else:
             src = ["--pid", str(self.serve_pid)]
         args = [self.bin, "snapshot", "run", *src, "--name", name, "--publish", f"127.0.0.1:{port}:8080"]
+        if port_answers("127.0.0.1", port):
+            raise RuntimeError(f"port {port} already answers before the restore")
         logf = open(f"{self.logdir}/{name}.log", "w")
         env = dict(os.environ, RUST_LOG=os.environ.get("RUST_LOG", "fcvm=info"))
         t0 = time.monotonic_ns()
         start_ms = now_ms()
         proc = subprocess.Popen(args, stdout=logf, stderr=subprocess.STDOUT, env=env, start_new_session=True)
         try:
-            t1, doc, attempts = await probe("127.0.0.1", port, 0.001, 60, attempt_timeout=0.5, max_inflight=512)
+            t1, doc, attempts = await probe(
+                "127.0.0.1", port, 0.001, 60, attempt_timeout=0.5, max_inflight=512, child=proc
+            )
         finally:
             await self.stop(proc)
             logf.close()
@@ -215,9 +238,9 @@ class Ec2:
         ip, _ = self.ip(iid)
         t0 = time.monotonic_ns()
         start_ms = now_ms()
-        self.ec2.start_instances(InstanceIds=[iid])
-        t_api = time.monotonic_ns()
         try:
+            self.ec2.start_instances(InstanceIds=[iid])
+            t_api = time.monotonic_ns()
             t1, doc, attempts = await probe(ip, 8080, 0.02, 300)
         finally:
             # Give the workload a moment so a hibernating guest has nothing in flight, then stop it for next time.
@@ -304,9 +327,14 @@ class Ecs:
         }
 
     async def ec2_sample(self, host_ip):
+        if port_answers(host_ip, 8080):
+            raise RuntimeError("the container instance already answers on 8080 before RunTask")
         t0 = time.monotonic_ns()
         start_ms = now_ms()
-        r = self.ecs.run_task(cluster="boot-race", taskDefinition="boot-race-ec2", launchType="EC2", count=1)
+        r = self.ecs.run_task(
+            cluster="boot-race", taskDefinition="boot-race-ec2", launchType="EC2", count=1,
+            placementConstraints=[{"type": "memberOf", "expression": f"ec2InstanceId == {self.cfg['ecs_host_instance']}"}],
+        )
         if r.get("failures"):
             raise RuntimeError(f"RunTask failures: {r['failures']}")
         t_api = time.monotonic_ns()
@@ -368,10 +396,43 @@ class Lambda:
 
 
 # ------------------------------------------------------------------ the campaign
+def check_identity(lane, prev, answer, cfg):
+    """Refuse a sample whose answer did not come from the process the lane claims; return the reason or None."""
+    same = prev is not None and prev["proc_id"] == answer["proc_id"]
+    if lane == "ec2-hibernate":
+        if prev is None:
+            return "no identity recorded before the hibernation"
+        if not same:
+            return "answered from a new process: the instance booted instead of resuming from hibernation"
+    elif lane == "lambda-warm":
+        if not same:
+            return "answered from a new runtime process: a cold start, not a warm invocation"
+    elif lane.startswith("fcvm"):
+        want = cfg.get("fcvm_proc_id")
+        if want and answer["proc_id"] != want:
+            return "answered from a process that is not the snapshot's workload"
+    elif lane != "lambda-cold" and same:
+        return "answered from the previous sample's process"
+    return None
+
+
+def last_answers(cfg):
+    """The identity each lane last answered with: prepare-time identities, then this campaign's records."""
+    prev = dict(cfg.get("identities", {}))
+    path = cfg["results"] + "/samples.jsonl"
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                r = json.loads(line)
+                if r.get("answer"):
+                    prev[r["lane"]] = r["answer"]
+    return prev
+
+
 async def run(cfg, rounds, first_round, lanes):
+    prev_answer = last_answers(cfg)
     out = open(cfg["results"] + "/samples.jsonl", "a")
     fcvm = Fcvm(cfg) if any(l.startswith("fcvm") for l in lanes) else None
-    prev_answer = {}
     for rnd in range(first_round, first_round + rounds):
         ec2 = Ec2(cfg) if any(l.startswith("ec2") for l in lanes) else None
         ecs = Ecs(cfg) if any(l.startswith("ecs") for l in lanes) else None
@@ -380,7 +441,7 @@ async def run(cfg, rounds, first_round, lanes):
         order = lanes[k:] + lanes[:k]
         for lane in order:
             log(f"round {rnd} lane {lane}")
-            rec = {"round": rnd, "lane": lane}
+            rec = {"round": rnd, "lane": lane, "t_attempt_unix_ms": now_ms()}
             try:
                 if lane.startswith("fcvm"):
                     s = await fcvm.sample(lane, f"br-{lane}-{rnd}", 21000 + rnd * 10 + LANES.index(lane))
@@ -396,13 +457,19 @@ async def run(cfg, rounds, first_round, lanes):
                     s = await ecs.ec2_sample(cfg["ecs_host_ip"])
                 else:
                     s = await lam.sample(lane)
-                rec.update(s, ok=True)
                 prev = prev_answer.get(lane)
+                rec.update(s)
                 if prev is not None:
                     rec["same_proc_as_previous"] = prev["proc_id"] == s["answer"]["proc_id"]
                     rec["same_boot_as_previous"] = prev["boot_id"] == s["answer"]["boot_id"]
                 prev_answer[lane] = s["answer"]
-                log(f"  {lane}: {s['ms']:.1f} ms")
+                why = check_identity(lane, prev, s["answer"], cfg)
+                if why:
+                    rec.update(ok=False, error=f"IdentityCheck: {why}")
+                    log(f"  {lane}: {s['ms']:.1f} ms REFUSED {why}")
+                else:
+                    rec["ok"] = True
+                    log(f"  {lane}: {s['ms']:.1f} ms")
             except Exception as e:  # a failed sample is recorded, never dropped
                 rec.update(ok=False, error=f"{type(e).__name__}: {e}", t_failed_unix_ms=now_ms())
                 log(f"  {lane}: FAILED {rec['error']}")

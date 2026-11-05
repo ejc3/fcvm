@@ -37,7 +37,7 @@ def save(path, cfg):
 def wait_answer(ip, timeout=600):
     import asyncio
 
-    asyncio.run(race.probe(ip, 8080, 0.5, timeout))
+    return asyncio.run(race.probe(ip, 8080, 0.5, timeout))[1]
 
 
 def image(cfg, s):
@@ -70,6 +70,13 @@ def lambda_code(cfg, s):
         env = lam.get_function_configuration(FunctionName=name)["Environment"]["Variables"]
         race.log(f"{name}: code updated, env {env}")
     cfg["function_urls"] = urls
+    # Prime the warm function: the warm lane's first sample must come from this same runtime process.
+    lam_lane = race.Lambda(cfg)
+    first = lam_lane.call(urls["warm"])["answer"]
+    again = lam_lane.call(urls["warm"])["answer"]
+    if first["proc_id"] != again["proc_id"]:
+        raise SystemExit("the warm function answered from two processes in a row")
+    cfg.setdefault("identities", {})["lambda-warm"] = again
 
 
 def ssh_key():
@@ -141,12 +148,16 @@ def instances(cfg, s):
             TagSpecifications=race.tags(f"boot-race-{lane.replace('_', '-')}"),
         )
         made[lane] = (r["Instances"][0]["InstanceId"], r["Instances"][0]["PrivateIpAddress"], hib)
+    answers = {}
     for lane, (iid, ip, hib) in made.items():
-        wait_answer(ip)
+        answers[lane] = wait_answer(ip)
         race.log(f"{lane} answers")
     # AWS asks for a few minutes after launch before the first hibernation, for the guest agent to prepare.
     time.sleep(240)
+    ids = cfg.setdefault("identities", {})
     for lane, (iid, ip, hib) in made.items():
+        # The identity just before the stop: a hibernate resume must answer from this same process.
+        ids["ec2-hibernate" if hib else "ec2-start"] = wait_answer(ip, 10)
         ec2.stop_instances(InstanceIds=[iid], Hibernate=hib)
         cfg[lane] = iid
     for lane, (iid, ip, hib) in made.items():
@@ -171,9 +182,11 @@ def ecs_host(cfg, s):
     race.log("container instance registered; pulling the image with one task")
     t = ecs.run_task(cluster="boot-race", taskDefinition="boot-race-ec2", launchType="EC2", count=1)
     arn = t["tasks"][0]["taskArn"]
-    wait_answer(cfg["ecs_host_ip"])
-    ecs.stop_task(cluster="boot-race", task=arn, reason="warm-up done")
-    ecs.get_waiter("tasks_stopped").wait(cluster="boot-race", tasks=[arn])
+    try:
+        cfg.setdefault("identities", {})["ecs-ec2"] = wait_answer(cfg["ecs_host_ip"])
+    finally:
+        ecs.stop_task(cluster="boot-race", task=arn, reason="warm-up done")
+        ecs.get_waiter("tasks_stopped").wait(cluster="boot-race", tasks=[arn])
     race.log("ECS host warm")
 
 
