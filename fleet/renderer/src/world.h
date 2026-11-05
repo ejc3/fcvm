@@ -23,8 +23,10 @@ HD V4 tab_fetch(const V4* t, int i) { return t[i]; }
 HD float alt_flat(V3 p) { return p.y + (p.x * p.x + p.z * p.z) * (0.5f / PLANET_R); }
 
 // Value noise with analytic derivatives from a table whose texel (i, j) holds
-// the four lattice values (i,j) (i+1,j) (i,j+1) (i+1,j+1): one fetch per call.
-// Returns (value in -1..1, d/dx, d/dy).
+// the bilinear coefficients of the four lattice values a = (i,j), b = (i+1,j),
+// c = (i,j+1), d = (i+1,j+1): a, b - a, c - a, a - b - c + d (fill_noise_table),
+// so a call fetches one texel and does no differencing. Returns (value in
+// -1..1, d/dx, d/dy).
 HD V3 noised(V2 x, const V4* tab) {
   float fx = floorf(x.x), fy = floorf(x.y);
   int ix = ((int)fx) & (NOISE_N - 1), iy = ((int)fy) & (NOISE_N - 1);
@@ -34,7 +36,7 @@ HD V3 noised(V2 x, const V4* tab) {
   float uy = wy * wy * wy * (wy * (wy * 6.0f - 15.0f) + 10.0f);
   float dux = 30.0f * wx * wx * (wx * (wx - 2.0f) + 1.0f);
   float duy = 30.0f * wy * wy * (wy * (wy - 2.0f) + 1.0f);
-  float k0 = c.x, k1 = c.y - c.x, k2 = c.z - c.x, k4 = c.x - c.y - c.z + c.w;
+  float k0 = c.x, k1 = c.y, k2 = c.z, k4 = c.w;
   return {k0 + k1 * ux + k2 * uy + k4 * ux * uy, dux * (k1 + k4 * uy), duy * (k2 + k4 * ux)};
 }
 HD float noise(V2 x, const V4* tab) { return noised(x, tab).x; }

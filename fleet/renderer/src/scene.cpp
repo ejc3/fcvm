@@ -347,8 +347,12 @@ void fill_noise_table(V4* tab) {
     return u01(h) * 2.0f - 1.0f;
   };
   for (int j = 0; j < NOISE_N; j++)
-    for (int i = 0; i < NOISE_N; i++)
-      tab[j * NOISE_N + i] = {val(i, j), val(i + 1, j), val(i, j + 1), val(i + 1, j + 1)};
+    for (int i = 0; i < NOISE_N; i++) {
+      float a = val(i, j), b = val(i + 1, j), c = val(i, j + 1), d = val(i + 1, j + 1);
+      // the coefficients noised interpolates (world.h), in the float
+      // arithmetic it used to do per call: the same values on host and GPU
+      tab[j * NOISE_N + i] = {a, b - a, c - a, a - b - c + d};
+    }
 }
 
 const HostNoise& host_noise() {

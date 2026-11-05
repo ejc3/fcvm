@@ -171,6 +171,83 @@ python3 tools/seam_metric.py out.png 4 2              # seam ratio at every tile
 "Viewers per renderer") opens many frame streams as the page does and reports
 each stream's frame rate, frame delay, and frames dropped for a slow reader.
 
+## The trace's code size (round 21, 2026-11-05)
+
+Round 20 left the heavy terrain tiles 1.53 (432 lines) and 1.68 (540 lines) times short of one
+sample on every pixel at the owner's view. Nsight Compute on the trace kernel (`k_moving`) of
+the heaviest 432-line tile of a staging pose: 0.96 instructions issued per cycle per SM, 14.3
+cycles between a warp's issues, 10.0 of them waiting for the instruction itself
+(`no_instruction`). Every device function was inlined into every caller, so the kernel was
+42,336 SASS instructions, and warps at different points of the march, shading, water and
+clouds kept missing the instruction cache. With the changes below the source view puts 46% of
+the executed instructions in `noised` and 18% more in the octave loop of `terrain_from`: the
+terrain field is the work that is left.
+
+- **Out of line.** The terrain field (`terrain_h`, `terrain_hw`, `macro_smooth`), the marches
+  (`march_terrain`, `terrain_shadow`, `march_clouds`), the cloud density and shadow, scatter,
+  the sky, the ring, the landmark shadow and the water are `__noinline__`. The kernel is
+  12,552 instructions, and `__launch_bounds__(64, 8)` keeps it at 128 registers.
+- **The eye-ray march in its own kernel** (`k_march`, 64 registers, twice the warps per SM).
+  `k_moving` shades the first sample from its distance; further samples march as before.
+- **The noise table holds the bilinear coefficients** (`fill_noise_table`), computed in the
+  float arithmetic `noised` did per call, so each octave skips four subtractions.
+
+The arithmetic is main's; the compiler contracts it differently out of line, which moves a
+march's decision on a few silhouette pixels. In the run below, each pose's one-sample frames
+differ from main's in 0.5 to 4.7% of pixels and by more than 8 levels in at most 0.003%. Drawn
+at 64 samples a frame (the heaviest four tiles of st1, st4 and s4), they differ in 0.45 to 4.2%
+of pixels, against 25 to 60% between main at 56 and at 64 samples (PSNR 66 to 76 dB against 51
+to 57). The coefficient table changes no
+pixel. `fleet-renderer-test` passes (94 checks).
+
+Measured on a g4dn.metal from the fleet host image (T4 at 1590 MHz, one fcvm VM per GPU), main
+and this round interleaved in one VM (main, this, main, this, main), 60 moving frames at one
+sample per drawn pixel after 30 warm-up frames, every tile of the 3456 x 1944 direct layout
+at its staging height. The poses are five read from the staging coordinator on 2026-11-05
+(st1 to st5) and five from 2026-11-03 (s1, s2, s4, s5, s6). The heaviest 432- and 540-line
+tile of each pose, trace ns per sample over the median and the 95th percentile frame:
+
+| pose | tile | main: ns/sample (median, p95) | this round | ratio of medians |
+|---|---|---|---|---|
+| st1 | 432 lines | 54.0, 62.0 | 39.4, 45.0 | 0.730 |
+| st1 | 540 lines | 55.4, 60.6 | 37.5, 38.7 | 0.678 |
+| st2 | 432 lines | 30.4, 31.7 | 23.4, 24.1 | 0.769 |
+| st2 | 540 lines | 38.6, 40.9 | 29.7, 31.3 | 0.769 |
+| st3 | 432 lines | 38.5, 39.4 | 36.8, 37.8 | 0.956 |
+| st3 | 540 lines | 22.3, 23.4 | 16.0, 16.9 | 0.720 |
+| st4 | 432 lines | 63.3, 64.7 | 46.5, 47.3 | 0.735 |
+| st4 | 540 lines | 61.8, 63.2 | 46.1, 46.7 | 0.746 |
+| st5 | 432 lines | 68.5, 72.0 | 46.9, 50.9 | 0.684 |
+| st5 | 540 lines | 71.1, 76.8 | 45.9, 48.9 | 0.646 |
+| s1 | 432 lines | 35.9, 37.3 | 26.5, 27.2 | 0.737 |
+| s1 | 540 lines | 31.5, 33.4 | 24.7, 25.8 | 0.786 |
+| s2 | 432 lines | 31.6, 32.5 | 23.4, 23.7 | 0.741 |
+| s2 | 540 lines | 27.9, 28.3 | 21.4, 21.6 | 0.768 |
+| s4 | 432 lines | 42.8, 43.6 | 40.1, 40.8 | 0.936 |
+| s4 | 540 lines | 28.4, 30.2 | 20.3, 21.8 | 0.713 |
+| s5 | 432 lines | 31.7, 35.4 | 24.2, 26.2 | 0.764 |
+| s5 | 540 lines | 46.3, 47.5 | 33.0, 34.2 | 0.712 |
+| s6 | 432 lines | 33.1, 33.5 | 25.9, 26.7 | 0.781 |
+| s6 | 540 lines | 30.8, 32.2 | 23.9, 24.5 | 0.776 |
+
+Over the 65 tiles that trace at 25 ns a sample or more on main, this round takes 0.760 of main's
+time (0.629 to 0.968).
+
+What is left: the heaviest tiles of st1, st4 and st5 trace at 37 to 47 ns a sample on their
+median frame, and one sample a pixel at 432 lines needs about 39 (a 23.3 ms frame at the fit's
+0.70 of the slot, less 1.8 ms of resolve and denoise), at 540 about 33. Of `k_moving`'s time on
+those tiles, terrain shading (the sun's shadow march and the bounce march among it) is 45 to
+83%, clouds 12 to 51%, and water up to half on a tile that shows a lake. The cloud march takes
+27 to 46 fine steps a sample there and finds cloud in few of them (under one light march a
+sample): it walks where `cloud_maybe` passes and the density is zero, until its cap of 64 fine
+steps. That cap decides which clouds behind are drawn, so a cheaper walk changes the picture.
+Tried and dropped, each measured
+the same way: octaves added only while the march is near the surface (4.5% slower), fetching
+each octave's texel two octaves ahead (2 to 7% slower), a half-precision noise table (within
+2%), the march started at TERRAIN_MAX for an eye above it (3 to 8% faster for a high eye, but
+1.2% of converged pixels moved by more than 8 levels), `k_moving` at 96 or 80 registers
+(within 1%), and the water's glitter shadow only where the glitter shows (no change).
+
 ## The grid budget at the owner's view (round 20, 2026-11-04)
 
 With rounds 18 and 19 deployed, the staging wall in direct mode at 3456 x 1944 held at a

@@ -166,7 +166,13 @@ __device__ float sphere_near(V3 o, V3 d, float hs) {
 // radiance (for unit sun irradiance scaled by cP.sun_e) and the transmittance.
 __device__ __forceinline__ float sph_alt(V3 p) { return length(v3(p.x, p.y + PLANET_R, p.z)) - PLANET_R; }
 
-__device__ V3 scatter(V3 o, V3 d, float tmax, int N, V3* trans_out) {
+// Out of line (__noinline__ here and on the cloud, terrain, march, shadow,
+// ring, landmark, sky and water functions below). Inlined into every caller,
+// they made the trace kernel 42,336 instructions, and on a heavy terrain tile
+// its warps waited on instruction fetch for 10.0 of the 14.3 cycles between
+// issues (Nsight Compute, no_instruction). Out of line it is 12,552
+// instructions and that wait 2.7 of 10.4. The arithmetic is the same.
+__device__ __noinline__ V3 scatter(V3 o, V3 d, float tmax, int N, V3* trans_out) {
   V3 sun = cP.sun_dir;
   float c = dot(d, sun);
   float pr = phase_ray(c), pm = phase_mie(c);
@@ -238,7 +244,7 @@ __global__ void k_sky(V4* out) {
   }
   out[j * SKY_W + i] = v4(L.x, L.y, L.z, 1);
 }
-__device__ V3 sky_lookup(V3 d) {
+__device__ __noinline__ V3 sky_lookup(V3 d) {
   float az = atan2f(d.z, d.x);
   if (az < 0) az += 2.0f * PI_F;
   float el = asinf(clampf(d.y, -1.0f, 1.0f)) / (0.5f * PI_F);  // -1..1
@@ -307,7 +313,7 @@ __device__ __forceinline__ float cloud_base(V3 p, float h, V2 w, V3* qo) {
 
 // Test for the coarse march: false only where cloud_density is zero (it skips
 // the height profile and the detail erosion, which only remove density).
-__device__ bool cloud_maybe(V3 p) {
+__device__ __noinline__ bool cloud_maybe(V3 p) {
   float h = alt_flat(p);
   float h01 = (h - CLOUD_BASE) * (1.0f / (cP.cloud_top - CLOUD_BASE));
   if (h01 <= 0.0f || h01 >= 1.0f) return false;
@@ -318,7 +324,7 @@ __device__ bool cloud_maybe(V3 p) {
   return cloud_base(p, cloud_vh(h, cloud_tw(cov)), w, &q) > 1.0f - cov;
 }
 
-__device__ float cloud_density(V3 p, bool detail) {
+__device__ __noinline__ float cloud_density(V3 p, bool detail) {
   float h = alt_flat(p);
   float h01 = (h - CLOUD_BASE) * (1.0f / (cP.cloud_top - CLOUD_BASE));
   if (h01 <= 0.0f || h01 >= 1.0f) return 0.0f;
@@ -371,7 +377,7 @@ __device__ float cloud_light_od(V3 p, int n) {
 }
 
 // Transmittance of sunlight through clouds reaching a ground point.
-__device__ float cloud_shadow(V3 p, V3 l) {
+__device__ __noinline__ float cloud_shadow(V3 p, V3 l) {
   if (l.y <= 0.01f) return 1.0f;
   float t0 = sphere_near(p, l, CLOUD_BASE), t1 = sphere_near(p, l, cP.cloud_top);
   if (t0 < 0.0f || t1 < 0.0f) return 1.0f;
@@ -470,7 +476,7 @@ __device__ __forceinline__ float cloud_up_od(V3 p) {
   return cloud_density(p + u * 0.12f, false) * 0.2f + cloud_density(p + u * 0.45f, false) * 0.5f;
 }
 
-__device__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bool cheap) {
+__device__ __noinline__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bool cheap) {
   CloudOut out{v3(0.0f), 1.0f, 0.0f};
   float ho = alt_flat(o);
   float ta, tb;
@@ -587,12 +593,20 @@ __device__ __forceinline__ Macro macro_at(V2 p) {
   }
   return macro_direct(p, cG.noise);
 }
-__device__ __forceinline__ float terrain(V2 p, int oct) { return terrain_from(p, macro_at(p), oct, cG.noise); }
+// The terrain field, out of line like scatter: every march step, normal and
+// shading point calls these.
+__device__ __noinline__ float terrain_h(V2 p, Macro m, int oct) { return terrain_from(p, m, oct, cG.noise); }
+__device__ __noinline__ V2 terrain_hw(V2 p, Macro m, int oct) {
+  float w;
+  float h = terrain_from(p, m, oct, cG.noise, &w);
+  return v2(h, w);
+}
+__device__ __forceinline__ float terrain(V2 p, int oct) { return terrain_h(p, macro_at(p), oct); }
 
 // The baked fields through a quadratic B-spline (9 texels). Hardware bilinear
 // filtering is only C0 and steps its weights in 1/256 of a texel, which shows
 // in shading normals as streaks; marching does not see that, shading does.
-__device__ Macro macro_smooth(V2 p) {
+__device__ __noinline__ Macro macro_smooth(V2 p) {
   float x = (p.x * (1.0f / MACRO_KM) + 0.5f) * MACRO_N - 0.5f;
   float y = (p.y * (1.0f / MACRO_KM) + 0.5f) * MACRO_N - 0.5f;
   if (!(x > 2.0f && y > 2.0f && x < MACRO_N - 3.0f && y < MACRO_N - 3.0f)) return macro_direct(p, cG.noise);
@@ -611,12 +625,11 @@ __device__ Macro macro_smooth(V2 p) {
   r.land = a.x; r.massif = a.y; r.w = v2(a.z, a.w);
   return r;
 }
-__device__ __forceinline__ float terrain_s(V2 p, int oct) { return terrain_from(p, macro_smooth(p), oct, cG.noise); }
+__device__ __forceinline__ float terrain_s(V2 p, int oct) { return terrain_h(p, macro_smooth(p), oct); }
 // Terrain, or the water over it (the sea at 0, lakes in basins).
 __device__ __forceinline__ float ground_h(V2 p, int oct) {
-  float w;
-  float g = terrain_from(p, macro_at(p), oct, cG.noise, &w);
-  return fmaxf(g, w);
+  V2 hw = terrain_hw(p, macro_at(p), oct);
+  return fmaxf(hw.x, hw.y);
 }
 
 __global__ void k_macro(float4* out) {
@@ -632,7 +645,7 @@ __device__ __forceinline__ int march_oct(float t) { return t < 3.0f ? 9 : t < 12
 
 // Intersect the ray with terrain and sea. Returns distance or -1. `tol` is the
 // accepted miss as a fraction of distance (about a pixel's angle).
-__device__ float march_terrain(V3 o, V3 d, float tmin, float tmax, int max_steps, int oct_cap, float tol = 0.0008f) {
+__device__ __noinline__ float march_terrain(V3 o, V3 d, float tmin, float tmax, int max_steps, int oct_cap, float tol = 0.0008f) {
   float t = tmin, tp = tmin;
   for (int i = 0; i < max_steps; i++) {
     V3 p = o + d * t;
@@ -661,9 +674,9 @@ __device__ float march_terrain(V3 o, V3 d, float tmin, float tmax, int max_steps
 }
 
 // 1 if the sun (direction l) is visible from p over the terrain.
-__device__ float ring_cover(V3 o, V3 d);  // the orbital ring's opacity along a ray (below)
+__device__ __noinline__ float ring_cover(V3 o, V3 d);  // the orbital ring's opacity along a ray (below)
 
-__device__ float terrain_shadow(V3 p, V3 l) {
+__device__ __noinline__ float terrain_shadow(V3 p, V3 l) {
   float t = 0.004f;
   const int n = cP.hq ? 56 : 32;  // the high-quality path follows long low-sun shadows further
   for (int i = 0; i < n; i++) {
@@ -844,7 +857,7 @@ __device__ bool landmark_box(const GText& g, V3 ol, V3 dl, float* ta, float* tb)
 // Sunlight reaching p past the landmark letters (1: none in the way, 0: a
 // letter in the way). The letters cast their shadows on the terrain through
 // this.
-__device__ float landmark_vis(V3 p, V3 l) {
+__device__ __noinline__ float landmark_vis(V3 p, V3 l) {
   for (int i = 0; i < cP.n_text; i++) {
     const GText& g = cP.text[i];
     if (!casts_landmark_shadow(g)) continue;
@@ -1015,7 +1028,7 @@ __device__ float ring_alpha(V2 uv, int* kind) {
 }
 
 // Opacity of the band along o + d*s (0 where nothing is hit).
-__device__ float ring_cover(V3 o, V3 d) {
+__device__ __noinline__ float ring_cover(V3 o, V3 d) {
   float t = ring_hit(o, d);
   if (t <= 0.0f) return 0.0f;
   V3 p = o + d * t;
@@ -1062,7 +1075,7 @@ __device__ V3 ring_shade(V3 o, V3 d, float t, float* alpha) {
   return col;
 }
 
-__device__ V3 sky_ray(V3 o, V3 d, bool with_sun) {
+__device__ __noinline__ V3 sky_ray(V3 o, V3 d, bool with_sun) {
   float tt = sphere_far(o, d, 60.0f);
   V3 T;
   int n = sph_alt(o) > 15.0f ? 40 : 24;  // the limb seen from high up is a long path
@@ -1079,7 +1092,7 @@ __device__ V3 sky_ray(V3 o, V3 d, bool with_sun) {
 }
 
 // Water at p (on the sea, or on a lake at `level`).
-__device__ V3 shade_water(V3 p, V3 rd, float t, float level, Rng& rng, bool full) {
+__device__ __noinline__ V3 shade_water(V3 p, V3 rd, float t, float level, Rng& rng, bool full) {
   V2 q = v2(p.x, p.z) * 70.0f;
   float wt = cP.wave_t;
   V3 n1 = noised(q + v2(wt, 0.35f * wt), cG.noise);
@@ -1163,21 +1176,27 @@ __global__ void k_sunvis() {
   g_sunvis = v;
 }
 
-__device__ Hit trace(V3 o, V3 d, float pix, Rng& rng) {
-  Hit hres;
-  hres.alb = v3(1.0f);
-  hres.nrm = -d;
+// The eye ray's distance to terrain or sea, or -1.
+__device__ __forceinline__ float primary_march(V3 o, V3 d, float pix) {
   // far enough to reach the horizon from any height (from 100 km it is 1,130 km away)
   float hz = sqrtf(2.0f * PLANET_R * fmaxf(alt_flat(o), 0.0f)) + 300.0f;
   // below 10 km the horizon is inside 360 km and haze hides what lies past it;
   // from higher up the march reaches the horizon, with more steps
   bool high = hz > 360.0f + 300.0f;
-  float th = march_terrain(o, d, 0.0f, high ? hz : 360.0f, high ? 360 : 260, 9, fmaxf(0.6f * pix, 0.0002f));
+  return march_terrain(o, d, 0.0f, high ? hz : 360.0f, high ? 360 : 260, 9, fmaxf(0.6f * pix, 0.0002f));
+}
+
+// th_pre: the eye ray's march, when k_march already took it (-2 when not).
+__device__ Hit trace(V3 o, V3 d, float pix, Rng& rng, float th_pre = -2.0f) {
+  Hit hres;
+  hres.alb = v3(1.0f);
+  hres.nrm = -d;
+  float th = th_pre > -1.5f ? th_pre : primary_march(o, d, pix);
   V3 L;
   if (th >= 0.0f) {
     V3 p = o + d * th;
-    float wl;
-    float h = terrain_from(v2(p.x, p.z), macro_at(v2(p.x, p.z)), 8, cG.noise, &wl);
+    V2 hw = terrain_hw(v2(p.x, p.z), macro_at(v2(p.x, p.z)), 8);
+    float h = hw.x, wl = hw.y;
     if (h <= wl) {
       L = shade_water(p, d, th, wl, rng, true);
       hres.id = 2.0f;
@@ -1571,12 +1590,32 @@ __global__ void k_moving_skip(float4* ring, float2* ring_aux, float4* ring_g) {
   ring_g[idx] = make_float4(1.0f, 1.0f, 1.0f, 0.0f);
 }
 
+// The first sample's eye-ray march of each drawn pixel (th, over the drawn
+// region), in a kernel of its own: it needs 64 registers where the whole trace
+// needs 128, so twice the warps share an SM and hide the noise table's
+// latency. k_moving shades from it. The jitter is the first sample's, drawn
+// from the same seed as k_moving's, so every sample is what one kernel drew.
+__global__ void k_march(float* th) {
+  int i, j;
+  if (!checker_pixel(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y, cP.ex0, cP.ey0, cP.ew,
+                     cP.eh, cP.half, cP.parity, &i, &j))
+    return;
+  uint32_t X = (uint32_t)(cP.ex0 + i), Y = (uint32_t)(cP.ey0 + j);
+  const GCam& cam = cP.cam;
+  float pix = 2.0f * cam.tan_half / cP.full_h;
+  Rng rng{hash4(X, Y, cP.seed, 0u)};
+  float jx = rng.next(), jy = rng.next();
+  th[j * cP.ew + i] = primary_march(cam.pos, ray_dir(cam, X + jx, Y + jy), pix);
+}
+
 // Draw this frame's samples over the drawn region (tile plus guard band) into
 // the ring entry for the frame: the mean of `spp` samples seeded by (pixel,
 // frame seed, s), the first sample's hit distance and kind. On a checkerboard
 // frame a thread runs only for each drawn pixel (checker_pixel); k_moving_skip
-// writes the rest.
-__global__ void k_moving(float4* ring, float2* ring_aux, float4* ring_g) {
+// writes the rest. The first sample starts from k_march's distance. Eight
+// blocks of 64 threads per SM keep it at 128 registers (out-of-line calls
+// otherwise take it to 134 and seven blocks).
+__global__ void __launch_bounds__(64, 8) k_moving(float4* ring, float2* ring_aux, float4* ring_g, const float* th) {
   int i, j;
   if (!checker_pixel(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y, cP.ex0, cP.ey0, cP.ew,
                      cP.eh, cP.half, cP.parity, &i, &j))
@@ -1590,7 +1629,7 @@ __global__ void k_moving(float4* ring, float2* ring_aux, float4* ring_g) {
   for (int s = 0; s < cP.spp; s++) {
     Rng rng{hash4(X, Y, cP.seed, (uint32_t)s)};
     float jx = rng.next(), jy = rng.next();
-    Hit hh = trace(cam.pos, ray_dir(cam, X + jx, Y + jy), pix, rng);
+    Hit hh = trace(cam.pos, ray_dir(cam, X + jx, Y + jy), pix, rng, s == 0 ? th[idx] : -2.0f);
     if (!isfinite(hh.L.x + hh.L.y + hh.L.z)) { atomicAdd(&g_bad, 1u); hh.L = v3(0.0f); }
     sum += hh.L;
     asum += hh.alb;
@@ -2329,7 +2368,8 @@ void Renderer::ensure_buffers(const Tile& t) {
   cudaFree(rgba_); cudaFree(hdr_); cudaFree(display_); cudaFree(hold_blend_);
   cudaFree(hold_sum_); cudaFree(hold_aux_);
   for (int i = 0; i < TEMPORAL_WINDOW; i++) { cudaFree(ring_[i]); cudaFree(ring_aux_[i]); cudaFree(ring_g_[i]); }
-  cudaFree(fill_c_); cudaFree(fill_a_); cudaFree(fill_g_); cudaFree(hold_g_); cudaFree(display_g_);
+  cudaFree(fill_c_); cudaFree(fill_a_); cudaFree(fill_g_); cudaFree(hold_g_); cudaFree(display_g_); cudaFree(th_);
+  CK(cudaMalloc(&th_, ne * sizeof(float)));
   cudaFree(dn_[0]); cudaFree(dn_[1]); cudaFree(dn_gp_);
   CK(cudaMalloc(&dn_gp_, nr * sizeof(float4)));
   CK(cudaMalloc(&fill_c_, ne * sizeof(float4)));
@@ -2460,7 +2500,9 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
     if (stride > 1)
       k_moving_skip<<<dim3((ew_ + 7) / 8, (eh_ + 7) / 8), bs, 0, st>>>((float4*)ring_[ri], (float2*)ring_aux_[ri],
                                                                          (float4*)ring_g_[ri]);
-    k_moving<<<dim3((mw + 7) / 8, (mh + 7) / 8), bs, 0, st>>>((float4*)ring_[ri], (float2*)ring_aux_[ri], (float4*)ring_g_[ri]);
+    k_march<<<dim3((mw + 7) / 8, (mh + 7) / 8), bs, 0, st>>>((float*)th_);
+    k_moving<<<dim3((mw + 7) / 8, (mh + 7) / 8), bs, 0, st>>>((float4*)ring_[ri], (float2*)ring_aux_[ri], (float4*)ring_g_[ri],
+                                                              (const float*)th_);
   }
   CK(cudaGetLastError());
   CK(cudaEventRecord((cudaEvent_t)evt1_, st));
