@@ -111,7 +111,8 @@ test("draws the ring: one tile per player on a circle, each in its colour, and n
     const index = new Map(seen.players);
     return seen.tiles.filter(([n, c]) => !index.has(n) || c !== potatoColour(index.get(n)!, seen.colours)).map(([n, c]) => `player ${n}: ${c}`);
   };
-  // The DOM follows the snapshot on the next frame, so a catch can land between the two reads.
+  // The store takes a snapshot when it arrives and React draws it on the next frame, so one read
+  // can find the DOM a snapshot behind the store.
   await expect.poll(mismatches, { timeout: 5000 }).toEqual([]);
 });
 
