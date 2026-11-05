@@ -90,15 +90,28 @@ pub enum Stop {
 /// first, so the pages a clone first needs are mapped first. A warmed 128 GiB guest's restore set fragments into millions
 /// of runs a few pages long (one clone recorded 3.7M pages in 1.6M runs), so a plan limited
 /// to a fixed number of runs leaves most of that set to demand paging.
-pub fn plan<'a>(
-    set: &'a PageSet,
-    regions: &'a [Region],
+#[cfg(test)]
+pub fn plan<'a>(set: &PageSet, regions: &'a [Region], page_size: usize, mem_len: u64) -> Plan<'a> {
+    plan_ordered(
+        std::sync::Arc::new(set.by_first_touch()),
+        regions,
+        page_size,
+        mem_len,
+    )
+}
+
+/// [`plan`] for a set already split by first-touch tier ([`PageSet::by_first_touch`]), which
+/// is what the server replays: the store keeps the split current, so a clone's fault path does
+/// not wait for it.
+pub fn plan_ordered(
+    tiers: std::sync::Arc<Vec<PageSet>>,
+    regions: &[Region],
     page_size: usize,
     mem_len: u64,
-) -> Plan<'a> {
+) -> Plan<'_> {
     let usable = page_size.is_power_of_two() && (4096..=CHUNK_BYTES).contains(&page_size);
     Plan {
-        runs: usable.then(|| OrderedRuns::new(set)),
+        runs: usable.then(|| OrderedRuns::from_tiers(tiers)),
         regions,
         page_size,
         mem_len,
