@@ -36,8 +36,9 @@
 //!
 //! # Order, and the race with a clone
 //!
-//! Replay plans every recorded run in ascending file offset
-//! ([`plan`](super::prefetch::plan)), which is the order the warm-up walks, and a request
+//! Replay plans every recorded run in first-touch order, tier by tier and each tier in
+//! ascending file offset ([`plan`](super::prefetch::plan)), which is the order the warm-up
+//! walks, and a request
 //! returns when its read is queued, not when it completes. A clone that reaches a page whose
 //! read is already queued waits for that read instead of issuing its own. Whether a clone
 //! that connects during a warm-up finds its pages cached is a race this module does not
@@ -533,7 +534,8 @@ pub(crate) fn unpaced_budget(meminfo: &str) -> u64 {
     }
 }
 
-/// Issue the requests for `recorded` through `advise`, in ascending file offset.
+/// Issue the requests for `recorded` through `advise`, in replay order: tier by tier, each
+/// tier in ascending file offset.
 ///
 /// `stop` is read before every request and nothing serialises it with the call that
 /// follows, so at most one further request starts after a stop.
@@ -561,7 +563,15 @@ fn warm_paced(
     let mut stats = WarmStats::default();
     let mut floor = 0u64;
     let mut requested = 0u64;
-    'runs: for run in recorded.runs() {
+    let mut runs = super::working_set::OrderedRuns::new(recorded);
+    let mut tier = 0;
+    'runs: while let Some(run) = runs.next() {
+        // Runs come tier by tier, each tier in ascending offset; a new tier starts again from
+        // the bottom of the image.
+        if runs.tier() != tier {
+            tier = runs.tier();
+            floor = 0;
+        }
         let mut counted = false;
         for request in requests_for(run, floor, page, mem_len) {
             loop {
