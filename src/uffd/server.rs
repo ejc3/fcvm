@@ -2689,9 +2689,9 @@ async fn replay_then_serve(
     working_set: Option<&WorkingSetStore>,
 ) -> Result<()> {
     if let Some(store) = working_set {
-        let recorded = store.to_prefetch();
-        if !recorded.is_empty()
-            && replay_working_set(ctx, async_uffd, &recorded, state).await? == Replay::Exited
+        let recorded = store.to_prefetch_ordered();
+        if recorded.iter().any(|tier| !tier.is_empty())
+            && replay_working_set(ctx, async_uffd, recorded, state).await? == Replay::Exited
         {
             log_clone_finished(ctx, state, "clone exited during working-set replay");
             return Ok(());
@@ -3411,7 +3411,7 @@ enum Replay {
 async fn replay_working_set(
     ctx: &VmContext<'_>,
     async_uffd: &AsyncFd<Uffd>,
-    recorded: &PageSet,
+    recorded: std::sync::Arc<Vec<PageSet>>,
     state: &mut VmState,
 ) -> Result<Replay> {
     // The copies of plain runs go to the worker threads when the clone has them. A pool that
@@ -3638,13 +3638,13 @@ fn drain_if_readable(
     drain_events(uffd, ctx, state)
 }
 
-/// The replay loop: plan the recorded set, step over what must not be copied, hand plain
-/// runs to `workers` when there are any, copy the rest here, and drain demand faults before
-/// every populate call.
+/// The replay loop: plan the recorded set (split by first-touch tier), step over what must not
+/// be copied, hand plain runs to `workers` when there are any, copy the rest here, and drain
+/// demand faults before every populate call.
 async fn replay_segments(
     ctx: &VmContext<'_>,
     async_uffd: &AsyncFd<Uffd>,
-    recorded: &PageSet,
+    recorded: std::sync::Arc<Vec<PageSet>>,
     state: &mut VmState,
     workers: &mut Option<ReplayWorkers>,
 ) -> Result<ReplayedSegments> {
@@ -3681,7 +3681,8 @@ async fn replay_segments(
     let mut yields = 0u64;
 
     let mut pacer = ReplayPacer::default();
-    'segments: for segment in prefetch::plan(recorded, &regions, ctx.page_size, ctx.mem_size as u64)
+    'segments: for segment in
+        prefetch::plan_ordered(recorded, &regions, ctx.page_size, ctx.mem_size as u64)
     {
         segments += 1;
         let mut done = 0usize;
@@ -6559,9 +6560,14 @@ mod tests {
         let mut recorded = PageSet::empty(clone.mem_size as u64);
         recorded.insert_range(0, (4 * PAGE) as u64);
 
-        let replayed = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-            .await
-            .expect("replay");
+        let replayed = replay_working_set(
+            &ctx,
+            &async_uffd,
+            std::sync::Arc::new(recorded.by_first_touch()),
+            &mut state,
+        )
+        .await
+        .expect("replay");
         assert_eq!(
             replayed,
             Replay::Finished {
@@ -6598,9 +6604,14 @@ mod tests {
         let mut recorded = PageSet::empty(clone.mem_size as u64);
         recorded.insert_range(0, (4 * PAGE) as u64);
 
-        let replayed = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-            .await
-            .expect("replay");
+        let replayed = replay_working_set(
+            &ctx,
+            &async_uffd,
+            std::sync::Arc::new(recorded.by_first_touch()),
+            &mut state,
+        )
+        .await
+        .expect("replay");
         assert_eq!(
             replayed,
             Replay::Finished {
@@ -6642,10 +6653,16 @@ mod tests {
         assert_eq!(state.fault_count, 2, "both touches faulted");
         let mut faulted = PageSet::empty(clone.mem_size as u64);
         faulted.insert_range(MinorClone::PAGE as u64, (2 * MinorClone::PAGE) as u64);
+        let recorded = state.recorded.as_ref().expect("the clone records");
         assert_eq!(
-            state.recorded,
-            Some(faulted),
+            recorded.runs().collect::<Vec<_>>(),
+            faulted.runs().collect::<Vec<_>>(),
             "the filled hole is recorded with the data page"
+        );
+        let page = MinorClone::PAGE as u64 / super::super::working_set::GRANULE;
+        assert!(
+            recorded.first_touch(page) > 0 && recorded.first_touch(2 * page) > 0,
+            "the faults are recorded with their first-touch times"
         );
     }
 
@@ -6671,9 +6688,14 @@ mod tests {
         let mut recorded = PageSet::empty(clone.mem_size as u64);
         recorded.insert_range(0, (8 * PAGE) as u64);
 
-        let replayed = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-            .await
-            .expect("replay");
+        let replayed = replay_working_set(
+            &ctx,
+            &async_uffd,
+            std::sync::Arc::new(recorded.by_first_touch()),
+            &mut state,
+        )
+        .await
+        .expect("replay");
         assert_eq!(
             replayed,
             Replay::Finished {
@@ -8038,7 +8060,13 @@ mod tests {
             wait_for_uffd_event(async_uffd.get_ref(), "a REMOVE event");
             let vcpu = FaultingReader::spawn(clone.page(40 + round));
             vcpu.wait_until_asleep();
-            let replayed = replay_working_set(&ctx, &async_uffd, &recorded, &mut state).await;
+            let replayed = replay_working_set(
+                &ctx,
+                &async_uffd,
+                std::sync::Arc::new(recorded.by_first_touch()),
+                &mut state,
+            )
+            .await;
             let failed = replayed.is_err();
             rounds.push((vcpu, replayed));
             if failed {
@@ -8983,9 +9011,14 @@ mod tests {
             let mut recorded = PageSet::empty((clone.file_pages * PAGE) as u64);
             recorded.insert_range((5 * PAGE) as u64, PAGE as u64);
             recorded.insert_range((9 * PAGE) as u64, PAGE as u64);
-            let exited = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-                .await
-                .expect("replay")
+            let exited = replay_working_set(
+                &ctx,
+                &async_uffd,
+                std::sync::Arc::new(recorded.by_first_touch()),
+                &mut state,
+            )
+            .await
+            .expect("replay")
                 == Replay::Exited;
             assert!(!exited, "the clone is alive");
             assert_eq!(
@@ -9877,9 +9910,14 @@ mod tests {
                 recorded.insert_range((page * PAGE) as u64, PAGE as u64);
             }
             prefetch::populate_threads_seen().clear();
-            let exited = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-                .await
-                .expect("replay")
+            let exited = replay_working_set(
+                &ctx,
+                &async_uffd,
+                std::sync::Arc::new(recorded.by_first_touch()),
+                &mut state,
+            )
+            .await
+            .expect("replay")
                 == Replay::Exited;
             assert!(!exited, "the clone is alive");
             assert_eq!(
@@ -10321,9 +10359,14 @@ mod tests {
         recorded.insert_range((4 * PAGE) as u64, (4 * PAGE) as u64);
         recorded.insert_range((10 * PAGE) as u64, (2 * PAGE) as u64);
 
-        let exited = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-            .await
-            .expect("replay")
+        let exited = replay_working_set(
+            &ctx,
+            &async_uffd,
+            std::sync::Arc::new(recorded.by_first_touch()),
+            &mut state,
+        )
+        .await
+        .expect("replay")
             == Replay::Exited;
         assert!(!exited, "no clone exit was reported");
         assert_eq!(
@@ -11002,9 +11045,14 @@ mod tests {
             recorded.insert_range((4 * PAGE) as u64, (5 * PAGE) as u64);
             recorded.insert_range((10 * PAGE) as u64, (2 * PAGE) as u64);
 
-            let outcome = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
-                .await
-                .expect("replay");
+            let outcome = replay_working_set(
+                &ctx,
+                &async_uffd,
+                std::sync::Arc::new(recorded.by_first_touch()),
+                &mut state,
+            )
+            .await
+            .expect("replay");
             assert_eq!(
                 outcome,
                 Replay::Finished {
