@@ -275,7 +275,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-chromium-corpus-extra bench-stop \
 	bench-chromium-request-run bench-chromium-request-all bench-chromium-hostcdp bench-chromium-fault \
-	bench-chromium-request-diag bench-webkit-request-diag \
+	bench-chromium-request-diag bench-webkit-request-diag test-boot-race build-boot-race-workload \
 	bench-chromium-scale check-chromium-scale analyze-chromium-scale report-chromium-scale test-chromium-scale \
 	test-chromium-fault \
 	bench-quick bench-throughput bench-operations bench-protocol \
@@ -369,6 +369,8 @@ help:
 	@echo "  test-gpu-restore       Run bench/gpu-restore/summarize.py's unit tests"
 	@echo "  test-computesdk        Run bench/computesdk/run.sh's output-directory checks"
 	@echo "  test-chromium-request  Run the request benchmark's deterministic unit tests"
+	@echo "  build-boot-race-workload  Build bench/boot-race's static workload binary (aarch64 musl)"
+	@echo "  test-boot-race        Run bench/boot-race's workload and page renderer tests"
 	@echo "  bench-chromium-scale  Open-loop FILE/UFFD Chromium request scalability run"
 	@echo "  check-chromium-scale  Validate the SCALE_* variables and their schedule, no VM"
 	@echo "  analyze-chromium-scale  Validate a scale run and write deterministic JSON"
@@ -1358,6 +1360,18 @@ test-gpu-restore:
 
 test-computesdk:
 	@python3 -m unittest discover -s bench/computesdk -p 'test_*.py' \
+		$(if $(FILTER),-k '$(FILTER)',)
+
+# bench/boot-race: the workload is its own crate (not a workspace member) with its own target dir.
+BOOT_RACE_TARGET ?= bench/boot-race/workload/target
+build-boot-race-workload:
+	cd bench/boot-race/workload && CARGO_TARGET_DIR=$(abspath $(BOOT_RACE_TARGET)) \
+		cargo build --release --target aarch64-unknown-linux-musl
+	@echo "$(abspath $(BOOT_RACE_TARGET))/aarch64-unknown-linux-musl/release/boot-race-workload"
+
+test-boot-race:
+	cd bench/boot-race/workload && CARGO_TARGET_DIR=$(abspath $(BOOT_RACE_TARGET)) cargo test --release
+	@python3 -m unittest discover -s bench/boot-race -p 'test_*.py' \
 		$(if $(FILTER),-k '$(FILTER)',)
 
 test-chromium-request:

@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""boot-race driver: time from asking for compute to the workload answering, for every lane, interleaved.
+
+Runs on a parallel box (bare metal, /dev/kvm) in us-east-2. The fcvm lanes restore a snapshot on this host; the AWS
+lanes start the same workload through the AWS APIs, with boot-race-driver credentials read from a JSON file
+(BOOT_RACE_CREDS, default /dev/shm/boot-race-creds.json) that the operator refreshes.
+
+Every lane is timed the same way: t0 is taken immediately before the call that asks for compute (Popen of
+`fcvm snapshot run`, RunInstances, StartInstances, RunTask, or the HTTPS request to a function URL), and t1 when an
+HTTP GET from this host, outside the VM/instance/task/function, has read a complete 200 answer from the workload.
+
+Subcommands: prepare-*, run, logs, cleanup. Samples are appended to <results>/samples.jsonl as they are taken.
+"""
+
+import argparse
+import asyncio
+import datetime
+import http.client
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import urllib.parse
+
+REGION = "us-east-2"
+TAG = {"Key": "Project", "Value": "boot-race"}
+LANES = [
+    "fcvm-file",
+    "fcvm-uffd",
+    "ec2-launch",
+    "ec2-start",
+    "ec2-hibernate",
+    "ecs-fargate",
+    "ecs-ec2",
+    "lambda-cold",
+    "lambda-warm",
+]
+
+
+def now_ms():
+    return time.time_ns() // 1_000_000
+
+
+def log(*a):
+    print(datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S.%f")[:-3], *a, file=sys.stderr, flush=True)
+
+
+# ------------------------------------------------------------------ AWS
+def session():
+    import boto3
+
+    path = os.environ.get("BOOT_RACE_CREDS", "/dev/shm/boot-race-creds.json")
+    with open(path) as f:
+        c = json.load(f)
+    exp = datetime.datetime.fromisoformat(c["Expiration"].replace("Z", "+00:00"))
+    left = (exp - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    if left < 120:
+        raise SystemExit(f"boot-race credentials expire in {left:.0f} s; refresh {path}")
+    return boto3.Session(
+        aws_access_key_id=c["AccessKeyId"],
+        aws_secret_access_key=c["SecretAccessKey"],
+        aws_session_token=c["SessionToken"],
+        region_name=REGION,
+    )
+
+
+def tags(name):
+    return [
+        {"ResourceType": rt, "Tags": [TAG, {"Key": "Name", "Value": name}]}
+        for rt in ("instance", "volume", "network-interface")
+    ]
+
+
+# ------------------------------------------------------------------ the probe
+async def one_get(host, port, timeout):
+    reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+    try:
+        writer.write(f"GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.read(-1), timeout)
+    finally:
+        writer.close()
+    head, _, body = raw.partition(b"\r\n\r\n")
+    if not head.startswith(b"HTTP/1.1 200"):
+        raise ConnectionError(head[:40])
+    doc = json.loads(body)
+    if not doc.get("ok"):
+        raise ConnectionError("answer without ok")
+    return doc
+
+
+async def probe(host, port, interval, deadline_s, attempt_timeout=1.0, max_inflight=64):
+    """Start a GET every `interval` seconds until one returns a complete 200; return (t1_ns, answer, attempts)."""
+    done = asyncio.get_running_loop().create_future()
+    inflight = set()
+    attempts = 0
+
+    async def attempt():
+        try:
+            doc = await one_get(host, port, attempt_timeout)
+        except (OSError, asyncio.TimeoutError, ConnectionError, ValueError):
+            return
+        t1 = time.monotonic_ns()
+        if not done.done():
+            done.set_result((t1, doc))
+
+    end = time.monotonic() + deadline_s
+    try:
+        while not done.done():
+            if time.monotonic() > end:
+                raise TimeoutError(f"no answer from {host}:{port} in {deadline_s} s after {attempts} attempts")
+            inflight = {t for t in inflight if not t.done()}
+            if len(inflight) < max_inflight:
+                attempts += 1
+                inflight.add(asyncio.ensure_future(attempt()))
+            try:
+                await asyncio.wait_for(asyncio.shield(done), interval)
+            except asyncio.TimeoutError:
+                pass
+        t1, doc = done.result()
+        return t1, doc, attempts
+    finally:
+        for t in inflight:
+            t.cancel()
+        await asyncio.gather(*inflight, return_exceptions=True)
+
+
+# ------------------------------------------------------------------ fcvm lanes
+class Fcvm:
+    def __init__(self, cfg):
+        self.bin = cfg["fcvm_bin"]
+        self.snapshot = cfg["fcvm_snapshot"]
+        self.serve_pid = cfg.get("fcvm_serve_pid")
+        self.logdir = cfg["results"] + "/fcvm-logs"
+        os.makedirs(self.logdir, exist_ok=True)
+
+    async def sample(self, lane, name, port):
+        if lane == "fcvm-file":
+            src = ["--snapshot", self.snapshot]
+        else:
+            src = ["--pid", str(self.serve_pid)]
+        args = [self.bin, "snapshot", "run", *src, "--name", name, "--publish", f"127.0.0.1:{port}:8080"]
+        logf = open(f"{self.logdir}/{name}.log", "w")
+        env = dict(os.environ, RUST_LOG=os.environ.get("RUST_LOG", "fcvm=info"))
+        t0 = time.monotonic_ns()
+        start_ms = now_ms()
+        proc = subprocess.Popen(args, stdout=logf, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+        try:
+            t1, doc, attempts = await probe("127.0.0.1", port, 0.001, 60, attempt_timeout=0.5, max_inflight=512)
+        finally:
+            await self.stop(proc)
+            logf.close()
+        return {"t_start_unix_ms": start_ms, "ms": (t1 - t0) / 1e6, "attempts": attempts, "answer": doc}
+
+    async def stop(self, proc):
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+        for _ in range(600):
+            if proc.poll() is not None:
+                return
+            await asyncio.sleep(0.05)
+        proc.kill()
+        proc.wait()
+
+
+# ------------------------------------------------------------------ EC2 lanes
+class Ec2:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.ec2 = session().client("ec2")
+
+    def ip(self, iid):
+        r = self.ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+        return r["PrivateIpAddress"], r["State"]["Name"]
+
+    def wait_state(self, iid, want, timeout=900):
+        end = time.time() + timeout
+        while time.time() < end:
+            _, st = self.ip(iid)
+            if st == want:
+                return
+            time.sleep(2)
+        raise TimeoutError(f"instance did not reach {want}")
+
+    async def launch_sample(self):
+        t0 = time.monotonic_ns()
+        start_ms = now_ms()
+        r = self.ec2.run_instances(
+            LaunchTemplate={"LaunchTemplateName": "boot-race-ec2"},
+            ImageId=self.cfg["ami"],
+            MinCount=1,
+            MaxCount=1,
+            HibernationOptions={"Configured": False},
+            TagSpecifications=tags("boot-race-ec2-launch"),
+        )
+        t_api = time.monotonic_ns()
+        inst = r["Instances"][0]
+        iid, ip = inst["InstanceId"], inst["PrivateIpAddress"]
+        try:
+            t1, doc, attempts = await probe(ip, 8080, 0.02, 300)
+        finally:
+            self.ec2.terminate_instances(InstanceIds=[iid])
+        return {
+            "t_start_unix_ms": start_ms,
+            "ms": (t1 - t0) / 1e6,
+            "api_ms": (t_api - t0) / 1e6,
+            "attempts": attempts,
+            "answer": doc,
+        }
+
+    async def start_sample(self, iid, hibernate):
+        await asyncio.to_thread(self.wait_state, iid, "stopped")
+        ip, _ = self.ip(iid)
+        t0 = time.monotonic_ns()
+        start_ms = now_ms()
+        self.ec2.start_instances(InstanceIds=[iid])
+        t_api = time.monotonic_ns()
+        try:
+            t1, doc, attempts = await probe(ip, 8080, 0.02, 300)
+        finally:
+            # Give the workload a moment so a hibernating guest has nothing in flight, then stop it for next time.
+            await asyncio.sleep(1)
+            await asyncio.to_thread(self.wait_state, iid, "running")
+            self.ec2.stop_instances(InstanceIds=[iid], Hibernate=hibernate)
+        return {
+            "t_start_unix_ms": start_ms,
+            "ms": (t1 - t0) / 1e6,
+            "api_ms": (t_api - t0) / 1e6,
+            "attempts": attempts,
+            "answer": doc,
+        }
+
+
+# ------------------------------------------------------------------ ECS lanes
+class Ecs:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        s = session()
+        self.ecs = s.client("ecs")
+
+    def describe(self, arn):
+        return self.ecs.describe_tasks(cluster="boot-race", tasks=[arn])["tasks"][0]
+
+    def wait_stopped(self, arn, timeout=300):
+        end = time.time() + timeout
+        while time.time() < end:
+            if self.describe(arn)["lastStatus"] == "STOPPED":
+                return
+            time.sleep(1)
+        raise TimeoutError("task did not stop")
+
+    async def fargate_sample(self):
+        t0 = time.monotonic_ns()
+        start_ms = now_ms()
+        r = self.ecs.run_task(
+            cluster="boot-race",
+            taskDefinition="boot-race-fargate",
+            launchType="FARGATE",
+            count=1,
+            networkConfiguration={
+                "awsvpcConfiguration": {
+                    "subnets": [self.cfg["subnet"]],
+                    "securityGroups": [self.cfg["security_group"]],
+                    "assignPublicIp": "ENABLED",
+                }
+            },
+        )
+        if r.get("failures"):
+            raise RuntimeError(f"RunTask failures: {r['failures']}")
+        t_api = time.monotonic_ns()
+        arn = r["tasks"][0]["taskArn"]
+        try:
+            ip = None
+            while ip is None:
+                if time.monotonic_ns() - t0 > 300e9:
+                    raise TimeoutError("no task address in 300 s")
+                t = self.describe(arn)
+                for a in t.get("attachments", []):
+                    for d in a.get("details", []):
+                        if d["name"] == "privateIPv4Address":
+                            ip = d["value"]
+                if ip is None:
+                    await asyncio.sleep(0.2)
+            t_ip = time.monotonic_ns()
+            t1, doc, attempts = await probe(ip, 8080, 0.02, 300)
+            t = self.describe(arn)
+        finally:
+            self.ecs.stop_task(cluster="boot-race", task=arn, reason="boot-race sample taken")
+        stamps = {
+            k: int(t[k].timestamp() * 1000)
+            for k in ("createdAt", "pullStartedAt", "pullStoppedAt", "startedAt")
+            if k in t
+        }
+        return {
+            "t_start_unix_ms": start_ms,
+            "ms": (t1 - t0) / 1e6,
+            "api_ms": (t_api - t0) / 1e6,
+            "address_ms": (t_ip - t0) / 1e6,
+            "attempts": attempts,
+            "aws_stamps_unix_ms": stamps,
+            "answer": doc,
+        }
+
+    async def ec2_sample(self, host_ip):
+        t0 = time.monotonic_ns()
+        start_ms = now_ms()
+        r = self.ecs.run_task(cluster="boot-race", taskDefinition="boot-race-ec2", launchType="EC2", count=1)
+        if r.get("failures"):
+            raise RuntimeError(f"RunTask failures: {r['failures']}")
+        t_api = time.monotonic_ns()
+        arn = r["tasks"][0]["taskArn"]
+        try:
+            t1, doc, attempts = await probe(host_ip, 8080, 0.005, 120)
+        finally:
+            self.ecs.stop_task(cluster="boot-race", task=arn, reason="boot-race sample taken")
+            await asyncio.to_thread(self.wait_stopped, arn)
+        return {
+            "t_start_unix_ms": start_ms,
+            "ms": (t1 - t0) / 1e6,
+            "api_ms": (t_api - t0) / 1e6,
+            "attempts": attempts,
+            "answer": doc,
+        }
+
+
+# ------------------------------------------------------------------ Lambda lanes
+class Lambda:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.creds = session().get_credentials().get_frozen_credentials()
+
+    def signed_get(self, url):
+        from botocore.auth import SigV4Auth
+        from botocore.awsrequest import AWSRequest
+        from botocore.credentials import Credentials
+
+        req = AWSRequest(method="GET", url=url, headers={"Host": urllib.parse.urlparse(url).netloc})
+        SigV4Auth(Credentials(*self.creds), "lambda", REGION).add_auth(req)
+        return dict(req.headers.items())
+
+    def call(self, url):
+        u = urllib.parse.urlparse(url)
+        headers = self.signed_get(url)  # signing is before t0: it is the client's work, not Lambda's
+        t0 = time.monotonic_ns()
+        start_ms = now_ms()
+        conn = http.client.HTTPSConnection(u.netloc, timeout=30)
+        try:
+            conn.request("GET", "/", headers=headers)
+            resp = conn.getresponse()
+            body = resp.read()
+            t1 = time.monotonic_ns()
+            rid = resp.getheader("x-amzn-RequestId")
+            status = resp.status
+        finally:
+            conn.close()
+        if status != 200:
+            raise RuntimeError(f"function URL answered {status}: {body[:200]!r}")
+        doc = json.loads(body)
+        if not doc.get("ok"):
+            raise RuntimeError("answer without ok")
+        return {"t_start_unix_ms": start_ms, "ms": (t1 - t0) / 1e6, "request_id": rid, "answer": doc}
+
+    async def sample(self, lane):
+        url = self.cfg["function_urls"]["cold" if lane == "lambda-cold" else "warm"]
+        return await asyncio.to_thread(self.call, url)
+
+
+# ------------------------------------------------------------------ the campaign
+async def run(cfg, rounds, first_round, lanes):
+    out = open(cfg["results"] + "/samples.jsonl", "a")
+    fcvm = Fcvm(cfg) if any(l.startswith("fcvm") for l in lanes) else None
+    prev_answer = {}
+    for rnd in range(first_round, first_round + rounds):
+        ec2 = Ec2(cfg) if any(l.startswith("ec2") for l in lanes) else None
+        ecs = Ecs(cfg) if any(l.startswith("ecs") for l in lanes) else None
+        lam = Lambda(cfg) if any(l.startswith("lambda") for l in lanes) else None
+        k = rnd % len(lanes)
+        order = lanes[k:] + lanes[:k]
+        for lane in order:
+            log(f"round {rnd} lane {lane}")
+            rec = {"round": rnd, "lane": lane}
+            try:
+                if lane.startswith("fcvm"):
+                    s = await fcvm.sample(lane, f"br-{lane}-{rnd}", 21000 + rnd * 10 + LANES.index(lane))
+                elif lane == "ec2-launch":
+                    s = await ec2.launch_sample()
+                elif lane == "ec2-start":
+                    s = await ec2.start_sample(cfg["start_instance"], hibernate=False)
+                elif lane == "ec2-hibernate":
+                    s = await ec2.start_sample(cfg["hibernate_instance"], hibernate=True)
+                elif lane == "ecs-fargate":
+                    s = await ecs.fargate_sample()
+                elif lane == "ecs-ec2":
+                    s = await ecs.ec2_sample(cfg["ecs_host_ip"])
+                else:
+                    s = await lam.sample(lane)
+                rec.update(s, ok=True)
+                prev = prev_answer.get(lane)
+                if prev is not None:
+                    rec["same_proc_as_previous"] = prev["proc_id"] == s["answer"]["proc_id"]
+                    rec["same_boot_as_previous"] = prev["boot_id"] == s["answer"]["boot_id"]
+                prev_answer[lane] = s["answer"]
+                log(f"  {lane}: {s['ms']:.1f} ms")
+            except Exception as e:  # a failed sample is recorded, never dropped
+                rec.update(ok=False, error=f"{type(e).__name__}: {e}", t_failed_unix_ms=now_ms())
+                log(f"  {lane}: FAILED {rec['error']}")
+            out.write(json.dumps(rec) + "\n")
+            out.flush()
+
+
+def fetch_reports(cfg):
+    """REPORT lines of both functions: request id -> {duration, init_duration} (Init Duration only on a cold start)."""
+    logs = session().client("logs")
+    found = {}
+    for k in ("cold", "warm"):
+        token = None
+        while True:
+            kw = {"logGroupName": f"/aws/lambda/boot-race-{k}", "filterPattern": "REPORT"}
+            if token:
+                kw["nextToken"] = token
+            r = logs.filter_log_events(**kw)
+            for e in r["events"]:
+                parts = dict(
+                    p.strip().split(": ", 1) for p in e["message"].strip().split("\t") if ": " in p
+                )
+                rid = parts.get("REPORT RequestId")
+                if rid:
+                    found[rid] = {
+                        "function": k,
+                        "duration": parts.get("Duration"),
+                        "init_duration": parts.get("Init Duration"),
+                        "log_stream": e["logStreamName"],
+                    }
+            token = r.get("nextToken")
+            if not token:
+                break
+    path = cfg["results"] + "/lambda-reports.json"
+    with open(path, "w") as f:
+        json.dump(found, f, indent=1)
+    log(f"{len(found)} REPORT lines -> {path}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run")
+    r.add_argument("--rounds", type=int, required=True)
+    r.add_argument("--first-round", type=int, default=0)
+    r.add_argument("--lanes", default=",".join(LANES))
+    sub.add_parser("reports")
+    a = ap.parse_args()
+    with open(a.config) as f:
+        cfg = json.load(f)
+    os.makedirs(cfg["results"], exist_ok=True)
+    if a.cmd == "run":
+        lanes = [l for l in a.lanes.split(",") if l]
+        unknown = set(lanes) - set(LANES)
+        if unknown:
+            raise SystemExit(f"unknown lanes: {sorted(unknown)}")
+        asyncio.run(run(cfg, a.rounds, a.first_round, lanes))
+    elif a.cmd == "reports":
+        fetch_reports(cfg)
+
+
+if __name__ == "__main__":
+    main()

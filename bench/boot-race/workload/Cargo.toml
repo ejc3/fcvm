@@ -1,0 +1,16 @@
+[package]
+name = "boot-race-workload"
+version = "0.1.0"
+edition = "2021"
+description = "The workload every boot-race lane starts: answer GET / with a small CPU job"
+publish = false
+
+# Not part of the fcvm workspace: built on its own, static, for every lane.
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
