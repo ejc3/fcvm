@@ -292,8 +292,9 @@ HEX = re.compile(r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})(?![0-9a-fA-F])")
 
 # The corpus campaigns the page quotes, by the date in their run names, and the
 # Firecracker builds subsection that describes each one's runs.
-CAMPAIGN_SUBSECTION = {"20261022": "2026-10-22 runs", "20261104": "2026-11-04 runs"}
-CAMPAIGN_PREFIXES = tuple(f"reqbench-{date}-corpus-" for date in CAMPAIGN_SUBSECTION)
+# The one campaign the page cites, by its index (test_report_one_campaign pins
+# that there is exactly one).
+CAMPAIGN_INDEX = re.compile(r"results/campaign-([0-9a-f]{8})-summary\.json")
 
 
 class ReportContent(unittest.TestCase):
@@ -323,6 +324,11 @@ class ReportContent(unittest.TestCase):
         extra = [r["Metric"] for r in rows[len(PUBLISHED):]]
         self.assertEqual(extra, ["Web-platform tests"], "rows after Cloudflare's six")
 
+    def campaign_id(self):
+        ids = set(CAMPAIGN_INDEX.findall(self.page.replace("<wbr>", "")))
+        self.assertEqual(len(ids), 1, f"the page cites {sorted(ids)} campaign indexes")
+        return ids.pop()
+
     def test_the_zero_failure_count_carries_its_interval(self):
         """RED BEFORE THE FIX: the headline tile said "0 failed requests in the
         four published corpus runs" and the sample-gate bullet "Zero failures in
@@ -333,23 +339,26 @@ class ReportContent(unittest.TestCase):
         Every text unit that states a zero-failure count must carry an exact
         interval, and one about the corpus runs must carry theirs and its 230
         attempts. "zero-failure gate" names the gate and is not a count. The
-        page must cite every committed run of the 2026-10-22 campaign, and
-        every arm of each must hold 0 failures in 230 attempts."""
-        cited = set(re.findall(r"results/(reqbench-[0-9-]+-corpus[a-z0-9-]*)", self.page))
-        campaign = self.campaign_runs()
-        self.assertTrue(campaign, "no 2026-10-22 corpus run is committed; the check is vacuous")
-        self.assertEqual(cited & set(campaign), set(campaign), "the page must cite every run of the campaign")
-        self.assertEqual(cited - set(campaign), set(self.EARLIER_CORPUS_RUNS),
-                         "the page cites a corpus run that is neither the campaign's nor an earlier listed one")
-        bounds = set()
+        page must cite every committed serial run of its campaign, and every arm
+        of each must hold 0 failures in 230 attempts."""
+        cid = self.campaign_id()
+        page = self.page.replace("<wbr>", "")
+        cited = set(re.findall(rf"results/(reqbench-{cid}-[a-z0-9-]+)", page))
+        campaign = self.campaign_runs(cid)
+        self.assertTrue(campaign, f"no serial run of campaign {cid} is committed; the check is vacuous")
+        self.assertEqual(cited & set(campaign), set(campaign), "the page must cite every serial run of the campaign")
+        # attempts per arm -> the upper end of its exact 95% interval. The
+        # rootless runs make 230 attempts per arm, the bridged and routed 430.
+        bounds = {}
         for run in campaign:
             with open(os.path.join(HERE, "results", run, "analysis.json")) as f:
                 arms = json.load(f)["arms"]
             for name, arm in arms.items():
-                self.assertEqual((arm["attempted"], arm["failed"]), (230, 0), (run, name))
-                bounds.add(f"{arm['failure_rate_ci'][1] * 100:.2f}%")
-        self.assertEqual(len(bounds), 1, f"the runs' intervals differ: {bounds}; quote each")
-        bound = bounds.pop()
+                self.assertEqual(arm["failed"], 0, (run, name))
+                self.assertIn(arm["attempted"], (230, 430), (run, name))
+                bounds.setdefault(str(arm["attempted"]), set()).add(f"{arm['failure_rate_ci'][1] * 100:.2f}%")
+        for attempts, b in bounds.items():
+            self.assertEqual(len(b), 1, f"runs of {attempts} attempts have intervals {b}")
         units = re.findall(r"<(?:li|p|td)\b[^>]*>(.*?)</(?:li|p|td)>", self.page, re.S)
         units += re.findall(r'<div><span class="num">(.*?)</div>', self.page, re.S)
         claim = re.compile(r"(?i)\b(?:no|zero|0)\s[^.]*\bfail")
@@ -362,106 +371,53 @@ class ReportContent(unittest.TestCase):
             checked += 1
             self.assertRegex(text, interval, f"a zero-failure count without its interval: {text[:160]!r}")
             if "corpus" in text:
-                self.assertIn(bound, text, f"a corpus zero-failure count without {bound}: {text[:160]!r}")
+                for attempts, b in bounds.items():
+                    self.assertIn(next(iter(b)), text, f"a corpus zero-failure count without its interval for {attempts}: {text[:160]!r}")
                 counts = re.findall(r"\b0 (?:of|failures in|in) (?:the [\w-]+ arm[\u2019']s )?(\d[\d,]*)", text)
-                self.assertTrue(counts, f"a corpus zero-failure count without its attempts: {text[:160]!r}")
-                self.assertEqual(set(counts), {"230"}, f"attempt counts {counts} in: {text[:160]!r}")
+                self.assertEqual(set(counts), set(bounds), f"attempt counts {counts} in: {text[:160]!r}")
         self.assertGreaterEqual(checked, 1, "no zero-failure count was checked; the sample-gate bullet states one")
 
     @staticmethod
-    def campaign_runs():
-        """Every committed run of the 2026-10-22 and 2026-11-04 corpus campaigns
-        (git ls-files)."""
+    def campaign_runs(cid):
+        """Every committed serial run of campaign cid (git ls-files): a serial
+        run's analysis.json sits at the top of its directory; a scale run's is
+        one level down, in its scale-* directory."""
         import subprocess
         out = subprocess.run(["git", "ls-files", "--", "results"], cwd=HERE,
                              capture_output=True, text=True, check=True).stdout
-        # A serial run's analysis.json sits at the top of its directory; the
-        # scale run's is one level down, in its scale-* directory.
         return sorted({p.split("/")[1] for p in out.split()
-                       if p.split("/")[1].startswith(CAMPAIGN_PREFIXES)
+                       if p.split("/")[1].startswith(f"reqbench-{cid}-")
                        and p.count("/") == 2 and p.endswith("/analysis.json")})
-
-    # Corpus runs of earlier campaigns the page cites; it cites none now.
-    EARLIER_CORPUS_RUNS = ()
-
-    # The Firecracker branch rootfs-config.toml selects at each fcvm source
-    # revision a cited run records (cell.source_revision). Derived with
-    #   git show <rev>:rootfs-config.toml | sed -n '/^\[firecracker\]/,/^\[/p'
-    # A run at a revision missing here fails the test until its pin is added.
-    FIRECRACKER_BRANCH = {
-        "55756858d46347f00bac3f66f1f5cacf3411bbb8": "agent/uffd-minor",
-        "1e9e9b70937ccc6317046ea22ba41ef0acc454d0": "agent/uffd-minor",
-        "46ed7eef965e22881ad8a4fd2bed4708e47dedb5": "bump-vsock-max-connections",
-        "0594e96a443ce34345dfd08664c08f88e52120a8": "bump-vsock-max-connections",
-        "f7d546902bb0d5e6ee2fc6b54ed7d66e997af9c9": "bump-vsock-max-connections",
-        "b72e516aa4bed8f677700d07c8a241c5b30e738f": "bump-vsock-max-connections",
-        "97074abdabf2be2af6f188499032e4c128385568": "bump-vsock-max-connections",
-        "5893de232a23a0ce00f52816e239ea85173a7c20": "bump-vsock-max-connections",
-        "ec5def10b716e4ddbe0fd886f0dec7bf705133a5": "agent/uffd-minor-v1.17.0-discard-dirty",
-        "ff9aef9e0884239112dc79ff31142846894bb1b9": "agent/uffd-minor-v1.17.0-discard-dirty",
-        "e5b0abfab94db0e23f54ce1ae02742ef5155e680": "agent/uffd-minor-v1.17.0-discard-dirty",
-        "ef0fb6725cec65cf9115d0a9146be524b8c5b832": "agent/uffd-minor-v1.17.0-discard-dirty",
-        "ffab8ecdcee2038eaeca89d73294cccfb3a130ce": "agent/uffd-minor-v1.17.0-discard-dirty",
-        "4d13d95419ba0293b5257170cd023144868fc1f8": "agent/uffd-minor-v1.17.0-discard-dirty",
-        "0bf1f9783fe52f4a9c0ea7d8a1d267a4a3ef6184": "agent/uffd-minor-v1.17.0-discard-dirty",
-        "1dc6ae42c0532c155747d8cb233c884b29206eb3": "agent/uffd-minor-v1.17.0-discard-dirty",
-        "c5352b1bfc70ed0574c8d1ed583f7198f04de2a0": "agent/uffd-minor-v1.17.0-discard-dirty",
-        "fcbeec9ef767b0ffc8dbc52528f7648c28fdf22a": "agent/uffd-minor-v1.17.0-discard-dirty",
-        "873d12c3e81fd4af272e3ed9091abad372b00d3d": "agent/uffd-minor-v1.17.0-discard-dirty",
-        "0142e05e1d85613587a45c1fc3d1f26d1847cf9c": "agent/uffd-minor-v1.17.0-drive-overrides",
-    }
 
     def test_each_cited_run_is_attributed_to_the_firecracker_it_ran(self):
         """RED BEFORE THE FIX: the page described one Firecracker build,
-        branch bump-vsock-max-connections, for every figure. The corpus runs
-        behind the headline were built from agent/uffd-minor, which
-        rootfs-config.toml selects at their source revisions; only the fixture
-        runs used bump-vsock-max-connections.
+        branch bump-vsock-max-connections, for every figure, while the corpus
+        runs were built from agent/uffd-minor.
 
-        Each subsection names exactly the branches its runs used, and no other
-        part of the page names a branch. The 2026-10-22 campaign's runs belong
-        to "2026-10-22 runs", every other cited run to "Earlier runs", and a
-        subsection with no cited run is absent."""
+        Every cited run records the Firecracker branch, commit and binary it
+        restored on, with the commit tied to the binary; the Firecracker build
+        section names exactly that branch, commit and binary, and no other part
+        of the page names a branch of the fork."""
+        cid = self.campaign_id()
         fc = section(self.page, "firecracker")
-        parts = re.split(r"<h3>([^<]+)</h3>", fc)
-        subsections = {parts[i].strip(): parts[i + 1] for i in range(1, len(parts), 2)}
-        branches = set(self.FIRECRACKER_BRANCH.values())
-        expected = {name: set() for name in CAMPAIGN_SUBSECTION.values()}
-        expected["Earlier runs"] = set()
-        runs = sorted(set(re.findall(r"results/(reqbench-[A-Za-z0-9-]+)", self.page)))
-        self.assertTrue(runs, "the page cites no reqbench run; the check is vacuous")
+        runs = sorted(set(re.findall(rf"results/(reqbench-{cid}-[a-z0-9-]+)", self.page.replace("<wbr>", ""))))
+        runs = [r for r in runs if os.path.exists(os.path.join(HERE, "results", r, "reqbench.jsonl"))]
+        self.assertTrue(runs, "the page cites no serial run; the check is vacuous")
+        builds = set()
         for run in runs:
-            with open(os.path.join(HERE, "results", run, "analysis.json")) as f:
-                revision = json.load(f)["cell"]["source_revision"]
-            self.assertIn(revision, self.FIRECRACKER_BRANCH,
-                          f"{run}: add the Firecracker pin at {revision}")
-            where = CAMPAIGN_SUBSECTION.get(run[len("reqbench-"):len("reqbench-") + 8], "Earlier runs")
-            expected[where].add(self.FIRECRACKER_BRANCH[revision])
-        # A subsection exists exactly when the page cites runs that belong to it.
-        expected = {where: want for where, want in expected.items() if want}
-        self.assertEqual(sorted(subsections), sorted(expected))
-        for where, want in expected.items():
-            named = {b for b in branches if re.search(rf"\b{re.escape(b)}\b(?![\w.-])", subsections[where])}
-            self.assertEqual(named, want, f"{where} must name exactly the branch its runs used")
-        rest = self.page.replace(fc, "")
-        self.assertEqual({b for b in branches if b in rest}, set(),
-                         "a branch is named outside Firecracker builds, where it is not tied to runs")
-        # A link to any other branch of the fork is attributed to nothing.
-        for where, html in subsections.items():
-            linked = set(re.findall(r"github\.com/ejc3/firecracker/tree/([^\"'#?]+)", html))
-            self.assertEqual(linked, expected[where], f"{where} links a branch its runs did not use")
-        self.assertEqual(re.findall(r"github\.com/ejc3/firecracker/tree/([^\"'#?]+)", rest), [],
-                         "a Firecracker branch link outside Firecracker builds")
-        # Each campaign run records the commit and the binary; its section names both.
-        for run in runs:
-            where = CAMPAIGN_SUBSECTION.get(run[len("reqbench-"):len("reqbench-") + 8])
-            if where is None:
-                continue
             with open(os.path.join(HERE, "results", run, "reqbench.jsonl")) as f:
                 firecracker = json.loads(f.readline())["firecracker"]
             self.assertTrue(firecracker["commit_matches_binary"], run)
-            self.assertIn(firecracker["commit"][:8], subsections[where], run)
-            self.assertIn(firecracker["sha256"][:12], subsections[where], run)
+            builds.add((firecracker["branch"], firecracker["commit"], firecracker["sha256"]))
+        self.assertEqual(len(builds), 1, f"the cited runs used {len(builds)} Firecracker builds")
+        branch, commit, sha = builds.pop()
+        self.assertIn(branch, fc)
+        self.assertIn(commit[:8], fc)
+        self.assertIn(sha[:12], fc)
+        rest = self.page.replace(fc, "")
+        self.assertNotIn(branch, rest, "the Firecracker branch is named outside Firecracker build")
+        self.assertEqual(re.findall(r"github\.com/ejc3/firecracker/tree/([^\"'#?]+)", rest), [],
+                         "a Firecracker branch link outside Firecracker build")
 
     def figure(self, label):
         """The HTML of the <figure> whose caption has id=label."""
@@ -485,18 +441,18 @@ class ReportContent(unittest.TestCase):
         records and named neither the file nor the fields. bench/chromium/
         AGENTS.md: every figure traceable to a raw record, cited next to it.
         Each figure computed from per-request records names a committed
-        2026-10-22 record and the fields it read."""
-        run = r"results/<wbr>reqbench-2026(?:1022|1104)-corpus-[a-z0-9-]+/<wbr>reqbench\.<wbr>jsonl|results/reqbench-2026(?:1022|1104)-corpus-[a-z0-9-]+/reqbench\.jsonl"
+        record of the page's campaign and the fields it read."""
         want = {
             "d-split": ["blocking_ms", "spawn_to_port_ms", "render.stages", "teardown_total_ms"],
             "c-marks": ["spawn_to_port_ms", "restore_marks", "resolve_polls"],
         }
-        campaign = set(self.campaign_runs())
+        cid = self.campaign_id()
+        campaign = set(self.campaign_runs(cid))
         for label, needles in want.items():
             src = re.findall(r'<p class="src">(.*?)</p>', self.figure(label), re.S)
             self.assertEqual(len(src), 1, f"#{label} carries one source line")
             text = src[0].replace("<wbr>", "")
-            named = re.findall(r"results/(reqbench-2026(?:1022|1104)-corpus-[a-z0-9-]+)/reqbench\.jsonl", text)
+            named = re.findall(rf"results/(reqbench-{cid}-[a-z0-9-]+)/reqbench\.jsonl", text)
             self.assertTrue(named, f"#{label}'s source line names no per-request record")
             self.assertLessEqual(set(named), campaign, f"#{label} names a record that is not committed")
             for needle in needles:

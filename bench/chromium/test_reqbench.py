@@ -8230,7 +8230,9 @@ class DocLint(unittest.TestCase):
         Markdown paragraphs span lines, so they are split on blank lines."""
         text = self._read(name)
         if name.endswith(".html"):
-            return text.splitlines()
+            # A record path carries <wbr> line-break hints between its parts;
+            # without removing them no citation of that form is read at all.
+            return text.replace("<wbr>", "").splitlines()
         return re.split(r"\n\s*\n", text)
 
     def _cell_urls(self, run):
