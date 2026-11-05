@@ -7,9 +7,16 @@
 // is a shadow that is put back into WebGL2 when a channel's context differs from the last one
 // that drew (`Shadow`). A guest context's default framebuffer is its draw surface's
 // framebuffer, and its vertex array 0 is a vertex array of its own.
+//
+// Rows: every color buffer holds its image with the top row at texture row 0, as gfxstream's
+// do. A window surface draws into a framebuffer of its own, GL's bottom row first, and a flush
+// copies it into its color buffer turned over, as the host's (EmulatedEglWindowSurface,
+// blitFromReadBufferToTextureFlipped). Composition keeps the top row first, as the host's
+// TextureDraw does, and a post draws the screen turned over onto the canvas.
 
 import { decodeCall, JOIN_PART, joinColorBuffer, joinEnd, PacketSplitter, RECORD, type Arg, type Call, type TapRecord } from "../../../core/mirror/wire.ts";
 import { RateMeter } from "../../../core/meter.ts";
+import { loadGlJoin, type JoinGlParts, type JoinGlStats, type JoinHost } from "./gl-join.ts";
 
 type GL = WebGL2RenderingContext;
 
@@ -23,7 +30,11 @@ const GL_READ_FRAMEBUFFER = 0x8ca8;
 const GL_DRAW_FRAMEBUFFER = 0x8ca9;
 const GL_RENDERBUFFER = 0x8d41;
 const GL_UNIFORM_BUFFER = 0x8a11;
+const GL_TRANSFORM_FEEDBACK_BUFFER = 0x8c8e;
 const GL_PRIMITIVE_RESTART_FIXED_INDEX = 0x8d69;
+const GL_INVALID_INDEX = 0xffffffff;
+/** TEXTURE_SWIZZLE_R..A: the host's emulation of LUMINANCE and ALPHA on core GL, which WebGL2 has natively and has no swizzle for. */
+const TEXTURE_SWIZZLES: ReadonlySet<number> = new Set([0x8e42, 0x8e43, 0x8e44, 0x8e45]);
 const CAPS = [0x0be2, 0x0b44, 0x0b71, 0x0bd0, 0x8037, 0x809e, 0x80a0, 0x0c11, 0x0b90, 0x8c89];
 const TEXTURE_UNITS = 16;
 const RASTER = /^gl(Draw|Clear$|ClearBuffer|BlitFramebuffer)/;
@@ -58,27 +69,66 @@ export interface JoinStats {
   ok: boolean | null;
   pauseUs: number | null;
   skipped: number | null;
+  /** The GL state the snapshot carried (END flags bit 0), rebuilt at END; null without it. */
+  gl: JoinGlStats | null;
 }
 
-interface ShareGroup {
+export interface ShareGroup {
   /** Tells share groups apart in the state shadow: one name in two groups is two objects. */
   id: number;
   textures: Map<number, WebGLTexture>;
-  buffers: Map<number, WebGLBuffer>;
+  buffers: Map<number, GuestBuffer>;
   renderbuffers: Map<number, WebGLRenderbuffer | ColorBuffer>;
   samplers: Map<number, WebGLSampler>;
   shaders: Map<number, WebGLShader>;
   programs: Map<number, Program>;
 }
 
-interface Program {
+export interface Program {
   p: WebGLProgram;
   locations: Map<number, WebGLUniformLocation | null>;
   blocks: Map<number, string>;
 }
 
+/**
+ * A guest buffer object. GLES binds a buffer to any target, while WebGL2 fixes a buffer's type
+ * at its first bind, element array or other, and refuses it the other kind of target after
+ * (WebGL 2.0, 5.1). So a guest buffer has a WebGL2 buffer of each type it was bound as. Every
+ * write goes to both (glCopyBufferSubData through copyBufferSubData), and the first bind of a
+ * second type copies the bytes over (WebGL2 copies between the types only through client
+ * memory). A vertex array holds its element buffer without binding it again, so both types must
+ * hold the guest's bytes before any draw.
+ */
+export interface GuestBuffer {
+  other: WebGLBuffer | null;
+  element: WebGLBuffer | null;
+  /** Which of the two holds the guest's bytes now; null before the first write. */
+  fresh: "other" | "element" | "both" | null;
+  usage: number;
+  /** Its size in bytes from its last glBufferData (or the join), for the copies GLES refuses. */
+  size?: number;
+}
+
+type BufferType = "other" | "element";
+
+/** The binding query of each buffer target, to find the buffer a write went to. */
+const BUFFER_BINDING = new Map<number, number>([
+  [0x8892, 0x8894], // ARRAY_BUFFER
+  [0x8893, 0x8895], // ELEMENT_ARRAY_BUFFER
+  [0x8f36, 0x8f36], // COPY_READ_BUFFER
+  [0x8f37, 0x8f37], // COPY_WRITE_BUFFER
+  [0x88eb, 0x88ed], // PIXEL_PACK_BUFFER
+  [0x88ec, 0x88ef], // PIXEL_UNPACK_BUFFER
+  [0x8a11, 0x8a28], // UNIFORM_BUFFER
+  [0x8c8e, 0x8c8f], // TRANSFORM_FEEDBACK_BUFFER
+]);
+const GL_COPY_READ_BUFFER = 0x8f36;
+const GL_COPY_WRITE_BUFFER = 0x8f37;
+
 interface Surface {
   fbo: WebGLFramebuffer;
+  /** The surface's own color, GL's bottom row first; a flush copies it into `cb`. Null only while it is made. */
+  color: WebGLTexture | null;
   depth: WebGLRenderbuffer;
   w: number;
   h: number;
@@ -90,16 +140,10 @@ export interface ColorBuffer {
   tex: WebGLTexture;
   w: number;
   h: number;
-  /**
-   * Its rows run from the screen's top: a composition target the host drew (the join's posted
-   * buffer), until the mirror composes into it. The mirror's own composition keeps GL's
-   * bottom row first.
-   */
-  topRowFirst?: boolean;
 }
 
 /** One guest context: its share group, its stand-ins for vertex array 0 and its framebuffers, and its state. */
-interface Ctx {
+export interface Ctx {
   handle: number;
   share: ShareGroup;
   vao0: WebGLVertexArrayObject;
@@ -149,6 +193,8 @@ interface Channel {
 type Handler = (c: Channel, a: Arg[], call: Call) => void;
 type ReplyHandler = (c: Channel, a: Arg[], reply: Uint8Array) => void;
 
+/** The buffer target of an indexed binding's setting key (ubo:<i>, tfbuf:<i>), or 0. */
+const indexedTarget = (key: string) => (key.startsWith("ubo:") ? GL_UNIFORM_BUFFER : key.startsWith("tfbuf:") ? GL_TRANSFORM_FEEDBACK_BUFFER : 0);
 const u32s = (b: Uint8Array) => new Uint32Array(b.buffer.slice(b.byteOffset, b.byteOffset + (b.byteLength & ~3)));
 const num = (a: Arg | undefined) => (typeof a === "number" ? a : typeof a === "bigint" ? Number(a) : 0);
 const bytes = (a: Arg | undefined) => (a instanceof Uint8Array ? a : new Uint8Array(0));
@@ -225,6 +271,10 @@ export class GlMirror {
   /** Per handle, FREE records still to come for buffers a create with that handle replaced. */
   private readonly staleFrees = new Map<number, number>();
   private readonly images = new Map<number, WebGLTexture>();
+  /** The guest buffer each WebGL2 buffer is one type of. */
+  private readonly bufferOwner = new WeakMap<WebGLBuffer, GuestBuffer>();
+  /** The join's GL state parts, kept until its END. */
+  private joinParts: JoinGlParts | null = null;
   private current: Ctx | null = null;
   /**
    * The mirror's own drawing (composition, posts, uploads) changed GL state behind the
@@ -310,11 +360,23 @@ export class GlMirror {
   /**
    * One part of the join snapshot: the phone's state when the copy started. Its color buffers
    * (every layer the composer can draw, and the screen) are made here with their pixels, and
-   * the screen is drawn at its END, so a phone that draws nothing new is shown at once.
+   * the screen is drawn at its END, so a phone that draws nothing new is shown at once. The GL
+   * state parts are kept until the END, which rebuilds them (gl-join.ts) before the screen.
    */
   private join(r: TapRecord): void {
-    const j = (this.stats.join ??= { colorBuffers: 0, bytes: 0, malformed: 0, ok: null, pauseUs: null, skipped: null });
-    if (r.aux === JOIN_PART.colorBuffer) {
+    const j = (this.stats.join ??= { colorBuffers: 0, bytes: 0, malformed: 0, ok: null, pauseUs: null, skipped: null, gl: null });
+    const parts = (this.joinParts ??= { glState: null, textures: new Map(), channels: new Map() });
+    if (r.aux === JOIN_PART.glState) {
+      parts.glState = r.payload;
+    } else if (r.aux === JOIN_PART.texture || r.aux === JOIN_PART.channel) {
+      // u32 id, then the saved bytes; a repeated id replaces the first
+      if (r.payload.length < 4) {
+        j.malformed++;
+        return;
+      }
+      const id = new DataView(r.payload.buffer, r.payload.byteOffset, 4).getUint32(0, true);
+      (r.aux === JOIN_PART.texture ? parts.textures : parts.channels).set(id, r.payload.subarray(4));
+    } else if (r.aux === JOIN_PART.colorBuffer) {
       const p = joinColorBuffer(r.payload);
       if (!p) {
         j.malformed++;
@@ -335,14 +397,52 @@ export class GlMirror {
       j.ok = e.status === 0;
       j.pauseUs = e.pauseUs;
       j.skipped = e.skipped;
-      // The posted buffer is the host's last composition target, whose rows run from the
-      // screen's top: it is drawn turned over until the mirror composes into it.
-      const posted = j.ok && e.lastPosted ? this.colorBuffers.get(e.lastPosted) : undefined;
-      if (posted) {
-        posted.topRowFirst = true;
-        this.post(posted.handle);
-      }
+      this.joinParts = null;
+      // the GL state over the color buffers: contexts, their objects and state, window surfaces,
+      // and what each channel had current, so the processes running before the copy keep drawing
+      if (j.ok && e.flags & 1) j.gl = loadGlJoin(this.joinHost(), parts);
+      if (j.ok && e.lastPosted) this.post(e.lastPosted);
     }
+  }
+
+  /** What the join loader (gl-join.ts) builds with: the live handlers' own paths. */
+  private joinHost(): JoinHost {
+    return {
+      gl: this.gl,
+      colorBuffers: this.colorBuffers,
+      images: this.images,
+      caps: CAPS,
+      newShare: () => this.newShare(),
+      createContext: (handle, share) => this.createContext(handle, share),
+      createWindowSurface: (handle, w, h) => this.createWindowSurface(handle, w, h),
+      setWindowColorBuffer: (surface, colorBuffer) => {
+        this.setWindowColorBuffer(surface, colorBuffer);
+        // the host's surface held what it last copied into a color buffer; the one attached
+        // now is the nearest the snapshot has
+        this.fillSurface(surface);
+      },
+      fillBuffer: (share, name, target, data, usage) => this.fillBuffer(share, name, target, data, usage),
+      bufferAt: (share, name, target) => (share.buffers.has(name) ? this.bufferAt(share, name, target) : null),
+      bindChannel: (id, context, draw, read) => {
+        const c = this.channel(id, true);
+        c.known = true;
+        this.bindContext(c, context, draw, read);
+        return c.ctx !== null;
+      },
+      call: (ctx, name, args) => {
+        const h = this.handlers.get(name);
+        if (!h) throw new Error(`no handler for ${name}`);
+        this.makeCurrent(ctx);
+        h({ id: 0, known: true, split: new PacketSplitter(), ctx, waiting: [] }, args, { op: 0, name, args, replies: false, retBytes: 0 });
+      },
+      vaoOf: (ctx, name) => this.vaoOf(ctx, name),
+      fboOf: (ctx, name) => this.fboOf(ctx, name, true),
+      view: (type, d) => this.view(type, d),
+      shaderSource: webglShaderSource,
+      touched: () => {
+        this.dirty = true;
+      },
+    };
   }
 
   private channel(id: number, known: boolean): Channel {
@@ -415,7 +515,17 @@ export class GlMirror {
     const next = ctx.shadow.settings;
     // settings this context never made go back to their defaults: those the previous context
     // made, or with no previous context to trust, every one any context made
-    for (const k of prev ? prev.shadow.settings.keys() : this.allKeys) if (!next.has(k)) this.defaultOf(k)?.();
+    // an indexed buffer binding sets its target's generic binding too: the targets whose indexed
+    // bindings were put back get their generic binding put back after them
+    const indexed = new Set<number>();
+    for (const k of prev ? prev.shadow.settings.keys() : this.allKeys)
+      if (!next.has(k)) {
+        const d = this.defaultOf(k);
+        if (!d) continue;
+        d();
+        const t = indexedTarget(k);
+        if (t) indexed.add(t);
+      }
     let unit: Setting | undefined;
     for (const [k, s] of next) {
       if (k === "activeTexture") {
@@ -424,6 +534,13 @@ export class GlMirror {
       }
       if (prev?.shadow.settings.get(k)?.value === s.value) continue;
       s.apply();
+      const t = indexedTarget(k);
+      if (t) indexed.add(t);
+    }
+    for (const t of indexed) {
+      const g = next.get(`buf:${t}`);
+      if (g) g.apply();
+      else gl.bindBuffer(t, null);
     }
     // per-context objects that WebGL2 holds globally
     gl.bindVertexArray(this.vaoOf(ctx, ctx.vao));
@@ -492,6 +609,8 @@ export class GlMirror {
         return () => gl.pixelStorei(Number(a), Number(a) === 0x0cf5 || Number(a) === 0x0d05 ? 4 : 0);
       case "ubo":
         return () => gl.bindBufferBase(GL_UNIFORM_BUFFER, Number(a), null);
+      case "attrib":
+        return () => gl.vertexAttrib4f(Number(a), 0, 0, 0, 1);
       case "tfb":
         return () => gl.bindTransformFeedback(0x8e22, null);
       default:
@@ -531,14 +650,153 @@ export class GlMirror {
     return t;
   }
 
-  private buf(ctx: Ctx, name: number): WebGLBuffer | null {
+  /**
+   * Guest buffer `name`'s WebGL2 buffer of the type `target` takes, holding the guest's bytes.
+   * A copy target takes either type: the one with the bytes. An element array buffer made here
+   * is left bound to ELEMENT_ARRAY_BUFFER, in the vertex array bound now: that bind gives it its
+   * type, and every caller that asks for one binds it there.
+   */
+  private bufferAt(share: ShareGroup, name: number, target: number): WebGLBuffer | null {
     if (name === 0) return null;
-    let b = ctx.share.buffers.get(name);
+    const gl = this.gl;
+    let gb = share.buffers.get(name);
+    if (!gb) {
+      gb = { other: null, element: null, fresh: null, usage: 0x88e4 };
+      share.buffers.set(name, gb);
+    }
+    const copy = target === GL_COPY_READ_BUFFER || target === GL_COPY_WRITE_BUFFER;
+    const type: BufferType = target === GL_ELEMENT_ARRAY_BUFFER || (copy && (gb.fresh === "element" || (!gb.other && gb.element))) ? "element" : "other";
+    let b = gb[type];
     if (!b) {
-      b = this.gl.createBuffer()!;
-      ctx.share.buffers.set(name, b);
+      b = gl.createBuffer()!;
+      gb[type] = b;
+      this.bufferOwner.set(b, gb);
+      if (type === "element") gl.bindBuffer(GL_ELEMENT_ARRAY_BUFFER, b);
+    }
+    if (gb.fresh !== null && gb.fresh !== "both" && gb.fresh !== type) {
+      this.copyBuffer(gb[gb.fresh]!, b, gb.usage);
+      gb.fresh = "both";
     }
     return b;
+  }
+
+  /** The bytes of `src` into `dst`, through client memory (WebGL2 copies no bytes between the types on the GPU). */
+  private copyBuffer(src: WebGLBuffer, dst: WebGLBuffer, usage: number): void {
+    const gl = this.gl;
+    const read = gl.getParameter(GL_COPY_READ_BUFFER) as WebGLBuffer | null;
+    const write = gl.getParameter(GL_COPY_WRITE_BUFFER) as WebGLBuffer | null;
+    gl.bindBuffer(GL_COPY_READ_BUFFER, src);
+    const size = Number(gl.getBufferParameter(GL_COPY_READ_BUFFER, 0x8764)) || 0;
+    const bytes = new Uint8Array(size);
+    if (size) gl.getBufferSubData(GL_COPY_READ_BUFFER, 0, bytes);
+    gl.bindBuffer(GL_COPY_WRITE_BUFFER, dst);
+    gl.bufferData(GL_COPY_WRITE_BUFFER, bytes, usage);
+    gl.bindBuffer(GL_COPY_READ_BUFFER, read);
+    gl.bindBuffer(GL_COPY_WRITE_BUFFER, write);
+  }
+
+  /**
+   * A write through `target` to the guest buffer bound there: `again` repeats it on the buffer's
+   * WebGL2 buffer of the other type (bound to COPY_WRITE_BUFFER). `whole` says the write gave the
+   * buffer all its bytes (glBufferData).
+   */
+  private wroteBuffer(target: number, whole: boolean, again: (target: number) => void, usage?: number, size?: number): void {
+    const gl = this.gl;
+    const binding = BUFFER_BINDING.get(target);
+    const b = binding === undefined ? null : (gl.getParameter(binding) as WebGLBuffer | null);
+    const gb = b ? this.bufferOwner.get(b) : undefined;
+    if (!b || !gb) return;
+    if (usage !== undefined) gb.usage = usage;
+    if (size !== undefined) gb.size = size;
+    const type: BufferType = gb.element === b ? "element" : "other";
+    const twin = gb[type === "element" ? "other" : "element"];
+    if (!twin) {
+      gb.fresh = type;
+      return;
+    }
+    const write = gl.getParameter(GL_COPY_WRITE_BUFFER) as WebGLBuffer | null;
+    gl.bindBuffer(GL_COPY_WRITE_BUFFER, twin);
+    again(GL_COPY_WRITE_BUFFER);
+    gl.bindBuffer(GL_COPY_WRITE_BUFFER, write);
+    // a part written to a stale twin leaves it stale
+    if (whole) gb.fresh = "both";
+    else if (gb.fresh !== "both") gb.fresh = type;
+  }
+
+  /**
+   * glCopyBufferSubData, on every type of the destination that holds the guest's bytes. WebGL2
+   * copies on the GPU only between buffers of one type: a type the source holds too is copied
+   * there, and any other gets the range read back once through client memory. So both types stay
+   * current, and an element buffer a vertex array holds draws the copied indices.
+   */
+  private copyBufferSubData(readTarget: number, writeTarget: number, readOffset: number, writeOffset: number, size: number): void {
+    const gl = this.gl;
+    const owner = (t: number) => {
+      const binding = BUFFER_BINDING.get(t);
+      const b = binding === undefined ? null : (gl.getParameter(binding) as WebGLBuffer | null);
+      return b ? this.bufferOwner.get(b) : undefined;
+    };
+    const src = owner(readTarget);
+    const dst = owner(writeTarget);
+    const holds = (gb: GuestBuffer, t: BufferType) => gb[t] !== null && (gb.fresh === t || gb.fresh === "both");
+    const srcType: BufferType | null = src ? (holds(src, "other") ? "other" : holds(src, "element") ? "element" : null) : null;
+    if (!src || !dst || !srcType || dst.fresh === null) {
+      // a buffer the mirror does not know, or one with no bytes yet (the phone refuses that copy
+      // too): the copy as the guest made it
+      gl.copyBufferSubData(readTarget, writeTarget, readOffset, writeOffset, size);
+      return;
+    }
+    // a range outside either buffer: GLES refuses the copy and writes nothing, so neither does
+    // the mirror (a readback of it would come back zeros and land in the other copy)
+    const outside = (gb: GuestBuffer, offset: number) => gb.size !== undefined && (offset < 0 || size < 0 || offset + size > gb.size);
+    if (outside(src, readOffset) || outside(dst, writeOffset)) return;
+    const read = gl.getParameter(GL_COPY_READ_BUFFER) as WebGLBuffer | null;
+    const write = gl.getParameter(GL_COPY_WRITE_BUFFER) as WebGLBuffer | null;
+    let bytes: Uint8Array | null = null;
+    for (const t of ["other", "element"] as const) {
+      if (!holds(dst, t)) continue;
+      if (holds(src, t)) {
+        gl.bindBuffer(GL_COPY_READ_BUFFER, src[t]);
+        gl.bindBuffer(GL_COPY_WRITE_BUFFER, dst[t]);
+        gl.copyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, readOffset, writeOffset, size);
+        continue;
+      }
+      if (!bytes) {
+        // GLES forbids overlapping ranges, so a copy within one buffer has not changed this range
+        bytes = new Uint8Array(size);
+        gl.bindBuffer(GL_COPY_READ_BUFFER, src[srcType]);
+        gl.getBufferSubData(GL_COPY_READ_BUFFER, readOffset, bytes);
+      }
+      gl.bindBuffer(GL_COPY_WRITE_BUFFER, dst[t]);
+      gl.bufferSubData(GL_COPY_WRITE_BUFFER, writeOffset, bytes);
+    }
+    gl.bindBuffer(GL_COPY_READ_BUFFER, read);
+    gl.bindBuffer(GL_COPY_WRITE_BUFFER, write);
+  }
+
+  /** The join's bytes for guest buffer `name`, as a bind to `target` and a glBufferData. */
+  private fillBuffer(share: ShareGroup, name: number, target: number, data: Uint8Array | null, usage: number): void {
+    const gl = this.gl;
+    if (!data) {
+      if (!share.buffers.has(name)) share.buffers.set(name, { other: null, element: null, fresh: null, usage });
+      return;
+    }
+    // an element array buffer binds into a vertex array: a scratch one keeps the contexts' own
+    const scratch = target === GL_ELEMENT_ARRAY_BUFFER ? gl.createVertexArray() : null;
+    if (scratch) gl.bindVertexArray(scratch);
+    const b = this.bufferAt(share, name, target);
+    gl.bindBuffer(target, b);
+    gl.bufferData(target, data, usage);
+    const gb = share.buffers.get(name)!;
+    gb.usage = usage;
+    gb.size = data.byteLength;
+    gb.fresh = target === GL_ELEMENT_ARRAY_BUFFER ? "element" : "other";
+    gl.bindBuffer(target, null);
+    if (scratch) {
+      gl.bindVertexArray(null);
+      gl.deleteVertexArray(scratch);
+    }
+    this.dirty = true;
   }
 
   private prog(ctx: Ctx, name: number): Program | null {
@@ -595,78 +853,30 @@ export class GlMirror {
     // renderControl: contexts, surfaces, color buffers, composition, posts
     this.onReply("rcCreateContext", (_c, a, r) => {
       const handle = new DataView(r.buffer, r.byteOffset).getUint32(0, true);
-      const share = this.contexts.get(n(a[1]))?.share ?? this.newShare();
-      this.contexts.set(handle, {
-        handle,
-        share,
-        vao0: gl.createVertexArray()!,
-        vaos: new Map(),
-        fbos: new Map(),
-        tfbs: new Map(),
-        queries: new Map(),
-        draw: null,
-        read: null,
-        shadow: new Shadow(),
-        boundFbo: { draw: 0, read: 0 },
-        boundRbo: 0,
-        boundTex: new Map(),
-        activeUnit: 0,
-        program: 0,
-        vao: 0,
-        arrayBuffer: 0,
-        scratch: new Map(),
-      });
+      this.createContext(handle, this.contexts.get(n(a[1]))?.share ?? this.newShare());
     });
     this.on("rcDestroyContext", (_c, a) => {
       const ctx = this.contexts.get(n(a[0]));
       if (ctx && this.current === ctx) this.current = null;
       this.contexts.delete(n(a[0]));
     });
-    const makeCurrent: Handler = (c, a) => {
-      const ctx = this.contexts.get(n(a[0])) ?? null;
-      c.ctx = ctx;
-      if (ctx) {
-        ctx.draw = this.surfaces.get(n(a[1])) ?? null;
-        ctx.read = this.surfaces.get(n(a[2])) ?? null;
-        // a context made current again on another surface rebinds its framebuffer 0
-        if (this.current === ctx) this.dirty = true;
-      }
-    };
+    const makeCurrent: Handler = (c, a) => this.bindContext(c, n(a[0]), n(a[1]), n(a[2]));
     this.on("rcMakeCurrent", makeCurrent);
     this.on("rcMakeCurrentAsync", makeCurrent);
-    this.onReply("rcCreateWindowSurface", (_c, a, r) => {
-      const handle = new DataView(r.buffer, r.byteOffset).getUint32(0, true);
-      const w = n(a[1]);
-      const h = n(a[2]);
-      const fbo = gl.createFramebuffer()!;
-      const depth = gl.createRenderbuffer()!;
-      gl.bindRenderbuffer(GL_RENDERBUFFER, depth);
-      gl.renderbufferStorage(GL_RENDERBUFFER, 0x88f0, Math.max(1, w), Math.max(1, h));
-      this.restoreRbo();
-      this.surfaces.set(handle, { fbo, depth, w, h, cb: null });
-    });
+    this.onReply("rcCreateWindowSurface", (_c, a, r) => this.createWindowSurface(new DataView(r.buffer, r.byteOffset).getUint32(0, true), n(a[1]), n(a[2])));
     this.on("rcDestroyWindowSurface", (_c, a) => {
       const s = this.surfaces.get(n(a[0]));
       if (!s) return;
       this.surfaces.delete(n(a[0]));
       gl.deleteFramebuffer(s.fbo);
+      gl.deleteTexture(s.color);
       gl.deleteRenderbuffer(s.depth);
       this.release(s.cb?.tex);
     });
-    this.on("rcSetWindowColorBuffer", (_c, a) => {
-      const s = this.surfaces.get(n(a[0]));
-      const cb = this.colorBuffers.get(n(a[1]));
-      if (!s || !cb) return;
-      const old = s.cb;
-      s.cb = cb;
-      this.withFbo(s.fbo, () => {
-        gl.framebufferTexture2D(GL_FRAMEBUFFER, 0x8ce0, GL_TEXTURE_2D, cb.tex, 0);
-        if (s.w === cb.w && s.h === cb.h) gl.framebufferRenderbuffer(GL_FRAMEBUFFER, 0x821a, GL_RENDERBUFFER, s.depth);
-      });
-      if (old !== cb) this.release(old?.tex);
-    });
-    // the surface draws straight into its color buffer: nothing to copy on a flush
-    for (const f of ["rcFlushWindowColorBuffer", "rcFlushWindowColorBufferAsync", "rcFlushWindowColorBufferAsyncWithFrameNumber"]) this.on(f, () => {});
+    this.on("rcSetWindowColorBuffer", (_c, a) => this.setWindowColorBuffer(n(a[0]), n(a[1])));
+    // what the surface drew goes into its color buffer, turned over (eglSwapBuffers, and a pbuffer's)
+    for (const f of ["rcFlushWindowColorBuffer", "rcFlushWindowColorBufferAsync", "rcFlushWindowColorBufferAsyncWithFrameNumber"])
+      this.on(f, (_c, a) => this.flushSurface(n(a[0])));
     const newColorBuffer = (handle: number, w: number, h: number) => void this.newColorBuffer(handle, w, h);
     this.onReply("rcCreateColorBuffer", (_c, a, r) => newColorBuffer(new DataView(r.buffer, r.byteOffset).getUint32(0, true), n(a[0]), n(a[1])));
     this.onReply("rcCreateColorBufferDMA", (_c, a, r) => newColorBuffer(new DataView(r.buffer, r.byteOffset).getUint32(0, true), n(a[0]), n(a[1])));
@@ -763,7 +973,9 @@ export class GlMirror {
         for (const id of u32s(r)) if (id) make(c.ctx, id);
       });
     gen("glGenTextures", (ctx, id) => this.tex(ctx, id));
-    gen("glGenBuffers", (ctx, id) => this.buf(ctx, id));
+    gen("glGenBuffers", (ctx, id) => {
+      if (!ctx.share.buffers.has(id)) ctx.share.buffers.set(id, { other: null, element: null, fresh: null, usage: 0x88e4 });
+    });
     gen("glGenRenderbuffers", (ctx, id) => ctx.share.renderbuffers.set(id, gl.createRenderbuffer()!));
     gen("glGenFramebuffers", (ctx, id) => this.fboOf(ctx, id, true));
     gen("glGenVertexArrays", (ctx, id) => this.vaoOf(ctx, id));
@@ -803,7 +1015,8 @@ export class GlMirror {
       this.release(t);
     });
     del("glDeleteBuffers", (ctx, id) => {
-      gl.deleteBuffer(ctx.share.buffers.get(id) ?? null);
+      const gb = ctx.share.buffers.get(id);
+      for (const b of [gb?.other, gb?.element]) if (b) gl.deleteBuffer(b);
       ctx.share.buffers.delete(id);
     });
     del("glDeleteRenderbuffers", (ctx, id) => {
@@ -883,10 +1096,16 @@ export class GlMirror {
       ctx.program = n(a[0]);
       gl.useProgram(this.prog(ctx, n(a[0]))?.p ?? null);
     });
+    // The guest names a block by the phone driver's index, which says nothing about WebGL2's: the
+    // block's name maps it (Program.blocks, from glGetUniformBlockIndex or the join). Without the
+    // name the binding is not applied.
     this.on("glUniformBlockBinding", (c, a) => {
       const p = this.prog(c.ctx!, n(a[0]));
       const name = p?.blocks.get(n(a[1]));
-      if (p && name !== undefined) gl.uniformBlockBinding(p.p, gl.getUniformBlockIndex(p.p, name), n(a[2]));
+      if (!p) return;
+      const index = name === undefined ? GL_INVALID_INDEX : gl.getUniformBlockIndex(p.p, name);
+      if (index === GL_INVALID_INDEX) this.skip("glUniformBlockBinding of a block not known by name");
+      else gl.uniformBlockBinding(p.p, index, n(a[2]));
     });
     const loc = (c: Channel, l: Arg | undefined) => this.prog(c.ctx!, c.ctx!.program)?.locations.get(n(l)) ?? null;
     const floats = (b: Arg | undefined) => {
@@ -924,19 +1143,28 @@ export class GlMirror {
     // bindings
     this.setting("glBindBuffer", (a) => (n(a[0]) === GL_ELEMENT_ARRAY_BUFFER ? "vaoState" : `buf:${n(a[0])}`), (a, ctx) => {
       if (n(a[0]) === GL_ARRAY_BUFFER) ctx.arrayBuffer = n(a[1]);
-      gl.bindBuffer(n(a[0]), this.buf(ctx, n(a[1])));
+      gl.bindBuffer(n(a[0]), this.bufferAt(ctx.share, n(a[1]), n(a[0])));
     });
     // the element array binding is the vertex array's state, not the context's: never replayed
     this.on("glBindBuffer", ((prev) => (c: Channel, a: Arg[], call: Call) => {
-      if (n(a[0]) === GL_ELEMENT_ARRAY_BUFFER) gl.bindBuffer(GL_ELEMENT_ARRAY_BUFFER, this.buf(c.ctx!, n(a[1])));
+      if (n(a[0]) === GL_ELEMENT_ARRAY_BUFFER) gl.bindBuffer(GL_ELEMENT_ARRAY_BUFFER, this.bufferAt(c.ctx!.share, n(a[1]), GL_ELEMENT_ARRAY_BUFFER));
       else prev(c, a, call);
     })(this.handlers.get("glBindBuffer")!));
-    this.setting("glBindBufferBase", (a) => (n(a[0]) === GL_UNIFORM_BUFFER ? `ubo:${n(a[1])}` : `tfbuf:${n(a[1])}`), (a, ctx) =>
-      gl.bindBufferBase(n(a[0]), n(a[1]), this.buf(ctx, n(a[2]))),
-    );
-    this.setting("glBindBufferRange", (a) => (n(a[0]) === GL_UNIFORM_BUFFER ? `ubo:${n(a[1])}` : `tfbuf:${n(a[1])}`), (a, ctx) =>
-      gl.bindBufferRange(n(a[0]), n(a[1]), this.buf(ctx, n(a[2])), n(a[3]), n(a[4])),
-    );
+    // an indexed binding is also the target's generic binding, in GLES and in WebGL2: the shadow
+    // keeps both, and makeCurrent puts the generic one back after the indexed ones
+    for (const f of ["glBindBufferBase", "glBindBufferRange"])
+      this.on(f, (c, a) => {
+        const ctx = c.ctx!;
+        const target = n(a[0]);
+        const name = n(a[2]);
+        const run = () =>
+          f === "glBindBufferBase"
+            ? gl.bindBufferBase(target, n(a[1]), this.bufferAt(ctx.share, name, target))
+            : gl.bindBufferRange(target, n(a[1]), this.bufferAt(ctx.share, name, target), n(a[3]), n(a[4]));
+        run();
+        this.shadowSet(ctx, `${target === GL_UNIFORM_BUFFER ? "ubo" : "tfbuf"}:${n(a[1])}`, f, a, run);
+        this.shadowSet(ctx, `buf:${target}`, "glBindBuffer", [target, name], () => gl.bindBuffer(target, this.bufferAt(ctx.share, name, target)));
+      });
     this.setting("glActiveTexture", () => "activeTexture", (a, ctx) => {
       ctx.activeUnit = n(a[0]) - GL_TEXTURE0;
       gl.activeTexture(n(a[0]));
@@ -1012,11 +1240,21 @@ export class GlMirror {
     this.setting("glClearStencil", () => "clearStencil", (a) => gl.clearStencil(n(a[0])));
     this.setting("glPixelStorei", (a) => `pixelStore:${n(a[0])}`, (a) => gl.pixelStorei(n(a[0]), n(a[1])));
     this.setting("glHint", (a) => `hint:${n(a[0])}`, (a) => (n(a[0]) === 0x8192 ? gl.hint(n(a[0]), n(a[1])) : undefined));
-    this.on("glVertexAttrib1f", (_c, a) => gl.vertexAttrib1f(n(a[0]), n(a[1])));
-    this.on("glVertexAttrib2f", (_c, a) => gl.vertexAttrib2f(n(a[0]), n(a[1]), n(a[2])));
-    this.on("glVertexAttrib3f", (_c, a) => gl.vertexAttrib3f(n(a[0]), n(a[1]), n(a[2]), n(a[3])));
-    this.on("glVertexAttrib4f", (_c, a) => gl.vertexAttrib4f(n(a[0]), n(a[1]), n(a[2]), n(a[3]), n(a[4])));
-    this.on("glVertexAttrib4fv", (_c, a) => gl.vertexAttrib4fv(n(a[0]), floats(a[1])));
+    // A constant attribute value is context state in GLES, and WebGL2 holds one for every guest
+    // context: each is a setting of its context, one key per attribute index.
+    const attrib = (name: string, apply: (a: Arg[]) => void) => this.setting(name, (a) => `attrib:${n(a[0])}`, apply);
+    attrib("glVertexAttrib1f", (a) => gl.vertexAttrib1f(n(a[0]), n(a[1])));
+    attrib("glVertexAttrib2f", (a) => gl.vertexAttrib2f(n(a[0]), n(a[1]), n(a[2])));
+    attrib("glVertexAttrib3f", (a) => gl.vertexAttrib3f(n(a[0]), n(a[1]), n(a[2]), n(a[3])));
+    attrib("glVertexAttrib4f", (a) => gl.vertexAttrib4f(n(a[0]), n(a[1]), n(a[2]), n(a[3]), n(a[4])));
+    attrib("glVertexAttrib1fv", (a) => gl.vertexAttrib1fv(n(a[0]), floats(a[1]).subarray(0, 1)));
+    attrib("glVertexAttrib2fv", (a) => gl.vertexAttrib2fv(n(a[0]), floats(a[1]).subarray(0, 2)));
+    attrib("glVertexAttrib3fv", (a) => gl.vertexAttrib3fv(n(a[0]), floats(a[1]).subarray(0, 3)));
+    attrib("glVertexAttrib4fv", (a) => gl.vertexAttrib4fv(n(a[0]), floats(a[1]).subarray(0, 4)));
+    attrib("glVertexAttribI4i", (a) => gl.vertexAttribI4i(n(a[0]), n(a[1]), n(a[2]), n(a[3]), n(a[4])));
+    attrib("glVertexAttribI4ui", (a) => gl.vertexAttribI4ui(n(a[0]), n(a[1]), n(a[2]), n(a[3]), n(a[4])));
+    attrib("glVertexAttribI4iv", (a) => gl.vertexAttribI4iv(n(a[0]), ints(a[1]).subarray(0, 4)));
+    attrib("glVertexAttribI4uiv", (a) => gl.vertexAttribI4uiv(n(a[0]), new Uint32Array(ints(a[1]).buffer).subarray(0, 4)));
 
     // vertex arrays: buffer offsets, or client data sent with the call
     this.on("glEnableVertexAttribArray", (_c, a) => gl.enableVertexAttribArray(n(a[0])));
@@ -1027,37 +1265,39 @@ export class GlMirror {
     this.on("glVertexAttribPointerData", (c, a) => {
       this.clientArray(c.ctx!, n(a[0]), bytes(a[5]));
       gl.vertexAttribPointer(n(a[0]), n(a[1]), n(a[2]), !!n(a[3]), n(a[4]), 0);
-      gl.bindBuffer(GL_ARRAY_BUFFER, this.buf(c.ctx!, c.ctx!.arrayBuffer));
+      gl.bindBuffer(GL_ARRAY_BUFFER, this.bufferAt(c.ctx!.share, c.ctx!.arrayBuffer, GL_ARRAY_BUFFER));
     });
     this.on("glVertexAttribIPointerDataAEMU", (c, a) => {
       this.clientArray(c.ctx!, n(a[0]), bytes(a[4]));
       gl.vertexAttribIPointer(n(a[0]), n(a[1]), n(a[2]), n(a[3]), 0);
-      gl.bindBuffer(GL_ARRAY_BUFFER, this.buf(c.ctx!, c.ctx!.arrayBuffer));
+      gl.bindBuffer(GL_ARRAY_BUFFER, this.bufferAt(c.ctx!.share, c.ctx!.arrayBuffer, GL_ARRAY_BUFFER));
     });
 
     // buffers
-    this.on("glBufferData", (_c, a) => {
-      const d = a[2];
-      if (d instanceof Uint8Array && d.length) gl.bufferData(n(a[0]), d, n(a[3]));
-      else gl.bufferData(n(a[0]), n(a[1]), n(a[3]));
-    });
-    this.on("glBufferDataSyncAEMU", (_c, a) => {
-      const d = a[2];
-      if (d instanceof Uint8Array && d.length) gl.bufferData(n(a[0]), d, n(a[3]));
-      else gl.bufferData(n(a[0]), n(a[1]), n(a[3]));
-    });
-    this.on("glBufferSubData", (_c, a) => gl.bufferSubData(n(a[0]), n(a[1]), bytes(a[3])));
-    this.on("glCopyBufferSubData", (_c, a) => gl.copyBufferSubData(n(a[0]), n(a[1]), n(a[2]), n(a[3]), n(a[4])));
+    // each write also reaches the guest buffer's WebGL2 buffer of the other type (wroteBuffer)
+    for (const f of ["glBufferData", "glBufferDataSyncAEMU"])
+      this.on(f, (_c, a) => {
+        const d = a[2];
+        const write = (t: number) => (d instanceof Uint8Array && d.length ? gl.bufferData(t, d, n(a[3])) : gl.bufferData(t, n(a[1]), n(a[3])));
+        write(n(a[0]));
+        this.wroteBuffer(n(a[0]), true, write, n(a[3]), n(a[1]));
+      });
+    const subData = (target: number, offset: number, d: Uint8Array) => {
+      gl.bufferSubData(target, offset, d);
+      this.wroteBuffer(target, false, (t) => gl.bufferSubData(t, offset, d));
+    };
+    this.on("glBufferSubData", (_c, a) => subData(n(a[0]), n(a[1]), bytes(a[3])));
+    this.on("glCopyBufferSubData", (_c, a) => this.copyBufferSubData(n(a[0]), n(a[1]), n(a[2]), n(a[3]), n(a[4])));
     // a write map's bytes come back with the unmap or the flush
     for (const f of ["glUnmapBufferAEMU", "glUnmapBufferAsyncAEMU"])
       this.on(f, (_c, a) => {
         const d = bytes(a[4]);
-        if (n(a[3]) & 0x0002 && d.length) gl.bufferSubData(n(a[0]), n(a[1]), d);
+        if (n(a[3]) & 0x0002 && d.length) subData(n(a[0]), n(a[1]), d);
       });
     for (const f of ["glFlushMappedBufferRangeAEMU", "glFlushMappedBufferRangeAEMU2"])
       this.on(f, (_c, a) => {
         const d = bytes(a[4]);
-        if (d.length) gl.bufferSubData(n(a[0]), n(a[1]), d);
+        if (d.length) subData(n(a[0]), n(a[1]), d);
       });
     this.on("glMapBufferRangeAEMU", () => {});
 
@@ -1081,10 +1321,15 @@ export class GlMirror {
     this.on("glCopyTexImage2D", (_c, a) => gl.copyTexImage2D(this.target(n(a[0])), n(a[1]), n(a[2]), n(a[3]), n(a[4]), n(a[5]), n(a[6]), n(a[7])));
     this.on("glCopyTexSubImage2D", (_c, a) => gl.copyTexSubImage2D(this.target(n(a[0])), n(a[1]), n(a[2]), n(a[3]), n(a[4]), n(a[5]), n(a[6]), n(a[7])));
     this.on("glGenerateMipmap", (_c, a) => gl.generateMipmap(this.target(n(a[0]))));
-    this.on("glTexParameteri", (_c, a) => gl.texParameteri(this.target(n(a[0])), n(a[1]), n(a[2])));
-    this.on("glTexParameterf", (_c, a) => gl.texParameterf(this.target(n(a[0])), n(a[1]), n(a[2])));
-    this.on("glTexParameteriv", (_c, a) => gl.texParameteri(this.target(n(a[0])), n(a[1]), ints(a[2])[0] ?? 0));
-    this.on("glTexParameterfv", (_c, a) => gl.texParameterf(this.target(n(a[0])), n(a[1]), floats(a[2])[0] ?? 0));
+    const texParameter = (name: string, set: (target: number, pname: number, a: Arg[]) => void) =>
+      this.on(name, (_c, a) => {
+        if (TEXTURE_SWIZZLES.has(n(a[1]))) this.skip(`${name} texture swizzle`);
+        else set(this.target(n(a[0])), n(a[1]), a);
+      });
+    texParameter("glTexParameteri", (t, p, a) => gl.texParameteri(t, p, n(a[2])));
+    texParameter("glTexParameterf", (t, p, a) => gl.texParameterf(t, p, n(a[2])));
+    texParameter("glTexParameteriv", (t, p, a) => gl.texParameteri(t, p, ints(a[2])[0] ?? 0));
+    texParameter("glTexParameterfv", (t, p, a) => gl.texParameterf(t, p, floats(a[2])[0] ?? 0));
     this.on("glSamplerParameteri", (c, a) => gl.samplerParameteri(c.ctx!.share.samplers.get(n(a[0]))!, n(a[1]), n(a[2])));
     this.on("glSamplerParameterf", (c, a) => gl.samplerParameterf(c.ctx!.share.samplers.get(n(a[0]))!, n(a[1]), n(a[2])));
     this.on("glEGLImageTargetTexture2DOES", (c, a) => {
@@ -1198,6 +1443,112 @@ export class GlMirror {
       "glReleaseShaderCompiler",
     ])
       if (!this.handlers.has(f)) this.on(f, () => {});
+  }
+
+  /** A guest context, as rcCreateContext makes it: no state set, sharing `share`'s objects. */
+  private createContext(handle: number, share: ShareGroup): Ctx {
+    const old = this.contexts.get(handle);
+    if (old && this.current === old) this.current = null;
+    const ctx: Ctx = {
+      handle,
+      share,
+      vao0: this.gl.createVertexArray()!,
+      vaos: new Map(),
+      fbos: new Map(),
+      tfbs: new Map(),
+      queries: new Map(),
+      draw: null,
+      read: null,
+      shadow: new Shadow(),
+      boundFbo: { draw: 0, read: 0 },
+      boundRbo: 0,
+      boundTex: new Map(),
+      activeUnit: 0,
+      program: 0,
+      vao: 0,
+      arrayBuffer: 0,
+      scratch: new Map(),
+    };
+    this.contexts.set(handle, ctx);
+    return ctx;
+  }
+
+  /** rcMakeCurrent: channel `c` draws with context `context` on surfaces `draw` and `read`. */
+  private bindContext(c: Channel, context: number, draw: number, read: number): void {
+    const ctx = this.contexts.get(context) ?? null;
+    c.ctx = ctx;
+    if (ctx) {
+      ctx.draw = this.surfaces.get(draw) ?? null;
+      ctx.read = this.surfaces.get(read) ?? null;
+      // a context made current again on another surface rebinds its framebuffer 0
+      if (this.current === ctx) this.dirty = true;
+    }
+  }
+
+  /** A window surface, as the host's pbuffer for it: its framebuffer, color and depth-stencil; its color buffer is bound later. */
+  private createWindowSurface(handle: number, w: number, h: number): void {
+    const gl = this.gl;
+    const s: Surface = { fbo: gl.createFramebuffer()!, color: null, depth: gl.createRenderbuffer()!, w: 0, h: 0, cb: null };
+    this.sizeSurface(s, w, h);
+    this.surfaces.set(handle, s);
+  }
+
+  /** The surface's color and depth at `w` x `h`, as the host makes a new pbuffer: its pixels are undefined. */
+  private sizeSurface(s: Surface, w: number, h: number): void {
+    const gl = this.gl;
+    s.w = w;
+    s.h = h;
+    if (s.color) gl.deleteTexture(s.color);
+    const color = gl.createTexture()!;
+    s.color = color;
+    this.withTexture(color, () => gl.texStorage2D(GL_TEXTURE_2D, 1, 0x8058, Math.max(1, w), Math.max(1, h)));
+    gl.bindRenderbuffer(GL_RENDERBUFFER, s.depth);
+    gl.renderbufferStorage(GL_RENDERBUFFER, 0x88f0, Math.max(1, w), Math.max(1, h));
+    this.restoreRbo();
+    this.withFbo(s.fbo, () => {
+      gl.framebufferTexture2D(GL_FRAMEBUFFER, 0x8ce0, GL_TEXTURE_2D, color, 0);
+      gl.framebufferRenderbuffer(GL_FRAMEBUFFER, 0x821a, GL_RENDERBUFFER, s.depth);
+    });
+  }
+
+  /** rcSetWindowColorBuffer: the color buffer the surface's next flush copies into. The host's pbuffer takes a new size with a buffer of another. */
+  private setWindowColorBuffer(surface: number, colorBuffer: number): void {
+    const s = this.surfaces.get(surface);
+    const cb = this.colorBuffers.get(colorBuffer);
+    if (!s || !cb) return;
+    const old = s.cb;
+    s.cb = cb;
+    if (s.w !== cb.w || s.h !== cb.h) this.sizeSurface(s, cb.w, cb.h);
+    if (old !== cb) this.release(old?.tex);
+  }
+
+  /** rcFlushWindowColorBuffer: the surface's pixels into its color buffer, turned over so its top row is the buffer's row 0. */
+  private flushSurface(surface: number): void {
+    const s = this.surfaces.get(surface);
+    if (s?.color && s.cb && s.cb.w === s.w && s.cb.h === s.h) this.blitTurned(s.color, s.cb.tex, s.w, s.h);
+  }
+
+  /** The join: a surface's pixels from its color buffer (the reverse of a flush). */
+  private fillSurface(surface: number): void {
+    const s = this.surfaces.get(surface);
+    if (s?.color && s.cb && s.cb.w === s.w && s.cb.h === s.h) this.blitTurned(s.cb.tex, s.color, s.w, s.h);
+  }
+
+  /** Texture `src` into texture `dst`, both `w` x `h`, upside down. */
+  private blitTurned(src: WebGLTexture, dst: WebGLTexture, w: number, h: number): void {
+    const gl = this.gl;
+    const read = gl.createFramebuffer()!;
+    const draw = gl.createFramebuffer()!;
+    this.ownState();
+    gl.bindFramebuffer(GL_READ_FRAMEBUFFER, read);
+    gl.framebufferTexture2D(GL_READ_FRAMEBUFFER, 0x8ce0, GL_TEXTURE_2D, src, 0);
+    gl.bindFramebuffer(GL_DRAW_FRAMEBUFFER, draw);
+    gl.framebufferTexture2D(GL_DRAW_FRAMEBUFFER, 0x8ce0, GL_TEXTURE_2D, dst, 0);
+    gl.blitFramebuffer(0, 0, w, h, 0, h, w, 0, 0x4000, 0x2600);
+    gl.bindFramebuffer(GL_READ_FRAMEBUFFER, null);
+    gl.bindFramebuffer(GL_DRAW_FRAMEBUFFER, null);
+    gl.deleteFramebuffer(read);
+    gl.deleteFramebuffer(draw);
   }
 
   private newColorBuffer(handle: number, w: number, h: number): ColorBuffer {
@@ -1425,6 +1776,10 @@ void main() { o = mode == 1 ? color : texture(src, t) * color.a; }`;
     gl.colorMask(true, true, true, true);
     gl.bindSampler(0, null);
     gl.activeTexture(GL_TEXTURE0);
+    // The blit program's sampler2D is on unit 0 for every draw, a solid colour's too, and WebGL2
+    // refuses a draw whose sampler2D unit holds a depth texture that compares (a guest's shadow
+    // map): INVALID_OPERATION, nothing drawn. Each texture draw binds its own.
+    gl.bindTexture(GL_TEXTURE_2D, null);
     gl.pixelStorei(0x0cf5, 4);
     this.dirty = true;
   }
@@ -1452,8 +1807,6 @@ void main() { o = mode == 1 ? color : texture(src, t) * color.a; }`;
       if (w <= 0 || h <= 0) return;
       target = this.newColorBuffer(handle, w, h);
     }
-    // the mirror draws it from here: GL's bottom row first
-    target.topRowFirst = false;
     const q = this.quad();
     const fbo = gl.createFramebuffer()!;
     this.ownState();
@@ -1506,7 +1859,7 @@ void main() { o = mode == 1 ? color : texture(src, t) * color.a; }`;
     if (post) this.post(target.handle, call);
   }
 
-  /** The screen: the posted color buffer, drawn to the canvas. */
+  /** The screen: the posted color buffer, drawn to the canvas turned over (its row 0 is the screen's top). */
   private post(handle: number, _call?: Call): void {
     const cb = this.colorBuffers.get(handle);
     if (!cb) return;
@@ -1527,7 +1880,7 @@ void main() { o = mode == 1 ? color : texture(src, t) * color.a; }`;
     gl.uniform1i(q.uMode, 0);
     gl.uniform4f(q.uColor, 1, 1, 1, 1);
     gl.uniform4f(q.uRect, 0, 0, 1, 1);
-    gl.uniform4f(q.uUv, 0, cb.topRowFirst ? 1 : 0, 1, cb.topRowFirst ? -1 : 1);
+    gl.uniform4f(q.uUv, 0, 1, 1, -1);
     gl.uniformMatrix2fv(q.uXm, false, [1, 0, 0, 1]);
     gl.uniform2f(q.uXo, 0, 0);
     gl.bindTexture(GL_TEXTURE_2D, cb.tex);

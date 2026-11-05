@@ -48,7 +48,8 @@ export interface MirrorStatsMsg {
 export type MirrorOut =
   | MirrorStatsMsg
   /** The join has been fed (or the stream has none and its first live record arrived): the copy runs, and the app can be restarted into it. */
-  | { type: "joined" }
+  /** `snapshot`: the join carried the GL state and it loaded, so every process draws on. */
+  | { type: "joined"; snapshot: boolean }
   | { type: "closed"; code: number; reason: string }
   /** The canvas has WebGL2: the mirror can open. */
   | { type: "ready" }

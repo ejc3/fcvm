@@ -6,6 +6,7 @@
 import { constants, createZstdCompress, type ZstdCompress } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { encodeCall, encodeRecord, JOIN_PART, RECORD } from "../mirror/wire.ts";
+import { glState } from "./gles-writer.ts";
 import type { MirrorIn, MirrorOut, MirrorStatsMsg } from "../../app/_wall/mirror/mirror-msgs.ts";
 
 class FakeSocket {
@@ -171,6 +172,29 @@ describe("the mirror worker", () => {
     ws.message(await msg(Buffer.concat([hello(), encodeRecord(RECORD.join, 0, u32(2, 0, 0, 0, 0), JOIN_PART.end)])));
     await settle();
     expect(joins()).toBe(1);
+    // no snapshot: the panel restarts the app into the copy
+    expect(posted.find((m) => m.type === "joined")).toEqual({ type: "joined", snapshot: false });
+    z.close();
+  });
+
+  it("says the join carried the GL state when it loaded, so the panel restarts nothing", async () => {
+    const send = await worker();
+    send({ type: "open", url: "wss://phone/mirror", admit: "t" });
+    const ws = FakeSocket.all[0]!;
+    const { z, msg } = streamer();
+    const u32 = (...x: number[]) => new Uint8Array(new Uint32Array(x).buffer);
+    ws.message(
+      await msg(
+        Buffer.concat([
+          hello(),
+          encodeRecord(RECORD.join, 0, u32(1), JOIN_PART.begin),
+          encodeRecord(RECORD.join, 0, glState({ element: 0 }), JOIN_PART.glState),
+          encodeRecord(RECORD.join, 0, u32(0, 1, 0, 0, 1), JOIN_PART.end),
+        ]),
+      ),
+    );
+    await settle();
+    expect(posted.find((m) => m.type === "joined")).toEqual({ type: "joined", snapshot: true });
     z.close();
   });
 

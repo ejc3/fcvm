@@ -12,6 +12,13 @@
 // stream starts with the join snapshot (JOIN records: every color buffer's pixels and the
 // screen posted last), and the mirror's first frame, drawn from it before any live record, is
 // compared with the phone's screenshot. Fixture e2e/fixtures/mirror/home (MIRROR_JOIN_FIXTURE).
+//
+// The third joins a phone with a browser open (Cromite on www.nvidia.com) and plays the live
+// records that follow: the apps that drew before the copy keep drawing from the GL state the
+// join rebuilt. The mirror's last frame is compared with the phone's screenshot of the page it
+// settled on. Fixture e2e/fixtures/mirror/browser (MIRROR_BROWSER_FIXTURE), cut from the
+// capture by keeping every record but dropping the textures no live draw samples and zeroing
+// the color buffers nothing reads.
 
 import { readdirSync, readFileSync } from "node:fs";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -26,6 +33,7 @@ import type { ReplayResult } from "./mirror/replay-entry.ts";
 const here = fileURLToPath(new URL(".", import.meta.url));
 const fixture = process.env.MIRROR_FIXTURE ?? join(here, "fixtures/mirror/robotpark");
 const joinFixture = process.env.MIRROR_JOIN_FIXTURE ?? join(here, "fixtures/mirror/home");
+const browserFixture = process.env.MIRROR_BROWSER_FIXTURE ?? join(here, "fixtures/mirror/browser");
 
 /**
  * The bar a mirror frame clears against the T4's frame of the same stamp. Two GPUs rasterize
@@ -90,6 +98,7 @@ test("a captured Robot Park stream replayed on WebGL2 matches the phone's own fr
   console.log(JSON.stringify({ ...r, stamped: `${r.stamped.length} frames, ${r.stamped[0]}..${r.stamped[r.stamped.length - 1]}` }));
   expect(r.refs.length, "the screenshots carry Robot Park's stamp").toBe(shots.length);
   expect(r.failed, "no call failed in WebGL2").toEqual({});
+  expect(r.glErrors, `no WebGL error after any record; first: ${r.firstGlErrors.join("; ")}`).toEqual({});
   expect(r.posts).toBeGreaterThan(30);
   expect(r.missing, "every screenshot's frame was posted by the mirror").toEqual([]);
   for (const m of r.matches) {
@@ -125,10 +134,65 @@ test("a stream that joins a running phone draws the phone's screen from the join
   });
   console.log(JSON.stringify(r));
   expect(r.failed, "no call failed in WebGL2").toEqual({});
+  expect(r.glErrors, `no WebGL error after any record; first: ${r.firstGlErrors.join("; ")}`).toEqual({});
   expect(r.join?.ok, "the stream began with a whole join snapshot").toBe(true);
   expect(r.join?.colorBuffers).toBeGreaterThan(0);
   expect(r.firstFromJoin, "the first frame was drawn from the snapshot, before any live record").toBe(true);
   expect(r.match, "a first frame of the screenshot's size").not.toBeNull();
   expect(r.match!.over16, "share of pixels more than 16 levels off").toBeLessThanOrEqual(MAX_OVER16);
   expect(r.match!.psnr, "PSNR").toBeGreaterThanOrEqual(MIN_PSNR);
+});
+
+/**
+ * The browser join's bar. Measured on the committed fixture, SwiftShader against the T4: no
+ * pixel more than 16 levels apart and 69.5 dB. The page is flat colour and text, so the bar is
+ * tighter than Robot Park's; a status bar drawn upside down, or glyphs drawn with the wrong
+ * indices, put 9.5% and more of the pixels over it.
+ */
+const BROWSER_MAX_OVER16 = Number(process.env.MIRROR_BROWSER_MAX_OVER16 ?? 0.002);
+const BROWSER_MIN_PSNR = Number(process.env.MIRROR_BROWSER_MIN_PSNR ?? 45);
+
+test("a stream that joins a phone running a browser keeps drawing it from the join's GL state", async ({ page }) => {
+  const tap = gunzipSync(readFileSync(join(browserFixture, "tap.gz")));
+  // route.fulfill takes at most 100 MB: the tap goes in pieces
+  const PIECE = 32 << 20;
+  await page.route("http://mirror.test/**", (route) => {
+    const name = new URL(route.request().url()).pathname.slice(1);
+    if (name.startsWith("tap/")) {
+      const i = Number(name.slice(4));
+      return route.fulfill({ body: tap.subarray(i * PIECE, (i + 1) * PIECE), contentType: "application/octet-stream" });
+    }
+    return route.fulfill({ body: readFileSync(join(browserFixture, name)), contentType: "image/png" });
+  });
+  await page.route("http://mirror.test/", (route) => route.fulfill({ body: "<!doctype html><canvas id=c width=720 height=1280></canvas>", contentType: "text/html" }));
+  await page.goto("http://mirror.test/");
+  await page.addScriptTag({ content: bundle });
+  const r = await page.evaluate(
+    async ([len, piece]) => {
+      const img = new Image();
+      img.src = "http://mirror.test/shot-3.png";
+      await img.decode();
+      const c = document.createElement("canvas");
+      c.width = img.width;
+      c.height = img.height;
+      const g = c.getContext("2d")!;
+      g.drawImage(img, 0, 0);
+      const px = g.getImageData(0, 0, c.width, c.height).data;
+      const tapBytes = new Uint8Array(len);
+      for (let i = 0; i * piece < len; i++) tapBytes.set(new Uint8Array(await (await fetch(`http://mirror.test/tap/${i}`)).arrayBuffer()), i * piece);
+      return window.mirrorReplay.replayLast(document.getElementById("c") as HTMLCanvasElement, tapBytes, { k: 0, w: c.width, h: c.height, px });
+    },
+    [tap.length, PIECE] as const,
+  );
+  console.log(JSON.stringify(r));
+  expect(r.failed, "no call failed in WebGL2").toEqual({});
+  expect(r.glErrors, `no WebGL error after any record; first: ${r.firstGlErrors.join("; ")}`).toEqual({});
+  expect(r.join?.ok, "the stream began with a whole join snapshot").toBe(true);
+  expect(r.join?.gl, "the join carried GL state").toBeTruthy();
+  expect(r.join!.gl!.error, "the join's GL state loaded").toBeNull();
+  expect(r.join!.gl!.channels, "channels made current from the snapshot").toBeGreaterThan(0);
+  expect(r.posts).toBeGreaterThan(30);
+  expect(r.match, "a last frame of the screenshot's size").not.toBeNull();
+  expect(r.match!.over16, "share of pixels more than 16 levels off").toBeLessThanOrEqual(BROWSER_MAX_OVER16);
+  expect(r.match!.psnr, "PSNR").toBeGreaterThanOrEqual(BROWSER_MIN_PSNR);
 });

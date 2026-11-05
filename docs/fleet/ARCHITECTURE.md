@@ -1138,7 +1138,7 @@ and the page shows it with `?mode=phones`.
 
 ### The GPU mirror
 
-Status: **built**; a viewer joins at a snapshot of the phone's color buffers (point 3), and the GL state at the join is the next PR. The owner, 2026-10-29: "when
+Status: **built**; a viewer joins at a snapshot of the phone's color buffers and GL state (point 3), with no app restart. The owner, 2026-10-29: "when
 you take over a phone, you can have this mirror gpu mode and streaming video mode and both
 shown with bandwidth of each", and "can we have the server gpu mode that can serve as that
 mirror to prevent blocking calls?"
@@ -1270,12 +1270,16 @@ outside the tap's ring (which does not bound them):
 
 The page makes every color buffer with its pixels and draws the one posted last at END, so the
 screen is right at once and every layer the composer draws (status bar, wallpaper, launcher)
-is right in the next composition. The GL parts are read by the next PR in the stack; until
-then the panel still restarts the app, so the app's own surfaces redraw live, and the
-surfaces of older processes stay as they were at the join. The streamer queues the `JOIN`
+is right in the next composition. The GL parts then rebuild every context, its share group's
+objects (textures from their TEXTURE parts, buffers, shaders, programs with their uniform
+values, samplers, framebuffers, vertex arrays) and its state, the window surfaces, and each
+paused channel's current context (`app/_wall/mirror/gl-join.ts`), so every process that was
+running at the join (SystemUI, the launcher, the browser, an app) keeps drawing, and the
+panel restarts nothing; it restarts the app only after a join without the GL state (`joined`
+says which). What the mirror cannot rebuild is counted in its join stats (renderbuffer
+contents, client-memory vertex pointers, programs that do not link in WebGL2). The streamer queues the `JOIN`
 records under a bound of their own (256 MiB) apart from the live 8 MiB, and the page bounds
-what it has not decoded at 256 MiB while a join is being fed. A join refuses (and the copy
-starts as for `S`) while the emulator holds the render threads paused for its own snapshot or
+what it has not decoded at 256 MiB while a join is being fed. A join is refused (the copy starts with a refused END) while the emulator holds the render threads paused for its own snapshot or
 a GPU release, and with address space graphics.
 
 Measured on a g4dn.metal (T4), the AOSP phone in its 6 GiB VM, eight joins in one session on
@@ -1301,6 +1305,20 @@ host-to-guest queue failed every guest read, which ended the guest processes' co
 color buffer and 400 live records: the mirror's first frame, drawn from the snapshot before any
 live record, against the phone's screenshot: 0.07 percent of pixels more than 16 levels off,
 47.6 dB. Without the loader the mirror draws nothing (99.9 percent off).
+
+`e2e/fixtures/mirror/browser` holds a join with the browser on www.nvidia.com in front and the
+9.4 s of live records after it, in which the page's carousel turns to its next slide. Every
+record is kept; the TEXTURE parts of textures no live draw samples, and of color buffers'
+own textures, are dropped, and the pixels of color buffers nothing reads are zeroed (1.9 MB
+gzipped, 92 MB inflated). The mirror's last frame against the phone's screenshot of the page:
+
+| | pixels more than 16 levels off | PSNR |
+|---|---|---|
+| the mirror | 0 | 69.5 dB |
+| rows as the mirror had them | 28.7 percent | 7.5 dB |
+| one buffer per guest buffer | 9.5 percent | 12.2 dB |
+| neither fix | 27.5 percent | 7.6 dB |
+| without the GL loader | 39.7 percent | 5.7 dB |
 
 **4. Backpressure, compression, GPU moves.**
 
@@ -1354,6 +1372,7 @@ mirror per phone at a time (the tap has one consumer).
 | the join: JOIN parts after HELLO and ahead of what render threads copied meanwhile; no handler, a refusal, a failure | `host/mirror_tap_unittest.cpp` (the fork) |
 | the join's bytes told from the live stream's, each under its own bound | `fleet/phone/streamer/test_host.cpp`, `core/test/mirror-worker.test.ts` |
 | a join's color buffers made with their pixels, the screen drawn at END | `core/test/mirror-gl.test.ts`; `e2e/mirror.spec.ts` against the phone's screenshot (above) |
+| the apps running at a join keep drawing from its GL state | `e2e/mirror.spec.ts`, the browser fixture's last frame against the phone's screenshot (above) |
 | the phone keeps composing after a join | `scripts/phone/mirror-capture.sh` checks SurfaceFlinger after its join |
 | replay: a Robot Park stream captured on a gpubox, with the T4's stamped frames, replayed in headless Chrome on WebGL2; each mirror frame compared with the T4 frame of the same stamp | `e2e/mirror.spec.ts` (`playwright.mirror.config.ts`; threshold below) |
 | the panel: three views, video closed in mirror-only, the readouts, the mirror drawing with WebGL2 | `e2e/phones.spec.ts` against the mock coordinator, whose phones serve a synthetic `/mirror` (`mock/mirror.ts`) |
@@ -1519,14 +1538,24 @@ CPU they are uploaded as textures. Firefox's 15 to 240 Mbit/s (`docs/fleet/phone
 comes from GeckoView resending whole mapped buffers; Chromium's GPU process does not. The phone
 keeps GPU rasterization.
 
-The mirror does not yet draw the browser right. A captured start of the browser on the page,
-replayed on WebGL2 in headless Chrome, draws the toolbar and the page, but the web content sits
-48 pixels low, one panel is drawn where the phone shows none, and 151 draws fail in WebGL2
-(`glDrawElements: Must have element array buffer bound`): Chromium's GPU process uses one buffer
-both as `ARRAY_BUFFER` and as `ELEMENT_ARRAY_BUFFER`, which GLES allows and WebGL2 forbids, so
-the mirror's bind of it as an index buffer is refused. The decoder needs a separate WebGL buffer
-for each role, its contents kept in step. Tracked in #1485; the video view is
-correct.
+Two things the browser showed wrong in the mirror, both fixed in `app/_wall/mirror/gl.ts`:
+
+- **Rows.** gfxstream's color buffers hold the top row at texture row 0: a window surface
+  draws into a pbuffer of its own and `rcFlushWindowColorBuffer` copies it into the color
+  buffer turned over (`blitFromReadBufferToTextureFlipped`), and HWC composes with the top row
+  first. The mirror drew a window surface straight into its color buffer, so those buffers were
+  turned over and every other one (gralloc uploads, Chromium's own render targets, the join's
+  pixels) was not. A full-screen app looked right; anything placed by its display frame did
+  not: the web content sat 48 pixels low, and after a join the status bar and toolbar, from the
+  snapshot, were drawn upside down at the bottom. A surface now has its own framebuffer and the
+  flush copies it over turned, as the host does; a post draws the screen turned over.
+- **Buffer types.** WebGL2 fixes a buffer's type (element array or other) at its first bind
+  and refuses the other kind after; GLES does not. Chromium's GPU process fills an index
+  buffer through `ARRAY_BUFFER` and draws with it as `ELEMENT_ARRAY_BUFFER`, and the join made
+  Skia's quad index buffer as a vertex buffer, so the bind failed and text drew with another
+  draw's indices (glyphs in pieces). A guest buffer now has a WebGL2 buffer of each type it is
+  bound as; writes the mirror holds the bytes of go to both, and the first bind of the second
+  type copies the bytes through `getBufferSubData`.
 
 ### Invariants (each becomes a test)
 

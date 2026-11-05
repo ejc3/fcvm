@@ -24,6 +24,31 @@ export function readStamp(px: Uint8ClampedArray | Uint8Array, w: number, h: numb
   return v === 0 || v === 0xffffffff ? null : v;
 }
 
+/**
+ * WebGL2's error flags, read after every record the mirror is fed: a call WebGL2 refused sets one
+ * and throws nothing, so the mirror's own `failed` count does not see it.
+ */
+export class GlErrors {
+  /** Errors by code (hex). */
+  readonly counts: Record<string, number> = {};
+  /** The first few records that left an error: their index in the stream, type and channel. */
+  readonly first: string[] = [];
+  private readonly gl: WebGL2RenderingContext;
+  private records = 0;
+  constructor(gl: WebGL2RenderingContext) {
+    this.gl = gl;
+  }
+  /** After record `r` was fed. */
+  check(r: { type: number; channel: number }): void {
+    const i = this.records++;
+    for (let e = this.gl.getError(), n = 0; e !== this.gl.NO_ERROR && n < 16; e = this.gl.getError(), n++) {
+      const code = `0x${e.toString(16)}`;
+      this.counts[code] = (this.counts[code] ?? 0) + 1;
+      if (this.first.length < 8) this.first.push(`record ${i} type ${r.type} channel ${r.channel}: ${code}`);
+    }
+  }
+}
+
 export interface Ref {
   k: number;
   w: number;
@@ -49,6 +74,8 @@ export interface ReplayResult {
   failed: Record<string, number>;
   unknownChannelPackets: number;
   flipped: boolean | null;
+  glErrors: Record<string, number>;
+  firstGlErrors: string[];
 }
 
 export function compare(a: Uint8Array, b: Uint8ClampedArray, w: number, h: number): Omit<Match, "k"> {
@@ -77,6 +104,7 @@ export function compare(a: Uint8Array, b: Uint8ClampedArray, w: number, h: numbe
 export function replay(canvas: HTMLCanvasElement, tap: Uint8Array, refs: Ref[]): ReplayResult {
   const gl = canvas.getContext("webgl2", { antialias: false, alpha: false, preserveDrawingBuffer: true })!;
   const m = new GlMirror(gl, () => 0);
+  const errors = new GlErrors(gl);
   const want = new Map(refs.map((r) => [r.k, r]));
   const stamped: number[] = [];
   const missed: number[] = [];
@@ -146,6 +174,7 @@ export function replay(canvas: HTMLCanvasElement, tap: Uint8Array, refs: Ref[]):
     if (next === undefined) break;
     if (m.skipDraws && anchor && dueUs(next) - rec.timeUs < 200_000) m.skipDraws = false;
     m.feed(rec);
+    errors.check(rec);
   }
   return {
     posts: m.stats.posts,
@@ -156,6 +185,8 @@ export function replay(canvas: HTMLCanvasElement, tap: Uint8Array, refs: Ref[]):
     failed: m.stats.failed,
     unknownChannelPackets: m.stats.unknownChannelPackets,
     flipped,
+    glErrors: errors.counts,
+    firstGlErrors: errors.first,
   };
 }
 
@@ -168,6 +199,8 @@ export interface JoinResult {
   w: number;
   h: number;
   failed: Record<string, number>;
+  glErrors: Record<string, number>;
+  firstGlErrors: string[];
 }
 
 /**
@@ -178,6 +211,7 @@ export interface JoinResult {
 export function replayJoin(canvas: HTMLCanvasElement, tap: Uint8Array, ref: Ref): JoinResult {
   const gl = canvas.getContext("webgl2", { antialias: false, alpha: false, preserveDrawingBuffer: true })!;
   const m = new GlMirror(gl, () => 0);
+  const errors = new GlErrors(gl);
   let first: Uint8Array | null = null;
   let live = false;
   let firstFromJoin = false;
@@ -195,6 +229,7 @@ export function replayJoin(canvas: HTMLCanvasElement, tap: Uint8Array, ref: Ref)
   for (const rec of new RecordReader().push(tap)) {
     if (rec.type !== RECORD.hello && rec.type !== RECORD.join) live = true;
     m.feed(rec);
+    errors.check(rec);
     if (first) break;
   }
   const w = gl.drawingBufferWidth;
@@ -206,12 +241,57 @@ export function replayJoin(canvas: HTMLCanvasElement, tap: Uint8Array, ref: Ref)
     w,
     h,
     failed: m.stats.failed,
+    glErrors: errors.counts,
+    firstGlErrors: errors.first,
   };
+}
+
+export interface LastResult {
+  join: JoinStats | null;
+  posts: number;
+  /** The last frame against the phone's screenshot, or null when the mirror drew none of its size. */
+  match: Omit<Match, "k"> | null;
+  /** Live calls the mirror skipped, by name. */
+  skipped: Record<string, number>;
+  failed: Record<string, number>;
+  glErrors: Record<string, number>;
+  firstGlErrors: string[];
+}
+
+/**
+ * A join stream with live records after it: the whole stream fed, and the last frame the mirror
+ * drew against the phone's screenshot of the screen it settled on.
+ */
+export function replayLast(canvas: HTMLCanvasElement, tap: Uint8Array, ref: Ref): LastResult {
+  const gl = canvas.getContext("webgl2", { antialias: false, alpha: false, preserveDrawingBuffer: true })!;
+  const m = new GlMirror(gl, () => 0);
+  const errors = new GlErrors(gl);
+  const rr = new RecordReader();
+  for (let at = 0; at < tap.length; at += 1 << 20)
+    for (const rec of rr.push(tap.subarray(at, Math.min(tap.length, at + (1 << 20))))) {
+      m.feed(rec);
+      errors.check(rec);
+    }
+  const w = gl.drawingBufferWidth;
+  const h = gl.drawingBufferHeight;
+  let match: Omit<Match, "k"> | null = null;
+  if (m.stats.posts > 0 && ref.w === w && ref.h === h) {
+    // the canvas, not what the guest's calls after the last post left bound
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    gl.pixelStorei(gl.PACK_ALIGNMENT, 4);
+    const raw = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, raw);
+    const top = new Uint8Array(w * h * 4);
+    for (let y = 0; y < h; y++) top.set(raw.subarray((h - 1 - y) * w * 4, (h - y) * w * 4), y * w * 4);
+    match = compare(top, ref.px, w, h);
+  }
+  return { join: m.stats.join, posts: m.stats.posts, match, skipped: m.stats.skipped, failed: m.stats.failed, glErrors: errors.counts, firstGlErrors: errors.first };
 }
 
 declare global {
   interface Window {
-    mirrorReplay: { replay: typeof replay; replayJoin: typeof replayJoin; readStamp: typeof readStamp };
+    mirrorReplay: { replay: typeof replay; replayJoin: typeof replayJoin; replayLast: typeof replayLast; readStamp: typeof readStamp };
   }
 }
-window.mirrorReplay = { replay, replayJoin, readStamp };
+window.mirrorReplay = { replay, replayJoin, replayLast, readStamp };
