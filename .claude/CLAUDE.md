@@ -166,6 +166,15 @@ egress opens; `the_egress_gate_rejects_ntp_and_no_other_udp` pins it. The reject
 so a source VM's chronyd logs at most one failed poll per snapshot, and both the source and a
 restored clone ask chronyd for a burst (`chrony_burst`) once egress is open again.
 
+The host's identity moves before egress opens too. A clone restored on another host would otherwise keep
+the preparing host's identity address on `lo` (and `eth0` outside routed mode) and its resolvers, so its
+first connections after egress opens would name the wrong host. The restore document carries the
+restoring host's identity address (`snapshot run --host-ipv6`, `FCVM_HOST_IPV6`; a podman cache hit
+forwards its own `--env HOST_IPV6`) and the resolvers a boot on that host would get; fc-agent adds the new
+address before deleting the old one and rewrites resolv.conf only when it differs, and a refused change
+fails the restore. `HOST_IPV6` is not in the snapshot key, so one snapshot serves every host.
+`the_host_identity_is_replaced_before_egress_opens_and_before_the_hook` pins the order.
+
 ### Opening the gate costs no grace period, and the barrier an expedited one
 
 Each half of the gate opens with one nf_tables commit covering both families,
