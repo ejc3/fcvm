@@ -289,7 +289,7 @@ printf '%s\n' '{"ok":true,"uptime_ms":60000,"scene_epoch_unix_ms":1761100000000}
   '{"ok":true,"uptime_ms":5,"scene_epoch_unix_ms":0}' '{"ok":true,"uptime_ms":9,"scene_epoch_unix_ms":0}' > "$dir/status-reply"
 act restart_app || bad "restart_app failed: $(cat "$dir/act.err")"
 want=$(printf '%s\n' status restart status status status place)
-got=$(sed -E 's/.*"type":"([a-z]+)".*"name":"([a-z]+)".*/\2/; s/.*"type":"([a-z]+)".*/\1/' "$dir/all.log")
+got=$(jq -r 'if .type == "action" then .name else .type end' "$dir/all.log")
 [ "$got" = "$want" ] && ok "restart_app waits for the restarted app's scene before telling it its place" \
   || bad "restart_app with the scene late sent: $(tr '\n' ' ' <<< "$got")"
 # The new process is known once its uptime goes back, even if its scene comes after its uptime
@@ -300,7 +300,7 @@ printf '%s\n' '{"ok":true,"uptime_ms":1000,"scene_epoch_unix_ms":1761100000000}'
   '{"ok":true,"uptime_ms":1300,"scene_epoch_unix_ms":1761100000000}' '{"ok":true,"uptime_ms":1500,"scene_epoch_unix_ms":1761100000000}' > "$dir/status-reply"
 act restart_app || bad "restart_app failed: $(cat "$dir/act.err")"
 want=$(printf '%s\n' status restart status status place)
-got=$(sed -E 's/.*"type":"([a-z]+)".*"name":"([a-z]+)".*/\2/; s/.*"type":"([a-z]+)".*/\1/' "$dir/all.log")
+got=$(jq -r 'if .type == "action" then .name else .type end' "$dir/all.log")
 rm -f "$dir/status-reply"
 [ "$got" = "$want" ] && ok "restart_app remembers the new process while it waits for the scene" \
   || bad "restart_app with the uptime past the old one's by the scene sent: $(tr '\n' ' ' <<< "$got")"
