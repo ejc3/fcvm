@@ -139,6 +139,19 @@ pub fn extents_up_to(file: &File, limit: u64) -> std::io::Result<u64> {
     Ok(extents)
 }
 
+/// How many extents the files at `paths` have together, counted only until they pass
+/// `limit`: the exact total when it is at most `limit`, otherwise `limit + 1`.
+pub fn extents_in_files_up_to(paths: &[std::path::PathBuf], limit: u64) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    for path in paths {
+        total += extents_up_to(&File::open(path)?, limit - total)?;
+        if total > limit {
+            return Ok(limit + 1);
+        }
+    }
+    Ok(total)
+}
+
 /// The ranges of `file` in extents no other file shares, with touching ranges joined.
 pub fn unshared_ranges(file: &File) -> std::io::Result<Vec<std::ops::Range<u64>>> {
     let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
@@ -177,22 +190,40 @@ mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
 
-    /// Three 4 KiB blocks with holes between them are three extents; the count stops one past
-    /// the limit. The file is made in the crate's directory, on the build's filesystem: tmpfs
-    /// does not answer FIEMAP.
-    #[test]
-    fn extents_are_counted_up_to_one_past_the_limit() {
-        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
-        let path = dir.path().join("three-extents");
+    /// A file of three 4 KiB blocks with holes between them: three extents.
+    fn three_extents(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
         let mut file = File::create(&path).unwrap();
         for block in 0..3u64 {
             file.seek(SeekFrom::Start(block * 64 * 1024)).unwrap();
             file.write_all(&[0xa5; 4096]).unwrap();
         }
         file.sync_all().unwrap();
-        let file = File::open(&path).unwrap();
+        path
+    }
+
+    /// The count stops one past the limit. The files are made in the crate's directory, on
+    /// the build's filesystem: tmpfs does not answer FIEMAP.
+    #[test]
+    fn extents_are_counted_up_to_one_past_the_limit() {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let file = File::open(three_extents(dir.path(), "a")).unwrap();
         assert_eq!(extents_up_to(&file, 10).unwrap(), 3);
         assert_eq!(extents_up_to(&file, 3).unwrap(), 3);
         assert_eq!(extents_up_to(&file, 1).unwrap(), 2);
+    }
+
+    /// Several files count together, up to one past the limit.
+    #[test]
+    fn extents_of_several_files_are_counted_together() {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let paths = [
+            three_extents(dir.path(), "a"),
+            three_extents(dir.path(), "b"),
+        ];
+        assert_eq!(extents_in_files_up_to(&paths, 10).unwrap(), 6);
+        assert_eq!(extents_in_files_up_to(&paths, 6).unwrap(), 6);
+        assert_eq!(extents_in_files_up_to(&paths, 4).unwrap(), 5);
+        assert_eq!(extents_in_files_up_to(&paths, 2).unwrap(), 3);
     }
 }

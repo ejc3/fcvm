@@ -63,11 +63,18 @@ fn reflink_is_cheaper(extents: Option<u64>) -> bool {
     matches!(extents, Some(n) if n <= REFLINK_MAX_EXTENTS)
 }
 
-/// The extents of the disk at `path`, counted up to one past [`REFLINK_MAX_EXTENTS`]; None
-/// when they cannot be counted.
-fn base_disk_extents(path: &Path) -> Option<u64> {
-    let file = std::fs::File::open(path).ok()?;
-    crate::storage::extents::extents_up_to(&file, REFLINK_MAX_EXTENTS).ok()
+/// The extents a clone of `base_dir`'s disks would reflink: every file in it, the root disk
+/// and the extra disks, which the reflink path copies one by one. Counted up to one past
+/// [`REFLINK_MAX_EXTENTS`]; None when they cannot be counted.
+fn snapshot_disks_extents(base_dir: &Path) -> Option<u64> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(base_dir).ok()? {
+        let entry = entry.ok()?;
+        if entry.file_type().ok()?.is_file() {
+            files.push(entry.path());
+        }
+    }
+    crate::storage::extents::extents_in_files_up_to(&files, REFLINK_MAX_EXTENTS).ok()
 }
 
 /// Create `path` as a btrfs subvolume, or as an ordinary directory where that
@@ -406,7 +413,11 @@ impl DiskManager {
         // REFLINK_MAX_EXTENTS extents is reflinked below instead. The snapshot
         // becomes this VM's disk directory, with the base disk renamed to the
         // rootfs name; the extra disks it carried are already in place.
-        let base_extents = base_disk_extents(&self.base_rootfs);
+        let base_extents = self
+            .base_rootfs
+            .parent()
+            .filter(|d| is_snapshot_disk_subvolume(d))
+            .and_then(snapshot_disks_extents);
         if let Some(base_dir) = self
             .base_rootfs
             .parent()
@@ -1132,12 +1143,15 @@ mod snapshot_dir_tests {
         assert!(!reflink_is_cheaper(None));
         let source = include_str!("disk.rs");
         let create = &source[source.find("pub async fn create_cow_disk").unwrap()..];
-        let subvolume = create
-            .find(".filter(|d| is_snapshot_disk_subvolume(d))")
-            .unwrap();
+        let subvolume = create.find("if let Some(base_dir) = self").unwrap();
         assert!(
-            create[subvolume..subvolume + 120].contains("!reflink_is_cheaper(base_extents)"),
-            "create_cow_disk takes the subvolume snapshot only for a disk not cheaper to reflink"
+            create[subvolume..subvolume + 260].contains("!reflink_is_cheaper(base_extents)"),
+            "create_cow_disk takes the subvolume snapshot only for disks not cheaper to reflink"
+        );
+        // the count covers every disk the reflink path would copy, the extra disks too
+        assert!(
+            create[..subvolume].contains(".and_then(snapshot_disks_extents)"),
+            "the reflink decision counts the snapshot's extra disks as well as its root disk"
         );
     }
 
