@@ -2575,7 +2575,10 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   extent (2.57 s for a 128 GiB memory image of 2,969,599 extents). Where the store cannot make a subvolume (not
   btrfs, or btrfs behind a FUSE map in a nested guest) `disk/` is an ordinary directory and the clone reflinks the
   disk as before, and so does an unprivileged clone of a snapshot another user made (a snapshot keeps every inode's
-  owner, so it would get a disk it cannot write or remove). `rm -rf` removes subvolumes, so teardown is unchanged, but
+  owner, so it would get a disk it cannot write or remove). A disk of at most 4096 extents (`REFLINK_MAX_EXTENTS`,
+  counted with FIEMAP) is reflinked as well: the subvolume snapshot's commit, and the parent directory lock it holds
+  through the commit, took 193 ms p50 and 1.8 s p99 with four restores and four snapshots at once on a fleet host,
+  against 17 ms and 192 ms for a reflink of a 684-extent disk. `rm -rf` removes subvolumes, so teardown is unchanged, but
   btrfs reclaims a removed subvolume's space on its cleaner thread after the rmdir returns, where an unlinked reflink
   freed its space at once; `df` right after many clone teardowns can read high for a while.
 - Each snapshot directory is a btrfs subvolume too, and a diff snapshot is staged as a subvolume snapshot of its
