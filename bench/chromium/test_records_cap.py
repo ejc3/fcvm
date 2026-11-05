@@ -95,6 +95,27 @@ class RecordsCap(unittest.TestCase):
                 with self.assertRaisesRegex(campaign_summary.RunError, "not the 2 bytes"):
                     campaign_summary.Sources(run).read_json(path)
 
+    def test_a_listed_record_that_is_a_symlink_is_held_to_the_manifest(self):
+        """RED BEFORE THE FIX (codex review of 90c0c93e..a21361f1): the key
+        resolved the file's own symlink, so a listed analysis.json linked to a
+        file elsewhere was looked up under the target's path, found unlisted,
+        and read unchecked."""
+        with tempfile.TemporaryDirectory() as run, tempfile.TemporaryDirectory() as elsewhere:
+            target = os.path.join(elsewhere, "analysis.json")
+            with open(target, "w") as handle:
+                handle.write('{"run_id": "edited"}')
+            path = os.path.join(run, "analysis.json")
+            os.symlink(target, path)
+            # The name the manifests use: the directory resolved, the file not.
+            key = os.path.relpath(os.path.join(os.path.realpath(run), "analysis.json"), records.REPO)
+            listed = {key: {
+                "path": key, "size": 2, "sha256": "0" * 64,
+                "manifest": "results/records-test.json", "fcvm_commit": None,
+                "repository": records.RECORDS_REPOSITORY, "records_commit": "f" * 40}}
+            with mock.patch.object(records, "_manifests", return_value=listed):
+                with self.assertRaisesRegex(records.MissingRecord, "not the 2 bytes"):
+                    records.read_bytes(path)
+
     def test_a_run_named_through_a_directory_alias_finds_its_moved_records(self):
         """RED BEFORE THE FIX (codex review of 7c62d332..90c0c93e): the manifest
         key kept the alias's own path, so a run directory named through a

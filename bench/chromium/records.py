@@ -82,9 +82,11 @@ class MissingRecord(FileNotFoundError):
 
 
 def repo_relative(path):
-    """path as the repository-relative name the manifests use. Symlinks are
-    resolved, so a run directory named through an alias finds its records."""
-    return os.path.relpath(os.path.realpath(os.fspath(path)), REPO).replace(os.sep, "/")
+    """path as the repository-relative name the manifests use. The directory's
+    symlinks are resolved, so a run named through an alias finds its records;
+    the file's own are not, so a listed name that is a link stays listed."""
+    head, leaf = os.path.split(os.path.abspath(os.fspath(path)))
+    return os.path.relpath(os.path.join(os.path.realpath(head), leaf), REPO).replace(os.sep, "/")
 
 
 def is_raw(relative_in_run):
