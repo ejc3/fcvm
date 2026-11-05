@@ -3,6 +3,7 @@
 // ladder, and the page on a phone and in light and dark.
 
 import { expect, test, type Page } from "@playwright/test";
+import { potatoColour } from "../core/potato.ts";
 import { admin, mockState } from "./helpers.ts";
 
 type MockRound = { id: number; size: number; started_at: number; hold_ms: number; pace_ms: number | null; holder: number | null };
@@ -82,7 +83,7 @@ test("draws the ring: one tile per player on a circle, each in its colour, and n
   const centres = await tiles(page).evaluateAll((els) =>
     els.map((e) => {
       const r = e.getBoundingClientRect();
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2, colour: getComputedStyle(e).backgroundColor };
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
     }),
   );
   const stage = (await page.getByTestId("potato-stage").boundingBox())!;
@@ -93,8 +94,25 @@ test("draws the ring: one tile per player on a circle, each in its colour, and n
   // player 0 at the top, the rest clockwise
   expect(centres[0]!.y).toBeLessThan(c.y);
   expect(centres[2]!.x).toBeGreaterThan(c.x);
-  for (const p of centres) expect(p.colour).toMatch(/^rgb/);
   expect(await page.getByText(/coordinator/i).count()).toBe(0);
+  // Each tile carries its own player's colour from the palette, dimmed tiles included. The
+  // computed fill is not compared: a dimmed tile's is a color-mix() (`color(srgb ...)`), and one
+  // changing phase is mid-transition (`oklab(...)`).
+  await expect(page.locator('[data-testid="potato-tile"][data-phase="asleep"]').first()).toBeAttached({ timeout: 10_000 });
+  const mismatches = async () => {
+    const seen = await page.evaluate(() => {
+      const p = window.__potato!.client.getState().accepted!.potato!;
+      return {
+        colours: p.colours,
+        players: p.players.map((x) => [x.player, x.colour] as const),
+        tiles: [...document.querySelectorAll<HTMLElement>('[data-testid="potato-tile"]')].map((e) => [Number(e.dataset["player"]), e.style.getPropertyValue("--c")] as const),
+      };
+    });
+    const index = new Map(seen.players);
+    return seen.tiles.filter(([n, c]) => !index.has(n) || c !== potatoColour(index.get(n)!, seen.colours)).map(([n, c]) => `player ${n}: ${c}`);
+  };
+  // The DOM follows the snapshot on the next frame, so a catch can land between the two reads.
+  await expect.poll(mismatches, { timeout: 5000 }).toEqual([]);
 });
 
 test("the ball moves from tile to tile, and players sleep and wake", async ({ page }) => {
