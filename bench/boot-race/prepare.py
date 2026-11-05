@@ -197,6 +197,7 @@ def cleanup(cfg, s):
     ids = [i["InstanceId"] for res in r["Reservations"] for i in res["Instances"]]
     if ids:
         ec2.terminate_instances(InstanceIds=ids)
+        ec2.get_waiter("instance_terminated").wait(InstanceIds=ids, WaiterConfig={"Delay": 10, "MaxAttempts": 90})
     race.log(f"terminated {len(ids)} instances")
     if cfg.get("ami"):
         snaps = [b["Ebs"]["SnapshotId"] for im in ec2.describe_images(ImageIds=[cfg["ami"]])["Images"]
@@ -205,6 +206,13 @@ def cleanup(cfg, s):
         for sid in snaps:
             ec2.delete_snapshot(SnapshotId=sid)
         race.log(f"deregistered the AMI and {len(snaps)} snapshots")
+    ecr = s.client("ecr")
+    imgs = [{"imageDigest": d["imageDigest"]} for d in ecr.describe_images(repositoryName="boot-race")["imageDetails"]]
+    if imgs:
+        r = ecr.batch_delete_image(repositoryName="boot-race", imageIds=imgs)
+        if r.get("failures"):
+            raise SystemExit(f"image delete failures: {r['failures']}")
+    race.log(f"deleted {len(imgs)} image references from the boot-race repository")
 
 
 def main():
