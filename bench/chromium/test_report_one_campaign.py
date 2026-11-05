@@ -180,6 +180,8 @@ class OneCampaign(unittest.TestCase):
             kind, identity = record_identity(name)
             self.assertIsNotNone(kind, f"{name}: no record names its commit and boot")
             rows = identity if kind == "extra" else [identity]
+            self.assertTrue([r for r in rows if not r.get("top")],
+                            f"{name}: no record of a phase on a host, only build provenance")
             for row in rows:
                 if row.get("top"):
                     extras.append((name, row))
@@ -309,6 +311,16 @@ class TheLintCatchesWhatItClaims(unittest.TestCase):
         def edit(name, kind, identity):
             if kind == "serial":
                 identity = dict(identity, browser_version=None)
+            return identity
+        with self._with_identity(edit), self.assertRaises(AssertionError):
+            self.lint().test_the_cited_records_share_one_commit_boot_and_build()
+
+    def test_a_memory_record_with_only_build_provenance_fails(self):
+        """RED BEFORE THE FIX: with the phase's run.json gone, the top-level
+        provenance alone (no commit, no boot) passed."""
+        def edit(name, kind, identity):
+            if kind == "extra" and name.endswith("-m4"):
+                identity = [row for row in identity if row.get("top")]
             return identity
         with self._with_identity(edit), self.assertRaises(AssertionError):
             self.lint().test_the_cited_records_share_one_commit_boot_and_build()
