@@ -55,7 +55,12 @@ fn spawn_host_server(host: std::net::IpAddr) -> Result<(u16, std::thread::JoinHa
 /// Run a VM with --forward-localhost that connects to localhost:port from the
 /// container, and assert the host server's greeting reaches the container.
 async fn run_forward_localhost_case(extra_args: &[&str], name_prefix: &str) -> Result<()> {
-    run_forward_localhost_case_to(std::net::Ipv4Addr::LOCALHOST.into(), extra_args, name_prefix).await
+    run_forward_localhost_case_to(
+        std::net::Ipv4Addr::LOCALHOST.into(),
+        extra_args,
+        name_prefix,
+    )
+    .await
 }
 
 async fn run_forward_localhost_case_to(
@@ -135,6 +140,14 @@ async fn test_forward_localhost() -> Result<()> {
 /// tries the second when the first refuses.
 #[tokio::test]
 async fn test_forward_localhost_reaches_a_host_service_on_ipv6_loopback_only() -> Result<()> {
+    // The guest reaches the host's ::1 only through pasta's IPv6 gateway, and pasta gives a
+    // guest IPv6 only when the host has a global IPv6 address. The CI container has none, so
+    // pasta runs --ipv4-only there and the guest has no route to ::1 to test; every host
+    // job runs this test.
+    if common::is_in_container() {
+        println!("SKIP: the container has no global IPv6, so pasta gives the guest none");
+        return Ok(());
+    }
     run_forward_localhost_case_to(
         std::net::Ipv6Addr::LOCALHOST.into(),
         &[],
