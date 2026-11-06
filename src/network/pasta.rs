@@ -1207,16 +1207,14 @@ impl PastaNetwork {
         None
     }
 
-    /// Detect HTTP proxy from host environment
+    /// Detect the host's proxy for one scheme: the first of `names` that is set.
     ///
     /// On IPv6-only hosts, traffic must go through a proxy.
     /// Returns the proxy URL with IPv6 address resolved from hostname.
-    fn detect_http_proxy() -> Option<String> {
-        let proxy_url = std::env::var("HTTP_PROXY")
-            .or_else(|_| std::env::var("http_proxy"))
-            .or_else(|_| std::env::var("HTTPS_PROXY"))
-            .or_else(|_| std::env::var("https_proxy"))
-            .ok()?;
+    fn detect_http_proxy(names: [&str; 4]) -> Option<String> {
+        let proxy_url = names
+            .into_iter()
+            .find_map(|name| std::env::var(name).ok())?;
 
         if let Some(rest) = proxy_url.strip_prefix("http://") {
             let host_port = rest.trim_end_matches('/');
@@ -2059,9 +2057,19 @@ impl NetworkManager for PastaNetwork {
             (None, None)
         };
 
-        let http_proxy = Self::detect_http_proxy();
+        // Each scheme gets its own proxy; one without a variable uses the other's, as
+        // the guest's single URL did before they could differ.
+        let http_proxy =
+            Self::detect_http_proxy(["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"]);
+        let https_proxy =
+            Self::detect_http_proxy(["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]);
         if let Some(ref proxy) = http_proxy {
             info!(proxy = %proxy, "detected HTTP proxy for IPv6-only network");
+        }
+        if https_proxy != http_proxy {
+            if let Some(ref proxy) = https_proxy {
+                info!(proxy = %proxy, "detected HTTPS proxy for IPv6-only network");
+            }
         }
 
         Ok(NetworkConfig {
@@ -2079,6 +2087,7 @@ impl NetworkManager for PastaNetwork {
             host_ipv6,
             dns_search: None,
             http_proxy,
+            https_proxy,
             namespace_name: None,
         })
     }
@@ -2353,6 +2362,34 @@ impl NetworkManager for PastaNetwork {
 
 #[cfg(test)]
 mod tests {
+    /// A rootless guest is given the host's HTTP and HTTPS proxies each for its own
+    /// scheme (#1464). nextest runs each test in its own process, so the environment
+    /// is this test's own.
+    #[test]
+    fn the_host_proxy_is_read_per_scheme() {
+        use super::PastaNetwork;
+        const HTTP: [&str; 4] = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"];
+        const HTTPS: [&str; 4] = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"];
+        for name in HTTP {
+            std::env::remove_var(name);
+        }
+        assert_eq!(PastaNetwork::detect_http_proxy(HTTP), None);
+        std::env::set_var("HTTPS_PROXY", "http://192.0.2.9:3129");
+        assert_eq!(
+            PastaNetwork::detect_http_proxy(HTTP).as_deref(),
+            Some("http://192.0.2.9:3129")
+        );
+        std::env::set_var("HTTP_PROXY", "http://192.0.2.8:3128");
+        assert_eq!(
+            PastaNetwork::detect_http_proxy(HTTP).as_deref(),
+            Some("http://192.0.2.8:3128")
+        );
+        assert_eq!(
+            PastaNetwork::detect_http_proxy(HTTPS).as_deref(),
+            Some("http://192.0.2.9:3129")
+        );
+    }
+
     use super::*;
 
     /// Render an argument vector as strings for assertions.

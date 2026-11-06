@@ -34,10 +34,15 @@ pub struct NetworkConfig {
     /// Named network namespace (for routed mode health checks via `ip netns exec`)
     #[serde(default)]
     pub namespace_name: Option<String>,
-    /// HTTP proxy URL for the guest to use
-    /// Passed to fc-agent via MMDS for container pulls and exec
+    /// The proxy URL the guest uses for plain HTTP, and for HTTPS too when
+    /// `https_proxy` is None. Passed to fc-agent via MMDS for container pulls and exec.
     #[serde(default)]
     pub http_proxy: Option<String>,
+    /// The proxy URL the guest uses for HTTPS, when it differs from `http_proxy`
+    /// (bridged networking relays the host's separate HTTP and HTTPS proxies on
+    /// separate ports). A state file from before this field loads as None.
+    #[serde(default)]
+    pub https_proxy: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

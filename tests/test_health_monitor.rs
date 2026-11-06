@@ -119,6 +119,7 @@ async fn test_health_monitor_behaviors() {
             host_ipv6: None,
             dns_search: None,
             http_proxy: None,
+            https_proxy: None,
             namespace_name: None,
         },
         "http://localhost/health",

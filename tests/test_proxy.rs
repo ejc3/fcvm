@@ -406,3 +406,105 @@ async fn test_no_proxy() -> Result<()> {
     println!("✅ NO_PROXY TEST PASSED!");
     Ok(())
 }
+
+/// A bridged guest reaches two different proxies on the host's loopback, each for its
+/// own scheme (#1464). The guest's `http_proxy` and `https_proxy` name relays on its
+/// gateway, on different ports; a request through each reaches its own proxy.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_bridged_separate_loopback_proxies() -> Result<()> {
+    let target = common::LocalTestServer::start_on_available_port("127.0.0.1")
+        .await
+        .context("start target server")?;
+    let http_proxy = common::LocalProxyServer::start_on_available_port("127.0.0.1")
+        .await
+        .context("start HTTP proxy")?;
+    let https_proxy = common::LocalProxyServer::start_on_available_port("127.0.0.1")
+        .await
+        .context("start HTTPS proxy")?;
+
+    let (vm_name, _, _, _) = common::unique_names("proxy-separate");
+    // The image pulls (the host's, and the guest's, which go through the guest's proxy
+    // variables) reach the registry directly: these proxies only stand in for the
+    // test's own plain HTTP requests.
+    let registry_hosts = "ecr-public.aws.com,.aws.com,.cloudfront.net,.amazonaws.com";
+    let (mut child, pid) = common::spawn_fcvm_with_env(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "bridged",
+            "--no-snapshot",
+            common::ALPINE_IMAGE,
+            "sleep",
+            "infinity",
+        ],
+        &[
+            ("http_proxy", http_proxy.url.as_str()),
+            ("HTTP_PROXY", http_proxy.url.as_str()),
+            ("https_proxy", https_proxy.url.as_str()),
+            ("HTTPS_PROXY", https_proxy.url.as_str()),
+            ("no_proxy", registry_hosts),
+            ("NO_PROXY", registry_hosts),
+        ],
+    )
+    .await
+    .context("spawn fcvm")?;
+
+    let outcome = async {
+        common::poll_health_by_pid(pid, 120)
+            .await
+            .context("VM never became healthy")?;
+        let env = common::exec_in_container(pid, &["env"]).await?;
+        let value = |name: &str| {
+            env.lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}=")))
+                .map(str::to_string)
+                .with_context(|| format!("{name} is not set in the guest:\n{env}"))
+        };
+        let (guest_http, guest_https) = (value("http_proxy")?, value("https_proxy")?);
+        println!("guest http_proxy={guest_http} https_proxy={guest_https}");
+        anyhow::ensure!(
+            !guest_http.contains("127.0.0.1") && !guest_https.contains("127.0.0.1"),
+            "a guest proxy URL names the guest's own loopback: {guest_http} {guest_https}"
+        );
+        anyhow::ensure!(
+            guest_http.contains(":41480") && guest_https.contains(":41481"),
+            "expected relays on ports 41480 and 41481: {guest_http} {guest_https}"
+        );
+
+        for (scheme, guest_url, server, other) in [
+            ("http", &guest_http, &http_proxy, &https_proxy),
+            ("https", &guest_https, &https_proxy, &http_proxy),
+        ] {
+            let before = (server.request_count(), other.request_count());
+            let assign = format!("http_proxy={guest_url}");
+            let output = common::exec_in_container(
+                pid,
+                &[&assign, "wget", "-q", "-O", "-", "-T", "10", &target.url],
+            )
+            .await
+            .with_context(|| format!("{scheme}: fetch through {guest_url}"))?;
+            anyhow::ensure!(output.contains("TEST_SUCCESS"), "{scheme}: got {output:?}");
+            anyhow::ensure!(
+                server.request_count() > before.0 && other.request_count() == before.1,
+                "{scheme}: the {scheme} proxy handled {} -> {} requests and the other {} -> {}",
+                before.0,
+                server.request_count(),
+                before.1,
+                other.request_count()
+            );
+        }
+        anyhow::Ok(())
+    }
+    .await;
+
+    target.stop().await;
+    http_proxy.stop().await;
+    https_proxy.stop().await;
+    common::kill_process(pid).await;
+    let _ = child.wait().await;
+    outcome
+}
