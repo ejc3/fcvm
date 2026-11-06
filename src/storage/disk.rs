@@ -650,9 +650,7 @@ async fn ensure_free_space_ext4(disk_path: &Path, min_free: u64) -> Result<()> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let block_size = parse_dumpe2fs_value(&stdout, "Block size")?;
-    let free_blocks = parse_dumpe2fs_value(&stdout, "Free blocks")?;
-    let free_bytes = free_blocks * block_size;
+    let free_bytes = ext4_free_bytes(&stdout)?;
     let before = ext4_geometry(&stdout);
 
     if free_bytes >= min_free {
@@ -1100,19 +1098,27 @@ fn parse_dump_super_value(output: &str, key: &str) -> Result<u64> {
     bail!("'{}' not found in btrfs dump-super output", key)
 }
 
-/// Parse a value from dumpe2fs -h output (e.g., "Block size:          4096")
-fn parse_dumpe2fs_value(output: &str, key: &str) -> Result<u64> {
-    for line in output.lines() {
-        if line.starts_with(key) {
-            if let Some(value) = line.split(':').nth(1) {
-                return value
-                    .trim()
-                    .parse::<u64>()
-                    .with_context(|| format!("parsing {} value", key));
-            }
-        }
+/// Free bytes from dumpe2fs -h output: "Free blocks" times "Block size", each read
+/// through `header_field`, so a key that is missing or appears twice (a header string
+/// such as the last mount point printed verbatim can carry a forged line) fails the
+/// resize instead of growing the disk by the wrong amount.
+fn ext4_free_bytes(header: &str) -> Result<u64> {
+    let number = |key: &str| -> Result<u64> {
+        let value = header_field(header, key).with_context(|| {
+            format!("'{key}' is missing from dumpe2fs output or appears more than once")
+        })?;
+        value
+            .parse::<u64>()
+            .with_context(|| format!("parsing dumpe2fs '{key}' value '{value}'"))
+    };
+    let block_size = number("Block size")?;
+    if !block_size.is_power_of_two() || !(1024..=65536).contains(&block_size) {
+        bail!("dumpe2fs 'Block size' {block_size} is not one ext4 can have");
     }
-    bail!("'{}' not found in dumpe2fs output", key)
+    let free_blocks = number("Free blocks")?;
+    free_blocks
+        .checked_mul(block_size)
+        .with_context(|| format!("free space overflows: {free_blocks} blocks of {block_size}"))
 }
 
 /// Parse size strings like "10G", "500M", "1024K", or plain bytes.
@@ -1516,6 +1522,33 @@ mod resize_inode_table_tests {
             "Block size:               0",
         );
         assert_eq!(ext4_geometry(&zero), None, "a block size ext4 cannot have");
+    }
+
+    /// The free-space reading that sizes the resize takes each field once: a forged
+    /// "Free blocks" or "Block size" line before the real one, from a header string
+    /// dumpe2fs prints verbatim, used to be the value read (#1546).
+    #[test]
+    fn free_space_refuses_a_header_field_that_appears_twice() {
+        let header = "Last mounted on:          /\n\
+                      Block count:              131072\n\
+                      Free blocks:              1000\n\
+                      Block size:               4096\n";
+        assert_eq!(ext4_free_bytes(header).unwrap(), 4096 * 1000);
+        for forged in ["Free blocks: 99999999\n", "Block size: 65536\n"] {
+            let injected = header.replacen("/\n", &format!("/x\n{forged}"), 1);
+            let error = ext4_free_bytes(&injected).expect_err(forged);
+            assert!(error.to_string().contains("more than once"), "{error}");
+        }
+        let missing = header.replace("Free blocks:              1000\n", "");
+        assert!(ext4_free_bytes(&missing).is_err());
+        let zero = header.replace(
+            "Block size:               4096",
+            "Block size:               0",
+        );
+        assert!(
+            ext4_free_bytes(&zero).is_err(),
+            "a block size ext4 cannot have"
+        );
     }
 
     /// e2fsprogs translates the group headings and the "Inode table at" label,
