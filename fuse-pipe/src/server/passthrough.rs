@@ -2320,6 +2320,51 @@ mod tests {
         );
     }
 
+    /// A copy within one open file through one handle for both ends returns, as the guest's
+    /// copy_file_range(fd, .., fd, ..) needs. fuse-backend-rs took that handle's lock twice, so
+    /// the request never returned and the guest process hung in D state.
+    #[test]
+    fn a_copy_within_one_handle_returns() {
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("one.txt"), "0123456789").unwrap();
+        let fs = std::sync::Arc::new(PassthroughFs::for_volume(dir.path(), false));
+        let ino = match fs.lookup(1, b"one.txt", uid, gid, 0) {
+            VolumeResponse::Entry { attr, .. } => attr.ino,
+            other => panic!("lookup: {other:?}"),
+        };
+        let fh = match fs.open(ino, libc::O_RDWR as u32, uid, gid, 0) {
+            VolumeResponse::Opened { fh, .. } => fh,
+            other => panic!("open: {other:?}"),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let copier = fs.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(copier.handle_request_with_groups(
+                &VolumeRequest::CopyFileRange {
+                    ino_in: ino,
+                    fh_in: fh,
+                    offset_in: 0,
+                    ino_out: ino,
+                    fh_out: fh,
+                    offset_out: 10,
+                    len: 4,
+                    flags: 0,
+                },
+                &[],
+            ));
+        });
+        let copied = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a copy within one handle did not return within 10 s");
+        assert!(copied.errno().is_none(), "copy: {copied:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("one.txt")).unwrap(),
+            "01234567890123"
+        );
+    }
+
     #[test]
     fn test_passthrough_open_read_write() {
         let dir = tempfile::tempdir().unwrap();
