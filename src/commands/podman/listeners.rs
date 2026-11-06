@@ -720,7 +720,9 @@ pub(crate) const CONTAINER_LOG_CAP: u64 = 64 << 20;
 
 /// The task keeping a prepare's container output and the token that tells it to stop.
 pub struct ContainerLogWriter {
-    pub(crate) handle: tokio::task::JoinHandle<()>,
+    /// The writer's result: how many lines it wrote, or the error that stopped it. `finish`
+    /// reports an error, so a log that is missing or cut short is a teardown failure.
+    pub(crate) handle: tokio::task::JoinHandle<std::io::Result<u64>>,
     pub(crate) stop: tokio_util::sync::CancellationToken,
     /// Teardown cancels this instead of aborting the output listener: the listener then stops
     /// accepting connections and reads the established one to its end, so the lines the guest
@@ -737,11 +739,7 @@ impl ContainerLogWriter {
         let stop = tokio_util::sync::CancellationToken::new();
         let path = dir.join(CONTAINER_LOG);
         let token = stop.clone();
-        let handle = tokio::spawn(async move {
-            if let Err(e) = write_container_log(rx, path.clone(), token, CONTAINER_LOG_CAP).await {
-                warn!(path = %path.display(), error = %e, "could not keep the container's output");
-            }
-        });
+        let handle = tokio::spawn(write_container_log(rx, path, token, CONTAINER_LOG_CAP));
         Self {
             handle,
             stop,
@@ -793,7 +791,10 @@ impl ContainerLogWriter {
         self.stop.cancel();
         let mut handle = self.handle;
         match tokio::time::timeout(bound, &mut handle).await {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(Ok(_lines))) => Ok(()),
+            Ok(Ok(Err(e))) => Err(format!(
+                "could not keep the container's output in {CONTAINER_LOG}: {e}"
+            )),
             Ok(Err(e)) => Err(format!("joining the container log writer: {e}")),
             Err(_) => {
                 handle.abort();
@@ -905,6 +906,40 @@ pub(crate) async fn write_container_log(
     }
 }
 
+/// The next connection on `listener`, or `None` when `drain` is cancelled with none queued. A
+/// connection the guest made before the drain request is returned and read, not dropped.
+///
+/// tokio's accept answers from the readiness its I/O driver last saw, which lags a connection
+/// made a moment before the drain request woke this task, so the queue is asked directly with a
+/// non-blocking `accept4(2)`.
+async fn accept_unless_drained(
+    listener: &tokio::net::UnixListener,
+    drain: &tokio_util::sync::CancellationToken,
+) -> Option<std::io::Result<tokio::net::UnixStream>> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    tokio::select! {
+        biased;
+        accepted = listener.accept() => Some(accepted.map(|(stream, _)| stream)),
+        () = drain.cancelled() => {
+            // SAFETY: accept4 on a listening socket this function borrows; a returned fd is new
+            // and owned by the UnixStream made from it.
+            let fd = unsafe {
+                libc::accept4(
+                    listener.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return None;
+            }
+            let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+            Some(tokio::net::UnixStream::from_std(stream))
+        }
+    }
+}
+
 /// Bidirectional I/O listener for container stdin/stdout/stderr.
 ///
 /// Listens on port 4997 for raw output from fc-agent.
@@ -963,11 +998,19 @@ pub(crate) async fn run_output_listener(
     let mut lines_forwarded: u64 = 0;
     let mut connection_count: u64 = 0;
     let mut lines_read = 0u64;
+    let drain = drain.unwrap_or_default();
 
-    // Accept the first connection (no timeout — image import can take 10+ min)
-    let (initial_stream, _) = match listener.accept().await {
-        Ok(conn) => conn,
-        Err(e) => {
+    // Accept the first connection (no timeout — image import can take 10+ min). A drain
+    // request before the guest connects (a setup that failed early) ends the listener at
+    // once: there is no connection to read.
+    let initial_stream = match accept_unless_drained(&listener, &drain).await {
+        None => {
+            info!(vm_id = %vm_id, "Asked to drain before the guest opened its output connection");
+            let _ = std::fs::remove_file(socket_path);
+            return Ok(());
+        }
+        Some(Ok(stream)) => stream,
+        Some(Err(e)) => {
             warn!(vm_id = %vm_id, error = %e, "Error accepting initial output connection");
             let _ = std::fs::remove_file(socket_path);
             return Ok(());
@@ -983,7 +1026,6 @@ pub(crate) async fn run_output_listener(
     // read_until keeps the bytes of a line it was interrupted in (a select! arm firing), where
     // read_line would lose them, so the buffer is cleared only after a whole line.
     let mut line_bytes: Vec<u8> = Vec::new();
-    let drain = drain.unwrap_or_default();
     let mut draining = false;
 
     // Read lines from the current connection.
@@ -1004,13 +1046,13 @@ pub(crate) async fn run_output_listener(
                     Ok(0) => {
                         // EOF — connection closed. Wait for next.
                         info!(vm_id = %vm_id, lines_read, "Output connection EOF");
-                        let accepted = tokio::select! {
-                            accepted = listener.accept() => accepted,
-                            // Asked to drain with no connection open: there is nothing left to read.
-                            () = drain.cancelled() => break,
+                        // Asked to drain with no connection open or queued: there is nothing
+                        // left to read.
+                        let Some(accepted) = accept_unless_drained(&listener, &drain).await else {
+                            break;
                         };
                         match accepted {
-                            Ok((s, _)) => {
+                            Ok(s) => {
                                 connection_count += 1;
                                 lines_read = 0;
                                 debug!(vm_id = %vm_id, connection_count, "Output connection established (after EOF)");
@@ -1095,12 +1137,11 @@ pub(crate) async fn run_output_listener(
             }
             _ = reconnect_notify.notified(), if !draining => {
                 info!(vm_id = %vm_id, lines_read, "Reconnect signal, waiting for new connection");
-                let accepted = tokio::select! {
-                    accepted = listener.accept() => accepted,
-                    () = drain.cancelled() => break,
+                let Some(accepted) = accept_unless_drained(&listener, &drain).await else {
+                    break;
                 };
                 match accepted {
-                    Ok((s, _)) => {
+                    Ok(s) => {
                         connection_count += 1;
                         lines_read = 0;
                         debug!(vm_id = %vm_id, connection_count, "Output connection established (after signal)");
@@ -1338,6 +1379,118 @@ mod container_log_tests {
             std::fs::read_to_string(dir.path().join(CONTAINER_LOG)).unwrap(),
             "stderr: exit 1: the reason\n"
         );
+    }
+
+    /// A setup that fails before the guest opens its output connection drains a listener still
+    /// in its first accept. That accept used to ignore the drain request, so every such failure
+    /// waited the whole drain bound before the listener was aborted (#1127). The clock is
+    /// paused, so the wait the old listener spent is read off tokio's clock, not a stopwatch.
+    #[tokio::test(start_paused = true)]
+    async fn a_listener_drained_before_the_guest_connects_ends_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("output-early.sock");
+        let socket_str = socket_path.to_string_lossy().to_string();
+        let (log_tx, log_rx) = tokio::sync::broadcast::channel::<LogLine>(16);
+        let writer = ContainerLogWriter::spawn(log_rx, dir.path());
+        let drain = writer.listener_drain.clone();
+        let listener = tokio::spawn(async move {
+            let _ = run_output_listener(
+                &socket_str,
+                "test-vm",
+                Some(log_tx),
+                std::sync::Arc::new(tokio::sync::Notify::new()),
+                false,
+                false,
+                None,
+                Some(drain),
+            )
+            .await;
+        });
+        while !socket_path.exists() {
+            tokio::task::yield_now().await;
+        }
+        let started = tokio::time::Instant::now();
+        writer
+            .finish_after_listener(Some(listener), OUTPUT_DRAIN_BOUND)
+            .await
+            .expect("the listener and the writer finish");
+        assert!(
+            started.elapsed() < OUTPUT_DRAIN_BOUND,
+            "draining a listener no guest connected to took {:?}, the whole drain bound",
+            started.elapsed()
+        );
+    }
+
+    /// A guest connection already queued when teardown asks the listener to drain is read to
+    /// its end, not dropped: the accept is tried before the drain request. Repeated, because an
+    /// unbiased select picks either ready arm at random.
+    #[tokio::test]
+    async fn a_connection_queued_before_the_drain_request_is_kept() {
+        for attempt in 0..32 {
+            let dir = tempfile::tempdir().unwrap();
+            let socket_path = dir.path().join("output-queued.sock");
+            let socket_str = socket_path.to_string_lossy().to_string();
+            let (log_tx, log_rx) = tokio::sync::broadcast::channel::<LogLine>(16);
+            let writer = ContainerLogWriter::spawn(log_rx, dir.path());
+            let drain = writer.listener_drain.clone();
+            let listener = tokio::spawn(async move {
+                let _ = run_output_listener(
+                    &socket_str,
+                    "test-vm",
+                    Some(log_tx),
+                    std::sync::Arc::new(tokio::sync::Notify::new()),
+                    false,
+                    false,
+                    None,
+                    Some(drain),
+                )
+                .await;
+            });
+            while !socket_path.exists() {
+                tokio::task::yield_now().await;
+            }
+            // The test's runtime is single-threaded: the listener cannot run between the
+            // connection and the drain request, so both arms are ready when it next does.
+            let mut guest = std::os::unix::net::UnixStream::connect(&socket_path).unwrap();
+            std::io::Write::write_all(&mut guest, b"stderr:queued before teardown\n").unwrap();
+            drop(guest);
+            writer
+                .finish_after_listener(Some(listener), OUTPUT_DRAIN_BOUND)
+                .await
+                .expect("the listener and the writer finish");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(CONTAINER_LOG)).unwrap(),
+                "stderr: queued before teardown\n",
+                "attempt {attempt}"
+            );
+        }
+    }
+
+    /// A writer that cannot keep the container's output (here: its directory is gone, as on a
+    /// full or read-only data filesystem the open or a write fails) must say so to teardown,
+    /// which records it as a cleanup failure. It used to log a warning and report success,
+    /// so a prepare published a missing or cut-short log with no failure recorded (#1126).
+    #[tokio::test]
+    async fn a_writer_that_could_not_keep_the_output_fails_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("removed");
+        let (tx, rx) = tokio::sync::broadcast::channel(4);
+        let writer = ContainerLogWriter::spawn(rx, &gone);
+        tx.send(line(0)).unwrap();
+        let error = writer
+            .finish(std::time::Duration::from_secs(5))
+            .await
+            .expect_err("a log the writer could not open is a failed finish");
+        assert!(error.contains(CONTAINER_LOG), "{error}");
+
+        // The same through the path both teardowns take.
+        let (_tx, rx) = tokio::sync::broadcast::channel(4);
+        let writer = ContainerLogWriter::spawn(rx, &gone);
+        let error = writer
+            .finish_after_listener(None, std::time::Duration::from_secs(5))
+            .await
+            .expect_err("finish_after_listener reports the writer's failure");
+        assert!(error.contains(CONTAINER_LOG), "{error}");
     }
 
     #[tokio::test]
