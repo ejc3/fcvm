@@ -195,6 +195,72 @@ class RunScripts(unittest.TestCase):
             self.assertIn("if ! wait_listening 127.0.0.1 20000 120 $CP; then", lines, name)
 
 
+FAKE_AWS = r"""#!/bin/bash
+# A stand-in for the AWS CLI: answers what `gpubox.sh up` asks, from FAKE_* variables, and
+# logs every call to $FAKE_LOG.
+echo "$*" >> "$FAKE_LOG"
+args=" $* "
+case "$args" in
+  *" sts get-caller-identity "*) echo 123456789012 ;;
+  *" ec2 describe-images "*) echo ami-fake ;;
+  *" ec2 describe-security-groups "*) echo sg-fake ;;
+  *" ec2 describe-subnets "*) echo subnet-fake ;;
+  *" service-quotas get-service-quota "*L-3819A6DF*) echo "$FAKE_SPOT_QUOTA" ;;
+  *" service-quotas get-service-quota "*L-DB2E81BA*) echo "$FAKE_OD_QUOTA" ;;
+  *" ec2 describe-instances "*"InstanceLifecycle==\`spot\`"*) printf '%s' "$FAKE_SPOT_IN_USE" ;;
+  *" ec2 describe-instances "*) printf '%s' "$FAKE_OD_IN_USE" ;;
+  *" ec2 run-instances "*) echo i-fakebox ;;
+  *) echo "fake aws: unexpected $*" >&2; exit 1 ;;
+esac
+"""
+
+
+class GpuboxWallReserve(unittest.TestCase):
+    """`gpubox.sh up` leaves the wall's GPU host room in the account's G quotas (#1257)."""
+
+    def up(self, spot_quota, spot_in_use, od_quota, od_in_use):
+        import tempfile
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "aws"), "w") as f:
+            f.write(FAKE_AWS)
+        os.chmod(os.path.join(d, "aws"), 0o755)
+        log = os.path.join(d, "calls")
+        env = dict(os.environ, PATH=f"{d}:{os.environ['PATH']}", FAKE_LOG=log, GPUBOX_USE_ENV="1",
+                   GPUBOX_AZS="a", FAKE_SPOT_QUOTA=str(spot_quota), FAKE_OD_QUOTA=str(od_quota),
+                   # describe-instances --output text: one "cores threads" line per instance.
+                   FAKE_SPOT_IN_USE="".join("48\t2\n" for _ in range(spot_in_use)),
+                   FAKE_OD_IN_USE="".join("48\t2\n" for _ in range(od_in_use)))
+        r = subprocess.run(["bash", os.path.join(HERE, "gpubox.sh"), "up", "--no-wait"],
+                           env=env, capture_output=True, text=True, timeout=60)
+        with open(log) as f:
+            calls = f.read().splitlines()
+        return r, [c for c in calls if " run-instances " in f" {c} "]
+
+    def test_a_full_quota_launches_nothing(self):
+        # 2026-11-05: three gpuboxes held the 384 on-demand vCPUs, the spot quota had no room
+        # for a box and the wall's host: the wall's host waited 13 minutes.
+        r, launches = self.up(spot_quota=192, spot_in_use=1, od_quota=384, od_in_use=3)
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(launches, [], r.stderr)
+        self.assertIn("wall", r.stderr)
+
+    def test_spot_goes_first_when_it_leaves_the_wall_room(self):
+        r, launches = self.up(spot_quota=192, spot_in_use=0, od_quota=384, od_in_use=3)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(launches), 1, launches)
+        self.assertIn("MarketType=spot", launches[0])
+
+    def test_on_demand_only_with_room_for_the_wall_host_and_its_tiles(self):
+        # 96 for the box, 96 for the wall's host and 32 for its on-demand tiles.
+        r, launches = self.up(spot_quota=192, spot_in_use=1, od_quota=384, od_in_use=1)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(launches), 1, launches)
+        self.assertNotIn("MarketType=spot", launches[0])
+        r, launches = self.up(spot_quota=192, spot_in_use=1, od_quota=384, od_in_use=2)
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(launches, [])
+
+
 if __name__ == "__main__":
     unittest.main()
 

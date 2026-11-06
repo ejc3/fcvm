@@ -27,7 +27,8 @@
 # Credentials: assumes fcvm-fleet-terraform (named in SSM /infra/fcvm-fleet, us-west-1) unless
 # the environment already holds that role's credentials (or GPUBOX_USE_ENV=1 says to use them).
 # Quota (us-east-1, 2026-10-23): G spot 192 vCPU, two g4dn.metal at once, shared with the
-# fleet's own spot host; G on demand 384 vCPU, four.
+# fleet's own spot host; G on demand 384 vCPU, four, shared with the wall's host, its
+# on-demand tiles and the AMI builders. `up` leaves room for the wall (room_for).
 set -euo pipefail
 REGION=us-east-1
 S3REGION=us-east-2
@@ -135,6 +136,33 @@ systemctl enable --now gpubox-lease.timer
 EOF
 }
 
+# The wall's GPU host shares this account's G quotas in this region: a gpubox may take a
+# market only if it leaves room there for one wall host (96 vCPU), and on demand also for the
+# wall's eight on-demand EC2 tiles (4 each). On 2026-11-05 the wall's host was refused with VcpuLimitExceeded for
+# 13 minutes on two wakes while gpuboxes and an AMI builder held the on-demand quota
+# (ejc3/fcvm#1257).
+WALL_RESERVE_spot=96
+WALL_RESERVE_ondemand=128
+QUOTA_CODE_spot=L-3819A6DF
+QUOTA_CODE_ondemand=L-DB2E81BA
+g_vcpus_in_use() { # market (spot|on-demand): vCPUs of G instances that count against its quota
+  local lc
+  if [ "$1" = spot ]; then lc='InstanceLifecycle==`spot`'; else lc='InstanceLifecycle!=`spot`'; fi
+  A ec2 describe-instances --filters Name=instance-state-name,Values=pending,running,stopping,shutting-down \
+    --query "Reservations[].Instances[?starts_with(InstanceType, \`g\`) && $lc].[CpuOptions.CoreCount, CpuOptions.ThreadsPerCore]" \
+    --output text | awk '{n += $1 * $2} END {print n + 0}'
+}
+room_for() { # market, vCPUs wanted: 0 when that many fit and still leave the wall's reserve
+  local code quota used reserve
+  if [ "$1" = spot ]; then code=$QUOTA_CODE_spot reserve=$WALL_RESERVE_spot; else code=$QUOTA_CODE_ondemand reserve=$WALL_RESERVE_ondemand; fi
+  quota=$(A service-quotas get-service-quota --service-code ec2 --quota-code "$code" --query 'Quota.Value' --output text)
+  used=$(g_vcpus_in_use "$1")
+  quota=${quota%.*}
+  if [ $((used + $2 + reserve)) -le "$quota" ]; then return 0; fi
+  say "no $1 $TYPE: $used of $quota G vCPUs in use, and $2 more would leave the wall's host less than its $reserve"
+  return 1
+}
+
 case "${1:-}" in
 up)
   shift; hours=4; owner=${GPUBOX_OWNER:-${USER:-agent}}; wait=1
@@ -153,6 +181,7 @@ up)
   ud=$(lease_userdata "$lease")
   t0=$(now); id=""
   for market in spot on-demand; do
+    room_for "$market" 96 || continue
     for az in $AZS; do
       subnet=$(A ec2 describe-subnets --filters Name=tag:Name,Values="fcvm-fleet-${REGION}${az}" --query 'Subnets[0].SubnetId' --output text)
       mo=(); [ "$market" = spot ] && mo=(--instance-market-options 'MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}')
@@ -173,7 +202,7 @@ up)
     done
   done
   rm -f /tmp/gpubox.err.$$
-  [ -n "$id" ] || die "no $TYPE capacity or quota in $REGION, spot or on demand"
+  [ -n "$id" ] || die "no $TYPE capacity or quota in $REGION, spot or on demand, that leaves the wall's host its room"
   say "launched $id ($market, ${REGION}${az}, $ami), lease until $lease UTC"
   [ "$wait" = 0 ] || wait_ready "$t0" "$id"
   echo "$id $REGION"
