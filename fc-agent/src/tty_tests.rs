@@ -537,6 +537,40 @@ async fn a_detached_tty_leader_is_reaped_while_a_descendant_holds_the_terminal()
     kill_group(pid).await;
 }
 
+/// The descendant here ignores SIGHUP, so it always outlives the leader with the
+/// terminal open (measured with a PTY outside fc-agent: the terminal hung up when
+/// the sleep exited, 3.0 s of 3 s, in 3 of 3 runs). `setsid sleep 30 &` above does the same only when it wins a race:
+/// the leader's exit sends SIGHUP to its own process group, and a background job
+/// that has not called setsid() by then dies with it and closes the terminal. Under
+/// load it called setsid() first, and the exited leader stayed a zombie until the
+/// descendant closed the terminal (#999).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_detached_tty_leader_is_reaped_while_a_hangup_proof_descendant_holds_the_terminal() {
+    // SIG_IGN is inherited across fork and exec, so the sleep ignores SIGHUP
+    // from its first instruction: there is no window for the hangup to win.
+    let mut session = sh("trap '' HUP; sleep 30 & exit 0", true, false);
+    session.detach = true;
+    let outcome = run(session, vec![]).await;
+    assert_eq!(outcome.exit, Some(0));
+    let pid: i32 = String::from_utf8_lossy(&outcome.stdout)
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("expected a pid line, got {:?}", outcome.stdout));
+
+    let stat = format!("/proc/{pid}/stat");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let left_behind = loop {
+        match std::fs::read_to_string(&stat) {
+            Err(_) => break None, // reaped
+            Ok(text) if Instant::now() > deadline => break Some(text),
+            Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    };
+    // The descendant is in the leader's process group: kill it either way.
+    unsafe { libc::kill(-pid, libc::SIGKILL) };
+    assert_eq!(left_behind, None, "the exited leader was never reaped");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_detached_tty_command_has_a_terminal_and_outlives_the_session() {
     // What `podman exec -d -t` gives a command: a terminal on its stdio, no

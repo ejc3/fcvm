@@ -500,21 +500,34 @@ fn resolve_identity(spec: &str) -> std::io::Result<Identity> {
 /// command is reaped at once; it does not wait as a zombie for a descendant.
 fn hold_detached_terminal(master: OwnedFd, mut child: tokio::process::Child) {
     tokio::spawn(async move {
-        match AsyncFdStream::new(master) {
-            Ok(mut master) => {
-                let mut buf = vec![0u8; 4096];
-                loop {
-                    match tokio::io::AsyncReadExt::read(&mut master, &mut buf).await {
-                        Ok(n) if n > 0 => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                        // Hung up: the command has exited.
-                        _ => break,
-                    }
-                }
+        let mut master = match AsyncFdStream::new(master) {
+            Ok(master) => Some(master),
+            Err(e) => {
+                eprintln!("[fc-agent] exec: cannot hold a detached terminal: {e}");
+                None
             }
-            Err(e) => eprintln!("[fc-agent] exec: cannot hold a detached terminal: {e}"),
+        };
+        let mut reaped = false;
+        let mut buf = vec![0u8; 4096];
+        // The terminal hangs up when the last process holding its slave side
+        // closes it, which a descendant that left the session leader's process
+        // group (setsid, or one that ignores SIGHUP) can put off for as long as
+        // it runs. The leader is reaped when it exits, not then (#999), and the
+        // terminal is drained until it hangs up so such a descendant never blocks
+        // writing to it.
+        while !reaped || master.is_some() {
+            tokio::select! {
+                _ = child.wait(), if !reaped => reaped = true,
+                read = async {
+                    tokio::io::AsyncReadExt::read(master.as_mut().unwrap(), &mut buf).await
+                }, if master.is_some() => match read {
+                    Ok(n) if n > 0 => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    // Hung up: nothing holds the terminal any more.
+                    _ => master = None,
+                },
+            }
         }
-        let _ = child.wait().await;
     });
 }
 
