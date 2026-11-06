@@ -460,8 +460,11 @@ boot)
   # tries: uwb_off stops it.
   tls=$(nvidia_tls)
   [ -n "$tls" ] || { echo "no libnvidia-tls among the GPU driver's libraries"; exit 1; }
+  # -qmp: QEMU's monitor on the container's loopback, for run.sh's check that a GPU release
+  # refuses while a guest memory dump runs (serve's phones have none). It must come last.
   LD_PRELOAD=$tls setsid "$EMU" -avd phone -no-window -no-audio -no-boot-anim -gpu host -accel on \
-    -no-snapshot-load -feature -Uwb -verbose > "$RUN/emulator.log" 2>&1 < /dev/null &
+    -no-snapshot-load -feature -Uwb -verbose -qemu -qmp "tcp:127.0.0.1:${PHONE_QMP_PORT:-4444},server=on,wait=off" \
+    > "$RUN/emulator.log" 2>&1 < /dev/null &
   echo $! > "$RUN/emulator.pid"
   timeout "${BOOT_TIMEOUT:-300}" "$ADB" wait-for-device
   until [ "$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; do

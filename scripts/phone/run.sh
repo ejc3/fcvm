@@ -17,7 +17,9 @@
 #      emulator's console): the emulator then holds no /dev/nvidia* descriptor or mapping;
 #      and takes it up again (`gpu retake`): the app draws 30 frames a second again. A retake
 #      that cannot create a Vulkan instance (the ICD manifest moved away) fails and leaves the
-#      phone running released, and the next retake takes the GPU up;
+#      phone running released, and the next retake takes the GPU up; a release while a guest
+#      memory dump runs (which paused the guest itself) is refused, the dump completes, and
+#      the phone keeps its GPU;
 #   6. a warm snapshot of the running phone (`fcvm snapshot create --gpu-warm`, whose park
 #      runs the hook) is taken and the source phone keeps drawing; a clone restored from it
 #      with the second GPU (`fcvm snapshot run --gpu`) runs the same phone on that GPU:
@@ -27,7 +29,7 @@
 #   7. the web browser (scripts/phone/browser.sh) runs through all of it: it opens
 #      www.nvidia.com through the phone web proxy before the release checks, which a guest
 #      Vulkan instance would refuse; the proxy refuses a name off its list; and on the clone,
-#      `phone.sh action open_browser` brings the page to the front and draws it.
+#      `phone.sh action open_browser` brings the page to the front within 1 s and draws it.
 #   8. Robot Park (fleet/phone-app), last, on the source phone: seams, surface loss and
 #      actions (scripts/phone/scene-test.sh); and the phone took no bug report during
 #      the whole run (phone.sh turns UWB off, whose service otherwise asks for one a minute
@@ -162,10 +164,78 @@ retake_without_vulkan() {
   check_draws "$pid" "after a retake without Vulkan and one with it"
 }
 
+# QMP command $1 (JSON without an id) on the phone's emulator (phone.sh boot serves QEMU's
+# monitor on the container's 127.0.0.1:4444); prints the reply to it, the line whose id is the
+# one sent, so events QEMU sends between (DUMP_COMPLETED among them) are never taken for it.
+qmp() {
+  X bash -c 'exec 3<> /dev/tcp/127.0.0.1/4444 || exit 1
+    IFS= read -r -t 5 l <&3
+    printf "%s\n" "{\"execute\":\"qmp_capabilities\",\"id\":\"cap\"}" "$(jq -c ". + {id: \"cmd\"}" <<< "$1")" >&3
+    while IFS= read -r -t 30 l <&3; do
+      [ "$(jq -r ".id // empty" <<< "$l" 2> /dev/null)" = cmd ] && { echo "$l"; exit 0; }
+    done
+    exit 1' _ "$1" 2>&1 | tr -d '\r'
+}
+dump_status() { qmp '{"execute":"query-dump"}' | jq -r '.return.status // empty' 2> /dev/null || true; }
+
+# A GPU release while a detached guest memory dump runs is refused: the dump stopped the
+# guest itself and starts it again when it ends, so a release that believed it had paused
+# the guest would leave it running without its GPU. The dump writes into a FIFO whose reader
+# reads nothing until /tmp/dump.go exists, so it is still running for both refusals, and once
+# let go it must complete: the emulator's dump failed on every phone, into a FIFO or a file,
+# until it left out the address space device's user-backed area ("failed to save memory: Bad
+# address"). Then the phone still holds its GPU and the app draws. A dump that never ends
+# leaves the guest paused, so the run ends there.
+release_during_dump() {
+  local r out st i rc
+  X sh -c 'rm -f /tmp/dump.fifo /tmp/dump.go && mkfifo /tmp/dump.fifo && { setsid sh -c "exec 3< /tmp/dump.fifo; i=0; while [ ! -e /tmp/dump.go ] && [ \$i -lt 1800 ]; do sleep 0.1; i=\$((i + 1)); done; cat <&3 > /dev/null" > /dev/null 2>&1 < /dev/null & }' \
+    || { bad "could not make the dump's FIFO"; return; }
+  r=$(qmp '{"execute":"dump-guest-memory","arguments":{"paging":false,"protocol":"file:/tmp/dump.fifo","detach":true}}' || true)
+  if [ "$(jq -c '.return // empty' <<< "$r" 2> /dev/null)" != "{}" ]; then
+    bad "a detached guest memory dump did not start: '$r'"
+    X touch /tmp/dump.go || true
+    return
+  fi
+  st=$(dump_status)
+  [ "$st" = active ] || bad "the dump is not running when the release asks: '$st'"
+  # the console's own pause refuses too, and answers (a refusal with no answer left the
+  # client waiting)
+  rc=0; r=$(X sh -c 'timeout 10 /android/platform-tools/adb emu avd pause' 2>&1 | tr -d '\r') || rc=$?
+  [ "$rc" = 0 ] && [[ "$r" == *"KO: could not pause the guest"* ]] && ok "'avd pause' during a guest memory dump answers KO" \
+    || bad "'avd pause' during a guest memory dump: exit $rc, '$r'"
+  if out=$(X /usr/local/bin/gpu-hook release 2>&1); then
+    bad "a GPU release during a guest memory dump succeeded: $(grep -o 'released_ms=[0-9]*' <<< "$out" || true)"
+  else
+    [[ "$out" == *"could not pause the guest"* ]] && ok "a GPU release during a guest memory dump is refused: $(grep -m1 KO <<< "$out" | tr -d '\r' || true)" \
+      || bad "a GPU release during a guest memory dump failed for another reason: $out"
+  fi
+  st=$(dump_status)
+  [ "$st" = active ] || bad "the dump ended before its reader was let go: '$st'"
+  X touch /tmp/dump.go || true
+  for i in $(seq 1 120); do
+    st=$(dump_status)
+    [ "$st" = active ] || break
+    sleep 1
+  done
+  if [ "$st" = active ]; then
+    bad "the dump still runs 120 s after its reader was let go, and the guest stays paused: ending the run"
+    exit 1
+  fi
+  [ "$st" = completed ] && ok "the dump completed" || bad "the dump did not complete: '$st'"
+  st=$(X sh -c '/android/platform-tools/adb emu gpu status | head -1' 2>&1 | tr -d '\r' || true)
+  if [ "$st" = held ]; then
+    ok "after the dump the phone holds its GPU"
+  else
+    bad "after the dump the phone's GPU is '$st'"
+    X /usr/local/bin/gpu-hook retake > /dev/null 2>&1 || true
+  fi
+  check_draws "$pid" "after a release refused during a guest memory dump"
+}
+
 # VM $1's phone shows the browser in front on the NVIDIA page, after `phone.sh action
 # open_browser`; $2 says where. Prints how long the browser took to come to the front.
 browser_in_front() {
-  local out top title green
+  local out top title green shown
   if ! out=$("$F" exec --pid "$1" -- /usr/local/bin/phone.sh action open_browser 2>&1); then
     bad "open_browser failed $2: $out"
     return
@@ -173,6 +243,12 @@ browser_in_front() {
   top=$("$F" exec --pid "$1" -- sh -c '/android/platform-tools/adb shell dumpsys activity activities | grep -m1 topResumedActivity' 2>&1 || true)
   [[ "$top" == *org.cromite.cromite/* ]] && ok "the browser is in front $2 ($(grep -o 'shown_ms=[0-9]*' <<< "$out"))" \
     || bad "the browser is not in front $2: $top"
+  # Its share groups were restored before it was asked for (gfxstream restores a retake's
+  # share groups once the first frame is posted): its first show after a restore took 2.7
+  # to 3.5 s while its first frame waited for them, and takes 0.07 to 0.6 s otherwise.
+  shown=$(grep -o 'shown_ms=[0-9]*' <<< "$out" | cut -d= -f2 || true)
+  [ -n "$shown" ] && [ "$shown" -lt 1000 ] && ok "the browser came to the front $2 in ${shown} ms, under 1 s" \
+    || bad "the browser took ${shown:-?} ms to come to the front $2 (1 s at most)"
   title=$("$F" exec --pid "$1" -- /usr/local/bin/phone.sh page 20 2>&1) && ok "the browser shows '$title' $2" \
     || bad "the browser shows no NVIDIA page $2: $title"
   # NVIDIA's green (#76b900) is on screen within 10 s: the page is drawn, not only loaded (the
@@ -277,6 +353,7 @@ if boot=$(timeout 400 "$F" exec --pid "$pid" -- /usr/local/bin/phone.sh boot 2>&
   check_draws "$pid" "with the browser behind it"
   in_place_release_and_retake
   retake_without_vulkan
+  release_during_dump
   warm_snapshot_onto_the_second_gpu
   "$(dirname "$0")/scene-test.sh" "$F" "$pid" "/work/$(basename "$APP")" "$LOGS/out" "$gpu_name" || { fail=1; keep_phone_logs "$pid" scene-test; }
   # The UWB service asked for its bug report a minute or two after boot, after the check
