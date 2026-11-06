@@ -143,52 +143,24 @@ fn env_proxy(lower: &str, upper: &str) -> Option<String> {
         .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
 }
 
-/// Where a bridged VM's relay for the host's proxy listens, and what it relays.
-#[derive(Debug, PartialEq)]
-struct BridgedProxyRelay {
-    bind_ip: String,
-    plan: super::tcp_proxy::ProxyRelayPlan,
-}
-
-/// The relay a bridged VM needs for the host's proxy (`http`, `https`: the host's
-/// variables), or None when the guest reaches the proxy as it is.
+/// The relays a bridged VM needs for the host's proxies (`http`, `https`: the host's
+/// variables), and the proxy URL the guest gets for each scheme. Only a proxy on the
+/// host's loopback is relayed; the guest reaches any other through the NAT as it is.
 ///
 /// The guest reaches the host side of its veth (`host_ip`) at its gateway: a fresh
 /// boot's gateway is that address, and a clone's namespace DNATs every guest-to-gateway
-/// connection to it (`setup_in_namespace_nat`, step 9). So the relay listens on
-/// `host_ip`, outside the namespace, and the guest's URL names `guest_gateway`.
-///
-/// The network's proxy URL is given to the guest for both schemes, so a relay is set up
-/// only when both schemes use the one proxy. Separate HTTP and HTTPS proxies keep their
-/// own selections, and a loopback one among them stays unreachable, with a warning.
-fn bridged_proxy_relay(
+/// connection to it (`setup_in_namespace_nat`, step 9). So each relay listens on
+/// `host_ip`, outside the namespace, and the guest's URL names `guest_gateway`. The
+/// HTTP and HTTPS proxies each get a relay on its own port, or share one when they are
+/// the same proxy (`tcp_proxy::plan_scheme_proxies`).
+fn bridged_proxy_relays(
     http: Option<&str>,
     https: Option<&str>,
-    host_ip: &str,
     guest_gateway: &str,
-) -> Option<BridgedProxyRelay> {
-    let proxy = https.or(http)?;
-    if http.or(https) != Some(proxy) {
-        warn!(
-            "the host has separate HTTP and HTTPS proxies; a bridged guest gets them as they \
-             are, and one on loopback is unreachable from it"
-        );
-        return None;
-    }
-    let plan = match super::tcp_proxy::plan_proxy_relay(proxy, guest_gateway) {
-        Ok(plan) => plan,
-        Err(e) => {
-            warn!(error = %format!("{e:#}"), "cannot relay the host's proxy");
-            return None;
-        }
-    };
-    plan.upstream
-        .iter()
-        .all(|address| address.ip().is_loopback())
-        .then(|| BridgedProxyRelay {
-            bind_ip: host_ip.to_string(),
-            plan,
-        })
+) -> super::tcp_proxy::SchemeProxies {
+    super::tcp_proxy::plan_scheme_proxies(http, https, guest_gateway, |upstream| {
+        upstream.iter().all(|address| address.ip().is_loopback())
+    })
 }
 
 /// Bridged networking using network namespace isolation with veth pairs
@@ -233,8 +205,8 @@ pub struct BridgedNetwork {
     is_clone: bool,
     /// For clones: the veth IP inside the namespace (used for port forwarding)
     veth_inner_ip: Option<String>,
-    /// The relay for a host proxy on loopback, which the guest cannot reach itself.
-    proxy_relay: Option<super::tcp_proxy::Relay>,
+    /// The relays for host proxies on loopback, which the guest cannot reach itself.
+    proxy_relays: Vec<super::tcp_proxy::Relay>,
     /// A restore: the TAP drops datagrams to the published UDP guest ports until the
     /// guest acknowledges ([`super::udp_gate`]).
     restore_udp_gate: bool,
@@ -263,7 +235,7 @@ impl BridgedNetwork {
             port_mapping_rules: Vec::new(),
             is_clone: false,
             veth_inner_ip: None,
-            proxy_relay: None,
+            proxy_relays: Vec::new(),
             restore_udp_gate: false,
         }
     }
@@ -730,22 +702,17 @@ impl NetworkManager for BridgedNetwork {
         }
 
         // A proxy on the host's loopback is the guest's own loopback inside the guest;
-        // relay it (`bridged_proxy_relay`).
-        let mut guest_proxy = None;
-        let relay = bridged_proxy_relay(
+        // relay it (`bridged_proxy_relays`), the HTTP and HTTPS proxies separately.
+        let proxies = bridged_proxy_relays(
             env_proxy("http_proxy", "HTTP_PROXY").as_deref(),
             env_proxy("https_proxy", "HTTPS_PROXY").as_deref(),
-            &host_ip,
             guest_gateway_ip.as_deref().unwrap_or(&host_ip),
         );
-        if let Some(relay) = relay {
-            match super::tcp_proxy::start_host_proxy_relay(&relay.bind_ip, relay.plan.upstream)
+        for relay in proxies.relays {
+            match super::tcp_proxy::start_host_proxy_relay(&host_ip, relay.port, relay.upstream)
                 .await
             {
-                Ok(handle) => {
-                    self.proxy_relay = Some(handle);
-                    guest_proxy = Some(relay.plan.guest_url);
-                }
+                Ok(handle) => self.proxy_relays.push(handle),
                 Err(e) => {
                     let _ = self.cleanup().await;
                     return Err(e).context("starting the relay for the host's proxy");
@@ -777,7 +744,8 @@ impl NetworkManager for BridgedNetwork {
             guest_ipv6: None, // Bridged mode doesn't support IPv6 yet
             host_ipv6: None,
             dns_search: None,
-            http_proxy: guest_proxy,
+            http_proxy: proxies.http_url,
+            https_proxy: proxies.https_url,
             namespace_name: None,
         })
     }
@@ -786,10 +754,8 @@ impl NetworkManager for BridgedNetwork {
         info!(vm_id = %self.vm_id, "cleaning up network namespace and resources");
         let mut errors = Vec::new();
 
-        // Step 0: stop the proxy relay, whose listener holds an address of the veth.
-        if let Some(relay) = self.proxy_relay.take() {
-            super::tcp_proxy::stop_relays([relay]).await;
-        }
+        // Step 0: stop the proxy relays, whose listeners hold an address of the veth.
+        super::tcp_proxy::stop_relays(std::mem::take(&mut self.proxy_relays)).await;
 
         // Step 1: Cleanup port mapping rules (if any)
         if !self.port_mapping_rules.is_empty() {
@@ -934,45 +900,105 @@ mod tests {
 
     /// The guest reaches the host side of its veth at its gateway: a fresh boot's gateway
     /// is that address, and a clone's namespace DNATs every guest-to-gateway TCP
-    /// connection to it (veth.rs, setup_in_namespace_nat step 9). So the relay listens
-    /// there, outside the namespace, for both; a listener on br0 in a clone's namespace
-    /// is never reached.
+    /// connection to it (veth.rs, setup_in_namespace_nat step 9). So the guest's URL names
+    /// the gateway, whichever layout, and the relay listens on the veth's host address.
     #[test]
-    fn a_bridged_relay_listens_where_the_guests_gateway_leads() {
+    fn a_bridged_relay_url_names_the_guests_gateway() {
         let proxy = Some("http://user:secret@127.0.0.1:3128");
-        for (is_clone, gateway) in [(false, "10.0.0.1"), (true, "172.30.0.1")] {
-            let relay = bridged_proxy_relay(None, proxy, "10.0.0.1", gateway)
-                .expect("a loopback proxy is relayed");
-            assert_eq!(relay.bind_ip, "10.0.0.1", "clone={is_clone}");
-            assert_eq!(
-                relay.plan.guest_url,
-                format!(
-                    "http://user:secret@{gateway}:{}/",
-                    super::super::tcp_proxy::PROXY_RELAY_PORT
-                )
+        for gateway in ["10.0.0.1", "172.30.0.1"] {
+            let plan = bridged_proxy_relays(None, proxy, gateway);
+            let url = format!(
+                "http://user:secret@{gateway}:{}/",
+                super::super::tcp_proxy::PROXY_RELAY_PORT
             );
+            assert_eq!(plan.relays.len(), 1, "{gateway}");
+            assert_eq!(plan.http_url.as_deref(), Some(url.as_str()));
+            assert_eq!(plan.https_url.as_deref(), Some(url.as_str()));
         }
     }
 
-    /// The network's proxy URL is given to the guest for both schemes, so it is set only
-    /// when both schemes use the one relayed proxy. Separate HTTP and HTTPS proxies keep
-    /// their own selections (and a loopback one stays unreachable, with a warning).
+    /// Separate loopback HTTP and HTTPS proxies each get a relay on its own port, with
+    /// its own upstream, and the guest gets each scheme its own relay's URL (#1464).
     #[test]
-    fn a_bridged_relay_keeps_separate_http_and_https_proxies() {
-        let relay = bridged_proxy_relay(
-            Some("http://192.0.2.7:80"),
-            Some("http://127.0.0.1:3128"),
-            "10.0.0.1",
+    fn separate_loopback_proxies_get_separate_relays() {
+        use super::super::tcp_proxy::{HTTPS_PROXY_RELAY_PORT, PROXY_RELAY_PORT};
+        let plan = bridged_proxy_relays(
+            Some("http://user:a@127.0.0.1:3128"),
+            Some("http://user:b@127.0.0.1:3129"),
             "10.0.0.1",
         );
-        assert_eq!(relay, None);
-        assert!(bridged_proxy_relay(
-            Some("http://127.0.0.1:3128"),
-            Some("http://127.0.0.1:3128"),
+        let upstream = |port: u16| vec![format!("127.0.0.1:{port}").parse().unwrap()];
+        assert_eq!(
+            plan.relays,
+            vec![
+                super::super::tcp_proxy::PlannedRelay {
+                    port: PROXY_RELAY_PORT,
+                    upstream: upstream(3128)
+                },
+                super::super::tcp_proxy::PlannedRelay {
+                    port: HTTPS_PROXY_RELAY_PORT,
+                    upstream: upstream(3129)
+                },
+            ]
+        );
+        assert_eq!(
+            plan.http_url,
+            Some(format!("http://user:a@10.0.0.1:{PROXY_RELAY_PORT}/"))
+        );
+        assert_eq!(
+            plan.https_url,
+            Some(format!("http://user:b@10.0.0.1:{HTTPS_PROXY_RELAY_PORT}/"))
+        );
+    }
+
+    /// One proxy for both schemes is one relay, whichever variables name it.
+    #[test]
+    fn one_loopback_proxy_for_both_schemes_is_one_relay() {
+        let proxy = Some("http://127.0.0.1:3128");
+        for (http, https) in [(proxy, proxy), (proxy, None), (None, proxy)] {
+            let plan = bridged_proxy_relays(http, https, "10.0.0.1");
+            assert_eq!(plan.relays.len(), 1, "{http:?} {https:?}");
+            assert_eq!(plan.http_url, plan.https_url);
+            assert!(plan.http_url.is_some());
+        }
+    }
+
+    /// A proxy that is not on loopback is reached through the NAT as it is, so only the
+    /// loopback one is relayed and the other scheme keeps its own URL.
+    #[test]
+    fn a_remote_proxy_beside_a_loopback_one_is_not_relayed() {
+        use super::super::tcp_proxy::HTTPS_PROXY_RELAY_PORT;
+        let plan = bridged_proxy_relays(
+            Some("http://192.0.2.7:3128"),
+            Some("http://127.0.0.1:3129"),
             "10.0.0.1",
+        );
+        assert_eq!(plan.relays.len(), 1);
+        assert_eq!(plan.relays[0].port, HTTPS_PROXY_RELAY_PORT);
+        assert_eq!(plan.http_url.as_deref(), Some("http://192.0.2.7:3128"));
+        assert_eq!(
+            plan.https_url,
+            Some(format!("http://10.0.0.1:{HTTPS_PROXY_RELAY_PORT}/"))
+        );
+        // The other way round: the HTTP one is relayed on the HTTP port.
+        let plan = bridged_proxy_relays(
+            Some("http://127.0.0.1:3128"),
+            Some("http://192.0.2.7:3129"),
             "10.0.0.1",
-        )
-        .is_some());
+        );
+        assert_eq!(plan.relays.len(), 1);
+        assert_eq!(
+            plan.relays[0].port,
+            super::super::tcp_proxy::PROXY_RELAY_PORT
+        );
+        assert_eq!(plan.https_url.as_deref(), Some("http://192.0.2.7:3129"));
+        // Nothing on loopback: nothing relayed, and the guest takes the variables as they are.
+        let plan = bridged_proxy_relays(
+            Some("http://192.0.2.7:3128"),
+            Some("http://192.0.2.8:3129"),
+            "10.0.0.1",
+        );
+        assert_eq!(plan, super::super::tcp_proxy::SchemeProxies::default());
     }
 
     /// A rule or route that cleanup could not remove keeps its record, and the veth and

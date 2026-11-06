@@ -770,8 +770,9 @@ fn host_ntp_servers() -> Vec<String> {
     addrs
 }
 
-/// The `(http_proxy, https_proxy)` URLs a guest is given: the network's proxy, or else
-/// the host's proxy variables (`env`), with the host name resolved to an address and a
+/// The `(http_proxy, https_proxy)` URLs a guest is given: the network's proxy for each
+/// scheme (its HTTPS proxy, else its HTTP one, for HTTPS), or else the host's proxy
+/// variables (`env`), with the host name resolved to an address and a
 /// loopback address made one the guest can reach (`reachable_from_guest`).
 fn guest_proxies(
     network_config: &crate::network::NetworkConfig,
@@ -787,8 +788,9 @@ fn guest_proxies(
         .and_then(|url| resolve_proxy_url(&url))
         .map(reachable);
     let https_proxy = network_config
-        .http_proxy
+        .https_proxy
         .clone()
+        .or_else(|| network_config.http_proxy.clone())
         .or_else(|| env("https_proxy"))
         .or_else(|| env("HTTPS_PROXY"))
         .or_else(|| env("http_proxy"))
@@ -2032,6 +2034,28 @@ mod tests {
         };
         let (_, https) = guest_proxies(&remote, FcNetworkMode::Rootless, no_env);
         assert_eq!(https.as_deref(), Some("http://192.0.2.7:3128/"));
+    }
+
+    #[test]
+    fn a_guest_gets_each_scheme_its_own_proxy() {
+        use super::guest_proxies;
+        use crate::firecracker::FcNetworkMode;
+        let network = crate::network::NetworkConfig {
+            http_proxy: Some("http://172.30.0.1:41480/".to_string()),
+            https_proxy: Some("http://172.30.0.1:41481/".to_string()),
+            ..Default::default()
+        };
+        let (http, https) = guest_proxies(&network, FcNetworkMode::Bridged, |_: &str| None);
+        assert_eq!(http.as_deref(), Some("http://172.30.0.1:41480/"));
+        assert_eq!(https.as_deref(), Some("http://172.30.0.1:41481/"));
+        // A network that names one proxy gives it to both schemes (rootless, routed).
+        let one = crate::network::NetworkConfig {
+            http_proxy: Some("http://172.30.0.1:41480/".to_string()),
+            ..Default::default()
+        };
+        let (http, https) = guest_proxies(&one, FcNetworkMode::Bridged, |_: &str| None);
+        assert_eq!(http, https);
+        assert_eq!(http.as_deref(), Some("http://172.30.0.1:41480/"));
     }
 
     /// The driver image is the last drive: after two --disk drives, one --disk-dir and

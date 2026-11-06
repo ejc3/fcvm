@@ -19,6 +19,8 @@ use super::PortMapping;
 /// Uses a high port to avoid colliding with common application ports (8080, 3128, etc.)
 /// that container processes might try to reach on the gateway.
 pub const PROXY_RELAY_PORT: u16 = 41480;
+/// The port of the relay for the HTTPS proxy when it is not the HTTP one.
+pub const HTTPS_PROXY_RELAY_PORT: u16 = 41481;
 
 /// Run a closure inside a network namespace, restoring the original namespace afterward.
 ///
@@ -628,8 +630,8 @@ pub struct ProxyRelayPlan {
     pub guest_url: String,
 }
 
-/// Plan a relay for `proxy` that listens on `relay_ip` (`PROXY_RELAY_PORT`).
-pub fn plan_proxy_relay(proxy: &str, relay_ip: &str) -> Result<ProxyRelayPlan> {
+/// Plan a relay for `proxy` that listens on `relay_ip:port`.
+pub fn plan_proxy_relay(proxy: &str, relay_ip: &str, port: u16) -> Result<ProxyRelayPlan> {
     let url = proxy_url(proxy)?;
     let upstream = resolve_proxy(&url)?;
     // The relay passes bytes through, so the guest speaks the proxy's own scheme.
@@ -638,12 +640,83 @@ pub fn plan_proxy_relay(proxy: &str, relay_ip: &str) -> Result<ProxyRelayPlan> {
         .set_host(Some(relay_ip))
         .with_context(|| format!("relay address {relay_ip} is not a URL host"))?;
     guest
-        .set_port(Some(PROXY_RELAY_PORT))
+        .set_port(Some(port))
         .map_err(|()| anyhow::anyhow!("the proxy URL cannot take a port"))?;
     Ok(ProxyRelayPlan {
         upstream,
         guest_url: guest.to_string(),
     })
+}
+
+/// One relay of a `SchemeProxies` plan.
+#[derive(Debug, PartialEq)]
+pub struct PlannedRelay {
+    pub port: u16,
+    pub upstream: Vec<SocketAddr>,
+}
+
+/// The relays a guest needs for the host's HTTP and HTTPS proxies, and the proxy URL
+/// the guest is given for each scheme.
+#[derive(Debug, Default, PartialEq)]
+pub struct SchemeProxies {
+    pub relays: Vec<PlannedRelay>,
+    /// The guest's HTTP and HTTPS proxy URLs. Both None when nothing is relayed: the
+    /// guest then takes the host's variables as they are. When something is relayed,
+    /// a scheme whose proxy needs no relay gets that proxy's own URL.
+    pub http_url: Option<String>,
+    pub https_url: Option<String>,
+}
+
+/// Plan the relays for the host's HTTP proxy (`http`) and HTTPS proxy (`https`), each
+/// the value of that scheme's variable. A scheme without a variable uses the other's
+/// proxy, as the guest's URL for both schemes was before they could differ.
+///
+/// A proxy `needs_relay` judges from the addresses it resolved to. The proxy a scheme
+/// uses is relayed on its own port: `PROXY_RELAY_PORT` for HTTP, and
+/// `HTTPS_PROXY_RELAY_PORT` for HTTPS when it is a different proxy. Both schemes on
+/// one proxy share one relay and one URL. A proxy that does not resolve is passed
+/// through with a warning, like one that needs no relay.
+pub fn plan_scheme_proxies(
+    http: Option<&str>,
+    https: Option<&str>,
+    relay_ip: &str,
+    needs_relay: impl Fn(&[SocketAddr]) -> bool,
+) -> SchemeProxies {
+    let (http, https) = (http.or(https), https.or(http));
+    let (Some(http), Some(https)) = (http, https) else {
+        return SchemeProxies::default();
+    };
+    let mut plan = SchemeProxies::default();
+    let relay_for = |proxy: &str, port: u16, plan: &mut SchemeProxies| -> String {
+        match plan_proxy_relay(proxy, relay_ip, port) {
+            Ok(relay) if needs_relay(&relay.upstream) => {
+                plan.relays.push(PlannedRelay {
+                    port,
+                    upstream: relay.upstream,
+                });
+                relay.guest_url
+            }
+            Ok(_) => proxy.to_string(),
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "cannot relay the host's proxy");
+                proxy.to_string()
+            }
+        }
+    };
+    let (http_url, https_url) = if http == https {
+        let url = relay_for(http, PROXY_RELAY_PORT, &mut plan);
+        (url.clone(), url)
+    } else {
+        (
+            relay_for(http, PROXY_RELAY_PORT, &mut plan),
+            relay_for(https, HTTPS_PROXY_RELAY_PORT, &mut plan),
+        )
+    };
+    if !plan.relays.is_empty() {
+        plan.http_url = Some(http_url);
+        plan.https_url = Some(https_url);
+    }
+    plan
 }
 
 /// Parse a proxy URL like "http://user:password@host:port" or "host:port" into the
@@ -685,14 +758,17 @@ fn resolve_proxy(url: &url::Url) -> Result<Vec<SocketAddr>> {
     Ok(addresses)
 }
 
-/// Start a relay for the host's proxy that listens on `bind_ip` in fcvm's own network
-/// namespace, where the guest reaches it through its veth, and connects to `proxy_addr`.
-pub async fn start_host_proxy_relay(bind_ip: &str, upstream: Vec<SocketAddr>) -> Result<Relay> {
-    let bind_addr: SocketAddr = format!("{bind_ip}:{PROXY_RELAY_PORT}")
+/// Start a relay for the host's proxy that listens on `bind_ip:port` in fcvm's own
+/// network namespace, where the guest reaches it through its veth, and connects to
+/// `upstream`.
+pub async fn start_host_proxy_relay(
+    bind_ip: &str,
+    port: u16,
+    upstream: Vec<SocketAddr>,
+) -> Result<Relay> {
+    let bind_addr: SocketAddr = format!("{bind_ip}:{port}")
         .parse()
-        .with_context(|| {
-            format!("invalid proxy relay bind address {bind_ip}:{PROXY_RELAY_PORT}")
-        })?;
+        .with_context(|| format!("invalid proxy relay bind address {bind_ip}:{port}"))?;
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("binding proxy relay listener on {bind_addr}"))?;
@@ -881,16 +957,88 @@ mod tests {
     /// The guest's URL for a relay keeps the proxy's credentials and names the relay.
     #[test]
     fn a_relay_url_keeps_the_proxys_credentials() {
-        let plan = plan_proxy_relay("http://user:secret@127.0.0.1:3128/", "10.0.2.1").unwrap();
+        let plan = plan_proxy_relay(
+            "http://user:secret@127.0.0.1:3128/",
+            "10.0.2.1",
+            PROXY_RELAY_PORT,
+        )
+        .unwrap();
         assert_eq!(plan.upstream, vec!["127.0.0.1:3128".parse().unwrap()]);
         assert_eq!(
             plan.guest_url,
             format!("http://user:secret@10.0.2.1:{PROXY_RELAY_PORT}/")
         );
-        let plan = plan_proxy_relay("127.0.0.1:3128", "172.30.0.1").unwrap();
+        let plan = plan_proxy_relay("127.0.0.1:3128", "172.30.0.1", PROXY_RELAY_PORT).unwrap();
         assert_eq!(
             plan.guest_url,
             format!("http://172.30.0.1:{PROXY_RELAY_PORT}/")
+        );
+    }
+
+    /// `plan_scheme_proxies` with a relay for every proxy on 127.0.0.1.
+    fn plan(http: Option<&str>, https: Option<&str>) -> SchemeProxies {
+        plan_scheme_proxies(http, https, "10.0.0.1", |upstream| {
+            upstream.iter().all(|a| a.ip().is_loopback())
+        })
+    }
+
+    /// No proxy variable, no relay and no URL.
+    #[test]
+    fn no_proxy_plans_nothing() {
+        assert_eq!(plan(None, None), SchemeProxies::default());
+    }
+
+    /// A scheme with no variable uses the other's proxy, and both schemes on one proxy
+    /// share one relay and one URL.
+    #[test]
+    fn a_shared_proxy_is_one_relay() {
+        let proxy = "http://127.0.0.1:3128";
+        for (http, https) in [
+            (Some(proxy), Some(proxy)),
+            (Some(proxy), None),
+            (None, Some(proxy)),
+        ] {
+            let plan = plan(http, https);
+            assert_eq!(
+                plan.relays,
+                vec![PlannedRelay {
+                    port: PROXY_RELAY_PORT,
+                    upstream: vec!["127.0.0.1:3128".parse().unwrap()],
+                }]
+            );
+            let url = format!("http://10.0.0.1:{PROXY_RELAY_PORT}/");
+            assert_eq!(plan.http_url.as_deref(), Some(url.as_str()));
+            assert_eq!(plan.https_url.as_deref(), Some(url.as_str()));
+        }
+    }
+
+    /// Two different proxies get two relays on distinct ports, each to its own upstream.
+    #[test]
+    fn different_proxies_get_distinct_relay_ports() {
+        let plan = plan(
+            Some("http://127.0.0.1:3128"),
+            Some("https://127.0.0.1:3129"),
+        );
+        assert_eq!(plan.relays.len(), 2);
+        assert_eq!(plan.relays[0].port, PROXY_RELAY_PORT);
+        assert_eq!(plan.relays[1].port, HTTPS_PROXY_RELAY_PORT);
+        assert_ne!(plan.relays[0].port, plan.relays[1].port);
+        assert_eq!(
+            plan.relays[0].upstream,
+            vec!["127.0.0.1:3128".parse().unwrap()]
+        );
+        assert_eq!(
+            plan.relays[1].upstream,
+            vec!["127.0.0.1:3129".parse().unwrap()]
+        );
+        assert_eq!(
+            plan.http_url,
+            Some(format!("http://10.0.0.1:{PROXY_RELAY_PORT}/"))
+        );
+        // The scheme of the proxy's URL stays the proxy's own.
+        assert_eq!(
+            plan.https_url,
+            Some(format!("https://10.0.0.1:{HTTPS_PROXY_RELAY_PORT}/"))
         );
     }
 
@@ -926,7 +1074,8 @@ mod tests {
     /// The relay passes bytes through, so a TLS proxy stays TLS for the guest.
     #[test]
     fn a_relay_url_keeps_the_proxys_scheme() {
-        let plan = plan_proxy_relay("https://127.0.0.1:3128", "10.0.2.1").unwrap();
+        let plan =
+            plan_proxy_relay("https://127.0.0.1:3128", "10.0.2.1", PROXY_RELAY_PORT).unwrap();
         assert_eq!(plan.upstream, vec!["127.0.0.1:3128".parse().unwrap()]);
         assert_eq!(
             plan.guest_url,

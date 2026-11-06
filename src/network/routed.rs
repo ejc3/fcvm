@@ -1372,7 +1372,7 @@ impl NetworkManager for RoutedNetwork {
         //     The guest's URL names the relay and keeps the proxy's credentials.
         let mut guest_proxy = None;
         if let Some(proxy) = tcp_proxy::host_proxy_from_env() {
-            match tcp_proxy::plan_proxy_relay(&proxy, GUEST_GATEWAY) {
+            match tcp_proxy::plan_proxy_relay(&proxy, GUEST_GATEWAY, tcp_proxy::PROXY_RELAY_PORT) {
                 Ok(plan) => {
                     let handle =
                         tcp_proxy::start_proxy_relay(&ns_name, GUEST_GATEWAY, plan.upstream)
@@ -1416,6 +1416,7 @@ impl NetworkManager for RoutedNetwork {
             // The gateway relay (step 16), whose host side goes through the host's
             // connect() hooks.
             http_proxy: guest_proxy,
+            https_proxy: None,
             namespace_name: self.namespace_id.clone(),
         })
     }
