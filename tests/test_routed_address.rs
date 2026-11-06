@@ -9,6 +9,7 @@
 mod common;
 
 use anyhow::{Context, Result};
+use std::time::Duration;
 
 /// An address in the documentation prefix (RFC 3849), which no host routes.
 const OUTSIDE_ANY_PREFIX: &str = "2001:db8:ffff:ffff::2";
@@ -175,6 +176,158 @@ async fn test_routed_vm_and_clone_take_the_given_ipv6_address() -> Result<()> {
         common::kill_process(pid).await;
     }
     result
+}
+
+/// A listener bound to a routed VM's own global IPv6 address, not to `::`, answers on
+/// the address of every clone restored from a snapshot taken while it listened (#1083).
+///
+/// The restore moves the guest to the clone's address, and the listener stays bound to
+/// the snapshot's. The guest keeps that address on `lo`, deprecated, and translates the
+/// clone's address to it for the listener's port.
+#[tokio::test]
+async fn test_routed_clone_reaches_a_listener_on_the_snapshot_address() -> Result<()> {
+    let (base_name, clone_name, snapshot_name, _) = common::unique_names("routed-bound");
+    let fcvm_path = common::find_fcvm_binary()?;
+    let mut running: Vec<u32> = Vec::new();
+    let result = async {
+        let (_base_child, base_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &base_name,
+                "--network",
+                "routed",
+                common::TEST_IMAGE,
+            ],
+            &base_name,
+        )
+        .await
+        .context("spawning the VM")?;
+        running.push(base_pid);
+        common::poll_health_by_pid(base_pid, 300)
+            .await
+            .context("the VM did not become healthy")?;
+        let base_address = guest_ipv6(base_pid).await?;
+
+        // A guest process listening on the VM's own address only.
+        let listener = format!(
+            "nohup setsid python3 -c \"import socket\n\
+             s = socket.socket(socket.AF_INET6)\n\
+             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n\
+             s.bind(('{base_address}', {BOUND_PORT}))\n\
+             s.listen(16)\n\
+             while True:\n    c, _ = s.accept()\n    c.sendall(b'{BOUND_REPLY}')\n    c.close()\n\" \
+             >/dev/null 2>&1 &"
+        );
+        common::exec_in_vm(base_pid, &[&listener])
+            .await
+            .context("starting the guest listener")?;
+        let reply = bound_reply(&base_address, Duration::from_secs(20)).await;
+        anyhow::ensure!(
+            reply.as_deref() == Ok(BOUND_REPLY),
+            "the listener on {base_address} did not answer before the snapshot: {reply:?}"
+        );
+
+        let snap = fcvm_output(
+            &fcvm_path,
+            &[
+                "snapshot",
+                "create",
+                "--pid",
+                &base_pid.to_string(),
+                "--tag",
+                &snapshot_name,
+            ],
+        )
+        .await?;
+        anyhow::ensure!(
+            snap.status.success(),
+            "snapshot create failed: {}",
+            String::from_utf8_lossy(&snap.stderr)
+        );
+        common::kill_process(base_pid).await;
+        running.retain(|pid| *pid != base_pid);
+
+        let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snapshot_name,
+                "--name",
+                &clone_name,
+            ],
+            &clone_name,
+        )
+        .await
+        .context("spawning the clone")?;
+        running.push(clone_pid);
+        common::poll_health_by_pid(clone_pid, 120)
+            .await
+            .context("the clone did not become healthy")?;
+        let clone_address = guest_ipv6(clone_pid).await?;
+        anyhow::ensure!(
+            clone_address != base_address,
+            "the clone kept the snapshot's address {base_address}"
+        );
+        let reply = bound_reply(&clone_address, Duration::from_secs(5)).await;
+        anyhow::ensure!(
+            reply.as_deref() == Ok(BOUND_REPLY),
+            "the listener bound to the snapshot's {base_address} does not answer on the \
+             clone's {clone_address}: {reply:?}"
+        );
+        Ok(())
+    }
+    .await;
+
+    for pid in running.into_iter().rev() {
+        common::kill_process(pid).await;
+    }
+    result
+}
+
+const BOUND_PORT: u16 = 8081;
+const BOUND_REPLY: &str = "BOUND-OK";
+
+/// The VM's global IPv6 address, as fcvm recorded it, without its prefix length.
+async fn guest_ipv6(pid: u32) -> Result<String> {
+    let recorded = common::get_network_field(pid, "guest_ipv6").await?;
+    Ok(recorded
+        .split('/')
+        .next()
+        .context("an empty guest_ipv6")?
+        .to_string())
+}
+
+/// What the guest's listener on `address` sends, retried until `limit`.
+async fn bound_reply(address: &str, limit: Duration) -> Result<String, String> {
+    use tokio::io::AsyncReadExt;
+    let target = format!("[{address}]:{BOUND_PORT}");
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        let attempt = async {
+            let mut stream = tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::net::TcpStream::connect(&target),
+            )
+            .await
+            .map_err(|_| "connect timed out".to_string())?
+            .map_err(|e| format!("connect: {e}"))?;
+            let mut reply = String::new();
+            tokio::time::timeout(Duration::from_secs(2), stream.read_to_string(&mut reply))
+                .await
+                .map_err(|_| "read timed out".to_string())?
+                .map_err(|e| format!("read: {e}"))?;
+            Ok::<String, String>(reply)
+        }
+        .await;
+        match attempt {
+            Ok(reply) => return Ok(reply),
+            Err(error) if std::time::Instant::now() >= deadline => return Err(error),
+            Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
 }
 
 /// Run fcvm to completion. Every launch here is expected to be refused, but one that

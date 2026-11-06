@@ -428,7 +428,26 @@ pub async fn handle_clone_restore(
     // cleanup below finishes.
     let ipv6_started = std::time::Instant::now();
     if let Some(new_ipv6) = clone_ipv6 {
-        network::reconfigure_ipv6(new_ipv6).await;
+        let retired = network::reconfigure_ipv6(new_ipv6).await;
+        // A listener bound to the address just retired, or to an earlier clone
+        // generation's, stays reachable at the new one (#1083). Before the
+        // publication below, so no client finds it refused; a failure keeps the
+        // clone unpublished rather than publishing one whose service is gone.
+        let current: std::net::Ipv6Addr = new_ipv6
+            .parse()
+            .with_context(|| format!("the clone's IPv6 address {new_ipv6:?}"))?;
+        let carried = tokio::task::spawn_blocking(move || {
+            crate::retired_address::carry_listeners(retired, current)
+        })
+        .await
+        .context("joining the retired-address step")?
+        .context("keeping listeners on a retired IPv6 address reachable")?;
+        if !carried.translate.is_empty() {
+            eprintln!(
+                "[fc-agent] listeners on retired IPv6 address(es) {:?} answer on {current}: {:?}",
+                carried.keep, carried.translate
+            );
+        }
     }
     phases.ipv6_ms = elapsed_ms(ipv6_started);
 

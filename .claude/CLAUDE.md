@@ -2593,6 +2593,10 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 - Port forwarding via built-in TCP proxy (setns + tokio relay). A mapping with a HOSTIP (`--publish '[::]:80:80'`) listens on that address, and `[::]` accepts IPv4 and IPv6 clients. A mapping without one listens on the VM's unique loopback IP (same allocation as rootless), which is allocated only when a mapping needs it
 - IPv4 stays internal to namespace (health checks only); all external traffic uses IPv6
 - Egress proxy is NOT used — IPv6 goes natively through the kernel stack
+- A restore moves the guest to the clone's own address. A listener bound to the snapshot's
+  address (not `::`) keeps answering on the clone's: fc-agent keeps that address on `lo`,
+  deprecated, and DNATs the clone's address to it for the listener's port
+  (`fc-agent/src/retired_address.rs`, `test_routed_clone_reaches_a_listener_on_the_snapshot_address`)
 - `--ipv6-prefix` is also read from `FCVM_IPV6_PREFIX`. On a host whose own addresses are not a routable /64, set it to the host's delegated subnet: the routed tests pass no prefix, so without it they stop at "routed mode preflight check failed" before a VM boots
 
 **Loopback IP Allocation** (`src/state/manager.rs`):
