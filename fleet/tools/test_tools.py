@@ -195,6 +195,168 @@ class RunScripts(unittest.TestCase):
             self.assertIn("if ! wait_listening 127.0.0.1 20000 120 $CP; then", lines, name)
 
 
+FAKE_AWS = r"""#!/bin/bash
+# A stand-in for the AWS CLI: answers what `gpubox.sh up` asks, from FAKE_* variables, and
+# logs every call to $FAKE_LOG. The box it launches is listed from then on, at FAKE_MY_TIME.
+echo "$*" >> "$FAKE_LOG"
+args=" $* "
+case "$args" in
+  *" sts get-caller-identity "*) echo 123456789012 ;;
+  *" ec2 describe-images "*) echo ami-fake ;;
+  *" ec2 describe-security-groups "*) echo sg-fake ;;
+  *" ec2 describe-subnets "*) [ -z "${FAKE_SLOW_SUBNETS:-}" ] || sleep 3; echo subnet-fake ;;
+  *" service-quotas get-service-quota "*L-3819A6DF*) echo "$FAKE_SPOT_QUOTA" ;;
+  *" service-quotas get-service-quota "*L-DB2E81BA*) echo "$FAKE_OD_QUOTA" ;;
+  *" ec2 describe-instances "*)
+    [ -z "${FAKE_USAGE_FAIL:-}" ] || { echo "An error occurred (RequestLimitExceeded)" >&2; exit 254; }
+    case "$args" in *"InstanceLifecycle==\`spot\`"*) m=spot; printf '%b' "$FAKE_SPOT_IN_USE" ;; *) m=on-demand; printf '%b' "$FAKE_OD_IN_USE" ;; esac
+    if [ -s "$FAKE_LOG.launched" ]; then
+      # Another box launched at the same time, listed only now.
+      case $m in spot) printf '%b' "${FAKE_SPOT_IN_USE_AFTER:-}" ;; *) printf '%b' "${FAKE_OD_IN_USE_AFTER:-}" ;; esac
+      [ "$(cat "$FAKE_LOG.launched")" != "$m" ] || printf '%s\ti-fakebox\tfcvm-fleet-gpubox\t48\t2\n' "$FAKE_MY_TIME"
+    fi ;;
+  *" ec2 run-instances "*)
+    case "$args" in *MarketType=spot*) echo spot ;; *) echo on-demand ;; esac > "$FAKE_LOG.launched"
+    echo i-fakebox ;;
+  *" ec2 terminate-instances "*) : ;;
+  # S3 in $FAKE_S3: a key is a file, its ETag beside it; put-object --if-none-match * creates
+  # it only if absent, delete-object --if-match deletes it only at that ETag.
+  *" s3api put-object "*)
+    key=$(sed -n 's/.*--key \([^ ]*\).*/\1/p' <<<"$*"); body=$(sed -n 's/.*--body \([^ ]*\).*/\1/p' <<<"$*")
+    mkdir -p "$FAKE_S3/$(dirname "$key")"
+    ( set -o noclobber; cat "$body" > "$FAKE_S3/$key" ) 2>/dev/null || { echo "An error occurred (PreconditionFailed)" >&2; exit 254; }
+    etag="\"$RANDOM$RANDOM\""; echo "$etag" > "$FAKE_S3/$key.etag"; echo "$etag" ;;
+  *" s3api get-object "*)
+    key=$(sed -n 's/.*--key \([^ ]*\).*/\1/p' <<<"$*"); out=$(sed -n "s|.*--key [^ ]* \([^ ]*\).*|\1|p" <<<"$*")
+    [ -z "${FAKE_S3_READ_FAIL:-}" ] || { echo "An error occurred (AccessDenied)" >&2; exit 254; }
+    [ -e "$FAKE_S3/$key" ] || { echo "An error occurred (NoSuchKey)" >&2; exit 254; }
+    cp "$FAKE_S3/$key" "$out"; cat "$FAKE_S3/$key.etag" 2>/dev/null || echo '"none"' ;;
+  *" s3api head-object "*)
+    key=$(sed -n 's/.*--key \([^ ]*\).*/\1/p' <<<"$*")
+    [ -z "${FAKE_LOCK_STOLEN:-}" ] || { echo '"another"'; exit 0; }
+    [ -e "$FAKE_S3/$key" ] || { echo "An error occurred (404)" >&2; exit 254; }
+    cat "$FAKE_S3/$key.etag" ;;
+  *" s3api delete-object "*)
+    key=$(sed -n 's/.*--key \([^ ]*\).*/\1/p' <<<"$*"); want=$(sed -n 's/.*--if-match \([^ ]*\).*/\1/p' <<<"$*")
+    [ "$(cat "$FAKE_S3/$key.etag" 2>/dev/null)" = "$want" ] || { echo "An error occurred (PreconditionFailed)" >&2; exit 254; }
+    rm -f "$FAKE_S3/$key" "$FAKE_S3/$key.etag" ;;
+  *" s3 cp "*"- s3://"*) key=$(sed -n 's|.*- s3://[^/]*/\([^ ]*\).*|\1|p' <<<"$args"); mkdir -p "$FAKE_S3/$(dirname "$key")"; cat > "$FAKE_S3/$key" ;;
+  *) echo "fake aws: unexpected $*" >&2; exit 1 ;;
+esac
+"""
+
+
+def boxes(n, purpose="fcvm-fleet-gpubox", at="2026-11-05T23:00:00+00:00"):
+    """describe-instances --output text lines for n g4dn.metal instances."""
+    return "".join(f"{at}\\ti-other{k}\\t{purpose}\\t48\\t2\\n" for k in range(n))
+
+
+class GpuboxWallReserve(unittest.TestCase):
+    """`gpubox.sh up` leaves the wall's GPU host room in the account's G quotas (#1257)."""
+
+    def up(self, spot_quota=192, spot_in_use="", od_quota=384, od_in_use="", s3=None, **extra):
+        import tempfile
+        d = tempfile.mkdtemp()
+        s3 = s3 or os.path.join(d, "s3")
+        with open(os.path.join(d, "aws"), "w") as f:
+            f.write(FAKE_AWS)
+        os.chmod(os.path.join(d, "aws"), 0o755)
+        log = os.path.join(d, "calls")
+        env = dict(os.environ, PATH=f"{d}:{os.environ['PATH']}", FAKE_LOG=log, GPUBOX_USE_ENV="1",
+                   GPUBOX_AZS="a", FAKE_S3=s3, FAKE_SPOT_QUOTA=str(spot_quota), FAKE_OD_QUOTA=str(od_quota),
+                   FAKE_SPOT_IN_USE=spot_in_use, FAKE_OD_IN_USE=od_in_use,
+                   FAKE_MY_TIME="2026-11-06T00:00:00+00:00", **extra)
+        r = subprocess.run(["bash", os.path.join(HERE, "gpubox.sh"), "up", "--no-wait"],
+                           env=env, capture_output=True, text=True, timeout=60)
+        with open(log) as f:
+            calls = f.read().splitlines()
+        def named(word):
+            return [c for c in calls if f" {word} " in f" {c} "]
+        return r, named("run-instances"), named("terminate-instances")
+
+    def test_a_full_quota_launches_nothing(self):
+        # 2026-11-05: gpuboxes held the 384 on-demand vCPUs and the spot quota had no room
+        # for a box and the wall's host: the wall's host waited 13 minutes.
+        r, launches, _ = self.up(spot_in_use=boxes(1), od_in_use=boxes(3))
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(launches, [], r.stderr)
+        self.assertIn("wall", r.stderr)
+
+    def test_spot_goes_first_when_it_leaves_the_wall_room(self):
+        r, launches, ends = self.up(od_in_use=boxes(3))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(launches), 1, launches)
+        self.assertIn("MarketType=spot", launches[0])
+        self.assertEqual(ends, [])
+
+    def test_on_demand_only_with_room_for_the_wall_host_and_its_tiles(self):
+        # 96 for the box, 96 for the wall's host and 32 for its on-demand tiles.
+        r, launches, _ = self.up(spot_in_use=boxes(1), od_in_use=boxes(1))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(launches), 1, launches)
+        self.assertNotIn("MarketType=spot", launches[0])
+        r, launches, _ = self.up(spot_in_use=boxes(1), od_in_use=boxes(2))
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(launches, [])
+
+    def test_unreadable_usage_launches_nothing(self):
+        r, launches, _ = self.up(FAKE_USAGE_FAIL="1")
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(launches, [], r.stderr)
+        self.assertIn("could not be read", r.stderr)
+        self.assertNotIn("unexpected", r.stderr)
+
+    def test_two_ups_at_once_admit_one_box_into_the_room(self):
+        # Spot has room for one box and the wall's host, on demand for none, and neither
+        # listing ever shows the other's box (describe-instances is eventually consistent).
+        import tempfile
+        from concurrent.futures import ThreadPoolExecutor
+        s3 = tempfile.mkdtemp()
+        with ThreadPoolExecutor(2) as ex:
+            runs = list(ex.map(lambda _: self.up(od_in_use=boxes(3), s3=s3), range(2)))
+        self.assertEqual(sorted(r.returncode == 0 for r, _, _ in runs), [False, True], [r.stderr for r, _, _ in runs])
+        self.assertEqual(sum(len(launches) for _, launches, _ in runs), 1)
+        self.assertFalse(os.path.exists(os.path.join(s3, "gpubox", "admission.lock")), "the lock was left behind")
+
+    def test_a_lock_broken_before_the_launch_launches_nothing(self):
+        r, launches, _ = self.up(od_in_use=boxes(3), FAKE_LOCK_STOLEN="1")
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(launches, [], r.stderr)
+        self.assertIn("the admission lock was broken", r.stderr)
+
+    def test_a_lock_held_past_half_its_stale_age_launches_nothing(self):
+        # A holder whose quota and subnet calls took long could otherwise pass the fence just
+        # before another up breaks its lock as stale.
+        r, launches, _ = self.up(od_in_use=boxes(3), FAKE_SLOW_SUBNETS="1", GPUBOX_ADMIT_STALE_S="4")
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(launches, [], r.stderr)
+
+    def test_an_unreadable_lock_or_ledger_launches_nothing(self):
+        import tempfile
+        # A lock is held and cannot be read; then no lock and a ledger that cannot be read.
+        for held in (True, False):
+            s3 = tempfile.mkdtemp()
+            os.makedirs(os.path.join(s3, "gpubox"))
+            if held:
+                with open(os.path.join(s3, "gpubox", "admission.lock"), "w") as f:
+                    f.write(f"{int(time.time())} someone\n")
+            r, launches, _ = self.up(od_in_use=boxes(3), s3=s3, FAKE_S3_READ_FAIL="1", GPUBOX_ADMIT_WAIT_S="4")
+            self.assertNotEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(launches, [], r.stderr)
+
+    def test_a_held_lock_is_broken_once_stale(self):
+        import tempfile
+        s3 = tempfile.mkdtemp()
+        os.makedirs(os.path.join(s3, "gpubox"))
+        with open(os.path.join(s3, "gpubox", "admission.lock"), "w") as f:
+            f.write(f"{int(time.time()) - 400} gone\n")
+        with open(os.path.join(s3, "gpubox", "admission.lock.etag"), "w") as f:
+            f.write('"stale"\n')
+        r, launches, _ = self.up(od_in_use=boxes(3), s3=s3)
+        self.assertEqual((r.returncode, len(launches)), (0, 1), r.stderr)
+        self.assertIn("breaking an admission lock", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
 
