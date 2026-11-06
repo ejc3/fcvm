@@ -710,8 +710,11 @@ def clone_forensics(args, clone, reason):
         None if owners is None or pasta_pid is None
         else any(o["pid"] == pasta_pid for o in owners))
     if clone.get("fcvm_pid"):
-        probe = (f"/usr/bin/curl -s -m 5 -o /dev/null -w 'http=%{{http_code}}\\n' "
-                 f"http://127.0.0.1:{port}/json/version; echo curl_rc=$?; /usr/bin/ss -Htln")
+        # netcat-openbsd and iproute2 are in the guest rootfs; curl is not
+        # (rootfs-config.toml [packages]; reqbench's FailureProbe uses the same).
+        probe = ("export PATH=/usr/sbin:/usr/bin:/sbin:/bin; "
+                 f"r=$(printf 'GET /json/version HTTP/1.0\\r\\n\\r\\n' | nc -w 2 127.0.0.1 {port}); "
+                 "rc=$?; printf '%s\\n' \"$r\" | head -c 400; echo; echo nc_rc=$rc; ss -Htln")
         try:
             inside = sh([args.fcvm, "exec", "--pid", str(clone["fcvm_pid"]), "--vm", "--",
                          "/bin/sh", "-c", probe], timeout=30)

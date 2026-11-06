@@ -3504,7 +3504,7 @@ class ZeroBasis(unittest.TestCase):
         fcvm = os.path.join(bindir, "fcvm")
         with open(fcvm, "w") as f:
             f.write("#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$FCVM_ARGV\"\n"
-                    "echo http=000; echo curl_rc=7; echo 'LISTEN 0 4096 0.0.0.0:22 0.0.0.0:*'\n")
+                    "echo nc_rc=1; echo 'LISTEN 0 4096 0.0.0.0:22 0.0.0.0:*'\n")
         for name in ("ss", "fcvm"):
             os.chmod(os.path.join(bindir, name), 0o755)
         args = SimpleNamespace(results=os.path.join(tmp, "results"), data_root=tmp, fcvm=fcvm,
@@ -3543,9 +3543,13 @@ class ZeroBasis(unittest.TestCase):
                 self.assertEqual(record["endpoint_listener_owners"], [{"comm": "pasta", "pid": 5002}])
                 self.assertEqual(record["clone_pasta_pid"], pasta_pid)
                 self.assertIs(record["endpoint_listener_is_this_clones_pasta"], ours)
-                self.assertIn("curl_rc=7", record["guest"]["stdout"])
+                self.assertIn("nc_rc=1", record["guest"]["stdout"])
                 with open(env["FCVM_ARGV"]) as f:
-                    self.assertTrue(f.read().startswith("exec --pid 4242 --vm -- /bin/sh -c"))
+                    argv = f.read()
+                self.assertTrue(argv.startswith("exec --pid 4242 --vm -- /bin/sh -c"), argv)
+                # The guest rootfs has netcat-openbsd and iproute2, not curl.
+                self.assertIn("nc -w 2 127.0.0.1 9222", argv)
+                self.assertNotIn("curl", argv)
 
     def test_a_serve_sample_with_no_process_basis_is_refused(self):
         args = SimpleNamespace(state_dir="/state")
