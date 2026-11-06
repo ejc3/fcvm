@@ -6,7 +6,7 @@
 # Both hours fire so that 03:30 Pacific is met in summer and winter time; the other one exits here. DOGFOOD_NOW=1 runs
 # it at any hour. One run at a time (a lock). The session works in its own worktree, reset to origin/main, and writes
 # to /mnt/fcvm-btrfs/fcvm-dogfood/<Pacific date>/<UTC start time>/: session.jsonl (the transcript), session.err,
-# run.log and machines (one line per instance the session launched: `pbox <slot> <instance id>` or `ec2 <region> <instance id>`).
+# run.log and machines (one line per instance the session launched: `pbox <slot> <instance id>` or `gpubox <instance id>`).
 # Whatever is listed there and still running when the session ends is taken down here, so a timeout cannot leave a box
 # billing.
 set -u
@@ -31,6 +31,9 @@ git -C "$repo" fetch -q origin main || fail "fetch"
 if [ -e "$wt" ] || [ -L "$wt" ]; then
   [ -d "$wt" ] && [ ! -L "$wt" ] || fail "$wt is not a plain directory"
   git -C "$repo" worktree list --porcelain | grep -qxF "worktree $wt" || fail "$wt is not a worktree of $repo"
+  # git's list can hold a stale entry for a path another clone now occupies: ask the directory itself as well.
+  [ "$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null)" = "$wt" ] || fail "$wt is not its own worktree root"
+  [ "$(cd "$wt" && realpath "$(git rev-parse --git-common-dir)")" = "$(realpath "$repo/.git")" ] || fail "$wt does not belong to $repo"
   git -C "$wt" checkout -q -f --detach origin/main && git -C "$wt" clean -qfd || fail "reset of $wt"
 else
   git -C "$repo" worktree add -q --detach "$wt" origin/main || fail "worktree add"
@@ -47,16 +50,10 @@ log "exit $status"
 # Take down what the session launched and left running. Only instances the session recorded, by id.
 while read -r kind a b; do
   case $kind in
-    pbox)
-      if pbox status 2>/dev/null | grep -A3 "^parallel-box $a:" | grep -qF "$b"; then
-        pbox down "$a" >>"$out/run.log" 2>&1 && log "took down pbox $a ($b)" || log "pbox down $a failed"
-      fi ;;
-    ec2)
-      state=$(aws ec2 describe-instances --region "$a" --instance-ids "$b" --query 'Reservations[].Instances[].State.Name' --output text 2>/dev/null)
-      case $state in
-        pending|running|stopping|stopped)
-          aws ec2 terminate-instances --region "$a" --instance-ids "$b" >/dev/null 2>&1 && log "terminated $b" || log "terminate $b failed" ;;
-      esac ;;
+    # `--instance` makes pbox act only while the slot still holds that instance.
+    pbox) pbox down "$a" --instance "$b" >>"$out/run.log" 2>&1 && log "pbox down $a ($b)" || log "pbox down $a ($b) refused or failed" ;;
+    # gpubox.sh assumes the fleet account's role itself, so the id is handed to it rather than to a bare aws call.
+    gpubox) bash fleet/tools/gpubox.sh down "$a" >>"$out/run.log" 2>&1 && log "gpubox down $a" || log "gpubox down $a failed" ;;
   esac
 done <"$out/machines"
 exit $status
