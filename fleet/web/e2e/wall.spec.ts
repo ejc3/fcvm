@@ -1,6 +1,6 @@
 import { expect, test, devices, type Page } from "@playwright/test";
 import { seconds, thousands, utcDate } from "../core/format.ts";
-import { DETAIL_TILE_PX, layoutMosaic, streamHeightFor, zoomTarget } from "../core/layout.ts";
+import { DETAIL_TILE_PX, layoutMosaic, neighbour, readingOrder, streamHeightFor, zoomTarget } from "../core/layout.ts";
 import { ZOOM_DIM_NEAR, ZOOM_SHEET_W, zoomInsetsFor } from "../core/view.ts";
 import { streamBitrate } from "../core/bandwidth.ts";
 import { COORD, admin, fleetNow, focusError, mockState, openWall, raceOver, seamReport, setSkew, setTimeOfDay } from "./helpers.ts";
@@ -1176,6 +1176,56 @@ test("broadcast mode, a late viewer: Enter on a tile zooms the broadcast, which 
     await page.keyboard.press("Escape");
     await expect(page.getByTestId("focus")).toHaveCount(0);
   } finally {
+    await closeBroadcast();
+  }
+});
+
+test("broadcast mode: after a re-tile the keyboard grid keeps the tiles of the frame on screen, and arrows move among them", async ({ page }) => {
+  type T = { id: string; rect: { x: number; y: number; w: number; h: number } };
+  await openBroadcast(page, false);
+  try {
+    // Hold the picture: the frame on screen stays, and with it the tiling the overlay draws.
+    await page.evaluate(() => window.__fleet!.client.ui({ paused: true }));
+    await page.waitForTimeout(500);
+    const onScreen = () => page.evaluate(() => (window.__fleet!.client.pinned?.state.tiles ?? []).map((t) => ({ id: t.id, rect: t.rect })));
+    const shown: T[] = await onScreen();
+    expect(shown).toHaveLength(15);
+    const gen0 = await page.evaluate(() => window.__fleet!.client.getState().accepted!.layout.generation);
+    // Two leave the fcvm side and three the EC2 side: ids go away and the rest move.
+    await admin("/mock/fault", { fcvm_gpus: 6, ec2_gpus: 4 });
+    await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().accepted!.layout.generation), { timeout: 15_000 }).toBe(gen0 + 1);
+    const liveTiles: T[] = await page.evaluate(() => window.__fleet!.client.getState().accepted!.tiles.map((t) => ({ id: t.id, rect: t.rect })));
+    expect(await onScreen()).toEqual(shown);
+    expect(liveTiles.map((t) => t.id).sort()).not.toEqual(shown.map((t) => t.id).sort());
+    // A button for every tile on screen, in its reading order.
+    const names = new Map((await view(page)).tiles.map((t) => [t.id, t.name]));
+    const labels = await page.locator(".key-grid button").evaluateAll((els) => els.map((e) => e.getAttribute("aria-label") ?? ""));
+    expect(labels.map((l) => l.split(",")[0])).toEqual(readingOrder(shown as never).map((t) => names.get(t.id)));
+    // An arrow goes to the neighbour on screen: one move whose neighbour among the live tiles is another.
+    const dirs = [["ArrowLeft", "left"], ["ArrowRight", "right"], ["ArrowUp", "up"], ["ArrowDown", "down"]] as const;
+    const moves = shown.flatMap((from) =>
+      dirs.map(([key, dir]) => {
+        const want = neighbour(shown as never, from as never, dir) as T | null;
+        const liveFrom = liveTiles.find((t) => t.id === from.id);
+        const live = liveFrom ? (neighbour(liveTiles as never, liveFrom as never, dir) as T | null) : null;
+        return { from, key, want: want?.id ?? null, live: liveFrom ? (live?.id ?? null) : "gone" };
+      }),
+    );
+    const m = moves.find((x) => x.want !== null && x.want !== x.live)!;
+    expect(m, "a move whose neighbour on screen differs from the live one").toBeDefined();
+    await says(page, names.get(m.from.id)!).focus();
+    await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().ui.keyId)).toBe(m.from.id);
+    await page.keyboard.press(m.key);
+    await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().ui.keyId)).toBe(m.want);
+    // The picture moves on to the new tiling while a tile that left holds the focus: the grid
+    // still has its one tab stop.
+    await says(page, names.get("ec2:7")!).focus();
+    await page.evaluate(() => window.__fleet!.client.ui({ paused: false }));
+    await expect.poll(async () => (await onScreen()).length, { timeout: 15_000 }).toBe(10);
+    await expect(page.locator('.key-grid button[tabindex="0"]')).toHaveCount(1);
+  } finally {
+    await page.evaluate(() => window.__fleet!.client.ui({ paused: false }));
+    await admin("/mock/fault", { fcvm_gpus: 8, ec2_gpus: 7 });
     await closeBroadcast();
   }
 });
