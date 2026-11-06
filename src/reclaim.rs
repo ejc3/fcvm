@@ -584,8 +584,14 @@ impl Owner {
     /// descriptor of it: a helper that writes this owner's resources keeps the owner live
     /// until it exits, and nothing reclaims what it is still writing.
     pub fn holder(&self) -> Result<Holder> {
+        self.inner.holder()
+    }
+}
+
+impl Inner {
+    fn holder(&self) -> Result<Holder> {
         use std::os::fd::AsFd;
-        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let lock = state
             .lock
             .as_ref()
@@ -727,6 +733,12 @@ fn owner(id: &str) -> Result<Arc<Inner>> {
 /// no owner is registered: a resource that is created without a record leaks on SIGKILL.
 pub fn record(id: &str, resource: Resource) -> Result<()> {
     owner(id)?.record(resource)
+}
+
+/// A handle on the lock of the owner registered under `id` (`Owner::holder`), for a helper
+/// that writes one of its resources.
+pub fn holder(id: &str) -> Result<Holder> {
+    owner(id)?.holder()
 }
 
 /// Drop the records of the owner under `id` that `matches` selects, without undoing
@@ -883,7 +895,7 @@ async fn undo_rule(program: &str, args: &[String]) -> Undo {
         return Undo::Kept(format!("{program} rule {args:?} has no -A"));
     };
     delete[append] = "-D".to_string();
-    match tokio::process::Command::new(program)
+    match crate::utils::helper_command(program)
         .args(&delete)
         .output()
         .await
@@ -1620,6 +1632,104 @@ mod tests {
         assert_ne!(first, second, "one directory for two host owners");
         assert_eq!(child(65534), first, "the first owner lost its directory");
         assert_eq!(child(65533), second, "the second owner lost its directory");
+    }
+
+    /// The body of the function whose definition starts with `signature` in `source`.
+    fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} is gone"));
+        let open = start + source[start..].find('{').expect("a body");
+        let mut depth = 0;
+        for (at, c) in source[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[open..open + at + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{signature} has no end")
+    }
+
+    /// #1316: every helper a reclaim pass runs to undo a kernel object dies with the pass. A
+    /// pass killed while its `iptables -D` was stopped left the delete to run later, after the
+    /// names and addresses could belong to a new VM. Each function `undo` reaches spawns its
+    /// commands with `crate::utils::helper_command`, and `undo` reaches no other.
+    ///
+    /// RED BEFORE THE FIX: every one of them spawned with `Command::new`.
+    #[test]
+    fn every_undo_helper_dies_with_the_pass_that_runs_it() {
+        let reclaim = include_str!("reclaim.rs");
+        let undo = body_of(reclaim, "async fn undo(resource: &Resource) -> Undo {");
+        let checked: [(&str, &str, &[&str]); 5] = [
+            ("reclaim", reclaim, &["async fn undo_rule("]),
+            (
+                "network::namespace",
+                include_str!("network/namespace.rs"),
+                &["pub async fn delete_namespace("],
+            ),
+            (
+                "network::veth",
+                include_str!("network/veth.rs"),
+                &[
+                    "pub async fn delete_veth_pair(",
+                    "pub async fn delete_host_route_to_guest(",
+                ],
+            ),
+            (
+                "network::portmap",
+                include_str!("network/portmap.rs"),
+                &["pub async fn cleanup_global_nat_if_unused("],
+            ),
+            (
+                "network::routed",
+                include_str!("network/routed.rs"),
+                &["async fn remove_address_objects("],
+            ),
+        ];
+        let mut reached: Vec<&str> = undo
+            .match_indices("crate::network::")
+            .map(|(at, _)| {
+                let call = &undo[at..];
+                &call[..call.find('(').expect("a call")]
+            })
+            .collect();
+        reached.sort();
+        assert_eq!(
+            reached,
+            [
+                "crate::network::namespace::delete_namespace",
+                "crate::network::portmap::cleanup_global_nat_if_unused",
+                "crate::network::routed::release_address",
+                "crate::network::veth::delete_host_route_to_guest",
+                "crate::network::veth::delete_veth_pair",
+            ],
+            "undo reaches other network functions: check their helpers and list them here"
+        );
+        // release_address leases the address and calls remove_address_objects.
+        assert!(body_of(
+            include_str!("network/routed.rs"),
+            "async fn release_address_in("
+        )
+        .contains("remove_address_objects("));
+        for (module, source, functions) in checked {
+            for function in functions {
+                let body = body_of(source, function);
+                assert!(
+                    body.contains("crate::utils::helper_command("),
+                    "{module} {function} spawns no helper_command"
+                );
+                assert!(
+                    !body.contains("Command::new("),
+                    "{module} {function} spawns a helper that outlives the pass"
+                );
+            }
+        }
     }
 
     /// A helper that writes an owner's resources inherits its lock, so a pass leaves them

@@ -209,6 +209,19 @@ impl StoreTemp {
             .holder()
     }
 
+    /// A command for a helper that writes this temp (curl, tar, mkfs, a build script). It
+    /// inherits the temp's owner lock (`holder`), so the record stays live, and no reclaim pass
+    /// removes the temp under it, until the helper exits, even when this process is killed
+    /// first (#1316).
+    pub(crate) fn command(
+        &self,
+        program: impl AsRef<std::ffi::OsStr>,
+    ) -> Result<tokio::process::Command> {
+        let mut command = tokio::process::Command::new(program);
+        self.holder()?.hold_in(&mut command);
+        Ok(command)
+    }
+
     /// Rename the temp onto `dest` and hand it back to the sudo invoker.
     ///
     /// A rename replaces a file or an empty directory atomically, but fails on a
@@ -401,6 +414,92 @@ mod store_ownership_tests {
         assert!(dir.is_dir());
         assert!(dir.join("x.lock").is_file());
         flock.unlock().map_err(|(_, e)| e).unwrap();
+    }
+
+    /// #1316: a helper that writes a store temp holds the temp's owner lock, so a reclaim pass
+    /// cannot remove the temp while the helper still writes it, even after setup is killed.
+    /// The helper inherits the lock as an open descriptor of the owner's lock file.
+    #[tokio::test]
+    async fn a_helper_writing_a_store_temp_holds_its_owner_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let owners = tmp.path().join("owners");
+        let temp = StoreTemp::new_in(
+            &crate::reclaim::owner_dir_in(&owners).unwrap(),
+            &tmp.path().join("kernel.bin"),
+        )
+        .unwrap();
+        let mut child = temp
+            .command("sleep")
+            .unwrap()
+            .arg("600")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let held: Vec<std::path::PathBuf> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap()
+            .filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok())
+            .filter(|target| target.starts_with(&owners))
+            .collect();
+        child.kill().await.unwrap();
+        assert!(
+            held.len() == 1 && held[0].extension().is_some_and(|e| e == "lock"),
+            "the helper holds {held:?} of the owner directory, not its owner's lock file"
+        );
+    }
+
+    /// #1316: setup spawns every helper that writes a store temp through
+    /// `StoreTemp::command`, so it holds the temp's owner lock. A function that makes a temp
+    /// and spawns a plain command is either a new writer that needs it or belongs in the
+    /// list below with the reason it does not.
+    #[test]
+    fn helpers_of_functions_that_make_store_temps_hold_their_locks() {
+        // git and cargo build a checkout of their own; the temp is written by a copy here.
+        const NOT_WRITERS: &[&str] = &["ensure_cloud_hypervisor"];
+        for (file, source) in [
+            ("src/setup/kernel.rs", include_str!("kernel.rs")),
+            ("src/setup/rootfs.rs", include_str!("rootfs.rs")),
+        ] {
+            let source = &source[..source
+                .find("\n#[cfg(test)]\nmod tests")
+                .unwrap_or(source.len())];
+            let mut rest = source;
+            while let Some(at) = rest.find("fn ") {
+                let after = &rest[at + 3..];
+                let name: String = after
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                let Some(open) = after.find('{') else { break };
+                if after[..open].contains(';') {
+                    rest = &after[after.find(';').unwrap()..];
+                    continue;
+                }
+                let mut depth = 0;
+                let mut end = open;
+                for (i, c) in after[open..].char_indices() {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = open + i;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let body = &after[open..end];
+                if body.contains("StoreTemp::new(") && !NOT_WRITERS.contains(&name.as_str()) {
+                    assert!(
+                        !body.contains("Command::new("),
+                        "{file} {name} makes a store temp and spawns a helper without its lock"
+                    );
+                }
+                rest = &after[end..];
+            }
+        }
     }
 
     #[test]

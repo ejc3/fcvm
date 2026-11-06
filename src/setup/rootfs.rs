@@ -1785,21 +1785,24 @@ pub async fn ensure_fc_agent_initrd(allow_create: bool) -> Result<PathBuf> {
     tokio::fs::copy(&busybox_path, temp_dir.join("bin/busybox")).await?;
 
     // Make busybox executable
-    Command::new("chmod")
+    build_dir
+        .command("chmod")?
         .args(["755", temp_dir.join("bin/busybox").to_str().unwrap()])
         .output()
         .await?;
 
     // Write init script
     tokio::fs::write(temp_dir.join("init"), INITRD_INIT_SCRIPT).await?;
-    Command::new("chmod")
+    build_dir
+        .command("chmod")?
         .args(["755", temp_dir.join("init").to_str().unwrap()])
         .output()
         .await?;
 
     // Copy fc-agent binary
     tokio::fs::copy(&fc_agent_path, temp_dir.join("fc-agent")).await?;
-    Command::new("chmod")
+    build_dir
+        .command("chmod")?
         .args(["755", temp_dir.join("fc-agent").to_str().unwrap()])
         .output()
         .await?;
@@ -1815,7 +1818,8 @@ pub async fn ensure_fc_agent_initrd(allow_create: bool) -> Result<PathBuf> {
     // Create cpio archive (initrd format)
     // Use bash with pipefail so cpio errors aren't masked by gzip success (v3)
     let temp_initrd = super::StoreTemp::new(&initrd_path)?;
-    let output = Command::new("bash")
+    let output = temp_initrd
+        .command("bash")?
         .args([
             "-c",
             &format!(
@@ -1893,14 +1897,16 @@ fn find_busybox() -> Result<PathBuf> {
 ///
 /// Requires a clean ext4 filesystem (runs e2fsck first).
 /// btrfs-convert works on image files, not just block devices.
-async fn convert_to_btrfs(image_path: &Path) -> Result<()> {
+async fn convert_to_btrfs(image: &super::StoreTemp) -> Result<()> {
+    let image_path = image.path();
     // Verify btrfs-convert is available (from btrfs-progs package)
     if which::which("btrfs-convert").is_err() {
         bail!("btrfs-convert not found — install btrfs-progs: apt-get install btrfs-progs");
     }
 
     // e2fsck first — btrfs-convert requires a clean ext4 filesystem
-    let e2fsck_output = Command::new("e2fsck")
+    let e2fsck_output = image
+        .command("e2fsck")?
         .args(["-f", "-y", path_to_str(image_path)?])
         .output()
         .await
@@ -1913,7 +1919,8 @@ async fn convert_to_btrfs(image_path: &Path) -> Result<()> {
         );
     }
 
-    let output = Command::new("btrfs-convert")
+    let output = image
+        .command("btrfs-convert")?
         .arg(path_to_str(image_path)?)
         .output()
         .await
@@ -1948,7 +1955,8 @@ async fn create_layer2_rootless(
     // when they drop.
     let full_disk = super::StoreTemp::new(output_path)?;
     let full_disk_path = full_disk.path();
-    let output = Command::new("qemu-img")
+    let output = full_disk
+        .command("qemu-img")?
         .args([
             "convert",
             "-f",
@@ -1976,7 +1984,8 @@ async fn create_layer2_rootless(
     let partition_path = partition.path();
 
     // Get partition info using sfdisk
-    let output = Command::new("sfdisk")
+    let output = full_disk
+        .command("sfdisk")?
         .args(["-J", path_to_str(full_disk_path)?])
         .output()
         .await
@@ -2023,7 +2032,8 @@ async fn create_layer2_rootless(
     );
 
     // Extract partition using dd (sector size is 512 bytes)
-    let output = Command::new("dd")
+    let output = partition
+        .command("dd")?
         .args([
             &format!("if={}", path_to_str(full_disk_path)?),
             &format!("of={}", path_to_str(partition_path)?),
@@ -2045,7 +2055,8 @@ async fn create_layer2_rootless(
 
     // Step 4: Expand the extracted partition to 10GB
     info!("expanding partition to {}", LAYER2_SIZE);
-    let output = Command::new("truncate")
+    let output = partition
+        .command("truncate")?
         .args(["-s", LAYER2_SIZE, path_to_str(partition_path)?])
         .output()
         .await
@@ -2060,14 +2071,16 @@ async fn create_layer2_rootless(
 
     // Resize the ext4 filesystem to fill the partition
     info!("resizing ext4 filesystem");
-    let _output = Command::new("e2fsck")
+    let _output = partition
+        .command("e2fsck")?
         .args(["-f", "-y", path_to_str(partition_path)?])
         .output()
         .await
         .context("running e2fsck")?;
     // e2fsck may return non-zero even on success (exit code 1 = errors corrected)
 
-    let output = Command::new("resize2fs")
+    let output = partition
+        .command("resize2fs")?
         .args([path_to_str(partition_path)?])
         .output()
         .await
@@ -2083,7 +2096,7 @@ async fn create_layer2_rootless(
     // Step 4b: Convert ext4 to btrfs if requested (before setup VM boot)
     if rootfs_type == Some("btrfs") {
         info!("converting rootfs from ext4 to btrfs");
-        convert_to_btrfs(partition_path).await?;
+        convert_to_btrfs(&partition).await?;
     }
 
     // Step 5: Download packages on host (host has network!)
@@ -2404,7 +2417,8 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
         format!("{}{download_script}", transport.prelude),
     ]);
 
-    let output = Command::new("podman")
+    let output = download
+        .command("podman")?
         .args(&podman_args)
         .output()
         .await
@@ -2503,7 +2517,8 @@ async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
 
     // -f makes curl fail on HTTP errors instead of saving the error page as the
     // image; -S still prints the error despite --progress-bar.
-    let output = Command::new("curl")
+    let output = temp
+        .command("curl")?
         .args([
             "-fSL",
             "-o",

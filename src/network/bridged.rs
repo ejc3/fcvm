@@ -453,7 +453,7 @@ impl NetworkManager for BridgedNetwork {
                     // rejected address on the veth, and the next accepted
                     // candidate would return with that routed address still
                     // configured alongside it.
-                    let del = tokio::process::Command::new("ip")
+                    let del = crate::utils::helper_command("ip")
                         .args(["addr", "del", &host_ip_with_cidr, "dev", &host_veth])
                         .output()
                         .await;
