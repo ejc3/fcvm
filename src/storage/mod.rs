@@ -4,7 +4,6 @@ pub mod extents;
 pub mod inode_flags;
 pub mod pmem;
 pub mod pmem_store;
-pub mod runtime_dir;
 pub mod snapshot;
 pub mod volume;
 
