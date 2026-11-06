@@ -597,6 +597,7 @@ impl FirecrackerConfig {
                     "https_proxy": runtime.https_proxy,
                     "no_proxy": runtime.no_proxy,
                     "ntp_servers": runtime.ntp_servers,
+                    "transparent_hugepage": runtime.transparent_hugepage,
                 },
             }
         });
@@ -651,6 +652,9 @@ pub struct MmdsRuntime {
     /// into chrony.conf as `server <addr>` directives, and shipping addresses
     /// means the guest needs no DNS of its own to end up with real sources.
     pub ntp_servers: Vec<String>,
+    /// The guest's transparent huge page mode (`--guest-thp`), or none for the
+    /// kernel's own. Not keyed: every restore sends its own (fc-agent `thp`).
+    pub transparent_hugepage: Option<String>,
 }
 
 #[cfg(test)]
@@ -1239,8 +1243,14 @@ mod tests {
             subgid_count: None,
             host_clock: std::time::Duration::ZERO,
             ntp_servers: vec![],
+            transparent_hugepage: None,
         });
 
+        assert_eq!(
+            plan.pointer("/latest/container-plan/transparent_hugepage"),
+            Some(&serde_json::Value::Null),
+            "the plan names the field even when the run gives no mode"
+        );
         assert_eq!(
             plan.pointer("/latest/container-plan/published_guest_ports"),
             Some(&serde_json::json!(["80", "81"]))
@@ -1267,6 +1277,7 @@ mod tests {
             subgid_count: None,
             host_clock: std::time::Duration::ZERO,
             ntp_servers: vec![],
+            transparent_hugepage: None,
         };
         let plan = test_config().to_mmds_json(runtime(Some("/dev/vdc")));
         assert_eq!(

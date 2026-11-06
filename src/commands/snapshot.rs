@@ -2709,10 +2709,16 @@ async fn cmd_snapshot_run_inner(
     // The restore hook: this invocation's when it gave one, else the snapshot's
     // for a command-line `snapshot run`, else none. The clone's restore runs it,
     // and a snapshot taken from this clone records it.
-    vm_state.config.restore_hook = restore_hook_for(
+    vm_state.config.restore_hook = per_restore_setting(
         args.on_restore.as_deref(),
         args.inherit_recorded_hook,
         snapshot_config.metadata.restore_hook.as_deref(),
+    );
+    // The huge page mode the same way. The restore sends it, `default` when none.
+    vm_state.config.guest_thp = per_restore_setting(
+        args.guest_thp.as_deref(),
+        args.inherit_recorded_hook,
+        snapshot_config.metadata.guest_thp.as_deref(),
     );
     vm_state.config.hugepages = args.hugepages.unwrap_or(snapshot_config.metadata.hugepages);
     // Restore username for rootless health checks (runuser -u <username>).
@@ -3060,6 +3066,10 @@ async fn cmd_snapshot_run_inner(
     if !gpus.is_empty() {
         restore_latest["gpus"] = serde_json::json!(gpus);
     }
+    // Always sent: the snapshot's guest runs in whatever mode its source had, and
+    // a clone that asked for none gets the kernel's own back.
+    restore_latest["transparent-hugepage"] =
+        serde_json::Value::String(restore_thp_mode(&vm_state.config.guest_thp));
     let bootplan_socket = format!(
         "{}_{}",
         clone_vsock_base.display(),
@@ -4185,6 +4195,7 @@ async fn build_clone_reboot_plan(
         ipv6_prefix,
         ipv6_address,
         meta.restore_hook.clone(),
+        meta.guest_thp.clone(),
     );
 
     // This runs when the guest reboots, and the relaunched fc-agent mounts the
@@ -4263,7 +4274,7 @@ async fn build_clone_reboot_plan(
 ///
 /// `restore_hook` is the hook the run gives the clone, resolved by the caller: for a
 /// disk-only clone the caller's `--on-restore`, else the recorded one when the command
-/// line inherits (`restore_hook_for`); for the reboot plan the clone's own.
+/// line inherits (`per_restore_setting`); for the reboot plan the clone's own.
 #[allow(clippy::too_many_arguments)]
 fn run_args_from_snapshot_metadata(
     meta: &crate::storage::SnapshotMetadata,
@@ -4277,6 +4288,7 @@ fn run_args_from_snapshot_metadata(
     ipv6_prefix: Option<&String>,
     ipv6_address: Option<std::net::Ipv6Addr>,
     restore_hook: Option<String>,
+    guest_thp: Option<String>,
 ) -> RunArgs {
     use crate::cli::args::NetworkMode as CliNetworkMode;
 
@@ -4349,6 +4361,7 @@ fn run_args_from_snapshot_metadata(
         // A cold boot of a captured disk takes no startup snapshot of its own.
         startup_snapshot: false,
         on_restore: restore_hook,
+        guest_thp,
         health_check_timeout: meta.health_check_timeout,
         privileged: false,
         interactive: meta.interactive,
@@ -4511,10 +4524,15 @@ async fn cmd_snapshot_run_disk_only(
         args.ipv6_prefix.as_ref(),
         args.ipv6_address,
         // The caller's hook, the recorded one only for a command line that inherits.
-        restore_hook_for(
+        per_restore_setting(
             args.on_restore.as_deref(),
             args.inherit_recorded_hook,
             meta.restore_hook.as_deref(),
+        ),
+        per_restore_setting(
+            args.guest_thp.as_deref(),
+            args.inherit_recorded_hook,
+            meta.guest_thp.as_deref(),
         ),
     );
 
@@ -4613,11 +4631,17 @@ async fn cmd_snapshot_ls() -> Result<()> {
     Ok(())
 }
 
-/// The hook a restored clone runs: the caller's own, else the snapshot's recorded one
-/// when the caller inherits (a command-line `snapshot run`), else none. `podman run`
-/// restoring its startup snapshot does not inherit: the hook is not in the snapshot
-/// cache key, so the snapshot may carry a hook another run gave.
-pub(crate) fn restore_hook_for(
+/// A per-restore setting (the restore hook, the huge page mode): the caller's own, else
+/// the snapshot's recorded one when the caller inherits (a command-line `snapshot run`),
+/// else none. `podman run` restoring its startup snapshot does not inherit: neither is
+/// in the snapshot cache key, so the snapshot may carry another run's.
+/// The huge page mode a restore document carries: the clone's, or `default` (the
+/// guest kernel's own) when it has none.
+pub(crate) fn restore_thp_mode(guest_thp: &Option<String>) -> String {
+    guest_thp.clone().unwrap_or_else(|| "default".to_string())
+}
+
+pub(crate) fn per_restore_setting(
     given: Option<&str>,
     inherit_recorded: bool,
     recorded: Option<&str>,
@@ -4782,10 +4806,10 @@ mod tests {
     /// runs the caller's hook, resolved the same way as a memory restore, instead of
     /// copying the snapshot's recorded hook over an accepted flag (a Codex finding on
     /// PR 1112). The builder takes the resolved hook; the disk-only path resolves it
-    /// with `restore_hook_for`, pinned at the source because that path boots a VM.
+    /// with `per_restore_setting`, pinned at the source because that path boots a VM.
     ///
     /// RED BEFORE THE FIX: the builder copied `meta.restore_hook` and the disk-only
-    /// path never called `restore_hook_for`.
+    /// path never called `per_restore_setting`.
     #[test]
     fn a_disk_only_clone_runs_the_callers_hook() {
         let source = include_str!("snapshot.rs");
@@ -4796,7 +4820,7 @@ mod tests {
         let end = body.find("\n}\n").expect("the disk-only path ends");
         let body = &body[..end];
         assert!(
-            body.contains("restore_hook_for(") && body.contains("args.on_restore"),
+            body.contains("per_restore_setting(") && body.contains("args.on_restore"),
             "the disk-only path does not resolve the caller's --on-restore"
         );
     }
@@ -4808,16 +4832,16 @@ mod tests {
     /// RED BEFORE THE FIX: the cache-hit path fell back to the recorded hook.
     #[test]
     fn a_cache_hit_without_a_hook_runs_none_and_the_command_line_inherits() {
-        assert_eq!(restore_hook_for(None, false, Some("recorded")), None);
+        assert_eq!(per_restore_setting(None, false, Some("recorded")), None);
         assert_eq!(
-            restore_hook_for(None, true, Some("recorded")).as_deref(),
+            per_restore_setting(None, true, Some("recorded")).as_deref(),
             Some("recorded")
         );
         assert_eq!(
-            restore_hook_for(Some("mine"), false, Some("recorded")).as_deref(),
+            per_restore_setting(Some("mine"), false, Some("recorded")).as_deref(),
             Some("mine")
         );
-        assert_eq!(restore_hook_for(None, true, None), None);
+        assert_eq!(per_restore_setting(None, true, None), None);
     }
 
     use super::*;
@@ -5050,6 +5074,7 @@ mod tests {
                 given,
                 None,
                 None,
+                None,
             )
             .ipv6_prefix
         };
@@ -5083,6 +5108,7 @@ mod tests {
             health_check_url: None,
             health_check_timeout: 5,
             restore_hook: None,
+            guest_thp: None,
             hugepages: false,
             extra_disks: vec![],
             pmem_devices: vec![],
@@ -5127,6 +5153,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(args.kernel_profile.as_deref(), Some("btrfs"));
         assert_eq!(args.image_mode, Some(crate::cli::ImageMode::Overlay));
@@ -5153,6 +5180,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(args2.env.is_empty());
 
@@ -5174,6 +5202,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(args_dns.dns.as_deref(), Some("192.0.2.53"));
 
@@ -5191,6 +5220,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -5227,6 +5257,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -5268,6 +5299,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(
             args.hypervisor,
@@ -5284,6 +5316,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -5327,6 +5360,7 @@ mod tests {
                 1024,
                 balloon,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -5664,6 +5698,7 @@ mod tests {
             non_blocking_output: false,
             on_restore: None,
             inherit_recorded_hook: true,
+            guest_thp: None,
             no_dirty_tracking: false,
             no_swap: false,
             vsock_dir: None,
@@ -5741,6 +5776,7 @@ mod tests {
             non_blocking_output: false,
             on_restore: None,
             inherit_recorded_hook: true,
+            guest_thp: None,
             no_dirty_tracking: false,
             no_swap: false,
             vsock_dir: None,

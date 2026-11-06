@@ -220,6 +220,11 @@ pub struct SnapshotMetadata {
     /// the clone is published; see `--on-restore`.
     #[serde(default)]
     pub restore_hook: Option<String>,
+    /// The guest's transparent huge page mode when the snapshot was taken
+    /// (`--guest-thp`); none is the kernel's own. Not part of the cache key: a
+    /// restore applies its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_thp: Option<String>,
     /// Whether VM uses 2MB hugepage-backed memory
     #[serde(default)]
     pub hugepages: bool,
@@ -848,6 +853,7 @@ mod tests {
                 health_check_url: None,
                 health_check_timeout: 5,
                 restore_hook: None,
+                guest_thp: None,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -1053,6 +1059,7 @@ mod tests {
                 health_check_url: None,
                 health_check_timeout: 5,
                 restore_hook: None,
+                guest_thp: None,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -1141,6 +1148,7 @@ mod tests {
                     health_check_url: None,
                     health_check_timeout: 5,
                     restore_hook: None,
+                    guest_thp: None,
                     hugepages: false,
                     extra_disks: vec![],
                     pmem_devices: vec![],
@@ -1216,6 +1224,7 @@ mod tests {
                 health_check_url: None,
                 health_check_timeout: 5,
                 restore_hook: None,
+                guest_thp: None,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -1416,6 +1425,7 @@ mod tests {
                 health_check_url: None,
                 health_check_timeout: 5,
                 restore_hook: None,
+                guest_thp: None,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -1572,6 +1582,7 @@ mod tests {
             health_check_url: None,
             health_check_timeout: 5,
             restore_hook: None,
+            guest_thp: None,
             hugepages: false,
             extra_disks: vec![],
             pmem_devices: vec![],

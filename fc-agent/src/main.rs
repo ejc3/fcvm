@@ -17,6 +17,7 @@ mod proxy;
 mod restore;
 mod snapshot_network;
 mod system;
+mod thp;
 mod tty;
 mod types;
 mod vitals;

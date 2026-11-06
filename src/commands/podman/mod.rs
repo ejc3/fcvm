@@ -909,9 +909,11 @@ fn snapshot_restore_args(
         hugepages: Some(args.hugepages),
         non_blocking_output: args.non_blocking_output,
         on_restore: args.on_restore.clone(),
-        // This run's own flag or nothing: the snapshot's recorded hook may be another
-        // run's (the hook is not in the cache key).
+        // This run's own flags or nothing: the snapshot's recorded hook and huge page
+        // mode may be another run's (neither is in the cache key). No mode is the
+        // guest kernel's own, which the restore asks for by name.
         inherit_recorded_hook: false,
+        guest_thp: args.guest_thp.clone(),
     }
 }
 
@@ -1778,6 +1780,7 @@ async fn prepare_vm_for_lifecycle(
     vm_state.config.health_check_url = args.health_check.clone();
     vm_state.config.health_check_timeout = args.health_check_timeout;
     vm_state.config.restore_hook = args.on_restore.clone();
+    vm_state.config.guest_thp = args.guest_thp.clone();
     vm_state.config.hugepages = args.hugepages;
     vm_state.config.balloon_mib = args.balloon;
     vm_state.config.balloon_free_page_reporting = args.free_page_reporting;
@@ -3472,6 +3475,7 @@ mod tests {
             startup_snapshot: false,
             health_check_timeout: 5,
             on_restore: None,
+            guest_thp: None,
             privileged: false,
             interactive: false,
             tty: false,
@@ -3675,6 +3679,37 @@ mod tests {
         args.network = NetworkMode::Rootless;
         let restore = snapshot_restore_args(&args, "key", None, (None, None));
         assert_eq!(restore.ipv6_prefix, None);
+    }
+
+    /// A cache hit restores in this run's huge page mode and never inherits the one the
+    /// snapshot recorded, which may be another run's: the mode is not in the cache key.
+    #[test]
+    fn a_cache_hit_restores_in_the_runs_own_huge_page_mode() {
+        let mut args = test_args();
+        let restore = snapshot_restore_args(&args, "key", None, (None, None));
+        assert_eq!(restore.guest_thp, None);
+        assert!(!restore.inherit_recorded_hook);
+        args.guest_thp = Some("never".to_string());
+        let restore = snapshot_restore_args(&args, "key", None, (None, None));
+        assert_eq!(restore.guest_thp.as_deref(), Some("never"));
+        assert_eq!(
+            crate::commands::snapshot::per_restore_setting(
+                restore.guest_thp.as_deref(),
+                restore.inherit_recorded_hook,
+                Some("madvise"),
+            )
+            .as_deref(),
+            Some("never")
+        );
+        assert_eq!(
+            crate::commands::snapshot::per_restore_setting(None, false, Some("never")),
+            None,
+            "a run without the flag does not inherit the snapshot's mode"
+        );
+        assert_eq!(
+            crate::commands::snapshot::restore_thp_mode(&None),
+            "default"
+        );
     }
 
     /// #1183: a launch records its runtime directory with its owner before anything in

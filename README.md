@@ -488,6 +488,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 --startup-snapshot    Snapshot the running container at its first Healthy (off by default)
 --cpu <N> --mem <MB>  CPU count and memory
 --hugepages           Use 2MB hugepages (pre-allocate pool first)
+--guest-thp <MODE>    Guest transparent huge pages: always, madvise or never (default: the guest kernel's); applied at boot and at every restore, not in the snapshot key, inherited by `snapshot run`
 --balloon <MIB>       Balloon device target; runs that differ only in the target share the pre-start snapshot
 --free-page-reporting Guest reports freed memory and the host takes it back (needs --balloon, Firecracker only, not with --hugepages; the run fails if the guest refuses it; in the snapshot key)
 --privileged          Allow device access and mknod in container
