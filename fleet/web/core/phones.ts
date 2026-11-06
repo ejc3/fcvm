@@ -16,7 +16,7 @@ import { streamBitrate } from "./bandwidth.ts";
 import * as fmt from "./format.ts";
 import { frameSocketUrl, mirrorSocketUrl, streamUrl } from "./net.ts";
 import { megabytes, mbits } from "./meter.ts";
-import { sameViewer, type PhoneTile, type Phones, type Tile } from "./protocol.ts";
+import { sameViewer, type Admission, type PhoneTile, type Phones, type Tile } from "./protocol.ts";
 import { serverNow } from "./clock.ts";
 import type { ClientState, Notice } from "./store.ts";
 import {
@@ -334,9 +334,12 @@ export function phonesPlan(inp: PhonesPlanInput): DrawPlan {
   const family = s.net.family;
   // phone streams take the direct seat's token as the wall's do (the streamer checks it)
   const admit = s.admission?.direct?.value ?? null;
+  // a viewer who came when every seat was held has no token, and the streamer refuses it
+  const seated = s.admission?.locked !== true;
   let bps = 0;
   const direct: DrawSource[] = [];
   for (const t of phones.tiles) {
+    if (!seated) break;
     const box = boxOf.get(t.id) ?? null;
     const base = streamUrl(t, family);
     if (box === null || base === null || !isLive(t) || t.id === inp.noVideo) continue;
@@ -686,6 +689,17 @@ const BLANK_PLAN = (s: ClientState, dpr: number): DrawPlan => ({
   atT: 0,
 });
 
+/**
+ * The banner of a viewer who came when every direct seat was held. The wall shows such a viewer
+ * the broadcast; phones have none, and their streams admit only a direct seat's token.
+ */
+function seatsFull(a: Admission): string {
+  const why = a.reason ?? "Direct streams are full.";
+  return a.seat_free
+    ? `${why} A direct seat is free now: reload the page to take it and see the phones.`
+    : `${why} Phones stream only to viewers with a direct seat, so they stay dark on this page until one is free.`;
+}
+
 export function phonesView(inp: PhonesInput): PhonesView {
   const s = inp.state;
   const phones = s.accepted?.phones ?? null;
@@ -703,6 +717,8 @@ export function phonesView(inp: PhonesInput): PhonesView {
   const zoom = { label: zoomOut ? "Zoom in" : "Zoom out", out: zoomOut, disabled: !online || phones === null };
   const banner = !inp.canDecode
     ? "This browser cannot decode H.264 with WebCodecs, so the picture stays still. Chrome, Edge and Safari 16.4 or later can."
+    : s.admission?.locked === true
+      ? seatsFull(s.admission)
     : s.accepted !== null && !online
       ? "The coordinator is offline. The picture still streams straight from the phones; the controls are paused until it is back."
       : null;

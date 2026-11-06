@@ -300,6 +300,21 @@ describe("the draw plan", () => {
     }
   });
 
+  it("a viewer who came when every seat was held is told so, and opens no phone stream the streamer would refuse", () => {
+    const st = stateWith(phonesOf(2));
+    const late = (seatFree: boolean) =>
+      ({
+        ...st,
+        admission: { seat: null, locked: true, reason: "Direct streams are full.", direct: null, broadcast: null, seat_free: seatFree, capacity: 500 },
+      }) as ClientState;
+    const v = phonesView(input(late(false)));
+    expect(v.plan.direct).toEqual([]);
+    expect(v.banner).toBe("Direct streams are full. Phones stream only to viewers with a direct seat, so they stay dark on this page until one is free.");
+    expect(phonesView(input(late(true))).banner).toBe("Direct streams are full. A direct seat is free now: reload the page to take it and see the phones.");
+    // a seated viewer sees no such banner
+    expect(phonesView(input(st)).banner).toBeNull();
+  });
+
   it("waits for the address family, as the wall does", () => {
     let s = reduce(initialState(), { type: "socket", status: "open", at: EPOCH });
     s = reduce(s, { type: "message", text: snapshotText(1, { ...fleet(), phones: phonesOf(2) }), at: EPOCH });
