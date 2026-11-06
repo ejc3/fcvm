@@ -106,21 +106,99 @@ impl PortMapping {
         })
     }
 
-    /// Refuse two mappings that claim the same host address and port for one protocol.
+    /// The address a mapping's host listener binds, as far as overlap is concerned.
+    fn listen_address(&self) -> ListenAddress<'_> {
+        use std::net::IpAddr;
+        match self.host_ip.as_deref() {
+            None => ListenAddress::VmLoopback,
+            Some(text) => match text.parse::<IpAddr>() {
+                Ok(IpAddr::V4(addr)) => ListenAddress::V4(addr),
+                Ok(IpAddr::V6(addr)) => match addr.to_ipv4_mapped() {
+                    Some(addr) => ListenAddress::V4(addr),
+                    None => ListenAddress::V6(addr),
+                },
+                Err(_) => ListenAddress::Unparsed(text),
+            },
+        }
+    }
+
+    /// Why the host listeners of `a` and `b` cannot both be bound under `mode`, or None
+    /// when they can.
+    ///
+    /// Bridged networking listens on the VM's veth address whatever HOSTIP says, so one
+    /// host port and protocol is one socket there. Rootless (pasta) and routed
+    /// networking listen on HOSTIP, or on the VM's own 127.x.y.z when there is none: a
+    /// specific IPv4 address that no other VM holds. A wildcard holds every address of
+    /// its family. Routed clears IPV6_V6ONLY on its listeners (`tcp_proxy.rs`), so its
+    /// `[::]` also holds the IPv4 port; pasta's IPv6 listeners are v6only. An
+    /// IPv4-mapped IPv6 address is its IPv4 address.
+    fn collision(a: &Self, b: &Self, mode: crate::firecracker::FcNetworkMode) -> Option<String> {
+        use crate::firecracker::FcNetworkMode;
+        use ListenAddress::{VmLoopback, V4, V6};
+        if a.host_port != b.host_port || a.proto != b.proto {
+            return None;
+        }
+        if mode == FcNetworkMode::Bridged {
+            return Some(
+                "claim the same host port: bridged networking listens on the VM's veth \
+                 address whatever HOSTIP says, so they would be one address and port. Use \
+                 different host ports."
+                    .to_string(),
+            );
+        }
+        let (a_addr, b_addr) = (a.listen_address(), b.listen_address());
+        if a_addr == b_addr {
+            return Some("claim the same host address and port".to_string());
+        }
+        let ipv4_wildcard = |addr: &ListenAddress| *addr == V4(std::net::Ipv4Addr::UNSPECIFIED);
+        let ipv6_wildcard = |addr: &ListenAddress| *addr == V6(std::net::Ipv6Addr::UNSPECIFIED);
+        let ipv4 = |addr: &ListenAddress| matches!(addr, V4(_) | VmLoopback);
+        let ipv6 = |addr: &ListenAddress| matches!(addr, V6(_));
+        for (wild, other) in [(a, b), (b, a)] {
+            let (wild_addr, other_addr) = (wild.listen_address(), other.listen_address());
+            if ipv4_wildcard(&wild_addr) && ipv4(&other_addr) {
+                return Some(format!(
+                    "cannot both be bound: {wild} listens on every IPv4 address of the \
+                     host, {other}'s included"
+                ));
+            }
+            if ipv6_wildcard(&wild_addr) && ipv6(&other_addr) {
+                return Some(format!(
+                    "cannot both be bound: {wild} listens on every IPv6 address of the \
+                     host, {other}'s included"
+                ));
+            }
+            if ipv6_wildcard(&wild_addr) && ipv4(&other_addr) && mode == FcNetworkMode::Routed {
+                return Some(format!(
+                    "cannot both be bound: routed networking's {wild} listener also takes \
+                     the IPv4 port, {other}'s included"
+                ));
+            }
+        }
+        None
+    }
+
+    /// Whether the host listeners of `a` and `b` can both be bound under `mode`.
+    pub fn can_both_bind(a: &Self, b: &Self, mode: crate::firecracker::FcNetworkMode) -> bool {
+        Self::collision(a, b, mode).is_none()
+    }
+
+    /// Refuse the first two mappings, in the order given, whose host listeners cannot
+    /// both be bound under `mode` ([`Self::can_both_bind`]).
     ///
     /// Left to network setup, routed and rootless networking fail the second bind after
     /// the VM's network exists, and bridged networking installs both DNAT rules and
-    /// delivers only the first.
-    pub fn require_distinct_host_sockets(mappings: &[Self]) -> anyhow::Result<()> {
-        let same_socket = |earlier: &Self, mapping: &Self| {
-            earlier.host_ip == mapping.host_ip
-                && earlier.host_port == mapping.host_port
-                && earlier.proto == mapping.proto
-        };
-        if let Some((earlier, mapping)) = Self::first_on_one_socket(mappings, same_socket) {
-            anyhow::bail!(
-                "port mappings {earlier} and {mapping} claim the same host address and port"
-            );
+    /// delivers only the first. `podman run` and `snapshot run` call this on their
+    /// parsed mappings before anything of the VM exists, and bridged setup again on
+    /// the mappings it is given.
+    pub fn require_bindable(
+        mappings: &[Self],
+        mode: crate::firecracker::FcNetworkMode,
+    ) -> anyhow::Result<()> {
+        let collide = |earlier: &Self, mapping: &Self| !Self::can_both_bind(earlier, mapping, mode);
+        if let Some((earlier, mapping)) = Self::first_on_one_socket(mappings, collide) {
+            let reason = Self::collision(earlier, mapping, mode).unwrap_or_default();
+            anyhow::bail!("port mappings {earlier} and {mapping} {reason}");
         }
         Ok(())
     }
@@ -190,6 +268,17 @@ impl PortMapping {
             proto,
         })
     }
+}
+
+/// The address a mapping's host listener binds, as overlap between listeners sees it.
+#[derive(Debug, PartialEq, Eq)]
+enum ListenAddress<'a> {
+    /// No HOSTIP: the VM's own 127.x.y.z, a specific IPv4 address no other VM holds.
+    VmLoopback,
+    V4(std::net::Ipv4Addr),
+    V6(std::net::Ipv6Addr),
+    /// A HOSTIP that is not an address, which `parse` never produces. Equal only to itself.
+    Unparsed(&'a str),
 }
 
 /// Generate a random MAC address for the guest
@@ -279,41 +368,142 @@ mod tests {
         }
     }
 
-    /// One host address and port, for one protocol, goes to one guest port.
+    /// Which pairs of mappings on one host port and protocol collide, per network mode
+    /// (#1039). Bridged networking listens on the VM's veth address whatever HOSTIP
+    /// says, so every such pair collides there. Rootless (pasta) and routed networking
+    /// listen on HOSTIP, or on the VM's own 127.x.y.z without one; a wildcard holds
+    /// every address of its family, routed's `[::]` also holds the IPv4 port
+    /// (IPV6_V6ONLY cleared) and pasta's does not. An IPv4-mapped IPv6 address is its
+    /// IPv4 address.
     #[test]
-    fn two_mappings_cannot_claim_one_host_socket() {
-        let mappings = |specs: &[&str]| -> Vec<PortMapping> {
-            specs
-                .iter()
-                .map(|spec| PortMapping::parse(spec).unwrap())
-                .collect()
-        };
-        for specs in [
-            &["8080:80", "8443:443", "8080:443"][..],
-            &["[::]:80:80", "[::]:80:8080"][..],
-            &["127.0.0.1:53:53/udp", "127.0.0.1:53:5353/udp"][..],
-        ] {
-            let error = PortMapping::require_distinct_host_sockets(&mappings(specs))
-                .expect_err("one host socket is claimed twice")
-                .to_string();
-            let (first, last) = (
-                mappings(specs)[0].to_string(),
-                mappings(specs)[specs.len() - 1].to_string(),
+    fn bindable_matrix_covers_every_pair_on_one_port_in_every_mode() {
+        use crate::firecracker::FcNetworkMode::{Bridged, Rootless, Routed};
+        // (a, b, collide under bridged, rootless, routed)
+        let cases: &[(&str, &str, [bool; 3])] = &[
+            // One address twice.
+            ("8080:80", "8080:443", [true, true, true]),
+            (
+                "127.0.0.1:8080:80",
+                "127.0.0.1:8080:443",
+                [true, true, true],
+            ),
+            ("[::]:8080:80", "[::]:8080:443", [true, true, true]),
+            (
+                "[::1]:8080:80",
+                "[0:0:0:0:0:0:0:1]:8080:443",
+                [true, true, true],
+            ),
+            // 0.0.0.0 and any IPv4 address, or no HOSTIP.
+            ("0.0.0.0:8080:80", "127.0.0.1:8080:443", [true, true, true]),
+            ("0.0.0.0:8080:80", "192.0.2.1:8080:443", [true, true, true]),
+            ("0.0.0.0:8080:80", "8080:443", [true, true, true]),
+            // [::] and any IPv6 address.
+            ("[::]:8080:80", "[::1]:8080:443", [true, true, true]),
+            ("[::]:8080:80", "[2001:db8::1]:8080:443", [true, true, true]),
+            // [::] and any IPv4 address, or no HOSTIP: routed's [::] is dual-stack.
+            ("[::]:8080:80", "127.0.0.1:8080:443", [true, false, true]),
+            ("[::]:8080:80", "0.0.0.0:8080:443", [true, false, true]),
+            ("[::]:8080:80", "8080:443", [true, false, true]),
+            ("[::]:53:53/udp", "0.0.0.0:53:53/udp", [true, false, true]),
+            // IPv4-mapped IPv6 addresses are their IPv4 address.
+            (
+                "[::ffff:127.0.0.1]:8080:80",
+                "127.0.0.1:8080:443",
+                [true, true, true],
+            ),
+            (
+                "[::ffff:0.0.0.0]:8080:80",
+                "192.0.2.1:8080:443",
+                [true, true, true],
+            ),
+            (
+                "[::ffff:192.0.2.1]:8080:80",
+                "[::]:8080:443",
+                [true, false, true],
+            ),
+            (
+                "[::ffff:192.0.2.1]:8080:80",
+                "[::ffff:192.0.2.2]:8080:443",
+                [true, false, false],
+            ),
+            // Two specific addresses, or a specific address and the VM's own loopback.
+            (
+                "127.0.0.1:8080:80",
+                "127.0.0.2:8080:443",
+                [true, false, false],
+            ),
+            ("127.0.0.1:8080:80", "8080:443", [true, false, false]),
+            ("[::1]:8080:80", "127.0.0.1:8080:443", [true, false, false]),
+            ("[::1]:8080:80", "0.0.0.0:8080:443", [true, false, false]),
+            ("[::1]:8080:80", "8080:443", [true, false, false]),
+            (
+                "[::1]:8080:80",
+                "[2001:db8::1]:8080:443",
+                [true, false, false],
+            ),
+            // Another host port or another protocol is another socket everywhere.
+            ("0.0.0.0:8080:80", "[::]:8081:80", [false, false, false]),
+            ("0.0.0.0:8080:80", "8080:80/udp", [false, false, false]),
+            ("[::]:8080:80", "8080:80/udp", [false, false, false]),
+            ("8080:80", "8081:80", [false, false, false]),
+        ];
+        let mut wrong = Vec::new();
+        for &(a, b, collide) in cases {
+            let (a, b) = (
+                PortMapping::parse(a).unwrap(),
+                PortMapping::parse(b).unwrap(),
             );
-            assert!(
-                error.contains(&first) && error.contains(&last),
-                "{specs:?}: {error}"
-            );
+            for (mode, collide) in [Bridged, Rootless, Routed].into_iter().zip(collide) {
+                for (first, second) in [(&a, &b), (&b, &a)] {
+                    if PortMapping::can_both_bind(first, second, mode) == collide {
+                        wrong.push(format!(
+                            "{mode:?}: {first} then {second} must {}",
+                            if collide { "collide" } else { "both bind" }
+                        ));
+                    }
+                    let checked =
+                        PortMapping::require_bindable(&[first.clone(), second.clone()], mode);
+                    match (collide, checked) {
+                        (true, Err(error)) => {
+                            let error = error.to_string();
+                            if !(error.contains(&first.to_string())
+                                && error.contains(&second.to_string()))
+                            {
+                                wrong
+                                    .push(format!("{mode:?}: refusal does not name both: {error}"));
+                            }
+                        }
+                        (false, Ok(())) => {}
+                        (true, Ok(())) => {
+                            wrong.push(format!("{mode:?}: [{first}, {second}] not refused"))
+                        }
+                        (false, Err(error)) => {
+                            wrong.push(format!("{mode:?}: [{first}, {second}] refused: {error}"))
+                        }
+                    }
+                }
+            }
         }
-        // Another protocol, another port or another address is another socket.
-        for specs in [
-            &["8080:80", "8080:80/udp"][..],
-            &["8080:80", "8081:80"][..],
-            &["127.0.0.1:8080:80", "8080:80", "[::1]:8080:80"][..],
-        ] {
-            PortMapping::require_distinct_host_sockets(&mappings(specs))
-                .unwrap_or_else(|e| panic!("{specs:?}: {e}"));
-        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// The refusal names the first colliding pair in the order given, and a list of
+    /// mappings that collide nowhere passes.
+    #[test]
+    fn require_bindable_names_the_first_colliding_pair() {
+        use crate::firecracker::FcNetworkMode::Routed;
+        let mappings: Vec<PortMapping> = ["8443:443", "0.0.0.0:8080:80", "[::]:9090:90", "8080:81"]
+            .iter()
+            .map(|spec| PortMapping::parse(spec).unwrap())
+            .collect();
+        let error = PortMapping::require_bindable(&mappings, Routed)
+            .expect_err("0.0.0.0 holds the VM's loopback address")
+            .to_string();
+        assert!(
+            error.contains("port mappings 0.0.0.0:8080:80/tcp and 8080:81/tcp"),
+            "{error}"
+        );
+        PortMapping::require_bindable(&mappings[..3], Routed).unwrap();
     }
 
     /// Every rejection names the spec it rejected, so one bad entry in a

@@ -136,28 +136,6 @@ fn route_get_names_dev(route_get_output: &str, veth_name: &str) -> bool {
         .any(|w| w[0] == "dev" && w[1] == veth_name)
 }
 
-/// Refuse two mappings that bridged forwarding would make one socket.
-///
-/// `setup` forwards every published port from the host address of the VM's veth,
-/// whatever HOSTIP a mapping names (step 8). Two mappings with one host port and
-/// protocol are then two DNAT rules for one destination: the first takes all the
-/// traffic, and the second mapping's guest port is never reached. The check on the
-/// mappings as given (`PortMapping::require_distinct_host_sockets`) compares HOSTIP too,
-/// so it lets through two that differ only there.
-fn require_distinct_host_ports(mappings: &[PortMapping]) -> Result<()> {
-    let same_port = |earlier: &PortMapping, mapping: &PortMapping| {
-        earlier.host_port == mapping.host_port && earlier.proto == mapping.proto
-    };
-    if let Some((earlier, mapping)) = PortMapping::first_on_one_socket(mappings, same_port) {
-        anyhow::bail!(
-            "port mappings {earlier} and {mapping} claim the same host port: bridged \
-             networking listens on the VM's veth address whatever HOSTIP says, so they \
-             would be one address and port. Use different host ports."
-        );
-    }
-    Ok(())
-}
-
 /// A host proxy variable, lowercase first.
 fn env_proxy(lower: &str, upper: &str) -> Option<String> {
     [lower, upper]
@@ -352,7 +330,10 @@ impl NetworkManager for BridgedNetwork {
         // IPv6 HOSTIP instead of refusing it, and make one socket of two mappings
         // that share a host port.
         portmap::require_ipv4_host_addresses(&self.port_mappings)?;
-        require_distinct_host_ports(&self.port_mappings)?;
+        PortMapping::require_bindable(
+            &self.port_mappings,
+            crate::firecracker::FcNetworkMode::Bridged,
+        )?;
 
         info!(vm_id = %self.vm_id, is_clone = %self.is_clone, "setting up network namespace");
 
@@ -1106,8 +1087,11 @@ mod tests {
             &["8080:80", "8080:80/udp"][..],
             &["127.0.0.1:53:53", "127.0.0.2:53:53/udp"][..],
         ] {
-            require_distinct_host_ports(&mappings(specs))
-                .unwrap_or_else(|e| panic!("{specs:?}: {e}"));
+            PortMapping::require_bindable(
+                &mappings(specs),
+                crate::firecracker::FcNetworkMode::Bridged,
+            )
+            .unwrap_or_else(|e| panic!("{specs:?}: {e}"));
         }
     }
 
