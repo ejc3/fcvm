@@ -179,39 +179,60 @@ room_for() {
   return 1
 }
 # Admission is one `up` at a time across every machine: a lock object in the asset bucket,
-# created only if absent (S3 conditional writes are strongly consistent), and a ledger of the
-# boxes admitted in the last ADMIT_LEDGER_S seconds, counted until describe-instances (which
-# is eventually consistent) lists them. A lock older than ADMIT_STALE_S is a holder that died.
+# created only if absent and deleted only by its own ETag (S3 conditional writes are strongly
+# consistent), and a ledger of the boxes admitted, each counted until describe-instances
+# (eventually consistent) lists it, or for ADMIT_LEDGER_S. A lock older than ADMIT_STALE_S is
+# a holder that died; the holder checks the lock is still its own before it launches.
 ADMIT_LOCK=gpubox/admission.lock
 ADMIT_LEDGER=gpubox/admitted
-ADMIT_LEDGER_S=600
+ADMIT_LEDGER_S=3600
 ADMIT_STALE_S=300
+ADMIT_ETAG=""
 S3A() { aws --region "$S3REGION" "$@"; }
 admit_lock() {
-  local deadline=$(( $(now) + ${GPUBOX_ADMIT_WAIT_S:-600} )) body age
-  body=$(mktemp); echo "$(now) ${owner:-agent}" > "$body"
-  while ! S3A s3api put-object --bucket "$BUCKET" --key "$ADMIT_LOCK" --body "$body" --if-none-match '*' >/dev/null 2>"$body.err"; do
-    grep -q -E 'PreconditionFailed|ConditionalRequestConflict' "$body.err" || { cat "$body.err" >&2; rm -f "$body" "$body.err"; return 1; }
-    age=$(S3A s3 cp --only-show-errors "s3://$BUCKET/$ADMIT_LOCK" - 2>/dev/null | awk -v t="$(now)" '{print t - $1}')
-    if [ -n "$age" ] && [ "$age" -gt "$ADMIT_STALE_S" ]; then
-      say "breaking an admission lock held ${age} s"; S3A s3 rm --only-show-errors "s3://$BUCKET/$ADMIT_LOCK" || true
+  local deadline=$(( $(now) + ${GPUBOX_ADMIT_WAIT_S:-600} )) f held etag at
+  f=$(mktemp)
+  while :; do
+    echo "$(now) ${owner:-agent}" > "$f"
+    if ADMIT_ETAG=$(S3A s3api put-object --bucket "$BUCKET" --key "$ADMIT_LOCK" --body "$f" --if-none-match '*' \
+        --query ETag --output text 2>"$f.err"); then
+      rm -f "$f" "$f.err"; return 0
     fi
-    [ "$(now)" -lt "$deadline" ] || { rm -f "$body" "$body.err"; say "another gpubox up held the admission lock"; return 1; }
+    grep -q -E 'PreconditionFailed|ConditionalRequestConflict' "$f.err" || { cat "$f.err" >&2; rm -f "$f" "$f.err"; return 1; }
+    if held=$(S3A s3api get-object --bucket "$BUCKET" --key "$ADMIT_LOCK" "$f.held" --query ETag --output text 2>"$f.err"); then
+      etag=$held; at=$(awk 'NR == 1 {print $1}' "$f.held")
+      if [[ "$at" =~ ^[0-9]+$ ]] && [ $(( $(now) - at )) -gt "$ADMIT_STALE_S" ]; then
+        say "breaking an admission lock held $(( $(now) - at )) s"
+        # Only that lock: a contender that broke it first and took a new one keeps its own.
+        S3A s3api delete-object --bucket "$BUCKET" --key "$ADMIT_LOCK" --if-match "$etag" >/dev/null 2>&1 && continue
+      fi
+    elif ! grep -q NoSuchKey "$f.err"; then
+      cat "$f.err" >&2; rm -f "$f" "$f.err" "$f.held"; return 1
+    fi
+    [ "$(now)" -lt "$deadline" ] || { rm -f "$f" "$f.err" "$f.held"; say "another gpubox up held the admission lock"; return 1; }
     sleep 2
   done
-  rm -f "$body" "$body.err"
 }
-admit_unlock() { S3A s3 rm --only-show-errors "s3://$BUCKET/$ADMIT_LOCK" || true; }
+# Whether the lock is still the one this `up` took (not broken as stale meanwhile).
+admit_held() {
+  local e
+  e=$(S3A s3api head-object --bucket "$BUCKET" --key "$ADMIT_LOCK" --query ETag --output text 2>/dev/null) || return 1
+  [ -n "$ADMIT_ETAG" ] && [ "$e" = "$ADMIT_ETAG" ]
+}
+admit_unlock() {
+  [ -z "$ADMIT_ETAG" ] || S3A s3api delete-object --bucket "$BUCKET" --key "$ADMIT_LOCK" --if-match "$ADMIT_ETAG" >/dev/null 2>&1 || true
+  ADMIT_ETAG=""
+}
 # The ledger's entries of the last ADMIT_LEDGER_S seconds: "<unix time> <instance id> <market>".
 # Fails when the ledger exists and cannot be read.
 ledger_recent() {
-  local t f rc=0; t=$(now); f=$(mktemp)
+  local t f; t=$(now); f=$(mktemp)
   if ! S3A s3api get-object --bucket "$BUCKET" --key "$ADMIT_LEDGER" "$f" >/dev/null 2>"$f.err"; then
-    if grep -q NoSuchKey "$f.err"; then : > "$f"; else cat "$f.err" >&2; rc=1; fi
+    grep -q NoSuchKey "$f.err" || { cat "$f.err" >&2; rm -f "$f" "$f.err"; return 1; }
+    : > "$f"
   fi
-  [ "$rc" = 0 ] && awk -v t="$t" -v keep=$ADMIT_LEDGER_S 'NF == 3 && t - $1 <= keep' "$f"
+  awk -v t="$t" -v keep=$ADMIT_LEDGER_S 'NF == 3 && t - $1 <= keep' "$f" || { rm -f "$f" "$f.err"; return 1; }
   rm -f "$f" "$f.err"
-  return "$rc"
 }
 ledger_add() { # id market
   local recent
@@ -243,6 +264,7 @@ up)
     for az in $AZS; do
       subnet=$(A ec2 describe-subnets --filters Name=tag:Name,Values="fcvm-fleet-${REGION}${az}" --query 'Subnets[0].SubnetId' --output text)
       mo=(); [ "$market" = spot ] && mo=(--instance-market-options 'MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}')
+      admit_held || die "the admission lock was broken while this up held it; nothing launched"
       if id=$(A ec2 run-instances --image-id "$ami" --instance-type $TYPE "${mo[@]}" \
           --instance-initiated-shutdown-behavior terminate \
           --network-interfaces "DeviceIndex=0,SubnetId=$subnet,Groups=$sg,AssociatePublicIpAddress=true,Ipv6PrefixCount=1,DeleteOnTermination=true" \
