@@ -1,0 +1,108 @@
+From b6eb05d462f034cf4d697897935eb76d83153b5d Mon Sep 17 00:00:00 2001
+From: ejc3 <ejc3@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 00:54:19 +0000
+Subject: [PATCH] fuse: trust the server's size and times when no file is open
+ for writing
+
+With the writeback cache, fuse_get_cache_mask() keeps the kernel's own
+size, mtime and ctime of a regular file for as long as the inode lives,
+because buffered writes may not have reached the server yet. A file
+another client changes on the server (for fcvm, the host changing a
+file under a read-write --map) is then read cut off at the old size, in
+a running guest and in a clone restored from a snapshot.
+
+Only a file open for writing can hold such writes: fuse_release()
+writes back the dirty pages and the times before the file leaves
+fi->write_files. So trust the cached values only while write_files is
+not empty, and bump attr_version when the last writer leaves it, so
+that a reply to a request sent before the last writes reached the
+server is dropped.
+
+With no writer, a changed size invalidates the page cache instead of
+truncating it: a writer that opens once fi->lock is dropped can dirty
+pages beyond the new size before the truncate would run, and
+invalidate_inode_pages2() writes those back where truncate_pagecache()
+would drop them.
+---
+ fs/fuse/file.c  | 13 ++++++++++++-
+ fs/fuse/inode.c | 28 ++++++++++++++++++++++++++--
+ 2 files changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index c581cd1df..c457710d6 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -313,7 +313,18 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
+ 	/* Inode is NULL on error path of fuse_create_open() */
+ 	if (likely(fi)) {
+ 		spin_lock(&fi->lock);
+-		list_del(&ff->write_entry);
++		if (!list_empty(&ff->write_entry)) {
++			list_del_init(&ff->write_entry);
++			/*
++			 * The last writer is gone and its writes are on the
++			 * server: from now on fuse_get_cache_mask() takes the
++			 * server's size and times, but not from a reply to a
++			 * request sent before this point.
++			 */
++			if (list_empty(&fi->write_files))
++				fi->attr_version =
++					atomic64_inc_return(&fc->attr_version);
++		}
+ 		spin_unlock(&fi->lock);
+ 	}
+ 	spin_lock(&fc->lock);
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+index e9ed693fc..cfa061152 100644
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -318,10 +318,24 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
+ u32 fuse_get_cache_mask(struct inode *inode)
+ {
+ 	struct fuse_conn *fc = get_fuse_conn(inode);
++	struct fuse_inode *fi = get_fuse_inode(inode);
+ 
+ 	if (!fc->writeback_cache || !S_ISREG(inode->i_mode))
+ 		return 0;
+ 
++	/*
++	 * Only a file open for writing can hold writes the server has not
++	 * seen: the last release writes back the dirty pages and the times
++	 * before the file leaves write_files (fuse_release()), and bumps
++	 * attr_version so that a reply to a request sent before that is
++	 * dropped.  With no writer, the server's size and times are the
++	 * file's, and another client may have changed them.  The caller that
++	 * applies attributes holds fi->lock, which fuse_link_write_file()
++	 * takes too.
++	 */
++	if (list_empty(&fi->write_files))
++		return 0;
++
+ 	return STATX_MTIME | STATX_CTIME | STATX_SIZE;
+ }
+ 
+@@ -378,9 +392,19 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
+ 		bool inval = false;
+ 
+ 		if (oldsize != attr->size) {
+-			truncate_pagecache(inode, attr->size);
+-			if (!fc->explicit_inval_data)
++			/*
++			 * With the writeback cache, a writer may open the file
++			 * once fi->lock is dropped above and dirty pages beyond
++			 * the new size before this runs.  Truncating would drop
++			 * them; invalidating writes them back first.
++			 */
++			if (fc->writeback_cache) {
+ 				inval = true;
++			} else {
++				truncate_pagecache(inode, attr->size);
++				if (!fc->explicit_inval_data)
++					inval = true;
++			}
+ 		} else if (fc->auto_inval_data) {
+ 			struct timespec64 new_mtime = {
+ 				.tv_sec = attr->mtime,
+-- 
+2.43.0
+

@@ -92,7 +92,7 @@ frees its name, SIGKILL included, so `exec --name X` always finds at most one VM
 ./fcvm ls --json
 ```
 
-A `--map` with `:ro` is mounted read-only in the guest, for the guest OS and the container alike, and follows the host: a file the host rewrites or replaces shows its new size, mtime and content in the guest about a second later, in a running VM and in a clone restored from a snapshot. A map without `:ro` is read-write, and the guest keeps the size and mtime of the files it has cached. [FUSE Volume Cache Coherency](DESIGN.md#fuse-volume-cache-coherency) says what the host may change under each.
+A `--map` with `:ro` is mounted read-only in the guest, for the guest OS and the container alike, and follows the host: a file the host rewrites or replaces shows its new size, mtime and content in the guest about a second later, in a running VM and in a clone restored from a snapshot. A map without `:ro` is read-write and follows the host the same way for every file no guest process has open for writing; a file a guest process has open for writing keeps the guest's own size and mtime until it is closed. [FUSE Volume Cache Coherency](DESIGN.md#fuse-volume-cache-coherency) says what the host may change under each.
 
 ---
 
@@ -536,7 +536,7 @@ Run `fcvm --help` or `fcvm <command> --help` for full options.
 |----------|---------|-------------|
 | `FCVM_DATA_DIR` | `/mnt/fcvm-btrfs` | Base directory for all data |
 | `FCVM_NO_SNAPSHOT` | unset | `1` to disable snapshot creation (same as `--no-snapshot`) |
-| `FCVM_NO_WRITEBACK_CACHE` | unset | `1` to mount read-write `--map` volumes without the FUSE writeback cache, so the guest takes a file's size and mtime from the host. Read-only maps never use that cache, and a run with no read-write map is the same run with or without it |
+| `FCVM_NO_WRITEBACK_CACHE` | unset | `1` to mount read-write `--map` volumes without the FUSE writeback cache, so every write goes to the host as it is made and the guest takes a file's size and mtime from the host even while a guest process has it open for writing. Read-only maps never use that cache, and a run with no read-write map is the same run with or without it |
 | `FCVM_SNAPSHOT_CONCURRENCY` | `10` | Max concurrent snapshot creations |
 | `FCVM_UFFD_MAX_CLONES` | `256` | Clones one `fcvm snapshot serve` will accept. They share that server's failure and fairness domain, so raising it widens the blast radius. Running two serve processes with half the clones each halves what one crashed or overloaded handler takes down |
 | `FCVM_CGROUP_PARENT` | `fcvm.slice` | Parent, below the cgroup2 root, of the cgroup each VM and memory server runs in; `none` keeps fcvm in the cgroup it was started in. See [A VM's own cgroup](#a-vms-own-cgroup) |
