@@ -192,6 +192,63 @@ fn owner_dir_name(euid: u32, user_namespace: Option<u64>, host_uid: Option<u32>)
     }
 }
 
+/// How many directories one owner directory name has: `<name>`, then `<name>.1` and on.
+const OWNER_DIR_SLOTS: usize = 64;
+
+/// The owner directory under `shared` for the name `name` and the uid `euid`: the first of
+/// `<name>`, `<name>.1`, `<name>.2`, ... that `euid` owns, or else the first that can be made.
+/// `owner_of` reads who owns a path, or None when nothing is there.
+///
+/// The name is the euid with the uid it maps to in the parent user namespace, which is all a
+/// process can read of its mapping. In a user namespace nested inside another non-initial one,
+/// two containers can both map uid 0 to their parent's uid 0 while their parents map to
+/// different host owners. Both get the name `0-host0`, and the directory the first one made
+/// shows to the second as owned by the overflow uid, which `owner_dir_in` refuses (#1465). The
+/// owner that the filesystem records is what separates them, so a directory another uid owns
+/// is passed over. A directory this uid owns is looked for first, in every slot, so that a
+/// later process with the same mapping finds the records the earlier one left, whichever slot
+/// it was given.
+fn pick_owner_dir(
+    shared: &Path,
+    name: &str,
+    euid: u32,
+    owner_of: impl Fn(&Path) -> Option<u32>,
+) -> Result<PathBuf> {
+    let slot = |n: usize| {
+        if n == 0 {
+            shared.join(name)
+        } else {
+            shared.join(format!("{name}.{n}"))
+        }
+    };
+    if let Some(mine) = (0..OWNER_DIR_SLOTS)
+        .map(slot)
+        .find(|path| owner_of(path) == Some(euid))
+    {
+        return Ok(mine);
+    }
+    for n in 0..OWNER_DIR_SLOTS {
+        let path = slot(n);
+        match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => return Ok(path),
+            // Made by another process of this uid in the meantime, or another uid's.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if owner_of(&path) == Some(euid) {
+                    return Ok(path);
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("creating {}", path.display()))
+            }
+        }
+    }
+    bail!(
+        "every owner directory named {name} in {} belongs to another uid ({OWNER_DIR_SLOTS} \
+         tried); remove the ones no fcvm uses",
+        shared.display()
+    )
+}
+
 /// [`owner_dir`] under an explicit data directory.
 pub fn owner_dir_in(data_dir: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(data_dir)
@@ -211,12 +268,12 @@ pub fn owner_dir_in(data_dir: &Path) -> Result<PathBuf> {
     let host_uid = std::fs::read_to_string("/proc/self/uid_map")
         .ok()
         .and_then(|map| host_uid_of(&map, euid));
-    let mine = shared.join(owner_dir_name(euid, current_user_namespace(), host_uid));
-    match std::fs::DirBuilder::new().mode(0o700).create(&mine) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error).with_context(|| format!("creating {}", mine.display())),
-    }
+    let name = owner_dir_name(euid, current_user_namespace(), host_uid);
+    let mine = pick_owner_dir(&shared, &name, euid, |path| {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|metadata| metadata.uid())
+    })?;
     let metadata =
         std::fs::symlink_metadata(&mine).with_context(|| format!("reading {}", mine.display()))?;
     if !metadata.is_dir() || metadata.uid() != euid || metadata.mode() & 0o022 != 0 {
@@ -1454,6 +1511,115 @@ mod tests {
         );
         // The host's root still uses its own directory.
         assert_eq!(owner_dir_in(root.path()).unwrap(), host_root);
+    }
+
+    /// Two owners whose names collide get directories of their own, told apart by who the
+    /// filesystem says owns each, and a later process of either finds its own again in
+    /// whichever slot it is.
+    #[test]
+    fn an_owner_directory_another_uid_owns_is_passed_over() {
+        let shared = tempfile::tempdir().unwrap();
+        let me = nix::unistd::geteuid().as_raw();
+        let other = me.wrapping_add(1);
+        let theirs: std::collections::HashSet<PathBuf> = ["0-host0", "0-host0.2"]
+            .map(|name| shared.path().join(name))
+            .into();
+        for path in &theirs {
+            std::fs::create_dir(path).unwrap();
+        }
+        let owner_of = |path: &Path| {
+            let found = std::fs::symlink_metadata(path).ok()?;
+            Some(if theirs.contains(path) {
+                other
+            } else {
+                found.uid()
+            })
+        };
+
+        let mine = pick_owner_dir(shared.path(), "0-host0", me, owner_of).unwrap();
+        assert_eq!(mine, shared.path().join("0-host0.1"));
+        assert_eq!(
+            pick_owner_dir(shared.path(), "0-host0", me, owner_of).unwrap(),
+            mine
+        );
+
+        // Ours in a later slot than a free one: found, not a new one made.
+        std::fs::remove_dir(&mine).unwrap();
+        std::fs::create_dir(shared.path().join("0-host0.3")).unwrap();
+        assert_eq!(
+            pick_owner_dir(shared.path(), "0-host0", me, owner_of).unwrap(),
+            shared.path().join("0-host0.3")
+        );
+        assert!(
+            !mine.exists(),
+            "a new directory was made while ours existed"
+        );
+    }
+
+    /// Set in the children of `nested_namespaces_with_one_mapping_get_their_own_directories`:
+    /// the data directory they make their owner directory in.
+    #[cfg(feature = "privileged-tests")]
+    const NESTED_ROOT_CHILD: &str = "FCVM_RECLAIM_NESTED_ROOT_DATA_DIR";
+
+    /// #1465: two containers, each root of a user namespace nested in another non-initial one,
+    /// both map uid 0 to their parent's uid 0 while the parents map to different host uids. Both
+    /// get the name `0-host0`. The second used to refuse the first's directory, which it sees as
+    /// owned by the overflow uid, and fail every launch. Each child runs this test again as
+    /// root of `unshare -r` inside `unshare -r` under a different unprivileged host uid.
+    #[cfg(feature = "privileged-tests")]
+    #[test]
+    fn nested_namespaces_with_one_mapping_get_their_own_directories() {
+        if let Some(data_dir) = std::env::var_os(NESTED_ROOT_CHILD) {
+            let mine = owner_dir_in(Path::new(&data_dir)).expect("owner directory");
+            Owner::begin_in(&mine, &format!("nested-root-{}", std::process::id()))
+                .expect("an owner in it");
+            println!("OWNER_DIR={}", mine.display());
+            return;
+        }
+        assert!(
+            nix::unistd::geteuid().is_root(),
+            "privileged-tests run as root"
+        );
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        owner_dir_in(root.path()).unwrap();
+        let exe = root.path().join("test-binary");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let child = |host_uid: u32| {
+            let output = std::process::Command::new("setpriv")
+                .arg(format!("--reuid={host_uid}"))
+                .arg(format!("--regid={host_uid}"))
+                .arg("--clear-groups")
+                .args(["unshare", "-U", "-r", "unshare", "-U", "-r"])
+                .arg(&exe)
+                .args([
+                    "--exact",
+                    "reclaim::tests::nested_namespaces_with_one_mapping_get_their_own_directories",
+                    "--nocapture",
+                ])
+                .env(NESTED_ROOT_CHILD, root.path())
+                .output()
+                .expect("spawning the nested child");
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            assert!(
+                output.status.success(),
+                "a nested root as host uid {host_uid} could not use the shared store: {}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            PathBuf::from(
+                stdout
+                    .lines()
+                    .find_map(|line| line.strip_prefix("OWNER_DIR="))
+                    .expect("the child names its owner directory"),
+            )
+        };
+        let first = child(65534);
+        let second = child(65533);
+        assert_ne!(first, second, "one directory for two host owners");
+        assert_eq!(child(65534), first, "the first owner lost its directory");
+        assert_eq!(child(65533), second, "the second owner lost its directory");
     }
 
     /// A helper that writes an owner's resources inherits its lock, so a pass leaves them
