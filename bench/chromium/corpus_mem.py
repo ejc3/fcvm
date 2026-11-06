@@ -687,7 +687,14 @@ def clone_forensics(args, clone, reason):
     except OSError as exc:
         record["loadavg"] = f"unreadable: {exc}"
     try:
-        listening = sh(["ss", "-Htlnp", f"sport = :{port}"], timeout=10)
+        # pasta makes itself non-dumpable, so its /proc/<pid>/fd is root's and
+        # an unprivileged `ss -p` lists its listener with no owner; root's
+        # names it. Unprivileged when sudo cannot run without a password.
+        listening = sh(["sudo", "-n", "ss", "-Htlnp", f"sport = :{port}"], timeout=10)
+        record["host_listeners_as"] = "root"
+        if listening.returncode != 0:
+            listening = sh(["ss", "-Htlnp", f"sport = :{port}"], timeout=10)
+            record["host_listeners_as"] = "user"
         record["host_listeners"] = {"rc": listening.returncode, "stdout": listening.stdout[-8000:],
                                     "stderr": listening.stderr[-2000:]}
         owners = []
