@@ -1028,11 +1028,6 @@ async fn settle_balloon_check(ctx: &mut VmContext) -> Result<()> {
     Ok(())
 }
 
-/// The `snapshot run` arguments that restore this run from a cached snapshot.
-///
-/// `publish` is this run's own `--publish`, so the clone listens where this run asked,
-/// and a spec the cache key's lenient parse skipped is refused here as it is on a cache
-/// miss. The key hashes the mappings, so today they equal the snapshot's.
 /// `--label KEY=VALUE` flags as the state's label map. A flag without `=` is dropped.
 pub(crate) fn parse_labels(labels: &[String]) -> std::collections::HashMap<String, String> {
     labels
@@ -1061,6 +1056,14 @@ fn run_host_ipv6(env: &[String]) -> Option<std::net::Ipv6Addr> {
     }
 }
 
+/// The `snapshot run` arguments that restore this run from a cached snapshot.
+///
+/// `publish` is this run's own `--publish`, so the clone listens where this run asked,
+/// and a spec the cache key's lenient parse skipped is refused here as it is on a cache
+/// miss. A run that publishes nothing passes `--publish none`, not an empty list, which
+/// would inherit the snapshot's mappings. The key hashes the guest side of the mappings,
+/// so a snapshot of a run without mappings records none either way; `none` makes the
+/// restore not depend on that.
 fn snapshot_restore_args(
     args: &RunArgs,
     snapshot_key: &str,
@@ -1075,7 +1078,11 @@ fn snapshot_restore_args(
         no_dirty_tracking: false, // podman needs dirty tracking for later snapshots
         no_swap: args.no_swap,
         vsock_dir: args.vsock_dir.clone(),
-        publish: args.publish.clone(),
+        publish: if args.publish.is_empty() {
+            vec![crate::commands::snapshot::PUBLISH_NONE.to_string()]
+        } else {
+            args.publish.clone()
+        },
         map: Vec::new(),
         ipv6_prefix: launch_ipv6_prefix(args),
         ipv6_address: args.ipv6_address,
@@ -4146,6 +4153,12 @@ mod tests {
         );
         assert_eq!(restore.publish, args.publish);
 
+        // A run that published nothing restores publishing nothing, whatever the
+        // snapshot recorded, instead of inheriting the snapshot's mappings (#1024).
+        args.publish = vec![];
+        let nothing = snapshot_restore_args(&args, "0123456789ab", None, (None, None));
+        assert_eq!(nothing.publish, ["none"]);
+
         // The other fields every cache restore carries.
         assert_eq!(restore.pid, None);
         assert_eq!(restore.snapshot.as_deref(), Some("0123456789ab"));
@@ -4160,10 +4173,6 @@ mod tests {
         assert_eq!(restore.firecracker_args, None);
         assert_eq!(restore.hugepages, Some(false));
         assert!(!restore.no_dirty_tracking && !restore.no_swap && restore.exec.is_none());
-
-        // A run that publishes nothing asks for nothing, and the clone inherits.
-        let plain = snapshot_restore_args(&test_args(), "k", None, (None, None));
-        assert!(plain.publish.is_empty());
     }
 
     /// Guest-visible launch inputs must change the snapshot key. --dns is

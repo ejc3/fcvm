@@ -1564,10 +1564,15 @@ fn ensure_not_disk_only(kind: crate::storage::SnapshotKind, command: &str) -> Re
     Ok(())
 }
 
+/// The spec that makes a clone publish nothing (`snapshot run --publish none`).
+pub(crate) const PUBLISH_NONE: &str = "none";
+
 /// The port mappings a clone publishes.
 ///
-/// Without `--publish` they are the snapshot's. With it they are exactly the requested
-/// ones: a clone chooses the host side of a mapping, its address and port, but the guest
+/// Without `--publish` they are the snapshot's. `--publish none` is none of them, so a
+/// clone of a snapshot that publishes a fixed host address can run beside another
+/// (#1024); it cannot be combined with another spec. Otherwise they are exactly the
+/// requested ones: a clone chooses the host side of a mapping, its address and port, but the guest
 /// port and protocol must be among the snapshot's. A guest restored from memory set its
 /// published ports up when it booted (fc-agent's DNAT to loopback, the
 /// --forward-localhost collision check) and the restore does not run that again. A
@@ -1581,6 +1586,16 @@ fn clone_port_mappings(
     if requested.is_empty() {
         crate::network::PortMapping::require_bindable(snapshot, meta.network_mode)?;
         return Ok(snapshot.to_vec());
+    }
+    if requested.iter().any(|spec| spec == PUBLISH_NONE) {
+        if requested.len() > 1 {
+            bail!(
+                "--publish {}: --publish none publishes nothing, so it cannot be combined \
+                 with another spec",
+                requested.join(",")
+            );
+        }
+        return Ok(Vec::new());
     }
     let mut mappings = Vec::with_capacity(requested.len());
     for spec in requested {
@@ -6414,6 +6429,32 @@ mod tests {
             .expect_err("must be refused")
             .to_string();
         assert!(error.contains("published no ports"), "{error}");
+    }
+
+    /// `--publish none` publishes nothing, whatever the snapshot published, and is
+    /// refused beside any other spec (#1024).
+    #[test]
+    fn publish_none_publishes_nothing_and_stands_alone() {
+        let snapshot = publishing(&["[::]:80:80", "5300:53/udp"]);
+        assert!(clone_port_mappings(&snapshot, &requested(&["none"]))
+            .unwrap()
+            .is_empty());
+        assert!(clone_port_mappings(&publishing(&[]), &requested(&["none"]))
+            .unwrap()
+            .is_empty());
+        for specs in [
+            &["none", "8080:80"][..],
+            &["8080:80", "none"][..],
+            &["none", "none"][..],
+        ] {
+            let error = clone_port_mappings(&snapshot, &requested(specs))
+                .expect_err("none stands alone")
+                .to_string();
+            assert!(
+                error.contains("--publish none") && error.contains(&specs.join(",")),
+                "{specs:?}: {error}"
+            );
+        }
     }
 
     /// A clone's --publish is checked under the snapshot's network mode, before anything

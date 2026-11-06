@@ -1408,7 +1408,8 @@ pub struct SnapshotRunArgs {
     /// repeated, as for `podman run --publish`. Each GUESTPORT/PROTO must be one the
     /// snapshot published. Bridged networking listens on the clone's veth address
     /// whatever HOSTIP says. Without this flag the clone inherits the snapshot's
-    /// mappings.
+    /// mappings. `--publish none` publishes nothing: no listener, no DNAT rule, no
+    /// pasta forward. `none` cannot be combined with another spec.
     #[arg(long, action = clap::ArgAction::Append, value_delimiter = ',')]
     pub publish: Vec<String>,
 
