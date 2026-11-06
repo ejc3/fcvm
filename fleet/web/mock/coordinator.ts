@@ -345,6 +345,11 @@ export class MockCoordinator {
     const first = NUDGE_TARGETS[0]!;
     this.camera = [{ t: t0, x: first.x, y: first.y, zoom: first.zoom }];
     this.server = http.createServer((req, res) => this.http(req, res));
+    // The client closes an idle connection first: a server that closes one at Node's default
+    // 5 s, against fetch's 4 s, raced a test process whose event loop was busy, which then sent
+    // on the closed socket and got ECONNRESET (#1348).
+    this.server.keepAliveTimeout = 60_000;
+    this.server.headersTimeout = 65_000;
     this.wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
     this.server.on("upgrade", (req, socket, head) => {
       const url = new URL(req.url ?? "/", "http://mock");

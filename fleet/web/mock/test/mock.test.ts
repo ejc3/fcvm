@@ -141,6 +141,36 @@ describe("mock coordinator", () => {
     c.ws.close();
   });
 
+  it("keeps an idle keep-alive connection open longer than a client keeps one (fetch: 4 s)", async () => {
+    // A test process stalled past the server's idle limit reused the socket the server had
+    // just closed: `fetch failed`, ECONNRESET, on an admin route (#1348).
+    const net = await import("node:net");
+    const s = net.connect(coord.port, "127.0.0.1");
+    let closedAt: number | null = null;
+    s.on("close", () => (closedAt = Date.now()));
+    const ask = () =>
+      new Promise<string>((resolve, reject) => {
+        if (closedAt !== null) return reject(new Error("the server closed the idle connection"));
+        let got = "";
+        const onData = (d: Buffer) => {
+          got += d.toString();
+          if (/\r\n\r\n[\s\S]*\}/.test(got)) {
+            s.off("data", onData);
+            resolve(got);
+          }
+        };
+        s.on("data", onData);
+        s.once("error", reject);
+        s.once("close", () => reject(new Error(`closed after ${JSON.stringify(got.slice(0, 40))}`)));
+        s.write("GET /mock/render-stats HTTP/1.1\r\nHost: mock\r\nConnection: keep-alive\r\n\r\n");
+      });
+    await new Promise((r) => s.once("connect", r));
+    expect(await ask()).toMatch(/^HTTP\/1\.1 200/);
+    await sleep(6500);
+    expect(await ask()).toMatch(/^HTTP\/1\.1 200/);
+    s.destroy();
+  }, 15_000);
+
   it("answers a ping with its clock", async () => {
     const c = await live();
     c.ws.send(JSON.stringify({ type: "ping", client_unix_ms: 123 }));
