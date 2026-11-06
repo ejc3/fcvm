@@ -321,3 +321,61 @@ class EntryResolverRule(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def warm_block() -> str:
+    """The shipped bytes from the renderer warm-up through the warm-page loop."""
+    with open(ENTRY) as handle:
+        src = handle.read()
+    match = re.search(r'(echo "chromium-bench: warming renderer"\n.*?\ndone\n)', src, re.S)
+    assert match, "entry.sh's warm-up block is gone"
+    return match.group(1)
+
+
+class EntryWarmPages(unittest.TestCase):
+    """BENCH_WARM_URLS renders each page once, in order, after the warm-up page and
+    before the ready marker; a page that fails to render stops the script."""
+
+    def run_block(self, shell, warm_urls, fail_on=None):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "renders")
+            stub = os.path.join(d, "python3")
+            with open(stub, "w") as handle:
+                handle.write(
+                    "#!/bin/sh\n"
+                    f'echo "$2" >> {log}\n'
+                    + (f'[ "$2" = "{fail_on}" ] && exit 3\n' if fail_on else "")
+                    + "exit 0\n")
+            os.chmod(stub, 0o755)
+            env = {"PATH": f"{d}:/usr/bin:/bin", "HTTP_PORT": "8000"}
+            if warm_urls is not None:
+                env["BENCH_WARM_URLS"] = warm_urls
+            script = "set -eu\n" + warm_block() + "echo READY\n"
+            result = subprocess.run([shell, "-c", script], env=env, cwd=d,
+                                    capture_output=True, text=True, timeout=30)
+            renders = open(log).read().split() if os.path.exists(log) else []
+            return result, renders
+
+    def test_each_warm_page_renders_once_in_order_before_ready(self):
+        for shell in SHELLS:
+            result, renders = self.run_block(shell, "https://a.example/ https://b.example/x")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(renders, ["http://127.0.0.1:8000/warmup.html",
+                                       "https://a.example/", "https://b.example/x"], shell)
+            self.assertIn("READY", result.stdout)
+
+    def test_no_warm_pages_renders_only_the_warmup_page(self):
+        for shell in SHELLS:
+            for value in (None, ""):
+                result, renders = self.run_block(shell, value)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(renders, ["http://127.0.0.1:8000/warmup.html"], shell)
+
+    def test_a_page_that_fails_to_render_stops_the_script(self):
+        for shell in SHELLS:
+            result, renders = self.run_block(
+                shell, "https://a.example/ https://b.example/ https://c.example/",
+                fail_on="https://b.example/")
+            self.assertNotEqual(result.returncode, 0, shell)
+            self.assertNotIn("READY", result.stdout)
+            self.assertNotIn("https://c.example/", renders)

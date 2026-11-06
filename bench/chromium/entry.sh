@@ -289,6 +289,16 @@ echo "chromium-bench: warming renderer"
 python3 /opt/bench/render.py "http://127.0.0.1:$HTTP_PORT/warmup.html" \
     --out-prefix /tmp/warmup --then-blank
 
+# BENCH_WARM_URLS: pages, separated by spaces, each rendered once before the
+# ready marker, so the golden snapshot is taken after the browser has loaded
+# them (`GUEST_ENV=BENCH_WARM_URLS=...`; GUEST_ENV splits on commas, so the
+# list cannot use them). A page that does not render stops this script, so a
+# golden is never taken from a half-warmed browser.
+for warm_url in ${BENCH_WARM_URLS:-}; do
+    echo "chromium-bench: warming $warm_url"
+    python3 /opt/bench/render.py "$warm_url" --out-prefix /tmp/warm-page --then-blank
+done
+
 # Warm marker. render.py returns zero only after the about:blank navigation's
 # own loader emits lifecycle `load` and Runtime.evaluate confirms both
 # location.href=about:blank and readyState=complete. Because this script uses
