@@ -1,8 +1,8 @@
 //! Host resources a killed fcvm leaves behind, and how the next fcvm takes them back.
 //!
 //! fcvm creates host resources that outlive its process unless teardown removes them: a
-//! VM's runtime directory (`vm-disks/<vm_id>`, with its disks), the mountpoint a restore
-//! makes over a source VM's directory, the temporaries of an image export. A SIGKILL skips
+//! VM's runtime directory (`vm-disks/<vm_id>`, with its disks), the temporaries of an
+//! image export. A SIGKILL skips
 //! teardown. The kernel ends the child processes (pdeathsig) and releases locks; every
 //! other resource stays.
 //!
@@ -25,9 +25,7 @@
 //! Recording comes before creating, so a kill between the two leaves a record of something
 //! that does not exist, and undoing it finds nothing. That is safe only for names no other
 //! process can create, which holds for every resource here: a VM's directory is named by
-//! its random vm_id and a temporary by a random UUID. A mountpoint can be another process's
-//! too, and its undo removes it only if it is empty and nobody
-//! leases it (`storage::runtime_dir`).
+//! its random vm_id and a temporary by a random UUID.
 //!
 //! Network objects follow the same rule with one change, because their names are not
 //! random: a namespace is named from a few characters of the vm_id and settled by
@@ -59,12 +57,8 @@ use tracing::{debug, info, warn};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Resource {
-    /// A VM's runtime directory. Removed whole, once no restore leases it.
+    /// A VM's runtime directory. Removed whole.
     RuntimeDir { path: PathBuf },
-    /// A source VM's directory that a restore binds its own directory over. Removed only
-    /// while it is empty and no restore leases it, so a live
-    /// VM's directory is never touched.
-    MountTarget { path: PathBuf },
     /// A temporary file or directory that is renamed into place or removed when its
     /// operation finishes.
     Temp { path: PathBuf },
@@ -92,10 +86,7 @@ pub enum Resource {
 impl Resource {
     /// An object of the running kernel, which a reboot discards.
     fn is_kernel_object(&self) -> bool {
-        !matches!(
-            self,
-            Resource::RuntimeDir { .. } | Resource::MountTarget { .. } | Resource::Temp { .. }
-        )
+        !matches!(self, Resource::RuntimeDir { .. } | Resource::Temp { .. })
     }
 
     /// Part of a VM's network, which its teardown removes (`forget`).
@@ -108,7 +99,6 @@ impl std::fmt::Display for Resource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Resource::RuntimeDir { path } => write!(f, "runtime directory {}", path.display()),
-            Resource::MountTarget { path } => write!(f, "mount target {}", path.display()),
             Resource::Temp { path } => write!(f, "temporary {}", path.display()),
             Resource::Netns { name } => write!(f, "network namespace {name}"),
             Resource::Link { name } => write!(f, "interface {name}"),
@@ -633,9 +623,8 @@ impl Inner {
             return delete_owner_files(&self.dir, &self.id, lock);
         }
         if remaining.iter().all(|(_, why)| why.starts_with(IN_USE)) {
-            // This process, or another, still leases them (a clone keeps the mountpoint
-            // its VMM's vsock path goes through until it exits). The record stays, and
-            // the first launch after the lease ends removes them.
+            // Another VM still holds the lease of a routed address this one recorded. The
+            // record stays, and the first launch after the lease ends removes it.
             let resources: Vec<Resource> = remaining.into_iter().map(|(r, _)| r).collect();
             write_record(&self.dir, &self.id, &resources)?;
             release(lock);
@@ -791,7 +780,6 @@ async fn undo_all(
 async fn undo(resource: &Resource) -> Undo {
     match resource {
         Resource::RuntimeDir { path } => undo_runtime_dir(path).await,
-        Resource::MountTarget { path } => undo_mount_target(path).await,
         Resource::Temp { path } => undo_temp(path).await,
         Resource::Netns { name } => {
             undo_result(crate::network::namespace::delete_namespace(name).await)
@@ -849,35 +837,7 @@ async fn undo_rule(program: &str, args: &[String]) -> Undo {
     }
 }
 
-/// Open `path` and lock it exclusively without waiting. `Ok(None)` when it does not exist
-/// or another inode replaced it after the open; `Err` with `WouldBlock` when it is locked.
-fn lock_directory(path: &Path) -> std::io::Result<Option<File>> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    // Fully qualified: std::fs::File has inherent try_lock_* methods with another error
-    // type, and inherent methods win over trait methods.
-    fs2::FileExt::try_lock_exclusive(&file)?;
-    let held = file.metadata()?;
-    match std::fs::symlink_metadata(path) {
-        Ok(current) if (current.dev(), current.ino()) == (held.dev(), held.ino()) => Ok(Some(file)),
-        Ok(_) => Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
 async fn undo_runtime_dir(path: &Path) -> Undo {
-    let _lock = match lock_directory(path) {
-        Ok(Some(file)) => file,
-        Ok(None) => return Undo::Done,
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            return Undo::InUse("a restore leases it".to_string())
-        }
-        Err(error) => return Undo::Kept(error.to_string()),
-    };
     remove_tree(path).await
 }
 
@@ -895,31 +855,6 @@ async fn remove_tree(path: &Path) -> Undo {
         Ok(Ok(())) => Undo::Done,
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Undo::Done,
         Ok(Err(error)) => Undo::Kept(error.to_string()),
-        Err(error) => Undo::Kept(error.to_string()),
-    }
-}
-
-async fn undo_mount_target(path: &Path) -> Undo {
-    let _lock = match lock_directory(path) {
-        Ok(Some(file)) => file,
-        Ok(None) => return Undo::Done,
-        // A restore leases it: removed by whichever lease ends last, or by a later
-        // launch once none does (a clone that exits without dropping its lease).
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            return Undo::InUse("a restore leases it".to_string())
-        }
-        Err(error) => return Undo::Kept(error.to_string()),
-    };
-    // Empty, as `storage::runtime_dir` judges a mountpoint a restore made: a live VM's
-    // directory holds its disks.
-    let removed = match std::fs::read_dir(path).map(|mut entries| entries.next().is_none()) {
-        Ok(true) => std::fs::remove_dir(path),
-        Ok(false) => Ok(()),
-        Err(error) => Err(error),
-    };
-    match removed {
-        Ok(()) => Undo::Done,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Undo::Done,
         Err(error) => Undo::Kept(error.to_string()),
     }
 }
@@ -1238,96 +1173,6 @@ mod tests {
             "a completed owner accepted a record"
         );
         drop(owner);
-    }
-
-    /// The runtime directory of a dead owner can still be leased by a restore of its
-    /// snapshot. It stays recorded until the lease ends.
-    #[tokio::test]
-    async fn a_leased_runtime_dir_waits_for_a_later_pass() {
-        let (root, dir) = test_dir();
-        let runtime_dir = root.path().join("vm-disks/vm-leased");
-        std::fs::create_dir_all(runtime_dir.join("disks")).unwrap();
-        std::fs::write(runtime_dir.join("disks/rootfs.raw"), b"disk").unwrap();
-        let owner = Owner::begin_in(&dir, "vm-leased").unwrap();
-        owner
-            .record(Resource::RuntimeDir {
-                path: runtime_dir.clone(),
-            })
-            .unwrap();
-        drop(owner);
-
-        let lease =
-            crate::storage::runtime_dir::lease_mount_targets(std::slice::from_ref(&runtime_dir))
-                .await
-                .unwrap();
-        assert_eq!(
-            reclaim_abandoned_in(&dir).await,
-            Reclaimed {
-                owners: 0,
-                resources: 0,
-                remaining: 1
-            }
-        );
-        assert!(runtime_dir.join("disks/rootfs.raw").exists());
-        drop(lease);
-        assert_eq!(
-            reclaim_abandoned_in(&dir).await,
-            Reclaimed {
-                owners: 1,
-                resources: 1,
-                remaining: 0
-            }
-        );
-        assert!(!runtime_dir.exists());
-        assert!(files_in(&dir).is_empty());
-    }
-
-    /// A mount target is removed only when it is empty and unleased.
-    #[tokio::test]
-    async fn a_mount_target_is_removed_only_when_it_is_an_empty_unleased_tree() {
-        let (root, dir) = test_dir();
-        let made = root.path().join("vm-disks/vm-made");
-        std::fs::create_dir_all(&made).unwrap();
-        let live = root.path().join("vm-disks/vm-live");
-        std::fs::create_dir_all(live.join("disks")).unwrap();
-        std::fs::write(live.join("disks/rootfs.raw"), b"disk").unwrap();
-        let held = root.path().join("vm-disks/vm-held");
-        std::fs::create_dir_all(&held).unwrap();
-
-        let owner = Owner::begin_in(&dir, "vm-clone").unwrap();
-        for path in [&made, &live, &held] {
-            owner
-                .record(Resource::MountTarget { path: path.clone() })
-                .unwrap();
-        }
-        drop(owner);
-        let other_clone = std::fs::File::open(&held).unwrap();
-        fs2::FileExt::try_lock_shared(&other_clone).unwrap();
-
-        // The held one stays recorded until no restore leases it.
-        assert_eq!(
-            reclaim_abandoned_in(&dir).await,
-            Reclaimed {
-                owners: 0,
-                resources: 2,
-                remaining: 1
-            }
-        );
-        assert!(!made.exists(), "an unleased empty mountpoint was left");
-        assert!(
-            live.join("disks/rootfs.raw").exists(),
-            "a VM's own directory was removed"
-        );
-        assert!(
-            held.exists(),
-            "a mountpoint another clone holds was removed"
-        );
-        drop(other_clone);
-        assert_eq!(reclaim_abandoned_in(&dir).await.owners, 1);
-        assert!(
-            !held.exists(),
-            "the mountpoint was left once no lease held it"
-        );
     }
 
     #[test]
@@ -1672,30 +1517,6 @@ mod tests {
         assert_eq!(state.resources, [netns]);
         drop(state);
         drop(owner);
-    }
-
-    /// A clone whose VMM goes through the redirect keeps its lease on the mountpoint past
-    /// its teardown. Completing its owner then leaves the record, so a clone that exits
-    /// without dropping the lease still has its mountpoint reclaimed.
-    #[tokio::test]
-    async fn completing_an_owner_keeps_a_mount_target_it_still_leases() {
-        let (root, dir) = test_dir();
-        let made = root.path().join("vm-disks/vm-gone-source");
-        std::fs::create_dir_all(&made).unwrap();
-        let owner = Owner::begin_in(&dir, "vm-clone-leasing").unwrap();
-        owner
-            .record(Resource::MountTarget { path: made.clone() })
-            .unwrap();
-        let own_lease = std::fs::File::open(&made).unwrap();
-        fs2::FileExt::try_lock_shared(&own_lease).unwrap();
-        owner.complete().await.unwrap();
-        assert!(
-            dir.join("vm-clone-leasing.json").exists(),
-            "completion dropped the record of a mountpoint still leased"
-        );
-        drop(own_lease);
-        assert_eq!(reclaim_abandoned_in(&dir).await.owners, 1);
-        assert!(!made.exists());
     }
 
     /// Records are read through the owner directory's own descriptor, opened without
