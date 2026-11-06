@@ -167,28 +167,56 @@ quota_of() {
 reserve_of() { if [ "$1" = spot ]; then echo $WALL_RESERVE_spot; else echo $WALL_RESERVE_ondemand; fi; }
 # room_for MARKET VCPUS: 0 when that many fit and still leave the wall's reserve.
 room_for() {
-  local quota usage used reserve
+  local quota usage ledger used reserve
   reserve=$(reserve_of "$1")
-  quota=$(quota_of "$1") && usage=$(g_usage "$1") || { say "no $1 $TYPE: the G quota or its usage could not be read"; return 1; }
-  used=$(awk '{n += $4} END {print n + 0}' <<<"$usage")
+  quota=$(quota_of "$1") && usage=$(g_usage "$1") && ledger=$(ledger_recent) \
+    || { say "no $1 $TYPE: the G quota, its usage or the admission ledger could not be read"; return 1; }
+  # The listing, then the boxes admitted just now that it does not show yet.
+  used=$( { awk '{print $2, $4, "listed"}' <<<"$usage"; awk -v m="$1" '$3 == m {print $2, 96, "ledger"}' <<<"$ledger"; } \
+    | awk '$3 == "ledger" {if (!($1 in seen)) n += $2; next} NF == 3 {seen[$1] = 1; n += $2} END {print n + 0}')
   if [ $((used + $2 + reserve)) -le "$quota" ]; then return 0; fi
   say "no $1 $TYPE: $used of $quota G vCPUs in use, and $2 more would leave the wall's host less than its $reserve"
   return 1
 }
-# still_fits MARKET ID: after launching ID, whether it fits ahead of the wall's reserve with
-# every other instance counted first except gpuboxes launched after it (by launch time, then
-# id). Two `up`s that passed room_for at once both see each other here, and only the later
-# box gives way.
-still_fits() {
-  local quota usage reserve
-  reserve=$(reserve_of "$1")
-  quota=$(quota_of "$1") && usage=$(g_usage "$1") || return 1
-  # Not listed yet: it launched just now, after every box that is.
-  grep -q " $2 " <<<"$usage" || usage+=$'\n'"$(date -u +%Y-%m-%dT%H:%M:%S+00:00) $2 $PURPOSE 96"
-  sort -k1,1 -k2,2 <<<"$usage" | awk -v me="$2" -v purpose="$PURPOSE" -v limit=$((quota - reserve)) '
-    $3 != purpose {n += $4; next}
-    !done {n += $4} $2 == me {done = 1}
-    END {exit (n <= limit) ? 0 : 1}'
+# Admission is one `up` at a time across every machine: a lock object in the asset bucket,
+# created only if absent (S3 conditional writes are strongly consistent), and a ledger of the
+# boxes admitted in the last ADMIT_LEDGER_S seconds, counted until describe-instances (which
+# is eventually consistent) lists them. A lock older than ADMIT_STALE_S is a holder that died.
+ADMIT_LOCK=gpubox/admission.lock
+ADMIT_LEDGER=gpubox/admitted
+ADMIT_LEDGER_S=600
+ADMIT_STALE_S=300
+S3A() { aws --region "$S3REGION" "$@"; }
+admit_lock() {
+  local deadline=$(( $(now) + ${GPUBOX_ADMIT_WAIT_S:-600} )) body age
+  body=$(mktemp); echo "$(now) ${owner:-agent}" > "$body"
+  while ! S3A s3api put-object --bucket "$BUCKET" --key "$ADMIT_LOCK" --body "$body" --if-none-match '*' >/dev/null 2>"$body.err"; do
+    grep -q -E 'PreconditionFailed|ConditionalRequestConflict' "$body.err" || { cat "$body.err" >&2; rm -f "$body" "$body.err"; return 1; }
+    age=$(S3A s3 cp --only-show-errors "s3://$BUCKET/$ADMIT_LOCK" - 2>/dev/null | awk -v t="$(now)" '{print t - $1}')
+    if [ -n "$age" ] && [ "$age" -gt "$ADMIT_STALE_S" ]; then
+      say "breaking an admission lock held ${age} s"; S3A s3 rm --only-show-errors "s3://$BUCKET/$ADMIT_LOCK" || true
+    fi
+    [ "$(now)" -lt "$deadline" ] || { rm -f "$body" "$body.err"; say "another gpubox up held the admission lock"; return 1; }
+    sleep 2
+  done
+  rm -f "$body" "$body.err"
+}
+admit_unlock() { S3A s3 rm --only-show-errors "s3://$BUCKET/$ADMIT_LOCK" || true; }
+# The ledger's entries of the last ADMIT_LEDGER_S seconds: "<unix time> <instance id> <market>".
+# Fails when the ledger exists and cannot be read.
+ledger_recent() {
+  local t f rc=0; t=$(now); f=$(mktemp)
+  if ! S3A s3api get-object --bucket "$BUCKET" --key "$ADMIT_LEDGER" "$f" >/dev/null 2>"$f.err"; then
+    if grep -q NoSuchKey "$f.err"; then : > "$f"; else cat "$f.err" >&2; rc=1; fi
+  fi
+  [ "$rc" = 0 ] && awk -v t="$t" -v keep=$ADMIT_LEDGER_S 'NF == 3 && t - $1 <= keep' "$f"
+  rm -f "$f" "$f.err"
+  return "$rc"
+}
+ledger_add() { # id market
+  local recent
+  recent=$(ledger_recent) || return 1
+  { [ -z "$recent" ] || echo "$recent"; echo "$(now) $1 $2"; } | S3A s3 cp --only-show-errors - "s3://$BUCKET/$ADMIT_LEDGER"
 }
 
 case "${1:-}" in
@@ -208,6 +236,8 @@ up)
   sg=$(A ec2 describe-security-groups --filters Name=group-name,Values=fcvm-fleet --query 'SecurityGroups[0].GroupId' --output text)
   ud=$(lease_userdata "$lease")
   t0=$(now); id=""
+  admit_lock || die "no admission: the lock in s3://$BUCKET/$ADMIT_LOCK could not be taken"
+  trap admit_unlock EXIT
   for market in spot on-demand; do
     room_for "$market" 96 || continue
     for az in $AZS; do
@@ -231,12 +261,8 @@ up)
   done
   rm -f /tmp/gpubox.err.$$
   [ -n "$id" ] || die "no $TYPE capacity or quota in $REGION, spot or on demand, that leaves the wall's host its room"
-  # A launch shows in describe-instances within seconds; then the later of two racing boxes gives way.
-  sleep "${GPUBOX_SETTLE_S:-10}"
-  if ! still_fits "$market" "$id"; then
-    A ec2 terminate-instances --instance-ids "$id" >/dev/null
-    die "terminated $id: with another box launched at the same time it would leave the wall's host less than its $(reserve_of "$market") $market vCPUs"
-  fi
+  ledger_add "$id" "$market" || { A ec2 terminate-instances --instance-ids "$id" >/dev/null; die "terminated $id: its admission could not be recorded"; }
+  admit_unlock; trap - EXIT
   say "launched $id ($market, ${REGION}${az}, $ami), lease until $lease UTC"
   [ "$wait" = 0 ] || wait_ready "$t0" "$id"
   echo "$id $REGION"

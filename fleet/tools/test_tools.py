@@ -219,6 +219,18 @@ case "$args" in
     case "$args" in *MarketType=spot*) echo spot ;; *) echo on-demand ;; esac > "$FAKE_LOG.launched"
     echo i-fakebox ;;
   *" ec2 terminate-instances "*) : ;;
+  # S3 in $FAKE_S3: a key is a file; put-object --if-none-match * creates it only if absent.
+  *" s3api put-object "*)
+    key=$(sed -n 's/.*--key \([^ ]*\).*/\1/p' <<<"$*"); body=$(sed -n 's/.*--body \([^ ]*\).*/\1/p' <<<"$*")
+    mkdir -p "$FAKE_S3/$(dirname "$key")"
+    ( set -o noclobber; cat "$body" > "$FAKE_S3/$key" ) 2>/dev/null || { echo "An error occurred (PreconditionFailed)" >&2; exit 254; } ;;
+  *" s3api get-object "*)
+    key=$(sed -n 's/.*--key \([^ ]*\).*/\1/p' <<<"$*"); out=${@: -1}
+    [ -e "$FAKE_S3/$key" ] || { echo "An error occurred (NoSuchKey)" >&2; exit 254; }
+    cp "$FAKE_S3/$key" "$out" ;;
+  *" s3 cp "*"- s3://"*) key=$(sed -n 's|.*- s3://[^/]*/\([^ ]*\).*|\1|p' <<<"$args"); mkdir -p "$FAKE_S3/$(dirname "$key")"; cat > "$FAKE_S3/$key" ;;
+  *" s3 cp "*" - "*) key=$(sed -n 's|.*s3://[^/]*/\([^ ]*\) - .*|\1|p' <<<"$args"); cat "$FAKE_S3/$key" 2>/dev/null ;;
+  *" s3 rm "*) key=$(sed -n 's|.*s3://[^/]*/\([^ ]*\).*|\1|p' <<<"$args"); rm -f "$FAKE_S3/$key" ;;
   *) echo "fake aws: unexpected $*" >&2; exit 1 ;;
 esac
 """
@@ -232,15 +244,16 @@ def boxes(n, purpose="fcvm-fleet-gpubox", at="2026-11-05T23:00:00+00:00"):
 class GpuboxWallReserve(unittest.TestCase):
     """`gpubox.sh up` leaves the wall's GPU host room in the account's G quotas (#1257)."""
 
-    def up(self, spot_quota=192, spot_in_use="", od_quota=384, od_in_use="", **extra):
+    def up(self, spot_quota=192, spot_in_use="", od_quota=384, od_in_use="", s3=None, **extra):
         import tempfile
         d = tempfile.mkdtemp()
+        s3 = s3 or os.path.join(d, "s3")
         with open(os.path.join(d, "aws"), "w") as f:
             f.write(FAKE_AWS)
         os.chmod(os.path.join(d, "aws"), 0o755)
         log = os.path.join(d, "calls")
         env = dict(os.environ, PATH=f"{d}:{os.environ['PATH']}", FAKE_LOG=log, GPUBOX_USE_ENV="1",
-                   GPUBOX_AZS="a", GPUBOX_SETTLE_S="0", FAKE_SPOT_QUOTA=str(spot_quota), FAKE_OD_QUOTA=str(od_quota),
+                   GPUBOX_AZS="a", FAKE_S3=s3, FAKE_SPOT_QUOTA=str(spot_quota), FAKE_OD_QUOTA=str(od_quota),
                    FAKE_SPOT_IN_USE=spot_in_use, FAKE_OD_IN_USE=od_in_use,
                    FAKE_MY_TIME="2026-11-06T00:00:00+00:00", **extra)
         r = subprocess.run(["bash", os.path.join(HERE, "gpubox.sh"), "up", "--no-wait"],
@@ -281,17 +294,41 @@ class GpuboxWallReserve(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0, r.stderr)
         self.assertEqual(launches, [], r.stderr)
         self.assertIn("could not be read", r.stderr)
+        self.assertNotIn("unexpected", r.stderr)
 
-    def test_of_two_boxes_launched_at_once_the_later_gives_way(self):
-        # Both passed the check before either launched (spot: 0 in use, room for one box and
-        # the wall's host); the other box is listed only after this one launched.
-        earlier = boxes(1, at="2026-11-05T23:59:59+00:00")
-        later = boxes(1, at="2026-11-06T00:00:01+00:00")
-        r, launches, ends = self.up(FAKE_SPOT_IN_USE_AFTER=earlier, od_in_use=boxes(3))
-        self.assertEqual(len(launches), 1, r.stderr)
-        self.assertNotEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(len(ends), 1, r.stderr)
-        self.assertIn("i-fakebox", ends[0])
-        r, launches, ends = self.up(FAKE_SPOT_IN_USE_AFTER=later, od_in_use=boxes(3))
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual((len(launches), ends), (1, []), r.stderr)
+    def test_two_ups_at_once_admit_one_box_into_the_room(self):
+        # Spot has room for one box and the wall's host, on demand for none, and neither
+        # listing ever shows the other's box (describe-instances is eventually consistent).
+        import tempfile
+        from concurrent.futures import ThreadPoolExecutor
+        s3 = tempfile.mkdtemp()
+        with ThreadPoolExecutor(2) as ex:
+            runs = list(ex.map(lambda _: self.up(od_in_use=boxes(3), s3=s3), range(2)))
+        self.assertEqual(sorted(r.returncode == 0 for r, _, _ in runs), [False, True], [r.stderr for r, _, _ in runs])
+        self.assertEqual(sum(len(launches) for _, launches, _ in runs), 1)
+        self.assertFalse(os.path.exists(os.path.join(s3, "gpubox", "admission.lock")), "the lock was left behind")
+
+    def test_a_held_lock_is_broken_once_stale(self):
+        import tempfile
+        s3 = tempfile.mkdtemp()
+        os.makedirs(os.path.join(s3, "gpubox"))
+        with open(os.path.join(s3, "gpubox", "admission.lock"), "w") as f:
+            f.write(f"{int(time.time()) - 400} gone\n")
+        r, launches, _ = self.up(od_in_use=boxes(3), s3=s3)
+        self.assertEqual((r.returncode, len(launches)), (0, 1), r.stderr)
+        self.assertIn("breaking an admission lock", r.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class PathrunLighting(unittest.TestCase):
+    def test_a_late_pass_posts_the_latest_time_of_day_not_the_next(self):
+        # The director's time of day moves every second while the camera flies; pathrun
+        # polls every 2 s, so a pass must catch up to the value due now, not the one after
+        # the last it posted, or the lighting falls behind the camera for the whole run.
+        tods = [(0.0, 0.71), (11.0, 0.7106), (12.0, 0.7112), (13.0, 0.7118), (30.0, 0.735)]
+        v, i = pathrun.due(tods, 1, 13.5)
+        self.assertEqual((v, i), (0.7118, 4))
+        self.assertEqual(pathrun.due(tods, i, 14.0), (None, 4))
