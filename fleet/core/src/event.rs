@@ -91,6 +91,14 @@ pub enum Event {
         at: u64,
         instances: Vec<ScaleInstance>,
     },
+    /// The GPU hosts the launcher keeps for the awake capacity (`--host-template`), by
+    /// instance id (an agent's host name), when every region is listed and holds that many
+    /// pending or running hosts; `None` while any region is unlisted or short, or when the
+    /// coordinator launches no hosts.
+    HostsExpected {
+        at: u64,
+        hosts: Option<Vec<String>>,
+    },
     /// A launch's or an aggregator's DNS names were minted; the coordinator's subzone
     /// answers them from the state this event is applied to.
     Published {
@@ -124,6 +132,7 @@ impl Event {
             | Event::Visibility { at, .. }
             | Event::Ec2Health { at, .. }
             | Event::ScaleInstances { at, .. }
+            | Event::HostsExpected { at, .. }
             | Event::Published { at, .. } => *at,
         }
     }

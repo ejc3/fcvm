@@ -651,6 +651,10 @@ pub struct Fleet {
     /// Potato mode's game.
     #[serde(default)]
     pub potato: crate::potato::Potato,
+    /// The GPU hosts the launcher keeps, by instance id (`Event::HostsExpected`); `None`
+    /// when it cannot say, or the coordinator launches none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_hosts: Option<std::collections::BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -715,6 +719,7 @@ impl State {
                 phones_zoom: Default::default(),
                 last_phones_zoom_at: BTreeMap::new(),
                 potato: Default::default(),
+                expected_hosts: None,
             },
             config,
             receipts: BTreeMap::new(),

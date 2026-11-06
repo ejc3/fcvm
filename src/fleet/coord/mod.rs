@@ -781,6 +781,7 @@ fn set_at(event: &mut Event, t: u64) {
         | Event::ReleaseQuarantine { at, .. }
         | Event::Visibility { at, .. }
         | Event::ScaleInstances { at, .. }
+        | Event::HostsExpected { at, .. }
         | Event::Ec2Health { at, .. }
         | Event::Published { at, .. } => *at = t,
     }
