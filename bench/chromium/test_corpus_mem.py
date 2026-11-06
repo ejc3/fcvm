@@ -3555,7 +3555,8 @@ class ZeroBasis(unittest.TestCase):
                 # The guest rootfs has netcat-openbsd and iproute2, not curl.
                 self.assertIn("nc -w 2 127.0.0.1 9222", argv)
                 self.assertNotIn("curl", argv)
-                self.assertIn("-L FCVM_SNAPSHOT_IN -v -n -x", argv)
+                self.assertIn("nft list ruleset", argv)
+                self.assertIn("/proc/net/snmp", argv)
 
     def test_a_serve_sample_with_no_process_basis_is_refused(self):
         args = SimpleNamespace(state_dir="/state")

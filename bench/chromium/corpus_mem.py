@@ -727,10 +727,12 @@ def clone_forensics(args, clone, reason):
                  "rc=$?; printf '%s\\n' \"$r\" | head -c 400; echo; echo nc_rc=$rc; ss -Htlnp; "
                  # The restore's ingress gate answers a new inbound TCP flow
                  # with a reset until the restore publishes (fc-agent
-                 # snapshot_network.rs); its rules and counters say whether
-                 # the resets were the gate's.
-                 "for t in iptables ip6tables; do echo \"== $t\"; "
-                 "$t -w 2 -L FCVM_SNAPSHOT_IN -v -n -x 2>&1; done; "
+                 # snapshot_network.rs). The rules say whether its chain is
+                 # still hooked, nft's counters how often it matched, and the
+                 # TCP counters how many resets the guest's own stack sent.
+                 "for t in iptables ip6tables; do echo \"== $t\"; $t -w 2 -S 2>&1 | head -40; done; "
+                 "echo '== nft'; nft list ruleset 2>&1 | grep -B2 -A12 FCVM_SNAPSHOT | head -80; "
+                 "echo '== tcp'; grep -A1 '^Tcp:' /proc/net/snmp; "
                  "echo '== browser'; pgrep -l chrom | head -5")
         try:
             inside = sh([args.fcvm, "exec", "--pid", str(clone["fcvm_pid"]), "--vm", "--",
