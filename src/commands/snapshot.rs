@@ -3130,11 +3130,10 @@ async fn cmd_snapshot_run_inner(
                 &mut vm_state,
             )
             .await
-            .map(|(backend, holder, lease)| {
+            .map(|(backend, holder)| {
                 (
                     Box::new(backend) as Box<dyn crate::hypervisor::Hypervisor>,
                     holder,
-                    lease,
                 )
             })
         } else {
@@ -3145,7 +3144,7 @@ async fn cmd_snapshot_run_inner(
                 &mut vm_state,
             )
             .await
-            .map(|(b, h, l)| (Box::new(b) as Box<dyn crate::hypervisor::Hypervisor>, h, l))
+            .map(|(b, h)| (Box::new(b) as Box<dyn crate::hypervisor::Hypervisor>, h))
         };
 
     // The restore has opened/reflinked everything it needs from the snapshot directory;
@@ -3154,10 +3153,7 @@ async fn cmd_snapshot_run_inner(
     drop(snapshot_shared_lock);
     failpoint::hit_async("restore.unlocked").await;
 
-    // `_vsock_redirect_lease` is held until this function returns, after the clone's
-    // teardown: its VMM resolves its vsock socket through the mount redirect for its
-    // whole life (storage::runtime_dir).
-    let (mut vm_manager, mut holder_child, _vsock_redirect_lease) = setup_try!(setup_result);
+    let (mut vm_manager, mut holder_child) = setup_try!(setup_result);
 
     // The VMM is now owned by the normal lifecycle. Move every companion out of
     // the setup transaction exactly once; failed setup never reaches this point.

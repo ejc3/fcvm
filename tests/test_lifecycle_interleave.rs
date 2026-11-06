@@ -2348,31 +2348,35 @@ async fn test_lifecycle_interleave_gym_cold_run_restore_after_source_teardown() 
 }
 
 // ---------------------------------------------------------------------------
-// CASE: source_teardown_waits_for_clone_disk_open
+// CASE: source_teardown_does_not_wait_for_a_restoring_clone
 // ---------------------------------------------------------------------------
 
-/// A clone's VMM opens the disks its snapshot names at the SOURCE VM's paths
-/// (`vm-disks/<source>/disks/rootfs.raw`), which resolve to the clone's own disks
-/// only through a bind mount over `vm-disks/<source>` in the VMM's mount namespace.
-/// When the source VM's teardown removes that directory, the kernel detaches the
-/// mount in every other namespace, so a clone whose VMM is between its spawn and
-/// its snapshot load then finds no disk. Four `podman run --gpu` launches of a new
-/// image hit this: each relaunches by restoring the first one's pre-start snapshot
-/// while the first one tears its source VM down.
+/// A clone's VMM reaches the disks its snapshot names at the source VM's paths through
+/// binds on a tmpfs over `vm-disks` in its own mount namespace (`utils::MountRedirects`),
+/// so the source VM's teardown, which removes `vm-disks/<source>` on the host, detaches
+/// nothing of the clone's and has nothing to wait for (#1311).
 ///
-/// The interleaving, made deterministic with `restore.pre_load`:
+/// Cloud Hypervisor clones always take the mount view (CH has no drive overrides), so the
+/// case runs there:
 ///
-/// 1. snapshot a rootless baseline, hold a clone of it at `restore.pre_load`
-///    (VMM spawned with its redirect, disks not yet opened);
-/// 2. SIGTERM the baseline, and wait until its teardown has either removed its
-///    runtime directory or logged that it waits for the clone;
-/// 3. release the clone. It must become healthy, and the baseline must then
-///    finish its teardown and remove its directory.
+/// 1. snapshot a rootless baseline, and hold a clone of it at
+///    `restore.post_network_pre_resume` (restored and paused, VMM spawned with its view);
+/// 2. SIGTERM the baseline: its teardown must finish, and remove its directory, while the
+///    clone is still held;
+/// 3. release the clone: it must become healthy.
+///
+/// RED BEFORE THE FIX: the teardown took the directory's lease exclusively and waited for
+/// the held clone's shared lease, so the baseline did not exit while the clone was held.
 #[tokio::test]
-async fn test_lifecycle_interleave_source_teardown_waits_for_clone_disk_open() -> Result<()> {
+async fn test_lifecycle_interleave_source_teardown_does_not_wait_for_a_restoring_clone(
+) -> Result<()> {
+    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
+        eprintln!("SKIP: cloud-hypervisor not found (#632/#61)");
+        return Ok(());
+    }
     let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("ilv-src-teardown");
-    let go_file = PathBuf::from(format!("/tmp/{clone_name}-pre-load-go"));
-    remove_file_if_exists(&go_file).context("removing stale pre-load go-file")?;
+    let go_file = PathBuf::from(format!("/tmp/{clone_name}-pre-resume-go"));
+    remove_file_if_exists(&go_file).context("removing stale pre-resume go-file")?;
 
     let mut baseline: Option<(tokio::process::Child, PinnedProcess)> = None;
     let mut clone: Option<(tokio::process::Child, PinnedProcess, PathBuf)> = None;
@@ -2388,6 +2392,8 @@ async fn test_lifecycle_interleave_source_teardown_waits_for_clone_disk_open() -
                     &baseline_name,
                     "--network",
                     "rootless",
+                    "--hypervisor",
+                    "cloud-hypervisor",
                     "--no-snapshot",
                     common::TEST_IMAGE,
                 ],
@@ -2398,7 +2404,7 @@ async fn test_lifecycle_interleave_source_teardown_waits_for_clone_disk_open() -
         let baseline_process =
             PinnedProcess::capture(baseline_pid).context("pinning rootless baseline")?;
         baseline = Some((baseline_child, baseline_process));
-        common::poll_health_by_pid(baseline_pid, 180)
+        common::poll_health_by_pid(baseline_pid, 300)
             .await
             .context("waiting for baseline health")?;
         let baseline_dir = artifacts_for_name(&baseline_name)?
@@ -2409,7 +2415,10 @@ async fn test_lifecycle_interleave_source_teardown_waits_for_clone_disk_open() -
             .context("creating the snapshot the clone restores")?;
         snapshot_created = true;
 
-        let failpoint_spec = format!("restore.pre_load:block_until_file:{}", go_file.display());
+        let failpoint_spec = format!(
+            "restore.post_network_pre_resume:block_until_file:{}",
+            go_file.display()
+        );
         let (clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
             &[
                 "snapshot",
@@ -2422,50 +2431,51 @@ async fn test_lifecycle_interleave_source_teardown_waits_for_clone_disk_open() -
             &[("FCVM_FAILPOINT", &failpoint_spec)],
         )
         .await
-        .context("spawning clone held before its snapshot load")?;
+        .context("spawning clone held before its resume")?;
         let clone_process = PinnedProcess::capture(clone_pid).context("pinning held clone")?;
         clone = Some((clone_child, clone_process, clone_log.clone()));
         let reached_at = wait_for_marker(
             &clone_log,
-            "FAILPOINT restore.pre_load reached",
+            "FAILPOINT restore.post_network_pre_resume reached",
             0,
-            Duration::from_secs(120),
+            Duration::from_secs(180),
         )
         .await?;
 
-        // The source goes away while the clone's VMM still has to open its disks.
-        let (_, baseline_process) = baseline.as_ref().context("baseline fixture disappeared")?;
+        // The source goes away while the clone is held.
+        let (baseline_child, baseline_process) =
+            baseline.as_mut().context("baseline fixture disappeared")?;
         baseline_process.signal(libc::SIGTERM)?;
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            if !baseline_dir.exists()
-                || log_contains(
-                    &baseline_log,
-                    "VM teardown waiting for clone restores that bind over its runtime directory",
+        let baseline_status = wait_exit(baseline_child, Duration::from_secs(60))
+            .await
+            .with_context(|| {
+                format!(
+                    "the baseline's teardown did not finish within 60 s while a clone of its \
+                     snapshot was held; log tail:\n{}",
+                    log_tail(&baseline_log, 40)
                 )
-            {
-                break;
-            }
-            anyhow::ensure!(
-                Instant::now() < deadline,
-                "baseline teardown neither removed {} nor waited for the clone within 60 s; \
-                 log tail:\n{}",
-                baseline_dir.display(),
-                log_tail(&baseline_log, 40)
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+            })?;
+        baseline = None;
+        anyhow::ensure!(
+            baseline_status.success(),
+            "baseline exited unsuccessfully: {baseline_status:?}"
+        );
+        anyhow::ensure!(
+            !baseline_dir.exists(),
+            "the baseline's teardown left {}",
+            baseline_dir.display()
+        );
         anyhow::ensure!(
             search_log_from(
                 &clone_log,
-                "FAILPOINT restore.pre_load released",
+                "FAILPOINT restore.post_network_pre_resume released",
                 reached_at
             )
             .is_none(),
-            "the clone loaded its snapshot before the baseline teardown reached its directory"
+            "the clone went on before the baseline's teardown finished"
         );
 
-        std::fs::write(&go_file, b"go").context("releasing restore.pre_load")?;
+        std::fs::write(&go_file, b"go").context("releasing the held clone")?;
         let (clone_child, _, _) = clone.as_mut().context("clone fixture disappeared")?;
         common::poll_health(clone_child, 180)
             .await
@@ -2475,28 +2485,13 @@ async fn test_lifecycle_interleave_source_teardown_waits_for_clone_disk_open() -
                     log_tail(&clone_log, 60)
                 )
             })?;
-
-        let (baseline_child, _) = baseline.as_mut().context("baseline fixture disappeared")?;
-        let baseline_status = wait_exit(baseline_child, Duration::from_secs(60))
-            .await
-            .context("baseline teardown did not finish after the clone loaded")?;
-        baseline = None;
-        anyhow::ensure!(
-            baseline_status.success(),
-            "baseline exited unsuccessfully: {baseline_status:?}"
-        );
-        anyhow::ensure!(
-            !baseline_dir.exists(),
-            "baseline teardown left its runtime directory {}",
-            baseline_dir.display()
-        );
         Ok(())
     }
     .await;
 
     let mut cleanup_errors = Vec::new();
     if let Err(error) = std::fs::write(&go_file, b"cleanup") {
-        cleanup_errors.push(format!("releasing pre-load failpoint: {error}"));
+        cleanup_errors.push(format!("releasing the held clone: {error}"));
     }
     let mut all_children_stopped = true;
     if let Some((child, process, _)) = clone.as_mut() {
@@ -2517,7 +2512,7 @@ async fn test_lifecycle_interleave_source_teardown_waits_for_clone_disk_open() -
         }
     }
     if let Err(error) = remove_file_if_exists(&go_file) {
-        cleanup_errors.push(format!("removing pre-load go-file: {error:#}"));
+        cleanup_errors.push(format!("removing pre-resume go-file: {error:#}"));
     }
 
     if let Err(error) = exercise {
@@ -2876,17 +2871,20 @@ async fn test_lifecycle_interleave_clone_vmm_shares_the_host_mount_namespace() -
     Ok(())
 }
 
-/// A restore of a snapshot whose source VM is gone recreates the source's runtime
-/// directory as a mountpoint for its disk redirect (issue 1187). Once the clone's VMM
-/// has opened its disks through it, and its Firecracker takes the vsock override
-/// (1.16.0 and later), nothing needs it, so the restore removes it. An older
-/// Firecracker resolves its vsock socket through the redirect for its whole life, so
-/// the directory stays until the clone exits. Either way none is left behind.
+/// A restore of a snapshot whose source VM is gone makes nothing on the host at the
+/// source's runtime directory: the clone's binds sit on a tmpfs in its own namespace, so
+/// `vm-disks/<source>` stays absent while the clone runs and after it exits (#1181, #1311).
 ///
-/// RED BEFORE THE FIX: the recreated directory outlived the clone.
-#[tokio::test]
-async fn test_lifecycle_interleave_restore_removes_a_recreated_source_dir() -> Result<()> {
-    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("ilv-recreated");
+/// RED BEFORE THE FIX on Cloud Hypervisor (and Firecracker before 1.16.0): the restore
+/// recreated `vm-disks/<source>` on the host as a mountpoint for its lease and kept it for
+/// the clone's life.
+async fn restore_never_recreates_the_source_dir(prefix: &str, hypervisor: &str) -> Result<()> {
+    if hypervisor == "cloud-hypervisor" && fcvm::commands::common::find_cloud_hypervisor().is_err()
+    {
+        eprintln!("SKIP: cloud-hypervisor not found (#632/#61)");
+        return Ok(());
+    }
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names(prefix);
     let mut clone: Option<(tokio::process::Child, PinnedProcess)> = None;
     let mut snapshot_created = false;
 
@@ -2899,6 +2897,8 @@ async fn test_lifecycle_interleave_restore_removes_a_recreated_source_dir() -> R
                 &baseline_name,
                 "--network",
                 "rootless",
+                "--hypervisor",
+                hypervisor,
                 "--no-snapshot",
                 common::TEST_IMAGE,
             ],
@@ -2909,7 +2909,7 @@ async fn test_lifecycle_interleave_restore_removes_a_recreated_source_dir() -> R
         let baseline_process =
             PinnedProcess::capture(baseline_pid).context("pinning rootless baseline")?;
         let seeded: Result<PathBuf> = async {
-            common::poll_health_by_pid(baseline_pid, 180).await?;
+            common::poll_health_by_pid(baseline_pid, 300).await?;
             let dir = artifacts_for_name(&baseline_name)?
                 .context("baseline published no state")?
                 .data_dir;
@@ -2944,7 +2944,7 @@ async fn test_lifecycle_interleave_restore_removes_a_recreated_source_dir() -> R
         let clone_process = PinnedProcess::capture(clone_pid).context("pinning the clone")?;
         clone = Some((clone_child, clone_process));
         let (clone_child, _) = clone.as_mut().context("clone fixture disappeared")?;
-        common::poll_health(clone_child, 180)
+        common::poll_health(clone_child, 300)
             .await
             .with_context(|| {
                 format!(
@@ -2952,45 +2952,14 @@ async fn test_lifecycle_interleave_restore_removes_a_recreated_source_dir() -> R
                     log_tail(&clone_log, 60)
                 )
             })?;
-        let firecracker = ls_vm_by_pid(clone_pid)
-            .await?
-            .and_then(|state| state.config.firecracker_bin)
-            .context("the clone recorded no Firecracker binary")?;
-        let version = std::process::Command::new(&firecracker)
-            .arg("--version")
-            .output()
-            .with_context(|| format!("running {} --version", firecracker.display()))?;
-        let version = String::from_utf8_lossy(&version.stdout).to_string();
-        let word = version
-            .split_whitespace()
-            .find_map(|word| word.strip_prefix('v'))
-            .with_context(|| format!("no version in {version:?}"))?;
-        // Build metadata (`+fcvm.drive-overrides`) does not order versions.
-        let word = word.split_once('+').map_or(word, |(version, _)| version);
-        let (release, prerelease) = match word.split_once('-') {
-            Some((release, _)) => (release, true),
-            None => (word, false),
-        };
-        let numbers: Vec<u32> = release
-            .split('.')
-            .map(|part| part.parse().context("parsing the Firecracker version"))
-            .collect::<Result<_>>()?;
-        // The rule restore applies (`FirecrackerVersion::at_least`): a pre-release of
-        // 1.16.0 can predate the override, so it counts as older.
-        let min = [1u32, 16, 0];
-        let overrides_vsock =
-            numbers.as_slice() > min.as_slice() || (numbers.as_slice() == min && !prerelease);
         anyhow::ensure!(
-            baseline_dir.exists() != overrides_vsock,
-            "Firecracker {} (vsock override: {overrides_vsock}): the source directory the \
-             restore recreated is {} while the clone runs; log tail:\n{}",
-            version.trim(),
-            if baseline_dir.exists() {
-                "present"
-            } else {
-                "gone"
-            },
-            log_tail(&clone_log, 40)
+            ls_vm_by_pid(clone_pid).await?.is_some(),
+            "the clone published no state"
+        );
+        anyhow::ensure!(
+            !baseline_dir.exists(),
+            "the restore made the source directory {} on the host while the clone runs",
+            baseline_dir.display()
         );
         let (clone_child, clone_process) = clone.as_mut().context("clone fixture disappeared")?;
         stop_test_child(clone_child, clone_process)
@@ -2999,7 +2968,7 @@ async fn test_lifecycle_interleave_restore_removes_a_recreated_source_dir() -> R
         clone = None;
         anyhow::ensure!(
             !baseline_dir.exists(),
-            "the restore left the source directory it recreated: {}",
+            "the restore left the source directory {}",
             baseline_dir.display()
         );
         Ok(())
@@ -3026,4 +2995,15 @@ async fn test_lifecycle_interleave_restore_removes_a_recreated_source_dir() -> R
         cleanup_errors.join("\n- ")
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn test_lifecycle_interleave_restore_never_recreates_a_source_dir() -> Result<()> {
+    restore_never_recreates_the_source_dir("ilv-recreated", "firecracker").await
+}
+
+#[tokio::test]
+async fn test_lifecycle_interleave_cloud_hypervisor_restore_never_recreates_a_source_dir(
+) -> Result<()> {
+    restore_never_recreates_the_source_dir("ilv-ch-recreated", "cloud-hypervisor").await
 }
