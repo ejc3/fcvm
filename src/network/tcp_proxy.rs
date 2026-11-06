@@ -101,13 +101,54 @@ impl Drop for Relay {
     }
 }
 
+/// How many connections the relays of one call may hold at once: those relaying and
+/// those whose upstream dial is still in progress. Each holds two descriptors (fcvm
+/// raises RLIMIT_NOFILE to 65536 at startup) and a task. At the limit a relay stops
+/// accepting, so a new client waits in its listener's accept queue (capped by
+/// net.core.somaxconn), and once that is full the kernel stops answering its SYN and
+/// the client retries. A relay accepts again as soon as one of its connections ends.
+pub const RELAY_CONNECTION_LIMIT: usize = 4096;
+
+/// The connections a set of relays may hold at once, shared by every relay given it.
+pub type RelayLimit = Arc<tokio::sync::Semaphore>;
+
+/// A limit of `connections` for the relays it is given.
+pub fn relay_limit(connections: usize) -> RelayLimit {
+    Arc::new(tokio::sync::Semaphore::new(connections))
+}
+
+/// Accept connections on `listener` and relay each to an upstream via `connect`, with a
+/// limit of its own ([`RELAY_CONNECTION_LIMIT`]).
+fn spawn_relay_loop<F, Fut>(
+    listener: tokio::net::TcpListener,
+    connect: F,
+    label: &'static str,
+) -> Relay
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<tokio::net::TcpStream>> + Send,
+{
+    spawn_limited_relay_loop(
+        listener,
+        relay_limit(RELAY_CONNECTION_LIMIT),
+        connect,
+        label,
+    )
+}
+
 /// Accept connections on `listener` and relay each to an upstream via `connect`.
 ///
 /// Shared relay loop used by both port forwarding and proxy relay. The relay's task owns
 /// the listener and every connection it accepted. Once stopped (`stop_relays`) it closes
 /// the listener, ends the connections and finishes only when their tasks have.
-fn spawn_relay_loop<F, Fut>(
+///
+/// A connection holds one of `limit`'s permits from before it is accepted until its task
+/// ends, its dial of the upstream included. With none free the relay does not accept.
+/// The dial is bounded by the kernel's SYN retries (`net.ipv4.tcp_syn_retries`, 6 by
+/// default: about 127 s), and a stopped relay ends a dial in progress with its task.
+fn spawn_limited_relay_loop<F, Fut>(
     listener: tokio::net::TcpListener,
+    limit: RelayLimit,
     connect: F,
     label: &'static str,
 ) -> Relay
@@ -123,7 +164,35 @@ where
         // the relay: a stopped relay shuts the set down below, and aborting this task
         // drops the set, which aborts each of them.
         let mut connections = tokio::task::JoinSet::new();
+        let mut at_limit = false;
         loop {
+            let permit = match Arc::clone(&limit).try_acquire_owned() {
+                Ok(permit) => {
+                    if at_limit {
+                        at_limit = false;
+                        info!("{label} relay below its connection limit, accepting again");
+                    }
+                    permit
+                }
+                Err(_) => {
+                    if !at_limit {
+                        at_limit = true;
+                        warn!(
+                            held = connections.len(),
+                            "{label} relay at its connection limit; new clients wait in the \
+                             listen queue"
+                        );
+                    }
+                    tokio::select! {
+                        _ = stopped.cancelled() => break,
+                        permit = Arc::clone(&limit).acquire_owned() => match permit {
+                            Ok(permit) => permit,
+                            Err(_) => break,
+                        },
+                        Some(_) = connections.join_next() => continue,
+                    }
+                }
+            };
             let accepted = tokio::select! {
                 _ = stopped.cancelled() => break,
                 accepted = listener.accept() => accepted,
@@ -134,6 +203,7 @@ where
                 Ok((client, peer)) => {
                     let connect = Arc::clone(&connect);
                     connections.spawn(async move {
+                        let _permit = permit;
                         match connect().await {
                             Ok(mut upstream) => {
                                 let mut client = client;
@@ -296,6 +366,10 @@ pub async fn start_port_forwards(
         .with_context(|| format!("invalid guest address {guest_ip}"))?;
     let listeners = bind_port_forwards(loopback_ip, mappings)?;
     let ns_name: Arc<str> = ns_name.into();
+    // One limit for the VM's published ports together, so a VM holds at most this many
+    // relayed connections and pending guest dials however many ports it publishes. A
+    // mapping with a HOSTIP can be reachable from other machines (`--publish [::]:80:80`).
+    let limit = relay_limit(RELAY_CONNECTION_LIMIT);
 
     Ok(listeners
         .into_iter()
@@ -303,8 +377,9 @@ pub async fn start_port_forwards(
         .map(|(listener, mapping)| {
             let ns_name = Arc::clone(&ns_name);
             let guest_addr = SocketAddr::new(guest_ip, mapping.guest_port);
-            spawn_relay_loop(
+            spawn_limited_relay_loop(
                 listener,
+                Arc::clone(&limit),
                 move || {
                     let ns = Arc::clone(&ns_name);
                     async move { connect_in_namespace(&ns, guest_addr).await }
@@ -543,6 +618,103 @@ pub async fn start_host_proxy_relay(bind_ip: &str, upstream: Vec<SocketAddr>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wait until `count` reaches `want`, then check it stays there for a while.
+    async fn settles_at(count: &std::sync::atomic::AtomicUsize, want: usize) {
+        use std::sync::atomic::Ordering;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while count.load(Ordering::SeqCst) < want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {} of {want} connections reached the upstream",
+                count.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            want,
+            "the relay dialled more upstreams than its limit allows"
+        );
+    }
+
+    /// A relay holds at most its limit of connections; a client over it waits in the
+    /// listen queue and is relayed once a connection ends (#1040).
+    #[tokio::test]
+    async fn a_relay_holds_no_more_connections_than_its_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = listener.local_addr().unwrap();
+        let dialled = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&dialled);
+        let relay = spawn_limited_relay_loop(
+            listener,
+            relay_limit(2),
+            move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(tokio::net::TcpStream::connect(upstream_addr).await?)
+                }
+            },
+            "test",
+        );
+        let mut clients = Vec::new();
+        for _ in 0..3 {
+            clients.push(tokio::net::TcpStream::connect(relay_addr).await.unwrap());
+        }
+        settles_at(&dialled, 2).await;
+        // The two relayed connections end on both sides; the waiting client is relayed.
+        let (first, _) = upstream.accept().await.unwrap();
+        let (second, _) = upstream.accept().await.unwrap();
+        drop((first, second, clients.remove(0), clients.remove(0)));
+        settles_at(&dialled, 3).await;
+        stop_relays([relay]).await;
+    }
+
+    /// A dial of the upstream that has not finished holds its place under the limit,
+    /// and stopping the relay ends it.
+    #[tokio::test]
+    async fn a_dial_in_progress_counts_toward_the_limit_and_ends_with_the_relay() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = listener.local_addr().unwrap();
+        let dialled = Arc::new(AtomicUsize::new(0));
+        let ended = Arc::new(AtomicBool::new(false));
+        let (counter, flag) = (Arc::clone(&dialled), Arc::clone(&ended));
+        let relay = spawn_limited_relay_loop(
+            listener,
+            relay_limit(1),
+            move || {
+                let counter = Arc::clone(&counter);
+                let guard = Dropped(Arc::clone(&flag));
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let _guard = guard;
+                    std::future::pending::<Result<tokio::net::TcpStream>>().await
+                }
+            },
+            "test",
+        );
+        let _first = tokio::net::TcpStream::connect(relay_addr).await.unwrap();
+        let _second = tokio::net::TcpStream::connect(relay_addr).await.unwrap();
+        settles_at(&dialled, 1).await;
+        assert!(!ended.load(Ordering::SeqCst));
+        stop_relays([relay]).await;
+        assert!(
+            ended.load(Ordering::SeqCst),
+            "the dial in progress outlived its stopped relay"
+        );
+    }
 
     /// A message the upstream writes in two parts reaches the relay's client without
     /// waiting for the client to acknowledge the first part. The relay writes each read
