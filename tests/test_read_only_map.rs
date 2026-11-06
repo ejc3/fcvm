@@ -608,6 +608,37 @@ async fn test_read_only_map_refuses_guest_writes() -> Result<()> {
             ));
         }
 
+        // A guest that remounts the map read-write gets past its own kernel, so the host's
+        // VolumeServer has to refuse the writes (#1042).
+        let remounted = attempt(pid, false, &format!("mount -i -o remount,rw {GUEST_DIR}")).await?;
+        let mountinfo = common::exec_in_vm(pid, &["cat /proc/self/mountinfo"]).await?;
+        let (per_mount, _) = mount_options_of(&mountinfo, GUEST_DIR)?;
+        if remounted != "status=0" || !per_mount.iter().any(|o| o == "rw") {
+            wrong.push(format!(
+                "the guest could not remount {GUEST_DIR} read-write, so the server's refusal \
+                 was not tried: {remounted:?}, mount options {}",
+                per_mount.join(",")
+            ));
+        }
+        for (what, command) in [
+            ("creating a file", format!("touch {GUEST_DIR}/created-after-remount")),
+            (
+                "overwriting a file",
+                format!("echo overwritten after the remount > {GUEST_DIR}/existing.txt"),
+            ),
+            ("making a directory", format!("mkdir {GUEST_DIR}/dir-after-remount")),
+            ("removing a file", format!("rm -f {GUEST_DIR}/existing.txt")),
+            ("changing a mode", format!("chmod 600 {GUEST_DIR}/existing.txt")),
+        ] {
+            let out = attempt(pid, false, &command).await?;
+            if !out.contains("Read-only file system") {
+                wrong.push(format!(
+                    "{what} from the guest OS after it remounted the map read-write did not \
+                     fail with EROFS: {out:?}"
+                ));
+            }
+        }
+
         let mut on_host: Vec<String> = std::fs::read_dir(&host_dir)?
             .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
             .collect::<Result<_>>()?;
@@ -617,11 +648,10 @@ async fn test_read_only_map_refuses_guest_writes() -> Result<()> {
                 "the host directory holds {on_host:?} after the guest's writes, not only existing.txt"
             ));
         }
-        let existing = std::fs::read_to_string(host_dir.join("existing.txt"))?;
-        if existing != HOST_CONTENT {
-            wrong.push(format!(
-                "existing.txt on the host now reads {existing:?}"
-            ));
+        match std::fs::read_to_string(host_dir.join("existing.txt")) {
+            Ok(existing) if existing == HOST_CONTENT => {}
+            Ok(existing) => wrong.push(format!("existing.txt on the host now reads {existing:?}")),
+            Err(e) => wrong.push(format!("existing.txt cannot be read on the host: {e}")),
         }
 
         anyhow::ensure!(

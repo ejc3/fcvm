@@ -56,6 +56,9 @@ pub struct PassthroughFs {
     attr_ttl_secs: u64,
     /// The server of a read-only volume: OPEN answers ENOSYS, see `try_for_volume`.
     zero_message_open: bool,
+    /// The server of a read-only volume refuses every request that could change it, see
+    /// `handle_request`.
+    read_only: bool,
 }
 
 impl PassthroughFs {
@@ -143,6 +146,7 @@ impl PassthroughFs {
             root_path,
             attr_ttl_secs: ATTR_TTL_SECS,
             zero_message_open: no_open,
+            read_only,
         })
     }
 
@@ -262,6 +266,26 @@ impl FilesystemHandler for PassthroughFs {
         let _guard = GroupsGuard;
 
         self.handle_request(request)
+    }
+
+    /// The server of a read-only volume answers a request that could change the volume with
+    /// EROFS (`VolumeRequest::writes_to_volume`) and serves the rest.
+    ///
+    /// fc-agent mounts a read-only volume read-only, so the guest kernel refuses a write before it
+    /// becomes a request. This is the host's own check, for a guest that remounts the volume
+    /// read-write or runs an agent that mounts it read-write: the host directory of a read-only
+    /// map is not written from the guest whatever the guest does. Every request reaches the
+    /// volume through here, `RemapFs`'s reopens of handles from before a restore included.
+    fn handle_request(&self, request: &VolumeRequest) -> VolumeResponse {
+        if self.read_only && request.writes_to_volume() {
+            tracing::debug!(
+                target: "passthrough",
+                op = request.op_name(),
+                "refused on a read-only volume"
+            );
+            return VolumeResponse::error(libc::EROFS);
+        }
+        super::handler::dispatch(self, request)
     }
 
     fn lookup(&self, parent: u64, name: &[u8], uid: u32, gid: u32, pid: u32) -> VolumeResponse {
@@ -1446,6 +1470,390 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The names of a path's extended attributes, not following a symlink.
+    fn xattr_names(path: &std::path::Path) -> Vec<String> {
+        use std::os::unix::ffi::OsStrExt;
+        let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut buf = vec![0u8; 4096];
+        // SAFETY: cpath is NUL-terminated and buf is writable for its length.
+        let len = unsafe { libc::llistxattr(cpath.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        assert!(
+            len >= 0,
+            "llistxattr {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+        let mut names: Vec<String> = buf[..len as usize]
+            .split(|b| *b == 0)
+            .filter(|n| !n.is_empty())
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Everything a test can see of a directory tree: each path, its mode, size, mtime, contents and
+    /// extended attribute names.
+    #[allow(clippy::type_complexity)]
+    fn tree_of(
+        root: &std::path::Path,
+    ) -> Vec<(String, u32, u64, (i64, i64), Vec<u8>, Vec<String>)> {
+        use std::os::unix::fs::MetadataExt;
+        let mut seen = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                let contents = if meta.is_file() {
+                    std::fs::read(&path).unwrap()
+                } else if meta.file_type().is_symlink() {
+                    std::fs::read_link(&path)
+                        .unwrap()
+                        .into_os_string()
+                        .into_encoded_bytes()
+                } else {
+                    if meta.is_dir() {
+                        pending.push(path.clone());
+                    }
+                    Vec::new()
+                };
+                let xattrs = xattr_names(&path);
+                seen.push((
+                    path.strip_prefix(root).unwrap().display().to_string(),
+                    meta.mode(),
+                    meta.size(),
+                    (meta.mtime(), meta.mtime_nsec()),
+                    contents,
+                    xattrs,
+                ));
+            }
+        }
+        seen.sort();
+        seen
+    }
+
+    /// The server of a read-only volume answers every request that could change the volume with
+    /// EROFS, through the entry point the volume server calls, and the host directory stays as it
+    /// was. A guest that remounts the volume read-write sends exactly these requests (#1042). Each
+    /// request is first served by a read-write volume's server, which must change the directory,
+    /// so that none of them is refused for some other reason.
+    #[test]
+    fn test_read_only_server_refuses_every_write() {
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let fixture = || {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("file.txt"), "content").unwrap();
+            std::fs::create_dir(dir.path().join("sub")).unwrap();
+            std::fs::create_dir(dir.path().join("empty")).unwrap();
+            let file = CString::new(
+                dir.path()
+                    .join("file.txt")
+                    .into_os_string()
+                    .into_encoded_bytes(),
+            )
+            .unwrap();
+            // SAFETY: both strings are NUL-terminated and the value is valid for its length.
+            let set = unsafe {
+                libc::setxattr(
+                    file.as_ptr(),
+                    c"user.kept".as_ptr(),
+                    b"v".as_ptr().cast(),
+                    1,
+                    0,
+                )
+            };
+            assert_eq!(set, 0, "setxattr: {}", std::io::Error::last_os_error());
+            dir
+        };
+        let ino_of = |fs: &PassthroughFs, name: &[u8]| match fs.lookup(1, name, uid, gid, 0) {
+            VolumeResponse::Entry { attr, .. } => attr.ino,
+            other => panic!("lookup {}: {other:?}", String::from_utf8_lossy(name)),
+        };
+        // Each request, given the inodes of file.txt and sub/ and two handles on file.txt.
+        type Build = Box<dyn Fn(u64, u64, (u64, u64)) -> VolumeRequest>;
+        let setattr = move |ino, mode, size, mtime_now| VolumeRequest::Setattr {
+            ino,
+            mode,
+            uid: None,
+            gid: None,
+            size,
+            atime_secs: None,
+            atime_nsecs: None,
+            atime_now: false,
+            mtime_secs: None,
+            mtime_nsecs: None,
+            mtime_now,
+            fh: None,
+            caller_uid: uid,
+            caller_gid: gid,
+            caller_pid: 0,
+        };
+        let writes: Vec<(&str, Build)> = vec![
+            (
+                "setattr mode",
+                Box::new(move |f, _, _| setattr(f, Some(0o600), None, false)),
+            ),
+            (
+                "setattr size",
+                Box::new(move |f, _, _| setattr(f, None, Some(1), false)),
+            ),
+            (
+                "setattr mtime",
+                Box::new(move |f, _, _| setattr(f, None, None, true)),
+            ),
+            (
+                "mkdir",
+                Box::new(move |_, _, _| VolumeRequest::Mkdir {
+                    parent: 1,
+                    name: b"new-dir".to_vec(),
+                    mode: 0o755,
+                    uid,
+                    gid,
+                    pid: 0,
+                }),
+            ),
+            (
+                "mknod",
+                Box::new(move |_, _, _| VolumeRequest::Mknod {
+                    parent: 1,
+                    name: b"fifo".to_vec(),
+                    mode: libc::S_IFIFO | 0o644,
+                    rdev: 0,
+                    uid,
+                    gid,
+                    pid: 0,
+                }),
+            ),
+            (
+                "rmdir",
+                Box::new(move |_, _, _| VolumeRequest::Rmdir {
+                    parent: 1,
+                    name: b"empty".to_vec(),
+                    uid,
+                    gid,
+                    pid: 0,
+                }),
+            ),
+            (
+                "create",
+                Box::new(move |_, _, _| VolumeRequest::Create {
+                    parent: 1,
+                    name: b"new.txt".to_vec(),
+                    mode: 0o644,
+                    flags: (libc::O_CREAT | libc::O_RDWR) as u32,
+                    uid,
+                    gid,
+                    pid: 0,
+                }),
+            ),
+            (
+                "open with O_TRUNC",
+                Box::new(move |f, _, _| VolumeRequest::Open {
+                    ino: f,
+                    flags: (libc::O_WRONLY | libc::O_TRUNC) as u32,
+                    uid,
+                    gid,
+                    pid: 0,
+                }),
+            ),
+            (
+                "write",
+                Box::new(move |f, _, (fh, _)| VolumeRequest::Write {
+                    ino: f,
+                    fh,
+                    offset: 0,
+                    data: b"CHANGED".to_vec(),
+                    uid,
+                    gid,
+                    pid: 0,
+                }),
+            ),
+            (
+                "unlink",
+                Box::new(move |_, _, _| VolumeRequest::Unlink {
+                    parent: 1,
+                    name: b"file.txt".to_vec(),
+                    uid,
+                    gid,
+                    pid: 0,
+                }),
+            ),
+            (
+                "rename",
+                Box::new(move |_, s, _| VolumeRequest::Rename {
+                    parent: 1,
+                    name: b"file.txt".to_vec(),
+                    newparent: s,
+                    newname: b"moved.txt".to_vec(),
+                    flags: 0,
+                    uid,
+                    gid,
+                    pid: 0,
+                }),
+            ),
+            (
+                "symlink",
+                Box::new(move |_, _, _| VolumeRequest::Symlink {
+                    parent: 1,
+                    name: b"link".to_vec(),
+                    target: b"file.txt".to_vec(),
+                    uid,
+                    gid,
+                    pid: 0,
+                }),
+            ),
+            (
+                "link",
+                Box::new(move |f, s, _| VolumeRequest::Link {
+                    ino: f,
+                    newparent: s,
+                    newname: b"hard.txt".to_vec(),
+                    uid,
+                    gid,
+                    pid: 0,
+                }),
+            ),
+            (
+                "setxattr",
+                Box::new(move |f, _, _| VolumeRequest::Setxattr {
+                    ino: f,
+                    name: b"user.fcvm".to_vec(),
+                    value: b"v".to_vec(),
+                    flags: 0,
+                    uid,
+                    gid,
+                    pid: 0,
+                }),
+            ),
+            (
+                "removexattr",
+                Box::new(move |f, _, _| VolumeRequest::Removexattr {
+                    ino: f,
+                    name: b"user.kept".to_vec(),
+                    uid,
+                    gid,
+                    pid: 0,
+                }),
+            ),
+            (
+                "fallocate",
+                Box::new(move |f, _, (fh, _)| VolumeRequest::Fallocate {
+                    ino: f,
+                    fh,
+                    offset: 0,
+                    length: 1 << 20,
+                    mode: 0,
+                }),
+            ),
+            (
+                "copy_file_range",
+                Box::new(move |f, _, (fh, fh_out)| VolumeRequest::CopyFileRange {
+                    ino_in: f,
+                    fh_in: fh,
+                    offset_in: 0,
+                    ino_out: f,
+                    fh_out,
+                    offset_out: 7,
+                    len: 7,
+                    flags: 0,
+                }),
+            ),
+        ];
+
+        for (name, build) in &writes {
+            let dir = fixture();
+            let before = tree_of(dir.path());
+            let fs = PassthroughFs::for_volume(dir.path(), false);
+            let (file, sub) = (ino_of(&fs, b"file.txt"), ino_of(&fs, b"sub"));
+            // COPY_FILE_RANGE reads through one handle and writes through the other.
+            let open = || match fs.open(file, libc::O_RDWR as u32, uid, gid, 0) {
+                VolumeResponse::Opened { fh, .. } => fh,
+                other => panic!("open: {other:?}"),
+            };
+            let handles = (open(), open());
+            let served = fs.handle_request_with_groups(&build(file, sub, handles), &[]);
+            assert!(
+                served.errno().is_none(),
+                "{name} on a read-write volume: {served:?}"
+            );
+            assert_ne!(
+                tree_of(dir.path()),
+                before,
+                "{name} on a read-write volume changed nothing"
+            );
+
+            let dir = fixture();
+            let before = tree_of(dir.path());
+            let fs = PassthroughFs::for_volume(dir.path(), true);
+            let (file, sub) = (ino_of(&fs, b"file.txt"), ino_of(&fs, b"sub"));
+            let refused = fs.handle_request_with_groups(&build(file, sub, (0, 0)), &[]);
+            assert_eq!(
+                refused.errno(),
+                Some(libc::EROFS),
+                "{name} on a read-only volume: {refused:?}"
+            );
+            assert_eq!(
+                tree_of(dir.path()),
+                before,
+                "{name} changed a read-only volume"
+            );
+        }
+
+        // A request that changes nothing itself but asks for write access is refused as a write
+        // would be; the same request asking for read access is served.
+        let dir = fixture();
+        let fs = PassthroughFs::for_volume(dir.path(), true);
+        let file = ino_of(&fs, b"file.txt");
+        let request = |flags: i32| VolumeRequest::Open {
+            ino: file,
+            flags: flags as u32,
+            uid,
+            gid,
+            pid: 0,
+        };
+        let access = |mask: i32| VolumeRequest::Access {
+            ino: file,
+            mask: mask as u32,
+            uid,
+            gid,
+            pid: 0,
+        };
+        for (asked, flags) in [("O_RDWR", libc::O_RDWR), ("O_WRONLY", libc::O_WRONLY)] {
+            let refused = fs.handle_request_with_groups(&request(flags), &[]);
+            assert_eq!(
+                refused.errno(),
+                Some(libc::EROFS),
+                "open {asked}: {refused:?}"
+            );
+        }
+        let refused = fs.handle_request_with_groups(&access(libc::W_OK), &[]);
+        assert_eq!(
+            refused.errno(),
+            Some(libc::EROFS),
+            "access W_OK: {refused:?}"
+        );
+        let served = fs.handle_request_with_groups(&access(libc::R_OK), &[]);
+        assert!(served.is_ok(), "access R_OK: {served:?}");
+        let read = fs.handle_request_with_groups(
+            &VolumeRequest::Read {
+                ino: file,
+                fh: 0,
+                offset: 0,
+                size: 100,
+                uid,
+                gid,
+                pid: 0,
+            },
+            &[],
+        );
+        assert!(
+            matches!(read, VolumeResponse::Data { ref data } if data == b"content"),
+            "read: {read:?}"
+        );
     }
 
     #[test]
