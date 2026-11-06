@@ -986,15 +986,16 @@ then on "Custom firecracker not found", because a hand-rolled runner called
 
 - **verify/diag/run and bench-chromium-scale must never gain a `build` dependency.**
   reqbench.sh seals fcvm, fc-agent, the request harness's six sources and the
-  scale harness's five into a hash-bound runtime bundle; the run, and the scale
+  scale harness's seven into a hash-bound runtime bundle; the run, and the scale
   run through `reqbench.sh scale`, refuse a golden recorded under a different
-  bundle hash. A rebuild, an
+  bundle hash, and `analyze-chromium-scale`/`report-chromium-scale` run the
+  run's own bundled analyzer and refuse a missing or changed bundle. A rebuild, an
   edit to a sealed file, or a new commit between golden and run invalidates
   the chain: the run also refuses a golden whose recorded source_revision is
   not the current git HEAD. Regolden instead of working around the seal.
   Sealed set: reqbench.{sh,py}, reqanalyze.py, cdpdrive.py, render.py,
   wddrive.py, reqscale.py, reqscale_analyze.py, faulttrace.bt, guardexec.py,
-  guardsupervise.py, fcvm, fc-agent. The Makefile and test files are not sealed:
+  guardsupervise.py, campaign_summary.py, records.py, fcvm, fc-agent. The Makefile and test files are not sealed:
   uncommitted edits to them do not affect a golden or a run in progress, but
   committing them before the run does.
 - Hugepage goldens are part of the snapshot identity: distinct tag, e.g.

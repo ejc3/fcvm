@@ -2466,6 +2466,7 @@ def sha256_file(path: str) -> str:
 HARNESS_SOURCES = (
     "reqscale.py", "reqscale_analyze.py", "reqbench.py", "cdpdrive.py",
     "render.py", "faulttrace.bt", "guardexec.py", "guardsupervise.py",
+    "campaign_summary.py", "records.py",
 )
 
 
