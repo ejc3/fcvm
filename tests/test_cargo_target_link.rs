@@ -408,6 +408,55 @@ fn leased_line_and_concurrent_link_take_the_locks_in_one_order() {
     assert_target_usable(work.path(), "after the leased line and the link");
 }
 
+/// The lease marker alone must not let the wrapper skip its own lease (#1038).
+///
+/// A descendant of a leased recipe line can keep `FCVM_TARGET_LEASE_HELD` while losing the
+/// descriptor that holds the lease: `sudo -E` preserves the environment and closes every
+/// descriptor above 2 (checked: a shell under `sudo -n` with fd 9 open in its parent sees
+/// only 0 to 3). Such a descendant can outlive the recipe line, so the generation is not
+/// pinned for it. The wrapper must then take a lease of its own. The inner command here runs
+/// with every inherited descriptor above 2 closed and reports whether its command holds a
+/// descriptor on the generation the marker names. RED with a marker-only check: the wrapper
+/// execs the command with no lease and the probe exits 9.
+#[test]
+fn a_lease_marker_without_its_descriptor_takes_a_lease_of_its_own() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let btrfs = tempfile::tempdir().expect("tempdir");
+    let (ok, out) = run_link(work.path(), btrfs.path());
+    assert!(ok, "cargo-target-link.sh failed:\n{out}");
+
+    let wrapper = shell_quote(&repo_root().join("scripts/cargo-target-run.sh"));
+    // The probe: does this process hold a descriptor on the generation its marker names?
+    let probe = "for f in /proc/$$/fd/*; do \
+                 [ \"$(stat -Lc %d:%i \"$f\" 2>/dev/null)\" = \"$FCVM_TARGET_LEASE_HELD\" ] && exit 0; \
+                 done; exit 9";
+    // Inside the leased line, drop every descriptor above 2 the way sudo does, keep the
+    // environment, and run the wrapper again.
+    let line = format!(
+        "python3 -c 'import os, sys; os.closerange(3, 65536); os.execvp(sys.argv[1], sys.argv[1:])' \
+         {wrapper} bash -c {probe}",
+        probe = shell_quote(Path::new(probe)),
+    );
+    let output = Command::new(repo_root().join("scripts/cargo-target-run.sh"))
+        .args(["-c", &line])
+        .env("BTRFS_ROOT", btrfs.path())
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_TARGET_LINK_LOCKED")
+        .env_remove("FCVM_TARGET_LEASE_HELD")
+        .current_dir(work.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run leased line");
+    assert!(
+        output.status.success(),
+        "a wrapper whose lease descriptor was closed ran its command without a lease \
+         (exit {:?}); a sudo'd descendant would then run unpinned:\n{}{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
