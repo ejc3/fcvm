@@ -7289,17 +7289,39 @@ async fn the_restore_hook_runs_when_a_healthy_startup_snapshot_restores() -> any
 #[tokio::test]
 #[cfg_attr(not(feature = "privileged-tests"), ignore)]
 async fn the_restore_hook_reaches_the_network() -> anyhow::Result<()> {
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("[::]:0").await?;
     let port = listener.local_addr()?.port();
+    // Each connection is served on its own task, which reads the request before it
+    // answers and drains the socket before it closes. A socket closed with unread bytes
+    // sends a reset instead of a FIN; through pasta, which relays the guest's
+    // connection, that reset could reach wget before the response did ("error getting
+    // response: Connection reset by peer", 3 of 336 SnapshotEnabled jobs between
+    // 2026-10-25 and 2026-11-05).
     let server = tokio::spawn(async move {
         loop {
             let (mut stream, _) = listener.accept().await?;
-            let _ = stream
-                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 11\r\n\r\nhook-egress")
-                .await;
-            let _ = stream.shutdown().await;
+            tokio::spawn(async move {
+                let serve = async {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = stream.read(&mut buf).await?;
+                        if n == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                    }
+                    stream
+                        .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 11\r\n\r\nhook-egress")
+                        .await?;
+                    stream.shutdown().await?;
+                    while stream.read(&mut buf).await? > 0 {}
+                    std::io::Result::Ok(())
+                };
+                let _ = tokio::time::timeout(Duration::from_secs(30), serve).await;
+            });
         }
         #[allow(unreachable_code)]
         anyhow::Ok(())

@@ -41,6 +41,10 @@ const SNAPSHOT_LINEAGE_RETRY_LIMIT: usize = 64;
 // VMM that never acknowledges its generation must not hold an unpublished clone
 // forever. Liveness and cancellation are checked independently during this bound.
 const RESTORE_COMPLETION_ACK_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// How long a restore waits for its ACK before it logs the VMM's threads, and how often
+/// after that. A healthy restore of a small guest acknowledges within a second.
+const ACK_WAIT_SAMPLE_AFTER: Duration = Duration::from_secs(10);
+const ACK_WAIT_SAMPLE_EVERY: Duration = Duration::from_secs(10);
 
 fn record_snapshot_lineage_retry(retries: &mut usize) -> Result<()> {
     *retries += 1;
@@ -845,6 +849,7 @@ async fn wait_for_restore_completion<F>(
     cancel: &tokio_util::sync::CancellationToken,
     timeout: Duration,
     liveness_interval: &mut tokio::time::Interval,
+    vmm_pid: Option<u32>,
     mut try_wait: F,
 ) -> Result<RestoreAck>
 where
@@ -852,6 +857,8 @@ where
 {
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
+    let waiting_since = std::time::Instant::now();
+    let mut next_sample = ACK_WAIT_SAMPLE_AFTER;
     loop {
         tokio::select! {
             result = &mut *completion_rx => {
@@ -892,7 +899,23 @@ where
                             "VM exited before restore-completion ACK (phase=vmm-liveness expected_epoch={expected_epoch} observed_epoch=<none> status={status})"
                         );
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        // A guest that has not acknowledged by now is stalled or slow, and
+                        // the VMM's threads say which: a vCPU sleeping in
+                        // handle_userfault waits on a page fault the memory server has
+                        // not served (#1148), one that is running is executing.
+                        let waited = waiting_since.elapsed();
+                        if let (Some(pid), true) = (vmm_pid, waited >= next_sample) {
+                            next_sample = waited + ACK_WAIT_SAMPLE_EVERY;
+                            info!(
+                                vm_id = %vm_id,
+                                restore_epoch = %expected_epoch,
+                                waited_ms = waited.as_millis() as u64,
+                                vmm_threads = %crate::utils::thread_sample(pid),
+                                "no restore ACK yet; the VMM's threads"
+                            );
+                        }
+                    }
                     Err(error) => {
                         return Err(error).context(format!(
                             "checking VM liveness before restore-completion ACK (phase=vmm-liveness expected_epoch={expected_epoch} observed_epoch=<none>)"
@@ -3728,6 +3751,7 @@ async fn cmd_snapshot_run_inner(
         &cancel,
         RESTORE_COMPLETION_ACK_TIMEOUT,
         &mut restore_liveness_interval,
+        vm_manager.pid().ok(),
         || vm_manager.try_wait(),
     )
     .await;
@@ -7976,6 +8000,7 @@ mod tests {
             &cancel,
             Duration::ZERO,
             &mut liveness,
+            None,
             || -> Result<Option<std::process::ExitStatus>> {
                 panic!("liveness must not be polled before an immediate ACK timeout")
             },
@@ -8019,6 +8044,7 @@ mod tests {
                 &cancel,
                 Duration::from_secs(60),
                 &mut liveness,
+                None,
                 || -> Result<Option<std::process::ExitStatus>> {
                     panic!("liveness must not run during an in-process ACK test")
                 },

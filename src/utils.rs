@@ -140,6 +140,44 @@ pub fn is_process_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{}", pid)).exists()
 }
 
+/// One line per thread of `pid`: name, scheduler state, CPU time in clock ticks and the
+/// kernel function it sleeps in (`/proc/<pid>/task/<tid>/{stat,wchan}`), joined with
+/// "; ". A vCPU sleeping in `handle_userfault` waits on a page fault; one in state R is
+/// executing. Only `stat` and `wchan` are read: neither touches the target's memory, so
+/// this answers for a process that is stalled on its own page faults.
+pub fn thread_sample(pid: u32) -> String {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return format!("<no /proc/{pid}/task>");
+    };
+    let mut lines: Vec<(u32, String)> = tasks
+        .filter_map(|entry| {
+            let tid: u32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat")).ok()?;
+            let (head, rest) = stat.rsplit_once(')')?;
+            let name = head.split_once('(')?.1;
+            let fields: Vec<&str> = rest.split_whitespace().collect();
+            // After the comm: state is field 3, utime 14 and stime 15.
+            let state = fields.first()?;
+            let cpu: u64 =
+                fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?;
+            let wchan = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/wchan"))
+                .unwrap_or_default();
+            let wchan = if wchan.is_empty() || wchan == "0" {
+                "-"
+            } else {
+                wchan.trim()
+            };
+            Some((tid, format!("{tid} {name} {state} cpu={cpu} wchan={wchan}")))
+        })
+        .collect();
+    lines.sort_unstable_by_key(|(tid, _)| *tid);
+    lines
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Read the start time of a process in clock ticks since boot (field 22 of
 /// `/proc/<pid>/stat`). Returns `None` if the process doesn't exist or the field
 /// can't be parsed.
@@ -1298,6 +1336,38 @@ pub fn install_namespace_pre_exec(
 
 #[cfg(test)]
 mod tests {
+    use super::thread_sample;
+
+    /// Every thread of a process is named with its state and where it sleeps.
+    #[test]
+    fn a_thread_sample_names_every_thread_with_its_state() {
+        let (parked, release) = std::sync::mpsc::channel::<()>();
+        let sleeper = std::thread::Builder::new()
+            .name("sample-sleeper".into())
+            .spawn(move || {
+                let _ = release.recv();
+            })
+            .unwrap();
+        // Give the thread time to block on the channel.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut sample = thread_sample(std::process::id());
+        while !sample.contains("sample-sleeper S") && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            sample = thread_sample(std::process::id());
+        }
+        drop(parked);
+        sleeper.join().unwrap();
+        assert!(
+            sample.contains("sample-sleeper S cpu="),
+            "the sleeping thread is not in the sample: {sample}"
+        );
+        assert!(
+            sample.split("; ").all(|line| line.contains(" wchan=")),
+            "a thread without its wait channel: {sample}"
+        );
+        assert!(thread_sample(u32::MAX).starts_with("<no /proc/"));
+    }
+
     use super::*;
 
     /// A helper spawned through `helper_command` is killed when the thread that spawned it
