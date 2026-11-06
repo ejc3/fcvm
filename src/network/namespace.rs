@@ -63,7 +63,7 @@ pub async fn create_namespace(ns_name: &str) -> Result<NamespaceCreation> {
 pub async fn delete_namespace(ns_name: &str) -> Result<()> {
     debug!(namespace = %ns_name, "deleting network namespace");
 
-    let output = Command::new("ip")
+    let output = crate::utils::helper_command("ip")
         .args(["netns", "del", ns_name])
         .output()
         .await

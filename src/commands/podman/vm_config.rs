@@ -397,6 +397,7 @@ pub(super) async fn attach_pmem_devices(
 /// Attach extra disks (--disk, --disk-dir, image archive) to the VM.
 ///
 /// Returns the list of extra disks and optionally the image archive device path.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn attach_extra_disks(
     args: &RunArgs,
     hv: &mut dyn crate::hypervisor::Hypervisor,
@@ -405,6 +406,7 @@ pub(super) async fn attach_extra_disks(
     image_disk_identity: Option<&str>,
     image_disk_read_only: bool,
     rebuild_disk_dir_images: bool,
+    vm_id: &str,
 ) -> Result<(Vec<crate::state::types::ExtraDisk>, Option<String>)> {
     let mut extra_disks = Vec::new();
 
@@ -527,7 +529,12 @@ pub(super) async fn attach_extra_disks(
                     source_dir.display()
                 );
             }
-            super::image::create_disk_from_dir(source_dir, &image_path, false, None).await?;
+            // The image is in the VM's runtime directory, which the VM's owner record names.
+            // du, truncate and mkfs.ext4 hold that owner's lock, so a reclaim pass leaves the
+            // directory alone until they exit, even when this process is killed first (#1316).
+            let owner = crate::reclaim::holder(vm_id)?;
+            super::image::create_disk_from_dir(source_dir, &image_path, false, Some(&owner))
+                .await?;
         } else {
             info!(
                 image = %image_path.display(),
@@ -1550,6 +1557,7 @@ pub(crate) async fn configure_and_boot_vm(
         plan.image_disk_identity.as_deref(),
         image_disk_read_only,
         network.is_some(),
+        &vm_state.vm_id,
     )
     .await?;
     vm_state.config.extra_disks = extra_disks;

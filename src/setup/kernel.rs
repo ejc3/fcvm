@@ -247,7 +247,8 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
         println!("  → Downloading tarball...");
         let tarball_temp = super::StoreTemp::new(&tarball_path)?;
 
-        let output = Command::new("curl")
+        let output = tarball_temp
+            .command("curl")?
             .args(["-fSL", url, "-o"])
             .arg(tarball_temp.path())
             .output()
@@ -278,7 +279,8 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
     super::give_store_entry_to_invoker(extract_temp);
 
     let extract_path = format!("./{}", archive_path);
-    let output = Command::new("tar")
+    let output = extract_dir
+        .command("tar")?
         .args(["--use-compress-program=zstd", "-xf"])
         .arg(&tarball_path)
         .arg("-C")
@@ -671,7 +673,8 @@ async fn download_kernel_binary(url: &str, dest: &Path) -> Result<()> {
     let max_retries = 3;
 
     for attempt in 1..=max_retries {
-        let output = Command::new("curl")
+        let output = temp
+            .command("curl")?
             .args(["-fSL", url, "-o"])
             .arg(temp_path)
             .output()
@@ -699,7 +702,8 @@ async fn download_kernel_binary(url: &str, dest: &Path) -> Result<()> {
     }
 
     // Verify it's a valid kernel binary
-    let output = Command::new("file")
+    let output = temp
+        .command("file")?
         .arg(temp_path)
         .output()
         .await
@@ -1065,11 +1069,10 @@ async fn build_kernel_locally(
     // this same script as the user); under sudo, drop the child so a failed
     // build cannot leave a root-owned /tmp build tree that blocks the next
     // rootless build of the same profile.
-    let mut cmd = Command::new(&script_path);
-    super::run_build_as_sudo_invoker(&mut cmd);
     // The script writes the staging path; a setup killed while it runs leaves it running,
     // and the staging path's record must stay live until it exits.
-    staging.holder()?.hold_in(&mut cmd);
+    let mut cmd = staging.command(&script_path)?;
+    super::run_build_as_sudo_invoker(&mut cmd);
     let status = run_streaming(cmd, "kernel_build")
         .await
         .context("running build script")?;

@@ -936,7 +936,7 @@ pub async fn add_host_route_to_guest(
                             "replacing route to live device with new clone route"
                         );
                     }
-                    let _ = Command::new("ip")
+                    let _ = crate::utils::helper_command("ip")
                         .args(["route", "del", &route])
                         .output()
                         .await;
@@ -996,7 +996,7 @@ pub async fn delete_host_route_to_guest(guest_ip: &str, veth_inner_ip: &str) -> 
     );
 
     let route = format!("{}/32", guest_ip);
-    let output = Command::new("ip")
+    let output = crate::utils::helper_command("ip")
         .args(["route", "del", &route, "via", veth_inner_ip])
         .output()
         .await
@@ -1021,7 +1021,7 @@ pub async fn delete_host_route_to_guest(guest_ip: &str, veth_inner_ip: &str) -> 
 pub async fn delete_veth_pair(host_veth: &str) -> Result<()> {
     debug!(veth = %host_veth, "deleting veth pair");
 
-    let output = Command::new("ip")
+    let output = crate::utils::helper_command("ip")
         .args(["link", "del", host_veth])
         .output()
         .await

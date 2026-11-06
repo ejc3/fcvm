@@ -157,7 +157,7 @@ pub async fn enable_route_localnet(interface: &str) -> Result<()> {
 async fn delete_rule(rule: &str) -> Result<()> {
     let delete_rule = to_delete_rule(rule);
 
-    let output = Command::new("iptables")
+    let output = crate::utils::helper_command("iptables")
         .args(delete_rule.split_whitespace())
         .output()
         .await
@@ -351,7 +351,7 @@ pub async fn cleanup_global_nat_if_unused() -> Result<()> {
         .context("acquiring the bridged NAT lock; global NAT rules left in place")?;
 
     // Check if any veth0- interfaces exist (active bridged VMs)
-    let output = Command::new("ip")
+    let output = crate::utils::helper_command("ip")
         .args(["-o", "link", "show"])
         .output()
         .await
@@ -378,7 +378,7 @@ pub async fn cleanup_global_nat_if_unused() -> Result<()> {
     // Remove the fcvm-tagged MASQUERADE rules for both subnets
     let mut failures = Vec::new();
     for subnet in &["172.30.0.0/16", "10.0.0.0/8"] {
-        let output = Command::new("iptables")
+        let output = crate::utils::helper_command("iptables")
             .args([
                 "-t",
                 "nat",

@@ -217,7 +217,7 @@ async fn remove_address_objects(
             "-j",
             "MASQUERADE",
         ];
-        match tokio::process::Command::new("ip6tables")
+        match crate::utils::helper_command("ip6tables")
             .args(rule)
             .output()
             .await
@@ -233,7 +233,7 @@ async fn remove_address_objects(
         }
     }
     let address = address.to_string();
-    match tokio::process::Command::new("ip")
+    match crate::utils::helper_command("ip")
         .args(["-6", "neigh", "del", "proxy", &address, "dev", iface])
         .output()
         .await
@@ -1356,7 +1356,7 @@ impl NetworkManager for RoutedNetwork {
 
             // Remove host route (use dev qualifier for parallel safety)
             if let Some(ref host_veth) = self.host_veth {
-                match tokio::process::Command::new("ip")
+                match crate::utils::helper_command("ip")
                     .args([
                         "-6",
                         "route",

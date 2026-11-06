@@ -270,6 +270,36 @@ pub fn is_same_process_name(pid: u32) -> bool {
     }
 }
 
+/// A short helper command fcvm runs and waits for, such as `ip link del` or `iptables -D`,
+/// that the kernel kills (SIGKILL, `PR_SET_PDEATHSIG`) when the thread that spawned it exits,
+/// which for fcvm's runtime threads is when fcvm exits, however it exits.
+///
+/// A helper that outlives fcvm runs later, in a world that has moved on: a reclaim pass killed
+/// while its `iptables -D` was stopped left that delete to run after another pass had removed
+/// the veth and namespace and a new VM had taken the names, and the delete then removed the new
+/// VM's identical rule (#1316). Use it for helpers that delete or change a kernel object by a
+/// name or address another VM can come to hold. Not for podman or skopeo, whose user-namespace
+/// re-exec clears the signal, nor for a helper spawned from a short-lived thread.
+pub fn helper_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
+    // SAFETY: getpid() before the fork; in the child only async-signal-safe calls (prctl,
+    // getppid, _exit) run before exec.
+    let parent = unsafe { libc::getpid() };
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The parent died between the fork and the prctl: no signal will come.
+            if libc::getppid() != parent {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+    command
+}
+
 /// Gracefully kill a process by sending SIGTERM first, then SIGKILL if needed.
 ///
 /// This allows the process to run cleanup handlers (network teardown, file cleanup, etc.)
@@ -1258,6 +1288,67 @@ pub fn install_namespace_pre_exec(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A helper spawned through `helper_command` is killed when the thread that spawned it
+    /// exits, as fcvm's threads do when fcvm is killed (#1316). A plain command's child lives on.
+    ///
+    /// RED BEFORE THE FIX: there was no helper_command; every helper was a plain command.
+    #[test]
+    fn a_helper_dies_with_the_thread_that_spawned_it() {
+        use std::os::unix::process::ExitStatusExt;
+        let spawn = |helper: bool| {
+            std::thread::spawn(move || {
+                let mut command = if helper {
+                    helper_command("sleep")
+                } else {
+                    tokio::process::Command::new("sleep")
+                };
+                command.arg("30");
+                command.as_std_mut().spawn().expect("spawning sleep")
+            })
+            .join()
+            .expect("the spawning thread")
+        };
+        let wait = |child: &mut std::process::Child| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    return Some(status);
+                }
+                if std::time::Instant::now() > deadline {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        let mut helper = spawn(true);
+        let status = wait(&mut helper);
+        if status.is_none() {
+            let _ = helper.kill();
+            let _ = helper.wait();
+        }
+        assert_eq!(
+            status.and_then(|s| s.signal()),
+            Some(libc::SIGKILL),
+            "a helper outlived the thread that spawned it"
+        );
+
+        let mut plain = spawn(false);
+        let alive = wait_briefly(&mut plain);
+        let _ = plain.kill();
+        let _ = plain.wait();
+        assert!(
+            alive,
+            "a plain command died with its thread, so this test shows nothing"
+        );
+    }
+
+    /// Whether `child` is still running 200 ms from now.
+    fn wait_briefly(child: &mut std::process::Child) -> bool {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        child.try_wait().unwrap().is_none()
+    }
     use std::path::PathBuf;
 
     /// A clone with its own vsock directory binds `<source>` to that directory and
