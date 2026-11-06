@@ -1,10 +1,9 @@
 // Robot Park, the phone app (docs/fleet/ARCHITECTURE.md, "Phones mode"). `scene` is plain
 // Kotlin (the scene model, the control protocol, the tile geometry) and its tests run on any
-// JVM; `app` is the Android app around it and needs the Android SDK. -PsceneOnly=true leaves
-// the app out, so the scene's tests run where no SDK is installed.
+// JVM; `app` is the Android app around it and compiles against the AOSP build's android.jar.
+// -PsceneOnly=true leaves the app out, so the scene's tests run without one.
 pluginManagement {
     repositories {
-        google()
         mavenCentral()
         gradlePluginPortal()
     }
@@ -12,7 +11,6 @@ pluginManagement {
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
-        google()
         mavenCentral()
     }
 }

@@ -258,7 +258,7 @@ jobs:
       - name: Operator script tests (fleet/tools)
         run: make -C fleet/tools test
       # Robot Park's scene model, control protocol and shader check (fleet/phone-app), in
-      # its build container. The app itself needs the Android SDK and is built by phone-test.
+      # its build container. The app itself needs the AOSP build's tools and is built by phone-test.
       - name: Phone app scene tests (fleet/phone-app)
         run: make -C fleet/phone-app test GRADLE_HOME="$RUNNER_TEMP/gradle-home"
       - name: Renderer host tests
@@ -285,6 +285,7 @@ jobs:
           bash scripts/phone/test-phone-sh.sh
           bash scripts/phone/test-gpu-hook.sh
           bash scripts/phone/test-seam.sh
+          bash scripts/phone/test-app-sh.sh
 
   # Plans which self-hosted jobs this run needs.
   #

@@ -940,20 +940,19 @@ phone-system-image:
 # GPU, the running phone releases the GPU and takes it up again, and a clone of its warm
 # snapshot runs the app on GPU2. Fetches the pinned system image and tools first
 # (scripts/phone/aosp.sh), builds the emulator, and builds Robot Park (scripts/phone/app.sh)
-# against the SDK's API 35 platform (scripts/phone/sdk.sh, which needs
-# ACCEPT_ANDROID_SDK_LICENSE=1), which then draws seamless tiles, survives surface loss and
+# with the AOSP build's tools, which then draws seamless tiles, survives surface loss and
 # takes its actions (scripts/phone/scene-test.sh). The web browser (scripts/phone/browser.sh)
 # opens www.nvidia.com through the phone web proxy and comes to the front in the clone.
 phone-test: private SHELL := $(TARGET_LEASE_SHELL)
 phone-test: $(if $(strip $(GPU)),setup-phone phone-emulator)
-	@test -n "$(GPU)" && test -n "$(GPU2)" || { echo "usage: make phone-test GPU=<pci address> GPU2=<another pci address> ACCEPT_ANDROID_SDK_LICENSE=1" >&2; exit 2; }
+	@test -n "$(GPU)" && test -n "$(GPU2)" || { echo "usage: make phone-test GPU=<pci address> GPU2=<another pci address>" >&2; exit 2; }
 	./scripts/phone/test-aosp-lock.sh
 	./scripts/phone/test-gpu-hook.sh
 	./scripts/phone/test-phone-sh.sh
 	./scripts/phone/test-run-checks.sh
 	./scripts/phone/test-seam.sh
+	./scripts/phone/test-app-sh.sh
 	./scripts/phone/aosp.sh
-	ACCEPT_ANDROID_SDK_LICENSE="$(ACCEPT_ANDROID_SDK_LICENSE)" ./scripts/phone/sdk.sh
 	./scripts/phone/app.sh > /dev/null
 	./scripts/phone/browser.sh > /dev/null
 	FCVM=./target/release/fcvm ./scripts/phone/run.sh "$(GPU)" "$(GPU2)"

@@ -37,13 +37,12 @@ cp "$dir/bin/javac" "$dir/bin/keytool"
 cp "$dir/bin/javac" "$dir/bin/java"
 chmod +x "$dir/bin/curl" "$dir/bin/javac" "$dir/bin/keytool" "$dir/bin/java"
 # took_turns script var: two runs of script on one directory (var names it) at once.
-# sdk.sh, which fetches what Robot Park compiles against, installs under the same kind of lock.
 took_turns() {
   local script=$1 var=$2 a b calls max
   rm -f "$dir/calls" "$dir/max" "$dir/active"
   mkdir -p "$dir/$script.d"
   for n in 1 2; do
-    env PATH="$dir/bin:$PATH" ACCEPT_ANDROID_SDK_LICENSE=1 "$var=$dir/$script.d" "$here/$script" > "$dir/out.$n" 2>&1 &
+    env PATH="$dir/bin:$PATH" "$var=$dir/$script.d" "$here/$script" > "$dir/out.$n" 2>&1 &
     eval "p$n=\$!"
   done
   wait "$p1" "$p2" || true
@@ -61,7 +60,6 @@ took_turns() {
   echo "ok   two $script runs on one directory took turns ($calls downloads, at most $max at once)"
 }
 took_turns aosp.sh ANDROID_AOSP
-took_turns sdk.sh ANDROID_SDK
 
 
 # The pins as "sha256 destination" lines, read from aosp.sh's PINS.

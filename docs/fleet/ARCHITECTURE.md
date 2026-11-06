@@ -1623,11 +1623,11 @@ Two things the browser showed wrong in the mirror, both fixed in `app/_wall/mirr
   - The archives are published as a GitHub release of this repository; its corresponding
     source is `fleet/phone/aosp.xml` (every project at a commit on
     android.googlesource.com) and, for the kernel, the release notes' kernel commit.
-  - Robot Park (`fleet/phone-app`) is still compiled by Gradle against the SDK's API 35
-    platform and build-tools (`scripts/phone/sdk.sh`, which alone keeps the
-    `ACCEPT_ANDROID_SDK_LICENSE` gate). That is the use the SDK license grants, developing
-    an app, and the APK carries none of the SDK: `android.jar` is compile-only. Building it
-    against the AOSP build's own platform instead is the remaining step.
+  - Robot Park (`fleet/phone-app`) is built with the same tools: Gradle compiles its Kotlin
+    against the AOSP build's `android.jar` (no Android Gradle plugin), and
+    `fleet/phone-app/build-apk.sh` dexes it with `d8`, links it with `aapt2` and signs it with
+    `apksigner`. Nothing in the build, the phone or a host is from the SDK, so no step asks
+    for the SDK license.
 - **The Android robot** is CC BY 3.0 with the attribution line above; "Android" and Google's
   marks follow Google's brand guidelines, as under "Branding".
 
