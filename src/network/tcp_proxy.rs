@@ -325,18 +325,41 @@ fn listen_for_port_forward(addr: SocketAddr) -> std::io::Result<tokio::net::TcpL
     socket.listen(PORT_FORWARD_BACKLOG)
 }
 
+/// The host-side listeners of a VM's published ports, one per mapping and in mapping
+/// order, bound and listening, until `start_port_forwards` hands them to their relays.
+#[derive(Debug, Default)]
+pub struct PortListeners {
+    listeners: Vec<std::net::TcpListener>,
+}
+
+impl std::ops::Index<usize> for PortListeners {
+    type Output = std::net::TcpListener;
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.listeners[index]
+    }
+}
+
+impl PortListeners {
+    #[cfg(test)]
+    fn into_tokio(self) -> Vec<tokio::net::TcpListener> {
+        self.listeners
+            .into_iter()
+            .map(|listener| tokio::net::TcpListener::from_std(listener).unwrap())
+            .collect()
+    }
+}
+
 /// Bind the host-side listener of every mapping, or of none.
 ///
-/// The listeners are plain values until a relay task takes them, so an error drops, and
-/// with that closes, the ones already bound before it is returned.
-fn bind_port_forwards(
-    loopback_ip: &str,
-    mappings: &[PortMapping],
-) -> Result<Vec<tokio::net::TcpListener>> {
+/// A mapping listens on the host address its HOSTIP names, or on `loopback_ip` (the VM's
+/// own loopback address) when it names none. No relay runs yet, so an error drops, and
+/// with that closes, the listeners already bound before it is returned.
+pub fn bind_port_forwards(loopback_ip: &str, mappings: &[PortMapping]) -> Result<PortListeners> {
     let mut listeners = Vec::with_capacity(mappings.len());
     for mapping in mappings {
         let addr = port_forward_bind_addr(mapping, loopback_ip)?;
         let listener = listen_for_port_forward(addr)
+            .and_then(|listener| listener.into_std())
             .with_context(|| format!("binding port forward on {addr}"))?;
         info!(
             listen = %addr,
@@ -345,33 +368,45 @@ fn bind_port_forwards(
         );
         listeners.push(listener);
     }
-    Ok(listeners)
+    Ok(PortListeners { listeners })
 }
 
-/// Start port forwarding: listen on the host, relay to the guest inside the namespace.
-///
-/// A mapping listens on the host address its HOSTIP names, or on `loopback_ip` (the VM's
-/// own loopback address) when it names none. Either every mapping is listening when this
-/// returns, or it returns an error and none is.
+/// Start port forwarding on `listeners` (`bind_port_forwards` of the same `mappings`):
+/// relay each connection to the guest inside the namespace.
 ///
 /// Returns a `Relay` per port mapping, for `stop_relays`.
-pub async fn start_port_forwards(
-    loopback_ip: &str,
+pub fn start_port_forwards(
+    listeners: PortListeners,
     mappings: &[PortMapping],
     ns_name: &str,
     guest_ip: &str,
 ) -> Result<Vec<Relay>> {
+    anyhow::ensure!(
+        listeners.listeners.len() == mappings.len(),
+        "{} port forward listeners for {} mappings",
+        listeners.listeners.len(),
+        mappings.len()
+    );
     let guest_ip: IpAddr = guest_ip
         .parse()
         .with_context(|| format!("invalid guest address {guest_ip}"))?;
-    let listeners = bind_port_forwards(loopback_ip, mappings)?;
+    // Every listener is registered with the runtime before any relay starts, so an
+    // error starts none.
+    let accepting = listeners
+        .listeners
+        .into_iter()
+        .map(|listener| {
+            tokio::net::TcpListener::from_std(listener)
+                .context("registering a port forward listener for its relay")
+        })
+        .collect::<Result<Vec<_>>>()?;
     let ns_name: Arc<str> = ns_name.into();
     // One limit for the VM's published ports together, so a VM holds at most this many
     // relayed connections and pending guest dials however many ports it publishes. A
     // mapping with a HOSTIP can be reachable from other machines (`--publish [::]:80:80`).
     let limit = relay_limit(RELAY_CONNECTION_LIMIT);
 
-    Ok(listeners
+    Ok(accepting
         .into_iter()
         .zip(mappings)
         .map(|(listener, mapping)| {
@@ -1007,9 +1042,7 @@ mod tests {
             mapping(Some(&free.to_string()), port),
             mapping(Some(&taken.to_string()), port),
         ];
-        // No relay starts, so the namespace is never entered.
-        let error = start_port_forwards(&loopback.to_string(), &mappings, "unused", "10.0.2.100")
-            .await
+        let error = bind_port_forwards(&loopback.to_string(), &mappings)
             .expect_err("the second mapping's address is in use");
         let error = format!("{error:#}");
         assert!(error.contains(&format!("{taken}:{port}")), "{error}");
@@ -1025,8 +1058,7 @@ mod tests {
 
         // 192.0.2.1 is TEST-NET-1, an address no host has.
         let absent = [mapping(Some("192.0.2.1"), port)];
-        let error = start_port_forwards(&loopback.to_string(), &absent, "unused", "10.0.2.100")
-            .await
+        let error = bind_port_forwards(&loopback.to_string(), &absent)
             .expect_err("192.0.2.1 is not an address of this host");
         let error = format!("{error:#}");
         assert!(error.contains(&format!("192.0.2.1:{port}")), "{error}");
@@ -1043,7 +1075,9 @@ mod tests {
             .await
             .unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
-        let listeners = bind_port_forwards(&test_ip(8).to_string(), &[mapping(None, 0)]).unwrap();
+        let listeners = bind_port_forwards(&test_ip(8).to_string(), &[mapping(None, 0)])
+            .unwrap()
+            .into_tokio();
         let listening = listeners[0].local_addr().unwrap();
         let relays: Vec<Relay> = listeners
             .into_iter()
@@ -1085,7 +1119,9 @@ mod tests {
     /// task has closed it.
     #[tokio::test]
     async fn stopped_relays_have_closed_their_listeners() {
-        let listeners = bind_port_forwards(&test_ip(6).to_string(), &[mapping(None, 0)]).unwrap();
+        let listeners = bind_port_forwards(&test_ip(6).to_string(), &[mapping(None, 0)])
+            .unwrap()
+            .into_tokio();
         let listening = listeners[0].local_addr().unwrap();
         let relays: Vec<Relay> = listeners
             .into_iter()
@@ -1127,7 +1163,9 @@ mod tests {
 
         let finished = Arc::new(AtomicBool::new(false));
         let (entered, entered_rx) = std::sync::mpsc::channel::<()>();
-        let listeners = bind_port_forwards(&test_ip(9).to_string(), &[mapping(None, 0)]).unwrap();
+        let listeners = bind_port_forwards(&test_ip(9).to_string(), &[mapping(None, 0)])
+            .unwrap()
+            .into_tokio();
         let listening = listeners[0].local_addr().unwrap();
         let relays: Vec<_> = listeners
             .into_iter()
@@ -1171,7 +1209,9 @@ mod tests {
     /// once the runtime has dropped the task, which is soon after and not at once.
     #[tokio::test]
     async fn a_dropped_relay_releases_its_listener() {
-        let listeners = bind_port_forwards(&test_ip(10).to_string(), &[mapping(None, 0)]).unwrap();
+        let listeners = bind_port_forwards(&test_ip(10).to_string(), &[mapping(None, 0)])
+            .unwrap()
+            .into_tokio();
         let listening = listeners[0].local_addr().unwrap();
         let relays: Vec<_> = listeners
             .into_iter()
@@ -1510,7 +1550,7 @@ mod tests {
         // Start port forward: host 127.0.0.1:0 → namespace 127.0.0.1:9999
         let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let host_addr = host_listener.local_addr()?;
-        drop(host_listener); // Release the port so start_port_forwards can bind it
+        drop(host_listener); // Release the port so bind_port_forwards can bind it
 
         let mapping = PortMapping {
             host_port: host_addr.port(),
@@ -1519,7 +1559,9 @@ mod tests {
             proto: super::super::types::Protocol::Tcp,
         };
 
-        let handles = start_port_forwards("127.0.0.1", &[mapping], &ns_name, "127.0.0.1").await?;
+        let mappings = [mapping];
+        let listeners = bind_port_forwards("127.0.0.1", &mappings)?;
+        let handles = start_port_forwards(listeners, &mappings, &ns_name, "127.0.0.1")?;
 
         // Give the listener a moment to start accepting
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
