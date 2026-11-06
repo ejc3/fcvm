@@ -1597,6 +1597,19 @@ pub struct RestoreNetworkReport {
     /// True when the snapshot's armed boundary verified intact and the
     /// re-close/link-down/receive-barrier re-assert was skipped.
     pub verified_armed: bool,
+    /// Milliseconds waiting for the guest-wide boundary lock. Zero when the
+    /// boundary ran without taking it (`restore_boundary_with` alone).
+    pub lock_wait_ms: f64,
+    /// Milliseconds building the gate, the receive barrier, the socket
+    /// diagnostic and the manifest store, after the lock.
+    pub construct_ms: f64,
+    /// Milliseconds writing the cleanup-complete line to the guest console, a
+    /// serial device whose write can block.
+    pub complete_console_ms: f64,
+    /// Milliseconds closing the gate when verification failed, plus adding the
+    /// clone's client-direction UDP rule. The close is part of `reassert_ms`
+    /// and the UDP rule is part of it too, but only on that path.
+    pub gate_arm_ms: f64,
     /// Milliseconds probing the gate rules and link flags.
     pub verify_ms: f64,
     /// Milliseconds re-asserting close/link-down/barrier; zero on the
@@ -2161,6 +2174,7 @@ async fn restore_boundary_with<
     };
     let verify_ms = verify_started.elapsed().as_secs_f64() * 1000.0;
     let reassert_started = std::time::Instant::now();
+    let gate_arm_started = std::time::Instant::now();
     if !verified_armed {
         gate.close()
             .await
@@ -2171,6 +2185,7 @@ async fn restore_boundary_with<
     gate.gate_udp_ingress()
         .await
         .context("gating client-direction UDP on the restored clone")?;
+    let gate_arm_ms = gate_arm_started.elapsed().as_secs_f64() * 1000.0;
     // No link-down here either. The clone inherits a CLOSED gate inside the
     // artifact, so no new flow can appear while the recorded cookies are
     // destroyed, and the barrier below drains what was already in flight.
@@ -2252,6 +2267,10 @@ async fn restore_boundary_with<
     Ok(RestoreNetworkReport {
         tally,
         verified_armed,
+        lock_wait_ms: 0.0,
+        construct_ms: 0.0,
+        complete_console_ms: 0.0,
+        gate_arm_ms,
         verify_ms,
         reassert_ms,
         barrier_ms,
@@ -2261,6 +2280,40 @@ async fn restore_boundary_with<
         reopen_ms: 0.0,
         gate: gate.timings(),
     })
+}
+
+/// The restore boundary as production runs it: take the guest-wide lock,
+/// build the gate, the receive barrier, the socket diagnostic and the manifest
+/// store, run [`restore_boundary_with`], then announce the result on the guest
+/// console. Each of those steps lies inside the restore orchestrator's
+/// `tcp_cleanup_ms` and outside the boundary's own sub-timers, so each is timed
+/// into the report (#1090). The lock is returned still held.
+async fn restore_locked_boundary_with<G, B, D, S>(
+    acquire_lock: impl FnOnce() -> Result<std::fs::File>,
+    construct: impl FnOnce() -> (G, B, D, S),
+    budget: std::time::Duration,
+    announce: impl FnOnce(&RestoreNetworkReport),
+) -> Result<(std::fs::File, G, RestoreNetworkReport)>
+where
+    G: FirewallGate,
+    B: PacketReceiveBarrier,
+    D: SocketDiagnostic,
+    S: ManifestStore,
+{
+    let lock_started = std::time::Instant::now();
+    let lock = acquire_lock()?;
+    let lock_wait_ms = lock_started.elapsed().as_secs_f64() * 1000.0;
+    let construct_started = std::time::Instant::now();
+    let (gate, receive_barrier, mut diagnostic, store) = construct();
+    let construct_ms = construct_started.elapsed().as_secs_f64() * 1000.0;
+    let mut report =
+        restore_boundary_with(&gate, &receive_barrier, &mut diagnostic, &store, budget).await?;
+    let console_started = std::time::Instant::now();
+    announce(&report);
+    report.complete_console_ms = console_started.elapsed().as_secs_f64() * 1000.0;
+    report.lock_wait_ms = lock_wait_ms;
+    report.construct_ms = construct_ms;
+    Ok((lock, gate, report))
 }
 
 /// The publication: run the restore hook with egress open and ingress still
@@ -2766,24 +2819,26 @@ impl RestoredNetwork {
 }
 
 pub async fn restore_snapshot_network() -> Result<RestoredNetwork> {
-    let transaction_lock = acquire_boundary_lock()?;
-    let gate = IptablesGate::new(SystemCommandRunner).with_template(gate_template());
-    let receive_barrier = SystemPacketReceiveBarrier::new();
-    let mut diagnostic = SystemSocketDiagnostic::new();
-    let store = FileManifestStore::default();
-    let report = restore_boundary_with(
-        &gate,
-        &receive_barrier,
-        &mut diagnostic,
-        &store,
+    let (transaction_lock, gate, report) = restore_locked_boundary_with(
+        acquire_boundary_lock,
+        || {
+            (
+                IptablesGate::new(SystemCommandRunner).with_template(gate_template()),
+                SystemPacketReceiveBarrier::new(),
+                SystemSocketDiagnostic::new(),
+                FileManifestStore::default(),
+            )
+        },
         CLEANUP_BUDGET,
+        |report| {
+            eprintln!(
+                "[fc-agent] snapshot network cleanup complete: destroyed={} already_gone={} \
+                 verified_armed={} link=UNTOUCHED gate=egress-open",
+                report.tally.destroyed, report.tally.already_gone, report.verified_armed
+            );
+        },
     )
     .await?;
-    eprintln!(
-        "[fc-agent] snapshot network cleanup complete: destroyed={} already_gone={} \
-         verified_armed={} link=UNTOUCHED gate=egress-open",
-        report.tally.destroyed, report.tally.already_gone, report.verified_armed
-    );
     Ok(RestoredNetwork {
         _transaction_lock: transaction_lock,
         gate,
@@ -5623,6 +5678,105 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1090: one restore spent 16 s inside `tcp_cleanup_ms` that no sub-timer
+    /// held. The lock wait, the constructors and the console write are the steps
+    /// outside the boundary's timers, each made slow here by a known amount, and
+    /// each must land in its own field of the record rather than in the phase's
+    /// remainder.
+    #[tokio::test]
+    async fn the_locked_boundary_times_the_lock_wait_the_constructors_and_the_console_write() {
+        const LOCK_HELD_MS: u64 = 150;
+        const CONSTRUCT_MS: u64 = 30;
+        const CONSOLE_MS: u64 = 40;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("snapshot-network.lock");
+        let held = acquire_boundary_lock_at(&path).unwrap();
+        // The holder lets go a fixed time after the acquirer has begun to wait,
+        // so the wait is at least that long whatever the scheduler does.
+        let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            attempting_rx.recv().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(LOCK_HELD_MS));
+            drop(held);
+        });
+        let state = Arc::new(Mutex::new(ModelState {
+            gate_closed: true,
+            egress_closed: true,
+            ..Default::default()
+        }));
+        let kernel = SharedKernel::new(&[], ModelAnswer::Kernel, ModelDelivery::InOrder);
+        let phase_started = std::time::Instant::now();
+        let (_lock, _gate, report) = restore_locked_boundary_with(
+            || {
+                attempting_tx.send(()).unwrap();
+                acquire_boundary_lock_at(&path)
+            },
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(CONSTRUCT_MS));
+                let store = MemoryStore::default();
+                store
+                    .save(&SnapshotNetworkManifest {
+                        version: MANIFEST_VERSION,
+                        routes: Vec::new(),
+                        sockets: Vec::new(),
+                    })
+                    .unwrap();
+                (
+                    ModelGate(state.clone()),
+                    ModelBarrier(state.clone()),
+                    ChannelDiag(CookieDestroyer::new(kernel.opener())),
+                    store,
+                )
+            },
+            CLEANUP_BUDGET,
+            |_| std::thread::sleep(std::time::Duration::from_millis(CONSOLE_MS)),
+        )
+        .await
+        .unwrap();
+        let cleanup_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+        holder.join().unwrap();
+
+        assert!(
+            report.lock_wait_ms >= LOCK_HELD_MS as f64,
+            "the lock was held {LOCK_HELD_MS} ms, the report says {} ms",
+            report.lock_wait_ms
+        );
+        assert!(
+            report.construct_ms >= CONSTRUCT_MS as f64,
+            "the constructors took {CONSTRUCT_MS} ms, the report says {} ms",
+            report.construct_ms
+        );
+        assert!(
+            report.complete_console_ms >= CONSOLE_MS as f64,
+            "the console write took {CONSOLE_MS} ms, the report says {} ms",
+            report.complete_console_ms
+        );
+
+        let mut phases = crate::restore::RestorePhases {
+            tcp_cleanup_ms: cleanup_ms,
+            ..Default::default()
+        };
+        phases.record_boundary(&report);
+        let accounted = phases.tcp_cleanup_accounted_ms();
+        assert!(
+            accounted >= (LOCK_HELD_MS + CONSTRUCT_MS + CONSOLE_MS) as f64,
+            "the timed parts hold {accounted} ms of a {cleanup_ms} ms phase"
+        );
+        assert!(
+            accounted <= cleanup_ms + 1e-6,
+            "the timed parts ({accounted} ms) overlap: they exceed the phase ({cleanup_ms} ms)"
+        );
+        let record: serde_json::Value = serde_json::from_str(&phases.to_frame_json()).unwrap();
+        assert!(
+            record["tcp_lock_wait_ms"].as_f64().unwrap() >= LOCK_HELD_MS as f64,
+            "{record}"
+        );
+        assert!(
+            record["tcp_cleanup_untimed_ms"].as_f64().unwrap() < accounted,
+            "the held lock must not be left in the remainder: {record}"
+        );
     }
 
     /// The cleanup's counts reach the record fcvm prints as guest_phases.
