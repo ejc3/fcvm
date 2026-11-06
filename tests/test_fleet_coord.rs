@@ -2940,6 +2940,7 @@ fn host_config(
         poll: Duration::from_millis(50),
         liveness: Duration::from_millis(100),
         capacity_retry: Duration::from_millis(300),
+        lost_launch_ttl: Duration::from_secs(60),
     }
 }
 
@@ -3299,6 +3300,146 @@ async fn a_launch_whose_answer_is_lost_is_asked_again_with_its_token() {
         "a second host for one shortfall: {:?}",
         fake.calls()
     );
+}
+
+/// A launch whose answer is lost just before the fleet sleeps (#1289): the asleep pass asks
+/// again with its token, learns the instance no list names yet, and terminates it, instead
+/// of leaving it running until the asleep check five minutes later.
+#[tokio::test]
+async fn a_lost_launch_is_terminated_when_the_fleet_sleeps_before_a_list_names_it() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let config = Config {
+        power_managed: true,
+        idle_scale_down_secs: 1,
+        ..Config::default()
+    };
+    let fake = Arc::new(FakeHosts::default());
+    *fake.ambiguous.lock().unwrap() = 1;
+    *fake.hide_new.lock().unwrap() = Some((0, u32::MAX));
+    let mut hosts = host_config(&fake, &["us-east-1"], 1, 8);
+    // No second pass while awake: the token is asked again only after the sleep.
+    hosts.poll = Duration::from_secs(30);
+    hosts.liveness = Duration::from_secs(30);
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        None,
+        None,
+        Some(hosts),
+        None,
+    );
+    let mut v = page_viewer(&handle).await;
+    v.until(|s| s["viewers"]["active"] == 1).await;
+    until_hosts(&fake, "the lost launch", |f| launches(f).len() == 1).await;
+    v.send(json!({"type": "visibility", "visible": false}))
+        .await;
+    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    until_hosts(&fake, "the lost launch's host terminated", |f| {
+        f.present("us-east-1").is_empty()
+    })
+    .await;
+    assert_eq!(
+        launches(&fake),
+        vec!["launch us-east-1 spot 1", "launch us-east-1 spot 1"],
+        "one launch, then its token asked again"
+    );
+}
+
+/// A lost launch whose token never gets an answer stops holding its region after
+/// `lost_launch_ttl`: tokens are kept across power changes now, so without the limit one such
+/// token would keep the region from launching for as long as the coordinator runs.
+#[tokio::test]
+async fn a_lost_launch_that_never_answers_stops_holding_its_region() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let fake = Arc::new(FakeHosts::default());
+    *fake.stuck.lock().unwrap() = 1;
+    let mut hosts = host_config(&fake, &["us-east-1"], 1, 8);
+    hosts.lost_launch_ttl = Duration::from_millis(500);
+    let (_handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        Some(hosts),
+        None,
+    );
+    until_hosts(&fake, "a host after the stuck token is dropped", |f| {
+        f.present("us-east-1").len() == 1
+    })
+    .await;
+}
+
+/// A GPU host that comes up after the EC2 half alone made the fleet awake still gets its
+/// last phase in the wake's record (#1289): the pass that sees it running publishes it
+/// before the region's host watch ends.
+#[tokio::test]
+async fn a_host_running_after_the_ec2_half_woke_the_fleet_records_its_boot() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    use fleet_core::protocol::SlotReport;
+    let config = Config {
+        power_managed: true,
+        idle_scale_down_secs: 1,
+        ec2_max: 2,
+        fcvm_tiles: 8,
+        light_interval_ms: 0,
+        ..Config::default()
+    };
+    let fake = Arc::new(FakeHosts::default());
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    let mut v = page_viewer(&handle).await;
+    v.send(json!({"type": "visibility", "visible": false}))
+        .await;
+    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    until_hosts(&fake, "asleep", |f| f.present("us-east-1").is_empty()).await;
+    v.send(json!({"type": "visibility", "visible": true})).await;
+    v.until(|s| {
+        s["fleet"]["power"]["state"] == "waking"
+            && s["fleet"]["power"]["hosts"]
+                .as_array()
+                .is_some_and(|h| h.len() == 1)
+    })
+    .await;
+    for id in ["ec2-1", "ec2-2"] {
+        handle
+            .send(Event::Ec2 {
+                at: 0,
+                report: SlotReport {
+                    id: id.into(),
+                    phase: "running".into(),
+                    generation: 1,
+                    vm: Some(format!("i-{id}")),
+                    frame_url: Some(format!("wss://{id}.example/frames")),
+                    timings: Default::default(),
+                    error: None,
+                    retry_in_ms: None,
+                    ipv6: None,
+                    ipv4: None,
+                    v4_port: None,
+                    place: None,
+                },
+            })
+            .await;
+    }
+    v.until(|s| s["fleet"]["power"]["state"] == "awake").await;
+    fake.set_state("us-east-1", "pending", "running");
+    let booted = |s: &Value| {
+        s["fleet"]["power"]["hosts"].as_array().is_some_and(|h| {
+            h.len() == 1
+                && h[0]["phases"]
+                    .as_array()
+                    .is_some_and(|p| p.iter().any(|p| p["phase"] == "booted"))
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), v.until(booted))
+        .await
+        .expect("the host's boot is recorded after the fleet woke");
 }
 
 /// An on-demand launch whose answer is lost counts against the fleet-wide cap until its
