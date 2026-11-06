@@ -119,11 +119,10 @@ impl VolumeServer {
         // (PassthroughFs::try_for_volume).
         let fs = fuse_pipe::PassthroughFs::for_volume(&self.host_path, self.config.read_only);
 
-        // Writes are not refused here: this server accepts writes on every
-        // volume. fc-agent mounts a read-only volume read-only, so the guest
-        // kernel refuses a write before it becomes a request. A guest that
-        // remounts the volume read-write can still write to the host
-        // directory (#1042).
+        // fc-agent mounts a read-only volume read-only, and this server refuses
+        // every request that could change it with EROFS
+        // (PassthroughFs::handle_request), so a guest that remounts the volume
+        // read-write still cannot write to the host directory.
 
         let serve_err = || {
             format!(

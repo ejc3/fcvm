@@ -411,6 +411,57 @@ impl VolumeRequest {
         )
     }
 
+    /// Whether serving this request can change the volume's files, their contents or their
+    /// attributes. The server of a read-only volume answers such a request with EROFS, as the
+    /// guest kernel does for a read-only mount (`PassthroughFs::handle_request`).
+    ///
+    /// An OPEN or CREATE counts by its flags: one that asks for write access or truncation can
+    /// change the file. ACCESS counts when it asks about write access, so that the server's answer
+    /// matches what a write would get. Locks, FSYNC, FLUSH and RELEASE change no file.
+    pub fn writes_to_volume(&self) -> bool {
+        let opens_for_writing =
+            |flags: u32| (flags as i32) & (libc::O_ACCMODE | libc::O_TRUNC) != libc::O_RDONLY;
+        match self {
+            VolumeRequest::Setattr { .. }
+            | VolumeRequest::Mkdir { .. }
+            | VolumeRequest::Mknod { .. }
+            | VolumeRequest::Rmdir { .. }
+            | VolumeRequest::Create { .. }
+            | VolumeRequest::Write { .. }
+            | VolumeRequest::Unlink { .. }
+            | VolumeRequest::Rename { .. }
+            | VolumeRequest::Symlink { .. }
+            | VolumeRequest::Link { .. }
+            | VolumeRequest::Setxattr { .. }
+            | VolumeRequest::Removexattr { .. }
+            | VolumeRequest::Fallocate { .. }
+            | VolumeRequest::CopyFileRange { .. }
+            | VolumeRequest::RemapFileRange { .. } => true,
+            VolumeRequest::Open { flags, .. } => opens_for_writing(*flags),
+            VolumeRequest::Access { mask, .. } => (*mask as i32) & libc::W_OK != 0,
+            VolumeRequest::Lookup { .. }
+            | VolumeRequest::Getattr { .. }
+            | VolumeRequest::Readdir { .. }
+            | VolumeRequest::Read { .. }
+            | VolumeRequest::Release { .. }
+            | VolumeRequest::Flush { .. }
+            | VolumeRequest::Fsync { .. }
+            | VolumeRequest::Readlink { .. }
+            | VolumeRequest::Statfs { .. }
+            | VolumeRequest::Opendir { .. }
+            | VolumeRequest::Releasedir { .. }
+            | VolumeRequest::Fsyncdir { .. }
+            | VolumeRequest::Getxattr { .. }
+            | VolumeRequest::Listxattr { .. }
+            | VolumeRequest::Lseek { .. }
+            | VolumeRequest::Getlk { .. }
+            | VolumeRequest::Setlk { .. }
+            | VolumeRequest::Readdirplus { .. }
+            | VolumeRequest::Forget { .. }
+            | VolumeRequest::BatchForget { .. } => false,
+        }
+    }
+
     /// Check if this is a fire-and-forget operation (no response expected).
     pub fn is_no_reply(&self) -> bool {
         matches!(
