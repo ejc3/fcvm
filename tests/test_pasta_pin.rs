@@ -4,7 +4,7 @@
 //! differs from CI's. The patch is dropped once the pin moves past its upstream
 //! merge.
 //!
-//! The last three tests run `fill_build_dir()` from scripts/build-passt.sh, the
+//! The last four tests run `fill_build_dir()` from scripts/build-passt.sh, the
 //! step that decides what that script builds from.
 
 use sha2::{Digest, Sha256};
@@ -49,13 +49,14 @@ fn both_pasta_builds_pin_the_same_upstream_commit_and_patch() {
         Some("https://passt.top/passt")
     );
 
+    assert_eq!(
+        config["pasta"]["archive_sha256"].as_str(),
+        Some(ARCHIVE_SHA256)
+    );
+
     let script = read("scripts/build-passt.sh");
     for (name, value) in [
         ("PASST_COMMIT", PINNED_COMMIT),
-        (
-            "PASST_TARBALL_URL",
-            "https://passt.top/passt/snapshot/passt-${PASST_COMMIT}.tar.xz",
-        ),
         ("PASST_TARBALL_SHA256", ARCHIVE_SHA256),
     ] {
         assert!(
@@ -95,6 +96,54 @@ fn both_pasta_builds_pin_the_same_upstream_commit_and_patch() {
             "upstream already contains {patch}"
         );
     }
+}
+
+/// passt.top refused TLS handshakes from the runners for hours on 2026-09-24,
+/// and every CI job that built pasta failed with it (#1008). Both builds take
+/// the archive from a list of sources, the first of them not on passt.top, and
+/// the two lists are the same.
+#[test]
+fn both_pasta_builds_fetch_the_archive_from_a_source_off_passt_top_first() {
+    let config: toml::Value = toml::from_str(&read("rootfs-config.toml")).unwrap();
+    let archives: Vec<&str> = config["pasta"]["archives"]
+        .as_array()
+        .expect("[pasta] archives is a list")
+        .iter()
+        .map(|url| url.as_str().unwrap())
+        .collect();
+    let file = format!("passt-{PINNED_COMMIT}.tar.xz");
+    assert_eq!(
+        archives,
+        [
+            format!(
+                "https://github.com/ejc3/fcvm/releases/download/passt-{}/{file}",
+                &PINNED_COMMIT[..12]
+            ),
+            format!("https://passt.top/passt/snapshot/{file}"),
+        ],
+        "the release asset scripts/publish-passt-archive.sh uploads, then passt.top"
+    );
+
+    let script = read("scripts/build-passt.sh");
+    let line = script
+        .lines()
+        .find_map(|line| line.strip_prefix("PASST_TARBALL_URLS=\""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("scripts/build-passt.sh sets PASST_TARBALL_URLS");
+    let expanded = line
+        .replace("${PASST_COMMIT:0:12}", &PINNED_COMMIT[..12])
+        .replace("${PASST_COMMIT}", PINNED_COMMIT);
+    assert_eq!(
+        expanded.split(' ').collect::<Vec<_>>(),
+        archives,
+        "scripts/build-passt.sh and rootfs-config.toml must list the same sources"
+    );
+
+    let setup = read("src/setup/pasta.rs");
+    assert!(
+        !setup.contains("\"clone\""),
+        "src/setup/pasta.rs must build from the verified archive, not a clone of passt.top"
+    );
 }
 
 /// The carried patch guards every flow-specific log call in `udp_sock_errs()`
@@ -182,6 +231,20 @@ fn fill_build_dir_source() -> String {
     rest[..end].to_string()
 }
 
+/// `fetch_archive()` from scripts/build-passt.sh, which `fill_build_dir()` calls.
+fn fetch_archive_source() -> String {
+    let script = read("scripts/build-passt.sh");
+    let start = script
+        .find("fetch_archive() {")
+        .expect("scripts/build-passt.sh has no fetch_archive()");
+    let rest = &script[start..];
+    let end = rest
+        .find("\n}\n")
+        .expect("fetch_archive() has no closing brace")
+        + 2;
+    rest[..end].to_string()
+}
+
 /// Call `fill_build_dir <kept> <build> <url> <sha256> <the carried patch>` under
 /// the script's own shell options. `build` is created empty first, as the script
 /// creates it with `mktemp -d`.
@@ -190,7 +253,8 @@ fn fill_build_dir(kept: &Path, build: &Path, url: &str, sha256: &str) -> Output 
     // The arguments go through the environment and are never pasted into the
     // program text.
     let program = format!(
-        "set -euo pipefail\n{}\nfill_build_dir \"$KEPT\" \"$BUILD\" \"$URL\" \"$SHA256\" \"$PATCH\"\n",
+        "set -euo pipefail\n{}\n{}\nfill_build_dir \"$KEPT\" \"$BUILD\" \"$URL\" \"$SHA256\" \"$PATCH\"\n",
+        fetch_archive_source(),
         fill_build_dir_source()
     );
     Command::new("bash")
@@ -201,6 +265,7 @@ fn fill_build_dir(kept: &Path, build: &Path, url: &str, sha256: &str) -> Output 
         .env("URL", url)
         .env("SHA256", sha256)
         .env("PATCH", in_manifest(PATCH_FILE))
+        .env("PASST_FETCH_RETRY_DELAY", "0")
         .output()
         .expect("running bash")
 }
@@ -365,4 +430,37 @@ fn an_archive_with_the_wrong_checksum_is_neither_extracted_nor_kept() {
     );
     assert!(!build.join("udp.c").exists(), "the archive was extracted");
     assert!(!kept.exists(), "a tree was kept from an unverified archive");
+}
+
+/// A source that does not answer, or serves other bytes, costs its attempts and
+/// the next source is tried; only when no source serves the pinned archive does
+/// the run fail (#1008).
+#[test]
+fn a_source_that_fails_falls_through_to_the_next_one() {
+    let fx = Fixture::new();
+    let other = fx.path("other.tar.xz");
+    std::fs::write(&other, b"not the pinned archive").unwrap();
+    let absent = format!("file://{}", fx.path("absent.tar.xz").display());
+    let wrong = format!("file://{}", other.display());
+    for (i, first) in [&absent, &wrong].into_iter().enumerate() {
+        let kept = fx.path(&format!("passt-build-0123456789a{i}"));
+        let build = fx.path(&format!("passt-build-0123456789a{i}.build.only"));
+        let run = fill_build_dir(&kept, &build, &format!("{first} {}", fx.url), &fx.sha256);
+        assert!(
+            run.status.success(),
+            "{first} failed and the pinned archive behind it was not tried: {}",
+            said(&run)
+        );
+        assert_eq!(guards(&build), 3);
+    }
+
+    let kept = fx.path("passt-build-0123456789b0");
+    let build = fx.path("passt-build-0123456789b0.build.only");
+    let run = fill_build_dir(&kept, &build, &format!("{absent} {wrong}"), &fx.sha256);
+    assert!(
+        !run.status.success(),
+        "no source served the archive: {}",
+        said(&run)
+    );
+    assert!(!build.join("udp.c").exists(), "the archive was extracted");
 }
