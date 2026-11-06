@@ -417,6 +417,75 @@ fn mountinfo_entry(mountinfo: &str, id: u64) -> Option<String> {
     })
 }
 
+/// The filesystem type and mount point of mount `id` in `mountinfo`.
+fn mountinfo_type_and_point(mountinfo: &str, id: u64) -> Option<(String, String)> {
+    mountinfo.lines().find_map(|line| {
+        let (mount, filesystem) = line.split_once(" - ")?;
+        let mut fields = mount.split_whitespace();
+        if fields.next()?.parse::<u64>().ok()? != id {
+            return None;
+        }
+        let mount_point = unescape_mount_field(fields.nth(3)?);
+        let fstype = filesystem.split_whitespace().next()?.to_string();
+        Some((fstype, mount_point))
+    })
+}
+
+/// An NFS share as fc-agent mounted it at boot: the share, and the ID of the mount its
+/// guest path reached right after the mount.
+#[derive(Debug, Clone)]
+pub struct MountedNfsShare {
+    pub share: NfsMount,
+    pub mount_id: u64,
+}
+
+/// Record which mount each share's guest path reaches, right after `mount_nfs_shares`
+/// mounted them. The restore remounts that mount where it is, not whatever the guest path
+/// reaches by then (#1086).
+pub fn record_nfs_mounts(shares: &[NfsMount]) -> Result<Vec<MountedNfsShare>> {
+    shares
+        .iter()
+        .map(|share| {
+            let mount_id = path_mount_id(&share.mount_path).with_context(|| {
+                format!("reading which mount NFS share {} reaches", share.mount_path)
+            })?;
+            Ok(MountedNfsShare {
+                share: share.clone(),
+                mount_id,
+            })
+        })
+        .collect()
+}
+
+/// Where the restore remounts `mounted`: the mount point of the NFS mount it made at boot,
+/// read from `mountinfo` by that mount's ID.
+///
+/// The share's guest path is not resolved again. A process in the guest that retargeted a
+/// symlink on that path between the boot and the snapshot would otherwise make the restore
+/// lazily unmount whatever the path reaches now (an extra disk, a FUSE volume, a pmem
+/// mount) and mount the share over it, leaving the dead pre-snapshot NFS mount where it
+/// was (#1086). A recorded mount that is gone, or is no longer NFS, fails the restore.
+pub fn nfs_remount_point(mountinfo: &str, mounted: &MountedNfsShare) -> Result<String> {
+    let (fstype, point) =
+        mountinfo_type_and_point(mountinfo, mounted.mount_id).with_context(|| {
+            format!(
+                "NFS share {}:{} mounted at {} at boot (mount {}) is no longer mounted",
+                mounted.share.host_ip,
+                mounted.share.host_path,
+                mounted.share.mount_path,
+                mounted.mount_id
+            )
+        })?;
+    anyhow::ensure!(
+        fstype.starts_with("nfs"),
+        "mount {} where NFS share {}:{} was mounted at boot is now {fstype} at {point}",
+        mounted.mount_id,
+        mounted.share.host_ip,
+        mounted.share.host_path
+    );
+    Ok(point)
+}
+
 /// Mount read-only pmem devices with DAX and check /proc/mounts shows it. Returns
 /// the mounted paths. Each device goes into `record` once it is mounted.
 pub fn mount_pmem_devices(devices: &[PmemMount], record: &mut MountRecord) -> Result<Vec<String>> {
@@ -666,6 +735,79 @@ mod tests {
             .map(|source| source.matches(definition).count())
             .sum();
         assert_eq!(definitions, 1);
+    }
+
+    fn share(mount_path: &str) -> MountedNfsShare {
+        MountedNfsShare {
+            share: NfsMount {
+                host_ip: "10.0.2.2".to_string(),
+                host_path: "/export".to_string(),
+                mount_path: mount_path.to_string(),
+                read_only: false,
+            },
+            mount_id: 77,
+        }
+    }
+
+    /// #1086: the share was mounted through `/data`, a symlink to /srv/a. Before the snapshot
+    /// a process retargeted `/data` to /srv/b, where an extra disk is mounted. The restore
+    /// remounts the share at the mount point of the mount the boot made (77, at /srv/a), and
+    /// never touches what `/data` reaches now.
+    #[test]
+    fn the_restore_remounts_an_nfs_share_where_the_boot_mounted_it() {
+        let mountinfo = "\
+            30 1 254:0 / / rw,relatime - ext4 /dev/vda rw\n\
+            77 30 0:55 / /srv/a rw,relatime - nfs4 10.0.2.2:/export rw,vers=4.2\n\
+            78 30 254:16 / /srv/b rw,relatime - ext4 /dev/vdb rw\n";
+        assert_eq!(
+            nfs_remount_point(mountinfo, &share("/data")).unwrap(),
+            "/srv/a"
+        );
+    }
+
+    /// A recorded mount that is gone, or that is no longer NFS, fails the restore instead of
+    /// mounting the share over another mount.
+    #[test]
+    fn a_recorded_nfs_mount_that_is_gone_or_not_nfs_fails_the_remount() {
+        let gone = "30 1 254:0 / / rw - ext4 /dev/vda rw\n";
+        let error = nfs_remount_point(gone, &share("/data")).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no longer mounted"),
+            "{error:#}"
+        );
+        let reused =
+            "30 1 254:0 / / rw - ext4 /dev/vda rw\n77 30 254:16 / /srv/b rw - ext4 /dev/vdb rw\n";
+        let error = nfs_remount_point(reused, &share("/data")).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("is now ext4 at /srv/b"),
+            "{error:#}"
+        );
+    }
+
+    /// A mount point with a space is escaped in mountinfo and comes back unescaped.
+    #[test]
+    fn an_escaped_nfs_mount_point_is_unescaped() {
+        let mountinfo = "77 30 0:55 / /srv/my\\040share rw - nfs 10.0.2.2:/export rw\n";
+        assert_eq!(
+            nfs_remount_point(mountinfo, &share("/data")).unwrap(),
+            "/srv/my share"
+        );
+    }
+
+    /// What the boot records is the ID of the mount the share's path reached right after the
+    /// mount, through any symlink on the way, which is what the restore looks up.
+    #[test]
+    fn the_boot_records_the_mount_a_share_reaches() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a");
+        std::fs::create_dir(&target).unwrap();
+        let link = dir.path().join("data");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let recorded = record_nfs_mounts(&[share(link.to_str().unwrap()).share]).unwrap();
+        assert_eq!(
+            recorded[0].mount_id,
+            path_mount_id(target.to_str().unwrap()).unwrap()
+        );
     }
 
     #[test]

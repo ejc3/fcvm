@@ -143,12 +143,14 @@ pub struct RestoreSignals {
     /// no new epoch and lapses. Accelerator only: the normal poll cadence
     /// remains the correctness path.
     pub vsock_reset_rx: watch::Receiver<u64>,
-    /// NFS mounts from the boot-time plan, kept for post-restore remounting.
-    /// MMDS can't be re-fetched here: the host's restore-epoch PUT replaces the
-    /// whole MMDS store, so `container-plan` is gone by the time restore runs.
-    /// This cache lives in the snapshot's memory image, so a restored VM sees
-    /// exactly the mounts that were active when the snapshot was taken.
-    pub nfs_mounts: Vec<crate::types::NfsMount>,
+    /// The NFS shares fc-agent mounted at boot, each with the ID of its mount, kept for
+    /// post-restore remounting. Set once, right after the boot mounted them, which comes
+    /// before the cache-ready handshake and so before any snapshot. MMDS can't be
+    /// re-fetched here: the host's restore-epoch PUT replaces the whole MMDS store, so
+    /// `container-plan` is gone by the time restore runs. This cache lives in the
+    /// snapshot's memory image, so a restored VM sees exactly the mounts that were active
+    /// when the snapshot was taken.
+    pub nfs_mounts: std::sync::Arc<std::sync::OnceLock<Vec<crate::mounts::MountedNfsShare>>>,
 }
 
 /// Per-phase milliseconds for one guest-side restore, carried to the host in
@@ -495,23 +497,39 @@ pub async fn handle_clone_restore(
     // Uses the boot-time plan cached in RestoreSignals — see its doc comment
     // for why MMDS can't be consulted here.
     let nfs_started = std::time::Instant::now();
-    if !signals.nfs_mounts.is_empty() {
+    let mounted_nfs = signals
+        .nfs_mounts
+        .get()
+        .context("restored before the boot recorded its NFS mounts")?;
+    if !mounted_nfs.is_empty() {
         eprintln!(
             "[fc-agent] remounting {} NFS share(s) after restore",
-            signals.nfs_mounts.len()
+            mounted_nfs.len()
         );
-        for share in &signals.nfs_mounts {
+        // Each share is remounted at the mount point of the mount the boot made, found by
+        // its mount ID, not by resolving its guest path again (#1086).
+        let mountinfo = tokio::fs::read_to_string("/proc/self/mountinfo")
+            .await
+            .context("reading /proc/self/mountinfo to remount NFS shares after restore")?;
+        let mut shares = Vec::with_capacity(mounted_nfs.len());
+        for mounted in mounted_nfs {
+            let point = crate::mounts::nfs_remount_point(&mountinfo, mounted)
+                .context("remounting NFS shares after restore, so the clone stays unpublished")?;
             let _ = tokio::process::Command::new("umount")
-                .args(["-l", &share.mount_path])
+                .args(["-l", &point])
                 .output()
                 .await;
+            shares.push(crate::types::NfsMount {
+                mount_path: point,
+                ..mounted.share.clone()
+            });
         }
         // No mount record: the boot's check passed the mounts this restore reproduces.
         // A failure fails the restore closed: the hook below may use the share,
         // and a mount point that is an ordinary directory would take its writes;
         // a published clone whose share is missing is the stale state the hook
         // exists to prevent.
-        crate::mounts::mount_nfs_shares(&signals.nfs_mounts, None)
+        crate::mounts::mount_nfs_shares(&shares, None)
             .context("remounting NFS shares after restore, so the clone stays unpublished")?;
     }
     phases.nfs_ms = elapsed_ms(nfs_started);
