@@ -725,10 +725,14 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
   are terminated, and a host that is reclaimed or terminated is replaced. The regions are
   listed (`DescribeInstances`) every 2 s while hosts come up or go away and every 15 s while
   they run; an instance a launch named counts as pending while lists leave it out (60 s at
-  most), and a launch whose answer is lost is asked again with the same idempotency token. The coordinator logs `wake: host launch accepted` (`market`, `request_ms`, the
+  most), and a launch whose answer is lost is asked again with the same idempotency token and
+  the same `CreateFleet` parameters, also after the fleet sleeps (an asleep pass terminates
+  what it launched), for up to 2 minutes; by then a list names whatever it launched. The
+  coordinator logs `wake: host launch accepted` (`market`, `request_ms`, the
   `CreateFleet` round trip), `wake: host running` (`request_to_running_ms`) and, once a
   region runs its awake capacity, `wake: host capacity in service` with `path` (`spot`,
-  `on-demand`, or `spot and on-demand`) and `since_wake_ms`. A call that fails marks the
+  `on-demand`, or `spot and on-demand`) and `since_wake_ms`; a region still short logs the
+  last refusal (`reason`). A call that fails marks the
   coordinator degraded (`scale`) and is retried at the next poll.
 - `--admin-listen` serves the operator's endpoint, `POST /quarantine/release` with
   `{"host": "<host>", "sbdf": "0000:05:00.0"}`, which returns a quarantined GPU to

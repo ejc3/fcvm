@@ -1154,6 +1154,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             // While they run: a reclaimed spot host is replaced within this.
             liveness: Duration::from_secs(15),
             capacity_retry: Duration::from_secs(10),
+            lost_launch_ttl: Duration::from_secs(120),
         })
     };
     let dns_token = match &args.dns_token_secret {

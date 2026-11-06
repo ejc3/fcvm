@@ -133,6 +133,10 @@ pub struct HostConfig {
     pub liveness: Duration,
     /// How long a region that neither market could fill waits before it asks again.
     pub capacity_retry: Duration,
+    /// How long a lost launch's token is asked again. By then a list names whatever it
+    /// launched (`LIST_GRACE`), so dropping it launches nothing twice, and a token whose
+    /// retry never gets an answer stops holding its region's launches.
+    pub lost_launch_ttl: Duration,
 }
 
 /// How long an instance a launch named counts as pending while no list names it.
@@ -221,8 +225,9 @@ fn lifecycle(state: &str) -> &'static str {
     }
 }
 
-/// Per region and market: the token and count of a launch whose outcome is unknown.
-type Tokens = HashMap<(String, Market), (String, u32)>;
+/// Per region and market: the token and count of a launch whose outcome is unknown, and when
+/// it was first asked.
+type Tokens = HashMap<(String, Market), (String, u32, Instant)>;
 
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
@@ -260,10 +265,23 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                 };
             }
             last_want = Some(want);
-            tokens.clear();
             tracing::info!(power = %state, hosts_per_region = want, "hosts set for the power state");
         }
         let now = Instant::now();
+        // Tokens are kept across power changes (an asleep pass terminates what a lost launch
+        // started), but not for ever.
+        tokens.retain(|(region, market), (_, count, at)| {
+            let keep = now.duration_since(*at) < cfg.lost_launch_ttl;
+            if !keep {
+                tracing::warn!(%region, market = market.name(), hosts = *count,
+                    "a lost GPU host launch got no answer in time; the hosts lists name what it launched");
+            }
+            keep
+        });
+        // Whether this pass reports the instances: decided before any region's watch ends, so
+        // the pass that sees a wake's last host running still publishes it, after the EC2 half
+        // alone made the fleet awake too.
+        let watching = state == "waking" || watch.iter().any(|w| w.coming_up);
         let mut errors: Vec<String> = Vec::new();
         // Every region's hosts; `None` for a region that could not be listed.
         let mut listed: Vec<Option<Vec<Host>>> = Vec::new();
@@ -292,7 +310,7 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
             *n += tokens
                 .iter()
                 .filter(|((_, m), _)| *m == Market::OnDemand)
-                .map(|(_, (_, c))| *c)
+                .map(|(_, (_, c, _))| *c)
                 .sum::<u32>();
         }
         let mut report = Vec::new();
@@ -350,6 +368,32 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                 }
             }
             if want == 0 {
+                // A launch whose answer was lost may have launched a host that no list names
+                // yet: ask again with its token to learn it, and terminate it now.
+                let lost = reconcile(
+                    &cfg,
+                    region,
+                    hosts,
+                    &mut tokens,
+                    &mut on_demand,
+                    &mut recent,
+                    &mut errors,
+                )
+                .await
+                .unwrap_or_default();
+                let lost: Vec<String> = lost.into_iter().filter(|id| !ids.contains(id)).collect();
+                if !lost.is_empty() {
+                    busy = true;
+                    match cfg.driver.terminate(region, &lost).await {
+                        Ok(()) => {
+                            tracing::info!(%region, instances = ?lost, power = %state, "terminating GPU hosts of lost launches")
+                        }
+                        Err(e) => {
+                            tracing::warn!(%region, error = %format!("{e:#}"), "terminating GPU hosts failed");
+                            errors.push(format!("{region}: {e:#}"));
+                        }
+                    }
+                }
                 continue;
             }
             let mut live = hosts.iter().filter(|h| h.live()).count() as u32;
@@ -368,6 +412,7 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                 )
                 .await
                 {
+                    let found = found.len() as u32;
                     live += found;
                     busy |= found > 0;
                     if live < want {
@@ -407,7 +452,7 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
                 busy = true;
             }
         }
-        if state == "waking" || watch.iter().any(|w| w.coming_up) {
+        if watching {
             handle
                 .send(Event::ScaleInstances {
                     at: 0,
@@ -425,7 +470,12 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
         let wait = if state == "waking" || busy || !errors.is_empty() {
             cfg.poll
         } else if want == 0 {
-            ASLEEP_CHECK
+            // A lost launch, or a launched host no list has shown going, is followed at `poll`.
+            if tokens.is_empty() && recent.is_empty() {
+                ASLEEP_CHECK
+            } else {
+                cfg.poll
+            }
         } else {
             cfg.liveness
         };
@@ -436,9 +486,9 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
     }
 }
 
-/// Ask `region`'s lost launches again with their tokens. Returns how many instances they
-/// launched that `hosts` does not list yet (now followed as pending), or `None` when one
-/// still has no answer (asked again at the next poll, and nothing new is launched).
+/// Ask `region`'s lost launches again with their tokens. Returns the instances they launched
+/// that `hosts` does not list yet (now followed as pending), or `None` when one still has no
+/// answer (asked again at the next poll, and nothing new is launched).
 async fn reconcile(
     cfg: &HostConfig,
     region: &str,
@@ -447,11 +497,11 @@ async fn reconcile(
     on_demand: &mut Option<u32>,
     recent: &mut HashMap<String, Recent>,
     errors: &mut Vec<String>,
-) -> Option<u32> {
-    let mut found = 0;
+) -> Option<Vec<String>> {
+    let mut found = Vec::new();
     for market in [Market::Spot, Market::OnDemand] {
         let key = (region.to_string(), market);
-        let Some((token, count)) = tokens.get(&key).cloned() else {
+        let Some((token, count, _)) = tokens.get(&key).cloned() else {
             continue;
         };
         let asked = Instant::now();
@@ -486,7 +536,7 @@ async fn reconcile(
                         *n = n.saturating_sub(count) + new.len() as u32;
                     }
                 }
-                found += new.len() as u32;
+                found.extend(new.into_iter().cloned());
             }
             Err(e) => {
                 tracing::warn!(%region, market = market.name(), error = %format!("{e:#}"), "asking a lost GPU host launch again failed");
@@ -549,7 +599,7 @@ async fn launch_shortfall(
             Err(e) => {
                 // It may have launched: [`reconcile`] asks again with this token, and an
                 // on-demand count is reserved against the cap until then.
-                tokens.insert((region.to_string(), market), (token, ask));
+                tokens.insert((region.to_string(), market), (token, ask, asked));
                 if market == Market::OnDemand {
                     if let Some(n) = on_demand.as_mut() {
                         *n += ask;
@@ -596,7 +646,8 @@ async fn launch_shortfall(
         refused = got.refused;
     }
     if launched < short {
-        tracing::warn!(%region, launched, short, "GPU hosts still short; asking again after the capacity retry");
+        tracing::warn!(%region, launched, short, reason = %refused.join("; "),
+            "GPU hosts still short; asking again after the capacity retry");
     }
     (launched, !failed)
 }
@@ -1053,7 +1104,9 @@ impl HostDriver for AwsHosts {
 /// A launch is idempotent by its token. `ambiguous` makes that many next launches that launch
 /// something fail after launching, as a request whose answer is lost. `hide_new` (show, hide): each launched
 /// instance is named by its region's next `show` lists, left out of the `hide` after them,
-/// then named again, as an eventually consistent DescribeInstances.
+/// then named again, as an eventually consistent DescribeInstances. `stuck` makes that many
+/// next launches with a new token fail without launching, and every later request with one of
+/// their tokens fail too, as a retry EC2 never answers.
 #[derive(Default)]
 pub struct FakeHosts {
     pub hosts: Mutex<BTreeMap<String, Vec<Host>>>,
@@ -1063,6 +1116,8 @@ pub struct FakeHosts {
     pub fail_lists: Mutex<HashMap<String, u32>>,
     pub ambiguous: Mutex<u32>,
     pub hide_new: Mutex<Option<(u32, u32)>>,
+    pub stuck: Mutex<u32>,
+    stuck_tokens: Mutex<std::collections::HashSet<String>>,
     by_token: Mutex<HashMap<String, Launch>>,
     visibility: Mutex<HashMap<String, (u32, u32)>>,
     next: std::sync::atomic::AtomicU64,
@@ -1140,6 +1195,17 @@ impl HostDriver for FakeHosts {
             .push(format!("launch {region} {} {count}", market.name()));
         if let Some(l) = self.by_token.lock().unwrap().get(token) {
             return Ok(l.clone());
+        }
+        {
+            let mut stuck = self.stuck.lock().unwrap();
+            let mut tokens = self.stuck_tokens.lock().unwrap();
+            if *stuck > 0 && !tokens.contains(token) {
+                *stuck -= 1;
+                tokens.insert(token.to_string());
+            }
+            if tokens.contains(token) {
+                bail!("injected: no answer for this token");
+            }
         }
         let n = {
             let mut cap = self.capacity.lock().unwrap();
