@@ -2171,8 +2171,12 @@ async fn save_vm_logs(data_dir: &Path, vm_id: &str, dest_dir: &Path) -> Result<(
         if !src.exists() {
             continue;
         }
-        let dest = dest_dir.join(format!("fcvm-{kind}-{vm_id}.log"));
-        match publish_log(&src, &dest).await {
+        let dest = saved_log_path(dest_dir, kind, vm_id);
+        // The Firecracker log is kept from its end: at FCVM_FIRECRACKER_LOG_LEVEL=Debug a
+        // FUSE-over-vsock guest writes gigabytes an hour, and every exit left a copy that size
+        // in /tmp (#969). The container output is kept whole: its writer caps it already.
+        let keep = (kind == "firecracker").then_some(FIRECRACKER_LOG_KEPT);
+        match publish_log(&src, &dest, keep).await {
             Ok(()) => info!(vm_id = %vm_id, log = %dest.display(), "saved {kind} log"),
             Err(e) if kind == "firecracker" => {
                 debug!(vm_id = %vm_id, error = %e, "could not save {kind} log")
@@ -2187,14 +2191,28 @@ async fn save_vm_logs(data_dir: &Path, vm_id: &str, dest_dir: &Path) -> Result<(
     }
 }
 
+/// The most of a VM's Firecracker log teardown copies to /tmp: its last 16 MiB. At the default
+/// level a whole log is far below it (the largest of 382 kept on one test host was 129 KiB).
+pub(crate) const FIRECRACKER_LOG_KEPT: u64 = 16 << 20;
+
+/// Where teardown copies a VM's log of `kind` (`firecracker`, `container`, `container.1`).
+pub(crate) fn saved_log_path(dest_dir: &Path, kind: &str, vm_id: &str) -> PathBuf {
+    dest_dir.join(format!("fcvm-{kind}-{vm_id}.log"))
+}
+
 /// Copy a VM's log out of its directory to `dest` (a path in /tmp other users can guess), as a file
 /// this process creates: written to a new 0600 file opened create-exclusive beside `dest`, then renamed
 /// over it. A rename replaces whatever `dest` is, a symlink included, instead of writing through it,
 /// so a symlink planted at the name cannot make fcvm (often root) overwrite the file it points to.
+///
+/// With `keep`, a `src` longer than that many bytes is copied from its end: from the first whole
+/// line in its last `keep` bytes, after a line saying how much was left out.
 pub(crate) async fn publish_log(
     src: &std::path::Path,
     dest: &std::path::Path,
+    keep: Option<u64>,
 ) -> std::io::Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt};
     let name = dest
         .file_name()
         .and_then(|n| n.to_str())
@@ -2208,7 +2226,29 @@ pub(crate) async fn publish_log(
         .await?;
     let copied = async {
         let mut input = tokio::fs::File::open(src).await?;
-        tokio::io::copy(&mut input, &mut out).await?;
+        let len = input.metadata().await?.len();
+        match keep {
+            Some(keep) if len > keep => {
+                input.seek(std::io::SeekFrom::Start(len - keep)).await?;
+                let mut input = tokio::io::BufReader::new(input);
+                // The cut lands in a line; the copy starts at the next one.
+                let mut partial = Vec::new();
+                let skipped = input.read_until(b'\n', &mut partial).await? as u64;
+                out.write_all(
+                    format!(
+                        "fcvm: the first {} of this log's {len} bytes were not kept\n",
+                        len - keep + skipped
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+                tokio::io::copy(&mut input, &mut out).await?;
+            }
+            _ => {
+                tokio::io::copy(&mut input, &mut out).await?;
+            }
+        }
+        out.flush().await?;
         drop(out);
         tokio::fs::rename(&tmp, dest).await
     }
@@ -10109,6 +10149,52 @@ mod publish_log_tests {
         );
     }
 
+    /// Teardown keeps the end of a Firecracker log longer than FIRECRACKER_LOG_KEPT, from a
+    /// whole line, and says how much it left out. It copied the whole file, so at Debug level
+    /// every VM exit left gigabytes in /tmp (#969). The source is sparse, so it costs no disk.
+    #[tokio::test]
+    async fn teardown_keeps_the_end_of_a_long_firecracker_log() {
+        use super::FIRECRACKER_LOG_KEPT;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("vm");
+        std::fs::create_dir(&data).unwrap();
+        let log = data.join("firecracker.log");
+        let file = std::fs::File::create(&log).unwrap();
+        file.set_len(3 * FIRECRACKER_LOG_KEPT).unwrap();
+        drop(file);
+        let mut tail = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        std::io::Write::write_all(&mut tail, b"\nthe line before the exit\n").unwrap();
+        drop(tail);
+        let len = std::fs::metadata(&log).unwrap().len();
+
+        let out = dir.path().join("tmp");
+        std::fs::create_dir(&out).unwrap();
+        save_vm_logs(&data, "vm-x", &out).await.unwrap();
+        let kept = std::fs::read(out.join("fcvm-firecracker-vm-x.log")).unwrap();
+        assert!(
+            kept.len() as u64 <= FIRECRACKER_LOG_KEPT + 100,
+            "{} bytes kept of a {len}-byte log",
+            kept.len()
+        );
+        let first = kept.split(|&b| b == b'\n').next().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(first),
+            format!(
+                "fcvm: the first {} of this log's {len} bytes were not kept",
+                3 * FIRECRACKER_LOG_KEPT + 1
+            )
+        );
+        assert!(kept.ends_with(b"\nthe line before the exit\n"));
+
+        // A log under the bound is copied whole, with no note.
+        std::fs::write(&log, "short\n").unwrap();
+        save_vm_logs(&data, "vm-y", &out).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.join("fcvm-firecracker-vm-y.log")).unwrap(),
+            "short\n"
+        );
+    }
+
     #[tokio::test]
     async fn a_symlink_at_the_destination_is_replaced_not_written_through() {
         let dir = tempfile::tempdir().unwrap();
@@ -10118,7 +10204,7 @@ mod publish_log_tests {
         std::fs::write(&victim, "precious\n").unwrap();
         let dest = dir.path().join("fcvm-container-vm.log");
         std::os::unix::fs::symlink(&victim, &dest).unwrap();
-        publish_log(&src, &dest).await.unwrap();
+        publish_log(&src, &dest, None).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(&victim).unwrap(),
             "precious\n",
