@@ -146,7 +146,7 @@ def _null_or_ipv4(value) -> bool:
         return False
 
 
-def corpus_dns_gate(run_dir: str, schedule: dict, provenance: dict):
+def corpus_dns_gate(run_dir: str, schedule: dict, provenance: dict, cell: dict):
     """None when publication needs no resolver evidence or has it, else why not.
 
     A run needs resolver evidence when a URL's host is a name only a resolver
@@ -164,6 +164,14 @@ def corpus_dns_gate(run_dir: str, schedule: dict, provenance: dict):
     records no guest resolver, so the brackets are held to the one the first
     of them names. A WITHDRAWN marker in the campaign directory, the results
     directory the withdrawal rule in AGENTS.md governs, withdraws the run too.
+
+    Once the DNS evidence holds, the campaign's diag/summary.json is held to
+    the run as the serial index holds it (campaign_summary.summarize_diag):
+    cell names what the scale analysis validated (the snapshot generation,
+    config and tag, the engine, the UFFD backend and mode the diag ran on, and
+    the runtime bundle), the URLs are the schedule's, the addresses are the
+    ones the verify brackets answered, and the load bound is the diag ceiling
+    the campaign recorded in the run's provenance (diag_max_load_ms).
     """
     corpus = provenance["host_control"].get("resolve_all_to") or any(
         reqanalyze.url_needs_resolver(url) is not False for url in schedule["urls"])
@@ -177,13 +185,27 @@ def corpus_dns_gate(run_dir: str, schedule: dict, provenance: dict):
     if not os.path.isfile(path):
         return f"corpus run without the campaign's DNS evidence ({path})"
     sources = campaign_summary.Sources(campaign_dir)
+    urls = list(schedule["urls"])
     try:
         evidence = sources.read_json(path)
-        campaign_summary.check_evidence(
-            campaign_dir, evidence, sources, None, list(schedule["urls"]), schedule["run_id"]
+        answers, _owner_load = campaign_summary.check_evidence(
+            campaign_dir, evidence, sources, None, urls, schedule["run_id"]
         )
     except campaign_summary.RunError as error:
         return f"the campaign's DNS evidence does not hold: {error}"
+    ceiling = provenance.get("diag_max_load_ms")
+    if ceiling is None:
+        return ("the run records no diag_max_load_ms, so the campaign's diag cannot be "
+                "held to the load ceiling it ran under")
+    diag_path = os.path.join(campaign_dir, "diag", "summary.json")
+    if not sources.exists(diag_path):
+        return f"corpus run without the campaign's diag ({diag_path})"
+    try:
+        addresses = campaign_summary.recorded_addresses(campaign_dir, urls, [], answers)
+        campaign_summary.summarize_diag(
+            campaign_dir, sources.read_json(diag_path), cell, urls, addresses, ceiling)
+    except campaign_summary.RunError as error:
+        return f"the campaign's diag does not hold for this run: {error}"
     return None
 
 
@@ -1286,8 +1308,13 @@ def _validate_provenance(provenance: dict, schedule: dict) -> tuple[str, str]:
         "host_control", "snapshot", "snapshot_generation_lease", "host",
         "fault_trace", "runtime_bundle_sha256", "golden_creator",
     }
-    if not isinstance(provenance, dict) or set(provenance) != required:
+    # Runs recorded before the field existed carry no diag_max_load_ms.
+    optional = {"diag_max_load_ms"}
+    if not isinstance(provenance, dict) or not required <= set(provenance) <= required | optional:
         raise AnalysisInvalid("provenance fields are incomplete or unknown")
+    ceiling = provenance.get("diag_max_load_ms")
+    if ceiling is not None and (type(ceiling) is not int or ceiling <= 0):
+        raise AnalysisInvalid(f"provenance diag_max_load_ms={ceiling!r} is not a positive integer")
     if provenance.get("schema") != "fcvm.chromium.reqscale.provenance.v2":
         raise AnalysisInvalid("unsupported provenance schema")
     if provenance.get("run_id") != schedule["run_id"]:
@@ -2096,7 +2123,20 @@ def analyze(run_dir: str) -> dict:
 
     # A WITHDRAWN marker withdraws a scale run wherever it was measured.
     withdrawn = campaign_summary.withdrawal_errors([run_dir])
-    block = withdrawn[0] if withdrawn else corpus_dns_gate(run_dir, schedule, provenance)
+    # What binds the campaign's diag to this run (campaign_summary.DIAG_IDENTITY
+    # and the runtime bundle), from artifacts validated above. The campaign's
+    # diag renders on the UFFD backend in the memory server's mode.
+    diag_cell = {
+        "snapshot_generation_id": generation_id,
+        "snapshot_config_sha256": config_sha256,
+        "snapshot": uffd_serve["snapshot_tag"],
+        "engine": "chromium",
+        "backend": "uffd",
+        "uffd_mode": uffd_serve["uffd_mode"],
+        "runtime_bundle_sha256": provenance["runtime_bundle_sha256"],
+    }
+    block = withdrawn[0] if withdrawn else corpus_dns_gate(
+        run_dir, schedule, provenance, diag_cell)
     return {
         "schema": ANALYSIS_SCHEMA,
         "run_id": run_id,

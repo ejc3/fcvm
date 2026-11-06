@@ -1692,6 +1692,7 @@ class CompleteAnalyzerFixture(unittest.TestCase):
                 "creator_runtime_bundle_sha256": "5" * 64,
                 "source_revision": "1" * 40,
             },
+            "diag_max_load_ms": 15000,
             "fcvm_version": "fcvm fixture",
             "schedule_sha256": reqscale.schedule_sha256(schedule),
             "snapshot": snapshot,
@@ -3294,6 +3295,43 @@ class ScheduleCheckBeforeTheGolden(unittest.TestCase):
                 capture_output=True, text=True, timeout=60).stderr)
             self.assertEqual(os.listdir(d), [])
 
+    def test_the_campaign_records_its_diag_ceiling_in_the_scale_run(self):
+        """#1100: the scale run carries the corpus campaign's DIAG_MAX_LOAD_MS
+        into its provenance, where the analysis's diag gate reads its bound.
+        RED BEFORE THE FIX: no argument, make variable or campaign export
+        carried it, and reqscale.py refused the argument."""
+        with open(os.path.join(HERE, "corpus_campaign.sh")) as f:
+            campaign = f.read()
+        body = campaign[campaign.index("scale_make() {"):]
+        body = body[:body.index("\n}\n")]
+        self.assertIn('SCALE_DIAG_MAX_LOAD_MS="$DIAG_MAX_LOAD_MS"', body)
+        dry = subprocess.run(
+            ["make", "-n", "-s", "-C", self.REPO, "bench-chromium-scale",
+             "SCALE_RATES=0.8", "SCALE_BURSTS=5", "SCALE_SEED=1", "SCALE_OUT=/nonexistent/x",
+             "SCALE_URL=http://127.0.0.1/", "SCALE_TAG=t", "SCALE_CONTROL_CHROMIUM=c",
+             "SCALE_MAX_OFFERED_ERROR_PCT=1", "SCALE_MIN_DEPARTURE_RATIO=1", "SCALE_MAX_BACKLOG=1",
+             "SCALE_MAX_LAUNCH_LAG_MS=1", "SCALE_MAX_CONTROL_DRIFT_PCT=1",
+             "SCALE_DIAG_MAX_LOAD_MS=15000"],
+            capture_output=True, text=True, timeout=60)
+        self.assertIn('--diag-max-load-ms "15000"', dry.stdout, dry.stdout + dry.stderr)
+        with open(os.path.join(HERE, "reqscale.py")) as f:
+            harness = f.read()
+        record = harness[harness.index("def collect_provenance("):]
+        record = record[:record.index("\ndef ")]
+        self.assertIn('"diag_max_load_ms": getattr(args, "diag_max_load_ms", None)', record)
+        for bad in ("0", "-5", "x"):
+            with self.subTest(bad=bad), contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(sys, "argv", [
+                        "reqscale.py", "--check-schedule", "--snapshot-tag", "t",
+                        "--url", "http://127.0.0.1/", "--rates", "0.8", "--bursts", "5",
+                        "--control-chromium", "c", "--max-offered-rps-error-pct", "1",
+                        "--min-departure-ratio", "1", "--max-score-end-backlog", "1",
+                        "--max-p95-launch-lag-ms", "1", "--max-control-median-drift-pct", "1",
+                        "--seed", "1", "--out-dir", "/nonexistent/x", "--diag-max-load-ms", bad]):
+                with self.assertRaises(SystemExit) as stopped:
+                    reqscale.main()
+                self.assertEqual(stopped.exception.code, 2)
+
     def test_the_makefile_rate_examples_pass_the_harness_rules(self):
         """The Makefile's only SCALE_RATES example, 2,4,8, is refused for the
         14-page corpus. RED BEFORE THE FIX: no example in the message passed
@@ -3452,6 +3490,19 @@ class AnalyzerHoldsTheCorpus(unittest.TestCase):
                 AnalyzerRejectsCorruptEvidence.GENERATION,
                 AnalyzerRejectsCorruptEvidence.CONFIG_SHA)
 
+    # The diag binding a scale analysis builds from its validated artifacts,
+    # here the identity test_campaign_summary's write_run and diag_summary use.
+    @staticmethod
+    def _cell(**overrides):
+        from test_campaign_summary import CONFIG_SHA256, GENERATION_ID, SEAL
+        cell = {"snapshot_generation_id": GENERATION_ID, "snapshot_config_sha256": CONFIG_SHA256,
+                "snapshot": "cb-req-corpus", "engine": "chromium", "backend": "uffd",
+                "uffd_mode": "minor", "runtime_bundle_sha256": SEAL["runtime_bundle_sha256"]}
+        cell.update(overrides)
+        return cell
+
+    PROVENANCE = {"host_control": {"resolve_all_to": "127.0.0.1"}, "diag_max_load_ms": 15000}
+
     def _gate(self, evidence):
         with tempfile.TemporaryDirectory() as d:
             run_dir = os.path.join(d, "scale")
@@ -3460,8 +3511,7 @@ class AnalyzerHoldsTheCorpus(unittest.TestCase):
                 with open(os.path.join(d, "dns-evidence.json"), "w") as handle:
                     json.dump(evidence, handle)
             return reqscale_analyze.corpus_dns_gate(
-                run_dir, {"run_id": RUN_ID, "urls": list(CORPUS)},
-                {"host_control": {"resolve_all_to": "127.0.0.1"}})
+                run_dir, {"run_id": RUN_ID, "urls": list(CORPUS)}, self.PROVENANCE, self._cell())
 
     def test_a_corpus_run_needs_the_campaigns_clean_dns_evidence(self):
         """Red before the gate: a corpus run's analysis said publishable with
@@ -3482,22 +3532,65 @@ class AnalyzerHoldsTheCorpus(unittest.TestCase):
         self.assertIsNotNone(bare, "two fields passed as a whole DNS evidence bundle")
         self.assertIn("samples", bare)
         schedule = {"run_id": RUN_ID, "urls": ["https://example.com/"]}
-        provenance = {"host_control": {"resolve_all_to": "127.0.0.1"}}
+        provenance = self.PROVENANCE
         with tempfile.TemporaryDirectory() as d:
             write_run(d, analysis_overrides={"run_id": RUN_ID})
             run_dir = os.path.join(d, "scale")
             os.mkdir(run_dir)
-            self.assertIsNone(reqscale_analyze.corpus_dns_gate(run_dir, schedule, provenance))
+            self.assertIsNone(reqscale_analyze.corpus_dns_gate(run_dir, schedule, provenance, self._cell()))
             with open(os.path.join(d, "corpus-dns.log"), "a") as handle:
                 handle.write("{}\n")
-            refused = reqscale_analyze.corpus_dns_gate(run_dir, schedule, provenance)
+            refused = reqscale_analyze.corpus_dns_gate(run_dir, schedule, provenance, self._cell())
         self.assertIsNotNone(refused, "a replay log changed after the verdict passed")
         self.assertIn("corpus-dns.log sha256", refused)
+
+    def _diag_gate(self, diag, cell=None, provenance=None):
+        """The gate over a campaign whose DNS evidence holds and whose
+        diag/summary.json is diag (None: no summary)."""
+        from test_campaign_summary import write_run
+
+        with tempfile.TemporaryDirectory() as d:
+            write_run(d, analysis_overrides={"run_id": RUN_ID}, diag=diag)
+            run_dir = os.path.join(d, "scale")
+            os.mkdir(run_dir)
+            return reqscale_analyze.corpus_dns_gate(
+                run_dir, {"run_id": RUN_ID, "urls": ["https://example.com/"]},
+                self.PROVENANCE if provenance is None else provenance,
+                cell or self._cell())
+
+    def test_a_corpus_run_is_held_to_the_campaigns_diag(self):
+        """RED BEFORE THE FIX (#1100): the gate read the DNS evidence and the
+        WITHDRAWN markers and never diag/summary.json, so a scale run whose
+        campaign diag was missing, or diagnosed another generation or ran other
+        code, stayed publishable."""
+        from test_campaign_summary import diag_summary
+
+        self.assertIsNone(self._diag_gate(diag_summary()), "a matching diag was refused")
+        cases = {
+            "missing": (None, {}, "without the campaign's diag"),
+            "generation": (diag_summary(snapshot_generation_id="44444444-4444-4444-8444-444444444444"),
+                           {}, "diagnosed something else"),
+            "bundle": (diag_summary(runtime_bundle_sha256="9" * 64), {}, "other code"),
+            "mode": (diag_summary(uffd_mode="copy"), {}, "uffd_mode"),
+            "failed": (diag_summary(passed=False, violations=(
+                {"url": "https://example.com/", "rep": 1, "kind": "remote_ip", "detail": "x"},)),
+                {}, "passed=False"),
+            "ceiling": (diag_summary(), {"provenance": {**self.PROVENANCE, "diag_max_load_ms": 1000}},
+                        "above"),
+            "unrecorded": (diag_summary(), {"provenance": {"host_control": {"resolve_all_to": "127.0.0.1"}}},
+                           "records no diag_max_load_ms"),
+        }
+        for case, (diag, kwargs, expected) in cases.items():
+            with self.subTest(case=case):
+                refused = self._diag_gate(diag, **kwargs)
+                self.assertIsNotNone(refused, f"{case}: the gate passed it")
+                self.assertIn(expected, refused)
+                self.assertIn("diag", refused)
 
     def test_a_single_page_run_needs_no_resolver_evidence(self):
         self.assertIsNone(reqscale_analyze.corpus_dns_gate(
             "/nonexistent/scale", {"run_id": RUN_ID, "urls": ["http://127.0.0.1/f"]},
-            {"host_control": {"resolve_all_to": None}}))
+            {"host_control": {"resolve_all_to": None}}, self._cell()))
 
     def test_the_control_resolver_must_be_null_or_an_ipv4_address(self):
         for good in (None, "127.0.0.1"):
@@ -3511,14 +3604,20 @@ class ScaleOutputHonoursThePublicationGate(unittest.TestCase):
 
     @staticmethod
     def _corpus_run(d, evidence=True):
-        from test_campaign_summary import write_run
+        from test_campaign_summary import diag_summary, write_run
 
         run_dir = os.path.join(d, "scale")
         os.mkdir(run_dir)
         CompleteAnalyzerFixture.build_run(
             run_dir, url="https://example.com/", resolve_all_to="127.0.0.1")
         if evidence:
-            write_run(d, analysis_overrides={"run_id": RUN_ID})
+            # The campaign's diag, bound to what CompleteAnalyzerFixture's run
+            # measured on.
+            write_run(d, analysis_overrides={"run_id": RUN_ID}, diag=diag_summary(
+                tag="golden", uffd_mode="copy",
+                snapshot_generation_id=CompleteAnalyzerFixture.GENERATION,
+                snapshot_config_sha256=CompleteAnalyzerFixture.CONFIG_SHA,
+                runtime_bundle_sha256="5" * 64))
         return run_dir
 
     @staticmethod

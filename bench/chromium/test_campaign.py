@@ -1194,6 +1194,7 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             script = ('set -euo pipefail\n'
                       f'URLS="{self._urls()}"\nUFFD_MODE=minor\nUFFD_PREFETCH=on\n'
                       'MEASURE=scale\nTAG=cb-req-corpus\nSCALE_DIR="$RESULTS/scale-attempt"\n'
+                      'DIAG_MAX_LOAD_MS=15000\n'
                       f'{self._helpers()}\n{check.group(1)}echo GOLDEN\n')
             refused = self._run(script, dict(env, MAKE_RC="2"))
             self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
@@ -1212,6 +1213,8 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             self.assertEqual(seen.get("SCALE_TAG"), "cb-req-corpus")
             self.assertEqual(seen.get("SCALE_OUT"), os.path.join(results, "scale-attempt"))
             self.assertEqual(seen.get("SCALE_CONTROL_URL"), self._urls().split(",")[0])
+            # The diag's load ceiling, which the analysis holds the diag to (#1100).
+            self.assertEqual(seen.get("SCALE_DIAG_MAX_LOAD_MS"), "15000")
         run = re.search(r'(if \[ "\$MEASURE" = scale \]; then\n    say "measured run: open-loop.*?\nfi\n)',
                         body, re.S)
         self.assertIsNotNone(run, "the campaign has no MEASURE=scale branch")
@@ -1230,7 +1233,7 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             env, results = self._fakes(tmp)
             script = ('set -euo pipefail\n'
                       f'URLS="{self._urls()}"\nUFFD_MODE=minor\nUFFD_PREFETCH=on\n'
-                      'TAG=cb-req-corpus\nSCALE_DIR="$RESULTS/scale-attempt"\n'
+                      'TAG=cb-req-corpus\nSCALE_DIR="$RESULTS/scale-attempt"\nDIAG_MAX_LOAD_MS=15000\n'
                       f'{self._helpers()}\nscale_make bench-chromium-scale\n')
             page = "http://127.0.0.1:8000/medium.html"
             run = self._run(script, dict(env, SCALE_URL_OVERRIDE=page))
@@ -1278,6 +1281,7 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
                       'UFFD_PREFETCH=on\nARMS=noop,cdp\nREPS=1\nWARMUP=1\n'
                       'STALL_MAX_MS=15000\nMEASURE=scale\nTAG=cb-req-corpus\n'
                       'SCALE_DIR="$RESULTS/scale-attempt"\nANALYSIS_JSON="$SCALE_DIR/analysis-pre-evidence.json"\n'
+                      'DIAG_MAX_LOAD_MS=15000\n'
                       f'{self._helpers()}\nrun_rc=0\n'
                       f'{block.group(1)}\necho "run_rc=$run_rc"\n')
             result = self._run(script, env)
