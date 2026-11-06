@@ -289,14 +289,15 @@ async fn test_trailing_args_command() -> Result<()> {
 /// would never receive its plan and the container would never run, so a clean exit is
 /// definitive proof the vsock boot-plan works.
 ///
-/// It ALSO guards against the #670 cache-poisoning regression: the snapshot cache key is
-/// a hash of FirecrackerConfig and does NOT encode the boot-plan transport. If a
-/// forced-vsock run cached a (watcher-less) snapshot under the shared key, a later NORMAL
-/// MMDS run with the same config would restore it and wedge (host signals restore over
-/// MMDS that nobody polls). So we run the SAME command twice — once forced-vsock, then
-/// normal — sharing a unique echo token (hence a unique, collision-free snapshot key).
-/// Without the fix the second run restores the poisoned snapshot and hangs (timeout);
-/// with the fix the forced-vsock run caches nothing, so the second run boots cleanly.
+/// It also proves the forced-vsock run shares the snapshot cache (#806). Its pre-start
+/// snapshot is cached under the same key an MMDS run computes, and a restore serves the
+/// restore epoch on the boot-plan vsock listener on every backend, which is where the
+/// restored agent's watcher reads it. So the second run, the SAME command with the normal
+/// transport, must restore that snapshot and run the container. Both runs share a unique
+/// echo token, so no other run can have populated their key.
+///
+/// RED BEFORE THE FIX: a forced-vsock run opted out of the cache, so the second run missed
+/// and booted cold.
 #[tokio::test]
 async fn test_bootplan_over_vsock() -> Result<()> {
     use std::time::Duration;
@@ -304,12 +305,10 @@ async fn test_bootplan_over_vsock() -> Result<()> {
     println!("\nTest boot plan over vsock (FCVM_BOOTPLAN=vsock)");
     println!("================================================");
 
-    // vm_vsock / vm_mmds: distinct VM names. `token`: a unique marker echoed by BOTH runs
-    // so they share one snapshot cache key that no other test/run can have populated.
     let (vm_vsock, vm_mmds, token, _) = common::unique_names("bootplan-vsock");
 
-    // Run 1 — forced vsock boot plan.
-    let (mut child, fcvm_pid) = common::spawn_fcvm_with_env(
+    // Run 1: forced vsock boot plan, a cache miss that creates the pre-start snapshot.
+    let (mut child, fcvm_pid, log1) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
         &[
             "podman",
             "run",
@@ -323,50 +322,56 @@ async fn test_bootplan_over_vsock() -> Result<()> {
     )
     .await
     .context("spawning fcvm with FCVM_BOOTPLAN=vsock")?;
-
     println!("  fcvm PID: {} (FCVM_BOOTPLAN=vsock)", fcvm_pid);
-
     let status = tokio::time::timeout(Duration::from_secs(120), child.wait())
         .await
         .context("timeout waiting for vsock-boot-plan VM")?
         .context("waiting for child")?;
-
     println!("  Run 1 (vsock) exit status: {}", status);
     assert!(
         status.success(),
-        "VM should boot via the vsock boot-plan (MMDS disabled) and run the container"
+        "VM should boot via the vsock boot-plan and run the container"
+    );
+    let first = std::fs::read_to_string(&log1)?;
+    assert!(
+        first.contains("Pre-start snapshot created successfully"),
+        "the forced-vsock run did not cache its pre-start snapshot ({})",
+        log1.display()
     );
 
-    // Run 2 — same command, NORMAL (MMDS) transport, no FCVM_BOOTPLAN. Shares run 1's
-    // snapshot key (same image + `echo <token>` + config). Regression guard for #670: if
-    // run 1 had cached its vsock-built snapshot, this run would restore the watcher-less
-    // guest and wedge; the timeout below would then fire and fail the test.
-    let (mut child2, fcvm_pid2) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
-        &vm_mmds,
-        common::TEST_IMAGE,
-        "echo",
-        &token,
-    ])
+    // Run 2: same command, normal transport. It must restore run 1's snapshot.
+    let (mut child2, fcvm_pid2, log2) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_mmds,
+            common::TEST_IMAGE,
+            "echo",
+            &token,
+        ],
+        &[],
+    )
     .await
     .context("spawning normal-MMDS fcvm for the same command")?;
-
     println!("  fcvm PID: {} (normal MMDS, same key)", fcvm_pid2);
-
     let status2 = tokio::time::timeout(Duration::from_secs(120), child2.wait())
         .await
-        .context("timeout waiting for normal-MMDS VM (would indicate #670 cache poisoning)")?
+        .context("timeout waiting for the run that restores the forced-vsock snapshot")?
         .context("waiting for child2")?;
-
     println!("  Run 2 (MMDS) exit status: {}", status2);
+    let second = std::fs::read_to_string(&log2)?;
+    assert!(
+        second.contains("Pre-start snapshot hit"),
+        "the normal run did not restore the forced-vsock run's snapshot ({})",
+        log2.display()
+    );
     assert!(
         status2.success(),
-        "Normal MMDS run of the same command must boot cleanly (not restore a vsock-built \
-         snapshot under the shared cache key — #670)"
+        "restoring the forced-vsock run's snapshot must run the container ({})",
+        log2.display()
     );
-    println!("✅ VSOCK BOOT-PLAN + #670 NON-POISONING TEST PASSED!");
+    println!("✅ VSOCK BOOT-PLAN + SHARED CACHE TEST PASSED!");
     Ok(())
 }
 
@@ -429,6 +434,69 @@ async fn test_cloud_hypervisor_cold_boot() -> Result<()> {
         "Cloud Hypervisor should cold-boot and run the container to completion"
     );
     println!("✅ CLOUD HYPERVISOR COLD-BOOT TEST PASSED!");
+    Ok(())
+}
+
+/// #806: a Cloud Hypervisor guest keeps the kernel's `eth0` for its PCI virtio-net NIC.
+/// fc-agent and fcvm configure the guest's network by that name (IPv6 address and route,
+/// the gateway's neighbour entry, the snapshot gate) and the rootfs's networkd unit matches
+/// `Name=eth0`; udev's predictable naming renamed the NIC to `enp0s<slot>` before CH boots
+/// passed `net.ifnames=0`. The container shares the guest's network namespace
+/// (`--network=host`), so it lists the guest's interfaces.
+#[tokio::test]
+async fn test_cloud_hypervisor_guest_nic_is_eth0() -> Result<()> {
+    use std::time::Duration;
+
+    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
+        eprintln!("SKIP: cloud-hypervisor not found — skipping CH NIC name test (#632/#61)");
+        return Ok(());
+    }
+    let (vm_name, _, _, _) = common::unique_names("ch-nic");
+    let marker = format!("nics-{vm_name}:");
+    let script = format!("echo {marker}$(ls /sys/class/net | tr '\\n' ,)");
+    let (mut child, fcvm_pid, log_path) = common::spawn_fcvm_with_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--hypervisor",
+            "cloud-hypervisor",
+            common::TEST_IMAGE,
+            "sh",
+            "-c",
+            &script,
+        ],
+        &vm_name,
+    )
+    .await
+    .context("spawning fcvm --hypervisor cloud-hypervisor")?;
+    println!("  fcvm PID: {fcvm_pid} (cloud-hypervisor)");
+    let status = tokio::time::timeout(Duration::from_secs(180), child.wait())
+        .await
+        .context("timeout waiting for Cloud Hypervisor VM")?
+        .context("waiting for child")?;
+    assert!(status.success(), "the CH VM failed: {status}");
+
+    let contents = std::fs::read_to_string(&log_path)
+        .with_context(|| format!("reading {}", log_path.display()))?;
+    let listed = contents
+        .lines()
+        .filter(|line| !line.contains("args=") && !line.contains("\"cmd\""))
+        .find_map(|line| {
+            line.split_once(&marker)
+                .map(|(_, nics)| nics.trim().to_string())
+        })
+        .with_context(|| format!("no {marker} line in {}", log_path.display()))?;
+    let nics: Vec<&str> = listed.split(',').filter(|nic| !nic.is_empty()).collect();
+    assert!(
+        nics.contains(&"eth0"),
+        "the CH guest's interfaces are {nics:?}, without eth0"
+    );
+    assert!(
+        !nics.iter().any(|nic| nic.starts_with("enp")),
+        "the CH guest's NIC was renamed: {nics:?}"
+    );
     Ok(())
 }
 
