@@ -284,6 +284,7 @@ jobs:
         run: |
           bash scripts/phone/test-phone-sh.sh
           bash scripts/phone/test-gpu-hook.sh
+          bash scripts/phone/test-seam.sh
 
   # Plans which self-hosted jobs this run needs.
   #

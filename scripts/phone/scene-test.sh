@@ -4,7 +4,7 @@
 #   1. the app's GLES context is on the VM's GPU, and it draws at least 30 frames a second;
 #   2. seams: the left and right halves of a two-phone image, and the whole image, drawn at
 #      the same t (the control protocol's `capture`, the same render path as the screen), agree
-#      pixel for pixel wherever they overlap (up to 9 pixels a tile 1 level apart, see seam.py),
+#      pixel for pixel wherever they overlap (seam.py),
 #      so the halves stitch with no seam; and one rect drawn twice gives the same bytes;
 #   3. surface loss: the app keeps drawing after its surface is destroyed and created again
 #      (home, then back), and after its EGL context is torn down and built again (the
@@ -86,13 +86,19 @@ drawn() { # frames drawn over 2 s, now
   a=$(field .frames "$(status)"); sleep 2; b=$(field .frames "$(status)")
   echo $(( ${b:-0} - ${a:-0} ))
 }
+# The app logs both callbacks: a resume that kept its surface must not pass for one that got a
+# new one, so the log between home and the frames counted has to show the surface destroyed
+# and then created.
+A logcat -c > /dev/null 2>&1
 A shell input keyevent KEYCODE_HOME
 sleep 2
 A shell am start -n dev.fcvm.robotpark/.MainActivity > /dev/null 2>&1
 sleep 3
 n=$(drawn)
-[ "$n" -ge 60 ] && ok "after the surface was destroyed and created again it drew $n frames in 2 s" \
-  || bad "after the surface came back it drew $n frames in 2 s: $(status)"
+surfaces=$(A logcat -d -s ROBOTPARK:I 2>/dev/null | grep -o -E 'surface (destroyed|created)' | paste -sd, || true)
+grep -q 'surface destroyed.*surface created' <<< "$surfaces" && [ "$n" -ge 60 ] \
+  && ok "after the surface was destroyed and created again it drew $n frames in 2 s ($surfaces)" \
+  || bad "after home and back: the app logged '${surfaces}' and drew $n frames in 2 s: $(status)"
 g0=$(field .context_generation "$(status)")
 r=$(C '{"type":"drop_context"}')
 sleep 1

@@ -2343,9 +2343,7 @@ app on the phone, sets a two-phone scene, and for three times (robots walking; a
 crossing the middle under two lights; the crowd dancing under confetti) captures the whole
 image (1440 x 1280) and its two halves (720 x 1280 each). `scripts/phone/seam.py` compares
 every pixel of each half with the whole image at the same whole-image position, and a
-redraw of one half with the first. It allows up to 9 pixels a tile 1 level apart (a residual
-seen in 3 of 10 runs, the same pixel in a light's glow) and fails on anything more; the result
-names the exact count.
+redraw of one half with the first. Any pixel apart fails; the result names the exact count.
 
 ## Phone streamer
 

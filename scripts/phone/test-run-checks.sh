@@ -12,8 +12,17 @@ trap 'rm -rf "$dir"' EXIT
 # frames (60 fps samples), slow (12 fps), offline (adb's error, exit 1, as phone.sh exits
 # when `adb logcat -c` fails); `exec --pid P -- sh -c SCRIPT` (the log collection) by keeping
 # SCRIPT in $LOGS/collect-script; and `exec --pid P --vm -- dmesg`.
+# `ls --json` fails FAKE_LS_FAILS times (counted in $LOGS/ls-calls), then lists VM "vm-a" healthy
+# as pid 42.
 cat > "$dir/fcvm" <<'STUB'
 #!/bin/bash
+if [ "$1" = ls ]; then
+  n=$(( $(cat "$LOGS/ls-calls" 2> /dev/null || echo 0) + 1 ))
+  echo "$n" > "$LOGS/ls-calls"
+  [ "$n" -gt "${FAKE_LS_FAILS:-0}" ] || { echo "Error: reading state: Permission denied" >&2; exit 1; }
+  echo '[{"name":"vm-a","health_status":"healthy","pid":42},{"name":"vm-b","health_status":"starting","pid":43}]'
+  exit 0
+fi
 shift 3   # exec --pid P
 vm=""
 [ "$1" = --vm ] && { vm=1; shift; }
@@ -80,6 +89,30 @@ stop_runner() { echo CLEANUP-RAN; }
 trap "finish_run stop_runner" EXIT
 exit 2'
 grep -q CLEANUP-RAN "$dir/out" && pass "the VMs are stopped when the logs cannot be kept" || miss "a failed log keep skipped the cleanup: $(cat "$dir/out")"
+
+# A poll for a healthy VM survives a failing `fcvm ls` (the next round asks again), and one
+# that never gets an answer says why in its FAIL line.
+FAKE_LS_FAILS=2 script frames 'rm -f "$LOGS/ls-calls"; p=$(wait_healthy vm-a 10 0.01) && echo "pid $p after $(cat "$LOGS/ls-calls") asks"'
+grep -q '^pid 42 after 3 asks$' "$dir/out" && grep -q 'continued fail=0' "$dir/out" && pass "a poll that sees fcvm ls fail asks again" \
+  || miss "a poll whose fcvm ls failed: $(cat "$dir/out")"
+mkdir -p "$dir/logs-never"; echo 0 > "$dir/logs-never/ls-calls"
+F="$dir/fcvm" LOGS="$dir/logs-never" FAKE_LS_FAILS=99 bash -c ". '$checks'
+p=\$(wait_healthy vm-a 3 0.01) || bad \"vm-a never became healthy: \$(ls_error)\"
+echo \"continued fail=\$fail\"" > "$dir/out" 2>&1
+grep -q '^FAIL vm-a never became healthy: Error: reading state: Permission denied' "$dir/out" && grep -q 'continued fail=1' "$dir/out" \
+  && pass "a poll that never got an answer says what fcvm ls said" || miss "a poll that never got an answer: $(cat "$dir/out")"
+script frames 'p=$(wait_healthy vm-b 3 0.01) || echo "not healthy"'
+grep -q '^not healthy$' "$dir/out" && pass "a VM that is not healthy is not taken" || miss "an unhealthy VM: $(cat "$dir/out")"
+
+# The clone's first frame: only a retake after the GPU hook's last release counts, so the
+# source phone's earlier retake, inherited through the snapshot, cannot stand in for the
+# clone's own.
+script frames 'log=$(printf "retaken_ms=7\nfirst_frame_ms=9 first_frame_at_ms=1000\nreleased_ms=5\n")
+echo "stale [$(first_frame_after_release "$log")]"
+log=$(printf "%s\nretaken_ms=8\nfirst_frame_ms=10 first_frame_at_ms=2000\n" "$log")
+echo "fresh [$(first_frame_after_release "$log")]"'
+grep -q '^stale \[\]$' "$dir/out" && grep -q '^fresh \[2000\]$' "$dir/out" && pass "a first frame from before the last release does not count" \
+  || miss "the first frame after the release: $(cat "$dir/out")"
 
 # Any other failing command ends the run with a FAIL line naming it, also inside a function
 # and a command substitution, as `snapshot_dir=$(grep ... | head -1)` would.

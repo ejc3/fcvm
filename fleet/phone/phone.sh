@@ -68,6 +68,7 @@ RUN=${PHONE_RUN:-/tmp}
 export PHONE_GO_FILE=${PHONE_GO_FILE:-/run/phone-verified}
 AVD=$ANDROID_AVD_HOME/phone.avd
 ms() { date +%s%3N; }
+. "$(dirname "$0")/phone-proc.sh"
 
 make_avd() {
   mkdir -p "$AVD"
@@ -227,10 +228,6 @@ streamer_loop() {
     sleep 0.2
   done
 }
-# A process that is running: a zombie (exited, not yet reaped, which happens to an orphan in
-# a container whose first process reaps nothing) is not.
-alive() { local st; st=$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f1) && [ -n "$st" ] && [ "$st" != Z ]; }
-any_alive() { local p; for p in $(pgrep -x "$1"); do alive "$p" && return 0; done; return 1; }
 loop_pid=""
 stop_streamer() {
   [ -n "$loop_pid" ] || return 0
@@ -239,17 +236,16 @@ stop_streamer() {
   loop_pid=""
   local pid
   pid=$(cat "$RUN/streamer.pid" 2>/dev/null || true)
-  if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
-  pkill -x "$(basename "$STREAMER")" 2>/dev/null || true
-  # its listeners are closed before failure mode binds them
-  while { [ -n "$pid" ] && alive "$pid"; } || any_alive "$(basename "$STREAMER")"; do sleep 0.05; done
+  # its listeners are closed before failure mode binds them; one that no signal ends (named
+  # on stderr) leaves them bound, and failure mode then says it cannot listen
+  stop_procs "$pid" "$(basename "$STREAMER")" || true
 }
 # The emulator this serve started, stopped: a phone reported failed holds no GPU.
 stop_emulator() {
   local p
   p=$(cat "$RUN/emulator.pid" 2>/dev/null) || return 0
   kill "$p" 2>/dev/null || return 0
-  for _ in $(seq 1 100); do kill -0 "$p" 2>/dev/null || return 0; sleep 0.1; done
+  for _ in $(seq 1 100); do alive "$p" || return 0; sleep 0.1; done
   kill -9 "$p" 2>/dev/null || true
 }
 # A phone that cannot render on its GPU is reported failed, never shown in software: the
@@ -293,7 +289,7 @@ serve)
     local t1
     t1=$(ms)
     until [ "$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; do
-      kill -0 "$(cat "$RUN/emulator.pid")" 2>/dev/null || fail "the emulator exited: $(grep -aE 'ERROR|FATAL' "$RUN/emulator.log" | tail -3 | tr '\n' ' ')"
+      alive "$(cat "$RUN/emulator.pid")" || fail "the emulator exited: $(grep -aE 'ERROR|FATAL' "$RUN/emulator.log" | tail -3 | tr '\n' ' ')"
       [ $(( $(ms) - t1 )) -lt $(( ${BOOT_TIMEOUT:-300} * 1000 )) ] || fail "no boot_completed within ${BOOT_TIMEOUT:-300} s"
       sleep 0.2
     done
@@ -314,7 +310,7 @@ serve)
   # the phone renders on its GPU: the streamer may stream it
   touch "$PHONE_GO_FILE"
   echo "phone.sh: streaming $(( $(ms) - t0 )) ms after the container started"
-  while kill -0 "$(cat "$RUN/emulator.pid")" 2>/dev/null; do sleep 1; done
+  while alive "$(cat "$RUN/emulator.pid")"; do sleep 1; done
   rm -f "$PHONE_GO_FILE"
   echo "phone.sh: the emulator exited" >&2
   grep -aE 'ERROR|FATAL' "$RUN/emulator.log" | tail -20 >&2
@@ -469,7 +465,7 @@ boot)
   echo $! > "$RUN/emulator.pid"
   timeout "${BOOT_TIMEOUT:-300}" "$ADB" wait-for-device
   until [ "$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; do
-    kill -0 "$(cat "$RUN/emulator.pid")" 2>/dev/null || { echo "the emulator exited:"; grep -aE 'ERROR|FATAL' "$RUN/emulator.log" | head -20; exit 1; }
+    alive "$(cat "$RUN/emulator.pid")" || { echo "the emulator exited:"; grep -aE 'ERROR|FATAL' "$RUN/emulator.log" | head -20; exit 1; }
     [ $(( $(ms) - t0 )) -lt $(( ${BOOT_TIMEOUT:-300} * 1000 )) ] || { echo "no boot_completed within ${BOOT_TIMEOUT:-300} s"; exit 1; }
     sleep 0.2
   done

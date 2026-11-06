@@ -990,15 +990,19 @@ Vulkan path is measured on the T4.
   subpixel grid. Blended particles are drawn unscissored (scissored, a few glow pixels blended
   1 level differently), and no two particles start at one point (a leaper's coincident
   sparkles made the same frame come out two ways from run to run). `scripts/phone/seam.py`
-  allows up to 9 pixels a tile 1 level apart for one residual it has seen in 3 of 10 runs, the same
-  pixel in a light's glow.
+  allows no pixel apart. It allowed 9 a tile 1 level apart for one glow pixel seen 1 level
+  apart in 3 of the first 10 runs of the final rendering; on the emulator built from source
+  that pixel came out identical in every later phone-test and in 60 app restarts in a row
+  (#1417).
 - **The emulator crashes when a guest GL client exits during composition.** Emulator 37.2.12
   logs `Failed to make display surface context current: 12290` (EGL_BAD_ACCESS) as a guest
   process with a GLES connection exits, then calls GL with no context and dies. Seen three
   times: after `screencap`, after the app was killed for a reinstall, and after a restart
   that exited without releasing EGL. The app now releases EGL before it exits for a restart (5
   of 5 restarts survived), and `make phone-test` installs onto a freshly booted phone. The
-  emulator built from source (stack PR 2) is where to fix it.
+  emulator built from source does not show it: 60 iterations of killing the app with
+  `am force-stop` while SurfaceFlinger composed (every tenth a restart through the app), each
+  followed by a `screencap`, left the emulator running with no such line in its log (#1417).
 - **Branding.** The robot may be reproduced or modified under CC BY 3.0 with Google's
   attribution line ("The Android robot is reproduced or modified from work created and shared
   by Google and used according to terms described in the Creative Commons 3.0 Attribution

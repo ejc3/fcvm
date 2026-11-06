@@ -99,20 +99,14 @@ t0=$(date +%s%3N)
   --portable-volumes --map "$AOSP:/android:ro" --map "$WORK:/work:ro" --map "$EMU:/emu:ro" --map "$LOGS/out:/out" --forward-localhost 3128 \
   "$IMAGE" > "$LOGS/vm.log" 2>&1 < /dev/null &
 runner=$!
-pid=""
-for _ in $(seq 1 600); do
-  pid=$("$F" ls --json 2>/dev/null | jq -r --arg n "$NAME" '.[] | select(.name == $n and .health_status == "healthy") | .pid' | head -1)
-  [ -n "$pid" ] && break
-  kill -0 "$runner" 2>/dev/null || break
-  sleep 1
-done
-[ -n "$pid" ] || { echo "FAIL the phone VM never became healthy (log $LOGS/vm.log)"; exit 1; }
+pid=$(WAIT_HEALTHY_WHILE=$runner wait_healthy "$NAME" 600 1) || pid=""
+[ -n "$pid" ] || { echo "FAIL the phone VM never became healthy: $(ls_error) (log $LOGS/vm.log)"; exit 1; }
 ack=$(grep -m1 '"ack_ms"' "$LOGS/vm.log" || true)
 status=$(jq -r '.status // empty' <<< "$ack" 2>/dev/null || true)
 echo "phone VM healthy after $(( $(date +%s%3N) - t0 )) ms; restore ack_ms=$(jq -r '.ack_ms' <<< "$ack") gpu_ms=$(jq -r '.guest_phases.gpu_ms' <<< "$ack")"
 [ "$status" = restored ] && ok "the phone VM was restored from its snapshot" || bad "the phone VM did not report a snapshot restore (status '${status}')"
 X() { "$F" exec --pid "$pid" -- "$@"; }
-gpu_name=$(X /usr/bin/nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | head -1)
+gpu_name=$(X /usr/bin/nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | head -1) || gpu_name=""
 [ -n "$gpu_name" ] && ok "the VM has GPU '$gpu_name'" || bad "nvidia-smi names no GPU"
 rc=0; probe=$(timeout 30 "$F" exec --pid "$pid" -- /usr/local/bin/kvmprobe 2>&1) || rc=$?
 [ "$probe" = "kvm ok" ] && ok "KVM runs a VM inside the restored phone VM" || bad "KVM in the restored VM: exit $rc, '${probe}'"
@@ -206,8 +200,9 @@ proxy_boundary() {
 }
 
 warm_snapshot_onto_the_second_gpu() {
-  local source_uuid cpid click ack first clone_uuid holds renderer
-  source_uuid=$(X /usr/bin/nvidia-smi --query-gpu=uuid --format=csv,noheader 2>&1 | head -1)
+  local source_uuid cpid click ack first clone_uuid clone_name holds renderer
+  source_uuid=$(X /usr/bin/nvidia-smi --query-gpu=uuid --format=csv,noheader 2>&1 | head -1) \
+    || { bad "nvidia-smi gave no GPU UUID on the source phone: '$source_uuid'"; source_uuid=""; }
   local started=$(date +%s%3N)
   if ! "$F" snapshot create --pid "$pid" --tag "$TAG" --gpu-warm > "$LOGS/snapshot.log" 2>&1; then
     bad "the warm snapshot of the running phone failed: $(grep -a -m1 -E 'Error|error' "$LOGS/snapshot.log") (log $LOGS/snapshot.log)"
@@ -219,31 +214,37 @@ warm_snapshot_onto_the_second_gpu() {
   click=$(date +%s%3N)
   "$F" snapshot run --snapshot "$TAG" --gpu "$GPU2" --name "$NAME-clone" > "$LOGS/clone.log" 2>&1 < /dev/null &
   clone=$!
-  cpid=""
-  for _ in $(seq 1 1200); do
-    cpid=$("$F" ls --json 2>/dev/null | jq -r --arg n "$NAME-clone" '.[] | select(.name == $n and .health_status == "healthy") | .pid' | head -1)
-    [ -n "$cpid" ] && break
-    kill -0 "$clone" 2>/dev/null || break
-    sleep 0.1
-  done
+  cpid=$(WAIT_HEALTHY_WHILE=$clone wait_healthy "$NAME-clone" 1200 0.1) || cpid=""
   if [ -z "$cpid" ]; then
-    bad "the clone on $GPU2 never became healthy (log $LOGS/clone.log)"
+    bad "the clone on $GPU2 never became healthy: $(ls_error) (log $LOGS/clone.log)"
     return
   fi
   ack=$(grep -a -m1 '"ack_ms"' "$LOGS/clone.log" || true)
   # The hook waited for the phone's first frame on the clone's GPU before the restore was
-  # acknowledged; the clone's clock was stepped to the host's at restore.
-  first=$("$F" exec --pid "$cpid" -- sh -c 'grep -o "first_frame_at_ms=[0-9]*" /tmp/gpu-hook.log | tail -1 | cut -d= -f2' 2>/dev/null || true)
-  echo "flow B: click to the app's first frame on the clone's GPU $(( ${first:-0} - click )) ms; restore ack_ms=$(jq -r '.ack_ms' <<< "$ack") gpu_ms=$(jq -r '.guest_phases.gpu_ms' <<< "$ack")"
-  [ -n "$first" ] && [ "$first" -ge "$click" ] && ok "the clone's phone posted a frame on its GPU before the restore was acknowledged" \
-    || bad "the clone's GPU hook recorded no first frame after the restore"
-  clone_uuid=$("$F" exec --pid "$cpid" -- /usr/bin/nvidia-smi --query-gpu=uuid --format=csv,noheader 2>&1 | head -1)
-  [ -n "$clone_uuid" ] && [ "$clone_uuid" != "$source_uuid" ] && ok "the clone has another GPU ($clone_uuid, the source $source_uuid)" \
+  # acknowledged; the clone's clock was stepped to the host's at restore. Its log starts with
+  # the source phone's, which the snapshot carries up to the release: only a first frame
+  # after that release is the clone's. The run keeps the clone's log.
+  "$F" exec --pid "$cpid" -- cat /tmp/gpu-hook.log > "$LOGS/out/clone-gpu-hook.log" 2>&1 || true
+  first=$(first_frame_after_release "$(cat "$LOGS/out/clone-gpu-hook.log")")
+  if [ -n "$first" ]; then
+    echo "flow B: click to the app's first frame on the clone's GPU $(( first - click )) ms; restore ack_ms=$(jq -r '.ack_ms' <<< "$ack") gpu_ms=$(jq -r '.guest_phases.gpu_ms' <<< "$ack")"
+  fi
+  if [ -n "$first" ] && [ "$first" -ge "$click" ]; then
+    ok "the clone's phone posted a frame on its GPU before the restore was acknowledged"
+  else
+    bad "the clone's GPU hook recorded no first frame after the restore (its log: $LOGS/out/clone-gpu-hook.log)"
+    keep_phone_logs "$cpid" clone-first-frame
+  fi
+  clone_uuid=$("$F" exec --pid "$cpid" -- /usr/bin/nvidia-smi --query-gpu=uuid --format=csv,noheader 2>&1 | head -1) || clone_uuid=""
+  [ -n "$source_uuid" ] && [ -n "$clone_uuid" ] && [ "$clone_uuid" != "$source_uuid" ] && ok "the clone has another GPU ($clone_uuid, the source $source_uuid)" \
     || bad "the clone's GPU '$clone_uuid' is not another GPU than the source's '$source_uuid'"
   holds=$("$F" exec --pid "$cpid" -- /usr/local/bin/phone.sh holds 2>&1 || true)
   [[ "$holds" =~ ^fds=[1-9] ]] && ok "the clone's emulator holds its GPU: $holds" || bad "the clone's emulator does not hold its GPU: $holds"
+  # the clone's own GPU name: its GPU may be another model than the source's
+  clone_name=$("$F" exec --pid "$cpid" -- /usr/bin/nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | head -1) || clone_name=""
   renderer=$("$F" exec --pid "$cpid" -- /usr/local/bin/phone.sh renderer 2>&1 || true)
-  [[ "$renderer" == *"$gpu_name"* ]] && ok "the clone's SurfaceFlinger: $renderer" || bad "the clone's SurfaceFlinger does not render on '$gpu_name': $renderer"
+  [ -n "$clone_name" ] && [[ "$renderer" == *"$clone_name"* ]] && ok "the clone's SurfaceFlinger: $renderer" \
+    || bad "the clone's SurfaceFlinger does not render on its GPU '$clone_name': $renderer"
   check_draws "$cpid" "on the clone's GPU"
   # the browser, started before the snapshot, comes to the front in the clone
   browser_in_front "$cpid" "on the clone"

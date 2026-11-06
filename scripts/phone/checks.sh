@@ -62,3 +62,28 @@ finish_run() {
   fi
   "$1"
 }
+
+# The pid of the fcvm VM named $1 once `fcvm ls` lists it healthy, asking up to $2 times, $3
+# seconds apart; fails when it never does. An `fcvm ls` that fails does not end the poll: the
+# next round asks again, and ls_error says what the last failure printed.
+wait_healthy() {
+  local i out p
+  for i in $(seq 1 "$2"); do
+    if out=$("$F" ls --json 2> "$LOGS/ls-error"); then
+      p=$(jq -r --arg n "$1" '.[] | select(.name == $n and .health_status == "healthy") | .pid' <<< "$out" 2>> "$LOGS/ls-error" | head -1) || p=""
+      [ -n "$p" ] && { echo "$p"; return 0; }
+    fi
+    [ -z "${WAIT_HEALTHY_WHILE:-}" ] || kill -0 "$WAIT_HEALTHY_WHILE" 2> /dev/null || return 1
+    sleep "$3"
+  done
+  return 1
+}
+ls_error() { [ -s "$LOGS/ls-error" ] && head -3 "$LOGS/ls-error" | tr '\n' ' ' || echo "fcvm ls did not list it healthy"; }
+
+# The first_frame_at_ms of the GPU hook's last retake after its last release, from the hook's
+# log text $1; nothing when the log holds no first frame after its last release. A clone's log
+# starts with the source phone's (inherited through the snapshot, which ends with the
+# release), so a stale first frame from the source cannot stand in for the clone's own.
+first_frame_after_release() {
+  awk '/released_ms=/ { f = "" } match($0, /first_frame_at_ms=[0-9]+/) { f = substr($0, RSTART + 18, RLENGTH - 18) } END { if (f != "") print f }' <<< "$1"
+}
