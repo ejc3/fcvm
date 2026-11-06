@@ -6195,6 +6195,144 @@ os.fsync = _fsync
             with open(completion_path) as handle:
                 self.assertEqual(handle.read(), f"armed {token}\n")
 
+    @staticmethod
+    def _replay_root_script():
+        """The program corpus_extra.sh hands `sudo -n sh -c` for the replay
+        phase, and the arguments it gives it, as shipped."""
+        with open(EXTRA) as handle:
+            text = handle.read()
+        start = text.index("    sudo -n sh -c '\n") + len("    sudo -n sh -c '\n")
+        end = text.index("    ' _ \"$BENCH/phase_supervisor.py\"", start)
+        return text[start:end]
+
+    def test_replay_lease_is_released_after_root_supervisor_sigkill(self):
+        """#895: a root supervisor destroyed after it armed completion leaves a
+        cleanup owner to drain the replay process set, restore dnsmasq and
+        publish completion; the host lease is released only after both.
+
+        RED BEFORE THE FIX: the shipped root script exec'd the supervisor
+        straight under sudo. Killed with SIGKILL after dnsmasq stopped and the
+        replay child started, it left the record at `armed`, so the guardian
+        held the lease for good, and the replay child kept running.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "bin")
+            os.makedirs(bindir)
+            paths = {name: os.path.join(tmp, name) for name in (
+                "corpus-extra.lock", "serve.control", "guardian.ready", "serve.ready",
+                "serve.pid", "serve.status", "serve.completion", "dnsmasq.state",
+                "restore.started", "restore.release", "guardian.log")}
+            token = "e" * 32
+            with open(paths["corpus-extra.lock"], "w"):
+                pass
+            with open(paths["dnsmasq.state"], "w") as handle:
+                handle.write("active\n")
+            systemctl = os.path.join(bindir, "systemctl")
+            with open(systemctl, "w") as handle:
+                handle.write(
+                    "#!/bin/bash\nset -eu\ncase \"$1\" in\n"
+                    "  stop) [ \"$2\" = dnsmasq ]; printf 'inactive\\n' >\"$SYSTEMCTL_STATE\" ;;\n"
+                    "  start) [ \"$2\" = dnsmasq ]; : >\"$RESTORE_STARTED\"\n"
+                    "    while [ ! -e \"$RESTORE_RELEASE\" ]; do sleep 0.01; done\n"
+                    "    printf 'active\\n' >\"$SYSTEMCTL_STATE\" ;;\n"
+                    "  is-active) [ \"$2\" = --quiet ]; [ \"$3\" = dnsmasq ]\n"
+                    "    grep -qx active \"$SYSTEMCTL_STATE\" ;;\n"
+                    "  *) exit 64 ;;\nesac\n")
+            os.chmod(systemctl, 0o755)
+            # The replay phase stand-in: stop dnsmasq, then hold the ports'
+            # place for longer than the test runs.
+            phase = ('[ "$1" = yes ] && systemctl stop dnsmasq || exit $?; '
+                     'printf "%s\\n" "$$" >"$SERVE_PID_PATH"; : >"$SERVE_READY"; exec sleep 120')
+            launcher = (
+                "set -euo pipefail\n"
+                "exec 9<\"$LOCK_PATH\"\nflock -x 9\n"
+                "mkfifo -- \"$CONTROL_PATH\"\nexec {control_fd}<>\"$CONTROL_PATH\"\n"
+                "python3 \"$SERVE_GUARDIAN\" --lease-fd 9 --control-fd \"$control_fd\" "
+                "--ready-path \"$GUARDIAN_READY\" --status-path \"$STATUS_PATH\" "
+                "--completion-path \"$COMPLETION_PATH\" --completion-token \"$COMPLETION_TOKEN\" -- "
+                "sh -c \"$ROOT_SCRIPT\" _ \"$PHASE_SUPERVISOR\" \"$CONTROL_PATH\" "
+                "\"$HOST_RESOURCE_FINALIZER\" \"$COMPLETION_PATH\" \"$COMPLETION_TOKEN\" yes "
+                "\"$PHASE\" a b c d e >\"$GUARDIAN_LOG\" 2>&1 &\n"
+                "guardian=$!\n"
+                "for _ in $(seq 1 500); do [ ! -e \"$GUARDIAN_READY\" ] || break; sleep 0.01; done\n"
+                "[ -e \"$GUARDIAN_READY\" ]\nexec 9>&-\nwait \"$guardian\"\n")
+            env = dict(
+                os.environ, PATH=bindir + os.pathsep + os.environ["PATH"],
+                LOCK_PATH=paths["corpus-extra.lock"], CONTROL_PATH=paths["serve.control"],
+                SERVE_GUARDIAN=SERVE_GUARDIAN, GUARDIAN_READY=paths["guardian.ready"],
+                STATUS_PATH=paths["serve.status"], COMPLETION_PATH=paths["serve.completion"],
+                COMPLETION_TOKEN=token, GUARDIAN_LOG=paths["guardian.log"],
+                ROOT_SCRIPT=self._replay_root_script(), PHASE=phase,
+                PHASE_SUPERVISOR=PHASE_SUPERVISOR, HOST_RESOURCE_FINALIZER=HOST_RESOURCE_FINALIZER,
+                SERVE_READY=paths["serve.ready"], SERVE_PID_PATH=paths["serve.pid"],
+                SYSTEMCTL_STATE=paths["dnsmasq.state"], RESTORE_STARTED=paths["restore.started"],
+                RESTORE_RELEASE=paths["restore.release"])
+            campaign = subprocess.Popen(["bash", "-c", launcher], env=env,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        text=True, start_new_session=True)
+            lease = os.open(paths["corpus-extra.lock"], os.O_RDONLY)
+
+            def lease_free():
+                try:
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return False
+                fcntl.flock(lease, fcntl.LOCK_UN)
+                return True
+
+            def alive(pid):
+                try:
+                    with open(f"/proc/{pid}/stat") as handle:
+                        return handle.read().rsplit(")", 1)[1].split()[0] != "Z"
+                except FileNotFoundError:
+                    return False
+
+            def until(predicate, description, timeout=60):
+                deadline = time.monotonic() + timeout
+                while not predicate():
+                    if time.monotonic() >= deadline:
+                        log = open(paths["guardian.log"]).read() if os.path.exists(paths["guardian.log"]) else ""
+                        self.fail(f"timed out waiting for {description}\n{log}")
+                    time.sleep(0.02)
+
+            replay = None
+            try:
+                until(lambda: os.path.exists(paths["serve.ready"]), "the replay child")
+                with open(paths["serve.pid"]) as handle:
+                    replay = int(handle.read())
+                with open(f"/proc/{replay}/status") as handle:
+                    supervisor = int(next(line.split()[1] for line in handle if line.startswith("PPid:")))
+                with open(f"/proc/{supervisor}/cmdline", "rb") as handle:
+                    self.assertIn(b"phase_supervisor.py", handle.read())
+                with open(paths["serve.completion"]) as handle:
+                    self.assertEqual(handle.read(), f"armed {token}\n")
+                os.kill(supervisor, signal.SIGKILL)
+                until(lambda: os.path.exists(paths["restore.started"]),
+                      "dnsmasq's restore after the supervisor's SIGKILL")
+                self.assertFalse(alive(replay), "dnsmasq was restored while the replay child ran")
+                self.assertFalse(lease_free(), "the lease was released before dnsmasq was active")
+                with open(paths["serve.completion"]) as handle:
+                    self.assertEqual(handle.read(), f"armed {token}\n")
+                time.sleep(0.3)
+                self.assertFalse(lease_free(), "the lease was released before dnsmasq was active")
+                with open(paths["restore.release"], "w"):
+                    pass
+                until(lease_free, "the lease after the cleanup owner's completion")
+                with open(paths["dnsmasq.state"]) as handle:
+                    self.assertEqual(handle.read(), "active\n")
+                with open(paths["serve.completion"]) as handle:
+                    self.assertEqual(handle.read(), f"complete {token}\n")
+                campaign.wait(timeout=30)
+            finally:
+                os.close(lease)
+                if replay is not None and alive(replay):
+                    os.kill(replay, signal.SIGKILL)
+                try:
+                    os.killpg(campaign.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                campaign.communicate(timeout=30)
+
     def test_replay_lease_waits_for_completion_after_sudo_parent_sigkill(self):
         """A dead sudo parent cannot release the lease ahead of finalization.
 
@@ -10378,7 +10516,7 @@ class ProvenanceNamesBytes(unittest.TestCase):
                      "reqbench.py", "reqbench.sh", "reqanalyze.py", "wddrive.py",
                      "owned_process.py", "phase_supervisor.py",
                      "host_resource_finalizer.py", "serve_guardian.py",
-                     "corpus_campaign.sh", "fcvm"):
+                     "cleanup_owner.py", "corpus_campaign.sh", "fcvm"):
             if bench_has_files:
                 with open(os.path.join(bench, name), "w") as handle:
                     handle.write(name)
@@ -10426,7 +10564,7 @@ class CorpusExtraRuntimeBundle(unittest.TestCase):
         "render.py", "corpus_serve.py", "report.py", "reqbench.py",
         "reqbench.sh", "reqanalyze.py", "wddrive.py", "owned_process.py",
         "phase_supervisor.py", "host_resource_finalizer.py", "serve_guardian.py",
-        "corpus_campaign.sh", "reqscale.py", "reqscale_analyze.py",
+        "cleanup_owner.py", "corpus_campaign.sh", "reqscale.py", "reqscale_analyze.py",
         "faulttrace.bt", "guardexec.py", "guardsupervise.py",
         "campaign_summary.py", "records.py",
     )
