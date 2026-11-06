@@ -82,11 +82,11 @@ pub struct CloudHypervisorBackend {
     /// the Firecracker backend's [`VmManager`](crate::firecracker::VmManager) retains
     /// these fields.
     namespace: NamespaceParams,
-    /// The live console-tail task ([`tail_console_to_tracing`]), tracked so a reboot
-    /// relaunch (or [`Hypervisor::kill`]) aborts the previous one instead of leaking it.
-    /// The relaunch reuses the VM dir and keeps `ch-console.log`, so an orphaned tail
-    /// would not self-exit — it must be aborted explicitly.
-    console_tail: Option<JoinHandle<()>>,
+    /// The live console tail ([`ConsoleTail`]), tracked so a reboot relaunch (or
+    /// [`Hypervisor::reap`]) finishes the previous one instead of leaking it. The
+    /// relaunch reuses the VM dir and keeps `ch-console.log`, so an orphaned tail would not
+    /// self-exit; finishing it also logs what it had not read yet.
+    console_tail: Option<ConsoleTail>,
     /// Guest console (hvc0) lines observed by the console tail since spawn
     /// (see [`Hypervisor::console_line_counter`]).
     console_lines: Arc<std::sync::atomic::AtomicU64>,
@@ -332,6 +332,21 @@ impl Hypervisor for CloudHypervisorBackend {
             self.vm_name = Some(name.clone());
         }
         self.merge_spec_namespace(spec);
+        // A reboot relaunch: log the rest of the old guest's console before this process can
+        // write the file (Cloud Hypervisor truncates it when it creates the VM), then empty it,
+        // so the new tail starts at the new guest's first byte and repeats nothing.
+        if let Some(old) = self.console_tail.take() {
+            old.finish();
+            if let Some(path) = self.console_path() {
+                if let Err(error) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|file| file.set_len(0))
+                {
+                    warn!(path = %path.display(), %error, "could not empty the guest console file for the relaunch");
+                }
+            }
+        }
 
         let _ = std::fs::remove_file(&self.api_socket);
 
@@ -401,18 +416,10 @@ impl Hypervisor for CloudHypervisorBackend {
         }));
 
         // Tail the guest console (hvc0 → file) into fcvm's tracing logs, mirroring the
-        // Firecracker serial-to-stdout capture. Abort any prior tail first: a reboot
-        // relaunch reuses the VM dir (keeps ch-console.log), so an orphaned tail would
-        // not self-exit and would duplicate console lines. Track the handle so kill()
-        // tears it down too.
-        if let Some(old) = self.console_tail.take() {
-            old.abort();
-        }
+        // Firecracker serial-to-stdout capture. A prior tail was finished above, before this
+        // process started. Track it so start_kill() finishes it too.
         if let Some(cpath) = self.console_path() {
-            self.console_tail = Some(tokio::spawn(tail_console_to_tracing(
-                cpath,
-                Arc::clone(&self.console_lines),
-            )));
+            self.console_tail = Some(ConsoleTail::start(cpath, Arc::clone(&self.console_lines)));
         }
         Ok(())
     }
@@ -478,9 +485,6 @@ impl Hypervisor for CloudHypervisorBackend {
         if let Some(monitor) = &self.reboot_monitor {
             monitor.abort();
         }
-        if let Some(tail) = self.console_tail.take() {
-            tail.abort();
-        }
         if let Some(ref mut p) = self.process {
             info!(vm_id = %self.vm_id, "SIGKILL to Cloud Hypervisor process");
             p.start_kill()
@@ -493,6 +497,11 @@ impl Hypervisor for CloudHypervisorBackend {
         self.stop_reboot_monitor().await;
         if let Some(mut p) = self.process.take() {
             let _ = p.wait().await;
+        }
+        // The VMM is gone, so nothing more reaches the console file: log what the tail had not
+        // read yet, a last line without its newline included.
+        if let Some(tail) = self.console_tail.take() {
+            tail.finish();
         }
     }
 
@@ -671,15 +680,125 @@ fn log_console_line(clean: &str) {
     }
 }
 
+/// The most bytes of one console line the tail holds while it waits for the line's newline. A
+/// guest that writes to hvc0 without newlines must not grow fcvm's memory without limit; a
+/// kernel record is under 1 KiB, so this keeps every one of them whole. A longer run is logged
+/// in pieces of this size.
+const CONSOLE_LINE_CAP: usize = 64 << 10;
+
+/// What the console tail has consumed of the console file: the byte offset it has read to, and
+/// the start of a line whose newline it has not read yet. Shared between the tail's task and the
+/// backend, which finishes the tail when it stops it ([`ConsoleTail::finish`]).
+#[derive(Default)]
+struct ConsoleTailState {
+    pos: u64,
+    pending: Vec<u8>,
+    /// Set by [`ConsoleTail::finish`]: the task's read in flight, if any, is discarded.
+    finished: bool,
+}
+
+impl ConsoleTailState {
+    /// Take `bytes` read at `self.pos`, and log every whole line in `pending` plus them.
+    fn consume(&mut self, bytes: &[u8], console_lines: &std::sync::atomic::AtomicU64) {
+        self.pos += bytes.len() as u64;
+        self.pending.extend_from_slice(bytes);
+        let mut start = 0;
+        while let Some(newline) = self.pending[start..].iter().position(|&b| b == b'\n') {
+            let end = start + newline;
+            log_console_bytes(&self.pending[start..end], console_lines);
+            start = end + 1;
+        }
+        self.pending.drain(..start);
+        while self.pending.len() >= CONSOLE_LINE_CAP {
+            let piece: Vec<u8> = self.pending.drain(..CONSOLE_LINE_CAP).collect();
+            log_console_bytes(&piece, console_lines);
+        }
+    }
+
+    /// Log what is left of an unfinished line.
+    fn flush(&mut self, console_lines: &std::sync::atomic::AtomicU64) {
+        if !self.pending.is_empty() {
+            let rest = std::mem::take(&mut self.pending);
+            log_console_bytes(&rest, console_lines);
+        }
+    }
+}
+
+fn log_console_bytes(line: &[u8], console_lines: &std::sync::atomic::AtomicU64) {
+    console_lines.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    log_console_line(String::from_utf8_lossy(line).trim_end());
+}
+
+/// A running console tail ([`tail_console_to_tracing`]) and what it has consumed, so the backend
+/// can finish it when it stops it.
+struct ConsoleTail {
+    task: JoinHandle<()>,
+    state: Arc<Mutex<ConsoleTailState>>,
+    path: PathBuf,
+    console_lines: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ConsoleTail {
+    fn start(path: PathBuf, console_lines: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        let state = Arc::new(Mutex::new(ConsoleTailState::default()));
+        let task = tokio::spawn(tail_console_to_tracing(
+            path.clone(),
+            Arc::clone(&state),
+            Arc::clone(&console_lines),
+        ));
+        Self {
+            task,
+            state,
+            path,
+            console_lines,
+        }
+    }
+
+    /// Stop the tail and log what it had not logged yet: the rest of the file, and a last line
+    /// without its newline. Called once the VMM has exited (`reap`, and a relaunch's `spawn`), so
+    /// nothing more is written. A read the task had in flight is discarded (`finished`), so
+    /// nothing is logged twice.
+    fn finish(self) {
+        use std::io::{Read, Seek};
+        self.task.abort();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.finished {
+            return;
+        }
+        state.finished = true;
+        if let Ok(mut file) = std::fs::File::open(&self.path) {
+            if file.seek(std::io::SeekFrom::Start(state.pos)).is_ok() {
+                let mut buf = vec![0u8; CONSOLE_LINE_CAP];
+                while let Ok(n @ 1..) = file.read(&mut buf) {
+                    state.consume(&buf[..n], &self.console_lines);
+                }
+            }
+        }
+        state.flush(&self.console_lines);
+    }
+}
+
 /// Follow the Cloud Hypervisor guest console file and emit each new line to fcvm's
 /// tracing logs (the portable equivalent of Firecracker streaming its serial to stdout)
-/// through [`log_console_line`]. Each read is logged as it returns, so a line Cloud
-/// Hypervisor writes in two pieces across a poll is logged as two (#1107). The loop exits once
-/// the file has been gone for a few seconds (the VM dir was cleaned up), so it never
-/// outlives its VM. Each line also bumps `console_lines` (dead-console detection
-/// after restore — see [`Hypervisor::console_line_counter`]).
-async fn tail_console_to_tracing(path: PathBuf, console_lines: Arc<std::sync::atomic::AtomicU64>) {
-    use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
+/// through [`log_console_line`]. A line read in pieces across polls is held until its newline
+/// arrives ([`ConsoleTailState::consume`]), so it is logged, and classified, whole (#1107). The
+/// loop exits once the file has been gone for a few seconds (the VM dir was cleaned up), so it
+/// never outlives its VM. Each line also bumps `console_lines` (dead-console detection after
+/// restore — see [`Hypervisor::console_line_counter`]).
+async fn tail_console_to_tracing(
+    path: PathBuf,
+    state: Arc<Mutex<ConsoleTailState>>,
+    console_lines: Arc<std::sync::atomic::AtomicU64>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let lock = || {
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
 
     // Wait for Cloud Hypervisor to create the console file at boot.
     for _ in 0..SOCKET_WAIT_RETRY_COUNT {
@@ -689,26 +808,30 @@ async fn tail_console_to_tracing(path: PathBuf, console_lines: Arc<std::sync::at
         tokio::time::sleep(SOCKET_WAIT_RETRY_DELAY).await;
     }
 
-    let mut pos: u64 = 0;
+    let mut buf = vec![0u8; CONSOLE_LINE_CAP];
     let mut missing = 0u32;
     loop {
+        let from = {
+            let state = lock();
+            if state.finished {
+                return;
+            }
+            state.pos
+        };
         match tokio::fs::File::open(&path).await {
             Ok(mut file) => {
                 missing = 0;
-                if file.seek(std::io::SeekFrom::Start(pos)).await.is_ok() {
-                    let mut reader = BufReader::new(file);
-                    let mut line = String::new();
+                if file.seek(std::io::SeekFrom::Start(from)).await.is_ok() {
                     loop {
-                        line.clear();
-                        match reader.read_line(&mut line).await {
-                            Ok(0) => break, // caught up; poll again after a short sleep
-                            Ok(n) => {
-                                pos += n as u64;
-                                console_lines.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                log_console_line(line.trim_end());
-                            }
-                            Err(_) => break,
+                        let n = match file.read(&mut buf).await {
+                            Ok(0) | Err(_) => break, // caught up; poll again after a short sleep
+                            Ok(n) => n,
+                        };
+                        let mut state = lock();
+                        if state.finished {
+                            return;
                         }
+                        state.consume(&buf[..n], &console_lines);
                     }
                 }
             }
@@ -716,7 +839,12 @@ async fn tail_console_to_tracing(path: PathBuf, console_lines: Arc<std::sync::at
                 // Console file gone (VM dir cleaned up). Stop after a grace window.
                 missing += 1;
                 if missing > 30 {
-                    break;
+                    let mut state = lock();
+                    if !state.finished {
+                        state.finished = true;
+                        state.flush(&console_lines);
+                    }
+                    return;
                 }
             }
         }
@@ -761,6 +889,178 @@ mod tests {
     }
 
     use super::*;
+
+    /// A reboot relaunch finishes the old guest's console tail before it starts the new Cloud
+    /// Hypervisor process, which truncates the file it shares with the old guest. Started
+    /// after, as the tail used to be, the old guest's unread lines were lost.
+    #[test]
+    fn a_relaunch_finishes_the_old_console_tail_before_the_new_vmm_starts() {
+        let source = include_str!("mod.rs");
+        let spawn = &source[source
+            .find("    async fn spawn(&mut self, spec: &ProcessSpec)")
+            .unwrap()..];
+        let finish = spawn
+            .find("old.finish()")
+            .expect("spawn finishes the old tail");
+        let command = spawn.find("Command::new(&spec.binary)").unwrap();
+        assert!(
+            finish < command,
+            "the old tail is finished after the new VMM starts"
+        );
+    }
+
+    /// The tail is finished once the VMM has been reaped, not when it is signalled: a write the
+    /// VMM had in flight when it was killed lands after the signal, and a tail finished then
+    /// would have reached the end of the file before it.
+    #[test]
+    fn the_console_tail_is_finished_after_the_vmm_is_reaped() {
+        let source = include_str!("mod.rs");
+        let body = |name: &str| {
+            let start = source.find(name).unwrap();
+            &source[start..start + source[start..].find("\n    }\n").unwrap()]
+        };
+        let start_kill = body("    fn start_kill(&mut self) -> Result<()> {");
+        assert!(!start_kill.contains("finish()"), "{start_kill}");
+        let reap = body("    async fn reap(&mut self) {");
+        let waited = reap.find("p.wait().await").unwrap();
+        let finished = reap.find("tail.finish()").expect("reap finishes the tail");
+        assert!(waited < finished, "{reap}");
+    }
+
+    /// Run `body` on a current-thread runtime under a subscriber that keeps everything, and
+    /// return what it logged. The tail's task runs on this thread, so its lines are captured.
+    fn logged_by_tail(body: impl FnOnce(&tokio::runtime::Runtime)) -> String {
+        crate::utils::log_capture::logged("trace", || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            body(&runtime);
+        })
+    }
+
+    /// Wait until the tail has consumed `bytes` of its file.
+    async fn tail_reaches(tail: &ConsoleTail, bytes: u64) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tail.state.lock().unwrap().pos < bytes {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the tail did not read {bytes} bytes within 10 s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn append(path: &Path, bytes: &[u8]) {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
+
+    /// A kernel panic line Cloud Hypervisor writes in two pieces, with a poll of the tail in
+    /// between, is logged once, whole, as a crash headline at WARN, and counted as one line.
+    /// The tail used to log each read as a line, so the headline was split and neither piece
+    /// was classified as one (#1107).
+    #[test]
+    fn a_line_written_in_two_pieces_is_logged_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ch-console.log");
+        let first = b"[    9.814619] Kernel panic - not ";
+        let rest = b"syncing: sysrq triggered crash\n";
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let log = logged_by_tail(|runtime| {
+            runtime.block_on(async {
+                append(&path, first);
+                let tail = ConsoleTail::start(path.clone(), Arc::clone(&counter));
+                tail_reaches(&tail, first.len() as u64).await;
+                append(&path, rest);
+                tail_reaches(&tail, (first.len() + rest.len()) as u64).await;
+                tail.finish();
+            })
+        });
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "{log}"
+        );
+        let headline: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("Kernel panic"))
+            .collect();
+        assert_eq!(headline.len(), 1, "{log}");
+        assert!(
+            headline[0].contains("WARN")
+                && headline[0].contains("fcvm::guest")
+                && headline[0].contains("Kernel panic - not syncing: sysrq triggered crash"),
+            "{log}"
+        );
+    }
+
+    /// A guest that writes without newlines cannot grow the tail's buffer past
+    /// CONSOLE_LINE_CAP: that much is logged as one line without waiting for a newline.
+    #[test]
+    fn a_line_without_a_newline_is_logged_at_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ch-console.log");
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let log = logged_by_tail(|runtime| {
+            runtime.block_on(async {
+                append(&path, &vec![b'x'; CONSOLE_LINE_CAP]);
+                let tail = ConsoleTail::start(path.clone(), Arc::clone(&counter));
+                tail_reaches(&tail, CONSOLE_LINE_CAP as u64).await;
+                assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+                assert!(tail.state.lock().unwrap().pending.is_empty());
+                tail.finish();
+            })
+        });
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "finishing logs nothing more"
+        );
+        assert!(
+            log.contains(&"x".repeat(CONSOLE_LINE_CAP)),
+            "the line is logged whole"
+        );
+    }
+
+    /// A last record without its newline, written just before the VMM is stopped, is logged
+    /// once by the stop, whether or not the tail had read it yet.
+    #[test]
+    fn stopping_the_tail_logs_a_last_line_without_a_newline_once() {
+        for wait_for_the_tail in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ch-console.log");
+            let words = b"[fc-agent] the last words";
+            let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let log = logged_by_tail(|runtime| {
+                runtime.block_on(async {
+                    append(&path, b"[fc-agent] booted\n");
+                    let tail = ConsoleTail::start(path.clone(), Arc::clone(&counter));
+                    append(&path, words);
+                    if wait_for_the_tail {
+                        tail_reaches(&tail, 18 + words.len() as u64).await;
+                    }
+                    tail.finish();
+                })
+            });
+            assert_eq!(
+                log.matches("the last words").count(),
+                1,
+                "waited={wait_for_the_tail}: {log}"
+            );
+            assert_eq!(
+                counter.load(std::sync::atomic::Ordering::Relaxed),
+                2,
+                "waited={wait_for_the_tail}: {log}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn reboot_monitor_cleanup_retains_handle_when_cancelled() {
