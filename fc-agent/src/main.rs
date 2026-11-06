@@ -15,6 +15,7 @@ mod nftables;
 mod output;
 mod proxy;
 mod restore;
+mod retired_address;
 mod snapshot_network;
 mod system;
 mod thp;

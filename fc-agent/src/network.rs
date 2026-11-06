@@ -927,9 +927,11 @@ impl std::fmt::Display for Ipv6Prefix {
 /// that was cold at snapshot time faults its pages in through the memory
 /// server. Its receives block, so it runs on tokio's blocking pool (see
 /// `off_the_runtime`).
-pub async fn reconfigure_ipv6(new_ipv6: &str) {
-    reconfigure_ipv6_over(eth0_route_channel, new_ipv6).await;
+/// Returns the address it removed from eth0, if it found one.
+pub async fn reconfigure_ipv6(new_ipv6: &str) -> Option<Ipv6Addr> {
+    let retired = reconfigure_ipv6_over(eth0_route_channel, new_ipv6).await;
     announce_ipv6("eth0", new_ipv6);
+    retired
 }
 
 /// The Ethernet multicast address of ff02::1, all nodes.
@@ -1022,7 +1024,7 @@ pub fn announce_ipv6(interface: &str, address: &str) {
 }
 
 /// `reconfigure_ipv6` over the socket `open` returns.
-async fn reconfigure_ipv6_over<C, F>(open: F, new_ipv6: &str)
+async fn reconfigure_ipv6_over<C, F>(open: F, new_ipv6: &str) -> Option<Ipv6Addr>
 where
     C: NetlinkChannel,
     F: FnOnce() -> anyhow::Result<(C, u32)> + Send + 'static,
@@ -1031,13 +1033,13 @@ where
     let new_ipv6 = new_ipv6.to_owned();
     let swapped = off_the_runtime("the IPv6 swap", move || {
         let (mut channel, index) = open()?;
-        swap_global_ipv6(&mut channel, index, &new_ipv6);
-        Ok(())
+        Ok(swap_global_ipv6(&mut channel, index, &new_ipv6))
     })
     .await;
-    if let Err(error) = swapped {
+    swapped.unwrap_or_else(|error| {
         eprintln!("[fc-agent] WARNING: cannot reconfigure IPv6: {error:#}");
-    }
+        None
+    })
 }
 
 /// The host identity address this guest holds, and whether a restore set it.
@@ -1286,15 +1288,24 @@ fn eth0_route_channel() -> anyhow::Result<(KernelChannel, u32)> {
 
 /// Remove the first global IPv6 on interface `index`, then add `new_ipv6` as a
 /// /128 without duplicate address detection. Every failure is a warning, and a
-/// failed lookup or removal still adds the new address.
-fn swap_global_ipv6<C: NetlinkChannel>(channel: &mut C, index: u32, new_ipv6: &str) {
+/// failed lookup or removal still adds the new address. Returns the address it
+/// removed.
+fn swap_global_ipv6<C: NetlinkChannel>(
+    channel: &mut C,
+    index: u32,
+    new_ipv6: &str,
+) -> Option<Ipv6Addr> {
     let old = first_global_ipv6(channel, index).unwrap_or_else(|error| {
         eprintln!("[fc-agent] WARNING: failed to list IPv6 addrs: {error:#}");
         None
     });
+    let mut removed = None;
     if let Some(old) = old {
         match change_address(channel, RTM_DELADDR, 0, index, old, 0) {
-            Ok(()) => eprintln!("[fc-agent] removed old IPv6 {old} from eth0"),
+            Ok(()) => {
+                eprintln!("[fc-agent] removed old IPv6 {old} from eth0");
+                removed = Some(old.address);
+            }
             Err(error) => eprintln!("[fc-agent] WARNING: failed to remove old IPv6: {error:#}"),
         }
     }
@@ -1316,6 +1327,7 @@ fn swap_global_ipv6<C: NetlinkChannel>(channel: &mut C, index: u32, new_ipv6: &s
         Ok(()) => eprintln!("[fc-agent] added new IPv6 {}/128 to eth0", new_ipv6),
         Err(error) => eprintln!("[fc-agent] WARNING: failed to add new IPv6: {error:#}"),
     }
+    removed
 }
 
 /// The address `ip -6 addr show dev <index> scope global` lists first: the
@@ -3504,8 +3516,8 @@ mod runtime_worker_tests {
 
     #[test]
     fn a_stalled_ipv6_swap_leaves_the_runtime_worker_free() {
-        assert_stall_leaves_the_worker_free(|channel| {
-            reconfigure_ipv6_over(move || Ok((channel, 2)), "2001:db8::2")
+        assert_stall_leaves_the_worker_free(|channel| async move {
+            reconfigure_ipv6_over(move || Ok((channel, 2)), "2001:db8::2").await;
         });
     }
 
