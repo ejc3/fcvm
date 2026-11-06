@@ -164,6 +164,19 @@ pub struct RestorePhases {
     pub clock_ms: f64,
     pub ipv6_ms: f64,
     pub tcp_cleanup_ms: f64,
+    /// The parts of `tcp_cleanup_ms` outside the boundary's own sub-timers
+    /// (#1090): the begin line written to the guest console (timed here), and
+    /// from the boundary's report the lock wait, the constructors, the gate
+    /// close with the UDP rule, and the cleanup-complete console line.
+    pub tcp_begin_console_ms: f64,
+    pub tcp_lock_wait_ms: f64,
+    pub tcp_construct_ms: f64,
+    pub tcp_gate_arm_ms: f64,
+    pub tcp_complete_console_ms: f64,
+    /// What `tcp_cleanup_ms` holds beyond every part above and the boundary's
+    /// verify, barrier, egress open and destroy timers. Nonzero means a step
+    /// of the phase is still unaccounted.
+    pub tcp_cleanup_untimed_ms: f64,
     /// Wire copy of
     /// [`crate::snapshot_network::RestoreNetworkReport::verified_armed`]:
     /// whether the boundary took the verified fast path.
@@ -225,6 +238,10 @@ impl RestorePhases {
         &mut self,
         boundary: &crate::snapshot_network::RestoreNetworkReport,
     ) {
+        self.tcp_lock_wait_ms = boundary.lock_wait_ms;
+        self.tcp_construct_ms = boundary.construct_ms;
+        self.tcp_gate_arm_ms = boundary.gate_arm_ms;
+        self.tcp_complete_console_ms = boundary.complete_console_ms;
         self.tcp_verified = boundary.verified_armed;
         self.tcp_verify_ms = boundary.verify_ms;
         self.tcp_reassert_ms = boundary.reassert_ms;
@@ -246,6 +263,25 @@ impl RestorePhases {
         self.tcp_gate_egress_commit_ms = gate.egress_commit_ms;
         self.tcp_gate_ingress_read_ms = gate.ingress_read_ms;
         self.tcp_gate_ingress_commit_ms = gate.ingress_commit_ms;
+        // Clamped: each timer is rounded on its own clock, so their sum can
+        // pass the phase's by a few microseconds.
+        self.tcp_cleanup_untimed_ms =
+            (self.tcp_cleanup_ms - self.tcp_cleanup_accounted_ms()).max(0.0);
+    }
+
+    /// The milliseconds of `tcp_cleanup_ms` the disjoint timers account for.
+    /// `tcp_reassert_ms` is left out because it contains the gate close, the
+    /// UDP rule and the barrier, each of which has its own timer.
+    pub(crate) fn tcp_cleanup_accounted_ms(&self) -> f64 {
+        self.tcp_begin_console_ms
+            + self.tcp_lock_wait_ms
+            + self.tcp_construct_ms
+            + self.tcp_verify_ms
+            + self.tcp_gate_arm_ms
+            + self.tcp_barrier_ms
+            + self.tcp_egress_open_ms
+            + self.tcp_destroy_ms
+            + self.tcp_complete_console_ms
     }
 
     /// Compact single-line JSON for the ACK frame, every timing rounded to
@@ -432,10 +468,14 @@ pub async fn handle_clone_restore(
     phases.neighbor_ms = elapsed_ms(neighbor_started);
 
     let tcp_cleanup_started = std::time::Instant::now();
+    // The console is a serial device and a write to it can block, so the line
+    // is timed like the rest of the phase.
+    let begin_console_started = std::time::Instant::now();
     eprintln!(
         "[fc-agent] restore phase=tcp-cleanup epoch={} begin",
         restore_epoch
     );
+    phases.tcp_begin_console_ms = elapsed_ms(begin_console_started);
     // The boundary retires the snapshot-time sockets and opens the gate's
     // egress half; ingress stays gated until the publication below. The
     // boundary lock is held across everything in between.
@@ -830,6 +870,12 @@ mod tests {
         phases.clock_ms = 99_999.999;
         phases.ipv6_ms = 99_999.999;
         phases.tcp_cleanup_ms = 99_999.999;
+        phases.tcp_begin_console_ms = 99_999.999;
+        phases.tcp_lock_wait_ms = 99_999.999;
+        phases.tcp_construct_ms = 99_999.999;
+        phases.tcp_gate_arm_ms = 99_999.999;
+        phases.tcp_complete_console_ms = 99_999.999;
+        phases.tcp_cleanup_untimed_ms = 99_999.999;
         phases.tcp_verified = true;
         phases.tcp_verify_ms = 99_999.999;
         phases.tcp_reassert_ms = 99_999.999;
@@ -883,6 +929,12 @@ mod tests {
         phases.clock_ms = long;
         phases.ipv6_ms = long;
         phases.tcp_cleanup_ms = long;
+        phases.tcp_begin_console_ms = long;
+        phases.tcp_lock_wait_ms = long;
+        phases.tcp_construct_ms = long;
+        phases.tcp_gate_arm_ms = long;
+        phases.tcp_complete_console_ms = long;
+        phases.tcp_cleanup_untimed_ms = long;
         phases.tcp_verified = true;
         phases.tcp_verify_ms = long;
         phases.tcp_reassert_ms = long;
@@ -920,6 +972,82 @@ mod tests {
         );
     }
 
+    fn boundary_report(
+        lock_wait_ms: f64,
+        construct_ms: f64,
+        complete_console_ms: f64,
+    ) -> crate::snapshot_network::RestoreNetworkReport {
+        crate::snapshot_network::RestoreNetworkReport {
+            verified_armed: true,
+            lock_wait_ms,
+            construct_ms,
+            complete_console_ms,
+            gate_arm_ms: 4.0,
+            verify_ms: 50.0,
+            reassert_ms: 0.0,
+            barrier_ms: 20.0,
+            destroy_ms: 600.0,
+            egress_open_ms: 30.0,
+            hook_ms: 0.0,
+            reopen_ms: 0.0,
+            tally: Default::default(),
+            gate: Default::default(),
+        }
+    }
+
+    /// #1090: `tcp_cleanup_untimed_ms` is what the phase holds beyond every
+    /// disjoint timer, so a step nobody timed shows up as a number instead of
+    /// hiding in `tcp_cleanup_ms`. `tcp_reassert_ms` contains the gate close,
+    /// the UDP rule and the barrier, so it is not counted a second time.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn the_cleanup_remainder_is_what_the_timers_leave() {
+        let mut phases = RestorePhases::default();
+        phases.tcp_cleanup_ms = 1000.0;
+        phases.tcp_begin_console_ms = 1.0;
+        phases.record_boundary(&boundary_report(200.0, 3.0, 2.0));
+        // 1 + 200 + 3 + 50 (verify) + 4 (gate arm) + 20 (barrier) + 30 (egress)
+        // + 600 (destroy) + 2 = 910.
+        assert_eq!(phases.tcp_cleanup_accounted_ms(), 910.0);
+        assert_eq!(phases.tcp_cleanup_untimed_ms, 90.0);
+
+        let mut reasserted = boundary_report(200.0, 3.0, 2.0);
+        reasserted.verified_armed = false;
+        reasserted.reassert_ms = 24.0;
+        phases.record_boundary(&reasserted);
+        assert_eq!(
+            phases.tcp_cleanup_untimed_ms, 90.0,
+            "the reassert contains the gate arm and the barrier and adds nothing"
+        );
+
+        // Rounding in the timers must never print a negative remainder.
+        phases.tcp_cleanup_ms = 900.0;
+        phases.record_boundary(&boundary_report(200.0, 3.0, 2.0));
+        assert_eq!(phases.tcp_cleanup_untimed_ms, 0.0);
+    }
+
+    /// The begin line is written to a serial console that can block, so the
+    /// phase times it. `handle_clone_restore` needs a whole guest, so the
+    /// contract is pinned at the source.
+    #[test]
+    fn the_begin_console_write_is_timed_inside_the_cleanup_phase() {
+        let source = include_str!("restore.rs");
+        let started = source.find("let tcp_cleanup_started").unwrap();
+        let begin = source.find("let begin_console_started").unwrap();
+        let line = source[begin..]
+            .find("restore phase=tcp-cleanup epoch={} begin")
+            .unwrap()
+            + begin;
+        let stored = source
+            .find("phases.tcp_begin_console_ms = elapsed_ms(begin_console_started)")
+            .unwrap();
+        let boundary = source.find("restore_snapshot_network()").unwrap();
+        assert!(
+            started < begin && begin < line && line < stored && stored < boundary,
+            "the begin console write must be timed after the phase starts and before the boundary"
+        );
+    }
+
     /// The ACK names the GPU memory scrub's duration, and says nothing about
     /// GPU steps without GPUs.
     #[test]
@@ -949,6 +1077,12 @@ mod tests {
         phases.clock_ms = long;
         phases.ipv6_ms = long;
         phases.tcp_cleanup_ms = long;
+        phases.tcp_begin_console_ms = long;
+        phases.tcp_lock_wait_ms = long;
+        phases.tcp_construct_ms = long;
+        phases.tcp_gate_arm_ms = long;
+        phases.tcp_complete_console_ms = long;
+        phases.tcp_cleanup_untimed_ms = long;
         phases.tcp_verified = true;
         phases.tcp_verify_ms = long;
         phases.tcp_reassert_ms = long;
