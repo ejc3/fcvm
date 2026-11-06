@@ -149,7 +149,7 @@ fn wait_for_fuse_mount(vol: &VolumeMount) -> Result<()> {
 }
 
 /// Wait about 5 s (10 checks, 500 ms apart) for a device node to appear.
-fn wait_for_device(device: &str) -> Result<()> {
+pub(crate) fn wait_for_device(device: &str) -> Result<()> {
     let device_path = std::path::Path::new(device);
     for attempt in 1..=10 {
         if device_path.exists() {
@@ -655,6 +655,18 @@ pub fn unmount_disks(paths: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// fc-agent has one block-device wait, so a change to it (a longer timeout, say) reaches
+    /// every device it waits for: the overlay image, pmem and the extra disks (#1087).
+    #[test]
+    fn there_is_one_block_device_wait() {
+        let definition = concat!("fn wait_for", "_device(");
+        let definitions: usize = [include_str!("container.rs"), include_str!("mounts.rs")]
+            .iter()
+            .map(|source| source.matches(definition).count())
+            .sum();
+        assert_eq!(definitions, 1);
+    }
 
     #[test]
     fn pmem_mount_args_are_read_only_ext4_with_dax() {

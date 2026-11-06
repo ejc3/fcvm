@@ -785,14 +785,17 @@ async fn test_snapshot_of_a_relaunched_clone_leaves_it_running() -> Result<()> {
             let mut wrong = Vec::new();
             // The relaunch serves the new guest's boot plan on the port (the guest steps
             // its clock from it), and that document must not carry the restore's epoch.
-            if let Some(document) = served_boot_plan(clone_pid)
-                .await?
-                .filter(|document| document.get("restore-epoch").is_some())
-            {
-                wrong.push(format!(
+            match served_boot_plan(clone_pid).await? {
+                None => wrong.push(
+                    "after the relaunch the host serves no boot plan on the boot-plan port, \
+                     which the relaunched guest steps its clock from"
+                        .to_string(),
+                ),
+                Some(document) if document.get("restore-epoch").is_some() => wrong.push(format!(
                     "after the relaunch the host still serves the restore's epoch on the \
-                     boot-plan port: {document}"
-                ));
+                         boot-plan port: {document}"
+                )),
+                Some(_) => {}
             }
             if let Err(error) = common::create_snapshot_by_pid(clone_pid, &second_snap).await {
                 wrong.push(format!(
