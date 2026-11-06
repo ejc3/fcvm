@@ -2340,21 +2340,33 @@ FROM_RUN_BUNDLE = "--from-run-bundle"
 def run_bundle(run_dir: str) -> str:
     """The runtime bundle a scale run was measured from, checked whole.
 
-    reqbench.sh stages the bundle at <campaign>/runtime/<sha256 of its
-    MANIFEST.sha256>, and reqscale.py records that hash in the run's
-    provenance.json as runtime_bundle_sha256; the run directory sits beside
-    runtime/ in the same campaign directory. The bundle is refused when it is
-    missing, when its manifest hashes to anything else, when a file it lists no
-    longer matches, or when it does not hold every source the analysis runs.
+    reqbench.sh stages the bundle at $RESULTS/runtime/<sha256 of its
+    MANIFEST.sha256>, and reqscale.py, which runs from it, records that hash in
+    the run's provenance.json as runtime_bundle_sha256 and its own fcvm as
+    fcvm_path. The run's output directory need not sit under that RESULTS
+    (a standalone bench-chromium-scale takes SCALE_OUT and RESULTS apart), so
+    the bundle is the directory fcvm_path names, and, for a run whose records
+    were copied away from where they were measured, <run parent>/runtime/<hash>,
+    the corpus campaign's layout. Either must be named by the hash. The bundle
+    is refused when it is missing, when its manifest hashes to anything else,
+    when a file it lists no longer matches, or when it does not hold every
+    source the analysis runs.
     """
     provenance = _load_json(os.path.join(run_dir, "provenance.json"))
     digest = provenance.get("runtime_bundle_sha256")
     if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise AnalysisInvalid(f"the run records no runtime bundle: runtime_bundle_sha256={digest!r}")
-    bundle = os.path.join(os.path.dirname(run_dir), "runtime", digest)
+    fcvm_path = provenance.get("fcvm_path")
+    candidates = []
+    if isinstance(fcvm_path, str) and os.path.isabs(fcvm_path):
+        candidates.append(os.path.dirname(fcvm_path))
+    candidates.append(os.path.join(os.path.dirname(run_dir), "runtime", digest))
+    named = [c for c in candidates if os.path.basename(os.path.normpath(c)) == digest]
+    bundle = next((c for c in named if os.path.isfile(os.path.join(c, "MANIFEST.sha256"))), None)
+    if bundle is None:
+        raise AnalysisInvalid(
+            f"the run's runtime bundle is missing: no MANIFEST.sha256 in {', '.join(named)}")
     manifest = os.path.join(bundle, "MANIFEST.sha256")
-    if not os.path.isfile(manifest):
-        raise AnalysisInvalid(f"the run's runtime bundle is missing: {manifest}")
     if reqscale.sha256_file(manifest) != digest:
         raise AnalysisInvalid(f"the run's runtime bundle manifest no longer hashes to {digest}: {manifest}")
     listed = set()

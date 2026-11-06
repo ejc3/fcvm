@@ -273,6 +273,34 @@ class ScaleAnalysisRunsFromTheRunsBundle(unittest.TestCase):
                 self.assertEqual(ran["argv"][ran["argv"].index("--run-dir") + 1], run)
                 self.assertIn(out, ran["argv"])
 
+    def test_a_standalone_run_outside_its_results_finds_its_bundle(self):
+        """Review of #1569: a standalone bench-chromium-scale takes SCALE_OUT
+        and RESULTS apart, so the run's directory need not sit beside the
+        bundle's runtime/. The bundle is the directory the run's fcvm_path
+        names. RED BEFORE THE FIX: "runtime bundle is missing"."""
+        with tempfile.TemporaryDirectory() as d:
+            bundle = write_bundle(os.path.join(d, "results"), self._stub_files())
+            run = os.path.join(d, "elsewhere", "scale-run")
+            os.makedirs(run)
+            with open(os.path.join(run, "provenance.json"), "w") as f:
+                json.dump({"runtime_bundle_sha256": os.path.basename(bundle),
+                           "fcvm_path": os.path.join(bundle, "fcvm")}, f)
+            mark = os.path.join(d, "mark.json")
+            out = os.path.join(d, "out")
+            result = self._make("analyze-chromium-scale", run, "SCALE_ANALYSIS_JSON", out, mark)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            with open(mark) as f:
+                self.assertEqual(os.path.realpath(json.load(f)["here"]), os.path.realpath(bundle))
+            # A fcvm_path in a directory not named by the hash is not the bundle.
+            with open(os.path.join(run, "provenance.json"), "w") as f:
+                json.dump({"runtime_bundle_sha256": os.path.basename(bundle),
+                           "fcvm_path": os.path.join(d, "fcvm")}, f)
+            os.unlink(mark)
+            refused = self._make("analyze-chromium-scale", run, "SCALE_ANALYSIS_JSON", out, mark)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("bundle is missing", refused.stderr + refused.stdout)
+            self.assertFalse(os.path.exists(mark))
+
     def test_a_missing_changed_or_old_bundle_is_refused(self):
         """Each refusal exits 4 with the reason and writes no output, and the
         bundled analyzer never runs."""
