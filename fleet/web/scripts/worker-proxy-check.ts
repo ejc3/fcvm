@@ -6,10 +6,13 @@
 //   node scripts/worker-proxy-check.ts check <worker port>   the checks; exit 1 on a failure
 
 import { createServer, type IncomingHttpHeaders } from "node:http";
-import { WebSocketServer } from "ws";
+import { WebSocket as NodeWebSocket, WebSocketServer } from "ws";
 
 const [mode, portArg] = process.argv.slice(2);
 const port = Number(portArg);
+const backendCookie = "CF_Authorization=api-session; Path=/; Secure; HttpOnly";
+const backendJwt = "api-jwt";
+const backendMarker = "coordinator-response";
 if (!(port > 0)) throw new Error("usage: worker-proxy-check.ts serve|check <port>");
 
 /** What the stand-in saw: the headers that decide whether forwarding is right. */
@@ -28,12 +31,22 @@ function seen(path: string, h: IncomingHttpHeaders): string {
 if (mode === "serve") {
   const server = createServer((req, res) => {
     if (req.url?.startsWith("/poster.jpg")) {
-      res.writeHead(200, { "content-type": "application/json" }).end(seen("/poster.jpg", req.headers));
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "set-cookie": backendCookie,
+        "cf-access-jwt-assertion": backendJwt,
+        "x-coordinator-test": backendMarker,
+      }).end(seen("/poster.jpg", req.headers));
     } else {
       res.writeHead(404).end("stand-in coordinator: not a coordinator path");
     }
   });
   const wss = new WebSocketServer({ noServer: true });
+  wss.on("headers", (headers) => headers.push(
+    `Set-Cookie: ${backendCookie}`,
+    `CF-Access-Jwt-Assertion: ${backendJwt}`,
+    `X-Coordinator-Test: ${backendMarker}`,
+  ));
   server.on("upgrade", (req, socket, head) => {
     if (!req.url?.startsWith("/live")) {
       socket.destroy();
@@ -67,23 +80,33 @@ if (mode === "serve") {
   const page = await fetch(`http://${base}/?mode=potato`, { signal: AbortSignal.timeout(30000) }).then((r) => r.text());
   expect("the page connects to its own origin", page.includes(`ws://${base}/live`), "no same-origin /live URL in the page");
 
-  const poster = await fetch(`http://${base}/poster.jpg`, { headers: viewer, signal: AbortSignal.timeout(10000) }).then((r) => r.text());
-  forwarded(poster, "/poster.jpg");
+  const poster = await fetch(`http://${base}/poster.jpg`, { headers: viewer, signal: AbortSignal.timeout(10000) });
+  forwarded(await poster.text(), "/poster.jpg");
+  expect("/poster.jpg strips the coordinator's Access response credentials",
+    !poster.headers.has("set-cookie") && !poster.headers.has("cf-access-jwt-assertion"), "unexpected authentication header");
+  expect("/poster.jpg keeps safe response headers", poster.headers.get("x-coordinator-test") === backendMarker, "missing test header");
 
-  // Node's WebSocket sends no cookie or custom headers, so the viewer's headers ride on the
-  // HTTP checks above; this one proves the upgrade itself is relayed and Origin passes.
+  // ws exposes the upgrade headers; a message afterwards proves the actual socket survives.
   const live = await new Promise<string>((resolve) => {
-    const ws = new WebSocket(`ws://${base}/live`);
-    const timer = setTimeout(() => resolve("timed out"), 10000);
-    ws.onmessage = (e) => {
+    const ws = new NodeWebSocket(`ws://${base}/live`);
+    const timer = setTimeout(() => {
+      resolve("timed out");
+      ws.terminate();
+    }, 10000);
+    ws.once("upgrade", (response) => {
+      expect("/live strips the coordinator's Access response credentials",
+        !response.headers["set-cookie"] && !response.headers["cf-access-jwt-assertion"], "unexpected authentication header");
+      expect("/live keeps safe upgrade headers", response.headers["x-coordinator-test"] === backendMarker, "missing test header");
+    });
+    ws.once("message", (data) => {
       clearTimeout(timer);
-      resolve(String(e.data));
+      resolve(String(data));
       ws.close();
-    };
-    ws.onerror = () => {
+    });
+    ws.once("error", () => {
       clearTimeout(timer);
       resolve("socket error");
-    };
+    });
   });
   const s = (() => {
     try {
