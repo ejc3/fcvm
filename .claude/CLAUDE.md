@@ -3072,7 +3072,10 @@ with the granule.
   zero-progress `EAGAIN` while `mmap_changing` is raised, abandons that granule to demand
   paging. It never fails a clone. A vCPU that faults inside the granule meanwhile is woken by
   the populate itself, because `UFFDIO_COPY` wakes every sleeper in the range it installs.
-  It stands down in three cases. While any fault is parked it serves demanded pages only: a
+  It stands down in four cases. While working-set replay runs it populates nothing: the
+  recorded set is the better prediction, and with the memory file evicted, 64 KiB granules
+  kept a 128 GiB guest's replay from finishing within 150 s, against 11.3 s without the
+  option (#978). While any fault is parked it serves demanded pages only: a
   parked fault is retried between batches and fails the clone if it is still refused 2 s
   after it was parked or after the last REMOVE event read, so nothing optional may lengthen a
   batch. After a demand copy that found its page
@@ -3080,7 +3083,8 @@ with the granule.
   fault on a page the clone's balloon gave back, which is answered with zeros, it
   populates nothing either. A fault on a hole in the memory file is answered with zeros
   and gets fault-around like any other. A page of the granule that the balloon gave back,
-  or that is a hole, is stepped over.
+  or that is a hole, is stepped over, and so is one whose source page is not in the host
+  page cache (`mincore`), so fault-around never waits on the disk inside the handler.
 - **Limitation: recording under the option is thin, and replay does not make up for it**:
   only the demanded page is recorded, and a page that fault-around installed is never
   recorded, because the guest never faults on it. So with the option on the recorded working
