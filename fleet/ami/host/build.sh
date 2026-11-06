@@ -144,11 +144,9 @@ build)
   podman load -q -i /mnt/fcvm-btrfs/potato.oci.tar
   rm -f /mnt/fcvm-btrfs/potato.oci.tar
   # Phones (docs/fleet/ARCHITECTURE.md, "Phones mode"): the phone profile, the emulator and the
-  # system image built from source, and Robot Park. Robot Park builds against the SDK's API 35
-  # platform (scripts/phone/sdk.sh): the SDK is used here to build the app and is left out of
-  # the store (bake), so nothing of Google's SDK is on a host.
+  # system image built from source, and Robot Park, built with the AOSP build's tools.
   as_user "cd $SRC && make setup-phone && make phone-emulator && ./scripts/phone/aosp.sh"
-  as_user "cd $SRC && ACCEPT_ANDROID_SDK_LICENSE=1 ./scripts/phone/sdk.sh && ./scripts/phone/app.sh"
+  as_user "cd $SRC && ./scripts/phone/app.sh"
   # the phones' web browser (scripts/phone/browser.sh: a pinned release, checked by SHA-256)
   as_user "cd $SRC && ./scripts/phone/browser.sh"
   as_user "cd $SRC && make -C fleet/phone image TAG=fleet"
@@ -191,7 +189,7 @@ bake)
   python3 "$HERE/store-pack.py" /mnt/fcvm-btrfs /var/lib/fcvm-fleet/store "${STORE_PARTS:-16}" \
       --exclude=./vm-disks --exclude=./state --exclude=./cache --exclude='./cargo-target*' \
       --exclude=./renderer.oci.tar --exclude=./renderer.oci.tar.zst --exclude='./*.lock' \
-      --exclude=./android-sdk --exclude='./android-emulator/*/src' --exclude='./android-aosp/*/.downloads'
+      --exclude='./android-emulator/*/src' --exclude='./android-aosp/*/.downloads'
   ls -la /var/lib/fcvm-fleet/store
   # Each part goes to S3 in one presigned PUT, which S3 refuses above 5 GiB; a host whose
   # S3 restore fails falls back to the AMI's copy, which took 1006 s against 78 s (2026-10-24).

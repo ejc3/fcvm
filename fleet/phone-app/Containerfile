@@ -1,11 +1,12 @@
 # Build container for Robot Park (fleet/phone-app): a JDK, Gradle at a pinned version and
-# checksum, and glslangValidator for the shader check. The Android SDK is not in the image: the
-# app's build mounts the one scripts/phone/sdk.sh fetched (read-only, at /sdk), and the scene's
-# tests need none. Dependencies resolve from Google's and Maven Central's repositories,
-# checked against gradle/verification-metadata.xml. `make -C fleet/phone-app` builds it.
+# checksum, zip, and glslangValidator for the shader check. The Android tools are not in the
+# image: the app's build (build-apk.sh) mounts the AOSP build's (scripts/phone/aosp.sh,
+# read-only, at /aosp-tools), and the scene's tests need none. Dependencies resolve from
+# Maven Central and the Gradle plugin portal, checked against gradle/verification-metadata.xml.
+# `make -C fleet/phone-app` builds it.
 FROM docker.io/library/ubuntu:24.04
 RUN apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
-      openjdk-17-jdk-headless curl ca-certificates unzip glslang-tools \
+      openjdk-17-jdk-headless curl ca-certificates unzip zip glslang-tools \
     && rm -rf /var/lib/apt/lists/*
 ARG GRADLE_VERSION=8.10.2
 ARG GRADLE_SHA256=31c55713e40233a8303827ceb42ca48a47267a0ad4bab9177123121e71524c26
