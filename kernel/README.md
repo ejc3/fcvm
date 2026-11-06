@@ -40,6 +40,14 @@ about one guest shutdown in 200 spins forever in `virtnet_poll_cleantx()`
 shipped guest kernel carries them. Drop a patch once the pinned release contains
 it: the build then fails when the patch no longer applies.
 
+`kernel/patches-default` also holds one change Linux does not have:
+`0002-fuse-trust-server-attributes-without-writers.patch`. With the FUSE writeback
+cache, upstream keeps the kernel's own size and times of a cached regular file for the
+life of the inode, so a file the host changed under a read-write `--map` was read cut off
+at the old size (#1041). The patch keeps them only while the file is open for writing.
+Every guest patch directory links it; the nested ones link it as a `.vm.patch`, so the
+host kernel built from the same directory does not apply it.
+
 x86-only patches live in `kernel/patches-default-x86`, which the x86 default
 profile applies in place of `kernel/patches-default` and which also links the
 shared patches. `kernel/patches-btrfs-x86` and `kernel/patches-x86` link them for

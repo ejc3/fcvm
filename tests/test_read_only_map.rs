@@ -241,19 +241,39 @@ fn write_version(host_dir: &Path, n: usize) -> Result<()> {
 /// again, in a clone restored from a snapshot taken before that second change.
 #[tokio::test]
 async fn test_read_only_map_follows_host_in_vm_and_clone() -> Result<()> {
-    const GUEST_DIR: &str = "/mnt/ro";
-    let (vm_name, clone_name, snap_name, _) = common::unique_names("ro-follow");
-    let host_dir = fresh_dir("ro-follow")?;
+    follows_host_in_vm_and_clone("ro-follow", true).await
+}
+
+/// The same for a read-write map, which keeps the FUSE writeback cache. The
+/// guest's kernel takes the host's size and times for a file no guest process
+/// has open for writing (kernel/patches-default/0002-fuse-trust-server-
+/// attributes-without-writers.patch).
+///
+/// RED BEFORE THE FIX (#1041): grows.txt read 8 of 92 bytes in the running VM,
+/// and 8 of 134 in the clone.
+#[tokio::test]
+async fn test_read_write_map_follows_host_in_vm_and_clone() -> Result<()> {
+    follows_host_in_vm_and_clone("rw-follow", false).await
+}
+
+async fn follows_host_in_vm_and_clone(name: &str, read_only: bool) -> Result<()> {
+    let guest_dir = if read_only { "/mnt/ro" } else { "/mnt/rw" };
+    let (vm_name, clone_name, snap_name, _) = common::unique_names(name);
+    let host_dir = fresh_dir(name)?;
     write_version(&host_dir, 0)?;
 
     let mut started: Vec<u32> = Vec::new();
     let result = async {
-        let map = format!("{}:{GUEST_DIR}:ro", host_dir.display());
+        let map = format!(
+            "{}:{guest_dir}{}",
+            host_dir.display(),
+            if read_only { ":ro" } else { "" }
+        );
         let (_child, pid) = start_vm(&vm_name, &[map], &mut started).await?;
 
         // The guest reads each file once, so it holds a size, an mtime and
         // pages for it before the host changes anything.
-        let before = wait_for_guest_to_follow(pid, &host_dir, GUEST_DIR, &FOLLOWED_FILES).await;
+        let before = wait_for_guest_to_follow(pid, &host_dir, guest_dir, &FOLLOWED_FILES).await;
         anyhow::ensure!(
             before.is_empty(),
             "the guest does not show the files as the host wrote them before boot:\n{}",
@@ -261,7 +281,7 @@ async fn test_read_only_map_follows_host_in_vm_and_clone() -> Result<()> {
         );
 
         write_version(&host_dir, 1)?;
-        let in_vm = wait_for_guest_to_follow(pid, &host_dir, GUEST_DIR, &FOLLOWED_FILES).await;
+        let in_vm = wait_for_guest_to_follow(pid, &host_dir, guest_dir, &FOLLOWED_FILES).await;
 
         // The snapshot holds what the guest cached of version 1. The host
         // writes version 2 before any clone exists.
@@ -276,13 +296,14 @@ async fn test_read_only_map_follows_host_in_vm_and_clone() -> Result<()> {
         started.push(clone_pid);
         common::poll_health_by_pid(clone_pid, 180).await?;
         let in_clone =
-            wait_for_guest_to_follow(clone_pid, &host_dir, GUEST_DIR, &FOLLOWED_FILES).await;
+            wait_for_guest_to_follow(clone_pid, &host_dir, guest_dir, &FOLLOWED_FILES).await;
 
         anyhow::ensure!(
             in_vm.is_empty() && in_clone.is_empty(),
-            "a read-only map does not follow the host.\n\
+            "a {} map does not follow the host.\n\
              running VM, {FOLLOW_LIMIT:?} after the host changed the files:\n{}\n\
              clone restored from a snapshot taken before the host changed them again:\n{}",
+            if read_only { "read-only" } else { "read-write" },
             in_vm.join("\n"),
             in_clone.join("\n")
         );

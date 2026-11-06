@@ -253,11 +253,12 @@ remove_dirs = [
 description = "Default fcvm guest kernel"
 kernel_version = "6.18.50"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "9f397af93a08"
+kernel_sha = "e157927b9f8f"
 build_inputs = [
     "kernel/default-arm64.build.toml",
     "kernel/default.conf",
     "kernel/patches-default/0001-virtio_ring-fix-infinite-loop-in-virtnet_poll_cleantx.patch",
+    "kernel/patches-default/0002-fuse-trust-server-attributes-without-writers.patch",
 ]
 kernel_config = "kernel/default.conf"
 # Applies every patch in kernel/patches-default, and build_inputs above names
@@ -269,12 +270,13 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 description = "Default fcvm guest kernel (x86_64)"
 kernel_version = "6.18.50"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "ce5378155114"
+kernel_sha = "2bf67c4be6a7"
 build_inputs = [
     "kernel/default-amd64.build.toml",
     "kernel/default-x86.conf",
     "kernel/patches-default-x86/0001-virtio_ring-fix-infinite-loop-in-virtnet_poll_cleantx.patch",
     "kernel/patches-default-x86/0002-x86-kvm-leave-the-async-pf-reason-for-the-fault-it-belongs-to.patch",
+    "kernel/patches-default-x86/0003-fuse-trust-server-attributes-without-writers.patch",
 ]
 kernel_config = "kernel/default-x86.conf"
 # Applies every patch in kernel/patches-default-x86 (the arm64 patches plus
@@ -428,7 +430,7 @@ cuda_checkpoint_sha256 = "707fa7f54136824d6c1d6dd724b9b1717610f831033c00d06da474
 description = "Nested virtualization support for running VMs inside VMs"
 kernel_version = "6.18.50"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "daca0ac45346"
+kernel_sha = "039882083eb2"
 
 # Build configuration - these files determine when kernel needs rebuilding
 # SHA is computed from contents of all files matching these patterns
@@ -482,7 +484,7 @@ build_inputs = [
 description = "Nested virtualization support for running VMs inside VMs (x86_64)"
 kernel_version = "6.18.50"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "087963bba9eb"
+kernel_sha = "ba32a646ca41"
 
 # Build configuration - these files determine when kernel needs rebuilding
 build_inputs = [
@@ -522,7 +524,7 @@ rootfs_type = "btrfs"
 description = "Kernel with FUSE and btrfs support for efficient container storage"
 kernel_version = "6.18.50"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "9f227940ab6e"
+kernel_sha = "aa276ba49bab"
 
 # The patches are build inputs: the build applies them, so the tag has to
 # change when one of them does.
@@ -547,7 +549,7 @@ rootfs_type = "btrfs"
 description = "Kernel with FUSE and btrfs support for efficient container storage (x86_64)"
 kernel_version = "6.18.50"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "247b2361148f"
+kernel_sha = "7bf42fe9216d"
 
 # The patches are build inputs: the build applies them, so the tag has to
 # change when one of them does.
