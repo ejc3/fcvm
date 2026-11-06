@@ -20,11 +20,16 @@ jobs:
     name: Build Runner AMI
     # Publishing affects every future runner. The environment requires owner
     # approval and permits main only; ordinary collaborator CI stays ungated.
+    # The image takes one release, the arm64 nested kernel (scripts/build-ami.sh
+    # runs `fcvm setup --kernel-profile nested ... --install-host-kernel`), so
+    # it waits for that release (the first step), not for every leg of Build
+    # Kernels to succeed: one failed x86_64 leg, or one dropped request in the
+    # run's release check, used to skip the image (#957).
     if: >-
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'workflow_dispatch' ||
        (github.event_name == 'workflow_run' &&
-        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.conclusion != 'cancelled' &&
         github.event.workflow_run.head_branch == 'main' &&
         github.event.workflow_run.head_repository.full_name == github.repository))
     environment: runner-ami-publish
@@ -38,6 +43,9 @@ jobs:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Check that the kernel the image downloads is published
+        run: python3 scripts/verify-kernel-releases.py --leg nested arm64
 
       - name: Check CI security contracts without AWS credentials
         run: make test-ci-security

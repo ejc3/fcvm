@@ -1,0 +1,9 @@
+# Immutable inputs for the published amd64 nested kernel artifact. This file is the
+# first build input, so changing the Firecracker base config, the fragment
+# path or the patch directory renames the release.
+# Bump build_spec whenever the generated kernel build procedure changes in a
+# way that can change vmlinux bytes.
+build_spec = 1
+base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/7614ab4d258ad66eee72a34f2fbf3712c3664c65/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
+kernel_config = "kernel/nested-x86.conf"
+patches_dir = "kernel/patches-x86"

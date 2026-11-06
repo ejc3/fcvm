@@ -170,6 +170,12 @@ pub struct KernelProfile {
     #[serde(default)]
     pub kernel_sha: Option<String>,
 
+    /// `false` for a table no job publishes a release of (a GPU or experiment
+    /// kernel): setup then builds it with --build-kernels and never asks GitHub
+    /// for a release that does not exist. Absent means published.
+    #[serde(default)]
+    pub published: Option<bool>,
+
     /// Base config URL for VM kernel (Firecracker's microvm config)
     /// {arch} is replaced with aarch64 or x86_64 at build time
     #[serde(default)]
@@ -245,6 +251,11 @@ pub struct HostKernelConfig {
 
 impl KernelProfile {
     /// Check if this profile builds a custom kernel from source
+    /// Whether a release of this table is published for setup to download.
+    pub fn is_published(&self) -> bool {
+        self.published != Some(false)
+    }
+
     pub fn is_custom(&self) -> bool {
         !self.kernel_version.is_empty() && !self.kernel_repo.is_empty()
     }

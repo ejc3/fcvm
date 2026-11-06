@@ -96,9 +96,21 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
     // Ordinary setup downloads the released default artifact. Any source-kernel
     // release job can bootstrap it locally with --build-kernels when the release
     // is not published yet; the per-artifact flock serializes concurrent setup.
-    let kernel_path = crate::setup::ensure_kernel("default", true, args.build_kernels)
-        .await
-        .context("setting up kernel")?;
+    //
+    // A forced rebuild of the default profile itself must not fetch it first: the
+    // fetch would take a file a runner kept from an earlier job, or fail where no
+    // release exists yet, before the rebuild it was asked for (#957).
+    let rebuilds_default =
+        rebuilds_the_default_kernel(args.force_build_kernels, args.kernel_profile.as_deref());
+    let kernel_path = if rebuilds_default {
+        crate::setup::rebuild_kernel_from_source("default")
+            .await
+            .context("rebuilding the default kernel from source")?
+    } else {
+        crate::setup::ensure_kernel("default", true, args.build_kernels)
+            .await
+            .context("setting up kernel")?
+    };
     println!("  ✓ Kernel ready: {}", kernel_path.display());
 
     // Build the pinned pasta if configured in [pasta] section (rootless
@@ -135,7 +147,9 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         // Download or build the profile kernel. --force-build-kernels bypasses
         // the download so a release refresh cannot republish the artifact it
         // was asked to replace.
-        let profile_kernel_path = if args.force_build_kernels {
+        let profile_kernel_path = if rebuilds_default {
+            kernel_path.clone()
+        } else if args.force_build_kernels {
             crate::setup::rebuild_kernel_from_source(profile_name)
                 .await
                 .context("rebuilding profile kernel from source")?
@@ -193,4 +207,24 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
     println!("\nSetup complete! You can now run VMs with: fcvm podman run ...");
 
     Ok(())
+}
+
+/// Whether setup rebuilds the default kernel from source in place of fetching it:
+/// only when it was asked to force-build the default profile itself.
+fn rebuilds_the_default_kernel(force_build_kernels: bool, kernel_profile: Option<&str>) -> bool {
+    force_build_kernels && kernel_profile == Some("default")
+}
+
+#[cfg(test)]
+mod default_kernel_tests {
+    use super::rebuilds_the_default_kernel;
+
+    #[test]
+    fn a_forced_default_release_build_rebuilds_instead_of_fetching() {
+        assert!(rebuilds_the_default_kernel(true, Some("default")));
+        assert!(!rebuilds_the_default_kernel(false, Some("default")));
+        // Another profile's forced rebuild still fetches the default kernel it boots.
+        assert!(!rebuilds_the_default_kernel(true, Some("nested")));
+        assert!(!rebuilds_the_default_kernel(true, None));
+    }
 }

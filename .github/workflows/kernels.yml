@@ -55,23 +55,6 @@ jobs:
           # that code can read it; the release steps scope GH_TOKEN themselves.
           persist-credentials: false
 
-      - uses: ./fcvm/.github/actions/checkout-deps
-
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-      - name: Install build dependencies
-        run: |
-          ./fcvm/scripts/ci-apt-get.sh update
-          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libseccomp-dev libclang-dev clang musl-tools
-
-      - name: Build fcvm and fc-agent
-        working-directory: fcvm
-        run: |
-          make build
-
       - name: Compute and verify release identity
         id: kernel
         working-directory: fcvm
@@ -116,16 +99,35 @@ jobs:
             exit 1
           fi
 
+      - uses: ./fcvm/.github/actions/checkout-deps
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+
+      - name: Install Rust
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install build dependencies
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        run: |
+          ./fcvm/scripts/ci-apt-get.sh update
+          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libseccomp-dev libclang-dev clang musl-tools
+
+      - name: Build fcvm and fc-agent
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        working-directory: fcvm
+        run: |
+          make build
+
       - name: Build kernel using fcvm
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
         working-directory: fcvm
         env:
-          # A forced rebuild has to discard the cached content-addressed file, or
-          # `fcvm setup` returns immediately and the release step republishes the very
-          # artifact the operator asked to replace. The Make target owns that, along
-          # with btrfs setup and config synchronisation.
+          # The Make target always rebuilds from source, so a file a runner kept
+          # under this name, or the release a forced rebuild replaces, is never
+          # what gets published. It also owns btrfs setup and config sync.
           KERNEL_FILE: ${{ steps.kernel.outputs.filename }}
-          FORCE: ${{ inputs.force_build == true && '1' || '0' }}
         run: |
           make release-default-kernel
 
@@ -213,26 +215,6 @@ jobs:
           # that code can read it; the release steps scope GH_TOKEN themselves.
           persist-credentials: false
 
-      - uses: ./fcvm/.github/actions/checkout-deps
-
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-      - name: Install build dependencies
-        run: |
-          ./fcvm/scripts/ci-apt-get.sh update
-          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libseccomp-dev libclang-dev clang musl-tools
-
-      - name: Build fcvm and fc-agent
-        working-directory: fcvm
-        run: |
-          make build-host-tools
-          # Sync the checkout's embedded config to the runner user's config dir so the
-          # kernel build below uses this checkout, not stale per-runner state.
-          ./target/release/fcvm setup --generate-config --force
-
       - name: Compute and verify release identity
         id: kernel
         working-directory: fcvm
@@ -285,6 +267,30 @@ jobs:
             echo "::error::cannot determine whether release $TAG exists (rc=$RC): $OUT"
             exit 1
           fi
+
+      - uses: ./fcvm/.github/actions/checkout-deps
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+
+      - name: Install Rust
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install build dependencies
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        run: |
+          ./fcvm/scripts/ci-apt-get.sh update
+          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libseccomp-dev libclang-dev clang musl-tools
+
+      - name: Build fcvm and fc-agent
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        working-directory: fcvm
+        run: |
+          make build-host-tools
+          # Sync the checkout's embedded config to the runner user's config dir so the
+          # kernel build below uses this checkout, not stale per-runner state.
+          ./target/release/fcvm setup --generate-config --force
 
       - name: Setup btrfs for fcvm
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
@@ -490,26 +496,6 @@ jobs:
           # that code can read it; the release steps scope GH_TOKEN themselves.
           persist-credentials: false
 
-      - uses: ./fcvm/.github/actions/checkout-deps
-
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-      - name: Install build dependencies
-        run: |
-          ./fcvm/scripts/ci-apt-get.sh update
-          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libseccomp-dev libclang-dev clang musl-tools
-
-      - name: Build fcvm and fc-agent
-        working-directory: fcvm
-        run: |
-          make build-host-tools
-          # Sync the checkout's embedded config to the runner user's config dir so the
-          # kernel build below uses this checkout, not stale per-runner state.
-          ./target/release/fcvm setup --generate-config --force
-
       - name: Compute and verify release identity
         id: kernel
         working-directory: fcvm
@@ -562,6 +548,30 @@ jobs:
             echo "::error::cannot determine whether release $TAG exists (rc=$RC): $OUT"
             exit 1
           fi
+
+      - uses: ./fcvm/.github/actions/checkout-deps
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+
+      - name: Install Rust
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install build dependencies
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        run: |
+          ./fcvm/scripts/ci-apt-get.sh update
+          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libseccomp-dev libclang-dev clang musl-tools
+
+      - name: Build fcvm and fc-agent
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        working-directory: fcvm
+        run: |
+          make build-host-tools
+          # Sync the checkout's embedded config to the runner user's config dir so the
+          # kernel build below uses this checkout, not stale per-runner state.
+          ./target/release/fcvm setup --generate-config --force
 
       - name: Setup btrfs for fcvm
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true

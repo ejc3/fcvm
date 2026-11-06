@@ -239,7 +239,7 @@ fn kernel_workflow_builds_and_releases_default_for_both_runner_arches() {
     // whatever kernel a bare `setup` happens to produce.
     let recipe = makefile_recipe("release-default-kernel");
     assert!(
-        recipe.contains("setup --kernel-profile default --build-kernels"),
+        recipe.contains("setup --kernel-profile default --force-build-kernels"),
         "release-default-kernel no longer builds the default profile; recipe is:\n{recipe}"
     );
 }
@@ -327,23 +327,29 @@ fn every_kernel_workflow_job_installs_what_setup_links() {
     assert_eq!(building, names[..3], "the jobs that build a kernel changed");
     for name in building {
         let steps = workflow["jobs"][name]["steps"].as_sequence().unwrap();
+        // Commands, not comments: the identity step, which runs first, explains
+        // itself in terms of `fcvm setup`.
+        let runs = |step: &YamlValue, command: &str| {
+            run_script(step)
+                .lines()
+                .any(|line| !line.trim_start().starts_with('#') && line.contains(command))
+        };
         let setup = steps
             .iter()
-            .position(|step| {
-                run_script(step).contains("fcvm setup")
-                    || run_script(step).contains("make release-default-kernel")
-            })
+            .position(|step| runs(step, "fcvm setup") || runs(step, "make release-default-kernel"))
             .unwrap_or_else(|| panic!("job `{name}` no longer runs setup"));
-        // Only a step that always runs, before setup does, provides the package.
+        // Only a step that runs whenever setup does, before it, provides the package:
+        // one with no condition, or with the setup step's own.
+        let setup_condition = steps[setup].get("if");
         let installed: std::collections::BTreeSet<String> = steps[..setup]
             .iter()
-            .filter(|step| step.get("if").is_none())
+            .filter(|step| step.get("if").is_none() || step.get("if") == setup_condition)
             .flat_map(|step| apt_packages(run_script(step)))
             .collect();
         assert!(
             installed.contains("libseccomp-dev"),
-            "job `{name}` runs fcvm setup, which builds Firecracker, and no unconditional step \
-             before it installs libseccomp-dev; those steps install: {installed:?}"
+            "job `{name}` runs fcvm setup, which builds Firecracker, and no step that runs \
+             whenever it does installs libseccomp-dev first; those steps install: {installed:?}"
         );
     }
 }
@@ -837,9 +843,9 @@ const BUILD_OR_FORCE: &str = "steps.check.outputs.exists == 'false' || inputs.fo
 /// a function that logs the setup command. They do not read `force_build`: the
 /// step's `if:` decides whether it runs, and whenever it runs it builds from
 /// source. The default job hands the build to `make release-default-kernel`,
-/// which forces only under FORCE=1: the recipe then passes
-/// `--force-build-kernels` without `--build-kernels`, and setup cannot fetch a
-/// default kernel that has no release yet without permission to build it.
+/// which always passes `--force-build-kernels`; for the default profile itself
+/// setup then rebuilds in place of its first fetch (`rebuilds_the_default_kernel`
+/// in src/commands/setup.rs), so it needs no `--build-kernels` (#957).
 #[test]
 fn a_kernel_build_step_always_builds_from_source() {
     let workflow = kernels_workflow();
@@ -864,17 +870,21 @@ fn a_kernel_build_step_always_builds_from_source() {
         let script = run_script(step);
 
         if profile == "default" {
-            assert_eq!(
-                step["env"]["FORCE"].as_str(),
-                Some("${{ inputs.force_build == true && '1' || '0' }}"),
-                "job `{name}` no longer passes force_build to make as FORCE"
-            );
             let recipe = makefile_recipe("release-default-kernel");
+            let setups: Vec<&str> = recipe
+                .lines()
+                .filter(|line| line.contains("fcvm setup --kernel-profile"))
+                .collect();
             assert!(
-                recipe.contains("if [ \"$(FORCE)\" = \"1\" ]; then")
-                    && recipe.contains("setup --kernel-profile default --force-build-kernels"),
-                "release-default-kernel no longer turns FORCE=1 into --force-build-kernels; \
+                !setups.is_empty()
+                    && setups.iter().all(|line| line.contains("--kernel-profile default --force-build-kernels")),
+                "release-default-kernel must always rebuild the default kernel from source, or \
+                 a file a runner kept under the release's name is what gets published; \
                  recipe is:\n{recipe}"
+            );
+            assert!(
+                !recipe.contains("$(FORCE)"),
+                "release-default-kernel must not rebuild only under FORCE; recipe is:\n{recipe}"
             );
             continue;
         }
@@ -1376,6 +1386,18 @@ kernel_repo = "example/kernels"
     );
     assert_eq!(client("bare"), "000000000000");
 
+    // Every published table carries the kernel_sha an installed binary names its
+    // release by, so give each one what the client computed.
+    let mut pinned = tables.clone();
+    for name in ["dotted", "ordered", "bare"] {
+        let header = format!("[kernel_profiles.{name}.{arch}]\n");
+        pinned = pinned.replace(
+            &header,
+            &format!("{header}kernel_sha = \"{}\"\n", client(name)),
+        );
+    }
+    std::fs::write(fixture.path().join("rootfs-config.toml"), pinned).unwrap();
+
     for name in ["dotted", "ordered", "bare"] {
         let sha = client(name);
         let run = run_identity_script(fixture.path(), name, arch, machine);
@@ -1515,12 +1537,12 @@ description = "runtime settings only"
     );
 }
 
-/// An installed binary has no `kernel/` tree to hash, so it finds the default
-/// release only through the table's `kernel_sha`. The default job's own step
-/// failed on a table without one, and the shared script has to as well. Only
-/// the default profile: the nested and btrfs tables carry no `kernel_sha`.
+/// An installed binary has no `kernel/` tree to hash, so it finds a release only
+/// through the table's `kernel_sha`. The default job's own step failed on a
+/// table without one, and the shared script refuses one for every profile: the
+/// nested and btrfs tables without it failed an installed binary (#957).
 #[test]
-fn a_default_table_without_kernel_sha_is_refused() {
+fn a_published_table_without_kernel_sha_is_refused() {
     let arch = host_config_arch();
     let machine = runtime_arch_of(arch);
     let source = "kernel_version = \"1.2.3\"\nkernel_repo = \"example/kernels\"\n\
@@ -1542,7 +1564,12 @@ fn a_default_table_without_kernel_sha_is_refused() {
         "refused for some other reason:\n{said}"
     );
     let run = run_identity_script(bare.path(), "other", arch, machine);
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let said = run.stderr.clone();
+    assert_refused("another table with no kernel_sha", run);
+    assert!(
+        said.contains("kernel_sha"),
+        "refused for some other reason:\n{said}"
+    );
 
     // The control: the same default table with its kernel_sha publishes.
     let pinned = identity_fixture(
@@ -2169,6 +2196,7 @@ fn run_release_check_at(root: &Path, base_url: &str) -> StepRun {
     command
         .arg(root.join(VERIFY_SCRIPT))
         .args(["--base-url", base_url])
+        .env("FCVM_RELEASE_CHECK_RETRY_DELAY", "0")
         .current_dir("/");
     for proxy in [
         "http_proxy",
@@ -2347,15 +2375,13 @@ fn the_release_check_fails_a_leg_whose_identity_it_cannot_derive() {
                  kernel_repo = \"example/kernels\"\n\
                  build_inputs = [\"inputs/a.conf\"]\n"
             ));
-            if profile == "default" {
-                // The arm64 default table carries a kernel_sha its inputs do not hash to.
-                let manifest = if arch == "arm64" {
-                    "000000000000"
-                } else {
-                    sha.as_str()
-                };
-                tables.push_str(&format!("kernel_sha = \"{manifest}\"\n"));
-            }
+            // The arm64 default table carries a kernel_sha its inputs do not hash to.
+            let manifest = if profile == "default" && arch == "arm64" {
+                "000000000000"
+            } else {
+                sha.as_str()
+            };
+            tables.push_str(&format!("kernel_sha = \"{manifest}\"\n"));
             tables.push('\n');
             answers.insert(
                 format!(
@@ -2508,4 +2534,261 @@ fn shipped_guest_kernels_applying(fix: &str) -> Vec<(String, bool)> {
             (format!("{profile_name}.{arch}"), applies)
         })
         .collect()
+}
+
+/// #957: a leg with nothing to build used to spend 167 to 298 s installing Rust
+/// and apt packages and building the host tools before it asked whether its
+/// release existed. The identity and the release check need only python3, gh
+/// and the checkout, so they run first, and every install and build step waits
+/// for their answer.
+#[test]
+fn every_kernel_leg_checks_for_its_release_before_installing_anything() {
+    let workflow = kernels_workflow();
+    let mut legs = 0usize;
+    for (name, job) in kernel_build_jobs(&workflow) {
+        let steps = job_steps(name, job);
+        let check = steps
+            .iter()
+            .position(|step| step["id"].as_str() == Some("check"))
+            .unwrap_or_else(|| panic!("job `{name}` has no step with id `check`"));
+        let label = |step: &YamlValue| {
+            step["name"]
+                .as_str()
+                .or_else(|| step["uses"].as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        for step in &steps[..check] {
+            let label = label(step);
+            assert!(
+                label == "Fix workspace permissions (pre-checkout)"
+                    || label.starts_with("actions/checkout@")
+                    || step["id"].as_str() == Some("kernel")
+                    || label == "Install GitHub CLI",
+                "job `{name}` runs `{label}` before it knows whether its release exists"
+            );
+        }
+        for step in &steps[check + 1..] {
+            let label = label(step);
+            let script = run_script(step);
+            let installs_or_builds = label.contains("checkout-deps")
+                || script.contains("rustup.rs")
+                || script.contains("ci-apt-get.sh install")
+                || script.contains("make build");
+            if installs_or_builds {
+                assert_eq!(
+                    step["if"].as_str(),
+                    Some(BUILD_OR_FORCE),
+                    "job `{name}` runs `{label}` even when its release already exists"
+                );
+            }
+        }
+        legs += 1;
+    }
+    assert_eq!(legs, 3, "expected the default, nested and btrfs jobs");
+}
+
+/// #957: the nested and btrfs tables took their Firecracker base config from
+/// upstream main, outside every build input, so a change there changed what a
+/// build produced under an unchanged tag, and the release check found the old
+/// release and skipped the rebuild. Every published table now names a recipe as
+/// its first build input that pins the base config to a commit and repeats the
+/// fragment and patch directory the table uses.
+#[test]
+fn every_published_kernel_hashes_a_recipe_with_an_immutable_base_config() {
+    let root = repo_root();
+    let config = rootfs_config();
+    let legs = published_kernel_legs(&kernels_workflow());
+    assert!(
+        legs.len() >= 6,
+        "expected six published legs, found {legs:?}"
+    );
+    let commit_url = |url: &str| {
+        let Some(rest) =
+            url.strip_prefix("https://raw.githubusercontent.com/firecracker-microvm/firecracker/")
+        else {
+            return false;
+        };
+        let commit = rest.split('/').next().unwrap_or("");
+        commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit())
+    };
+    for (profile, arch) in &legs {
+        let table = &config["kernel_profiles"][profile.as_str()][arch.as_str()];
+        let first = table["build_inputs"][0].as_str().unwrap_or("");
+        assert_eq!(
+            first,
+            format!("kernel/{profile}-{arch}.build.toml"),
+            "{profile}.{arch} must hash its build recipe first"
+        );
+        let recipe: toml::Value =
+            toml::from_str(&std::fs::read_to_string(root.join(first)).unwrap()).unwrap();
+        assert_eq!(recipe["build_spec"].as_integer(), Some(1), "{first}");
+        for key in ["base_config_url", "kernel_config", "patches_dir"] {
+            assert_eq!(
+                table[key].as_str(),
+                recipe[key].as_str(),
+                "{profile}.{arch} {key} differs from {first}, so the hashed recipe does not \
+                 describe the build"
+            );
+        }
+        let url = table["base_config_url"].as_str().unwrap_or("");
+        assert!(
+            commit_url(url),
+            "{profile}.{arch} base_config_url must name a Firecracker commit, got {url}"
+        );
+    }
+    // Tables no job publishes are built locally from the same kind of source.
+    for (profile_name, arch, profile) in source_built_tables(&config) {
+        if let Some(url) = profile.base_config_url.as_deref() {
+            assert!(
+                commit_url(url),
+                "{profile_name}.{arch} base_config_url must name a Firecracker commit, got {url}"
+            );
+        }
+    }
+}
+
+/// #957: a table that names a kernel_repo made `fcvm setup` ask for a release,
+/// and no job published the mountinfo, gpu or phone kernels, so setup without
+/// --build-kernels asked for a release that does not exist. A table is either
+/// built by a kernels.yml leg, or says `published = false`, which makes setup
+/// build it and never ask.
+#[test]
+fn every_kernel_table_is_published_by_a_leg_or_says_it_is_not() {
+    let config = rootfs_config();
+    let legs = published_kernel_legs(&kernels_workflow());
+    let mut wrong = Vec::new();
+    for (profile_name, arch, profile) in source_built_tables(&config) {
+        let leg = legs.contains(&(profile_name.clone(), arch.clone()));
+        if leg != profile.is_published() {
+            wrong.push(format!(
+                "{profile_name}.{arch}: a kernels.yml leg builds it: {leg}, published: {}",
+                profile.is_published()
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// #957: a binary with no source checkout beside it names a release only from
+/// `kernel_sha`, and only the default tables carried one, so an installed
+/// binary failed on nested and btrfs before it asked for the release. Every
+/// published table carries it, and the identity script refuses one without it.
+#[test]
+fn every_published_kernel_table_records_its_kernel_sha() {
+    let root = repo_root();
+    let config = rootfs_config();
+    for (profile_name, arch) in published_kernel_legs(&kernels_workflow()) {
+        let profile = kernel_profile_table(&config, &profile_name, &arch);
+        let computed = compute_profile_kernel_sha_at_root(
+            &KernelProfile {
+                kernel_sha: None,
+                ..profile.clone()
+            },
+            Some(&root),
+        )
+        .unwrap();
+        assert_eq!(
+            profile.kernel_sha.as_deref(),
+            Some(computed.as_str()),
+            "set kernel_sha = \"{computed}\" in [kernel_profiles.{profile_name}.{arch}] (the \
+             first 12 hex digits of SHA-256 over its build_inputs; \
+             `python3 scripts/kernel-release-identity.py {profile_name} {arch}` on that \
+             architecture prints it)"
+        );
+    }
+}
+
+/// A release host whose answer for a path changes with each request: the n-th
+/// request for `path` gets `answers[path][n]`, and the last one after that.
+fn release_host_sequence(answers: BTreeMap<String, Vec<String>>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut served: BTreeMap<String, usize> = BTreeMap::new();
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            if reader.read_line(&mut request).is_err() {
+                continue;
+            }
+            loop {
+                let mut header = String::new();
+                match reader.read_line(&mut header) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) if header == "\r\n" => break,
+                    Ok(_) => {}
+                }
+            }
+            let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+            let response = match answers.get(&path) {
+                Some(sequence) => {
+                    let n = served.entry(path).or_default();
+                    let answer = sequence[(*n).min(sequence.len() - 1)].clone();
+                    *n += 1;
+                    answer
+                }
+                None => http_answer("404 Not Found", ""),
+            };
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+/// #957: two dropped requests in a row failed the run's release check, and with
+/// it the runner image, while every kernel was published. The check asks up to
+/// four times.
+#[test]
+fn the_release_check_outlasts_two_dropped_requests() {
+    let assets = published_assets();
+    let mut answers: BTreeMap<String, Vec<String>> = all_found(&assets)
+        .into_iter()
+        .map(|(path, answer)| (path, vec![answer]))
+        .collect();
+    let (_, flaky) = &assets[&("nested".to_string(), "arm64".to_string())];
+    let failed = http_answer("502 Bad Gateway", "");
+    answers.insert(flaky.clone(), vec![failed.clone(), failed, found_answer()]);
+    let run = run_release_check(&release_host_sequence(answers));
+    assert_eq!(run.code, Some(0), "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(lines_with(&run, "present").len(), assets.len());
+}
+
+/// #957: Build Runner AMI ran only after a fully successful Build Kernels run,
+/// so one failed x86_64 leg skipped the arm64 image. It now starts on any run
+/// that was not cancelled and first checks the one release it takes.
+#[test]
+fn the_runner_image_waits_for_its_own_kernel_not_the_whole_run() {
+    let path = repo_root().join(".github/workflows/build-runner-ami.yml");
+    let workflow: YamlValue =
+        serde_norway::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let job = &workflow["jobs"]["build-ami"];
+    let condition = job["if"].as_str().unwrap();
+    assert!(
+        condition.contains("github.event.workflow_run.conclusion != 'cancelled'")
+            && !condition.contains("conclusion == 'success'"),
+        "build-ami must start on every finished Build Kernels run: {condition}"
+    );
+    let steps = job["steps"].as_sequence().unwrap();
+    let check = steps
+        .iter()
+        .position(|step| {
+            run_script(step).trim()
+                == "python3 scripts/verify-kernel-releases.py --leg nested arm64"
+        })
+        .expect("build-ami checks the arm64 nested release it downloads");
+    let build = steps
+        .iter()
+        .position(|step| run_script(step).contains("scripts/build-ami.sh"))
+        .expect("build-ami runs scripts/build-ami.sh");
+    assert!(
+        check < build,
+        "the release check must come before the image build"
+    );
+    let ami = std::fs::read_to_string(repo_root().join("scripts/build-ami.sh")).unwrap();
+    assert!(
+        ami.contains("fcvm setup --kernel-profile nested"),
+        "scripts/build-ami.sh no longer takes the nested kernel; check another leg"
+    );
 }
