@@ -75,6 +75,11 @@ pub struct PastaConfig {
     /// Pinned upstream commit (full SHA). A commit — not a branch — so the
     /// content-addressed binary path is computable offline.
     pub commit: String,
+    /// SHA-256 of the pinned commit's source archive (passt.top's snapshot).
+    pub archive_sha256: String,
+    /// Where that archive can be downloaded, tried in order. Any copy that
+    /// matches `archive_sha256` is the same source.
+    pub archives: Vec<String>,
 }
 
 /// Default Firecracker build configuration.
