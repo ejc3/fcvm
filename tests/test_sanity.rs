@@ -949,7 +949,7 @@ async fn test_failed_prepare_keeps_the_container_output() -> Result<()> {
     let started = SystemTime::now();
     // Prepare is the snapshot lifecycle, which the SnapshotDisabled lane switches off with
     // FCVM_NO_SNAPSHOT (prepare then refuses to run); opt back in so the test means the same in every lane.
-    let (mut child, _pid, _log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+    let (mut child, _pid, log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
         &[
             "podman",
             "prepare",
@@ -1004,6 +1004,24 @@ async fn test_failed_prepare_keeps_the_container_output() -> Result<()> {
         text.contains(&format!("stderr: {marker}-err")),
         "{}: {text}",
         path.display()
+    );
+
+    // The error names the container's exit code and that file, and ends with the output.
+    common::wait_for_log_eof(&log, Duration::from_secs(10)).await?;
+    let printed = std::fs::read_to_string(&log)?;
+    let names_the_file = format!("(the output fcvm kept is in {})", path.display());
+    let after = printed
+        .find(&names_the_file)
+        .map(|at| &printed[at..])
+        .with_context(|| format!("the prepare's error does not name {}", path.display()))?;
+    assert!(
+        after.contains(&format!("stdout: {marker}-out"))
+            && after.contains(&format!("stderr: {marker}-err")),
+        "the error does not end with the container's output: {after}"
+    );
+    assert!(
+        printed.contains("the container exited with code 1"),
+        "the error does not name the container's exit code: {printed}"
     );
     let _ = std::fs::remove_file(&path);
     Ok(())
