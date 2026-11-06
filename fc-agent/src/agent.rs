@@ -176,6 +176,10 @@ pub async fn run() -> Result<()> {
     let exec_rebind_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let exec_rebind_done_notify = std::sync::Arc::new(tokio::sync::Notify::new());
 
+    // The NFS shares the boot mounts, with their mount IDs, for the restore to remount.
+    let nfs_mounts: std::sync::Arc<std::sync::OnceLock<Vec<mounts::MountedNfsShare>>> =
+        std::sync::Arc::default();
+
     // Start the restore-epoch watcher for the active transport: Firecracker polls MMDS,
     // Cloud Hypervisor polls the host's boot-plan vsock port (#632 P2). Both call
     // handle_clone_restore identically when a restore-epoch appears.
@@ -189,7 +193,7 @@ pub async fn run() -> Result<()> {
             exec_rebind_done_notify: exec_rebind_done_notify.clone(),
             egress_gen_rx: egress_gen_rx.clone(),
             vsock_reset_rx,
-            nfs_mounts: plan.nfs_mounts.clone(),
+            nfs_mounts: nfs_mounts.clone(),
         };
         tokio::spawn(async move {
             eprintln!("[fc-agent] starting restore-epoch watcher ({transport:?})");
@@ -297,6 +301,8 @@ pub async fn run() -> Result<()> {
             .context("mounting NFS shares")?;
         eprintln!("[fc-agent] NFS shares mounted successfully");
     }
+    let _ = nfs_mounts
+        .set(mounts::record_nfs_mounts(&plan.nfs_mounts).context("recording the NFS mounts")?);
 
     // Start lock test watcher if shared volume exists
     if has_shared_volume {
