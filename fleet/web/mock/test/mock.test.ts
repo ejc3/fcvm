@@ -770,6 +770,31 @@ describe("mock phones", () => {
     for (const x of [a, b, c]) x.ws.close();
   });
 
+  it("refuses claim_gpu and claim_phone from a viewer admitted late, with the coordinator's reason, and records nothing", async () => {
+    await settle();
+    await admin("/mock/broadcast", { url: "https://broadcast.example/playback.m3u8", late: true });
+    const late = await live();
+    await admin("/mock/broadcast", { url: "https://broadcast.example/playback.m3u8", late: false });
+    const seated = await live();
+    try {
+      const actions = () => (coord.fleetState() as unknown as { actions: unknown[] }).actions.length;
+      const before = actions();
+      // The coordinator's own reason (src/fleet/coord/live.rs LATE_CLAIM), answered before the intent is applied (version 0).
+      const reason = /pub const LATE_CLAIM: &str =\s*"([^"]+)";/.exec(readFileSync("../../src/fleet/coord/live.rs", "utf8"))?.[1];
+      expect(reason).toBeDefined();
+      expect(await send(late, "claim_gpu")).toMatchObject({ outcome: "refused", reason, version: 0 });
+      expect(await send(late, "claim_phone")).toMatchObject({ outcome: "refused", reason, version: 0 });
+      expect(actions()).toBe(before);
+      expect(phonesNow().tiles.every((t) => t.borrowed === null)).toBe(true);
+      // A seated viewer still borrows a phone.
+      expect(await send(seated, "claim_phone")).toMatchObject({ outcome: "committed" });
+    } finally {
+      late.ws.close();
+      seated.ws.close();
+      await admin("/mock/broadcast", { url: null });
+    }
+  });
+
   it("takes only the enumerated actions, from the holder, one a second", async () => {
     await settle();
     const a = await live();

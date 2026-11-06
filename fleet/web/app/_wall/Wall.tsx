@@ -671,14 +671,17 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
 
   // ---- keyboard grid -------------------------------------------------------------------
 
-  const order = useMemo(() => readingOrder(state.accepted?.tiles ?? []), [state.accepted]);
-  const keyTarget = state.ui.keyId ?? order[0]?.id ?? null;
+  // The tiles drawn: in broadcast mode, the frame on screen's (as the pointer and the zoom use).
+  const gridTiles = shown.state.accepted?.tiles;
+  const order = useMemo(() => readingOrder(gridTiles ?? []), [gridTiles]);
+  // The focused tile, while the grid has it (a tile that left the picture took its button).
+  const keyTarget = (state.ui.keyId !== null && order.some((t) => t.id === state.ui.keyId) ? state.ui.keyId : order[0]?.id) ?? null;
   const onGridKey = (e: React.KeyboardEvent, id: string) => {
     const dirs: Record<string, Direction> = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
     const dir = dirs[e.key];
     if (!dir) return;
     e.preventDefault();
-    const tiles = state.accepted?.tiles ?? [];
+    const tiles = gridTiles ?? [];
     const from = tiles.find((t) => t.id === id);
     const to = from ? neighbour(tiles, from, dir) : null;
     if (to) gridRefs.current.get(to.id)?.focus();
