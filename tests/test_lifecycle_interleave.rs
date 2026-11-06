@@ -3051,3 +3051,219 @@ async fn test_lifecycle_interleave_restore_removes_a_recreated_source_dir() -> R
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// CASE: sigterm_while_waiting_for_the_vm_snapshot_lock
+// ---------------------------------------------------------------------------
+
+/// Hold `path`'s exclusive flock, as a `fcvm snapshot create` of the same VM does for as long
+/// as its pause and save take. Blocks while another holder has it.
+fn hold_vm_snapshot_lock(path: &Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    // SAFETY: `file` is an open descriptor for the whole call.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    anyhow::ensure!(
+        rc == 0,
+        "flock {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+    Ok(file)
+}
+
+/// The `snapshot.lock` of the VM that `pid` runs, once its state names a VM id.
+async fn vm_snapshot_lock_path(pid: u32) -> Result<PathBuf> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if let Some(state) = ls_vm_by_pid(pid).await? {
+            return Ok(fcvm::paths::vm_runtime_dir(&state.vm_id).join("snapshot.lock"));
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "no state for fcvm pid {pid} within 120s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Pins #1075: a `podman run` whose pre-start snapshot waits for the per-VM snapshot lock
+/// stops when it is told to, instead of waiting for the holder first. The run is held at
+/// `snapshot.create.locked` (it has the generation lock and not yet the per-VM one), the
+/// test takes the per-VM lock as a `fcvm snapshot create` of the VM would, proves the run
+/// is still inside the hold, and sends SIGTERM once the hold ends. The run must exit while
+/// the test still holds the lock. Before the fix the lock wait was polled with nothing
+/// else, so the run sat in it until the lock was given back.
+#[tokio::test]
+async fn test_lifecycle_interleave_sigterm_while_the_pre_start_snapshot_waits_for_the_vm_lock(
+) -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("ilv-snaplock");
+    // Unique cmd, unique snapshot key: this run creates the pre-start snapshot.
+    let script = format!("echo boot-{}; exec sleep 300", vm_name);
+    let (mut child, pid, vm_log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            common::ALPINE_IMAGE,
+            "sh",
+            "-c",
+            &script,
+        ],
+        &[("FCVM_FAILPOINT", "snapshot.create.locked:sleep:10000")],
+    )
+    .await?;
+
+    let reached_at = wait_for_marker(
+        &vm_log,
+        "FAILPOINT snapshot.create.locked reached",
+        0,
+        Duration::from_secs(300),
+    )
+    .await?;
+    let lock_path = vm_snapshot_lock_path(pid).await?;
+    let holder = hold_vm_snapshot_lock(&lock_path)?;
+    anyhow::ensure!(
+        search_log_from(
+            &vm_log,
+            "FAILPOINT snapshot.create.locked released",
+            reached_at
+        )
+        .is_none(),
+        "the hold ended before the test held the per-VM snapshot lock, so the run may have \
+         taken it first; log tail:\n{}",
+        log_tail(&vm_log, 40)
+    );
+    let released_at = wait_for_marker(
+        &vm_log,
+        "FAILPOINT snapshot.create.locked released",
+        reached_at,
+        Duration::from_secs(30),
+    )
+    .await?;
+    // The run is in the per-VM lock's wait.
+    wait_for_marker(
+        &vm_log,
+        "waiting for per-VM snapshot lock",
+        released_at,
+        Duration::from_secs(30),
+    )
+    .await?;
+    sigterm(pid).await;
+
+    let exited = wait_exit(&mut child, Duration::from_secs(30)).await;
+    // Give the lock back either way, so a run that is still waiting can finish its teardown.
+    drop(holder);
+    if exited.is_err() {
+        let _ = wait_exit(&mut child, Duration::from_secs(120)).await;
+    }
+    let cleaned = cleanup_pre_start_key(&vm_log).await;
+    let status = exited.with_context(|| {
+        format!(
+            "fcvm did not exit within 30s of SIGTERM while its pre-start snapshot waited for \
+             the per-VM snapshot lock; log tail:\n{}",
+            log_tail(&vm_log, 40)
+        )
+    })?;
+    println!("fcvm exited after SIGTERM with {status:?}");
+    anyhow::ensure!(
+        !log_contains(&vm_log, "Pre-start snapshot created successfully"),
+        "the run took its pre-start snapshot after SIGTERM; log tail:\n{}",
+        log_tail(&vm_log, 40)
+    );
+    cleaned
+}
+
+/// Pins #1075's second wait: a `--free-page-reporting` run checks its balloon at the guest's
+/// first cache request, under the per-VM snapshot lock. With the test holding that lock
+/// before the guest asks, a SIGTERM must end the run while the lock is still held.
+/// `--no-snapshot` keeps the run out of the cache, so the check is the only thing the request
+/// arm waits for.
+#[tokio::test]
+async fn test_lifecycle_interleave_sigterm_while_the_balloon_check_waits_for_the_vm_lock(
+) -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("ilv-fprlock");
+    let (mut child, pid, vm_log) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--no-snapshot",
+            "--balloon",
+            "0",
+            "--free-page-reporting",
+            common::ALPINE_IMAGE,
+            "sleep",
+            "300",
+        ],
+        &[],
+    )
+    .await?;
+
+    let lock_path = vm_snapshot_lock_path(pid).await?;
+    // The VM directory is created with the state's VM id; wait for it to exist.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !lock_path.parent().is_some_and(Path::is_dir) {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "{} never appeared",
+            lock_path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let holder = hold_vm_snapshot_lock(&lock_path)?;
+    // The run takes the lock for the check and logs this after it, so with the lock held by
+    // the test, its absence proves the check has not happened and cannot until the test
+    // lets go.
+    anyhow::ensure!(
+        !log_contains(&vm_log, "the guest brought up its balloon device"),
+        "the balloon check ran before the test held the lock; log tail:\n{}",
+        log_tail(&vm_log, 40)
+    );
+    // The guest's first cache request: the run is now in the check, waiting for the lock.
+    wait_for_marker(
+        &vm_log,
+        "waiting for per-VM snapshot lock",
+        0,
+        Duration::from_secs(300),
+    )
+    .await?;
+    sigterm(pid).await;
+
+    let exited = wait_exit(&mut child, Duration::from_secs(30)).await;
+    drop(holder);
+    if exited.is_err() {
+        let _ = wait_exit(&mut child, Duration::from_secs(120)).await;
+    }
+    let status = exited.with_context(|| {
+        format!(
+            "fcvm did not exit within 30s of SIGTERM while its balloon check waited for the \
+             per-VM snapshot lock; log tail:\n{}",
+            log_tail(&vm_log, 40)
+        )
+    })?;
+    println!("fcvm exited after SIGTERM with {status:?}");
+    Ok(())
+}
+
+/// Remove the pre-start snapshot (and its startup sibling) named in `log`'s "Creating
+/// pre-start snapshot" line, if the run got that far.
+async fn cleanup_pre_start_key(log: &Path) -> Result<()> {
+    let content = std::fs::read_to_string(log).unwrap_or_default();
+    let key = content
+        .lines()
+        .filter(|line| line.contains("Creating pre-start snapshot"))
+        .find_map(|line| {
+            line.split_whitespace()
+                .find_map(|tok| tok.strip_prefix("snapshot_key="))
+                .map(|key| key.trim_matches('"').to_string())
+        });
+    cleanup_snapshot_keys(&[key]).await;
+    Ok(())
+}
