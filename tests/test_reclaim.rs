@@ -74,18 +74,26 @@ async fn next_launch() -> Result<()> {
 /// [`next_launch`] in a network mode, so that it runs as the user that the killed
 /// process ran as: each user reclaims only its own records.
 async fn next_launch_on(network: &str) -> Result<()> {
+    next_launch_with(network, &[]).await
+}
+
+/// [`next_launch_on`] with `env` set for the launch, such as a data dir of its own.
+async fn next_launch_with(network: &str, env: &[(&str, &str)]) -> Result<()> {
     let (name, _, _, _) = common::unique_names("reclaim-next");
-    let (mut child, _) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
-        &name,
-        "--network",
-        network,
-        "--no-snapshot",
-        common::TEST_IMAGE,
-        "true",
-    ])
+    let (mut child, _) = common::spawn_fcvm_with_env(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &name,
+            "--network",
+            network,
+            "--no-snapshot",
+            common::TEST_IMAGE,
+            "true",
+        ],
+        env,
+    )
     .await?;
     let status = tokio::time::timeout(Duration::from_secs(180), child.wait())
         .await
@@ -328,13 +336,8 @@ fn cache_temps(key: &str) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-/// Every temporary a record of the fcvm process `pid` lists, in this user's owner
-/// directory.
-fn recorded_temps(pid: u32) -> Vec<PathBuf> {
-    // The directory fcvm itself uses: its name depends on the user namespace.
-    let Ok(dir) = fcvm::reclaim::owner_dir() else {
-        return Vec::new();
-    };
+/// Every temporary a record of the fcvm process `pid` lists, in the owner directory `dir`.
+fn recorded_temps(dir: &Path, pid: u32) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -360,13 +363,9 @@ fn recorded_temps(pid: u32) -> Vec<PathBuf> {
     temps
 }
 
-/// The lock files of the records the fcvm process `pid` wrote.
-fn record_locks(pid: u32) -> Vec<PathBuf> {
-    // The directory fcvm itself uses: its name depends on the user namespace.
-    let Ok(dir) = fcvm::reclaim::owner_dir() else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+/// The lock files of the records the fcvm process `pid` wrote in the owner directory `dir`.
+fn record_locks(dir: &Path, pid: u32) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     entries
@@ -403,17 +402,36 @@ async fn wait_for_helpers(locks: &[PathBuf]) -> Result<()> {
 /// #1186: a SIGKILLed export of a localhost image leaves its temporary archive, and a
 /// SIGKILLed storage image build leaves its temporary store and image. The next launch
 /// removes them.
+///
+/// The killed fcvm and the next launch use a data dir of their own, so their owner records
+/// are where no other test's launch reclaims them. With the shared data dir any VM launch of
+/// the parallel suite may take the records once the killed build's helpers exit: in
+/// CI 40897395580 another test's launch reclaimed the killed build's three temporaries
+/// ("owners=1 resources=3") 0.1 s before this test checked that the store was still there
+/// (#1436). That pass is made here on purpose, at that moment, as every launch of the suite
+/// does it, and it must leave this test's records alone.
 #[cfg(feature = "integration-slow")]
 #[tokio::test]
 async fn a_sigkilled_image_export_leaves_its_temporaries_to_the_next_launch() -> Result<()> {
     let image = format!("localhost/fcvm-reclaim-{}", uuid::Uuid::new_v4().simple());
     let key = unique_localhost_image(&image).await?;
+    // Short: a VM's sockets sit under <data>/vm-disks/vm-<32 hex>/, and AF_UNIX paths stop at
+    // 108 bytes.
+    let data_dir = fcvm::paths::data_dir().join(format!(
+        "rt-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    let data_dir_str = data_dir.to_str().context("data dir path")?.to_string();
+    let env = [("FCVM_DATA_DIR", data_dir_str.as_str())];
+    let owners = fcvm::reclaim::owner_dir_in(&data_dir)?;
     let result = async {
         // Killed while podman writes the archive.
         let (name, _, _, _) = common::unique_names("reclaim-export");
-        let (mut child, pid) =
-            common::spawn_fcvm(&["podman", "run", "--name", &name, "--no-snapshot", &image])
-                .await?;
+        let (mut child, pid) = common::spawn_fcvm_with_env(
+            &["podman", "run", "--name", &name, "--no-snapshot", &image],
+            &env,
+        )
+        .await?;
         let observed = wait_for(
             "no temporary archive appeared",
             Duration::from_secs(120),
@@ -424,11 +442,11 @@ async fn a_sigkilled_image_export_leaves_its_temporaries_to_the_next_launch() ->
             },
         )
         .await;
-        let locks = record_locks(pid);
+        let locks = record_locks(&owners, pid);
         sigkill(&mut child, pid).await?;
         let archive_temp = observed?;
         wait_for_helpers(&locks).await?;
-        next_launch().await?;
+        next_launch_with("rootless", &env).await?;
         anyhow::ensure!(
             !archive_temp.exists(),
             "the killed export's archive survived the next launch: {}",
@@ -437,9 +455,11 @@ async fn a_sigkilled_image_export_leaves_its_temporaries_to_the_next_launch() ->
 
         // Killed while the storage image is built from the published archive.
         let (name, _, _, _) = common::unique_names("reclaim-storage");
-        let (mut child, pid) =
-            common::spawn_fcvm(&["podman", "run", "--name", &name, "--no-snapshot", &image])
-                .await?;
+        let (mut child, pid) = common::spawn_fcvm_with_env(
+            &["podman", "run", "--name", &name, "--no-snapshot", &image],
+            &env,
+        )
+        .await?;
         let observed = wait_for(
             "no temporary storage image appeared",
             Duration::from_secs(180),
@@ -450,10 +470,12 @@ async fn a_sigkilled_image_export_leaves_its_temporaries_to_the_next_launch() ->
             },
         )
         .await;
-        let recorded = recorded_temps(pid);
-        let locks = record_locks(pid);
+        let recorded = recorded_temps(&owners, pid);
+        let locks = record_locks(&owners, pid);
         sigkill(&mut child, pid).await?;
         wait_for_helpers(&locks).await?;
+        // What any other launch of the suite may do now that the helpers are gone.
+        fcvm::reclaim::reclaim_abandoned().await;
         let storage_temp = observed?;
         let store = recorded.iter().find(|p| {
             p.file_name()
@@ -463,7 +485,7 @@ async fn a_sigkilled_image_export_leaves_its_temporaries_to_the_next_launch() ->
             store.is_some_and(|s| s.is_dir()),
             "no record of the killed build lists an existing temporary store: {recorded:?}"
         );
-        next_launch().await?;
+        next_launch_with("rootless", &env).await?;
         let left: Vec<_> = std::iter::once(&storage_temp)
             .chain(recorded.iter())
             .filter(|p| p.exists())
@@ -479,6 +501,7 @@ async fn a_sigkilled_image_export_leaves_its_temporaries_to_the_next_launch() ->
         .args(["rmi", "-f", &image])
         .output()
         .await;
+    let _ = std::fs::remove_dir_all(&data_dir);
     // The image's cache entries: no other test uses this digest.
     for entry in std::fs::read_dir(fcvm::paths::image_cache_dir())?.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
