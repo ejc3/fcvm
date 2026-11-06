@@ -574,6 +574,15 @@ class ReleaseInvocationTests(unittest.TestCase):
         self.assertEqual(sleeps, [60, 60, 60])
         self.assertEqual(json.loads(printed.splitlines()[-1])["status"], "unchanged")
 
+    def test_a_call_the_cli_rejects_before_invoking_is_not_retried(self):
+        # 252: the command's syntax was refused; 253: the configuration was. Nothing was invoked.
+        for status in (252, 253):
+            printed, error, sleeps = self.run_publish([status])
+            self.assertIsInstance(error, publish.CommandFailed)
+            self.assertEqual(error.returncode, status)
+            self.assertEqual(sleeps, [])
+            self.assertEqual(printed, "")
+
     def test_invocations_that_never_return_a_result_still_fail(self):
         printed, error, sleeps = self.run_publish([255] * 11)
         self.assertIsInstance(error, publish.CommandFailed)

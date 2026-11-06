@@ -70,7 +70,9 @@ def main():
                 # The call can end while the function keeps running (its connection was dropped, then the
                 # CLI's own retries were throttled by the function's single reserved slot). The release is
                 # serialized and idempotent: a later invocation reports busy, then the finished release.
-                if attempt == 10:
+                # 252 (command syntax) and 253 (configuration): the CLI refused the call before
+                # invoking anything, and the same call is refused again.
+                if attempt == 10 or error.returncode in (252, 253):
                     raise
                 print(f"The release invocation ended without a result (aws exit {error.returncode}); "
                       "retrying in 60 seconds", flush=True)
