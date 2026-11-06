@@ -628,8 +628,9 @@ classifies console lines for both backends, and checks this prefix before anythi
 a pile-up line can name a thread called `fc-agent`): `[fcvm-vitals]` is DEBUG, so the 10s sampler lands in the per-VM file and NOT the job log, which
 is what lets it run for every VM without flooding a runner. `[fc-agent] VITALS` is INFO, so the
 on-failure block also reaches the test's captured output. fc-agent's lines go under `fcvm::console`
-(INFO, and WARN for its `ERROR`, `FATAL ERROR` and `Error:` lines, which fcvm's default `warn`
-filter then shows), so RUST_LOG=fcvm=info keeps them; every other console line stays at DEBUG under
+(INFO, and WARN for its `ERROR`, `FATAL`, `WARNING` and `Error:` lines, which fcvm's default `warn`
+filter then shows: a restore that failed closed in the guest used to leave only the host's
+"connection closed without a frame" there, #1080), so RUST_LOG=fcvm=info keeps them; every other console line stays at DEBUG under
 the console's own `firecracker` or `cloud-hypervisor` target, outside `fcvm`, so RUST_LOG=fcvm=debug
 does not pull kernel messages and vitals samples into a job log (#1104). A guest kernel crash headline (panic,
 Oops, BUG, a WARN, a stalled CPU, task or RCU, an OOM kill) is WARN under `fcvm::guest`, apart
