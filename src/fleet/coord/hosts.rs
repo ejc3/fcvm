@@ -645,14 +645,27 @@ pub struct AwsHosts {
     pub fleet: String,
     /// Per-region API base; default `https://ec2.<region>.amazonaws.com`.
     pub endpoints: BTreeMap<String, String>,
+    /// How long a template's instance type is reused before it is read again.
+    pub template_type_ttl: Duration,
     /// Each template's instance type, as its validated default says, and when it was read.
     types: Mutex<HashMap<(String, String), (String, Instant)>>,
+    /// By ClientToken, the parameters of each CreateFleet that got no decision, and when they
+    /// were sent. A retry with the token sends them again unchanged: EC2 refuses a token with
+    /// other parameters (IdempotentParameterMismatch), and the template's instance type can
+    /// change between the two requests.
+    unanswered: Mutex<HashMap<String, (QueryParams, Instant)>>,
     chain: CredentialChain,
     http: reqwest::Client,
 }
 
-/// How long a template's instance type is reused before it is read again.
+/// How long a template's instance type is reused before it is read again, by default.
 const TEMPLATE_TYPE_TTL: Duration = Duration::from_secs(300);
+
+/// An EC2 query request's parameters, in order.
+type QueryParams = Vec<(String, String)>;
+
+/// How long an unanswered CreateFleet's parameters are kept for a retry with its token.
+const UNANSWERED_TTL: Duration = Duration::from_secs(24 * 3600);
 
 impl AwsHosts {
     pub fn new(templates: &[Regional], subnets: &[Regional], fleet: String) -> Result<Self> {
@@ -681,7 +694,9 @@ impl AwsHosts {
             subnets: s,
             fleet,
             endpoints: BTreeMap::new(),
+            template_type_ttl: TEMPLATE_TYPE_TTL,
             types: Mutex::new(HashMap::new()),
+            unanswered: Mutex::new(HashMap::new()),
             chain: CredentialChain::new()?,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
@@ -745,11 +760,11 @@ impl AwsHosts {
     }
 
     /// The instance type of `template`'s validated default in `region`, read at most once per
-    /// `TEMPLATE_TYPE_TTL`.
+    /// `template_type_ttl`.
     async fn template_type(&self, region: &str, template: &str) -> Result<String> {
         let key = (region.to_string(), template.to_string());
         if let Some((ty, at)) = self.types.lock().unwrap().get(&key) {
-            if at.elapsed() < TEMPLATE_TYPE_TTL {
+            if at.elapsed() < self.template_type_ttl {
                 return Ok(ty.clone());
             }
         }
@@ -971,27 +986,53 @@ impl HostDriver for AwsHosts {
         count: u32,
         token: &str,
     ) -> Result<Launch> {
-        let templates = self
-            .templates
-            .get(region)
-            .with_context(|| format!("no host template in {region}"))?;
-        let subnets = self
-            .subnets
-            .get(region)
-            .with_context(|| format!("no host subnet in {region}"))?;
-        let mut typed = Vec::with_capacity(templates.len());
-        for t in templates {
-            typed.push((t.clone(), self.template_type(region, t).await?));
-        }
-        let params = create_fleet_params(&typed, subnets, market, count, &self.fleet, token);
-        match self.call(region, &params).await {
-            Ok(xml) => Ok(parse_create_fleet(&xml)),
+        let kept = self
+            .unanswered
+            .lock()
+            .unwrap()
+            .get(token)
+            .map(|(params, _)| params.clone());
+        let params = match kept {
+            Some(params) => params,
+            None => {
+                let templates = self
+                    .templates
+                    .get(region)
+                    .with_context(|| format!("no host template in {region}"))?;
+                let subnets = self
+                    .subnets
+                    .get(region)
+                    .with_context(|| format!("no host subnet in {region}"))?;
+                let mut typed = Vec::with_capacity(templates.len());
+                for t in templates {
+                    typed.push((t.clone(), self.template_type(region, t).await?));
+                }
+                create_fleet_params(&typed, subnets, market, count, &self.fleet, token)
+            }
+        };
+        let answer = self.call(region, &params).await;
+        let mut unanswered = self.unanswered.lock().unwrap();
+        match answer {
+            Ok(xml) => {
+                unanswered.remove(token);
+                Ok(parse_create_fleet(&xml))
+            }
             // A request refused as a whole for capacity is a refusal like a per-pool one.
-            Err((code, msg)) if CAPACITY_CODES.contains(&code.as_str()) => Ok(Launch {
-                refused: vec![format!("{code}: {msg}")],
-                ..Launch::default()
-            }),
-            Err((code, msg)) => bail!("CreateFleet: {code}: {msg}"),
+            Err((code, msg)) if CAPACITY_CODES.contains(&code.as_str()) => {
+                unanswered.remove(token);
+                Ok(Launch {
+                    refused: vec![format!("{code}: {msg}")],
+                    ..Launch::default()
+                })
+            }
+            // No decision: the caller asks again with this token, and gets these parameters.
+            Err((code, msg)) => {
+                unanswered.retain(|_, (_, at)| at.elapsed() < UNANSWERED_TTL);
+                unanswered
+                    .entry(token.to_string())
+                    .or_insert_with(|| (params, Instant::now()));
+                bail!("CreateFleet: {code}: {msg}")
+            }
         }
     }
 
