@@ -2738,6 +2738,10 @@ def collect_provenance(args, schedule: dict, snapshot: dict) -> dict:
         "fcvm_sha256": args.runtime["creator_fcvm_sha256"],
         "runtime_bundle_sha256": args.runtime["creator_runtime_bundle_sha256"],
         "golden_creator": args.golden_creator,
+        # The corpus campaign's diag load ceiling, which reqscale_analyze's
+        # corpus gate holds the campaign's diag/summary.json to; null outside
+        # a corpus campaign.
+        "diag_max_load_ms": getattr(args, "diag_max_load_ms", None),
         "fcvm_version": _command([fcvm, "--version"]),
         "host_control": {
             "chromium_path": args.control_chromium,
@@ -3986,6 +3990,10 @@ def main() -> int:
     parser.add_argument("--control-resolve-all-to", default="",
                         help="map every host name the control Chromium resolves to "
                              "this IPv4 address, e.g. a corpus replay server")
+    parser.add_argument("--diag-max-load-ms", type=int, default=None,
+                        help="the load-event ceiling the corpus campaign's diag ran with "
+                             "(DIAG_MAX_LOAD_MS); recorded so the analysis can hold the "
+                             "campaign's diag to it")
     parser.add_argument("--control-timeout", type=float, default=8.0)
     parser.add_argument("--control-tmp-root", default="/tmp")
     parser.add_argument("--format", choices=("png", "jpeg"), default="jpeg")
@@ -4029,6 +4037,8 @@ def main() -> int:
             ipaddress.IPv4Address(args.control_resolve_all_to)
         except ValueError:
             parser.error("--control-resolve-all-to must be an IPv4 address")
+    if args.diag_max_load_ms is not None and args.diag_max_load_ms <= 0:
+        parser.error("--diag-max-load-ms must be a positive integer of milliseconds")
     args.control_tmp_root = os.path.abspath(args.control_tmp_root)
     try:
         _validate_snapshot_tag(args.snapshot_tag)

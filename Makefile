@@ -1389,6 +1389,9 @@ SCALE_UFFD_MODE ?= copy
 SCALE_UFFD_PREFETCH ?= on
 SCALE_CONTROL_URL ?=
 SCALE_CONTROL_RESOLVE_ALL_TO ?=
+# The corpus campaign's DIAG_MAX_LOAD_MS, recorded in the run's provenance so
+# the analysis holds the campaign's diag to the ceiling it ran under.
+SCALE_DIAG_MAX_LOAD_MS ?=
 # reqscale.py's arguments, one list for the schedule check and the measured run,
 # so the check validates exactly what the run will be given.
 SCALE_REQSCALE_ARGS = --url "$(SCALE_URL)" --rates "$(SCALE_RATES)" \
@@ -1402,6 +1405,7 @@ SCALE_REQSCALE_ARGS = --url "$(SCALE_URL)" --rates "$(SCALE_RATES)" \
 	--uffd-mode "$(SCALE_UFFD_MODE)" --uffd-prefetch "$(SCALE_UFFD_PREFETCH)" \
 	$(if $(SCALE_CONTROL_URL),--control-url "$(SCALE_CONTROL_URL)") \
 	$(if $(SCALE_CONTROL_RESOLVE_ALL_TO),--control-resolve-all-to "$(SCALE_CONTROL_RESOLVE_ALL_TO)") \
+	$(if $(SCALE_DIAG_MAX_LOAD_MS),--diag-max-load-ms "$(SCALE_DIAG_MAX_LOAD_MS)") \
 	--out-dir "$(SCALE_OUT)" $(SCALE_TRACE_ARGS)
 # Validates the SCALE_* variables and the schedule they make with reqscale.py's
 # own rules (whole requests per 15 s ramp, whole corpus cycles per 60 s window,

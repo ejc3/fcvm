@@ -509,7 +509,7 @@ class ResolverEvidenceGate(unittest.TestCase):
             gate = reqscale_analyze.corpus_dns_gate(
                 run_dir, {"run_id": self.RUN_ID,
                           "urls": ["http://127.0.0.1/a", "http://localhost/b"]},
-                {"host_control": {"resolve_all_to": None}})
+                {"host_control": {"resolve_all_to": None}}, {})
         self.assertIsNone(gate, gate)
 
     def test_a_hostname_url_needs_resolver_evidence_even_alone(self):
@@ -520,7 +520,7 @@ class ResolverEvidenceGate(unittest.TestCase):
             os.mkdir(run_dir)
             gate = reqscale_analyze.corpus_dns_gate(
                 run_dir, {"run_id": self.RUN_ID, "urls": ["https://example.com/"]},
-                {"host_control": {"resolve_all_to": None}})
+                {"host_control": {"resolve_all_to": None}}, {})
         self.assertIn("without the campaign's DNS evidence", gate or "the gate passed it")
 
 class ScaleGraph(test_reqbench.MakefileBenchGraph):
