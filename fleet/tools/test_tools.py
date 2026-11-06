@@ -204,7 +204,7 @@ case "$args" in
   *" sts get-caller-identity "*) echo 123456789012 ;;
   *" ec2 describe-images "*) echo ami-fake ;;
   *" ec2 describe-security-groups "*) echo sg-fake ;;
-  *" ec2 describe-subnets "*) echo subnet-fake ;;
+  *" ec2 describe-subnets "*) [ -z "${FAKE_SLOW_SUBNETS:-}" ] || sleep 3; echo subnet-fake ;;
   *" service-quotas get-service-quota "*L-3819A6DF*) echo "$FAKE_SPOT_QUOTA" ;;
   *" service-quotas get-service-quota "*L-DB2E81BA*) echo "$FAKE_OD_QUOTA" ;;
   *" ec2 describe-instances "*)
@@ -322,7 +322,14 @@ class GpuboxWallReserve(unittest.TestCase):
         r, launches, _ = self.up(od_in_use=boxes(3), FAKE_LOCK_STOLEN="1")
         self.assertNotEqual(r.returncode, 0, r.stderr)
         self.assertEqual(launches, [], r.stderr)
-        self.assertIn("broken while this up held it", r.stderr)
+        self.assertIn("the admission lock was broken", r.stderr)
+
+    def test_a_lock_held_past_half_its_stale_age_launches_nothing(self):
+        # A holder whose quota and subnet calls took long could otherwise pass the fence just
+        # before another up breaks its lock as stale.
+        r, launches, _ = self.up(od_in_use=boxes(3), FAKE_SLOW_SUBNETS="1", GPUBOX_ADMIT_STALE_S="4")
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(launches, [], r.stderr)
 
     def test_an_unreadable_lock_or_ledger_launches_nothing(self):
         import tempfile

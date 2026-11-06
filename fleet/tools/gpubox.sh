@@ -186,14 +186,15 @@ room_for() {
 ADMIT_LOCK=gpubox/admission.lock
 ADMIT_LEDGER=gpubox/admitted
 ADMIT_LEDGER_S=3600
-ADMIT_STALE_S=300
+ADMIT_STALE_S=${GPUBOX_ADMIT_STALE_S:-300}
 ADMIT_ETAG=""
+ADMIT_AT=0
 S3A() { aws --region "$S3REGION" "$@"; }
 admit_lock() {
   local deadline=$(( $(now) + ${GPUBOX_ADMIT_WAIT_S:-600} )) f held etag at
   f=$(mktemp)
   while :; do
-    echo "$(now) ${owner:-agent}" > "$f"
+    ADMIT_AT=$(now); echo "$ADMIT_AT ${owner:-agent}" > "$f"
     if ADMIT_ETAG=$(S3A s3api put-object --bucket "$BUCKET" --key "$ADMIT_LOCK" --body "$f" --if-none-match '*' \
         --query ETag --output text 2>"$f.err"); then
       rm -f "$f" "$f.err"; return 0
@@ -213,9 +214,11 @@ admit_lock() {
     sleep 2
   done
 }
-# Whether the lock is still the one this `up` took (not broken as stale meanwhile).
+# Whether the lock is still the one this `up` took, and young enough that nobody can break it
+# as stale before the launch is in the ledger (half of ADMIT_STALE_S, about 150 s of margin).
 admit_held() {
   local e
+  [ $(( $(now) - ADMIT_AT )) -lt $(( ADMIT_STALE_S / 2 )) ] || return 1
   e=$(S3A s3api head-object --bucket "$BUCKET" --key "$ADMIT_LOCK" --query ETag --output text 2>/dev/null) || return 1
   [ -n "$ADMIT_ETAG" ] && [ "$e" = "$ADMIT_ETAG" ]
 }
@@ -264,7 +267,7 @@ up)
     for az in $AZS; do
       subnet=$(A ec2 describe-subnets --filters Name=tag:Name,Values="fcvm-fleet-${REGION}${az}" --query 'Subnets[0].SubnetId' --output text)
       mo=(); [ "$market" = spot ] && mo=(--instance-market-options 'MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}')
-      admit_held || die "the admission lock was broken while this up held it; nothing launched"
+      admit_held || die "the admission lock was broken, or held too long to launch under it; nothing launched, run up again"
       if id=$(A ec2 run-instances --image-id "$ami" --instance-type $TYPE "${mo[@]}" \
           --instance-initiated-shutdown-behavior terminate \
           --network-interfaces "DeviceIndex=0,SubnetId=$subnet,Groups=$sg,AssociatePublicIpAddress=true,Ipv6PrefixCount=1,DeleteOnTermination=true" \
