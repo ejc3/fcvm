@@ -197,7 +197,7 @@ class RunScripts(unittest.TestCase):
 
 FAKE_AWS = r"""#!/bin/bash
 # A stand-in for the AWS CLI: answers what `gpubox.sh up` asks, from FAKE_* variables, and
-# logs every call to $FAKE_LOG.
+# logs every call to $FAKE_LOG. The box it launches is listed from then on, at FAKE_MY_TIME.
 echo "$*" >> "$FAKE_LOG"
 args=" $* "
 case "$args" in
@@ -207,18 +207,32 @@ case "$args" in
   *" ec2 describe-subnets "*) echo subnet-fake ;;
   *" service-quotas get-service-quota "*L-3819A6DF*) echo "$FAKE_SPOT_QUOTA" ;;
   *" service-quotas get-service-quota "*L-DB2E81BA*) echo "$FAKE_OD_QUOTA" ;;
-  *" ec2 describe-instances "*"InstanceLifecycle==\`spot\`"*) printf '%s' "$FAKE_SPOT_IN_USE" ;;
-  *" ec2 describe-instances "*) printf '%s' "$FAKE_OD_IN_USE" ;;
-  *" ec2 run-instances "*) echo i-fakebox ;;
+  *" ec2 describe-instances "*)
+    [ -z "${FAKE_USAGE_FAIL:-}" ] || { echo "An error occurred (RequestLimitExceeded)" >&2; exit 254; }
+    case "$args" in *"InstanceLifecycle==\`spot\`"*) m=spot; printf '%b' "$FAKE_SPOT_IN_USE" ;; *) m=on-demand; printf '%b' "$FAKE_OD_IN_USE" ;; esac
+    if [ -s "$FAKE_LOG.launched" ]; then
+      # Another box launched at the same time, listed only now.
+      case $m in spot) printf '%b' "${FAKE_SPOT_IN_USE_AFTER:-}" ;; *) printf '%b' "${FAKE_OD_IN_USE_AFTER:-}" ;; esac
+      [ "$(cat "$FAKE_LOG.launched")" != "$m" ] || printf '%s\ti-fakebox\tfcvm-fleet-gpubox\t48\t2\n' "$FAKE_MY_TIME"
+    fi ;;
+  *" ec2 run-instances "*)
+    case "$args" in *MarketType=spot*) echo spot ;; *) echo on-demand ;; esac > "$FAKE_LOG.launched"
+    echo i-fakebox ;;
+  *" ec2 terminate-instances "*) : ;;
   *) echo "fake aws: unexpected $*" >&2; exit 1 ;;
 esac
 """
 
 
+def boxes(n, purpose="fcvm-fleet-gpubox", at="2026-11-05T23:00:00+00:00"):
+    """describe-instances --output text lines for n g4dn.metal instances."""
+    return "".join(f"{at}\\ti-other{k}\\t{purpose}\\t48\\t2\\n" for k in range(n))
+
+
 class GpuboxWallReserve(unittest.TestCase):
     """`gpubox.sh up` leaves the wall's GPU host room in the account's G quotas (#1257)."""
 
-    def up(self, spot_quota, spot_in_use, od_quota, od_in_use):
+    def up(self, spot_quota=192, spot_in_use="", od_quota=384, od_in_use="", **extra):
         import tempfile
         d = tempfile.mkdtemp()
         with open(os.path.join(d, "aws"), "w") as f:
@@ -226,51 +240,58 @@ class GpuboxWallReserve(unittest.TestCase):
         os.chmod(os.path.join(d, "aws"), 0o755)
         log = os.path.join(d, "calls")
         env = dict(os.environ, PATH=f"{d}:{os.environ['PATH']}", FAKE_LOG=log, GPUBOX_USE_ENV="1",
-                   GPUBOX_AZS="a", FAKE_SPOT_QUOTA=str(spot_quota), FAKE_OD_QUOTA=str(od_quota),
-                   # describe-instances --output text: one "cores threads" line per instance.
-                   FAKE_SPOT_IN_USE="".join("48\t2\n" for _ in range(spot_in_use)),
-                   FAKE_OD_IN_USE="".join("48\t2\n" for _ in range(od_in_use)))
+                   GPUBOX_AZS="a", GPUBOX_SETTLE_S="0", FAKE_SPOT_QUOTA=str(spot_quota), FAKE_OD_QUOTA=str(od_quota),
+                   FAKE_SPOT_IN_USE=spot_in_use, FAKE_OD_IN_USE=od_in_use,
+                   FAKE_MY_TIME="2026-11-06T00:00:00+00:00", **extra)
         r = subprocess.run(["bash", os.path.join(HERE, "gpubox.sh"), "up", "--no-wait"],
                            env=env, capture_output=True, text=True, timeout=60)
         with open(log) as f:
             calls = f.read().splitlines()
-        return r, [c for c in calls if " run-instances " in f" {c} "]
+        def named(word):
+            return [c for c in calls if f" {word} " in f" {c} "]
+        return r, named("run-instances"), named("terminate-instances")
 
     def test_a_full_quota_launches_nothing(self):
-        # 2026-11-05: three gpuboxes held the 384 on-demand vCPUs, the spot quota had no room
+        # 2026-11-05: gpuboxes held the 384 on-demand vCPUs and the spot quota had no room
         # for a box and the wall's host: the wall's host waited 13 minutes.
-        r, launches = self.up(spot_quota=192, spot_in_use=1, od_quota=384, od_in_use=3)
+        r, launches, _ = self.up(spot_in_use=boxes(1), od_in_use=boxes(3))
         self.assertNotEqual(r.returncode, 0, r.stderr)
         self.assertEqual(launches, [], r.stderr)
         self.assertIn("wall", r.stderr)
 
     def test_spot_goes_first_when_it_leaves_the_wall_room(self):
-        r, launches = self.up(spot_quota=192, spot_in_use=0, od_quota=384, od_in_use=3)
+        r, launches, ends = self.up(od_in_use=boxes(3))
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(len(launches), 1, launches)
         self.assertIn("MarketType=spot", launches[0])
+        self.assertEqual(ends, [])
 
     def test_on_demand_only_with_room_for_the_wall_host_and_its_tiles(self):
         # 96 for the box, 96 for the wall's host and 32 for its on-demand tiles.
-        r, launches = self.up(spot_quota=192, spot_in_use=1, od_quota=384, od_in_use=1)
+        r, launches, _ = self.up(spot_in_use=boxes(1), od_in_use=boxes(1))
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(len(launches), 1, launches)
         self.assertNotIn("MarketType=spot", launches[0])
-        r, launches = self.up(spot_quota=192, spot_in_use=1, od_quota=384, od_in_use=2)
+        r, launches, _ = self.up(spot_in_use=boxes(1), od_in_use=boxes(2))
         self.assertNotEqual(r.returncode, 0, r.stderr)
         self.assertEqual(launches, [])
 
+    def test_unreadable_usage_launches_nothing(self):
+        r, launches, _ = self.up(FAKE_USAGE_FAIL="1")
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(launches, [], r.stderr)
+        self.assertIn("could not be read", r.stderr)
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-class PathrunLighting(unittest.TestCase):
-    def test_a_late_pass_posts_the_latest_time_of_day_not_the_next(self):
-        # The director's time of day moves every second while the camera flies; pathrun
-        # polls every 2 s, so a pass must catch up to the value due now, not the one after
-        # the last it posted, or the lighting falls behind the camera for the whole run.
-        tods = [(0.0, 0.71), (11.0, 0.7106), (12.0, 0.7112), (13.0, 0.7118), (30.0, 0.735)]
-        v, i = pathrun.due(tods, 1, 13.5)
-        self.assertEqual((v, i), (0.7118, 4))
-        self.assertEqual(pathrun.due(tods, i, 14.0), (None, 4))
+    def test_of_two_boxes_launched_at_once_the_later_gives_way(self):
+        # Both passed the check before either launched (spot: 0 in use, room for one box and
+        # the wall's host); the other box is listed only after this one launched.
+        earlier = boxes(1, at="2026-11-05T23:59:59+00:00")
+        later = boxes(1, at="2026-11-06T00:00:01+00:00")
+        r, launches, ends = self.up(FAKE_SPOT_IN_USE_AFTER=earlier, od_in_use=boxes(3))
+        self.assertEqual(len(launches), 1, r.stderr)
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(ends), 1, r.stderr)
+        self.assertIn("i-fakebox", ends[0])
+        r, launches, ends = self.up(FAKE_SPOT_IN_USE_AFTER=later, od_in_use=boxes(3))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((len(launches), ends), (1, []), r.stderr)

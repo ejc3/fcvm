@@ -138,29 +138,57 @@ EOF
 
 # The wall's GPU host shares this account's G quotas in this region: a gpubox may take a
 # market only if it leaves room there for one wall host (96 vCPU), and on demand also for the
-# wall's eight on-demand EC2 tiles (4 each). On 2026-11-05 the wall's host was refused with VcpuLimitExceeded for
-# 13 minutes on two wakes while gpuboxes and an AMI builder held the on-demand quota
-# (ejc3/fcvm#1257).
+# wall's eight on-demand EC2 tiles (4 each). On 2026-11-05 the wall's host was refused with
+# VcpuLimitExceeded for 13 minutes on two wakes while gpuboxes and an AMI builder held the
+# on-demand quota (ejc3/fcvm#1257). A check that cannot read the quota or the usage refuses.
 WALL_RESERVE_spot=96
 WALL_RESERVE_ondemand=128
 QUOTA_CODE_spot=L-3819A6DF
 QUOTA_CODE_ondemand=L-DB2E81BA
-g_vcpus_in_use() { # market (spot|on-demand): vCPUs of G instances that count against its quota
-  local lc
+# g_usage MARKET: one line per G instance counting against that market's quota (pending,
+# running, stopping, shutting down): "<launch time> <instance id> <purpose> <vCPUs>".
+g_usage() {
+  local lc out
   if [ "$1" = spot ]; then lc='InstanceLifecycle==`spot`'; else lc='InstanceLifecycle!=`spot`'; fi
-  A ec2 describe-instances --filters Name=instance-state-name,Values=pending,running,stopping,shutting-down \
-    --query "Reservations[].Instances[?starts_with(InstanceType, \`g\`) && $lc].[CpuOptions.CoreCount, CpuOptions.ThreadsPerCore]" \
-    --output text | awk '{n += $1 * $2} END {print n + 0}'
+  out=$(A ec2 describe-instances --filters Name=instance-state-name,Values=pending,running,stopping,shutting-down \
+    --query "Reservations[].Instances[?starts_with(InstanceType, \`g\`) && $lc].[LaunchTime, InstanceId, Tags[?Key=='Purpose']|[0].Value, CpuOptions.CoreCount, CpuOptions.ThreadsPerCore]" \
+    --output text) || return 1
+  awk 'NF == 5 && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/ {print $1, $2, $3, $4 * $5; next} NF {bad = 1} END {exit bad}' <<<"$out"
 }
-room_for() { # market, vCPUs wanted: 0 when that many fit and still leave the wall's reserve
-  local code quota used reserve
-  if [ "$1" = spot ]; then code=$QUOTA_CODE_spot reserve=$WALL_RESERVE_spot; else code=$QUOTA_CODE_ondemand reserve=$WALL_RESERVE_ondemand; fi
-  quota=$(A service-quotas get-service-quota --service-code ec2 --quota-code "$code" --query 'Quota.Value' --output text)
-  used=$(g_vcpus_in_use "$1")
-  quota=${quota%.*}
+# quota_of MARKET: the market's G vCPU quota, a whole number.
+quota_of() {
+  local code q
+  if [ "$1" = spot ]; then code=$QUOTA_CODE_spot; else code=$QUOTA_CODE_ondemand; fi
+  q=$(A service-quotas get-service-quota --service-code ec2 --quota-code "$code" --query 'Quota.Value' --output text) || return 1
+  q=${q%.*}
+  [[ "$q" =~ ^[0-9]+$ ]] || return 1
+  echo "$q"
+}
+reserve_of() { if [ "$1" = spot ]; then echo $WALL_RESERVE_spot; else echo $WALL_RESERVE_ondemand; fi; }
+# room_for MARKET VCPUS: 0 when that many fit and still leave the wall's reserve.
+room_for() {
+  local quota usage used reserve
+  reserve=$(reserve_of "$1")
+  quota=$(quota_of "$1") && usage=$(g_usage "$1") || { say "no $1 $TYPE: the G quota or its usage could not be read"; return 1; }
+  used=$(awk '{n += $4} END {print n + 0}' <<<"$usage")
   if [ $((used + $2 + reserve)) -le "$quota" ]; then return 0; fi
   say "no $1 $TYPE: $used of $quota G vCPUs in use, and $2 more would leave the wall's host less than its $reserve"
   return 1
+}
+# still_fits MARKET ID: after launching ID, whether it fits ahead of the wall's reserve with
+# every other instance counted first except gpuboxes launched after it (by launch time, then
+# id). Two `up`s that passed room_for at once both see each other here, and only the later
+# box gives way.
+still_fits() {
+  local quota usage reserve
+  reserve=$(reserve_of "$1")
+  quota=$(quota_of "$1") && usage=$(g_usage "$1") || return 1
+  # Not listed yet: it launched just now, after every box that is.
+  grep -q " $2 " <<<"$usage" || usage+=$'\n'"$(date -u +%Y-%m-%dT%H:%M:%S+00:00) $2 $PURPOSE 96"
+  sort -k1,1 -k2,2 <<<"$usage" | awk -v me="$2" -v purpose="$PURPOSE" -v limit=$((quota - reserve)) '
+    $3 != purpose {n += $4; next}
+    !done {n += $4} $2 == me {done = 1}
+    END {exit (n <= limit) ? 0 : 1}'
 }
 
 case "${1:-}" in
@@ -203,6 +231,12 @@ up)
   done
   rm -f /tmp/gpubox.err.$$
   [ -n "$id" ] || die "no $TYPE capacity or quota in $REGION, spot or on demand, that leaves the wall's host its room"
+  # A launch shows in describe-instances within seconds; then the later of two racing boxes gives way.
+  sleep "${GPUBOX_SETTLE_S:-10}"
+  if ! still_fits "$market" "$id"; then
+    A ec2 terminate-instances --instance-ids "$id" >/dev/null
+    die "terminated $id: with another box launched at the same time it would leave the wall's host less than its $(reserve_of "$market") $market vCPUs"
+  fi
   say "launched $id ($market, ${REGION}${az}, $ami), lease until $lease UTC"
   [ "$wait" = 0 ] || wait_ready "$t0" "$id"
   echo "$id $REGION"
