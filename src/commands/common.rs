@@ -2426,10 +2426,10 @@ async fn cleanup_vm_inner(
         let saved = save_vm_logs(&data_dir, &vm_id, std::path::Path::new("/tmp")).await;
 
         failpoint::hit_async("teardown.pre_remove_data_dir").await;
-        // Includes disks, sockets, everything under the VM's runtime directory.
-        // A clone of this VM's snapshot that is still loading it reads its disks through
-        // a bind over this directory, so the removal waits for it.
-        let removed = crate::storage::runtime_dir::remove_runtime_dir(&data_dir)
+        // Includes disks, sockets, everything under the VM's runtime directory. A clone of
+        // this VM's snapshot binds its own directory on a tmpfs of its own namespace, not
+        // over this one, so nothing waits for a restore (#1311).
+        let removed = remove_runtime_dir(&data_dir)
             .await
             .map(|()| info!(vm_id = %vm_id, "cleaned up VM data directory"));
         (saved, removed)
@@ -2440,9 +2440,8 @@ async fn cleanup_vm_inner(
     failures.record("deleting state", state_deleted);
     failures.record("saving the container's output", logs_saved);
     failures.record("removing VM data directory", data_dir_removed);
-    // Teardown removed what it made. This removes the mountpoints a restore made over
-    // source VM directories and deletes the VM's owner record; a resource it cannot
-    // remove stays recorded for the next launch (crate::reclaim).
+    // Teardown removed what it made. This deletes the VM's owner record; a resource it
+    // cannot remove stays recorded for the next launch (crate::reclaim).
     failures.record(
         "reclaiming the VM's recorded resources",
         crate::reclaim::complete(&vm_id).await,
@@ -3402,10 +3401,6 @@ pub struct CloneSubstrate {
     /// set to `(baseline_dirs, clone_dir)` so the VMM opens the clone's CoW disk where the
     /// snapshot embedded the baseline's path.
     pub namespace: crate::utils::NamespaceParams,
-    /// Shared leases on the source VM directories `mount_redirects` binds over. The
-    /// caller holds them until the VMM has opened the disks the snapshot names, so the
-    /// source VM's teardown cannot remove a directory, and with it the bind mount, first.
-    pub mount_target_lease: crate::storage::runtime_dir::MountTargetLease,
 }
 
 /// Stop and reap a rootless namespace holder retained by a failed restore.
@@ -3647,31 +3642,10 @@ async fn prepare_clone_substrate(
         namespace.mount_redirects = Some(redirects);
     }
 
-    // The VMM opens the snapshot's disks at these directories' paths, which its view
-    // binds to the clone's own (utils::MountRedirects), so a teardown that removes them
-    // no longer detaches anything here. The lease is still held until the disks are
-    // open (storage::runtime_dir).
-    // Recorded before the lease, which creates a directory whose VM is gone as an empty
-    // directory: the clone's teardown, or the next launch after a SIGKILL, removes it.
-    let leased = async {
-        for dir in &disk_dirs {
-            crate::reclaim::record(
-                vm_id,
-                crate::reclaim::Resource::MountTarget { path: dir.clone() },
-            )?;
-        }
-        crate::storage::runtime_dir::lease_mount_targets(&disk_dirs).await
-    };
-    let mount_target_lease = match leased
-        .await
-        .context("leasing the source VM directories the clone's disks are bound over")
-    {
-        Ok(lease) => lease,
-        Err(error) => {
-            cleanup_failed_clone_holder(&mut holder_child, "leasing source VM directories").await;
-            return Err(error);
-        }
-    };
+    // The VMM opens the snapshot's disks at these directories' paths, which its view binds
+    // to the clone's own on a tmpfs over vm-disks (utils::MountRedirects). Nothing is made
+    // or bound on the host, so a source VM's teardown that removes its directory detaches
+    // nothing here and has nothing of this clone's to wait for (#1311).
 
     // Extra disk images (disk-dir) in the clone's disk directory, so the redirected baseline
     // paths resolve to real files. A disk directory made as a subvolume snapshot of the
@@ -3715,8 +3689,19 @@ async fn prepare_clone_substrate(
         holder_child,
         holder_pid_for_post_start,
         namespace,
-        mount_target_lease,
     })
+}
+
+/// Remove a VM's runtime directory (`vm-disks/<vm_id>`). A missing directory is not an
+/// error.
+async fn remove_runtime_dir(dir: &Path) -> Result<()> {
+    match tokio::fs::remove_dir_all(dir).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("removing runtime directory {}", dir.display()))
+        }
+    }
 }
 
 /// Mint the restore-epoch value that tells a restored guest's fc-agent "you have
@@ -3736,14 +3721,8 @@ pub(crate) fn new_restore_epoch() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// What a restore hands its caller: the VMM backend, the rootless namespace holder,
-/// and the part of the mount-target lease the VMM needs for its whole life
-/// (`storage::runtime_dir::MountTargetLease::after_load`).
-pub type RestoredVmm<B> = (
-    B,
-    Option<tokio::process::Child>,
-    Option<crate::storage::runtime_dir::MountTargetLease>,
-);
+/// What a restore hands its caller: the VMM backend and the rootless namespace holder.
+pub type RestoredVmm<B> = (B, Option<tokio::process::Child>);
 
 /// Restore a VM from a snapshot.
 ///
@@ -3846,8 +3825,6 @@ pub async fn restore_from_snapshot(
         );
     }
     let holder_pid_for_post_start = substrate.holder_pid_for_post_start;
-    let mut mount_target_lease = Some(substrate.mount_target_lease);
-    let mut vsock_redirect_lease = None;
 
     let fc_log_path = data_dir.join("firecracker.log");
     let mut vm_manager = VmManager::new(
@@ -3991,12 +3968,6 @@ pub async fn restore_from_snapshot(
                 }
             })?;
         let load_duration = load_start.elapsed();
-        // The load opened every disk at its source path, so the source VMs may go. A
-        // VMM without the vsock override keeps resolving its socket through the redirect,
-        // which its view keeps whether or not the source directory exists.
-        vsock_redirect_lease = mount_target_lease
-            .take()
-            .and_then(|lease| lease.after_load(vsock_override.is_none()));
         info!(
             duration_ms = load_duration.as_millis(),
             track_dirty_pages, "snapshot load completed"
@@ -4221,7 +4192,6 @@ pub async fn restore_from_snapshot(
     Ok((
         FirecrackerBackend::from_vm_manager(vm_manager),
         holder_child,
-        vsock_redirect_lease,
     ))
 }
 
@@ -4414,8 +4384,6 @@ pub async fn restore_from_snapshot_ch(
     }
 
     let mut holder_child = substrate.holder_child.take();
-    let mut mount_target_lease = Some(substrate.mount_target_lease);
-    let mut vsock_redirect_lease = None;
     // Everything after spawn runs in a fallible block so a failure kills the CH process
     // (callers may fall back to a fresh boot, so a half-restored process must not leak).
     let post_start = async {
@@ -4435,12 +4403,6 @@ pub async fn restore_from_snapshot_ch(
             .resume()
             .await
             .context("resuming Cloud Hypervisor after restore")?;
-        // The restore opened every disk at its source path, so the source VMs may go.
-        // Cloud Hypervisor keeps resolving its vsock socket through the redirect, which its
-        // view keeps whether or not the source directory exists.
-        vsock_redirect_lease = mount_target_lease
-            .take()
-            .and_then(|lease| lease.after_load(true));
 
         vm_state.pid = Some(std::process::id());
         // Future snapshots of this clone must redirect using the original vsock vm_id.
@@ -4485,7 +4447,7 @@ pub async fn restore_from_snapshot_ch(
         return Err(e);
     }
 
-    Ok((backend, holder_child, vsock_redirect_lease))
+    Ok((backend, holder_child))
 }
 
 /// Core snapshot creation logic with automatic diff snapshot support.
