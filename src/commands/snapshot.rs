@@ -3022,7 +3022,8 @@ async fn cmd_snapshot_run_inner(
         FcNetworkMode::Bridged => {
             let mut net =
                 BridgedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
-                    .with_dns_server(resolvers.mode_server.clone());
+                    .with_dns_server(resolvers.mode_server.clone())
+                    .with_restore_udp_gate();
             // If snapshot has saved network config with guest_ip, use it
             if let Some(ref guest_ip) = saved_network.guest_ip {
                 net = net.with_guest_ip(guest_ip.clone());
@@ -3684,6 +3685,16 @@ async fn cmd_snapshot_run_inner(
         || vm_manager.try_wait(),
     )
     .await;
+    // The host's gate on the published UDP ports opens at the ACK, which the guest sends
+    // after it has published (network::udp_gate). One that cannot open fails the restore
+    // instead of leaving a published clone whose UDP ports drop every datagram.
+    let restore_completion_result = match restore_completion_result {
+        Ok(RestoreAck::Acked { guest_phases }) => match network.open_restore_udp_gate().await {
+            Ok(()) => Ok(RestoreAck::Acked { guest_phases }),
+            Err(error) => Err(error.context("publishing the restored clone's UDP ports")),
+        },
+        other => other,
+    };
 
     // For routed mode clones: fc-agent reconfigures eth0 with the new vm_ipv6 via MMDS.
     // The state already has the correct guest_ipv6 = vm_ipv6 (set by restore_from_snapshot).

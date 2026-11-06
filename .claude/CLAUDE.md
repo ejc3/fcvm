@@ -179,6 +179,14 @@ already runs with the address in its environment, which a restore cannot change,
 (`two_host_identities_share_the_pre_start_snapshot_and_not_the_startup_one`).
 `the_host_identity_is_replaced_before_egress_opens_and_before_the_hook` pins the order.
 
+A restored clone's published UDP ports are closed by the host. The guest adds its UDP rule only
+once it runs, while pasta `-u` and the bridged UDP DNAT rules are live before the resume, and a
+client sending from before the resume had 13 and 18 datagrams delivered before the restore hook
+ran. From before the clone's TAP can carry a frame until the guest acknowledges its restore
+(which it does after publication), a clsact egress filter on the TAP drops datagrams to every
+published UDP guest port (`src/network/udp_gate.rs`);
+`test_restored_clone_udp_port_is_closed_until_the_restore_ack` pins it.
+
 ### Opening the gate costs no grace period, and the barrier an expedited one
 
 Each half of the gate opens with one nf_tables commit covering both families,
