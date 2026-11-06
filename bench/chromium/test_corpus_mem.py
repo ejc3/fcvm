@@ -3505,7 +3505,10 @@ class ZeroBasis(unittest.TestCase):
         with open(fcvm, "w") as f:
             f.write("#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$FCVM_ARGV\"\n"
                     "echo nc_rc=1; echo 'LISTEN 0 4096 0.0.0.0:22 0.0.0.0:*'\n")
-        for name in ("ss", "fcvm"):
+        # sudo -n runs the command as given, as the box's passwordless sudo does.
+        with open(os.path.join(bindir, "sudo"), "w") as f:
+            f.write('#!/bin/sh\n[ "$1" = -n ] && shift\nexec "$@"\n')
+        for name in ("ss", "fcvm", "sudo"):
             os.chmod(os.path.join(bindir, name), 0o755)
         args = SimpleNamespace(results=os.path.join(tmp, "results"), data_root=tmp, fcvm=fcvm,
                                state_dir=os.path.join(tmp, "state"), op="screenshot",
@@ -3541,6 +3544,8 @@ class ZeroBasis(unittest.TestCase):
                 with open(path) as f:
                     record = json.load(f)
                 self.assertEqual(record["endpoint_listener_owners"], [{"comm": "pasta", "pid": 5002}])
+                # pasta is non-dumpable, so only root's ss names the owner.
+                self.assertEqual(record["host_listeners_as"], "root")
                 self.assertEqual(record["clone_pasta_pid"], pasta_pid)
                 self.assertIs(record["endpoint_listener_is_this_clones_pasta"], ours)
                 self.assertIn("nc_rc=1", record["guest"]["stdout"])
