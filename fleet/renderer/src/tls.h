@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -29,7 +30,9 @@ class Conn {
   long read(void* buf, size_t n);
   bool read_exact(void* buf, size_t n);
   bool write_all(const void* p, size_t n);
-  void set_read_timeout_ms(int ms);  // 0: wait forever
+  // Every read fails once ms have passed from now, however much arrives in between;
+  // 0 removes the deadline (reads wait forever).
+  void set_read_deadline_ms(int ms);
   void set_option(int level, int name, int value);
   void shutdown_both();  // wakes a blocked reader or writer
 
@@ -37,7 +40,10 @@ class Conn {
   int fd_;
   SSL* ssl_;
   std::mutex mu_;
-  int rto_ms_ = 0;
+  bool has_deadline_ = false;
+  std::chrono::steady_clock::time_point deadline_{};
+  // How long a read may wait for the deadline (-1: no deadline, 0: it has passed).
+  int read_wait_ms() const;
 };
 
 class TlsFront {
