@@ -15,7 +15,10 @@
 #
 # $FCVM_HOST_KERNEL_MIN_FREE_GIB (default 40) is the free space required on
 # the chosen directory's filesystem. A build on a 29 GB root disk ran out of
-# space part way through.
+# space part way through. When that filesystem is on a loop device (the
+# setup-btrfs image, a sparse file on the root disk), the image grows into the
+# filesystem holding its backing file as the build writes, so that filesystem
+# needs the same room.
 set -euo pipefail
 
 # What `make bindeb-pkg` and the generated build script use: the compiler
@@ -57,12 +60,38 @@ else
   build_dir=$default_dir
 fi
 
+# Free GiB on the filesystem holding $1 (an existing directory), or empty.
+free_gib_of() { df --output=avail -B1G "$1" | tail -n 1 | tr -d ' '; }
+
 anc=$(existing_ancestor "$build_dir")
-free_gib=$(df --output=avail -B1G "$anc" | tail -n 1 | tr -d ' ')
+free_gib=$(free_gib_of "$anc")
 if ! [[ "$free_gib" =~ ^[0-9]+$ ]] || ((free_gib < min_free_gib)); then
   echo "check-host-kernel-build: ${build_dir} has ${free_gib:-unknown} GiB free on its filesystem (${anc}); the host kernel build needs ${min_free_gib} GiB." >&2
   echo "  Set FCVM_HOST_KERNEL_BUILD_DIR to a directory on a larger disk (for example one on the scratch disk), or mount one at ${scratch}." >&2
   exit 2
 fi
+
+# Follow loop devices down to real storage: each backing file's filesystem must
+# have the room too. Bounded, so a loop chain cannot spin.
+dir=$anc
+for _ in 1 2 3 4 5 6 7 8; do
+  source_dev=$(findmnt --noheadings --nofsroot --output SOURCE --target "$dir" 2>/dev/null | head -n 1 || true)
+  [[ "$source_dev" == /dev/loop* ]] || break
+  backing=$(losetup --list --noheadings --output BACK-FILE "$source_dev" 2>/dev/null | head -n 1 || true)
+  backing=${backing%% (deleted)}
+  backing=$(printf '%s' "$backing" | sed 's/[[:space:]]*$//')
+  if [[ -z "$backing" ]]; then
+    echo "check-host-kernel-build: ${build_dir} is on loop device ${source_dev}, and its backing file could not be read (losetup --list -O BACK-FILE ${source_dev}), so the free space of the disk it grows into is unknown." >&2
+    echo "  Set FCVM_HOST_KERNEL_BUILD_DIR to a directory on a disk that is not loop-backed." >&2
+    exit 2
+  fi
+  dir=$(existing_ancestor "$(dirname "$backing")")
+  free_gib=$(free_gib_of "$dir")
+  if ! [[ "$free_gib" =~ ^[0-9]+$ ]] || ((free_gib < min_free_gib)); then
+    echo "check-host-kernel-build: ${build_dir} is on loop device ${source_dev}, backed by ${backing}, whose filesystem (${dir}) has ${free_gib:-unknown} GiB free; the image grows into it as the build writes, and the host kernel build needs ${min_free_gib} GiB." >&2
+    echo "  Free space there, or set FCVM_HOST_KERNEL_BUILD_DIR to a directory on a disk that is not loop-backed." >&2
+    exit 2
+  fi
+done
 
 printf '%s\n' "$build_dir"
