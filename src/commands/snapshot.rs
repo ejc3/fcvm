@@ -1574,10 +1574,12 @@ fn ensure_not_disk_only(kind: crate::storage::SnapshotKind, command: &str) -> Re
 /// disk-only clone boots, and a UDP mapping has no guest-side setup, so the rule is wider
 /// than those two need: it is one rule for every clone.
 fn clone_port_mappings(
-    snapshot: &[crate::network::PortMapping],
+    meta: &crate::storage::SnapshotMetadata,
     requested: &[String],
 ) -> Result<Vec<crate::network::PortMapping>> {
+    let snapshot = &meta.port_mappings;
     if requested.is_empty() {
+        crate::network::PortMapping::require_bindable(snapshot, meta.network_mode)?;
         return Ok(snapshot.to_vec());
     }
     let mut mappings = Vec::with_capacity(requested.len());
@@ -1610,7 +1612,7 @@ fn clone_port_mappings(
         }
         mappings.push(mapping);
     }
-    crate::network::PortMapping::require_distinct_host_sockets(&mappings)?;
+    crate::network::PortMapping::require_bindable(&mappings, meta.network_mode)?;
     Ok(mappings)
 }
 
@@ -2573,8 +2575,7 @@ async fn cmd_snapshot_run_inner(
 
     // Where this clone publishes its ports, settled before anything is allocated: a
     // --publish the snapshot cannot serve fails here with nothing to clean up.
-    let port_mappings =
-        clone_port_mappings(&snapshot_config.metadata.port_mappings, &args.publish)?;
+    let port_mappings = clone_port_mappings(&snapshot_config.metadata, &args.publish)?;
     crate::network::require_routed_for_address(
         snapshot_config.metadata.network_mode,
         args.ipv6_address,
@@ -6254,6 +6255,13 @@ mod tests {
         specs.iter().map(|spec| spec.to_string()).collect()
     }
 
+    /// A rootless snapshot that published `specs`.
+    fn publishing(specs: &[&str]) -> crate::storage::SnapshotMetadata {
+        let mut meta = metadata_fixture();
+        meta.port_mappings = published(specs);
+        meta
+    }
+
     fn volume(
         host: &std::path::Path,
         guest: &str,
@@ -6345,9 +6353,14 @@ mod tests {
     /// requested ones and nothing else, on the host addresses and ports they name.
     #[test]
     fn a_clone_inherits_the_snapshots_mappings_or_uses_exactly_the_requested_ones() {
-        let snapshot = published(&["127.0.0.1:8080:80", "8443:443", "5300:53/udp"]);
-        assert_eq!(clone_port_mappings(&snapshot, &[]).unwrap(), snapshot);
-        assert!(clone_port_mappings(&[], &[]).unwrap().is_empty());
+        let snapshot = publishing(&["127.0.0.1:8080:80", "8443:443", "5300:53/udp"]);
+        assert_eq!(
+            clone_port_mappings(&snapshot, &[]).unwrap(),
+            snapshot.port_mappings
+        );
+        assert!(clone_port_mappings(&publishing(&[]), &[])
+            .unwrap()
+            .is_empty());
 
         // Guest port 80 twice on different host sockets, 53/udp moved, 443 dropped.
         let chosen = clone_port_mappings(
@@ -6365,7 +6378,7 @@ mod tests {
     /// another guest port or the same port under another protocol.
     #[test]
     fn a_clone_cannot_publish_a_guest_port_the_snapshot_did_not() {
-        let snapshot = published(&["8080:80", "8443:443", "5300:53/udp"]);
+        let snapshot = publishing(&["8080:80", "8443:443", "5300:53/udp"]);
         let refusal = |specs: &[&str]| {
             clone_port_mappings(&snapshot, &requested(specs))
                 .expect_err("must be refused")
@@ -6397,10 +6410,50 @@ mod tests {
         );
 
         // A snapshot that published nothing has nothing a clone could publish.
-        let error = clone_port_mappings(&[], &requested(&["8080:80"]))
+        let error = clone_port_mappings(&publishing(&[]), &requested(&["8080:80"]))
             .expect_err("must be refused")
             .to_string();
         assert!(error.contains("published no ports"), "{error}");
+    }
+
+    /// A clone's --publish is checked under the snapshot's network mode, before anything
+    /// of the clone exists (#1039): a wildcard beside a specific address on one port is
+    /// refused where both cannot be bound.
+    #[test]
+    fn a_clone_refuses_publish_mappings_that_cannot_both_bind_in_its_mode() {
+        use crate::firecracker::FcNetworkMode;
+        let mut meta = metadata_fixture();
+        meta.port_mappings = published(&["8080:80", "8443:443"]);
+        let overlapping = requested(&["[::]:8080:80", "127.0.0.1:8080:443"]);
+        meta.network_mode = FcNetworkMode::Rootless;
+        clone_port_mappings(&meta, &overlapping).unwrap();
+        meta.network_mode = FcNetworkMode::Routed;
+        let error = clone_port_mappings(&meta, &overlapping)
+            .expect_err("routed's [::] holds the IPv4 port")
+            .to_string();
+        assert!(
+            error.contains("[::]:8080:80/tcp and 127.0.0.1:8080:443/tcp"),
+            "{error}"
+        );
+        // Bridged listens on the veth address whatever HOSTIP says.
+        meta.network_mode = FcNetworkMode::Bridged;
+        let error = clone_port_mappings(
+            &meta,
+            &requested(&["127.0.0.1:8080:80", "127.0.0.2:8080:443"]),
+        )
+        .expect_err("one veth address and port")
+        .to_string();
+        assert!(error.contains("veth address"), "{error}");
+        // A snapshot whose own mappings collide is refused for a clone that inherits them.
+        meta.network_mode = FcNetworkMode::Rootless;
+        meta.port_mappings = published(&["0.0.0.0:8080:80", "8080:443"]);
+        let error = clone_port_mappings(&meta, &[])
+            .expect_err("0.0.0.0 holds the clone's loopback address")
+            .to_string();
+        assert!(
+            error.contains("0.0.0.0:8080:80/tcp and 8080:443/tcp"),
+            "{error}"
+        );
     }
 
     /// A warm GPU snapshot that was published while the source did not get its GPUs

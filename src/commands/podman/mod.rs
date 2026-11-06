@@ -1440,9 +1440,8 @@ async fn export_localhost_image_disk(
 /// The `--publish` mappings of a run, parsed before anything else reads the specs.
 ///
 /// A malformed spec fails the run here, before the kernel, the rootfs and the image are
-/// looked up. So do two mappings that claim one host address and port: left to network
-/// setup, routed and rootless networking fail the second bind after the VM's network
-/// exists, and bridged networking installs both DNAT rules and delivers only the first.
+/// looked up. So do two mappings whose host listeners cannot both be bound under the
+/// run's network mode (`PortMapping::require_bindable`).
 fn publish_mappings(args: &RunArgs) -> Result<Vec<PortMapping>> {
     let port_mappings: Vec<PortMapping> = args
         .publish
@@ -1478,7 +1477,7 @@ fn publish_mappings(args: &RunArgs) -> Result<Vec<PortMapping>> {
             );
         }
     }
-    PortMapping::require_distinct_host_sockets(&port_mappings)?;
+    PortMapping::require_bindable(&port_mappings, args.network.into())?;
 
     Ok(port_mappings)
 }
@@ -4052,6 +4051,40 @@ mod tests {
         let error = format!("{:#}", publish_mappings(&args).unwrap_err());
         assert!(
             error.contains("8080:80/tcp") && error.contains("8080:443/tcp"),
+            "{error}"
+        );
+    }
+
+    /// Two mappings whose listeners overlap are refused by the run's own parse, under
+    /// the run's network mode, before a VM id or a network exists (#1039).
+    #[test]
+    fn a_run_refuses_publish_mappings_that_cannot_both_bind_in_its_mode() {
+        let mut args = test_args();
+        args.publish = vec![
+            "0.0.0.0:8080:80".to_string(),
+            "127.0.0.1:8080:443".to_string(),
+        ];
+        for network in [
+            NetworkMode::Bridged,
+            NetworkMode::Rootless,
+            NetworkMode::Routed,
+        ] {
+            args.network = network;
+            let error = format!("{:#}", publish_mappings(&args).unwrap_err());
+            assert!(
+                error.contains("0.0.0.0:8080:80/tcp and 127.0.0.1:8080:443/tcp"),
+                "{network:?}: {error}"
+            );
+        }
+
+        // Routed's [::] listener also holds the IPv4 port; pasta's does not.
+        args.publish = vec!["[::]:8080:80".to_string(), "8080:443".to_string()];
+        args.network = NetworkMode::Rootless;
+        publish_mappings(&args).unwrap();
+        args.network = NetworkMode::Routed;
+        let error = format!("{:#}", publish_mappings(&args).unwrap_err());
+        assert!(
+            error.contains("[::]:8080:80/tcp and 8080:443/tcp"),
             "{error}"
         );
     }
