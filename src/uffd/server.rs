@@ -2064,6 +2064,11 @@ struct FaultAroundStats {
     /// Granules abandoned part-way because the kernel refused a copy. Their remaining pages
     /// fault on demand.
     refused: u64,
+    /// Bytes of granules stepped over because their source pages were not in the host page
+    /// cache ([`source_residency_run`]). Their pages fault on demand.
+    uncached_bytes: u64,
+    /// Demand faults that got no fault-around because working-set replay was running.
+    during_replay: u64,
 }
 
 /// A fault whose resolving ioctl (`UFFDIO_CONTINUE` for a MINOR clone, `UFFDIO_COPY` for a
@@ -2410,6 +2415,10 @@ struct VmState {
     /// `UFFDIO_ZEROPAGE` failed with EINVAL once, so every later zero answer of this clone is
     /// a private copy ([`VmContext::zero_fill`]).
     zero_page_refused: bool,
+    /// Working-set replay is running. Fault-around stands down for its duration: the
+    /// recorded set is the better prediction, and the two compete for the one task that
+    /// serves faults (#978).
+    replaying: bool,
     recorded: Option<PageSet>,
     /// When this clone's recording window closes. `None` means unbounded (a window too
     /// large for the clock to represent). Faults are always SERVED regardless; the deadline
@@ -2613,6 +2622,7 @@ async fn handle_vm_page_faults(
         given_back: GivenBackStats::default(),
         hole_zero_filled: 0,
         zero_page_refused: false,
+        replaying: false,
         recorded: working_set.as_deref().map(WorkingSetStore::recorder),
         // Anchored here, right after the handshake: the window is measured from the
         // moment this clone could first fault, not from server startup. A window the
@@ -3429,6 +3439,7 @@ async fn replay_working_set(
         }
         None => None,
     };
+    state.replaying = true;
     let ran = replay_segments(ctx, async_uffd, recorded, state, &mut workers).await;
     // A replay error enters the fail-closed path, which kills the VMM: the workers are
     // dropped, which closes the queue and joins them, with no flush and no wait for outcomes
@@ -3441,6 +3452,7 @@ async fn replay_working_set(
         }
         None => ReplayWorkersTally::default(),
     };
+    state.replaying = false;
     let mut ran = ran?;
     if tally.vm_gone {
         return Ok(Replay::Exited);
@@ -3996,6 +4008,8 @@ fn log_clone_finished(ctx: &VmContext<'_>, state: &VmState, reason: &str) {
             extra_pages = stats.extra_bytes / ctx.page_size as u64,
             extra_mib = stats.extra_bytes / (1024 * 1024),
             refused_granules = stats.refused,
+            uncached_skipped_mib = stats.uncached_bytes / (1024 * 1024),
+            faults_during_replay = stats.during_replay,
             "fault-around populated pages beyond the demanded ones"
         );
     }
@@ -4129,6 +4143,15 @@ fn populate_around_fault(
                 done += run;
                 continue;
             }
+            // A source page that is not in the host page cache is left to demand paging:
+            // copying it would wait on the disk inside the task that serves every fault
+            // (#978).
+            let (cached, run) = source_residency_run(mmap, at, run, ctx.page_size);
+            if !cached {
+                stats.uncached_bytes += run as u64;
+                done += run;
+                continue;
+            }
             let wanted = prefetch::Segment {
                 len: done + run,
                 ..segment
@@ -4161,6 +4184,66 @@ fn populate_around_fault(
         stats.extra_bytes += populated as u64;
     }
     vm_alive
+}
+
+/// Whether the memory file's bytes from `offset` are in the host page cache, and how many
+/// bytes from there, up to `max_len`, get the same answer, in whole pages of `page_size`.
+/// `offset` is page aligned and `max_len` is a positive multiple of `page_size`.
+///
+/// `mincore` reads the page cache without touching it, so asking does not read the file. A
+/// range `mincore` does not answer for, or one outside the mapping, counts as not cached:
+/// fault-around is speculation, and stepping over a page only leaves it to demand paging.
+/// A page that is in the cache but still being read counts as cached; a copy from it waits
+/// only for a read already in flight.
+fn source_residency_run(
+    mmap: &[u8],
+    offset: usize,
+    max_len: usize,
+    page_size: usize,
+) -> (bool, usize) {
+    const PAGES_PER_CALL: usize = 512;
+    let not_cached = (false, max_len);
+    let host_page = host_page_size() as usize;
+    if page_size != host_page
+        || max_len == 0
+        || offset
+            .checked_add(max_len)
+            .is_none_or(|end| end > mmap.len())
+    {
+        return not_cached;
+    }
+    let mut first: Option<bool> = None;
+    let mut run = 0usize;
+    let mut vec = [0u8; PAGES_PER_CALL];
+    while run < max_len {
+        let len = (max_len - run).min(PAGES_PER_CALL * host_page);
+        let pages = len.div_ceil(host_page);
+        // SAFETY: `[offset + run, offset + run + len)` lies inside `mmap` (checked above),
+        // its start is page aligned, and `vec` holds one byte for each of its `pages` pages.
+        let rc = unsafe {
+            libc::mincore(
+                mmap.as_ptr().add(offset + run) as *mut libc::c_void,
+                len,
+                vec.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return match first {
+                Some(cached) => (cached, run),
+                None => not_cached,
+            };
+        }
+        for &byte in &vec[..pages] {
+            let cached = byte & 1 != 0;
+            match first {
+                None => first = Some(cached),
+                Some(want) if want != cached => return (want, run),
+                Some(_) => {}
+            }
+            run += host_page;
+        }
+    }
+    (first.unwrap_or(false), max_len)
 }
 
 /// The rest of the granule around a demanded page: the pages after it, then the pages before
@@ -4432,9 +4515,17 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                             // wanted. A fault on a hole gets fault-around like any other: a
                             // page of zeros among data says nothing about its neighbours, and
                             // fault-around steps over the holes of the granule.
+                            //
+                            // And while working-set replay runs, there is no speculation at
+                            // all: the recorded set is the better prediction, and fault-around
+                            // would compete with it for this one task (#978).
                             let speculate = matches!(outcome, FaultOutcome::Resolved)
                                 && state.parked_faults.is_empty()
                                 && zero != Some(ZeroReason::GivenBack);
+                            if speculate && state.replaying && ctx.fault_around().is_some() {
+                                state.fault_around.during_replay += 1;
+                            }
+                            let speculate = speculate && !state.replaying;
                             if speculate
                                 && !populate_around_fault(
                                     uffd,
@@ -5049,6 +5140,7 @@ mod tests {
             given_back: GivenBackStats::default(),
             hole_zero_filled: 0,
             zero_page_refused: false,
+            replaying: false,
             recorded: None,
             record_until: None,
             started: origin,
@@ -5249,6 +5341,7 @@ mod tests {
             given_back: GivenBackStats::default(),
             hole_zero_filled: 0,
             zero_page_refused: false,
+            replaying: false,
             recorded: Some(PageSet::empty(mem_len)),
             record_until: Some(started), // zero-length window: closed before any fault
             started,
@@ -5273,6 +5366,7 @@ mod tests {
             given_back: GivenBackStats::default(),
             hole_zero_filled: 0,
             zero_page_refused: false,
+            replaying: false,
             recorded: Some(PageSet::empty(mem_len)),
             record_until: started.checked_add(DEFAULT_PREFETCH_RECORD_WINDOW),
             started,
@@ -5315,6 +5409,7 @@ mod tests {
             given_back: GivenBackStats::default(),
             hole_zero_filled: 0,
             zero_page_refused: false,
+            replaying: false,
             recorded: Some(store.recorder()),
             record_until: started.checked_add(window),
             started,
@@ -6446,6 +6541,7 @@ mod tests {
                 given_back: GivenBackStats::default(),
                 hole_zero_filled: 0,
                 zero_page_refused: false,
+                replaying: false,
                 recorded: Some(PageSet::empty(self.mem_size as u64)),
                 record_until: None,
                 started: std::time::Instant::now(),
@@ -7584,6 +7680,7 @@ mod tests {
                 given_back: GivenBackStats::default(),
                 hole_zero_filled: 0,
                 zero_page_refused: false,
+                replaying: false,
                 recorded: None,
                 record_until: None,
                 started: std::time::Instant::now(),
@@ -8604,16 +8701,67 @@ mod tests {
             region_pages: usize,
             features: userfaultfd::FeatureFlags,
         ) -> (Self, Uffd) {
-            let guard_pages = granule_pages.max(1);
-            // Long enough that an unclipped granule would still be inside the file: a missing
-            // clip must show up as resident guard pages and not as a refused copy.
-            let file_pages = first_file_page + region_pages + guard_pages;
+            let file_pages = Self::file_pages(granule_pages, first_file_page, region_pages);
             let mut snapshot =
                 memmap2::MmapMut::map_anon(file_pages * Self::PAGE).expect("mapping a snapshot");
             for (index, page) in snapshot.chunks_exact_mut(Self::PAGE).enumerate() {
                 page.fill((index + 1) as u8);
             }
             let mmap = snapshot.make_read_only().expect("sealing the snapshot");
+            Self::with_snapshot(granule_pages, first_file_page, region_pages, features, mmap)
+        }
+
+        /// Pages of the snapshot file for a clone of this shape. Long enough that an
+        /// unclipped granule would still be inside the file: a missing clip must show up as
+        /// resident guard pages and not as a refused copy.
+        fn file_pages(granule_pages: usize, first_file_page: usize, region_pages: usize) -> usize {
+            first_file_page + region_pages + granule_pages.max(1)
+        }
+
+        /// [`Self::new`] over a snapshot file on a disk, evicted from the page cache, and
+        /// mapped `MADV_RANDOM` so that a copy out of it reads the one page it copies and no
+        /// read-around. Page `i` is incompressible, with `i + 1` as its first byte, so a
+        /// compressing filesystem stores it as is and reads no neighbour with it.
+        fn on_disk(granule_pages: usize, region_pages: usize) -> (Self, Uffd) {
+            use crate::uffd::warmup::testing::{disk_dir, make_cold};
+            use std::io::Write;
+            let file_pages = Self::file_pages(granule_pages, 0, region_pages);
+            let mut file = tempfile::tempfile_in(disk_dir()).expect("a snapshot file");
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            for index in 0..file_pages {
+                let mut page = vec![0u8; Self::PAGE];
+                for word in page.chunks_exact_mut(8) {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    word.copy_from_slice(&state.to_le_bytes());
+                }
+                page[0] = (index + 1) as u8;
+                file.write_all(&page).expect("writing the snapshot file");
+            }
+            file.sync_all().expect("flushing the snapshot file");
+            // SAFETY: the file is unnamed and private to this test, and is not written again.
+            let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.expect("mapping it");
+            mmap.advise(memmap2::Advice::Random).expect("MADV_RANDOM");
+            make_cold(&file, &mmap, &[(0, (file_pages * Self::PAGE) as u64)]);
+            Self::with_snapshot(
+                granule_pages,
+                0,
+                region_pages,
+                userfaultfd::FeatureFlags::empty(),
+                mmap,
+            )
+        }
+
+        fn with_snapshot(
+            granule_pages: usize,
+            first_file_page: usize,
+            region_pages: usize,
+            features: userfaultfd::FeatureFlags,
+            mmap: memmap2::Mmap,
+        ) -> (Self, Uffd) {
+            let guard_pages = granule_pages.max(1);
+            let file_pages = Self::file_pages(granule_pages, first_file_page, region_pages);
             let (base, uffd) = missing_guest_memory(
                 (guard_pages + region_pages + guard_pages) * Self::PAGE,
                 features,
@@ -8671,6 +8819,7 @@ mod tests {
                 given_back: GivenBackStats::default(),
                 hole_zero_filled: 0,
                 zero_page_refused: false,
+                replaying: false,
                 recorded: Some(PageSet::empty((self.file_pages * Self::PAGE) as u64)),
                 record_until: None,
                 started: std::time::Instant::now(),
@@ -8802,6 +8951,120 @@ mod tests {
         );
         assert_eq!(state.fault_around.refused, 0);
         clone.unmap();
+    }
+
+    /// Fault-around stands down while working-set replay runs: the recorded set is the better
+    /// prediction, and fault-around competed with it for the one task that serves faults, so
+    /// replay with fault-around on an evicted memory file had not finished after 150 s (#978).
+    #[test]
+    fn a_fault_during_replay_gets_no_fault_around() {
+        let (clone, uffd) = FaultAroundClone::new(4, 0, 12);
+        let mut state = clone.state();
+        state.replaying = true;
+
+        assert_eq!(clone.touch(&uffd, &mut state, 5), 6, "the demanded page");
+
+        assert_eq!(clone.resident_region_pages(), vec![5]);
+        assert_eq!(state.fault_around.granules, 0);
+        assert_eq!(state.fault_around.during_replay, 1);
+
+        // Once replay is over the next fault gets its granule as before.
+        state.replaying = false;
+        assert_eq!(clone.touch(&uffd, &mut state, 9), 10);
+        assert_eq!(clone.resident_region_pages(), vec![5, 8, 9, 10, 11]);
+        assert_eq!(state.fault_around.granules, 1);
+        clone.unmap();
+
+        // `replay_working_set` raises the flag for the whole of the replay, workers included.
+        let source = include_str!("server.rs");
+        let replay = &source[source.find("\nasync fn replay_working_set(").unwrap()..];
+        let replay = &replay[..replay.find("\n}\n").unwrap()];
+        let raised = replay
+            .find("state.replaying = true;")
+            .expect("replay raises the flag");
+        let segments = replay.find("replay_segments(ctx,").unwrap();
+        let finished = replay.find("workers.finish(").unwrap();
+        let lowered = replay
+            .find("state.replaying = false;")
+            .expect("and lowers it");
+        assert!(
+            raised < segments && finished < lowered,
+            "the flag covers replay"
+        );
+    }
+
+    /// Fault-around populates only granule pages whose source is in the host page cache. A
+    /// page that is not would be read from disk inside the task that serves every fault, so
+    /// it is left to demand paging (#978).
+    #[test]
+    fn fault_around_steps_over_source_pages_that_are_not_cached() {
+        let (clone, uffd) = FaultAroundClone::on_disk(4, 12);
+        let mut state = clone.state();
+        let PageSource::Copy { mmap, .. } = &clone.source else {
+            unreachable!()
+        };
+        // Page 6 of the granule 4..8 is in the page cache; 4 and 7 are not.
+        // SAFETY: a byte inside the live read-only mapping.
+        assert_eq!(
+            unsafe { std::ptr::read_volatile(&mmap[6 * FaultAroundClone::PAGE]) },
+            7
+        );
+
+        assert_eq!(clone.touch(&uffd, &mut state, 5), 6, "the demanded page");
+
+        assert_eq!(
+            clone.resident_region_pages(),
+            vec![5, 6],
+            "the demanded page and the cached one, not the two that would be read from disk"
+        );
+        assert_eq!(clone.byte(6), 7);
+        assert_eq!(
+            state.fault_around.extra_bytes,
+            FaultAroundClone::PAGE as u64
+        );
+        assert_eq!(
+            state.fault_around.uncached_bytes,
+            2 * FaultAroundClone::PAGE as u64
+        );
+        clone.unmap();
+    }
+
+    /// The residency answer splits a range at every change, and a range `mincore` cannot
+    /// answer for counts as not cached.
+    #[test]
+    fn source_residency_runs_split_where_the_page_cache_changes() {
+        const PAGE: usize = 4096;
+        let mut anon = memmap2::MmapMut::map_anon(8 * PAGE).unwrap();
+        for page in [0, 1, 4] {
+            anon[page * PAGE] = 1;
+        }
+        let mmap = anon.make_read_only().unwrap();
+        assert_eq!(
+            source_residency_run(&mmap, 0, 8 * PAGE, PAGE),
+            (true, 2 * PAGE)
+        );
+        assert_eq!(
+            source_residency_run(&mmap, 2 * PAGE, 6 * PAGE, PAGE),
+            (false, 2 * PAGE)
+        );
+        assert_eq!(
+            source_residency_run(&mmap, 4 * PAGE, 4 * PAGE, PAGE),
+            (true, PAGE)
+        );
+        assert_eq!(
+            source_residency_run(&mmap, 5 * PAGE, 3 * PAGE, PAGE),
+            (false, 3 * PAGE)
+        );
+        assert_eq!(
+            source_residency_run(&mmap, 6 * PAGE, 4 * PAGE, PAGE),
+            (false, 4 * PAGE),
+            "past the end of the mapping"
+        );
+        assert_eq!(
+            source_residency_run(&mmap, 0, 2 * PAGE, 2 * PAGE),
+            (false, 2 * PAGE),
+            "a page size that is not the host's"
+        );
     }
 
     /// The region maps file pages 2..10, so with 4-page granules both of its ends fall inside
