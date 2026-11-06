@@ -4586,6 +4586,52 @@ async fn replay_segments(
     })
 }
 
+/// How often a clone's fault service reports its progress (#1148).
+const FAULT_PROGRESS_EVERY: Duration = Duration::from_secs(10);
+
+/// Whether `fd` has an event to read now, by `poll` with no wait: what the handler
+/// would read if its readiness had been signalled.
+fn readable_now(fd: RawFd) -> bool {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd, a zero timeout.
+    let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+    ready > 0 && pollfd.revents & libc::POLLIN != 0
+}
+
+/// One progress report: the faults served so far and since the last report, and
+/// whether faults are waiting that the handler has not read. The handler reads the
+/// queue whenever it is readable (it is checked before this report), so a queue that
+/// is readable here while no fault was served since the last report is a missed
+/// wakeup in this server, and a flat count with an empty queue means the guest is not
+/// faulting.
+fn report_fault_progress(ctx: &VmContext<'_>, state: &VmState, uffd: RawFd, last_count: u64) {
+    let since = state.fault_count - last_count;
+    let queued = readable_now(uffd);
+    if queued && since == 0 {
+        warn!(
+            target: "uffd",
+            vm_id = ctx.vm_id,
+            fault_count = state.fault_count,
+            elapsed_secs = state.started.elapsed().as_secs(),
+            "the clone has faults queued that this server has not read for {FAULT_PROGRESS_EVERY:?}"
+        );
+    } else {
+        debug!(
+            target: "uffd",
+            vm_id = ctx.vm_id,
+            fault_count = state.fault_count,
+            faults_since_last = since,
+            queued,
+            parked = state.parked_faults.by_page.len(),
+            "fault service progress"
+        );
+    }
+}
+
 async fn serve_faults(
     ctx: &VmContext<'_>,
     async_uffd: &AsyncFd<Uffd>,
@@ -4593,6 +4639,12 @@ async fn serve_faults(
     peer_pid: u32,
     state: &mut VmState,
 ) -> Result<()> {
+    let mut progress = tokio::time::interval_at(
+        tokio::time::Instant::now() + FAULT_PROGRESS_EVERY,
+        FAULT_PROGRESS_EVERY,
+    );
+    progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_count = state.fault_count;
     loop {
         let pause = (!state.parked_faults.is_empty()).then(|| state.parked_faults.retry_pause());
         let retry_due = async move {
@@ -4634,6 +4686,11 @@ async fn serve_faults(
             }
 
             _ = retry_due => {}
+
+            _ = progress.tick() => {
+                report_fault_progress(ctx, state, async_uffd.get_ref().as_raw_fd(), last_count);
+                last_count = state.fault_count;
+            }
         }
 
         if !retry_parked_faults(ctx, async_uffd.get_ref(), state)? {
@@ -5840,6 +5897,22 @@ mod tests {
 
     use super::*;
     use nix::fcntl::{Flock, FlockArg};
+
+    /// The progress report's queue check sees an event waiting and an empty queue.
+    #[test]
+    fn a_waiting_event_is_seen_without_reading_it() {
+        let (read, write) = nix::unistd::pipe().unwrap();
+        assert!(
+            !readable_now(read.as_raw_fd()),
+            "an empty pipe reads as queued"
+        );
+        nix::unistd::write(&write, b"x").unwrap();
+        assert!(
+            readable_now(read.as_raw_fd()),
+            "a queued byte reads as empty"
+        );
+        assert!(readable_now(read.as_raw_fd()), "looking consumed the byte");
+    }
 
     /// The fault trace is only useful if `faultanalyze.py` can read it, and that reader is
     /// hardcoded to `struct.unpack_from("<QQQ", data, i * 24)`. Encoding drift here would not
