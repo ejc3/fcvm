@@ -133,12 +133,35 @@ fn unique_regular_blocks(path: &Path) -> u64 {
     visit(path, &mut HashSet::new())
 }
 
+/// Regular files under `path` whose mtime is not `unix_seconds`.
+fn regular_files_with_mtime_other_than(path: &Path, unix_seconds: u64) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(path).unwrap_or_else(|error| panic!("read {path:?}: {error}")) {
+        let entry_path = entry
+            .unwrap_or_else(|error| panic!("read entry in {path:?}: {error}"))
+            .path();
+        let metadata = std::fs::symlink_metadata(&entry_path)
+            .unwrap_or_else(|error| panic!("stat {entry_path:?}: {error}"));
+        if metadata.file_type().is_dir() {
+            found.extend(regular_files_with_mtime_other_than(
+                &entry_path,
+                unix_seconds,
+            ));
+        } else if metadata.file_type().is_file() && metadata.mtime() != unix_seconds as i64 {
+            found.push(entry_path);
+        }
+    }
+    found
+}
+
 fn run_target_pruner(btrfs_root: &Path, runner_work_root: &Path) -> (bool, String) {
     let out = Command::new(repo_root().join("scripts/runner-disk-preflight.sh"))
         .arg("--target-dirs-only")
         .env("BTRFS_ROOT", btrfs_root)
         .env("RUNNER_WORK_ROOT", runner_work_root)
-        .env("TARGET_AGE_DAYS", "1")
+        // A cutoff a day ahead ("-1 days ago"), for the reason IDLE_CUTOFF gives: the caller
+        // ages files to make them idle, and a read by any other process must not undo that.
+        .env("TARGET_AGE_DAYS", "-1")
         .output()
         .expect("run target-dir preflight");
     let text = format!(
@@ -1852,13 +1875,25 @@ fn clear_fixture_compile_log(project: &Path) {
     }
 }
 
+/// The cutoff every direct pruner run in these tests uses: an hour from now, so every file the
+/// test wrote counts as idle however recently something read it.
+///
+/// The pruner keeps a target with any file written or read since its cutoff, and these tests
+/// make files idle by aging their timestamps. A past cutoff left them at the mercy of every
+/// other reader on the box: one read after the aging moves an atime to now (relatime updates it
+/// when the atime is not after the mtime, which aging guarantees) and the pruner keeps the
+/// target instead of doing what the test is about (#985). None of these tests is about the
+/// activity check, so the cutoff sits past anything a reader can set. What the activity check
+/// must not be broken by (reclaim refreshing its own files) is asserted on the timestamps.
+const IDLE_CUTOFF: &str = "1 hour";
+
 fn run_direct_target_pruner(
     target_root: &Path,
     fail_after_fingerprints: bool,
 ) -> std::process::Output {
     let mut command = Command::new(repo_root().join("scripts/prune-cargo-target.sh"));
     command.args([
-        std::ffi::OsStr::new("1 day ago"),
+        std::ffi::OsStr::new(IDLE_CUTOFF),
         std::ffi::OsStr::new("0"),
         std::ffi::OsStr::new(""),
         target_root.as_os_str(),
@@ -1995,6 +2030,16 @@ fn target_pruner_invalidates_cargo_before_reclaiming_hardlinked_payloads() {
         "Cargo fixture target has no allocated blocks"
     );
 
+    // Another process reading a cached file between the aging above and the pruner (#985).
+    // Under relatime a read moves the atime of an aged file to now (its atime is not after
+    // its mtime), and the pruner keeps a target with any file read since its cutoff. With a
+    // past cutoff that kept the generation and exited 0, which is the failure in #985:
+    // `left: Some(0), right: Some(49)`. The test controls neither the box's other readers nor
+    // the mount's atime policy, so it sets the atime itself, the same way every run.
+    std::fs::File::open(&rlib)
+        .expect("open helper rlib as a reader")
+        .set_times(FileTimes::new().set_accessed(SystemTime::now()))
+        .expect("record a read of the helper rlib");
     let interrupted = run_direct_target_pruner(&managed_root, true);
     let interrupted_text = format!(
         "{}{}",
@@ -2082,6 +2127,14 @@ fn target_pruner_invalidates_cargo_before_reclaiming_hardlinked_payloads() {
         "reclaim left most Cargo payload allocated: before={before_blocks} after={after_blocks}\n{completed_text}"
     );
 
+    // Reclaim must not refresh its own idle files: a truncated file with a new mtime would read
+    // as activity to the next pruner run. Checked on the timestamps rather than through a
+    // second run against a past cutoff, which any reader on the box can defeat (#985).
+    let refreshed = regular_files_with_mtime_other_than(&second_generation, 946_684_800);
+    assert!(
+        refreshed.is_empty(),
+        "reclaim refreshed the mtime of its own idle files: {refreshed:?}\n{completed_text}"
+    );
     let immediate_resume = run_direct_target_pruner(&managed_root, false);
     let immediate_text = format!(
         "{}{}",
@@ -2089,8 +2142,8 @@ fn target_pruner_invalidates_cargo_before_reclaiming_hardlinked_payloads() {
         String::from_utf8_lossy(&immediate_resume.stderr)
     );
     assert!(
-        immediate_resume.status.success() && !immediate_text.contains("keeping (active"),
-        "reclaim refreshed its own idle files and blocked immediate resume:\n{immediate_text}"
+        immediate_resume.status.success(),
+        "a pruner run right after reclaim failed:\n{immediate_text}"
     );
 
     let rebuilt = run_cargo_fixture_build(project.path(), target_root.path());
