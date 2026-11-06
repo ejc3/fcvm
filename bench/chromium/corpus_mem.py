@@ -668,11 +668,14 @@ def clone_forensics(args, clone, reason):
     #1135: in a 96-clone cell one clone's published port reset every connect
     for 30 s while fcvm's own readiness probe reached the guest's port from
     inside its namespace, and nothing recorded whether the host listener was
-    this clone's pasta or an earlier clone's. This records the host listeners
-    on the port with their owners (`ss -ltnp`), the clone's own pasta pid
-    (vm-disks/<vm_id>/pasta.pid) and whether it owns the endpoint's listener,
-    and, from inside the guest (`fcvm exec --vm`), whether DevTools answers on
-    127.0.0.1 there and which ports the guest listens on. Returns the path of
+    this clone's pasta or an earlier clone's. fcvm's readiness probe counts a
+    reset from the guest as an answer, so it does not show the port open. This
+    records the host listeners on the port with their owners (`ss -ltnp`), the
+    clone's own pasta pid (vm-disks/<vm_id>/pasta.pid) and whether it owns the
+    endpoint's listener, and, from inside the guest (`fcvm exec --vm`), whether
+    DevTools answers on 127.0.0.1 there, which ports the guest listens on and
+    by whom, the restore ingress gate's rules and counters, and whether a
+    browser process runs. Returns the path of
     the record; a collector that could not run says so in it."""
     host, _, port = clone.get("endpoint", ":").rpartition(":")
     record = {"clone": clone.get("name"), "reason": reason, "endpoint": clone.get("endpoint"),
@@ -714,7 +717,14 @@ def clone_forensics(args, clone, reason):
         # (rootfs-config.toml [packages]; reqbench's FailureProbe uses the same).
         probe = ("export PATH=/usr/sbin:/usr/bin:/sbin:/bin; "
                  f"r=$(printf 'GET /json/version HTTP/1.0\\r\\n\\r\\n' | nc -w 2 127.0.0.1 {port}); "
-                 "rc=$?; printf '%s\\n' \"$r\" | head -c 400; echo; echo nc_rc=$rc; ss -Htln")
+                 "rc=$?; printf '%s\\n' \"$r\" | head -c 400; echo; echo nc_rc=$rc; ss -Htlnp; "
+                 # The restore's ingress gate answers a new inbound TCP flow
+                 # with a reset until the restore publishes (fc-agent
+                 # snapshot_network.rs); its rules and counters say whether
+                 # the resets were the gate's.
+                 "for t in iptables ip6tables; do echo \"== $t\"; "
+                 "$t -w 2 -L FCVM_SNAPSHOT_IN -v -n -x 2>&1; done; "
+                 "echo '== browser'; pgrep -l chrom | head -5")
         try:
             inside = sh([args.fcvm, "exec", "--pid", str(clone["fcvm_pid"]), "--vm", "--",
                          "/bin/sh", "-c", probe], timeout=30)
