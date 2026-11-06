@@ -250,6 +250,55 @@ static void run() {
           (unsigned long long)late.generation());
     unlink(path2.c_str());
   }
+  // A read deadline bounds the whole read, not each call: a peer that sends a byte every
+  // 100 ms keeps every single read under any per-read timeout, and must still be cut off.
+  {
+    auto trickled = [](Conn& c, int peer_sends_ms, const char* what) {
+      c.set_read_deadline_ms(400);
+      char want[64];
+      auto t0 = std::chrono::steady_clock::now();
+      bool got = c.read_exact(want, sizeof want);
+      long ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+      CHECK(!got && ms >= 350 && ms < 1000, "%s: a trickling peer is cut off at the deadline (read %d, after %ld ms; it sends for %d ms)",
+            what, got ? 1 : 0, ms, peer_sends_ms);
+      c.set_read_deadline_ms(0);
+    };
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    std::thread plain_peer([fd = sv[1]] {
+      for (int i = 0; i < 30; i++) {
+        if (send(fd, "x", 1, MSG_NOSIGNAL) != 1) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+      close(fd);
+    });
+    {
+      Conn plain(sv[0], nullptr);
+      trickled(plain, 3000, "plain");
+      plain.shutdown_both();
+    }
+    plain_peer.join();
+    int tport;
+    int tfd = listen_lo(&tport);
+    std::thread tls_peer([tport] {
+      Client c(tport, 0);
+      for (int i = 0; c.ok && i < 30; i++) {
+        if (SSL_write(c.ssl, "x", 1) != 1) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+    });
+    int afd = accept(tfd, nullptr, nullptr);
+    std::string e;
+    std::unique_ptr<Conn> tc = front.accept(afd, 5000, &e);
+    CHECK(tc != nullptr, "the trickling TLS client connects (%s)", e.c_str());
+    if (tc) {
+      trickled(*tc, 3000, "TLS");
+      tc->shutdown_both();
+    }
+    tls_peer.join();
+    tc.reset();
+    close(tfd);
+  }
   shutdown(lfd, SHUT_RDWR);
   close(lfd);
   srv.join();

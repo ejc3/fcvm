@@ -139,19 +139,22 @@ Conn::~Conn() {
 
 void Conn::set_option(int level, int name, int value) { setsockopt(fd_, level, name, &value, sizeof value); }
 
-void Conn::set_read_timeout_ms(int ms) {
-  rto_ms_ = ms;
-  if (!ssl_) {
-    timeval tv{ms / 1000, (ms % 1000) * 1000};
-    setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-  }
+void Conn::set_read_deadline_ms(int ms) {
+  has_deadline_ = ms > 0;
+  deadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+}
+
+int Conn::read_wait_ms() const {
+  return has_deadline_ ? (int)std::clamp(ms_left(deadline_), 0L, (long)INT32_MAX) : -1;
 }
 
 void Conn::shutdown_both() { ::shutdown(fd_, SHUT_RDWR); }
 
 long Conn::read(void* buf, size_t n) {
+  if (has_deadline_ && ms_left(deadline_) <= 0) return -1;
   if (!ssl_) {
     while (true) {
+      if (has_deadline_ && !wait_fd(fd_, POLLIN, read_wait_ms())) return -1;
       ssize_t r = ::recv(fd_, buf, n, 0);
       if (r < 0 && errno == EINTR) continue;
       return (long)r;
@@ -168,9 +171,9 @@ long Conn::read(void* buf, size_t n) {
     if (r > 0) return r;
     if (e == SSL_ERROR_ZERO_RETURN) return 0;
     if (e == SSL_ERROR_WANT_READ) {
-      if (!wait_fd(fd_, POLLIN, rto_ms_ > 0 ? rto_ms_ : -1)) return -1;
+      if (!wait_fd(fd_, POLLIN, read_wait_ms())) return -1;
     } else if (e == SSL_ERROR_WANT_WRITE) {
-      if (!wait_fd(fd_, POLLOUT, rto_ms_ > 0 ? rto_ms_ : -1)) return -1;
+      if (!wait_fd(fd_, POLLOUT, read_wait_ms())) return -1;
     } else {
       return e == SSL_ERROR_SYSCALL ? 0 : -1;
     }

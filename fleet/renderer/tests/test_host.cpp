@@ -214,6 +214,20 @@ int main() {
     CHECK(ws >= 0 && needs > ws && first > needs && sub > first,
           "a stream that needs a direct token reads it from the first message before it subscribes (%ld %ld %ld %ld)", ws, needs, first,
           sub);
+    // One deadline per phase (tls_check.h tests the deadline itself): the request head, the
+    // admission message of /frames and /mirror, and none once a stream runs.
+    long handle = find_from(0, "void Server::handle(Conn& c)");
+    long head_deadline = find_from(handle, "c.set_read_deadline_ms(10000)");
+    long head_read = find_from(handle, "c.read(tmp, sizeof tmp)");
+    long admit_deadline = find_from(needs, "c.set_read_deadline_ms(ADMIT_WAIT_MS)");
+    long cleared = find_from(first, "c.set_read_deadline_ms(0)");
+    long mirror = find_from(0, "path == \"/mirror\"");
+    long mirror_deadline = find_from(mirror, "c.set_read_deadline_ms(ADMIT_WAIT_MS)");
+    long mirror_read = find_from(mirror, "read_ws_message(c, &op, &first)");
+    CHECK(handle >= 0 && head_deadline > handle && head_read > head_deadline && admit_deadline > needs && admit_deadline < first &&
+              cleared > first && cleared < sub && mirror_deadline > mirror && mirror_read > mirror_deadline,
+          "reads run under one deadline per phase (%ld %ld %ld %ld %ld %ld %ld)", head_deadline, head_read, admit_deadline, cleared,
+          mirror, mirror_deadline, mirror_read);
   }
 
   check_autopilot_lap();
