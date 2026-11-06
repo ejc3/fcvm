@@ -261,6 +261,10 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             }
             None
         }
+        Event::HostsExpected { hosts, .. } => {
+            state.fleet.expected_hosts = hosts.as_ref().map(|h| h.iter().cloned().collect());
+            None
+        }
         Event::ScaleInstances { instances, .. } => {
             let p = &mut state.fleet.power;
             if wake_open(p) {
@@ -1644,7 +1648,9 @@ fn drop_missing_from_races(f: &mut Fleet, at: u64) {
 ///   dropped (the driver terminates their instances). Each has a place, instance or not.
 /// - fcvm places: `max(min(fcvm_tiles, max_tiles) - phone GPUs - quarantined GPUs, fcvm
 ///   GPUs)`, where phone GPUs are those connected hosts run phones on and quarantined GPUs
-///   are wall GPUs of connected hosts out of rotation: no GPU can fill either's place. The
+///   are wall GPUs of connected hosts out of rotation: no GPU can fill either's place. Once
+///   every host the launcher keeps (`expected_hosts`) has connected, the first term is at
+///   most the GPUs the wall could place, so a GPU no hello listed leaves no place. The
 ///   GPUs are grouped into one band per host and the places left over are one dark band
 ///   below them.
 /// - Asleep, neither side has a place.
@@ -1671,6 +1677,9 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
     // the side is on the wall (a cold start, a wake) every GPU joins at once.
     let placed = |n: &u32| f.slots[n].position.is_some();
     let any_placed = wall.iter().any(placed);
+    // The GPUs the wall could place: once every host the launcher keeps has connected, no
+    // other GPU is coming, so a place beyond these would stay dark (#1517).
+    let eligible = wall.len().min(c.max_tiles);
     let beyond = wall.split_off(wall.len().min(c.max_tiles));
     let (mut active, warming): (Vec<u32>, Vec<u32>) = wall.into_iter().partition(|n| {
         let s = &f.slots[n];
@@ -1717,14 +1726,24 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
         .filter(|s| is_quarantined(f, s) && !host_draining(&f.hosts, s))
         .filter(|s| s.host.as_ref().is_some_and(|h| f.hosts.contains_key(h)))
         .count();
+    let all_connected = f
+        .expected_hosts
+        .as_ref()
+        .is_some_and(|ids| !ids.is_empty() && ids.iter().all(|id| f.hosts.contains_key(id)));
     let fcvm_places = if asleep {
         0
     } else {
-        c.fcvm_tiles
+        let configured = c
+            .fcvm_tiles
             .min(c.max_tiles)
             .saturating_sub(f.phones.len())
-            .saturating_sub(quarantined)
-            .max(active.len())
+            .saturating_sub(quarantined);
+        let configured = if all_connected {
+            configured.min(eligible)
+        } else {
+            configured
+        };
+        configured.max(active.len())
     };
     f.n = active.len();
     f.ec2_n = ec2_places.len();

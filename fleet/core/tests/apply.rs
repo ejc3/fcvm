@@ -551,6 +551,65 @@ fn phone_gpus_take_no_place_on_the_wall() {
     check_layout(&s);
 }
 
+/// A host whose hello lists fewer GPUs than the side's places (a GPU that failed before it
+/// was enumerated) leaves no place that no GPU will fill, once every host the coordinator
+/// launched has connected (#1517). While a launched host has not connected, its places
+/// hold, so its arrival re-tiles nothing; a replacement host the launcher lists brings them
+/// back.
+#[test]
+fn every_launched_host_connected_leaves_no_place_for_a_gpu_no_host_listed() {
+    let config = config_with(serde_json::json!({"ec2_max": 2, "fcvm_tiles": 8}));
+    let mut s = State::new(config, 0);
+    let fcvm = |s: &State| -> Vec<(String, Option<String>)> {
+        view(s)
+            .tiles
+            .iter()
+            .filter(|t| t.half == Half::Fcvm)
+            .map(|t| (t.id.clone(), t.slot.clone()))
+            .collect()
+    };
+    let expected = |at: u64, hosts: &[&str]| -> Event {
+        events(serde_json::json!([{"type": "hosts_expected", "at": at, "hosts": hosts}])).remove(0)
+    };
+    s = apply(s, &expected(500, &["h1", "h2"]));
+    s = apply(s, &hello(1000, "h1", 4));
+    for k in 1..=4 {
+        s = apply(s, &running(1000 + k * 10, "h1", &format!("slot-{k}")));
+    }
+    assert_eq!(fcvm(&s).len(), 8, "h2 has not connected: its places hold");
+    let generation = view(&s).layout.generation;
+    // h2's hello lists three of its four GPUs.
+    s = apply(s, &hello(2000, "h2", 3));
+    for k in 5..=7 {
+        s = apply(s, &running(2000 + k * 10, "h2", &format!("slot-{k}")));
+    }
+    let after = fcvm(&s);
+    assert_eq!(after.len(), 7, "every launched host connected: {after:?}");
+    assert!(after.iter().all(|(_, slot)| slot.is_some()), "{after:?}");
+    assert!(s.fleet.fcvm_dark.is_empty());
+    assert!(view(&s).layout.generation > generation);
+    check_layout(&s);
+    // h2 is reclaimed and the launcher lists its replacement: the places come back for it.
+    s = apply(
+        s,
+        &Event::AgentGone {
+            at: 3000,
+            host: "h2".into(),
+        },
+    );
+    s = apply(s, &expected(3100, &["h1", "h3"]));
+    assert_eq!(fcvm(&s).len(), 8, "h3 has not connected yet");
+    // A launcher that cannot say which hosts it expects keeps the configured places.
+    s = apply(s, &hello(4000, "h3", 3));
+    s = apply(
+        s,
+        &events(serde_json::json!([{"type": "hosts_expected", "at": 4100, "hosts": null}]))
+            .remove(0),
+    );
+    assert_eq!(fcvm(&s).len(), 8);
+    check_layout(&s);
+}
+
 /// An EC2 tile without an instance holds its place but has no renderer to report a fit, so
 /// it does not hold back the grid budget of the tiles that render.
 #[test]

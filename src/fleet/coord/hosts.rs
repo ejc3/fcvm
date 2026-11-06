@@ -205,6 +205,31 @@ pub fn excess(hosts: &[Host], want: u32) -> Vec<String> {
     live.into_iter().take(n).map(|h| h.id.clone()).collect()
 }
 
+/// The hosts the launcher keeps for `want` per region, by instance id, sorted: every
+/// region's pending or running hosts less those over the capacity. `None` while any region
+/// is unlisted or short of `want`, or asleep.
+pub fn expected_hosts(listed: &[Option<Vec<Host>>], want: u32) -> Option<Vec<String>> {
+    if want == 0 {
+        return None;
+    }
+    let mut ids = Vec::new();
+    for hosts in listed {
+        let hosts = hosts.as_ref()?;
+        let over = excess(hosts, want);
+        let kept: Vec<String> = hosts
+            .iter()
+            .filter(|h| h.live() && !over.contains(&h.id))
+            .map(|h| h.id.clone())
+            .collect();
+        if kept.len() < want as usize {
+            return None;
+        }
+        ids.extend(kept);
+    }
+    ids.sort();
+    Some(ids)
+}
+
 /// Which of a wake's running hosts came from which market.
 pub fn path_name(spot: u32, on_demand: u32) -> &'static str {
     match (spot > 0, on_demand > 0) {
@@ -270,6 +295,7 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
     // Per region and market, a launch whose outcome is unknown: its token and count.
     let mut tokens: Tokens = HashMap::new();
     let mut last_want: Option<u32> = None;
+    let mut last_expected: Option<Option<Vec<String>>> = None;
     // A degraded `scale` was reported and not cleared yet.
     let mut reported = false;
     loop {
@@ -476,6 +502,18 @@ pub async fn run(cfg: HostConfig, mut power: watch::Receiver<String>, handle: Ha
             } else {
                 busy = true;
             }
+        }
+        // The hosts kept for the awake capacity, once every region is listed and holds that
+        // many: the side then needs no place for a GPU no connected host listed (#1517).
+        let expected = expected_hosts(&listed, want);
+        if last_expected.as_ref() != Some(&expected) {
+            handle
+                .send(Event::HostsExpected {
+                    at: 0,
+                    hosts: expected.clone(),
+                })
+                .await;
+            last_expected = Some(expected);
         }
         if watching {
             handle
@@ -1338,6 +1376,27 @@ mod tests {
             state: state.into(),
             market,
         }
+    }
+
+    /// Every region listed and at its capacity: its live hosts less the excess. A region
+    /// unlisted or short, or asleep, says nothing.
+    #[test]
+    fn expected_hosts_are_the_kept_hosts_of_full_regions_only() {
+        let a = vec![
+            host("i-2", "running", Market::Spot),
+            host("i-1", "pending", Market::OnDemand),
+            host("i-0", "shutting-down", Market::Spot),
+        ];
+        let b = vec![host("i-3", "running", Market::Spot)];
+        assert_eq!(
+            expected_hosts(&[Some(a.clone()), Some(b.clone())], 1),
+            Some(vec!["i-2".to_string(), "i-3".to_string()]),
+            "the on-demand host over the capacity is not kept"
+        );
+        assert_eq!(expected_hosts(&[Some(a.clone()), Some(b.clone())], 2), None);
+        assert_eq!(expected_hosts(&[Some(a.clone()), None], 1), None);
+        assert_eq!(expected_hosts(&[Some(a), Some(b)], 0), None);
+        assert_eq!(expected_hosts(&[Some(vec![])], 1), None);
     }
 
     #[test]
