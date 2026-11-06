@@ -170,6 +170,44 @@ int main(int argc, char** argv) {
   }
   r.set_checkerboard(-1);
 
+  // 4a. Neighbours at different strides (the coordinator's every-pixel grant,
+  // PROTOCOL.md "Grid budget"): each tile is the whole image drawn at its own
+  // stride, whatever its neighbours draw, so a tile edge between strides joins
+  // two correct images. Moving, with history, one sample on each drawn pixel.
+  {
+    std::vector<std::pair<double, int>> seq;
+    const long k0 = 37 * 30;
+    for (int k = 0; k < 12; k++) seq.push_back({(k0 + k) / 30.0, 1});
+    Img w1, w2, qm[4];
+    r.set_checkerboard(0);
+    w1 = draw(r, s, Rect{0, 0, 1, 1}, 2 * h, seq, true);
+    r.set_checkerboard(2);
+    w2 = draw(r, s, Rect{0, 0, 1, 1}, 2 * h, seq, true);
+    const int stride_of[4] = {1, 2, 2, 1};
+    for (int k = 0; k < 4; k++) {
+      r.set_checkerboard(stride_of[k] == 1 ? 0 : 2);
+      qm[k] = draw(r, s, Rect{0.5 * (k & 1), 0.5 * (k >> 1), 0.5, 0.5}, h, seq, true);
+    }
+    r.set_checkerboard(-1);
+    long off = 0, offh = 0, between = 0;
+    for (int k = 0; k < 4; k++) {
+      const Img& w = stride_of[k] == 1 ? w1 : w2;
+      const Img& t = qm[k];
+      for (int j = 0; j < t.tile.h; j++)
+        for (int i = 0; i < t.tile.w; i++) {
+          int X = t.tile.x0 + i, Y = t.tile.y0 + j;
+          if (X >= w.tile.w || Y >= w.tile.h) continue;
+          size_t a = 4 * ((size_t)Y * w.tile.w + X), b = 4 * ((size_t)j * t.tile.w + i);
+          off += memcmp(&w.rgba[a], &t.rgba[b], 4) != 0;
+          offh += memcmp(&w.hdr[a], &t.hdr[b], 16) != 0;
+          between += memcmp(&w1.rgba[a], &w2.rgba[a], 3) != 0;
+        }
+    }
+    CHECK(off == 0 && offh == 0, "strides 1 and 2 side by side: %ld pixels differ from the whole image at the tile's stride (8-bit), %ld (float)",
+          off, offh);
+    CHECK(between > 1000, "control: the two strides draw different pixels (%ld)", between);
+  }
+
   // 4b. A checkerboard frame traces only its drawn pixels: the trace of a stride-2
   // frame takes about half a full frame's, stride 4 about a quarter. Launched over
   // every pixel, a warp ran its drawn lanes and idled the rest, and the stride

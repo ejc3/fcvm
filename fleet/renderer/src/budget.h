@@ -11,31 +11,40 @@
 #include <vector>
 
 // Budgets that take effect from a frame slot: every tile is given the same
-// entries, so every tile uses the same budget at the same slot.
+// budgets, so every tile uses the same budget at the same slot. An entry may
+// also say every_pixel: the tile's own fit lets it draw every pixel, so it
+// draws at least effective_budget's one sample a pixel (below) whatever the
+// grid's budget would give its size.
 class BudgetSchedule {
  public:
   // From slot k on, use budget b. A later entry for the same slot replaces it.
-  void add(long long k, double b) {
+  void add(long long k, double b, bool every_pixel = false) {
     for (auto& e : v_)
-      if (e.first == k) { e.second = b; return; }
-    v_.emplace_back(k, b);
-    std::sort(v_.begin(), v_.end());
+      if (e.k == k) { e.b = b; e.every_pixel = every_pixel; return; }
+    v_.push_back({k, b, every_pixel});
+    std::sort(v_.begin(), v_.end(), [](const E& x, const E& y) { return x.k < y.k; });
   }
   // The budget for slot k: the latest entry at or before k. Entries older than
   // the one in effect at k are dropped.
-  bool at(long long k, double* b) {
+  bool at(long long k, double* b, bool* every_pixel = nullptr) {
     int in = -1;
     for (int i = 0; i < (int)v_.size(); i++)
-      if (v_[i].first <= k) in = i;
+      if (v_[i].k <= k) in = i;
     if (in < 0) return false;
     if (in > 0) v_.erase(v_.begin(), v_.begin() + in);
-    *b = v_[0].second;
+    *b = v_[0].b;
+    if (every_pixel) *every_pixel = v_[0].every_pixel;
     return true;
   }
   size_t size() const { return v_.size(); }
 
  private:
-  std::vector<std::pair<long long, double>> v_;
+  struct E {
+    long long k;
+    double b;
+    bool every_pixel;
+  };
+  std::vector<E> v_;
 };
 
 // The schedule a new scene leaves. On the same clock (the same epoch_unix_ms,
@@ -50,7 +59,8 @@ inline BudgetSchedule schedule_after_scene(BudgetSchedule s, bool same_clock, bo
   if (same_clock) return s;
   BudgetSchedule n;
   double b;
-  if (s.at(k_last, &b)) n.add(0, b);
+  bool ep = false;
+  if (s.at(k_last, &b, &ep)) n.add(0, b, ep);
   return n;
 }
 
@@ -65,6 +75,17 @@ inline double budget_fit(double samples_drawn, double render_ms, double slot_ms,
 // The checkerboard stride for a budget per drawn pixel: a quarter of the
 // pixels under 0.3, half under 0.5, else every pixel (PROTOCOL.md).
 inline int stride_for(double per_px) { return per_px < 0.3 ? 4 : per_px < 0.5 ? 2 : 1; }
+
+// The smallest budget at which a frame of `px` drawn pixels draws every pixel
+// (stride 1, one sample each), and the budget a tile draws when its schedule
+// says every_pixel: the grid's, or that one where the grid's would leave pixels
+// undrawn. The coordinator grants every_pixel to a tile whose own fit reaches
+// every_pixel_budget (PROTOCOL.md, "Grid budget"); applied at the size the
+// tile draws, it stays one sample a pixel when the height guard changes it.
+inline double every_pixel_budget(double px) { return 0.5 * px; }
+inline double effective_budget(double b, bool every_pixel, double px) {
+  return every_pixel ? std::max(b, every_pixel_budget(px)) : b;
+}
 
 // Samples a frame of `px` drawn pixels really draws for budget b (a stride
 // draws one sample on its share of the pixels, whatever the budget).

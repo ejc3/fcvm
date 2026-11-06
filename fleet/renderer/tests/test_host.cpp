@@ -510,6 +510,30 @@ int main() {
     c.add(200, 9e5);
     c.add(200, 5e5);
     CHECK(c.at(210, &x) && x == 5e5, "a later entry for the same slot replaces it");
+    {
+      // every_pixel: a tile whose own fit lets it draw every pixel draws one
+      // sample on each at any drawn size, and nothing more; without it, the
+      // grid's budget as posted.
+      BudgetSchedule e;
+      bool ep = true;
+      e.add(100, 2.1e5);
+      e.add(130, 2.1e5, true);
+      e.add(170, 2.1e5, false);
+      CHECK(e.at(120, &x, &ep) && !ep && e.at(130, &x, &ep) && ep && e.at(169, &x, &ep) && ep && e.at(170, &x, &ep) && !ep,
+            "every_pixel takes effect at its slot and a later entry ends it");
+      bool all = true;
+      for (double px : {300000.0, 550896.0, 571120.0, 645018.0, 1.2e6}) {
+        double b = effective_budget(2.1e5, true, px);
+        all = all && stride_for(b / px) == 1 && samples_for(b, px) == px && b == std::max(2.1e5, every_pixel_budget(px));
+        all = all && effective_budget(2.1e5, false, px) == 2.1e5;
+        all = all && effective_budget(4e6, true, px) == 4e6;  // the grid's already draws every pixel
+      }
+      CHECK(all, "every_pixel draws one sample on every drawn pixel at any size, never fewer than the grid's");
+      BudgetSchedule f;
+      f.add(100, 2.1e5, true);
+      BudgetSchedule g = schedule_after_scene(f, false, false, 140);
+      CHECK(g.at(0, &x, &ep) && x == 2.1e5 && ep, "a new clock keeps every_pixel with the budget in force");
+    }
     CHECK(std::fabs(budget_fit(1e6, 20.0, 1000.0 / 30) - 1e6 * 0.7 * (1000.0 / 30) / 20.0) < 1, "fit at 70%% of a slot");
     CHECK(ladder_floor(250000) == 250000 && ladder_floor(297302) == 297302 && ladder_floor(297300) == 250000 &&
               ladder_floor(1e6) == 1000000 && ladder_floor(10) == 62500,

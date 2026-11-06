@@ -1807,7 +1807,7 @@ impl ec2::Ec2Driver for RestartingRendererEc2 {
 
 #[tokio::test]
 async fn an_ec2_renderer_restarted_on_its_instance_gets_its_scene_again() {
-    use fleet_core::protocol::{AssignSlot, BudgetBody, SharedScene};
+    use fleet_core::protocol::{AssignSlot, BudgetPlan, SharedScene};
     let boot = Arc::new(std::sync::Mutex::new("boot-1".to_string()));
     let scenes = Arc::new(std::sync::Mutex::new(Vec::new()));
     let budgets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1840,9 +1840,10 @@ async fn an_ec2_renderer_restarted_on_its_instance_gets_its_scene_again() {
         &fleet_core::scene::Scene::new(1_000),
         32.0 / 9.0,
     )));
-    let (_budget, budget) = tokio::sync::watch::channel(Some(BudgetBody {
+    let (_budget, budget) = tokio::sync::watch::channel(Some(BudgetPlan {
         budget: 500_000,
         t: 1.0,
+        every_pixel: Default::default(),
     }));
     tokio::spawn(ec2::run(driver, assign, scene, budget, handle));
     let count = |s: &Arc<std::sync::Mutex<Vec<String>>>| s.lock().unwrap().len();
@@ -1928,7 +1929,7 @@ impl ec2::Ec2Driver for SceneGateEc2 {
 
 #[tokio::test]
 async fn an_ec2_tile_is_reported_running_only_after_its_renderer_has_its_scene() {
-    use fleet_core::protocol::{AssignSlot, BudgetBody, SharedScene};
+    use fleet_core::protocol::{AssignSlot, BudgetPlan, SharedScene};
     let gate = Arc::new(tokio::sync::Notify::new());
     let called = Arc::new(tokio::sync::Notify::new());
     let scenes = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1961,9 +1962,10 @@ async fn an_ec2_tile_is_reported_running_only_after_its_renderer_has_its_scene()
         &fleet_core::scene::Scene::new(1_000),
         32.0 / 9.0,
     )));
-    let (_budget, budget) = tokio::sync::watch::channel(Some(BudgetBody {
+    let (_budget, budget) = tokio::sync::watch::channel(Some(BudgetPlan {
         budget: 500_000,
         t: 1.0,
+        every_pixel: Default::default(),
     }));
     tokio::spawn(ec2::run(driver, assign, scene, budget, handle));
     tokio::time::timeout(Duration::from_secs(10), called.notified())
@@ -2045,7 +2047,7 @@ impl ec2::Ec2Driver for RegionNamedEc2 {
 /// A viewer is told the region a tile runs in, never its instance id.
 #[tokio::test]
 async fn a_running_ec2_tile_reports_its_region_as_its_place_and_not_its_instance() {
-    use fleet_core::protocol::{AssignSlot, BudgetBody, SharedScene};
+    use fleet_core::protocol::{AssignSlot, BudgetPlan, SharedScene};
     let (handle, reports) = recording_handle();
     let tile = AssignSlot {
         id: "ec2-1".into(),
@@ -2070,9 +2072,10 @@ async fn a_running_ec2_tile_reports_its_region_as_its_place_and_not_its_instance
         &fleet_core::scene::Scene::new(1_000),
         32.0 / 9.0,
     )));
-    let (_budget, budget) = tokio::sync::watch::channel(Some(BudgetBody {
+    let (_budget, budget) = tokio::sync::watch::channel(Some(BudgetPlan {
         budget: 500_000,
         t: 1.0,
+        every_pixel: Default::default(),
     }));
     tokio::spawn(ec2::run(
         Arc::new(RegionNamedEc2),
@@ -5169,6 +5172,7 @@ async fn the_slowest_tile_sets_one_budget_for_every_tile() {
                 budget_fit: Some(fit),
                 t: Some(t),
                 render_ms_max: None,
+                budget_every_pixel: None,
             }))
             .unwrap();
     }
@@ -5191,7 +5195,67 @@ async fn the_slowest_tile_sets_one_budget_for_every_tile() {
         assert!(Instant::now() < deadline, "the EC2 tile got no budget");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(driver.posted.lock().unwrap()[0], got);
+    assert_eq!(
+        driver.posted.lock().unwrap()[0],
+        fleet_core::protocol::BudgetBody {
+            budget: got.budget,
+            t: got.t,
+            every_pixel: false
+        }
+    );
+}
+
+/// A tile whose own fit draws every pixel while the grid's budget gives it a checkerboard
+/// is granted every pixel after three rounds; the slowest tile keeps the grid's budget and
+/// its checkerboard.
+#[tokio::test]
+async fn a_tile_whose_fit_draws_every_pixel_is_granted_it() {
+    let (handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 2);
+    agent.assign().await;
+    agent.report("slot-1", "running", 1);
+    agent.report("slot-2", "running", 1);
+    // slot-1 fits 825,518 (every pixel of its 550,896 at one sample), slot-2 only its
+    // checkerboard (275,173): the grid is under both every-pixel budgets.
+    for (id, fit) in [("slot-1", 825_518.0), ("slot-2", 275_173.0)] {
+        agent
+            .to_coord
+            .send(AgentMsg::Health(fleet_core::protocol::HealthReport {
+                id: id.into(),
+                fps: 30.0,
+                gpu: Value::Null,
+                budget_fit: Some(fit),
+                t: Some(5.0),
+                render_ms_max: None,
+                budget_every_pixel: Some(275_448.0),
+            }))
+            .unwrap();
+    }
+    let got = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let CoordMsg::Budget(b) = agent.next().await {
+                if b.every_pixel.values().any(|e| e.on) {
+                    return b;
+                }
+            }
+        }
+    })
+    .await
+    .expect("a grant within 30 s");
+    assert!(
+        got.budget < 275_448,
+        "the grid draws a checkerboard: {}",
+        got.budget
+    );
+    assert!(got.for_tile("slot-1").every_pixel);
+    assert!(!got.for_tile("slot-2").every_pixel);
 }
 
 /// One instance of [`PoolEc2`]: state, tags, image, spot request.

@@ -15,12 +15,23 @@
 //! - a change takes effect for every tile at one scene time `t`, a second past the newest
 //!   frame any tile has drawn, rounded up to a frame.
 //!
+//! A tile whose own fit reaches the budget at which it draws every pixel
+//! (`budget_every_pixel`, one sample on each, stride 1) while the grid's budget gives it a
+//! checkerboard is granted `every_pixel` after three rounds in a row allow it, at its own
+//! scene time; the grant ends at once when its fit falls under that budget or its frames
+//! overrun, and a granted tile's overrun does not move the grid. So every tile that can draw
+//! every pixel does, and the others draw the grid's checkerboard. Each tile's pixels are
+//! the whole image's at its own stride, so its edge with a neighbour at another stride is
+//! the edge between two correct images (the renderer's seam test, per stride).
+//!
 //! Layout generations do not move the budget. Every tile of the wall covers the same share
 //! of the image (each side is as wide as its share of the tiles), so one budget gives every
 //! tile the same samples per pixel, and the same path, in any layout, and a re-tile changes
 //! them for all tiles at the layout's frame. A tile's fit is a cost model of its GPU (a fixed
 //! part per frame and a cost per sample on each path), which a tile's size changes little;
 //! a re-tile that does is answered at the next round.
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -54,15 +65,98 @@ pub struct Budget {
     #[serde(default)]
     pub up_rounds: u32,
     pub next_round_at: u64,
+    /// Every wall tile's every-pixel grant, by tile id.
+    #[serde(default)]
+    pub every_pixel: BTreeMap<String, TileGrant>,
+}
+
+/// A tile's every-pixel grant, the scene time of its last change, and the rounds in a row
+/// that have allowed one.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct TileGrant {
+    pub on: bool,
+    pub t: f64,
+    #[serde(default)]
+    pub up_rounds: u32,
+}
+
+/// One wall tile as a round sees it: its fit, the budget at which it draws every pixel, and
+/// whether its slowest frame over the last 2 s overran 90% of a slot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TileFit<'a> {
+    pub id: &'a str,
+    pub fit: Option<f64>,
+    pub every_pixel_budget: Option<f64>,
+    pub overloaded: bool,
 }
 
 impl Budget {
-    /// The budget in force and its start, as posted to renderers.
-    pub fn body(&self) -> Option<crate::protocol::BudgetBody> {
-        Some(crate::protocol::BudgetBody {
+    /// The budget in force and its start, with every tile's grant, as posted to renderers.
+    pub fn body(&self) -> Option<crate::protocol::BudgetPlan> {
+        Some(crate::protocol::BudgetPlan {
             budget: self.current?,
             t: self.from_t?,
+            every_pixel: self
+                .every_pixel
+                .iter()
+                .map(|(id, g)| (id.clone(), crate::protocol::EveryPixel { on: g.on, t: g.t }))
+                .collect(),
         })
+    }
+
+    /// Whether tile `id` draws more than the grid's budget gives it: its grant is on and the
+    /// grid's budget is under the one at which it draws every pixel. Such a tile's overrun
+    /// ends its grant and does not move the grid.
+    pub fn elevated(&self, id: &str, every_pixel_budget: Option<f64>) -> bool {
+        let on = self.every_pixel.get(id).is_some_and(|g| g.on);
+        match (self.current, every_pixel_budget) {
+            (Some(cur), Some(e)) => on && (cur as f64) < e,
+            _ => on,
+        }
+    }
+
+    /// The every-pixel grants, after the grid's round: a tile the grid's budget would draw
+    /// at a checkerboard whose fit reaches its `every_pixel_budget` is granted after three
+    /// rounds in a row allow it; a grant ends when the fit falls under that budget or the
+    /// tile's frames overrun. A tile with no fit keeps what it has, unless it overruns.
+    /// Tiles no longer on the wall are forgotten. Returns whether a grant changed.
+    pub fn strides(&mut self, tiles: &[TileFit], newest_t: f64) -> bool {
+        let Some(cur) = self.current else {
+            return false;
+        };
+        self.every_pixel
+            .retain(|id, _| tiles.iter().any(|t| t.id == id.as_str()));
+        let start = ((newest_t + LEAD_SECS) * 30.0).ceil() / 30.0;
+        let mut changed = false;
+        for t in tiles {
+            let g = self.every_pixel.entry(t.id.to_string()).or_default();
+            let affords = match (t.fit, t.every_pixel_budget) {
+                (Some(f), Some(e)) => Some(f.is_finite() && f >= e),
+                _ => None,
+            };
+            if g.on {
+                if t.overloaded || affords == Some(false) {
+                    g.on = false;
+                    g.t = start;
+                    g.up_rounds = 0;
+                    changed = true;
+                }
+                continue;
+            }
+            let needed = t.every_pixel_budget.is_some_and(|e| (cur as f64) < e);
+            if needed && affords == Some(true) && !t.overloaded {
+                g.up_rounds += 1;
+                if g.up_rounds >= 3 {
+                    g.on = true;
+                    g.t = start;
+                    g.up_rounds = 0;
+                    changed = true;
+                }
+            } else {
+                g.up_rounds = 0;
+            }
+        }
+        changed
     }
 
     /// One round. `fits` holds every placed tile's fit (`None` for a tile that has not
@@ -151,6 +245,96 @@ impl Budget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tile<'a>(id: &'a str, fit: f64, every: f64, overloaded: bool) -> TileFit<'a> {
+        TileFit {
+            id,
+            fit: Some(fit),
+            every_pixel_budget: Some(every),
+            overloaded,
+        }
+    }
+
+    #[test]
+    fn a_tile_whose_fit_draws_every_pixel_draws_every_pixel() {
+        // Staging, 2026-11-05: the grid sat at 250,000 (a checkerboard on every 432- and
+        // 540-line tile) because five heavy tiles could not draw every pixel, while the
+        // others reported fits that could (825,518 at 432 lines, 275,448 every-pixel
+        // budget). Those draw every pixel now; the heavy ones keep the grid's checkerboard.
+        let mut b = Budget::default();
+        let light = |o| tile("ec2:1", 825_518.0, 275_448.0, o);
+        let heavy = |o| tile("ec2:5", 275_173.0, 275_448.0, o);
+        assert!(b.round(&[Some(825_518.0), Some(275_173.0)], false, 10.0));
+        assert!(b.current.unwrap() < 275_448);
+        for r in 0..2 {
+            assert!(
+                !b.strides(&[light(false), heavy(false)], 10.0 + r as f64),
+                "three rounds first"
+            );
+        }
+        assert!(b.strides(&[light(false), heavy(false)], 12.0));
+        let plan = b.body().unwrap();
+        let l = plan.for_tile("ec2:1");
+        let h = plan.for_tile("ec2:5");
+        assert!(l.every_pixel && !h.every_pixel);
+        assert_eq!(
+            (l.budget, h.budget),
+            (b.current.unwrap(), b.current.unwrap())
+        );
+        assert_eq!(
+            l.t,
+            ((12.0 + LEAD_SECS) * 30.0f64).ceil() / 30.0,
+            "at its own scene time"
+        );
+        assert!(b.elevated("ec2:1", Some(275_448.0)) && !b.elevated("ec2:5", Some(275_448.0)));
+
+        // Its frames overrun: the grant ends at once, at a later time, and the grid stays.
+        let grid = b.current;
+        assert!(
+            !b.round(&[Some(825_518.0), Some(275_173.0)], false, 20.0),
+            "an elevated tile's overrun is not the grid's"
+        );
+        assert!(b.strides(&[light(true), heavy(false)], 20.0));
+        assert_eq!(b.current, grid);
+        let ended = b.body().unwrap().for_tile("ec2:1");
+        assert!(
+            !ended.every_pixel && ended.t > l.t,
+            "the end is posted at its own time"
+        );
+
+        // A fit that falls under the every-pixel budget ends it too.
+        for r in 0..3 {
+            b.strides(&[light(false), heavy(false)], 30.0 + r as f64);
+        }
+        assert!(b.body().unwrap().for_tile("ec2:1").every_pixel);
+        assert!(b.strides(
+            &[tile("ec2:1", 275_173.0, 275_448.0, false), heavy(false)],
+            40.0
+        ));
+        assert!(!b.body().unwrap().for_tile("ec2:1").every_pixel);
+
+        // A tile that leaves the wall is forgotten; one with no fit keeps what it has.
+        for r in 0..3 {
+            b.strides(&[light(false)], 50.0 + r as f64);
+        }
+        let nofit = TileFit {
+            id: "ec2:1",
+            fit: None,
+            every_pixel_budget: None,
+            overloaded: false,
+        };
+        assert!(!b.strides(&[nofit], 60.0));
+        assert!(b.body().unwrap().for_tile("ec2:1").every_pixel);
+        assert!(!b.body().unwrap().every_pixel.contains_key("ec2:5"));
+
+        // Where the grid's budget already draws every pixel there is nothing to grant.
+        let mut c = Budget::default();
+        c.round(&[Some(4e6)], false, 10.0);
+        for r in 0..5 {
+            assert!(!c.strides(&[tile("ec2:2", 4e6, 275_448.0, false)], 10.0 + r as f64));
+        }
+        assert!(!c.body().unwrap().for_tile("ec2:2").every_pixel);
+    }
 
     #[test]
     fn the_ladder_matches_the_reference() {

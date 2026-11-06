@@ -220,6 +220,9 @@ pub struct HealthReport {
     /// The slowest render over its last 2 s (`frames_2s.render_ms_max`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_ms_max: Option<f64>,
+    /// The budget at which it draws every pixel at its drawn size (`budget_every_pixel`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_every_pixel: Option<f64>,
 }
 
 impl HealthReport {
@@ -235,6 +238,7 @@ impl HealthReport {
             budget_fit: num(h.get("budget_fit")).filter(|_| ready),
             t: num(h.get("t")),
             render_ms_max: num(h.get("frames_2s").and_then(|f| f.get("render_ms_max"))),
+            budget_every_pixel: num(h.get("budget_every_pixel")).filter(|v| *v > 0.0),
         }
     }
 }
@@ -439,8 +443,9 @@ pub enum CoordMsg {
     },
     Scene(SharedScene),
     /// The grid's budget: every renderer draws `budget` pixel-samples per frame from the
-    /// first frame at or after scene time `t` (`POST /budget`, again after every scene).
-    Budget(BudgetBody),
+    /// first frame at or after scene time `t` (`POST /budget`, again after every scene),
+    /// and the tiles that draw every pixel (`BudgetPlan::for_tile`).
+    Budget(BudgetPlan),
     /// A state that holds the agent's `quarantine` report `report` for this GPU (or an
     /// operator's release that came after it) is stored: the agent stops replaying that
     /// report.
@@ -459,11 +464,53 @@ fn is_zero(n: &u32) -> bool {
     *n == 0
 }
 
-/// The body of a renderer's `POST /budget`.
+/// The body of a renderer's `POST /budget`. With `every_pixel` the renderer draws at
+/// least one sample on every pixel it draws, whatever stride `budget` would give its size
+/// (fleet/PROTOCOL.md, "Grid budget").
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BudgetBody {
     pub budget: u64,
     pub t: f64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub every_pixel: bool,
+}
+
+/// One tile's every-pixel grant: on or off from scene time `t`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EveryPixel {
+    pub on: bool,
+    pub t: f64,
+}
+
+/// The budget of every wall tile: the grid's, and, by tile id, the grants of the tiles
+/// whose own fit lets them draw every pixel (and of those whose grant ended, so its end
+/// is posted at its own time).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BudgetPlan {
+    pub budget: u64,
+    pub t: f64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub every_pixel: BTreeMap<String, EveryPixel>,
+}
+
+impl BudgetPlan {
+    /// The `POST /budget` body for tile `id`: the grid's budget with the tile's grant, from
+    /// the later of the two changes, so a body posted again after a scene post or posted
+    /// late says exactly what is in force from its `t` on.
+    pub fn for_tile(&self, id: &str) -> BudgetBody {
+        match self.every_pixel.get(id) {
+            Some(e) => BudgetBody {
+                budget: self.budget,
+                t: self.t.max(e.t),
+                every_pixel: e.on,
+            },
+            None => BudgetBody {
+                budget: self.budget,
+                t: self.t,
+                every_pixel: false,
+            },
+        }
+    }
 }
 
 /// The body of a renderer's `POST /scene`.
