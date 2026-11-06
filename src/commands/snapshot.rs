@@ -665,29 +665,56 @@ fn direct_restore_memory(
     }
 }
 
+/// How the wait for the restored guest's output channel ended without an error.
+#[derive(Debug, PartialEq, Eq)]
+enum OutputHandshake {
+    /// fc-agent's output channel connected: the exec server is ready.
+    Connected,
+    /// fcvm was told to stop.
+    Cancelled,
+    /// The container had exited and the guest did not power off by the power-off watchdog's
+    /// deadline, so the watchdog killed the VMM. That is not a clone failure (#998, #1006).
+    WatchdogKilled,
+}
+
+/// The VMM as the output handshake needs it: whether it has exited, and a kill for the
+/// power-off watchdog.
+trait HandshakeVmm: super::podman::Killable {
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>>;
+}
+
+impl HandshakeVmm for dyn crate::hypervisor::Hypervisor {
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        crate::hypervisor::Hypervisor::try_wait(self)
+    }
+}
+
 /// Wait for the restored guest's output channel, which is the final fc-agent
 /// rebind handshake before health monitoring may begin.
 ///
 /// A dropped sender, an exited VMM, or a failed liveness query is a restore
 /// failure, not a reason to continue. Returning those errors through the
 /// caller's shared verification/cleanup path keeps `lifecycle_ready` false.
-async fn wait_for_restored_output<F>(
+///
+/// The wait has no deadline of its own (a freshly restored guest can be starved for
+/// minutes), but it is bounded by the same power-off watchdog as the supervision loop: a
+/// container that exits before the handshake completes, in a guest that then wedges in
+/// shutdown, would otherwise hold this wait for ever (#1006).
+async fn wait_for_restored_output<V: HandshakeVmm + ?Sized>(
     vm_id: &str,
     output_connected_rx: &mut tokio::sync::oneshot::Receiver<()>,
     cancel: &tokio_util::sync::CancellationToken,
     liveness_interval: &mut tokio::time::Interval,
-    mut try_wait: F,
-) -> Result<bool>
-where
-    F: FnMut() -> Result<Option<std::process::ExitStatus>>,
-{
+    watchdog: &mut super::podman::PoweroffWatchdog,
+    vmm: &mut V,
+) -> Result<OutputHandshake> {
     loop {
         tokio::select! {
             result = &mut *output_connected_rx => {
                 match result {
                     Ok(()) => {
                         info!(vm_id = %vm_id, "fc-agent output connected, exec server ready");
-                        return Ok(true);
+                        return Ok(OutputHandshake::Connected);
                     }
                     Err(error) => {
                         bail!(
@@ -697,7 +724,7 @@ where
                 }
             }
             _ = liveness_interval.tick() => {
-                match try_wait() {
+                match vmm.try_wait() {
                     Ok(Some(status)) => {
                         bail!(
                             "VM exited before fc-agent output connected (status: {status})"
@@ -711,9 +738,21 @@ where
                     }
                 }
             }
+            _ = watchdog.expired() => {
+                warn!(
+                    vm_id = %vm_id,
+                    deadline_s = super::podman::GUEST_POWEROFF_DEADLINE.as_secs(),
+                    "the container exited and the guest did not power off before fc-agent's \
+                     output connected; killing the VMM"
+                );
+                watchdog.fire(vmm).context(
+                    "killing a VMM whose guest did not power off after the container exited",
+                )?;
+                return Ok(OutputHandshake::WatchdogKilled);
+            }
             _ = cancel.cancelled() => {
                 info!(vm_id = %vm_id, "shutdown requested while waiting for fc-agent output");
-                return Ok(false);
+                return Ok(OutputHandshake::Cancelled);
             }
         }
     }
@@ -2065,41 +2104,39 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
         }
     };
 
-    // Only signal PIDs that are alive AND still belong to an fcvm process. State files
-    // outlive crashed clones, so a recorded PID may have been reused by an unrelated
-    // process — never send signals to a PID we cannot identify as one of our clones.
-    let clone_pids: Vec<u32> = my_clones
-        .iter()
-        .filter_map(|clone| {
-            let pid = clone.pid?;
-            let clone_id = truncate_id(&clone.vm_id, 8);
-            if !crate::utils::is_process_alive(pid) {
-                debug!("clone {} (PID {}) already exited", clone_id, pid);
-                return None;
-            }
-            if !crate::utils::is_same_process_name(pid) {
-                warn!(
-                    "PID {} recorded for clone {} no longer belongs to an fcvm process (PID reuse), not signalling it",
-                    pid, clone_id
-                );
-                return None;
-            }
-            info!("stopping clone {} (PID {})", clone_id, pid);
-            Some(pid)
-        })
-        .collect();
+    // Each listed clone is signalled only if its state, read again under its lock, still names
+    // this server (`stop_clone_if_still_served`): a clone whose guest rebooted clears
+    // `serve_pid` under that lock before it relaunches from its own disk, and then no longer
+    // belongs to this server (#1078).
+    let mut clone_pids: Vec<u32> = Vec::new();
+    for clone in &my_clones {
+        match stop_clone_if_still_served(
+            &state_manager,
+            &clone.vm_id,
+            my_pid,
+            crate::utils::is_same_process_name,
+            |pid| {
+                nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGTERM,
+                )
+                .map_err(anyhow::Error::from)
+            },
+        )
+        .await
+        {
+            Ok(Some(pid)) => clone_pids.push(pid),
+            Ok(None) => {}
+            Err(e) => warn!(
+                "could not stop clone {}: {:#}",
+                truncate_id(&clone.vm_id, 8),
+                e
+            ),
+        }
+    }
 
     if !clone_pids.is_empty() {
         println!("Stopping {} clone(s)...", clone_pids.len());
-
-        for &pid in &clone_pids {
-            if let Err(e) = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            ) {
-                warn!("failed to send SIGTERM to clone PID {}: {}", pid, e);
-            }
-        }
 
         // Wait for the clones to exit; escalate to SIGKILL after the timeout.
         let term_deadline = tokio::time::Instant::now() + CLONE_SHUTDOWN_TIMEOUT;
@@ -2180,6 +2217,55 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     println!("Memory server stopped");
 
     Ok(())
+}
+
+/// The serve shutdown's step for one clone it listed: read the clone's state again under its
+/// lock, and SIGTERM the clone's process from inside that lock if the state still names this
+/// server and the process is alive and still an fcvm process (`is_clone_process`; state
+/// files outlive crashed clones, so a recorded PID may belong to an unrelated process now).
+/// Returns the PID it signalled.
+///
+/// The lock is what makes the check hold: a clone whose guest rebooted clears `serve_pid`
+/// under the same lock before it relaunches from its own disk, so either this step signals
+/// it first, while it still is this server's clone, or it reads the cleared state and leaves
+/// it alone (#1078).
+async fn stop_clone_if_still_served(
+    state_manager: &crate::state::StateManager,
+    vm_id: &str,
+    serve_pid: u32,
+    is_clone_process: impl FnOnce(u32) -> bool,
+    signal: impl FnOnce(u32) -> Result<()>,
+) -> Result<Option<u32>> {
+    let clone_id = truncate_id(vm_id, 8).to_string();
+    let decision = state_manager
+        .with_locked_state(vm_id, |state| -> Result<Option<u32>> {
+            if state.config.serve_pid != Some(serve_pid) {
+                info!(
+                    "clone {} no longer depends on this server (its guest rebooted); not stopping it",
+                    clone_id
+                );
+                return Ok(None);
+            }
+            let Some(pid) = state.pid else {
+                return Ok(None);
+            };
+            if !crate::utils::is_process_alive(pid) {
+                debug!("clone {} (PID {}) already exited", clone_id, pid);
+                return Ok(None);
+            }
+            if !is_clone_process(pid) {
+                warn!(
+                    "PID {} recorded for clone {} no longer belongs to an fcvm process (PID reuse), not signalling it",
+                    pid, clone_id
+                );
+                return Ok(None);
+            }
+            info!("stopping clone {} (PID {})", clone_id, pid);
+            signal(pid).with_context(|| format!("sending SIGTERM to clone PID {pid}"))?;
+            Ok(Some(pid))
+        })
+        .await?;
+    decision.unwrap_or(Ok(None))
 }
 
 /// Rebuild `HOST:GUEST[:ro]` volume specs and the portable flag from snapshot volume metadata.
@@ -3830,9 +3916,15 @@ async fn cmd_snapshot_run_inner(
     // falcon all resume simultaneously) and fc-agent's MMDS poll + restore handler
     // can take minutes. Proceeding early causes exec failures; waiting is correct.
     // But poll VM liveness to avoid hanging forever if Firecracker crashes.
+    // Bounds the wait for a guest that never powers off after its container exited (#998),
+    // from here on: the output handshake below is bounded by it too (#1006).
+    let mut watchdog = super::podman::PoweroffWatchdog::new(
+        container_exit_seen.clone(),
+        super::podman::GUEST_POWEROFF_DEADLINE,
+    );
     let output_handshake_result = match restore_completion_result {
         Err(error) => Err(error),
-        Ok(RestoreAck::Interrupted) => Ok(false),
+        Ok(RestoreAck::Interrupted) => Ok(OutputHandshake::Cancelled),
         Ok(RestoreAck::Acked { .. }) if !tty_mode => {
             // First liveness check at 250ms, then every 5s: restore_from_snapshot no
             // longer sleeps post-resume (its old 200ms crash-window moved here, off
@@ -3848,13 +3940,18 @@ async fn cmd_snapshot_run_inner(
                 &mut output_connected_rx,
                 &cancel,
                 &mut liveness_interval,
-                || vm_manager.try_wait(),
+                &mut watchdog,
+                vm_manager.as_mut(),
             )
             .await
         }
-        Ok(RestoreAck::Acked { .. }) => Ok(false),
+        Ok(RestoreAck::Acked { .. }) => Ok(OutputHandshake::Cancelled),
     };
-    let output_connected = matches!(&output_handshake_result, Ok(true));
+    let output_connected = matches!(&output_handshake_result, Ok(OutputHandshake::Connected));
+    let killed_in_handshake = matches!(
+        &output_handshake_result,
+        Ok(OutputHandshake::WatchdogKilled)
+    );
 
     // Dead-serial detection: the output vsock reconnecting proves the guest
     // and its virtio transport are alive, but the serial console can still
@@ -3931,6 +4028,8 @@ async fn cmd_snapshot_run_inner(
     // state file, loopback IP, and data directory that only cleanup_vm removes.
     let verify_result = match output_handshake_result {
         Err(error) => Err(error),
+        // The VMM is being killed: there is no guest to verify.
+        Ok(OutputHandshake::WatchdogKilled) => Ok(()),
         Ok(_) => tokio::select! {
             result = network.verify_port_forwarding() => {
                 result.context("port forwarding verification failed after snapshot restore")
@@ -3955,7 +4054,25 @@ async fn cmd_snapshot_run_inner(
     // What a prepare's restore did (`SnapshotRunArgs::prepare`), when it got that far.
     let mut prepare_result: Option<Result<super::podman::PreparedSnapshot>> = None;
 
-    if verify_result.is_ok() {
+    if killed_in_handshake {
+        // The watchdog killed the VMM before the handshake completed. Reap it and report the
+        // container's exit code, as the supervision loop does for the same kill.
+        let status = vm_manager.wait().await;
+        info!(status = ?status, "Firecracker child exited after the power-off watchdog's kill");
+        clone_failure = clone_failure_after_vmm_exit(
+            &status,
+            false,
+            true,
+            crate::uffd::failure::read_failure(&data_dir),
+        );
+        let code = if let Some(handle) = tty_handle.take() {
+            handle.join().ok().and_then(|r| r.ok())
+        } else {
+            super::podman::read_container_exit_code(&container_exit_seen, &data_dir).await
+        };
+        info!(container_exit_code = ?code, "container exit code");
+        vm_exit = Some(code);
+    } else if verify_result.is_ok() {
         // Spawn health monitor task with startup snapshot trigger support
         health_monitor_handle = Some(crate::health::spawn_health_monitor_full(
             vm_id.clone(),
@@ -4048,11 +4165,6 @@ async fn cmd_snapshot_run_inner(
             });
         }
 
-        // Bounds the wait for a guest that never powers off after its container exited (#998).
-        let mut watchdog = super::podman::PoweroffWatchdog::new(
-            container_exit_seen.clone(),
-            super::podman::GUEST_POWEROFF_DEADLINE,
-        );
         let mut watchdog_killed = false;
         // Wait for cancellation, VM exit, memory-server death, or startup snapshot trigger.
         // A prepare's VM is done once its snapshot is installed or its wait failed.
@@ -4194,6 +4306,44 @@ async fn cmd_snapshot_run_inner(
                         };
                         if let Some((plan, synth_args, volume_mappings)) = reboot_plan.as_ref() {
                             info!("guest rebooted — relaunching restored clone in place (cold boot)");
+                            // The relaunched guest boots from its own disk, so the clone no
+                            // longer depends on (or belongs to) its memory server. Recorded
+                            // under the state lock BEFORE the relaunch, which is the lock a
+                            // serve shutdown reads it under before it signals a clone, so a
+                            // shutdown either stops this clone before this point or leaves it
+                            // alone (#1078). A clear that fails leaves the clone the server's,
+                            // and its watch on the server armed.
+                            let detached = state_manager
+                                .update_state(&vm_id, |state| {
+                                    state.config.snapshot_name = None;
+                                    state.config.serve_pid = None;
+                                })
+                                .await;
+                            match detached {
+                                Ok(Some(_)) => {
+                                    // The rebooted VM's memory is a fresh boot, not a
+                                    // descendant of the restored snapshot: a later
+                                    // `snapshot create` takes a full snapshot, never a
+                                    // bogus diff.
+                                    vm_state.config.snapshot_name = None;
+                                    vm_state.config.serve_pid = None;
+                                    // The watch on that server ends with the dependence.
+                                    // Left armed, the server's exit would fail a VM that
+                                    // boots from its disk and has no page left for the
+                                    // server to serve.
+                                    serve_watch = None;
+                                }
+                                Ok(None) => warn!(
+                                    "the clone's state file is gone; it stays its memory \
+                                     server's clone through the relaunch"
+                                ),
+                                Err(error) => warn!(
+                                    error = %format!("{error:#}"),
+                                    "could not record that the rebooted clone no longer \
+                                     depends on its memory server; it stays the server's \
+                                     clone through the relaunch"
+                                ),
+                            }
                             // The restore's control plane ends with the restored guest.
                             // The boot-plan listener still serves this restore's epoch,
                             // and the agent of the guest booting now has handled none. It
@@ -4253,27 +4403,11 @@ async fn cmd_snapshot_run_inner(
                                     // boot from the host time it stamps. Owned here so the
                                     // exit path aborts it like the restore's.
                                     bootplan_handle = relaunch_bootplan;
-                                    // The rebooted VM's memory is a fresh boot, not a
-                                    // descendant of the restored snapshot — clear the
-                                    // recorded parent so a later `snapshot create`
-                                    // takes a full snapshot, never a bogus diff.
-                                    vm_state.config.snapshot_name = None;
-                                    // The rebooted clone no longer depends on (or
-                                    // belongs to) its serve process — a serve
-                                    // shutdown must not SIGTERM it.
-                                    vm_state.config.serve_pid = None;
                                     // The relaunch booted this fcvm's fc-agent, which
                                     // applies a restore's huge page mode.
                                     vm_state.config.guest_thp_restore = true;
-                                    // The watch on that server ends with the
-                                    // dependence. Left armed, the server's exit would
-                                    // fail a VM that booted from its disk and has no
-                                    // page left for the server to serve.
-                                    serve_watch = None;
                                     let _ = state_manager
                                         .update_state(&vm_id, |state| {
-                                            state.config.snapshot_name = None;
-                                            state.config.serve_pid = None;
                                             state.config.guest_thp_restore = true;
                                         })
                                         .await;
@@ -4298,7 +4432,12 @@ async fn cmd_snapshot_run_inner(
                     // could not serve. Record it so the clone reports FAILED instead of
                     // exiting 0 as if nothing happened.
                     clone_failure =
-                        clone_failure_after_vmm_exit(&status, guest_rebooted, watchdog_killed);
+                        clone_failure_after_vmm_exit(
+                        &status,
+                        guest_rebooted,
+                        watchdog_killed,
+                        crate::uffd::failure::read_failure(&data_dir),
+                    );
                     // A TTY run's exit code comes from the TTY session; any other run's from
                     // the "exit:" the guest sent on the status channel, which the status
                     // listener wrote to `container-exit` (the drain handshake above proved it
@@ -4604,11 +4743,23 @@ async fn restored_prepare(
 /// What a VMM exit means for the clone's report. A guest reboot is orderly, and so is a VMM that
 /// fcvm's own power-off watchdog killed after the container had exited (#998); any other signal
 /// death or unreadable status is something that happened to the clone.
+///
+/// `served_failure` is the reason the clone's memory server recorded before it killed the VMM
+/// for faults it could no longer serve (`uffd::failure`). It decides the report whoever else
+/// signalled the VMM: the watchdog's kill is idempotent on a VMM the server already killed, so
+/// the watchdog flag alone would hide the server's (#1007).
 fn clone_failure_after_vmm_exit(
     status: &Result<std::process::ExitStatus>,
     guest_rebooted: bool,
     watchdog_killed: bool,
+    served_failure: Option<String>,
 ) -> Option<String> {
+    if let Some(reason) = served_failure {
+        return Some(format!(
+            "its memory server killed its VMM because it could no longer serve the clone's \
+             page faults: {reason}"
+        ));
+    }
     if guest_rebooted {
         return None;
     }
@@ -7291,6 +7442,41 @@ mod tests {
         assert_eq!(served.unwrap(), (UffdBacking::Copy, true));
     }
 
+    /// The VMM as the output handshake sees it, scripted.
+    struct HandshakeFake {
+        liveness: Box<dyn FnMut() -> Result<Option<std::process::ExitStatus>> + Send>,
+        kills: usize,
+    }
+
+    impl crate::commands::podman::Killable for HandshakeFake {
+        fn start_kill(&mut self) -> Result<()> {
+            self.kills += 1;
+            Ok(())
+        }
+    }
+
+    impl super::HandshakeVmm for HandshakeFake {
+        fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
+            (self.liveness)()
+        }
+    }
+
+    fn fake(
+        liveness: impl FnMut() -> Result<Option<std::process::ExitStatus>> + Send + 'static,
+    ) -> HandshakeFake {
+        HandshakeFake {
+            liveness: Box::new(liveness),
+            kills: 0,
+        }
+    }
+
+    fn idle_watchdog() -> crate::commands::podman::PoweroffWatchdog {
+        crate::commands::podman::PoweroffWatchdog::new(
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            crate::commands::podman::GUEST_POWEROFF_DEADLINE,
+        )
+    }
+
     #[tokio::test]
     async fn restored_output_sender_drop_fails_the_handshake() {
         let (sender, mut receiver) = tokio::sync::oneshot::channel();
@@ -7300,15 +7486,16 @@ mod tests {
             tokio::time::Instant::now() + Duration::from_secs(60),
             Duration::from_secs(1),
         );
+        let mut vmm =
+            fake(|| panic!("liveness must not be polled before an already-dropped sender"));
 
         let error = wait_for_restored_output(
             "vm-test",
             &mut receiver,
             &cancel,
             &mut liveness,
-            || -> Result<Option<std::process::ExitStatus>> {
-                panic!("liveness must not be polled before an already-dropped sender")
-            },
+            &mut idle_watchdog(),
+            &mut vmm,
         )
         .await
         .unwrap_err();
@@ -7328,13 +7515,18 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut liveness =
             tokio::time::interval_at(tokio::time::Instant::now(), Duration::from_secs(1));
+        let mut vmm = fake(|| Ok(Some(std::process::ExitStatus::from_raw(1 << 8))));
 
-        let error =
-            wait_for_restored_output("vm-test", &mut receiver, &cancel, &mut liveness, || {
-                Ok(Some(std::process::ExitStatus::from_raw(1 << 8)))
-            })
-            .await
-            .unwrap_err();
+        let error = wait_for_restored_output(
+            "vm-test",
+            &mut receiver,
+            &cancel,
+            &mut liveness,
+            &mut idle_watchdog(),
+            &mut vmm,
+        )
+        .await
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -7349,13 +7541,18 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut liveness =
             tokio::time::interval_at(tokio::time::Instant::now(), Duration::from_secs(1));
+        let mut vmm = fake(|| Err(anyhow::anyhow!("pidfd unavailable")));
 
-        let error =
-            wait_for_restored_output("vm-test", &mut receiver, &cancel, &mut liveness, || {
-                Err(anyhow::anyhow!("pidfd unavailable"))
-            })
-            .await
-            .unwrap_err();
+        let error = wait_for_restored_output(
+            "vm-test",
+            &mut receiver,
+            &cancel,
+            &mut liveness,
+            &mut idle_watchdog(),
+            &mut vmm,
+        )
+        .await
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -7363,6 +7560,44 @@ mod tests {
             "unexpected error: {error:#}"
         );
         assert!(format!("{error:#}").contains("pidfd unavailable"));
+    }
+
+    /// #1006: a container that exits before the output handshake completes, in a guest that
+    /// then never powers off and never connects its output, does not hold the handshake for
+    /// ever. The power-off watchdog's deadline passes, the VMM is killed once, and the wait
+    /// reports that kill rather than a failure.
+    #[tokio::test]
+    async fn restored_output_handshake_ends_at_the_poweroff_deadline_after_the_container_exits() {
+        let (_sender, mut receiver) = tokio::sync::oneshot::channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut liveness = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_millis(50),
+            Duration::from_millis(50),
+        );
+        // The guest is wedged: alive, never connecting.
+        let mut vmm = fake(|| Ok(None));
+        let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut watchdog =
+            crate::commands::podman::PoweroffWatchdog::new(exited, Duration::from_millis(300));
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_restored_output(
+                "vm-test",
+                &mut receiver,
+                &cancel,
+                &mut liveness,
+                &mut watchdog,
+                &mut vmm,
+            ),
+        )
+        .await
+        .expect(
+            "the handshake waited past the power-off deadline for a guest whose container exited",
+        )
+        .unwrap();
+        assert_eq!(outcome, super::OutputHandshake::WatchdogKilled);
+        assert_eq!(vmm.kills, 1, "the VMM was not killed exactly once");
     }
 
     #[test]
@@ -7557,13 +7792,31 @@ mod watchdog_exit_classification_tests {
     /// The watchdog's own SIGKILL of a guest that would not power off is not a clone failure.
     #[test]
     fn a_vmm_the_watchdog_killed_is_not_a_failure() {
-        assert_eq!(clone_failure_after_vmm_exit(&killed(), false, true), None);
+        assert_eq!(
+            clone_failure_after_vmm_exit(&killed(), false, true, None),
+            None
+        );
+    }
+
+    /// #1007: a memory server that killed the VMM for faults it could not serve recorded why
+    /// before it signalled. That kill is a failure even when the watchdog's kill also landed,
+    /// which, being idempotent on an already signalled child, reported success.
+    #[test]
+    fn a_vmm_its_memory_server_killed_is_a_failure_even_after_a_watchdog_kill() {
+        let reason = clone_failure_after_vmm_exit(
+            &killed(),
+            false,
+            true,
+            Some("UFFDIO_COPY failed".to_string()),
+        )
+        .expect("the server's kill was taken for the watchdog's");
+        assert!(reason.contains("UFFDIO_COPY failed"), "{reason}");
     }
 
     /// The same signal with no watchdog behind it is still reported.
     #[test]
     fn a_vmm_killed_by_someone_else_is_still_a_failure() {
-        assert!(clone_failure_after_vmm_exit(&killed(), false, false).is_some());
+        assert!(clone_failure_after_vmm_exit(&killed(), false, false, None).is_some());
     }
 
     /// The loop must consult the watchdog, kill through it, classify the exit with the flag it
@@ -7585,8 +7838,10 @@ mod watchdog_exit_classification_tests {
             "the arm does not kill the VMM"
         );
         assert!(
-            body.contains("clone_failure_after_vmm_exit(&status, guest_rebooted, watchdog_killed)"),
-            "the exit is not classified with the watchdog flag"
+            body.split_whitespace().collect::<String>().contains(
+                "clone_failure_after_vmm_exit(&status,guest_rebooted,watchdog_killed,crate::uffd::failure::read_failure(&data_dir),"
+            ),
+            "the exit is not classified with the watchdog flag and the server's recorded failure"
         );
         assert!(
             body.contains("watchdog.rearm();\n                        watchdog_killed = false;"),
@@ -7650,9 +7905,15 @@ mod watchdog_exit_classification_tests {
     #[test]
     fn a_failed_watchdog_kill_goes_through_cleanup() {
         let source = include_str!("snapshot.rs");
-        let arm_start = source
-            .find("_ = watchdog.expired() => {")
-            .expect("no watchdog arm");
+        // The supervision loop's arm. The output handshake's arm returns its error to the
+        // caller, whose match on the handshake's result routes it through the same cleanup.
+        let loop_start = source
+            .find("let mut watchdog_killed = false;")
+            .expect("no supervision loop");
+        let arm_start = loop_start
+            + source[loop_start..]
+                .find("_ = watchdog.expired() => {")
+                .expect("no watchdog arm");
         let arm = &source[arm_start
             ..arm_start
                 + source[arm_start..]
@@ -7673,7 +7934,7 @@ mod watchdog_exit_classification_tests {
     #[test]
     fn a_watchdog_kill_does_not_hide_a_failed_wait() {
         let failed_wait: anyhow::Result<ExitStatus> = Err(anyhow::anyhow!("process not running"));
-        let reason = clone_failure_after_vmm_exit(&failed_wait, false, true);
+        let reason = clone_failure_after_vmm_exit(&failed_wait, false, true, None);
         assert!(
             reason.is_some_and(|r| r.contains("could not determine how the VMM exited")),
             "a watchdog kill followed by a wait error reported the clone as finished"
@@ -7682,6 +7943,136 @@ mod watchdog_exit_classification_tests {
 
     #[test]
     fn a_guest_reboot_is_not_a_failure() {
-        assert_eq!(clone_failure_after_vmm_exit(&killed(), true, false), None);
+        assert_eq!(
+            clone_failure_after_vmm_exit(&killed(), true, false, None),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod serve_shutdown_tests {
+    use super::stop_clone_if_still_served;
+    use crate::state::{StateManager, VmState};
+
+    async fn clone_state(
+        dir: &std::path::Path,
+        vm_id: &str,
+        serve_pid: Option<u32>,
+    ) -> StateManager {
+        let manager = StateManager::new(dir.to_path_buf());
+        manager.init().await.unwrap();
+        let mut state = VmState::new(vm_id.to_string(), "alpine".to_string(), 1, 128);
+        state.pid = Some(std::process::id());
+        state.config.serve_pid = serve_pid;
+        manager.save_state(&state).await.unwrap();
+        manager
+    }
+
+    /// A serve shutdown signals a listed clone only while the clone's state, read under its
+    /// lock, still names that server. A clone that cleared `serve_pid` before relaunching
+    /// after a guest reboot gets no signal (#1078); one that still names the server does.
+    #[tokio::test]
+    async fn the_serve_shutdown_signals_only_a_clone_that_still_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = clone_state(dir.path(), "vm-detached", Some(4242)).await;
+        // The clone's guest rebooted after the shutdown listed it.
+        manager
+            .update_state("vm-detached", |state| state.config.serve_pid = None)
+            .await
+            .unwrap();
+        let mut signalled = Vec::new();
+        let stopped = stop_clone_if_still_served(
+            &manager,
+            "vm-detached",
+            4242,
+            |_| true,
+            |pid| {
+                signalled.push(pid);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(stopped, None);
+        assert!(
+            signalled.is_empty(),
+            "a detached clone was signalled: {signalled:?}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = clone_state(dir.path(), "vm-served", Some(4242)).await;
+        let mut signalled = Vec::new();
+        let stopped = stop_clone_if_still_served(
+            &manager,
+            "vm-served",
+            4242,
+            |_| true,
+            |pid| {
+                signalled.push(pid);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(stopped, Some(std::process::id()));
+        assert_eq!(signalled, vec![std::process::id()]);
+
+        // Another server's clone, and a recorded PID that is no longer an fcvm process, are
+        // left alone.
+        let mut signalled = Vec::new();
+        let other = stop_clone_if_still_served(
+            &manager,
+            "vm-served",
+            1,
+            |_| true,
+            |pid| {
+                signalled.push(pid);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        let reused = stop_clone_if_still_served(
+            &manager,
+            "vm-served",
+            4242,
+            |_| false,
+            |pid| {
+                signalled.push(pid);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!((other, reused), (None, None));
+        assert!(signalled.is_empty(), "{signalled:?}");
+    }
+
+    /// The clone records that it no longer depends on its server before it relaunches, under
+    /// the state lock, and acts on a failed record: the relaunch's spawn comes after the
+    /// update, and the update's result is matched rather than dropped.
+    #[test]
+    fn a_rebooted_clone_detaches_from_its_server_before_it_relaunches() {
+        let source = include_str!("snapshot.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let start = code
+            .find("relaunching restored clone in place (cold boot)")
+            .expect("no in-place relaunch");
+        let body = &code[start..];
+        let detach = body
+            .find("state.config.serve_pid = None;")
+            .expect("the relaunch does not clear serve_pid");
+        let spawn = body
+            .find(".spawn(&relaunch_spec)")
+            .expect("the relaunch does not spawn the VMM");
+        assert!(
+            detach < spawn,
+            "serve_pid is cleared after the relaunch starts"
+        );
+        assert!(
+            body[..spawn].contains("match detached {"),
+            "the clear's result is not acted on"
+        );
     }
 }

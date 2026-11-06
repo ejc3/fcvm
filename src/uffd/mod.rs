@@ -1,3 +1,4 @@
+pub mod failure;
 mod handler;
 mod holes;
 mod prefetch;
