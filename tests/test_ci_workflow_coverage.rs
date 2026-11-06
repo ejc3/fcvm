@@ -2911,3 +2911,40 @@ fn every_self_hosted_ci_job_asks_for_an_on_demand_host_on_a_rerun() {
     }
     assert_eq!(self_hosted, 3, "expected the three self-hosted matrix jobs");
 }
+
+/// The kernel workflows set up /mnt/fcvm-btrfs with `make setup-btrfs`, the target a
+/// developer runs, so the two cannot drift (#806). Each workflow step that names btrfs runs
+/// the target, and no step makes a btrfs filesystem by hand.
+#[test]
+fn kernel_workflows_set_up_btrfs_with_the_make_target() {
+    let kernels = parse_workflow("kernels.yml");
+    let jobs = kernels["jobs"]
+        .as_mapping()
+        .expect("kernels.yml has no jobs mapping");
+    let mut setups = 0;
+    for (job, body) in jobs {
+        let Some(steps) = body.get("steps").and_then(Value::as_sequence) else {
+            continue;
+        };
+        for step in steps {
+            let run = step.get("run").and_then(Value::as_str).unwrap_or("");
+            assert!(
+                !run.contains("mkfs.btrfs"),
+                "job {job:?} makes a btrfs filesystem by hand: {run}"
+            );
+            if step.get("name").and_then(Value::as_str) == Some("Setup btrfs for fcvm") {
+                assert_eq!(run.trim(), "make setup-btrfs", "job {job:?}");
+                assert_eq!(
+                    step.get("working-directory").and_then(Value::as_str),
+                    Some("fcvm"),
+                    "job {job:?} runs make outside the checkout"
+                );
+                setups += 1;
+            }
+        }
+    }
+    assert!(
+        setups >= 2,
+        "found {setups} btrfs setup steps in kernels.yml"
+    );
+}
