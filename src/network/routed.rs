@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::names;
 use super::namespace;
@@ -102,6 +102,7 @@ pub(crate) fn lease_address(
     // Ipv6Addr's Display is the canonical (RFC 5952) form, so every spelling of one
     // address names one file.
     let path = dir.join(format!("{address}.lock"));
+    remove_abandoned_leases(dir, &path);
     // A retry needs a holder that unlinked the file between this open and this lock,
     // which takes a release and a new lease each time.
     for _ in 0..100 {
@@ -153,6 +154,75 @@ pub(crate) fn lease_address(
         }
     }
     anyhow::bail!("the lease of IPv6 address {address} kept being replaced while taking it")
+}
+
+/// Remove the lease files in `dir` that no process holds, except `keep`.
+///
+/// A holder that is SIGKILLed releases its lock but leaves its file, and derived
+/// addresses differ on every launch, so nothing else would remove it before a reboot
+/// (#1147). Each file is removed the way a holder removes its own (`AddressLease`'s
+/// Drop): under an exclusive lock, and only while the path still names the locked inode.
+/// A file another process holds refuses the lock and is kept. A file a process has just
+/// created but not yet locked may be removed; that process then finds the path no longer
+/// names the file it locked, and opens it again (`lease_address`).
+///
+/// Every error here is logged and skipped: a leftover file costs an inode, never a lease.
+fn remove_abandoned_leases(dir: &std::path::Path, keep: &std::path::Path) {
+    use nix::fcntl::{Flock, FlockArg};
+    use std::os::unix::fs::MetadataExt;
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!(dir = %dir.display(), %error, "listing IPv6 address leases");
+            return;
+        }
+    };
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(error) => {
+                warn!(dir = %dir.display(), %error, "listing IPv6 address leases");
+                return;
+            }
+        };
+        if path == keep || path.extension().is_none_or(|ext| ext != "lock") {
+            continue;
+        }
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            // Its holder released it, or another sweep removed it.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                debug!(path = %path.display(), %error, "opening an IPv6 address lease");
+                continue;
+            }
+        };
+        let lock = match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => lock,
+            // Held: a live VM's lease.
+            Err((_, nix::errno::Errno::EWOULDBLOCK)) => continue,
+            Err((_, error)) => {
+                debug!(path = %path.display(), %error, "locking an IPv6 address lease");
+                continue;
+            }
+        };
+        let names_the_locked_file = match (lock.metadata(), std::fs::metadata(&path)) {
+            (Ok(held), Ok(current)) => held.dev() == current.dev() && held.ino() == current.ino(),
+            _ => false,
+        };
+        if !names_the_locked_file {
+            // Removed and created again since the open: the new file is not this one.
+            continue;
+        }
+        match crate::state::manager::remove_if_exists(&path) {
+            Ok(()) => debug!(path = %path.display(), "removed an abandoned IPv6 address lease"),
+            Err(error) => {
+                warn!(path = %path.display(), %error, "removing an abandoned IPv6 address lease")
+            }
+        }
+        drop(lock);
+    }
 }
 
 /// Remove the proxy NDP entry and, with `masquerade`, the MASQUERADE rule a routed VM that
@@ -1882,10 +1952,35 @@ mod tests {
     /// the descriptor), which is then SIGKILLed.
     #[test]
     fn a_killed_holder_releases_its_lease() {
-        use std::io::BufRead;
         let dir = tempfile::tempdir().unwrap();
         let address: std::net::Ipv6Addr = "2001:db8::7".parse().unwrap();
-        let path = dir.path().join(format!("{address}.lock"));
+        let mut holder = hold_in_child(&dir.path().join(format!("{address}.lock")));
+        assert!(leased(lease_address(dir.path(), address, "vm-b").unwrap()).is_none());
+        holder.kill();
+        assert!(leased(lease_address(dir.path(), address, "vm-b").unwrap()).is_some());
+    }
+
+    /// A child process holding a lease file's lock, SIGKILLed when dropped so a failed
+    /// assertion leaves no holder (with the test runner's inherited descriptors) behind.
+    struct ChildHolder(std::process::Child);
+
+    impl ChildHolder {
+        fn kill(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    impl Drop for ChildHolder {
+        fn drop(&mut self) {
+            self.kill();
+        }
+    }
+
+    /// Lock `path` from a child process that holds it until it is killed (a shell that
+    /// execs `sleep`, so one process holds the descriptor).
+    fn hold_in_child(path: &std::path::Path) -> ChildHolder {
+        use std::io::BufRead;
         let mut holder = std::process::Command::new("bash")
             .args([
                 "-c",
@@ -1901,10 +1996,51 @@ mod tests {
             .read_line(&mut line)
             .unwrap();
         assert_eq!(line.trim(), "locked");
-        assert!(leased(lease_address(dir.path(), address, "vm-b").unwrap()).is_none());
-        holder.kill().unwrap();
-        holder.wait().unwrap();
-        assert!(leased(lease_address(dir.path(), address, "vm-b").unwrap()).is_some());
+        ChildHolder(holder)
+    }
+
+    /// A killed holder's lease file is removed by the next lease of any address, and a
+    /// live holder's is kept (#1147). The killed holders are a file nobody ever locked and
+    /// a child that locked its file and was SIGKILLed; the live ones are a child and a
+    /// lease of this process.
+    #[test]
+    fn a_lease_removes_the_files_of_killed_holders_and_keeps_live_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |address: &str| dir.path().join(format!("{address}.lock"));
+
+        std::fs::write(file("2001:db8::10"), "4242 vm-gone\n").unwrap();
+        hold_in_child(&file("2001:db8::11")).kill();
+        let _live = hold_in_child(&file("2001:db8::12"));
+        let _ours =
+            leased(lease_address(dir.path(), "2001:db8::13".parse().unwrap(), "vm-c").unwrap())
+                .unwrap();
+        // Not a lease file: left alone.
+        std::fs::write(dir.path().join("README"), "").unwrap();
+
+        let _new =
+            leased(lease_address(dir.path(), "2001:db8::14".parse().unwrap(), "vm-d").unwrap())
+                .unwrap();
+
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "2001:db8::12.lock",
+                "2001:db8::13.lock",
+                "2001:db8::14.lock",
+                "README"
+            ],
+            "only the files of live holders, and the new lease, may remain"
+        );
+        // The live holder still holds its address.
+        assert!(leased(
+            lease_address(dir.path(), "2001:db8::12".parse().unwrap(), "vm-e").unwrap()
+        )
+        .is_none());
     }
 
     /// An address the host itself holds has its /128 only in table `local`, and the
