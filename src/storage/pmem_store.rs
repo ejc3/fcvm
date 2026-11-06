@@ -6,33 +6,59 @@
 //! write to the user's file reaches none of them and the next run copies the new
 //! generation.
 //!
-//! An entry is `<data_dir>/pmem/<64 hex>.img`, named by sha256 over a domain tag, the
-//! image's canonical path and its identity from `fstat` of the descriptor that is copied
-//! (inode, length, modification and change time, `storage::pmem::image_identity`), so
-//! the name and the bytes describe the same file. An entry appears only through
-//! `link(temp, entry)` and is never replaced, renamed, linked again or opened for
-//! writing; it is mode 0400 and owned by the invoking user. A run uses an entry, one it
-//! publishes or finds and one a snapshot it restores names, only when the entry belongs to
-//! the run's own uid or, under sudo, to the invoking user with that user's group or the
-//! run's (`check_entry_owner`): those are the owners whose mode 0400 file Firecracker can
-//! open inside a VM's holder namespace, under sudo too. Any other entry (in a data_dir two
-//! users share, the other user's) is refused instead of handed to Firecracker. Nothing
-//! deletes entries yet.
+//! An entry is `<data_dir>/pmem/<64 hex>.img`, named by sha256 over a domain tag, the uid it
+//! belongs to and the digest of the image's bytes (`content_digest`), so two paths that hold
+//! the same bytes, and an image touched without changing a byte, map one entry and get one
+//! snapshot key. The uid keeps two users of one data_dir from publishing under one name an
+//! entry only one of them can use. An entry appears only through `link(temp, entry)` and is
+//! never replaced, renamed, linked again or opened for writing; it is mode 0400 and owned by
+//! the invoking user. A run uses an entry, one it publishes or finds and one a snapshot it
+//! restores names, only when the entry belongs to the run's own uid or, under sudo, to the
+//! invoking user with that user's group or the run's (`check_entry_owner`): those are the
+//! owners whose mode 0400 file Firecracker can open inside a VM's holder namespace, under
+//! sudo too. Any other entry (in a data_dir two users share, the other user's) is refused
+//! instead of handed to Firecracker. Nothing deletes entries yet.
 //!
-//! A copy is published only if it is consistent. The source is fsynced before the copy
-//! and its identity compared before and after it: after the fsync any write through a
-//! shared mapping faults and moves the change time (measured on btrfs: without the fsync
-//! a second write to an already dirtied page moved no timestamp in 200 of 200 trials,
-//! with it 0 of 200). fcvm refuses an image on tmpfs, ramfs and hugetlbfs, where a write
-//! through a shared mapping has no such fault, on FUSE, NFS, SMB and 9p, where the
-//! kernel serves the size and times from a cache that a write through another mount or
-//! client need not update, and on overlayfs, whose statfs type does not name the layer
-//! that holds the file, which can be tmpfs or a network filesystem. Those are the
+//! Hashing reads every data block of the image, so the store also keeps
+//! `<data_dir>/pmem/<64 hex>.source`, a symlink named by sha256 over a domain tag, the uid,
+//! the image's canonical path and its identity from `fstat` (inode, length, modification and
+//! change time, `storage::pmem::image_identity`), pointing at the entry that holds those
+//! bytes. A run whose image still has a recorded identity uses that entry without reading
+//! the image. A symlink is replaced, never edited, and one that points at a missing entry is
+//! ignored.
+//!
+//! A copy is published only if it is consistent. Ingest takes a read lease on the image
+//! (`F_SETLEASE`, `F_RDLCK`) before it reads the identity, hashes and copies, and checks the
+//! lease after. The kernel refuses the lease while any process has the image open for
+//! writing, a writable shared mapping included, and breaks it when one opens it, so a copy
+//! is published only if no process could write the image while it was hashed and copied.
+//! Every write needs such an open, so this holds whatever the timestamp granularity. A
+//! writer that opens the image meanwhile waits for the copy to finish, up to the kernel's
+//! lease break time (`/proc/sys/fs/lease-break-time`, 45 s by default), after which the
+//! kernel removes the lease and the check refuses the copy. The kernel grants a lease only
+//! to the image's owner or a process with `CAP_LEASE` (root, so a run under sudo), and only
+//! on a filesystem that supports leases. Without one the image is copied only from a
+//! filesystem that cannot write it (squashfs, iso9660, erofs, cramfs, romfs); anything else
+//! is refused with what to do instead.
+//!
+//! A recorded identity stands for the bytes only while every write to the image changes it.
+//! A write after the lease changes the change time unless it lands in the same timestamp
+//! tick as the image's last change, which a kernel or filesystem without multigrain
+//! timestamps allows. So the symlink is recorded only when the image's change time is at
+//! least `IDENTITY_SETTLE` (2 s, above every Linux filesystem's change-time granularity)
+//! older than the coarse realtime clock read while the lease is held: any later write gets
+//! a change time at least that clock's value truncated to the granularity, so it cannot
+//! repeat the recorded one. An image changed more recently is copied and used, and the next
+//! run hashes it again. Setting the realtime clock back by about 2 s or more can let a
+//! later write repeat a recorded change time; nothing in the store detects that.
+//!
+//! fcvm refuses an image on tmpfs, ramfs and hugetlbfs, where a write through a shared
+//! mapping changes no timestamp, on FUSE, NFS, SMB and 9p, where the kernel serves the size
+//! and times from a cache that a write through another mount or client need not update and
+//! a lease does not reach another client, and on overlayfs, whose statfs type does not name
+//! the layer that holds the file, which can be tmpfs or a network filesystem. Those are the
 //! filesystems it recognizes; an image on another one with the same problem (Ceph, AFS,
-//! Lustre, GPFS) is copied, and its copy check can miss a write. On a kernel or filesystem
-//! without multigrain timestamps the change time has the filesystem's timestamp
-//! granularity, so a write within one tick of the image's previous change keeps its
-//! identity: the copy check misses it, and so does the next run's generation.
+//! Lustre, GPFS) is copied, and a write by another client can be missed.
 //!
 //! The store is per data_dir, like the snapshots that will reference its entries: flock
 //! is authoritative only within one kernel, and assets_dir is shared across nesting
@@ -69,9 +95,44 @@ use tracing::{debug, info, warn};
 
 use crate::state::types::PmemDevice;
 
-/// Domain tag hashed ahead of the source path, so a change to how entries are named
-/// changes every name.
-const NAME_DOMAIN: &[u8] = b"fcvm-pmem-v1";
+/// Domain tag hashed ahead of an entry's owner and content digest, so a change to how
+/// entries are named changes every name.
+const ENTRY_DOMAIN: &[u8] = b"fcvm-pmem-content-v1";
+
+/// Domain tag hashed ahead of a source symlink's owner, path and identity.
+const SOURCE_DOMAIN: &[u8] = b"fcvm-pmem-source-v1";
+
+/// Domain tag of `content_digest`.
+const CONTENT_DOMAIN: &[u8] = b"fcvm-pmem-bytes-v1";
+
+/// How much older than the coarse realtime clock an image's change time must be for its
+/// identity to be recorded (module doc). Every Linux filesystem keeps change times at a
+/// granularity of at most this.
+const IDENTITY_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `content_digest` hashes the image in segments of this many bytes, in parallel.
+const HASH_SEGMENT: u64 = 64 << 20;
+
+/// At most this many threads hash one image.
+const HASH_THREADS: usize = 8;
+
+/// `F_SETSIG` from linux/fcntl.h, which libc exports only for some targets.
+const F_SETSIG: libc::c_int = 10;
+
+/// The signal the kernel sends ingest when a writer breaks its lease. The default, SIGIO,
+/// terminates the process. SIGURG is ignored unless a handler is installed, and ingest
+/// learns of a break from `F_GETLEASE`, not from the signal.
+const LEASE_BREAK_SIGNAL: libc::c_int = libc::SIGURG;
+
+/// Filesystems with no write path, statfs magic and name: an image on one is copied without
+/// a lease when the kernel grants none.
+const READ_ONLY_FILESYSTEMS: &[(FsType, &str)] = &[
+    (FsType(0x7371_7368), "squashfs"),
+    (FsType(0x9660), "iso9660"),
+    (FsType(0xe0f5_e1e2), "erofs"),
+    (FsType(0x28cd_3d45), "cramfs"),
+    (FsType(0x7275), "romfs"),
+];
 
 /// Mode of every published entry: the owner reads it, nobody writes it. Firecracker opens
 /// a read-only pmem file without write access and maps it PROT_READ, so read is all it
@@ -234,16 +295,34 @@ impl PmemStore {
         &self.dir
     }
 
-    /// The name of the entry a source generation is published as.
-    fn entry_name(source: &Path, identity: &str) -> String {
-        use std::os::unix::ffi::OsStrExt;
+    /// The uid a store entry this run publishes belongs to: the sudo invoker's, to whom it is
+    /// handed, or this run's real uid. It is part of every name, so two users of one data_dir
+    /// never publish under one name an entry only one of them can use.
+    fn owner(&self) -> u32 {
+        self.invoker
+            .as_ref()
+            .map_or_else(|| nix::unistd::getuid().as_raw(), |user| user.uid.as_raw())
+    }
+
+    /// The name of the entry that holds the bytes whose digest is `digest` (`content_digest`).
+    fn entry_name(&self, digest: &[u8; 32]) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(NAME_DOMAIN);
-        hasher.update([0u8]);
+        hasher.update(ENTRY_DOMAIN);
+        hasher.update(self.owner().to_le_bytes());
+        hasher.update(digest);
+        format!("{}.img", hex::encode(hasher.finalize()))
+    }
+
+    /// The name of the symlink that records which entry holds the image at `source` (a
+    /// canonical path) while it has the identity `identity` (`storage::pmem::image_identity`).
+    fn source_name(&self, source: &Path, identity: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(SOURCE_DOMAIN);
+        hasher.update(self.owner().to_le_bytes());
         hasher.update(source.as_os_str().as_bytes());
         hasher.update([0u8]);
         hasher.update(identity.as_bytes());
-        format!("{}.img", hex::encode(hasher.finalize()))
+        format!("{}.source", hex::encode(hasher.finalize()))
     }
 
     /// Whether `path` names an entry of this store (`is_entry_of`).
@@ -309,21 +388,25 @@ impl PmemStore {
         Ok(metadata)
     }
 
-    /// Return the entry holding the image at `source` (a canonical path) as it is now,
-    /// copying it into the store first unless that generation is already published. The store
-    /// directory is synced before the entry is returned, one this run published or one it
-    /// found, so a host crash cannot remove an entry a VM or a snapshot of this run names.
+    /// Return the entry holding the image at `source` (a canonical path) as it is now. An
+    /// image whose identity a source symlink records maps that entry without being read.
+    /// Any other is hashed and, unless an entry already holds its bytes, copied into the
+    /// store, both under a read lease (module doc). The store directory is synced before the
+    /// entry is returned, one this run published or one it found, so a host crash cannot
+    /// remove an entry a VM or a snapshot of this run names.
     pub fn ingest(&self, source: &Path) -> Result<PathBuf> {
-        self.ingest_with(source, || Ok(()), &sync_parent)
+        self.ingest_with(source, || Ok(()), &sync_parent, &coarse_realtime)
     }
 
-    /// `ingest`, running `after_copy` between the copy and the second fstat of the source and
-    /// syncing the store directory through `sync` (`SyncStep`).
+    /// `ingest`, running `after_copy` once the image is hashed and copied (or its entry
+    /// found), before the lease is checked, syncing the store directory through `sync`
+    /// (`SyncStep`) and reading the coarse realtime clock through `clock`.
     fn ingest_with(
         &self,
         source: &Path,
         after_copy: impl FnOnce() -> Result<()>,
         sync: SyncStep<'_>,
+        clock: &dyn Fn() -> std::time::Duration,
     ) -> Result<PathBuf> {
         let started = std::time::Instant::now();
         // O_NONBLOCK keeps a FIFO named by mistake from blocking the open; it has no
@@ -334,38 +417,55 @@ impl PmemStore {
             .open(source)
             .with_context(|| format!("opening --pmem image {}", source.display()))?;
         refuse_unverifiable_filesystem(&file, source)?;
-        let before = file
+        let seen = file
             .metadata()
             .with_context(|| format!("reading --pmem image {}", source.display()))?;
-        crate::storage::pmem::check_image_metadata(&before, source)?;
-        let identity = crate::storage::pmem::image_identity(&before);
-        let name = Self::entry_name(source, &identity);
-        let entry = self.dir.join(&name);
-        if std::fs::symlink_metadata(&entry).is_ok() {
-            self.check_entry(&entry, Some(before.len()))?;
+        crate::storage::pmem::check_image_metadata(&seen, source)?;
+        if let Some(entry) = self.find_by_identity(source, &seen)? {
             // Another run links an entry before it syncs the store directory, so the name
             // found here need not survive a crash yet.
             make_name_durable(sync, &self.pmem, &entry)?;
             info!(
                 source = %source.display(),
                 entry = %entry.display(),
-                "using the pmem store's copy of this image generation"
+                "using the pmem store's copy of this image, found by its file identity"
             );
             return Ok(entry);
         }
 
-        sync_source(&file, source)?;
+        let lease = ReadLease::take(&file, source)?;
+        let before = file
+            .metadata()
+            .with_context(|| format!("reading --pmem image {}", source.display()))?;
+        crate::storage::pmem::check_image_metadata(&before, source)?;
+        let identity = crate::storage::pmem::image_identity(&before);
+        let hashing = std::time::Instant::now();
+        let digest = content_digest(&file, before.len())
+            .with_context(|| format!("hashing --pmem image {}", source.display()))?;
+        let hash_ms = hashing.elapsed().as_millis() as u64;
+        let name = self.entry_name(&digest);
+        let entry = self.dir.join(&name);
         let _lock = self.lock_shared()?;
-        let temp = TempFile::create(&self.tmp, &self.dir.join("tmp"))?;
-        let out = &temp.file;
-        let method = copy_image(&file, out, before.len()).with_context(|| {
-            format!(
-                "copying --pmem image {} into {}",
-                source.display(),
-                temp.path.display()
-            )
-        })?;
+        let copied = if std::fs::symlink_metadata(&entry).is_ok() {
+            self.check_entry(&entry, Some(before.len()))?;
+            None
+        } else {
+            let temp = TempFile::create(&self.tmp, &self.dir.join("tmp"))?;
+            let method = copy_image(&file, &temp.file, before.len()).with_context(|| {
+                format!(
+                    "copying --pmem image {} into {}",
+                    source.display(),
+                    temp.path.display()
+                )
+            })?;
+            Some((temp, method))
+        };
         after_copy()?;
+        // Any write from here on gets a change time no earlier than this reading, truncated.
+        let now = clock();
+        if let Some(lease) = &lease {
+            lease.check(source)?;
+        }
         let after = file
             .metadata()
             .with_context(|| format!("reading --pmem image {}", source.display()))?;
@@ -373,10 +473,149 @@ impl PmemStore {
         ensure!(
             identity_after == identity,
             "--pmem image {} changed while fcvm copied it (inode:length:mtime:ctime {identity} \
-             then, {identity_after} now); stop writing it and run again",
+             then, {identity_after} now); stop changing it and run again",
             source.display()
         );
+        drop(lease);
 
+        let method = match copied {
+            Some((temp, method)) => {
+                self.publish(&temp, &name, &entry, before.len())?;
+                make_name_durable(sync, &self.pmem, &entry)?;
+                drop(temp);
+                Some(method)
+            }
+            None => {
+                make_name_durable(sync, &self.pmem, &entry)?;
+                None
+            }
+        };
+        let index = identity_is_settled(&before, now).then(|| {
+            let index = self.source_name(source, &identity);
+            match self.record_source(&index, &name) {
+                Ok(()) => Some(self.dir.join(index)),
+                Err(error) => {
+                    warn!(
+                        source = %source.display(),
+                        entry = %entry.display(),
+                        error = format!("{error:#}"),
+                        "could not record which pmem store entry holds this image; the next \
+                         run hashes it again"
+                    );
+                    None
+                }
+            }
+        });
+        let index = index.flatten();
+        if index.is_none() {
+            debug!(
+                source = %source.display(),
+                "the image changed too recently for its identity to stand for its bytes, so \
+                 the next run hashes it again"
+            );
+        }
+        let allocated = std::fs::metadata(&entry)
+            .map(|m| m.blocks() * 512)
+            .unwrap_or(0);
+        let index = index
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        match method {
+            Some(method) => info!(
+                source = %source.display(),
+                entry = %entry.display(),
+                index = %index,
+                method = ?method,
+                bytes = before.len(),
+                allocated,
+                hash_ms,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "copied --pmem image into the pmem store"
+            ),
+            None => info!(
+                source = %source.display(),
+                entry = %entry.display(),
+                index = %index,
+                bytes = before.len(),
+                hash_ms,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "using the pmem store's copy of these bytes"
+            ),
+        }
+        Ok(entry)
+    }
+
+    /// The entry a source symlink records for `source` with the identity of `metadata`, or
+    /// `None` when there is no symlink or its entry is gone. A symlink that points at
+    /// anything but an entry name is refused, and so is an entry `check_entry` refuses.
+    fn find_by_identity(
+        &self,
+        source: &Path,
+        metadata: &std::fs::Metadata,
+    ) -> Result<Option<PathBuf>> {
+        let identity = crate::storage::pmem::image_identity(metadata);
+        let name = self.source_name(source, &identity);
+        let index = self.dir.join(&name);
+        let target = match nix::fcntl::readlinkat(&self.pmem, name.as_str()) {
+            Ok(target) => target,
+            Err(Errno::ENOENT) => return Ok(None),
+            Err(Errno::EINVAL) => bail!(
+                "{} is not a symlink, so fcvm did not make it; remove it and run again",
+                index.display()
+            ),
+            Err(errno) => {
+                return Err(errno).with_context(|| format!("reading {}", index.display()))
+            }
+        };
+        let entry = self.dir.join(&target);
+        ensure!(
+            self.is_entry(&entry),
+            "{} points at {target:?}, which is not an entry of the pmem image store {}, so fcvm \
+             did not make it; remove it and run again",
+            index.display(),
+            self.dir.display()
+        );
+        match std::fs::symlink_metadata(&entry) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading pmem store entry {}", entry.display()))
+            }
+        }
+        self.check_entry(&entry, Some(metadata.len()))?;
+        Ok(Some(entry))
+    }
+
+    /// Point the source symlink `index` at the entry `entry_name`, replacing any symlink
+    /// there. The symlink is made in `tmp` and renamed into place, so a reader finds the old
+    /// target or the new one. The caller holds `.lock` shared, so a collector does not remove
+    /// it from `tmp` meanwhile. Under sudo it stays root's: handing a name over takes a
+    /// chown by name in a directory the invoker can write, which the invoker could point at
+    /// another file, and the invoker reads root's symlink as well as their own.
+    fn record_source(&self, index: &str, entry_name: &str) -> Result<()> {
+        let temp = format!("{}.source", uuid::Uuid::new_v4().simple());
+        let temp_path = self.dir.join("tmp").join(&temp);
+        nix::unistd::symlinkat(entry_name, &self.tmp, temp.as_str())
+            .with_context(|| format!("creating {}", temp_path.display()))?;
+        if let Err(errno) = nix::fcntl::renameat(&self.tmp, temp.as_str(), &self.pmem, index) {
+            let _ = nix::unistd::unlinkat(&self.tmp, temp.as_str(), UnlinkatFlags::NoRemoveDir);
+            return Err(errno).with_context(|| {
+                format!(
+                    "renaming {} onto {}",
+                    temp_path.display(),
+                    self.dir.join(index).display()
+                )
+            });
+        }
+        Ok(())
+    }
+
+    /// Publish the temp `temp`, holding a copy of `len` bytes, as the entry `name` at `entry`:
+    /// make it read-only, hand it to the invoker, sync it and link it into place. When another
+    /// run published those bytes first, its inode is used and never replaced.
+    fn publish(&self, temp: &TempFile<'_>, name: &str, entry: &Path, len: u64) -> Result<()> {
+        let out = &temp.file;
         out.set_permissions(std::fs::Permissions::from_mode(ENTRY_MODE))
             .with_context(|| format!("making {} read-only", temp.path.display()))?;
         crate::setup::give_store_fd_to(out, &temp.path, self.invoker.as_ref());
@@ -386,34 +625,15 @@ impl PmemStore {
             &self.tmp,
             temp.name.as_str(),
             &self.pmem,
-            name.as_str(),
+            name,
             AtFlags::empty(),
         ) {
-            Ok(()) => {}
-            // Another run published this generation first: use its inode, never replace it.
-            // The sync below makes its name durable, which that run may not have done yet.
-            Err(Errno::EEXIST) => {
-                self.check_entry(&entry, Some(before.len()))?;
-            }
-            Err(errno) => {
-                return Err(errno).with_context(|| format!("publishing {}", entry.display()))
-            }
+            Ok(()) => Ok(()),
+            // The caller's sync makes the other run's name durable, which that run may not
+            // have done yet.
+            Err(Errno::EEXIST) => self.check_entry(entry, Some(len)).map(drop),
+            Err(errno) => Err(errno).with_context(|| format!("publishing {}", entry.display())),
         }
-        make_name_durable(sync, &self.pmem, &entry)?;
-        drop(temp);
-        let allocated = std::fs::metadata(&entry)
-            .map(|m| m.blocks() * 512)
-            .unwrap_or(0);
-        info!(
-            source = %source.display(),
-            entry = %entry.display(),
-            method = ?method,
-            bytes = before.len(),
-            allocated,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "copied --pmem image into the pmem store"
-        );
-        Ok(entry)
     }
 
     /// Hold `.lock` shared. Ingest holds it from creating its temp until it removes it.
@@ -1200,27 +1420,280 @@ pub(crate) fn test_image_dir() -> &'static Path {
     dir
 }
 
-/// fsync the source, so any later write through a shared mapping faults and moves its
-/// change time. A filesystem without fsync (squashfs, iso9660) is accepted only when it is
-/// mounted read-only, since then nothing can write the image.
-fn sync_source(file: &File, source: &Path) -> Result<()> {
-    let Err(error) = file.sync_all() else {
-        return Ok(());
-    };
-    let read_only = || {
-        nix::sys::statvfs::fstatvfs(file)
-            .map(|vfs| vfs.flags().contains(nix::sys::statvfs::FsFlags::ST_RDONLY))
-            .unwrap_or(false)
-    };
-    if fsync_error_is_benign(error.raw_os_error(), read_only) {
-        return Ok(());
-    }
-    Err(error).with_context(|| format!("syncing --pmem image {}", source.display()))
+/// A read lease (`F_SETLEASE`, `F_RDLCK`) on an image, held while it is hashed and copied
+/// and released when dropped (module doc).
+struct ReadLease<'a> {
+    file: &'a File,
 }
 
-/// Whether an fsync error leaves the copy safe: EINVAL or EROFS on a read-only mount.
-fn fsync_error_is_benign(errno: Option<i32>, read_only: impl FnOnce() -> bool) -> bool {
-    matches!(errno, Some(libc::EINVAL | libc::EROFS)) && read_only()
+impl<'a> ReadLease<'a> {
+    /// Take a read lease on `file`, the image at `source`. `None` when the kernel grants none
+    /// but the image's filesystem cannot write it (`READ_ONLY_FILESYSTEMS`). An image that a
+    /// process has open for writing is refused, and so is one on which the kernel grants no
+    /// lease, with what to do instead.
+    fn take(file: &'a File, source: &Path) -> Result<Option<Self>> {
+        // SAFETY: fcntl on a descriptor `file` keeps open.
+        if unsafe { libc::fcntl(file.as_raw_fd(), F_SETSIG, LEASE_BREAK_SIGNAL) } != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "setting the lease break signal of --pmem image {}",
+                    source.display()
+                )
+            });
+        }
+        // SAFETY: as above.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLEASE, libc::F_RDLCK) } == 0 {
+            return Ok(Some(Self { file }));
+        }
+        let error = std::io::Error::last_os_error();
+        let kind = nix::sys::statfs::fstatfs(file)
+            .ok()
+            .map(|statfs| statfs.filesystem_type());
+        match lease_refusal(error.raw_os_error(), kind) {
+            LeaseRefusal::Fallback(name) => {
+                debug!(
+                    source = %source.display(),
+                    filesystem = name,
+                    %error,
+                    "copying a --pmem image without a read lease: its filesystem cannot write it"
+                );
+                Ok(None)
+            }
+            LeaseRefusal::OpenForWriting => bail!(
+                "--pmem image {} is open for writing in a process (through a descriptor or a \
+                 writable shared mapping), which could change it while fcvm copies it; close it \
+                 there and run again",
+                source.display()
+            ),
+            LeaseRefusal::NotOwner => {
+                let owner = file.metadata().map(|m| m.uid().to_string()).ok();
+                bail!(
+                    "fcvm copies --pmem image {} under a read lease, so that no process can \
+                     write it during the copy, and the kernel grants one only to the image's \
+                     owner (uid {}) or a process with CAP_LEASE. Run fcvm as that user or under \
+                     sudo, or pass a copy you own (cp --reflink=auto)",
+                    source.display(),
+                    owner.as_deref().unwrap_or("unknown")
+                )
+            }
+            LeaseRefusal::Unsupported => bail!(
+                "fcvm copies --pmem image {} under a read lease, so that no process can write \
+                 it during the copy, and the kernel grants none there: its filesystem has no \
+                 leases, or fs.leases-enable is 0. Copy the image to a local disk filesystem \
+                 and pass that copy",
+                source.display()
+            ),
+            LeaseRefusal::Failed => Err(error).with_context(|| {
+                format!("taking a read lease on --pmem image {}", source.display())
+            }),
+        }
+    }
+
+    /// Refuse the copy unless the lease is still held: a process that opened the image for
+    /// writing since it was taken starts a lease break, and the kernel removes the lease
+    /// once the break time passes, and either way `F_GETLEASE` no longer reports `F_RDLCK`.
+    fn check(&self, source: &Path) -> Result<()> {
+        // SAFETY: fcntl on a descriptor `self.file` keeps open.
+        let state = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_GETLEASE) };
+        if state < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "reading the read lease on --pmem image {}",
+                    source.display()
+                )
+            });
+        }
+        ensure!(
+            state == libc::F_RDLCK,
+            "--pmem image {} was opened for writing while fcvm copied it, so the copy need \
+             not match any one version of it; stop writing it and run again",
+            source.display()
+        );
+        Ok(())
+    }
+}
+
+impl Drop for ReadLease<'_> {
+    fn drop(&mut self) {
+        // SAFETY: fcntl on a descriptor `self.file` keeps open. Closing the descriptor would
+        // release the lease too; this lets a waiting writer go as soon as the check is done.
+        unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_SETLEASE, libc::F_UNLCK) };
+    }
+}
+
+/// What a refused `F_SETLEASE` means for the copy.
+#[derive(Debug, PartialEq, Eq)]
+enum LeaseRefusal {
+    /// The filesystem named cannot write the image, so it is copied without a lease.
+    Fallback(&'static str),
+    /// EAGAIN: a process has the image open for writing.
+    OpenForWriting,
+    /// EACCES or EPERM: neither the image's owner nor CAP_LEASE.
+    NotOwner,
+    /// EINVAL: no leases on this filesystem, or none at all.
+    Unsupported,
+    /// Any other error.
+    Failed,
+}
+
+/// Classify a refused `F_SETLEASE`, with `errno` and the image's filesystem type `kind`.
+fn lease_refusal(errno: Option<i32>, kind: Option<FsType>) -> LeaseRefusal {
+    if errno == Some(libc::EAGAIN) {
+        return LeaseRefusal::OpenForWriting;
+    }
+    let read_only = kind.and_then(|kind| {
+        READ_ONLY_FILESYSTEMS
+            .iter()
+            .find(|(magic, _)| *magic == kind)
+            .map(|(_, name)| *name)
+    });
+    match (errno, read_only) {
+        (Some(libc::EACCES | libc::EPERM | libc::EINVAL), Some(name)) => {
+            LeaseRefusal::Fallback(name)
+        }
+        (Some(libc::EACCES | libc::EPERM), None) => LeaseRefusal::NotOwner,
+        (Some(libc::EINVAL), None) => LeaseRefusal::Unsupported,
+        _ => LeaseRefusal::Failed,
+    }
+}
+
+/// CLOCK_REALTIME_COARSE as time since the epoch: the clock a filesystem without
+/// multigrain timestamps takes a change time from. Zero if it cannot be read, so nothing is
+/// recorded.
+fn coarse_realtime() -> std::time::Duration {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes one timespec to `now`, which outlives the call.
+    if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut now) } != 0 {
+        return std::time::Duration::ZERO;
+    }
+    std::time::Duration::new(now.tv_sec.max(0) as u64, now.tv_nsec as u32)
+}
+
+/// Whether the identity in `metadata` can stand for the image's bytes once the lease ends,
+/// `now` being the coarse realtime clock read while it was held: its change time is at least
+/// `IDENTITY_SETTLE` older (module doc).
+fn identity_is_settled(metadata: &std::fs::Metadata, now: std::time::Duration) -> bool {
+    let Ok(seconds) = u64::try_from(metadata.ctime()) else {
+        return false;
+    };
+    let changed = std::time::Duration::new(seconds, metadata.ctime_nsec() as u32);
+    changed + IDENTITY_SETTLE <= now
+}
+
+/// The digest of the first `len` bytes of `file` that names its store entry. It depends on
+/// the bytes alone, not on which ranges are holes: sha256 over a domain tag, the length and
+/// the sha256 of each `HASH_SEGMENT`, which covers each 4 KiB block holding a non-zero byte
+/// as its offset and its bytes. Holes are skipped with SEEK_DATA, and up to `HASH_THREADS`
+/// threads hash the segments.
+fn content_digest(file: &File, len: u64) -> Result<[u8; 32]> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let segments = len.div_ceil(HASH_SEGMENT) as usize;
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(HASH_THREADS)
+        .min(segments)
+        .max(1);
+    let next = AtomicUsize::new(0);
+    let mut digests = vec![[0u8; 32]; segments];
+    std::thread::scope(|scope| -> Result<()> {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| -> Result<Vec<(usize, [u8; 32])>> {
+                    let mut buffer = vec![0u8; 1 << 20];
+                    let mut done = Vec::new();
+                    loop {
+                        let segment = next.fetch_add(1, Ordering::Relaxed);
+                        if segment >= segments {
+                            return Ok(done);
+                        }
+                        let start = segment as u64 * HASH_SEGMENT;
+                        let end = (start + HASH_SEGMENT).min(len);
+                        done.push((segment, segment_digest(file, start, end, &mut buffer)?));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            let done = worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+            for (segment, digest) in done {
+                digests[segment] = digest;
+            }
+        }
+        Ok(())
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(CONTENT_DOMAIN);
+    hasher.update(len.to_le_bytes());
+    for digest in &digests {
+        hasher.update(digest);
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// The sha256 of the 4 KiB blocks in `start..end` of `file` that hold a non-zero byte, each
+/// as its offset and its bytes, read through `buffer`. `start` and `end` are 4 KiB aligned. A
+/// data run is widened to whole blocks and never hashes a block twice, so a filesystem whose
+/// runs are not block aligned gives the digest one whose runs are.
+fn segment_digest(file: &File, start: u64, end: u64, buffer: &mut [u8]) -> Result<[u8; 32]> {
+    const BLOCK: u64 = ZERO_BLOCK as u64;
+    let mut hasher = Sha256::new();
+    let mut hashed = start;
+    for_each_data_run(file, start, end, |data, hole| {
+        let mut position = (data / BLOCK * BLOCK).max(hashed);
+        let stop = hole.div_ceil(BLOCK).saturating_mul(BLOCK).min(end);
+        while position < stop {
+            let chunk = ((stop - position) as usize).min(buffer.len());
+            file.read_exact_at(&mut buffer[..chunk], position)
+                .with_context(|| format!("reading at {position}"))?;
+            for (index, block) in buffer[..chunk].chunks(ZERO_BLOCK).enumerate() {
+                if !is_zero(block) {
+                    hasher.update((position + (index * ZERO_BLOCK) as u64).to_le_bytes());
+                    hasher.update(block);
+                }
+            }
+            position += chunk as u64;
+        }
+        hashed = hashed.max(stop);
+        Ok(())
+    })?;
+    Ok(hasher.finalize().into())
+}
+
+/// Whether `bytes` are all zero, 16 at a time where it can.
+fn is_zero(bytes: &[u8]) -> bool {
+    let mut words = bytes.chunks_exact(16);
+    words
+        .by_ref()
+        .all(|word| u128::from_ne_bytes(word.try_into().unwrap()) == 0)
+        && words.remainder().iter().all(|byte| *byte == 0)
+}
+
+/// Call `each` with the start and end of every data run of `file` in `start..end`, clipped to
+/// it, in order (SEEK_DATA, SEEK_HOLE).
+fn for_each_data_run(
+    file: &File,
+    start: u64,
+    end: u64,
+    mut each: impl FnMut(u64, u64) -> Result<()>,
+) -> Result<()> {
+    let mut offset = start;
+    while offset < end {
+        let Some(data) = seek(file, offset, libc::SEEK_DATA)? else {
+            break;
+        };
+        if data >= end {
+            break;
+        }
+        let hole = seek(file, data, libc::SEEK_HOLE)?.unwrap_or(end).min(end);
+        each(data, hole)?;
+        offset = hole;
+    }
+    Ok(())
 }
 
 /// Give `dst` the bytes of `src`, `len` long: FICLONE when the filesystem can share the
@@ -1286,15 +1759,7 @@ fn match_nodatacow(src: &File, dst: &File) -> bool {
 /// this exists for.
 fn copy_data_runs(src: &File, dst: &File, len: u64) -> Result<()> {
     let mut buffer = vec![0u8; 1 << 20];
-    let mut offset = 0u64;
-    while offset < len {
-        let Some(data) = seek(src, offset, libc::SEEK_DATA)? else {
-            break;
-        };
-        if data >= len {
-            break;
-        }
-        let hole = seek(src, data, libc::SEEK_HOLE)?.unwrap_or(len).min(len);
+    for_each_data_run(src, 0, len, |data, hole| {
         let mut position = data;
         while position < hole {
             let chunk = ((hole - position) as usize).min(buffer.len());
@@ -1303,8 +1768,8 @@ fn copy_data_runs(src: &File, dst: &File, len: u64) -> Result<()> {
             write_nonzero_blocks(dst, &buffer[..chunk], position)?;
             position += chunk as u64;
         }
-        offset = hole;
-    }
+        Ok(())
+    })?;
     dst.set_len(len).context("setting the copy's length")?;
     Ok(())
 }
@@ -1319,7 +1784,7 @@ fn write_nonzero_blocks(dst: &File, data: &[u8], offset: u64) -> Result<()> {
     let mut run: Option<usize> = None;
     for (index, block) in data.chunks(ZERO_BLOCK).enumerate() {
         let start = index * ZERO_BLOCK;
-        let zero = block.iter().all(|byte| *byte == 0);
+        let zero = is_zero(block);
         match (zero, run) {
             (false, None) => run = Some(start),
             (true, Some(first)) => {
@@ -1642,42 +2107,260 @@ mod tests {
         assert_eq!(contents(&store), (vec![], vec![]));
     }
 
-    /// A process that dirtied a page of the image through a shared mapping before the copy
-    /// rewrites it after the copy. Without the fsync before the copy that second write moves
-    /// no timestamp, so the copy would be published under the generation it no longer
-    /// matches.
+    /// #1096: a process that opens the image for writing while it is copied makes the ingest
+    /// refuse. Every write starts with such an open, and a write in the same timestamp tick
+    /// as the copy keeps the image's identity, so comparing the identity before and after
+    /// the copy cannot see it. The writer here opens with O_NONBLOCK, as a writer that will
+    /// not wait for the copy to finish does. Afterwards nothing delays a writer.
     #[test]
-    fn a_shared_mapping_write_after_the_copy_is_refused() {
-        // A disk filesystem, where an fsync write-protects the image's pages.
+    fn a_writer_that_opens_the_image_during_the_copy_is_refused() {
         let disk = tempfile::tempdir_in(test_image_dir()).unwrap();
-        // A store on tmpfs makes the copy a byte copy: FICLONE fails across filesystems,
-        // and unlike a btrfs clone a read does not write the image back first.
-        let shm = tempfile::tempdir_in("/dev/shm").unwrap();
-        assert_ne!(dev(disk.path()), dev(shm.path()));
-        let source = image_in(disk.path(), 4 * MIB);
+        let data = tempfile::tempdir().unwrap();
+        let source = image_in(disk.path(), 2 * MIB);
+        let store = PmemStore::open(data.path()).unwrap();
+        let result = store.ingest_with(
+            &source,
+            || match File::options()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&source)
+            {
+                Ok(_) => Ok(()),
+                Err(error) if error.raw_os_error() == Some(libc::EWOULDBLOCK) => Ok(()),
+                Err(error) => Err(error.into()),
+            },
+            &sync_parent,
+            &coarse_realtime,
+        );
+        let error = format!(
+            "{:#}",
+            result.expect_err("a copy was published although a writer opened the image during it")
+        );
+        assert!(error.contains("opened for writing"), "{error}");
+        assert_eq!(contents(&store), (vec![], vec![]));
+        let started = std::time::Instant::now();
+        File::options().write(true).open(&source).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a writer waited {:?} after the ingest returned",
+            started.elapsed()
+        );
+    }
+
+    /// #1096: an image that a process holds open for writing, through a descriptor or a
+    /// writable shared mapping whose descriptor it closed, is refused before anything is
+    /// copied: that process can write it during the copy without moving its identity.
+    #[test]
+    fn an_image_open_for_writing_is_refused() {
+        let disk = tempfile::tempdir_in(test_image_dir()).unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let store = PmemStore::open(data.path()).unwrap();
+        let source = image_in(disk.path(), 2 * MIB);
+        let writer = File::options().write(true).open(&source).unwrap();
+        let error = format!(
+            "{:#}",
+            store
+                .ingest(&source)
+                .expect_err("an image open for writing was copied")
+        );
+        assert!(error.contains("open for writing"), "{error}");
+        drop(writer);
         let file = File::options()
             .read(true)
             .write(true)
             .open(&source)
             .unwrap();
         // SAFETY: the test owns the image and nothing truncates it while it is mapped.
-        let mut map = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
-        map[..4096].fill(1);
-        let store = PmemStore::open(shm.path()).unwrap();
-        let result = store.ingest_with(
-            &source,
-            || {
-                map[..4096].fill(2);
-                Ok(())
-            },
-            &sync_parent,
-        );
+        let map = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
+        drop(file);
         let error = format!(
             "{:#}",
-            result.expect_err("a copy older than the image was published")
+            store
+                .ingest(&source)
+                .expect_err("an image mapped writable was copied")
         );
-        assert!(error.contains("changed while fcvm copied it"), "{error}");
+        assert!(error.contains("open for writing"), "{error}");
         assert_eq!(contents(&store), (vec![], vec![]));
+        drop(map);
+        store
+            .ingest(&source)
+            .expect("the image was refused after its writers went away");
+    }
+
+    /// The source symlinks under the store directory, with their targets.
+    fn sources(store: &PmemStore) -> Vec<(PathBuf, PathBuf)> {
+        let mut found: Vec<(PathBuf, PathBuf)> = std::fs::read_dir(store.dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension() == Some(OsStr::new("source")))
+            .map(|path| {
+                let target = std::fs::read_link(&path).unwrap();
+                (path, target)
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// A clock this far ahead of the realtime clock, so an image made by the test counts as
+    /// unchanged for `IDENTITY_SETTLE`.
+    fn settled_clock() -> std::time::Duration {
+        coarse_realtime() + std::time::Duration::from_secs(60)
+    }
+
+    /// An image whose identity is recorded is found by it without a lease, so a process that
+    /// holds it open for writing (and has not written) does not stop the run, and maps the
+    /// entry that holds its bytes. A write changes the identity, and the image is hashed and
+    /// leased again.
+    #[test]
+    fn an_unchanged_image_is_found_by_its_identity_without_reading_it() {
+        let disk = tempfile::tempdir_in(test_image_dir()).unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let source = image_in(disk.path(), 2 * MIB);
+        let store = PmemStore::open(data.path()).unwrap();
+        let entry = store
+            .ingest_with(&source, || Ok(()), &sync_parent, &settled_clock)
+            .unwrap();
+        let recorded = sources(&store);
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].1, PathBuf::from(entry.file_name().unwrap()));
+        assert_eq!(contents(&store).1, Vec::<PathBuf>::new(), "a temp was left");
+
+        let writer = File::options().write(true).open(&source).unwrap();
+        assert_eq!(
+            store
+                .ingest(&source)
+                .expect("the recorded identity was not used"),
+            entry
+        );
+        // The settled clock is fake, so make the write land in a later tick than the image's
+        // last change, as the real clock guarantees for a recorded identity. The image is on
+        // btrfs, which keeps nanoseconds.
+        let metadata = std::fs::metadata(&source).unwrap();
+        let changed =
+            std::time::Duration::new(metadata.ctime() as u64, metadata.ctime_nsec() as u32);
+        while coarse_realtime() <= changed + std::time::Duration::from_millis(20) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut first = [0u8];
+        File::open(&source)
+            .unwrap()
+            .read_exact_at(&mut first, 0)
+            .unwrap();
+        writer.write_all_at(&[!first[0]], 0).unwrap();
+        let error = format!(
+            "{:#}",
+            store
+                .ingest(&source)
+                .expect_err("a recorded identity was used after a write changed the image")
+        );
+        assert!(error.contains("open for writing"), "{error}");
+        drop(writer);
+        let changed = store.ingest(&source).unwrap();
+        assert_ne!(changed, entry, "a changed image mapped the old entry");
+    }
+
+    /// The identity of an image changed less than `IDENTITY_SETTLE` before the lease was
+    /// checked is not recorded: a later write in the same timestamp tick would keep it.
+    #[test]
+    fn an_image_changed_within_the_settle_time_records_no_identity() {
+        let disk = tempfile::tempdir_in(test_image_dir()).unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let source = image_in(disk.path(), 2 * MIB);
+        let store = PmemStore::open(data.path()).unwrap();
+        let metadata = std::fs::metadata(&source).unwrap();
+        let changed =
+            std::time::Duration::new(metadata.ctime() as u64, metadata.ctime_nsec() as u32);
+        let edge = changed + IDENTITY_SETTLE;
+        assert!(identity_is_settled(&metadata, edge));
+        assert!(!identity_is_settled(
+            &metadata,
+            edge - std::time::Duration::from_nanos(1)
+        ));
+        let clock = || edge - std::time::Duration::from_nanos(1);
+        store
+            .ingest_with(&source, || Ok(()), &sync_parent, &clock)
+            .unwrap();
+        assert_eq!(sources(&store), vec![], "a fresh identity was recorded");
+    }
+
+    /// Two images with the same bytes have one digest whichever ranges are holes and however
+    /// the filesystem reports its data runs, across a segment boundary too, and one changed
+    /// byte gives another digest.
+    #[test]
+    fn the_content_digest_names_the_bytes_not_how_they_are_stored() {
+        const LEN: u64 = HASH_SEGMENT + 2 * MIB;
+        let mut bytes = vec![0u8; LEN as usize];
+        let around = (HASH_SEGMENT - 6 * 4096) as usize;
+        bytes[around..around + 12 * 4096].copy_from_slice(&random(12 * 4096));
+        bytes[..4096].copy_from_slice(&random(4096));
+        let disk = tempfile::tempdir_in(test_image_dir()).unwrap();
+        let sparse = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(disk.path().join("sparse"))
+            .unwrap();
+        sparse.set_len(LEN).unwrap();
+        sparse.write_all_at(&bytes[..4096], 0).unwrap();
+        sparse
+            .write_all_at(&bytes[around..around + 12 * 4096], around as u64)
+            .unwrap();
+        let shm = tempfile::tempdir_in("/dev/shm").unwrap();
+        let full = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(shm.path().join("full"))
+            .unwrap();
+        full.write_all_at(&bytes, 0).unwrap();
+        assert_eq!(
+            seek(&full, 0, libc::SEEK_HOLE).unwrap(),
+            Some(LEN),
+            "the second image has holes, so this test would not compare two layouts"
+        );
+        let digest = content_digest(&sparse, LEN).unwrap();
+        assert_eq!(content_digest(&full, LEN).unwrap(), digest);
+        full.write_all_at(&[1], LEN - 1).unwrap();
+        assert_ne!(content_digest(&full, LEN).unwrap(), digest);
+    }
+
+    /// A refused lease is fatal unless the image's filesystem cannot write it, and an image
+    /// open for writing is refused there too.
+    #[test]
+    fn a_refused_lease_falls_back_only_on_a_filesystem_that_cannot_write() {
+        let squashfs = Some(FsType(0x7371_7368));
+        let btrfs = Some(nix::sys::statfs::BTRFS_SUPER_MAGIC);
+        for errno in [libc::EACCES, libc::EPERM, libc::EINVAL] {
+            assert_eq!(
+                lease_refusal(Some(errno), squashfs),
+                LeaseRefusal::Fallback("squashfs")
+            );
+        }
+        assert_eq!(
+            lease_refusal(Some(libc::EAGAIN), squashfs),
+            LeaseRefusal::OpenForWriting
+        );
+        assert_eq!(
+            lease_refusal(Some(libc::EAGAIN), btrfs),
+            LeaseRefusal::OpenForWriting
+        );
+        assert_eq!(
+            lease_refusal(Some(libc::EACCES), btrfs),
+            LeaseRefusal::NotOwner
+        );
+        assert_eq!(
+            lease_refusal(Some(libc::EPERM), None),
+            LeaseRefusal::NotOwner
+        );
+        assert_eq!(
+            lease_refusal(Some(libc::EINVAL), btrfs),
+            LeaseRefusal::Unsupported
+        );
+        assert_eq!(
+            lease_refusal(Some(libc::ENOLCK), squashfs),
+            LeaseRefusal::Failed
+        );
     }
 
     /// Entries are mode 0400, so their owner cannot open one for writing either.
@@ -1718,6 +2401,7 @@ mod tests {
                     Ok(())
                 },
                 &sync_parent,
+                &coarse_realtime,
             )
             .unwrap();
         let first = first.expect("the racing ingest did not run");
@@ -1933,15 +2617,6 @@ mod tests {
                 "{error}"
             );
         }
-    }
-
-    /// A filesystem without fsync is accepted only when mounted read-only.
-    #[test]
-    fn an_fsync_error_is_accepted_only_on_a_read_only_mount() {
-        assert!(fsync_error_is_benign(Some(libc::EINVAL), || true));
-        assert!(fsync_error_is_benign(Some(libc::EROFS), || true));
-        assert!(!fsync_error_is_benign(Some(libc::EINVAL), || false));
-        assert!(!fsync_error_is_benign(Some(libc::EIO), || true));
     }
 
     /// A symlink at `<data_dir>/pmem` or at its `tmp` is refused, and nothing is created
@@ -2598,7 +3273,9 @@ mod tests {
         let ingest = |case: &str, source: &Path, after_copy: &dyn Fn() -> Result<()>| {
             let log = RefCell::new(Vec::new());
             let record = recording_sync(&log);
-            let entry = store.ingest_with(source, after_copy, &record).unwrap();
+            let entry = store
+                .ingest_with(source, after_copy, &record, &coarse_realtime)
+                .unwrap();
             let name = entry.file_name().unwrap().to_string_lossy().into_owned();
             assert_eq!(
                 log.take(),
@@ -2613,7 +3290,7 @@ mod tests {
         let error = format!(
             "{:#}",
             store
-                .ingest_with(&source, || Ok(()), &failing_sync)
+                .ingest_with(&source, || Ok(()), &failing_sync, &coarse_realtime)
                 .expect_err("a failed sync of a found entry was ignored")
         );
         assert!(

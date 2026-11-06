@@ -352,21 +352,26 @@ async fn pmem_devices(pid: u32) -> Result<Vec<serde_json::Value>> {
         .clone())
 }
 
-/// Whether `path` is shaped like a pmem store entry, `<data_dir>/pmem/<64 hex>.img`.
+/// Whether `path` is shaped like a pmem store entry, `<data_dir>/pmem/<64 hex>.img`, or a
+/// source symlink, `<data_dir>/pmem/<64 hex>.source`.
 fn is_store_entry(path: &Path) -> bool {
     path.parent().and_then(Path::file_name) == Some("pmem".as_ref())
         && path
             .file_name()
             .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_suffix(".img"))
+            .and_then(|name| {
+                name.strip_suffix(".img")
+                    .or_else(|| name.strip_suffix(".source"))
+            })
             .is_some_and(|hex| {
                 hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
             })
 }
 
-/// Remove the store copies the VMs mapped, so the tests do not leave them in the data
-/// directory: nothing collects store entries yet. Only a path shaped like an entry is
-/// removed, so the image under a test's own directory never is.
+/// Remove the store copies the VMs mapped, and the source symlinks that name them, so the
+/// tests do not leave them in the data directory: nothing collects store entries yet. Only
+/// a path shaped like an entry or a source symlink is removed, so the image under a test's
+/// own directory never is.
 fn remove_store_copies(copies: &[String]) {
     for copy in copies {
         if is_store_entry(Path::new(copy)) {
@@ -386,14 +391,20 @@ async fn remove_logged_store_copies(log_path: &Path) {
     remove_store_copies(&store_copies_logged(log_path));
 }
 
-/// The store entries a run's debug log says it copied an image into or found there.
+/// The store entries a run's debug log says it copied an image into or found there, and the
+/// source symlinks it recorded.
 fn store_copies_logged(log_path: &Path) -> Vec<String> {
     let log = std::fs::read_to_string(log_path).unwrap_or_default();
     let mut copies: Vec<String> = log
         .lines()
         .filter(|line| line.contains("pmem store"))
         .flat_map(str::split_whitespace)
-        .filter_map(|field| field.strip_prefix("entry="))
+        .filter_map(|field| {
+            field
+                .strip_prefix("entry=")
+                .or_else(|| field.strip_prefix("index="))
+        })
+        .filter(|path| !path.is_empty())
         .map(str::to_string)
         .collect();
     copies.sort();

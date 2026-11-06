@@ -4552,6 +4552,55 @@ mod tests {
         assert_ne!(key(&link), rewritten, "the symlink names another image now");
     }
 
+    /// #1097: the snapshot key names the bytes of a --pmem image, not its path or its file
+    /// identity. Two paths holding the same bytes, one of them a hard link, share a key and
+    /// a store entry, and so does an image touched without changing a byte; changing one
+    /// byte changes the key.
+    #[test]
+    fn the_snapshot_key_names_the_pmem_image_content() {
+        let dir = tempfile::tempdir_in(crate::storage::pmem_store::test_image_dir()).unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let (a, b, link) = (
+            dir.path().join("a.ext4"),
+            dir.path().join("b.ext4"),
+            dir.path().join("link.ext4"),
+        );
+        let mut bytes = vec![0u8; 2 << 20];
+        bytes[..4096].fill(0x5a);
+        bytes[1 << 20..(1 << 20) + 4096].fill(0xa5);
+        std::fs::write(&a, &bytes).unwrap();
+        std::fs::write(&b, &bytes).unwrap();
+        std::fs::hard_link(&a, &link).unwrap();
+        let resolve = |image: &std::path::Path| {
+            let mut args = test_args();
+            args.pmem = vec![format!("{}:/mnt/cache:ro", image.display())];
+            resolve_pmem_into_store(&mut args, data.path()).unwrap();
+            (
+                key_for(&args, GuestBootInputs::default()),
+                args.pmem_devices[0].path.clone(),
+            )
+        };
+        let (key, entry) = resolve(&a);
+        assert_eq!(
+            resolve(&b),
+            (key.clone(), entry.clone()),
+            "two copies of one image"
+        );
+        assert_eq!(resolve(&link), (key.clone(), entry.clone()), "a hard link");
+        std::fs::File::options()
+            .write(true)
+            .open(&a)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(resolve(&a), (key.clone(), entry.clone()), "a touched image");
+        bytes[4095] ^= 1;
+        std::fs::write(&b, &bytes).unwrap();
+        let (changed, changed_entry) = resolve(&b);
+        assert_ne!(changed, key, "one byte changed and the key did not");
+        assert_ne!(changed_entry, entry);
+    }
+
     /// A mount point at or under a --pmem mount point is refused before boot: the pmem
     /// image is a read-only filesystem mounted after the extra disks, so it would hide
     /// the disk, or the mount point could not be created on it. A sibling path is not

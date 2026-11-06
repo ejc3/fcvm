@@ -65,7 +65,7 @@ pub fn parse_pmem_spec(spec: &str) -> Result<(PathBuf, String)> {
 }
 
 /// Resolve `--pmem` specs into store entries, in device order. A spec naming an image is
-/// copied into the store unless that generation is already there. A spec that already
+/// copied into the store unless an entry already holds its bytes. A spec that already
 /// names an entry of `store` (a disk-only clone or reboot of a snapshot passes its
 /// recorded devices back in) is used as it is, with the source `recorded` gives for it,
 /// or the entry itself when nothing recorded it.
@@ -100,13 +100,14 @@ pub fn resolve_pmem_devices(
         .collect()
 }
 
-/// The identity of an image generation, which names its store entry: inode, length and
+/// The identity of an image generation, which names the source symlink that finds its
+/// store entry without reading the image (`storage::pmem_store`): inode, length and
 /// modification time, then change time, all from one fstat of the descriptor that is
 /// copied. An in-place rewrite can keep the first three (`cp -p`, `rsync --inplace -t`,
 /// images built with normalized timestamps). write(2), truncate, fallocate and a reflink
-/// into the file move the change time, which userspace cannot set back, and so does a
-/// write through a writable shared mapping once the file was fsynced (the store fsyncs
-/// before it copies). The device number is left out: btrfs and loop-backed stores number
+/// into the file move the change time, which userspace cannot set back, and so does the
+/// first write through a writable shared mapping, which faults (a mapping made before the
+/// store's read lease refuses the lease). The device number is left out: btrfs and loop-backed stores number
 /// a filesystem when it is mounted, so it can differ after a host reboot while the image
 /// is unchanged.
 pub(crate) fn image_identity(metadata: &std::fs::Metadata) -> String {
@@ -266,10 +267,20 @@ mod tests {
     use crate::storage::pmem_store::test_image_dir;
     use std::os::unix::fs::PermissionsExt;
 
-    fn image(len: u64) -> tempfile::NamedTempFile {
+    /// A `len` byte image, closed: the store refuses an image a process holds open for
+    /// writing.
+    struct Image(tempfile::TempPath);
+
+    impl Image {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    fn image(len: u64) -> Image {
         let file = tempfile::NamedTempFile::new_in(test_image_dir()).unwrap();
         file.as_file().set_len(len).unwrap();
-        file
+        Image(file.into_temp_path())
     }
 
     /// The store under `data` and the device a spec for `path` resolves to.

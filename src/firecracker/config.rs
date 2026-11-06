@@ -47,9 +47,9 @@ pub struct FirecrackerConfig {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub extra_disks: Vec<String>,
     /// Read-only virtio-pmem specs (--pmem), in device order, each naming the image's
-    /// pmem store entry, so the key names the image generation: Firecracker reopens
-    /// the recorded entry on restore and the memory snapshot holds the guest's view
-    /// of it. Kept apart from extra_disks so a --pmem and a --disk with the same text
+    /// pmem store entry, which is named by the image's bytes, so the key names the
+    /// image's content and not its path: Firecracker reopens the recorded entry on
+    /// restore and the memory snapshot holds the guest's view of it. Kept apart from extra_disks so a --pmem and a --disk with the same text
     /// get different keys.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pmem: Vec<String>,
