@@ -86,7 +86,10 @@ fn every_inner_fcvm_run_has_a_data_dir_of_its_own() {
             "an inner fcvm run reuses the NESTED_DATA of an earlier run"
         );
     }
-    assert!(runs >= 4, "found {runs} inner fcvm runs in tests/test_kvm.rs, expected at least 4");
+    assert!(
+        runs >= 4,
+        "found {runs} inner fcvm runs in tests/test_kvm.rs, expected at least 4"
+    );
 }
 
 /// #875: an L1 whose resolv.conf sources name only a loopback stub fails the
