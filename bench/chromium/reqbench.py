@@ -2296,6 +2296,47 @@ def _flock_until(fd: int, deadline: float) -> bool:
             time.sleep(0.01)
 
 
+def _lock_runtime_dir_for_reap(data_dir: str):
+    """data_dir's fd, held with an exclusive flock, or None when it is gone.
+
+    fcvm takes this same lock (storage::runtime_dir, a flock on the directory
+    itself): a VM's teardown exclusively around the removal of its runtime
+    directory, and every launch's reclaim of an abandoned owner
+    (reclaim::undo_runtime_dir) exclusively without waiting, leaving a
+    directory it finds locked for a later pass. A clone ended with SIGKILL
+    leaves its owner record abandoned, so another clone's launch can remove
+    this tree while the reap's rmtree is inside it. On btrfs that is not a
+    benign race: a subvolume deleted between rmtree's stat of the clone's
+    `disks` and its fstat of the opened directory reports st_dev 0 to the
+    fstat, and rmtree refuses with "Cannot call rmtree on a symbolic link"
+    (#1525; 4 in 3,000 concurrent removals of such a tree on this kernel). So
+    the reap holds the lock across its removal, as fcvm's own teardown does.
+
+    A directory that disappears, or is replaced, while the reap waits was
+    removed by the holder. Raises OSError when the lock is still held after
+    STATE_LOCK_WAIT_S."""
+    try:
+        fd = os.open(data_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    try:
+        if not _flock_until(fd, time.monotonic() + STATE_LOCK_WAIT_S):
+            raise BlockingIOError(
+                errno.EAGAIN, "runtime directory lock still held after the wait", data_dir)
+        held = os.fstat(fd)
+        try:
+            named = os.lstat(data_dir)
+        except FileNotFoundError:
+            named = None
+    except OSError:
+        os.close(fd)
+        raise
+    if named is None or (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino):
+        os.close(fd)
+        return None
+    return fd
+
+
 def _ignore_missing(function, path, exc):
     """rmtree onexc: an entry another process removed first is not an error."""
     if not isinstance(exc, FileNotFoundError):
@@ -2376,20 +2417,28 @@ def reap_disk(
     # Remove the disk first.  If this fails, keep the state and lock as the only
     # durable pointer to the still-allocated clone rather than orphaning it.
     if data_dir and os.path.isdir(data_dir):
+        dir_lock = None
         try:
-            # Every fcvm launch reclaims the runtime directory of a SIGKILLed
-            # fcvm whose owner lock nobody holds (src/reclaim.rs), so under
-            # concurrent clones another launch can remove entries of this tree
-            # while the walk is in it. An entry already gone is that removal,
-            # not a failure; anything else still raises.
-            shutil.rmtree(data_dir, onexc=_ignore_missing)
-            reaped.append(data_dir)
+            # Under the runtime directory's lock, which keeps another launch's
+            # reclaim of this SIGKILLed clone (src/reclaim.rs) out of the tree
+            # while the walk is in it (_lock_runtime_dir_for_reap). An entry
+            # already gone is still not a failure: a reclaim that held the
+            # lock first removed it.
+            t_lock = time.monotonic()
+            dir_lock = _lock_runtime_dir_for_reap(data_dir)
+            out["disk_lock_wait_ms"] = (time.monotonic() - t_lock) * 1000
+            if dir_lock is not None:
+                shutil.rmtree(data_dir, onexc=_ignore_missing)
+                reaped.append(data_dir)
         except OSError as e:
             out.setdefault("disk_errors", []).append(f"{data_dir}: {e}")
             if state_lock is not None:
                 fcntl.flock(state_lock, fcntl.LOCK_UN)
                 os.close(state_lock)
             return reaped
+        finally:
+            if dir_lock is not None:
+                os.close(dir_lock)
     # A removal that finds the file already gone has nothing left to do: under
     # concurrent clones another fcvm's stale-state cleanup can delete this
     # clone's state or lock between the check and the remove.

@@ -1088,6 +1088,112 @@ class ReapDiskPathGuard(unittest.TestCase):
             self.assertNotIn("disk_errors", out)
 
 
+class ReapExcludesReclaim(unittest.TestCase):
+    """#1525: the fast teardown's disk reap takes the runtime directory's flock,
+    the lock fcvm's teardown and every launch's reclaim of an abandoned owner
+    take, so another clone's launch cannot remove the tree while the reap's
+    rmtree is inside it. On btrfs that concurrent removal made rmtree refuse
+    with "Cannot call rmtree on a symbolic link": a `disks` subvolume deleted
+    between rmtree's stat and its fstat reports st_dev 0 to the fstat."""
+
+    VM_ID = "vm-19299daf02974ac5bdca3da898b8526c"
+
+    def _clone(self, root):
+        state = os.path.join(root, "state", f"{self.VM_ID}.json")
+        os.makedirs(os.path.dirname(state))
+        with open(state, "w") as f:
+            json.dump({"vm_id": self.VM_ID}, f)
+        vm_dir = os.path.join(root, "vm-disks", self.VM_ID)
+        os.makedirs(os.path.join(vm_dir, "disks"))
+        for name in ("disks/rootfs.raw", "firecracker.sock", "pasta.pid"):
+            with open(os.path.join(vm_dir, name), "w") as f:
+                f.write("x")
+        return state, vm_dir
+
+    def test_a_reclaim_cannot_remove_the_tree_under_the_reap(self):
+        """RED BEFORE THE FIX: the reap's rmtree ran without the directory
+        lock, so a reclaim (reclaim::undo_runtime_dir: try the exclusive lock,
+        remove the tree when it is free) removed the tree under the walk, and
+        on btrfs the walk refused with the error the scale run recorded."""
+        from unittest import mock
+        real_rmtree = shutil.rmtree
+        reclaims = []
+
+        def rmtree_beside_a_reclaim(path, *args, **kwargs):
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    reclaims.append("in use")
+                else:
+                    # What the kernel does to the walk when a reclaim deletes a
+                    # btrfs subvolume under it.
+                    reclaims.append("removed")
+                    real_rmtree(path)
+                    raise OSError("Cannot call rmtree on a symbolic link")
+            finally:
+                os.close(fd)
+            return real_rmtree(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as root:
+            state, vm_dir = self._clone(root)
+            out: dict = {}
+            with mock.patch.object(shutil, "rmtree", rmtree_beside_a_reclaim):
+                reaped = reqbench.reap_disk(out, root, state, vm_dir)
+            self.assertEqual(reclaims, ["in use"], "a reclaim got the lock during the reap's removal")
+            self.assertNotIn("disk_errors", out)
+            self.assertEqual(reaped, [vm_dir, state])
+            self.assertEqual(reqbench.left_on_disk(state, vm_dir), [])
+
+    def test_a_reclaim_holding_the_lock_is_waited_for(self):
+        """A reclaim that holds the lock when the reap arrives removes the tree;
+        the reap waits for it and finds nothing left, which is a clean reap."""
+        with tempfile.TemporaryDirectory() as root:
+            state, vm_dir = self._clone(root)
+            ready = os.path.join(root, "ready")
+            os.mkfifo(ready)
+            holder = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import fcntl, os, shutil, sys, time\n"
+                 "fd = os.open(sys.argv[1], os.O_RDONLY)\n"
+                 "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+                 "open(sys.argv[2], 'w').close()\n"
+                 "time.sleep(0.3)\n"
+                 "shutil.rmtree(sys.argv[1])\n", vm_dir, ready])
+            try:
+                with open(ready):
+                    pass
+                out: dict = {}
+                reaped = reqbench.reap_disk(out, root, state, vm_dir)
+            finally:
+                holder.wait(timeout=30)
+            self.assertEqual(holder.returncode, 0)
+            self.assertNotIn("disk_errors", out)
+            self.assertGreaterEqual(out["disk_lock_wait_ms"], 200.0, out)
+            self.assertEqual(reaped, [state])
+            self.assertEqual(reqbench.left_on_disk(state, vm_dir), [])
+
+    def test_a_lock_held_past_the_wait_keeps_the_state(self):
+        """A holder that does not let go is not a reclaim: the reap records the
+        error and keeps the state, the only pointer to the clone's disk."""
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as root:
+            state, vm_dir = self._clone(root)
+            fd = os.open(vm_dir, os.O_RDONLY)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                out: dict = {}
+                with mock.patch.object(reqbench, "STATE_LOCK_WAIT_S", 0.2):
+                    reaped = reqbench.reap_disk(out, root, state, vm_dir)
+            finally:
+                os.close(fd)
+            self.assertEqual(reaped, [])
+            self.assertIn("still held", " ".join(out["disk_errors"]))
+            self.assertTrue(os.path.isdir(vm_dir))
+            self.assertTrue(os.path.lexists(state))
+
+
 class TeardownNormalLeakVerdict(unittest.TestCase):
     """`teardown_normal` computes `all_gone` and must ACT on it — correctly.
 
