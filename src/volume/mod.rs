@@ -50,6 +50,25 @@ pub struct VolumeConfig {
     pub port: u32,
     /// Use portable inode numbering (RemapFs wrapper)
     pub portable: bool,
+    /// Where the guest mounts another filesystem inside this volume, relative to its root
+    /// (`mount_points_inside`). The server keeps answering each with the directory the guest
+    /// mounted over (`PassthroughFs::with_mount_points`).
+    pub mount_points: Vec<PathBuf>,
+}
+
+/// The guest paths in `mount_points` that lie inside the volume mounted at `guest_path`,
+/// relative to it.
+pub fn mount_points_inside<'a>(
+    guest_path: &Path,
+    mount_points: impl IntoIterator<Item = &'a Path>,
+) -> Vec<PathBuf> {
+    mount_points
+        .into_iter()
+        .filter(|inner| *inner != guest_path)
+        .filter_map(|inner| inner.strip_prefix(guest_path).ok())
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect()
 }
 
 /// Volume server that serves host directories to guests.
@@ -117,7 +136,8 @@ impl VolumeServer {
         // answers OPEN and FLUSH with ENOSYS, so the guest kernel stops sending
         // OPEN, FLUSH and RELEASE and keeps file pages between opens
         // (PassthroughFs::try_for_volume).
-        let fs = fuse_pipe::PassthroughFs::for_volume(&self.host_path, self.config.read_only);
+        let fs = fuse_pipe::PassthroughFs::for_volume(&self.host_path, self.config.read_only)
+            .with_mount_points(&self.config.mount_points);
 
         // fc-agent mounts a read-only volume read-only, and this server refuses
         // every request that could change it with EROFS
@@ -194,7 +214,8 @@ impl VolumeServer {
             "VolumeServer starting (Unix socket)"
         );
 
-        let fs = fuse_pipe::PassthroughFs::for_volume(&self.host_path, self.config.read_only);
+        let fs = fuse_pipe::PassthroughFs::for_volume(&self.host_path, self.config.read_only)
+            .with_mount_points(&self.config.mount_points);
         let server = fuse_pipe::AsyncServer::new(fs);
         server
             .serve_unix(&path_str)
@@ -401,7 +422,8 @@ pub async fn spawn_volume_servers_with_tables(
         let port = config.port;
 
         if config.portable {
-            let fs = fuse_pipe::PassthroughFs::for_volume(&host_path, config.read_only);
+            let fs = fuse_pipe::PassthroughFs::for_volume(&host_path, config.read_only)
+                .with_mount_points(&config.mount_points);
             let table = inode_tables.get(idx).and_then(|t| t.as_ref());
 
             let remap = if let Some(json) = table {

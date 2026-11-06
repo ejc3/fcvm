@@ -59,6 +59,48 @@ pub struct PassthroughFs {
     /// The server of a read-only volume refuses every request that could change it, see
     /// `handle_request`.
     read_only: bool,
+    /// The directories the guest mounts something over inside this volume, see
+    /// `with_mount_points`.
+    mount_points: Option<MountPoints>,
+}
+
+/// The directories inside a volume that the guest mounts other filesystems over, and the
+/// directories on the way to them (`PassthroughFs::with_mount_points`).
+struct MountPoints {
+    state: std::sync::Mutex<MountPointState>,
+}
+
+/// The names below one directory that are, or lead to, a mount point.
+#[derive(Default, Clone)]
+struct MountTree {
+    names: std::collections::HashMap<Vec<u8>, MountTree>,
+}
+
+#[derive(Default)]
+struct MountPointState {
+    /// The part of the mount-point tree below each directory inode the guest got on the way to
+    /// a mount point, and below the root. Keyed by inode, not path, so a guest rename that
+    /// moves a directory moves what is below it with it.
+    below: std::collections::HashMap<u64, MountTree>,
+    /// The inode the guest first got for each such name, by (parent inode, name).
+    first: std::collections::HashMap<(u64, Vec<u8>), u64>,
+}
+
+impl MountPointState {
+    /// The subtree at `name` in `parent`, when that name is on the way to a mount point.
+    fn tree_at(&self, parent: u64, name: &[u8]) -> Option<MountTree> {
+        self.below.get(&parent)?.names.get(name).cloned()
+    }
+
+    /// Record `inode` as the directory the guest got at `name` in `parent`.
+    fn keep(&mut self, parent: u64, name: &[u8], inode: u64, tree: MountTree) {
+        if let Some(earlier) = self.first.insert((parent, name.to_vec()), inode) {
+            if earlier != inode {
+                self.below.remove(&earlier);
+            }
+        }
+        self.below.insert(inode, tree);
+    }
 }
 
 impl PassthroughFs {
@@ -147,7 +189,191 @@ impl PassthroughFs {
             attr_ttl_secs: ATTR_TTL_SECS,
             zero_message_open: no_open,
             read_only,
+            mount_points: None,
         })
+    }
+
+    /// Keep answering each of `mount_points` (paths relative to the volume's root at which the
+    /// guest mounts another filesystem) and each directory on the way to one with the inode the
+    /// guest first got there.
+    ///
+    /// The guest's kernel looks a name up again once its entry timeout passes, and when the
+    /// answer is another inode it drops the dentry, and with it every mount on it
+    /// (`d_invalidate`). So a host that replaced or removed the directory an inner map, disk or
+    /// share is mounted on took that mount out of the guest within a second, and the guest saw
+    /// the outer volume's new directory in its place (#1043). The directory the guest mounted
+    /// over is the one it keeps: the host's replacement stays out of sight under the mount, as
+    /// the original was.
+    pub fn with_mount_points(mut self, mount_points: &[PathBuf]) -> Self {
+        use std::os::unix::ffi::OsStrExt;
+        let mut tree = MountTree::default();
+        for mount_point in mount_points {
+            // Where a `..` leads depends on symlinks in the guest, so such a path names no
+            // directory here, and it is not kept.
+            let names: Option<Vec<&[u8]>> = mount_point
+                .components()
+                .filter(|component| *component != std::path::Component::CurDir)
+                .map(|component| match component {
+                    std::path::Component::Normal(name) => Some(name.as_bytes()),
+                    _ => None,
+                })
+                .collect();
+            let Some(names) = names else {
+                continue;
+            };
+            let mut at = &mut tree;
+            for name in names {
+                at = at.names.entry(name.to_vec()).or_default();
+            }
+        }
+        if tree.names.is_empty() {
+            self.mount_points = None;
+            return self;
+        }
+        let mut state = MountPointState::default();
+        state
+            .below
+            .insert(fuse_backend_rs::api::filesystem::ROOT_ID, tree);
+        self.mount_points = Some(MountPoints {
+            state: std::sync::Mutex::new(state),
+        });
+        self
+    }
+
+    /// The guest made the directory `entry` at `name` in `parent`. fc-agent makes a missing
+    /// mount point this way and mounts on the entry the reply gave it, with no lookup, so a
+    /// mount point (`with_mount_points`) made here is the directory the guest mounts over.
+    fn created_mount_point(&self, parent: u64, name: &[u8], entry: &Entry) {
+        let Some(mount_points) = &self.mount_points else {
+            return;
+        };
+        let mut state = mount_points.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tree) = state.tree_at(parent, name) {
+            state.keep(parent, name, entry.inode, tree);
+        }
+    }
+
+    /// The guest renamed `from` to `to`, each a name in a parent directory (`exchange`: swapped
+    /// them). Its kernel moved its own dentries and the mounts under them, so the mount-point
+    /// tree at `from` now hangs at `to`, whatever directory `to` is in, and what is below the
+    /// moved directory, keyed by its inode, stays. The old name follows the host again. What
+    /// was at `to` is dropped, as the guest replaced it, unless the rename swapped the two.
+    fn renamed_by_guest(&self, from: (u64, &[u8]), to: (u64, &[u8]), exchange: bool) {
+        let Some(mount_points) = &self.mount_points else {
+            return;
+        };
+        let mut state = mount_points.state.lock().unwrap_or_else(|e| e.into_inner());
+        let take = |state: &mut MountPointState, (parent, name): (u64, &[u8])| {
+            let tree = state.below.get_mut(&parent)?.names.remove(name)?;
+            Some((tree, state.first.remove(&(parent, name.to_vec()))))
+        };
+        let moved = take(&mut state, from);
+        let replaced = take(&mut state, to);
+        let put = |state: &mut MountPointState,
+                   (parent, name): (u64, &[u8]),
+                   (tree, kept): (MountTree, Option<u64>)| {
+            state
+                .below
+                .entry(parent)
+                .or_default()
+                .names
+                .insert(name.to_vec(), tree);
+            if let Some(inode) = kept {
+                state.first.insert((parent, name.to_vec()), inode);
+            }
+        };
+        if let Some(moved) = moved {
+            put(&mut state, to, moved);
+        }
+        match replaced {
+            Some(replaced) if exchange => put(&mut state, from, replaced),
+            Some((_, Some(inode))) => {
+                state.below.remove(&inode);
+            }
+            _ => {}
+        }
+    }
+
+    /// The guest's kernel forgot `inodes`, and the backend has been told. A kept directory
+    /// among them that the backend no longer holds (the guest evicted it, which it does not
+    /// while anything is mounted on it) is kept no longer, with what was kept below it, so its
+    /// name follows the host again even if the directory is looked up later under another name
+    /// the host gave it. Whether the backend still holds one is asked with a lookup of ".",
+    /// undone at once: a LOOKUP served between the FORGET and here keeps it held, and then so
+    /// is the pin. The pins' lock is held across, so no lookup records a pin in between.
+    fn forgotten_by_guest(&self, inodes: &[u64]) {
+        let Some(mount_points) = &self.mount_points else {
+            return;
+        };
+        let mut state = mount_points.state.lock().unwrap_or_else(|e| e.into_inner());
+        let ctx = Context::new();
+        for &inode in inodes {
+            if !state.first.values().any(|kept| *kept == inode) {
+                continue;
+            }
+            match self.inner.lookup(&ctx, inode, c".") {
+                Ok(held) => self.inner.forget(&ctx, held.inode, 1),
+                Err(_) => {
+                    state.first.retain(|_, kept| *kept != inode);
+                    state.below.remove(&inode);
+                }
+            }
+        }
+    }
+
+    /// What a lookup of `name` in `parent` answers, given what the backend `found`. For a
+    /// mount point (`with_mount_points`) whose directory the host replaced or removed, that is
+    /// the directory the guest got first, taken with a lookup of "." so that its count of
+    /// lookups grows as the kernel's does, and the backend's new answer is forgotten.
+    fn keep_mount_point(
+        &self,
+        ctx: &Context,
+        parent: u64,
+        name: &[u8],
+        found: std::io::Result<Entry>,
+    ) -> std::io::Result<Entry> {
+        let Some(mount_points) = &self.mount_points else {
+            return found;
+        };
+        let mut state = mount_points.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(tree) = state.tree_at(parent, name) else {
+            return found;
+        };
+        let first = state.first.get(&(parent, name.to_vec())).copied();
+        match (first, &found) {
+            (Some(first), Ok(entry)) if entry.inode == first => found,
+            (Some(first), _) => match self.inner.lookup(ctx, first, c".") {
+                Ok(kept) => {
+                    if let Ok(entry) = &found {
+                        self.inner.forget(ctx, entry.inode, 1);
+                    }
+                    tracing::warn!(
+                        target: "passthrough",
+                        root = %self.root_path.display(),
+                        parent,
+                        name = %String::from_utf8_lossy(name),
+                        "the host replaced or removed a directory the guest has a mount on; the \
+                         guest keeps the directory it mounted over"
+                    );
+                    Ok(kept)
+                }
+                // The guest forgot the directory, and the server with it: nothing is mounted
+                // on it any more, so the host's directory is the answer.
+                Err(_) => {
+                    state.first.remove(&(parent, name.to_vec()));
+                    state.below.remove(&first);
+                    if let Ok(entry) = &found {
+                        state.keep(parent, name, entry.inode, tree);
+                    }
+                    found
+                }
+            },
+            (None, Ok(entry)) => {
+                state.keep(parent, name, entry.inode, tree);
+                found
+            }
+            (None, Err(_)) => found,
+        }
     }
 
     /// Set the attribute TTL.
@@ -296,7 +522,7 @@ impl FilesystemHandler for PassthroughFs {
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
 
-        match self.inner.lookup(&ctx, parent, &cname) {
+        match self.keep_mount_point(&ctx, parent, name, self.inner.lookup(&ctx, parent, &cname)) {
             Ok(entry) => {
                 let attr = Self::entry_to_attr(&entry);
                 tracing::debug!(
@@ -568,6 +794,7 @@ impl FilesystemHandler for PassthroughFs {
         match self.inner.mkdir(&ctx, parent, &cname, mode, 0) {
             Ok(entry) => {
                 tracing::debug!(target: "passthrough", inode = entry.inode, "mkdir succeeded");
+                self.created_mount_point(parent, name, &entry);
                 let attr = Self::entry_to_attr(&entry);
                 VolumeResponse::Entry {
                     attr,
@@ -871,7 +1098,11 @@ impl FilesystemHandler for PassthroughFs {
             .inner
             .rename(&ctx, parent, &cname, newparent, &cnewname, flags)
         {
-            Ok(()) => VolumeResponse::Ok,
+            Ok(()) => {
+                // RENAME_EXCHANGE (linux/fs.h) swaps the two names.
+                self.renamed_by_guest((parent, name), (newparent, newname), flags & 2 != 0);
+                VolumeResponse::Ok
+            }
             Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
         }
     }
@@ -1203,16 +1434,7 @@ impl FilesystemHandler for PassthroughFs {
             let mut add_entry = |dir_entry: fuse_backend_rs::api::filesystem::DirEntry,
                                  entry: Entry|
              -> std::io::Result<usize> {
-                let name = dir_entry.name.to_vec();
-                let attr = Self::entry_to_attr(&entry);
-                entries.push(DirEntryPlus {
-                    ino: entry.inode,
-                    name,
-                    attr,
-                    generation: entry.generation,
-                    attr_ttl_secs: self.attr_ttl_secs,
-                    entry_ttl_secs: self.attr_ttl_secs,
-                });
+                entries.push((dir_entry.name.to_vec(), entry));
                 last_offset = dir_entry.offset;
                 Ok(1)
             };
@@ -1240,6 +1462,30 @@ impl FilesystemHandler for PassthroughFs {
             next_offset = last_offset;
         }
 
+        // The kernel drops a dentry, and every mount on it, when READDIRPLUS names another inode
+        // for it, as a lookup does (`fuse_direntplus_link`), so a listing keeps mount points too.
+        let entries = entries
+            .into_iter()
+            .map(|(name, entry)| {
+                let entry = if name == b"." || name == b".." {
+                    entry
+                } else {
+                    // A kept mount point never fails: an error leaves the backend's entry.
+                    match self.keep_mount_point(&ctx, ino, &name, Ok(entry)) {
+                        Ok(entry) => entry,
+                        Err(_) => unreachable!("keep_mount_point fails only when the backend did"),
+                    }
+                };
+                DirEntryPlus {
+                    ino: entry.inode,
+                    attr: Self::entry_to_attr(&entry),
+                    generation: entry.generation,
+                    name,
+                    attr_ttl_secs: self.attr_ttl_secs,
+                    entry_ttl_secs: self.attr_ttl_secs,
+                }
+            })
+            .collect::<Vec<_>>();
         tracing::debug!(target: "passthrough", ino, offset, count = entries.len(), "readdirplus succeeded");
         VolumeResponse::DirEntriesPlus { entries }
     }
@@ -1329,6 +1575,7 @@ impl FilesystemHandler for PassthroughFs {
     fn forget(&self, ino: u64, nlookup: u64) {
         let ctx = Context::new();
         self.inner.forget(&ctx, ino, nlookup);
+        self.forgotten_by_guest(&[ino]);
     }
 
     fn batch_forget(&self, inodes: &[(u64, u64)]) {
@@ -1340,6 +1587,7 @@ impl FilesystemHandler for PassthroughFs {
                 .map(|&(ino, nlookup)| (ino, nlookup))
                 .collect(),
         );
+        self.forgotten_by_guest(&inodes.iter().map(|&(ino, _)| ino).collect::<Vec<_>>());
     }
 }
 
@@ -1853,6 +2101,222 @@ mod tests {
         assert!(
             matches!(read, VolumeResponse::Data { ref data } if data == b"content"),
             "read: {read:?}"
+        );
+    }
+
+    /// A directory on the way to a mount point that the guest forgot takes what was kept below
+    /// it along: under the name the host moved it to, its old subdirectories follow the host.
+    #[test]
+    fn a_forgotten_directory_keeps_nothing_below_it() {
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("a/inner")).unwrap();
+        let fs =
+            PassthroughFs::for_volume(root, false).with_mount_points(&[PathBuf::from("a/inner")]);
+        let lookup = |parent: u64, name: &[u8]| match fs.lookup(parent, name, uid, gid, 0) {
+            VolumeResponse::Entry { attr, .. } => attr.ino,
+            other => panic!("lookup: {other:?}"),
+        };
+        let a = lookup(1, b"a");
+        let inner = lookup(a, b"inner");
+        fs.forget(inner, 1);
+        fs.forget(a, 1);
+        std::fs::rename(root.join("a"), root.join("a.old")).unwrap();
+        std::fs::create_dir_all(root.join("a/inner")).unwrap();
+        assert_ne!(lookup(1, b"a"), a);
+        assert_eq!(lookup(1, b"a.old"), a);
+        let seen = lookup(a, b"inner");
+        std::fs::rename(root.join("a.old/inner"), root.join("a.old/inner.x")).unwrap();
+        std::fs::create_dir(root.join("a.old/inner")).unwrap();
+        assert_ne!(
+            lookup(a, b"inner"),
+            seen,
+            "a subdirectory of a forgotten directory is still kept"
+        );
+    }
+
+    /// A mount point with a `..` names no directory the server can tell before the guest
+    /// resolves it, so it keeps nothing: `a/../inner` does not keep `a/inner`.
+    #[test]
+    fn a_mount_point_with_a_parent_component_keeps_nothing() {
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/inner")).unwrap();
+        let fs = PassthroughFs::for_volume(dir.path(), false)
+            .with_mount_points(&[PathBuf::from("a/../inner")]);
+        let lookup = |parent: u64, name: &[u8]| match fs.lookup(parent, name, uid, gid, 0) {
+            VolumeResponse::Entry { attr, .. } => attr.ino,
+            other => panic!("lookup: {other:?}"),
+        };
+        let a = lookup(1, b"a");
+        let inner = lookup(a, b"inner");
+        std::fs::rename(dir.path().join("a/inner"), dir.path().join("a/inner.old")).unwrap();
+        std::fs::create_dir(dir.path().join("a/inner")).unwrap();
+        assert_ne!(
+            lookup(a, b"inner"),
+            inner,
+            "a/inner was kept for the mount point a/../inner"
+        );
+    }
+
+    /// A directory the guest mounts something over keeps the inode the guest first got, in a
+    /// lookup and in a listing, after the host renames it away and makes a new one, and after
+    /// the host removes it. The guest's kernel otherwise drops the dentry and every mount on it
+    /// (#1043). A directory nothing is mounted on follows the host, and once the guest forgets
+    /// the one it mounted over, the host's directory is the answer again.
+    ///
+    /// RED BEFORE THE FIX: the second lookup of "outer/inner" answered the new directory's inode.
+    #[test]
+    fn a_mount_point_keeps_its_inode_when_the_host_replaces_it() {
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("outer/inner")).unwrap();
+        std::fs::create_dir(root.join("plain")).unwrap();
+        let fs = PassthroughFs::for_volume(root, false)
+            .with_mount_points(&[PathBuf::from("outer/inner"), PathBuf::from("outer/made")]);
+        let lookup = |parent: u64, name: &[u8]| match fs.lookup(parent, name, uid, gid, 0) {
+            VolumeResponse::Entry { attr, .. } => attr.ino,
+            other => panic!("lookup {}: {other:?}", String::from_utf8_lossy(name)),
+        };
+        let listed = |parent: u64, name: &[u8]| {
+            let fh = match fs.opendir(parent, 0, uid, gid, 0) {
+                VolumeResponse::Openeddir { fh } => fh,
+                other => panic!("opendir: {other:?}"),
+            };
+            let ino = match fs.readdirplus(parent, fh, 0, uid, gid, 0) {
+                VolumeResponse::DirEntriesPlus { entries } => entries
+                    .iter()
+                    .find(|e| e.name == name)
+                    .map(|e| e.ino)
+                    .unwrap_or_else(|| panic!("{} is not listed", String::from_utf8_lossy(name))),
+                other => panic!("readdirplus: {other:?}"),
+            };
+            fs.releasedir(parent, fh);
+            ino
+        };
+
+        let outer = lookup(1, b"outer");
+        let inner = lookup(outer, b"inner");
+        let plain = lookup(1, b"plain");
+        let mut answers = 1u64;
+
+        // The host replaces both directories.
+        for name in ["outer/inner", "plain"] {
+            std::fs::rename(root.join(name), root.join(format!("{name}.old"))).unwrap();
+            std::fs::create_dir(root.join(name)).unwrap();
+        }
+        assert_eq!(
+            lookup(outer, b"inner"),
+            inner,
+            "a replaced mount point got a new inode"
+        );
+        answers += 1;
+        assert_eq!(
+            listed(outer, b"inner"),
+            inner,
+            "a listing named a new inode for a mount point"
+        );
+        // The listing answered the directory twice: as "inner", and as "inner.old", the name
+        // the host moved it to.
+        answers += 2;
+        assert_ne!(
+            lookup(1, b"plain"),
+            plain,
+            "a directory nothing is mounted on stopped following the host"
+        );
+
+        // The host removes it.
+        std::fs::remove_dir(root.join("outer/inner")).unwrap();
+        assert_eq!(
+            lookup(outer, b"inner"),
+            inner,
+            "a removed mount point is no longer found"
+        );
+        answers += 1;
+
+        // The guest forgets it: the host's directory, once made again, is the answer.
+        std::fs::create_dir(root.join("outer/inner")).unwrap();
+        // A FORGET of fewer lookups than the guest holds, as when a LOOKUP is served before
+        // it, leaves the directory held, and kept.
+        fs.forget(inner, answers - 1);
+        assert_eq!(
+            lookup(outer, b"inner"),
+            inner,
+            "a FORGET of fewer lookups than the guest holds dropped the kept directory"
+        );
+        // The guest forgets it: the lookup left and the one just made.
+        fs.forget(inner, 2);
+        // Looked up again under the name the host gave it, the forgotten directory is back in
+        // the server, and still not what `inner` answers.
+        assert_eq!(lookup(outer, b"inner.old"), inner);
+        assert_ne!(
+            lookup(outer, b"inner"),
+            inner,
+            "a mount point the guest forgot still answers with the directory it forgot"
+        );
+
+        // A mount point the guest makes itself, as fc-agent does for a missing one, is kept
+        // from its MKDIR, before any lookup of it.
+        let made = match fs.mkdir(outer, b"made", 0o755, uid, gid, 0) {
+            VolumeResponse::Entry { attr, .. } => attr.ino,
+            other => panic!("mkdir: {other:?}"),
+        };
+        std::fs::rename(root.join("outer/made"), root.join("outer/made.old")).unwrap();
+        std::fs::create_dir(root.join("outer/made")).unwrap();
+        assert_eq!(
+            lookup(outer, b"made"),
+            made,
+            "a mount point the guest made got the host's replacement in its first lookup"
+        );
+
+        // The guest renames the directory above its mount points: the old name is gone, as
+        // it is in the guest, not answered with the directory the guest moved, and the mount
+        // points moved with it are kept at their new path.
+        let renamed = fs.rename(1, b"outer", 1, b"moved", 0, uid, gid, 0);
+        assert!(renamed.errno().is_none(), "rename: {renamed:?}");
+        let gone = fs.lookup(1, b"outer", uid, gid, 0);
+        assert_eq!(
+            gone.errno(),
+            Some(libc::ENOENT),
+            "the name the guest renamed away still answers: {gone:?}"
+        );
+        assert_eq!(
+            lookup(1, b"moved"),
+            outer,
+            "the renamed directory has another inode"
+        );
+        std::fs::rename(root.join("moved/made"), root.join("moved/made.older")).unwrap();
+        std::fs::create_dir(root.join("moved/made")).unwrap();
+        assert_eq!(
+            lookup(outer, b"made"),
+            made,
+            "a mount point the guest moved is no longer kept at its new path"
+        );
+
+        // Moved again, into a directory nothing is mounted under: still kept.
+        let plain = lookup(1, b"plain");
+        let renamed = fs.rename(1, b"moved", plain, b"deeper", 0, uid, gid, 0);
+        assert!(renamed.errno().is_none(), "rename: {renamed:?}");
+        std::fs::rename(
+            root.join("plain/deeper/made"),
+            root.join("plain/deeper/made.oldest"),
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("plain/deeper/made")).unwrap();
+        assert_eq!(
+            lookup(plain, b"deeper"),
+            outer,
+            "the moved directory has another inode"
+        );
+        assert_eq!(
+            lookup(outer, b"made"),
+            made,
+            "a mount point moved into a directory with no mount points is no longer kept"
         );
     }
 

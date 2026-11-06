@@ -462,6 +462,21 @@ fn check_mount_order(mount_points: &[(String, String)]) -> Result<()> {
     Ok(())
 }
 
+/// The guest path of every mount fc-agent makes for `args`, the maps' own included.
+/// `attaches_image_disk` is what `checked_volume_mappings` takes.
+pub(crate) fn guest_mount_paths(
+    args: &RunArgs,
+    maps: &[VolumeMapping],
+    attaches_image_disk: bool,
+) -> Vec<PathBuf> {
+    let mounts_image_store = attaches_image_disk
+        && super::resolve_image_mode(args) == crate::firecracker::ImageMode::Overlay;
+    guest_mount_points(args, maps, mounts_image_store)
+        .into_iter()
+        .map(|(_, guest_path)| PathBuf::from(guest_path))
+        .collect()
+}
+
 /// Every guest path fc-agent creates and mounts something at for this run,
 /// each with what asked for it: the `--map`, `--disk`, `--disk-dir`, `--pmem`
 /// and `--nfs` arguments, and the image store when the run mounts one.

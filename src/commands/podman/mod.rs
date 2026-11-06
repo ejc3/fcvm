@@ -21,7 +21,10 @@ pub use types::{
 };
 // Re-exported for the snapshot restore path's up-front reboot plan (a rebooted VM
 // relaunches in place via the same shared primitive, on every lifecycle path).
-pub(crate) use types::{checked_volume_mappings, RebootSpec, VolumeMapping};
+pub(crate) use types::{
+    checked_volume_mappings, RebootSpec, VolumeMapping, IMAGE_STORE_MOUNT_POINT,
+    IMAGE_STORE_RAW_MOUNT_POINT,
+};
 
 // Re-exported for the #598 regression test (export must pin immutable content by image
 // ID even when the tag is rebuilt mid-export).
@@ -2267,6 +2270,7 @@ async fn prepare_vm_for_lifecycle(
     // Build VolumeConfigs and spawn VolumeServers BEFORE the VM starts
     // Each VolumeServer listens on vsock.sock_{port} (e.g., vsock.sock_5000)
     // Firecracker binds to vsock.sock and routes guest connections to the per-port sockets
+    let mount_paths = types::guest_mount_paths(&args, &volume_mappings, attaches_image_disk(&args));
     let volume_configs: Vec<VolumeConfig> = volume_mappings
         .iter()
         .enumerate()
@@ -2276,6 +2280,10 @@ async fn prepare_vm_for_lifecycle(
             read_only: vol.read_only,
             port: VSOCK_VOLUME_PORT_BASE + idx as u32,
             portable: args.portable_volumes,
+            mount_points: crate::volume::mount_points_inside(
+                std::path::Path::new(&vol.guest_path),
+                mount_paths.iter().map(std::path::PathBuf::as_path),
+            ),
         })
         .collect();
 

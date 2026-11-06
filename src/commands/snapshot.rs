@@ -2731,8 +2731,26 @@ async fn cmd_snapshot_run_inner(
         Some(snapshot_config.source_vsock_socket_path.clone());
 
     // Build VolumeConfigs from snapshot metadata and spawn VolumeServers
-    let volume_configs: Vec<VolumeConfig> = snapshot_config
-        .metadata
+    let metadata = &snapshot_config.metadata;
+    // Everything the guest has mounted, from what the snapshot recorded: its maps, disks,
+    // pmem devices, NFS shares and, for an image in overlay mode, the image store.
+    let image_store = (metadata.image_mode.as_deref() == Some("overlay")
+        && metadata.image_disk_path.is_some())
+    .then_some([
+        crate::commands::podman::IMAGE_STORE_MOUNT_POINT,
+        crate::commands::podman::IMAGE_STORE_RAW_MOUNT_POINT,
+    ]);
+    let mount_paths: Vec<std::path::PathBuf> = metadata
+        .volumes
+        .iter()
+        .map(|vol| vol.guest_path.as_str())
+        .chain(metadata.extra_disks.iter().map(|d| d.mount_path.as_str()))
+        .chain(metadata.pmem_devices.iter().map(|d| d.mount_path.as_str()))
+        .chain(metadata.nfs_shares.iter().map(|s| s.mount_path.as_str()))
+        .chain(image_store.into_iter().flatten())
+        .map(std::path::PathBuf::from)
+        .collect();
+    let volume_configs: Vec<VolumeConfig> = metadata
         .volumes
         .iter()
         .map(|vol| VolumeConfig {
@@ -2741,6 +2759,10 @@ async fn cmd_snapshot_run_inner(
             read_only: vol.read_only,
             port: vol.vsock_port,
             portable: vol.portable,
+            mount_points: crate::volume::mount_points_inside(
+                std::path::Path::new(&vol.guest_path),
+                mount_paths.iter().map(std::path::PathBuf::as_path),
+            ),
         })
         .collect();
 

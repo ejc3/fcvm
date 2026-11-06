@@ -8986,6 +8986,7 @@ mod tests {
             read_only: true,
             port: 5000,
             portable: false,
+            mount_points: Vec::new(),
         }];
         let result = volume_configs_to_snapshot(&configs);
         assert_eq!(result.len(), 1);

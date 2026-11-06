@@ -730,6 +730,33 @@ async fn test_map_inside_read_only_map_is_mounted_over_it() -> Result<()> {
             ));
         }
 
+        // The host replaces the directory the inner map is mounted on. The guest looks the
+        // name up again once its 1 s entry timeout passes, and must keep the inner mount
+        // (#1043).
+        std::fs::rename(outer_host.join("inner"), outer_host.join("inner.old"))?;
+        std::fs::create_dir(outer_host.join("inner"))?;
+        std::fs::write(outer_host.join("inner/in-the-new-directory.txt"), "new")?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let mountinfo = common::exec_in_vm(pid, &["cat /proc/self/mountinfo"]).await?;
+        if mount_options_of(&mountinfo, INNER).is_err() {
+            wrong.push(format!(
+                "the inner map left the guest's mount table after the host replaced {}",
+                outer_host.join("inner").display()
+            ));
+        }
+        for in_container in [false, true] {
+            // `ls` of the outer map first: a listing names the replaced directory too.
+            let listing = attempt(pid, in_container, &format!("ls {OUTER} >/dev/null; ls {INNER}"))
+                .await?;
+            if listing != "from-guest.txt\ninner.txt\nstatus=0" {
+                wrong.push(format!(
+                    "{INNER} in the {} does not list the inner map's files after the host \
+                     replaced the directory it is mounted on: {listing:?}",
+                    if in_container { "container" } else { "guest OS" }
+                ));
+            }
+        }
+
         anyhow::ensure!(
             wrong.is_empty(),
             "a map inside a read-only map is not mounted over it:\n{}",
