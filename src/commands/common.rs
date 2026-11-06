@@ -4844,6 +4844,24 @@ pub fn extra_disks_to_snapshot(vm_state: &VmState) -> Vec<crate::storage::Snapsh
 ///
 /// A snapshot holds it from its read of the VM's balloon to its save, and
 /// `fcvm balloon` takes it to set a target, so the target cannot change in between.
+/// Await a lock wait unless `cancel` fires first, which fails with an error naming `what`.
+///
+/// A dropped lock wait holds nothing: each lock is an open `File` the future owns, so
+/// dropping it gives back whatever it had taken.
+pub async fn unless_cancelled<T>(
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    what: &str,
+    wait: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let Some(cancel) = cancel else {
+        return wait.await;
+    };
+    tokio::select! {
+        result = wait => result,
+        _ = cancel.cancelled() => anyhow::bail!("cancelled while waiting for {what}"),
+    }
+}
+
 pub async fn acquire_vm_snapshot_lock(disk_path: &Path) -> Result<std::fs::File> {
     lock_vm_snapshots(disk_path, None)
         .await?
