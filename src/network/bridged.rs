@@ -257,6 +257,9 @@ pub struct BridgedNetwork {
     veth_inner_ip: Option<String>,
     /// The relay for a host proxy on loopback, which the guest cannot reach itself.
     proxy_relay: Option<super::tcp_proxy::Relay>,
+    /// A restore: the TAP drops datagrams to the published UDP guest ports until the
+    /// guest acknowledges ([`super::udp_gate`]).
+    restore_udp_gate: bool,
 }
 
 impl BridgedNetwork {
@@ -283,7 +286,24 @@ impl BridgedNetwork {
             is_clone: false,
             veth_inner_ip: None,
             proxy_relay: None,
+            restore_udp_gate: false,
         }
+    }
+
+    /// This network is a restored clone's: close the host's gate on its published UDP
+    /// ports before the TAP joins the namespace's network, and keep it closed until
+    /// [`NetworkManager::open_restore_udp_gate`].
+    pub fn with_restore_udp_gate(mut self) -> Self {
+        self.restore_udp_gate = true;
+        self
+    }
+
+    /// The guest UDP ports this network gates, empty when it gates none.
+    fn gated_udp_ports(&self) -> Vec<u16> {
+        if !self.restore_udp_gate {
+            return Vec::new();
+        }
+        super::udp_gate::published_udp_guest_ports(&self.port_mappings)
     }
 
     /// Set the resolver setup() reports as the guest's DNS server. setup()
@@ -579,6 +599,19 @@ impl NetworkManager for BridgedNetwork {
         if let Err(e) = veth::create_tap_in_ns(&namespace_id, &self.tap_device).await {
             let _ = self.cleanup().await;
             return Err(e).context("creating TAP device in namespace");
+        }
+
+        // Step 4b: a restore drops datagrams to its published UDP ports until the guest
+        // acknowledges, from before the TAP is connected to anything.
+        let gated = self.gated_udp_ports();
+        if !gated.is_empty() {
+            let script = super::udp_gate::close_script(&self.tap_device, &gated);
+            if let Err(e) =
+                namespace::exec_in_namespace_checked(&namespace_id, &["sh", "-c", &script]).await
+            {
+                let _ = self.cleanup().await;
+                return Err(e).context("closing the restored clone's UDP gate");
+            }
         }
 
         // Step 5: Connect TAP to network - different for clones vs baseline
@@ -886,6 +919,23 @@ impl NetworkManager for BridgedNetwork {
                 errors.join("; ")
             )
         }
+    }
+
+    async fn open_restore_udp_gate(&mut self) -> Result<()> {
+        if self.gated_udp_ports().is_empty() {
+            return Ok(());
+        }
+        let namespace_id = self
+            .namespace_id
+            .as_deref()
+            .context("opening the clone's UDP gate: the network was never set up")?;
+        let mut command = vec!["tc"];
+        command.extend(super::udp_gate::open_args(&self.tap_device));
+        namespace::exec_in_namespace_checked(namespace_id, &command)
+            .await
+            .context("opening the clone's UDP gate")?;
+        info!(tap = %self.tap_device, "opened the published UDP ports after the restore ACK");
+        Ok(())
     }
 
     fn tap_device(&self) -> &str {

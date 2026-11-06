@@ -1074,7 +1074,22 @@ impl PastaNetwork {
                     format!("link show {}", self.tap_device),
                 ),
             ],
-            &[],
+            &[&self.restore_udp_gate_script()],
+        )
+    }
+
+    /// In restore mode, the `tc` lines that drop datagrams to the published UDP guest
+    /// ports on the clone's TAP until the restore is acknowledged
+    /// ([`super::udp_gate`]). They run in the setup script, before pasta starts and
+    /// before the TAP joins the bridge, so no forwarded datagram can reach the TAP
+    /// ahead of them. Empty outside restore mode or without a UDP mapping.
+    fn restore_udp_gate_script(&self) -> String {
+        if !self.restore_mode {
+            return String::new();
+        }
+        super::udp_gate::close_script(
+            &self.tap_device,
+            &super::udp_gate::published_udp_guest_ports(&self.port_mappings),
         )
     }
 
@@ -2242,6 +2257,32 @@ impl NetworkManager for PastaNetwork {
 
     fn tap_device(&self) -> &str {
         &self.tap_device
+    }
+
+    async fn open_restore_udp_gate(&mut self) -> Result<()> {
+        if self.restore_udp_gate_script().is_empty() {
+            return Ok(());
+        }
+        let holder_pid = self
+            .holder_pid
+            .context("opening the clone's UDP gate: the namespace holder was never started")?;
+        let prefix = self.build_nsenter_prefix(holder_pid);
+        let output = Command::new(&prefix[0])
+            .args(&prefix[1..])
+            .arg("tc")
+            .args(super::udp_gate::open_args(&self.tap_device))
+            .output()
+            .await
+            .context("running tc to open the clone's UDP gate")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "opening the clone's UDP gate on {} failed: {}",
+                self.tap_device,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        info!(tap = %self.tap_device, "opened the published UDP ports after the restore ACK");
+        Ok(())
     }
 
     /// Verify the guest is reachable after snapshot restore, then that its

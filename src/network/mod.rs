@@ -7,6 +7,7 @@ pub mod portmap;
 pub mod routed;
 pub mod tcp_proxy;
 pub mod types;
+pub mod udp_gate;
 pub mod veth;
 
 pub use bridged::BridgedNetwork;
@@ -101,6 +102,15 @@ pub trait NetworkManager: Send + Sync {
     /// the listening socket exists. Default implementation does nothing (bridged DNAT
     /// is kernel-level and works immediately).
     async fn verify_port_forwarding(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Open the host's gate on a restored clone's published UDP ports ([`udp_gate`]).
+    ///
+    /// Called once the guest has acknowledged its restore, which it does after it has
+    /// published. A clone whose network closed no gate (no UDP mapping, not a restore,
+    /// or routed networking, which refuses UDP mappings) has nothing to open.
+    async fn open_restore_udp_gate(&mut self) -> Result<()> {
         Ok(())
     }
 
