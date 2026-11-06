@@ -338,6 +338,49 @@ impl PeerVmm {
         rc == 0
     }
 
+    /// Write `reason` into the runtime directory of the clone this VMM belongs to, before the
+    /// fail-closed kill, so that clone reports the kill as its memory server's even when its
+    /// own power-off watchdog signalled the VMM too (#1007; see `uffd::failure`). Bounded and
+    /// best effort: the kill that follows is the fail-closed contract, this only names it.
+    async fn record_failure(&self, reason: &str) {
+        let recorded = tokio::time::timeout(Duration::from_secs(2), async {
+            let parent = super::failure::parent_pid(self.pid)
+                .with_context(|| format!("reading the parent of VMM PID {}", self.pid))?;
+            let parent_start = crate::utils::process_start_time(parent)
+                .with_context(|| format!("reading the start time of fcvm PID {parent}"))?;
+            // Both reads named the VMM's PID and its parent's; the pidfd still pinning a live
+            // VMM means neither PID was reused under them.
+            anyhow::ensure!(self.is_alive(), "the VMM exited before its clone was found");
+            let states = crate::state::StateManager::new(crate::paths::state_dir())
+                .list_vms()
+                .await
+                .context("listing VM states")?;
+            let vm_id = super::failure::clone_of_parent(&states, parent, parent_start)
+                .with_context(|| format!("no VM state names fcvm PID {parent} as its process"))?;
+            super::failure::write_failure(&crate::paths::vm_runtime_dir(&vm_id), reason)
+        })
+        .await;
+        match recorded {
+            Ok(Ok(path)) => info!(
+                target: "uffd",
+                peer_pid = self.pid,
+                path = %path.display(),
+                "recorded the fail-closed kill for the clone"
+            ),
+            Ok(Err(error)) => warn!(
+                target: "uffd",
+                peer_pid = self.pid,
+                error = %format!("{error:#}"),
+                "could not record the fail-closed kill for the clone; killing its VMM anyway"
+            ),
+            Err(_) => warn!(
+                target: "uffd",
+                peer_pid = self.pid,
+                "recording the fail-closed kill for the clone took over 2 s; killing its VMM anyway"
+            ),
+        }
+    }
+
     /// SIGKILL the VMM. Returns whether the signal was delivered.
     ///
     /// SIGKILL, not SIGTERM: a VMM whose memory this server can no longer serve must not get
@@ -1497,7 +1540,11 @@ async fn serve_clone_fail_closed(
                 error = ?e,
                 "clone's UFFD service FAILED — killing its VMM"
             );
-            peer.kill_now(&format!("{e:#}"));
+            let reason = format!("{e:#}");
+            if peer.is_alive() {
+                peer.record_failure(&reason).await;
+            }
+            peer.kill_now(&reason);
         }
     }
 }
@@ -4990,6 +5037,28 @@ pub fn preflight_clone_hugepages(memory_mib: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// #1007: the fail-closed path records the failure for the clone before it signals the
+    /// VMM, so a clone that reaps a VMM this server killed always finds the record.
+    #[test]
+    fn the_fail_closed_kill_is_recorded_before_it_is_sent() {
+        let source = include_str!("server.rs");
+        let code = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let start = code
+            .find("async fn serve_clone_fail_closed(")
+            .expect("no serve_clone_fail_closed");
+        let body = &code[start..start + code[start..].find("\n}\n").unwrap()];
+        let recorded = body
+            .find("peer.record_failure(&reason).await")
+            .expect("the fail-closed path does not record its failure");
+        let killed = body
+            .find("peer.kill_now(&reason)")
+            .expect("the fail-closed path does not kill the VMM");
+        assert!(
+            recorded < killed,
+            "the VMM is killed before the failure is recorded"
+        );
+    }
+
     use super::*;
     use nix::fcntl::{Flock, FlockArg};
 
