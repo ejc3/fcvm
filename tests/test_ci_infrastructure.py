@@ -28,7 +28,9 @@ MOCK_PS_SCRIPT = (
     "esac\n"
     "if [ \"${MOCK_PS_HANG:-0}\" = 1 ]; then exec sleep 30; fi\n"
     "call_count=$(wc -l <\"$MOCK_PS_CALLS\")\n"
-    "if [ \"$call_count\" -gt 1 ]; then\n"
+    "if [ \"$call_count\" -gt 2 ] && [ -n \"${MOCK_PS_OUTPUT_LATER+set}\" ]; then\n"
+    "  printf '%s' \"$MOCK_PS_OUTPUT_LATER\"\n"
+    "elif [ \"$call_count\" -gt 1 ]; then\n"
     "  printf '%s' \"$MOCK_PS_OUTPUT_AFTER\"\n"
     "else\n"
     "  printf '%s' \"${MOCK_PS_OUTPUT:-}\"\n"
@@ -334,6 +336,8 @@ class StrayVmGuardTests(unittest.TestCase):
         ps_output: str,
         *,
         ps_output_after: str | None = None,
+        ps_output_later: str | None = None,
+        exit_grace: str = "0",
         hang_ps: bool = False,
         dry_run: bool = True,
         outer_timeout: float = 5,
@@ -373,6 +377,7 @@ class StrayVmGuardTests(unittest.TestCase):
                 # keeps instant mock responses safely inside the window; only
                 # hang tests pass 1 (they assert the timeout itself).
                 "FCVM_GUARD_SCAN_TIMEOUT_SECONDS": scan_timeout,
+                "FCVM_GUARD_EXIT_GRACE_SECONDS": exit_grace,
                 "FCVM_PROC_ROOT": str(proc_root),
                 "FCVM_MM_SAMPLE_INTERVAL_SECONDS": "0",
                 "MOCK_PS_CALLS": str(ps_calls),
@@ -386,6 +391,8 @@ class StrayVmGuardTests(unittest.TestCase):
                 "MOCK_SUDO_CALLS": str(sudo_calls),
             }
         )
+        if ps_output_later is not None:
+            env["MOCK_PS_OUTPUT_LATER"] = ps_output_later
         command = [str(STRAY_GUARD), "post"]
         if dry_run:
             command.append("--dry-run")
@@ -582,12 +589,58 @@ class StrayVmGuardTests(unittest.TestCase):
             [["kill", "-9", "--", "100"], ["kill", "-9", "--", "200"]],
         )
         self.assertIn(
-            "killed 2 process group(s), still live after SIGKILL: 1", result.stdout
+            "killed 2 process group(s), still live after SIGKILL and 0s: 1", result.stdout
         )
         self.assertIn("Unkillable microVMs", result.stdout)
         after_report = log_dir / "stray-vm-threads-post-after.tsv"
         self.assertTrue(after_report.is_file())
         self.assertIn("100\t101\t1\tD\tfc_vcpu 0", after_report.read_text())
+
+    def test_a_group_started_after_the_kill_is_not_a_survivor(self) -> None:
+        """#871: on 2026-11-05 two jobs reported "Unkillable microVMs" for fcvm
+        processes in S state with no signal pending, which had started after the
+        guard's scan. Whatever started them was still running; they are reported
+        with their parent and killed, and the groups the guard killed are gone."""
+        before = "100 100 1 S firecracker\n100 101 1 S fc_vcpu 0\n"
+        after = (
+            "250 250 1 S cargo-nextest\n"
+            "300 300 250 S fcvm\n"
+            "300 301 250 S tokio-rt-worker\n"
+        )
+        result, _log_dir, _ps_calls, sudo_calls, _elapsed = self.run_guard(
+            before, ps_output_after=after, dry_run=False, outer_timeout=20
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Unkillable microVMs", result.stdout)
+        self.assertIn("still live after SIGKILL and 0s: 0", result.stdout)
+        self.assertIn("started after the kill", result.stdout)
+        self.assertIn("tgid 300: parent 250 (cargo-nextest)", result.stdout)
+        commands = [shlex.split(line) for line in sudo_calls.splitlines()]
+        self.assertCountEqual(
+            commands, [["kill", "-9", "--", "100"], ["kill", "-9", "--", "300"]]
+        )
+
+    def test_a_group_that_finishes_exiting_within_the_grace_is_not_unkillable(self) -> None:
+        """A killed firecracker's last thread unmaps the guest's memory before the
+        group is gone, which takes seconds for a large guest: on 2026-11-05 the
+        guard scanned 2 s after the kill, saw zombie leaders with threads still
+        exiting, and reported them unkillable."""
+        before = "100 100 1 S firecracker\n100 101 1 S fc_vcpu 0\n"
+        exiting = "100 100 1 Z firecracker\n100 101 1 D fc_vcpu 0\n"
+        gone = "100 100 1 Z firecracker\n"
+        result, _log_dir, _ps_calls, _sudo_calls, _elapsed = self.run_guard(
+            before,
+            ps_output_after=exiting,
+            ps_output_later=gone,
+            exit_grace="10",
+            dry_run=False,
+            outer_timeout=20,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Unkillable microVMs", result.stdout)
+        self.assertIn("still live after SIGKILL and 10s: 0", result.stdout)
 
     def test_evidence_is_captured_per_tid_before_the_kill_and_for_survivors(self) -> None:
         """The August 2026 wedge was diagnosed by hand from /proc stacks that were

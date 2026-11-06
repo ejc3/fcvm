@@ -68,12 +68,14 @@ print_thread_table() {
 	done <"$table"
 }
 
+# scan_vm_groups <selected> <live> <zombies> [all]: [all] keeps every thread's row,
+# for naming the parent of a group.
 scan_vm_groups() {
 	local selected=$1
 	local live=$2
 	local zombies=$3
-	local all
-	all=$(new_temporary_file) || return 1
+	local all=${4:-}
+	[ -n "$all" ] || all=$(new_temporary_file) || return 1
 	: >"$live"
 	: >"$zombies"
 	if ! vm_scan_all_threads "$all" "$SCAN_TIMEOUT_SECONDS" "$TEMPORARY_PREFIX"; then
@@ -132,20 +134,61 @@ for tgid in "${STRAY_TGIDS[@]}"; do
 	# `kill` needs only the numeric TGID and never reads the target mm/cmdline.
 	timeout --signal=KILL 2 sudo kill -9 -- "$tgid" 2>/dev/null || true
 done
-sleep 2
 
+# A killed group can take seconds to finish exiting (a large guest's memory is
+# unmapped by its last thread), and nothing it does then is a wedge. Re-scan until
+# every group killed above is gone or the grace window ends. A group that appears
+# only after the kill was started by something still running: it is reported and
+# killed on its own, and never counted as a survivor of the kill (#871: both
+# "unkillable" reports of 2026-11-05 were zombies, exiting threads and such
+# latecomers, none of them in D state).
+EXIT_GRACE_SECONDS="${FCVM_GUARD_EXIT_GRACE_SECONDS:-20}"
+grace_deadline=$((SECONDS + EXIT_GRACE_SECONDS))
 LIVE_AFTER=$(new_temporary_file)
 ZOMBIE_AFTER=$(new_temporary_file)
-if ! scan_vm_groups "$THREADS_AFTER" "$LIVE_AFTER" "$ZOMBIE_AFTER"; then
-	echo "post-kill process/thread scan timed out; survivor count is unknown"
-	echo "::warning title=Unkillable microVM scan incomplete (${PHASE})::Post-kill enumeration did not complete; runner replacement is required."
-	[ -n "${GITHUB_STEP_SUMMARY:-}" ] &&
-		echo "- stray microVM guard (${PHASE}): found ${COUNT}, survivor scan incomplete" >>"$GITHUB_STEP_SUMMARY"
-	exit 0
+THREADS_AFTER_ALL=$(new_temporary_file)
+declare -A KILLED=()
+for tgid in "${STRAY_TGIDS[@]}"; do KILLED[$tgid]=1; done
+while :; do
+	sleep 1
+	if ! scan_vm_groups "$THREADS_AFTER" "$LIVE_AFTER" "$ZOMBIE_AFTER" "$THREADS_AFTER_ALL"; then
+		echo "post-kill process/thread scan timed out; survivor count is unknown"
+		echo "::warning title=Unkillable microVM scan incomplete (${PHASE})::Post-kill enumeration did not complete; runner replacement is required."
+		[ -n "${GITHUB_STEP_SUMMARY:-}" ] &&
+			echo "- stray microVM guard (${PHASE}): found ${COUNT}, survivor scan incomplete" >>"$GITHUB_STEP_SUMMARY"
+		exit 0
+	fi
+	SURVIVOR_TGIDS=()
+	LATE_TGIDS=()
+	while IFS= read -r tgid; do
+		[ -n "$tgid" ] || continue
+		if [ -n "${KILLED[$tgid]:-}" ]; then
+			SURVIVOR_TGIDS+=("$tgid")
+		else
+			LATE_TGIDS+=("$tgid")
+		fi
+	done <"$LIVE_AFTER"
+	[ "${#SURVIVOR_TGIDS[@]}" -eq 0 ] && break
+	[ "$SECONDS" -ge "$grace_deadline" ] && break
+done
+
+if [ "${#LATE_TGIDS[@]}" -gt 0 ]; then
+	echo "${#LATE_TGIDS[@]} process group(s) started after the kill (not in the pre-kill scan); their parents:"
+	while IFS=$'\t' read -r tgid tid ppid _state _thread; do
+		[ "$tgid" = "$tid" ] || continue
+		for late in "${LATE_TGIDS[@]}"; do
+			[ "$late" = "$tgid" ] || continue
+			parent=$(awk -F '\t' -v p="$ppid" '$1 == p && $2 == p { print $5; exit }' "$THREADS_AFTER_ALL" 2>/dev/null)
+			echo "  tgid ${tgid}: parent ${ppid} (${parent:-not in the scan})"
+		done
+	done <"$THREADS_AFTER"
+	echo "::warning title=Stray microVMs started during cleanup (${PHASE})::${#LATE_TGIDS[@]} process group(s) were started after the guard's kill, so something that launches VMs is still running; killing them once."
+	for tgid in "${LATE_TGIDS[@]}"; do
+		timeout --signal=KILL 2 sudo kill -9 -- "$tgid" 2>/dev/null || true
+	done
 fi
 
-mapfile -t SURVIVOR_TGIDS <"$LIVE_AFTER"
-echo "killed ${COUNT} process group(s), still live after SIGKILL: ${#SURVIVOR_TGIDS[@]}"
+echo "killed ${COUNT} process group(s), still live after SIGKILL and ${EXIT_GRACE_SECONDS}s: ${#SURVIVOR_TGIDS[@]}"
 if [ "${#SURVIVOR_TGIDS[@]}" -gt 0 ]; then
 	print_thread_table "$THREADS_AFTER"
 	# A survivor is a task the kernel could not reap: its status now shows the
