@@ -614,9 +614,13 @@ Routing is by prefix and it is load-bearing (`console_line_is_important` in `src
 classifies console lines for both backends, and checks this prefix before anything else, because
 a pile-up line can name a thread called `fc-agent`): `[fcvm-vitals]` is DEBUG, so the 10s sampler lands in the per-VM file and NOT the job log, which
 is what lets it run for every VM without flooding a runner. `[fc-agent] VITALS` is INFO, so the
-on-failure block also reaches the test's captured output. A guest kernel crash headline (panic,
+on-failure block also reaches the test's captured output. fc-agent's lines go under `fcvm::console`
+(INFO, and WARN for its `ERROR`, `FATAL ERROR` and `Error:` lines, which fcvm's default `warn`
+filter then shows), so RUST_LOG=fcvm=info keeps them; every other console line stays at DEBUG under
+the console's own `firecracker` or `cloud-hypervisor` target, outside `fcvm`, so RUST_LOG=fcvm=debug
+does not pull kernel messages and vitals samples into a job log (#1104). A guest kernel crash headline (panic,
 Oops, BUG, a WARN, a stalled CPU, task or RCU, an OOM kill) is WARN under `fcvm::guest`, apart
-from the console's own `firecracker` and `cloud-hypervisor` targets, so it survives fcvm's default
+from the console's own targets, so it survives fcvm's default
 filter and RUST_LOG=fcvm=info: a guest that panics leaves
 nothing else that says why (on x86 Firecracker logs only `Unexpected exit reason on vcpu run:
 Shutdown`; on arm64 the guest resets through PSCI).
@@ -624,8 +628,8 @@ Shutdown`; on arm64 the guest resets through PSCI).
 Rules learned the hard way, each from a check that could not fire:
 
 - **Never conclude "no OOM" from a job log.** A job log keeps no guest console line but a crash
-  headline: the console's `firecracker` target is outside `fcvm`, so a filter on fcvm's targets
-  drops even fc-agent's INFO lines. Lines below the guest's console level (4, between early boot
+  headline and fc-agent's own lines: the console's `firecracker` target, where kernel messages
+  and vitals samples go, is outside `fcvm`, so a filter on fcvm's targets drops them. Lines below the guest's console level (4, between early boot
   and the poweroff) never reach the console, console output can be lost or run into another line,
   and host `dmesg` only reaches an artifact. Measured: `grep -c "DEBUG firecracker"` on a
   259,570-line job log returns 0. Render resource verdicts against `/tmp/fcvm-test-logs/*`, and

@@ -378,12 +378,7 @@ impl Hypervisor for CloudHypervisorBackend {
                 }
                 debug!(target: "cloud-hypervisor", "{}", clean);
             } else {
-                let important = crate::utils::console_line_is_important(clean);
-                if important {
-                    info!(target: "cloud-hypervisor", "{}", clean);
-                } else {
-                    debug!(target: "cloud-hypervisor", "{}", clean);
-                }
+                log_console_line(clean);
             }
         })
         .context("spawning Cloud Hypervisor process")?;
@@ -668,15 +663,10 @@ pub const fn default_guest_cid() -> u32 {
     GUEST_CID
 }
 
-/// Log one line of the guest console: a kernel crash headline at WARN under `fcvm::guest`
-/// (`log_kernel_crash_headline`), fc-agent's lines and container output at INFO, the rest at DEBUG.
+/// Log one line of the guest console: a line fcvm keeps above DEBUG under fcvm's own targets
+/// (`log_console_line_under_fcvm`), the rest at DEBUG under `cloud-hypervisor`.
 fn log_console_line(clean: &str) {
-    if crate::utils::log_kernel_crash_headline(clean) {
-        return;
-    }
-    if crate::utils::console_line_is_important(clean) {
-        info!(target: "cloud-hypervisor", "{}", clean);
-    } else {
+    if !crate::utils::log_console_line_under_fcvm(clean) {
         debug!(target: "cloud-hypervisor", "{}", clean);
     }
 }
@@ -736,6 +726,21 @@ async fn tail_console_to_tracing(path: PathBuf, console_lines: Arc<std::sync::at
 
 #[cfg(test)]
 mod tests {
+    /// fc-agent's console lines reach a log filtered to fcvm's own targets (#1104); the other
+    /// console lines stay under `cloud-hypervisor`.
+    #[test]
+    fn cloud_hypervisor_logs_agent_console_lines_under_fcvm() {
+        use crate::utils::log_capture::logged;
+        let all = || {
+            super::log_console_line("[fc-agent] run_agent starting");
+            super::log_console_line("[    1.234567] virtio_net virtio1 eth0: link up");
+        };
+        let info = logged("fcvm=info", all);
+        assert_eq!(info.matches("run_agent starting").count(), 1, "{info:?}");
+        assert!(!info.contains("virtio_net"), "{info:?}");
+        assert!(logged("cloud-hypervisor=debug", all).contains("virtio_net"));
+    }
+
     /// A guest kernel's panic line in the Cloud Hypervisor console file reaches fcvm's default
     /// log once, at WARN under fcvm::guest, and not also under the console's own target.
     #[test]
