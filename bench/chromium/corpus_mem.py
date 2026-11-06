@@ -658,6 +658,81 @@ def clone_gone(state_dir, name):
     return True
 
 
+LISTENER_OWNER = re.compile(r'"([^"]+)",pid=(\d+),fd=\d+')
+
+
+def clone_forensics(args, clone, reason):
+    """What answered on a clone's published DevTools port, written before the
+    clone is torn down, so a port that resets every connect can be attributed.
+
+    #1135: in a 96-clone cell one clone's published port reset every connect
+    for 30 s while fcvm's own readiness probe reached the guest's port from
+    inside its namespace, and nothing recorded whether the host listener was
+    this clone's pasta or an earlier clone's. This records the host listeners
+    on the port with their owners (`ss -ltnp`), the clone's own pasta pid
+    (vm-disks/<vm_id>/pasta.pid) and whether it owns the endpoint's listener,
+    and, from inside the guest (`fcvm exec --vm`), whether DevTools answers on
+    127.0.0.1 there and which ports the guest listens on. Returns the path of
+    the record; a collector that could not run says so in it."""
+    host, _, port = clone.get("endpoint", ":").rpartition(":")
+    record = {"clone": clone.get("name"), "reason": reason, "endpoint": clone.get("endpoint"),
+              "vm_id": clone.get("vm_id"), "fcvm_pid": clone.get("fcvm_pid"),
+              "time_unix": time.time()}
+    try:
+        with open("/proc/loadavg") as f:
+            record["loadavg"] = f.read().strip()
+    except OSError as exc:
+        record["loadavg"] = f"unreadable: {exc}"
+    try:
+        listening = sh(["ss", "-Htlnp", f"sport = :{port}"], timeout=10)
+        record["host_listeners"] = {"rc": listening.returncode, "stdout": listening.stdout[-8000:],
+                                    "stderr": listening.stderr[-2000:]}
+        owners = []
+        for line in listening.stdout.splitlines():
+            fields = line.split()
+            if len(fields) >= 4 and fields[3] == f"{host}:{port}":
+                owners += [{"comm": m.group(1), "pid": int(m.group(2))}
+                           for m in LISTENER_OWNER.finditer(line)]
+        record["endpoint_listener_owners"] = owners
+    except (OSError, subprocess.SubprocessError) as exc:
+        record["host_listeners"] = {"error": f"{type(exc).__name__}: {exc}"}
+        owners = None
+    pasta_pid = None
+    if clone.get("vm_id"):
+        path = os.path.join(args.data_root, "vm-disks", clone["vm_id"], "pasta.pid")
+        try:
+            with open(path) as f:
+                pasta_pid = int(f.read().strip())
+        except (OSError, ValueError) as exc:
+            record["clone_pasta_pid_error"] = f"{path}: {exc}"
+    record["clone_pasta_pid"] = pasta_pid
+    record["endpoint_listener_is_this_clones_pasta"] = (
+        None if owners is None or pasta_pid is None
+        else any(o["pid"] == pasta_pid for o in owners))
+    if clone.get("fcvm_pid"):
+        probe = (f"/usr/bin/curl -s -m 5 -o /dev/null -w 'http=%{{http_code}}\\n' "
+                 f"http://127.0.0.1:{port}/json/version; echo curl_rc=$?; /usr/bin/ss -Htln")
+        try:
+            inside = sh([args.fcvm, "exec", "--pid", str(clone["fcvm_pid"]), "--vm", "--",
+                         "/bin/sh", "-c", probe], timeout=30)
+            record["guest"] = {"rc": inside.returncode, "stdout": inside.stdout[-8000:],
+                               "stderr": inside.stderr[-2000:]}
+        except (OSError, subprocess.SubprocessError) as exc:
+            record["guest"] = {"error": f"{type(exc).__name__}: {exc}"}
+    else:
+        record["guest"] = {"error": "the clone's fcvm pid is not known"}
+    out = os.path.join(args.results, "logs", f"{clone.get('name')}.forensics.json")
+    try:
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "w") as f:
+            json.dump(record, f, indent=1, sort_keys=True)
+            f.write("\n")
+    except OSError as exc:
+        log(f"cannot write {out}: {exc}")
+        return None
+    return out
+
+
 def render(endpoint, url, timeout=120, op="screenshot"):
     r = sh([sys.executable, CDPDRIVE, endpoint, url, "--format", "jpeg", "--op", op],
            timeout=timeout)
@@ -733,17 +808,21 @@ class FcvmSide:
                 die(f"clone {c['name']} never published a usable state file; see {c['log']}")
             st, ip = found
             c["vm_id"] = st.get("vm_id")
+            c["fcvm_pid"] = st.get("pid")
             c["endpoint"] = f"{ip}:{self.args.cdp_port}"
             deadline = time.monotonic() + 180
             while not port_open(ip, self.args.cdp_port):
                 if time.monotonic() >= deadline:
-                    die(f"clone {c['name']} never answered on {c['endpoint']}; see {c['log']}")
+                    record = clone_forensics(self.args, c, "never answered")
+                    die(f"clone {c['name']} never answered on {c['endpoint']}; see {c['log']} "
+                        f"and {record}")
                 time.sleep(0.05)
         for c in live:
             url = self.args.urls[url_indices[c["i"]]]
             ok, out = render(c["endpoint"], url, op=self.args.op)
             if not ok:
-                die(f"clone {c['name']} failed to render {url}: {out}")
+                record = clone_forensics(self.args, c, f"failed to render {url}")
+                die(f"clone {c['name']} failed to render {url}: {out}; forensics {record}")
             c["url"] = url
         return live
 
