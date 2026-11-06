@@ -27,27 +27,57 @@ fn sudo_fcvm_setup_recipes_forward_the_config_dir() {
          use $(SUDO_FCVM) instead:\n{}",
         bare.join("\n")
     );
-    // `$(SUDO_FCVM) env VAR=value ./target/release/fcvm setup` forwards the config dir too:
-    // SUDO_FCVM's own env sets it, and a further env only adds variables.
     let forwarded = makefile
         .lines()
-        .filter(|line| {
-            line.split("$(SUDO_FCVM) ").skip(1).any(|rest| {
-                let mut words = rest.split_whitespace().peekable();
-                if words.peek() == Some(&"env") {
-                    words.next();
-                    while words.peek().is_some_and(|w| w.contains('=')) {
-                        words.next();
-                    }
-                }
-                words.next() == Some("./target/release/fcvm") && words.next() == Some("setup")
-            })
-        })
+        .filter(|line| forwards_config_dir(line))
         .count();
     assert!(
         forwarded >= 8,
         "expected every sudo fcvm setup recipe to use $(SUDO_FCVM), found {forwarded}"
     );
+}
+
+/// True when `line` runs `fcvm setup` through `$(SUDO_FCVM)` with the forwarded
+/// FCVM_CONFIG_DIR intact. `$(SUDO_FCVM) env VAR=value ./target/release/fcvm setup`
+/// forwards it too: SUDO_FCVM's own env sets it, and a further env only adds
+/// variables, unless one of them is FCVM_CONFIG_DIR, which replaces the value
+/// SUDO_FCVM forwarded.
+fn forwards_config_dir(line: &str) -> bool {
+    line.split("$(SUDO_FCVM) ").skip(1).any(|rest| {
+        let mut words = rest.split_whitespace().peekable();
+        if words.peek() == Some(&"env") {
+            words.next();
+            while let Some(word) = words.peek() {
+                let Some((name, _)) = word.split_once('=') else {
+                    break;
+                };
+                if name == "FCVM_CONFIG_DIR" {
+                    return false;
+                }
+                words.next();
+            }
+        }
+        words.next() == Some("./target/release/fcvm") && words.next() == Some("setup")
+    })
+}
+
+#[test]
+fn an_env_prefix_that_overrides_the_config_dir_does_not_count_as_forwarding() {
+    let setup = "./target/release/fcvm setup --kernel-profile nested";
+    assert!(forwards_config_dir(&format!("\t$(SUDO_FCVM) {setup}")));
+    assert!(forwards_config_dir(&format!(
+        "\t$(SUDO_FCVM) env FCVM_HOST_KERNEL_BUILD_DIR=\"$$dir\" {setup}"
+    )));
+    for overriding in [
+        format!("\t$(SUDO_FCVM) env FCVM_CONFIG_DIR= {setup}"),
+        format!("\t$(SUDO_FCVM) env FCVM_CONFIG_DIR=/elsewhere {setup}"),
+        format!("\t$(SUDO_FCVM) env A=1 FCVM_CONFIG_DIR= B=2 {setup}"),
+    ] {
+        assert!(
+            !forwards_config_dir(&overriding),
+            "counted as forwarding although it replaces FCVM_CONFIG_DIR: {overriding}"
+        );
+    }
 }
 
 /// What the stub sudo received when a recipe ran `$(SUDO_FCVM) probe-args`.
